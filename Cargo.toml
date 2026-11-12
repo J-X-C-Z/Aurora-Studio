@@ -1,0 +1,42 @@
+[workspace]
+members = ["crates/engine", "crates/app"]
+default-members = ["crates/app"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+lumen-engine = { path = "crates/engine" }
+# gpui-kit 0.9.0 and Ely both pin gpui-pre =0.3.11, so they share one GPUI in one window.
+gpui-kit = { version = "=0.9.0" }
+ely-core = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "e0f355a" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+# gpui's Windows renderer precompiles its HLSL with fxc.exe only when the build
+# host is Windows. For cross-compiled release builds, keep runtime shader
+# compilation (d3dcompiler_47, part of Windows 10+) by leaving its debug
+# assertions on. Native Windows builds may remove this override.
+[profile.release.package.gpui-pre-windows]
+debug-assertions = true
+
+[profile.dev.package.lumen-engine]
+opt-level = 3
+
+[profile.test.package.lumen-engine]
+opt-level = 3
