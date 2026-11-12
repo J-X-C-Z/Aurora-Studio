@@ -1,0 +1,23 @@
+[package]
+name = "lumen-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "lumen_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aurora-studio"
+path = "src/main.rs"
+
+[dependencies]
+lumen-engine.workspace = true
+gpui-kit.workspace = true
+ely-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+image = { version = "0.25", default-features = false }
