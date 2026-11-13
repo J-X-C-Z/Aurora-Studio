@@ -284,6 +284,8 @@ fn path() -> Option<PathBuf> {
 fn config_dir(windows: &str, unix: &str) -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(windows))
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support").join(windows))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)

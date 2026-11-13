@@ -580,7 +580,7 @@ impl RenderOnce for ParamSlider {
                     let on_change = on_change.clone();
                     let on_commit = on_commit.clone();
                     move |e: &ScrollEvent, window, cx| {
-                        if !e.modifiers.control {
+                        if !(e.modifiers.control || e.modifiers.platform) {
                             return;
                         }
                         let dy = match e.delta {

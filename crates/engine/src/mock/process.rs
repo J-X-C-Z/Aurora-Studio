@@ -2,6 +2,7 @@
 //! control in the interface has a visible, plausible effect during UI work.
 
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use crate::*;
 
@@ -28,19 +29,22 @@ fn srgb_to_linear(v: f32) -> f32 {
     if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
 
-fn linear_to_srgb(v: f32) -> f32 {
+pub(crate) fn linear_to_srgb(v: f32) -> f32 {
     if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
 /// Linear → sRGB over `0 ..= 4` linear, so highlight recovery has headroom to pull from.
-struct GammaLut(Vec<f32>);
+struct GammaLut(&'static [f32; 8192]);
 
 impl GammaLut {
     const SIZE: usize = 8192;
     const RANGE: f32 = 4.0;
 
     fn new() -> Self {
-        Self((0..Self::SIZE).map(|i| linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)).collect())
+        static TABLE: OnceLock<[f32; GammaLut::SIZE]> = OnceLock::new();
+        Self(TABLE.get_or_init(|| std::array::from_fn(|i| {
+            linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)
+        })))
     }
 
     fn get(&self, v: f32) -> f32 {
@@ -1454,23 +1458,34 @@ fn apply_layers(
     }
     let w = width as usize;
     let h = height as usize;
-    let n = plan.layers.len();
-    // Per-pixel mask weights, one slot per layer, pixel-major. The spatial
-    // pass below only reads them for layers that actually run a filter.
+    let mut n = 0;
+    let slots: Vec<Option<usize>> = plan.layers.iter().map(|lp| {
+        if lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0 {
+            let slot = n;
+            n += 1;
+            Some(slot)
+        } else {
+            None
+        }
+    }).collect();
+    // Pixel-major weights only for spatial layers, captured before each
+    // layer changes the colour used by luma and colour range masks.
     let mut weights = vec![0f32; w * h * n];
     let xs: Vec<f32> =
         (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
     // Colour pass: the layers stack, so each one sees the previous result.
-    rgba.par_chunks_mut(w * 4).zip(weights.par_chunks_mut(w * n)).enumerate().for_each(|(y, (line, wline))| {
+    let color_line = |y: usize, line: &mut [u8], wline: &mut [f32]| {
         let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
         for x in 0..w {
             let px = x * 4;
             let mut g = [line[px] as f32 / 255.0, line[px + 1] as f32 / 255.0, line[px + 2] as f32 / 255.0];
             let f = [xs[x], fy];
             let (p, _) = map.map(f);
-            for (li, lp) in plan.layers.iter().enumerate() {
+            for (lp, slot) in plan.layers.iter().zip(&slots) {
                 let m = layer_weight(lp, p, g);
-                wline[x * n + li] = m;
+                if let Some(slot) = slot {
+                    wline[x * n + *slot] = m;
+                }
                 if m <= 1e-4 {
                     continue;
                 }
@@ -1480,69 +1495,76 @@ fn apply_layers(
                 line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
-    });
+    };
+    if n == 0 {
+        rgba.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| color_line(y, line, &mut []));
+    } else {
+        rgba.par_chunks_mut(w * 4).zip(weights.par_chunks_mut(w * n)).enumerate()
+            .for_each(|(y, (line, wline))| color_line(y, line, wline));
+    }
     // Spatial pass: the operators need neighbours, so they work on the frame.
-    for (li, lp) in plan.layers.iter().enumerate() {
-        let spatial = lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0;
-        if !spatial {
-            continue;
-        }
-        let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + li]).collect();
-        if wgt.iter().all(|v| *v <= 1e-4) {
-            continue;
-        }
-        let luma = luma_plane(rgba, w, h);
-        let mut target = luma.clone();
-        if let Some(nr) = &lp.noise_reduction {
-            let strength = (nr.luminance / 100.0).clamp(0.0, 1.0);
-            if strength > 0.0 {
-                let blur = mean3x3(&luma, w, h);
-                for i in 0..w * h {
-                    target[i] = luma[i] + (blur[i] - luma[i]) * strength;
-                }
-            }
-        }
-        if lp.moire.amount > 0.0 {
-            let amount = (lp.moire.amount / 100.0).clamp(0.0, 1.0);
-            let pattern = (lp.moire.pattern / 100.0).clamp(0.0, 1.0);
-            let weight = amount * (0.25 + 0.75 * pattern);
-            let blur = mean3x3(&target, w, h);
+    for (lp, slot) in plan.layers.iter().zip(&slots) {
+        let Some(slot) = slot else { continue };
+        let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + *slot]).collect();
+        apply_layer_spatial(rgba, w, h, lp, &wgt, scale);
+    }
+}
+
+fn apply_layer_spatial(rgba: &mut [u8], w: usize, h: usize, lp: &LayerPlan, wgt: &[f32], scale: f32) {
+    if wgt.iter().all(|v| *v <= 1e-4) {
+        return;
+    }
+    let luma = luma_plane(rgba, w, h);
+    let mut target = luma.clone();
+    if let Some(nr) = &lp.noise_reduction {
+        let strength = (nr.luminance / 100.0).clamp(0.0, 1.0);
+        if strength > 0.0 {
+            let blur = mean3x3(&luma, w, h);
             for i in 0..w * h {
-                let hf = (target[i] - blur[i]).abs();
-                let blend = weight * (hf / 10.0).clamp(0.0, 1.0);
-                target[i] += (blur[i] - target[i]) * blend;
+                target[i] = luma[i] + (blur[i] - luma[i]) * strength;
             }
         }
-        if let Some(sh) = &lp.sharpening {
-            let amount = sh.amount / 100.0;
-            if amount > 0.0 {
-                let radius = ((sh.radius.max(0.1)) * scale).round().max(1.0) as i32;
-                let blur = box_blur3(&target, w, h, radius);
-                let threshold = sh.threshold.max(0.0);
-                for i in 0..w * h {
-                    let mut detail = target[i] - blur[i];
-                    if detail.abs() < threshold {
-                        detail = 0.0;
-                    }
-                    target[i] += detail * amount * 0.75;
-                }
-            }
-        }
-        // Write the new luminance back, keeping the hue ratios, and blend it
-        // in by the mask weight.
+    }
+    if lp.moire.amount > 0.0 {
+        let amount = (lp.moire.amount / 100.0).clamp(0.0, 1.0);
+        let pattern = (lp.moire.pattern / 100.0).clamp(0.0, 1.0);
+        let weight = amount * (0.25 + 0.75 * pattern);
+        let blur = mean3x3(&target, w, h);
         for i in 0..w * h {
-            let px = i * 4;
-            let old = luma[i];
-            let new = target[i];
-            let weight = wgt[i];
-            if weight <= 1e-4 {
-                continue;
+            let hf = (target[i] - blur[i]).abs();
+            let blend = weight * (hf / 10.0).clamp(0.0, 1.0);
+            target[i] += (blur[i] - target[i]) * blend;
+        }
+    }
+    if let Some(sh) = &lp.sharpening {
+        let amount = sh.amount / 100.0;
+        if amount > 0.0 {
+            let radius = ((sh.radius.max(0.1)) * scale).round().max(1.0) as i32;
+            let blur = box_blur3(&target, w, h, radius);
+            let threshold = sh.threshold.max(0.0);
+            for i in 0..w * h {
+                let mut detail = target[i] - blur[i];
+                if detail.abs() < threshold {
+                    detail = 0.0;
+                }
+                target[i] += detail * amount * 0.75;
             }
-            let mixed = old + (new - old) * weight;
-            let f = if old > 1.0 { mixed / old } else { 1.0 };
-            for k in 0..3 {
-                rgba[px + k] = (rgba[px + k] as f32 * f).clamp(0.0, 255.0).round() as u8;
-            }
+        }
+    }
+    // Write the new luminance back, keeping the hue ratios, and blend it
+    // in by the mask weight.
+    for i in 0..w * h {
+        let px = i * 4;
+        let old = luma[i];
+        let new = target[i];
+        let weight = wgt[i];
+        if weight <= 1e-4 {
+            continue;
+        }
+        let mixed = old + (new - old) * weight;
+        let f = if old > 1.0 { mixed / old } else { 1.0 };
+        for k in 0..3 {
+            rgba[px + k] = (rgba[px + k] as f32 * f).clamp(0.0, 255.0).round() as u8;
         }
     }
 }
@@ -1723,6 +1745,127 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamma_lut_reuses_table_with_original_bits_and_lookups() {
+        let original: Vec<f32> = (0..GammaLut::SIZE).map(|i| {
+            linear_to_srgb(i as f32 / (GammaLut::SIZE - 1) as f32 * GammaLut::RANGE)
+        }).collect();
+        let lut = GammaLut::new();
+        assert!(std::ptr::eq(lut.0, GammaLut::new().0));
+        for (actual, expected) in lut.0.iter().zip(&original) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        for v in (0..=16384).map(|i| i as f32 / 4096.0).chain([
+            -1.0, -0.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN,
+        ]) {
+            let i = (v.max(0.0) / GammaLut::RANGE * (GammaLut::SIZE - 1) as f32) as usize;
+            assert_eq!(lut.get(v).to_bits(), original[i.min(GammaLut::SIZE - 1)].to_bits());
+        }
+    }
+
+    // Original all-layer weight layout and colour ordering; share only the
+    // unchanged spatial operators so the reference need not duplicate filters.
+    fn apply_layers_original(
+        rgba: &mut [u8], width: u32, height: u32, plan: &Plan,
+        map: &super::super::geometry::FrameMap, region: NormRect, scale: f32,
+    ) -> bool {
+        let (w, h, n) = (width as usize, height as usize, plan.layers.len());
+        let mut weights = vec![0f32; w * h * n];
+        let xs: Vec<f32> =
+            (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
+        for (y, line) in rgba.chunks_mut(w * 4).enumerate() {
+            let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
+            for x in 0..w {
+                let px = x * 4;
+                let mut g = [line[px] as f32 / 255.0, line[px + 1] as f32 / 255.0, line[px + 2] as f32 / 255.0];
+                let (p, _) = map.map([xs[x], fy]);
+                for (li, lp) in plan.layers.iter().enumerate() {
+                    let m = layer_weight(lp, p, g);
+                    weights[(y * w + x) * n + li] = m;
+                    if m <= 1e-4 {
+                        continue;
+                    }
+                    g = layer_pixel(lp, g, m);
+                }
+                for k in 0..3 {
+                    line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        let color_only = rgba.to_vec();
+        for (li, lp) in plan.layers.iter().enumerate() {
+            if lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0 {
+                let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + li]).collect();
+                apply_layer_spatial(rgba, w, h, lp, &wgt, scale);
+            }
+        }
+        rgba != color_only.as_slice()
+    }
+
+    #[test]
+    fn apply_layers_matches_original_bytes_for_color_and_mixed_layers() {
+        let (w, h) = (17, 13);
+        let mut input = synthetic(w, h);
+        for (i, px) in input.chunks_exact_mut(4).enumerate() {
+            px[2] = ((i * 97) % 256) as u8;
+            px[3] = ((i * 31) % 256) as u8;
+        }
+        let mut color = Layer { id: 1, opacity: 73.0, ..Default::default() };
+        color.adjustments.exposure.exposure = 0.65;
+        color.adjustments.exposure.saturation = -23.0;
+        color.mask.luma_range = Some(LumaRange::default());
+        let mut fill = Layer { id: 2, opacity: 42.0, ..Default::default() };
+        fill.adjustments.fill_color = Some([0.8, 0.15, 0.45]);
+        let mut sharpen = Layer { id: 3, opacity: 64.0, ..Default::default() };
+        sharpen.mask = hard_disc(0.65);
+        sharpen.mask.luma_range = Some(LumaRange {
+            low_outer: 0.05, low_inner: 0.25, high_inner: 0.6, high_outer: 0.85,
+            ..Default::default()
+        });
+        sharpen.adjustments.exposure.exposure = -0.8;
+        sharpen.adjustments.sharpening = Some(Sharpening {
+            amount: 180.0, radius: 1.4, threshold: 0.0, ..Default::default()
+        });
+        let mut denoise = Layer { id: 4, opacity: 81.0, ..Default::default() };
+        denoise.mask.luma_range = Some(LumaRange::default());
+        denoise.mask.color_range = Some(ColorRange { hue: 210.0, width: 180.0, ..Default::default() });
+        denoise.adjustments.noise_reduction = Some(NoiseReduction {
+            luminance: 67.0, ..Default::default()
+        });
+        denoise.adjustments.moire.amount = 55.0;
+        denoise.adjustments.moire.pattern = 72.0;
+        let mut masked_out = sharpen.clone();
+        masked_out.id = 5;
+        masked_out.mask.density = 0.0;
+        let cases = [
+            vec![color.clone(), fill.clone()],
+            vec![color, sharpen, fill, masked_out, denoise],
+        ];
+        for (case, layers) in cases.into_iter().enumerate() {
+            let adj = AdjustmentSet { layers, ..Default::default() };
+            let map = super::super::geometry::FrameMap::new((w, h), &adj.geometry);
+            let plan = Plan {
+                adj: &adj, input_profile: None, film_lut: None, gamma: GammaLut::new(),
+                fine: false, wb: [1.0; 3], exposure: 1.0, base_contrast: 0.0,
+                curve_rgb: None, curve_r: None, curve_g: None, curve_b: None, curve_luma: None,
+                levels: false, color_editor: false, color_balance: false,
+                layers: layer_plans(&adj, w as f32 / h as f32, w as f32 / 256.0, None, Some(2)),
+            };
+            for region in [NormRect::FULL, NormRect { x: 0.1, y: 0.15, width: 0.7, height: 0.6 }] {
+                for scale in [0.5, 1.0] {
+                    let mut expected = input.clone();
+                    let spatial_changed = apply_layers_original(&mut expected, w, h, &plan, &map, region, scale);
+                    assert_eq!(spatial_changed, case == 1, "mixed case must exercise spatial filters");
+                    let mut actual = input.clone();
+                    apply_layers(&mut actual, w, h, &plan, &map, region, scale);
+                    assert_eq!(actual, expected, "case {case}, region {region:?}, scale {scale}");
+                    assert_ne!(actual, input, "colour layers must change pixels");
+                    assert!(actual.chunks_exact(4).zip(input.chunks_exact(4)).all(|(a, b)| a[3] == b[3]));
+                }
+            }
+        }
+    }
 
     /// Draft vs Final render cost on a 2000x1333 source.
     /// `cargo test -p lumen-engine bench_render_quality -- --ignored --nocapture`

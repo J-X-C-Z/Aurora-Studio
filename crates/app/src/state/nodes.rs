@@ -49,13 +49,13 @@ impl NewNode {
         }
     }
 
-    pub fn keys(self) -> &'static str {
-        match self {
-            Self::Serial => "Alt+S",
-            Self::Parallel => "Alt+Shift+P",
-            Self::Layer => "Alt+L",
-            Self::Outside => "Alt+Shift+O",
-        }
+    pub fn keys(self) -> String {
+        crate::platform::keys(match self {
+            Self::Serial => "alt-s",
+            Self::Parallel => "alt-shift-p",
+            Self::Layer => "alt-l",
+            Self::Outside => "alt-shift-o",
+        })
     }
 }
 

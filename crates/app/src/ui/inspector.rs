@@ -105,7 +105,7 @@ pub fn tool_strip(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -
                     let selected = tab == current;
                     let st = state.clone();
                     let tip: SharedString = match tab.shortcut() {
-                        Some(k) => format!("{}  ({})", tab.label(), k.replace("ctrl", "Ctrl")).into(),
+                        Some(k) => format!("{}  ({})", tab.label(), crate::platform::keys(k)).into(),
                         None => tab.label().into(),
                     };
                     div()

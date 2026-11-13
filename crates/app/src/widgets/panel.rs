@@ -216,7 +216,7 @@ impl RenderOnce for ToolPanel {
                     let (a, b, c) = (st.clone(), st.clone(), st.clone());
                     let (d, e, f) = (st.clone(), st.clone(), st.clone());
                     let menu = menu
-                        .item(PopupMenuItem::new(crate::i18n::t("Show Only This Panel  (Alt-click)", "仅展开此面板（Alt+单击）")).on_click(move |_, _, cx| d.update(cx, |s, cx| s.solo_panel(id, cx))))
+                        .item(PopupMenuItem::new(format!("{}  ({}{})", crate::i18n::t("Show Only This Panel", "仅展开此面板"), crate::platform::alt(), crate::i18n::t("-click", "+单击"))).on_click(move |_, _, cx| d.update(cx, |s, cx| s.solo_panel(id, cx))))
                         .item(PopupMenuItem::new(crate::i18n::t("Expand All Panels", "展开全部面板")).on_click(move |_, _, cx| e.update(cx, |s, cx| s.set_all_panels(true, cx))))
                         .item(PopupMenuItem::new(crate::i18n::t("Collapse All Panels", "折叠全部面板")).on_click(move |_, _, cx| f.update(cx, |s, cx| s.set_all_panels(false, cx))))
                         .separator();

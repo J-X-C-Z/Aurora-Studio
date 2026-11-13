@@ -325,6 +325,10 @@ pub trait ImageEngine: Send + Sync + 'static {
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities::default()
     }
+    /// Basic exposure fusion for bracketed frames; alignment/deghosting are not applied.
+    fn merge_hdr_frames(&self, _ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        anyhow::bail!("HDR merge is not supported by this engine")
+    }
 
     // ── Catalog ──
 
@@ -361,9 +365,19 @@ pub trait ImageEngine: Send + Sync + 'static {
     }
     /// Persists rating, tag, keywords and IPTC changes made in the interface.
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()>;
+    /// Persists a selection in one FileEngine commit, with rollback on I/O errors.
+    fn update_infos(&self, infos: &[ImageInfo]) -> anyhow::Result<()> {
+        for info in infos { self.update_info(info)?; }
+        Ok(())
+    }
     /// Adjustments stored for an image, so reopening a session restores them.
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet;
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()>;
+    /// Persists a selection together; fallback engines retain their single-save behavior.
+    fn save_adjustments_batch(&self, changes: &[(ImageId, &AdjustmentSet)]) -> anyhow::Result<()> {
+        for &(image, adjustments) in changes { self.save_adjustments(image, adjustments)?; }
+        Ok(())
+    }
     /// Creates a new variant of `image` with the given adjustments; returns its info.
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo>;
 

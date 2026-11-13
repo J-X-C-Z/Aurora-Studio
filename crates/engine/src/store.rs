@@ -308,13 +308,17 @@ impl Store {
         self.root.join("previews").join(format!("{}.png", id.0))
     }
 
-    pub(crate) fn save_library_preview(&self, id: crate::ImageId, frame: &crate::RgbaImage) -> Result<()> {
+    pub(crate) fn encode_library_preview(frame: &crate::RgbaImage) -> Result<Vec<u8>> {
         use image::ImageEncoder;
         let mut bytes = Vec::new();
         image::codecs::png::PngEncoder::new(&mut bytes).write_image(
             frame.pixels.as_ref(), frame.width, frame.height, image::ExtendedColorType::Rgba8,
         )?;
-        write_atomic(&self.preview_path(id), &bytes)
+        Ok(bytes)
+    }
+
+    pub(crate) fn save_library_preview(&self, id: crate::ImageId, bytes: &[u8]) -> Result<()> {
+        write_atomic(&self.preview_path(id), bytes)
     }
 
     pub(crate) fn load_library_preview(&self, id: crate::ImageId) -> Result<image::RgbaImage> {

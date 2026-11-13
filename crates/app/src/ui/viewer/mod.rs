@@ -742,7 +742,7 @@ impl Render for Viewer {
                                 .small()
                                 .outline()
                                 .icon(Icon::new(IconName::ImageDown))
-                                .label(format!("{}  Ctrl+Shift+I", t("Import…", "导入…")))
+                                .label(format!("{}  {}", t("Import…", "导入…"), crate::platform::keys("ctrl-shift-i")))
                                 .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::Import), cx)),
                         ),
                 )
@@ -1056,7 +1056,7 @@ fn tool_hint(tool: CursorTool, layer: Option<&str>) -> Option<String> {
     Some(match tool {
         CursorTool::Select | CursorTool::Annotate => return None,
         CursorTool::Pan => t("Drag to pan · double-click toggles 100%", "拖动平移 · 双击在 100% 与适合窗口间切换").to_string(),
-        CursorTool::Zoom => t("Click to zoom in · Alt-click to zoom out", "单击放大 · Alt+单击缩小").to_string(),
+        CursorTool::Zoom => format!("{} · {}{}", t("Click to zoom in", "单击放大"), crate::platform::alt(), t("-click to zoom out", "+单击缩小")),
         CursorTool::Crop => t("Drag to draw a crop · drag its edges or corners to adjust · drag inside to move", "拖动画出裁剪框 · 拖动边或角调整 · 在框内拖动可移动").to_string(),
         CursorTool::Straighten => t("Drag along a line that should be level or upright", "沿着应当水平或垂直的线拖动").to_string(),
         CursorTool::Keystone => t("Drag up or down for vertical, left or right for horizontal correction", "上下拖动校正垂直透视 · 左右拖动校正水平透视").to_string(),
