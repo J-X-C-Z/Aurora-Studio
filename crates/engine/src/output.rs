@@ -61,12 +61,18 @@ impl ExportFormat {
     /// Whether this build has an encoder for the format. The interface greys
     /// the others out; [`Self::ensure_supported`] is the exporter's own gate.
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::WebP)
+        match self {
+            Self::Heif => crate::heif_write::available(),
+            _ => matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::WebP),
+        }
     }
 
     /// Fails with [`UnsupportedFormat`] when there is no encoder, so a job is
     /// rejected before anything is rendered or written.
     pub fn ensure_supported(self) -> anyhow::Result<()> {
+        if self == Self::Heif {
+            return crate::heif_write::probe();
+        }
         if self.is_supported() {
             Ok(())
         } else {
@@ -84,6 +90,35 @@ impl ExportFormat {
             _ => anyhow::bail!(
                 "{self:?} has no {depth}-bit encoder; only PNG and TIFF support 16-bit"
             ),
+        }
+    }
+}
+
+/// Stable category for a failed export job, for translated queue labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportErrorKind {
+    Cancelled,
+    Unsupported,
+    Io,
+    Other,
+}
+
+impl ExportErrorKind {
+    pub fn of(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("cancelled") {
+            Self::Cancelled
+        } else if lower.contains("unsupported") || lower.contains("no encoder") || lower.contains("not supported") {
+            Self::Unsupported
+        } else if lower.contains("os error")
+            || lower.contains("no such file")
+            || lower.contains("permission denied")
+            || lower.contains("disk full")
+            || lower.contains("read-only")
+        {
+            Self::Io
+        } else {
+            Self::Other
         }
     }
 }
@@ -140,6 +175,25 @@ pub enum OutputSharpening {
     Print,
 }
 
+/// Output-sharpening numbers read from Capture One's recipe XML.
+///
+/// `Control`, `Method` and viewing distance are preserved without acting on
+/// them: their semantics have not been cross-checked against Capture One.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputSharpeningSettings {
+    /// XML value; C1's scale is not proven, so it is passed through unscaled.
+    pub amount: f32,
+    /// Pixel radius after rounding in the current Aurora implementation.
+    pub radius: f32,
+    /// Conservative detail threshold in 8-bit levels.
+    pub threshold: f32,
+    pub control: u8,
+    pub method: u8,
+    pub viewing_distance: u32,
+    pub viewing_distance_unit: u8,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProcessRecipe {
@@ -156,6 +210,7 @@ pub struct ProcessRecipe {
     pub scale: ScaleMode,
     pub scale_value: (u32, u32),
     pub output_sharpening: OutputSharpening,
+    pub output_sharpening_settings: Option<OutputSharpeningSettings>,
     /// Folder; `None` writes beside the source in an "Output" folder.
     pub destination: Option<PathBuf>,
     /// Tokens such as `[Image Name]`, `[Counter]`, `[Date]`.
@@ -179,6 +234,7 @@ impl Default for ProcessRecipe {
             scale: ScaleMode::Fixed100,
             scale_value: (0, 0),
             output_sharpening: OutputSharpening::Disabled,
+            output_sharpening_settings: None,
             destination: None,
             file_name_format: "[Image Name]".into(),
             include_metadata: MetadataPolicy::default(),
@@ -377,5 +433,13 @@ mod tests {
             output_path("{name}.{ext}", "back\\slash", 0, "jpg"),
             PathBuf::from("back_slash.jpg")
         );
+    }
+
+    #[test]
+    fn export_failures_map_to_stable_kinds() {
+        assert_eq!(ExportErrorKind::of("cancelled"), ExportErrorKind::Cancelled);
+        assert_eq!(ExportErrorKind::of("Unsupported: no encoder for PSD"), ExportErrorKind::Unsupported);
+        assert_eq!(ExportErrorKind::of("No such file or directory (os error 2)"), ExportErrorKind::Io);
+        assert_eq!(ExportErrorKind::of("render failed"), ExportErrorKind::Other);
     }
 }

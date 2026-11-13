@@ -185,6 +185,24 @@ pub fn by_key(key: &str) -> Option<&'static ParamMeta> {
     CATALOG.iter().find(|m| m.key == key)
 }
 
+/// The six black-and-white channel keys, in `BlackWhite::sensitivity` order.
+pub(crate) const BW_CHANNELS: [&str; 6] =
+    ["BwRed", "BwYellow", "BwGreen", "BwCyan", "BwBlue", "BwMagenta"];
+
+/// Clamps `value` to the catalog row's C1 range.
+///
+/// The C1 layer-row path (`c1_model`) and the `.copreset` text path (`presets`)
+/// both clamp through here, so a range is edited in one place only. Only keys
+/// whose range is settled (PARAM-RANGE-DECISIONS) may use it: several rows are
+/// `RawImage` fallbacks, not safe engine bounds. Unknown keys pass through.
+pub(crate) fn clamp(key: &str, value: f32) -> f32 {
+    match by_key(key) {
+        Some(m) if value.is_nan() => m.min,
+        Some(m) => value.clamp(m.min, m.max),
+        None => value,
+    }
+}
+
 pub fn by_group(group: &str) -> Vec<&'static ParamMeta> {
     CATALOG.iter().filter(|m| m.group == group).collect()
 }
@@ -416,6 +434,12 @@ impl ParamOverrides {
         }
         let default = self.defaults.get(meta.key).copied().unwrap_or(meta.default).clamp(min, max);
         (min, max, default)
+    }
+
+    /// The override value for `key`, or `None` when nothing supplied one and the
+    /// catalog's static default still applies.
+    pub fn default_for(&self, key: &str) -> Option<f32> {
+        self.defaults.get(key).copied()
     }
 }
 

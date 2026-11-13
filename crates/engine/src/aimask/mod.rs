@@ -137,6 +137,12 @@ pub(crate) fn model_path(name: &str) -> Result<PathBuf> {
     )
 }
 
+/// Whether a model file exists anywhere [`model_path`] would look, without
+/// opening the ONNX session.
+pub fn model_available(name: &str) -> bool {
+    model_candidates(name).iter().any(|path| path.is_file())
+}
+
 /// A loaded model plus what its metadata says about the tensors.
 pub(crate) struct Segmenter {
     pub(crate) session: Session,

@@ -10,10 +10,12 @@
 //! C1 never has exclusive access to its catalog, so the file is opened read-only
 //! and a `.readlock` sibling only produces a warning, never a block.
 
+use crate::c1_masks::mask_layers_from_rows;
 use crate::c1_model::{from_layer_row, to_adjustment_set, C1VariantSettings};
+use crate::c1_retouch::{group_retouching_rows, RetouchingLayer};
 use crate::catalog::CollectionKind;
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -559,6 +561,11 @@ pub struct C1Variant {
     pub index: i64,
     pub canvas: Option<(f32, f32)>,
     pub settings: C1VariantSettings,
+    /// Read-only `ZRETOUCHINGLAYER` rows. Not applied to edits or rendering.
+    pub retouching: Vec<RetouchingLayer>,
+    /// Parsed `Z_ENT=23` rows. They are not applied until their `.comask`
+    /// geometry is available.
+    pub local_layers: Vec<crate::c1_masks::C1MaskLayer>,
     pub adjustments: crate::AdjustmentSet,
     pub rating: i64,
     pub color_tag: i64,
@@ -649,7 +656,9 @@ impl C1Catalog {
         }
 
         // A catalog and a session share this schema; a stray SQLite file does not.
-        for table in ["ZIMAGE", "ZVARIANT", "ZVARIANTLAYER", "ZVARIANTMETADATA", "ZPATHLOCATION"] {
+        // Only the three tables that hold the images themselves are required:
+        // leaner and older sessions drop metadata, keyword and collection tables.
+        for table in ["ZIMAGE", "ZVARIANT", "ZVARIANTLAYER"] {
             if !db.has_table(table)? {
                 bail!(
                     "{} is not a Capture One catalog or session: it has no {table} table",
@@ -657,11 +666,11 @@ impl C1Catalog {
                 );
             }
         }
-        let document_type = Self::read_document_type(&mut db, &mut warnings)?;
-        let images = Self::read_images(&mut db)?;
-        let collections = Self::read_collections(&mut db)?;
-        let keywords = Self::read_keywords(&mut db)?;
-        let variants = Self::read_variants(&mut db, &keywords)?;
+        let document_type = Self::read_document_type(&mut db, path, &mut warnings)?;
+        let images = Self::read_images(&mut db, &mut warnings)?;
+        let collections = Self::read_collections(&mut db, &mut warnings)?;
+        let keywords = Self::read_keywords(&mut db, &mut warnings)?;
+        let variants = Self::read_variants(&mut db, &keywords, &mut warnings)?;
         Ok(Self { document_type, images, variants, collections, keywords, warnings, wal })
     }
 
@@ -671,11 +680,39 @@ impl C1Catalog {
     /// is reported rather than guessed at, so a wrong reader never runs silently.
     fn read_document_type(
         db: &mut SqliteReader,
+        path: &Path,
         warnings: &mut Vec<String>,
     ) -> Result<C1DocumentType> {
         if !db.has_table("ZDOCUMENTCONTENT")? {
-            warnings.push("no ZDOCUMENTCONTENT table; treating the file as a catalog".into());
-            return Ok(C1DocumentType::Catalog);
+            // The extension still says what the user opened, so a session never
+            // gets silently downgraded to a catalog.
+            let by_extension = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(|e| {
+                    if e.eq_ignore_ascii_case("cosessiondb") {
+                        Some(C1DocumentType::Session)
+                    } else if e.eq_ignore_ascii_case("cocatalogdb") {
+                        Some(C1DocumentType::Catalog)
+                    } else {
+                        None
+                    }
+                });
+            let Some(kind) = by_extension else {
+                bail!(
+                    "{} has no ZDOCUMENTCONTENT table and its name does not say whether it is a catalog or a session",
+                    path.display()
+                );
+            };
+            warnings.push(format!(
+                "no ZDOCUMENTCONTENT table; reading {} as a {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                match kind {
+                    C1DocumentType::Catalog => "catalog",
+                    C1DocumentType::Session => "session",
+                }
+            ));
+            return Ok(kind);
         }
         let value = db
             .select("ZDOCUMENTCONTENT")?
@@ -696,15 +733,18 @@ impl C1Catalog {
     /// C1 has no `ZTYPE`/`ZKIND` columns: what a collection *is* comes from its
     /// `Z_ENT`, which `ZENTITIES` names. Folder collections carry no name
     /// either; their name is the catalog path they point at.
-    fn read_collections(db: &mut SqliteReader) -> Result<Vec<C1Collection>> {
+    fn read_collections(
+        db: &mut SqliteReader,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<C1Collection>> {
         let mut paths: HashMap<i64, String> = HashMap::new();
-        for row in db.select("ZPATHLOCATION")? {
+        for row in optional_rows(db, "ZPATHLOCATION", warnings)? {
             let Some(pk) = row.get("Z_PK").and_then(Value::as_f64) else { continue };
             paths.insert(pk as i64, location_path(&row));
         }
 
         let mut entities: HashMap<i64, String> = HashMap::new();
-        for row in db.select("ZENTITIES")? {
+        for row in optional_rows(db, "ZENTITIES", warnings)? {
             let (Some(ent), Some(name)) = (
                 row.get("Z_ENT").and_then(Value::as_f64),
                 row.get("ZNAME").and_then(Value::as_str),
@@ -715,7 +755,7 @@ impl C1Catalog {
         }
 
         let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
-        for row in db.select("ZIMAGEINCOLLECTION")? {
+        for row in optional_rows(db, "ZIMAGEINCOLLECTION", warnings)? {
             let (Some(coll), Some(image)) = (
                 row.get("ZCOLLECTION").and_then(Value::as_f64),
                 row.get("ZIMAGE").and_then(Value::as_f64),
@@ -725,7 +765,7 @@ impl C1Catalog {
             members.entry(coll as i64).or_default().push(image as i64);
         }
 
-        let rows = db.select("ZCOLLECTION")?;
+        let rows = optional_rows(db, "ZCOLLECTION", warnings)?;
         // The catalog root is the one collection that belongs to no project;
         // it also names the four system collections C1 keeps for itself.
         let root_pk = rows
@@ -827,9 +867,11 @@ impl C1Catalog {
     }
 
     /// Reads the keyword tree (`ZKEYWORD`): C1 nests keywords with `ZPARENT`.
-    fn read_keywords(db: &mut SqliteReader) -> Result<Vec<C1Keyword>> {
-        Ok(db
-            .select("ZKEYWORD")?
+    fn read_keywords(
+        db: &mut SqliteReader,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<C1Keyword>> {
+        Ok(optional_rows(db, "ZKEYWORD", warnings)?
             .iter()
             .filter_map(|row| {
                 Some(C1Keyword {
@@ -845,9 +887,11 @@ impl C1Catalog {
             .collect())
     }
 
-    fn read_images(db: &mut SqliteReader) -> Result<Vec<C1Image>> {
-        let locations: HashMap<i64, String> = db
-            .select("ZPATHLOCATION")?
+    fn read_images(
+        db: &mut SqliteReader,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<C1Image>> {
+        let locations: HashMap<i64, String> = optional_rows(db, "ZPATHLOCATION", warnings)?
             .iter()
             .filter_map(|r| {
                 let pk = r.get("Z_PK")?.as_f64()? as i64;
@@ -886,7 +930,11 @@ impl C1Catalog {
             .collect())
     }
 
-    fn read_variants(db: &mut SqliteReader, keywords: &[C1Keyword]) -> Result<Vec<C1Variant>> {
+    fn read_variants(
+        db: &mut SqliteReader,
+        keywords: &[C1Keyword],
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<C1Variant>> {
         let layers = db.select("ZVARIANTLAYER")?;
         // Source pixel size per image, to tell whether a variant's canvas is turned.
         let dims: HashMap<i64, (u32, u32)> = db
@@ -899,14 +947,28 @@ impl C1Catalog {
                 (pk, (w, h))
             })
             .collect();
-        let metadata: HashMap<i64, Row> = db
-            .select("ZVARIANTMETADATA")?
+        let metadata: HashMap<i64, Row> = optional_rows(db, "ZVARIANTMETADATA", warnings)?
             .into_iter()
             .filter_map(|r| Some((r.get("Z_PK")?.as_f64()? as i64, r)))
             .collect();
 
+        let variant_rows = db.select("ZVARIANT")?;
+        let variant_pks: HashSet<i64> = variant_rows
+            .iter()
+            .filter_map(|v| v.get("Z_PK").and_then(Value::as_f64).map(|pk| pk as i64))
+            .collect();
+        // shortcut: catalogs older than the ZFACE schema may lack this table,
+        // which is treated as "no retouching rows" rather than a read failure.
+        let retouch_rows: Vec<HashMap<String, Option<String>>> = db
+            .select("ZRETOUCHINGLAYER")
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.iter().map(|(k, v)| (k.clone(), v.as_string())).collect())
+            .collect();
+        let mut retouching = group_retouching_rows(&retouch_rows, &variant_pks);
+
         let mut out = Vec::new();
-        for v in db.select("ZVARIANT")? {
+        for v in variant_rows {
             let pk = v.get("Z_PK").and_then(Value::as_f64).unwrap_or(0.0) as i64;
             let mut mine: Vec<&Row> = layers
                 .iter()
@@ -919,6 +981,7 @@ impl C1Catalog {
             let mut merged: HashMap<String, Option<String>> = HashMap::new();
             let mut mask_layers = 0;
             let mut mask_names = Vec::new();
+            let mut local_rows = Vec::new();
             for layer in &mine {
                 match layer.get("Z_ENT").and_then(Value::as_f64).unwrap_or(0.0) as i64 {
                     18 | 17 => {
@@ -933,12 +996,16 @@ impl C1Catalog {
                         if let Some(name) = layer.get("ZNAME").and_then(Value::as_str) {
                             mask_names.push(name.to_string());
                         }
+                        let row: HashMap<&str, Option<String>> =
+                            layer.iter().map(|(k, v)| (k.as_str(), v.as_string())).collect();
+                        local_rows.push(row);
                     }
                     _ => {}
                 }
             }
             let borrowed: HashMap<&str, Option<String>> =
                 merged.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let local_layers = mask_layers_from_rows(&local_rows);
             let mut settings = from_layer_row(&borrowed);
             // ZCROP is in canvas pixels and ZCANVASSIZE is only stored on ZVARIANT,
             // never on the layer row, so the canvas has to come from the variant.
@@ -957,7 +1024,6 @@ impl C1Catalog {
                     .map(|pk| pk as i64)
                     .and_then(|pk| dims.get(&pk).copied())
                     .unwrap_or((0, 0));
-                eprintln!("TRACE variant {pk} canvas {cw}x{ch} source {:?}", source);
                 let portrait_canvas = ch > cw;
                 let portrait_source = source.1 > source.0;
                 if source.0 > 0 && portrait_canvas != portrait_source {
@@ -994,12 +1060,14 @@ impl C1Catalog {
                 index: v.get("ZINDEX").and_then(Value::as_f64).map(|v| v as i64).unwrap_or(0),
                 canvas,
                 settings,
+                local_layers,
                 adjustments,
                 rating,
                 color_tag,
                 keywords: keyword_list,
                 mask_layers,
                 mask_names,
+                retouching: retouching.by_variant.remove(&pk).unwrap_or_default(),
             });
         }
         Ok(out)
@@ -1018,6 +1086,26 @@ fn parse_pair(text: &str) -> Option<(f32, f32)> {
     let w = it.next()?.trim().parse().ok()?;
     let h = it.next()?.trim().parse().ok()?;
     Some((w, h))
+}
+
+/// Rows of a table that leaner or older sessions may not carry.
+///
+/// A missing table reads as empty and is reported once; it never turns the file
+/// into an invalid one. Only `ZIMAGE`, `ZVARIANT` and `ZVARIANTLAYER` are
+/// required.
+fn optional_rows(
+    db: &mut SqliteReader,
+    table: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Row>> {
+    if !db.has_table(table)? {
+        let warning = format!("no {table} table; reading it as empty");
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+        return Ok(Vec::new());
+    }
+    db.select(table)
 }
 
 /// The folder a `ZPATHLOCATION` row points at: `ZWINROOT + ZRELATIVEPATH`, or
@@ -1081,13 +1169,173 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "external-fixtures")]
-    use super::test_support::{fixture_path, fixture_with_wal, wal_bytes};
+    use super::test_support::{
+        fixture_path, fixture_with_wal, session_tables, sqlite_file, synthetic_session, wal_bytes,
+    };
     use super::*;
+
+    /// A `-wal` holding the given `(page, db_size, image)` frames; a non-zero
+    /// `db_size` marks a commit, exactly like SQLite writes it.
+    #[cfg(feature = "external-fixtures")]
+    fn wal_with_frames(frames: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
+        let salt = (0x1122_3344u32, 0x5566_7788u32);
+        let mut header = Vec::new();
+        header.extend(0x377f_0682u32.to_be_bytes());
+        header.extend(3_007_000u32.to_be_bytes());
+        header.extend(4096u32.to_be_bytes());
+        header.extend(0u32.to_be_bytes());
+        header.extend(salt.0.to_be_bytes());
+        header.extend(salt.1.to_be_bytes());
+        let mut sum = wal_checksum(&header, (0, 0), false);
+        header.extend(sum.0.to_be_bytes());
+        header.extend(sum.1.to_be_bytes());
+
+        let mut out = header;
+        for (page, db_size, image) in frames {
+            assert_eq!(image.len(), 4096);
+            let mut head = Vec::new();
+            head.extend(page.to_be_bytes());
+            head.extend(db_size.to_be_bytes());
+            head.extend(salt.0.to_be_bytes());
+            head.extend(salt.1.to_be_bytes());
+            sum = wal_checksum(image, wal_checksum(&head[..8], sum, false), false);
+            head.extend(sum.0.to_be_bytes());
+            head.extend(sum.1.to_be_bytes());
+            out.extend(head);
+            out.extend(image);
+        }
+        out
+    }
 
 
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("lumen-c1-{tag}-{}", std::process::id()))
     }
+
+    /// The synthetic session bytes without one table, written as `name`.
+    #[cfg(feature = "external-fixtures")]
+    fn session_without(dir: &Path, table: &str, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let tables: Vec<_> = session_tables()
+            .into_iter()
+            .filter(|t| t.name() != table)
+            .collect();
+        let path = dir.join(name);
+        std::fs::write(&path, sqlite_file(&tables)).unwrap();
+        path
+    }
+
+
+
+
+
+    #[cfg(feature = "external-fixtures")]
+    #[test]
+    fn a_session_without_variant_metadata_still_opens() {
+        let dir = temp_dir("session-no-metadata");
+        let db = session_without(&dir, "ZVARIANTMETADATA", "Lean.cosessiondb");
+        let before = std::fs::read(&db).unwrap();
+
+        let c = C1Catalog::open_ro(&db).expect("a lean session is not a broken file");
+        assert_eq!(c.document_type, C1DocumentType::Session);
+        assert_eq!((c.images.len(), c.variants.len()), (2, 4));
+        assert!(
+            c.warnings.iter().any(|w| w.contains("ZVARIANTMETADATA") && w.contains("as empty")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        // No ratings or keywords without the table, and no error either.
+        assert!(c.variants.iter().all(|v| v.rating == 0 && v.keywords.is_empty()));
+        // The adjustments and mask layers are still read.
+        assert_eq!(c.variants.iter().map(|v| v.mask_layers).sum::<usize>(), 1);
+        assert!(c.variants.iter().any(|v| v.settings.exposure == 0.75));
+        assert_eq!(std::fs::read(&db).unwrap(), before, "the database file changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "external-fixtures")]
+    #[test]
+    fn a_missing_document_content_table_follows_the_file_name() {
+        let dir = temp_dir("session-no-doctype");
+        for (name, want) in [
+            ("Lean.cosessiondb", C1DocumentType::Session),
+            ("Lean.cocatalogdb", C1DocumentType::Catalog),
+        ] {
+            let db = session_without(&dir, "ZDOCUMENTCONTENT", name);
+            let before = std::fs::read(&db).unwrap();
+            let c = C1Catalog::open_ro(&db).expect("the document type comes from the name");
+            assert_eq!(c.document_type, want, "{name}");
+            assert!(
+                c.warnings.iter().any(|w| w.contains("no ZDOCUMENTCONTENT") && w.contains(name)),
+                "{name} warnings: {:?}",
+                c.warnings
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), before, "{name} changed");
+        }
+        // With neither the table nor a telling extension, guessing is refused.
+        let odd = session_without(&dir, "ZDOCUMENTCONTENT", "Lean.sqlite");
+        let err = format!("{:#}", C1Catalog::open_ro(&odd).unwrap_err());
+        assert!(err.contains("does not say whether it is a catalog or a session"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    #[cfg(feature = "external-fixtures")]
+    #[test]
+    fn a_wal_replays_only_the_frames_up_to_its_last_commit() {
+        let dir = temp_dir("wal-commit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("Session.cosessiondb");
+        let bytes = synthetic_session();
+        std::fs::write(&db_path, &bytes).unwrap();
+
+        let page = |n: usize| bytes[n * 4096..(n + 1) * 4096].to_vec();
+        // Frames 1-2 rewrite ZIMAGE unchanged, frame 2 carries the commit marker.
+        // Frame 3 zeroes ZDOCUMENTCONTENT and was never committed, so applying it
+        // would make the database unreadable.
+        std::fs::write(
+            dir.join("Session.cosessiondb-wal"),
+            wal_with_frames(&[(5, 0, page(4)), (5, 7, page(4)), (3, 0, vec![0u8; 4096])]),
+        )
+        .unwrap();
+
+        let c = C1Catalog::open_ro(&db_path).expect("the committed frames replay");
+        let report = c.wal.expect("the wal was found");
+        assert_eq!((report.frames_total, report.frames_applied), (3, 2));
+        assert_eq!(report.frames_uncommitted, 1);
+        assert_eq!(report.pages_overridden, 1);
+        assert!(
+            c.warnings.iter().any(|w| w.contains("2 of 3 frames") && w.contains("1 uncommitted")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        // The uncommitted frame never reached the metadata page.
+        assert_eq!(c.document_type, C1DocumentType::Session);
+        assert_eq!(c.images.len(), 2);
+        assert_eq!(std::fs::read(&db_path).unwrap(), bytes, "the database file changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+
+
+
+
 
 
     #[test]

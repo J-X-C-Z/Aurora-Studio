@@ -1,0 +1,10 @@
+[package]
+name = "aurora-pixcake"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Explicit-input portrait geometry and pixel stages with CPU, CUDA and Metal adapters"
+
+[features]
+default = []
+external-fixtures = []

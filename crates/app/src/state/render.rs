@@ -135,7 +135,7 @@ impl AppState {
             bypass,
             mask_overlay: mask_overlay.filter(|_| !bypass),
             generation: self.preview.generation,
-        })
+         display_profile: None, proof_profile: None, proof_paper_white: 1.0, proof_black_point: 0.0, })
     }
 
     pub fn request_render(&mut self, quality: RenderQuality, cx: &mut Context<Self>) {

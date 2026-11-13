@@ -264,6 +264,18 @@ mod tests {
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
     #[test]
     fn a_database_without_the_variant_tables_is_rejected() {
         let dir = temp_dir("session-min");

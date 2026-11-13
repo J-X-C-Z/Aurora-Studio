@@ -42,6 +42,7 @@ struct State {
     lru: Vec<ImageId>,
     jobs: HashMap<u64, JobStatus>,
     preview: PreviewCache,
+    profiled: crate::engine::ProfileCache,
 }
 
 pub struct MockEngine {
@@ -78,6 +79,7 @@ impl MockEngine {
                 path: PathBuf::from(format!("C:/Photos/2026/Session/LUM_{:04}.IIQ", 1000 + i)),
                 file_name: format!("LUM_{:04} {}.IIQ", 1000 + i, scene.title()),
                 kind: FileKind::Raw,
+                heif: None,
                 width: w,
                 height: h,
                 file_size: 92_000_000 + (i as u64 * 1_234_567) % 30_000_000,
@@ -164,12 +166,20 @@ impl MockEngine {
         let fast = false;
         let adj = crate::styles::resolve(&request.adjustments);
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
-        if let Some(hit) = self.state.lock().preview.get(key) {
+        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+        let hit = self.state.lock().preview.get(key);
+        if let Some(hit) = hit {
+            let histogram = hit.histogram.clone();
+            let source = hit.into_image();
+            let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
+            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
             return Ok(PreviewFrame {
-                histogram: hit.histogram.clone(),
-                image: hit.into_image(),
+                histogram,
+                image,
                 generation: request.generation,
                 elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+                degraded,
+                gamut_warning,
             });
         }
         let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
@@ -180,11 +190,16 @@ impl MockEngine {
             histogram: out.histogram.clone(),
         };
         self.state.lock().preview.insert(key, frame.clone());
+        let source = frame.into_image();
+        let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
+        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
         Ok(PreviewFrame {
-            image: frame.into_image(),
+            image,
             histogram: out.histogram,
             generation: request.generation,
             elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            degraded,
+            gamut_warning,
         })
     }
 
@@ -205,6 +220,7 @@ impl MockEngine {
             path: path.to_path_buf(),
             file_name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             kind,
+            heif: None,
             width: w,
             height: h,
             file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
@@ -536,6 +552,8 @@ impl ImageEngine for MockEngine {
             exposure_comp: 0.0,
             white_balance: "Daylight".into(),
             drive_mode: "Single".into(),
+            focus_mode: "Auto".into(),
+            focus_distance: "2.4 m".into(),
         })
     }
 }
@@ -554,6 +572,10 @@ mod tests {
             bypass: false,
             mask_overlay: None,
             generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
         }
     }
 
@@ -571,15 +593,37 @@ mod tests {
     }
 
     #[test]
+    fn profiled_thumbnail_defaults_to_plain_pixels() {
+        let engine = MockEngine::new();
+        let id = engine.images()[0].id;
+        let adj = AdjustmentSet::default();
+        let plain = engine.thumbnail(id, &adj, 64).unwrap();
+        let same = engine.thumbnail_profiled(id, &adj, 64, None, None, (1.0, 0.0)).unwrap();
+        assert_eq!(plain.pixels, same.pixels);
+        let clamped = engine.thumbnail_profiled(id, &adj, 64, None, None, (2.0, -1.0)).unwrap();
+        assert_eq!(plain.pixels, clamped.pixels);
+        if crate::icc::profile("NikonZ6III-Generic").is_some() {
+            let neutral = engine.thumbnail_profiled(id, &adj, 64, None, Some("NikonZ6III-Generic"), (1.0, 0.0)).unwrap();
+            let level = engine.thumbnail_profiled(id, &adj, 64, None, Some("NikonZ6III-Generic"), (0.8, 0.1)).unwrap();
+            assert_ne!(neutral.pixels, level.pixels, "non-neutral paper levels must change a proofed thumbnail");
+        }
+        let srgb = std::path::Path::new(r"C:\Windows\System32\spool\drivers\color\sRGB Color Space Profile.icm");
+        if srgb.exists() {
+            let skipped = engine.thumbnail_profiled(id, &adj, 64, Some(srgb), None, (1.0, 0.0)).unwrap();
+            assert_eq!(plain.pixels, skipped.pixels);
+        }
+    }
+
+    #[test]
     fn start_export_rejects_an_unimplemented_format_before_queueing() {
         let engine = MockEngine::new();
         let mut recipe = crate::output::ProcessRecipe::default();
-        recipe.format = crate::output::ExportFormat::Heif;
+        recipe.format = crate::output::ExportFormat::JpegXl;
         let job = ExportJob { job_id: 9001, image: engine.images()[0].id, recipe };
 
         let err = engine.start_export(job).unwrap_err();
 
-        assert!(err.to_string().contains("HEIF"), "{err}");
+        assert!(err.to_string().contains("JPEG XL"), "{err}");
         assert!(engine.state.lock().jobs.is_empty(), "the job was queued anyway");
     }
 

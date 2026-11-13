@@ -38,7 +38,8 @@
 
 use std::collections::HashMap;
 
-use crate::adjust::{Clarity, ClarityMethod, Exposure, HighDynamicRange, WhiteBalance};
+use crate::adjust::{Clarity, ClarityMethod, Dehaze, Exposure, HighDynamicRange, WhiteBalance};
+use crate::comask::{ComaskDocument, ComaskMask};
 use crate::c1_model::{from_layer_row, gains_to_kelvin_tint, C1Brush, C1Eraser, C1EntityKind};
 use crate::layers::{
     BrushStroke, Layer, LayerKind, LocalAdjustments, Mask, MaskOp, MaskShape,
@@ -88,6 +89,10 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
                 clarity: s.clarity,
                 structure: s.clarity_structure,
             },
+            dehaze: Dehaze {
+                amount: s.dehaze_amount.clamp(0.0, 100.0),
+                shadow_tone: s.dehaze_color,
+            },
             ..Default::default()
         };
         C1MaskLayer {
@@ -112,6 +117,13 @@ pub fn mask_layers_from_rows(rows: &[HashMap<&str, Option<String>>]) -> Vec<C1Ma
 }
 
 impl C1MaskLayer {
+    /// Links this catalog row to its `.comask` metadata by UUID. Geometry is
+    /// intentionally not implied by this lookup.
+    pub fn comask_metadata<'a>(&self, document: &'a ComaskDocument) -> Option<&'a ComaskMask> {
+        let uuid = self.mask_uuid.as_deref()?;
+        document.masks.iter().find(|mask| mask.uuid.as_deref() == Some(uuid))
+    }
+
     /// Builds the render layer. The catalog stores no stroke geometry (see the
     /// module docs), so `add` and `subtract` carry the normalized points with
     /// pressure; `long_side_px` converts C1's pixel brush size to the
@@ -154,7 +166,14 @@ impl C1MaskLayer {
             kind: LayerKind::Adjustment,
             enabled: self.enabled,
             opacity: self.opacity,
-            mask: Mask { shapes, ..Default::default() },
+            mask: Mask {
+                shapes,
+                // C1 exposes no mask-edge column in ZVARIANTLAYER (the .comask
+                // sidecar is absent), so its surface-smoothness value drives the
+                // engine's edge refine; both use the same 0..=100 scale.
+                refine: self.surface_smoothness.clamp(0.0, 100.0),
+                ..Default::default()
+            },
             adjustments: self.adjustments.clone(),
         }
     }
@@ -255,6 +274,8 @@ mod tests {
                 ("ZHIGHLIGHTRECOVERY", Some("57.39")),
                 ("ZSHADOWRECOVERY", Some("6.667")),
                 ("ZCONTRAST", Some("3.768")),
+                ("ZDEHAZEAMOUNT", Some("22.5")),
+                ("ZDEHAZECOLOR", Some("0.1;0.2;0.3")),
                 ("ZWHITEBALANCE", Some("1.385986;1.000000;1.524762")),
                 ("ZSATURATION", Some("13.33")),
                 ("ZBRIGHTNESS", Some("7.536")),
@@ -266,8 +287,34 @@ mod tests {
         assert_eq!((a.clarity.clarity, a.clarity.structure), (-33.62, -34.78));
         assert_eq!((a.hdr.highlights, a.hdr.shadows), (57.39, 6.667));
         assert_eq!(a.exposure.contrast, 3.768);
+        assert_eq!(a.dehaze.amount, 22.5);
+        assert_eq!(a.dehaze.shadow_tone, [0.1, 0.2, 0.3]);
         assert!(a.white_balance.is_some(), "a non-neutral ZWHITEBALANCE must survive");
         assert_eq!((a.exposure.saturation, a.exposure.brightness), (13.33, 7.536));
+    }
+
+    #[test]
+    fn comask_metadata_matches_the_mask_uuid() {
+        let rows = [layer_row("1", "背景遮罩 1", "12.9658")];
+        let layer = mask_layer_from_row(&rows[0]).unwrap();
+        let document = ComaskDocument {
+            sections: Vec::new(),
+            masks: vec![ComaskMask {
+                index: 7,
+                uuid: Some("24391591-4129-4c9f-a9f5-bb4dd4c41289".into()),
+                mask_type: Some(3),
+                generator: None,
+                generator_options: None,
+                comp_params: vec![1.0, 0.0, 0.0],
+                linear_gradient: Some([1.0, 2.0, 3.0, 4.0, 0.5]),
+                rand_seed: None,
+                rasters: Vec::new(),
+            }],
+        };
+        let metadata = layer.comask_metadata(&document).expect("UUID match");
+        assert_eq!(metadata.index, 7);
+        assert_eq!(metadata.mask_type, Some(3));
+        assert_eq!(metadata.linear_gradient, Some([1.0, 2.0, 3.0, 4.0, 0.5]));
     }
 
     #[test]
@@ -275,5 +322,31 @@ mod tests {
         let mut m = HashMap::new();
         row(&[("Z_ENT", Some("18")), ("ZINDEX", Some("0"))], &mut m);
         assert!(mask_layer_from_row(&m).is_none());
+    }
+
+    #[test]
+    fn surface_smoothness_drives_the_mask_refine() {
+        let mut m = layer_row("0", "Mask", "100");
+        row(&[("ZSURFACESMOOTHNESSAMOUNT", Some("40"))], &mut m);
+        let layer = mask_layer_from_row(&m).unwrap().to_layer(1, 1000.0, vec![], vec![]);
+        assert_eq!(layer.mask.refine, 40.0);
+    }
+
+    #[test]
+    fn absent_columns_keep_c1_defaults() {
+        let mut m = HashMap::new();
+        row(&[("Z_ENT", Some("23")), ("ZINDEX", Some("0"))], &mut m);
+        let parsed = mask_layer_from_row(&m).unwrap();
+        let layer = parsed.to_layer(1, 1000.0, vec![], vec![]);
+        assert_eq!((layer.enabled, layer.opacity), (true, 100.0));
+        assert_eq!(layer.mask.refine, 0.0);
+        assert_eq!(
+            (parsed.brush.size, parsed.brush.hardness, parsed.brush.opacity),
+            (100.0, 80.0, 100.0)
+        );
+        assert_eq!(
+            (parsed.eraser.size, parsed.eraser.hardness, parsed.eraser.opacity),
+            (100.0, 80.0, 100.0)
+        );
     }
 }

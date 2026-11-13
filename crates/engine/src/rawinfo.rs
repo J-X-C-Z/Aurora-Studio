@@ -423,11 +423,15 @@ impl CameraDefaults {
         for (k, v) in &cam.base {
             merged.insert(k.as_str(), *v);
         }
-        let rung = match iso {
-            Some(actual) => cam.ladder.iter().filter(|(i, _)| *i <= actual).max_by_key(|(i, _)| *i),
-            None => cam.ladder.iter().min_by_key(|(i, _)| *i),
+        // Each `<ISO>` block only states what changes at that ISO (the 12800
+        // block just moves USMThreshold), so merge every rung at or below the
+        // actual ISO in order instead of taking the last block alone.
+        let mut rungs: Vec<_> = match iso {
+            Some(actual) => cam.ladder.iter().filter(|(i, _)| *i <= actual).collect(),
+            None => cam.ladder.iter().min_by_key(|(i, _)| *i).into_iter().collect(),
         };
-        if let Some((_, values)) = rung {
+        rungs.sort_by_key(|(i, _)| *i);
+        for (_, values) in rungs {
             for (k, v) in values {
                 merged.insert(k.as_str(), *v);
             }
@@ -449,12 +453,21 @@ impl CameraDefaults {
     /// whole table.
     fn resolve(&self, model: &str) -> Option<String> {
         let want = normalise(model);
-        if self.cams.contains_key(&want) {
-            return Some(want);
+        // The XML ids are C1's own spelling ("NikonZ6II", "NikonZ6III"),
+        // which is not the normalised EXIF form, so compare normalised keys and
+        // return the raw id `apply_camera` can look up.
+        let find = |candidate: &str| {
+            self.cams
+                .keys()
+                .find(|id| normalise(id) == candidate)
+                .cloned()
+        };
+        if let Some(id) = find(&want) {
+            return Some(id);
         }
         for candidate in numeral_variants(&want) {
-            if self.cams.contains_key(&candidate) {
-                return Some(candidate);
+            if let Some(id) = find(&candidate) {
+                return Some(id);
             }
         }
         None
@@ -746,6 +759,24 @@ mod tests {
         assert_eq!(o.apply(by_key("Saturation").unwrap()), (-100.0, 100.0, 0.0));
     }
 
+
+    #[test]
+    fn mixed_case_camera_ids_resolve_and_sparse_rungs_accumulate() {
+        let xml = r#"<cameraDefaults>
+  <cameraID val="BASEDEFAULT"><USMAmount_default val="160" /></cameraID>
+  <cameraID val="NikonZ 6III">
+    <USMAmount_default val="180" />
+    <ISO val="3200"><USMAmount_default val="160" /></ISO>
+    <ISO val="12800"><USMThreshold_default val="1.5" /></ISO>
+  </cameraID>
+</cameraDefaults>"#;
+        let defaults = CameraDefaults::parse(xml);
+        let at = |iso| defaults.overrides(Some("NIKON Z6_3"), Some(iso));
+        assert_eq!(at(200).apply(by_key("USMAmount").unwrap()).2, 180.0, "C1's own id spelling must resolve");
+        assert_eq!(at(5000).apply(by_key("USMAmount").unwrap()).2, 160.0);
+        assert_eq!(at(12800).apply(by_key("USMAmount").unwrap()).2, 160.0, "the 12800 rung inherits USM");
+        assert_eq!(at(12800).apply(by_key("USMThreshold").unwrap()).2, 1.5);
+    }
 
     #[test]
     fn numeral_variants_cover_the_alias_table() {

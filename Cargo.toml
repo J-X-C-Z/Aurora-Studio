@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/engine", "crates/app"]
+members = ["crates/engine", "crates/app", "crates/portrait"]
 default-members = ["crates/app"]
 resolver = "3"
 

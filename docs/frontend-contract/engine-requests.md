@@ -1,3 +1,5 @@
+> 发布快照更新（2026-11-13）：下文是上游历史请求清单。当前版本保留节点图类型与 u16 旋转；film_curves / import_style / cancel_job / source_status 已连接。PreviewRequest 新增显示/软打样参数，前端默认关闭，软打样仍标记未接通。HEIF 输出依赖可选运行库，导入仍待接线。人像库已加入，提供 portrait_capabilities / render_portrait_stage / export_portrait_stage；automatic=false，前端不得据阶段注册就开放自动效果。详细边界见 [后端更新](../backend-update-20261113.md)。
+
 # 前端 → 引擎：待办与约定（2026-11-11，2026-11-12 更新）
 
 前端（`crates/app`）这一轮把引擎已有、但界面没接上的能力接了进来。下面是需要引擎侧（Codex）处理的部分，按优先级排列。

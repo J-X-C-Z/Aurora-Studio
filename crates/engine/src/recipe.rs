@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::catalog::ImageInfo;
 use crate::icc::{self, Profile};
 use crate::output::{
-    ExportFormat, MetadataPolicy, OutputSharpening, ProcessRecipe, ScaleMode, UnsupportedFormat, Watermark,
+    ExportFormat, MetadataPolicy, OutputSharpening, OutputSharpeningSettings, ProcessRecipe, ScaleMode,
+    UnsupportedFormat, Watermark,
 };
 
 /// 8x8 bitmap font for the watermark, covering ASCII 0x20..=0x7E.
@@ -282,7 +283,7 @@ pub fn collision_free(dir: &Path, name: &str, ext: &str) -> PathBuf {
 ///
 /// Blurs luminance-preserving per channel with a separable box pass, then adds
 /// `amount * (original - blurred)`. Alpha is left alone. `amount <= 0` is a no-op.
-pub fn output_sharpen(rgba: &mut [u8], w: u32, h: u32, amount: f32, radius: f32) {
+pub fn output_sharpen(rgba: &mut [u8], w: u32, h: u32, amount: f32, radius: f32, threshold: f32) {
     let (wu, hu) = (w as usize, h as usize);
     if !(amount > 0.0) || !amount.is_finite() || wu == 0 || hu == 0 || rgba.len() < wu * hu * 4 {
         return;
@@ -323,17 +324,61 @@ pub fn output_sharpen(rgba: &mut [u8], w: u32, h: u32, amount: f32, radius: f32)
         }
     }
 
+    let threshold = if threshold.is_finite() && threshold > 0.0 { threshold } else { 0.0 };
+
     use rayon::prelude::*;
-    rgba.par_chunks_mut(wu * 4).enumerate().for_each(|(y, row)| {
+    // Only `w * h` pixels belong to this frame; a caller may hand over a larger
+    // buffer, and chunking that whole slice would make `y` exceed `h`.
+    rgba[..wu * hu * 4].par_chunks_mut(wu * 4).enumerate().for_each(|(y, row)| {
         for x in 0..wu {
             for c in 0..3 {
                 let i = x * 4 + c;
                 let orig = row[i] as f32;
                 let blurred = blur[(y * wu + x) * 3 + c] as f32;
-                row[i] = (orig + amount * (orig - blurred)).round().clamp(0.0, 255.0) as u8;
+                let detail = orig - blurred;
+                if detail.abs() <= threshold {
+                    continue;
+                }
+                row[i] = (orig + amount * detail).round().clamp(0.0, 255.0) as u8;
             }
         }
     });
+}
+
+/// Reads `SharpeningOutput*` from a Capture One recipe XML.
+///
+/// Unknown properties are ignored; missing fields are conservative zeroes.
+pub fn parse_output_sharpening_xml(text: &str) -> OutputSharpeningSettings {
+    let mut out = OutputSharpeningSettings::default();
+    for (key, value) in crate::presets::parse_sl(text) {
+        if !key.starts_with("SharpeningOutput") {
+            continue;
+        }
+        let suffix = &key["SharpeningOutput".len()..];
+        match suffix {
+            "Amount" => out.amount = value.trim().parse().unwrap_or(0.0),
+            "Radius" => out.radius = value.trim().parse().unwrap_or(0.0),
+            "Threshold" => out.threshold = value.trim().parse().unwrap_or(0.0),
+            "Control" => out.control = value.trim().parse().unwrap_or(0),
+            "Method" => out.method = value.trim().parse().unwrap_or(0),
+            "ViewingDistance" => out.viewing_distance = value.trim().parse().unwrap_or(0),
+            "ViewingDistanceUnit" => out.viewing_distance_unit = value.trim().parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Reads one Capture One recipe XML and keeps only the output-sharpening fields.
+///
+/// The returned recipe is synthetic and UI-only until imported into app state.
+pub fn recipe_from_output_sharpening_xml(text: &str) -> ProcessRecipe {
+    let settings = parse_output_sharpening_xml(text);
+    let has_settings = text.contains("SharpeningOutput");
+    ProcessRecipe {
+        output_sharpening_settings: has_settings.then_some(settings),
+        ..ProcessRecipe::default()
+    }
 }
 
 /// Rough output size in bytes for queue progress and volume warnings.
@@ -473,6 +518,7 @@ struct TiffEntry {
     value: Vec<u8>,
 }
 
+const TIFF_BYTE: u16 = 1;
 const TIFF_ASCII: u16 = 2;
 const TIFF_SHORT: u16 = 3;
 const TIFF_LONG: u16 = 4;
@@ -681,6 +727,267 @@ fn tiff_block(mut ifd0: Vec<TiffEntry>, exif_ifd: Vec<TiffEntry>, gps_ifd: Vec<T
 ///
 /// `Exif` copies the source segment instead, so it never reaches here. Each
 /// group replaces the whole block: what it does not name is not written.
+/// Offset of the first IFD in a TIFF header.
+fn tiff_ifd_at(tiff: &[u8]) -> Option<usize> {
+    let b = tiff.get(4..8)?;
+    Some(if tiff.starts_with(b"II") {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else if tiff.starts_with(b"MM") {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        return None;
+    } as usize)
+}
+
+fn ifd_entries(exif: &[u8], ifd: usize) -> Vec<(u16, u16, u32, Vec<u8>)> {
+    let le = exif.starts_with(b"II");
+    let r16 = |at: usize| -> Option<u16> {
+        let s = exif.get(at..at + 2)?;
+        Some(if le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
+    };
+    let r32 = |at: usize| -> Option<u32> {
+        let s = exif.get(at..at + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+    let Some(count) = r16(ifd) else { return Vec::new() };
+    let mut out = Vec::new();
+    for i in 0..count as usize {
+        let at = ifd + 2 + i * 12;
+        let (Some(tag), Some(typ), Some(count)) = (r16(at), r16(at + 2), r32(at + 4)) else { continue };
+        let unit = match typ {
+            TIFF_BYTE => 1,
+            TIFF_ASCII => 1,
+            TIFF_SHORT => 2,
+            TIFF_LONG => 4,
+            TIFF_RATIONAL => 8,
+            _ => continue,
+        };
+        let size = count as usize * unit;
+        let value = if size <= 4 {
+            exif.get(at + 8..at + 8 + size).map(<[u8]>::to_vec)
+        } else {
+            r32(at + 8).and_then(|off| exif.get(off as usize..off as usize + size)).map(<[u8]>::to_vec)
+        };
+        let Some(value) = value else { continue };
+        out.push((tag, typ, count, value));
+    }
+    out
+}
+
+/// IFD0 entries of an EXIF block, values resolved to raw bytes. Sub-IFD
+/// pointers are dropped: their targets would not survive the move into another
+/// file.
+fn ifd0_entries(exif: &[u8]) -> Vec<(u16, u16, u32, Vec<u8>)> {
+    let Some(ifd) = tiff_ifd_at(exif) else { return Vec::new() };
+    ifd_entries(exif, ifd)
+        .into_iter()
+        .filter(|(tag, ..)| !matches!(*tag, 0x8769 | 0x8825))
+        .collect()
+}
+
+/// The Exif sub-IFD an EXIF block points at (tag 0x8769), resolved to bytes.
+fn exif_ifd_entries(exif: &[u8]) -> Vec<(u16, u16, u32, Vec<u8>)> {
+    let Some(ifd0) = tiff_ifd_at(exif) else { return Vec::new() };
+    let Some((_, _, _, value)) = ifd_entries(exif, ifd0).into_iter().find(|e| e.0 == 0x8769) else {
+        return Vec::new();
+    };
+    let Some(b) = value.get(..4) else { return Vec::new() };
+    let at = if exif.starts_with(b"II") {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    } as usize;
+    ifd_entries(exif, at)
+}
+
+/// The GPS sub-IFD an EXIF block points at (tag 0x8825), resolved to bytes.
+fn gps_ifd_entries(exif: &[u8]) -> Vec<(u16, u16, u32, Vec<u8>)> {
+    let Some(ifd0) = tiff_ifd_at(exif) else { return Vec::new() };
+    let Some((_, _, _, value)) = ifd_entries(exif, ifd0).into_iter().find(|e| e.0 == 0x8825) else {
+        return Vec::new();
+    };
+    let Some(b) = value.get(..4) else { return Vec::new() };
+    let at = if exif.starts_with(b"II") {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    } as usize;
+    ifd_entries(exif, at)
+}
+
+/// One 12-byte IFD entry, valid only when `value` matches the type and count.
+fn make_entry(tag: u16, typ: u16, count: u32, value: &[u8], le: bool) -> Option<[u8; 12]> {
+    let unit = match typ {
+        TIFF_BYTE => 1,
+        TIFF_ASCII => 1,
+        TIFF_SHORT => 2,
+        TIFF_LONG => 4,
+        TIFF_RATIONAL => 8,
+        _ => return None,
+    };
+    if value.len() != count as usize * unit {
+        return None;
+    }
+    let mut entry = [0u8; 12];
+    let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    entry[0..2].copy_from_slice(&u16b(tag));
+    entry[2..4].copy_from_slice(&u16b(typ));
+    entry[4..8].copy_from_slice(&u32b(count));
+    if value.len() <= 4 {
+        entry[8..8 + value.len()].copy_from_slice(value);
+    }
+    Some(entry)
+}
+
+/// Serialises one IFD that starts at `ifd_at`: its header, its entries and its
+/// out-of-line values, with every value offset made absolute.
+fn pack_ifd(
+    fields: &[(u16, u16, u32, Vec<u8>)],
+    ifd_at: usize,
+    le: bool,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let mut entries: Vec<(u16, [u8; 12])> = Vec::with_capacity(fields.len());
+    for (tag, typ, count, value) in fields {
+        entries.push((*tag, make_entry(*tag, *typ, *count, value, le)?));
+    }
+    entries.sort_by_key(|(tag, _)| *tag);
+    let data_at = ifd_at + 2 + entries.len() * 12 + 4;
+    let mut data: Vec<u8> = Vec::new();
+    for (tag, entry) in entries.iter_mut() {
+        let value = fields.iter().find(|(t, ..)| t == tag)?.3.clone();
+        if value.len() <= 4 {
+            continue;
+        }
+        entry[8..12].copy_from_slice(&u32b((data_at + data.len()) as u32));
+        data.extend_from_slice(&value);
+        if data.len() % 2 == 1 {
+            data.push(0);
+        }
+    }
+    let mut blob = u16b(entries.len() as u16).to_vec();
+    for (_, entry) in &entries {
+        blob.extend_from_slice(entry);
+    }
+    blob.extend_from_slice(&u32b(0));
+    Some((blob, data))
+}
+
+/// Rewrites the encoder's last IFD with `extra` tags appended and `exif_ifd`
+/// / `gps_ifd` as its Exif and GPS sub-IFDs. The image crate's `TiffEncoder`
+/// has no metadata API, but its output keeps the IFD at the end, so a new IFD
+/// can point at the untouched pixel data. `None` when the layout is not the
+/// one it writes.
+fn tiff_add_tags(
+    tiff: &[u8],
+    extra: &[(u16, u16, u32, Vec<u8>)],
+    exif_ifd: &[(u16, u16, u32, Vec<u8>)],
+    gps_ifd: &[(u16, u16, u32, Vec<u8>)],
+) -> Option<Vec<u8>> {
+    let le = match tiff.get(..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+    let r16 = |b: &[u8], at: usize| -> Option<u16> {
+        let s = b.get(at..at + 2)?;
+        Some(if le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
+    };
+    let r32 = |b: &[u8], at: usize| -> Option<u32> {
+        let s = b.get(at..at + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+    let ifd = r32(tiff, 4)? as usize;
+    let old_count = r16(tiff, ifd)? as usize;
+    let mut entries: Vec<(u16, [u8; 12])> = Vec::with_capacity(old_count);
+    for i in 0..old_count {
+        let at = ifd + 2 + i * 12;
+        let mut entry = [0u8; 12];
+        entry.copy_from_slice(tiff.get(at..at + 12)?);
+        entries.push((r16(tiff, at)?, entry));
+    }
+    let mut added: Vec<u16> = Vec::new();
+    let mut added_values: Vec<(u16, Vec<u8>)> = Vec::new();
+    for (tag, typ, count, value) in extra {
+        if entries.iter().any(|(existing, _)| existing == tag) {
+            continue;
+        }
+        entries.push((*tag, make_entry(*tag, *typ, *count, value, le)?));
+        added.push(*tag);
+        added_values.push((*tag, value.clone()));
+    }
+    if !exif_ifd.is_empty() && !entries.iter().any(|(tag, _)| *tag == 0x8769) {
+        entries.push((0x8769, make_entry(0x8769, TIFF_LONG, 1, &[0; 4], le)?));
+    }
+    if !gps_ifd.is_empty() && !entries.iter().any(|(tag, _)| *tag == 0x8825) {
+        entries.push((0x8825, make_entry(0x8825, TIFF_LONG, 1, &[0; 4], le)?));
+    }
+    entries.sort_by_key(|(tag, _)| *tag);
+    let mut out = tiff.to_vec();
+    if out.len() % 2 == 1 {
+        out.push(0);
+    }
+    let new_ifd = out.len();
+    let count = entries.len();
+    let data_at = new_ifd + 2 + count * 12 + 4;
+    let mut data: Vec<u8> = Vec::new();
+    for (tag, entry) in entries.iter_mut() {
+        if *tag == 0x8769 || *tag == 0x8825 {
+            continue;
+        }
+        if !added.contains(tag) {
+            continue;
+        }
+        let value = added_values.iter().find(|(t, _)| t == tag)?.1.clone();
+        if value.len() <= 4 {
+            continue;
+        }
+        entry[8..12].copy_from_slice(&u32b((data_at + data.len()) as u32));
+        data.extend_from_slice(&value);
+        if data.len() % 2 == 1 {
+            data.push(0);
+        }
+    }
+    let exif_at = data_at + data.len();
+    let (exif_blob, exif_data) =
+        if exif_ifd.is_empty() { (Vec::new(), Vec::new()) } else { pack_ifd(exif_ifd, exif_at, le)? };
+    let gps_at = exif_at + exif_blob.len() + exif_data.len();
+    let (gps_blob, gps_data) =
+        if gps_ifd.is_empty() { (Vec::new(), Vec::new()) } else { pack_ifd(gps_ifd, gps_at, le)? };
+    for (tag, entry) in entries.iter_mut() {
+        if *tag == 0x8769 {
+            entry[8..12].copy_from_slice(&u32b(exif_at as u32));
+        }
+        if *tag == 0x8825 {
+            entry[8..12].copy_from_slice(&u32b(gps_at as u32));
+        }
+    }
+    out[4..8].copy_from_slice(&u32b(new_ifd as u32));
+    out.extend_from_slice(&u16b(count as u16));
+    for (_, entry) in &entries {
+        out.extend_from_slice(entry);
+    }
+    out.extend_from_slice(&u32b(0));
+    out.extend_from_slice(&data);
+    out.extend_from_slice(&exif_blob);
+    out.extend_from_slice(&exif_data);
+    out.extend_from_slice(&gps_blob);
+    out.extend_from_slice(&gps_data);
+    Some(out)
+}
+
 fn policy_exif(info: &ImageInfo, policy: MetadataPolicy) -> Option<Vec<u8>> {
     match policy {
         MetadataPolicy::Copyright => {
@@ -771,10 +1078,10 @@ fn gps_parts(value: f64, positive: &'static str, negative: &'static str) -> (&'s
 
 // --------------------------------------------------------------- watermark
 
-/// Draws the watermark text in the bottom-right corner.
+/// Draws the watermark text at `Watermark::position`.
 ///
-/// The only positions implemented are the bottom-right corner; the recipe's
-/// `position` field is ignored. `opacity` is a percentage, `scale` a pixel
+/// `position` is a normalized anchor for the centre of the text, clamped so
+/// the block stays inside the frame. `opacity` is a percentage, `scale` a pixel
 /// multiple of the 8x8 cell.
 pub fn draw_watermark(rgba: &mut [u8], w: u32, h: u32, mark: &Watermark) {
     if mark.text.is_empty() || mark.opacity <= 0.0 {
@@ -793,8 +1100,12 @@ pub fn draw_watermark(rgba: &mut [u8], w: u32, h: u32, mark: &Watermark) {
     if text_w + margin * 2 > w || cell + margin * 2 > h {
         return;
     }
-    let x0 = w - margin - text_w;
-    let y0 = h - margin - cell;
+    let anchor_x = if mark.position[0].is_finite() { mark.position[0].clamp(0.0, 1.0) } else { 0.95 };
+    let anchor_y = if mark.position[1].is_finite() { mark.position[1].clamp(0.0, 1.0) } else { 0.95 };
+    let x0 = (anchor_x * w as f32 - text_w as f32 / 2.0).round() as u32;
+    let y0 = (anchor_y * h as f32 - cell as f32 / 2.0).round() as u32;
+    let x0 = x0.clamp(margin, w - margin - text_w);
+    let y0 = y0.clamp(margin, h - margin - cell);
     for (index, ch) in chars.iter().enumerate() {
         let code = if ch.is_ascii() { *ch as usize } else { '?' as usize };
         let Some(glyph) = FONT8X8.get(code.saturating_sub(0x20)) else { continue };
@@ -923,15 +1234,18 @@ fn write_export_pixels(
         rgba
     };
     let develop8 = wide.is_some().then(|| rgba.clone());
-    // The recipe only carries C1's Screen/Print choice, no amount or radius, so
-    // these two thresholds are a guess at what those presets mean; they have
-    // not been cross-checked against Capture One.
     let amount = match recipe.output_sharpening {
         OutputSharpening::Disabled => 0.0,
         OutputSharpening::Screen => 0.6,
         OutputSharpening::Print => 1.0,
     };
-    output_sharpen(&mut rgba, tw, th, amount, 1.0);
+    if let Some(settings) = recipe.output_sharpening_settings {
+        output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
+    } else {
+        output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0);
+    }
+    // shortcut: Control/Method/viewing distance are saved but not applied; C1
+    // semantics are unproven, revisit with real output pairs.
 
     // The rendered buffer is gamma-encoded sRGB. Converting it into the
     // recipe's profile is what makes the profile take effect.
@@ -969,10 +1283,36 @@ fn write_export_pixels(
     };
     let xmp_packet = policy_xmp(info, recipe.include_metadata);
 
-    let (mut bytes, extension) =
-        encode(&rgba, wide.as_deref(), tw, th, recipe, icc_bytes.as_deref(), exif_bytes.as_deref())?;
+    let (mut bytes, extension) = encode(
+        &rgba,
+        wide.as_deref(),
+        tw,
+        th,
+        recipe,
+        icc_bytes.as_deref(),
+        exif_bytes.as_deref(),
+        xmp_packet.as_deref().map(str::as_bytes),
+    )?;
+    // `image`'s TIFF encoder has no metadata API, so the EXIF tags go in by
+    // rewriting its last IFD. Sub-IFDs (Exif, GPS) are not carried over.
+    if extension == "tif" {
+        let mut tags = exif_bytes.as_deref().map(ifd0_entries).unwrap_or_default();
+        if let Some(packet) = xmp_packet.as_deref() {
+            tags.push((700, TIFF_BYTE, packet.len() as u32, packet.as_bytes().to_vec()));
+        }
+        let exif_ifd = exif_bytes.as_deref().map(exif_ifd_entries).unwrap_or_default();
+        let gps_ifd = exif_bytes.as_deref().map(gps_ifd_entries).unwrap_or_default();
+        if !tags.is_empty() || !exif_ifd.is_empty() || !gps_ifd.is_empty() {
+            match tiff_add_tags(&bytes, &tags, &exif_ifd, &gps_ifd) {
+                Some(tagged) => bytes = tagged,
+                None => log::warn!("export: could not add the EXIF tags to the TIFF"),
+            }
+        }
+    }
     if let Some(packet) = xmp_packet {
-        embed_xmp(&mut bytes, packet.as_bytes());
+        if extension != "tif" && extension != "heic" {
+            embed_xmp(&mut bytes, packet.as_bytes());
+        }
     }
     let path = collision_free(dir, &output_name(recipe, info, index), extension);
     let estimate = estimate_bytes(tw, th, recipe.format).max(1);
@@ -989,8 +1329,9 @@ fn write_export_pixels(
 
 /// Encodes `rgba` in the recipe's format and returns the bytes and extension.
 ///
-/// JpegXl, Heif, Dng and Psd have no encoder in the `image` crate and fail with
-/// [`UnsupportedFormat`] rather than falling back to JPEG.
+/// JpegXl, Dng and Psd have no encoder in the `image` crate and fail with
+/// [`UnsupportedFormat`] rather than falling back to JPEG. Heif uses the
+/// runtime libheif encoder when it is installed.
 fn encode(
     rgba: &[u8],
     wide: Option<&[u16]>,
@@ -999,6 +1340,7 @@ fn encode(
     recipe: &ProcessRecipe,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    xmp: Option<&[u8]>,
 ) -> anyhow::Result<(Vec<u8>, &'static str)> {
     use image::ImageEncoder as _;
 
@@ -1028,7 +1370,11 @@ fn encode(
                 return Ok((out.into_inner(), "png"));
             }
             ExportFormat::Tiff => {
-                image::codecs::tiff::TiffEncoder::new(&mut out).write_image(&bytes, w, h, wide_color)?;
+                let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+                if let Some(icc) = icc {
+                    encoder.set_icc_profile(icc.to_vec())?;
+                }
+                encoder.write_image(&bytes, w, h, wide_color)?;
                 return Ok((out.into_inner(), "tif"));
             }
             other => anyhow::bail!(
@@ -1052,7 +1398,11 @@ fn encode(
             Ok((out.into_inner(), "png"))
         }
         ExportFormat::Tiff => {
-            image::codecs::tiff::TiffEncoder::new(&mut out).write_image(rgba, w, h, color)?;
+            let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+            if let Some(icc) = icc {
+                encoder.set_icc_profile(icc.to_vec())?;
+            }
+            encoder.write_image(rgba, w, h, color)?;
             Ok((out.into_inner(), "tif"))
         }
         ExportFormat::WebP => {
@@ -1089,6 +1439,10 @@ fn encode(
             }
             Ok((out.into_inner(), "jpg"))
         }
+        ExportFormat::Heif => Ok((
+            crate::heif_write::encode_to_vec(rgba, w, h, quality, icc, exif, xmp)?,
+            "heic",
+        )),
         other => Err(UnsupportedFormat { format: other }.into()),
     }
 }
@@ -1176,11 +1530,40 @@ mod tests {
             variant: 2,
             has_adjustments: false,
             trashed: false,
+            heif: None,
         }
     }
 
     fn recipe(scale: ScaleMode, value: (u32, u32)) -> ProcessRecipe {
         ProcessRecipe { scale, scale_value: value, ..ProcessRecipe::default() }
+    }
+
+
+    #[test]
+    fn missing_or_bad_output_sharpening_fields_fall_back_conservatively() {
+        let recipe = recipe_from_output_sharpening_xml("<OR><E K=\"Name\" V=\"x\" /></OR>");
+        assert_eq!(recipe.output_sharpening_settings, None);
+        assert_eq!(recipe.output_sharpening, OutputSharpening::Disabled);
+
+        let recipe = recipe_from_output_sharpening_xml(
+            r#"<OR><E K="SharpeningOutputAmount" V="not-a-number" /><E K="SharpeningOutputRadius" V="NaN" /></OR>"#,
+        );
+        let settings = recipe.output_sharpening_settings.unwrap();
+        assert_eq!(settings.amount, 0.0);
+        assert!(settings.radius.is_nan(), "invalid XML passes through for diagnostics");
+        assert_eq!(settings.threshold, 0.0);
+    }
+
+    #[test]
+    fn partial_settings_survive_json_round_trip() {
+        let json = r#"{"output_sharpening":"Screen","output_sharpening_settings":{"amount":80.0}}"#;
+        let recipe: ProcessRecipe = serde_json::from_str(json).unwrap();
+        assert_eq!(recipe.output_sharpening, OutputSharpening::Screen);
+        assert_eq!(recipe.output_sharpening_settings.as_ref().unwrap().amount, 80.0);
+        assert_eq!(recipe.output_sharpening_settings.as_ref().unwrap().radius, 0.0);
+
+        let old: ProcessRecipe = serde_json::from_str(r#"{"output_sharpening":"Screen"}"#).unwrap();
+        assert_eq!(old.output_sharpening_settings, None);
     }
 
     #[test]
@@ -1258,7 +1641,7 @@ mod tests {
     fn sharpen_zero_is_byte_identical() {
         let mut px: Vec<u8> = (0..16 * 16 * 4).map(|i| (i * 7 % 256) as u8).collect();
         let before = px.clone();
-        output_sharpen(&mut px, 16, 16, 0.0, 2.0);
+        output_sharpen(&mut px, 16, 16, 0.0, 2.0, 0.0);
         assert_eq!(px, before);
     }
 
@@ -1275,7 +1658,7 @@ mod tests {
             }
         }
         let before = px.clone();
-        output_sharpen(&mut px, w, h, 1.0, 2.0);
+        output_sharpen(&mut px, w, h, 1.0, 2.0, 0.0);
         for i in (3..px.len()).step_by(4) {
             assert_eq!(px[i], 255);
         }
@@ -1283,6 +1666,16 @@ mod tests {
         assert!(px[edge - 4] < before[edge - 4], "left of edge should darken");
         assert!(px[edge] > before[edge], "right of edge should brighten");
         assert_eq!(px[0], before[0], "flat area away from the edge is untouched");
+    }
+
+    #[test]
+    fn sharpen_threshold_skips_small_detail() {
+        let mut px = vec![0u8; 16 * 4];
+        px[0] = 100;
+        px[4] = 130;
+        let before = px.clone();
+        output_sharpen(&mut px, 4, 1, 1.0, 1.0, 100.0);
+        assert_eq!(px, before);
     }
 
     #[test]
@@ -1342,8 +1735,52 @@ mod tests {
     }
 
     #[test]
+    fn settings_amount_zero_is_byte_identical_and_amount_eighty_changes_pixels() {
+        let mut zero = recipe(ScaleMode::Fixed100, (0, 0));
+        zero.format = ExportFormat::Png;
+        zero.output_sharpening_settings = Some(OutputSharpeningSettings { amount: 0.0, radius: 0.6, ..Default::default() });
+        let mut eighty = zero.clone();
+        eighty.output_sharpening_settings.as_mut().unwrap().amount = 80.0;
+        let px: Vec<u8> = (0..16 * 16 * 4).map(|i| (i * 23 % 256) as u8).collect();
+
+        let dir = temp_dir("sharp-zero");
+        let path = write_export(&dir, &info(), &zero, 0, px.clone(), 16, 16, |_| {}).unwrap();
+        let unchanged = image::open(&path).unwrap().to_rgba8().into_raw();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = temp_dir("sharp-eighty");
+        let path = write_export(&dir, &info(), &eighty, 0, px.clone(), 16, 16, |_| {}).unwrap();
+        let sharpened = image::open(&path).unwrap().to_rgba8().into_raw();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(unchanged, px);
+        assert_ne!(unchanged, sharpened);
+    }
+
+    #[test]
+    fn radius_and_threshold_change_the_output() {
+        let make = |radius: f32, threshold: f32| {
+            let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+            r.format = ExportFormat::Png;
+            r.output_sharpening_settings =
+                Some(OutputSharpeningSettings { amount: 80.0, radius, threshold, ..Default::default() });
+            r
+        };
+        let px: Vec<u8> = (0..32 * 32 * 4).map(|i| ((i / 4) * 13 % 256) as u8).collect();
+        let mut outputs = Vec::new();
+        for (radius, threshold) in [(0.6, 0.0), (3.0, 0.0), (0.6, 100.0)] {
+            let dir = temp_dir("sharp-variant");
+            let path = write_export(&dir, &info(), &make(radius, threshold), 0, px.clone(), 32, 32, |_| {}).unwrap();
+            outputs.push(image::open(&path).unwrap().to_rgba8().into_raw());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        assert_ne!(outputs[0], outputs[1]);
+        assert_ne!(outputs[0], outputs[2]);
+    }
+
+    #[test]
     fn unsupported_formats_fail_and_write_nothing() {
-        for format in [ExportFormat::JpegXl, ExportFormat::Heif, ExportFormat::Dng, ExportFormat::Psd] {
+        for format in [ExportFormat::JpegXl, ExportFormat::Dng, ExportFormat::Psd] {
             let base = temp_dir("unsupported");
             let dir = base.join("out");
             let mut r = recipe(ScaleMode::Fixed100, (0, 0));
@@ -1360,9 +1797,9 @@ mod tests {
 
     #[test]
     fn the_export_error_carries_the_format() {
-        let err = ExportFormat::Heif.ensure_supported().unwrap_err();
+        let err = ExportFormat::Dng.ensure_supported().unwrap_err();
         let unsupported = err.downcast_ref::<UnsupportedFormat>().expect("structured format error");
-        assert_eq!(unsupported.format, ExportFormat::Heif);
+        assert_eq!(unsupported.format, ExportFormat::Dng);
     }
 
     #[test]
@@ -1384,14 +1821,9 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_lists_exactly_the_four_encoders() {
+    fn is_supported_matches_runtime_encoders() {
         for format in ExportFormat::ALL {
-            let expected = matches!(
-                format,
-                ExportFormat::Jpeg | ExportFormat::Png | ExportFormat::Tiff | ExportFormat::WebP
-            );
-            assert_eq!(format.is_supported(), expected, "{format:?}");
-            assert_eq!(format.ensure_supported().is_ok(), expected, "{format:?}");
+            assert_eq!(format.ensure_supported().is_ok(), format.is_supported(), "{format:?}");
         }
     }
 
@@ -1442,6 +1874,187 @@ mod tests {
         let path = write_export(&dir, &info(), &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
         let bytes = std::fs::read(path).unwrap();
         assert!(find(&bytes, b"ICC_PROFILE\0").is_some(), "the profile must be embedded");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_exported_icc_bytes_match_the_source_profile() {
+        let Some(target) = resolve_profile("sRGB IEC61966-2.1") else { return };
+        let source = std::fs::read(&target.path).unwrap();
+        let dir = temp_dir("icc-bytes");
+        for format in [ExportFormat::Jpeg, ExportFormat::Tiff] {
+            let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+            r.icc_profile = "sRGB IEC61966-2.1".into();
+            r.format = format;
+            let path =
+                write_export(&dir, &info(), &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+            let back = crate::file_engine::embedded_icc(&path).expect("ICC must read back");
+            assert_eq!(back, source, "{format:?}: ICC bytes must survive verbatim");
+            assert!(
+                !crate::icc::parse_icc(&back).unwrap().description.is_empty(),
+                "{format:?}: the description must still parse"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_16_bit_tiff_export_keeps_the_icc_bytes() {
+        let Some(target) = resolve_profile("sRGB IEC61966-2.1") else { return };
+        let source = std::fs::read(&target.path).unwrap();
+        let dir = temp_dir("icc-bytes16");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.icc_profile = "sRGB IEC61966-2.1".into();
+        r.format = ExportFormat::Tiff;
+        r.bit_depth = 16;
+        let path =
+            write_export16(&dir, &info(), &r, 0, vec![40000u16; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_ICC_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let back = crate::file_engine::embedded_icc(&path).expect("ICC must read back");
+        assert_eq!(back, source, "16-bit TIFF: ICC bytes must survive verbatim");
+        assert!(!crate::icc::parse_icc(&back).unwrap().description.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn camera_make_and_model_are_written_into_a_tiff() {
+        let dir = temp_dir("tiff-meta");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Tiff;
+        r.include_metadata = MetadataPolicy::Camera;
+        let mut info = info();
+        info.exif.camera_make = Some("Lumen".into());
+        info.exif.camera_model = Some("Synthetic One".into());
+        info.exif.lens = Some("Lumen 50mm".into());
+        info.exif.iso = Some(400);
+        let path = write_export(&dir, &info, &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_TIFF_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(find(&bytes, b"Lumen\0").is_some(), "make must be in the TIFF");
+        assert!(find(&bytes, b"Synthetic One\0").is_some(), "model must be in the TIFF");
+        assert!(find(&bytes, b"Lumen 50mm\0").is_some(), "lens must be in the Exif sub-IFD");
+
+        assert!(image::open(&path).is_ok(), "the rewritten TIFF must still decode");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gps_is_written_into_a_tiff() {
+        let dir = temp_dir("tiff-gps");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Tiff;
+        r.include_metadata = MetadataPolicy::Gps;
+        let mut info = info();
+        info.exif.gps = Some((31.2304, 121.4737));
+        let path = write_export(&dir, &info, &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_TIFF_GPS_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let gps = gps_ifd_entries(&bytes);
+        assert!(gps.iter().any(|(tag, ..)| *tag == 1), "GPSLatitudeRef must be in the GPS IFD");
+        assert!(gps.iter().any(|(tag, ..)| *tag == 2), "GPSLatitude must be in the GPS IFD");
+        assert!(image::open(&path).is_ok(), "the rewritten TIFF must still decode");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_16_bit_tiff_carries_the_metadata_and_icc() {
+        let Some(target) = resolve_profile("sRGB IEC61966-2.1") else { return };
+        let source = std::fs::read(&target.path).unwrap();
+        let dir = temp_dir("tiff16-meta");
+
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Tiff;
+        r.bit_depth = 16;
+        r.icc_profile = "sRGB IEC61966-2.1".into();
+        r.include_metadata = MetadataPolicy::Camera;
+        let mut sample = info();
+        sample.exif.camera_make = Some("Lumen".into());
+        sample.exif.camera_model = Some("Synthetic One".into());
+        sample.exif.lens = Some("Lumen 50mm".into());
+        sample.exif.iso = Some(400);
+        let path =
+            write_export16(&dir, &sample, &r, 0, vec![40000u16; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_TIFF16_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::file_engine::embedded_icc(&path).unwrap(),
+            source,
+            "16-bit TIFF must keep the ICC bytes"
+        );
+        let ifd0 = ifd_entries(&bytes, tiff_ifd_at(&bytes).unwrap());
+        assert!(
+            ifd0.iter().any(|(tag, .., value)| *tag == 0x010F && find(value, b"Lumen").is_some()),
+            "Make must be in the 16-bit IFD0"
+        );
+        assert!(ifd0.iter().any(|(tag, ..)| *tag == 0x0110), "Model must be in the 16-bit IFD0");
+        let sub = exif_ifd_entries(&bytes);
+        assert!(sub.iter().any(|(tag, ..)| *tag == 0xA434), "LensModel must be in the Exif IFD");
+        assert!(sub.iter().any(|(tag, ..)| *tag == 0x8827), "ISO must be in the Exif IFD");
+        assert_eq!(
+            image::open(&path).unwrap().to_rgba16().as_raw()[0],
+            40000,
+            "the tags must not disturb the 16-bit samples"
+        );
+
+        let mut xmp = r.clone();
+        xmp.include_metadata = MetadataPolicy::Keywords;
+        let mut tagged = info();
+        tagged.keywords = vec!["synthetic".into()];
+        let path =
+            write_export16(&dir, &tagged, &xmp, 0, vec![40000u16; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_TIFF16_XMP_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let packet = ifd_entries(&bytes, tiff_ifd_at(&bytes).unwrap())
+            .into_iter()
+            .find(|entry| entry.0 == 700)
+            .expect("XMP must be in tag 700");
+        assert!(find(&packet.3, b"dc:subject").is_some(), "16-bit TIFF must carry the keywords XMP");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xmp_is_written_into_a_tiff() {
+        let dir = temp_dir("tiff-xmp");
+        let mut keywords = recipe(ScaleMode::Fixed100, (0, 0));
+        keywords.format = ExportFormat::Tiff;
+        keywords.include_metadata = MetadataPolicy::Keywords;
+        let mut sample = info();
+        sample.keywords = vec!["synthetic".into()];
+        let path =
+            write_export(&dir, &sample, &keywords, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_TIFF_XMP_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let read_packet = |bytes: &[u8]| {
+            let ifd = tiff_ifd_at(bytes).unwrap();
+            ifd_entries(bytes, ifd).into_iter().find(|entry| entry.0 == 700).map(|entry| entry.3)
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let packet = read_packet(&bytes).expect("XMP must be in tag 700");
+        assert!(find(&packet, b"dc:subject").is_some(), "the keywords packet must name dc:subject");
+        assert!(image::open(&path).is_ok(), "the rewritten TIFF must still decode");
+
+        let mut rated = recipe(ScaleMode::Fixed100, (0, 0));
+        rated.format = ExportFormat::Tiff;
+        rated.include_metadata = MetadataPolicy::RatingAndTag;
+        let plain = info();
+        let path =
+            write_export(&dir, &plain, &rated, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        if let Ok(copy) = std::env::var("LUMEN_TIFF_RATING_ARTIFACT") {
+            let _ = std::fs::copy(&path, copy);
+        }
+        let packet = read_packet(&std::fs::read(&path).unwrap()).expect("rating XMP must be in tag 700");
+        assert!(find(&packet, b"xmp:Rating").is_some(), "the rating packet must name xmp:Rating");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2031,6 +2644,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `position` is a normalized centre anchor; it must actually move the text.
+    #[test]
+    fn the_watermark_follows_its_position() {
+        let dir = temp_dir("watermark-pos");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Png;
+        r.watermark = Some(Watermark {
+            text: "W".into(),
+            opacity: 100.0,
+            scale: 1.0,
+            position: [0.1, 0.1],
+        });
+        let path = write_export(&dir, &info(), &r, 0, vec![0u8; 32 * 32 * 4], 32, 32, |_| {}).unwrap();
+        let img = image::open(path).unwrap().to_rgba8();
+        let top_left = (0..16).any(|y| (0..16).any(|x| img.get_pixel(x, y).0[0] > 200));
+        let bottom_right = (16..32).any(|y| (16..32).any(|x| img.get_pixel(x, y).0[0] > 200));
+        assert!(top_left, "position [0.1, 0.1] must draw near the top-left");
+        assert!(!bottom_right, "nothing must be drawn in the opposite corner");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn rating_and_tag_write_an_xmp_itxt_chunk_in_png() {
         let dir = temp_dir("meta-rating-png");
@@ -2237,4 +2871,7 @@ mod tests {
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
+
+    #[cfg(feature = "external-fixtures")]
+    include!("../local-fixtures/recipe-tests.rs");
 }

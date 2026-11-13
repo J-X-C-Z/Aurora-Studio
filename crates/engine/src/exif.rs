@@ -17,6 +17,19 @@ pub fn read_exif(path: &std::path::Path) -> crate::Exif {
 /// Read EXIF and IPTC together, one pass over the file head.
 pub fn read_metadata(path: &std::path::Path) -> (Exif, Iptc) {
     use std::io::Read;
+    // HEIF keeps EXIF in a metadata item, not in an APP1/eXIf block; the
+    // container bytes themselves have no TIFF header to scan.
+    if matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("heic" | "heif")
+    ) {
+        if let Some(tiff) = crate::heif::read_exif(path) {
+            return (parse_exif(&tiff), Iptc::default());
+        }
+    }
     let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let Ok(mut file) = std::fs::File::open(path) else { return (Exif::default(), Iptc::default()) };
     let mut head = Vec::with_capacity(len.min(HEAD_BYTES) as usize);
@@ -443,6 +456,47 @@ mod tests {
         path
     }
 
+
+
+
+
+
+    #[test]
+    fn heif_exif_is_read_through_libheif() {
+        if !crate::heif_write::available() {
+            return;
+        }
+        let mut text = b"LumenCam".to_vec();
+        text.push(0);
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x010Fu16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&text);
+
+        let path =
+            std::env::temp_dir().join(format!("lumen-exif-heif-{}.heic", std::process::id()));
+        crate::heif_write::encode(
+            &path,
+            &vec![90u8; 16 * 12 * 4],
+            16,
+            12,
+            80,
+            None,
+            Some(&tiff),
+            None,
+        )
+        .unwrap();
+        let (exif, iptc) = read_metadata(&path);
+        assert_eq!(exif.camera_make.as_deref(), Some("LumenCam"));
+        assert_eq!(iptc, Iptc::default());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[cfg(feature = "external-fixtures")]
     include!("../local-fixtures/exif-tests.rs");

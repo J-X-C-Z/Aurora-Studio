@@ -27,19 +27,20 @@ pub fn import_style(engine: &dyn ImageEngine, path: &Path) -> anyhow::Result<Sty
     engine.import_style(path)
 }
 
-pub const CANCEL_READY: bool = false;
+pub const CANCEL_READY: bool = true;
 
 /// `fn cancel_job(&self, job_id: u64) -> bool`: stops a queued or running
 /// export; the job then reports `JobStatus::Failed { message: "cancelled" }`.
-pub fn cancel_job(_engine: &dyn ImageEngine, _job: u64) -> anyhow::Result<()> {
-    Err(not_connected(t("Cancel export", "取消导出")))
+pub fn cancel_job(engine: &dyn ImageEngine, job: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(engine.cancel_job(job), "{}", t("The export has already finished", "导出已结束"));
+    Ok(())
 }
 
 /// `fn source_status(&self, image: ImageId) -> Option<String>`: why the engine
 /// shows something other than the full sensor data (an embedded preview after
 /// a failed RAW decode, an unsupported compression). `None` when all is well.
-pub fn source_status(_engine: &dyn ImageEngine, _image: ImageId) -> Option<String> {
-    None
+pub fn source_status(engine: &dyn ImageEngine, image: ImageId) -> Option<String> {
+    engine.source_status(image)
 }
 
 /// How the frames of an HDR merge are combined. Mirrors the engine type the

@@ -1,7 +1,7 @@
 //! ICC v2/v4 profile parsing and sRGB<->profile conversion.
 //! Support level: matrix/TRC profiles (PCS XYZ D50) and `mft2` A2B0 3D-LUT profiles (PCS Lab).
 //! Unsupported colour spaces: CMYK and any device space wider than three channels.
-//! Unsupported tag paths: `mAB`/`mBA`, multi-CLUT `A2B1`/`B2A1`, `gamt`/`bkpt`, `ncl`.
+//! Unsupported tag paths: `mAB`/`mBA`, multi-CLUT `A2B1`/`B2A1`, `gamt`, `ncl`.
 //! Precision: 16-bit CLUT on the Lab PCS path, single-precision `f32` on the matrix/TRC path.
 
 use anyhow::{bail, Context, Result};
@@ -134,6 +134,34 @@ impl Lut2 {
     }
 }
 
+/// ICC rendering intent, as a request. Only `Relative` is honoured: the
+/// matrix/TRC path is D50 relative colourimetric and the `A2B0` path uses the
+/// table the profile ships. There is no secondary table (`A2B1`) selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Intent {
+    #[default]
+    Relative,
+    Perceptual,
+    Saturation,
+    Absolute,
+}
+
+/// A conversion request. The pipeline either honours it completely or refuses
+/// it; it never silently ignores a field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rendering {
+    pub intent: Intent,
+    pub black_point_compensation: bool,
+}
+
+impl Rendering {
+    /// Intents other than relative colourimetric need tables this parser does
+    /// not read (`A2B1`/`B2A1`). BPC additionally needs the profile's `bkpt`.
+    pub fn is_supported(&self) -> bool {
+        self.intent == Intent::Relative
+    }
+}
+
 /// A parsed ICC profile.
 #[derive(Debug, Clone)]
 pub struct Profile {
@@ -143,6 +171,8 @@ pub struct Profile {
     pub matrix: Option<MatrixTrc>,
     pub a2b: Option<Lut2>,
     pub b2a: Option<Lut2>,
+    /// PCS black point from the `bkpt` tag (D50 XYZ), when the profile has one.
+    pub bkpt: Option<[f32; 3]>,
     /// Tone curve of a greyscale profile (`GRAY` data space).
     pub gray: Option<Curve>,
     pub path: Option<PathBuf>,
@@ -159,6 +189,43 @@ impl Profile {
     pub fn from_linear_srgb(&self, rgb: [f32; 3]) -> Result<[f32; 3]> {
         Ok(self.encode(linear_srgb_to_xyz_d50(rgb)))
     }
+
+    /// [`Profile::to_linear_srgb`] for a request the caller can state. An
+    /// unsupported intent, or BPC on a profile without `bkpt`, returns `None`
+    /// instead of being silently ignored.
+    pub fn to_linear_srgb_with(&self, rgb: [f32; 3], rendering: Rendering) -> Option<[f32; 3]> {
+        if !rendering.is_supported() {
+            return None;
+        }
+        let xyz = self.decode(rgb);
+        let xyz = if rendering.black_point_compensation {
+            apply_bpc(xyz, self.bkpt?)
+        } else {
+            xyz
+        };
+        Some(xyz_d50_to_linear_srgb(xyz))
+    }
+
+    /// [`Profile::from_linear_srgb`] with the same intent rule. BPC is only
+    /// implemented on the PCS -> sRGB side, so it is refused here.
+    pub fn from_linear_srgb_with(
+        &self,
+        rgb: [f32; 3],
+        rendering: Rendering,
+    ) -> Option<Result<[f32; 3]>> {
+        (rendering.is_supported() && !rendering.black_point_compensation)
+            .then(|| self.from_linear_srgb(rgb))
+    }
+}
+
+/// Minimal black point compensation in the PCS: subtract the profile's black
+/// point per channel and rescale so white stays at 1. No chromatic adaptation
+/// of the black point and no gamut mapping.
+fn apply_bpc(xyz: [f32; 3], black: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|i| {
+        let k = black[i].clamp(0.0, 0.99);
+        ((xyz[i] - k) / (1.0 - k)).max(0.0)
+    })
 }
 
 /// Invert a monotone curve: find the x with `curve(x) == y`.
@@ -401,6 +468,14 @@ pub fn parse_icc(bytes: &[u8]) -> Result<Profile> {
         .map(|t| parse_mft2(&bytes[t.offset..t.offset + t.size]))
         .transpose()?;
 
+    // PCS black point. Out-of-range or non-finite values are treated as absent
+    // rather than poisoning every conversion.
+    let bkpt = find(b"bkpt").and_then(|t| {
+        let d = &bytes[t.offset..t.offset + t.size];
+        let k = [s15f16(d, 8)?, s15f16(d, 12)?, s15f16(d, 16)?];
+        k.iter().all(|v| v.is_finite() && (0.0..1.0).contains(v)).then_some(k)
+    });
+
     if matrix.is_none() && a2b.is_none() && gray.is_none() {
         bail!("profile has neither a matrix/TRC nor an A2B0 table");
     }
@@ -411,6 +486,7 @@ pub fn parse_icc(bytes: &[u8]) -> Result<Profile> {
         matrix,
         a2b,
         b2a,
+        bkpt,
         gray,
         path: None,
         inverse: OnceLock::new(),
@@ -547,6 +623,12 @@ pub fn load_profile(path: &Path) -> Result<Profile> {
     Profile::from_file(path)
 }
 
+/// True for the standard sRGB profile (matrix/TRC and an sRGB description such
+/// as Windows' "sRGB Color Space Profile"), so callers can skip a no-op conversion.
+pub(crate) fn is_srgb(profile: &Profile) -> bool {
+    profile.gray.is_none() && profile.matrix.is_some() && profile.name().to_ascii_lowercase().contains("srgb")
+}
+
 /// Where Capture One keeps its profiles on this machine. Overridable for tests
 /// and for installs that live elsewhere (`LUMEN_ICC_DIR`).
 pub fn profile_dir() -> PathBuf {
@@ -567,27 +649,149 @@ fn index() -> &'static Mutex<std::collections::HashMap<String, Option<Arc<Profil
     INDEX.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn profile_paths() -> &'static Vec<(String, PathBuf)> {
-    static PATHS: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
-    PATHS.get_or_init(|| scan_profiles(&[profile_dir()]))
+/// One installed profile: its file stem, where it lives and the description
+/// stored inside it.
+pub(crate) struct Discovered {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) description: String,
+    pub(crate) matrix: bool,
 }
 
-/// Profile names shipped with the install, sorted.
+/// Directories searched for profiles: the Capture One/local install and, unless
+/// `LUMEN_ICC_DIR` pins the search, the Windows colour directory.
+fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![profile_dir()];
+    if std::env::var_os("LUMEN_ICC_DIR").is_none() {
+        let system = PathBuf::from(r"C:\Windows\System32\spool\drivers\color");
+        if system.is_dir() {
+            dirs.push(system);
+        }
+    }
+    dirs
+}
+
+/// Every profile below `dirs` that parses, deduplicated by file stem. Earlier
+/// directories win, so a locally installed profile shadows a system copy.
+pub(crate) fn discover_profiles(dirs: &[PathBuf]) -> Vec<Discovered> {
+    let mut out: Vec<Discovered> = Vec::new();
+    for dir in dirs {
+        for (name, path) in scan_profiles(std::slice::from_ref(dir)) {
+            if out.iter().any(|profile| profile.name == name) {
+                continue;
+            }
+            let Ok(profile) = Profile::from_file(&path) else { continue };
+            out.push(Discovered {
+                name,
+                path,
+                description: profile.description,
+                matrix: profile.matrix.is_some(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn discovered() -> &'static Vec<Discovered> {
+    static PROFILES: OnceLock<Vec<Discovered>> = OnceLock::new();
+    PROFILES.get_or_init(|| discover_profiles(&search_dirs()))
+}
+
+/// Profile names shipped with the install and the system, sorted.
 pub fn profile_names() -> Vec<String> {
-    profile_paths().iter().map(|(name, _)| name.clone()).collect()
+    discovered().iter().map(|profile| profile.name.clone()).collect()
 }
 
-/// A profile by file stem, parsed once and shared.
+/// The recipe default, matched by description when no file is named after it.
+pub const DEFAULT_PROFILE: &str = "sRGB IEC61966-2.1";
+
+/// What a profile is for. The split is structural, not a curated catalogue:
+/// C1 camera colour spaces are LUT profiles named `-ProStandard`/`-Generic`,
+/// output spaces are matrix/TRC profiles, and the rest are looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileGroup {
+    Camera,
+    Standard,
+    Output,
+}
+
+fn group_of(profile: &Discovered) -> ProfileGroup {
+    if profile.name.ends_with("-ProStandard") || profile.name.ends_with("-Generic") {
+        ProfileGroup::Camera
+    } else if profile.matrix {
+        ProfileGroup::Output
+    } else {
+        ProfileGroup::Standard
+    }
+}
+
+/// Groups and their profile counts.
+pub fn profile_groups() -> Vec<(ProfileGroup, usize)> {
+    let mut out = vec![
+        (ProfileGroup::Camera, 0usize),
+        (ProfileGroup::Standard, 0),
+        (ProfileGroup::Output, 0),
+    ];
+    for profile in discovered() {
+        let group = group_of(profile);
+        if let Some((_, count)) = out.iter_mut().find(|(g, _)| *g == group) {
+            *count += 1;
+        }
+    }
+    out
+}
+
+/// A filtered page of the profile list for a picker: optional vendor group,
+/// case-insensitive name/description query, and a `limit` of 0 meaning all.
+///
+/// [`DEFAULT_PROFILE`] stays first when it is in the page, and is prepended
+/// when there is no filter at all, so the recipe default is always selectable.
+pub fn profile_menu(group: Option<ProfileGroup>, query: Option<&str>, limit: usize) -> Vec<String> {
+    let query = query.map(|q| q.trim().to_ascii_lowercase()).filter(|q| !q.is_empty());
+    let mut names: Vec<String> = Vec::new();
+    for profile in discovered() {
+        if group.is_some_and(|g| group_of(profile) != g) {
+            continue;
+        }
+        if let Some(query) = &query {
+            let name = profile.name.to_ascii_lowercase();
+            let description = profile.description.to_ascii_lowercase();
+            if !name.contains(query.as_str()) && !description.contains(query.as_str()) {
+                continue;
+            }
+        }
+        names.push(profile.name.clone());
+    }
+    match names.iter().position(|name| name == DEFAULT_PROFILE) {
+        Some(at) => {
+            let default = names.remove(at);
+            names.insert(0, default);
+        }
+        None if group.is_none() && query.is_none() && profile(DEFAULT_PROFILE).is_some() => {
+            names.insert(0, DEFAULT_PROFILE.to_string());
+        }
+        None => {}
+    }
+    if limit > 0 {
+        names.truncate(limit);
+    }
+    names
+}
+
+/// A profile by file stem or by the description inside the file, parsed once
+/// and shared.
 pub fn profile(name: &str) -> Option<Arc<Profile>> {
     let mut index = index().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(hit) = index.get(name) {
         return hit.clone();
     }
-    let loaded = profile_paths()
+    let path = discovered()
         .iter()
-        .find(|(stem, _)| stem == name)
-        .and_then(|(_, path)| Profile::from_file(path).ok())
-        .map(Arc::new);
+        .find(|profile| profile.name == name)
+        .or_else(|| discovered().iter().find(|profile| profile.description.eq_ignore_ascii_case(name)))
+        .map(|profile| profile.path.clone());
+    let loaded = path.and_then(|path| Profile::from_file(&path).ok()).map(Arc::new);
     index.insert(name.to_string(), loaded.clone());
     loaded
 }
@@ -966,6 +1170,42 @@ mod tests {
         Profile::from_file(&srgb_profile_path()?).ok()
     }
 
+    fn synthetic(description: &str, gamma: f32) -> Profile {
+        Profile {
+            description: description.into(),
+            data_space: *b"RGB ",
+            pcs: Pcs::Xyz,
+            matrix: Some(MatrixTrc {
+                matrix: [[0.4361, 0.3851, 0.1431], [0.2225, 0.7169, 0.0606], [0.0139, 0.0971, 0.7141]],
+                trc: [Curve::Gamma(gamma), Curve::Gamma(gamma), Curve::Gamma(gamma)],
+            }),
+            a2b: None,
+            b2a: None,
+            gray: None,
+            path: None,
+            bkpt: None,
+            inverse: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn srgb_detection_needs_description_and_matrix() {
+        assert!(is_srgb(&synthetic("sRGB Color Space Profile", 2.2)));
+        assert!(!is_srgb(&synthetic("Adobe RGB (1998)", 2.2)));
+        let mut lut = synthetic("sRGB with LUT", 2.2);
+        lut.matrix = None;
+        assert!(!is_srgb(&lut));
+    }
+
+    #[test]
+    fn non_srgb_profile_still_converts() {
+        let profile = synthetic("Adobe RGB (1998)", 0.5);
+        let mut px = vec![128u8, 64, 32, 255];
+        convert_srgb_to(&mut px, &profile);
+        assert_ne!(&px[..3], &[128, 64, 32]);
+        assert_eq!(px[3], 255);
+    }
+
     fn find_profile(name: &str) -> Option<PathBuf> {
         let mut stack = vec![profile_dir()];
         while let Some(dir) = stack.pop() {
@@ -1023,6 +1263,82 @@ mod tests {
         assert!(parse_icc(&[0u8; 200]).is_err());
         assert!(Profile::from_bytes(b"not a profile at all").is_err());
         assert!(Profile::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn discovery_keeps_only_parseable_profiles_and_dedupes() {
+        let Some(system) = srgb_profile_path() else { return };
+        let dir = std::env::temp_dir().join(format!("lumen-icc-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::copy(&system, dir.join("a").join("alpha.icm")).unwrap();
+        std::fs::write(dir.join("a").join("broken.icm"), b"not a profile").unwrap();
+        std::fs::copy(&system, dir.join("b").join("alpha.icm")).unwrap();
+        std::fs::copy(&system, dir.join("b").join("gamma.icm")).unwrap();
+
+        let found = discover_profiles(&[dir.join("a"), dir.join("b")]);
+        let names: Vec<&str> = found.iter().map(|profile| profile.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "gamma"], "broken files and duplicates must be dropped");
+        assert!(found[0].path.starts_with(dir.join("a")), "the first directory must win");
+        assert!(!found[0].description.is_empty(), "the description must come from the parse");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_listed_profile_resolves() {
+        let names = profile_names();
+        if names.is_empty() {
+            return;
+        }
+        println!("listed ICC profiles: {} ({:?} .. {:?})", names.len(), names.first(), names.last());
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "the list must be sorted");
+        let mut unique = names.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "the list must be deduplicated");
+        for name in &names {
+            assert!(profile(name).is_some(), "{name} is listed but does not parse");
+        }
+        let default = profile("sRGB IEC61966-2.1");
+        println!("default sRGB by description: {}", default.is_some());
+    }
+
+    #[test]
+    fn the_menu_filters_groups_and_limits_with_the_default_first() {
+        if profile_names().is_empty() {
+            return;
+        }
+        let all = profile_menu(None, None, 0);
+        let names = profile_names();
+        assert!(all.len() >= names.len(), "the default alias may add one entry");
+        assert!(all.iter().skip(1).all(|name| names.contains(name)));
+        assert_eq!(all[0], DEFAULT_PROFILE, "the default must stay first");
+        let mut unique = all.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "no duplicates in the menu");
+
+        let five = profile_menu(None, None, 5);
+        assert_eq!(five.len(), 5);
+        assert_eq!(five[0], DEFAULT_PROFILE);
+
+        let groups = profile_groups();
+        println!("menu entries: {} groups: {:?}", all.len(), groups);
+        assert_eq!(groups.iter().map(|(_, count)| count).sum::<usize>(), names.len());
+        for (group, count) in groups {
+            let page = profile_menu(Some(group), None, 0);
+            assert_eq!(page.len(), count, "{group:?}");
+            assert!(page.iter().all(|name| profile(name).is_some()));
+        }
+
+        let nikon = profile_menu(None, Some("nikon"), 20);
+        assert!(nikon.iter().all(|name| {
+            let description = profile(name).map(|p| p.description.to_ascii_lowercase()).unwrap_or_default();
+            name.to_ascii_lowercase().contains("nikon") || description.contains("nikon")
+        }));
+        assert!(nikon.len() <= 20);
     }
 
     #[test]
@@ -1097,6 +1413,113 @@ mod tests {
         convert_to_srgb(&mut buf, &profile);
         for (a, b) in buf.iter().zip(before.iter()) {
             assert!((*a as i32 - *b as i32).abs() <= 3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn only_plain_relative_colourimetric_requests_are_honoured() {
+        let Some(profile) = srgb_profile() else { return };
+        let rgb = [0.2, 0.4, 0.6];
+        let relative = Rendering::default();
+        assert_eq!(relative.intent, Intent::Relative);
+        assert!(!relative.black_point_compensation);
+        assert_eq!(profile.to_linear_srgb_with(rgb, relative), Some(profile.to_linear_srgb(rgb)));
+        for rendering in [
+            Rendering { intent: Intent::Perceptual, ..relative },
+            Rendering { intent: Intent::Saturation, ..relative },
+            Rendering { intent: Intent::Absolute, ..relative },
+        ] {
+            assert!(
+                profile.to_linear_srgb_with(rgb, rendering).is_none(),
+                "{rendering:?} must be refused, not ignored"
+            );
+            assert!(profile.from_linear_srgb_with(rgb, rendering).is_none(), "{rendering:?} must be refused");
+        }
+        let bpc = Rendering { black_point_compensation: true, ..relative };
+        assert!(profile.from_linear_srgb_with(rgb, bpc).is_none(), "BPC on the encode side is not implemented");
+        assert_eq!(
+            profile.to_linear_srgb_with(rgb, bpc).is_some(),
+            profile.bkpt.is_some(),
+            "BPC needs bkpt and nothing else"
+        );
+        assert_eq!(
+            profile.from_linear_srgb_with(rgb, relative).unwrap().unwrap(),
+            profile.from_linear_srgb(rgb).unwrap()
+        );
+    }
+
+    /// A matrix/TRC profile whose only optional tag is `bkpt`.
+    fn profile_with_black_point(black: Option<[f32; 3]>) -> Vec<u8> {
+        let xyz = |x: f32, y: f32, z: f32| {
+            let mut d = b"XYZ \0\0\0\0".to_vec();
+            for v in [x, y, z] {
+                d.extend_from_slice(&((v * 65536.0).round() as i32).to_be_bytes());
+            }
+            d
+        };
+        let mut trc = b"curv\0\0\0\0".to_vec();
+        trc.extend_from_slice(&1u32.to_be_bytes());
+        trc.extend_from_slice(&0x0100u16.to_be_bytes());
+        let mut payloads: Vec<(&[u8; 4], Vec<u8>)> =
+            vec![
+                (b"rXYZ", xyz(1.0, 0.0, 0.0)),
+                (b"gXYZ", xyz(0.0, 1.0, 0.0)),
+                (b"bXYZ", xyz(0.0, 0.0, 1.0)),
+                (b"rTRC", trc),
+            ];
+        if let Some(k) = black {
+            payloads.push((b"bkpt", xyz(k[0], k[1], k[2])));
+        }
+        let mut out = vec![0u8; 132];
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(b"RGB ");
+        out[20..24].copy_from_slice(b"XYZ ");
+        out[36..40].copy_from_slice(b"acsp");
+        out[128..132].copy_from_slice(&(payloads.len() as u32).to_be_bytes());
+        let mut offset = 128 + 4 + payloads.len() * 12;
+        for (sig, data) in &payloads {
+            out.extend_from_slice(*sig);
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            offset += (data.len() + 3) & !3;
+        }
+        for (_, data) in &payloads {
+            out.extend_from_slice(data);
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bpc_needs_bkpt_and_moves_the_black_point() {
+        let rgb = [0.2, 0.2, 0.2];
+        let bpc = Rendering { black_point_compensation: true, ..Rendering::default() };
+
+        let plain = parse_icc(&profile_with_black_point(None)).unwrap();
+        assert!(plain.bkpt.is_none());
+        assert!(
+            plain.to_linear_srgb_with(rgb, bpc).is_none(),
+            "BPC without bkpt must be refused, not approximated"
+        );
+
+        let compensated = parse_icc(&profile_with_black_point(Some([0.0, 0.0, 0.2]))).unwrap();
+        let black = compensated.bkpt.expect("bkpt must parse");
+        assert!((black[2] - 0.2).abs() < 1e-3, "{black:?}");
+        let without = compensated.to_linear_srgb(rgb);
+        let with = compensated.to_linear_srgb_with(rgb, bpc).unwrap();
+        assert!(with.iter().zip(without).any(|(a, b)| (a - b).abs() > 1e-4), "BPC must change the result");
+        let darkened = compensated.to_linear_srgb_with([0.0; 3], bpc).unwrap();
+        assert!(darkened.iter().all(|v| *v <= 1e-6), "black must stay black: {darkened:?}");
+    }
+
+    #[test]
+    fn real_profiles_expose_their_black_point_tag() {
+        let Some(path) = find_profile("Adobe RGB (1998)") else { return };
+        let Ok(profile) = Profile::from_file(&path) else { return };
+        if let Some(k) = profile.bkpt {
+            assert!(k.iter().all(|v| (0.0..1.0).contains(v)), "{k:?}");
         }
     }
 
