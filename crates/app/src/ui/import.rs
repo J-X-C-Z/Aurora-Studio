@@ -4,6 +4,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+#[path = "import_files.rs"]
+mod import_files;
+pub use import_files::apply_naming;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -21,12 +26,9 @@ use gpui_kit::{
 };
 
 use crate::i18n::t;
-use crate::state::{AppState, ImportAfter};
+use crate::state::{AppState, DocumentKind, ImportAfter, LibraryDocument};
 use crate::theme::pal;
 use crate::widgets::{Segmented, caption, row, select, switch_row, text_field};
-
-const EXTENSIONS: [&str; 16] =
-    ["jpg", "jpeg", "png", "tif", "tiff", "webp", "dng", "iiq", "nef", "cr2", "cr3", "arw", "raf", "orf", "rw2", "heic"];
 
 struct SourceFile {
     path: PathBuf,
@@ -41,6 +43,8 @@ pub struct ImportDialog {
     include_sub: bool,
     files: Vec<SourceFile>,
     scanning: bool,
+    scan_generation: Arc<AtomicU64>,
+    skip_duplicates: bool,
     copy: bool,
     dest: Option<PathBuf>,
     by_date: bool,
@@ -54,26 +58,13 @@ pub struct ImportDialog {
     style: Option<usize>,
     album: Option<u64>,
     working: bool,
+    cancel: Arc<AtomicBool>,
+    result: Option<String>,
 }
 
 fn is_image(p: &Path) -> bool {
-    p.extension().and_then(|e| e.to_str()).is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-}
-
-fn scan(dir: &Path, recursive: bool, out: &mut Vec<(PathBuf, u64)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| e.file_name());
-    for e in entries {
-        let path = e.path();
-        if path.is_dir() {
-            if recursive && !e.file_name().to_string_lossy().starts_with('.') {
-                scan(&path, true, out);
-            }
-        } else if is_image(&path) {
-            out.push((path, e.metadata().map(|m| m.len()).unwrap_or(0)));
-        }
-    }
+    lumen_engine::raw::is_raw(p) || p.extension().and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif"))
 }
 
 fn thumb(path: &Path) -> Option<Arc<RenderImage>> {
@@ -89,12 +80,6 @@ fn thumb(path: &Path) -> Option<Arc<RenderImage>> {
     }
     let buf = image::RgbaImage::from_raw(w, h, data)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buf)])))
-}
-
-/// Applies a naming format to one file.
-pub fn apply_naming(format: &str, original: &Path, counter: usize, date: &str) -> String {
-    let stem = original.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    format.replace("[Image Name]", &stem).replace("[Counter]", &format!("{counter:04}")).replace("[Date]", date)
 }
 
 pub fn today() -> String {
@@ -119,6 +104,7 @@ fn pick_dir(cx: &mut Context<ImportDialog>, set: impl Fn(&mut ImportDialog, Path
             && let Some(dir) = paths.into_iter().next()
         {
             this.update(cx, |d, cx| {
+                if d.working { return; }
                 set(d, dir, cx);
                 cx.notify();
             })
@@ -129,16 +115,22 @@ fn pick_dir(cx: &mut Context<ImportDialog>, set: impl Fn(&mut ImportDialog, Path
 }
 
 impl ImportDialog {
-    fn new(state: Entity<AppState>) -> Self {
+    fn new(state: Entity<AppState>, cx: &App) -> Self {
+        let current = state.read(cx);
+        let dest = current.engine.library_root().and_then(|root| initial_destination(&root, current.library_document.as_ref()));
+        let include_sub = current.library_document.as_ref().is_none_or(|doc| doc.include_subfolders);
+        let native_copy = dest.is_some();
         Self {
             state,
             source: None,
-            include_sub: true,
+            include_sub,
             files: Vec::new(),
             scanning: false,
-            copy: false,
-            dest: None,
-            by_date: true,
+            scan_generation: Arc::new(AtomicU64::new(0)),
+            skip_duplicates: true,
+            copy: native_copy,
+            dest,
+            by_date: !native_copy,
             backup: false,
             backup_dir: None,
             rename: false,
@@ -149,41 +141,53 @@ impl ImportDialog {
             style: None,
             album: None,
             working: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            result: None,
         }
     }
 
     fn set_source(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if self.working { return; }
+        if self.copy && self.dest.as_ref().is_some_and(|dest| import_files::same_directory(dest, &dir)) {
+            self.copy = false;
+        }
+        let expected = self.scan_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self.scan_generation.clone();
         self.source = Some(dir.clone());
         self.files.clear();
+        self.result = None;
         self.scanning = true;
         let recursive = self.include_sub;
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
-                    let mut out = Vec::new();
-                    scan(&dir, recursive, &mut out);
-                    out
+                    import_files::scan(&dir, recursive, &generation, expected, is_image)
                 })
                 .await;
             let paths: Vec<PathBuf> = found.iter().take(120).map(|f| f.0.clone()).collect();
-            this.update(cx, |d, cx| {
+            let current = this.update(cx, |d, cx| {
+                if d.scan_generation.load(Ordering::Relaxed) != expected { return false; }
                 d.scanning = false;
                 d.files = found.into_iter().map(|(path, size)| SourceFile { path, size, checked: true, thumb: None }).collect();
                 cx.notify();
+                true
             })
-            .ok();
+            .unwrap_or(false);
+            if !current { return; }
             // Thumbnails arrive one by one so the list is usable at once.
             for path in paths {
                 let p2 = path.clone();
                 let t = cx.background_spawn(async move { thumb(&p2) }).await;
                 let alive = this
                     .update(cx, |d, cx| {
+                        if d.scan_generation.load(Ordering::Relaxed) != expected { return false; }
                         if let Some(f) = d.files.iter_mut().find(|f| f.path == path) {
                             f.thumb = t;
                         }
                         cx.notify();
+                        true
                     })
-                    .is_ok();
+                    .unwrap_or(false);
                 if !alive {
                     break;
                 }
@@ -192,7 +196,14 @@ impl ImportDialog {
         .detach();
     }
 
-    fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn copies_into_source(&self) -> bool {
+        self.copy && self.dest.as_ref().zip(self.source.as_ref())
+            .is_some_and(|(dest, source)| import_files::same_directory(dest, source))
+    }
+
+    fn run(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.working || self.scanning || self.state.read(cx).library_busy || self.copies_into_source()
+            || (self.copy && self.dest.is_none()) || (self.backup && self.backup_dir.is_none()) { return; }
         let chosen: Vec<PathBuf> = self.files.iter().filter(|f| f.checked).map(|f| f.path.clone()).collect();
         if chosen.is_empty() {
             return;
@@ -205,6 +216,14 @@ impl ImportDialog {
         };
         let backup = self.backup.then(|| self.backup_dir.clone()).flatten();
         let rename = (self.copy && self.rename).then(|| self.naming.clone());
+        let options = import_files::ImportOptions {
+            dest,
+            backup,
+            naming: rename,
+            date,
+            skip_duplicates: self.skip_duplicates,
+            known_sources: self.state.read(cx).images.iter().map(|image| image.path.clone()).collect(),
+        };
         let state = self.state.clone();
         let after = ImportAfter {
             copyright: self.copyright.clone(),
@@ -214,56 +233,43 @@ impl ImportDialog {
             album: self.album,
         };
         self.working = true;
+        self.result = None;
+        self.cancel.store(false, Ordering::Relaxed);
+        let cancel = self.cancel.clone();
         cx.notify();
-        let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let copied = cx
-                .background_spawn(async move {
-                    let mut out = Vec::new();
-                    let mut errors = Vec::new();
-                    for (i, src) in chosen.iter().enumerate() {
-                        let ext = src.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-                        let name = match &rename {
-                            Some(fmt) => format!("{}.{ext}", apply_naming(fmt, src, i + 1, &date)),
-                            None => src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                        };
-                        if let Some(b) = &backup {
-                            let target = b.join(src.file_name().unwrap_or_default());
-                            if let Err(e) = std::fs::create_dir_all(b).and_then(|_| std::fs::copy(src, &target)) {
-                                errors.push(format!("{}: {e}", src.display()));
-                            }
-                        }
-                        match &dest {
-                            Some(d) => {
-                                let target = d.join(&name);
-                                match std::fs::create_dir_all(d).and_then(|_| std::fs::copy(src, &target)) {
-                                    Ok(_) => out.push(target),
-                                    Err(e) => errors.push(format!("{}: {e}", src.display())),
-                                }
-                            }
-                            None => out.push(src.clone()),
-                        }
-                    }
-                    (out, errors)
-                })
+                .background_spawn(async move { import_files::import_files(&chosen, &options, &cancel) })
                 .await;
-            let (paths, errors) = copied;
+            let import_files::ImportResult { paths, skipped, errors, cancelled } = copied;
+            let mut summary = format!("已准备 {} 张图像，跳过 {skipped} 张，失败 {} 张，取消后未处理 {cancelled} 张。", paths.len(), errors.len());
+            if !errors.is_empty() {
+                summary.push('\n');
+                summary.push_str(&errors.join("\n"));
+            }
             cx.update(|cx| {
                 state.update(cx, |s, cx| {
-                    if !errors.is_empty() {
-                        s.notify(format!("{} {}: {}", errors.len(), t("files failed to copy", "个文件复制失败"), errors[0]), cx);
+                    s.notify(summary.clone(), cx);
+                    if !paths.is_empty() {
+                        s.import_with(paths, after, cx);
                     }
-                    s.import_with(paths, after, cx)
                 })
             });
             this.update(cx, |d, cx| {
                 d.working = false;
+                d.result = Some(summary);
                 cx.notify();
             })
             .ok();
-            handle.update(cx, |_, window, cx| window.close_dialog(cx)).ok();
         })
         .detach();
+    }
+}
+
+impl Drop for ImportDialog {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.scan_generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -295,6 +301,7 @@ impl Render for ImportDialog {
             let this = this.clone();
             move |v: bool, _: &mut Window, cx: &mut App| {
                 this.update(cx, |d, cx| {
+                    if d.working { return; }
                     f(d, v);
                     cx.notify();
                 })
@@ -302,7 +309,11 @@ impl Render for ImportDialog {
         };
         let text = |key: &'static str, initial: String, placeholder: &'static str, f: fn(&mut ImportDialog, String), window: &mut Window, cx: &mut App| {
             let this = this.clone();
-            text_field(key, initial, placeholder, move |v, _, cx| this.update(cx, |d, _| f(d, v)), window, cx)
+            text_field(key, initial, placeholder, move |v, _, cx| this.update(cx, |d, cx| {
+                if d.working { return; }
+                f(d, v);
+                cx.notify();
+            }), window, cx)
         };
         let path_label = |p: &Option<PathBuf>, none: &'static str| p.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| none.to_string());
 
@@ -310,7 +321,7 @@ impl Render for ImportDialog {
             .gap_2()
             .child(Icon::new(IconName::FolderOpen).small().text_color(p.text_muted))
             .child(div().flex_1().text_sm().text_color(if self.source.is_some() { p.text } else { p.text_subtle }).overflow_hidden().whitespace_nowrap().text_ellipsis().child(path_label(&self.source, t("Choose a folder or card to import from", "选择要导入的文件夹或存储卡"))))
-            .child(Button::new("imp-src").small().outline().label(t("Choose…", "选择…")).on_click(cx.listener(|_, _, _, cx| pick_dir(cx, |d, dir, cx| d.set_source(dir, cx)))));
+            .child(Button::new("imp-src").small().outline().disabled(self.working).label(t("Choose…", "选择…")).on_click(cx.listener(|_, _, _, cx| pick_dir(cx, |d, dir, cx| d.set_source(dir, cx)))));
 
         let grid = div()
             .id("imp-files")
@@ -348,6 +359,7 @@ impl Render for ImportDialog {
                             .hover(|d| d.bg(p.hover))
                             .on_click(move |_, _, cx| {
                                 this.update(cx, |d, cx| {
+                                    if d.working { return; }
                                     if let Some(f) = d.files.get_mut(i) {
                                         f.checked = !f.checked;
                                     }
@@ -400,6 +412,7 @@ impl Render for ImportDialog {
                         move |v: &bool, _, cx| {
                             let v = *v;
                             this.update(cx, |d, cx| {
+                                if d.working { return; }
                                 d.include_sub = v;
                                 if let Some(src) = d.source.clone() {
                                     d.set_source(src, cx);
@@ -412,12 +425,14 @@ impl Render for ImportDialog {
                     .child(div().text_xs().text_color(p.text_muted).child(format!("{checked}/{} · {:.1} MB", self.files.len(), bytes as f64 / 1e6)))
                     .child(Button::new("imp-all").xsmall().ghost().label(t("All", "全选")).on_click(move |_, _, cx| {
                         this_all.update(cx, |d, cx| {
+                            if d.working { return; }
                             d.files.iter_mut().for_each(|f| f.checked = true);
                             cx.notify();
                         })
                     }))
                     .child(Button::new("imp-none").xsmall().ghost().label(t("None", "全不选")).on_click(move |_, _, cx| {
                         this_none.update(cx, |d, cx| {
+                            if d.working { return; }
                             d.files.iter_mut().for_each(|f| f.checked = false);
                             cx.notify();
                         })
@@ -437,6 +452,7 @@ impl Render for ImportDialog {
                         let this = this.clone();
                         move |i, _, cx| {
                             this.update(cx, |d, cx| {
+                                if d.working { return; }
                                 d.copy = i == 1;
                                 cx.notify();
                             })
@@ -451,7 +467,7 @@ impl Render for ImportDialog {
                         .pt_1p5()
                         .gap_2()
                         .child(div().flex_1().text_xs().text_color(p.text_muted).overflow_hidden().whitespace_nowrap().text_ellipsis().child(path_label(&self.dest, t("Choose a destination", "选择目标文件夹"))))
-                        .child(Button::new("imp-dest").xsmall().outline().label(t("Choose…", "选择…")).on_click(cx.listener(|_, _, _, cx| pick_dir(cx, |d, dir, _| d.dest = Some(dir))))),
+                        .child(Button::new("imp-dest").xsmall().outline().disabled(self.working).label(t("Choose…", "选择…")).on_click(cx.listener(|_, _, _, cx| pick_dir(cx, |d, dir, _| d.dest = Some(dir))))),
                 )
                 .child(switch_row("imp-bydate", t("Subfolder by date", "按日期建子文件夹"), self.by_date, upd(|d, v| d.by_date = v), cx))
                 .child(switch_row("imp-rename", t("Rename files", "重命名文件"), self.rename, upd(|d, v| d.rename = v), cx))
@@ -460,6 +476,8 @@ impl Render for ImportDialog {
                         .when_some(sample.clone(), |d, s| d.child(row(t("Sample", "示例"), div().text_xs().text_color(p.accent).child(s), cx)))
                 })
             })
+            .child(switch_row("imp-skip-duplicates", t("Skip duplicates", "跳过重复项"), self.skip_duplicates, upd(|d, v| d.skip_duplicates = v), cx))
+            .child(div().px_3().text_xs().text_color(p.text_muted).child(t("Skip catalog sources and existing destination/backup names. If off, number conflicting copies.", "跳过图库中同源文件及目标／备份重名项；关闭后自动编号，始终不覆盖。")))
             .child(caption(t("Backup", "备份"), cx))
             .child(switch_row("imp-backup", t("Back up originals", "备份原始文件"), self.backup, upd(|d, v| d.backup = v), cx))
             .when(self.backup, |d| {
@@ -468,7 +486,7 @@ impl Render for ImportDialog {
                         .px_3()
                         .gap_2()
                         .child(div().flex_1().text_xs().text_color(p.text_muted).overflow_hidden().whitespace_nowrap().text_ellipsis().child(path_label(&self.backup_dir, t("Choose a backup folder", "选择备份文件夹"))))
-                        .child(Button::new("imp-bdir").xsmall().outline().label(t("Choose…", "选择…")).on_click(cx.listener(|_, _, _, cx| pick_dir(cx, |d, dir, _| d.backup_dir = Some(dir))))),
+                        .child(Button::new("imp-bdir").xsmall().outline().disabled(self.working).label(t("Choose…", "选择…")).on_click(cx.listener(|_, _, _, cx| pick_dir(cx, |d, dir, _| d.backup_dir = Some(dir))))),
                 )
             })
             .child(caption(t("Metadata", "元数据"), cx))
@@ -480,6 +498,7 @@ impl Render for ImportDialog {
                 let this = this.clone();
                 move |v, _, cx| {
                     this.update(cx, |d, cx| {
+                        if d.working { return; }
                         d.style = v;
                         cx.notify();
                     })
@@ -490,22 +509,40 @@ impl Render for ImportDialog {
                 let this = this.clone();
                 move |v, _, cx| {
                     this.update(cx, |d, cx| {
+                        if d.working { return; }
                         d.album = v;
                         cx.notify();
                     })
                 }
             }), cx));
 
-        let can_import = checked > 0 && !self.working && (!self.copy || self.dest.is_some()) && (!self.backup || self.backup_dir.is_some());
+        let source_conflict = self.copies_into_source();
+        let can_import = checked > 0 && !self.scanning && !self.working && !self.state.read(cx).library_busy && !source_conflict
+            && (!self.copy || self.dest.is_some()) && (!self.backup || self.backup_dir.is_some());
         v_flex()
             .h(px(560.0))
             .gap_3()
             .child(h_flex().items_start().flex_1().min_h_0().gap_3().child(left.h_full()).child(right.h_full()))
+            .when(source_conflict, |d| d.child(div().text_xs().text_color(p.text_muted).child(t("The destination is the source folder. Use Add in place or choose another folder.", "目标与源文件夹相同，请使用就地添加或选择其他目标文件夹。"))))
+            .when(self.working, |d| d.child(div().text_xs().text_color(p.text_muted).child(t("Importing… Stop takes effect after the current file and its XMP/backup finish.", "正在导入…取消将在当前文件及其 XMP／备份处理完后生效。"))))
+            .when_some(self.result.clone(), |d, message| d.child(div().id("imp-result").max_h(px(76.0)).overflow_y_scrollbar().text_xs().text_color(p.text_muted).child(message)))
             .child(
                 h_flex()
                     .justify_end()
                     .gap_2()
-                    .child(Button::new("imp-cancel").outline().label(t("Cancel", "取消")).on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("imp-cancel").outline()
+                        .disabled(self.working && self.cancel.load(Ordering::Relaxed))
+                        .label(if self.working {
+                            if self.cancel.load(Ordering::Relaxed) { t("Stopping…", "正在取消…") } else { t("Stop import", "取消导入") }
+                        } else { t("Close", "关闭") })
+                        .on_click(cx.listener(|d, _, window, cx| {
+                            if d.working {
+                                d.cancel.store(true, Ordering::Relaxed);
+                                cx.notify();
+                            } else {
+                                window.close_dialog(cx);
+                            }
+                        })))
                     .child(
                         Button::new("imp-run")
                             .primary()
@@ -519,6 +556,14 @@ impl Render for ImportDialog {
     }
 }
 
+/// Native library documents choose managed copy destinations; plain folders add in place.
+fn initial_destination(root: &Path, document: Option<&LibraryDocument>) -> Option<PathBuf> {
+    document.map(|doc| match doc.kind {
+        DocumentKind::Session => doc.shortcuts.get("Capture").map(|path| LibraryDocument::resolve(root, path)).unwrap_or_else(|| root.join("Capture")),
+        DocumentKind::Catalog => root.join("Originals"),
+    })
+}
+
 /// The folder the window starts in: `LUMEN_IMPORT_SOURCE`, else the user's Pictures folder.
 fn default_source() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("LUMEN_IMPORT_SOURCE").map(PathBuf::from).filter(|p| p.is_dir()) {
@@ -530,11 +575,44 @@ fn default_source() -> Option<PathBuf> {
 
 pub fn open(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     let view = cx.new(|cx| {
-        let mut d = ImportDialog::new(state.clone());
+        let mut d = ImportDialog::new(state.clone(), cx);
         if let Some(dir) = default_source() {
             d.set_source(dir, cx);
         }
         d
     });
-    window.open_dialog(cx, move |dialog, _, _| dialog.title(t("Import Images", "导入图像")).w(px(1040.0)).child(view.clone()));
+    window.open_dialog(cx, move |dialog, _, _| dialog.title(t("Import Images", "导入图像"))
+        .close_button(false).overlay_closable(false).keyboard(false)
+        .w(px(1040.0)).child(view.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_scan_includes_engine_raw_and_heif() {
+        for ext in ["iiq", "nef", "cr3", "cr2", "arw", "dng", "raf", "orf", "rw2", "pef", "srw", "3fr", "fff", "mos", "heic", "heif", "jpg", "jpeg", "png", "tif", "tiff", "webp"] {
+            assert!(is_image(Path::new(&format!("PHOTO.{}", ext.to_ascii_uppercase()))), "{ext}");
+        }
+        assert!(!is_image(Path::new("photo.xmp")));
+    }
+
+    #[test]
+    fn native_library_import_destinations_follow_the_document() {
+        let root = std::env::temp_dir().join("aurora-import-defaults");
+        let mut doc = LibraryDocument {
+            version: 1, kind: DocumentKind::Session, name: "test".into(),
+            shortcuts: Default::default(), favorites: Vec::new(), include_subfolders: false,
+        };
+        assert_eq!(initial_destination(&root, None), None);
+        assert_eq!(initial_destination(&root, Some(&doc)), Some(root.join("Capture")));
+        doc.shortcuts.insert("Capture".into(), PathBuf::from("CustomCapture"));
+        assert_eq!(initial_destination(&root, Some(&doc)), Some(root.join("CustomCapture")));
+        let external = std::env::temp_dir().join("external-capture");
+        doc.shortcuts.insert("Capture".into(), external.clone());
+        assert_eq!(initial_destination(&root, Some(&doc)), Some(external));
+        doc.kind = DocumentKind::Catalog;
+        assert_eq!(initial_destination(&root, Some(&doc)), Some(root.join("Originals")));
+    }
 }

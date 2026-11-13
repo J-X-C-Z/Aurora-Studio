@@ -134,6 +134,18 @@ pub trait ImageEngine: Send + Sync + 'static {
     /// Adds files (or every image in a folder) and returns what was added.
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>>;
     fn collections(&self) -> Vec<Collection>;
+    fn library_root(&self) -> Option<PathBuf> {
+        None
+    }
+    fn collection_path(&self, _id: u64) -> Option<PathBuf> {
+        None
+    }
+    fn user_collections(&self) -> Vec<UserCollection> {
+        Vec::new()
+    }
+    fn manage_files(&self, _action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
+        anyhow::bail!("library filesystem operations are unsupported by this engine")
+    }
     /// Images listed by one engine collection; `None` when the interface should
     /// derive membership itself (all images, recent imports, folders).
     fn collection_images(&self, _collection: u64) -> Option<Vec<ImageId>> {

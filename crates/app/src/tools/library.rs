@@ -59,6 +59,8 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
     let id = c.id;
     let kind = c.kind;
     let user = c.user;
+    let folder_path = c.path.as_ref().map(std::path::PathBuf::from);
+    let drop_folder = folder_path.clone();
     let name: SharedString = if c.user { c.name.clone() } else { crate::i18n::builtin(&c.name) }.into();
     let toggle = open_state.clone();
     let st_menu = state.clone();
@@ -78,6 +80,11 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
             let st = state.clone();
             d.drag_over::<DraggedImages>(move |style, _, _, cx| style.bg(pal(cx).accent.opacity(0.35)))
                 .on_drop(move |drag: &DraggedImages, _, cx| st.update(cx, |s, cx| s.add_to_album(id, &drag.0, cx)))
+        })
+        .when_some(drop_folder, |d, path| {
+            let st = state.clone();
+            d.drag_over::<DraggedImages>(move |style, _, _, cx| style.bg(pal(cx).accent.opacity(0.35)))
+                .on_drop(move |drag: &DraggedImages, _, cx| st.update(cx, |s, cx| s.run_library_action(LibraryAction::Move { images: drag.0.clone(), destination: path.clone() }, cx)))
         })
         .on_click({
             let name = name.clone();
@@ -110,7 +117,7 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
         .child(Icon::new(kind_icon(kind)).xsmall().text_color(if active { p.accent } else { p.text_muted }))
         .child(div().flex_1().text_xs().text_color(if active { p.text } else { p.text_muted }).overflow_hidden().whitespace_nowrap().text_ellipsis().child(name))
         .child(div().text_xs().text_color(p.text_subtle).child(format!("{count}")))
-        .context_menu(move |mut menu, _, _| {
+        .context_menu(move |mut menu, _, cx| {
             let st = st_menu.clone();
             let container = matches!(kind, CollectionKind::Project | CollectionKind::Group);
             if container {
@@ -147,7 +154,7 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
             }
             if kind == CollectionKind::Trash {
                 let st = st.clone();
-                menu = menu.item(PopupMenuItem::new(t("Empty Trash", "清空废纸篓")).on_click(move |_, _, cx| st.update(cx, |s, cx| s.empty_trash(cx))));
+                menu = menu.item(PopupMenuItem::new(t("Empty Trash…", "清空废纸篓…")).on_click(move |_, window, cx| crate::ui::files::empty_trash(&st, window, cx)));
             }
             if user {
                 let (a, b) = (st.clone(), st.clone());
@@ -157,7 +164,7 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
                     .item(PopupMenuItem::new(t("Delete", "删除")).on_click(move |_, _, cx| b.update(cx, |s, cx| s.delete_collection(id, cx))));
             }
             if kind == CollectionKind::Folder {
-                menu = menu.item(PopupMenuItem::new(t("Show in Explorer", "在资源管理器中显示")).disabled(true));
+                if let Some(path) = &folder_path { menu = crate::ui::files::folder_menu(menu, &st, path.clone(), cx); }
             }
             menu
         });
@@ -178,9 +185,13 @@ fn collections_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App
     };
     let section = |label: &'static str| div().px_3().pt_2().pb_1().text_xs().text_color(p.text_subtle).child(label);
     let catalog: Vec<AnyElement> = roots.iter().filter(|c| is_catalog(c)).map(|c| node(state, c, 0, window, cx)).collect();
-    let user: Vec<AnyElement> = roots.iter().filter(|c| !is_catalog(c) && c.kind != CollectionKind::Folder).map(|c| node(state, c, 0, window, cx)).collect();
-    let folders: Vec<AnyElement> = roots.iter().filter(|c| c.kind == CollectionKind::Folder).map(|c| node(state, c, 0, window, cx)).collect();
+    let system_folder = |c: &CollNode| c.kind == CollectionKind::Folder || (!c.user && c.id == 10 && c.kind == CollectionKind::Group);
+    let user: Vec<AnyElement> = roots.iter().filter(|c| !is_catalog(c) && !system_folder(c)).map(|c| node(state, c, 0, window, cx)).collect();
+    let folders: Vec<AnyElement> = roots.iter().filter(|c| system_folder(c)).map(|c| node(state, c, 0, window, cx)).collect();
     let st_new = state.clone();
+    let (st_browse, st_sync, st_sub) = (state.clone(), state.clone(), state.clone());
+    let root = state.read(cx).engine.library_root();
+    let recursive = state.read(cx).library_include_subfolders;
     let new_menu = Button::new("coll-new")
         .xsmall()
         .ghost()
@@ -210,20 +221,35 @@ fn collections_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App
             window.dispatch_action(Box::new(crate::actions::Import), cx)
         }))
         .child(section(t("Catalog Collections", "目录集合")))
+        .when(state.read(cx).library_busy, |d| d.child(div().px_3().text_xs().text_color(p.accent).child(t("Updating library…", "正在更新图库…"))))
+        .when(!state.read(cx).library_offline.is_empty(), |d| d.child(div().px_3().text_xs().text_color(p.warning).child(format!("{} {}", state.read(cx).library_offline.len(), t("offline variants · Locate to reconnect", "个离线变体 · 定位文件夹可重新连接")))))
         .children(catalog)
         .child(h_flex().pr_2().child(div().flex_1().child(section(t("User Collections", "用户集合")))).child(new_menu))
         .children(user)
         .child(div().px_3().py_1().text_xs().text_color(p.text_disabled).child(t("Drag thumbnails onto an album to add them · right-click for more", "将缩略图拖到相册即可加入 · 右键查看更多")))
         .child(section(t("Folders", "文件夹")))
+        .child(h_flex().px_3().gap_1()
+            .child(Button::new("lib-browse").xsmall().ghost().label(t("Browse…", "浏览…")).on_click(move |_, _, cx| crate::ui::files::browse(&st_browse, cx)))
+            .child(Button::new("lib-sync").xsmall().ghost().label(t("Synchronize", "同步")).on_click(move |_, _, cx| { if let Some(root) = &root { crate::ui::files::synchronize(&st_sync, root.clone(), cx); } })))
+        .child(switch_row("library-subfolders", t("Include Subfolders", "包含子文件夹"), recursive, move |v, _, cx| st_sub.update(cx, |s, cx| {
+            if let Some(mut doc) = s.library_document.clone() { doc.include_subfolders = v; s.save_library_document(doc, cx); }
+            else { s.library_include_subfolders = v; cx.notify(); }
+        }), cx))
+        .child(crate::ui::files::shortcuts(state, cx))
         .children(folders)
+        .child(section(t("System Folders", "系统文件夹")))
+        .child(crate::ui::system_folders::render(state, window, cx))
 }
 
 fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
     let f = s.filter.clone();
-    let counts: Vec<usize> = (-1..=5).map(|r| s.images.iter().filter(|i| i.rating == r).count()).collect();
-    let tag_counts: Vec<usize> = ColorTag::ALL.iter().map(|t| s.images.iter().filter(|i| i.color_tag == *t).count()).collect();
+    let members = s.members(s.active_collection);
+    let in_trash = s.node(s.active_collection).is_some_and(|n| n.kind == CollectionKind::Trash);
+    let scoped: Vec<_> = s.images.iter().filter(|i| members.as_ref().is_none_or(|m| m.contains(&i.id)) && (in_trash || !s.trash.contains(&i.id))).collect();
+    let counts: Vec<usize> = (-1..=5).map(|r| scoped.iter().filter(|i| if r == -1 { i.rating == -1 } else { i.rating >= r }).count()).collect();
+    let tag_counts: Vec<usize> = ColorTag::ALL.iter().map(|t| scoped.iter().filter(|i| i.color_tag == *t).count()).collect();
     let (st, st2, st3) = (state.clone(), state.clone(), state.clone());
     let search = text_field(
         "lib-search",
@@ -240,7 +266,7 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
     );
     let rating_rows = (-1..=5i8).rev().map(|r| {
         let st = state.clone();
-        let active = f.min_rating == r && r != -1;
+        let active = if r == -1 { f.rejected_only } else { !f.rejected_only && f.min_rating == r };
         h_flex()
             .id(SharedString::from(format!("rf-{r}")))
             .h(px(22.0))
@@ -253,7 +279,8 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
             .hover(|d| d.bg(p.hover))
             .on_click(move |_, _, cx| {
                 st.update(cx, |s, cx| {
-                    s.filter.min_rating = if s.filter.min_rating == r { -1 } else { r };
+                    if r == -1 { s.filter.rejected_only = !s.filter.rejected_only; s.filter.min_rating = -1; }
+                    else { s.filter.min_rating = if !s.filter.rejected_only && s.filter.min_rating == r { -1 } else { r }; s.filter.rejected_only = false; }
                     cx.notify();
                 })
             })

@@ -80,11 +80,6 @@ impl AppState {
         self.settings.save();
     }
 
-    /// Position of `id` in the custom order; images never placed sort last.
-    pub(crate) fn custom_rank(&self, id: ImageId) -> usize {
-        self.custom_order.iter().position(|i| *i == id).unwrap_or(usize::MAX)
-    }
-
     pub fn stack_of(&self, id: ImageId) -> Option<&Stack> {
         self.stacks.iter().find(|s| s.ids.contains(&id))
     }

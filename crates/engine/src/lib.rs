@@ -4,6 +4,7 @@
 //!
 //! * [`AdjustmentSet`] is the full, serializable state of one variant's edits.
 //! * [`ImageEngine`] is what an engine implements; the interface calls nothing else.
+//! * [`LibraryAction`] manages catalog folders and source references explicitly.
 //! * [`FileEngine`] reads a real folder of images and persists edits in `.lumen`.
 //! * [`MockEngine`] is a reference implementation with procedural images, kept for
 //!   interface work when no folder is given.

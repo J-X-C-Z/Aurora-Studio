@@ -7,6 +7,8 @@
 mod binding;
 mod clipboard;
 mod collections;
+mod files;
+pub(crate) mod library_document;
 pub(crate) mod render;
 mod settings;
 mod source;
@@ -28,6 +30,7 @@ use lumen_engine::*;
 pub use binding::*;
 pub use clipboard::ClipGroup;
 pub use collections::CollNode;
+pub use library_document::{DocumentKind, LibraryDocument};
 pub use settings::*;
 pub use source::Source;
 pub use arrange::{Arrangement, Stack};
@@ -240,6 +243,7 @@ pub enum SortKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Filter {
     pub min_rating: i8,
+    pub rejected_only: bool,
     pub color_tag: Option<ColorTag>,
     pub search: String,
     pub edited_only: bool,
@@ -247,8 +251,24 @@ pub struct Filter {
 
 impl Default for Filter {
     fn default() -> Self {
-        Self { min_rating: -1, color_tag: None, search: String::new(), edited_only: false }
+        Self { min_rating: -1, rejected_only: false, color_tag: None, search: String::new(), edited_only: false }
     }
+}
+
+impl Filter {
+    fn matches_rating(&self, rating: i8) -> bool { rating >= self.min_rating && (!self.rejected_only || rating < 0) }
+}
+
+#[test]
+fn rejected_filter_and_rating_threshold_are_distinct() {
+    let all = Filter::default();
+    assert!((-1..=5).all(|rating| all.matches_rating(rating)));
+    let rejected = Filter { rejected_only: true, ..Default::default() };
+    assert!(rejected.matches_rating(-1));
+    assert!((0..=5).all(|rating| !rejected.matches_rating(rating)));
+    let starred = Filter { min_rating: 4, ..Default::default() };
+    assert!(!starred.matches_rating(3));
+    assert!(starred.matches_rating(4) && starred.matches_rating(5));
 }
 
 /// One image's adjustments and history.
@@ -476,6 +496,11 @@ pub struct AppState {
     pub engine: Arc<dyn ImageEngine>,
     pub images: Vec<ImageInfo>,
     pub nodes: Vec<CollNode>,
+    pub library_document: Option<LibraryDocument>,
+    pub library_busy: bool,
+    pub library_offline: HashSet<ImageId>,
+    pub library_include_subfolders: bool,
+    pub(crate) file_status_generation: u64,
     pub recent_imports: BTreeSet<ImageId>,
     pub recent_captures: BTreeSet<ImageId>,
     pub trash: BTreeSet<ImageId>,
@@ -602,6 +627,11 @@ impl AppState {
             },
         ];
         let mut this = Self {
+            library_document: source.path().and_then(|p| LibraryDocument::load(if p.is_dir() { p } else { p.parent()? }).ok().flatten()),
+            library_busy: false,
+            library_offline: HashSet::new(),
+            library_include_subfolders: true,
+            file_status_generation: 0,
             styles: engine.styles(),
             icc_profiles: engine.icc_profiles(),
             lens_profiles: engine.lens_profiles(),
@@ -673,6 +703,10 @@ impl AppState {
             cursor_changed: std::time::Instant::now(),
         };
         let layout = this.settings.workspace.clone();
+        this.library_include_subfolders = this.library_document.as_ref().is_none_or(|d| d.include_subfolders);
+        if let Some((root, output)) = this.engine.library_root().zip(this.library_document.as_ref().and_then(|d| d.shortcuts.get("Output"))) {
+            for recipe in &mut this.recipes { recipe.destination = Some(LibraryDocument::resolve(&root, output)); }
+        }
         this.load_layout(&layout);
         this.load_arrangement();
         this.view.viewer_gray = this.settings.viewer_gray;
@@ -682,6 +716,7 @@ impl AppState {
         this.queue_thumbs(all, cx);
         this.request_render(RenderQuality::Final, cx);
         this.probe_tether(cx);
+        this.refresh_file_status(cx);
         this
     }
 
@@ -706,13 +741,13 @@ impl AppState {
             .iter()
             .filter(|i| members.as_ref().is_none_or(|m| m.contains(&i.id)))
             .filter(|i| in_trash || !self.trash.contains(&i.id))
-            .filter(|i| i.rating >= f.min_rating)
+            .filter(|i| f.matches_rating(i.rating))
             .filter(|i| f.color_tag.is_none_or(|t| i.color_tag == t))
             .filter(|i| !f.edited_only || self.edits.get(&i.id).is_some_and(|e| !e.adj.is_default()))
             .filter(|i| {
                 search.is_empty()
                     || i.file_name.to_lowercase().contains(&search)
-                    || i.keywords.iter().any(|k| k.contains(&search))
+                    || i.keywords.iter().any(|k| k.to_lowercase().contains(&search))
             })
             .collect();
         match self.sort {
@@ -721,7 +756,10 @@ impl AppState {
             SortKey::Rating => out.sort_by(|a, b| b.rating.cmp(&a.rating)),
             SortKey::ColorTag => out.sort_by_key(|i| i.color_tag as u8),
             SortKey::FileSize => out.sort_by_key(|i| i.file_size),
-            SortKey::Custom => out.sort_by_key(|i| (self.custom_rank(i.id), i.file_name.clone())),
+            SortKey::Custom => {
+                let ranks: HashMap<_, _> = self.custom_order.iter().enumerate().map(|(rank, id)| (*id, rank)).collect();
+                out.sort_by(|a, b| (ranks.get(&a.id).copied().unwrap_or(usize::MAX), &a.file_name).cmp(&(ranks.get(&b.id).copied().unwrap_or(usize::MAX), &b.file_name)));
+            }
         }
         if self.sort_desc {
             out.reverse();
@@ -903,11 +941,16 @@ impl AppState {
 
     /// Imports files, then applies metadata, a style and an album to what arrived.
     pub fn import_with(&mut self, paths: Vec<std::path::PathBuf>, after: ImportAfter, cx: &mut Context<Self>) {
+        if self.library_busy { self.notify(t("A file operation is already running", "正在处理文件，请稍候"), cx); return; }
+        self.library_busy = true;
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { engine.import(&paths) }).await;
-            this.update(cx, |this, cx| match result {
-                Ok(added) => {
+            let result = cx.background_spawn(async move { engine.import(&paths).map(|added| (added, collections::flatten(engine.as_ref(), &engine.collections()))) }).await;
+            this.update(cx, |this, cx| { this.library_busy = false; match result {
+                Ok((added, nodes)) => {
+                    let user_ids: HashSet<_> = this.nodes.iter().filter(|n| n.user).map(|n| n.id).collect();
+                    this.nodes.retain(|n| n.user);
+                    this.nodes.extend(nodes.into_iter().filter(|n| !user_ids.contains(&n.id)));
                     let ids: Vec<_> = added.iter().map(|i| i.id).collect();
                     for info in &added {
                         this.edits.insert(info.id, Edit::default());
@@ -945,7 +988,7 @@ impl AppState {
                     this.notify(format!("{} {n} {}", t("Imported", "已导入"), t("images", "张图像")), cx);
                 }
                 Err(err) => this.notify(format!("{}: {err}", t("Import failed", "导入失败")), cx),
-            })
+            }})
             .ok();
         })
         .detach();

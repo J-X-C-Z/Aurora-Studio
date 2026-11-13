@@ -19,7 +19,7 @@ const MAX_BYTES: usize = 256 << 20;
 /// Bump this whenever a change to decoding or rendering alters output pixels.
 /// Cached frames outlive rebuilds, so without a bump an upgraded engine would
 /// keep serving frames produced by the old algorithm.
-const RENDER_VERSION: u32 = 1;
+const RENDER_VERSION: u32 = 2;
 
 /// Everything that changes the rendered bytes. `generation` is deliberately
 /// absent: a redraw of the same content must hit.

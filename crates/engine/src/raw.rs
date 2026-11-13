@@ -41,7 +41,13 @@ pub fn embedded_preview(path: &Path) -> anyhow::Result<RgbaImage> {
         }
         Some((u64::from(w) * u64::from(h), decoded.to_rgba8()))
     })?;
-    found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))
+    let preview = found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))?;
+    let mut preview = image::DynamicImage::ImageRgba8(preview);
+    // Match libraw's camera-oriented pixels, including the preview fallback.
+    preview.apply_orientation(image::metadata::Orientation::from_exif(
+        exif_orientation_tag(path).unwrap_or(1) as u8,
+    ).unwrap_or(image::metadata::Orientation::NoTransforms));
+    Ok(preview.to_rgba8())
 }
 
 /// The sRGB transfer curve on linear light 0..=1.
@@ -183,14 +189,18 @@ fn same_picture(a: &[f32], path: &Path) -> bool {
         return true;
     };
     let b = luma_grid(&preview);
-    // libraw hands over the sensor in its stored orientation while the camera's
-    // preview is already turned, so a quarter turn must not count as a mismatch.
+    // Decoders may differ in orientation; every quarter turn is the same picture.
     // Correlation is used rather than a difference because the sensor decode is
     // linear and the preview is display-encoded: only the picture shape may be
     // compared, not the level.
-    let straight = correlation(a, &b);
-    let quarter = correlation(&transpose(a), &b);
-    straight.max(quarter) > 0.90
+    let mut grid = a.to_vec();
+    for _ in 0..4 {
+        if correlation(&grid, &b) > 0.90 {
+            return true;
+        }
+        grid = transpose(&grid);
+    }
+    false
 }
 /// Pearson correlation of two equally sized grids.
 fn correlation(a: &[f32], b: &[f32]) -> f32 {
@@ -277,6 +287,7 @@ pub fn is_raw(path: &Path) -> bool {
 ///
 /// Only the JPEG headers are read, so this is cheap enough to run over a whole folder.
 pub fn preview_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let swap = matches!(exif_orientation_tag(path), Some(5..=8));
     scan_best(path, |segment| {
         let reader =
             image::ImageReader::with_format(std::io::Cursor::new(segment), ImageFormat::Jpeg);
@@ -284,7 +295,8 @@ pub fn preview_dimensions(path: &Path) -> Option<(u32, u32)> {
         if w == 0 || h == 0 {
             return None;
         }
-        Some((u64::from(w) * u64::from(h), (w, h)))
+        let size = if swap { (h, w) } else { (w, h) };
+        Some((u64::from(w) * u64::from(h), size))
     })
     .ok()
     .flatten()
@@ -881,6 +893,74 @@ mod tests {
         let img = embedded_preview(&path).unwrap();
         assert_eq!((img.width(), img.height()), (96, 64));
         assert_eq!(preview_dimensions(&path), Some((96, 64)));
+    }
+
+    fn oriented_raw(orientation: u16) -> PathBuf {
+        let mut bytes = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&274u16.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&orientation.to_le_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&jpeg(96, 64, 17));
+        temp_file(&format!("orientation-{orientation}.nef"), &bytes)
+    }
+
+    #[test]
+    fn preview_and_fallback_follow_all_camera_orientations() {
+        use image::imageops::{flip_horizontal, flip_vertical, rotate90, rotate180, rotate270};
+        let original = embedded_preview(&oriented_raw(1)).unwrap();
+        for orientation in 1..=8 {
+            let path = oriented_raw(orientation);
+            let expected = match orientation {
+                2 => flip_horizontal(&original),
+                3 => rotate180(&original),
+                4 => flip_vertical(&original),
+                5 => flip_horizontal(&rotate90(&original)),
+                6 => rotate90(&original),
+                7 => flip_vertical(&rotate90(&original)),
+                8 => rotate270(&original),
+                _ => original.clone(),
+            };
+            assert_eq!(embedded_preview(&path).unwrap(), expected, "EXIF {orientation}");
+            assert_eq!(decode(&path).unwrap(), expected, "fallback EXIF {orientation}");
+            assert_eq!(preview_dimensions(&path), Some(expected.dimensions()));
+        }
+    }
+
+    #[test]
+    fn picture_validation_accepts_every_quarter_turn() {
+        let path = oriented_raw(8);
+        let mut grid = luma_grid(&embedded_preview(&path).unwrap());
+        for _ in 0..4 {
+            assert!(same_picture(&grid, &path));
+            grid = transpose(&grid);
+        }
+        assert!(!same_picture(&vec![0.0; 1024], &path));
+    }
+
+    #[test]
+    #[ignore = "needs LUMEN_TEST_RAW and LUMEN_TEST_OUTPUT; writes only diagnostic previews"]
+    fn camera_orientation_real_file() {
+        let path = PathBuf::from(std::env::var_os("LUMEN_TEST_RAW").unwrap());
+        let output = PathBuf::from(std::env::var_os("LUMEN_TEST_OUTPUT").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        let preview = embedded_preview(&path).unwrap();
+        let eight = decode(&path).unwrap();
+        let size = sensor_dimensions(&path).unwrap();
+        assert_eq!(eight.width() < eight.height(), size.0 < size.1);
+        if let Some((w, h, pixels)) = decode16(&path) {
+            assert_eq!((w, h), eight.dimensions());
+            assert_eq!(pixels.len(), (w * h * 4) as usize);
+            assert_eq!(from_sensor(&path), Some(true));
+        } else {
+            assert_eq!(eight, preview, "unsupported sensor data must use the oriented preview");
+            assert_eq!(from_sensor(&path), Some(false));
+        }
+        preview.save(output.join("camera-preview.png")).unwrap();
+        image::imageops::thumbnail(&eight, 1000, 1000).save(output.join("sensor-preview.png")).unwrap();
+        eprintln!("orientation={}, preview={:?}, decoded={:?}, from_sensor={:?}", exif_rotation_deg(&path), preview.dimensions(), eight.dimensions(), from_sensor(&path));
     }
 
     #[test]
