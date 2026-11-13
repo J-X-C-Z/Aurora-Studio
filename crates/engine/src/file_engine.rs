@@ -1504,6 +1504,7 @@ mod tests {
         dir
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn a_tiff_still_in_the_camera_colour_space_gets_the_camera_profile() {
         let dir = icc_temp_dir("tiff-camera");
@@ -1566,6 +1567,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn raw_files_still_get_their_camera_defaults() {
         let dir = icc_temp_dir("raw");

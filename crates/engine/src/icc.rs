@@ -1156,6 +1156,7 @@ mod tests {
         assert!(worst <= 2, "worst channel error {worst}/255 vs lcms");
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn other_c1_profile_families_match_lcms() {
         // Ground truth from lcms2 for one profile from each C1 family.
@@ -1249,6 +1250,7 @@ mod tests {
         assert!(with_lut > 0 && with_matrix > 0, "samples must cover both families");
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn scan_profiles_lists_c1_profiles() {
         let dir = profile_dir();
