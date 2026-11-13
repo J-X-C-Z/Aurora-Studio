@@ -33,6 +33,7 @@ actions!(
         OpenFolder,
         OpenCatalog,
         NewSession,
+        NewCatalog,
         SyncXmp,
         ExportSelected,
         OpenExportDialog,
@@ -143,6 +144,8 @@ pub fn shortcuts() -> Vec<Shortcut> {
     let rate = t("Rating & Tags", "评级与色标");
     add("quit", "Exit", "退出", file, &["ctrl-q"], Box::new(Quit));
     add("import", "Import images", "导入图像", file, &["ctrl-shift-i"], Box::new(Import));
+    add("new-catalog", "New catalog", "新建目录", file, &["ctrl-shift-n"], Box::new(NewCatalog));
+    add("new-session", "New session", "新建会话", file, &["ctrl-n"], Box::new(NewSession));
     add("export-selected", "Process selected", "处理所选", file, &["ctrl-d"], Box::new(ExportSelected));
     add("export", "Export…", "导出…", file, &["ctrl-shift-d"], Box::new(OpenExportDialog));
     add("print", "Print…", "打印…", file, &["ctrl-p"], Box::new(Print));
@@ -302,7 +305,8 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
                 MenuItem::action(t("Open Folder…", "打开文件夹…"), OpenFolder),
                 MenuItem::action(t("Open Capture One Catalog… (partial)", "打开 Capture One 目录…（部分）"), OpenCatalog),
                 MenuItem::submenu(Menu { name: t("Open Recent", "打开最近").into(), items: recent_items, disabled: false }),
-                MenuItem::action(t("New Session… (unavailable)", "新建会话…（后端未接）"), NewSession),
+                MenuItem::action(t("New Catalog…", "新建目录…"), NewCatalog),
+                MenuItem::action(t("New Session…", "新建会话…"), NewSession),
                 MenuItem::action(t("Sync XMP Metadata (unavailable)", "同步 XMP 元数据（后端未接）"), SyncXmp),
                 MenuItem::separator(),
                 MenuItem::action(t("Export Selected", "导出所选"), ExportSelected),

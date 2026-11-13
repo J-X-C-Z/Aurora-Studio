@@ -1,4 +1,4 @@
-//! Collection dialogs (rename, smart-album rules) and the drag payload that
+//! Collection dialogs (rename/move, smart-album rules) and the drag payload that
 //! carries images from the browser onto albums.
 
 use gpui_kit::assets::IconName;
@@ -56,19 +56,38 @@ pub fn rename(state: &Entity<AppState>, id: u64, current: String, window: &mut W
         let st = st.clone();
         input.read(cx).focus_handle(cx).focus(window, cx);
         dialog
-            .title(t("Rename collection", "重命名集合"))
+            .title(t("Rename / move collection", "重命名 / 移动集合"))
             .w(px(380.0))
             .child(Input::new(&input))
+            .child(move_to(&st, id, cx))
             .footer(
                 h_flex().gap_2().justify_end().child(Button::new("coll-rename-ok").primary().label(t("Rename", "重命名")).on_click(move |_, window, cx| {
                     let name = input2.read(cx).value().to_string();
-                    if !name.trim().is_empty() {
-                        st.update(cx, |s, cx| s.rename_collection(id, name.trim().to_string(), cx));
+                    if !name.trim().is_empty()
+                        && st.update(cx, |s, cx| s.rename_collection(id, name.trim().to_string(), cx))
+                    {
+                        window.close_dialog(cx);
                     }
-                    window.close_dialog(cx);
                 })),
             )
     });
+}
+
+/// Reuses the collection placement rules for both manual and smart-album dialogs.
+pub fn move_to(state: &Entity<AppState>, id: u64, cx: &App) -> gpui_kit::AnyElement {
+    let s = state.read(cx);
+    let Some(node) = s.node(id).filter(|n| n.user) else { return div().into_any_element() };
+    let mut options = vec![(None, t("User Collections", "用户集合").into())];
+    options.extend(s.nodes.iter().filter(|n| s.can_move_collection(id, Some(n.id))).map(|n| (Some(n.id), n.name.clone().into())));
+    let st = state.clone();
+    h_flex()
+        .gap_2()
+        .text_sm()
+        .child(t("Move to", "移动到"))
+        .child(div().flex_1().child(select(format!("coll-move-{id}"), options, node.parent, move |parent, _, cx| {
+            st.update(cx, |s, cx| { s.move_collection(id, parent, cx); });
+        })))
+        .into_any_element()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -234,11 +253,12 @@ pub fn smart_rules(state: &Entity<AppState>, id: u64, window: &mut Window, cx: &
                         s.set_smart_rules(id, rules, all, cx);
                     })
                 }))
-        });
+        }).collect::<Vec<_>>();
         let (st_all, st_add) = (st.clone(), st.clone());
         dialog
             .title(format!("{} · {}", t("Smart Album", "智能相册"), node.name))
             .w(px(560.0))
+            .child(move_to(&st, id, cx))
             .child(
                 v_flex()
                     .gap_2()

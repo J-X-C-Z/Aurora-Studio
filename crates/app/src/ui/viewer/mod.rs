@@ -604,7 +604,9 @@ impl Render for Viewer {
         let split = s.view.split;
         let rendering = s.preview.rendering;
         let render_error = s.preview.error.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, e)| e.clone());
-        let source_note = s.source_note.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, n)| n.clone());
+        let source_note = if s.current.is_some_and(|id| s.library_offline.contains(&id)) {
+            Some(t("Original offline · cached preview; adjustments become visible when reconnected", "原片离线 · 正在显示缓存预览，调整将在原片连接后显示").into())
+        } else { s.source_note.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, n)| n.clone()) };
         // Soft proofing uses the output profile of the selected process recipe, as Capture One does.
         let soft_proof = s.view.soft_proof.then(|| {
             let profile = s.recipes.get(s.selected_recipe).map(|r| r.icc_profile.clone()).filter(|p| !p.is_empty()).unwrap_or_else(|| "sRGB".into());

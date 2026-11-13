@@ -45,3 +45,5 @@ GPU 界面显示不代表图像处理或 AI 推理已使用 CUDA/TensorRT。本�
 ## 许可
 
 项目代码采用 [MIT](LICENSE)；第三方依赖适用各自许可。本机 Capture One 资产与照片不包含在 MIT 授权或发布包内。
+
+图库与文件管理的操作说明、目录格式升级和功能边界见 [docs/library-management.md](docs/library-management.md)。

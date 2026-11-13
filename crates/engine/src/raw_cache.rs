@@ -67,7 +67,7 @@ fn cache_key(path: &Path, dir: &Path, long_side: u32) -> Result<PathBuf> {
         .map_or(0, |d| d.as_nanos());
     let mut a = DefaultHasher::new();
     let mut b = DefaultHasher::new();
-    (1u8, path, meta.len(), mtime, long_side).hash(&mut a);
+    (2u8, path, meta.len(), mtime, long_side).hash(&mut a);
     (0xa5u8, path, mtime, long_side, meta.len()).hash(&mut b);
     let name = format!("{PREFIX}{:016x}{:016x}-{long_side}.png", a.finish(), b.finish());
     Ok(dir.join(name))

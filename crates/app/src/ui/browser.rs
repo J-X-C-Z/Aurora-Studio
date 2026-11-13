@@ -177,7 +177,7 @@ fn cell(
     let st = state.clone();
     let rating = info.rating;
     let tag = info.color_tag;
-    let name: SharedString = info.file_name.clone().into();
+    let name: SharedString = if s.library_offline.contains(&id) { format!("{} · {}", info.file_name, t("Offline", "离线")).into() } else { info.file_name.clone().into() };
     let variant = info.variant;
     let dragged: Vec<ImageId> = if selected { s.selection.iter().copied().collect() } else { vec![id] };
     // Stack: the pick carries a badge with the count; open members sit on a well.
@@ -348,6 +348,7 @@ fn cell(
             let in_stack = s.stack_of(id).is_some();
             let is_pick = s.stack_of(id).is_some_and(|st| st.pick() == id);
             let st = st_menu.clone();
+            let menu = crate::ui::files::image_menu(menu, &st_menu, id, cx);
             menu.item(PopupMenuItem::new(t("Stack Selected", "堆叠所选")).on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::StackSelected), cx)))
                 .when(in_stack, |m| {
                     m.item(PopupMenuItem::new(t("Unstack", "取消堆叠")).on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::UnstackSelected), cx)))
@@ -368,6 +369,7 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
     let thumb = s.thumbs.get(&id).cloned();
     let st = state.clone();
     let e = &info.exif;
+    let st_menu = state.clone();
     let col = |w: f32, text: String| div().w(px(w)).flex_shrink_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(text);
     h_flex()
         .id(SharedString::from(format!("row-{}", id.0)))
@@ -386,7 +388,7 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
             st.update(cx, |s, cx| s.select(id, m.control || m.platform, m.shift, cx))
         })
         .child(div().w(px(44.0)).h(px(30.0)).flex().items_center().justify_center().when_some(thumb, |d, t| d.child(img(t).max_w_full().max_h_full().object_fit(ObjectFit::Contain))))
-        .child(col(240.0, info.file_name.clone()).text_color(p.text))
+        .child(col(240.0, if s.library_offline.contains(&id) { format!("{} · {}", info.file_name, t("Offline", "离线")) } else { info.file_name.clone() }).text_color(p.text))
         .child(col(150.0, e.captured_at.clone().unwrap_or_default().replace('T', " ").chars().take(16).collect()))
         .child(col(160.0, format!("{} {}", e.camera_make.clone().unwrap_or_default(), e.camera_model.clone().unwrap_or_default())))
         .child(col(70.0, e.iso.map(|i| format!("ISO {i}")).unwrap_or_default()))
@@ -396,6 +398,7 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
         .child(div().w(px(12.0)).h(px(12.0)).rounded_full().when(info.color_tag != ColorTag::None, |d| d.bg(hex(info.color_tag.rgb()))))
         .child(col(80.0, format!("{:.1} MB", info.file_size as f64 / 1_000_000.0)))
         .child(col(120.0, format!("{} × {}", info.width, info.height)))
+        .context_menu(move |menu, _, cx| crate::ui::files::image_menu(menu, &st_menu, id, cx))
 }
 
 impl Render for Browser {

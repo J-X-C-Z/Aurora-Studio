@@ -25,12 +25,11 @@ use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, JobStatus, NormRe
 const SOURCE_LONG_SIDE: u32 = 4096;
 /// How many decoded sources stay in memory at once.
 const CACHED_SOURCES: usize = 8;
-/// Folder collection ids start here; the index into `folder_dirs()` is added.
+/// Persistent folder identities start here.
 const FOLDER_BASE: u64 = 1000;
 
-fn folder_id(index: usize) -> u64 {
-    FOLDER_BASE + index as u64
-}
+#[path = "library_fs.rs"]
+mod library_fs;
 
 /// A decoded frame, capped to [`SOURCE_LONG_SIDE`] with its aspect ratio kept.
 fn fit_long_side(size: (u32, u32)) -> (u32, u32) {
@@ -98,6 +97,7 @@ fn raw16_source(path: &Path) -> Option<Source> {
     Some(Source::from_rgba16(w, h, img.as_raw()))
 }
 
+#[derive(Clone)]
 struct FileEntry {
     info: ImageInfo,
     path: PathBuf,
@@ -131,7 +131,8 @@ pub struct FileEngine {
 impl FileEngine {
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root = root.as_ref().to_path_buf();
+        let root = library_fs::canonical_path(root.as_ref())?;
+        anyhow::ensure!(root.is_dir(), "library root is not a directory");
         let store = match Store::open(&root) {
             Ok(store) => Some(store),
             Err(err) => {
@@ -144,12 +145,15 @@ impl FileEngine {
                 None
             }
         };
-        let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
+        let catalog = match &store {
+            Some(store) => store.load_index()?,
+            None => Catalog::default(),
+        };
         let engine = Self {
-            root,
+            root: root.clone(),
             state: Arc::new(Mutex::new(State {
-                entries: Vec::new(),
-                next_id: 1,
+                entries: Self::restore_entries(&root, store.as_ref(), &catalog)?,
+                next_id: catalog.next_id.max(catalog.images.iter().filter_map(|e| e.info.as_ref()).map(|i| i.id.0 + 1).max().unwrap_or(1)),
                 sources: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
@@ -192,13 +196,17 @@ impl FileEngine {
         }) {
             root = root.parent().unwrap_or(Path::new(".")).to_path_buf();
         }
+        let root = library_fs::canonical_path(&root)?;
         let store = Store::open(&root).ok();
-        let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
+        let catalog = match &store {
+            Some(store) => store.load_index()?,
+            None => Catalog::default(),
+        };
         let engine = Self {
-            root,
+            root: root.clone(),
             state: Arc::new(Mutex::new(State {
-                entries: Vec::new(),
-                next_id: 1,
+                entries: Self::restore_entries(&root, store.as_ref(), &catalog)?,
+                next_id: catalog.next_id.max(catalog.images.iter().filter_map(|e| e.info.as_ref()).map(|i| i.id.0 + 1).max().unwrap_or(1)),
                 sources: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
@@ -210,7 +218,8 @@ impl FileEngine {
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
         };
-        engine.import_c1(&import);
+        engine.import_c1(&import)?;
+        engine.rescan()?;
         engine.preload_ai_masks();
         Ok(engine)
     }
@@ -239,17 +248,22 @@ impl FileEngine {
         }
     }
 
-    fn import_c1(&self, import: &crate::c1import::C1Import) {
-        let mut imported: Vec<(String, AdjustmentSet, ImageInfo)> = Vec::new();
+    fn import_c1(&self, import: &crate::c1import::C1Import) -> anyhow::Result<()> {
         let mut st = self.state.lock();
+        let mut entries = st.entries.clone();
+        let catalog = st.catalog.clone();
+        let mut next_id = st.next_id;
         for image in import.images() {
             let path = PathBuf::from(&image.abs_path);
+            if catalog.excluded.contains(&path) { continue; }
             for variant in import.variants_of(image.pk) {
                 let number = variant.index.max(0) as u32 + 1;
                 let rel_path = crate::c1import::store_key(&path, number);
+                if catalog.excluded_variants.iter().any(|v| v.key == rel_path || (v.path == path && v.variant == number)) { continue; }
+                if entries.iter().any(|e| e.rel_path == rel_path || (e.path == path && e.info.variant == number)) { continue; }
                 // Our store wins over C1's copy, so reopening the catalog keeps the
                 // edits made in Lumen instead of resetting them to C1's.
-                let stored = st.catalog.entry(&rel_path).cloned();
+                let stored = catalog.entry(&rel_path).cloned();
                 let adjustments = match (&self.store, &stored) {
                     (Some(store), Some(_)) => store.load_adjustments(&rel_path).unwrap_or_default(),
                     _ => {
@@ -258,20 +272,15 @@ impl FileEngine {
                         // already applied the camera's EXIF rotation to the pixels,
                         // so only the difference is left for the renderer.
                         if crate::raw::is_raw(&path) {
-                            // Nothing in this pipeline turns the sensor data: libraw is
-                            // asked for the stored orientation and the embedded preview
-                            // is stored the same way. So the full turn is still needed.
-                            if adjustments.geometry.orientation == 0 && path.is_file() {
-                                adjustments.geometry.orientation =
-                                    ((crate::raw::exif_rotation_deg(&path) / 90) % 4) as u8;
-                            }
+                            adjustments.geometry.orientation =
+                                ((adjustments.geometry.orientation as u16 + 4
+                                    - crate::raw::exif_rotation_deg(&path) / 90) % 4) as u8;
                         }
                         adjustments
                     }
                 };
-                let id = ImageId(st.next_id);
-                st.next_id += 1;
-                let fresh = stored.is_none();
+                let id = ImageId(next_id);
+                next_id += 1;
                 let info = ImageInfo {
                     id,
                     path: path.clone(),
@@ -301,157 +310,40 @@ impl FileEngine {
                     has_adjustments: !adjustments.is_default(),
                     trashed: stored.as_ref().is_some_and(|e| e.trashed),
                 };
-                st.entries.push(FileEntry {
+                entries.push(FileEntry {
                     info: info.clone(),
                     path: path.clone(),
                     rel_path: rel_path.clone(),
                     adjustments: adjustments.clone(),
                 });
-                if fresh {
-                    imported.push((rel_path, adjustments, info));
-                }
             }
         }
-        // Persist everything in one catalog write: one save per image would rewrite
-        // catalog.json once per file on a large catalog.
-        if let Some(store) = &self.store {
-            for (rel_path, adjustments, _) in &imported {
-                if let Err(err) = store.save_adjustments(rel_path, adjustments) {
-                    log::warn!("save adjustments {rel_path}: {err}");
-                }
-            }
-        }
-        for (rel_path, _, info) in &imported {
-            st.catalog.upsert(Entry {
-                rel_path: rel_path.clone(),
-                rating: info.rating,
-                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-                keywords: info.keywords.clone(),
-                variant: info.variant,
-                updated_at: now_secs(),
-                trashed: info.trashed,
-            });
-        }
-        let catalog = st.catalog.clone();
-        drop(st);
-        if let Some(store) = &self.store {
-            if let Err(err) = store.save_index(&catalog) {
-                log::warn!("save catalog: {err}");
-            }
-        }
-    }
-
-    /// Re-reads the folder, keeping edits already made.
-    pub fn rescan(&self) -> anyhow::Result<()> {
-        let mut found = Vec::new();
-        collect(&self.root, &self.root, 0, &mut found)?;
-        found.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut st = self.state.lock();
-        let previous: HashMap<String, (AdjustmentSet, i8, ColorTag, Vec<String>, u32)> = st
-            .entries
-            .iter()
-            .map(|e| {
-                (
-                    e.rel_path.clone(),
-                    (e.adjustments.clone(), e.info.rating, e.info.color_tag, e.info.keywords.clone(), e.info.variant),
-                )
-            })
-            .collect();
-
-        st.entries.clear();
-        for (rel, abs) in found {
-            let (w, h) = dimensions(&abs);
-            let rel_path = rel.replace('\\', "/");
-            let stored = previous.get(&rel_path);
-            let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
-            // Restore edits saved in a previous process; keep unsaved in-memory
-            // edits made before this rescan.
-            if adjustments.is_default() {
-                if let Some(store) = &self.store {
-                    if let Ok(saved) = store.load_adjustments(&rel_path) {
-                        adjustments = saved;
-                    }
-                }
-            }
-            let mut rating = stored.map(|s| s.1).unwrap_or(0);
-            let mut color_tag = stored.map(|s| s.2).unwrap_or(ColorTag::None);
-            let mut keywords = stored.map(|s| s.3.clone()).unwrap_or_default();
-            let mut variant = stored.map(|s| s.4).unwrap_or(1);
-            let mut trashed = false;
-
-            // The catalog wins over the in-memory copy: it survives restarts.
-            if let Some(entry) = st.catalog.entry(&rel_path) {
-                rating = entry.rating;
-                color_tag = ColorTag::ALL[(entry.color_tag.clamp(0, 7)) as usize];
-                keywords = entry.keywords.clone();
-                variant = variant.max(entry.variant);
-                trashed = entry.trashed;
-            }
-
-            let (exif, iptc) = crate::exif::read_metadata(&abs);
-            if keywords.is_empty() {
-                keywords = iptc.keywords.clone();
-            }
-            let id = ImageId(st.next_id);
-            st.next_id += 1;
-            st.entries.push(FileEntry {
-                info: ImageInfo {
-                    id,
-                    path: abs.clone(),
-                    file_name: abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                    kind: file_kind(&abs),
-                    width: w,
-                    height: h,
-                    file_size: std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0),
-                    exif,
-                    iptc,
-                    keywords,
-                    rating,
-                    color_tag,
-                    variant,
-                    has_adjustments: !adjustments.is_default(),
-                    trashed,
-                },
-                path: abs,
-                rel_path,
-                adjustments,
-            });
-        }
+        self.commit_library(&mut st, entries, catalog, &[], None)?;
         Ok(())
     }
 
+    /// Re-reads the folder, preserving identities, variants, edits and offline records.
+    pub fn rescan(&self) -> anyhow::Result<()> {
+        self.synchronize_folder(&self.root, true, false).map(|_| ())
+    }
+
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
-        let (w, h) = dimensions(path);
-        let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        let path = library_fs::canonical_path(path)?;
+        anyhow::ensure!(path.is_file() && is_supported(&path), "unsupported image {}", path.display());
         let mut st = self.state.lock();
+        if let Some(entry) = st.entries.iter().find(|e| e.path == path) {
+            return Ok(entry.info.clone());
+        }
+        let mut catalog = st.catalog.clone();
+        catalog.excluded.retain(|p| p != &path);
+        catalog.excluded_variants.retain(|v| v.path != path);
+        let mut entries = st.entries.clone();
         let id = ImageId(st.next_id);
-        st.next_id += 1;
-        let (exif, iptc) = crate::exif::read_metadata(path);
-        let keywords = iptc.keywords.clone();
-        let info = ImageInfo {
-            id,
-            path: path.to_path_buf(),
-            file_name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            kind: file_kind(path),
-            width: w,
-            height: h,
-            file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-            exif,
-            iptc,
-            keywords,
-            rating: 0,
-            color_tag: ColorTag::None,
-            variant: 1,
-            has_adjustments: false,
-            trashed: false,
-        };
-        st.entries.push(FileEntry {
-            info: info.clone(),
-            path: path.to_path_buf(),
-            rel_path: rel,
-            adjustments: AdjustmentSet::default(),
-        });
+        let key = self.unique_store_key(&path, 1, id, &entries);
+        let entry = self.discovered_entry(&path, id, key.clone(), catalog.entry(&key))?;
+        let info = entry.info.clone();
+        entries.push(entry);
+        self.commit_library(&mut st, entries, catalog, &[], None)?;
         Ok(info)
     }
 
@@ -511,6 +403,12 @@ impl FileEngine {
     /// Cached preview frame at full requested pixel quality.
     fn preview_frame(&self, request: &PreviewRequest, _fast: bool) -> anyhow::Result<PreviewFrame> {
         let start = Instant::now();
+        if let Some(image) = self.offline_library_preview(request.image, request.max_size)? {
+            return Ok(PreviewFrame {
+                histogram: process::histogram(image.pixels.as_ref()), image,
+                generation: request.generation, elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            });
+        }
         let src = self.source(request.image)?;
         let max = request.max_size;
         let fast = false;
@@ -540,87 +438,7 @@ impl FileEngine {
         })
     }
 
-    fn persist(&self, rel_path: &str, adjustments: &AdjustmentSet, info: &ImageInfo) {
-        let Some(store) = &self.store else { return };
-        if let Err(err) = store.save_adjustments(rel_path, adjustments) {
-            log::warn!("save adjustments {rel_path}: {err}");
-            return;
-        }
-        let mut st = self.state.lock();
-        st.catalog.upsert(Entry {
-            rel_path: rel_path.to_string(),
-            rating: info.rating,
-            color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-            keywords: info.keywords.clone(),
-            variant: info.variant,
-            updated_at: now_secs(),
-            trashed: info.trashed,
-        });
-        let catalog = st.catalog.clone();
-        drop(st);
-        if let Err(err) = store.save_index(&catalog) {
-            log::warn!("save catalog: {err}");
-        }
-    }
 
-    fn collection_tree(&self) -> Vec<Collection> {
-        let (count, trashed) = {
-            let st = self.state.lock();
-            (st.entries.len(), st.entries.iter().filter(|e| e.info.trashed).count())
-        };
-        let folders: Vec<Collection> = self
-            .folder_dirs()
-            .iter()
-            .enumerate()
-            .map(|(index, (dir, n))| Collection {
-                id: folder_id(index),
-                name: if dir.is_empty() { self.root.display().to_string() } else { dir.clone() },
-                kind: CollectionKind::Folder,
-                count: *n,
-                children: Vec::new(),
-            })
-            .collect();
-        let node = |id, name: &str, kind, count, children| Collection { id, name: name.into(), kind, count, children };
-        vec![
-            node(1, "All Images", CollectionKind::AllImages, count, vec![]),
-            node(2, "Recent Imports", CollectionKind::RecentImports, count.min(12), vec![]),
-            node(3, "Recent Captures", CollectionKind::RecentCaptures, 0, vec![]),
-            node(4, "Trash", CollectionKind::Trash, trashed, vec![]),
-            node(10, "Folders", CollectionKind::Group, folders.len(), folders),
-        ]
-    }
-
-    fn collection_images(&self, collection: u64) -> Option<Vec<ImageId>> {
-        let index = collection.checked_sub(FOLDER_BASE)? as usize;
-        let dir = self.folder_dirs().get(index)?.0.clone();
-        let st = self.state.lock();
-        Some(
-            st.entries
-                .iter()
-                .filter(|e| match e.rel_path.rfind('/') {
-                    Some(idx) => e.rel_path[..idx] == dir,
-                    None => dir.is_empty(),
-                })
-                .map(|e| e.info.id)
-                .collect(),
-        )
-    }
-
-    /// Every immediate directory of the catalog with its image count, sorted.
-    fn folder_dirs(&self) -> Vec<(String, usize)> {
-        let st = self.state.lock();
-        let mut by_dir: HashMap<String, usize> = HashMap::new();
-        for entry in &st.entries {
-            let dir = match entry.rel_path.rfind('/') {
-                Some(idx) => entry.rel_path[..idx].to_string(),
-                None => String::new(),
-            };
-            *by_dir.entry(dir).or_insert(0) += 1;
-        }
-        let mut dirs: Vec<(String, usize)> = by_dir.into_iter().collect();
-        dirs.sort();
-        dirs
-    }
 }
 
 fn now_secs() -> i64 {
@@ -640,28 +458,6 @@ fn file_kind(path: &Path) -> FileKind {
         Some("dng") => FileKind::Dng,
         _ => FileKind::Raw,
     }
-}
-
-/// Depth-limited so a symlink loop cannot hang the scan.
-fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) -> anyhow::Result<()> {
-    if depth > 12 {
-        return Ok(());
-    }
-    let Ok(read) = std::fs::read_dir(dir) else { return Ok(()) };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "lumen-output" {
-                continue;
-            }
-            collect(root, &path, depth + 1, out)?;
-        } else if path.is_file() && is_supported(&path) {
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
-            out.push((rel, path));
-        }
-    }
-    Ok(())
 }
 
 fn is_supported(path: &Path) -> bool {
@@ -810,15 +606,10 @@ impl ImageEngine for FileEngine {
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>> {
         let mut added = Vec::new();
         for path in paths {
-            if path.is_dir() && !path.starts_with(&self.root) {
-                let mut files = Vec::new();
-                collect(path, path, 0, &mut files)?;
-                for (_, abs) in files {
-                    if let Ok(info) = self.add_file(&abs) {
-                        added.push(info);
-                    }
-                }
-            } else if path.is_file() && is_supported(path) {
+            if path.is_dir() {
+                let before: Vec<_> = self.images().iter().map(|i| i.id).collect();
+                added.extend(self.synchronize_folder(path, true, true)?.into_iter().filter(|i| !before.contains(&i.id)));
+            } else {
                 added.push(self.add_file(path)?);
             }
         }
@@ -829,74 +620,52 @@ impl ImageEngine for FileEngine {
         self.collection_tree()
     }
 
-    // Without this the trait default (`None`) hides the folder membership from the
-    // interface, which only sees `dyn ImageEngine`.
+    fn library_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+
+    fn collection_path(&self, id: u64) -> Option<PathBuf> {
+        self.state.lock().catalog.folders.iter().find(|f| f.id == id).map(|f| f.path.clone())
+    }
+
+    fn user_collections(&self) -> Vec<crate::UserCollection> {
+        self.store.as_ref().map(|store| store.load_user_collections()).unwrap_or_default()
+    }
+
+    fn manage_files(&self, action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
+        self.manage_library(action)
+    }
+
     fn collection_images(&self, collection: u64) -> Option<Vec<ImageId>> {
-        FileEngine::collection_images(self, collection)
+        let path = self.collection_path(collection)?;
+        Some(self.state.lock().entries.iter().filter(|e| e.path.parent() == Some(path.as_path())).map(|e| e.info.id).collect())
     }
 
     fn save_user_collections(&self, collections: &[crate::UserCollection]) -> anyhow::Result<()> {
-        match &self.store {
-            Some(store) => store.save_user_collections(collections).map_err(Into::into),
-            None => Ok(()),
-        }
+        let _st = self.state.lock();
+        let store = self.writable_store()?;
+        store.save_user_collections(collections)
     }
 
     fn set_trashed(&self, ids: &[ImageId], trashed: bool) -> anyhow::Result<()> {
-        let catalog = {
-            let mut st = self.state.lock();
-            let mut changed = Vec::new();
-            for entry in st.entries.iter_mut().filter(|e| ids.contains(&e.info.id)) {
-                entry.info.trashed = trashed;
-                changed.push((entry.rel_path.clone(), entry.info.clone()));
-            }
-            for (rel, info) in changed {
-                st.catalog.upsert(Entry {
-                    rel_path: rel,
-                    rating: info.rating,
-                    color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-                    keywords: info.keywords.clone(),
-                    variant: info.variant,
-                    updated_at: now_secs(),
-                    trashed,
-                });
-            }
-            st.catalog.clone()
-        };
-        if let Some(store) = &self.store {
-            store.save_index(&catalog)?;
+        let mut st = self.state.lock();
+        let mut entries = st.entries.clone();
+        for entry in entries.iter_mut().filter(|e| ids.contains(&e.info.id)) {
+            entry.info.trashed = trashed;
         }
-        Ok(())
+        let catalog = st.catalog.clone();
+        self.commit_library(&mut st, entries, catalog, &[], None)
     }
 
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()> {
-        let (rel, catalog) = {
-            let mut st = self.state.lock();
-            let entry = st
-                .entries
-                .iter_mut()
-                .find(|e| e.info.id == info.id)
-                .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-            entry.info = info.clone();
-            let rel = entry.rel_path.clone();
-            st.catalog.upsert(Entry {
-                rel_path: rel.clone(),
-                rating: info.rating,
-                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-                keywords: info.keywords.clone(),
-                variant: info.variant,
-                updated_at: now_secs(),
-                trashed: info.trashed,
-            });
-            (rel.clone(), st.catalog.clone())
-        };
-        let _ = rel;
-        if let Some(store) = &self.store {
-            if let Err(err) = store.save_index(&catalog) {
-                log::warn!("save catalog: {err}");
-            }
-        }
-        Ok(())
+        let mut st = self.state.lock();
+        let mut entries = st.entries.clone();
+        let entry = entries.iter_mut().find(|e| e.info.id == info.id)
+            .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
+        anyhow::ensure!(entry.path == info.path && entry.info.variant == info.variant, "use manage_files to change image paths");
+        entry.info = info.clone();
+        let catalog = st.catalog.clone();
+        self.commit_library(&mut st, entries, catalog, &[], None)
     }
 
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet {
@@ -943,48 +712,48 @@ impl ImageEngine for FileEngine {
     }
 
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
-        let (rel, info) = {
-            let mut st = self.state.lock();
-            let entry = st
-                .entries
-                .iter_mut()
-                .find(|e| e.info.id == image)
-                .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-            entry.adjustments = adjustments.clone();
-            entry.info.has_adjustments = !adjustments.is_default();
-            (entry.rel_path.clone(), entry.info.clone())
-        };
-        self.persist(&rel, adjustments, &info);
-        Ok(())
+        let mut st = self.state.lock();
+        let mut entries = st.entries.clone();
+        let entry = entries.iter_mut().find(|e| e.info.id == image)
+            .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
+        entry.adjustments = adjustments.clone();
+        entry.info.has_adjustments = !adjustments.is_default();
+        let catalog = st.catalog.clone();
+        self.commit_library(&mut st, entries, catalog, &[], None)
     }
 
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
         let mut st = self.state.lock();
-        let next = st.next_id;
-        let pos = st
-            .entries
-            .iter()
-            .position(|e| e.info.id == image)
+        let pos = st.entries.iter().position(|e| e.info.id == image)
             .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-        let mut info = st.entries[pos].info.clone();
-        info.id = ImageId(next);
-        info.variant += 1;
-        info.has_adjustments = !adjustments.is_default();
-        st.next_id += 1;
-        let entry = FileEntry {
-            info: info.clone(),
-            path: st.entries[pos].path.clone(),
-            rel_path: st.entries[pos].rel_path.clone(),
-            adjustments: adjustments.clone(),
-        };
-        st.entries.insert(pos + 1, entry);
+        let mut entries = st.entries.clone();
+        let mut entry = entries[pos].clone();
+        entry.info.id = ImageId(st.next_id);
+        entry.info.variant = entries.iter().filter(|e| e.path == entry.path).map(|e| e.info.variant)
+            .chain(st.catalog.excluded_variants.iter().filter(|v| v.path == entry.path).map(|v| v.variant))
+            .max().unwrap_or(0) + 1;
+        entry.info.has_adjustments = !adjustments.is_default();
+        entry.rel_path = self.unique_store_key(&entry.path, entry.info.variant, entry.info.id, &entries);
+        entry.adjustments = adjustments.clone();
+        let info = entry.info.clone();
+        entries.insert(pos + 1, entry);
+        let catalog = st.catalog.clone();
+        self.commit_library(&mut st, entries, catalog, &[], None)?;
         Ok(info)
     }
 
     fn thumbnail(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<RgbaImage> {
+        if let Some(preview) = self.offline_library_preview(image, max_size)? { return Ok(preview); }
         let src = self.source(image)?;
         let out = process::render(&src, &crate::styles::resolve(adjustments), NormRect::FULL, max_size, false, None);
-        Ok(RgbaImage::new(out.width, out.height, out.rgba))
+        let frame = RgbaImage::new(out.width, out.height, out.rgba);
+        let st = self.state.lock();
+        if st.entries.iter().any(|e| e.info.id == image) {
+            if let Some(store) = &self.store {
+                if let Err(err) = store.save_library_preview(image, &frame) { log::warn!("save offline preview: {err}"); }
+            }
+        }
+        Ok(frame)
     }
 
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
@@ -1359,15 +1128,16 @@ impl ImageEngine for FileEngine {
         CameraStatus::Disconnected
     }
     fn capture(&self) -> anyhow::Result<ImageInfo> {
+        let dir = self.capture_directory()?;
         let frame = tether::capture_frame()?;
-        let dir = self.root.join("Capture");
-        std::fs::create_dir_all(&dir)?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let path = dir.join(format!("CAP_{stamp}.jpg"));
-        std::fs::write(&path, &frame.jpeg)?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        file.write_all(&frame.jpeg)?;
         self.add_file(&path)
     }
     fn live_view_frame(&self, width: u32) -> Option<RgbaImage> {

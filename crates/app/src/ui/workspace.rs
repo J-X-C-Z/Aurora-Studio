@@ -268,9 +268,8 @@ impl Workspace {
                     this.spawn_window(path, false, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &NewSession, _, cx| {
-                this.with_state(cx, |s, cx| s.notify(crate::contract::SESSIONS.note().unwrap_or_default(), cx))
-            }))
+            .on_action(cx.listener(|this, _: &NewSession, window, cx| super::files::new_document(&this.state, crate::state::DocumentKind::Session, window, cx)))
+            .on_action(cx.listener(|this, _: &NewCatalog, window, cx| super::files::new_document(&this.state, crate::state::DocumentKind::Catalog, window, cx)))
             .on_action(cx.listener(|this, _: &SyncXmp, _, cx| {
                 this.with_state(cx, |s, cx| s.notify(crate::contract::SESSIONS.note().unwrap_or_default(), cx))
             }))

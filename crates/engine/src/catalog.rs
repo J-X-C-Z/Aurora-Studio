@@ -8,6 +8,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ImageId(pub u64);
 
+/// Explicit catalog and filesystem operations. Forget never deletes originals.
+#[derive(Clone, Debug)]
+pub enum LibraryAction {
+    Synchronize { folder: PathBuf, recursive: bool },
+    Move { images: Vec<ImageId>, destination: PathBuf },
+    MoveFolder { from: PathBuf, to: PathBuf },
+    Rename { image: ImageId, name: String },
+    RenameMany { names: Vec<(ImageId, String)> },
+    Locate { from: PathBuf, to: PathBuf },
+    LocateImage { image: ImageId, to: PathBuf },
+    Forget { images: Vec<ImageId> },
+    CreateFolder { path: PathBuf },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ColorTag {
     #[default]

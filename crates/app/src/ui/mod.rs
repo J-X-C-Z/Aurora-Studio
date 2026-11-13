@@ -3,6 +3,8 @@
 pub mod browser;
 pub mod collections;
 pub mod dialogs;
+pub mod files;
+pub mod system_folders;
 pub mod export;
 pub mod import;
 pub mod inspector;
