@@ -1413,6 +1413,7 @@ mod tests {
 
     // --------------------------------------------------------------- ICC
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn icc_profile_changes_the_output() {
         let dir = temp_dir("icc");
@@ -1432,6 +1433,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn the_icc_profile_is_embedded_in_the_file() {
         let dir = temp_dir("icc-embed");

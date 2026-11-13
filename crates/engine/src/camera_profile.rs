@@ -43,6 +43,7 @@ mod tests {
         assert_eq!(for_camera(""), None);
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn real_icm_parses_as_mft2_lut() {
         let profile = crate::icc::profile("NikonZ6III-ProStandard").expect("profile must load");
@@ -54,6 +55,7 @@ mod tests {
         println!("description={} grid={} b2a={:?}", profile.description, lut.grid, profile.b2a.is_some());
     }
 
+    #[cfg(feature = "external-fixtures")]
     #[test]
     fn lut_conversion_is_monotone_in_l() {
         let profile = crate::icc::profile("NikonZ6III-ProStandard").expect("profile must load");
