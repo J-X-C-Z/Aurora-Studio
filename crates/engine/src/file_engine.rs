@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
 use crate::adjust::{AdjustmentSet, WhiteBalanceMode};
+#[cfg(test)]
+use crate::RenderQuality;
 use crate::catalog::{ColorTag, Exif, FileKind, ImageId, ImageInfo, Iptc};
-use crate::engine::{AutoResult, AutoTarget, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, RenderQuality, StyleInfo};
+use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, StyleInfo};
 use crate::mock::process::{self, Source};
 use crate::preview_cache::{self, CachedFrame, PreviewCache};
 use crate::store::{Catalog, Entry, Store, StoreError};
@@ -25,11 +27,77 @@ use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, JobStatus, NormRe
 const SOURCE_LONG_SIDE: u32 = 4096;
 /// How many decoded sources stay in memory at once.
 const CACHED_SOURCES: usize = 8;
+/// Test probes: how many decodes really ran, and an optional slow-down that
+/// makes ten concurrent requests provably overlap.
+#[cfg(test)]
+static DECODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static DECODE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Persistent folder identities start here.
 const FOLDER_BASE: u64 = 1000;
 
 #[path = "library_fs.rs"]
 mod library_fs;
+
+/// Stable category for an import/decode failure, so the interface can show a
+/// translated message. Raw error text still goes to the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportErrorKind {
+    /// libraw is not installed or cannot be loaded.
+    NoLibRaw,
+    /// libraw or the image decoder could not read the file.
+    DecodeFailed,
+    /// The file or its pixels exceed what this build can hold.
+    TooLarge,
+    /// The format or compression is not supported.
+    Unsupported,
+    /// Filesystem error (missing file, permissions).
+    Io,
+    Other,
+}
+
+impl ImportErrorKind {
+    pub fn of(err: &anyhow::Error) -> Self {
+        let lower = format!("{err:#}").to_ascii_lowercase();
+        if lower.contains("too large") || lower.contains("out of memory") || lower.contains("memory") {
+            Self::TooLarge
+        } else if lower.contains("libraw") && (lower.contains("not loadable") || lower.contains("not found")) {
+            Self::NoLibRaw
+        } else if lower.contains("unsupported") || lower.contains("not supported") {
+            Self::Unsupported
+        } else if lower.contains("decode") || lower.contains("demosaic") || lower.contains("not decodable") {
+            Self::DecodeFailed
+        } else if lower.contains("os error") || lower.contains("no such file") || lower.contains("permission denied") {
+            Self::Io
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Why a preview is not full sensor data, for a translated viewer notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceStatusKind {
+    /// libraw could not decode the sensor data at all.
+    DecodeFailed,
+    /// libraw decoded the embedded preview because the compression is unsupported.
+    UnsupportedCompression,
+    Other,
+}
+
+impl SourceStatusKind {
+    pub fn of(reason: &str) -> Self {
+        let lower = reason.to_ascii_lowercase();
+        if lower.contains("decode failed") {
+            Self::DecodeFailed
+        } else if lower.contains("unsupported raw compression") || lower.contains("embedded preview") {
+            Self::UnsupportedCompression
+        } else {
+            Self::Other
+        }
+    }
+}
+
 
 /// A decoded frame, capped to [`SOURCE_LONG_SIDE`] with its aspect ratio kept.
 fn fit_long_side(size: (u32, u32)) -> (u32, u32) {
@@ -112,20 +180,28 @@ struct State {
     /// Most recently used last.
     lru: Vec<ImageId>,
     jobs: HashMap<u64, JobStatus>,
-    imported_styles: Vec<StyleInfo>,
+    /// Jobs whose worker must not overwrite the cancelled status.
+    cancelled: std::collections::HashSet<u64>,
+    /// Why a source is not full sensor data; consumed by `source_status`.
+    source_reasons: HashMap<ImageId, String>,
     catalog: Catalog,
     preview: PreviewCache,
+    profiled: crate::engine::ProfileCache,
 }
 
 /// An engine over a real folder of images.
 pub struct FileEngine {
     root: PathBuf,
     state: Arc<Mutex<State>>,
+    /// One decode at a time. Waiters re-check the source cache after taking it,
+    /// so concurrent requests for the same image decode it once.
+    decode: Mutex<()>,
     store: Option<Store>,
     /// Camera defaults from Capture One's `coreConfig.cdx`, read once.
     camera_defaults: std::sync::OnceLock<Option<crate::CameraDefaults>>,
     /// Closed-eye results, computed once per image.
     eyes: Mutex<HashMap<ImageId, crate::EyeReport>>,
+    imported_styles: RwLock<Vec<StyleInfo>>,
 }
 
 impl FileEngine {
@@ -157,13 +233,17 @@ impl FileEngine {
                 sources: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
-                imported_styles: Vec::new(),
+                cancelled: Default::default(),
+                source_reasons: HashMap::new(),
                 catalog,
                 preview: PreviewCache::default(),
+                profiled: Default::default(),
             })),
+            decode: Mutex::new(()),
             store,
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
+            imported_styles: RwLock::new(Vec::new()),
         };
         engine.rescan()?;
         engine.preload_ai_masks();
@@ -183,12 +263,9 @@ impl FileEngine {
         // A bundle is `X.cocatalogdb/X.cocatalogdb` (or `.cosessiondb`, or a
         // `.cos` session folder); `.lumen` must not land inside it.
         let mut root = import.catalog_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        // A bundle is a folder named after the database it holds; step outside it so
-        // our own `.lumen` never lands inside Capture One's package.
-        let stem = import.catalog_path.file_stem().map(|s| s.to_os_string());
-        while stem.is_some() && root.file_name().map(|n| n.to_os_string()) == stem {
-            root = root.parent().unwrap_or(Path::new(".")).to_path_buf();
-        }
+        // Step outside every Capture One package component so our own `.lumen`
+        // never lands inside one. A plain `Shoot/Shoot.cocatalogdb` file keeps
+        // `Shoot` as the root; only extension-named folders are packages.
         while root.extension().is_some_and(|e| {
             ["cocatalogdb", "cosessiondb", "cos"]
                 .iter()
@@ -210,13 +287,17 @@ impl FileEngine {
                 sources: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
-                imported_styles: Vec::new(),
+                cancelled: Default::default(),
+                source_reasons: HashMap::new(),
                 catalog,
                 preview: PreviewCache::default(),
+                profiled: Default::default(),
             })),
+            decode: Mutex::new(()),
             store,
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
+            imported_styles: RwLock::new(Vec::new()),
         };
         engine.import_c1(&import)?;
         engine.rescan()?;
@@ -286,6 +367,7 @@ impl FileEngine {
                     path: path.clone(),
                     file_name: image.file_name.clone(),
                     kind: file_kind(&path),
+                    heif: None,
                     width: image.width,
                     height: image.height,
                     file_size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
@@ -356,6 +438,17 @@ impl FileEngine {
                 return Ok(src);
             }
         }
+        // Single flight: the first request decodes while the rest wait here,
+        // then find the finished source in the cache instead of decoding again.
+        let _decoding = self.decode.lock();
+        {
+            let mut st = self.state.lock();
+            if let Some(src) = st.sources.get(&image).cloned() {
+                st.lru.retain(|i| *i != image);
+                st.lru.push(image);
+                return Ok(src);
+            }
+        }
         let (path, lens) = {
             let st = self.state.lock();
             let entry = st
@@ -365,14 +458,31 @@ impl FileEngine {
                 .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
             (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif))
         };
-        // Decoding happens outside the lock so a slow file cannot block the UI.
+        #[cfg(test)]
+        {
+            DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let delay = DECODE_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
+        // Decoding happens outside the state lock; the decode lock is the only
+        // thing a concurrent caller waits on.
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
+        let mut decoded_reason = None;
         let source = match raw16_source(&path) {
             Some(source) => source,
             None => {
                 let img = if crate::raw::is_raw(&path) {
-                    crate::raw::decode(&path)?
+                    match crate::raw::decode(&path) {
+                        Ok(img) => img,
+                        Err(err) => {
+                            let reason = format!("RAW decode failed: {err:#}");
+                            self.state.lock().source_reasons.insert(image, reason);
+                            return Err(err);
+                        }
+                    }
                 } else {
                     image::open(&path)?.to_rgba8()
                 };
@@ -387,9 +497,20 @@ impl FileEngine {
         };
         let camera_preview =
             crate::raw::is_raw(&path) && crate::raw::from_sensor(&path) == Some(false);
+        if camera_preview {
+            decoded_reason = Some("unsupported RAW compression; showing the camera's embedded preview".into());
+        }
         let source = Arc::new(source.with_lens_shot(lens).with_camera_preview(camera_preview));
 
         let mut st = self.state.lock();
+        match decoded_reason {
+            Some(reason) => {
+                st.source_reasons.insert(image, reason);
+            }
+            None => {
+                st.source_reasons.remove(&image);
+            }
+        }
         st.sources.insert(image, source.clone());
         st.lru.retain(|i| *i != image);
         st.lru.push(image);
@@ -407,19 +528,27 @@ impl FileEngine {
             return Ok(PreviewFrame {
                 histogram: process::histogram(image.pixels.as_ref()), image,
                 generation: request.generation, elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
-            });
+             degraded: None, gamut_warning: None, });
         }
         let src = self.source(request.image)?;
         let max = request.max_size;
         let fast = false;
         let adj = crate::styles::resolve(&request.adjustments);
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
-        if let Some(hit) = self.state.lock().preview.get(key) {
+        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+        let hit = self.state.lock().preview.get(key);
+        if let Some(hit) = hit {
+            let histogram = hit.histogram.clone();
+            let source = hit.into_image();
+            let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
+            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
             return Ok(PreviewFrame {
-                histogram: hit.histogram.clone(),
-                image: hit.into_image(),
+                histogram,
+                image,
                 generation: request.generation,
                 elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+                degraded,
+                gamut_warning,
             });
         }
         let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
@@ -430,11 +559,16 @@ impl FileEngine {
             histogram: out.histogram.clone(),
         };
         self.state.lock().preview.insert(key, frame.clone());
+        let source = frame.into_image();
+        let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
+        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
         Ok(PreviewFrame {
-            image: frame.into_image(),
+            image,
             histogram: out.histogram,
             generation: request.generation,
             elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            degraded,
+            gamut_warning,
         })
     }
 
@@ -492,7 +626,7 @@ fn rd_u32(b: &[u8], at: usize, le: bool) -> Option<u32> {
 /// ICC bytes embedded in a JPEG (APP2 `ICC_PROFILE` chunks) or a TIFF
 /// (`ICCProfile`, tag 34675). Reads the head first; a TIFF profile that sits
 /// past it falls back to a seek instead of reading the whole file.
-fn embedded_icc(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn embedded_icc(path: &Path) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = Vec::new();
@@ -513,7 +647,8 @@ fn embedded_icc(path: &Path) -> Option<Vec<u8>> {
         if rd_u16(&head, entry, le)? != 34675 {
             continue;
         }
-        if rd_u16(&head, entry + 2, le)? != 7 {
+        // image's TIFF encoder writes BYTE(1); the TIFF spec uses UNDEFINED(7).
+        if !matches!(rd_u16(&head, entry + 2, le)?, 1 | 7) {
             return None;
         }
         let len = rd_u32(&head, entry + 4, le)? as usize;
@@ -579,9 +714,9 @@ fn profile_keyword(name: &str) -> String {
 /// colour space: the embedded ICC description names the model that
 /// `for_camera` maps to. An output profile (sRGB, Adobe RGB) never matches, so
 /// those files are left untouched and are not converted twice.
-fn camera_icc(path: &Path, model: Option<&str>) -> Option<&'static str> {
+fn camera_icc(path: &Path, model: Option<&str>) -> Option<String> {
     let mapped = model.and_then(crate::camera_profile::for_camera)?;
-    let keyword = profile_keyword(mapped);
+    let keyword = profile_keyword(mapped.as_str());
     if keyword.is_empty() {
         return None;
     }
@@ -609,7 +744,7 @@ impl ImageEngine for FileEngine {
             if path.is_dir() {
                 let before: Vec<_> = self.images().iter().map(|i| i.id).collect();
                 added.extend(self.synchronize_folder(path, true, true)?.into_iter().filter(|i| !before.contains(&i.id)));
-            } else {
+            } else if is_supported(path) {
                 added.push(self.add_file(path)?);
             }
         }
@@ -690,7 +825,7 @@ impl ImageEngine for FileEngine {
                 adjustments.base.icc_profile = model
                     .and_then(crate::camera_profile::for_camera)
                     .filter(|name| crate::camera_profile::is_available(name))
-                    .map(str::to_string);
+                    .map(|name| name.as_str().to_string());
             }
             if adjustments.noise_reduction == crate::NoiseReduction::default() {
                 if let Some(iso) = entry.info.exif.iso {
@@ -705,8 +840,7 @@ impl ImageEngine for FileEngine {
                 &entry.info.path,
                 entry.info.exif.camera_model.as_deref(),
             )
-            .filter(|name| crate::camera_profile::is_available(name))
-            .map(str::to_string);
+            .filter(|name| crate::camera_profile::is_available(name));
         }
         adjustments
     }
@@ -784,13 +918,21 @@ impl ImageEngine for FileEngine {
         let mean = h.luma.iter().enumerate().map(|(i, c)| i as f32 * *c as f32).sum::<f32>() / total.max(1) as f32 / 255.0;
         let mut adj = current.clone();
         let all = target == AutoTarget::All;
-        if all || target == AutoTarget::Exposure {
-            adj.exposure.exposure = (((0.46f32 / mean.max(0.02f32)).log2()) * 0.8f32).clamp(-2.0f32, 2.0f32);
-            adj.exposure.contrast = 8.0;
+        let needs_exposure = all || target == AutoTarget::Exposure;
+        let needs_hdr = all || target == AutoTarget::HighDynamicRange;
+        let suggestions = if needs_exposure || needs_hdr {
+            Some(crate::auto_exposure::analyze(&probe.rgba, probe.width, probe.height))
+        } else {
+            None
+        };
+        if let (true, Some(s)) = (needs_exposure, suggestions.as_ref()) {
+            adj.exposure.exposure = s.exposure;
+            adj.exposure.contrast = s.contrast;
+            adj.exposure.brightness = s.brightness;
+            adj.exposure.saturation = s.saturation;
         }
-        if all || target == AutoTarget::HighDynamicRange {
-            adj.hdr.highlights = (-h.clipped_highlights * 800.0).clamp(-60.0, 0.0);
-            adj.hdr.shadows = (h.clipped_shadows * 600.0 + 10.0).clamp(0.0, 50.0);
+        if let (true, Some(s)) = (needs_hdr, suggestions.as_ref()) {
+            adj.hdr = s.hdr.clone();
         }
         if all || target == AutoTarget::WhiteBalance {
             let avg = |v: &Vec<u32>| v.iter().enumerate().map(|(i, c)| i as f32 * *c as f32).sum::<f32>() / total.max(1) as f32;
@@ -973,29 +1115,24 @@ impl ImageEngine for FileEngine {
     }
 
     fn styles(&self) -> Vec<StyleInfo> {
-        // A real Capture One install ships its own presets and styles; fall back
-        // to the built-in demo list only when none are found.
-        let installed = crate::presets::styles();
-        let mut out = if installed.is_empty() { crate::styles::all() } else { installed };
-        for style in &self.state.lock().imported_styles {
-            out.retain(|s| s.name != style.name);
-            out.push(style.clone());
-        }
-        out
+        let mut all = crate::styles::all();
+        all.extend(crate::c1_style_index::installed_styles());
+        all.extend(film_curve_styles());
+        all.extend(self.imported_styles.read().clone());
+        dedupe_styles(all)
     }
 
     fn film_curves(&self) -> Vec<String> {
-        static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-        NAMES.get_or_init(|| crate::fcrv_index::scan(&crate::curve_dir()).rows.into_iter().map(|r| r.name).collect()).clone()
+        crate::filmcurve::names()
     }
 
     fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo> {
-        let parsed = crate::load_style(path)?;
-        let style = StyleInfo { name: parsed.name, group: "Imported".into(), adjustments: parsed.adjustments };
-        let mut st = self.state.lock();
-        st.imported_styles.retain(|s| s.name != style.name);
-        st.imported_styles.push(style.clone());
-        Ok(style)
+        let style = crate::c1_styles::load_style(path)?;
+        let info = StyleInfo { name: style.name, group: "Imported".into(), adjustments: style.adjustments };
+        let mut imported = self.imported_styles.write();
+        imported.retain(|s| !(s.group == info.group && s.name == info.name));
+        imported.push(info.clone());
+        Ok(info)
     }
 
     fn icc_profiles(&self) -> Vec<String> {
@@ -1060,6 +1197,10 @@ impl ImageEngine for FileEngine {
             .map(|e| e.info.clone())
             .ok_or_else(|| anyhow::anyhow!("export: unknown image {}", job.image.0))?;
         std::thread::spawn(move || {
+            let cancelled = |state: &Mutex<State>| state.lock().cancelled.contains(&job_id);
+            if cancelled(&state) {
+                return;
+            }
             state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.05 });
             let (tw, th) = crate::recipe::output_size(&job.recipe, (info.width, info.height));
             let dir = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("lumen-output"));
@@ -1081,7 +1222,9 @@ impl ImageEngine for FileEngine {
                     out.width,
                     out.height,
                     |p| {
-                        state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
+                        if !cancelled(&state) {
+                            state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
+                        }
                     },
                 )
             } else {
@@ -1102,17 +1245,22 @@ impl ImageEngine for FileEngine {
                     out.width,
                     out.height,
                     |p| {
-                        state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
+                        if !cancelled(&state) {
+                            state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
+                        }
                     },
                 )
             };
-            state.lock().jobs.insert(
-                job_id,
-                match result {
-                    Ok(output) => JobStatus::Done { output },
-                    Err(err) => JobStatus::Failed { message: err.to_string() },
-                },
-            );
+            let mut state = state.lock();
+            if !state.cancelled.contains(&job_id) {
+                state.jobs.insert(
+                    job_id,
+                    match result {
+                        Ok(output) => JobStatus::Done { output },
+                        Err(err) => JobStatus::Failed { message: err.to_string() },
+                    },
+                );
+            }
         });
         Ok(())
     }
@@ -1121,15 +1269,56 @@ impl ImageEngine for FileEngine {
         self.state.lock().jobs.get(&job_id).cloned().unwrap_or(JobStatus::Failed { message: "unknown job".into() })
     }
 
+    fn cancel_job(&self, job_id: u64) -> bool {
+        let mut st = self.state.lock();
+        match st.jobs.get(&job_id) {
+            Some(JobStatus::Queued) | Some(JobStatus::Running { .. }) => {
+                st.cancelled.insert(job_id);
+                st.jobs.insert(job_id, JobStatus::Failed { message: "cancelled".into() });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn source_status(&self, image: ImageId) -> Option<String> {
+        self.state.lock().source_reasons.get(&image).cloned()
+    }
+
     fn tether_status(&self) -> TetherStatus {
         tether::probe()
     }
+    fn capabilities(&self) -> crate::engine::EngineCapabilities {
+        crate::engine::EngineCapabilities {
+            ai_mask_kinds: vec![
+                AiMaskKind::Subject,
+                AiMaskKind::Person,
+                AiMaskKind::Clothing,
+                AiMaskKind::Skin,
+                AiMaskKind::Hair,
+                AiMaskKind::Sky,
+                AiMaskKind::Background,
+            ],
+            eye_report: true,
+            auto_rotate: true,
+            match_look: true,
+            tether: cfg!(windows),
+            export_formats: crate::output::ExportFormat::ALL
+                .into_iter()
+                .filter(|format| format.is_supported())
+                .collect(),
+        }
+    }
     fn camera_status(&self) -> CameraStatus {
-        CameraStatus::Disconnected
+        tether::camera_status()
+    }
+    fn camera_settings(&self) -> Option<CameraSettings> {
+        tether::camera_settings()
     }
     fn capture(&self) -> anyhow::Result<ImageInfo> {
-        let dir = self.capture_directory()?;
+        // Do not create a capture folder unless the camera produced a frame.
         let frame = tether::capture_frame()?;
+        let dir = self.capture_directory()?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1154,9 +1343,236 @@ impl ImageEngine for FileEngine {
     fn live_view_focus(&self, _steps: i32) {}
 }
 
+/// Sorted by `(group, name)`; of a duplicate pair the first one wins.
+fn dedupe_styles(mut styles: Vec<StyleInfo>) -> Vec<StyleInfo> {
+    styles.sort_by(|a, b| a.group.cmp(&b.group).then_with(|| a.name.cmp(&b.name)));
+    styles.dedup_by(|a, b| a.group == b.group && a.name == b.name);
+    styles
+}
+
+/// One representative curve per kind the installer ships, keyed by the file
+/// stem `curve_lut` reads. Missing kinds are skipped.
+fn film_curve_styles() -> Vec<StyleInfo> {
+    const KINDS: [&str; 3] = ["-Auto", "-Linear Response", "-Film Standard"];
+    let names = crate::filmcurve::names();
+    KINDS
+        .iter()
+        .filter_map(|kind| {
+            let name = names
+                .iter()
+                .find(|n| n.ends_with(kind) && crate::filmcurve::curve_lut(n).is_some())?;
+            let mut adjustments = AdjustmentSet::default();
+            adjustments.base.film_curve = Some(name.clone());
+            Some(StyleInfo { name: name.clone(), group: "Film Curve".into(), adjustments })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ten previews for the same cold image must decode it once: the first
+    /// request decodes, the other nine wait on the decode lock and then use the
+    /// cached source. A test-only delay makes the overlap deterministic.
+    #[test]
+    fn ten_concurrent_previews_decode_the_source_once() {
+        let (dir, synthetic) = match std::env::var_os("LUMEN_PREVIEW_BENCH_DIR") {
+            Some(dir) => (PathBuf::from(dir), false),
+            None => {
+                let dir = std::env::temp_dir().join(format!("lumen-single-flight-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let img = image::RgbaImage::from_fn(3000, 2000, |x, y| {
+                    let v = ((x * 7 + y * 13) % 256) as u8;
+                    image::Rgba([v, v / 3, 255 - v, 255])
+                });
+                img.save(dir.join("frame.png")).unwrap();
+                (dir, true)
+            }
+        };
+        let engine = Arc::new(FileEngine::open(&dir).unwrap());
+        let image = engine.images()[0].id;
+        let request = PreviewRequest {
+            image,
+            adjustments: AdjustmentSet::default(),
+            region: NormRect::FULL,
+            max_size: 1400,
+            quality: crate::RenderQuality::Draft,
+            bypass: false,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+        };
+        let before = DECODE_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        DECODE_DELAY_MS.store(150, std::sync::atomic::Ordering::SeqCst);
+        let frames = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for step in 0..10u64 {
+                let engine = engine.clone();
+                let frames = &frames;
+                let mut request = request.clone();
+                request.generation = step + 1;
+                request.adjustments.exposure.exposure = step as f32 * 0.1;
+                scope.spawn(move || {
+                    let frame = engine.render_preview(&request).unwrap();
+                    frames.lock().push((frame.generation, frame.image.width));
+                });
+            }
+        });
+        DECODE_DELAY_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let frames = frames.into_inner();
+        assert_eq!(frames.len(), 10, "every preview must succeed");
+        let decodes = DECODE_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert_eq!(decodes, 1, "ten concurrent previews must decode the source exactly once");
+        println!("single-flight: 10 previews, decodes={decodes}, frames={frames:?}");
+        if synthetic {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Draft, Final and the internal half-size fast path must all return the
+    /// same dimensions; only the pixels computed internally may differ.
+    #[test]
+    fn draft_final_and_fast_keep_the_same_output_size() {
+        let dir = std::env::temp_dir().join(format!("lumen-same-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_fn(2400, 1600, |x, y| image::Rgba([(x % 255) as u8, (y % 255) as u8, 80, 255]))
+            .save(dir.join("frame.png"))
+            .unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let image = engine.images()[0].id;
+        let request = PreviewRequest {
+            image,
+            adjustments: AdjustmentSet::default(),
+            region: NormRect::FULL,
+            max_size: 2000,
+            quality: crate::RenderQuality::Draft,
+            bypass: false,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+        };
+        let draft = engine.render_preview(&request).unwrap();
+        let mut final_request = request.clone();
+        final_request.quality = crate::RenderQuality::Final;
+        final_request.adjustments.exposure.exposure = 0.25;
+        let final_frame = engine.render_preview(&final_request).unwrap();
+        let mut fast_request = request.clone();
+        fast_request.adjustments.exposure.exposure = -0.25;
+        let fast = engine.render_preview_fast(&fast_request, true).unwrap();
+        let size = |f: &PreviewFrame| (f.image.width, f.image.height);
+        assert_eq!(size(&draft), size(&final_frame), "Draft cap changed the output size");
+        assert_eq!(size(&fast), size(&final_frame), "fast changed the output size");
+        assert_eq!(final_frame.image.width, 2000);
+        println!("same-size: draft={:?} final={:?} fast={:?}", size(&draft), size(&final_frame), size(&fast));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A missing camera must fail before anything is written or catalogued; the
+    /// mock engine is never consulted from this path.
+    #[test]
+    fn capture_without_a_camera_leaves_the_catalog_unchanged() {
+        if !matches!(tether::probe(), TetherStatus::NoCamera) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lumen-nocam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let before = engine.images().len();
+        let err = engine.capture().expect_err("capture must fail without a camera").to_string();
+        assert!(err.contains("NoCamera"), "{err}");
+        assert_eq!(engine.images().len(), before);
+        assert!(!dir.join("Capture").exists(), "an empty capture folder was created");
+    }
+
+    /// The interface decides which panels and formats to show from this, so it
+    /// must list only what the file engine really produces.
+    #[test]
+    fn capabilities_match_the_engine_and_the_encoders() {
+        let dir = std::env::temp_dir().join(format!("lumen-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let caps = FileEngine::open(&dir).unwrap().capabilities();
+        assert!(caps.eye_report && caps.auto_rotate && caps.match_look);
+        assert!(caps.ai_mask_kinds.contains(&AiMaskKind::Subject));
+        assert!(!caps.ai_mask_kinds.contains(&AiMaskKind::Eyes));
+        let expected: Vec<_> = crate::output::ExportFormat::ALL
+            .into_iter()
+            .filter(|f| f.is_supported())
+            .collect();
+        assert_eq!(caps.export_formats, expected);
+    }
+
+    #[test]
+    fn import_errors_map_to_stable_kinds() {
+        use anyhow::anyhow;
+        let kind = |text: &str| ImportErrorKind::of(&anyhow!("{text}"));
+        assert_eq!(kind("libraw is not loadable on this machine"), ImportErrorKind::NoLibRaw);
+        assert_eq!(kind("RAW decode failed: bad CFA data"), ImportErrorKind::DecodeFailed);
+        assert_eq!(kind("image is too large (90000 x 90000)"), ImportErrorKind::TooLarge);
+        assert_eq!(kind("Unsupported: no encoder for PSD"), ImportErrorKind::Unsupported);
+        assert_eq!(kind("No such file or directory (os error 2)"), ImportErrorKind::Io);
+        assert_eq!(kind("collect failed"), ImportErrorKind::Other);
+    }
+
+    #[test]
+    fn importing_an_unsupported_file_adds_nothing() {
+        let dir = std::env::temp_dir().join(format!("lumen-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let note = dir.join("note.txt");
+        std::fs::write(&note, b"not an image").unwrap();
+        let added = engine.import(&[note]).unwrap();
+        assert!(added.is_empty());
+        assert_eq!(engine.images().len(), 0);
+    }
+
+    #[test]
+    fn source_status_reasons_map_to_stable_kinds() {
+        assert_eq!(
+            SourceStatusKind::of("RAW decode failed: bad data"),
+            SourceStatusKind::DecodeFailed
+        );
+        assert_eq!(
+            SourceStatusKind::of("unsupported RAW compression; showing the camera's embedded preview"),
+            SourceStatusKind::UnsupportedCompression
+        );
+        assert_eq!(SourceStatusKind::of("other"), SourceStatusKind::Other);
+    }
+
+    #[test]
+    fn cancelling_a_queued_job_sticks() {
+        let dir = std::env::temp_dir().join(format!("lumen-cancel-job-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        engine.state.lock().jobs.insert(77, JobStatus::Queued);
+        assert!(engine.cancel_job(77));
+        assert_eq!(engine.job_status(77), JobStatus::Failed { message: "cancelled".into() });
+        assert!(!engine.cancel_job(77));
+        assert_eq!(engine.source_status(ImageId(1)), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_imported_style_appears_once_in_styles() {
+        let dir = std::env::temp_dir().join(format!("lumen-import-style-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let style = dir.join("Imported.costyle");
+        std::fs::write(&style, b"<SL><E K=\"Name\" V=\"Synthetic\"/><E K=\"Exposure\" V=\"1\"/></SL>").unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        assert_eq!(engine.import_style(&style).unwrap().name, "Synthetic");
+        assert_eq!(engine.import_style(&style).unwrap().name, "Synthetic");
+        let count = engine.styles().iter().filter(|s| s.group == "Imported" && s.name == "Synthetic").count();
+        assert_eq!(count, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn source_scales_the_long_side_and_keeps_the_aspect_ratio() {
@@ -1205,7 +1621,7 @@ mod tests {
         let engine = FileEngine::open(&dir).unwrap();
         let image = engine.images()[0].id;
         let mut request = PreviewRequest { image, adjustments: AdjustmentSet::default(), region: NormRect::FULL,
-            max_size: 1600, quality: RenderQuality::Draft, bypass: false, mask_overlay: None, generation: 1 };
+            max_size: 1600, quality: RenderQuality::Draft, bypass: false, mask_overlay: None, generation: 1 , display_profile: None, proof_profile: None, proof_paper_white: 1.0, proof_black_point: 0.0, };
         let draft = engine.render_preview(&request).unwrap();
         request.quality = RenderQuality::Final;
         let final_frame = engine.render_preview(&request).unwrap();

@@ -14,7 +14,7 @@ fn request(image: lumen_engine::ImageId) -> PreviewRequest {
         bypass: false,
         mask_overlay: None,
         generation: 0,
-    }
+     display_profile: None, proof_profile: None, proof_paper_white: 1.0, proof_black_point: 0.0, }
 }
 
 #[test]

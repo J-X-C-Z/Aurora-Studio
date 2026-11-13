@@ -479,6 +479,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurora-pixcake"
+version = "0.1.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3643,6 +3647,7 @@ name = "lumen-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aurora-pixcake",
  "image",
  "log",
  "parking_lot",

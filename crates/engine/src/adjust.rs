@@ -789,7 +789,7 @@ pub struct Sharpening {
     pub amount: f32,
     /// 0.2 ..= 2.5 px.
     pub radius: f32,
-    /// 0 ..= 10.
+    /// 0 ..= 12.
     pub threshold: f32,
     /// 0 ..= 100.
     pub halo_suppression: f32,

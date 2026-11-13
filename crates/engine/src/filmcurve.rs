@@ -217,6 +217,15 @@ pub fn curve_lut(name: &str) -> Option<[f32; 256]> {
     })
 }
 
+/// Every curve stem in the installed index, sorted by name.
+pub fn names() -> Vec<String> {
+    with_curves(|index| {
+        let mut names: Vec<String> = index.keys().cloned().collect();
+        names.sort();
+        names
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

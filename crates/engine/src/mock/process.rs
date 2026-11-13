@@ -207,6 +207,9 @@ fn luma(c: [f32; 3]) -> f32 {
 }
 
 fn sstep(a: f32, b: f32, x: f32) -> f32 {
+    if b <= a {
+        return if x < a { 0.0 } else { 1.0 };
+    }
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -354,9 +357,10 @@ impl MaskGrid {
         if mask.refine > 0.0 {
             let r = (mask.refine / cell_px.max(1e-3)).round() as i32;
             if r > 0 {
-                if let Some(guide) = guide {
-                    grid.data = guided_filter_grid(&grid.data, guide, w, h, r);
-                }
+                grid.data = match guide {
+                    Some(guide) => guided_filter_grid(&grid.data, guide, w, h, r),
+                    None => box_blur_grid(&grid.data, w, h, r),
+                };
             }
         }
         grid
@@ -405,11 +409,14 @@ fn shape_value(
     match shape {
         MaskShape::Brush(stroke) => {
             let mut best = 0.0f32;
-            let r = stroke.size.max(1e-4);
+            // `size` is a fraction of the long side; distance is measured in
+            // short-side units so aspect and size share one scale.
+            let long = aspect.max(1.0);
+            let r = (stroke.size * long).max(1e-4);
             let hard = (stroke.hardness / 100.0).clamp(0.0, 0.99);
             for pt in &stroke.points {
-                let dx = (p[0] - pt[0]) * aspect.max(1.0);
-                let dy = (p[1] - pt[1]) * (1.0 / aspect).max(1.0);
+                let dx = (p[0] - pt[0]) * aspect;
+                let dy = p[1] - pt[1];
                 let d = (dx * dx + dy * dy).sqrt() / r;
                 let v = 1.0 - sstep(hard, 1.0, d);
                 best = best.max(v * pt[2].max(0.05));
@@ -1938,6 +1945,176 @@ mod tests {
         let guide = luma_guide(&src, &geometry, gw, gh);
         assert_eq!(guide.len(), gw * gh);
         assert!(guide.iter().any(|v| *v > 0.02 && *v < 0.98), "the guide must carry the image's tones");
+    }
+
+    // ───────────────────────────── mask parameter geometry ─────────────────────────────
+
+    fn plan_with<'a>(layer: &'a Layer, adj: &'a AdjustmentSet) -> LayerPlan<'a> {
+        let grid = MaskGrid::build(&layer.mask, 4.0 / 3.0, 4.0, None, &[]);
+        layer_plan(layer, adj, Some(grid), None)
+    }
+
+    /// Layer opacity 100 must leave the mask's own weight untouched.
+    #[test]
+    fn full_opacity_is_the_identity_mask_weight() {
+        let adj = AdjustmentSet::default();
+        let layer = Layer { id: 1, opacity: 100.0, mask: hard_disc(0.3), ..Default::default() };
+        let lp = plan_with(&layer, &adj);
+        assert!((layer_weight(&lp, [0.5, 0.5], [0.0; 3]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn layer_opacity_scales_the_mask_weight() {
+        let adj = AdjustmentSet::default();
+        let mut layer = Layer { id: 1, opacity: 50.0, mask: hard_disc(0.3), ..Default::default() };
+        let half = layer_weight(&plan_with(&layer, &adj), [0.5, 0.5], [0.0; 3]);
+        assert!((half - 0.5).abs() < 1e-6, "50% opacity must halve the weight, got {half}");
+        layer.opacity = 25.0;
+        let quarter = layer_weight(&plan_with(&layer, &adj), [0.5, 0.5], [0.0; 3]);
+        assert!((quarter - 0.25).abs() < 1e-6, "25% opacity must quarter the weight, got {quarter}");
+    }
+
+    #[test]
+    fn zero_opacity_or_disabled_layer_is_skipped() {
+        let mut adj = AdjustmentSet::default();
+        adj.layers.push(Layer { id: 1, opacity: 0.0, mask: hard_disc(0.3), ..Default::default() });
+        assert!(layer_plans(&adj, 4.0 / 3.0, 4.0, None, None).is_empty());
+        adj.layers[0].opacity = 100.0;
+        adj.layers[0].enabled = false;
+        assert!(layer_plans(&adj, 4.0 / 3.0, 4.0, None, None).is_empty());
+    }
+
+    #[test]
+    fn linear_gradient_ramps_once_from_inner_to_outer() {
+        let shape = MaskShape::Linear(LinearGradient {
+            op: MaskOp::Add,
+            start: [0.2, 0.5],
+            end: [0.8, 0.5],
+        });
+        let at = |x: f32| shape_value(&shape, [x, 0.5], 1.0, None).1;
+        assert!((at(0.1) - 1.0).abs() < 1e-6, "before the inner line must be full effect");
+        assert!((at(0.9)).abs() < 1e-6, "past the outer line must be zero");
+        let ramp: Vec<f32> = (0..=10).map(|i| at(0.2 + 0.06 * i as f32)).collect();
+        assert!((0.3..0.7).contains(&at(0.5)), "the middle must be a partial value");
+        assert!(ramp.windows(2).all(|w| w[0] >= w[1]), "ramp must be monotonic: {ramp:?}");
+        // Swapping the two lines is the exact linear inversion; the model has
+        // no separate flag, matching how C1 stores the pair as geometry.
+        let flipped = MaskShape::Linear(LinearGradient {
+            op: MaskOp::Add,
+            start: [0.8, 0.5],
+            end: [0.2, 0.5],
+        });
+        let at_flipped = |x: f32| shape_value(&flipped, [x, 0.5], 1.0, None).1;
+        assert!((at_flipped(0.1) - 0.0).abs() < 1e-6);
+        assert!((at_flipped(0.9) - 1.0).abs() < 1e-6);
+    }
+
+    /// The radial gradient peaks at its centre, reaches zero on the outer
+    /// radius, and its `inverted` flag flips both.
+    #[test]
+    fn radial_gradient_centre_edge_and_invert() {
+        let radial = |inverted| {
+            MaskShape::Radial(RadialGradient {
+                op: MaskOp::Add,
+                center: [0.5, 0.5],
+                radius: [0.2, 0.2],
+                rotation: 0.0,
+                feather: 50.0,
+                inverted,
+            })
+        };
+        let at = |shape: &MaskShape, p: [f32; 2]| shape_value(shape, p, 1.0, None).1;
+        let normal = radial(false);
+        assert!((at(&normal, [0.5, 0.5]) - 1.0).abs() < 1e-6);
+        assert!((0.3..0.7).contains(&at(&normal, [0.65, 0.5])), "the feather must fade");
+        assert!(at(&normal, [0.7, 0.5]).abs() < 1e-6, "the outer radius must be zero");
+        let inverted = radial(true);
+        assert!(at(&inverted, [0.5, 0.5]).abs() < 1e-6);
+        assert!((at(&inverted, [0.7, 0.5]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn whole_mask_invert_flips_the_weight() {
+        let adj = AdjustmentSet::default();
+        let layer = Layer {
+            id: 1,
+            mask: Mask { invert: true, ..hard_disc(0.3) },
+            ..Default::default()
+        };
+        let lp = plan_with(&layer, &adj);
+        assert!(layer_weight(&lp, [0.5, 0.5], [0.0; 3]).abs() < 1e-6);
+        assert!((layer_weight(&lp, [0.02, 0.02], [0.0; 3]) - 1.0).abs() < 1e-6);
+    }
+
+    /// A hard radial edge is a step, not a NaN, and a feathered edge crosses
+    /// the boundary without a visible jump.
+    #[test]
+    fn feather_edges_are_finite_and_continuous() {
+        let hard = MaskShape::Radial(RadialGradient {
+            op: MaskOp::Add,
+            center: [0.5, 0.5],
+            radius: [0.2, 0.2],
+            rotation: 0.0,
+            feather: 0.0,
+            inverted: false,
+        });
+        for i in 0..=100 {
+            let d = i as f32 / 50.0;
+            let v = shape_value(&hard, [0.5 + 0.2 * d, 0.5], 1.0, None).1;
+            assert!(v.is_finite(), "radius {d} produced {v}");
+            assert!((0.0..=1.0).contains(&v));
+        }
+        let mut mask = hard_disc(0.3);
+        mask.feather = 40.0;
+        let grid = MaskGrid::build(&mask, 4.0 / 3.0, 4.0, None, &[]);
+        assert!(grid.data.iter().all(|v| v.is_finite()));
+        let row = grid.h / 2;
+        let jump = (1..grid.w)
+            .map(|x| (grid.data[row * grid.w + x] - grid.data[row * grid.w + x - 1]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(jump < 0.25, "feather must not step across the edge, jump {jump}");
+    }
+
+    /// `ZSURFACESMOOTHNESSAMOUNT` reaches `Mask::refine`; without a luminance
+    /// guide the refine still smooths instead of silently doing nothing.
+    #[test]
+    fn surface_smoothness_smooths_the_mask_edge() {
+        let mut mask = hard_disc(0.3);
+        let sharp = MaskGrid::build(&mask, 4.0 / 3.0, 4.0, None, &[]);
+        mask.refine = 40.0;
+        let soft = MaskGrid::build(&mask, 4.0 / 3.0, 4.0, None, &[]);
+        assert_ne!(sharp.data, soft.data, "refine must change the raster");
+        assert!(soft.data.iter().all(|v| v.is_finite()));
+        let softened = soft
+            .data
+            .iter()
+            .zip(&sharp.data)
+            .filter(|(b, a)| **b > 0.0 && **b < 1.0 && **a <= 0.0)
+            .count();
+        assert!(softened > 0, "refine must leave intermediate values on the edge");
+    }
+
+    /// A brush radius is physical: on a 16:9 image the same fractional radius
+    /// must reach equally far in x and y, not be squashed by the aspect.
+    #[test]
+    fn brush_radius_is_round_on_a_wide_image() {
+        let aspect = 16.0 / 9.0;
+        let mut brush = BrushStroke {
+            op: MaskOp::Add,
+            points: vec![[0.5, 0.5, 1.0]],
+            size: 0.1,
+            hardness: 0.0,
+            opacity: 100.0,
+            flow: 100.0,
+            auto_mask: false,
+        };
+        let shape = MaskShape::Brush(brush.clone());
+        let x = shape_value(&shape, [0.55, 0.5], aspect, None).1;
+        let y = shape_value(&shape, [0.5, 0.5 + 0.05 * aspect], aspect, None).1;
+        assert!((x - y).abs() < 1e-3, "radius must be round: x={x} y={y}");
+        brush.hardness = 100.0;
+        let shape = MaskShape::Brush(brush);
+        assert!(shape_value(&shape, [0.5, 0.5], aspect, None).1 > 0.99);
     }
 
     // ───────────────────────────── brush + eraser ─────────────────────────────

@@ -1,0 +1,2153 @@
+[
+  {
+    "pf": 0,
+    "key": "spotless",
+    "label": "祛斑祛痘",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "job_id",
+      "source_sha256",
+      "face_id",
+      "roi",
+      "skin_mask",
+      "hair_mask",
+      "instance_mask",
+      "slot_planes_21",
+      "same_job_binding_sha256",
+      "detector_float32",
+      "acne_mask",
+      "blemish_model_output",
+      "repair_model_output",
+      "composition_flag",
+      "spotless_degree"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 5,
+    "key": "",
+    "label": "祛黑眼圈",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "processed residual RGB f32 (warped + masked)",
+      "bias 80"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8,
+    "key": "PF8_UI_KEY_NOT_RECOVERED",
+    "label": "Stereo shadow volume",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA",
+      "face-parsing RGBA mask",
+      "ROI"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 9,
+    "key": "PF9_UI_KEY_NOT_RECOVERED",
+    "label": "Stereo highlight volume",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA",
+      "blusher RGBA mask",
+      "ROI"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 100,
+    "key": "eyebrowDegree_left",
+    "label": "Eyebrow color makeup (left)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "EyeBrowMaskType=5 mask (RB)",
+      "UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "FilterType 11"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 101,
+    "key": "silkwormDegree",
+    "label": "Silkworm degree",
+    "stage": "unavailable",
+    "required_inputs": [
+      "live eye mask/LUT"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 103,
+    "key": "eyelinerDegree_upper",
+    "label": "Upper eyeliner color makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "EyeMaskType=4 mask (RG)",
+      "UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "FilterType 11"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 105,
+    "key": "eyelashDegree_upper",
+    "label": "Upper eyelash color makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "EyeLashMaskType=4 L mask as RGBA (GL_LUMINANCE, RG=min(2L,1))",
+      "UV",
+      "MixColor RGBA",
+      "opacity",
+      "degree01",
+      "FilterType 11"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 106,
+    "key": "blusherDegree",
+    "label": "Blusher color makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "BlusherMaskType=15 owner mask RGBA",
+      "UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "BlendMode macro"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 107,
+    "key": "lipstickDegree",
+    "label": "Lipstick image makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA",
+      "main mask R",
+      "extra mask by LipMaskType",
+      "mask/material UV",
+      "MixColor RGBA",
+      "opacity/degree/shelter/region",
+      "FilterType 40/41/42/54"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 108,
+    "key": "teethWhitening",
+    "label": "Teeth whitening",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "teeth mask id2.G",
+      "Whiten LUT",
+      "Bright LUT"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 111,
+    "key": "eyePupilDegree",
+    "label": "Eye pupil image makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA",
+      "material UV",
+      "MixColor RGBA",
+      "opacity",
+      "degree01",
+      "FilterType 40 (EyePupilMaskType=0: no mask)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 115,
+    "key": "faceDecorationDegree",
+    "label": "Face decoration (sticker)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA",
+      "MASK_RGBA mask",
+      "element list (pos/scale/rot)",
+      "global scale, fl, fk",
+      "FilterType",
+      "flip mask flag"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 116,
+    "key": "contourDegree",
+    "label": "Blusher image makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA",
+      "BlusherMaskType=15 owner mask RGBA",
+      "UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "BlendMode macro"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 117,
+    "key": "eyebrowDegree_right",
+    "label": "Eyebrow color makeup (right)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "EyeBrowMaskType=5 mask (RB)",
+      "UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "FilterType 11"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 118,
+    "key": "eyelashDegree_lower",
+    "label": "Lower eyelash color makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "EyeLashMaskType=4 L mask as RGBA (GL_LUMINANCE, RG=min(2L,1))",
+      "UV",
+      "MixColor RGBA",
+      "opacity",
+      "degree01",
+      "FilterType 11"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 202,
+    "key": "hairLine",
+    "label": "Hair line",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "194 landmarks",
+      "135 weights",
+      "control slots"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 232,
+    "key": "skullEnhance",
+    "label": "Skull top enhance",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks 192..206",
+      "15 factors"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 242,
+    "key": "face_chin",
+    "label": "Sharp chin",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "33 face+0x368 points",
+      "face+0x1B0 center",
+      "ui -100..100",
+      "effect.json parts 17..20 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 243,
+    "key": "face_chin",
+    "label": "Sharp chin",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "33 face+0x368 points",
+      "face+0x1B0 center",
+      "ui -100..100",
+      "effect.json parts 17..20 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 247,
+    "key": "face_v",
+    "label": "V face",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "ui -100..100",
+      "roi atlas texel (RGBA 0..1)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 248,
+    "key": "face_v",
+    "label": "V face",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "ui -100..100",
+      "roi atlas texel (RGBA 0..1)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 400,
+    "key": "slimArm",
+    "label": "ArmRefine (row 105)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "source_points",
+      "destination_points",
+      "degrees",
+      "strength",
+      "inverse_aspect",
+      "valid_point_count"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 401,
+    "key": "slimWaist",
+    "label": "SlimWaist (row 108)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mesh",
+      "passes"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 403,
+    "key": "enhanceBreastMask",
+    "label": "EnhanceBreast source mask (row 106)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source_mask",
+      "radius01"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 404,
+    "key": "niceButtock",
+    "label": "ButtockRefine (row 111)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "source_points",
+      "destination_points",
+      "degrees",
+      "scale",
+      "inverse_aspect",
+      "valid_point_count"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 405,
+    "key": "slimBody",
+    "label": "Body slim",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF405_BODY_MASK_R",
+      "PF405_SOURCE_UV",
+      "PF405_TARGET_UV"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 406,
+    "key": "headZoom",
+    "label": "HeadZoom (row 103)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mesh",
+      "passes"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 407,
+    "key": "",
+    "label": "Lengthen leg refine (two-stage UV warp)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "colour source (RGBA8)",
+      "five leg columns (sample_u 0..1, clip_x -1..1, increasing)",
+      "field channel BA / mp=1 when supplied as texture",
+      "catmull size (F,O px, optional)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 408,
+    "key": "heightIncrease",
+    "label": "HeightIncrease (row 102)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "source_uv",
+      "destination_uv",
+      "defines"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 410,
+    "key": "neckLength",
+    "label": "NeckLength (row 104)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mesh",
+      "passes"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 415,
+    "key": "upBodyRatio",
+    "label": "UpBodyRatio (row 110)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mesh",
+      "passes"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 416,
+    "key": "waistLengthen",
+    "label": "WaistLengthen (row 109)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "warped_uv",
+      "mask_r"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8001,
+    "key": "",
+    "label": "粗细",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mesh168",
+      "guide168",
+      "face_fields",
+      "ui_left",
+      "ui_right",
+      "indices"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8002,
+    "key": "",
+    "label": "粗细",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mesh168",
+      "guide168",
+      "face_fields",
+      "ui_left",
+      "ui_right",
+      "indices"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8005,
+    "key": "",
+    "label": "眉距",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mesh168",
+      "raw_face",
+      "ui_left",
+      "ui_right",
+      "indices",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8006,
+    "key": "",
+    "label": "眉距",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mesh168",
+      "raw_face",
+      "ui_left",
+      "ui_right",
+      "indices",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8009,
+    "key": "",
+    "label": "形状",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mesh168",
+      "guide168",
+      "face_fields",
+      "ui_left",
+      "ui_right",
+      "indices"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8010,
+    "key": "",
+    "label": "形状",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mesh168",
+      "guide168",
+      "face_fields",
+      "ui_left",
+      "ui_right",
+      "indices"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8011,
+    "key": "",
+    "label": "眼瞳大小",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "eye_factor"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8012,
+    "key": "",
+    "label": "眼瞳大小",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "eye_factor"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8013,
+    "key": "",
+    "label": "眼高",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "factor_list1"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8014,
+    "key": "",
+    "label": "眼高",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "factor_list1"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8015,
+    "key": "",
+    "label": "眼距",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "pair5",
+      "indices",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8016,
+    "key": "",
+    "label": "眼距",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "pair5",
+      "indices",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8017,
+    "key": "",
+    "label": "倾斜",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "ui_left",
+      "ui_right",
+      "pair2_source_20",
+      "pair2_indices",
+      "tilt_factor",
+      "angle_scale",
+      "geometry_scale",
+      "ring_center",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8018,
+    "key": "",
+    "label": "倾斜",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "ui_left",
+      "ui_right",
+      "pair2_source_20",
+      "pair2_indices",
+      "tilt_factor",
+      "angle_scale",
+      "geometry_scale",
+      "ring_center",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8019,
+    "key": "Be.eyeWidth_left",
+    "label": "眼宽",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "render_factor"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8020,
+    "key": "Be.eyeWidth_right",
+    "label": "眼宽",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "width",
+      "height",
+      "face_scale",
+      "ui_left",
+      "ui_right",
+      "render_factor"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8021,
+    "key": "",
+    "label": "位置",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "ui_left",
+      "ui_right",
+      "pair5",
+      "indices",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8022,
+    "key": "",
+    "label": "位置",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "landmarks194",
+      "ui_left",
+      "ui_right",
+      "pair5",
+      "indices",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8023,
+    "key": "face_jaw",
+    "label": "Jaw",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "33 face+0x368 points",
+      "face+0x1B0 center",
+      "left/right ui -100..100",
+      "effect.json parts 29..32 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8024,
+    "key": "face_jaw",
+    "label": "Jaw",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "33 face+0x368 points",
+      "face+0x1B0 center",
+      "left/right ui -100..100",
+      "effect.json parts 29..32 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8025,
+    "key": "slim",
+    "label": "Slim face",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "ui 0..100",
+      "roi atlas texel (RGBA 0..1)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8026,
+    "key": "slim",
+    "label": "Slim face",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "ui 0..100",
+      "roi atlas texel (RGBA 0..1)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8027,
+    "key": "face_cheek",
+    "label": "Cheek",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "33 face+0x368 points",
+      "face+0x1B0 center",
+      "ui -100..100",
+      "effect.json parts 33/34 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8028,
+    "key": "face_cheek",
+    "label": "Cheek",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "33 face+0x368 points",
+      "face+0x1B0 center",
+      "ui -100..100",
+      "effect.json parts 33/34 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8029,
+    "key": "face_temple",
+    "label": "Temple",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "face+0x924 prepared 237+ points",
+      "ui -100..100 (native = ui/100)",
+      "effect.json parts 23/24 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8030,
+    "key": "face_temple",
+    "label": "Temple",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "face+0x924 prepared 237+ points",
+      "ui -100..100 (native = ui/100)",
+      "effect.json parts 23/24 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8033,
+    "key": "smileMouthCorner",
+    "label": "Smile mouth corner",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mean/reshape mesh",
+      "projection matrix",
+      "degree",
+      "dense dx/dy/mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8050,
+    "key": "face_overall_size",
+    "label": "Overall size",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "6 eye landmarks",
+      "72 + 72 neutral patch",
+      "left/right ui -100..100"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8051,
+    "key": "face_overall_size",
+    "label": "Overall size",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "6 eye landmarks",
+      "72 + 72 neutral patch",
+      "left/right ui -100..100"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8068,
+    "key": "skinGloss",
+    "label": "皮肤光泽",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "masks_r[3]",
+      "extra_masks_r[3]",
+      "native_percent",
+      "gloss_luts[3][256] (caller)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 8069,
+    "key": "skinTexture",
+    "label": "Skin texture (negative blur / positive material)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mask_r",
+      "extra_mask_r",
+      "ui",
+      "material_layer (ui>0)"
+    ],
+    "engine_bridge": true,
+    "automatic": false
+  },
+  {
+    "pf": 8070,
+    "key": "skinClarity",
+    "label": "清晰度",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "roi_base",
+      "roi_blur",
+      "mask_r",
+      "roi",
+      "degree",
+      "threshold",
+      "factor"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21015,
+    "key": "skinColorHue",
+    "label": "Skin color hue",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "skin mask",
+      "TintGreen LUT",
+      "TintMagenta LUT"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21024,
+    "key": "",
+    "label": "Glabella wrinkles",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "base",
+      "residual",
+      "mask_r",
+      "mask_b",
+      "skin_mask",
+      "uniforms"
+    ],
+    "engine_bridge": true,
+    "automatic": false
+  },
+  {
+    "pf": 21025,
+    "key": "",
+    "label": "Puppet Wrinkle",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "base",
+      "residual",
+      "mask_rgba",
+      "skin_mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21026,
+    "key": "removeStubble",
+    "label": "祛胡须",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mask_a",
+      "mask_b",
+      "repair RGB",
+      "strength"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21069,
+    "key": "",
+    "label": "Cheek Wrinkle",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "base",
+      "residual",
+      "mask_rgba",
+      "skin_mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21070,
+    "key": "",
+    "label": "Nose Back Wrinkle",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "base",
+      "residual",
+      "mask_rgba",
+      "skin_mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21071,
+    "key": "",
+    "label": "Perioral Wrinkle",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "base",
+      "residual",
+      "mask_rgba",
+      "skin_mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21076,
+    "key": "smileDegree_closeMouth",
+    "label": "Closed-mouth smile",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "model output RGB (full frame)",
+      "paste gate flag"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21104,
+    "key": "",
+    "label": "祛鼻孔瑕疵",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "M_plane",
+      "A_plane",
+      "V_plane",
+      "T_plane",
+      "source_rgb",
+      "degree"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 21105,
+    "key": "bodySkinToneUnify",
+    "label": "AI body skin unify",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "body/face masks",
+      "effect passes"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30007,
+    "key": "eyelinerDegree_lower",
+    "label": "Lower eyeliner color makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "EyeMaskType=4 mask (RG)",
+      "UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "FilterType 11"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30009,
+    "key": "hairColorUnify",
+    "label": "Hair colour unify",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF30009_MODEL_EFFECT_RGB",
+      "PF30009_HAIR_MASK"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30013,
+    "key": "neutralGrayFlattening",
+    "label": "Neutral Grey Flat",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "original",
+      "current",
+      "mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30014,
+    "key": "",
+    "label": "Neutral Grey 3D",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source_bgr512",
+      "light",
+      "dark",
+      "alpha",
+      "mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30017,
+    "key": "poreEnhance",
+    "label": "Collar bone enhance (UI key poreEnhance)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "model composite",
+      "collarbone mask",
+      "judge mask",
+      "control points",
+      "ui"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30021,
+    "key": "freqSplit_face",
+    "label": "HLF Face",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "median",
+      "gauss",
+      "face_mask",
+      "skin_mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30022,
+    "key": "freqSplit_body",
+    "label": "HLF Body",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "median",
+      "gauss",
+      "face_mask",
+      "skin_mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30025,
+    "key": "teethBlemishRemoval",
+    "label": "Tooth repair",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "teeth mask",
+      "repair layer",
+      "ROI"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30026,
+    "key": "teethAlignment",
+    "label": "Teeth alignment",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "four mouth landmarks [73,78,83,89]",
+      "fit mode (FirstThree | LeastSquares)",
+      "edge planes A/B",
+      "teeth mask",
+      "effect RGB"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30030,
+    "key": "removeBlueVeinsSlider",
+    "label": "Hand blue veins",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF30030_HAND_VEIN_MASK",
+      "PF30030_MODEL_CORRECTION_RGB"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30059,
+    "key": "skinToneUnifyMulti",
+    "label": "Skin tone unify (multi)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "per-face targets",
+      "brightness LUT",
+      "optional LUT3D/matrix",
+      "supports",
+      "ui"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30073,
+    "key": "",
+    "label": "眼睑下至",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "prepared100",
+      "param_list6",
+      "center",
+      "ui_left",
+      "ui_right",
+      "ebo_0x60F2B60",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30079,
+    "key": "",
+    "label": "眼睑下至",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "prepared100",
+      "param_list6",
+      "center",
+      "ui_left",
+      "ui_right",
+      "ebo_0x60F2B60",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30080,
+    "key": "face_forehead_width",
+    "label": "Forehead width",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "27 source slots",
+      "135 negative + 135 positive weights",
+      "anchor + reference points",
+      "left/right ui -100..100",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30081,
+    "key": "face_forehead_width",
+    "label": "Forehead width",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "27 source slots",
+      "135 negative + 135 positive weights",
+      "anchor + reference points",
+      "left/right ui -100..100",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30082,
+    "key": "face_forehead_height",
+    "label": "Forehead height",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "27 source slots",
+      "135 negative + 135 positive weights",
+      "anchor + reference points",
+      "left/right ui -100..100",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30083,
+    "key": "face_forehead_height",
+    "label": "Forehead height",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "27 source slots",
+      "135 negative + 135 positive weights",
+      "anchor + reference points",
+      "left/right ui -100..100",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30092,
+    "key": "face_width",
+    "label": "Face width",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "414 face+0x924 points",
+      "ui -100..100",
+      "effect.json parts 25..28 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30093,
+    "key": "face_width",
+    "label": "Face width",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "414 face+0x924 points",
+      "ui -100..100",
+      "effect.json parts 25..28 parameter+factor",
+      "image width/height"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30187,
+    "key": "Vl.handNeutralGray",
+    "label": "Hand neutral gray",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF30187_HAND_MASK",
+      "PF30187_MODEL_ALPHA",
+      "PF30187_MODEL_NEUTRAL"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30188,
+    "key": "removeDoubleChin_degree",
+    "label": "祛双下巴-程度",
+    "stage": "unavailable",
+    "required_inputs": [
+      "double_chin_degree",
+      "face_parsing_masks",
+      "model_output",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30189,
+    "key": "removeDoubleChin_shadow",
+    "label": "祛双下巴-阴影",
+    "stage": "unavailable",
+    "required_inputs": [
+      "double_chin_shadow",
+      "face_parsing_masks",
+      "model_output",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30190,
+    "key": "Vl.handReshape",
+    "label": "Hand reshape",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF30190_SHIFT_X",
+      "PF30190_SHIFT_Y",
+      "PF30190_HAND_MASK",
+      "PF30190_PROTECT_MASK"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30191,
+    "key": "foreheadPlump",
+    "label": "额头程度",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "degree",
+      "flatten",
+      "brighten",
+      "model",
+      "mask",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30194,
+    "key": "midFacePlump",
+    "label": "面中程度",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "degree",
+      "smooth",
+      "brighten",
+      "owner_mask",
+      "model",
+      "weights",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30197,
+    "key": "cheekPlump",
+    "label": "面颊程度",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "native_degree",
+      "mask_a",
+      "owner_mask_b",
+      "model",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30198,
+    "key": "nasalBasePlump",
+    "label": "鼻基底程度",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "native_degree",
+      "model_mask",
+      "protect_planes",
+      "displacement_xy",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30203,
+    "key": "geisonPlump",
+    "label": "眉弓程度",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "native_degree",
+      "model_field",
+      "mask_a",
+      "owner_mask_b",
+      "luts"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30204,
+    "key": "chinPlump",
+    "label": "下巴程度",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "native_degree",
+      "chin_point",
+      "displacement",
+      "owner_mask",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30207,
+    "key": "mouthAngulusPlump",
+    "label": "嘴角上扬",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "native_degree",
+      "mouth_angle_mask",
+      "displacement_xy",
+      "source_rgba",
+      "model_output"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30209,
+    "key": "",
+    "label": "下颌线增强",
+    "stage": "unavailable",
+    "required_inputs": [
+      "face_194_packet",
+      "jawline_indices",
+      "mask",
+      "model_output"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30210,
+    "key": "fullFacePlump",
+    "label": "全脸丰盈",
+    "stage": "parameters_only",
+    "required_inputs": [
+      "native_degree",
+      "owner_masks",
+      "offset_rgb",
+      "dual_lut_768",
+      "model_tensor"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 30259,
+    "key": "",
+    "label": "祛汗珠（脸部）",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "model output RGB (full frame)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 38556,
+    "key": "breastLift",
+    "label": "BreastLift (row 107)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "degree01",
+      "brushes",
+      "density",
+      "freeze_mask",
+      "warp_direction",
+      "edge_margin"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 41922,
+    "key": "",
+    "label": "眉尾长短",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "type1018_inputs",
+      "indices",
+      "ui_left",
+      "ui_right",
+      "head_slots",
+      "part_kind",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 44124,
+    "key": "",
+    "label": "眉头长短",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "type1018_inputs",
+      "indices",
+      "ui_left",
+      "ui_right",
+      "head_slots",
+      "part_kind",
+      "same_job_identity",
+      "index_builder_0x7080940"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 44297,
+    "key": "Gn.removeBlueVeins",
+    "label": "Foot blue veins",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF44297_MODEL_MASK",
+      "PF44297_MODEL_REPAIR"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 48019,
+    "key": "",
+    "label": "眉头长短",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "type1018_inputs",
+      "indices",
+      "ui_left",
+      "ui_right",
+      "head_slots",
+      "part_kind",
+      "same_job_identity",
+      "index_builder_0x7080940"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 49221,
+    "key": "",
+    "label": "眉尾长短",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "type1018_inputs",
+      "indices",
+      "ui_left",
+      "ui_right",
+      "head_slots",
+      "part_kind",
+      "same_job_identity"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90001,
+    "key": "textureSmoothSkin",
+    "label": "Texture Smooth Skin",
+    "stage": "unavailable",
+    "required_inputs": [
+      "ui degree 0..100",
+      "per-face engine table (non-empty, finite)",
+      "RGBA8 source",
+      "ROI-tight u8 mask",
+      "roi + affine[6]",
+      "SkinDBPipeline service (external merge)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90002,
+    "key": "moistureSmoothSkin",
+    "label": "Moisture smooth (face)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mask rgba",
+      "blur Y",
+      "skin map",
+      "pivot/gain",
+      "beauty LUTs"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90003,
+    "key": "skinColorUniform",
+    "label": "Body skin color uniform",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "native 0x15F93 value",
+      "body mask",
+      "ROI mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90004,
+    "key": "skinRadiance",
+    "label": "Skin radiance",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "skin/parsing/face masks",
+      "valueMean",
+      "native LUT rows, gamma table, color matrices"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90005,
+    "key": "skinWhitening",
+    "label": "皮肤美白",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mask_r",
+      "lut_rgb512",
+      "mix",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90007,
+    "key": "skinRosy",
+    "label": "皮肤红润",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "mask_r",
+      "lut_rgb512",
+      "mix",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90008,
+    "key": "Y.removeStretchMark",
+    "label": "Stretch Mark",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "model_output",
+      "mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90010,
+    "key": "moistureSmoothSkin_body",
+    "label": "Moisture smooth (body)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "skin weight",
+      "dog weight",
+      "beauty LUT",
+      "captured degree",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90015,
+    "key": "",
+    "label": "Neck wrinkles",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "repair RGB",
+      "paste x/y"
+    ],
+    "engine_bridge": true,
+    "automatic": false
+  },
+  {
+    "pf": 90021,
+    "key": "PF90021_UI_KEY_NOT_RECOVERED",
+    "label": "Lip makeup enhance",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "mouth mask",
+      "LipsLUT",
+      "LipDodgeLUT"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90023,
+    "key": "removeEyeLines",
+    "label": "Eye wrinkles",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "base",
+      "residual",
+      "mask_r",
+      "mask_b",
+      "skin_mask",
+      "uniforms"
+    ],
+    "engine_bridge": true,
+    "automatic": false
+  },
+  {
+    "pf": 90024,
+    "key": "removeForeheadLines",
+    "label": "Forehead wrinkles",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "base",
+      "residual",
+      "mask_r",
+      "mask_b",
+      "skin_mask",
+      "uniforms"
+    ],
+    "engine_bridge": true,
+    "automatic": false
+  },
+  {
+    "pf": 90032,
+    "key": "eyeMakeupDegree",
+    "label": "Eye image makeup",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "material RGBA texture",
+      "EyeMaskType=10 mask (RGB)",
+      "mask/material UV",
+      "MixColor RGBA",
+      "Opacity percent",
+      "degree01",
+      "FilterType 41/42/44"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90033,
+    "key": "suitMakeupDegree",
+    "label": "Suit makeup (ordered passes)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "ordered pass list",
+      "per-pass material RGBA",
+      "per-pass mask + UV",
+      "MixColor/opacity/degree/shelter/region",
+      "FilterType"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90034,
+    "key": "",
+    "label": "祛双下巴",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "dense 2-channel shift field",
+      "mode (Flow | Absolute)",
+      "scale"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90041,
+    "key": "aiBodyReshape",
+    "label": "AI body reshape",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF90041_BODY_MASK",
+      "PF90041_SHIFT_MAP"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90080,
+    "key": "",
+    "label": "祛油光（脸部）",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "effect_rgb",
+      "mask",
+      "degree"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90085,
+    "key": "skinToneUnifyFace",
+    "label": "Skin tone unify (face)",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "per-face target",
+      "skin/face/tooth/instance masks",
+      "model weight",
+      "ui"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90086,
+    "key": "skinToneUnifyBody",
+    "label": "肤色统一（身体）",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source",
+      "model_m",
+      "model_o",
+      "w_m",
+      "w_o"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90087,
+    "key": "PF90087_UI_KEY_NOT_RECOVERED",
+    "label": "Hair seam fill",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "part-line mask",
+      "hair mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90088,
+    "key": "Ue.removeStrayHair",
+    "label": "Stray hair removal",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF90088_HAIRFLY_V1",
+      "PF90088_RAW_STRAY_HAIR_MASK"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90089,
+    "key": "SpotlessBody_Baby",
+    "label": "Body Blemish Child",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "model_output",
+      "mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90116,
+    "key": "Y.removeEyeBag",
+    "label": "祛眼袋",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "aligned_color_field_rgb_f32",
+      "aligned_response_mask",
+      "degree"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90118,
+    "key": "",
+    "label": "唇纹修整",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "source_bgra",
+      "repair_bgra",
+      "mask_a",
+      "mask_b",
+      "lip_points"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90130,
+    "key": "glassesGlareRemoval",
+    "label": "Glasses glare removal",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "network mask",
+      "effect RGB",
+      "lens mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90131,
+    "key": "removeWhiteHair",
+    "label": "White hair removal",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF90131_RAW_HAIR_MASK",
+      "PF90131_REPAIR_IMAGE"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90139,
+    "key": "hairSmooth",
+    "label": "Hair smooth",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF90139_HAIR_MASK",
+      "PF90139_BLEND_SOURCE",
+      "PF90139_DETAIL"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 90160,
+    "key": "hairGlossySlider",
+    "label": "Hair gloss",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "PF90160_MODEL_DETAIL",
+      "PF90160_HAIR_MASK"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 100004,
+    "key": "redBloodRemoval",
+    "label": "Eye red blood removal",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "model RGB",
+      "model alpha"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 100005,
+    "key": "eyeWhitePurify",
+    "label": "Eye white purify",
+    "stage": "unavailable",
+    "required_inputs": [
+      "eye mask",
+      "8-channel model output",
+      "vendor pixel law (open)"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 100007,
+    "key": "smileDegree_openMouth",
+    "label": "Open-mouth smile",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "Grinning material",
+      "lip/mouth masks",
+      "model dx/dy",
+      "roi"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  },
+  {
+    "pf": 100008,
+    "key": "Y.repairBreast",
+    "label": "Repair Breast",
+    "stage": "cpu_stage",
+    "required_inputs": [
+      "model_output",
+      "mask"
+    ],
+    "engine_bridge": false,
+    "automatic": false
+  }
+]

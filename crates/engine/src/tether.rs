@@ -29,6 +29,39 @@ pub enum TetherStatus {
     Available { lib_version: String },
 }
 
+/// Stable category for a tether/capture failure, so the interface can show a
+/// translated message instead of driver text. The raw error goes to the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TetherErrorKind {
+    /// The platform runtime (libgphoto2, WIA COM) is missing or failed to start.
+    NoLibrary,
+    /// No camera answered, or the device could not be opened.
+    NoCamera,
+    /// The driver is there but does not implement the operation (vendor SDK needed,
+    /// non-JPEG output, no preview component).
+    Unsupported,
+    /// The camera stopped responding within the time budget.
+    Timeout,
+    Other,
+}
+
+impl TetherErrorKind {
+    pub fn of(err: &anyhow::Error) -> Self {
+        let text = format!("{err:#}");
+        if text.contains("timed out") {
+            Self::Timeout
+        } else if text.contains("NoLibrary") {
+            Self::NoLibrary
+        } else if text.contains("NoCamera") {
+            Self::NoCamera
+        } else if text.contains("Unsupported") {
+            Self::Unsupported
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// One captured frame: the camera JPEG bytes and its decoded dimensions.
 #[derive(Clone, Debug)]
 pub struct CapturedFrame {
@@ -71,6 +104,31 @@ pub fn probe() -> TetherStatus {
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         TetherStatus::NoLibrary
+    }
+}
+
+/// Model, battery and shots remaining when the platform backend can read them;
+/// `Disconnected` without a camera, and never an error.
+pub fn camera_status() -> crate::CameraStatus {
+    #[cfg(windows)]
+    {
+        wia::camera_status().unwrap_or(crate::CameraStatus::Disconnected)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::CameraStatus::Disconnected
+    }
+}
+
+/// Read-only exposure settings when the platform backend exposes them.
+pub fn camera_settings() -> Option<crate::CameraSettings> {
+    #[cfg(windows)]
+    {
+        wia::camera_settings()
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 
@@ -260,7 +318,7 @@ mod gp {
     }
 
     pub fn missing_library() -> anyhow::Error {
-        anyhow!("NoCamera: libgphoto2.so.6 is not loadable on this machine")
+        anyhow!("NoLibrary: libgphoto2.so.6 is not loadable on this machine")
     }
 
     fn check(api: &Api, code: c_int, what: &str) -> Result<()> {
@@ -413,6 +471,7 @@ mod wia {
     use anyhow::{anyhow, bail, Result};
 
     use super::{jpeg_dimensions, CapturedFrame, TetherStatus};
+    use crate::{CameraSettings, CameraStatus};
 
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -440,8 +499,19 @@ mod wia {
     /// register as streaming video instead.
     const WIA_DEVICE_TYPE_IMAGE: i32 = 2;
     const WIA_DEVICE_TYPE_ALL: i32 = 0;
+    // WiaDef.h: device description and the two camera-status properties.
     const WIA_DIP_DEV_ID: u32 = 2;
+    const WIA_DIP_DEV_DESC: u32 = 4;
     const WIA_DIP_DEV_NAME: u32 = 7;
+    const WIA_DPC_EXPOSURE_COMP: u32 = 2053;
+    const WIA_DPC_EXPOSURE_TIME: u32 = 2054;
+    const WIA_DPC_FNUMBER: u32 = 2055;
+    const WIA_DPC_FOCUS_MODE: u32 = 2057;
+    const WIA_DPC_PICTURES_REMAINING: u32 = 2051;
+    const WIA_DPC_BATTERY_STATUS: u32 = 2065;
+    const WIA_DPC_EXPOSURE_INDEX: u32 = 2083;
+    const WIA_DPC_FOCUS_DISTANCE: u32 = 2086;
+    const WIA_DPC_WHITE_BALANCE: u32 = 2089;
 
     const COINIT_MULTITHREADED: u32 = 0;
     const CLSCTX_ALL: u32 = 0x17;
@@ -453,6 +523,7 @@ mod wia {
     const VT_BSTR: u16 = 8;
     const VT_LPWSTR: u16 = 31;
     const PRSPEC_PROPID: u32 = 1;
+    const IID_IWIA_PROPERTY_STORAGE: Guid = guid(0x98B5E8A0, 0x29CC, 0x491A, [0xAA, 0xC0, 0xE6, 0xDB, 0x4F, 0xDC, 0xCE, 0xB6]);
 
     #[link(name = "ole32")]
     unsafe extern "system" {
@@ -580,15 +651,23 @@ mod wia {
         data: [usize; 2],
     }
 
-    fn device_property(storage: *mut c_void, propid: u32) -> String {
+    /// Reads one WIA item property. Enumerator and device items both expose
+    /// `IWiaPropertyStorage` through `QueryInterface`; its `ReadMultiple` is at
+    /// the same vtable slot as `IPropertyStorage`'s.
+    fn read_property(item: *mut c_void, propid: u32) -> Option<PropVariant> {
+        let storage = query_interface(item, &IID_IWIA_PROPERTY_STORAGE)?;
         let spec = PropSpec { kind: PRSPEC_PROPID, propid };
         let mut value = PropVariant { vt: 0, reserved1: 0, reserved2: 0, reserved3: 0, data: [0; 2] };
         let read: unsafe extern "system" fn(*mut c_void, u32, *const PropSpec, *mut PropVariant) -> i32 =
-            unsafe { std::mem::transmute(vtable_slot(storage, 3)) };
-        let hr = unsafe { read(storage, 1, &spec, &mut value) };
-        if hr < 0 {
+            unsafe { std::mem::transmute(vtable_slot(storage.ptr(), 3)) };
+        let hr = unsafe { read(storage.ptr(), 1, &spec, &mut value) };
+        (hr >= 0).then_some(value)
+    }
+
+    fn device_property(item: *mut c_void, propid: u32) -> String {
+        let Some(value) = read_property(item, propid) else {
             return String::new();
-        }
+        };
         unsafe {
             match value.vt {
                 VT_BSTR => {
@@ -610,6 +689,91 @@ mod wia {
                 _ => String::new(),
             }
         }
+    }
+
+    /// Integer value of a property, for `VT_UI1`/`VT_UI2`/`VT_UI4`/`VT_I2`/`VT_I4`.
+    fn device_number(item: *mut c_void, propid: u32) -> Option<u32> {
+        let value = read_property(item, propid)?;
+        let n = match value.vt {
+            2 | 3 | 17 | 18 | 19 => value.data[0] as u32,
+            _ => return None,
+        };
+        Some(n)
+    }
+
+    /// WIA battery status is a percentage 1..=100; 0 means the driver has none.
+    fn battery_fraction(raw: u32) -> f32 {
+        (raw.min(100) as f32) / 100.0
+    }
+
+    /// `WIA_DPC_EXPOSURE_TIME` is in 100 µs units: 1250 → 1/8 s, 25000 → 2.5 s.
+    pub(super) fn exposure_time_label(raw: u32) -> String {
+        let secs = raw as f64 / 10_000.0;
+        if secs <= 0.0 {
+            return String::new();
+        }
+        if secs >= 1.0 {
+            format!("{secs:.1} s")
+        } else {
+            format!("1/{}", (1.0 / secs).round() as u32)
+        }
+    }
+
+    /// `WIA_DPC_FNUMBER` is the f-number × 100: 280 → f/2.8, 800 → f/8.
+    pub(super) fn fnumber_label(raw: u32) -> String {
+        let f = raw as f64 / 100.0;
+        if (f - f.round()).abs() < 0.05 {
+            format!("f/{f:.0}")
+        } else {
+            format!("f/{f:.1}")
+        }
+    }
+
+    /// `WIA_DPC_EXPOSURE_COMP` is stops × 1000.
+    pub(super) fn exposure_comp_label(raw: i32) -> String {
+        format!("{:+.1} EV", raw as f64 / 1000.0)
+    }
+
+    /// `WiaDef.h` WHITEBALANCE_* constants.
+    pub(super) fn white_balance_label(raw: u32) -> &'static str {
+        match raw {
+            1 => "Manual",
+            2 => "Auto",
+            3 => "One-push auto",
+            4 => "Daylight",
+            5 => "Fluorescent",
+            6 => "Tungsten",
+            7 => "Flash",
+            _ => "",
+        }
+    }
+
+    /// `WiaDef.h` FOCUSMODE_* constants.
+    pub(super) fn focus_mode_label(raw: u32) -> &'static str {
+        match raw {
+            1 => "Manual",
+            2 => "Auto",
+            3 => "Macro auto",
+            _ => "",
+        }
+    }
+
+    /// `WIA_DPC_FOCUS_DISTANCE` is millimetres; 0 and 0xFFFFFFFF mean unknown.
+    pub(super) fn focus_distance_label(raw: u32) -> String {
+        if raw == 0 || raw == u32::MAX {
+            return String::new();
+        }
+        let mm = raw as f64;
+        if mm >= 1000.0 {
+            format!("{:.1} m", mm / 1000.0)
+        } else {
+            format!("{raw} mm")
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn battery_fraction_for_test(raw: u32) -> f32 {
+        battery_fraction(raw)
     }
 
     struct Device {
@@ -677,6 +841,59 @@ mod wia {
                 TetherStatus::NoCamera
             }
         }
+    }
+
+    /// Model, battery and shots remaining from the first WIA device. Read-only
+    /// properties; `None` when no device is connected or the driver exposes
+    /// neither a description nor a name.
+    pub(super) fn camera_status() -> Option<CameraStatus> {
+        let _com = ComInit::new().ok()?;
+        let devices = list_devices().ok()?;
+        let device = devices.first()?;
+        let root = create_device(&device.id).ok()?;
+        let model = {
+            let desc = device_property(root.ptr(), WIA_DIP_DEV_DESC);
+            let name = device_property(root.ptr(), WIA_DIP_DEV_NAME);
+            let name = if name.is_empty() { device.name.clone() } else { name };
+            if desc.is_empty() { name } else { desc }
+        };
+        if model.trim().is_empty() {
+            return None;
+        }
+        Some(CameraStatus::Connected {
+            model,
+            battery: device_number(root.ptr(), WIA_DPC_BATTERY_STATUS).map(battery_fraction).unwrap_or(0.0),
+            shots_remaining: device_number(root.ptr(), WIA_DPC_PICTURES_REMAINING).unwrap_or(0),
+        })
+    }
+
+    /// Read-only exposure settings. WIA has no dedicated ISO-speed property, so
+    /// `WIA_DPC_EXPOSURE_INDEX` is shown as the ISO-equivalent. Empty strings /
+    /// zero mean the driver does not expose that property; `None` without a
+    /// device or when none of them can be read.
+    pub(super) fn camera_settings() -> Option<CameraSettings> {
+        let _com = ComInit::new().ok()?;
+        let devices = list_devices().ok()?;
+        let device = devices.first()?;
+        let root = create_device(&device.id).ok()?;
+        let read = |propid| device_number(root.ptr(), propid);
+        let iso = read(WIA_DPC_EXPOSURE_INDEX).map(|n| format!("ISO {n}")).unwrap_or_default();
+        let shutter = read(WIA_DPC_EXPOSURE_TIME).map(exposure_time_label).unwrap_or_default();
+        let aperture = read(WIA_DPC_FNUMBER).map(fnumber_label).unwrap_or_default();
+        let exposure_comp = read(WIA_DPC_EXPOSURE_COMP).map(|n| n as i32 as f64 / 1000.0).unwrap_or(0.0) as f32;
+        let white_balance = read(WIA_DPC_WHITE_BALANCE).map(white_balance_label).unwrap_or("").to_string();
+        let focus_mode = read(WIA_DPC_FOCUS_MODE).map(focus_mode_label).unwrap_or("").to_string();
+        let focus_distance = read(WIA_DPC_FOCUS_DISTANCE).map(focus_distance_label).unwrap_or_default();
+        if iso.is_empty()
+            && shutter.is_empty()
+            && aperture.is_empty()
+            && white_balance.is_empty()
+            && focus_mode.is_empty()
+            && focus_distance.is_empty()
+        {
+            return None;
+        }
+        Some(CameraSettings { iso, shutter, aperture, exposure_comp, white_balance, drive_mode: String::new(), focus_mode, focus_distance })
     }
 
     fn create_device(device_id: &str) -> Result<ComPtr> {
@@ -1042,6 +1259,84 @@ mod tests {
     fn windows_wia_enumeration_reaches_the_device_manager() {
         let count = wia::device_count_for_test().expect("WiaDevMgr2 enumeration");
         println!("WIA imaging devices: {count}");
+    }
+
+    /// No camera must read as `Disconnected`, not an error or a fake device.
+    #[cfg(windows)]
+    #[test]
+    fn wia_camera_status_is_safe_without_a_camera() {
+        let count = wia::device_count_for_test().expect("WiaDevMgr2 enumeration");
+        let status = wia::camera_status();
+        println!("WIA devices: {count}, status: {status:?}");
+        assert_eq!(count == 0, status.is_none(), "an empty enumeration must not report a camera");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wia_battery_status_maps_to_a_fraction() {
+        assert_eq!(wia::battery_fraction_for_test(0), 0.0);
+        assert_eq!(wia::battery_fraction_for_test(50), 0.5);
+        assert_eq!(wia::battery_fraction_for_test(250), 1.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wia_exposure_values_map_to_display_strings() {
+        assert_eq!(wia::exposure_time_label(1250), "1/8");
+        assert_eq!(wia::exposure_time_label(25000), "2.5 s");
+        assert_eq!(wia::exposure_time_label(0), "");
+        assert_eq!(wia::fnumber_label(280), "f/2.8");
+        assert_eq!(wia::fnumber_label(800), "f/8");
+        assert_eq!(wia::exposure_comp_label(-1000), "-1.0 EV");
+        assert_eq!(wia::exposure_comp_label(2000), "+2.0 EV");
+        assert_eq!(wia::white_balance_label(4), "Daylight");
+        assert_eq!(wia::white_balance_label(99), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wia_focus_values_are_read_only_labels() {
+        assert_eq!(wia::focus_mode_label(1), "Manual");
+        assert_eq!(wia::focus_mode_label(2), "Auto");
+        assert_eq!(wia::focus_mode_label(9), "");
+        assert_eq!(wia::focus_distance_label(2400), "2.4 m");
+        assert_eq!(wia::focus_distance_label(350), "350 mm");
+        assert_eq!(wia::focus_distance_label(u32::MAX), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wia_camera_settings_is_safe_without_a_camera() {
+        let count = wia::device_count_for_test().expect("WiaDevMgr2 enumeration");
+        let settings = wia::camera_settings();
+        if count == 0 {
+            assert!(settings.is_none(), "an empty enumeration must not report settings");
+        }
+    }
+
+    /// No camera must be an error for the one-shot preview, never a fake frame.
+    #[cfg(windows)]
+    #[test]
+    fn wia_preview_without_a_camera_reports_no_camera() {
+        if wia::device_count_for_test().expect("WiaDevMgr2 enumeration") != 0 {
+            return;
+        }
+        let err = wia::preview(640).expect_err("no camera must not produce a preview").to_string();
+        assert!(err.contains("NoCamera"), "{err}");
+    }
+
+    #[test]
+    fn tether_errors_map_to_stable_kinds() {
+        use anyhow::anyhow;
+        let kind = |text: &str| TetherErrorKind::of(&anyhow!("{text}"));
+        assert_eq!(kind("NoLibrary: libgphoto2.so.6 is not loadable"), TetherErrorKind::NoLibrary);
+        assert_eq!(kind("NoCamera: no WIA imaging device is connected"), TetherErrorKind::NoCamera);
+        assert_eq!(
+            kind("Unsupported: this device needs a vendor SDK (WIA_CMD_TAKE_PICTURE failed, HRESULT 0x80004005)"),
+            TetherErrorKind::Unsupported
+        );
+        assert_eq!(kind("NoCamera: libgphoto2 is still busy with a previous call that timed out"), TetherErrorKind::Timeout);
+        assert_eq!(kind("disk full"), TetherErrorKind::Other);
     }
 
     /// 2x2 24-bit bottom-up DIB: bottom row blue, top row red.

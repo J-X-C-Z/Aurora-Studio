@@ -362,7 +362,33 @@ impl Store {
 
     /// Reads the XMP sidecar of one image; `Ok(None)` when there is none.
     pub fn load_xmp(&self, rel_path: &str) -> Result<Option<crate::XmpMeta>> {
-        crate::XmpMeta::load(&self.xmp_path(rel_path)?)
+        let sidecar = self.xmp_path(rel_path)?;
+        if let Some(meta) = crate::XmpMeta::load(&sidecar)? {
+            return Ok(Some(meta));
+        }
+        let image = {
+            validate_rel_path(rel_path)?;
+            let folder = self
+                .root
+                .parent()
+                .ok_or_else(|| StoreError::InvalidPath(rel_path.to_string()))?;
+            folder.join(rel_path)
+        };
+        if matches!(
+            image
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("heic" | "heif")
+        ) {
+            if let Some(packet) = crate::heif::read_xmp(&image) {
+                return crate::XmpMeta::parse(&packet)
+                    .map(Some)
+                    .with_context(|| format!("parsing embedded XMP in {}", image.display()));
+            }
+        }
+        Ok(None)
     }
 
     /// Writes rating, label and keywords to the image's XMP sidecar. Callers
@@ -908,6 +934,34 @@ mod tests {
         assert!(temp.path().join("img_001.xmp").exists());
         assert_eq!(store.load_xmp("img_001.cr3").unwrap(), Some(meta));
         assert!(!temp.path().join("img_001.xmp.tmp").exists());
+    }
+
+    #[test]
+    fn loads_embedded_heif_xmp_when_there_is_no_sidecar() {
+        if !crate::heif_write::available() {
+            return;
+        }
+        let temp = TempFolder::new();
+        let image = temp.path().join("shot.heic");
+        let meta = crate::XmpMeta {
+            rating: 5,
+            label: "Green".into(),
+            keywords: vec!["portrait".into()],
+        };
+        crate::heif_write::encode(
+            &image,
+            &vec![90u8; 16 * 12 * 4],
+            16,
+            12,
+            80,
+            None,
+            None,
+            Some(meta.packet().as_bytes()),
+        )
+        .unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        assert_eq!(store.load_xmp("shot.heic").unwrap(), Some(meta));
+        std::fs::remove_file(&image).unwrap();
     }
 
     #[test]

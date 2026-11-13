@@ -9,31 +9,10 @@ use crate::engine::StyleInfo;
 /// engine styles. `LUMEN_C1_STYLES` names a directory whose direct children are
 /// the install's style roots, so tests can point at synthetic packages.
 pub fn installed_styles() -> Vec<StyleInfo> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for dir in roots() {
-        for path in package_paths(&dir) {
-            let group = path
-                .parent()
-                .and_then(|p| p.strip_prefix(&dir).ok())
-                .map(relative_name)
-                .unwrap_or_default();
-            match crate::c1_styles::load_style(&path) {
-                Ok(style) if seen.insert(style.name.clone()) => out.push(StyleInfo {
-                    name: style.name,
-                    group,
-                    adjustments: style.adjustments,
-                }),
-                Ok(_) => {}
-                Err(err) => log::warn!("c1 style {}: {err:#}", path.display()),
-            }
-        }
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.group.cmp(&b.group)));
-    out
+    installed_styles_from(&roots())
 }
 
-fn installed_styles_from(dirs: &[PathBuf]) -> Vec<StyleInfo> {
+pub(crate) fn installed_styles_from(dirs: &[PathBuf]) -> Vec<StyleInfo> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for dir in dirs {
@@ -119,10 +98,27 @@ mod tests {
 
     #[test]
     fn real_install_has_styles() {
+        let _serial = crate::filmcurve::test_lock();
         if !roots().first().is_some_and(|path| path.is_dir()) {
             return;
         }
         assert!(!installed_styles().is_empty());
+    }
+
+    #[test]
+    fn lumen_c1_styles_overrides_the_install_directory() {
+        let _serial = crate::filmcurve::test_lock();
+        let root = temp_root("override");
+        fs::write(root.join("Lane Only.costyle"), sl("Lane Only", 0.3)).unwrap();
+        let previous = std::env::var_os("LUMEN_C1_STYLES");
+        unsafe { std::env::set_var("LUMEN_C1_STYLES", &root) };
+        let styles = installed_styles();
+        match previous {
+            Some(v) => unsafe { std::env::set_var("LUMEN_C1_STYLES", v) },
+            None => unsafe { std::env::remove_var("LUMEN_C1_STYLES") },
+        }
+        assert_eq!(styles.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Lane Only"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

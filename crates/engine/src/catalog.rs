@@ -142,11 +142,34 @@ pub struct ImageInfo {
     pub has_adjustments: bool,
     /// Soft delete: the file stays on disk, the trash collection lists it.
     pub trashed: bool,
+    /// HEIF auxiliary images; `None` for every other format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heif: Option<HeifInfo>,
 }
 
 impl ImageInfo {
     pub fn aspect(&self) -> f32 {
         self.width as f32 / self.height.max(1) as f32
+    }
+}
+
+/// What a HEIF file carries besides the primary image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeifInfo {
+    pub thumbnails: u32,
+    pub depth_images: u32,
+}
+
+impl HeifInfo {
+    /// The library thumbnail path uses the embedded image when there are no
+    /// adjustments, so `thumbnails > 0` means "embedded is preferred".
+    pub fn uses_embedded_thumbnail(&self) -> bool {
+        self.thumbnails > 0
+    }
+
+    /// Compact browser label: thumbnails/depth counts.
+    pub fn aux_label(&self) -> String {
+        format!("{}t/{}d", self.thumbnails, self.depth_images)
     }
 }
 
@@ -236,5 +259,17 @@ mod tests {
         let json = serde_json::to_string(&album).unwrap();
         let back: UserCollection = serde_json::from_str(&json).unwrap();
         assert_eq!(back, album);
+    }
+
+    #[test]
+    fn heif_info_labels_auxiliary_counts() {
+        let none = HeifInfo::default();
+        assert_eq!(none.aux_label(), "0t/0d");
+        assert!(!none.uses_embedded_thumbnail());
+        let some = HeifInfo { thumbnails: 1, depth_images: 2 };
+        assert_eq!(some.aux_label(), "1t/2d");
+        assert!(some.uses_embedded_thumbnail());
+        let json = serde_json::to_string(&some).unwrap();
+        assert_eq!(serde_json::from_str::<HeifInfo>(&json).unwrap(), some);
     }
 }

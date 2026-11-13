@@ -14,6 +14,33 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+/// Stable category for a failed `.costyle` / `.copreset` import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleImportErrorKind {
+    /// The bytes are readable but are not a Capture One style.
+    NotAStyle,
+    /// The file could not be read.
+    Io,
+    /// The style uses something this build cannot import.
+    Unsupported,
+    Other,
+}
+
+impl StyleImportErrorKind {
+    pub fn of(err: &anyhow::Error) -> Self {
+        let lower = format!("{err:#}").to_ascii_lowercase();
+        if lower.contains("is not a capture one style") || lower.contains("no <sl> root") {
+            Self::NotAStyle
+        } else if lower.contains("reading ") || lower.contains("os error") || lower.contains("no such file") {
+            Self::Io
+        } else if lower.contains("unsupported") || lower.contains("not supported") {
+            Self::Unsupported
+        } else {
+            Self::Other
+        }
+    }
+}
+
 use crate::c1_model::{self, C1VariantSettings};
 use crate::AdjustmentSet;
 
@@ -263,6 +290,21 @@ mod tests {
         assert_eq!(style.adjustments.exposure.exposure, -1.0);
         assert_eq!(style.adjustments.white_balance, AdjustmentSet::default().white_balance);
         assert_eq!(style.adjustments.moire, AdjustmentSet::default().moire);
+    }
+
+    #[test]
+    fn style_import_failures_map_to_stable_kinds() {
+        use anyhow::anyhow;
+        assert_eq!(
+            StyleImportErrorKind::of(&anyhow!("foo.costyle is not a Capture One style: no <SL> root")),
+            StyleImportErrorKind::NotAStyle
+        );
+        assert_eq!(
+            StyleImportErrorKind::of(&anyhow!("reading C:/x.costyle: No such file (os error 2)")),
+            StyleImportErrorKind::Io
+        );
+        assert_eq!(StyleImportErrorKind::of(&anyhow!("Unsupported version")), StyleImportErrorKind::Unsupported);
+        assert_eq!(StyleImportErrorKind::of(&anyhow!("other")), StyleImportErrorKind::Other);
     }
 
     #[cfg(feature = "external-fixtures")]

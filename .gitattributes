@@ -8,6 +8,9 @@
 *.yaml text eol=lf
 *.sh text eol=lf
 
+# Preserve the generated kernel image bytes used by dispatch records.
+*.ptx -text whitespace=-blank-at-eof,cr-at-eol
+
 *.exe binary
 *.dll binary
 *.lib binary

@@ -36,7 +36,7 @@ cargo build -p lumen-app --release --locked
 
 ## 已知限制
 
-节点图的并行/图层混合器仍按串行列表渲染，导出仍包含未连接节点。HDR/全景合并、AI 降噪、镜头模糊、ICC 软打样、取消导出及 HEIF/JXL/DNG/PSD 原生导出尚未接通，界面会标注状态。Windows 联机能力取决于 WIA 相机驱动；尚未完成真实相机验收。
+节点图的并行/图层混合器仍按串行列表渲染，导出仍包含未连接节点。HDR/全景合并、AI 降噪、镜头模糊、ICC 软打样的前端、HEIF 导入及 JXL/DNG/PSD 原生导出尚未接通；HEIF 输出需要可选编码运行库，取消导出已连接到后端任务状态，界面会标注状态。Windows 联机能力取决于 WIA 相机驱动；尚未完成真实相机验收。
 
 GPU 界面显示不代表图像处理或 AI 推理已使用 CUDA/TensorRT。本版不宣称新的 GPU 推理加速或原厂算法一致性。
 
@@ -47,3 +47,7 @@ GPU 界面显示不代表图像处理或 AI 推理已使用 CUDA/TensorRT。本�
 项目代码采用 [MIT](LICENSE)；第三方依赖适用各自许可。本机 Capture One 资产与照片不包含在 MIT 授权或发布包内。
 
 图库与文件管理的操作说明、目录格式升级和功能边界见 [docs/library-management.md](docs/library-management.md)。
+
+当前后端更新及能力边界见 [docs/backend-update-20261113.md](docs/backend-update-20261113.md)。
+
+人像计算库已纳入工作区；统一调用入口、可用阶段和输入要求见 [后端更新](docs/backend-update-20261113.md)。这不代表全部人像滑块已自动生效；模型、蒙版、特征点及材质仍须按接口提供。

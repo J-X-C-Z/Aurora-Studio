@@ -198,6 +198,7 @@ mod tests {
                     variant: 1,
                     has_adjustments: false,
                     trashed: false,
+                    heif: None,
                 })
                 .collect();
             Arc::new(Self {

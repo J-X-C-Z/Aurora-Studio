@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 
-use crate::{AdjustmentSet, CurvePoint, GrainKind, StyleInfo};
+use crate::{param_meta, AdjustmentSet, CurvePoint, GrainKind, StyleInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresetKind {
@@ -43,6 +43,9 @@ pub struct C1Preset {
     /// order. Writing a preset follows this list, so metadata keys and values
     /// we cannot regenerate are preserved.
     pub orig: Vec<(String, String)>,
+    /// `ColorCorrections` rows as C1 wrote them, so they can be written back
+    /// without re-encoding the editor's bands and shifts.
+    pub color_corrections: Vec<[f32; 18]>,
 }
 
 /// `K`/`V` pairs of one `<E/>` element, in file order.
@@ -111,11 +114,29 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
         "GradationCurveRed" => set.curves.red = curve(value),
         "GradationCurveGreen" => set.curves.green = curve(value),
         "GradationCurveBlue" => set.curves.blue = curve(value),
+        // The Curve tool's own keys use the same `x,y;x,y` encoding.
+        "GCurve" => set.curves.rgb = curve(value),
+        "GCurveR" => set.curves.red = curve(value),
+        "GCurveG" => set.curves.green = curve(value),
+        "GCurveB" => set.curves.blue = curve(value),
         // Name-for-name only: C1's Y curve is not proven to be our luma curve.
         "GradationCurveY" => set.curves.luma = curve(value),
+        // The Levels tool: four `;`-separated values, master first, then R/G/B.
+        "Shadow" => levels_edge(&mut set.levels, 0, value),
+        "Highlight" => levels_edge(&mut set.levels, 1, value),
+        "TargetShadow" => levels_edge(&mut set.levels, 2, value),
+        "TargetHighlight" => levels_edge(&mut set.levels, 3, value),
+        "Midtone" => levels_midtone(&mut set.levels, value),
+        // C1 stores the white balance as camera RGB gains beside its UI
+        // temperature; the gains only stand in when no temperature is present.
+        // shortcut: gains→kelvin uses the engine's 5600 K reference, unverified
+        // against Capture One's own conversion; revisit with a C1-exported pair.
+        "WhiteBalance" => white_balance_gains(set, value),
         "USMAmount" => set.sharpening.amount = num().unwrap_or(0.0),
         "USMRadius" => set.sharpening.radius = num().unwrap_or(0.0),
-        "USMThreshold" => set.sharpening.threshold = num().unwrap_or(0.0),
+        "USMThreshold" => {
+            set.sharpening.threshold = param_meta::clamp("USMThreshold", num().unwrap_or(0.0))
+        }
         "FilmGrainAmount" => set.film_grain.impact = num().unwrap_or(0.0),
         "FilmGrainGranularity" => set.film_grain.granularity = num().unwrap_or(0.0),
         // shortcut: index taken as our GrainKind order, C1's enum order unproven.
@@ -147,8 +168,47 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
 
 fn bw_sensitivity(set: &mut AdjustmentSet, channel: usize, value: Option<f32>) {
     if let Some(v) = value {
-        set.black_white.sensitivity[channel] = v;
+        set.black_white.sensitivity[channel] = param_meta::clamp(param_meta::BW_CHANNELS[channel], v);
     }
+}
+
+fn levels_edge(levels: &mut crate::Levels, slot: usize, value: &str) {
+    let v: Vec<f32> = value.split(';').filter_map(|x| x.trim().parse().ok()).collect();
+    if v.len() != 4 {
+        return;
+    }
+    let channels = [&mut levels.rgb, &mut levels.red, &mut levels.green, &mut levels.blue];
+    for (i, channel) in channels.into_iter().enumerate() {
+        let x = v[i].clamp(0.0, 1.0);
+        match slot {
+            0 => channel.input_black = x,
+            1 => channel.input_white = x,
+            2 => channel.output_black = x,
+            _ => channel.output_white = x,
+        }
+    }
+}
+
+fn levels_midtone(levels: &mut crate::Levels, value: &str) {
+    let v: Vec<f32> = value.split(';').filter_map(|x| x.trim().parse().ok()).collect();
+    if v.len() != 4 {
+        return;
+    }
+    let channels = [&mut levels.rgb, &mut levels.red, &mut levels.green, &mut levels.blue];
+    for (i, channel) in channels.into_iter().enumerate() {
+        channel.gamma = crate::gamma_from_c1_midtone(v[i]);
+    }
+}
+
+fn white_balance_gains(set: &mut AdjustmentSet, value: &str) {
+    let v: Vec<f32> = value.split(';').filter_map(|x| x.trim().parse().ok()).collect();
+    if v.len() != 3 {
+        return;
+    }
+    let (kelvin, tint) = crate::c1_model::gains_to_kelvin_tint([v[0], v[1], v[2]]);
+    set.white_balance.mode = crate::WhiteBalanceMode::Custom;
+    set.white_balance.kelvin = kelvin.clamp(2000.0, 50000.0);
+    set.white_balance.tint = tint.clamp(-50.0, 50.0);
 }
 
 fn curve(value: &str) -> crate::Curve {
@@ -191,7 +251,7 @@ fn write_sl(path: &Path, preset: &C1Preset) -> Result<()> {
 /// Capture One one.
 pub fn sl_text(preset: &C1Preset) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<SL Engine=\"800\">\n");
-    let mapped = mapped_values(&preset.adjustments);
+    let mapped = mapped_values(&preset.adjustments, &preset.color_corrections);
     let mut written: Vec<String> = Vec::new();
     for (key, value) in &preset.orig {
         let text = match key.as_str() {
@@ -217,6 +277,26 @@ pub fn sl_text(preset: &C1Preset) -> String {
                     None
                 } else {
                     mapped.iter().find(|(k, _, _)| k == key).map(|(_, v, _)| v.clone())
+                }
+            }
+            // The Curve tool's keys and `GradationCurve*` hold the same curve:
+            // write the value back under the file's own key, and keep the
+            // equivalent gradation key from being appended beside it.
+            "GCurve" | "GCurveR" | "GCurveG" | "GCurveB" => {
+                let default = AdjustmentSet::default();
+                let (gradation, is_default) = match key.as_str() {
+                    "GCurve" => ("GradationCurve", preset.adjustments.curves.rgb == default.curves.rgb),
+                    "GCurveR" => ("GradationCurveRed", preset.adjustments.curves.red == default.curves.red),
+                    "GCurveG" => ("GradationCurveGreen", preset.adjustments.curves.green == default.curves.green),
+                    _ => ("GradationCurveBlue", preset.adjustments.curves.blue == default.curves.blue),
+                };
+                written.push(gradation.to_owned());
+                // An empty `V` means "no curve"; keep it rather than write a
+                // neutral one beside it.
+                if is_default {
+                    None
+                } else {
+                    mapped.iter().find(|(k, _, _)| k == gradation).map(|(_, v, _)| v.clone())
                 }
             }
             _ => mapped.iter().find(|(k, _, _)| k == key).map(|(_, v, _)| v.clone()),
@@ -273,7 +353,7 @@ fn escape(value: &str) -> String {
 
 /// The mapped keys of an adjustment set, in the encoding `parse_sl` reads,
 /// each with whether it still holds the engine's default value.
-fn mapped_values(a: &AdjustmentSet) -> Vec<(String, String, bool)> {
+fn mapped_values(a: &AdjustmentSet, corrections: &[[f32; 18]]) -> Vec<(String, String, bool)> {
     let d = AdjustmentSet::default();
     let mut out: Vec<(String, String, bool)> = Vec::new();
     macro_rules! num {
@@ -332,7 +412,52 @@ fn mapped_values(a: &AdjustmentSet) -> Vec<(String, String, bool)> {
     num!("BwLightSaturation", a.black_white.highlight_tone.saturation, 0.0);
     num!("BwDarkHue", a.black_white.shadow_tone.hue, 0.0);
     num!("BwDarkSaturation", a.black_white.shadow_tone.saturation, 0.0);
+    // The Levels tool keeps one four-value vector per key, master first.
+    for (key, slot) in [
+        ("Shadow", 0usize),
+        ("Highlight", 1),
+        ("TargetShadow", 2),
+        ("TargetHighlight", 3),
+    ] {
+        let value = levels_text(&a.levels, slot, false);
+        out.push((key.to_owned(), value.clone(), value == levels_text(&d.levels, slot, false)));
+    }
+    let midtone = levels_text(&a.levels, 0, true);
+    out.push(("Midtone".to_owned(), midtone.clone(), midtone == levels_text(&d.levels, 0, true)));
+    // shortcut: the rows are written as read; edits made to the converted
+    // editor are not re-encoded until one round-trips through C1.
+    out.push((
+        "ColorCorrections".to_owned(),
+        rows_text(corrections),
+        corrections.is_empty(),
+    ));
     out
+}
+
+fn levels_text(levels: &crate::Levels, slot: usize, midtone: bool) -> String {
+    let channels = [&levels.rgb, &levels.red, &levels.green, &levels.blue];
+    let mut out = Vec::with_capacity(4);
+    for channel in channels {
+        let value = if midtone {
+            crate::c1_midtone_from_gamma(channel.gamma)
+        } else {
+            match slot {
+                0 => channel.input_black,
+                1 => channel.input_white,
+                2 => channel.output_black,
+                _ => channel.output_white,
+            }
+        };
+        out.push(fmt_f32(value));
+    }
+    out.join(";")
+}
+
+fn rows_text(rows: &[[f32; 18]]) -> String {
+    rows.iter()
+        .map(|row| row.iter().map(|v| fmt_f32(*v)).collect::<Vec<_>>().join(","))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn fmt_f32(value: f32) -> String {
@@ -362,14 +487,19 @@ pub fn preset_from_sl(
     let mut adjustments = AdjustmentSet::default();
     let mut name = None;
     let mut unmapped = Vec::new();
+    let mut corrections: Vec<[f32; 18]> = Vec::new();
+    // Capture One's UI temperature and its internal gains are two forms of the
+    // same white balance; the temperature wins when both are present.
+    let has_temperature = pairs.iter().any(|(k, _)| k == "WhiteBalanceTemperature");
     for (k, v) in &pairs {
         match k.as_str() {
             "Name" => name = Some(v.clone()),
             // Metadata, not an adjustment: UUID, StyleSource, Flip,
-            // TechnicalProcessingMethod, Color_tag_index and every key whose
-            // C1 semantics we have not proven (ColorBalance*, Highlight,
-            // Midtone, Shadow, GCurve*).
+            // TechnicalProcessingMethod, Color_tag_index and the ColorBalance
+            // family, whose C1 semantics are still unproven.
             "UUID" | "StyleSource" | "Flip" | "TechnicalProcessingMethod" | "Color_tag_index" => {}
+            "WhiteBalance" if has_temperature => {}
+            "ColorCorrections" => corrections.extend(crate::c1_model::parse_color_corrections(v)),
             _ => {
                 if !apply_key(&mut adjustments, k, v) {
                     unmapped.push((k.clone(), v.clone()));
@@ -377,6 +507,7 @@ pub fn preset_from_sl(
             }
         }
     }
+    adjustments.color_editor = crate::c1_model::color_editor_from_c1(&corrections);
     Some(C1Preset {
         id: fallback_name.to_owned(),
         name: name.unwrap_or_else(|| fallback_name.to_owned()),
@@ -385,6 +516,7 @@ pub fn preset_from_sl(
         adjustments,
         unmapped,
         orig: pairs,
+        color_corrections: corrections,
     })
 }
 
@@ -657,6 +789,67 @@ mod tests {
     }
 
 
+
+
+
+    /// The `.copreset` path and the `ZVARIANTLAYER` path must clamp identically:
+    /// both ask `param_meta::clamp`, which reads the one catalog range.
+    #[test]
+    fn preset_and_c1_row_clamp_out_of_range_values_the_same_way() {
+        let text = r#"<?xml version="1.0" encoding="utf-8"?>
+<SL Engine="800">
+  <E K="USMThreshold" V="30" />
+  <E K="BwRed" V="120" />
+  <E K="BwBlue" V="-130" />
+</SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "synthetic").expect("preset parses");
+        let mut row: std::collections::HashMap<&str, Option<String>> = std::collections::HashMap::new();
+        row.insert("ZUSMTHRESHOLD", Some("30".to_string()));
+        row.insert("ZBWRED", Some("120".to_string()));
+        row.insert("ZBWBLUE", Some("-130".to_string()));
+        let set = crate::c1_model::to_adjustment_set(&crate::c1_model::from_layer_row(&row));
+
+        assert_eq!(p.adjustments.sharpening.threshold, 12.0);
+        assert_eq!(set.sharpening.threshold, 12.0);
+        assert_eq!(p.adjustments.black_white.sensitivity, set.black_white.sensitivity);
+        assert_eq!(p.adjustments.black_white.sensitivity[0], 100.0);
+        assert_eq!(p.adjustments.black_white.sensitivity[4], -100.0);
+    }
+
+    #[test]
+    fn preset_keeps_in_range_threshold_and_sensitivity() {
+        let text = r#"<?xml version="1.0" encoding="utf-8"?>
+<SL Engine="800">
+  <E K="USMThreshold" V="12" />
+  <E K="BwGreen" V="-42.5" />
+  <E K="BwMagenta" V="100" />
+</SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "synthetic").expect("preset parses");
+        assert_eq!(p.adjustments.sharpening.threshold, 12.0);
+        assert_eq!(p.adjustments.black_white.sensitivity[2], -42.5);
+        assert_eq!(p.adjustments.black_white.sensitivity[5], 100.0);
+    }
+
+    /// `.lumen` is the serialized `AdjustmentSet`; loading one must hand back the
+    /// stored numbers unchanged, in range or not, or a later save would rewrite
+    /// the user's document behind their back.
+    #[test]
+    fn lumen_round_trip_does_not_clamp_stored_values() {
+        let mut a = AdjustmentSet::default();
+        a.sharpening.threshold = 12.0;
+        a.black_white.sensitivity = [100.0, -100.0, 0.0, 0.0, 0.0, 0.0];
+        let back: AdjustmentSet = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(back, a);
+
+        // A document written before the preset clamp keeps its stored number.
+        let mut legacy = a.clone();
+        legacy.sharpening.threshold = 30.0;
+        let back: AdjustmentSet =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(back.sharpening.threshold, 30.0);
+    }
+
+
     #[test]
     fn unmapped_keys_are_kept_not_dropped() {
         let text = r#"<SL><E K="ColorBalanceHighlight" V="1.000000;1.000000;1.000000"/><E K="Name" V="x"/></SL>"#;
@@ -672,11 +865,149 @@ mod tests {
     }
 
 
+
+
+
+
+    /// The Curve tool's keys carry the same `x,y;x,y` data as `GradationCurve`;
+    /// values from the installed `Mid tones - brighter.copreset`.
+    #[test]
+    fn gcurve_keys_fill_the_rgb_curve() {
+        let text = r#"<SL Engine="600">
+  <E K="GCurve" V="0.514,0.583;0.210,0.260" />
+  <E K="GCurveR" V="" />
+  <E K="GCurveG" V="" />
+  <E K="GCurveB" V="" />
+  <E K="Name" V="Mid tones - brighter" />
+</SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "x").expect("parses");
+        assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
+        let pts = &p.adjustments.curves.rgb.points;
+        assert_eq!(pts.len(), 2);
+        assert!((pts[0].x - 0.514).abs() < 1e-6 && (pts[0].y - 0.583).abs() < 1e-6);
+        assert!((pts[1].x - 0.210).abs() < 1e-6 && (pts[1].y - 0.260).abs() < 1e-6);
+        let default = AdjustmentSet::default();
+        let out = crate::styles::apply_style(&default, &p.adjustments);
+        assert_ne!(out.curves, default.curves, "the preset must move the curve");
+    }
+
+    /// Four `;`-separated values, master first then R/G/B. Values from the
+    /// installed `Fujicolor Pro 160C.costyle`.
+    #[test]
+    fn levels_keys_fill_the_scale_from_the_file() {
+        let text = r#"<SL Engine="800">
+  <E K="Highlight" V="0.507402;0.792946;0.858029;1.000000" />
+  <E K="Midtone" V="0.000000;0.000000;0.000000;0.000000" />
+  <E K="Shadow" V="0.171981;0.198540;0.238351;0.000000" />
+  <E K="TargetHighlight" V="1.000000;1.000000;1.000000;0.940427" />
+</SL>"#;
+        let p = preset_from_sl(text, PresetKind::Style, "", "x").expect("parses");
+        let l = &p.adjustments.levels;
+        assert!((l.rgb.input_white - 0.507402).abs() < 1e-5, "{}", l.rgb.input_white);
+        assert!((l.red.input_white - 0.792946).abs() < 1e-5);
+        assert!((l.blue.input_white - 1.0).abs() < 1e-6);
+        assert!((l.rgb.input_black - 0.171981).abs() < 1e-5);
+        assert!((l.blue.input_black - 0.0).abs() < 1e-6);
+        assert!((l.rgb.gamma - 1.0).abs() < 1e-5);
+        assert!((l.blue.output_white - 0.940427).abs() < 1e-5);
+        assert!((l.rgb.output_white - 1.0).abs() < 1e-6);
+        assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
+    }
+
+    #[test]
+    fn levels_and_editor_stay_default_when_the_file_has_none() {
+        let text = r#"<SL Engine="800"><E K="Exposure" V="0.5"/></SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "x").expect("parses");
+        let default = AdjustmentSet::default();
+        assert_eq!(p.adjustments.levels, default.levels);
+        assert_eq!(p.adjustments.color_editor, default.color_editor);
+    }
+
+    /// The installed `Effect - Blue only.copreset` row.
+    #[test]
+    fn color_corrections_build_the_color_editor() {
+        let text = r#"<SL Engine="600"><E K="ColorCorrections" V="1,1,0,0.000000,-100.000000,0.000000,58.000000,82.000000,126.000000,-20.000000,20.000000,-53.968250,46.031750,20.000000,0.000000,1,0.0,0.0"/></SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "x").expect("parses");
+        assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
+        let ce = &p.adjustments.color_editor;
+        assert_eq!(ce.advanced.len(), 1, "kind 0 is an advanced group");
+        assert!(ce.advanced[0].shift.saturation < -99.0);
+        assert!(ce.advanced_bands[0].1.inverted, "field 15 is the inverted flag");
+        let default = AdjustmentSet::default();
+        assert_ne!(ce, &default.color_editor);
+        assert_ne!(
+            crate::styles::apply_style(&default, &p.adjustments).color_editor,
+            default.color_editor
+        );
+    }
+
+    /// `WhiteBalance` holds camera RGB gains; Capture One's UI temperature is
+    /// the same white balance, so it wins when the file carries both.
+    #[test]
+    fn white_balance_gains_stand_in_only_without_a_temperature() {
+        let gains_only = r#"<SL Engine="800"><E K="WhiteBalance" V="0.9022633;1;1.1216389"/></SL>"#;
+        let p = preset_from_sl(gains_only, PresetKind::Preset, "", "x").expect("parses");
+        assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
+        // The conversion anchors on the engine's 6500 K reference.
+        let expected = 6500.0 * 1.1216389 / 0.9022633;
+        assert!((p.adjustments.white_balance.kelvin - expected).abs() < 5.0,
+            "{}", p.adjustments.white_balance.kelvin);
+        assert!(p.adjustments.white_balance.tint.abs() < 5.0);
+
+        let both = r#"<SL Engine="800">
+  <E K="WhiteBalance" V="0.9022633;1;1.1216389" />
+  <E K="WhiteBalanceTemperature" V="5000.0009765625" />
+  <E K="WhiteBalanceTint" V="0" />
+</SL>"#;
+        let q = preset_from_sl(both, PresetKind::Preset, "", "x").expect("parses");
+        assert!((q.adjustments.white_balance.kelvin - 5000.001).abs() < 0.01);
+    }
+
+    #[test]
+    fn levels_survive_a_save_and_reload() {
+        let text = r#"<SL Engine="800">
+  <E K="Highlight" V="0.507402;0.792946;0.858029;1.000000" />
+  <E K="Midtone" V="0.000000;0.100000;-0.200000;0.000000" />
+  <E K="Shadow" V="0.171981;0.198540;0.238351;0.000000" />
+  <E K="TargetHighlight" V="1.000000;1.000000;1.000000;0.940427" />
+  <E K="TargetShadow" V="0.000000;0.050000;0.000000;0.000000" />
+  <E K="Name" V="Levels" />
+</SL>"#;
+        let p = preset_from_sl(text, PresetKind::Style, "", "Levels").expect("parses");
+        let dir = TempDir::new("levels-rt");
+        let path = dir.file("Levels.costyle");
+        save_style(&path, &p).expect("saves");
+        let written = std::fs::read_to_string(&path).expect("readable");
+        assert!(written.contains(r#"<E K="Shadow" V="0.171981;0.19854;0.238351;0" />"#), "{written}");
+        assert!(written.contains(r#"<E K="TargetHighlight" V="1;1;1;0.940427" />"#), "{written}");
+        let back = load(&path).expect("reads back");
+        assert_eq!(back.adjustments.levels, p.adjustments.levels);
+    }
+
+    #[test]
+    fn color_corrections_survive_a_save_and_reload() {
+        let text = r#"<SL Engine="600"><E K="ColorCorrections" V="1,1,0,0.000000,-100.000000,0.000000,58.000000,82.000000,126.000000,-20.000000,20.000000,-53.968250,46.031750,20.000000,0.000000,1,0.0,0.0"/></SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "Blue").expect("parses");
+        let dir = TempDir::new("cc-rt");
+        let path = dir.file("Blue.copreset");
+        save_preset(&path, &p).expect("saves");
+        let written = std::fs::read_to_string(&path).expect("readable");
+        let row = written
+            .lines()
+            .find(|l| l.contains(r#"K="ColorCorrections""#))
+            .expect("the key is written");
+        assert_eq!(row.matches(',').count(), 17, "{row}");
+        let back = load(&path).expect("reads back");
+        assert_eq!(back.adjustments.color_editor, p.adjustments.color_editor);
+    }
+
+
+
     #[test]
     fn unmapped_keys_are_written_back_verbatim() {
         let text = r#"<SL Engine="600">
   <E K="ColorBalanceHighlight" V="1.000000;1.000000;1.000000"/>
-  <E K="ColorCorrections" V="1,1,0,0.000000,-100.000000"/>
+  <E K="ColorBalance" V="1,1,0,0.000000,-100.000000"/>
   <E K="Exposure" V="-1.000"/>
   <E K="Name" V="Round trip"/>
   <E K="UUID" V="{82466223-FC65-4BC5-8965-0CAA0E5B6813}"/>
@@ -687,7 +1018,7 @@ mod tests {
         save_style(&path, &p).expect("saves");
         let written = std::fs::read_to_string(&path).expect("readable");
         assert!(written.contains(r#"<E K="ColorBalanceHighlight" V="1.000000;1.000000;1.000000" />"#), "{written}");
-        assert!(written.contains(r#"<E K="ColorCorrections" V="1,1,0,0.000000,-100.000000" />"#), "{written}");
+        assert!(written.contains(r#"<E K="ColorBalance" V="1,1,0,0.000000,-100.000000" />"#), "{written}");
         let back = load(&path).expect("reads back");
         assert_eq!(sorted(&back.unmapped), sorted(&p.unmapped));
         assert!(back.adjustments.exposure.exposure == -1.0);

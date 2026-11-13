@@ -197,7 +197,7 @@ impl SplineProfile {
 }
 
 /// Strips the quoting and whitespace C1 wraps its values in.
-fn clean(raw: &str) -> &str {
+pub(crate) fn clean(raw: &str) -> &str {
     raw.trim().trim_matches('\'').trim()
 }
 
@@ -348,14 +348,14 @@ fn fixed(raw: Option<&str>, default: f32) -> f32 {
     raw.and_then(parse_scalar).unwrap_or(default)
 }
 
-fn flag(raw: Option<&str>, default: bool) -> bool {
+pub(crate) fn flag(raw: Option<&str>, default: bool) -> bool {
     match raw.map(parse_scalar) {
         Some(Some(v)) => v != 0.0,
         _ => default,
     }
 }
 
-fn text(raw: Option<&str>) -> Option<String> {
+pub(crate) fn text(raw: Option<&str>) -> Option<String> {
     let t = clean(raw.unwrap_or(""));
     if t.is_empty() {
         None
@@ -943,6 +943,79 @@ fn rgb_to_hue(r: f32, g: f32, b: f32) -> f32 {
 }
 
 /// Maps C1's stored settings onto the engine's adjustment contract.
+/// C1's `ZCOLORCORRECTIONS` / `ColorCorrections` rows as the engine's editor.
+///
+/// C1 stores its eight basic slices in descending hue order, not in the
+/// engine's Red..Magenta order, so each group is placed by its own color.
+/// `local` separates the global group from slices; `kind` keeps advanced and
+/// skin groups out of the eight basic slots.
+pub fn color_editor_from_c1(rows: &[[f32; 18]]) -> ColorEditor {
+    let mut editor = ColorEditor::default();
+    let mut basic_used = [false; 8];
+    for (index, row) in rows.iter().enumerate() {
+        let cc = ColorCorrection::from_row(row);
+        let (center_hue, center_saturation) = selected_hue_saturation(cc.rgb);
+        let center_value = (cc.rgb[0].max(cc.rgb[1]).max(cc.rgb[2]) / 255.0).clamp(0.0, 1.0);
+        let band = ColorBand {
+            center_hue,
+            center_saturation,
+            center_value,
+            hue_low: cc.hue_low,
+            hue_high: cc.hue_high,
+            sat_low: cc.sat_low,
+            sat_high: cc.sat_high,
+            smoothness: clamp(cc.smoothness, 0.0, 60.0),
+            homogeneity: cc.homogeneity,
+            inverted: cc.inverted,
+            enabled: cc.enabled,
+        };
+        let shift = HslShift {
+            hue: clamp(cc.hue, -30.0, 30.0),
+            saturation: clamp(cc.saturation, -100.0, 100.0),
+            // C1 stores ValueChange at 1/10 of the UI slider.
+            lightness: clamp(cc.lightness * 10.0, -100.0, 100.0),
+        };
+
+        if !cc.local {
+            editor.global = band;
+            editor.global_shift = shift;
+            continue;
+        }
+
+        if cc.kind == 1 {
+            let slot = HueSector::nearest(center_hue) as usize;
+            if !basic_used[slot] {
+                editor.basic[slot] = shift;
+                editor.bands[slot] = band;
+                basic_used[slot] = true;
+            }
+        } else {
+            let id = index as u64 + 1;
+            let skin = cc.kind == 2;
+            let range = ColorRange {
+                id,
+                hue: center_hue,
+                width: (cc.hue_high - cc.hue_low).abs().max(1.0),
+                smoothness: clamp(cc.smoothness, 0.0, 60.0),
+                min_saturation: ((center_saturation * 100.0 + cc.sat_low) / 100.0).clamp(0.0, 1.0),
+                shift,
+                uniformity: skin.then(|| SkinUniformity {
+                    hue: cc.homogeneity[0],
+                    saturation: cc.homogeneity[1],
+                    lightness: cc.homogeneity[2],
+                }),
+            };
+            if skin {
+                editor.skin.push(range);
+            } else {
+                editor.advanced.push(range);
+            }
+            editor.advanced_bands.push((id, band));
+        }
+    }
+    editor
+}
+
 pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     let mut set = crate::AdjustmentSet::default();
 
@@ -1020,80 +1093,13 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     // until a sample with a non-neutral balance proves the encoding.
     let _ = &s.color_balance;
 
-    // C1 stores its eight basic slices in descending hue order, not in the
-    // engine's Red..Magenta order, so each group is placed by its own color.
-    // `local` separates the global group from slices; `kind` keeps advanced and
-    // skin groups out of the eight basic slots.
-    let mut editor = ColorEditor::default();
-    let mut basic_used = [false; 8];
-    for (index, row) in s.color_corrections.iter().enumerate() {
-        let cc = ColorCorrection::from_row(row);
-        let (center_hue, center_saturation) = selected_hue_saturation(cc.rgb);
-        let center_value =
-            (cc.rgb[0].max(cc.rgb[1]).max(cc.rgb[2]) / 255.0).clamp(0.0, 1.0);
-        let band = ColorBand {
-            center_hue,
-            center_saturation,
-            center_value,
-            hue_low: cc.hue_low,
-            hue_high: cc.hue_high,
-            sat_low: cc.sat_low,
-            sat_high: cc.sat_high,
-            smoothness: clamp(cc.smoothness, 0.0, 60.0),
-            homogeneity: cc.homogeneity,
-            inverted: cc.inverted,
-            enabled: cc.enabled,
-        };
-        let shift = HslShift {
-            hue: clamp(cc.hue, -30.0, 30.0),
-            saturation: clamp(cc.saturation, -100.0, 100.0),
-            // C1 stores ValueChange at 1/10 of the UI slider.
-            lightness: clamp(cc.lightness * 10.0, -100.0, 100.0),
-        };
-
-        if !cc.local {
-            editor.global = band;
-            editor.global_shift = shift;
-            continue;
-        }
-
-        if cc.kind == 1 {
-            let slot = HueSector::nearest(center_hue) as usize;
-            if !basic_used[slot] {
-                editor.basic[slot] = shift;
-                editor.bands[slot] = band;
-                basic_used[slot] = true;
-            }
-        } else {
-            let id = index as u64 + 1;
-            let skin = cc.kind == 2;
-            let range = ColorRange {
-                id,
-                hue: center_hue,
-                width: (cc.hue_high - cc.hue_low).abs().max(1.0),
-                smoothness: clamp(cc.smoothness, 0.0, 60.0),
-                min_saturation: ((center_saturation * 100.0 + cc.sat_low) / 100.0)
-                    .clamp(0.0, 1.0),
-                shift,
-                uniformity: skin.then(|| SkinUniformity {
-                    hue: cc.homogeneity[0],
-                    saturation: cc.homogeneity[1],
-                    lightness: cc.homogeneity[2],
-                }),
-            };
-            if skin {
-                editor.skin.push(range);
-            } else {
-                editor.advanced.push(range);
-            }
-            editor.advanced_bands.push((id, band));
-        }
-    }
-    set.color_editor = editor;
+    set.color_editor = color_editor_from_c1(&s.color_corrections);
 
     set.black_white = BlackWhite {
         enabled: s.black_white.enabled,
-        sensitivity: s.black_white.sensitivity,
+        sensitivity: std::array::from_fn(|i| {
+            crate::param_meta::clamp(crate::param_meta::BW_CHANNELS[i], s.black_white.sensitivity[i])
+        }),
         highlight_tone: SplitTone {
             hue: clamp(s.black_white.light_tone_hue, 0.0, 360.0),
             saturation: clamp(s.black_white.light_tone_saturation, 0.0, 100.0),
@@ -1107,7 +1113,9 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     set.sharpening = Sharpening {
         amount: clamp(s.sharpening.amount, 0.0, 1000.0),
         radius: clamp(s.sharpening.radius, 0.2, 2.5),
-        threshold: clamp(s.sharpening.threshold, 0.0, 10.0),
+        // The catalog row is C1's own 0..12; the old engine cap of 10 clipped
+        // legal 11–12 values.
+        threshold: crate::param_meta::clamp("USMThreshold", s.sharpening.threshold),
         halo_suppression: clamp(s.sharpening.halo_suppression, 0.0, 100.0),
     };
 
@@ -1142,7 +1150,9 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         profile: s.lens.profile.clone(),
         // shortcut: C1 stores a lens-profile GUID we cannot resolve to its LCP data,
         // so enabling a warp from a guessed profile only crops the frame.
-        use_profile: false,
+        // A variant that names a lens GUID asks for that lens's correction;
+        // a GUID the database does not know leaves the frame unchanged.
+        use_profile: s.lens.profile.is_some(),
         distortion: clamp(s.lens.distortion.param(0).unwrap_or(0.0), 0.0, 100.0),
         // ZLENSLIGHTFALLOFF covers light falloff only; the engine's separate
         // sharpness-falloff amount has no C1 column and stays at zero.
@@ -1503,6 +1513,19 @@ mod tests {
     }
 
     #[test]
+    fn lens_profile_guid_enables_calibration_only_when_present() {
+        let present = to_adjustment_set(&from_layer_row(&row(&[
+            ("ZLENSIDGUID", Some("EF11-24-GUID")),
+        ])));
+        assert!(present.lens.use_profile);
+        assert_eq!(present.lens.profile.as_deref(), Some("EF11-24-GUID"));
+
+        let missing = to_adjustment_set(&from_layer_row(&row(&[])));
+        assert!(!missing.lens.use_profile);
+        assert_eq!(missing.lens.profile, None);
+    }
+
+    #[test]
     fn missing_components_fall_back_to_defaults() {
         let s = from_layer_row(&row(&[("ZWHITEBALANCE", Some("1.625000"))]));
         assert!((s.white_balance_gains[0] - 1.625).abs() < 1e-6);
@@ -1654,6 +1677,26 @@ mod tests {
         assert!(set.black_white.enabled);
         assert!((set.black_white.sensitivity[0] - 12.5).abs() < 1e-5);
         assert!((set.black_white.shadow_tone.hue - 210.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn usm_threshold_keeps_the_c1_bound_and_clamps_above_it() {
+        let at_bound = to_adjustment_set(&from_layer_row(&row(&[("ZUSMTHRESHOLD", Some("12"))])));
+        assert_eq!(at_bound.sharpening.threshold, 12.0);
+        let over = to_adjustment_set(&from_layer_row(&row(&[("ZUSMTHRESHOLD", Some("30"))])));
+        assert_eq!(over.sharpening.threshold, 12.0);
+    }
+
+    #[test]
+    fn black_white_sensitivity_clamps_each_channel_to_plus_minus_100() {
+        let s = from_layer_row(&row(&[
+            ("ZBWRED", Some("120")),
+            ("ZBWYELLOW", Some("-130")),
+            ("ZBWGREEN", Some("100")),
+            ("ZBWMAGENTA", Some("-100")),
+        ]));
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.black_white.sensitivity, [100.0, -100.0, 100.0, 0.0, 0.0, -100.0]);
     }
 
     /// `ZFILMCURVE` names a file, so the renderer needs the name itself, not

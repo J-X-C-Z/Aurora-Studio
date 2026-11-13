@@ -54,7 +54,7 @@ impl FileEngine {
                         exif, iptc, keywords: record.keywords.clone(), rating: record.rating,
                         color_tag: ColorTag::None, variant: record.variant,
                         has_adjustments: false, trashed: record.trashed,
-                    };
+                     heif: None, };
                     next += 1;
                     info
                 }
@@ -104,7 +104,7 @@ impl FileEngine {
             color_tag: legacy.map(|e| ColorTag::ALL[e.color_tag.clamp(0, 7) as usize]).unwrap_or(ColorTag::None),
             variant: legacy.map(|e| e.variant).unwrap_or(1),
             has_adjustments: !adjustments.is_default(), trashed: legacy.is_some_and(|e| e.trashed),
-        };
+         heif: None, };
         Ok(FileEntry { path: path.to_path_buf(), info, rel_path, adjustments })
     }
 
@@ -1058,7 +1058,7 @@ mod tests {
         assert_eq!((offline.width, offline.height), (online.width, online.height));
         assert_eq!(offline.pixels.as_ref(), online.pixels.as_ref());
         let request = PreviewRequest { image: id, adjustments: edits(2.0), region: NormRect::FULL, max_size: 2,
-            quality: RenderQuality::Final, bypass: false, mask_overlay: None, generation: 17 };
+            quality: RenderQuality::Final, bypass: false, mask_overlay: None, generation: 17 , display_profile: None, proof_profile: None, proof_paper_white: 1.0, proof_black_point: 0.0, };
         let preview = engine.render_preview(&request).unwrap();
         assert!(preview.image.width <= 2 && preview.image.height <= 2);
         assert_eq!(preview.generation, 17);
