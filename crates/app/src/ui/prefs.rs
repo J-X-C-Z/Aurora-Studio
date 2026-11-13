@@ -414,7 +414,7 @@ impl PrefsView {
                     .disabled(!s.warn_shadows)
                     .on_change(move |v, _, cx| t3.update(cx, |p, cx| p.edit_render(cx, |s| s.warn_low = v.round() as u8))),
             )
-            .child(div().px_3().text_xs().text_color(p.text_subtle).child(t("Red marks clipped highlights, blue blocked shadows (Alt+E).", "红色标记高光溢出，蓝色标记暗部死黑（Alt+E）。")))
+            .child(div().px_3().text_xs().text_color(p.text_subtle).child(format!("{}（{}）", t("Red marks clipped highlights, blue blocked shadows", "红色标记高光溢出，蓝色标记暗部死黑"), crate::platform::keys("alt-e"))))
             .child(caption(t("Focus mask", "焦点蒙版"), cx))
             .child(ParamSlider::new("pref-focus", t("Edge threshold", "边缘阈值"), s.focus_threshold, 5.0, 80.0).step(1.0).default_value(22.0).on_change(move |v, _, cx| {
                 t4.update(cx, |p, cx| p.edit_render(cx, |s| s.focus_threshold = v))

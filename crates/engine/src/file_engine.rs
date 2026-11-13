@@ -175,6 +175,7 @@ struct FileEntry {
 
 struct State {
     entries: Vec<FileEntry>,
+    source_version: u64,
     next_id: u64,
     sources: HashMap<ImageId, Arc<Source>>,
     /// Most recently used last.
@@ -228,6 +229,7 @@ impl FileEngine {
         let engine = Self {
             root: root.clone(),
             state: Arc::new(Mutex::new(State {
+                source_version: 0,
                 entries: Self::restore_entries(&root, store.as_ref(), &catalog)?,
                 next_id: catalog.next_id.max(catalog.images.iter().filter_map(|e| e.info.as_ref()).map(|i| i.id.0 + 1).max().unwrap_or(1)),
                 sources: HashMap::new(),
@@ -282,6 +284,7 @@ impl FileEngine {
         let engine = Self {
             root: root.clone(),
             state: Arc::new(Mutex::new(State {
+                source_version: 0,
                 entries: Self::restore_entries(&root, store.as_ref(), &catalog)?,
                 next_id: catalog.next_id.max(catalog.images.iter().filter_map(|e| e.info.as_ref()).map(|i| i.id.0 + 1).max().unwrap_or(1)),
                 sources: HashMap::new(),
@@ -400,7 +403,7 @@ impl FileEngine {
                 });
             }
         }
-        self.commit_library(&mut st, entries, catalog, &[], None)?;
+        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
         Ok(())
     }
 
@@ -425,17 +428,67 @@ impl FileEngine {
         let entry = self.discovered_entry(&path, id, key.clone(), catalog.entry(&key))?;
         let info = entry.info.clone();
         entries.push(entry);
-        self.commit_library(&mut st, entries, catalog, &[], None)?;
+        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
         Ok(info)
     }
 
     fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
+        self.source_versioned(image).map(|(source, _)| source)
+    }
+
+    /// Fuses bracketed frames into a 16-bit TIFF beside the first frame.
+    pub fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        anyhow::ensure!(!ids.is_empty(), "HDR merge needs at least one frame");
+        let (paths, exposures): (Vec<_>, Vec<_>) = {
+            let st = self.state.lock();
+            ids.iter().map(|id| {
+                let entry = st.entries.iter().find(|e| e.info.id == *id)
+                    .ok_or_else(|| anyhow::anyhow!("HDR merge: unknown image {id:?}"))?;
+                Ok((entry.path.clone(), entry.info.exif.clone()))
+            }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().unzip()
+        };
+        let stops: Vec<f32> = exposures.iter().map(|exif| crate::hdr::relative_stops(&exposures[0], exif)).collect();
+        let sources: Vec<_> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
+        let frames: Vec<&Source> = sources.iter().map(AsRef::as_ref).collect();
+        let fused = crate::hdr::fuse(&frames, &stops)?;
+        let samples = crate::hdr::to_srgb16(&fused);
+        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        use image::ImageEncoder as _;
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::codecs::tiff::TiffEncoder::new(&mut encoded)
+            .write_image(&bytes, fused.width, fused.height, image::ExtendedColorType::Rgb16)?;
+
+        let first = &paths[0];
+        let directory = first.parent().unwrap_or_else(|| Path::new("."));
+        let stem = first.file_stem().and_then(|s| s.to_str()).unwrap_or("merge");
+        let (path, temporary) = (1..=999).find_map(|n| {
+            let suffix = if n == 1 { String::new() } else { format!("-{n}") };
+            let name = format!("{stem}_HDR{suffix}.tif");
+            let path = directory.join(&name);
+            (!path.exists()).then(|| (path.clone(), directory.join(format!(".{name}.merge-tmp"))))
+        }).ok_or_else(|| anyhow::anyhow!("HDR merge: no free output name beside {}", first.display()))?;
+        std::fs::write(&temporary, encoded.into_inner())?;
+        if let Err(err) = std::fs::rename(&temporary, &path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(err.into());
+        }
+        match self.add_file(&path) {
+            Ok(info) => Ok(info),
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                Err(err)
+            }
+        }
+    }
+
+    fn source_versioned(&self, image: ImageId) -> anyhow::Result<(Arc<Source>, u64)> {
+        loop {
         {
             let mut st = self.state.lock();
             if let Some(src) = st.sources.get(&image).cloned() {
                 st.lru.retain(|i| *i != image);
                 st.lru.push(image);
-                return Ok(src);
+                return Ok((src, st.source_version));
             }
         }
         // Single flight: the first request decodes while the rest wait here,
@@ -446,17 +499,17 @@ impl FileEngine {
             if let Some(src) = st.sources.get(&image).cloned() {
                 st.lru.retain(|i| *i != image);
                 st.lru.push(image);
-                return Ok(src);
+                return Ok((src, st.source_version));
             }
         }
-        let (path, lens) = {
+        let (path, lens, version) = {
             let st = self.state.lock();
             let entry = st
                 .entries
                 .iter()
                 .find(|e| e.info.id == image)
                 .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
-            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif))
+            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif), st.source_version)
         };
         #[cfg(test)]
         {
@@ -471,7 +524,7 @@ impl FileEngine {
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
         let mut decoded_reason = None;
-        let source = match raw16_source(&path) {
+        let decoded = (|| -> anyhow::Result<Source> { Ok(match raw16_source(&path) {
             Some(source) => source,
             None => {
                 let img = if crate::raw::is_raw(&path) {
@@ -479,7 +532,10 @@ impl FileEngine {
                         Ok(img) => img,
                         Err(err) => {
                             let reason = format!("RAW decode failed: {err:#}");
-                            self.state.lock().source_reasons.insert(image, reason);
+                            let mut st = self.state.lock();
+                            if st.source_version == version {
+                                st.source_reasons.insert(image, reason);
+                            }
                             return Err(err);
                         }
                     }
@@ -494,6 +550,11 @@ impl FileEngine {
                 };
                 Source::from_rgba(w, h, img.as_raw())
             }
+        }) })();
+        let source = match decoded {
+            Ok(source) => source,
+            Err(_) if self.state.lock().source_version != version => continue,
+            Err(err) => return Err(err),
         };
         let camera_preview =
             crate::raw::is_raw(&path) && crate::raw::from_sensor(&path) == Some(false);
@@ -503,6 +564,10 @@ impl FileEngine {
         let source = Arc::new(source.with_lens_shot(lens).with_camera_preview(camera_preview));
 
         let mut st = self.state.lock();
+        // A move/locate may finish while decoding outside the state lock.
+        if st.source_version != version {
+            continue;
+        }
         match decoded_reason {
             Some(reason) => {
                 st.source_reasons.insert(image, reason);
@@ -518,7 +583,8 @@ impl FileEngine {
             let old = st.lru.remove(0);
             st.sources.remove(&old);
         }
-        Ok(source)
+        return Ok((source, version));
+        }
     }
 
     /// Cached preview frame at full requested pixel quality.
@@ -530,11 +596,12 @@ impl FileEngine {
                 generation: request.generation, elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
              degraded: None, gamut_warning: None, });
         }
-        let src = self.source(request.image)?;
+        let (src, source_version) = self.source_versioned(request.image)?;
         let max = request.max_size;
         let fast = false;
         let adj = crate::styles::resolve(&request.adjustments);
-        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
+            .with_source_version(source_version);
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
         let hit = self.state.lock().preview.get(key);
         if let Some(hit) = hit {
@@ -558,7 +625,12 @@ impl FileEngine {
             pixels: Arc::new(out.rgba),
             histogram: out.histogram.clone(),
         };
-        self.state.lock().preview.insert(key, frame.clone());
+        {
+            let mut st = self.state.lock();
+            if st.source_version == source_version {
+                st.preview.insert(key, frame.clone());
+            }
+        }
         let source = frame.into_image();
         let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
         let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
@@ -789,18 +861,26 @@ impl ImageEngine for FileEngine {
             entry.info.trashed = trashed;
         }
         let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None)
+        self.commit_library(&mut st, entries, catalog, &[], None, true)
     }
 
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()> {
+        self.update_infos(std::slice::from_ref(info))
+    }
+
+    fn update_infos(&self, infos: &[ImageInfo]) -> anyhow::Result<()> {
+        if infos.is_empty() { return Ok(()); }
         let mut st = self.state.lock();
         let mut entries = st.entries.clone();
-        let entry = entries.iter_mut().find(|e| e.info.id == info.id)
-            .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-        anyhow::ensure!(entry.path == info.path && entry.info.variant == info.variant, "use manage_files to change image paths");
-        entry.info = info.clone();
+        let positions: HashMap<_, _> = entries.iter().enumerate().map(|(i, e)| (e.info.id, i)).collect();
+        for info in infos {
+            let pos = positions.get(&info.id).ok_or_else(|| anyhow::anyhow!("unknown image"))?;
+            let entry = &mut entries[*pos];
+            anyhow::ensure!(entry.path == info.path && entry.info.variant == info.variant, "use manage_files to change image paths");
+            entry.info = info.clone();
+        }
         let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None)
+        self.commit_library(&mut st, entries, catalog, &[], None, true)
     }
 
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet {
@@ -846,14 +926,26 @@ impl ImageEngine for FileEngine {
     }
 
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
+        self.save_adjustments_batch(&[(image, adjustments)])
+    }
+
+    fn save_adjustments_batch(&self, changes: &[(ImageId, &AdjustmentSet)]) -> anyhow::Result<()> {
+        if changes.is_empty() { return Ok(()); }
         let mut st = self.state.lock();
         let mut entries = st.entries.clone();
-        let entry = entries.iter_mut().find(|e| e.info.id == image)
-            .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-        entry.adjustments = adjustments.clone();
-        entry.info.has_adjustments = !adjustments.is_default();
+        let positions: HashMap<_, _> = entries.iter().enumerate().map(|(i, e)| (e.info.id, i)).collect();
+        for &(image, adjustments) in changes {
+            let pos = positions.get(&image).ok_or_else(|| anyhow::anyhow!("unknown image"))?;
+            let entry = &mut entries[*pos];
+            entry.adjustments = adjustments.clone();
+            entry.info.has_adjustments = !adjustments.is_default();
+        }
         let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None)
+        self.commit_library(&mut st, entries, catalog, &[], None, true)
+    }
+
+    fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        FileEngine::merge_hdr_frames(self, ids)
     }
 
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
@@ -872,19 +964,26 @@ impl ImageEngine for FileEngine {
         let info = entry.info.clone();
         entries.insert(pos + 1, entry);
         let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None)?;
+        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
         Ok(info)
     }
 
     fn thumbnail(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<RgbaImage> {
         if let Some(preview) = self.offline_library_preview(image, max_size)? { return Ok(preview); }
-        let src = self.source(image)?;
+        let (src, version) = self.source_versioned(image)?;
         let out = process::render(&src, &crate::styles::resolve(adjustments), NormRect::FULL, max_size, false, None);
         let frame = RgbaImage::new(out.width, out.height, out.rgba);
-        let st = self.state.lock();
-        if st.entries.iter().any(|e| e.info.id == image) {
-            if let Some(store) = &self.store {
-                if let Err(err) = store.save_library_preview(image, &frame) { log::warn!("save offline preview: {err}"); }
+        if let Some(store) = &self.store {
+            // PNG encoding does not need the catalog lock; publication still checks identity.
+            let saved = Store::encode_library_preview(&frame).and_then(|bytes| {
+                let st = self.state.lock();
+                if st.source_version == version && st.entries.iter().any(|e| e.info.id == image) {
+                    store.save_library_preview(image, &bytes)?;
+                }
+                Ok(())
+            });
+            if let Err(err) = saved {
+                log::warn!("save offline preview: {err}");
             }
         }
         Ok(frame)
@@ -1980,6 +2079,46 @@ mod tests {
         let images = engine.images();
         assert_eq!(images.len(), 1);
         assert_eq!(engine.load_adjustments(images[0].id).base.icc_profile, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hdr_merge_round_trips_and_is_cataloged() {
+        let dir = std::env::temp_dir().join(format!("lumen-hdr-one-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = image::RgbaImage::from_fn(8, 6, |x, y| image::Rgba([x as u8 * 30, y as u8 * 40, 90, 255]));
+        img.save(dir.join("a.png")).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let merged = engine.merge_hdr_frames(&[id]).unwrap();
+        assert_eq!((merged.width, merged.height), (8, 6));
+        assert_eq!(merged.kind, FileKind::Tiff);
+        assert!(merged.file_name.ends_with("_HDR.tif"));
+        assert_eq!(engine.images().len(), 2);
+        let actual = image::open(&merged.path).unwrap().to_rgb16();
+        for (out, src) in actual.pixels().zip(img.pixels()) {
+            for k in 0..3 {
+                assert!((out.0[k] as i32 - src.0[k] as i32 * 257).abs() <= 2);
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hdr_merge_rejects_mismatched_sizes_without_output() {
+        let dir = std::env::temp_dir().join(format!("lumen-hdr-size-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([80, 80, 80, 255])).save(dir.join("a.png")).unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([80, 80, 80, 255])).save(dir.join("b.png")).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let ids: Vec<_> = engine.images().iter().map(|i| i.id).collect();
+        let err = engine.merge_hdr_frames(&ids).unwrap_err().to_string();
+        assert!(err.contains("share one size"), "{err}");
+        assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with("_HDR.tif")));
+        let fallback = crate::MockEngine::new().merge_hdr_frames(&ids).unwrap_err().to_string();
+        assert!(fallback.contains("not supported"), "{fallback}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

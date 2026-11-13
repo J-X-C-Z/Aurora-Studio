@@ -617,7 +617,8 @@ impl Workspace {
                             .justify_center()
                             .child(Icon::new(IconName::Aperture).size(px(12.0)).text_color(gpui_kit::white())),
                     )
-                    .child(self.menu_bar.clone()),
+                    // A Mac shows the menus in the system menu bar instead.
+                    .when(!crate::platform::is_mac(), |d| d.child(self.menu_bar.clone())),
             )
             .child(
                 h_flex()

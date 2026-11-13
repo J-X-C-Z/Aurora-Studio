@@ -26,6 +26,7 @@ const RENDER_VERSION: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewKey {
     build: u64,
+    source_version: u64,
     image: ImageId,
     params: u64,
     long_side: u32,
@@ -33,6 +34,13 @@ pub(crate) struct PreviewKey {
     bypass: bool,
     mask_overlay: Option<u64>,
     fast: bool,
+}
+
+impl PreviewKey {
+    pub(crate) fn with_source_version(mut self, version: u64) -> Self {
+        self.source_version = version;
+        self
+    }
 }
 
 /// One cached frame. The pixel buffer is shared, so a hit costs an `Arc` clone.
@@ -117,6 +125,7 @@ pub(crate) fn key(
     fast: bool,
 ) -> PreviewKey {
     PreviewKey {
+        source_version: 0,
         build: build_fingerprint(),
         image,
         params: params_fingerprint(adj),
@@ -185,6 +194,15 @@ mod tests {
         assert_eq!(key_for(1, 0.5), key_for(1, 0.5));
         assert_ne!(key_for(1, 0.5), key_for(1, 0.500_001));
         assert_ne!(key_for(1, 0.5), key_for(2, 0.5));
+    }
+
+    #[test]
+    fn changed_source_cannot_hit_a_previous_frame() {
+        let mut cache = PreviewCache::new(2);
+        let old = key_for(1, 0.5).with_source_version(4);
+        cache.insert(old, frame(1));
+        assert!(cache.get(old).is_some());
+        assert!(cache.get(old.with_source_version(5)).is_none());
     }
 
     #[test]

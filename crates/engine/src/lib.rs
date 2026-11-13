@@ -41,6 +41,7 @@ mod filmcurve;
 mod heif;
 mod heif_write;
 mod highlight;
+pub mod hdr;
 mod iptc;
 mod layers;
 mod lens_correct;

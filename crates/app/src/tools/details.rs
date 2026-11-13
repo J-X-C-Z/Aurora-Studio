@@ -46,7 +46,7 @@ pub fn panel(id: &str, state: &Entity<AppState>, _window: &mut Window, cx: &mut 
 }
 
 /// Binds a field of an optional local structure, creating it from the background's copy on first write.
-fn opt_binding<T: Clone + Default + 'static>(
+pub(crate) fn opt_binding<T: Clone + Default + 'static>(
     scope: Scope,
     global: fn(&mut AdjustmentSet) -> &mut T,
     local: fn(&mut LocalAdjustments) -> &mut Option<T>,

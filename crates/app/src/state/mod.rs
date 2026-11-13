@@ -837,25 +837,30 @@ impl AppState {
     }
 
     pub fn set_rating(&mut self, rating: i8, cx: &mut Context<Self>) {
-        let targets: Vec<ImageId> = self.selection.iter().copied().collect();
-        for id in targets {
-            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
-                info.rating = rating;
-                let _ = self.engine.update_info(info);
-            }
-        }
+        let changes = self.images.iter().filter(|i| self.selection.contains(&i.id) && i.rating != rating)
+            .cloned().map(|mut info| { info.rating = rating; info }).collect();
+        self.persist_infos(changes, cx);
         cx.notify();
     }
 
     pub fn set_color_tag(&mut self, tag: ColorTag, cx: &mut Context<Self>) {
-        let targets: Vec<ImageId> = self.selection.iter().copied().collect();
-        for id in targets {
-            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
-                info.color_tag = tag;
-                let _ = self.engine.update_info(info);
-            }
-        }
+        let changes = self.images.iter().filter(|i| self.selection.contains(&i.id) && i.color_tag != tag)
+            .cloned().map(|mut info| { info.color_tag = tag; info }).collect();
+        self.persist_infos(changes, cx);
         cx.notify();
+    }
+
+    fn persist_infos(&mut self, changes: Vec<ImageInfo>, cx: &mut Context<Self>) -> bool {
+        if changes.is_empty() { return true; }
+        if let Err(err) = self.engine.update_infos(&changes) {
+            self.notify(format!("{}: {err}", t("Could not save metadata", "无法存储元数据")), cx);
+            return false;
+        }
+        let mut changes: HashMap<_, _> = changes.into_iter().map(|i| (i.id, i)).collect();
+        for info in &mut self.images {
+            if let Some(updated) = changes.remove(&info.id) { *info = updated; }
+        }
+        true
     }
 
     /// Saves the current image's IPTC fields and keywords as a metadata preset.
@@ -878,9 +883,9 @@ impl AppState {
                 *dst = src.clone();
             }
         };
-        let ids: Vec<ImageId> = if self.selection.is_empty() { self.current.into_iter().collect() } else { self.selection.iter().copied().collect() };
-        let mut failed = 0;
-        for info in self.images.iter_mut().filter(|i| ids.contains(&i.id)) {
+        let ids: HashSet<ImageId> = if self.selection.is_empty() { self.current.into_iter().collect() } else { self.selection.iter().copied().collect() };
+        let mut changes: Vec<_> = self.images.iter().filter(|i| ids.contains(&i.id)).cloned().collect();
+        for info in &mut changes {
             let (d, s) = (&mut info.iptc, &preset.iptc);
             fill(&mut d.title, &s.title);
             fill(&mut d.description, &s.description);
@@ -895,17 +900,11 @@ impl AppState {
                     info.keywords.push(k.clone());
                 }
             }
-            if self.engine.update_info(info).is_err() {
-                failed += 1;
-            }
         }
+        if !self.persist_infos(changes, cx) { return; }
         // Fields keep their own text; a new revision starts them from the new values.
         self.metadata_rev += 1;
-        let msg = if failed == 0 {
-            format!("{} {} · {} {}", t("Applied", "已应用"), preset.name, ids.len(), t("images", "张图像"))
-        } else {
-            format!("{} {failed} {}", t("Could not save metadata for", "无法存储元数据："), t("images", "张图像"))
-        };
+        let msg = format!("{} {} · {} {}", t("Applied", "已应用"), preset.name, ids.len(), t("images", "张图像"));
         self.notify(msg, cx);
     }
 
@@ -927,10 +926,11 @@ impl AppState {
 
     pub fn update_current_info(&mut self, f: impl FnOnce(&mut ImageInfo), cx: &mut Context<Self>) {
         if let Some(id) = self.current
-            && let Some(info) = self.images.iter_mut().find(|i| i.id == id)
+            && let Some(info) = self.images.iter().find(|i| i.id == id)
         {
-            f(info);
-            let _ = self.engine.update_info(info);
+            let mut info = info.clone();
+            f(&mut info);
+            self.persist_infos(vec![info], cx);
             cx.notify();
         }
     }
@@ -958,8 +958,11 @@ impl AppState {
                     let n = added.len();
                     this.recent_imports.extend(ids.iter().copied());
                     this.images.extend(added);
-                    for id in &ids {
-                        if let Some(info) = this.images.iter_mut().find(|i| i.id == *id) {
+                    let mut metadata = Vec::new();
+                    if !after.copyright.is_empty() || !after.creator.is_empty() || !after.keywords.is_empty() {
+                        let imported: HashSet<_> = ids.iter().copied().collect();
+                        for info in this.images.iter().filter(|i| imported.contains(&i.id)) {
+                            let mut info = info.clone();
                             if !after.copyright.is_empty() {
                                 info.iptc.copyright = after.copyright.clone();
                             }
@@ -971,9 +974,10 @@ impl AppState {
                                     info.keywords.push(k.clone());
                                 }
                             }
-                            let _ = this.engine.update_info(info);
+                            metadata.push(info);
                         }
                     }
+                    let metadata_saved = this.persist_infos(metadata, cx);
                     if let Some(album) = after.album {
                         this.add_to_album(album, &ids, cx);
                     }
@@ -985,7 +989,9 @@ impl AppState {
                     if let Some(first) = ids.first() {
                         this.select(*first, false, false, cx);
                     }
-                    this.notify(format!("{} {n} {}", t("Imported", "已导入"), t("images", "张图像")), cx);
+                    if metadata_saved {
+                        this.notify(format!("{} {n} {}", t("Imported", "已导入"), t("images", "张图像")), cx);
+                    }
                 }
                 Err(err) => this.notify(format!("{}: {err}", t("Import failed", "导入失败")), cx),
             }})
@@ -1106,6 +1112,7 @@ impl AppState {
         let label = label.into();
         self.end_gesture(cx);
         let ids: Vec<ImageId> = self.selection.iter().copied().collect();
+        let mut changed = Vec::new();
         for id in ids {
             let edit = self.edits.entry(id).or_default();
             let before = edit.adj.clone();
@@ -1113,23 +1120,31 @@ impl AppState {
             if before != edit.adj {
                 edit.undo.push((label.clone(), before));
                 edit.redo.clear();
-                self.after_commit(id, cx);
+                changed.push(id);
             }
         }
+        self.after_commit_many(changed, cx);
         self.preview.before_dirty = true;
         self.request_render(RenderQuality::Final, cx);
         cx.notify();
     }
 
     pub(crate) fn after_commit(&mut self, id: ImageId, cx: &mut Context<Self>) {
-        if let Some(edit) = self.edits.get(&id) {
-            let _ = self.engine.save_adjustments(id, &edit.adj);
-            let changed = !edit.adj.is_default();
-            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
-                info.has_adjustments = changed;
-            }
+        self.after_commit_many(vec![id], cx);
+    }
+
+    fn after_commit_many(&mut self, ids: Vec<ImageId>, cx: &mut Context<Self>) {
+        if ids.is_empty() { return; }
+        let changes: Vec<_> = ids.iter().filter_map(|id| self.edits.get(id).map(|e| (*id, &e.adj))).collect();
+        let saved = self.engine.save_adjustments_batch(&changes);
+        let changed: HashMap<_, _> = changes.iter().map(|(id, adj)| (*id, !adj.is_default())).collect();
+        if let Err(err) = saved {
+            self.notify(format!("{}: {err}", t("Could not save adjustments", "无法存储调整")), cx);
         }
-        self.queue_thumbs(vec![id], cx);
+        for info in &mut self.images {
+            if let Some(changed) = changed.get(&info.id) { info.has_adjustments = *changed; }
+        }
+        self.queue_thumbs(ids, cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {

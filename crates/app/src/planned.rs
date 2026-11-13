@@ -103,12 +103,13 @@ impl Default for PanoramaOptions {
 /// viewer only marks that proofing is on.
 pub const PROOF_READY: bool = false;
 
-pub const MERGE_READY: bool = false;
+/// Basic exposure fusion is connected; alignment, deghosting and auto tone are not.
+pub const MERGE_READY: bool = true;
 
 /// `fn merge_hdr(&self, images: &[ImageId], options: &HdrOptions) -> anyhow::Result<ImageInfo>`:
 /// writes a linear DNG/TIFF beside the first frame and catalogs it.
-pub fn merge_hdr(_engine: &dyn ImageEngine, _images: &[ImageId], _options: &HdrOptions) -> anyhow::Result<ImageInfo> {
-    Err(not_connected(t("HDR merge", "HDR 合并")))
+pub fn merge_hdr(engine: &dyn ImageEngine, images: &[ImageId], _options: &HdrOptions) -> anyhow::Result<ImageInfo> {
+    engine.merge_hdr_frames(images)
 }
 
 /// `fn merge_panorama(&self, images: &[ImageId], options: &PanoramaOptions) -> anyhow::Result<ImageInfo>`.

@@ -96,7 +96,7 @@ fn node_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> im
                         .gap_2()
                         .child(
                             IconBtn::new(SharedString::from(format!("node-on-{id}")), if l.enabled { IconName::Power } else { IconName::PowerOff }, t("Enable / disable node", "启用 / 停用节点"))
-                                .shortcut("Ctrl+Shift+E")
+                                .shortcut(crate::platform::keys("ctrl-shift-e"))
                                 .active(l.enabled)
                                 .size(22.0)
                                 .on_click(move |_, cx| st_eye.update(cx, |s, cx| s.toggle_node(id, cx))),

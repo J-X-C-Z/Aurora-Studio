@@ -230,7 +230,18 @@ pub fn shortcuts() -> Vec<Shortcut> {
 
 /// The keys `shortcut` is bound to after the user's overrides.
 pub fn keys_for(shortcut: &Shortcut, overrides: &std::collections::BTreeMap<String, Vec<String>>) -> Vec<String> {
-    overrides.get(&shortcut.id).cloned().unwrap_or_else(|| shortcut.defaults.iter().map(|k| k.to_string()).collect())
+    // Overrides are what the user pressed, so they are already native.
+    // Two defaults can land on the same Mac key (Ctrl+Y and Ctrl+Shift+Z are both ⇧⌘Z).
+    overrides.get(&shortcut.id).cloned().unwrap_or_else(|| {
+        let mut keys: Vec<String> = Vec::new();
+        for k in &shortcut.defaults {
+            let k = crate::platform::native_keys(k);
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        keys
+    })
 }
 
 /// (Re)installs Aurora's key bindings with `overrides`, keeping every binding
@@ -254,37 +265,9 @@ pub fn bind_keys(cx: &mut App, overrides: &std::collections::BTreeMap<String, Ve
     cx.bind_keys(keys);
 }
 
-/// `ctrl-shift-k` → `Ctrl+Shift+K`.
+/// `ctrl-shift-k` → `Ctrl+Shift+K` (`⇧⌘K` on a Mac).
 pub fn display_keys(keys: &str) -> String {
-    keys.split(' ')
-        .map(|stroke| {
-            stroke
-                .split('-')
-                .filter(|p| !p.is_empty())
-                .map(|p| match p {
-                    "ctrl" => "Ctrl".to_string(),
-                    "alt" => "Alt".to_string(),
-                    "shift" => "Shift".to_string(),
-                    "cmd" | "super" | "win" => "Win".to_string(),
-                    "left" => "←".to_string(),
-                    "right" => "→".to_string(),
-                    "up" => "↑".to_string(),
-                    "down" => "↓".to_string(),
-                    "enter" => "Enter".to_string(),
-                    "escape" => "Esc".to_string(),
-                    "delete" => "Delete".to_string(),
-                    "space" => "Space".to_string(),
-                    other if other.len() == 1 => other.to_uppercase(),
-                    other => {
-                        let mut c = other.chars();
-                        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("+")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::platform::display(keys)
 }
 
 fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
@@ -296,7 +279,8 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
     workspace_items.push(MenuItem::separator());
     workspace_items.push(MenuItem::action(t("Save Workspace…", "存储工作区…"), SaveWorkspace));
     workspace_items.push(MenuItem::action(t("Tools on the Other Side", "工具栏换边"), ToggleInspectorSide));
-    vec![
+    let mac = crate::platform::is_mac();
+    let mut menus = vec![
         Menu {
             name: t("File", "文件").into(),
             items: vec![
@@ -312,11 +296,16 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
                 MenuItem::action(t("Export Selected", "导出所选"), ExportSelected),
                 MenuItem::action(t("Export…", "导出…"), OpenExportDialog),
                 MenuItem::action(t("Print…", "打印…"), Print),
+            ]
+            .into_iter()
+            // A Mac keeps Preferences and Quit in the application menu.
+            .chain((!mac).then(|| vec![
                 MenuItem::separator(),
                 MenuItem::action(t("Preferences…", "首选项…"), ShowPreferences),
                 MenuItem::separator(),
                 MenuItem::action(t("Exit", "退出"), Quit),
-            ],
+            ]).into_iter().flatten())
+            .collect(),
             disabled: false,
         },
         Menu {
@@ -435,12 +424,28 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
             items: vec![
                 MenuItem::action(t("Keyboard Shortcuts", "键盘快捷键"), ShowShortcuts),
                 MenuItem::action(t("Switch Language (English / 中文)", "切换语言（English / 中文）"), ToggleLanguage),
-                MenuItem::separator(),
-                MenuItem::action(t("About Aurora Studio", "关于 Aurora Studio"), ShowAbout),
-            ],
+            ]
+            .into_iter()
+            .chain((!mac).then(|| vec![MenuItem::separator(), MenuItem::action(t("About Aurora Studio", "关于 Aurora Studio"), ShowAbout)]).into_iter().flatten())
+            .collect(),
             disabled: false,
         },
-    ]
+    ];
+    if mac {
+        // The application menu, first in the Mac menu bar, named after the app.
+        menus.insert(0, Menu {
+            name: "Aurora Studio".into(),
+            items: vec![
+                MenuItem::action(t("About Aurora Studio", "关于 Aurora Studio"), ShowAbout),
+                MenuItem::separator(),
+                MenuItem::action(t("Preferences…", "首选项…"), ShowPreferences),
+                MenuItem::separator(),
+                MenuItem::action(t("Quit Aurora Studio", "退出 Aurora Studio"), Quit),
+            ],
+            disabled: false,
+        });
+    }
+    menus
 }
 
 /// Installs the menus for both the native menu bar and the in-window [`AppMenuBar`].

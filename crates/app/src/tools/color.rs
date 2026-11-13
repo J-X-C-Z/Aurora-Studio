@@ -112,7 +112,7 @@ fn film_curve_select(state: &Entity<AppState>, base: &BaseCharacteristics, mut n
     })
 }
 
-fn wb_binding(scope: Scope, kelvin: bool) -> Binding {
+pub(crate) fn wb_binding(scope: Scope, kelvin: bool) -> Binding {
     let get = move |a: &AdjustmentSet| {
         let wb = match scope {
             Scope::Global => Some(&a.white_balance),

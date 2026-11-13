@@ -77,7 +77,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
             .on_click(move |_, cx| st.update(cx, |s, cx| s.set_cursor(tool, cx)))
     };
 
-    let dispatch = |id: &'static str, icon: IconName, tip: &'static str, key: &'static str, action: Box<dyn gpui_kit::Action>| {
+    let dispatch = |id: &'static str, icon: IconName, tip: &'static str, key: String, action: Box<dyn gpui_kit::Action>| {
         IconBtn::new(id, icon, tip).shortcut(key).on_click(move |window, cx| window.dispatch_action(action.boxed_clone(), cx))
     };
 
@@ -121,7 +121,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
             })
     };
     let st_view = state.clone();
-    let view_toggle = |id: &'static str, icon: IconName, tip: &'static str, key: &'static str, on: bool, f: fn(&mut AppState)| {
+    let view_toggle = |id: &'static str, icon: IconName, tip: &'static str, key: String, on: bool, f: fn(&mut AppState)| {
         let st = st_view.clone();
         IconBtn::new(id, icon, tip).shortcut(key).active(on).on_click(move |_, cx| {
             st.update(cx, |s, cx| {
@@ -143,43 +143,43 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
         // Catalog.
         .child(
             group(cx)
-                .child(dispatch("tb-import", IconName::ImageDown, t("Import", "导入"), "Ctrl+Shift+I", Box::new(actions::Import)))
+                .child(dispatch("tb-import", IconName::ImageDown, t("Import", "导入"), crate::platform::keys("ctrl-shift-i"), Box::new(actions::Import)))
                 .child(if camera_ready {
-                    dispatch("tb-capture", IconName::Camera, t("Capture", "拍摄"), "Ctrl+K", Box::new(actions::Capture))
+                    dispatch("tb-capture", IconName::Camera, t("Capture", "拍摄"), crate::platform::keys("ctrl-k"), Box::new(actions::Capture))
                 } else {
                     IconBtn::new("tb-capture", IconName::CameraOff, tether_note).disabled(true)
                 })
-                .child(dispatch("tb-export", IconName::Upload, t("Process / Export", "处理 / 导出"), "Ctrl+D", Box::new(actions::OpenExportDialog))),
+                .child(dispatch("tb-export", IconName::Upload, t("Process / Export", "处理 / 导出"), crate::platform::keys("ctrl-d"), Box::new(actions::OpenExportDialog))),
         )
         .child(sep(cx))
         .child(
             group(cx)
                 .child(
                     IconBtn::new("tb-undo", IconName::Undo2, undo_tip)
-                        .shortcut("Ctrl+Z")
+                        .shortcut(crate::platform::keys("ctrl-z"))
                         .disabled(!can_undo)
                         .on_click(|window, cx| window.dispatch_action(Box::new(actions::Undo), cx)),
                 )
                 .child(
                     IconBtn::new("tb-redo", IconName::Redo2, redo_tip)
-                        .shortcut("Ctrl+Y")
+                        .shortcut(crate::platform::keys("ctrl-y"))
                         .disabled(!can_redo)
                         .on_click(|window, cx| window.dispatch_action(Box::new(actions::Redo), cx)),
                 ),
         )
         .child(
             group(cx)
-                .child(dispatch("tb-reset", IconName::RotateCcw, t("Reset adjustments", "复位调整"), "Ctrl+R", Box::new(actions::ResetAdjustments)))
+                .child(dispatch("tb-reset", IconName::RotateCcw, t("Reset adjustments", "复位调整"), crate::platform::keys("ctrl-r"), Box::new(actions::ResetAdjustments)))
                 .child(
                     IconBtn::new("tb-auto", IconName::WandSparkles, t("Auto adjust", "自动调整"))
-                        .shortcut("Ctrl+L")
+                        .shortcut(crate::platform::keys("ctrl-l"))
                         .disabled(!has_image)
                         .on_click(move |_, cx| st_auto.update(cx, |s, cx| s.auto_adjust(AutoTarget::All, cx))),
                 )
-                .child(dispatch("tb-copy", IconName::Copy, t("Copy adjustments", "拷贝调整"), "Ctrl+Shift+C", Box::new(actions::CopyAdjustments)))
+                .child(dispatch("tb-copy", IconName::Copy, t("Copy adjustments", "拷贝调整"), crate::platform::keys("ctrl-shift-c"), Box::new(actions::CopyAdjustments)))
                 .child(
                     IconBtn::new("tb-apply", IconName::ClipboardPaste, t("Apply adjustments", "应用调整"))
-                        .shortcut("Ctrl+Shift+V")
+                        .shortcut(crate::platform::keys("ctrl-shift-v"))
                         .disabled(!has_clip)
                         .on_click(|window, cx| window.dispatch_action(Box::new(actions::ApplyAdjustments), cx)),
                 ),
@@ -192,15 +192,15 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
         .child(div().flex_1())
         .child(
             group(cx)
-                .child(view_toggle("tb-compare", IconName::Columns2, t("Before / after", "前后对比"), "Y", view.compare != CompareMode::Off, |s| {
+                .child(view_toggle("tb-compare", IconName::Columns2, t("Before / after", "前后对比"), "Y".to_string(), view.compare != CompareMode::Off, |s| {
                     s.view.compare = if s.view.compare == CompareMode::Off { CompareMode::Split } else { CompareMode::Off }
                 }))
-                .child(view_toggle("tb-exposure", IconName::TriangleAlert, t("Exposure warning", "曝光警告"), "Alt+E", view.exposure_warning, |s| {
+                .child(view_toggle("tb-exposure", IconName::TriangleAlert, t("Exposure warning", "曝光警告"), crate::platform::keys("alt-e"), view.exposure_warning, |s| {
                     s.view.exposure_warning = !s.view.exposure_warning
                 }))
-                .child(view_toggle("tb-focus", IconName::Focus, t("Focus mask", "焦点蒙版"), "", view.focus_mask, |s| s.view.focus_mask = !s.view.focus_mask))
-                .child(view_toggle("tb-grid", IconName::Grid3x3, t("Grid overlay", "网格叠加"), "Alt+G", view.grid, |s| s.view.grid = !s.view.grid))
-                .child(view_toggle("tb-proof", IconName::Frame, t("Proof margin", "校样边距"), "Alt+P", view.proof, |s| s.view.proof = !s.view.proof)),
+                .child(view_toggle("tb-focus", IconName::Focus, t("Focus mask", "焦点蒙版"), String::new(), view.focus_mask, |s| s.view.focus_mask = !s.view.focus_mask))
+                .child(view_toggle("tb-grid", IconName::Grid3x3, t("Grid overlay", "网格叠加"), crate::platform::keys("alt-g"), view.grid, |s| s.view.grid = !s.view.grid))
+                .child(view_toggle("tb-proof", IconName::Frame, t("Proof margin", "校样边距"), crate::platform::keys("alt-p"), view.proof, |s| s.view.proof = !s.view.proof)),
         )
         .child(sep(cx))
         .child(
@@ -208,7 +208,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
                 .child(browser_btn(BrowserMode::Filmstrip, IconName::PanelBottom, t("Filmstrip", "胶片条")))
                 .child(browser_btn(BrowserMode::Grid, IconName::LayoutGrid, t("Grid browser", "网格浏览")))
                 .child(browser_btn(BrowserMode::List, IconName::List, t("List browser", "列表浏览")))
-                .child(view_toggle("tb-inspector", IconName::PanelLeft, t("Show tools", "显示工具"), "Ctrl+T", view.show_inspector, |s| {
+                .child(view_toggle("tb-inspector", IconName::PanelLeft, t("Show tools", "显示工具"), crate::platform::keys("ctrl-t"), view.show_inspector, |s| {
                     s.view.show_inspector = !s.view.show_inspector
                 })),
         )

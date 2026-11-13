@@ -5,6 +5,7 @@ mod contract;
 mod i18n;
 mod motion;
 mod perf;
+mod platform;
 mod planned;
 mod state;
 mod theme;

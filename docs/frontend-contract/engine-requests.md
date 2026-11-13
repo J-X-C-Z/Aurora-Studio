@@ -1,4 +1,4 @@
-> 发布快照更新（2026-11-13）：下文是上游历史请求清单。当前版本保留节点图类型与 u16 旋转；film_curves / import_style / cancel_job / source_status 已连接。PreviewRequest 新增显示/软打样参数，前端默认关闭，软打样仍标记未接通。HEIF 输出依赖可选运行库，导入仍待接线。人像库已加入，提供 portrait_capabilities / render_portrait_stage / export_portrait_stage；automatic=false，前端不得据阶段注册就开放自动效果。详细边界见 [后端更新](../backend-update-20261113.md)。
+> 发布快照更新（2026-11-14）：下文是上游历史请求清单。当前版本保留节点图类型与 u16 旋转；film_curves / import_style / cancel_job / source_status 已连接。HDR 已连接基础曝光融合与 16 位 TIFF 输出，对齐、去鬼影和自动色调仍忽略。PreviewRequest 新增显示/软打样参数，前端默认关闭，软打样仍标记未接通。HEIF 输出依赖可选运行库，导入仍待接线。人像库已加入，提供 portrait_capabilities / render_portrait_stage / export_portrait_stage；automatic=false，前端不得据阶段注册就开放自动效果。详细边界见 [后端更新](../backend-update-20261113.md)。
 
 # 前端 → 引擎：待办与约定（2026-11-11，2026-11-12 更新）
 
@@ -31,7 +31,7 @@
 | B | 导入 Capture One 风格 | 调整 → 风格与预设 → "导入 Capture One 风格…"（可多选文件） | `fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo>`，导入后 `styles()` 里要能看到。可以直接复用 win-main 的 `c1_styles::load_style` |
 | C | 取消导出 | 批处理页，排队中或进行中的任务右侧 × | `fn cancel_job(&self, job_id: u64) -> bool`；取消后 `job_status` 返回 `Failed { message: "cancelled" }` |
 | D | 原图降级提示 | 查看器右下角的黄色提示 | `fn source_status(&self, image: ImageId) -> Option<String>`：比如"libraw 解不了，显示的是机内嵌入预览"。一切正常时返回 `None`（第 4 条的另一种做法） |
-| E | HDR 合并 | 图像 → 合并为 HDR…（Ctrl+H） | `fn merge_hdr(&self, images: &[ImageId], options: &HdrOptions) -> anyhow::Result<ImageInfo>`；`HdrOptions { align: bool, deghost: u8 /*0 关 1 低 2 中 3 高*/, auto_tone: bool }`。输出为线性 DNG 或 16 位 TIFF，放在第一帧旁边并加入图库 |
+| E | HDR 合并 | 图像 → 合并为 HDR…（Ctrl+H） | **基础版已连接**：`ImageEngine::merge_hdr_frames` 读取所选帧，按 EXIF 曝光差做曝光融合，输出 16 位 TIFF 并加入图库。`HdrOptions` 中 align/deghost/auto_tone 尚未实现，不宣称已生效 |
 | F | 全景合并 | 图像 → 合并为全景…（Ctrl+M） | `fn merge_panorama(&self, images: &[ImageId], options: &PanoramaOptions) -> anyhow::Result<ImageInfo>`；`PanoramaOptions { projection: Spherical/Cylindrical/Perspective, boundary_warp: f32 /*0..=100*/, auto_crop: bool }` |
 | G | 软打样 | 视图 → 软打样（Ctrl+Alt+P）；使用所选处理配方的 ICC | `PreviewRequest::proof_profile: Option<String>`：预览先转到这个输出配置文件，再转回显示，让超出色域的颜色呈现打印后的样子 |
 | H | AI 降噪、条纹抑制 | 细节 → 降噪 | 前端已经把值写进 `extra["AIDenoiseAmount"]`、`extra["BandingReductionAmount"]`（C1 原生键，0..=100）。请在渲染里读取它们 |

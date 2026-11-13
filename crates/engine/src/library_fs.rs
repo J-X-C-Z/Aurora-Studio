@@ -111,6 +111,7 @@ impl FileEngine {
     pub(super) fn commit_library(
         &self, st: &mut State, entries: Vec<FileEntry>, mut catalog: Catalog,
         removed: &[String], collections: Option<&[UserCollection]>,
+        preserve_sources: bool,
     ) -> Result<()> {
         let store = self.writable_store()?;
         let mut adjustments = Vec::new();
@@ -134,13 +135,25 @@ impl FileEngine {
         for parent in parents { add_folder(&mut catalog, &self.root, &parent); }
         catalog.next_id = catalog.next_id.max(st.next_id).max(entries.iter().map(|e| e.info.id.0 + 1).max().unwrap_or(1));
         store.commit_library(&catalog, &adjustments, removed, collections)?;
+        let same_sources = preserve_sources && st.entries.len() == entries.len() && st.entries.iter().zip(&entries).all(|(old, new)| {
+            old.info.id == new.info.id && old.path == new.path
+                && old.info.width == new.info.width && old.info.height == new.info.height
+                && old.info.file_size == new.info.file_size && old.info.kind == new.info.kind
+                && old.info.exif == new.info.exif && old.info.heif == new.info.heif
+        });
         st.next_id = catalog.next_id;
         st.catalog = catalog;
         st.entries = entries;
-        st.sources.clear();
-        st.lru.clear();
-        st.preview = PreviewCache::default();
-        self.eyes.lock().clear();
+        // Parameters are part of frame keys; metadata-only saves keep decoded pixels warm.
+        if !same_sources {
+            st.source_version += 1;
+            st.sources.clear();
+            st.source_reasons.clear();
+            st.lru.clear();
+            st.preview = PreviewCache::default();
+            st.profiled = Default::default();
+            self.eyes.lock().clear();
+        }
         Ok(())
     }
 
@@ -175,7 +188,7 @@ impl FileEngine {
             entries.push(self.discovered_entry(&path, id, key, record)?);
         }
         catalog.next_id = next_id;
-        self.commit_library(&mut st, entries, catalog, &[], None)?;
+        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
         Ok(st.entries.iter().map(|e| e.info.clone()).collect())
     }
 
@@ -332,7 +345,7 @@ impl FileEngine {
             }
             completed.push((from.clone(), to.clone()));
         }
-        if let Err(err) = self.commit_library(&mut st, entries, catalog, &removed, collections.as_deref()) {
+        if let Err(err) = self.commit_library(&mut st, entries, catalog, &removed, collections.as_deref(), false) {
             let err = rollback_moves(&completed, err);
             if let Some((from, to)) = folder_move {
                 let rollback = ensure_absent(&from).and_then(|_| fs::rename(&to, &from).map_err(Into::into));
@@ -637,6 +650,222 @@ mod tests {
     }
     fn album(ids: Vec<ImageId>) -> UserCollection {
         UserCollection { id: 1 << 40, parent: None, name: "Picks".into(), kind: CollectionKind::Album, images: ids, rules: vec![], match_all: true }
+    }
+
+    fn preview_request(image: ImageId, adjustments: AdjustmentSet) -> PreviewRequest {
+        PreviewRequest {
+            image, adjustments, region: NormRect::FULL, max_size: 64,
+            quality: crate::RenderQuality::Final, bypass: false, mask_overlay: None,
+            generation: 1, display_profile: None, proof_profile: None,
+            proof_paper_white: 1.0, proof_black_point: 0.0,
+        }
+    }
+
+    #[test]
+    fn selection_saves_are_atomic_and_preserve_cached_sources() {
+        let f = Fixture::new();
+        f.image("a.png");
+        f.image("b.png");
+        let engine = f.open();
+        let mut infos = engine.images();
+        let source = engine.source(infos[0].id).unwrap();
+        infos[0].rating = 5;
+        infos[1].color_tag = ColorTag::Red;
+        infos[1].iptc.creator = "Synthetic test".into();
+        engine.update_infos(&infos).unwrap();
+        let a = edits(0.75);
+        let b = edits(-0.5);
+        engine.save_adjustments_batch(&[(infos[0].id, &a), (infos[1].id, &b)]).unwrap();
+        assert!(Arc::ptr_eq(&source, &engine.source(infos[0].id).unwrap()));
+        assert_eq!(engine.load_adjustments(infos[0].id), a);
+        assert_eq!(engine.load_adjustments(infos[1].id), b);
+        let before = engine.images();
+        let store = engine.store.as_ref().unwrap();
+        let json = fs::read(store.root().join("catalog.json")).unwrap();
+        let mut bad = before.clone();
+        bad[0].rating = 1;
+        bad[1].path = f.0.join("wrong.png");
+        assert!(engine.update_infos(&bad).is_err());
+        bad[1] = before[1].clone();
+        bad[1].id = ImageId(u64::MAX);
+        assert!(engine.update_infos(&bad).is_err());
+        assert!(engine.save_adjustments_batch(&[(infos[0].id, &b), (ImageId(u64::MAX), &a)]).is_err());
+        assert_eq!(engine.images(), before);
+        assert_eq!(engine.load_adjustments(infos[0].id), a);
+        assert_eq!(fs::read(store.root().join("catalog.json")).unwrap(), json);
+        let obstruction = store.root().join("catalog.json.tmp");
+        fs::create_dir(&obstruction).unwrap();
+        let mut changed = before.clone();
+        changed[0].rating = 2;
+        changed[1].rating = 3;
+        assert!(engine.update_infos(&changed).is_err());
+        assert!(engine.save_adjustments_batch(&[(infos[0].id, &b), (infos[1].id, &a)]).is_err());
+        engine.update_infos(&[]).unwrap();
+        engine.save_adjustments_batch(&[]).unwrap();
+        assert_eq!(engine.images(), before);
+        assert_eq!(engine.load_adjustments(infos[0].id), a);
+        assert_eq!(engine.load_adjustments(infos[1].id), b);
+        assert_eq!(fs::read(store.root().join("catalog.json")).unwrap(), json);
+        fs::remove_dir(obstruction).unwrap();
+        drop(engine);
+        let engine = f.open();
+        assert_eq!(engine.images(), before);
+        assert_eq!(engine.load_adjustments(infos[0].id), a);
+        assert_eq!(engine.load_adjustments(infos[1].id), b);
+        // Duplicate IDs retain the order of the old sequence of individual saves.
+        engine.save_adjustments_batch(&[(infos[0].id, &b), (infos[0].id, &a)]).unwrap();
+        assert_eq!(engine.load_adjustments(infos[0].id), a);
+    }
+
+    #[test]
+    #[ignore = "synthetic catalog persistence timing; run release with one test thread"]
+    fn bench_selection_persistence() {
+        let f = Fixture::new();
+        for i in 0..32 { f.image(&format!("{i:02}.png")); }
+        let engine = f.open();
+        let mut infos = engine.images();
+        let mut single = Vec::new();
+        let mut batch = Vec::new();
+        for round in 0..11 {
+            for info in &mut infos { info.rating = (round % 6) as i8; }
+            let start = Instant::now();
+            for info in &infos { engine.update_info(info).unwrap(); }
+            single.push(start.elapsed().as_secs_f64() * 1000.0);
+            for info in &mut infos { info.rating = ((round + 1) % 6) as i8; }
+            let start = Instant::now();
+            engine.update_infos(&infos).unwrap();
+            batch.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(engine.images(), infos);
+        }
+        let cold_single = single.remove(0);
+        let cold_batch = batch.remove(0);
+        single.sort_by(f64::total_cmp);
+        batch.sort_by(f64::total_cmp);
+        eprintln!("selection32 ms: first single={cold_single:.3} batch={cold_batch:.3}; warm single p50={:.3} p95={:.3}; batch p50={:.3} p95={:.3}", single[4], single[9], batch[4], batch[9]);
+        drop(engine);
+        assert_eq!(f.open().images(), infos);
+    }
+
+    #[test]
+    fn saving_edits_and_metadata_preserves_sources_and_cached_pixels() {
+        let f = Fixture::new();
+        f.image("a.png");
+        f.image("b.png");
+        let engine = f.open();
+        let images = engine.images();
+        let request = preview_request(images[0].id, edits(0.75));
+        let original = engine.render_preview(&request).unwrap();
+        let source = engine.source(images[0].id).unwrap();
+        let neighbor = engine.source(images[1].id).unwrap();
+        let decodes = DECODE_COUNT.load(Ordering::SeqCst);
+        engine.save_adjustments(images[0].id, &request.adjustments).unwrap();
+        let mut info = images[0].clone();
+        info.rating = 5;
+        info.color_tag = ColorTag::Red;
+        engine.update_info(&info).unwrap();
+        engine.set_trashed(&[info.id], true).unwrap();
+        assert!(Arc::ptr_eq(&source, &engine.source(info.id).unwrap()));
+        assert!(Arc::ptr_eq(&neighbor, &engine.source(images[1].id).unwrap()));
+        let cached = engine.render_preview(&request).unwrap();
+        assert!(Arc::ptr_eq(&original.image.pixels, &cached.image.pixels));
+        assert_eq!(original.histogram, cached.histogram);
+        let mut changed = request.clone();
+        changed.adjustments = edits(-0.5);
+        engine.save_adjustments(info.id, &changed.adjustments).unwrap();
+        let new = engine.render_preview(&changed).unwrap();
+        assert_ne!(original.image.pixels, new.image.pixels);
+        assert!(Arc::ptr_eq(&original.image.pixels, &engine.render_preview(&request).unwrap().image.pixels));
+        assert_eq!(DECODE_COUNT.load(Ordering::SeqCst), decodes);
+        let cold = f.open().render_preview(&changed).unwrap();
+        assert_eq!(new.image.pixels, cold.image.pixels);
+        assert_eq!(new.histogram, cold.histogram);
+    }
+
+    #[test]
+    fn file_operations_invalidate_sources_and_profile_versions() {
+        let f = Fixture::new();
+        let path = f.image("a.png");
+        let engine = f.open();
+        let id = engine.images()[0].id;
+        let source = engine.source(id).unwrap();
+        let before = engine.render_preview(&preview_request(id, edits(0.0))).unwrap();
+        let version = engine.state.lock().source_version;
+        engine.manage_files(LibraryAction::Rename { image: id, name: "b.png".into() }).unwrap();
+        assert!(engine.state.lock().source_version > version);
+        assert!(!Arc::ptr_eq(&source, &engine.source(id).unwrap()));
+        assert_eq!(before.image.pixels, engine.render_preview(&preview_request(id, edits(0.0))).unwrap().image.pixels);
+        assert!(!path.exists());
+        image::RgbaImage::from_pixel(4, 3, image::Rgba([180, 30, 90, 255])).save(f.0.join("b.png")).unwrap();
+        engine.manage_files(LibraryAction::Synchronize { folder: f.0.clone(), recursive: false }).unwrap();
+        let replaced = engine.render_preview(&preview_request(id, edits(0.0))).unwrap();
+        assert_ne!(before.image.pixels, replaced.image.pixels);
+        assert_eq!(replaced.image.pixels, f.open().render_preview(&preview_request(id, edits(0.0))).unwrap().image.pixels);
+    }
+
+    #[test]
+    fn decode_in_flight_retries_after_a_source_relocation() {
+        let f = Fixture::new();
+        f.image("a.png");
+        let engine = f.open();
+        let id = engine.images()[0].id;
+        let before = DECODE_COUNT.load(Ordering::SeqCst);
+        DECODE_DELAY_MS.store(150, Ordering::SeqCst);
+        let source = std::thread::scope(|scope| {
+            let task = scope.spawn(|| engine.source(id));
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while DECODE_COUNT.load(Ordering::SeqCst) == before && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            DECODE_DELAY_MS.store(0, Ordering::SeqCst);
+            assert!(DECODE_COUNT.load(Ordering::SeqCst) > before, "decode did not start");
+            engine.manage_files(LibraryAction::Rename { image: id, name: "b.png".into() }).unwrap();
+            task.join().unwrap().unwrap()
+        });
+        assert!(Arc::ptr_eq(&source, &engine.source(id).unwrap()));
+        assert_eq!(DECODE_COUNT.load(Ordering::SeqCst) - before, 2);
+        assert_eq!(engine.images()[0].file_name, "b.png");
+    }
+
+    #[test]
+    #[ignore = "synthetic save/render timing; run in release with one test thread"]
+    fn bench_save_render_cache_retention() {
+        let f = Fixture::new();
+        image::RgbaImage::from_fn(1920, 1280, |x, y| {
+            image::Rgba([((x * 7 + y * 13) % 256) as u8, ((x + y * 3) % 256) as u8, (y % 256) as u8, 255])
+        }).save(f.0.join("frame.png")).unwrap();
+        let engine = f.open();
+        let id = engine.images()[0].id;
+        let mut request = preview_request(id, edits(0.0));
+        request.max_size = 1400;
+        let mut outputs = Vec::new();
+        for clear in [true, false] {
+            engine.render_preview(&request).unwrap();
+            let before = DECODE_COUNT.load(Ordering::SeqCst);
+            let mut timings = Vec::new();
+            for step in 0..20 {
+                request.adjustments = edits((step % 2) as f32 * 0.5);
+                engine.render_preview(&request).unwrap();
+                let start = Instant::now();
+                engine.save_adjustments(id, &request.adjustments).unwrap();
+                if clear {
+                    // Reproduce the previous post-save invalidation without changing pixel math.
+                    let mut st = engine.state.lock();
+                    st.sources.clear();
+                    st.lru.clear();
+                    st.preview = PreviewCache::default();
+                }
+                let frame = engine.render_preview(&request).unwrap();
+                timings.push(start.elapsed().as_secs_f64() * 1000.0);
+                if clear { outputs.push((frame.image.pixels, frame.histogram)); }
+                else {
+                    assert_eq!(frame.image.pixels, outputs[step].0);
+                    assert_eq!(frame.histogram, outputs[step].1);
+                }
+            }
+            timings.sort_by(f64::total_cmp);
+            println!("save-render synthetic legacy_clear={clear} size=1400 samples=20 p50_ms={:.3} p95_ms={:.3} decodes={}",
+                timings[9], timings[18], DECODE_COUNT.load(Ordering::SeqCst) - before);
+        }
     }
 
     #[test]
