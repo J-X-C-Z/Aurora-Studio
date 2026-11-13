@@ -1307,22 +1307,22 @@ mod tests {
 
     #[test]
     fn the_menu_filters_groups_and_limits_with_the_default_first() {
-        if profile_names().is_empty() {
-            return;
-        }
         let all = profile_menu(None, None, 0);
         let names = profile_names();
         assert!(all.len() >= names.len(), "the default alias may add one entry");
         assert!(all.iter().skip(1).all(|name| names.contains(name)));
-        assert_eq!(all[0], DEFAULT_PROFILE, "the default must stay first");
+        if profile(DEFAULT_PROFILE).is_some() {
+            assert_eq!(all.first().map(String::as_str), Some(DEFAULT_PROFILE), "the default must stay first");
+        } else {
+            assert!(!all.iter().any(|name| name == DEFAULT_PROFILE), "unavailable profiles must not be listed");
+        }
         let mut unique = all.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), all.len(), "no duplicates in the menu");
 
         let five = profile_menu(None, None, 5);
-        assert_eq!(five.len(), 5);
-        assert_eq!(five[0], DEFAULT_PROFILE);
+        assert_eq!(five, all.iter().take(5).cloned().collect::<Vec<_>>());
 
         let groups = profile_groups();
         println!("menu entries: {} groups: {:?}", all.len(), groups);

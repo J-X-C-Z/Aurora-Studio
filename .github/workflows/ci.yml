@@ -43,7 +43,7 @@ jobs:
         shell: powershell
         run: |
           $tracked = @(git ls-files | Where-Object {
-            $_ -like 'crates/engine/testdata/*' -or
+            $_ -match '^crates/(engine|portrait)/(testdata|local-fixtures|tests/fixtures)/' -or
             $_ -match '(?i)\.(nef|dng|cr[23]|arw|raf|orf|rw2|pef)$'
           })
           if ($tracked.Count -gt 0) {
@@ -51,13 +51,15 @@ jobs:
             throw "Private media or Capture One testdata must not enter the repository."
           }
 
-      - name: Check lumen-engine package contents
+      - name: Check engine and portrait package contents
         shell: powershell
         run: |
-          $contents = cargo package -p lumen-engine --list --allow-dirty
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $bad = @($contents | Where-Object { $_ -match '(^|[\\/])testdata([\\/]|$)' })
-          if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { Write-Error "private fixture packaged: $_" }
-            throw "lumen-engine package contains local-only testdata."
+          foreach ($package in @('lumen-engine', 'aurora-pixcake')) {
+            $contents = cargo package -p $package --list --allow-dirty
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $bad = @($contents | Where-Object { $_ -match '(^|[\\/])(testdata|local-fixtures|fixtures)([\\/]|$)' })
+            if ($bad.Count -gt 0) {
+              $bad | ForEach-Object { Write-Error "private fixture packaged: $_" }
+              throw "$package contains local-only fixtures."
+            }
           }
