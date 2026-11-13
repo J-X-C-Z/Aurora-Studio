@@ -32,6 +32,7 @@ mod engine;
 mod exif;
 mod file_engine;
 pub mod param_contract;
+#[cfg(windows)]
 pub mod portrait;
 pub use aurora_pixcake as portrait_backend;
 pub mod auto_exposure;
