@@ -305,12 +305,15 @@ pub struct EngineCapabilities {
 
 pub trait ImageEngine: Send + Sync + 'static {
     /// Explicit-input portrait stages; availability is separate from automatic UI processing.
+    #[cfg(windows)]
     fn portrait_capabilities(&self) -> Vec<crate::portrait::Capability> {
         crate::portrait::capabilities()
     }
+    #[cfg(windows)]
     fn render_portrait_stage(&self, request: &crate::portrait::Request<'_>) -> anyhow::Result<crate::portrait::Frame> {
         crate::portrait::render(request)
     }
+    #[cfg(windows)]
     fn export_portrait_stage(&self, request: &crate::portrait::Request<'_>, info: &ImageInfo,
         recipe: &crate::ProcessRecipe, directory: &Path) -> anyhow::Result<PathBuf> {
         crate::portrait::export(request, info, recipe, directory)

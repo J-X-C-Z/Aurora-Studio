@@ -13,7 +13,7 @@
 ## 人像能力
 
 - 人像算法独立为 `aurora-pixcake` crate，保留 CPU、CUDA 与 Metal 的 typed API；引擎通过 `portrait_backend` 再导出。
-- `ImageEngine::portrait_capabilities()` 返回阶段状态、所需输入、统一桥支持及 automatic=false。代码可调用、像素阶段可执行和自动滑块生效是不同状态。
+- Windows 的 `ImageEngine::portrait_capabilities()` 返回阶段状态、所需输入、统一桥支持及 automatic=false。统一桥依赖 Windows CUDA 会话，按平台编译；独立人像库的 CPU/Metal API 保留。代码可调用、像素阶段可执行和自动滑块生效是不同状态。
 - `render_portrait_stage()` / `export_portrait_stage()` 连接纹理平滑 PF8069 负值分支、三类皱纹阶段及颈纹修复回贴，另有通用蒙版组合。其他家族继续使用对应 typed module API，缺输入明确拒绝。
 - CUDA 皱纹阶段复用调用方会话，并返回真实设备/内核 dispatch；显式 CUDA 请求不偷偷改用 CPU。
 - 预览与导出使用同一阶段；导出要求完整源尺寸和 8 位配方，拒绝用低清预览放大或把 RGBA8 冒充 16 位处理。
