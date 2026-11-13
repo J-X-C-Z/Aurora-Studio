@@ -82,10 +82,10 @@ mod tests {
         let parent = std::env::temp_dir().join(format!("aurora-library-open-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir(&parent).unwrap();
         for (name, kind) in [("Catalog", DocumentKind::Catalog), ("Session", DocumentKind::Session)] {
-            let root = LibraryDocument::create(&parent, name, kind).unwrap();
+            let root = std::fs::canonicalize(LibraryDocument::create(&parent, name, kind).unwrap()).unwrap();
             let descriptor = LibraryDocument::descriptor(&root, kind);
             let (engine, folder_source) = open(&root).unwrap();
-            assert_eq!(engine.library_root().as_deref(), Some(root.as_path()));
+            assert_eq!(std::fs::canonicalize(engine.library_root().unwrap()).unwrap(), root);
             let (_, file_source) = open(&descriptor).unwrap();
             assert_eq!(folder_source, file_source);
             assert!(matches!((kind, folder_source), (DocumentKind::Catalog, Source::Catalog(_)) | (DocumentKind::Session, Source::Session(_))));
