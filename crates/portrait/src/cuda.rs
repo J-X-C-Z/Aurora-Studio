@@ -122,7 +122,7 @@ impl Uniforms {
         if self.roi_size != self.width {
             return Err(Refusal::ShapeMismatch("roi_size"));
         }
-        if self.pf != 90023 && self.pf != 90024 && self.pf != 21024 {
+        if !matches!(self.pf, 90023 | 90024 | 21024 | 21025 | 21069 | 21070 | 21071) {
             return Err(Refusal::UnknownEffect(self.pf));
         }
         if !(self.pf_value > self.gate) || self.gate != GATE {
@@ -172,6 +172,28 @@ pub struct Dispatch {
     pub driver_version: i32,
 }
 
+/// Process-wide counters for the cached LUT path.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DriverMetrics {
+    pub ptx_module_load_calls: usize,
+    pub skin_lut_uploads: usize,
+}
+
+#[cfg(windows)]
+pub fn driver_metrics() -> DriverMetrics {
+    driver::metrics()
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn test_driver_counts() -> [usize; 3] {
+    [
+        driver::live_contexts(),
+        driver::device_allocations(),
+        driver::context_syncs(),
+    ]
+}
+
 /// Why the NVIDIA path produced nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CudaError {
@@ -218,25 +240,59 @@ pub fn restamp_ptx(ptx: &str, target: (u32, u32)) -> Option<String> {
 #[cfg(windows)]
 mod driver {
     use super::{
-        cpu, ptx_isa, restamp_ptx, CudaError, Dispatch, Image, Pass, Refusal, Uniforms, PTX,
+        cpu, ptx_isa, restamp_ptx, CudaError, Dispatch, DriverMetrics, Image, Pass, Refusal,
+        Uniforms, PTX,
     };
+    use std::cell::RefCell;
+    #[cfg(test)]
+    use std::cell::Cell;
     use std::ffi::{c_char, c_void, CString, CStr};
     use std::ptr;
-    // Test-only context census, thread-local so parallel tests cannot perturb
-    // it. Opens and drops in these tests happen on the same thread.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    // Test-only process census. The domain is intentionally process-wide.
+    #[cfg(test)]
+    static LIVE_CONTEXTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     #[cfg(test)]
     thread_local! {
-        static LIVE_CONTEXTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static DEVICE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        static CONTEXT_SYNCS: Cell<usize> = const { Cell::new(0) };
     }
 
     #[cfg(test)]
     fn count_context(delta: isize) {
-        LIVE_CONTEXTS.with(|live| live.set((live.get() as isize + delta).max(0) as usize));
+        use std::sync::atomic::Ordering;
+        if delta >= 0 {
+            LIVE_CONTEXTS.fetch_add(delta as usize, Ordering::SeqCst);
+        } else {
+            LIVE_CONTEXTS.fetch_sub((-delta) as usize, Ordering::SeqCst);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn live_contexts() -> usize {
-        LIVE_CONTEXTS.with(|live| live.get())
+        LIVE_CONTEXTS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn count_device_allocation() {
+        DEVICE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_allocations() -> usize {
+        DEVICE_ALLOCATIONS.with(|count| count.get())
+    }
+
+    #[cfg(test)]
+    fn count_context_sync() {
+        CONTEXT_SYNCS.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_syncs() -> usize {
+        CONTEXT_SYNCS.with(|count| count.get())
     }
 
     type CuResult = i32;
@@ -258,6 +314,7 @@ mod driver {
         fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     }
 
+    #[derive(Clone, Copy)]
     struct Api {
         init: unsafe extern "system" fn(u32) -> CuResult,
         device_get: unsafe extern "system" fn(*mut CuDevice, i32) -> CuResult,
@@ -266,6 +323,7 @@ mod driver {
         driver_version: unsafe extern "system" fn(*mut i32) -> CuResult,
         ctx_create: unsafe extern "system" fn(*mut CuContext, u32, CuDevice) -> CuResult,
         ctx_destroy: unsafe extern "system" fn(CuContext) -> CuResult,
+        ctx_set_current: unsafe extern "system" fn(CuContext) -> CuResult,
         ctx_sync: unsafe extern "system" fn() -> CuResult,
         module_load: unsafe extern "system" fn(
             *mut CuModule,
@@ -332,6 +390,7 @@ mod driver {
                 driver_version: sym2!("cuDriverGetVersion", "cuDriverGetVersion"),
                 ctx_create: sym2!("cuCtxCreate_v2", "cuCtxCreate"),
                 ctx_destroy: sym2!("cuCtxDestroy_v2", "cuCtxDestroy"),
+                ctx_set_current: sym!("cuCtxSetCurrent"),
                 ctx_sync: sym!("cuCtxSynchronize"),
                 module_load: sym!("cuModuleLoadDataEx"),
                 module_unload: sym!("cuModuleUnload"),
@@ -354,34 +413,287 @@ mod driver {
         }
     }
 
-    /// A context, module and device identity. Dropping it releases all three.
-    /// One context per process: parallel contexts crashed the driver in tests.
-    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[derive(Clone, Copy)]
+    struct LoadedModule {
+        image: &'static str,
+        module: usize,
+        ptx_isa: (u32, u32),
+        image_bytes: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct BufferShape {
+        width: u32,
+        height: u32,
+        stride: u32,
+    }
+
+    /// One process-wide context owns every JIT-compiled PTX module.
+    ///
+    /// The handle stores no resource and therefore cannot outlive the domain.
+    /// Every driver call locks the domain and makes this context current on the
+    /// calling thread before touching a module or allocation.
+    struct Domain {
+        api: Api,
+        ctx: usize,
+        modules: Vec<LoadedModule>,
+        pending: bool,
+        composite_buffers: Option<(BufferShape, Vec<(CuPtr, usize)>)>,
+        name: String,
+        compute_cap: (i32, i32),
+        driver_version: i32,
+    }
+
+    static DOMAIN: OnceLock<Result<Mutex<Domain>, CudaError>> = OnceLock::new();
+    static PTX_MODULE_LOADS: AtomicUsize = AtomicUsize::new(0);
+    static SKIN_LUT_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+    const LUT_CACHE_SLOTS: usize = 2;
+
+    #[derive(Debug)]
+    struct CachedLut {
+        bytes: Vec<u8>,
+        ptr: CuPtr,
+    }
+
+    fn domain() -> Result<&'static Mutex<Domain>, CudaError> {
+        match DOMAIN.get_or_init(|| Domain::open().map(Mutex::new)) {
+            Ok(domain) => Ok(domain),
+            Err(error) => Err(error.clone()),
+        }
+    }
 
     pub struct Nvidia {
-        /// Held for this context's lifetime; shortcut: one GPU job at a time.
-        _job: std::sync::MutexGuard<'static, ()>,
+        image: &'static str,
         api: Api,
-        ctx: CuContext,
-        module: CuModule,
         name: String,
         compute_cap: (i32, i32),
         driver_version: i32,
         ptx_isa: (u32, u32),
-        /// Bytes of the image actually loaded, which is the restamped text when
-        /// the driver rejected the compiled ISA level.
         image_bytes: usize,
+        lut_cache: RefCell<Vec<CachedLut>>,
+    }
+
+    impl Domain {
+        fn open() -> Result<Self, CudaError> {
+            let api = load()?;
+            let mut device: CuDevice = 0;
+            let mut ctx: CuContext = ptr::null_mut();
+            let mut version = 0;
+            unsafe {
+                check((api.init)(0), "cuInit")?;
+                check((api.driver_version)(&mut version), "cuDriverGetVersion")?;
+                check((api.device_get)(&mut device, 0), "cuDeviceGet")?;
+                check((api.ctx_create)(&mut ctx, 0, device), "cuCtxCreate")?;
+            }
+            #[cfg(test)]
+            count_context(1);
+            let mut domain = Self {
+                api,
+                ctx: ctx as usize,
+                modules: Vec::new(),
+                pending: false,
+                composite_buffers: None,
+                name: String::new(),
+                compute_cap: (0, 0),
+                driver_version: version,
+            };
+            let mut name_buf = [0 as c_char; 256];
+            let mut major = 0;
+            let mut minor = 0;
+            unsafe {
+                check(
+                    (domain.api.device_name)(
+                        name_buf.as_mut_ptr(),
+                        name_buf.len() as i32,
+                        device,
+                    ),
+                    "cuDeviceGetName",
+                )?;
+                check(
+                    (domain.api.device_attribute)(&mut major, ATTR_CC_MAJOR, device),
+                    "cuDeviceGetAttribute",
+                )?;
+                check(
+                    (domain.api.device_attribute)(&mut minor, ATTR_CC_MINOR, device),
+                    "cuDeviceGetAttribute",
+                )?;
+            }
+            domain.name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            domain.compute_cap = (major, minor);
+            Ok(domain)
+        }
+
+        fn bind(&mut self) -> Result<(), CudaError> {
+            unsafe {
+                check(
+                    (self.api.ctx_set_current)(self.ctx as CuContext),
+                    "cuCtxSetCurrent",
+                )
+            }
+        }
+
+        fn load_module(api: &Api, text: &str) -> Result<CuModule, CudaError> {
+            let mut image = text.as_bytes().to_vec();
+            image.push(0);
+            let mut module: CuModule = ptr::null_mut();
+            PTX_MODULE_LOADS.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                check(
+                    (api.module_load)(
+                        &mut module,
+                        image.as_ptr() as *const c_void,
+                        0,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    ),
+                    "cuModuleLoadDataEx",
+                )?;
+            }
+            Ok(module)
+        }
+
+        fn module(&mut self, image: &'static str) -> Result<LoadedModule, CudaError> {
+            // Module cache hits may run on a different host thread, so binding
+            // must precede the lookup rather than only the first JIT load.
+            self.bind()?;
+            self.synchronize_pending()?;
+            if let Some(module) = self.modules.iter().find(|module| module.image == image) {
+                return Ok(*module);
+            }
+            // Only driver error 222 licenses the header-only compatibility retry.
+            let (module, isa, loaded) = match Self::load_module(&self.api, image) {
+                Ok(module) => (
+                    module,
+                    ptx_isa(image).ok_or(CudaError::Unavailable("ptx image"))?,
+                    image.len(),
+                ),
+                Err(CudaError::Driver(_, UNSUPPORTED_PTX_VERSION))
+                    if self.driver_version >= 4000 =>
+                {
+                    let target = (
+                        (self.driver_version as u32 / 1000 - 4),
+                        (self.driver_version as u32 % 1000) / 10,
+                    );
+                    let downgraded =
+                        restamp_ptx(image, target).ok_or(CudaError::Unavailable("ptx image"))?;
+                    let module = Self::load_module(&self.api, &downgraded)?;
+                    (
+                        module,
+                        ptx_isa(&downgraded).unwrap_or(target),
+                        downgraded.len(),
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            let loaded_module = LoadedModule {
+                image,
+                module: module as usize,
+                ptx_isa: isa,
+                image_bytes: loaded,
+            };
+            self.modules.push(loaded_module);
+            Ok(loaded_module)
+        }
+
+        fn synchronize_pending(&mut self) -> Result<(), CudaError> {
+            if self.pending {
+                #[cfg(test)]
+                count_context_sync();
+                unsafe { check((self.api.ctx_sync)(), "cuCtxSynchronize")? };
+                self.pending = false;
+            }
+            Ok(())
+        }
+
+        fn composite_buffers(
+            &mut self,
+            uniforms: &Uniforms,
+            sizes: [usize; 6],
+        ) -> Result<[CuPtr; 6], CudaError> {
+            let shape = BufferShape {
+                width: uniforms.width,
+                height: uniforms.height,
+                stride: uniforms.stride,
+            };
+            let reusable = self
+                .composite_buffers
+                .as_ref()
+                .is_some_and(|(cached_shape, buffers)| {
+                    *cached_shape == shape
+                        && buffers
+                            .iter()
+                            .map(|(_, size)| *size)
+                            .eq(sizes.iter().copied())
+                });
+            if !reusable {
+                if let Some((_, old)) = self.composite_buffers.take() {
+                    for (ptr, _) in old {
+                        unsafe {
+                            let _ = (self.api.mem_free)(ptr);
+                        }
+                    }
+                }
+                let mut allocations = Buffers {
+                    api: &self.api,
+                    ptrs: Vec::new(),
+                    pending_launch: false,
+                };
+                for size in sizes {
+                    allocations.alloc(size)?;
+                }
+                self.composite_buffers = Some((
+                    shape,
+                    allocations.ptrs.drain(..).zip(sizes).collect(),
+                ));
+            }
+            Ok(std::array::from_fn(|index| {
+                self.composite_buffers
+                    .as_ref()
+                    .expect("composite buffer cache")
+                    .1[index]
+                    .0
+            }))
+        }
+    }
+
+    impl Drop for Domain {
+        fn drop(&mut self) {
+            let _ = self.synchronize_pending();
+            if let Some((_, buffers)) = self.composite_buffers.take() {
+                for (ptr, _) in buffers {
+                    unsafe {
+                        let _ = (self.api.mem_free)(ptr);
+                    }
+                }
+            }
+            unsafe {
+                let _ = (self.api.ctx_set_current)(self.ctx as CuContext);
+                for module in self.modules.drain(..) {
+                    let _ = (self.api.module_unload)(module.module as CuModule);
+                }
+                if self.ctx != 0 {
+                    let _ = (self.api.ctx_destroy)(self.ctx as CuContext);
+                }
+                #[cfg(test)]
+                count_context(-1);
+            }
+        }
     }
 
     struct Buffers<'a> {
         api: &'a Api,
         ptrs: Vec<CuPtr>,
+        pending_launch: bool,
     }
 
     impl Buffers<'_> {
         fn alloc(&mut self, bytes: usize) -> Result<CuPtr, CudaError> {
             let mut ptr: CuPtr = 0;
             unsafe { check((self.api.mem_alloc)(&mut ptr, bytes), "cuMemAlloc")? };
+            #[cfg(test)]
+            count_device_allocation();
             self.ptrs.push(ptr);
             Ok(ptr)
         }
@@ -389,6 +701,11 @@ mod driver {
 
     impl Drop for Buffers<'_> {
         fn drop(&mut self) {
+            if self.pending_launch {
+                unsafe {
+                    let _ = (self.api.ctx_sync)();
+                }
+            }
             for ptr in self.ptrs.drain(..) {
                 unsafe {
                     let _ = (self.api.mem_free)(ptr);
@@ -401,8 +718,8 @@ mod driver {
     /// that needs several buffers alive across two launches can hold them.
     #[allow(dead_code)] // consumed by `cuda_mesh`
     pub struct DeviceBuffer<'a> {
-        api: &'a Api,
         ptr: CuPtr,
+        owner: std::marker::PhantomData<&'a Nvidia>,
     }
 
     impl DeviceBuffer<'_> {
@@ -414,8 +731,15 @@ mod driver {
 
     impl Drop for DeviceBuffer<'_> {
         fn drop(&mut self) {
-            unsafe {
-                let _ = (self.api.mem_free)(self.ptr);
+            if let Ok(domain) = domain() {
+                let mut domain =
+                    domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if domain.bind().is_ok() {
+                    let _ = domain.synchronize_pending();
+                    unsafe {
+                        let _ = (domain.api.mem_free)(self.ptr);
+                    }
+                }
             }
         }
     }
@@ -425,8 +749,8 @@ mod driver {
     /// not pay `cuMemAlloc` per launch.
     #[allow(dead_code)] // consumed by the O1h session benchmark
     pub(crate) struct DeviceSet<'a> {
-        api: &'a Api,
         buffers: Vec<(CuPtr, usize)>,
+        owner: std::marker::PhantomData<&'a Nvidia>,
     }
 
     #[allow(dead_code)] // consumed by the O1h session benchmark
@@ -442,9 +766,16 @@ mod driver {
 
     impl Drop for DeviceSet<'_> {
         fn drop(&mut self) {
-            for (ptr, _) in self.buffers.drain(..) {
-                unsafe {
-                    let _ = (self.api.mem_free)(ptr);
+            if let Ok(domain) = domain() {
+                let mut domain =
+                    domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if domain.bind().is_ok() {
+                    let _ = domain.synchronize_pending();
+                    for (ptr, _) in self.buffers.drain(..) {
+                        unsafe {
+                            let _ = (domain.api.mem_free)(ptr);
+                        }
+                    }
                 }
             }
         }
@@ -499,87 +830,76 @@ mod driver {
     }
 
     impl Nvidia {
-        fn load_module(api: &Api, text: &str) -> Result<CuModule, CudaError> {
-            let mut image = text.as_bytes().to_vec();
-            image.push(0);
-            let mut module: CuModule = ptr::null_mut();
-            unsafe {
-                check(
-                    (api.module_load)(&mut module, image.as_ptr() as *const c_void, 0, ptr::null_mut(), ptr::null_mut()),
-                    "cuModuleLoadDataEx",
-                )?;
-            }
-            Ok(module)
-        }
-
-        /// Opens device 0 and JIT-loads the recovered PTX image into it.
+        /// Returns a handle to the process domain's cached P15 module.
         pub fn open() -> Result<Self, CudaError> {
             Self::open_image(PTX)
         }
 
-        /// The real opener, taking the image to load. `open` passes the bundled
-        /// PTX; tests pass junk to exercise the failure path.
-        pub(crate) fn open_image(image: &str) -> Result<Self, CudaError> {
-            let job = GPU_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let api = load()?;
-            let mut device: CuDevice = 0;
-            let mut ctx: CuContext = ptr::null_mut();
-            let mut version = 0;
-            unsafe {
-                check((api.init)(0), "cuInit")?;
-                check((api.driver_version)(&mut version), "cuDriverGetVersion")?;
-                check((api.device_get)(&mut device, 0), "cuDeviceGet")?;
-                check((api.ctx_create)(&mut ctx, 0, device), "cuCtxCreate")?;
-            }
-            #[cfg(test)]
-            count_context(1);
-            // The context exists now, so it is owned before the next fallible
-            // call: every `?` below drops this guard and destroys it.
-            let mut gpu = Self {
-                _job: job,
-                api,
-                ctx,
-                module: ptr::null_mut(),
-                name: String::new(),
-                compute_cap: (0, 0),
-                driver_version: version,
-                ptx_isa: (0, 0),
-                image_bytes: image.len(),
-            };
-            // Load the bundled image exactly as compiled. Only the driver saying
-            // "unsupported PTX version" licenses a compatibility retry, and the
-            // retry is a header rewrite of the same image, never a recompile.
-            let (module, isa, loaded) = match Self::load_module(&gpu.api, image) {
-                Ok(module) => (module, ptx_isa(image).ok_or(CudaError::Unavailable("ptx image"))?, image.len()),
-                Err(CudaError::Driver(_, UNSUPPORTED_PTX_VERSION)) if version >= 4000 => {
-                    let target = ((version as u32 / 1000 - 4), (version as u32 % 1000) / 10);
-                    let downgraded = restamp_ptx(image, target).ok_or(CudaError::Unavailable("ptx image"))?;
-                    let module = Self::load_module(&gpu.api, &downgraded)?;
-                    (module, ptx_isa(&downgraded).unwrap_or(target), downgraded.len())
-                }
-                Err(error) => return Err(error),
-            };
-            gpu.module = module;
-            gpu.ptx_isa = isa;
-            gpu.image_bytes = loaded;
-            let mut name_buf = [0 as c_char; 256];
-            let mut major = 0;
-            let mut minor = 0;
-            unsafe {
-                check((gpu.api.device_name)(name_buf.as_mut_ptr(), name_buf.len() as i32, device), "cuDeviceGetName")?;
-                check((gpu.api.device_attribute)(&mut major, ATTR_CC_MAJOR, device), "cuDeviceGetAttribute")?;
-                check((gpu.api.device_attribute)(&mut minor, ATTR_CC_MINOR, device), "cuDeviceGetAttribute")?;
-            }
-            gpu.name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }.to_string_lossy().into_owned();
-            gpu.compute_cap = (major, minor);
-            Ok(gpu)
+        /// Returns a handle after ensuring this PTX image is in the cached domain.
+        pub(crate) fn open_image(image: &'static str) -> Result<Self, CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(image)?;
+            Ok(Self {
+                image,
+                api: domain.api,
+                name: domain.name.clone(),
+                compute_cap: domain.compute_cap,
+                driver_version: domain.driver_version,
+                ptx_isa: module.ptx_isa,
+                image_bytes: module.image_bytes,
+                lut_cache: RefCell::new(Vec::new()),
+            })
+        }
+
+        /// Kept for the LUT session API. The operation lock is already
+        /// released between calls, so this only refreshes the current context.
+        pub(crate) fn resume(&mut self) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()
+        }
+
+        /// Kept for the LUT session API. All work is synchronous at this
+        /// boundary, and no lock is held after the operation returns.
+        pub(crate) fn suspend(&mut self) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()
         }
 
         /// Crate-private: load another recovered image through the same guarded
         /// opener and the same 222-only retry.
         #[allow(dead_code)] // consumed by `cuda_lut`, which lib.rs mounts separately
-        pub fn open_ptx(image: &str) -> Result<Self, CudaError> {
+        pub fn open_ptx(image: &'static str) -> Result<Self, CudaError> {
             Self::open_image(image)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn clear_composite_buffers(&self) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()?;
+            if let Some((_, buffers)) = domain.composite_buffers.take() {
+                for (ptr, _) in buffers {
+                    unsafe {
+                        check((domain.api.mem_free)(ptr), "cuMemFree")?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn with_domain<T>(
+            &self,
+            call: impl FnOnce(&mut Domain, CuModule) -> Result<T, CudaError>,
+        ) -> Result<T, CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            call(&mut domain, module)
         }
 
         /// Crate-private: run one loaded kernel over byte buffers, reusing the
@@ -597,6 +917,94 @@ mod driver {
             uniform_bytes: &[u8],
         ) -> Result<(Vec<u8>, Dispatch), CudaError> {
             self.run_u8_with_init(kernel, grid, inputs, uniform_bytes, None)
+        }
+
+        /// Run RGBA8 + mask + one LUT while retaining the LUT on device.
+        pub(crate) fn run_u8_cached_lut(
+            &self,
+            kernel: &'static str,
+            grid: (u32, u32),
+            source: &[u8],
+            mask: &[u8],
+            lut: &[u8],
+            uniform_bytes: &[u8],
+        ) -> Result<(Vec<u8>, Dispatch), CudaError> {
+            if source.is_empty()
+                || uniform_bytes.is_empty()
+                || uniform_bytes.len() % 4 != 0
+            {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("buffers")));
+            }
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let api = domain.api;
+            let mut buffers = Buffers {
+                api: &api,
+                ptrs: Vec::new(),
+                pending_launch: false,
+            };
+            let source_ptr = buffers.alloc(source.len())?;
+            let mask_ptr = buffers.alloc(mask.len())?;
+            let output_ptr = buffers.alloc(source.len())?;
+            self.upload(source_ptr, source)?;
+            self.upload(mask_ptr, mask)?;
+            let lut_ptr = self.cached_lut(&domain, lut)?;
+
+            let mut source_arg = source_ptr;
+            let mut mask_arg = mask_ptr;
+            let mut lut_arg = lut_ptr;
+            let mut output_arg = output_ptr;
+            let mut block = uniform_bytes.to_vec();
+            let mut params: [*mut c_void; 5] = [
+                &mut source_arg as *mut CuPtr as *mut c_void,
+                &mut mask_arg as *mut CuPtr as *mut c_void,
+                &mut lut_arg as *mut CuPtr as *mut c_void,
+                &mut output_arg as *mut CuPtr as *mut c_void,
+                block.as_mut_ptr() as *mut c_void,
+            ];
+            let dispatch = self.launch_on(&api, module, kernel, grid, BLOCK, &mut params)?;
+            buffers.pending_launch = true;
+            domain.pending = true;
+            domain.synchronize_pending()?;
+            buffers.pending_launch = false;
+            let mut output = vec![0u8; source.len()];
+            self.download(output_ptr, &mut output)?;
+            Ok((output, dispatch))
+        }
+
+        fn cached_lut(&self, domain: &Domain, data: &[u8]) -> Result<CuPtr, CudaError> {
+            let mut cache = self.lut_cache.borrow_mut();
+            if let Some(hit) = cache.iter().find(|entry| entry.bytes == data) {
+                return Ok(hit.ptr);
+            }
+            if cache.len() == LUT_CACHE_SLOTS {
+                let evicted = cache.remove(0);
+                unsafe {
+                    let _ = (domain.api.mem_free)(evicted.ptr);
+                }
+            }
+            let mut ptr: CuPtr = 0;
+            unsafe {
+                check(
+                    (domain.api.mem_alloc)(&mut ptr, data.len().max(1)),
+                    "cuMemAlloc",
+                )?;
+            }
+            #[cfg(test)]
+            count_device_allocation();
+            if let Err(error) = self.upload(ptr, data) {
+                unsafe {
+                    let _ = (domain.api.mem_free)(ptr);
+                }
+                return Err(error);
+            }
+            SKIN_LUT_UPLOADS.fetch_add(1, Ordering::Relaxed);
+            cache.push(CachedLut {
+                bytes: data.to_vec(),
+                ptr,
+            });
+            Ok(ptr)
         }
 
         /// Reuse `inputs[0]` as the output allocation. The kernel must read the
@@ -639,7 +1047,15 @@ mod driver {
             if output_bytes == 0 || uniform_bytes.is_empty() || uniform_bytes.len() % 4 != 0 {
                 return Err(CudaError::Refused(Refusal::ShapeMismatch("buffers")));
             }
-            let mut buffers = Buffers { api: &self.api, ptrs: Vec::new() };
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let api = domain.api;
+            let mut buffers = Buffers {
+                api: &api,
+                ptrs: Vec::new(),
+                pending_launch: false,
+            };
             let mut inputs_on_device: Vec<CuPtr> = Vec::with_capacity(inputs.len());
             for input in inputs {
                 inputs_on_device.push(buffers.alloc(input.len())?);
@@ -674,7 +1090,10 @@ mod driver {
             let mut block = uniform_bytes.to_vec();
             params.push(block.as_mut_ptr() as *mut c_void);
 
-            let dispatch = self.launch(kernel, grid, &mut params)?;
+            let dispatch = self.launch_on(&api, module, kernel, grid, BLOCK, &mut params)?;
+            buffers.pending_launch = true;
+            domain.pending = true;
+            domain.synchronize_pending()?;
             let mut bytes = vec![0u8; output_bytes];
             self.download(output, &mut bytes)?;
             Ok((bytes, dispatch))
@@ -693,20 +1112,10 @@ mod driver {
             }
         }
 
-        fn launch(
+        fn launch_on(
             &self,
-            kernel: &'static str,
-            geometry: (u32, u32),
-            params: &mut [*mut c_void],
-        ) -> Result<Dispatch, CudaError> {
-            self.launch_raw(kernel, geometry, BLOCK, params)
-        }
-
-        /// Crate-private: the same launch path with an explicit block shape, for
-        /// kernels whose geometry is not the P15 16x16 tiling.
-        #[allow(dead_code)] // consumed by `cuda_mesh`
-        pub fn launch_raw(
-            &self,
+            api: &Api,
+            module: CuModule,
             kernel: &'static str,
             geometry: (u32, u32),
             block: (u32, u32),
@@ -715,9 +1124,12 @@ mod driver {
             let symbol = CString::new(kernel).expect("static kernel name");
             let mut function: CuFunction = ptr::null_mut();
             unsafe {
-                check((self.api.module_function)(&mut function, self.module, symbol.as_ptr()), "cuModuleGetFunction")?;
                 check(
-                    (self.api.launch)(
+                    (api.module_function)(&mut function, module, symbol.as_ptr()),
+                    "cuModuleGetFunction",
+                )?;
+                check(
+                    (api.launch)(
                         function,
                         geometry.0,
                         geometry.1,
@@ -732,9 +1144,25 @@ mod driver {
                     ),
                     "cuLaunchKernel",
                 )?;
-                check((self.api.ctx_sync)(), "cuCtxSynchronize")?;
             }
             Ok(self.dispatch(kernel, geometry, block))
+        }
+
+        /// Crate-private: the same launch path with an explicit block shape, for
+        /// kernels whose geometry is not the P15 16x16 tiling.
+        #[allow(dead_code)] // consumed by `cuda_mesh`
+        pub fn launch_raw(
+            &self,
+            kernel: &'static str,
+            geometry: (u32, u32),
+            block: (u32, u32),
+            params: &mut [*mut c_void],
+        ) -> Result<Dispatch, CudaError> {
+            self.with_domain(|domain, module| {
+                let dispatch = self.launch_on(&domain.api, module, kernel, geometry, block, params)?;
+                domain.pending = true;
+                Ok(dispatch)
+            })
         }
 
         fn upload(&self, ptr: CuPtr, data: &[u8]) -> Result<(), CudaError> {
@@ -754,50 +1182,119 @@ mod driver {
         /// Crate-private: allocate a buffer that lives across several launches.
         #[allow(dead_code)] // consumed by `cuda_mesh`
         pub fn alloc_buffer(&self, bytes: usize) -> Result<DeviceBuffer<'_>, CudaError> {
-            let mut ptr: CuPtr = 0;
-            unsafe {
-                check((self.api.mem_alloc)(&mut ptr, bytes), "cuMemAlloc")?;
-            }
-            Ok(DeviceBuffer { api: &self.api, ptr })
+            self.with_domain(|domain, _| {
+                let mut ptr: CuPtr = 0;
+                unsafe {
+                    check((domain.api.mem_alloc)(&mut ptr, bytes), "cuMemAlloc")?;
+                }
+                #[cfg(test)]
+                count_device_allocation();
+                Ok(DeviceBuffer {
+                    ptr,
+                    owner: std::marker::PhantomData,
+                })
+            })
         }
 
         #[allow(dead_code)] // consumed by `cuda_mesh`
         pub fn upload_buffer(&self, buffer: &DeviceBuffer<'_>, data: &[u8]) -> Result<(), CudaError> {
-            self.upload(buffer.ptr, data)
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()?;
+            unsafe {
+                check(
+                    (domain.api.copy_in)(
+                        buffer.ptr,
+                        data.as_ptr() as *const c_void,
+                        data.len(),
+                    ),
+                    "cuMemcpyHtoD",
+                )
+            }
         }
 
         #[allow(dead_code)] // consumed by `cuda_mesh`
         pub fn download_buffer(&self, buffer: &DeviceBuffer<'_>, data: &mut [u8]) -> Result<(), CudaError> {
-            self.download(buffer.ptr, data)
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()?;
+            unsafe {
+                check(
+                    (domain.api.copy_out)(
+                        data.as_mut_ptr() as *mut c_void,
+                        buffer.ptr,
+                        data.len(),
+                    ),
+                    "cuMemcpyDtoH",
+                )
+            }
         }
 
         /// Crate-private: allocate a group of buffers that can be reused for
         /// every launch of the same job shape.
         #[allow(dead_code)] // consumed by the O1h session benchmark
         pub(crate) fn alloc_set(&self, sizes: &[usize]) -> Result<DeviceSet<'_>, CudaError> {
-            let mut buffers = Vec::with_capacity(sizes.len());
-            for size in sizes {
-                let mut ptr: CuPtr = 0;
-                unsafe {
-                    check((self.api.mem_alloc)(&mut ptr, (*size).max(1)), "cuMemAlloc")?;
+            self.with_domain(|domain, _| {
+                let mut buffers = Vec::with_capacity(sizes.len());
+                for size in sizes {
+                    let mut ptr: CuPtr = 0;
+                    unsafe {
+                        check(
+                            (domain.api.mem_alloc)(&mut ptr, (*size).max(1)),
+                            "cuMemAlloc",
+                        )?;
+                    }
+                    #[cfg(test)]
+                    count_device_allocation();
+                    buffers.push((ptr, *size));
                 }
-                buffers.push((ptr, *size));
-            }
-            Ok(DeviceSet { api: &self.api, buffers })
+                Ok(DeviceSet {
+                    buffers,
+                    owner: std::marker::PhantomData,
+                })
+            })
         }
 
         #[allow(dead_code)] // consumed by the O1h session benchmark
         pub(crate) fn set_upload(&self, set: &DeviceSet<'_>, index: usize, data: &[u8]) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()?;
             match set.buffers.get(index) {
-                Some((ptr, size)) if data.len() <= *size => self.upload(*ptr, data),
+                Some((ptr, size)) if data.len() <= *size => unsafe {
+                    check(
+                        (domain.api.copy_in)(
+                            *ptr,
+                            data.as_ptr() as *const c_void,
+                            data.len(),
+                        ),
+                        "cuMemcpyHtoD",
+                    )
+                },
                 _ => Err(CudaError::Refused(Refusal::ShapeMismatch("buffer"))),
             }
         }
 
         #[allow(dead_code)] // consumed by the O1h session benchmark
         pub(crate) fn set_download(&self, set: &DeviceSet<'_>, index: usize, data: &mut [u8]) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()?;
             match set.buffers.get(index) {
-                Some((ptr, size)) if data.len() <= *size => self.download(*ptr, data),
+                Some((ptr, size)) if data.len() <= *size => unsafe {
+                    check(
+                        (domain.api.copy_out)(
+                            data.as_mut_ptr() as *mut c_void,
+                            *ptr,
+                            data.len(),
+                        ),
+                        "cuMemcpyDtoH",
+                    )
+                },
                 _ => Err(CudaError::Refused(Refusal::ShapeMismatch("buffer"))),
             }
         }
@@ -838,13 +1335,20 @@ mod driver {
             check_masks(mask, skin_mask, uniforms)?;
             let bytes = len * 4;
             let skin_bytes = skin_mask.len() * 4;
-            let mut buffers = Buffers { api: &self.api, ptrs: Vec::new() };
-            let device_source = buffers.alloc(bytes)?;
-            let device_mask = buffers.alloc(bytes)?;
-            let device_skin = buffers.alloc(skin_bytes)?;
-            let device_base = buffers.alloc(bytes)?;
-            let device_residual = buffers.alloc(bytes)?;
-            let device_output = buffers.alloc(bytes)?;
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let [
+                device_source,
+                device_mask,
+                device_skin,
+                device_base,
+                device_residual,
+                device_output,
+            ] = domain.composite_buffers(
+                uniforms,
+                [bytes, bytes, skin_bytes, bytes, bytes, bytes],
+            )?;
             self.upload(device_source, as_bytes(source))?;
             self.upload(device_mask, as_bytes(mask))?;
             self.upload(device_skin, as_bytes(skin_mask))?;
@@ -867,9 +1371,22 @@ mod driver {
                 &mut output_arg as *mut CuPtr as *mut c_void,
                 &mut uniforms_arg as *mut Uniforms as *mut c_void,
             ];
-            let dispatch = self.launch(super::COMPOSITE, grid(uniforms.width, uniforms.height), &mut params)?;
+            let dispatch = self.launch_on(
+                &domain.api,
+                module,
+                super::COMPOSITE,
+                grid(uniforms.width, uniforms.height),
+                BLOCK,
+                &mut params,
+            )?;
+            domain.pending = true;
             let mut output = vec![0f32; len];
-            self.download(device_output, as_bytes_mut(&mut output))?;
+            // DtoH copies to pageable host memory wait for prior launches.
+            let downloaded = self.download(device_output, as_bytes_mut(&mut output));
+            if downloaded.is_ok() {
+                domain.pending = false;
+            }
+            downloaded?;
             Ok((output, dispatch))
         }
 
@@ -887,7 +1404,15 @@ mod driver {
             }
             check_pixels(source, uniforms)?;
             let bytes = len * 4;
-            let mut buffers = Buffers { api: &self.api, ptrs: Vec::new() };
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let api = domain.api;
+            let mut buffers = Buffers {
+                api: &api,
+                ptrs: Vec::new(),
+                pending_launch: false,
+            };
             let device_source = buffers.alloc(bytes)?;
             let device_output = buffers.alloc(bytes)?;
             self.upload(device_source, as_bytes(source))?;
@@ -899,7 +1424,17 @@ mod driver {
                 &mut output_arg as *mut CuPtr as *mut c_void,
                 &mut uniforms_arg as *mut Uniforms as *mut c_void,
             ];
-            let dispatch = self.launch(pass.kernel(), grid(uniforms.width, uniforms.height), &mut params)?;
+            let dispatch = self.launch_on(
+                &api,
+                module,
+                pass.kernel(),
+                grid(uniforms.width, uniforms.height),
+                BLOCK,
+                &mut params,
+            )?;
+            buffers.pending_launch = true;
+            domain.pending = true;
+            domain.synchronize_pending()?;
             let mut output = vec![0f32; len];
             self.download(device_output, as_bytes_mut(&mut output))?;
             Ok((output, dispatch))
@@ -956,6 +1491,22 @@ mod driver {
         }
     }
 
+    impl Drop for Nvidia {
+        fn drop(&mut self) {
+            let Ok(domain) = domain() else { return };
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if domain.bind().is_err() {
+                return;
+            }
+            let _ = domain.synchronize_pending();
+            for lut in self.lut_cache.get_mut().drain(..) {
+                unsafe {
+                    let _ = (domain.api.mem_free)(lut.ptr);
+                }
+            }
+        }
+    }
+
     fn as_bytes(values: &[f32]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
     }
@@ -964,18 +1515,10 @@ mod driver {
         unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, values.len() * 4) }
     }
 
-    impl Drop for Nvidia {
-        fn drop(&mut self) {
-            unsafe {
-                if !self.module.is_null() {
-                    let _ = (self.api.module_unload)(self.module);
-                }
-                if !self.ctx.is_null() {
-                    let _ = (self.api.ctx_destroy)(self.ctx);
-                }
-                #[cfg(test)]
-                count_context(-isize::from(!self.ctx.is_null()));
-            }
+    pub(super) fn metrics() -> DriverMetrics {
+        DriverMetrics {
+            ptx_module_load_calls: PTX_MODULE_LOADS.load(Ordering::Relaxed),
+            skin_lut_uploads: SKIN_LUT_UPLOADS.load(Ordering::Relaxed),
         }
     }
 }
@@ -1215,12 +1758,112 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn smooth_case(
+        width: u32,
+        height: u32,
+        constant: bool,
+    ) -> (Image, Image, Image, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let pixels = (width * height) as usize;
+        if constant {
+            (
+                Image::solid(width, height, [127, 63, 191, 255]),
+                Image::solid(width, height, [91, 113, 137, 255]),
+                Image::solid(width, height, [19, 29, 43, 255]),
+                vec![128; pixels],
+                vec![64; pixels],
+                vec![200; pixels],
+            )
+        } else {
+            (
+                Image::new(width, height, noise(pixels * 4, 7)).unwrap(),
+                Image::new(width, height, noise(pixels * 4, 11)).unwrap(),
+                Image::new(width, height, noise(pixels * 4, 13)).unwrap(),
+                noise(pixels, 17),
+                noise(pixels, 19),
+                noise(pixels, 23),
+            )
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn failed_kernel_load_releases_its_context() {
+    fn reused_shape_buffers_are_byte_identical_for_constant_and_random_fields() {
+        let Some(nvidia) = gpu() else { return };
+        nvidia.clear_composite_buffers().expect("clear composite cache");
+        let cases = [
+            ("constant_64", 64, 64, true, 6usize),
+            ("random_64_same_shape", 64, 64, false, 0usize),
+            ("random_37x19_shape_change", 37, 19, false, 6usize),
+            ("random_64_return_shape", 64, 64, false, 6usize),
+        ];
+        for (label, width, height, constant, cold_allocations) in cases {
+            let (source, base, residual, mask_r, mask_b, skin) =
+                smooth_case(width, height, constant);
+            let expected = cpu::apply(
+                &source,
+                &base,
+                &residual,
+                &mask_r,
+                &mask_b,
+                &skin,
+                samples(),
+            )
+            .unwrap();
+
+            let before = super::driver::device_allocations();
+            let (first, dispatch) = nvidia
+                .facial_smooth(
+                    &source,
+                    &base,
+                    &residual,
+                    &mask_r,
+                    &mask_b,
+                    &skin,
+                    90024,
+                    0.5,
+                    &samples(),
+                )
+                .expect("real GPU dispatch");
+            let cold = super::driver::device_allocations() - before;
+
+            let before = super::driver::device_allocations();
+            let (second, _) = nvidia
+                .facial_smooth(
+                    &source,
+                    &base,
+                    &residual,
+                    &mask_r,
+                    &mask_b,
+                    &skin,
+                    90024,
+                    0.5,
+                    &samples(),
+                )
+                .expect("warm GPU dispatch");
+            let warm = super::driver::device_allocations() - before;
+
+            assert_eq!(cold, cold_allocations, "{label}: cold allocations");
+            assert_eq!(warm, 0, "{label}: warm allocations");
+            assert_eq!(dispatch.kernel, COMPOSITE);
+            assert_eq!(first.pixels, expected.pixels, "{label}: CPU byte mismatch");
+            assert_eq!(second.pixels, expected.pixels, "{label}: warm CPU byte mismatch");
+            assert_eq!(first.pixels, second.pixels, "{label}: reuse changed output");
+            eprintln!(
+                "{label} {}x{} cold_alloc={cold} warm_alloc={warm} bytes={} exact",
+                width,
+                height,
+                first.pixels.len()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_kernel_load_reuses_the_shared_context() {
         {
             let Some(_probe) = gpu() else { return };
         }
-        assert_eq!(super::driver::live_contexts(), 0, "a dropped Nvidia owns no context");
+        assert_eq!(super::driver::live_contexts(), 1, "one shared context");
         for _ in 0..8 {
             let error = match Nvidia::open_image("not a ptx image") {
                 Err(error) => error,
@@ -1232,14 +1875,36 @@ mod tests {
             );
             assert_eq!(
                 super::driver::live_contexts(),
-                0,
-                "a failed open leaked its context"
+                1,
+                "a failed module load must not rebuild the context"
             );
         }
-        let gpu = Nvidia::open_image(PTX).expect("bundled image still loads");
+        let _gpu = Nvidia::open_image(PTX).expect("bundled image still loads");
         assert_eq!(super::driver::live_contexts(), 1);
-        drop(gpu);
-        assert_eq!(super::driver::live_contexts(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portrait_stage_handles_share_one_context_without_holding_the_lock() {
+        const SECOND_STAGE_PTX: &str = include_str!("../native/cuda/skin_lut.ptx");
+
+        let Some(first) = gpu() else { return };
+        let second = Nvidia::open_ptx(SECOND_STAGE_PTX).expect("second stage handle");
+        let third = Nvidia::open_ptx(PTX).expect("third stage handle");
+        assert_eq!(super::driver::live_contexts(), 1, "all handles share one context");
+
+        let uniforms = block(16, 16);
+        let source = vec![0.5; uniforms.buffer_f32()];
+        first
+            .run_pass(Pass::BoxBlur, &source, &uniforms)
+            .expect("a retained handle still dispatches");
+
+        drop((first, second, third));
+        assert_eq!(
+            super::driver::live_contexts(),
+            1,
+            "the process registry keeps the shared context alive"
+        );
     }
 
     #[cfg(windows)]

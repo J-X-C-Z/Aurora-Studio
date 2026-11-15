@@ -13,16 +13,21 @@
  * channel 0 reads field.rg, channel 1 reads field.ba.
  * catmull 0 uses the 3-arg texture tap, 1 uses the 9-tap Catmull-Rom sample
  * with `catmull_w`/`catmull_h` as the shader's u_Width/u_Height.
+ *
+ * mode 0 keeps that recovered path. mode 1 reads the field at the current
+ * pixel and treats `.xy` as source-pixel offsets; zero `.w` copies the source
+ * pixel. In mode 1, channel selects the raw-byte quantizer (0 half-up,
+ * 1 ties-to-even) and catmull selects alpha (0 sampled, 1 destination).
  */
 typedef struct UvmapUniforms {
   uint32_t width;
   uint32_t height;
   uint32_t stride;   /* bytes per source row, >= width * 4 */
-  uint32_t channel;  /* 0 = RG, 1 = BA */
-  uint32_t catmull;  /* 0 = bilinear, 1 = Catmull-Rom */
+  uint32_t channel;  /* mode 0: RG/BA; mode 1: half-up/ties-to-even */
+  uint32_t catmull;  /* mode 0: tap; mode 1: sampled/destination alpha */
   float catmull_w;
   float catmull_h;
-  uint32_t reserved0;
+  uint32_t mode;     /* 0 = PF407 UV map, 1 = direct-pixel raw-byte */
 } UvmapUniforms;
 
 #ifdef __cplusplus

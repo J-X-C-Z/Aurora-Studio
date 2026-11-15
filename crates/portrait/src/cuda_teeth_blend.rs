@@ -5,6 +5,9 @@
 //! alpha always copied from the original. The uniform block is passed by value.
 
 use crate::cuda::{CudaError, Dispatch};
+use crate::kernels::teeth_blend::{
+    validate_alignment_final_blend, AlignmentFinalBlendJob,
+};
 use crate::{Image, Refusal};
 
 /// Recovered kernel entry point.
@@ -52,6 +55,16 @@ pub struct TeethBlend {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlignmentFinalBlendGpu {
+    Gated,
+    Applied {
+        image: Image,
+        dispatches: Vec<Dispatch>,
+    },
+}
+
+#[cfg(windows)]
 impl TeethBlend {
     pub fn open() -> Result<Self, CudaError> {
         Ok(Self { gpu: crate::cuda::Nvidia::open_ptx(PTX)? })
@@ -88,6 +101,19 @@ impl TeethBlend {
         let image = Image::new(original.width, original.height, pixels)
             .ok_or(CudaError::Refused(Refusal::ShapeMismatch("teeth blend output")))?;
         Ok((image, vec![dispatch]))
+    }
+
+    /// PF30026 alignment final blend with the worker's A/B edge gate.
+    pub fn apply_alignment_final_blend(
+        &self,
+        job: AlignmentFinalBlendJob<'_>,
+    ) -> Result<AlignmentFinalBlendGpu, CudaError> {
+        let job = validate_alignment_final_blend(job).map_err(CudaError::Refused)?;
+        if !job.gate_open {
+            return Ok(AlignmentFinalBlendGpu::Gated);
+        }
+        let (image, dispatches) = self.apply(job.original, job.effect_rgb, job.teeth_mask)?;
+        Ok(AlignmentFinalBlendGpu::Applied { image, dispatches })
     }
 }
 
