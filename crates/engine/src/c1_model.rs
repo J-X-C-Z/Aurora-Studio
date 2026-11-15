@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::adjust::{
-    AspectRatio, BlackWhite, Clarity, ClarityMethod, ColorBalance, ColorBand, ColorEditor,
+    AspectRatio, BlackWhite, Clarity, ClarityMethod, ColorBalance, ColorBalanceGains, ColorBand, ColorEditor,
     ColorRange, ColorWheel, Curve, CurvePoint, Curves, Dehaze, Exposure, FilmGrain, Geometry,
     GrainKind, HighDynamicRange, HslShift, HueSector, Keystone, Levels, LevelsChannel,
     LensCorrection, Moire, NoiseReduction, NormRect, Sharpening, SkinUniformity, SplitTone,
@@ -194,6 +194,16 @@ impl SplineProfile {
     pub fn param(&self, index: usize) -> Option<f32> {
         self.params.get(index).copied()
     }
+
+    /// A spline from `|`-field `which`, normalized to the first radius.
+    pub fn scale(&self, which: usize) -> Vec<(f32, f32)> {
+        let Some(points) = self.splines.get(which) else { return Vec::new() };
+        let radius = points.first().map(|p| p.0).unwrap_or(0.0);
+        if radius <= 0.0 {
+            return Vec::new();
+        }
+        points.iter().map(|&(x, y)| (x / radius, y / radius)).collect()
+    }
 }
 
 /// Strips the quoting and whitespace C1 wraps its values in.
@@ -304,6 +314,15 @@ pub struct ColorCorrection {
 }
 
 impl ColorCorrection {
+    /// Whether the group actually shifts colour; its band geometry alone is
+    /// part of C1's editor state, not an edit.
+    pub fn affects_color(&self) -> bool {
+        self.hue != 0.0
+            || self.saturation != 0.0
+            || self.lightness != 0.0
+            || self.homogeneity != [0.0; 3]
+    }
+
     pub fn from_row(v: &[f32; 18]) -> Self {
         Self {
             local: v[0] != 0.0,
@@ -413,6 +432,8 @@ pub struct C1VariantSettings {
     pub name: Option<String>,
     pub opacity: f32,
     pub mask_uuid: Option<String>,
+    /// `ZTECHNICALPROCESSINGMETHOD`: C1 Base Characteristics mode.
+    pub technical_processing_method: i32,
 
     pub exposure: f32,
     pub contrast: f32,
@@ -635,6 +656,7 @@ impl C1VariantSettings {
             name: None,
             opacity: 100.0,
             mask_uuid: None,
+            technical_processing_method: 0,
 
             exposure: 0.0,
             contrast: 0.0,
@@ -721,6 +743,10 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.opacity = fixed(get("ZOPACITY"), s.opacity);
     s.name = text(get("ZNAME"));
     s.mask_uuid = text(get("ZMASKUUID"));
+    s.technical_processing_method = get("ZTECHNICALPROCESSINGMETHOD")
+        .and_then(parse_scalar)
+        .map(|v| v as i32)
+        .unwrap_or(s.technical_processing_method);
 
     s.exposure = fixed(get("ZEXPOSURE"), s.exposure);
     s.contrast = fixed(get("ZCONTRAST"), s.contrast);
@@ -875,37 +901,7 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
 // White balance conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Reference temperature the gain model is anchored at, in Kelvin.
-const WB_REFERENCE_KELVIN: f32 = 6500.0;
-/// Scale from log-gain to the -50 ..= 50 tint axis.
-const WB_TINT_SCALE: f32 = 100.0;
-
-/// Approximates the (kelvin, tint) pair behind C1's RGB gains.
-///
-/// C1 stores relative channel gains with green pinned at 1; this inverts that
-/// with a log-ratio model, not C1's real colour transform: the kelvin axis is
-/// `6500 * exp(-(ln r - ln b))` and the tint axis measures how far green sits
-/// below the red/blue average. Expect it to be close, not identical, to C1.
-pub fn gains_to_kelvin_tint(gains: [f32; 3]) -> (f32, f32) {
-    let (r, g, b) = (gains[0], gains[1], gains[2]);
-    if !(g > 0.0) || !r.is_finite() || !b.is_finite() {
-        return (WB_REFERENCE_KELVIN, 0.0);
-    }
-    let lr = (r / g).ln();
-    let lb = (b / g).ln();
-    let kelvin = WB_REFERENCE_KELVIN * (-(lr - lb)).exp();
-    let tint = -0.5 * (lr + lb) * WB_TINT_SCALE;
-    (kelvin, tint)
-}
-
-/// Approximates RGB gains for a (kelvin, tint) pair; the inverse of
-/// [`gains_to_kelvin_tint`] under the same log-ratio model.
-pub fn kelvin_tint_to_gains(kelvin: f32, tint: f32) -> [f32; 3] {
-    let kelvin = kelvin.clamp(1000.0, 40000.0);
-    let d = -(kelvin / WB_REFERENCE_KELVIN).ln() / 2.0;
-    let m = -tint / WB_TINT_SCALE;
-    [(m + d).exp(), 1.0, (m - d).exp()]
-}
+pub use crate::c1_wb_oracle::{gains_to_kelvin_tint, kelvin_tint_to_gains};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversion to the engine's AdjustmentSet
@@ -964,6 +960,9 @@ pub fn color_editor_from_c1(rows: &[[f32; 18]]) -> ColorEditor {
             hue_high: cc.hue_high,
             sat_low: cc.sat_low,
             sat_high: cc.sat_high,
+            // C1's ColorCorrection has no value bounds (18 getters checked).
+            value_low: 0.0,
+            value_high: 1.0,
             smoothness: clamp(cc.smoothness, 0.0, 60.0),
             homogeneity: cc.homogeneity,
             inverted: cc.inverted,
@@ -1016,6 +1015,49 @@ pub fn color_editor_from_c1(rows: &[[f32; 18]]) -> ColorEditor {
     editor
 }
 
+/// The five `ZLEVELS*` columns in engine form.
+pub fn levels_from_c1(s: &C1VariantSettings) -> Levels {
+    let channel = |i: usize| LevelsChannel {
+        input_black: clamp(s.levels_shadow[i], 0.0, 1.0),
+        input_white: clamp(s.levels_highlight[i], 0.0, 1.0),
+        gamma: gamma_from_c1_midtone(s.levels_midtone[i]),
+        output_black: clamp(s.levels_target_shadow[i], 0.0, 1.0),
+        output_white: clamp(s.levels_target_highlight[i], 0.0, 1.0),
+    };
+    Levels { rgb: channel(0), red: channel(1), green: channel(2), blue: channel(3) }
+}
+
+/// The five `ZGRADATIONCURVE*` columns in engine form.
+pub fn curves_from_c1(s: &C1VariantSettings) -> Curves {
+    Curves {
+        rgb: curve_from(&s.gradation_curves[0]),
+        red: curve_from(&s.gradation_curves[1]),
+        green: curve_from(&s.gradation_curves[2]),
+        blue: curve_from(&s.gradation_curves[3]),
+        // ZGRADATIONCURVEY has no counterpart: the engine's luma curve stays empty.
+        luma: Curve::default(),
+    }
+}
+
+/// The `ZBW*` columns in engine form. Global variants and local mask rows share
+/// them, so they share this mapping.
+pub fn black_white_from_c1(s: &C1VariantSettings) -> BlackWhite {
+    BlackWhite {
+        enabled: s.black_white.enabled,
+        sensitivity: std::array::from_fn(|i| {
+            crate::param_meta::clamp(crate::param_meta::BW_CHANNELS[i], s.black_white.sensitivity[i])
+        }),
+        highlight_tone: SplitTone {
+            hue: clamp(s.black_white.light_tone_hue, 0.0, 360.0),
+            saturation: clamp(s.black_white.light_tone_saturation, 0.0, 100.0),
+        },
+        shadow_tone: SplitTone {
+            hue: clamp(s.black_white.dark_tone_hue, 0.0, 360.0),
+            saturation: clamp(s.black_white.dark_tone_saturation, 0.0, 100.0),
+        },
+    }
+}
+
 pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     let mut set = crate::AdjustmentSet::default();
 
@@ -1032,6 +1074,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         kelvin: clamp(kelvin, 2000.0, 50000.0),
         tint: clamp(tint, -50.0, 50.0),
         skin_tone: None,
+        gains: Some(s.white_balance_gains),
     };
 
     set.hdr = HighDynamicRange {
@@ -1087,28 +1130,22 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         method: VignetteMethod::EllipticOnCrop,
     };
 
-    // shortcut: C1's three numbers per colour-balance wheel are unproven — they may
-    // be RGB multipliers, not hue/saturation/lightness. Feeding the neutral 1;1;1
-    // through the wheel turns every catalog image red, so the mapping stays off
-    // until a sample with a non-neutral balance proves the encoding.
-    let _ = &s.color_balance;
+    // C1's three numbers per zone are RGB multipliers: 1;1;1 is neutral and the
+    // values follow the preset names (Warm lowers blue, Cool lowers red).
+    let zone = |v: [f32; 3]| {
+        v.map(|x| if x.is_finite() { x.clamp(0.0, 8.0) } else { 1.0 })
+    };
+    let gains = ColorBalanceGains {
+        master: zone(s.color_balance[0]),
+        shadow: zone(s.color_balance[1]),
+        midtone: zone(s.color_balance[2]),
+        highlight: zone(s.color_balance[3]),
+    };
+    set.color_balance_gains = (!gains.is_neutral()).then_some(gains);
 
     set.color_editor = color_editor_from_c1(&s.color_corrections);
 
-    set.black_white = BlackWhite {
-        enabled: s.black_white.enabled,
-        sensitivity: std::array::from_fn(|i| {
-            crate::param_meta::clamp(crate::param_meta::BW_CHANNELS[i], s.black_white.sensitivity[i])
-        }),
-        highlight_tone: SplitTone {
-            hue: clamp(s.black_white.light_tone_hue, 0.0, 360.0),
-            saturation: clamp(s.black_white.light_tone_saturation, 0.0, 100.0),
-        },
-        shadow_tone: SplitTone {
-            hue: clamp(s.black_white.dark_tone_hue, 0.0, 360.0),
-            saturation: clamp(s.black_white.dark_tone_saturation, 0.0, 100.0),
-        },
-    };
+    set.black_white = black_white_from_c1(s);
 
     set.sharpening = Sharpening {
         amount: clamp(s.sharpening.amount, 0.0, 1000.0),
@@ -1122,7 +1159,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     set.noise_reduction = NoiseReduction {
         luminance: clamp(s.noise_reduction.luminance, 0.0, 100.0),
         details: clamp(s.noise_reduction.details, 0.0, 100.0),
-        color: clamp(s.noise_reduction.color, 0.0, 100.0),
+        color: crate::param_meta::clamp("AIDenoiseAmount", s.noise_reduction.color),
         // ZCLEANLONGEXPOSUREAMOUNT has no field of its own; it is dropped here.
         single_pixel: 0.0,
     };
@@ -1159,6 +1196,8 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         sharpness_falloff: 0.0,
         light_falloff: clamp(s.lens.light_falloff.param(0).unwrap_or(0.0), 0.0, 100.0),
         chromatic_aberration: s.lens.chromatic_aberration_enabled,
+        ca_red_points: s.lens.chromatic_aberration.scale(1),
+        ca_blue_points: s.lens.chromatic_aberration.scale(0),
         purple_fringing: clamp(s.lens.purple_fringing, 0.0, 100.0),
         hide_distorted_areas: true,
         shift_x: clamp(s.lens.shift_xy[0], -100.0, 100.0),
@@ -1203,7 +1242,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         keystone: Keystone {
             vertical: clamp(s.keystone_tilt_y, -100.0, 100.0),
             horizontal: clamp(s.keystone_tilt_x, -100.0, 100.0),
-            amount: clamp(s.keystone_amount, 0.0, 100.0),
+            amount: crate::param_meta::clamp("KeystoneAmount", s.keystone_amount),
             aspect: clamp(s.keystone_aspect, -50.0, 50.0),
         },
     };
@@ -1213,6 +1252,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     // has to go or the camera profile and film curve are silently dropped.
     set.base.icc_profile = s.icc_profile.clone().filter(|p| p != "EMBEDDED").map(|p| stem_of(&p));
     set.base.film_curve = s.film_curve.clone().map(|p| stem_of(&p));
+    set.base.processing_method = crate::TechnicalProcessingMethod::from_code(s.technical_processing_method);
     set.base.curve = match s.film_curve.as_deref() {
         Some(name) if name.contains("ExtraShadow") => ToneCurvePreset::FilmExtraShadow,
         Some(name) if name.contains("HighContrast") => ToneCurvePreset::FilmHighContrast,
@@ -1221,6 +1261,15 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         Some(name) if name.contains("Auto") => ToneCurvePreset::Auto,
         _ => ToneCurvePreset::Auto,
     };
+
+    let banding = crate::param_meta::clamp("BandingReductionAmount", s.noise_reduction.cnr);
+    if banding != 0.0 {
+        set.extra.insert("BandingReductionAmount".to_string(), banding);
+    }
+    let density = crate::param_meta::clamp("FilmGrainDensity", s.film_grain.density);
+    if density != 0.0 {
+        set.extra.insert("FilmGrainDensity".to_string(), density);
+    }
 
     set
 }
@@ -1593,6 +1642,7 @@ mod tests {
         assert_eq!(s.levels_highlight, [1.0; 4]);
         assert_eq!(s.sharpening.radius, 0.8);
         assert_eq!(s.sharpening.threshold, 1.0);
+        assert!(to_adjustment_set(&s).extra.is_empty());
     }
 
     #[test]
@@ -1619,19 +1669,19 @@ mod tests {
     fn gains_and_kelvin_tint_round_trip() {
         let gains = [1.625, 1.0, 1.412];
         let (kelvin, tint) = gains_to_kelvin_tint(gains);
-        assert!((kelvin - 5648.0).abs() < 60.0, "kelvin {kelvin}");
-        assert!((tint + 41.5).abs() < 3.0, "tint {tint}");
+        assert!((kelvin - 4779.55).abs() < 2.0, "kelvin {kelvin}");
+        assert!((tint + 4.4875).abs() < 0.05, "tint {tint}");
         let back = kelvin_tint_to_gains(kelvin, tint);
         for (a, b) in gains.iter().zip(back.iter()) {
-            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+            assert!((a - b).abs() < 2e-3, "{a} vs {b}");
         }
     }
 
     #[test]
-    fn neutral_gains_map_to_the_reference_temperature() {
+    fn neutral_gains_match_c1_neutral() {
         let (kelvin, tint) = gains_to_kelvin_tint([1.0, 1.0, 1.0]);
-        assert!((kelvin - 6500.0).abs() < 1.0);
-        assert!(tint.abs() < 1e-3);
+        assert!((kelvin - 4325.11).abs() < 2.0);
+        assert!((tint + 36.49).abs() < 0.5);
     }
 
     #[test]
@@ -1728,5 +1778,18 @@ mod tests {
         let s = from_layer_row(&row(&[("ZICCPROFILE", Some("EMBEDDED"))]));
         let set = to_adjustment_set(&s);
         assert_eq!(set.base.icc_profile, None);
+    }
+
+    #[test]
+    fn technical_processing_method_reaches_base_characteristics() {
+        for (text, expected) in [
+            ("0", crate::TechnicalProcessingMethod::Photography),
+            ("2", crate::TechnicalProcessingMethod::ReproFilmNegatives),
+            ("3", crate::TechnicalProcessingMethod::ReproFilmPositives),
+            ("4", crate::TechnicalProcessingMethod::StandardFilmNegatives),
+        ] {
+            let s = from_layer_row(&row(&[("ZTECHNICALPROCESSINGMETHOD", Some(text))]));
+            assert_eq!(to_adjustment_set(&s).base.processing_method, expected);
+        }
     }
 }

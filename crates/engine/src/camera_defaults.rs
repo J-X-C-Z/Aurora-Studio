@@ -166,6 +166,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn real_nef_fields_are_read_and_mapped() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
+        let data = std::fs::read(&path).expect("testdata sample");
+        let info = crate::parse_info_block(&data).expect("parses the real NEF");
+        println!("model={:?} iso={:?}", info.model, info.iso);
+        for (k, v) in &info.values {
+            println!("{k} = {v}");
+        }
+        assert_eq!(info.iso, Some(5000));
+        assert_eq!(info.get("IB_F_EXP_SHUTTERSPEED"), Some(0.025), "1/40 s");
+        assert_eq!(info.get("IB_F_EXP_APERTURE"), Some(4.0));
+        assert_eq!(info.get("IB_F_EXP_FOCALLENGTH"), Some(120.0));
+        let ev = ev100(&info).expect("EV");
+        assert!((ev - 3.68).abs() < 0.05, "{ev}");
+
+        let o = overrides_for(&info);
+        assert_eq!(o.apply(by_key("Exposure").unwrap()), (-4.0, 4.0, 0.0));
+        assert_eq!(o.apply(by_key("USMAmount").unwrap()).2, 160.0, "ISO 5000 -> 3200 rung");
+        assert_eq!(o.apply(by_key("NoiseReductionAmount").unwrap()).2, 50.0);
+        let (_, _, kelvin) = o.apply(by_key("WhiteBalanceTemperature").unwrap());
+        assert!((kelvin - 4779.55).abs() < 2.0, "{kelvin}");
+    }
 
     #[test]
     fn missing_fields_fall_back_to_catalog_defaults() {
@@ -199,8 +222,49 @@ mod tests {
         assert_eq!(overrides_for(&b), overrides_for(&b));
     }
 
+    #[test]
+    fn reference_ladder_matches_the_core_config_file() {
+        let core_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/coreConfig.cdx");
+        let Ok(core) = crate::CameraDefaults::load(&core_path) else {
+            eprintln!("coreConfig.cdx unavailable, skipping");
+            return;
+        };
+        let data = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin"))
+            .expect("testdata sample");
+        let info = crate::parse_info_block(&data).expect("parses the real header");
+        let ours = overrides_for(&info);
+        let theirs = core.overrides(Some("NIKON Z6_3"), info.iso);
+        for key in [
+            "USMAmount",
+            "USMRadius",
+            "USMThreshold",
+            "NoiseReductionAmount",
+            "NoiseDetailsAmount",
+            "ColorNoiseReductionAmount",
+        ] {
+            assert_eq!(ours.apply(by_key(key).unwrap()), theirs.apply(by_key(key).unwrap()), "{key}");
+        }
+    }
 
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/camera_defaults-tests.rs");
+    #[test]
+    fn unknown_body_falls_back_to_the_neutral_base_without_panicking() {
+        let core_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/coreConfig.cdx");
+        let Ok(core) = crate::CameraDefaults::load(&core_path) else {
+            eprintln!("coreConfig.cdx unavailable, skipping");
+            return;
+        };
+        let base = core.overrides(None, Some(5000));
+        let unknown = core.overrides(Some("ACME CAMERA 9000"), Some(5000));
+        for key in [
+            "USMAmount",
+            "USMRadius",
+            "USMThreshold",
+            "NoiseReductionAmount",
+            "NoiseDetailsAmount",
+            "ColorNoiseReductionAmount",
+        ] {
+            assert_eq!(unknown.apply(by_key(key).unwrap()), base.apply(by_key(key).unwrap()), "{key}");
+        }
+        assert_eq!(crate::camera_curve::default_curve("ACME CAMERA 9000"), None);
+    }
 }

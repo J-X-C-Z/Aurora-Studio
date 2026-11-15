@@ -1,10 +1,11 @@
 [package]
-name = "aurora-pixcake"
+name = "aurora-portrait"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 license.workspace = true
-description = "Explicit-input portrait geometry and pixel stages with CPU, CUDA and Metal adapters"
 
-[features]
-default = []
-external-fixtures = []
+[dependencies]
+
+[dev-dependencies]
+serde_json.workspace = true
+

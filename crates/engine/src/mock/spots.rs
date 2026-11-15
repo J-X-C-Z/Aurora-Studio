@@ -1,7 +1,9 @@
 //! Spot removal for a developed RGBA frame: dust (median) and heal (Laplacian
-//! diffusion of the surrounding ring).
-//! Approximation only — no texture synthesis, no seam matching, and the ring
-//! is sampled at 32 angles, so healed areas lose fine detail.
+//! diffusion of the surrounding ring plus high-frequency detail from a mirrored
+//! patch just outside the spot).
+//! Clone copies a source patch instead of synthesising one, feathering its rim.
+//! Approximation only — no seam matching or source-point search, and the ring
+//! is sampled at 32 angles.
 //! Limits: radii follow the spot radius fraction of the oriented image's long side.
 
 use crate::{AdjustmentSet, Geometry, Spot, SpotKind};
@@ -13,6 +15,8 @@ pub(crate) enum SpotMode {
     Heal,
     /// 3x3 median filter.
     Dust,
+    /// Copy the patch at the spot's source offset.
+    Clone,
 }
 
 const TAU: f32 = std::f32::consts::TAU;
@@ -53,13 +57,17 @@ pub(crate) fn apply_spots_with(
         return;
     }
     for (mode, spot) in tasks {
-        let Some((cx, cy, radius_px)) = spot_geometry(spot, geometry, source_size, width, height)
-        else {
+        let Some(frame) = spot_geometry(spot, geometry, source_size, width, height) else {
             continue;
         };
         match mode {
-            SpotMode::Heal => heal(rgba, width, height, cx, cy, radius_px),
-            SpotMode::Dust => dust(rgba, width, height, cx, cy, radius_px),
+            SpotMode::Heal => heal(rgba, width, height, frame.cx, frame.cy, frame.radius),
+            SpotMode::Dust => dust(rgba, width, height, frame.cx, frame.cy, frame.radius),
+            SpotMode::Clone => {
+                if let Some(src) = frame.src {
+                    clone_patch(rgba, width, height, frame.cx, frame.cy, frame.radius, src);
+                }
+            }
         }
     }
 }
@@ -103,19 +111,29 @@ fn overlaps(a: &Spot, b: &Spot) -> bool {
 fn mode_of(kind: SpotKind) -> SpotMode {
     match kind {
         SpotKind::Dust => SpotMode::Dust,
-        // `Spot` is the interface's "heal" spot; there is no clone spot kind.
         SpotKind::Spot => SpotMode::Heal,
+        SpotKind::Clone { .. } => SpotMode::Clone,
     }
 }
 
-/// Maps a spot to frame pixels: centre in the developed frame and its radius.
+/// A spot in developed-frame pixels.
+struct FrameSpot {
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    /// Clone source offset in frame pixels; `None` for heal and dust.
+    src: Option<(f32, f32)>,
+}
+
+/// Maps a spot to frame pixels: centre in the developed frame, its radius, and
+/// the clone source offset.
 fn spot_geometry(
     spot: &Spot,
     geometry: &Geometry,
     source_size: (u32, u32),
     width: u32,
     height: u32,
-) -> Option<(f32, f32, f32)> {
+) -> Option<FrameSpot> {
     let (sw, sh) = source_size;
     if sw == 0 || sh == 0 || width == 0 || height == 0 {
         return None;
@@ -155,7 +173,62 @@ fn spot_geometry(
     if !radius_px.is_finite() || radius_px <= 0.0 {
         return None;
     }
-    Some((fx * width as f32, fy * height as f32, radius_px))
+    // The source offset lives in the oriented, uncropped image, so it takes the
+    // same quarter turn and crop scale as the centre.
+    let src = match spot.kind {
+        SpotKind::Clone { src_offset } => {
+            let (dx, dy) = (src_offset.0 as f32, src_offset.1 as f32);
+            Some(((cos * dx - sin * dy) * scale, (sin * dx + cos * dy) * scale))
+        }
+        _ => None,
+    };
+    Some(FrameSpot { cx: fx * width as f32, cy: fy * height as f32, radius: radius_px, src })
+}
+
+/// Clone: copies the source patch into the disc, feathering its rim into the
+/// pixels it replaces. The source is read from a snapshot, so an overlapping
+/// source cannot feed on the clone itself.
+fn clone_patch(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    src: (f32, f32),
+) {
+    let radius = radius.max(1.0);
+    let feather = (radius * FEATHER_RATIO).max(1.0);
+    let outer = radius + feather;
+    let source: Vec<u8> = rgba.to_vec();
+    let x0 = (cx - outer).floor().max(0.0) as i64;
+    let x1 = (cx + outer).ceil().min(width as f32 - 1.0) as i64;
+    let y0 = (cy - outer).floor().max(0.0) as i64;
+    let y1 = (cy + outer).ceil().min(height as f32 - 1.0) as i64;
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let d = ((px as f32 - cx).powi(2) + (py as f32 - cy).powi(2)).sqrt();
+            if d > outer {
+                continue;
+            }
+            let w = if d <= radius { 1.0 } else { 1.0 - smoothstep(radius, outer, d) };
+            if w <= 0.0 {
+                continue;
+            }
+            let p = (py as usize * width as usize + px as usize) * 4;
+            if p + 3 >= rgba.len() {
+                continue;
+            }
+            let Some(c) = sample(&source, width, height, px as f32 + src.0, py as f32 + src.1)
+            else {
+                continue;
+            };
+            for k in 0..3 {
+                let orig = source[p + k] as f32;
+                rgba[p + k] = (orig * (1.0 - w) + c[k] * w).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }
 
 /// Heal: fills the disc with a diffusion of the surrounding ring.
@@ -280,6 +353,16 @@ fn heal(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32)
         [0.0; 3]
     };
 
+    // A mirrored strip beside the patch keeps the source outside the damaged
+    // area. Diffusion supplies its low frequency; this only carries fine detail.
+    let source_right = cx + 3.0 * outer + 2.0 <= width as f32;
+    let source_axis = if source_right {
+        (cx + outer).ceil()
+    } else {
+        (cx - outer).floor()
+    };
+    let source_x = |px: f32| 2.0 * source_axis - px;
+
     for gy in 0..gh {
         for gx in 0..gw {
             let idx = gy * gw + gx;
@@ -297,13 +380,39 @@ fn heal(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32)
             if p + 3 >= rgba.len() {
                 continue;
             }
+            let detail = high_pass(rgba, width, height, source_x(px as f32), py as f32);
             for k in 0..3 {
-                let healed = vals[idx][k] + dev[k] + offset[k];
+                let healed = vals[idx][k] + dev[k] + offset[k] + detail[k];
                 let v = orig[idx][k] * (1.0 - w) + healed * w;
                 rgba[p + k] = v.clamp(0.0, 255.0) as u8;
             }
         }
     }
+}
+
+/// Sample minus a four-neighbour average: the fine detail of the source patch.
+fn high_pass(rgba: &[u8], width: u32, height: u32, x: f32, y: f32) -> [f32; 3] {
+    let Some(centre) = sample(rgba, width, height, x, y) else {
+        return [0.0; 3];
+    };
+    let mut around = [0f32; 3];
+    let mut n = 0.0;
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        if let Some(c) = sample(rgba, width, height, x + dx, y + dy) {
+            for k in 0..3 {
+                around[k] += c[k];
+            }
+            n += 1.0;
+        }
+    }
+    if n == 0.0 {
+        return [0.0; 3];
+    }
+    let mut out = [0f32; 3];
+    for k in 0..3 {
+        out[k] = centre[k] - around[k] / n;
+    }
+    out
 }
 
 /// Dust: 3x3 median filter over the disc.
@@ -443,6 +552,108 @@ mod tests {
     }
 
     #[test]
+    fn heal_removes_a_bright_spot_from_a_smooth_gradient() {
+        let (w, h) = (100u32, 100u32);
+        let base = |x: u32, y: u32| 90.0 + x as f32 * 0.6 + y as f32 * 0.2;
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let v = base(x, y).round() as u8;
+                buf.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        // A bright blemish inside the 5 px heal radius.
+        for y in 46..=54 {
+            for x in 46..=54 {
+                if ((x as f32 - 50.0).powi(2) + (y as f32 - 50.0).powi(2)).sqrt() <= 4.0 {
+                    let p = ((y * 100 + x) * 4) as usize;
+                    let v = (base(x, y) + 70.0).min(255.0) as u8;
+                    buf[p..p + 3].fill(v);
+                }
+            }
+        }
+        let before = buf.clone();
+        let mut adj = AdjustmentSet::default();
+        adj.spots.push(spot(SpotKind::Spot, 0.5, 0.5, 0.05));
+        apply_spots(&mut buf, w, h, &adj, (w, h));
+
+        // Surrounding mean from an untouched ring 8 px out; the gradient is linear,
+        // so this is also the value the centre should have had without the blemish.
+        let mut sum = 0f32;
+        let mut n = 0f32;
+        for i in 0..64 {
+            let a = i as f32 / 64.0 * std::f32::consts::TAU;
+            let x = (50.0 + 8.0 * a.cos()).round() as u32;
+            let y = (50.0 + 8.0 * a.sin()).round() as u32;
+            sum += before[((y * 100 + x) * 4) as usize] as f32;
+            n += 1.0;
+        }
+        let mean = sum / n;
+        let centre = buf[(50 * 100 + 50) * 4] as f32;
+        assert!(
+            (centre - mean).abs() < 2.0,
+            "healed centre {centre} differs from surrounding mean {mean}"
+        );
+
+        // Nothing beyond 3 px past the heal radius may move.
+        for y in 0..h {
+            for x in 0..w {
+                let d = ((x as f32 - 50.0).powi(2) + (y as f32 - 50.0).powi(2)).sqrt();
+                if d > 5.0 + 3.0 {
+                    let p = ((y * 100 + x) * 4) as usize;
+                    assert_eq!(&buf[p..p + 3], &before[p..p + 3], "pixel ({x},{y}) outside the patch changed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn heal_keeps_fine_texture_from_the_source_patch() {
+        let (w, h) = (100u32, 100u32);
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (128 + if (x + y) % 2 == 0 { 12 } else { -12 }) as u8;
+                buf.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        for y in 48..=52 {
+            for x in 48..=52 {
+                let p = ((y * 100 + x) * 4) as usize;
+                buf[p..p + 3].fill(220);
+            }
+        }
+        let mut adj = AdjustmentSet::default();
+        adj.spots.push(spot(SpotKind::Spot, 0.5, 0.5, 0.05));
+        apply_spots(&mut buf, w, h, &adj, (w, h));
+
+        let energy = |b: &[u8], cx: u32, cy: u32| -> f32 {
+            let mut sum = 0f32;
+            let mut n = 0f32;
+            for y in cy - 2..=cy + 2 {
+                for x in cx - 2..=cx + 2 {
+                    let p = ((y * 100 + x) * 4) as usize;
+                    let around = [-1i32, 0, 1, 0]
+                        .into_iter()
+                        .zip([0i32, -1, 0, 1])
+                        .map(|(dx, dy)| b[(((y as i32 + dy) * 100 + x as i32 + dx) * 4) as usize] as f32)
+                        .sum::<f32>()
+                        / 4.0;
+                    sum += (b[p] as f32 - around).abs();
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+        let control = energy(&buf, 25, 25);
+        let healed = energy(&buf, 50, 50);
+        assert!(
+            healed > control * 0.5,
+            "texture energy in the healed patch {healed} is far below a clean patch {control}"
+        );
+    }
+
+    #[test]
     fn out_of_range_spots_are_ignored() {
         let mut buf = gray(32, 32, 77);
         let before = buf.clone();
@@ -503,5 +714,136 @@ mod tests {
         ];
         apply_detected_spots(&mut buf, 32, 32, &adj, &Geometry::default(), &dust, (32, 32));
         assert_eq!(buf, before);
+    }
+
+    fn pattern(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let px = [
+                    ((x * 3 + y * 7) % 251) as u8,
+                    ((x * 11 + y * 5) % 241) as u8,
+                    ((x * 13 + y * 17) % 233) as u8,
+                    255,
+                ];
+                buf.extend_from_slice(&px);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn clone_copies_the_source_point() {
+        let (w, h) = (64u32, 64u32);
+        let mut buf = pattern(w, h);
+        let before = buf.clone();
+        let mut adj = AdjustmentSet::default();
+        // Centre (16,16), source (48,16): offset (32,0) in source pixels.
+        adj.spots.push(spot(SpotKind::Clone { src_offset: (32, 0) }, 0.25, 0.25, 0.1));
+        apply_spots(&mut buf, w, h, &adj, (w, h));
+        for (dx, dy) in [(0i32, 0i32), (2, 1), (-1, -2)] {
+            let dp = (((16 + dy) * 64 + (16 + dx)) * 4) as usize;
+            let sp = (((16 + dy) * 64 + (48 + dx)) * 4) as usize;
+            for k in 0..3 {
+                let diff = buf[dp + k] as i32 - before[sp + k] as i32;
+                assert!(
+                    diff.abs() <= 1,
+                    "channel {k} at ({},{}) is {} but the source has {}",
+                    dx,
+                    dy,
+                    buf[dp + k],
+                    before[sp + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clone_scales_the_source_offset_to_the_frame() {
+        let (w, h) = (128u32, 128u32);
+        let mut buf = pattern(w, h);
+        let before = buf.clone();
+        let mut adj = AdjustmentSet::default();
+        // A 64 px source frame shown at 128 px: the 16 px offset doubles.
+        adj.spots.push(spot(SpotKind::Clone { src_offset: (16, 0) }, 0.25, 0.25, 0.1));
+        apply_spots(&mut buf, w, h, &adj, (64, 64));
+        let dp = (32 * 128 + 32) * 4;
+        let sp = (32 * 128 + 64) * 4;
+        for k in 0..3 {
+            let diff = buf[dp + k] as i32 - before[sp + k] as i32;
+            assert!(diff.abs() <= 1, "channel {k}: {} vs source {}", buf[dp + k], before[sp + k]);
+        }
+    }
+
+    #[test]
+    fn clone_feathers_its_edge() {
+        let (w, h) = (96u32, 96u32);
+        let mut buf = gray(w, h, 100);
+        for y in 0..h {
+            for x in 50..90 {
+                let p = ((y * 96 + x) * 4) as usize;
+                buf[p..p + 3].fill(220);
+            }
+        }
+        let before = buf.clone();
+        let mut adj = AdjustmentSet::default();
+        adj.spots.push(spot(SpotKind::Clone { src_offset: (40, 0) }, 0.3, 0.5, 10.0 / 96.0));
+        apply_spots(&mut buf, w, h, &adj, (w, h));
+
+        // The inner disc is the source patch; nothing 4 px past the feather moves.
+        let centre = ((48 * 96 + 29) * 4) as usize;
+        assert_eq!(buf[centre], 220, "clone centre is {}", buf[centre]);
+        let mut partial = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let d = ((x as f32 - 28.8).powi(2) + (y as f32 - 48.0).powi(2)).sqrt();
+                let p = ((y * 96 + x) * 4) as usize;
+                if d > 10.0 + 10.0 * 0.35 + 4.0 {
+                    assert_eq!(&buf[p..p + 3], &before[p..p + 3], "pixel ({x},{y}) outside moved");
+                }
+                if buf[p] > 105 && buf[p] < 215 {
+                    partial += 1;
+                }
+                // Steps are judged inside the clone only: the source stripe's own
+                // edge at x = 50 is a hard step in the input.
+                if (1..45).contains(&x) {
+                    let step = (buf[p] as i32 - buf[p - 4] as i32).abs();
+                    assert!(step <= 60, "hard seam at ({x},{y}): step {step}");
+                }
+            }
+        }
+        assert!(partial > 10, "only {partial} feathered pixels, the edge looks cut");
+    }
+
+    #[test]
+    fn heal_output_matches_the_pre_clone_golden() {
+        let (w, h) = (100u32, 100u32);
+        let base = |x: u32, y: u32| 90.0 + x as f32 * 0.6 + y as f32 * 0.2;
+        let mut buf = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let v = base(x, y).round() as u8;
+                buf.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        for y in 40..=60 {
+            for x in 40..=60 {
+                let d = ((x as f32 - 50.0).powi(2) + (y as f32 - 50.0).powi(2)).sqrt();
+                if d <= 4.0 {
+                    let p = ((y * 100 + x) * 4) as usize;
+                    let v = (base(x, y) + 70.0).min(255.0) as u8;
+                    buf[p..p + 3].fill(v);
+                }
+            }
+        }
+        let mut adj = AdjustmentSet::default();
+        adj.spots.push(spot(SpotKind::Spot, 0.5, 0.5, 0.05));
+        apply_spots(&mut buf, w, h, &adj, (w, h));
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in &buf {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        assert_eq!(hash, 0xd973_d661_f61a_ba56, "heal output changed: {hash:016x}");
     }
 }

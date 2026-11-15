@@ -10,7 +10,7 @@ use gpui_kit::{
     App, Context, Entity, InteractiveElement, IntoElement, ObjectFit, ParentElement, Pixels, Render,
     ScrollDelta, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _, Subscription, Window, div, img, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::i18n::t;
 use crate::motion;
@@ -156,6 +156,29 @@ impl Viewer {
             }
             CursorTool::Spot => {
                 let at = self.to_image(f, cx);
+                let clone = state.read(cx).panels.spot_clone;
+                if clone {
+                    let pending = state.read(cx).spot_anchor;
+                    state.update(cx, |s, cx| {
+                        let size = s.panels.brush_size;
+                        let Some(id) = s.current else { return };
+                        let src = pending.filter(|(a, _)| *a == id).map(|(_, p)| p);
+                        let Some(src) = src else {
+                            s.spot_anchor = Some((id, at));
+                            cx.notify();
+                            return;
+                        };
+                        let geo = s.adj().geometry.clone();
+                        let source = s.current_info().map(|i| (i.width, i.height)).unwrap_or((0, 0));
+                        let offset = crate::state::clone_offset(src, at, &geo, source);
+                        s.spot_anchor = None;
+                        s.edit(t("Clone", "仿制"), |a| {
+                            let spot = a.spots.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+                            a.spots.push(Spot { id: spot, kind: SpotKind::Clone { src_offset: offset }, x: at[0], y: at[1], radius: size * 0.5 });
+                        }, cx)
+                    });
+                    return;
+                }
                 state.update(cx, |s, cx| {
                     let size = s.panels.brush_size;
                     s.edit(t("Spot removal", "污点去除"), |a| {
@@ -238,6 +261,7 @@ impl Viewer {
                             a.white_balance.mode = WhiteBalanceMode::Custom;
                             a.white_balance.kelvin = k;
                             a.white_balance.tint = tint;
+                            a.white_balance.gains = None;
                         }, cx),
                         Err(err) => s.notify(err.to_string(), cx),
                     }
@@ -604,12 +628,16 @@ impl Render for Viewer {
         let split = s.view.split;
         let rendering = s.preview.rendering;
         let render_error = s.preview.error.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, e)| e.clone());
-        let source_note = if s.current.is_some_and(|id| s.library_offline.contains(&id)) {
-            Some(t("Original offline · cached preview; adjustments become visible when reconnected", "原片离线 · 正在显示缓存预览，调整将在原片连接后显示").into())
-        } else { s.source_note.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, n)| n.clone()) };
-        // Soft proofing uses the output profile of the selected process recipe, as Capture One does.
+        let source_note = s.source_note.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, n)| n.clone());
+        let degraded = s.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.current).and_then(|f| f.degraded.clone());
+        let source_note = match (source_note, degraded) {
+            (Some(note), Some(reason)) => Some(SharedString::from(format!("{note} · {reason}"))),
+            (note, None) => note,
+            (None, reason) => reason,
+        };
+        // Soft proofing uses the profile chosen in Preferences.
         let soft_proof = s.view.soft_proof.then(|| {
-            let profile = s.recipes.get(s.selected_recipe).map(|r| r.icc_profile.clone()).filter(|p| !p.is_empty()).unwrap_or_else(|| "sRGB".into());
+            let profile = s.settings.proof_profile.clone().unwrap_or_else(|| t("No proof profile selected", "未选择打样配置文件").into());
             (profile, crate::planned::PROOF_READY)
         });
         let after = s.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.current).map(frame_el);
@@ -742,7 +770,7 @@ impl Render for Viewer {
                                 .small()
                                 .outline()
                                 .icon(Icon::new(IconName::ImageDown))
-                                .label(format!("{}  {}", t("Import…", "导入…"), crate::platform::keys("ctrl-shift-i")))
+                                .label(format!("{}  Ctrl+Shift+I", t("Import…", "导入…")))
                                 .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::Import), cx)),
                         ),
                 )
@@ -1056,7 +1084,7 @@ fn tool_hint(tool: CursorTool, layer: Option<&str>) -> Option<String> {
     Some(match tool {
         CursorTool::Select | CursorTool::Annotate => return None,
         CursorTool::Pan => t("Drag to pan · double-click toggles 100%", "拖动平移 · 双击在 100% 与适合窗口间切换").to_string(),
-        CursorTool::Zoom => format!("{} · {}{}", t("Click to zoom in", "单击放大"), crate::platform::alt(), t("-click to zoom out", "+单击缩小")),
+        CursorTool::Zoom => t("Click to zoom in · Alt-click to zoom out", "单击放大 · Alt+单击缩小").to_string(),
         CursorTool::Crop => t("Drag to draw a crop · drag its edges or corners to adjust · drag inside to move", "拖动画出裁剪框 · 拖动边或角调整 · 在框内拖动可移动").to_string(),
         CursorTool::Straighten => t("Drag along a line that should be level or upright", "沿着应当水平或垂直的线拖动").to_string(),
         CursorTool::Keystone => t("Drag up or down for vertical, left or right for horizontal correction", "上下拖动校正垂直透视 · 左右拖动校正水平透视").to_string(),
@@ -1101,9 +1129,20 @@ impl ViewportReport for Surface {
         use gpui_kit::base::ElementExt as _;
         self.on_prepaint(move |bounds, window, cx| {
             let sf = window.scale_factor();
+            #[cfg(windows)]
+            let hwnd = {
+                use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+                match window.window_handle().ok().map(|h| h.as_raw()) {
+                    Some(RawWindowHandle::Win32(w)) => w.hwnd.get(),
+                    _ => 0,
+                }
+            };
+            #[cfg(not(windows))]
+            let hwnd = 0;
             let changed = {
                 let s = state.read(cx);
                 s.viewport_origin != bounds.origin
+                    || s.window_hwnd != hwnd
                     || (f32::from(bounds.size.width) - s.viewport.0).abs() > 0.5
                     || (f32::from(bounds.size.height) - s.viewport.1).abs() > 0.5
                     || s.scale_factor != sf
@@ -1111,6 +1150,7 @@ impl ViewportReport for Surface {
             if changed {
                 state.update(cx, |s, cx| {
                     s.viewport_origin = bounds.origin;
+                    s.window_hwnd = hwnd;
                     s.set_viewport((bounds.size.width, bounds.size.height), sf, cx);
                 });
             }

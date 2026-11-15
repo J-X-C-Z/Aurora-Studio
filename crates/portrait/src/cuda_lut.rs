@@ -118,6 +118,16 @@ impl SkinLut {
         Ok(Self(crate::cuda::Nvidia::open_ptx(PTX)?))
     }
 
+    /// Release the process-wide GPU lock while keeping the module and LUTs.
+    pub fn suspend(&mut self) -> Result<(), CudaError> {
+        self.0.suspend()
+    }
+
+    /// Reacquire the GPU lock before another call on a retained session.
+    pub fn resume(&mut self) -> Result<(), CudaError> {
+        self.0.resume()
+    }
+
     /// GPU twin of `kernels::makeup::skin_adjust_lut`.
     pub fn skin_adjust(
         &self,
@@ -133,10 +143,12 @@ impl SkinLut {
             source.width.div_ceil(BLOCK.0).max(1),
             source.height.div_ceil(BLOCK.1).max(1),
         );
-        let (pixels, dispatch) = self.0.run_u8(
+        let (pixels, dispatch) = self.0.run_u8_cached_lut(
             KERNEL,
             grid,
-            &[&source.pixels, mask_r, lut_rgb512],
+            &source.pixels,
+            mask_r,
+            lut_rgb512,
             as_bytes(&uniforms),
         )?;
         Ok((

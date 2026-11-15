@@ -1,10 +1,11 @@
 //! The Print window: paper, orientation, a rows × columns layout with margins
 //! and spacing, and a live page preview whose cells glide when the layout
-//! changes. Sending pages to a printer is not connected to a backend yet.
+//! changes. Printing renders the current image into a single-page PDF on the
+//! selected paper through [`aurora_engine::print`].
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    Icon, Sizable as _, WindowExt as _,
+    Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -12,7 +13,8 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ObjectFit, ParentElement, Render, SharedString, Styled, StyledImage as _, Window, div,
     img, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::ImageId;
+use aurora_engine::print::{PageSpec, RenderedPage};
+use aurora_engine::{ImageId, NormRect, PreviewRequest, RenderQuality};
 
 use crate::i18n::t;
 use crate::motion;
@@ -29,11 +31,14 @@ const PAPERS: [(&str, f32, f32); 6] = [
     ("8 × 10 in", 203.2, 254.0),
 ];
 
+const DPIS: [u32; 3] = [150, 300, 600];
+
 pub struct PrintDialog {
     state: Entity<AppState>,
     images: Vec<ImageId>,
     printer: usize,
     paper: usize,
+    dpi: usize,
     landscape: bool,
     rows: f32,
     cols: f32,
@@ -43,6 +48,7 @@ pub struct PrintDialog {
     captions: bool,
     copies: f32,
     page: usize,
+    printing: bool,
 }
 
 impl PrintDialog {
@@ -59,6 +65,80 @@ impl PrintDialog {
         self.page = self.page.min(self.pages() - 1);
         cx.notify();
     }
+
+    fn spec(&self) -> PageSpec {
+        let (_, mut w, mut h) = PAPERS[self.paper];
+        if self.landscape {
+            (w, h) = (h, w);
+        }
+        PageSpec { width_mm: w, height_mm: h, margin_mm: self.margin, dpi: DPIS[self.dpi] }
+    }
+
+    /// Renders the current image at print resolution and writes one PDF page.
+    fn send(&mut self, cx: &mut Context<Self>) {
+        let spec = self.spec();
+        let Some((image, name, adjustments, engine, max_size)) = ({
+            let s = self.state.read(cx);
+            let image = s.current.filter(|id| self.images.contains(id)).or_else(|| self.images.first().copied());
+            image.and_then(|image| {
+                let (w, h) = spec.content_px().ok()?;
+                Some((image, s.info(image)?.file_name.clone(), crate::state::flattened(s.adj()), s.engine.clone(), w.max(h)))
+            })
+        }) else {
+            self.state.update(cx, |s, cx| s.notify(t("No image to print", "没有可打印的图像"), cx));
+            return;
+        };
+        self.printing = true;
+        cx.notify();
+        let state = self.state.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let frame = engine.render_preview(&PreviewRequest {
+                        image,
+                        adjustments,
+                        region: NormRect::FULL,
+                        max_size: max_size.clamp(64, 8192),
+                        quality: RenderQuality::Final,
+                        bypass: false,
+                        mask_overlay: None,
+                        generation: 0,
+                        display_profile: None,
+                        proof_profile: None,
+                        proof_paper_white: 1.0,
+                        proof_black_point: 0.0,
+                        rendering_intent: None,
+                        black_point_compensation: false,
+                    })?;
+                    let rgba = image::RgbaImage::from_raw(frame.image.width, frame.image.height, frame.image.pixels.as_ref().clone())
+                        .ok_or_else(|| anyhow::anyhow!("engine returned a mismatched buffer"))?;
+                    write_pdf(&rgba, &name, &spec)
+                })
+                .await;
+            cx.update(|cx| {
+                state.update(cx, |s, cx| {
+                    let msg = match &result {
+                        Ok(page) => format!("{} {}", t("PDF written to", "PDF 已生成："), page.output.display()),
+                        Err(err) => err.to_string(),
+                    };
+                    s.notify(msg, cx);
+                });
+                this.update(cx, |d, cx| {
+                    d.printing = false;
+                    cx.notify();
+                })
+                .ok();
+            });
+        })
+        .detach();
+    }
+}
+
+/// Writes `image` to `%TEMP%\aurora-print\<stem>.pdf` on the given page.
+fn write_pdf(image: &image::RgbaImage, name: &str, spec: &PageSpec) -> anyhow::Result<RenderedPage> {
+    let stem = std::path::Path::new(name).file_stem().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "print".into());
+    let output = std::env::temp_dir().join("aurora-print").join(format!("{stem}.pdf"));
+    aurora_engine::print::write_image_pdf(&image::DynamicImage::ImageRgba8(image.clone()), &output, spec)
 }
 
 impl Render for PrintDialog {
@@ -140,13 +220,15 @@ impl Render for PrintDialog {
 
         let printers: Vec<(usize, SharedString)> = vec![(0, t("System default printer", "系统默认打印机").into()), (1, "Microsoft Print to PDF".into())];
         let papers: Vec<(usize, SharedString)> = PAPERS.iter().enumerate().map(|(i, (n, _, _))| (i, SharedString::from(*n))).collect();
-        let (t1, t2, t3, t4, t5) = (this.clone(), this.clone(), this.clone(), this.clone(), this.clone());
+        let dpis: Vec<(usize, SharedString)> = DPIS.iter().enumerate().map(|(i, d)| (i, SharedString::from(format!("{d} dpi")))).collect();
+        let (t1, t2, t3, t4, t5, t6) = (this.clone(), this.clone(), this.clone(), this.clone(), this.clone(), this.clone());
         let settings = v_flex()
             .flex_1()
             .min_w_0()
             .child(caption(t("Printer", "打印机"), cx))
             .child(row(t("Printer", "打印机"), select("print-printer", printers, self.printer, move |i, _, cx| t1.update(cx, |d, cx| d.set(cx, |d| d.printer = i))), cx))
             .child(row(t("Paper", "纸张"), select("print-paper", papers, self.paper, move |i, _, cx| t2.update(cx, |d, cx| d.set(cx, |d| d.paper = i))), cx))
+            .child(row(t("Resolution", "分辨率"), select("print-dpi", dpis, self.dpi, move |i, _, cx| t6.update(cx, |d, cx| d.set(cx, |d| d.dpi = i))), cx))
             .child(row(
                 t("Orientation", "方向"),
                 Segmented::new("print-orient", if self.landscape { 1 } else { 0 }).text(t("Portrait", "纵向")).text(t("Landscape", "横向")).on_select(move |i, _, cx| t3.update(cx, |d, cx| d.set(cx, |d| d.landscape = i == 1))),
@@ -166,8 +248,6 @@ impl Render for PrintDialog {
             .child(slider("print-copies", t("Copies", "份数"), self.copies, 1.0, 20.0, "", |d, v| d.copies = v.round()));
 
         let n = self.images.len();
-        let status = crate::contract::PRINT;
-        let state = self.state.clone();
         v_flex()
             .gap_3()
             .child(h_flex().items_start().gap_4().child(preview).child(settings))
@@ -179,9 +259,11 @@ impl Render for PrintDialog {
                     .child(
                         Button::new("print-go")
                             .primary()
+                            .loading(self.printing)
+                            .disabled(self.printing)
                             .icon(Icon::new(IconName::Printer))
                             .label(t("Print", "打印"))
-                            .on_click(move |_, _, cx| state.update(cx, |s, cx| s.notify(status.note().unwrap_or_default(), cx))),
+                            .on_click(cx.listener(|d, _, _, cx| d.send(cx))),
                     ),
             )
     }
@@ -197,6 +279,7 @@ pub fn open(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
         images,
         printer: 0,
         paper: 0,
+        dpi: 1,
         landscape: false,
         rows: 2.0,
         cols: 2.0,
@@ -206,6 +289,23 @@ pub fn open(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
         captions: true,
         copies: 1.0,
         page: 0,
+        printing: false,
     });
     window.open_dialog(cx, move |dialog, _, _| dialog.title(t("Print", "打印")).w(px(760.0)).child(view.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_helper_writes_a_pdf_header() {
+        let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([90, 120, 150, 255]));
+        let spec = PageSpec { width_mm: 210.0, height_mm: 297.0, margin_mm: 12.0, dpi: 150 };
+        let page = write_pdf(&image, "printwire-helper", &spec).unwrap();
+        let bytes = std::fs::read(&page.output).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert_eq!(page.layout.page_px, (1240, 1754));
+        let _ = std::fs::remove_file(&page.output);
+    }
 }

@@ -158,7 +158,7 @@ fn remove_partial(recipe: &ProcessRecipe, info: Option<&ImageInfo>) {
     let dir = recipe
         .destination
         .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("lumen-output"));
+        .unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
     let name = crate::output_name(recipe, info, info.variant as usize);
     let tmp: PathBuf = dir.join(format!("{name}.{}.tmp", recipe.format.extension()));
     let _ = std::fs::remove_file(tmp);
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn failure_deletes_the_partial_temp_file() {
         let engine = MockEngine::new(2, &[1], 1);
-        let dir = std::env::temp_dir().join(format!("lumen-batch-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-batch-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut recipe = ProcessRecipe::default();
         recipe.destination = Some(dir.clone());

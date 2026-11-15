@@ -85,6 +85,7 @@ pub fn apply_style(base: &AdjustmentSet, style: &AdjustmentSet) -> AdjustmentSet
     group!(dehaze);
     group!(vignetting);
     group!(color_balance);
+    group!(color_balance_gains);
     group!(color_editor);
     group!(black_white);
     group!(sharpening);
@@ -223,6 +224,8 @@ mod tests {
                 proof_profile: None,
                 proof_paper_white: 1.0,
                 proof_black_point: 0.0,
+                rendering_intent: None,
+                black_point_compensation: false,
             })
             .unwrap()
             .image

@@ -32,6 +32,7 @@ pub const META: &[EffectMeta] = &[
     EffectMeta { pf: 21105, key: "bodySkinToneUnify", label: "AI body skin unify", access: Access::Cpu, inputs: &["body/face masks", "effect passes"] },
     EffectMeta { pf: 30007, key: "eyelinerDegree_lower", label: "Lower eyeliner color makeup", access: Access::Cpu, inputs: &["EyeMaskType=4 mask (RG)", "UV", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 11"] },
     EffectMeta { pf: 30025, key: "teethBlemishRemoval", label: "Tooth repair", access: Access::Cpu, inputs: &["teeth mask", "repair layer", "ROI"] },
+    EffectMeta { pf: 30096, key: "sediao", label: "Skin temperature", access: Access::Cpu, inputs: &["skin mask", "cold LUT", "warm LUT"] },
     EffectMeta { pf: 90003, key: "skinColorUniform", label: "Body skin color uniform", access: Access::Cpu, inputs: &["native 0x15F93 value", "body mask", "ROI mask"] },
     EffectMeta { pf: 90021, key: "PF90021_UI_KEY_NOT_RECOVERED", label: "Lip makeup enhance", access: Access::Cpu, inputs: &["mouth mask", "LipsLUT", "LipDodgeLUT"] },
     EffectMeta { pf: 90032, key: "eyeMakeupDegree", label: "Eye image makeup", access: Access::Cpu, inputs: &["material RGBA texture", "EyeMaskType=10 mask (RGB)", "mask/material UV", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 41/42/44"] },

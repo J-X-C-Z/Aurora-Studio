@@ -13,7 +13,7 @@ use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::{ColorTag, ImageInfo, Iptc};
+use aurora_engine::{ColorTag, ImageInfo, Iptc};
 
 use crate::i18n::t;
 use crate::state::AppState;

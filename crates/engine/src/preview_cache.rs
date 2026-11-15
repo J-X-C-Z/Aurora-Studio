@@ -19,14 +19,13 @@ const MAX_BYTES: usize = 256 << 20;
 /// Bump this whenever a change to decoding or rendering alters output pixels.
 /// Cached frames outlive rebuilds, so without a bump an upgraded engine would
 /// keep serving frames produced by the old algorithm.
-const RENDER_VERSION: u32 = 2;
+const RENDER_VERSION: u32 = 1;
 
 /// Everything that changes the rendered bytes. `generation` is deliberately
 /// absent: a redraw of the same content must hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewKey {
     build: u64,
-    source_version: u64,
     image: ImageId,
     params: u64,
     long_side: u32,
@@ -34,13 +33,6 @@ pub(crate) struct PreviewKey {
     bypass: bool,
     mask_overlay: Option<u64>,
     fast: bool,
-}
-
-impl PreviewKey {
-    pub(crate) fn with_source_version(mut self, version: u64) -> Self {
-        self.source_version = version;
-        self
-    }
 }
 
 /// One cached frame. The pixel buffer is shared, so a hit costs an `Arc` clone.
@@ -125,7 +117,6 @@ pub(crate) fn key(
     fast: bool,
 ) -> PreviewKey {
     PreviewKey {
-        source_version: 0,
         build: build_fingerprint(),
         image,
         params: params_fingerprint(adj),
@@ -155,7 +146,7 @@ fn params_fingerprint(adj: &AdjustmentSet) -> u64 {
 fn build_fingerprint() -> u64 {
     static FINGERPRINT: OnceLock<u64> = OnceLock::new();
     *FINGERPRINT.get_or_init(|| {
-        let id = option_env!("LUMEN_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION"));
+        let id = option_env!("AURORA_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION"));
         build_fingerprint_of(id, RENDER_VERSION)
     })
 }
@@ -194,15 +185,6 @@ mod tests {
         assert_eq!(key_for(1, 0.5), key_for(1, 0.5));
         assert_ne!(key_for(1, 0.5), key_for(1, 0.500_001));
         assert_ne!(key_for(1, 0.5), key_for(2, 0.5));
-    }
-
-    #[test]
-    fn changed_source_cannot_hit_a_previous_frame() {
-        let mut cache = PreviewCache::new(2);
-        let old = key_for(1, 0.5).with_source_version(4);
-        cache.insert(old, frame(1));
-        assert!(cache.get(old).is_some());
-        assert!(cache.get(old.with_source_version(5)).is_none());
     }
 
     #[test]

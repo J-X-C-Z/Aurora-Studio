@@ -1,6 +1,6 @@
 //! PF90002 face / PF90010 body moisturizing pixel law.
 //!
-//! Recovered from pixcake.exe SHA256
+//! Recovered from portrait.exe SHA256
 //! `A84519DA489BC52E4E914AF7880EDE43E3CE58992657723D02197161832464C7`.
 //!
 //! Both effects share the process shader:

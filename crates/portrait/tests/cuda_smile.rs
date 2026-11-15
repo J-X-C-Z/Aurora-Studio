@@ -6,10 +6,10 @@
 
 #[cfg(windows)]
 mod smile_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_smile::{Smile, KERNEL, MASK_KERNEL};
-    use aurora_pixcake::kernels::smile_warp::{self, Rect};
-    use aurora_pixcake::Refusal;
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_smile::{Smile, KERNEL, MASK_KERNEL};
+    use aurora_portrait::kernels::smile_warp::{self, Rect};
+    use aurora_portrait::Refusal;
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -37,7 +37,7 @@ mod smile_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

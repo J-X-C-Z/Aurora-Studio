@@ -1,8 +1,9 @@
 //! A small CPU development pipeline. It is not color-accurate; it exists so every
 //! control in the interface has a visible, plausible effect during UI work.
 
-use rayon::prelude::*;
 use std::sync::OnceLock;
+
+use rayon::prelude::*;
 
 use crate::*;
 
@@ -16,6 +17,8 @@ pub struct Source {
     lens_auto: Option<super::lens_profile::LensWarp>,
     /// True when the pixels are the camera's own JPEG preview, not sensor data.
     camera_preview: bool,
+    /// Skin/hair/face masks, computed lazily for portrait effects.
+    portrait_masks: OnceLock<crate::portrait_stage::PortraitMasks>,
 }
 
 pub(crate) struct Plane {
@@ -34,17 +37,14 @@ pub(crate) fn linear_to_srgb(v: f32) -> f32 {
 }
 
 /// Linear → sRGB over `0 ..= 4` linear, so highlight recovery has headroom to pull from.
-struct GammaLut(&'static [f32; 8192]);
+struct GammaLut(Vec<f32>);
 
 impl GammaLut {
     const SIZE: usize = 8192;
     const RANGE: f32 = 4.0;
 
     fn new() -> Self {
-        static TABLE: OnceLock<[f32; GammaLut::SIZE]> = OnceLock::new();
-        Self(TABLE.get_or_init(|| std::array::from_fn(|i| {
-            linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)
-        })))
+        Self((0..Self::SIZE).map(|i| linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)).collect())
     }
 
     fn get(&self, v: f32) -> f32 {
@@ -84,6 +84,7 @@ impl Source {
                 lens_shot: None,
                 lens_auto: None,
                 camera_preview: false,
+                portrait_masks: OnceLock::new(),
             };
         }
         data.truncate((width as usize) * (height as usize));
@@ -107,7 +108,13 @@ impl Source {
                 .collect();
             levels.push(Plane { width: w, height: h, data });
         }
-        Self { levels, lens_shot: None, lens_auto: None, camera_preview: false }
+        Self {
+            levels,
+            lens_shot: None,
+            lens_auto: None,
+            camera_preview: false,
+            portrait_masks: OnceLock::new(),
+        }
     }
 
     pub(crate) fn size(&self) -> (u32, u32) {
@@ -125,6 +132,31 @@ impl Source {
         self.lens_auto = shot.as_ref().and_then(super::lens_profile::auto_warp);
         self.lens_shot = shot;
         self
+    }
+
+    /// Portrait masks at 512x512, computed once per source image.
+    pub(crate) fn portrait_masks(&self) -> &crate::portrait_stage::PortraitMasks {
+        self.portrait_masks.get_or_init(|| {
+            let edge = 512usize;
+            let mut rgba = vec![0u8; edge * edge * 4];
+            for y in 0..edge {
+                for x in 0..edge {
+                    let px = self
+                        .sample(
+                            0,
+                            (x as f32 + 0.5) / edge as f32,
+                            (y as f32 + 0.5) / edge as f32,
+                        )
+                        .unwrap_or([0.0; 3]);
+                    let i = (y * edge + x) * 4;
+                    for k in 0..3 {
+                        rgba[i + k] = (linear_to_srgb(px[k]).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                    rgba[i + 3] = 255;
+                }
+            }
+            crate::portrait_stage::PortraitMasks::from_rgba(&rgba, edge as u32, edge as u32)
+        })
     }
 
     fn sample(&self, level: usize, sx: f32, sy: f32) -> Option<[f32; 3]> {
@@ -184,26 +216,10 @@ fn catmull_rom(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
 }
 
 /// Approximate white point of a black body at `kelvin`, normalized to green.
-fn kelvin_rgb(kelvin: f32) -> [f32; 3] {
-    let t = kelvin.clamp(1000.0, 40000.0) / 100.0;
-    let r = if t <= 66.0 { 255.0 } else { 329.698_73 * (t - 60.0).powf(-0.133_204_76) };
-    let g = if t <= 66.0 { 99.470_8 * t.ln() - 161.119_57 } else { 288.122_16 * (t - 60.0).powf(-0.075_514_85) };
-    let b = if t >= 66.0 {
-        255.0
-    } else if t <= 19.0 {
-        0.0
-    } else {
-        138.517_73 * (t - 10.0).ln() - 305.044_8
-    };
-    let (r, g, b) = (r.clamp(1.0, 255.0), g.clamp(1.0, 255.0), b.clamp(1.0, 255.0));
-    [srgb_to_linear(r / 255.0) / srgb_to_linear(g / 255.0), 1.0, srgb_to_linear(b / 255.0) / srgb_to_linear(g / 255.0)]
-}
-
-pub(crate) fn white_balance_gains(kelvin: f32, tint: f32) -> [f32; 3] {
-    let shot = kelvin_rgb(5600.0);
-    let set = kelvin_rgb(kelvin);
-    let tint_gain = 1.0 - tint / 100.0 * 0.6;
-    [shot[0] / set[0], tint_gain, shot[2] / set[2]]
+pub(crate) fn white_balance_gains(wb: &crate::WhiteBalance) -> [f32; 3] {
+    // C1 imports carry the exact stored gains; K/T is only the display pair.
+    wb.gains
+        .unwrap_or_else(|| crate::c1_model::kelvin_tint_to_gains(wb.kelvin, wb.tint))
 }
 
 fn luma(c: [f32; 3]) -> f32 {
@@ -536,7 +552,7 @@ fn guided_filter_grid(mask: &[f32], guide: &[f32], w: usize, h: usize, r: i32) -
 /// Oriented-image point to source-image point: flips first, then the
 /// quarter turn, which is the inverse of what [`super::geometry::FrameMap`]
 /// does to reach the source.
-fn oriented_to_source(o: [f32; 2], g: &Geometry) -> [f32; 2] {
+pub(crate) fn oriented_to_source(o: [f32; 2], g: &Geometry) -> [f32; 2] {
     let mut q = o;
     if g.flip_horizontal {
         q[0] = 1.0 - q[0];
@@ -633,7 +649,7 @@ struct LayerPlan<'a> {
     curve_g: Option<[f32; 256]>,
     curve_b: Option<[f32; 256]>,
     curve_luma: Option<[f32; 256]>,
-    levels: bool,
+    levels: Option<Levels>,
     /// Constants a per-pixel `local()` would otherwise recompute every time.
     exposure_gain: f32,
     saturation: f32,
@@ -659,16 +675,16 @@ fn layer_plan<'a>(
         grid,
         overlay: mask_overlay == Some(l.id),
         wb_gains: a.white_balance.as_ref().map(|w| {
-            let g = white_balance_gains(w.kelvin, w.tint);
-            let base = white_balance_gains(adj.white_balance.kelvin, adj.white_balance.tint);
+            let g = white_balance_gains(w);
+            let base = white_balance_gains(&adj.white_balance);
             [g[0] / base[0], g[1] / base[1], g[2] / base[2]]
         }),
-        curve_rgb: lut_of(&a.curves.rgb),
-        curve_r: lut_of(&a.curves.red),
-        curve_g: lut_of(&a.curves.green),
-        curve_b: lut_of(&a.curves.blue),
-        curve_luma: lut_of(&a.curves.luma),
-        levels: a.levels != Levels::default(),
+        curve_rgb: a.curves.as_ref().and_then(|c| lut_of(&c.rgb)),
+        curve_r: a.curves.as_ref().and_then(|c| lut_of(&c.red)),
+        curve_g: a.curves.as_ref().and_then(|c| lut_of(&c.green)),
+        curve_b: a.curves.as_ref().and_then(|c| lut_of(&c.blue)),
+        curve_luma: a.curves.as_ref().and_then(|c| lut_of(&c.luma)),
+        levels: a.levels.clone(),
         exposure_gain: 2f32.powf(a.exposure.exposure * 0.6),
         saturation: 1.0 + a.exposure.saturation / 100.0,
         opacity: (l.opacity / 100.0) * (l.mask.density.clamp(0.0, 100.0) / 100.0),
@@ -914,7 +930,7 @@ fn render_sized(
         },
         gamma: GammaLut::new(),
         fine: wide,
-        wb: white_balance_gains(adj.white_balance.kelvin, adj.white_balance.tint),
+        wb: white_balance_gains(&adj.white_balance),
         exposure: 2f32.powf(adj.exposure.exposure),
         base_contrast: match adj.base.curve {
             ToneCurvePreset::Auto | ToneCurvePreset::FilmStandard => 0.12,
@@ -981,6 +997,16 @@ fn render_sized(
     // layer mix sees the healed one.
     if !bypass {
         apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale);
+    }
+    if !adj.extra.is_empty() && !bypass {
+        crate::portrait_stage::apply_portrait_effects(
+            &mut rgba,
+            out_w,
+            out_h,
+            region,
+            &adj.extra,
+            src.portrait_masks(),
+        );
     }
     if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
         for ((px, base), after) in
@@ -1053,8 +1079,16 @@ fn encode(plan: &Plan, lin: [f32; 3]) -> [f32; 3] {
 }
 
 fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
+    if let Some(c) = negative_film_branch(plan) {
+        return c;
+    }
     // The camera profile is an input transform: device RGB -> linear sRGB.
+    // Most C1 profiles carry an `mft2` shaper that is the sRGB encode, so they
+    // want linear values; the Leaf/Mamiya/Phase One backs ship an identity
+    // shaper and want the stored codes, so only they get the encode first.
+    // Encoding unconditionally cost 20 ΔE on the 5673 (34.64 -> 14.73).
     let lin = match &plan.input_profile {
+        Some(profile) if profile.expects_linear_input() => profile.to_linear_srgb(lin),
         Some(profile) => {
             let encoded = [
                 plan.gamma.get(lin[0]),
@@ -1125,6 +1159,9 @@ fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
     if plan.color_balance {
         g = color_balance(g, &adj.color_balance, 1.0);
     }
+    if let Some(gains) = &adj.color_balance_gains {
+        g = color_balance_gains(g, gains);
+    }
     if plan.color_editor {
         g = color_editor(g, &adj.color_editor, 1.0);
     }
@@ -1133,6 +1170,24 @@ fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
     }
 
     g
+}
+
+/// Placeholder for C1's film-negative/positive branch. The field is parsed and
+/// preserved, but the inversion/black-point order is not proven yet; return
+/// `None` so the normal develop path is used unchanged.
+fn negative_film_branch(plan: &Plan) -> Option<[f32; 3]> {
+    if plan.adj.base.processing_method == TechnicalProcessingMethod::Photography {
+        return None;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "processing_method {:?} is parsed but its negative-film branch is not implemented; using normal develop path",
+            plan.adj.base.processing_method
+        );
+    }
+    None
 }
 
 fn tone(
@@ -1208,6 +1263,28 @@ fn color_balance(g: [f32; 3], cb: &ColorBalance, k: f32) -> [f32; 3] {
     out
 }
 
+/// Capture One's per-zone RGB multipliers, weighted by the same tonal zones the
+/// wheel stage uses. Neutral (all 1.0) returns the pixel untouched so an image
+/// with no such values stays byte-identical; gains are clamped against overflow.
+fn color_balance_gains(g: [f32; 3], gains: &ColorBalanceGains) -> [f32; 3] {
+    if gains.is_neutral() {
+        return g;
+    }
+    let l = luma(g).clamp(0.0, 1.0);
+    let ws = (1.0 - l).powi(2);
+    let wh = l.powi(2);
+    let wm = (1.0 - ws - wh).max(0.0);
+    let mut out = g;
+    for i in 0..3 {
+        let zone = ws * gains.shadow[i] + wm * gains.midtone[i] + wh * gains.highlight[i];
+        let gain = gains.master[i] * zone;
+        if gain.is_finite() {
+            out[i] = g[i] * gain.clamp(0.0, 8.0);
+        }
+    }
+    out
+}
+
 fn signed_hue_delta(h: f32, center: f32) -> f32 {
     let d = (h - center).rem_euclid(360.0);
     if d > 180.0 {
@@ -1217,9 +1294,10 @@ fn signed_hue_delta(h: f32, center: f32) -> f32 {
     }
 }
 
-/// Coverage of one color-editor band for a pixel at hue `h`, saturation `s`.
-/// `extra_feather` widens every band edge (the global group's smoothness).
-fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32) -> f32 {
+/// Coverage of one color-editor band for a pixel at hue `h`, saturation `s`,
+/// value `v`. `extra_feather` widens every band edge (the global group's
+/// smoothness).
+fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32, v: f32) -> f32 {
     let d = signed_hue_delta(h, b.center_hue);
     let feather = b.smoothness.max(0.1) + extra_feather;
     let hue_w = if d < b.hue_low {
@@ -1238,7 +1316,16 @@ fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32) -> f32 {
     } else {
         1.0
     };
-    (hue_w * sat_w).clamp(0.0, 1.0)
+    // Fixed 0.05 V feather: C1 has no value band, so there is no stored unit to borrow.
+    let v = v.clamp(0.0, 1.0);
+    let value_w = if v < b.value_low {
+        sstep(b.value_low - 0.05, b.value_low, v)
+    } else if v > b.value_high {
+        1.0 - sstep(b.value_high, b.value_high + 0.05, v)
+    } else {
+        1.0
+    };
+    (hue_w * sat_w * value_w).clamp(0.0, 1.0)
 }
 
 fn apply_homogeneity(b: &ColorBand, w: f32, h: &mut f32, s: &mut f32, v: &mut f32) {
@@ -1270,7 +1357,7 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     let mut dl = 0.0;
 
     if ce.global.enabled {
-        let mut w = band_weight(&ce.global, 0.0, h0, s0);
+        let mut w = band_weight(&ce.global, 0.0, h0, s0, v0);
         if ce.global.inverted {
             w = 1.0 - w;
         }
@@ -1281,7 +1368,7 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     }
 
     for band in ce.bands.iter().filter(|b| b.enabled) {
-        let mut w = band_weight(band, extra, h0, s0);
+        let mut w = band_weight(band, extra, h0, s0, v0);
         if band.inverted {
             w = 1.0 - w;
         }
@@ -1293,7 +1380,7 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
             if !band.enabled {
                 continue;
             }
-            let mut w = band_weight(band, 0.0, h0, s0);
+            let mut w = band_weight(band, 0.0, h0, s0, v0);
             if band.inverted {
                 w = 1.0 - w;
             }
@@ -1312,7 +1399,7 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         if !band.enabled {
             continue;
         }
-        let mut w = band_weight(band, extra, h, s);
+        let mut w = band_weight(band, extra, h, s, v);
         if band.inverted {
             w = 1.0 - w;
         }
@@ -1324,7 +1411,7 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     for r in ce.advanced.iter().chain(ce.skin.iter()) {
         let w = match ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
             Some((_, band)) if band.enabled => {
-                let w = band_weight(band, 0.0, h0, s0);
+                let w = band_weight(band, 0.0, h0, s0, v0);
                 if band.inverted { 1.0 - w } else { w }
             }
             Some(_) => 0.0,
@@ -1379,8 +1466,8 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
         c = [c[0] * e, c[1] * e, c[2] * e];
     }
     c = tone(c, &a.hdr, &a.exposure, 0.0, &a.clarity, &a.dehaze);
-    if lp.levels {
-        c = a.levels.apply(c);
+    if let Some(levels) = &lp.levels {
+        c = levels.apply(c);
     }
     if let Some(lut) = &lp.curve_rgb {
         c = [lut_get(lut, c[0]), lut_get(lut, c[1]), lut_get(lut, c[2])];
@@ -1409,6 +1496,9 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
     }
     if a.color_editor != ColorEditor::default() {
         c = color_editor(c, &a.color_editor, 1.0);
+    }
+    if let Some(bw) = a.black_white.as_ref().filter(|bw| bw.enabled) {
+        c = black_white(c, bw);
     }
     [g[0] + (c[0] - g[0]) * m, g[1] + (c[1] - g[1]) * m, g[2] + (c[2] - g[2]) * m]
 }
@@ -1458,34 +1548,23 @@ fn apply_layers(
     }
     let w = width as usize;
     let h = height as usize;
-    let mut n = 0;
-    let slots: Vec<Option<usize>> = plan.layers.iter().map(|lp| {
-        if lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0 {
-            let slot = n;
-            n += 1;
-            Some(slot)
-        } else {
-            None
-        }
-    }).collect();
-    // Pixel-major weights only for spatial layers, captured before each
-    // layer changes the colour used by luma and colour range masks.
+    let n = plan.layers.len();
+    // Per-pixel mask weights, one slot per layer, pixel-major. The spatial
+    // pass below only reads them for layers that actually run a filter.
     let mut weights = vec![0f32; w * h * n];
     let xs: Vec<f32> =
         (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
     // Colour pass: the layers stack, so each one sees the previous result.
-    let color_line = |y: usize, line: &mut [u8], wline: &mut [f32]| {
+    rgba.par_chunks_mut(w * 4).zip(weights.par_chunks_mut(w * n)).enumerate().for_each(|(y, (line, wline))| {
         let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
         for x in 0..w {
             let px = x * 4;
             let mut g = [line[px] as f32 / 255.0, line[px + 1] as f32 / 255.0, line[px + 2] as f32 / 255.0];
             let f = [xs[x], fy];
             let (p, _) = map.map(f);
-            for (lp, slot) in plan.layers.iter().zip(&slots) {
+            for (li, lp) in plan.layers.iter().enumerate() {
                 let m = layer_weight(lp, p, g);
-                if let Some(slot) = slot {
-                    wline[x * n + *slot] = m;
-                }
+                wline[x * n + li] = m;
                 if m <= 1e-4 {
                     continue;
                 }
@@ -1495,76 +1574,69 @@ fn apply_layers(
                 line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
-    };
-    if n == 0 {
-        rgba.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| color_line(y, line, &mut []));
-    } else {
-        rgba.par_chunks_mut(w * 4).zip(weights.par_chunks_mut(w * n)).enumerate()
-            .for_each(|(y, (line, wline))| color_line(y, line, wline));
-    }
+    });
     // Spatial pass: the operators need neighbours, so they work on the frame.
-    for (lp, slot) in plan.layers.iter().zip(&slots) {
-        let Some(slot) = slot else { continue };
-        let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + *slot]).collect();
-        apply_layer_spatial(rgba, w, h, lp, &wgt, scale);
-    }
-}
-
-fn apply_layer_spatial(rgba: &mut [u8], w: usize, h: usize, lp: &LayerPlan, wgt: &[f32], scale: f32) {
-    if wgt.iter().all(|v| *v <= 1e-4) {
-        return;
-    }
-    let luma = luma_plane(rgba, w, h);
-    let mut target = luma.clone();
-    if let Some(nr) = &lp.noise_reduction {
-        let strength = (nr.luminance / 100.0).clamp(0.0, 1.0);
-        if strength > 0.0 {
-            let blur = mean3x3(&luma, w, h);
-            for i in 0..w * h {
-                target[i] = luma[i] + (blur[i] - luma[i]) * strength;
-            }
-        }
-    }
-    if lp.moire.amount > 0.0 {
-        let amount = (lp.moire.amount / 100.0).clamp(0.0, 1.0);
-        let pattern = (lp.moire.pattern / 100.0).clamp(0.0, 1.0);
-        let weight = amount * (0.25 + 0.75 * pattern);
-        let blur = mean3x3(&target, w, h);
-        for i in 0..w * h {
-            let hf = (target[i] - blur[i]).abs();
-            let blend = weight * (hf / 10.0).clamp(0.0, 1.0);
-            target[i] += (blur[i] - target[i]) * blend;
-        }
-    }
-    if let Some(sh) = &lp.sharpening {
-        let amount = sh.amount / 100.0;
-        if amount > 0.0 {
-            let radius = ((sh.radius.max(0.1)) * scale).round().max(1.0) as i32;
-            let blur = box_blur3(&target, w, h, radius);
-            let threshold = sh.threshold.max(0.0);
-            for i in 0..w * h {
-                let mut detail = target[i] - blur[i];
-                if detail.abs() < threshold {
-                    detail = 0.0;
-                }
-                target[i] += detail * amount * 0.75;
-            }
-        }
-    }
-    // Write the new luminance back, keeping the hue ratios, and blend it
-    // in by the mask weight.
-    for i in 0..w * h {
-        let px = i * 4;
-        let old = luma[i];
-        let new = target[i];
-        let weight = wgt[i];
-        if weight <= 1e-4 {
+    for (li, lp) in plan.layers.iter().enumerate() {
+        let spatial = lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0;
+        if !spatial {
             continue;
         }
-        let mixed = old + (new - old) * weight;
-        let f = if old > 1.0 { mixed / old } else { 1.0 };
-        for k in 0..3 {
-            rgba[px + k] = (rgba[px + k] as f32 * f).clamp(0.0, 255.0).round() as u8;
+        let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + li]).collect();
+        if wgt.iter().all(|v| *v <= 1e-4) {
+            continue;
+        }
+        let luma = luma_plane(rgba, w, h);
+        let mut target = luma.clone();
+        if let Some(nr) = &lp.noise_reduction {
+            let strength = (nr.luminance / 100.0).clamp(0.0, 1.0);
+            if strength > 0.0 {
+                let blur = mean3x3(&luma, w, h);
+                for i in 0..w * h {
+                    target[i] = luma[i] + (blur[i] - luma[i]) * strength;
+                }
+            }
+        }
+        if lp.moire.amount > 0.0 {
+            let amount = (lp.moire.amount / 100.0).clamp(0.0, 1.0);
+            let pattern = (lp.moire.pattern / 100.0).clamp(0.0, 1.0);
+            let weight = amount * (0.25 + 0.75 * pattern);
+            let blur = mean3x3(&target, w, h);
+            for i in 0..w * h {
+                let hf = (target[i] - blur[i]).abs();
+                let blend = weight * (hf / 10.0).clamp(0.0, 1.0);
+                target[i] += (blur[i] - target[i]) * blend;
+            }
+        }
+        if let Some(sh) = &lp.sharpening {
+            let amount = sh.amount / 100.0;
+            if amount > 0.0 {
+                let radius = ((sh.radius.max(0.1)) * scale).round().max(1.0) as i32;
+                let blur = box_blur3(&target, w, h, radius);
+                let threshold = sh.threshold.max(0.0);
+                for i in 0..w * h {
+                    let mut detail = target[i] - blur[i];
+                    if detail.abs() < threshold {
+                        detail = 0.0;
+                    }
+                    target[i] += detail * amount * 0.75;
+                }
+            }
+        }
+        // Write the new luminance back, keeping the hue ratios, and blend it
+        // in by the mask weight.
+        for i in 0..w * h {
+            let px = i * 4;
+            let old = luma[i];
+            let new = target[i];
+            let weight = wgt[i];
+            if weight <= 1e-4 {
+                continue;
+            }
+            let mixed = old + (new - old) * weight;
+            let f = if old > 1.0 { mixed / old } else { 1.0 };
+            for k in 0..3 {
+                rgba[px + k] = (rgba[px + k] as f32 * f).clamp(0.0, 255.0).round() as u8;
+            }
         }
     }
 }
@@ -1713,7 +1785,7 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
         },
         gamma: GammaLut::new(),
         fine: false,
-        wb: white_balance_gains(adj.white_balance.kelvin, adj.white_balance.tint),
+        wb: white_balance_gains(&adj.white_balance),
         exposure: 2f32.powf(adj.exposure.exposure),
         base_contrast: 0.12,
         curve_rgb: lut_of(&adj.curves.rgb),
@@ -1746,129 +1818,8 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
 mod tests {
     use super::*;
 
-    #[test]
-    fn gamma_lut_reuses_table_with_original_bits_and_lookups() {
-        let original: Vec<f32> = (0..GammaLut::SIZE).map(|i| {
-            linear_to_srgb(i as f32 / (GammaLut::SIZE - 1) as f32 * GammaLut::RANGE)
-        }).collect();
-        let lut = GammaLut::new();
-        assert!(std::ptr::eq(lut.0, GammaLut::new().0));
-        for (actual, expected) in lut.0.iter().zip(&original) {
-            assert_eq!(actual.to_bits(), expected.to_bits());
-        }
-        for v in (0..=16384).map(|i| i as f32 / 4096.0).chain([
-            -1.0, -0.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN,
-        ]) {
-            let i = (v.max(0.0) / GammaLut::RANGE * (GammaLut::SIZE - 1) as f32) as usize;
-            assert_eq!(lut.get(v).to_bits(), original[i.min(GammaLut::SIZE - 1)].to_bits());
-        }
-    }
-
-    // Original all-layer weight layout and colour ordering; share only the
-    // unchanged spatial operators so the reference need not duplicate filters.
-    fn apply_layers_original(
-        rgba: &mut [u8], width: u32, height: u32, plan: &Plan,
-        map: &super::super::geometry::FrameMap, region: NormRect, scale: f32,
-    ) -> bool {
-        let (w, h, n) = (width as usize, height as usize, plan.layers.len());
-        let mut weights = vec![0f32; w * h * n];
-        let xs: Vec<f32> =
-            (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
-        for (y, line) in rgba.chunks_mut(w * 4).enumerate() {
-            let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
-            for x in 0..w {
-                let px = x * 4;
-                let mut g = [line[px] as f32 / 255.0, line[px + 1] as f32 / 255.0, line[px + 2] as f32 / 255.0];
-                let (p, _) = map.map([xs[x], fy]);
-                for (li, lp) in plan.layers.iter().enumerate() {
-                    let m = layer_weight(lp, p, g);
-                    weights[(y * w + x) * n + li] = m;
-                    if m <= 1e-4 {
-                        continue;
-                    }
-                    g = layer_pixel(lp, g, m);
-                }
-                for k in 0..3 {
-                    line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
-            }
-        }
-        let color_only = rgba.to_vec();
-        for (li, lp) in plan.layers.iter().enumerate() {
-            if lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0 {
-                let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + li]).collect();
-                apply_layer_spatial(rgba, w, h, lp, &wgt, scale);
-            }
-        }
-        rgba != color_only.as_slice()
-    }
-
-    #[test]
-    fn apply_layers_matches_original_bytes_for_color_and_mixed_layers() {
-        let (w, h) = (17, 13);
-        let mut input = synthetic(w, h);
-        for (i, px) in input.chunks_exact_mut(4).enumerate() {
-            px[2] = ((i * 97) % 256) as u8;
-            px[3] = ((i * 31) % 256) as u8;
-        }
-        let mut color = Layer { id: 1, opacity: 73.0, ..Default::default() };
-        color.adjustments.exposure.exposure = 0.65;
-        color.adjustments.exposure.saturation = -23.0;
-        color.mask.luma_range = Some(LumaRange::default());
-        let mut fill = Layer { id: 2, opacity: 42.0, ..Default::default() };
-        fill.adjustments.fill_color = Some([0.8, 0.15, 0.45]);
-        let mut sharpen = Layer { id: 3, opacity: 64.0, ..Default::default() };
-        sharpen.mask = hard_disc(0.65);
-        sharpen.mask.luma_range = Some(LumaRange {
-            low_outer: 0.05, low_inner: 0.25, high_inner: 0.6, high_outer: 0.85,
-            ..Default::default()
-        });
-        sharpen.adjustments.exposure.exposure = -0.8;
-        sharpen.adjustments.sharpening = Some(Sharpening {
-            amount: 180.0, radius: 1.4, threshold: 0.0, ..Default::default()
-        });
-        let mut denoise = Layer { id: 4, opacity: 81.0, ..Default::default() };
-        denoise.mask.luma_range = Some(LumaRange::default());
-        denoise.mask.color_range = Some(ColorRange { hue: 210.0, width: 180.0, ..Default::default() });
-        denoise.adjustments.noise_reduction = Some(NoiseReduction {
-            luminance: 67.0, ..Default::default()
-        });
-        denoise.adjustments.moire.amount = 55.0;
-        denoise.adjustments.moire.pattern = 72.0;
-        let mut masked_out = sharpen.clone();
-        masked_out.id = 5;
-        masked_out.mask.density = 0.0;
-        let cases = [
-            vec![color.clone(), fill.clone()],
-            vec![color, sharpen, fill, masked_out, denoise],
-        ];
-        for (case, layers) in cases.into_iter().enumerate() {
-            let adj = AdjustmentSet { layers, ..Default::default() };
-            let map = super::super::geometry::FrameMap::new((w, h), &adj.geometry);
-            let plan = Plan {
-                adj: &adj, input_profile: None, film_lut: None, gamma: GammaLut::new(),
-                fine: false, wb: [1.0; 3], exposure: 1.0, base_contrast: 0.0,
-                curve_rgb: None, curve_r: None, curve_g: None, curve_b: None, curve_luma: None,
-                levels: false, color_editor: false, color_balance: false,
-                layers: layer_plans(&adj, w as f32 / h as f32, w as f32 / 256.0, None, Some(2)),
-            };
-            for region in [NormRect::FULL, NormRect { x: 0.1, y: 0.15, width: 0.7, height: 0.6 }] {
-                for scale in [0.5, 1.0] {
-                    let mut expected = input.clone();
-                    let spatial_changed = apply_layers_original(&mut expected, w, h, &plan, &map, region, scale);
-                    assert_eq!(spatial_changed, case == 1, "mixed case must exercise spatial filters");
-                    let mut actual = input.clone();
-                    apply_layers(&mut actual, w, h, &plan, &map, region, scale);
-                    assert_eq!(actual, expected, "case {case}, region {region:?}, scale {scale}");
-                    assert_ne!(actual, input, "colour layers must change pixels");
-                    assert!(actual.chunks_exact(4).zip(input.chunks_exact(4)).all(|(a, b)| a[3] == b[3]));
-                }
-            }
-        }
-    }
-
     /// Draft vs Final render cost on a 2000x1333 source.
-    /// `cargo test -p lumen-engine bench_render_quality -- --ignored --nocapture`
+    /// `cargo test -p aurora-engine bench_render_quality -- --ignored --nocapture`
     #[test]
     #[ignore = "timing benchmark, run explicitly with --ignored"]
     fn bench_render_quality() {
@@ -1920,6 +1871,59 @@ mod tests {
             }
         }
         buf
+    }
+
+    #[test]
+    fn wb_gains_ignore_the_kelvin_tint_display_pair() {
+        // Same stored gains, different display K/T: the render must not move.
+        let rgba = synthetic(8, 8);
+        let src = Source::from_rgba(8, 8, &rgba);
+        let mut a = AdjustmentSet::default();
+        a.white_balance.gains = Some([1.625, 1.0, 1.412]);
+        a.white_balance.kelvin = 4779.55;
+        a.white_balance.tint = -4.4875;
+        let mut b = a.clone();
+        b.white_balance.kelvin = 3000.0;
+        b.white_balance.tint = 20.0;
+        let ra = render(&src, &a, NormRect::FULL, 8, false, None);
+        let rb = render(&src, &b, NormRect::FULL, 8, false, None);
+        assert_eq!(ra.rgba, rb.rgba);
+    }
+
+    /// Neutral `ColorBalance*` values (the `1;1;1` default) must not move a pixel.
+    #[test]
+    fn neutral_color_balance_gains_keep_the_pixels() {
+        let rgba = [20u8, 20, 20, 255, 220, 220, 220, 255, 60, 120, 200, 255, 200, 80, 40, 255];
+        let src = Source::from_rgba(2, 2, &rgba);
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 2, false, None);
+        let mut adj = AdjustmentSet::default();
+        adj.color_balance_gains = Some(ColorBalanceGains::default());
+        let neutral = render(&src, &adj, NormRect::FULL, 2, false, None);
+        assert_eq!(plain.rgba, neutral.rgba);
+    }
+
+    /// A shadow-only gain hits darks harder than highlights.
+    #[test]
+    fn shadow_gain_dims_dark_pixels_more_than_bright_ones() {
+        let gains = ColorBalanceGains { shadow: [0.5; 3], ..Default::default() };
+        let dark = color_balance_gains([0.1; 3], &gains);
+        let bright = color_balance_gains([0.9; 3], &gains);
+        let dark_drop = 0.1 - dark[0];
+        let bright_drop = 0.9 - bright[0];
+        assert!(dark_drop > 0.03, "dark drop {dark_drop}");
+        assert!(dark_drop > bright_drop, "{dark_drop} vs {bright_drop}");
+        let extreme = color_balance_gains([1.5, -0.2, 0.5], &gains);
+        assert!(extreme.iter().all(|v| v.is_finite()), "{extreme:?}");
+    }
+
+    /// The master gains scale one channel and leave the others alone.
+    #[test]
+    fn master_gain_scales_only_its_channel() {
+        let gains = ColorBalanceGains { master: [0.5, 1.0, 1.0], ..Default::default() };
+        let out = color_balance_gains([0.5, 0.5, 0.5], &gains);
+        assert!((out[0] - 0.25).abs() < 1e-6, "{out:?}");
+        assert_eq!(out[1], 0.5);
+        assert_eq!(out[2], 0.5);
     }
 
     /// Capture One's default layer is not neutral: ZUSMAMOUNT=160 and the noise
@@ -2010,6 +2014,85 @@ mod tests {
         [v, v, v, 255].repeat((w * h) as usize)
     }
 
+    fn film_dir() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::filmcurve::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::filmcurve::use_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/film-curves"));
+        guard
+    }
+
+    #[test]
+    fn linear_film_curve_replaces_the_srgb_encode() {
+        let _guard = film_dir();
+        let (w, h) = (8, 6);
+        let src = Source::from_rgba(w, h, &flat(w, h, 128));
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, w, false, None);
+        let mut adj = AdjustmentSet::default();
+        adj.base.film_curve = Some("AppleiPhonePro-Linear Response".into());
+        let curved = render(&src, &adj, NormRect::FULL, w, false, None);
+        // A linear-response curve is the identity on linear light, so the frame
+        // comes out linear-coded: much darker than the sRGB-encoded default.
+        assert_eq!(curved.rgba[0], 49, "linear response writes linear codes");
+        assert_ne!(curved.rgba, plain.rgba, "the sRGB encode is replaced, not stacked");
+    }
+
+    #[test]
+    fn unknown_film_curve_falls_back_to_the_default_path() {
+        let _guard = film_dir();
+        let (w, h) = (8, 6);
+        let src = Source::from_rgba(w, h, &flat(w, h, 128));
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, w, false, None);
+        let mut adj = AdjustmentSet::default();
+        adj.base.film_curve = Some("no such curve".into());
+        let missing = render(&src, &adj, NormRect::FULL, w, false, None);
+        assert_eq!(missing.rgba, plain.rgba);
+    }
+
+    /// Capture One's `.fcrv` already lands on display codes, so it replaces the
+    /// sRGB encode instead of being fed through it a second time.
+    #[test]
+    fn film_curve_replaces_gamma() {
+        let _guard = film_dir();
+        let (w, h) = (4, 4);
+        let src = Source::from_rgba(w, h, &flat(w, h, 128));
+        let mut adj = AdjustmentSet::default();
+        adj.base.curve = ToneCurvePreset::Linear;
+        adj.base.film_curve = Some("TestHalfDown".into());
+        let out = render(&src, &adj, NormRect::FULL, w, false, None);
+
+        let lut = crate::filmcurve::curve_lut("TestHalfDown").expect("test curve");
+        let lin = srgb_to_linear(128.0 / 255.0);
+        let gamma = GammaLut::new();
+        let expected = (lut_get(&lut, lin).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let stacked = (gamma.get(lut_get(&lut, lin)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        assert_eq!(out.rgba[0], expected, "the curve output is the display code");
+        assert_ne!(out.rgba[0], stacked, "gamma must not stack on the curve");
+    }
+
+    #[test]
+    fn film_curve_darkens_midtones() {
+        let _guard = film_dir();
+        let (w, h) = (4, 4);
+        let src = Source::from_rgba(w, h, &flat(w, h, 96));
+        let mut adj = AdjustmentSet::default();
+        adj.base.curve = ToneCurvePreset::Linear;
+        let plain = render(&src, &adj, NormRect::FULL, w, false, None);
+        adj.base.film_curve = Some("TestHalfDown".into());
+        let curved = render(&src, &adj, NormRect::FULL, w, false, None);
+        assert!(curved.rgba[0] < plain.rgba[0], "0.5 -> 0.2 must darken");
+    }
+
+    #[test]
+    fn film_curve_index_is_built_once() {
+        let _guard = film_dir();
+        let (w, h) = (4, 4);
+        let src = Source::from_rgba(w, h, &flat(w, h, 128));
+        let mut adj = AdjustmentSet::default();
+        adj.base.film_curve = Some("TestHalfDown".into());
+        render(&src, &adj, NormRect::FULL, w, false, None);
+        let scans = crate::filmcurve::scan_count();
+        render(&src, &adj, NormRect::FULL, w, false, None);
+        assert_eq!(crate::filmcurve::scan_count(), scans, "renders must not rescan the directory");
+    }
 
     // ───────────────────────────── mask feather and refine ─────────────────────────────
 
@@ -2150,6 +2233,21 @@ mod tests {
         let at_flipped = |x: f32| shape_value(&flipped, [x, 0.5], 1.0, None).1;
         assert!((at_flipped(0.1) - 0.0).abs() < 1e-6);
         assert!((at_flipped(0.9) - 1.0).abs() < 1e-6);
+    }
+
+    /// C1 names the zero-effect line first; `file_engine` feeds it in reversed
+    /// because this model is full at `start`.
+    #[test]
+    fn a_c1_gradient_reaches_full_effect_at_the_line_it_names_second() {
+        let shape = MaskShape::Linear(LinearGradient {
+            op: MaskOp::Add,
+            start: [0.8, 0.5],
+            end: [0.2, 0.5],
+        });
+        let at = |x: f32| shape_value(&shape, [x, 0.5], 1.0, None).1;
+        assert!(at(0.1) < 1e-6, "the C1 zero line must stay at zero effect");
+        assert!((at(0.9) - 1.0).abs() < 1e-6, "the C1 full line must reach full effect");
+        assert!((at(0.5) - 0.5).abs() < 1e-6);
     }
 
     /// The radial gradient peaks at its centre, reaches zero on the outer
@@ -2373,10 +2471,10 @@ mod tests {
             opacity: 100.0,
             mask,
             adjustments: LocalAdjustments {
-                curves: Curves {
+                curves: Some(Curves {
                     rgb: Curve { points: vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(0.5, 0.95), CurvePoint::new(1.0, 1.0)] },
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             },
         }
@@ -2510,6 +2608,73 @@ mod tests {
         assert_eq!(color_editor([0.5, 0.5, 0.5], &ce, 1.0), [0.5, 0.5, 0.5]);
     }
 
+    /// The default 0 ..= 1 value band must not change one byte of the old
+    /// two-factor (hue × saturation) weight.
+    #[test]
+    fn default_value_band_matches_the_old_weight_over_v() {
+        let mut band = ColorBand {
+            center_hue: 30.0,
+            center_saturation: 0.4,
+            hue_low: -20.0,
+            hue_high: 15.0,
+            sat_low: -40.0,
+            sat_high: 25.0,
+            smoothness: 8.0,
+            ..ColorBand::default()
+        };
+        for extra in [0.0, 5.0] {
+            for h in (0..=360).step_by(5) {
+                for s in [0.0, 0.1, 0.4, 0.8, 1.0] {
+                    let reference = band_weight(&band, extra, h as f32, s, 0.5);
+                    for v in [0.0, 0.05, 0.2, 0.5, 0.8, 1.0, 1.4] {
+                        assert_eq!(
+                            band_weight(&band, extra, h as f32, s, v),
+                            reference,
+                            "default value band moved weight at h={h} s={s} v={v}"
+                        );
+                    }
+                }
+            }
+        }
+        band.inverted = true;
+        assert_eq!(band_weight(&band, 0.0, 30.0, 0.4, 0.9), band_weight(&band, 0.0, 30.0, 0.4, 0.1));
+    }
+
+    /// Old `.portrait` documents have no value bounds and must load as 0 / 1.
+    #[test]
+    fn old_documents_load_the_full_value_band() {
+        let band: ColorBand =
+            serde_json::from_str(r#"{"center_hue":120.0,"smoothness":15.0}"#).unwrap();
+        assert_eq!((band.value_low, band.value_high), (0.0, 1.0));
+        assert_eq!(ColorBand::default().value_low, 0.0);
+        assert_eq!(ColorBand::default().value_high, 1.0);
+    }
+
+    /// Tightening the value band must keep dark and bright pixels untouched.
+    #[test]
+    fn tightened_value_band_only_edits_its_window() {
+        let mut ce = ColorEditor::default();
+        let band = &mut ce.bands[HueSector::Red as usize];
+        band.hue_low = -25.0;
+        band.hue_high = 25.0;
+        band.sat_low = -100.0;
+        band.sat_high = 100.0;
+        band.smoothness = 10.0;
+        band.center_saturation = 1.0;
+        band.value_low = 0.4;
+        band.value_high = 0.6;
+        ce.basic[HueSector::Red as usize] =
+            HslShift { hue: 30.0, saturation: 0.0, lightness: 0.0 };
+
+        let mid = hsv_to_rgb(0.0, 1.0, 0.5);
+        let dark = hsv_to_rgb(0.0, 1.0, 0.1);
+        let bright = hsv_to_rgb(0.0, 1.0, 0.95);
+        let shift = |p: [f32; 3]| signed_hue_delta(hue_of(color_editor(p, &ce, 1.0)), 0.0);
+        assert!(shift(mid) > 20.0, "midtone must still shift: {}", shift(mid));
+        assert!(shift(dark).abs() < 1e-3, "dark pixel moved: {}", shift(dark));
+        assert!(shift(bright).abs() < 1e-3, "bright pixel moved: {}", shift(bright));
+    }
+
     fn narrow_bands(ce: &mut ColorEditor) {
         for band in &mut ce.bands {
             band.hue_low = -6.0;
@@ -2560,6 +2725,8 @@ mod tests {
             hue_high: 0.0,
             sat_low: 0.0,
             sat_high: 0.0,
+            value_low: 0.0,
+            value_high: 1.0,
             smoothness: 0.0,
             homogeneity: [0.0; 3],
             inverted: false,
@@ -2636,6 +2803,8 @@ mod tests {
             hue_high: 1.0e9,
             sat_low: -1.0e9,
             sat_high: 1.0e9,
+            value_low: -1.0e9,
+            value_high: 1.0e9,
             smoothness: 1.0e9,
             homogeneity: [1.0e9; 3],
             inverted: true,
@@ -2684,6 +2853,8 @@ mod tests {
             hue_high: 5.0,
             sat_low: -100.0,
             sat_high: 100.0,
+            value_low: 0.0,
+            value_high: 1.0,
             smoothness: 2.0,
             homogeneity: [0.0; 3],
             inverted: false,
@@ -2813,7 +2984,7 @@ mod tests {
     }
 
     /// Shadow-level and render-cost numbers for the report.
-    /// `cargo test -p lumen-engine --offline shadow_levels_16_vs_8 -- --ignored --nocapture`
+    /// `cargo test -p aurora-engine --offline shadow_levels_16_vs_8 -- --ignored --nocapture`
     #[test]
     #[ignore = "measurement, run explicitly with --ignored"]
     fn shadow_levels_16_vs_8() {
@@ -2970,7 +3141,7 @@ mod tests {
     }
 
     /// The report's case: 6000x4000, an eighth of the frame at 1200 px.
-    /// `cargo test -p lumen-engine --offline zoom_region_bench -- --ignored --nocapture`
+    /// `cargo test -p aurora-engine --offline zoom_region_bench -- --ignored --nocapture`
     #[test]
     #[ignore = "timing benchmark, run explicitly with --ignored"]
     fn zoom_region_bench() {
@@ -3010,6 +3181,27 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "external-fixtures")]
-    include!("../../local-fixtures/mock_process-tests.rs");
+    #[test]
+    fn default_white_balance_gains_are_identity() {
+        // The WB stage is a per-channel multiply; [1,1,1] makes it a no-op, so
+        // default renders stay byte-identical to the pre-fix pipeline.
+        assert_eq!(white_balance_gains(&crate::WhiteBalance::default()), [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn c1_gains_bypass_the_kelvin_conversion() {
+        let wb = crate::WhiteBalance {
+            gains: Some([1.625, 1.0, 1.412]),
+            kelvin: 4779.55,
+            tint: -4.4875,
+            ..Default::default()
+        };
+        let gains = white_balance_gains(&wb);
+        assert_eq!(gains, [1.625, 1.0, 1.412]);
+        assert!((gains[0] / gains[2] - 1.625 / 1.412).abs() < 1e-6);
+
+        // A K/T edit clears `gains`, so the oracle inverse takes over again.
+        let edited = crate::WhiteBalance { gains: None, kelvin: 5000.0, tint: 0.0, ..Default::default() };
+        assert_ne!(white_balance_gains(&edited), [1.0, 1.0, 1.0]);
+    }
 }

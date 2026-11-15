@@ -129,11 +129,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::param_meta::{MetaSource, by_key};
+    use crate::param_meta::{MetaSource, by_key, catalog};
 
     fn contract_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/frontend-contract/params.json")
+            .ancestors()
+            .map(|dir| dir.join("01_frontend/contracts/params.json"))
+            .find(|path| path.is_file())
+            .expect("shared params.json above the crate")
     }
 
     fn contract(id: &str, min: f64, max: f64, default: f64) -> ParamContract {
@@ -146,22 +149,6 @@ mod tests {
             step: 0.1,
             decimals: 2,
             unit: String::new(),
-        }
-    }
-
-    fn catalog_meta(id: &'static str, min: f32, max: f32, default: f32) -> ParamMeta {
-        ParamMeta {
-            key: id,
-            label: id,
-            label_zh: id,
-            min,
-            max,
-            default,
-            unit: "",
-            step: 0.1,
-            decimals: 2,
-            group: "Synthetic",
-            source: MetaSource::Hardcoded,
         }
     }
 
@@ -180,32 +167,35 @@ mod tests {
     }
 
     #[test]
-    fn compare_reports_synthetic_differences_deterministically() {
-        let catalog = [
-            catalog_meta("Alpha", 0.0, 1.0, 0.25),
-            catalog_meta("Beta", -1.0, 1.0, 0.0),
-            catalog_meta("OnlyCatalog", 0.0, 1.0, 0.5),
-        ];
-        let contracts = [
-            contract("OnlyContract", 0.0, 1.0, 0.0),
-            contract("Beta", -2.0, 2.0, 0.5),
-            contract("Alpha", 0.0, 1.0, 0.25),
-        ];
-        let diffs = compare(&catalog, &contracts);
+    fn compare_against_catalog_is_stable() {
+        let contracts = load(&contract_path()).unwrap();
+        let diffs = compare(catalog(), &contracts);
+        assert_eq!(diffs.len(), 10);
         assert_eq!(
-            diffs
-                .iter()
-                .map(|d| (d.id.as_str(), d.field, d.catalog, d.contract))
-                .collect::<Vec<_>>(),
+            diffs.iter().filter(|d| d.field == DiffField::Min).count(),
+            5
+        );
+        assert_eq!(
+            diffs.iter().filter(|d| d.field == DiffField::Max).count(),
+            5
+        );
+        assert_eq!(compare(catalog(), &contracts), diffs);
+        let ids: Vec<&str> = diffs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
             [
-                ("Beta", DiffField::Min, Some(-1.0), Some(-2.0)),
-                ("Beta", DiffField::Max, Some(1.0), Some(2.0)),
-                ("Beta", DiffField::Default, Some(0.0), Some(0.5)),
-                ("OnlyCatalog", DiffField::MissingInContract, Some(0.5), None),
-                ("OnlyContract", DiffField::MissingInCatalog, None, Some(0.0)),
+                "Clarity",
+                "Clarity",
+                "ClarityStructure",
+                "ClarityStructure",
+                "KeystoneAspect",
+                "KeystoneAspect",
+                "KeystoneH",
+                "KeystoneH",
+                "KeystoneV",
+                "KeystoneV"
             ]
         );
-        assert_eq!(compare(&catalog, &contracts), diffs);
     }
 
     #[test]
@@ -237,7 +227,7 @@ mod tests {
     #[test]
     fn bad_json_names_the_file_and_the_cause() {
         let path = std::env::temp_dir().join(format!(
-            "lumen-param-contract-bad-{}.json",
+            "portrait-param-contract-bad-{}.json",
             std::process::id()
         ));
         std::fs::write(&path, "{ not json").unwrap();

@@ -17,7 +17,7 @@ use gpui_kit::{
     AnyElement, App, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, PathBuilder, Pixels, Point, ScrollDelta, SharedString,
     StatefulInteractiveElement, Styled, Window, canvas, div, point, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::{GraphNode, LayerKind, NodeGraph, NodeKind};
+use aurora_engine::{GraphNode, LayerKind, NodeGraph, NodeKind};
 
 use crate::actions;
 use crate::i18n::t;
@@ -680,7 +680,7 @@ pub fn toolbar(state: &Entity<AppState>, docked: bool, cx: &App) -> impl IntoEle
                 .xsmall()
                 .ghost()
                 .icon(Icon::new(if docked { IconName::PanelBottom } else { IconName::Maximize }))
-                .tooltip(format!("{} ({})", if docked { t("Back to the Nodes tab", "放回节点页") } else { t("Dock under the viewer", "停靠到查看器下方") }, crate::platform::keys("ctrl-shift-n")))
+                .tooltip(if docked { t("Back to the Nodes tab (Ctrl+Shift+N)", "放回节点页（Ctrl+Shift+N）") } else { t("Dock under the viewer (Ctrl+Shift+N)", "停靠到查看器下方（Ctrl+Shift+N）") })
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(actions::ToggleNodeDock), cx)),
         )
         .text_color(p.text_muted)

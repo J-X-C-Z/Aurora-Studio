@@ -1,6 +1,6 @@
 //! Face3d pose/camera composition for the PF8033 smile projection.
 //!
-//! Recovered from `pixcake.exe` (`a84519da...64c7`) at
+//! Recovered from `portrait.exe` (`a84519da...64c7`) at
 //! `0x7119B56..0x7119F29` (pose), `0x7B138E0..0x7B13BC4` (camera) and
 //! `0x711A103..0x711AA05` (compose). The native SSE fixture matches within
 //! `1e-6 * max(1, |expected|)`.

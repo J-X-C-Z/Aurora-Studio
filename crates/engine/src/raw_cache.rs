@@ -67,7 +67,7 @@ fn cache_key(path: &Path, dir: &Path, long_side: u32) -> Result<PathBuf> {
         .map_or(0, |d| d.as_nanos());
     let mut a = DefaultHasher::new();
     let mut b = DefaultHasher::new();
-    (2u8, path, meta.len(), mtime, long_side).hash(&mut a);
+    (1u8, path, meta.len(), mtime, long_side).hash(&mut a);
     (0xa5u8, path, mtime, long_side, meta.len()).hash(&mut b);
     let name = format!("{PREFIX}{:016x}{:016x}-{long_side}.png", a.finish(), b.finish());
     Ok(dir.join(name))
@@ -290,11 +290,11 @@ mod tests {
         assert_eq!(cache_files(&dir).len(), 1);
     }
 
-    /// Manual measurement against a real file: set `LUMEN_RAW_CACHE_BENCH`.
+    /// Manual measurement against a real file: set `AURORA_RAW_CACHE_BENCH`.
     #[test]
-    #[ignore = "manual timing, needs LUMEN_RAW_CACHE_BENCH"]
+    #[ignore = "manual timing, needs AURORA_RAW_CACHE_BENCH"]
     fn bench_real_raw() {
-        let Ok(path) = std::env::var("LUMEN_RAW_CACHE_BENCH") else { return };
+        let Ok(path) = std::env::var("AURORA_RAW_CACHE_BENCH") else { return };
         let path = PathBuf::from(path);
         let dir = scratch("bench");
         let started = std::time::Instant::now();

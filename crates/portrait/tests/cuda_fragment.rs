@@ -10,9 +10,9 @@
 
 #[cfg(windows)]
 mod fragment_gpu {
-    use aurora_pixcake::cuda::{CudaError, Dispatch, Nvidia};
-    use aurora_pixcake::raster_fragment::{self, Clamp, Defines, Edge};
-    use aurora_pixcake::Image;
+    use aurora_portrait::cuda::{CudaError, Dispatch, Nvidia};
+    use aurora_portrait::raster_fragment::{self, Clamp, Defines, Edge};
+    use aurora_portrait::Image;
     use std::ffi::c_void;
 
     const PTX: &str = include_str!("../native/cuda/mesh_fragment.ptx");
@@ -61,7 +61,7 @@ mod fragment_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

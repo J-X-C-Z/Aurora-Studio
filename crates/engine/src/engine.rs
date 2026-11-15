@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdjustmentSet, AiMaskKind, Collection, ExportFormat, ExportJob, ImageId, ImageInfo, JobStatus,
-    MatchLook, NormRect, TetherStatus, UserCollection,
+    HdrOptions, MatchLook, NormRect, PanoramaOptions, TetherStatus, UserCollection,
 };
 
 /// 8-bit straight-alpha RGBA pixels, row-major, no padding.
@@ -86,10 +86,42 @@ pub struct PreviewRequest {
     /// Soft-proof black level; 0.0 is neutral.
     #[serde(default)]
     pub proof_black_point: f32,
+    /// Soft-proof rendering intent: 0 perceptual, 1 relative (default),
+    /// 2 saturation, 3 absolute. Only relative is implemented; every other
+    /// value falls back to it so a request never shifts pixels by accident.
+    #[serde(default)]
+    pub rendering_intent: Option<u8>,
+    /// Apply black point compensation while proofing. Ignored without a proof
+    /// profile or without a `bkpt` tag; the frame then reports `degraded`.
+    #[serde(default)]
+    pub black_point_compensation: bool,
 }
 
 fn unit() -> f32 {
     1.0
+}
+
+/// Map a request intent onto the ICC request. C1's enum order is perceptual,
+/// relative, saturation, absolute; unknown values and intents that need
+/// `A2B1`/`B2A1` tables stay on relative and report why.
+fn proof_rendering(intent: Option<u8>, black_point_compensation: bool) -> (crate::icc::Rendering, Option<String>) {
+    use crate::icc::{Intent, Rendering};
+    let note = match intent {
+        None | Some(1) => None,
+        Some(0) => Some("rendering intent perceptual: unsupported, using relative".to_string()),
+        Some(2) => Some("rendering intent saturation: unsupported, using relative".to_string()),
+        Some(3) => Some("rendering intent absolute: unsupported, using relative".to_string()),
+        Some(other) => Some(format!("rendering intent {other}: unknown, using relative")),
+    };
+    (Rendering { intent: Intent::Relative, black_point_compensation }, note)
+}
+
+/// Rendering to use for a request; intent and BPC only apply while proofing.
+pub(crate) fn request_rendering(request: &PreviewRequest) -> (crate::icc::Rendering, Option<String>) {
+    if request.proof_profile.is_none() {
+        return (crate::icc::Rendering::default(), None);
+    }
+    proof_rendering(request.rendering_intent, request.black_point_compensation)
 }
 
 #[derive(Clone, Debug)]
@@ -115,28 +147,41 @@ pub struct GamutWarning {
 /// Workspace sRGB -> proof profile -> display profile, 8-bit. The cached frame
 /// stays sRGB; only requested conversions copy the pixels. Proof failure keeps
 /// the original frame and reports why.
-pub(crate) fn with_display_profile(image: RgbaImage, proof: Option<&str>, path: Option<&Path>, levels: (f32, f32)) -> (RgbaImage, Option<String>) {
+pub(crate) fn with_display_profile(
+    image: RgbaImage,
+    proof: Option<&str>,
+    path: Option<&Path>,
+    levels: (f32, f32),
+    rendering: crate::icc::Rendering,
+) -> (RgbaImage, Option<String>) {
     let mut image = image;
+    let mut degraded = None;
     if let Some(name) = proof {
         let Some(profile) = crate::icc::profile(name) else {
             return (image, Some(format!("proof profile {name}: not found")));
         };
         if !crate::icc::is_srgb(&profile) {
             let pixels = Arc::make_mut(&mut image.pixels);
-            crate::icc::convert_srgb_to(pixels, &profile);
+            if crate::icc::convert_srgb_to_with(pixels, &profile, rendering).is_none() {
+                crate::icc::convert_srgb_to(pixels, &profile);
+                degraded = Some("proof rendering not supported by profile: using relative".to_string());
+            }
         }
         apply_paper_levels(&mut image, levels.0, levels.1);
     }
-    let Some(path) = path else { return (image, None) };
+    let Some(path) = path else { return (image, degraded) };
     match crate::icc::load_profile(path) {
         Ok(profile) => {
             if !crate::icc::is_srgb(&profile) {
                 let pixels = Arc::make_mut(&mut image.pixels);
                 crate::icc::convert_srgb_to(pixels, &profile);
             }
-            (image, None)
+            (image, degraded)
         }
-        Err(err) => (image, Some(format!("display profile {}: {err}", path.display()))),
+        Err(err) => {
+            let reason = format!("display profile {}: {err}", path.display());
+            (image, Some(degraded.map_or(reason.clone(), |d| format!("{d}; {reason}"))))
+        }
     }
 }
 
@@ -164,12 +209,20 @@ pub(crate) struct ProfileKey {
     display: Option<PathBuf>,
     proof: Option<String>,
     levels: (u32, u32),
+    rendering: crate::icc::Rendering,
 }
 
 impl ProfileKey {
-    pub(crate) fn new(frame: crate::preview_cache::PreviewKey, proof: Option<&str>, display: Option<&Path>, levels: (f32, f32)) -> Self {
+    pub(crate) fn new(
+        frame: crate::preview_cache::PreviewKey,
+        proof: Option<&str>,
+        display: Option<&Path>,
+        levels: (f32, f32),
+        rendering: crate::icc::Rendering,
+    ) -> Self {
         let levels = if proof.is_some() { (levels.0.to_bits(), levels.1.to_bits()) } else { (1.0f32.to_bits(), 0.0f32.to_bits()) };
-        Self { frame, display: display.map(Path::to_path_buf), proof: proof.map(str::to_string), levels }
+        let rendering = if proof.is_some() { rendering } else { crate::icc::Rendering::default() };
+        Self { frame, display: display.map(Path::to_path_buf), proof: proof.map(str::to_string), levels, rendering }
     }
 }
 
@@ -195,6 +248,7 @@ impl ProfileCache {
         proof: Option<&str>,
         display: Option<&Path>,
         levels: (f32, f32),
+        rendering: crate::icc::Rendering,
     ) -> (RgbaImage, Option<String>) {
         if proof.is_none() && display.is_none() {
             return (image, None);
@@ -205,7 +259,7 @@ impl ProfileCache {
             self.entries.push(entry);
             return out;
         }
-        let (out, degraded) = with_display_profile(image, proof, display, levels);
+        let (out, degraded) = with_display_profile(image, proof, display, levels, rendering);
         self.entries.push((key, out.clone(), degraded.clone()));
         const CAPACITY: usize = 4;
         const MAX_BYTES: usize = 256 << 20;
@@ -288,6 +342,16 @@ pub enum AutoTarget {
     Keystone,
 }
 
+/// A layer imported from a Capture One catalog, shown read-only in the Layers
+/// panel. The mask pixels are not decoded yet, so nothing renders from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerSummary {
+    pub name: String,
+    pub enabled: bool,
+    /// Capture One's `ZMASKUUID`; the `.comask` payload is not resolved yet.
+    pub mask_uuid: Option<String>,
+}
+
 /// What an engine can actually do on this machine, so the interface can grey
 /// out menus instead of guessing. Detection must stay cheap: check that model
 /// files and platform libraries exist, never run inference.
@@ -304,20 +368,6 @@ pub struct EngineCapabilities {
 }
 
 pub trait ImageEngine: Send + Sync + 'static {
-    /// Explicit-input portrait stages; availability is separate from automatic UI processing.
-    #[cfg(windows)]
-    fn portrait_capabilities(&self) -> Vec<crate::portrait::Capability> {
-        crate::portrait::capabilities()
-    }
-    #[cfg(windows)]
-    fn render_portrait_stage(&self, request: &crate::portrait::Request<'_>) -> anyhow::Result<crate::portrait::Frame> {
-        crate::portrait::render(request)
-    }
-    #[cfg(windows)]
-    fn export_portrait_stage(&self, request: &crate::portrait::Request<'_>, info: &ImageInfo,
-        recipe: &crate::ProcessRecipe, directory: &Path) -> anyhow::Result<PathBuf> {
-        crate::portrait::export(request, info, recipe, directory)
-    }
     /// Human-readable engine name and version, shown in About.
     fn name(&self) -> String;
 
@@ -325,9 +375,51 @@ pub trait ImageEngine: Send + Sync + 'static {
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities::default()
     }
-    /// Basic exposure fusion for bracketed frames; alignment/deghosting are not applied.
+
+    /// Local layers that came from a Capture One catalog. Read-only: the mask
+    /// pixels are not decoded, so these are listed but never rendered.
+    fn layer_summaries(&self, _image: ImageId) -> Vec<LayerSummary> {
+        Vec::new()
+    }
+
+    /// Read-only `ZRETOUCHINGLAYER` mask summaries: skin evening and blemish
+    /// removal UUIDs, plus whether a `.comask` record has a Map grid. Nothing
+    /// here reaches the renderer.
+    fn retouch_masks(&self, _image: ImageId) -> Vec<crate::c1_retouch::RetouchMaskSummary> {
+        Vec::new()
+    }
+
+    /// Merges bracketed exposures into one 16-bit TIFF beside the first frame
+    /// and catalogs it. Alignment, deghosting and auto tone are not applied yet.
     fn merge_hdr_frames(&self, _ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
         anyhow::bail!("HDR merge is not supported by this engine")
+    }
+
+    /// Like [`Self::merge_hdr_frames`], with the interface's merge options.
+    /// Engines that have not consumed the options keep the old behaviour.
+    fn merge_hdr_with_options(
+        &self,
+        ids: &[ImageId],
+        _options: &HdrOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        self.merge_hdr_frames(ids)
+    }
+
+    /// Stitches frames left to right into one 8-bit TIFF beside the first frame
+    /// and catalogs it. Horizontal alignment and overlap feathering only:
+    /// distortion, perspective and exposure matching are not applied yet.
+    fn merge_panorama_frames(&self, _ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        anyhow::bail!("Panorama merge is not supported by this engine")
+    }
+
+    /// Like [`Self::merge_panorama_frames`], with the interface's merge options.
+    /// Engines that have not consumed the options keep the old behaviour.
+    fn merge_panorama_with_options(
+        &self,
+        ids: &[ImageId],
+        _options: &PanoramaOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        self.merge_panorama_frames(ids)
     }
 
     // ── Catalog ──
@@ -337,18 +429,6 @@ pub trait ImageEngine: Send + Sync + 'static {
     /// Adds files (or every image in a folder) and returns what was added.
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>>;
     fn collections(&self) -> Vec<Collection>;
-    fn library_root(&self) -> Option<PathBuf> {
-        None
-    }
-    fn collection_path(&self, _id: u64) -> Option<PathBuf> {
-        None
-    }
-    fn user_collections(&self) -> Vec<UserCollection> {
-        Vec::new()
-    }
-    fn manage_files(&self, _action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
-        anyhow::bail!("library filesystem operations are unsupported by this engine")
-    }
     /// Images listed by one engine collection; `None` when the interface should
     /// derive membership itself (all images, recent imports, folders).
     fn collection_images(&self, _collection: u64) -> Option<Vec<ImageId>> {
@@ -365,19 +445,9 @@ pub trait ImageEngine: Send + Sync + 'static {
     }
     /// Persists rating, tag, keywords and IPTC changes made in the interface.
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()>;
-    /// Persists a selection in one FileEngine commit, with rollback on I/O errors.
-    fn update_infos(&self, infos: &[ImageInfo]) -> anyhow::Result<()> {
-        for info in infos { self.update_info(info)?; }
-        Ok(())
-    }
     /// Adjustments stored for an image, so reopening a session restores them.
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet;
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()>;
-    /// Persists a selection together; fallback engines retain their single-save behavior.
-    fn save_adjustments_batch(&self, changes: &[(ImageId, &AdjustmentSet)]) -> anyhow::Result<()> {
-        for &(image, adjustments) in changes { self.save_adjustments(image, adjustments)?; }
-        Ok(())
-    }
     /// Creates a new variant of `image` with the given adjustments; returns its info.
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo>;
 
@@ -397,11 +467,13 @@ pub trait ImageEngine: Send + Sync + 'static {
         levels: (f32, f32),
     ) -> anyhow::Result<RgbaImage> {
         let img = self.thumbnail(image, adjustments, max_size)?;
-        Ok(with_display_profile(img, proof_profile, display_profile, levels).0)
+        Ok(with_display_profile(img, proof_profile, display_profile, levels, crate::icc::Rendering::default()).0)
     }
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame>;
-    /// Compatibility entry point; interactive previews preserve full pixel quality.
-    /// Implementations may reuse cached work, but must not reduce resolution.
+    /// [`Self::render_preview`] with an explicit quality switch. `fast` renders at
+    /// half resolution and upsamples, for the frames issued while a slider is
+    /// dragged; `false` is exactly `render_preview`. Engines that cannot go
+    /// faster ignore the flag.
     fn render_preview_fast(&self, request: &PreviewRequest, _fast: bool) -> anyhow::Result<PreviewFrame> {
         self.render_preview(request)
     }
@@ -504,6 +576,7 @@ pub struct StyleInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icc::Rendering;
 
     fn request() -> PreviewRequest {
         PreviewRequest {
@@ -519,6 +592,8 @@ mod tests {
             proof_profile: None,
             proof_paper_white: 1.0,
             proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
         }
     }
 
@@ -529,11 +604,51 @@ mod tests {
         value.as_object_mut().unwrap().remove("proof_profile");
         value.as_object_mut().unwrap().remove("proof_paper_white");
         value.as_object_mut().unwrap().remove("proof_black_point");
+        value.as_object_mut().unwrap().remove("rendering_intent");
+        value.as_object_mut().unwrap().remove("black_point_compensation");
         let request: PreviewRequest = serde_json::from_value(value).unwrap();
         assert_eq!(request.display_profile, None);
         assert_eq!(request.proof_profile, None);
         assert_eq!(request.proof_paper_white, 1.0);
         assert_eq!(request.proof_black_point, 0.0);
+        assert_eq!(request.rendering_intent, None);
+        assert!(!request.black_point_compensation);
+    }
+
+    #[test]
+    fn relative_without_bpc_matches_the_legacy_conversion() {
+        let Some(profile) = crate::icc::profile("NikonZ6III-Generic") else { return };
+        let image = RgbaImage::new(2, 1, vec![128, 64, 32, 255, 0, 255, 128, 255]);
+        let (out, degraded) = with_display_profile(image.clone(), Some("NikonZ6III-Generic"), None, (1.0, 0.0), Rendering::default());
+        let mut legacy = image.pixels.as_ref().clone();
+        crate::icc::convert_srgb_to(&mut legacy, &profile);
+        assert_eq!(&*out.pixels, &legacy, "relative + no BPC must equal the old path");
+        assert!(degraded.is_none());
+    }
+
+    #[test]
+    fn unknown_intent_falls_back_to_relative_without_panic() {
+        let (fallback, note) = proof_rendering(Some(250), false);
+        assert_eq!(fallback, Rendering::default());
+        assert!(note.as_deref().is_some_and(|n| n.contains("unknown")));
+        let (perceptual, note) = proof_rendering(Some(0), false);
+        assert_eq!(perceptual, Rendering::default());
+        assert!(note.as_deref().is_some_and(|n| n.contains("unsupported")));
+        let (bpc_only, note) = proof_rendering(Some(250), true);
+        assert!(bpc_only.black_point_compensation, "fallback keeps BPC");
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn bpc_without_bkpt_falls_back_to_relative_and_reports() {
+        let Some(profile) = crate::icc::profile("NikonZ6III-Generic") else { return };
+        assert!(profile.bkpt.is_none(), "LUT camera profile has no bkpt tag");
+        let image = RgbaImage::new(1, 1, vec![128, 64, 32, 255]);
+        let (plain, _) = with_display_profile(image.clone(), Some("NikonZ6III-Generic"), None, (1.0, 0.0), Rendering::default());
+        let bpc = Rendering { black_point_compensation: true, ..Rendering::default() };
+        let (out, degraded) = with_display_profile(image, Some("NikonZ6III-Generic"), None, (1.0, 0.0), bpc);
+        assert_eq!(out.pixels, plain.pixels, "unsupported BPC must not change pixels");
+        assert!(degraded.as_deref().is_some_and(|d| d.contains("not supported")));
     }
 
     #[test]
@@ -548,7 +663,7 @@ mod tests {
     #[test]
     fn missing_profile_keeps_srgb_and_reports_reason() {
         let image = RgbaImage::new(1, 1, vec![10, 20, 30, 255]);
-        let (out, degraded) = with_display_profile(image, None, Some(Path::new("C:/no/such/profile.icc")), (1.0, 0.0));
+        let (out, degraded) = with_display_profile(image, None, Some(Path::new("C:/no/such/profile.icc")), (1.0, 0.0), Rendering::default());
         assert_eq!(&*out.pixels, &[10, 20, 30, 255]);
         assert!(degraded.is_some(), "missing profile must report a reason");
     }
@@ -560,7 +675,7 @@ mod tests {
             return;
         }
         let image = RgbaImage::new(1, 1, vec![12, 200, 99, 255]);
-        let (out, degraded) = with_display_profile(image, None, Some(path), (1.0, 0.0));
+        let (out, degraded) = with_display_profile(image, None, Some(path), (1.0, 0.0), Rendering::default());
         assert_eq!(&*out.pixels, &[12, 200, 99, 255]);
         assert!(degraded.is_none());
     }
@@ -568,7 +683,7 @@ mod tests {
     #[test]
     fn no_proof_profile_keeps_pixels() {
         let image = RgbaImage::new(1, 1, vec![7, 8, 9, 255]);
-        let (out, degraded) = with_display_profile(image, None, None, (1.0, 0.0));
+        let (out, degraded) = with_display_profile(image, None, None, (1.0, 0.0), Rendering::default());
         assert_eq!(&*out.pixels, &[7, 8, 9, 255]);
         assert!(degraded.is_none());
     }
@@ -576,7 +691,7 @@ mod tests {
     #[test]
     fn unknown_proof_profile_keeps_pixels_and_reports_reason() {
         let image = RgbaImage::new(1, 1, vec![7, 8, 9, 255]);
-        let (out, degraded) = with_display_profile(image, Some("No Such Profile"), None, (1.0, 0.0));
+        let (out, degraded) = with_display_profile(image, Some("No Such Profile"), None, (1.0, 0.0), Rendering::default());
         assert_eq!(&*out.pixels, &[7, 8, 9, 255]);
         assert!(degraded.as_deref().is_some_and(|d| d.contains("No Such Profile")));
     }
@@ -587,7 +702,7 @@ mod tests {
             return;
         }
         let image = RgbaImage::new(1, 1, vec![128, 64, 32, 255]);
-        let (out, degraded) = with_display_profile(image, Some("NikonZ6III-Generic"), None, (1.0, 0.0));
+        let (out, degraded) = with_display_profile(image, Some("NikonZ6III-Generic"), None, (1.0, 0.0), Rendering::default());
         assert_ne!(&*out.pixels, &[128, 64, 32, 255]);
         assert!(degraded.is_none());
     }
@@ -614,20 +729,20 @@ mod tests {
         let frame = crate::preview_cache::key(ImageId(1), &AdjustmentSet::default(), NormRect::FULL, 64, false, None, false);
         let mut cache = ProfileCache::default();
         let image = RgbaImage::new(1, 1, vec![128, 64, 32, 255]);
-        let key = ProfileKey::new(frame, Some("NikonZ6III-Generic"), None, (0.8, 0.1));
-        let (a, _) = cache.converted(key.clone(), image.clone(), Some("NikonZ6III-Generic"), None, (0.8, 0.1));
+        let key = ProfileKey::new(frame, Some("NikonZ6III-Generic"), None, (0.8, 0.1), Rendering::default());
+        let (a, _) = cache.converted(key.clone(), image.clone(), Some("NikonZ6III-Generic"), None, (0.8, 0.1), Rendering::default());
         assert_eq!(cache.len(), 1);
-        let (b, _) = cache.converted(key, image.clone(), Some("NikonZ6III-Generic"), None, (0.8, 0.1));
+        let (b, _) = cache.converted(key, image.clone(), Some("NikonZ6III-Generic"), None, (0.8, 0.1), Rendering::default());
         assert_eq!(cache.len(), 1, "same key must hit");
         assert_eq!(a.pixels, b.pixels);
-        let other = ProfileKey::new(frame, Some("NikonZ6III-Generic"), None, (0.6, 0.2));
-        cache.converted(other, image.clone(), Some("NikonZ6III-Generic"), None, (0.6, 0.2));
+        let other = ProfileKey::new(frame, Some("NikonZ6III-Generic"), None, (0.6, 0.2), Rendering::default());
+        cache.converted(other, image.clone(), Some("NikonZ6III-Generic"), None, (0.6, 0.2), Rendering::default());
         assert_eq!(cache.len(), 2, "different paper levels must miss");
-        let display = ProfileKey::new(frame, None, Some(Path::new("C:/icc/a.icc")), (1.0, 0.0));
-        cache.converted(display, image.clone(), None, Some(Path::new("C:/icc/a.icc")), (1.0, 0.0));
+        let display = ProfileKey::new(frame, None, Some(Path::new("C:/icc/a.icc")), (1.0, 0.0), Rendering::default());
+        cache.converted(display, image.clone(), None, Some(Path::new("C:/icc/a.icc")), (1.0, 0.0), Rendering::default());
         assert_eq!(cache.len(), 3, "different display profile must miss");
-        let plain = ProfileKey::new(frame, None, None, (1.0, 0.0));
-        cache.converted(plain, image, None, None, (1.0, 0.0));
+        let plain = ProfileKey::new(frame, None, None, (1.0, 0.0), Rendering::default());
+        cache.converted(plain, image, None, None, (1.0, 0.0), Rendering::default());
         assert_eq!(cache.len(), 3, "no profile skips the cache");
     }
 

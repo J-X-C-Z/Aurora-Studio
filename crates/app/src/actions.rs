@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::i18n::t;
 
 actions!(
-    lumen,
+    portrait,
     [
         Quit,
         SaveUserStyle,
@@ -33,7 +33,6 @@ actions!(
         OpenFolder,
         OpenCatalog,
         NewSession,
-        NewCatalog,
         SyncXmp,
         ExportSelected,
         OpenExportDialog,
@@ -91,28 +90,28 @@ actions!(
 );
 
 #[derive(Action, Clone, PartialEq, Deserialize)]
-#[action(namespace = lumen, no_json)]
+#[action(namespace = portrait, no_json)]
 pub struct SetRating(pub i8);
 
 #[derive(Action, Clone, PartialEq, Deserialize)]
-#[action(namespace = lumen, no_json)]
+#[action(namespace = portrait, no_json)]
 pub struct SetColorTag(pub u8);
 
 #[derive(Action, Clone, PartialEq, Deserialize)]
-#[action(namespace = lumen, no_json)]
+#[action(namespace = portrait, no_json)]
 pub struct SelectToolTab(pub usize);
 
 #[derive(Action, Clone, PartialEq, Deserialize)]
-#[action(namespace = lumen, no_json)]
+#[action(namespace = portrait, no_json)]
 pub struct SelectCursor(pub u8);
 
 #[derive(Action, Clone, PartialEq, Deserialize)]
-#[action(namespace = lumen, no_json)]
+#[action(namespace = portrait, no_json)]
 pub struct SetWorkspace(pub usize);
 
 /// Opens the `n`-th entry of File → Open Recent.
 #[derive(Action, Clone, PartialEq, Deserialize)]
-#[action(namespace = lumen, no_json)]
+#[action(namespace = portrait, no_json)]
 pub struct OpenRecent(pub usize);
 
 /// Key context of the workspace.
@@ -144,8 +143,6 @@ pub fn shortcuts() -> Vec<Shortcut> {
     let rate = t("Rating & Tags", "评级与色标");
     add("quit", "Exit", "退出", file, &["ctrl-q"], Box::new(Quit));
     add("import", "Import images", "导入图像", file, &["ctrl-shift-i"], Box::new(Import));
-    add("new-catalog", "New catalog", "新建目录", file, &["ctrl-shift-n"], Box::new(NewCatalog));
-    add("new-session", "New session", "新建会话", file, &["ctrl-n"], Box::new(NewSession));
     add("export-selected", "Process selected", "处理所选", file, &["ctrl-d"], Box::new(ExportSelected));
     add("export", "Export…", "导出…", file, &["ctrl-shift-d"], Box::new(OpenExportDialog));
     add("print", "Print…", "打印…", file, &["ctrl-p"], Box::new(Print));
@@ -230,24 +227,13 @@ pub fn shortcuts() -> Vec<Shortcut> {
 
 /// The keys `shortcut` is bound to after the user's overrides.
 pub fn keys_for(shortcut: &Shortcut, overrides: &std::collections::BTreeMap<String, Vec<String>>) -> Vec<String> {
-    // Overrides are what the user pressed, so they are already native.
-    // Two defaults can land on the same Mac key (Ctrl+Y and Ctrl+Shift+Z are both ⇧⌘Z).
-    overrides.get(&shortcut.id).cloned().unwrap_or_else(|| {
-        let mut keys: Vec<String> = Vec::new();
-        for k in &shortcut.defaults {
-            let k = crate::platform::native_keys(k);
-            if !keys.contains(&k) {
-                keys.push(k);
-            }
-        }
-        keys
-    })
+    overrides.get(&shortcut.id).cloned().unwrap_or_else(|| shortcut.defaults.iter().map(|k| k.to_string()).collect())
 }
 
 /// (Re)installs Aurora's key bindings with `overrides`, keeping every binding
 /// the component libraries registered.
 pub fn bind_keys(cx: &mut App, overrides: &std::collections::BTreeMap<String, Vec<String>>) {
-    let others: Vec<KeyBinding> = cx.key_bindings().borrow().bindings().filter(|b| !b.action().name().starts_with("lumen::")).cloned().collect();
+    let others: Vec<KeyBinding> = cx.key_bindings().borrow().bindings().filter(|b| !b.action().name().starts_with("portrait::")).cloned().collect();
     cx.clear_key_bindings();
     cx.bind_keys(others);
     // Workspace shortcuts stand aside while a text input has focus, so typing a
@@ -265,9 +251,37 @@ pub fn bind_keys(cx: &mut App, overrides: &std::collections::BTreeMap<String, Ve
     cx.bind_keys(keys);
 }
 
-/// `ctrl-shift-k` → `Ctrl+Shift+K` (`⇧⌘K` on a Mac).
+/// `ctrl-shift-k` → `Ctrl+Shift+K`.
 pub fn display_keys(keys: &str) -> String {
-    crate::platform::display(keys)
+    keys.split(' ')
+        .map(|stroke| {
+            stroke
+                .split('-')
+                .filter(|p| !p.is_empty())
+                .map(|p| match p {
+                    "ctrl" => "Ctrl".to_string(),
+                    "alt" => "Alt".to_string(),
+                    "shift" => "Shift".to_string(),
+                    "cmd" | "super" | "win" => "Win".to_string(),
+                    "left" => "←".to_string(),
+                    "right" => "→".to_string(),
+                    "up" => "↑".to_string(),
+                    "down" => "↓".to_string(),
+                    "enter" => "Enter".to_string(),
+                    "escape" => "Esc".to_string(),
+                    "delete" => "Delete".to_string(),
+                    "space" => "Space".to_string(),
+                    other if other.len() == 1 => other.to_uppercase(),
+                    other => {
+                        let mut c = other.chars();
+                        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
@@ -279,8 +293,7 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
     workspace_items.push(MenuItem::separator());
     workspace_items.push(MenuItem::action(t("Save Workspace…", "存储工作区…"), SaveWorkspace));
     workspace_items.push(MenuItem::action(t("Tools on the Other Side", "工具栏换边"), ToggleInspectorSide));
-    let mac = crate::platform::is_mac();
-    let mut menus = vec![
+    vec![
         Menu {
             name: t("File", "文件").into(),
             items: vec![
@@ -289,23 +302,17 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
                 MenuItem::action(t("Open Folder…", "打开文件夹…"), OpenFolder),
                 MenuItem::action(t("Open Capture One Catalog… (partial)", "打开 Capture One 目录…（部分）"), OpenCatalog),
                 MenuItem::submenu(Menu { name: t("Open Recent", "打开最近").into(), items: recent_items, disabled: false }),
-                MenuItem::action(t("New Catalog…", "新建目录…"), NewCatalog),
-                MenuItem::action(t("New Session…", "新建会话…"), NewSession),
+                MenuItem::action(t("New Session… (unavailable)", "新建会话…（后端未接）"), NewSession),
                 MenuItem::action(t("Sync XMP Metadata (unavailable)", "同步 XMP 元数据（后端未接）"), SyncXmp),
                 MenuItem::separator(),
                 MenuItem::action(t("Export Selected", "导出所选"), ExportSelected),
                 MenuItem::action(t("Export…", "导出…"), OpenExportDialog),
                 MenuItem::action(t("Print…", "打印…"), Print),
-            ]
-            .into_iter()
-            // A Mac keeps Preferences and Quit in the application menu.
-            .chain((!mac).then(|| vec![
                 MenuItem::separator(),
                 MenuItem::action(t("Preferences…", "首选项…"), ShowPreferences),
                 MenuItem::separator(),
                 MenuItem::action(t("Exit", "退出"), Quit),
-            ]).into_iter().flatten())
-            .collect(),
+            ],
             disabled: false,
         },
         Menu {
@@ -424,28 +431,12 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
             items: vec![
                 MenuItem::action(t("Keyboard Shortcuts", "键盘快捷键"), ShowShortcuts),
                 MenuItem::action(t("Switch Language (English / 中文)", "切换语言（English / 中文）"), ToggleLanguage),
-            ]
-            .into_iter()
-            .chain((!mac).then(|| vec![MenuItem::separator(), MenuItem::action(t("About Aurora Studio", "关于 Aurora Studio"), ShowAbout)]).into_iter().flatten())
-            .collect(),
-            disabled: false,
-        },
-    ];
-    if mac {
-        // The application menu, first in the Mac menu bar, named after the app.
-        menus.insert(0, Menu {
-            name: "Aurora Studio".into(),
-            items: vec![
+                MenuItem::separator(),
                 MenuItem::action(t("About Aurora Studio", "关于 Aurora Studio"), ShowAbout),
-                MenuItem::separator(),
-                MenuItem::action(t("Preferences…", "首选项…"), ShowPreferences),
-                MenuItem::separator(),
-                MenuItem::action(t("Quit Aurora Studio", "退出 Aurora Studio"), Quit),
             ],
             disabled: false,
-        });
-    }
-    menus
+        },
+    ]
 }
 
 /// Installs the menus for both the native menu bar and the in-window [`AppMenuBar`].

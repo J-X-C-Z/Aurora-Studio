@@ -2,10 +2,10 @@
 
 #[cfg(windows)]
 mod moisture_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_moisture::{Moisture, BODY_KERNEL, FACE_KERNEL};
-    use aurora_pixcake::kernels::moisture::{self, FaceParams, Lut1D, MaskChannel, SkinMap};
-    use aurora_pixcake::{Image, Refusal};
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_moisture::{Moisture, BODY_KERNEL, FACE_KERNEL};
+    use aurora_portrait::kernels::moisture::{self, FaceParams, Lut1D, MaskChannel, SkinMap};
+    use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -33,7 +33,7 @@ mod moisture_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

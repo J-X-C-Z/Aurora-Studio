@@ -19,7 +19,7 @@
 //! compared pixel-for-pixel against
 //! `kernels::facial_smooth::composite_pixel` without an RGBA8 round trip.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::ffi::{c_char, c_void, CString};
 
 use crate::{metal_mesh, metal_smile};
@@ -1406,11 +1406,11 @@ impl MetalContext {
 }
 
 pub fn execute_facial_smooth(input: &SmoothInput<'_>) -> MetalResult<Vec<f32>> {
-    MetalContext::new()?.facial_smooth(input)
+    with_shared_metal_context(|context| context.facial_smooth(input))
 }
 
 pub fn execute_facial_smooth_rgba8(input: &SmoothInput<'_>) -> MetalResult<Vec<u8>> {
-    MetalContext::new()?.facial_smooth_rgba8(input)
+    with_shared_metal_context(|context| context.facial_smooth_rgba8(input))
 }
 
 fn quantize_rgba8(pixels: &[f32]) -> Vec<u8> {
@@ -1421,11 +1421,11 @@ fn quantize_rgba8(pixels: &[f32]) -> Vec<u8> {
 }
 
 pub fn execute_masked_whiten(input: &WhitenInput<'_>) -> MetalResult<Vec<u8>> {
-    MetalContext::new()?.masked_whiten(input)
+    with_shared_metal_context(|context| context.masked_whiten(input))
 }
 
 pub fn execute_mask_projection(input: &ProjectionInput<'_>) -> MetalResult<Vec<u8>> {
-    MetalContext::new()?.project_mask(input)
+    with_shared_metal_context(|context| context.project_mask(input))
 }
 
 pub fn execute_skin_lut_fixed(
@@ -1434,7 +1434,25 @@ pub fn execute_skin_lut_fixed(
     lut_rgb: &[u8],
     mix: f32,
 ) -> MetalResult<Image> {
-    MetalContext::new()?.skin_lut_fixed(source, mask_r, lut_rgb, mix)
+    with_shared_metal_context(|context| context.skin_lut_fixed(source, mask_r, lut_rgb, mix))
+}
+
+thread_local! {
+    static SHARED_METAL_CONTEXT: RefCell<Option<MetalContext>> = const { RefCell::new(None) };
+}
+
+/// Reuse the thread-local Metal device, queue and compiled pipelines across
+/// convenience executions. `MetalContext` is thread-bound, so this preserves
+/// its no-cross-thread lifetime while avoiding repeated creation.
+fn with_shared_metal_context<T>(
+    execute: impl FnOnce(&MetalContext) -> MetalResult<T>,
+) -> MetalResult<T> {
+    SHARED_METAL_CONTEXT.with_borrow_mut(|context| {
+        if context.is_none() {
+            *context = Some(MetalContext::new()?);
+        }
+        execute(context.as_ref().expect("context was just created"))
+    })
 }
 
 pub fn check_gate(pf: u32, pf_value: f32) -> MetalResult<()> {
@@ -1636,7 +1654,7 @@ fn report_error(lib: &Lib, error: *mut c_void) {
         let text = send_cstr0(lib, description, "UTF8String");
         if !text.is_null() {
             eprintln!(
-                "pixcake metal: {}",
+                "portrait metal: {}",
                 std::ffi::CStr::from_ptr(text).to_string_lossy()
             );
         }
@@ -2504,6 +2522,34 @@ mod tests {
         };
         assert_eq!(
             execute_facial_smooth(&input),
+            Err(MetalRefusal::HostUnavailable)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shared_convenience_entries_reuse_unavailable_refusal() {
+        let (source, base, residual, mask, skin) = one_pixel();
+        let input = SmoothInput {
+            source: &source,
+            mask_rgba: &mask,
+            skin_mask: &skin,
+            base: &base,
+            residual: &residual,
+            width: 1,
+            height: 1,
+            stride: 1,
+            pf: 90023,
+            pf_value: 0.5,
+            ticket: 1,
+            uniforms: test_uniforms(),
+        };
+        assert_eq!(
+            execute_facial_smooth(&input),
+            Err(MetalRefusal::HostUnavailable)
+        );
+        assert_eq!(
+            execute_facial_smooth_rgba8(&input),
             Err(MetalRefusal::HostUnavailable)
         );
     }

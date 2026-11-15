@@ -5,11 +5,35 @@
 // - `TextureDegreeCore.cs` (FaceSurfaceBlur AlgoType=0 negative branch)
 // - `Pf8070ClarityCore.cs` (type136 SharpnessWithMask law)
 //
-// Masks, gloss LUTs, base/blur planes and degrees are caller inputs. The PF8069
+// Masks, base/blur planes and degrees are explicit arguments. The PF8069
 // positive FaceSticker branch stays a named refusal.
 
 use crate::{Access, EffectMeta, Image, Refusal};
 
+const fn nibble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => panic!("bad hex digit"),
+    }
+}
+
+const fn hex_bytes<const N: usize>(text: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut index = 0;
+    while index < N {
+        out[index] = nibble(text[index * 2]) << 4 | nibble(text[index * 2 + 1]);
+        index += 1;
+    }
+    out
+}
+
+// Verbatim from `Pf8068Gloss.Tables.cs`.
+const GLOSS_POSITIVE1: [u8; 256] = hex_bytes(b"0001020404050607090a0b0c0d0e0f10111314151617191a1a1b1c1e1f20212224252627282a2b2c2d2f3030313234353637383a3b3c3d3e40414243444647494a4c4d4e4f50525354555658595a5b5c5e5f606263656667686a6b6c6d6e71727374757778797b7c7e7f80818284868788898b8c8d8e8f929394959697999a9b9c9d9fa0a2a3a4a5a6a7a8a9abacadaeafb0b1b2b3b4b5b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfcfd0d0d1d2d3d4d5d6d7d8d9d9dadbdcdddededfe0e1e2e3e3e4e5e5e5e6e7e8e8e9eaeaebececedeeeeeff0f0f1f2f2f2f2f3f4f4f5f5f6f6f7f7f8f8f9f9fafafbfbfbfbfbfcfcfcfdfdfdfefefeffff");
+const GLOSS_POSITIVE2: [u8; 256] = hex_bytes(b"0001020304060708090a0b0c0d0e1011121314151617181a1b1c1d1e1f2021232425262728292a2b2d2e2f3031323334353738393a3b3c3d3e3f4142434445464748494b4c4d4e4f5051525355565758595a5b5c5d5f6061626364656668696a6b6c6d6e6f7072737475767778797a7c7d7e7f8081828384868788898a8b8c8d8f9091929394959697999a9b9c9d9e9fa0a1a3a4a5a6a7a8a9aaabacaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbec0c1c2c3c4c5c6c7c8c9cacbcccdcececfd0d1d2d3d4d5d6d7d8d9dadadbdcdddedfe0e1e1e2e3e4e5e5e6e7e8e9e9eaebececedeeeeeff0f1f1f2f3f3f4f4f5f6f6f7f7f8f9f9fafafbfbfcfcfdfdfefeffff");
+const GLOSS_NEGATIVE: [u8; 256] = hex_bytes(b"000101010203040405050607070808090a0b0b0c0c0d0e0f0f0f10111213141414151617171819191a1b1b1c1d1e1f1f202021222323242526272728292a2b2b2c2d2d2e2f2f3031323333343536373838393a3b3c3c3d3e3f40424243444546464748494a4b4b4c4d4e4f4f5152535455555657585a5a5b5c5d5e5f5f6062636464656667696a6a6b6c6d6f707071727475767677797a7b7c7e7e7f8081838485868688898a8b8d8e8f9092929394959698999a9b9c9d9fa0a1a2a3a4a5a7a7a8a9abacadaeb0b1b2b3b4b5b6b7b8b9babbbdbfc0c1c2c3c4c6c7c8c9cbcccdced0d1d2d3d4d5d7d8dadbdddedfe0e2e4e5e6e8eaebedeff0f2f4f6f8fafdff");
+const GLOSS_LUTS: [&[u8; 256]; 3] = [&GLOSS_POSITIVE1, &GLOSS_POSITIVE2, &GLOSS_NEGATIVE];
 
 /// 256-entry LUT lookup used by the gloss pass: `coded/255*256 - 0.5`,
 /// edge taps clamped independently.
@@ -68,25 +92,11 @@ fn gloss_pass(
 /// `positive=max(2*u-1,0)`, `negative=max(1-2*u,0)`, with `u=native_percent/100`.
 /// This is captured config percent (neutral 50), not signed UI (neutral 0).
 /// The unresolved UI writer is not replaced with an invented conversion.
-/// Compatibility entry: active work refuses missing LUTs; use gloss_apply_with_luts.
 pub fn gloss_apply(
     source: &Image,
     masks_r: [&[u8]; 3],
     extra_masks_r: [&[u8]; 3],
     native_percent: f32,
-) -> Result<Image, Refusal> {
-    gloss_apply_with_luts(source, masks_r, extra_masks_r, native_percent, None)
-}
-
-/// Apply caller-owned LUTs in positive1, positive2, negative order.
-/// No curves are bundled or generated. Missing LUTs refuse active work;
-/// neutral native_percent=50 remains an identity after input validation.
-pub fn gloss_apply_with_luts(
-    source: &Image,
-    masks_r: [&[u8]; 3],
-    extra_masks_r: [&[u8]; 3],
-    native_percent: f32,
-    luts: Option<[&[u8; 256]; 3]>,
 ) -> Result<Image, Refusal> {
     let pixels = check_image(source, "source")?;
     if !native_percent.is_finite() || !(0.0..=100.0).contains(&native_percent) {
@@ -102,14 +112,10 @@ pub fn gloss_apply_with_luts(
     let positive = (2.0 * normalized - 1.0).max(0.0);
     let negative = (1.0 - 2.0 * normalized).max(0.0);
 
-    if positive == 0.0 && negative == 0.0 {
-        return Ok(source.clone());
-    }
-    let luts = luts.ok_or(Refusal::MissingInput("gloss_luts"))?;
     let mut out = source.clone();
-    gloss_pass(&mut out, masks_r[0], extra_masks_r[0], luts[0], positive);
-    gloss_pass(&mut out, masks_r[1], extra_masks_r[1], luts[1], positive);
-    gloss_pass(&mut out, masks_r[2], extra_masks_r[2], luts[2], negative);
+    gloss_pass(&mut out, masks_r[0], extra_masks_r[0], GLOSS_LUTS[0], positive);
+    gloss_pass(&mut out, masks_r[1], extra_masks_r[1], GLOSS_LUTS[1], positive);
+    gloss_pass(&mut out, masks_r[2], extra_masks_r[2], GLOSS_LUTS[2], negative);
     Ok(out)
 }
 
@@ -383,7 +389,7 @@ pub fn clarity_apply(
 }
 
 const GLOSS_INPUTS: &[&str] = &[
-    "source", "masks_r[3]", "extra_masks_r[3]", "native_percent", "gloss_luts[3][256] (caller)",
+    "source", "masks_r[3]", "extra_masks_r[3]", "native_percent", "builtin_luts",
 ];
 const TEXTURE_INPUTS: &[&str] = &[
     "source", "mask_r", "extra_mask_r", "ui", "material_layer (ui>0)",
@@ -420,9 +426,6 @@ pub const META: &[EffectMeta] = &[
 mod tests {
     use super::*;
 
-    // Synthetic test curves only, not substitutes for product assets.
-    const TEST_LUTS: [[u8; 256]; 3] = [[255; 256], [160; 256], [0; 256]];
-
     #[test]
     fn clarity_rejects_transposed_planes_and_overflowing_roi() {
         let source = Image::solid(2, 2, [100, 90, 80, 77]);
@@ -456,6 +459,8 @@ mod tests {
             let sampled = gloss_lut_sample(&ramp, coded);
             assert!((sampled - coded as f32 / 255.0).abs() < 0.01, "coded {coded}");
         }
+        assert!(GLOSS_POSITIVE1.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(GLOSS_NEGATIVE.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]
@@ -463,14 +468,14 @@ mod tests {
         let src = pixel([200, 100, 60, 77]);
         let masks = [[255u8; 1]; 3];
         let extras = [[255u8; 1]; 3];
-        let positive = gloss_apply_with_luts(&src, [&masks[0], &masks[1], &masks[2]], [&extras[0], &extras[1], &extras[2]], 100.0, Some([&TEST_LUTS[0], &TEST_LUTS[1], &TEST_LUTS[2]])).unwrap();
-        let negative = gloss_apply_with_luts(&src, [&masks[0], &masks[1], &masks[2]], [&extras[0], &extras[1], &extras[2]], 0.0, Some([&TEST_LUTS[0], &TEST_LUTS[1], &TEST_LUTS[2]])).unwrap();
+        let positive = gloss_apply(&src, [&masks[0], &masks[1], &masks[2]], [&extras[0], &extras[1], &extras[2]], 100.0).unwrap();
+        let negative = gloss_apply(&src, [&masks[0], &masks[1], &masks[2]], [&extras[0], &extras[1], &extras[2]], 0.0).unwrap();
         assert_ne!(positive.pixel(0, 0), src.pixel(0, 0));
         assert_ne!(negative.pixel(0, 0), src.pixel(0, 0));
         assert_eq!(positive.pixel(0, 0)[3], 77);
         assert_eq!(negative.pixel(0, 0)[3], 77);
-        let expected = to_byte(gloss_lut_sample(&TEST_LUTS[0], 200));
-        let second = to_byte(gloss_lut_sample(&TEST_LUTS[1], expected));
+        let expected = to_byte(gloss_lut_sample(&GLOSS_POSITIVE1, 200));
+        let second = to_byte(gloss_lut_sample(&GLOSS_POSITIVE2, expected));
         assert_eq!(positive.pixel(0, 0)[0], second);
     }
 
@@ -479,23 +484,15 @@ mod tests {
         let src = pixel([200, 100, 60, 77]);
         let masks = [[255u8; 1]; 3];
         let extras = [[255u8; 1]; 3];
-        let mid = gloss_apply_with_luts(&src, [&masks[0], &masks[1], &masks[2]], [&extras[0], &extras[1], &extras[2]], 50.0, Some([&TEST_LUTS[0], &TEST_LUTS[1], &TEST_LUTS[2]])).unwrap();
+        let mid = gloss_apply(&src, [&masks[0], &masks[1], &masks[2]], [&extras[0], &extras[1], &extras[2]], 50.0).unwrap();
         assert_eq!(mid, src);
         let zero = [[0u8; 1]; 3];
-        let out = gloss_apply_with_luts(&src, [&zero[0], &zero[1], &zero[2]], [&zero[0], &zero[1], &zero[2]], 100.0, Some([&TEST_LUTS[0], &TEST_LUTS[1], &TEST_LUTS[2]])).unwrap();
+        let out = gloss_apply(&src, [&zero[0], &zero[1], &zero[2]], [&zero[0], &zero[1], &zero[2]], 100.0).unwrap();
         assert_eq!(out, src);
     }
 
     #[test]
     fn gloss_refuses_bad_inputs() {
-        let source = pixel([200, 100, 60, 77]);
-        let masks = [&[255u8][..]; 3];
-        for percent in [0.0, 75.0, 100.0] {
-            assert_eq!(gloss_apply(&source, masks, masks, percent),
-                Err(Refusal::MissingInput("gloss_luts")));
-        }
-        assert_eq!(gloss_apply(&source, masks, masks, 50.0).unwrap(), source);
-
         let src = pixel([200, 100, 60, 77]);
         let full = [255u8; 1];
         let empty: [u8; 0] = [];

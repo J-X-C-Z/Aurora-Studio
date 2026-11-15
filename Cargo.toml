@@ -9,7 +9,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
-lumen-engine = { path = "crates/engine" }
+aurora-engine = { path = "crates/engine" }
 # gpui-kit 0.9.0 and Ely both pin gpui-pre =0.3.11, so they share one GPUI in one window.
 gpui-kit = { version = "=0.9.0" }
 ely-core = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "e0f355a" }
@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 log = "0.4"
+aurora-portrait = { path = "crates/portrait" }
 
 [profile.dev]
 opt-level = 1
@@ -35,8 +36,8 @@ codegen-units = 4
 [profile.release.package.gpui-pre-windows]
 debug-assertions = true
 
-[profile.dev.package.lumen-engine]
+[profile.dev.package.aurora-engine]
 opt-level = 3
 
-[profile.test.package.lumen-engine]
+[profile.test.package.aurora-engine]
 opt-level = 3

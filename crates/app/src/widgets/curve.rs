@@ -1,6 +1,6 @@
 //! Tone curve editor. Click to add a point, drag to move it, double-click or drag
 //! it out of the box to remove it. The drawn curve uses the same interpolation as
-//! the engine contract ([`lumen_engine::Curve::eval`]).
+//! the engine contract ([`aurora_engine::Curve::eval`]).
 
 use std::rc::Rc;
 
@@ -8,7 +8,7 @@ use gpui_kit::{
     App, Entity, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, canvas, div,
     prelude::FluentBuilder as _, px,
 };
-use lumen_engine::{Curve, CurvePoint};
+use aurora_engine::{Curve, CurvePoint};
 
 use super::paint;
 use super::surface::{Pointer, Surface, SurfaceState};

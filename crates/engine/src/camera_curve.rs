@@ -45,18 +45,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aurora-camera-curves-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut bytes = b"MM".to_vec();
-        for word in [6u32, 2, 0, 0, u32::MAX, u32::MAX, 1] { bytes.extend_from_slice(&word.to_be_bytes()); }
-        for name in ["Synthetic", "Linear response"] {
-            bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(name.as_bytes());
-        }
-        for name in ["NikonZ6III-Auto", "NikonZ7II-Auto", "NikonZ9-Auto"] {
-            std::fs::write(dir.join(format!("{name}.fcrv")), &bytes).unwrap();
-        }
-        dir
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
     }
 
     #[test]
@@ -69,18 +58,18 @@ mod tests {
         assert!(packed.is_some(), "Z6III must resolve when the curve ships");
     }
     #[test]
-    fn parses_synthetic_camera_curve() {
+    fn parses_real_z6_3_curve() {
         let bytes = std::fs::read(test_dir().join("NikonZ6III-Auto.fcrv")).unwrap();
         let curves = parse_film_curves(&bytes).unwrap();
-        assert_eq!(curves.len(), 1);
-        assert_eq!(curves[0].points.len(), 2);
+        assert_eq!(curves.len(), 3);
+        assert_eq!(curves[0].points.len(), 12);
         assert_eq!(curves[0].name, "Linear response");
         assert!((curves[0].points[0].0 - 0.0).abs() < 1e-6);
         assert!((curves[0].points.last().unwrap().0 - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn synthetic_camera_lut_is_monotonic() {
+    fn real_z6_3_lut_is_monotonic() {
         let _serial = crate::filmcurve::test_lock();
         crate::filmcurve::use_dir(test_dir());
         let lut = curve_lut("NikonZ6III-Auto").unwrap();

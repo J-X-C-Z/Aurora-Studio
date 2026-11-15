@@ -1,9 +1,9 @@
 //! Portrait tab: Capture One's Retouch tools (face & skin, hair, teeth, eyes) and
 //! the portrait algorithm catalogue from `docs/frontend-contract/`.
 //!
-//! None of these render yet. Values are stored in `AdjustmentSet::extra`, so
-//! they follow undo, copy/paste, styles and the sidecar, and the engine can pick
-//! them up key by key once an algorithm lands.
+//! Values are stored in `AdjustmentSet::extra`, so they follow undo, copy/paste,
+//! styles and the sidecar. Effects with available same-job inputs render; the
+//! rest stay marked as needing face geometry or model output.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -15,7 +15,7 @@ use gpui_kit::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, Wind
 
 use crate::contract::{self, BANDS, Band, PortraitParam, Status};
 use crate::i18n::t;
-use crate::state::{AppState, extra_binding};
+use crate::state::{AppState, Binding, extra_binding};
 use crate::theme::pal;
 use crate::widgets::*;
 
@@ -25,6 +25,25 @@ const RETOUCH_GROUPS: [(&str, &str, &str); 4] = [
     ("RetouchHair", "Hair", "头发"),
     ("RetouchTeeth", "Teeth", "牙齿"),
 ];
+
+/// Effects whose CPU kernels have their same-job inputs wired. Values are
+/// stored as 0..=1 in `AdjustmentSet::extra`; the sliders show 0..=100.
+const WIRED_SKIN_EFFECTS: &[(&str, &str, &str, f32)] = &[
+    ("pc:21015", "Skin hue", "肤色色相", 0.5),
+    ("pc:30096", "Skin temperature", "色调", 0.5),
+    ("pc:90005", "Whitening", "美白", 0.0),
+    ("pc:90007", "Rosy", "红润", 0.0),
+    ("pc:8068", "Skin gloss", "皮肤光泽", 0.5),
+    ("pc:8069", "Skin texture", "肤质", 0.5),
+    ("pc:8070", "Skin clarity", "清晰度", 0.0),
+    ("pc:90004", "Skin radiance", "皮肤透亮", 0.0),
+];
+
+fn portrait_amount_binding(key: &'static str, default: f32) -> Binding {
+    let inner = extra_binding(key, default);
+    let (get, set) = (inner.get.clone(), inner.set.clone());
+    Binding::new(move |a| get(a) * 100.0, move |a, v| set(a, v / 100.0))
+}
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let query = state.read(cx).panels.portrait_query.trim().to_lowercase();
@@ -52,10 +71,18 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                         .child(Icon::new(IconName::Info).xsmall().text_color(p.accent))
                         .items_start()
                         .child(div().flex_1().min_w_0().text_xs().text_color(p.text_muted).child(t(
-                            "Parameters follow the frontend contract and are saved with the variant. The algorithms are not connected yet, so the preview does not change.",
-                            "参数按前端契约解析，可调并随变体保存；后端算法尚未接入，预览不会变化。",
+                            "Parameters follow the frontend contract and are saved with the variant. Skin hue, whitening, rosy, gloss, texture, clarity and radiance render; effects needing face geometry or model output stay marked.",
+                            "参数按前端契约解析，可调并随变体保存；肤色色相、美白、红润、光泽、肤质、清晰度和透亮已接入，需要面部几何或模型输出的效果会标记缺输入。",
                         ))),
                 )
+                .child(div().text_xs().text_color(p.text_subtle).child(format!(
+                    "{} {}",
+                    WIRED_SKIN_EFFECTS.len(),
+                    t(
+                        "effects render with current inputs; the rest need face geometry or model outputs",
+                        "个效果当前可渲染；其余需要人脸几何或模型输出"
+                    ),
+                )))
                 .child(h_flex().gap_1p5().child(Icon::new(IconName::Search).xsmall().text_color(p.text_subtle)).child(div().flex_1().child(search))),
         );
 
@@ -77,7 +104,7 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                     .gap_2()
                     .rounded(px(6.0))
                     .bg(p.well)
-                    .child(div().text_sm().text_color(p.text).child(t("Portrait tools are not rendered yet", "人像工具尚未接入渲染")))
+                    .child(div().text_sm().text_color(p.text).child(t("Portrait tools are partially rendered", "人像工具已部分接入渲染")))
                     .child(div().text_xs().text_color(p.text_muted).child(format!(
                         "{} {} · {} {}",
                         total,
@@ -119,10 +146,19 @@ fn matches(query: &str, label: &str, key: &str, id: Option<i64>) -> bool {
 fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static str, query: &str, cx: &App) -> AnyElement {
     let s = state.read(cx);
     let metas: Vec<_> = s.engine.param_metadata().iter().filter(|m| m.group == group).collect();
-    let keys: Vec<&'static str> = metas.iter().map(|m| m.key).collect();
+    let wired: Vec<_> = if group == "RetouchFaceSkin" {
+        WIRED_SKIN_EFFECTS
+            .iter()
+            .filter(|(key, en, zh, _)| matches(query, t(*en, *zh), *key, None))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut keys: Vec<&'static str> = metas.iter().map(|m| m.key).collect();
+    keys.extend(wired.iter().map(|(key, ..)| *key));
     let modified = keys.iter().any(|k| s.adj().extra.contains_key(*k));
     let shown: Vec<_> = metas.into_iter().filter(|m| matches(query, t(m.label, m.label_zh), m.key, None)).collect();
-    if shown.is_empty() && !query.is_empty() {
+    if shown.is_empty() && wired.is_empty() && !query.is_empty() {
         return div().into_any_element();
     }
     let st = state.clone();
@@ -146,6 +182,18 @@ fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static 
             })
         })
         .children(shown.into_iter().map(|m| param_c1(state, format!("rt-{}", m.key), m.key, extra_binding(m.key, m.default), cx)))
+        .children(wired.into_iter().map(|(key, en, zh, default)| {
+            param(
+                state,
+                format!("rt-{key}"),
+                t(*en, *zh),
+                portrait_amount_binding(*key, *default),
+                0.0,
+                100.0,
+                cx,
+            )
+            .default_value(*default * 100.0)
+        }))
         .into_any_element()
 }
 
@@ -162,7 +210,7 @@ fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &A
     let open = !query.is_empty() || !s.panels.collapsed.contains(band.id);
     let st = state.clone();
     let mut panel = ToolPanel::new(state, band.id, band.title())
-        .status(Status::Pending("Parsed from the vendor UI registry; the algorithm is not implemented yet", "参数与效果映射已解析，算法后端尚未实现"))
+        .status(Status::Partial("Skin effects render; face geometry and model-dependent effects need live inputs", "皮肤类效果已接入；面部几何与依赖模型输出的效果需要实时输入"))
         .badge(if set > 0 { format!("{set}/{}", params.len()) } else { format!("{}", params.len()) })
         .modified(set > 0)
         .force_open(!query.is_empty())

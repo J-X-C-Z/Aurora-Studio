@@ -1,4 +1,4 @@
-# Lumen Studio 效果目录 — 给 Opus 的前端生成依据
+# Aurora Studio 效果目录 — 给 Opus 的前端生成依据
 
 生成时间 2026-11-11，基于 `cargo test` 通过的 281 个测试的代码现状。
 

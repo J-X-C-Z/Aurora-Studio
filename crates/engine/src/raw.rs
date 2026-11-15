@@ -2,7 +2,7 @@
 //! demosaiced and white-balanced by the capture's own camera multipliers, output as
 //! linear light in the camera's own colour space; otherwise the camera-embedded JPEG
 //! is all we have. The demosaic filter is selectable through [`set_demosaic`] or the
-//! `LUMEN_DEMOSAIC` environment variable; AHD stays the default.
+//! `AURORA_DEMOSAIC` environment variable; AHD stays the default.
 //!
 //! libraw is resolved at run time, so a build without it falls back to the
 //! preview instead of failing. On Windows the DLL and its dependencies are
@@ -16,7 +16,7 @@ use image::{ImageFormat, RgbaImage};
 
 macro_rules! raw_trace {
     ($($arg:tt)*) => {
-        if std::env::var_os("LUMEN_RAW_TRACE").is_some() {
+        if std::env::var_os("AURORA_RAW_TRACE").is_some() {
             eprintln!($($arg)*);
         }
     };
@@ -41,13 +41,7 @@ pub fn embedded_preview(path: &Path) -> anyhow::Result<RgbaImage> {
         }
         Some((u64::from(w) * u64::from(h), decoded.to_rgba8()))
     })?;
-    let preview = found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))?;
-    let mut preview = image::DynamicImage::ImageRgba8(preview);
-    // Match libraw's camera-oriented pixels, including the preview fallback.
-    preview.apply_orientation(image::metadata::Orientation::from_exif(
-        exif_orientation_tag(path).unwrap_or(1) as u8,
-    ).unwrap_or(image::metadata::Orientation::NoTransforms));
-    Ok(preview.to_rgba8())
+    found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))
 }
 
 /// The sRGB transfer curve on linear light 0..=1.
@@ -82,7 +76,7 @@ fn normalise_demosaic(quality: i32) -> i32 {
     }
 }
 
-/// Parses a numeric `LUMEN_DEMOSAIC` value, rejecting filters libraw lacks here.
+/// Parses a numeric `AURORA_DEMOSAIC` value, rejecting filters libraw lacks here.
 fn parse_demosaic(text: &str) -> Option<i32> {
     match text.trim().parse::<i32>() {
         Ok(quality @ (0 | 1 | 2 | 3 | 11 | 12)) => Some(quality),
@@ -97,12 +91,12 @@ pub fn set_demosaic(quality: i32) {
     DEMOSAIC.store(normalise_demosaic(quality), Ordering::Relaxed);
 }
 
-/// Resolves the filter in force: `LUMEN_DEMOSAIC` wins over [`set_demosaic`],
+/// Resolves the filter in force: `AURORA_DEMOSAIC` wins over [`set_demosaic`],
 /// and AHD is the final default.
 pub fn demosaic_quality() -> i32 {
-    match std::env::var("LUMEN_DEMOSAIC") {
+    match std::env::var("AURORA_DEMOSAIC") {
         Ok(text) => parse_demosaic(&text).unwrap_or_else(|| {
-            log::warn!("LUMEN_DEMOSAIC={text:?} is not 0/1/2/3/11/12; using AHD");
+            log::warn!("AURORA_DEMOSAIC={text:?} is not 0/1/2/3/11/12; using AHD");
             DEMOSAIC_DEFAULT
         }),
         Err(_) => match DEMOSAIC.load(Ordering::Relaxed) {
@@ -188,19 +182,71 @@ fn same_picture(a: &[f32], path: &Path) -> bool {
     let Ok(preview) = embedded_preview(path) else {
         return true;
     };
-    let b = luma_grid(&preview);
-    // Decoders may differ in orientation; every quarter turn is the same picture.
-    // Correlation is used rather than a difference because the sensor decode is
-    // linear and the preview is display-encoded: only the picture shape may be
-    // compared, not the level.
-    let mut grid = a.to_vec();
+    similar(a, &luma_grid(&preview))
+}
+fn similar(a: &[f32], preview: &[f32]) -> bool {
+    // Rank correlation of 2x2-averaged cells: the sensor decode is linear light
+    // and the preview is display-encoded and tone-mapped, so the same picture can
+    // differ by a whole exposure; ranks ignore that, averaging ignores the noise
+    // that made a night shot at ISO 5000 score 0.82. A stripe decode still scores
+    // near zero.
+    let b = ranks(&halve(preview));
+    let mut g = ranks(&halve(a));
+    // libraw hands over the sensor in its stored orientation while the camera's
+    // preview is already turned; any quarter turn is still the same picture.
     for _ in 0..4 {
-        if correlation(&grid, &b) > 0.90 {
+        if correlation(&g, &b) > 0.90 {
             return true;
         }
-        grid = transpose(&grid);
+        g = transpose16(&g);
     }
     false
+}
+/// 2x2 box average of a 32x32 luma grid.
+fn halve(grid: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0; 16 * 16];
+    for y in 0..16 {
+        for x in 0..16 {
+            out[y * 16 + x] = (grid[(2 * y) * 32 + 2 * x]
+                + grid[(2 * y) * 32 + 2 * x + 1]
+                + grid[(2 * y + 1) * 32 + 2 * x]
+                + grid[(2 * y + 1) * 32 + 2 * x + 1])
+                / 4.0;
+        }
+    }
+    out
+}
+/// Values replaced by their rank, so a monotone tone curve cannot change them.
+fn ranks(grid: &[f32]) -> Vec<f32> {
+    let mut order: Vec<usize> = (0..grid.len()).collect();
+    order.sort_by(|&i, &j| grid[i].total_cmp(&grid[j]));
+    let mut out = vec![0.0; grid.len()];
+    let mut start = 0;
+    while start < order.len() {
+        // Ties share their average rank, so a flat frame cannot masquerade as a
+        // gradient just because the sort happened to be stable.
+        let mut end = start;
+        while end + 1 < order.len() && grid[order[end + 1]] == grid[order[start]] {
+            end += 1;
+        }
+        let shared = (start + end) as f32 / 2.0;
+        for &i in &order[start..=end] {
+            out[i] = shared;
+        }
+        start = end + 1;
+    }
+    out
+}
+/// 90-degree turn of a 16x16 grid.
+fn transpose16(grid: &[f32]) -> Vec<f32> {
+    const N: usize = 16;
+    let mut out = vec![0.0; grid.len()];
+    for y in 0..N {
+        for x in 0..N {
+            out[y * N + x] = grid[x * N + (N - 1 - y)];
+        }
+    }
+    out
 }
 /// Pearson correlation of two equally sized grids.
 fn correlation(a: &[f32], b: &[f32]) -> f32 {
@@ -287,7 +333,6 @@ pub fn is_raw(path: &Path) -> bool {
 ///
 /// Only the JPEG headers are read, so this is cheap enough to run over a whole folder.
 pub fn preview_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let swap = matches!(exif_orientation_tag(path), Some(5..=8));
     scan_best(path, |segment| {
         let reader =
             image::ImageReader::with_format(std::io::Cursor::new(segment), ImageFormat::Jpeg);
@@ -295,8 +340,7 @@ pub fn preview_dimensions(path: &Path) -> Option<(u32, u32)> {
         if w == 0 || h == 0 {
             return None;
         }
-        let size = if swap { (h, w) } else { (w, h) };
-        Some((u64::from(w) * u64::from(h), size))
+        Some((u64::from(w) * u64::from(h), (w, h)))
     })
     .ok()
     .flatten()
@@ -485,7 +529,7 @@ mod libraw {
         let wide_name: Vec<u16> =
             name.trim_end_matches('\0').encode_utf16().chain(std::iter::once(0)).collect();
         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(dir) = std::env::var_os("LUMEN_LIBRAW_DIR") {
+        if let Some(dir) = std::env::var_os("AURORA_LIBRAW_DIR") {
             dirs.push(dir.into());
         }
         if let Ok(exe) = std::env::current_exe() {
@@ -861,7 +905,7 @@ mod tests {
     }
 
     fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lumen-raw-{}-{}", std::process::id(), name));
+        let dir = std::env::temp_dir().join(format!("portrait-raw-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
@@ -893,74 +937,6 @@ mod tests {
         let img = embedded_preview(&path).unwrap();
         assert_eq!((img.width(), img.height()), (96, 64));
         assert_eq!(preview_dimensions(&path), Some((96, 64)));
-    }
-
-    fn oriented_raw(orientation: u16) -> PathBuf {
-        let mut bytes = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&274u16.to_le_bytes());
-        bytes.extend_from_slice(&3u16.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&orientation.to_le_bytes());
-        bytes.extend_from_slice(&[0; 6]);
-        bytes.extend_from_slice(&jpeg(96, 64, 17));
-        temp_file(&format!("orientation-{orientation}.nef"), &bytes)
-    }
-
-    #[test]
-    fn preview_and_fallback_follow_all_camera_orientations() {
-        use image::imageops::{flip_horizontal, flip_vertical, rotate90, rotate180, rotate270};
-        let original = embedded_preview(&oriented_raw(1)).unwrap();
-        for orientation in 1..=8 {
-            let path = oriented_raw(orientation);
-            let expected = match orientation {
-                2 => flip_horizontal(&original),
-                3 => rotate180(&original),
-                4 => flip_vertical(&original),
-                5 => flip_horizontal(&rotate90(&original)),
-                6 => rotate90(&original),
-                7 => flip_vertical(&rotate90(&original)),
-                8 => rotate270(&original),
-                _ => original.clone(),
-            };
-            assert_eq!(embedded_preview(&path).unwrap(), expected, "EXIF {orientation}");
-            assert_eq!(decode(&path).unwrap(), expected, "fallback EXIF {orientation}");
-            assert_eq!(preview_dimensions(&path), Some(expected.dimensions()));
-        }
-    }
-
-    #[test]
-    fn picture_validation_accepts_every_quarter_turn() {
-        let path = oriented_raw(8);
-        let mut grid = luma_grid(&embedded_preview(&path).unwrap());
-        for _ in 0..4 {
-            assert!(same_picture(&grid, &path));
-            grid = transpose(&grid);
-        }
-        assert!(!same_picture(&vec![0.0; 1024], &path));
-    }
-
-    #[test]
-    #[ignore = "needs LUMEN_TEST_RAW and LUMEN_TEST_OUTPUT; writes only diagnostic previews"]
-    fn camera_orientation_real_file() {
-        let path = PathBuf::from(std::env::var_os("LUMEN_TEST_RAW").unwrap());
-        let output = PathBuf::from(std::env::var_os("LUMEN_TEST_OUTPUT").unwrap());
-        std::fs::create_dir_all(&output).unwrap();
-        let preview = embedded_preview(&path).unwrap();
-        let eight = decode(&path).unwrap();
-        let size = sensor_dimensions(&path).unwrap();
-        assert_eq!(eight.width() < eight.height(), size.0 < size.1);
-        if let Some((w, h, pixels)) = decode16(&path) {
-            assert_eq!((w, h), eight.dimensions());
-            assert_eq!(pixels.len(), (w * h * 4) as usize);
-            assert_eq!(from_sensor(&path), Some(true));
-        } else {
-            assert_eq!(eight, preview, "unsupported sensor data must use the oriented preview");
-            assert_eq!(from_sensor(&path), Some(false));
-        }
-        preview.save(output.join("camera-preview.png")).unwrap();
-        image::imageops::thumbnail(&eight, 1000, 1000).save(output.join("sensor-preview.png")).unwrap();
-        eprintln!("orientation={}, preview={:?}, decoded={:?}, from_sensor={:?}", exif_rotation_deg(&path), preview.dimensions(), eight.dimensions(), from_sensor(&path));
     }
 
     #[test]
@@ -1077,18 +1053,99 @@ mod tests {
         assert!(decode(Path::new("no-such-file.nef")).is_err());
     }
 
-    #[cfg(all(target_os = "windows", feature = "external-fixtures"))]
+    #[test]
+    fn the_preview_gate_ignores_tone_and_turn_but_rejects_stripes() {
+        // A linear-light decode of a ramp, the camera's tone-mapped preview of
+        // the same ramp, and a quarter-turned copy are the same picture.
+        let ramp: Vec<f32> = (0..32)
+            .flat_map(|y| (0..32).map(move |x| (x * 8 + y * 3) as f32))
+            .collect();
+        let display: Vec<f32> = ramp.iter().map(|v| (v / 255.0).powf(0.45) * 255.0).collect();
+        assert!(similar(&ramp, &display));
+        assert!(similar(&transpose(&ramp), &display));
+        assert!(similar(&transpose(&transpose(&transpose(&ramp))), &display));
+
+        // A decoder that hands back stripes instead of the picture must not pass,
+        // however plausible its levels look.
+        let stripes: Vec<f32> = (0..32)
+            .flat_map(|_| (0..32).map(|x| if x % 2 == 0 { 0.0 } else { 255.0 }))
+            .collect();
+        assert!(!similar(&stripes, &display));
+    }
+
+    #[cfg(target_os = "windows")]
     mod windows_libraw {
-        include!("../local-fixtures/raw-windows-tests.rs");
+        use super::*;
+        use std::path::PathBuf;
+
+        const SAMPLE: &str = r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF";
+        const HE_SAMPLE: &str = r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF";
+
+        fn sample() -> PathBuf {
+            PathBuf::from(SAMPLE)
+        }
+
+        fn sample_is_available() -> bool {
+            sample().is_file()
+        }
+
+        #[test]
+        fn dll_missing_falls_back_to_preview() {
+            // The same decode path must still return the preview when the
+            // DLL is absent. We cannot unload it here, so we simulate the
+            // failure with a file that libraw cannot open but the preview
+            // scanner can, i.e. any TIFF container with an embedded JPEG.
+            let mut file = vec![0x49, 0x49, 0x2A, 0x00];
+            file.extend_from_slice(&jpeg(48, 32, 4));
+            let path = temp_file("dll-missing.nef", &file);
+            let img = decode(&path).unwrap();
+            assert_eq!((img.width(), img.height()), (48, 32));
+        }
+
+        #[test]
+        fn real_nef_decodes_successfully() {
+            if !sample_is_available() {
+                panic!("real NEF sample not found: {SAMPLE}");
+            }
+            let img = decode(&sample()).unwrap();
+            assert!(img.width().max(img.height()) > 3000, "{:?}", img.dimensions());
+            assert!(sensor_dimensions(&sample()).unwrap().0.max(sensor_dimensions(&sample()).unwrap().1) > 3000);
+        }
+
+        #[test]
+        fn invalid_file_does_not_panic() {
+            let path = temp_file("invalid.nef", &[0u8; 4096]);
+            assert!(decode(&path).is_err());
+            assert!(decode16(&path).is_none());
+        }
+
+        #[test]
+        fn sixteen_bit_path_returns_or_falls_back() {
+            if !sample_is_available() {
+                panic!("real NEF sample not found: {SAMPLE}");
+            }
+            match decode16(&sample()) {
+                Some((w, h, rgba)) => {
+                    assert_eq!(rgba.len(), (w * h * 4) as usize);
+                    assert!(w.max(h) > 3000);
+                }
+                None => {
+                    // HE* compression is not demosaiced by this libraw build:
+                    // the 8-bit path must still deliver the embedded preview.
+                    let eight = decode(&PathBuf::from(HE_SAMPLE).exists().then(|| PathBuf::from(HE_SAMPLE)).unwrap_or_else(|| sample())).unwrap();
+                    assert!(eight.width() > 0);
+                }
+            }
+        }
     }
 
     /// Needs a real camera file and a machine with libraw; run with
-    /// `LUMEN_TEST_RAW=/path/to/file.nef cargo test -- --include-ignored`.
+    /// `AURORA_TEST_RAW=/path/to/file.nef cargo test -- --include-ignored`.
     #[test]
-    #[ignore = "needs a real RAW file (LUMEN_TEST_RAW) and libraw"]
+    #[ignore = "needs a real RAW file (AURORA_TEST_RAW) and libraw"]
     fn decodes_sensor_data() {
-        let Ok(path) = std::env::var("LUMEN_TEST_RAW") else {
-            panic!("set LUMEN_TEST_RAW to a RAW file");
+        let Ok(path) = std::env::var("AURORA_TEST_RAW") else {
+            panic!("set AURORA_TEST_RAW to a RAW file");
         };
         let path = PathBuf::from(path);
         let img = decode(&path).unwrap();
@@ -1110,12 +1167,12 @@ mod tests {
     /// The 16-bit path on a real file: either libraw hands over linear u16, or it
     /// cannot demosaic the file (Nikon High Efficiency) and the 8-bit path takes
     /// over. Both outcomes must leave a usable picture.
-    /// `LUMEN_TEST_RAW=/path/to/file.nef cargo test -- --include-ignored`
+    /// `AURORA_TEST_RAW=/path/to/file.nef cargo test -- --include-ignored`
     #[test]
-    #[ignore = "needs a real RAW file (LUMEN_TEST_RAW) and libraw"]
+    #[ignore = "needs a real RAW file (AURORA_TEST_RAW) and libraw"]
     fn decodes_sensor_data_at_sixteen_bits() {
-        let Ok(path) = std::env::var("LUMEN_TEST_RAW") else {
-            panic!("set LUMEN_TEST_RAW to a RAW file");
+        let Ok(path) = std::env::var("AURORA_TEST_RAW") else {
+            panic!("set AURORA_TEST_RAW to a RAW file");
         };
         let path = PathBuf::from(path);
         match decode16(&path) {

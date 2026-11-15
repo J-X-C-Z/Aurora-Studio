@@ -11,18 +11,32 @@ pub mod kernels;
 pub mod device;
 pub mod cuda;
 pub mod cuda_lut;
+pub mod cuda_pf90021;
+pub mod cuda_lip_line;
 pub mod cuda_mesh;
+pub mod cuda_hand_neutral_gray;
+pub mod cuda_neutral_gray;
+pub mod cuda_oil_shine_blend;
+pub mod cuda_foot_blue_vein;
 pub mod cuda_gloss;
+pub mod cuda_stray_hair;
 pub mod cuda_teeth;
 pub mod cuda_uvmap;
 pub mod cuda_moisture;
 pub mod cuda_smile;
 pub mod cuda_texture_blend;
+pub mod cuda_skin_models;
+pub mod cuda_hair_detail;
+pub mod cuda_wrinkle;
 pub mod cuda_eye_bag;
 pub mod cuda_beard;
 pub mod cuda_makeup;
 pub mod cuda_teeth_blend;
+pub mod cuda_blue_vein;
 pub mod cuda_mesh_attribute;
+pub mod cuda_v2warp;
+pub mod cuda_v2fuseoffset;
+pub mod cuda_vface;
 pub mod raster;
 pub mod raster_fragment;
 pub mod metal;
@@ -253,7 +267,3 @@ mod tests {
         assert!(!json.contains("\"\"\""));
     }
 }
-
-#[cfg(all(test, feature = "external-fixtures"))]
-#[path = "../tests/support/mod.rs"]
-mod external_fixtures;

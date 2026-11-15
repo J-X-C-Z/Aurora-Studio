@@ -120,6 +120,34 @@ pub struct MaskSlot {
     pub mask_crop: Option<String>,
 }
 
+/// Which retouching slider a `ZRETOUCHINGLAYER` mask belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetouchMaskKind {
+    SkinEvening,
+    BlemishRemoval,
+}
+
+impl RetouchMaskKind {
+    /// C1's own column stem, e.g. `ZSKINEVENING`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SkinEvening => "skin_evening",
+            Self::BlemishRemoval => "blemish_removal",
+        }
+    }
+}
+
+/// Read-only view of one retouching mask: the UUID the catalog stores and
+/// whether a `.comask` record behind it carries a decodable `Map` grid.
+///
+/// Nothing here is rendered or decoded by the engine; this is a field report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetouchMaskSummary {
+    pub kind: RetouchMaskKind,
+    pub uuid: Option<String>,
+    pub has_plane: bool,
+}
+
 /// One decoded `ZRETOUCHINGLAYER` row.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RetouchingLayer {
@@ -224,6 +252,38 @@ impl RetouchingLayer {
             other,
         }
     }
+
+    /// Skin evening then blemish removal: the masks this engine surfaces.
+    ///
+    /// `masks` is the metadata of the `.comask` sidecar that owns this variant,
+    /// or `None` when no sidecar was found. Without it the UUIDs still come
+    /// back, with `has_plane = false`.
+    pub fn mask_summaries(
+        &self,
+        masks: Option<&[crate::comask::ComaskMask]>,
+    ) -> Vec<RetouchMaskSummary> {
+        [
+            (RetouchMaskKind::SkinEvening, &self.skin_evening_mask),
+            (RetouchMaskKind::BlemishRemoval, &self.blemish_removal_mask),
+        ]
+        .into_iter()
+        .filter_map(|(kind, slot)| {
+            let uuid = slot.mask_uuid.as_deref().filter(|u| !is_empty_uuid(u))?;
+            let has_plane = masks.is_some_and(|list| {
+                list.iter().any(|m| {
+                    m.uuid.as_deref() == Some(uuid)
+                        && m.rasters.iter().any(|r| r.kind == crate::comask::RasterKind::Map)
+                })
+            });
+            Some(RetouchMaskSummary { kind, uuid: Some(uuid.to_string()), has_plane })
+        })
+        .collect()
+    }
+}
+
+/// C1 writes all-zero UUIDs for "no mask in this slot".
+fn is_empty_uuid(uuid: &str) -> bool {
+    uuid.bytes().all(|b| b == b'-' || b == b'0')
 }
 
 fn cell<'a>(row: &'a HashMap<String, Option<String>>, key: &str) -> Option<&'a str> {
@@ -291,34 +351,34 @@ mod tests {
         pairs.iter().map(|(k, v)| ((*k).to_string(), v.map(str::to_string))).collect()
     }
 
-    const SYNTHETIC_FACE: &str = "0.1;0.2;0.3;0.4;\
-0.15;0.25;0.35;0.25;\
-0.25;0.35;0.2;0.4;\
-0.3;0.4;0.25;0.1;\
-0.9;1;0.125";
+    const REAL_FACE: &str = "0.366963;0.366116;0.160704;0.162455;\
+0.461312;0.467326;0.466840;0.500799;\
+0.434745;0.526875;0.403148;0.479062;\
+0.406296;0.503819;0.459778;0.406264;\
+0.999023;1;0.115612";
 
     #[test]
     fn face_field_order_matches_mcfaceinfo() {
-        let face = FaceInfo::parse(SYNTHETIC_FACE).unwrap();
-        assert_eq!(face.bbox, [0.1, 0.2, 0.3, 0.4]);
-        assert_eq!(face.eye1, [0.15, 0.25]);
-        assert_eq!(face.eye2, [0.35, 0.25]);
-        assert_eq!(face.nose, [0.25, 0.35]);
-        assert_eq!(face.mouth_left, [0.2, 0.4]);
-        assert_eq!(face.mouth_right, [0.3, 0.4]);
-        assert_eq!(face.head, [0.25, 0.1]);
-        assert_eq!(face.confidence, 0.9);
+        let face = FaceInfo::parse(REAL_FACE).unwrap();
+        assert_eq!(face.bbox, [0.366963, 0.366116, 0.160704, 0.162455]);
+        assert_eq!(face.eye1, [0.461312, 0.467326]);
+        assert_eq!(face.eye2, [0.466840, 0.500799]);
+        assert_eq!(face.nose, [0.434745, 0.526875]);
+        assert_eq!(face.mouth_left, [0.403148, 0.479062]);
+        assert_eq!(face.mouth_right, [0.406296, 0.503819]);
+        assert_eq!(face.head, [0.459778, 0.406264]);
+        assert_eq!(face.confidence, 0.999023);
         assert_eq!(face.importance, 1.0);
-        assert_eq!(face.face_size_ratio, 0.125);
+        assert_eq!(face.face_size_ratio, 0.115612);
     }
 
     #[test]
     fn face_missing_value_is_not_shifted() {
-        let short = "0.1;0.2;0.3;0.4;\
-0.15;0.25;0.35;0.25;\
-0.25;0.35;0.2;0.4;\
-0.3;0.4;0.25;0.1;\
-0.9;1";
+        let short = "0.366963;0.366116;0.160704;0.162455;\
+0.461312;0.467326;0.466840;0.500799;\
+0.434745;0.526875;0.403148;0.479062;\
+0.406296;0.503819;0.459778;0.406264;\
+0.999023;1";
         assert_eq!(FaceInfo::parse(short), None);
         assert_eq!(FaceInfo::parse(""), None);
         assert_eq!(FaceInfo::parse("1;2;3;not-a-number;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19"), None);
@@ -341,7 +401,7 @@ mod tests {
             ("Z_ENT", Some("51")),
             ("Z_PK", Some("7")),
             ("ZVARIANT", Some("9")),
-            ("ZFACE", Some(SYNTHETIC_FACE)),
+            ("ZFACE", Some(REAL_FACE)),
             ("ZBLEMISHREMOVALMASKUUID", Some("blemish-uuid")),
             ("ZBLEMISHREMOVALMASKCROP", Some("0;0;1;1")),
             ("ZBLEMISHREMOVALAMOUNT", Some("51.0989")),
@@ -384,7 +444,7 @@ mod tests {
         assert_eq!(layer.entity, Some(51));
         assert_eq!(layer.pk, Some(7));
         assert_eq!(layer.variant, Some(9));
-        assert_eq!(layer.face.unwrap().mouth_left, [0.2, 0.4]);
+        assert_eq!(layer.face.unwrap().mouth_left, [0.403148, 0.479062]);
         assert_eq!(layer.blemish_removal_mask.mask_uuid.as_deref(), Some("blemish-uuid"));
         assert_eq!(layer.blemish_removal_mask.mask_crop.as_deref(), Some("0;0;1;1"));
         assert_eq!(layer.blemish_removal_amount, Some(51.0989));
@@ -470,7 +530,7 @@ mod tests {
                 ("Z_ENT", Some("51")),
                 ("Z_PK", Some("3")),
                 ("ZVARIANT", Some("10")),
-                ("ZFACE", Some(SYNTHETIC_FACE)),
+                ("ZFACE", Some(REAL_FACE)),
             ]),
             owned_row(&[
                 ("Z_ENT", Some("51")),
@@ -491,7 +551,7 @@ mod tests {
         assert_eq!(ten[0].blemish_removal_amount, Some(51.0989));
         assert_eq!(ten[1].skin_evening_texture, Some(55.0));
         assert_eq!(ten[1].skin_evening_amount, None);
-        assert_eq!(ten[2].face.unwrap().face_size_ratio, 0.125);
+        assert_eq!(ten[2].face.unwrap().face_size_ratio, 0.115612);
         assert_eq!(group.by_variant[&20].len(), 1);
     }
 
@@ -524,5 +584,68 @@ mod tests {
         assert_eq!(group.by_variant.len(), 1);
         assert_eq!(group.by_variant[&10].len(), 1);
         assert_eq!(group.by_variant[&10][0].pk, Some(4));
+    }
+
+    const SKIN_UUID: &str = "cf7a832a-6002-4543-aba0-ccdf30d1242b";
+    const BLEMISH_UUID: &str = "7c423e46-c999-440c-a71e-09d1139d8a7e";
+
+    fn mask_row() -> HashMap<&'static str, Option<String>> {
+        row(&[
+            ("Z_ENT", Some("51")),
+            ("Z_PK", Some("1")),
+            ("ZVARIANT", Some("1")),
+            ("ZSKINEVENINGMASKUUID", Some(SKIN_UUID)),
+            ("ZBLEMISHREMOVALMASKUUID", Some(BLEMISH_UUID)),
+        ])
+    }
+
+    #[test]
+    fn retouch_masks_without_a_comask_do_not_panic() {
+        let layer = RetouchingLayer::from_row(&mask_row());
+        let masks = layer.mask_summaries(None);
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[0].kind, RetouchMaskKind::SkinEvening);
+        assert_eq!(masks[0].uuid.as_deref(), Some(SKIN_UUID));
+        assert_eq!(masks[1].kind, RetouchMaskKind::BlemishRemoval);
+        assert_eq!(masks[1].uuid.as_deref(), Some(BLEMISH_UUID));
+        assert!(masks.iter().all(|m| !m.has_plane), "no sidecar, no plane");
+    }
+
+    #[test]
+    fn retouch_masks_hit_the_real_comask_uuids() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/comask/_DSC5673.NEF.comask");
+        // The 1.2 MB C1 sample is not part of the tree; without it the pairing
+        // is covered by the no-sidecar test above.
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        };
+        let document = crate::comask::ComaskDocument::parse(&bytes).unwrap();
+        let layer = RetouchingLayer::from_row(&mask_row());
+        let masks = layer.mask_summaries(Some(&document.masks));
+        assert_eq!(masks.len(), 2);
+        assert!(masks.iter().all(|m| m.has_plane), "both records carry a Map grid: {masks:?}");
+        for mask in &masks {
+            let uuid = mask.uuid.as_deref().unwrap();
+            assert!(
+                document.masks.iter().any(|m| m.uuid.as_deref() == Some(uuid)),
+                "UUID {uuid} missing from the .comask"
+            );
+        }
+    }
+
+    #[test]
+    fn all_zero_mask_uuids_are_not_reported() {
+        let layer = RetouchingLayer::from_row(&row(&[
+            ("Z_ENT", Some("51")),
+            ("Z_PK", Some("2")),
+            ("ZVARIANT", Some("1")),
+            ("ZSKINEVENINGMASKUUID", Some("00000000-0000-0000-0000-000000000000")),
+            ("ZBLEMISHREMOVALMASKUUID", Some(BLEMISH_UUID)),
+        ]));
+        let masks = layer.mask_summaries(None);
+        assert_eq!(masks.len(), 1);
+        assert_eq!(masks[0].kind, RetouchMaskKind::BlemishRemoval);
     }
 }

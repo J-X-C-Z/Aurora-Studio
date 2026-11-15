@@ -8,6 +8,7 @@ use gpui_kit::component::{
     Icon, Sizable as _, VirtualListScrollHandle, h_flex, h_virtual_list,
     menu::{ContextMenuExt as _, PopupMenuItem},
     input::{Input, InputEvent, InputState},
+    tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
 use gpui_kit::{
@@ -15,7 +16,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Window, div, img,
     prelude::FluentBuilder as _, px, size,
 };
-use lumen_engine::{ColorTag, ImageId, ImageInfo};
+use aurora_engine::{ColorTag, ImageId, ImageInfo};
 
 use crate::i18n::t;
 use crate::state::{AppState, BrowserMode, SortKey};
@@ -177,7 +178,7 @@ fn cell(
     let st = state.clone();
     let rating = info.rating;
     let tag = info.color_tag;
-    let name: SharedString = if s.library_offline.contains(&id) { format!("{} · {}", info.file_name, t("Offline", "离线")).into() } else { info.file_name.clone().into() };
+    let name: SharedString = info.file_name.clone().into();
     let variant = info.variant;
     let dragged: Vec<ImageId> = if selected { s.selection.iter().copied().collect() } else { vec![id] };
     // Stack: the pick carries a badge with the count; open members sit on a well.
@@ -348,7 +349,6 @@ fn cell(
             let in_stack = s.stack_of(id).is_some();
             let is_pick = s.stack_of(id).is_some_and(|st| st.pick() == id);
             let st = st_menu.clone();
-            let menu = crate::ui::files::image_menu(menu, &st_menu, id, cx);
             menu.item(PopupMenuItem::new(t("Stack Selected", "堆叠所选")).on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::StackSelected), cx)))
                 .when(in_stack, |m| {
                     m.item(PopupMenuItem::new(t("Unstack", "取消堆叠")).on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::UnstackSelected), cx)))
@@ -369,7 +369,7 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
     let thumb = s.thumbs.get(&id).cloned();
     let st = state.clone();
     let e = &info.exif;
-    let st_menu = state.clone();
+    let heif_tip = info.heif.as_ref().map(heif_tip);
     let col = |w: f32, text: String| div().w(px(w)).flex_shrink_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(text);
     h_flex()
         .id(SharedString::from(format!("row-{}", id.0)))
@@ -388,7 +388,7 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
             st.update(cx, |s, cx| s.select(id, m.control || m.platform, m.shift, cx))
         })
         .child(div().w(px(44.0)).h(px(30.0)).flex().items_center().justify_center().when_some(thumb, |d, t| d.child(img(t).max_w_full().max_h_full().object_fit(ObjectFit::Contain))))
-        .child(col(240.0, if s.library_offline.contains(&id) { format!("{} · {}", info.file_name, t("Offline", "离线")) } else { info.file_name.clone() }).text_color(p.text))
+        .child(col(240.0, info.file_name.clone()).text_color(p.text))
         .child(col(150.0, e.captured_at.clone().unwrap_or_default().replace('T', " ").chars().take(16).collect()))
         .child(col(160.0, format!("{} {}", e.camera_make.clone().unwrap_or_default(), e.camera_model.clone().unwrap_or_default())))
         .child(col(70.0, e.iso.map(|i| format!("ISO {i}")).unwrap_or_default()))
@@ -397,8 +397,44 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
         .child(col(80.0, if info.rating < 0 { "✕".into() } else { "★".repeat(info.rating as usize) }).text_color(p.warning))
         .child(div().w(px(12.0)).h(px(12.0)).rounded_full().when(info.color_tag != ColorTag::None, |d| d.bg(hex(info.color_tag.rgb()))))
         .child(col(80.0, format!("{:.1} MB", info.file_size as f64 / 1_000_000.0)))
-        .child(col(120.0, format!("{} × {}", info.width, info.height)))
-        .context_menu(move |menu, _, cx| crate::ui::files::image_menu(menu, &st_menu, id, cx))
+        .child(
+            col(120.0, match &info.heif {
+                Some(heif) => format!("{}×{} · HEIF {}", info.width, info.height, heif.aux_label()),
+                None => format!("{} × {}", info.width, info.height),
+            })
+            .id(SharedString::from(format!("dims-{}", id.0)))
+            .when_some(heif_tip, |d, tip| {
+                d.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            }),
+        )
+}
+
+fn heif_tip(heif: &aurora_engine::HeifInfo) -> String {
+    format!(
+        "{} {} · {} {} · {}",
+        heif.thumbnails,
+        t("thumbnails", "缩略图"),
+        heif.depth_images,
+        t("depth images", "深度图"),
+        if heif.uses_embedded_thumbnail() {
+            t("embedded thumbnail used when unedited", "无调整时使用内嵌缩略图")
+        } else {
+            t("no embedded thumbnail", "无内嵌缩略图")
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::heif_tip;
+
+    #[test]
+    fn heif_tooltip_reports_both_counts() {
+        let tip = heif_tip(&aurora_engine::HeifInfo { thumbnails: 2, depth_images: 3 });
+        assert!(tip.contains('2') && tip.contains('3'), "{tip}");
+        let none = heif_tip(&aurora_engine::HeifInfo::default());
+        assert!(none.contains('0'), "{none}");
+    }
 }
 
 impl Render for Browser {

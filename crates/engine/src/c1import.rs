@@ -2,7 +2,7 @@
 //! handing the stored variants to the engine.
 //!
 //! The C1 database is **read-only for us**: nothing here writes to it, and the
-//! engine keeps everything it saves in its own `.lumen` directory. A `.readlock`
+//! engine keeps everything it saves in its own `.portrait` directory. A `.readlock`
 //! or an uncommitted `-wal` only produces a warning (see [`C1Catalog::open_ro`]).
 
 use std::collections::HashMap;
@@ -204,6 +204,9 @@ pub(crate) fn store_key(path: &Path, variant: u32) -> String {
 mod tests {
     use super::*;
 
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb")
+    }
 
     const PAGE: usize = 4096;
 
@@ -244,12 +247,90 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lumen-c1-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-c1-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
+    /// A copy of the fixture rewritten into a session: type 2 and a mac path.
+    fn session_database(dir: &Path) -> PathBuf {
+        let db = dir.join("Session.cosessiondb");
+        std::fs::copy(fixture(), &db).unwrap();
+        let mut bytes = std::fs::read(&db).unwrap();
+        bytes[PAGE..2 * PAGE].copy_from_slice(&decode_rle(SESSION_DOC_PAGE));
+        bytes[18 * PAGE..19 * PAGE].copy_from_slice(&decode_rle(SESSION_PATH_PAGE));
+        std::fs::write(&db, bytes).unwrap();
+        db
+    }
+
+    #[test]
+    fn opens_the_fixture() {
+        let import = C1Import::open(&fixture()).unwrap();
+        assert_eq!(import.images().len(), 3);
+        assert_eq!(import.variants().len(), 4);
+        assert!(import.catalog.warnings.is_empty());
+    }
+
+    #[test]
+    fn variants_are_grouped_per_image_in_index_order() {
+        let import = C1Import::open(&fixture()).unwrap();
+        let first = &import.images()[0];
+        let variants = import.variants_of(first.pk);
+        assert_eq!(variants.len(), 2);
+        assert!(variants[0].index <= variants[1].index);
+    }
+
+    #[test]
+    fn every_variant_carries_a_non_default_adjustment_set() {
+        let import = C1Import::open(&fixture()).unwrap();
+        for variant in import.variants() {
+            assert!(!variant.adjustments.is_default(), "variant {} lost its edits", variant.pk);
+        }
+    }
+
+    #[test]
+    fn crop_is_normalized_inside_the_variants_canvas() {
+        let import = C1Import::open(&fixture()).unwrap();
+        let variant = &import.variants()[0];
+        assert!(variant.canvas.is_some());
+        let crop = variant.adjustments.geometry.crop;
+        for value in [crop.x, crop.y, crop.width, crop.height] {
+            assert!((0.0..=1.0).contains(&value), "crop {value} outside the canvas");
+        }
+        // ZCROP is 2525.8;2348.1;3328.8;4993.3 on a 4043x6057 canvas, so this only
+        // holds when the variant's ZCANVASSIZE was used: a full frame would be 1.0.
+        assert!((crop.width - 0.1986).abs() < 0.01, "crop width {}", crop.width);
+        assert!(crop.height < 0.5, "crop height {}", crop.height);
+    }
+
+    #[test]
+    fn ratings_tags_and_keywords_are_read() {
+        let import = C1Import::open(&fixture()).unwrap();
+        let variant = &import.variants()[0];
+        assert_eq!(variant.rating, 5);
+        // This catalog has no keywords and no colour tags on any variant, so an
+        // empty result is the correct read, not a failed one.
+        assert!(variant.keywords.is_empty());
+        assert_eq!(variant.color_tag, 0);
+    }
+
+    #[test]
+    fn a_bundle_directory_opens_like_the_file() {
+        let dir = std::env::temp_dir().join(format!("portrait-c1-bundle-{}", std::process::id()));
+        let bundle = dir.join("Test.cocatalogdb");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::copy(fixture(), bundle.join("Test.cocatalogdb")).unwrap();
+        let import = C1Import::open(&bundle).unwrap();
+        assert_eq!(import.images().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_with_one_catalog_opens() {
+        let import = C1Import::open(fixture().parent().unwrap()).unwrap();
+        assert_eq!(import.images().len(), 3);
+    }
 
     #[test]
     fn a_missing_path_is_an_error_not_a_panic() {
@@ -263,18 +344,182 @@ mod tests {
         assert_eq!(store_key(Path::new("C:\\Users\\me\\shot.NEF"), 2), "C_/Users/me/shot.NEF#v2");
     }
 
+    #[test]
+    fn the_catalog_tree_becomes_engine_collections() {
+        let import = C1Import::open(&fixture()).unwrap();
+        let tree = import.collections();
+        assert_eq!(tree.len(), 1, "one project root");
+        let root = &tree[0];
+        assert_eq!(root.kind, CollectionKind::Project);
+        assert_eq!(root.name, "[Collection]");
+        assert_eq!(root.id, C1_COLLECTION_ID_BASE + 1);
 
+        let by_name = |name: &str| {
+            root.children
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no collection {name}"))
+        };
+        // The system collections come from the root's role pointers.
+        assert_eq!(by_name("全部图像").kind, CollectionKind::AllImages);
+        assert_eq!(by_name("全部图像").count, import.images().len());
+        assert_eq!(by_name("最近拍摄").kind, CollectionKind::RecentCaptures);
+        assert_eq!(by_name("最近导入").kind, CollectionKind::RecentImports);
+        assert_eq!(by_name("回收箱").kind, CollectionKind::Trash);
 
+        // The album hangs under "最近导入" and holds the three catalogued images.
+        let album = by_name("最近导入")
+            .children
+            .iter()
+            .find(|c| c.name == "2026年9月13日 22:20:27")
+            .unwrap();
+        assert_eq!(album.kind, CollectionKind::Album);
+        assert_eq!(album.count, 3);
 
+        // The folder chain is nested by the parent pointers.
+        let drive = by_name("C:\\");
+        assert_eq!(drive.kind, CollectionKind::Folder);
+        assert_eq!(drive.children.len(), 1);
+        assert_eq!(drive.children[0].name, "Users");
+        assert_eq!(drive.children[0].children[0].name, "Jxcz2");
+        assert_eq!(drive.children[0].children[0].children[0].name, "Desktop");
+    }
 
+    #[test]
+    fn keywords_are_empty_in_the_real_catalog() {
+        let import = C1Import::open(&fixture()).unwrap();
+        assert!(import.catalog.keywords.is_empty());
+        assert!(import.keyword_paths().is_empty());
+        assert!(import.keywords_of(import.images()[0].pk).is_empty());
+    }
 
+    #[test]
+    fn a_catalog_reports_its_document_type() {
+        let import = C1Import::open(&fixture()).unwrap();
+        assert_eq!(import.document_type(), C1DocumentType::Catalog);
+        assert!(!import.is_session());
+    }
 
+    #[test]
+    fn a_session_bundle_opens_with_its_mac_paths() {
+        let dir = temp_dir("session");
+        let bundle = dir.join("Session.cos");
+        let inner = bundle.join("Session.cosessiondb");
+        std::fs::create_dir_all(&inner).unwrap();
+        session_database(&inner);
 
+        // The `.cos` folder, the bundle and the file all resolve to the same db.
+        for path in [bundle.as_path(), inner.as_path(), dir.as_path()] {
+            let import = C1Import::open(path).unwrap();
+            assert_eq!(import.document_type(), C1DocumentType::Session, "{}", path.display());
+            assert!(import.is_session());
+            assert_eq!(import.images().len(), 3);
+            assert_eq!(import.variants().len(), 4);
+            assert_eq!(
+                import.images()[0].abs_path,
+                "/Users/jxcz/Pictures/Shoot/_DSC5673.NEF"
+            );
+            // No original is on this machine, and the entries still import.
+            assert!(!Path::new(&import.images()[0].abs_path).exists());
+            assert!(import.catalog.warnings.is_empty(), "{:?}", import.catalog.warnings);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn an_unknown_document_type_is_an_error() {
+        let dir = temp_dir("session-unknown");
+        let db = dir.join("Odd.cosessiondb");
+        std::fs::copy(fixture(), &db).unwrap();
+        let mut bytes = std::fs::read(&db).unwrap();
+        bytes[PAGE..2 * PAGE].copy_from_slice(&decode_rle(UNKNOWN_DOC_PAGE));
+        std::fs::write(&db, bytes).unwrap();
 
+        let err = format!("{:#}", C1Import::open(&db).unwrap_err());
+        assert!(err.contains("document type 3"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    /// The synthetic session, written where [`C1Import::open`] can find it.
+    fn synthetic_session(dir: &Path) -> PathBuf {
+        let db = dir.join("Session.cosessiondb");
+        std::fs::write(&db, crate::c1catalog::test_support::synthetic_session()).unwrap();
+        db
+    }
 
+    #[test]
+    fn a_synthetic_session_reads_exact_adjustments() {
+        let dir = temp_dir("synthetic-session-adjust");
+        let import = C1Import::open(&synthetic_session(&dir)).unwrap();
+        let variant = import.variants_of(1).into_iter().find(|v| v.index == 0).unwrap();
 
+        // The delta with the higher Z_PK wins over the snapshot and the earlier delta.
+        assert_eq!(variant.settings.exposure, 0.75);
+        assert_eq!(variant.settings.contrast, 20.0);
+        assert_eq!(variant.adjustments.exposure.exposure, 0.75);
+        assert_eq!(variant.adjustments.exposure.contrast, 20.0);
+
+        // ZCROP is in canvas pixels and only becomes normalized with ZCANVASSIZE.
+        let crop = variant.adjustments.geometry.crop;
+        assert!((crop.x - 0.25).abs() < 1e-6, "x {}", crop.x);
+        assert!((crop.y - 1.0 / 6.0).abs() < 1e-6, "y {}", crop.y);
+        assert!((crop.width - 0.25).abs() < 1e-6, "width {}", crop.width);
+        assert!((crop.height - 1.0 / 3.0).abs() < 1e-6, "height {}", crop.height);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn variants_and_layers_follow_c1_order() {
+        let dir = temp_dir("synthetic-session-order");
+        let import = C1Import::open(&synthetic_session(&dir)).unwrap();
+
+        // ZVARIANT rows are stored as index 2, 0, 1; the import orders by ZINDEX.
+        let variants = import.variants_of(1);
+        let indexes: Vec<i64> = variants.iter().map(|v| v.index).collect();
+        let pks: Vec<i64> = variants.iter().map(|v| v.pk).collect();
+        assert_eq!(indexes, vec![0, 1, 2]);
+        assert_eq!(pks, vec![11, 12, 10]);
+
+        // The mask layer stays out of the variant's global settings.
+        assert_eq!(variants[0].mask_layers, 1);
+        assert_eq!(variants[0].mask_names, vec!["Skin Mask 1".to_string()]);
+        assert_eq!(variants[0].local_layers.len(), 1);
+        assert_eq!(variants[0].settings.exposure, 0.75);
+
+        // Layers belong to their own variant only.
+        assert_eq!(variants[2].settings.exposure, -1.0);
+        assert_eq!(variants[1].settings.exposure, 2.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_synthetic_session_exposes_its_metadata() {
+        let dir = temp_dir("synthetic-session-meta");
+        let import = C1Import::open(&synthetic_session(&dir)).unwrap();
+
+        assert_eq!(import.document_type(), C1DocumentType::Session);
+        assert!(import.is_session());
+        assert!(import.catalog.warnings.is_empty(), "{:?}", import.catalog.warnings);
+        assert!(import.catalog_path.ends_with("Session.cosessiondb"));
+
+        // A session made on macOS carries only the mac root.
+        let image = &import.images()[0];
+        assert_eq!(image.abs_path, "/Volumes/Shoot/2026/Day 1/_DSC0001.NEF");
+        assert_eq!(image.file_name, "_DSC0001.NEF");
+        assert_eq!((image.width, image.height), (6000, 4000));
+        assert_eq!(image.iso, Some(400));
+        assert_eq!(image.camera_model, "NIKON Z6_3");
+
+        // Keywords keep the hierarchy and the rating takes the layer-chain max.
+        let variant = import.variants_of(1)[0];
+        assert_eq!(variant.rating, 6);
+        assert_eq!(variant.keywords, vec!["Wedding/Bride".to_string()]);
+        assert_eq!(
+            import.keyword_paths().get("Bride").map(String::as_str),
+            Some("Wedding/Bride")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_database_without_the_variant_tables_is_rejected() {
@@ -300,7 +545,4 @@ mod tests {
         assert!(err.contains("settings file"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/c1import-tests.rs");
 }

@@ -1027,7 +1027,13 @@ impl C1Catalog {
                 let portrait_canvas = ch > cw;
                 let portrait_source = source.1 > source.0;
                 if source.0 > 0 && portrait_canvas != portrait_source {
-                    adjustments.geometry.orientation = 90;
+                    // `orientation` is quarter turns; a raw 90 is read as 90 % 4 == 2
+                    // and turns the frame twice. Only add a quarter turn when the
+                    // current one is even; an odd ZROTATION already has the axis.
+                    let turn = adjustments.geometry.orientation % 4;
+                    if turn % 2 == 0 {
+                        adjustments.geometry.orientation = (turn + 1) % 4;
+                    }
                 }
             }
 
@@ -1108,6 +1114,28 @@ fn optional_rows(
     db.select(table)
 }
 
+/// Raw text rows of one table, for the session exporter's column pass-through.
+///
+/// A missing table is an empty list, so lean/synthetic sessions keep working.
+pub(crate) fn export_table_rows(
+    path: &Path,
+    table: &str,
+) -> Result<Vec<HashMap<String, Option<String>>>> {
+    let mut db = SqliteReader::open(path)?;
+    let rows = match db.select(table) {
+        Ok(rows) => rows,
+        Err(_) => return Ok(Vec::new()),
+    };
+    Ok(rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|(key, value)| (key.clone(), value.as_string()))
+                .collect()
+        })
+        .collect())
+}
+
 /// The folder a `ZPATHLOCATION` row points at: `ZWINROOT + ZRELATIVEPATH`, or
 /// the mac root when the Windows one is empty (a session made on macOS).
 fn location_path(row: &Row) -> String {
@@ -1162,13 +1190,348 @@ pub fn keyword_paths(keywords: &[C1Keyword]) -> HashMap<String, String> {
 /// journal_mode=WAL`, then two `ZKEYWORD` inserts and one
 /// `ZVARIANTMETADATA.ZCONTENT_KEYWORDS` update, committed) and stored as
 /// (byte, u16 length) runs.
-#[cfg(all(test, feature = "external-fixtures"))]
-#[path = "../local-fixtures/catalog_support.rs"]
-pub(crate) mod test_support;
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    const WAL_RLE_HEX: &str = concat!(
+        "3701007f01000601008201000001002d0100e201001801000002001001000005001f0100b80100dd01004a0100d10100",
+        "fb0100ac0100b801001f0100c40100bb01003201009001005901008e0100a801000003000901000004001f0100b80100",
+        "dd01004a0100d10100fb0100ac0100b80100f00100f101000a0100a10100c50100c601000e0100a101000d0100000300",
+        "0201000f0100d901000001000f0100ec01000f0100d9010000cd0f110100020100090100010100000100170100090100",
+        "0102000002002c01004201007201006901006401006501000301000401001201000101000901000101000001001b0100",
+        "0801000901000101000002002c01005701006501006402006901006e01006701000201000003000a01000004001f0100",
+        "b80100dd01004a0100d10100fb0100ac0100b801004d01006201005c01002301008d01001901002201003a01000a0100",
+        "0003000201000f0100f601000001000f0100fc01000f0100f6010000ea0f050100030100010200030100020100030200",
+        "0902000003000b01000004001f0100b80100dd01004a0100d10100fb0100ac0100b801003f0100380100780100750100",
+        "6f01003901007f0100d701000a01000003000201000f0100f501000001000f0100fb01000f0100f5010000e90f050100",
+        "0301000102000401000201000401000301000101000901000201000003000c01000004001f0100b80100dd01004a0100",
+        "d10100fb0100ac0100b801006d0100fe01006a0100b70100c80100290100100100af01000a01000003000201000f0100",
+        "e901000001000f0100e901000f0100f4010000dd0f0a0100040100170100090100010100420100720100690100640100",
+        "6501000201000b01000401001b01000801000901005701006501006402006901006e01006701000003001d0100000400",
+        "1f0100b80100dd01004a0100d10100fb0100ac0100b801004b0100b10100fd01001b0100b50100ce01003c01007a0100",
+        "0d01000f01005f01000001001201000c01002001000001000c01002001000f01003001000f01008c01000f0100020100",
+        "0e01007801000e0100d401000e0100a601000e01004a01000e01001c01000d0100ee01000d0100c001000d0100920100",
+        "0d01006401000d01003601000c0100fc01000c0100ce01000c01009401000c010066010000f40b4401000101002a0100",
+        "0101000001000901000801000d01001501000008000d01000003002701000004001d01000001000d0100000a000d0100",
+        "0004000d01004a01005801004301005a01004201007201006901006401006501002c0100570100650100640200690100",
+        "6e01006701003201003001003201003601003001003901003101003301002c01001401002a0100010100000100010100",
+        "0001000d01000024000d01001401003801001301002a01000101000001000101000801000d01001501000008000d0100",
+        "0008001d01000001000d0100000a000d01000004000d01001301004a01005801004301005a0100320100300100320100",
+        "3601003001003901003101003301002c01001201002a01000101000001000101000001000d01000024000d0100120100",
+        "3801001101002a01000101000001000101000801000d01001501000008000d01000008001d01000001000d0100000a00",
+        "0d01000004000d01001101004a01005801004301005a0100320100300100320100360100300100390100310100330100",
+        "2c01001001002a01000101000001000101000001000d01000009000d0100000a000d0100000a000d01000004000d0100",
+        "1001002c01000f01002a01000101000001000101000001000d01000024000d01000f01002c01000e01002a0100010100",
+        "0001000101000001000d01000009000d0100000a000d0100000a000d01000004000d01000e01002c01000d01002a0100",
+        "0101000001000101000001000d01000009000d0100000a000d0100000a000d01000004000d02002c01000c01002a0100",
+        "0101000001000101000001000d01000024000d01000c01002c01000b01002a01000101000001000101000001000d0100",
+        "0009000d0100000a000d0100000a000d01000004000d01000b01002c01000a01002a0100010100000100010100000100",
+        "0d01000024000d01000a01002c01000701002a01000101000001000101000001000d01000024000d01000701002c0100",
+        "0901002a01000101000001000101000001000d01000024000d01000901002c01000801002a0100010100000100010100",
+        "0001000d01000024000d01000801002c01000401002a01000101000001000101000001000d01000024000d0100040100",
+        "2d01000201002a01000101000001000102000d01000024000d01000201000501000f0100c701000001002d0100000100",
+        "0101000801000d01001501000008000d01000008001d01000001000d0100000a000d01000004000d0100390100030100",
+        "2a01000101000001000102000d01001501000008000d01000008001d01000001000d0100000a000d01000004000d0100",
+        "0301000501004a01005801004301005a0100320100300100320100360100300100390100310100330100000300390100",
+        "0001000901000801000d01001501000008000d01000008001d01000001000d0100000a000d01000004000d01004a0100",
+        "5801004301005a01003201003001003201003601003001003901003101003301000003002601000003004201001f0100",
+        "b80100dd01004a0100d10100fb0100ac0100b80100890100b50100f301008d0100dd01004d01004a01005701000a0100",
+        "0003000201000f0100f601000001000f0100fc01000f0100f6010000ea0f050100030100010200030100020100030200",
+        "090200",
+    );
+
+    pub fn fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb")
+    }
+
+    /// The bytes of the `-wal` file, decoded from its run-length form.
+    pub fn wal_bytes() -> Vec<u8> {
+        let hex: Vec<u8> = WAL_RLE_HEX.trim().bytes().collect();
+        let mut runs = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.chunks(2) {
+            let text = std::str::from_utf8(pair).unwrap();
+            runs.push(u8::from_str_radix(text, 16).unwrap());
+        }
+        let mut out = Vec::new();
+        for run in runs.chunks_exact(3) {
+            let count = usize::from(u16::from_le_bytes([run[1], run[2]]));
+            out.extend(std::iter::repeat_n(run[0], count));
+        }
+        out
+    }
+
+    /// A copy of the fixture plus that `-wal` beside it, in `dir`.
+    pub fn fixture_with_wal(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let db = dir.join("Copy.cocatalogdb");
+        std::fs::copy(fixture_path(), &db).unwrap();
+        std::fs::write(dir.join("Copy.cocatalogdb-wal"), wal_bytes()).unwrap();
+        db
+    }
+
+    pub use crate::sqlite_write::{Cell, SynthTable};
+
+    /// The session fixtures as a SQLite file. The shared writer in
+    /// [`crate::sqlite_write`] is the same code the session export uses.
+    pub fn sqlite_file(tables: &[SynthTable]) -> Vec<u8> {
+        crate::sqlite_write::sqlite_bytes(tables).expect("test tables fit the writer's limits")
+    }
+
+    /// The tables of a synthetic Capture One session: two images, three variants
+    /// on the first (row order 2, 0, 1) and one on the second, a mac path,
+    /// keywords and a mask layer. Tests drop one table to model leaner sessions.
+    pub fn session_tables() -> Vec<SynthTable> {
+        vec![
+            SynthTable::new("ZENTITIES", &["Z_ENT INTEGER PRIMARY KEY", "ZNAME TEXT"])
+                .row(vec![Cell::Int(1), Cell::text("ProjectCollection")])
+                .row(vec![Cell::Int(2), Cell::text("AlbumCollection")]),
+            SynthTable::new(
+                "ZDOCUMENTCONTENT",
+                &["Z_PK INTEGER PRIMARY KEY", "ZDOCUMENTTYPE INTEGER"],
+            )
+            .row(vec![Cell::Int(1), Cell::Int(2)]),
+            SynthTable::new(
+                "ZPATHLOCATION",
+                &[
+                    "Z_PK INTEGER PRIMARY KEY",
+                    "ZWINROOT TEXT",
+                    "ZMACROOT TEXT",
+                    "ZRELATIVEPATH TEXT",
+                ],
+            )
+            .row(vec![
+                Cell::Int(1),
+                Cell::text(""),
+                Cell::text("/Volumes/Shoot/2026"),
+                Cell::text("Day 1"),
+            ]),
+            SynthTable::new(
+                "ZIMAGE",
+                &[
+                    "Z_PK INTEGER PRIMARY KEY",
+                    "ZIMAGEUUID TEXT",
+                    "ZIMAGEFILENAME TEXT",
+                    "ZIMAGELOCATION INTEGER",
+                    "ZWIDTH INTEGER",
+                    "ZHEIGHT INTEGER",
+                    "ZISO INTEGER",
+                    "ZCAMERA_MODEL TEXT",
+                ],
+            )
+            .row(vec![
+                Cell::Int(1),
+                Cell::text("UUID-1"),
+                Cell::text("_DSC0001.NEF"),
+                Cell::Int(1),
+                Cell::Int(6000),
+                Cell::Int(4000),
+                Cell::Int(400),
+                Cell::text("NIKON Z6_3"),
+            ])
+            .row(vec![
+                Cell::Int(2),
+                Cell::text("UUID-2"),
+                Cell::text("_DSC0002.NEF"),
+                Cell::Int(1),
+                Cell::Int(6000),
+                Cell::Int(4000),
+                Cell::Int(800),
+                Cell::text("NIKON Z6_3"),
+            ]),
+            SynthTable::new(
+                "ZVARIANT",
+                &[
+                    "Z_PK INTEGER PRIMARY KEY",
+                    "ZIMAGE INTEGER",
+                    "ZINDEX INTEGER",
+                    "ZCANVASSIZE TEXT",
+                ],
+            )
+            .row(vec![Cell::Int(10), Cell::Int(1), Cell::Int(2), Cell::text("4000;3000")])
+            .row(vec![Cell::Int(11), Cell::Int(1), Cell::Int(0), Cell::text("4000;3000")])
+            .row(vec![Cell::Int(12), Cell::Int(1), Cell::Int(1), Cell::text("4000;3000")])
+            .row(vec![Cell::Int(13), Cell::Int(2), Cell::Int(0), Cell::Null]),
+            SynthTable::new(
+                "ZVARIANTLAYER",
+                &[
+                    "Z_PK INTEGER PRIMARY KEY",
+                    "Z_ENT INTEGER",
+                    "ZVARIANT INTEGER",
+                    "ZMETADATA INTEGER",
+                    "ZNAME TEXT",
+                    "ZEXPOSURE REAL",
+                    "ZCONTRAST REAL",
+                    "ZCROP TEXT",
+                ],
+            )
+            // Full snapshot, then two deltas; the later Z_PK wins.
+            .row(vec![
+                Cell::Int(100),
+                Cell::Int(18),
+                Cell::Int(11),
+                Cell::Null,
+                Cell::Null,
+                Cell::Real(0.5),
+                Cell::Real(4.0),
+                Cell::text("1000;500;2000;1500"),
+            ])
+            .row(vec![
+                Cell::Int(101),
+                Cell::Int(17),
+                Cell::Int(11),
+                Cell::Int(1),
+                Cell::Null,
+                Cell::Null,
+                Cell::Real(10.0),
+                Cell::Null,
+            ])
+            .row(vec![
+                Cell::Int(102),
+                Cell::Int(17),
+                Cell::Int(11),
+                Cell::Int(2),
+                Cell::Null,
+                Cell::Real(0.75),
+                Cell::Real(20.0),
+                Cell::Null,
+            ])
+            // A mask layer must stay local, never override the global settings.
+            .row(vec![
+                Cell::Int(103),
+                Cell::Int(23),
+                Cell::Int(11),
+                Cell::Null,
+                Cell::text("Skin Mask 1"),
+                Cell::Real(3.0),
+                Cell::Null,
+                Cell::Null,
+            ])
+            .row(vec![
+                Cell::Int(104),
+                Cell::Int(18),
+                Cell::Int(10),
+                Cell::Null,
+                Cell::Null,
+                Cell::Real(-1.0),
+                Cell::Null,
+                Cell::Null,
+            ])
+            .row(vec![
+                Cell::Int(105),
+                Cell::Int(18),
+                Cell::Int(12),
+                Cell::Null,
+                Cell::Null,
+                Cell::Real(2.0),
+                Cell::Null,
+                Cell::Null,
+            ]),
+            SynthTable::new(
+                "ZVARIANTMETADATA",
+                &[
+                    "Z_PK INTEGER PRIMARY KEY",
+                    "ZBASIC_RATING INTEGER",
+                    "ZCONTENT_KEYWORDS TEXT",
+                ],
+            )
+            .row(vec![Cell::Int(1), Cell::Int(6), Cell::text("Bride")])
+            .row(vec![Cell::Int(2), Cell::Int(1), Cell::Null]),
+            SynthTable::new(
+                "ZCOLLECTION",
+                &[
+                    "Z_PK INTEGER PRIMARY KEY",
+                    "Z_ENT INTEGER",
+                    "ZPARENT INTEGER",
+                    "ZPROJECT INTEGER",
+                    "ZNAME TEXT",
+                    "ZCOLLECTIONINDEX INTEGER",
+                    "ZALLIMAGESCOLLECTION INTEGER",
+                    "ZLASTCAPTURESCOLLECTION INTEGER",
+                    "ZLASTIMPORTSCOLLECTION INTEGER",
+                    "ZTRASHCOLLECTION INTEGER",
+                ],
+            )
+            .row(vec![
+                Cell::Int(1),
+                Cell::Int(1),
+                Cell::Null,
+                Cell::Int(-1),
+                Cell::text("[Collection]"),
+                Cell::Int(0),
+                Cell::Int(2),
+                Cell::Int(3),
+                Cell::Int(4),
+                Cell::Int(5),
+            ])
+            .row(vec![
+                Cell::Int(2),
+                Cell::Int(2),
+                Cell::Int(1),
+                Cell::Int(1),
+                Cell::text("All"),
+                Cell::Int(0),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ])
+            .row(vec![
+                Cell::Int(3),
+                Cell::Int(2),
+                Cell::Int(1),
+                Cell::Int(1),
+                Cell::text("Captures"),
+                Cell::Int(1),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ])
+            .row(vec![
+                Cell::Int(4),
+                Cell::Int(2),
+                Cell::Int(1),
+                Cell::Int(1),
+                Cell::text("Imports"),
+                Cell::Int(2),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ])
+            .row(vec![
+                Cell::Int(5),
+                Cell::Int(2),
+                Cell::Int(1),
+                Cell::Int(1),
+                Cell::text("Trash"),
+                Cell::Int(3),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ]),
+            SynthTable::new("ZIMAGEINCOLLECTION", &["ZCOLLECTION INTEGER", "ZIMAGE INTEGER"])
+                .row(vec![Cell::Int(2), Cell::Int(1)])
+                .row(vec![Cell::Int(2), Cell::Int(2)])
+                .row(vec![Cell::Int(4), Cell::Int(1)]),
+            SynthTable::new(
+                "ZKEYWORD",
+                &["Z_PK INTEGER PRIMARY KEY", "ZNAME TEXT", "ZPARENT INTEGER"],
+            )
+            .row(vec![Cell::Int(1), Cell::text("Wedding"), Cell::Null])
+            .row(vec![Cell::Int(2), Cell::text("Bride"), Cell::Int(1)]),
+        ]
+    }
+
+    pub fn synthetic_session() -> Vec<u8> {
+        sqlite_file(&session_tables())
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "external-fixtures")]
     use super::test_support::{
         fixture_path, fixture_with_wal, session_tables, sqlite_file, synthetic_session, wal_bytes,
     };
@@ -1176,7 +1539,6 @@ mod tests {
 
     /// A `-wal` holding the given `(page, db_size, image)` frames; a non-zero
     /// `db_size` marks a commit, exactly like SQLite writes it.
-    #[cfg(feature = "external-fixtures")]
     fn wal_with_frames(frames: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
         let salt = (0x1122_3344u32, 0x5566_7788u32);
         let mut header = Vec::new();
@@ -1207,13 +1569,15 @@ mod tests {
         out
     }
 
+    fn sample() -> C1Catalog {
+        C1Catalog::open_ro(&fixture_path()).expect("fixture opens")
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("lumen-c1-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("portrait-c1-{tag}-{}", std::process::id()))
     }
 
     /// The synthetic session bytes without one table, written as `name`.
-    #[cfg(feature = "external-fixtures")]
     fn session_without(dir: &Path, table: &str, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let tables: Vec<_> = session_tables()
@@ -1225,11 +1589,76 @@ mod tests {
         path
     }
 
+    #[test]
+    fn reads_the_collection_tree() {
+        let c = sample();
+        assert_eq!(c.collections.len(), 11);
+        let by_pk = |pk: i64| c.collections.iter().find(|c| c.pk == pk).unwrap();
 
+        let root = by_pk(1);
+        assert_eq!((root.kind, root.name.as_str(), root.parent), (CollectionKind::Project, "[Collection]", None));
+        // The system collections are named by the root's role pointers, not by Z_ENT.
+        assert_eq!((by_pk(7).kind, by_pk(7).name.as_str()), (CollectionKind::AllImages, "全部图像"));
+        assert_eq!((by_pk(8).kind, by_pk(8).name.as_str()), (CollectionKind::RecentCaptures, "最近拍摄"));
+        assert_eq!((by_pk(9).kind, by_pk(9).name.as_str()), (CollectionKind::RecentImports, "最近导入"));
+        assert_eq!((by_pk(10).kind, by_pk(10).name.as_str()), (CollectionKind::Trash, "回收箱"));
+        assert_eq!(by_pk(11).kind, CollectionKind::Group);
+        for pk in 7..=10 {
+            assert_eq!(by_pk(pk).parent, Some(1), "system collection {pk} sits under the root");
+        }
+    }
 
+    #[test]
+    fn reads_collections_kinds_from_the_entity_table() {
+        let c = sample();
+        let album = c.collections.iter().find(|c| c.pk == 2).unwrap();
+        assert_eq!(album.kind, CollectionKind::Album);
+        assert_eq!(album.ent_name, "AlbumCollection");
+        assert_eq!(album.name, "2026年9月13日 22:20:27");
+        assert_eq!(album.images, vec![1, 2, 3]);
 
+        // pk3..6 are one folder chain; each name is the path relative to its parent.
+        for (pk, name) in [(4, "C:\\"), (5, "Users"), (6, "Jxcz2"), (3, "Desktop")] {
+            let folder = c.collections.iter().find(|c| c.pk == pk).unwrap();
+            assert_eq!(folder.kind, CollectionKind::Folder, "collection {pk}");
+            assert_eq!(folder.ent_name, "CatalogFolderCollection");
+            assert_eq!(folder.name, name, "collection {pk}");
+        }
+        assert_eq!(c.collections.iter().find(|c| c.pk == 4).unwrap().folder_path.as_deref(), Some("C:\\"));
+    }
 
-    #[cfg(feature = "external-fixtures")]
+    #[test]
+    fn the_real_catalog_has_no_keyword_rows() {
+        // ZKEYWORD exists but is empty here; that is the correct read, not a failure.
+        let c = sample();
+        assert!(c.keywords.is_empty());
+        assert!(c.warnings.is_empty());
+        assert!(c.wal.is_none());
+    }
+
+    #[test]
+    fn a_wal_is_replayed_in_memory_and_the_database_is_not_written() {
+        let dir = temp_dir("wal");
+        let db_path = fixture_with_wal(&dir);
+        let before = std::fs::read(&db_path).unwrap();
+
+        let c = C1Catalog::open_ro(&db_path).expect("catalog with a wal opens");
+        let report = c.wal.expect("the wal was found");
+        assert_eq!(report.frames_total, 6);
+        assert_eq!(report.frames_applied, 6);
+        assert_eq!(report.frames_uncommitted, 0);
+        assert_eq!(report.pages_overridden, 6);
+
+        let wedding = c.keywords.iter().find(|k| k.name == "Wedding").unwrap();
+        assert_eq!((wedding.pk, wedding.parent), (1, None));
+        let bride = c.keywords.iter().find(|k| k.name == "Bride").unwrap();
+        assert_eq!((bride.pk, bride.parent), (2, Some(1)));
+
+        // The keywords come from the WAL page images, not from the database file.
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "the database file changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_session_without_variant_metadata_still_opens() {
         let dir = temp_dir("session-no-metadata");
@@ -1253,7 +1682,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn a_missing_document_content_table_follows_the_file_name() {
         let dir = temp_dir("session-no-doctype");
@@ -1279,23 +1707,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_minimal_session_fixture_opens_as_a_session() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/session-min.cosessiondb");
+        let c = C1Catalog::open_ro(&path).expect("a session without collection tables is valid");
+        assert_eq!(c.document_type, C1DocumentType::Session);
+        assert_eq!((c.images.len(), c.variants.len()), (2, 3));
+        assert!(c.collections.is_empty());
+        assert!(c.keywords.is_empty());
+        for table in ["ZCOLLECTION", "ZKEYWORD", "ZIMAGEINCOLLECTION"] {
+            assert!(
+                c.warnings.iter().any(|w| w.contains(table)),
+                "{table} missing from warnings: {:?}",
+                c.warnings
+            );
+        }
+    }
 
+    #[test]
+    fn a_truncated_wal_is_reported_not_ignored() {
+        let dir = temp_dir("wal-truncated");
+        let db_path = fixture_with_wal(&dir);
+        let before = std::fs::read(&db_path).unwrap();
+        let wal = wal_bytes();
+        // One full frame is 24 + 4096 bytes; keep three of them and 100 extra bytes.
+        std::fs::write(dir.join("Copy.cocatalogdb-wal"), &wal[..32 + 3 * 4120 + 100]).unwrap();
 
+        let c = C1Catalog::open_ro(&db_path).expect("the database still opens");
+        assert!(c.wal.is_none());
+        assert!(
+            c.warnings.iter().any(|w| w.contains("partial frame") && w.contains("missing")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "the database file changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn a_wal_header_that_is_truncated_is_reported() {
+        let dir = temp_dir("wal-header");
+        let db_path = fixture_with_wal(&dir);
+        let before = std::fs::read(&db_path).unwrap();
+        std::fs::write(dir.join("Copy.cocatalogdb-wal"), &wal_bytes()[..12]).unwrap();
 
+        let c = C1Catalog::open_ro(&db_path).expect("the database still opens");
+        assert!(c.wal.is_none());
+        assert!(
+            c.warnings.iter().any(|w| w.contains("WAL header is truncated")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "the database file changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn a_wal_with_a_broken_checksum_names_the_frames_that_cannot_be_replayed() {
+        let dir = temp_dir("wal-broken");
+        let db_path = fixture_with_wal(&dir);
+        let before = std::fs::read(&db_path).unwrap();
+        let mut wal = wal_bytes();
+        let last_page_byte = 32 + 5 * 4120 + 24 + 4000;
+        wal[last_page_byte] ^= 0xff;
+        std::fs::write(dir.join("Copy.cocatalogdb-wal"), &wal).unwrap();
 
+        let c = C1Catalog::open_ro(&db_path).expect("the database still opens");
+        assert!(c.wal.is_none());
+        assert!(
+            c.warnings.iter().any(|w| w.contains("checksum") && w.contains("frame")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        assert!(c.keywords.iter().all(|k| k.name != "Wedding"), "a broken wal was applied");
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "the database file changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-
-
-
-
-
-
-
-
-
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn a_wal_replays_only_the_frames_up_to_its_last_commit() {
         let dir = temp_dir("wal-commit");
@@ -1331,18 +1819,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn keyword_names_are_qualified_with_their_parent() {
+        let dir = temp_dir("wal-keywords");
+        let db_path = fixture_with_wal(&dir);
+        let c = C1Catalog::open_ro(&db_path).unwrap();
 
+        let paths = keyword_paths(&c.keywords);
+        assert_eq!(paths.get("Wedding").map(String::as_str), Some("Wedding"));
+        assert_eq!(paths.get("Bride").map(String::as_str), Some("Wedding/Bride"));
 
+        // The variant's own keyword list is qualified the same way.
+        let variant = c.variants.iter().find(|v| v.pk == 1).unwrap();
+        assert_eq!(variant.keywords, vec!["Wedding/Bride".to_string(), "Wedding".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn reads_images_with_paths_and_exif() {
+        let c = sample();
+        assert_eq!(c.images.len(), 3);
+        let first = &c.images[0];
+        assert_eq!(first.file_name, "_DSC5673.NEF");
+        assert_eq!(first.abs_path, "C:\\Users\\Jxcz2\\Desktop\\_DSC5673.NEF");
+        assert_eq!((first.width, first.height), (6048, 4032));
+        assert_eq!(first.iso, Some(5000));
+        assert_eq!(first.camera_model, "NIKON Z6_3");
+        assert_eq!(first.camera_lens, "NIKKOR Z 24-120mm f/4 S");
+        assert!((first.focal_length.unwrap() - 120.0).abs() < 0.01);
+    }
 
+    #[test]
+    fn reads_all_variants() {
+        let c = sample();
+        assert_eq!(c.variants.len(), 4);
+        assert_eq!(c.variants.iter().filter(|v| v.image_pk == 1).count(), 2);
+        assert_eq!(c.variants[0].canvas, Some((4043.054, 6056.673)));
+        // orientation is quarter turns, never a raw 90 degrees.
+        assert!(c.variants[0].adjustments.geometry.orientation <= 3);
+    }
 
+    #[test]
+    fn base_layer_becomes_adjustments() {
+        let c = sample();
+        let v = &c.variants[0];
+        assert_eq!(v.settings.exposure, 0.0);
+        assert!((v.settings.white_balance_gains[0] - 1.625).abs() < 1e-3);
+        assert_eq!(v.settings.white_balance_gains[1], 1.0);
+        assert_eq!(v.adjustments.exposure.exposure, 0.0);
+        assert!((v.adjustments.white_balance.kelvin - 4779.55).abs() < 2.0);
+    }
 
+    #[test]
+    fn mask_layers_are_parsed_but_not_merged_globally() {
+        let c = sample();
+        assert_eq!(c.variants[0].mask_layers, 5);
+        assert_eq!(c.variants[0].local_layers.len(), 5);
+        assert_eq!(c.variants[0].local_layers[0].name.as_deref(), Some("Skin Mask 1"));
+        assert_eq!(c.variants[0].settings.brightness, 0.0);
+    }
+
+    #[test]
+    fn utf8_text_survives() {
+        let c = sample();
+        let names: Vec<&str> = c
+            .variants
+            .iter()
+            .flat_map(|v| v.mask_names.iter().map(String::as_str))
+            .collect();
+        assert!(names.contains(&"Skin Mask 1"));
+        assert!(names.iter().any(|n| n.chars().any(|c| !c.is_ascii())));
+    }
+
+    #[test]
+    fn ratings_take_the_max_of_the_layer_chain() {
+        let c = sample();
+        assert_eq!(c.variants.iter().map(|v| v.rating).max(), Some(5));
+        assert_eq!(c.variants[0].rating, 5);
+    }
 
     #[test]
     fn missing_file_is_an_error_not_a_panic() {
         assert!(C1Catalog::open_ro(Path::new("no-such.cocatalogdb")).is_err());
     }
 
+    #[test]
+    fn reading_does_not_modify_the_database() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb");
+        let before = std::fs::metadata(&path).unwrap().len();
+        let _ = C1Catalog::open_ro(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+    }
 
     #[test]
     fn parses_column_list_from_create_table() {
@@ -1351,7 +1918,4 @@ mod tests {
         );
         assert_eq!(cols, vec!["Z_PK", "ZNAME", "amount"]);
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/c1catalog-tests.rs");
 }

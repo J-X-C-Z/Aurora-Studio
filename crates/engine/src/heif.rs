@@ -41,6 +41,7 @@ type DepthHandleFn =
 type DepthInfoFn =
     unsafe extern "C" fn(*const c_void, u32, *mut *const DepthRepresentationInfo) -> c_int;
 type DepthInfoFreeFn = unsafe extern "C" fn(*const DepthRepresentationInfo);
+type BitsFn = unsafe extern "C" fn(*const c_void) -> c_int;
 
 /// `heif_depth_representation_info` from libheif 1.23.7 `heif_aux_images.h`.
 #[repr(C)]
@@ -75,6 +76,7 @@ struct Dll {
     release_handle: ReleaseHandleFn,
     handle_width: HandleSizeFn,
     handle_height: HandleSizeFn,
+    bits_per_pixel: BitsFn,
     get_image_width: GetImageSizeFn,
     get_image_height: GetImageSizeFn,
     decode: DecodeFn,
@@ -151,6 +153,10 @@ impl Dll {
                 handle_height: symbol!(
                     "heif_image_handle_get_height",
                     HandleSizeFn
+                ),
+                bits_per_pixel: symbol!(
+                    "heif_image_handle_get_luma_bits_per_pixel",
+                    BitsFn
                 ),
                 get_image_width: symbol!(
                     "heif_image_get_width",
@@ -245,6 +251,31 @@ pub fn dimensions(path: &Path) -> Result<(u32, u32)> {
                 bail!("libheif 返回了空的图像尺寸");
             }
             Ok((width as u32, height as u32))
+        })();
+        (dll.context_free)(context);
+        result
+    }
+}
+
+/// Bits per sample of the primary image, or `None` when unreadable.
+pub fn bit_depth(path: &Path) -> Option<u8> {
+    let dll = Dll::load().ok()?;
+    let file_name = CString::new(path.to_str()?).ok()?;
+    unsafe {
+        let context = (dll.context_alloc)();
+        if context.is_null() {
+            return None;
+        }
+        let result = (|| {
+            if (dll.read_from_file)(context, file_name.as_ptr(), std::ptr::null()).0 != 0 {
+                return None;
+            }
+            let mut handle = std::ptr::null_mut();
+            if (dll.primary_handle)(context, &mut handle).0 != 0 || handle.is_null() {
+                return None;
+            }
+            let _guard = HandleGuard { dll: &dll, handle };
+            u8::try_from((dll.bits_per_pixel)(handle)).ok().filter(|&bits| bits > 0)
         })();
         (dll.context_free)(context);
         result
@@ -656,7 +687,7 @@ mod tests {
 
     #[test]
     fn corrupt_file_does_not_panic() {
-        let temp = std::env::temp_dir().join("lumen-heif-corrupt.heic");
+        let temp = std::env::temp_dir().join("portrait-heif-corrupt.heic");
         std::fs::write(&temp, b"not-heif").unwrap();
         assert!(decode(&temp).is_err());
     }
@@ -666,8 +697,14 @@ mod tests {
         assert!(decode(Path::new(r"Z:\no-such-file.heic")).is_err());
     }
 
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/heif-tests.rs");
+    #[test]
+    #[ignore = "需要本机 C:\\Users\\Jxcz2\\Pictures\\codex-heif-test.heic"]
+    fn real_sample_decodes_at_expected_size() {
+        let path = Path::new(r"C:\Users\Jxcz2\Pictures\codex-heif-test.heic");
+        let image = decode(path).unwrap();
+        assert_eq!((image.width(), image.height()), (33, 17));
+    }
+
     fn tiff_with_make(make: &str) -> Vec<u8> {
         let mut text = make.as_bytes().to_vec();
         text.push(0);
@@ -689,8 +726,8 @@ mod tests {
         if !crate::heif_write::available() {
             return;
         }
-        let path = std::env::temp_dir().join(format!("lumen-heif-read-{}.heic", std::process::id()));
-        let tiff = tiff_with_make("LumenCam");
+        let path = std::env::temp_dir().join(format!("portrait-heif-read-{}.heic", std::process::id()));
+        let tiff = tiff_with_make("PortraitCam");
         crate::heif_write::encode(
             &path,
             &vec![90u8; 16 * 12 * 4],
@@ -705,7 +742,7 @@ mod tests {
         let raw = read_exif(&path).expect("EXIF item");
         assert_eq!(raw, tiff);
         let exif = crate::exif::parse_exif(&raw);
-        assert_eq!(exif.camera_make.as_deref(), Some("LumenCam"));
+        assert_eq!(exif.camera_make.as_deref(), Some("PortraitCam"));
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -714,7 +751,7 @@ mod tests {
         if !crate::heif_write::available() {
             return;
         }
-        let path = std::env::temp_dir().join(format!("lumen-heif-noexif-{}.heic", std::process::id()));
+        let path = std::env::temp_dir().join(format!("portrait-heif-noexif-{}.heic", std::process::id()));
         crate::heif_write::encode(&path, &vec![90u8; 16 * 12 * 4], 16, 12, 80, None, None, None)
             .unwrap();
         assert!(read_exif(&path).is_none());
@@ -726,11 +763,12 @@ mod tests {
         if !crate::heif_write::available() {
             return;
         }
-        let path = std::env::temp_dir().join(format!("lumen-heif-xmp-{}.heic", std::process::id()));
+        let path = std::env::temp_dir().join(format!("portrait-heif-xmp-{}.heic", std::process::id()));
         let meta = crate::XmpMeta {
             rating: 4,
             label: "Red".into(),
             keywords: vec!["wedding".into(), "hero & co".into()],
+            ..Default::default()
         };
         let packet = meta.packet();
         crate::heif_write::encode(
@@ -755,7 +793,7 @@ mod tests {
         if !crate::heif_write::available() {
             return;
         }
-        let path = std::env::temp_dir().join(format!("lumen-heif-noxmp-{}.heic", std::process::id()));
+        let path = std::env::temp_dir().join(format!("portrait-heif-noxmp-{}.heic", std::process::id()));
         crate::heif_write::encode(&path, &vec![90u8; 16 * 12 * 4], 16, 12, 80, None, None, None)
             .unwrap();
         assert!(read_xmp(&path).is_none());
@@ -767,7 +805,7 @@ mod tests {
         if !crate::heif_write::available() {
             return;
         }
-        let path = std::env::temp_dir().join(format!("lumen-heif-aux-{}.heic", std::process::id()));
+        let path = std::env::temp_dir().join(format!("portrait-heif-aux-{}.heic", std::process::id()));
         crate::heif_write::encode(&path, &vec![90u8; 16 * 12 * 4], 16, 12, 80, None, None, None)
             .unwrap();
         let components = components(&path).expect("handle probe");
@@ -776,6 +814,19 @@ mod tests {
         assert!(depth(&path).unwrap().is_none());
         assert!(depth_info(&path).is_none());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn real_sample_auxiliary_counts_are_readable() {
+        let path = Path::new(r"C:\Users\Jxcz2\Pictures\codex-heif-test.heic");
+        if !path.exists() {
+            return;
+        }
+        let components = components(path).expect("handle probe");
+        assert_eq!(components.depth_images, 0);
+        let _ = thumbnail(path).expect("thumbnail probe");
+        assert!(depth(path).expect("depth probe").is_none());
+        assert!(depth_info(path).is_none());
     }
 
     #[test]

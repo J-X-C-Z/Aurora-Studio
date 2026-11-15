@@ -189,17 +189,34 @@ pub fn by_key(key: &str) -> Option<&'static ParamMeta> {
 pub(crate) const BW_CHANNELS: [&str; 6] =
     ["BwRed", "BwYellow", "BwGreen", "BwCyan", "BwBlue", "BwMagenta"];
 
-/// Clamps `value` to the catalog row's C1 range.
+/// Ranges for RAW properties that have no [`CATALOG`] row; `VARIANT_RANGES`
+/// carries only the info-block key, so the 0..=100 bounds are the engine's
+/// settled reading of those sliders.
+const RAW_RANGE_CLAMPS: &[(&str, f32, f32)] = &[
+    ("KeystoneAmount", 0.0, 100.0),
+    ("FilmGrainDensity", 0.0, 100.0),
+    ("AIDenoiseAmount", 0.0, 100.0),
+    ("BandingReductionAmount", 0.0, 100.0),
+];
+
+/// Clamps `value` to the C1 range the engine knows for `key`.
 ///
 /// The C1 layer-row path (`c1_model`) and the `.copreset` text path (`presets`)
-/// both clamp through here, so a range is edited in one place only. Only keys
-/// whose range is settled (PARAM-RANGE-DECISIONS) may use it: several rows are
+/// both clamp through here, so a range is edited in one place only: a
+/// [`CATALOG`] row when one exists, else [`RAW_RANGE_CLAMPS`]. Only keys whose
+/// range is settled (PARAM-RANGE-DECISIONS) may use it: several rows are
 /// `RawImage` fallbacks, not safe engine bounds. Unknown keys pass through.
 pub(crate) fn clamp(key: &str, value: f32) -> f32 {
-    match by_key(key) {
-        Some(m) if value.is_nan() => m.min,
-        Some(m) => value.clamp(m.min, m.max),
-        None => value,
+    if let Some(m) = by_key(key) {
+        return if value.is_nan() { m.min } else { value.clamp(m.min, m.max) };
+    }
+    let Some((_, min, max)) = RAW_RANGE_CLAMPS.iter().find(|(k, _, _)| *k == key) else {
+        return value;
+    };
+    if value.is_nan() {
+        *min
+    } else {
+        value.clamp(*min, *max)
     }
 }
 
@@ -330,6 +347,14 @@ const DEFAULT_KEYS: &[(&str, &str)] = &[
     ("IB_F_SMOOTH_SKIN_TEXTURE_DEFAULT", "SkinEveningTexture"),
     ("IB_F_TEETH_DESATURATION_DEFAULT", "TeethWhiteningDesaturation"),
     ("IB_F_TEETH_BRIGHTNESS_DEFAULT", "TeethWhiteningBrightness"),
+    // All six eye keys are emitted by the engine's `infbDefaults` block and are
+    // mapped in `P1.C1.Core`'s `s_infoBlockDefaultsToVariantSettingsLUT`.
+    ("IB_F_EYE_BRIGHT_BOTH_IRIS_DEFAULT", "EyeBrightBothIrisAmount"),
+    ("IB_F_EYE_BRIGHT_BOTH_SCLERA_DEFAULT", "EyeBrightBothScleraAmount"),
+    ("IB_F_EYE_BRIGHT_LEFT_IRIS_DEFAULT", "EyeBrightLeftIrisAmount"),
+    ("IB_F_EYE_BRIGHT_LEFT_SCLERA_DEFAULT", "EyeBrightLeftScleraAmount"),
+    ("IB_F_EYE_BRIGHT_RIGHT_IRIS_DEFAULT", "EyeBrightRightIrisAmount"),
+    ("IB_F_EYE_BRIGHT_RIGHT_SCLERA_DEFAULT", "EyeBrightRightScleraAmount"),
     ("IB_F_HAIR_REMOVAL_INNER_AMOUNT_DEFAULT", "StrayHairRemovalInnerAmount"),
     ("IB_F_HAIR_REMOVAL_OUTER_AMOUNT_DEFAULT", "StrayHairRemovalOuterAmount"),
     // `detailsAmount_* -> IB_F_DETAILSAMOUNT_*` and
@@ -496,6 +521,85 @@ mod tests {
         // Unrelated keys keep the static numbers.
         let (_, _, untouched) = o.apply(by_key("Exposure").unwrap());
         assert_eq!(untouched, 0.0);
+    }
+
+    #[test]
+    fn eye_default_keys_fall_back_then_apply() {
+        let meta = by_key("EyeBrightBothIrisAmount").expect("eye meta");
+
+        // Without the eye key the catalog default still applies (fallback).
+        let missing = ParamOverrides::from_pairs([("IB_F_TEETH_BRIGHTNESS_DEFAULT", "0")]);
+        assert_eq!(missing.default_for(meta.key), None);
+        assert_eq!(missing.apply(meta), (0.0, 100.0, 0.0));
+
+        // With the key present the real info-block value wins.
+        let pairs = [
+            ("IB_F_EYE_BRIGHT_BOTH_IRIS_DEFAULT", "12.5", 12.5, "EyeBrightBothIrisAmount"),
+            ("IB_F_EYE_BRIGHT_BOTH_SCLERA_DEFAULT", "13.5", 13.5, "EyeBrightBothScleraAmount"),
+            ("IB_F_EYE_BRIGHT_LEFT_IRIS_DEFAULT", "-7.5", -7.5, "EyeBrightLeftIrisAmount"),
+            ("IB_F_EYE_BRIGHT_LEFT_SCLERA_DEFAULT", "-8.5", -8.5, "EyeBrightLeftScleraAmount"),
+            ("IB_F_EYE_BRIGHT_RIGHT_IRIS_DEFAULT", "7.5", 7.5, "EyeBrightRightIrisAmount"),
+            ("IB_F_EYE_BRIGHT_RIGHT_SCLERA_DEFAULT", "8.5", 8.5, "EyeBrightRightScleraAmount"),
+        ];
+        let overrides = ParamOverrides::from_pairs(
+            pairs.iter().map(|(ib, value, _, _)| (*ib, *value)),
+        );
+        for (ib, _, expected, prop) in pairs {
+            assert_eq!(overrides.default_for(prop), Some(expected), "{ib}");
+            let meta = by_key(prop).expect(prop);
+            assert_eq!(meta.source, MetaSource::RawImage, "{prop}");
+            assert!(meta.min < meta.max && meta.default >= meta.min && meta.default <= meta.max);
+        }
+
+        // Values the engine actually returned for the three sampled NEFs.
+        let observed = ParamOverrides::from_pairs([
+            ("IB_F_OPACITY_DEFAULT", "100.000000"),
+            ("IB_F_EYE_BRIGHT_BOTH_IRIS_DEFAULT", "0.000000"),
+        ]);
+        assert_eq!(observed.default_for("RetouchingOpacity"), Some(100.0));
+        assert_eq!(observed.default_for("EyeBrightBothIrisAmount"), Some(0.0));
+    }
+
+    #[test]
+    fn keystone_amount_clamps_to_raw_range() {
+        assert_eq!(clamp("KeystoneAmount", 50.0), 50.0);
+        assert_eq!(clamp("KeystoneAmount", -1.0), 0.0);
+        assert_eq!(clamp("KeystoneAmount", 101.0), 100.0);
+        assert_eq!(clamp("KeystoneAmount", f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn film_grain_density_clamps_to_raw_range() {
+        assert_eq!(clamp("FilmGrainDensity", 50.0), 50.0);
+        assert_eq!(clamp("FilmGrainDensity", -1.0), 0.0);
+        assert_eq!(clamp("FilmGrainDensity", 101.0), 100.0);
+        assert_eq!(clamp("FilmGrainDensity", f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn ai_denoise_amount_clamps_to_raw_range() {
+        assert_eq!(clamp("AIDenoiseAmount", 50.0), 50.0);
+        assert_eq!(clamp("AIDenoiseAmount", -1.0), 0.0);
+        assert_eq!(clamp("AIDenoiseAmount", 101.0), 100.0);
+        assert_eq!(clamp("AIDenoiseAmount", f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn banding_reduction_amount_clamps_to_raw_range() {
+        assert_eq!(clamp("BandingReductionAmount", 50.0), 50.0);
+        assert_eq!(clamp("BandingReductionAmount", -1.0), 0.0);
+        assert_eq!(clamp("BandingReductionAmount", 101.0), 100.0);
+        assert_eq!(clamp("BandingReductionAmount", f32::NAN), 0.0);
+        assert_eq!(clamp("UnknownRawKey", 999.0), 999.0);
+    }
+
+    #[test]
+    fn catalog_defaults_and_ranges_are_unchanged() {
+        for m in catalog() {
+            assert_eq!(clamp(m.key, m.default), m.default);
+            assert_eq!(clamp(m.key, m.min), m.min);
+            assert_eq!(clamp(m.key, m.max), m.max);
+        }
     }
 
     #[test]

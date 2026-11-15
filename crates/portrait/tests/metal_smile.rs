@@ -1,35 +1,22 @@
-#[cfg(feature = "external-fixtures")]
-#[path = "support/mod.rs"]
-mod external_fixtures;
+//! PF100007 Metal contract and golden-pack tests.
+//!
+//! The four fixture cases live in `tests/fixtures/metal_smile`. The CPU test
+//! recomputes every expected byte with `pf100007_apply`; the macOS-only GPU
+//! test loads the same files through the same loader and compares GPU bytes.
 
-// PF100007 Metal contract and golden-pack tests.
-//
-// The four fixture cases live in `tests/fixtures/metal_smile`. The CPU test
-// recomputes every expected byte with `pf100007_apply`; the macOS-only GPU
-// test loads the same files through the same loader and compares GPU bytes.
-
-#[cfg(feature = "external-fixtures")]
 use std::fs;
-#[cfg(feature = "external-fixtures")]
 use std::path::Path;
 
-use aurora_pixcake::kernels::smile_warp::Rect;
-#[cfg(feature = "external-fixtures")]
-use aurora_pixcake::kernels::smile_warp;
-#[cfg(feature = "external-fixtures")]
-use aurora_pixcake::metal::MetalContext;
-use aurora_pixcake::metal_smile::{SmileInput, SmileParams, SMILE_MSL, SMILE_PARAMS_BYTES};
-use aurora_pixcake::Refusal;
-
-#[cfg(feature = "external-fixtures")]
+use aurora_portrait::kernels::smile_warp::{self, Rect};
+use aurora_portrait::metal::MetalContext;
+use aurora_portrait::metal_smile::{SmileInput, SmileParams, SMILE_MSL, SMILE_PARAMS_BYTES};
+use aurora_portrait::Refusal;
 
 fn require_macos() {
     if !cfg!(target_os = "macos") {
         panic!("requires macOS and a Metal device; non-macOS is not a pass");
     }
 }
-
-#[cfg(feature = "external-fixtures")]
 
 struct GoldenCase {
     name: String,
@@ -45,8 +32,6 @@ struct GoldenCase {
     expected: Vec<u8>,
 }
 
-#[cfg(feature = "external-fixtures")]
-
 fn read_f32(path: &Path) -> Vec<f32> {
     fs::read(path)
         .unwrap()
@@ -56,9 +41,8 @@ fn read_f32(path: &Path) -> Vec<f32> {
 }
 
 /// Single loader shared by the CPU and GPU tests.
-#[cfg(feature = "external-fixtures")]
 fn load_cases() -> Vec<GoldenCase> {
-    let root = external_fixtures::root().join("metal_smile");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metal_smile");
     let index = fs::read_to_string(root.join("index.tsv")).expect("index.tsv");
     let mut cases = Vec::new();
     for line in index.lines().skip(1).filter(|line| !line.trim().is_empty()) {
@@ -87,8 +71,6 @@ fn load_cases() -> Vec<GoldenCase> {
     }
     cases
 }
-
-#[cfg(feature = "external-fixtures")]
 
 fn input<'a>(case: &'a GoldenCase) -> SmileInput<'a> {
     SmileInput {
@@ -208,7 +190,6 @@ fn validation_matches_cpu_entry_checks() {
 }
 
 #[test]
-#[cfg(feature = "external-fixtures")]
 fn golden_pack_cpu_recomputes_all_four_cases() {
     let cases = load_cases();
     assert_eq!(cases.len(), 4);
@@ -260,7 +241,6 @@ fn golden_pack_cpu_recomputes_all_four_cases() {
 
 #[test]
 #[ignore = "requires macOS Metal device"]
-#[cfg(feature = "external-fixtures")]
 fn golden_pack_gpu_matches_expected_per_case() {
     require_macos();
     let context = MetalContext::new().expect("MetalContext");

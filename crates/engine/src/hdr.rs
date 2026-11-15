@@ -1,9 +1,13 @@
-//! Exposure fusion for a bracketed HDR merge.
+//! Exposure fusion for a bracketed HDR merge: no alignment, with deghosting.
 //!
-//! Frames arrive as linear-light [`Source`] values. Each frame is scaled by its
-//! EXIF exposure relative to the first frame, then combined with Mertens'
-//! well-exposedness, contrast and saturation weights. Alignment and deghosting
-//! are not applied.
+//! Frames arrive as linear-light [`Source`]s. Each frame is first scaled by its
+//! EXIF exposure relative to the middle-exposure frame, then every pixel gets
+//! Mertens' exposure-fusion weight: well-exposedness × contrast × saturation.
+//! Averaging with those weights takes shadows from the longer exposures and
+//! highlights from the shorter ones; the result stays at the reference frame's
+//! exposure. A pixel that differs from the reference beyond `DEGHOST_THRESHOLD`
+//! drops that frame's weight, so a moving object keeps the reference pixels
+//! instead of being blended into a ghost.
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -11,20 +15,26 @@ use rayon::prelude::*;
 use crate::mock::process::linear_to_srgb;
 use crate::{Exif, Source};
 
+/// Width of the well-exposedness bell, in linear light.
 const SIGMA: f32 = 0.2;
+/// Keeps flat, colourless regions from dropping to a zero weight.
 const EPS: f32 = 0.01;
+/// Largest linear-light channel difference still treated as the same scene.
+const DEGHOST_THRESHOLD: f32 = 0.08;
 
+/// A fused frame in linear light.
 pub struct FusedFrame {
     pub width: u32,
     pub height: u32,
-    /// Row-major linear RGB, 0 ..= 1.
+    /// Row-major RGB, 0 ..= 1.
     pub rgb: Vec<[f32; 3]>,
 }
 
 /// Relative exposure of `frame` against `reference`, in stops.
 ///
-/// A component only counts when both sides carry a positive tag. Missing EXIF
-/// contributes zero rather than a guessed exposure.
+/// `EV = log2(t) + log2(ISO) - 2·log2(f)`, so the difference is
+/// `log2(t_b/t_a) + log2(ISO_b/ISO_a) - 2·log2(f_b/f_a)`. A component only
+/// counts when both sides carry it; nothing is guessed from a missing tag.
 pub fn relative_stops(reference: &Exif, frame: &Exif) -> f32 {
     let ratio = |a: Option<f32>, b: Option<f32>| match (a, b) {
         (Some(a), Some(b)) if a > 0.0 && b > 0.0 => Some(b / a),
@@ -43,7 +53,12 @@ pub fn relative_stops(reference: &Exif, frame: &Exif) -> f32 {
     stops
 }
 
+/// Fuses `frames` at their relative `stops`, one `stops` entry per frame.
 pub fn fuse(frames: &[&Source], stops: &[f32]) -> Result<FusedFrame> {
+    fuse_with(frames, stops, true)
+}
+
+fn fuse_with(frames: &[&Source], stops: &[f32], deghost: bool) -> Result<FusedFrame> {
     let Some(first) = frames.first() else {
         bail!("HDR merge needs at least one frame");
     };
@@ -56,18 +71,27 @@ pub fn fuse(frames: &[&Source], stops: &[f32]) -> Result<FusedFrame> {
         bail!("HDR merge frames must share one size: {width}x{height} vs {w}x{h}");
     }
 
-    let reference = stops[0];
-    let gains: Vec<f32> = stops.iter().map(|s| 2f32.powf(reference - s)).collect();
+    let reference = middle_exposure(stops);
+    let reference_stops = stops[reference];
+    let gains: Vec<f32> = stops.iter().map(|s| 2f32.powf(reference_stops - s)).collect();
     let planes: Vec<&crate::mock::process::Plane> = frames.iter().map(|f| &f.levels[0]).collect();
+    let reference_pixel = &planes[reference].data;
+    let reference_gain = gains[reference];
     let rgb: Vec<[f32; 3]> = (0..(width as usize) * (height as usize))
         .into_par_iter()
         .map(|i| {
             let (x, y) = (i as u32 % width, i as u32 / width);
             let mut acc = [0.0f32; 3];
             let mut sum = 0.0f32;
-            for (plane, &gain) in planes.iter().zip(&gains) {
-                let weight = weight(plane, x, y);
+            for (index, (plane, &gain)) in planes.iter().zip(&gains).enumerate() {
                 let pixel = plane.data[i];
+                if deghost
+                    && index != reference
+                    && differs(pixel, gain, reference_pixel[i], reference_gain)
+                {
+                    continue;
+                }
+                let weight = weight(plane, x, y);
                 for k in 0..3 {
                     acc[k] += pixel[k].clamp(0.0, 1.0) * gain * weight;
                 }
@@ -83,14 +107,33 @@ pub fn fuse(frames: &[&Source], stops: &[f32]) -> Result<FusedFrame> {
     Ok(FusedFrame { width, height, rgb })
 }
 
-/// Encodes fused linear values as the 16-bit sRGB transport used by TIFF.
+/// Index of the frame at the median exposure; ties pick the shorter exposure.
+fn middle_exposure(stops: &[f32]) -> usize {
+    let mut order: Vec<usize> = (0..stops.len()).collect();
+    order.sort_by(|&a, &b| stops[a].total_cmp(&stops[b]));
+    order[(order.len() - 1) / 2]
+}
+
+fn differs(pixel: [f32; 3], gain: f32, reference: [f32; 3], reference_gain: f32) -> bool {
+    (0..3).any(|k| {
+        let reference = reference[k] * reference_gain;
+        // A clipped reference has no detail left for a shorter frame to protect.
+        reference < 1.0 - 1e-3
+            && (pixel[k] * gain - reference).abs() > DEGHOST_THRESHOLD
+    })
+}
+
+/// 16-bit sRGB samples for a TIFF: the fused linear values go through the same
+/// transfer the file engine applies when it reads a non-RAW file back.
 pub fn to_srgb16(frame: &FusedFrame) -> Vec<u16> {
     let mut out = vec![0u16; frame.rgb.len() * 3];
-    out.par_chunks_mut(3).zip(frame.rgb.par_iter()).for_each(|(out, pixel)| {
-        for k in 0..3 {
-            out[k] = (linear_to_srgb(pixel[k].clamp(0.0, 1.0)) * 65535.0 + 0.5) as u16;
-        }
-    });
+    out.par_chunks_mut(3)
+        .zip(frame.rgb.par_iter())
+        .for_each(|(out, pixel)| {
+            for k in 0..3 {
+                out[k] = (linear_to_srgb(pixel[k].clamp(0.0, 1.0)) * 65535.0 + 0.5) as u16;
+            }
+        });
     out
 }
 
@@ -100,8 +143,8 @@ fn weight(plane: &crate::mock::process::Plane, x: u32, y: u32) -> f32 {
     let well_exposed = (-(luma - 0.5).powi(2) / (2.0 * SIGMA * SIGMA)).exp();
     let contrast = laplacian(plane, x, y).abs();
     let mean = (pixel[0] + pixel[1] + pixel[2]) / 3.0;
-    let saturation = (((pixel[0] - mean).powi(2) + (pixel[1] - mean).powi(2)
-        + (pixel[2] - mean).powi(2)) / 3.0)
+    let saturation = (((pixel[0] - mean).powi(2) + (pixel[1] - mean).powi(2) + (pixel[2] - mean).powi(2))
+        / 3.0)
         .sqrt();
     (well_exposed * (contrast + EPS) * (saturation + EPS)).max(1e-8)
 }
@@ -136,30 +179,76 @@ mod tests {
     }
 
     #[test]
-    fn single_frame_is_returned_unchanged() {
+    fn a_single_frame_is_returned_unchanged() {
         let src = frame(8, 8, |x, y| [x as f32 / 7.0, y as f32 / 7.0, 0.4]);
         let fused = fuse(&[&src], &[0.0]).unwrap();
-        for (actual, expected) in fused.rgb.iter().zip(&src.levels[0].data) {
+        for (a, b) in fused.rgb.iter().zip(&src.levels[0].data) {
             for k in 0..3 {
-                assert!((actual[k] - expected[k]).abs() < 1e-6);
+                assert!((a[k] - b[k]).abs() < 1e-6, "{a:?} vs {b:?}");
             }
         }
     }
 
     #[test]
-    fn highlights_and_shadows_come_from_the_opposite_exposures() {
+    fn highlights_come_from_the_dark_frame_and_shadows_from_the_bright_one() {
+        // First frame: correct exposure, shadow crushed to black, highlight detail.
         let dark = frame(16, 16, |x, _| if x < 8 { [0.8; 3] } else { [0.0; 3] });
+        // Second frame: two stops brighter, so the highlight clipped and the
+        // shadow carries usable signal.
         let bright = frame(16, 16, |x, _| if x < 8 { [1.0; 3] } else { [0.008; 3] });
         let fused = fuse(&[&dark, &bright], &[0.0, 2.0]).unwrap();
         let left = fused.rgb[8 * 16 + 4];
         let right = fused.rgb[8 * 16 + 12];
-        assert!((0.6..0.95).contains(&left[0]));
-        assert!(right[0] > 0.0005);
+        assert!(left[0] < 0.95, "the clipped highlight stayed at 1.0: {left:?}");
+        assert!(left[0] > 0.6, "the dark frame's highlight was lost: {left:?}");
+        assert!(right[0] > 0.0005, "the bright frame's shadow was not used: {right:?}");
     }
 
     #[test]
-    fn relative_stops_reads_all_exposure_components() {
-        let base = Exif { shutter: Some(1.0 / 125.0), iso: Some(100), aperture: Some(4.0), ..Default::default() };
+    fn a_pixel_that_moves_out_of_frame_takes_the_reference_frame() {
+        // The block is in the first two frames only; the bright frame sees the
+        // background there. Blending it would make the block semi-transparent.
+        let dark = frame(16, 16, |x, _| if (6..10).contains(&x) { [0.2; 3] } else { [0.1; 3] });
+        let middle = frame(16, 16, |x, _| if (6..10).contains(&x) { [0.4; 3] } else { [0.2; 3] });
+        let bright = frame(16, 16, |_x, _y| [0.4; 3]);
+        let fused = fuse(&[&dark, &middle, &bright], &[-1.0, 0.0, 1.0]).unwrap();
+        let block = fused.rgb[8 * 16 + 8];
+        let reference = middle.levels[0].data[8 * 16 + 8];
+        let ghosted = fuse_with(&[&dark, &middle, &bright], &[-1.0, 0.0, 1.0], false).unwrap();
+        assert!(
+            (ghosted.rgb[8 * 16 + 8][0] - reference[0]).abs() > 0.02,
+            "the fixture does not exercise blending without deghosting"
+        );
+        assert!(
+            (block[0] - reference[0]).abs() < 1e-4,
+            "the moving block was blended: {block:?} vs reference {reference:?}"
+        );
+        let background = fused.rgb[8 * 16 + 2];
+        assert!((background[0] - 0.2).abs() < 1e-4, "static background changed: {background:?}");
+    }
+
+    #[test]
+    fn a_static_scene_is_unchanged_by_deghosting() {
+        let dark = frame(16, 16, |x, _| [0.05 + x as f32 * 0.01; 3]);
+        let middle = frame(16, 16, |x, _| [0.1 + x as f32 * 0.02; 3]);
+        let bright = frame(16, 16, |x, _| [0.2 + x as f32 * 0.04; 3]);
+        let frames = [&dark, &middle, &bright];
+        let with = fuse_with(&frames, &[-1.0, 0.0, 1.0], true).unwrap();
+        let without = fuse_with(&frames, &[-1.0, 0.0, 1.0], false).unwrap();
+        assert_eq!(with.rgb.len(), without.rgb.len());
+        for (a, b) in with.rgb.iter().zip(&without.rgb) {
+            assert_eq!(a, b, "deghosting changed a static pixel: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn relative_stops_reads_shutter_iso_and_aperture() {
+        let base = Exif {
+            shutter: Some(1.0 / 125.0),
+            iso: Some(100),
+            aperture: Some(4.0),
+            ..Default::default()
+        };
         let longer = Exif { shutter: Some(1.0 / 31.25), ..base.clone() };
         assert!((relative_stops(&base, &longer) - 2.0).abs() < 1e-5);
         let higher_iso = Exif { iso: Some(400), ..base.clone() };

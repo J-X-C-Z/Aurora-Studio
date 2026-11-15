@@ -7,6 +7,8 @@ pub mod process;
 pub(crate) mod scenes;
 pub(crate) mod spots;
 pub(crate) mod detail;
+#[cfg(windows)]
+pub(crate) mod detail_gpu;
 pub(crate) mod geometry;
 pub(crate) mod lens_profile;
 
@@ -96,7 +98,7 @@ impl MockEngine {
                     captured_at: Some(format!("2026-10-{:02}T{:02}:{:02}:00+08:00", 1 + i % 28, 6 + i % 12, (i * 7) % 60)),
                     gps: Some((46.5 + i as f64 * 0.01, 8.0 + i as f64 * 0.02)),
                 },
-                iptc: Iptc { creator: "Lumen Studio".into(), copyright: "© 2026".into(), ..Default::default() },
+                iptc: Iptc { creator: "Aurora Studio".into(), copyright: "© 2026".into(), ..Default::default() },
                 keywords: vec![scene.title().to_lowercase()],
                 rating: [0, 3, 5, 4, 0, 2, 1, 0, -1, 3][i % 10],
                 color_tag: ColorTag::ALL[[0, 0, 4, 0, 1, 0, 5, 0, 0, 3][i % 10]],
@@ -166,13 +168,15 @@ impl MockEngine {
         let fast = false;
         let adj = crate::styles::resolve(&request.adjustments);
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
-        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+        let (rendering, intent_note) = crate::engine::request_rendering(request);
+        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let hit = self.state.lock().preview.get(key);
         if let Some(hit) = hit {
             let histogram = hit.histogram.clone();
             let source = hit.into_image();
             let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
-            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+            let degraded = degraded.or(intent_note);
             return Ok(PreviewFrame {
                 histogram,
                 image,
@@ -192,7 +196,8 @@ impl MockEngine {
         self.state.lock().preview.insert(key, frame.clone());
         let source = frame.into_image();
         let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
-        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+        let degraded = degraded.or(intent_note);
         Ok(PreviewFrame {
             image,
             histogram: out.histogram,
@@ -247,7 +252,7 @@ fn is_image(path: &Path) -> bool {
 
 impl ImageEngine for MockEngine {
     fn name(&self) -> String {
-        "Lumen Mock Engine 0.1 (CPU preview)".into()
+        "Portrait Mock Engine 0.1 (CPU preview)".into()
     }
 
     fn images(&self) -> Vec<ImageInfo> {
@@ -402,6 +407,7 @@ impl ImageEngine for MockEngine {
             adj.white_balance.mode = WhiteBalanceMode::Auto;
             adj.white_balance.kelvin = (5600.0 + (r - b) * -18.0).clamp(2500.0, 12000.0);
             adj.white_balance.tint = 0.0;
+            adj.white_balance.gains = None;
         }
         if all || target == AutoTarget::Levels {
             let cut = total / 500;
@@ -481,7 +487,7 @@ impl ImageEngine for MockEngine {
         std::thread::spawn(move || {
             state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.05 });
             let (tw, th) = crate::recipe::output_size(&job.recipe, (info.width, info.height));
-            let dir = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("lumen-output"));
+            let dir = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
             let wide = job.recipe.bit_depth == 16;
             let result = if wide {
                 let out = process::render16(
@@ -576,6 +582,8 @@ mod tests {
             proof_profile: None,
             proof_paper_white: 1.0,
             proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
         }
     }
 

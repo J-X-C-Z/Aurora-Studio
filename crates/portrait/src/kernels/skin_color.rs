@@ -158,6 +158,21 @@ fn vendor_round_byte(value: f32) -> u8 {
     (adjusted as i32).clamp(0, 255) as u8
 }
 
+pub const LIP_LINE_MASK_PRODUCER_OPEN: &str =
+    "PF90118 FaceParsing records 0x92/0xA3/0xB4 at +0x50 select masks, but their \
+     producers and exact mapping to mask_a/mask_b are not recovered; Spotless, \
+     HLFreq and PF90021 MouthMask are not substitutes";
+
+/// Fail closed until the selected FaceParsing planes can be mapped to A/B.
+/// Unrelated masks and image heuristics are never accepted as substitutes.
+pub fn lip_line_face_parsing_masks(
+    _record_0x92: &[u8],
+    _record_0xa3: &[u8],
+    _record_0xb4: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), Refusal> {
+    Err(Refusal::MissingInput(LIP_LINE_MASK_PRODUCER_OPEN))
+}
+
 // ---------------------------------------------------------------------------
 // Priority 26 - PF90080 face oil shine
 // ---------------------------------------------------------------------------
@@ -897,4 +912,53 @@ pub fn masked_lut_blend(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lip_line_min_mask_blend_preserves_bgra_alpha() {
+        let source = Image::solid(1, 1, [10, 20, 30, 77]);
+        let repair = Image::solid(1, 1, [110, 120, 130, 9]);
+        let out = shared_min_mask_composite(&source, &repair, &[255], &[128]).unwrap();
+        assert_eq!(out.pixel(0, 0), [60, 70, 80, 77]);
+        let identity = shared_min_mask_composite(&source, &repair, &[0], &[255]).unwrap();
+        assert_eq!(identity, source);
+    }
+
+    #[test]
+    fn lip_line_roi_uses_eleven_transformed_points() {
+        let points = [
+            (10.0, 10.0),
+            (20.0, 10.0),
+            (20.0, 20.0),
+            (10.0, 20.0),
+            (15.0, 15.0),
+            (12.0, 14.0),
+            (18.0, 14.0),
+            (12.0, 18.0),
+            (18.0, 18.0),
+            (15.0, 10.0),
+            (15.0, 20.0),
+        ];
+        assert_eq!(
+            lip_line_roi(&points, 100, 100).unwrap(),
+            Roi {
+                x: 9,
+                y: 9,
+                w: 12,
+                h: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn lip_line_mask_producer_is_typed_refusal() {
+        assert_eq!(
+            lip_line_face_parsing_masks(&[1], &[2], &[3]),
+            Err(Refusal::MissingInput(LIP_LINE_MASK_PRODUCER_OPEN))
+        );
+    }
 }

@@ -5,14 +5,14 @@
 //! against `composite_pixel`, then the RGBA8 twin against `apply`.
 //!
 //! A host without a usable NVIDIA driver prints one `SKIP_NO_NVIDIA_DRIVER` line
-//! per test and returns; set `PIXCAKE_CUDA_REQUIRED=1` to turn that into a
+//! per test and returns; set `PORTRAIT_CUDA_REQUIRED=1` to turn that into a
 //! failure. A driver that is present but broken never skips — it panics.
 
 #![cfg(windows)]
 
-use aurora_pixcake::cuda::{CudaError, Nvidia, Uniforms};
-use aurora_pixcake::kernels::facial_smooth as cpu;
-use aurora_pixcake::{Image, Refusal};
+use aurora_portrait::cuda::{CudaError, Nvidia, Uniforms};
+use aurora_portrait::kernels::facial_smooth as cpu;
+use aurora_portrait::{Image, Refusal};
 
 #[derive(Clone)]
 struct Rng(u64);
@@ -50,7 +50,7 @@ fn gpu() -> Option<Nvidia> {
         Err(CudaError::Unavailable(reason)) => {
             eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
             assert!(
-                std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                 "CUDA required but unavailable: {reason}"
             );
             None

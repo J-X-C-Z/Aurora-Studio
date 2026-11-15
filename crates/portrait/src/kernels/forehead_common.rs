@@ -82,7 +82,6 @@ pub enum Direction {
 pub enum Refusal {
     MissingPoints,
     MissingWeights,
-    MissingTopology,
     NonFinite(&'static str),
     BadDimension,
     BadIndexTable,
@@ -92,11 +91,11 @@ pub const VERTEX_COUNT: usize = 136;
 pub const INDEX_COUNT: usize = 705;
 pub const WEIGHT_COUNT: usize = 135;
 
+/// Initial EBO, RVA `0x946E290`, 1410 bytes,
+/// SHA-256 `e400d3ccdde6b847393e8ab9aff85065d88f26244f71425abc230de4d4036343`.
+const INITIAL_INDEX_BYTES: &[u8; INDEX_COUNT * 2] = include_bytes!("type1012-indices.u16le");
 
 pub struct Inputs<'a> {
-    /// Caller-owned topology: exactly INDEX_COUNT indices below VERTEX_COUNT.
-    /// An empty slice is refused; no bundled or synthesized topology is used.
-    pub topology: &'a [u16],
     /// `face+0x924`, 414 float2 in native working coordinates.
     pub points414: &'a [Point],
     /// `ParamList` for the chosen part, exactly 135 floats.
@@ -266,15 +265,6 @@ pub fn build(input: &Inputs<'_>) -> Result<Mesh, Refusal> {
         return Err(Refusal::NonFinite("native"));
     }
 
-    if input.topology.is_empty() {
-        return Err(Refusal::MissingTopology);
-    }
-    if input.topology.len() != INDEX_COUNT
-        || input.topology.iter().any(|&index| index as usize >= VERTEX_COUNT)
-    {
-        return Err(Refusal::BadIndexTable);
-    }
-
     let ranges = match input.direction {
         Direction::Negative => [0.0, 0.0, -1.0],
         Direction::Positive => [1.0, 0.0, 0.0],
@@ -299,7 +289,12 @@ pub fn build(input: &Inputs<'_>) -> Result<Mesh, Refusal> {
     );
 
     let mut indices = [0u16; INDEX_COUNT];
-    indices.copy_from_slice(input.topology);
+    for (i, slot) in indices.iter_mut().enumerate() {
+        *slot = u16::from_le_bytes([INITIAL_INDEX_BYTES[i * 2], INITIAL_INDEX_BYTES[i * 2 + 1]]);
+        if *slot as usize >= VERTEX_COUNT {
+            return Err(Refusal::BadIndexTable);
+        }
+    }
 
     Ok(Mesh {
         a: grid,
@@ -312,9 +307,6 @@ pub fn build(input: &Inputs<'_>) -> Result<Mesh, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Synthetic test topology only; never used by the runtime producer.
-    const TOPOLOGY: [u16; INDEX_COUNT] = [0; INDEX_COUNT];
 
     fn points() -> Vec<Point> {
         (0..414)
@@ -337,7 +329,6 @@ mod tests {
         direction: Direction,
     ) -> Inputs<'a> {
         Inputs {
-            topology: &TOPOLOGY,
             points414,
             weights135,
             direction,
@@ -348,9 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn caller_topology_is_preserved() {
+    fn initial_index_table_is_the_pinned_ebo() {
+        assert_eq!(INITIAL_INDEX_BYTES.len(), 1410);
         let mesh = build(&input(&points(), &weights(), [0.5, 0.5], Direction::Positive)).unwrap();
-        assert_eq!(mesh.initial_indices, TOPOLOGY);
         assert_eq!(mesh.initial_indices.len(), 705);
         assert!(mesh.initial_indices.iter().all(|&i| (i as usize) < 136));
     }
@@ -404,7 +395,6 @@ mod tests {
         let mut p = points();
         p[54] = Point::new(5000.0, -5000.0);
         let mesh = build(&Inputs {
-            topology: &TOPOLOGY,
             points414: &p,
             weights135: &weights(),
             direction: Direction::Positive,
@@ -471,23 +461,4 @@ mod tests {
         assert!((mesh.b[13].x - expected.x).abs() < 1e-3);
         assert!((mesh.b[13].y - expected.y).abs() < 1e-3);
     }
-    #[test]
-    fn missing_malformed_and_out_of_range_topology_are_refused() {
-        let p = points();
-        let w = weights();
-        let mut args = input(&p, &w, [0.5, 0.5], Direction::Positive);
-        args.topology = &[];
-        assert_eq!(build(&args).unwrap_err(), Refusal::MissingTopology);
-        args.topology = &[0; INDEX_COUNT - 1];
-        assert_eq!(build(&args).unwrap_err(), Refusal::BadIndexTable);
-        let mut indices = [0; INDEX_COUNT];
-        indices[INDEX_COUNT - 1] = VERTEX_COUNT as u16;
-        args.topology = &indices;
-        assert_eq!(build(&args).unwrap_err(), Refusal::BadIndexTable);
-        let mut valid_indices = indices;
-        valid_indices[INDEX_COUNT - 1] = (VERTEX_COUNT - 1) as u16;
-        args.topology = &valid_indices;
-        assert_eq!(build(&args).unwrap().initial_indices, valid_indices);
-    }
-
 }

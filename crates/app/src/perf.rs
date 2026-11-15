@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{AnyWindowHandle, App, Entity};
-use lumen_engine::RenderQuality;
+use aurora_engine::RenderQuality;
 
 use crate::state::{AppState, ToolTab};
 
@@ -23,14 +23,14 @@ impl Stamp {
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LUMEN_PERF_REPLAY").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("AURORA_PERF_REPLAY").is_some())
 }
 
 pub(crate) fn record(mut data: serde_json::Value) {
     if enabled() {
         static START: OnceLock<Instant> = OnceLock::new();
         data["t_ms"] = (START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0).into();
-        eprintln!("LUMEN_PERF {data}");
+        eprintln!("AURORA_PERF {data}");
     }
 }
 

@@ -7,8 +7,6 @@
 mod binding;
 mod clipboard;
 mod collections;
-mod files;
-pub(crate) mod library_document;
 pub(crate) mod render;
 mod settings;
 mod source;
@@ -25,12 +23,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui_kit::{App, AppContext, Context, Entity, EventEmitter, Pixels, RenderImage, SharedString, Task};
-use lumen_engine::*;
+use aurora_engine::*;
 
 pub use binding::*;
 pub use clipboard::ClipGroup;
 pub use collections::CollNode;
-pub use library_document::{DocumentKind, LibraryDocument};
 pub use settings::*;
 pub use source::Source;
 pub use arrange::{Arrangement, Stack};
@@ -243,7 +240,6 @@ pub enum SortKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Filter {
     pub min_rating: i8,
-    pub rejected_only: bool,
     pub color_tag: Option<ColorTag>,
     pub search: String,
     pub edited_only: bool,
@@ -251,24 +247,8 @@ pub struct Filter {
 
 impl Default for Filter {
     fn default() -> Self {
-        Self { min_rating: -1, rejected_only: false, color_tag: None, search: String::new(), edited_only: false }
+        Self { min_rating: -1, color_tag: None, search: String::new(), edited_only: false }
     }
-}
-
-impl Filter {
-    fn matches_rating(&self, rating: i8) -> bool { rating >= self.min_rating && (!self.rejected_only || rating < 0) }
-}
-
-#[test]
-fn rejected_filter_and_rating_threshold_are_distinct() {
-    let all = Filter::default();
-    assert!((-1..=5).all(|rating| all.matches_rating(rating)));
-    let rejected = Filter { rejected_only: true, ..Default::default() };
-    assert!(rejected.matches_rating(-1));
-    assert!((0..=5).all(|rating| !rejected.matches_rating(rating)));
-    let starred = Filter { min_rating: 4, ..Default::default() };
-    assert!(!starred.matches_rating(3));
-    assert!(starred.matches_rating(4) && starred.matches_rating(5));
 }
 
 /// One image's adjustments and history.
@@ -305,6 +285,8 @@ pub struct Frame {
     pub warning: Option<Arc<RenderImage>>,
     /// Sharp edges in green, when the focus mask is on.
     pub focus: Option<Arc<RenderImage>>,
+    /// Why the display profile was not applied; the frame is sRGB.
+    pub degraded: Option<SharedString>,
     pub(crate) stamp: crate::perf::Stamp,
 }
 
@@ -369,6 +351,8 @@ pub struct PanelPrefs {
     pub selected_sector: usize,
     pub histogram_mode: u8,
     pub brush_size: f32,
+    /// The spot tool clones from a clicked source point instead of healing.
+    pub spot_clone: bool,
     pub brush_hardness: f32,
     pub brush_opacity: f32,
     pub brush_flow: f32,
@@ -402,6 +386,7 @@ impl Default for PanelPrefs {
             selected_sector: 0,
             histogram_mode: 0,
             brush_size: 0.05,
+            spot_clone: false,
             brush_hardness: 50.0,
             brush_opacity: 100.0,
             brush_flow: 100.0,
@@ -496,11 +481,6 @@ pub struct AppState {
     pub engine: Arc<dyn ImageEngine>,
     pub images: Vec<ImageInfo>,
     pub nodes: Vec<CollNode>,
-    pub library_document: Option<LibraryDocument>,
-    pub library_busy: bool,
-    pub library_offline: HashSet<ImageId>,
-    pub library_include_subfolders: bool,
-    pub(crate) file_status_generation: u64,
     pub recent_imports: BTreeSet<ImageId>,
     pub recent_captures: BTreeSet<ImageId>,
     pub trash: BTreeSet<ImageId>,
@@ -517,6 +497,9 @@ pub struct AppState {
     pub active_node: Option<u64>,
     pub tool_tab: ToolTab,
     pub cursor: CursorTool,
+    /// Clone tool's first click: the image and crop-normalised source point
+    /// waiting for its target.
+    pub spot_anchor: Option<(ImageId, [f32; 2])>,
     pub view: ViewPrefs,
     pub panels: PanelPrefs,
     pub zoom: ViewZoom,
@@ -524,10 +507,14 @@ pub struct AppState {
     pub viewport: (f32, f32),
     /// Window position of the viewer's top-left corner.
     pub viewport_origin: gpui_kit::Point<Pixels>,
+    /// Native handle of the main window, for display-profile lookup.
+    pub window_hwnd: isize,
     pub scale_factor: f32,
     pub preview: Preview,
     pub thumbs: HashMap<ImageId, Arc<RenderImage>>,
     thumb_queue: Vec<ImageId>,
+    /// Bumped when cached thumbnails are invalidated; older results are dropped.
+    thumb_rev: u64,
     thumb_task: Option<Task<()>>,
     pub clipboard: Option<AdjustmentSet>,
     /// Tools the adjustments clipboard copies and applies.
@@ -538,6 +525,8 @@ pub struct AppState {
     pub annotations: HashMap<ImageId, Vec<Vec<(f32, f32)>>>,
     pub styles: Vec<StyleInfo>,
     pub icc_profiles: Vec<String>,
+    pub icc_group: usize,
+    pub icc_query: String,
     pub lens_profiles: Vec<String>,
     pub recipes: Vec<ProcessRecipe>,
     pub selected_recipe: usize,
@@ -569,6 +558,8 @@ pub struct AppState {
     pub source_note: Option<(ImageId, SharedString)>,
     pub settings: Settings,
     pub engine_name: String,
+    /// What the engine reported it can do on this machine, read once at start.
+    pub capabilities: EngineCapabilities,
     /// What this window has open.
     pub source: Source,
     /// The welcome screen covers the demo images until one is opened or the
@@ -627,19 +618,18 @@ impl AppState {
             },
         ];
         let mut this = Self {
-            library_document: source.path().and_then(|p| LibraryDocument::load(if p.is_dir() { p } else { p.parent()? }).ok().flatten()),
-            library_busy: false,
-            library_offline: HashSet::new(),
-            library_include_subfolders: true,
-            file_status_generation: 0,
             styles: engine.styles(),
             icc_profiles: engine.icc_profiles(),
+            icc_group: settings.icc_group.min(3) as usize,
+            icc_query: String::new(),
             lens_profiles: engine.lens_profiles(),
             nodes: collections::flatten(engine.as_ref(), &engine.collections()),
             recent_imports: BTreeSet::new(),
             recent_captures: BTreeSet::new(),
             trash: BTreeSet::new(),
-            camera: engine.camera_status(),
+            // Trust `tether_status` first: mock/imaging-only devices may report
+            // `camera_status` without a camera the tether backend can open.
+            camera: CameraStatus::Disconnected,
             camera_settings: engine.camera_settings(),
             tether: None,
             ai_unavailable: HashSet::new(),
@@ -649,6 +639,7 @@ impl AppState {
             source_note: None,
             tether_probing: false,
             engine_name: engine.name(),
+            capabilities: crate::planned::capabilities(engine.as_ref()),
             engine,
             selection: current.into_iter().collect(),
             current,
@@ -662,16 +653,19 @@ impl AppState {
             active_node: None,
             tool_tab: tab_from(&settings.workspace.tab).unwrap_or(ToolTab::Exposure),
             cursor: CursorTool::Select,
+            spot_anchor: None,
             view: ViewPrefs::default(),
             settings,
             panels: PanelPrefs::default(),
             zoom: ViewZoom::default(),
             viewport: (1200.0, 800.0),
             viewport_origin: Default::default(),
+            window_hwnd: 0,
             scale_factor: 1.0,
             preview: Preview::default(),
             thumbs: HashMap::new(),
             thumb_queue: Vec::new(),
+            thumb_rev: 0,
             thumb_task: None,
             clipboard: None,
             clip_groups: ClipGroup::ALL.iter().copied().filter(|g| !g.is_composition()).collect(),
@@ -703,10 +697,6 @@ impl AppState {
             cursor_changed: std::time::Instant::now(),
         };
         let layout = this.settings.workspace.clone();
-        this.library_include_subfolders = this.library_document.as_ref().is_none_or(|d| d.include_subfolders);
-        if let Some((root, output)) = this.engine.library_root().zip(this.library_document.as_ref().and_then(|d| d.shortcuts.get("Output"))) {
-            for recipe in &mut this.recipes { recipe.destination = Some(LibraryDocument::resolve(&root, output)); }
-        }
         this.load_layout(&layout);
         this.load_arrangement();
         this.view.viewer_gray = this.settings.viewer_gray;
@@ -716,7 +706,6 @@ impl AppState {
         this.queue_thumbs(all, cx);
         this.request_render(RenderQuality::Final, cx);
         this.probe_tether(cx);
-        this.refresh_file_status(cx);
         this
     }
 
@@ -741,13 +730,13 @@ impl AppState {
             .iter()
             .filter(|i| members.as_ref().is_none_or(|m| m.contains(&i.id)))
             .filter(|i| in_trash || !self.trash.contains(&i.id))
-            .filter(|i| f.matches_rating(i.rating))
+            .filter(|i| i.rating >= f.min_rating)
             .filter(|i| f.color_tag.is_none_or(|t| i.color_tag == t))
             .filter(|i| !f.edited_only || self.edits.get(&i.id).is_some_and(|e| !e.adj.is_default()))
             .filter(|i| {
                 search.is_empty()
                     || i.file_name.to_lowercase().contains(&search)
-                    || i.keywords.iter().any(|k| k.to_lowercase().contains(&search))
+                    || i.keywords.iter().any(|k| k.contains(&search))
             })
             .collect();
         match self.sort {
@@ -756,10 +745,7 @@ impl AppState {
             SortKey::Rating => out.sort_by(|a, b| b.rating.cmp(&a.rating)),
             SortKey::ColorTag => out.sort_by_key(|i| i.color_tag as u8),
             SortKey::FileSize => out.sort_by_key(|i| i.file_size),
-            SortKey::Custom => {
-                let ranks: HashMap<_, _> = self.custom_order.iter().enumerate().map(|(rank, id)| (*id, rank)).collect();
-                out.sort_by(|a, b| (ranks.get(&a.id).copied().unwrap_or(usize::MAX), &a.file_name).cmp(&(ranks.get(&b.id).copied().unwrap_or(usize::MAX), &b.file_name)));
-            }
+            SortKey::Custom => out.sort_by_key(|i| (self.custom_rank(i.id), i.file_name.clone())),
         }
         if self.sort_desc {
             out.reverse();
@@ -837,30 +823,25 @@ impl AppState {
     }
 
     pub fn set_rating(&mut self, rating: i8, cx: &mut Context<Self>) {
-        let changes = self.images.iter().filter(|i| self.selection.contains(&i.id) && i.rating != rating)
-            .cloned().map(|mut info| { info.rating = rating; info }).collect();
-        self.persist_infos(changes, cx);
+        let targets: Vec<ImageId> = self.selection.iter().copied().collect();
+        for id in targets {
+            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
+                info.rating = rating;
+                let _ = self.engine.update_info(info);
+            }
+        }
         cx.notify();
     }
 
     pub fn set_color_tag(&mut self, tag: ColorTag, cx: &mut Context<Self>) {
-        let changes = self.images.iter().filter(|i| self.selection.contains(&i.id) && i.color_tag != tag)
-            .cloned().map(|mut info| { info.color_tag = tag; info }).collect();
-        self.persist_infos(changes, cx);
+        let targets: Vec<ImageId> = self.selection.iter().copied().collect();
+        for id in targets {
+            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
+                info.color_tag = tag;
+                let _ = self.engine.update_info(info);
+            }
+        }
         cx.notify();
-    }
-
-    fn persist_infos(&mut self, changes: Vec<ImageInfo>, cx: &mut Context<Self>) -> bool {
-        if changes.is_empty() { return true; }
-        if let Err(err) = self.engine.update_infos(&changes) {
-            self.notify(format!("{}: {err}", t("Could not save metadata", "无法存储元数据")), cx);
-            return false;
-        }
-        let mut changes: HashMap<_, _> = changes.into_iter().map(|i| (i.id, i)).collect();
-        for info in &mut self.images {
-            if let Some(updated) = changes.remove(&info.id) { *info = updated; }
-        }
-        true
     }
 
     /// Saves the current image's IPTC fields and keywords as a metadata preset.
@@ -883,9 +864,9 @@ impl AppState {
                 *dst = src.clone();
             }
         };
-        let ids: HashSet<ImageId> = if self.selection.is_empty() { self.current.into_iter().collect() } else { self.selection.iter().copied().collect() };
-        let mut changes: Vec<_> = self.images.iter().filter(|i| ids.contains(&i.id)).cloned().collect();
-        for info in &mut changes {
+        let ids: Vec<ImageId> = if self.selection.is_empty() { self.current.into_iter().collect() } else { self.selection.iter().copied().collect() };
+        let mut failed = 0;
+        for info in self.images.iter_mut().filter(|i| ids.contains(&i.id)) {
             let (d, s) = (&mut info.iptc, &preset.iptc);
             fill(&mut d.title, &s.title);
             fill(&mut d.description, &s.description);
@@ -900,11 +881,17 @@ impl AppState {
                     info.keywords.push(k.clone());
                 }
             }
+            if self.engine.update_info(info).is_err() {
+                failed += 1;
+            }
         }
-        if !self.persist_infos(changes, cx) { return; }
         // Fields keep their own text; a new revision starts them from the new values.
         self.metadata_rev += 1;
-        let msg = format!("{} {} · {} {}", t("Applied", "已应用"), preset.name, ids.len(), t("images", "张图像"));
+        let msg = if failed == 0 {
+            format!("{} {} · {} {}", t("Applied", "已应用"), preset.name, ids.len(), t("images", "张图像"))
+        } else {
+            format!("{} {failed} {}", t("Could not save metadata for", "无法存储元数据："), t("images", "张图像"))
+        };
         self.notify(msg, cx);
     }
 
@@ -926,11 +913,10 @@ impl AppState {
 
     pub fn update_current_info(&mut self, f: impl FnOnce(&mut ImageInfo), cx: &mut Context<Self>) {
         if let Some(id) = self.current
-            && let Some(info) = self.images.iter().find(|i| i.id == id)
+            && let Some(info) = self.images.iter_mut().find(|i| i.id == id)
         {
-            let mut info = info.clone();
-            f(&mut info);
-            self.persist_infos(vec![info], cx);
+            f(info);
+            let _ = self.engine.update_info(info);
             cx.notify();
         }
     }
@@ -941,16 +927,11 @@ impl AppState {
 
     /// Imports files, then applies metadata, a style and an album to what arrived.
     pub fn import_with(&mut self, paths: Vec<std::path::PathBuf>, after: ImportAfter, cx: &mut Context<Self>) {
-        if self.library_busy { self.notify(t("A file operation is already running", "正在处理文件，请稍候"), cx); return; }
-        self.library_busy = true;
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { engine.import(&paths).map(|added| (added, collections::flatten(engine.as_ref(), &engine.collections()))) }).await;
-            this.update(cx, |this, cx| { this.library_busy = false; match result {
-                Ok((added, nodes)) => {
-                    let user_ids: HashSet<_> = this.nodes.iter().filter(|n| n.user).map(|n| n.id).collect();
-                    this.nodes.retain(|n| n.user);
-                    this.nodes.extend(nodes.into_iter().filter(|n| !user_ids.contains(&n.id)));
+            let result = cx.background_spawn(async move { engine.import(&paths) }).await;
+            this.update(cx, |this, cx| match result {
+                Ok(added) => {
                     let ids: Vec<_> = added.iter().map(|i| i.id).collect();
                     for info in &added {
                         this.edits.insert(info.id, Edit::default());
@@ -958,11 +939,8 @@ impl AppState {
                     let n = added.len();
                     this.recent_imports.extend(ids.iter().copied());
                     this.images.extend(added);
-                    let mut metadata = Vec::new();
-                    if !after.copyright.is_empty() || !after.creator.is_empty() || !after.keywords.is_empty() {
-                        let imported: HashSet<_> = ids.iter().copied().collect();
-                        for info in this.images.iter().filter(|i| imported.contains(&i.id)) {
-                            let mut info = info.clone();
+                    for id in &ids {
+                        if let Some(info) = this.images.iter_mut().find(|i| i.id == *id) {
                             if !after.copyright.is_empty() {
                                 info.iptc.copyright = after.copyright.clone();
                             }
@@ -974,10 +952,9 @@ impl AppState {
                                     info.keywords.push(k.clone());
                                 }
                             }
-                            metadata.push(info);
+                            let _ = this.engine.update_info(info);
                         }
                     }
-                    let metadata_saved = this.persist_infos(metadata, cx);
                     if let Some(album) = after.album {
                         this.add_to_album(album, &ids, cx);
                     }
@@ -989,12 +966,21 @@ impl AppState {
                     if let Some(first) = ids.first() {
                         this.select(*first, false, false, cx);
                     }
-                    if metadata_saved {
-                        this.notify(format!("{} {n} {}", t("Imported", "已导入"), t("images", "张图像")), cx);
-                    }
+                    this.notify(format!("{} {n} {}", t("Imported", "已导入"), t("images", "张图像")), cx);
                 }
-                Err(err) => this.notify(format!("{}: {err}", t("Import failed", "导入失败")), cx),
-            }})
+                Err(err) => {
+                    log::warn!("import: {err:#}");
+                    let reason = match ImportErrorKind::of(&err) {
+                        ImportErrorKind::NoLibRaw => t("LibRaw is not installed, so RAW files cannot be decoded", "本机缺少 LibRaw，无法解码 RAW"),
+                        ImportErrorKind::DecodeFailed => t("the file could not be decoded", "文件无法解码"),
+                        ImportErrorKind::TooLarge => t("the file is too large for this build", "文件超出本版本可处理的规模"),
+                        ImportErrorKind::Unsupported => t("the format is not supported", "不支持该格式"),
+                        ImportErrorKind::Io => t("the file could not be read", "文件无法读取"),
+                        ImportErrorKind::Other => t("see the log for details", "详情见日志"),
+                    };
+                    this.notify(format!("{}: {reason}", t("Import failed", "导入失败")), cx)
+                }
+            })
             .ok();
         })
         .detach();
@@ -1038,6 +1024,24 @@ impl AppState {
             Some(id) if self.adj().layers.iter().any(|l| l.id == id) => Scope::Layer(id),
             _ => Scope::Global,
         }
+    }
+
+    pub fn icc_picker(&self, current: Option<&str>, query: &str) -> Vec<String> {
+        use aurora_engine::icc::ProfileGroup;
+        let group = match self.icc_group {
+            1 => Some(ProfileGroup::Camera),
+            2 => Some(ProfileGroup::Standard),
+            3 => Some(ProfileGroup::Output),
+            _ => None,
+        };
+        let query = query.trim();
+        let mut names = aurora_engine::icc::profile_menu(group, (!query.is_empty()).then_some(query), 300);
+        if let Some(current) = current {
+            if !names.iter().any(|name| name == current) {
+                names.insert(0, current.to_string());
+            }
+        }
+        names
     }
 
     pub fn active_layer_ref(&self) -> Option<&Layer> {
@@ -1112,7 +1116,6 @@ impl AppState {
         let label = label.into();
         self.end_gesture(cx);
         let ids: Vec<ImageId> = self.selection.iter().copied().collect();
-        let mut changed = Vec::new();
         for id in ids {
             let edit = self.edits.entry(id).or_default();
             let before = edit.adj.clone();
@@ -1120,31 +1123,23 @@ impl AppState {
             if before != edit.adj {
                 edit.undo.push((label.clone(), before));
                 edit.redo.clear();
-                changed.push(id);
+                self.after_commit(id, cx);
             }
         }
-        self.after_commit_many(changed, cx);
         self.preview.before_dirty = true;
         self.request_render(RenderQuality::Final, cx);
         cx.notify();
     }
 
     pub(crate) fn after_commit(&mut self, id: ImageId, cx: &mut Context<Self>) {
-        self.after_commit_many(vec![id], cx);
-    }
-
-    fn after_commit_many(&mut self, ids: Vec<ImageId>, cx: &mut Context<Self>) {
-        if ids.is_empty() { return; }
-        let changes: Vec<_> = ids.iter().filter_map(|id| self.edits.get(id).map(|e| (*id, &e.adj))).collect();
-        let saved = self.engine.save_adjustments_batch(&changes);
-        let changed: HashMap<_, _> = changes.iter().map(|(id, adj)| (*id, !adj.is_default())).collect();
-        if let Err(err) = saved {
-            self.notify(format!("{}: {err}", t("Could not save adjustments", "无法存储调整")), cx);
+        if let Some(edit) = self.edits.get(&id) {
+            let _ = self.engine.save_adjustments(id, &edit.adj);
+            let changed = !edit.adj.is_default();
+            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
+                info.has_adjustments = changed;
+            }
         }
-        for info in &mut self.images {
-            if let Some(changed) = changed.get(&info.id) { info.has_adjustments = *changed; }
-        }
-        self.queue_thumbs(ids, cx);
+        self.queue_thumbs(vec![id], cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
@@ -1310,8 +1305,15 @@ impl AppState {
         cx.notify();
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
-            let (tether, camera, settings) =
-                cx.background_spawn(async move { (engine.tether_status(), engine.camera_status(), engine.camera_settings()) }).await;
+            let (tether, camera, settings) = cx
+                .background_spawn(async move {
+                    let tether = engine.tether_status();
+                    let open = matches!(tether, TetherStatus::Available { .. });
+                    let camera = if open { engine.camera_status() } else { CameraStatus::Disconnected };
+                    let settings = if open { engine.camera_settings() } else { None };
+                    (tether, camera, settings)
+                })
+                .await;
             this.update(cx, |this, cx| {
                 this.tether_probing = false;
                 this.tether = Some(tether);
@@ -1347,7 +1349,18 @@ impl AppState {
                         // Capture One reviews each capture for closed eyes; it only reports.
                         this.run_eye_check(vec![id], false, cx);
                     }
-                    Err(err) => this.notify(format!("{}: {err}", t("Capture failed", "拍摄失败")), cx),
+                    Err(err) => {
+                        // The log keeps the driver error; the notice stays translatable.
+                        log::warn!("capture: {err:#}");
+                        let reason = match TetherErrorKind::of(&err) {
+                            TetherErrorKind::NoLibrary => t("tethering is not available on this system", "本机没有可用的联机后端"),
+                            TetherErrorKind::NoCamera => t("no camera is connected", "未连接相机"),
+                            TetherErrorKind::Unsupported => t("the camera driver does not support this capture", "该相机驱动不支持此拍摄"),
+                            TetherErrorKind::Timeout => t("the camera stopped responding", "相机无响应"),
+                            TetherErrorKind::Other => t("see the log for details", "详情见日志"),
+                        };
+                        this.notify(format!("{}: {reason}", t("Capture failed", "拍摄失败")), cx)
+                    }
                 }
             })
             .ok();
@@ -1497,6 +1510,9 @@ impl AppState {
         self.prev_cursor = self.cursor;
         self.cursor_changed = std::time::Instant::now();
         self.cursor = tool;
+        if tool != CursorTool::Spot {
+            self.spot_anchor = None;
+        }
         if tool == CursorTool::Crop || was_crop {
             // The crop tool shows the uncropped frame with an overlay.
             self.zoom = ViewZoom::default();
@@ -1538,6 +1554,7 @@ impl AppState {
             self.viewport = size;
             self.scale_factor = scale_factor;
             self.preview.before_dirty = true;
+            crate::state::invalidate_display_profile_cache();
             self.request_render(RenderQuality::Final, cx);
         }
     }
@@ -1626,6 +1643,9 @@ impl AppState {
                         for job in &mut this.jobs {
                             if matches!(job.status, JobStatus::Queued | JobStatus::Running { .. }) {
                                 job.status = this.engine.job_status(job.id);
+                                if let JobStatus::Failed { message } = &job.status {
+                                    log::warn!("export {}: {message}", job.id);
+                                }
                                 busy |= matches!(job.status, JobStatus::Queued | JobStatus::Running { .. });
                             }
                         }
@@ -1841,4 +1861,69 @@ fn user_style_onto(a: &mut AdjustmentSet, style: &UserStyle) {
         g.copy(a, &style.adjustments);
     }
     a.style = Some(style.name.clone());
+}
+
+/// Source-minus-target offset in oriented, uncropped source pixels — what
+/// `SpotKind::Clone` stores. Both points are crop-normalised, so the crop scale
+/// comes back out here and the fine rotation is undone: the engine turns the
+/// offset by `rotation` again when it draws.
+pub fn clone_offset(src: [f32; 2], dst: [f32; 2], g: &Geometry, source_size: (u32, u32)) -> (i32, i32) {
+    let (sw, sh) = source_size;
+    if sw == 0 || sh == 0 {
+        return (0, 0);
+    }
+    let (ow, oh) = if g.orientation % 2 == 1 {
+        (sh as f32, sw as f32)
+    } else {
+        (sw as f32, sh as f32)
+    };
+    let dx = (src[0] - dst[0]) * g.crop.width * ow;
+    let dy = (src[1] - dst[1]) * g.crop.height * oh;
+    let (sin, cos) = g.rotation.to_radians().sin_cos();
+    let (x, y) = (cos * dx + sin * dy, cos * dy - sin * dx);
+    if !x.is_finite() || !y.is_finite() {
+        return (0, 0);
+    }
+    (x.round() as i32, y.round() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: (u32, u32) = (100, 60);
+
+    /// A plain frame: the offset is the clicked delta in source pixels.
+    #[test]
+    fn clone_offset_is_the_clicked_delta() {
+        let g = Geometry::default();
+        assert_eq!(clone_offset([0.6, 0.5], [0.4, 0.5], &g, SRC), (20, 0));
+        assert_eq!(clone_offset([0.5, 0.4], [0.5, 0.5], &g, SRC), (0, -6));
+    }
+
+    /// A quarter turn swaps the long side the normalised x is measured against.
+    #[test]
+    fn clone_offset_follows_the_orientation() {
+        let g = Geometry { orientation: 1, ..Default::default() };
+        assert_eq!(clone_offset([0.6, 0.5], [0.4, 0.5], &g, SRC), (12, 0));
+    }
+
+    /// Crop-normalised points scale by the crop, not the whole image.
+    #[test]
+    fn clone_offset_undoes_the_crop() {
+        let g = Geometry { crop: NormRect { x: 0.25, y: 0.0, width: 0.5, height: 1.0 }, ..Default::default() };
+        assert_eq!(clone_offset([0.6, 0.5], [0.4, 0.5], &g, SRC), (10, 0));
+    }
+
+    /// The engine rotates the offset before drawing, so the helper must undo it.
+    #[test]
+    fn clone_offset_undoes_the_fine_rotation() {
+        let g = Geometry { rotation: 90.0, ..Default::default() };
+        assert_eq!(clone_offset([0.5, 0.6], [0.5, 0.5], &g, SRC), (6, 0));
+    }
+
+    #[test]
+    fn clone_offset_survives_a_missing_image() {
+        assert_eq!(clone_offset([0.6, 0.5], [0.4, 0.5], &Geometry::default(), (0, 0)), (0, 0));
+    }
 }

@@ -10,7 +10,7 @@ use crate::catalog::ImageInfo;
 use crate::icc::{self, Profile};
 use crate::output::{
     ExportFormat, MetadataPolicy, OutputSharpening, OutputSharpeningSettings, ProcessRecipe, ScaleMode,
-    UnsupportedFormat, Watermark,
+    ScaleUnit, SizeMode, SizeRequest, UnsupportedFormat, Watermark, WatermarkSettings,
 };
 
 /// 8x8 bitmap font for the watermark, covering ASCII 0x20..=0x7E.
@@ -155,10 +155,136 @@ fn scaled(w: u32, h: u32, factor: f32) -> (u32, u32) {
     (one(w), one(h))
 }
 
+/// Capture One uses 300 ppi when a recipe has no usable resolution.
+pub const DEFAULT_RESOLUTION_PPI: u32 = 300;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeError {
+    EmptySource,
+    ZeroTarget,
+}
+
+impl std::fmt::Display for SizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySource => f.write_str("source image has a zero dimension"),
+            Self::ZeroTarget => f.write_str("size request has no usable target"),
+        }
+    }
+}
+
+impl std::error::Error for SizeError {}
+
+/// Target pixel size for the C1 size request parsed into [`ProcessRecipe::size`].
+///
+/// This is intentionally not wired into [`output_size`] yet: parsing a recipe
+/// must not change the existing export path. The four C1 samples this supports
+/// are:
+///
+/// - `Fixed`: `fixedScale amount:1;unit:1` -> 100% of the source.
+/// - `Width`: `widthScale width:1080;unit:0` -> width 1080 px, height by ratio.
+/// - `LongEdge`: `longEdgeScale length:2048;unit:0` -> long edge 2048 px.
+/// - `Size`: `boundingBoxScale height:29.7;width:42;unit:3` -> 42x29.7 cm box
+///   at `resolution`/`resolutionUnit` (300 ppi in the local A3 sample).
+///
+/// C1 rounds with `Math.Round` (ties to even); `round_ties_even` below mirrors
+/// that. For physical units the conversion is:
+/// `px = value * ppi`, `value * ppi / 25.4` (mm), or `value * ppi / 2.54` (cm).
+/// Missing/zero DPI uses 300 ppi. Unknown XML units fall back to pixels during
+/// parsing instead of panicking.
+pub fn target_size(recipe: &ProcessRecipe, src: (u32, u32)) -> Result<(u32, u32), SizeError> {
+    if src.0 == 0 || src.1 == 0 {
+        return Err(SizeError::EmptySource);
+    }
+    let Some(size) = recipe.size else {
+        return Ok(output_size(recipe, src));
+    };
+    let ppi = if recipe.resolution_ppi == 0 { DEFAULT_RESOLUTION_PPI } else { recipe.resolution_ppi };
+    let (sw, sh) = (src.0 as f32, src.1 as f32);
+    let target_px = |value: f32, unit: ScaleUnit| -> Result<f32, SizeError> {
+        let factor = match unit {
+            ScaleUnit::Pixel => 1.0,
+            ScaleUnit::Inch => ppi as f32,
+            ScaleUnit::Millimeter => ppi as f32 / 25.4,
+            ScaleUnit::Centimeter => ppi as f32 / 2.54,
+        };
+        let px = value * factor;
+        (value.is_finite() && value > 0.0 && px.is_finite() && px > 0.0)
+            .then_some(px)
+            .ok_or(SizeError::ZeroTarget)
+    };
+    let dims = |factor: f32| -> (u32, u32) {
+        let one = |value: f32| round_ties_even((value * factor).max(1.0)) as u32;
+        (one(sw), one(sh))
+    };
+    let clamp = |factor: f32| -> f32 {
+        let max = if size.never_upscale { 1.0 } else { 2.5 };
+        factor.clamp(0.01, max)
+    };
+
+    match size.mode {
+        SizeMode::Fixed => {
+            if !(size.fixed_percent.is_finite() && size.fixed_percent > 0.0) {
+                return Err(SizeError::ZeroTarget);
+            }
+            let factor = size.fixed_percent / 100.0;
+            Ok(dims(factor))
+        }
+        SizeMode::Width => {
+            let target = target_px(size.width, size.unit)?;
+            Ok(dims(clamp(target / sw)))
+        }
+        SizeMode::Height => {
+            let target = target_px(size.height, size.unit)?;
+            Ok(dims(clamp(target / sh)))
+        }
+        SizeMode::LongEdge => {
+            let target = target_px(size.width, size.unit)?;
+            let edge = sw.max(sh);
+            Ok(dims(clamp(target / edge)))
+        }
+        SizeMode::ShortEdge => {
+            let target = target_px(size.width, size.unit)?;
+            let edge = sw.min(sh);
+            Ok(dims(clamp(target / edge)))
+        }
+        SizeMode::Size | SizeMode::WidthByHeight => {
+            let mut bw = target_px(size.width, size.unit)?;
+            let mut bh = target_px(size.height, size.unit)?;
+            let box_ratio = bw / bh;
+            let src_ratio = sw / sh;
+            if size.mode == SizeMode::Size
+                && ((box_ratio < 1.0 && src_ratio > 1.0) || (box_ratio > 1.0 && src_ratio < 1.0))
+            {
+                std::mem::swap(&mut bw, &mut bh);
+            }
+            let factor = if bw / bh > src_ratio { bh / sh } else { bw / sw };
+            Ok(dims(clamp(factor)))
+        }
+    }
+}
+
+/// C1's `Math.Round(double)` default: midpoint ties go to the even integer.
+fn round_ties_even(value: f32) -> i64 {
+    let floor = value.floor();
+    let fraction = value - floor;
+    let rounded = if fraction < 0.5 {
+        floor
+    } else if fraction > 0.5 {
+        floor + 1.0
+    } else if (floor as i64) % 2 == 0 {
+        floor
+    } else {
+        floor + 1.0
+    };
+    rounded.clamp(0.0, u32::MAX as f32) as i64
+}
+
 /// File name (no extension) for one exported image.
 ///
 /// Placeholders: `{name}` source stem, `{seq}` zero-padded index, `{date}`
-/// `YYYYMMDD` from the capture time, `{rating}`, `{variant}`, `{counter}`.
+/// `YYYYMMDD` from the capture time, `{rating}`, `{variant}`, `{counter}`,
+/// `{make}`, `{model}`, `{lens}`. Missing EXIF text is omitted.
 /// Capture One's bracketed spellings (`[Image Name]`, `[Counter]`, ...) work too.
 /// An unknown placeholder or a path separator falls back to `{name}`.
 pub fn output_name(recipe: &ProcessRecipe, info: &ImageInfo, index: usize) -> String {
@@ -168,6 +294,10 @@ pub fn output_name(recipe: &ProcessRecipe, info: &ImageInfo, index: usize) -> St
         return fallback;
     }
     let mut out = String::with_capacity(template.len() + 16);
+    let counter = recipe
+        .file_name_counter_start
+        .max(1)
+        .saturating_add(u32::try_from(index.saturating_sub(1)).unwrap_or(u32::MAX));
     let mut rest = template.as_str();
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
@@ -176,12 +306,17 @@ pub fn output_name(recipe: &ProcessRecipe, info: &ImageInfo, index: usize) -> St
         let token = rest[..close].trim();
         match token {
             "name" => out.push_str(&fallback),
-            "seq" => out.push_str(&format!("{index:03}")),
-            // short: caller supplies the counter, so a start value is not modelled here
-            "counter" => out.push_str(&index.to_string()),
+            "seq" => out.push_str(&format!("{counter:03}")),
+            "counter" => out.push_str(&counter.to_string()),
             "date" => out.push_str(&capture_date(info)),
             "rating" => out.push_str(&info.rating.to_string()),
             "variant" => out.push_str(&info.variant.to_string()),
+            "recipe" => out.push_str(&recipe.name),
+            "document" => out.push_str(&source_stem(info)),
+            "format" => out.push_str(recipe.format.label()),
+            "make" => out.push_str(info.exif.camera_make.as_deref().unwrap_or_default()),
+            "model" => out.push_str(info.exif.camera_model.as_deref().unwrap_or_default()),
+            "lens" => out.push_str(info.exif.lens.as_deref().unwrap_or_default()),
             _ => return fallback,
         }
         rest = &rest[close + 1..];
@@ -223,6 +358,12 @@ fn c1_tokens(template: &str) -> String {
             "date" => "{date}",
             "rating" => "{rating}",
             "variant" => "{variant}",
+            "recipe name" | "recipe" => "{recipe}",
+            "document name" | "document" => "{document}",
+            "format" => "{format}",
+            "make" | "camera make" => "{make}",
+            "model" | "camera model" => "{model}",
+            "lens" => "{lens}",
             _ => "[",
         };
         match token {
@@ -369,6 +510,136 @@ pub fn parse_output_sharpening_xml(text: &str) -> OutputSharpeningSettings {
     out
 }
 
+/// Reads the `Watermark*` values from a Capture One recipe XML.
+///
+/// Unknown keys are ignored and missing fields stay `None`. Text and color
+/// values are returned as written by C1; tokens are not expanded and no
+/// watermark rendering happens here.
+pub fn parse_watermark_xml(text: &str) -> WatermarkSettings {
+    let mut out = WatermarkSettings::default();
+    for (key, value) in crate::presets::parse_sl(text) {
+        let Some(suffix) = key.strip_prefix("Watermark") else {
+            continue;
+        };
+        match suffix {
+            "Type" => out.watermark_type = value.trim().parse().ok(),
+            "Text" => out.text = Some(value),
+            "FontName" => out.font_name = Some(value),
+            "FontType" => out.font_type = value.trim().parse().ok(),
+            "FontSize" => out.font_size = parse_watermark_f32(&value),
+            "PixelFontSize" => out.pixel_font_size = parse_watermark_f32(&value),
+            "PointFontSize" => out.point_font_size = parse_watermark_f32(&value),
+            "TextScale" => out.text_scale = parse_watermark_f32(&value),
+            "TextRelativeSize" => out.text_relative_size = parse_watermark_f32(&value),
+            "TextOpacity" => out.text_opacity = parse_watermark_f32(&value),
+            "Color" => out.color = Some(value),
+            "Underline" => out.underline = value.trim().parse().ok(),
+            "UnderlineColor" => out.underline_color = Some(value),
+            "StrikeThrough" => out.strike_through = value.trim().parse().ok(),
+            "StrikeThroughColor" => out.strike_through_color = Some(value),
+            "HTextPlacement" => out.h_text_placement = parse_watermark_f32(&value),
+            "VTextPlacement" => out.v_text_placement = parse_watermark_f32(&value),
+            "ImageFilePath" => out.image_file_path = Some(value),
+            "ImageOpacity" => out.image_opacity = parse_watermark_f32(&value),
+            "ImageScale" => out.image_scale = parse_watermark_f32(&value),
+            "HImagePlacement" => out.h_image_placement = parse_watermark_f32(&value),
+            "VImagePlacement" => out.v_image_placement = parse_watermark_f32(&value),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn parse_watermark_f32(value: &str) -> Option<f32> {
+    let value: f32 = value.trim().parse().ok()?;
+    value.is_finite().then_some(value)
+}
+
+/// Maps the clear text-watermark fields to the existing renderer model.
+///
+/// `WatermarkType=0` is C1's `None`, so it draws nothing. `WatermarkType=1`
+/// (or an absent legacy type) uses the text fields; image watermarks, fonts,
+/// colours, decorations and `TextRelativeSize` stay unconnected until their
+/// units are proven.
+pub fn watermark_from_settings(settings: &WatermarkSettings) -> Option<Watermark> {
+    if settings
+        .image_file_path
+        .as_deref()
+        .map(|path| !path.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    match settings.watermark_type {
+        Some(0) => return None,
+        Some(1) | None => {}
+        Some(_) => return None,
+    }
+    let text = readable_watermark_text(settings.text.as_deref()?)?;
+    let opacity = match settings.text_opacity {
+        Some(value) if (0.0..=1.0).contains(&value) => value * 100.0,
+        _ => 50.0,
+    };
+    let scale = settings
+        .text_scale
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let position = [
+        settings
+            .h_text_placement
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
+        settings
+            .v_text_placement
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
+    ];
+    Some(Watermark { text, opacity, scale, position })
+}
+
+/// C1 stores a text watermark as a `DestinationName`. An empty serialized
+/// `DestinationName` is `<TokenName Version="2" />` with no `<Token>` child:
+/// it means "no text", not a token. A wrapper that actually contains a
+/// `<Token ...>` child keeps the existing readable placeholder because the
+/// renderer has no token resolver yet.
+fn readable_watermark_text(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("<TokenName") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = token_name_end(tail) else {
+            out.push_str(tail);
+            rest = "";
+            break;
+        };
+        let wrapper = &tail[..end];
+        if wrapper.contains("<Token ") || wrapper.contains("<Token>") {
+            out.push_str("Image Name");
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    let text = out.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn token_name_end(tail: &str) -> Option<usize> {
+    let next_open = tail[1..].find("<TokenName").map(|offset| offset + 1);
+    let close = tail.find("</TokenName>");
+    match (next_open, close) {
+        (Some(next), Some(end)) if end < next => {
+            return Some(end + "</TokenName>".len());
+        }
+        (Some(next), _) => return tail[..next].find("/>").map(|offset| offset + 2),
+        (None, Some(end)) => return Some(end + "</TokenName>".len()),
+        (None, None) => {}
+    }
+    tail.find("/>").map(|offset| offset + 2)
+}
+
 /// Reads one Capture One recipe XML and keeps only the output-sharpening fields.
 ///
 /// The returned recipe is synthetic and UI-only until imported into app state.
@@ -379,6 +650,172 @@ pub fn recipe_from_output_sharpening_xml(text: &str) -> ProcessRecipe {
         output_sharpening_settings: has_settings.then_some(settings),
         ..ProcessRecipe::default()
     }
+}
+
+/// Reads one Capture One output recipe XML into the fields this crate models.
+///
+/// Size, resolution, counter-start and the clear text-watermark fields are
+/// mapped here. Format, ICC and metadata keep their defaults.
+pub fn recipe_from_xml(text: &str) -> ProcessRecipe {
+    let fields = crate::presets::parse_sl(text);
+    let get = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.trim());
+    let mut recipe = recipe_from_output_sharpening_xml(text);
+
+    if let Some(value) = get("resolution").and_then(|v| v.parse::<f32>().ok()) {
+        let unit = get("resolutionUnit").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
+        if let Some(ppi) = resolution_ppi(value, unit) {
+            recipe.resolution_ppi = ppi;
+        }
+    }
+
+    let scale = match get("scaleMethod").and_then(|v| v.parse::<u8>().ok()) {
+        Some(5) => Some((ScaleMode::LongEdge, "longEdgeScale")),
+        Some(6) => Some((ScaleMode::ShortEdge, "shortEdgeScale")),
+        _ => None,
+    };
+    if let Some((mode, key)) = scale {
+        if let Some(px) = get(key).and_then(c1_length).and_then(|(v, u)| length_px(v, u, recipe.resolution_ppi)) {
+            recipe.scale = mode;
+            recipe.scale_value = if mode == ScaleMode::LongEdge { (px, 0) } else { (0, px) };
+        }
+    }
+
+    let never_upscale = get("neverUpscale").and_then(parse_c1_bool).unwrap_or(false);
+    if let Some(method) = get("scaleMethod").and_then(|v| v.parse::<u8>().ok()) {
+        let mut size = SizeRequest { never_upscale, ..SizeRequest::default() };
+        let recognised = match method {
+            0 => get("fixedScale").and_then(|v| c1_value(v, "amount")).map(|(amount, unit)| {
+                size.mode = SizeMode::Fixed;
+                size.fixed_percent = amount * 100.0;
+                size.unit = c1_scale_unit(unit);
+            }),
+            1 => get("widthScale").and_then(|v| c1_value(v, "width")).map(|(width, unit)| {
+                size.mode = SizeMode::Width;
+                size.width = width;
+                size.unit = c1_scale_unit(unit);
+            }),
+            2 => get("heightScale").and_then(|v| c1_value(v, "height")).map(|(height, unit)| {
+                size.mode = SizeMode::Height;
+                size.height = height;
+                size.unit = c1_scale_unit(unit);
+            }),
+            3 => get("boundingBoxScale").and_then(c1_rect).map(|(width, height, unit)| {
+                size.mode = SizeMode::Size;
+                size.width = width;
+                size.height = height;
+                size.unit = c1_scale_unit(unit);
+            }),
+            4 => get("widthByHeightScale").and_then(c1_rect).map(|(width, height, unit)| {
+                size.mode = SizeMode::WidthByHeight;
+                size.width = width;
+                size.height = height;
+                size.unit = c1_scale_unit(unit);
+            }),
+            5 => get("longEdgeScale").and_then(|v| c1_value(v, "length")).map(|(length, unit)| {
+                size.mode = SizeMode::LongEdge;
+                size.width = length;
+                size.unit = c1_scale_unit(unit);
+            }),
+            6 => get("shortEdgeScale").and_then(|v| c1_value(v, "length")).map(|(length, unit)| {
+                size.mode = SizeMode::ShortEdge;
+                size.width = length;
+                size.unit = c1_scale_unit(unit);
+            }),
+            _ => None,
+        };
+        if recognised.is_some() {
+            recipe.size = Some(size);
+        }
+    }
+
+    // C1 keeps the counter on the collection (`ZCOLLECTION.ZOUTPUTCOUNTER`),
+    // not in the recipe XML; accept it when a recipe carries the same key.
+    if let Some(start) = get("OutputCounter").and_then(|v| v.parse::<u32>().ok()) {
+        recipe.file_name_counter_start = start.max(1);
+    }
+    recipe.watermark = watermark_from_settings(&parse_watermark_xml(text));
+    recipe
+}
+
+/// `resolution` + C1 `ResolutionUnit` (`1` inch, `2` mm, `3` cm) as pixels/inch.
+fn resolution_ppi(value: f32, unit: u8) -> Option<u32> {
+    let ppi = match unit {
+        1 => value,
+        2 => value * 25.4,
+        3 => value * 2.54,
+        _ => return None,
+    };
+    (ppi.is_finite() && ppi >= 1.0).then(|| ppi.round().min(u32::MAX as f32) as u32)
+}
+
+/// `length:2048;unit:0` → `(2048.0, 0)`; C1 `ScalingUnit` 0 is pixels.
+fn c1_length(value: &str) -> Option<(f32, u8)> {
+    let mut length = None;
+    let mut unit = 0;
+    for part in value.split(';') {
+        let Some((key, val)) = part.split_once(':') else { continue };
+        match key.trim() {
+            "length" => length = val.trim().parse().ok(),
+            "unit" => unit = val.trim().parse().ok()?,
+            _ => {}
+        }
+    }
+    Some((length?, unit))
+}
+
+fn parse_c1_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" | "true" | "True" => Some(true),
+        "0" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+fn c1_value(value: &str, wanted: &str) -> Option<(f32, u8)> {
+    let mut number = None;
+    let mut unit = 0;
+    for part in value.split(';') {
+        let Some((key, val)) = part.split_once(':') else { continue };
+        match key.trim() {
+            key if key == wanted => number = val.trim().parse().ok(),
+            "unit" => unit = val.trim().parse().ok()?,
+            _ => {}
+        }
+    }
+    Some((number?, unit))
+}
+
+fn c1_rect(value: &str) -> Option<(f32, f32, u8)> {
+    let mut width = None;
+    let mut height = None;
+    let mut unit = 0;
+    for part in value.split(';') {
+        let Some((key, val)) = part.split_once(':') else { continue };
+        match key.trim() {
+            "width" => width = val.trim().parse().ok(),
+            "height" => height = val.trim().parse().ok(),
+            "unit" => unit = val.trim().parse().ok()?,
+            _ => {}
+        }
+    }
+    Some((width?, height?, unit))
+}
+
+fn c1_scale_unit(unit: u8) -> ScaleUnit {
+    ScaleUnit::from_c1(unit).unwrap_or(ScaleUnit::Pixel)
+}
+
+/// A C1 `ScalingUnit` length in pixels at `ppi`.
+fn length_px(value: f32, unit: u8, ppi: u32) -> Option<u32> {
+    let factor = match unit {
+        0 => 1.0,
+        1 => ppi as f32,
+        2 => ppi as f32 / 25.4,
+        3 => ppi as f32 / 2.54,
+        _ => return None,
+    };
+    let px = value * factor;
+    (px.is_finite() && px >= 1.0).then(|| px.round().min(u32::MAX as f32) as u32)
 }
 
 /// Rough output size in bytes for queue progress and volume warnings.
@@ -394,6 +831,8 @@ pub fn estimate_bytes(w: u32, h: u32, format: ExportFormat) -> u64 {
         ExportFormat::Tiff => 6.0,
         ExportFormat::Psd => 8.0,
         ExportFormat::Dng => 3.0,
+        ExportFormat::JpegQuickProof => 0.6,
+        ExportFormat::Original => 0.0,
     };
     let pixels = w as f64 * h as f64;
     (pixels * bytes_per_pixel) as u64 + 16 * 1024
@@ -1012,10 +1451,10 @@ fn policy_exif(info: &ImageInfo, policy: MetadataPolicy) -> Option<Vec<u8>> {
 fn policy_xmp(info: &ImageInfo, policy: MetadataPolicy) -> Option<String> {
     match policy {
         MetadataPolicy::Keywords if !info.keywords.is_empty() => Some(
-            crate::XmpMeta { rating: 0, label: String::new(), keywords: info.keywords.clone() }.packet(),
+            crate::XmpMeta { rating: 0, label: String::new(), keywords: info.keywords.clone(), ..Default::default() }.packet(),
         ),
         MetadataPolicy::RatingAndTag => Some(
-            crate::XmpMeta { rating: info.rating, label: info.color_tag.label().into(), keywords: Vec::new() }
+            crate::XmpMeta { rating: info.rating, label: info.color_tag.label().into(), keywords: Vec::new(), ..Default::default() }
                 .packet(),
         ),
         // A copyright EXIF cannot hold (non-ASCII) still has an XMP home.
@@ -1155,8 +1594,9 @@ pub fn write_export(
     write_export_pixels(dir, info, recipe, index, Pixels::Rgba8(rgba), width, height, &mut progress)
 }
 
-/// [`write_export`] for a 16-bit frame. Only PNG and TIFF carry 16 bits;
-/// any other format is an error rather than a silent 8-bit downgrade.
+/// [`write_export`] for a 16-bit frame. PNG and TIFF keep 16 bits; HEIF is
+/// quantised to 12-bit HEVC. Any other format is an error rather than a
+/// silent 8-bit downgrade.
 pub fn write_export16(
     dir: &Path,
     info: &ImageInfo,
@@ -1180,6 +1620,97 @@ fn checked_len(width: u32, height: u32) -> anyhow::Result<usize> {
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| anyhow::anyhow!("export: {width}x{height} overflows the pixel buffer"))
+}
+
+/// Per-output-sample Triangle weights, exactly as `image`'s `horizontal_sample`
+/// and `vertical_sample` build them.
+pub fn triangle_weights(src: u32, dst: u32) -> Vec<(u32, Vec<f32>)> {
+    let ratio = src as f32 / dst as f32;
+    let sratio = if ratio < 1.0 { 1.0 } else { ratio };
+    (0..dst)
+        .map(|out| {
+            let input = (out as f32 + 0.5) * ratio;
+            let left = ((input - sratio).floor() as i64).clamp(0, src as i64 - 1) as u32;
+            let right =
+                ((input + sratio).ceil() as i64).clamp(left as i64 + 1, src as i64) as u32;
+            let input = input - 0.5;
+            let mut ws = Vec::with_capacity((right - left) as usize);
+            let mut sum = 0.0;
+            for i in left..right {
+                let x = (i as f32 - input) / sratio;
+                let w = if x.abs() < 1.0 { 1.0 - x.abs() } else { 0.0 };
+                ws.push(w);
+                sum += w;
+            }
+            for w in ws.iter_mut() {
+                *w /= sum;
+            }
+            (left, ws)
+        })
+        .collect()
+}
+
+/// [`image::imageops::resize`] with `FilterType::Triangle` on 16-bit RGBA,
+/// parallel over output rows.
+///
+/// Same weights, same f32 accumulation order and the same rounding as the
+/// single-threaded original, so the output is byte-identical; only the work is
+/// spread across rayon threads.
+pub fn resize_rgba16(src: &[u16], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u16> {
+    use rayon::prelude::*;
+
+    if (tw, th) == (sw, sh) {
+        return src.to_vec();
+    }
+    if sw == 0 || sh == 0 || tw == 0 || th == 0 {
+        return vec![0; (tw as usize) * (th as usize) * 4];
+    }
+    let row = |len: u32| (len as usize) * 4;
+
+    // Vertical pass: columns are sampled into f32 rows of the source width,
+    // mirroring `vertical_sample`. Iterating the kernel taps outside the pixels
+    // keeps each accumulation in the original left-to-right order.
+    let vweights = triangle_weights(sh, th);
+    let mut tmp = vec![0f32; row(sw) * th as usize];
+    tmp.par_chunks_mut(row(sw))
+        .zip(vweights.par_iter())
+        .for_each(|(out_row, (left, ws))| {
+            for (i, w) in ws.iter().enumerate() {
+                let tap = (left + i as u32) as usize * row(sw);
+                for x in 0..sw as usize {
+                    let p = tap + x * 4;
+                    for c in 0..4 {
+                        out_row[x * 4 + c] += src[p + c] as f32 * *w;
+                    }
+                }
+            }
+        });
+
+    let hweights = triangle_weights(sw, tw);
+    let mut out = vec![0u16; row(tw) * th as usize];
+    out.par_chunks_mut(row(tw)).enumerate().for_each(|(y, out_row)| {
+        let base = y * row(sw);
+        for (outx, (left, ws)) in hweights.iter().enumerate() {
+            let mut t = [0f32; 4];
+            for (i, w) in ws.iter().enumerate() {
+                let p = base + (left + i as u32) as usize * 4;
+                for c in 0..4 {
+                    t[c] += tmp[p + c] * *w;
+                }
+            }
+            for c in 0..4 {
+                let v = if t[c] < 0.0 {
+                    0.0
+                } else if t[c] > 65535.0 {
+                    65535.0
+                } else {
+                    t[c]
+                };
+                out_row[outx * 4 + c] = v.round() as u16;
+            }
+        }
+    });
+    out
 }
 
 fn narrow_from_wide(rgba: &[u16]) -> Vec<u8> {
@@ -1221,9 +1752,7 @@ fn write_export_pixels(
     let (tw, th) = output_size(recipe, (width, height));
     let mut rgba = if let Some(wide) = wide.as_mut() {
         if (tw, th) != (width, height) {
-            let img = image::ImageBuffer::<image::Rgba<u16>, _>::from_raw(width, height, std::mem::take(wide))
-                .ok_or_else(|| anyhow::anyhow!("engine returned a buffer of the wrong size"))?;
-            *wide = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw();
+            *wide = resize_rgba16(&std::mem::take(wide), width, height, tw, th);
         }
         narrow_from_wide(wide)
     } else if (tw, th) != (width, height) {
@@ -1233,23 +1762,39 @@ fn write_export_pixels(
     } else {
         rgba
     };
-    let develop8 = wide.is_some().then(|| rgba.clone());
+    // The 8-bit frame is only needed when a later stage edits it and the change
+    // must be folded back into the 16-bit buffer. With no sharpening, watermark
+    // or profile the two are identical, so the clone and the fold are skipped.
+    let profile = resolve_profile(&recipe.icc_profile);
+    // C1's Control=2 (LensAndSharpening) clears the output-sharpening pass.
+    // Control=0/1 and a missing key keep the previous behaviour. This is based
+    // on the decompiled C1 management chain; it has not been pixel-tested
+    // against a C1 export.
+    let sharpen = match recipe.output_sharpening_settings {
+        Some(settings) => settings.control != 2 && settings.amount > 0.0,
+        None => !matches!(recipe.output_sharpening, OutputSharpening::Disabled),
+    };
+    let edits_8bit = profile.is_some()
+        || recipe.watermark.is_some()
+        || sharpen;
+    let develop8 = (wide.is_some() && edits_8bit).then(|| rgba.clone());
     let amount = match recipe.output_sharpening {
         OutputSharpening::Disabled => 0.0,
         OutputSharpening::Screen => 0.6,
         OutputSharpening::Print => 1.0,
     };
-    if let Some(settings) = recipe.output_sharpening_settings {
-        output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
-    } else {
-        output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0);
+    if sharpen {
+        if let Some(settings) = recipe.output_sharpening_settings {
+            output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
+        } else {
+            output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0);
+        }
     }
-    // shortcut: Control/Method/viewing distance are saved but not applied; C1
-    // semantics are unproven, revisit with real output pairs.
+    // Method and viewing distance are still saved but not applied; C1
+    // semantics for those are unproven.
 
     // The rendered buffer is gamma-encoded sRGB. Converting it into the
     // recipe's profile is what makes the profile take effect.
-    let profile = resolve_profile(&recipe.icc_profile);
     if profile.is_none() {
         log::warn!("export: ICC profile '{}' not found, writing untagged sRGB", recipe.icc_profile);
     }
@@ -1377,8 +1922,25 @@ fn encode(
                 encoder.write_image(&bytes, w, h, wide_color)?;
                 return Ok((out.into_inner(), "tif"));
             }
+            ExportFormat::Heif => {
+                // HEVC tops out at 12 bits (`hvcC` cannot signal 16), so the
+                // 16-bit buffer is quantised to 12-bit 4:4:4 rather than rejected.
+                return Ok((
+                    crate::heif_write::encode_rgb16_to_vec(
+                        wide,
+                        w,
+                        h,
+                        12,
+                        recipe.quality.clamp(1, 100),
+                        icc,
+                        exif,
+                        xmp,
+                    )?,
+                    "heic",
+                ));
+            }
             other => anyhow::bail!(
-                "export: {other:?} has no 16-bit encoder; use PNG or TIFF"
+                "export: {other:?} has no 16-bit encoder; use PNG, TIFF or HEIF"
             ),
         }
     }
@@ -1511,6 +2073,9 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod watermark_27_fixtures;
+    mod size_27_fixtures;
+    mod outsharp_27_fixtures;
     use crate::catalog::{ColorTag, Exif, FileKind, ImageId, Iptc};
 
     fn info() -> ImageInfo {
@@ -1538,6 +2103,410 @@ mod tests {
         ProcessRecipe { scale, scale_value: value, ..ProcessRecipe::default() }
     }
 
+    #[test]
+    fn parses_real_recipe_output_sharpening_keys() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/recipes/JPEG - 2048px 网络使用.xml");
+        let text = std::fs::read_to_string(path).unwrap();
+        let settings = parse_output_sharpening_xml(&text);
+        assert_eq!(settings.amount, 60.0);
+        assert!((settings.radius - 0.6).abs() < 1e-7);
+        assert_eq!(settings.threshold, 0.0);
+        assert_eq!(settings.control, 0);
+        assert_eq!(settings.method, 0);
+        assert_eq!(settings.viewing_distance, 100);
+        assert_eq!(settings.viewing_distance_unit, 3);
+    }
+
+    #[test]
+    fn parses_all_watermark_keys_and_keeps_token_text() {
+        let xml = r#"<OR>
+            <E K="WatermarkType" V="0" />
+            <E K="WatermarkText" V="&lt;TokenName Version=&quot;2&quot; /&gt;" />
+            <E K="WatermarkFontName" V="Microsoft Sans Serif" />
+            <E K="WatermarkFontType" V="0" />
+            <E K="WatermarkFontSize" V="300" />
+            <E K="WatermarkPixelFontSize" V="300" />
+            <E K="WatermarkPointFontSize" V="18" />
+            <E K="WatermarkTextScale" V="1" />
+            <E K="WatermarkTextRelativeSize" V="0" />
+            <E K="WatermarkTextOpacity" V="0.5" />
+            <E K="WatermarkColor" V="red:0.999916017055511;green:1;blue:0.999843895435333;" />
+            <E K="WatermarkUnderline" V="0" />
+            <E K="WatermarkUnderlineColor" V="red:0.999916017055511;green:1;blue:0.999843895435333;" />
+            <E K="WatermarkStrikeThrough" V="0" />
+            <E K="WatermarkStrikeThroughColor" V="red:0.999916017055511;green:1;blue:0.999843895435333;" />
+            <E K="WatermarkHTextPlacement" V="0.5" />
+            <E K="WatermarkVTextPlacement" V="0.5" />
+            <E K="WatermarkImageFilePath" V="" />
+            <E K="WatermarkImageOpacity" V="0.5" />
+            <E K="WatermarkImageScale" V="1" />
+            <E K="WatermarkHImagePlacement" V="0.5" />
+            <E K="WatermarkVImagePlacement" V="0.5" />
+        </OR>"#;
+        let settings = parse_watermark_xml(xml);
+
+        assert_eq!(settings.watermark_type, Some(0));
+        assert_eq!(settings.text.as_deref(), Some(r#"<TokenName Version="2" />"#));
+        assert_eq!(settings.font_name.as_deref(), Some("Microsoft Sans Serif"));
+        assert_eq!(settings.font_type, Some(0));
+        assert_eq!(settings.font_size, Some(300.0));
+        assert_eq!(settings.pixel_font_size, Some(300.0));
+        assert_eq!(settings.point_font_size, Some(18.0));
+        assert_eq!(settings.text_scale, Some(1.0));
+        assert_eq!(settings.text_relative_size, Some(0.0));
+        assert_eq!(settings.text_opacity, Some(0.5));
+        assert_eq!(
+            settings.color.as_deref(),
+            Some("red:0.999916017055511;green:1;blue:0.999843895435333;")
+        );
+        assert_eq!(settings.underline, Some(0));
+        assert_eq!(
+            settings.underline_color.as_deref(),
+            Some("red:0.999916017055511;green:1;blue:0.999843895435333;")
+        );
+        assert_eq!(settings.strike_through, Some(0));
+        assert_eq!(
+            settings.strike_through_color.as_deref(),
+            Some("red:0.999916017055511;green:1;blue:0.999843895435333;")
+        );
+        assert_eq!(settings.h_text_placement, Some(0.5));
+        assert_eq!(settings.v_text_placement, Some(0.5));
+        assert_eq!(settings.image_file_path.as_deref(), Some(""));
+        assert_eq!(settings.image_opacity, Some(0.5));
+        assert_eq!(settings.image_scale, Some(1.0));
+        assert_eq!(settings.h_image_placement, Some(0.5));
+        assert_eq!(settings.v_image_placement, Some(0.5));
+    }
+
+    #[test]
+    fn watermark_missing_and_unknown_keys_stay_none() {
+        let empty = parse_watermark_xml(r#"<OR><E K="Name" V="x" /></OR>"#);
+        assert_eq!(empty, WatermarkSettings::default());
+
+        let bad = parse_watermark_xml(
+            r#"<OR>
+                <E K="WatermarkType" V="x" />
+                <E K="WatermarkFontSize" V="NaN" />
+                <E K="WatermarkText" V="" />
+                <E K="WatermarkImageFilePath" V="" />
+            </OR>"#,
+        );
+        assert_eq!(bad.watermark_type, None);
+        assert_eq!(bad.font_size, None);
+        assert_eq!(bad.text.as_deref(), Some(""));
+        assert_eq!(bad.image_file_path.as_deref(), Some(""));
+        assert_eq!(bad.font_name, None);
+
+        let unknown = parse_watermark_xml(r#"<OR><E K="WatermarkRotation" V="45" /></OR>"#);
+        assert_eq!(unknown, WatermarkSettings::default());
+    }
+
+    #[test]
+    fn watermark_parse_local_c1_recipes() {
+        fn collect_xml(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect_xml(&path, out);
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("xml"))
+                    .unwrap_or(false)
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let explicit = std::env::var_os("AURORA_C1_RECIPES").map(PathBuf::from);
+        let dir = explicit.clone().or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|path| PathBuf::from(path).join("CaptureOne").join("Recipes165"))
+        });
+        let Some(dir) = dir else {
+            return;
+        };
+        if !dir.is_dir() {
+            if explicit.is_some() {
+                panic!("AURORA_C1_RECIPES does not exist: {}", dir.display());
+            }
+            return;
+        }
+
+        let mut paths = Vec::new();
+        collect_xml(&dir, &mut paths);
+        assert!(paths.len() >= 9, "expected at least 9 recipes, found {}", paths.len());
+        let mut token_count = 0;
+        for path in &paths {
+            let text = std::fs::read_to_string(path).unwrap();
+            let settings = parse_watermark_xml(&text);
+            assert!(settings.text.is_some(), "missing WatermarkText in {}", path.display());
+            if let Some(text) = settings.text.as_deref() {
+                if text.contains("TokenName") {
+                    token_count += 1;
+                }
+            }
+        }
+        assert!(token_count >= 1, "no WatermarkText token found");
+    }
+
+    fn watermark_bounds(mark: &Watermark, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        draw_watermark(&mut rgba, w, h, mark);
+        let mut min_x = w;
+        let mut min_y = h;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        let mut any = false;
+        for y in 0..h {
+            for x in 0..w {
+                let at = ((y as usize) * (w as usize) + x as usize) * 4;
+                if rgba[at] > 0 {
+                    any = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        any.then_some((min_x, min_y, max_x, max_y))
+    }
+
+    #[test]
+    fn watermark_mapping_uses_clear_c1_units() {
+        let xml = r#"<OR>
+            <E K="WatermarkType" V="1" />
+            <E K="WatermarkText" V="W" />
+            <E K="WatermarkTextOpacity" V="0.5" />
+            <E K="WatermarkTextScale" V="2" />
+            <E K="WatermarkHTextPlacement" V="0.1" />
+            <E K="WatermarkVTextPlacement" V="0.9" />
+        </OR>"#;
+        let recipe = recipe_from_xml(xml);
+        let mark = recipe.watermark.as_ref().unwrap();
+        assert_eq!(mark.text, "W");
+        assert_eq!(mark.opacity, 50.0);
+        assert_eq!(mark.scale, 2.0);
+        assert_eq!(mark.position, [0.1, 0.9]);
+    }
+
+    #[test]
+    fn watermark_mapping_uses_c1_defaults_when_optional_values_are_missing() {
+        let xml = r#"<OR><E K="WatermarkType" V="1" /><E K="WatermarkText" V="W" /></OR>"#;
+        let recipe = recipe_from_xml(xml);
+        let mark = recipe.watermark.as_ref().unwrap();
+        assert_eq!(mark.opacity, 50.0);
+        assert_eq!(mark.scale, 1.0);
+        assert_eq!(mark.position, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn watermark_empty_token_wrapper_is_not_text() {
+        let xml = r#"<OR>
+            <E K="WatermarkType" V="1" />
+            <E K="WatermarkText" V="&lt;TokenName Version=&quot;2&quot; /&gt;" />
+        </OR>"#;
+        let recipe = recipe_from_xml(xml);
+        assert_eq!(recipe.watermark, None);
+    }
+
+    #[test]
+    fn all_27_local_recipes_never_draw_a_watermark() {
+        assert_eq!(watermark_27_fixtures::RECIPES.len(), 27);
+        let mut wrappers = 0;
+        for (name, xml) in watermark_27_fixtures::RECIPES {
+            let mut recipe = recipe_from_xml(xml);
+            assert_eq!(recipe.watermark, None, "{name} must not draw a watermark");
+            if xml.contains("TokenName") {
+                wrappers += 1;
+            }
+            recipe.format = ExportFormat::Png;
+            let baseline = ProcessRecipe { watermark: None, ..recipe.clone() };
+            let with_recipe = temp_dir("watermark-27-a");
+            let without = temp_dir("watermark-27-b");
+            let with_path = write_export(
+                &with_recipe,
+                &info(),
+                &recipe,
+                0,
+                vec![0u8; 32 * 32 * 4],
+                32,
+                32,
+                |_| {},
+            )
+            .unwrap();
+            let without_path = write_export(
+                &without,
+                &info(),
+                &baseline,
+                0,
+                vec![0u8; 32 * 32 * 4],
+                32,
+                32,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(&with_path).unwrap(),
+                std::fs::read(&without_path).unwrap(),
+                "{name} changed the export bytes"
+            );
+            let _ = std::fs::remove_dir_all(&with_recipe);
+            let _ = std::fs::remove_dir_all(&without);
+        }
+        assert_eq!(wrappers, 11, "expected the 11 empty TokenName wrappers");
+    }
+
+    #[test]
+    fn explicit_text_watermark_changes_bytes_and_position() {
+        let xml = r#"<OR>
+            <E K="WatermarkType" V="1" />
+            <E K="WatermarkText" V="© 2026" />
+            <E K="WatermarkTextOpacity" V="1" />
+            <E K="WatermarkHTextPlacement" V="0.1" />
+            <E K="WatermarkVTextPlacement" V="0.9" />
+        </OR>"#;
+        let mut recipe = recipe_from_xml(xml);
+        let mark = recipe.watermark.as_ref().expect("explicit text must draw");
+        assert_eq!(mark.text, "© 2026");
+        let bounds = watermark_bounds(mark, 256, 64).expect("explicit text must paint pixels");
+        assert!(bounds.0 < 64, "expected the text on the left: {bounds:?}");
+        assert!(bounds.1 > 32, "expected the text near the bottom: {bounds:?}");
+
+        recipe.format = ExportFormat::Png;
+        let baseline = ProcessRecipe { watermark: None, ..recipe.clone() };
+        let with_mark = temp_dir("watermark-explicit-a");
+        let without = temp_dir("watermark-explicit-b");
+        let with_path =
+            write_export(&with_mark, &info(), &recipe, 0, vec![0u8; 64 * 64 * 4], 64, 64, |_| {})
+                .unwrap();
+        let without_path =
+            write_export(&without, &info(), &baseline, 0, vec![0u8; 64 * 64 * 4], 64, 64, |_| {})
+                .unwrap();
+        assert_ne!(
+            std::fs::read(&with_path).unwrap(),
+            std::fs::read(&without_path).unwrap(),
+            "explicit text must change the export bytes"
+        );
+        let _ = std::fs::remove_dir_all(&with_mark);
+        let _ = std::fs::remove_dir_all(&without);
+
+        let token = r#"<OR>
+            <E K="WatermarkType" V="1" />
+            <E K="WatermarkText" V="&lt;TokenName Version=&quot;2&quot;&gt;&lt;Token Type=&quot;1&quot; /&gt;&lt;/TokenName&gt;" />
+        </OR>"#;
+        assert_eq!(recipe_from_xml(token).watermark.unwrap().text, "Image Name");
+    }
+
+    #[test]
+    fn empty_token_wrapper_matches_no_watermark_bytes() {
+        for xml in [
+            r#"<OR><E K="WatermarkType" V="1" /><E K="WatermarkText" V="&lt;TokenName Version=&quot;2&quot; /&gt;" /></OR>"#,
+            r#"<OR><E K="WatermarkType" V="1" /><E K="WatermarkText" V="   " /></OR>"#,
+        ] {
+            let mut recipe = recipe_from_xml(xml);
+            assert_eq!(recipe.watermark, None);
+            recipe.format = ExportFormat::Png;
+            let mut baseline = recipe_from_xml(
+                r#"<OR><E K="resolution" V="300" /><E K="resolutionUnit" V="1" /></OR>"#,
+            );
+            baseline.format = ExportFormat::Png;
+
+            let with_recipe = temp_dir("watermark-empty-a");
+            let without = temp_dir("watermark-empty-b");
+            let with_path = write_export(
+                &with_recipe,
+                &info(),
+                &recipe,
+                0,
+                vec![0u8; 32 * 32 * 4],
+                32,
+                32,
+                |_| {},
+            )
+            .unwrap();
+            let without_path = write_export(
+                &without,
+                &info(),
+                &baseline,
+                0,
+                vec![0u8; 32 * 32 * 4],
+                32,
+                32,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(&with_path).unwrap(),
+                std::fs::read(&without_path).unwrap()
+            );
+            let _ = std::fs::remove_dir_all(&with_recipe);
+            let _ = std::fs::remove_dir_all(&without);
+        }
+    }
+
+    #[test]
+    fn watermark_position_mapping_moves_pixels() {
+        let low_xml = r#"<OR>
+            <E K="WatermarkType" V="1" />
+            <E K="WatermarkText" V="W" />
+            <E K="WatermarkTextOpacity" V="1" />
+            <E K="WatermarkHTextPlacement" V="0.1" />
+            <E K="WatermarkVTextPlacement" V="0.1" />
+        </OR>"#;
+        let high_xml = r#"<OR>
+            <E K="WatermarkType" V="1" />
+            <E K="WatermarkText" V="W" />
+            <E K="WatermarkTextOpacity" V="1" />
+            <E K="WatermarkHTextPlacement" V="0.9" />
+            <E K="WatermarkVTextPlacement" V="0.9" />
+        </OR>"#;
+        let low = recipe_from_xml(low_xml).watermark.unwrap();
+        let high = recipe_from_xml(high_xml).watermark.unwrap();
+        let low_bounds = watermark_bounds(&low, 64, 64).unwrap();
+        let high_bounds = watermark_bounds(&high, 64, 64).unwrap();
+        assert!(low_bounds.0 < 16 && low_bounds.1 < 16, "low: {low_bounds:?}");
+        assert!(high_bounds.0 > 32 && high_bounds.1 > 32, "high: {high_bounds:?}");
+    }
+
+    #[test]
+    fn image_watermark_type_is_not_mapped_to_text() {
+        let text_type = r#"<OR><E K="WatermarkType" V="1" /><E K="WatermarkText" V="W" /></OR>"#;
+        assert!(recipe_from_xml(text_type).watermark.is_some());
+
+        let image_type = r#"<OR><E K="WatermarkType" V="2" /><E K="WatermarkText" V="W" /></OR>"#;
+        assert_eq!(recipe_from_xml(image_type).watermark, None);
+
+        let image_path = r#"<OR>
+            <E K="WatermarkType" V="0" />
+            <E K="WatermarkText" V="W" />
+            <E K="WatermarkImageFilePath" V="logo.png" />
+        </OR>"#;
+        assert_eq!(recipe_from_xml(image_path).watermark, None);
+    }
+
+    #[test]
+    fn watermark_absent_xml_keeps_export_bytes() {
+        let xml = r#"<OR>
+            <E K="resolution" V="300" />
+            <E K="resolutionUnit" V="1" />
+            <E K="scaleMethod" V="0" />
+        </OR>"#;
+        let mut recipe = recipe_from_xml(xml);
+        assert_eq!(recipe.watermark, None);
+        recipe.format = ExportFormat::Png;
+        let first = temp_dir("watermark-absent-a");
+        let second = temp_dir("watermark-absent-b");
+        let first_path =
+            write_export(&first, &info(), &recipe, 0, vec![0u8; 32 * 32 * 4], 32, 32, |_| {}).unwrap();
+        let second_path =
+            write_export(&second, &info(), &recipe, 0, vec![0u8; 32 * 32 * 4], 32, 32, |_| {}).unwrap();
+        assert_eq!(std::fs::read(first_path).unwrap(), std::fs::read(second_path).unwrap());
+        std::fs::remove_dir_all(first).unwrap();
+        std::fs::remove_dir_all(second).unwrap();
+    }
 
     #[test]
     fn missing_or_bad_output_sharpening_fields_fall_back_conservatively() {
@@ -1597,10 +2566,167 @@ mod tests {
     }
 
     #[test]
+    fn all_27_size_fixtures_calculate_expected_pixels() {
+        assert_eq!(size_27_fixtures::RECIPES.len(), 27);
+        let (mut fixed, mut width, mut long, mut size) = (0, 0, 0, 0);
+        for (name, xml) in size_27_fixtures::RECIPES {
+            let recipe = recipe_from_xml(xml);
+            let request = recipe.size.as_ref().unwrap_or_else(|| panic!("{name}: no size request"));
+            match request.mode {
+                SizeMode::Fixed => {
+                    fixed += 1;
+                    assert!((request.fixed_percent - 100.0).abs() < 1e-4, "{name}");
+                    assert_eq!(target_size(&recipe, (3000, 2000)).unwrap(), (3000, 2000), "{name}");
+                }
+                SizeMode::Width => {
+                    width += 1;
+                    assert_eq!(request.unit, ScaleUnit::Pixel, "{name}");
+                    assert_eq!(target_size(&recipe, (3000, 2000)).unwrap(), (1080, 720), "{name}");
+                }
+                SizeMode::LongEdge => {
+                    long += 1;
+                    assert_eq!(request.unit, ScaleUnit::Pixel, "{name}");
+                    assert_eq!(target_size(&recipe, (3000, 2000)).unwrap(), (2048, 1365), "{name}");
+                }
+                SizeMode::Size => {
+                    size += 1;
+                    assert_eq!(request.unit, ScaleUnit::Centimeter, "{name}");
+                    assert_eq!(target_size(&recipe, (4961, 3508)).unwrap(), (4961, 3508), "{name}");
+                }
+                other => panic!("{name}: unexpected size mode {other:?}"),
+            }
+        }
+        assert_eq!((fixed, width, long, size), (18, 3, 3, 3));
+    }
+
+    #[test]
+    fn size_defaults_errors_and_export_path_stay_independent() {
+        let empty = recipe_from_xml("<OR></OR>");
+        assert_eq!(empty.size, None);
+        assert_eq!(target_size(&empty, (100, 80)).unwrap(), (100, 80));
+        assert_eq!(output_size(&empty, (100, 80)), (100, 80));
+
+        let width_xml = r#"<OR>
+            <E K="scaleMethod" V="1" />
+            <E K="widthScale" V="width:1080;unit:0" />
+        </OR>"#;
+        let width = recipe_from_xml(width_xml);
+        assert_eq!(target_size(&width, (3000, 2000)).unwrap(), (1080, 720));
+        assert_eq!(
+            output_size(&width, (3000, 2000)),
+            (3000, 2000),
+            "size parsing must not wire output_size"
+        );
+
+        let a3_xml = r#"<OR>
+            <E K="scaleMethod" V="3" />
+            <E K="boundingBoxScale" V="height:29.7000007629395;width:42;unit:3" />
+            <E K="resolution" V="300" />
+            <E K="resolutionUnit" V="1" />
+        </OR>"#;
+        let mut a3 = recipe_from_xml(a3_xml);
+        assert_eq!(
+            target_size(&a3, (2000, 2000)).unwrap(),
+            (3508, 3508),
+            "42x29.7cm at 300ppi is a 4961x3508 box"
+        );
+        a3.resolution_ppi = 0;
+        assert_eq!(target_size(&a3, (4961, 3508)).unwrap(), (4961, 3508), "missing DPI uses 300");
+
+        let unknown_unit = recipe_from_xml(
+            r#"<OR><E K="scaleMethod" V="1" /><E K="widthScale" V="width:1080;unit:99" /></OR>"#,
+        );
+        assert_eq!(unknown_unit.size.unwrap().unit, ScaleUnit::Pixel);
+        assert_eq!(target_size(&unknown_unit, (3000, 2000)).unwrap(), (1080, 720));
+
+        assert!(matches!(target_size(&width, (0, 2000)), Err(SizeError::EmptySource)));
+        let unknown_method = recipe_from_xml(
+            r#"<OR><E K="scaleMethod" V="99" /><E K="widthScale" V="width:1080;unit:0" /></OR>"#,
+        );
+        assert_eq!(unknown_method.size, None);
+        assert_eq!(target_size(&unknown_method, (100, 80)).unwrap(), (100, 80));
+    }
+
+    #[test]
+    fn c1_rounding_is_ties_to_even() {
+        assert_eq!(round_ties_even(2.5), 2);
+        assert_eq!(round_ties_even(3.5), 4);
+        assert_eq!(round_ties_even(1365.333), 1365);
+    }
+
+    #[test]
+    fn size_absent_xml_keeps_export_bytes() {
+        let parsed = recipe_from_xml("<OR></OR>");
+        assert_eq!(parsed, ProcessRecipe::default());
+
+        let mut first_recipe = parsed;
+        first_recipe.format = ExportFormat::Png;
+        let mut second_recipe = ProcessRecipe::default();
+        second_recipe.format = ExportFormat::Png;
+        let first = temp_dir("size-absent-a");
+        let second = temp_dir("size-absent-b");
+        let first_path = write_export(
+            &first,
+            &info(),
+            &first_recipe,
+            0,
+            vec![0u8; 32 * 32 * 4],
+            32,
+            32,
+            |_| {},
+        )
+        .unwrap();
+        let second_path = write_export(
+            &second,
+            &info(),
+            &second_recipe,
+            0,
+            vec![0u8; 32 * 32 * 4],
+            32,
+            32,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(first_path).unwrap(), std::fs::read(second_path).unwrap());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn quickproof_and_original_are_enum_only() {
+        assert_eq!(ExportFormat::ALL.len(), 10);
+        for format in [ExportFormat::JpegQuickProof, ExportFormat::Original] {
+            assert!(!format.is_supported(), "{format:?}");
+            assert!(format.ensure_supported().is_err(), "{format:?}");
+        }
+        assert_eq!(ExportFormat::JpegQuickProof.extension(), "jpg");
+        assert!(ExportFormat::Original.supports_bit_depth(8).is_err());
+    }
+
+    #[test]
     fn name_expands_every_placeholder() {
         let mut r = recipe(ScaleMode::Fixed100, (0, 0));
         r.file_name_format = "{name}_{date}_r{rating}_v{variant}_{seq}_{counter}".into();
         assert_eq!(output_name(&r, &info(), 5), "DSC_0042_20261110_r4_v2_005_5");
+    }
+
+    /// The C1 counter starts at `ZOUTPUTCOUNTER`, not always at one.
+    #[test]
+    fn capture_one_recipe_document_and_format_tokens_expand() {
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.name = "Web JPEG".into();
+        r.file_name_format = "[Recipe Name]_[Document Name]_[Format]".into();
+        assert_eq!(output_name(&r, &info(), 1), "Web JPEG_DSC_0042_JPEG");
+    }
+
+    #[test]
+    fn counter_start_moves_the_first_name() {
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.file_name_format = "{counter}".into();
+        assert_eq!(output_name(&r, &info(), 1), "1");
+        r.file_name_counter_start = 17;
+        assert_eq!(output_name(&r, &info(), 1), "17");
+        assert_eq!(output_name(&r, &info(), 3), "19");
     }
 
     #[test]
@@ -1608,6 +2734,20 @@ mod tests {
         let mut r = recipe(ScaleMode::Fixed100, (0, 0));
         r.file_name_format = "[Image Name]-[Counter]".into();
         assert_eq!(output_name(&r, &info(), 3), "DSC_0042-3");
+    }
+
+    #[test]
+    fn name_expands_camera_and_lens_tokens() {
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.file_name_format = "{make}_{model}_{lens}".into();
+        assert_eq!(output_name(&r, &info(), 0), "__");
+
+        let mut info = info();
+        info.exif.camera_make = Some("Portrait".into());
+        info.exif.camera_model = Some("Synthetic One".into());
+        info.exif.lens = Some("50mm".into());
+        r.file_name_format = "[Camera Make]-[Model]-[Lens]".into();
+        assert_eq!(output_name(&r, &info, 0), "Portrait-Synthetic One-50mm");
     }
 
     #[test]
@@ -1622,7 +2762,7 @@ mod tests {
     #[test]
     fn collision_appends_suffix() {
         let dir = std::env::temp_dir().join(format!(
-            "lumen-recipe-{}-{}",
+            "portrait-recipe-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -1668,6 +2808,21 @@ mod tests {
         assert_eq!(px[0], before[0], "flat area away from the edge is untouched");
     }
 
+    /// The parallel 16-bit resize must stay byte-identical to the single-threaded
+    /// one it replaces.
+    #[test]
+    fn parallel_resize_matches_the_single_threaded_one() {
+        let (sw, sh) = (64u32, 48u32);
+        let src: Vec<u16> = (0..sw * sh * 4).map(|i| ((i * 37) % 65535) as u16).collect();
+        for (tw, th) in [(31u32, 23u32), (128, 96)] {
+            let img = image::ImageBuffer::<image::Rgba<u16>, _>::from_raw(sw, sh, src.clone())
+                .expect("source buffer");
+            let expected =
+                image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw();
+            assert_eq!(resize_rgba16(&src, sw, sh, tw, th), expected, "{tw}x{th}");
+        }
+    }
+
     #[test]
     fn sharpen_threshold_skips_small_detail() {
         let mut px = vec![0u8; 16 * 4];
@@ -1687,7 +2842,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "lumen-export-{tag}-{}-{}",
+            "portrait-export-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -1755,6 +2910,169 @@ mod tests {
 
         assert_eq!(unchanged, px);
         assert_ne!(unchanged, sharpened);
+    }
+
+    #[test]
+    fn control_two_18_real_recipes_keep_the_same_bytes() {
+        assert_eq!(outsharp_27_fixtures::RECIPES.len(), 27);
+        let mut control_two = 0;
+        let pixels: Vec<u8> = (0..64 * 64 * 4).map(|i| ((i / 4) * 37 % 256) as u8).collect();
+        for (name, xml) in outsharp_27_fixtures::RECIPES {
+            let mut recipe = recipe_from_xml(xml);
+            let Some(settings) = recipe.output_sharpening_settings else {
+                panic!("{name}: no sharpening settings");
+            };
+            if settings.control != 2 {
+                continue;
+            }
+            control_two += 1;
+            recipe.format = ExportFormat::Png;
+            let mut baseline = recipe.clone();
+            baseline.output_sharpening_settings = None;
+
+            let with = temp_dir("outsharp-two-a");
+            let without = temp_dir("outsharp-two-b");
+            let with_path =
+                write_export(&with, &info(), &recipe, 0, pixels.clone(), 64, 64, |_| {}).unwrap();
+            let without_path =
+                write_export(&without, &info(), &baseline, 0, pixels.clone(), 64, 64, |_| {}).unwrap();
+            assert_eq!(
+                std::fs::read(&with_path).unwrap(),
+                std::fs::read(&without_path).unwrap(),
+                "{name}: Control=2 must not change the bytes"
+            );
+            let _ = std::fs::remove_dir_all(&with);
+            let _ = std::fs::remove_dir_all(&without);
+        }
+        assert_eq!(control_two, 18, "expected the 18 Control=2 recipes");
+    }
+
+    #[test]
+    fn control_two_skips_the_16bit_fold_path() {
+        let xml = r#"<OR>
+            <E K="SharpeningOutputControl" V="2" />
+            <E K="SharpeningOutputAmount" V="80" />
+            <E K="SharpeningOutputRadius" V="0.6" />
+            <E K="SharpeningOutputThreshold" V="0" />
+        </OR>"#;
+        let mut recipe = recipe_from_xml(xml);
+        recipe.format = ExportFormat::Png;
+        recipe.bit_depth = 16;
+        let mut baseline = recipe.clone();
+        baseline.output_sharpening_settings = None;
+        let pixels: Vec<u16> = (0..64 * 64 * 4).map(|i| ((i / 4) * 37 % 65536) as u16).collect();
+        let with = temp_dir("outsharp-two16-a");
+        let without = temp_dir("outsharp-two16-b");
+        let with_path =
+            write_export16(&with, &info(), &recipe, 0, pixels.clone(), 64, 64, |_| {}).unwrap();
+        let without_path =
+            write_export16(&without, &info(), &baseline, 0, pixels, 64, 64, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read(&with_path).unwrap(),
+            std::fs::read(&without_path).unwrap(),
+            "Control=2 must also skip the 16-bit 8-bit-fold path"
+        );
+        let _ = std::fs::remove_dir_all(&with);
+        let _ = std::fs::remove_dir_all(&without);
+    }
+
+    fn high_freq_energy(path: &Path) -> f64 {
+        let image = image::open(path).unwrap().to_luma8();
+        let (w, h) = image.dimensions();
+        let mut sum = 0.0;
+        let mut count = 0u64;
+        for y in 1..h - 1 {
+            for x in 1..w - 1 {
+                let at = |x: u32, y: u32| image.get_pixel(x, y)[0] as f64;
+                let center = at(x, y);
+                let laplacian =
+                    4.0 * center - at(x - 1, y) - at(x + 1, y) - at(x, y - 1) - at(x, y + 1);
+                sum += laplacian * laplacian;
+                count += 1;
+            }
+        }
+        sum / count.max(1) as f64
+    }
+
+    #[test]
+    fn control_zero_amount_eighty_increases_high_frequency() {
+        let xml = r#"<OR>
+            <E K="SharpeningOutputControl" V="0" />
+            <E K="SharpeningOutputAmount" V="80" />
+            <E K="SharpeningOutputRadius" V="0.6" />
+            <E K="SharpeningOutputThreshold" V="0" />
+        </OR>"#;
+        let mut sharpened = recipe_from_xml(xml);
+        assert_eq!(sharpened.output_sharpening_settings.unwrap().control, 0);
+        sharpened.format = ExportFormat::Png;
+        let mut baseline = sharpened.clone();
+        baseline.output_sharpening_settings = None;
+        let pixels: Vec<u8> = (0..64 * 64 * 4).map(|i| ((i / 4) * 37 % 256) as u8).collect();
+        let with = temp_dir("outsharp-zero-a");
+        let without = temp_dir("outsharp-zero-b");
+        let with_path =
+            write_export(&with, &info(), &sharpened, 0, pixels.clone(), 64, 64, |_| {}).unwrap();
+        let without_path =
+            write_export(&without, &info(), &baseline, 0, pixels, 64, 64, |_| {}).unwrap();
+        assert_ne!(
+            std::fs::read(&with_path).unwrap(),
+            std::fs::read(&without_path).unwrap(),
+            "Control=0 + Amount=80 must still sharpen"
+        );
+        let sharp_energy = high_freq_energy(&with_path);
+        let base_energy = high_freq_energy(&without_path);
+        assert!(
+            sharp_energy > base_energy * 1.01,
+            "high-frequency energy did not rise: sharp={sharp_energy}, base={base_energy}"
+        );
+        let _ = std::fs::remove_dir_all(&with);
+        let _ = std::fs::remove_dir_all(&without);
+    }
+
+    #[test]
+    fn control_one_keeps_the_same_sharpening_as_control_zero() {
+        let make = |control: u8| {
+            let xml = format!(
+                r#"<OR>
+                    <E K="SharpeningOutputControl" V="{control}" />
+                    <E K="SharpeningOutputAmount" V="80" />
+                    <E K="SharpeningOutputRadius" V="0.6" />
+                    <E K="SharpeningOutputThreshold" V="0" />
+                </OR>"#
+            );
+            let mut recipe = recipe_from_xml(&xml);
+            recipe.format = ExportFormat::Png;
+            recipe
+        };
+        let pixels: Vec<u8> = (0..64 * 64 * 4).map(|i| ((i / 4) * 37 % 256) as u8).collect();
+        let zero = temp_dir("outsharp-one-zero");
+        let one = temp_dir("outsharp-one-one");
+        let zero_path = write_export(&zero, &info(), &make(0), 0, pixels.clone(), 64, 64, |_| {}).unwrap();
+        let one_path = write_export(&one, &info(), &make(1), 0, pixels, 64, 64, |_| {}).unwrap();
+        assert_eq!(std::fs::read(zero_path).unwrap(), std::fs::read(one_path).unwrap());
+        let _ = std::fs::remove_dir_all(&zero);
+        let _ = std::fs::remove_dir_all(&one);
+    }
+
+    #[test]
+    fn outsharp_absent_xml_keeps_export_bytes() {
+        let parsed = recipe_from_xml("<OR></OR>");
+        assert_eq!(parsed.output_sharpening_settings, None);
+        let mut first_recipe = parsed;
+        first_recipe.format = ExportFormat::Png;
+        let mut second_recipe = ProcessRecipe::default();
+        second_recipe.format = ExportFormat::Png;
+        let first = temp_dir("outsharp-absent-a");
+        let second = temp_dir("outsharp-absent-b");
+        let first_path =
+            write_export(&first, &info(), &first_recipe, 0, vec![0u8; 32 * 32 * 4], 32, 32, |_| {})
+                .unwrap();
+        let second_path =
+            write_export(&second, &info(), &second_recipe, 0, vec![0u8; 32 * 32 * 4], 32, 32, |_| {})
+                .unwrap();
+        assert_eq!(std::fs::read(first_path).unwrap(), std::fs::read(second_path).unwrap());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]
@@ -1837,7 +3155,7 @@ mod tests {
             assert!(format.supports_bit_depth(8).is_ok(), "{format:?}");
             assert_eq!(
                 format.supports_bit_depth(16).is_ok(),
-                matches!(format, ExportFormat::Png | ExportFormat::Tiff),
+                matches!(format, ExportFormat::Png | ExportFormat::Tiff | ExportFormat::Heif),
                 "{format:?}"
             );
         }
@@ -1845,7 +3163,6 @@ mod tests {
 
     // --------------------------------------------------------------- ICC
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn icc_profile_changes_the_output() {
         let dir = temp_dir("icc");
@@ -1865,7 +3182,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn the_icc_profile_is_embedded_in_the_file() {
         let dir = temp_dir("icc-embed");
@@ -1898,6 +3214,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// ICC payload of the first `colr` box that carries a `prof` profile.
+    fn colr_profile(bytes: &[u8]) -> Option<&[u8]> {
+        let at = bytes.windows(4).position(|w| w == b"colr")?;
+        if bytes.get(at + 4..at + 8)? != b"prof" {
+            return None;
+        }
+        let start = at.checked_sub(4)?;
+        let size = u32::from_be_bytes(bytes.get(start..at)?.try_into().ok()?) as usize;
+        bytes.get(at + 8..start + size)
+    }
+
+    #[test]
+    fn heif_export_carries_the_recipe_icc_and_xmp_together() {
+        if !crate::heif_write::available() {
+            return;
+        }
+        let Some(target) = resolve_profile("sRGB IEC61966-2.1") else { return };
+        let source = std::fs::read(&target.path).unwrap();
+        let dir = temp_dir("heif-icc-xmp");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Heif;
+        r.icc_profile = "sRGB IEC61966-2.1".into();
+        r.include_metadata = MetadataPolicy::Keywords;
+        let mut info = info();
+        info.keywords = vec!["heif-meta".into(), "icc & xmp".into()];
+        let path = write_export(&dir, &info, &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
+        assert_eq!(path.extension().unwrap(), "heic");
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            colr_profile(&bytes),
+            Some(source.as_slice()),
+            "the recipe's ICC bytes must be embedded verbatim"
+        );
+
+        let text = crate::heif::read_xmp(&path).expect("XMP item");
+        let expected = crate::XmpMeta { keywords: info.keywords.clone(), ..Default::default() };
+        assert_eq!(crate::XmpMeta::parse(&text).unwrap(), expected);
+        assert_eq!(crate::heif::dimensions(&path).unwrap(), (8, 8));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn the_16_bit_tiff_export_keeps_the_icc_bytes() {
         let Some(target) = resolve_profile("sRGB IEC61966-2.1") else { return };
@@ -1909,12 +3267,40 @@ mod tests {
         r.bit_depth = 16;
         let path =
             write_export16(&dir, &info(), &r, 0, vec![40000u16; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_ICC_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_ICC_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let back = crate::file_engine::embedded_icc(&path).expect("ICC must read back");
         assert_eq!(back, source, "16-bit TIFF: ICC bytes must survive verbatim");
         assert!(!crate::icc::parse_icc(&back).unwrap().description.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn heif16_exports_12_bit_with_icc_and_xmp() {
+        if !crate::heif_write::available() {
+            return;
+        }
+        let Some(target) = resolve_profile("sRGB IEC61966-2.1") else { return };
+        let source = std::fs::read(&target.path).unwrap();
+        let dir = scratch_dir("heif16");
+        let mut r = recipe16(ExportFormat::Heif);
+        r.icc_profile = "sRGB IEC61966-2.1".into();
+        r.include_metadata = MetadataPolicy::Keywords;
+        let mut info = info();
+        info.keywords = vec!["heif16".into()];
+        let (w, h) = (8u32, 4u32);
+        let path = write_export16(&dir, &info, &r, 0, wide_image(w, h), w, h, |_| {}).unwrap();
+        assert_eq!(path.extension().unwrap(), "heic");
+        assert_eq!(crate::heif::bit_depth(&path), Some(12), "16-bit recipe must land at 12 bits");
+        assert_eq!(crate::heif::dimensions(&path).unwrap(), (w, h));
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(colr_profile(&bytes), Some(source.as_slice()), "ICC bytes must survive");
+
+        let text = crate::heif::read_xmp(&path).expect("XMP item");
+        let expected = crate::XmpMeta { keywords: info.keywords.clone(), ..Default::default() };
+        assert_eq!(crate::XmpMeta::parse(&text).unwrap(), expected);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1925,18 +3311,18 @@ mod tests {
         r.format = ExportFormat::Tiff;
         r.include_metadata = MetadataPolicy::Camera;
         let mut info = info();
-        info.exif.camera_make = Some("Lumen".into());
+        info.exif.camera_make = Some("Portrait".into());
         info.exif.camera_model = Some("Synthetic One".into());
-        info.exif.lens = Some("Lumen 50mm".into());
+        info.exif.lens = Some("Portrait 50mm".into());
         info.exif.iso = Some(400);
         let path = write_export(&dir, &info, &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_TIFF_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_TIFF_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let bytes = std::fs::read(&path).unwrap();
-        assert!(find(&bytes, b"Lumen\0").is_some(), "make must be in the TIFF");
+        assert!(find(&bytes, b"Portrait\0").is_some(), "make must be in the TIFF");
         assert!(find(&bytes, b"Synthetic One\0").is_some(), "model must be in the TIFF");
-        assert!(find(&bytes, b"Lumen 50mm\0").is_some(), "lens must be in the Exif sub-IFD");
+        assert!(find(&bytes, b"Portrait 50mm\0").is_some(), "lens must be in the Exif sub-IFD");
 
         assert!(image::open(&path).is_ok(), "the rewritten TIFF must still decode");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1951,7 +3337,7 @@ mod tests {
         let mut info = info();
         info.exif.gps = Some((31.2304, 121.4737));
         let path = write_export(&dir, &info, &r, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_TIFF_GPS_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_TIFF_GPS_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -1974,13 +3360,13 @@ mod tests {
         r.icc_profile = "sRGB IEC61966-2.1".into();
         r.include_metadata = MetadataPolicy::Camera;
         let mut sample = info();
-        sample.exif.camera_make = Some("Lumen".into());
+        sample.exif.camera_make = Some("Portrait".into());
         sample.exif.camera_model = Some("Synthetic One".into());
-        sample.exif.lens = Some("Lumen 50mm".into());
+        sample.exif.lens = Some("Portrait 50mm".into());
         sample.exif.iso = Some(400);
         let path =
             write_export16(&dir, &sample, &r, 0, vec![40000u16; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_TIFF16_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_TIFF16_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -1991,7 +3377,7 @@ mod tests {
         );
         let ifd0 = ifd_entries(&bytes, tiff_ifd_at(&bytes).unwrap());
         assert!(
-            ifd0.iter().any(|(tag, .., value)| *tag == 0x010F && find(value, b"Lumen").is_some()),
+            ifd0.iter().any(|(tag, .., value)| *tag == 0x010F && find(value, b"Portrait").is_some()),
             "Make must be in the 16-bit IFD0"
         );
         assert!(ifd0.iter().any(|(tag, ..)| *tag == 0x0110), "Model must be in the 16-bit IFD0");
@@ -2010,7 +3396,7 @@ mod tests {
         tagged.keywords = vec!["synthetic".into()];
         let path =
             write_export16(&dir, &tagged, &xmp, 0, vec![40000u16; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_TIFF16_XMP_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_TIFF16_XMP_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -2032,7 +3418,7 @@ mod tests {
         sample.keywords = vec!["synthetic".into()];
         let path =
             write_export(&dir, &sample, &keywords, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_TIFF_XMP_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_TIFF_XMP_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let read_packet = |bytes: &[u8]| {
@@ -2050,7 +3436,7 @@ mod tests {
         let plain = info();
         let path =
             write_export(&dir, &plain, &rated, 0, vec![90u8; 8 * 8 * 4], 8, 8, |_| {}).unwrap();
-        if let Ok(copy) = std::env::var("LUMEN_TIFF_RATING_ARTIFACT") {
+        if let Ok(copy) = std::env::var("AURORA_TIFF_RATING_ARTIFACT") {
             let _ = std::fs::copy(&path, copy);
         }
         let packet = read_packet(&std::fs::read(&path).unwrap()).expect("rating XMP must be in tag 700");
@@ -2356,7 +3742,7 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
 
         let meta = crate::XmpMeta::parse(&xmp_text(&bytes)).unwrap();
-        assert_eq!(meta, crate::XmpMeta { rating: 0, label: String::new(), keywords: info.keywords.clone() });
+        assert_eq!(meta, crate::XmpMeta { rating: 0, label: String::new(), keywords: info.keywords.clone(), ..Default::default() });
         assert!(app1(&bytes, b"Exif\0\0").is_none(), "keywords must not write EXIF");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2586,7 +3972,7 @@ mod tests {
         let text = xmp_text(&bytes);
         assert_eq!(
             crate::XmpMeta::parse(&text).unwrap(),
-            crate::XmpMeta { rating: 4, label: "Red".into(), keywords: Vec::new() }
+            crate::XmpMeta { rating: 4, label: "Red".into(), keywords: Vec::new(), ..Default::default() }
         );
         assert!(find(text.as_bytes(), b"dc:subject").is_none(), "rating does not write keywords");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2682,7 +4068,7 @@ mod tests {
         let tail = b"<?xpacket end=\"w\"?>";
         let end = start + find(&bytes[start..], tail).unwrap() + tail.len();
         let meta = crate::XmpMeta::parse(std::str::from_utf8(&bytes[start..end]).unwrap()).unwrap();
-        assert_eq!(meta, crate::XmpMeta { rating: 4, label: "Red".into(), keywords: Vec::new() });
+        assert_eq!(meta, crate::XmpMeta { rating: 4, label: "Red".into(), keywords: Vec::new(), ..Default::default() });
         assert!(find(&bytes, b"dc:subject").is_none(), "rating does not write keywords");
         assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 8, "the chunk must keep the PNG valid");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2810,7 +4196,7 @@ mod tests {
     }
 
     /// Export timings and shadow code counts for the 3000x2000 report.
-    /// `cargo test -p lumen-engine --offline bench_export16 -- --ignored --nocapture`
+    /// `cargo test -p aurora-engine --offline bench_export16 -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn bench_export16_against_8bit() {
@@ -2871,7 +4257,4 @@ mod tests {
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/recipe-tests.rs");
 }

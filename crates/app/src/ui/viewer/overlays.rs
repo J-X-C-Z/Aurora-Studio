@@ -5,7 +5,7 @@ use gpui_kit::{
     App, Entity, Hsla, IntoElement, ParentElement, PathBuilder, Styled, Window, canvas, div,
     prelude::FluentBuilder as _, px,
 };
-use lumen_engine::*;
+use aurora_engine::*;
 
 use super::Placement;
 use crate::i18n::t;

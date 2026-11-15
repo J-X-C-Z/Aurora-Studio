@@ -13,7 +13,7 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, PathPromptOptions, Render, SharedString, Styled,
     Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::{ExportFormat, ImageId};
+use aurora_engine::{ExportFormat, ImageId};
 
 use crate::i18n::t;
 use crate::state::AppState;
@@ -92,7 +92,7 @@ impl ExportDialog {
                             Ok(_) => {
                                 done += 1;
                                 if let Some(json) = json {
-                                    let side = dest.join(format!("{}.lumen.json", name.to_string_lossy()));
+                                    let side = dest.join(format!("{}.portrait.json", name.to_string_lossy()));
                                     if let Err(e) = std::fs::write(side, json) {
                                         errors.push(e.to_string());
                                     }
@@ -157,7 +157,7 @@ impl Render for ExportDialog {
                         })
                     }
                 }, cx))
-                .child(switch_row("exp-sidecar", t("Include adjustments (.lumen.json)", "附带调整（.lumen.json）"), self.sidecar, {
+                .child(switch_row("exp-sidecar", t("Include adjustments (.portrait.json)", "附带调整（.portrait.json）"), self.sidecar, {
                     let this = this.clone();
                     move |v, _, cx| {
                         this.update(cx, |d, cx| {
@@ -184,7 +184,7 @@ impl Render for ExportDialog {
                         cx.notify();
                     })
                 }), cx))
-                .child(row(t("Format", "格式"), select("exp-format", ExportFormat::ALL.iter().map(|f| (*f, crate::contract::format_label(*f).into())).collect(), format, move |f, _, cx| {
+                .child(row(t("Format", "格式"), select("exp-format", ExportFormat::ALL.iter().map(|f| (*f, crate::contract::format_label(&s.capabilities, *f).into())).collect(), format, move |f, _, cx| {
                     this3.update(cx, |d, cx| {
                         d.format = Some(f);
                         cx.notify();

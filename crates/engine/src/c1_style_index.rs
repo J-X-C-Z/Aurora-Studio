@@ -6,7 +6,7 @@ use std::{
 use crate::engine::StyleInfo;
 
 /// Every Capture One style and preset installed under the app directory, as
-/// engine styles. `LUMEN_C1_STYLES` names a directory whose direct children are
+/// engine styles. `AURORA_C1_STYLES` names a directory whose direct children are
 /// the install's style roots, so tests can point at synthetic packages.
 pub fn installed_styles() -> Vec<StyleInfo> {
     installed_styles_from(&roots())
@@ -38,7 +38,7 @@ pub(crate) fn installed_styles_from(dirs: &[PathBuf]) -> Vec<StyleInfo> {
 }
 
 fn roots() -> Vec<PathBuf> {
-    if let Some(dir) = std::env::var_os("LUMEN_C1_STYLES") {
+    if let Some(dir) = std::env::var_os("AURORA_C1_STYLES") {
         return vec![PathBuf::from(dir)];
     }
     let install = crate::presets::c1_dir();
@@ -90,7 +90,7 @@ mod tests {
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("lumen-style-index-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("portrait-style-index-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -106,16 +106,16 @@ mod tests {
     }
 
     #[test]
-    fn lumen_c1_styles_overrides_the_install_directory() {
+    fn portrait_c1_styles_overrides_the_install_directory() {
         let _serial = crate::filmcurve::test_lock();
         let root = temp_root("override");
         fs::write(root.join("Lane Only.costyle"), sl("Lane Only", 0.3)).unwrap();
-        let previous = std::env::var_os("LUMEN_C1_STYLES");
-        unsafe { std::env::set_var("LUMEN_C1_STYLES", &root) };
+        let previous = std::env::var_os("AURORA_C1_STYLES");
+        unsafe { std::env::set_var("AURORA_C1_STYLES", &root) };
         let styles = installed_styles();
         match previous {
-            Some(v) => unsafe { std::env::set_var("LUMEN_C1_STYLES", v) },
-            None => unsafe { std::env::remove_var("LUMEN_C1_STYLES") },
+            Some(v) => unsafe { std::env::set_var("AURORA_C1_STYLES", v) },
+            None => unsafe { std::env::remove_var("AURORA_C1_STYLES") },
         }
         assert_eq!(styles.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Lane Only"]);
         fs::remove_dir_all(root).unwrap();

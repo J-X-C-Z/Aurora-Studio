@@ -125,25 +125,20 @@ pub fn rasterize(
 mod tests {
     use super::*;
 
-
-    #[cfg(feature = "external-fixtures")]
-
+    const TRIANGLES: &[u8; 51228] =
+        include_bytes!("../../../../assets/portrait/smile/triangles.u32le");
+    const MEAN: &[u8; 26472] =
+        include_bytes!("../../../../assets/portrait/smile/mean.f32le");
 
     fn decode_faces() -> Vec<u32> {
-        let bytes = crate::external_fixtures::read("smile/triangles.u32le");
-        assert_eq!(bytes.len(), 51228);
-        bytes
+        TRIANGLES
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
 
-    #[cfg(feature = "external-fixtures")]
-
     fn decode_mean() -> Vec<[f32; 2]> {
-        let bytes = crate::external_fixtures::read("smile/mean.f32le");
-        assert_eq!(bytes.len(), 26472);
-        bytes.chunks_exact(12)
+        MEAN.chunks_exact(12)
             .map(|c| {
                 [
                     f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
@@ -198,7 +193,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn real_mesh_rasterizes_with_zero_displacement() {
         let mean = decode_mean();
         let faces = decode_faces();

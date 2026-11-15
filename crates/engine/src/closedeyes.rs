@@ -338,9 +338,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs LUMEN_AIMODELS pointing at C1's ClosedEyesDetection models"]
+    #[ignore = "needs AURORA_AIMODELS pointing at C1's ClosedEyesDetection models"]
     fn real_face() {
-        let path = std::env::var("LUMEN_EYE_PHOTO").expect("set LUMEN_EYE_PHOTO to a portrait");
+        let path = std::env::var("AURORA_EYE_PHOTO").expect("set AURORA_EYE_PHOTO to a portrait");
         let image = image::open(&path).unwrap().to_rgba8();
         let (w, h) = image.dimensions();
         let start = std::time::Instant::now();
@@ -361,12 +361,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs LUMEN_AIMODELS and LUMEN_EYE_PHOTO"]
+    #[ignore = "needs AURORA_AIMODELS and AURORA_EYE_PHOTO"]
     fn file_engine_reports_once_and_caches() {
         use crate::{FileEngine, ImageEngine};
 
-        let path = std::env::var("LUMEN_EYE_PHOTO").expect("set LUMEN_EYE_PHOTO to a portrait");
-        let dir = std::env::temp_dir().join(format!("lumen-closedeyes-{}", std::process::id()));
+        let path = std::env::var("AURORA_EYE_PHOTO").expect("set AURORA_EYE_PHOTO to a portrait");
+        let dir = std::env::temp_dir().join(format!("portrait-closedeyes-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let copy = dir.join("portrait.png");
         image::open(&path).unwrap().to_rgba8().save(&copy).unwrap();

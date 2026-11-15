@@ -53,6 +53,47 @@ __device__ __forceinline__ void u_bilinear(
   }
 }
 
+__device__ __forceinline__ float u_raw_texel(
+    const unsigned char* source,
+    int width,
+    int x,
+    int y,
+    int channel) {
+  return (float)source[((size_t)y * (size_t)width + (size_t)x) * 4u + (size_t)channel];
+}
+
+// Source-pixel bilinear over raw u8 values. This is the sampler shared by
+// PF30190 and the PF400/PF404/PF416 body remaps, not the normalized PF407 tap.
+__device__ __forceinline__ void u_bilinear_raw(
+    const unsigned char* source,
+    int width,
+    int height,
+    float px,
+    float py,
+    float* out) {
+  float max_x = u_sub((float)width, 1.0f);
+  float max_y = u_sub((float)height, 1.0f);
+  float x = fminf(fmaxf(px, 0.0f), max_x);
+  float y = fminf(fmaxf(py, 0.0f), max_y);
+  float x0 = floorf(x);
+  float y0 = floorf(y);
+  float x1 = fminf(u_add(x0, 1.0f), max_x);
+  float y1 = fminf(u_add(y0, 1.0f), max_y);
+  float fx = u_sub(x, x0);
+  float fy = u_sub(y, y0);
+  for (int channel = 0; channel < 4; ++channel) {
+    float top = u_lerp(
+        u_raw_texel(source, width, (int)x0, (int)y0, channel),
+        u_raw_texel(source, width, (int)x1, (int)y0, channel),
+        fx);
+    float bottom = u_lerp(
+        u_raw_texel(source, width, (int)x0, (int)y1, channel),
+        u_raw_texel(source, width, (int)x1, (int)y1, channel),
+        fx);
+    out[channel] = u_lerp(top, bottom, fy);
+  }
+}
+
 // texture2D(mo, uv) for the float4 displacement field. Only the sampling
 // coordinate is clamped; the signed offsets themselves stay untouched.
 __device__ __forceinline__ void u_field_bilinear(
@@ -154,6 +195,17 @@ __device__ __forceinline__ unsigned char u_quantize(float value) {
   return (unsigned char)(q < 0 ? 0 : (q > 255 ? 255 : q));
 }
 
+__device__ __forceinline__ unsigned char u_quantize_raw_half_up(float value) {
+  int q = (int)floorf(u_add(value, 0.5f));
+  return (unsigned char)(q < 0 ? 0 : (q > 255 ? 255 : q));
+}
+
+__device__ __forceinline__ unsigned char u_quantize_raw_even(float value) {
+  value = fminf(fmaxf(value, 0.0f), 255.0f);
+  int q = (int)rintf(value);
+  return (unsigned char)(q < 0 ? 0 : (q > 255 ? 255 : q));
+}
+
 extern "C" __global__ void uvmap_color_kernel(
     const unsigned char* source_rgba,
     const float* field_xy,
@@ -165,6 +217,40 @@ extern "C" __global__ void uvmap_color_kernel(
 
   unsigned int source_index =
       (unsigned int)y * uniforms.stride + (unsigned int)x * 4u;
+
+  if (uniforms.mode == 1u) {
+    size_t field_index =
+        ((size_t)y * (size_t)uniforms.width + (size_t)x) * 4u;
+    float offset_x = field_xy[field_index + 0u];
+    float offset_y = field_xy[field_index + 1u];
+    if (field_xy[field_index + 3u] == 0.0f) {
+      out_rgba[source_index + 0u] = source_rgba[source_index + 0u];
+      out_rgba[source_index + 1u] = source_rgba[source_index + 1u];
+      out_rgba[source_index + 2u] = source_rgba[source_index + 2u];
+      out_rgba[source_index + 3u] = source_rgba[source_index + 3u];
+      return;
+    }
+
+    float raw[4];
+    u_bilinear_raw(
+        source_rgba,
+        (int)uniforms.width,
+        (int)uniforms.height,
+        u_add((float)x, offset_x),
+        u_add((float)y, offset_y),
+        raw);
+    bool even = uniforms.channel == 1u;
+    out_rgba[source_index + 0u] =
+        even ? u_quantize_raw_even(raw[0]) : u_quantize_raw_half_up(raw[0]);
+    out_rgba[source_index + 1u] =
+        even ? u_quantize_raw_even(raw[1]) : u_quantize_raw_half_up(raw[1]);
+    out_rgba[source_index + 2u] =
+        even ? u_quantize_raw_even(raw[2]) : u_quantize_raw_half_up(raw[2]);
+    out_rgba[source_index + 3u] = uniforms.catmull != 0u
+        ? source_rgba[source_index + 3u]
+        : (even ? u_quantize_raw_even(raw[3]) : u_quantize_raw_half_up(raw[3]));
+    return;
+  }
 
   float u = u_div(u_add((float)x, 0.5f), (float)uniforms.width);
   float v = u_div(u_add((float)y, 0.5f), (float)uniforms.height);

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::{AppContext as _, Context};
-use lumen_engine::{ImageId, JobStatus};
+use aurora_engine::{ImageId, JobStatus, StyleImportErrorKind};
 
 use super::{AppState, Edit};
 use crate::i18n::t;
@@ -48,7 +48,14 @@ impl AppState {
                             added += 1;
                         }
                         Err(err) => {
-                            first_err.get_or_insert(err.to_string());
+                            log::warn!("style import: {err:#}");
+                            let reason = match StyleImportErrorKind::of(&err) {
+                                StyleImportErrorKind::NotAStyle => t("the file is not a Capture One style", "文件不是 Capture One 风格"),
+                                StyleImportErrorKind::Io => t("the file could not be read", "文件无法读取"),
+                                StyleImportErrorKind::Unsupported => t("the style uses unsupported settings", "该风格包含不支持的设置"),
+                                StyleImportErrorKind::Other => t("see the log for details", "详情见日志"),
+                            };
+                            first_err.get_or_insert(reason.to_string());
                         }
                     }
                 }

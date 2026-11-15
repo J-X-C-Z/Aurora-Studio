@@ -1,7 +1,7 @@
 //! The frontend contract in `docs/frontend-contract/`.
 //!
 //! * Slider metadata (`params.json`) is served by the engine as
-//!   [`lumen_engine::ParamMeta`]; [`crate::widgets::param_c1`] turns a key into a slider.
+//!   [`aurora_engine::ParamMeta`]; [`crate::widgets::param_c1`] turns a key into a slider.
 //! * Feature status (`catalog.md`) is mirrored by the [`Status`] constants below,
 //!   which tool panels show as a badge.
 //! * The portrait parameter catalogue (`portrait-algorithms.json`) is embedded and
@@ -47,7 +47,7 @@ impl Status {
     }
 }
 
-pub const COLOR_EDITOR: Status = Status::Partial("Uses 5 of the 18 range fields", "18 个范围字段只用到 5 个");
+pub const COLOR_EDITOR: Status = Status::Partial("Centres, hue/saturation bands, smoothness, homogeneity and inverted map from C1's 18-field rows; value-band edges are unused", "C1 18 字段行里的中心色、色相/饱和度带宽、平滑、均匀度与反转已映射；明度边界未使用");
 pub const MOIRE: Status = Status::Partial("3×3 low-pass, no frequency-domain filter", "3×3 低通，无频域处理");
 pub const LENS_CORRECTION: Status = Status::Partial("Distortion, aberration and purple fringing direction are assumed", "畸变/色差/紫边方向为假设");
 pub const KEYSTONE: Status = Status::Partial("Direction assumed, not verified against Capture One", "方向为假设，未与 C1 对拍");
@@ -61,36 +61,62 @@ pub const SPOTS: Status = Status::Partial("Healing is approximate", "修复为�
 pub const C1_CATALOG: Status = Status::Partial("Collections and WAL only", "仅集合与 WAL");
 pub const AI_MASK: Status = Status::Partial("Subject, background and skin only, and only where the segmentation models and ONNX Runtime are installed", "仅主体、背景与皮肤，且需本机装有分割模型与 ONNX Runtime");
 pub const TETHER: Status = Status::Partial("Linux libgphoto2 / Windows WIA; capture and live view depend on the camera driver; settings and focus are not read yet", "Linux libgphoto2 / Windows WIA；拍摄和取景取决于相机驱动，设置与对焦尚未读取");
-/// The monitor profile is chosen and saved; the engine does not convert previews to it yet.
-pub const DISPLAY_PROFILE: Status = Status::Missing(
-    "The engine does not convert previews to a monitor profile yet; previews are shown as sRGB",
-    "引擎尚未按显示器配置文件转换预览，目前按 sRGB 显示",
+/// The chosen profile, Windows discovery and soft proofing are applied; paper/ink is approximate.
+pub const DISPLAY_PROFILE: Status = Status::Partial(
+    "Monitor profile, Windows discovery and 8-bit soft proofing are applied; paper/ink simulation is approximate",
+    "显示器配置、Windows 探测与 8 位软打样已用于预览；纸白/油墨为近似"
 );
 /// Parsed Capture One parameters the engine stores but does not render yet.
 pub const AI_DENOISE: Status = Status::Pending("Saved with the variant; the engine has no AI denoise yet", "随变体保存，引擎尚无 AI 降噪");
 pub const BANDING: Status = Status::Pending("Saved with the variant; the engine has no banding reduction yet", "随变体保存，引擎尚无条纹抑制");
 /// Interface built ahead of the engine (see `planned`).
-pub const MERGE: Status = Status::Missing("The engine cannot merge images yet", "引擎尚不支持合并图像");
+pub const MERGE: Status = Status::Partial("Basic HDR and panorama merges are available; projection and deghosting options are still not consumed", "基础 HDR/全景合并可用；投影/去鬼影选项仍未消费");
 pub const STYLE_IMPORT: Status = Status::Partial("Imported styles are available for this session", "导入风格在当前会话可用");
 pub const SESSIONS: Status = Status::Partial("Session import is read-only; XMP write-back and .P1X are not connected yet", "Session 支持只读导入；XMP 写回与 .P1X 尚未接入");
-pub const PRINT: Status = Status::Missing("Printing is not connected to a backend yet", "打印后端尚未接入");
+pub const PRINT: Status = Status::Partial("Single-page PDF output is available; system printers, multi-image layouts and ICC proofing are not connected", "单页 PDF 输出可用；系统打印机、多图版式与 ICC 打样尚未接入");
 pub const RETOUCH: Status = Status::Pending("Saved with the variant; the engine does not render it yet", "随变体保存，渲染管线尚未实现");
 pub const SURFACE_NOISE: Status = Status::Pending("Surface smoothness has no engine field yet", "表面平滑尚无引擎字段");
 
-/// Export formats the engine has an encoder for (`ExportFormat::is_supported`).
-pub fn format_ready(format: lumen_engine::ExportFormat) -> bool {
-    format.is_supported()
+/// Export formats the engine reports it can write. An engine that reports none
+/// (the default trait answer) falls back to the static encoder list.
+pub fn export_formats(caps: &aurora_engine::EngineCapabilities) -> Vec<aurora_engine::ExportFormat> {
+    if caps.export_formats.is_empty() {
+        aurora_engine::ExportFormat::ALL.into_iter().filter(|f| f.is_supported()).collect()
+    } else {
+        caps.export_formats.clone()
+    }
 }
 
-/// The label a format selector shows. Formats without an encoder stay listed so
-/// recipes can be set up ahead of the engine, but say that exporting fails.
-pub fn format_label(format: lumen_engine::ExportFormat) -> String {
+pub fn format_ready(caps: &aurora_engine::EngineCapabilities, format: aurora_engine::ExportFormat) -> bool {
+    export_formats(caps).contains(&format)
+}
+
+/// The label a format selector shows. Formats the engine cannot write stay
+/// listed so recipes can be set up ahead of it, but say that exporting fails.
+pub fn format_label(caps: &aurora_engine::EngineCapabilities, format: aurora_engine::ExportFormat) -> String {
     let ext = format.extension().to_uppercase();
-    if format_ready(format) { ext } else { format!("{ext} · {}", t("not connected, export fails", "未接入，导出会失败")) }
+    if format_ready(caps, format) { ext } else { format!("{ext} · {}", t("not connected, export fails", "未接入，导出会失败")) }
 }
 
-/// Soft proofing: chosen and shown, but the engine does not convert previews yet.
-pub const SOFT_PROOF: Status = Status::Missing("The engine does not render the proof profile yet; the preview is unchanged", "引擎尚未按校样配置文件渲染，预览不变");
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn export_formats_follow_the_engine_with_a_static_fallback() {
+        let empty = aurora_engine::EngineCapabilities::default();
+        assert_eq!(export_formats(&empty), aurora_engine::ExportFormat::ALL.into_iter().filter(|f| f.is_supported()).collect::<Vec<_>>());
+
+        let jpeg_only = aurora_engine::EngineCapabilities { export_formats: vec![aurora_engine::ExportFormat::Jpeg], ..Default::default() };
+        assert!(format_ready(&jpeg_only, aurora_engine::ExportFormat::Jpeg));
+        assert!(!format_ready(&jpeg_only, aurora_engine::ExportFormat::Heif));
+        assert!(format_label(&jpeg_only, aurora_engine::ExportFormat::Heif).contains("HEIC"));
+    }
+}
+
+/// Soft proofing converts the preview through the chosen ICC profile; without
+/// that profile the engine falls back and reports the preview as degraded.
+pub const SOFT_PROOF: Status = Status::Partial("Proofs through the chosen ICC profile; a missing profile falls back with no gamut warning", "按所选 ICC 配置文件校样；缺配置文件时回退且不提示色域");
 /// Lens blur: stored with the variant; the engine has no depth map or blur yet.
 pub const LENS_BLUR: Status = Status::Pending("Saved with the variant; the engine has no depth estimation or lens blur yet", "随变体保存，引擎尚无景深估计与镜头模糊");
 

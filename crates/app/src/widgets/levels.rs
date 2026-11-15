@@ -8,7 +8,7 @@ use gpui_kit::{
     App, Entity, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, canvas, div, linear_color_stop,
     linear_gradient, px,
 };
-use lumen_engine::LevelsChannel;
+use aurora_engine::LevelsChannel;
 
 use super::paint;
 use super::surface::{Pointer, Surface};

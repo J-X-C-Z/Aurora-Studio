@@ -1,20 +1,14 @@
 // Real NVIDIA coverage for PF8068 SKIN_GLOSS.
 //
-// Synthetic caller-owned curves, byte-for-byte against `skin_models::gloss_apply_with_luts`, with the three-pass gate
+// Byte-for-byte against `skin_models::gloss_apply`, with the three-pass gate
 // made visible through the returned dispatch list.
 
 #[cfg(windows)]
 mod gloss_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_gloss::{Gloss, KERNEL};
-    use aurora_pixcake::kernels::skin_models;
-    use aurora_pixcake::{Image, Refusal};
-
-    // Test curves only; no product or vendor LUT data.
-    const TEST_LUTS: [[u8; 256]; 3] = [[255; 256], [160; 256], [0; 256]];
-    fn luts() -> Option<[&'static [u8; 256]; 3]> {
-        Some([&TEST_LUTS[0], &TEST_LUTS[1], &TEST_LUTS[2]])
-    }
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_gloss::{Gloss, KERNEL};
+    use aurora_portrait::kernels::skin_models;
+    use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -38,7 +32,7 @@ mod gloss_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None
@@ -69,14 +63,15 @@ mod gloss_gpu {
         percent: f32,
         label: &str,
     ) {
-        let expected = skin_models::gloss_apply_with_luts(
+        let expected = skin_models::gloss_apply(
             source,
             [&mask[0], &mask[1], &mask[2]],
             [&extra[0], &extra[1], &extra[2]],
-            percent, luts())
+            percent,
+        )
         .unwrap();
         let (actual, dispatches) = gpu
-            .apply_with_luts(source, [&mask[0], &mask[1], &mask[2]], [&extra[0], &extra[1], &extra[2]], percent, luts())
+            .apply(source, [&mask[0], &mask[1], &mask[2]], [&extra[0], &extra[1], &extra[2]], percent)
             .expect("real GPU dispatch");
         let differing = expected.pixels.iter().zip(&actual.pixels).filter(|(a, b)| a != b).count();
         assert_eq!(
@@ -124,7 +119,7 @@ mod gloss_gpu {
         let extra = [vec![255u8; pixels], vec![255u8; pixels], vec![255u8; pixels]];
         // 100% runs two passes, so a skipped blend would still be visible.
         let (actual, dispatches) = gpu
-            .apply_with_luts(&source, [&masks[0], &masks[1], &masks[2]], [&extra[0], &extra[1], &extra[2]], 100.0, luts())
+            .apply(&source, [&masks[0], &masks[1], &masks[2]], [&extra[0], &extra[1], &extra[2]], 100.0)
             .unwrap();
         assert_eq!(dispatches.len(), 2);
         assert_eq!(actual, source, "mask 0 must be the identity");
@@ -136,7 +131,7 @@ mod gloss_gpu {
         let source = canvas(8, 8, 43);
         let (mask, extra) = masks(64, 47);
         let run = |percent: f32| {
-            gpu.apply_with_luts(&source, [&mask[0], &mask[1], &mask[2]], [&extra[0], &extra[1], &extra[2]], percent, luts())
+            gpu.apply(&source, [&mask[0], &mask[1], &mask[2]], [&extra[0], &extra[1], &extra[2]], percent)
                 .unwrap()
         };
         assert_eq!(run(0.0).1.len(), 1, "0% runs only the negative pass");
@@ -156,26 +151,14 @@ mod gloss_gpu {
         }
         let source = Image::new(3, 3, pixels).unwrap();
         let all = vec![255u8; 9];
-        let (actual, _) = gpu.apply_with_luts(&source, [&all, &all, &all], [&all, &all, &all], 100.0, luts()).unwrap();
+        let (actual, _) = gpu.apply(&source, [&all, &all, &all], [&all, &all, &all], 100.0).unwrap();
         for pixel in 0..9usize {
             assert_eq!(actual.pixels[pixel * 4 + 3], source.pixels[pixel * 4 + 3], "alpha copied");
         }
         assert_eq!(
             actual,
-            skin_models::gloss_apply_with_luts(&source, [&all, &all, &all], [&all, &all, &all], 100.0, luts()).unwrap()
+            skin_models::gloss_apply(&source, [&all, &all, &all], [&all, &all, &all], 100.0).unwrap()
         );
-    }
-
-    #[test]
-    fn missing_tables_refuse_without_dispatch_and_neutral_needs_none() {
-        let Some(gpu) = gpu() else { return };
-        let source = canvas(4, 4, 17);
-        let masks = [&[255; 16][..]; 3];
-        assert_eq!(gpu.apply(&source, masks, masks, 100.0).err(),
-            Some(CudaError::Refused(Refusal::MissingInput("gloss_luts"))));
-        let (neutral, dispatches) = gpu.apply(&source, masks, masks, 50.0).unwrap();
-        assert_eq!(neutral, source);
-        assert!(dispatches.is_empty());
     }
 
     #[test]
@@ -185,24 +168,26 @@ mod gloss_gpu {
         let (mask, extra) = masks(16, 59);
         let short = [&mask[0][..15], &mask[1], &mask[2]];
         assert_eq!(
-            gpu.apply_with_luts(&source, short, [&extra[0], &extra[1], &extra[2]], 100.0, luts()).err(),
+            gpu.apply(&source, short, [&extra[0], &extra[1], &extra[2]], 100.0).err(),
             Some(CudaError::Refused(Refusal::ShapeMismatch("mask_r")))
         );
         assert_eq!(
-            gpu.apply_with_luts(
+            gpu.apply(
                 &source,
                 [&mask[0], &mask[1], &mask[2]],
                 [&extra[0], &extra[1], &extra[2]],
-                f32::NAN, luts())
+                f32::NAN
+            )
             .err(),
             Some(CudaError::Refused(Refusal::ValueOutOfRange("native_percent")))
         );
         assert_eq!(
-            gpu.apply_with_luts(
+            gpu.apply(
                 &source,
                 [&mask[0], &mask[1], &mask[2]],
                 [&extra[0], &extra[1], &extra[2]],
-                101.0, luts())
+                101.0
+            )
             .err(),
             Some(CudaError::Refused(Refusal::ValueOutOfRange("native_percent")))
         );

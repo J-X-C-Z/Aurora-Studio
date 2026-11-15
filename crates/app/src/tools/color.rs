@@ -12,7 +12,7 @@ use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::i18n::t;
 use crate::state::{AppState, Binding, CursorTool, Scope, read_scoped, with_scoped};
@@ -54,11 +54,12 @@ pub fn hue_stops() -> Vec<gpui_kit::Hsla> {
 fn base_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let base = s.adj().base.clone();
-    let profiles = s.icc_profiles.clone();
+    let profiles = s.icc_picker(base.icc_profile.as_deref(), "");
     let (st, st2, st3) = (state.clone(), state.clone(), state.clone());
     let mut icc: Vec<(Option<usize>, SharedString)> = vec![(None, t("Default for camera", "相机默认").into())];
     icc.extend(profiles.iter().enumerate().map(|(i, p)| (Some(i), p.clone().into())));
     let current_icc = base.icc_profile.as_ref().and_then(|n| profiles.iter().position(|p| p == n));
+    let group = s.icc_group;
     let curves = crate::planned::film_curves(s.engine.as_ref());
     let curve_names = [
         t("Auto", "自动"),
@@ -72,10 +73,31 @@ fn base_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
         .modified(base != BaseCharacteristics::default())
         .on_reset(move |_, cx| st.update(cx, |s, cx| s.edit(t("Reset base", "复位基础特性"), |a| a.base = Default::default(), cx)))
         .child(row(
+            t("ICC Group", "ICC 分组"),
+            {
+                let stg = state.clone();
+                Segmented::new("icc-group", group)
+                    .text(t("All", "全部"))
+                    .text(t("Camera", "相机"))
+                    .text(t("Looks", "风格"))
+                    .text(t("Output", "输出"))
+                    .on_select(move |i, _, cx| {
+                        stg.update(cx, |s, _| {
+                            s.icc_group = i;
+                            s.settings.icc_group = i as u8;
+                            s.settings.save();
+                        })
+                    })
+                    .into_any_element()
+            },
+            cx,
+        ))
+        .child(row(
             t("ICC Profile", "ICC 配置"),
             select("icc", icc, current_icc, move |i, _, cx| {
+                let profiles = profiles.clone();
                 st2.update(cx, |s, cx| {
-                    let name = i.and_then(|i| s.icc_profiles.get(i).cloned());
+                    let name = i.and_then(|i| profiles.get(i).cloned());
                     s.edit(t("ICC profile", "ICC 配置"), |a| a.base.icc_profile = name, cx)
                 })
             }),
@@ -92,7 +114,7 @@ fn base_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
             cx,
         ))
         .child(row(t("Film Curve", "胶片曲线"), film_curve_select(state, &base, curves), cx))
-        .child(row(t("Engine", "引擎"), div().text_xs().text_color(p.text_muted).child(base.engine_version.replacen("Lumen", "Aurora", 1)), cx))
+        .child(row(t("Engine", "引擎"), div().text_xs().text_color(p.text_muted).child(base.engine_version.replacen("Portrait", "Aurora", 1)), cx))
 }
 
 /// The film curve the engine applies before gamma: none, the one it set for the
@@ -112,7 +134,7 @@ fn film_curve_select(state: &Entity<AppState>, base: &BaseCharacteristics, mut n
     })
 }
 
-pub(crate) fn wb_binding(scope: Scope, kelvin: bool) -> Binding {
+fn wb_binding(scope: Scope, kelvin: bool) -> Binding {
     let get = move |a: &AdjustmentSet| {
         let wb = match scope {
             Scope::Global => Some(&a.white_balance),

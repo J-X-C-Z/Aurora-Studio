@@ -1,6 +1,6 @@
 //! PF90004 `SkinLighten_PixCook` pixel backend.
 //!
-//! Recovered from pixcake.exe SHA256
+//! Recovered from portrait.exe SHA256
 //! `A84519DA489BC52E4E914AF7880EDE43E3CE58992657723D02197161832464C7`:
 //! parameter compiler `0x702EC20`, brightness LUT selector `0x7031830`,
 //! contrast LUT selector `0x7033480`, statistics `0x702E3F0`,

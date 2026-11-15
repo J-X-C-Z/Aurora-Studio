@@ -108,8 +108,14 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
         "Saturation" => set.exposure.saturation = num().unwrap_or(0.0),
         // C1 stores the temperature itself, not gains: 5000.0009765625 in the
         // bundled presets, which is 5000 K as a float.
-        "WhiteBalanceTemperature" => set.white_balance.kelvin = num().unwrap_or(6500.0),
-        "WhiteBalanceTint" => set.white_balance.tint = num().unwrap_or(0.0),
+        "WhiteBalanceTemperature" => {
+            set.white_balance.kelvin = num().unwrap_or(6500.0);
+            set.white_balance.gains = None;
+        }
+        "WhiteBalanceTint" => {
+            set.white_balance.tint = num().unwrap_or(0.0);
+            set.white_balance.gains = None;
+        }
         "GradationCurve" => set.curves.rgb = curve(value),
         "GradationCurveRed" => set.curves.red = curve(value),
         "GradationCurveGreen" => set.curves.green = curve(value),
@@ -129,15 +135,28 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
         "Midtone" => levels_midtone(&mut set.levels, value),
         // C1 stores the white balance as camera RGB gains beside its UI
         // temperature; the gains only stand in when no temperature is present.
-        // shortcut: gains→kelvin uses the engine's 5600 K reference, unverified
+        // shortcut: gains→kelvin uses the engine's 6500 K reference, unverified
         // against Capture One's own conversion; revisit with a C1-exported pair.
         "WhiteBalance" => white_balance_gains(set, value),
+        // Per-zone RGB multipliers, 1;1;1 neutral.
+        "ColorBalance" => color_balance_gain(set, 0, value),
+        "ColorBalanceShadow" => color_balance_gain(set, 1, value),
+        "ColorBalanceMidtone" => color_balance_gain(set, 2, value),
+        "ColorBalanceHighlight" => color_balance_gain(set, 3, value),
         "USMAmount" => set.sharpening.amount = num().unwrap_or(0.0),
         "USMRadius" => set.sharpening.radius = num().unwrap_or(0.0),
         "USMThreshold" => {
             set.sharpening.threshold = param_meta::clamp("USMThreshold", num().unwrap_or(0.0))
         }
         "FilmGrainAmount" => set.film_grain.impact = num().unwrap_or(0.0),
+        "FilmGrainDensity" => {
+            if let Some(v) = num() {
+                set.extra.insert(
+                    "FilmGrainDensity".to_string(),
+                    param_meta::clamp("FilmGrainDensity", v),
+                );
+            }
+        }
         "FilmGrainGranularity" => set.film_grain.granularity = num().unwrap_or(0.0),
         // shortcut: index taken as our GrainKind order, C1's enum order unproven.
         "FilmGrainType" => {
@@ -161,6 +180,26 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
         "BwLightSaturation" => set.black_white.highlight_tone.saturation = num().unwrap_or(0.0),
         "BwDarkHue" => set.black_white.shadow_tone.hue = num().unwrap_or(0.0),
         "BwDarkSaturation" => set.black_white.shadow_tone.saturation = num().unwrap_or(0.0),
+        "KeystoneAmount" => {
+            set.geometry.keystone.amount = param_meta::clamp(
+                "KeystoneAmount",
+                num().unwrap_or(set.geometry.keystone.amount),
+            )
+        }
+        "AIDenoiseAmount" => {
+            set.noise_reduction.color = param_meta::clamp(
+                "AIDenoiseAmount",
+                num().unwrap_or(set.noise_reduction.color),
+            )
+        }
+        "BandingReductionAmount" => {
+            if let Some(v) = num() {
+                set.extra.insert(
+                    "BandingReductionAmount".to_string(),
+                    param_meta::clamp("BandingReductionAmount", v),
+                );
+            }
+        }
         _ => return false,
     }
     true
@@ -209,6 +248,20 @@ fn white_balance_gains(set: &mut AdjustmentSet, value: &str) {
     set.white_balance.mode = crate::WhiteBalanceMode::Custom;
     set.white_balance.kelvin = kelvin.clamp(2000.0, 50000.0);
     set.white_balance.tint = tint.clamp(-50.0, 50.0);
+    set.white_balance.gains = Some([v[0], v[1], v[2]]);
+}
+
+fn color_balance_gain(set: &mut AdjustmentSet, zone: usize, value: &str) {
+    let v: Vec<f32> = value.split(';').filter_map(|x| x.trim().parse().ok()).collect();
+    if v.len() != 3 || v.iter().any(|x| !x.is_finite()) {
+        return;
+    }
+    let gain = [v[0].clamp(0.0, 8.0), v[1].clamp(0.0, 8.0), v[2].clamp(0.0, 8.0)];
+    let gains = set.color_balance_gains.get_or_insert_with(Default::default);
+    gains.set_zone(zone, gain);
+    if gains.is_neutral() {
+        set.color_balance_gains = None;
+    }
 }
 
 fn curve(value: &str) -> crate::Curve {
@@ -412,6 +465,16 @@ fn mapped_values(a: &AdjustmentSet, corrections: &[[f32; 18]]) -> Vec<(String, S
     num!("BwLightSaturation", a.black_white.highlight_tone.saturation, 0.0);
     num!("BwDarkHue", a.black_white.shadow_tone.hue, 0.0);
     num!("BwDarkSaturation", a.black_white.shadow_tone.saturation, 0.0);
+    let gains = a.color_balance_gains.unwrap_or_default();
+    for (key, zone) in [
+        ("ColorBalance", gains.master),
+        ("ColorBalanceShadow", gains.shadow),
+        ("ColorBalanceMidtone", gains.midtone),
+        ("ColorBalanceHighlight", gains.highlight),
+    ] {
+        let text = zone.iter().map(|v| fmt_f32(*v)).collect::<Vec<_>>().join(";");
+        out.push((key.to_owned(), text, zone == [1.0; 3]));
+    }
     // The Levels tool keeps one four-value vector per key, master first.
     for (key, slot) in [
         ("Shadow", 0usize),
@@ -495,8 +558,8 @@ pub fn preset_from_sl(
         match k.as_str() {
             "Name" => name = Some(v.clone()),
             // Metadata, not an adjustment: UUID, StyleSource, Flip,
-            // TechnicalProcessingMethod, Color_tag_index and the ColorBalance
-            // family, whose C1 semantics are still unproven.
+            // TechnicalProcessingMethod, Color_tag_index and any key whose C1
+            // semantics are still unproven.
             "UUID" | "StyleSource" | "Flip" | "TechnicalProcessingMethod" | "Color_tag_index" => {}
             "WhiteBalance" if has_temperature => {}
             "ColorCorrections" => corrections.extend(crate::c1_model::parse_color_corrections(v)),
@@ -520,9 +583,9 @@ pub fn preset_from_sl(
     })
 }
 
-/// Directory holding presets and styles: `LUMEN_C1_DIR`, else this machine's install.
+/// Directory holding presets and styles: `AURORA_C1_DIR`, else this machine's install.
 pub fn c1_dir() -> PathBuf {
-    std::env::var_os("LUMEN_C1_DIR")
+    std::env::var_os("AURORA_C1_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One"))
 }
@@ -705,13 +768,17 @@ mod tests {
   <E K="UUID" V="{82466223-FC65-4BC5-8965-0CAA0E5B6813}" />
 </SL>"#;
 
+    fn preset(name: &str) -> C1Preset {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/presets").join(name);
+        load(&path).expect("bundled preset parses")
+    }
 
     /// A scratch directory that cleans itself up.
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("lumen-c1-{tag}-{}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("portrait-c1-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("temp dir");
             Self(path)
@@ -762,6 +829,23 @@ mod tests {
         out
     }
 
+    /// Every real `.copreset` / `.costyle` bundled under `testdata/c1-real`.
+    fn real_files() -> Vec<PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-real");
+        let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("real preset folder")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("copreset") | Some("costyle")
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
 
     /// Every `.copreset` / `.costyle` below `dir`, recursively.
     fn collect_presets(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -788,9 +872,22 @@ mod tests {
         assert_eq!(pairs[0], ("Exposure".to_owned(), "-1.000".to_owned()));
     }
 
+    #[test]
+    fn maps_a_bundled_exposure_preset() {
+        let p = preset("Exposure compensation -1 fstop.copreset");
+        assert_eq!(p.kind, PresetKind::Preset);
+        assert_eq!(p.name, "Exposure compensation -1 fstop");
+        assert_eq!(p.adjustments.exposure.exposure, -1.0);
+        assert!(p.unmapped.is_empty());
+    }
 
-
-
+    #[test]
+    fn maps_a_bw_preset_onto_the_six_sensitivities() {
+        let p = preset("Color - Panchromatic 1.copreset");
+        assert!(p.adjustments.black_white.enabled);
+        let s = p.adjustments.black_white.sensitivity;
+        assert_eq!(s, [-16.26506, -7.8313255, -46.5, 0.0, 5.5, 0.0]);
+    }
 
     /// The `.copreset` path and the `ZVARIANTLAYER` path must clamp identically:
     /// both ask `param_meta::clamp`, which reads the one catalog range.
@@ -830,11 +927,11 @@ mod tests {
         assert_eq!(p.adjustments.black_white.sensitivity[5], 100.0);
     }
 
-    /// `.lumen` is the serialized `AdjustmentSet`; loading one must hand back the
+    /// `.portrait` is the serialized `AdjustmentSet`; loading one must hand back the
     /// stored numbers unchanged, in range or not, or a later save would rewrite
     /// the user's document behind their back.
     #[test]
-    fn lumen_round_trip_does_not_clamp_stored_values() {
+    fn portrait_round_trip_does_not_clamp_stored_values() {
         let mut a = AdjustmentSet::default();
         a.sharpening.threshold = 12.0;
         a.black_white.sensitivity = [100.0, -100.0, 0.0, 0.0, 0.0, 0.0];
@@ -849,12 +946,25 @@ mod tests {
         assert_eq!(back.sharpening.threshold, 30.0);
     }
 
+    #[test]
+    fn maps_a_bundled_style_curve_and_film_curve() {
+        let p = preset("Fujicolor Pro 160C.costyle");
+        assert_eq!(p.kind, PresetKind::Style);
+        let pts = &p.adjustments.curves.rgb.points;
+        assert_eq!(pts.len(), 3);
+        assert!((pts[1].x - 0.504).abs() < 1e-6 && (pts[1].y - 0.450).abs() < 1e-6);
+        // The .fcrv extension is dropped so `filmcurve::curve_lut` finds the stem.
+        assert_eq!(p.adjustments.base.film_curve.as_deref(), Some("PhaseOneIQ180-Linear Response"));
+        assert!((p.adjustments.white_balance.kelvin - 2445.051).abs() < 0.01);
+        assert_eq!(p.adjustments.white_balance.tint, -15.3893);
+        assert_eq!(p.adjustments.exposure.exposure, 2.355544);
+    }
 
     #[test]
     fn unmapped_keys_are_kept_not_dropped() {
-        let text = r#"<SL><E K="ColorBalanceHighlight" V="1.000000;1.000000;1.000000"/><E K="Name" V="x"/></SL>"#;
+        let text = r#"<SL><E K="ProprietaryLook" V="1.000000;1.000000;1.000000"/><E K="Name" V="x"/></SL>"#;
         let p = preset_from_sl(text, PresetKind::Style, "", "x").expect("parses");
-        assert_eq!(p.unmapped, vec![("ColorBalanceHighlight".to_owned(), "1.000000;1.000000;1.000000".to_owned())]);
+        assert_eq!(p.unmapped, vec![("ProprietaryLook".to_owned(), "1.000000;1.000000;1.000000".to_owned())]);
     }
 
     #[test]
@@ -864,10 +974,24 @@ mod tests {
         assert!(parse_p1x(b"nope").is_err());
     }
 
+    #[test]
+    fn scans_the_bundled_folder_once() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/presets");
+        let first = scan(&dir);
+        let second = scan(&dir);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first[0].group, "");
+    }
 
-
-
-
+    #[test]
+    fn a_preset_can_be_applied_as_a_style() {
+        let p = preset("Fujicolor Pro 160C.costyle");
+        let base = AdjustmentSet::default();
+        let out = crate::styles::apply_style(&base, &as_style(&p).adjustments);
+        assert_eq!(out.exposure.exposure, 2.355544);
+        assert!((out.white_balance.kelvin - 2445.051).abs() < 0.01);
+    }
 
     /// The Curve tool's keys carry the same `x,y;x,y` data as `GradationCurve`;
     /// values from the installed `Mid tones - brighter.copreset`.
@@ -948,11 +1072,10 @@ mod tests {
         let gains_only = r#"<SL Engine="800"><E K="WhiteBalance" V="0.9022633;1;1.1216389"/></SL>"#;
         let p = preset_from_sl(gains_only, PresetKind::Preset, "", "x").expect("parses");
         assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
-        // The conversion anchors on the engine's 6500 K reference.
-        let expected = 6500.0 * 1.1216389 / 0.9022633;
-        assert!((p.adjustments.white_balance.kelvin - expected).abs() < 5.0,
+        // C1's own conversion for this triple (Z6III profile): 3779.25 K.
+        assert!((p.adjustments.white_balance.kelvin - 3779.25).abs() < 15.0,
             "{}", p.adjustments.white_balance.kelvin);
-        assert!(p.adjustments.white_balance.tint.abs() < 5.0);
+        assert!((p.adjustments.white_balance.tint + 35.65).abs() < 0.5);
 
         let both = r#"<SL Engine="800">
   <E K="WhiteBalance" V="0.9022633;1;1.1216389" />
@@ -1001,13 +1124,82 @@ mod tests {
         assert_eq!(back.adjustments.color_editor, p.adjustments.color_editor);
     }
 
+    /// The four `ColorBalance*` keys are per-zone RGB multipliers; `1;1;1` stays
+    /// `None` so a neutral preset changes nothing.
+    #[test]
+    fn color_balance_keys_become_rgb_gains() {
+        let text = r#"<SL Engine="800">
+  <E K="ColorBalance" V="1.000000;0.979861;0.940517" />
+  <E K="ColorBalanceHighlight" V="1.046504;0.996546;0.967491" />
+  <E K="ColorBalanceMidtone" V="1.014911;0.973734;0.925204" />
+  <E K="ColorBalanceShadow" V="0.917383;0.947512;1.000000" />
+  <E K="Name" V="Bright Gold" />
+</SL>"#;
+        let p = preset_from_sl(text, PresetKind::Preset, "", "Bright Gold").expect("parses");
+        assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
+        let g = p.adjustments.color_balance_gains.expect("gains");
+        assert!((g.master[1] - 0.979861).abs() < 1e-6 && (g.master[2] - 0.940517).abs() < 1e-6);
+        assert!((g.highlight[0] - 1.046504).abs() < 1e-6);
+        assert!((g.midtone[2] - 0.925204).abs() < 1e-6);
+        assert!((g.shadow[0] - 0.917383).abs() < 1e-6);
+        let applied = crate::styles::apply_style(&AdjustmentSet::default(), &p.adjustments);
+        assert_eq!(applied.color_balance_gains, p.adjustments.color_balance_gains);
 
+        let neutral = r#"<SL Engine="800">
+  <E K="ColorBalance" V="1.000000;1.000000;1.000000" />
+  <E K="ColorBalanceShadow" V="1;1;1" />
+</SL>"#;
+        let n = preset_from_sl(neutral, PresetKind::Preset, "", "neutral").expect("parses");
+        assert_eq!(n.adjustments.color_balance_gains, None);
+        assert!(n.adjustments.is_default());
+    }
+
+    #[test]
+    fn saves_a_preset_that_reads_back_the_same() {
+        let p = preset("Fujicolor Pro 160C.costyle");
+        let dir = TempDir::new("preset");
+        let path = dir.file("Fujicolor Pro 160C.costyle");
+        save_style(&path, &p).expect("saves");
+        let back = load(&path).expect("reads back");
+        assert!(approx_eq(&p.adjustments, &back.adjustments), "{:#?}", back.adjustments);
+        assert_eq!(back.name, p.name);
+        assert_eq!(sorted(&back.unmapped), sorted(&p.unmapped));
+        assert_eq!(keys(&back.orig), keys(&p.orig));
+    }
+
+    #[test]
+    fn every_real_preset_survives_a_round_trip() {
+        let dir = TempDir::new("real");
+        let mut checked = 0;
+        for file in real_files() {
+            let p = load(&file).expect("real preset parses");
+            let ext = file.extension().unwrap();
+            let out = dir.file(&format!("{}.{}", p.id, ext.to_str().unwrap()));
+            if ext == "costyle" {
+                save_style(&out, &p).expect("saves style");
+            } else {
+                save_preset(&out, &p).expect("saves preset");
+            }
+            let back = load(&out).expect("reads back");
+            assert!(
+                approx_eq(&p.adjustments, &back.adjustments),
+                "{}: {:#?}",
+                file.display(),
+                back.adjustments
+            );
+            assert_eq!(sorted(&back.unmapped), sorted(&p.unmapped), "{}", file.display());
+            assert_eq!(keys(&back.orig), keys(&p.orig), "{}", file.display());
+            assert_eq!(back.name, p.name);
+            checked += 1;
+        }
+        assert!(checked >= 4, "only {checked} real presets were checked");
+    }
 
     #[test]
     fn unmapped_keys_are_written_back_verbatim() {
         let text = r#"<SL Engine="600">
-  <E K="ColorBalanceHighlight" V="1.000000;1.000000;1.000000"/>
-  <E K="ColorBalance" V="1,1,0,0.000000,-100.000000"/>
+  <E K="ProprietaryLook" V="1.000000;1.000000;1.000000"/>
+  <E K="ProprietaryMix" V="1,1,0,0.000000,-100.000000"/>
   <E K="Exposure" V="-1.000"/>
   <E K="Name" V="Round trip"/>
   <E K="UUID" V="{82466223-FC65-4BC5-8965-0CAA0E5B6813}"/>
@@ -1017,8 +1209,8 @@ mod tests {
         let path = dir.file("Round trip.costyle");
         save_style(&path, &p).expect("saves");
         let written = std::fs::read_to_string(&path).expect("readable");
-        assert!(written.contains(r#"<E K="ColorBalanceHighlight" V="1.000000;1.000000;1.000000" />"#), "{written}");
-        assert!(written.contains(r#"<E K="ColorBalance" V="1,1,0,0.000000,-100.000000" />"#), "{written}");
+        assert!(written.contains(r#"<E K="ProprietaryLook" V="1.000000;1.000000;1.000000" />"#), "{written}");
+        assert!(written.contains(r#"<E K="ProprietaryMix" V="1,1,0,0.000000,-100.000000" />"#), "{written}");
         let back = load(&path).expect("reads back");
         assert_eq!(sorted(&back.unmapped), sorted(&p.unmapped));
         assert!(back.adjustments.exposure.exposure == -1.0);
@@ -1042,6 +1234,60 @@ mod tests {
         assert_eq!(back.name, "B&W Generic 4");
     }
 
+    #[test]
+    fn a_saved_file_is_a_plain_sl_document() {
+        let p = preset("Exposure compensation -1 fstop.copreset");
+        let text = sl_text(&p);
+        assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<SL Engine=\"800\">"), "{text}");
+        assert!(text.ends_with("</SL>\n"), "{text}");
+        assert!(text.contains(r#"<E K="Exposure" V="-1" />"#), "{text}");
+    }
+
+    #[test]
+    fn a_saved_file_keeps_the_metadata_and_the_order() {
+        let p = preset("Fujicolor Pro 160C.costyle");
+        let text = sl_text(&p);
+        assert!(text.contains(r#"<E K="UUID" V="F6C1E9B4-52F1-4FF3-A18E-0F4D389DD731" />"#), "{text}");
+        assert!(text.contains(r#"<E K="FilmCurve" V="PhaseOneIQ180-Linear Response.fcrv" />"#), "{text}");
+        // Levels are now mapped and regenerated from the adjustments.
+        assert!(
+            text.contains(r#"<E K="Highlight" V="0.507402;0.792946;0.858029;1" />"#),
+            "{text}"
+        );
+        // The original order is kept.
+        let at = |k: &str| text.find(&format!(r#"<E K="{k}""#)).unwrap();
+        assert!(at("Brightness") < at("ColorBalance"));
+        assert!(at("ColorBalance") < at("Contrast"));
+        assert!(at("Exposure") < at("FilmCurve"));
+    }
+
+    #[test]
+    fn an_edited_adjustment_is_written_out() {
+        let mut p = preset("Exposure compensation -1 fstop.copreset");
+        p.adjustments.exposure.contrast = 12.0;
+        let dir = TempDir::new("edited");
+        let path = dir.file("Edited.copreset");
+        save_preset(&path, &p).expect("saves");
+        let written = std::fs::read_to_string(&path).expect("readable");
+        assert!(written.contains(r#"<E K="Contrast" V="12" />"#), "{written}");
+        let back = load(&path).expect("reads back");
+        assert_eq!(back.adjustments.exposure.contrast, 12.0);
+        assert_eq!(back.adjustments.exposure.exposure, -1.0);
+    }
+
+    #[test]
+    fn a_saved_preset_carries_every_mapped_key_of_a_bw_preset() {
+        let p = preset("Color - Panchromatic 1.copreset");
+        let dir = TempDir::new("bw");
+        let path = dir.file("Color - Panchromatic 1.copreset");
+        save_preset(&path, &p).expect("saves");
+        let written = std::fs::read_to_string(&path).expect("readable");
+        for key in ["BwEnabled", "BwRed", "BwYellow", "BwGreen"] {
+            assert!(written.contains(&format!(r#"<E K="{key}" V=""#)), "{key} missing: {written}");
+        }
+        let back = load(&path).expect("reads back");
+        assert_eq!(back.adjustments.black_white.sensitivity, p.adjustments.black_white.sensitivity);
+    }
 
     #[test]
     #[ignore = "needs this machine's Capture One install"]
@@ -1106,7 +1352,4 @@ mod tests {
         let c = parse_p1x(&bytes).expect("parses");
         assert!(c.assets.iter().any(|a| a.tag == 0xF1), "colour-transform payload present");
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/presets-tests.rs");
 }
