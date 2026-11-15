@@ -3,8 +3,12 @@
 #[cfg(windows)]
 mod teeth_blend_gpu {
     use aurora_portrait::cuda::CudaError;
-    use aurora_portrait::cuda_teeth_blend::{TeethBlend, KERNEL};
-    use aurora_portrait::kernels::teeth_blend;
+    use aurora_portrait::cuda_teeth_blend::{
+        AlignmentFinalBlendGpu, TeethBlend, KERNEL,
+    };
+    use aurora_portrait::kernels::teeth_blend::{
+        self, AlignmentFinalBlendJob, AlignmentFinalBlendOutcome,
+    };
     use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
@@ -139,5 +143,80 @@ mod teeth_blend_gpu {
             .filter(|(left, right)| left != right)
             .count();
         assert_eq!(differing, 0, "full mask sweep drifted");
+    }
+
+    #[test]
+    fn alignment_final_blend_uses_the_same_job_gate_and_matches_cpu() {
+        let Some(gpu) = gpu() else { return };
+        let original = canvas(17, 13, 79);
+        let effect = canvas(17, 13, 83);
+        let mask: Vec<u8> = (0..17 * 13).map(|index| (index * 29 % 256) as u8).collect();
+        let edges = vec![0.5f32; 17 * 13];
+        let job = AlignmentFinalBlendJob {
+            original: Some(&original),
+            effect_rgb: Some(&effect),
+            teeth_mask: Some(&mask),
+            edge_plane_a: Some(&edges),
+            edge_plane_b: Some(&edges),
+        };
+        let expected = teeth_blend::apply_alignment_final_blend(job).unwrap();
+        let actual = gpu.apply_alignment_final_blend(job).unwrap();
+        match (expected, actual) {
+            (
+                AlignmentFinalBlendOutcome::Applied(expected),
+                AlignmentFinalBlendGpu::Applied { image, dispatches },
+            ) => {
+                assert_eq!(image.pixels, expected.pixels);
+                assert_eq!(dispatches.len(), 1);
+                assert_eq!(dispatches[0].kernel, KERNEL);
+                eprintln!(
+                    "PF30026 final blend kernel={} device={} grid={:?} block={:?} ptx_isa={:?}",
+                    dispatches[0].kernel,
+                    dispatches[0].device,
+                    dispatches[0].grid,
+                    dispatches[0].block,
+                    dispatches[0].ptx_isa
+                );
+            }
+            (expected, actual) => panic!("expected applied parity, got {expected:?} / {actual:?}"),
+        }
+    }
+
+    #[test]
+    fn alignment_final_blend_closed_gate_does_not_dispatch() {
+        let Some(gpu) = gpu() else { return };
+        let original = canvas(4, 4, 89);
+        let effect = canvas(4, 4, 97);
+        let job = AlignmentFinalBlendJob {
+            original: Some(&original),
+            effect_rgb: Some(&effect),
+            teeth_mask: Some(&[128; 16]),
+            edge_plane_a: Some(&[0.1; 16]),
+            edge_plane_b: Some(&[0.1; 16]),
+        };
+        assert_eq!(
+            gpu.apply_alignment_final_blend(job).unwrap(),
+            AlignmentFinalBlendGpu::Gated
+        );
+    }
+
+    #[test]
+    fn alignment_final_blend_missing_input_is_typed() {
+        let Some(gpu) = gpu() else { return };
+        let original = canvas(4, 4, 101);
+        let effect = canvas(4, 4, 103);
+        let err = gpu
+            .apply_alignment_final_blend(AlignmentFinalBlendJob {
+                original: Some(&original),
+                effect_rgb: Some(&effect),
+                teeth_mask: Some(&[128; 16]),
+                edge_plane_a: Some(&[0.5; 16]),
+                edge_plane_b: None,
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CudaError::Refused(Refusal::MissingInput("PF30026 edge plane B"))
+        );
     }
 }

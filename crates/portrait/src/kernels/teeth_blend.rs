@@ -65,6 +65,97 @@ pub fn apply(original: &Image, effect: &Image, mask: &[u8]) -> Result<Image, Ref
     Image::new(original.width, original.height, pixels).ok_or(Refusal::ShapeMismatch("teeth blend output"))
 }
 
+/// Inputs produced by one PF30026 worker job.
+///
+/// This is the final mask blend only. The opaque model output and dense warp
+/// are already inside `effect_rgb`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlignmentFinalBlendJob<'a> {
+    pub original: Option<&'a Image>,
+    /// RGBA8 container carrying the effect RGB; its alpha is ignored.
+    pub effect_rgb: Option<&'a Image>,
+    pub teeth_mask: Option<&'a [u8]>,
+    /// First worker `CV_32FC1` edge plane.
+    pub edge_plane_a: Option<&'a [f32]>,
+    /// Second worker `CV_32FC1` edge plane.
+    pub edge_plane_b: Option<&'a [f32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlignmentFinalBlendOutcome {
+    Gated,
+    Applied(Image),
+}
+
+pub(crate) struct ValidatedAlignmentFinalBlend<'a> {
+    pub original: &'a Image,
+    pub effect_rgb: &'a Image,
+    pub teeth_mask: &'a [u8],
+    pub gate_open: bool,
+}
+
+pub(crate) fn validate_alignment_final_blend(
+    job: AlignmentFinalBlendJob<'_>,
+) -> Result<ValidatedAlignmentFinalBlend<'_>, Refusal> {
+    let original = job
+        .original
+        .ok_or(Refusal::MissingInput("PF30026 original"))?;
+    let effect_rgb = job
+        .effect_rgb
+        .ok_or(Refusal::MissingInput("PF30026 effect RGB"))?;
+    let teeth_mask = job
+        .teeth_mask
+        .ok_or(Refusal::MissingInput("PF30026 teeth mask"))?;
+    let edge_plane_a = job
+        .edge_plane_a
+        .ok_or(Refusal::MissingInput("PF30026 edge plane A"))?;
+    let edge_plane_b = job
+        .edge_plane_b
+        .ok_or(Refusal::MissingInput("PF30026 edge plane B"))?;
+
+    original
+        .validate()
+        .map_err(|_| Refusal::ShapeMismatch("PF30026 original"))?;
+    effect_rgb
+        .validate()
+        .map_err(|_| Refusal::ShapeMismatch("PF30026 effect RGB"))?;
+    if (original.width, original.height) != (effect_rgb.width, effect_rgb.height) {
+        return Err(Refusal::ShapeMismatch("PF30026 effect RGB"));
+    }
+    if teeth_mask.len() != original.pixel_count() {
+        return Err(Refusal::ShapeMismatch("PF30026 teeth mask"));
+    }
+    let gate_open = crate::kernels::teeth_alignment::edge_gate(
+        edge_plane_a,
+        edge_plane_b,
+        original.width,
+        original.height,
+    )?;
+    Ok(ValidatedAlignmentFinalBlend {
+        original,
+        effect_rgb,
+        teeth_mask,
+        gate_open,
+    })
+}
+
+/// Validate the complete same-job bundle and return the A/B edge gate without
+/// blending pixels. Used by CUDA-only callers that must not report a CPU run.
+pub fn alignment_final_blend_gate(job: AlignmentFinalBlendJob<'_>) -> Result<bool, Refusal> {
+    validate_alignment_final_blend(job).map(|job| job.gate_open)
+}
+
+/// CPU oracle for the PF30026 alignment final blend stage.
+pub fn apply_alignment_final_blend(
+    job: AlignmentFinalBlendJob<'_>,
+) -> Result<AlignmentFinalBlendOutcome, Refusal> {
+    let job = validate_alignment_final_blend(job)?;
+    if !job.gate_open {
+        return Ok(AlignmentFinalBlendOutcome::Gated);
+    }
+    apply(job.original, job.effect_rgb, job.teeth_mask).map(AlignmentFinalBlendOutcome::Applied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +278,94 @@ mod tests {
         assert_eq!(
             apply(&broken, &effect, &[0; 4]),
             Err(Refusal::ShapeMismatch("teeth blend original"))
+        );
+    }
+
+    #[test]
+    fn alignment_stage_requires_every_same_job_input() {
+        let original = Image::solid(2, 2, [10, 20, 30, 40]);
+        let effect = Image::solid(2, 2, [200, 210, 220, 0]);
+        let mask = [128u8; 4];
+        let edge = [0.5f32; 4];
+        let full = AlignmentFinalBlendJob {
+            original: Some(&original),
+            effect_rgb: Some(&effect),
+            teeth_mask: Some(&mask),
+            edge_plane_a: Some(&edge),
+            edge_plane_b: Some(&edge),
+        };
+        for (job, missing) in [
+            (
+                AlignmentFinalBlendJob {
+                    original: None,
+                    ..full
+                },
+                "PF30026 original",
+            ),
+            (
+                AlignmentFinalBlendJob {
+                    effect_rgb: None,
+                    ..full
+                },
+                "PF30026 effect RGB",
+            ),
+            (
+                AlignmentFinalBlendJob {
+                    teeth_mask: None,
+                    ..full
+                },
+                "PF30026 teeth mask",
+            ),
+            (
+                AlignmentFinalBlendJob {
+                    edge_plane_a: None,
+                    ..full
+                },
+                "PF30026 edge plane A",
+            ),
+            (
+                AlignmentFinalBlendJob {
+                    edge_plane_b: None,
+                    ..full
+                },
+                "PF30026 edge plane B",
+            ),
+        ] {
+            assert_eq!(
+                validate_alignment_final_blend(job).err(),
+                Some(Refusal::MissingInput(missing))
+            );
+        }
+    }
+
+    #[test]
+    fn alignment_stage_obeys_the_same_job_edge_gate() {
+        let original = Image::solid(2, 2, [10, 20, 30, 40]);
+        let effect = Image::solid(2, 2, [200, 210, 220, 0]);
+        let mask = [128u8; 4];
+        let open = [0.5f32; 4];
+        let closed = [0.1f32; 4];
+        let applied = apply_alignment_final_blend(AlignmentFinalBlendJob {
+            original: Some(&original),
+            effect_rgb: Some(&effect),
+            teeth_mask: Some(&mask),
+            edge_plane_a: Some(&open),
+            edge_plane_b: Some(&open),
+        })
+        .unwrap();
+        assert_eq!(
+            applied,
+            AlignmentFinalBlendOutcome::Applied(apply(&original, &effect, &mask).unwrap())
+        );
+        assert_eq!(
+            apply_alignment_final_blend(AlignmentFinalBlendJob {
+                original: Some(&original),
+                effect_rgb: Some(&effect),
+                teeth_mask: Some(&mask),
+                edge_plane_a: Some(&closed),
+                edge_plane_b: Some(&closed),
+            }),
+            Ok(AlignmentFinalBlendOutcome::Gated)
         );
     }
 }

@@ -9,7 +9,9 @@
 //! as a pointer; the PTX signature is the contract.
 
 use crate::cuda::{CudaError, Dispatch};
-use crate::kernels::makeup_material::{BlendMode, ColorMaterialParams, MaskChannel};
+use crate::kernels::makeup_material::{
+    BlendMode, ColorMaterialParams, MakeupLayer as CpuMakeupLayer, MaskChannel,
+};
 use crate::{Image, Refusal};
 
 /// Recovered kernel entry point.
@@ -75,6 +77,100 @@ fn channel_index(channel: MaskChannel) -> u32 {
         MaskChannel::Gba => 13,
         MaskChannel::Rgba => 14,
     }
+}
+
+pub const ROUTED_PFS: [u32; 7] = [100, 103, 105, 111, 117, 118, 30007];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MakeupRoute {
+    Color {
+        pf: u32,
+        filter_type: u32,
+        mask_channel: MaskChannel,
+    },
+    ImageUnmasked {
+        pf: u32,
+        filter_type: u32,
+    },
+}
+
+impl MakeupRoute {
+    pub fn resolve(pf: u32) -> Result<Self, Refusal> {
+        Ok(match pf {
+            100 | 117 => Self::Color {
+                pf,
+                filter_type: 11,
+                mask_channel: MaskChannel::RB,
+            },
+            103 | 30007 => Self::Color {
+                pf,
+                filter_type: 11,
+                mask_channel: MaskChannel::RG,
+            },
+            105 | 118 => Self::Color {
+                pf,
+                filter_type: 11,
+                mask_channel: MaskChannel::RG,
+            },
+            111 => Self::ImageUnmasked {
+                pf,
+                filter_type: 40,
+            },
+            _ => return Err(Refusal::UnknownEffect(pf)),
+        })
+    }
+
+    pub fn pf(self) -> u32 {
+        match self {
+            Self::Color { pf, .. } | Self::ImageUnmasked { pf, .. } => pf,
+        }
+    }
+
+    pub fn filter_type(self) -> u32 {
+        match self {
+            Self::Color { filter_type, .. } | Self::ImageUnmasked { filter_type, .. } => {
+                filter_type
+            }
+        }
+    }
+
+    pub fn mask_channel(self) -> Option<MaskChannel> {
+        match self {
+            Self::Color { mask_channel, .. } => Some(mask_channel),
+            Self::ImageUnmasked { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RouteInputs<'a> {
+    pub mix_color: [u8; 4],
+    pub opacity_percent: f32,
+    pub degree01: f32,
+    pub filter_type: u32,
+    pub material: Option<&'a Image>,
+    pub material_uv: Option<&'a [[f32; 2]]>,
+    pub mask: Option<&'a Image>,
+    pub mask_uv: Option<&'a [[f32; 2]]>,
+}
+
+fn route_layer(route: MakeupRoute, inputs: RouteInputs<'_>) -> Result<CpuMakeupLayer, Refusal> {
+    if inputs.filter_type != route.filter_type() {
+        return Err(Refusal::ValueOutOfRange("makeup FilterType"));
+    }
+    if !inputs.opacity_percent.is_finite() || !(0.0..=100.0).contains(&inputs.opacity_percent) {
+        return Err(Refusal::ValueOutOfRange("opacity_percent"));
+    }
+    if !inputs.degree01.is_finite() || !(0.0..=1.0).contains(&inputs.degree01) {
+        return Err(Refusal::ValueOutOfRange("degree01"));
+    }
+    Ok(CpuMakeupLayer {
+        mix_color: inputs.mix_color,
+        opacity_percent: inputs.opacity_percent,
+        degree01: inputs.degree01,
+        filter_type: route.filter_type(),
+        mask_channel: route.mask_channel().unwrap_or(MaskChannel::A),
+    })
 }
 
 /// Mirrors `apply_image_layer_dual`'s entry checks.
@@ -172,6 +268,57 @@ impl MakeupLayer {
             .ok_or(CudaError::Refused(Refusal::ShapeMismatch("output")))?;
         Ok((image, vec![dispatch]))
     }
+
+    /// Applies one of the seven recovered makeup rows through the shared
+    /// image-layer kernel. Color rows use an opaque 1x1 material; PF111 uses a
+    /// constant opaque alpha mask to express its fixed no-mask program.
+    pub fn apply_route(
+        &self,
+        pf: u32,
+        source: &Image,
+        inputs: RouteInputs<'_>,
+    ) -> Result<(Image, Vec<Dispatch>), CudaError> {
+        let route = MakeupRoute::resolve(pf).map_err(CudaError::Refused)?;
+        let layer = route_layer(route, inputs).map_err(CudaError::Refused)?;
+        let params = layer.params_of().map_err(CudaError::Refused)?;
+        match route {
+            MakeupRoute::Color { .. } => {
+                let mask = inputs
+                    .mask
+                    .ok_or(CudaError::Refused(Refusal::MissingInput("makeup mask")))?;
+                let mask_uv = inputs.mask_uv.ok_or(CudaError::Refused(Refusal::MissingInput(
+                    "makeup mask UV",
+                )))?;
+                let [r, g, b, _] = inputs.mix_color;
+                let material = Image::solid(1, 1, [r, g, b, 255]);
+                self.apply_image_layer_dual(
+                    source, &material, mask, mask_uv, mask_uv, params,
+                )
+            }
+            MakeupRoute::ImageUnmasked { .. } => {
+                let material = inputs
+                    .material
+                    .ok_or(CudaError::Refused(Refusal::MissingInput("makeup material")))?;
+                let material_uv = inputs.material_uv.ok_or(CudaError::Refused(
+                    Refusal::MissingInput("makeup material UV"),
+                ))?;
+                if inputs.mask.is_some() || inputs.mask_uv.is_some() {
+                    return Err(CudaError::Refused(Refusal::ValueOutOfRange(
+                        "PF111 mask must be absent",
+                    )));
+                }
+                let identity_mask = Image::solid(1, 1, [0, 0, 0, 255]);
+                self.apply_image_layer_dual(
+                    source,
+                    material,
+                    &identity_mask,
+                    material_uv,
+                    material_uv,
+                    params,
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +352,30 @@ mod tests {
         assert_eq!(mode_index(BlendMode::SoftLight), Some(2));
         assert_eq!(mode_index(BlendMode::PinLight), Some(3));
         assert_eq!(mode_index(BlendMode::Screen), None);
+    }
+
+    #[test]
+    fn route_family_is_exact() {
+        let expected = [
+            (100, 11, Some(MaskChannel::RB)),
+            (103, 11, Some(MaskChannel::RG)),
+            (105, 11, Some(MaskChannel::RG)),
+            (111, 40, None),
+            (117, 11, Some(MaskChannel::RB)),
+            (118, 11, Some(MaskChannel::RG)),
+            (30007, 11, Some(MaskChannel::RG)),
+        ];
+        assert_eq!(
+            ROUTED_PFS.map(|pf| {
+                let route = MakeupRoute::resolve(pf).unwrap();
+                (route.pf(), route.filter_type(), route.mask_channel())
+            }),
+            expected
+        );
+        assert_eq!(MakeupRoute::resolve(106), Err(Refusal::UnknownEffect(106)));
+        assert_eq!(
+            MakeupRoute::resolve(90032),
+            Err(Refusal::UnknownEffect(90032))
+        );
     }
 }
