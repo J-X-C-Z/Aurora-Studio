@@ -2,12 +2,12 @@
 
 #[cfg(windows)]
 mod makeup_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_makeup::{MakeupLayer, KERNEL};
-    use aurora_pixcake::kernels::makeup_material::{
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_makeup::{MakeupLayer, KERNEL};
+    use aurora_portrait::kernels::makeup_material::{
         self, BlendMode, ColorMaterialParams, MaskChannel,
     };
-    use aurora_pixcake::{Image, Refusal};
+    use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -35,7 +35,7 @@ mod makeup_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

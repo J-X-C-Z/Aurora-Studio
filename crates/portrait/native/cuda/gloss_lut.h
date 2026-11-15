@@ -10,8 +10,7 @@
  * writes r/g/b and copies alpha through untouched. `mask_r` and `extra_mask_r`
  * are one byte per pixel; their product (each /255) is the blend weight.
  *
- * The explicit `lut` pointer supplies 256 caller-owned bytes.
- * `pass` identifies the stage: 0 positive1, 1 positive2,
+ * `pass` selects the embedded 256-entry table: 0 positive1, 1 positive2,
  * 2 negative. `degree` is the already-normalised positive/negative value.
  */
 typedef struct GlossUniforms {

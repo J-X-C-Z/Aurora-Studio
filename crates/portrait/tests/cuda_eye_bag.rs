@@ -2,10 +2,10 @@
 
 #[cfg(windows)]
 mod eye_bag_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_eye_bag::{reference, EyeBag, KERNEL};
-    use aurora_pixcake::kernels::eye_bag::{self, BlendMode};
-    use aurora_pixcake::{Image, Refusal};
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_eye_bag::{reference, EyeBag, KERNEL};
+    use aurora_portrait::kernels::eye_bag::{self, BlendMode};
+    use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -29,7 +29,7 @@ mod eye_bag_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

@@ -3,9 +3,9 @@
 ## 基本要求
 
 - 一个改动解决一个明确问题，并说明用户可见结果、测试范围和已知限制。
-- 界面只能通过 `lumen_engine::ImageEngine` 访问处理逻辑。
+- 界面只能通过 `aurora_engine::ImageEngine` 访问处理逻辑。
 - 保持 `Cargo.lock` 可复现；升级依赖时说明原因、兼容性和验证结果。
-- 项目代码采用 MIT 许可证；贡献须拥有相应权利，第三方资产不因本项目许可而获得再分发权。
+- 许可证保持 `Proprietary`。贡献不代表获得再分发权，不得擅自改成开源许可。
 - 不提交个人照片、客户数据、相机序列号、GPS、所有者信息、本机路径、
   Capture One 私有资产或其他无权再分发的文件。
 
@@ -23,7 +23,7 @@ CI 只运行不依赖外部资产的 synthetic 测试。涉及外部资产的测
 `external-fixtures` feature 后，只能在具备合法本地资产的机器上运行：
 
 ```powershell
-cargo test -p lumen-engine --features external-fixtures --locked -- --test-threads=1
+cargo test -p aurora-engine --features external-fixtures --locked -- --test-threads=1
 ```
 
 `crates/engine/testdata/` 被 `.gitignore` 整体排除。不得为了让 CI 通过而上传
@@ -54,7 +54,7 @@ latest-value 实现必须保证：
   超阈值像素比例及目标容差。
 - 画质截图或可复现命令，覆盖高光、阴影、肤色、细发、文字边缘和噪声区域。
 
-`preview_bench` 和 `LUMEN_PERF_REPLAY` 可用于取证，但单次结果或缓存命中时间
+`preview_bench` 和 `AURORA_PERF_REPLAY` 可用于取证，但单次结果或缓存命中时间
 不能代替发布基准。共享 CI runner 的数字不作为性能验收值。
 
 ## 原图与数据安全
@@ -82,9 +82,3 @@ latest-value 实现必须保证：
 
 PR 应写明修改前后行为、命令结果、未验证项和风险。CI 未实际运行或外部 fixture
 测试未运行时必须明确写出，不能把本地检查描述为 CI 通过。
-
-## 人像阶段
-
-算法阶段、CPU/GPU 执行、自动模型输入与真实照片效果分别验收。显式输入必须来自同一图像和处理任务；禁止捏造人脸、蒙版、LUT、模型输出或原厂默认值补齐缺口。界面只能通过 ImageEngine 调用；阶段注册不等于自动滑块已接通。
-
-人像阶段的 RGB/alpha、ROI、量化规则和输入校验必须保留。CUDA 比对要求实际 dispatch，并明确设备与用例；无 GPU 的 CI 只验证编译与 CPU/合成合同。厂商资源不能内嵌到 Rust、PTX、测试数组或发布包，测试用自造输入。RGBA8 阶段禁止用于伪造 16 位处理或低清放大导出。

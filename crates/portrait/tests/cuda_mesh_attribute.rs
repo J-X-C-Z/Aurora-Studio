@@ -1,7 +1,3 @@
-#[cfg(feature = "external-fixtures")]
-#[path = "support/mod.rs"]
-mod external_fixtures;
-
 // PF8033 attribute rasterizer on the GPU, bit-for-bit against the CPU.
 //
 // Last-writer order is reproduced by "highest covering triangle index wins",
@@ -9,30 +5,23 @@ mod external_fixtures;
 
 #[cfg(windows)]
 mod attribute_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_mesh_attribute::{MeshAttribute, RESOLVE_KERNEL, SELECT_KERNEL};
-    use aurora_pixcake::kernels::mesh_attribute;
-    use aurora_pixcake::Refusal;
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_mesh_attribute::{MeshAttribute, RESOLVE_KERNEL, SELECT_KERNEL};
+    use aurora_portrait::kernels::mesh_attribute;
+    use aurora_portrait::Refusal;
 
-
-    #[cfg(feature = "external-fixtures")]
-
+    const TRIANGLES: &[u8] = include_bytes!("../../../assets/portrait/smile/triangles.u32le");
+    const MEAN: &[u8] = include_bytes!("../../../assets/portrait/smile/mean.f32le");
 
     fn decode_faces() -> Vec<u32> {
-        let bytes = super::external_fixtures::read("smile/triangles.u32le");
-        assert_eq!(bytes.len(), 51228);
-        bytes
+        TRIANGLES
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
 
-    #[cfg(feature = "external-fixtures")]
-
     fn decode_mean() -> Vec<[f32; 2]> {
-        let bytes = super::external_fixtures::read("smile/mean.f32le");
-        assert_eq!(bytes.len(), 26472);
-        bytes.chunks_exact(12)
+        MEAN.chunks_exact(12)
             .map(|c| {
                 [
                     f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
@@ -48,7 +37,7 @@ mod attribute_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None
@@ -87,7 +76,6 @@ mod attribute_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn real_mesh_matches_the_cpu_on_96x64() {
         let Some(gpu) = gpu() else { return };
         let mean = decode_mean();
@@ -106,7 +94,6 @@ mod attribute_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn real_mesh_matches_the_cpu_on_512x512() {
         let Some(gpu) = gpu() else { return };
         let mean = decode_mean();

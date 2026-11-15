@@ -221,7 +221,7 @@ mod tests {
     fn gpu_compose_matches_the_cpu_order() {
         let Ok(gpu) = crate::cuda_makeup::MakeupLayer::open() else {
             assert!(
-                std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                 "CUDA required but unavailable"
             );
             return;

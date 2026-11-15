@@ -136,12 +136,12 @@ fn to_unit(pts: &[(u32, u32)]) -> Vec<(f32, f32)> {
 static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Directory holding Capture One's `.fcrv` files. `use_dir` wins, then
-/// `LUMEN_FILM_CURVES`, then this machine's install.
+/// `AURORA_FILM_CURVES`, then this machine's install.
 pub fn curve_dir() -> PathBuf {
     if let Some(dir) = DIR.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         return dir.clone();
     }
-    std::env::var_os("LUMEN_FILM_CURVES")
+    std::env::var_os("AURORA_FILM_CURVES")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One\Film Curves"))
 }

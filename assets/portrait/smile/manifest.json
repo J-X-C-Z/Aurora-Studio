@@ -1,0 +1,54 @@
+{
+  "family": "SmileMouth3D_DL3D_Warp",
+  "note": "2206-vertex / 4269-face morphable model; triangles are u32 (OBJ index-1)",
+  "param_flag": 8033,
+  "order": "mean, normal, side_right, side_left",
+  "vertex_count": 2206,
+  "triangle_count": 4269,
+  "topology_identical": true,
+  "assets": [
+    {
+      "file": "mean.f32le",
+      "bytes": 26472,
+      "config_field": "MeanShape",
+      "sha256": "3F1B97071F9EEDB061E023FC98B67965833897930124A15C667A73618971CC2C",
+      "source": "C:\\WorkSpace\\\u81ea\u7814\u56fe\u50cf\u7f16\u8f91\u8f6f\u4ef6\\\u9006\u5411\u5de5\u7a0b\\\u50cf\u7d20\u86cb\u7cd5\\effect-decrypted\\config\\SmileMouth3D\\meanshape.obj"
+    },
+    {
+      "file": "normal.f32le",
+      "bytes": 26472,
+      "config_field": "ReshapeList[0]",
+      "sha256": "E16FA83F7604254DB39CD275F6F6FA3A4C01F587E4DE71E3563B41B4ED83EDD3",
+      "source": "C:\\WorkSpace\\\u81ea\u7814\u56fe\u50cf\u7f16\u8f91\u8f6f\u4ef6\\\u9006\u5411\u5de5\u7a0b\\\u50cf\u7d20\u86cb\u7cd5\\effect-decrypted\\config\\SmileMouth3D\\normal.obj"
+    },
+    {
+      "file": "side_right.f32le",
+      "bytes": 26472,
+      "config_field": "ReshapeList[1]",
+      "sha256": "D2B0D35F0E1241934876EA0D8FB8BDE5EBE3851609D93221D67D1B8B80273DD8",
+      "source": "C:\\WorkSpace\\\u81ea\u7814\u56fe\u50cf\u7f16\u8f91\u8f6f\u4ef6\\\u9006\u5411\u5de5\u7a0b\\\u50cf\u7d20\u86cb\u7cd5\\effect-decrypted\\config\\SmileMouth3D\\side_right.obj"
+    },
+    {
+      "file": "side_left.f32le",
+      "bytes": 26472,
+      "config_field": "ReshapeList[2]",
+      "sha256": "5018891FF5FB2D651FD34F78F2F1720A1D0C3E1E56D670FA37DCB0AF16BADA5B",
+      "source": "C:\\WorkSpace\\\u81ea\u7814\u56fe\u50cf\u7f16\u8f91\u8f6f\u4ef6\\\u9006\u5411\u5de5\u7a0b\\\u50cf\u7d20\u86cb\u7cd5\\effect-decrypted\\config\\SmileMouth3D\\side_left.obj"
+    },
+    {
+      "file": "triangles.u32le",
+      "bytes": 51228,
+      "config_field": "topology",
+      "sha256": "059078C65E53383D25982FC99F683F7AACECA934D5EE591829D611FA39183F21",
+      "source": "C:\\WorkSpace\\\u81ea\u7814\u56fe\u50cf\u7f16\u8f91\u8f6f\u4ef6\\\u9006\u5411\u5de5\u7a0b\\\u50cf\u7d20\u86cb\u7cd5\\effect-decrypted\\config\\SmileMouth3D\\meanshape.obj (faces, verified identical in all 4)"
+    },
+    {
+      "file": "effect.json",
+      "bytes": 1070,
+      "config_field": "EffectName=DL3D_Warp",
+      "sha256": "E5C4D83E5A353A903C429E0F2271EAC21C2E1ACBD9BDAD26672F9A4A16E69998",
+      "source": "C:\\WorkSpace\\\u81ea\u7814\u56fe\u50cf\u7f16\u8f91\u8f6f\u4ef6\\\u9006\u5411\u5de5\u7a0b\\\u50cf\u7d20\u86cb\u7cd5\\effect-decrypted\\config\\SmileMouth3D\\effect.json"
+    }
+  ],
+  "schema": "aurora-local-smile-assets/1"
+}

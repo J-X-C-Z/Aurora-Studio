@@ -4,14 +4,14 @@
 //! never records a pass. Run on macOS with:
 //!
 //! ```text
-//! cargo test -p aurora-pixcake --test metal_runtime -- --ignored --test-threads=1
+//! cargo test -p aurora-portrait --test metal_runtime -- --ignored --test-threads=1
 //! ```
 //!
 //! On a non-macOS host an explicit `--ignored` run panics instead of skipping,
 //! so a missing Apple GPU can never be mistaken for a pass.
 
-use aurora_pixcake::kernels::facial_smooth::{composite_pixel, Uniforms as CpuUniforms};
-use aurora_pixcake::metal::{
+use aurora_portrait::kernels::facial_smooth::{composite_pixel, Uniforms as CpuUniforms};
+use aurora_portrait::metal::{
     BlurKernel, MetalContext, MetalRefusal, ProductUniforms, ProjectionInput, SmoothInput,
     WhitenInput, LUT_FLOATS,
 };
@@ -57,7 +57,7 @@ fn cpu_product() -> CpuUniforms {
 #[ignore = "requires macOS Metal device"]
 fn p15_composite_matches_cpu_float_golden_on_non_square_roi() {
     require_macos();
-    assert!(aurora_pixcake::metal::available());
+    assert!(aurora_portrait::metal::available());
 
     // Five by three ROI with a padded stride: exercises a non-square dispatch.
     let width = 5u32;

@@ -7,7 +7,7 @@ use gpui_kit::component::{
     h_flex, v_flex,
 };
 use gpui_kit::{AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div};
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::global;
 use crate::i18n::t;
@@ -144,30 +144,7 @@ impl SelectedExt for Button {
     }
 }
 
-/// Sets the crop ratio and fits the crop to it around its center. `original`
-/// is the oriented image's width over height.
-pub(crate) fn set_aspect(adj: &mut AdjustmentSet, a: AspectRatio, original: f32) {
-    adj.geometry.aspect = a;
-    if let Some(r) = a.ratio(original) {
-        let r = if adj.geometry.portrait { 1.0 / r } else { r };
-        let k = r / original;
-        let c = adj.geometry.crop;
-        let (cx0, cy0) = (c.x + c.width / 2.0, c.y + c.height / 2.0);
-        let (mut w, mut h) = (c.width, c.width / k);
-        if h > c.height {
-            h = c.height;
-            w = h * k;
-        }
-        adj.geometry.crop = NormRect {
-            x: (cx0 - w / 2.0).clamp(0.0, 1.0 - w),
-            y: (cy0 - h / 2.0).clamp(0.0, 1.0 - h),
-            width: w,
-            height: h,
-        };
-    }
-}
-
-pub(crate) fn aspect_name(a: AspectRatio) -> &'static str {
+fn aspect_name(a: AspectRatio) -> &'static str {
     match a {
         AspectRatio::Unconstrained => t("Unconstrained", "不受约束"),
         AspectRatio::Original => t("Original", "原始比例"),
@@ -206,7 +183,24 @@ fn crop_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
             select("crop-ratio", AspectRatio::ALL.iter().map(|a| (*a, aspect_name(*a).into())).collect(), g.aspect, move |a, _, cx| {
                 st2.update(cx, |s, cx| {
                     s.edit(t("Crop ratio", "裁剪比例"), |adj| {
-                        set_aspect(adj, a, original);
+                        adj.geometry.aspect = a;
+                        if let Some(r) = a.ratio(original) {
+                            let r = if adj.geometry.portrait { 1.0 / r } else { r };
+                            let k = r / original;
+                            let c = adj.geometry.crop;
+                            let (cx0, cy0) = (c.x + c.width / 2.0, c.y + c.height / 2.0);
+                            let (mut w, mut h) = (c.width, c.width / k);
+                            if h > c.height {
+                                h = c.height;
+                                w = h * k;
+                            }
+                            adj.geometry.crop = NormRect {
+                                x: (cx0 - w / 2.0).clamp(0.0, 1.0 - w),
+                                y: (cy0 - h / 2.0).clamp(0.0, 1.0 - h),
+                                width: w,
+                                height: h,
+                            };
+                        }
                     }, cx)
                 })
             }),

@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use lumen_engine::{AdjustmentSet, LocalAdjustments};
+use aurora_engine::{AdjustmentSet, LocalAdjustments};
 
 /// Where tool edits land: the background, or one local adjustment layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,8 +47,8 @@ pub fn extra_binding(key: impl Into<String>, default: f32) -> Binding {
 macro_rules! global {
     ($($path:tt)+) => {
         $crate::state::Binding::new(
-            move |a: &lumen_engine::AdjustmentSet| a.$($path)+,
-            move |a: &mut lumen_engine::AdjustmentSet, v: f32| a.$($path)+ = v,
+            move |a: &aurora_engine::AdjustmentSet| a.$($path)+,
+            move |a: &mut aurora_engine::AdjustmentSet, v: f32| a.$($path)+ = v,
         )
     };
 }
@@ -59,7 +59,7 @@ macro_rules! scoped {
     ($scope:expr, $($path:tt)+) => {{
         let scope: $crate::state::Scope = $scope;
         $crate::state::Binding::new(
-            move |a: &lumen_engine::AdjustmentSet| match scope {
+            move |a: &aurora_engine::AdjustmentSet| match scope {
                 $crate::state::Scope::Global => a.$($path)+,
                 $crate::state::Scope::Layer(id) => a
                     .layers
@@ -68,7 +68,7 @@ macro_rules! scoped {
                     .map(|l| l.adjustments.$($path)+)
                     .unwrap_or_default(),
             },
-            move |a: &mut lumen_engine::AdjustmentSet, v: f32| match scope {
+            move |a: &mut aurora_engine::AdjustmentSet, v: f32| match scope {
                 $crate::state::Scope::Global => a.$($path)+ = v,
                 $crate::state::Scope::Layer(id) => {
                     if let Some(l) = a.layers.iter_mut().find(|l| l.id == id) {
@@ -86,8 +86,8 @@ macro_rules! layer_field {
     ($id:expr, $($path:tt)+) => {{
         let id: u64 = $id;
         $crate::state::Binding::new(
-            move |a: &lumen_engine::AdjustmentSet| a.layers.iter().find(|l| l.id == id).map(|l| l.$($path)+).unwrap_or_default(),
-            move |a: &mut lumen_engine::AdjustmentSet, v: f32| {
+            move |a: &aurora_engine::AdjustmentSet| a.layers.iter().find(|l| l.id == id).map(|l| l.$($path)+).unwrap_or_default(),
+            move |a: &mut aurora_engine::AdjustmentSet, v: f32| {
                 if let Some(l) = a.layers.iter_mut().find(|l| l.id == id) {
                     l.$($path)+ = v;
                 }
@@ -124,5 +124,44 @@ pub fn read_scoped<'a, T>(
     match scope {
         Scope::Global => Some(global(a)),
         Scope::Layer(id) => a.layers.iter().find(|l| l.id == id).map(|l| local(&l.adjustments)),
+    }
+}
+
+/// Reads a scoped structure that local layers store as `Option`. A layer
+/// without the edit reads as neutral; the background always has one.
+pub fn read_scoped_optional<'a, T: Clone + Default + 'a>(
+    a: &'a AdjustmentSet,
+    scope: Scope,
+    global: impl FnOnce(&'a AdjustmentSet) -> &'a T,
+    local: impl FnOnce(&'a LocalAdjustments) -> &'a Option<T>,
+) -> T {
+    match scope {
+        Scope::Global => global(a).clone(),
+        Scope::Layer(id) => a
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .and_then(|l| local(&l.adjustments).as_ref())
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+/// The write side of [`read_scoped_optional`]: a local layer materialises the
+/// structure on the first edit.
+pub fn with_scoped_optional<T: Default>(
+    a: &mut AdjustmentSet,
+    scope: Scope,
+    global: impl FnOnce(&mut AdjustmentSet) -> &mut T,
+    local: impl FnOnce(&mut LocalAdjustments) -> &mut Option<T>,
+    f: impl FnOnce(&mut T),
+) {
+    match scope {
+        Scope::Global => f(global(a)),
+        Scope::Layer(id) => {
+            if let Some(l) = a.layers.iter_mut().find(|l| l.id == id) {
+                f(local(&mut l.adjustments).get_or_insert_default());
+            }
+        }
     }
 }

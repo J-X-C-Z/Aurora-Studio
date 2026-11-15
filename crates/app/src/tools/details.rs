@@ -9,7 +9,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, Styled, StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px, relative,
 };
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::i18n::t;
 use crate::state::{AppState, Binding, CursorTool, Scope};
@@ -46,7 +46,7 @@ pub fn panel(id: &str, state: &Entity<AppState>, _window: &mut Window, cx: &mut 
 }
 
 /// Binds a field of an optional local structure, creating it from the background's copy on first write.
-pub(crate) fn opt_binding<T: Clone + Default + 'static>(
+fn opt_binding<T: Clone + Default + 'static>(
     scope: Scope,
     global: fn(&mut AdjustmentSet) -> &mut T,
     local: fn(&mut LocalAdjustments) -> &mut Option<T>,
@@ -314,6 +314,8 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let p = pal(cx).clone();
     let (st, st2) = (state.clone(), state.clone());
     let size = s.panels.brush_size;
+    let clone = s.panels.spot_clone;
+    let anchored = s.spot_anchor.is_some();
     ToolPanel::new(state, "spots", t("Spot Removal", "污点去除"))
         .status(crate::contract::SPOTS)
         .modified(!spots.is_empty())
@@ -325,12 +327,52 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                     .xsmall()
                     .map(|b| if active { b.primary() } else { b.outline() })
                     .icon(Icon::new(IconName::Bandage))
-                    .label(if active { t("Click image to add", "单击图像添加") } else { t("Heal & clone tool", "修复与仿制工具") })
+                    .label(if !active {
+                        t("Heal & clone tool", "修复与仿制工具")
+                    } else if clone {
+                        if anchored { t("Click target", "单击目标点") } else { t("Click source", "单击源点") }
+                    } else {
+                        t("Click image to add", "单击图像添加")
+                    })
                     .on_click(move |_, _, cx| {
                         st2.update(cx, |s, cx| {
                             let next = if s.cursor == CursorTool::Spot { CursorTool::Select } else { CursorTool::Spot };
                             s.set_cursor(next, cx)
                         })
+                    }),
+            ),
+        )
+        .child(
+            h_flex().px_3().pb_1().gap_1().child(
+                Button::new("spot-heal")
+                    .xsmall()
+                    .map(|b| if clone { b.outline() } else { b.primary() })
+                    .label(t("Heal", "修复"))
+                    .on_click({
+                        let st = state.clone();
+                        move |_, _, cx| {
+                            st.update(cx, |s, cx| {
+                                s.panels.spot_clone = false;
+                                s.spot_anchor = None;
+                                s.set_cursor(CursorTool::Spot, cx);
+                                cx.notify();
+                            })
+                        }
+                    }),
+            ).child(
+                Button::new("spot-clone")
+                    .xsmall()
+                    .map(|b| if clone { b.primary() } else { b.outline() })
+                    .label(t("Clone", "仿制"))
+                    .on_click({
+                        let st = state.clone();
+                        move |_, _, cx| {
+                            st.update(cx, |s, cx| {
+                                s.panels.spot_clone = true;
+                                s.set_cursor(CursorTool::Spot, cx);
+                                cx.notify();
+                            })
+                        }
                     }),
             ),
         )
@@ -364,12 +406,21 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                     Button::new(SharedString::from(format!("spot-kind-{id}")))
                         .xsmall()
                         .ghost()
-                        .label(if kind == SpotKind::Dust { t("Dust", "灰尘") } else { t("Spot", "斑点") })
+                        .label(match kind {
+                            SpotKind::Dust => t("Dust", "灰尘"),
+                            SpotKind::Spot => t("Spot", "斑点"),
+                            SpotKind::Clone { .. } => t("Clone", "仿制"),
+                        })
                         .on_click(move |_, _, cx| {
                             st_k.update(cx, |s, cx| {
                                 s.edit(t("Spot type", "污点类型"), |a| {
                                     if let Some(sp) = a.spots.iter_mut().find(|s| s.id == id) {
-                                        sp.kind = if sp.kind == SpotKind::Dust { SpotKind::Spot } else { SpotKind::Dust };
+                                        sp.kind = match sp.kind {
+                                            SpotKind::Dust => SpotKind::Spot,
+                                            SpotKind::Spot => SpotKind::Dust,
+                                            // A clone without its offset is just a heal.
+                                            SpotKind::Clone { .. } => SpotKind::Spot,
+                                        };
                                     }
                                 }, cx)
                             })

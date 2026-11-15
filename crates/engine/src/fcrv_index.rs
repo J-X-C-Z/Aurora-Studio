@@ -156,13 +156,12 @@ mod tests {
     const INSTALLED: &str = r"C:\Program Files\Capture One\Capture One\Film Curves";
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lumen-fcrv-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-fcrv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn installed_directory_enumerates_every_curve() {
         let dir = PathBuf::from(INSTALLED);
@@ -176,8 +175,24 @@ mod tests {
         assert!(index.rows.iter().any(|r| r.name == "NikonZ6III-Auto"));
     }
 
+    #[test]
+    fn bad_file_is_reported_not_fatal() {
+        let dir = temp_dir("bad");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/NikonZ6III-Auto.fcrv"),
+            dir.join("Good.fcrv"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("Broken.fcrv"), b"PK\x03\x04not a curve").unwrap();
+        let index = scan(&dir);
+        assert_eq!(index.total, 2);
+        assert_eq!(index.parsed, 1);
+        assert_eq!(index.failed, 1);
+        assert_eq!(index.failures.len(), 1);
+        assert!(index.failures[0].starts_with("Broken.fcrv:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn nikon_z_series_maps_to_auto_curve() {
         let _serial = crate::filmcurve::test_lock();
@@ -194,6 +209,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rows_are_sorted_by_name() {
+        let dir = temp_dir("sort");
+        let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/NikonZ6III-Auto.fcrv");
+        for name in ["Zulu", "alpha", "Mike"] {
+            std::fs::copy(&sample, dir.join(format!("{name}.fcrv"))).unwrap();
+        }
+        let index = scan(&dir);
+        let names: Vec<_> = index.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "Mike", "Zulu"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_stem_sorts_before_its_variants() {
+        let dir = temp_dir("variant");
+        let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/NikonZ6III-Auto.fcrv");
+        for name in ["Body Film ACROS +Ye FILTER", "Body Film ACROS"] {
+            std::fs::copy(&sample, dir.join(format!("{name}.fcrv"))).unwrap();
+        }
+        let index = scan(&dir);
+        let names: Vec<_> = index.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Body Film ACROS", "Body Film ACROS +Ye FILTER"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn json_quantises_to_four_decimals() {
@@ -210,7 +250,4 @@ mod tests {
         assert!(json.contains("\"points\":[[0.1235,0],[1,1]]"), "{json}");
         assert!(json.contains("\"monotonic\":true"));
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/fcrv_index-tests.rs");
 }

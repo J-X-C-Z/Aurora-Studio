@@ -2,10 +2,12 @@
 //! dehaze and vignetting. Everything except vignetting follows the selected layer.
 
 use gpui_kit::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, Window, div, prelude::FluentBuilder as _, px};
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::i18n::t;
-use crate::state::{AppState, Scope, read_scoped, with_scoped};
+use crate::state::{
+    AppState, Scope, read_scoped, read_scoped_optional, with_scoped, with_scoped_optional,
+};
 use crate::theme::{hex, pal};
 use crate::widgets::*;
 use crate::{global, scoped};
@@ -64,7 +66,7 @@ fn scopes_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
                     .on_select(move |i, _, cx| {
                         st.update(cx, |s, cx| {
                             s.panels.scope_kind = crate::state::ScopeKind::ALL[i];
-                            s.request_render(lumen_engine::RenderQuality::Final, cx);
+                            s.request_render(aurora_engine::RenderQuality::Final, cx);
                             cx.notify();
                         })
                     }),
@@ -202,7 +204,7 @@ fn channel_bins(h: &Histogram, c: ToneChannel) -> Vec<f32> {
 fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let channel = s.panels.levels_channel;
-    let levels = read_scoped(s.adj(), scope, |a| &a.levels, |l| &l.levels).cloned().unwrap_or_default();
+    let levels = read_scoped_optional(s.adj(), scope, |a| &a.levels, |l| &l.levels);
     let value = levels.channel(channel).clone();
     let hist = channel_bins(&s.preview.histogram, channel);
     let (st, st2, st3, st4) = (state.clone(), state.clone(), state.clone(), state.clone());
@@ -213,7 +215,7 @@ fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx
         .on_reset(move |_, cx| {
             st.update(cx, |s, cx| {
                 let scope = s.scope();
-                s.edit(t("Reset levels", "复位色阶"), |a| with_scoped(a, scope, |a| &mut a.levels, |l| &mut l.levels, |l| *l = Default::default()), cx)
+                s.edit(t("Reset levels", "复位色阶"), |a| with_scoped_optional(a, scope, |a| &mut a.levels, |l| &mut l.levels, |v| *v = Default::default()), cx)
             })
         })
         .child(
@@ -238,7 +240,7 @@ fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx
                         let scope = s.scope();
                         let channel = s.panels.levels_channel;
                         s.edit_live(t("Levels", "色阶"), |a| {
-                            with_scoped(a, scope, |a| &mut a.levels, |l| &mut l.levels, |l| *l.channel_mut(channel) = v)
+                            with_scoped_optional(a, scope, |a| &mut a.levels, |l| &mut l.levels, |lv| *lv.channel_mut(channel) = v)
                         }, cx)
                     })
                 })
@@ -252,7 +254,7 @@ fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx
 fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let channel = s.panels.curve_channel;
-    let curves = read_scoped(s.adj(), scope, |a| &a.curves, |l| &l.curves).cloned().unwrap_or_default();
+    let curves = read_scoped_optional(s.adj(), scope, |a| &a.curves, |l| &l.curves);
     let curve = curves.channel(channel).clone();
     let hist = channel_bins(&s.preview.histogram, channel);
     let idx = ToneChannel::CURVES.iter().position(|c| *c == channel).unwrap_or(0);
@@ -265,7 +267,7 @@ fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoEle
                 let scope = s.scope();
                 let channel = s.panels.curve_channel;
                 s.edit(t("Reset curve", "复位曲线"), |a| {
-                    with_scoped(a, scope, |a| &mut a.curves, |l| &mut l.curves, |c| *c.channel_mut(channel) = Curve::default())
+                    with_scoped_optional(a, scope, |a| &mut a.curves, |l| &mut l.curves, |c| *c.channel_mut(channel) = Curve::default())
                 }, cx)
             })
         })
@@ -294,7 +296,7 @@ fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoEle
                             let scope = s.scope();
                             let channel = s.panels.curve_channel;
                             s.edit_live(t("Curve", "曲线"), |a| {
-                                with_scoped(a, scope, |a| &mut a.curves, |l| &mut l.curves, |cv| *cv.channel_mut(channel) = c)
+                                with_scoped_optional(a, scope, |a| &mut a.curves, |l| &mut l.curves, |cv| *cv.channel_mut(channel) = c)
                             }, cx)
                         })
                     })

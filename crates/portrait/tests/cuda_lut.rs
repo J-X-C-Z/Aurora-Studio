@@ -1,7 +1,3 @@
-#[cfg(feature = "external-fixtures")]
-#[path = "support/mod.rs"]
-mod external_fixtures;
-
 // Real NVIDIA coverage for PF90005/PF90007 SkinAdjustV2 (`skin_adjust_lut`).
 //
 // The GPU stage must produce byte-identical pixels to the CPU oracle for the
@@ -9,18 +5,17 @@ mod external_fixtures;
 // material is fabricated or claimed.
 //
 // No driver or no device prints `SKIP_NO_NVIDIA_DRIVER` and returns; set
-// `PIXCAKE_CUDA_REQUIRED=1` to make that a failure. A present-but-broken
+// `PORTRAIT_CUDA_REQUIRED=1` to make that a failure. A present-but-broken
 // driver panics.
 
 #[cfg(windows)]
 mod skin_lut_gpu {
+    use std::path::Path;
 
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_lut::{SkinLut, GATE, KERNEL, LUT_BYTES};
-    use aurora_pixcake::kernels::makeup;
-    #[cfg(feature = "external-fixtures")]
-    use aurora_pixcake::kernels::face_detail;
-    use aurora_pixcake::{Image, Refusal};
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_lut::{SkinLut, GATE, KERNEL, LUT_BYTES};
+    use aurora_portrait::kernels::{face_detail, makeup};
+    use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -48,7 +43,7 @@ mod skin_lut_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None
@@ -85,10 +80,12 @@ mod skin_lut_gpu {
         (source, mask)
     }
 
-    #[cfg(feature = "external-fixtures")]
-
     fn tint_fixture(name: &str) -> Vec<u8> {
-        let bytes = super::external_fixtures::read(&format!("pf21015/{name}"));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pf21015")
+            .join(name);
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         assert_eq!(bytes.len(), LUT_BYTES);
         bytes
     }
@@ -244,7 +241,6 @@ mod skin_lut_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn tint_green_magenta_and_full_limits_match_the_fixed_oracle() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -263,7 +259,6 @@ mod skin_lut_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn tint_zero_and_signed_limits_cover_geometry_and_alpha() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -302,7 +297,6 @@ mod skin_lut_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn tint_refuses_bad_ui_and_bad_atlases() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -331,7 +325,6 @@ mod skin_lut_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn tint_clamps_ui_outside_the_ui_range() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -355,7 +348,6 @@ mod skin_lut_gpu {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn tint_fixed_oracle_is_not_skin_tint() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");

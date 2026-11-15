@@ -1,6 +1,6 @@
 //! Detail-fusion pixel backend: PF30259 / PF30209 / PF21026.
 //!
-//! Recovered from the installed PE the reference executable
+//! Recovered from the installed PE `C:\Program Files\Vendor\portrait_2\portrait.exe`
 //! (SHA256 `A84519DA489BC52E4E914AF7880EDE43E3CE58992657723D02197161832464C7`,
 //! image base `0x140000000`) and the read-only source lanes
 //! `p13-rows26-29-vendor-parse` / `p14-rows30-34-vendor-parse`.

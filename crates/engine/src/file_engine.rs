@@ -1,4 +1,4 @@
-//! A catalog backed by real files on disk, with edits persisted in `.lumen`.
+//! A catalog backed by real files on disk, with edits persisted in `.portrait`.
 //!
 //! [`crate::MockEngine`] serves procedural scenes so the interface can be built
 //! before an engine exists. This one reads an actual folder: it scans it,
@@ -13,31 +13,21 @@ use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
 use crate::adjust::{AdjustmentSet, WhiteBalanceMode};
-#[cfg(test)]
-use crate::RenderQuality;
 use crate::catalog::{ColorTag, Exif, FileKind, ImageId, ImageInfo, Iptc};
-use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, StyleInfo};
+use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, RenderQuality, StyleInfo};
+use crate::layers::{AiMask, Layer, LinearGradient, Mask, MaskOp, MaskShape};
 use crate::mock::process::{self, Source};
 use crate::preview_cache::{self, CachedFrame, PreviewCache};
 use crate::store::{Catalog, Entry, Store, StoreError};
 use crate::tether::{self, TetherStatus};
-use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, JobStatus, NormRect, RgbaImage};
+use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, HdrOptions, JobStatus, NormRect, PanoramaOptions, RgbaImage};
 
 /// Longest side kept for a decoded source; larger files are downscaled.
 const SOURCE_LONG_SIDE: u32 = 4096;
 /// How many decoded sources stay in memory at once.
 const CACHED_SOURCES: usize = 8;
-/// Test probes: how many decodes really ran, and an optional slow-down that
-/// makes ten concurrent requests provably overlap.
-#[cfg(test)]
-static DECODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-static DECODE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Persistent folder identities start here.
+/// Folder collection ids start here; the index into `folder_dirs()` is added.
 const FOLDER_BASE: u64 = 1000;
-
-#[path = "library_fs.rs"]
-mod library_fs;
 
 /// Stable category for an import/decode failure, so the interface can show a
 /// translated message. Raw error text still goes to the log.
@@ -98,6 +88,9 @@ impl SourceStatusKind {
     }
 }
 
+fn folder_id(index: usize) -> u64 {
+    FOLDER_BASE + index as u64
+}
 
 /// A decoded frame, capped to [`SOURCE_LONG_SIDE`] with its aspect ratio kept.
 fn fit_long_side(size: (u32, u32)) -> (u32, u32) {
@@ -149,23 +142,201 @@ fn downscale_rgba(img: &image::RgbaImage, w: u32, h: u32) -> image::RgbaImage {
 
 /// A RAW at libraw's own 16-bit linear precision, before any transfer encoding.
 /// `None` when the file is not a RAW or libraw cannot demosaic it.
+/// Capture One preview cache files are JXL, not RAW.
+fn is_cop(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("cop"))
+}
+
 fn raw16_source(path: &Path) -> Option<Source> {
+    if is_cop(path) {
+        return None;
+    }
     if !crate::raw::is_raw(path) {
         return None;
     }
     let (w, h, px) = crate::raw::decode16(path)?;
-    let img: image::ImageBuffer<image::Rgba<u16>, Vec<u16>> =
-        image::ImageBuffer::from_raw(w, h, px)?;
-    let (w, h) = fit_long_side((w, h));
-    let img = if img.dimensions() != (w, h) {
-        image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle)
-    } else {
-        img
-    };
-    Some(Source::from_rgba16(w, h, img.as_raw()))
+    let (tw, th) = fit_long_side((w, h));
+    let scaled = crate::recipe::resize_rgba16(&px, w, h, tw, th);
+    Some(Source::from_rgba16(tw, th, &scaled))
 }
 
-#[derive(Clone)]
+/// Indexes `<source file name>.comask` sidecars below `Adjustments/LAM`.
+fn collect_comask(dir: &Path, out: &mut HashMap<String, Vec<PathBuf>>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_comask(&path, out);
+        } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("comask")) {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.entry(stem.to_string()).or_default().push(path);
+            }
+        }
+    }
+}
+
+/// Bilinear sample of a decoded `.comask` plane in source coordinates.
+fn sample_comask(plane: &crate::comask::MaskPlane, s: [f32; 2]) -> f32 {
+    if plane.width == 0 || plane.height == 0 {
+        return 0.0;
+    }
+    let x = (s[0] * plane.width as f32 - 0.5).clamp(0.0, (plane.width - 1) as f32);
+    let y = (s[1] * plane.height as f32 - 0.5).clamp(0.0, (plane.height - 1) as f32);
+    let (x0, y0) = (x as usize, y as usize);
+    let (x1, y1) = ((x0 + 1).min(plane.width - 1), (y0 + 1).min(plane.height - 1));
+    let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+    let at = |xx: usize, yy: usize| plane.data[yy * plane.width + xx];
+    let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+    let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+    top + (bottom - top) * ty
+}
+
+/// Rotates a source-space `.comask` plane into the renderer's oriented space.
+///
+// shortcut: orientation and flips are baked in; geometry.rotation and keystone
+// are not (both zero in the sample catalog). The plane is capped at 2048 px
+// because the render grid samples 256 cells, so this stays 8x above it.
+fn oriented_mask_plane(
+    plane: &crate::comask::MaskPlane,
+    g: &crate::Geometry,
+) -> crate::aimask::MaskPlane {
+    let (ow, oh) = if g.orientation % 2 == 1 {
+        (plane.height, plane.width)
+    } else {
+        (plane.width, plane.height)
+    };
+    let scale = (2048.0 / ow.max(oh).max(1) as f32).min(1.0);
+    let w = ((ow as f32 * scale).round() as usize).max(1);
+    let h = ((oh as f32 * scale).round() as usize).max(1);
+    let mut data = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let o = [(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32];
+            data.push(sample_comask(plane, crate::mock::process::oriented_to_source(o, g)));
+        }
+    }
+    crate::aimask::MaskPlane::new(w, h, data)
+}
+
+/// C1 skews the ramp around a midpoint other than 0.5. That curve has no C1
+/// reference sample yet, so say so instead of silently drawing a smoothstep.
+fn warn_unverified_midpoint(layer: &str, gradient: [f32; 5]) {
+    if !((gradient[4] - 0.5).abs() <= 1e-6) {
+        log::warn!(
+            "C1 layer {layer:?}: gradient midpoint {:.3} != 0.5; the skewed ramp is not matched to C1, drawing smoothstep",
+            gradient[4]
+        );
+    }
+}
+
+/// Source point → oriented point, the inverse of
+/// [`crate::mock::process::oriented_to_source`].
+fn source_to_oriented(s: [f32; 2], g: &crate::Geometry) -> [f32; 2] {
+    let q = match g.orientation % 4 {
+        1 => [1.0 - s[1], s[0]],
+        2 => [1.0 - s[0], 1.0 - s[1]],
+        3 => [s[1], 1.0 - s[0]],
+        _ => s,
+    };
+    [
+        if g.flip_horizontal { 1.0 - q[0] } else { q[0] },
+        if g.flip_vertical { 1.0 - q[1] } else { q[1] },
+    ]
+}
+
+/// Builds one render layer per C1 local layer whose `.comask` mask is present.
+fn attach_c1_layers(
+    adjustments: &mut AdjustmentSet,
+    variant: &crate::c1catalog::C1Variant,
+    image: &crate::c1catalog::C1Image,
+    comask_files: &HashMap<String, Vec<PathBuf>>,
+    rel_path: &str,
+    number: u32,
+) {
+    let Some(candidates) = comask_files.get(&image.file_name) else {
+        for layer in &variant.local_layers {
+            log::warn!("C1 layer {:?}: no .comask under Adjustments/LAM; not attached", layer.name);
+        }
+        return;
+    };
+    let uuids: Vec<&str> = variant.local_layers.iter().filter_map(|l| l.mask_uuid.as_deref()).collect();
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(document) = crate::comask::ComaskDocument::parse(&bytes) else { continue };
+        // Two variants can share a source name; take the file that owns them all.
+        let owns_all = !uuids.is_empty()
+            && uuids.iter().all(|uuid| document.masks.iter().any(|m| m.uuid.as_deref() == Some(*uuid)));
+        if !owns_all {
+            continue;
+        }
+        let Ok(planes) = crate::comask::read_comask_masks_for(&bytes, &uuids) else { continue };
+        let by_uuid: HashMap<&str, &crate::comask::MaskPlane> = planes
+            .iter()
+            .filter_map(|p| p.uuid.as_deref().map(|u| (u, p)))
+            .collect();
+        let mut attached = Vec::new();
+        for layer in &variant.local_layers {
+            let Some(uuid) = layer.mask_uuid.as_deref() else {
+                log::warn!("C1 layer {:?}: no ZMASKUUID; not attached", layer.name);
+                continue;
+            };
+            let Some(record) = document.masks.iter().find(|m| m.uuid.as_deref() == Some(uuid)) else {
+                log::warn!("C1 layer {:?}: UUID {uuid} missing from {}; not attached", layer.name, path.display());
+                continue;
+            };
+            let key = format!("c1-comask:{rel_path}#v{number}:{uuid}");
+            // A parameter gradient stays editable and costs no raster memory;
+            // prefer it over the decoded plane of the same record.
+            let shape = if let Some(g) = record.linear_gradient {
+                warn_unverified_midpoint(layer.name.as_deref().unwrap_or("<unnamed>"), g);
+                let w = image.width.max(1) as f32;
+                let h = image.height.max(1) as f32;
+                let zero_line = source_to_oriented([g[0] / w, g[1] / h], &adjustments.geometry);
+                let full_line = source_to_oriented([g[2] / w, g[3] / h], &adjustments.geometry);
+                // C1's ramp is zero at P0 and full at P1 (`comask::fill_gradient`,
+                // matched to IC_MaskSampleInt), while `LinearGradient` is full at
+                // `start`, so the C1 pair has to be fed reversed.
+                MaskShape::Linear(LinearGradient { op: MaskOp::Add, start: full_line, end: zero_line })
+            } else if let Some(plane) = by_uuid.get(uuid) {
+                let oriented = oriented_mask_plane(plane, &adjustments.geometry);
+                crate::aimask::store(&key, Arc::new(oriented));
+                MaskShape::Ai(AiMask {
+                    op: MaskOp::Add,
+                    kind: AiMaskKind::Subject,
+                    cache_key: Some(key),
+                })
+            } else {
+                // A mask record without pixels (an empty layer): a zero plane
+                // keeps the layer attached without changing the frame.
+                crate::aimask::store(&key, Arc::new(crate::aimask::MaskPlane::new(1, 1, vec![0.0])));
+                MaskShape::Ai(AiMask {
+                    op: MaskOp::Add,
+                    kind: AiMaskKind::Subject,
+                    cache_key: Some(key),
+                })
+            };
+            attached.push(Layer {
+                id: layer.index.max(0) as u64 + 1,
+                name: layer.name.clone().unwrap_or_else(|| format!("Layer {}", layer.index)),
+                kind: crate::layers::LayerKind::Adjustment,
+                enabled: layer.enabled,
+                opacity: layer.opacity.clamp(0.0, 100.0),
+                mask: Mask {
+                    shapes: vec![shape],
+                    refine: layer.surface_smoothness.clamp(0.0, 100.0),
+                    ..Default::default()
+                },
+                adjustments: layer.adjustments.clone(),
+            });
+        }
+        adjustments.layers.extend(attached);
+        return;
+    }
+    for layer in &variant.local_layers {
+        log::warn!("C1 layer {:?}: no .comask mask decoded; not attached", layer.name);
+    }
+}
+
 struct FileEntry {
     info: ImageInfo,
     path: PathBuf,
@@ -175,7 +346,6 @@ struct FileEntry {
 
 struct State {
     entries: Vec<FileEntry>,
-    source_version: u64,
     next_id: u64,
     sources: HashMap<ImageId, Arc<Source>>,
     /// Most recently used last.
@@ -185,6 +355,13 @@ struct State {
     cancelled: std::collections::HashSet<u64>,
     /// Why a source is not full sensor data; consumed by `source_status`.
     source_reasons: HashMap<ImageId, String>,
+    /// Local layers read from a C1 catalog: listed in the panel, never rendered.
+    layers: HashMap<ImageId, Vec<crate::engine::LayerSummary>>,
+    /// Read-only retouching mask summaries keyed by image.
+    retouch: HashMap<ImageId, Vec<crate::c1_retouch::RetouchMaskSummary>>,
+    /// Collections C1 stores, and their members in this engine's ids.
+    c1_collections: Vec<Collection>,
+    c1_members: HashMap<u64, Vec<ImageId>>,
     catalog: Catalog,
     preview: PreviewCache,
     profiled: crate::engine::ProfileCache,
@@ -198,6 +375,8 @@ pub struct FileEngine {
     /// so concurrent requests for the same image decode it once.
     decode: Mutex<()>,
     store: Option<Store>,
+    /// A C1 catalog is read-only: opening it must not save the imported index.
+    c1_catalog: bool,
     /// Camera defaults from Capture One's `coreConfig.cdx`, read once.
     camera_defaults: std::sync::OnceLock<Option<crate::CameraDefaults>>,
     /// Closed-eye results, computed once per image.
@@ -208,8 +387,7 @@ pub struct FileEngine {
 impl FileEngine {
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root = library_fs::canonical_path(root.as_ref())?;
-        anyhow::ensure!(root.is_dir(), "library root is not a directory");
+        let root = root.as_ref().to_path_buf();
         let store = match Store::open(&root) {
             Ok(store) => Some(store),
             Err(err) => {
@@ -222,27 +400,28 @@ impl FileEngine {
                 None
             }
         };
-        let catalog = match &store {
-            Some(store) => store.load_index()?,
-            None => Catalog::default(),
-        };
+        let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
         let engine = Self {
-            root: root.clone(),
+            root,
             state: Arc::new(Mutex::new(State {
-                source_version: 0,
-                entries: Self::restore_entries(&root, store.as_ref(), &catalog)?,
-                next_id: catalog.next_id.max(catalog.images.iter().filter_map(|e| e.info.as_ref()).map(|i| i.id.0 + 1).max().unwrap_or(1)),
+                entries: Vec::new(),
+                next_id: 1,
                 sources: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
                 cancelled: Default::default(),
                 source_reasons: HashMap::new(),
+                layers: HashMap::new(),
+                retouch: HashMap::new(),
+                c1_collections: Vec::new(),
+                c1_members: HashMap::new(),
                 catalog,
                 preview: PreviewCache::default(),
                 profiled: Default::default(),
             })),
             decode: Mutex::new(()),
             store,
+            c1_catalog: false,
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
             imported_styles: RwLock::new(Vec::new()),
@@ -258,52 +437,50 @@ impl FileEngine {
     }
 
     /// Opens a Capture One catalog or session read-only and imports its images
-    /// as Lumen entries. Edits are saved to `.lumen` beside the database; the C1
+    /// as Portrait entries. Edits are saved to `.portrait` beside the database; the C1
     /// database itself is never written to.
     pub fn open_c1_catalog(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let import = crate::c1import::C1Import::open(path.as_ref())?;
         // A bundle is `X.cocatalogdb/X.cocatalogdb` (or `.cosessiondb`, or a
-        // `.cos` session folder); `.lumen` must not land inside it.
+        // `.cos` session folder); `.portrait` must not land inside it.
         let mut root = import.catalog_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        // Step outside every Capture One package component so our own `.lumen`
-        // never lands inside one. A plain `Shoot/Shoot.cocatalogdb` file keeps
-        // `Shoot` as the root; only extension-named folders are packages.
-        while root.extension().is_some_and(|e| {
+        // The outer `X.cocatalogdb` folder is itself Capture One's package:
+        // keep our sidecar in the folder that contains the package, never inside it.
+        if root.extension().is_some_and(|e| {
             ["cocatalogdb", "cosessiondb", "cos"]
                 .iter()
                 .any(|want| e.eq_ignore_ascii_case(want))
         }) {
             root = root.parent().unwrap_or(Path::new(".")).to_path_buf();
         }
-        let root = library_fs::canonical_path(&root)?;
         let store = Store::open(&root).ok();
-        let catalog = match &store {
-            Some(store) => store.load_index()?,
-            None => Catalog::default(),
-        };
+        let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
         let engine = Self {
-            root: root.clone(),
+            root,
             state: Arc::new(Mutex::new(State {
-                source_version: 0,
-                entries: Self::restore_entries(&root, store.as_ref(), &catalog)?,
-                next_id: catalog.next_id.max(catalog.images.iter().filter_map(|e| e.info.as_ref()).map(|i| i.id.0 + 1).max().unwrap_or(1)),
+                entries: Vec::new(),
+                next_id: 1,
                 sources: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
                 cancelled: Default::default(),
                 source_reasons: HashMap::new(),
+                layers: HashMap::new(),
+                retouch: HashMap::new(),
+                c1_collections: Vec::new(),
+                c1_members: HashMap::new(),
                 catalog,
                 preview: PreviewCache::default(),
                 profiled: Default::default(),
             })),
             decode: Mutex::new(()),
             store,
+            c1_catalog: true,
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
             imported_styles: RwLock::new(Vec::new()),
         };
-        engine.import_c1(&import)?;
-        engine.rescan()?;
+        engine.import_c1(&import);
         engine.preload_ai_masks();
         Ok(engine)
     }
@@ -332,22 +509,25 @@ impl FileEngine {
         }
     }
 
-    fn import_c1(&self, import: &crate::c1import::C1Import) -> anyhow::Result<()> {
+    fn import_c1(&self, import: &crate::c1import::C1Import) {
+        let mut imported: Vec<(String, AdjustmentSet, ImageInfo)> = Vec::new();
+        // `.comask` sidecars live under the catalog's `Adjustments/LAM` tree,
+        // named after the source file. Index them once per import.
+        let mut comask_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        if let Some(dir) = import.catalog_path.parent() {
+            collect_comask(&dir.join("Adjustments").join("LAM"), &mut comask_files);
+        }
+        // C1 collections point at ZIMAGE rows; remember every variant's id.
+        let mut pk_ids: HashMap<i64, Vec<ImageId>> = HashMap::new();
         let mut st = self.state.lock();
-        let mut entries = st.entries.clone();
-        let catalog = st.catalog.clone();
-        let mut next_id = st.next_id;
         for image in import.images() {
             let path = PathBuf::from(&image.abs_path);
-            if catalog.excluded.contains(&path) { continue; }
             for variant in import.variants_of(image.pk) {
                 let number = variant.index.max(0) as u32 + 1;
                 let rel_path = crate::c1import::store_key(&path, number);
-                if catalog.excluded_variants.iter().any(|v| v.key == rel_path || (v.path == path && v.variant == number)) { continue; }
-                if entries.iter().any(|e| e.rel_path == rel_path || (e.path == path && e.info.variant == number)) { continue; }
                 // Our store wins over C1's copy, so reopening the catalog keeps the
-                // edits made in Lumen instead of resetting them to C1's.
-                let stored = catalog.entry(&rel_path).cloned();
+                // edits made in Portrait instead of resetting them to C1's.
+                let stored = st.catalog.entry(&rel_path).cloned();
                 let adjustments = match (&self.store, &stored) {
                     (Some(store), Some(_)) => store.load_adjustments(&rel_path).unwrap_or_default(),
                     _ => {
@@ -356,15 +536,71 @@ impl FileEngine {
                         // already applied the camera's EXIF rotation to the pixels,
                         // so only the difference is left for the renderer.
                         if crate::raw::is_raw(&path) {
-                            adjustments.geometry.orientation =
-                                ((adjustments.geometry.orientation as u16 + 4
-                                    - crate::raw::exif_rotation_deg(&path) / 90) % 4) as u8;
+                            // Nothing in this pipeline turns the sensor data: libraw is
+                            // asked for the stored orientation and the embedded preview
+                            // is stored the same way. So the full turn is still needed.
+                            if adjustments.geometry.orientation == 0 && path.is_file() {
+                                adjustments.geometry.orientation =
+                                    ((crate::raw::exif_rotation_deg(&path) / 90) % 4) as u8;
+                            }
                         }
                         adjustments
                     }
                 };
-                let id = ImageId(next_id);
-                next_id += 1;
+                let mut render_adjustments = adjustments.clone();
+                let mut retouch_documents = Vec::new();
+                if !variant.local_layers.is_empty() {
+                    attach_c1_layers(
+                        &mut render_adjustments,
+                        variant,
+                        image,
+                        &comask_files,
+                        &rel_path,
+                        number,
+                    );
+                    // Read the same sidecar once for retouching mask summaries.
+                    if let Some(path) = comask_files.get(&image.file_name).and_then(|v| v.first()) {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            if let Ok(document) = crate::comask::ComaskDocument::parse(&bytes) {
+                                retouch_documents.push(document);
+                            }
+                        }
+                    }
+                }
+                let id = ImageId(st.next_id);
+                st.next_id += 1;
+                pk_ids.entry(image.pk).or_default().push(id);
+                if !variant.local_layers.is_empty() {
+                    st.layers.insert(
+                        id,
+                        variant
+                            .local_layers
+                            .iter()
+                            .map(|layer| {
+                                let summary = layer.summary();
+                                crate::engine::LayerSummary {
+                                    name: summary.name,
+                                    enabled: summary.enabled,
+                                    mask_uuid: summary.mask_uuid,
+                                }
+                            })
+                            .collect(),
+                    );
+                }
+                if !variant.retouching.is_empty() {
+                    let document = retouch_documents.first();
+                    let masks: Vec<_> = variant
+                        .retouching
+                        .iter()
+                        .flat_map(|row| {
+                            row.mask_summaries(document.map(|d| d.masks.as_slice()))
+                        })
+                        .collect();
+                    if !masks.is_empty() {
+                        st.retouch.insert(id, masks);
+                    }
+                }
+                let fresh = stored.is_none();
                 let info = ImageInfo {
                     id,
                     path: path.clone(),
@@ -395,102 +631,204 @@ impl FileEngine {
                     has_adjustments: !adjustments.is_default(),
                     trashed: stored.as_ref().is_some_and(|e| e.trashed),
                 };
-                entries.push(FileEntry {
+                st.entries.push(FileEntry {
                     info: info.clone(),
                     path: path.clone(),
                     rel_path: rel_path.clone(),
-                    adjustments: adjustments.clone(),
+                    adjustments: render_adjustments,
                 });
+                if fresh {
+                    imported.push((rel_path, adjustments, info));
+                }
             }
         }
-        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
+        // C1's own albums and folders become the collection tree; each member is
+        // a ZIMAGE row, so every variant of that image belongs to it.
+        let c1_collections = import.collections();
+        if !c1_collections.is_empty() {
+            let mut members = HashMap::new();
+            for node in &import.catalog.collections {
+                // C1 computes the system collections instead of storing rows.
+                let ids: Vec<ImageId> = if node.kind == CollectionKind::AllImages {
+                    pk_ids.values().flatten().copied().collect()
+                } else {
+                    node.images
+                        .iter()
+                        .flat_map(|pk| pk_ids.get(pk).cloned().unwrap_or_default())
+                        .collect()
+                };
+                members.insert(crate::c1import::C1_COLLECTION_ID_BASE + node.pk as u64, ids);
+            }
+            st.c1_collections = c1_collections;
+            st.c1_members = members;
+        }
+        // Persist everything in one catalog write: one save per image would rewrite
+        // catalog.json once per file on a large catalog.
+        if let Some(store) = &self.store {
+            for (rel_path, adjustments, _) in &imported {
+                if let Err(err) = store.save_adjustments(rel_path, adjustments) {
+                    log::warn!("save adjustments {rel_path}: {err}");
+                }
+            }
+        }
+        for (rel_path, _, info) in &imported {
+            st.catalog.upsert(Entry {
+                rel_path: rel_path.clone(),
+                rating: info.rating,
+                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
+                keywords: info.keywords.clone(),
+                variant: info.variant,
+                updated_at: now_secs(),
+                trashed: info.trashed,
+            });
+        }
+        let catalog = st.catalog.clone();
+        drop(st);
+        // Opening a read-only C1 catalog is not an edit: writing the index here
+        // changes the source folder even when its bytes stay the same.
+        if !self.c1_catalog {
+            if let Some(store) = &self.store {
+            if let Err(err) = store.save_index(&catalog) {
+                log::warn!("save catalog: {err}");
+            }
+        }
+        }
+    }
+
+    /// Re-reads the folder, keeping edits already made.
+    pub fn rescan(&self) -> anyhow::Result<()> {
+        let mut found = Vec::new();
+        collect(&self.root, &self.root, 0, &mut found)?;
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut st = self.state.lock();
+        let previous: HashMap<String, (AdjustmentSet, i8, ColorTag, Vec<String>, u32)> = st
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.rel_path.clone(),
+                    (e.adjustments.clone(), e.info.rating, e.info.color_tag, e.info.keywords.clone(), e.info.variant),
+                )
+            })
+            .collect();
+
+        st.entries.clear();
+        for (rel, abs) in found {
+            let (w, h) = dimensions(&abs);
+            let rel_path = rel.replace('\\', "/");
+            let stored = previous.get(&rel_path);
+            let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
+            // Restore edits saved in a previous process; keep unsaved in-memory
+            // edits made before this rescan.
+            if adjustments.is_default() {
+                if let Some(store) = &self.store {
+                    if let Ok(saved) = store.load_adjustments(&rel_path) {
+                        adjustments = saved;
+                    }
+                }
+            }
+            let mut rating = stored.map(|s| s.1).unwrap_or(0);
+            let mut color_tag = stored.map(|s| s.2).unwrap_or(ColorTag::None);
+            let mut keywords = stored.map(|s| s.3.clone()).unwrap_or_default();
+            let mut variant = stored.map(|s| s.4).unwrap_or(1);
+            let mut trashed = false;
+
+            // The catalog wins over the in-memory copy: it survives restarts.
+            if let Some(entry) = st.catalog.entry(&rel_path) {
+                rating = entry.rating;
+                color_tag = ColorTag::ALL[(entry.color_tag.clamp(0, 7)) as usize];
+                keywords = entry.keywords.clone();
+                variant = variant.max(entry.variant);
+                trashed = entry.trashed;
+            }
+
+            let (exif, iptc) = crate::exif::read_metadata(&abs);
+            if keywords.is_empty() {
+                keywords = iptc.keywords.clone();
+            }
+            let id = ImageId(st.next_id);
+            st.next_id += 1;
+            st.entries.push(FileEntry {
+                info: ImageInfo {
+                    id,
+                    path: abs.clone(),
+                    file_name: abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    kind: file_kind(&abs),
+                    heif: None,
+                    width: w,
+                    height: h,
+                    file_size: std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0),
+                    exif,
+                    iptc,
+                    keywords,
+                    rating,
+                    color_tag,
+                    variant,
+                    has_adjustments: !adjustments.is_default(),
+                    trashed,
+                },
+                path: abs,
+                rel_path,
+                adjustments,
+            });
+        }
         Ok(())
     }
 
-    /// Re-reads the folder, preserving identities, variants, edits and offline records.
-    pub fn rescan(&self) -> anyhow::Result<()> {
-        self.synchronize_folder(&self.root, true, false).map(|_| ())
-    }
-
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
-        let path = library_fs::canonical_path(path)?;
-        anyhow::ensure!(path.is_file() && is_supported(&path), "unsupported image {}", path.display());
+        let (w, h) = dimensions(path);
+        let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
         let mut st = self.state.lock();
-        if let Some(entry) = st.entries.iter().find(|e| e.path == path) {
-            return Ok(entry.info.clone());
-        }
-        let mut catalog = st.catalog.clone();
-        catalog.excluded.retain(|p| p != &path);
-        catalog.excluded_variants.retain(|v| v.path != path);
-        let mut entries = st.entries.clone();
         let id = ImageId(st.next_id);
-        let key = self.unique_store_key(&path, 1, id, &entries);
-        let entry = self.discovered_entry(&path, id, key.clone(), catalog.entry(&key))?;
-        let info = entry.info.clone();
-        entries.push(entry);
-        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
+        st.next_id += 1;
+        let (exif, iptc) = crate::exif::read_metadata(path);
+        let keywords = iptc.keywords.clone();
+        let info = ImageInfo {
+            id,
+            path: path.to_path_buf(),
+            file_name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            kind: file_kind(path),
+            heif: None,
+            width: w,
+            height: h,
+            file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            exif,
+            iptc,
+            keywords,
+            rating: 0,
+            color_tag: ColorTag::None,
+            variant: 1,
+            has_adjustments: false,
+            trashed: false,
+        };
+        st.entries.push(FileEntry {
+            info: info.clone(),
+            path: path.to_path_buf(),
+            rel_path: rel,
+            adjustments: AdjustmentSet::default(),
+        });
         Ok(info)
     }
 
     fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
-        self.source_versioned(image).map(|(source, _)| source)
-    }
-
-    /// Fuses bracketed frames into a 16-bit TIFF beside the first frame.
-    pub fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
-        anyhow::ensure!(!ids.is_empty(), "HDR merge needs at least one frame");
-        let (paths, exposures): (Vec<_>, Vec<_>) = {
-            let st = self.state.lock();
-            ids.iter().map(|id| {
-                let entry = st.entries.iter().find(|e| e.info.id == *id)
-                    .ok_or_else(|| anyhow::anyhow!("HDR merge: unknown image {id:?}"))?;
-                Ok((entry.path.clone(), entry.info.exif.clone()))
-            }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().unzip()
-        };
-        let stops: Vec<f32> = exposures.iter().map(|exif| crate::hdr::relative_stops(&exposures[0], exif)).collect();
-        let sources: Vec<_> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
-        let frames: Vec<&Source> = sources.iter().map(AsRef::as_ref).collect();
-        let fused = crate::hdr::fuse(&frames, &stops)?;
-        let samples = crate::hdr::to_srgb16(&fused);
-        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        use image::ImageEncoder as _;
-        let mut encoded = std::io::Cursor::new(Vec::new());
-        image::codecs::tiff::TiffEncoder::new(&mut encoded)
-            .write_image(&bytes, fused.width, fused.height, image::ExtendedColorType::Rgb16)?;
-
-        let first = &paths[0];
-        let directory = first.parent().unwrap_or_else(|| Path::new("."));
-        let stem = first.file_stem().and_then(|s| s.to_str()).unwrap_or("merge");
-        let (path, temporary) = (1..=999).find_map(|n| {
-            let suffix = if n == 1 { String::new() } else { format!("-{n}") };
-            let name = format!("{stem}_HDR{suffix}.tif");
-            let path = directory.join(&name);
-            (!path.exists()).then(|| (path.clone(), directory.join(format!(".{name}.merge-tmp"))))
-        }).ok_or_else(|| anyhow::anyhow!("HDR merge: no free output name beside {}", first.display()))?;
-        std::fs::write(&temporary, encoded.into_inner())?;
-        if let Err(err) = std::fs::rename(&temporary, &path) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(err.into());
-        }
-        match self.add_file(&path) {
-            Ok(info) => Ok(info),
-            Err(err) => {
-                let _ = std::fs::remove_file(&path);
-                Err(err)
-            }
-        }
-    }
-
-    fn source_versioned(&self, image: ImageId) -> anyhow::Result<(Arc<Source>, u64)> {
-        loop {
         {
             let mut st = self.state.lock();
             if let Some(src) = st.sources.get(&image).cloned() {
                 st.lru.retain(|i| *i != image);
                 st.lru.push(image);
-                return Ok((src, st.source_version));
+                return Ok(src);
             }
         }
+        let (path, lens) = {
+            let st = self.state.lock();
+            let entry = st
+                .entries
+                .iter()
+                .find(|e| e.info.id == image)
+                .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
+            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif))
+        };
         // Single flight: the first request decodes while the rest wait here,
         // then find the finished source in the cache instead of decoding again.
         let _decoding = self.decode.lock();
@@ -499,24 +837,7 @@ impl FileEngine {
             if let Some(src) = st.sources.get(&image).cloned() {
                 st.lru.retain(|i| *i != image);
                 st.lru.push(image);
-                return Ok((src, st.source_version));
-            }
-        }
-        let (path, lens, version) = {
-            let st = self.state.lock();
-            let entry = st
-                .entries
-                .iter()
-                .find(|e| e.info.id == image)
-                .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
-            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif), st.source_version)
-        };
-        #[cfg(test)]
-        {
-            DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let delay = DECODE_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
-            if delay > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+                return Ok(src);
             }
         }
         // Decoding happens outside the state lock; the decode lock is the only
@@ -524,20 +845,44 @@ impl FileEngine {
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
         let mut decoded_reason = None;
-        let decoded = (|| -> anyhow::Result<Source> { Ok(match raw16_source(&path) {
+        let source = match raw16_source(&path) {
             Some(source) => source,
             None => {
-                let img = if crate::raw::is_raw(&path) {
+                let img = if is_cop(&path) {
+                    match crate::jxl::decode_cop(&path) {
+                        Ok(img) => img,
+                        Err(err) => {
+                            let reason = format!(".cop decode failed: {err:#}");
+                            self.state.lock().source_reasons.insert(image, reason.clone());
+                            return Err(anyhow::anyhow!(reason));
+                        }
+                    }
+                } else if crate::raw::is_raw(&path) {
                     match crate::raw::decode(&path) {
                         Ok(img) => img,
                         Err(err) => {
                             let reason = format!("RAW decode failed: {err:#}");
-                            let mut st = self.state.lock();
-                            if st.source_version == version {
-                                st.source_reasons.insert(image, reason);
-                            }
+                            self.state.lock().source_reasons.insert(image, reason);
                             return Err(err);
                         }
+                    }
+                } else if file_kind(&path) == FileKind::Heif {
+                    match crate::heif::decode(&path) {
+                        Ok(img) => img,
+                        Err(err) => match image::open(&path) {
+                            Ok(img) => {
+                                decoded_reason = Some(format!(
+                                    "HEIF via libheif failed ({err:#}); used the image crate fallback"
+                                ));
+                                img.to_rgba8()
+                            }
+                            Err(fallback) => {
+                                let reason =
+                                    format!("HEIF decode failed: libheif: {err:#}; image crate: {fallback}");
+                                self.state.lock().source_reasons.insert(image, reason.clone());
+                                return Err(anyhow::anyhow!(reason));
+                            }
+                        },
                     }
                 } else {
                     image::open(&path)?.to_rgba8()
@@ -550,11 +895,6 @@ impl FileEngine {
                 };
                 Source::from_rgba(w, h, img.as_raw())
             }
-        }) })();
-        let source = match decoded {
-            Ok(source) => source,
-            Err(_) if self.state.lock().source_version != version => continue,
-            Err(err) => return Err(err),
         };
         let camera_preview =
             crate::raw::is_raw(&path) && crate::raw::from_sensor(&path) == Some(false);
@@ -564,10 +904,6 @@ impl FileEngine {
         let source = Arc::new(source.with_lens_shot(lens).with_camera_preview(camera_preview));
 
         let mut st = self.state.lock();
-        // A move/locate may finish while decoding outside the state lock.
-        if st.source_version != version {
-            continue;
-        }
         match decoded_reason {
             Some(reason) => {
                 st.source_reasons.insert(image, reason);
@@ -583,32 +919,229 @@ impl FileEngine {
             let old = st.lru.remove(0);
             st.sources.remove(&old);
         }
-        return Ok((source, version));
+        Ok(source)
+    }
+
+    /// Cached preview frame; `fast` renders at half size and upsamples.
+    /// Merges bracketed frames into one 16-bit TIFF beside the first frame and
+    /// catalogs it. The first frame's exposure is the reference the result is
+    /// rendered at; frames must share one size.
+    pub fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        self.merge_hdr(ids, None)
+    }
+
+    /// [`Self::merge_hdr_frames`] with the interface's options. `align: false`
+    /// is honoured by keeping the existing no-alignment path; the remaining
+    /// fields are not implemented and are only logged.
+    pub fn merge_hdr_with_options(
+        &self,
+        ids: &[ImageId],
+        options: &HdrOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        self.merge_hdr(ids, Some(options))
+    }
+
+    fn merge_hdr(&self, ids: &[ImageId], options: Option<&HdrOptions>) -> anyhow::Result<ImageInfo> {
+        if let Some(options) = options {
+            Self::warn_hdr_options(options);
+        }
+        let mut paths = Vec::with_capacity(ids.len());
+        let mut exposures = Vec::with_capacity(ids.len());
+        {
+            let st = self.state.lock();
+            for id in ids {
+                let entry = st
+                    .entries
+                    .iter()
+                    .find(|e| e.info.id == *id)
+                    .ok_or_else(|| anyhow::anyhow!("HDR merge: unknown image {id:?}"))?;
+                paths.push(entry.path.clone());
+                exposures.push(entry.info.exif.clone());
+            }
+        }
+        let Some(first_path) = paths.first() else {
+            anyhow::bail!("HDR merge needs at least one frame");
+        };
+        let stops: Vec<f32> = exposures
+            .iter()
+            .map(|exif| crate::hdr::relative_stops(&exposures[0], exif))
+            .collect();
+        let sources: Vec<Arc<Source>> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
+        let frames: Vec<&Source> = sources.iter().map(|s| s.as_ref()).collect();
+        let fused = crate::hdr::fuse(&frames, &stops)?;
+        let wide = crate::hdr::to_srgb16(&fused);
+
+        let dir = first_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = first_path.file_stem().and_then(|s| s.to_str()).unwrap_or("merge");
+        let mut path = dir.join(format!("{stem}_HDR.tif"));
+        let mut counter = 2;
+        while path.exists() {
+            if counter > 999 {
+                anyhow::bail!("HDR merge: no free output name beside {}", first_path.display());
+            }
+            path = dir.join(format!("{stem}_HDR-{counter}.tif"));
+            counter += 1;
+        }
+        {
+            use image::ImageEncoder as _;
+            let bytes: Vec<u8> = wide.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let mut out = std::io::Cursor::new(Vec::new());
+            let encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+            encoder.write_image(&bytes, fused.width, fused.height, image::ExtendedColorType::Rgb16)?;
+            std::fs::write(&path, out.into_inner())?;
+        }
+
+        let info = self.add_file(&path)?;
+        let rel = {
+            let st = self.state.lock();
+            st.entries
+                .iter()
+                .find(|e| e.info.id == info.id)
+                .map(|e| e.rel_path.clone())
+                .ok_or_else(|| anyhow::anyhow!("HDR merge: output missing from the catalog"))?
+        };
+        self.persist(&rel, &AdjustmentSet::default(), &info);
+        Ok(info)
+    }
+
+    /// Stitches frames left to right into one 8-bit TIFF beside the first frame
+    /// and catalogs it. Frames must share one height; each neighbouring pair is
+    /// aligned by a horizontal SAD search and the overlap is feathered.
+    /// Distortion, perspective and exposure matching are not applied yet.
+    pub fn merge_panorama_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        self.merge_panorama(ids, None)
+    }
+
+    /// [`Self::merge_panorama_frames`] with the interface's options.
+    /// `auto_crop: false` is honoured by keeping the stitched canvas edges;
+    /// projection, boundary warp and auto crop are not implemented yet.
+    pub fn merge_panorama_with_options(
+        &self,
+        ids: &[ImageId],
+        options: &PanoramaOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        self.merge_panorama(ids, Some(options))
+    }
+
+    fn merge_panorama(
+        &self,
+        ids: &[ImageId],
+        options: Option<&PanoramaOptions>,
+    ) -> anyhow::Result<ImageInfo> {
+        if let Some(options) = options {
+            Self::warn_panorama_options(options);
+        }
+        let first_path = {
+            let st = self.state.lock();
+            let id = ids.first().ok_or_else(|| anyhow::anyhow!("Panorama merge needs at least one frame"))?;
+            st.entries
+                .iter()
+                .find(|e| e.info.id == *id)
+                .map(|e| e.path.clone())
+                .ok_or_else(|| anyhow::anyhow!("Panorama merge: unknown image {id:?}"))?
+        };
+        let sources: Vec<Arc<Source>> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
+        let frames: Vec<&Source> = sources.iter().map(|s| s.as_ref()).collect();
+        let fused = crate::pano::stitch(&frames)?;
+        let bytes = crate::pano::to_srgb8(&fused);
+        self.write_merge(&first_path, "Pano", fused.width, fused.height, &bytes, image::ExtendedColorType::Rgb8)
+    }
+
+    fn warn_hdr_options(options: &HdrOptions) {
+        if options.align {
+            log::warn!("HDR merge: align=true is not applied; frames are never aligned");
+        }
+        log::warn!(
+            "HDR merge: deghost={} is not consumed; the engine's built-in deghosting stays on",
+            options.deghost
+        );
+        if options.auto_tone {
+            log::warn!("HDR merge: auto_tone=true is not applied");
         }
     }
 
-    /// Cached preview frame at full requested pixel quality.
-    fn preview_frame(&self, request: &PreviewRequest, _fast: bool) -> anyhow::Result<PreviewFrame> {
-        let start = Instant::now();
-        if let Some(image) = self.offline_library_preview(request.image, request.max_size)? {
-            return Ok(PreviewFrame {
-                histogram: process::histogram(image.pixels.as_ref()), image,
-                generation: request.generation, elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
-             degraded: None, gamut_warning: None, });
+    fn warn_panorama_options(options: &PanoramaOptions) {
+        log::warn!(
+            "Panorama merge: projection={:?} is not applied; the stitch is translation only",
+            options.projection
+        );
+        if options.boundary_warp != 0.0 {
+            log::warn!(
+                "Panorama merge: boundary_warp={} is not applied",
+                options.boundary_warp
+            );
         }
-        let (src, source_version) = self.source_versioned(request.image)?;
+        if options.auto_crop {
+            log::warn!(
+                "Panorama merge: auto_crop=true is not applied; the stitched canvas keeps its edges"
+            );
+        } else {
+            log::debug!("Panorama merge: auto_crop=false, keeping the stitched canvas edges");
+        }
+    }
+
+    /// Writes a merged TIFF beside the first frame, names it `{stem}_{tag}.tif`
+    /// without clobbering an existing file, then catalogs and persists it.
+    fn write_merge(
+        &self,
+        first_path: &Path,
+        tag: &str,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+        color: image::ExtendedColorType,
+    ) -> anyhow::Result<ImageInfo> {
+        let dir = first_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = first_path.file_stem().and_then(|s| s.to_str()).unwrap_or("merge");
+        let mut path = dir.join(format!("{stem}_{tag}.tif"));
+        let mut counter = 2;
+        while path.exists() {
+            if counter > 999 {
+                anyhow::bail!("{tag} merge: no free output name beside {}", first_path.display());
+            }
+            path = dir.join(format!("{stem}_{tag}-{counter}.tif"));
+            counter += 1;
+        }
+        {
+            use image::ImageEncoder as _;
+            let mut out = std::io::Cursor::new(Vec::new());
+            let encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+            encoder.write_image(bytes, width, height, color)?;
+            std::fs::write(&path, out.into_inner())?;
+        }
+
+        let info = self.add_file(&path)?;
+        let rel = {
+            let st = self.state.lock();
+            st.entries
+                .iter()
+                .find(|e| e.info.id == info.id)
+                .map(|e| e.rel_path.clone())
+                .ok_or_else(|| anyhow::anyhow!("{tag} merge: output missing from the catalog"))?
+        };
+        self.persist(&rel, &AdjustmentSet::default(), &info);
+        Ok(info)
+    }
+
+    /// Cached preview frame; `fast` renders at half size and upsamples.
+    fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
+        let start = Instant::now();
+        let src = self.source(request.image)?;
+        // Draft and Final must keep the same output size: a lower draft cap made
+        // the preview jump when the pointer was released. Draft is cheaper
+        // because `fast` renders half size and upsamples, not because it is smaller.
         let max = request.max_size;
-        let fast = false;
         let adj = crate::styles::resolve(&request.adjustments);
-        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
-            .with_source_version(source_version);
-        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let (rendering, intent_note) = crate::engine::request_rendering(request);
+        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let hit = self.state.lock().preview.get(key);
         if let Some(hit) = hit {
             let histogram = hit.histogram.clone();
             let source = hit.into_image();
             let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
-            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+            let degraded = degraded.or(intent_note);
             return Ok(PreviewFrame {
                 histogram,
                 image,
@@ -625,15 +1158,11 @@ impl FileEngine {
             pixels: Arc::new(out.rgba),
             histogram: out.histogram.clone(),
         };
-        {
-            let mut st = self.state.lock();
-            if st.source_version == source_version {
-                st.preview.insert(key, frame.clone());
-            }
-        }
+        self.state.lock().preview.insert(key, frame.clone());
         let source = frame.into_image();
         let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
-        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point));
+        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+        let degraded = degraded.or(intent_note);
         Ok(PreviewFrame {
             image,
             histogram: out.histogram,
@@ -644,7 +1173,90 @@ impl FileEngine {
         })
     }
 
+    fn persist(&self, rel_path: &str, adjustments: &AdjustmentSet, info: &ImageInfo) {
+        let Some(store) = &self.store else { return };
+        if let Err(err) = store.save_adjustments(rel_path, adjustments) {
+            log::warn!("save adjustments {rel_path}: {err}");
+            return;
+        }
+        let mut st = self.state.lock();
+        st.catalog.upsert(Entry {
+            rel_path: rel_path.to_string(),
+            rating: info.rating,
+            color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
+            keywords: info.keywords.clone(),
+            variant: info.variant,
+            updated_at: now_secs(),
+            trashed: info.trashed,
+        });
+        let catalog = st.catalog.clone();
+        drop(st);
+        if let Err(err) = store.save_index(&catalog) {
+            log::warn!("save catalog: {err}");
+        }
+    }
 
+    fn collection_tree(&self) -> Vec<Collection> {
+        let (count, trashed) = {
+            let st = self.state.lock();
+            (st.entries.len(), st.entries.iter().filter(|e| e.info.trashed).count())
+        };
+        let folders: Vec<Collection> = self
+            .folder_dirs()
+            .iter()
+            .enumerate()
+            .map(|(index, (dir, n))| Collection {
+                id: folder_id(index),
+                name: if dir.is_empty() { self.root.display().to_string() } else { dir.clone() },
+                kind: CollectionKind::Folder,
+                count: *n,
+                children: Vec::new(),
+            })
+            .collect();
+        let node = |id, name: &str, kind, count, children| Collection { id, name: name.into(), kind, count, children };
+        vec![
+            node(1, "All Images", CollectionKind::AllImages, count, vec![]),
+            node(2, "Recent Imports", CollectionKind::RecentImports, count.min(12), vec![]),
+            node(3, "Recent Captures", CollectionKind::RecentCaptures, 0, vec![]),
+            node(4, "Trash", CollectionKind::Trash, trashed, vec![]),
+            node(10, "Folders", CollectionKind::Group, folders.len(), folders),
+        ]
+    }
+
+    fn collection_images(&self, collection: u64) -> Option<Vec<ImageId>> {
+        if let Some(ids) = self.state.lock().c1_members.get(&collection).cloned() {
+            return Some(ids);
+        }
+        let index = collection.checked_sub(FOLDER_BASE)? as usize;
+        let dir = self.folder_dirs().get(index)?.0.clone();
+        let st = self.state.lock();
+        Some(
+            st.entries
+                .iter()
+                .filter(|e| match e.rel_path.rfind('/') {
+                    Some(idx) => e.rel_path[..idx] == dir,
+                    None => dir.is_empty(),
+                })
+                .map(|e| e.info.id)
+                .collect(),
+        )
+    }
+
+    /// Every immediate directory of the catalog with its image count, sorted.
+    fn folder_dirs(&self) -> Vec<(String, usize)> {
+        let st = self.state.lock();
+        let mut by_dir: HashMap<String, usize> = HashMap::new();
+        for entry in &st.entries {
+            let dir = match entry.rel_path.rfind('/') {
+                Some(idx) => entry.rel_path[..idx].to_string(),
+                None => String::new(),
+            };
+            *by_dir.entry(dir).or_insert(0) += 1;
+        }
+        let mut dirs: Vec<(String, usize)> = by_dir.into_iter().collect();
+        dirs.sort();
+        dirs
+    }
 }
 
 fn now_secs() -> i64 {
@@ -666,15 +1278,44 @@ fn file_kind(path: &Path) -> FileKind {
     }
 }
 
+/// Depth-limited so a symlink loop cannot hang the scan.
+fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) -> anyhow::Result<()> {
+    if depth > 12 {
+        return Ok(());
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return Ok(()) };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "portrait-output" {
+                continue;
+            }
+            collect(root, &path, depth + 1, out)?;
+        } else if path.is_file() && is_supported(&path) {
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            out.push((rel, path));
+        }
+    }
+    Ok(())
+}
+
 fn is_supported(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp")
-    ) || crate::raw::is_raw(path)
+        Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif")
+    ) || is_cop(path)
+        || crate::raw::is_raw(path)
 }
 
 /// Pixel dimensions of a file: the sensor size for RAW, else the header size.
 fn dimensions(path: &Path) -> (u32, u32) {
+    if is_cop(path) {
+        return crate::jxl::dimensions(path).unwrap_or((0, 0));
+    }
+    if file_kind(path) == FileKind::Heif {
+        return crate::heif::dimensions(path).unwrap_or((0, 0));
+    }
     if crate::raw::is_raw(path) {
         return crate::raw::sensor_dimensions(path).unwrap_or((0, 0));
     }
@@ -801,9 +1442,75 @@ fn camera_icc(path: &Path, model: Option<&str>) -> Option<String> {
     description.contains(&keyword).then_some(mapped)
 }
 
+/// EXIF lens name -> the `lensDatabase.cdx` entry's full name. This is Capture
+/// One's automatic lens detection: both the name and the focal length must be
+/// present, and nothing is guessed when the database has no entry.
+fn auto_lens_profile(lenses: &[crate::LensProfile], exif: &Exif) -> Option<String> {
+    let lens = exif.lens.as_deref()?;
+    let focal = exif.focal_length_mm?;
+    crate::lensdb::detect_lens(lenses, "", lens, focal).map(|p| p.full_name.clone())
+}
+
+/// Enables the calibrated warp when EXIF names a lens in the database. An
+/// existing user choice is never replaced.
+fn apply_auto_lens(lens: &mut crate::LensCorrection, lenses: &[crate::LensProfile], exif: &Exif) {
+    if lens.use_profile || lens.profile.is_some() {
+        return;
+    }
+    if let Some(name) = auto_lens_profile(lenses, exif) {
+        lens.profile = Some(name);
+        lens.use_profile = true;
+    }
+}
+
+impl FileEngine {
+    /// `coreConfig.cdx` ranges and defaults for one body and ISO; loaded once.
+    fn catalog_overrides(&self, model: Option<&str>, iso: Option<u32>) -> crate::ParamOverrides {
+        self.camera_defaults
+            .get_or_init(|| {
+                let path = std::env::var_os("AURORA_CORE_CONFIG")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One\coreConfig.cdx"));
+                match crate::CameraDefaults::load(&path) {
+                    Ok(d) => Some(d),
+                    Err(err) => {
+                        log::info!("coreConfig unavailable ({}): {err}", path.display());
+                        None
+                    }
+                }
+            })
+            .as_ref()
+            .map_or_else(Default::default, |d| d.overrides(model, iso))
+    }
+
+    /// [`Self::catalog_overrides`] plus the values the frame itself states
+    /// (EXIF exposure, Nikon white balance). Used for the sliders; the render
+    /// path only needs the catalog half, so it does not re-read the RAW.
+    fn frame_defaults(&self, model: Option<&str>, iso: Option<u32>, path: &Path) -> crate::ParamOverrides {
+        let catalog = self.catalog_overrides(model, iso);
+        let catalog_loaded = matches!(self.camera_defaults.get(), Some(Some(_)));
+        let frame = crate::read_nikon_info_block(path).ok();
+        // `camera_defaults` encodes the reference Z6III's ladder. Use it only
+        // when coreConfig is missing and the frame really is that body, so no
+        // other camera gets defaults it never had.
+        let reference = !catalog_loaded
+            && model.is_some_and(|m| {
+                crate::camera_profile::for_camera(m) == crate::camera_profile::for_camera("NIKON Z6_3")
+            });
+        let mut overrides = match (&frame, reference) {
+            (Some(frame), true) => crate::overrides_for(frame),
+            _ => catalog,
+        };
+        if let Some(frame) = &frame {
+            frame.apply_to(&mut overrides);
+        }
+        overrides
+    }
+}
+
 impl ImageEngine for FileEngine {
     fn name(&self) -> String {
-        format!("Lumen File Engine ({})", self.root.display())
+        format!("Portrait File Engine ({})", self.root.display())
     }
 
     fn images(&self) -> Vec<ImageInfo> {
@@ -813,10 +1520,15 @@ impl ImageEngine for FileEngine {
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>> {
         let mut added = Vec::new();
         for path in paths {
-            if path.is_dir() {
-                let before: Vec<_> = self.images().iter().map(|i| i.id).collect();
-                added.extend(self.synchronize_folder(path, true, true)?.into_iter().filter(|i| !before.contains(&i.id)));
-            } else if is_supported(path) {
+            if path.is_dir() && !path.starts_with(&self.root) {
+                let mut files = Vec::new();
+                collect(path, path, 0, &mut files)?;
+                for (_, abs) in files {
+                    if let Ok(info) = self.add_file(&abs) {
+                        added.push(info);
+                    }
+                }
+            } else if path.is_file() && is_supported(path) {
                 added.push(self.add_file(path)?);
             }
         }
@@ -824,80 +1536,102 @@ impl ImageEngine for FileEngine {
     }
 
     fn collections(&self) -> Vec<Collection> {
-        self.collection_tree()
+        let c1 = self.state.lock().c1_collections.clone();
+        if c1.is_empty() {
+            self.collection_tree()
+        } else {
+            c1
+        }
     }
 
-    fn library_root(&self) -> Option<PathBuf> {
-        Some(self.root.clone())
-    }
-
-    fn collection_path(&self, id: u64) -> Option<PathBuf> {
-        self.state.lock().catalog.folders.iter().find(|f| f.id == id).map(|f| f.path.clone())
-    }
-
-    fn user_collections(&self) -> Vec<crate::UserCollection> {
-        self.store.as_ref().map(|store| store.load_user_collections()).unwrap_or_default()
-    }
-
-    fn manage_files(&self, action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
-        self.manage_library(action)
-    }
-
+    // Without this the trait default (`None`) hides the folder membership from the
+    // interface, which only sees `dyn ImageEngine`.
     fn collection_images(&self, collection: u64) -> Option<Vec<ImageId>> {
-        let path = self.collection_path(collection)?;
-        Some(self.state.lock().entries.iter().filter(|e| e.path.parent() == Some(path.as_path())).map(|e| e.info.id).collect())
+        FileEngine::collection_images(self, collection)
     }
 
     fn save_user_collections(&self, collections: &[crate::UserCollection]) -> anyhow::Result<()> {
-        let _st = self.state.lock();
-        let store = self.writable_store()?;
-        store.save_user_collections(collections)
+        match &self.store {
+            Some(store) => store.save_user_collections(collections).map_err(Into::into),
+            None => Ok(()),
+        }
     }
 
     fn set_trashed(&self, ids: &[ImageId], trashed: bool) -> anyhow::Result<()> {
-        let mut st = self.state.lock();
-        let mut entries = st.entries.clone();
-        for entry in entries.iter_mut().filter(|e| ids.contains(&e.info.id)) {
-            entry.info.trashed = trashed;
+        let catalog = {
+            let mut st = self.state.lock();
+            let mut changed = Vec::new();
+            for entry in st.entries.iter_mut().filter(|e| ids.contains(&e.info.id)) {
+                entry.info.trashed = trashed;
+                changed.push((entry.rel_path.clone(), entry.info.clone()));
+            }
+            for (rel, info) in changed {
+                st.catalog.upsert(Entry {
+                    rel_path: rel,
+                    rating: info.rating,
+                    color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
+                    keywords: info.keywords.clone(),
+                    variant: info.variant,
+                    updated_at: now_secs(),
+                    trashed,
+                });
+            }
+            st.catalog.clone()
+        };
+        if let Some(store) = &self.store {
+            store.save_index(&catalog)?;
         }
-        let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None, true)
+        Ok(())
     }
 
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()> {
-        self.update_infos(std::slice::from_ref(info))
-    }
-
-    fn update_infos(&self, infos: &[ImageInfo]) -> anyhow::Result<()> {
-        if infos.is_empty() { return Ok(()); }
-        let mut st = self.state.lock();
-        let mut entries = st.entries.clone();
-        let positions: HashMap<_, _> = entries.iter().enumerate().map(|(i, e)| (e.info.id, i)).collect();
-        for info in infos {
-            let pos = positions.get(&info.id).ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-            let entry = &mut entries[*pos];
-            anyhow::ensure!(entry.path == info.path && entry.info.variant == info.variant, "use manage_files to change image paths");
+        let (rel, catalog) = {
+            let mut st = self.state.lock();
+            let entry = st
+                .entries
+                .iter_mut()
+                .find(|e| e.info.id == info.id)
+                .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
             entry.info = info.clone();
+            let rel = entry.rel_path.clone();
+            st.catalog.upsert(Entry {
+                rel_path: rel.clone(),
+                rating: info.rating,
+                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
+                keywords: info.keywords.clone(),
+                variant: info.variant,
+                updated_at: now_secs(),
+                trashed: info.trashed,
+            });
+            (rel.clone(), st.catalog.clone())
+        };
+        let _ = rel;
+        if let Some(store) = &self.store {
+            if let Err(err) = store.save_index(&catalog) {
+                log::warn!("save catalog: {err}");
+            }
         }
-        let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None, true)
+        Ok(())
     }
 
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet {
-        let st = self.state.lock();
-        let Some(entry) = st.entries.iter().find(|e| e.info.id == image) else {
-            return AdjustmentSet::default();
+        let (mut adjustments, info) = {
+            let st = self.state.lock();
+            let Some(entry) = st.entries.iter().find(|e| e.info.id == image) else {
+                return AdjustmentSet::default();
+            };
+            (entry.adjustments.clone(), entry.info.clone())
         };
-        let mut adjustments = entry.adjustments.clone();
         // RAW defaults follow Capture One: its own camera profile and film curve,
-        // plus the noise reduction it would start at for this ISO. JPEG/TIFF frames
-        // are already display-referred, so they get none of this.
+        // plus the noise reduction and sharpening it starts a frame with for this
+        // body and ISO. JPEG/TIFF frames are already display-referred, so they get
+        // none of this.
         // Only sensor-decoded RAW gets the camera profile and film curve; the
         // embedded preview is already processed by the camera.
-        if crate::raw::is_raw(&entry.info.path)
-            && crate::raw::from_sensor(&entry.info.path) != Some(false)
+        if crate::raw::is_raw(&info.path)
+            && crate::raw::from_sensor(&info.path) != Some(false)
         {
-            let model = entry.info.exif.camera_model.as_deref();
+            let model = info.exif.camera_model.as_deref();
             if adjustments.base.film_curve.is_none() {
                 adjustments.base.film_curve = model.and_then(crate::camera_curve::default_curve);
             }
@@ -907,86 +1641,113 @@ impl ImageEngine for FileEngine {
                     .filter(|name| crate::camera_profile::is_available(name))
                     .map(|name| name.as_str().to_string());
             }
+            let catalog = self.catalog_overrides(model, info.exif.iso);
             if adjustments.noise_reduction == crate::NoiseReduction::default() {
-                if let Some(iso) = entry.info.exif.iso {
-                    adjustments.noise_reduction = crate::noise_defaults::for_iso(iso).into();
+                if let Some(iso) = info.exif.iso {
+                    // C1's own values win; the ISO curve only fills gaps a body
+                    // leaves unstated in coreConfig.
+                    let heuristic: crate::NoiseReduction = crate::noise_defaults::for_iso(iso).into();
+                    adjustments.noise_reduction = crate::NoiseReduction {
+                        luminance: catalog.default_for("NoiseReductionAmount").unwrap_or(heuristic.luminance),
+                        details: catalog.default_for("NoiseDetailsAmount").unwrap_or(heuristic.details),
+                        color: catalog.default_for("ColorNoiseReductionAmount").unwrap_or(heuristic.color),
+                        single_pixel: heuristic.single_pixel,
+                    };
                 }
             }
-        } else if !crate::raw::is_raw(&entry.info.path) && adjustments.base.icc_profile.is_none() {
+            if adjustments.sharpening == crate::Sharpening::default() {
+                let default = crate::Sharpening::default();
+                adjustments.sharpening = crate::Sharpening {
+                    amount: catalog.default_for("USMAmount").unwrap_or(default.amount),
+                    radius: catalog.default_for("USMRadius").unwrap_or(default.radius),
+                    threshold: catalog.default_for("USMThreshold").unwrap_or(default.threshold),
+                    halo_suppression: default.halo_suppression,
+                };
+            }
+        } else if !crate::raw::is_raw(&info.path) && adjustments.base.icc_profile.is_none() {
             // Display-referred JPEG/TIFF keeps its embedded profile. Only a file
             // still carrying the camera's own colour space gets the camera
             // profile added here (see `camera_icc`).
             adjustments.base.icc_profile = camera_icc(
-                &entry.info.path,
-                entry.info.exif.camera_model.as_deref(),
+                &info.path,
+                info.exif.camera_model.as_deref(),
             )
             .filter(|name| crate::camera_profile::is_available(name));
         }
+        // C1's automatic lens detection is an import default like the ones
+        // above: EXIF names the lens, the database supplies the profile, and
+        // only a hit turns the calibrated warp on.
+        apply_auto_lens(&mut adjustments.lens, crate::lensdb::default_database().unwrap_or(&[]), &info.exif);
         adjustments
     }
 
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
-        self.save_adjustments_batch(&[(image, adjustments)])
-    }
-
-    fn save_adjustments_batch(&self, changes: &[(ImageId, &AdjustmentSet)]) -> anyhow::Result<()> {
-        if changes.is_empty() { return Ok(()); }
-        let mut st = self.state.lock();
-        let mut entries = st.entries.clone();
-        let positions: HashMap<_, _> = entries.iter().enumerate().map(|(i, e)| (e.info.id, i)).collect();
-        for &(image, adjustments) in changes {
-            let pos = positions.get(&image).ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-            let entry = &mut entries[*pos];
+        let (rel, info) = {
+            let mut st = self.state.lock();
+            let entry = st
+                .entries
+                .iter_mut()
+                .find(|e| e.info.id == image)
+                .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
             entry.adjustments = adjustments.clone();
             entry.info.has_adjustments = !adjustments.is_default();
-        }
-        let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None, true)
+            (entry.rel_path.clone(), entry.info.clone())
+        };
+        self.persist(&rel, adjustments, &info);
+        Ok(())
+    }
+
+    fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
+        let mut st = self.state.lock();
+        let next = st.next_id;
+        let pos = st
+            .entries
+            .iter()
+            .position(|e| e.info.id == image)
+            .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
+        let mut info = st.entries[pos].info.clone();
+        info.id = ImageId(next);
+        info.variant += 1;
+        info.has_adjustments = !adjustments.is_default();
+        st.next_id += 1;
+        let entry = FileEntry {
+            info: info.clone(),
+            path: st.entries[pos].path.clone(),
+            rel_path: st.entries[pos].rel_path.clone(),
+            adjustments: adjustments.clone(),
+        };
+        st.entries.insert(pos + 1, entry);
+        Ok(info)
     }
 
     fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
         FileEngine::merge_hdr_frames(self, ids)
     }
 
-    fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
-        let mut st = self.state.lock();
-        let pos = st.entries.iter().position(|e| e.info.id == image)
-            .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-        let mut entries = st.entries.clone();
-        let mut entry = entries[pos].clone();
-        entry.info.id = ImageId(st.next_id);
-        entry.info.variant = entries.iter().filter(|e| e.path == entry.path).map(|e| e.info.variant)
-            .chain(st.catalog.excluded_variants.iter().filter(|v| v.path == entry.path).map(|v| v.variant))
-            .max().unwrap_or(0) + 1;
-        entry.info.has_adjustments = !adjustments.is_default();
-        entry.rel_path = self.unique_store_key(&entry.path, entry.info.variant, entry.info.id, &entries);
-        entry.adjustments = adjustments.clone();
-        let info = entry.info.clone();
-        entries.insert(pos + 1, entry);
-        let catalog = st.catalog.clone();
-        self.commit_library(&mut st, entries, catalog, &[], None, false)?;
-        Ok(info)
+    fn merge_hdr_with_options(
+        &self,
+        ids: &[ImageId],
+        options: &HdrOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        FileEngine::merge_hdr_with_options(self, ids, options)
+    }
+
+    fn merge_panorama_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        FileEngine::merge_panorama_frames(self, ids)
+    }
+
+    fn merge_panorama_with_options(
+        &self,
+        ids: &[ImageId],
+        options: &PanoramaOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        FileEngine::merge_panorama_with_options(self, ids, options)
     }
 
     fn thumbnail(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<RgbaImage> {
-        if let Some(preview) = self.offline_library_preview(image, max_size)? { return Ok(preview); }
-        let (src, version) = self.source_versioned(image)?;
+        let src = self.source(image)?;
         let out = process::render(&src, &crate::styles::resolve(adjustments), NormRect::FULL, max_size, false, None);
-        let frame = RgbaImage::new(out.width, out.height, out.rgba);
-        if let Some(store) = &self.store {
-            // PNG encoding does not need the catalog lock; publication still checks identity.
-            let saved = Store::encode_library_preview(&frame).and_then(|bytes| {
-                let st = self.state.lock();
-                if st.source_version == version && st.entries.iter().any(|e| e.info.id == image) {
-                    store.save_library_preview(image, &bytes)?;
-                }
-                Ok(())
-            });
-            if let Err(err) = saved {
-                log::warn!("save offline preview: {err}");
-            }
-        }
-        Ok(frame)
+        Ok(RgbaImage::new(out.width, out.height, out.rgba))
     }
 
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
@@ -1039,6 +1800,7 @@ impl ImageEngine for FileEngine {
             adj.white_balance.mode = WhiteBalanceMode::Auto;
             adj.white_balance.kelvin = (5600.0 + (r - b) * -18.0).clamp(2500.0, 12000.0);
             adj.white_balance.tint = 0.0;
+            adj.white_balance.gains = None;
         }
         if all || target == AutoTarget::Levels {
             let cut = total / 500;
@@ -1227,6 +1989,9 @@ impl ImageEngine for FileEngine {
 
     fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo> {
         let style = crate::c1_styles::load_style(path)?;
+        if let Some(warning) = crate::c1_styles::processing_method_warning(style.adjustments.base.processing_method) {
+            log::warn!("C1 style {}: {warning}", style.name);
+        }
         let info = StyleInfo { name: style.name, group: "Imported".into(), adjustments: style.adjustments };
         let mut imported = self.imported_styles.write();
         imported.retain(|s| !(s.group == info.group && s.name == info.name));
@@ -1244,22 +2009,6 @@ impl ImageEngine for FileEngine {
     /// Camera ranges and defaults from `coreConfig.cdx`, plus the frame's own
     /// values (EXIF exposure, Nikon MakerNote white balance).
     fn param_overrides(&self, image: ImageId) -> crate::ParamOverrides {
-        let defaults = self
-            .camera_defaults
-            .get_or_init(|| {
-                let path = std::env::var_os("LUMEN_CORE_CONFIG")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One\coreConfig.cdx"));
-                match crate::CameraDefaults::load(&path) {
-                    Ok(d) => Some(d),
-                    Err(err) => {
-                        log::info!("coreConfig unavailable ({}): {err}", path.display());
-                        None
-                    }
-                }
-            })
-            .as_ref();
-
         let (model, iso, path) = {
             let st = self.state.lock();
             let Some(entry) = st.entries.iter().find(|e| e.info.id == image) else {
@@ -1267,12 +2016,7 @@ impl ImageEngine for FileEngine {
             };
             (entry.info.exif.camera_model.clone(), entry.info.exif.iso, entry.path.clone())
         };
-
-        let mut overrides = defaults.map_or_else(Default::default, |d| d.overrides(model.as_deref(), iso));
-        if let Ok(frame) = crate::read_nikon_info_block(&path) {
-            frame.apply_to(&mut overrides);
-        }
-        overrides
+        self.frame_defaults(model.as_deref(), iso, &path)
     }
 
     fn lens_profiles(&self) -> Vec<String> {
@@ -1302,7 +2046,7 @@ impl ImageEngine for FileEngine {
             }
             state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.05 });
             let (tw, th) = crate::recipe::output_size(&job.recipe, (info.width, info.height));
-            let dir = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("lumen-output"));
+            let dir = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
             let wide = job.recipe.bit_depth == 16;
             let result = if wide {
                 let out = process::render16(
@@ -1381,11 +2125,29 @@ impl ImageEngine for FileEngine {
     }
 
     fn source_status(&self, image: ImageId) -> Option<String> {
-        self.state.lock().source_reasons.get(&image).cloned()
+        let st = self.state.lock();
+        let method_warning = st
+            .entries
+            .iter()
+            .find(|entry| entry.info.id == image)
+            .and_then(|entry| crate::c1_styles::processing_method_warning(entry.adjustments.base.processing_method))
+            .map(str::to_owned);
+        let source_reason = st.source_reasons.get(&image).cloned();
+        match (method_warning, source_reason) {
+            (Some(method), Some(source)) => Some(format!("{method}; {source}")),
+            (Some(method), None) => Some(method),
+            (None, source) => source,
+        }
     }
 
     fn tether_status(&self) -> TetherStatus {
         tether::probe()
+    }
+    fn layer_summaries(&self, image: ImageId) -> Vec<crate::engine::LayerSummary> {
+        self.state.lock().layers.get(&image).cloned().unwrap_or_default()
+    }
+    fn retouch_masks(&self, image: ImageId) -> Vec<crate::c1_retouch::RetouchMaskSummary> {
+        self.state.lock().retouch.get(&image).cloned().unwrap_or_default()
     }
     fn capabilities(&self) -> crate::engine::EngineCapabilities {
         crate::engine::EngineCapabilities {
@@ -1415,17 +2177,15 @@ impl ImageEngine for FileEngine {
         tether::camera_settings()
     }
     fn capture(&self) -> anyhow::Result<ImageInfo> {
-        // Do not create a capture folder unless the camera produced a frame.
         let frame = tether::capture_frame()?;
-        let dir = self.capture_directory()?;
+        let dir = self.root.join("Capture");
+        std::fs::create_dir_all(&dir)?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let path = dir.join(format!("CAP_{stamp}.jpg"));
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-        file.write_all(&frame.jpeg)?;
+        std::fs::write(&path, &frame.jpeg)?;
         self.add_file(&path)
     }
     fn live_view_frame(&self, width: u32) -> Option<RgbaImage> {
@@ -1471,108 +2231,12 @@ fn film_curve_styles() -> Vec<StyleInfo> {
 mod tests {
     use super::*;
 
-    /// Ten previews for the same cold image must decode it once: the first
-    /// request decodes, the other nine wait on the decode lock and then use the
-    /// cached source. A test-only delay makes the overlap deterministic.
     #[test]
-    fn ten_concurrent_previews_decode_the_source_once() {
-        let (dir, synthetic) = match std::env::var_os("LUMEN_PREVIEW_BENCH_DIR") {
-            Some(dir) => (PathBuf::from(dir), false),
-            None => {
-                let dir = std::env::temp_dir().join(format!("lumen-single-flight-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
-                std::fs::create_dir_all(&dir).unwrap();
-                let img = image::RgbaImage::from_fn(3000, 2000, |x, y| {
-                    let v = ((x * 7 + y * 13) % 256) as u8;
-                    image::Rgba([v, v / 3, 255 - v, 255])
-                });
-                img.save(dir.join("frame.png")).unwrap();
-                (dir, true)
-            }
-        };
-        let engine = Arc::new(FileEngine::open(&dir).unwrap());
-        let image = engine.images()[0].id;
-        let request = PreviewRequest {
-            image,
-            adjustments: AdjustmentSet::default(),
-            region: NormRect::FULL,
-            max_size: 1400,
-            quality: crate::RenderQuality::Draft,
-            bypass: false,
-            mask_overlay: None,
-            generation: 1,
-            display_profile: None,
-            proof_profile: None,
-            proof_paper_white: 1.0,
-            proof_black_point: 0.0,
-        };
-        let before = DECODE_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        DECODE_DELAY_MS.store(150, std::sync::atomic::Ordering::SeqCst);
-        let frames = Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for step in 0..10u64 {
-                let engine = engine.clone();
-                let frames = &frames;
-                let mut request = request.clone();
-                request.generation = step + 1;
-                request.adjustments.exposure.exposure = step as f32 * 0.1;
-                scope.spawn(move || {
-                    let frame = engine.render_preview(&request).unwrap();
-                    frames.lock().push((frame.generation, frame.image.width));
-                });
-            }
-        });
-        DECODE_DELAY_MS.store(0, std::sync::atomic::Ordering::SeqCst);
-        let frames = frames.into_inner();
-        assert_eq!(frames.len(), 10, "every preview must succeed");
-        let decodes = DECODE_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before;
-        assert_eq!(decodes, 1, "ten concurrent previews must decode the source exactly once");
-        println!("single-flight: 10 previews, decodes={decodes}, frames={frames:?}");
-        if synthetic {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// Draft, Final and the internal half-size fast path must all return the
-    /// same dimensions; only the pixels computed internally may differ.
-    #[test]
-    fn draft_final_and_fast_keep_the_same_output_size() {
-        let dir = std::env::temp_dir().join(format!("lumen-same-size-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        image::RgbaImage::from_fn(2400, 1600, |x, y| image::Rgba([(x % 255) as u8, (y % 255) as u8, 80, 255]))
-            .save(dir.join("frame.png"))
-            .unwrap();
-        let engine = FileEngine::open(&dir).unwrap();
-        let image = engine.images()[0].id;
-        let request = PreviewRequest {
-            image,
-            adjustments: AdjustmentSet::default(),
-            region: NormRect::FULL,
-            max_size: 2000,
-            quality: crate::RenderQuality::Draft,
-            bypass: false,
-            mask_overlay: None,
-            generation: 1,
-            display_profile: None,
-            proof_profile: None,
-            proof_paper_white: 1.0,
-            proof_black_point: 0.0,
-        };
-        let draft = engine.render_preview(&request).unwrap();
-        let mut final_request = request.clone();
-        final_request.quality = crate::RenderQuality::Final;
-        final_request.adjustments.exposure.exposure = 0.25;
-        let final_frame = engine.render_preview(&final_request).unwrap();
-        let mut fast_request = request.clone();
-        fast_request.adjustments.exposure.exposure = -0.25;
-        let fast = engine.render_preview_fast(&fast_request, true).unwrap();
-        let size = |f: &PreviewFrame| (f.image.width, f.image.height);
-        assert_eq!(size(&draft), size(&final_frame), "Draft cap changed the output size");
-        assert_eq!(size(&fast), size(&final_frame), "fast changed the output size");
-        assert_eq!(final_frame.image.width, 2000);
-        println!("same-size: draft={:?} final={:?} fast={:?}", size(&draft), size(&final_frame), size(&fast));
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn midpoint_warning_only_touches_non_default_gradients() {
+        warn_unverified_midpoint("default", [0.0, 0.0, 10.0, 0.0, 0.5]);
+        warn_unverified_midpoint("skewed", [0.0, 0.0, 10.0, 0.0, 0.25]);
+        warn_unverified_midpoint("skewed", [0.0, 0.0, 10.0, 0.0, 0.75]);
+        warn_unverified_midpoint("broken", [0.0, 0.0, 10.0, 0.0, f32::NAN]);
     }
 
     /// A missing camera must fail before anything is written or catalogued; the
@@ -1582,7 +2246,7 @@ mod tests {
         if !matches!(tether::probe(), TetherStatus::NoCamera) {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("lumen-nocam-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-nocam-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
         let before = engine.images().len();
@@ -1596,7 +2260,7 @@ mod tests {
     /// must list only what the file engine really produces.
     #[test]
     fn capabilities_match_the_engine_and_the_encoders() {
-        let dir = std::env::temp_dir().join(format!("lumen-caps-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-caps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let caps = FileEngine::open(&dir).unwrap().capabilities();
         assert!(caps.eye_report && caps.auto_rotate && caps.match_look);
@@ -1622,8 +2286,44 @@ mod tests {
     }
 
     #[test]
+    fn heif_sources_decode_through_libheif() {
+        if !crate::heif_write::available() {
+            eprintln!("libheif unavailable; skipped the HEIF import round-trip");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("portrait-heif-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.heic");
+        crate::heif_write::encode(&path, &vec![80u8; 32 * 24 * 4], 32, 24, 80, None, None, None)
+            .unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine.images()[0].clone();
+        assert_eq!(info.kind, FileKind::Heif);
+        assert_eq!((info.width, info.height), (32, 24));
+        let frame = engine.render_preview(&PreviewRequest {
+            image: info.id,
+            adjustments: AdjustmentSet::default(),
+            region: NormRect::FULL,
+            max_size: 32,
+            quality: crate::RenderQuality::Final,
+            bypass: false,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
+        }).unwrap();
+        assert_eq!((frame.image.width, frame.image.height), (32, 24));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn importing_an_unsupported_file_adds_nothing() {
-        let dir = std::env::temp_dir().join(format!("lumen-import-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-import-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
         let note = dir.join("note.txt");
@@ -1648,7 +2348,7 @@ mod tests {
 
     #[test]
     fn cancelling_a_queued_job_sticks() {
-        let dir = std::env::temp_dir().join(format!("lumen-cancel-job-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-cancel-job-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
         engine.state.lock().jobs.insert(77, JobStatus::Queued);
@@ -1661,7 +2361,7 @@ mod tests {
 
     #[test]
     fn an_imported_style_appears_once_in_styles() {
-        let dir = std::env::temp_dir().join(format!("lumen-import-style-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-import-style-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let style = dir.join("Imported.costyle");
         std::fs::write(&style, b"<SL><E K=\"Name\" V=\"Synthetic\"/><E K=\"Exposure\" V=\"1\"/></SL>").unwrap();
@@ -1691,7 +2391,7 @@ mod tests {
         for ext in ["nef", "cr3", "arw", "dng"] {
             assert!(is_supported(Path::new(&format!("shot.{ext}"))), "{ext}");
         }
-        for ext in ["jpg", "png", "tif", "webp"] {
+        for ext in ["jpg", "png", "tif", "webp", "heic", "heif"] {
             assert!(is_supported(Path::new(&format!("shot.{ext}"))), "{ext}");
         }
         assert!(!is_supported(Path::new("notes.txt")));
@@ -1712,38 +2412,8 @@ mod tests {
     }
 
     #[test]
-    fn integrated_preview_quality_and_style_import() {
-        let dir = std::env::temp_dir().join(format!("aurora-integration-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        image::RgbaImage::from_fn(1600, 32, |x, y| image::Rgba([(x % 251) as u8, (y * 7) as u8, 90, 255]))
-            .save(dir.join("frame.png")).unwrap();
-        let engine = FileEngine::open(&dir).unwrap();
-        let image = engine.images()[0].id;
-        let mut request = PreviewRequest { image, adjustments: AdjustmentSet::default(), region: NormRect::FULL,
-            max_size: 1600, quality: RenderQuality::Draft, bypass: false, mask_overlay: None, generation: 1 , display_profile: None, proof_profile: None, proof_paper_white: 1.0, proof_black_point: 0.0, };
-        let draft = engine.render_preview(&request).unwrap();
-        request.quality = RenderQuality::Final;
-        let final_frame = engine.render_preview(&request).unwrap();
-        let fast = engine.render_preview_fast(&request, true).unwrap();
-        assert_eq!(draft.image.width, 1600);
-        assert_eq!(draft.image.pixels, final_frame.image.pixels);
-        assert_eq!(draft.image.pixels, fast.image.pixels);
-        let path = dir.join("test.costyle");
-        std::fs::write(&path, r#"<SL><E K="Name" V="Integration"/><E K="Exposure" V="0.5"/></SL>"#).unwrap();
-        let style = engine.import_style(&path).unwrap();
-        assert_eq!(style.name, "Integration");
-        assert_eq!(style.adjustments.exposure.exposure, 0.5);
-        engine.import_style(&path).unwrap();
-        assert_eq!(engine.styles().iter().filter(|s| s.name == style.name).count(), 1);
-        std::fs::write(&path, "invalid style").unwrap();
-        assert!(engine.import_style(&path).is_err());
-        drop(engine);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn opening_an_empty_folder_yields_no_images() {
-        let dir = std::env::temp_dir().join(format!("lumen-empty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
@@ -1756,7 +2426,7 @@ mod tests {
     fn categories_without_a_parser_class_return_an_error() {
         use crate::{AiMaskKind, ImageEngine};
 
-        let dir = std::env::temp_dir().join(format!("lumen-maskcat-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-maskcat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         image::RgbaImage::from_pixel(32, 24, image::Rgba([120, 90, 70, 255]))
@@ -1773,7 +2443,7 @@ mod tests {
 
     #[test]
     fn a_folder_mixing_formats_lists_only_supported_files() {
-        let dir = std::env::temp_dir().join(format!("lumen-mixed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-mixed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         image::RgbImage::from_pixel(8, 6, image::Rgb([10, 20, 30])).save(dir.join("a.jpg")).unwrap();
@@ -1794,7 +2464,7 @@ mod tests {
     fn saved_ai_masks_are_back_in_memory_after_reopening() {
         use crate::{AiMask, Layer, Mask, MaskOp, MaskShape};
 
-        let dir = std::env::temp_dir().join(format!("lumen-mask-reopen-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-mask-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         image::RgbaImage::from_pixel(8, 6, image::Rgba([50, 60, 70, 255]))
@@ -1824,14 +2494,14 @@ mod tests {
         // A fresh engine has none of the previous process's memory cache.
         let reopened = FileEngine::open(&dir).unwrap();
         assert!(reopened.images()[0].has_adjustments);
-        let plane = crate::aimask::lookup(&key).expect("preloaded from .lumen/masks");
+        let plane = crate::aimask::lookup(&key).expect("preloaded from .portrait/masks");
         assert_eq!((plane.w, plane.h), (4, 3));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn trash_survives_reopening_the_folder() {
-        let dir = std::env::temp_dir().join(format!("lumen-trash-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-trash-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         image::RgbaImage::from_pixel(4, 4, image::Rgba([20, 40, 60, 255])).save(dir.join("a.png")).unwrap();
@@ -1845,7 +2515,7 @@ mod tests {
         };
 
         let reopened = FileEngine::open(&dir).unwrap();
-        assert!(reopened.images()[0].trashed, "trash is persisted in .lumen/catalog.json");
+        assert!(reopened.images()[0].trashed, "trash is persisted in .portrait/catalog.json");
         let trash = reopened.collections().into_iter().find(|c| c.kind == CollectionKind::Trash).unwrap();
         assert_eq!(trash.count, 1);
         let folders: Vec<u64> = reopened
@@ -1859,6 +2529,137 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Copies the C1 fixture into a temp folder so the store lands there too.
+    fn c1_copy(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("portrait-c1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb");
+        std::fs::copy(source, dir.join("Capture One.cocatalogdb")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn c1_catalog_imports_every_variant_once() {
+        let dir = c1_copy("import");
+        let engine = FileEngine::open_c1_catalog(&dir).unwrap();
+        let images = engine.images();
+        assert_eq!(images.len(), 4, "3 images, 4 variants");
+        assert_eq!(images.iter().filter(|i| i.file_name == "_DSC5673.NEF").count(), 2);
+
+        let again = FileEngine::open_c1_catalog(&dir).unwrap();
+        assert_eq!(again.images().len(), 4, "reopening must not duplicate entries");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn c1_import_keeps_adjustments_and_metadata() {
+        let dir = c1_copy("meta");
+        let engine = FileEngine::open_c1_catalog(&dir).unwrap();
+        let first = &engine.images()[0];
+        assert!(first.has_adjustments);
+        assert_eq!(first.rating, 5);
+        let adj = engine.load_adjustments(first.id);
+        assert!((adj.white_balance.kelvin - 4779.55).abs() < 2.0);
+        assert!(adj.geometry.crop.width > 0.0 && adj.geometry.crop.width <= 1.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Opening a C1 catalog must publish C1's own albums, not the folder tree.
+    #[test]
+    fn c1_collections_replace_the_folder_tree() {
+        let dir = c1_copy("collections");
+        let engine = FileEngine::open_c1_catalog(&dir).unwrap();
+        let collections = engine.collections();
+        assert!(!collections.is_empty(), "the fixture stores collections");
+        assert!(
+            collections.iter().all(|c| c.id >= crate::c1import::C1_COLLECTION_ID_BASE),
+            "ids must come from C1, got {:?}",
+            collections.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
+        fn walk(list: &[Collection], out: &mut Vec<u64>) {
+            for c in list {
+                out.push(c.id);
+                walk(&c.children, out);
+            }
+        }
+        let mut ids = Vec::new();
+        walk(&collections, &mut ids);
+        for id in ids {
+            assert!(
+                engine.collection_images(id).is_some(),
+                "C1 collection {id} must resolve to a member list"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// C1 local layers are attached only when their `.comask` mask can be decoded;
+    /// the fixture has no sidecar, so it must stay unattached and safe.
+    #[test]
+    fn c1_layers_without_a_mask_stay_out_of_the_render() {
+        let dir = c1_copy("layers");
+        let engine = FileEngine::open_c1_catalog(&dir).unwrap();
+        let with_layers = engine
+            .images()
+            .into_iter()
+            .find(|info| !engine.layer_summaries(info.id).is_empty())
+            .expect("the fixture keeps local layers on one variant");
+        let layers = engine.layer_summaries(with_layers.id);
+        assert!(!layers.is_empty());
+        assert!(layers.iter().all(|layer| layer.mask_uuid.is_some()));
+        assert!(
+            engine.load_adjustments(with_layers.id).layers.is_empty(),
+            "no layer may render without its mask"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn c1_import_saves_to_portrait_not_the_catalog() {
+        let dir = c1_copy("store");
+        let catalog_file = dir.join("Capture One.cocatalogdb");
+        let before = std::fs::metadata(&catalog_file).unwrap().len();
+        let engine = FileEngine::open_c1_catalog(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&catalog_file).unwrap().len(), before);
+        assert!(!dir.join(".portrait/catalog.json").exists(), "opening is not an edit");
+        assert_eq!(engine.images().len(), 4, "the catalog is materialized in memory");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A real C1 catalog is a package folder; our store must stay outside it.
+    #[test]
+    fn c1_bundle_leaves_no_portrait_inside_the_package() {
+        let dir = std::env::temp_dir().join(format!("portrait-c1-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let package = dir.join("Capture One.cocatalogdb");
+        let inner = package.join("Capture One.cocatalogdb");
+        std::fs::create_dir_all(&package).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb");
+        std::fs::copy(fixture, &inner).unwrap();
+        let engine = FileEngine::open_c1_catalog(&inner).unwrap();
+        assert_eq!(engine.images().len(), 4);
+        assert!(!package.join(".portrait").exists(), "no sidecar inside the C1 package");
+        assert!(!dir.join(".portrait/catalog.json").exists(), "opening does not rewrite the index");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn c1_import_keeps_portrait_edits_on_reopen() {
+        let dir = c1_copy("reopen");
+        {
+            let engine = FileEngine::open_c1_catalog(&dir).unwrap();
+            let id = engine.images()[0].id;
+            let mut adj = engine.load_adjustments(id);
+            adj.exposure.exposure = 1.5;
+            engine.save_adjustments(id, &adj).unwrap();
+        }
+        let reopened = FileEngine::open_c1_catalog(&dir).unwrap();
+        let same = reopened.images().into_iter().find(|i| i.variant == 1).unwrap();
+        assert!((reopened.load_adjustments(same.id).exposure.exposure - 1.5).abs() < 1e-6);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn icc_with_description(description: &str) -> Vec<u8> {
         let text = description.as_bytes();
@@ -2013,13 +2814,12 @@ mod tests {
     }
 
     fn icc_temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lumen-icc-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-icc-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn a_tiff_still_in_the_camera_colour_space_gets_the_camera_profile() {
         let dir = icc_temp_dir("tiff-camera");
@@ -2083,47 +2883,6 @@ mod tests {
     }
 
     #[test]
-    fn hdr_merge_round_trips_and_is_cataloged() {
-        let dir = std::env::temp_dir().join(format!("lumen-hdr-one-{}-{}", std::process::id(), now_secs()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let img = image::RgbaImage::from_fn(8, 6, |x, y| image::Rgba([x as u8 * 30, y as u8 * 40, 90, 255]));
-        img.save(dir.join("a.png")).unwrap();
-        let engine = FileEngine::open(&dir).unwrap();
-        let id = engine.images()[0].id;
-        let merged = engine.merge_hdr_frames(&[id]).unwrap();
-        assert_eq!((merged.width, merged.height), (8, 6));
-        assert_eq!(merged.kind, FileKind::Tiff);
-        assert!(merged.file_name.ends_with("_HDR.tif"));
-        assert_eq!(engine.images().len(), 2);
-        let actual = image::open(&merged.path).unwrap().to_rgb16();
-        for (out, src) in actual.pixels().zip(img.pixels()) {
-            for k in 0..3 {
-                assert!((out.0[k] as i32 - src.0[k] as i32 * 257).abs() <= 2);
-            }
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn hdr_merge_rejects_mismatched_sizes_without_output() {
-        let dir = std::env::temp_dir().join(format!("lumen-hdr-size-{}-{}", std::process::id(), now_secs()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        image::RgbaImage::from_pixel(8, 6, image::Rgba([80, 80, 80, 255])).save(dir.join("a.png")).unwrap();
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([80, 80, 80, 255])).save(dir.join("b.png")).unwrap();
-        let engine = FileEngine::open(&dir).unwrap();
-        let ids: Vec<_> = engine.images().iter().map(|i| i.id).collect();
-        let err = engine.merge_hdr_frames(&ids).unwrap_err().to_string();
-        assert!(err.contains("share one size"), "{err}");
-        assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with("_HDR.tif")));
-        let fallback = crate::MockEngine::new().merge_hdr_frames(&ids).unwrap_err().to_string();
-        assert!(fallback.contains("not supported"), "{fallback}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[cfg(feature = "external-fixtures")]
-    #[test]
     fn raw_files_still_get_their_camera_defaults() {
         let dir = icc_temp_dir("raw");
         let tiff_path = dir.join("shot.tif");
@@ -2147,6 +2906,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/file_engine-tests.rs");
+    #[test]
+    fn exif_lens_name_enables_only_a_database_match() {
+        let lenses = crate::lensdb::parse_lenses(
+            r#"<lenses>
+  <lens ID="Z2470" type="Zoom">
+    <fullName>Nikon NIKKOR Z 24-70mm f/4 S</fullName>
+    <shortName>NIKKOR Z 24-70mm f/4 S</shortName>
+    <brand>Nikon</brand>
+    <focalLength dependent="true" min="24.0" max="70.0"/>
+  </lens>
+</lenses>"#,
+        );
+
+        let mut known = crate::LensCorrection::default();
+        let exif = Exif {
+            lens: Some("NIKKOR Z 24-70mm f/4 S".into()),
+            focal_length_mm: Some(70.0),
+            ..Default::default()
+        };
+        apply_auto_lens(&mut known, &lenses, &exif);
+        assert_eq!(known.profile.as_deref(), Some("Nikon NIKKOR Z 24-70mm f/4 S"));
+        assert!(known.use_profile, "a database hit turns the calibrated warp on");
+
+        let mut unknown = crate::LensCorrection::default();
+        let exif = Exif {
+            lens: Some("NIKKOR Z 24-120mm f/4 S".into()),
+            focal_length_mm: Some(120.0),
+            ..Default::default()
+        };
+        apply_auto_lens(&mut unknown, &lenses, &exif);
+        assert_eq!(unknown.profile, None);
+        assert!(!unknown.use_profile, "an unknown lens must stay off");
+
+        let mut missing = crate::LensCorrection::default();
+        apply_auto_lens(&mut missing, &lenses, &Exif::default());
+        assert_eq!(missing.profile, None);
+        assert!(!missing.use_profile);
+
+        let mut manual = crate::LensCorrection { profile: Some("Manual".into()), ..Default::default() };
+        apply_auto_lens(&mut manual, &lenses, &Exif { lens: Some("NIKKOR Z 24-70mm f/4 S".into()), focal_length_mm: Some(50.0), ..Default::default() });
+        assert_eq!(manual.profile.as_deref(), Some("Manual"));
+        assert!(!manual.use_profile, "a user-picked profile is not replaced");
+    }
+
+    #[test]
+    fn merge_default_options_match_the_old_methods_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("portrait-mergeopts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frame.tif");
+        let pixels: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> = image::ImageBuffer::from_fn(
+            16,
+            8,
+            |x, y| image::Rgb([(x * 1000) as u16, (y * 2000) as u16, 30_000]),
+        );
+        image::DynamicImage::ImageRgb16(pixels)
+            .save_with_format(&path, image::ImageFormat::Tiff)
+            .unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine
+            .images()
+            .into_iter()
+            .find(|image| image.file_name == "frame.tif")
+            .unwrap()
+            .id;
+
+        let hdr_old = FileEngine::merge_hdr_frames(&engine, &[id]).unwrap();
+        let hdr_new = engine.merge_hdr_with_options(&[id], &HdrOptions::default()).unwrap();
+        assert_ne!(hdr_old.path, hdr_new.path);
+        assert_eq!(
+            std::fs::read(&hdr_old.path).unwrap(),
+            std::fs::read(&hdr_new.path).unwrap(),
+            "default HDR options changed the merged TIFF"
+        );
+
+        let pano_old = FileEngine::merge_panorama_frames(&engine, &[id]).unwrap();
+        let pano_new = engine
+            .merge_panorama_with_options(&[id], &PanoramaOptions::default())
+            .unwrap();
+        assert_ne!(pano_old.path, pano_new.path);
+        assert_eq!(
+            std::fs::read(&pano_old.path).unwrap(),
+            std::fs::read(&pano_new.path).unwrap(),
+            "default panorama options changed the merged TIFF"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

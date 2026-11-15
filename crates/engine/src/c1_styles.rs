@@ -42,6 +42,7 @@ impl StyleImportErrorKind {
 }
 
 use crate::c1_model::{self, C1VariantSettings};
+use crate::presets::{C1Preset, PresetKind};
 use crate::AdjustmentSet;
 
 /// One `.costyle` / `.copreset` mapped onto the engine's adjustments.
@@ -49,7 +50,31 @@ use crate::AdjustmentSet;
 pub struct C1Style {
     /// The file's own `Name`, or the file stem when it carries none.
     pub name: String,
+    /// Root `<SL Engine="...">` value; 800 when absent.
+    pub engine: u32,
+    /// Every `K`/`V` pair in file order, including metadata this writer omits.
+    pub original: Vec<(String, String)>,
+    /// Raw `ColorCorrections` rows, so writing does not re-encode the editor.
+    pub color_corrections: Vec<[f32; 18]>,
     pub adjustments: AdjustmentSet,
+}
+
+/// Status shown when a C1 style asks for a processing branch this engine does
+/// not implement. `Photography` is the only branch that renders normally.
+pub fn processing_method_warning(method: crate::TechnicalProcessingMethod) -> Option<&'static str> {
+    match method {
+        crate::TechnicalProcessingMethod::Photography => None,
+        crate::TechnicalProcessingMethod::ReproFilmNegatives
+        | crate::TechnicalProcessingMethod::StandardFilmNegatives => {
+            Some("C1 film negative processing is not implemented; rendering as normal photography")
+        }
+        crate::TechnicalProcessingMethod::ReproFilmPositives => {
+            Some("C1 film positive processing is not implemented; rendering as normal photography")
+        }
+        crate::TechnicalProcessingMethod::Scientific => {
+            Some("C1 scientific processing is not implemented; rendering as normal photography")
+        }
+    }
 }
 
 /// Reads one style or preset file.
@@ -68,12 +93,13 @@ pub fn load_style(path: &Path) -> Result<C1Style> {
     let mut settings = C1VariantSettings::defaults();
     let mut name = None;
     let (mut kelvin, mut tint) = (None, None);
-    for (key, value) in crate::presets::parse_sl(&text) {
+    let original = crate::presets::parse_sl(&text);
+    for (key, value) in &original {
         match key.as_str() {
-            "Name" => name = Some(value),
-            "WhiteBalanceTemperature" => kelvin = c1_model::parse_scalar(&value),
-            "WhiteBalanceTint" => tint = c1_model::parse_scalar(&value),
-            _ => apply(&mut settings, &key, &value),
+            "Name" => name = Some(value.clone()),
+            "WhiteBalanceTemperature" => kelvin = c1_model::parse_scalar(value),
+            "WhiteBalanceTint" => tint = c1_model::parse_scalar(value),
+            _ => apply(&mut settings, key, value),
         }
     }
     // Temperature and tint are the numbers Capture One's UI shows; the
@@ -83,10 +109,97 @@ pub fn load_style(path: &Path) -> Result<C1Style> {
         settings.white_balance_gains = c1_model::kelvin_tint_to_gains(k, tint.unwrap_or(0.0));
     }
 
+    let adjustments = defined_groups(&settings);
     Ok(C1Style {
         name: name.unwrap_or_else(|| stem.to_owned()),
-        adjustments: defined_groups(&settings),
+        engine: engine_attr(&text).unwrap_or(800),
+        original,
+        color_corrections: settings.color_corrections,
+        adjustments,
     })
+}
+
+fn engine_attr(text: &str) -> Option<u32> {
+    let start = text.find("Engine=\"")? + "Engine=\"".len();
+    let end = text[start..].find('"')?;
+    text[start..start + end].parse().ok()
+}
+
+/// Keys this writer can emit. `C1Style.original` is filtered to this set so
+/// metadata such as UUID/StyleSource/TechnicalProcessingMethod is not written.
+fn writable_key(key: &str) -> bool {
+    matches!(
+        key,
+        "Name"
+            | "Exposure"
+            | "Contrast"
+            | "Brightness"
+            | "Saturation"
+            | "WhiteBalance"
+            | "WhiteBalanceTemperature"
+            | "WhiteBalanceTint"
+            | "GradationCurve"
+            | "GradationCurveRed"
+            | "GradationCurveGreen"
+            | "GradationCurveBlue"
+            | "USMAmount"
+            | "USMRadius"
+            | "USMThreshold"
+            | "FilmGrainAmount"
+            | "FilmGrainGranularity"
+            | "FilmGrainType"
+            | "FilmCurve"
+            | "BwEnabled"
+            | "BwRed"
+            | "BwYellow"
+            | "BwGreen"
+            | "BwCyan"
+            | "BwBlue"
+            | "BwMagenta"
+            | "BwLightHue"
+            | "BwLightSaturation"
+            | "BwDarkHue"
+            | "BwDarkSaturation"
+            | "ColorCorrections"
+    )
+}
+
+/// Writes a loaded style as C1 XML. The real file's header and Engine value are
+/// preserved; keys outside [`writable_key`] are intentionally omitted.
+pub fn write_costyle_text(style: &C1Style) -> String {
+    let preset = C1Preset {
+        id: style.name.clone(),
+        name: style.name.clone(),
+        group: String::new(),
+        kind: PresetKind::Style,
+        adjustments: style.adjustments.clone(),
+        unmapped: Vec::new(),
+        orig: style
+            .original
+            .iter()
+            .filter(|(key, _)| writable_key(key))
+            .cloned()
+            .collect(),
+        color_corrections: style.color_corrections.clone(),
+    };
+    let mut text = crate::presets::sl_text(&preset);
+    text = text.replacen(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+        "<?xml version=\"1.0\"?>",
+        1,
+    );
+    text = text.replacen(
+        "<SL Engine=\"800\">",
+        &format!("<SL Engine=\"{}\">", style.engine),
+        1,
+    );
+    text
+}
+
+/// Writes a loaded style to `path`.
+pub fn save_costyle(path: &Path, style: &C1Style) -> Result<()> {
+    std::fs::write(path, write_costyle_text(style))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Converts the settings and keeps only the tool groups the file defines.
@@ -136,6 +249,9 @@ fn defined_groups(s: &C1VariantSettings) -> AdjustmentSet {
     if full.base.curve != neutral.base.curve {
         out.base.curve = full.base.curve;
     }
+    if full.base.processing_method != neutral.base.processing_method {
+        out.base.processing_method = full.base.processing_method;
+    }
     out
 }
 
@@ -150,6 +266,11 @@ fn apply(s: &mut C1VariantSettings, key: &str, value: &str) {
         "WhiteBalance" => {
             if let Some(g) = gains(value) {
                 s.white_balance_gains = g;
+            }
+        }
+        "TechnicalProcessingMethod" => {
+            if let Some(v) = n {
+                s.technical_processing_method = v as i32;
             }
         }
         "GradationCurve" => s.gradation_curves[0] = c1_model::parse_curve(value),
@@ -207,6 +328,9 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn testdata(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-styles").join(name)
+    }
 
     /// A scratch file that removes itself when the test ends.
     struct Scratch(PathBuf);
@@ -214,7 +338,7 @@ mod tests {
     impl Scratch {
         fn new(name: &str, body: &[u8]) -> Self {
             let path = std::env::temp_dir()
-                .join(format!("lumen-c1-style-{}-{name}", std::process::id()));
+                .join(format!("portrait-c1-style-{}-{name}", std::process::id()));
             std::fs::write(&path, body).expect("temp file");
             Self(path)
         }
@@ -226,6 +350,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_real_style_maps_its_tools() {
+        let style = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("real style parses");
+        assert_eq!(style.name, "Fujicolor Pro 160C");
+        let a = &style.adjustments;
+        println!(
+            "{}\texposure={}\tcontrast={}\tsaturation={}\tkelvin={}\ttint={}",
+            style.name,
+            a.exposure.exposure,
+            a.exposure.contrast,
+            a.exposure.saturation,
+            a.white_balance.kelvin,
+            a.white_balance.tint
+        );
+        assert!((a.exposure.exposure - 2.355544).abs() < 1e-3);
+        assert!((a.exposure.contrast - 24.09511).abs() < 1e-3);
+        assert!((a.exposure.brightness - -3.422448).abs() < 1e-3);
+        // The temperature survives the round trip through C1's RGB gains.
+        assert!((a.white_balance.kelvin - 2445.051).abs() < 0.5, "{}", a.white_balance.kelvin);
+        assert!((a.white_balance.tint - -15.3893).abs() < 0.01);
+        assert_eq!(a.curves.rgb.points.len(), 3);
+        // The `.fcrv` extension is dropped, so the curve is found by stem.
+        assert_eq!(a.base.film_curve.as_deref(), Some("PhaseOneIQ180-Linear Response"));
+        assert_eq!(a.base.curve, crate::ToneCurvePreset::Linear);
+    }
+
+    #[test]
+    fn every_real_sample_parses() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-styles");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("sample folder")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                matches!(p.extension().and_then(|e| e.to_str()), Some("copreset") | Some("costyle"))
+            })
+            .collect();
+        files.sort();
+        assert!(files.len() >= 5, "only {} samples", files.len());
+        let mut non_default = 0;
+        for file in &files {
+            let style = load_style(file).unwrap_or_else(|e| panic!("{}: {e:#}", file.display()));
+            let a = &style.adjustments;
+            if !a.is_default() {
+                non_default += 1;
+            }
+            println!(
+                "{}\texposure={}\tcontrast={}\tsaturation={}",
+                style.name, a.exposure.exposure, a.exposure.contrast, a.exposure.saturation
+            );
+        }
+        assert_eq!(non_default, files.len(), "every sample defines something");
+        let bw = load_style(&testdata("Color - Panchromatic 1.copreset")).expect("bw preset");
+        assert!(bw.adjustments.black_white.enabled);
+        assert_eq!(bw.adjustments.black_white.sensitivity[0], -16.26506);
+        let blue = load_style(&testdata("Effect - Blue only.copreset")).expect("color editor");
+        let advanced = &blue.adjustments.color_editor.advanced;
+        assert_eq!(advanced.len(), 1, "kind 0 is an advanced group");
+        assert!(advanced[0].shift.saturation < -99.0);
+        let band = blue.adjustments.color_editor.advanced_bands[0].1;
+        assert!(band.inverted, "field 15 is the inverted flag");
+    }
 
     #[test]
     fn a_broken_file_is_an_error() {
@@ -293,6 +479,160 @@ mod tests {
     }
 
     #[test]
+    fn technical_processing_method_reaches_the_style() {
+        let file = Scratch::new(
+            "negative.costyle",
+            br#"<SL Engine="800"><E K="TechnicalProcessingMethod" V="2"/></SL>"#,
+        );
+        let style = load_style(&file.0).expect("parses");
+        assert_eq!(
+            style.adjustments.base.processing_method,
+            crate::TechnicalProcessingMethod::ReproFilmNegatives
+        );
+    }
+
+    #[test]
+    fn only_non_photography_processing_methods_warn() {
+        assert_eq!(
+            processing_method_warning(crate::TechnicalProcessingMethod::Photography),
+            None
+        );
+        for method in [
+            crate::TechnicalProcessingMethod::Scientific,
+            crate::TechnicalProcessingMethod::ReproFilmNegatives,
+            crate::TechnicalProcessingMethod::ReproFilmPositives,
+            crate::TechnicalProcessingMethod::StandardFilmNegatives,
+        ] {
+            assert!(processing_method_warning(method).is_some(), "missing warning for {method:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the local Capture One style installation"]
+    fn installed_styles_report_all_processing_methods() {
+        fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("style directory") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("costyle") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(r"C:\Program Files\Capture One\Capture One");
+        let mut files = Vec::new();
+        collect(root, &mut files);
+        let mut methods = std::collections::BTreeMap::new();
+        for path in &files {
+            let style = load_style(path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            *methods.entry(style.adjustments.base.processing_method).or_insert(0usize) += 1;
+        }
+        assert_eq!(files.len(), 25, "installed style count");
+        assert_eq!(
+            methods,
+            std::collections::BTreeMap::from([
+                (crate::TechnicalProcessingMethod::Photography, 3),
+                (crate::TechnicalProcessingMethod::ReproFilmNegatives, 11),
+                (crate::TechnicalProcessingMethod::ReproFilmPositives, 11),
+            ])
+        );
+    }
+
+    #[test]
+    fn written_style_round_trips_mapped_values() {
+        let original = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("source style");
+        let text = write_costyle_text(&original);
+        assert!(
+            text.starts_with("<?xml version=\"1.0\"?>\n<SL Engine=\""),
+            "unexpected header: {text}"
+        );
+        assert!(text.contains(&format!("<SL Engine=\"{}\">", original.engine)), "{text}");
+        let file = Scratch::new("written.costyle", b"");
+        std::fs::write(&file.0, text.as_bytes()).expect("write temp style");
+        let read = load_style(&file.0).expect("reload written style");
+        assert_eq!(read.name, original.name);
+        assert_eq!(read.engine, original.engine);
+        // TechnicalProcessingMethod is metadata outside the 30 writable keys.
+        let mut expected = original.adjustments.clone();
+        expected.base.processing_method = crate::TechnicalProcessingMethod::Photography;
+        assert_eq!(read.adjustments, expected);
+        assert_eq!(read.color_corrections, original.color_corrections);
+    }
+
+    #[test]
+    fn writer_omits_metadata_and_unmapped_keys() {
+        let style = load_style(&testdata("B&W Generic 4.costyle")).expect("source style");
+        let text = write_costyle_text(&style);
+        for key in ["UUID", "StyleSource", "TechnicalProcessingMethod", "Flip", "Color_tag_index"] {
+            assert!(!text.contains(&format!("K=\"{key}\"")), "{key} leaked into {text}");
+        }
+        assert!(text.contains("K=\"Name\""), "{text}");
+        assert!(text.contains("K=\"Exposure\""), "{text}");
+    }
+
+    #[test]
+    fn writer_field_diff_against_real_sample() {
+        // Layer two: same parameters in, field-level diff out, order ignored.
+        let path = testdata("Fujicolor Pro 160C.costyle");
+        let source = std::fs::read_to_string(&path).expect("sample text");
+        let style = load_style(&path).expect("source style");
+        let written = write_costyle_text(&style);
+        let before = crate::presets::parse_sl(&source);
+        let after = crate::presets::parse_sl(&written);
+
+        let numbers = |value: &str| -> Option<Vec<f32>> {
+            value
+                .split([';', ','])
+                .map(|part| part.trim().parse::<f32>().ok())
+                .collect()
+        };
+        let mut dropped = Vec::new();
+        let mut changed = Vec::new();
+        for (key, old) in &before {
+            match after.iter().find(|(k, _)| k == key) {
+                None => dropped.push(key.clone()),
+                Some((_, new)) => {
+                    if old == new {
+                        continue;
+                    }
+                    let same_numbers = matches!(
+                        (numbers(old), numbers(new)),
+                        (Some(a), Some(b))
+                            if a.len() == b.len()
+                                && a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-4 * x.abs().max(1.0))
+                    );
+                    assert!(same_numbers, "{key}: {old:?} != {new:?}");
+                    changed.push((key.clone(), old.clone(), new.clone()));
+                }
+            }
+        }
+        for (key, _) in &after {
+            assert!(before.iter().any(|(k, _)| k == key), "writer invented {key}");
+        }
+        assert_eq!(
+            dropped,
+            vec![
+                "ColorBalance",
+                "ColorBalanceHighlight",
+                "ColorBalanceMidtone",
+                "ColorBalanceShadow",
+                "Color_tag_index",
+                "Flip",
+                "Highlight",
+                "Midtone",
+                "Shadow",
+                "TechnicalProcessingMethod",
+                "UUID",
+            ]
+        );
+        println!("kept {} keys, dropped {} keys", after.len(), dropped.len());
+        for (key, old, new) in &changed {
+            println!("format-only {key}: {old} -> {new}");
+        }
+    }
+
+    #[test]
     fn style_import_failures_map_to_stable_kinds() {
         use anyhow::anyhow;
         assert_eq!(
@@ -306,7 +646,4 @@ mod tests {
         assert_eq!(StyleImportErrorKind::of(&anyhow!("Unsupported version")), StyleImportErrorKind::Unsupported);
         assert_eq!(StyleImportErrorKind::of(&anyhow!("other")), StyleImportErrorKind::Other);
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/c1_styles-tests.rs");
 }

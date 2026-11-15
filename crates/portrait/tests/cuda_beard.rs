@@ -2,10 +2,10 @@
 
 #[cfg(windows)]
 mod beard_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_beard::{Beard, KERNEL};
-    use aurora_pixcake::kernels::beard;
-    use aurora_pixcake::Image;
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_beard::{Beard, KERNEL};
+    use aurora_portrait::kernels::beard;
+    use aurora_portrait::Image;
 
     fn gpu() -> Option<Beard> {
         match Beard::open() {
@@ -13,7 +13,7 @@ mod beard_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

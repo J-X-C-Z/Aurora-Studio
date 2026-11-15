@@ -725,7 +725,7 @@ mod tests {
         let mut o = ParamOverrides::default();
         block.apply_to(&mut o);
         let (_, _, k) = o.apply(by_key("WhiteBalanceTemperature").unwrap());
-        assert!((k - 5648.0).abs() < 20.0, "{k}");
+        assert!((k - 4779.55).abs() < 2.0, "{k}");
     }
 
     #[test]
@@ -759,6 +759,32 @@ mod tests {
         assert_eq!(o.apply(by_key("Saturation").unwrap()), (-100.0, 100.0, 0.0));
     }
 
+    /// The real `coreConfig.cdx` must reproduce the sharpening default Capture
+    /// One stored for the reference frame: Z6_3 at ISO 5000 has USMAmount 160,
+    /// which is the ISO 3200 rung, not the ISO 0 rung (180).
+    #[test]
+    fn real_core_config_matches_capture_ones_stored_default() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/coreConfig.cdx");
+        let Ok(defaults) = CameraDefaults::load(&path) else { return };
+        let o = defaults.overrides(Some("NIKON Z6_3"), Some(5000));
+        let (min, max, def) = o.apply(by_key("USMAmount").unwrap());
+        assert_eq!((min, max), (0.0, 1000.0));
+        assert_eq!(def, 160.0);
+        let (_, _, exposure) = o.apply(by_key("Exposure").unwrap());
+        assert_eq!(exposure, 0.0);
+        let (min, max, _) = o.apply(by_key("Exposure").unwrap());
+        assert_eq!((min, max), (-4.0, 4.0));
+
+        // The body's own block, not just BASEDEFAULT: 180 below ISO 3200, and
+        // the sparse 12800 block inherits 140 from the 6400 rung.
+        let usm = |iso| defaults.overrides(Some("NIKON Z6_3"), Some(iso)).apply(by_key("USMAmount").unwrap()).2;
+        assert_eq!(usm(200), 180.0);
+        assert_eq!(usm(1600), 180.0);
+        assert_eq!(usm(12800), 140.0);
+        // An unknown body keeps BASEDEFAULT only; no invented ladder.
+        let unknown = defaults.overrides(Some("ACME CAMERA 9000"), Some(200));
+        assert_eq!(unknown.apply(by_key("USMAmount").unwrap()).2, 160.0);
+    }
 
     #[test]
     fn mixed_case_camera_ids_resolve_and_sparse_rungs_accumulate() {
@@ -788,6 +814,29 @@ mod tests {
         assert!(v.contains(&"CANONEOSR5MK2".to_string()), "{v:?}");
     }
 
+    /// The first 212 kB of a real Nikon Z6_3 NEF: file header, IFD0, the EXIF
+    /// IFD and the whole 176 kB MakerNote, with the sensor data cut off.
+    #[test]
+    fn real_nef_matches_capture_ones_stored_white_balance() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
+        let data = std::fs::read(&path).expect("testdata sample");
+        let block = parse_info_block(&data).expect("parses the real header");
+        let (r, g, b) = (
+            block.get("IB_F_WBRED").expect("WB red"),
+            block.get("IB_F_WBGREEN").expect("WB green"),
+            block.get("IB_F_WBBLUE").expect("WB blue"),
+        );
+        // Capture One stores the same frame as ZWHITEBALANCE='1.625;1.000;1.412'.
+        assert!((r / g - 1.625).abs() < 1e-4, "{r}/{g}");
+        assert!((b / g - 1.412).abs() < 1e-3, "{b}/{g}");
+        assert_eq!(block.iso, Some(5000));
+        assert_eq!(block.model.as_deref(), Some("NIKON Z6_3"));
+    }
+
+    fn testdata() -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
+        std::fs::read(path).expect("testdata sample")
+    }
 
     /// IFD0 `0x014A` holds the SubIFD offsets; the full-size one wins over the
     /// 384x256 and 160x120 previews.
@@ -832,6 +881,23 @@ mod tests {
         out
     }
 
+    /// exiftool: `[ExifIFD] LensModel = NIKKOR Z 24-120mm f/4 S` (tag 0xA434).
+    #[test]
+    fn lens_model_comes_from_the_exif_ifd() {
+        let block = parse_info_block(&testdata()).unwrap();
+        assert_eq!(block.lens_model.as_deref(), Some("NIKKOR Z 24-120mm f/4 S"));
+    }
+
+    /// exiftool: `[Nikon] WhiteBalance Auto1` (tag 0x0005),
+    /// `[Nikon] ColorTemperatureAuto 4790` (0x004F),
+    /// `[Nikon] ShutterCount 265058` (0x00A7).
+    #[test]
+    fn nikon_makernote_wb_and_shutter_count() {
+        let block = parse_info_block(&testdata()).unwrap();
+        assert_eq!(block.wb_mode.as_deref(), Some("Auto1"));
+        assert_eq!(block.color_temperature, Some(4790));
+        assert_eq!(block.shutter_count, Some(265058));
+    }
 
     /// A frame without SubIFDs, lens or MakerNote reports None, not a guess.
     #[test]
@@ -877,7 +943,4 @@ mod tests {
         assert_eq!(block.get("IB_F_PIXELWIDTH"), Some(6064.0));
         assert_eq!(block.get("IB_F_PIXELHEIGHT"), Some(4040.0));
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/rawinfo-tests.rs");
 }

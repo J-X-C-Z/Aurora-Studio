@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use gpui_kit::RenderImage;
-use lumen_engine::RgbaImage;
+use aurora_engine::RgbaImage;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScopeKind {

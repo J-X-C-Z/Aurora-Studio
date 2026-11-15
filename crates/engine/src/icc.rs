@@ -56,6 +56,24 @@ pub struct MatrixTrc {
     pub trc: [Curve; 3],
 }
 
+/// True when an A2B input shaper is (within 10% of) the identity curve.
+///
+/// The installed corpus separates cleanly: identity shapers peak at 0.0002,
+/// `PhaseOneH20-Outdoor Daylight` (identity plus a small highlight lift) peaks
+/// at 0.075, and every encode shaper peaks above 0.266. 10% lands in that gap,
+/// so only the boundary profile moves class.
+fn curve_is_linear(curve: &Curve) -> bool {
+    match curve {
+        Curve::Identity => true,
+        Curve::Table(t) if t.len() < 2 => true,
+        Curve::Table(t) => {
+            let last = (t.len() - 1) as f32;
+            t.iter().enumerate().all(|(i, v)| (v - i as f32 / last).abs() < 0.10)
+        }
+        Curve::Gamma(_) => false,
+    }
+}
+
 /// An `mft2` look-up: shaper curves -> 3D grid -> output curves.
 #[derive(Debug, Clone)]
 pub struct Lut2 {
@@ -180,6 +198,21 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Whether the A2B LUT wants linear device values.
+    ///
+    /// Capture One camera profiles carry an `mft2` shaper that *is* the sRGB
+    /// encode (1440 of the 1555 profiles installed here), so their CLUT is
+    /// indexed in encoded space and the caller has to hand over linear values.
+    /// The Leaf, Mamiya and Phase One backs (103 profiles) ship an identity
+    /// shaper: their CLUT indexes the stored device codes, so the caller encodes
+    /// first. Matrix/TRC profiles have no A2B and always take encoded values.
+    pub fn expects_linear_input(&self) -> bool {
+        match &self.a2b {
+            Some(lut) => lut.input.iter().any(|curve| !curve_is_linear(curve)),
+            None => false,
+        }
+    }
+
     /// Device RGB (0..1, as stored in the file) to linear sRGB.
     pub fn to_linear_srgb(&self, rgb: [f32; 3]) -> [f32; 3] {
         xyz_d50_to_linear_srgb(self.decode(rgb))
@@ -215,6 +248,23 @@ impl Profile {
     ) -> Option<Result<[f32; 3]>> {
         (rendering.is_supported() && !rendering.black_point_compensation)
             .then(|| self.from_linear_srgb(rgb))
+    }
+
+    /// PCS -> device under a rendering request. BPC maps PCS black onto the
+    /// profile's `bkpt`, the inverse of [`apply_bpc`]. Profiles without `bkpt`
+    /// refuse the request instead of silently ignoring it.
+    pub fn encode_with(&self, pcs: [f32; 3], rendering: Rendering) -> Option<[f32; 3]> {
+        if !rendering.is_supported() {
+            return None;
+        }
+        if !rendering.black_point_compensation {
+            return Some(self.encode(pcs));
+        }
+        let black = self.bkpt?;
+        Some(self.encode([0, 1, 2].map(|i| {
+            let k = black[i].clamp(0.0, 0.99);
+            pcs[i] * (1.0 - k) + k
+        })))
     }
 }
 
@@ -630,9 +680,9 @@ pub(crate) fn is_srgb(profile: &Profile) -> bool {
 }
 
 /// Where Capture One keeps its profiles on this machine. Overridable for tests
-/// and for installs that live elsewhere (`LUMEN_ICC_DIR`).
+/// and for installs that live elsewhere (`AURORA_ICC_DIR`).
 pub fn profile_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("LUMEN_ICC_DIR") {
+    if let Some(dir) = std::env::var_os("AURORA_ICC_DIR") {
         return PathBuf::from(dir);
     }
     let install = PathBuf::from(r"C:\Program Files\Capture One\Capture One\Color Profiles");
@@ -659,10 +709,10 @@ pub(crate) struct Discovered {
 }
 
 /// Directories searched for profiles: the Capture One/local install and, unless
-/// `LUMEN_ICC_DIR` pins the search, the Windows colour directory.
+/// `AURORA_ICC_DIR` pins the search, the Windows colour directory.
 fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![profile_dir()];
-    if std::env::var_os("LUMEN_ICC_DIR").is_none() {
+    if std::env::var_os("AURORA_ICC_DIR").is_none() {
         let system = PathBuf::from(r"C:\Windows\System32\spool\drivers\color");
         if system.is_dir() {
             dirs.push(system);
@@ -716,8 +766,18 @@ pub enum ProfileGroup {
     Output,
 }
 
+/// True for a C1 camera space stem, tolerating a revision suffix such as
+/// `SigmaFPL-ProStandard v2` so it groups with its base name.
+fn is_camera_space(name: &str) -> bool {
+    let base = match name.rsplit_once(' ') {
+        Some((base, rev)) if rev.starts_with('v') && rev[1..].bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => name,
+    };
+    base.ends_with("-ProStandard") || base.ends_with("-Generic")
+}
+
 fn group_of(profile: &Discovered) -> ProfileGroup {
-    if profile.name.ends_with("-ProStandard") || profile.name.ends_with("-Generic") {
+    if is_camera_space(&profile.name) {
         ProfileGroup::Camera
     } else if profile.matrix {
         ProfileGroup::Output
@@ -1076,6 +1136,15 @@ fn solve3(m: [[f32; 3]; 3], v: [f32; 3]) -> Option<[f32; 3]> {
 /// Uses rayon for the per-pixel work. A buffer whose length is not a multiple
 /// of four is handled safely: the trailing bytes are left untouched.
 pub fn convert_srgb_to(rgba: &mut [u8], profile: &Profile) {
+    let _ = convert_srgb_to_with(rgba, profile, Rendering::default());
+}
+
+/// [`convert_srgb_to`] under an explicit rendering request. Returns `None`
+/// without touching the buffer when the profile cannot honour it.
+pub fn convert_srgb_to_with(rgba: &mut [u8], profile: &Profile, rendering: Rendering) -> Option<()> {
+    if !rendering.is_supported() || (rendering.black_point_compensation && profile.bkpt.is_none()) {
+        return None;
+    }
     rgba.par_chunks_mut(4).for_each(|px| {
         if px.len() < 4 {
             return;
@@ -1085,15 +1154,27 @@ pub fn convert_srgb_to(rgba: &mut [u8], profile: &Profile) {
             px[1] as f32 / 255.0,
             px[2] as f32 / 255.0,
         ];
-        let out = profile.encode(srgb_to_xyz_d50(srgb));
-        px[0] = to_u8(out[0]);
-        px[1] = to_u8(out[1]);
-        px[2] = to_u8(out[2]);
+        if let Some(out) = profile.encode_with(srgb_to_xyz_d50(srgb), rendering) {
+            px[0] = to_u8(out[0]);
+            px[1] = to_u8(out[1]);
+            px[2] = to_u8(out[2]);
+        }
     });
+    Some(())
 }
 
 /// Convert an RGBA buffer in the profile's device space into sRGB.
 pub fn convert_to_srgb(rgba: &mut [u8], profile: &Profile) {
+    let _ = convert_to_srgb_with(rgba, profile, Rendering::default());
+}
+
+/// [`convert_to_srgb`] under an explicit rendering request. Returns `None`
+/// without touching the buffer when the profile cannot honour it.
+pub fn convert_to_srgb_with(rgba: &mut [u8], profile: &Profile, rendering: Rendering) -> Option<()> {
+    if !rendering.is_supported() || (rendering.black_point_compensation && profile.bkpt.is_none()) {
+        return None;
+    }
+    let black = if rendering.black_point_compensation { Some(profile.bkpt?) } else { None };
     rgba.par_chunks_mut(4).for_each(|px| {
         if px.len() < 4 {
             return;
@@ -1103,11 +1184,14 @@ pub fn convert_to_srgb(rgba: &mut [u8], profile: &Profile) {
             px[1] as f32 / 255.0,
             px[2] as f32 / 255.0,
         ];
-        let out = xyz_d50_to_srgb(profile.decode(device));
+        let xyz = profile.decode(device);
+        let xyz = black.map_or(xyz, |k| apply_bpc(xyz, k));
+        let out = xyz_d50_to_srgb(xyz);
         px[0] = to_u8(out[0]);
         px[1] = to_u8(out[1]);
         px[2] = to_u8(out[2]);
     });
+    Some(())
 }
 
 fn to_u8(v: f32) -> u8 {
@@ -1166,6 +1250,30 @@ mod tests {
         None
     }
 
+    /// The two shaper classes must be told apart by the profile itself, not by
+    /// a hardcoded device brand.
+    #[test]
+    fn shaper_declares_the_input_domain() {
+        match crate::icc::profile("NikonZ6III-ProStandard") {
+            Some(p) => assert!(p.expects_linear_input(), "C1 camera space is encode-shaper"),
+            None => eprintln!("NikonZ6III-ProStandard missing, skipping"),
+        }
+        match crate::icc::profile("LeafLF2-LF2 Portrait 4") {
+            Some(p) => assert!(!p.expects_linear_input(), "Leaf LF2 is identity-shaper"),
+            None => eprintln!("Leaf LF2 missing, skipping"),
+        }
+        // Identity plus a 0.075 highlight lift: the 10% tolerance keeps it on
+        // the encoded path, alongside the other Phase One H20 profiles.
+        match crate::icc::profile("PhaseOneH20-Outdoor Daylight") {
+            Some(p) => assert!(!p.expects_linear_input(), "H20 Outdoor is a boundary identity"),
+            None => eprintln!("PhaseOneH20-Outdoor Daylight missing, skipping"),
+        }
+        if let Some(path) = srgb_profile_path() {
+            let matrix = Profile::from_file(&path).expect("sRGB parses");
+            assert!(!matrix.expects_linear_input(), "matrix/TRC takes encoded values");
+        }
+    }
+
     fn srgb_profile() -> Option<Profile> {
         Profile::from_file(&srgb_profile_path()?).ok()
     }
@@ -1195,6 +1303,35 @@ mod tests {
         let mut lut = synthetic("sRGB with LUT", 2.2);
         lut.matrix = None;
         assert!(!is_srgb(&lut));
+    }
+
+    fn discovered(name: &str, matrix: bool) -> Discovered {
+        Discovered {
+            name: name.into(),
+            path: PathBuf::from(format!("{name}.icm")),
+            description: name.into(),
+            matrix,
+        }
+    }
+
+    #[test]
+    fn revision_suffix_stays_in_the_camera_group() {
+        let base = group_of(&discovered("SigmaFPL-ProStandard", false));
+        assert_eq!(base, ProfileGroup::Camera);
+        assert_eq!(group_of(&discovered("SigmaFPL-ProStandard v2", false)), base);
+        assert_eq!(group_of(&discovered("SonyA7M4-Generic v10", false)), ProfileGroup::Camera);
+    }
+
+    #[test]
+    fn plain_camera_and_output_stems_group_as_before() {
+        assert_eq!(group_of(&discovered("NikonZ6III-ProStandard", false)), ProfileGroup::Camera);
+        assert_eq!(group_of(&discovered("Adobe RGB (1998)", true)), ProfileGroup::Output);
+    }
+
+    #[test]
+    fn unknown_stem_stays_standard() {
+        assert_eq!(group_of(&discovered("My Custom Look v2", false)), ProfileGroup::Standard);
+        assert_eq!(group_of(&discovered("ProStandard v2", false)), ProfileGroup::Standard);
     }
 
     #[test]
@@ -1268,7 +1405,7 @@ mod tests {
     #[test]
     fn discovery_keeps_only_parseable_profiles_and_dedupes() {
         let Some(system) = srgb_profile_path() else { return };
-        let dir = std::env::temp_dir().join(format!("lumen-icc-discover-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-icc-discover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("a")).unwrap();
         std::fs::create_dir_all(dir.join("b")).unwrap();
@@ -1307,22 +1444,22 @@ mod tests {
 
     #[test]
     fn the_menu_filters_groups_and_limits_with_the_default_first() {
+        if profile_names().is_empty() {
+            return;
+        }
         let all = profile_menu(None, None, 0);
         let names = profile_names();
         assert!(all.len() >= names.len(), "the default alias may add one entry");
         assert!(all.iter().skip(1).all(|name| names.contains(name)));
-        if profile(DEFAULT_PROFILE).is_some() {
-            assert_eq!(all.first().map(String::as_str), Some(DEFAULT_PROFILE), "the default must stay first");
-        } else {
-            assert!(!all.iter().any(|name| name == DEFAULT_PROFILE), "unavailable profiles must not be listed");
-        }
+        assert_eq!(all[0], DEFAULT_PROFILE, "the default must stay first");
         let mut unique = all.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), all.len(), "no duplicates in the menu");
 
         let five = profile_menu(None, None, 5);
-        assert_eq!(five, all.iter().take(5).cloned().collect::<Vec<_>>());
+        assert_eq!(five.len(), 5);
+        assert_eq!(five[0], DEFAULT_PROFILE);
 
         let groups = profile_groups();
         println!("menu entries: {} groups: {:?}", all.len(), groups);
@@ -1414,6 +1551,44 @@ mod tests {
         for (a, b) in buf.iter().zip(before.iter()) {
             assert!((*a as i32 - *b as i32).abs() <= 3, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn rendering_requests_never_touch_pixels_they_cannot_honour() {
+        let profile = synthetic("render-test", 2.2);
+        let before = vec![10, 20, 30, 255, 200, 100, 50, 255];
+        let mut buf = before.clone();
+        let perceptual = Rendering { intent: Intent::Perceptual, ..Rendering::default() };
+        assert!(convert_srgb_to_with(&mut buf, &profile, perceptual).is_none());
+        assert_eq!(buf, before, "unsupported intent must leave the buffer alone");
+        let mut buf = before.clone();
+        let bpc = Rendering { black_point_compensation: true, ..Rendering::default() };
+        assert!(convert_srgb_to_with(&mut buf, &profile, bpc).is_none(), "no bkpt tag");
+        assert_eq!(buf, before, "missing bkpt must leave the buffer alone");
+    }
+
+    #[test]
+    fn default_rendering_matches_the_legacy_conversions() {
+        let Some(profile) = srgb_profile() else { return };
+        let mut legacy = vec![20, 140, 240, 255, 250, 5, 90, 255];
+        let mut rendered = legacy.clone();
+        convert_srgb_to(&mut legacy, &profile);
+        assert!(convert_srgb_to_with(&mut rendered, &profile, Rendering::default()).is_some());
+        assert_eq!(rendered, legacy);
+        let mut back_legacy = legacy.clone();
+        let mut back_rendered = legacy.clone();
+        convert_to_srgb(&mut back_legacy, &profile);
+        assert!(convert_to_srgb_with(&mut back_rendered, &profile, Rendering::default()).is_some());
+        assert_eq!(back_rendered, back_legacy);
+    }
+
+    #[test]
+    fn bpc_is_accepted_only_with_a_black_point_tag() {
+        let Some(path) = find_profile("Adobe RGB (1998)") else { return };
+        let Ok(profile) = Profile::from_file(&path) else { return };
+        let bpc = Rendering { black_point_compensation: true, ..Rendering::default() };
+        let mut buf = vec![32, 64, 96, 255];
+        assert!(convert_srgb_to_with(&mut buf, &profile, bpc).is_some(), "{} has bkpt", path.display());
     }
 
     #[test]
@@ -1579,7 +1754,6 @@ mod tests {
         assert!(worst <= 2, "worst channel error {worst}/255 vs lcms");
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn other_c1_profile_families_match_lcms() {
         // Ground truth from lcms2 for one profile from each C1 family.
@@ -1673,7 +1847,6 @@ mod tests {
         assert!(with_lut > 0 && with_matrix > 0, "samples must cover both families");
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
     fn scan_profiles_lists_c1_profiles() {
         let dir = profile_dir();

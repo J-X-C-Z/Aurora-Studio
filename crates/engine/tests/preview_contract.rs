@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use lumen_engine::{AdjustmentSet, ImageEngine, MockEngine, NormRect, PreviewRequest, RenderQuality};
+use aurora_engine::{AdjustmentSet, ImageEngine, MockEngine, NormRect, PreviewRequest, RenderQuality};
 
-fn request(image: lumen_engine::ImageId) -> PreviewRequest {
+fn request(image: aurora_engine::ImageId) -> PreviewRequest {
     PreviewRequest {
         image,
         adjustments: AdjustmentSet::default(),
@@ -14,7 +14,13 @@ fn request(image: lumen_engine::ImageId) -> PreviewRequest {
         bypass: false,
         mask_overlay: None,
         generation: 0,
-     display_profile: None, proof_profile: None, proof_paper_white: 1.0, proof_black_point: 0.0, }
+        display_profile: None,
+        proof_profile: None,
+        proof_paper_white: 1.0,
+        proof_black_point: 0.0,
+        rendering_intent: None,
+        black_point_compensation: false,
+    }
 }
 
 #[test]

@@ -12,7 +12,7 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
     PathPromptOptions, Render, Styled, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::{AutoTarget, ColorTag, RenderQuality};
+use aurora_engine::{AutoTarget, ColorTag, RenderQuality};
 
 use super::browser::Browser;
 use super::viewer::Viewer;
@@ -268,8 +268,9 @@ impl Workspace {
                     this.spawn_window(path, false, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &NewSession, window, cx| super::files::new_document(&this.state, crate::state::DocumentKind::Session, window, cx)))
-            .on_action(cx.listener(|this, _: &NewCatalog, window, cx| super::files::new_document(&this.state, crate::state::DocumentKind::Catalog, window, cx)))
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| {
+                this.with_state(cx, |s, cx| s.notify(crate::contract::SESSIONS.note().unwrap_or_default(), cx))
+            }))
             .on_action(cx.listener(|this, _: &SyncXmp, _, cx| {
                 this.with_state(cx, |s, cx| s.notify(crate::contract::SESSIONS.note().unwrap_or_default(), cx))
             }))
@@ -420,7 +421,8 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &ToggleSoftProof, _, cx| {
                 this.with_state(cx, |s, cx| {
                     s.view.soft_proof = !s.view.soft_proof;
-                    s.request_render(lumen_engine::RenderQuality::Final, cx);
+                    s.refresh_thumbs(cx);
+                    s.request_render(aurora_engine::RenderQuality::Final, cx);
                     cx.notify();
                 })
             }))
@@ -455,7 +457,7 @@ impl Workspace {
             }))
             .on_action(cx.listener(|this, _: &NewLayer, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.add_layer(lumen_engine::LayerKind::Adjustment, None, None, cx);
+                    s.add_layer(aurora_engine::LayerKind::Adjustment, None, None, cx);
                     s.tool_tab = ToolTab::Layers;
                 })
             }))
@@ -617,8 +619,7 @@ impl Workspace {
                             .justify_center()
                             .child(Icon::new(IconName::Aperture).size(px(12.0)).text_color(gpui_kit::white())),
                     )
-                    // A Mac shows the menus in the system menu bar instead.
-                    .when(!crate::platform::is_mac(), |d| d.child(self.menu_bar.clone())),
+                    .child(self.menu_bar.clone()),
             )
             .child(
                 h_flex()

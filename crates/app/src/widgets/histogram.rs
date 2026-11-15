@@ -4,7 +4,7 @@
 use gpui_kit::{
     App, ElementId, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, canvas, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::Histogram;
+use aurora_engine::Histogram;
 
 use super::paint;
 use crate::motion;

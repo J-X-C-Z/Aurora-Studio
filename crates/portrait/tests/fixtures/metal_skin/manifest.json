@@ -1,0 +1,168 @@
+{
+  "schema": "pixcake/o2m/metal-skin-fixtures/1",
+  "oracle": {
+    "path": "crates/pixcake/src/kernels/makeup.rs",
+    "sha256": "F8FE9BB5387B0BA5D99DCD74E5F6AA0BC36689F64D88B2C61A58FFF6CEAF9D1D"
+  },
+  "atlases": {
+    "whiten": {
+      "file": "atlases/whiten.rgb8",
+      "bytes": 786432,
+      "sha256": "A0F6AAED19E2BD2AA521B7AC0269914308238182066C219C878469F0B0A5E0AD"
+    },
+    "ruddy": {
+      "file": "atlases/ruddy.rgb8",
+      "bytes": 786432,
+      "sha256": "FAC7E59F2EB16B31EA38179FE0A460C56A6492D411E86994166ECC81A3FF25C0"
+    }
+  },
+  "cases": [
+    {
+      "atlas": "ruddy",
+      "name": "boundary_ruddy_0_250_500",
+      "width": 1,
+      "height": 1,
+      "mix": 1,
+      "files": {
+        "source.rgba8": {
+          "bytes": 4,
+          "sha256": "81F9456EE0BB909B7FB7C887C21C21F9FC45430E881DD5D92450609410FC3936"
+        },
+        "mask.u8": {
+          "bytes": 1,
+          "sha256": "A8100AE6AA1940D0B663BB31CD466142EBBDBD5187131B92D93818987832EB89"
+        },
+        "expected.rgba8": {
+          "bytes": 4,
+          "sha256": "613339D09BD0A9E6F42DEA247672BC8E57FC096538FF5B47FED32F1C303350B3"
+        }
+      }
+    },
+    {
+      "atlas": "whiten",
+      "name": "boundary_whiten_1000_0_1000",
+      "width": 1,
+      "height": 1,
+      "mix": 1,
+      "files": {
+        "source.rgba8": {
+          "bytes": 4,
+          "sha256": "F7F9E13D8ACE3958B3FEE2A2CBFA1D16DC90523B4EA4FD124C8E3ABA6A872401"
+        },
+        "mask.u8": {
+          "bytes": 1,
+          "sha256": "A8100AE6AA1940D0B663BB31CD466142EBBDBD5187131B92D93818987832EB89"
+        },
+        "expected.rgba8": {
+          "bytes": 4,
+          "sha256": "8188C6A9988B06D55A2DD2E3036605D25596505482A11CD070BB8EE5AD75CFD4"
+        }
+      }
+    },
+    {
+      "atlas": "ruddy",
+      "name": "discriminator_ruddy_010",
+      "width": 1,
+      "height": 1,
+      "mix": 1,
+      "files": {
+        "source.rgba8": {
+          "bytes": 4,
+          "sha256": "3BA8DF1DC933D6DE709E68BF7605A16B8D18BBD1CBFDF2E3A0BB115711CF1F9E"
+        },
+        "mask.u8": {
+          "bytes": 1,
+          "sha256": "A8100AE6AA1940D0B663BB31CD466142EBBDBD5187131B92D93818987832EB89"
+        },
+        "expected.rgba8": {
+          "bytes": 4,
+          "sha256": "7046DC1DDE6793C1908003C366EC9EEEABFF967898CBFC08309D0C8FE4AAB977"
+        }
+      }
+    },
+    {
+      "atlas": "whiten",
+      "name": "discriminator_whiten_010",
+      "width": 1,
+      "height": 1,
+      "mix": 1,
+      "files": {
+        "source.rgba8": {
+          "bytes": 4,
+          "sha256": "3BA8DF1DC933D6DE709E68BF7605A16B8D18BBD1CBFDF2E3A0BB115711CF1F9E"
+        },
+        "mask.u8": {
+          "bytes": 1,
+          "sha256": "A8100AE6AA1940D0B663BB31CD466142EBBDBD5187131B92D93818987832EB89"
+        },
+        "expected.rgba8": {
+          "bytes": 4,
+          "sha256": "42454FF6F4A98F21B7205F1CBA84448C216F2108C97A752843E908BCE032222C"
+        }
+      }
+    },
+    {
+      "atlas": "whiten",
+      "name": "small_mask0_mix1000",
+      "width": 4,
+      "height": 4,
+      "mix": 1,
+      "files": {
+        "source.rgba8": {
+          "bytes": 64,
+          "sha256": "F287E812994E3B1457C3239D40E0A84E2F3BEDE23B22B76EDF29AD85A6596A1A"
+        },
+        "mask.u8": {
+          "bytes": 16,
+          "sha256": "374708FFF7719DD5979EC875D56CD2286F6D3CF7EC317A3B25632AAB28EC37BB"
+        },
+        "expected.rgba8": {
+          "bytes": 64,
+          "sha256": "F287E812994E3B1457C3239D40E0A84E2F3BEDE23B22B76EDF29AD85A6596A1A"
+        }
+      }
+    },
+    {
+      "atlas": "whiten",
+      "name": "small_mask255_mix1000",
+      "width": 4,
+      "height": 4,
+      "mix": 1,
+      "files": {
+        "source.rgba8": {
+          "bytes": 64,
+          "sha256": "F287E812994E3B1457C3239D40E0A84E2F3BEDE23B22B76EDF29AD85A6596A1A"
+        },
+        "mask.u8": {
+          "bytes": 16,
+          "sha256": "5AC6A5945F16500911219129984BA8B387A06F24FE383CE4E81A73294065461B"
+        },
+        "expected.rgba8": {
+          "bytes": 64,
+          "sha256": "39DDC3920A3CC5AC6147DF8125A9D7B4F4C69ACE5403FC51D9C9D939DA952855"
+        }
+      }
+    },
+    {
+      "atlas": "whiten",
+      "name": "small_mask_mixed_mix500",
+      "width": 4,
+      "height": 4,
+      "mix": 0.5,
+      "files": {
+        "source.rgba8": {
+          "bytes": 64,
+          "sha256": "F287E812994E3B1457C3239D40E0A84E2F3BEDE23B22B76EDF29AD85A6596A1A"
+        },
+        "mask.u8": {
+          "bytes": 16,
+          "sha256": "BF4751F7EAC255450237A11B07F525C618C941DDFB6229B3FF8C766B263D09DC"
+        },
+        "expected.rgba8": {
+          "bytes": 64,
+          "sha256": "B3465D8F5DC111A8F295FFF552F64C1BBB61D5DA9A6989E94F4BBB764B7B15A2"
+        }
+      }
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 //!
 //! The encoder is optional: when the host has no `libheif` (or no HEVC
 //! encoder) the job fails with a structured error instead of leaving a half
-//! written file behind. `LUMEN_HEIF_LIB` points at a non-standard library.
+//! written file behind. `AURORA_HEIF_LIB` points at a non-standard library.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -28,6 +28,7 @@ struct HeifError {
 const HEIF_ERROR_OK: c_int = 0;
 const HEIF_COMPRESSION_HEVC: c_int = 1;
 const HEIF_COLORSPACE_RGB: c_int = 1;
+const HEIF_CHROMA_444: c_int = 3;
 const HEIF_CHROMA_INTERLEAVED_RGBA: c_int = 11;
 const HEIF_CHANNEL_INTERLEAVED: c_int = 10;
 const RTLD_NOW: c_int = 2;
@@ -121,7 +122,7 @@ fn free(handle: Handle) {
 }
 
 fn library_candidates() -> Vec<PathBuf> {
-    if let Some(path) = std::env::var_os("LUMEN_HEIF_LIB") {
+    if let Some(path) = std::env::var_os("AURORA_HEIF_LIB") {
         return vec![PathBuf::from(path)];
     }
     if cfg!(windows) {
@@ -134,7 +135,7 @@ fn library_candidates() -> Vec<PathBuf> {
 fn missing_library_error(reason: &str) -> anyhow::Error {
     anyhow!(
         "HEIF export needs libheif.dll with a HEVC encoder (libx265); \
-         no suitable library was found. Set LUMEN_HEIF_LIB to the full path of libheif.dll. \
+         no suitable library was found. Set AURORA_HEIF_LIB to the full path of libheif.dll. \
          Load error: {reason}"
     )
 }
@@ -184,7 +185,56 @@ pub fn encode(
     let (handle, library_path) = load()?;
     let result = unsafe {
         encode_with(
-            handle, library_path, path, rgba, width, height, quality, icc, exif, xmp,
+            handle, library_path, path, rgba, width, height, quality, icc, exif, xmp, None, 8,
+        )
+    };
+    free(handle);
+    result
+}
+
+/// Encodes 10- or 12-bit RGB into HEIF. The alpha channel of `rgba16` is
+/// dropped, mirroring the 8-bit path. `bit_depth` must be 10 or 12: HEVC's
+/// `hvcC` cannot signal more, and libheif rejects 16-bit samples.
+pub fn encode_rgb16(
+    path: &Path,
+    rgba16: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    quality: u8,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+    xmp: Option<&[u8]>,
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("HEIF export needs a non-empty image");
+    }
+    if !matches!(bit_depth, 10 | 12) {
+        bail!("HEIF supports 10- or 12-bit samples, not {bit_depth}");
+    }
+    let expected = width as usize * height as usize * 4;
+    if rgba16.len() != expected {
+        bail!(
+            "HEIF export: buffer is {} samples, expected {expected}",
+            rgba16.len()
+        );
+    }
+    let quality = quality.clamp(1, 100);
+    let (handle, library_path) = load()?;
+    let result = unsafe {
+        encode_with(
+            handle,
+            library_path,
+            path,
+            &[],
+            width,
+            height,
+            quality,
+            icc,
+            exif,
+            xmp,
+            Some(rgba16),
+            bit_depth,
         )
     };
     free(handle);
@@ -204,12 +254,38 @@ pub fn encode_to_vec(
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "lumen-heif-{}-{}.heic",
+        "portrait-heif-{}-{}.heic",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let result = encode(&path, rgba, width, height, quality, icc, exif, xmp)
         .and_then(|()| std::fs::read(&path).map_err(Into::into));
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// [`encode_rgb16`] into memory, so the normal export path can write the file.
+pub fn encode_rgb16_to_vec(
+    rgba16: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    quality: u8,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+    xmp: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "lumen-heif16-{}-{}.heic",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = encode_rgb16(
+        &path, rgba16, width, height, bit_depth, quality, icc, exif, xmp,
+    )
+    .and_then(|()| std::fs::read(&path).map_err(Into::into));
     let _ = std::fs::remove_file(&path);
     result
 }
@@ -298,6 +374,8 @@ unsafe fn encode_with(
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
     xmp: Option<&[u8]>,
+    wide: Option<&[u16]>,
+    bit_depth: u8,
 ) -> Result<()> {
     unsafe fn function<T: Copy>(handle: Handle, name: &str) -> Result<T> {
         let address = unsafe { symbol(handle, name)? };
@@ -368,39 +446,81 @@ unsafe fn encode_with(
         tmp.set_file_name(format!("{stem}.heifwrite.tmp.{extension}"));
         let tmp_name = CString::new(tmp.as_os_str().to_string_lossy().as_bytes())?;
 
-        let status = unsafe {
-            (image_create)(
-                width as c_int,
-                height as c_int,
-                HEIF_COLORSPACE_RGB,
-                HEIF_CHROMA_INTERLEAVED_RGBA,
-                &mut image,
-            )
-        };
-        check(status, "allocating the HEIF image")?;
-        if image.is_null() {
-            bail!("libheif returned no image");
-        }
-        let status = unsafe {
-            (image_add_plane)(
-                image,
-                HEIF_CHANNEL_INTERLEAVED,
-                width as c_int,
-                height as c_int,
-                8,
-            )
-        };
-        check(status, "allocating the RGBA plane")?;
-        let mut stride: c_int = 0;
-        let plane = unsafe { (image_get_plane)(image, HEIF_CHANNEL_INTERLEAVED, &mut stride) };
-        let row_bytes = width as usize * 4;
-        if plane.is_null() || (stride as usize) < row_bytes {
-            bail!("libheif returned no usable RGBA plane");
-        }
-        for row in 0..height as usize {
-            let source = unsafe { rgba.as_ptr().add(row * row_bytes) };
-            let target = unsafe { plane.add(row * stride as usize) };
-            unsafe { std::ptr::copy_nonoverlapping(source, target, row_bytes) };
+        if let Some(wide) = wide {
+            let chroma = HEIF_CHROMA_444;
+            let status = unsafe {
+                (image_create)(
+                    width as c_int,
+                    height as c_int,
+                    HEIF_COLORSPACE_RGB,
+                    chroma,
+                    &mut image,
+                )
+            };
+            check(status, "allocating the HEIF image")?;
+            if image.is_null() {
+                bail!("libheif returned no image");
+            }
+            let shift = 16 - bit_depth as u32;
+            for (channel, source) in [(3, 0usize), (4, 1), (5, 2)] {
+                let status = unsafe {
+                    (image_add_plane)(
+                        image,
+                        channel,
+                        width as c_int,
+                        height as c_int,
+                        bit_depth as c_int,
+                    )
+                };
+                check(status, "allocating an RGB plane")?;
+                let mut stride: c_int = 0;
+                let plane = unsafe { (image_get_plane)(image, channel, &mut stride) };
+                if plane.is_null() || (stride as usize) < width as usize * 2 {
+                    bail!("libheif returned no usable RGB plane");
+                }
+                for row in 0..height as usize {
+                    let target = unsafe { plane.add(row * stride as usize) }.cast::<u16>();
+                    for column in 0..width as usize {
+                        let value = wide[(row * width as usize + column) * 4 + source] >> shift;
+                        unsafe { target.add(column).write_unaligned(value) };
+                    }
+                }
+            }
+        } else {
+            let status = unsafe {
+                (image_create)(
+                    width as c_int,
+                    height as c_int,
+                    HEIF_COLORSPACE_RGB,
+                    HEIF_CHROMA_INTERLEAVED_RGBA,
+                    &mut image,
+                )
+            };
+            check(status, "allocating the HEIF image")?;
+            if image.is_null() {
+                bail!("libheif returned no image");
+            }
+            let status = unsafe {
+                (image_add_plane)(
+                    image,
+                    HEIF_CHANNEL_INTERLEAVED,
+                    width as c_int,
+                    height as c_int,
+                    8,
+                )
+            };
+            check(status, "allocating the RGBA plane")?;
+            let mut stride: c_int = 0;
+            let plane = unsafe { (image_get_plane)(image, HEIF_CHANNEL_INTERLEAVED, &mut stride) };
+            let row_bytes = width as usize * 4;
+            if plane.is_null() || (stride as usize) < row_bytes {
+                bail!("libheif returned no usable RGBA plane");
+            }
+            for row in 0..height as usize {
+                let source = unsafe { rgba.as_ptr().add(row * row_bytes) };
+                let target = unsafe { plane.add(row * stride as usize) };
+                unsafe { std::ptr::copy_nonoverlapping(source, target, row_bytes) };
+            }
         }
         if let Some(icc) = icc {
             let set_profile =
@@ -481,7 +601,7 @@ mod tests {
 
     fn temp_file(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("lumen-heifwrite-{}-{name}", std::process::id()));
+        path.push(format!("portrait-heifwrite-{}-{name}", std::process::id()));
         path
     }
 
@@ -493,18 +613,18 @@ mod tests {
 
     #[test]
     fn missing_library_reports_structured_error() {
-        let previous = std::env::var_os("LUMEN_HEIF_LIB");
-        unsafe { std::env::set_var("LUMEN_HEIF_LIB", "Z:/definitely/not/libheif.dll") };
+        let previous = std::env::var_os("AURORA_HEIF_LIB");
+        unsafe { std::env::set_var("AURORA_HEIF_LIB", "Z:/definitely/not/libheif.dll") };
         let path = temp_file("missing.heic");
         let err = encode(&path, &pixels(2, 2), 2, 2, 80, None, None, None).unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.contains("LUMEN_HEIF_LIB"), "{text}");
+        assert!(text.contains("AURORA_HEIF_LIB"), "{text}");
         assert!(text.contains("libheif.dll"), "{text}");
         assert!(text.contains("libx265"), "{text}");
         assert!(!path.exists());
         match previous {
-            Some(value) => unsafe { std::env::set_var("LUMEN_HEIF_LIB", value) },
-            None => unsafe { std::env::remove_var("LUMEN_HEIF_LIB") },
+            Some(value) => unsafe { std::env::set_var("AURORA_HEIF_LIB", value) },
+            None => unsafe { std::env::remove_var("AURORA_HEIF_LIB") },
         }
     }
 
@@ -530,8 +650,8 @@ mod tests {
 
     #[test]
     fn failed_encode_leaves_no_temp_file() {
-        let previous = std::env::var_os("LUMEN_HEIF_LIB");
-        unsafe { std::env::set_var("LUMEN_HEIF_LIB", "Z:/definitely/not/libheif.dll") };
+        let previous = std::env::var_os("AURORA_HEIF_LIB");
+        unsafe { std::env::set_var("AURORA_HEIF_LIB", "Z:/definitely/not/libheif.dll") };
         let path = temp_file("no-temp.heic");
         let _ = std::fs::remove_file(&path);
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
@@ -542,8 +662,8 @@ mod tests {
         assert!(!path.exists());
         assert!(!tmp.exists());
         match previous {
-            Some(value) => unsafe { std::env::set_var("LUMEN_HEIF_LIB", value) },
-            None => unsafe { std::env::remove_var("LUMEN_HEIF_LIB") },
+            Some(value) => unsafe { std::env::set_var("AURORA_HEIF_LIB", value) },
+            None => unsafe { std::env::remove_var("AURORA_HEIF_LIB") },
         }
     }
 
@@ -613,5 +733,48 @@ mod tests {
             "the XMP packet is missing from the HEIF output"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encodes_10_and_12_bit_heif_with_metadata() {
+        if !available() {
+            return;
+        }
+        let meta = crate::XmpMeta {
+            rating: 3,
+            keywords: vec!["hdr".into()],
+            ..Default::default()
+        };
+        let packet = meta.packet();
+        let samples: Vec<u16> = (0..16 * 12 * 4).map(|i| ((i * 4096) % 65536) as u16).collect();
+        for bits in [10u8, 12] {
+            let path = temp_file(&format!("wide{bits}.heic"));
+            let _ = std::fs::remove_file(&path);
+            encode_rgb16(
+                &path,
+                &samples,
+                16,
+                12,
+                bits,
+                90,
+                None,
+                None,
+                Some(packet.as_bytes()),
+            )
+            .unwrap();
+            assert_eq!(crate::heif::bit_depth(&path), Some(bits), "{bits}-bit round trip");
+            assert_eq!(crate::heif::read_xmp(&path).as_deref(), Some(packet.as_str()));
+            assert_eq!(crate::heif::dimensions(&path).unwrap(), (16, 12));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn rejects_16_bit_samples_before_touching_libheif() {
+        let path = temp_file("wide16.heic");
+        let err = encode_rgb16(&path, &vec![0u16; 2 * 2 * 4], 2, 2, 16, 80, None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("10- or 12-bit"), "{err}");
+        assert!(!path.exists());
     }
 }

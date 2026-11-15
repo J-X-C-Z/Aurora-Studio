@@ -24,8 +24,11 @@ pub struct LocalAdjustments {
     pub hdr: HighDynamicRange,
     pub clarity: Clarity,
     pub dehaze: Dehaze,
-    pub curves: Curves,
-    pub levels: Levels,
+    /// Present only when the layer edits tone; neutral or absent is `None`.
+    pub curves: Option<Curves>,
+    pub levels: Option<Levels>,
+    /// Present only when the layer converts to black and white.
+    pub black_white: Option<BlackWhite>,
     pub color_balance: ColorBalance,
     pub color_editor: ColorEditor,
     pub sharpening: Option<Sharpening>,
@@ -339,5 +342,18 @@ mod node_tests {
     fn missing_graph_field_still_parses() {
         let a: crate::AdjustmentSet = serde_json::from_str("{}").unwrap();
         assert!(a.nodes.is_none());
+    }
+
+    /// A saved `.portrait` document is a serialized `AdjustmentSet`. A local layer
+    /// written before it carried curves or levels must load with both absent.
+    #[test]
+    fn old_portrait_document_loads_local_layer_without_tone_edits() {
+        let json = r#"{"layers":[{"id":1,"name":"Skin","kind":"Adjustment","enabled":true,"opacity":100.0,"mask":{"shapes":[],"invert":false,"feather":0.0,"density":100.0},"adjustments":{"exposure":{"exposure":1.0,"contrast":0.0,"brightness":0.0,"saturation":0.0}}}]}"#;
+        let set: crate::AdjustmentSet = serde_json::from_str(json).unwrap();
+        let a = &set.layers[0].adjustments;
+        assert!(a.curves.is_none());
+        assert!(a.levels.is_none());
+        assert!(a.black_white.is_none());
+        assert_eq!(a.exposure.exposure, 1.0);
     }
 }

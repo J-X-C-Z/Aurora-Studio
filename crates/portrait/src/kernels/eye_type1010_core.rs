@@ -373,7 +373,6 @@ mod tests {
         0.29999998211860657, 0.07000000029802322, 0.0, 0.0, 0.0, 0.0, 0.0,
         0.10080999881029129, 0.3002699911594391, 0.5, 0.8499999642372131,
     ];
-    #[cfg(feature = "external-fixtures")]
     const PARAM9: [f32; 28] = [
         0.3799999952316284, 0.3499999940395355, 0.17999999225139618,
         0.07999999821186066, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -381,8 +380,6 @@ mod tests {
         0.5199999809265137, 0.3999999761581421, 0.2800000011920929, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.47999998927116394, 0.7799999713897705, 1.0,
     ];
-
-    #[cfg(feature = "external-fixtures")]
 
     fn fixture(bytes: &[u8]) -> [Point; VERTEX_COUNT] {
         assert_eq!(bytes.len(), VERTEX_COUNT * 8);
@@ -402,30 +399,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn part8_matches_pe_fixture_bitwise() {
         let mesh = compute(CENTER, &FIRST, &SECOND, &PARAM8, DEGREES).unwrap();
         assert!(bits_equal(
             &mesh.prepared_a,
-            &fixture(&crate::external_fixtures::read("eye/positive_asym.part8.rawA.bin"))
+            &fixture(include_bytes!("positive_asym.part8.rawA.bin"))
         ));
         assert!(bits_equal(
             &mesh.deformed_b,
-            &fixture(&crate::external_fixtures::read("eye/positive_asym.part8.rawB.bin"))
+            &fixture(include_bytes!("positive_asym.part8.rawB.bin"))
         ));
     }
 
     #[test]
-    #[cfg(feature = "external-fixtures")]
     fn part9_matches_pe_fixture_bitwise() {
         let mesh = compute(CENTER, &FIRST, &SECOND, &PARAM9, DEGREES).unwrap();
         assert!(bits_equal(
             &mesh.prepared_a,
-            &fixture(&crate::external_fixtures::read("eye/positive_asym.part9.rawA.bin"))
+            &fixture(include_bytes!("positive_asym.part9.rawA.bin"))
         ));
         assert!(bits_equal(
             &mesh.deformed_b,
-            &fixture(&crate::external_fixtures::read("eye/positive_asym.part9.rawB.bin"))
+            &fixture(include_bytes!("positive_asym.part9.rawB.bin"))
         ));
     }
 

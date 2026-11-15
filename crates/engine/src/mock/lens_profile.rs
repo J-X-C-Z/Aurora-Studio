@@ -213,7 +213,7 @@ mod tests {
         assert!((falloff.1 - -1.5).abs() < 1e-6);
     }
 
-    /// Needs the real database: `LUMEN_LENS_DB=<path to decoded lensDatabase.cdx>`.
+    /// Needs the real database: `AURORA_LENS_DB=<path to decoded lensDatabase.cdx>`.
     #[test]
     #[ignore]
     fn real_database_builds_a_warp() {

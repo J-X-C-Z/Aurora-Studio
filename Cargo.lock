@@ -479,8 +479,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "aurora-pixcake"
+name = "aurora-engine"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aurora-portrait",
+ "image",
+ "log",
+ "parking_lot",
+ "rayon",
+ "roxmltree 0.20.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aurora-portrait"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "autocfg"
@@ -3629,35 +3647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lumen-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ely-core",
- "gpui-kit",
- "image",
- "log",
- "lumen-engine",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "lumen-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aurora-pixcake",
- "image",
- "log",
- "parking_lot",
- "rayon",
- "roxmltree 0.20.0",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "lyon"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4903,6 +4892,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "portrait-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aurora-engine",
+ "ely-core",
+ "embed-resource",
+ "gpui-kit",
+ "image",
+ "log",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

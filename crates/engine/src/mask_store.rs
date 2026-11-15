@@ -1,5 +1,5 @@
 //! AI masks that survive a restart, as 8-bit grayscale PGM under
-//! `<catalog>/.lumen/masks/<hash>.pgm`.
+//! `<catalog>/.portrait/masks/<hash>.pgm`.
 //!
 //! The key is built from the image's path relative to the catalog, its variant
 //! number and the mask kind, never from `ImageId` (that changes every launch).
@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use crate::aimask::MaskPlane;
 use crate::AiMaskKind;
 
-const MASK_DIR: &str = ".lumen/masks";
+const MASK_DIR: &str = ".portrait/masks";
 /// PGM is header + one byte per pixel; larger files are not a mask this engine
 /// wrote, and rejecting them keeps a corrupt header from allocating gigabytes.
 const MAX_PIXELS: usize = 16 * 1024 * 1024;
@@ -117,7 +117,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lumen-maskstore-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-maskstore-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -189,7 +189,7 @@ mod tests {
         let dir = temp_dir("unwritable");
         // A regular file where the mask directory should be makes every write
         // fail on all platforms, without relying on read-only permissions.
-        fs::create_dir_all(dir.join(".lumen")).unwrap();
+        fs::create_dir_all(dir.join(".portrait")).unwrap();
         fs::write(dir.join(MASK_DIR), b"blocker").unwrap();
         let key = key("shot.NEF", 1, AiMaskKind::Subject);
         assert!(save(&dir, &key, &gradient(4, 4)).is_err());
@@ -207,15 +207,15 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Two independent `cargo test` runs: `LUMEN_MASK_BENCH=warm` builds a
+    /// Two independent `cargo test` runs: `AURORA_MASK_BENCH=warm` builds a
     /// synthetic plane and saves it; `cold` only loads it.
     #[test]
-    #[ignore = "manual two-process timing, needs LUMEN_MASK_BENCH"]
+    #[ignore = "manual two-process timing, needs AURORA_MASK_BENCH"]
     fn bench_persist_versus_load() {
-        let dir = std::env::temp_dir().join("lumen-mask-bench");
+        let dir = std::env::temp_dir().join("portrait-mask-bench");
         fs::create_dir_all(&dir).unwrap();
         let key = key("bench/synthetic.NEF", 1, AiMaskKind::Subject);
-        let phase = std::env::var("LUMEN_MASK_BENCH").unwrap_or_else(|_| "warm".into());
+        let phase = std::env::var("AURORA_MASK_BENCH").unwrap_or_else(|_| "warm".into());
         let start = std::time::Instant::now();
         if phase == "cold" {
             let plane = load(&dir, &key).expect("warm run saved the mask");

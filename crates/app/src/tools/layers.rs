@@ -15,7 +15,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Entity, Focusable as _, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::i18n::t;
 use crate::layer_field;
@@ -96,7 +96,7 @@ fn node_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> im
                         .gap_2()
                         .child(
                             IconBtn::new(SharedString::from(format!("node-on-{id}")), if l.enabled { IconName::Power } else { IconName::PowerOff }, t("Enable / disable node", "启用 / 停用节点"))
-                                .shortcut(crate::platform::keys("ctrl-shift-e"))
+                                .shortcut("Ctrl+Shift+E")
                                 .active(l.enabled)
                                 .size(22.0)
                                 .on_click(move |_, cx| st_eye.update(cx, |s, cx| s.toggle_node(id, cx))),

@@ -160,28 +160,6 @@ fn percentile(hist: &[u32; 256], total: u32, q: f32) -> f32 {
     1.0
 }
 
-/// Kelvin whose `r/b` gain matches `ratio`. The gain rises with kelvin, so a
-/// binary search over the slider range is exact enough and allocates nothing.
-fn kelvin_for_ratio(ratio: f32) -> f32 {
-    let (lo, hi) = range("WhiteBalanceTemperature");
-    let gain_ratio = |k: f32| {
-        let g = crate::mock::process::white_balance_gains(k, 0.0);
-        g[0] / g[2]
-    };
-    if ratio <= gain_ratio(lo) {
-        return lo;
-    }
-    if ratio >= gain_ratio(hi) {
-        return hi;
-    }
-    let (mut lo, mut hi) = (lo, hi);
-    for _ in 0..40 {
-        let mid = 0.5 * (lo + hi);
-        if gain_ratio(mid) < ratio { lo = mid } else { hi = mid }
-    }
-    0.5 * (lo + hi)
-}
-
 /// Measures both images and returns the adjustments that carry the reference's
 /// look onto the target. Empty pixels or a zero dimension is an error; a nearly
 /// black or white image yields neutral values with low confidence, never NaN.
@@ -206,11 +184,9 @@ pub fn match_look(
     if !(nr.is_finite() && ng.is_finite() && nb.is_finite()) || nr <= 0.0 || nb <= 0.0 {
         wb_conf = 0.0;
     }
-    let kelvin = if wb_conf > 0.0 { kelvin_for_ratio(nr / nb) } else { 5600.0 };
-    // Green relative to the r/b geometric mean; the tint slider maps 1.0 to 0.
-    let green_ratio = if wb_conf > 0.0 { ng / (nr * nb).sqrt() } else { 1.0 };
-    let tint = clamp_to("WhiteBalanceTint", (1.0 - green_ratio) * 100.0 / 0.6);
-    let kelvin = clamp_to("WhiteBalanceTemperature", kelvin);
+    // Work in gain space: C1 stores gains, and K/T is only their display pair.
+    let wb_gains = if wb_conf > 0.0 { [nr / ng, 1.0, nb / ng] } else { [1.0, 1.0, 1.0] };
+    let (kelvin, tint) = crate::c1_model::gains_to_kelvin_tint(wb_gains);
     items.push(MatchItem {
         key: "WhiteBalanceTemperature",
         applied: kelvin,
@@ -225,7 +201,7 @@ pub fn match_look(
         unit: "",
         confidence: wb_conf,
         reference: 1.0,
-        target: ng / (nr * nb).max(1e-5).sqrt(),
+        target: wb_gains[2],
     });
 
     // ── Exposure: median luma ratio in linear light ──
@@ -281,6 +257,7 @@ pub fn match_look(
     adjustments.white_balance.mode = WhiteBalanceMode::Custom;
     adjustments.white_balance.kelvin = kelvin;
     adjustments.white_balance.tint = tint;
+    adjustments.white_balance.gains = Some(wb_gains);
     adjustments.exposure.exposure = exposure;
     adjustments.exposure.saturation = saturation;
     adjustments.levels.rgb = LevelsChannel {
@@ -293,7 +270,7 @@ pub fn match_look(
 
     // Luma the four tools leave between the gray points, after white balance,
     // exposure and saturation have done their part.
-    let wb = crate::mock::process::white_balance_gains(kelvin, tint);
+    let wb = wb_gains;
     let after = [
         t.mean_lin[0] * wb[0] * gain,
         t.mean_lin[1] * wb[1] * gain,
@@ -379,8 +356,18 @@ mod tests {
         let look = match_look(&img, W, H, &img, W, H).unwrap();
         assert_in_range(&look);
         assert!(item(&look, "Exposure").applied.abs() < 0.01);
-        assert!((item(&look, "WhiteBalanceTemperature").applied - 5600.0).abs() < 10.0);
-        assert!(item(&look, "WhiteBalanceTint").applied.abs() < 0.5);
+        // Identical images must produce neutral gains. C1's neutral display
+        // pair is 4325 K / -36.5 tint, not 5600 K / 0.
+        let wb = &look.adjustments.white_balance;
+        let gains = crate::c1_model::kelvin_tint_to_gains(wb.kelvin, wb.tint);
+        assert!(
+            (gains[0] - 1.0).abs() < 0.05
+                && (gains[1] - 1.0).abs() < 0.05
+                && (gains[2] - 1.0).abs() < 0.05,
+            "{gains:?} at {} K / {} tint",
+            wb.kelvin,
+            wb.tint
+        );
         assert!(item(&look, "Saturation").applied.abs() < 1.0);
         let l = &look.adjustments.levels.rgb;
         assert!((l.input_black - l.output_black).abs() < 0.01);

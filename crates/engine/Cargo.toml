@@ -1,17 +1,11 @@
 [package]
-name = "lumen-engine"
-description = "Contract between the Lumen Studio interface and its processing engine, plus a mock engine for UI development."
+name = "aurora-engine"
+description = "Aurora Studio's processing engine: contract between the interface and the image pipeline, plus a mock engine for UI development."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-exclude = ["testdata/**", "local-fixtures/**", "src/**/*.rs.rs"]
-
-[features]
-external-fixtures = []
-
 [dependencies]
-aurora-pixcake = { path = "../portrait", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -20,3 +14,4 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rayon = "1.10"
 parking_lot = "0.12"
 roxmltree = "0.20"
+aurora-portrait.workspace = true

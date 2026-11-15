@@ -1,8 +1,8 @@
 //! Region effect data contract — how the 378 C1 params with no AdjustmentSet field are stored.
-//! Semantics come from the PixCake UI key registry (crate::pixcake_map::C1_PARAMS): every entry below is
+//! Semantics come from the Vendor UI key registry (crate::portrait_map::C1_PARAMS): every entry below is
 //! named after a real key there. The response curve of each effect is NOT verified.
 
-use crate::pixcake_map::{Family, Target};
+use crate::portrait_map::{Family, Target};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RegionKind {
@@ -50,7 +50,7 @@ pub struct EffectOptions {
     pub invert_mask: bool,
 }
 
-/// One entry per `Target::Effect` family in `pixcake_map`; an effect keeps the exact C1 key it came
+/// One entry per `Target::Effect` family in `portrait_map`; an effect keeps the exact C1 key it came
 /// from, so a region effect maps back to its preset slot without a table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectKind {
@@ -122,7 +122,7 @@ impl EffectKind {
         }
     }
 
-    /// The pixcake_map family this effect belongs to, so mapping stays provable against the table.
+    /// The portrait_map family this effect belongs to, so mapping stays provable against the table.
     pub fn c1_family(self) -> Family {
         match self {
             Self::Sculpt { .. } => Family::BodyFaceSculpt,
@@ -180,7 +180,7 @@ impl EffectFamily {
         Self::AiRetouch,
     ];
 
-    /// The pixcake_map family this family is spelled with, for audit against the table.
+    /// The portrait_map family this family is spelled with, for audit against the table.
     pub fn c1_family(self) -> Family {
         match self {
             Self::Sculpt => Family::BodyFaceSculpt,
@@ -219,10 +219,10 @@ impl EffectFamily {
     }
 }
 
-/// Reverse lookup over `crate::pixcake_map::C1_PARAMS`; `None` for ids that adjust the image globally,
+/// Reverse lookup over `crate::portrait_map::C1_PARAMS`; `None` for ids that adjust the image globally,
 /// are unmapped, or do not exist.
 pub fn from_c1(id: i32) -> Option<EffectKind> {
-    let param = crate::pixcake_map::C1_PARAMS.iter().find(|param| param.id == id)?;
+    let param = crate::portrait_map::C1_PARAMS.iter().find(|param| param.id == id)?;
     if !matches!(param.target, Target::Effect(_)) {
         return None;
     }
@@ -250,9 +250,9 @@ pub fn families() -> &'static [EffectFamily] {
     &EffectFamily::ALL
 }
 
-/// How many `pixcake_map` params a family carries.
+/// How many `portrait_map` params a family carries.
 pub fn count(family: EffectFamily) -> usize {
-    crate::pixcake_map::C1_PARAMS.iter().filter(|param| from_c1(param.id).is_some_and(|kind| kind.family() == family)).count()
+    crate::portrait_map::C1_PARAMS.iter().filter(|param| from_c1(param.id).is_some_and(|kind| kind.family() == family)).count()
 }
 
 /// Turns one C1 batch into region effects. Params for the same region and family merge into a
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn every_effect_param_maps() {
-        let effects: Vec<_> = crate::pixcake_map::C1_PARAMS
+        let effects: Vec<_> = crate::portrait_map::C1_PARAMS
             .iter()
             .filter(|param| matches!(param.target, Target::Effect(_)))
             .collect();
@@ -322,7 +322,7 @@ mod tests {
             assert_eq!(kind.param(), param.key);
             assert_eq!(kind.c1_family(), param.family);
         }
-        assert_eq!(crate::pixcake_map::coverage(), (452, 482));
+        assert_eq!(crate::portrait_map::coverage(), (452, 482));
     }
 
     #[test]
@@ -371,9 +371,9 @@ mod tests {
 
     #[test]
     fn sided_and_lip_keys_narrow_the_region() {
-        let eyebrow = crate::pixcake_map::C1_PARAMS.iter().find(|param| param.key == "eyebrowDegree_left").unwrap();
-        let blusher = crate::pixcake_map::C1_PARAMS.iter().find(|param| param.key == "blusherDegree").unwrap();
-        let lip = crate::pixcake_map::C1_PARAMS.iter().find(|param| param.key == "lipstickDegree").unwrap();
+        let eyebrow = crate::portrait_map::C1_PARAMS.iter().find(|param| param.key == "eyebrowDegree_left").unwrap();
+        let blusher = crate::portrait_map::C1_PARAMS.iter().find(|param| param.key == "blusherDegree").unwrap();
+        let lip = crate::portrait_map::C1_PARAMS.iter().find(|param| param.key == "lipstickDegree").unwrap();
         assert_eq!(to_region_effects(&[(eyebrow.id, 0.5)])[0].region.kind, RegionKind::LeftEye);
         assert_eq!(to_region_effects(&[(blusher.id, 0.5)])[0].region.kind, RegionKind::Face);
         assert_eq!(to_region_effects(&[(lip.id, 0.5)])[0].region.kind, RegionKind::Mouth);

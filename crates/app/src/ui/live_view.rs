@@ -13,7 +13,7 @@ use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ObjectFit, ParentElement, Render, RenderImage, Styled, StyledImage as _,
     Subscription, Task, Window, WindowBounds, WindowOptions, canvas, div, img, prelude::FluentBuilder as _, px, size,
 };
-use lumen_engine::CameraStatus;
+use aurora_engine::CameraStatus;
 
 use crate::i18n::t;
 use crate::state::AppState;

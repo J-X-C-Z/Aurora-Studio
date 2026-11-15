@@ -211,14 +211,12 @@ mod tests {
         assert_neutral(&analyze(&[0; 9], 10, 10));
     }
 
-    #[cfg(feature = "external-fixtures")]
     #[test]
-    #[ignore = "requires an explicit LUMEN_TEST_RAW input"]
+    #[ignore = "decodes a 16 MP NEF from this machine"]
     fn report_real_nef() {
         use std::path::Path;
 
-        let input = std::env::var_os("LUMEN_TEST_RAW").expect("set LUMEN_TEST_RAW to a local test RAW");
-        let path = Path::new(&input);
+        let path = Path::new(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF");
         let image = crate::raw::decode(path).unwrap();
         let src = crate::Source::from_rgba(image.width(), image.height(), image.as_raw());
 

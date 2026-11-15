@@ -32,15 +32,21 @@
 
 //! Local colour adjustments ride on the same row: `ZWHITEBALANCE`,
 //! `ZHIGHLIGHTRECOVERY` / `ZSHADOWRECOVERY`, `ZCLARITY` /
-//! `ZCLARITYSTRUCTURE`, `ZCONTRAST`, `ZBRIGHTNESS`, `ZSATURATION`
-//! (variant 1, PK 7 stores non-neutral values for all of them). They map onto
-//! [`LocalAdjustments`], which `local()` already applies.
+//! `ZCLARITYSTRUCTURE`, `ZCONTRAST`, `ZBRIGHTNESS`, `ZSATURATION`,
+//! `ZCOLORCORRECTIONS` (only groups with a non-zero shift are an edit; the
+//! eight basic bands are always stored), `ZGRADATIONCURVE*` / `ZLEVELS*`, and
+//! `ZBW*`. They map onto [`LocalAdjustments`], which `local()` applies.
 
 use std::collections::HashMap;
 
-use crate::adjust::{Clarity, ClarityMethod, Dehaze, Exposure, HighDynamicRange, WhiteBalance};
+use crate::adjust::{
+    Clarity, ClarityMethod, Curves, Dehaze, Exposure, HighDynamicRange, Levels, WhiteBalance,
+};
 use crate::comask::{ComaskDocument, ComaskMask};
-use crate::c1_model::{from_layer_row, gains_to_kelvin_tint, C1Brush, C1Eraser, C1EntityKind};
+use crate::c1_model::{
+    black_white_from_c1, color_editor_from_c1, curves_from_c1, from_layer_row,
+    gains_to_kelvin_tint, levels_from_c1, C1Brush, C1Eraser, C1EntityKind, ColorCorrection,
+};
 use crate::layers::{
     BrushStroke, Layer, LayerKind, LocalAdjustments, Mask, MaskOp, MaskShape,
 };
@@ -63,14 +69,45 @@ pub struct C1MaskLayer {
     pub adjustments: LocalAdjustments,
 }
 
+/// Display-only summary of a local layer. Mask pixels are deliberately absent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct C1LayerSummary {
+    pub index: i64,
+    pub name: String,
+    pub enabled: bool,
+    pub mask_uuid: Option<String>,
+    /// Engine layer kind. C1's finer mask type is not a `ZVARIANTLAYER` column.
+    pub kind: LayerKind,
+}
+
+impl C1MaskLayer {
+    pub fn summary(&self) -> C1LayerSummary {
+        C1LayerSummary {
+            index: self.index,
+            name: self.name.clone().unwrap_or_else(|| format!("Layer {}", self.index)),
+            enabled: self.enabled,
+            mask_uuid: self.mask_uuid.clone(),
+            kind: LayerKind::Adjustment,
+        }
+    }
+}
+
+/// Summaries in the same order as [`mask_layers_from_rows`].
+pub fn layer_summaries(layers: &[C1MaskLayer]) -> Vec<C1LayerSummary> {
+    layers.iter().map(C1MaskLayer::summary).collect()
+}
+
 /// Reads one `ZVARIANTLAYER` row; `None` when it is not a local mask layer.
 pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1MaskLayer> {
     let s = from_layer_row(row);
     (s.entity == C1EntityKind::LocalMask).then(|| {
         let (kelvin, tint) = gains_to_kelvin_tint(s.white_balance_gains);
+        let curves = curves_from_c1(&s);
+        let levels = levels_from_c1(&s);
+        let black_white = black_white_from_c1(&s);
         let adjustments = LocalAdjustments {
             white_balance: (s.white_balance_gains != [1.0; 3])
-                .then_some(WhiteBalance { kelvin, tint, ..Default::default() }),
+                .then_some(WhiteBalance { kelvin, tint, gains: None, ..Default::default() }),
             exposure: Exposure {
                 exposure: s.exposure,
                 contrast: s.contrast,
@@ -92,6 +129,18 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
             dehaze: Dehaze {
                 amount: s.dehaze_amount.clamp(0.0, 100.0),
                 shadow_tone: s.dehaze_color,
+            },
+            curves: (curves != Curves::default()).then_some(curves),
+            levels: (levels != Levels::default()).then_some(levels),
+            black_white: black_white.enabled.then_some(black_white),
+            color_editor: if s
+                .color_corrections
+                .iter()
+                .any(|row| ColorCorrection::from_row(row).affects_color())
+            {
+                color_editor_from_c1(&s.color_corrections)
+            } else {
+                Default::default()
             },
             ..Default::default()
         };
@@ -293,6 +342,214 @@ mod tests {
         assert_eq!((a.exposure.saturation, a.exposure.brightness), (13.33, 7.536));
     }
 
+    /// Both rows are real C1 editor state: the eight basic bands are always
+    /// stored, but only a non-zero shift is an edit.
+    const NEUTRAL_CORRECTIONS: &str =
+        "1,1,1,0,0,0,255,0,0,-10,10,-100,100,15,0,0,0,0";
+    const RED_SHIFT_CORRECTIONS: &str =
+        "1,1,1,20,30,0,255,0,0,-10,10,-100,100,15,0,0,0,0";
+
+    fn corrections_row(corrections: &'static str) -> HashMap<&'static str, Option<String>> {
+        let mut m = layer_row("0", "背景遮罩 1", "100");
+        row(&[("ZCOLORCORRECTIONS", Some(corrections))], &mut m);
+        m
+    }
+
+    #[test]
+    fn neutral_color_corrections_do_not_populate_the_editor() {
+        let parsed = mask_layer_from_row(&corrections_row(NEUTRAL_CORRECTIONS)).unwrap();
+        assert_eq!(parsed.adjustments.color_editor, Default::default());
+    }
+
+    #[test]
+    fn colour_editor_shift_reaches_the_layer() {
+        let parsed = mask_layer_from_row(&corrections_row(RED_SHIFT_CORRECTIONS)).unwrap();
+        let shift =
+            parsed.adjustments.color_editor.basic[crate::adjust::HueSector::Red as usize];
+        assert_eq!((shift.hue, shift.saturation, shift.lightness), (20.0, 30.0, 0.0));
+    }
+
+    /// The mapped editor must be neutral on a plain row and change pixels when
+    /// a real shift is present.
+    #[test]
+    fn colour_editor_mapping_changes_the_rendered_output_only_when_edited() {
+        use crate::{render, AdjustmentSet, NormRect, Source};
+
+        let rgba: Vec<u8> = (0..16 * 16).flat_map(|_| [220, 40, 30, 255]).collect();
+        let src = Source::from_rgba(16, 16, &rgba);
+        let render_layer = |corrections| {
+            let layer = mask_layer_from_row(&corrections_row(corrections))
+                .unwrap()
+                .to_layer(1, 1000.0, vec![], vec![]);
+            let set = AdjustmentSet { layers: vec![layer], ..Default::default() };
+            render(&src, &set, NormRect::FULL, 16, false, None).rgba
+        };
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 16, false, None).rgba;
+        assert_eq!(render_layer(NEUTRAL_CORRECTIONS), plain);
+        assert_ne!(render_layer(RED_SHIFT_CORRECTIONS), plain);
+    }
+
+    /// Real rows store identity gradation curves and neutral levels; those are
+    /// not an edit and must stay absent.
+    #[test]
+    fn neutral_curves_and_levels_stay_absent() {
+        let mut m = layer_row("0", "Mask", "100");
+        row(
+            &[
+                ("ZGRADATIONCURVE", Some("0.000,0.000;1.000,1.000")),
+                ("ZGRADATIONCURVERED", Some("0.000,0.000;1.000,1.000")),
+                ("ZLEVELSSHADOW", Some("0.000;0.000;0.000;0.000")),
+                ("ZLEVELSHIGHLIGHT", Some("1.000;1.000;1.000;1.000")),
+                ("ZMIDTONE", Some("0.000;0.000;0.000;0.000")),
+                ("ZLEVELSTARGETHIGHLIGHT", Some("1.000;1.000;1.000;1.000")),
+            ],
+            &mut m,
+        );
+        let a = mask_layer_from_row(&m).unwrap().adjustments;
+        assert!(a.curves.is_none(), "identity curves are not an edit");
+        assert!(a.levels.is_none(), "neutral levels are not an edit");
+    }
+
+    /// The local rows carry the same `ZGRADATIONCURVE*` / `ZLEVELS*` columns as
+    /// a variant, so a real edit must reach the layer unclamped.
+    #[test]
+    fn real_curve_and_levels_columns_reach_the_layer() {
+        let mut m = layer_row("0", "Mask", "100");
+        row(
+            &[
+                ("ZGRADATIONCURVE", Some("0.000,0.000;0.500,0.900;1.000,1.000")),
+                ("ZGRADATIONCURVEBLUE", Some("0.000,0.000;0.500,0.400;1.000,1.000")),
+                ("ZLEVELSSHADOW", Some("0.100;0.000;0.000;0.000")),
+                ("ZLEVELSHIGHLIGHT", Some("0.900;1.000;1.000;1.000")),
+                ("ZMIDTONE", Some("0.200;0.000;0.000;0.000")),
+                ("ZLEVELSTARGETHIGHLIGHT", Some("1.000;1.000;1.000;0.900")),
+            ],
+            &mut m,
+        );
+        let a = mask_layer_from_row(&m).unwrap().adjustments;
+        let curves = a.curves.expect("a real curve must reach the layer");
+        assert_eq!(curves.rgb.points.len(), 3);
+        assert_eq!((curves.rgb.points[1].x, curves.rgb.points[1].y), (0.5, 0.9));
+        assert!(curves.blue.points[1].y < 0.5, "the blue curve must stay separate");
+        let levels = a.levels.expect("real levels must reach the layer");
+        assert_eq!((levels.rgb.input_black, levels.rgb.input_white), (0.1, 0.9));
+        assert!(levels.rgb.gamma > 1.0, "a positive midtone lifts midtones");
+        assert_eq!((levels.rgb.output_white, levels.blue.output_white), (1.0, 0.9));
+    }
+
+    /// A neutral local row must leave the frame byte-identical; a real curve or
+    /// levels edit must change it.
+    #[test]
+    fn local_curve_and_levels_only_change_the_frame_when_edited() {
+        use crate::{render, AdjustmentSet, NormRect, Source};
+
+        let rgba: Vec<u8> = (0..16 * 16).flat_map(|_| [90, 110, 160, 255]).collect();
+        let src = Source::from_rgba(16, 16, &rgba);
+        let render_columns = |columns: &[(&'static str, Option<&'static str>)]| {
+            let mut m = layer_row("0", "Mask", "100");
+            row(columns, &mut m);
+            let layer = mask_layer_from_row(&m)
+                .unwrap()
+                .to_layer(1, 1000.0, vec![], vec![]);
+            let set = AdjustmentSet { layers: vec![layer], ..Default::default() };
+            render(&src, &set, NormRect::FULL, 16, false, None).rgba
+        };
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 16, false, None).rgba;
+        assert_eq!(
+            render_columns(&[("ZGRADATIONCURVE", Some("0.000,0.000;1.000,1.000"))]),
+            plain
+        );
+        assert_ne!(
+            render_columns(&[("ZGRADATIONCURVE", Some("0.000,0.000;0.500,0.900;1.000,1.000"))]),
+            plain
+        );
+        assert_eq!(
+            render_columns(&[
+                ("ZLEVELSHIGHLIGHT", Some("1.000;1.000;1.000;1.000")),
+                ("ZLEVELSTARGETHIGHLIGHT", Some("1.000;1.000;1.000;1.000")),
+            ]),
+            plain
+        );
+        assert_ne!(
+            render_columns(&[("ZLEVELSSHADOW", Some("0.250;0.000;0.000;0.000"))]),
+            plain
+        );
+    }
+
+    /// C1 writes `ZBWENABLED=0` on a neutral row; even with channel values
+    /// stored, the conversion is off and must stay absent.
+    #[test]
+    fn disabled_black_white_stays_absent() {
+        let mut m = layer_row("0", "Mask", "100");
+        row(
+            &[("ZBWENABLED", Some("0")), ("ZBWRED", Some("80.0"))],
+            &mut m,
+        );
+        let a = mask_layer_from_row(&m).unwrap().adjustments;
+        assert!(a.black_white.is_none());
+    }
+
+    /// A real conversion must reach the layer with its channel sensitivities
+    /// and tones, clamped to the same ranges the global path uses.
+    #[test]
+    fn black_white_columns_reach_the_layer() {
+        let mut m = layer_row("0", "Mask", "100");
+        row(
+            &[
+                ("ZBWENABLED", Some("1")),
+                ("ZBWRED", Some("12.5")),
+                ("ZBWYELLOW", Some("-40")),
+                ("ZBWBLUE", Some("25")),
+                ("ZBWDARKTONEHUE", Some("210")),
+                ("ZBWDARKTONESATURATION", Some("8")),
+            ],
+            &mut m,
+        );
+        let bw = mask_layer_from_row(&m)
+            .unwrap()
+            .adjustments
+            .black_white
+            .expect("an enabled conversion must reach the layer");
+        assert!(bw.enabled);
+        assert_eq!(bw.sensitivity, [12.5, -40.0, 0.0, 0.0, 25.0, 0.0]);
+        assert_eq!((bw.shadow_tone.hue, bw.shadow_tone.saturation), (210.0, 8.0));
+    }
+
+    /// Neutral stays byte-identical; an enabled conversion desaturates and its
+    /// channel sensitivity changes the result.
+    #[test]
+    fn black_white_only_changes_the_frame_when_enabled() {
+        use crate::{render, AdjustmentSet, NormRect, Source};
+
+        let rgba: Vec<u8> = (0..16 * 16).flat_map(|_| [200, 60, 40, 255]).collect();
+        let src = Source::from_rgba(16, 16, &rgba);
+        let render_columns = |columns: &[(&'static str, Option<&'static str>)]| {
+            let mut m = layer_row("0", "Mask", "100");
+            row(columns, &mut m);
+            let layer = mask_layer_from_row(&m)
+                .unwrap()
+                .to_layer(1, 1000.0, vec![], vec![]);
+            let set = AdjustmentSet { layers: vec![layer], ..Default::default() };
+            render(&src, &set, NormRect::FULL, 16, false, None).rgba
+        };
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 16, false, None).rgba;
+        assert_eq!(
+            render_columns(&[("ZBWENABLED", Some("0")), ("ZBWRED", Some("80"))]),
+            plain
+        );
+        let gray = render_columns(&[("ZBWENABLED", Some("1"))]);
+        assert_ne!(gray, plain, "an enabled conversion must change the frame");
+        assert!(
+            gray.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]),
+            "black and white output must be neutral"
+        );
+        assert_ne!(
+            render_columns(&[("ZBWENABLED", Some("1")), ("ZBWRED", Some("80"))]),
+            gray,
+            "red sensitivity must change the converted output"
+        );
+    }
+
     #[test]
     fn comask_metadata_matches_the_mask_uuid() {
         let rows = [layer_row("1", "背景遮罩 1", "12.9658")];
@@ -348,5 +605,22 @@ mod tests {
             (parsed.eraser.size, parsed.eraser.hardness, parsed.eraser.opacity),
             (100.0, 80.0, 100.0)
         );
+    }
+
+    #[test]
+    fn summaries_expose_name_enabled_and_mask_uuid() {
+        let rows = [
+            layer_row("2", "Skin Mask 1", "500"),
+            layer_row("0", "背景遮罩 1", "100"),
+        ];
+        let layers = mask_layers_from_rows(&rows);
+        let summaries = layer_summaries(&layers);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].index, 0);
+        assert_eq!(summaries[0].name, "背景遮罩 1");
+        assert!(summaries[0].enabled);
+        assert!(summaries[0].mask_uuid.is_some());
+        assert_eq!(summaries[0].kind, LayerKind::Adjustment);
+        assert_eq!(summaries[1].name, "Skin Mask 1");
     }
 }

@@ -5,7 +5,7 @@
 //! its render order, so engines that only read the list still draw it.
 
 use gpui_kit::{Context, SharedString};
-use lumen_engine::{AdjustmentSet, GraphNode, Layer, LayerKind, Mask, MaskOp, MaskShape, NodeGraph, NodeKind, NodeLink, RadialGradient};
+use aurora_engine::{AdjustmentSet, GraphNode, Layer, LayerKind, Mask, MaskOp, MaskShape, NodeGraph, NodeKind, NodeLink, RadialGradient};
 
 use super::AppState;
 use crate::i18n::t;
@@ -49,13 +49,13 @@ impl NewNode {
         }
     }
 
-    pub fn keys(self) -> String {
-        crate::platform::keys(match self {
-            Self::Serial => "alt-s",
-            Self::Parallel => "alt-shift-p",
-            Self::Layer => "alt-l",
-            Self::Outside => "alt-shift-o",
-        })
+    pub fn keys(self) -> &'static str {
+        match self {
+            Self::Serial => "Alt+S",
+            Self::Parallel => "Alt+Shift+P",
+            Self::Layer => "Alt+L",
+            Self::Outside => "Alt+Shift+O",
+        }
     }
 }
 

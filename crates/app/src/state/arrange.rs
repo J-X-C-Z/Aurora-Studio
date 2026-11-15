@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use gpui_kit::Context;
-use lumen_engine::{ImageId, ImageInfo};
+use aurora_engine::{ImageId, ImageInfo};
 use serde::{Deserialize, Serialize};
 
 use super::{AppState, SortKey};
@@ -78,6 +78,11 @@ impl AppState {
             self.settings.arrangements.insert(key, saved);
         }
         self.settings.save();
+    }
+
+    /// Position of `id` in the custom order; images never placed sort last.
+    pub(crate) fn custom_rank(&self, id: ImageId) -> usize {
+        self.custom_order.iter().position(|i| *i == id).unwrap_or(usize::MAX)
     }
 
     pub fn stack_of(&self, id: ImageId) -> Option<&Stack> {

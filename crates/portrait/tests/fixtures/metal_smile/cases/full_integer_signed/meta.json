@@ -1,0 +1,8 @@
+{
+  "name": "full_integer_signed",
+  "width": 8,
+  "height": 6,
+  "degree": 1,
+  "roi": {"x": 0, "y": 0, "width": 8, "height": 6},
+  "notes": "full ROI, integer positive/negative displacement, non-constant alpha"
+}

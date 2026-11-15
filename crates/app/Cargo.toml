@@ -1,11 +1,12 @@
 [package]
-name = "lumen-app"
+name = "portrait-app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [lib]
-name = "lumen_app"
+name = "portrait_app"
 path = "src/lib.rs"
 
 [[bin]]
@@ -13,7 +14,7 @@ name = "aurora-studio"
 path = "src/main.rs"
 
 [dependencies]
-lumen-engine.workspace = true
+aurora-engine.workspace = true
 gpui-kit.workspace = true
 ely-core.workspace = true
 serde.workspace = true
@@ -21,3 +22,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 log.workspace = true
 image = { version = "0.25", default-features = false }
+raw-window-handle = "0.6"
+
+[build-dependencies]
+embed-resource = "=3.0.12"

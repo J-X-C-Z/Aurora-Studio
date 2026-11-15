@@ -176,7 +176,7 @@ fn trunc_byte(value: f32) -> u8 {
     (value as i32).clamp(0, 255) as u8
 }
 
-fn roi_valid(roi: (u32, u32, u32, u32), width: u32, height: u32) -> bool {
+pub(crate) fn roi_valid(roi: (u32, u32, u32, u32), width: u32, height: u32) -> bool {
     let (x, y, w, h) = roi;
     w > 0
         && h > 0
@@ -185,7 +185,12 @@ fn roi_valid(roi: (u32, u32, u32, u32), width: u32, height: u32) -> bool {
 }
 
 /// Separable box feather with rounded integer means; radius 0 is an exact copy.
-fn feather_box(mask: &[u8], width: usize, height: usize, radius: u32) -> Vec<u8> {
+pub(crate) fn feather_box(
+    mask: &[u8],
+    width: usize,
+    height: usize,
+    radius: u32,
+) -> Vec<u8> {
     if radius == 0 {
         return mask.to_vec();
     }
@@ -649,23 +654,27 @@ fn sample_bgra_px(image: &Image, px: f32, py: f32) -> [u8; 4] {
 /// Shift map `pixel + shift * degree * sourceScale`, min-clamped, then a
 /// bilinear remap gated by the hand mask. Alpha is taken from the destination
 /// pixel, matching the recovered 4-channel remap path.
-pub fn hand_shape(
+pub(crate) fn hand_shape_field(
     source: &Image,
     native_parameter: i32,
-    shift_x: &[f32],
-    shift_y: &[f32],
-    hand_mask: &[u8],
-    protect_mask: &[u8],
+    shift_x: Option<&[f32]>,
+    shift_y: Option<&[f32]>,
+    hand_mask: Option<&[u8]>,
+    protect_mask: Option<&[u8]>,
     source_scale: Option<f32>,
-) -> Result<Image, Refusal> {
+) -> Result<Option<Vec<[f32; 4]>>, Refusal> {
     let count = pixels(source)?;
     if !(0..=100).contains(&native_parameter) {
         return Err(Refusal::ValueOutOfRange("PF30190_NATIVE_PARAMETER"));
     }
     let degree = native_parameter as f32 * 1.2 / 100.0;
     if degree == 0.0 {
-        return Ok(source.clone());
+        return Ok(None);
     }
+    let shift_x = shift_x.ok_or(Refusal::MissingInput("PF30190_SHIFT"))?;
+    let shift_y = shift_y.ok_or(Refusal::MissingInput("PF30190_SHIFT"))?;
+    let hand_mask = hand_mask.ok_or(Refusal::MissingInput("PF30190_HAND_MASK"))?;
+    let protect_mask = protect_mask.ok_or(Refusal::MissingInput("PF30190_PROTECT_MASK"))?;
     if shift_x.len() != count || shift_y.len() != count {
         return Err(Refusal::ShapeMismatch("PF30190_SHIFT"));
     }
@@ -680,18 +689,56 @@ pub fn hand_shape(
         None => hand_shape_source_scale(source.width, source.height)?,
     };
 
-    let mut out = source.clone();
+    let mut field = vec![[0.0f32; 4]; count];
     for index in 0..count {
         if hand_mask[index] == 0 {
             continue;
         }
         let factor = 1.0 - protect_mask[index] as f32 / 255.0;
+        field[index] = [
+            shift_x[index] * factor * degree * scale,
+            shift_y[index] * factor * degree * scale,
+            0.0,
+            1.0,
+        ];
+    }
+    Ok(Some(field))
+}
+
+/// CPU oracle for row 98. Consumes the same field the CUDA mode-1 path uses.
+pub fn hand_shape(
+    source: &Image,
+    native_parameter: i32,
+    shift_x: &[f32],
+    shift_y: &[f32],
+    hand_mask: &[u8],
+    protect_mask: &[u8],
+    source_scale: Option<f32>,
+) -> Result<Image, Refusal> {
+    let Some(field) = hand_shape_field(
+        source,
+        native_parameter,
+        Some(shift_x),
+        Some(shift_y),
+        Some(hand_mask),
+        Some(protect_mask),
+        source_scale,
+    )?
+    else {
+        return Ok(source.clone());
+    };
+
+    let mut out = source.clone();
+    for (index, pixel_field) in field.iter().enumerate() {
+        if pixel_field[3] == 0.0 {
+            continue;
+        }
         let x = (index % source.width as usize) as f32;
         let y = (index / source.width as usize) as f32;
-        let map_x = (x + shift_x[index] * factor * degree * scale)
+        let map_x = (x + pixel_field[0])
             .min((source.width - 1) as f32)
             .max(0.0);
-        let map_y = (y + shift_y[index] * factor * degree * scale)
+        let map_y = (y + pixel_field[1])
             .min((source.height - 1) as f32)
             .max(0.0);
         let sampled = sample_bgra_px(source, map_x, map_y);
@@ -760,7 +807,8 @@ fn distance_transform(foreground: &[bool], width: usize, height: usize, target: 
     distance
 }
 
-fn feather_distance(mask: &[u8], width: usize, height: usize, radius: u32) -> Vec<u8> {
+/// Shared with the PF44297 CUDA adapter's host feather preparation.
+pub(crate) fn feather_distance(mask: &[u8], width: usize, height: usize, radius: u32) -> Vec<u8> {
     let foreground: Vec<bool> = mask.iter().map(|&value| value >= 128).collect();
     let to_background = distance_transform(&foreground, width, height, false);
     let to_foreground = distance_transform(&foreground, width, height, true);
@@ -1417,6 +1465,39 @@ mod tests {
         assert_eq!(
             hand_shape(&src, 0, &[1.0, 1.0], &[0.0, 0.0], &[255, 255], &[0, 0], None).unwrap(),
             src
+        );
+    }
+
+    #[test]
+    fn row98_missing_same_job_inputs_are_typed_refusals() {
+        let src = pixel([10, 20, 30, 255]);
+        assert_eq!(
+            hand_shape_field(&src, 50, None, None, None, None, None),
+            Err(Refusal::MissingInput("PF30190_SHIFT"))
+        );
+        assert_eq!(
+            hand_shape_field(
+                &src,
+                50,
+                Some(&[1.0]),
+                Some(&[0.0]),
+                None,
+                None,
+                None,
+            ),
+            Err(Refusal::MissingInput("PF30190_HAND_MASK"))
+        );
+        assert_eq!(
+            hand_shape_field(
+                &src,
+                50,
+                Some(&[1.0]),
+                Some(&[0.0]),
+                Some(&[255]),
+                None,
+                None,
+            ),
+            Err(Refusal::MissingInput("PF30190_PROTECT_MASK"))
         );
     }
 

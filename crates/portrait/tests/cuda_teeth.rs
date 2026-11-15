@@ -1,28 +1,18 @@
-#[cfg(feature = "external-fixtures")]
-#[path = "support/mod.rs"]
-mod external_fixtures;
-
 // Real NVIDIA coverage for PF108-PF110 teeth whitening.
 //
 // The atlases are the shipped assets decoded exactly like
-// `processing::pixcake_assets::load_lut_png` (PngDecoder -> into_rgb8), dumped
+// `processing::portrait_assets::load_lut_png` (PngDecoder -> into_rgb8), dumped
 // to work/backend-r11/o1i/{whiten,bright}.rgb by o1i/decode.
 
-#[cfg(all(windows, feature = "external-fixtures"))]
+#[cfg(windows)]
 mod teeth_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_teeth::{Teeth, KERNEL, LUT_BYTES};
-    use aurora_pixcake::kernels::face_detail;
-    use aurora_pixcake::{Image, Refusal};
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_teeth::{Teeth, KERNEL, LUT_BYTES};
+    use aurora_portrait::kernels::face_detail;
+    use aurora_portrait::{Image, Refusal};
 
-    fn whiten_lut() -> &'static [u8] {
-        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        BYTES.get_or_init(|| super::external_fixtures::read("teeth/whiten.rgb"))
-    }
-    fn bright_lut() -> &'static [u8] {
-        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        BYTES.get_or_init(|| super::external_fixtures::read("teeth/bright.rgb"))
-    }
+    const WHITEN: &[u8] = include_bytes!("../../../work/backend-r11/o1i/whiten.rgb");
+    const BRIGHT: &[u8] = include_bytes!("../../../work/backend-r11/o1i/bright.rgb");
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -46,7 +36,7 @@ mod teeth_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None
@@ -74,14 +64,14 @@ mod teeth_gpu {
         deyellow: f32,
         label: &str,
     ) {
-        assert_eq!(whiten_lut().len(), LUT_BYTES);
-        assert_eq!(bright_lut().len(), LUT_BYTES);
+        assert_eq!(WHITEN.len(), LUT_BYTES);
+        assert_eq!(BRIGHT.len(), LUT_BYTES);
         let expected = face_detail::teeth_whitening(
-            source, mask, whiten_lut(), bright_lut(), common, bright, deyellow,
+            source, mask, WHITEN, BRIGHT, common, bright, deyellow,
         )
         .unwrap();
         let (actual, dispatches) = gpu
-            .apply(source, mask, whiten_lut(), bright_lut(), common, bright, deyellow)
+            .apply(source, mask, WHITEN, BRIGHT, common, bright, deyellow)
             .expect("real GPU dispatch");
         let differing =
             expected.output.pixels.iter().zip(&actual.pixels).filter(|(a, b)| a != b).count();
@@ -132,23 +122,23 @@ mod teeth_gpu {
         let mask = masks(pixels, 43);
 
         // common = 0 -> both weights 0 -> no launch, identity.
-        let (actual, dispatches) = gpu.apply(&source, &mask, whiten_lut(), bright_lut(), 0.0, 70.0, 70.0).unwrap();
+        let (actual, dispatches) = gpu.apply(&source, &mask, WHITEN, BRIGHT, 0.0, 70.0, 70.0).unwrap();
         assert!(dispatches.is_empty());
         assert_eq!(actual, source);
 
         // mask 0 -> gate 0.001 on both weights -> identity even at full degree.
         let zero_mask = vec![0u8; pixels];
         let (actual, dispatches) =
-            gpu.apply(&source, &zero_mask, whiten_lut(), bright_lut(), 100.0, 100.0, 100.0).unwrap();
+            gpu.apply(&source, &zero_mask, WHITEN, BRIGHT, 100.0, 100.0, 100.0).unwrap();
         assert_eq!(dispatches.len(), 1);
         assert_eq!(actual, source, "mask.g == 0 must copy every byte");
 
         // mask 1 quantizes to byte 1, i.e. weight 1/255 = 0.0039 > 0.001, so the
         // stage does run; it must still equal the CPU lane exactly.
         let tiny_mask = vec![1u8; pixels];
-        let (actual, _) = gpu.apply(&source, &tiny_mask, whiten_lut(), bright_lut(), 100.0, 100.0, 100.0).unwrap();
+        let (actual, _) = gpu.apply(&source, &tiny_mask, WHITEN, BRIGHT, 100.0, 100.0, 100.0).unwrap();
         let expected =
-            face_detail::teeth_whitening(&source, &tiny_mask, whiten_lut(), bright_lut(), 100.0, 100.0, 100.0)
+            face_detail::teeth_whitening(&source, &tiny_mask, WHITEN, BRIGHT, 100.0, 100.0, 100.0)
                 .unwrap()
                 .output;
         assert_eq!(actual, expected);
@@ -171,19 +161,19 @@ mod teeth_gpu {
         let source = canvas(4, 4, 59);
         let mask = masks(16, 61);
         assert_eq!(
-            gpu.apply(&source, &mask[..15], whiten_lut(), bright_lut(), 100.0, 100.0, 100.0).err(),
+            gpu.apply(&source, &mask[..15], WHITEN, BRIGHT, 100.0, 100.0, 100.0).err(),
             Some(CudaError::Refused(Refusal::ShapeMismatch("mask_g")))
         );
         assert_eq!(
-            gpu.apply(&source, &mask, &whiten_lut()[..LUT_BYTES - 3], bright_lut(), 100.0, 100.0, 100.0).err(),
+            gpu.apply(&source, &mask, &WHITEN[..LUT_BYTES - 3], BRIGHT, 100.0, 100.0, 100.0).err(),
             Some(CudaError::Refused(Refusal::ShapeMismatch("whiten_lut")))
         );
         assert_eq!(
-            gpu.apply(&source, &mask, whiten_lut(), bright_lut(), f32::NAN, 100.0, 100.0).err(),
+            gpu.apply(&source, &mask, WHITEN, BRIGHT, f32::NAN, 100.0, 100.0).err(),
             Some(CudaError::Refused(Refusal::ValueOutOfRange("common_ui")))
         );
         assert_eq!(
-            gpu.apply(&source, &mask, whiten_lut(), bright_lut(), 100.0, 101.0, 100.0).err(),
+            gpu.apply(&source, &mask, WHITEN, BRIGHT, 100.0, 101.0, 100.0).err(),
             Some(CudaError::Refused(Refusal::ValueOutOfRange("bright_ui")))
         );
     }
@@ -191,7 +181,7 @@ mod teeth_gpu {
     #[test]
     fn session_revalidates_the_source_before_upload() {
         let Some(gpu) = gpu() else { return };
-        let session = gpu.session(4, 4, whiten_lut(), bright_lut()).unwrap();
+        let session = gpu.session(4, 4, WHITEN, BRIGHT).unwrap();
         let short = Image {
             width: 4,
             height: 4,
@@ -212,7 +202,7 @@ mod teeth_gpu {
             pixels: vec![0; 15],
         };
         assert_eq!(
-            gpu.apply(&short, &[0; 16], whiten_lut(), bright_lut(), 100.0, 100.0, 100.0)
+            gpu.apply(&short, &[0; 16], WHITEN, BRIGHT, 100.0, 100.0, 100.0)
                 .err(),
             Some(CudaError::Refused(Refusal::ShapeMismatch("source")))
         );
@@ -233,12 +223,12 @@ mod teeth_gpu {
         ] {
             let expected =
                 face_detail::teeth_whitening(
-                    &source, &mask, whiten_lut(), bright_lut(), common, bright, deyellow,
+                    &source, &mask, WHITEN, BRIGHT, common, bright, deyellow,
                 )
                 .unwrap()
                 .output;
             let (actual, _) = gpu
-                .apply(&source, &mask, whiten_lut(), bright_lut(), common, bright, deyellow)
+                .apply(&source, &mask, WHITEN, BRIGHT, common, bright, deyellow)
                 .unwrap();
             let differing = expected
                 .pixels

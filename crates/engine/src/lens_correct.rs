@@ -90,19 +90,10 @@ struct BuiltinChroma {
 }
 
 fn builtin_lenses() -> Option<&'static Vec<BuiltinLens>> {
-    static DB: std::sync::OnceLock<Option<Vec<BuiltinLens>>> = std::sync::OnceLock::new();
-    DB.get_or_init(|| {
-        // Private calibration stays local; public builds can use the installed lens database.
-        let path = std::env::var_os("LUMEN_LENS_DB").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/lens_correct.json"));
-        match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(db) => Some(db),
-                Err(err) => { log::warn!("lens calibration {}: {err}", path.display()); None }
-            },
-            Err(_) => None,
-        }
-    }).as_ref()
+    static DB: std::sync::OnceLock<Vec<BuiltinLens>> = std::sync::OnceLock::new();
+    Some(DB.get_or_init(|| {
+        serde_json::from_slice(include_bytes!("../testdata/lens_correct.json")).expect("built-in lens DB")
+    }))
 }
 
 fn builtin_profile(model: &str) -> Option<&'static BuiltinLens> {
@@ -665,6 +656,29 @@ mod tests {
         assert!((c.max_distortion_px(half) - 360.6).abs() < 0.5);
     }
 
+    fn builtin_nikkor() -> &'static str {
+        "Nikon AF-S NIKKOR 24-120mm f/4G ED VR"
+    }
+
+    #[test]
+    fn builtin_lens_loads_real_curves() {
+        let c = LensCorrector::from_builtin_model(builtin_nikkor(), 24.0, 4.0, None, HALF_UM);
+        println!("24mm f/4 max vignette {} EV", c.max_vignette_ev());
+        println!("24mm f/4 max distortion {} px at 1000px half diagonal", c.max_distortion_px(1000.0));
+        assert!(!c.distortion.is_empty());
+        assert!(!c.falloff.is_empty());
+        assert!(!c.red.is_empty());
+        assert!(!c.blue.is_empty());
+        assert!(c.max_vignette_ev() > 0.5);
+        assert!(c.max_distortion_px(1000.0) > 20.0);
+    }
+
+    #[test]
+    fn builtin_lens_matches_mount_reference_radius() {
+        let c = LensCorrector::from_builtin_model(builtin_nikkor(), 24.0, 4.0, None, 0.0);
+        let last = c.falloff.last().copied().unwrap();
+        assert!(last.0 > 0.8 && last.0 < 1.0, "falloff should approach the mount corner, got {}", last.0);
+    }
 
     #[test]
     fn builtin_unknown_lens_is_identity() {
@@ -676,12 +690,40 @@ mod tests {
         assert_eq!(buf, before);
     }
 
+    #[test]
+    fn builtin_aperture_selection_changes_correction() {
+        let wide = LensCorrector::from_builtin_model(builtin_nikkor(), 24.0, 4.0, None, HALF_UM);
+        let narrow = LensCorrector::from_builtin_model(builtin_nikkor(), 24.0, 22.0, None, HALF_UM);
+        assert!(wide.max_vignette_ev() > narrow.max_vignette_ev());
+    }
 
-    /// Real database check; set `LUMEN_LENS_DB` to a decoded `lensDatabase.cdx`.
+    #[test]
+    fn builtin_ca_correction_moves_both_ways() {
+        let c = LensCorrector::from_builtin_model(builtin_nikkor(), 24.0, 11.0, None, HALF_UM);
+        let t = 0.75;
+        let red = sample(&c.red, t);
+        let blue = sample(&c.blue, t);
+        assert!(red > blue, "24mm CA should have stronger red shift: red={red}, blue={blue}");
+    }
+
+    #[test]
+    fn builtin_distortion_corrects_a_real_corner() {
+        let c = LensCorrector::from_builtin_model(builtin_nikkor(), 24.0, 4.0, None, HALF_UM);
+        let mut buf = gray(64, 64, 120);
+        c.apply_rgba(&mut buf, 64, 64);
+        assert_eq!(buf.len(), 64 * 64 * 4);
+        let center_alpha = buf[(32 * 64 + 32) * 4 + 3];
+        assert!(center_alpha == 255, "center should stay in frame");
+        let corner = buf[3];
+        assert!(corner == 255 || corner == 0, "corner must be transparent or in-frame, got {corner}");
+    }
+
+
+    /// Real database check; set `AURORA_LENS_DB` to a decoded `lensDatabase.cdx`.
     #[test]
     #[ignore]
     fn real_nikkor_24_120_reports_its_limits() {
-        let db = crate::lensdb::default_database().expect("set LUMEN_LENS_DB");
+        let db = crate::lensdb::default_database().expect("set AURORA_LENS_DB");
         let p = db
             .iter()
             .find(|p| p.full_name.contains("24-120mm f/4G"))
@@ -697,8 +739,5 @@ mod tests {
         assert!(c.max_vignette_ev() > 0.5);
         assert!(c.max_distortion_px(half) > 10.0);
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/lens_correct-tests.rs");
 }
 

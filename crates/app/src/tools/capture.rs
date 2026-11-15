@@ -8,7 +8,7 @@ use gpui_kit::component::{
     h_flex, v_flex,
 };
 use gpui_kit::{AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div, px, relative};
-use lumen_engine::{CameraStatus, TetherStatus};
+use aurora_engine::{CameraStatus, TetherStatus};
 
 use crate::i18n::t;
 use crate::state::AppState;
@@ -25,9 +25,13 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
         .into_any_element()
 }
 
-fn camera_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+fn camera_panel(state: &Entity<AppState>, cx: &App) -> AnyElement {
     let s = state.read(cx);
     let p = pal(cx).clone();
+    // No platform backend: neither probing nor "check again" can help.
+    if !s.capabilities.tether {
+        return v_flex().px_3().gap_2().child(div().text_xs().text_color(p.text_muted).child(s.tether_note())).into_any_element();
+    }
     let capturing = s.capturing;
     let probing = s.tether_probing;
     let st = state.clone();
@@ -106,7 +110,7 @@ fn camera_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
             .child(h_flex().pt_1().child(recheck("tether-recheck")))
             .into_any_element(),
     };
-    ToolPanel::new(state, "camera", t("Camera", "相机")).status(crate::contract::TETHER).child(body)
+    ToolPanel::new(state, "camera", t("Camera", "相机")).status(crate::contract::TETHER).child(body).into_any_element()
 }
 
 fn settings_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
@@ -134,6 +138,7 @@ fn settings_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<
                     .child(tile(t("White Bal.", "白平衡"), c.white_balance))
                     .child(tile(t("Drive", "驱动"), c.drive_mode)),
             )
+            .child(h_flex().gap_1p5().child(tile(t("Focus", "对焦"), c.focus_mode)).child(tile(t("Distance", "距离"), c.focus_distance)))
             .into_any_element(),
         None => div().px_3().text_xs().text_color(p.text_subtle).child(t("Settings appear when a camera is connected.", "连接相机后显示设置。")).into_any_element(),
     })

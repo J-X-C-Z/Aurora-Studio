@@ -3,7 +3,7 @@
 //! catalog's own (`ImageInfo::rating`, -1 rejected); nothing else changes.
 
 use gpui_kit::{Context, Window};
-use lumen_engine::ImageId;
+use aurora_engine::ImageId;
 
 use super::{AppState, RenderQuality};
 use crate::i18n::t;

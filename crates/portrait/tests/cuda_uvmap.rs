@@ -6,11 +6,11 @@
 
 #[cfg(windows)]
 mod uvmap_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_uvmap::{Uvmap, KERNEL};
-    use aurora_pixcake::kernels::uvmap_color::{self, Channel};
-    use aurora_pixcake::raster_fragment;
-    use aurora_pixcake::{Image, Refusal};
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_uvmap::{Uvmap, KERNEL};
+    use aurora_portrait::kernels::uvmap_color::{self, Channel};
+    use aurora_portrait::raster_fragment;
+    use aurora_portrait::{Image, Refusal};
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -34,7 +34,7 @@ mod uvmap_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None

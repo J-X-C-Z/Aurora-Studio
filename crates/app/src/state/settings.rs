@@ -1,7 +1,7 @@
 //! Preferences that outlive a session: appearance, viewer behavior, keyboard
 //! shortcuts and workspaces. Stored as JSON in the user's config folder
 //! (`%APPDATA%\Aurora Studio\settings.json` on Windows; settings saved under
-//! the earlier Lumen Studio name are picked up on first launch).
+//! the earlier Aurora Studio name are picked up on first launch).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -125,6 +125,323 @@ pub fn display_profiles() -> Vec<PathBuf> {
     found
 }
 
+/// The ICC profile Windows reports for the monitor under `hwnd` (the app's
+/// window); falls back to the primary display. `None` off Windows or on failure.
+pub fn detected_display_profile(hwnd: isize) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        win_icm::current(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        None
+    }
+}
+
+/// What the current monitor lookup resolved, and whether it fell back to the
+/// primary display.
+pub struct DisplayProfileStatus {
+    pub path: Option<PathBuf>,
+    pub fallback: bool,
+}
+
+pub fn detected_display_profile_status(hwnd: isize) -> DisplayProfileStatus {
+    #[cfg(windows)]
+    {
+        let (path, fallback) = win_icm::status(hwnd);
+        DisplayProfileStatus { path, fallback }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        DisplayProfileStatus { path: None, fallback: false }
+    }
+}
+
+/// Drops cached monitor profiles, e.g. on a display change.
+pub fn invalidate_display_profile_cache() {
+    #[cfg(windows)]
+    win_icm::invalidate();
+}
+
+#[cfg(windows)]
+mod win_icm {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+        /// `MONITORINFOEXW.szDevice`, NUL-terminated.
+        device: [u16; 32],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDC(hwnd: *mut c_void) -> *mut c_void;
+        fn ReleaseDC(hwnd: *mut c_void, hdc: *mut c_void) -> i32;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn IsWindow(hwnd: *mut c_void) -> i32;
+        fn EnumDisplayMonitors(dc: *mut c_void, clip: *mut Rect, cb: Option<unsafe extern "system" fn(*mut c_void, *mut c_void, *mut Rect, isize) -> i32>, data: isize) -> i32;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn GetICMProfileW(hdc: *mut c_void, size: *mut u32, file: *mut u16) -> i32;
+        fn CreateDCW(driver: *const u16, device: *const u16, port: *const u16, init: *mut c_void) -> *mut c_void;
+        fn DeleteDC(hdc: *mut c_void) -> i32;
+    }
+
+    /// Display profiles change rarely; a short TTL also covers hot-plug and
+    /// Windows colour-management changes that we get no callback for.
+    const CACHE_TTL: Duration = Duration::from_secs(5);
+
+    type Entry = (String, Option<PathBuf>, Instant);
+
+    fn cache() -> &'static Mutex<Vec<Entry>> {
+        static CACHE: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
+        CACHE.get_or_init(Default::default)
+    }
+
+    fn cached(key: &str) -> Option<Option<PathBuf>> {
+        let now = Instant::now();
+        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+        let at = cache.iter().position(|(k, _, _)| k == key)?;
+        if !fresh(cache[at].2, now) {
+            cache.remove(at);
+            return None;
+        }
+        Some(cache[at].1.clone())
+    }
+
+    fn remember(key: String, value: Option<PathBuf>) {
+        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|(k, _, _)| *k != key);
+        if cache.len() < 16 {
+            cache.push((key, value, Instant::now()));
+        }
+    }
+
+    fn fresh(since: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(since) <= CACHE_TTL
+    }
+
+    pub(super) fn invalidate() {
+        cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// ICC of the monitor under the app window; the primary screen when that
+    /// window, its monitor, or its device context cannot be resolved.
+    pub(super) fn current(hwnd: isize) -> Option<PathBuf> {
+        status(hwnd).0
+    }
+
+    pub(super) fn status(hwnd: isize) -> (Option<PathBuf>, bool) {
+        if let Some(device) = window_point(hwnd).and_then(device_at) {
+            let key = device_key(&device);
+            if let Some(hit) = cached(&key) {
+                return (hit, false);
+            }
+            let out = unsafe {
+                let hdc = CreateDCW(std::ptr::null(), device.as_ptr(), std::ptr::null(), std::ptr::null_mut());
+                if hdc.is_null() {
+                    None
+                } else {
+                    let out = profile(hdc);
+                    DeleteDC(hdc);
+                    out
+                }
+            };
+            if out.is_some() {
+                remember(key, out.clone());
+                return (out, false);
+            }
+            remember(key, None);
+        }
+        let key = "primary".to_string();
+        if let Some(hit) = cached(&key) {
+            return (hit, true);
+        }
+        let out = unsafe {
+            let hdc = GetDC(std::ptr::null_mut());
+            if hdc.is_null() {
+                None
+            } else {
+                let out = profile(hdc);
+                ReleaseDC(std::ptr::null_mut(), hdc);
+                out
+            }
+        };
+        remember(key, out.clone());
+        (out, true)
+    }
+
+    fn device_key(device: &[u16; 32]) -> String {
+        let len = device.iter().position(|c| *c == 0).unwrap_or(device.len());
+        String::from_utf16_lossy(&device[..len]).to_ascii_lowercase()
+    }
+
+    fn window_point(hwnd: isize) -> Option<(i32, i32)> {
+        if hwnd == 0 {
+            return None;
+        }
+        unsafe {
+            let hwnd = hwnd as *mut c_void;
+            if IsWindow(hwnd) == 0 {
+                return None;
+            }
+            let mut rect = Rect::default();
+            if GetWindowRect(hwnd, &mut rect) == 0 {
+                return None;
+            }
+            Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
+        }
+    }
+
+    unsafe fn profile(hdc: *mut c_void) -> Option<PathBuf> {
+        unsafe {
+            let mut size: u32 = 0;
+            GetICMProfileW(hdc, &mut size, std::ptr::null_mut());
+            let mut buf = vec![0u16; size.max(1) as usize];
+            size = buf.len() as u32;
+            let ok = GetICMProfileW(hdc, &mut size, buf.as_mut_ptr());
+            decode(&buf, ok)
+        }
+    }
+
+    struct Search {
+        point: (i32, i32),
+        device: Option<[u16; 32]>,
+    }
+
+    unsafe extern "system" fn find_monitor(monitor: *mut c_void, _dc: *mut c_void, _clip: *mut Rect, data: isize) -> i32 {
+        let search = unsafe { &mut *(data as *mut Search) };
+        let mut info = MonitorInfo {
+            cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+            rc_monitor: Rect::default(),
+            rc_work: Rect::default(),
+            flags: 0,
+            device: [0; 32],
+        };
+        unsafe {
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return 0;
+            }
+        }
+        if contains(&info.rc_monitor, search.point.0, search.point.1) {
+            search.device = Some(info.device);
+            1
+        } else {
+            0
+        }
+    }
+
+    fn device_at(point: (i32, i32)) -> Option<[u16; 32]> {
+        let mut search = Search { point, device: None };
+        unsafe {
+            EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null_mut(), Some(find_monitor), &mut search as *mut Search as isize);
+        }
+        search.device
+    }
+
+    fn contains(rect: &Rect, x: i32, y: i32) -> bool {
+        x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+    }
+
+    /// NUL-terminated wide path, only when the call reported success.
+    fn decode(buf: &[u16], ok: i32) -> Option<PathBuf> {
+        if ok == 0 {
+            return None;
+        }
+        let len = buf.iter().position(|c| *c == 0).filter(|len| *len > 0)?;
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Rect, cached, contains, current, decode, device_key, fresh, invalidate, remember, status, window_point};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn monitor_rect_contains_edges_exclusively() {
+            let rect = Rect { left: -1920, top: 0, right: 0, bottom: 1080 };
+            assert!(contains(&rect, -1920, 0));
+            assert!(contains(&rect, -1, 1079));
+            assert!(!contains(&rect, 0, 0));
+            assert!(!contains(&rect, -1920, 1080));
+        }
+
+        #[test]
+        fn null_dc_has_no_profile() {
+            assert!(unsafe { super::profile(std::ptr::null_mut()) }.is_none());
+        }
+
+        #[test]
+        fn current_profile_is_readable_when_present() {
+            if let Some(path) = current(0) {
+                assert!(path.exists(), "{}", path.display());
+            }
+        }
+
+        #[test]
+        fn invalid_window_falls_back_to_primary() {
+            assert_eq!(window_point(0), None);
+            assert_eq!(window_point(1), None);
+            let wide: Vec<u16> = "\\\\.\\DISPLAY1".encode_utf16().chain([0]).collect();
+            let mut device = [0u16; 32];
+            device[..wide.len()].copy_from_slice(&wide);
+            assert_eq!(device_key(&device), "\\\\.\\display1");
+        }
+
+        #[test]
+        fn expired_entries_are_dropped_and_can_be_cleared() {
+            let now = Instant::now();
+            assert!(fresh(now, now));
+            assert!(!fresh(now - Duration::from_secs(10), now));
+            remember("test-device".into(), None);
+            assert_eq!(cached("test-device"), Some(None));
+            invalidate();
+            assert_eq!(cached("test-device"), None);
+        }
+
+        #[test]
+        fn missing_window_reports_primary_fallback() {
+            let (path, fallback) = status(0);
+            assert!(fallback);
+            if let Some(path) = path {
+                assert!(path.exists(), "{}", path.display());
+            }
+        }
+
+        #[test]
+        fn failed_or_empty_profile_is_none() {
+            let path = "C:\\Windows\\System32\\spool\\drivers\\color\\sRGB Color Space Profile.icm";
+            let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+            assert_eq!(decode(&wide, 0), None);
+            assert_eq!(decode(&[], 1), None);
+            assert_eq!(decode(&[0], 1), None);
+            assert_eq!(decode(&wide, 1).unwrap().to_string_lossy(), path);
+        }
+    }
+}
+
 /// Where the tabs sit before the user moves them: Quick after Capture, as in Capture One.
 pub fn default_tab_order() -> Vec<ToolTab> {
     let mut order: Vec<ToolTab> = ToolTab::ALL.into_iter().filter(|t| *t != ToolTab::Quick).collect();
@@ -213,8 +530,28 @@ pub struct Settings {
     pub cull_auto_advance: bool,
     /// The monitor's ICC profile; `None` shows previews as sRGB.
     pub display_profile: Option<PathBuf>,
+    /// Soft-proof profile name (engine profile stem); `None` skips proofing.
+    pub proof_profile: Option<String>,
+    /// Soft-proof white level; 1.0 is neutral.
+    #[serde(default = "one")]
+    pub proof_paper_white: f32,
+    /// Soft-proof black level; 0.0 is neutral.
+    pub proof_black_point: f32,
     /// Custom order and stacks per folder or catalog path.
     pub arrangements: BTreeMap<String, super::Arrangement>,
+    /// ICC picker group: 0 all, 1 camera, 2 looks, 3 output. Unknown values
+    /// read as 0, so an old or hand-edited file never blocks startup.
+    #[serde(deserialize_with = "icc_group_value")]
+    pub icc_group: u8,
+}
+
+fn icc_group_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw {
+        serde_json::Value::Number(n) => n.as_u64().filter(|v| *v <= 3).unwrap_or(0) as u8,
+        serde_json::Value::String(s) => s.parse::<u8>().ok().filter(|v| *v <= 3).unwrap_or(0),
+        _ => 0,
+    })
 }
 
 /// IPTC fields and keywords to stamp onto images. Empty fields are left alone
@@ -223,7 +560,7 @@ pub struct Settings {
 #[serde(default)]
 pub struct MetadataPreset {
     pub name: String,
-    pub iptc: lumen_engine::Iptc,
+    pub iptc: aurora_engine::Iptc,
     pub keywords: Vec<String>,
 }
 
@@ -234,7 +571,7 @@ pub struct UserStyle {
     pub name: String,
     /// [`super::ClipGroup::id`] of each included tool.
     pub groups: Vec<String>,
-    pub adjustments: lumen_engine::AdjustmentSet,
+    pub adjustments: aurora_engine::AdjustmentSet,
 }
 
 impl Default for Settings {
@@ -269,13 +606,18 @@ impl Default for Settings {
             slideshow_interval: 4.0,
             cull_auto_advance: true,
             display_profile: None,
+            proof_profile: None,             proof_paper_white: 1.0,             proof_black_point: 0.0,             icc_group: 0,
         }
     }
 }
 
-/// `AURORA_SETTINGS` (or the older `LUMEN_SETTINGS`), else the config folder.
+fn one() -> f32 {
+    1.0
+}
+
+/// `AURORA_SETTINGS` (or the older `AURORA_SETTINGS`), else the config folder.
 fn path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("AURORA_SETTINGS").or_else(|| std::env::var_os("LUMEN_SETTINGS")) {
+    if let Some(p) = std::env::var_os("AURORA_SETTINGS").or_else(|| std::env::var_os("AURORA_SETTINGS")) {
         return Some(p.into());
     }
     config_dir("Aurora Studio", "aurora-studio").map(|d| d.join("settings.json"))
@@ -284,8 +626,6 @@ fn path() -> Option<PathBuf> {
 fn config_dir(windows: &str, unix: &str) -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(windows))
-    } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support").join(windows))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -296,7 +636,7 @@ fn config_dir(windows: &str, unix: &str) -> Option<PathBuf> {
 
 /// Settings written before the rename to Aurora Studio.
 fn legacy_path() -> Option<PathBuf> {
-    config_dir("Lumen Studio", "lumen-studio").map(|d| d.join("settings.json"))
+    config_dir("Aurora Studio", "aurora-studio").map(|d| d.join("settings.json"))
 }
 
 const RECENT: usize = 10;
@@ -372,5 +712,25 @@ mod tab_tests {
         let w: WorkspaceLayout = serde_json::from_str(r#"{"name":"Mine","hidden_tabs":["Batch"]}"#).unwrap();
         assert!(w.tab_order.is_empty());
         assert_eq!(w.hidden_tabs, vec!["Batch".to_string()]);
+    }
+
+    #[test]
+    fn settings_without_proof_profile_defaults_to_none() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.proof_profile, None);
+        assert_eq!(s.proof_paper_white, 1.0);
+        assert_eq!(s.proof_black_point, 0.0);
+    }
+
+    #[test]
+    fn the_icc_group_defaults_to_all_and_rejects_unknown_values() {
+        assert_eq!(Settings::default().icc_group, 0);
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().icc_group, 0);
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"icc_group":3}"#).unwrap().icc_group, 3);
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"icc_group":7}"#).unwrap().icc_group, 0);
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"icc_group":"2"}"#).unwrap().icc_group, 2);
+        assert_eq!(serde_json::from_str::<Settings>(r#"{"icc_group":"nope"}"#).unwrap().icc_group, 0);
+        let round = serde_json::to_string(&Settings { icc_group: 1, ..Settings::default() }).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&round).unwrap().icc_group, 1);
     }
 }

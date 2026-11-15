@@ -17,7 +17,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
     Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::RenderQuality;
+use aurora_engine::RenderQuality;
 
 use crate::actions::{self, display_keys, keys_for, shortcuts};
 use crate::i18n::{self, Locale, t};
@@ -70,6 +70,18 @@ impl PrefsView {
         self.state.update(cx, |s, cx| {
             f(&mut s.settings);
             s.save_settings();
+            s.request_render(RenderQuality::Final, cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// A profile change also refetches every visible thumbnail.
+    fn edit_thumbs(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
+        self.state.update(cx, |s, cx| {
+            f(&mut s.settings);
+            s.save_settings();
+            s.refresh_thumbs(cx);
             s.request_render(RenderQuality::Final, cx);
             cx.notify();
         });
@@ -334,6 +346,18 @@ impl PrefsView {
         let mut options: Vec<(usize, SharedString)> = vec![(0, t("sRGB (no conversion)", "sRGB（不转换）").into())];
         options.extend(profiles.iter().enumerate().map(|(i, path)| (i + 1, path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().into())));
         let this = cx.entity();
+        let refresh = cx.entity();
+        let detected = crate::state::detected_display_profile_status(self.state.read(cx).window_hwnd);
+        let name_of = |p: &std::path::PathBuf| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
+        let fallback = if detected.fallback { format!(" · {}", t("primary fallback", "回退主屏")) } else { String::new() };
+        let detected_name = detected.path.as_ref().map(|p| name_of(p)).unwrap_or_else(|| t("none", "无").to_string());
+        let pick = if let Some(manual) = chosen.as_ref() {
+            format!("{}: {} · {}: {detected_name}{fallback}", t("Manual", "手动"), name_of(manual), t("Detected", "探测"))
+        } else if detected.path.is_some() {
+            format!("{}: {detected_name}{fallback}", t("Detected", "探测"))
+        } else {
+            t("No display profile detected; previews stay sRGB", "未检测到显示器配置，预览保持 sRGB").to_string()
+        };
         let status = crate::contract::DISPLAY_PROFILE;
         v_flex()
             .child(caption(t("Color management", "色彩管理"), cx))
@@ -341,10 +365,31 @@ impl PrefsView {
                 t("Monitor profile", "显示器配置文件"),
                 select("pref-display-profile", options, current, move |i, _, cx| {
                     let path = i.checked_sub(1).and_then(|i| profiles.get(i).cloned());
-                    this.update(cx, |v, cx| v.edit(cx, |s| s.settings.display_profile = path));
+                    this.update(cx, |v, cx| v.edit_thumbs(cx, move |s| s.display_profile = path));
                 }),
                 cx,
             ))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pb_1()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(p.text_muted)
+                    .child(div().flex_1().child(pick))
+                    .child(
+                        Button::new("pref-display-refresh")
+                            .xsmall()
+                            .ghost()
+                            .icon(Icon::new(IconName::RotateCcw))
+                            .label(t("Refresh", "刷新"))
+                            .on_click(move |_, _, cx| {
+                                crate::state::invalidate_display_profile_cache();
+                                refresh.update(cx, |v, cx| v.edit_thumbs(cx, |_| {}));
+                            }),
+                    ),
+            )
+            .child(self.proof_profile(cx))
             .child(
                 h_flex()
                     .px_3()
@@ -355,6 +400,40 @@ impl PrefsView {
                     .child(Icon::new(IconName::TriangleAlert).xsmall())
                     .child(div().flex_1().child(status.note().unwrap_or_default())),
             )
+            .into_any_element()
+    }
+
+    /// Soft-proof profile, from the engine's ICC list; used while soft proof is on.
+    fn proof_profile(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let chosen = self.state.read(cx).settings.proof_profile.clone();
+        let white = self.state.read(cx).settings.proof_paper_white;
+        let black = self.state.read(cx).settings.proof_black_point;
+        let mut profiles = self.state.read(cx).icc_profiles.clone();
+        if let Some(c) = chosen.as_ref().filter(|c| !profiles.contains(c)) {
+            profiles.insert(0, c.clone());
+        }
+        let current = chosen.as_ref().and_then(|c| profiles.iter().position(|p| p == c)).map_or(0, |i| i + 1);
+        let mut options: Vec<(usize, SharedString)> = vec![(0, t("None (no proofing)", "无（不软打样）").into())];
+        options.extend(profiles.iter().enumerate().map(|(i, name)| (i + 1, name.clone().into())));
+        let this = cx.entity();
+        let (t1, t2) = (this.clone(), this.clone());
+        v_flex()
+            .child(row(
+                t("Soft proof profile", "软打样配置文件"),
+                select("pref-proof-profile", options, current, move |i, _, cx| {
+                    let name = i.checked_sub(1).and_then(|i| profiles.get(i).cloned());
+                    this.update(cx, |v, cx| v.edit_thumbs(cx, move |s| s.proof_profile = name));
+                }),
+                cx,
+            ))
+            .when(chosen.is_some(), |d| {
+                d.child(ParamSlider::new("pref-proof-white", t("Paper white", "纸白"), white * 100.0, 50.0, 100.0).default_value(100.0).unit("%").on_change(move |value, _, cx| {
+                    t1.update(cx, |v, cx| v.edit_thumbs(cx, move |s| s.proof_paper_white = (value / 100.0).clamp(0.0, 1.0)))
+                }))
+                .child(ParamSlider::new("pref-proof-black", t("Black point", "黑点"), black * 100.0, 0.0, 50.0).default_value(0.0).unit("%").on_change(move |value, _, cx| {
+                    t2.update(cx, |v, cx| v.edit_thumbs(cx, move |s| s.proof_black_point = (value / 100.0).clamp(0.0, 1.0)))
+                }))
+            })
             .into_any_element()
     }
 
@@ -414,7 +493,7 @@ impl PrefsView {
                     .disabled(!s.warn_shadows)
                     .on_change(move |v, _, cx| t3.update(cx, |p, cx| p.edit_render(cx, |s| s.warn_low = v.round() as u8))),
             )
-            .child(div().px_3().text_xs().text_color(p.text_subtle).child(format!("{}（{}）", t("Red marks clipped highlights, blue blocked shadows", "红色标记高光溢出，蓝色标记暗部死黑"), crate::platform::keys("alt-e"))))
+            .child(div().px_3().text_xs().text_color(p.text_subtle).child(t("Red marks clipped highlights, blue blocked shadows (Alt+E).", "红色标记高光溢出，蓝色标记暗部死黑（Alt+E）。")))
             .child(caption(t("Focus mask", "焦点蒙版"), cx))
             .child(ParamSlider::new("pref-focus", t("Edge threshold", "边缘阈值"), s.focus_threshold, 5.0, 80.0).step(1.0).default_value(22.0).on_change(move |v, _, cx| {
                 t4.update(cx, |p, cx| p.edit_render(cx, |s| s.focus_threshold = v))

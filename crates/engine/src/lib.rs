@@ -1,11 +1,10 @@
-//! # lumen-engine
+//! # aurora-engine
 //!
-//! The contract between the Lumen Studio interface and its image-processing engine.
+//! The contract between the Aurora Studio interface and its image-processing engine.
 //!
 //! * [`AdjustmentSet`] is the full, serializable state of one variant's edits.
 //! * [`ImageEngine`] is what an engine implements; the interface calls nothing else.
-//! * [`LibraryAction`] manages catalog folders and source references explicitly.
-//! * [`FileEngine`] reads a real folder of images and persists edits in `.lumen`.
+//! * [`FileEngine`] reads a real folder of images and persists edits in `.portrait`.
 //! * [`MockEngine`] is a reference implementation with procedural images, kept for
 //!   interface work when no folder is given.
 //!
@@ -18,9 +17,13 @@ mod adjust;
 mod c1catalog;
 mod c1import;
 mod c1_masks;
+mod c1session_export;
+mod sqlite_write;
 mod c1_style_index;
 mod c1_styles;
 mod c1_model;
+pub mod c1_nef_lensdata;
+mod c1_wb_oracle;
 pub mod c1_retouch;
 pub mod comask;
 mod camera_defaults;
@@ -32,9 +35,6 @@ mod engine;
 mod exif;
 mod file_engine;
 pub mod param_contract;
-#[cfg(windows)]
-pub mod portrait;
-pub use aurora_pixcake as portrait_backend;
 pub mod auto_exposure;
 pub mod fcrv_index;
 mod filmcurve;
@@ -42,16 +42,21 @@ mod heif;
 mod heif_write;
 mod highlight;
 pub mod hdr;
+pub mod pano;
+pub mod print;
+pub mod jxl;
 mod iptc;
 mod layers;
 mod lens_correct;
 mod layer_graph;
 mod lensdb;
 mod matchlook;
+mod merge_options;
 mod mock;
 pub mod mask_store;
 mod noise_defaults;
 mod output;
+mod portrait_stage;
 mod param_meta;
 mod preview_cache;
 mod presets;
@@ -74,15 +79,15 @@ pub mod dustdetect;
 pub mod autorotate;
 pub mod keystone;
 
-// PixCake (像素蛋糕) preset parameters, injected into this machine's Capture One
+// Vendor (像素蛋糕) preset parameters, injected into this machine's Capture One
 // install by third-party DLLs. Deliberately not re-exported at the crate root:
 // these 482 keys are NOT Capture One's own adjustment model. Capture One's real
 // per-variant parameter set is the 163-column `ZVARIANTLAYER` table.
 mod effects;
-mod pixcake_map;
-pub mod pixcake {
+mod portrait_map;
+pub mod portrait {
     pub use crate::effects::*;
-    pub use crate::pixcake_map::*;
+    pub use crate::portrait_map::*;
 }
 
 pub use adjust::*;
@@ -90,6 +95,7 @@ pub use c1catalog::{
     C1Catalog, C1Collection, C1DocumentType, C1Image, C1Keyword, C1Variant, WalReplay,
 };
 pub use c1import::{resolve_database, C1Import, C1_COLLECTION_ID_BASE};
+pub use c1session_export::{export_session, SessionExport};
 pub use c1_masks::*;
 pub use c1_style_index::*;
 pub use c1_styles::*;
@@ -97,6 +103,7 @@ pub use c1_model::*;
 pub use camera_defaults::overrides_for;
 pub use batch::*;
 pub use catalog::*;
+pub use exif::read_exif;
 pub use closedeyes::{any_eye_closed, detect_eyes, EyeBox, EyeReport};
 pub use engine::*;
 pub use file_engine::{FileEngine, ImportErrorKind, SourceStatusKind};
@@ -107,6 +114,7 @@ pub use lens_correct::*;
 pub use layer_graph::*;
 pub use lensdb::*;
 pub use matchlook::*;
+pub use merge_options::*;
 pub use mock::MockEngine;
 pub use output::*;
 #[doc(hidden)]

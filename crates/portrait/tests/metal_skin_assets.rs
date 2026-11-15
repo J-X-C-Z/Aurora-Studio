@@ -1,26 +1,14 @@
-#[cfg(feature = "external-fixtures")]
-#[path = "support/mod.rs"]
-mod external_fixtures;
+//! Real-atlas fixtures for the fixed-point Metal SkinAdjust LUT channel.
+//!
+//! Windows runs hash/CPU-oracle checks. The GPU test is `#[ignore]` and panics
+//! on non-macOS instead of passing.
 
-// Real-atlas fixtures for the fixed-point Metal SkinAdjust LUT channel.
-//
-// Windows runs hash/CPU-oracle checks. The GPU test is `#[ignore]` and panics
-// on non-macOS instead of passing.
-
-#[cfg(feature = "external-fixtures")]
 use std::fs;
-#[cfg(feature = "external-fixtures")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[cfg(feature = "external-fixtures")]
-use aurora_pixcake::kernels::makeup;
-use aurora_pixcake::metal::SkinLutParams;
-#[cfg(feature = "external-fixtures")]
-use aurora_pixcake::metal::MetalContext;
-#[cfg(feature = "external-fixtures")]
-use aurora_pixcake::Image;
-
-#[cfg(feature = "external-fixtures")]
+use aurora_portrait::kernels::makeup;
+use aurora_portrait::metal::{MetalContext, SkinLutParams};
+use aurora_portrait::Image;
 
 fn require_macos() {
     if !cfg!(target_os = "macos") {
@@ -28,19 +16,13 @@ fn require_macos() {
     }
 }
 
-#[cfg(feature = "external-fixtures")]
-
 fn fixture_root() -> PathBuf {
-    external_fixtures::root().join("metal_skin")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metal_skin")
 }
-
-#[cfg(feature = "external-fixtures")]
 
 fn atlas(name: &str) -> Vec<u8> {
     fs::read(fixture_root().join(format!("atlases/{name}.rgb8"))).expect("atlas")
 }
-
-#[cfg(feature = "external-fixtures")]
 
 struct GoldenCase {
     atlas: String,
@@ -52,8 +34,6 @@ struct GoldenCase {
     mask: Vec<u8>,
     expected: Vec<u8>,
 }
-
-#[cfg(feature = "external-fixtures")]
 
 fn cases() -> Vec<GoldenCase> {
     let root = fixture_root();
@@ -77,8 +57,6 @@ fn cases() -> Vec<GoldenCase> {
     out
 }
 
-#[cfg(feature = "external-fixtures")]
-
 fn cpu(case: &GoldenCase, lut: &[u8]) -> Image {
     makeup::skin_adjust_lut(
         &Image::new(case.width, case.height, case.source.clone()).unwrap(),
@@ -90,7 +68,6 @@ fn cpu(case: &GoldenCase, lut: &[u8]) -> Image {
 }
 
 // Minimal SHA-256 for fixture integrity; test-only, no dependency.
-#[cfg(feature = "external-fixtures")]
 fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -167,13 +144,9 @@ fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|v| format!("{v:08X}")).collect()
 }
 
-#[cfg(feature = "external-fixtures")]
-
 fn clamp01(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
 }
-
-#[cfg(feature = "external-fixtures")]
 
 fn float_lut(lut: &[u8], color: [f32; 3]) -> [f32; 3] {
     let pr = clamp01(color[0]) * 63.0;
@@ -204,8 +177,6 @@ fn float_lut(lut: &[u8], color: [f32; 3]) -> [f32; 3] {
     out
 }
 
-#[cfg(feature = "external-fixtures")]
-
 fn round_half_even(value: f32) -> u8 {
     let scaled = value * 255.0;
     if !(scaled > 0.0) {
@@ -222,8 +193,6 @@ fn round_half_even(value: f32) -> u8 {
     }
     rounded.min(255) as u8
 }
-
-#[cfg(feature = "external-fixtures")]
 
 fn float_byte(source: &[u8], mask: &[u8], lut: &[u8], mix: f32, pixel: usize) -> u8 {
     let weight = (mask[pixel] as f32 / 255.0) * mix;
@@ -246,7 +215,6 @@ fn params_are_32_bytes() {
 }
 
 #[test]
-#[cfg(feature = "external-fixtures")]
 fn fixture_hashes_and_cpu_expected_match() {
     let root = fixture_root();
     for line in fs::read_to_string(root.join("SHA256SUMS")).unwrap().lines() {
@@ -271,7 +239,6 @@ fn fixture_hashes_and_cpu_expected_match() {
 }
 
 #[test]
-#[cfg(feature = "external-fixtures")]
 fn real_whiten_index5_is_fixed_153_not_float_154() {
     let whiten = atlas("whiten");
     let source = vec![
@@ -287,7 +254,6 @@ fn real_whiten_index5_is_fixed_153_not_float_154() {
 
 #[test]
 #[ignore = "requires macOS Metal device"]
-#[cfg(feature = "external-fixtures")]
 fn real_atlas_metal_matches_fixture_expected() {
     require_macos();
     let context = MetalContext::new().expect("MetalContext");

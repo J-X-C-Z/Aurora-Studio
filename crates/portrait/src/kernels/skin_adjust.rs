@@ -123,15 +123,34 @@ fn mix(from: f32, to: f32, amount: f32) -> f32 {
     from * (1.0 - amount) + to * amount
 }
 
-/// `value * 255` truncated toward zero, matching the vendor `cvttss2si` store.
-fn trunc_u8(value: f32) -> u8 {
-    if value <= 0.0 {
-        0
-    } else if value >= 1.0 {
-        255
-    } else {
-        (value * 255.0) as u8
+/// Byte store used after a float pixel law.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreMode {
+    /// CPU wrinkle rows: `value * 255` truncated toward zero (`cvttss2si`).
+    TruncU8,
+    /// GPU P15 execution: clamp to `[0,1]`, scale, then round to nearest.
+    Round,
+}
+
+impl StoreMode {
+    pub fn quantize(self, value: f32) -> u8 {
+        match self {
+            Self::TruncU8 => {
+                if value <= 0.0 {
+                    0
+                } else if value >= 1.0 {
+                    255
+                } else {
+                    (value * 255.0) as u8
+                }
+            }
+            Self::Round => (value.clamp(0.0, 1.0) * 255.0).round() as u8,
+        }
     }
+}
+
+fn trunc_u8(value: f32) -> u8 {
+    StoreMode::TruncU8.quantize(value)
 }
 
 /// Inclusive-exclusive pixel rectangle inside one frame.
@@ -144,7 +163,7 @@ pub struct Roi {
 }
 
 impl Roi {
-    fn validate(self, width: u32, height: u32) -> Result<(), Refusal> {
+    pub(crate) fn validate(self, width: u32, height: u32) -> Result<(), Refusal> {
         let inside = self.width > 0
             && self.height > 0
             && self.x as u64 + self.width as u64 <= width as u64
@@ -186,7 +205,7 @@ pub struct WrinkleUniforms {
 }
 
 impl WrinkleUniforms {
-    fn validate(&self) -> Result<(), Refusal> {
+    pub(crate) fn validate(&self) -> Result<(), Refusal> {
         let finite = [
             self.legal_alpha,
             self.dark_circle_alpha,

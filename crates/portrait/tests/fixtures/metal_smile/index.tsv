@@ -1,0 +1,5 @@
+name	width	height	degree	roi_x	roi_y	roi_width	roi_height
+edge_clamp_half_store	8	6	1	0	0	8	6
+full_integer_signed	8	6	1	0	0	8	6
+gate_zero_support	8	6	1	1	1	6	4
+inset_fractional	8	6	0.6	1	1	5	3

@@ -1,6 +1,6 @@
 //! PF407 / row 112 `LengthenLegRefine` UV-map producer.
 //!
-//! Recovered chain (pixcake.exe `a84519da…`):
+//! Recovered chain (portrait.exe `a84519da…`):
 //!   `0x4B9C600` EffectLengthenLegRefineCell::Initialize creates two 0x2C8
 //!   reshape objects at `cell+0x280/+0x288`, sets second `+0x2A9=1`
 //!   (ENABLE_UVMAP), `+0x2AA=[+0x34B]` (UVMAP_BA) and zeroes `+0x2A8`

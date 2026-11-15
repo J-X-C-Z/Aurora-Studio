@@ -1,16 +1,15 @@
-#![cfg(feature = "external-fixtures")]
-#[cfg(feature = "external-fixtures")]
-#[path = "support/mod.rs"]
-mod external_fixtures;
+//! Real `whiten.png` atlas checks for the Apple whiten kernel.
+//!
+//! The LUT golden is decoded offline by
+//! `work/backend-r11/o2e/decode_lut.py` into RGBA float32. The MSL reads
+//! `float4 .x/.y/.z`, so the byte order is RGBA, not BGRA.
 
-// Real `whiten.png` atlas checks for the Apple whiten kernel.
-//
-// The LUT golden is decoded offline by
-// `work/backend-r11/o2e/decode_lut.py` into RGBA float32. The MSL reads
-// `float4 .x/.y/.z`, so the byte order is RGBA, not BGRA.
+use aurora_portrait::metal::{MetalContext, WhitenInput};
 
-use aurora_pixcake::metal::{MetalContext, WhitenInput};
-
+const LUT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../work/backend-r11/o2e/whiten_lut.f32"
+);
 const O3B_MSL: &str = include_str!("../native/metal/o3b_masked_lut_whiten.metal");
 
 fn require_macos() {
@@ -20,7 +19,7 @@ fn require_macos() {
 }
 
 fn read_lut() -> Vec<f32> {
-    let bytes = external_fixtures::read("teeth/whiten_lut.f32");
+    let bytes = std::fs::read(LUT_PATH).expect("whiten_lut.f32 missing; run decode_lut.py");
     assert_eq!(bytes.len(), 512 * 512 * 4 * 4);
     bytes
         .chunks_exact(4)
@@ -108,6 +107,7 @@ fn oracle(source: &[u8], mask: &[u8], lut: &[f32], alpha: f32) -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires macOS Metal device")]
 fn lut_asset_is_rgba_float_and_o3b_abi_is_rgba() {
     let lut = read_lut();
     assert_eq!(lut.len(), 512 * 512 * 4);

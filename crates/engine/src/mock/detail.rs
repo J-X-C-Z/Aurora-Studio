@@ -4,6 +4,30 @@
 
 use rayon::prelude::*;
 
+#[cfg(windows)]
+use super::detail_gpu;
+#[cfg(not(windows))]
+mod detail_gpu {
+    use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
+
+    pub(super) fn enabled() -> bool {
+        false
+    }
+
+    pub(super) fn post_process(
+        _rgba: &mut [u8],
+        _w: usize,
+        _h: usize,
+        _nr: &NoiseReduction,
+        _moire: &Moire,
+        _sh: &Sharpening,
+        _lens: &LensCorrection,
+        _scale: f32,
+    ) -> bool {
+        false
+    }
+}
+
 use crate::{FilmGrain, GrainKind, LensCorrection, Moire, NoiseReduction, Sharpening};
 
 /// Applies the detail stages to one sRGB 8-bit RGBA frame, in place.
@@ -61,11 +85,19 @@ pub(crate) fn post_process_with_lens(
     }
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
 
-    stage_luminance_nr(rgba, w, h, nr);
-    stage_color_nr(rgba, w, h, nr);
-    stage_moire(rgba, w, h, &adj.moire);
-    stage_sharpening(rgba, w, h, &adj.sharpening, scale);
-    stage_lens(rgba, w, h, lens, warp);
+    let use_profile = lens.use_profile && warp.is_some();
+    let gpu = !use_profile
+        && detail_gpu::enabled()
+        && detail_gpu::post_process(rgba, w, h, nr, &adj.moire, &adj.sharpening, lens, scale);
+    if !gpu {
+        stage_luminance_nr(rgba, w, h, nr);
+        stage_color_nr(rgba, w, h, nr);
+        stage_moire(rgba, w, h, &adj.moire);
+        stage_sharpening(rgba, w, h, &adj.sharpening, scale);
+    }
+    if !gpu {
+        stage_lens(rgba, w, h, lens, warp);
+    }
     stage_grain(rgba, w, h, &adj.film_grain);
 }
 
@@ -553,12 +585,23 @@ fn stage_lens_profile(
             }
             let mut rgb = sample_bilinear(&src, w, h, sx, sy);
             if ca && r_px > 1e-4 {
+                let red_points = if adj.ca_red_points.is_empty() { &warp.red } else { &adj.ca_red_points };
+                let blue_points = if adj.ca_blue_points.is_empty() { &warp.blue } else { &adj.ca_blue_points };
                 let offset = |shift: &[(f32, f32)]| -> f32 {
                     let f = r_px / half_diag + LensWarp::sample(shift, t);
                     f * half_diag / r_px
                 };
-                rgb[0] = sample_bilinear(&src, w, h, cx + dx * offset(&warp.red), cy + dy * offset(&warp.red))[0];
-                rgb[2] = sample_bilinear(&src, w, h, cx + dx * offset(&warp.blue), cy + dy * offset(&warp.blue))[2];
+                let red_offset = offset(red_points);
+                let blue_offset = offset(blue_points);
+                let normal = r_px / half_diag;
+                if (red_offset - normal).abs() > 1e-5 {
+                    rgb[0] =
+                        sample_bilinear(&src, w, h, cx + dx * red_offset, cy + dy * red_offset)[0];
+                }
+                if (blue_offset - normal).abs() > 1e-5 {
+                    rgb[2] =
+                        sample_bilinear(&src, w, h, cx + dx * blue_offset, cy + dy * blue_offset)[2];
+                }
             }
             if falloff > 0.0 {
                 // Table EV is a loss (negative toward the corner); undo it.
@@ -741,7 +784,210 @@ mod tests {
         }
     }
 
-    /// Per-stage cost on a Draft-sized frame. `cargo test -p lumen-engine
+    /// The CUDA detail path must reproduce the CPU stages byte for byte.
+    /// Skipped unless `AURORA_DETAIL_GPU` is set; CI stays CPU-only.
+    #[cfg(windows)]
+    #[test]
+    fn cuda_detail_matches_the_cpu_stages() {
+        if !detail_gpu::enabled() {
+            eprintln!("skipping: AURORA_DETAIL_GPU is not set");
+            return;
+        }
+        let (w, h) = (64usize, 48usize);
+        let base: Vec<u8> = (0..w * h * 4).map(|i| ((i * 73 + i / 7) % 256) as u8).collect();
+        let adj = crate::AdjustmentSet {
+            noise_reduction: NoiseReduction {
+                luminance: 60.0,
+                details: 35.0,
+                color: 40.0,
+                single_pixel: 20.0,
+            },
+            sharpening: Sharpening {
+                amount: 180.0,
+                radius: 0.8,
+                threshold: 1.0,
+                halo_suppression: 20.0,
+            },
+            moire: Moire {
+                amount: 60.0,
+                pattern: 50.0,
+            },
+            ..Default::default()
+        };
+        let mut cpu = base.clone();
+        let saved = std::env::var_os("AURORA_DETAIL_GPU");
+        unsafe { std::env::remove_var("AURORA_DETAIL_GPU") };
+        post_process(&mut cpu, w as u32, h as u32, &adj, 1.0);
+        unsafe { std::env::set_var("AURORA_DETAIL_GPU", "1") };
+        let mut gpu = base.clone();
+        post_process(&mut gpu, w as u32, h as u32, &adj, 1.0);
+        assert_eq!(gpu, cpu, "CUDA detail must match the CPU stages");
+        assert!(detail_gpu::post_process(
+            &mut gpu,
+            w,
+            h,
+            &adj.noise_reduction,
+            &adj.moire,
+            &adj.sharpening,
+            &adj.lens,
+            1.0
+        ));
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("AURORA_DETAIL_GPU", value),
+                None => std::env::remove_var("AURORA_DETAIL_GPU"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real NEF and an NVIDIA CUDA device"]
+    fn cuda_detail_matches_real_nef_and_benchmarks() {
+        use std::path::Path;
+        use std::time::Instant;
+
+        let path = std::env::var("AURORA_DETAIL_BENCH_NEF")
+            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+        let image = crate::raw::decode(Path::new(&path)).expect("decode NEF");
+        assert_eq!(
+            crate::raw::from_sensor(Path::new(&path)),
+            Some(true),
+            "libraw fell back to the embedded preview"
+        );
+        let (w, h) = image.dimensions();
+        let original = image.into_raw();
+        let mut adj = crate::AdjustmentSet::default();
+        adj.noise_reduction = NoiseReduction {
+            luminance: 50.0,
+            details: 50.0,
+            color: 50.0,
+            single_pixel: 0.0,
+        };
+        adj.moire = Moire {
+            amount: 50.0,
+            pattern: 50.0,
+        };
+        adj.lens = LensCorrection {
+            profile: None,
+            use_profile: false,
+            distortion: 30.0,
+            sharpness_falloff: 0.0,
+            light_falloff: 30.0,
+            chromatic_aberration: true,
+            purple_fringing: 40.0,
+            hide_distorted_areas: false,
+            ca_red_points: Vec::new(),
+            ca_blue_points: Vec::new(),
+            shift_x: 0.0,
+            shift_y: 0.0,
+        };
+        adj.sharpening = Sharpening {
+            amount: 160.0,
+            radius: 0.8,
+            threshold: 1.0,
+            halo_suppression: 0.0,
+        };
+
+        let saved = std::env::var_os("AURORA_DETAIL_GPU");
+        unsafe { std::env::remove_var("AURORA_DETAIL_GPU") };
+        let mut cpu = original.clone();
+        post_process(&mut cpu, w, h, &adj, 1.0);
+
+        let gpu = detail_gpu::open_for_bench().expect("CUDA context");
+        let pixels = w as usize * h as usize;
+        let pool = gpu.alloc_buffer(pixels * 4 * 6).expect("device pool");
+        let lut = gpu.alloc_buffer(1025 * 4).expect("device lut");
+        let run_gpu = |buf: &mut [u8]| {
+            detail_gpu::post_process_pool(
+                &gpu,
+                buf,
+                w as usize,
+                h as usize,
+                &adj.noise_reduction,
+                &adj.moire,
+                &adj.sharpening,
+                &adj.lens,
+                1.0,
+                &pool,
+                Some(&lut),
+            )
+            .expect("CUDA detail launch");
+        };
+        let mut gpu_frame = original.clone();
+        run_gpu(&mut gpu_frame);
+
+        let (mut max_diff, mut over1, mut diff_px) = (0i32, 0usize, 0usize);
+        for (a, b) in cpu.chunks_exact(4).zip(gpu_frame.chunks_exact(4)) {
+            let mut px_diff = false;
+            for k in 0..3 {
+                let d = (a[k] as i32 - b[k] as i32).abs();
+                max_diff = max_diff.max(d);
+                over1 += usize::from(d > 1);
+                px_diff |= d > 0;
+            }
+            diff_px += usize::from(px_diff);
+        }
+
+        let mut cpu_ms = Vec::new();
+        let mut gpu_pool_ms = Vec::new();
+        let mut gpu_alloc_ms = Vec::new();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let mut frame = original.clone();
+            unsafe { std::env::remove_var("AURORA_DETAIL_GPU") };
+            post_process(&mut frame, w, h, &adj, 1.0);
+            cpu_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+            let start = Instant::now();
+            let mut frame = original.clone();
+            run_gpu(&mut frame);
+            gpu_pool_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+            let start = Instant::now();
+            let mut frame = original.clone();
+            detail_gpu::post_process_with(
+                &gpu,
+                &mut frame,
+                w as usize,
+                h as usize,
+                &adj.noise_reduction,
+                &adj.moire,
+                &adj.sharpening,
+                &adj.lens,
+                1.0,
+            )
+            .expect("CUDA detail allocate-and-run");
+            gpu_alloc_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        cpu_ms.sort_by(f64::total_cmp);
+        gpu_pool_ms.sort_by(f64::total_cmp);
+        gpu_alloc_ms.sort_by(f64::total_cmp);
+        println!(
+            "DETAIL_REAL nef={path} w={w} h={h} cpu_p50_ms={:.1} cpu_p95_ms={:.1} \
+gpu_pool_p50_ms={:.1} gpu_pool_p95_ms={:.1} gpu_alloc_p50_ms={:.1} \
+gpu_alloc_p95_ms={:.1} speedup_pool_p50={:.2} speedup_alloc_p50={:.2} max_diff={max_diff} \
+over1={over1} diff_px={diff_px}",
+            cpu_ms[1],
+            cpu_ms[2],
+            gpu_pool_ms[1],
+            gpu_pool_ms[2],
+            gpu_alloc_ms[1],
+            gpu_alloc_ms[2],
+            cpu_ms[1] / gpu_pool_ms[1],
+            cpu_ms[1] / gpu_alloc_ms[1],
+        );
+        assert!(max_diff <= 1, "max diff {max_diff}, over1 {over1}");
+
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("AURORA_DETAIL_GPU", value),
+                None => std::env::remove_var("AURORA_DETAIL_GPU"),
+            }
+        }
+    }
+
+    /// Per-stage cost on a Draft-sized frame. `cargo test -p aurora-engine
     /// bench_detail_stages -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing benchmark, run explicitly with --ignored"]
@@ -811,6 +1057,8 @@ mod tests {
             hide_distorted_areas: false,
             shift_x: 0.0,
             shift_y: 0.0,
+            ca_red_points: Vec::new(),
+            ca_blue_points: Vec::new(),
         };
         adj
     }
@@ -1089,6 +1337,21 @@ mod tests {
                 buf[(y * size + x) * 4 + 3] = 255;
             }
         }
+
+        buf
+    }
+
+    fn axis_gradient(size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; size * size * 4];
+        for y in 0..size {
+            for x in 0..size {
+                let i = (y * size + x) * 4;
+                buf[i] = (200.0 - x as f32 * 2.0).clamp(0.0, 255.0).round() as u8;
+                buf[i + 1] = 100;
+                buf[i + 2] = (x as f32 * 2.0).clamp(0.0, 255.0).round() as u8;
+                buf[i + 3] = 255;
+            }
+        }
         buf
     }
 
@@ -1117,6 +1380,35 @@ mod tests {
         post_process_with_lens(&mut a, 48, 48, &adj, 1.0, Some(&warp(&[(0.0, 0.0), (1.0, 0.05)], &[(0.0, 0.0), (1.0, -1.0)])));
         post_process(&mut b, 48, 48, &adj, 1.0);
         assert_eq!(a, b, "the profile must be inert while use_profile is false");
+    }
+
+    #[test]
+    fn ca_zero_is_byte_identical() {
+        let mut buf = ring(48, 0.7);
+        let before = buf.clone();
+        let mut adj = off();
+        adj.lens.use_profile = true;
+        adj.lens.chromatic_aberration = true;
+        adj.lens.ca_red_points = vec![(0.0, 0.0), (1.0, 0.0)];
+        adj.lens.ca_blue_points = vec![(0.0, 0.0), (1.0, 0.0)];
+        post_process_with_lens(&mut buf, 48, 48, &adj, 1.0, Some(&warp(&[], &[])));
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn ca_moves_red_and_blue_in_opposite_directions() {
+        let mut buf = axis_gradient(64);
+        let before = buf.clone();
+        let mut adj = off();
+        adj.lens.use_profile = true;
+        adj.lens.chromatic_aberration = true;
+        adj.lens.ca_red_points = vec![(0.0, 0.0), (1.0, 0.04)];
+        adj.lens.ca_blue_points = vec![(0.0, 0.0), (1.0, -0.04)];
+        post_process_with_lens(&mut buf, 64, 64, &adj, 1.0, Some(&warp(&[], &[])));
+        let probe = (32 * 64 + 56) * 4;
+        assert!(buf[probe] < before[probe], "positive red shift must sample outward");
+        assert!(buf[probe + 2] < before[probe + 2], "negative blue shift must sample inward");
+        assert!(buf[probe + 1].abs_diff(before[probe + 1]) <= 8, "green must stay close");
     }
 
     #[test]

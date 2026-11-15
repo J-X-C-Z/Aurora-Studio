@@ -11,7 +11,7 @@ use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, PathPromptOptions,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::*;
+use aurora_engine::*;
 
 use crate::i18n::t;
 use crate::state::AppState;
@@ -134,7 +134,10 @@ fn recipe_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
     let Some(r) = s.recipes.get(s.selected_recipe).cloned() else {
         return div().into_any_element();
     };
-    let profiles = s.icc_profiles.clone();
+    let caps = s.capabilities.clone();
+    let query = s.icc_query.clone();
+    let profiles = s.icc_picker(Some(r.icc_profile.as_str()), &query);
+    let group = s.icc_group;
     let rid = r.id;
     let st = state.clone();
     let slider = |id: &'static str, label: &'static str, value: f32, min: f32, max: f32, f: fn(&mut ProcessRecipe, f32)| {
@@ -160,11 +163,11 @@ fn recipe_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
         .child(row(t("Name", "名称"), name_field, cx))
         .child(row(
             t("Format", "格式"),
-            select(format!("fmt-{rid}"), ExportFormat::ALL.iter().map(|f| (*f, crate::contract::format_label(*f).into())).collect(), r.format, move |f, _, cx| edit_recipe(&st, cx, |r| r.format = f)),
+            select(format!("fmt-{rid}"), ExportFormat::ALL.iter().map(|f| (*f, crate::contract::format_label(&caps, *f).into())).collect(), r.format, move |f, _, cx| edit_recipe(&st, cx, |r| r.format = f)),
             cx,
         ))
         .when(r.format.has_quality(), |d| d.child(slider("quality", t("Quality", "质量"), r.quality as f32, 1.0, 100.0, |r, v| r.quality = v.round() as u8)))
-        .when(r.format.has_bit_depth(), |d| {
+        .when(r.format.supports_bit_depth(16).is_ok(), |d| {
             let st = state.clone();
             d.child(row(
                 t("Bit Depth", "位深"),
@@ -175,11 +178,43 @@ fn recipe_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
             ))
         })
         .child(row(
+            t("ICC Search", "ICC 搜索"),
+            text_field(
+                format!("ricc-search-{rid}"),
+                query.clone(),
+                t("Filter by name", "按名称筛选"),
+                {
+                    let st = state.clone();
+                    move |v, _, cx| st.update(cx, |s, _| s.icc_query = v)
+                },
+                window,
+                cx,
+            ),
+            cx,
+        ))
+        .child(row(
+            t("ICC Group", "ICC 分组"),
+            {
+                let stg = state.clone();
+                Segmented::new(format!("ricc-group-{rid}"), group)
+                    .text(t("All", "全部")).text(t("Camera", "相机")).text(t("Looks", "风格")).text(t("Output", "输出"))
+                    .on_select(move |i, _, cx| {
+                        stg.update(cx, |s, _| {
+                            s.icc_group = i;
+                            s.settings.icc_group = i as u8;
+                            s.settings.save();
+                        })
+                    })
+            },
+            cx,
+        ))
+        .child(row(
             t("ICC Profile", "ICC 配置"),
             select(format!("ricc-{rid}"), std::iter::once((None, t("Default", "默认").into())).chain(profiles.iter().enumerate().map(|(i, p)| (Some(i), p.clone().into()))).collect(), icc_idx, {
                 let st = state.clone();
+                let profiles = profiles.clone();
                 move |i, _, cx| {
-                    let name = i.and_then(|i| st.read(cx).icc_profiles.get(i).cloned()).unwrap_or_default();
+                    let name = i.and_then(|i| profiles.get(i).cloned()).unwrap_or_default();
                     edit_recipe(&st, cx, |r| r.icc_profile = name)
                 }
             }),
@@ -334,7 +369,19 @@ fn queue_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                 JobStatus::Queued => (0.0, t("Queued", "排队中").to_string(), p.text_subtle, IconName::Clock),
                 JobStatus::Running { progress } => (*progress, format!("{:.0}%", progress * 100.0), p.accent, IconName::LoaderCircle),
                 JobStatus::Done { output } => (1.0, output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p.success, IconName::CircleCheck),
-                JobStatus::Failed { message } => (1.0, message.clone(), p.danger, IconName::CircleX),
+                JobStatus::Failed { message } => {
+                    let label = if message == t("Cancelled", "已取消") {
+                        message.clone()
+                    } else {
+                        match ExportErrorKind::of(message) {
+                            ExportErrorKind::Cancelled => t("Cancelled", "已取消").to_string(),
+                            ExportErrorKind::Unsupported => t("the format is not supported", "不支持该格式").to_string(),
+                            ExportErrorKind::Io => t("the file could not be written", "文件无法写入").to_string(),
+                            ExportErrorKind::Other => t("export failed (see log)", "导出失败（见日志）").to_string(),
+                        }
+                    };
+                    (1.0, label, p.danger, IconName::CircleX)
+                }
             };
             v_flex()
                 .px_3()

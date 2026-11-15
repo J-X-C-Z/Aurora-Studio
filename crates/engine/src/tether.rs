@@ -1211,7 +1211,7 @@ mod tests {
     }
 
     /// Needs a real camera on USB/PTP and `libgphoto2.so.6`; run with
-    /// `cargo test -p lumen-engine -- --ignored tether`.
+    /// `cargo test -p aurora-engine -- --ignored tether`.
     #[test]
     #[ignore]
     fn real_camera_captures_and_previews() {

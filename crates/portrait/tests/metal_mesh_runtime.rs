@@ -2,7 +2,7 @@
 //!
 //! Default `cargo test` only compiles these; every test is `#[ignore]`.
 //! Run on macOS with:
-//!   cargo test -p aurora-pixcake --test metal_mesh_runtime -- --ignored
+//!   cargo test -p aurora-portrait --test metal_mesh_runtime -- --ignored
 //!
 //! On non-macOS an explicit `--ignored` run panics instead of passing.
 //!
@@ -12,13 +12,13 @@
 //! `perspective_zero_and_negative_reciprocal_are_refused`,
 //! `perspective_vendor_contract_is_typed_refused`.
 
-use aurora_pixcake::metal::{MetalContext, MetalRefusal};
-use aurora_pixcake::metal_mesh::{
+use aurora_portrait::metal::{MetalContext, MetalRefusal};
+use aurora_portrait::metal_mesh::{
     perspective_uv, MeshContract, MeshContractRefusal, MeshRasterInput, PerspectiveMeshInput,
     VendorMeshEffect, MESH_RASTER_ABI_VERSION,
 };
-use aurora_pixcake::raster::{Cull, Edge, Overlap, Rules, Sampler, Winding, Wrap};
-use aurora_pixcake::Image;
+use aurora_portrait::raster::{Cull, Edge, Overlap, Rules, Sampler, Winding, Wrap};
+use aurora_portrait::Image;
 
 fn require_macos() {
     if !cfg!(target_os = "macos") {
@@ -624,7 +624,7 @@ fn invalid_input_is_refused_before_any_dispatch() {
     let context = MetalContext::new().expect("MetalContext");
     assert_eq!(
         context.mesh_raster(&input),
-        Err(aurora_pixcake::metal::MetalRefusal::ShapeMismatch("ebo"))
+        Err(aurora_portrait::metal::MetalRefusal::ShapeMismatch("ebo"))
     );
 }
 

@@ -13,7 +13,7 @@ use gpui_kit::component::{
 use gpui_kit::{App, Entity, ParentElement, Styled, Window, div, prelude::FluentBuilder as _, px};
 
 use crate::i18n::t;
-use crate::planned::{HdrOptions, PanoramaOptions, Projection};
+use crate::planned::{projection_label, HdrOptions, PanoramaOptions, Projection};
 use crate::state::{AppState, MergeKind};
 use crate::theme::pal;
 use crate::widgets::{ParamSlider, Segmented, row, select, switch_row};
@@ -58,7 +58,7 @@ pub fn open(state: &Entity<AppState>, kind: MergeKind, window: &mut Window, cx: 
                 v_flex()
                     .child(row(
                         t("Projection", "投影"),
-                        select("pano-projection", Projection::ALL.iter().map(|p| (*p, p.label().into())).collect(), o.projection, move |v, window, _| {
+                        select("pano-projection", Projection::ALL.iter().map(|p| (*p, projection_label(*p).into())).collect(), o.projection, move |v, window, _| {
                             a.borrow_mut().projection = v;
                             window.refresh();
                         }),

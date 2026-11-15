@@ -21,6 +21,10 @@ pub struct AdjustmentSet {
     pub dehaze: Dehaze,
     pub vignetting: Vignetting,
     pub color_balance: ColorBalance,
+    /// Capture One's `ColorBalance*` RGB multipliers, per tonal zone. Kept
+    /// beside the wheels so older documents (no field) read as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_balance_gains: Option<ColorBalanceGains>,
     pub color_editor: ColorEditor,
     pub black_white: BlackWhite,
     pub sharpening: Sharpening,
@@ -59,6 +63,10 @@ pub struct BaseCharacteristics {
     /// Camera input profile name; `None` means the engine's profile for the camera.
     pub icc_profile: Option<String>,
     pub curve: ToneCurvePreset,
+    /// Capture One Base Characteristics "Mode" (`TechnicalProcessingMethod`).
+    /// This is a processing branch, not a tone curve.
+    #[serde(default)]
+    pub processing_method: TechnicalProcessingMethod,
     /// Capture One `.fcrv` file name (`ZFILMCURVE`), applied to linear values
     /// before gamma. Keyed on the file name: the curve's embedded name does not
     /// match its content in Capture One's own files.
@@ -68,7 +76,42 @@ pub struct BaseCharacteristics {
 
 impl Default for BaseCharacteristics {
     fn default() -> Self {
-        Self { icc_profile: None, curve: ToneCurvePreset::Auto, film_curve: None, engine_version: "Lumen 1".into() }
+        Self {
+            icc_profile: None,
+            curve: ToneCurvePreset::Auto,
+            processing_method: TechnicalProcessingMethod::Photography,
+            film_curve: None,
+            engine_version: "Portrait 1".into(),
+        }
+    }
+}
+
+/// Capture One's Base Characteristics mode. Values match
+/// `P1.AppCore.TechnicalProcessingMethod`; 0 is ordinary photography.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TechnicalProcessingMethod {
+    #[default]
+    Photography = 0,
+    Scientific = 1,
+    ReproFilmNegatives = 2,
+    ReproFilmPositives = 3,
+    StandardFilmNegatives = 4,
+}
+
+impl TechnicalProcessingMethod {
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            1 => Self::Scientific,
+            2 => Self::ReproFilmNegatives,
+            3 => Self::ReproFilmPositives,
+            4 => Self::StandardFilmNegatives,
+            _ => Self::Photography,
+        }
+    }
+
+    pub fn is_film_negative(self) -> bool {
+        matches!(self, Self::ReproFilmNegatives | Self::StandardFilmNegatives)
     }
 }
 
@@ -157,11 +200,21 @@ pub struct WhiteBalance {
     pub tint: f32,
     /// Skin tone target picked from the skin-tone presets; engine-defined name.
     pub skin_tone: Option<String>,
+    /// Exact C1 `ZWHITEBALANCE` gains when the import had them. Rendering uses
+    /// these verbatim; K/T is then only the display pair. Any K/T edit clears
+    /// this so the sliders win again.
+    pub gains: Option<[f32; 3]>,
 }
 
 impl Default for WhiteBalance {
     fn default() -> Self {
-        Self { mode: WhiteBalanceMode::Shot, kelvin: 5600.0, tint: 0.0, skin_tone: None }
+        Self {
+            mode: WhiteBalanceMode::Shot,
+            kelvin: 5600.0,
+            tint: 0.0,
+            skin_tone: None,
+            gains: Some([1.0, 1.0, 1.0]),
+        }
     }
 }
 
@@ -578,6 +631,56 @@ pub struct ColorBalance {
     pub highlight: ColorWheel,
 }
 
+/// Capture One's `ColorBalance*` triples: per-zone RGB multipliers, 1.0 neutral.
+///
+/// They are applied after the [`ColorWheel`] stage. The zone order matches the
+/// `.copreset` keys and the `ZCOLORBALANCE*` columns: master, shadow, midtone,
+/// highlight.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColorBalanceGains {
+    pub master: [f32; 3],
+    pub shadow: [f32; 3],
+    pub midtone: [f32; 3],
+    pub highlight: [f32; 3],
+}
+
+impl Default for ColorBalanceGains {
+    fn default() -> Self {
+        Self {
+            master: [1.0; 3],
+            shadow: [1.0; 3],
+            midtone: [1.0; 3],
+            highlight: [1.0; 3],
+        }
+    }
+}
+
+impl ColorBalanceGains {
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `0 = master, 1 = shadow, 2 = midtone, 3 = highlight`.
+    pub fn zone(&self, index: usize) -> [f32; 3] {
+        match index {
+            0 => self.master,
+            1 => self.shadow,
+            2 => self.midtone,
+            _ => self.highlight,
+        }
+    }
+
+    pub fn set_zone(&mut self, index: usize, value: [f32; 3]) {
+        match index {
+            0 => self.master = value,
+            1 => self.shadow = value,
+            2 => self.midtone = value,
+            _ => self.highlight = value,
+        }
+    }
+}
+
 /// The eight hue sectors of the basic color editor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HueSector {
@@ -659,6 +762,10 @@ pub struct ColorBand {
     /// Band edges relative to the selected saturation, percentage points.
     pub sat_low: f32,
     pub sat_high: f32,
+    /// Band edges on HSV V, absolute 0 ..= 1. C1 stores no value band, so the
+    /// full range keeps imported bands byte-identical.
+    pub value_low: f32,
+    pub value_high: f32,
     /// Feather half-width of the band edge, degrees (C1: 1 ..= 29.1).
     pub smoothness: f32,
     /// Pull toward the selected hue/saturation/lightness, 0 ..= 100.
@@ -677,6 +784,8 @@ impl Default for ColorBand {
             hue_high: 25.0,
             sat_low: -100.0,
             sat_high: 100.0,
+            value_low: 0.0,
+            value_high: 1.0,
             smoothness: 10.0,
             homogeneity: [0.0; 3],
             inverted: false,
@@ -884,6 +993,9 @@ pub struct LensCorrection {
     pub sharpness_falloff: f32,
     pub light_falloff: f32,
     pub chromatic_aberration: bool,
+    /// C1's red/blue CA splines, normalized to the first radius.
+    pub ca_red_points: Vec<(f32, f32)>,
+    pub ca_blue_points: Vec<(f32, f32)>,
     pub purple_fringing: f32,
     pub hide_distorted_areas: bool,
     /// -100 ..= 100, a manual movement/shift of the optical center.
@@ -900,6 +1012,8 @@ impl Default for LensCorrection {
             sharpness_falloff: 0.0,
             light_falloff: 0.0,
             chromatic_aberration: false,
+            ca_red_points: Vec::new(),
+            ca_blue_points: Vec::new(),
             purple_fringing: 0.0,
             hide_distorted_areas: true,
             shift_x: 0.0,
@@ -1017,6 +1131,10 @@ pub enum SpotKind {
     #[default]
     Dust,
     Spot,
+    /// Copy a source patch instead of synthesising pixels. `src_offset` is the
+    /// source point minus the spot centre, in pixels of the oriented, uncropped
+    /// source image (the same frame the viewer draws).
+    Clone { src_offset: (i32, i32) },
 }
 
 /// A spot-removal circle in normalized image space.
@@ -1062,8 +1180,8 @@ mod tests {
     fn as_shot_inverts_exif_gains() {
         let wb = WhiteBalance { mode: WhiteBalanceMode::Shot, ..Default::default() };
         let (kelvin, tint) = wb.resolved(Some([1.625, 1.0, 1.412]), [0.5; 3]);
-        assert!((kelvin - 5648.0).abs() < 20.0, "{kelvin}");
-        assert!((tint + 41.5).abs() < 1.0, "{tint}");
+        assert!((kelvin - 4779.55).abs() < 2.0, "{kelvin}");
+        assert!((tint + 4.4875).abs() < 0.05, "{tint}");
     }
 
     #[test]
@@ -1082,7 +1200,13 @@ mod tests {
         assert!(auto_from_mean(warm).0 < 5600.0);
         let green = [0.5, 0.55, 0.5];
         assert!(auto_from_mean(green).1 > 0.0);
-        let wb = WhiteBalance { mode: WhiteBalanceMode::Auto, kelvin: 1234.0, tint: 9.0, skin_tone: None };
+        let wb = WhiteBalance {
+            mode: WhiteBalanceMode::Auto,
+            kelvin: 1234.0,
+            tint: 9.0,
+            skin_tone: None,
+            gains: None,
+        };
         assert_eq!(wb.resolved(None, warm), auto_from_mean(warm));
     }
 
@@ -1096,6 +1220,18 @@ mod tests {
         assert_eq!(wb.resolved(None, [0.5; 3]), auto_from_mean([0.5; 3]));
     }
 
+    /// The reference Z6_3 frame: C1 stores gains `1.625;1.000;1.412`, which
+    /// resolve to its 4779.6 K / -4.5 tint.
+    #[test]
+    fn as_shot_reads_the_real_nef_gains() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
+        let block = crate::read_nikon_info_block(&path).expect("sample header parses");
+        let gains = block.white_balance_gains().expect("MakerNote WB gains");
+        let wb = WhiteBalance { mode: WhiteBalanceMode::Shot, ..Default::default() };
+        let (kelvin, tint) = wb.resolved(Some(gains), [0.5; 3]);
+        assert!((kelvin - 4779.55).abs() < 2.0, "{kelvin}");
+        assert!((tint + 4.4875).abs() < 0.05, "{tint}");
+    }
 
     fn s_curve() -> Curve {
         Curve {
@@ -1260,6 +1396,18 @@ mod tests {
         assert!((got[1] - 0.5 * k).abs() < 1e-5, "{got:?}");
     }
 
+    /// Documents written before `color_balance_gains` existed carry no field and
+    /// must read back as `None`; a default document must not start writing it.
+    #[test]
+    fn old_documents_read_color_balance_gains_as_none() {
+        let a: AdjustmentSet =
+            serde_json::from_str(r#"{"exposure":{"exposure":0.5}}"#).expect("old document");
+        assert_eq!(a.exposure.exposure, 0.5);
+        assert_eq!(a.color_balance_gains, None);
+        let text = serde_json::to_string(&AdjustmentSet::default()).expect("serializes");
+        assert!(!text.contains("color_balance_gains"), "{text}");
+    }
+
     #[test]
     fn levels_identity_is_identity() {
         let levels = Levels::default();
@@ -1354,7 +1502,4 @@ mod tests {
             assert!(close(channel.map(input / 255.0), expected), "{input} -> {}", channel.map(input / 255.0));
         }
     }
-
-    #[cfg(feature = "external-fixtures")]
-    include!("../local-fixtures/adjust-tests.rs");
 }

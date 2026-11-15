@@ -6,10 +6,10 @@
 //! parser. The parser's classes are background, hair, body skin, face skin,
 //! clothing and a held object; there is no eye or lip class. Sky has no model
 //! at all, so it is a colour heuristic over the subject mask.
-//! `LUMEN_AIMODELS` points at a folder holding copies of the two files, for
+//! `AURORA_AIMODELS` points at a folder holding copies of the two files, for
 //! machines without Capture One.
 //!
-//! `LUMEN_ORT_LIB` overrides the ONNX Runtime library. Everything degrades to a
+//! `AURORA_ORT_LIB` overrides the ONNX Runtime library. Everything degrades to a
 //! warning when either is missing; nothing here panics.
 
 mod ort;
@@ -92,7 +92,7 @@ pub fn lookup(key: &str) -> Option<Arc<MaskPlane>> {
 /// Folders a Capture One install keeps its models and `onnxruntime.dll` in.
 pub(crate) fn c1_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(dir) = std::env::var_os("LUMEN_C1_DIR") {
+    if let Some(dir) = std::env::var_os("AURORA_C1_DIR") {
         roots.push(PathBuf::from(dir));
     }
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
@@ -110,7 +110,7 @@ fn model_candidates(name: &str) -> Vec<PathBuf> {
         _ => "AIModels/Common",
     };
     let mut paths = Vec::new();
-    if let Some(dir) = std::env::var_os("LUMEN_AIMODELS") {
+    if let Some(dir) = std::env::var_os("AURORA_AIMODELS") {
         let dir = PathBuf::from(dir);
         paths.push(dir.join(name));
         paths.push(dir.join(subfolder).join(name));
@@ -132,7 +132,7 @@ pub(crate) fn model_path(name: &str) -> Result<PathBuf> {
         return Ok(path.clone());
     }
     bail!(
-        "AI model {name} not found; set LUMEN_AIMODELS to a folder with the file (looked in {})",
+        "AI model {name} not found; set AURORA_AIMODELS to a folder with the file (looked in {})",
         candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
     )
 }
@@ -141,6 +141,17 @@ pub(crate) fn model_path(name: &str) -> Result<PathBuf> {
 /// opening the ONNX session.
 pub fn model_available(name: &str) -> bool {
     model_candidates(name).iter().any(|path| path.is_file())
+}
+
+/// Builds the reusable ONNX sessions ahead of the first interactive mask.
+/// This only runs when models are installed and never performs an inference.
+pub fn prewarm_models() -> Result<()> {
+    for name in ["subjectMasking.onnx", "skinMasking.onnx"] {
+        if model_available(name) {
+            Segmenter::load(name)?;
+        }
+    }
+    Ok(())
 }
 
 /// A loaded model plus what its metadata says about the tensors.
@@ -157,8 +168,8 @@ pub(crate) struct Segmenter {
 impl Segmenter {
     fn load(name: &str) -> Result<Arc<Segmenter>> {
         static MODELS: OnceLock<Mutex<HashMap<String, Arc<Segmenter>>>> = OnceLock::new();
-        let models = MODELS.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(model) = models.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+        let mut models = MODELS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(model) = models.get(name) {
             return Ok(model.clone());
         }
         let path = model_path(name)?;
@@ -184,10 +195,7 @@ impl Segmenter {
             .unwrap_or(1) as usize;
         let out_nchw = channels > 1 && out_dims.get(1) == Some(&(channels as i64));
         let model = Arc::new(Segmenter { session, path: path.clone(), in_w, in_h, nchw, channels, out_nchw });
-        models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string(), model.clone());
+        models.insert(name.to_string(), model.clone());
         Ok(model)
     }
 
@@ -312,6 +320,47 @@ pub fn people_class_mask(rgba: &[u8], w: u32, h: u32, class: PeopleClass) -> Res
     Ok(resample(&plane, model.in_w, model.in_h, w, h))
 }
 
+/// Face skin, body skin and hair from one parser inference.
+pub struct PeopleMasks {
+    pub face: Vec<f32>,
+    pub body: Vec<f32>,
+    pub hair: Vec<f32>,
+}
+
+/// Runs the people parser once and resamples the three portrait classes.
+pub fn people_masks(rgba: &[u8], w: u32, h: u32) -> Result<PeopleMasks> {
+    let (w, h) = (w as usize, h as usize);
+    check_rgba(rgba, w, h)?;
+    if w == 0 || h == 0 {
+        return Ok(PeopleMasks {
+            face: Vec::new(),
+            body: Vec::new(),
+            hair: Vec::new(),
+        });
+    }
+    let model = Segmenter::load("skinMasking.onnx")?;
+    let mut input = model.input_tensor(rgba, w, h);
+    let out = model.run(&mut input)?;
+    let pixels = model.in_w * model.in_h;
+    let classes = model.channels.max(1);
+    if out.len() < pixels * classes {
+        bail!(
+            "skinMasking.onnx returned {} values, expected {}",
+            out.len(),
+            pixels * classes
+        );
+    }
+    let plane = |class| {
+        let values = class_plane(&out, pixels, classes, model.out_nchw, class);
+        resample(&values, model.in_w, model.in_h, w, h)
+    };
+    Ok(PeopleMasks {
+        face: plane(PeopleClass::FaceSkin as usize),
+        body: plane(PeopleClass::BodySkin as usize),
+        hair: plane(PeopleClass::Hair as usize),
+    })
+}
+
 /// Per-pixel softmax probability of `class`, in model resolution.
 fn class_plane(out: &[f32], pixels: usize, classes: usize, out_nchw: bool, class: usize) -> Vec<f32> {
     let class = class.min(classes.saturating_sub(1));
@@ -391,6 +440,13 @@ pub fn model_summary(name: &str) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// The execution provider a model session actually opened on.
+pub fn model_provider(name: &str) -> Option<&'static str> {
+    Segmenter::load(name)
+        .ok()
+        .map(|model| model.session.provider().label())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +457,45 @@ mod tests {
         assert!(skin_mask(&[], 0, 0).unwrap().is_empty());
         assert!(hair_mask(&[], 0, 0).unwrap().is_empty());
         assert!(sky_mask(&[], 0, 0).unwrap().is_empty());
+    }
+
+    /// Cold (model load + session creation) and warm inference for both models,
+    /// so a provider can be compared on the same machine. Iteration 0 is cold;
+    /// the median of the rest is warm.
+    #[test]
+    #[ignore = "needs Capture One's ONNX models; prints cold and warm inference times"]
+    fn bench_real_models_cold_and_warm() {
+        let (w, h) = (640u32, 480u32);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let sky = y < h / 3;
+                let subject = (x as i32 - w as i32 / 2).abs() < 120 && y > h / 3;
+                let px = if sky { [90, 140, 220] } else if subject { [200, 150, 120] } else { [40, 40, 45] };
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        let runs = 6;
+        let benches: [(&str, fn(&[u8], u32, u32) -> Result<Vec<f32>>); 2] =
+            [("subject", subject_mask), ("skin", skin_mask)];
+        for (name, run) in benches {
+            let mut times = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let start = std::time::Instant::now();
+                let mask = run(&rgba, w, h).expect("model");
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(mask.len(), (w * h) as usize);
+            }
+            let mut warm = times[1..].to_vec();
+            warm.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let median = warm[warm.len() / 2];
+            println!(
+                "{name}: cold {:.0} ms, warm median {:.0} ms over {} runs",
+                times[0],
+                median,
+                runs - 1
+            );
+        }
     }
 
     #[test]
@@ -489,7 +584,7 @@ mod tests {
         );
     }
 
-    /// `LUMEN_AIMODELS=~/agents/evidence cargo test -p lumen-engine -- --ignored`
+    /// `AURORA_AIMODELS=~/agents/evidence cargo test -p aurora-engine -- --ignored`
     #[test]
     #[ignore = "needs Capture One's ONNX models"]
     fn real_models_produce_a_mask() {
@@ -523,6 +618,107 @@ mod tests {
         }
     }
 
+    fn print_profile_summary(path: &std::path::Path) -> Result<()> {
+        let profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path)?).context("reading ORT profile")?;
+        let events = profile
+            .as_array()
+            .or_else(|| profile.get("traceEvents").and_then(|v| v.as_array()))
+            .context("ORT profile has no traceEvents")?;
+        let mut providers = std::collections::BTreeMap::<String, (usize, f64)>::new();
+        let mut nodes = std::collections::BTreeMap::<String, (usize, f64)>::new();
+        for event in events {
+            if event.get("cat").and_then(|v| v.as_str()) != Some("Node") {
+                continue;
+            }
+            let args = event.get("args");
+            let provider = args
+                .and_then(|v| v.get("provider"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let op = args
+                .and_then(|v| v.get("op_name"))
+                .and_then(|v| v.as_str())
+                .or_else(|| event.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("unknown");
+            let duration_us = event.get("dur").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let total = providers.entry(provider.to_string()).or_default();
+            total.0 += 1;
+            total.1 += duration_us;
+            let total = nodes.entry(format!("{provider}:{op}")).or_default();
+            total.0 += 1;
+            total.1 += duration_us;
+        }
+        println!("profile: {}", path.display());
+        for (provider, (count, duration_us)) in &providers {
+            println!("provider {provider}: nodes={count} total={:.3} ms", duration_us / 1000.0);
+        }
+        let mut nodes: Vec<_> = nodes.into_iter().collect();
+        nodes.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        for (node, (count, duration_us)) in nodes.into_iter().take(8) {
+            println!("node {node}: runs={count} total={:.3} ms", duration_us / 1000.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "needs Capture One's ONNX models and AURORA_ORT_PROFILE_DIR"]
+    fn real_models_coldstart_and_node_profile() {
+        let (w, h) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| [180u8, 160, 140, 255]).collect();
+        let runtime_start = std::time::Instant::now();
+        Runtime::get().expect("ONNX Runtime");
+        println!("runtime load {:.3} ms", runtime_start.elapsed().as_secs_f64() * 1000.0);
+        for (name, run) in [
+            ("subjectMasking.onnx", subject_mask as fn(&[u8], u32, u32) -> Result<Vec<f32>>),
+            ("skinMasking.onnx", skin_mask as fn(&[u8], u32, u32) -> Result<Vec<f32>>),
+        ] {
+            let session_start = std::time::Instant::now();
+            let model = Segmenter::load(name).expect("model session");
+            let session_ms = session_start.elapsed().as_secs_f64() * 1000.0;
+            let first_start = std::time::Instant::now();
+            let first_mask = run(&rgba, w, h).expect("first inference");
+            let first_ms = first_start.elapsed().as_secs_f64() * 1000.0;
+            let hash = first_mask.iter().fold(0xcbf29ce484222325u64, |hash, value| {
+                (hash ^ u64::from(value.to_bits())).wrapping_mul(0x100000001b3)
+            });
+            let mut warm = Vec::new();
+            for _ in 0..4 {
+                let start = std::time::Instant::now();
+                run(&rgba, w, h).expect("warm inference");
+                warm.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            warm.sort_by(f64::total_cmp);
+            println!(
+                "{name}: provider={} session={session_ms:.3} ms first={first_ms:.3} ms warm_p50={:.3} ms hash={hash:016x}",
+                model.session.provider().label(),
+                warm[1]
+            );
+            if let Some(path) = model.session.end_profiling().expect("end ORT profiling") {
+                print_profile_summary(&path).expect("summarize ORT profile");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs Capture One's ONNX models"]
+    fn real_models_are_ready_after_prewarm() {
+        let (w, h) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| [180u8, 160, 140, 255]).collect();
+        let start = std::time::Instant::now();
+        prewarm_models().expect("prewarm");
+        let prewarm_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let subject_start = std::time::Instant::now();
+        subject_mask(&rgba, w, h).expect("subject after prewarm");
+        let subject_ms = subject_start.elapsed().as_secs_f64() * 1000.0;
+        let skin_start = std::time::Instant::now();
+        skin_mask(&rgba, w, h).expect("skin after prewarm");
+        let skin_ms = skin_start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "prewarm={prewarm_ms:.3} ms subject_first={subject_ms:.3} ms skin_first={skin_ms:.3} ms"
+        );
+    }
+
     /// The same models through `FileEngine`: compute, cache, and the kinds no
     /// model covers.
     #[test]
@@ -532,7 +728,7 @@ mod tests {
 
         let (w, h) = (320u32, 240u32);
         let rgba: Vec<u8> = (0..w * h).flat_map(|_| [180u8, 160, 140, 255]).collect();
-        let dir = std::env::temp_dir().join(format!("lumen-aimask-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portrait-aimask-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         image::RgbaImage::from_raw(w, h, rgba).unwrap().save(dir.join("frame.png")).unwrap();
 

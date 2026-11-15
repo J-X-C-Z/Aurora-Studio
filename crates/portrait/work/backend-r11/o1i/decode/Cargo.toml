@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "teeth-decode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

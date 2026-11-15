@@ -8,7 +8,7 @@ use gpui_kit::{
     App, IntoElement, ObjectFit, ParentElement, RenderImage, RenderOnce, SharedString, Styled, StyledImage as _, Window,
     div, img, prelude::FluentBuilder as _, px, relative,
 };
-use lumen_engine::ColorWheel;
+use aurora_engine::ColorWheel;
 
 use super::surface::{Pointer, Surface};
 use crate::motion;

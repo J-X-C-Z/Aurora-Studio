@@ -4,10 +4,10 @@
 
 #[cfg(windows)]
 mod blend_gpu {
-    use aurora_pixcake::cuda::CudaError;
-    use aurora_pixcake::cuda_texture_blend::{Blend, KERNEL};
-    use aurora_pixcake::kernels::texture_mask_blend::{self, NormalBlend};
-    use aurora_pixcake::Image;
+    use aurora_portrait::cuda::CudaError;
+    use aurora_portrait::cuda_texture_blend::{Blend, KERNEL};
+    use aurora_portrait::kernels::texture_mask_blend::{self, NormalBlend};
+    use aurora_portrait::Image;
 
     fn gpu() -> Option<Blend> {
         match Blend::open() {
@@ -15,7 +15,7 @@ mod blend_gpu {
             Err(CudaError::Unavailable(reason)) => {
                 eprintln!("SKIP_NO_NVIDIA_DRIVER: {reason}");
                 assert!(
-                    std::env::var_os("PIXCAKE_CUDA_REQUIRED").is_none(),
+                    std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
                     "CUDA required but unavailable: {reason}"
                 );
                 None
@@ -167,7 +167,7 @@ mod blend_gpu {
     /// Non-finite and misshapen inputs must be refused before any dispatch.
     #[test]
     fn refusals_match_the_cpu_lane() {
-        use aurora_pixcake::Refusal;
+        use aurora_portrait::Refusal;
 
         let Some(gpu) = gpu() else { return };
         let original = original(8, 6);

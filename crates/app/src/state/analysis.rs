@@ -2,7 +2,7 @@
 //! Match Look. Each runs in the background, applies what it found as ordinary
 //! undoable edits, and reports a one-line summary, including what failed and why.
 
-use lumen_engine::{AdjustmentSet, EyeReport, ImageId};
+use aurora_engine::{AdjustmentSet, EyeReport, ImageId};
 use gpui_kit::{AppContext as _, Context};
 
 use super::AppState;
@@ -170,7 +170,7 @@ impl AppState {
         }
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
-            let results: Vec<(ImageId, anyhow::Result<lumen_engine::MatchLook>)> =
+            let results: Vec<(ImageId, anyhow::Result<aurora_engine::MatchLook>)> =
                 cx.background_spawn(async move { targets.into_iter().map(|id| (id, engine.match_look(reference, id))).collect() }).await;
             this.update(cx, |this, cx| {
                 this.analysing = false;
@@ -222,6 +222,7 @@ mod tests {
         look.exposure.exposure = 0.7;
         look.exposure.contrast = -40.0;
         look.white_balance.kelvin = 6100.0;
+        look.white_balance.gains = None;
         overlay_look(&mut dst, &look);
         assert_eq!(dst.exposure.exposure, 0.7);
         assert_eq!(dst.exposure.contrast, 12.0);

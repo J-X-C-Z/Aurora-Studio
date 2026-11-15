@@ -317,13 +317,13 @@ pub fn load_lens_database(path: &Path) -> Result<Vec<LensProfile>> {
 
 /// The installed Capture One lens database, loaded once on first use.
 ///
-/// `LUMEN_LENS_DB` overrides the path so a machine without Capture One can
+/// `AURORA_LENS_DB` overrides the path so a machine without Capture One can
 /// point at a copy; without either the empty database means no calibrated
 /// correction is available and the generic formula stays in charge.
 pub fn default_database() -> Option<&'static [LensProfile]> {
     static DB: OnceLock<Option<Vec<LensProfile>>> = OnceLock::new();
     DB.get_or_init(|| {
-        let path = std::env::var_os("LUMEN_LENS_DB")
+        let path = std::env::var_os("AURORA_LENS_DB")
             .map(PathBuf::from)
             .or_else(|| Some(PathBuf::from(r"C:\Program Files\Capture One\Capture One\lensDatabase.cdx")))
             .filter(|p| p.is_file())?;
@@ -332,53 +332,301 @@ pub fn default_database() -> Option<&'static [LensProfile]> {
     .as_deref()
 }
 
+/// Why an EXIF lens name did not resolve to a database profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissReason {
+    /// EXIF reported no lens model at all.
+    EmptyModel,
+    /// No profile with a matching name exists; the database is missing this lens.
+    ProfileAbsent,
+    /// A profile shares the query as a prefix but adds a suffix (e.g. `USM` vs
+    /// `USM DS`); choosing either one would be a guess.
+    AmbiguousSuffix,
+    /// The name matches but every match excludes the reported focal length.
+    FocalOutOfRange,
+    /// The name matches but the body make and lens brand disagree.
+    BrandMismatch,
+}
+
+/// How a profile was matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    /// EXIF make and model already equal the stored brand and name.
+    Exact,
+    /// A hit after brand/legal-suffix/name canonicalization.
+    Normalized,
+}
+
+/// Result of an EXIF lookup, including the reason for a miss.
+#[derive(Debug, Clone, Copy)]
+pub enum LensMatch<'a> {
+    Hit { lens: &'a LensProfile, kind: MatchKind },
+    Miss(MissReason),
+}
+
+impl<'a> LensMatch<'a> {
+    pub fn lens(self) -> Option<&'a LensProfile> {
+        match self {
+            LensMatch::Hit { lens, .. } => Some(lens),
+            LensMatch::Miss(_) => None,
+        }
+    }
+
+    pub fn kind(self) -> Option<MatchKind> {
+        match self {
+            LensMatch::Hit { kind, .. } => Some(kind),
+            LensMatch::Miss(_) => None,
+        }
+    }
+
+    pub fn reason(self) -> Option<MissReason> {
+        match self {
+            LensMatch::Miss(reason) => Some(reason),
+            LensMatch::Hit { .. } => None,
+        }
+    }
+}
+
+/// Shared corporate suffixes, in the punctuation-free form produced by
+/// [`normalize`]. Stripped repeatedly so `RICOH IMAGING COMPANY, LTD.` folds
+/// down to `ricoh`.
+const CORPORATE_SUFFIXES: &[&str] = &[
+    "corporation",
+    "incorporated",
+    "company",
+    "limited",
+    "coltd",
+    "ltd",
+    "inc",
+    "corp",
+    "gmbh",
+    "imaging",
+    "camera",
+    "digital",
+    "solutions",
+];
+
+/// Canonical brand key for both EXIF `Make` and database `brand`.
+pub fn canonical_brand(value: &str) -> String {
+    let mut key = normalize(value);
+    loop {
+        let mut changed = false;
+        for suffix in CORPORATE_SUFFIXES {
+            if key.len() > suffix.len() + 1 && key.ends_with(suffix) {
+                key.truncate(key.len() - suffix.len());
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    match key.as_str() {
+        "carlzeiss" => "zeiss".to_string(),
+        "om" => "omsystem".to_string(),
+        "phaseoneas" => "phaseone".to_string(),
+        "leicacameraag" | "leicaag" => "leica".to_string(),
+        "nikoncoporation" => "nikon".to_string(),
+        _ => key,
+    }
+}
+
+/// Mount qualifiers that may trail a database name without changing the optic.
+fn is_mount_token(value: &str) -> bool {
+    matches!(
+        normalize(value).as_str(),
+        "nikonf"
+            | "nikonz"
+            | "nikon1"
+            | "canonef"
+            | "canonefs"
+            | "canonrf"
+            | "sonye"
+            | "sonyfe"
+            | "sonya"
+            | "leical"
+            | "leicam"
+            | "fujifilmx"
+            | "fujifilmg"
+            | "microfourthirds"
+            | "mft"
+            | "lmount"
+            | "pentaxk"
+    )
+}
+
+/// Drop a trailing `(Nikon F)`-style mount qualifier, but keep qualifiers such
+/// as `(2x Tele)` that identify a different optical formula.
+fn strip_mount_suffix(name: &str) -> &str {
+    let trimmed = name.trim_end();
+    if !trimmed.ends_with(')') {
+        return trimmed;
+    }
+    let Some(open) = trimmed.rfind('(') else {
+        return trimmed;
+    };
+    if is_mount_token(&trimmed[open + 1..trimmed.len() - 1]) {
+        trimmed[..open].trim_end()
+    } else {
+        trimmed
+    }
+}
+
+/// Canonical lens-name key: punctuation-free, lower case, brand prefix and
+/// mount suffix removed.
+pub fn canonical_model(value: &str, brand: &str) -> String {
+    let mut key = normalize(strip_mount_suffix(value));
+    let brand_key = canonical_brand(brand);
+    if !brand_key.is_empty() && key.starts_with(&brand_key) && key.len() > brand_key.len() + 2 {
+        key.drain(..brand_key.len());
+    }
+    key
+}
+
+/// The human-readable part of a `fileDetectID` such as
+/// `N[170,60,...]S[NIKKOR Z 24-70mm f/4 S]`.
+fn detect_id_model(value: &str) -> Option<&str> {
+    let start = value.find("S[")? + 2;
+    let end = value[start..].find(']')? + start;
+    Some(&value[start..end])
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+/// Look up a lens and explain a miss instead of returning a neighbouring
+/// profile. Exact canonical names win; a profile that only shares the query as
+/// a prefix is rejected as ambiguous (`USM` must not select `USM DS`).
+pub fn detect_lens_explained<'a>(
+    lenses: &'a [LensProfile],
+    make: &str,
+    model: &str,
+    focal_mm: f32,
+) -> LensMatch<'a> {
+    let model = model.trim();
+    if model.is_empty() {
+        return LensMatch::Miss(MissReason::EmptyModel);
+    }
+    let make_brand = canonical_brand(make);
+    let query = canonical_model(model, &make_brand);
+    if query.is_empty() {
+        return LensMatch::Miss(MissReason::EmptyModel);
+    }
+
+    let mut exact: Option<(&LensProfile, MatchKind)> = None;
+    let mut ambiguous = false;
+    let mut focal_miss = false;
+    let mut brand_miss = false;
+
+    for lens in lenses {
+        // Callers that have no EXIF make pass ""; try the query with the
+        // candidate's own brand prefix stripped as well.
+        let query_lens = canonical_model(model, &lens.brand);
+        let mut keys = Vec::with_capacity(6);
+        for raw in [&lens.full_name, &lens.short_name] {
+            let key = canonical_model(raw, &lens.brand);
+            if !key.is_empty() {
+                keys.push(key);
+            }
+            let raw_key = normalize(raw);
+            if !raw_key.is_empty() && !keys.contains(&raw_key) {
+                keys.push(raw_key);
+            }
+        }
+        if let Some(detected) = lens.detect_id.as_deref().and_then(detect_id_model) {
+            let key = canonical_model(detected, &lens.brand);
+            if !key.is_empty() {
+                keys.push(key);
+            }
+        }
+
+        let mut exact_name = false;
+        let mut prefix_name = false;
+        for key in &keys {
+            if *key == query || (!query_lens.is_empty() && *key == query_lens) {
+                exact_name = true;
+                break;
+            }
+            for candidate_query in [&query, &query_lens] {
+                if (key.starts_with(candidate_query) || candidate_query.starts_with(key))
+                    && common_prefix_len(key, candidate_query) >= 6
+                {
+                    prefix_name = true;
+                }
+            }
+        }
+        if !exact_name && !prefix_name {
+            continue;
+        }
+
+        let brand_key = canonical_brand(&lens.brand);
+        if !make_brand.is_empty()
+            && !brand_key.is_empty()
+            && brand_key != make_brand
+            && !normalize(&lens.full_name).contains(&make_brand)
+            && !query.contains(&make_brand)
+        {
+            brand_miss = true;
+            continue;
+        }
+
+        let in_range = match (lens.focal_min, lens.focal_max) {
+            (Some(min), Some(max)) => focal_mm >= min - 0.5 && focal_mm <= max + 0.5,
+            _ => true,
+        };
+        if exact_name {
+            if !in_range {
+                focal_miss = true;
+                continue;
+            }
+            if exact.is_none() {
+                let raw_name = lens.full_name.trim().eq_ignore_ascii_case(model)
+                    || lens.short_name.trim().eq_ignore_ascii_case(model);
+                let raw_brand = lens.brand.trim().eq_ignore_ascii_case(make.trim());
+                let kind = if raw_name && raw_brand {
+                    MatchKind::Exact
+                } else {
+                    MatchKind::Normalized
+                };
+                exact = Some((lens, kind));
+            }
+            continue;
+        }
+        if in_range {
+            ambiguous = true;
+        } else {
+            focal_miss = true;
+        }
+    }
+
+    if let Some((lens, kind)) = exact {
+        return LensMatch::Hit { lens, kind };
+    }
+    if ambiguous {
+        return LensMatch::Miss(MissReason::AmbiguousSuffix);
+    }
+    if focal_miss {
+        return LensMatch::Miss(MissReason::FocalOutOfRange);
+    }
+    if brand_miss {
+        return LensMatch::Miss(MissReason::BrandMismatch);
+    }
+    LensMatch::Miss(MissReason::ProfileAbsent)
+}
+
 /// Look up a lens by the EXIF-reported make/model/focal length.
+///
+/// Thin wrapper over [`detect_lens_explained`]; use that when the caller needs
+/// to report *why* a lens was not found.
 pub fn detect_lens<'a>(
     lenses: &'a [LensProfile],
     make: &str,
     model: &str,
     focal_mm: f32,
 ) -> Option<&'a LensProfile> {
-    let make_key = normalize(make);
-    let model_key = normalize(model);
-    if model_key.is_empty() {
-        return None;
-    }
-
-    let mut fallback: Option<&LensProfile> = None;
-    for lens in lenses {
-        let brand_key = normalize(&lens.brand);
-        if !make_key.is_empty()
-            && !brand_key.is_empty()
-            && brand_key != make_key
-            && !normalize(&lens.full_name).contains(&make_key)
-            && !model_key.contains(&make_key)
-        {
-            continue;
-        }
-        let full = normalize(&lens.full_name);
-        let short = normalize(&lens.short_name);
-        let name_hit = full == model_key
-            || short == model_key
-            || full.contains(&model_key)
-            || short.contains(&model_key)
-            || model_key.contains(&short)
-            || (lens.detect_id.as_deref().is_some_and(|d| normalize(d).contains(&model_key)));
-        if !name_hit {
-            continue;
-        }
-        let in_range = match (lens.focal_min, lens.focal_max) {
-            (Some(min), Some(max)) => focal_mm >= min - 0.5 && focal_mm <= max + 0.5,
-            _ => true,
-        };
-        if in_range {
-            return Some(lens);
-        }
-        if fallback.is_none() {
-            fallback = Some(lens);
-        }
-    }
-    fallback
+    detect_lens_explained(lenses, make, model, focal_mm).lens()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -653,6 +901,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_make_matches_by_lens_name() {
+        let lenses = parse_lenses(SAMPLE);
+        let found = detect_lens(&lenses, "", "Canon EF 11-24mm f/4L USM", 12.0).unwrap();
+        assert_eq!(found.id, "2BDA368D-EBD9-4E19-9E59-19BDE21D2352");
+        let bare = detect_lens(&lenses, "", "EF 11-24mm f/4L USM", 12.0).unwrap();
+        assert_eq!(bare.id, "2BDA368D-EBD9-4E19-9E59-19BDE21D2352");
+    }
+
+    #[test]
     fn missing_curves_return_none() {
         let lenses = parse_lenses(SAMPLE);
         let prime = &lenses[1];
@@ -701,6 +958,164 @@ mod tests {
         assert!(lenses[0].chroma.is_empty());
         assert_eq!(lenses[0].falloff.len(), 1);
         assert!(lenses[1].falloff.is_empty());
+    }
+
+    #[test]
+    fn corporate_suffixes_fold_to_brand() {
+        assert_eq!(canonical_brand("NIKON CORPORATION"), "nikon");
+        assert_eq!(canonical_brand("Canon Inc."), "canon");
+        assert_eq!(canonical_brand("SONY"), "sony");
+        assert_eq!(canonical_brand("OLYMPUS IMAGING CORP."), "olympus");
+        assert_eq!(canonical_brand("RICOH IMAGING COMPANY, LTD."), "ricoh");
+        assert_eq!(canonical_brand("Phase One A/S"), "phaseone");
+        assert_eq!(canonical_brand("OM Digital Solutions"), "omsystem");
+        assert_eq!(canonical_brand("Leica Camera AG"), "leica");
+    }
+
+    #[test]
+    fn corporate_make_is_a_normalized_hit() {
+        let lenses = parse_lenses(
+            r#"<lenses><lens ID="N1" type="Zoom">
+  <fullName>Nikon AF-S NIKKOR 24-120mm f/4G ED VR</fullName>
+  <shortName>Nikon AF-S NIKKOR 24-120mm f/4G ED VR</shortName>
+  <brand>Nikon</brand><mount>Nikon F</mount>
+  <focalLength min="24.0" max="120.0"/>
+</lens></lenses>"#,
+        );
+        match detect_lens_explained(
+            &lenses,
+            "NIKON CORPORATION",
+            "Nikon AF-S NIKKOR 24-120mm f/4G ED VR",
+            88.0,
+        ) {
+            LensMatch::Hit { lens, kind } => {
+                assert_eq!(lens.id, "N1");
+                assert_eq!(kind, MatchKind::Normalized);
+            }
+            other => panic!("expected normalized hit, got {other:?}"),
+        }
+        match detect_lens_explained(
+            &lenses,
+            "Nikon",
+            "Nikon AF-S NIKKOR 24-120mm f/4G ED VR",
+            88.0,
+        ) {
+            LensMatch::Hit { kind, .. } => assert_eq!(kind, MatchKind::Exact),
+            other => panic!("expected exact hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_name_beats_the_ds_variant() {
+        let lenses = parse_lenses(
+            r#"<lenses>
+  <lens ID="DS" type="Prime">
+    <fullName>Canon RF 85mm F1.2L USM DS</fullName>
+    <shortName>Canon RF 85mm F1.2L USM DS</shortName>
+    <brand>Canon</brand><mount>Canon RF</mount>
+    <focalLength min="85.0" max="85.0"/>
+  </lens>
+  <lens ID="PLAIN" type="Prime">
+    <fullName>Canon RF 85mm F1.2L USM</fullName>
+    <shortName>Canon RF 85mm F1.2L USM</shortName>
+    <brand>Canon</brand><mount>Canon RF</mount>
+  </lens>
+</lenses>"#,
+        );
+        let hit = detect_lens(&lenses, "Canon", "Canon RF 85mm F1.2L USM", 85.0)
+            .expect("plain USM must match");
+        assert_eq!(hit.id, "PLAIN");
+
+        let only_ds = parse_lenses(
+            r#"<lenses><lens ID="DS" type="Prime">
+  <fullName>Canon RF 85mm F1.2L USM DS</fullName>
+  <shortName>Canon RF 85mm F1.2L USM DS</shortName>
+  <brand>Canon</brand><mount>Canon RF</mount>
+  <focalLength min="85.0" max="85.0"/>
+</lens></lenses>"#,
+        );
+        assert!(detect_lens(&only_ds, "Canon", "Canon RF 85mm F1.2L USM", 85.0).is_none());
+        assert_eq!(
+            detect_lens_explained(&only_ds, "Canon", "Canon RF 85mm F1.2L USM", 85.0).reason(),
+            Some(MissReason::AmbiguousSuffix)
+        );
+    }
+
+    #[test]
+    fn absent_lens_is_reported_not_substituted() {
+        let lenses = parse_lenses(
+            r#"<lenses><lens ID="Z2470" type="Zoom">
+  <fullName>Nikon NIKKOR Z 24-70mm f/4 S</fullName>
+  <shortName>Nikon NIKKOR Z 24-70mm f/4 S</shortName>
+  <brand>Nikon</brand><mount>Nikon F</mount>
+  <focalLength min="24.0" max="70.0"/>
+</lens></lenses>"#,
+        );
+        assert!(detect_lens(&lenses, "NIKON CORPORATION", "NIKKOR Z 24-120mm f/4 S", 88.0).is_none());
+        assert_eq!(
+            detect_lens_explained(&lenses, "NIKON CORPORATION", "NIKKOR Z 24-120mm f/4 S", 88.0)
+                .reason(),
+            Some(MissReason::ProfileAbsent)
+        );
+    }
+
+    #[test]
+    fn focal_outside_profile_is_reported() {
+        let lenses = parse_lenses(
+            r#"<lenses><lens ID="N1" type="Zoom">
+  <fullName>Nikon AF-S NIKKOR 24-120mm f/4G ED VR</fullName>
+  <shortName>Nikon AF-S NIKKOR 24-120mm f/4G ED VR</shortName>
+  <brand>Nikon</brand><mount>Nikon F</mount>
+  <focalLength min="24.0" max="120.0"/>
+</lens></lenses>"#,
+        );
+        assert_eq!(
+            detect_lens_explained(
+                &lenses,
+                "NIKON CORPORATION",
+                "Nikon AF-S NIKKOR 24-120mm f/4G ED VR",
+                200.0
+            )
+            .reason(),
+            Some(MissReason::FocalOutOfRange)
+        );
+    }
+
+    #[test]
+    fn wrong_body_brand_is_reported() {
+        let lenses = parse_lenses(
+            r#"<lenses><lens ID="C1" type="Prime">
+  <fullName>Canon RF 85mm F1.2L USM</fullName>
+  <shortName>Canon RF 85mm F1.2L USM</shortName>
+  <brand>Canon</brand><mount>Canon RF</mount>
+  <focalLength min="85.0" max="85.0"/>
+</lens></lenses>"#,
+        );
+        assert_eq!(
+            detect_lens_explained(&lenses, "NIKON CORPORATION", "Canon RF 85mm F1.2L USM", 85.0)
+                .reason(),
+            Some(MissReason::BrandMismatch)
+        );
+    }
+
+    #[test]
+    fn mount_suffix_does_not_hide_an_exact_lens() {
+        let lenses = parse_lenses(
+            r#"<lenses><lens ID="S1" type="Zoom">
+  <fullName>Nikon AF-S NIKKOR 24-120mm f/4G ED VR (Nikon F)</fullName>
+  <shortName>Nikon AF-S NIKKOR 24-120mm f/4G ED VR</shortName>
+  <brand>Nikon</brand><mount>Nikon F</mount>
+  <focalLength min="24.0" max="120.0"/>
+</lens></lenses>"#,
+        );
+        let hit = detect_lens(
+            &lenses,
+            "NIKON CORPORATION",
+            "Nikon AF-S NIKKOR 24-120mm f/4G ED VR",
+            88.0,
+        )
+        .expect("mount suffix must not block the match");
+        assert_eq!(hit.id, "S1");
     }
 
     /// Lazily parses the real 12.9 MB database from a Capture One install.

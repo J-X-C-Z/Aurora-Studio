@@ -2,7 +2,7 @@
 //!
 //! Same law as `kernels::skin_models::gloss_apply`: three passes over the image
 //! (positive1, positive2 with `positive = max(2u-1, 0)`, negative with
-//! `negative = max(1-2u, 0)`), each blending towards the caller-supplied 256-entry
+//! `negative = max(1-2u, 0)`), each blending towards the embedded 256-entry
 //! table by `weight = (mask/255) * (extra_mask/255)`. RGB is rewritten, alpha is
 //! copied. A pass whose degree is exactly zero never launches, which is the
 //! CPU's strict `if degree == 0.0 { return; }` gate.
@@ -97,8 +97,8 @@ impl Gloss {
         Ok(Self(crate::cuda::Nvidia::open_ptx(PTX)?))
     }
 
-    /// Compatibility entry: active work refuses missing LUTs; neutral returns
-    /// identity with no dispatch. Use apply_with_luts for caller-owned curves.
+    /// GPU twin of `skin_models::gloss_apply`. Returns the dispatches that
+    /// actually ran, so a zero-degree pass is visibly absent rather than implied.
     pub fn apply(
         &self,
         source: &Image,
@@ -106,23 +106,7 @@ impl Gloss {
         extra_masks_r: [&[u8]; 3],
         native_percent: f32,
     ) -> Result<(Image, Vec<Dispatch>), CudaError> {
-        self.apply_with_luts(source, masks_r, extra_masks_r, native_percent, None)
-    }
-
-    /// Explicit caller-owned tables; None refuses active work without dispatch.
-    pub fn apply_with_luts(
-        &self,
-        source: &Image,
-        masks_r: [&[u8]; 3],
-        extra_masks_r: [&[u8]; 3],
-        native_percent: f32,
-        luts: Option<[&[u8; 256]; 3]>,
-    ) -> Result<(Image, Vec<Dispatch>), CudaError> {
         check(source, masks_r, extra_masks_r, native_percent)?;
-        if passes(native_percent).iter().all(|&(_, degree)| degree == 0.0) {
-            return Ok((source.clone(), Vec::new()));
-        }
-        let luts = luts.ok_or(Refusal::MissingInput("gloss_luts"))?;
         let grid = (
             source.width.div_ceil(BLOCK).max(1),
             source.height.div_ceil(BLOCK).max(1),
@@ -137,7 +121,7 @@ impl Gloss {
             let (next, dispatch) = self.0.run_u8(
                 KERNEL,
                 grid,
-                &[&current, masks_r[pass as usize], extra_masks_r[pass as usize], luts[pass as usize]],
+                &[&current, masks_r[pass as usize], extra_masks_r[pass as usize]],
                 as_bytes(&uniforms),
             )?;
             current = next;

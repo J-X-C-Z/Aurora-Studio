@@ -320,7 +320,7 @@ mod tests {
         assert!(detect_with(Path::new("definitely-not-a-model.onnx"), &[0; 16], 2, 2).is_err());
     }
 
-    /// `LUMEN_AIMODELS=~/agents/evidence cargo test -p lumen-engine autorotate -- --ignored --nocapture`
+    /// `AURORA_AIMODELS=~/agents/evidence cargo test -p aurora-engine autorotate -- --ignored --nocapture`
     #[test]
     #[ignore = "needs Capture One's autoRotation.onnx"]
     fn model_io() {
@@ -366,12 +366,12 @@ mod tests {
         assert!(detect_with(&path, &rgba, 320, 240).is_err());
     }
 
-    /// Real photos, with per-turn scores: `LUMEN_PROBE_IMAGE=/path/photo.jpg`.
+    /// Real photos, with per-turn scores: `AURORA_PROBE_IMAGE=/path/photo.jpg`.
     #[test]
     #[ignore = "needs a real photo"]
     fn real_photo_round_trip() {
-        let Ok(photo) = std::env::var("LUMEN_PROBE_IMAGE") else {
-            println!("set LUMEN_PROBE_IMAGE to a real photo; skipping");
+        let Ok(photo) = std::env::var("AURORA_PROBE_IMAGE") else {
+            println!("set AURORA_PROBE_IMAGE to a real photo; skipping");
             return;
         };
         let path = crate::aimask::model_path(MODEL).expect("model");

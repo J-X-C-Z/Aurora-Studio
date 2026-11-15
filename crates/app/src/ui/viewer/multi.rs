@@ -8,7 +8,7 @@ use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
-use lumen_engine::ImageId;
+use aurora_engine::ImageId;
 
 use crate::i18n::t;
 use crate::motion;

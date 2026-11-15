@@ -1,7 +1,7 @@
 //! Selective copy and apply of adjustments, per tool, as in Capture One's
 //! adjustments clipboard.
 
-use lumen_engine::AdjustmentSet;
+use aurora_engine::AdjustmentSet;
 
 use crate::i18n::t;
 

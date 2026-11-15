@@ -78,14 +78,14 @@ fn session() -> Result<&'static Loaded> {
     }
 }
 
-/// `LUMEN_DUST_MODEL` wins, then `LUMEN_AIMODELS/dust.onnx`, then the Capture
+/// `AURORA_DUST_MODEL` wins, then `AURORA_AIMODELS/dust.onnx`, then the Capture
 /// One install the other AI models come from.
 fn model_path() -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path) = std::env::var_os("LUMEN_DUST_MODEL") {
+    if let Some(path) = std::env::var_os("AURORA_DUST_MODEL") {
         candidates.push(PathBuf::from(path));
     }
-    if let Some(dir) = std::env::var_os("LUMEN_AIMODELS") {
+    if let Some(dir) = std::env::var_os("AURORA_AIMODELS") {
         candidates.push(PathBuf::from(&dir).join("dust.onnx"));
         candidates.push(PathBuf::from(&dir).join("AIModels/Common/dust.onnx"));
     }
@@ -97,7 +97,7 @@ fn model_path() -> Result<PathBuf> {
         return Ok(path.clone());
     }
     bail!(
-        "dust.onnx not found; set LUMEN_DUST_MODEL to the model file (looked in {})",
+        "dust.onnx not found; set AURORA_DUST_MODEL to the model file (looked in {})",
         candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
     )
 }
@@ -308,7 +308,7 @@ mod tests {
         assert!(detect_dust(&[0u8; 16], 8, 8, 0.3).is_err());
     }
 
-    /// Real model run. Needs `LUMEN_DUST_MODEL` (and ONNX Runtime) on the host.
+    /// Real model run. Needs `AURORA_DUST_MODEL` (and ONNX Runtime) on the host.
     #[test]
     #[ignore]
     fn detect_synthetic_dots_with_the_real_model() {
@@ -351,7 +351,7 @@ mod tests {
         assert!(spots.iter().any(|s| (s.x - 100.0 / 416.0).abs() < 0.05 && (s.y - 100.0 / 416.0).abs() < 0.05));
     }
 
-    /// Run where neither `LUMEN_DUST_MODEL` nor a Capture One install exists.
+    /// Run where neither `AURORA_DUST_MODEL` nor a Capture One install exists.
     #[test]
     #[ignore]
     fn a_missing_model_is_an_error_not_a_panic() {
