@@ -1,0 +1,17 @@
+[package]
+name = "aurora-engine"
+description = "Aurora Studio's processing engine: contract between the interface and the image pipeline, plus a mock engine for UI development."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+rayon = "1.10"
+parking_lot = "0.12"
+roxmltree = "0.20"
+aurora-portrait.workspace = true
