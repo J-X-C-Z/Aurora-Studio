@@ -7,10 +7,12 @@
 //! were confirmed by opening both models and reading their tensor metadata.
 
 use std::ffi::{CStr, CString};
+use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, atomic::{AtomicBool, Ordering}};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -32,6 +34,8 @@ const CREATE_ENV: usize = 3;
 const CREATE_SESSION: usize = 7;
 const RUN: usize = 9;
 const CREATE_SESSION_OPTIONS: usize = 10;
+const SET_OPTIMIZED_MODEL_FILE_PATH: usize = 11;
+const ENABLE_PROFILING: usize = 14;
 const SET_SESSION_GRAPH_OPTIMIZATION_LEVEL: usize = 23;
 const SET_INTRA_OP_NUM_THREADS: usize = 24;
 const SESSION_GET_INPUT_COUNT: usize = 30;
@@ -51,6 +55,7 @@ const GET_TENSOR_TYPE_AND_SHAPE: usize = 65;
 const ALLOCATOR_FREE: usize = 76;
 const ALLOCATOR_GET_INFO: usize = 77;
 const GET_ALLOCATOR_WITH_DEFAULT_OPTIONS: usize = 78;
+const SESSION_END_PROFILING: usize = 110;
 const RELEASE_ENV: usize = 92;
 const RELEASE_STATUS: usize = 93;
 const RELEASE_SESSION: usize = 95;
@@ -86,6 +91,7 @@ unsafe fn function<T: Copy>(api: ApiPtr, index: usize) -> T {
 pub(crate) struct Runtime {
     api: ApiPtr,
     env: *mut c_void,
+    allocator: *mut c_void,
     memory_info: *mut c_void,
     handle: *mut c_void,
     library: PathBuf,
@@ -158,6 +164,34 @@ fn apply_override(probed: Vec<Provider>, forced: Option<Provider>) -> Vec<Provid
         return vec![Provider::Cpu];
     }
     vec![forced, Provider::Cpu]
+}
+
+fn graph_optimization_level() -> c_int {
+    match std::env::var("AURORA_ORT_OPT_LEVEL").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "disable" | "none" | "0" => 0,
+        "basic" | "1" => 1,
+        "extended" | "2" => 2,
+        _ => OPT_ENABLE_ALL,
+    }
+}
+
+fn optimized_model_cache_path(path: &Path, provider: Provider, optimization: c_int) -> Option<PathBuf> {
+    let dir = std::env::var_os("AURORA_ORT_CACHE_DIR")?;
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hash);
+    metadata.len().hash(&mut hash);
+    modified.hash(&mut hash);
+    provider.label().hash(&mut hash);
+    optimization.hash(&mut hash);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    Some(PathBuf::from(dir).join(format!("{stem}-{:016x}.onnx", hash.finish())))
 }
 
 // ORT objects are internally synchronised; `Run` may be called from any thread.
@@ -236,6 +270,7 @@ impl Runtime {
         Ok(Self {
             api,
             env,
+            allocator,
             memory_info,
             handle,
             library,
@@ -317,27 +352,43 @@ impl Runtime {
     pub(crate) fn open_session(&self, path: &Path) -> Result<Session> {
         let mut last = None;
         for provider in self.available_providers() {
-            match self.open_session_with(path, provider) {
+            let cached = optimized_model_cache_path(path, provider, graph_optimization_level())
+                .is_some_and(|path| path.is_file());
+            match self.open_session_with(path, provider, cached) {
                 Ok(session) => {
                     log::info!("ONNX Runtime using {} for {}", provider.label(), path.display());
                     return Ok(session);
                 }
                 Err(err) => {
-                    if provider != Provider::Cpu {
+                    if cached {
                         log::warn!(
-                            "{} session failed for {}, falling back: {err:#}",
+                            "{} cached model failed for {}, rebuilding from source: {err:#}",
                             provider.label(),
                             path.display()
                         );
+                        match self.open_session_with(path, provider, false) {
+                            Ok(session) => return Ok(session),
+                            Err(rebuild_err) => {
+                                last = Some(rebuild_err.context("rebuilding the optimized model cache"));
+                            }
+                        }
+                    } else {
+                        last = Some(err);
                     }
-                    last = Some(err);
+                    if provider != Provider::Cpu {
+                        log::warn!(
+                            "{} session failed for {}, falling back",
+                            provider.label(),
+                            path.display(),
+                        );
+                    }
                 }
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("no execution provider available")))
     }
 
-    fn open_session_with(&self, path: &Path, provider: Provider) -> Result<Session> {
+    fn open_session_with(&self, path: &Path, provider: Provider, use_cached_model: bool) -> Result<Session> {
         let api = self.api;
         let create_options: unsafe extern "C" fn(*mut *mut c_void) -> Status =
             unsafe { function(api, CREATE_SESSION_OPTIONS) };
@@ -345,6 +396,10 @@ impl Runtime {
             unsafe { function(api, SET_INTRA_OP_NUM_THREADS) };
         let set_optimization: unsafe extern "C" fn(*mut c_void, c_int) -> Status =
             unsafe { function(api, SET_SESSION_GRAPH_OPTIMIZATION_LEVEL) };
+        let set_optimized_path: unsafe extern "C" fn(*mut c_void, *const c_void) -> Status =
+            unsafe { function(api, SET_OPTIMIZED_MODEL_FILE_PATH) };
+        let enable_profiling: unsafe extern "C" fn(*mut c_void, *const c_void) -> Status =
+            unsafe { function(api, ENABLE_PROFILING) };
         let create_session: unsafe extern "C" fn(
             *const c_void,
             *const c_void,
@@ -356,17 +411,51 @@ impl Runtime {
         let mut options = ptr::null_mut();
         unsafe { check(create_options(&mut options), api)? };
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) as c_int;
+        // The cache already contains ORT's optimized graph; re-running transforms only adds latency.
+        let optimization = if use_cached_model { 0 } else { graph_optimization_level() };
         let result = unsafe {
             let result = check(set_threads(options, threads), api).and_then(|()| {
-                check(set_optimization(options, OPT_ENABLE_ALL), api)
+                check(set_optimization(options, optimization), api)
             });
             result
         };
+        let cache_path = optimized_model_cache_path(path, provider, graph_optimization_level());
+        let result = result.and_then(|()| {
+            let Some(cache_path) = cache_path.as_ref().filter(|_| !use_cached_model) else {
+                return Ok(());
+            };
+            if let Some(dir) = cache_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let cache_path = ort_path(cache_path);
+            unsafe { check(set_optimized_path(options, cache_path.as_ptr() as *const c_void), api) }
+                .context("setting the optimized model cache path")
+        });
         let result = result.and_then(|()| unsafe { self.append_provider(options, provider) });
+        let profile_prefix = std::env::var_os("AURORA_ORT_PROFILE_DIR").map(|dir| {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+            PathBuf::from(dir).join(format!("{stem}-{}-{}", provider.label(), std::process::id()))
+        });
+        let result = result.and_then(|()| {
+            let Some(prefix) = &profile_prefix else {
+                return Ok(());
+            };
+            if let Some(dir) = prefix.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let prefix = ort_path(prefix);
+            unsafe { check(enable_profiling(options, prefix.as_ptr() as *const c_void), api) }
+                .context("enabling ONNX Runtime profiling")
+        });
         let mut session = ptr::null_mut();
         let result = result.and_then(|()| {
             // `OrtCreateSession` takes ORTCHAR_T: wchar_t on Windows, char elsewhere.
-            let path = ort_path(path);
+            let model_path = if use_cached_model {
+                cache_path.as_deref().unwrap_or(path)
+            } else {
+                path
+            };
+            let path = ort_path(model_path);
             unsafe {
                 check(
                     create_session(self.env, path.as_ptr() as *const c_void, options, &mut session),
@@ -375,15 +464,42 @@ impl Runtime {
             }
         });
         unsafe { release_options(options) };
-        result.with_context(|| format!("opening {}", path.display()))?;
+        result.with_context(|| {
+            if use_cached_model {
+                format!("opening cached model for {}", path.display())
+            } else {
+                format!("opening {}", path.display())
+            }
+        })?;
         let session = Session {
             api,
             ptr: session,
             provider,
+            profile_active: AtomicBool::new(profile_prefix.is_some()),
             input: TensorMeta { name: String::new(), dims: Vec::new(), element_type: 0 },
             outputs: Vec::new(),
         };
         Ok(unsafe { session.with_metadata() }?)
+    }
+
+    pub(crate) fn end_profiling(&self, session: &Session) -> Result<Option<PathBuf>> {
+        if !session.profile_active.swap(false, Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let end: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_char) -> Status =
+            unsafe { function(self.api, SESSION_END_PROFILING) };
+        let free: unsafe extern "C" fn(*mut c_void, *mut c_void) -> Status =
+            unsafe { function(self.api, ALLOCATOR_FREE) };
+        let mut raw = ptr::null_mut();
+        unsafe { check(end(session.ptr, self.allocator, &mut raw), self.api) }
+            .context("ending ONNX Runtime profiling")?;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let path = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { check(free(self.allocator, raw.cast()), self.api) }
+            .context("freeing the ONNX Runtime profile path")?;
+        Ok(Some(PathBuf::from(path)))
     }
 
     pub(crate) fn run(&self, session: &Session, input: &mut [f32], shape: &[i64]) -> Result<Vec<Vec<f32>>> {
@@ -568,6 +684,7 @@ pub(crate) struct Session {
     api: ApiPtr,
     ptr: *mut c_void,
     provider: Provider,
+    profile_active: AtomicBool,
     pub(crate) input: TensorMeta,
     pub(crate) outputs: Vec<TensorMeta>,
 }
@@ -580,6 +697,11 @@ impl Session {
     /// support can still run on CPU inside the same session.
     pub(crate) fn provider(&self) -> Provider {
         self.provider
+    }
+
+    pub(crate) fn end_profiling(&self) -> Result<Option<PathBuf>> {
+        let runtime = Runtime::get().context("ONNX Runtime is not available")?;
+        runtime.end_profiling(self)
     }
 
     unsafe fn with_metadata(self) -> Result<Self> {

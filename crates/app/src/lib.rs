@@ -73,8 +73,43 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
             } else {
                 ui::workspace::open(state, cx);
             }
+            prewarm_ai_in_background();
         });
 }
+
+fn prewarm_ai_in_background() {
+    if gpui_kit::is_mobile()
+        || std::env::var("AURORA_AI_PREWARM").is_ok_and(|value| value == "0")
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("aurora-ai-prewarm".into())
+        .spawn(|| {
+            lower_current_thread_priority();
+            let start = std::time::Instant::now();
+            match aurora_engine::aimask::prewarm_models() {
+                Ok(()) => log::info!("AI sessions ready in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0),
+                Err(err) => log::warn!("AI session prewarm skipped: {err:#}"),
+            }
+        });
+}
+
+#[cfg(windows)]
+fn lower_current_thread_priority() {
+    use std::ffi::c_void;
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+    }
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_current_thread_priority() {}
 
 fn env_logger_init() {
     struct Stderr;
