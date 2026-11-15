@@ -1,14 +1,14 @@
 //! Optional CUDA path for the detail stages.
 //!
-//! It mirrors `stage_luminance_nr`, `stage_color_nr` and `stage_sharpening`
-//! byte-for-byte; the CPU path stays the default and is used whenever the
-//! driver, PTX or `AURORA_DETAIL_GPU` is absent.
+//! It mirrors `stage_luminance_nr`, `stage_color_nr`, `stage_moire` and
+//! `stage_sharpening` byte-for-byte; the CPU path stays the default and is used
+//! whenever the driver, PTX or `AURORA_DETAIL_GPU` is absent.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
 use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia};
 
-use crate::{NoiseReduction, Sharpening};
+use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
 
 const PTX: &str = include_str!("../../native/cuda/detail_gpu.ptx");
 const BLOCK: (u32, u32) = (16, 16);
@@ -21,14 +21,16 @@ pub(crate) fn enabled() -> bool {
     std::env::var_os("AURORA_DETAIL_GPU").is_some_and(|v| v != "0")
 }
 
-/// Runs the NR + colour NR + sharpening stages on the GPU. `false` means the
+/// Runs the NR + colour NR + moire + sharpening stages on the GPU. `false` means the
 /// caller must use the CPU stages (no driver, no context, or an invalid frame).
 pub(crate) fn post_process(
     rgba: &mut [u8],
     w: usize,
     h: usize,
     nr: &NoiseReduction,
+    moire: &Moire,
     sh: &Sharpening,
+    lens: &LensCorrection,
     scale: f32,
 ) -> bool {
     GPU.with(|slot| {
@@ -42,7 +44,7 @@ pub(crate) fn post_process(
             }
         }
         let guard = slot.borrow();
-        match post_process_with(guard.as_ref().unwrap(), rgba, w, h, nr, sh, scale) {
+        match post_process_with(guard.as_ref().unwrap(), rgba, w, h, nr, moire, sh, lens, scale) {
             Ok(()) => true,
             Err(err) => {
                 log::warn!("detail_gpu: {err:?}; staying on CPU");
@@ -58,13 +60,20 @@ pub(crate) fn post_process_with(
     w: usize,
     h: usize,
     nr: &NoiseReduction,
+    moire: &Moire,
     sh: &Sharpening,
+    lens: &LensCorrection,
     scale: f32,
 ) -> Result<(), CudaError> {
     let lum_active = nr.luminance > 0.0 || nr.single_pixel > 0.0;
     let color_active = nr.color > 0.0;
+    let moire_active = moire.amount > 0.0;
     let sharp_active = sh.amount > 0.0;
-    if !lum_active && !color_active && !sharp_active {
+    let lens_active = lens.distortion != 0.0
+        || lens.light_falloff != 0.0
+        || lens.chromatic_aberration
+        || lens.purple_fringing > 0.0;
+    if !lum_active && !color_active && !moire_active && !sharp_active && !lens_active {
         return Ok(());
     }
     let Some(pixels) = w.checked_mul(h) else { return Ok(()) };
@@ -74,7 +83,7 @@ pub(crate) fn post_process_with(
     let bytes = pixels * 4;
     let pool = gpu.alloc_buffer(bytes * 6)?;
     let lut = lum_active.then(|| gpu.alloc_buffer(1025 * 4)).transpose()?;
-    post_process_pool(gpu, rgba, w, h, nr, sh, scale, &pool, lut.as_ref())
+    post_process_pool(gpu, rgba, w, h, nr, moire, sh, lens, scale, &pool, lut.as_ref())
 }
 
 pub(crate) fn post_process_pool(
@@ -83,15 +92,22 @@ pub(crate) fn post_process_pool(
     w: usize,
     h: usize,
     nr: &NoiseReduction,
+    moire: &Moire,
     sh: &Sharpening,
+    lens: &LensCorrection,
     scale: f32,
     pool: &DeviceBuffer<'_>,
     lut_buf: Option<&DeviceBuffer<'_>>,
 ) -> Result<(), CudaError> {
     let lum_active = nr.luminance > 0.0 || nr.single_pixel > 0.0;
     let color_active = nr.color > 0.0;
+    let moire_active = moire.amount > 0.0;
     let sharp_active = sh.amount > 0.0;
-    if !lum_active && !color_active && !sharp_active {
+    let lens_active = lens.distortion != 0.0
+        || lens.light_falloff != 0.0
+        || lens.chromatic_aberration
+        || lens.purple_fringing > 0.0;
+    if !lum_active && !color_active && !moire_active && !sharp_active && !lens_active {
         return Ok(());
     }
     let Some(pixels) = w.checked_mul(h) else { return Ok(()) };
@@ -188,6 +204,22 @@ pub(crate) fn post_process_pool(
         )?;
     }
 
+    if moire_active {
+        launch2(gpu, "luma_plane_kernel", w, h, [
+            ptr(&mut p_rgba), ptr(&mut p_luma), ptr(&mut w_i), ptr(&mut h_i),
+        ])?;
+        let amount = (moire.amount / 100.0).clamp(0.0, 1.0);
+        let pattern = (moire.pattern / 100.0).clamp(0.0, 1.0);
+        let mut weight = amount * (0.25 + 0.75 * pattern);
+        launch2(gpu, "moire_kernel", w, h, [
+            ptr(&mut p_rgba),
+            ptr(&mut p_luma),
+            ptr(&mut w_i),
+            ptr(&mut h_i),
+            ptr(&mut weight),
+        ])?;
+    }
+
     if sharp_active {
         launch2(gpu, "luma_plane_kernel", w, h, [
             ptr(&mut p_rgba), ptr(&mut p_luma), ptr(&mut w_i), ptr(&mut h_i),
@@ -219,6 +251,27 @@ pub(crate) fn post_process_pool(
             ptr(&mut gain),
             ptr(&mut threshold),
             ptr(&mut halo),
+        ])?;
+    }
+
+    if lens_active {
+        let mut n_i = pixels as i32;
+        launch1(gpu, "copy_rgba_kernel", pixels, [ptr(&mut p_rgba), ptr(&mut p_tmp), ptr(&mut n_i)])?;
+        let mut distortion = (lens.distortion / 100.0).clamp(-1.0, 1.0);
+        let mut falloff = (lens.light_falloff / 100.0).clamp(0.0, 1.0);
+        let mut purple = (lens.purple_fringing / 100.0).clamp(0.0, 1.0);
+        let mut ca = i32::from(lens.chromatic_aberration);
+        let mut hide = i32::from(lens.hide_distorted_areas);
+        launch2(gpu, "lens_kernel", w, h, [
+            ptr(&mut p_tmp),
+            ptr(&mut p_rgba),
+            ptr(&mut w_i),
+            ptr(&mut h_i),
+            ptr(&mut distortion),
+            ptr(&mut falloff),
+            ptr(&mut ca),
+            ptr(&mut hide),
+            ptr(&mut purple),
         ])?;
     }
 

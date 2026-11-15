@@ -143,6 +143,17 @@ pub fn model_available(name: &str) -> bool {
     model_candidates(name).iter().any(|path| path.is_file())
 }
 
+/// Builds the reusable ONNX sessions ahead of the first interactive mask.
+/// This only runs when models are installed and never performs an inference.
+pub fn prewarm_models() -> Result<()> {
+    for name in ["subjectMasking.onnx", "skinMasking.onnx"] {
+        if model_available(name) {
+            Segmenter::load(name)?;
+        }
+    }
+    Ok(())
+}
+
 /// A loaded model plus what its metadata says about the tensors.
 pub(crate) struct Segmenter {
     pub(crate) session: Session,
@@ -157,8 +168,8 @@ pub(crate) struct Segmenter {
 impl Segmenter {
     fn load(name: &str) -> Result<Arc<Segmenter>> {
         static MODELS: OnceLock<Mutex<HashMap<String, Arc<Segmenter>>>> = OnceLock::new();
-        let models = MODELS.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(model) = models.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+        let mut models = MODELS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(model) = models.get(name) {
             return Ok(model.clone());
         }
         let path = model_path(name)?;
@@ -184,10 +195,7 @@ impl Segmenter {
             .unwrap_or(1) as usize;
         let out_nchw = channels > 1 && out_dims.get(1) == Some(&(channels as i64));
         let model = Arc::new(Segmenter { session, path: path.clone(), in_w, in_h, nchw, channels, out_nchw });
-        models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string(), model.clone());
+        models.insert(name.to_string(), model.clone());
         Ok(model)
     }
 
@@ -608,6 +616,107 @@ mod tests {
             assert_eq!(plane.data.len(), (w * h) as usize);
             assert!(plane.data.iter().all(|v| (0.0..=1.0).contains(v)));
         }
+    }
+
+    fn print_profile_summary(path: &std::path::Path) -> Result<()> {
+        let profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path)?).context("reading ORT profile")?;
+        let events = profile
+            .as_array()
+            .or_else(|| profile.get("traceEvents").and_then(|v| v.as_array()))
+            .context("ORT profile has no traceEvents")?;
+        let mut providers = std::collections::BTreeMap::<String, (usize, f64)>::new();
+        let mut nodes = std::collections::BTreeMap::<String, (usize, f64)>::new();
+        for event in events {
+            if event.get("cat").and_then(|v| v.as_str()) != Some("Node") {
+                continue;
+            }
+            let args = event.get("args");
+            let provider = args
+                .and_then(|v| v.get("provider"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let op = args
+                .and_then(|v| v.get("op_name"))
+                .and_then(|v| v.as_str())
+                .or_else(|| event.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("unknown");
+            let duration_us = event.get("dur").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let total = providers.entry(provider.to_string()).or_default();
+            total.0 += 1;
+            total.1 += duration_us;
+            let total = nodes.entry(format!("{provider}:{op}")).or_default();
+            total.0 += 1;
+            total.1 += duration_us;
+        }
+        println!("profile: {}", path.display());
+        for (provider, (count, duration_us)) in &providers {
+            println!("provider {provider}: nodes={count} total={:.3} ms", duration_us / 1000.0);
+        }
+        let mut nodes: Vec<_> = nodes.into_iter().collect();
+        nodes.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        for (node, (count, duration_us)) in nodes.into_iter().take(8) {
+            println!("node {node}: runs={count} total={:.3} ms", duration_us / 1000.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "needs Capture One's ONNX models and AURORA_ORT_PROFILE_DIR"]
+    fn real_models_coldstart_and_node_profile() {
+        let (w, h) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| [180u8, 160, 140, 255]).collect();
+        let runtime_start = std::time::Instant::now();
+        Runtime::get().expect("ONNX Runtime");
+        println!("runtime load {:.3} ms", runtime_start.elapsed().as_secs_f64() * 1000.0);
+        for (name, run) in [
+            ("subjectMasking.onnx", subject_mask as fn(&[u8], u32, u32) -> Result<Vec<f32>>),
+            ("skinMasking.onnx", skin_mask as fn(&[u8], u32, u32) -> Result<Vec<f32>>),
+        ] {
+            let session_start = std::time::Instant::now();
+            let model = Segmenter::load(name).expect("model session");
+            let session_ms = session_start.elapsed().as_secs_f64() * 1000.0;
+            let first_start = std::time::Instant::now();
+            let first_mask = run(&rgba, w, h).expect("first inference");
+            let first_ms = first_start.elapsed().as_secs_f64() * 1000.0;
+            let hash = first_mask.iter().fold(0xcbf29ce484222325u64, |hash, value| {
+                (hash ^ u64::from(value.to_bits())).wrapping_mul(0x100000001b3)
+            });
+            let mut warm = Vec::new();
+            for _ in 0..4 {
+                let start = std::time::Instant::now();
+                run(&rgba, w, h).expect("warm inference");
+                warm.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            warm.sort_by(f64::total_cmp);
+            println!(
+                "{name}: provider={} session={session_ms:.3} ms first={first_ms:.3} ms warm_p50={:.3} ms hash={hash:016x}",
+                model.session.provider().label(),
+                warm[1]
+            );
+            if let Some(path) = model.session.end_profiling().expect("end ORT profiling") {
+                print_profile_summary(&path).expect("summarize ORT profile");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs Capture One's ONNX models"]
+    fn real_models_are_ready_after_prewarm() {
+        let (w, h) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| [180u8, 160, 140, 255]).collect();
+        let start = std::time::Instant::now();
+        prewarm_models().expect("prewarm");
+        let prewarm_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let subject_start = std::time::Instant::now();
+        subject_mask(&rgba, w, h).expect("subject after prewarm");
+        let subject_ms = subject_start.elapsed().as_secs_f64() * 1000.0;
+        let skin_start = std::time::Instant::now();
+        skin_mask(&rgba, w, h).expect("skin after prewarm");
+        let skin_ms = skin_start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "prewarm={prewarm_ms:.3} ms subject_first={subject_ms:.3} ms skin_first={skin_ms:.3} ms"
+        );
     }
 
     /// The same models through `FileEngine`: compute, cache, and the kinds no
