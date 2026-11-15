@@ -1,0 +1,190 @@
+{
+  "schema": "pixcake/o2i/pf100007-golden-pack/1",
+  "family": "SmileMouth3D_DL3D_Warp + synthetic PF100007",
+  "oracle": {
+    "kind": "cpu",
+    "symbol": "kernels::smile_warp::pf100007_apply",
+    "path": "crates/pixcake/src/kernels/smile_warp.rs",
+    "sha256": "3437B213B9435B7AC24379AE281327824BAD63DA8E15453260787E1DD17A6910"
+  },
+  "smile_mouth3d": {
+    "note": "PF8033 asset family; PF100007 fields below are synthetic, not SmileMouth3D output",
+    "effect_json_sha256": "E5C4D83E5A353A903C429E0F2271EAC21C2E1ACBD9BDAD26672F9A4A16E69998",
+    "meshes": {
+      "meanshape.obj": {
+        "sha256": "37428A6C9F48B67A9F5E056BF91CFF5156A0D847FA9846746D4E7CAFEDF338A1",
+        "bytes": 171925
+      },
+      "normal.obj": {
+        "sha256": "03F6702AFCE8519C2F6A6B26DDD23E7CF1E42DF4B2500C465017D9378F3EA18F",
+        "bytes": 171927
+      },
+      "side_right.obj": {
+        "sha256": "DADABD5883593B74D7037606557E1D2408C0EA91862968E8F2D3566E33805093",
+        "bytes": 171927
+      },
+      "side_left.obj": {
+        "sha256": "38483176D07B245D11A9C6AEBB747CE9581372E25A4E6027C219A135B8567D63",
+        "bytes": 171993
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "edge_clamp_half_store",
+      "width": 8,
+      "height": 6,
+      "degree": 1,
+      "roi": {
+        "x": 0,
+        "y": 0,
+        "width": 8,
+        "height": 6
+      },
+      "notes": "0.5 bilinear tap (truncation), edge clamp +10/-10, variable alpha",
+      "files": {
+        "source.bgra": {
+          "bytes": 192,
+          "sha256": "042F4591A7000E766BCDFDEA72BE5D0BB66FCE64C6F2BCDA5113CFF33E624B53"
+        },
+        "lip.u8": {
+          "bytes": 48,
+          "sha256": "80A76A18ACF8CB64FEC3A659FFC4BAB4A87CD9A6FDE4DAB2161A8751D136C9D2"
+        },
+        "mouth.u8": {
+          "bytes": 48,
+          "sha256": "80A76A18ACF8CB64FEC3A659FFC4BAB4A87CD9A6FDE4DAB2161A8751D136C9D2"
+        },
+        "dx.f32le": {
+          "bytes": 192,
+          "sha256": "F465C784C1A700282BA174C553EE29E01325D02CE50F8C2EC7C1307F230F09FF"
+        },
+        "dy.f32le": {
+          "bytes": 192,
+          "sha256": "A6823810DD01F2160005AA5B7027CEC485D6DDAC483C19B9758D3535C15DAFBC"
+        },
+        "expected.bgra": {
+          "bytes": 192,
+          "sha256": "26494F100418DB684AD1F01BA99CD87D3B7F1F59E2F09CA09518995EAFA56B2D"
+        }
+      }
+    },
+    {
+      "name": "full_integer_signed",
+      "width": 8,
+      "height": 6,
+      "degree": 1,
+      "roi": {
+        "x": 0,
+        "y": 0,
+        "width": 8,
+        "height": 6
+      },
+      "notes": "full ROI, integer positive/negative displacement, non-constant alpha",
+      "files": {
+        "source.bgra": {
+          "bytes": 192,
+          "sha256": "86CEB90F5E60C46003110183C69DB403AB96258025637BEFE9499CE9F5F4C904"
+        },
+        "lip.u8": {
+          "bytes": 48,
+          "sha256": "80A76A18ACF8CB64FEC3A659FFC4BAB4A87CD9A6FDE4DAB2161A8751D136C9D2"
+        },
+        "mouth.u8": {
+          "bytes": 48,
+          "sha256": "80A76A18ACF8CB64FEC3A659FFC4BAB4A87CD9A6FDE4DAB2161A8751D136C9D2"
+        },
+        "dx.f32le": {
+          "bytes": 192,
+          "sha256": "ABB610CE459EC22F63C981CB1FA8D523CBF3B73BC8DD727A4CC4F221F8F115F1"
+        },
+        "dy.f32le": {
+          "bytes": 192,
+          "sha256": "EDA10EC2958889B92DCA891D5543EC1405FCF22E9889C7341A60B34B66D2B111"
+        },
+        "expected.bgra": {
+          "bytes": 192,
+          "sha256": "B5707D3D275F41EF378535D6A55A781AAC146E894AEF5225333F3D954DCEBA39"
+        }
+      }
+    },
+    {
+      "name": "gate_zero_support",
+      "width": 8,
+      "height": 6,
+      "degree": 1,
+      "roi": {
+        "x": 1,
+        "y": 1,
+        "width": 6,
+        "height": 4
+      },
+      "notes": "zero-support pixels inside ROI with huge displacement; must stay source",
+      "files": {
+        "source.bgra": {
+          "bytes": 192,
+          "sha256": "86CEB90F5E60C46003110183C69DB403AB96258025637BEFE9499CE9F5F4C904"
+        },
+        "lip.u8": {
+          "bytes": 48,
+          "sha256": "BD9DAC030A9A63D1205D24F4C1D8340A3EE5859E8B2FB5C16479471339926D9F"
+        },
+        "mouth.u8": {
+          "bytes": 48,
+          "sha256": "8B5FD36C03348A1AA53BAEFAB4609BACC3C9B5BEB1507F97222781164EBE94D0"
+        },
+        "dx.f32le": {
+          "bytes": 192,
+          "sha256": "BC1F9BE3C14177F3E2F35AB8A9E4C33F1EFCD7A3E902146AF26C27057731D0E6"
+        },
+        "dy.f32le": {
+          "bytes": 192,
+          "sha256": "EB773FEC2CA18098674E27CB9AB2DF68889CA16D3F4F325285051D5E063DC94C"
+        },
+        "expected.bgra": {
+          "bytes": 192,
+          "sha256": "6E3DA827C71892557D68F34636006F4A3F702473D96265CBA9B729437FE0D824"
+        }
+      }
+    },
+    {
+      "name": "inset_fractional",
+      "width": 8,
+      "height": 6,
+      "degree": 0.6,
+      "roi": {
+        "x": 1,
+        "y": 1,
+        "width": 5,
+        "height": 3
+      },
+      "notes": "non-full ROI, fractional +- displacement, non-constant alpha",
+      "files": {
+        "source.bgra": {
+          "bytes": 192,
+          "sha256": "86CEB90F5E60C46003110183C69DB403AB96258025637BEFE9499CE9F5F4C904"
+        },
+        "lip.u8": {
+          "bytes": 48,
+          "sha256": "0102227287A07C2D00F1731CC34D1CA96872797F370460AE608CE9C67F294C49"
+        },
+        "mouth.u8": {
+          "bytes": 48,
+          "sha256": "4A41EE22242AA2B5F466AEDDC197591CFFA1623B31DD0E9B784572D742BF5550"
+        },
+        "dx.f32le": {
+          "bytes": 192,
+          "sha256": "C3353BC93A79487DA8D8241C47AC8DB46AC59F6EDF1247A1C2D9BFBAD87183ED"
+        },
+        "dy.f32le": {
+          "bytes": 192,
+          "sha256": "19C0E8B7F39DEB1168F5178E26D588B92390D263B0AF44CAF186255E01D3DD92"
+        },
+        "expected.bgra": {
+          "bytes": 192,
+          "sha256": "85400931D756F04A822458BD086C7F2305F0CE02D725280CCC4A81853AB6F28E"
+        }
+      }
+    }
+  ]
+}

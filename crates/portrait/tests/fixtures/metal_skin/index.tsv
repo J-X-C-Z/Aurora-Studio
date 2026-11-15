@@ -1,0 +1,8 @@
+atlas	name	width	height	mix
+ruddy	boundary_ruddy_0_250_500	1	1	1
+whiten	boundary_whiten_1000_0_1000	1	1	1
+ruddy	discriminator_ruddy_010	1	1	1
+whiten	discriminator_whiten_010	1	1	1
+whiten	small_mask0_mix1000	4	4	1
+whiten	small_mask255_mix1000	4	4	1
+whiten	small_mask_mixed_mix500	4	4	0.5

@@ -1,0 +1,27 @@
+{
+  "family": "SkinRadiance PF90004",
+  "note": "native LUT rows 300/150, gamma 16384 f32, matrices 18 f32",
+  "schema": "aurora-local-radiance-assets/1",
+  "assets": [
+    {
+      "bytes": 76800,
+      "file": "native-lut-a.bin",
+      "sha256": "48E82EC7EB49CF1AAA5DB3A42AFE102548AE5108BD14B15B96D71BE0BB6BB5D1"
+    },
+    {
+      "bytes": 38400,
+      "file": "native-lut-b.bin",
+      "sha256": "B804EFCF3A057A5406316BB12F82F9F741A7A8320C8DE92A3517E2C93038AF1D"
+    },
+    {
+      "bytes": 65536,
+      "file": "native-gamma-rgba32f.bin",
+      "sha256": "914627555C93495CD987992F3153913BE30AB312997959C85680398697C503BA"
+    },
+    {
+      "bytes": 72,
+      "file": "native-color-matrices.bin",
+      "sha256": "6436DE49AC2CEDA925E08E841BAD926A8A3156F6434DAF0D426D23B0FA801D65"
+    }
+  ]
+}

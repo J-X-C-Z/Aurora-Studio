@@ -1,0 +1,8 @@
+{
+  "name": "edge_clamp_half_store",
+  "width": 8,
+  "height": 6,
+  "degree": 1,
+  "roi": {"x": 0, "y": 0, "width": 8, "height": 6},
+  "notes": "0.5 bilinear tap (truncation), edge clamp +10/-10, variable alpha"
+}

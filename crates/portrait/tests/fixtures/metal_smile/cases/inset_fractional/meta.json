@@ -1,0 +1,8 @@
+{
+  "name": "inset_fractional",
+  "width": 8,
+  "height": 6,
+  "degree": 0.6,
+  "roi": {"x": 1, "y": 1, "width": 5, "height": 3},
+  "notes": "non-full ROI, fractional +- displacement, non-constant alpha"
+}

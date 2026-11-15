@@ -1,0 +1,64 @@
+{
+  "schema": "pixcake/o1i/rust-nvidia-teeth/1",
+  "status": "PASS_REAL_GPU_TEETH",
+  "hardware": {
+    "device": "NVIDIA GeForce RTX 4070 Ti",
+    "compute_capability": "8.9",
+    "driver_version": 13030,
+    "ptx_isa_loaded": "9.3",
+    "ptx_bytes": 37572,
+    "ptx_fma_instructions": 0
+  },
+  "kernel": {
+    "entry": "teeth_whiten_bright_kernel",
+    "block": "16x16",
+    "passes": "whiten then bright inside one launch",
+    "abi_bytes": 32,
+    "store_rule": "fraction >= 256-entry threshold table, compared in double"
+  },
+  "assets": {
+    "source": "assets/pixcake/teeth/{Whiten,Bright}.png",
+    "decode": "PngDecoder -> DynamicImage::from_decoder -> into_rgb8 (same path as processing::pixcake_assets)",
+    "dumps": ["work/backend-r11/o1i/whiten.rgb", "work/backend-r11/o1i/bright.rgb"],
+    "bytes_each": 786432
+  },
+  "real_gpu_execution": {
+    "executed": true,
+    "byte_identity_vs_cpu_oracle": true,
+    "geometry": ["1x1", "17x13", "32x24"],
+    "ui": [[100, 100, 100], [50, 70, 60], [100, 0, 100], [100, 100, 0], [30, 30, 30]],
+    "alpha_mismatch_pixels": 0
+  },
+  "gates": {
+    "common_zero": "0 launches, identity",
+    "mask_zero": "1 launch, byte identity",
+    "mask_one": "weight 1/255 crosses 0.001, matches CPU"
+  },
+  "negative_tests": [
+    "mask length -> ShapeMismatch(\"mask_g\")",
+    "whiten length -> ShapeMismatch(\"whiten_lut\")",
+    "common_ui NaN -> ValueOutOfRange",
+    "bright_ui 101 -> ValueOutOfRange"
+  ],
+  "tests": {
+    "harness": "work/backend-r11/o1i/check.rs",
+    "teeth_gpu_passed": 4,
+    "failed": 0,
+    "suite_rerun": { "lib": 273, "cuda_fragment": 2, "cuda_gloss": 5, "cuda_lut": 4, "cuda_mesh": 7, "cuda_roi": 7 }
+  },
+  "timing_512x512": {
+    "owner": "o1i",
+    "grid": "32x32",
+    "block": "16x16",
+    "gpu_seconds_cold": 0.0009,
+    "gpu_ms_median": 0.739,
+    "cpu_ms": 63.906,
+    "allocations_per_session": 5,
+    "allocations_per_apply": 0,
+    "differing_bytes": 0
+  },
+  "needs_controller": [
+    "add `pub mod cuda_teeth;` to crates/pixcake/src/lib.rs; until then cargo test fails on tests/cuda_teeth.rs"
+  ],
+  "not_run": ["Capture One host", "live tooth mask/ROI", "install / production write"]
+}

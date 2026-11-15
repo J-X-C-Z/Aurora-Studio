@@ -1,0 +1,4779 @@
+{
+  "schema": "pixcake-param-coverage/v1",
+  "generated_at": "2026-11-10T08:50:29.470532+00:00",
+  "inputs_readonly": true,
+  "counts": {
+    "preset_params": 482,
+    "mapped_effect_config": 204,
+    "ambiguous": 7,
+    "unmapped_before": 278,
+    "newly_resolved": 248,
+    "resolved_total": 452,
+    "still_unresolved": 30,
+    "coverage_strict": 0.4232,
+    "coverage_extended": 0.9378,
+    "resolved_by": {
+      "ui_bundle_param_registry": 247,
+      "preset_string_enum": 1
+    }
+  },
+  "channels": {
+    "effect_configs": {
+      "path": "analysis/param_effect_map.json",
+      "distinct_param_flags": 207,
+      "preset_hits": 204
+    },
+    "vendor_ui_bundle": {
+      "path": "C:\\Program Files\\PixCake\\pixcake_2\\Resources\\www\\agent\\assets\\dnd-overlay.vue_vue_type_style_index_0_scoped_e11a735c_lang-Cf6pNYKR.js",
+      "param_ids_found": 416,
+      "preset_hits": 247,
+      "authority": "shipped UI, semantic key -> ParamFlag id"
+    },
+    "preset_string_enum": {
+      "hits": 1
+    },
+    "shader_feature_index": {
+      "path": "analysis/shader_feature_index.json",
+      "shader_files": 501,
+      "role": "effect-family corroboration only; shaders carry uniforms, not ParamFlag ids"
+    },
+    "base_db_dump": {
+      "path": "analysis/base_db_dump.json",
+      "tables": {
+        "craftDictionary": 4,
+        "craft_ai_scene_category": 24,
+        "craft_ai_scene_info": 145
+      },
+      "role": "negative: no parameter registry, only craft/ai-scene catalogue tables"
+    },
+    "effect_asset_map": {
+      "features": 110,
+      "effect_rows": 831
+    }
+  },
+  "ambiguous": {
+    "100": {
+      "id": 100,
+      "preset_group": "PT_F",
+      "default": 0.7,
+      "string_enum": null,
+      "config_effects": [
+        "NormalEyeBrowColorMakeup",
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "ui_key": "eyebrowDegree_left",
+      "ui_label": "眉毛",
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "UI key `eyebrowDegree_left` maps id 100 to one control that the decrypted configs bind into 2 effect variants"
+    },
+    "107": {
+      "id": 107,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "config_effects": [
+        "LipColor",
+        "LipStickImageMakeup"
+      ],
+      "ui_key": "lipstickDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "UI key `lipstickDegree` maps id 107 to one control that the decrypted configs bind into 2 effect variants"
+    },
+    "115": {
+      "id": 115,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "config_effects": [
+        "3DMMFaceSticker",
+        "BlusherImageMakeup"
+      ],
+      "ui_key": "faceDecorationDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "UI key `faceDecorationDegree` maps id 115 to one control that the decrypted configs bind into 2 effect variants"
+    },
+    "117": {
+      "id": 117,
+      "preset_group": "PT_F",
+      "default": 0.7,
+      "string_enum": null,
+      "config_effects": [
+        "NormalEyeBrowColorMakeup",
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "ui_key": "eyebrowDegree_right",
+      "ui_label": "眉毛",
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "UI key `eyebrowDegree_right` maps id 117 to one control that the decrypted configs bind into 2 effect variants"
+    },
+    "233": {
+      "id": 233,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "config_effects": [
+        "FacialRefine",
+        "FacialRefineV2"
+      ],
+      "ui_key": "mLip",
+      "ui_label": "M唇",
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "UI key `mLip` maps id 233 to one control that the decrypted configs bind into 2 effect variants"
+    },
+    "8069": {
+      "id": 8069,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "config_effects": [
+        "FaceSticker",
+        "FaceSurfaceBlur"
+      ],
+      "ui_key": "skinTexture",
+      "ui_label": null,
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "UI key `skinTexture` maps id 8069 to one control that the decrypted configs bind into 2 effect variants"
+    },
+    "90033": {
+      "id": 90033,
+      "preset_group": "PT_F",
+      "default": 0.7,
+      "string_enum": null,
+      "config_effects": [
+        "BlusherImageMakeup",
+        "EyePupilMakeup",
+        "LipColor",
+        "LipStickImageMakeup",
+        "NormalEyeBrowImageMakeup",
+        "NormalEyeImageMakeup",
+        "NormalEyeLashImageMakeup",
+        "SilkWorm",
+        "SymEyeBrowImageMakeup",
+        "SymEyeImageMakeup",
+        "SymEyeLashColorMakeup",
+        "SymEyeLashImageMakeup"
+      ],
+      "ui_key": "suitMakeupDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolution": "shared_effect_param",
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "UI key `suitMakeupDegree` maps id 90033 to one control that the decrypted configs bind into 12 effect variants"
+    }
+  },
+  "newly_resolved": [
+    {
+      "id": 0,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "spotless",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `spotless` -> 0",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "Spotless"
+      ]
+    },
+    {
+      "id": 1,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "spotless_acne",
+      "ui_label": "祛痘",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `spotless_acne` -> 1",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "Spotless"
+      ]
+    },
+    {
+      "id": 2,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "spotless_spot",
+      "ui_label": "祛斑",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `spotless_spot` -> 2",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "Spotless"
+      ]
+    },
+    {
+      "id": 3,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "spotless_texture",
+      "ui_label": "质感保留",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `spotless_texture` -> 3",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "Spotless"
+      ]
+    },
+    {
+      "id": 5,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "lightenPouch",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `lightenPouch` -> 5",
+      "effect_name_similarity_candidates": [
+        "SkinLighten_PixCook"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 109,
+      "preset_group": "PT_F",
+      "default": 0.7,
+      "string_enum": null,
+      "ui_key": "teethWhitening_brightness",
+      "ui_label": "明度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `teethWhitening_brightness` -> 109",
+      "effect_name_similarity_candidates": [
+        "TeethWhitenV3_PixCook"
+      ],
+      "shader_groups": [
+        "WhitenTeeth"
+      ]
+    },
+    {
+      "id": 110,
+      "preset_group": "PT_F",
+      "default": 0.7,
+      "string_enum": null,
+      "ui_key": "teethWhitening_deYellow",
+      "ui_label": "祛黄",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `teethWhitening_deYellow` -> 110",
+      "effect_name_similarity_candidates": [
+        "TeethWhitenV3_PixCook"
+      ],
+      "shader_groups": [
+        "WhitenTeeth"
+      ]
+    },
+    {
+      "id": 249,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "faceShapePreset_degree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `faceShapePreset_degree` -> 249",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 21002,
+      "preset_group": "COMMON",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "tianchongMode",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `tianchongMode` -> 21002",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21012,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "quxiaci_dimian",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `quxiaci_dimian` -> 21012",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21013,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "quxiaci_beijing",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `quxiaci_beijing` -> 21013",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21014,
+      "preset_group": "COMMON",
+      "default": 2,
+      "string_enum": null,
+      "ui_key": "kouxiangbaoliu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `kouxiangbaoliu` -> 21014",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21015,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "skinColorHue",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinColorHue` -> 21015",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 21020,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "aiRemoveTattoo",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `aiRemoveTattoo` -> 21020",
+      "effect_name_similarity_candidates": [
+        "DeTattoo"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21022,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "removeStubble_cleanShave",
+      "ui_label": "祛胡青",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeStubble_cleanShave` -> 21022",
+      "effect_name_similarity_candidates": [
+        "RemoveStubble"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21023,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "removeStubble_stubble",
+      "ui_label": "祛胡渣",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeStubble_stubble` -> 21023",
+      "effect_name_similarity_candidates": [
+        "RemoveStubble"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21024,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeGlabellaLines",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeGlabellaLines` -> 21024",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21025,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeMarionetteLines",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeMarionetteLines` -> 21025",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21026,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeStubble",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeStubble` -> 21026",
+      "effect_name_similarity_candidates": [
+        "RemoveStubble"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21027,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "yinyingButouming",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `yinyingButouming` -> 21027",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21028,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "yinyingXuhua",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `yinyingXuhua` -> 21028",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21029,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "jianbian",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `jianbian` -> 21029",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21030,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "xuhuaFanwei",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `xuhuaFanwei` -> 21030",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21031,
+      "preset_group": "COMMON",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "yinyingBlendMode",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `yinyingBlendMode` -> 21031",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21040,
+      "preset_group": "COMMON",
+      "default": null,
+      "string_enum": "BgShadow/00",
+      "ui_key": "yinyingSucaiPath",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `yinyingSucaiPath` -> 21040",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21042,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "aiYinyingSwitch",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `aiYinyingSwitch` -> 21042",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21043,
+      "preset_group": "COMMON",
+      "default": 0.85,
+      "string_enum": null,
+      "ui_key": "aiYinyingChengdu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `aiYinyingChengdu` -> 21043",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21044,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "guangyingjunyun_chengdu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `guangyingjunyun_chengdu` -> 21044",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21047,
+      "preset_group": "COMMON",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "aiYinyingBlendMode",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `aiYinyingBlendMode` -> 21047",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21048,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "guangyingjunyun_mingdu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `guangyingjunyun_mingdu` -> 21048",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21049,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeTearTrough_left",
+      "ui_label": "祛法令纹",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeTearTrough_left` -> 21049",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21050,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeTearTrough_right",
+      "ui_label": "祛法令纹",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeTearTrough_right` -> 21050",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21052,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "guangyingjunyun",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `guangyingjunyun` -> 21052",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21054,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "redEyeRemoval",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `redEyeRemoval` -> 21054",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 21055,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "CLOTHES_BLEMISH_REMOVAL",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `CLOTHES_BLEMISH_REMOVAL` -> 21055",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21056,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "CLOTHES_EDGE_SMOOTH_PROTECT_THING",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `CLOTHES_EDGE_SMOOTH_PROTECT_THING` -> 21056",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21069,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeCheekWrinkles",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeCheekWrinkles` -> 21069",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21070,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeNasalWrinkles",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeNasalWrinkles` -> 21070",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21071,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removePerioralWrinkles",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removePerioralWrinkles` -> 21071",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21075,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeSpill",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeSpill` -> 21075",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21076,
+      "preset_group": "PT_F",
+      "default": 0.67,
+      "string_enum": null,
+      "ui_key": "smileDegree_closeMouth",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `smileDegree_closeMouth` -> 21076",
+      "effect_name_similarity_candidates": [
+        "CloseMouth"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 21093,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "irisEditingSwitch",
+      "ui_label": "AI眼球调整",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingSwitch` -> 21093",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21094,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "irisEditingDirectSwitch",
+      "ui_label": "直视镜头",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingDirectSwitch` -> 21094",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21095,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "irisEditingLeftHorizontal",
+      "ui_label": "水平",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingLeftHorizontal` -> 21095",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21096,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "irisEditingLeftVertical",
+      "ui_label": "垂直",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingLeftVertical` -> 21096",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21097,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "irisEditingLeftScale",
+      "ui_label": "大小",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingLeftScale` -> 21097",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21098,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "irisEditingRightHorizontal",
+      "ui_label": "水平",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingRightHorizontal` -> 21098",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21099,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "irisEditingRightVertical",
+      "ui_label": "垂直",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingRightVertical` -> 21099",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21100,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "irisEditingRightScale",
+      "ui_label": "大小",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `irisEditingRightScale` -> 21100",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21104,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeNoseFlaw",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeNoseFlaw` -> 21104",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 21105,
+      "preset_group": "PT_F",
+      "default": 0.85,
+      "string_enum": null,
+      "ui_key": "skinUnifyColorPicker",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinUnifyColorPicker` -> 21105",
+      "effect_name_similarity_candidates": [
+        "HairColorUnify",
+        "FaceSkinUnify"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 21138,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "CLOTHES_SWEAT_STAIN_REMOVAL",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `CLOTHES_SWEAT_STAIN_REMOVAL` -> 21138",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval",
+        "EffectRemoveSweat",
+        "ClothRemoveSweat"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30004,
+      "preset_group": "PT_F",
+      "default": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "string_enum": null,
+      "ui_key": "blusherColor",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `blusherColor` -> 30004",
+      "effect_name_similarity_candidates": [
+        "BlusherImageMakeup",
+        "BlusherColorMakeup",
+        "Blusher"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 30005,
+      "preset_group": "PT_F",
+      "default": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "string_enum": null,
+      "ui_key": "eyelashColor",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `eyelashColor` -> 30005",
+      "effect_name_similarity_candidates": [
+        "Eyelash"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 30006,
+      "preset_group": "PT_F",
+      "default": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "string_enum": null,
+      "ui_key": "eyebrowColor",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `eyebrowColor` -> 30006",
+      "effect_name_similarity_candidates": [
+        "Eyebrow"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 30008,
+      "preset_group": "PT_F",
+      "default": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "string_enum": null,
+      "ui_key": "eyelinerColor",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `eyelinerColor` -> 30008",
+      "effect_name_similarity_candidates": [
+        "Eyeliner"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 30009,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "hairColorUnify",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `hairColorUnify` -> 30009",
+      "effect_name_similarity_candidates": [
+        "HairColorUnify",
+        "FaceSkinUnify"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 30014,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "neutralGrayStereo",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `neutralGrayStereo` -> 30014",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30015,
+      "preset_group": "PT_F",
+      "default": 0.8,
+      "string_enum": null,
+      "ui_key": "neutralGrayStereo_facial",
+      "ui_label": "五官",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `neutralGrayStereo_facial` -> 30015",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 30016,
+      "preset_group": "PT_F",
+      "default": 0.8,
+      "string_enum": null,
+      "ui_key": "neutralGrayStereo_contour",
+      "ui_label": "轮廓",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `neutralGrayStereo_contour` -> 30016",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30017,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "poreEnhance",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `poreEnhance` -> 30017",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30018,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "chunsebgquchuanbang",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `chunsebgquchuanbang` -> 30018",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30021,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "freqSplit_face",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `freqSplit_face` -> 30021",
+      "effect_name_similarity_candidates": [
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30022,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "freqSplit_body",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `freqSplit_body` -> 30022",
+      "effect_name_similarity_candidates": [
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30023,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeDoubleEyelids_left",
+      "ui_label": "祛双眼皮贴",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeDoubleEyelids_left` -> 30023",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30025,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "teethBlemishRemoval",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `teethBlemishRemoval` -> 30025",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval",
+        "TeethWhitenV3_PixCook"
+      ],
+      "shader_groups": [
+        "WhitenTeeth"
+      ]
+    },
+    {
+      "id": 30026,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "teethAlignment",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `teethAlignment` -> 30026",
+      "effect_name_similarity_candidates": [
+        "TeethWhitenV3_PixCook"
+      ],
+      "shader_groups": [
+        "WhitenTeeth"
+      ]
+    },
+    {
+      "id": 30027,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "teethBlemishRemoval_edge",
+      "ui_label": "边缘补齐",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `teethBlemishRemoval_edge` -> 30027",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval",
+        "TeethWhitenV3_PixCook"
+      ],
+      "shader_groups": [
+        "WhitenTeeth"
+      ]
+    },
+    {
+      "id": 30028,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "FacePresets/00",
+      "ui_key": "faceShapePreset_path",
+      "ui_label": "脸型预设",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `faceShapePreset_path` -> 30028",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30029,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "aiBodyReshape_bodySmooth",
+      "ui_label": "身型流畅",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `aiBodyReshape_bodySmooth` -> 30029",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 30030,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeVein",
+      "ui_label": "祛青筋",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeVein` -> 30030",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30031,
+      "preset_group": "PT_F",
+      "default": 0.55,
+      "string_enum": null,
+      "ui_key": "freqSplit_face_high",
+      "ui_label": "高频增强（脸部）",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `freqSplit_face_high` -> 30031",
+      "effect_name_similarity_candidates": [
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30032,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "freqSplit_face_low",
+      "ui_label": "低频平整（脸部）",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `freqSplit_face_low` -> 30032",
+      "effect_name_similarity_candidates": [
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30033,
+      "preset_group": "PT_F",
+      "default": 0.55,
+      "string_enum": null,
+      "ui_key": "freqSplit_body_high",
+      "ui_label": "高频增强（身体）",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `freqSplit_body_high` -> 30033",
+      "effect_name_similarity_candidates": [
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30034,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "freqSplit_body_low",
+      "ui_label": "低频平整（身体）",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `freqSplit_body_low` -> 30034",
+      "effect_name_similarity_candidates": [
+        "SymEyeBrowColorSplitDegreeMakeup"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30039,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeDoubleEyelids_right",
+      "ui_label": "祛双眼皮贴",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeDoubleEyelids_right` -> 30039",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30040,
+      "preset_group": "PT_F",
+      "default": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "string_enum": null,
+      "ui_key": "lipstickColor",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `lipstickColor` -> 30040",
+      "effect_name_similarity_candidates": [
+        "Lipstick"
+      ],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 30059,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinToneUnifyMulti",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinToneUnifyMulti` -> 30059",
+      "effect_name_similarity_candidates": [
+        "HairColorUnify",
+        "FaceSkinUnify"
+      ],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 30076,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "None",
+      "ui_key": "smileMaterialPath",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `smileMaterialPath` -> 30076",
+      "effect_name_similarity_candidates": [
+        "SymEyeImageMakeupAdjustMaterial",
+        "EyePupilMakeupAdjustMaterial",
+        "AnimalEyePupilMakeupAdjustMaterial"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30096,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "sediao",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `sediao` -> 30096",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30187,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "handNeutralGray",
+      "ui_label": "手部中性灰",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `handNeutralGray` -> 30187",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30188,
+      "preset_group": "PT_F",
+      "default": 0.9,
+      "string_enum": null,
+      "ui_key": "removeDoubleChin_degree",
+      "ui_label": "祛除程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeDoubleChin_degree` -> 30188",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30189,
+      "preset_group": "PT_F",
+      "default": 0.8,
+      "string_enum": null,
+      "ui_key": "removeDoubleChin_shadow",
+      "ui_label": "阴影程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeDoubleChin_shadow` -> 30189",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30190,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "handReshape",
+      "ui_label": "手部美型",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `handReshape` -> 30190",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 30191,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "foreheadPlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `foreheadPlump` -> 30191",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30192,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "foreheadPlump_flatten",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `foreheadPlump_flatten` -> 30192",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30193,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "foreheadPlump_brighten",
+      "ui_label": "提亮程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `foreheadPlump_brighten` -> 30193",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30194,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "midFacePlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `midFacePlump` -> 30194",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30195,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "midFacePlump_flatten",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `midFacePlump_flatten` -> 30195",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30196,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "midFacePlump_brighten",
+      "ui_label": "提亮程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `midFacePlump_brighten` -> 30196",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30197,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "cheekPlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `cheekPlump` -> 30197",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30198,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "nasalBasePlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `nasalBasePlump` -> 30198",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30199,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "nasalBasePlump_flatten",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `nasalBasePlump_flatten` -> 30199",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30200,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "nasalBasePlump_brighten",
+      "ui_label": "提亮程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `nasalBasePlump_brighten` -> 30200",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30201,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "eyeSocketPlump_left",
+      "ui_label": "眼窝程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeSocketPlump_left` -> 30201",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 30202,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "eyeSocketPlump_right",
+      "ui_label": "眼窝程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeSocketPlump_right` -> 30202",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 30203,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "geisonPlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `geisonPlump` -> 30203",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30204,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "chinPlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `chinPlump` -> 30204",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30205,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "chinPlump_flatten",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `chinPlump_flatten` -> 30205",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30206,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "chinPlump_brighten",
+      "ui_label": "提亮程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `chinPlump_brighten` -> 30206",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30207,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "mouthAngulusPlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `mouthAngulusPlump` -> 30207",
+      "effect_name_similarity_candidates": [
+        "FacePlump",
+        "CloseMouth"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 30209,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "jawlineEnhance",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `jawlineEnhance` -> 30209",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 30210,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "fullFacePlump",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `fullFacePlump` -> 30210",
+      "effect_name_similarity_candidates": [
+        "FacePlump"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 30258,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftEyeLiquifyDegree",
+      "ui_label": "液化程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftEyeLiquifyDegree` -> 30258",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine",
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 30259,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeSweat",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeSweat` -> 30259",
+      "effect_name_similarity_candidates": [
+        "EffectRemoveSweat",
+        "ClothRemoveSweat"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 31561,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftMouthDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `facialLiftMouthDegree` -> 31561",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine",
+        "CloseMouth"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 31933,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftMidFaceDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `facialLiftMidFaceDegree` -> 31933",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FacialRefine",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 32035,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "mouthJawReshapeContour",
+      "ui_label": "轮廓塑形",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `mouthJawReshapeContour` -> 32035",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape",
+        "CloseMouth"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 32729,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftMidFaceSmoothDegree",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftMidFaceSmoothDegree` -> 32729",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FacialRefine",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 33070,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftMouthSmoothDegree",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftMouthSmoothDegree` -> 33070",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine",
+        "CloseMouth"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 33149,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftMidFaceLiquifyDegree",
+      "ui_label": "液化程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftMidFaceLiquifyDegree` -> 33149",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FacialRefine",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 34722,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftEyeDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `facialLiftEyeDegree` -> 34722",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine",
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 34794,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftContourDegree",
+      "ui_label": "轮廓",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftContourDegree` -> 34794",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 35040,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "shuipingFanzhuan",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `shuipingFanzhuan` -> 35040",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 35470,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftEyeSmoothDegree",
+      "ui_label": "平整程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftEyeSmoothDegree` -> 35470",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine",
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 36671,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "mouthJawReshape",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `mouthJawReshape` -> 36671",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape",
+        "CloseMouth"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 36965,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "tiankongJianbian",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `tiankongJianbian` -> 36965",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 37595,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "mouthJawReshapeShadow",
+      "ui_label": "光影矫正",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `mouthJawReshapeShadow` -> 37595",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape",
+        "CloseMouth"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 39753,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftMouthLiquifyDegree",
+      "ui_label": "液化程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftMouthLiquifyDegree` -> 39753",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine",
+        "CloseMouth"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 39798,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "xuanzhuanJiaodu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `xuanzhuanJiaodu` -> 39798",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 39920,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "facialLiftTotalDegree",
+      "ui_label": "全脸提拉",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `facialLiftTotalDegree` -> 39920",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 40100,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEnable",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `makeupRemovalEnable` -> 40100",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 40101,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalBlusher",
+      "ui_label": "腮红",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalBlusher` -> 40101",
+      "effect_name_similarity_candidates": [
+        "BlusherImageMakeup",
+        "BlusherColorMakeup",
+        "Blusher"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 40102,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalSilkworm",
+      "ui_label": "卧蚕",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalSilkworm` -> 40102",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 40103,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEyepupil",
+      "ui_label": "美瞳",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalEyepupil` -> 40103",
+      "effect_name_similarity_candidates": [
+        "Eyepupil"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 40104,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEyelash",
+      "ui_label": "睫毛",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalEyelash` -> 40104",
+      "effect_name_similarity_candidates": [
+        "Eyelash"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 40105,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEyebrow",
+      "ui_label": "眉毛",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalEyebrow` -> 40105",
+      "effect_name_similarity_candidates": [
+        "Eyebrow"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 40106,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEyeliner",
+      "ui_label": "眼线",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalEyeliner` -> 40106",
+      "effect_name_similarity_candidates": [
+        "Eyeliner"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 40107,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEyeMakeup",
+      "ui_label": "眼影",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalEyeMakeup` -> 40107",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 40108,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalLipstick",
+      "ui_label": "口红",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalLipstick` -> 40108",
+      "effect_name_similarity_candidates": [
+        "Lipstick"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 40109,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalContourPositive",
+      "ui_label": "高光",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalContourPositive` -> 40109",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 40110,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalContourNegative",
+      "ui_label": "阴影",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalContourNegative` -> 40110",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 40111,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalFacialDecoration",
+      "ui_label": "面部装饰",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `makeupRemovalFacialDecoration` -> 40111",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 40112,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalContourDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `makeupRemovalContourDegree` -> 40112",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 40113,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalEyeDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `makeupRemovalEyeDegree` -> 40113",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 40114,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalFullFaceDegree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `makeupRemovalFullFaceDegree` -> 40114",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 40115,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupRemovalFullFaceEnable",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `makeupRemovalFullFaceEnable` -> 40115",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 44297,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeBlueVeins",
+      "ui_label": "祛青筋",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeBlueVeins` -> 44297",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 44634,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "eyeholeCornerSwitch",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `eyeholeCornerSwitch` -> 44634",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 80001,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "skinToneSelect_path",
+      "ui_label": "肤色选择",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `skinToneSelect_path` -> 80001",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 80002,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinToneSelect_degree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinToneSelect_degree` -> 80002",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 80003,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "skinToneWarmth",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinToneWarmth` -> 80003",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90002,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "moistureSmoothSkin",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `moistureSmoothSkin` -> 90002",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90003,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinColorUniform",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinColorUniform` -> 90003",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90005,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinWhitening",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinWhitening` -> 90005",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90007,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinRosy",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinRosy` -> 90007",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90008,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeStretchMark",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeStretchMark` -> 90008",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90010,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "moistureSmoothSkin_body",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `moistureSmoothSkin_body` -> 90010",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90013,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeNevus",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeNevus` -> 90013",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90015,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeNeckLine",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeNeckLine` -> 90015",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90019,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "bodySpotless",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bodySpotless` -> 90019",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "Spotless"
+      ]
+    },
+    {
+      "id": 90023,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeEyeLines",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeEyeLines` -> 90023",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90024,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeForeheadLines",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeForeheadLines` -> 90024",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90034,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeDoubleChin",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeDoubleChin` -> 90034",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90035,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "chunsebgquxiaci",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `chunsebgquxiaci` -> 90035",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90037,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "removeStretchMark_line",
+      "ui_label": "祛妊娠线",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeStretchMark_line` -> 90037",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90038,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "qusecaiduanceng",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `qusecaiduanceng` -> 90038",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90040,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "teethRepair",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `teethRepair` -> 90040",
+      "effect_name_similarity_candidates": [
+        "TeethWhitenV3_PixCook"
+      ],
+      "shader_groups": [
+        "WhitenTeeth"
+      ]
+    },
+    {
+      "id": 90041,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "aiBodyReshape",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `aiBodyReshape` -> 90041",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 90042,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "bianyuantiaozheng",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bianyuantiaozheng` -> 90042",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90046,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "symmetryReshapeSwitch",
+      "ui_label": "对称液化（适用证件照）",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `symmetryReshapeSwitch` -> 90046",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 90047,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "symmetryReshapeFace",
+      "ui_label": "五官对称",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `symmetryReshapeFace` -> 90047",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery",
+        "Reshape"
+      ]
+    },
+    {
+      "id": 90048,
+      "preset_group": "PT_F",
+      "default": 0.4,
+      "string_enum": null,
+      "ui_key": "symmetryReshapeBody",
+      "ui_label": "上半身对称",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `symmetryReshapeBody` -> 90048",
+      "effect_name_similarity_candidates": [
+        "AIBodyReshape"
+      ],
+      "shader_groups": [
+        "Reshape",
+        "AIBodyReshape"
+      ]
+    },
+    {
+      "id": 90049,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "bianyuanGuodu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bianyuanGuodu` -> 90049",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90050,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "sewen",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `sewen` -> 90050",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90051,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "baohedu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `baohedu` -> 90051",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90052,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "liangdu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `liangdu` -> 90052",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90053,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "xuhua",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `xuhua` -> 90053",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90054,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "jingwuSecai",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `jingwuSecai` -> 90054",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90055,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "renwuSecai",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `renwuSecai` -> 90055",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90056,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "jingwuFanshe",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `jingwuFanshe` -> 90056",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90057,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "jingwuShuixiaoXuhua",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `jingwuShuixiaoXuhua` -> 90057",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90060,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "butouming",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `butouming` -> 90060",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90061,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "quxiaci_chengdu",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `quxiaci_chengdu` -> 90061",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90080,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeOilShine",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeOilShine` -> 90080",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90085,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinToneUnifyFace",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinToneUnifyFace` -> 90085",
+      "effect_name_similarity_candidates": [
+        "HairColorUnify",
+        "FaceSkinUnify"
+      ],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery",
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90086,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "skinToneUnifyBody",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skinToneUnifyBody` -> 90086",
+      "effect_name_similarity_candidates": [
+        "HairColorUnify",
+        "FaceSkinUnify"
+      ],
+      "shader_groups": [
+        "SkinRetune"
+      ]
+    },
+    {
+      "id": 90087,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "hairPartFill",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `hairPartFill` -> 90087",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90088,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeStrayHair",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeStrayHair` -> 90088",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90089,
+      "preset_group": "PT_C",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "bodySpotless_baby",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bodySpotless_baby` -> 90089",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "Spotless"
+      ]
+    },
+    {
+      "id": 90090,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "suitMakeupPath",
+      "ui_label": "主题妆容",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `suitMakeupPath` -> 90090",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90091,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "blusherPath",
+      "ui_label": "腮红",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `blusherPath` -> 90091",
+      "effect_name_similarity_candidates": [
+        "BlusherImageMakeup",
+        "BlusherColorMakeup",
+        "Blusher"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90092,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "eyebrowPath",
+      "ui_label": "眉毛",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyebrowPath` -> 90092",
+      "effect_name_similarity_candidates": [
+        "Eyebrow"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90093,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "eyelashPath",
+      "ui_label": "睫毛",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyelashPath` -> 90093",
+      "effect_name_similarity_candidates": [
+        "Eyelash"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90094,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "eyeMakeupPath",
+      "ui_label": "眼妆",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeMakeupPath` -> 90094",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90095,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "lipstickPath",
+      "ui_label": "口红",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.75,
+      "evidence": "shipped UI bundle maps `lipstickPath` -> 90095",
+      "effect_name_similarity_candidates": [
+        "Lipstick"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90097,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "eyePupilPath",
+      "ui_label": "美瞳",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyePupilPath` -> 90097",
+      "effect_name_similarity_candidates": [
+        "EyePupilMakeupAdjustMaterial",
+        "EyePupilMakeup",
+        "BrightEyeWithPupil"
+      ],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90099,
+      "preset_group": "COMMON",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "bgReplacePath",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bgReplacePath` -> 90099",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90100,
+      "preset_group": "COMMON",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "skyReplacePath",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `skyReplacePath` -> 90100",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90111,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "chuizhiWeizhi",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `chuizhiWeizhi` -> 90111",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90112,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "shuipingWeizhi",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `shuipingWeizhi` -> 90112",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90113,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "removeStrayHair_person",
+      "ui_label": "人物区域",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeStrayHair_person` -> 90113",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90114,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "removeStrayHair_bg",
+      "ui_label": "背景区域",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeStrayHair_bg` -> 90114",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90115,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "aiFacialSmooth",
+      "ui_label": "AI面部流畅",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `aiFacialSmooth` -> 90115",
+      "effect_name_similarity_candidates": [
+        "FacialRefineV2",
+        "FacialRefine"
+      ],
+      "shader_groups": [
+        "FacialRefine"
+      ]
+    },
+    {
+      "id": 90116,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeEyeBag",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeEyeBag` -> 90116",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90117,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "removeEyeBag_keepSilkworm",
+      "ui_label": "保留卧蚕",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `removeEyeBag_keepSilkworm` -> 90117",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90118,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "lipLineCorrection",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `lipLineCorrection` -> 90118",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "LipColor"
+      ]
+    },
+    {
+      "id": 90130,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "glassesGlareRemoval",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `glassesGlareRemoval` -> 90130",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90131,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "removeWhiteHair",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `removeWhiteHair` -> 90131",
+      "effect_name_similarity_candidates": [
+        "WhiteSoft",
+        "RemoveWhiteHair"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90132,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "hairColorSelect_path",
+      "ui_label": "发色选择",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `hairColorSelect_path` -> 90132",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 90133,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "daxiao",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `daxiao` -> 90133",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90134,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "chuizhiWeizhi",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `chuizhiWeizhi` -> 90134",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90135,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "shuipingWeizhi",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `shuipingWeizhi` -> 90135",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90136,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "butouming",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `butouming` -> 90136",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90137,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "hairColorSelect_degree",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `hairColorSelect_degree` -> 90137",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 90139,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "hairSmooth",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `hairSmooth` -> 90139",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90140,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "hairSmooth_strand",
+      "ui_label": "发丝调整",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `hairSmooth_strand` -> 90140",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90141,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "CLOTHES_EDGE_SMOOTH",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `CLOTHES_EDGE_SMOOTH` -> 90141",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90142,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "eyelidsMaterialPath",
+      "ui_label": "双眼皮素材",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyelidsMaterialPath` -> 90142",
+      "effect_name_similarity_candidates": [
+        "SymEyeImageMakeupAdjustMaterial",
+        "EyePupilMakeupAdjustMaterial",
+        "AnimalEyePupilMakeupAdjustMaterial"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90143,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsDegree_left",
+      "ui_label": "双眼皮程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsDegree_left` -> 90143",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90144,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsDegree_right",
+      "ui_label": "双眼皮程度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsDegree_right` -> 90144",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90145,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsLength_left",
+      "ui_label": "双眼皮长度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsLength_left` -> 90145",
+      "effect_name_similarity_candidates": [
+        "NeckLength"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90146,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsLength_right",
+      "ui_label": "双眼皮长度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsLength_right` -> 90146",
+      "effect_name_similarity_candidates": [
+        "NeckLength"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90147,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsHeight_left",
+      "ui_label": "双眼皮高度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsHeight_left` -> 90147",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90148,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsHeight_right",
+      "ui_label": "双眼皮高度",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsHeight_right` -> 90148",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90149,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsHeight_lateral_left",
+      "ui_label": "眼尾",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsHeight_lateral_left` -> 90149",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90153,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsHeight_lateral_right",
+      "ui_label": "眼尾",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsHeight_lateral_right` -> 90153",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90154,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsHeight_medial_left",
+      "ui_label": "眼头",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsHeight_medial_left` -> 90154",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90155,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsHeight_medial_right",
+      "ui_label": "眼头",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsHeight_medial_right` -> 90155",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 90156,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsLength_lateral_left",
+      "ui_label": "眼尾",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsLength_lateral_left` -> 90156",
+      "effect_name_similarity_candidates": [
+        "NeckLength"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90157,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsLength_lateral_right",
+      "ui_label": "眼尾",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsLength_lateral_right` -> 90157",
+      "effect_name_similarity_candidates": [
+        "NeckLength"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90158,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsLength_medial_left",
+      "ui_label": "眼头",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsLength_medial_left` -> 90158",
+      "effect_name_similarity_candidates": [
+        "NeckLength"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90159,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "ui_key": "doubleEyelidsLength_medial_right",
+      "ui_label": "眼头",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `doubleEyelidsLength_medial_right` -> 90159",
+      "effect_name_similarity_candidates": [
+        "NeckLength"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90160,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "hairGloss",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `hairGloss` -> 90160",
+      "effect_name_similarity_candidates": [
+        "HairGloss"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 90170,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "eyeSymmetry",
+      "ui_label": "眼睛对称",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeSymmetry` -> 90170",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90171,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "eyeSymmetry_horizontal",
+      "ui_label": "水平对称",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeSymmetry_horizontal` -> 90171",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90172,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "eyeSymmetry_size",
+      "ui_label": "大小对称",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeSymmetry_size` -> 90172",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90173,
+      "preset_group": "PT_F",
+      "default": 0,
+      "string_enum": null,
+      "ui_key": "eyeSymmetry_size_combobox",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `eyeSymmetry_size_combobox` -> 90173",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 90200,
+      "preset_group": "COMMON",
+      "default": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "string_enum": null,
+      "ui_key": "bgColor",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bgColor` -> 90200",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "LipColor",
+        "ColorDispersion",
+        "Color.frag"
+      ]
+    },
+    {
+      "id": 90201,
+      "preset_group": "COMMON",
+      "default": 1,
+      "string_enum": null,
+      "ui_key": "bgBlendMode",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `bgBlendMode` -> 90201",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 100004,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "redBloodRemoval",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `redBloodRemoval` -> 100004",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 100005,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "eyeWhitePurify",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `eyeWhitePurify` -> 100005",
+      "effect_name_similarity_candidates": [
+        "WhiteSoft",
+        "RemoveWhiteHair"
+      ],
+      "shader_groups": [
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 100007,
+      "preset_group": "PT_F",
+      "default": 0.2,
+      "string_enum": null,
+      "ui_key": "smileDegree_openMouth",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `smileDegree_openMouth` -> 100007",
+      "effect_name_similarity_candidates": [
+        "CloseMouth"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100008,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "repairBreast",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `repairBreast` -> 100008",
+      "effect_name_similarity_candidates": [
+        "BreastRefine",
+        "BreastLift"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100010,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "makeupProtection",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `makeupProtection` -> 100010",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 100011,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "arcProtection",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `arcProtection` -> 100011",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 100013,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "REMOVE_CLOTHES_CREASE_TOP",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `REMOVE_CLOTHES_CREASE_TOP` -> 100013",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100014,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "REMOVE_CLOTHES_CREASE_TOP_COARSE",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `REMOVE_CLOTHES_CREASE_TOP_COARSE` -> 100014",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100015,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "REMOVE_CLOTHES_CREASE_TOP_DETAIL",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `REMOVE_CLOTHES_CREASE_TOP_DETAIL` -> 100015",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100016,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "ui_key": "REMOVE_CLOTHES_CREASE_BOTTOM",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `REMOVE_CLOTHES_CREASE_BOTTOM` -> 100016",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100017,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "REMOVE_CLOTHES_CREASE_BOTTOM_COARSE",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `REMOVE_CLOTHES_CREASE_BOTTOM_COARSE` -> 100017",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 100018,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "ui_key": "REMOVE_CLOTHES_CREASE_BOTTOM_DETAIL",
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.85,
+      "evidence": "shipped UI bundle maps `REMOVE_CLOTHES_CREASE_BOTTOM_DETAIL` -> 100018",
+      "effect_name_similarity_candidates": [
+        "ClothesBlemishRemoval"
+      ],
+      "shader_groups": []
+    },
+    {
+      "id": 900109,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "eyeLightPath",
+      "ui_label": "眼瞳光",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyeLightPath` -> 900109",
+      "effect_name_similarity_candidates": [
+        "FaceHighLightEnhance"
+      ],
+      "shader_groups": [
+        "Light",
+        "BrightEye"
+      ]
+    },
+    {
+      "id": 900110,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "faceDecorationPath",
+      "ui_label": "脸部装饰",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `faceDecorationPath` -> 900110",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": [
+        "FaceRetouch",
+        "FaceSurgery"
+      ]
+    },
+    {
+      "id": 900111,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "contourPath",
+      "ui_label": "修容",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `contourPath` -> 900111",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 900112,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "silkwormPath",
+      "ui_label": "卧蚕",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `silkwormPath` -> 900112",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 900113,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "SkinTexture/00",
+      "ui_key": null,
+      "ui_label": null,
+      "ui_group": null,
+      "resolved_by": "preset_string_enum",
+      "confidence": 0.7,
+      "evidence": "preset stores `se` = \"SkinTexture/00\", a material/style slot",
+      "effect_name_similarity_candidates": [],
+      "shader_groups": []
+    },
+    {
+      "id": 900114,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "ui_key": "eyelinerPath",
+      "ui_label": "眼线",
+      "ui_group": null,
+      "resolved_by": "ui_bundle_param_registry",
+      "confidence": 0.95,
+      "evidence": "shipped UI bundle maps `eyelinerPath` -> 900114",
+      "effect_name_similarity_candidates": [
+        "Eyeliner"
+      ],
+      "shader_groups": []
+    }
+  ],
+  "unresolved": [
+    {
+      "id": 21032,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21031": "yinyingBlendMode",
+        "21030": "xuhuaFanwei",
+        "21029": "jianbian"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21033,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21031": "yinyingBlendMode",
+        "21030": "xuhuaFanwei",
+        "21029": "jianbian"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21034,
+      "preset_group": "COMMON",
+      "default": 0.6,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21031": "yinyingBlendMode",
+        "21030": "xuhuaFanwei",
+        "21029": "jianbian"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21035,
+      "preset_group": "COMMON",
+      "default": 0.525,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21031": "yinyingBlendMode",
+        "21040": "yinyingSucaiPath",
+        "21030": "xuhuaFanwei"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21036,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21040": "yinyingSucaiPath",
+        "21031": "yinyingBlendMode",
+        "21042": "aiYinyingSwitch"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21037,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21040": "yinyingSucaiPath",
+        "21042": "aiYinyingSwitch",
+        "21043": "aiYinyingChengdu"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21038,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21040": "yinyingSucaiPath",
+        "21042": "aiYinyingSwitch",
+        "21043": "aiYinyingChengdu"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21039,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21040": "yinyingSucaiPath",
+        "21042": "aiYinyingSwitch",
+        "21043": "aiYinyingChengdu"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21077,
+      "preset_group": "PT_P",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21076": "smileDegree_closeMouth",
+        "21075": "removeSpill",
+        "21071": "removePerioralWrinkles"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21092,
+      "preset_group": "PT_P",
+      "default": null,
+      "string_enum": "",
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21093": "irisEditingSwitch",
+        "21094": "irisEditingDirectSwitch",
+        "21095": "irisEditingLeftHorizontal"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21106,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21105": "skinUnifyColorPicker",
+        "21104": "removeNoseFlaw",
+        "21100": "irisEditingRightScale"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21107,
+      "preset_group": "PT_F",
+      "default": null,
+      "string_enum": "",
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21105": "skinUnifyColorPicker",
+        "21104": "removeNoseFlaw",
+        "21100": "irisEditingRightScale"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21135,
+      "preset_group": "COMMON",
+      "default": 0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21138": "CLOTHES_SWEAT_STAIN_REMOVAL",
+        "21105": "skinUnifyColorPicker",
+        "21104": "removeNoseFlaw"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 21136,
+      "preset_group": "COMMON",
+      "default": 60.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "21000-21999 face retouch v2",
+      "nearest_ui_ids": {
+        "21138": "CLOTHES_SWEAT_STAIN_REMOVAL",
+        "21105": "skinUnifyColorPicker",
+        "21104": "removeNoseFlaw"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 30003,
+      "preset_group": "PT_F",
+      "default": 0.5,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "30004": "blusherColor",
+        "30005": "eyelashColor",
+        "30006": "eyebrowColor"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 30208,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "30207": "mouthAngulusPlump",
+        "30209": "jawlineEnhance",
+        "30210": "fullFacePlump"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 31655,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "31561": "facialLiftMouthDegree",
+        "31933": "facialLiftMidFaceDegree",
+        "32035": "mouthJawReshapeContour"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 34241,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "34722": "facialLiftEyeDegree",
+        "34794": "facialLiftContourDegree",
+        "35040": "shuipingFanzhuan"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 34583,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "34722": "facialLiftEyeDegree",
+        "34794": "facialLiftContourDegree",
+        "35040": "shuipingFanzhuan"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 34678,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "34722": "facialLiftEyeDegree",
+        "34794": "facialLiftContourDegree",
+        "35040": "shuipingFanzhuan"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 35846,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "35470": "facialLiftEyeSmoothDegree",
+        "35040": "shuipingFanzhuan",
+        "36671": "mouthJawReshape"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 37926,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "37595": "mouthJawReshapeShadow",
+        "38556": "increaseBreast",
+        "36965": "tiankongJianbian"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 39129,
+      "preset_group": "COMMON",
+      "default": 1.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "30000-39999 body/skin/makeup",
+      "nearest_ui_ids": {
+        "38556": "increaseBreast",
+        "39753": "facialLiftMouthLiquifyDegree",
+        "39798": "xuanzhuanJiaodu"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 90043,
+      "preset_group": "COMMON",
+      "default": 0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "90000-90999 makeup/material",
+      "nearest_ui_ids": {
+        "90042": "bianyuantiaozheng",
+        "90041": "aiBodyReshape",
+        "90046": "symmetryReshapeSwitch"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 90044,
+      "preset_group": "COMMON",
+      "default": 0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "90000-90999 makeup/material",
+      "nearest_ui_ids": {
+        "90042": "bianyuantiaozheng",
+        "90046": "symmetryReshapeSwitch",
+        "90041": "aiBodyReshape"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 90059,
+      "preset_group": "COMMON",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "90000-90999 makeup/material",
+      "nearest_ui_ids": {
+        "90060": "butouming",
+        "90061": "quxiaci_chengdu",
+        "90057": "jingwuShuixiaoXuhua"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 90110,
+      "preset_group": "COMMON",
+      "default": 0.5,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "90000-90999 makeup/material",
+      "nearest_ui_ids": {
+        "90111": "chuizhiWeizhi",
+        "90112": "shuipingWeizhi",
+        "90113": "removeStrayHair_person"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 100001,
+      "preset_group": "PT_F",
+      "default": 0.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "100000+ AI eye/clothes",
+      "nearest_ui_ids": {
+        "100004": "redBloodRemoval",
+        "100005": "eyeWhitePurify",
+        "100007": "smileDegree_openMouth"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 100002,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "100000+ AI eye/clothes",
+      "nearest_ui_ids": {
+        "100004": "redBloodRemoval",
+        "100005": "eyeWhitePurify",
+        "100007": "smileDegree_openMouth"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    },
+    {
+      "id": 100003,
+      "preset_group": "PT_F",
+      "default": 1.0,
+      "string_enum": null,
+      "attempted": [
+        "effect-config ParamFlag scan: absent",
+        "UI bundle registry: absent",
+        "preset string enum: absent/empty",
+        "base DB dump: no parameter table"
+      ],
+      "id_band": "100000+ AI eye/clothes",
+      "nearest_ui_ids": {
+        "100004": "redBloodRemoval",
+        "100005": "eyeWhitePurify",
+        "100007": "smileDegree_openMouth"
+      },
+      "resolved_by": "id_range_inference",
+      "confidence": 0.2
+    }
+  ]
+}

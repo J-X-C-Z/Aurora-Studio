@@ -1,0 +1,30 @@
+{
+  "family": "TeethWhitenV3_PixCook",
+  "note": "toothMask.png is the static 111x43 mask; live teeth mask is FaceParsingV2 id2.G",
+  "param_flag": 108,
+  "order": "whiten then bright",
+  "assets": [
+    {
+      "file": "Whiten.png",
+      "bytes": 99654,
+      "config_field": "WhitenLutPath",
+      "sha256": "09D42DF0C193ACC72F8700D6197FF5C2C2BDC3392678710AAB0AEC3593517CC4",
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\TeethWhitenV3\\Whiten.png"
+    },
+    {
+      "file": "Bright.png",
+      "bytes": 196345,
+      "config_field": "BrightLutPath",
+      "sha256": "BBE841A751DD7AA78D0D1386C3CC685722C6371C3C913041BC9BF3143C9D126C",
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\TeethWhitenV3\\Bright.png"
+    },
+    {
+      "file": "toothMask.png",
+      "bytes": 1850,
+      "config_field": "ToothMaskPath",
+      "sha256": "17F866BF942B223CAADDDEEA7CCCC2B3C2B3D8CFA2B0D3E725E8FEC06B291B4C",
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\SkinAdjust\\toothMask.png"
+    }
+  ],
+  "schema": "aurora-local-teeth-assets/1"
+}

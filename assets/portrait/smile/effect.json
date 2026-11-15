@@ -1,0 +1,47 @@
+{
+  "Effects": [
+    {
+      "EffectName": "DL3D_Warp",
+      "WarpType": 1,
+      "MeanShape": "meanshape.obj",
+      "ReshapeList": [
+        "normal.obj",
+        "side_right.obj",
+        "side_left.obj"
+      ],
+      "MeshType": 0,
+      "EnableFresnelFactor": false,
+      "EnableFaceParsing": true,
+      "ErodeInterval": 3.0,
+      "Opacity": 90,
+      "AngleRange": [
+        28.420000076293945,
+        -28.420000076293945
+      ],
+      "DistRatioRange": [
+        5.050000190734863,
+        0.0009999939939007163
+      ],
+      "ForceUseNormalRender": true,
+      "ParamFlag": 8033,
+      "DefaultDegree": 100,
+      "DegreeRange": [
+        0,
+        100
+      ],
+      "EnableDegreeRemap": false,
+      "bPreCompute": false,
+      "FemaleDegreeFactor": 1.0,
+      "MaleDegreeFactor": 1.0,
+      "ChildDegreeFactor": 1.0,
+      "OlderDegreeFactor": 1.0,
+      "SmallFaceDegreeFactor": 1.0,
+      "StartRenderTime": [
+        0
+      ],
+      "RenderDuration": [
+        9223372036854775806
+      ]
+    }
+  ]
+}
