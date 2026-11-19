@@ -39,7 +39,7 @@ impl LiveView {
                 let started = std::time::Instant::now();
                 let Some((engine, paused)) = this.update(cx, |v, cx| (v.state.read(cx).engine.clone(), v.paused)).ok() else { break };
                 if !paused {
-                    let frame = cx.background_spawn(async move { engine.live_view_frame(1280).map(|f| to_render_image(&f)) }).await;
+                    let frame = cx.background_spawn(async move { engine.live_view_frame(1280).map(to_render_image) }).await;
                     let alive = this
                         .update(cx, |v, cx| {
                             v.supported = frame.is_some();

@@ -7,10 +7,14 @@ namespace {
 
 constexpr int kLutEdge = 64;
 constexpr float kLutSpan = 63.0f;
-constexpr float kInv255 = 1.0f / 255.0f;
 
 __device__ __forceinline__ float clamp01(float value) {
   return fminf(fmaxf(value, 0.0f), 1.0f);
+}
+
+__device__ __forceinline__ float div255(uint8_t value) {
+  // Match the CPU oracle at one-LSB rounding boundaries.
+  return __fdiv_rn(static_cast<float>(value), 255.0f);
 }
 
 __device__ __forceinline__ float lerp_rn(float a, float b, float t) {
@@ -93,16 +97,14 @@ extern "C" __global__ void pf90021_lut64_pass_kernel(
 
   const uint8_t* src = source + source_index;
   const float3 rgb = make_float3(
-      __fmul_rn(static_cast<float>(src[0]), kInv255),
-      __fmul_rn(static_cast<float>(src[1]), kInv255),
-      __fmul_rn(static_cast<float>(src[2]), kInv255));
+      div255(src[0]), div255(src[1]), div255(src[2]));
   const float3 mapped = sample_lut64(volume, rgb);
   const int output_index =
       pixel_index(params.width, params.height, params.output_stride, 16);
   uint8_t* output_bytes = reinterpret_cast<uint8_t*>(output);
   float4* dst = reinterpret_cast<float4*>(output_bytes + output_index);
   *dst = make_float4(clamp01(mapped.x), clamp01(mapped.y), clamp01(mapped.z),
-                     __fmul_rn(static_cast<float>(src[3]), kInv255));
+                     div255(src[3]));
 }
 
 extern "C" __global__ void pf90021_mask_composite_kernel(
@@ -126,13 +128,12 @@ extern "C" __global__ void pf90021_mask_composite_kernel(
   const uint8_t* effect_bytes = reinterpret_cast<const uint8_t*>(effect);
   const float4* mapped =
       reinterpret_cast<const float4*>(effect_bytes + effect_index);
-  const float mask_weight =
-      __fmul_rn(static_cast<float>(mask[mask_index]), kInv255);
+  const float mask_weight = div255(mask[mask_index]);
   const float alpha = __fmul_rn(clamp01(params.u_alpha), mask_weight);
 
-  const float src_r = __fmul_rn(static_cast<float>(src[0]), kInv255);
-  const float src_g = __fmul_rn(static_cast<float>(src[1]), kInv255);
-  const float src_b = __fmul_rn(static_cast<float>(src[2]), kInv255);
+  const float src_r = div255(src[0]);
+  const float src_g = div255(src[1]);
+  const float src_b = div255(src[2]);
   uint8_t* dst = output + output_index;
   dst[0] = half_up_u8(lerp_rn(src_r, mapped->x, alpha));
   dst[1] = half_up_u8(lerp_rn(src_g, mapped->y, alpha));

@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 log.workspace = true
+rayon = "1.10"
 image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"
 

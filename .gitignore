@@ -1,6 +1,7 @@
 # Rust / Cargo
 /target/
 **/*.rs.bk
+*.conflict
 
 # Capture One / third-party reference assets are local-only.
 /crates/engine/testdata/

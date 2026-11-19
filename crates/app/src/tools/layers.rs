@@ -213,6 +213,7 @@ fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoEle
             MaskShape::Radial(_) if crate::state::is_full(&mask) => (IconName::Square, t("Whole frame", "整幅画面").to_string()),
             MaskShape::Radial(_) => (IconName::CircleDot, t("Radial gradient", "径向渐变").to_string()),
             MaskShape::Ai(a) => (IconName::Sparkles, format!("AI · {}", ai_name(a.kind))),
+            MaskShape::Raster(r) => (IconName::Square, format!("{} · {}×{}", t("Raster mask", "栅格蒙版"), r.width, r.height)),
             MaskShape::Copy { .. } => (IconName::Copy, t("Copied mask", "复制的蒙版").to_string()),
         };
         let st = state.clone();

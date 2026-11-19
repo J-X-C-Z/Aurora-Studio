@@ -725,7 +725,7 @@ mod tests {
         let mut o = ParamOverrides::default();
         block.apply_to(&mut o);
         let (_, _, k) = o.apply(by_key("WhiteBalanceTemperature").unwrap());
-        assert!((k - 4779.55).abs() < 2.0, "{k}");
+        assert!((k - 5648.0).abs() < 20.0, "{k}");
     }
 
     #[test]

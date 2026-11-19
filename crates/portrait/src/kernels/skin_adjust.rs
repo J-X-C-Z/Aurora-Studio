@@ -753,6 +753,55 @@ impl BodyHlfUniforms {
     }
 }
 
+/// Vendor PF30022 adjust-LUT shared by the CPU and CUDA spotless branch.
+///
+/// The recovered asset is one `256x1` `GL_LUMINANCE` row. A byte value `v`
+/// means `v / 255`. Sampling is linear on the x pixel centres with
+/// clamp-to-edge borders; `degree` only weights the post-LUT result.
+/// Fractions are quantised to the same 8-bit integer weights on both backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdjustLut<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub luma: &'a [u8],
+}
+
+impl<'a> AdjustLut<'a> {
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.width < 2 || self.height != 1 {
+            return Err(Refusal::ShapeMismatch("adjust_lut"));
+        }
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize);
+        if expected != Some(self.luma.len()) || self.width > i32::MAX as u32 {
+            return Err(Refusal::ShapeMismatch("adjust_lut"));
+        }
+        Ok(())
+    }
+
+    fn sample(&self, u: f32) -> f32 {
+        let u = u.clamp(0.0, 1.0);
+        let fx = u * self.width as f32 - 0.5;
+        let x0f = fx.floor();
+        let x0_raw = x0f as i32;
+        let kx = ((fx - x0f) * 256.0 + 0.5).floor() as i32;
+        let x0 = x0_raw.clamp(0, self.width as i32 - 1) as usize;
+        let x1 = (x0_raw + 1).clamp(0, self.width as i32 - 1) as usize;
+        let q = self.luma[x0] as i32 * (256 - kx) + self.luma[x1] as i32 * kx;
+        q as f32 / (255.0 * 256.0)
+    }
+
+    fn body_adjusted(&self, high_r: f32) -> [f32; 3] {
+        let first = self.sample(high_r * 0.5 + 0.5);
+        let second = self.sample(first);
+        [
+            (first - 0.5) * 2.0,
+            (second - 0.5) * 2.0,
+            (second - 0.5) * 2.0,
+        ]
+    }
+}
+
 /// PF30022: body ROI writeback. Pixels outside the ROI and every alpha byte are
 /// preserved. The adjust LUT is a required live input when spotless is active.
 pub fn body_hlf_apply(
@@ -764,7 +813,7 @@ pub fn body_hlf_apply(
     skin_mask: &[f32],
     ui: f32,
     uniforms: BodyHlfUniforms,
-    adjust_lut: Option<&dyn Fn(f32) -> [f32; 3]>,
+    adjust_lut: Option<&AdjustLut<'_>>,
 ) -> Result<Image, Refusal> {
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
         return Err(Refusal::ValueOutOfRange("ui"));
@@ -801,6 +850,9 @@ pub fn body_hlf_apply(
     if uniforms.spotless_degree > 0.0 && adjust_lut.is_none() {
         return Err(Refusal::MissingInput("adjust_lut"));
     }
+    if let Some(lut) = adjust_lut {
+        lut.validate()?;
+    }
 
     for y in roi.y..roi.y + roi.height {
         for x in roi.x..roi.x + roi.width {
@@ -835,18 +887,7 @@ pub fn body_hlf_apply(
 
             if uniforms.spotless_degree > 0.0 {
                 let lut = adjust_lut.expect("checked above");
-                let probe = [
-                    high[0] * 0.5 + 0.5,
-                    high[1] * 0.5 + 0.5,
-                    high[2] * 0.5 + 0.5,
-                ];
-                let common = lut(probe[0])[0];
-                let channels = lut(common);
-                let adjusted = [
-                    (channels[0] - 0.5) * 2.0,
-                    (channels[1] - 0.5) * 2.0,
-                    (channels[2] - 0.5) * 2.0,
-                ];
+                let adjusted = lut.body_adjusted(high[0]);
                 let magnitude = (adjusted[0] * adjusted[0]
                     + adjusted[1] * adjusted[1]
                     + adjusted[2] * adjusted[2])
@@ -1312,6 +1353,41 @@ mod tests {
                 None
             ),
             Err(Refusal::MissingInput("adjust_lut"))
+        );
+    }
+
+    #[test]
+    fn adjust_lut_contract_is_single_row_luminance_with_clamp_to_edge() {
+        let luma = [0, 64, 128, 255];
+        let lut = AdjustLut {
+            width: 4,
+            height: 1,
+            luma: &luma,
+        };
+        lut.validate().unwrap();
+        assert_eq!(lut.sample(-1.0), 0.0);
+        assert!((lut.sample(0.125) - 0.0).abs() < 1e-7);
+        assert!((lut.sample(0.375) - 64.0 / 255.0).abs() < 1e-7);
+        assert!((lut.sample(0.625) - 128.0 / 255.0).abs() < 1e-7);
+        assert_eq!(lut.sample(2.0), 1.0);
+        let first = lut.sample(0.5);
+        let second = lut.sample(first);
+        assert_eq!(
+            lut.body_adjusted(0.0),
+            [
+                (first - 0.5) * 2.0,
+                (second - 0.5) * 2.0,
+                (second - 0.5) * 2.0,
+            ]
+        );
+        assert_eq!(
+            AdjustLut {
+                width: 4,
+                height: 2,
+                luma: &luma,
+            }
+            .validate(),
+            Err(Refusal::ShapeMismatch("adjust_lut"))
         );
     }
 

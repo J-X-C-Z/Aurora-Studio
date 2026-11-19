@@ -273,6 +273,15 @@ impl FrameMap {
         self.oriented
     }
 
+    pub(crate) fn is_identity(&self) -> bool {
+        self.crop == NormRect::FULL
+            && self.keystone.is_none()
+            && self.rotation.abs() <= 1e-5
+            && self.orientation == 0
+            && !self.flip_h
+            && !self.flip_v
+    }
+
     /// Frame point → (oriented-image point, source point).
     pub(crate) fn map(&self, f: [f32; 2]) -> ([f32; 2], [f32; 2]) {
         let f = finite_pair(f);
@@ -302,6 +311,37 @@ impl FrameMap {
         };
         (oriented, finite_pair(s))
     }
+
+    /// Same mapping for internally validated finite coordinates. The public
+    /// path keeps finite-value cleanup; render loops already clean their region
+    /// and geometry once, so repeating those checks per pixel only adds work.
+    pub(crate) fn map_clean(&self, f: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+        let (ow, oh) = self.oriented;
+        let mut p = [self.crop.x + f[0] * self.crop.width, self.crop.y + f[1] * self.crop.height];
+        if let Some(k) = &self.keystone {
+            p = k.apply(p);
+        }
+        if self.rotation.abs() > 1e-5 && ow > EPS && oh > EPS {
+            let (cx, cy) = ((p[0] - 0.5) * ow, (p[1] - 0.5) * oh);
+            let (s, c) = (self.rotation_sin, self.rotation_cos);
+            p = [(cx * c - cy * s) / ow + 0.5, (cx * s + cy * c) / oh + 0.5];
+        }
+        let oriented = p;
+        let mut q = p;
+        if self.flip_h {
+            q[0] = 1.0 - q[0];
+        }
+        if self.flip_v {
+            q[1] = 1.0 - q[1];
+        }
+        let source = match self.orientation {
+            1 => [q[1], 1.0 - q[0]],
+            2 => [1.0 - q[0], 1.0 - q[1]],
+            3 => [1.0 - q[1], q[0]],
+            _ => q,
+        };
+        (oriented, source)
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +358,72 @@ mod tests {
     fn default_centre_is_identity() {
         assert_near(frame_to_source([0.5, 0.5], &Geometry::default(), SRC), [0.5, 0.5]);
         assert_near(frame_to_oriented([0.5, 0.5], &Geometry::default()), [0.5, 0.5]);
+    }
+
+    #[test]
+    fn clean_map_is_bit_identical_for_valid_render_coordinates() {
+        let g = Geometry {
+            rotation: 13.5,
+            flip_horizontal: true,
+            orientation: 1,
+            crop: NormRect { x: 0.07, y: 0.11, width: 0.82, height: 0.73 },
+            keystone: Keystone {
+                amount: 20.0,
+                vertical: 10.0,
+                horizontal: -5.0,
+                aspect: 2.0,
+            },
+            ..Geometry::default()
+        };
+        let map = FrameMap::new(SRC, &g);
+        for y in 0..=32 {
+            for x in 0..=32 {
+                let point = [x as f32 / 32.0, y as f32 / 32.0];
+                let expected = map.map(point);
+                let actual = map.map_clean(point);
+                assert_eq!(
+                    (
+                        expected.0.map(f32::to_bits),
+                        expected.1.map(f32::to_bits)
+                    ),
+                    (
+                        actual.0.map(f32::to_bits),
+                        actual.1.map(f32::to_bits)
+                    ),
+                    "{point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "profiles validated-coordinate mapping"]
+    fn bench_clean_map_2m() {
+        use std::time::Instant;
+
+        let g = Geometry {
+            rotation: 13.5,
+            crop: NormRect { x: 0.07, y: 0.11, width: 0.82, height: 0.73 },
+            ..Geometry::default()
+        };
+        let map = FrameMap::new(SRC, &g);
+        let measure = |clean: bool| {
+            let started = Instant::now();
+            let mut sum = 0.0f32;
+            for i in 0..2_000_000u32 {
+                let point = [(i % 2000) as f32 / 1999.0, (i / 2000) as f32 / 999.0];
+                let out = if clean { map.map_clean(point) } else { map.map(point) };
+                sum += out.1[0] + out.1[1];
+            }
+            (started.elapsed().as_secs_f64() * 1000.0, sum)
+        };
+        let (checked, sum_a) = measure(false);
+        let (clean, sum_b) = measure(true);
+        assert_eq!(sum_a.to_bits(), sum_b.to_bits());
+        println!(
+            "FRAME_MAP 2m checked={checked:.2} ms clean={clean:.2} ms speedup={:.2}x",
+            checked / clean
+        );
     }
 
     #[test]
@@ -544,6 +650,28 @@ mod tests {
                 assert_eq!(map.map(f), reference, "case {i}, point {f:?}");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "profiles identity FrameMap versus direct coordinates"]
+    fn bench_identity_frame_map() {
+        use std::time::Instant;
+        let map = FrameMap::new(SRC, &Geometry::default());
+        assert!(map.is_identity());
+        let points: Vec<[f32; 2]> = (0..1_000_000)
+            .map(|i| [(i % SRC.0 as usize) as f32 / SRC.0 as f32, (i / SRC.0 as usize) as f32 / SRC.1 as f32])
+            .collect();
+        let start = Instant::now();
+        for &point in &points {
+            std::hint::black_box(map.map(point));
+        }
+        let full_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = Instant::now();
+        for &point in &points {
+            std::hint::black_box(point);
+        }
+        let direct_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!("IDENTITY_FRAME_MAP full={full_ms:.3} ms direct={direct_ms:.3} ms");
     }
 
     #[test]

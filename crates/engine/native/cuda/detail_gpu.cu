@@ -201,10 +201,9 @@ __device__ __forceinline__ float3 sample_bilinear(
             int sx = clampi(x0 + dx, 0, w - 1);
             int sy = clampi(y0 + dy, 0, h - 1);
             uchar4 p = src[sy * w + sx];
-            float weight = wx * wy;
-            acc.x += (float)p.x * weight;
-            acc.y += (float)p.y * weight;
-            acc.z += (float)p.z * weight;
+            acc.x += (float)p.x * wx * wy;
+            acc.y += (float)p.y * wx * wy;
+            acc.z += (float)p.z * wx * wy;
         }
     }
     return acc;

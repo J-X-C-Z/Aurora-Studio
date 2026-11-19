@@ -1912,6 +1912,32 @@ mod tests {
     }
 
     #[test]
+    fn chromatic_aberration_columns_reach_the_model() {
+        let c = sample();
+        let lens = c
+            .variants
+            .iter()
+            .map(|v| &v.settings.lens)
+            .find(|l| l.chromatic_aberration.splines.len() == 2)
+            .expect("sample has a lens-corrected variant");
+        assert!(lens.chromatic_aberration_enabled);
+        assert_eq!(
+            lens.chromatic_aberration_origin,
+            crate::c1_model::ChromaAberOrigin::LensDb
+        );
+        let red = &lens.chromatic_aberration.splines[0];
+        let blue = &lens.chromatic_aberration.splines[1];
+        assert_eq!(red.len(), 3);
+        assert!((red[2].0 - 23742.6).abs() < 1e-2);
+        assert!((red[2].1 + 7.4068).abs() < 1e-3);
+        assert!((blue[2].1 + 4.7671).abs() < 1e-3);
+        // The sample stores "|||||": a six-field fringing record with no points.
+        assert!(lens.chroma_fringing.is_empty());
+        assert_eq!(lens.chromatic_aberration_custom_name, None);
+        assert_eq!(lens.purple_fringing, 0.0);
+    }
+
+    #[test]
     fn parses_column_list_from_create_table() {
         let cols = parse_columns(
             "CREATE TABLE \"t\" (\"Z_PK\" INTEGER PRIMARY KEY, ZNAME VARCHAR, amount REAL, PRIMARY KEY (Z_PK))",

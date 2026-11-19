@@ -108,6 +108,8 @@ pub enum MaskShape {
     Brush(BrushStroke),
     Linear(LinearGradient),
     Radial(RadialGradient),
+    /// A coverage bitmap decoded from a Capture One `.comask` mask.
+    Raster(RasterMask),
     /// A mask the engine computes, such as the subject or the sky.
     Ai(AiMask),
     /// A mask copied from another layer by id.
@@ -126,6 +128,55 @@ pub struct BrushStroke {
     pub opacity: f32,
     pub flow: f32,
     pub auto_mask: bool,
+    /// C1's `ZBRUSHAIRBRUSH`. Parsed and carried; the renderer ignores it.
+    #[serde(default)]
+    pub hair_brush: bool,
+    /// C1's `ZBRUSHUSEPENPRESSURE` (eraser strokes use `ZERASERUSEPENPRESSURE`).
+    #[serde(default)]
+    pub use_pen_pressure: bool,
+}
+
+/// A pixel mask over a normalized rectangle: `width * height` 8-bit coverage
+/// bytes, row-major, `rect = [x0, y0, x1, y1]` in oriented image coordinates.
+///
+/// This is the `.comask` `Map` bitmap after decoding, cropped to its non-zero
+/// bounding box, so an imported local layer carries its own geometry instead
+/// of an engine-side cache handle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RasterMask {
+    pub op: MaskOp,
+    pub rect: [f32; 4],
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<u8>,
+}
+
+impl RasterMask {
+    /// A one-pixel zero mask: keeps a layer attached without changing pixels.
+    pub fn empty(op: MaskOp) -> Self {
+        Self { op, rect: [0.0, 0.0, 1.0, 1.0], width: 1, height: 1, data: vec![0] }
+    }
+
+    /// Bilinear coverage at a normalized image point; `0.0` outside `rect`.
+    pub fn sample(&self, p: [f32; 2]) -> f32 {
+        let [x0, y0, x1, y1] = self.rect;
+        let (dw, dh) = (x1 - x0, y1 - y0);
+        if dw <= 0.0 || dh <= 0.0 || self.width == 0 || self.height == 0 {
+            return 0.0;
+        }
+        let (u, v) = ((p[0] - x0) / dw, (p[1] - y0) / dh);
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return 0.0;
+        }
+        let x = (u * self.width as f32 - 0.5).clamp(0.0, (self.width as f32 - 1.001).max(0.0));
+        let y = (v * self.height as f32 - 0.5).clamp(0.0, (self.height as f32 - 1.001).max(0.0));
+        let (xi, yi) = (x as usize, y as usize);
+        let (xn, yn) = ((xi + 1).min(self.width - 1), (yi + 1).min(self.height - 1));
+        let at = |xx: usize, yy: usize| self.data[yy * self.width + xx] as f32 / 255.0;
+        let top = at(xi, yi) + (at(xn, yi) - at(xi, yi)) * (x - xi as f32);
+        let bottom = at(xi, yn) + (at(xn, yn) - at(xi, yn)) * (x - xi as f32);
+        (top + (bottom - top) * (y - yi as f32)).clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -355,5 +406,19 @@ mod node_tests {
         assert!(a.levels.is_none());
         assert!(a.black_white.is_none());
         assert_eq!(a.exposure.exposure, 1.0);
+    }
+
+    #[test]
+    fn raster_mask_survives_a_json_round_trip() {
+        let shape = MaskShape::Raster(RasterMask {
+            op: MaskOp::Subtract,
+            rect: [0.1, 0.2, 0.9, 0.8],
+            width: 3,
+            height: 2,
+            data: vec![0, 64, 255, 128, 32, 7],
+        });
+        let json = serde_json::to_string(&shape).unwrap();
+        let back: MaskShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(shape, back);
     }
 }

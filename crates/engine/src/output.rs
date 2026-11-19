@@ -17,28 +17,11 @@ pub enum ExportFormat {
     Dng,
     Psd,
     WebP,
-    /// Capture One's JPEG QuickProof: a JPEG rendered at the preview/proxy
-    /// size. It is intentionally unsupported by the encoder; the enum exists so
-    /// a recipe can be represented without silently becoming a full JPEG.
-    JpegQuickProof,
-    /// Capture One's "Copy original files" mode. This is a copy path, not an
-    /// encoder; `encode()` must reject it.
-    Original,
 }
 
 impl ExportFormat {
-    pub const ALL: [Self; 10] = [
-        Self::Jpeg,
-        Self::JpegXl,
-        Self::Tiff,
-        Self::Png,
-        Self::Heif,
-        Self::Dng,
-        Self::Psd,
-        Self::WebP,
-        Self::JpegQuickProof,
-        Self::Original,
-    ];
+    pub const ALL: [Self; 8] =
+        [Self::Jpeg, Self::JpegXl, Self::Tiff, Self::Png, Self::Heif, Self::Dng, Self::Psd, Self::WebP];
 
     pub fn extension(self) -> &'static str {
         match self {
@@ -50,8 +33,6 @@ impl ExportFormat {
             Self::Dng => "dng",
             Self::Psd => "psd",
             Self::WebP => "webp",
-            Self::JpegQuickProof => "jpg",
-            Self::Original => "orig",
         }
     }
 
@@ -74,8 +55,6 @@ impl ExportFormat {
             Self::Dng => "DNG",
             Self::Psd => "PSD",
             Self::WebP => "WebP",
-            Self::JpegQuickProof => "JPEG QuickProof",
-            Self::Original => "Original",
         }
     }
 
@@ -84,7 +63,6 @@ impl ExportFormat {
     pub fn is_supported(self) -> bool {
         match self {
             Self::Heif => crate::heif_write::available(),
-            Self::JpegQuickProof | Self::Original => false,
             _ => matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::WebP),
         }
     }
@@ -106,12 +84,6 @@ impl ExportFormat {
     /// have a 16-bit encoder; requesting 16 bits for anything else is an
     /// error, never a silent downgrade.
     pub fn supports_bit_depth(self, depth: u8) -> anyhow::Result<()> {
-        if self == Self::Original {
-            anyhow::bail!("Original is a copy mode; it has no bit-depth encoder");
-        }
-        if self == Self::JpegQuickProof && depth == 8 {
-            return Ok(());
-        }
         match depth {
             8 => Ok(()),
             // HEIF stores 10/12-bit HEVC; the recipe's 16-bit buffer is
@@ -197,79 +169,6 @@ impl ScaleMode {
     ];
 }
 
-/// Capture One `ScalingUnit` (`0` pixel, `1` inch, `2` millimetre, `3` centimetre).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ScaleUnit {
-    #[default]
-    Pixel,
-    Inch,
-    Millimeter,
-    Centimeter,
-}
-
-impl ScaleUnit {
-    pub fn from_c1(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Pixel),
-            1 => Some(Self::Inch),
-            2 => Some(Self::Millimeter),
-            3 => Some(Self::Centimeter),
-            _ => None,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pixel => "px",
-            Self::Inch => "in",
-            Self::Millimeter => "mm",
-            Self::Centimeter => "cm",
-        }
-    }
-}
-
-/// Capture One `ScalingMethod` (`0` fixed, `1` width, `2` height, `3` size,
-/// `4` width-by-height, `5` long edge, `6` short edge).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SizeMode {
-    #[default]
-    Fixed,
-    Width,
-    Height,
-    Size,
-    WidthByHeight,
-    LongEdge,
-    ShortEdge,
-}
-
-/// A parsed C1 size request. `width`/`height` are in `unit`; for `Fixed` only
-/// `fixed_percent` is used. This is deliberately separate from the legacy
-/// `scale`/`scale_value` fields so parsing a recipe does not change the export
-/// path until backend-opt wires `target_size`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SizeRequest {
-    pub mode: SizeMode,
-    pub width: f32,
-    pub height: f32,
-    pub unit: ScaleUnit,
-    pub fixed_percent: f32,
-    pub never_upscale: bool,
-}
-
-impl Default for SizeRequest {
-    fn default() -> Self {
-        Self {
-            mode: SizeMode::Fixed,
-            width: 0.0,
-            height: 0.0,
-            unit: ScaleUnit::Pixel,
-            fixed_percent: 100.0,
-            never_upscale: false,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OutputSharpening {
     #[default]
@@ -347,9 +246,6 @@ pub struct ProcessRecipe {
     pub resolution_ppi: u32,
     pub scale: ScaleMode,
     pub scale_value: (u32, u32),
-    /// C1 size request, kept separate from `scale`/`scale_value` until the
-    /// export path opts into `target_size`.
-    pub size: Option<SizeRequest>,
     pub output_sharpening: OutputSharpening,
     pub output_sharpening_settings: Option<OutputSharpeningSettings>,
     /// Folder; `None` writes beside the source in an "Output" folder.
@@ -376,7 +272,6 @@ impl Default for ProcessRecipe {
             resolution_ppi: 300,
             scale: ScaleMode::Fixed100,
             scale_value: (0, 0),
-            size: None,
             output_sharpening: OutputSharpening::Disabled,
             output_sharpening_settings: None,
             destination: None,

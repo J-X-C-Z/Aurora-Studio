@@ -79,6 +79,7 @@ pub fn add_shape(mask: &mut Mask, shape: MaskShape) {
     let adds = match &shape {
         MaskShape::Brush(b) => b.op == MaskOp::Add,
         MaskShape::Linear(_) | MaskShape::Radial(_) | MaskShape::Ai(_) => true,
+        MaskShape::Raster(r) => r.op == MaskOp::Add,
         MaskShape::Copy { op, .. } => *op == MaskOp::Add,
     };
     if adds && is_full(mask) {

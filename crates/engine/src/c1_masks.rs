@@ -48,7 +48,7 @@ use crate::c1_model::{
     gains_to_kelvin_tint, levels_from_c1, C1Brush, C1Eraser, C1EntityKind, ColorCorrection,
 };
 use crate::layers::{
-    BrushStroke, Layer, LayerKind, LocalAdjustments, Mask, MaskOp, MaskShape,
+    BrushStroke, Layer, LayerKind, LocalAdjustments, Mask, MaskOp, MaskShape, RasterMask,
 };
 
 /// The brush-tool columns of one local mask layer.
@@ -65,6 +65,10 @@ pub struct C1MaskLayer {
     pub surface_smoothness: f32,
     pub brush: C1Brush,
     pub eraser: C1Eraser,
+    /// `ZBRUSHSTYLEUUID` / `ZBRUSHSTYLENAME`: the selected brush preset.
+    /// Parsed for round-trip bookkeeping; the renderer does not read them.
+    pub brush_style_uuid: Option<String>,
+    pub brush_style_name: Option<String>,
     /// The layer's own colour adjustments, already in engine form.
     pub adjustments: LocalAdjustments,
 }
@@ -121,8 +125,7 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
                 blacks: s.blacks_recovery,
             },
             clarity: Clarity {
-                // Numeric mapping of ZCLARITYMETHOD is unproven; keep C1's order.
-                method: ClarityMethod::ALL[(s.clarity_method.clamp(0, 3)) as usize],
+                method: ClarityMethod::from_c1(s.clarity_method),
                 clarity: s.clarity,
                 structure: s.clarity_structure,
             },
@@ -153,6 +156,8 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
             surface_smoothness: s.surface_smoothness,
             brush: s.brush,
             eraser: s.eraser,
+            brush_style_uuid: row.get("ZBRUSHSTYLEUUID").cloned().flatten(),
+            brush_style_name: row.get("ZBRUSHSTYLENAME").cloned().flatten(),
             adjustments,
         }
     })
@@ -196,6 +201,8 @@ impl C1MaskLayer {
                 opacity: self.brush.opacity,
                 flow: self.brush.flow,
                 auto_mask: self.brush.auto_mask,
+                hair_brush: self.brush.hair_brush,
+                use_pen_pressure: self.brush.use_pen_pressure,
             }));
         }
         if !subtract.is_empty() {
@@ -207,6 +214,10 @@ impl C1MaskLayer {
                 opacity: self.eraser.opacity,
                 flow: self.eraser.flow,
                 auto_mask: self.eraser.auto_mask,
+                // C1's eraser has an air-brush flag, not a hair brush; the
+                // closest stroke field stays false.
+                hair_brush: false,
+                use_pen_pressure: self.eraser.use_pen_pressure,
             }));
         }
         Layer {
@@ -226,6 +237,68 @@ impl C1MaskLayer {
             adjustments: self.adjustments.clone(),
         }
     }
+}
+
+/// Longest side of the raster kept in [`RasterMask`]. The renderer builds its
+/// mask grid 256 cells across, so 512 px is two samples per cell: enough to
+/// keep the decoded edge, cheap enough to clone with the layer every frame.
+const RASTER_LONG_SIDE: usize = 512;
+
+/// Crops a decoded `.comask` plane to its non-zero bounding box and turns it
+/// into an 8-bit [`RasterMask`]. `None` when the plane is empty.
+pub fn raster_shape_from_plane(
+    width: usize,
+    height: usize,
+    data: &[f32],
+    op: MaskOp,
+) -> Option<RasterMask> {
+    if width == 0 || height == 0 || data.len() < width * height {
+        return None;
+    }
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
+    for y in 0..height {
+        for x in 0..width {
+            if data[y * width + x] <= 0.0 {
+                continue;
+            }
+            bounds = Some(match bounds {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            });
+        }
+    }
+    let (x0, y0, x1, y1) = bounds?;
+    let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+    let scale = (RASTER_LONG_SIDE as f32 / bw.max(bh) as f32).min(1.0);
+    let out_w = ((bw as f32 * scale).round() as usize).max(1);
+    let out_h = ((bh as f32 * scale).round() as usize).max(1);
+    let mut cells = Vec::with_capacity(out_w * out_h);
+    for y in 0..out_h {
+        let fy = y0 as f32 + (y as f32 + 0.5) * bh as f32 / out_h as f32;
+        for x in 0..out_w {
+            let fx = x0 as f32 + (x as f32 + 0.5) * bw as f32 / out_w as f32;
+            let (xi, yi) = (fx.floor() as usize, fy.floor() as usize);
+            let (xn, yn) = ((xi + 1).min(width - 1), (yi + 1).min(height - 1));
+            let (tx, ty) = (fx - xi as f32, fy - yi as f32);
+            let at = |xx: usize, yy: usize| data[yy * width + xx];
+            let top = at(xi, yi) + (at(xn, yi) - at(xi, yi)) * tx;
+            let bottom = at(xi, yn) + (at(xn, yn) - at(xi, yn)) * tx;
+            let v = (top + (bottom - top) * ty).clamp(0.0, 1.0);
+            cells.push((v * 255.0 + 0.5) as u8);
+        }
+    }
+    Some(RasterMask {
+        op,
+        rect: [
+            x0 as f32 / width as f32,
+            y0 as f32 / height as f32,
+            (x1 + 1) as f32 / width as f32,
+            (y1 + 1) as f32 / height as f32,
+        ],
+        width: out_w,
+        height: out_h,
+        data: cells,
+    })
 }
 
 #[cfg(test)]
@@ -340,6 +413,27 @@ mod tests {
         assert_eq!(a.dehaze.shadow_tone, [0.1, 0.2, 0.3]);
         assert!(a.white_balance.is_some(), "a non-neutral ZWHITEBALANCE must survive");
         assert_eq!((a.exposure.saturation, a.exposure.brightness), (13.33, 7.536));
+    }
+
+    /// A decoded plane becomes a raster cropped to its non-zero bbox; the
+    /// rect is normalized against the whole canvas.
+    #[test]
+    fn plane_maps_to_a_cropped_normalized_raster() {
+        let (w, h) = (8usize, 4usize);
+        let mut data = vec![0.0f32; w * h];
+        data[w + 2] = 1.0;
+        data[w + 3] = 1.0;
+        data[2 * w + 2] = 1.0;
+        data[2 * w + 3] = 1.0;
+        data[2 * w + 5] = 0.5;
+        let raster = raster_shape_from_plane(w, h, &data, MaskOp::Add).expect("non-empty plane");
+        assert_eq!((raster.width, raster.height), (4, 2));
+        assert_eq!(raster.rect, [2.0 / 8.0, 1.0 / 4.0, 6.0 / 8.0, 3.0 / 4.0]);
+        assert!(raster.sample([2.5 / 8.0, 1.5 / 4.0]) > 0.9, "the first cell must stay full");
+        assert!(raster.sample([5.5 / 8.0, 2.5 / 4.0]) > 0.1, "the half cell must survive");
+
+        let empty = vec![0.0f32; w * h];
+        assert!(raster_shape_from_plane(w, h, &empty, MaskOp::Add).is_none());
     }
 
     /// Both rows are real C1 editor state: the eight basic bands are always
@@ -622,5 +716,79 @@ mod tests {
         assert!(summaries[0].mask_uuid.is_some());
         assert_eq!(summaries[0].kind, LayerKind::Adjustment);
         assert_eq!(summaries[1].name, "Skin Mask 1");
+    }
+}
+
+/// r87: all 16 brush columns are readable and land on the layer.
+#[cfg(test)]
+mod brush_wire_tests {
+    use super::*;
+
+    const COLUMNS: [&str; 16] = [
+        "ZBRUSHSTYLEUUID", "ZBRUSHSTYLENAME", "ZBRUSHSIZE", "ZBRUSHHARDNESS",
+        "ZBRUSHOPACITY", "ZBRUSHFLOW", "ZBRUSHAIRBRUSH", "ZBRUSHUSEPENPRESSURE",
+        "ZBRUSHAUTOMASK", "ZERASERSIZE", "ZERASERHARDNESS", "ZERASEROPACITY",
+        "ZERASERFLOW", "ZERASERAIRBRUSH", "ZERASERUSEPENPRESSURE", "ZERASERAUTOMASK",
+    ];
+
+    fn catalog() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb")
+    }
+
+    #[test]
+    fn all_sixteen_columns_exist_and_parse() {
+        let path = catalog();
+        let mut db = crate::c1catalog::SqliteReader::open(&path).unwrap();
+        let cols = db.columns("ZVARIANTLAYER").unwrap();
+        for name in COLUMNS {
+            assert!(cols.iter().any(|c| c == name), "{name} missing from ZVARIANTLAYER");
+        }
+        let cat = crate::C1Catalog::open_ro(&path).unwrap();
+        let layers: Vec<&C1MaskLayer> = cat.variants.iter().flat_map(|v| &v.local_layers).collect();
+        assert!(!layers.is_empty(), "fixture must carry local layers");
+        // Real data: hair brush never used, pen pressure used at least once.
+        assert!(layers.iter().all(|l| !l.brush.hair_brush && !l.eraser.air_brush));
+        assert!(layers.iter().any(|l| l.brush.use_pen_pressure || l.eraser.use_pen_pressure));
+        // The fixture has no brush preset.
+        assert!(layers.iter().all(|l| l.brush_style_uuid.is_none() && l.brush_style_name.is_none()));
+    }
+
+    #[test]
+    fn new_stroke_fields_reach_the_shape_and_default_false() {
+        let mut layer = C1MaskLayer {
+            index: 0,
+            name: None,
+            mask_uuid: None,
+            enabled: true,
+            opacity: 100.0,
+            surface_smoothness: 0.0,
+            brush: C1Brush { hair_brush: true, use_pen_pressure: true, ..Default::default() },
+            eraser: C1Eraser { use_pen_pressure: true, ..Default::default() },
+            brush_style_uuid: None,
+            brush_style_name: None,
+            adjustments: LocalAdjustments::default(),
+        };
+        let out = layer.to_layer(1, 1000.0, vec![[0.5, 0.5, 1.0]], vec![[0.2, 0.2, 1.0]]);
+        match (&out.mask.shapes[0], &out.mask.shapes[1]) {
+            (MaskShape::Brush(add), MaskShape::Brush(sub)) => {
+                assert!(add.hair_brush && add.use_pen_pressure);
+                assert!(!sub.hair_brush && sub.use_pen_pressure);
+            }
+            other => panic!("unexpected shapes {other:?}"),
+        }
+        layer.brush.hair_brush = false;
+        let out = layer.to_layer(2, 1000.0, vec![[0.5, 0.5, 1.0]], vec![]);
+        match &out.mask.shapes[0] {
+            MaskShape::Brush(add) => assert!(!add.hair_brush && add.use_pen_pressure),
+            other => panic!("unexpected shape {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strokes_without_the_new_fields_still_deserialize() {
+        let json = r#"{"op":"Add","points":[[0.5,0.5,1.0]],"size":0.1,"hardness":50.0,
+                       "opacity":100.0,"flow":100.0,"auto_mask":false}"#;
+        let stroke: BrushStroke = serde_json::from_str(json).unwrap();
+        assert!(!stroke.hair_brush && !stroke.use_pen_pressure);
     }
 }

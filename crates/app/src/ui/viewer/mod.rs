@@ -202,6 +202,8 @@ impl Viewer {
                             opacity: pr.brush_opacity,
                             flow: pr.brush_flow,
                             auto_mask: pr.brush_auto_mask,
+                            hair_brush: false,
+                            use_pen_pressure: false,
                         }))
                     }, cx)
                 });
@@ -261,7 +263,6 @@ impl Viewer {
                             a.white_balance.mode = WhiteBalanceMode::Custom;
                             a.white_balance.kelvin = k;
                             a.white_balance.tint = tint;
-                            a.white_balance.gains = None;
                         }, cx),
                         Err(err) => s.notify(err.to_string(), cx),
                     }

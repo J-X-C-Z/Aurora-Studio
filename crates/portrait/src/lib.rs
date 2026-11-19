@@ -12,8 +12,11 @@ pub mod device;
 pub mod cuda;
 pub mod cuda_lut;
 pub mod cuda_pf90021;
+pub mod cuda_pf8050;
+pub mod cuda_radiance;
 pub mod cuda_lip_line;
 pub mod cuda_mesh;
+pub mod cuda_hlf;
 pub mod cuda_hand_neutral_gray;
 pub mod cuda_neutral_gray;
 pub mod cuda_oil_shine_blend;
@@ -34,6 +37,7 @@ pub mod cuda_makeup;
 pub mod cuda_teeth_blend;
 pub mod cuda_blue_vein;
 pub mod cuda_mesh_attribute;
+pub mod cuda_pf111_uv;
 pub mod cuda_v2warp;
 pub mod cuda_v2fuseoffset;
 pub mod cuda_vface;
@@ -267,3 +271,5 @@ mod tests {
         assert!(!json.contains("\"\"\""));
     }
 }
+pub mod cuda_hair_seam;
+pub mod cuda_pf30025;

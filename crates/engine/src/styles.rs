@@ -8,10 +8,13 @@
 //! does not touch keeps the current values.
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use crate::{AdjustmentSet, ColorWheel, CurvePoint, SplitTone, StyleInfo};
 
-pub fn all() -> Vec<StyleInfo> {
+fn builtin_styles() -> &'static [StyleInfo] {
+    static STYLES: OnceLock<Vec<StyleInfo>> = OnceLock::new();
+    STYLES.get_or_init(|| {
     let mut out = Vec::new();
     let mut add = |group: &str, name: &str, f: &dyn Fn(&mut AdjustmentSet)| {
         let mut a = AdjustmentSet::default();
@@ -56,12 +59,18 @@ pub fn all() -> Vec<StyleInfo> {
         a.clarity.structure = 15.0;
     });
     out
+    })
+}
+
+pub fn all() -> Vec<StyleInfo> {
+    builtin_styles().to_vec()
 }
 
 pub fn lookup(name: &str) -> Option<StyleInfo> {
-    all()
-        .into_iter()
+    builtin_styles()
+        .iter()
         .find(|s| s.name == name)
+        .cloned()
         // Capture One's own presets and styles, when the install is present.
         .or_else(|| crate::presets::style_by_name(name))
 }
@@ -248,5 +257,19 @@ mod tests {
         let plain = preview(&engine, adj.clone());
         adj.style = Some("Tri-X Push".into());
         assert_ne!(preview(&engine, adj).pixels, plain.pixels);
+    }
+
+    #[test]
+    #[ignore = "profiles repeated built-in style lookup"]
+    fn bench_builtin_style_lookup() {
+        use std::time::Instant;
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            std::hint::black_box(lookup("Portra Warm"));
+        }
+        println!(
+            "BUILTIN_STYLE_LOOKUP 10000={:.3} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }

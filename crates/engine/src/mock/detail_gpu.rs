@@ -4,21 +4,96 @@
 //! `stage_sharpening` byte-for-byte; the CPU path stays the default and is used
 //! whenever the driver, PTX or `AURORA_DETAIL_GPU` is absent.
 
-use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::{Mutex, OnceLock};
 use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia};
 
 use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
 
 const PTX: &str = include_str!("../../native/cuda/detail_gpu.ptx");
 const BLOCK: (u32, u32) = (16, 16);
+const PREWARM_BYTES: usize = 1400 * 933 * 4;
+// Keep one 24-32 MP render resident so slider refinements do not reallocate the
+// six-plane pool. Larger frames release after each call instead of pinning
+// unbounded GPU memory.
+const MAX_RETAINED_BYTES: usize = 768 * 1024 * 1024;
 
-thread_local! {
-    static GPU: RefCell<Option<Nvidia>> = const { RefCell::new(None) };
+struct DetailPool {
+    gpu: Box<Nvidia>,
+    pool: SendBuffer,
+    lut: SendBuffer,
+    bytes: usize,
+}
+
+impl DetailPool {
+    fn open(bytes: usize) -> Result<Self, CudaError> {
+        let gpu = Box::new(Nvidia::open_ptx(PTX)?);
+        Ok(Self {
+            pool: SendBuffer(alloc_static(&gpu, bytes * 6)?),
+            lut: SendBuffer(alloc_static(&gpu, 1025 * 4)?),
+            gpu,
+            bytes,
+        })
+    }
+
+    fn ensure(&mut self, bytes: usize) -> Result<(), CudaError> {
+        if bytes > self.bytes {
+            self.pool = SendBuffer(alloc_static(&self.gpu, bytes * 6)?);
+            self.bytes = bytes;
+        }
+        Ok(())
+    }
+}
+
+struct SendBuffer(DeviceBuffer<'static>);
+
+// `DeviceBuffer` only needs the driver table to move; the owning `Nvidia`
+// object stays boxed and `State` serializes every use.
+unsafe impl Send for SendBuffer {}
+
+/// The boxed driver table never moves, and `DetailPool` owns it for its whole
+/// allocation lifetime, so the buffers can safely outlive the short borrow.
+fn alloc_static(gpu: &Nvidia, bytes: usize) -> Result<DeviceBuffer<'static>, CudaError> {
+    let buffer = gpu.alloc_buffer(bytes)?;
+    Ok(unsafe { std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer) })
+}
+
+enum State {
+    NotTried,
+    Ready(DetailPool),
+    Unavailable,
+}
+
+fn state() -> &'static Mutex<State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(State::NotTried))
 }
 
 pub(crate) fn enabled() -> bool {
-    std::env::var_os("AURORA_DETAIL_GPU").is_some_and(|v| v != "0")
+    match std::env::var_os("AURORA_DETAIL_GPU") {
+        Some(value) => value != "0",
+        None => cfg!(windows),
+    }
+}
+
+pub(crate) fn prewarm() -> bool {
+    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+    match &mut *state {
+        State::Ready(_) => true,
+        State::Unavailable => false,
+        State::NotTried => match DetailPool::open(PREWARM_BYTES) {
+            Ok(pool) => {
+                *state = State::Ready(pool);
+                log::info!("CUDA detail path ready");
+                true
+            }
+            Err(err) => {
+                log::warn!("detail_gpu: {err:?}; staying on CPU");
+                *state = State::Unavailable;
+                false
+            }
+        },
+    }
 }
 
 /// Runs the NR + colour NR + moire + sharpening stages on the GPU. `false` means the
@@ -33,25 +108,101 @@ pub(crate) fn post_process(
     lens: &LensCorrection,
     scale: f32,
 ) -> bool {
-    GPU.with(|slot| {
-        if slot.borrow().is_none() {
-            match Nvidia::open_ptx(PTX) {
-                Ok(gpu) => *slot.borrow_mut() = Some(gpu),
+    let Some(pixels) = w.checked_mul(h) else { return false };
+    let bytes = pixels.saturating_mul(4);
+    if bytes == 0 || rgba.len() != bytes || bytes.saturating_mul(6) > MAX_RETAINED_BYTES {
+        return post_process_alloc(
+            rgba, w, h, nr, moire, sh, lens, scale,
+        );
+    }
+    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+    match &mut *state {
+        State::Unavailable => false,
+        State::NotTried => {
+            let mut pool = match DetailPool::open(bytes) {
+                Ok(pool) => pool,
                 Err(err) => {
                     log::warn!("detail_gpu: {err:?}; staying on CPU");
+                    *state = State::Unavailable;
                     return false;
+                }
+            };
+            let result = pool
+                .ensure(bytes)
+                .and_then(|()| post_process_pool(
+                    pool.gpu.as_ref(),
+                    rgba,
+                    w,
+                    h,
+                    nr,
+                    moire,
+                    sh,
+                    lens,
+                    scale,
+                    &pool.pool.0,
+                    Some(&pool.lut.0),
+                ));
+            match result {
+                Ok(()) => {
+                    *state = State::Ready(pool);
+                    true
+                }
+                Err(err) => {
+                    log::warn!("detail_gpu: {err:?}; staying on CPU");
+                    false
                 }
             }
         }
-        let guard = slot.borrow();
-        match post_process_with(guard.as_ref().unwrap(), rgba, w, h, nr, moire, sh, lens, scale) {
+        State::Ready(pool) => {
+            let result = pool
+                .ensure(bytes)
+                .and_then(|()| post_process_pool(
+                    pool.gpu.as_ref(),
+                    rgba,
+                    w,
+                    h,
+                    nr,
+                    moire,
+                    sh,
+                    lens,
+                    scale,
+                    &pool.pool.0,
+                    Some(&pool.lut.0),
+                ));
+            match result {
+                Ok(()) => true,
+                Err(err) => {
+                    log::warn!("detail_gpu: {err:?}; staying on CPU");
+                    false
+                }
+            }
+        }
+    }
+}
+
+fn post_process_alloc(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    moire: &Moire,
+    sh: &Sharpening,
+    lens: &LensCorrection,
+    scale: f32,
+) -> bool {
+    match Nvidia::open_ptx(PTX) {
+        Ok(gpu) => match post_process_with(&gpu, rgba, w, h, nr, moire, sh, lens, scale) {
             Ok(()) => true,
             Err(err) => {
                 log::warn!("detail_gpu: {err:?}; staying on CPU");
                 false
             }
+        },
+        Err(err) => {
+            log::warn!("detail_gpu: {err:?}; staying on CPU");
+            false
         }
-    })
+    }
 }
 
 pub(crate) fn post_process_with(

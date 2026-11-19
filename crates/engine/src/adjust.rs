@@ -46,6 +46,10 @@ pub struct AdjustmentSet {
     /// Engines ignore keys they do not render.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extra: std::collections::BTreeMap<String, f32>,
+    /// Ephemeral producer bytes for this exact render job. Never persisted.
+    #[serde(skip)]
+    pub portrait_producer_inputs:
+        Option<std::sync::Arc<crate::portrait_stage::ProducerInputs>>,
 }
 
 impl AdjustmentSet {
@@ -551,6 +555,27 @@ pub enum ClarityMethod {
 
 impl ClarityMethod {
     pub const ALL: [Self; 4] = [Self::Natural, Self::Punch, Self::Neutral, Self::Classic];
+
+    /// `ZCLARITYMETHOD` stores the `IC_ClarityMethod` enum, whose order is not
+    /// this enum's declaration order. 3 is Contrast in C1, shown as Natural.
+    pub fn from_c1(value: i32) -> Self {
+        match value {
+            0 => Self::Neutral,
+            1 => Self::Punch,
+            2 => Self::Classic,
+            _ => Self::Natural,
+        }
+    }
+
+    /// The inverse of [`Self::from_c1`], for writing a C1 row back.
+    pub fn to_c1(self) -> i32 {
+        match self {
+            Self::Neutral => 0,
+            Self::Punch => 1,
+            Self::Classic => 2,
+            Self::Natural => 3,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -561,6 +586,42 @@ pub struct Clarity {
     pub clarity: f32,
     /// -100 ..= 100.
     pub structure: f32,
+}
+
+impl Clarity {
+    /// Capture One's Clarity2012 amount uniform: `*0.012`, negative `*0.003`,
+    /// method 3 negatives doubled, clamped at -1.
+    pub fn c1_amount(&self) -> f32 {
+        let mut a = self.clarity * 0.012;
+        if a < 0.0 {
+            a = self.clarity * 0.003;
+            if matches!(self.method, ClarityMethod::Natural) {
+                a *= 2.0;
+            }
+        }
+        a.max(-1.0)
+    }
+
+    /// Capture One's Structure2012 amount uniform: negative `*0.01`, else `*0.02`.
+    pub fn c1_structure(&self) -> f32 {
+        let a = if self.structure < 0.0 { self.structure * 0.01 } else { self.structure * 0.02 };
+        a.clamp(-1.0, 1.0)
+    }
+}
+
+/// Clarity2012 pyramid radius for a positive amount.
+pub fn c1_clarity_radius_big(width: u32, height: u32, zoom: f32) -> u32 {
+    (0.125 * width.min(height) as f32 * zoom).floor().max(8.0) as u32
+}
+
+/// Clarity2012 radius for a negative amount without an auxiliary buffer.
+pub fn c1_clarity_radius_small(width: u32, zoom: f32) -> u32 {
+    (100.0 * width as f32 * zoom / 11976.0).floor().max(8.0) as u32
+}
+
+/// The low-pass runs on a 1/8-resolution copy.
+pub fn c1_clarity_lowres_radius(radius: u32) -> u32 {
+    radius / 8
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -889,6 +950,15 @@ pub struct BlackWhite {
     pub shadow_tone: SplitTone,
 }
 
+impl BlackWhite {
+    /// The six floats in C1's internal `s_bwColorSensitivityProperties` order
+    /// (`settings+0x10b7c`): blue, yellow, cyan, green, red, magenta.
+    pub fn c1_runtime_sensitivity(&self) -> [f32; 6] {
+        let s = &self.sensitivity;
+        [s[4], s[1], s[3], s[2], s[0], s[5]]
+    }
+}
+
 // ───────────────────────────── Details ─────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1001,6 +1071,21 @@ pub struct LensCorrection {
     /// -100 ..= 100, a manual movement/shift of the optical center.
     pub shift_x: f32,
     pub shift_y: f32,
+    /// Curves Capture One's built-in "Manufacturer Profile" (type 15) keeps on
+    /// the variant instead of `lensDatabase.cdx`, in sensor-plane micrometres.
+    pub manufacturer: Option<ManufacturerCurves>,
+    /// Camera mount, so the manufacturer curves have a half diagonal to
+    /// normalize against.
+    pub mount: Option<String>,
+}
+
+/// `(r_um, Δr_um)` radial curves carried by a Manufacturer Profile variant.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManufacturerCurves {
+    pub distortion: Vec<(f32, f32)>,
+    pub ca_red: Vec<(f32, f32)>,
+    pub ca_blue: Vec<(f32, f32)>,
 }
 
 impl Default for LensCorrection {
@@ -1018,6 +1103,8 @@ impl Default for LensCorrection {
             hide_distorted_areas: true,
             shift_x: 0.0,
             shift_y: 0.0,
+            manufacturer: None,
+            mount: None,
         }
     }
 }
@@ -1486,6 +1573,43 @@ mod tests {
         let m = c1_midtone_from_gamma(1.2);
         assert!(close(m, 0.129449));
         assert!(close(gamma_from_c1_midtone(m), 1.2));
+    }
+
+    #[test]
+    fn c1_clarity_method_numbers_follow_ic_enum_order() {
+        assert_eq!(ClarityMethod::from_c1(0), ClarityMethod::Neutral);
+        assert_eq!(ClarityMethod::from_c1(1), ClarityMethod::Punch);
+        assert_eq!(ClarityMethod::from_c1(2), ClarityMethod::Classic);
+        assert_eq!(ClarityMethod::from_c1(3), ClarityMethod::Natural);
+        assert_eq!(ClarityMethod::from_c1(9), ClarityMethod::Natural);
+        for method in ClarityMethod::ALL {
+            assert_eq!(ClarityMethod::from_c1(method.to_c1()), method);
+        }
+    }
+
+    #[test]
+    fn c1_clarity_amount_and_radius_match_the_host_formula() {
+        let neutral = Clarity { method: ClarityMethod::Neutral, clarity: 50.0, structure: 0.0 };
+        assert!(close(neutral.c1_amount(), 0.6));
+        let natural = Clarity { method: ClarityMethod::Natural, clarity: -100.0, structure: 0.0 };
+        assert!(close(natural.c1_amount(), -0.6));
+        let punch = Clarity { method: ClarityMethod::Punch, clarity: -100.0, structure: 0.0 };
+        assert!(close(punch.c1_amount(), -0.3));
+        assert!(close(Clarity { clarity: 0.0, ..Clarity::default() }.c1_amount(), 0.0));
+        assert!(close(Clarity { structure: 100.0, ..Clarity::default() }.c1_structure(), 1.0));
+        assert!(close(Clarity { structure: -100.0, ..Clarity::default() }.c1_structure(), -1.0));
+
+        assert_eq!(c1_clarity_radius_big(6000, 4000, 1.0), 500);
+        assert_eq!(c1_clarity_radius_big(6000, 4000, 0.01), 8);
+        assert_eq!(c1_clarity_radius_small(6000, 1.0), 50);
+        assert_eq!(c1_clarity_radius_small(6000, 0.01), 8);
+        assert_eq!(c1_clarity_lowres_radius(500), 62);
+    }
+
+    #[test]
+    fn c1_bw_runtime_order_is_blue_yellow_cyan_green_red_magenta() {
+        let bw = BlackWhite { sensitivity: [10.0, 20.0, 30.0, 40.0, 50.0, 60.0], ..BlackWhite::default() };
+        assert_eq!(bw.c1_runtime_sensitivity(), [50.0, 20.0, 40.0, 30.0, 10.0, 60.0]);
     }
 
     #[test]

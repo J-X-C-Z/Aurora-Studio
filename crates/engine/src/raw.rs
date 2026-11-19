@@ -676,46 +676,7 @@ mod libraw {
     pub fn decode(path: &Path, quality: i32) -> Result<RgbaImage, String> {
         let guard = processed(path, quality)?;
         let (out, raw, (width, height)) = view(&guard)?;
-        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        // libraw gives linear light; the sRGB encode happens here, at 16-bit
-        // precision, so the shadows keep their gradation.
-        let enc16 = |v: u16| encode_srgb(v as f32 / 65535.0);
-        let enc8 = |v: u8| encode_srgb(v as f32 / 255.0);
-        if out.bits == 16 {
-            // 16-bit linear down to 8-bit linear: the caller treats these bytes as
-            // linear light, so this is a scale, not a transfer curve.
-            let wide: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|p| u16::from_le_bytes([p[0], p[1]]))
-                .collect();
-            match out.colors {
-                3 => wide.chunks_exact(3).for_each(|p| {
-                    rgba.extend_from_slice(&[enc16(p[0]), enc16(p[1]), enc16(p[2]), 255])
-                }),
-                4 => wide.chunks_exact(4).for_each(|p| {
-                    rgba.extend_from_slice(&[enc16(p[0]), enc16(p[1]), enc16(p[2]), 255])
-                }),
-                1 => wide.iter().for_each(|g| {
-                    let v = enc16(*g);
-                    rgba.extend_from_slice(&[v, v, v, 255])
-                }),
-                colors => return Err(format!("colors {colors} unsupported")),
-            }
-        } else {
-            match out.colors {
-                3 => raw.chunks_exact(3).for_each(|p| {
-                    rgba.extend_from_slice(&[enc8(p[0]), enc8(p[1]), enc8(p[2]), 255])
-                }),
-                4 => raw.chunks_exact(4).for_each(|p| {
-                    rgba.extend_from_slice(&[enc8(p[0]), enc8(p[1]), enc8(p[2]), p[3]])
-                }),
-                1 => raw.iter().for_each(|g| {
-                    let v = enc8(*g);
-                    rgba.extend_from_slice(&[v, v, v, 255])
-                }),
-                colors => return Err(format!("colors {colors} unsupported")),
-            }
-        }
+        let rgba = expand_raw8(raw, out.bits, out.colors, width as usize * height as usize)?;
         RgbaImage::from_raw(width, height, rgba).ok_or_else(|| "pixel buffer mismatch".into())
     }
 
@@ -727,15 +688,7 @@ mod libraw {
         if out.bits != 16 {
             return Err(format!("bits {} where 16 were requested", out.bits));
         }
-        let wide: Vec<u16> =
-            raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        match out.colors {
-            3 => wide.chunks_exact(3).for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 65535])),
-            4 => wide.chunks_exact(4).for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 65535])),
-            1 => wide.iter().for_each(|g| rgba.extend_from_slice(&[*g, *g, *g, 65535])),
-            colors => return Err(format!("colors {colors} unsupported")),
-        }
+        let rgba = expand_raw16(raw, out.colors, width as usize * height as usize)?;
         Ok((width, height, rgba))
     }
 
@@ -754,6 +707,118 @@ mod libraw {
         let height = unsafe { (api.iheight)(data) };
         (width > 0 && height > 0).then_some((width as u32, height as u32))
     }
+}
+
+fn expand_raw16(raw: &[u8], colors: u16, pixels: usize) -> Result<Vec<u16>, String> {
+    use rayon::prelude::*;
+
+    let mut rgba = vec![0u16; pixels.saturating_mul(4)];
+    let read = |p: &[u8]| u16::from_le_bytes([p[0], p[1]]);
+    match colors {
+        3 => rgba
+            .par_chunks_exact_mut(4)
+            .zip(raw.par_chunks_exact(6))
+            .for_each(|(dst, src)| {
+                dst[0] = read(&src[0..2]);
+                dst[1] = read(&src[2..4]);
+                dst[2] = read(&src[4..6]);
+                dst[3] = 65535;
+            }),
+        4 => rgba
+            .par_chunks_exact_mut(4)
+            .zip(raw.par_chunks_exact(8))
+            .for_each(|(dst, src)| {
+                dst[0] = read(&src[0..2]);
+                dst[1] = read(&src[2..4]);
+                dst[2] = read(&src[4..6]);
+                dst[3] = 65535;
+            }),
+        1 => rgba
+            .par_chunks_exact_mut(4)
+            .zip(raw.par_chunks_exact(2))
+            .for_each(|(dst, src)| {
+                dst[0] = read(src);
+                dst[1] = dst[0];
+                dst[2] = dst[0];
+                dst[3] = 65535;
+            }),
+        colors => return Err(format!("colors {colors} unsupported")),
+    }
+    Ok(rgba)
+}
+
+fn expand_raw8(raw: &[u8], bits: u16, colors: u16, pixels: usize) -> Result<Vec<u8>, String> {
+    use rayon::prelude::*;
+
+    let mut rgba = vec![0u8; pixels.saturating_mul(4)];
+    if bits == 16 {
+        let read = |p: &[u8]| encode_srgb(u16::from_le_bytes([p[0], p[1]]) as f32 / 65535.0);
+        match colors {
+            3 => rgba
+                .par_chunks_exact_mut(4)
+                .zip(raw.par_chunks_exact(6))
+                .for_each(|(dst, src)| {
+                    dst[0] = read(&src[0..2]);
+                    dst[1] = read(&src[2..4]);
+                    dst[2] = read(&src[4..6]);
+                    dst[3] = 255;
+                }),
+            4 => rgba
+                .par_chunks_exact_mut(4)
+                .zip(raw.par_chunks_exact(8))
+                .for_each(|(dst, src)| {
+                    dst[0] = read(&src[0..2]);
+                    dst[1] = read(&src[2..4]);
+                    dst[2] = read(&src[4..6]);
+                    dst[3] = 255;
+                }),
+            1 => rgba
+                .par_chunks_exact_mut(4)
+                .zip(raw.par_chunks_exact(2))
+                .for_each(|(dst, src)| {
+                    dst[0] = read(src);
+                    dst[1] = dst[0];
+                    dst[2] = dst[0];
+                    dst[3] = 255;
+                }),
+            colors => return Err(format!("colors {colors} unsupported")),
+        }
+        return Ok(rgba);
+    }
+    if bits == 8 {
+        match colors {
+            3 => rgba
+                .par_chunks_exact_mut(4)
+                .zip(raw.par_chunks_exact(3))
+                .for_each(|(dst, src)| {
+                    dst[0] = encode_srgb(src[0] as f32 / 255.0);
+                    dst[1] = encode_srgb(src[1] as f32 / 255.0);
+                    dst[2] = encode_srgb(src[2] as f32 / 255.0);
+                    dst[3] = 255;
+                }),
+            4 => rgba
+                .par_chunks_exact_mut(4)
+                .zip(raw.par_chunks_exact(4))
+                .for_each(|(dst, src)| {
+                    dst[0] = encode_srgb(src[0] as f32 / 255.0);
+                    dst[1] = encode_srgb(src[1] as f32 / 255.0);
+                    dst[2] = encode_srgb(src[2] as f32 / 255.0);
+                    dst[3] = src[3];
+                }),
+            1 => rgba
+                .par_chunks_exact_mut(4)
+                .zip(raw.par_chunks_exact(1))
+                .for_each(|(dst, src)| {
+                    dst[0] = encode_srgb(src[0] as f32 / 255.0);
+                    dst[1] = dst[0];
+                    dst[2] = dst[0];
+                    dst[3] = 255;
+                }),
+            colors => return Err(format!("colors {colors} unsupported")),
+        }
+        return Ok(rgba);
+    }
+    Err(format!("bits {bits} unsupported"))
 }
 
 /// Streams the file and keeps the highest-scoring decodable `FF D8 FF .. FF D9` segment.
@@ -998,6 +1063,163 @@ mod tests {
         assert!(encode_srgb(1.0 / 4096.0) > 0);
         assert!(encode_srgb(0.2) < encode_srgb(0.4));
     }
+
+    fn expand_raw16_serial(raw: &[u8], colors: u16) -> Vec<u16> {
+        let wide: Vec<u16> =
+            raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let mut rgba = Vec::with_capacity(wide.len() / colors as usize * 4);
+        match colors {
+            3 => wide
+                .chunks_exact(3)
+                .for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 65535])),
+            4 => wide
+                .chunks_exact(4)
+                .for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 65535])),
+            1 => wide
+                .iter()
+                .for_each(|g| rgba.extend_from_slice(&[*g, *g, *g, 65535])),
+            _ => unreachable!(),
+        }
+        rgba
+    }
+
+    #[test]
+    fn parallel_raw16_expansion_matches_the_serial_original_exactly() {
+        let pixels = 73usize * 41;
+        for colors in [1usize, 3, 4] {
+            let raw: Vec<u8> = (0..pixels * colors * 2)
+                .map(|i| i.wrapping_mul(37).wrapping_add(i / 11) as u8)
+                .collect();
+            let expected = expand_raw16_serial(&raw, colors as u16);
+            let actual = expand_raw16(&raw, colors as u16, pixels).unwrap();
+            assert_eq!(actual, expected, "colors={colors}");
+        }
+        assert!(expand_raw16(&[], 2, 0).is_err());
+    }
+
+    fn expand_raw8_serial(raw: &[u8], bits: u16, colors: u16) -> Vec<u8> {
+        let enc16 = |v: u16| encode_srgb(v as f32 / 65535.0);
+        let enc8 = |v: u8| encode_srgb(v as f32 / 255.0);
+        let mut rgba = Vec::new();
+        if bits == 16 {
+            let wide: Vec<u16> =
+                raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+            match colors {
+                3 => wide.chunks_exact(3).for_each(|p| {
+                    rgba.extend_from_slice(&[enc16(p[0]), enc16(p[1]), enc16(p[2]), 255])
+                }),
+                4 => wide.chunks_exact(4).for_each(|p| {
+                    rgba.extend_from_slice(&[enc16(p[0]), enc16(p[1]), enc16(p[2]), 255])
+                }),
+                1 => wide.iter().for_each(|g| {
+                    let v = enc16(*g);
+                    rgba.extend_from_slice(&[v, v, v, 255])
+                }),
+                _ => unreachable!(),
+            }
+        } else {
+            match colors {
+                3 => raw.chunks_exact(3).for_each(|p| {
+                    rgba.extend_from_slice(&[enc8(p[0]), enc8(p[1]), enc8(p[2]), 255])
+                }),
+                4 => raw.chunks_exact(4).for_each(|p| {
+                    rgba.extend_from_slice(&[enc8(p[0]), enc8(p[1]), enc8(p[2]), p[3]])
+                }),
+                1 => raw.iter().for_each(|g| {
+                    let v = enc8(*g);
+                    rgba.extend_from_slice(&[v, v, v, 255])
+                }),
+                _ => unreachable!(),
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn parallel_raw8_expansion_matches_the_serial_original_exactly() {
+        let pixels = 73usize * 41;
+        for bits in [8usize, 16] {
+            for colors in [1usize, 3, 4] {
+                let bytes = pixels * colors * if bits == 16 { 2 } else { 1 };
+                let raw: Vec<u8> = (0..bytes)
+                    .map(|i| i.wrapping_mul(37).wrapping_add(i / 11) as u8)
+                    .collect();
+                let expected = expand_raw8_serial(&raw, bits as u16, colors as u16);
+                let actual = expand_raw8(&raw, bits as u16, colors as u16, pixels).unwrap();
+                assert_eq!(actual, expected, "bits={bits} colors={colors}");
+            }
+        }
+        assert!(expand_raw8(&[], 12, 3, 0).is_err());
+        assert!(expand_raw8(&[], 8, 2, 0).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_parallel_raw16_expansion_24mp() {
+        use std::time::Instant;
+
+        let pixels = 6000usize * 4000;
+        let raw: Vec<u8> = (0..pixels * 6)
+            .map(|i| i.wrapping_mul(40503).wrapping_add(i / 17) as u8)
+            .collect();
+        let measure = |parallel: bool| {
+            let mut times = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let started = Instant::now();
+                let out = if parallel {
+                    expand_raw16(&raw, 3, pixels).unwrap()
+                } else {
+                    expand_raw16_serial(&raw, 3)
+                };
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(out);
+            }
+            times.sort_by(f64::total_cmp);
+            (times[times.len() / 2], times[(times.len() * 95 / 100).max(times.len() - 1)])
+        };
+        let (serial50, serial95) = measure(false);
+        let (parallel50, parallel95) = measure(true);
+        println!(
+            "6000x4000 RAW16 RGB expansion: serial {serial50:.3}/{serial95:.3} ms, parallel \
+             {parallel50:.3}/{parallel95:.3} ms, {:.2}x P50",
+            serial50 / parallel50
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_parallel_raw8_expansion_24mp() {
+        use std::time::Instant;
+
+        let pixels = 6000usize * 4000;
+        let raw: Vec<u8> = (0..pixels * 6)
+            .map(|i| i.wrapping_mul(40503).wrapping_add(i / 17) as u8)
+            .collect();
+        let measure = |parallel: bool| {
+            let mut times = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let started = Instant::now();
+                let out = if parallel {
+                    expand_raw8(&raw, 16, 3, pixels).unwrap()
+                } else {
+                    expand_raw8_serial(&raw, 16, 3)
+                };
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(out);
+            }
+            times.sort_by(f64::total_cmp);
+            (times[times.len() / 2], times[(times.len() * 95 / 100).max(times.len() - 1)])
+        };
+        let (serial50, serial95) = measure(false);
+        let (parallel50, parallel95) = measure(true);
+        println!(
+            "6000x4000 RAW16 to RGBA8 expansion: serial {serial50:.3}/{serial95:.3} ms, parallel \
+             {parallel50:.3}/{parallel95:.3} ms, {:.2}x P50",
+            serial50 / parallel50
+        );
+    }
+
+
     #[test]
     fn demosaic_values_map_to_the_filters_this_libraw_has() {
         for quality in [0, 1, 2, 3, 11, 12] {

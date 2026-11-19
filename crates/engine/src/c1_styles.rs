@@ -10,7 +10,9 @@
 //! [`c1_model::to_adjustment_set`], so a style and a catalog variant share one
 //! conversion.
 
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 
@@ -126,11 +128,12 @@ fn engine_attr(text: &str) -> Option<u32> {
 }
 
 /// Keys this writer can emit. `C1Style.original` is filtered to this set so
-/// metadata such as UUID/StyleSource/TechnicalProcessingMethod is not written.
+/// metadata such as UUID/StyleSource is not written.
 fn writable_key(key: &str) -> bool {
     matches!(
         key,
         "Name"
+            | "TechnicalProcessingMethod"
             | "Exposure"
             | "Contrast"
             | "Brightness"
@@ -142,6 +145,7 @@ fn writable_key(key: &str) -> bool {
             | "GradationCurveRed"
             | "GradationCurveGreen"
             | "GradationCurveBlue"
+            | "GradationCurveY"
             | "USMAmount"
             | "USMRadius"
             | "USMThreshold"
@@ -193,13 +197,163 @@ pub fn write_costyle_text(style: &C1Style) -> String {
         &format!("<SL Engine=\"{}\">", style.engine),
         1,
     );
-    text
+    preserve_unchanged_values(&text, &style.original)
+}
+
+/// Capture One does not re-format numbers on write: its own files hold
+/// `0.000,0.000;...` and `0.273999989032745,0.025000000372529;...` side by side,
+/// so no single formatter can reproduce both. A value that still parses to the
+/// same number keeps the file's own spelling; only edited values are formatted
+/// canonically.
+fn preserve_unchanged_values(text: &str, original: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let Some(key) = attribute(line, "K=\"") else {
+            out.push_str(line);
+            continue;
+        };
+        let Some(value) = attribute(line, " V=\"") else {
+            out.push_str(line);
+            continue;
+        };
+        let Some(old) = original.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()) else {
+            out.push_str(line);
+            continue;
+        };
+        if !writable_key(key) || !same_number_text(old, value) {
+            out.push_str(line);
+            continue;
+        }
+        let start = line.find(" V=\"").expect("value attribute") + 4;
+        let end = start + line[start..].find('"').expect("closing quote");
+        out.push_str(&line[..start]);
+        out.push_str(&escape_attribute(old));
+        out.push_str(&line[end..]);
+    }
+    out
+}
+
+/// The text between `prefix` and the next `"` in a generated `<E/>` line.
+fn attribute<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let start = line.find(prefix)? + prefix.len();
+    let end = start + line[start..].find('"')?;
+    Some(&line[start..end])
+}
+
+/// True when both strings hold the same numbers in the same shape. Non-numeric
+/// values (Name, FilmCurve) have to match exactly. The tolerance absorbs the
+/// white-balance `kelvin -> gains -> kelvin` round trip, which moves the fourth
+/// decimal of the temperature.
+fn same_number_text(a: &str, b: &str) -> bool {
+    let left: Vec<&str> = a.split([';', ',']).map(str::trim).collect();
+    let right: Vec<&str> = b.split([';', ',']).map(str::trim).collect();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().zip(&right).all(|(x, y)| match (x.parse::<f32>(), y.parse::<f32>()) {
+        (Ok(x), Ok(y)) => (x - y).abs() <= 1e-6 * x.abs().max(y.abs()).max(1.0),
+        _ => x == y,
+    })
+}
+
+fn escape_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A filesystem-safe `.costyle` file name for a style's display name.
+///
+/// C1's own files are named after the style (`Fujicolor Pro 160C.costyle`).
+/// Characters Windows forbids become `_`, trailing spaces/dots are dropped,
+/// reserved device names get a leading `_`, and the extension is added once.
+pub fn style_file_name(name: &str) -> String {
+    let mut stem: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    while stem.ends_with([' ', '.']) {
+        stem.pop();
+    }
+    if stem.is_empty() {
+        stem = "Untitled".to_owned();
+    }
+    let upper = stem.to_ascii_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"]
+        .contains(&upper.as_str())
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        stem.insert(0, '_');
+    }
+    if stem.to_ascii_lowercase().ends_with(".costyle") {
+        stem
+    } else {
+        format!("{stem}.costyle")
+    }
 }
 
 /// Writes a loaded style to `path`.
+///
+/// The text lands in a sibling temporary file first and is renamed into place,
+/// so a failed write never leaves a half-written style; an existing file is
+/// replaced. Windows cannot rename over an existing file, so the replace falls
+/// back to remove + rename there (the only non-atomic window).
 pub fn save_costyle(path: &Path, style: &C1Style) -> Result<()> {
-    std::fs::write(path, write_costyle_text(style))
-        .with_context(|| format!("writing {}", path.display()))
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let text = write_costyle_text(style);
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("style");
+    let tmp = path.with_file_name(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing {}", tmp.display()))?;
+        drop(file);
+        replace_file(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("saving {}", path.display()))
+}
+
+fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        // Windows refuses to rename over an existing file. Removing first is
+        // the only std-only way to replace it.
+        Err(err) if cfg!(windows) && path.exists() => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("replacing {}", path.display()))?;
+            std::fs::rename(tmp, path)
+                .with_context(|| format!("writing {}", path.display()))
+        }
+        Err(err) => Err(err).with_context(|| format!("writing {}", path.display())),
+    }
 }
 
 /// Converts the settings and keeps only the tool groups the file defines.
@@ -273,10 +427,12 @@ fn apply(s: &mut C1VariantSettings, key: &str, value: &str) {
                 s.technical_processing_method = v as i32;
             }
         }
-        "GradationCurve" => s.gradation_curves[0] = c1_model::parse_curve(value),
-        "GradationCurveRed" => s.gradation_curves[1] = c1_model::parse_curve(value),
-        "GradationCurveGreen" => s.gradation_curves[2] = c1_model::parse_curve(value),
-        "GradationCurveBlue" => s.gradation_curves[3] = c1_model::parse_curve(value),
+        // `GCurve*` are Capture One's own legacy names for the same curve:
+        // `P1.C1.Core` maps them onto `GradationCurve*` when it reads a style.
+        "GradationCurve" | "GCurve" => s.gradation_curves[0] = c1_model::parse_curve(value),
+        "GradationCurveRed" | "GCurveR" => s.gradation_curves[1] = c1_model::parse_curve(value),
+        "GradationCurveGreen" | "GCurveG" => s.gradation_curves[2] = c1_model::parse_curve(value),
+        "GradationCurveBlue" | "GCurveB" => s.gradation_curves[3] = c1_model::parse_curve(value),
         "GradationCurveY" => s.gradation_curves[4] = c1_model::parse_curve(value),
         "USMAmount" => s.sharpening.amount = n.unwrap_or(s.sharpening.amount),
         "USMRadius" => s.sharpening.radius = n.unwrap_or(s.sharpening.radius),
@@ -438,7 +594,7 @@ mod tests {
   <E K="Midtone" V="0;0;0;0"/>
   <E K="Shadow" V="0.171981;0.198540;0.238351;0"/>
   <E K="TargetHighlight" V="1;1;1;0.940427"/>
-  <E K="GCurve" V="0.514,0.583;0.210,0.260"/>
+  <E K="CurveAlias" V="0.514,0.583;0.210,0.260"/>
   <E K="ColorBalance" V="1;1;1"/>
   <E K="Flip" V="1"/>
   <E K="UUID" V="{82466223-FC65-4BC5-8965-0CAA0E5B6813}"/>
@@ -449,6 +605,55 @@ mod tests {
         let plain = load_style(&plain.0).expect("plain parses");
         let noisy = load_style(&noisy.0).expect("unknown keys do not break the load");
         assert_eq!(noisy.adjustments, plain.adjustments);
+    }
+
+    /// `GCurve*` is Capture One's legacy spelling; its own property map turns it
+    /// into `GradationCurve*`, so both files must load the same curve.
+    #[test]
+    fn gcurve_is_the_legacy_name_for_gradation_curve() {
+        let legacy = Scratch::new(
+            "legacy.costyle",
+            br#"<SL Engine="800"><E K="GCurve" V="0.514,0.583;0.210,0.260"/></SL>"#,
+        );
+        let current = Scratch::new(
+            "current.costyle",
+            br#"<SL Engine="800"><E K="GradationCurve" V="0.514,0.583;0.210,0.260"/></SL>"#,
+        );
+        let legacy = load_style(&legacy.0).expect("legacy curve");
+        let current = load_style(&current.0).expect("current curve");
+        assert_eq!(legacy.adjustments.curves.rgb, current.adjustments.curves.rgb);
+        assert_ne!(legacy.adjustments.curves.rgb, crate::Curve::default());
+    }
+
+    /// The installed `Presets60/Curve/Contrast Luma.copreset` carries this value.
+    #[test]
+    fn gradation_curve_y_reaches_the_luma_curve() {
+        let y = Scratch::new(
+            "luma.costyle",
+            br#"<SL Engine="800"><E K="GradationCurveY" V="0.000,0.000;0.104,0.075;0.252,0.254;0.549,0.640;1.000,1.000"/></SL>"#,
+        );
+        let style = load_style(&y.0).expect("luma curve");
+        let a = &style.adjustments;
+        assert_eq!(a.curves.luma.points.len(), 5);
+        assert!((a.curves.luma.points[3].y - 0.640).abs() < 1e-6);
+        assert_eq!(a.curves.rgb, crate::Curve::default(), "Y must not move the RGB curve");
+    }
+
+    /// A legacy style writes back under the canonical key and still loads the
+    /// same curve, so the alias does not leak into saved files.
+    #[test]
+    fn a_gcurve_style_round_trips_through_the_writer() {
+        let legacy = Scratch::new(
+            "legacy.costyle",
+            br#"<SL Engine="800"><E K="Name" V="Legacy"/><E K="GCurve" V="0.514,0.583;0.210,0.260"/></SL>"#,
+        );
+        let loaded = load_style(&legacy.0).expect("legacy curve");
+        let text = write_costyle_text(&loaded);
+        assert!(!text.contains("GCurve\""), "the writer canonicalises the key");
+        assert!(text.contains("GradationCurve\""));
+        let again = Scratch::new("again.costyle", text.as_bytes());
+        let reloaded = load_style(&again.0).expect("written curve");
+        assert_eq!(reloaded.adjustments.curves.rgb, loaded.adjustments.curves.rgb);
     }
 
     #[test]
@@ -553,10 +758,8 @@ mod tests {
         let read = load_style(&file.0).expect("reload written style");
         assert_eq!(read.name, original.name);
         assert_eq!(read.engine, original.engine);
-        // TechnicalProcessingMethod is metadata outside the 30 writable keys.
-        let mut expected = original.adjustments.clone();
-        expected.base.processing_method = crate::TechnicalProcessingMethod::Photography;
-        assert_eq!(read.adjustments, expected);
+        // C1 persists the processing method inside a style, so it must survive.
+        assert_eq!(read.adjustments, original.adjustments);
         assert_eq!(read.color_corrections, original.color_corrections);
     }
 
@@ -564,7 +767,7 @@ mod tests {
     fn writer_omits_metadata_and_unmapped_keys() {
         let style = load_style(&testdata("B&W Generic 4.costyle")).expect("source style");
         let text = write_costyle_text(&style);
-        for key in ["UUID", "StyleSource", "TechnicalProcessingMethod", "Flip", "Color_tag_index"] {
+        for key in ["UUID", "StyleSource", "Flip", "Color_tag_index"] {
             assert!(!text.contains(&format!("K=\"{key}\"")), "{key} leaked into {text}");
         }
         assert!(text.contains("K=\"Name\""), "{text}");
@@ -581,29 +784,15 @@ mod tests {
         let before = crate::presets::parse_sl(&source);
         let after = crate::presets::parse_sl(&written);
 
-        let numbers = |value: &str| -> Option<Vec<f32>> {
-            value
-                .split([';', ','])
-                .map(|part| part.trim().parse::<f32>().ok())
-                .collect()
-        };
         let mut dropped = Vec::new();
         let mut changed = Vec::new();
         for (key, old) in &before {
             match after.iter().find(|(k, _)| k == key) {
                 None => dropped.push(key.clone()),
                 Some((_, new)) => {
-                    if old == new {
-                        continue;
+                    if old != new {
+                        changed.push((key.clone(), old.clone(), new.clone()));
                     }
-                    let same_numbers = matches!(
-                        (numbers(old), numbers(new)),
-                        (Some(a), Some(b))
-                            if a.len() == b.len()
-                                && a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-4 * x.abs().max(1.0))
-                    );
-                    assert!(same_numbers, "{key}: {old:?} != {new:?}");
-                    changed.push((key.clone(), old.clone(), new.clone()));
                 }
             }
         }
@@ -627,9 +816,229 @@ mod tests {
             ]
         );
         println!("kept {} keys, dropped {} keys", after.len(), dropped.len());
-        for (key, old, new) in &changed {
-            println!("format-only {key}: {old} -> {new}");
+        assert!(changed.is_empty(), "format drift in kept keys: {changed:?}");
+    }
+
+    #[test]
+    fn writer_reproduces_capture_one_number_spelling() {
+        let path = testdata("Fujicolor Pro 160C.costyle");
+        let style = load_style(&path).expect("source style");
+        let before = crate::presets::parse_sl(&std::fs::read_to_string(&path).expect("sample"));
+        let after = crate::presets::parse_sl(&write_costyle_text(&style));
+        for key in [
+            "GradationCurve",
+            "GradationCurveRed",
+            "GradationCurveGreen",
+            "GradationCurveBlue",
+            "WhiteBalanceTemperature",
+            "WhiteBalanceTint",
+        ] {
+            let old = before.iter().find(|(k, _)| k == key).expect("original key").1.clone();
+            let new = after.iter().find(|(k, _)| k == key).expect("written key").1.clone();
+            assert_eq!(old, new, "{key}");
         }
+    }
+
+    #[test]
+    fn unchanged_numbers_keep_their_original_spelling() {
+        // Integer, zero, negative zero, one, half, and exponent forms.
+        assert!(same_number_text("0", "0.000000"));
+        assert!(same_number_text("1", "1.000000"));
+        assert!(same_number_text("-0", "0"));
+        assert!(same_number_text("0.5", "0.500"));
+        assert!(same_number_text("1e-3", "0.001"));
+        assert!(!same_number_text("0", "0.001"));
+        assert!(!same_number_text("1;2", "1"), "shape mismatch is a change");
+        assert!(!same_number_text("Camera A", "Camera B"));
+    }
+
+    #[test]
+    fn edited_values_are_written_canonically() {
+        let mut style = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("source style");
+        style.adjustments.exposure.exposure = -1.5;
+        let text = write_costyle_text(&style);
+        assert!(text.contains("K=\"Exposure\" V=\"-1.5\""), "{text}");
+        let file = Scratch::new("edited.costyle", text.as_bytes());
+        let read = load_style(&file.0).expect("reload edited style");
+        assert_eq!(read.adjustments.exposure.exposure, -1.5);
+    }
+
+    #[test]
+    fn high_precision_curves_are_not_shortened() {
+        let file = Scratch::new(
+            "precise.costyle",
+            br#"<SL Engine="800"><E K="GradationCurve" V="0,0;0.273999989032745,0.025000000372529;1,1"/></SL>"#,
+        );
+        let style = load_style(&file.0).expect("parses");
+        let text = write_costyle_text(&style);
+        assert!(
+            text.contains("0.273999989032745,0.025000000372529"),
+            "the sample's own precision was reformatted: {text}"
+        );
+    }
+
+    fn fnv1a<I: Iterator<Item = u8>>(bytes: I) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// End to end on one real NEF: the engine writes a style, loads it again,
+    /// and the rendered frame must match the frame from the source style byte
+    /// for byte. Values in the three source styles come from installed C1 files.
+    #[test]
+    #[ignore = "needs AURORA_TEST_RAW (a real NEF) and libraw"]
+    fn written_styles_render_the_same_frame_as_their_source() {
+        let Ok(raw) = std::env::var("AURORA_TEST_RAW") else {
+            panic!("set AURORA_TEST_RAW to a real NEF");
+        };
+        let raw = PathBuf::from(raw);
+        let (source, width, height, sixteen) = match crate::raw::decode16(&raw) {
+            Some((w, h, rgba)) => {
+                (crate::mock::process::Source::from_rgba16(w, h, &rgba), w, h, true)
+            }
+            None => {
+                let img = crate::raw::decode(&raw).expect("decode raw");
+                let (w, h) = (img.width(), img.height());
+                (crate::mock::process::Source::from_rgba(w, h, img.as_raw()), w, h, false)
+            }
+        };
+        println!("source\t{width}x{height}\tsixteen={sixteen}");
+        let neutral = crate::mock::process::render16(
+            &source,
+            &AdjustmentSet::default(),
+            crate::NormRect::FULL,
+            1024,
+            false,
+        );
+        let cases = [
+            (
+                "curve",
+                r#"<SL Engine="800">
+<E K="Name" V="E2E Curve"/>
+<E K="GradationCurve" V="0.000,0.000;0.504,0.450;1.000,1.000"/>
+</SL>"#,
+            ),
+            (
+                "wb",
+                r#"<SL Engine="800">
+<E K="Name" V="E2E WB"/>
+<E K="WhiteBalanceTemperature" V="2445.051"/>
+<E K="WhiteBalanceTint" V="-15.3893"/>
+</SL>"#,
+            ),
+            (
+                "bw",
+                r#"<SL Engine="800">
+<E K="Name" V="E2E BW"/>
+<E K="BwEnabled" V="1"/>
+<E K="BwRed" V="-16.26506"/>
+<E K="BwYellow" V="12.5"/>
+<E K="BwGreen" V="30"/>
+<E K="BwCyan" V="-10"/>
+<E K="BwBlue" V="-25"/>
+<E K="BwMagenta" V="5"/>
+</SL>"#,
+            ),
+        ];
+        for (label, text) in cases {
+            let original = Scratch::new(&format!("e2e-src-{label}.costyle"), text.as_bytes());
+            let source_style = load_style(&original.0).expect("source style parses");
+            let written = write_costyle_text(&source_style);
+            let copy = Scratch::new(&format!("e2e-out-{label}.costyle"), written.as_bytes());
+            let written_style = load_style(&copy.0).expect("written style parses");
+            assert_eq!(
+                source_style.adjustments, written_style.adjustments,
+                "{label}: field values changed on the round trip"
+            );
+            let a = crate::mock::process::render16(
+                &source,
+                &crate::styles::resolve(&source_style.adjustments),
+                crate::NormRect::FULL,
+                1024,
+                false,
+            );
+            let b = crate::mock::process::render16(
+                &source,
+                &crate::styles::resolve(&written_style.adjustments),
+                crate::NormRect::FULL,
+                1024,
+                false,
+            );
+            assert_eq!((a.width, a.height), (b.width, b.height), "{label}: frame size");
+            assert_eq!(a.rgba, b.rgba, "{label}: rendered frames differ");
+            assert_ne!(a.rgba, neutral.rgba, "{label}: the style did not change the frame");
+            let hash = fnv1a(a.rgba.iter().flat_map(|v| v.to_le_bytes()));
+            println!("{label}\t{}x{}\tfnv1a64={hash:016x}", a.width, a.height);
+            if let Ok(dir) = std::env::var("AURORA_E2E_OUT") {
+                let pixels: Vec<u8> = a
+                    .rgba
+                    .chunks_exact(4)
+                    .flat_map(|p| [(p[0] >> 8) as u8, (p[1] >> 8) as u8, (p[2] >> 8) as u8, (p[3] >> 8) as u8])
+                    .collect();
+                let img = image::RgbaImage::from_raw(a.width, a.height, pixels).expect("frame size");
+                let out = Path::new(&dir).join(format!("{label}.png"));
+                img.save(&out).expect("png export");
+                println!("png\t{}", out.display());
+            }
+        }
+    }
+
+    #[test]
+    fn style_file_names_are_safe_and_keep_the_extension() {
+        assert_eq!(style_file_name("Fujicolor Pro 160C"), "Fujicolor Pro 160C.costyle");
+        assert_eq!(style_file_name("  Fuji  "), "Fuji.costyle");
+        assert_eq!(style_file_name("A/B:C*?\"<>|"), "A_B_C______.costyle");
+        assert_eq!(style_file_name("dots... "), "dots.costyle");
+        assert_eq!(style_file_name(""), "Untitled.costyle");
+        assert_eq!(style_file_name("CON"), "_CON.costyle");
+        assert_eq!(style_file_name("Look.costyle"), "Look.costyle");
+        assert_eq!(style_file_name("Look.COSTYLE"), "Look.COSTYLE");
+    }
+
+    #[test]
+    fn save_replaces_an_existing_style_without_leaving_temp_files() {
+        let dir = std::env::temp_dir().join(format!("portrait-costyle-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("Look.costyle");
+        let mut style = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("source style");
+        style.adjustments.exposure.exposure = 1.0;
+        save_costyle(&path, &style).expect("first save");
+        style.adjustments.exposure.exposure = -2.0;
+        save_costyle(&path, &style).expect("overwrite");
+        let read = load_style(&path).expect("reload");
+        assert_eq!(read.adjustments.exposure.exposure, -2.0);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_existing_path() {
+        let dir = std::env::temp_dir().join(format!("portrait-costyle-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A directory where the style should go makes the final rename fail.
+        let path = dir.join("Taken.costyle");
+        std::fs::create_dir(&path).expect("occupied path");
+        let style = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("source style");
+        assert!(save_costyle(&path, &style).is_err(), "saving over a directory must fail");
+        assert!(path.is_dir(), "the failed save must not remove the existing path");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

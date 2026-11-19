@@ -24,6 +24,15 @@ use crate::preview_cache::{self, CachedFrame, PreviewCache};
 use process::Source;
 use scenes::Scene;
 
+/// Load the exact CUDA detail module while the app is idle. Failure leaves
+/// rendering on the CPU; the explicit switch remains available for comparisons.
+#[cfg(windows)]
+pub(crate) fn prewarm_gpu() {
+    if detail_gpu::enabled() {
+        let _ = detail_gpu::prewarm();
+    }
+}
+
 enum Origin {
     Scene(Scene, u32),
     File(PathBuf),
@@ -407,7 +416,6 @@ impl ImageEngine for MockEngine {
             adj.white_balance.mode = WhiteBalanceMode::Auto;
             adj.white_balance.kelvin = (5600.0 + (r - b) * -18.0).clamp(2500.0, 12000.0);
             adj.white_balance.tint = 0.0;
-            adj.white_balance.gains = None;
         }
         if all || target == AutoTarget::Levels {
             let cut = total / 500;

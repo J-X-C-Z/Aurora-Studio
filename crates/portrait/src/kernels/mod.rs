@@ -50,6 +50,7 @@ pub mod radiance;
 pub mod moisture;
 pub mod smile_warp;
 pub mod pore;
+pub mod pf111_uv;
 pub mod uvmap_color;
 
 use crate::EffectMeta;

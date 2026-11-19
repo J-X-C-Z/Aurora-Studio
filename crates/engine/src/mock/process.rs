@@ -1,7 +1,8 @@
 //! A small CPU development pipeline. It is not color-accurate; it exists so every
 //! control in the interface has a visible, plausible effect during UI work.
 
-use std::sync::OnceLock;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}};
 
 use rayon::prelude::*;
 
@@ -10,6 +11,7 @@ use crate::*;
 /// Source pixels with a mip pyramid for fast zoomed-out sampling.
 #[doc(hidden)]
 pub struct Source {
+    snapshot_id: u64,
     pub(crate) levels: Vec<Plane>,
     /// Lens EXIF of the capture, for the optional C1 lens profile.
     pub(crate) lens_shot: Option<super::lens_profile::LensShot>,
@@ -19,6 +21,8 @@ pub struct Source {
     camera_preview: bool,
     /// Skin/hair/face masks, computed lazily for portrait effects.
     portrait_masks: OnceLock<crate::portrait_stage::PortraitMasks>,
+    /// Stable fingerprint of the decoded source snapshot.
+    fingerprint: OnceLock<u64>,
 }
 
 pub(crate) struct Plane {
@@ -37,14 +41,20 @@ pub(crate) fn linear_to_srgb(v: f32) -> f32 {
 }
 
 /// Linear → sRGB over `0 ..= 4` linear, so highlight recovery has headroom to pull from.
-struct GammaLut(Vec<f32>);
+const GAMMA_LUT_SIZE: usize = 8192;
+struct GammaLut(&'static [f32; GAMMA_LUT_SIZE]);
 
 impl GammaLut {
-    const SIZE: usize = 8192;
+    const SIZE: usize = GAMMA_LUT_SIZE;
     const RANGE: f32 = 4.0;
 
     fn new() -> Self {
-        Self((0..Self::SIZE).map(|i| linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)).collect())
+        static TABLE: OnceLock<[f32; GammaLut::SIZE]> = OnceLock::new();
+        Self(TABLE.get_or_init(|| {
+            std::array::from_fn(|i| {
+                linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)
+            })
+        }))
     }
 
     fn get(&self, v: f32) -> f32 {
@@ -53,7 +63,113 @@ impl GammaLut {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SourceSample {
+    rgb: [f32; 3],
+}
+
+impl SourceSample {
+    const fn invalid() -> Self {
+        Self { rgb: [f32::NAN; 3] }
+    }
+
+    fn valid(self) -> bool {
+        !self.rgb[0].is_nan()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SourceSampleKey {
+    source: u64,
+    geometry: Geometry,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    cubic: bool,
+}
+
+type SourceSampleCache = Mutex<Vec<(SourceSampleKey, Arc<Vec<SourceSample>>)>>;
+
+/// One exact sampled source frame. A slider that only changes colour reuses it;
+/// geometry, crop, output size, mip and interpolation all participate in the key.
+fn source_samples(
+    src: &Source,
+    map: &super::geometry::FrameMap,
+    geometry: &Geometry,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    cubic: bool,
+    xs: &[f32],
+) -> Arc<Vec<SourceSample>> {
+    const MAX_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 8;
+    static CACHE: OnceLock<SourceSampleCache> = OnceLock::new();
+    let key = SourceSampleKey {
+        source: src.snapshot_id(),
+        geometry: geometry.clone(),
+        region,
+        out_w,
+        out_h,
+        level,
+        cubic,
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut entries = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = entries.iter().position(|(cached_key, _)| cached_key == &key) {
+        let entry = entries.remove(index);
+        let samples = Arc::clone(&entry.1);
+        entries.push(entry);
+        return samples;
+    }
+    drop(entries);
+
+    let mut samples = vec![SourceSample::invalid(); (out_w * out_h) as usize];
+    let identity = map.is_identity();
+    samples.par_chunks_mut(out_w as usize).enumerate().for_each(|(y, line)| {
+        let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
+        for (x, &fx) in xs.iter().enumerate() {
+            let s = if identity { [fx, fy] } else { map.map_clean([fx, fy]).1 };
+            let sampled = if cubic { src.sample_cubic(level, s[0], s[1]) } else { src.sample(level, s[0], s[1]) };
+            if let Some(rgb) = sampled {
+                line[x] = SourceSample { rgb };
+            }
+        }
+    });
+    let samples = Arc::new(samples);
+    let bytes = samples.len().saturating_mul(std::mem::size_of::<SourceSample>());
+    if bytes <= MAX_ENTRY_BYTES {
+        let mut entries = cache.lock().unwrap_or_else(|error| error.into_inner());
+        while entries.len() >= MAX_ENTRIES
+            || entries
+                .iter()
+                .map(|(_, cached)| {
+                    cached.len().saturating_mul(std::mem::size_of::<SourceSample>())
+                })
+                .sum::<usize>()
+                .saturating_add(bytes)
+                > MAX_TOTAL_BYTES
+        {
+            entries.remove(0);
+        }
+        entries.push((key, Arc::clone(&samples)));
+    }
+    samples
+}
+
 impl Source {
+    fn next_snapshot_id() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn snapshot_id(&self) -> u64 {
+        self.snapshot_id
+    }
+
     pub(crate) fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Self {
         let lut: Vec<f32> = (0..256).map(|i| srgb_to_linear(i as f32 / 255.0)).collect();
         let data: Vec<[f32; 3]> = rgba
@@ -68,10 +184,34 @@ impl Source {
     /// of the encoded range; this keeps 65535.
     #[doc(hidden)]
     pub fn from_rgba16(width: u32, height: u32, rgba: &[u16]) -> Self {
-        let data: Vec<[f32; 3]> = rgba
-            .par_chunks_exact(4)
-            .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
-            .collect();
+        let mut data = vec![[0.0; 3]; rgba.len() / 4];
+        data.par_chunks_mut(1024)
+            .zip(rgba.par_chunks(4 * 1024))
+            .for_each(|(out, input)| {
+                for (pixel, src) in out.iter_mut().zip(input.chunks_exact(4)) {
+                    *pixel = [
+                        src[0] as f32 / 65535.0,
+                        src[1] as f32 / 65535.0,
+                        src[2] as f32 / 65535.0,
+                    ];
+                }
+            });
+        Self::from_linear(width, height, data)
+    }
+
+    pub(crate) fn from_rgb16(width: u32, height: u32, rgb: &[u16]) -> Self {
+        let mut data = vec![[0.0; 3]; rgb.len() / 3];
+        data.par_chunks_mut(1024)
+            .zip(rgb.par_chunks(3 * 1024))
+            .for_each(|(out, input)| {
+                for (pixel, src) in out.iter_mut().zip(input.chunks_exact(3)) {
+                    *pixel = [
+                        src[0] as f32 / 65535.0,
+                        src[1] as f32 / 65535.0,
+                        src[2] as f32 / 65535.0,
+                    ];
+                }
+            });
         Self::from_linear(width, height, data)
     }
 
@@ -80,11 +220,13 @@ impl Source {
     fn from_linear(width: u32, height: u32, mut data: Vec<[f32; 3]>) -> Self {
         if width == 0 || height == 0 || data.len() < (width as usize) * (height as usize) {
             return Self {
+                snapshot_id: Self::next_snapshot_id(),
                 levels: vec![Plane { width: 1, height: 1, data: vec![[0.0; 3]] }],
                 lens_shot: None,
                 lens_auto: None,
                 camera_preview: false,
                 portrait_masks: OnceLock::new(),
+                fingerprint: OnceLock::new(),
             };
         }
         data.truncate((width as usize) * (height as usize));
@@ -109,11 +251,13 @@ impl Source {
             levels.push(Plane { width: w, height: h, data });
         }
         Self {
+            snapshot_id: Self::next_snapshot_id(),
             levels,
             lens_shot: None,
             lens_auto: None,
             camera_preview: false,
             portrait_masks: OnceLock::new(),
+            fingerprint: OnceLock::new(),
         }
     }
 
@@ -138,24 +282,54 @@ impl Source {
     pub(crate) fn portrait_masks(&self) -> &crate::portrait_stage::PortraitMasks {
         self.portrait_masks.get_or_init(|| {
             let edge = 512usize;
-            let mut rgba = vec![0u8; edge * edge * 4];
-            for y in 0..edge {
-                for x in 0..edge {
-                    let px = self
-                        .sample(
-                            0,
-                            (x as f32 + 0.5) / edge as f32,
-                            (y as f32 + 0.5) / edge as f32,
-                        )
-                        .unwrap_or([0.0; 3]);
-                    let i = (y * edge + x) * 4;
-                    for k in 0..3 {
-                        rgba[i + k] = (linear_to_srgb(px[k]).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    }
-                    rgba[i + 3] = 255;
-                }
-            }
+            let rgba = self.portrait_mask_rgba(edge);
             crate::portrait_stage::PortraitMasks::from_rgba(&rgba, edge as u32, edge as u32)
+        })
+    }
+
+    fn portrait_mask_rgba(&self, edge: usize) -> Vec<u8> {
+        let mut rgba = vec![0u8; edge * edge * 4];
+        rgba.par_chunks_mut(edge * 4).enumerate().for_each(|(y, row)| {
+            for x in 0..edge {
+                let px = self
+                    .sample(
+                        0,
+                        (x as f32 + 0.5) / edge as f32,
+                        (y as f32 + 0.5) / edge as f32,
+                    )
+                    .unwrap_or([0.0; 3]);
+                for k in 0..3 {
+                    row[x * 4 + k] =
+                        (linear_to_srgb(px[k]).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+                row[x * 4 + 3] = 255;
+            }
+        });
+        rgba
+    }
+
+    fn fingerprint(&self) -> u64 {
+        *self.fingerprint.get_or_init(|| {
+            let hashes: Vec<u64> = self.levels[0]
+                .data
+                .par_chunks(4096)
+                .map(|chunk| {
+                    let mut hash = 0xcbf29ce484222325u64;
+                    for pixel in chunk {
+                        for value in pixel {
+                            hash ^= u64::from(value.to_bits());
+                            hash = hash.wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    hash
+                })
+                .collect();
+            let mut hash = 0xcbf29ce484222325u64;
+            for chunk_hash in hashes {
+                hash ^= chunk_hash;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash | 1
         })
     }
 
@@ -201,7 +375,13 @@ impl Source {
         for k in 0..3 {
             let cols: [f32; 4] = std::array::from_fn(|i| {
                 let xx = x0 - 1 + i as i64;
-                catmull_rom(at(xx, y0 - 1)[k], at(xx, y0)[k], at(xx, y0 + 1)[k], at(xx, y0 + 2)[k], ty)
+                catmull_rom(
+                    at(xx, y0 - 1)[k],
+                    at(xx, y0)[k],
+                    at(xx, y0 + 1)[k],
+                    at(xx, y0 + 2)[k],
+                    ty,
+                )
             });
             out[k] = catmull_rom(cols[0], cols[1], cols[2], cols[3], tx);
         }
@@ -216,10 +396,26 @@ fn catmull_rom(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
 }
 
 /// Approximate white point of a black body at `kelvin`, normalized to green.
-pub(crate) fn white_balance_gains(wb: &crate::WhiteBalance) -> [f32; 3] {
-    // C1 imports carry the exact stored gains; K/T is only the display pair.
-    wb.gains
-        .unwrap_or_else(|| crate::c1_model::kelvin_tint_to_gains(wb.kelvin, wb.tint))
+fn kelvin_rgb(kelvin: f32) -> [f32; 3] {
+    let t = kelvin.clamp(1000.0, 40000.0) / 100.0;
+    let r = if t <= 66.0 { 255.0 } else { 329.698_73 * (t - 60.0).powf(-0.133_204_76) };
+    let g = if t <= 66.0 { 99.470_8 * t.ln() - 161.119_57 } else { 288.122_16 * (t - 60.0).powf(-0.075_514_85) };
+    let b = if t >= 66.0 {
+        255.0
+    } else if t <= 19.0 {
+        0.0
+    } else {
+        138.517_73 * (t - 10.0).ln() - 305.044_8
+    };
+    let (r, g, b) = (r.clamp(1.0, 255.0), g.clamp(1.0, 255.0), b.clamp(1.0, 255.0));
+    [srgb_to_linear(r / 255.0) / srgb_to_linear(g / 255.0), 1.0, srgb_to_linear(b / 255.0) / srgb_to_linear(g / 255.0)]
+}
+
+pub(crate) fn white_balance_gains(kelvin: f32, tint: f32) -> [f32; 3] {
+    let shot = kelvin_rgb(5600.0);
+    let set = kelvin_rgb(kelvin);
+    let tint_gain = 1.0 - tint / 100.0 * 0.6;
+    [shot[0] / set[0], tint_gain, shot[2] / set[2]]
 }
 
 fn luma(c: [f32; 3]) -> f32 {
@@ -406,6 +602,79 @@ fn grid_dims(aspect: f32) -> (usize, usize) {
     (w, h)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct MaskGridCacheKey {
+    source: u64,
+    geometry: Geometry,
+    layers: Vec<(u64, Mask)>,
+    has_guide: bool,
+}
+
+fn cached_mask_grids(
+    src: &Source,
+    adj: &AdjustmentSet,
+    aspect: f32,
+    cell_px: f32,
+    guide: Option<&[f32]>,
+) -> Arc<Vec<Option<MaskGrid>>> {
+    const MAX_CACHED_BYTES: usize = 8 * 1024 * 1024;
+    static CACHE: OnceLock<
+        Mutex<Vec<(MaskGridCacheKey, Arc<Vec<Option<MaskGrid>>>)>>,
+    > =
+        OnceLock::new();
+    let active: Vec<&Layer> =
+        adj.layers.iter().filter(|layer| layer.enabled && layer.opacity > 0.0).collect();
+    let key = MaskGridCacheKey {
+        source: src.snapshot_id(),
+        geometry: adj.geometry.clone(),
+        layers: active.iter().map(|layer| (layer.id, layer.mask.clone())).collect(),
+        has_guide: guide.is_some(),
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut entries = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = entries.iter().position(|(cached_key, _)| cached_key == &key) {
+        let entry = entries.remove(index);
+        let grids = Arc::clone(&entry.1);
+        entries.push(entry);
+        return grids;
+    }
+
+    let mut built: Vec<(u64, MaskGrid)> = Vec::new();
+    let mut grids = Vec::with_capacity(active.len());
+    for layer in active {
+        let grid = (!layer.mask.shapes.is_empty())
+            .then(|| MaskGrid::build(&layer.mask, aspect, cell_px, guide, &built));
+        if let Some(grid) = &grid {
+            built.push((layer.id, grid.clone()));
+        }
+        grids.push(grid);
+    }
+    let bytes = grids
+        .iter()
+        .flatten()
+        .map(|grid| grid.data.len() * std::mem::size_of::<f32>())
+        .sum::<usize>();
+    if bytes <= MAX_CACHED_BYTES {
+        while entries
+            .iter()
+            .map(|(_, cached)| {
+                cached
+                    .iter()
+                    .flatten()
+                    .map(|grid| grid.data.len() * std::mem::size_of::<f32>())
+                    .sum::<usize>()
+            })
+            .sum::<usize>()
+            .saturating_add(bytes)
+            > 32 * 1024 * 1024
+        {
+            entries.remove(0);
+        }
+        entries.push((key, Arc::new(grids.clone())));
+    }
+    Arc::new(grids)
+}
+
 /// The ellipse fallback looks like a real mask in the viewer, so say once why
 /// it is being used.
 fn warn_missing_ai_mask(ai: &AiMask) {
@@ -460,6 +729,7 @@ fn shape_value(
             let v = 1.0 - sstep(inner, 1.0, d);
             (g.op, if g.inverted { 1.0 - v } else { v })
         }
+        MaskShape::Raster(r) => (r.op, r.sample(p)),
         MaskShape::Ai(ai) => {
             if let Some(plane) = plane {
                 return (ai.op, plane.sample(p));
@@ -581,18 +851,19 @@ pub(crate) fn ai_input_rgba(src: &Source, g: &Geometry, long: u32) -> (Vec<u8>, 
         .iter()
         .rposition(|p| p.width >= w && p.height >= h)
         .unwrap_or(0);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    rgba.par_chunks_mut((w * 4) as usize).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let o = [(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32];
             let s = oriented_to_source(o, g);
             let c = src.sample(level, s[0], s[1]).unwrap_or([0.0; 3]);
-            for value in c {
-                rgba.push((linear_to_srgb(value.max(0.0)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+            for k in 0..3 {
+                row[(x * 4) as usize + k] =
+                    (linear_to_srgb(c[k].max(0.0)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
-            rgba.push(255);
+            row[(x * 4 + 3) as usize] = 255;
         }
-    }
+    });
     (rgba, w, h)
 }
 
@@ -605,6 +876,7 @@ fn luma_guide(src: &Source, g: &Geometry, w: usize, h: usize) -> Vec<f32> {
         .position(|p| p.width.max(p.height) <= 256)
         .unwrap_or(src.levels.len() - 1);
     (0..w * h)
+        .into_par_iter()
         .map(|i| {
             let o = [
                 (i % w) as f32 / w as f32 + 0.5 / w as f32,
@@ -653,12 +925,21 @@ struct LayerPlan<'a> {
     /// Constants a per-pixel `local()` would otherwise recompute every time.
     exposure_gain: f32,
     saturation: f32,
+    simple_exposure: bool,
     opacity: f32,
     /// Spatial operators; they need neighbours, so they run on the whole
     /// frame after the layers have been mixed.
     moire: Moire,
     sharpening: Option<Sharpening>,
     noise_reduction: Option<NoiseReduction>,
+}
+
+fn layer_has_spatial(a: &LocalAdjustments) -> bool {
+    a.moire.amount > 0.0
+        || a.sharpening.as_ref().is_some_and(|sharp| sharp.amount > 0.0)
+        || a.noise_reduction.as_ref().is_some_and(|nr| {
+            nr.luminance > 0.0 || nr.color > 0.0 || nr.single_pixel > 0.0
+        })
 }
 
 /// Builds the per-layer plan in draw order. Each mask is rasterized before the
@@ -670,13 +951,30 @@ fn layer_plan<'a>(
     mask_overlay: Option<u64>,
 ) -> LayerPlan<'a> {
     let a = &l.adjustments;
+    let opacity = (l.opacity / 100.0) * (l.mask.density.clamp(0.0, 100.0) / 100.0);
+    let simple_exposure = a.fill_color.is_none()
+        && a.hdr.highlights == 0.0
+        && a.hdr.shadows == 0.0
+        && a.hdr.whites == 0.0
+        && a.hdr.blacks == 0.0
+        && a.exposure.brightness == 0.0
+        && a.exposure.contrast == 0.0
+        && a.clarity.clarity == 0.0
+        && a.clarity.structure == 0.0
+        && a.dehaze.amount <= 0.0
+        && a.levels.is_none()
+        && a.curves.is_none()
+        && a.exposure.saturation == 0.0
+        && a.color_balance == ColorBalance::default()
+        && a.color_editor == ColorEditor::default()
+        && !a.black_white.as_ref().is_some_and(|bw| bw.enabled);
     LayerPlan {
         layer: l,
         grid,
         overlay: mask_overlay == Some(l.id),
         wb_gains: a.white_balance.as_ref().map(|w| {
-            let g = white_balance_gains(w);
-            let base = white_balance_gains(&adj.white_balance);
+            let g = white_balance_gains(w.kelvin, w.tint);
+            let base = white_balance_gains(adj.white_balance.kelvin, adj.white_balance.tint);
             [g[0] / base[0], g[1] / base[1], g[2] / base[2]]
         }),
         curve_rgb: a.curves.as_ref().and_then(|c| lut_of(&c.rgb)),
@@ -687,7 +985,8 @@ fn layer_plan<'a>(
         levels: a.levels.clone(),
         exposure_gain: 2f32.powf(a.exposure.exposure * 0.6),
         saturation: 1.0 + a.exposure.saturation / 100.0,
-        opacity: (l.opacity / 100.0) * (l.mask.density.clamp(0.0, 100.0) / 100.0),
+        simple_exposure,
+        opacity,
         moire: a.moire.clone(),
         sharpening: a.sharpening.clone(),
         noise_reduction: a.noise_reduction.clone(),
@@ -695,28 +994,26 @@ fn layer_plan<'a>(
 }
 
 fn layer_plans<'a>(
+    src: &Source,
     adj: &'a AdjustmentSet,
     aspect: f32,
     cell_px: f32,
     guide: Option<&[f32]>,
     mask_overlay: Option<u64>,
 ) -> Vec<LayerPlan<'a>> {
-    let mut built: Vec<(u64, MaskGrid)> = Vec::new();
-    let mut plans = Vec::new();
-    for l in adj.layers.iter().filter(|l| l.enabled && l.opacity > 0.0) {
-        let grid = (!l.mask.shapes.is_empty())
-            .then(|| MaskGrid::build(&l.mask, aspect, cell_px, guide, &built));
-        if let Some(g) = &grid {
-            built.push((l.id, g.clone()));
-        }
-        plans.push(layer_plan(l, adj, grid, mask_overlay));
-    }
-    plans
+    let grids = cached_mask_grids(src, adj, aspect, cell_px, guide);
+    adj.layers
+        .iter()
+        .filter(|layer| layer.enabled && layer.opacity > 0.0)
+        .zip(grids.iter().cloned())
+        .map(|(layer, grid)| layer_plan(layer, adj, grid, mask_overlay))
+        .collect()
 }
 
 /// Everything precomputed once per render.
 struct Plan<'a> {
     adj: &'a AdjustmentSet,
+    source: u64,
     /// Camera input profile; `None` keeps the source's own sRGB encoding.
     input_profile: Option<std::sync::Arc<crate::icc::Profile>>,
     /// Capture One film curve, applied to linear values before gamma.
@@ -736,7 +1033,197 @@ struct Plan<'a> {
     levels: bool,
     color_editor: bool,
     color_balance: bool,
+    color_balance_offsets: ColorBalanceOffsets,
+    color_balance_gains: bool,
+    black_white: Option<BlackWhitePlan>,
+    tone: ToneConstants,
+    saturation: f32,
+    /// Amount and normalized radius scale when vignetting is active.
+    vignette: Option<(f32, f32)>,
     layers: Vec<LayerPlan<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct ToneConstants {
+    hdr_active: bool,
+    hdr_highlights: f32,
+    hdr_shadows: f32,
+    hdr_whites: f32,
+    hdr_blacks: f32,
+    brightness_gamma: Option<f32>,
+    contrast: f32,
+    clarity: f32,
+    clarity_punch: bool,
+    dehaze: f32,
+    dehaze_denominator: f32,
+    dehaze_scale: f32,
+}
+
+impl ToneConstants {
+    fn new(
+        base_contrast: f32,
+        exp: &Exposure,
+        clarity: &Clarity,
+        dehaze: &Dehaze,
+    ) -> Self {
+        Self {
+            hdr_active: false,
+            hdr_highlights: 0.0,
+            hdr_shadows: 0.0,
+            hdr_whites: 0.0,
+            hdr_blacks: 0.0,
+            brightness_gamma: (exp.brightness.abs() > 1e-3)
+                .then(|| 2f32.powf(-exp.brightness / 50.0 * 0.6)),
+            contrast: base_contrast + exp.contrast / 50.0 * 0.8,
+            clarity: (clarity.clarity + clarity.structure * 0.5) / 100.0,
+            clarity_punch: matches!(clarity.method, ClarityMethod::Punch),
+            dehaze: dehaze.amount / 100.0 * 0.22,
+            dehaze_denominator: 1.0 - dehaze.amount / 100.0 * 0.22,
+            dehaze_scale: 1.0 + dehaze.amount / 100.0 * 0.22,
+        }
+    }
+
+    fn with_hdr(mut self, hdr: &HighDynamicRange) -> Self {
+        self.hdr_active = hdr.highlights != 0.0
+            || hdr.shadows != 0.0
+            || hdr.whites != 0.0
+            || hdr.blacks != 0.0;
+        self.hdr_highlights = hdr.highlights / 100.0 * 0.35;
+        self.hdr_shadows = hdr.shadows / 100.0 * 0.3;
+        self.hdr_whites = hdr.whites / 100.0 * 0.2;
+        self.hdr_blacks = hdr.blacks / 100.0 * 0.12;
+        self
+    }
+}
+
+type ColorBalanceOffsets = [Option<[f32; 3]>; 4];
+
+fn color_balance_offsets(cb: &ColorBalance) -> ColorBalanceOffsets {
+    [&cb.master, &cb.shadow, &cb.midtone, &cb.highlight].map(|wheel| {
+        (wheel.saturation != 0.0 || wheel.lightness != 0.0)
+            .then(|| wheel_offset(wheel, 0.35))
+    })
+}
+
+#[derive(Clone, Copy)]
+struct BlackWhiteTonePlan {
+    color: [f32; 3],
+    mean: f32,
+    factor: f32,
+}
+
+struct BlackWhitePlan {
+    sensitivity: [f32; 6],
+    highlight: Option<BlackWhiteTonePlan>,
+    shadow: Option<BlackWhiteTonePlan>,
+}
+
+impl BlackWhitePlan {
+    fn new(bw: &BlackWhite) -> Self {
+        let tone = |tone: &SplitTone| {
+            (tone.saturation > 0.0).then(|| {
+                let color = hue_rgb(tone.hue);
+                BlackWhiteTonePlan {
+                    color,
+                    mean: (color[0] + color[1] + color[2]) / 3.0,
+                    factor: tone.saturation / 100.0 * 0.35,
+                }
+            })
+        };
+        Self {
+            sensitivity: bw.sensitivity,
+            highlight: tone(&bw.highlight_tone),
+            shadow: tone(&bw.shadow_tone),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LayerOutputWeightKey {
+    source: u64,
+    geometry: Geometry,
+    layers: Vec<(u64, Mask)>,
+    region: NormRect,
+    width: usize,
+    height: usize,
+}
+
+fn cached_layer_weights(
+    plan: &Plan<'_>,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    width: usize,
+    height: usize,
+) -> Option<Arc<Vec<f32>>> {
+    if plan.layers.is_empty()
+        || plan
+            .layers
+            .iter()
+            .any(|layer| layer.layer.mask.luma_range.is_some() || layer.layer.mask.color_range.is_some())
+    {
+        return None;
+    }
+    const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+    static CACHE: OnceLock<
+        Mutex<Vec<(LayerOutputWeightKey, Arc<Vec<f32>>)>>,
+    > = OnceLock::new();
+    let key = LayerOutputWeightKey {
+        source: plan.source,
+        geometry: plan.adj.geometry.clone(),
+        layers: plan
+            .layers
+            .iter()
+            .map(|layer| (layer.layer.id, layer.layer.mask.clone()))
+            .collect(),
+        region,
+        width,
+        height,
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut entries = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = entries.iter().position(|(cached_key, _)| cached_key == &key) {
+        let entry = entries.remove(index);
+        let weights = Arc::clone(&entry.1);
+        entries.push(entry);
+        return Some(weights);
+    }
+
+    let n = plan.layers.len();
+    let xs: Vec<f32> =
+        (0..width).map(|x| region.x + (x as f32 + 0.5) / width as f32 * region.width).collect();
+    let mut weights = vec![0.0f32; width * height * n];
+    weights.par_chunks_mut(width * n).enumerate().for_each(|(y, row)| {
+        let fy = region.y + (y as f32 + 0.5) / height as f32 * region.height;
+        for (x, &fx) in xs.iter().enumerate() {
+            let (p, _) = map.map_clean([fx, fy]);
+            for (layer_index, layer) in plan.layers.iter().enumerate() {
+                row[x * n + layer_index] = layer_mask_weight(
+                    &layer.layer.mask,
+                    layer.grid.as_ref(),
+                    layer.opacity,
+                    p,
+                    [0.0; 3],
+                );
+            }
+        }
+    });
+    let weights = Arc::new(weights);
+    let bytes = weights.len() * std::mem::size_of::<f32>();
+    if bytes <= MAX_ENTRY_BYTES {
+        while entries.len() >= 4
+            || entries
+                .iter()
+                .map(|(_, cached)| cached.len() * std::mem::size_of::<f32>())
+                .sum::<usize>()
+                .saturating_add(bytes)
+                > MAX_TOTAL_BYTES
+        {
+            entries.remove(0);
+        }
+        entries.push((key, Arc::clone(&weights)));
+    }
+    Some(weights)
 }
 
 fn lut_of(c: &Curve) -> Option<[f32; 256]> {
@@ -750,11 +1237,36 @@ fn lut_get(lut: &[f32; 256], v: f32) -> f32 {
     lut[i] + (lut[i + 1] - lut[i]) * t
 }
 
+fn portrait_job_id(
+    src: &Source,
+    adj: &AdjustmentSet,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    wide: bool,
+) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    src.fingerprint().hash(&mut hash);
+    src.size().hash(&mut hash);
+    level.hash(&mut hash);
+    wide.hash(&mut hash);
+    out_w.hash(&mut hash);
+    out_h.hash(&mut hash);
+    region.x.to_bits().hash(&mut hash);
+    region.y.to_bits().hash(&mut hash);
+    region.width.to_bits().hash(&mut hash);
+    region.height.to_bits().hash(&mut hash);
+    crate::preview_cache::params_fingerprint(adj).hash(&mut hash);
+    hash.finish() | 1
+}
+
 pub struct Rendered {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub(crate) histogram: Histogram,
+    pub portrait_report: Option<crate::portrait_stage::PortraitRunReport>,
 }
 
 /// A 16-bit frame for export. Previews keep using the 8-bit [`Rendered`].
@@ -762,6 +1274,7 @@ pub struct Rendered16 {
     pub rgba: Vec<u16>,
     pub width: u32,
     pub height: u32,
+    pub portrait_report: Option<crate::portrait_stage::PortraitRunReport>,
 }
 
 #[doc(hidden)]
@@ -795,6 +1308,7 @@ pub fn render16(
         rgba: wide.expect("a wide render always returns its 16-bit buffer"),
         width: narrow.width,
         height: narrow.height,
+        portrait_report: narrow.portrait_report,
     }
 }
 
@@ -856,7 +1370,13 @@ pub(crate) fn render_at(
     }
     let rgba = upsample(&small.rgba, small.width, small.height, tw, th);
     let histogram = histogram(&rgba);
-    Rendered { rgba, width: tw, height: th, histogram }
+    Rendered {
+        rgba,
+        width: tw,
+        height: th,
+        histogram,
+        portrait_report: small.portrait_report,
+    }
 }
 
 /// Bilinear upsample. `image`'s resize costs more than the half-size render it
@@ -915,9 +1435,16 @@ fn render_sized(
         l.enabled && l.opacity > 0.0 && l.mask.refine > 0.0 && !l.mask.shapes.is_empty()
     });
     let guide = needs_guide.then(|| luma_guide(src, &adj.geometry, gw, gh));
+    let base_contrast = match adj.base.curve {
+        ToneCurvePreset::Auto | ToneCurvePreset::FilmStandard => 0.12,
+        ToneCurvePreset::FilmExtraShadow => 0.06,
+        ToneCurvePreset::FilmHighContrast => 0.3,
+        ToneCurvePreset::Linear => 0.0,
+    };
 
     let plan = Plan {
         adj,
+        source: src.snapshot_id(),
         input_profile: if src.camera_preview {
             None
         } else {
@@ -930,14 +1457,9 @@ fn render_sized(
         },
         gamma: GammaLut::new(),
         fine: wide,
-        wb: white_balance_gains(&adj.white_balance),
+        wb: white_balance_gains(adj.white_balance.kelvin, adj.white_balance.tint),
         exposure: 2f32.powf(adj.exposure.exposure),
-        base_contrast: match adj.base.curve {
-            ToneCurvePreset::Auto | ToneCurvePreset::FilmStandard => 0.12,
-            ToneCurvePreset::FilmExtraShadow => 0.06,
-            ToneCurvePreset::FilmHighContrast => 0.3,
-            ToneCurvePreset::Linear => 0.0,
-        },
+        base_contrast,
         curve_rgb: lut_of(&adj.curves.rgb),
         curve_r: lut_of(&adj.curves.red),
         curve_g: lut_of(&adj.curves.green),
@@ -946,46 +1468,92 @@ fn render_sized(
         levels: adj.levels != Levels::default(),
         color_editor: adj.color_editor != ColorEditor::default(),
         color_balance: adj.color_balance != ColorBalance::default(),
-        layers: layer_plans(adj, aspect, cell_px, guide.as_deref(), mask_overlay),
+        color_balance_offsets: color_balance_offsets(&adj.color_balance),
+        color_balance_gains: adj
+            .color_balance_gains
+            .as_ref()
+            .is_some_and(|gains| !gains.is_neutral()),
+        black_white: adj.black_white.enabled.then(|| BlackWhitePlan::new(&adj.black_white)),
+        tone: ToneConstants::new(base_contrast, &adj.exposure, &adj.clarity, &adj.dehaze)
+            .with_hdr(&adj.hdr),
+        saturation: 1.0 + adj.exposure.saturation / 100.0,
+        vignette: (adj.vignetting.amount.abs() > 1e-3).then(|| {
+            let scale = match adj.vignetting.method {
+                VignetteMethod::EllipticOnCrop => std::f32::consts::SQRT_2,
+                VignetteMethod::Circular | VignetteMethod::CircularCrop => 1.6,
+            };
+            (adj.vignetting.amount, scale)
+        }),
+        layers: layer_plans(src, adj, aspect, cell_px, guide.as_deref(), mask_overlay),
     };
 
-    // The frame-point x of each column does not depend on the row.
-    let xs: Vec<f32> =
-        (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
     let len = (out_w * out_h * 4) as usize;
     let row = (out_w * 4) as usize;
     let mut rgba = vec![0u8; len];
     let mut rgba16 = wide.then(|| vec![0u16; len]);
+    let xs: Vec<f32> =
+        (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
     // Above 1:1 the region is magnified, so a bicubic tap keeps the detail the
     // zoom is for; at or below 1:1 the bilinear mip sample is the correct filter.
     let sharp = scale > 1.0;
+    let samples = source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
     match rgba16.as_mut() {
         Some(wide_line) => {
             rgba.par_chunks_mut(row)
                 .zip(wide_line.par_chunks_mut(row))
                 .enumerate()
                 .for_each(|(y, (line, line16))| {
-                    develop_line(&plan, src, &map, region, level, out_h, &xs, y, bypass, sharp, line, Some(line16));
+                    develop_line(&plan, region, out_h, &xs, &samples, y, bypass, line, Some(line16));
                 });
         }
         None => {
             rgba.par_chunks_mut(row).enumerate().for_each(|(y, line)| {
-                develop_line(&plan, src, &map, region, level, out_h, &xs, y, bypass, sharp, line, None);
+                develop_line(&plan, region, out_h, &xs, &samples, y, bypass, line, None);
             });
         }
     }
     // Detail, spots and layers are 8-bit stages; keeping their delta lets the
     // wide buffer carry the develop precision through them.
-    let develop8 = rgba16.is_some().then(|| rgba.clone());
+    let mut develop8 = rgba16.is_some().then(|| rgba.clone());
     if !bypass {
         let warp = if adj.lens.use_profile {
-            src.lens_shot
-                .as_ref()
-                .and_then(|shot| super::lens_profile::warp_for(&adj.lens, shot, src.lens_auto.as_ref()))
+            super::lens_profile::warp_for(&adj.lens, src.lens_shot.as_ref(), src.lens_auto.as_ref())
         } else {
             None
         };
         match warp.as_ref() {
+            // A warp is not a small delta: apply it to both buffers. The 8-bit
+            // buffer feeds previews and the histogram; converting its warp to
+            // a delta would replace the export's 16-bit detail with 8-bit
+            // quantisation noise wherever the warp moves pixels.
+            Some(warp) if rgba16.is_some() => {
+                let mut preview = adj.clone();
+                preview.lens.distortion = 0.0;
+                preview.lens.light_falloff = 0.0;
+                preview.lens.chromatic_aberration = false;
+                preview.lens.purple_fringing = 0.0;
+                preview.lens.use_profile = false;
+                super::detail::post_process(&mut rgba, out_w, out_h, &preview, scale);
+                if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
+                    merge_wide_delta(wide, before, &rgba, out_w as usize);
+                }
+                super::detail::stage_lens(&mut rgba, out_w as usize, out_h as usize, &adj.lens, Some(warp));
+                if let Some(wide) = rgba16.as_mut() {
+                    super::detail::stage_lens_profile16(
+                        wide,
+                        out_w as usize,
+                        out_h as usize,
+                        &adj.lens,
+                        warp,
+                        (adj.lens.distortion / 100.0).clamp(-1.0, 1.0),
+                        (adj.lens.light_falloff / 100.0).clamp(0.0, 1.0),
+                        adj.lens.chromatic_aberration,
+                    );
+                }
+                // Everything after this point (spots, layers) is local and can
+                // merge as before.
+                develop8 = Some(rgba.clone());
+            }
             Some(warp) => super::detail::post_process_with_lens(&mut rgba, out_w, out_h, adj, scale, Some(warp)),
             None => super::detail::post_process(&mut rgba, out_w, out_h, adj, scale),
         }
@@ -998,56 +1566,90 @@ fn render_sized(
     if !bypass {
         apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale);
     }
-    if !adj.extra.is_empty() && !bypass {
-        crate::portrait_stage::apply_portrait_effects(
+    let portrait_report = if !adj.extra.is_empty() && !bypass {
+        let masks = src.portrait_masks();
+        let receipt = crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt(
+            &rgba,
+            out_w,
+            out_h,
+            region,
+            &adj.extra,
+            masks,
+        );
+        let mut inputs =
+            crate::portrait_stage::PortraitJobInputs::from_renderer_receipt(receipt, masks);
+        if let Some(producer) = adj.portrait_producer_inputs.as_deref() {
+            inputs.fill_from_producer_inputs(producer);
+        }
+        Some(crate::portrait_stage::apply_portrait_effects_with_job(
             &mut rgba,
             out_w,
             out_h,
             region,
             &adj.extra,
-            src.portrait_masks(),
-        );
-    }
+            &inputs,
+        ))
+    } else {
+        None
+    };
     if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
-        for ((px, base), after) in
-            wide.chunks_exact_mut(4).zip(before.chunks_exact(4)).zip(rgba.chunks_exact(4))
-        {
-            for k in 0..3 {
-                px[k] = (px[k] as i32 + (after[k] as i32 - base[k] as i32) * 257)
-                    .clamp(0, 65535) as u16;
-            }
-            px[3] = if after[3] == base[3] { px[3] } else { after[3] as u16 * 257 };
-        }
+        merge_wide_delta(wide, before, &rgba, out_w as usize);
     }
     let histogram = histogram(&rgba);
-    (Rendered { rgba, width: out_w, height: out_h, histogram }, rgba16)
+    (
+        Rendered {
+            rgba,
+            width: out_w,
+            height: out_h,
+            histogram,
+            portrait_report,
+        },
+        rgba16,
+    )
+}
+
+fn merge_wide_delta(wide: &mut [u16], before: &[u8], after: &[u8], width: usize) {
+    if width == 0 {
+        return;
+    }
+    let row = width * 4;
+    wide.par_chunks_mut(row)
+        .zip(before.par_chunks(row))
+        .zip(after.par_chunks(row))
+        .for_each(|((wide_line, base_line), after_line)| {
+            for ((px, base), after) in wide_line
+                .chunks_exact_mut(4)
+                .zip(base_line.chunks_exact(4))
+                .zip(after_line.chunks_exact(4))
+            {
+                for k in 0..3 {
+                    px[k] = (px[k] as i32 + (after[k] as i32 - base[k] as i32) * 257)
+                        .clamp(0, 65535) as u16;
+                }
+                px[3] = if after[3] == base[3] { px[3] } else { after[3] as u16 * 257 };
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
 fn develop_line(
     plan: &Plan,
-    src: &Source,
-    map: &super::geometry::FrameMap,
     region: NormRect,
-    level: usize,
     out_h: u32,
     xs: &[f32],
+    samples: &[SourceSample],
     y: usize,
     bypass: bool,
-    sharp: bool,
     line: &mut [u8],
     line16: Option<&mut [u16]>,
 ) {
     let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
     let mut line16 = line16;
-    for (x, &fx) in xs.iter().enumerate() {
+    let pixels = line.len() / 4;
+    let row = &samples[y * pixels..(y + 1) * pixels];
+    for (x, (sample, &fx)) in row.iter().zip(xs).enumerate() {
         let f = [fx, fy];
-        let (_, s) = map.map(f);
-        let sample = if sharp { src.sample_cubic(level, s[0], s[1]) } else { src.sample(level, s[0], s[1]) };
-        let c = match sample {
-            Some(lin) => develop(plan, lin, f, bypass),
-            None => [0.11, 0.11, 0.11],
-        };
+        let c = if sample.valid() { develop(plan, sample.rgb, f, bypass) } else { [0.11, 0.11, 0.11] };
         let px = &mut line[x * 4..x * 4 + 4];
         let mut px16 = line16.as_deref_mut().map(|l| &mut l[x * 4..x * 4 + 4]);
         for k in 0..3 {
@@ -1079,16 +1681,8 @@ fn encode(plan: &Plan, lin: [f32; 3]) -> [f32; 3] {
 }
 
 fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
-    if let Some(c) = negative_film_branch(plan) {
-        return c;
-    }
     // The camera profile is an input transform: device RGB -> linear sRGB.
-    // Most C1 profiles carry an `mft2` shaper that is the sRGB encode, so they
-    // want linear values; the Leaf/Mamiya/Phase One backs ship an identity
-    // shaper and want the stored codes, so only they get the encode first.
-    // Encoding unconditionally cost 20 ΔE on the 5673 (34.64 -> 14.73).
     let lin = match &plan.input_profile {
-        Some(profile) if profile.expects_linear_input() => profile.to_linear_srgb(lin),
         Some(profile) => {
             let encoded = [
                 plan.gamma.get(lin[0]),
@@ -1112,14 +1706,11 @@ fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
     let mut c = [lin[0] * plan.wb[0] * e, lin[1] * plan.wb[1] * e, lin[2] * plan.wb[2] * e];
 
     // Lens light falloff is corrected toward flat; vignetting adds its own.
-    let dx = f[0] - 0.5;
-    let dy = f[1] - 0.5;
-    let radius = match adj.vignetting.method {
-        VignetteMethod::EllipticOnCrop => (dx * dx + dy * dy).sqrt() * std::f32::consts::SQRT_2,
-        VignetteMethod::Circular | VignetteMethod::CircularCrop => (dx * dx + dy * dy).sqrt() * 1.6,
-    };
-    if adj.vignetting.amount.abs() > 1e-3 {
-        let v = 2f32.powf(adj.vignetting.amount * sstep(0.35, 1.1, radius));
+    if let Some((amount, radius_scale)) = plan.vignette {
+        let dx = f[0] - 0.5;
+        let dy = f[1] - 0.5;
+        let radius = (dx * dx + dy * dy).sqrt() * radius_scale;
+        let v = 2f32.powf(amount * sstep(0.35, 1.1, radius));
         c = [c[0] * v, c[1] * v, c[2] * v];
     }
 
@@ -1127,7 +1718,7 @@ fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
     // codes (0.18 maps to 0.49), so it replaces the sRGB encode rather than
     // stacking on top of it.
     let mut g = encode(plan, c);
-    g = tone(g, &adj.hdr, &adj.exposure, plan.base_contrast, &adj.clarity, &adj.dehaze);
+    g = tone(g, plan.tone);
 
     if plan.levels {
         g = adj.levels.apply(g);
@@ -1151,64 +1742,44 @@ fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
     }
 
     // Color.
-    let sat = 1.0 + adj.exposure.saturation / 100.0;
+    let sat = plan.saturation;
     if (sat - 1.0).abs() > 1e-4 {
         let l = luma(g);
         g = [l + (g[0] - l) * sat, l + (g[1] - l) * sat, l + (g[2] - l) * sat];
     }
     if plan.color_balance {
-        g = color_balance(g, &adj.color_balance, 1.0);
+        g = apply_color_balance(g, &plan.color_balance_offsets, 1.0);
     }
-    if let Some(gains) = &adj.color_balance_gains {
+    if plan.color_balance_gains {
+        let gains = adj.color_balance_gains.as_ref().expect("checked in Plan");
         g = color_balance_gains(g, gains);
     }
     if plan.color_editor {
         g = color_editor(g, &adj.color_editor, 1.0);
     }
-    if adj.black_white.enabled {
-        g = black_white(g, &adj.black_white);
+    if let Some(bw) = &plan.black_white {
+        g = apply_black_white(g, bw);
     }
 
     g
 }
 
-/// Placeholder for C1's film-negative/positive branch. The field is parsed and
-/// preserved, but the inversion/black-point order is not proven yet; return
-/// `None` so the normal develop path is used unchanged.
-fn negative_film_branch(plan: &Plan) -> Option<[f32; 3]> {
-    if plan.adj.base.processing_method == TechnicalProcessingMethod::Photography {
-        return None;
-    }
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            "processing_method {:?} is parsed but its negative-film branch is not implemented; using normal develop path",
-            plan.adj.base.processing_method
-        );
-    }
-    None
-}
-
-fn tone(
-    mut g: [f32; 3],
-    hdr: &HighDynamicRange,
-    exp: &Exposure,
-    base_contrast: f32,
-    clarity: &Clarity,
-    dehaze: &Dehaze,
-) -> [f32; 3] {
-    let l = luma(g);
-    let wh = sstep(0.45, 1.2, l);
-    let ws = 1.0 - sstep(0.0, 0.55, l);
-    let ww = sstep(0.65, 1.0, l);
-    let wb = 1.0 - sstep(0.0, 0.25, l);
-    let shift = hdr.highlights / 100.0 * 0.35 * wh + hdr.shadows / 100.0 * 0.3 * ws + hdr.whites / 100.0 * 0.2 * ww
-        + hdr.blacks / 100.0 * 0.12 * wb;
-    if shift.abs() > 1e-5 {
-        let target = (l + shift).max(0.0);
-        let k = target / l.max(1e-4);
-        g = [g[0] * k, g[1] * k, g[2] * k];
+fn tone(mut g: [f32; 3], constants: ToneConstants) -> [f32; 3] {
+    if constants.hdr_active {
+        let l = luma(g);
+        let wh = sstep(0.45, 1.2, l);
+        let ws = 1.0 - sstep(0.0, 0.55, l);
+        let ww = sstep(0.65, 1.0, l);
+        let wb = 1.0 - sstep(0.0, 0.25, l);
+        let shift = constants.hdr_highlights * wh
+            + constants.hdr_shadows * ws
+            + constants.hdr_whites * ww
+            + constants.hdr_blacks * wb;
+        if shift.abs() > 1e-5 {
+            let target = (l + shift).max(0.0);
+            let k = target / l.max(1e-4);
+            g = [g[0] * k, g[1] * k, g[2] * k];
+        }
     }
     // Soft shoulder for whatever still exceeds white.
     for v in &mut g {
@@ -1217,47 +1788,54 @@ fn tone(
             *v = 0.9 + over / (1.0 + over * 10.0);
         }
     }
-    if exp.brightness.abs() > 1e-3 {
-        let gamma = 2f32.powf(-exp.brightness / 50.0 * 0.6);
+    if let Some(gamma) = constants.brightness_gamma {
         g = [g[0].max(0.0).powf(gamma), g[1].max(0.0).powf(gamma), g[2].max(0.0).powf(gamma)];
     }
-    let c = base_contrast + exp.contrast / 50.0 * 0.8;
-    g = [contrast(g[0], c), contrast(g[1], c), contrast(g[2], c)];
-    let local = (clarity.clarity + clarity.structure * 0.5) / 100.0;
+    g = [
+        contrast(g[0], constants.contrast),
+        contrast(g[1], constants.contrast),
+        contrast(g[2], constants.contrast),
+    ];
+    let local = constants.clarity;
     if local.abs() > 1e-4 {
         let l = luma(g);
         let mid = 4.0 * l * (1.0 - l);
         let k = 1.0 + local * 0.6 * mid;
         g = [0.5 + (g[0] - 0.5) * k, 0.5 + (g[1] - 0.5) * k, 0.5 + (g[2] - 0.5) * k];
-        if matches!(clarity.method, ClarityMethod::Punch) {
+        if constants.clarity_punch {
             let l = luma(g);
             let s = 1.0 + local * 0.25;
             g = [l + (g[0] - l) * s, l + (g[1] - l) * s, l + (g[2] - l) * s];
         }
     }
-    if dehaze.amount > 0.0 {
-        let a = dehaze.amount / 100.0 * 0.22;
-        g = [(g[0] - a) / (1.0 - a), (g[1] - a) / (1.0 - a), (g[2] - a) / (1.0 - a)];
+    if constants.dehaze > 0.0 {
+        let a = constants.dehaze;
+        g = [
+            (g[0] - a) / constants.dehaze_denominator,
+            (g[1] - a) / constants.dehaze_denominator,
+            (g[2] - a) / constants.dehaze_denominator,
+        ];
         let l = luma(g);
-        let s = 1.0 + a;
+        let s = constants.dehaze_scale;
         g = [l + (g[0] - l) * s, l + (g[1] - l) * s, l + (g[2] - l) * s];
     }
     g
 }
 
 fn color_balance(g: [f32; 3], cb: &ColorBalance, k: f32) -> [f32; 3] {
+    apply_color_balance(g, &color_balance_offsets(cb), k)
+}
+
+fn apply_color_balance(g: [f32; 3], offsets: &ColorBalanceOffsets, k: f32) -> [f32; 3] {
     let l = luma(g).clamp(0.0, 1.0);
     let ws = (1.0 - l).powi(2);
     let wh = l.powi(2);
     let wm = (1.0 - ws - wh).max(0.0);
     let mut out = g;
-    for (wheel, w) in [(&cb.master, 1.0), (&cb.shadow, ws), (&cb.midtone, wm), (&cb.highlight, wh)] {
-        if wheel.saturation == 0.0 && wheel.lightness == 0.0 {
-            continue;
-        }
-        let o = wheel_offset(wheel, 0.35);
+    for (offset, w) in offsets.iter().zip([1.0, ws, wm, wh]) {
+        let Some(offset) = offset else { continue };
         for i in 0..3 {
-            out[i] += o[i] * w * k;
+            out[i] += offset[i] * w * k;
         }
     }
     out
@@ -1355,6 +1933,18 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     let mut dh = 0.0;
     let mut ds = 0.0;
     let mut dl = 0.0;
+    let range_count = ce.advanced.len() + ce.skin.len();
+    let mut stack_weights = [0.0f32; 32];
+    let mut heap_weights = if range_count > stack_weights.len() {
+        vec![0.0f32; range_count]
+    } else {
+        Vec::new()
+    };
+    let range_weights: &mut [f32] = if range_count > stack_weights.len() {
+        &mut heap_weights
+    } else {
+        &mut stack_weights[..range_count]
+    };
 
     if ce.global.enabled {
         let mut w = band_weight(&ce.global, 0.0, h0, s0, v0);
@@ -1375,20 +1965,26 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         apply_homogeneity(band, w, &mut h, &mut s, &mut v);
     }
 
-    for r in ce.advanced.iter().chain(ce.skin.iter()) {
-        if let Some((_, band)) = ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
-            if !band.enabled {
-                continue;
+    for (index, r) in ce.advanced.iter().chain(ce.skin.iter()).enumerate() {
+        let w = match ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
+            Some((_, band)) if band.enabled => {
+                let mut w = band_weight(band, 0.0, h0, s0, v0);
+                if band.inverted {
+                    w = 1.0 - w;
+                }
+                apply_homogeneity(band, w, &mut h, &mut s, &mut v);
+                w
             }
-            let mut w = band_weight(band, 0.0, h0, s0, v0);
-            if band.inverted {
-                w = 1.0 - w;
+            Some(_) => 0.0,
+            None => {
+                let w = color_range_weight(r, g);
+                if let Some(u) = &r.uniformity {
+                    h += signed_hue_delta(r.hue, h) * (u.hue / 100.0 * w);
+                }
+                w
             }
-            apply_homogeneity(band, w, &mut h, &mut s, &mut v);
-        } else if let Some(u) = &r.uniformity {
-            let w = color_range_weight(r, g);
-            h += signed_hue_delta(r.hue, h) * (u.hue / 100.0 * w);
-        }
+        };
+        range_weights[index] = w;
     }
 
     for (i, shift) in ce.basic.iter().enumerate() {
@@ -1408,15 +2004,7 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         dl += shift.lightness * w;
     }
 
-    for r in ce.advanced.iter().chain(ce.skin.iter()) {
-        let w = match ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
-            Some((_, band)) if band.enabled => {
-                let w = band_weight(band, 0.0, h0, s0, v0);
-                if band.inverted { 1.0 - w } else { w }
-            }
-            Some(_) => 0.0,
-            None => color_range_weight(r, g),
-        };
+    for (r, w) in ce.advanced.iter().chain(ce.skin.iter()).zip(range_weights.iter().copied()) {
         dh += r.shift.hue * w;
         ds += r.shift.saturation * w;
         dl += r.shift.lightness * w;
@@ -1430,26 +2018,66 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
 }
 
 fn black_white(g: [f32; 3], bw: &BlackWhite) -> [f32; 3] {
-    let (h, s, _) = rgb_to_hsv([g[0].max(0.0), g[1].max(0.0), g[2].max(0.0)]);
-    let centers = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
-    let mut boost = 0.0;
-    for (i, c) in centers.iter().enumerate() {
-        let w = (1.0 - hue_distance(h, *c) / 60.0).max(0.0);
-        boost += bw.sensitivity[i] / 100.0 * w;
+    apply_black_white(g, &BlackWhitePlan::new(bw))
+}
+
+fn apply_black_white(g: [f32; 3], plan: &BlackWhitePlan) -> [f32; 3] {
+    // Zero sliders keep the exact display luma and therefore the old buckets.
+    let l = if plan.sensitivity.iter().all(|&v| v == 0.0) {
+        luma(g)
+    } else {
+        bw_sector_y(g, &plan.sensitivity)
     }
-    let l = (luma(g) * (1.0 + boost * s * 0.8)).max(0.0);
+    .max(0.0);
     let mut out = [l, l, l];
-    for (tone, w) in [(&bw.highlight_tone, sstep(0.4, 1.0, l)), (&bw.shadow_tone, 1.0 - sstep(0.0, 0.6, l))] {
-        if tone.saturation > 0.0 {
-            let c = hue_rgb(tone.hue);
-            let a = tone.saturation / 100.0 * 0.35 * w;
-            let mean = (c[0] + c[1] + c[2]) / 3.0;
-            for i in 0..3 {
-                out[i] += (c[i] - mean) * a;
-            }
+    for (tone, w) in [
+        (plan.highlight.as_ref(), sstep(0.4, 1.0, l)),
+        (plan.shadow.as_ref(), 1.0 - sstep(0.0, 0.6, l)),
+    ] {
+        let Some(tone) = tone else { continue };
+        let a = tone.factor * w;
+        for i in 0..3 {
+            out[i] += (tone.color[i] - tone.mean) * a;
         }
     }
     out
+}
+
+/// Rec.601 luma, the B&W zero baseline.
+const BW_LUMA: [f32; 3] = [0.299, 0.587, 0.114];
+
+/// The max-side and min-side weights in Q10, from
+/// `[red, yellow, green, cyan, blue, magenta]`. Each slider spans its slot from
+/// the Rec.601 baseline to full white; the exact C1 scale is not traced.
+fn bw_weights(sensitivity: &[f32; 6]) -> ([i32; 3], [i32; 3]) {
+    let mut w_max = BW_LUMA;
+    let mut w_min = [BW_LUMA[0] - 1.0, BW_LUMA[1] - 1.0, BW_LUMA[2] - 1.0];
+    // Pure red/green/blue enter through the max side, their complements
+    // (cyan/magenta/yellow) through the min side.
+    w_max[0] += sensitivity[0] / 100.0 * (1.0 - BW_LUMA[0]);
+    w_max[1] += sensitivity[2] / 100.0 * (1.0 - BW_LUMA[1]);
+    w_max[2] += sensitivity[4] / 100.0 * (1.0 - BW_LUMA[2]);
+    w_min[0] += sensitivity[3] / 100.0 * (1.0 - BW_LUMA[0]);
+    w_min[1] += sensitivity[5] / 100.0 * (1.0 - BW_LUMA[1]);
+    w_min[2] += sensitivity[1] / 100.0 * (1.0 - BW_LUMA[2]);
+    let q10 = |w: [f32; 3]| w.map(|v| (v * 1024.0).round() as i32);
+    (q10(w_max), q10(w_min))
+}
+
+/// `CImgOpBlackWhiteV8_tonemap`'s 16-bit fast path: sort RGB, pick the sector
+/// by `(argmax, argmin)`, then `t = (max-min)*wMax + (mid-min)*wMin`.
+fn bw_sector_y(g: [f32; 3], sensitivity: &[f32; 6]) -> f32 {
+    let (w_max, w_min) = bw_weights(sensitivity);
+    let q = g.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as i32);
+    // The host's argmax favours R unless B >= R, and argmin favours R unless
+    // G < R; ties therefore pick R. Keep that order so sector boundaries match.
+    let (i_max, max) = if q[0] > q[2] { (0, q[0]) } else { (2, q[2]) };
+    let (i_max, max) = if q[1] > max { (1, q[1]) } else { (i_max, max) };
+    let (i_min, min) = if q[1] < q[0] { (1, q[1]) } else { (0, q[0]) };
+    let (i_min, min) = if q[2] < min { (2, q[2]) } else { (i_min, min) };
+    let mid = q[3 - i_max - i_min];
+    let t = (max - min) * w_max[i_max] + (mid - min) * w_min[i_min];
+    (mid + (t >> 10)).clamp(0, 65535) as f32 / 65535.0
 }
 
 fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
@@ -1465,7 +2093,14 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
         let e = lp.exposure_gain;
         c = [c[0] * e, c[1] * e, c[2] * e];
     }
-    c = tone(c, &a.hdr, &a.exposure, 0.0, &a.clarity, &a.dehaze);
+    if lp.simple_exposure {
+        c = shoulder(c);
+        return [g[0] + (c[0] - g[0]) * m, g[1] + (c[1] - g[1]) * m, g[2] + (c[2] - g[2]) * m];
+    }
+    c = tone(
+        c,
+        ToneConstants::new(0.0, &a.exposure, &a.clarity, &a.dehaze).with_hdr(&a.hdr),
+    );
     if let Some(levels) = &lp.levels {
         c = levels.apply(c);
     }
@@ -1506,17 +2141,27 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
 /// The mask weight of one layer at a point, including invert, the luma and
 /// colour windows, the layer opacity and the mask density.
 fn layer_weight(lp: &LayerPlan, p: [f32; 2], g: [f32; 3]) -> f32 {
-    let mut m = lp.grid.as_ref().map_or(1.0, |grid| grid.sample(p));
-    if lp.layer.mask.invert {
+    layer_mask_weight(&lp.layer.mask, lp.grid.as_ref(), lp.opacity, p, g)
+}
+
+fn layer_mask_weight(
+    mask: &Mask,
+    grid: Option<&MaskGrid>,
+    opacity: f32,
+    p: [f32; 2],
+    g: [f32; 3],
+) -> f32 {
+    let mut m = grid.map_or(1.0, |grid| grid.sample(p));
+    if mask.invert {
         m = 1.0 - m;
     }
-    if let Some(r) = &lp.layer.mask.luma_range {
+    if let Some(r) = &mask.luma_range {
         m *= luma_range_weight(r, luma(g));
     }
-    if let Some(r) = &lp.layer.mask.color_range {
+    if let Some(r) = &mask.color_range {
         m *= color_range_weight(r, g);
     }
-    m * lp.opacity
+    m * opacity
 }
 
 /// One layer's contribution to a pixel: the colour adjustments, blended in by
@@ -1549,40 +2194,82 @@ fn apply_layers(
     let w = width as usize;
     let h = height as usize;
     let n = plan.layers.len();
-    // Per-pixel mask weights, one slot per layer, pixel-major. The spatial
-    // pass below only reads them for layers that actually run a filter.
-    let mut weights = vec![0f32; w * h * n];
     let xs: Vec<f32> =
         (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
+    let static_weights = cached_layer_weights(plan, map, region, w, h);
+    // Luma/colour windows depend on the stack at the moment this layer ran, so
+    // only those layers need a full-frame weight recording.
+    let record_dynamic = static_weights.is_none()
+        && plan
+            .layers
+            .iter()
+            .any(|layer| layer_has_spatial(&layer.layer.adjustments));
+    let mut recorded = record_dynamic.then(|| vec![0f32; w * h * n]);
     // Colour pass: the layers stack, so each one sees the previous result.
-    rgba.par_chunks_mut(w * 4).zip(weights.par_chunks_mut(w * n)).enumerate().for_each(|(y, (line, wline))| {
-        let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
-        for x in 0..w {
-            let px = x * 4;
-            let mut g = [line[px] as f32 / 255.0, line[px + 1] as f32 / 255.0, line[px + 2] as f32 / 255.0];
-            let f = [xs[x], fy];
-            let (p, _) = map.map(f);
-            for (li, lp) in plan.layers.iter().enumerate() {
-                let m = layer_weight(lp, p, g);
-                wline[x * n + li] = m;
-                if m <= 1e-4 {
-                    continue;
-                }
-                g = layer_pixel(lp, g, m);
-            }
-            for k in 0..3 {
-                line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            }
-        }
-    });
+    if let Some(weights) = static_weights.as_ref() {
+        rgba.par_chunks_mut(w * 4)
+            .zip(weights.par_chunks(w * n))
+            .enumerate()
+            .for_each(|(y, (line, weights))| {
+                apply_layer_color_row(
+                    line,
+                    Some(weights),
+                    None,
+                    n,
+                    plan,
+                    map,
+                    region,
+                    &xs,
+                    y,
+                    h,
+                );
+            });
+    } else if let Some(weights) = recorded.as_mut() {
+        rgba.par_chunks_mut(w * 4)
+            .zip(weights.par_chunks_mut(w * n))
+            .enumerate()
+            .for_each(|(y, (line, wline))| {
+                apply_layer_color_row(
+                    line,
+                    None,
+                    Some(wline),
+                    n,
+                    plan,
+                    map,
+                    region,
+                    &xs,
+                    y,
+                    h,
+                );
+            });
+    } else {
+        rgba.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| {
+            apply_layer_color_row(line, None, None, n, plan, map, region, &xs, y, h);
+        });
+    }
     // Spatial pass: the operators need neighbours, so they work on the frame.
     for (li, lp) in plan.layers.iter().enumerate() {
-        let spatial = lp.sharpening.is_some() || lp.noise_reduction.is_some() || lp.moire.amount > 0.0;
-        if !spatial {
+        if !layer_has_spatial(&lp.layer.adjustments) {
             continue;
         }
-        let wgt: Vec<f32> = (0..w * h).map(|i| weights[i * n + li]).collect();
-        if wgt.iter().all(|v| *v <= 1e-4) {
+        let wgt = static_weights.is_none().then(|| {
+            let weights = recorded.as_ref().expect("dynamic layer weights");
+            (0..w * h)
+                .into_par_iter()
+                .map(|i| weights[i * n + li])
+                .collect::<Vec<_>>()
+        });
+        let all_zero = wgt.as_ref().map_or_else(
+            || {
+                static_weights.as_ref().is_some_and(|weights| {
+                    (0..w * h)
+                        .into_par_iter()
+                        .all(|i| weights[i * n + li] <= 1e-4)
+                })
+            },
+            |weights| weights.iter().all(|value| *value <= 1e-4),
+        );
+        if all_zero || !static_mask_can_apply(lp) {
             continue;
         }
         let luma = luma_plane(rgba, w, h);
@@ -1591,9 +2278,13 @@ fn apply_layers(
             let strength = (nr.luminance / 100.0).clamp(0.0, 1.0);
             if strength > 0.0 {
                 let blur = mean3x3(&luma, w, h);
-                for i in 0..w * h {
-                    target[i] = luma[i] + (blur[i] - luma[i]) * strength;
-                }
+                target
+                    .par_iter_mut()
+                    .zip(&luma)
+                    .zip(&blur)
+                    .for_each(|((target, &luma), &blur)| {
+                        *target = luma + (blur - luma) * strength;
+                    });
             }
         }
         if lp.moire.amount > 0.0 {
@@ -1601,11 +2292,11 @@ fn apply_layers(
             let pattern = (lp.moire.pattern / 100.0).clamp(0.0, 1.0);
             let weight = amount * (0.25 + 0.75 * pattern);
             let blur = mean3x3(&target, w, h);
-            for i in 0..w * h {
-                let hf = (target[i] - blur[i]).abs();
+            target.par_iter_mut().zip(&blur).for_each(|(target, &blur)| {
+                let hf = (*target - blur).abs();
                 let blend = weight * (hf / 10.0).clamp(0.0, 1.0);
-                target[i] += (blur[i] - target[i]) * blend;
-            }
+                *target += (blur - *target) * blend;
+            });
         }
         if let Some(sh) = &lp.sharpening {
             let amount = sh.amount / 100.0;
@@ -1613,30 +2304,96 @@ fn apply_layers(
                 let radius = ((sh.radius.max(0.1)) * scale).round().max(1.0) as i32;
                 let blur = box_blur3(&target, w, h, radius);
                 let threshold = sh.threshold.max(0.0);
-                for i in 0..w * h {
-                    let mut detail = target[i] - blur[i];
+                target.par_iter_mut().zip(&blur).for_each(|(target, &blur)| {
+                    let mut detail = *target - blur;
                     if detail.abs() < threshold {
                         detail = 0.0;
                     }
-                    target[i] += detail * amount * 0.75;
-                }
+                    *target += detail * amount * 0.75;
+                });
             }
         }
         // Write the new luminance back, keeping the hue ratios, and blend it
         // in by the mask weight.
-        for i in 0..w * h {
-            let px = i * 4;
-            let old = luma[i];
-            let new = target[i];
-            let weight = wgt[i];
-            if weight <= 1e-4 {
+        rgba.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| {
+            let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
+            for x in 0..w {
+                let i = y * w + x;
+                let old = luma[i];
+                let new = target[i];
+                let weight = static_weights
+                    .as_ref()
+                    .map_or_else(|| wgt.as_ref().expect("spatial weights")[i], |weights| {
+                        weights[i * n + li]
+                    });
+                if weight <= 1e-4 {
+                    continue;
+                }
+                let mixed = old + (new - old) * weight;
+                let f = if old > 1.0 { mixed / old } else { 1.0 };
+                for k in 0..3 {
+                    line[x * 4 + k] =
+                        (line[x * 4 + k] as f32 * f).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+    }
+}
+
+fn static_mask_can_apply(lp: &LayerPlan<'_>) -> bool {
+    if lp.opacity <= 1e-4 {
+        return false;
+    }
+    let Some(grid) = &lp.grid else {
+        return true;
+    };
+    grid.data.iter().any(|value| {
+        let value = if lp.layer.mask.invert { 1.0 - *value } else { *value };
+        value * lp.opacity > 1e-4
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_layer_color_row(
+    line: &mut [u8],
+    static_weights: Option<&[f32]>,
+    recorded_weights: Option<&mut [f32]>,
+    n: usize,
+    plan: &Plan,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    xs: &[f32],
+    y: usize,
+    h: usize,
+) {
+    let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
+    let mut recorded_weights = recorded_weights;
+    for x in 0..xs.len() {
+        let px = x * 4;
+        let mut g = [
+            line[px] as f32 / 255.0,
+            line[px + 1] as f32 / 255.0,
+            line[px + 2] as f32 / 255.0,
+        ];
+        let p = static_weights
+            .is_none()
+            .then(|| map.map_clean([xs[x], fy]).0);
+        for (li, lp) in plan.layers.iter().enumerate() {
+            let m = if let Some(weights) = static_weights {
+                weights[x * n + li]
+            } else {
+                layer_weight(lp, p.expect("layer positions"), g)
+            };
+            if let Some(weights) = recorded_weights.as_deref_mut() {
+                weights[x * n + li] = m;
+            }
+            if m <= 1e-4 {
                 continue;
             }
-            let mixed = old + (new - old) * weight;
-            let f = if old > 1.0 { mixed / old } else { 1.0 };
-            for k in 0..3 {
-                rgba[px + k] = (rgba[px + k] as f32 * f).clamp(0.0, 255.0).round() as u8;
-            }
+            g = layer_pixel(lp, g, m);
+        }
+        for k in 0..3 {
+            line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
     }
 }
@@ -1644,17 +2401,20 @@ fn apply_layers(
 /// Luminance of the frame, 0..255.
 fn luma_plane(rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
     let mut plane = vec![0f32; w * h];
-    for (i, p) in plane.iter_mut().enumerate() {
+    plane.par_iter_mut().enumerate().for_each(|(i, p)| {
         let j = i * 4;
         *p = 0.2126 * rgba[j] as f32 + 0.7152 * rgba[j + 1] as f32 + 0.0722 * rgba[j + 2] as f32;
-    }
+    });
     plane
 }
 
 /// 3x3 mean of a plane.
 fn mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
     let mut out = vec![0f32; w * h];
-    for y in 0..h {
+    if w == 0 || h == 0 {
+        return out;
+    }
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let mut sum = 0.0f32;
             for dy in -1i32..=1 {
@@ -1664,9 +2424,9 @@ fn mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
                     sum += src[yy * w + xx];
                 }
             }
-            out[y * w + x] = sum / 9.0;
+            row[x] = sum / 9.0;
         }
-    }
+    });
     out
 }
 
@@ -1685,29 +2445,35 @@ fn box_blur3(src: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
 
 fn box_blur_h(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: i32) {
     let inv = 1.0 / (2 * r + 1) as f32;
-    for y in 0..h {
+    if w == 0 || h == 0 {
+        return;
+    }
+    dst.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let base = y * w;
         for x in 0..w {
             let mut sum = 0.0f32;
             for k in -r..=r {
                 sum += src[base + (x as i32 + k).clamp(0, w as i32 - 1) as usize];
             }
-            dst[base + x] = sum * inv;
+            row[x] = sum * inv;
         }
-    }
+    });
 }
 
 fn box_blur_v(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: i32) {
     let inv = 1.0 / (2 * r + 1) as f32;
-    for y in 0..h {
+    if w == 0 || h == 0 {
+        return;
+    }
+    dst.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let mut sum = 0.0f32;
             for k in -r..=r {
                 sum += src[(y as i32 + k).clamp(0, h as i32 - 1) as usize * w + x];
             }
-            dst[y * w + x] = sum * inv;
+            row[x] = sum * inv;
         }
-    }
+    });
 }
 
 pub(crate) fn histogram(rgba: &[u8]) -> Histogram {
@@ -1771,8 +2537,10 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
     let oriented = map.oriented();
     let aspect = oriented.0 / oriented.1;
     let cell_px = oriented.0 / 256.0;
+    let base_contrast = 0.12;
     let plan = Plan {
         adj,
+        source: src.snapshot_id(),
         input_profile: if src.camera_preview {
             None
         } else {
@@ -1785,9 +2553,9 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
         },
         gamma: GammaLut::new(),
         fine: false,
-        wb: white_balance_gains(&adj.white_balance),
+        wb: white_balance_gains(adj.white_balance.kelvin, adj.white_balance.tint),
         exposure: 2f32.powf(adj.exposure.exposure),
-        base_contrast: 0.12,
+        base_contrast,
         curve_rgb: lut_of(&adj.curves.rgb),
         curve_r: lut_of(&adj.curves.red),
         curve_g: lut_of(&adj.curves.green),
@@ -1796,7 +2564,23 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
         levels: adj.levels != Levels::default(),
         color_editor: adj.color_editor != ColorEditor::default(),
         color_balance: adj.color_balance != ColorBalance::default(),
-        layers: layer_plans(adj, aspect, cell_px, None, None),
+        color_balance_offsets: color_balance_offsets(&adj.color_balance),
+        color_balance_gains: adj
+            .color_balance_gains
+            .as_ref()
+            .is_some_and(|gains| !gains.is_neutral()),
+        black_white: adj.black_white.enabled.then(|| BlackWhitePlan::new(&adj.black_white)),
+        tone: ToneConstants::new(base_contrast, &adj.exposure, &adj.clarity, &adj.dehaze)
+            .with_hdr(&adj.hdr),
+        saturation: 1.0 + adj.exposure.saturation / 100.0,
+        vignette: (adj.vignetting.amount.abs() > 1e-3).then(|| {
+            let scale = match adj.vignetting.method {
+                VignetteMethod::EllipticOnCrop => std::f32::consts::SQRT_2,
+                VignetteMethod::Circular | VignetteMethod::CircularCrop => 1.6,
+            };
+            (adj.vignetting.amount, scale)
+        }),
+        layers: layer_plans(src, adj, aspect, cell_px, None, None),
     };
     let mut g = match src.sample(0, s[0], s[1]) {
         Some(lin) => develop(&plan, lin, f, false),
@@ -1857,6 +2641,249 @@ mod tests {
         println!("draft, detail off {:8.2} ms", t.elapsed().as_secs_f64() * 1000.0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs an NVIDIA CUDA device and profiles first-frame startup"]
+    fn bench_detail_prewarm_then_first_render() {
+        use std::time::Instant;
+
+        let started = Instant::now();
+        let ready = crate::mock::detail_gpu::prewarm();
+        let prewarm_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if !ready {
+            return;
+        }
+        let (w, h) = (2000u32, 1333u32);
+        let src = Source::from_rgba(w, h, &synthetic(w, h));
+        let adj = AdjustmentSet::default();
+        let started = Instant::now();
+        let out = render(&src, &adj, NormRect::FULL, 800, false, None);
+        let first_render_ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "DETAIL_PREWARM prewarm={prewarm_ms:.2} ms first_render={first_render_ms:.2} ms \
+             size={}x{}",
+            out.width, out.height
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles portrait adjustment fingerprints"]
+    fn bench_portrait_adjustment_fingerprint_10k() {
+        use std::hash::{Hash, Hasher};
+        use std::time::Instant;
+
+        let mut adj = AdjustmentSet::default();
+        adj.white_balance.kelvin += 420.0;
+        adj.exposure.exposure = 0.37;
+        adj.hdr.highlights = -25.0;
+        adj.color_balance.master.saturation = 0.25;
+        let measure = |debug_string: bool| {
+            let mut times = Vec::with_capacity(9);
+            for _ in 0..9 {
+                let started = Instant::now();
+                for _ in 0..10_000 {
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    if debug_string {
+                        format!("{adj:?}").hash(&mut hash);
+                    } else {
+                        crate::preview_cache::params_fingerprint(&adj).hash(&mut hash);
+                    }
+                    std::hint::black_box(hash.finish());
+                }
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            times[times.len() / 2]
+        };
+        let debug = measure(true);
+        let streaming = measure(false);
+        println!(
+            "PORTRAIT_ADJ_FINGERPRINT 10k debug={debug:.2} ms streaming={streaming:.2} ms speedup={:.2}x",
+            debug / streaming
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles 4K develop point-chain constant setup"]
+    fn bench_develop_constants() {
+        use std::time::Instant;
+
+        let (w, h) = (3840u32, 2160u32);
+        let src = Source::from_rgba(w, h, &synthetic(w, h));
+        let mut adj = AdjustmentSet::default();
+        adj.white_balance.kelvin += 420.0;
+        adj.exposure = Exposure {
+            exposure: 0.37,
+            brightness: 18.0,
+            contrast: 22.0,
+            saturation: 14.0,
+            ..adj.exposure
+        };
+        adj.hdr = HighDynamicRange {
+            highlights: -25.0,
+            shadows: 20.0,
+            whites: 12.0,
+            blacks: -8.0,
+        };
+        adj.color_balance.master = ColorWheel {
+            hue: 35.0,
+            saturation: 0.25,
+            lightness: 0.04,
+        };
+        adj.color_balance.shadow = ColorWheel {
+            hue: 210.0,
+            saturation: 0.18,
+            lightness: -0.03,
+        };
+        adj.color_balance.midtone = ColorWheel {
+            hue: 120.0,
+            saturation: 0.16,
+            lightness: 0.02,
+        };
+        adj.color_balance.highlight = ColorWheel {
+            hue: 48.0,
+            saturation: 0.12,
+            lightness: 0.03,
+        };
+        let red = HueSector::Red as usize;
+        adj.color_editor.bands[red] = ColorBand {
+            center_hue: HueSector::Red.hue(),
+            center_saturation: 0.75,
+            center_value: 0.8,
+            hue_low: -24.0,
+            hue_high: 24.0,
+            sat_low: -35.0,
+            sat_high: 25.0,
+            smoothness: 8.0,
+            homogeneity: [18.0, 10.0, 5.0],
+            ..adj.color_editor.bands[red]
+        };
+        adj.color_editor.basic[red] = HslShift {
+            hue: 7.0,
+            saturation: 12.0,
+            lightness: 4.0,
+        };
+        adj.color_editor.global = ColorBand {
+            center_hue: 30.0,
+            hue_low: -30.0,
+            hue_high: 30.0,
+            smoothness: 12.0,
+            homogeneity: [4.0, 3.0, 2.0],
+            enabled: true,
+            ..adj.color_editor.global
+        };
+        adj.color_editor.global_shift = HslShift {
+            hue: 2.0,
+            saturation: 3.0,
+            lightness: 1.0,
+        };
+        adj.color_editor.advanced_bands.push((
+            101,
+            ColorBand {
+                center_hue: 120.0,
+                center_saturation: 0.65,
+                center_value: 0.75,
+                hue_low: -22.0,
+                hue_high: 22.0,
+                smoothness: 9.0,
+                homogeneity: [15.0, 8.0, 4.0],
+                enabled: true,
+                ..ColorBand::default()
+            },
+        ));
+        adj.color_editor.advanced.push(ColorRange {
+            id: 101,
+            hue: 120.0,
+            width: 44.0,
+            shift: HslShift {
+                hue: 5.0,
+                saturation: 8.0,
+                lightness: 2.0,
+            },
+            ..ColorRange::default()
+        });
+        adj.color_editor.advanced_bands.push((
+            202,
+            ColorBand {
+                center_hue: 25.0,
+                center_saturation: 0.55,
+                center_value: 0.8,
+                hue_low: -18.0,
+                hue_high: 18.0,
+                smoothness: 7.0,
+                homogeneity: [20.0, 14.0, 6.0],
+                enabled: true,
+                ..ColorBand::default()
+            },
+        ));
+        adj.color_editor.skin.push(ColorRange {
+            id: 202,
+            hue: 25.0,
+            width: 36.0,
+            shift: HslShift {
+                hue: 3.0,
+                saturation: 6.0,
+                lightness: 3.0,
+            },
+            uniformity: Some(SkinUniformity {
+                hue: 20.0,
+                saturation: 18.0,
+                lightness: 12.0,
+            }),
+            ..ColorRange::default()
+        });
+        adj.black_white = BlackWhite {
+            enabled: true,
+            sensitivity: [22.0, -12.0, 18.0, 9.0, -16.0, 11.0],
+            highlight_tone: SplitTone {
+                hue: 48.0,
+                saturation: 24.0,
+            },
+            shadow_tone: SplitTone {
+                hue: 215.0,
+                saturation: 18.0,
+            },
+        };
+        adj.clarity.clarity = 24.0;
+        adj.clarity.structure = 12.0;
+        adj.dehaze.amount = 14.0;
+        adj.vignetting.amount = 18.0;
+        adj.noise_reduction = NoiseReduction {
+            luminance: 0.0,
+            details: 0.0,
+            color: 0.0,
+            single_pixel: 0.0,
+        };
+        adj.moire.amount = 0.0;
+        adj.sharpening.amount = 0.0;
+        adj.film_grain.impact = 0.0;
+        adj.lens.distortion = 0.0;
+        adj.lens.light_falloff = 0.0;
+        adj.lens.chromatic_aberration = false;
+        adj.lens.purple_fringing = 0.0;
+
+        let warm = render(&src, &adj, NormRect::FULL, w.max(h), false, None);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        warm.rgba.hash(&mut hash);
+        let hash = hash.finish();
+
+        let mut times = Vec::new();
+        for _ in 0..9 {
+            let start = Instant::now();
+            let out = render(&src, &adj, NormRect::FULL, w.max(h), false, None);
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            let mut again = std::collections::hash_map::DefaultHasher::new();
+            out.rgba.hash(&mut again);
+            assert_eq!(again.finish(), hash);
+        }
+        times.sort_by(f64::total_cmp);
+        println!(
+            "DEVELOP_CONSTANTS p50={:.3} ms p95={:.3} ms hash={hash:016x}",
+            times[times.len() / 2],
+            times[(times.len() - 1) * 95 / 100],
+        );
+    }
+
     /// A synthetic gradient with enough structure for the detail stages to act on.
     fn synthetic(w: u32, h: u32) -> Vec<u8> {
         let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -1874,20 +2901,74 @@ mod tests {
     }
 
     #[test]
-    fn wb_gains_ignore_the_kelvin_tint_display_pair() {
-        // Same stored gains, different display K/T: the render must not move.
-        let rgba = synthetic(8, 8);
-        let src = Source::from_rgba(8, 8, &rgba);
-        let mut a = AdjustmentSet::default();
-        a.white_balance.gains = Some([1.625, 1.0, 1.412]);
-        a.white_balance.kelvin = 4779.55;
-        a.white_balance.tint = -4.4875;
-        let mut b = a.clone();
-        b.white_balance.kelvin = 3000.0;
-        b.white_balance.tint = 20.0;
-        let ra = render(&src, &a, NormRect::FULL, 8, false, None);
-        let rb = render(&src, &b, NormRect::FULL, 8, false, None);
-        assert_eq!(ra.rgba, rb.rgba);
+    fn gamma_lut_is_shared_and_matches_the_formula_exactly() {
+        let first = GammaLut::new();
+        let second = GammaLut::new();
+        assert!(std::ptr::eq(first.0, second.0));
+        for i in [0usize, 1, 127, 4097, GAMMA_LUT_SIZE - 1] {
+            let expected = linear_to_srgb(i as f32 / (GAMMA_LUT_SIZE - 1) as f32 * GammaLut::RANGE);
+            assert_eq!(first.0[i].to_bits(), expected.to_bits(), "entry {i}");
+        }
+    }
+
+    /// The pre-r263 hue tent, kept only to show where the sector kernel departs.
+    fn tent_bw_y(g: [f32; 3], sensitivity: &[f32; 6]) -> f32 {
+        let (h, s, _) = rgb_to_hsv([g[0].max(0.0), g[1].max(0.0), g[2].max(0.0)]);
+        let centers = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
+        let mut boost = 0.0;
+        for (i, c) in centers.iter().enumerate() {
+            let w = (1.0 - hue_distance(h, *c) / 60.0).max(0.0);
+            boost += sensitivity[i] / 100.0 * w;
+        }
+        (luma(g) * (1.0 + boost * s * 0.8)).max(0.0)
+    }
+
+    /// Zero sliders must keep the exact luma the old path produced, so default
+    /// renders stay byte-identical; an equal-channel pixel is identical in the
+    /// sector kernel too.
+    #[test]
+    fn zero_bw_sliders_keep_the_exact_luma() {
+        let bw = BlackWhite { enabled: true, ..BlackWhite::default() };
+        for g in [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.5, 0.5, 0.5],
+            [0.2, 0.2, 0.2],
+            [0.9, 0.9, 0.9],
+            [0.37, 0.37, 0.37],
+        ] {
+            let y = bw_sector_y(g, &bw.sensitivity);
+            assert!((y - g[0]).abs() < 2e-3, "{g:?}: sector {y}");
+            assert_eq!(black_white(g, &bw), [luma(g); 3], "{g:?} default path changed");
+        }
+    }
+
+    /// Same six UI weights, old tent vs new sector: neutral keeps its luma,
+    /// saturated colours take different paths.
+    #[test]
+    fn bw_sector_and_tent_differ_on_colour_but_not_on_neutral() {
+        let sensitivity = [40.0, -20.0, 30.0, -10.0, 50.0, 20.0];
+        let cases = [
+            ("neutral", [0.5, 0.5, 0.5]),
+            ("red", [1.0, 0.0, 0.0]),
+            ("yellow", [1.0, 1.0, 0.0]),
+            ("green", [0.0, 1.0, 0.0]),
+            ("cyan", [0.0, 1.0, 1.0]),
+            ("blue", [0.0, 0.0, 1.0]),
+            ("magenta", [1.0, 0.0, 1.0]),
+            ("skin", [0.8, 0.6, 0.5]),
+        ];
+        let mut differing = 0;
+        for (name, g) in cases {
+            let old = tent_bw_y(g, &sensitivity);
+            let new = bw_sector_y(g, &sensitivity);
+            println!("{name:8} tent={old:.6} sector={new:.6} delta={:.6}", new - old);
+            if (new - old).abs() > 0.02 {
+                differing += 1;
+            }
+        }
+        assert!((tent_bw_y([0.5; 3], &sensitivity) - bw_sector_y([0.5; 3], &sensitivity)).abs() < 1e-4);
+        assert!(differing >= 5, "only {differing} colours changed");
     }
 
     /// Neutral `ColorBalance*` values (the `1;1;1` default) must not move a pixel.
@@ -1902,6 +2983,122 @@ mod tests {
         assert_eq!(plain.rgba, neutral.rgba);
     }
 
+    #[test]
+    fn source_sample_cache_is_exact_and_geometry_keyed() {
+        let (w, h) = (31u32, 23u32);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(w, h, &rgba);
+        let geometry = Geometry::default();
+        let region = NormRect { x: 0.13, y: 0.21, width: 0.67, height: 0.55 };
+        let (out_w, out_h) = (17, 13);
+        let map = super::super::geometry::FrameMap::new(src.size(), &geometry);
+        let xs: Vec<f32> =
+            (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
+        let first = source_samples(&src, &map, &geometry, region, out_w, out_h, 0, false, &xs);
+        let second = source_samples(&src, &map, &geometry, region, out_w, out_h, 0, false, &xs);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        for y in 0..out_h as usize {
+            let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
+            for (x, &fx) in xs.iter().enumerate() {
+                let (_, s) = map.map([fx, fy]);
+                let expected = src.sample(0, s[0], s[1]);
+                let actual = first[y * out_w as usize + x];
+                assert_eq!(actual.valid(), expected.is_some());
+                if let Some(rgb) = expected {
+                    assert_eq!(
+                        actual.rgb.map(f32::to_bits),
+                        rgb.map(f32::to_bits),
+                        "sample {x},{y}"
+                    );
+                }
+            }
+        }
+
+        let changed = Geometry { rotation: 3.0, ..geometry };
+        let changed_map = super::super::geometry::FrameMap::new(src.size(), &changed);
+        let third =
+            source_samples(&src, &changed_map, &changed, region, out_w, out_h, 0, false, &xs);
+        assert!(!Arc::ptr_eq(&first, &third));
+    }
+
+    #[test]
+    #[ignore = "profiles source sampling across a preview and thumbnail batch"]
+    fn bench_source_sample_cache_across_thumbnails() {
+        use std::time::Instant;
+
+        let big = Source::from_rgba(1600, 1000, &synthetic(1600, 1000));
+        let geometry = Geometry::default();
+        let map = super::super::geometry::FrameMap::new(big.size(), &geometry);
+        let region = NormRect::FULL;
+        let (out_w, out_h) = (1400, 875);
+        let xs: Vec<f32> =
+            (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
+
+        let start = Instant::now();
+        let first =
+            source_samples(&big, &map, &geometry, region, out_w, out_h, 0, false, &xs);
+        let build_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let small_geometry = Geometry::default();
+        let small_region = NormRect::FULL;
+        let (small_w, small_h) = (360, 225);
+        let small_xs: Vec<f32> = (0..small_w)
+            .map(|x| small_region.x + (x as f32 + 0.5) / small_w as f32 * small_region.width)
+            .collect();
+        let start = Instant::now();
+        for i in 0..6 {
+            let src = Source::from_rgba(400, 300, &synthetic(400 + i, 300 + i));
+            let map = super::super::geometry::FrameMap::new(src.size(), &small_geometry);
+            std::hint::black_box(source_samples(
+                &src,
+                &map,
+                &small_geometry,
+                small_region,
+                small_w,
+                small_h,
+                0,
+                false,
+                &small_xs,
+            ));
+        }
+        let thumb_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let start = Instant::now();
+        let again =
+            source_samples(&big, &map, &geometry, region, out_w, out_h, 0, false, &xs);
+        let second_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "SOURCE_SAMPLE_CACHE build={build_ms:.3} ms thumbs={thumb_ms:.3} ms second={second_ms:.3} ms reused={}",
+            Arc::ptr_eq(&first, &again)
+        );
+    }
+
+    #[test]
+    fn source_sample_cache_hit_matches_a_fresh_render_exactly() {
+        let (w, h) = (64u32, 48u32);
+        let rgba = synthetic(w, h);
+        let first = Source::from_rgba(w, h, &rgba);
+        let second = Source::from_rgba(w, h, &rgba);
+        let mut adj = AdjustmentSet::default();
+        let _ = render(&first, &adj, NormRect::FULL, 53, false, None);
+        adj.exposure.exposure = 0.37;
+        adj.white_balance.kelvin += 420.0;
+        let cached = render(&first, &adj, NormRect::FULL, 53, false, None);
+        let fresh = render(&second, &adj, NormRect::FULL, 53, false, None);
+        assert_eq!(cached.rgba, fresh.rgba);
+        assert_eq!(cached.histogram, fresh.histogram);
+    }
+
     /// A shadow-only gain hits darks harder than highlights.
     #[test]
     fn shadow_gain_dims_dark_pixels_more_than_bright_ones() {
@@ -1914,6 +3111,25 @@ mod tests {
         assert!(dark_drop > bright_drop, "{dark_drop} vs {bright_drop}");
         let extreme = color_balance_gains([1.5, -0.2, 0.5], &gains);
         assert!(extreme.iter().all(|v| v.is_finite()), "{extreme:?}");
+    }
+
+    #[test]
+    fn zero_hdr_does_not_change_the_tone_path() {
+        let exposure = Exposure::default();
+        let clarity = Clarity::default();
+        let dehaze = Dehaze::default();
+        let constants = ToneConstants::new(0.0, &exposure, &clarity, &dehaze);
+        for g in [[0.01, 0.2, 0.8], [0.18, 0.4, 0.65], [0.5, 0.55, 0.7]] {
+            assert_eq!(
+                tone(g, constants.with_hdr(&HighDynamicRange::default())),
+                g
+            );
+        }
+        let active = HighDynamicRange { highlights: -40.0, ..Default::default() };
+        assert_ne!(
+            tone([0.65, 0.65, 0.65], constants.with_hdr(&active)),
+            [0.65, 0.65, 0.65]
+        );
     }
 
     /// The master gains scale one channel and leave the others alone.
@@ -2107,6 +3323,8 @@ mod tests {
                 opacity: 100.0,
                 flow: 100.0,
                 auto_mask: false,
+                hair_brush: false,
+                use_pen_pressure: false,
             })],
             feather: 0.0,
             refine: 0.0,
@@ -2160,6 +3378,98 @@ mod tests {
         assert!(softened > 0, "the feather must leave intermediate values on the edge");
     }
 
+    // ──────────────────────────── C1 raster (`.comask`) masks ────────────────────────────
+
+    /// Left half of the frame, full coverage, optionally feathered.
+    fn left_half_raster(feather: f32) -> Mask {
+        let (w, h) = (64, 32);
+        Mask {
+            shapes: vec![MaskShape::Raster(RasterMask {
+                op: MaskOp::Add,
+                rect: [0.0, 0.0, 0.5, 1.0],
+                width: w,
+                height: h,
+                data: vec![255; w * h],
+            })],
+            feather,
+            ..Default::default()
+        }
+    }
+
+    fn wb_layer(mask: Mask) -> Layer {
+        Layer {
+            id: 1,
+            name: "local wb".into(),
+            kind: LayerKind::Adjustment,
+            enabled: true,
+            opacity: 100.0,
+            mask,
+            adjustments: LocalAdjustments {
+                white_balance: Some(WhiteBalance {
+                    kelvin: 7000.0,
+                    tint: 20.0,
+                    gains: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// One WB layer on a raster mask must move masked pixels and leave every
+    /// pixel outside the mask byte-identical to the layer-less render.
+    #[test]
+    fn raster_wb_changes_only_the_masked_pixels() {
+        let (w, h) = (64u32, 32u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let base = render(&src, &AdjustmentSet::default(), NormRect::FULL, w, false, None);
+        let mut adj = AdjustmentSet::default();
+        adj.layers.push(wb_layer(left_half_raster(0.0)));
+        let out = render(&src, &adj, NormRect::FULL, w, false, None);
+        let at = |frame: &Rendered, x: u32, y: u32| {
+            let i = ((y * frame.width + x) * 4) as usize;
+            [frame.rgba[i], frame.rgba[i + 1], frame.rgba[i + 2]]
+        };
+        assert_ne!(at(&out, 8, 16), at(&base, 8, 16), "inside the mask the WB must apply");
+        assert_eq!(at(&out, 56, 16), at(&base, 56, 16), "outside the mask nothing may change");
+    }
+
+    /// The mask edge gets a ramp instead of a step when `Mask::feather` is set.
+    #[test]
+    fn raster_feather_fades_across_the_mask_edge() {
+        let sharp = MaskGrid::build(&left_half_raster(0.0), 2.0, 1.0, None, &[]);
+        let soft = MaskGrid::build(&left_half_raster(16.0), 2.0, 1.0, None, &[]);
+        assert!((sharp.sample([0.25, 0.5]) - 1.0).abs() < 1e-6);
+        assert!((sharp.sample([0.75, 0.5])).abs() < 1e-6);
+        assert!(soft.sample([0.25, 0.5]) > 0.9, "well inside stays at full effect");
+        let edge = soft.sample([0.5, 0.5]);
+        assert!(edge > 0.05 && edge < 0.95, "the feathered edge must be partial, got {edge}");
+        assert!(soft.sample([0.75, 0.5]) < 0.1, "well outside stays at zero");
+    }
+
+    /// The layer-less pipeline must stay byte-identical: this hash comes from
+    /// the same render on the pre-patch build.
+    #[test]
+    fn default_render_bytes_are_the_pre_patch_bytes() {
+        let (w, h) = (257usize, 193usize);
+        let mut px = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x * 65535) / (w - 1)) as u16;
+                let g = ((y * 65535) / (h - 1)) as u16;
+                let b = (((x + y) * 32767) / (w + h - 2)) as u16;
+                px.extend_from_slice(&[r, g, b, 65535]);
+            }
+        }
+        let src = Source::from_rgba16(w as u32, h as u32, &px);
+        let frame = render(&src, &AdjustmentSet::default(), NormRect::FULL, 256, false, None);
+        let fnv = frame
+            .rgba
+            .iter()
+            .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+        assert_eq!(fnv, 0xd880b1433295a193);
+    }
+
     /// The refine edge follows the image's luminance, so the guide is the
     /// source's brightness at each cell.
     #[test]
@@ -2201,13 +3511,59 @@ mod tests {
     }
 
     #[test]
+    fn spatial_mask_samples_the_output_frame_not_the_mask_grid() {
+        let (w, h) = (640u32, 480u32);
+        let src = Source::from_rgba(w, h, &synthetic(w, h));
+        let mut layer = Layer {
+            id: 1,
+            opacity: 73.0,
+            mask: Mask { invert: true, density: 81.0, ..hard_disc(0.31) },
+            ..Default::default()
+        };
+        layer.adjustments.exposure.exposure = 0.4;
+        layer.adjustments.sharpening =
+            Some(Sharpening { amount: 120.0, ..Default::default() });
+        let mut static_adj = AdjustmentSet::default();
+        static_adj.layers.push(layer.clone());
+        let mut recorded_adj = static_adj.clone();
+        recorded_adj.layers[0].mask.luma_range = Some(LumaRange {
+            low_outer: 0.0,
+            low_inner: 0.0,
+            high_inner: 1.0,
+            high_outer: 1.0,
+            ..Default::default()
+        });
+        let static_out = render(&src, &static_adj, NormRect::FULL, 420, false, None);
+        let recorded_out = render(&src, &recorded_adj, NormRect::FULL, 420, false, None);
+        assert_eq!(static_out.rgba, recorded_out.rgba);
+        assert_eq!(static_out.histogram, recorded_out.histogram);
+    }
+
+    #[test]
+    fn simple_local_exposure_matches_the_general_tone_path_exactly() {
+        let (w, h) = (320u32, 240u32);
+        let src = Source::from_rgba(w, h, &synthetic(w, h));
+        let mut layer = Layer { id: 1, mask: hard_disc(0.35), ..Default::default() };
+        layer.adjustments.exposure.exposure = 0.6;
+        let mut simple = AdjustmentSet::default();
+        simple.layers.push(layer.clone());
+        let mut general = simple.clone();
+        general.layers[0].adjustments.exposure.contrast = 0.001;
+        let simple_out = render(&src, &simple, NormRect::FULL, 280, false, None);
+        let general_out = render(&src, &general, NormRect::FULL, 280, false, None);
+        assert_eq!(simple_out.rgba, general_out.rgba);
+        assert_eq!(simple_out.histogram, general_out.histogram);
+    }
+
+    #[test]
     fn zero_opacity_or_disabled_layer_is_skipped() {
         let mut adj = AdjustmentSet::default();
+        let src = Source::from_rgba(8, 6, &flat(8, 6, 128));
         adj.layers.push(Layer { id: 1, opacity: 0.0, mask: hard_disc(0.3), ..Default::default() });
-        assert!(layer_plans(&adj, 4.0 / 3.0, 4.0, None, None).is_empty());
+        assert!(layer_plans(&src, &adj, 4.0 / 3.0, 4.0, None, None).is_empty());
         adj.layers[0].opacity = 100.0;
         adj.layers[0].enabled = false;
-        assert!(layer_plans(&adj, 4.0 / 3.0, 4.0, None, None).is_empty());
+        assert!(layer_plans(&src, &adj, 4.0 / 3.0, 4.0, None, None).is_empty());
     }
 
     #[test]
@@ -2348,6 +3704,8 @@ mod tests {
             opacity: 100.0,
             flow: 100.0,
             auto_mask: false,
+            hair_brush: false,
+            use_pen_pressure: false,
         };
         let shape = MaskShape::Brush(brush.clone());
         let x = shape_value(&shape, [0.55, 0.5], aspect, None).1;
@@ -2369,6 +3727,8 @@ mod tests {
             opacity: 100.0,
             flow: 100.0,
             auto_mask: false,
+            hair_brush: false,
+            use_pen_pressure: false,
         })
     }
 
@@ -2494,6 +3854,8 @@ mod tests {
                 opacity: 100.0,
                 flow: 100.0,
                 auto_mask: false,
+                hair_brush: false,
+                use_pen_pressure: false,
             })],
             ..Default::default()
         };
@@ -2983,6 +4345,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn source_sample_uses_a_compact_non_finite_sentinel() {
+        assert_eq!(std::mem::size_of::<SourceSample>(), 12);
+        let invalid = SourceSample::invalid();
+        assert!(!invalid.valid());
+        let valid = SourceSample { rgb: [0.1, 0.2, 0.3] };
+        assert!(valid.valid());
+        assert_eq!(valid.rgb, [0.1, 0.2, 0.3]);
+    }
+
     /// Shadow-level and render-cost numbers for the report.
     /// `cargo test -p aurora-engine --offline shadow_levels_16_vs_8 -- --ignored --nocapture`
     #[test]
@@ -3181,27 +4553,572 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
-    fn default_white_balance_gains_are_identity() {
-        // The WB stage is a per-channel multiply; [1,1,1] makes it a no-op, so
-        // default renders stay byte-identical to the pre-fix pipeline.
-        assert_eq!(white_balance_gains(&crate::WhiteBalance::default()), [1.0, 1.0, 1.0]);
+    #[ignore = "needs a real NEF, portrait model, and NVIDIA CUDA device"]
+    fn portrait_mask_route_runs_through_preview_and_export_entries() {
+        use std::path::Path;
+
+        let path = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
+            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+        let (w, h, rgba16) = crate::raw::decode16(Path::new(&path)).expect("decode NEF");
+        assert_eq!(crate::raw::from_sensor(Path::new(&path)), Some(true));
+        let src = Source::from_rgba16(w, h, &rgba16);
+        let mut adj = AdjustmentSet::default();
+        adj.extra.insert("pc:21015".into(), 0.9);
+
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 512, false, None);
+        assert!(plain.portrait_report.is_none());
+        let preview = render(&src, &adj, NormRect::FULL, 512, false, None);
+        let export = render16(&src, &adj, NormRect::FULL, 512, false);
+
+        for (entry, report) in [
+            ("preview", preview.portrait_report.as_ref()),
+            ("export16", export.portrait_report.as_ref()),
+        ] {
+            let report = report.unwrap_or_else(|| panic!("{entry} report missing"));
+            assert!(report.job_id.is_some(), "{entry} job id missing");
+            assert_eq!(report.effects.len(), 1, "{entry} report");
+            let effect = &report.effects[0];
+            assert_eq!(effect.pf, 21015);
+            assert!(effect.executed, "{entry} did not execute: {effect:?}");
+            assert_eq!(
+                effect.backend,
+                crate::portrait_stage::PortraitBackend::Cuda,
+                "{entry} must execute CUDA on this acceptance machine: {effect:?}"
+            );
+            assert!(!effect.dispatches.is_empty(), "{entry} has no dispatch");
+            println!(
+                "{entry} job={:?} backend={:?} dispatch={:?}",
+                report.job_id, effect.backend, effect.dispatches
+            );
+        }
+        assert_ne!(preview.rgba, plain.rgba, "PF21015 must change preview pixels");
+        assert!(export.rgba.chunks_exact(4).all(|pixel| pixel[3] == 65535));
+    }
+
+    fn serial_mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0.0f32;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                        let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                        sum += src[yy * w + xx];
+                    }
+                }
+                out[y * w + x] = sum / 9.0;
+            }
+        }
+        out
+    }
+
+    fn serial_luma_guide(src: &Source, g: &Geometry, w: usize, h: usize) -> Vec<f32> {
+        let level = src
+            .levels
+            .iter()
+            .position(|p| p.width.max(p.height) <= 256)
+            .unwrap_or(src.levels.len() - 1);
+        (0..w * h)
+            .map(|i| {
+                let o = [
+                    (i % w) as f32 / w as f32 + 0.5 / w as f32,
+                    (i / w) as f32 / h as f32 + 0.5 / h as f32,
+                ];
+                let s = oriented_to_source(o, g);
+                match src.sample(level, s[0], s[1]) {
+                    Some(c) => {
+                        (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).clamp(0.0, 1.0)
+                    }
+                    None => 0.0,
+                }
+            })
+            .collect()
+    }
+
+    fn serial_ai_input(src: &Source, g: &Geometry, long: u32) -> (Vec<u8>, u32, u32) {
+        let (ow, oh) = crate::mock::geometry::FrameMap::new(src.size(), g).oriented();
+        let scale = long as f32 / ow.max(oh).max(1.0);
+        let w = ((ow * scale).round() as u32).max(1);
+        let h = ((oh * scale).round() as u32).max(1);
+        let level = src
+            .levels
+            .iter()
+            .rposition(|p| p.width >= w && p.height >= h)
+            .unwrap_or(0);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let o = [(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32];
+                let s = oriented_to_source(o, g);
+                let c = src.sample(level, s[0], s[1]).unwrap_or([0.0; 3]);
+                for value in c {
+                    rgba.push(
+                        (linear_to_srgb(value.max(0.0)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    );
+                }
+                rgba.push(255);
+            }
+        }
+        (rgba, w, h)
+    }
+
+    fn serial_portrait_mask_rgba(src: &Source, edge: usize) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(edge * edge * 4);
+        for y in 0..edge {
+            for x in 0..edge {
+                let px = src
+                    .sample(
+                        0,
+                        (x as f32 + 0.5) / edge as f32,
+                        (y as f32 + 0.5) / edge as f32,
+                    )
+                    .unwrap_or([0.0; 3]);
+                for value in px {
+                    rgba.push(
+                        (linear_to_srgb(value).clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    );
+                }
+                rgba.push(255);
+            }
+        }
+        rgba
+    }
+
+    fn serial_box_blur_h(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: i32) {
+        let inv = 1.0 / (2 * r + 1) as f32;
+        for y in 0..h {
+            let base = y * w;
+            for x in 0..w {
+                let mut sum = 0.0f32;
+                for k in -r..=r {
+                    sum += src[base + (x as i32 + k).clamp(0, w as i32 - 1) as usize];
+                }
+                dst[base + x] = sum * inv;
+            }
+        }
+    }
+
+    fn serial_box_blur_v(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: i32) {
+        let inv = 1.0 / (2 * r + 1) as f32;
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0.0f32;
+                for k in -r..=r {
+                    sum += src[(y as i32 + k).clamp(0, h as i32 - 1) as usize * w + x];
+                }
+                dst[y * w + x] = sum * inv;
+            }
+        }
+    }
+
+    fn serial_box_blur3(src: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
+        let mut a = src.to_vec();
+        let mut b = vec![0.0f32; w * h];
+        for _ in 0..3 {
+            serial_box_blur_h(&a, &mut b, w, h, r);
+            std::mem::swap(&mut a, &mut b);
+            serial_box_blur_v(&a, &mut b, w, h, r);
+            std::mem::swap(&mut a, &mut b);
+        }
+        a
     }
 
     #[test]
-    fn c1_gains_bypass_the_kelvin_conversion() {
-        let wb = crate::WhiteBalance {
-            gains: Some([1.625, 1.0, 1.412]),
-            kelvin: 4779.55,
-            tint: -4.4875,
-            ..Default::default()
-        };
-        let gains = white_balance_gains(&wb);
-        assert_eq!(gains, [1.625, 1.0, 1.412]);
-        assert!((gains[0] / gains[2] - 1.625 / 1.412).abs() < 1e-6);
+    fn parallel_spatial_filters_match_serial_exactly() {
+        let (w, h) = (37usize, 23usize);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let plane: Vec<f32> = (0..w * h)
+            .map(|i| ((i * 29 % 997) as f32) / 17.0 - 13.0)
+            .collect();
 
-        // A K/T edit clears `gains`, so the oracle inverse takes over again.
-        let edited = crate::WhiteBalance { gains: None, kelvin: 5000.0, tint: 0.0, ..Default::default() };
-        assert_ne!(white_balance_gains(&edited), [1.0, 1.0, 1.0]);
+        let luma = luma_plane(&rgba, w, h);
+        let serial_luma: Vec<f32> = rgba
+            .chunks_exact(4)
+            .map(|p| {
+                0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+            })
+            .collect();
+        assert_eq!(luma, serial_luma);
+        assert_eq!(mean3x3(&plane, w, h), serial_mean3x3(&plane, w, h));
+
+        let mut horizontal = vec![0.0f32; w * h];
+        let mut serial_horizontal = vec![0.0f32; w * h];
+        box_blur_h(&plane, &mut horizontal, w, h, 3);
+        serial_box_blur_h(&plane, &mut serial_horizontal, w, h, 3);
+        assert_eq!(horizontal, serial_horizontal);
+
+        let mut vertical = vec![0.0f32; w * h];
+        let mut serial_vertical = vec![0.0f32; w * h];
+        box_blur_v(&plane, &mut vertical, w, h, 3);
+        serial_box_blur_v(&plane, &mut serial_vertical, w, h, 3);
+        assert_eq!(vertical, serial_vertical);
+        assert_eq!(box_blur3(&plane, w, h, 3), serial_box_blur3(&plane, w, h, 3));
+    }
+
+    #[test]
+    fn parallel_luma_guide_matches_serial_exactly() {
+        let (sw, sh) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(sw, sh, &rgba);
+        let g = Geometry::default();
+        assert_eq!(
+            luma_guide(&src, &g, 256, 192),
+            serial_luma_guide(&src, &g, 256, 192)
+        );
+    }
+
+    #[test]
+    fn parallel_ai_input_matches_serial_exactly() {
+        let (sw, sh) = (1024u32, 768u32);
+        let rgba: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(sw, sh, &rgba);
+        let g = Geometry::default();
+        assert_eq!(ai_input_rgba(&src, &g, 1024), serial_ai_input(&src, &g, 1024));
+    }
+
+    #[test]
+    fn parallel_portrait_mask_input_matches_serial_exactly() {
+        let (sw, sh) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(sw, sh, &rgba);
+        assert_eq!(
+            src.portrait_mask_rgba(128),
+            serial_portrait_mask_rgba(&src, 128)
+        );
+    }
+
+    #[test]
+    fn parallel_wide_delta_matches_serial_exactly() {
+        let (w, h) = (37usize, 23usize);
+        let mut wide: Vec<u16> = (0..w * h * 4)
+            .map(|i| ((i * 4051) % 65536) as u16)
+            .collect();
+        let before: Vec<u8> =
+            (0..w * h * 4).map(|i| ((i * 37 + i / 5) % 256) as u8).collect();
+        let mut after = before.clone();
+        for (i, value) in after.iter_mut().enumerate() {
+            *value = value.wrapping_add(((i * 29) % 19) as u8);
+        }
+        for pixel in after.chunks_exact_mut(4).take(w) {
+            pixel[3] = 127;
+        }
+        let mut expected = wide.clone();
+        for ((px, base), result) in expected
+            .chunks_exact_mut(4)
+            .zip(before.chunks_exact(4))
+            .zip(after.chunks_exact(4))
+        {
+            for k in 0..3 {
+                px[k] = (px[k] as i32 + (result[k] as i32 - base[k] as i32) * 257)
+                    .clamp(0, 65535) as u16;
+            }
+            px[3] = if result[3] == base[3] { px[3] } else { result[3] as u16 * 257 };
+        }
+        merge_wide_delta(&mut wide, &before, &after, w);
+        assert_eq!(wide, expected);
+    }
+
+    #[test]
+    #[ignore = "profiles 4K local spatial filters"]
+    fn bench_parallel_spatial_filters() {
+        let (w, h) = (3840usize, 2160usize);
+        let plane: Vec<f32> = (0..w * h)
+            .map(|i| ((i * 37 % 4093) as f32) / 91.0 - 17.0)
+            .collect();
+        let run = |serial: bool| {
+            let start = std::time::Instant::now();
+            if serial {
+                std::hint::black_box(serial_mean3x3(&plane, w, h));
+            } else {
+                std::hint::black_box(mean3x3(&plane, w, h));
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let mut serial_mean = Vec::new();
+        let mut parallel_mean = Vec::new();
+        for _ in 0..3 {
+            serial_mean.push(run(true));
+            parallel_mean.push(run(false));
+        }
+        serial_mean.sort_by(f64::total_cmp);
+        parallel_mean.sort_by(f64::total_cmp);
+
+        let run_blur = |serial: bool| {
+            let start = std::time::Instant::now();
+            if serial {
+                std::hint::black_box(serial_box_blur3(&plane, w, h, 4));
+            } else {
+                std::hint::black_box(box_blur3(&plane, w, h, 4));
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let mut serial_blur = Vec::new();
+        let mut parallel_blur = Vec::new();
+        for _ in 0..3 {
+            serial_blur.push(run_blur(true));
+            parallel_blur.push(run_blur(false));
+        }
+        serial_blur.sort_by(f64::total_cmp);
+        parallel_blur.sort_by(f64::total_cmp);
+
+        println!(
+            "4K local spatial filters: mean3x3 {:.2}x ({:.3}->{:.3} ms), box3 {:.2}x ({:.3}->{:.3} ms)",
+            serial_mean[1] / parallel_mean[1].max(f64::EPSILON),
+            serial_mean[1],
+            parallel_mean[1],
+            serial_blur[1] / parallel_blur[1].max(f64::EPSILON),
+            serial_blur[1],
+            parallel_blur[1]
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles the 256-cell refine guide"]
+    fn bench_luma_guide() {
+        let (sw, sh) = (2400u32, 1600u32);
+        let rgba: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(sw, sh, &rgba);
+        let g = Geometry::default();
+        let mut serial = Vec::new();
+        let mut parallel = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(serial_luma_guide(&src, &g, 256, 171));
+            serial.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            std::hint::black_box(luma_guide(&src, &g, 256, 171));
+            parallel.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        serial.sort_by(f64::total_cmp);
+        parallel.sort_by(f64::total_cmp);
+        println!(
+            "256-cell luma guide: serial={:.3} ms parallel={:.3} ms ({:.2}x)",
+            serial[2],
+            parallel[2],
+            serial[2] / parallel[2].max(f64::EPSILON)
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles 1024 px AI input preparation"]
+    fn bench_ai_input() {
+        let (sw, sh) = (2400u32, 1600u32);
+        let rgba: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(sw, sh, &rgba);
+        let g = Geometry::default();
+        let mut serial = Vec::new();
+        let mut parallel = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(serial_ai_input(&src, &g, 1024));
+            serial.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            std::hint::black_box(ai_input_rgba(&src, &g, 1024));
+            parallel.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        serial.sort_by(f64::total_cmp);
+        parallel.sort_by(f64::total_cmp);
+        println!(
+            "1024 px AI input: serial={:.3} ms parallel={:.3} ms ({:.2}x)",
+            serial[2],
+            parallel[2],
+            serial[2] / parallel[2].max(f64::EPSILON),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles 512 px portrait mask input"]
+    fn bench_portrait_mask_input() {
+        let (sw, sh) = (2400u32, 1600u32);
+        let rgba: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let src = Source::from_rgba(sw, sh, &rgba);
+        let mut serial = Vec::new();
+        let mut parallel = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(serial_portrait_mask_rgba(&src, 512));
+            serial.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            std::hint::black_box(src.portrait_mask_rgba(512));
+            parallel.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        serial.sort_by(f64::total_cmp);
+        parallel.sort_by(f64::total_cmp);
+        println!(
+            "512 px portrait mask input: serial={:.3} ms parallel={:.3} ms ({:.2}x)",
+            serial[2],
+            parallel[2],
+            serial[2] / parallel[2].max(f64::EPSILON),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real portrait NEF and an NVIDIA CUDA device"]
+    fn portrait_lut_route_runs_through_preview_and_export_entries() {
+        use std::path::Path;
+
+        let path = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
+            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+        let (w, h, rgba16) = crate::raw::decode16(Path::new(&path)).expect("decode NEF");
+        assert_eq!(crate::raw::from_sensor(Path::new(&path)), Some(true));
+        let src = Source::from_rgba16(w, h, &rgba16);
+        let mut adj = AdjustmentSet::default();
+        adj.extra.insert("pc:90007".into(), 0.9);
+
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 512, false, None);
+        let plain16 = render16(&src, &AdjustmentSet::default(), NormRect::FULL, 512, false);
+        let preview = render(&src, &adj, NormRect::FULL, 512, false, None);
+        let export = render16(&src, &adj, NormRect::FULL, 512, false);
+
+        let skin = src
+            .portrait_masks()
+            .mask_u8(
+                crate::portrait_stage::MaskKind::Skin,
+                preview.width,
+                preview.height,
+                NormRect::FULL,
+            )
+            .expect("real skin mask");
+        let skin_pixels = skin.iter().filter(|&&value| value > 0).count();
+        assert!(skin_pixels > 0, "the real portrait job produced an empty skin mask");
+
+        for (entry, report) in [
+            ("preview", preview.portrait_report.as_ref()),
+            ("export16", export.portrait_report.as_ref()),
+        ] {
+            let report = report.unwrap_or_else(|| panic!("{entry} report missing"));
+            assert!(report.job_id.is_some(), "{entry} job id missing");
+            assert_eq!(report.effects.len(), 1, "{entry} report");
+            let effect = &report.effects[0];
+            assert_eq!(effect.pf, 90007);
+            assert!(effect.executed, "{entry} did not execute: {effect:?}");
+            assert_eq!(
+                effect.backend,
+                crate::portrait_stage::PortraitBackend::Cuda,
+                "{entry} must execute CUDA on this acceptance machine: {effect:?}"
+            );
+            assert!(
+                effect
+                    .dispatches
+                    .iter()
+                    .any(|dispatch| dispatch.kernel == "skin_adjust_lut_kernel"),
+                "{entry} did not dispatch the ruddy LUT kernel: {effect:?}"
+            );
+            println!(
+                "{entry} job={:?} backend={:?} dispatch={:?}",
+                report.job_id, effect.backend, effect.dispatches
+            );
+        }
+
+        let preview_diff: Vec<u8> = preview
+            .rgba
+            .iter()
+            .zip(&plain.rgba)
+            .map(|(&after, &before)| after.abs_diff(before))
+            .collect();
+        let preview_channels = preview_diff
+            .chunks_exact(4)
+            .flat_map(|pixel| &pixel[..3])
+            .filter(|&&difference| difference != 0)
+            .count();
+        let preview_pixels = preview_diff
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3].iter().any(|&difference| difference != 0))
+            .count();
+        let preview_max = preview_diff.iter().copied().max().unwrap_or_default();
+        let preview_sum: u64 = preview_diff.chunks_exact(4).flat_map(|pixel| &pixel[..3])
+            .map(|&difference| u64::from(difference))
+            .sum();
+
+        let export_diff: Vec<u16> = export
+            .rgba
+            .iter()
+            .zip(&plain16.rgba)
+            .map(|(&after, &before)| after.abs_diff(before))
+            .collect();
+        let export_pixels = export_diff
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3].iter().any(|&difference| difference != 0))
+            .count();
+        let export_max = export_diff.iter().copied().max().unwrap_or_default();
+        let export_sum: u64 = export_diff.chunks_exact(4).flat_map(|pixel| &pixel[..3])
+            .map(|&difference| u64::from(difference))
+            .sum();
+
+        println!(
+            "source={path} decoded={w}x{h} skin_pixels={skin_pixels} preview_changed_pixels={preview_pixels} preview_changed_channels={preview_channels} preview_max={preview_max} preview_mean_rgb={:.6} export_changed_pixels={export_pixels} export_max={export_max} export_mean_rgb={:.6}",
+            preview_sum as f64 / (preview.width * preview.height * 3) as f64,
+            export_sum as f64 / (export.width * export.height * 3) as f64,
+        );
+        assert_ne!(preview.rgba, plain.rgba, "PF90007 must change preview pixels");
+        assert_ne!(export.rgba, plain16.rgba, "PF90007 must change exported pixels");
+        assert!(export.rgba.chunks_exact(4).all(|pixel| pixel[3] == 65535));
     }
 }

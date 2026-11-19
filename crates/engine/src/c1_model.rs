@@ -10,8 +10,9 @@ use crate::adjust::{
     AspectRatio, BlackWhite, Clarity, ClarityMethod, ColorBalance, ColorBalanceGains, ColorBand, ColorEditor,
     ColorRange, ColorWheel, Curve, CurvePoint, Curves, Dehaze, Exposure, FilmGrain, Geometry,
     GrainKind, HighDynamicRange, HslShift, HueSector, Keystone, Levels, LevelsChannel,
-    LensCorrection, Moire, NoiseReduction, NormRect, Sharpening, SkinUniformity, SplitTone,
-    ToneCurvePreset, VignetteMethod, Vignetting, WhiteBalance, WhiteBalanceMode,
+    LensCorrection, ManufacturerCurves, Moire, NoiseReduction, NormRect, Sharpening,
+    SkinUniformity, SplitTone, ToneCurvePreset, VignetteMethod, Vignetting, WhiteBalance,
+    WhiteBalanceMode,
     gamma_from_c1_midtone,
 };
 
@@ -137,6 +138,10 @@ pub static C1_COLUMNS: &[C1Column] = &[
     C1Column { name: "ZLENSDISTORTION", encoding: C1Encoding::Pipe, components: 5 },
     C1Column { name: "ZLENSLIGHTFALLOFF", encoding: C1Encoding::Pipe, components: 3 },
     C1Column { name: "ZLENSDEFAULTCHROMABR", encoding: C1Encoding::Pipe, components: 2 },
+    C1Column { name: "ZLENSCUSTOMCHROMABR", encoding: C1Encoding::Pipe, components: 2 },
+    C1Column { name: "ZLENSCUSTOMCHROMABRNAME", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSCHROMABRORIGIN", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSCHROMAFRINGING", encoding: C1Encoding::Pipe, components: 6 },
     C1Column { name: "ZLENSOPTICCENTER", encoding: C1Encoding::Pipe, components: 2 },
     C1Column { name: "ZCOLORCORRECTIONS", encoding: C1Encoding::SemicolonComma, components: 18 },
     C1Column { name: "ZROTATION", encoding: C1Encoding::Scalar, components: 1 },
@@ -231,10 +236,17 @@ pub fn parse_vec(raw: &str) -> Vec<f32> {
     clean(raw).split(';').filter_map(parse_scalar).collect()
 }
 
-/// Parses `in,out;in,out` control points. Pairs that are not two numbers are skipped.
+/// Capture One's `IC_GradationCurve` holds 16 interior points plus a start and
+/// an end point; `P1.C1.ViewModels` refuses arrays of 18 or more. A stored value
+/// can therefore never exceed this, so extra pairs are a corrupt file.
+pub const MAX_CURVE_POINTS: usize = 18;
+
+/// Parses `in,out;in,out` control points. Pairs that are not two numbers are
+/// skipped, and at most [`MAX_CURVE_POINTS`] pairs are kept. C1 sorts the points
+/// on load but stores them in editor order, which is not always ascending.
 pub fn parse_curve(raw: &str) -> Vec<(f32, f32)> {
     let mut out = Vec::new();
-    for pair in clean(raw).split(';') {
+    for pair in clean(raw).split(';').take(MAX_CURVE_POINTS) {
         let mut it = pair.split(',');
         let (Some(x), Some(y)) = (it.next().and_then(parse_scalar), it.next().and_then(parse_scalar))
         else {
@@ -260,6 +272,24 @@ pub fn parse_spline(raw: &str) -> SplineProfile {
         }
     }
     profile
+}
+
+/// Parses `ZLENSCHROMAFRINGING`: six `x,y;…` curves ordered red shift, red
+/// radius, red strength, blue shift, blue radius, blue strength. Any other
+/// field count reads as empty, matching C1's own parser.
+pub fn parse_chroma_fringing(raw: &str) -> ChromaFringing {
+    let fields: Vec<&str> = clean(raw).split('|').collect();
+    if fields.len() != 6 {
+        return ChromaFringing::default();
+    }
+    ChromaFringing {
+        red_shift: parse_curve(fields[0]),
+        red_ra: parse_curve(fields[1]),
+        red_strength: parse_curve(fields[2]),
+        blue_shift: parse_curve(fields[3]),
+        blue_ra: parse_curve(fields[4]),
+        blue_strength: parse_curve(fields[5]),
+    }
 }
 
 /// Parses `ZCOLORCORRECTIONS`: 9 groups of 18 comma-separated numbers.
@@ -575,6 +605,56 @@ impl Default for C1BlackWhite {
     }
 }
 
+/// `ZLENSCHROMABRORIGIN`, C1's `ChromaticAberrationOrigin`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChromaAberOrigin {
+    /// 0: no active source; the stored curves are not applied.
+    #[default]
+    None,
+    /// 1: the lens database supplied the curves in `ZLENSDEFAULTCHROMABR`.
+    LensDb,
+    /// 2: `ZLENSCUSTOMCHROMABR` is the active curve.
+    Custom,
+}
+
+impl ChromaAberOrigin {
+    fn from_stored(raw: Option<&str>) -> Self {
+        match raw.and_then(parse_scalar) {
+            Some(v) if v == 1.0 => Self::LensDb,
+            Some(v) if v == 2.0 => Self::Custom,
+            _ => Self::None,
+        }
+    }
+}
+
+/// `ZLENSCHROMAFRINGING`: the lens profile's six lateral-fringing curves as
+/// `x,y;x,y` control points, one `|`-separated field each.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChromaFringing {
+    pub red_shift: Vec<(f32, f32)>,
+    pub red_ra: Vec<(f32, f32)>,
+    pub red_strength: Vec<(f32, f32)>,
+    pub blue_shift: Vec<(f32, f32)>,
+    pub blue_ra: Vec<(f32, f32)>,
+    pub blue_strength: Vec<(f32, f32)>,
+}
+
+impl ChromaFringing {
+    /// Whether none of the six curves carries a point.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.red_shift,
+            &self.red_ra,
+            &self.red_strength,
+            &self.blue_shift,
+            &self.blue_ra,
+            &self.blue_strength,
+        ]
+        .iter()
+        .all(|curve| curve.is_empty())
+    }
+}
+
 /// C1's lens calibration block.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct C1Lens {
@@ -585,6 +665,14 @@ pub struct C1Lens {
     /// `ZLENSDEFAULTCHROMABR`: two radial splines (red and blue).
     pub chromatic_aberration: SplineProfile,
     pub chromatic_aberration_enabled: bool,
+    /// `ZLENSCHROMABRORIGIN`: which of the two curves above is active.
+    pub chromatic_aberration_origin: ChromaAberOrigin,
+    /// `ZLENSCUSTOMCHROMABR`: user-drawn red | blue curves.
+    pub chromatic_aberration_custom: SplineProfile,
+    /// `ZLENSCUSTOMCHROMABRNAME`: label of the custom curve.
+    pub chromatic_aberration_custom_name: Option<String>,
+    /// `ZLENSCHROMAFRINGING`: lateral-fringing model from the lens profile.
+    pub chroma_fringing: ChromaFringing,
     pub profile: Option<String>,
     pub revision_profile: Option<String>,
     pub aperture: f32,
@@ -592,6 +680,9 @@ pub struct C1Lens {
     /// Manual optical centre shift, `x;y` in percent.
     pub shift_xy: [f32; 2],
     pub purple_fringing: f32,
+    /// Set only when `profile` names Capture One's built-in Manufacturer
+    /// Profile; the curves above are then the profile's real calibration.
+    pub manufacturer: Option<ManufacturerCurves>,
 }
 
 /// C1's brush tool settings (local mask layers).
@@ -707,12 +798,17 @@ impl C1VariantSettings {
                 light_falloff: SplineProfile::default(),
                 chromatic_aberration: SplineProfile::default(),
                 chromatic_aberration_enabled: false,
+                chromatic_aberration_origin: ChromaAberOrigin::None,
+                chromatic_aberration_custom: SplineProfile::default(),
+                chromatic_aberration_custom_name: None,
+                chroma_fringing: ChromaFringing::default(),
                 profile: None,
                 revision_profile: None,
                 aperture: 4.0,
                 focal_length: 120.0,
                 shift_xy: [0.0, 0.0],
                 purple_fringing: 0.0,
+                manufacturer: None,
             },
             vignetting: [0.0, 1.0, 0.0, 1.0],
             icc_profile: None,
@@ -863,6 +959,14 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.lens.chromatic_aberration = get("ZLENSDEFAULTCHROMABR").map(parse_spline).unwrap_or_default();
     s.lens.chromatic_aberration_enabled =
         flag(get("ZLENSCHROMABRENABLED"), s.lens.chromatic_aberration_enabled);
+    s.lens.chromatic_aberration_origin =
+        ChromaAberOrigin::from_stored(get("ZLENSCHROMABRORIGIN"));
+    s.lens.chromatic_aberration_custom =
+        get("ZLENSCUSTOMCHROMABR").map(parse_spline).unwrap_or_default();
+    s.lens.chromatic_aberration_custom_name = text(get("ZLENSCUSTOMCHROMABRNAME"));
+    s.lens.chroma_fringing = get("ZLENSCHROMAFRINGING")
+        .map(parse_chroma_fringing)
+        .unwrap_or_default();
     s.lens.profile = text(get("ZLENSIDGUID"));
     s.lens.revision_profile = text(get("ZLENSREVISIONIDGUID"));
     s.lens.aperture = fixed(get("ZLENSAPERTURE"), s.lens.aperture);
@@ -870,6 +974,16 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     let shift = components(get("ZLENSSHIFTXY"), 2, 0.0);
     s.lens.shift_xy = [shift[0], shift[1]];
     s.lens.purple_fringing = fixed(get("ZLENSPURPLEFRINGINGAMOUNT"), s.lens.purple_fringing);
+    if matches!(
+        s.lens.profile.as_deref().and_then(crate::lensdb::builtin_profile),
+        Some(crate::lensdb::BuiltinProfile::Manufacturer)
+    ) {
+        s.lens.manufacturer = Some(ManufacturerCurves {
+            distortion: s.lens.distortion.points().to_vec(),
+            ca_red: s.lens.chromatic_aberration.splines.first().cloned().unwrap_or_default(),
+            ca_blue: s.lens.chromatic_aberration.splines.get(1).cloned().unwrap_or_default(),
+        });
+    }
 
     let vig = components(get("ZLENSVIGNETTING"), 4, 0.0);
     s.vignetting = [vig[0], vig[1], vig[2], vig[3]];
@@ -901,7 +1015,10 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
 // White balance conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub use crate::c1_wb_oracle::{gains_to_kelvin_tint, kelvin_tint_to_gains};
+pub use crate::c1_wb_oracle::{
+    gains_to_kelvin_tint, gains_to_kelvin_tint_for_body, kelvin_tint_to_gains,
+    WbDisplayConfidence,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversion to the engine's AdjustmentSet
@@ -1034,8 +1151,9 @@ pub fn curves_from_c1(s: &C1VariantSettings) -> Curves {
         red: curve_from(&s.gradation_curves[1]),
         green: curve_from(&s.gradation_curves[2]),
         blue: curve_from(&s.gradation_curves[3]),
-        // ZGRADATIONCURVEY has no counterpart: the engine's luma curve stays empty.
-        luma: Curve::default(),
+        // `ZGRADATIONCURVEY` is C1's luminance curve: the same gradation curve
+        // class, selected by `GradationCurveY` when the editor is on luma.
+        luma: curve_from(&s.gradation_curves[4]),
     }
 }
 
@@ -1103,19 +1221,11 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         red: curve_from(&s.gradation_curves[1]),
         green: curve_from(&s.gradation_curves[2]),
         blue: curve_from(&s.gradation_curves[3]),
-        // ZGRADATIONCURVEY has no counterpart: the engine's luma curve stays empty.
-        luma: Curve::default(),
+        luma: curve_from(&s.gradation_curves[4]),
     };
 
     set.clarity = Clarity {
-        // C1's ZCLARITYMETHOD numbering is not proven to match the engine's enum.
-        method: match s.clarity_method {
-            0 => ClarityMethod::Natural,
-            1 => ClarityMethod::Punch,
-            2 => ClarityMethod::Neutral,
-            3 => ClarityMethod::Classic,
-            _ => ClarityMethod::Natural,
-        },
+        method: ClarityMethod::from_c1(s.clarity_method),
         clarity: clamp(s.clarity, -100.0, 100.0),
         structure: clamp(s.clarity_structure, -100.0, 100.0),
     };
@@ -1196,12 +1306,24 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         sharpness_falloff: 0.0,
         light_falloff: clamp(s.lens.light_falloff.param(0).unwrap_or(0.0), 0.0, 100.0),
         chromatic_aberration: s.lens.chromatic_aberration_enabled,
-        ca_red_points: s.lens.chromatic_aberration.scale(1),
-        ca_blue_points: s.lens.chromatic_aberration.scale(0),
-        purple_fringing: clamp(s.lens.purple_fringing, 0.0, 100.0),
+        // A manufacturer profile's CA lives in `manufacturer`; the raw splines
+        // are not normalized to a usable radius, so they must not override it.
+        ca_red_points: if s.lens.manufacturer.is_some() {
+            Vec::new()
+        } else {
+            s.lens.chromatic_aberration.scale(1)
+        },
+        ca_blue_points: if s.lens.manufacturer.is_some() {
+            Vec::new()
+        } else {
+            s.lens.chromatic_aberration.scale(0)
+        },
+        purple_fringing: clamp(s.lens.purple_fringing, -100.0, 100.0),
         hide_distorted_areas: true,
         shift_x: clamp(s.lens.shift_xy[0], -100.0, 100.0),
         shift_y: clamp(s.lens.shift_xy[1], -100.0, 100.0),
+        manufacturer: s.lens.manufacturer.clone(),
+        mount: None,
     };
 
     // A variant without ZCROP stores all four values as 0; that is "no crop",
@@ -1369,6 +1491,8 @@ mod tests {
         assert_eq!(column("ZCOLORCORRECTIONS").unwrap().encoding, C1Encoding::SemicolonComma);
         assert_eq!(column("ZGRADATIONCURVE").unwrap().encoding, C1Encoding::CommaPairs);
         assert_eq!(column("ZLENSVIGNETTING").unwrap().encoding, C1Encoding::Pipe);
+        assert_eq!(column("ZLENSCHROMAFRINGING").unwrap().encoding, C1Encoding::Pipe);
+        assert_eq!(column("ZLENSCHROMAFRINGING").unwrap().components, 6);
     }
 
     #[test]
@@ -1391,6 +1515,38 @@ mod tests {
         let c = parse_curve("0.000,0.000;1.000,1.000");
         assert_eq!(c.len(), 2);
         assert!((c[1].0 - 1.0).abs() < 1e-6 && (c[1].1 - 1.0).abs() < 1e-6);
+    }
+
+    /// Legacy `GCurve` values are stored in editor order and may descend; the
+    /// parser keeps them verbatim so a write-back is byte-faithful. C1 sorts
+    /// them itself when it loads the file (`SetGradation`).
+    #[test]
+    fn stored_curve_order_is_preserved() {
+        let c = parse_curve("0.514,0.583;0.210,0.260");
+        assert_eq!(c, vec![(0.514, 0.583), (0.210, 0.260)]);
+    }
+
+    #[test]
+    fn curve_points_are_capped_at_c1_capacity() {
+        let raw = (0..20).map(|i| format!("{},{}", i as f32 / 19.0, i as f32 / 19.0))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(parse_curve(&raw).len(), MAX_CURVE_POINTS);
+    }
+
+    /// `ZGRADATIONCURVEY` is the luminance curve; its non-identity value comes
+    /// from the installed `Presets60/Curve/Contrast Luma.copreset`.
+    #[test]
+    fn gradation_curve_y_reaches_the_luma_curve() {
+        let s = from_layer_row(&row(&[(
+            "ZGRADATIONCURVEY",
+            Some("0.000,0.000;0.104,0.075;0.252,0.254;0.549,0.640;1.000,1.000"),
+        )]));
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.curves.luma.points.len(), 5);
+        assert!((set.curves.luma.points[3].y - 0.640).abs() < 1e-6);
+        assert_eq!(set.curves.rgb, Curve::default(), "Y must not leak into RGB");
+        assert!(!set.curves.luma.is_identity(), "the luma curve must survive");
     }
 
     #[test]
@@ -1572,6 +1728,117 @@ mod tests {
         let missing = to_adjustment_set(&from_layer_row(&row(&[])));
         assert!(!missing.lens.use_profile);
         assert_eq!(missing.lens.profile, None);
+    }
+
+    #[test]
+    fn manufacturer_profile_reads_the_variants_curves() {
+        let adj = to_adjustment_set(&from_layer_row(&row(&[
+            ("ZLENSIDGUID", Some("2420559E-FE2D-4B13-91BB-E488FFA530E1")),
+            (
+                "ZLENSDISTORTION",
+                Some("0.0,0.0000;742.0,-43.3392;23742.6,146.6017|100.0|1|100|-1.00000"),
+            ),
+            (
+                "ZLENSDEFAULTCHROMABR",
+                Some("0.0,0.0000;13355.2,-3.9107|0.0,0.0000;13355.2,-2.0419"),
+            ),
+            ("ZLENSCHROMABRENABLED", Some("1")),
+        ])));
+        let curves = adj.lens.manufacturer.as_ref().expect("manufacturer curves");
+        assert_eq!(curves.distortion.len(), 3);
+        assert!((curves.ca_red[1].1 + 3.9107).abs() < 1e-4);
+        assert!((curves.ca_blue[1].1 + 2.0419).abs() < 1e-4);
+        // The raw splines cannot be normalized by their first radius (it is 0),
+        // so they must not shadow the curves above.
+        assert!(adj.lens.ca_red_points.is_empty());
+        assert!(adj.lens.ca_blue_points.is_empty());
+
+        let unknown = to_adjustment_set(&from_layer_row(&row(&[
+            ("ZLENSIDGUID", Some("6E1F8E5B-0000-0000-0000-000000000000")),
+            ("ZLENSDISTORTION", Some("0.0,0.0000;742.0,-43.3392|100.0|1|100|-1.00000")),
+        ])));
+        assert!(unknown.lens.manufacturer.is_none());
+    }
+
+    #[test]
+    fn chroma_aberration_origin_maps_c1_values() {
+        let origin = |raw: Option<&'static str>| {
+            from_layer_row(&row(&[("ZLENSCHROMABRORIGIN", raw)]))
+                .lens
+                .chromatic_aberration_origin
+        };
+        assert_eq!(origin(Some("0")), ChromaAberOrigin::None);
+        assert_eq!(origin(Some("1")), ChromaAberOrigin::LensDb);
+        assert_eq!(origin(Some("2")), ChromaAberOrigin::Custom);
+        // C1's SetChromOrigin treats every other value as "no origin".
+        assert_eq!(origin(Some("3")), ChromaAberOrigin::None);
+        assert_eq!(origin(None), ChromaAberOrigin::None);
+    }
+
+    #[test]
+    fn custom_chroma_curves_and_name_parse() {
+        let s = from_layer_row(&row(&[
+            (
+                "ZLENSCUSTOMCHROMABR",
+                Some("0.0,0.0000;1000.0,-1.5000|0.0,0.0000;1000.0,-0.7500"),
+            ),
+            ("ZLENSCUSTOMCHROMABRNAME", Some("SamYang 14mm")),
+            ("ZLENSCHROMABRORIGIN", Some("2")),
+        ]));
+        assert_eq!(s.lens.chromatic_aberration_custom.splines.len(), 2);
+        assert!((s.lens.chromatic_aberration_custom.splines[0][1].1 + 1.5).abs() < 1e-6);
+        assert!((s.lens.chromatic_aberration_custom.splines[1][1].1 + 0.75).abs() < 1e-6);
+        assert_eq!(
+            s.lens.chromatic_aberration_custom_name.as_deref(),
+            Some("SamYang 14mm")
+        );
+
+        let empty = from_layer_row(&row(&[]));
+        assert!(empty.lens.chromatic_aberration_custom.splines.is_empty());
+        assert_eq!(empty.lens.chromatic_aberration_custom_name, None);
+    }
+
+    #[test]
+    fn chroma_fringing_parses_six_named_curves() {
+        let raw = "0.000,0.000;10.000,1.000|0.000,0.500|0.000,0.250|\
+                   0.000,0.000;10.000,-1.000|0.000,-0.500|0.000,-0.250";
+        let f = from_layer_row(&row(&[("ZLENSCHROMAFRINGING", Some(raw))]))
+            .lens
+            .chroma_fringing;
+        assert_eq!(f.red_shift.len(), 2);
+        assert_eq!(f.red_ra.len(), 1);
+        assert!((f.blue_shift[1].1 + 1.0).abs() < 1e-6);
+        assert!((f.blue_strength[0].1 + 0.25).abs() < 1e-6);
+        assert!(!f.is_empty());
+
+        // The real catalog stores "|||||" for a profile without fringing data.
+        let empty =
+            from_layer_row(&row(&[("ZLENSCHROMAFRINGING", Some("|||||"))]))
+                .lens
+                .chroma_fringing;
+        assert!(empty.is_empty());
+        // C1 ignores anything that is not exactly six fields.
+        assert!(parse_chroma_fringing("0.000,0.000").is_empty());
+    }
+
+    #[test]
+    fn purple_fringing_keeps_the_full_signed_range() {
+        let adj = |raw: &'static str| {
+            to_adjustment_set(&from_layer_row(&row(&[(
+                "ZLENSPURPLEFRINGINGAMOUNT",
+                Some(raw),
+            )])))
+            .lens
+            .purple_fringing
+        };
+        assert_eq!(adj("-40.0"), -40.0);
+        assert_eq!(adj("100.0"), 100.0);
+        assert_eq!(
+            to_adjustment_set(&from_layer_row(&row(&[])))
+                .lens
+                .purple_fringing,
+            0.0
+        );
     }
 
     #[test]

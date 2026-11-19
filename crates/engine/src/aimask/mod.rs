@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 
 pub(crate) use ort::{Runtime, Session};
 
@@ -144,15 +145,45 @@ pub fn model_available(name: &str) -> bool {
 }
 
 /// Builds the reusable ONNX sessions ahead of the first interactive mask.
-/// This only runs when models are installed and never performs an inference.
+/// Subject and skin are independent models, so they load in parallel on
+/// below-normal-priority threads. A per-model lock prevents duplicate sessions
+/// without serializing different models behind one global table lock.
 pub fn prewarm_models() -> Result<()> {
-    for name in ["subjectMasking.onnx", "skinMasking.onnx"] {
+    fn prewarm(name: &str) -> Result<()> {
+        lower_current_thread_priority();
         if model_available(name) {
             Segmenter::load(name)?;
         }
+        Ok(())
     }
-    Ok(())
+
+    std::thread::scope(|scope| {
+        let subject = scope.spawn(|| prewarm("subjectMasking.onnx"));
+        let skin = scope.spawn(|| prewarm("skinMasking.onnx"));
+        subject
+            .join()
+            .map_err(|_| anyhow::anyhow!("subject AI prewarm thread panicked"))??;
+        skin.join()
+            .map_err(|_| anyhow::anyhow!("skin AI prewarm thread panicked"))??;
+        Ok(())
+    })
 }
+
+#[cfg(windows)]
+fn lower_current_thread_priority() {
+    use std::ffi::c_void;
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+    }
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_current_thread_priority() {}
 
 /// A loaded model plus what its metadata says about the tensors.
 pub(crate) struct Segmenter {
@@ -165,11 +196,34 @@ pub(crate) struct Segmenter {
     pub(crate) out_nchw: bool,
 }
 
+type ModelCache = Mutex<HashMap<String, Arc<Segmenter>>>;
+
+fn model_cache() -> &'static ModelCache {
+    static MODELS: OnceLock<ModelCache> = OnceLock::new();
+    MODELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn model_lock(name: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    locks
+        .entry(name.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 impl Segmenter {
     fn load(name: &str) -> Result<Arc<Segmenter>> {
-        static MODELS: OnceLock<Mutex<HashMap<String, Arc<Segmenter>>>> = OnceLock::new();
-        let mut models = MODELS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(model) = models.get(name) {
+        let load_lock = model_lock(name);
+        let _loading = load_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(model) = model_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(name)
+        {
             return Ok(model.clone());
         }
         let path = model_path(name)?;
@@ -195,35 +249,55 @@ impl Segmenter {
             .unwrap_or(1) as usize;
         let out_nchw = channels > 1 && out_dims.get(1) == Some(&(channels as i64));
         let model = Arc::new(Segmenter { session, path: path.clone(), in_w, in_h, nchw, channels, out_nchw });
-        models.insert(name.to_string(), model.clone());
+        model_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(name.to_string(), model.clone());
         Ok(model)
     }
 
     fn input_tensor(&self, rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
         let mut tensor = vec![0.0f32; 3 * self.in_w * self.in_h];
-        for y in 0..self.in_h {
-            let sy = (y as f32 + 0.5) * h as f32 / self.in_h as f32 - 0.5;
-            let y0 = sy.floor().max(0.0) as usize;
-            let y1 = (y0 + 1).min(h - 1);
-            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-            for x in 0..self.in_w {
+        let xs: Vec<_> = (0..self.in_w)
+            .map(|x| {
                 let sx = (x as f32 + 0.5) * w as f32 / self.in_w as f32 - 0.5;
                 let x0 = sx.floor().max(0.0) as usize;
-                let x1 = (x0 + 1).min(w - 1);
-                let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-                let at = |xx: usize, yy: usize, c: usize| rgba[(yy * w + xx) * 4 + c] as f32 / 255.0;
-                let i = y * self.in_w + x;
-                for c in 0..3 {
-                    let top = at(x0, y0, c) * (1.0 - fx) + at(x1, y0, c) * fx;
-                    let bottom = at(x0, y1, c) * (1.0 - fx) + at(x1, y1, c) * fx;
-                    let value = top * (1.0 - fy) + bottom * fy;
-                    if self.nchw {
-                        tensor[c * self.in_w * self.in_h + i] = value;
-                    } else {
-                        tensor[i * 3 + c] = value;
+                (x0, (x0 + 1).min(w - 1), (sx - x0 as f32).clamp(0.0, 1.0))
+            })
+            .collect();
+        let ys: Vec<_> = (0..self.in_h)
+            .map(|y| {
+                let sy = (y as f32 + 0.5) * h as f32 / self.in_h as f32 - 0.5;
+                let y0 = sy.floor().max(0.0) as usize;
+                (y0, (y0 + 1).min(h - 1), (sy - y0 as f32).clamp(0.0, 1.0))
+            })
+            .collect();
+        let plane = self.in_w * self.in_h;
+        if self.nchw {
+            tensor.par_chunks_mut(plane).enumerate().for_each(|(c, channel)| {
+                for (y, &(y0, y1, fy)) in ys.iter().enumerate() {
+                    for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
+                        let at = |xx: usize, yy: usize| rgba[(yy * w + xx) * 4 + c] as f32 / 255.0;
+                        let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+                        let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+                        channel[y * self.in_w + x] = top * (1.0 - fy) + bottom * fy;
                     }
                 }
-            }
+            });
+        } else {
+            tensor.par_chunks_mut(self.in_w * 3).enumerate().for_each(|(y, row)| {
+                let (y0, y1, fy) = ys[y];
+                for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
+                    let at = |xx: usize, yy: usize, c: usize| {
+                        rgba[(yy * w + xx) * 4 + c] as f32 / 255.0
+                    };
+                    for c in 0..3 {
+                        let top = at(x0, y0, c) * (1.0 - fx) + at(x1, y0, c) * fx;
+                        let bottom = at(x0, y1, c) * (1.0 - fx) + at(x1, y1, c) * fx;
+                        row[x * 3 + c] = top * (1.0 - fy) + bottom * fy;
+                    }
+                }
+            });
         }
         tensor
     }
@@ -254,22 +328,25 @@ fn check_rgba(rgba: &[u8], w: usize, h: usize) -> Result<()> {
 /// Bilinear resample of a single-channel plane.
 fn resample(src: &[f32], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; w * h];
-    for y in 0..h {
+    let xs: Vec<_> = (0..w)
+        .map(|x| {
+            let sx = (x as f32 + 0.5) * sw as f32 / w as f32 - 0.5;
+            let x0 = sx.floor().max(0.0) as usize;
+            (x0, (x0 + 1).min(sw - 1), (sx - x0 as f32).clamp(0.0, 1.0))
+        })
+        .collect();
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let sy = (y as f32 + 0.5) * sh as f32 / h as f32 - 0.5;
         let y0 = sy.floor().max(0.0) as usize;
         let y1 = (y0 + 1).min(sh - 1);
         let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..w {
-            let sx = (x as f32 + 0.5) * sw as f32 / w as f32 - 0.5;
-            let x0 = sx.floor().max(0.0) as usize;
-            let x1 = (x0 + 1).min(sw - 1);
-            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+        for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
             let at = |xx: usize, yy: usize| src[yy * sw + xx];
             let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * fx;
             let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * fx;
-            out[y * w + x] = (top + (bottom - top) * fy).clamp(0.0, 1.0);
+            row[x] = (top + (bottom - top) * fy).clamp(0.0, 1.0);
         }
-    }
+    });
     out
 }
 
@@ -350,14 +427,30 @@ pub fn people_masks(rgba: &[u8], w: u32, h: u32) -> Result<PeopleMasks> {
             pixels * classes
         );
     }
-    let plane = |class| {
-        let values = class_plane(&out, pixels, classes, model.out_nchw, class);
-        resample(&values, model.in_w, model.in_h, w, h)
-    };
+    let [face, body, hair] = class_planes(
+        &out,
+        pixels,
+        classes,
+        model.out_nchw,
+        [
+            PeopleClass::FaceSkin as usize,
+            PeopleClass::BodySkin as usize,
+            PeopleClass::Hair as usize,
+        ],
+    );
+    let (face, (body, hair)) = rayon::join(
+        || resample(&face, model.in_w, model.in_h, w, h),
+        || {
+            rayon::join(
+                || resample(&body, model.in_w, model.in_h, w, h),
+                || resample(&hair, model.in_w, model.in_h, w, h),
+            )
+        },
+    );
     Ok(PeopleMasks {
-        face: plane(PeopleClass::FaceSkin as usize),
-        body: plane(PeopleClass::BodySkin as usize),
-        hair: plane(PeopleClass::Hair as usize),
+        face,
+        body,
+        hair,
     })
 }
 
@@ -365,6 +458,7 @@ pub fn people_masks(rgba: &[u8], w: u32, h: u32) -> Result<PeopleMasks> {
 fn class_plane(out: &[f32], pixels: usize, classes: usize, out_nchw: bool, class: usize) -> Vec<f32> {
     let class = class.min(classes.saturating_sub(1));
     (0..pixels)
+        .into_par_iter()
         .map(|i| {
             let at = |c: usize| {
                 if out_nchw { out[c * pixels + i] } else { out[i * classes + c] }
@@ -374,6 +468,48 @@ fn class_plane(out: &[f32], pixels: usize, classes: usize, out_nchw: bool, class
             if sum > 0.0 { (at(class) - max).exp() / sum } else { 0.0 }
         })
         .collect()
+}
+
+/// Three softmax probabilities from one logits traversal. `people_masks`
+/// previously repeated the max/sum loop once per class; the selected values
+/// and operation order here match [`class_plane`] bit for bit.
+fn class_planes(
+    out: &[f32],
+    pixels: usize,
+    classes: usize,
+    out_nchw: bool,
+    requested: [usize; 3],
+) -> [Vec<f32>; 3] {
+    let selected = requested.map(|class| class.min(classes.saturating_sub(1)));
+    let mut planes = std::array::from_fn(|_| vec![0.0f32; pixels]);
+    let [first, second, third] = &mut planes;
+    first
+        .par_iter_mut()
+        .zip(second.par_iter_mut())
+        .zip(third.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, ((first, second), third))| {
+            let at = |class: usize| {
+                if out_nchw {
+                    out[class * pixels + i]
+                } else {
+                    out[i * classes + class]
+                }
+            };
+            let max = (0..classes).fold(f32::MIN, |maximum, class| maximum.max(at(class)));
+            let sum: f32 = (0..classes).map(|class| (at(class) - max).exp()).sum();
+            let probabilities = selected.map(|class| {
+                if sum > 0.0 {
+                    (at(class) - max).exp() / sum
+                } else {
+                    0.0
+                }
+            });
+            *first = probabilities[0];
+            *second = probabilities[1];
+            *third = probabilities[2];
+        });
+    planes
 }
 
 /// Face skin from the people parser.
@@ -410,18 +546,23 @@ pub fn sky_mask(rgba: &[u8], w: u32, h: u32) -> Result<Vec<f32>> {
         return Ok(Vec::new());
     }
     let subject = subject_mask(rgba, w as u32, h as u32)?;
+    Ok(sky_mask_from_subject(rgba, w, h, &subject))
+}
+
+/// The sky heuristic after the subject model has already run for this frame.
+pub(crate) fn sky_mask_from_subject(rgba: &[u8], w: usize, h: usize, subject: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; w * h];
-    for y in 0..h {
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         // Sky is above the horizon: full weight down to 60%, gone by 90%.
         let vertical = ((0.9 - y as f32 / h as f32) / 0.3).clamp(0.0, 1.0);
         for x in 0..w {
             let i = y * w + x;
             let p = &rgba[i * 4..i * 4 + 4];
             let prior = sky_prior(p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
-            out[i] = (1.0 - subject[i]) * prior * vertical;
+            row[x] = (1.0 - subject[i]) * prior * vertical;
         }
-    }
-    Ok(out)
+    });
+    out
 }
 
 /// One line per tensor, for the probe binary.
@@ -534,6 +675,23 @@ mod tests {
     }
 
     #[test]
+    fn fused_class_planes_match_the_single_class_path_bit_for_bit() {
+        let (pixels, classes) = (7, 6);
+        let out: Vec<f32> = (0..pixels * classes)
+            .map(|i| ((i * 37 % 101) as f32) / 17.0 - 3.0)
+            .collect();
+        let requested = [
+            PeopleClass::FaceSkin as usize,
+            PeopleClass::BodySkin as usize,
+            PeopleClass::Hair as usize,
+        ];
+        let fused = class_planes(&out, pixels, classes, false, requested);
+        for (plane, class) in fused.into_iter().zip(requested) {
+            assert_eq!(plane, class_plane(&out, pixels, classes, false, class));
+        }
+    }
+
+    #[test]
     fn sky_prior_prefers_blue_and_rejects_ground() {
         assert!(sky_prior(0.35, 0.55, 0.85) > 0.8);
         assert_eq!(sky_prior(0.35, 0.30, 0.22), 0.0);
@@ -546,6 +704,18 @@ mod tests {
     fn missing_model_is_an_error_not_a_panic() {
         assert!(model_path("not-a-model.onnx").is_err());
         assert!(Segmenter::load("not-a-model.onnx").is_err());
+    }
+
+    #[test]
+    fn model_locks_serialize_one_model_without_blocking_another() {
+        let subject = model_lock("test:subject");
+        let subject_again = model_lock("test:subject");
+        let skin = model_lock("test:skin");
+        assert!(Arc::ptr_eq(&subject, &subject_again));
+
+        let _subject_loading = subject.lock().unwrap();
+        assert!(subject_again.try_lock().is_err());
+        assert!(skin.try_lock().is_ok());
     }
 
     #[test]
@@ -701,6 +871,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs Capture One's PeopleMasking model; compares fused softmax output and time"]
+    fn real_people_masks_fused_softmax_parity_and_bench() {
+        let (w, h) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| [180u8, 160, 140, 255]).collect();
+        let model = Segmenter::load("skinMasking.onnx").expect("skin model");
+        let mut input = model.input_tensor(&rgba, w as usize, h as usize);
+        let out = model.run(&mut input).expect("skin inference");
+        let pixels = model.in_w * model.in_h;
+        let classes = model.channels.max(1);
+        let requested = [
+            PeopleClass::FaceSkin as usize,
+            PeopleClass::BodySkin as usize,
+            PeopleClass::Hair as usize,
+        ];
+        let old = || {
+            requested
+                .into_iter()
+                .map(|class| {
+                    let plane = class_plane(&out, pixels, classes, model.out_nchw, class);
+                    resample(&plane, model.in_w, model.in_h, w as usize, h as usize)
+                })
+                .collect::<Vec<_>>()
+        };
+        let fused = || {
+            let [face, body, hair] =
+                class_planes(&out, pixels, classes, model.out_nchw, requested);
+            let (face, (body, hair)) = rayon::join(
+                || resample(&face, model.in_w, model.in_h, w as usize, h as usize),
+                || {
+                    rayon::join(
+                        || resample(&body, model.in_w, model.in_h, w as usize, h as usize),
+                        || resample(&hair, model.in_w, model.in_h, w as usize, h as usize),
+                    )
+                },
+            );
+            vec![face, body, hair]
+        };
+        let old_planes = old();
+        let fused_planes = fused();
+        assert_eq!(old_planes, fused_planes, "fused softmax output changed");
+
+        let mut old_ms = Vec::new();
+        let mut fused_ms = Vec::new();
+        for _ in 0..10 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(old());
+            old_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            std::hint::black_box(fused());
+            fused_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        old_ms.sort_by(f64::total_cmp);
+        fused_ms.sort_by(f64::total_cmp);
+        println!(
+            "people mask extraction: old_p50={:.3} ms fused_p50={:.3} ms speedup={:.2}x",
+            old_ms[old_ms.len() / 2],
+            fused_ms[fused_ms.len() / 2],
+            old_ms[old_ms.len() / 2] / fused_ms[fused_ms.len() / 2].max(f64::EPSILON)
+        );
+    }
+
+    #[test]
     #[ignore = "needs Capture One's ONNX models"]
     fn real_models_are_ready_after_prewarm() {
         let (w, h) = (640u32, 480u32);
@@ -738,9 +970,19 @@ mod tests {
         let plane = lookup(&key).expect("stored under the returned key");
         assert_eq!(plane.w, 1024);
         assert_eq!(engine.compute_ai_mask(image, AiMaskKind::Subject).unwrap(), key);
-        assert!(engine.compute_ai_mask(image, AiMaskKind::Background).is_ok());
-        assert!(engine.compute_ai_mask(image, AiMaskKind::Sky).is_ok());
-        assert!(engine.compute_ai_mask(image, AiMaskKind::Hair).is_ok());
+        for derived in [AiMaskKind::Person, AiMaskKind::Clothing] {
+            let derived_key = crate::mask_store::key("frame.png", 1, derived);
+            assert!(lookup(&derived_key).is_some(), "{derived:?} was not derived");
+        }
+        for derived in [AiMaskKind::Background, AiMaskKind::Sky] {
+            let derived_key = engine.compute_ai_mask(image, derived).unwrap();
+            assert!(lookup(&derived_key).is_some(), "{derived:?} was not stored");
+        }
+        let hair_key = engine.compute_ai_mask(image, AiMaskKind::Hair).unwrap();
+        assert!(lookup(&hair_key).is_some());
+        let skin_key = crate::mask_store::key("frame.png", 1, AiMaskKind::Skin);
+        assert!(lookup(&skin_key).is_some(), "skin was not derived with hair");
+        assert_eq!(engine.compute_ai_mask(image, AiMaskKind::Skin).unwrap(), skin_key);
         let err = engine.compute_ai_mask(image, AiMaskKind::Eyes).unwrap_err();
         assert!(err.to_string().contains("no Eyes class"), "{err}");
         let err = engine.compute_ai_mask(image, AiMaskKind::Lips).unwrap_err();

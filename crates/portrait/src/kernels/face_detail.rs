@@ -887,6 +887,64 @@ pub fn mouth_corner_warp(
 // Row 78 / PF30025 tooth repair.
 // ---------------------------------------------------------------------------
 
+pub const PF30025_MODEL_INPUT_781141184: &str = "781141184";
+pub const PF30025_MODEL_INPUT_SHAPE_781141184: [u32; 4] = [1, 3, 768, 1024];
+pub const PF30025_REPAIR_OUTPUT_780929437: &str = "780929437";
+pub const PF30025_REPAIR_SLOT_0X228: usize = 0x228;
+pub const PF30025_GATE_OUTPUT_3204548346: &str = "3204548346";
+pub const PF30025_GATE_SLOT_0X280: usize = 0x280;
+
+/// One PF30025 producer result. Output `780929437` is the only repair source;
+/// output `3204548346` is retained as an unconsumed gate slot until its dtype
+/// and host law are recovered.
+#[derive(Clone, Copy, Debug)]
+pub struct ToothRepairProducer<'a> {
+    /// Output tensor `780929437` at per-face `+0x228`, packed BGRA8.
+    pub repair_780929437_bgra: &'a [u8],
+    /// Output tensor `3204548346` at per-face `+0x280`, raw host bytes.
+    pub gate_3204548346: Option<&'a [u8]>,
+    /// Explicit same-job teeth support, already normalized to `[0,1]`.
+    pub teeth_mask: &'a [f32],
+    pub roi: Rect,
+}
+
+/// Typed same-job entry. It performs the BGRA to RGBA swizzle once, then calls
+/// the recovered consumer, including its half-away-from-zero byte rounding.
+pub fn tooth_repair_same_job(
+    source: &Image,
+    producer: Option<ToothRepairProducer<'_>>,
+    ui: f32,
+) -> Result<Image, Refusal> {
+    let producer = producer.ok_or(Refusal::MissingInput("pf30025 repair_bgra"))?;
+    let pixels = checked_pixels(source, "source")?;
+    let bytes = pixels
+        .checked_mul(4)
+        .ok_or(Refusal::ShapeMismatch("pf30025 repair_bgra"))?;
+    if producer.repair_780929437_bgra.is_empty() {
+        return Err(Refusal::MissingInput("pf30025 repair_bgra"));
+    }
+    if producer.repair_780929437_bgra.len() != bytes {
+        return Err(Refusal::ShapeMismatch("pf30025 repair_bgra"));
+    }
+    let mut repair = vec![0u8; bytes];
+    for pixel in 0..pixels {
+        let offset = pixel * 4;
+        repair[offset] = producer.repair_780929437_bgra[offset + 2];
+        repair[offset + 1] = producer.repair_780929437_bgra[offset + 1];
+        repair[offset + 2] = producer.repair_780929437_bgra[offset];
+        repair[offset + 3] = producer.repair_780929437_bgra[offset + 3];
+    }
+    let repair = Image::new(source.width, source.height, repair)
+        .ok_or(Refusal::ShapeMismatch("pf30025 repair_bgra"))?;
+    tooth_repair(
+        source,
+        &repair,
+        producer.teeth_mask,
+        producer.roi,
+        ui,
+    )
+}
+
 pub fn tooth_repair(
     source: &Image,
     repair: &Image,
@@ -2891,7 +2949,7 @@ pub fn hair_line(
 mod tests {
     use super::*;
 
-    fn image_from<F: Fn(u32, u32) -> [u8; 4]>(width: u32, height: u32, f: F) -> Image {
+    pub(super) fn image_from<F: Fn(u32, u32) -> [u8; 4]>(width: u32, height: u32, f: F) -> Image {
         let mut pixels = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
             for x in 0..width {
@@ -3114,6 +3172,39 @@ mod tests {
         assert_eq!(
             tooth_repair(&source, &repair, &[1.1; 4], roi, 100.0).unwrap_err(),
             Refusal::ValueOutOfRange("teeth_mask")
+        );
+    }
+
+    #[test]
+    fn row78_same_job_producer_swizzles_bgra_and_rounds_half_away() {
+        let source = Image::solid(1, 1, [10, 20, 30, 91]);
+        let producer = ToothRepairProducer {
+            repair_780929437_bgra: &[30, 20, 200, 255],
+            gate_3204548346: Some(&[7]),
+            teeth_mask: &[0.25],
+            roi: Rect { x: 0, y: 0, width: 1, height: 1 },
+        };
+        let out = tooth_repair_same_job(&source, Some(producer), 100.0).unwrap();
+        assert_eq!(out.pixel(0, 0), [58, 20, 30, 91]);
+        assert_eq!(
+            tooth_repair_same_job(&source, None, 100.0).unwrap_err(),
+            Refusal::MissingInput("pf30025 repair_bgra")
+        );
+        let empty = ToothRepairProducer {
+            repair_780929437_bgra: &[],
+            ..producer
+        };
+        assert_eq!(
+            tooth_repair_same_job(&source, Some(empty), 100.0).unwrap_err(),
+            Refusal::MissingInput("pf30025 repair_bgra")
+        );
+        let short = ToothRepairProducer {
+            repair_780929437_bgra: &[30, 20, 200],
+            ..producer
+        };
+        assert_eq!(
+            tooth_repair_same_job(&source, Some(short), 100.0).unwrap_err(),
+            Refusal::ShapeMismatch("pf30025 repair_bgra")
         );
     }
 
@@ -3357,3 +3448,289 @@ mod tests {
         );
     }
 }
+#[derive(Debug)]
+pub struct HairSeamRepair {
+    /// Tight RGB8 repair plane, three bytes per source pixel.
+    pub repair_rgb: Vec<u8>,
+    /// 255 where a bilateral pair was found; zero preserves the source pixel.
+    pub repair_mask: Vec<u8>,
+    pub degree: f32,
+    pub half_x: f32,
+    pub half_y: f32,
+    pub probe_limit: u32,
+    pub part_line_pixels: u32,
+    pub candidate_pixels: u32,
+    pub full_weight_pixels: u32,
+    pub repaired_pixels: u32,
+}
+
+#[derive(Debug)]
+pub struct HairSeamBlendResult {
+    pub output: Image,
+    pub degree: f32,
+    pub part_line_pixels: u32,
+    pub candidate_pixels: u32,
+    pub changed: u32,
+    pub alpha_changed: u32,
+}
+
+fn hair_seam_roi(
+    width: u32,
+    height: u32,
+    roi: (u32, u32, u32, u32),
+) -> Result<(), Refusal> {
+    let (x, y, w, h) = roi;
+    if x > width || y > height || w > width - x || h > height - y {
+        return Err(Refusal::ValueOutOfRange("PF90087_ROI"));
+    }
+    Ok(())
+}
+
+/// CPU producer half of the split path. Normal/Sobel estimation and the
+/// bilateral / 16-direction search stay here; the device consumer only blends
+/// the returned repair plane.
+pub fn hair_seam_repair(
+    source: &Image,
+    part_line_mask: Option<&[u8]>,
+    hair_mask: Option<&[u8]>,
+    ui: f32,
+    normals: Option<(&[f32], &[f32])>,
+    max_probe_radius: Option<u32>,
+) -> Result<HairSeamRepair, Refusal> {
+    let pixels = checked_pixels(source, "source")?;
+    if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
+        return Err(Refusal::ValueOutOfRange("PF90087_UI"));
+    }
+    let degree = ui / 100.0;
+    let half_x = 0.5 * (source.width as f32 - 1.0) * degree;
+    let half_y = 0.5 * (source.height as f32 - 1.0) * degree;
+    let default_radius = half_x.max(half_y);
+    let probe_limit = match max_probe_radius {
+        Some(0) => return Err(Refusal::ValueOutOfRange("PF90087_PROBE_LIMIT")),
+        Some(value) => value,
+        None => default_radius.ceil().max(2.0) as u32,
+    };
+    let mut result = HairSeamRepair {
+        repair_rgb: vec![0; pixels * 3],
+        repair_mask: vec![0; pixels],
+        degree,
+        half_x,
+        half_y,
+        probe_limit,
+        part_line_pixels: 0,
+        candidate_pixels: 0,
+        full_weight_pixels: 0,
+        repaired_pixels: 0,
+    };
+    if degree == 0.0 {
+        return Ok(result);
+    }
+    let part_line_mask =
+        part_line_mask.ok_or(Refusal::MissingInput("PF90087_PART_LINE_MASK"))?;
+    let hair_mask = hair_mask.ok_or(Refusal::MissingInput("PF90087_HAIR_MASK"))?;
+    check_plane(part_line_mask.len(), pixels, "PF90087_PART_LINE_MASK")?;
+    check_plane(hair_mask.len(), pixels, "PF90087_HAIR_MASK")?;
+    if let Some((nx, ny)) = normals {
+        check_plane(nx.len(), pixels, "normal_x")?;
+        check_plane(ny.len(), pixels, "normal_y")?;
+        if !nx.iter().chain(ny.iter()).all(|value| value.is_finite()) {
+            return Err(Refusal::ValueOutOfRange("normals"));
+        }
+    }
+    for y in 0..source.height as usize {
+        for x in 0..source.width as usize {
+            let pixel = y * source.width as usize + x;
+            let mask_value = part_line_mask[pixel];
+            if mask_value == 0 {
+                continue;
+            }
+            result.part_line_pixels += 1;
+            let weight = clamp01(degree * (mask_value as f32 / 255.0));
+            if weight <= 0.0 {
+                continue;
+            }
+            result.candidate_pixels += 1;
+            if weight >= 1.0 {
+                result.full_weight_pixels += 1;
+            }
+            let (mut nx, mut ny) = match normals {
+                Some((normal_x, normal_y)) => (normal_x[pixel], normal_y[pixel]),
+                None => estimate_normal(
+                    part_line_mask,
+                    source.width as usize,
+                    source.height as usize,
+                    x,
+                    y,
+                ),
+            };
+            normalize2(&mut nx, &mut ny);
+            let pair = if nx != 0.0 || ny != 0.0 {
+                find_pair(
+                    source,
+                    hair_mask,
+                    x as f32,
+                    y as f32,
+                    nx,
+                    ny,
+                    probe_limit,
+                )
+            } else {
+                None
+            };
+            let pair = pair.or_else(|| {
+                find_best_angle(source, hair_mask, x as f32, y as f32, probe_limit)
+            });
+            let Some((_, plus, minus)) = pair else {
+                continue;
+            };
+            let repair = pixel * 3;
+            for channel in 0..3 {
+                result.repair_rgb[repair + channel] =
+                    byte_away(plus[channel] * 0.5 + minus[channel] * 0.5);
+            }
+            result.repair_mask[pixel] = 255;
+            result.repaired_pixels += 1;
+        }
+    }
+    Ok(result)
+}
+
+/// CPU consumer half of the split path. `repair_mask` is the compacted producer
+/// coverage; a zero byte preserves the source even when `part_line_mask` is set.
+pub fn hair_seam_blend(
+    source: &Image,
+    part_line_mask: Option<&[u8]>,
+    repair_rgb: Option<&[u8]>,
+    repair_mask: Option<&[u8]>,
+    ui: f32,
+    roi: (u32, u32, u32, u32),
+) -> Result<HairSeamBlendResult, Refusal> {
+    let pixels = checked_pixels(source, "source")?;
+    if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
+        return Err(Refusal::ValueOutOfRange("PF90087_UI"));
+    }
+    hair_seam_roi(source.width, source.height, roi)?;
+    let degree = ui / 100.0;
+    let mut result = HairSeamBlendResult {
+        output: source.clone(),
+        degree,
+        part_line_pixels: 0,
+        candidate_pixels: 0,
+        changed: 0,
+        alpha_changed: 0,
+    };
+    if degree == 0.0 || roi.2 == 0 || roi.3 == 0 {
+        return Ok(result);
+    }
+    let part_line_mask =
+        part_line_mask.ok_or(Refusal::MissingInput("PF90087_PART_LINE_MASK"))?;
+    let repair_rgb = repair_rgb.ok_or(Refusal::MissingInput("PF90087_REPAIR_RGB"))?;
+    let repair_mask = repair_mask.ok_or(Refusal::MissingInput("PF90087_REPAIR_MASK"))?;
+    check_plane(part_line_mask.len(), pixels, "PF90087_PART_LINE_MASK")?;
+    check_plane(repair_rgb.len(), pixels * 3, "PF90087_REPAIR_RGB")?;
+    check_plane(repair_mask.len(), pixels, "PF90087_REPAIR_MASK")?;
+    let (roi_x, roi_y, roi_w, roi_h) = roi;
+    for y in roi_y as usize..(roi_y + roi_h) as usize {
+        for x in roi_x as usize..(roi_x + roi_w) as usize {
+            let pixel = y * source.width as usize + x;
+            let mask_value = part_line_mask[pixel];
+            if mask_value == 0 {
+                continue;
+            }
+            result.part_line_pixels += 1;
+            if repair_mask[pixel] == 0 {
+                continue;
+            }
+            let weight = clamp01(degree * (mask_value as f32 / 255.0));
+            if weight <= 0.0 {
+                continue;
+            }
+            result.candidate_pixels += 1;
+            let base = pixel * 4;
+            let repair = pixel * 3;
+            for channel in 0..3 {
+                let value = source.pixels[base + channel] as f32 * (1.0 - weight)
+                    + repair_rgb[repair + channel] as f32 * weight;
+                result.output.pixels[base + channel] = byte_away(value);
+            }
+            if (0..3).any(|channel| {
+                result.output.pixels[base + channel] != source.pixels[base + channel]
+            }) {
+                result.changed += 1;
+            }
+            if result.output.pixels[base + 3] != source.pixels[base + 3] {
+                result.alpha_changed += 1;
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod hair_seam_contract_tests {
+    use super::tests::image_from;
+    use super::*;
+
+    #[test]
+    fn row88_split_producer_and_final_blend_keep_contract() {
+        let source = image_from(5, 5, |x, y| [(20 + x * x * 10 + y * 3) as u8, 50, 60, 77]);
+        let mut part_line = vec![0u8; 25];
+        part_line[2 * 5 + 2] = 255;
+        let mut hair = vec![0u8; 25];
+        hair[2 * 5] = 255;
+        hair[2 * 5 + 4] = 255;
+        let repair =
+            hair_seam_repair(&source, Some(&part_line), Some(&hair), 100.0, None, Some(4))
+                .unwrap();
+        assert_eq!(repair.repaired_pixels, 1);
+        assert_eq!(repair.repair_mask[12], 255);
+        assert_eq!(&repair.repair_rgb[36..39], &[106, 50, 60]);
+        let out = hair_seam_blend(
+            &source,
+            Some(&part_line),
+            Some(&repair.repair_rgb),
+            Some(&repair.repair_mask),
+            100.0,
+            (0, 0, 5, 5),
+        )
+        .unwrap();
+        assert_eq!(out.output.pixel(2, 2), [106, 50, 60, 77]);
+        assert_eq!(out.alpha_changed, 0);
+
+        let identity = hair_seam_blend(&source, None, None, None, 0.0, (0, 0, 5, 5)).unwrap();
+        assert_eq!(identity.output, source);
+        assert_eq!(
+            hair_seam_repair(&source, None, Some(&hair), 100.0, None, None).unwrap_err(),
+            Refusal::MissingInput("PF90087_PART_LINE_MASK")
+        );
+        assert_eq!(
+            hair_seam_repair(&source, Some(&part_line), None, 100.0, None, None).unwrap_err(),
+            Refusal::MissingInput("PF90087_HAIR_MASK")
+        );
+        assert_eq!(
+            hair_seam_repair(&source, Some(&part_line), Some(&hair), 100.0, None, Some(0))
+                .unwrap_err(),
+            Refusal::ValueOutOfRange("PF90087_PROBE_LIMIT")
+        );
+    }
+
+    #[test]
+    fn row88_final_blend_rounds_half_away_and_honors_roi() {
+        let source = Image::solid(2, 1, [0, 1, 0, 91]);
+        let repair_rgb = [1, 0, 1, 0, 0, 0];
+        let blend = hair_seam_blend(
+            &source,
+            Some(&[255, 255]),
+            Some(&repair_rgb),
+            Some(&[255, 255]),
+            50.0,
+            (0, 0, 1, 1),
+        )
+        .unwrap();
+        assert_eq!(blend.output.pixel(0, 0), [1, 1, 1, 91]);
+        assert_eq!(blend.output.pixel(1, 0), source.pixel(1, 0));
+        assert_eq!(blend.changed, 1);
+        assert_eq!(blend.alpha_changed, 0);
+    }
+}
+

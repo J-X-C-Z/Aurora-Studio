@@ -90,8 +90,10 @@ impl ReadbackContract {
     }
 }
 
-fn serial_readback_contract(_width: u32, _height: u32) -> Result<ReadbackContract, MetalRefusal> {
-    Err(MetalRefusal::ValueOutOfRange("serial_force"))
+fn serial_readback_contract(width: u32, height: u32) -> Result<ReadbackContract, MetalRefusal> {
+    let contract = ReadbackContract::tight(width, height);
+    contract.validate()?;
+    Ok(contract)
 }
 
 fn source_image() -> Image {
@@ -510,11 +512,8 @@ fn readback_contract_rejects_bad_format_stride_length_and_fence() {
 }
 
 #[test]
-fn serial_readback_contract_is_typed_blocked() {
-    assert_eq!(
-        serial_readback_contract(4, 4),
-        Err(MetalRefusal::ValueOutOfRange("serial_force"))
-    );
+fn serial_readback_contract_is_tight_and_valid() {
+    assert_eq!(serial_readback_contract(4, 4), Ok(ReadbackContract::tight(4, 4)));
 }
 
 #[test]
@@ -576,7 +575,7 @@ fn perspective_readback_contract_matches_expected() {
 }
 
 #[test]
-#[ignore = "BLOCKED: no force-serial host selector"]
+#[ignore = "requires macOS Metal device"]
 fn serial_force_mesh_bytes_match_raster() {
     require_macos();
     let image = source_image();
@@ -595,12 +594,16 @@ fn serial_force_mesh_bytes_match_raster() {
         contract: MeshContract::AffineBufferCandidate,
     };
     let expected = input.cpu_golden().expect("serial CPU golden");
-    // A13_SERIAL_FORCE_BLOCKED: no public force-serial host selector exists.
-    panic!(
-        "BLOCKED: serial_force_mesh_bytes_match_raster has fixture input/expected ({} bytes) \
-         but no force-serial host selector; do not report PASS",
-        expected.pixels.len()
-    );
+    let gpu = MetalContext::new()
+        .expect("MetalContext")
+        .mesh_raster_serial(&input)
+        .expect("force-serial mesh dispatch");
+    let contract = serial_readback_contract(image.width, image.height)
+        .expect("force-serial readback contract");
+    contract
+        .validate_bytes(&gpu.pixels)
+        .expect("force-serial readback contract");
+    assert_eq!(gpu.pixels, expected.pixels);
 }
 
 #[test]

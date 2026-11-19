@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use gpui_kit::{App, AppContext, Context, Entity, EventEmitter, Pixels, RenderImage, SharedString, Task};
 use aurora_engine::*;
+use rayon::prelude::*;
 
 pub use binding::*;
 pub use clipboard::ClipGroup;
@@ -278,6 +279,8 @@ impl Default for ViewZoom {
 
 pub struct Frame {
     pub image: Arc<RenderImage>,
+    /// Identity of the engine RGBA buffer used to build `image`.
+    pub(crate) source_pixels: usize,
     /// The developed-frame region this frame shows.
     pub region: NormRect,
     pub image_id: ImageId,
@@ -292,7 +295,21 @@ pub struct Frame {
 
 impl Frame {
     pub(crate) fn release(self, cx: &mut gpui_kit::App) {
-        cx.drop_image(self.image, None);
+        let Frame { image, warning, focus, .. } = self;
+        cx.drop_image(image, None);
+        if let Some(warning) = warning {
+            cx.drop_image(warning, None);
+        }
+        if let Some(focus) = focus {
+            cx.drop_image(focus, None);
+        }
+    }
+
+    pub(crate) fn release_reusing_image(self, cx: &mut gpui_kit::App) {
+        self.release_overlays(cx);
+    }
+
+    fn release_overlays(self, cx: &mut gpui_kit::App) {
         if let Some(w) = self.warning {
             cx.drop_image(w, None);
         }
@@ -512,7 +529,7 @@ pub struct AppState {
     pub scale_factor: f32,
     pub preview: Preview,
     pub thumbs: HashMap<ImageId, Arc<RenderImage>>,
-    thumb_queue: Vec<ImageId>,
+    thumb_queue: render::ThumbQueue,
     /// Bumped when cached thumbnails are invalidated; older results are dropped.
     thumb_rev: u64,
     thumb_task: Option<Task<()>>,
@@ -591,7 +608,7 @@ impl AppState {
     pub fn new(engine: Arc<dyn ImageEngine>, source: Source, settings: Settings, cx: &mut Context<Self>) -> Self {
         let images = engine.images();
         let edits = images
-            .iter()
+            .par_iter()
             .map(|i| (i.id, Edit { adj: engine.load_adjustments(i.id), ..Default::default() }))
             .collect();
         let current = images.first().map(|i| i.id);
@@ -664,7 +681,7 @@ impl AppState {
             scale_factor: 1.0,
             preview: Preview::default(),
             thumbs: HashMap::new(),
-            thumb_queue: Vec::new(),
+            thumb_queue: render::ThumbQueue::default(),
             thumb_rev: 0,
             thumb_task: None,
             clipboard: None,
@@ -782,6 +799,7 @@ impl AppState {
         if self.current != Some(id) {
             self.end_gesture(cx);
             self.current = Some(id);
+            self.thumb_queue.prioritize(id);
             self.active_layer = None;
             self.active_node = None;
             self.zoom = ViewZoom::default();
@@ -824,22 +842,30 @@ impl AppState {
 
     pub fn set_rating(&mut self, rating: i8, cx: &mut Context<Self>) {
         let targets: Vec<ImageId> = self.selection.iter().copied().collect();
+        let mut updated = Vec::with_capacity(targets.len());
         for id in targets {
             if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
                 info.rating = rating;
-                let _ = self.engine.update_info(info);
+                updated.push(info.clone());
             }
+        }
+        if let Err(err) = self.engine.update_info_batch(&updated) {
+            self.notify(format!("{} {err}", t("Could not save rating", "无法存储评级：")), cx);
         }
         cx.notify();
     }
 
     pub fn set_color_tag(&mut self, tag: ColorTag, cx: &mut Context<Self>) {
         let targets: Vec<ImageId> = self.selection.iter().copied().collect();
+        let mut updated = Vec::with_capacity(targets.len());
         for id in targets {
             if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
                 info.color_tag = tag;
-                let _ = self.engine.update_info(info);
+                updated.push(info.clone());
             }
+        }
+        if let Err(err) = self.engine.update_info_batch(&updated) {
+            self.notify(format!("{} {err}", t("Could not save color tag", "无法存储色标：")), cx);
         }
         cx.notify();
     }
@@ -865,7 +891,7 @@ impl AppState {
             }
         };
         let ids: Vec<ImageId> = if self.selection.is_empty() { self.current.into_iter().collect() } else { self.selection.iter().copied().collect() };
-        let mut failed = 0;
+        let mut updated = Vec::with_capacity(ids.len());
         for info in self.images.iter_mut().filter(|i| ids.contains(&i.id)) {
             let (d, s) = (&mut info.iptc, &preset.iptc);
             fill(&mut d.title, &s.title);
@@ -881,16 +907,15 @@ impl AppState {
                     info.keywords.push(k.clone());
                 }
             }
-            if self.engine.update_info(info).is_err() {
-                failed += 1;
-            }
+            updated.push(info.clone());
         }
+        let save_error = self.engine.update_info_batch(&updated).err();
         // Fields keep their own text; a new revision starts them from the new values.
         self.metadata_rev += 1;
-        let msg = if failed == 0 {
+        let msg = if save_error.is_none() {
             format!("{} {} · {} {}", t("Applied", "已应用"), preset.name, ids.len(), t("images", "张图像"))
         } else {
-            format!("{} {failed} {}", t("Could not save metadata for", "无法存储元数据："), t("images", "张图像"))
+            format!("{} {} {}", t("Could not save metadata for", "无法存储元数据："), ids.len(), t("images", "张图像"))
         };
         self.notify(msg, cx);
     }
@@ -1116,6 +1141,7 @@ impl AppState {
         let label = label.into();
         self.end_gesture(cx);
         let ids: Vec<ImageId> = self.selection.iter().copied().collect();
+        let mut changed = Vec::new();
         for id in ids {
             let edit = self.edits.entry(id).or_default();
             let before = edit.adj.clone();
@@ -1123,23 +1149,39 @@ impl AppState {
             if before != edit.adj {
                 edit.undo.push((label.clone(), before));
                 edit.redo.clear();
-                self.after_commit(id, cx);
+                changed.push(id);
             }
         }
+        self.after_commit_many(changed, cx);
         self.preview.before_dirty = true;
         self.request_render(RenderQuality::Final, cx);
         cx.notify();
     }
 
     pub(crate) fn after_commit(&mut self, id: ImageId, cx: &mut Context<Self>) {
-        if let Some(edit) = self.edits.get(&id) {
-            let _ = self.engine.save_adjustments(id, &edit.adj);
-            let changed = !edit.adj.is_default();
-            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
-                info.has_adjustments = changed;
+        self.after_commit_many(vec![id], cx);
+    }
+
+    fn after_commit_many(&mut self, ids: Vec<ImageId>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let items: Vec<(ImageId, AdjustmentSet)> = ids
+            .iter()
+            .filter_map(|id| self.edits.get(id).map(|edit| (*id, edit.adj.clone())))
+            .collect();
+        if let Err(err) = self.engine.save_adjustments_batch(&items) {
+            self.notify(format!("{} {err}", t("Could not save adjustments", "无法存储调整：")), cx);
+        }
+        for id in &ids {
+            if let Some(edit) = self.edits.get(id) {
+                let changed = !edit.adj.is_default();
+                if let Some(info) = self.images.iter_mut().find(|info| info.id == *id) {
+                    info.has_adjustments = changed;
+                }
             }
         }
-        self.queue_thumbs(vec![id], cx);
+        self.queue_thumbs(ids, cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {

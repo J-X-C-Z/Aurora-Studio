@@ -188,16 +188,18 @@ pub(crate) fn with_display_profile(
 /// Bounded linear paper white / black point on proofed pixels. Neutral is an
 /// exact no-op; this is a stand-in for, not a copy of, C1's paper/ink model.
 fn apply_paper_levels(image: &mut RgbaImage, paper_white: f32, black_point: f32) {
+    use rayon::prelude::*;
+
     let white = paper_white.clamp(0.0, 1.0);
     let black = black_point.clamp(0.0, 1.0).min(white);
     if white >= 1.0 && black <= 0.0 {
         return;
     }
-    for px in Arc::make_mut(&mut image.pixels).chunks_exact_mut(4) {
+    Arc::make_mut(&mut image.pixels).par_chunks_exact_mut(4).for_each(|px| {
         for channel in &mut px[..3] {
             *channel = (black * 255.0 + *channel as f32 * (white - black)).round().clamp(0.0, 255.0) as u8;
         }
-    }
+    });
 }
 
 /// Key for one converted frame: the sRGB frame's content key (image, params,
@@ -266,7 +268,9 @@ impl ProfileCache {
         while self.entries.len() > CAPACITY {
             self.entries.remove(0);
         }
-        while self.entries.len() > 1 && self.entries.iter().map(|e| e.1.pixels.len()).sum::<usize>() > MAX_BYTES {
+        while self.entries.len() > 1
+            && self.entries.iter().map(|e| e.1.pixels.len()).sum::<usize>() > MAX_BYTES
+        {
             self.entries.remove(0);
         }
         (out, degraded)
@@ -290,12 +294,15 @@ pub fn gamut_warning(image: &RgbaImage, proof: Option<&str>) -> Option<GamutWarn
     crate::icc::convert_srgb_to(&mut round, &profile);
     crate::icc::convert_to_srgb(&mut round, &profile);
     const THRESHOLD: i32 = 12;
-    let mut out_of_gamut = 0u64;
-    for (src, back) in image.pixels.chunks_exact(4).zip(round.chunks_exact(4)) {
-        if (0..3).any(|i| (src[i] as i32 - back[i] as i32).abs() > THRESHOLD) {
-            out_of_gamut += 1;
-        }
-    }
+    use rayon::prelude::*;
+    let out_of_gamut = image
+        .pixels
+        .par_chunks_exact(4)
+        .zip(round.par_chunks_exact(4))
+        .filter(|(src, back)| {
+            (0..3).any(|i| (src[i] as i32 - back[i] as i32).abs() > THRESHOLD)
+        })
+        .count() as u64;
     Some(GamutWarning { out_of_gamut, total: (image.pixels.len() / 4) as u64 })
 }
 
@@ -445,9 +452,25 @@ pub trait ImageEngine: Send + Sync + 'static {
     }
     /// Persists rating, tag, keywords and IPTC changes made in the interface.
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()>;
+    /// Persists metadata for a multi-image edit. Engines that can commit one
+    /// catalog snapshot override this; simple engines share the single path.
+    fn update_info_batch(&self, infos: &[ImageInfo]) -> anyhow::Result<()> {
+        for info in infos {
+            self.update_info(info)?;
+        }
+        Ok(())
+    }
     /// Adjustments stored for an image, so reopening a session restores them.
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet;
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()>;
+    /// Persists a multi-image adjustment edit with one catalog commit when the
+    /// engine supports it.
+    fn save_adjustments_batch(&self, items: &[(ImageId, AdjustmentSet)]) -> anyhow::Result<()> {
+        for (image, adjustments) in items {
+            self.save_adjustments(*image, adjustments)?;
+        }
+        Ok(())
+    }
     /// Creates a new variant of `image` with the given adjustments; returns its info.
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo>;
 
@@ -722,6 +745,69 @@ mod tests {
         let mut clamped = RgbaImage::new(1, 1, vec![128, 64, 32, 255]);
         apply_paper_levels(&mut clamped, 2.0, 2.0);
         assert_eq!(&*clamped.pixels, &[255, 255, 255, 255]);
+    }
+
+    fn apply_paper_levels_serial(image: &mut RgbaImage, paper_white: f32, black_point: f32) {
+        let white = paper_white.clamp(0.0, 1.0);
+        let black = black_point.clamp(0.0, 1.0).min(white);
+        for px in Arc::make_mut(&mut image.pixels).chunks_exact_mut(4) {
+            for channel in &mut px[..3] {
+                *channel = (black * 255.0 + *channel as f32 * (white - black))
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_paper_levels_match_the_serial_original_exactly() {
+        let (w, h) = (73u32, 41u32);
+        let pixels: Vec<u8> = (0..w * h * 4)
+            .map(|i| i.wrapping_mul(73).wrapping_add(i / 11) as u8)
+            .collect();
+        for levels in [(0.8, 0.1), (0.53, 0.07), (0.0, 0.0), (1.0, 0.0)] {
+            let mut expected =
+                RgbaImage::new(w, h, pixels.clone());
+            let mut actual =
+                RgbaImage::new(w, h, pixels.clone());
+            apply_paper_levels_serial(&mut expected, levels.0, levels.1);
+            apply_paper_levels(&mut actual, levels.0, levels.1);
+            assert_eq!(actual.pixels, expected.pixels, "{levels:?}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_parallel_paper_levels_24mp() {
+        use std::time::Instant;
+
+        let (w, h) = (6000u32, 4000u32);
+        let pixels: Vec<u8> = (0..w * h * 4)
+            .map(|i| i.wrapping_mul(40503).wrapping_add(i / 17) as u8)
+            .collect();
+        let measure = |parallel: bool| {
+            let mut times = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let mut image = RgbaImage::new(w, h, pixels.clone());
+                let started = Instant::now();
+                if parallel {
+                    apply_paper_levels(&mut image, 0.8, 0.1);
+                } else {
+                    apply_paper_levels_serial(&mut image, 0.8, 0.1);
+                }
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(image);
+            }
+            times.sort_by(f64::total_cmp);
+            (times[times.len() / 2], times[(times.len() * 95 / 100).max(times.len() - 1)])
+        };
+        let (serial50, serial95) = measure(false);
+        let (parallel50, parallel95) = measure(true);
+        println!(
+            "6000x4000 paper levels: serial {serial50:.3}/{serial95:.3} ms, parallel \
+             {parallel50:.3}/{parallel95:.3} ms, {:.2}x P50",
+            serial50 / parallel50
+        );
     }
 
     #[test]
