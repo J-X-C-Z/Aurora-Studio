@@ -811,7 +811,6 @@ mod tests {
                 "Highlight",
                 "Midtone",
                 "Shadow",
-                "TechnicalProcessingMethod",
                 "UUID",
             ]
         );

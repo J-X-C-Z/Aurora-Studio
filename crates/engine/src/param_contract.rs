@@ -153,9 +153,9 @@ mod tests {
     }
 
     #[test]
-    fn loads_all_72_contracts() {
+    fn loads_all_82_contracts() {
         let contracts = load(&contract_path()).unwrap();
-        assert_eq!(contracts.len(), 72);
+        assert_eq!(contracts.len(), 82);
         let exposure = contracts.iter().find(|c| c.id == "Exposure").unwrap();
         assert_eq!(exposure.name, "Exposure");
         assert_eq!(
@@ -170,7 +170,7 @@ mod tests {
     fn compare_against_catalog_is_stable() {
         let contracts = load(&contract_path()).unwrap();
         let diffs = compare(catalog(), &contracts);
-        assert_eq!(diffs.len(), 10);
+        assert_eq!(diffs.len(), 20);
         assert_eq!(
             diffs.iter().filter(|d| d.field == DiffField::Min).count(),
             5
@@ -184,16 +184,26 @@ mod tests {
         assert_eq!(
             ids,
             [
+                "AIDenoiseAmount",
+                "AllowCropOutsideOfImage",
+                "BandingChroma",
+                "BandingLuma",
                 "Clarity",
                 "Clarity",
                 "ClarityStructure",
                 "ClarityStructure",
+                "FilmGrainDensity",
+                "FilmGrainType",
+                "GradationCurveY",
                 "KeystoneAspect",
                 "KeystoneAspect",
                 "KeystoneH",
                 "KeystoneH",
                 "KeystoneV",
-                "KeystoneV"
+                "KeystoneV",
+                "LensDiffractionCorrectionEnabled",
+                "LensLccLightFalloff",
+                "TargetEnable"
             ]
         );
     }

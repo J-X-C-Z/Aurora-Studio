@@ -3088,7 +3088,8 @@ mod tests {
         assert!(first.has_adjustments);
         assert_eq!(first.rating, 5);
         let adj = engine.load_adjustments(first.id);
-        assert!((adj.white_balance.kelvin - 5648.0).abs() < 20.0);
+        // C1's own IC_RGBToKelvinTint reports 4779.55 K for these Z6III gains.
+        assert!((adj.white_balance.kelvin - 4779.55).abs() < 20.0);
         assert!(adj.geometry.crop.width > 0.0 && adj.geometry.crop.width <= 1.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }

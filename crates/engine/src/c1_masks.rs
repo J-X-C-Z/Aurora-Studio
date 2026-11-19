@@ -25,10 +25,13 @@
 //! recovered here; callers pass them in. `ZBRUSH*` / `ZERASER*` are the *tool
 //! state at save time* (each local layer stores its current brush and eraser
 //! settings), not necessarily the settings each stroke was painted with, so
-//! they are used as the default for the strokes supplied by the caller. The
-//! direction of `ZINDEX` (whether a higher value draws on top) is also
-//! unproven — only the ordering itself is observed. This module keeps
-//! ascending order and the renderer paints layers in list order.
+//! they are used as the default for the strokes supplied by the caller.
+//!
+//! `ZINDEX` is the layer's position in C1's `LocalAdjustmentsLayerCollection`:
+//! `Add` appends to the end and `TrySelectTopmostEnabledLayer` takes
+//! `LastOrDefault`, so the end of the list is the topmost layer. Ascending
+//! `ZINDEX` is therefore bottom-to-top; this module keeps that order and the
+//! renderer paints in list order, so the highest index lands last on top.
 
 //! Local colour adjustments ride on the same row: `ZWHITEBALANCE`,
 //! `ZHIGHLIGHTRECOVERY` / `ZSHADOWRECOVERY`, `ZCLARITY` /
@@ -58,6 +61,9 @@ pub struct C1MaskLayer {
     pub index: i64,
     pub name: Option<String>,
     pub mask_uuid: Option<String>,
+    /// `ZLAYERSELECTPOINT`: the viewer's layer handle in raw image pixels.
+    /// UI-only; see [`crate::Layer::select_point`].
+    pub select_point: Option<[f32; 2]>,
     pub enabled: bool,
     /// `ZOPACITY`, 0 ..= 100.
     pub opacity: f32,
@@ -151,6 +157,7 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
             index: s.index,
             name: s.name,
             mask_uuid: s.mask_uuid,
+            select_point: s.layer_select_point,
             enabled: s.enabled,
             opacity: s.opacity,
             surface_smoothness: s.surface_smoothness,
@@ -226,6 +233,7 @@ impl C1MaskLayer {
             kind: LayerKind::Adjustment,
             enabled: self.enabled,
             opacity: self.opacity,
+            select_point: self.select_point,
             mask: Mask {
                 shapes,
                 // C1 exposes no mask-edge column in ZVARIANTLAYER (the .comask
@@ -382,6 +390,25 @@ mod tests {
         let names: Vec<String> =
             mask_layers_from_rows(&rows).into_iter().map(|l| l.name.unwrap()).collect();
         assert_eq!(names, ["base", "middle", "top"]);
+    }
+
+    /// The select point is the viewer's raw-pixel handle; it must reach the
+    /// engine layer unchanged and must not be treated as normalized.
+    #[test]
+    fn layer_select_point_reaches_the_layer_in_raw_pixels() {
+        let mut m = layer_row("3", "1 局部图层", "12.9658");
+        row(&[("ZLAYERSELECTPOINT", Some("778.75641;2700.73657"))], &mut m);
+        let layers = mask_layers_from_rows(&[m]);
+        assert_eq!(layers[0].select_point, Some([778.75641, 2700.73657]));
+        let layer = layers[0].to_layer(9, 6048.0, vec![], vec![]);
+        assert_eq!(layer.select_point, Some([778.75641, 2700.73657]));
+    }
+
+    #[test]
+    fn layer_select_point_is_none_when_null() {
+        let layers = mask_layers_from_rows(&[layer_row("0", "Skin Mask 1", "100")]);
+        assert_eq!(layers[0].select_point, None);
+        assert_eq!(layers[0].to_layer(1, 1000.0, vec![], vec![]).select_point, None);
     }
 
     /// PK 7 (`背景遮罩 1`) stores local tone and colour edits on the mask row;
@@ -759,6 +786,7 @@ mod brush_wire_tests {
             index: 0,
             name: None,
             mask_uuid: None,
+            select_point: None,
             enabled: true,
             opacity: 100.0,
             surface_smoothness: 0.0,
