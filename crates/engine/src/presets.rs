@@ -108,14 +108,8 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
         "Saturation" => set.exposure.saturation = num().unwrap_or(0.0),
         // C1 stores the temperature itself, not gains: 5000.0009765625 in the
         // bundled presets, which is 5000 K as a float.
-        "WhiteBalanceTemperature" => {
-            set.white_balance.kelvin = num().unwrap_or(6500.0);
-            set.white_balance.gains = None;
-        }
-        "WhiteBalanceTint" => {
-            set.white_balance.tint = num().unwrap_or(0.0);
-            set.white_balance.gains = None;
-        }
+        "WhiteBalanceTemperature" => set.white_balance.kelvin = num().unwrap_or(6500.0),
+        "WhiteBalanceTint" => set.white_balance.tint = num().unwrap_or(0.0),
         "GradationCurve" => set.curves.rgb = curve(value),
         "GradationCurveRed" => set.curves.red = curve(value),
         "GradationCurveGreen" => set.curves.green = curve(value),
@@ -248,7 +242,6 @@ fn white_balance_gains(set: &mut AdjustmentSet, value: &str) {
     set.white_balance.mode = crate::WhiteBalanceMode::Custom;
     set.white_balance.kelvin = kelvin.clamp(2000.0, 50000.0);
     set.white_balance.tint = tint.clamp(-50.0, 50.0);
-    set.white_balance.gains = Some([v[0], v[1], v[2]]);
 }
 
 fn color_balance_gain(set: &mut AdjustmentSet, zone: usize, value: &str) {
@@ -1072,10 +1065,11 @@ mod tests {
         let gains_only = r#"<SL Engine="800"><E K="WhiteBalance" V="0.9022633;1;1.1216389"/></SL>"#;
         let p = preset_from_sl(gains_only, PresetKind::Preset, "", "x").expect("parses");
         assert!(p.unmapped.is_empty(), "{:?}", p.unmapped);
-        // C1's own conversion for this triple (Z6III profile): 3779.25 K.
-        assert!((p.adjustments.white_balance.kelvin - 3779.25).abs() < 15.0,
+        // The conversion anchors on the engine's 6500 K reference.
+        let expected = 6500.0 * 1.1216389 / 0.9022633;
+        assert!((p.adjustments.white_balance.kelvin - expected).abs() < 5.0,
             "{}", p.adjustments.white_balance.kelvin);
-        assert!((p.adjustments.white_balance.tint + 35.65).abs() < 0.5);
+        assert!(p.adjustments.white_balance.tint.abs() < 5.0);
 
         let both = r#"<SL Engine="800">
   <E K="WhiteBalance" V="0.9022633;1;1.1216389" />

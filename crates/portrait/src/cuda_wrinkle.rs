@@ -13,6 +13,7 @@ use crate::{Image, Refusal};
 
 pub const KERNEL: &str = cuda::COMPOSITE;
 pub const ROUTED_PFS: [u32; 4] = [21025, 21069, 21070, 21071];
+const INV255: f32 = 1.0 / 255.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WrinkleRoute {
@@ -83,7 +84,7 @@ fn crop_plane(values: &[u8], width: u32, roi: Roi) -> Vec<u8> {
 }
 
 fn rgba_f32(values: &[u8]) -> Vec<f32> {
-    values.iter().map(|byte| *byte as f32 / 255.0).collect()
+    values.iter().map(|byte| *byte as f32 * INV255).collect()
 }
 
 fn check(
@@ -180,16 +181,16 @@ impl WrinkleGpu {
         let mask_f32: Vec<f32> = (0..skin_roi.len())
             .flat_map(|index| {
                 [
-                    mask_roi[index * 4] as f32 / 255.0,
+                    mask_roi[index * 4] as f32 * INV255,
                     0.0,
-                    mask_roi[index * 4 + 2] as f32 / 255.0,
+                    mask_roi[index * 4 + 2] as f32 * INV255,
                     0.0,
                 ]
             })
             .collect();
         let skin_f32: Vec<f32> = skin_roi
             .iter()
-            .map(|byte| *byte as f32 / 255.0)
+            .map(|byte| *byte as f32 * INV255)
             .collect();
         let p15 = cuda::Uniforms::new(
             roi.width,
@@ -245,6 +246,17 @@ mod tests {
             StoreMode::TruncU8.quantize(0.5),
             StoreMode::Round.quantize(0.5)
         );
+    }
+
+    #[test]
+    fn byte_inputs_follow_the_cpu_inv255_lane() {
+        let actual = rgba_f32(&[3, 6, 7, 255]);
+        let expected: Vec<f32> = [3.0, 6.0, 7.0, 255.0]
+            .into_iter()
+            .map(|byte| byte * INV255)
+            .collect();
+        assert_eq!(actual, expected);
+        assert_ne!(actual[0], 3.0f32 / 255.0);
     }
 
     #[cfg(windows)]

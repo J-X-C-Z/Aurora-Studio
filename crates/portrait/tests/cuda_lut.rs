@@ -12,8 +12,8 @@
 mod skin_lut_gpu {
     use std::path::Path;
 
-    use aurora_portrait::cuda::CudaError;
-    use aurora_portrait::cuda_lut::{SkinLut, GATE, KERNEL, LUT_BYTES};
+    use aurora_portrait::cuda::{driver_metrics, CudaError};
+    use aurora_portrait::cuda_lut::{GATE, KERNEL, LUT_BYTES, SkinLut, TEMPERATURE_KERNEL};
     use aurora_portrait::kernels::{face_detail, makeup};
     use aurora_portrait::{Image, Refusal};
 
@@ -150,6 +150,54 @@ mod skin_lut_gpu {
         assert_eq!(actual.width, source.width);
         assert_eq!(actual.height, source.height);
         worst
+    }
+
+    fn temperature_parity(
+        gpu: &SkinLut,
+        source: &Image,
+        mask: &[u8],
+        cold: &[u8],
+        warm: &[u8],
+        ui: f32,
+    ) -> u8 {
+        let expected = face_detail::skin_temperature(source, mask, cold, warm, ui).unwrap();
+        let (actual, dispatch) = gpu
+            .temperature(source, mask, cold, warm, ui)
+            .expect("real GPU temperature dispatch");
+        assert_eq!(dispatch.kernel, TEMPERATURE_KERNEL);
+        assert!(dispatch.compute_cap.0 >= 8, "PTX needs sm_89 or newer");
+        assert_eq!(actual.width, source.width);
+        assert_eq!(actual.height, source.height);
+        let mut worst = 0u8;
+        for (index, (left, right)) in expected.pixels.iter().zip(&actual.pixels).enumerate() {
+            let delta = left.abs_diff(*right);
+            assert_eq!(
+                delta,
+                0,
+                "{}x{} ui {ui} byte {index} (pixel {}, channel {}): cpu {left} gpu {right}",
+                source.width,
+                source.height,
+                index / 4,
+                index % 4
+            );
+            worst = worst.max(delta);
+        }
+        for pixel in 0..(source.width * source.height) as usize {
+            assert_eq!(
+                actual.pixels[pixel * 4 + 3],
+                source.pixels[pixel * 4 + 3],
+                "{}x{} ui {ui} alpha pixel {pixel}",
+                source.width,
+                source.height
+            );
+        }
+        worst
+    }
+
+    fn percentile(samples: &[f64], fraction: f64) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[((sorted.len() - 1) as f64 * fraction).round() as usize]
     }
 
     #[test]
@@ -362,5 +410,247 @@ mod skin_lut_gpu {
             fixed.pixels, float.pixels,
             "fixed-point CUDA and skin_tint are different oracles"
         );
+    }
+
+    #[test]
+    fn temperature_is_byte_identical_on_odd_geometry() {
+        let Some(gpu) = gpu() else { return };
+        let cold = pseudo_lut(101);
+        let warm = pseudo_lut(202);
+        for (width, height) in [(1, 1), (17, 13), (37, 19)] {
+            let (source, mask) = job(&mut Rng::new((width * 1009 + height) as u64), width, height);
+            for ui in [-100.0f32, -37.5, 0.0, 43.25, 100.0] {
+                assert_eq!(
+                    temperature_parity(&gpu, &source, &mask, &cold, &warm, ui),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn temperature_roi_and_alpha_are_preserved() {
+        let Some(gpu) = gpu() else { return };
+        let (width, height) = (23u32, 11u32);
+        let (source, _) = job(&mut Rng::new(303), width, height);
+        let mut mask = vec![0u8; (width * height) as usize];
+        let mut rng = Rng::new(404);
+        for y in 2..9 {
+            for x in 3..19 {
+                mask[(y * width + x) as usize] = rng.byte().max(1);
+            }
+        }
+        let cold = pseudo_lut(505);
+        let warm = pseudo_lut(606);
+        for ui in [-73.0f32, 67.0] {
+            let expected = face_detail::skin_temperature(&source, &mask, &cold, &warm, ui).unwrap();
+            assert_eq!(
+                temperature_parity(&gpu, &source, &mask, &cold, &warm, ui),
+                0
+            );
+            for y in 0..height {
+                for x in 0..width {
+                    if mask[(y * width + x) as usize] == 0 {
+                        let offset = ((y * width + x) * 4) as usize;
+                        assert_eq!(
+                            expected.pixels[offset..offset + 4],
+                            source.pixels[offset..offset + 4],
+                            "ui {ui} changed outside the mask at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn temperature_uses_the_selected_lut_for_each_direction() {
+        let Some(gpu) = gpu() else { return };
+        let cold = ramp_lut([0, 255, 0]);
+        let warm = ramp_lut([255, 0, 128]);
+        let source = Image::new(1, 1, vec![27, 153, 110, 226]).unwrap();
+        let mask = [255u8];
+        assert_eq!(
+            temperature_parity(&gpu, &source, &mask, &cold, &warm, -100.0),
+            0
+        );
+        assert_eq!(
+            temperature_parity(&gpu, &source, &mask, &cold, &warm, 100.0),
+            0
+        );
+        let (cold_out, _) = gpu
+            .temperature(&source, &mask, &cold, &warm, -100.0)
+            .unwrap();
+        let (warm_out, _) = gpu
+            .temperature(&source, &mask, &cold, &warm, 100.0)
+            .unwrap();
+        assert_ne!(cold_out.pixels, warm_out.pixels);
+    }
+
+    #[test]
+    fn temperature_cold_warm_luts_are_reused_across_domain_handles() {
+        let before_open = driver_metrics();
+        let Some(first) = gpu() else { return };
+        let cold = pseudo_lut(9_151);
+        let warm = pseudo_lut(9_152);
+        let (source, mask) = job(&mut Rng::new(9_153), 1, 1);
+
+        let before_cold_warm = driver_metrics();
+        first.temperature(&source, &mask, &cold, &warm, -100.0)
+            .expect("cold LUT dispatch");
+        first.temperature(&source, &mask, &cold, &warm, 100.0)
+            .expect("warm LUT dispatch");
+        let after_cold_warm = driver_metrics();
+        assert_eq!(
+            after_cold_warm.skin_lut_uploads - before_cold_warm.skin_lut_uploads,
+            2,
+            "the first cold/warm pair must upload exactly two atlases"
+        );
+
+        let before_reuse = driver_metrics();
+        for index in 0..16 {
+            let ui = if index % 2 == 0 { -73.0 } else { 67.0 };
+            first.temperature(&source, &mask, &cold, &warm, ui)
+                .expect("cached LUT dispatch");
+        }
+        let after_reuse = driver_metrics();
+        assert_eq!(
+            after_reuse.skin_lut_uploads - before_reuse.skin_lut_uploads,
+            0,
+            "warm calls must not re-upload either atlas"
+        );
+        assert_eq!(
+            after_reuse.device_allocations - before_reuse.device_allocations,
+            0,
+            "warm calls must reuse the task buffers"
+        );
+        assert_eq!(
+            after_reuse.context_syncs - before_reuse.context_syncs,
+            0,
+            "warm calls must not add a context synchronization"
+        );
+
+        drop(first);
+        let Some(reopened) = gpu() else { return };
+        let before_reopen = driver_metrics();
+        reopened
+            .temperature(&source, &mask, &cold, &warm, -73.0)
+            .expect("cold atlases after handle reopen");
+        reopened
+            .temperature(&source, &mask, &cold, &warm, 67.0)
+            .expect("warm atlases after handle reopen");
+        let after_reopen = driver_metrics();
+        assert_eq!(
+            after_reopen.skin_lut_uploads - before_reopen.skin_lut_uploads,
+            0,
+            "a reopened handle must see the process-domain atlas cache"
+        );
+        assert_eq!(
+            after_reopen.device_allocations - before_reopen.device_allocations,
+            0,
+            "a reopened handle must reuse the task buffers"
+        );
+        assert_eq!(
+            after_reopen.context_syncs - before_reopen.context_syncs,
+            0,
+            "a reopened handle must not add a context synchronization"
+        );
+        assert_eq!(
+            after_reopen.ptx_module_load_calls,
+            after_reuse.ptx_module_load_calls,
+            "the module must not reload on a warm handle reopen"
+        );
+        eprintln!(
+            "PF30096_CACHE module_loads={} first_pair_uploads={} warm_uploads={} warm_allocations={} warm_syncs={} reopen_uploads={} reopen_allocations={} reopen_syncs={}",
+            after_reopen.ptx_module_load_calls - before_open.ptx_module_load_calls,
+            after_cold_warm.skin_lut_uploads - before_cold_warm.skin_lut_uploads,
+            after_reuse.skin_lut_uploads - before_reuse.skin_lut_uploads,
+            after_reuse.device_allocations - before_reuse.device_allocations,
+            after_reuse.context_syncs - before_reuse.context_syncs,
+            after_reopen.skin_lut_uploads - before_reopen.skin_lut_uploads,
+            after_reopen.device_allocations - before_reopen.device_allocations,
+            after_reopen.context_syncs - before_reopen.context_syncs,
+        );
+    }
+
+    #[test]
+    #[ignore = "24 MP PF30096 parity and warm timing gate"]
+    fn temperature_24mp_parity_and_warm_timing() {
+        let Some(gpu) = gpu() else { return };
+        let (width, height) = (6_000u32, 4_000u32);
+        let pixels = (width * height) as usize;
+        let source = Image::new(
+            width,
+            height,
+            (0..pixels * 4)
+                .map(|index| ((index as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+                .collect(),
+        )
+        .expect("24 MP frame");
+        let mask = (0..pixels)
+            .map(|index| if index % 7 == 0 { 0 } else { 255 })
+            .collect::<Vec<_>>();
+        let cold = pseudo_lut(9_154);
+        let warm = pseudo_lut(9_155);
+        let expected = face_detail::skin_temperature(&source, &mask, &cold, &warm, -61.0)
+            .expect("CPU 24 MP oracle");
+        let (actual, dispatch) = gpu
+            .temperature(&source, &mask, &cold, &warm, -61.0)
+            .expect("24 MP CUDA dispatch");
+        assert_eq!(dispatch.kernel, TEMPERATURE_KERNEL);
+        for (index, (left, right)) in expected.pixels.iter().zip(&actual.pixels).enumerate() {
+            assert_eq!(
+                left, right,
+                "24 MP byte {index} (pixel {}, channel {}): cpu {left} gpu {right}",
+                index / 4,
+                index % 4
+            );
+        }
+
+        let mut samples = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let start = std::time::Instant::now();
+            gpu.temperature(&source, &mask, &cold, &warm, 61.0)
+                .expect("24 MP warm dispatch");
+            samples.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let metrics = driver_metrics();
+        eprintln!(
+            "PF30096_24MP cpu_cuda_differing_bytes=0 warm_p50_ms={:.3} warm_p95_ms={:.3} module_loads={} allocations={} syncs={}",
+            percentile(&samples, 0.50),
+            percentile(&samples, 0.95),
+            metrics.ptx_module_load_calls,
+            metrics.device_allocations,
+            metrics.context_syncs,
+        );
+    }
+
+    #[test]
+    fn temperature_refuses_bad_inputs_before_launch() {
+        let Some(gpu) = gpu() else { return };
+        let (source, mask) = job(&mut Rng::new(707), 4, 4);
+        let cold = pseudo_lut(808);
+        let warm = pseudo_lut(909);
+        assert_eq!(
+            gpu.temperature(&source, &mask, &cold[..cold.len() - 3], &warm, 0.0)
+                .err(),
+            Some(CudaError::Refused(Refusal::ShapeMismatch("cold_lut")))
+        );
+        assert_eq!(
+            gpu.temperature(&source, &mask, &cold, &warm[..warm.len() - 3], 0.0)
+                .err(),
+            Some(CudaError::Refused(Refusal::ShapeMismatch("warm_lut")))
+        );
+        assert_eq!(
+            gpu.temperature(&source, &mask[..15], &cold, &warm, 0.0)
+                .err(),
+            Some(CudaError::Refused(Refusal::ShapeMismatch("mask_r")))
+        );
+        for ui in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -100.1, 100.1] {
+            assert_eq!(
+                gpu.temperature(&source, &mask, &cold, &warm, ui).err(),
+                Some(CudaError::Refused(Refusal::ValueOutOfRange("ui")))
+            );
+        }
     }
 }

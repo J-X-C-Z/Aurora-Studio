@@ -514,7 +514,7 @@ pub fn apply(
 }
 
 // Palette compiler `0x70351D0` (222 floats), kept here so `apply` is callable.
-fn hue_maps_for(parameters: &[i32; 5]) -> Vec<f32> {
+pub fn hue_maps_for(parameters: &[i32; 5]) -> Vec<f32> {
     const ORDER: [usize; 8] = [0, 5, 6, 3, 1, 2, 4, 7];
     const KNOTS: [f32; 8] = [0.0, 30.0, 55.0, 95.0, 160.0, 230.0, 275.0, 330.0];
     const HUE_SCALES: [[f32; 8]; 2] = [

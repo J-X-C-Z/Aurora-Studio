@@ -13,9 +13,11 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use aurora_portrait::cuda::{CudaError, Dispatch};
+use aurora_portrait::cuda_pf8050::{self, MESH_POINTS};
 use aurora_portrait::cuda_pf90021::{
     Direction as Pf90021Direction, RuntimeScalars as Pf90021RuntimeScalars, VolumeLut64,
 };
+use aurora_portrait::device::{Backend as DeviceBackend, DeviceRefusal, Selection};
 #[cfg(windows)]
 use aurora_portrait::cuda_hair_detail::HairDetail;
 use aurora_portrait::cuda_hair_detail::{
@@ -23,18 +25,34 @@ use aurora_portrait::cuda_hair_detail::{
 };
 use aurora_portrait::cuda_makeup::{MakeupRoute, RouteInputs};
 use aurora_portrait::cuda_stray_hair::Params as StrayHairParams;
+use aurora_portrait::kernels::face_detail::{Rect as ToothRect, ToothRepairProducer};
 use aurora_portrait::kernels::makeup_material::{
-    MakeupLayer, color_makeup, image_makeup, image_makeup_unmasked,
+    MakeupLayer, MaskChannel as MakeupMaskChannel, color_makeup, image_makeup,
+    image_makeup_unmasked,
 };
 use aurora_portrait::kernels::moisture::{FaceParams, Lut1D, MaskChannel, SkinMap};
+use aurora_portrait::kernels::skin_adjust::{
+    self, AdjustLut, BodyHlfUniforms, Roi, StoreMode, WrinkleUniforms,
+};
 use aurora_portrait::kernels::smile_warp::{self, Rect};
 use aurora_portrait::kernels::suit_makeup::{SuitPass, SuitPassKind};
-#[cfg(test)]
 use aurora_portrait::kernels::teeth_blend::AlignmentFinalBlendOutcome;
 use aurora_portrait::kernels::teeth_blend::AlignmentFinalBlendJob;
 use aurora_portrait::{Access, Image, Refusal};
 
 use crate::NormRect;
+
+#[cfg(test)]
+#[path = "portrait_hlf_wrinkle_stage_tests.rs"]
+mod hlf_wrinkle_stage_tests;
+
+#[cfg(test)]
+#[path = "portrait_hlf_24mp_bench_tests.rs"]
+mod hlf_24mp_bench_tests;
+
+#[cfg(test)]
+#[path = "portrait_pf8050_stage_tests.rs"]
+mod pf8050_stage_tests;
 
 #[cfg(test)]
 const MASK_EDGE: usize = 512;
@@ -114,6 +132,22 @@ impl PortraitMasks {
         out_h: u32,
         region: NormRect,
     ) -> Option<Vec<u8>> {
+        self.mask_f32(kind, out_w, out_h, region).map(|out| {
+            out.into_iter()
+                .map(|value| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                .collect()
+        })
+    }
+
+    /// Samples a mask without quantizing it, so automatic HLF producers keep
+    /// the same float mask domain as explicit same-job inputs.
+    pub fn mask_f32(
+        &self,
+        kind: MaskKind,
+        out_w: u32,
+        out_h: u32,
+        region: NormRect,
+    ) -> Option<Vec<f32>> {
         let plane = self.plane(kind)?;
         if self.width == 0
             || self.height == 0
@@ -128,11 +162,44 @@ impl PortraitMasks {
             let ny = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
             for x in 0..out_w {
                 let nx = region.x + (x as f32 + 0.5) / out_w as f32 * region.width;
-                let value = sample_plane(plane, self.width, self.height, nx, ny);
-                out.push((value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                out.push(sample_plane(plane, self.width, self.height, nx, ny).clamp(0.0, 1.0));
             }
         }
         Some(out)
+    }
+
+    /// Build the PF90004 fields that the local people parser can prove.
+    /// Vendor parsing/face packings remain absent rather than being guessed.
+    pub fn pf90004_parser_inputs(
+        &self,
+        rgba: &[u8],
+        out_w: u32,
+        out_h: u32,
+        region: NormRect,
+    ) -> Result<Pf90004AutoInputs, Refusal> {
+        if region != NormRect::FULL {
+            return Err(Refusal::ValueOutOfRange("PF90004_ROI"));
+        }
+        let pixels = usize::try_from(out_w)
+            .ok()
+            .and_then(|w| usize::try_from(out_h).ok().and_then(|h| w.checked_mul(h)))
+            .filter(|&pixels| pixels != 0)
+            .ok_or(Refusal::ShapeMismatch("PF90004_FRAME_SIZE"))?;
+        if rgba.len() != pixels.saturating_mul(4) {
+            return Err(Refusal::ShapeMismatch("PF90004_FRAME_RGBA"));
+        }
+        let skin_mask = self
+            .mask_u8(MaskKind::Skin, out_w, out_h, region)
+            .ok_or(Refusal::MissingInput("PF90004_PARSER_SKIN_MASK"))?;
+        let value_mean = pf90004_value_mean(rgba, out_w, out_h, &skin_mask)?;
+        Ok(Pf90004AutoInputs {
+            source: Pf90004AutoSource::PortraitParser,
+            skin_mask,
+            parsing_rgba: None,
+            face_rgba: None,
+            value_mean,
+            roi: NormRect::FULL,
+        })
     }
 
     #[cfg(test)]
@@ -147,6 +214,85 @@ impl PortraitMasks {
             height: MASK_EDGE,
         }
     }
+}
+
+/// Provenance is part of the value: parser coverage is not a vendor plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pf90004AutoSource {
+    PortraitParser,
+}
+
+/// The subset of PF90004 inputs derivable without inventing vendor packing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pf90004AutoInputs {
+    pub source: Pf90004AutoSource,
+    pub skin_mask: Vec<u8>,
+    pub parsing_rgba: Option<Vec<u8>>,
+    pub face_rgba: Option<Vec<u8>>,
+    pub value_mean: f32,
+    pub roi: NormRect,
+}
+
+/// The native statistic at `0x702E3F0`: max-side 320 resize to even
+/// dimensions, then the mean red byte over pixels whose resized mask is nonzero.
+/// Vendor input surfaces are BGR; Aurora's `Image` is RGBA8, so red is byte 0.
+fn pf90004_value_mean(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    skin_mask: &[u8],
+) -> Result<f32, Refusal> {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(Refusal::ShapeMismatch("PF90004_FRAME_SIZE"))?;
+    if skin_mask.len() != pixels {
+        return Err(Refusal::ShapeMismatch("PF90004_SKIN_MASK"));
+    }
+    if rgba.len() != pixels.saturating_mul(4) {
+        return Err(Refusal::ShapeMismatch("PF90004_FRAME_RGBA"));
+    }
+
+    let max_side = width.max(height) as f64;
+    let scale = (320.0_f64 / max_side).min(1.0) as f32;
+    let stats_w = (2.0 * (width as f32 * scale * 0.5).round()) as u32;
+    let stats_h = (2.0 * (height as f32 * scale * 0.5).round()) as u32;
+    if stats_w == 0 || stats_h == 0 {
+        return Ok(0.0);
+    }
+
+    let sx_step = width as f32 / stats_w as f32;
+    let sy_step = height as f32 / stats_h as f32;
+    let mut sum = 0.0f32;
+    let mut count = 0u32;
+    for y in 0..stats_h {
+        let sy = (y as f32 + 0.5) * sy_step - 0.5;
+        let y0 = sy.max(0.0) as u32;
+        let y1 = (y0 + 1).min(height - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..stats_w {
+            let sx = (x as f32 + 0.5) * sx_step - 0.5;
+            let x0 = sx.max(0.0) as u32;
+            let x1 = (x0 + 1).min(width - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let at = |xx: u32, yy: u32| {
+                let i = yy as usize * width as usize + xx as usize;
+                (rgba[i * 4] as f32, skin_mask[i] as f32)
+            };
+            let (r00, m00) = at(x0, y0);
+            let (r10, m10) = at(x1, y0);
+            let (r01, m01) = at(x0, y1);
+            let (r11, m11) = at(x1, y1);
+            let red = (r00 * (1.0 - fx) + r10 * fx) * (1.0 - fy)
+                + (r01 * (1.0 - fx) + r11 * fx) * fy;
+            let mask = (m00 * (1.0 - fx) + m10 * fx) * (1.0 - fy)
+                + (m01 * (1.0 - fx) + m11 * fx) * fy;
+            if (mask + 0.5).floor() != 0.0 {
+                sum += (red + 0.5).floor();
+                count += 1;
+            }
+        }
+    }
+    Ok(if count == 0 { 0.0 } else { sum / count as f32 })
 }
 
 #[allow(dead_code)]
@@ -191,11 +337,707 @@ pub struct PortraitRunReport {
     pub effects: Vec<PortraitEffectRun>,
 }
 
+pub type Pf8050GeometryInputs<'a> = cuda_pf8050::Inputs<'a>;
+
+/// Vendor GL receipts are separate from the six-stage geometry contract.
+/// s934 proved PF8033's Vec3/ROI family cannot substitute for PF8050.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pf8050VendorRuntime<'a> {
+    pub attach: Option<Pf8050AttachReceipt>,
+    pub vec3: Option<&'a [[f32; 3]]>,
+    pub roi: Option<NormRect>,
+    pub vbo: Option<&'a [u8]>,
+    pub fbo: Option<Pf8050FboReceipt>,
+    pub readback: Option<&'a [u8]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pf8050AttachReceipt {
+    pub job_id: u64,
+    pub face_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pf8050FboReceipt {
+    pub framebuffer_id: u32,
+    pub color_attachment: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pf8050StageInputs<'a> {
+    pub geometry: Pf8050GeometryInputs<'a>,
+    pub runtime: Pf8050VendorRuntime<'a>,
+}
+
+/// Candidate six-stage geometry result. `candidate_only` must remain true
+/// until same-job vendor VBO/FBO/readback bytes are captured and consumed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortraitGeometryRun {
+    pub backend: PortraitBackend,
+    pub selection: Selection,
+    pub dispatches: Vec<Dispatch>,
+    pub fallback_reason: Option<String>,
+    pub refusal: Option<Refusal>,
+    pub stages: Vec<[[f32; 2]; MESH_POINTS]>,
+    pub candidate_only: bool,
+}
+
 /// Asset bytes needed by rows that cannot use the shared parser masks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PortraitAssetInputs<'a> {
     pub teeth_whiten_lut: Option<&'a [u8]>,
     pub teeth_bright_lut: Option<&'a [u8]>,
+}
+
+/// Explicit producer output for one renderer job. Missing rows stay absent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProducerInputs {
+    pub teeth: Option<TeethProducerInputs>,
+    pub pf30025: Option<Pf30025ProducerInputs>,
+    pub teeth_alignment: Option<TeethAlignmentProducerInputs>,
+    pub stray_hair: Option<StrayHairProducerInputs>,
+    pub pf90021: Option<Pf90021ProducerInputs>,
+    pub pf90004: Option<Pf90004ProducerInputs>,
+    pub hlf_body_adjust_lut: Option<HlfBodyAdjustLutProducerInputs>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeethProducerInputs {
+    pub mask_g: Vec<u8>,
+    pub bright_ui: f32,
+    pub deyellow_ui: f32,
+    pub whiten_lut: Vec<u8>,
+    pub bright_lut: Vec<u8>,
+}
+
+/// PF90088 same-job native values and planes. Every field stays optional so an
+/// incomplete producer row retains the consumer's typed refusal order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StrayHairProducerInputs {
+    pub hairfly_v1: Option<Image>,
+    pub raw_mask: Option<Vec<u8>>,
+    pub person_mask: Option<Vec<u8>>,
+    pub background_mask: Option<Vec<u8>>,
+    pub native_degree: Option<f32>,
+    pub native_person_area: Option<f32>,
+    pub native_background_area: Option<f32>,
+}
+
+/// PF30025 same-job model outputs and support inputs.
+#[derive(Clone, Copy, Debug)]
+pub struct Pf30025Inputs<'a> {
+    pub repair_780929437_bgra: &'a [u8],
+    pub gate_3204548346: Option<&'a [u8]>,
+    pub teeth_mask: &'a [f32],
+    pub roi: ToothRect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pf30025ProducerInputs {
+    /// Model output `780929437`, per-face slot `+0x228`, packed BGRA8.
+    pub repair_780929437_bgra: Vec<u8>,
+    /// Model output `3204548346`, per-face slot `+0x280`, raw host bytes.
+    pub gate_3204548346: Option<Vec<u8>>,
+    /// Explicit same-job teeth support normalized to `[0,1]`.
+    pub teeth_mask: Vec<f32>,
+    pub roi: ToothRect,
+}
+
+/// PF30026 producer bytes for one renderer job. The edge planes are candidate
+/// record wrappers C/D; unproven gate binding stays absent rather than defaulted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TeethAlignmentProducerInputs {
+    pub effect_rgb: Option<Image>,
+    pub teeth_mask: Option<Vec<u8>>,
+    pub edge_plane_a: Option<Vec<f32>>,
+    pub edge_plane_b: Option<Vec<f32>>,
+    pub roi: Option<NormRect>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pf90021ProducerInputs {
+    pub direction: Pf90021Direction,
+    pub positive_lut: VolumeLut64,
+    pub negative_lut: VolumeLut64,
+    pub mask_r: Vec<u8>,
+    pub runtime: Pf90021RuntimeScalars,
+}
+
+/// The five PF90004 producer outputs plus the exact rendered-frame size they
+/// belong to. Planes are RGBA8/R8 coverage values in the consumer's byte domain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pf90004ProducerInputs {
+    width: u32,
+    height: u32,
+    skin_mask: Vec<u8>,
+    parsing_rgba: Vec<u8>,
+    face_rgba: Vec<u8>,
+    value_mean: f32,
+    roi: NormRect,
+}
+
+impl Pf90004ProducerInputs {
+    pub fn from_same_job(
+        width: u32,
+        height: u32,
+        skin_mask: Vec<u8>,
+        parsing_rgba: Vec<u8>,
+        face_rgba: Vec<u8>,
+        value_mean: f32,
+        roi: NormRect,
+    ) -> Result<Self, Refusal> {
+        let bundle = Self {
+            width,
+            height,
+            skin_mask,
+            parsing_rgba,
+            face_rgba,
+            value_mean,
+            roi,
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    fn validate(&self) -> Result<(), Refusal> {
+        let pixels = usize::try_from(self.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .filter(|&pixels| pixels != 0)
+            .ok_or(Refusal::ShapeMismatch("PF90004_FRAME_SIZE"))?;
+        if self.skin_mask.len() != pixels {
+            return Err(Refusal::ShapeMismatch("PF90004_SKIN_MASK"));
+        }
+        let rgba = pixels
+            .checked_mul(4)
+            .ok_or(Refusal::ShapeMismatch("PF90004_FRAME_SIZE"))?;
+        if self.parsing_rgba.len() != rgba {
+            return Err(Refusal::ShapeMismatch("PF90004_PARSING_RGBA"));
+        }
+        if self.face_rgba.len() != rgba {
+            return Err(Refusal::ShapeMismatch("PF90004_FACE_RGBA"));
+        }
+        if !self.value_mean.is_finite() || !(0.0..=255.0).contains(&self.value_mean) {
+            return Err(Refusal::ValueOutOfRange("PF90004_VALUE_MEAN"));
+        }
+        if self.roi != NormRect::FULL {
+            return Err(Refusal::ValueOutOfRange("PF90004_ROI"));
+        }
+        Ok(())
+    }
+}
+
+/// Vendor PF30022 L8 curve. The source, median, gauss, face and skin planes
+/// remain separate same-job inputs and are never synthesized from this LUT.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HlfBodyAdjustLutProducerInputs {
+    pub width: u32,
+    pub height: u32,
+    pub luma: Vec<u8>,
+}
+
+/// Candidate filter settings for the automatic HLF producer.
+///
+/// s923 recovered the kernel shapes but not the vendor interval values. These
+/// defaults are explicitly candidate values, not a vendor_equivalent claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HlfAutoProducerOptions {
+    pub median_interval: u32,
+    pub gauss_interval: u32,
+}
+
+impl Default for HlfAutoProducerOptions {
+    fn default() -> Self {
+        Self {
+            median_interval: 1,
+            gauss_interval: 1,
+        }
+    }
+}
+
+impl HlfAutoProducerOptions {
+    fn validate(self) -> Result<Self, Refusal> {
+        if self.median_interval == 0 || self.gauss_interval == 0 {
+            return Err(Refusal::ValueOutOfRange("HLF auto interval"));
+        }
+        Ok(self)
+    }
+}
+
+const HLF_MEDIAN_RADIUS: i32 = 1;
+const HLF_GAUSS_SUPPORT: i32 = 4;
+const HLF_GAUSS_WEIGHTS: [f32; 9] = [
+    0.0162, 0.054, 0.1216, 0.1945, 0.227, 0.1945, 0.1216, 0.054, 0.0162,
+];
+
+#[derive(Clone, Debug, PartialEq)]
+struct HlfAutoInputs {
+    width: u32,
+    height: u32,
+    source_rgb_full_f32: Vec<f32>,
+    median_rgb_full_f32: Vec<f32>,
+    gauss_rgb_full_f32: Vec<f32>,
+    face_mask_full_f32: Vec<f32>,
+    skin_mask_full_f32: Vec<f32>,
+    face_mask_rgba_full_f32: Vec<f32>,
+    roi: Roi,
+    preprocess_dispatches: Vec<Dispatch>,
+    preprocess_fallback: Option<String>,
+}
+
+impl HlfAutoInputs {
+    fn face(&self) -> HlfFaceInputs<'_> {
+        HlfFaceInputs {
+            width: self.width,
+            height: self.height,
+            source_rgb_full_f32: &self.source_rgb_full_f32,
+            median_rgb_full_f32: &self.median_rgb_full_f32,
+            gauss_rgb_full_f32: &self.gauss_rgb_full_f32,
+            face_mask_full_f32: &self.face_mask_full_f32,
+            skin_mask_full_f32: &self.skin_mask_full_f32,
+            roi: self.roi,
+        }
+    }
+
+    fn body(&self) -> HlfBodyInputs<'_> {
+        HlfBodyInputs {
+            width: self.width,
+            height: self.height,
+            median_rgb_full_f32: &self.median_rgb_full_f32,
+            gauss_rgb_full_f32: &self.gauss_rgb_full_f32,
+            face_mask_rgba_full_f32: &self.face_mask_rgba_full_f32,
+            skin_mask_full_f32: &self.skin_mask_full_f32,
+            roi: self.roi,
+            uniforms: hlf_auto_body_uniforms(),
+            adjust_lut: None,
+        }
+    }
+}
+
+fn hlf_auto_body_uniforms() -> BodyHlfUniforms {
+    BodyHlfUniforms {
+        spotless_degree: 0.0,
+        retouch_degree: 1.0,
+        spotless_acne_threshold: 0.0,
+        spotless_high_freq_factor: 1.0,
+        spotless_low_freq_alpha: 0.0,
+        retouch_high_freq_factor: 0.0,
+        diff_min_range: -0.2,
+        diff_max_range: 0.2,
+    }
+}
+
+fn hlf_auto_roi(region: NormRect, width: u32, height: u32) -> Result<Roi, Refusal> {
+    check_norm_rect(region, "HLF auto region")?;
+    if width == 0 || height == 0 {
+        return Err(Refusal::ShapeMismatch("HLF auto frame"));
+    }
+    let x0 = (region.x * width as f32).floor() as u32;
+    let y0 = (region.y * height as f32).floor() as u32;
+    let x1 = ((region.x + region.width) * width as f32).ceil() as u32;
+    let y1 = ((region.y + region.height) * height as f32).ceil() as u32;
+    let x0 = x0.min(width - 1);
+    let y0 = y0.min(height - 1);
+    let x1 = x1.clamp(x0 + 1, width);
+    let y1 = y1.clamp(y0 + 1, height);
+    Ok(Roi {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
+fn hlf_median_rgb(source: &[f32], width: usize, height: usize, interval: u32) -> Vec<f32> {
+    let step = i64::from(interval);
+    let mut out = vec![0.0; source.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let dst = (y * width + x) * 3;
+            for channel in 0..3 {
+                let mut samples = [0.0f32; 9];
+                let mut index = 0;
+                for dy in -HLF_MEDIAN_RADIUS..=HLF_MEDIAN_RADIUS {
+                    let sy = (y as i64 + i64::from(dy) * step)
+                        .clamp(0, height as i64 - 1) as usize;
+                    for dx in -HLF_MEDIAN_RADIUS..=HLF_MEDIAN_RADIUS {
+                        let sx = (x as i64 + i64::from(dx) * step)
+                            .clamp(0, width as i64 - 1) as usize;
+                        samples[index] = source[(sy * width + sx) * 3 + channel];
+                        index += 1;
+                    }
+                }
+                samples.sort_by(f32::total_cmp);
+                out[dst + channel] = samples[4];
+            }
+        }
+    }
+    out
+}
+
+fn hlf_gauss_rgb(source: &[f32], width: usize, height: usize, interval: u32) -> Vec<f32> {
+    let step = i64::from(interval);
+    let mut horizontal = vec![0.0; source.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let dst = (y * width + x) * 3;
+            for channel in 0..3 {
+                let mut value = 0.0;
+                for dx in -HLF_GAUSS_SUPPORT..=HLF_GAUSS_SUPPORT {
+                    let sx = (x as i64 + i64::from(dx) * step)
+                        .clamp(0, width as i64 - 1) as usize;
+                    let wx = (dx + HLF_GAUSS_SUPPORT) as usize;
+                    value += source[(y * width + sx) * 3 + channel] * HLF_GAUSS_WEIGHTS[wx];
+                }
+                horizontal[dst + channel] = value;
+            }
+        }
+    }
+    let mut out = vec![0.0; source.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let dst = (y * width + x) * 3;
+            for channel in 0..3 {
+                let mut value = 0.0;
+                for dy in -HLF_GAUSS_SUPPORT..=HLF_GAUSS_SUPPORT {
+                    let sy = (y as i64 + i64::from(dy) * step)
+                        .clamp(0, height as i64 - 1) as usize;
+                    let wy = (dy + HLF_GAUSS_SUPPORT) as usize;
+                    value += horizontal[(sy * width + x) * 3 + channel] * HLF_GAUSS_WEIGHTS[wy];
+                }
+                out[dst + channel] = value;
+            }
+        }
+    }
+    out
+}
+
+fn hlf_cpu_preprocess(
+    source: &[f32],
+    width: u32,
+    height: u32,
+    options: HlfAutoProducerOptions,
+) -> (Vec<f32>, Vec<f32>) {
+    (
+        hlf_median_rgb(source, width as usize, height as usize, options.median_interval),
+        hlf_gauss_rgb(source, width as usize, height as usize, options.gauss_interval),
+    )
+}
+
+fn hlf_preprocess(
+    source: &[f32],
+    width: u32,
+    height: u32,
+    options: HlfAutoProducerOptions,
+) -> (Vec<f32>, Vec<f32>, Vec<Dispatch>, Option<String>) {
+    #[cfg(windows)]
+    {
+        if let Some(error) = forced_cuda_failure() {
+            let (median, gauss) = hlf_cpu_preprocess(source, width, height, options);
+            return (median, gauss, Vec::new(), Some(format!("{error:?}")));
+        }
+        match aurora_portrait::cuda_hlf::Hlf::open().and_then(|gpu| {
+            gpu.preprocess_source_rgb(
+                source,
+                width,
+                height,
+                options.median_interval,
+                options.gauss_interval,
+            )
+        }) {
+            Ok((median, gauss, dispatches)) => {
+                return (median, gauss, dispatches, None);
+            }
+            Err(error) => {
+                let (median, gauss) = hlf_cpu_preprocess(source, width, height, options);
+                return (median, gauss, Vec::new(), Some(format!("{error:?}")));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let (median, gauss) = hlf_cpu_preprocess(source, width, height, options);
+        (median, gauss, Vec::new(), None)
+    }
+}
+
+fn produce_hlf_auto(
+    current: &Image,
+    region: NormRect,
+    masks: &PortraitMasks,
+    options: HlfAutoProducerOptions,
+) -> Result<HlfAutoInputs, Refusal> {
+    options.validate()?;
+    current.validate()?;
+    let pixels = current.pixel_count();
+    let face_mask = masks
+        .mask_f32(MaskKind::Face, current.width, current.height, region)
+        .ok_or(Refusal::MissingInput("HLF auto face mask"))?;
+    let skin_mask = masks
+        .mask_f32(MaskKind::Skin, current.width, current.height, region)
+        .ok_or(Refusal::MissingInput("HLF auto skin mask"))?;
+    if face_mask.len() != pixels || skin_mask.len() != pixels {
+        return Err(Refusal::ShapeMismatch("HLF auto masks"));
+    }
+    let mut source = Vec::with_capacity(pixels * 3);
+    for pixel in current.pixels.chunks_exact(4) {
+        source.push(pixel[0] as f32 / 255.0);
+        source.push(pixel[1] as f32 / 255.0);
+        source.push(pixel[2] as f32 / 255.0);
+    }
+    let (median, gauss, preprocess_dispatches, preprocess_fallback) =
+        hlf_preprocess(&source, current.width, current.height, options);
+    let mut face_rgba = Vec::with_capacity(pixels * 4);
+    for value in &face_mask {
+        face_rgba.extend_from_slice(&[*value, 0.0, 0.0, 1.0]);
+    }
+    Ok(HlfAutoInputs {
+        width: current.width,
+        height: current.height,
+        source_rgb_full_f32: source,
+        median_rgb_full_f32: median,
+        gauss_rgb_full_f32: gauss,
+        face_mask_full_f32: face_mask,
+        skin_mask_full_f32: skin_mask,
+        face_mask_rgba_full_f32: face_rgba,
+        roi: hlf_auto_roi(region, current.width, current.height)?,
+        preprocess_dispatches,
+        preprocess_fallback,
+    })
+}
+
+#[cfg(windows)]
+fn try_cuda_hlf_auto(
+    current: &Image,
+    pf: u32,
+    degree: f32,
+    region: NormRect,
+    masks: &PortraitMasks,
+) -> Option<(Image, Vec<Dispatch>)> {
+    if forced_cuda_failure().is_some() {
+        return None;
+    }
+    if forced_cuda_empty_dispatch() {
+        return None;
+    }
+    let options = HlfAutoProducerOptions::default();
+    options.validate().ok()?;
+    current.validate().ok()?;
+    let pixels = current.pixel_count();
+    let face_mask =
+        masks.mask_f32(MaskKind::Face, current.width, current.height, region)?;
+    let skin_mask =
+        masks.mask_f32(MaskKind::Skin, current.width, current.height, region)?;
+    if face_mask.len() != pixels || skin_mask.len() != pixels {
+        return None;
+    }
+    let mut source_rgb = Vec::with_capacity(pixels * 3);
+    for pixel in current.pixels.chunks_exact(4) {
+        source_rgb.push(pixel[0] as f32 / 255.0);
+        source_rgb.push(pixel[1] as f32 / 255.0);
+        source_rgb.push(pixel[2] as f32 / 255.0);
+    }
+    let roi = hlf_auto_roi(region, current.width, current.height).ok()?;
+    let gpu = aurora_portrait::cuda_hlf::Hlf::open().ok()?;
+    let (next, dispatches) = match pf {
+        30021 => {
+            let (rgb, dispatches) = gpu
+                .auto_face_apply(
+                    &source_rgb,
+                    &face_mask,
+                    &skin_mask,
+                    current.width,
+                    current.height,
+                    options.median_interval,
+                    options.gauss_interval,
+                    degree * 100.0,
+                )
+                .ok()?;
+            (hlf_rgb_f32_to_image(current, &rgb).ok()?, dispatches)
+        }
+        30022 => {
+            let mut face_rgba = Vec::with_capacity(pixels * 4);
+            for value in &face_mask {
+                face_rgba.extend_from_slice(&[*value, 0.0, 0.0, 1.0]);
+            }
+            gpu.auto_body_apply(
+                current,
+                &source_rgb,
+                &face_rgba,
+                &skin_mask,
+                roi,
+                options.median_interval,
+                options.gauss_interval,
+                degree * 100.0,
+                hlf_auto_body_uniforms(),
+            )
+            .ok()?
+        }
+        _ => return None,
+    };
+    (!dispatches.is_empty()).then_some((next, dispatches))
+}
+
+impl ProducerInputs {
+    pub fn write_pf90004(&mut self, bundle: Pf90004ProducerInputs) {
+        self.pf90004 = Some(bundle);
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        let mut hash = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-producer-inputs-v2");
+        hash = fnv_u64(hash, u64::from(self.teeth.is_some()));
+        if let Some(teeth) = self.teeth.as_ref() {
+            hash = fnv_usize(hash, teeth.mask_g.len());
+            hash = fnv1a64(hash, &teeth.mask_g);
+            hash = fnv_u64(hash, teeth.bright_ui.to_bits() as u64);
+            hash = fnv_u64(hash, teeth.deyellow_ui.to_bits() as u64);
+            hash = fnv_usize(hash, teeth.whiten_lut.len());
+            hash = fnv1a64(hash, &teeth.whiten_lut);
+            hash = fnv_usize(hash, teeth.bright_lut.len());
+            hash = fnv1a64(hash, &teeth.bright_lut);
+        }
+        hash = match self.stray_hair.as_ref() {
+            None => fnv_u64(hash, 0),
+            Some(stray_hair) => {
+                hash = fnv_u64(hash, 1);
+                hash = match stray_hair.hairfly_v1.as_ref() {
+                    None => fnv_u64(hash, 0),
+                    Some(hairfly_v1) => {
+                        hash = fnv_u64(hash, 1);
+                        hash = fnv_u64(hash, hairfly_v1.width as u64);
+                        hash = fnv_u64(hash, hairfly_v1.height as u64);
+                        hash = fnv_usize(hash, hairfly_v1.pixels.len());
+                        fnv1a64(hash, &hairfly_v1.pixels)
+                    }
+                };
+                hash = fnv_option_bytes(hash, stray_hair.raw_mask.as_deref());
+                hash = fnv_option_bytes(hash, stray_hair.person_mask.as_deref());
+                hash = fnv_option_bytes(hash, stray_hair.background_mask.as_deref());
+                hash = fnv_option_f32(hash, stray_hair.native_degree);
+                hash = fnv_option_f32(hash, stray_hair.native_person_area);
+                fnv_option_f32(hash, stray_hair.native_background_area)
+            }
+        };
+        hash = match self.pf30025.as_ref() {
+            None => fnv_u64(hash, 0),
+            Some(pf30025) => {
+                hash = fnv_u64(hash, 1);
+                hash = fnv_usize(hash, pf30025.repair_780929437_bgra.len());
+                hash = fnv1a64(hash, &pf30025.repair_780929437_bgra);
+                hash = match pf30025.gate_3204548346.as_ref() {
+                    None => fnv_u64(hash, 0),
+                    Some(gate) => {
+                        hash = fnv_u64(hash, 1);
+                        hash = fnv_usize(hash, gate.len());
+                        fnv1a64(hash, gate)
+                    }
+                };
+                hash = fnv_usize(hash, pf30025.teeth_mask.len());
+                for value in &pf30025.teeth_mask {
+                    hash = fnv_u64(hash, value.to_bits() as u64);
+                }
+                for value in [
+                    pf30025.roi.x as u32,
+                    pf30025.roi.y as u32,
+                    pf30025.roi.width as u32,
+                    pf30025.roi.height as u32,
+                ] {
+                    hash = fnv_u64(hash, value as u64);
+                }
+                hash
+            }
+        };
+        hash = match self.teeth_alignment.as_ref() {
+            None => fnv_u64(hash, 0),
+            Some(alignment) => {
+                hash = fnv_u64(hash, 1);
+                hash = match alignment.effect_rgb.as_ref() {
+                    None => fnv_u64(hash, 0),
+                    Some(effect) => {
+                        hash = fnv_u64(hash, 1);
+                        hash = fnv_u64(hash, effect.width as u64);
+                        hash = fnv_u64(hash, effect.height as u64);
+                        hash = fnv_usize(hash, effect.pixels.len());
+                        fnv1a64(hash, &effect.pixels)
+                    }
+                };
+                hash = fnv_option_bytes(hash, alignment.teeth_mask.as_deref());
+                hash = fnv_option_f32_plane(hash, alignment.edge_plane_a.as_deref());
+                hash = fnv_option_f32_plane(hash, alignment.edge_plane_b.as_deref());
+                match alignment.roi {
+                    None => fnv_u64(hash, 0),
+                    Some(roi) => {
+                        hash = fnv_u64(hash, 1);
+                        hash = fnv_u64(hash, roi.x.to_bits() as u64);
+                        hash = fnv_u64(hash, roi.y.to_bits() as u64);
+                        hash = fnv_u64(hash, roi.width.to_bits() as u64);
+                        fnv_u64(hash, roi.height.to_bits() as u64)
+                    }
+                }
+            }
+        };
+        hash = fnv_u64(hash, u64::from(self.pf90021.is_some()));
+        if let Some(pf90021) = self.pf90021.as_ref() {
+            hash = fnv_u64(
+                hash,
+                match pf90021.direction {
+                    Pf90021Direction::Neutral => 0,
+                    Pf90021Direction::Positive => 1,
+                    Pf90021Direction::Negative => 2,
+                },
+            );
+            for lut in [&pf90021.positive_lut, &pf90021.negative_lut] {
+                hash = fnv_usize(hash, lut.nodes().len());
+                for node in lut.nodes() {
+                    hash = fnv_u64(hash, node.to_bits() as u64);
+                }
+            }
+            hash = fnv_usize(hash, pf90021.mask_r.len());
+            hash = fnv1a64(hash, &pf90021.mask_r);
+            for value in [
+                pf90021.runtime.degree01,
+                pf90021.runtime.opacity01,
+                pf90021.runtime.shelter,
+                pf90021.runtime.region,
+            ] {
+                hash = fnv_u64(hash, value.to_bits() as u64);
+            }
+        }
+        hash = fnv_u64(hash, u64::from(self.pf90004.is_some()));
+        if let Some(pf90004) = self.pf90004.as_ref() {
+            hash = fnv_u64(hash, u64::from(pf90004.width));
+            hash = fnv_u64(hash, u64::from(pf90004.height));
+            hash = fnv_usize(hash, pf90004.skin_mask.len());
+            hash = fnv1a64(hash, &pf90004.skin_mask);
+            hash = fnv_usize(hash, pf90004.parsing_rgba.len());
+            hash = fnv1a64(hash, &pf90004.parsing_rgba);
+            hash = fnv_usize(hash, pf90004.face_rgba.len());
+            hash = fnv1a64(hash, &pf90004.face_rgba);
+            hash = fnv_u64(hash, u64::from(pf90004.value_mean.to_bits()));
+            for value in [
+                pf90004.roi.x,
+                pf90004.roi.y,
+                pf90004.roi.width,
+                pf90004.roi.height,
+            ] {
+                hash = fnv_u64(hash, u64::from(value.to_bits()));
+            }
+        }
+        hash = fnv_u64(hash, u64::from(self.hlf_body_adjust_lut.is_some()));
+        if let Some(lut) = self.hlf_body_adjust_lut.as_ref() {
+            hash = fnv_u64(hash, lut.width as u64);
+            hash = fnv_u64(hash, lut.height as u64);
+            hash = fnv_usize(hash, lut.luma.len());
+            hash = fnv1a64(hash, &lut.luma);
+        }
+        hash
+    }
 }
 
 /// PF108 same-job inputs. `pc:108` supplies the common UI fraction; the other
@@ -217,6 +1059,19 @@ pub struct TeethAlignmentInputs<'a> {
     pub teeth_mask: Option<&'a [u8]>,
     pub edge_plane_a: Option<&'a [f32]>,
     pub edge_plane_b: Option<&'a [f32]>,
+    pub roi: Option<NormRect>,
+}
+
+/// PF90004 same-job binding. The parser's skin mask is not a substitute for
+/// the vendor's skin/parsing/face planes or its valueMean receipt.
+#[derive(Clone, Copy, Debug)]
+pub struct RadianceInputs<'a> {
+    pub frame_width: Option<u32>,
+    pub frame_height: Option<u32>,
+    pub skin_mask: Option<&'a [u8]>,
+    pub parsing_rgba: Option<&'a [u8]>,
+    pub face_rgba: Option<&'a [u8]>,
+    pub value_mean: Option<f32>,
     pub roi: Option<NormRect>,
 }
 
@@ -343,6 +1198,176 @@ pub struct SuitPassInput<'a> {
     pub region: f32,
 }
 
+/// Static PF90033 fields carried by the exported suit preset. Runtime pixels,
+/// UVs and weights live in [`SuitPassSameJobInputs`].
+#[derive(Clone, Copy, Debug)]
+pub struct SuitPassPlan<'a> {
+    pub order: u32,
+    pub effect: &'a str,
+    pub degree: Option<f32>,
+    pub opacity: Option<f32>,
+    pub filter_type: Option<u32>,
+    pub material_path: Option<&'a str>,
+    pub mask_field: Option<&'a str>,
+    pub mask_value: Option<u32>,
+    pub shelter_type: Option<i32>,
+    pub force_use_shelter: Option<bool>,
+    /// Geometry metadata only. This field never becomes the region weight.
+    pub region_rect: Option<[i32; 4]>,
+    pub mix_color: Option<[u8; 4]>,
+}
+
+/// Inputs that must come from the same renderer job as the output frame.
+#[derive(Clone, Copy, Debug)]
+pub struct SuitPassSameJobInputs<'a> {
+    pub mask: Option<&'a Image>,
+    pub mask_uv: Option<&'a [[f32; 2]]>,
+    pub material: Option<&'a Image>,
+    pub material_uv: Option<&'a [[f32; 2]]>,
+    pub shelter: Option<f32>,
+    pub region: Option<f32>,
+}
+
+fn suit_mask_channel(field: &str, value: u32) -> Result<MakeupMaskChannel, Refusal> {
+    match (field, value) {
+        ("BlusherMaskType", 15) => Ok(MakeupMaskChannel::Rgba),
+        ("EyeBrowMaskType", 5) => Ok(MakeupMaskChannel::RB),
+        ("EyeMaskType", 10) => Ok(MakeupMaskChannel::Rgb),
+        ("EyeMaskType", 4) | ("EyeLashMaskType", 4) => Ok(MakeupMaskChannel::RG),
+        ("LipMaskType", 3) => Ok(MakeupMaskChannel::R),
+        _ => Err(Refusal::MissingInput("suit mask channel")),
+    }
+}
+
+fn validate_suit_uv(
+    uv: &[[f32; 2]],
+    pixel_count: usize,
+    name: &'static str,
+) -> Result<(), Refusal> {
+    if uv.len() != pixel_count {
+        return Err(Refusal::ShapeMismatch(name));
+    }
+    if !uv
+        .iter()
+        .all(|point| point[0].is_finite() && point[1].is_finite())
+    {
+        return Err(Refusal::ValueOutOfRange(name));
+    }
+    Ok(())
+}
+
+fn suit_weight(value: Option<f32>, name: &'static str) -> Result<f32, Refusal> {
+    let value = required(value, name)?;
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(Refusal::ValueOutOfRange(name));
+    }
+    Ok(value)
+}
+
+/// Converts one static pass plus same-job data into the existing stage input.
+/// Missing runtime data is refused by name rather than defaulted.
+pub fn produce_suit_pass<'a>(
+    pixel_count: usize,
+    plan: &SuitPassPlan<'_>,
+    inputs: SuitPassSameJobInputs<'a>,
+) -> Result<SuitPassInput<'a>, Refusal> {
+    let mask = required(inputs.mask, "suit mask")?;
+    mask.validate()?;
+    let mask_uv = required(inputs.mask_uv, "suit mask uv")?;
+    validate_suit_uv(mask_uv, pixel_count, "suit mask uv")?;
+
+    let (mask_field, mask_value) = match (plan.mask_field, plan.mask_value) {
+        (Some(field), Some(value)) => (field, value),
+        (None, None) => return Err(Refusal::MissingInput("suit mask spec")),
+        _ => return Err(Refusal::ShapeMismatch("suit mask spec")),
+    };
+    let mask_channel = suit_mask_channel(mask_field, mask_value)?;
+
+    let degree = required(plan.degree, "suit degree")?;
+    if !degree.is_finite() || !(0.0..=100.0).contains(&degree) {
+        return Err(Refusal::ValueOutOfRange("suit degree"));
+    }
+    let opacity = required(plan.opacity, "suit opacity")?;
+    if !opacity.is_finite() || !(0.0..=100.0).contains(&opacity) {
+        return Err(Refusal::ValueOutOfRange("suit opacity"));
+    }
+    let filter_type = required(plan.filter_type, "suit filter type")?;
+    let mix_color = required(plan.mix_color, "suit mix color")?;
+    let layer = MakeupLayer {
+        mix_color,
+        opacity_percent: opacity,
+        degree01: degree / 100.0,
+        filter_type,
+        mask_channel,
+    };
+
+    let kind = match plan.effect {
+        "BlusherImageMakeup"
+        | "NormalEyeBrowImageMakeup"
+        | "SymEyeImageMakeup"
+        | "SymEyeLashImageMakeup"
+        | "LipStickImageMakeup" => {
+            required(plan.material_path, "suit material path")?;
+            let material = required(inputs.material, "suit material")?;
+            material.validate()?;
+            let material_uv = required(inputs.material_uv, "suit material uv")?;
+            validate_suit_uv(material_uv, pixel_count, "suit material uv")?;
+            SuitPassKindInput::Image {
+                material: Some(material),
+                material_uv: Some(material_uv),
+            }
+        }
+        "LipColor" => SuitPassKindInput::Color,
+        _ => SuitPassKindInput::Unavailable("suit pass effect"),
+    };
+
+    let skip_shelter_query = plan.force_use_shelter == Some(true)
+        || (plan.shelter_type.is_some() && plan.mask_field.is_none());
+    let shelter = if skip_shelter_query {
+        1.0
+    } else {
+        suit_weight(inputs.shelter, "suit shelter")?
+    };
+    let region = suit_weight(inputs.region, "suit region")?;
+
+    Ok(SuitPassInput {
+        kind,
+        mask: Some(mask),
+        mask_uv: Some(mask_uv),
+        layer: Some(layer),
+        shelter,
+        region,
+    })
+}
+
+/// Fail-fast 12-pass adapter. Plan and same-job arrays are positional and
+/// ordered; the returned slice is accepted directly by `PortraitJobInputs`.
+pub fn produce_suit_passes<'a>(
+    pixel_count: usize,
+    plans: Option<&[SuitPassPlan<'_>]>,
+    inputs: Option<&'a [SuitPassSameJobInputs<'a>]>,
+) -> Result<Vec<SuitPassInput<'a>>, Refusal> {
+    let plans = required(plans, "suit passes")?;
+    let inputs = required(inputs, "suit job inputs")?;
+    if plans.is_empty() {
+        return Err(Refusal::MissingInput("suit passes"));
+    }
+    if plans.len() != inputs.len() {
+        return Err(Refusal::ShapeMismatch("suit passes"));
+    }
+    plans
+        .iter()
+        .zip(inputs)
+        .enumerate()
+        .map(|(index, (plan, inputs))| {
+            if plan.order != index as u32 + 1 {
+                return Err(Refusal::ValueOutOfRange("suit pass order"));
+            }
+            produce_suit_pass(pixel_count, plan, *inputs)
+        })
+        .collect()
+}
+
 /// One recovered makeup PF. `pc:<pf>` supplies `degree01`; every texture and
 /// UV stream stays owned by the same job that produced the frame.
 #[derive(Clone, Copy, Debug)]
@@ -353,8 +1378,51 @@ pub struct MakeupInput<'a> {
     pub filter_type: u32,
     pub material: Option<&'a Image>,
     pub material_uv: Option<&'a [[f32; 2]]>,
+    /// PF111 coverage; `material_uv[p]` is valid only when `writes[p] > 0`.
+    pub material_uv_writes: Option<&'a [u16]>,
     pub mask: Option<&'a Image>,
     pub mask_uv: Option<&'a [[f32; 2]]>,
+}
+
+/// PF30021 consumes explicit full-frame f32 source/filter/mask planes. The
+/// current RGBA8 stage is used only to preserve alpha in the final byte store.
+#[derive(Clone, Copy, Debug)]
+pub struct HlfFaceInputs<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub source_rgb_full_f32: &'a [f32],
+    pub median_rgb_full_f32: &'a [f32],
+    pub gauss_rgb_full_f32: &'a [f32],
+    pub face_mask_full_f32: &'a [f32],
+    pub skin_mask_full_f32: &'a [f32],
+    pub roi: Roi,
+}
+
+/// PF30022 keeps the current RGBA8 frame as source and requires full-frame
+/// f32 median/gauss/mask planes. Only RGB inside `roi` is replaced.
+#[derive(Clone, Copy, Debug)]
+pub struct HlfBodyInputs<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub median_rgb_full_f32: &'a [f32],
+    pub gauss_rgb_full_f32: &'a [f32],
+    pub face_mask_rgba_full_f32: &'a [f32],
+    pub skin_mask_full_f32: &'a [f32],
+    pub roi: Roi,
+    pub uniforms: BodyHlfUniforms,
+    pub adjust_lut: Option<AdjustLut<'a>>,
+}
+
+/// PF21025/21069/21070/21071 share one full-frame wrinkle bundle. `base`,
+/// `residual`, masks and ROI all come from the same renderer job.
+#[derive(Clone, Copy, Debug)]
+pub struct WrinkleInputs<'a> {
+    pub base_full: &'a Image,
+    pub residual_full: &'a Image,
+    pub mask_rgba_full: &'a [u8],
+    pub skin_mask_full: &'a [u8],
+    pub roi: Roi,
+    pub uniforms: WrinkleUniforms,
 }
 
 /// PF90021 same-job inputs. The host selects one direction; both LUTs remain
@@ -368,8 +1436,199 @@ pub struct Pf90021Inputs<'a> {
     pub runtime: Option<Pf90021RuntimeScalars>,
 }
 
-/// Where a job's inputs came from. Only a renderer job proves that absent
-/// fields are absent in the same job, rather than unavailable at this entry.
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
+
+fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
+}
+
+fn fnv_usize(hash: u64, value: usize) -> u64 {
+    fnv1a64(hash, &(value as u64).to_le_bytes())
+}
+
+fn fnv_u64(hash: u64, value: u64) -> u64 {
+    fnv1a64(hash, &value.to_le_bytes())
+}
+
+fn fnv_option_bytes(hash: u64, bytes: Option<&[u8]>) -> u64 {
+    match bytes {
+        None => fnv_u64(hash, 0),
+        Some(bytes) => {
+            let hash = fnv_u64(hash, 1);
+            fnv1a64(fnv_usize(hash, bytes.len()), bytes)
+        }
+    }
+}
+
+fn fnv_option_f32_plane(hash: u64, values: Option<&[f32]>) -> u64 {
+    match values {
+        None => fnv_u64(hash, 0),
+        Some(values) => {
+            let mut hash = fnv_usize(fnv_u64(hash, 1), values.len());
+            for value in values {
+                hash = fnv_u64(hash, value.to_bits() as u64);
+            }
+            hash
+        }
+    }
+}
+
+fn fnv_option_f32(hash: u64, value: Option<f32>) -> u64 {
+    match value {
+        None => fnv_u64(hash, 0),
+        Some(value) => fnv_u64(fnv_u64(hash, 1), value.to_bits() as u64),
+    }
+}
+
+/// Producer-supplied fingerprint for one immutable portrait input bundle.
+///
+/// The fingerprint binds the pre-effect RGBA8 frame, dimensions, normalized
+/// region, the complete parameter table and all four mask planes. A receipt has
+/// no public constructor with a caller-chosen id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortraitJobReceipt {
+    fingerprint: u64,
+    width: u32,
+    height: u32,
+    frame_len: usize,
+    region_bits: [u32; 4],
+    mask_width: usize,
+    mask_height: usize,
+    plane_lengths: [Option<usize>; 4],
+}
+
+impl PortraitJobReceipt {
+    /// Builds a receipt from the current renderer inputs before portrait effects.
+    pub fn from_renderer_receipt(
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        region: NormRect,
+        params: &BTreeMap<String, f32>,
+        masks: &PortraitMasks,
+    ) -> Self {
+        let region_bits = [
+            region.x.to_bits(),
+            region.y.to_bits(),
+            region.width.to_bits(),
+            region.height.to_bits(),
+        ];
+        let planes = [&masks.skin, &masks.hair, &masks.face, &masks.body];
+        let plane_lengths = [
+            masks.skin.as_ref().map(Vec::len),
+            masks.hair.as_ref().map(Vec::len),
+            masks.face.as_ref().map(Vec::len),
+            masks.body.as_ref().map(Vec::len),
+        ];
+
+        let mut fingerprint = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
+        fingerprint = fnv_usize(fingerprint, frame.len());
+        fingerprint = fnv1a64(fingerprint, frame);
+        fingerprint = fnv_u64(fingerprint, width as u64);
+        fingerprint = fnv_u64(fingerprint, height as u64);
+        for bits in region_bits {
+            fingerprint = fnv_u64(fingerprint, bits as u64);
+        }
+        fingerprint = fnv_usize(fingerprint, params.len());
+        for (key, value) in params {
+            fingerprint = fnv_usize(fingerprint, key.len());
+            fingerprint = fnv1a64(fingerprint, key.as_bytes());
+            fingerprint = fnv_u64(fingerprint, value.to_bits() as u64);
+        }
+        fingerprint = fnv_usize(fingerprint, masks.width);
+        fingerprint = fnv_usize(fingerprint, masks.height);
+        for (index, plane) in planes.into_iter().enumerate() {
+            fingerprint = fnv_u64(fingerprint, index as u64);
+            fingerprint = fnv_u64(fingerprint, plane_lengths[index].unwrap_or(usize::MAX) as u64);
+            if let Some(plane) = plane {
+                for value in plane {
+                    fingerprint = fnv_u64(fingerprint, value.to_bits() as u64);
+                }
+            }
+        }
+
+        Self {
+            fingerprint,
+            width,
+            height,
+            frame_len: frame.len(),
+            region_bits,
+            mask_width: masks.width,
+            mask_height: masks.height,
+            plane_lengths,
+        }
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+
+    pub fn job_id(&self) -> u64 {
+        self.fingerprint
+    }
+
+    fn refusal(
+        &self,
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        region: NormRect,
+        params: &BTreeMap<String, f32>,
+        masks: &PortraitMasks,
+    ) -> Option<Refusal> {
+        let expected_frame_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if Some(self.frame_len) != expected_frame_len
+            || frame.len() != self.frame_len
+            || self.width != width
+            || self.height != height
+            || self.region_bits
+                != [
+                    region.x.to_bits(),
+                    region.y.to_bits(),
+                    region.width.to_bits(),
+                    region.height.to_bits(),
+                ]
+        {
+            return Some(Refusal::ShapeMismatch("PortraitJobReceipt frame/region"));
+        }
+
+        let expected_plane_len = masks.width.checked_mul(masks.height);
+        if self.mask_width != masks.width
+            || self.mask_height != masks.height
+            || self.plane_lengths
+                != [
+                    masks.skin.as_ref().map(Vec::len),
+                    masks.hair.as_ref().map(Vec::len),
+                    masks.face.as_ref().map(Vec::len),
+                    masks.body.as_ref().map(Vec::len),
+                ]
+        {
+            return Some(Refusal::ShapeMismatch("PortraitJobReceipt masks"));
+        }
+        for plane in [&masks.skin, &masks.hair, &masks.face, &masks.body] {
+            if plane
+                .as_ref()
+                .is_some_and(|plane| Some(plane.len()) != expected_plane_len)
+            {
+                return Some(Refusal::ShapeMismatch("PortraitJobReceipt mask plane"));
+            }
+        }
+
+        let actual = Self::from_renderer_receipt(frame, width, height, region, params, masks);
+        (actual.fingerprint != self.fingerprint)
+            .then_some(Refusal::ValueOutOfRange("PortraitJobReceipt digest"))
+    }
+}
+
+/// Where a job's inputs came from. Only a renderer receipt or test-only
+/// renderer job proves that absent fields are absent in the same job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortraitJobInputOrigin {
     MasksOnly,
@@ -379,10 +1638,13 @@ pub enum PortraitJobInputOrigin {
 /// Backend input container for effects whose producer is outside this stage.
 pub struct PortraitJobInputs<'a> {
     pub origin: PortraitJobInputOrigin,
+    pub receipt: Option<PortraitJobReceipt>,
     pub masks: &'a PortraitMasks,
     pub assets: PortraitAssetInputs<'a>,
     pub teeth: Option<TeethInputs<'a>>,
+    pub pf30025: Option<Pf30025Inputs<'a>>,
     pub teeth_alignment: Option<TeethAlignmentInputs<'a>>,
+    pub radiance: Option<RadianceInputs<'a>>,
     pub beard: Option<BeardInputs<'a>>,
     pub moisture_face: Option<MoistureFaceInputs<'a>>,
     pub moisture_body: Option<MoistureBodyInputs<'a>>,
@@ -393,6 +1655,9 @@ pub struct PortraitJobInputs<'a> {
     pub smile: SmileInputs<'a>,
     pub suit_passes: Option<&'a [SuitPassInput<'a>]>,
     pub makeup: Option<&'a [MakeupInput<'a>]>,
+    pub hlf_face: Option<HlfFaceInputs<'a>>,
+    pub hlf_body: Option<HlfBodyInputs<'a>>,
+    pub wrinkle: Option<WrinkleInputs<'a>>,
     pub pf90021: Option<Pf90021Inputs<'a>>,
 }
 
@@ -405,10 +1670,13 @@ impl<'a> PortraitJobInputs<'a> {
     pub fn masks_only(masks: &'a PortraitMasks) -> Self {
         Self {
             origin: PortraitJobInputOrigin::MasksOnly,
+            receipt: None,
             masks,
             assets: PortraitAssetInputs::default(),
             teeth: None,
+            pf30025: None,
             teeth_alignment: None,
+            radiance: None,
             beard: None,
             moisture_face: None,
             moisture_body: None,
@@ -419,12 +1687,15 @@ impl<'a> PortraitJobInputs<'a> {
             smile: SmileInputs::default(),
             suit_passes: None,
             makeup: None,
+            hlf_face: None,
+            hlf_body: None,
+            wrinkle: None,
             pf90021: None,
         }
     }
 
-    /// A renderer supplies every field from one job. Optional fields mean the
-    /// producer found no such input for this job, never a mask fallback.
+    /// Test-only legacy constructor with a caller-chosen label.
+    #[cfg(test)]
     pub fn from_renderer_job(job_id: u64, masks: &'a PortraitMasks) -> Self {
         Self {
             origin: PortraitJobInputOrigin::RendererJob { job_id },
@@ -432,7 +1703,94 @@ impl<'a> PortraitJobInputs<'a> {
         }
     }
 
+    /// Production entry: the job id is the producer receipt's input fingerprint.
+    pub fn from_renderer_receipt(
+        receipt: PortraitJobReceipt,
+        masks: &'a PortraitMasks,
+    ) -> Self {
+        Self {
+            origin: PortraitJobInputOrigin::RendererJob {
+                job_id: receipt.job_id(),
+            },
+            receipt: Some(receipt),
+            ..Self::masks_only(masks)
+        }
+    }
+
+    pub fn fill_from_producer_inputs(&mut self, producer: &'a ProducerInputs) {
+        if let Some(teeth) = producer.teeth.as_ref() {
+            self.teeth = Some(TeethInputs {
+                mask_g: &teeth.mask_g,
+                bright_ui: teeth.bright_ui,
+                deyellow_ui: teeth.deyellow_ui,
+            });
+            self.assets.teeth_whiten_lut = Some(&teeth.whiten_lut);
+            self.assets.teeth_bright_lut = Some(&teeth.bright_lut);
+        }
+        if let Some(stray_hair) = producer.stray_hair.as_ref() {
+            self.stray_hair = StrayHairInputs {
+                hairfly_v1: stray_hair.hairfly_v1.as_ref(),
+                raw_mask: stray_hair.raw_mask.as_deref(),
+                person_mask: stray_hair.person_mask.as_deref(),
+                background_mask: stray_hair.background_mask.as_deref(),
+                native_degree: stray_hair.native_degree,
+                native_person_area: stray_hair.native_person_area,
+                native_background_area: stray_hair.native_background_area,
+            };
+        }
+        if let Some(pf30025) = producer.pf30025.as_ref() {
+            self.pf30025 = Some(Pf30025Inputs {
+                repair_780929437_bgra: &pf30025.repair_780929437_bgra,
+                gate_3204548346: pf30025.gate_3204548346.as_deref(),
+                teeth_mask: &pf30025.teeth_mask,
+                roi: pf30025.roi,
+            });
+        }
+        if let Some(alignment) = producer.teeth_alignment.as_ref() {
+            self.teeth_alignment = Some(TeethAlignmentInputs {
+                effect_rgb: alignment.effect_rgb.as_ref(),
+                teeth_mask: alignment.teeth_mask.as_deref(),
+                edge_plane_a: alignment.edge_plane_a.as_deref(),
+                edge_plane_b: alignment.edge_plane_b.as_deref(),
+                roi: alignment.roi,
+            });
+        }
+        if let Some(pf90021) = producer.pf90021.as_ref() {
+            self.pf90021 = Some(Pf90021Inputs {
+                direction: pf90021.direction,
+                positive_lut: Some(&pf90021.positive_lut),
+                negative_lut: Some(&pf90021.negative_lut),
+                mask_r: Some(&pf90021.mask_r),
+                runtime: Some(pf90021.runtime),
+            });
+        }
+        if let Some(pf90004) = producer.pf90004.as_ref() {
+            self.radiance = Some(RadianceInputs {
+                frame_width: Some(pf90004.width),
+                frame_height: Some(pf90004.height),
+                skin_mask: Some(&pf90004.skin_mask),
+                parsing_rgba: Some(&pf90004.parsing_rgba),
+                face_rgba: Some(&pf90004.face_rgba),
+                value_mean: Some(pf90004.value_mean),
+                roi: Some(pf90004.roi),
+            });
+        }
+        if let (Some(body), Some(lut)) = (
+            self.hlf_body.as_mut(),
+            producer.hlf_body_adjust_lut.as_ref(),
+        ) {
+            body.adjust_lut = Some(AdjustLut {
+                width: lut.width,
+                height: lut.height,
+                luma: &lut.luma,
+            });
+        }
+    }
+
     pub fn job_id(&self) -> Option<u64> {
+        if let Some(receipt) = self.receipt {
+            return Some(receipt.job_id());
+        }
         match self.origin {
             PortraitJobInputOrigin::MasksOnly => None,
             PortraitJobInputOrigin::RendererJob { job_id } => Some(job_id),
@@ -461,7 +1819,12 @@ fn sample_plane(plane: &[f32], width: usize, height: usize, x: f32, y: f32) -> f
 /// Effects that can run from the frame, a mask and bundled LUT bytes today.
 const SUPPORTED_EFFECTS: &[u32] = &[
     108,    // Teeth whitening
+    30025,  // Tooth repair
     30026,  // Teeth alignment final blend
+    21025,  // Puppet wrinkle
+    21069,  // Cheek wrinkle
+    21070,  // Nose-back wrinkle
+    21071,  // Perioral wrinkle
     8068,   // Skin gloss
     8069,   // Skin texture (negative surface-blur branch)
     8070,   // Skin clarity
@@ -479,6 +1842,8 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     90139,  // Hair smooth
     90160,  // Hair gloss
     90088,  // Stray hair removal
+    30021,  // High-low frequency face
+    30022,  // High-low frequency body
     100007, // Open-mouth smile
     100,    // Eyebrow color makeup, left
     103,    // Upper eyeliner color makeup
@@ -580,14 +1945,43 @@ pub fn apply_portrait_effects_with_report_and_inputs(
     extra: &BTreeMap<String, f32>,
     inputs: &PortraitJobInputs<'_>,
 ) -> PortraitRunReport {
+    apply_portrait_effects_with_report_and_inputs_policy(
+        portrait,
+        width,
+        height,
+        region,
+        extra,
+        inputs,
+        cfg!(not(test)),
+    )
+}
+
+fn apply_portrait_effects_with_report_and_inputs_policy(
+    portrait: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    region: NormRect,
+    extra: &BTreeMap<String, f32>,
+    inputs: &PortraitJobInputs<'_>,
+    require_renderer_receipt: bool,
+) -> PortraitRunReport {
     let mut report = PortraitRunReport {
         job_id: inputs.job_id(),
         effects: Vec::new(),
     };
-    let Some(source) = Image::new(width, height, std::mem::take(portrait)) else {
-        return report;
+    let missing_renderer_receipt = require_renderer_receipt
+        && inputs.receipt.is_none()
+        && matches!(
+            inputs.origin,
+            PortraitJobInputOrigin::RendererJob { .. }
+        );
+    let receipt_refusal = if missing_renderer_receipt {
+        Some(Refusal::MissingInput("renderer receipt"))
+    } else {
+        inputs.receipt.as_ref().and_then(|receipt| {
+            receipt.refusal(portrait, width, height, region, extra, inputs.masks)
+        })
     };
-
     let mut effects: Vec<(u32, f32)> = extra
         .iter()
         .filter_map(|(key, value)| {
@@ -596,6 +1990,32 @@ pub fn apply_portrait_effects_with_report_and_inputs(
         })
         .collect();
     effects.sort_by_key(|&(pf, _)| pf);
+
+    if let Some(refusal) = receipt_refusal {
+        for &(pf, _) in &effects {
+            let Some(meta) = aurora_portrait::lookup(pf) else {
+                continue;
+            };
+            if meta.access != Access::Cpu || !SUPPORTED_EFFECTS.contains(&pf) {
+                continue;
+            }
+            report.effects.push(PortraitEffectRun {
+                pf,
+                backend: PortraitBackend::Skipped,
+                dispatches: Vec::new(),
+                fallback_reason: Some(format!("receipt refused: {refusal:?}")),
+                skipped: true,
+                executed: false,
+                refusal: Some(refusal.clone()),
+                skip_reason: Some(PortraitSkipReason::InputRefused(refusal.clone())),
+            });
+        }
+        return report;
+    }
+
+    let Some(source) = Image::new(width, height, std::mem::take(portrait)) else {
+        return report;
+    };
 
     let mut current = source;
     // Keep the main-session optimization: skin effects share one sampled plane.
@@ -656,8 +2076,57 @@ pub fn apply_portrait_effects_with_report_and_inputs(
             report.effects.push(suit_run);
             continue;
         }
+        let needs_hlf_auto = (pf == 30021 && inputs.hlf_face.is_none())
+            || (pf == 30022 && inputs.hlf_body.is_none());
+        #[cfg(windows)]
+        if needs_hlf_auto {
+            if let Some((next, dispatches)) =
+                try_cuda_hlf_auto(&current, pf, degree, region, inputs.masks)
+            {
+                current = next;
+                run.backend = PortraitBackend::Cuda;
+                run.dispatches = dispatches;
+                run.skipped = false;
+                run.executed = true;
+                report.effects.push(run);
+                continue;
+            }
+        }
+        let hlf_auto = if needs_hlf_auto {
+            match produce_hlf_auto(
+                &current,
+                region,
+                inputs.masks,
+                HlfAutoProducerOptions::default(),
+            ) {
+                Ok(auto) => Some(auto),
+                Err(refusal) => {
+                    run.backend = PortraitBackend::Skipped;
+                    run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                    run.refusal = Some(refusal.clone());
+                    run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal));
+                    report.effects.push(run);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(auto) = hlf_auto.as_ref() {
+            if let Some(reason) = auto.preprocess_fallback.as_ref() {
+                run.fallback_reason = Some(format!("HLF preprocessing CPU fallback: {reason}"));
+            }
+        }
         if let Err(refusal) =
-            validate_effect_inputs(pf, &current, extra, skin_mask.as_deref(), inputs)
+            validate_effect_inputs(
+                pf,
+                &current,
+                region,
+                extra,
+                skin_mask.as_deref(),
+                inputs,
+                hlf_auto.as_ref(),
+            )
         {
             run.fallback_reason = Some(format!("input refused: {refusal:?}"));
             run.refusal = Some(refusal);
@@ -665,42 +2134,41 @@ pub fn apply_portrait_effects_with_report_and_inputs(
             continue;
         }
         #[cfg(windows)]
-        let cuda_result = try_cuda_effect(&current, pf, degree, skin_mask.as_deref())
-            .or_else(|| try_cuda_same_job_effect(&current, pf, degree, inputs));
+        let cuda_result =
+            try_cuda_effect(&current, pf, degree, skin_mask.as_deref()).or_else(|| {
+                try_cuda_same_job_effect(&current, pf, degree, inputs, hlf_auto.as_ref())
+            });
         #[cfg(windows)]
         if let Some(result) = cuda_result {
             match result {
                 Ok((next, dispatches)) if !dispatches.is_empty() => {
                     current = next;
                     run.backend = PortraitBackend::Cuda;
-                    run.dispatches = dispatches;
-                    run.skipped = false;
-                    run.executed = true;
-                    report.effects.push(run);
-                    continue;
-                }
-                Ok((next, _)) if matches!(pf, 90088 | 90139 | 90160) => {
-                    current = next;
+                    if let Some(auto) = hlf_auto.as_ref() {
+                        run.dispatches = auto.preprocess_dispatches.clone();
+                        run.dispatches.extend(dispatches);
+                    } else {
+                        run.dispatches = dispatches;
+                    }
                     run.skipped = false;
                     run.executed = true;
                     report.effects.push(run);
                     continue;
                 }
                 Ok(_) => {
-                    run.fallback_reason = Some(
-                        "CUDA returned no dispatch; CPU kernel selected for parity".to_string(),
-                    );
-                }
-                Err(err) if matches!(pf, 90139 | 90160) => {
-                    run.refusal = Some(match &err {
-                        CudaError::Refused(refusal) => refusal.clone(),
-                        _ => Refusal::NotImplemented(pf),
+                    let reason = "CUDA returned no dispatch; CPU kernel selected for parity";
+                    run.fallback_reason = Some(match run.fallback_reason.take() {
+                        Some(previous) => format!("{previous}; {reason}"),
+                        None => reason.to_string(),
                     });
-                    run.fallback_reason = Some(format!("{err:?}"));
-                    report.effects.push(run);
-                    continue;
                 }
-                Err(err) => run.fallback_reason = Some(format!("{err:?}")),
+                Err(err) => {
+                    let reason = format!("{err:?}");
+                    run.fallback_reason = Some(match run.fallback_reason.take() {
+                        Some(previous) => format!("{previous}; CUDA effect: {reason}"),
+                        None => reason,
+                    });
+                }
             }
         }
         let result = apply_cpu_effect(
@@ -712,6 +2180,7 @@ pub fn apply_portrait_effects_with_report_and_inputs(
             width,
             height,
             inputs,
+            hlf_auto.as_ref(),
         );
         match result {
             Ok(next) => {
@@ -736,6 +2205,98 @@ pub fn apply_portrait_effects_with_report_and_inputs(
     report
 }
 
+/// Runs the PF8050/PF8051 six-stage candidate geometry path.
+pub fn apply_pf8050_pf8051_geometry(
+    inputs: Pf8050GeometryInputs<'_>,
+) -> PortraitGeometryRun {
+    let resolved = match cuda_pf8050::resolve(inputs) {
+        Ok(resolved) => resolved,
+        Err(refusal) => {
+            return PortraitGeometryRun {
+                backend: PortraitBackend::Skipped,
+                selection: Selection::Refused(DeviceRefusal::EffectUnsupported),
+                dispatches: Vec::new(),
+                fallback_reason: Some(format!("input refused: {refusal:?}")),
+                refusal: Some(refusal),
+                stages: Vec::new(),
+                candidate_only: true,
+            };
+        }
+    };
+
+    #[cfg(windows)]
+    let fallback_reason = {
+        let cuda_result = match forced_cuda_failure() {
+            Some(error) => Err(error),
+            None => match cuda_pf8050::Pf8050Stage::open() {
+                Ok(gpu) => gpu.apply(resolved),
+                Err(error) => Err(error),
+            },
+        };
+        match cuda_result {
+            Ok((output, dispatch)) if !dispatch.kernel.is_empty() => {
+                return PortraitGeometryRun {
+                    backend: PortraitBackend::Cuda,
+                    selection: Selection::Selected(DeviceBackend::Cuda),
+                    dispatches: vec![dispatch],
+                    fallback_reason: None,
+                    refusal: None,
+                    stages: output.stages,
+                    candidate_only: true,
+                };
+            }
+            Ok(_) => Some("CUDA returned no dispatch".to_string()),
+            Err(error) => Some(format!("{error:?}")),
+        }
+    };
+    #[cfg(not(windows))]
+    let fallback_reason = None;
+
+    let output = cuda_pf8050::apply_cpu(resolved);
+    PortraitGeometryRun {
+        backend: PortraitBackend::Cpu,
+        selection: Selection::Selected(DeviceBackend::Cpu),
+        dispatches: Vec::new(),
+        fallback_reason,
+        refusal: None,
+        stages: output.stages,
+        candidate_only: true,
+    }
+}
+
+/// Full product stage entry. Missing vendor receipts are typed refusals; a
+/// complete receipt set still reports the open raster consumer, never success.
+pub fn apply_pf8050_pf8051_stage(inputs: Pf8050StageInputs<'_>) -> PortraitGeometryRun {
+    if let Err(refusal) = require_pf8050_vendor_inputs(inputs.runtime) {
+        return PortraitGeometryRun {
+            backend: PortraitBackend::Skipped,
+            selection: Selection::Refused(DeviceRefusal::EffectUnsupported),
+            dispatches: Vec::new(),
+            fallback_reason: Some(format!("vendor input refused: {refusal:?}")),
+            refusal: Some(refusal),
+            stages: Vec::new(),
+            candidate_only: false,
+        };
+    }
+
+    let mut run = apply_pf8050_pf8051_geometry(inputs.geometry);
+    run.refusal = Some(Refusal::NotImplemented(8050));
+    run.fallback_reason = Some(
+        "vendor VBO/FBO/readback consumer is not wired; candidate geometry only".to_string(),
+    );
+    run
+}
+
+fn require_pf8050_vendor_inputs(runtime: Pf8050VendorRuntime<'_>) -> Result<(), Refusal> {
+    required(runtime.attach, "PF8050_ATTACH")?;
+    required(runtime.vec3, "PF8050_VEC3")?;
+    required(runtime.roi, "PF8050_ROI")?;
+    required(runtime.vbo, "PF8050_VBO")?;
+    required(runtime.fbo, "PF8050_FBO")?;
+    required(runtime.readback, "PF8050_READBACK")?;
+    Ok(())
+}
+
 fn required<T>(value: Option<T>, name: &'static str) -> Result<T, Refusal> {
     value.ok_or(Refusal::MissingInput(name))
 }
@@ -745,6 +2306,15 @@ fn check_plane(len: usize, expected: usize, name: &'static str) -> Result<(), Re
         Ok(())
     } else {
         Err(Refusal::ShapeMismatch(name))
+    }
+}
+
+fn check_f32_plane(plane: &[f32], expected: usize, name: &'static str) -> Result<(), Refusal> {
+    check_plane(plane.len(), expected, name)?;
+    if plane.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(Refusal::ValueOutOfRange(name))
     }
 }
 
@@ -775,6 +2345,102 @@ fn check_roi(width: u32, height: u32, roi: (u32, u32, u32, u32)) -> Result<(), R
     } else {
         Ok(())
     }
+}
+
+fn check_skin_roi(width: u32, height: u32, roi: Roi) -> Result<(), Refusal> {
+    check_roi(width, height, (roi.x, roi.y, roi.width, roi.height))
+}
+
+fn validate_hlf_face(current: &Image, input: HlfFaceInputs<'_>) -> Result<(), Refusal> {
+    if (input.width, input.height) != (current.width, current.height) {
+        return Err(Refusal::ShapeMismatch("PF30021_HLF frame"));
+    }
+    check_skin_roi(current.width, current.height, input.roi)?;
+    let pixels = current.pixel_count();
+    check_f32_plane(
+        input.source_rgb_full_f32,
+        pixels * 3,
+        "PF30021_source_rgb_full_f32",
+    )?;
+    check_f32_plane(input.median_rgb_full_f32, pixels * 3, "median_rgb_full_f32")?;
+    check_f32_plane(input.gauss_rgb_full_f32, pixels * 3, "gauss_rgb_full_f32")?;
+    check_f32_plane(input.face_mask_full_f32, pixels, "face_mask_full_f32")?;
+    check_f32_plane(input.skin_mask_full_f32, pixels, "skin_mask_full_f32")
+}
+
+fn validate_hlf_body(current: &Image, input: HlfBodyInputs<'_>) -> Result<(), Refusal> {
+    if (input.width, input.height) != (current.width, current.height) {
+        return Err(Refusal::ShapeMismatch("PF30022_HLF frame"));
+    }
+    check_skin_roi(current.width, current.height, input.roi)?;
+    let pixels = current.pixel_count();
+    check_f32_plane(input.median_rgb_full_f32, pixels * 3, "median_rgb_full_f32")?;
+    check_f32_plane(input.gauss_rgb_full_f32, pixels * 3, "gauss_rgb_full_f32")?;
+    check_f32_plane(
+        input.face_mask_rgba_full_f32,
+        pixels * 4,
+        "face_mask_rgba_full_f32",
+    )?;
+    check_f32_plane(input.skin_mask_full_f32, pixels, "skin_mask_full_f32")?;
+    let uniforms = [
+        input.uniforms.spotless_degree,
+        input.uniforms.retouch_degree,
+        input.uniforms.spotless_acne_threshold,
+        input.uniforms.spotless_high_freq_factor,
+        input.uniforms.spotless_low_freq_alpha,
+        input.uniforms.retouch_high_freq_factor,
+        input.uniforms.diff_min_range,
+        input.uniforms.diff_max_range,
+    ];
+    if !uniforms.iter().all(|value| value.is_finite())
+        || input.uniforms.diff_min_range > input.uniforms.diff_max_range
+    {
+        return Err(Refusal::ValueOutOfRange("PF30022_HLF uniforms"));
+    }
+    if let Some(lut) = input.adjust_lut.as_ref() {
+        lut.validate()?;
+    } else if input.uniforms.spotless_degree > 0.0 {
+        return Err(Refusal::MissingInput("adjust_lut"));
+    }
+    Ok(())
+}
+
+fn validate_wrinkle(current: &Image, input: WrinkleInputs<'_>) -> Result<(), Refusal> {
+    input.base_full.validate()?;
+    input.residual_full.validate()?;
+    if (input.base_full.width, input.base_full.height) != (current.width, current.height) {
+        return Err(Refusal::ShapeMismatch("wrinkle_base_full"));
+    }
+    if (input.residual_full.width, input.residual_full.height) != (current.width, current.height) {
+        return Err(Refusal::ShapeMismatch("wrinkle_residual_full"));
+    }
+    let pixels = current.pixel_count();
+    check_plane(
+        input.mask_rgba_full.len(),
+        pixels * 4,
+        "wrinkle_mask_rgba_full",
+    )?;
+    check_plane(input.skin_mask_full.len(), pixels, "wrinkle_skin_mask_full")?;
+    check_skin_roi(current.width, current.height, input.roi)?;
+    let uniforms = [
+        input.uniforms.legal_alpha,
+        input.uniforms.dark_circle_alpha,
+        input.uniforms.diff_factor,
+        input.uniforms.diff_factor2,
+        input.uniforms.color_threshold_factor,
+        input.uniforms.mix_alpha,
+        input.uniforms.diff_min_threshold,
+        input.uniforms.diff_max_threshold,
+        input.uniforms.high_freq_min_threshold,
+        input.uniforms.high_freq_max_threshold,
+    ];
+    if !uniforms.iter().all(|value| value.is_finite())
+        || input.uniforms.diff_min_threshold > input.uniforms.diff_max_threshold
+        || input.uniforms.high_freq_min_threshold > input.uniforms.high_freq_max_threshold
+    {
+        return Err(Refusal::ValueOutOfRange("wrinkle_uniforms"));
+    }
+    Ok(())
 }
 
 fn check_norm_rect(rect: NormRect, name: &'static str) -> Result<(), Refusal> {
@@ -883,16 +2549,15 @@ fn apply_pf90021_stage(
     {
         let result = match forced_cuda_failure() {
             Some(error) => Err(error),
-            None => match aurora_portrait::cuda_pf90021::Pf90021::open() {
-                Ok(gpu) => gpu.run(aurora_portrait::cuda_pf90021::Request {
+            None => with_pf90021(|gpu| {
+                gpu.run(aurora_portrait::cuda_pf90021::Request {
                     source: current,
                     direction,
                     lut: Some(lut),
                     mask_r: Some(mask_r),
                     runtime: Some(runtime),
-                }),
-                Err(error) => Err(error),
-            },
+                })
+            }),
         };
         match result {
             Ok(aurora_portrait::cuda_pf90021::Run::Executed { output, dispatch }) => {
@@ -961,6 +2626,44 @@ fn apply_pf90021_stage(
     }
 }
 
+#[cfg(windows)]
+thread_local! {
+    static PF90021: RefCell<Option<aurora_portrait::cuda_pf90021::Pf90021>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(windows)]
+fn with_pf90021<T>(
+    run: impl FnOnce(&aurora_portrait::cuda_pf90021::Pf90021) -> Result<T, CudaError>,
+) -> Result<T, CudaError> {
+    PF90021.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(aurora_portrait::cuda_pf90021::Pf90021::open()?);
+        } else if let Err(error) = slot.as_mut().expect("PF90021 session").resume() {
+            *slot = None;
+            return Err(error);
+        }
+        let result = run(slot.as_ref().expect("PF90021 session"));
+        if result.is_err() {
+            let _ = slot.as_mut().expect("PF90021 session").suspend();
+            *slot = None;
+            return result;
+        }
+        match slot.as_mut().expect("PF90021 session").suspend() {
+            Ok(()) => result,
+            Err(error) => {
+                *slot = None;
+                if result.is_ok() {
+                    Err(error)
+                } else {
+                    result
+                }
+            }
+        }
+    })
+}
+
 fn pf30026_skipped(
     reason: PortraitSkipReason,
     detail: String,
@@ -975,6 +2678,43 @@ fn pf30026_skipped(
         executed: false,
         refusal,
         skip_reason: Some(reason),
+    }
+}
+
+fn pf30026_cpu_fallback(
+    job: AlignmentFinalBlendJob<'_>,
+    cuda_reason: String,
+) -> (Option<Image>, PortraitEffectRun) {
+    match aurora_portrait::kernels::teeth_blend::apply_alignment_final_blend(job) {
+        Ok(AlignmentFinalBlendOutcome::Applied(image)) => (
+            Some(image),
+            PortraitEffectRun {
+                pf: 30026,
+                backend: PortraitBackend::Cpu,
+                dispatches: Vec::new(),
+                fallback_reason: Some(cuda_reason),
+                skipped: false,
+                executed: true,
+                refusal: None,
+                skip_reason: None,
+            },
+        ),
+        Ok(AlignmentFinalBlendOutcome::Gated) => (
+            None,
+            pf30026_skipped(
+                PortraitSkipReason::EdgeGateClosed,
+                format!("{cuda_reason}; CPU edge gate closed"),
+                None,
+            ),
+        ),
+        Err(error) => (
+            None,
+            pf30026_skipped(
+                PortraitSkipReason::InputRefused(error.clone()),
+                format!("{cuda_reason}; CPU: {error:?}"),
+                Some(error),
+            ),
+        ),
     }
 }
 
@@ -1051,33 +2791,17 @@ fn apply_pf30026_stage<'a>(
     #[cfg(windows)]
     {
         if let Some(error) = forced_cuda_failure() {
-            return (
-                None,
-                pf30026_skipped(
-                    PortraitSkipReason::Cuda(error.clone()),
-                    format!("CUDA unavailable: {error:?}"),
-                    None,
-                ),
-            );
+            return pf30026_cpu_fallback(job, format!("CUDA unavailable: {error:?}"));
         }
         let gpu = match aurora_portrait::cuda_teeth_blend::TeethBlend::open() {
             Ok(gpu) => gpu,
-            Err(error) => {
-                return (
-                    None,
-                    pf30026_skipped(
-                        PortraitSkipReason::Cuda(error.clone()),
-                        format!("CUDA unavailable: {error:?}"),
-                        None,
-                    ),
-                );
-            }
+            Err(error) => return pf30026_cpu_fallback(job, format!("CUDA unavailable: {error:?}")),
         };
         match gpu.apply_alignment_final_blend(job) {
             Ok(aurora_portrait::cuda_teeth_blend::AlignmentFinalBlendGpu::Applied {
                 image,
                 dispatches,
-            }) => (
+            }) if !dispatches.is_empty() => (
                 Some(image),
                 PortraitEffectRun {
                     pf: 30026,
@@ -1090,6 +2814,12 @@ fn apply_pf30026_stage<'a>(
                     skip_reason: None,
                 },
             ),
+            Ok(aurora_portrait::cuda_teeth_blend::AlignmentFinalBlendGpu::Applied { .. }) => {
+                pf30026_cpu_fallback(
+                    job,
+                    "CUDA returned no dispatch; CPU kernel selected for parity".to_string(),
+                )
+            }
             Ok(aurora_portrait::cuda_teeth_blend::AlignmentFinalBlendGpu::Gated) => (
                 None,
                 pf30026_skipped(
@@ -1098,28 +2828,14 @@ fn apply_pf30026_stage<'a>(
                     None,
                 ),
             ),
-            Err(error) => (
-                None,
-                pf30026_skipped(
-                    PortraitSkipReason::Cuda(error.clone()),
-                    format!("CUDA failed: {error:?}"),
-                    None,
-                ),
-            ),
+            Err(error) => pf30026_cpu_fallback(job, format!("CUDA failed: {error:?}")),
         }
     }
 
     #[cfg(not(windows))]
     {
         let error = CudaError::Unavailable("PF30026 requires NVIDIA CUDA");
-        (
-            None,
-            pf30026_skipped(
-                PortraitSkipReason::Cuda(error.clone()),
-                format!("CUDA unavailable: {error:?}"),
-                None,
-            ),
-        )
+        pf30026_cpu_fallback(job, format!("CUDA unavailable: {error:?}"))
     }
 }
 
@@ -1284,7 +3000,11 @@ fn makeup_layer(
     })
 }
 
-fn validate_makeup_inputs(pf: u32, inputs: &PortraitJobInputs<'_>) -> Result<(), Refusal> {
+fn validate_makeup_inputs(
+    pf: u32,
+    pixels: usize,
+    inputs: &PortraitJobInputs<'_>,
+) -> Result<(), Refusal> {
     let (route, input) = find_makeup_input(pf, inputs)?;
     match route {
         MakeupRoute::Color { .. } => {
@@ -1293,7 +3013,10 @@ fn validate_makeup_inputs(pf: u32, inputs: &PortraitJobInputs<'_>) -> Result<(),
         }
         MakeupRoute::ImageUnmasked { .. } => {
             required(input.material, "makeup material")?.validate()?;
-            required(input.material_uv, "makeup material UV")?;
+            let material_uv = required(input.material_uv, "makeup material UV")?;
+            check_plane(material_uv.len(), pixels, "makeup material UV")?;
+            let writes = required(input.material_uv_writes, "makeup material UV writes")?;
+            check_plane(writes.len(), pixels, "makeup material UV writes")?;
             if input.mask.is_some() || input.mask_uv.is_some() {
                 return Err(Refusal::ValueOutOfRange("PF111 mask must be absent"));
             }
@@ -1302,17 +3025,78 @@ fn validate_makeup_inputs(pf: u32, inputs: &PortraitJobInputs<'_>) -> Result<(),
     Ok(())
 }
 
+struct ResolvedRadiance<'a> {
+    skin: &'a [u8],
+    parsing_rgba: &'a [u8],
+    face_rgba: &'a [u8],
+    value_mean: f32,
+}
+
+fn resolve_radiance_inputs<'a>(
+    current: &Image,
+    job: Option<RadianceInputs<'a>>,
+) -> Result<ResolvedRadiance<'a>, Refusal> {
+    let job = required(job, "PF90004_SAME_JOB_INPUTS")?;
+    let frame_width = required(job.frame_width, "PF90004_FRAME_WIDTH")?;
+    let frame_height = required(job.frame_height, "PF90004_FRAME_HEIGHT")?;
+    if frame_width != current.width || frame_height != current.height {
+        return Err(Refusal::ShapeMismatch("PF90004_FRAME_SIZE"));
+    }
+    let skin = required(job.skin_mask, "PF90004_SKIN_MASK")?;
+    let parsing_rgba = required(job.parsing_rgba, "PF90004_PARSING_RGBA")?;
+    let face_rgba = required(job.face_rgba, "PF90004_FACE_RGBA")?;
+    let value_mean = required(job.value_mean, "PF90004_VALUE_MEAN")?;
+    let roi = required(job.roi, "PF90004_ROI")?;
+    if roi != NormRect::FULL {
+        return Err(Refusal::ValueOutOfRange("PF90004_ROI"));
+    }
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "skin_mask")?;
+    check_plane(parsing_rgba.len(), pixels.saturating_mul(4), "parsing_rgba")?;
+    check_plane(face_rgba.len(), pixels.saturating_mul(4), "face_rgba")?;
+    if !value_mean.is_finite() || !(0.0..=255.0).contains(&value_mean) {
+        return Err(Refusal::ValueOutOfRange("PF90004_VALUE_MEAN"));
+    }
+    Ok(ResolvedRadiance {
+        skin,
+        parsing_rgba,
+        face_rgba,
+        value_mean,
+    })
+}
+
 fn validate_effect_inputs(
     pf: u32,
     current: &Image,
+    region: NormRect,
     extra: &BTreeMap<String, f32>,
     skin_mask: Option<&[u8]>,
     inputs: &PortraitJobInputs<'_>,
+    hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<(), Refusal> {
     let pixels = current.pixel_count();
+    if pf == 90004 {
+        check_degree01(
+            extra.get("pc:90004").copied().unwrap_or_default(),
+            "degree",
+        )?;
+        if inputs.radiance.is_none() {
+            let automatic = inputs.masks.pf90004_parser_inputs(
+                &current.pixels,
+                current.width,
+                current.height,
+                region,
+            )?;
+            if automatic.parsing_rgba.is_none() {
+                return Err(Refusal::MissingInput("PF90004_PARSING_RGBA"));
+            }
+        }
+        resolve_radiance_inputs(current, inputs.radiance)?;
+        return Ok(());
+    }
     if matches!(
         pf,
-        8068 | 8069 | 8070 | 21015 | 30096 | 90004 | 90005 | 90007
+        8068 | 8069 | 8070 | 21015 | 30096 | 90005 | 90007
     ) {
         required(skin_mask, "skin mask")?;
         match pf {
@@ -1334,7 +3118,9 @@ fn validate_effect_inputs(
     }
 
     match pf {
-        100 | 103 | 105 | 111 | 117 | 118 | 30007 => validate_makeup_inputs(pf, inputs)?,
+        100 | 103 | 105 | 111 | 117 | 118 | 30007 => {
+            validate_makeup_inputs(pf, pixels, inputs)?
+        }
         108 => {
             check_degree01(extra.get("pc:108").copied().unwrap_or_default(), "degree")?;
             let teeth = required(inputs.teeth, "teeth mask")?;
@@ -1345,6 +3131,28 @@ fn validate_effect_inputs(
             check_plane(bright.len(), LUT_BYTES, "teeth bright LUT")?;
             check_ui_percent(teeth.bright_ui, "teeth bright UI")?;
             check_ui_percent(teeth.deyellow_ui, "teeth deyellow UI")?;
+        }
+        30025 => {
+            check_degree01(
+                extra.get("pc:30025").copied().unwrap_or_default(),
+                "PF30025 degree",
+            )?;
+            let pf30025 = required(inputs.pf30025, "pf30025 repair_bgra")?;
+            if pf30025.repair_780929437_bgra.is_empty() {
+                return Err(Refusal::MissingInput("pf30025 repair_bgra"));
+            }
+            let bytes = pixels
+                .checked_mul(4)
+                .ok_or(Refusal::ShapeMismatch("pf30025 repair_bgra"))?;
+            check_plane(
+                pf30025.repair_780929437_bgra.len(),
+                bytes,
+                "pf30025 repair_bgra",
+            )?;
+            check_f32_plane(pf30025.teeth_mask, pixels, "pf30025 teeth mask")?;
+            if !pf30025.roi.inside(current.width, current.height) {
+                return Err(Refusal::ValueOutOfRange("pf30025 roi"));
+            }
         }
         21026 => {
             check_degree01(
@@ -1437,6 +3245,43 @@ fn validate_effect_inputs(
                 inputs,
             )?;
         }
+        21025 | 21069 | 21070 | 21071 => {
+            check_degree01(
+                extra.get(&format!("pc:{pf}")).copied().unwrap_or_default(),
+                "wrinkle ui",
+            )?;
+            let input = required(
+                inputs.wrinkle,
+                "PF21025_PF21069_PF21070_PF21071_WRINKLE_SAME_JOB_INPUTS",
+            )?;
+            validate_wrinkle(current, input)?;
+        }
+        30021 => {
+            check_degree01(
+                extra.get("pc:30021").copied().unwrap_or_default(),
+                "PF30021 ui",
+            )?;
+            let input = match inputs.hlf_face {
+                Some(input) => input,
+                None => hlf_auto
+                    .ok_or(Refusal::MissingInput("PF30021_HLF_SAME_JOB_INPUTS"))?
+                    .face(),
+            };
+            validate_hlf_face(current, input)?;
+        }
+        30022 => {
+            check_degree01(
+                extra.get("pc:30022").copied().unwrap_or_default(),
+                "PF30022 ui",
+            )?;
+            let input = match inputs.hlf_body {
+                Some(input) => input,
+                None => hlf_auto
+                    .ok_or(Refusal::MissingInput("PF30022_HLF_SAME_JOB_INPUTS"))?
+                    .body(),
+            };
+            validate_hlf_body(current, input)?;
+        }
         100007 => {
             check_degree01(
                 extra.get("pc:100007").copied().unwrap_or_default(),
@@ -1484,12 +3329,17 @@ fn apply_cpu_effect(
     width: u32,
     height: u32,
     inputs: &PortraitJobInputs<'_>,
+    hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<Image, Refusal> {
     match pf {
         100 | 103 | 105 | 111 | 117 | 118 | 30007 => {
             apply_makeup_cpu(current, pf, degree, inputs)
         }
         108 => apply_teeth_cpu(current, degree, inputs),
+        30025 => apply_pf30025_cpu(current, degree, inputs),
+        21025 | 21069 | 21070 | 21071 => apply_wrinkle_cpu(current, pf, degree, inputs),
+        30021 => apply_hlf_face_cpu(current, degree, inputs, hlf_auto),
+        30022 => apply_hlf_body_cpu(current, degree, inputs, hlf_auto),
         8068 => apply_skin_gloss(current, degree, skin_mask),
         8069 => apply_skin_texture(current, degree, skin_mask),
         8070 => apply_skin_clarity(current, degree, skin_mask, width, height),
@@ -1497,13 +3347,13 @@ fn apply_cpu_effect(
         21026 => apply_beard_cpu(current, degree, inputs),
         30096 => apply_skin_temperature(current, degree, skin_mask),
         90002 => apply_moisture_face_cpu(current, degree, inputs),
-        90004 => apply_skin_radiance(current, degree, skin_mask),
+        90004 => apply_skin_radiance(current, degree, inputs.radiance),
         90005 => apply_skin_whiten(current, degree, skin_mask),
         90007 => apply_skin_ruddy(current, degree, skin_mask),
         90010 => apply_moisture_body_cpu(current, degree, inputs),
         90116 => apply_eye_bag_cpu(current, degree, inputs),
-        // These rows are GPU-only until the legacy hair_body CPU slots are reconciled.
-        90139 | 90160 => Err(Refusal::NotImplemented(pf)),
+        90139 => apply_hair_smooth_cpu(current, degree, inputs),
+        90160 => apply_hair_gloss_cpu(current, degree, inputs),
         90088 => apply_stray_hair_cpu(current, degree, inputs),
         100007 => apply_smile_cpu(current, degree, inputs),
         _ => Ok(current.clone()),
@@ -1528,6 +3378,177 @@ fn apply_stray_hair_cpu(
         Some(job.raw_mask),
         job.person_mask,
         job.background_mask,
+    )
+}
+
+fn apply_hair_smooth_cpu(
+    current: &Image,
+    degree: f32,
+    inputs: &PortraitJobInputs<'_>,
+) -> Result<Image, Refusal> {
+    let (input, roi) = resolve_hair_smooth(current, degree, inputs)?;
+    let hair_mask = required(input.hair_mask, "PF90139_HAIR_MASK")?;
+    let mix_mask = required(input.mix_mask, "PF90139_MIX_MASK")?;
+    let blend = required(input.blend_rgb, "PF90139_BLEND_SOURCE_RGB8")?;
+    let detail = required(input.detail, "PF90139_DETAIL")?;
+    let mut output = current.clone();
+    for y in 0..roi.height as usize {
+        for x in 0..roi.width as usize {
+            let hair = hair_mask[y * input.hair_stride as usize + x];
+            if hair == 0 {
+                continue;
+            }
+            let mix = mix_mask[y * input.mix_stride as usize + x];
+            let detail = detail[y * input.detail_stride as usize + x];
+            let gate = hair as f32 * 0.003921568859368563;
+            let mix_weight = mix as f32 * 0.003921568859368563 * input.mix_strength * gate;
+            let detail_add = (detail as f32 - 127.5) * 4.0 * (gate * degree * 0.8);
+            let offset =
+                ((roi.y as usize + y) * current.width as usize + roi.x as usize + x) * 4;
+            let blend_offset = y * input.blend_stride as usize + x * 3;
+            for channel in 0..3 {
+                let source = current.pixels[offset + channel] as f32;
+                let base = if mix_weight > 0.0 {
+                    source * (1.0 - mix_weight)
+                        + blend[blend_offset + channel] as f32 * mix_weight
+                } else {
+                    source
+                };
+                output.pixels[offset + channel] = (base + detail_add)
+                    .round_ties_even()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn apply_hair_gloss_cpu(
+    current: &Image,
+    degree: f32,
+    inputs: &PortraitJobInputs<'_>,
+) -> Result<Image, Refusal> {
+    let (input, roi) = resolve_hair_gloss(current, degree, inputs)?;
+    let hair_mask = required(input.hair_mask, "PF90160_HAIR_MASK")?;
+    let detail = required(input.model_detail, "PF90160_MODEL_DETAIL")?;
+    let mut output = current.clone();
+    for y in 0..roi.height as usize {
+        for x in 0..roi.width as usize {
+            let hair = hair_mask[y * input.hair_stride as usize + x];
+            if hair == 0 {
+                continue;
+            }
+            let detail = detail[y * input.detail_stride as usize + x];
+            let delta = (detail as f32 - 127.5)
+                * 2.0
+                * hair as f32
+                * 0.003921568859368563
+                * input.dynamic_scale;
+            let offset =
+                ((roi.y as usize + y) * current.width as usize + roi.x as usize + x) * 4;
+            for channel in 0..3 {
+                output.pixels[offset + channel] =
+                    (current.pixels[offset + channel] as f32 + delta).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn apply_wrinkle_cpu(
+    current: &Image,
+    pf: u32,
+    degree: f32,
+    inputs: &PortraitJobInputs<'_>,
+) -> Result<Image, Refusal> {
+    let input = required(
+        inputs.wrinkle,
+        "PF21025_PF21069_PF21070_PF21071_WRINKLE_SAME_JOB_INPUTS",
+    )?;
+    validate_wrinkle(current, input)?;
+    let degree = skin_adjust::wrinkle_degree(pf, degree * 100.0)?;
+    skin_adjust::wrinkle_apply(
+        current,
+        input.base_full,
+        input.residual_full,
+        input.mask_rgba_full,
+        input.skin_mask_full,
+        input.roi,
+        degree,
+        input.uniforms,
+    )
+}
+
+fn hlf_rgb_f32_to_image(current: &Image, rgb: &[f32]) -> Result<Image, Refusal> {
+    check_plane(
+        rgb.len(),
+        current.pixel_count() * 3,
+        "PF30021_HLF output",
+    )?;
+    let mut pixels = current.pixels.clone();
+    for (index, rgb) in rgb.chunks_exact(3).enumerate() {
+        let offset = index * 4;
+        for channel in 0..3 {
+            pixels[offset + channel] = StoreMode::TruncU8.quantize(rgb[channel]);
+        }
+    }
+    Ok(Image {
+        width: current.width,
+        height: current.height,
+        pixels,
+    })
+}
+
+fn apply_hlf_face_cpu(
+    current: &Image,
+    degree: f32,
+    inputs: &PortraitJobInputs<'_>,
+    hlf_auto: Option<&HlfAutoInputs>,
+) -> Result<Image, Refusal> {
+    let input = match inputs.hlf_face {
+        Some(input) => input,
+        None => hlf_auto
+            .ok_or(Refusal::MissingInput("PF30021_HLF_SAME_JOB_INPUTS"))?
+            .face(),
+    };
+    validate_hlf_face(current, input)?;
+    let rgb = skin_adjust::hlf_face_apply(
+        input.source_rgb_full_f32,
+        input.median_rgb_full_f32,
+        input.gauss_rgb_full_f32,
+        input.face_mask_full_f32,
+        input.skin_mask_full_f32,
+        current.width,
+        current.height,
+        input.roi,
+        degree * 100.0,
+    )?;
+    hlf_rgb_f32_to_image(current, &rgb)
+}
+
+fn apply_hlf_body_cpu(
+    current: &Image,
+    degree: f32,
+    inputs: &PortraitJobInputs<'_>,
+    hlf_auto: Option<&HlfAutoInputs>,
+) -> Result<Image, Refusal> {
+    let input = match inputs.hlf_body {
+        Some(input) => input,
+        None => hlf_auto
+            .ok_or(Refusal::MissingInput("PF30022_HLF_SAME_JOB_INPUTS"))?
+            .body(),
+    };
+    validate_hlf_body(current, input)?;
+    skin_adjust::body_hlf_apply(
+        current,
+        input.roi,
+        input.median_rgb_full_f32,
+        input.gauss_rgb_full_f32,
+        input.face_mask_rgba_full_f32,
+        input.skin_mask_full_f32,
+        degree * 100.0,
+        input.uniforms,
+        input.adjust_lut.as_ref(),
     )
 }
 
@@ -1556,8 +3577,26 @@ fn apply_makeup_cpu(
                 required(input.material_uv, "makeup material UV")?,
                 layer,
             )
+            .and_then(|output| {
+                gate_makeup_writes(
+                    current,
+                    output,
+                    required(input.material_uv_writes, "makeup material UV writes")?,
+                )
+            })
         }
     }
+}
+
+fn gate_makeup_writes(source: &Image, mut output: Image, writes: &[u16]) -> Result<Image, Refusal> {
+    check_plane(writes.len(), source.pixel_count(), "makeup material UV writes")?;
+    for (pixel, writes) in writes.iter().enumerate() {
+        if *writes == 0 {
+            let base = pixel * 4;
+            output.pixels[base..base + 4].copy_from_slice(&source.pixels[base..base + 4]);
+        }
+    }
+    Ok(output)
 }
 
 fn apply_teeth_cpu(
@@ -1578,6 +3617,24 @@ fn apply_teeth_cpu(
         teeth.deyellow_ui,
     )?
     .output)
+}
+
+fn apply_pf30025_cpu(
+    current: &Image,
+    degree: f32,
+    inputs: &PortraitJobInputs<'_>,
+) -> Result<Image, Refusal> {
+    let pf30025 = required(inputs.pf30025, "pf30025 repair_bgra")?;
+    aurora_portrait::kernels::face_detail::tooth_repair_same_job(
+        current,
+        Some(ToothRepairProducer {
+            repair_780929437_bgra: pf30025.repair_780929437_bgra,
+            gate_3204548346: pf30025.gate_3204548346,
+            teeth_mask: pf30025.teeth_mask,
+            roi: pf30025.roi,
+        }),
+        degree * 100.0,
+    )
 }
 
 fn apply_beard_cpu(
@@ -1897,6 +3954,7 @@ fn apply_suit_effect(
 #[cfg(all(windows, test))]
 thread_local! {
     static FORCE_CUDA_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_CUDA_EMPTY_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(windows)]
@@ -1906,6 +3964,15 @@ fn forced_cuda_failure() -> Option<CudaError> {
         return Some(CudaError::Unavailable("test-forced CUDA failure"));
     }
     None
+}
+
+#[cfg(windows)]
+fn forced_cuda_empty_dispatch() -> bool {
+    #[cfg(test)]
+    if FORCE_CUDA_EMPTY_DISPATCH.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -1988,11 +4055,115 @@ fn try_cuda_same_job_effect(
     pf: u32,
     degree: f32,
     inputs: &PortraitJobInputs<'_>,
+    hlf_auto: Option<&HlfAutoInputs>,
 ) -> Option<Result<(Image, Vec<Dispatch>), CudaError>> {
     if let Some(error) = forced_cuda_failure() {
         return Some(Err(error));
     }
+    if forced_cuda_empty_dispatch() {
+        return Some(Ok((current.clone(), Vec::new())));
+    }
     match pf {
+        90004 => {
+            let resolved =
+                resolve_radiance_inputs(current, inputs.radiance).expect("validated PF90004 inputs");
+            let assets = radiance_assets();
+            let fixed = aurora_portrait::kernels::radiance::FixedAssets {
+                lut_a: &assets.lut_a,
+                lut_b: &assets.lut_b,
+                gamma: &assets.gamma,
+                matrices: &assets.matrices,
+            };
+            let gpu = match aurora_portrait::cuda_radiance::Radiance::open() {
+                Ok(gpu) => gpu,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(
+                gpu.apply(aurora_portrait::cuda_radiance::Request {
+                    source: current,
+                    skin_r: resolved.skin,
+                    parsing_rgba: resolved.parsing_rgba,
+                    face_rgba: resolved.face_rgba,
+                    ui: (degree * 100.0).clamp(0.0, 100.0),
+                    value_mean: resolved.value_mean,
+                    assets: &fixed,
+                })
+                .map(|(image, dispatch)| (image, dispatch.into_iter().collect())),
+            )
+        }
+        21025 | 21069 | 21070 | 21071 => {
+            let input = inputs
+                .wrinkle
+                .expect("validated wrinkle same-job inputs");
+            validate_wrinkle(current, input).expect("validated wrinkle inputs");
+            let gpu = match aurora_portrait::cuda_wrinkle::WrinkleGpu::open() {
+                Ok(gpu) => gpu,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(gpu.apply_route(
+                pf,
+                current,
+                input.base_full,
+                input.residual_full,
+                input.mask_rgba_full,
+                input.skin_mask_full,
+                input.roi,
+                degree * 100.0,
+                input.uniforms,
+                StoreMode::TruncU8,
+            ))
+        }
+        30021 => {
+            let input = match inputs.hlf_face {
+                Some(input) => input,
+                None => hlf_auto.expect("validated PF30021 HLF inputs").face(),
+            };
+            validate_hlf_face(current, input).expect("validated PF30021 HLF inputs");
+            let gpu = match aurora_portrait::cuda_hlf::Hlf::open() {
+                Ok(gpu) => gpu,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(
+                gpu.face_apply(
+                    input.source_rgb_full_f32,
+                    input.median_rgb_full_f32,
+                    input.gauss_rgb_full_f32,
+                    input.face_mask_full_f32,
+                    input.skin_mask_full_f32,
+                    current.width,
+                    current.height,
+                    input.roi,
+                    degree * 100.0,
+                )
+                .and_then(|(rgb, dispatches)| {
+                    let image =
+                        hlf_rgb_f32_to_image(current, &rgb).map_err(CudaError::Refused)?;
+                    Ok((image, dispatches))
+                }),
+            )
+        }
+        30022 => {
+            let input = match inputs.hlf_body {
+                Some(input) => input,
+                None => hlf_auto.expect("validated PF30022 HLF inputs").body(),
+            };
+            validate_hlf_body(current, input).expect("validated PF30022 HLF inputs");
+            let gpu = match aurora_portrait::cuda_hlf::Hlf::open() {
+                Ok(gpu) => gpu,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(gpu.body_apply(
+                current,
+                input.roi,
+                input.median_rgb_full_f32,
+                input.gauss_rgb_full_f32,
+                input.face_mask_rgba_full_f32,
+                input.skin_mask_full_f32,
+                degree * 100.0,
+                input.uniforms,
+                input.adjust_lut.as_ref(),
+            ))
+        }
         100 | 103 | 105 | 111 | 117 | 118 | 30007 => {
             let (_, input) =
                 find_makeup_input(pf, inputs).expect("validated makeup same-job input");
@@ -2000,7 +4171,7 @@ fn try_cuda_same_job_effect(
                 Ok(gpu) => gpu,
                 Err(error) => return Some(Err(error)),
             };
-            Some(gpu.apply_route(
+            let result = gpu.apply_route(
                 pf,
                 current,
                 RouteInputs {
@@ -2013,7 +4184,19 @@ fn try_cuda_same_job_effect(
                     mask: input.mask,
                     mask_uv: input.mask_uv,
                 },
-            ))
+            );
+            Some(if pf == 111 {
+                let writes = input
+                    .material_uv_writes
+                    .expect("validated PF111 material UV writes");
+                result.and_then(|(next, dispatches)| {
+                    let next =
+                        gate_makeup_writes(current, next, writes).map_err(CudaError::Refused)?;
+                    Ok((next, dispatches))
+                })
+            } else {
+                result
+            })
         }
         108 => {
             let teeth = inputs.teeth.expect("validated PF108 teeth input");
@@ -2038,6 +4221,21 @@ fn try_cuda_same_job_effect(
                 teeth.bright_ui,
                 teeth.deyellow_ui,
             ))
+        }
+        30025 => {
+            let input = inputs.pf30025.expect("validated PF30025 repair input");
+            let gpu = match aurora_portrait::cuda_pf30025::ToothRepair::open() {
+                Ok(gpu) => gpu,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(gpu.apply(&aurora_portrait::cuda_pf30025::Job {
+                source: current,
+                repair_780929437_bgra: input.repair_780929437_bgra,
+                gate_3204548346: input.gate_3204548346,
+                teeth_mask: input.teeth_mask,
+                roi: input.roi,
+                ui: degree * 100.0,
+            }))
         }
         21026 => {
             let beard = inputs.beard.expect("validated PF21026 beard input");
@@ -2245,7 +4443,7 @@ fn try_cuda_effect(
     if let Some(error) = forced_cuda_failure() {
         return Some(Err(error));
     }
-    if !matches!(pf, 8068 | 8069 | 8070 | 21015 | 90005 | 90007) {
+    if !matches!(pf, 8068 | 8069 | 8070 | 21015 | 30096 | 90005 | 90007) {
         return None;
     }
     let mask = match skin_mask {
@@ -2296,6 +4494,18 @@ fn try_cuda_effect(
             let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
             Some(with_skin_lut(|gpu| {
                 gpu.tint(current, mask, green, magenta, ui)
+                    .map(|(image, dispatch)| (image, vec![dispatch]))
+            }))
+        }
+        30096 => {
+            let (Some(cold), Some(warm)) = (cold_lut(), warm_lut()) else {
+                return Some(Err(CudaError::Refused(Refusal::MissingInput(
+                    "skin temperature LUT",
+                ))));
+            };
+            let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
+            Some(with_skin_lut(|gpu| {
+                gpu.temperature(current, mask, cold, warm, ui)
                     .map(|(image, dispatch)| (image, vec![dispatch]))
             }))
         }
@@ -2643,34 +4853,13 @@ fn radiance_assets() -> &'static RadianceAssets {
 fn apply_skin_radiance(
     current: &Image,
     degree: f32,
-    skin_mask: Option<&[u8]>,
+    job: Option<RadianceInputs<'_>>,
 ) -> Result<Image, aurora_portrait::Refusal> {
-    let Some(skin) = skin_mask else {
-        return Err(aurora_portrait::Refusal::MissingInput("skin mask"));
-    };
-    let parsing_rgba = vec![0u8; skin.len() * 4];
-    let face_rgba = vec![0u8; skin.len() * 4];
+    let resolved = resolve_radiance_inputs(current, job)?;
     let planes = aurora_portrait::kernels::radiance::MaskPlanes {
-        skin: &skin,
-        parsing_rgba: &parsing_rgba,
-        face_rgba: &face_rgba,
-    };
-    let mut sum = 0.0f32;
-    let mut count = 0usize;
-    for (index, &m) in skin.iter().enumerate() {
-        if m > 32 {
-            let i = index * 4;
-            let lum = 0.2126 * current.pixels[i] as f32
-                + 0.7152 * current.pixels[i + 1] as f32
-                + 0.0722 * current.pixels[i + 2] as f32;
-            sum += lum;
-            count += 1;
-        }
-    }
-    let value_mean = if count > 0 {
-        sum / count as f32
-    } else {
-        return Ok(current.clone());
+        skin: resolved.skin,
+        parsing_rgba: resolved.parsing_rgba,
+        face_rgba: resolved.face_rgba,
     };
     let assets = radiance_assets();
     let fixed = aurora_portrait::kernels::radiance::FixedAssets {
@@ -2680,7 +4869,14 @@ fn apply_skin_radiance(
         matrices: &assets.matrices,
     };
     let ui = (degree * 100.0).clamp(0.0, 100.0);
-    Ok(aurora_portrait::kernels::radiance::apply(current, &planes, ui, value_mean, &fixed)?.image)
+    Ok(aurora_portrait::kernels::radiance::apply(
+        current,
+        &planes,
+        ui,
+        resolved.value_mean,
+        &fixed,
+    )?
+    .image)
 }
 
 #[cfg(test)]
@@ -2707,6 +4903,323 @@ mod tests {
         let masks = PortraitMasks::solid(1.0);
         let inputs = PortraitJobInputs::from_renderer_job(1, &masks);
         let _ = apply_portrait_effects_with_job(rgba, w, h, NormRect::FULL, &map, &inputs);
+    }
+
+    #[test]
+    fn renderer_receipt_rejects_changed_frame_or_params_before_dispatch() {
+        let masks = PortraitMasks::solid(1.0);
+        let (width, height) = (8, 8);
+        let source = frame(width, height);
+        let params = BTreeMap::from([("pc:90005".to_string(), 0.9f32)]);
+        let receipt = PortraitJobReceipt::from_renderer_receipt(
+            &source,
+            width,
+            height,
+            NormRect::FULL,
+            &params,
+            &masks,
+        );
+        let inputs = PortraitJobInputs::from_renderer_receipt(receipt, &masks);
+
+        let mut changed_frame = source.clone();
+        changed_frame[0] ^= 1;
+        let before = changed_frame.clone();
+        let report = apply_portrait_effects_with_job(
+            &mut changed_frame,
+            width,
+            height,
+            NormRect::FULL,
+            &params,
+            &inputs,
+        );
+        assert_eq!(changed_frame, before);
+        assert_eq!(report.job_id, Some(receipt.job_id()));
+        assert_eq!(
+            report.effects[0].refusal,
+            Some(Refusal::ValueOutOfRange("PortraitJobReceipt digest"))
+        );
+        assert!(report.effects[0].skipped);
+        assert!(!report.effects[0].executed);
+        assert!(report.effects[0].dispatches.is_empty());
+
+        let mut changed_params = params.clone();
+        changed_params.insert("pc:90005".to_string(), 0.8);
+        let mut unchanged_frame = source.clone();
+        let before = unchanged_frame.clone();
+        let report = apply_portrait_effects_with_job(
+            &mut unchanged_frame,
+            width,
+            height,
+            NormRect::FULL,
+            &changed_params,
+            &inputs,
+        );
+        assert_eq!(unchanged_frame, before);
+        assert_eq!(report.job_id, Some(receipt.job_id()));
+        assert_eq!(
+            report.effects[0].refusal,
+            Some(Refusal::ValueOutOfRange("PortraitJobReceipt digest"))
+        );
+        assert!(report.effects[0].dispatches.is_empty());
+    }
+
+    #[test]
+    fn renderer_receipt_does_not_promote_masks_only() {
+        let masks = PortraitMasks::solid(1.0);
+        let mut rgba = frame(8, 8);
+        let before = rgba.clone();
+        let params = BTreeMap::from([("pc:90005".to_string(), 0.9f32)]);
+        let inputs = PortraitJobInputs::masks_only(&masks);
+        let report = apply_portrait_effects_with_job(
+            &mut rgba,
+            8,
+            8,
+            NormRect::FULL,
+            &params,
+            &inputs,
+        );
+        assert_eq!(rgba, before);
+        assert_eq!(
+            report.effects[0].refusal,
+            Some(Refusal::MissingInput("same-job input bundle"))
+        );
+        assert!(report.effects[0].skipped);
+        assert!(report.effects[0].dispatches.is_empty());
+    }
+
+    #[test]
+    fn renderer_job_without_receipt_is_refused_before_dispatch() {
+        let masks = PortraitMasks::solid(1.0);
+        let mut rgba = frame(8, 8);
+        let before = rgba.clone();
+        let params = BTreeMap::from([("pc:90005".to_string(), 0.9f32)]);
+        let inputs = PortraitJobInputs::from_renderer_job(9, &masks);
+        let report = apply_portrait_effects_with_report_and_inputs_policy(
+            &mut rgba,
+            8,
+            8,
+            NormRect::FULL,
+            &params,
+            &inputs,
+            true,
+        );
+        assert_eq!(rgba, before);
+        assert_eq!(report.job_id, Some(9));
+        assert_eq!(
+            report.effects[0].refusal,
+            Some(Refusal::MissingInput("renderer receipt"))
+        );
+        assert!(report.effects[0].skipped);
+        assert!(!report.effects[0].executed);
+        assert!(report.effects[0].dispatches.is_empty());
+    }
+
+    #[test]
+    fn pf30025_uses_existing_producer_inputs_and_fails_closed() {
+        let masks = PortraitMasks::solid(1.0);
+        let mut inputs = PortraitJobInputs::from_renderer_job(12, &masks);
+        let (before, run) = apply_one_with_inputs(30025, 1, 1, &inputs);
+        assert_eq!(
+            run.refusal,
+            Some(Refusal::MissingInput("pf30025 repair_bgra"))
+        );
+        assert!(run.skipped);
+        assert!(!run.executed);
+
+        inputs.pf30025 = Some(Pf30025Inputs {
+            repair_780929437_bgra: &[30, 20, 200, 255],
+            gate_3204548346: None,
+            teeth_mask: &[0.0],
+            roi: ToothRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        });
+        let (after, run) = apply_one_with_inputs(30025, 1, 1, &inputs);
+        assert_eq!(after, before);
+        assert_eq!(run.refusal, None);
+        assert!(run.executed);
+        assert!(!run.skipped);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pf30025_cuda_matches_cpu_for_bgra_roi_alpha_and_gate() {
+        struct Case {
+            width: u32,
+            height: u32,
+            source: Vec<u8>,
+            repair_bgra: Vec<u8>,
+            teeth_mask: Vec<f32>,
+            roi: ToothRect,
+            degree01: f32,
+            gate: Option<Vec<u8>>,
+        }
+
+        fn run(case: &Case, force_cpu: bool) -> (Vec<u8>, PortraitEffectRun) {
+            let masks = PortraitMasks::solid(1.0);
+            let mut inputs = PortraitJobInputs::from_renderer_job(30025, &masks);
+            inputs.pf30025 = Some(Pf30025Inputs {
+                repair_780929437_bgra: &case.repair_bgra,
+                gate_3204548346: case.gate.as_deref(),
+                teeth_mask: &case.teeth_mask,
+                roi: case.roi,
+            });
+            let mut rgba = case.source.clone();
+            let _force = force_cpu.then(ForceCudaFailureGuard::new);
+            let report = apply_portrait_effects_with_job(
+                &mut rgba,
+                case.width,
+                case.height,
+                NormRect::FULL,
+                &BTreeMap::from([("pc:30025".to_string(), case.degree01)]),
+                &inputs,
+            );
+            assert_eq!(report.effects.len(), 1);
+            (rgba, report.effects.into_iter().next().unwrap())
+        }
+
+        let cases = [
+            Case {
+                width: 1,
+                height: 1,
+                source: vec![10, 20, 30, 91],
+                // R rounds from 10.5 to 11: midpoint away from zero.
+                repair_bgra: vec![30, 20, 12, 255],
+                teeth_mask: vec![0.25],
+                roi: ToothRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                degree01: 1.0,
+                gate: Some(vec![7]),
+            },
+            Case {
+                width: 4,
+                height: 3,
+                source: vec![
+                    10, 20, 30, 41, 50, 60, 70, 81, 90, 100, 110, 121, 130, 140, 150, 161,
+                    12, 22, 32, 42, 52, 62, 72, 82, 92, 102, 112, 122, 132, 142, 152, 162,
+                    14, 24, 34, 44, 54, 64, 74, 84, 94, 104, 114, 124, 134, 144, 154, 164,
+                ],
+                repair_bgra: vec![
+                    200, 180, 160, 0, 210, 190, 170, 1, 220, 200, 180, 2, 230, 210, 190, 3,
+                    240, 220, 200, 4, 250, 230, 210, 5, 20, 30, 40, 6, 30, 40, 50, 7,
+                    40, 50, 60, 8, 50, 60, 70, 9, 60, 70, 80, 10, 70, 80, 90, 11,
+                ],
+                teeth_mask: vec![
+                    0.0, 0.2, 0.5, 1.0, 0.7, 0.33, 0.25, 0.9, 0.6, 0.15, 0.45, 0.8,
+                ],
+                roi: ToothRect {
+                    x: 1,
+                    y: 1,
+                    width: 2,
+                    height: 1,
+                },
+                degree01: 0.37,
+                gate: None,
+            },
+            Case {
+                width: 3,
+                height: 2,
+                source: vec![
+                    8, 18, 28, 38, 48, 58, 68, 78, 88, 98, 108, 118,
+                    13, 23, 33, 43, 53, 63, 73, 83, 93, 103, 113, 123,
+                ],
+                repair_bgra: vec![
+                    180, 160, 140, 255, 190, 170, 150, 254, 200, 180, 160, 253,
+                    210, 190, 170, 252, 220, 200, 180, 251, 230, 210, 190, 250,
+                ],
+                teeth_mask: vec![0.1, 0.4, 0.9, 1.0, 0.55, 0.75],
+                roi: ToothRect {
+                    x: 0,
+                    y: 0,
+                    width: 3,
+                    height: 2,
+                },
+                degree01: 1.0,
+                gate: Some(vec![1, 2, 3]),
+            },
+        ];
+
+        for case in &cases {
+            let (cpu, cpu_run) = run(case, true);
+            let (actual, actual_run) = run(case, false);
+            let differing_bytes = actual
+                .iter()
+                .zip(&cpu)
+                .filter(|(left, right)| left != right)
+                .count();
+            assert_eq!(actual, cpu, "PF30025 CPU/CUDA byte parity");
+            assert_eq!(differing_bytes, 0);
+            assert_eq!(cpu_run.backend, PortraitBackend::Cpu);
+            assert!(cpu_run.dispatches.is_empty());
+            assert!(actual_run.executed);
+            assert!(actual_run.refusal.is_none());
+            for pixel in 0..case.width as usize * case.height as usize {
+                assert_eq!(
+                    actual[pixel * 4 + 3],
+                    case.source[pixel * 4 + 3],
+                    "PF30025 alpha pixel {pixel}"
+                );
+                let x = pixel as i32 % case.width as i32;
+                let y = pixel as i32 / case.width as i32;
+                let inside = x >= case.roi.x
+                    && y >= case.roi.y
+                    && x < case.roi.x + case.roi.width
+                    && y < case.roi.y + case.roi.height;
+                if !inside {
+                    assert_eq!(
+                        &actual[pixel * 4..pixel * 4 + 4],
+                        &case.source[pixel * 4..pixel * 4 + 4],
+                        "PF30025 ROI pixel {pixel}"
+                    );
+                }
+            }
+            if std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_some() {
+                assert_eq!(
+                    actual_run.backend,
+                    PortraitBackend::Cuda,
+                    "{:?}",
+                    actual_run.fallback_reason
+                );
+                assert_eq!(actual_run.dispatches.len(), 1);
+                assert_eq!(
+                    actual_run.dispatches[0].kernel,
+                    aurora_portrait::cuda_pf30025::KERNEL
+                );
+                assert!(!actual_run.dispatches[0].device.is_empty());
+                let dispatch = &actual_run.dispatches[0];
+                eprintln!(
+                    "PF30025 case={}x{} roi={}x{}+{}+{} backend=Cuda kernel={} device={} cc={}.{} driver={} ptx_isa={}.{} differing_bytes={}",
+                    case.width,
+                    case.height,
+                    case.roi.width,
+                    case.roi.height,
+                    case.roi.x,
+                    case.roi.y,
+                    dispatch.kernel,
+                    dispatch.device,
+                    dispatch.compute_cap.0,
+                    dispatch.compute_cap.1,
+                    dispatch.driver_version,
+                    dispatch.ptx_isa.0,
+                    dispatch.ptx_isa.1,
+                    differing_bytes,
+                );
+            } else if actual_run.backend == PortraitBackend::Cpu {
+                assert!(actual_run.fallback_reason.is_some());
+            } else {
+                assert_eq!(
+                    actual_run.dispatches[0].kernel,
+                    aurora_portrait::cuda_pf30025::KERNEL
+                );
+            }
+        }
     }
 
     fn apply_one_with_inputs(
@@ -3189,6 +5702,151 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn run_hair_route_cuda_fault(
+        pf: u32,
+        empty_dispatch: bool,
+    ) -> (Vec<u8>, PortraitEffectRun, Vec<u8>) {
+        let masks = PortraitMasks::solid(1.0);
+        let (width, height) = (7u32, 5u32);
+        let source = Image::new(width, height, hair_frame(width, height)).unwrap();
+        let (roi_x, roi_y, roi_width, roi_height) = (2u32, 1u32, 3u32, 2u32);
+        let roi = HairRoi {
+            x: roi_x,
+            y: roi_y,
+            width: roi_width,
+            height: roi_height,
+        };
+        let run_case = |inputs: &PortraitJobInputs<'_>, expected: Vec<u8>| {
+            let _empty_guard = empty_dispatch.then(ForceCudaEmptyDispatchGuard::new);
+            let _failure_guard = (!empty_dispatch).then(ForceCudaFailureGuard::new);
+            let mut actual = source.pixels.clone();
+            let report = apply_portrait_effects_with_job(
+                &mut actual,
+                width,
+                height,
+                NormRect::FULL,
+                &BTreeMap::from([(format!("pc:{pf}"), 0.8)]),
+                inputs,
+            );
+            (
+                actual,
+                report.effects.into_iter().next().unwrap(),
+                expected,
+            )
+        };
+        if pf == 90139 {
+            let hair =
+                strided_plane(&[255, 180, 0, 96, 64, 220], roi_width, roi_height, 5, 1);
+            let mix =
+                strided_plane(&[180, 240, 64, 32, 128, 255], roi_width, roi_height, 4, 1);
+            let blend = strided_plane(
+                &[
+                    20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 10, 30, 50, 70,
+                    90, 110,
+                ],
+                roi_width,
+                roi_height,
+                14,
+                3,
+            );
+            let detail =
+                strided_plane(&[96, 127, 128, 160, 255, 0], roi_width, roi_height, 6, 1);
+            let smooth = HairSmoothInputs {
+                ticket: 17,
+                width,
+                height,
+                roi: (roi_x, roi_y, roi_width, roi_height),
+                mix_strength: 0.6,
+                hair_mask: Some(&hair),
+                mix_mask: Some(&mix),
+                blend_rgb: Some(&blend),
+                detail: Some(&detail),
+                hair_stride: 5,
+                mix_stride: 4,
+                blend_stride: 14,
+                detail_stride: 6,
+            };
+            let expected = hair_smooth_cpu(&source, roi, 0.8, &smooth);
+            let inputs = PortraitJobInputs {
+                hair_smooth: Some(smooth),
+                ..PortraitJobInputs::from_renderer_job(1, &masks)
+            };
+            run_case(&inputs, expected)
+        } else if pf == 90160 {
+            let hair =
+                strided_plane(&[255, 180, 0, 96, 64, 220], roi_width, roi_height, 5, 1);
+            let detail =
+                strided_plane(&[128, 127, 200, 64, 255, 0], roi_width, roi_height, 7, 1);
+            let gloss = HairGlossInputs {
+                ticket: 18,
+                width,
+                height,
+                roi: (roi_x, roi_y, roi_width, roi_height),
+                dynamic_scale: 0.5,
+                hair_mask: Some(&hair),
+                model_detail: Some(&detail),
+                hair_stride: 5,
+                detail_stride: 7,
+            };
+            let expected = hair_gloss_cpu(&source, roi, &gloss);
+            let inputs = PortraitJobInputs {
+                hair_gloss: Some(gloss),
+                ..PortraitJobInputs::from_renderer_job(1, &masks)
+            };
+            run_case(&inputs, expected)
+        } else {
+            unreachable!("hair CUDA fault test only covers PF90139/PF90160")
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n855_pf90139_forced_cuda_failure_falls_back_to_cpu() {
+        let (actual, run, expected) = run_hair_route_cuda_fault(90139, false);
+        assert_eq!(actual, expected);
+        assert_eq!(run.backend, PortraitBackend::Cpu);
+        assert!(run.executed);
+        assert!(run.dispatches.is_empty());
+        assert!(run
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("test-forced CUDA failure")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n855_pf90160_forced_cuda_failure_falls_back_to_cpu() {
+        let (actual, run, expected) = run_hair_route_cuda_fault(90160, false);
+        assert_eq!(actual, expected);
+        assert_eq!(run.backend, PortraitBackend::Cpu);
+        assert!(run.executed);
+        assert!(run.dispatches.is_empty());
+        assert!(run
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("test-forced CUDA failure")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n855_empty_cuda_dispatch_falls_back_to_cpu_for_hair_routes() {
+        for pf in [90139, 90160] {
+            let (actual, run, expected) = run_hair_route_cuda_fault(pf, true);
+            assert_eq!(actual, expected, "PF{pf}");
+            assert_eq!(run.backend, PortraitBackend::Cpu, "PF{pf}");
+            assert!(run.executed, "PF{pf}");
+            assert!(run.dispatches.is_empty(), "PF{pf}");
+            assert!(
+                run.fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("CUDA returned no dispatch")),
+                "PF{pf}: {:?}",
+                run.fallback_reason
+            );
+        }
+    }
+
     #[test]
     fn pf90088_stage_refuses_missing_same_job_inputs_before_dispatch() {
         let masks = PortraitMasks::solid(1.0);
@@ -3249,6 +5907,137 @@ mod tests {
     }
 
     #[test]
+    fn pf90088_producer_binds_fields_and_keeps_typed_refusal_order() {
+        let masks = PortraitMasks::solid(1.0);
+        let (source, repair, raw, person, background) = stray_hair_fixture();
+        let complete = StrayHairProducerInputs {
+            hairfly_v1: Some(repair.clone()),
+            raw_mask: Some(raw.clone()),
+            person_mask: Some(person.clone()),
+            background_mask: Some(background.clone()),
+            native_degree: Some(0.5),
+            native_person_area: Some(1.0),
+            native_background_area: Some(0.5),
+        };
+        let producer = ProducerInputs {
+            stray_hair: Some(complete.clone()),
+            ..Default::default()
+        };
+        let mut inputs = PortraitJobInputs::from_renderer_job(941, &masks);
+        inputs.fill_from_producer_inputs(&producer);
+        let staged = inputs.stray_hair;
+        assert_eq!(staged.hairfly_v1, Some(&repair));
+        assert_eq!(staged.raw_mask, Some(raw.as_slice()));
+        assert_eq!(staged.person_mask, Some(person.as_slice()));
+        assert_eq!(staged.background_mask, Some(background.as_slice()));
+        assert_eq!(staged.native_degree, Some(0.5));
+        assert_eq!(staged.native_person_area, Some(1.0));
+        assert_eq!(staged.native_background_area, Some(0.5));
+
+        let fingerprint = producer.fingerprint();
+        assert_ne!(fingerprint, ProducerInputs::default().fingerprint());
+        let changed_rows = [
+            StrayHairProducerInputs {
+                hairfly_v1: None,
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                raw_mask: None,
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                person_mask: None,
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                background_mask: None,
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                native_degree: Some(0.25),
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                native_degree: Some(0.0),
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                native_person_area: Some(0.75),
+                ..complete.clone()
+            },
+            StrayHairProducerInputs {
+                native_background_area: Some(0.25),
+                ..complete
+            },
+        ];
+        for changed in changed_rows {
+            assert_ne!(
+                fingerprint,
+                ProducerInputs {
+                    stray_hair: Some(changed),
+                    ..Default::default()
+                }
+                .fingerprint()
+            );
+        }
+
+        let cases = [
+            (
+                StrayHairProducerInputs::default(),
+                "PF90088_NATIVE_DEGREE",
+            ),
+            (
+                StrayHairProducerInputs {
+                    native_degree: Some(0.5),
+                    ..Default::default()
+                },
+                "PF90088_NATIVE_PERSON_AREA",
+            ),
+            (
+                StrayHairProducerInputs {
+                    native_degree: Some(0.5),
+                    native_person_area: Some(1.0),
+                    ..Default::default()
+                },
+                "PF90088_NATIVE_BACKGROUND_AREA",
+            ),
+            (
+                StrayHairProducerInputs {
+                    native_degree: Some(0.5),
+                    native_person_area: Some(1.0),
+                    native_background_area: Some(0.5),
+                    ..Default::default()
+                },
+                "PF90088_HAIRFLY_V1",
+            ),
+            (
+                StrayHairProducerInputs {
+                    hairfly_v1: Some(repair.clone()),
+                    native_degree: Some(0.5),
+                    native_person_area: Some(1.0),
+                    native_background_area: Some(0.5),
+                    ..Default::default()
+                },
+                "PF90088_RAW_STRAY_HAIR_MASK",
+            ),
+        ];
+        for (candidate, missing) in cases {
+            let producer = ProducerInputs {
+                stray_hair: Some(candidate),
+                ..Default::default()
+            };
+            let mut inputs = PortraitJobInputs::from_renderer_job(941, &masks);
+            inputs.fill_from_producer_inputs(&producer);
+            let (actual, run) = run_stray_hair_stage(&source, &inputs, true);
+            assert_eq!(actual, source.pixels);
+            assert_eq!(run.refusal, Some(Refusal::MissingInput(missing)));
+            assert!(run.skipped);
+            assert!(!run.executed);
+            assert!(run.dispatches.is_empty());
+        }
+    }
+
+    #[test]
     fn pf90088_stage_cpu_preserves_alpha_and_half_away_rounding() {
         let masks = PortraitMasks::solid(1.0);
         let (source, repair, raw, person, background) = stray_hair_fixture();
@@ -3275,6 +6064,46 @@ mod tests {
         assert_eq!(run.backend, PortraitBackend::Cpu);
         assert!(run.executed);
         assert!(run.dispatches.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n855_pf90088_empty_cuda_dispatch_falls_back_to_cpu() {
+        let masks = PortraitMasks::solid(1.0);
+        let (source, repair, raw, person, background) = stray_hair_fixture();
+        let expected = aurora_portrait::kernels::hair_body::stray_hair(
+            &source,
+            80.0,
+            0.5,
+            1.0,
+            0.5,
+            Some(&repair),
+            Some(&raw),
+            Some(&person),
+            Some(&background),
+        )
+        .unwrap();
+        let inputs =
+            stray_hair_stage_inputs(&masks, &repair, &raw, &person, &background);
+        let _empty = ForceCudaEmptyDispatchGuard::new();
+        let mut actual = source.pixels.clone();
+        let report = apply_portrait_effects_with_job(
+            &mut actual,
+            source.width,
+            source.height,
+            NormRect::FULL,
+            &BTreeMap::from([("pc:90088".to_string(), 0.8f32)]),
+            &inputs,
+        );
+        let run = &report.effects[0];
+        assert_eq!(actual, expected.pixels);
+        assert_eq!(run.backend, PortraitBackend::Cpu);
+        assert!(run.executed);
+        assert!(run.dispatches.is_empty());
+        assert!(run
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("CUDA returned no dispatch")));
     }
 
     #[cfg(windows)]
@@ -3322,11 +6151,11 @@ mod tests {
     }
 
     #[cfg(windows)]
-    struct ForceCudaFailureGuard;
+    pub(super) struct ForceCudaFailureGuard;
 
     #[cfg(windows)]
     impl ForceCudaFailureGuard {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             FORCE_CUDA_FAILURE.with(|flag| flag.set(true));
             Self
         }
@@ -3336,6 +6165,170 @@ mod tests {
     impl Drop for ForceCudaFailureGuard {
         fn drop(&mut self) {
             FORCE_CUDA_FAILURE.with(|flag| flag.set(false));
+        }
+    }
+
+    #[cfg(windows)]
+    struct ForceCudaEmptyDispatchGuard;
+
+    #[cfg(windows)]
+    impl ForceCudaEmptyDispatchGuard {
+        fn new() -> Self {
+            FORCE_CUDA_EMPTY_DISPATCH.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ForceCudaEmptyDispatchGuard {
+        fn drop(&mut self) {
+            FORCE_CUDA_EMPTY_DISPATCH.with(|flag| flag.set(false));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hlf_wrinkle_forced_cpu_paths_match_their_oracles() {
+        let width = 7u32;
+        let height = 5u32;
+        let pixels = width as usize * height as usize;
+        let source = Image::new(width, height, frame(width, height)).unwrap();
+        let base = Image::new(width, height, source.pixels.iter().rev().copied().collect()).unwrap();
+        let residual = Image::solid(width, height, [51, 102, 153, 77]);
+        let roi = Roi {
+            x: 1,
+            y: 1,
+            width: 4,
+            height: 3,
+        };
+        let source_rgb: Vec<f32> = (0..pixels * 3)
+            .map(|i| (i * 17 % 251) as f32 / 255.0)
+            .collect();
+        let median_rgb: Vec<f32> = (0..pixels * 3)
+            .map(|i| (i * 19 % 241) as f32 / 255.0)
+            .collect();
+        let gauss_rgb: Vec<f32> = (0..pixels * 3)
+            .map(|i| (i * 23 % 239) as f32 / 255.0)
+            .collect();
+        let face_mask: Vec<f32> = (0..pixels).map(|i| (i % 7) as f32 / 6.0).collect();
+        let face_mask_rgba: Vec<f32> = (0..pixels * 4)
+            .map(|i| (i % 11) as f32 / 10.0)
+            .collect();
+        let skin_mask: Vec<f32> = (0..pixels).map(|i| (i % 5) as f32 / 4.0).collect();
+        let wrinkle_mask: Vec<u8> = (0..pixels * 4).map(|i| (i * 13 % 256) as u8).collect();
+        let wrinkle_skin: Vec<u8> = (0..pixels).map(|i| (i * 29 % 256) as u8).collect();
+        let wrinkle_uniforms = WrinkleUniforms {
+            legal_alpha: 1.0,
+            dark_circle_alpha: 1.0,
+            diff_factor: 1.0,
+            diff_factor2: 0.0,
+            color_threshold_factor: 0.0,
+            mix_alpha: 1.0,
+            diff_min_threshold: -1.0,
+            diff_max_threshold: 1.0,
+            high_freq_min_threshold: -1.0,
+            high_freq_max_threshold: 1.0,
+        };
+        let hlf_body_uniforms = BodyHlfUniforms {
+            spotless_degree: 0.0,
+            retouch_degree: 1.0,
+            spotless_acne_threshold: 0.0,
+            spotless_high_freq_factor: 1.0,
+            spotless_low_freq_alpha: 0.0,
+            retouch_high_freq_factor: 0.0,
+            diff_min_range: -0.2,
+            diff_max_range: 0.2,
+        };
+        let masks = PortraitMasks::solid(1.0);
+        let inputs = PortraitJobInputs {
+            hlf_face: Some(HlfFaceInputs {
+                width,
+                height,
+                source_rgb_full_f32: &source_rgb,
+                median_rgb_full_f32: &median_rgb,
+                gauss_rgb_full_f32: &gauss_rgb,
+                face_mask_full_f32: &face_mask,
+                skin_mask_full_f32: &skin_mask,
+                roi,
+            }),
+            hlf_body: Some(HlfBodyInputs {
+                width,
+                height,
+                median_rgb_full_f32: &median_rgb,
+                gauss_rgb_full_f32: &gauss_rgb,
+                face_mask_rgba_full_f32: &face_mask_rgba,
+                skin_mask_full_f32: &skin_mask,
+                roi,
+                uniforms: hlf_body_uniforms,
+                adjust_lut: None,
+            }),
+            wrinkle: Some(WrinkleInputs {
+                base_full: &base,
+                residual_full: &residual,
+                mask_rgba_full: &wrinkle_mask,
+                skin_mask_full: &wrinkle_skin,
+                roi,
+                uniforms: wrinkle_uniforms,
+            }),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let _force = ForceCudaFailureGuard::new();
+        for pf in [21025, 21069, 21070, 21071, 30021, 30022] {
+            let expected = match pf {
+                21025 | 21069 | 21070 | 21071 => skin_adjust::wrinkle_apply(
+                    &source,
+                    &base,
+                    &residual,
+                    &wrinkle_mask,
+                    &wrinkle_skin,
+                    roi,
+                    skin_adjust::wrinkle_degree(pf, 50.0).unwrap(),
+                    wrinkle_uniforms,
+                )
+                .unwrap(),
+                30021 => {
+                    let rgb = skin_adjust::hlf_face_apply(
+                        &source_rgb,
+                        &median_rgb,
+                        &gauss_rgb,
+                        &face_mask,
+                        &skin_mask,
+                        width,
+                        height,
+                        roi,
+                        50.0,
+                    )
+                    .unwrap();
+                    hlf_rgb_f32_to_image(&source, &rgb).unwrap()
+                }
+                30022 => skin_adjust::body_hlf_apply(
+                    &source,
+                    roi,
+                    &median_rgb,
+                    &gauss_rgb,
+                    &face_mask_rgba,
+                    &skin_mask,
+                    50.0,
+                    hlf_body_uniforms,
+                    None,
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            };
+            let mut actual = source.pixels.clone();
+            let extra = BTreeMap::from([(format!("pc:{pf}"), 0.5)]);
+            let report = apply_portrait_effects_with_job(
+                &mut actual,
+                width,
+                height,
+                NormRect::FULL,
+                &extra,
+                &inputs,
+            );
+            assert_eq!(actual, expected.pixels, "PF{pf}");
+            assert_eq!(report.effects[0].backend, PortraitBackend::Cpu);
+            assert!(report.effects[0].executed);
+            assert!(report.effects[0].dispatches.is_empty());
         }
     }
 
@@ -3434,6 +6427,255 @@ mod tests {
                 "PF{pf} must name its own missing input"
             );
         }
+    }
+
+    fn suit_plan(order: u32) -> SuitPassPlan<'static> {
+        let (effect, mask_field, mask_value) = match order {
+            1..=3 => ("BlusherImageMakeup", "BlusherMaskType", 15),
+            4..=5 => ("NormalEyeBrowImageMakeup", "EyeBrowMaskType", 5),
+            6..=7 => ("SymEyeImageMakeup", "EyeMaskType", 10),
+            8..=9 => ("SymEyeImageMakeup", "EyeMaskType", 4),
+            10..=11 => ("SymEyeLashImageMakeup", "EyeLashMaskType", 4),
+            12 => ("LipStickImageMakeup", "LipMaskType", 3),
+            _ => panic!("suit order must be 1..=12"),
+        };
+        SuitPassPlan {
+            order,
+            effect,
+            degree: Some(70.0),
+            opacity: Some(49.0),
+            filter_type: Some(42),
+            material_path: Some("Resources/material.png"),
+            mask_field: Some(mask_field),
+            mask_value: Some(mask_value),
+            shelter_type: Some(7),
+            force_use_shelter: Some((4..=11).contains(&order)),
+            region_rect: Some([95, 40, 901, 1081]),
+            mix_color: Some([0, 0, 0, 255]),
+        }
+    }
+
+    fn suit_stage_pass<'a>(
+        mask: Option<&'a Image>,
+        mask_uv: Option<&'a [[f32; 2]]>,
+        material: Option<&'a Image>,
+        material_uv: Option<&'a [[f32; 2]]>,
+    ) -> SuitPassInput<'a> {
+        SuitPassInput {
+            kind: SuitPassKindInput::Image {
+                material,
+                material_uv,
+            },
+            mask,
+            mask_uv,
+            layer: Some(MakeupLayer {
+                mix_color: [0, 0, 0, 255],
+                opacity_percent: 49.0,
+                degree01: 0.7,
+                filter_type: 42,
+                mask_channel: MakeupMaskChannel::Rgba,
+            }),
+            shelter: 0.5,
+            region: 0.75,
+        }
+    }
+
+    #[test]
+    fn suit_producer_names_every_missing_same_job_input() {
+        let plan = suit_plan(1);
+        let mask = Image::solid(1, 1, [255, 255, 255, 255]);
+        let material = Image::solid(1, 1, [20, 30, 40, 128]);
+        let uv = [[0.5, 0.5]];
+        let complete = SuitPassSameJobInputs {
+            mask: Some(&mask),
+            mask_uv: Some(&uv),
+            material: Some(&material),
+            material_uv: Some(&uv),
+            shelter: Some(0.5),
+            region: Some(0.75),
+        };
+        assert!(produce_suit_pass(1, &plan, complete).is_ok());
+
+        let cases = [
+            (
+                SuitPassSameJobInputs {
+                    mask: None,
+                    ..complete
+                },
+                "suit mask",
+            ),
+            (
+                SuitPassSameJobInputs {
+                    mask_uv: None,
+                    ..complete
+                },
+                "suit mask uv",
+            ),
+            (
+                SuitPassSameJobInputs {
+                    material: None,
+                    ..complete
+                },
+                "suit material",
+            ),
+            (
+                SuitPassSameJobInputs {
+                    material_uv: None,
+                    ..complete
+                },
+                "suit material uv",
+            ),
+            (
+                SuitPassSameJobInputs {
+                    shelter: None,
+                    ..complete
+                },
+                "suit shelter",
+            ),
+            (
+                SuitPassSameJobInputs {
+                    region: None,
+                    ..complete
+                },
+                "suit region",
+            ),
+        ];
+        for (inputs, missing) in cases {
+            assert_eq!(
+                produce_suit_pass(1, &plan, inputs).err(),
+                Some(Refusal::MissingInput(missing))
+            );
+        }
+    }
+
+    #[test]
+    fn suit_stage_refuses_missing_existing_inputs() {
+        let mask = Image::solid(1, 1, [255, 255, 255, 255]);
+        let material = Image::solid(1, 1, [20, 30, 40, 128]);
+        let uv = [[0.5, 0.5]];
+        let cases = [
+            (
+                suit_stage_pass(None, Some(&uv), Some(&material), Some(&uv)),
+                "suit mask",
+            ),
+            (
+                suit_stage_pass(Some(&mask), None, Some(&material), Some(&uv)),
+                "suit mask uv",
+            ),
+            (
+                suit_stage_pass(Some(&mask), Some(&uv), None, Some(&uv)),
+                "suit material",
+            ),
+            (
+                suit_stage_pass(Some(&mask), Some(&uv), Some(&material), None),
+                "suit material uv",
+            ),
+        ];
+        for (pass, missing) in cases {
+            assert_eq!(
+                resolve_suit_passes(Some(&[pass])).err(),
+                Some(Refusal::MissingInput(missing))
+            );
+        }
+    }
+
+    #[test]
+    fn suit_producer_uses_only_pinned_mask_channels() {
+        let cases = [
+            ("BlusherMaskType", 15, MakeupMaskChannel::Rgba),
+            ("EyeBrowMaskType", 5, MakeupMaskChannel::RB),
+            ("EyeMaskType", 10, MakeupMaskChannel::Rgb),
+            ("EyeMaskType", 4, MakeupMaskChannel::RG),
+            ("EyeLashMaskType", 4, MakeupMaskChannel::RG),
+            ("LipMaskType", 3, MakeupMaskChannel::R),
+        ];
+        for (field, value, expected) in cases {
+            assert_eq!(suit_mask_channel(field, value), Ok(expected));
+        }
+        assert_eq!(
+            suit_mask_channel("UnknownMaskType", 99),
+            Err(Refusal::MissingInput("suit mask channel"))
+        );
+    }
+
+    #[test]
+    fn suit_producer_keeps_skip_shelter_and_region_rect_separate() {
+        let mask = Image::solid(1, 1, [255, 255, 255, 255]);
+        let material = Image::solid(1, 1, [20, 30, 40, 128]);
+        let uv = [[0.5, 0.5]];
+        let inputs = SuitPassSameJobInputs {
+            mask: Some(&mask),
+            mask_uv: Some(&uv),
+            material: Some(&material),
+            material_uv: Some(&uv),
+            shelter: None,
+            region: Some(0.75),
+        };
+        let mut plan = suit_plan(1);
+        plan.force_use_shelter = Some(true);
+        let before = produce_suit_pass(1, &plan, inputs).unwrap();
+        plan.region_rect = Some([0, 0, 0, 0]);
+        let after = produce_suit_pass(1, &plan, inputs).unwrap();
+        assert_eq!(before.shelter, 1.0);
+        assert_eq!(after.shelter, 1.0);
+        assert_eq!(before.region, 0.75);
+        assert_eq!(after.region, 0.75);
+    }
+
+    #[test]
+    fn suit_producer_emits_twelve_ordered_existing_inputs() {
+        let mask = Image::solid(1, 1, [255, 255, 255, 255]);
+        let material = Image::solid(1, 1, [20, 30, 40, 128]);
+        let uv = [[0.5, 0.5]];
+        let plans: Vec<_> = (1..=12).map(suit_plan).collect();
+        let jobs = vec![
+            SuitPassSameJobInputs {
+                mask: Some(&mask),
+                mask_uv: Some(&uv),
+                material: Some(&material),
+                material_uv: Some(&uv),
+                shelter: Some(0.5),
+                region: Some(0.75),
+            };
+            12
+        ];
+        let produced = produce_suit_passes(1, Some(&plans), Some(&jobs)).unwrap();
+        assert_eq!(produced.len(), 12);
+        assert!(produced
+            .iter()
+            .all(|pass| pass.mask.is_some() && pass.mask_uv.is_some()));
+        assert!(produced.iter().all(|pass| matches!(
+            &pass.kind,
+            SuitPassKindInput::Image {
+                material: Some(_),
+                material_uv: Some(_)
+            }
+        )));
+
+        let resolved = resolve_suit_passes(Some(&produced)).unwrap();
+        assert_eq!(resolved.len(), 12);
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|pass| pass.layer.mask_channel)
+                .collect::<Vec<_>>(),
+            vec![
+                MakeupMaskChannel::Rgba,
+                MakeupMaskChannel::Rgba,
+                MakeupMaskChannel::Rgba,
+                MakeupMaskChannel::RB,
+                MakeupMaskChannel::RB,
+                MakeupMaskChannel::Rgb,
+                MakeupMaskChannel::Rgb,
+                MakeupMaskChannel::RG,
+                MakeupMaskChannel::RG,
+                MakeupMaskChannel::RG,
+                MakeupMaskChannel::RG,
+                MakeupMaskChannel::R,
+            ]
+        );
+        assert!(resolved.iter().all(|pass| pass.shelter == 1.0
+            || (pass.shelter == 0.5 && pass.region == 0.75)));
     }
 
     fn pf90021_volume(offset: f32) -> VolumeLut64 {
@@ -3699,7 +6941,15 @@ mod tests {
                     run.skip_reason
                 );
             }
-            PortraitBackend::Cpu => panic!("PF30026 must never report a CPU stage success"),
+            PortraitBackend::Cpu => {
+                assert!(run.executed);
+                assert!(run.dispatches.is_empty());
+                assert!(run.fallback_reason.is_some());
+                let AlignmentFinalBlendOutcome::Applied(expected) = expected else {
+                    panic!("open edge gate produced a CPU-gated oracle");
+                };
+                assert_eq!(actual, expected.pixels, "PF30026 CPU fallback parity");
+            }
         }
     }
 
@@ -3845,9 +7095,104 @@ mod tests {
         assert_eq!(actual, source_pixels);
     }
 
+    #[test]
+    fn pf30026_producer_preserves_fields_and_typed_missing() {
+        let (width, height) = (4u32, 3u32);
+        let pixels = (width * height) as usize;
+        let masks = PortraitMasks::solid(1.0);
+        let source_pixels = frame(width, height);
+        let effect = Image::solid(width, height, [10, 20, 30, 40]);
+        let teeth_mask = vec![128u8; pixels];
+        let edge = vec![0.5f32; pixels];
+        let alignment = TeethAlignmentProducerInputs {
+            effect_rgb: Some(effect.clone()),
+            teeth_mask: Some(teeth_mask.clone()),
+            edge_plane_a: Some(edge.clone()),
+            edge_plane_b: Some(edge.clone()),
+            roi: Some(NormRect::FULL),
+        };
+        let producer = ProducerInputs {
+            teeth_alignment: Some(alignment.clone()),
+            ..Default::default()
+        };
+
+        let mut inputs = PortraitJobInputs::from_renderer_job(1, &masks);
+        inputs.fill_from_producer_inputs(&producer);
+        let staged = inputs.teeth_alignment.expect("producer row is present");
+        assert_eq!(staged.effect_rgb, Some(&effect));
+        assert_eq!(staged.teeth_mask, Some(teeth_mask.as_slice()));
+        assert_eq!(staged.edge_plane_a, Some(edge.as_slice()));
+        assert_eq!(staged.edge_plane_b, Some(edge.as_slice()));
+        assert_eq!(staged.roi, Some(NormRect::FULL));
+
+        let mut changed = producer.clone();
+        changed.teeth_alignment.as_mut().unwrap().edge_plane_b = Some(vec![0.25f32; pixels]);
+        assert_ne!(producer.fingerprint(), changed.fingerprint());
+
+        let cases = [
+            (
+                TeethAlignmentProducerInputs {
+                    effect_rgb: None,
+                    ..alignment.clone()
+                },
+                "PF30026 effect RGB",
+            ),
+            (
+                TeethAlignmentProducerInputs {
+                    teeth_mask: None,
+                    ..alignment.clone()
+                },
+                "PF30026 teeth mask",
+            ),
+            (
+                TeethAlignmentProducerInputs {
+                    edge_plane_a: None,
+                    ..alignment.clone()
+                },
+                "PF30026 edge plane A",
+            ),
+            (
+                TeethAlignmentProducerInputs {
+                    edge_plane_b: None,
+                    ..alignment.clone()
+                },
+                "PF30026 edge plane B",
+            ),
+            (
+                TeethAlignmentProducerInputs {
+                    roi: None,
+                    ..alignment
+                },
+                "PF30026 ROI",
+            ),
+        ];
+        for (alignment, missing) in cases {
+            let producer = ProducerInputs {
+                teeth_alignment: Some(alignment),
+                ..Default::default()
+            };
+            let mut inputs = PortraitJobInputs::from_renderer_job(1, &masks);
+            inputs.fill_from_producer_inputs(&producer);
+            let mut actual = source_pixels.clone();
+            let report = apply_portrait_effects_with_job(
+                &mut actual,
+                width,
+                height,
+                NormRect::FULL,
+                &BTreeMap::from([("pc:30026".to_string(), 0.8)]),
+                &inputs,
+            );
+            assert_eq!(
+                report.effects[0].refusal,
+                Some(Refusal::MissingInput(missing))
+            );
+            assert_eq!(actual, source_pixels);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn pf30026_forced_cuda_failure_is_not_a_cpu_success() {
+    fn n855_pf30026_forced_cuda_failure_falls_back_to_cpu() {
         let (width, height) = (4u32, 3u32);
         let masks = PortraitMasks::solid(1.0);
         let source_pixels = frame(width, height);
@@ -3875,14 +7220,29 @@ mod tests {
             &inputs,
         );
         let run = &report.effects[0];
-        assert_eq!(run.backend, PortraitBackend::Skipped);
-        assert!(!run.executed);
+        let expected = aurora_portrait::kernels::teeth_blend::apply_alignment_final_blend(
+            AlignmentFinalBlendJob {
+                original: Some(&Image::new(width, height, source_pixels.clone()).unwrap()),
+                effect_rgb: Some(&effect),
+                teeth_mask: Some(&[128; 12]),
+                edge_plane_a: Some(&edge),
+                edge_plane_b: Some(&edge),
+            },
+        )
+        .unwrap();
+        let AlignmentFinalBlendOutcome::Applied(expected) = expected else {
+            panic!("open edge gate produced a CPU-gated oracle");
+        };
+        assert_eq!(actual, expected.pixels);
+        assert_eq!(run.backend, PortraitBackend::Cpu);
+        assert!(run.executed);
         assert!(run.dispatches.is_empty());
-        assert!(matches!(
-            run.skip_reason,
-            Some(PortraitSkipReason::Cuda(CudaError::Unavailable(_)))
-        ));
-        assert_eq!(actual, source_pixels);
+        assert!(run
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("test-forced CUDA failure")));
+        assert!(run.refusal.is_none());
+        assert!(run.skip_reason.is_none());
     }
 
     #[test]
@@ -3907,6 +7267,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: None,
             }];
@@ -3936,6 +7297,7 @@ mod tests {
             filter_type: 40,
             material: Some(&material),
             material_uv: None,
+            material_uv_writes: None,
             mask: None,
             mask_uv: None,
         }];
@@ -3947,6 +7309,28 @@ mod tests {
         assert_eq!(
             effect.refusal,
             Some(Refusal::MissingInput("makeup material UV"))
+        );
+
+        let material_uv = vec![[0.0, 0.0]; 8 * 6];
+        let no_writes = [MakeupInput {
+            pf: 111,
+            mix_color: [30, 60, 90, 180],
+            opacity_percent: 75.0,
+            filter_type: 40,
+            material: Some(&material),
+            material_uv: Some(&material_uv),
+            material_uv_writes: None,
+            mask: None,
+            mask_uv: None,
+        }];
+        let inputs = PortraitJobInputs {
+            makeup: Some(&no_writes),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let (_, effect) = apply_one_with_inputs(111, 8, 6, &inputs);
+        assert_eq!(
+            effect.refusal,
+            Some(Refusal::MissingInput("makeup material UV writes"))
         );
     }
 
@@ -3987,6 +7371,7 @@ mod tests {
                 ]
             })
             .collect();
+        let material_uv_writes = vec![1u16; pixels];
 
         let rows = [
             MakeupInput {
@@ -3996,6 +7381,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: Some(&mask_uv),
             },
@@ -4006,6 +7392,7 @@ mod tests {
                 filter_type: 40,
                 material: Some(&material),
                 material_uv: Some(&material_uv),
+                material_uv_writes: Some(&material_uv_writes),
                 mask: None,
                 mask_uv: None,
             },
@@ -4016,6 +7403,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: Some(&mask_uv),
             },
@@ -4026,6 +7414,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: Some(&mask_uv),
             },
@@ -4036,6 +7425,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: Some(&mask_uv),
             },
@@ -4046,6 +7436,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: Some(&mask_uv),
             },
@@ -4056,6 +7447,7 @@ mod tests {
                 filter_type: 11,
                 material: None,
                 material_uv: None,
+                material_uv_writes: None,
                 mask: Some(&mask),
                 mask_uv: Some(&mask_uv),
             },
@@ -4170,6 +7562,153 @@ mod tests {
         run_makeup_route_case(false);
     }
 
+    struct Pf111StageResult {
+        before: Vec<u8>,
+        after: Vec<u8>,
+        writes: Vec<u16>,
+        effect: PortraitEffectRun,
+    }
+
+    fn run_pf111_producer_stage(force_cpu: bool) -> Pf111StageResult {
+        use aurora_portrait::kernels::pf111_uv::{
+            EyePupilPosition49, EyeSide, NormalEyeEbo, NormalEyeUv49, PF111_VERTEX_COUNT,
+            Pf111RasterInputs, RasterExtent, rasterize_pixels,
+        };
+
+        let (width, height) = (8u32, 8u32);
+        let mut positions = vec![[0.0; 2]; PF111_VERTEX_COUNT];
+        let mut normal_eye_uv = vec![[0.0; 2]; PF111_VERTEX_COUNT];
+        positions[0] = [0.0, 0.0];
+        positions[1] = [width as f32, 0.0];
+        positions[2] = [0.0, height as f32];
+        normal_eye_uv[0] = [0.5, 0.5];
+        normal_eye_uv[1] = [0.5, 0.5];
+        normal_eye_uv[2] = [0.5, 0.5];
+        let ebo = [0u16, 1, 2];
+        let uv = rasterize_pixels(Pf111RasterInputs {
+            side: EyeSide::Left,
+            positions: Some(EyePupilPosition49::new(&positions).unwrap()),
+            normal_eye_uv: Some(NormalEyeUv49::new(&normal_eye_uv).unwrap()),
+            extent: Some(RasterExtent::new(width, height).unwrap()),
+            normal_eye_ebo: Some(NormalEyeEbo::new(&ebo).unwrap()),
+        })
+        .unwrap();
+        let material = Image::solid(1, 1, [0, 0, 255, 255]);
+        let rows = [MakeupInput {
+            pf: 111,
+            mix_color: [255, 255, 255, 255],
+            opacity_percent: 100.0,
+            filter_type: 40,
+            material: Some(&material),
+            material_uv: Some(uv.material_uv()),
+            material_uv_writes: Some(uv.writes()),
+            mask: None,
+            mask_uv: None,
+        }];
+        let masks = PortraitMasks::solid(1.0);
+        let inputs = PortraitJobInputs {
+            makeup: Some(&rows),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let mut rgba = frame(width, height);
+        let before = rgba.clone();
+        #[cfg(windows)]
+        let _force = force_cpu.then(ForceCudaFailureGuard::new);
+        #[cfg(not(windows))]
+        let _ = force_cpu;
+        let report = apply_portrait_effects_with_job(
+            &mut rgba,
+            width,
+            height,
+            NormRect::FULL,
+            &BTreeMap::from([("pc:111".to_string(), 0.8f32)]),
+            &inputs,
+        );
+        assert_eq!(report.effects.len(), 1);
+        Pf111StageResult {
+            before,
+            after: rgba,
+            writes: uv.writes().to_vec(),
+            effect: report.effects.into_iter().next().unwrap(),
+        }
+    }
+
+    fn assert_pf111_uncovered_pixels_are_not_injected(case: &Pf111StageResult) {
+        assert!(case.writes.iter().any(|writes| *writes == 0));
+        assert!(case.writes.iter().any(|writes| *writes > 0));
+        let mut covered_changed = false;
+        for (pixel, writes) in case.writes.iter().enumerate() {
+            let base = pixel * 4;
+            if *writes == 0 {
+                assert_eq!(
+                    &case.after[base..base + 4],
+                    &case.before[base..base + 4],
+                    "uncovered pixel {pixel} sampled the [0,0] material slot"
+                );
+            } else if case.after[base..base + 4] != case.before[base..base + 4] {
+                covered_changed = true;
+            }
+        }
+        assert!(covered_changed, "covered PF111 pixels must be affected");
+    }
+
+    #[test]
+    fn pf111_producer_stage_gate_matches_cpu() {
+        let cpu = run_pf111_producer_stage(true);
+        assert_eq!(cpu.effect.backend, PortraitBackend::Cpu);
+        assert!(cpu.effect.executed);
+        assert!(cpu.effect.dispatches.is_empty());
+        assert_pf111_uncovered_pixels_are_not_injected(&cpu);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pf111_producer_stage_gate_matches_real_backend() {
+        let cpu = run_pf111_producer_stage(true);
+        let actual = run_pf111_producer_stage(false);
+        assert_eq!(actual.after, cpu.after, "PF111 producer-stage parity");
+        assert_pf111_uncovered_pixels_are_not_injected(&actual);
+        eprintln!(
+            "PF111 producer-stage backend={:?} kernels={:?} fallback={:?}",
+            actual.effect.backend,
+            actual
+                .effect
+                .dispatches
+                .iter()
+                .map(|dispatch| dispatch.kernel)
+                .collect::<Vec<_>>(),
+            actual.effect.fallback_reason
+        );
+        if actual.effect.backend == PortraitBackend::Cpu {
+            assert!(
+                std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
+                "CUDA required but PF111 fell back: {:?}",
+                actual.effect.fallback_reason
+            );
+        } else {
+            assert!(!actual.effect.dispatches.is_empty());
+        }
+    }
+
+    #[test]
+    fn pf111_missing_same_job_producer_input_stays_typed() {
+        use aurora_portrait::kernels::pf111_uv::{
+            EYE_PUPIL_POSITION_MISSING, EyeSide, Pf111RasterInputs, rasterize_pixels,
+        };
+
+        assert_eq!(
+            rasterize_pixels(Pf111RasterInputs {
+                side: EyeSide::Left,
+                positions: None,
+                normal_eye_uv: None,
+                extent: None,
+                normal_eye_ebo: None,
+            })
+            .unwrap_err(),
+            Refusal::MissingInput(EYE_PUPIL_POSITION_MISSING)
+        );
+    }
+
     #[test]
     fn missing_skin_plane_is_a_typed_refusal() {
         let mut masks = PortraitMasks::solid(1.0);
@@ -4263,6 +7802,7 @@ mod tests {
 
         let inputs = PortraitJobInputs {
             origin: PortraitJobInputOrigin::RendererJob { job_id: 9 },
+            receipt: None,
             masks: &masks,
             assets: PortraitAssetInputs {
                 teeth_whiten_lut: Some(&teeth_lut),
@@ -4273,7 +7813,9 @@ mod tests {
                 bright_ui: 60.0,
                 deyellow_ui: 70.0,
             }),
+            pf30025: None,
             teeth_alignment: None,
+            radiance: None,
             beard: Some(BeardInputs {
                 mask_a: &beard_a,
                 mask_b: &beard_b,
@@ -4321,6 +7863,9 @@ mod tests {
             hair_gloss: None,
             stray_hair: StrayHairInputs::default(),
             makeup: None,
+            hlf_face: None,
+            hlf_body: None,
+            wrinkle: None,
             pf90021: None,
         };
 
@@ -4530,12 +8075,415 @@ mod tests {
     }
 
     #[test]
-    fn skin_clarity_and_radiance_run_with_assets() {
-        for (pf, degree) in [(8070u32, 0.5f32), (90004, 0.5)] {
-            let mut rgba = frame(8, 8);
-            apply(&mut rgba, 8, 8, &[(&format!("pc:{pf}"), degree)]);
-            assert_eq!(rgba.len(), 8 * 8 * 4, "PF{pf} output size");
+    fn skin_clarity_runs_with_assets() {
+        let mut rgba = frame(8, 8);
+        apply(&mut rgba, 8, 8, &[("pc:8070", 0.5)]);
+        assert_eq!(rgba.len(), 8 * 8 * 4);
+    }
+
+    #[test]
+    fn pf90004_requires_an_owned_same_job_bundle() {
+        let masks = PortraitMasks::solid(1.0);
+        let absent = PortraitJobInputs::from_renderer_job(1, &masks);
+        let (_, run) = apply_one_with_inputs(90004, 8, 8, &absent);
+        assert_eq!(
+            run.refusal,
+            Some(Refusal::MissingInput("PF90004_PARSING_RGBA"))
+        );
+
+        let skin = vec![255u8; 64];
+        let rgba = vec![0u8; 64 * 4];
+        let complete = RadianceInputs {
+            frame_width: Some(8),
+            frame_height: Some(8),
+            skin_mask: Some(&skin),
+            parsing_rgba: Some(&rgba),
+            face_rgba: Some(&rgba),
+            value_mean: Some(128.0),
+            roi: Some(NormRect::FULL),
+        };
+        for (radiance, missing) in [
+            (
+                RadianceInputs {
+                    frame_width: None,
+                    ..complete
+                },
+                "PF90004_FRAME_WIDTH",
+            ),
+            (
+                RadianceInputs {
+                    frame_height: None,
+                    ..complete
+                },
+                "PF90004_FRAME_HEIGHT",
+            ),
+            (
+                RadianceInputs {
+                    skin_mask: None,
+                    ..complete
+                },
+                "PF90004_SKIN_MASK",
+            ),
+            (
+                RadianceInputs {
+                    parsing_rgba: None,
+                    ..complete
+                },
+                "PF90004_PARSING_RGBA",
+            ),
+            (
+                RadianceInputs {
+                    face_rgba: None,
+                    ..complete
+                },
+                "PF90004_FACE_RGBA",
+            ),
+            (
+                RadianceInputs {
+                    value_mean: None,
+                    ..complete
+                },
+                "PF90004_VALUE_MEAN",
+            ),
+            (
+                RadianceInputs { roi: None, ..complete },
+                "PF90004_ROI",
+            ),
+        ] {
+            let inputs = PortraitJobInputs {
+                radiance: Some(radiance),
+                ..PortraitJobInputs::from_renderer_job(1, &masks)
+            };
+            let (_, run) = apply_one_with_inputs(90004, 8, 8, &inputs);
+            assert_eq!(run.refusal, Some(Refusal::MissingInput(missing)));
         }
+
+        let inputs = PortraitJobInputs {
+            radiance: Some(RadianceInputs {
+                roi: Some(NormRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                }),
+                ..complete
+            }),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let (_, run) = apply_one_with_inputs(90004, 8, 8, &inputs);
+        assert_eq!(
+            run.refusal,
+            Some(Refusal::ValueOutOfRange("PF90004_ROI"))
+        );
+
+        let inputs = PortraitJobInputs {
+            radiance: Some(complete),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let (_, run) = apply_one_with_inputs(90004, 8, 8, &inputs);
+        assert!(run.refusal.is_none());
+        assert!(run.executed);
+    }
+
+    #[test]
+    fn pf90004_producer_writer_is_atomic_and_frame_exact() {
+        let bundle = || {
+            Pf90004ProducerInputs::from_same_job(
+                8,
+                8,
+                vec![0u8; 64],
+                vec![0u8; 64 * 4],
+                vec![0u8; 64 * 4],
+                82.42559051513672,
+                NormRect::FULL,
+            )
+            .expect("valid PF90004 bundle")
+        };
+
+        for (result, expected) in [
+            (
+                Pf90004ProducerInputs::from_same_job(
+                    0,
+                    8,
+                    vec![0; 64],
+                    vec![0; 64 * 4],
+                    vec![0; 64 * 4],
+                    128.0,
+                    NormRect::FULL,
+                ),
+                Refusal::ShapeMismatch("PF90004_FRAME_SIZE"),
+            ),
+            (
+                Pf90004ProducerInputs::from_same_job(
+                    8,
+                    8,
+                    vec![0; 63],
+                    vec![0; 64 * 4],
+                    vec![0; 64 * 4],
+                    128.0,
+                    NormRect::FULL,
+                ),
+                Refusal::ShapeMismatch("PF90004_SKIN_MASK"),
+            ),
+            (
+                Pf90004ProducerInputs::from_same_job(
+                    8,
+                    8,
+                    vec![0; 64],
+                    vec![0; 64 * 4 - 1],
+                    vec![0; 64 * 4],
+                    128.0,
+                    NormRect::FULL,
+                ),
+                Refusal::ShapeMismatch("PF90004_PARSING_RGBA"),
+            ),
+            (
+                Pf90004ProducerInputs::from_same_job(
+                    8,
+                    8,
+                    vec![0; 64],
+                    vec![0; 64 * 4],
+                    vec![0; 64 * 4 - 1],
+                    128.0,
+                    NormRect::FULL,
+                ),
+                Refusal::ShapeMismatch("PF90004_FACE_RGBA"),
+            ),
+            (
+                Pf90004ProducerInputs::from_same_job(
+                    8,
+                    8,
+                    vec![0; 64],
+                    vec![0; 64 * 4],
+                    vec![0; 64 * 4],
+                    f32::NAN,
+                    NormRect::FULL,
+                ),
+                Refusal::ValueOutOfRange("PF90004_VALUE_MEAN"),
+            ),
+            (
+                Pf90004ProducerInputs::from_same_job(
+                    8,
+                    8,
+                    vec![0; 64],
+                    vec![0; 64 * 4],
+                    vec![0; 64 * 4],
+                    128.0,
+                    NormRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.5,
+                        height: 1.0,
+                    },
+                ),
+                Refusal::ValueOutOfRange("PF90004_ROI"),
+            ),
+        ] {
+            assert_eq!(result.expect_err("invalid bundle"), expected);
+        }
+
+        let mut producer = ProducerInputs::default();
+        let empty_fingerprint = producer.fingerprint();
+        producer.write_pf90004(bundle());
+        assert_ne!(producer.fingerprint(), empty_fingerprint);
+
+        let masks = PortraitMasks::solid(1.0);
+        let mut inputs = PortraitJobInputs::from_renderer_job(7, &masks);
+        inputs.fill_from_producer_inputs(&producer);
+        let radiance = inputs.radiance.expect("PF90004 bundle");
+        assert_eq!(
+            (radiance.frame_width, radiance.frame_height),
+            (Some(8), Some(8))
+        );
+        assert_eq!(radiance.skin_mask.map(<[u8]>::len), Some(64));
+        assert_eq!(radiance.parsing_rgba.map(<[u8]>::len), Some(64 * 4));
+        assert_eq!(radiance.face_rgba.map(<[u8]>::len), Some(64 * 4));
+        assert_eq!(radiance.value_mean, Some(82.42559051513672));
+        assert_eq!(radiance.roi, Some(NormRect::FULL));
+
+        let (_, run) = apply_one_with_inputs(90004, 8, 8, &inputs);
+        assert!(run.refusal.is_none());
+        assert!(run.executed);
+
+        let shape_bundle = Pf90004ProducerInputs::from_same_job(
+            4,
+            16,
+            vec![0; 64],
+            vec![0; 64 * 4],
+            vec![0; 64 * 4],
+            128.0,
+            NormRect::FULL,
+        )
+        .expect("same byte count, different frame shape");
+        let mut wrong_shape = ProducerInputs::default();
+        wrong_shape.write_pf90004(shape_bundle);
+        let mut wrong_inputs = PortraitJobInputs::from_renderer_job(8, &masks);
+        wrong_inputs.fill_from_producer_inputs(&wrong_shape);
+        let (_, run) = apply_one_with_inputs(90004, 8, 8, &wrong_inputs);
+        assert_eq!(
+            run.refusal,
+            Some(Refusal::ShapeMismatch("PF90004_FRAME_SIZE"))
+        );
+    }
+
+    #[test]
+    fn pf90004_parser_producer_keeps_unproven_planes_absent() {
+        let masks = PortraitMasks {
+            skin: Some(vec![1.0, 0.0, 0.5, 0.0]),
+            hair: None,
+            face: Some(vec![1.0, 1.0, 1.0, 1.0]),
+            body: Some(vec![0.0; 4]),
+            width: 2,
+            height: 2,
+        };
+        let mut rgba = vec![0u8; 16];
+        for (pixel, red) in [100u8, 200, 50, 20].into_iter().enumerate() {
+            rgba[pixel * 4] = red;
+            rgba[pixel * 4 + 3] = 255;
+        }
+        let auto = masks
+            .pf90004_parser_inputs(&rgba, 2, 2, NormRect::FULL)
+            .expect("parser fields");
+        assert_eq!(auto.source, Pf90004AutoSource::PortraitParser);
+        assert_eq!(auto.skin_mask, vec![255, 0, 128, 0]);
+        assert_eq!(auto.parsing_rgba, None);
+        assert_eq!(auto.face_rgba, None);
+        assert_eq!(auto.value_mean, 75.0);
+        assert_eq!(auto.roi, NormRect::FULL);
+    }
+
+    #[test]
+    fn pf90004_value_mean_uses_native_even_statistics_size() {
+        let masks = PortraitMasks {
+            skin: Some(vec![1.0; 15]),
+            hair: None,
+            face: None,
+            body: None,
+            width: 5,
+            height: 3,
+        };
+        let mut rgba = vec![0u8; 15 * 4];
+        for pixel in 0..15 {
+            rgba[pixel * 4] = 101;
+            rgba[pixel * 4 + 1] = 202;
+            rgba[pixel * 4 + 2] = 17;
+            rgba[pixel * 4 + 3] = 255;
+        }
+        let auto = masks
+            .pf90004_parser_inputs(&rgba, 5, 3, NormRect::FULL)
+            .expect("parser fields");
+        assert_eq!(auto.value_mean, 101.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pf90004_cuda_route_matches_cpu_oracle_and_reports_dispatch() {
+        let (width, height) = (35u32, 27u32);
+        let pixels = (width * height) as usize;
+        let source = Image::new(width, height, frame(width, height)).unwrap();
+        let masks = PortraitMasks::solid(1.0);
+        let skin: Vec<u8> = (0..pixels).map(|i| (40 + (i * 19) % 216) as u8).collect();
+        let parsing: Vec<u8> = (0..pixels * 4)
+            .map(|i| ((i * 13 + 7) % 256) as u8)
+            .collect();
+        let face: Vec<u8> = (0..pixels * 4)
+            .map(|i| ((i * 29 + 11) % 256) as u8)
+            .collect();
+        let radiance = RadianceInputs {
+            frame_width: Some(width),
+            frame_height: Some(height),
+            skin_mask: Some(&skin),
+            parsing_rgba: Some(&parsing),
+            face_rgba: Some(&face),
+            value_mean: Some(143.25),
+            roi: Some(NormRect::FULL),
+        };
+        let inputs = PortraitJobInputs {
+            radiance: Some(radiance),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let expected = apply_skin_radiance(&source, 0.47, Some(radiance)).unwrap();
+        let mut actual = source.pixels.clone();
+        let report = apply_portrait_effects_with_job(
+            &mut actual,
+            width,
+            height,
+            NormRect::FULL,
+            &BTreeMap::from([("pc:90004".to_string(), 0.47f32)]),
+            &inputs,
+        );
+        assert_eq!(actual, expected.pixels);
+        let effect = &report.effects[0];
+        assert!(effect.executed);
+        assert!(effect.refusal.is_none());
+        if effect.backend == PortraitBackend::Cuda {
+            assert_eq!(
+                effect
+                    .dispatches
+                    .iter()
+                    .map(|dispatch| dispatch.kernel)
+                    .collect::<Vec<_>>(),
+                vec![aurora_portrait::cuda_radiance::KERNEL]
+            );
+            let dispatch = &effect.dispatches[0];
+            assert_eq!(dispatch.block, (16, 16));
+            assert!(!dispatch.device.is_empty());
+            eprintln!(
+                "PF90004 stage device={} kernel={} cc={:?} driver={} ptx_isa={:?}",
+                dispatch.device,
+                dispatch.kernel,
+                dispatch.compute_cap,
+                dispatch.driver_version,
+                dispatch.ptx_isa
+            );
+        } else {
+            assert!(
+                std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
+                "CUDA required but PF90004 fell back: {:?}",
+                effect.fallback_reason
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pf90004_forced_cuda_failure_uses_cpu_oracle() {
+        let (width, height) = (8u32, 8u32);
+        let pixels = (width * height) as usize;
+        let source = Image::new(width, height, frame(width, height)).unwrap();
+        let masks = PortraitMasks::solid(1.0);
+        let skin = vec![255u8; pixels];
+        let parsing = vec![0u8; pixels * 4];
+        let face = vec![0u8; pixels * 4];
+        let radiance = RadianceInputs {
+            frame_width: Some(width),
+            frame_height: Some(height),
+            skin_mask: Some(&skin),
+            parsing_rgba: Some(&parsing),
+            face_rgba: Some(&face),
+            value_mean: Some(128.0),
+            roi: Some(NormRect::FULL),
+        };
+        let inputs = PortraitJobInputs {
+            radiance: Some(radiance),
+            ..PortraitJobInputs::from_renderer_job(1, &masks)
+        };
+        let expected = apply_skin_radiance(&source, 0.5, Some(radiance)).unwrap();
+        let mut actual = source.pixels.clone();
+        let _force = ForceCudaFailureGuard::new();
+        let report = apply_portrait_effects_with_job(
+            &mut actual,
+            width,
+            height,
+            NormRect::FULL,
+            &BTreeMap::from([("pc:90004".to_string(), 0.5f32)]),
+            &inputs,
+        );
+        assert_eq!(actual, expected.pixels);
+        let effect = &report.effects[0];
+        assert_eq!(effect.backend, PortraitBackend::Cpu);
+        assert!(effect.dispatches.is_empty());
+        assert!(effect.fallback_reason.is_some());
     }
 
     #[test]
@@ -4551,9 +8499,16 @@ mod tests {
         let source = Image::new(8, 8, frame(8, 8)).expect("frame");
         let masks = PortraitMasks::solid(1.0);
         let skin = masks.mask_u8(MaskKind::Skin, 8, 8, NormRect::FULL);
-        for (pf, degree) in [(8068u32, 0.1f32), (90005, 0.9), (90007, 0.9)] {
+        for (pf, degree) in [
+            (8068u32, 0.1f32),
+            (30096, 0.1),
+            (30096, 0.9),
+            (90005, 0.9),
+            (90007, 0.9),
+        ] {
             let cpu = match pf {
                 8068 => apply_skin_gloss(&source, degree, skin.as_deref()),
+                30096 => apply_skin_temperature(&source, degree, skin.as_deref()),
                 90005 => apply_skin_whiten(&source, degree, skin.as_deref()),
                 90007 => apply_skin_ruddy(&source, degree, skin.as_deref()),
                 _ => unreachable!(),
@@ -4583,6 +8538,78 @@ mod tests {
                 }
                 None => panic!("expected PF{pf} CUDA route"),
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pf30096_forced_cuda_failure_falls_back_to_cpu() {
+        let (width, height) = (8u32, 8u32);
+        let source = Image::new(width, height, frame(width, height)).expect("frame");
+        let masks = PortraitMasks::solid(1.0);
+        let skin = masks.mask_u8(MaskKind::Skin, width, height, NormRect::FULL);
+        let expected = apply_skin_temperature(&source, 0.9, skin.as_deref()).expect("cpu");
+        let params = BTreeMap::from([("pc:30096".to_string(), 0.9f32)]);
+        let inputs = PortraitJobInputs::from_renderer_job(1, &masks);
+        let mut actual = source.pixels.clone();
+        let _force = ForceCudaFailureGuard::new();
+        let report = apply_portrait_effects_with_report_and_inputs(
+            &mut actual,
+            width,
+            height,
+            NormRect::FULL,
+            &params,
+            &inputs,
+        );
+        assert_eq!(actual, expected.pixels);
+        let effect = &report.effects[0];
+        assert_eq!(effect.backend, PortraitBackend::Cpu);
+        assert!(effect.dispatches.is_empty());
+        assert!(effect.executed);
+        assert!(
+            effect
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("test-forced CUDA failure"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pf30096_report_marks_the_real_backend() {
+        let (width, height) = (8u32, 8u32);
+        let source = Image::new(width, height, frame(width, height)).expect("frame");
+        let masks = PortraitMasks::solid(1.0);
+        let skin = masks.mask_u8(MaskKind::Skin, width, height, NormRect::FULL);
+        let expected = apply_skin_temperature(&source, 0.9, skin.as_deref()).expect("cpu");
+        let params = BTreeMap::from([("pc:30096".to_string(), 0.9f32)]);
+        let inputs = PortraitJobInputs::from_renderer_job(1, &masks);
+        let mut actual = source.pixels.clone();
+        let report = apply_portrait_effects_with_report_and_inputs(
+            &mut actual,
+            width,
+            height,
+            NormRect::FULL,
+            &params,
+            &inputs,
+        );
+        assert_eq!(actual, expected.pixels);
+        let effect = &report.effects[0];
+        assert!(effect.executed);
+        assert!(effect.refusal.is_none());
+        match effect.backend {
+            PortraitBackend::Cuda => {
+                assert_eq!(effect.dispatches.len(), 1);
+                assert_eq!(
+                    effect.dispatches[0].kernel,
+                    aurora_portrait::cuda_lut::TEMPERATURE_KERNEL
+                );
+            }
+            PortraitBackend::Cpu => {
+                assert!(std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none());
+                assert!(effect.fallback_reason.is_some());
+            }
+            PortraitBackend::Skipped => panic!("PF30096 unexpectedly skipped"),
         }
     }
 

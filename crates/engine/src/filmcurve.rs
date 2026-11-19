@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 
 const FULL: f32 = u32::MAX as f32;
 
@@ -179,20 +180,23 @@ fn with_curves<R>(f: impl FnOnce(&HashMap<String, FilmCurve>) -> R) -> R {
 
 fn load_index(dir: &Path) -> Result<HashMap<String, FilmCurve>> {
     SCANS.fetch_add(1, Ordering::Relaxed);
-    let mut out = HashMap::new();
-    for entry in std::fs::read_dir(dir)?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("fcrv") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(mut parsed) = parse_film_curves(&bytes) {
-                if let Some(primary) = parsed.drain(..).next() {
-                    out.insert(stem.to_owned(), primary);
-                }
-            }
-        }
+    let files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("fcrv"))
+        .collect();
+    let curves: Vec<(String, FilmCurve)> = files
+        .into_par_iter()
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?.to_owned();
+            let bytes = std::fs::read(path).ok()?;
+            let mut parsed = parse_film_curves(&bytes).ok()?;
+            Some((stem, parsed.drain(..).next()?))
+        })
+        .collect();
+    let mut out = HashMap::with_capacity(curves.len());
+    for (stem, curve) in curves {
+        out.insert(stem, curve);
     }
     Ok(out)
 }
@@ -302,6 +306,22 @@ mod tests {
     #[test]
     fn unknown_name_has_no_lut() {
         assert!(curve_lut("definitely not a curve").is_none());
+    }
+
+    #[test]
+    #[ignore = "profiles the installed Capture One film-curve index"]
+    fn bench_installed_curve_index() {
+        use std::time::Instant;
+        if !curve_dir().is_dir() {
+            return;
+        }
+        let start = Instant::now();
+        let names = names();
+        println!(
+            "FILM_CURVE_INDEX count={} ms={:.3}",
+            names.len(),
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     /// Needs the Capture One install, so it is skipped by default.

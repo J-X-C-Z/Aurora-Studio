@@ -222,7 +222,6 @@ mod tests {
         look.exposure.exposure = 0.7;
         look.exposure.contrast = -40.0;
         look.white_balance.kelvin = 6100.0;
-        look.white_balance.gains = None;
         overlay_look(&mut dst, &look);
         assert_eq!(dst.exposure.exposure, 0.7);
         assert_eq!(dst.exposure.contrast, 12.0);

@@ -1,4 +1,5 @@
-//! PF90005 SKIN_WHITEN / PF90007 SKIN_ROSY / PF21015 SKIN_TINT on NVIDIA.
+//! PF90005 SKIN_WHITEN / PF90007 SKIN_ROSY / PF21015 SKIN_TINT /
+//! PF30096 SKIN_TEMPERATURE on NVIDIA.
 //!
 //! Same pixel law as `kernels::makeup::skin_adjust_lut`: packed 512x512x3 atlas,
 //! 8x8 tiles of 64x64 selected by blue, 8-bit fixed-point bilinear tap,
@@ -15,6 +16,10 @@
 //! PF21015 is the fixed-point contract: the host selects one of the two tint
 //! atlases and passes `mix = abs(ui/100)`. It is not byte-identical to
 //! `kernels::face_detail::skin_tint`, which uses f64 sampling and half-even.
+//!
+//! PF30096 keeps the CPU `face_detail::skin_temperature` contract: f64 LUT
+//! sampling, f64 blend, and ties-to-even byte conversion. Its extra kernel is
+//! in the same PTX image and uses the same atlas/mask ABI.
 
 use crate::cuda::{CudaError, Dispatch};
 use crate::{Image, Refusal};
@@ -27,6 +32,10 @@ pub const GATE: f32 = 0.001;
 pub const LUT_BYTES: usize = 512 * 512 * 3;
 /// PF21015 SKIN_TINT with TintGreen/TintMagenta selection.
 pub const PF_TINT: u32 = 21015;
+/// PF30096 SKIN_TEMPERATURE.
+pub const PF_TEMPERATURE: u32 = 30096;
+/// PF30096 f64 kernel entry point.
+pub const TEMPERATURE_KERNEL: &str = "skin_temperature_kernel";
 /// Kernel launch shape, shared with the P15 stages.
 const BLOCK: (u32, u32) = (16, 16);
 
@@ -86,6 +95,31 @@ fn check(
     }
     if pf != 90005 && pf != 90007 && pf != PF_TINT {
         return Err(Refusal::UnknownEffect(pf));
+    }
+    Ok(())
+}
+
+fn check_temperature(
+    source: &Image,
+    mask_r: &[u8],
+    cold_lut: &[u8],
+    warm_lut: &[u8],
+    ui: f32,
+) -> Result<(), Refusal> {
+    source
+        .validate()
+        .map_err(|_| Refusal::ShapeMismatch("source"))?;
+    if mask_r.len() != source.pixel_count() {
+        return Err(Refusal::ShapeMismatch("mask_r"));
+    }
+    if cold_lut.len() != LUT_BYTES {
+        return Err(Refusal::ShapeMismatch("cold_lut"));
+    }
+    if warm_lut.len() != LUT_BYTES {
+        return Err(Refusal::ShapeMismatch("warm_lut"));
+    }
+    if !ui.is_finite() || !(-100.0..=100.0).contains(&ui) {
+        return Err(Refusal::ValueOutOfRange("ui"));
     }
     Ok(())
 }
@@ -161,6 +195,80 @@ impl SkinLut {
         ))
     }
 
+    /// PF30096 byte-for-byte GPU twin of
+    /// `kernels::face_detail::skin_temperature`.
+    pub fn temperature(
+        &self,
+        source: &Image,
+        mask_r: &[u8],
+        cold_lut: &[u8],
+        warm_lut: &[u8],
+        ui: f32,
+    ) -> Result<(Image, Dispatch), CudaError> {
+        check_temperature(source, mask_r, cold_lut, warm_lut, ui)?;
+        let lut = if ui < 0.0 { cold_lut } else { warm_lut };
+        // The kernel's `mix` slot carries the signed UI for PF30096.
+        let uniforms = Uniforms::new(source.width, source.height, ui);
+        let grid = (
+            source.width.div_ceil(BLOCK.0).max(1),
+            source.height.div_ceil(BLOCK.1).max(1),
+        );
+        let (pixels, dispatch) = self.0.run_u8_cached_lut(
+            TEMPERATURE_KERNEL,
+            grid,
+            &source.pixels,
+            mask_r,
+            lut,
+            as_bytes(&uniforms),
+        )?;
+        Ok((
+            Image {
+                width: source.width,
+                height: source.height,
+                pixels,
+            },
+            dispatch,
+        ))
+    }
+
+    /// Run PF90005 -> PF90007 with one source/mask upload and one final download.
+    pub fn skin_adjust_chain(
+        &self,
+        source: &Image,
+        mask_r: &[u8],
+        first_lut_rgb512: &[u8],
+        first_mix: f32,
+        second_lut_rgb512: &[u8],
+        second_mix: f32,
+    ) -> Result<(Image, Dispatch), CudaError> {
+        check(source, mask_r, first_lut_rgb512, first_mix, 90005)?;
+        check(source, mask_r, second_lut_rgb512, second_mix, 90007)?;
+        let first_uniforms = Uniforms::new(source.width, source.height, first_mix);
+        let second_uniforms = Uniforms::new(source.width, source.height, second_mix);
+        let grid = (
+            source.width.div_ceil(BLOCK.0).max(1),
+            source.height.div_ceil(BLOCK.1).max(1),
+        );
+        let (pixels, dispatch) = self.0.run_u8_cached_lut_chain(
+            KERNEL,
+            grid,
+            &source.pixels,
+            mask_r,
+            first_lut_rgb512,
+            second_lut_rgb512,
+            as_bytes(&first_uniforms),
+            as_bytes(&second_uniforms),
+        )?;
+        Ok((
+            Image {
+                width: source.width,
+                height: source.height,
+                pixels,
+            },
+            dispatch,
+        ))
+    }
+
     /// PF21015 fixed-point tint: host selects TintGreen/TintMagenta and passes
     /// `|ui|/100` as the kernel's mix. The 32-byte ABI and kernel stay shared.
     pub fn tint(
@@ -203,6 +311,8 @@ mod tests {
         assert_eq!(GATE, 0.001);
         assert_eq!(LUT_BYTES, 512 * 512 * 3);
         assert_eq!(PF_TINT, 21015);
+        assert_eq!(PF_TEMPERATURE, 30096);
+        assert_eq!(TEMPERATURE_KERNEL, "skin_temperature_kernel");
     }
 
     #[test]

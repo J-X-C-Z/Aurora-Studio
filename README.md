@@ -36,16 +36,15 @@ cargo build -p portrait-app --release --locked
 
 ## GPU 适配
 
-- **CUDA 细节与几何阶段**：`AURORA_DETAIL_GPU=1` 启用亮度降噪、颜色降噪、摩尔纹、锐化，以及通用镜头畸变/CA/暗角/紫边。整段驻留一次显存，通用路径与 CPU 逐字节对拍；带实测 lens profile 表时回退 CPU。CUDA 不可用时自动回退 CPU。
-- **ONNX Runtime provider**：按运行时真实导出的符号自动选择 TensorRT → CUDA → DirectML → CPU；`AURORA_AI_PROVIDER` 可固定 provider。桌面窗口打开后会用低优先级线程预建可用模型 session，`AURORA_AI_PREWARM=0` 可关闭。
-- **AI 冷启动诊断**：`AURORA_ORT_CACHE_DIR` 可保存按运行时、provider 和模型版本指纹命名的优化图；`AURORA_ORT_PROFILE_DIR` 可输出 ORT 节点 trace，`AURORA_ORT_OPT_LEVEL` 可覆盖图优化等级。
+- **CUDA 细节阶段**：`AURORA_DETAIL_GPU=1` 启用亮度降噪、颜色降噪与锐化 CUDA 路径；与 CPU 阶段逐字节一致，本机 RTX 4070 Ti / 610.88 通过。CUDA 不可用时自动回退 CPU。
+- **ONNX Runtime provider**：按运行时真实导出的符号自动选择 TensorRT → CUDA → DirectML → CPU；`AURORA_AI_PROVIDER` 可固定 provider。本机 Capture One ONNX Runtime 1.22.1 实际导出 DirectML + CPU，人像探针走 DirectML。
 - **人像 CUDA kernel**：`aurora-portrait` 已有 LUT、mesh、teeth、smile、gloss、moisture、makeup 等 CUDA 路径，本机 16 个 CUDA 测试文件、84 个测试通过；尚未接入应用的人像预览主路径。
 - **Metal**：保留为 macOS 真机目标，本 Windows 版本未验证，不宣称可用。
 - 本构建没有 TensorRT 缓存预热/指纹匹配策略；自动模式是 provider 偏好顺序，不是“TensorRT 已加速”。CUDA/TensorRT provider 需要本机 ONNX Runtime 自己导出对应符号。
 
 ## 已知限制
 
-节点图的并行/图层混合器仍按串行列表渲染，导出仍包含未连接节点。HDR/全景合并、AI 降噪、镜头模糊、ICC 软打样、取消导出及 HEIF/JXL/DNG/PSD 原生导出尚未接通，界面会标注状态。crop/rotate/keystone 尚未并入整帧 develop GPU 链；带 lens profile 表的几何路径仍走 CPU。Windows 联机能力取决于 WIA 相机驱动；尚未完成真实相机验收。
+节点图的并行/图层混合器仍按串行列表渲染，导出仍包含未连接节点。HDR/全景合并、AI 降噪、镜头模糊、ICC 软打样、取消导出及 HEIF/JXL/DNG/PSD 原生导出尚未接通，界面会标注状态。Windows 联机能力取决于 WIA 相机驱动；尚未完成真实相机验收。
 
 人像 132 个已注册 CPU kernel 中，当前 8 个具备真实同 job 输入并会出像素；其余等待 194 点 landmark、逐效果 model output、material/UV 或 ROI/统计量。人像面板会显示缺输入，不用假蒙版或拟合参数硬跑。
 

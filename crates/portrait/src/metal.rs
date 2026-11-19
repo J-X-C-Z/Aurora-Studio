@@ -890,6 +890,48 @@ impl MetalContext {
         }
     }
 
+    /// Force the affine serial mesh pipeline for device acceptance. The
+    /// default remains atomic-first with compile-failure fallback.
+    pub fn mesh_raster_serial(&self, input: &metal_mesh::MeshRasterInput<'_>) -> MetalResult<Image> {
+        input.validate_contract().map_err(map_mesh_contract_refusal)?;
+        input.validate().map_err(map_mesh_refusal)?;
+        let serial = unsafe {
+            compile_pipelines(&self.lib, &self.device, MESH_SERIAL_MSL, &MESH_SERIAL_ENTRY_POINTS)?
+        };
+        let pipeline = mesh_pipeline(&serial, "mesh_raster_serial")?;
+        let params = input.params().map_err(map_mesh_refusal)?;
+        let width = input.source.width;
+        let height = input.source.height;
+        let pixel_count = input.source.pixel_count();
+        let dest: Vec<f32> = input.dest.iter().flat_map(|p| p.iter().copied()).collect();
+        let uv: Vec<f32> = input.source_uv.iter().flat_map(|p| p.iter().copied()).collect();
+        let _pool = Pool::new(self.lib);
+        unsafe {
+            let dest_buffer = self.buffer_f32(&dest)?;
+            let uv_buffer = self.buffer_f32(&uv)?;
+            let ebo_buffer = self.buffer_bytes(std::slice::from_raw_parts(
+                input.ebo.as_ptr() as *const u8,
+                input.ebo.len() * std::mem::size_of::<u16>(),
+            ))?;
+            let source_buffer = self.buffer_bytes(&input.source.pixels)?;
+            let out_buffer = self.buffer_bytes(&input.source.pixels)?;
+            let params_buffer = self.buffer_bytes(as_bytes(&params))?;
+            self.dispatch_pipeline(
+                pipeline,
+                &[
+                    &dest_buffer,
+                    &uv_buffer,
+                    &ebo_buffer,
+                    &source_buffer,
+                    &out_buffer,
+                    &params_buffer,
+                ],
+                grid_1d(pixel_count, 64),
+            )?;
+            let bytes = read_bytes(&out_buffer, input.source.pixels.len())?;
+            Image::new(width, height, bytes).ok_or(MetalRefusal::ShapeMismatch("mesh output"))
+        }
+    }
     /// Runs `mesh_raster_select` then `mesh_raster_emit`.
     ///
     /// Each pass gets its own command buffer and `waitUntilCompleted`, so the
@@ -1756,7 +1798,7 @@ const RTLD_NOW: i32 = 2;
 
 #[cfg(target_os = "macos")]
 fn load() -> Option<Lib> {
-    extern "C" {
+    unsafe extern "C" {
         fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }

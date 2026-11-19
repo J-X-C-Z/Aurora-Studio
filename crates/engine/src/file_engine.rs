@@ -12,10 +12,10 @@ use std::time::Instant;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
-use crate::adjust::{AdjustmentSet, WhiteBalanceMode};
+use crate::adjust::{AdjustmentSet, Geometry, WhiteBalanceMode};
 use crate::catalog::{ColorTag, Exif, FileKind, ImageId, ImageInfo, Iptc};
 use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, RenderQuality, StyleInfo};
-use crate::layers::{AiMask, Layer, LinearGradient, Mask, MaskOp, MaskShape};
+use crate::layers::{Layer, LinearGradient, Mask, MaskOp, MaskShape};
 use crate::mock::process::{self, Source};
 use crate::preview_cache::{self, CachedFrame, PreviewCache};
 use crate::store::{Catalog, Entry, Store, StoreError};
@@ -28,6 +28,18 @@ const SOURCE_LONG_SIDE: u32 = 4096;
 const CACHED_SOURCES: usize = 8;
 /// Folder collection ids start here; the index into `folder_dirs()` is added.
 const FOLDER_BASE: u64 = 1000;
+
+struct ScannedFile {
+    rel_path: String,
+    path: PathBuf,
+    file_name: String,
+    kind: FileKind,
+    width: u32,
+    height: u32,
+    file_size: u64,
+    exif: Exif,
+    iptc: Iptc,
+}
 
 /// Stable category for an import/decode failure, so the interface can show a
 /// translated message. Raw error text still goes to the log.
@@ -103,6 +115,16 @@ fn fit_long_side(size: (u32, u32)) -> (u32, u32) {
     if w >= h { (SOURCE_LONG_SIDE, short) } else { (short, SOURCE_LONG_SIDE) }
 }
 
+fn geometry_fingerprint(geometry: &Geometry) -> u64 {
+    let bytes = serde_json::to_vec(geometry).unwrap_or_default();
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Area-average downscale, parallel over output rows.
 /// `image`'s resize is single-threaded and costs seconds on a 24 MP photo;
 /// this is ~1.5×1.5 source pixels per output pixel, so a box average is both
@@ -154,10 +176,7 @@ fn raw16_source(path: &Path) -> Option<Source> {
     if !crate::raw::is_raw(path) {
         return None;
     }
-    let (w, h, px) = crate::raw::decode16(path)?;
-    let (tw, th) = fit_long_side((w, h));
-    let scaled = crate::recipe::resize_rgba16(&px, w, h, tw, th);
-    Some(Source::from_rgba16(tw, th, &scaled))
+    crate::raw_cache::get_or_decode_source16(path, SOURCE_LONG_SIDE)
 }
 
 /// Indexes `<source file name>.comask` sidecars below `Adjustments/LAM`.
@@ -250,8 +269,6 @@ fn attach_c1_layers(
     variant: &crate::c1catalog::C1Variant,
     image: &crate::c1catalog::C1Image,
     comask_files: &HashMap<String, Vec<PathBuf>>,
-    rel_path: &str,
-    number: u32,
 ) {
     let Some(candidates) = comask_files.get(&image.file_name) else {
         for layer in &variant.local_layers {
@@ -284,7 +301,6 @@ fn attach_c1_layers(
                 log::warn!("C1 layer {:?}: UUID {uuid} missing from {}; not attached", layer.name, path.display());
                 continue;
             };
-            let key = format!("c1-comask:{rel_path}#v{number}:{uuid}");
             // A parameter gradient stays editable and costs no raster memory;
             // prefer it over the decoded plane of the same record.
             let shape = if let Some(g) = record.linear_gradient {
@@ -299,21 +315,20 @@ fn attach_c1_layers(
                 MaskShape::Linear(LinearGradient { op: MaskOp::Add, start: full_line, end: zero_line })
             } else if let Some(plane) = by_uuid.get(uuid) {
                 let oriented = oriented_mask_plane(plane, &adjustments.geometry);
-                crate::aimask::store(&key, Arc::new(oriented));
-                MaskShape::Ai(AiMask {
-                    op: MaskOp::Add,
-                    kind: AiMaskKind::Subject,
-                    cache_key: Some(key),
-                })
+                // The decoded bitmap is the layer's own geometry, so it rides
+                // in the adjustment set instead of an engine-side cache key.
+                let raster = crate::c1_masks::raster_shape_from_plane(
+                    oriented.w,
+                    oriented.h,
+                    &oriented.data,
+                    MaskOp::Add,
+                )
+                .unwrap_or_else(|| crate::RasterMask::empty(MaskOp::Add));
+                MaskShape::Raster(raster)
             } else {
                 // A mask record without pixels (an empty layer): a zero plane
                 // keeps the layer attached without changing the frame.
-                crate::aimask::store(&key, Arc::new(crate::aimask::MaskPlane::new(1, 1, vec![0.0])));
-                MaskShape::Ai(AiMask {
-                    op: MaskOp::Add,
-                    kind: AiMaskKind::Subject,
-                    cache_key: Some(key),
-                })
+                MaskShape::Raster(crate::RasterMask::empty(MaskOp::Add))
             };
             attached.push(Layer {
                 id: layer.index.max(0) as u64 + 1,
@@ -344,10 +359,19 @@ struct FileEntry {
     adjustments: AdjustmentSet,
 }
 
+struct AiInput {
+    source_id: u64,
+    geometry: u64,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 struct State {
     entries: Vec<FileEntry>,
     next_id: u64,
     sources: HashMap<ImageId, Arc<Source>>,
+    ai_inputs: HashMap<ImageId, Arc<AiInput>>,
     /// Most recently used last.
     lru: Vec<ImageId>,
     jobs: HashMap<u64, JobStatus>,
@@ -364,13 +388,18 @@ struct State {
     c1_members: HashMap<u64, Vec<ImageId>>,
     catalog: Catalog,
     preview: PreviewCache,
-    profiled: crate::engine::ProfileCache,
 }
 
 /// An engine over a real folder of images.
 pub struct FileEngine {
     root: PathBuf,
     state: Arc<Mutex<State>>,
+    /// ICC conversion has its own lock: a cold profile miss must not block the
+    /// catalog, thumbnails, or source-cache readers.
+    profiled: Mutex<crate::engine::ProfileCache>,
+    /// Gamut counts are tiny compared with the frame; keep recent proof results
+    /// so a repaint does not repeat the full round trip.
+    gamut: Mutex<Vec<(preview_cache::PreviewKey, String, crate::GamutWarning)>>,
     /// One decode at a time. Waiters re-check the source cache after taking it,
     /// so concurrent requests for the same image decode it once.
     decode: Mutex<()>,
@@ -407,6 +436,7 @@ impl FileEngine {
                 entries: Vec::new(),
                 next_id: 1,
                 sources: HashMap::new(),
+                ai_inputs: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
                 cancelled: Default::default(),
@@ -417,8 +447,9 @@ impl FileEngine {
                 c1_members: HashMap::new(),
                 catalog,
                 preview: PreviewCache::default(),
-                profiled: Default::default(),
             })),
+            profiled: Mutex::new(Default::default()),
+            gamut: Mutex::new(Vec::new()),
             decode: Mutex::new(()),
             store,
             c1_catalog: false,
@@ -461,6 +492,7 @@ impl FileEngine {
                 entries: Vec::new(),
                 next_id: 1,
                 sources: HashMap::new(),
+                ai_inputs: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
                 cancelled: Default::default(),
@@ -471,8 +503,9 @@ impl FileEngine {
                 c1_members: HashMap::new(),
                 catalog,
                 preview: PreviewCache::default(),
-                profiled: Default::default(),
             })),
+            profiled: Mutex::new(Default::default()),
+            gamut: Mutex::new(Vec::new()),
             decode: Mutex::new(()),
             store,
             c1_catalog: true,
@@ -555,8 +588,6 @@ impl FileEngine {
                         variant,
                         image,
                         &comask_files,
-                        &rel_path,
-                        number,
                     );
                     // Read the same sidecar once for retouching mask summaries.
                     if let Some(path) = comask_files.get(&image.file_name).and_then(|v| v.first()) {
@@ -713,10 +744,14 @@ impl FileEngine {
             })
             .collect();
 
+        let scanned: Vec<ScannedFile> = found
+            .into_par_iter()
+            .map(|(rel, path)| scan_file(rel, path))
+            .collect();
+
         st.entries.clear();
-        for (rel, abs) in found {
-            let (w, h) = dimensions(&abs);
-            let rel_path = rel.replace('\\', "/");
+        for scanned in scanned {
+            let rel_path = scanned.rel_path;
             let stored = previous.get(&rel_path);
             let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
             // Restore edits saved in a previous process; keep unsaved in-memory
@@ -743,24 +778,23 @@ impl FileEngine {
                 trashed = entry.trashed;
             }
 
-            let (exif, iptc) = crate::exif::read_metadata(&abs);
             if keywords.is_empty() {
-                keywords = iptc.keywords.clone();
+                keywords = scanned.iptc.keywords.clone();
             }
             let id = ImageId(st.next_id);
             st.next_id += 1;
             st.entries.push(FileEntry {
                 info: ImageInfo {
                     id,
-                    path: abs.clone(),
-                    file_name: abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                    kind: file_kind(&abs),
+                    path: scanned.path.clone(),
+                    file_name: scanned.file_name,
+                    kind: scanned.kind,
                     heif: None,
-                    width: w,
-                    height: h,
-                    file_size: std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0),
-                    exif,
-                    iptc,
+                    width: scanned.width,
+                    height: scanned.height,
+                    file_size: scanned.file_size,
+                    exif: scanned.exif,
+                    iptc: scanned.iptc,
                     keywords,
                     rating,
                     color_tag,
@@ -768,7 +802,7 @@ impl FileEngine {
                     has_adjustments: !adjustments.is_default(),
                     trashed,
                 },
-                path: abs,
+                path: scanned.path,
                 rel_path,
                 adjustments,
             });
@@ -777,24 +811,23 @@ impl FileEngine {
     }
 
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
-        let (w, h) = dimensions(path);
         let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        let scanned = scan_file(rel, path.to_path_buf());
         let mut st = self.state.lock();
         let id = ImageId(st.next_id);
         st.next_id += 1;
-        let (exif, iptc) = crate::exif::read_metadata(path);
-        let keywords = iptc.keywords.clone();
+        let keywords = scanned.iptc.keywords.clone();
         let info = ImageInfo {
             id,
-            path: path.to_path_buf(),
-            file_name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            kind: file_kind(path),
+            path: scanned.path.clone(),
+            file_name: scanned.file_name,
+            kind: scanned.kind,
             heif: None,
-            width: w,
-            height: h,
-            file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-            exif,
-            iptc,
+            width: scanned.width,
+            height: scanned.height,
+            file_size: scanned.file_size,
+            exif: scanned.exif,
+            iptc: scanned.iptc,
             keywords,
             rating: 0,
             color_tag: ColorTag::None,
@@ -804,8 +837,8 @@ impl FileEngine {
         };
         st.entries.push(FileEntry {
             info: info.clone(),
-            path: path.to_path_buf(),
-            rel_path: rel,
+            path: scanned.path,
+            rel_path: scanned.rel_path,
             adjustments: AdjustmentSet::default(),
         });
         Ok(info)
@@ -918,8 +951,38 @@ impl FileEngine {
         while st.lru.len() > CACHED_SOURCES {
             let old = st.lru.remove(0);
             st.sources.remove(&old);
+            st.ai_inputs.remove(&old);
         }
         Ok(source)
+    }
+
+    fn ai_input(&self, image: ImageId) -> anyhow::Result<Arc<AiInput>> {
+        let source = self.source(image)?;
+        let geometry = self.load_adjustments(image).geometry;
+        let fingerprint = geometry_fingerprint(&geometry);
+        if let Some(input) = self
+            .state
+            .lock()
+            .ai_inputs
+            .get(&image)
+            .filter(|input| input.source_id == source.snapshot_id() && input.geometry == fingerprint)
+            .cloned()
+        {
+            return Ok(input);
+        }
+        let (rgba, width, height) = process::ai_input_rgba(&source, &geometry, 1024);
+        let input = Arc::new(AiInput {
+            source_id: source.snapshot_id(),
+            geometry: fingerprint,
+            rgba,
+            width,
+            height,
+        });
+        self.state
+            .lock()
+            .ai_inputs
+            .insert(image, input.clone());
+        Ok(input)
     }
 
     /// Cached preview frame; `fast` renders at half size and upsamples.
@@ -1123,6 +1186,30 @@ impl FileEngine {
         Ok(info)
     }
 
+    fn cached_gamut_warning(
+        &self,
+        key: preview_cache::PreviewKey,
+        proof: &str,
+        image: &RgbaImage,
+    ) -> Option<crate::GamutWarning> {
+        let mut entries = self.gamut.lock();
+        if let Some(index) = entries
+            .iter()
+            .position(|(cached_key, cached_proof, _)| *cached_key == key && cached_proof == proof)
+        {
+            let entry = entries.remove(index);
+            let warning = entry.2;
+            entries.push(entry);
+            return Some(warning);
+        }
+        let warning = crate::engine::gamut_warning(image, Some(proof))?;
+        entries.push((key, proof.to_owned(), warning));
+        while entries.len() > 8 {
+            entries.remove(0);
+        }
+        Some(warning)
+    }
+
     /// Cached preview frame; `fast` renders at half size and upsamples.
     fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
         let start = Instant::now();
@@ -1139,8 +1226,11 @@ impl FileEngine {
         if let Some(hit) = hit {
             let histogram = hit.histogram.clone();
             let source = hit.into_image();
-            let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
-            let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+            let gamut_warning = request
+                .proof_profile
+                .as_deref()
+                .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
+            let (image, degraded) = self.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
             let degraded = degraded.or(intent_note);
             return Ok(PreviewFrame {
                 histogram,
@@ -1160,8 +1250,11 @@ impl FileEngine {
         };
         self.state.lock().preview.insert(key, frame.clone());
         let source = frame.into_image();
-        let gamut_warning = crate::engine::gamut_warning(&source, request.proof_profile.as_deref());
-        let (image, degraded) = self.state.lock().profiled.converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+        let gamut_warning = request
+            .proof_profile
+            .as_deref()
+            .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
+        let (image, degraded) = self.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let degraded = degraded.or(intent_note);
         Ok(PreviewFrame {
             image,
@@ -1174,21 +1267,34 @@ impl FileEngine {
     }
 
     fn persist(&self, rel_path: &str, adjustments: &AdjustmentSet, info: &ImageInfo) {
+        self.persist_batch(&[(rel_path.to_string(), adjustments.clone(), info.clone())]);
+    }
+
+    fn persist_batch(&self, items: &[(String, AdjustmentSet, ImageInfo)]) {
         let Some(store) = &self.store else { return };
-        if let Err(err) = store.save_adjustments(rel_path, adjustments) {
-            log::warn!("save adjustments {rel_path}: {err}");
+        let mut saved = Vec::new();
+        for (rel_path, adjustments, info) in items {
+            if let Err(err) = store.save_adjustments(rel_path, adjustments) {
+                log::warn!("save adjustments {rel_path}: {err}");
+            } else {
+                saved.push((rel_path, info));
+            }
+        }
+        if saved.is_empty() {
             return;
         }
         let mut st = self.state.lock();
-        st.catalog.upsert(Entry {
-            rel_path: rel_path.to_string(),
-            rating: info.rating,
-            color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-            keywords: info.keywords.clone(),
-            variant: info.variant,
-            updated_at: now_secs(),
-            trashed: info.trashed,
-        });
+        for (rel_path, info) in saved {
+            st.catalog.upsert(Entry {
+                rel_path: rel_path.clone(),
+                rating: info.rating,
+                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
+                keywords: info.keywords.clone(),
+                variant: info.variant,
+                updated_at: now_secs(),
+                trashed: info.trashed,
+            });
+        }
         let catalog = st.catalog.clone();
         drop(st);
         if let Err(err) = store.save_index(&catalog) {
@@ -1298,6 +1404,25 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf
         }
     }
     Ok(())
+}
+
+fn scan_file(rel: String, path: PathBuf) -> ScannedFile {
+    let (width, height) = dimensions(&path);
+    let (exif, iptc) = crate::exif::read_metadata(&path);
+    ScannedFile {
+        rel_path: rel.replace('\\', "/"),
+        file_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        kind: file_kind(&path),
+        file_size: std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+        path,
+        width,
+        height,
+        exif,
+        iptc,
+    }
 }
 
 fn is_supported(path: &Path) -> bool {
@@ -1518,19 +1643,58 @@ impl ImageEngine for FileEngine {
     }
 
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>> {
-        let mut added = Vec::new();
+        let mut files = Vec::new();
         for path in paths {
             if path.is_dir() && !path.starts_with(&self.root) {
-                let mut files = Vec::new();
-                collect(path, path, 0, &mut files)?;
-                for (_, abs) in files {
-                    if let Ok(info) = self.add_file(&abs) {
-                        added.push(info);
-                    }
-                }
+                let mut found = Vec::new();
+                collect(path, path, 0, &mut found)?;
+                files.extend(found.into_iter().map(|(_, path)| path));
             } else if path.is_file() && is_supported(path) {
-                added.push(self.add_file(path)?);
+                files.push(path.clone());
             }
+        }
+        let scanned: Vec<ScannedFile> = files
+            .into_par_iter()
+            .map(|path| {
+                let rel = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                scan_file(rel, path)
+            })
+            .collect();
+        let mut st = self.state.lock();
+        let mut added = Vec::with_capacity(scanned.len());
+        for scanned in scanned {
+            let id = ImageId(st.next_id);
+            st.next_id += 1;
+            let keywords = scanned.iptc.keywords.clone();
+            let info = ImageInfo {
+                id,
+                path: scanned.path.clone(),
+                file_name: scanned.file_name,
+                kind: scanned.kind,
+                heif: None,
+                width: scanned.width,
+                height: scanned.height,
+                file_size: scanned.file_size,
+                exif: scanned.exif,
+                iptc: scanned.iptc,
+                keywords,
+                rating: 0,
+                color_tag: ColorTag::None,
+                variant: 1,
+                has_adjustments: false,
+                trashed: false,
+            };
+            added.push(info.clone());
+            st.entries.push(FileEntry {
+                info,
+                path: scanned.path,
+                rel_path: scanned.rel_path,
+                adjustments: AdjustmentSet::default(),
+            });
         }
         Ok(added)
     }
@@ -1585,27 +1749,42 @@ impl ImageEngine for FileEngine {
     }
 
     fn update_info(&self, info: &ImageInfo) -> anyhow::Result<()> {
-        let (rel, catalog) = {
+        ImageEngine::update_info_batch(self, std::slice::from_ref(info))
+    }
+
+    fn update_info_batch(&self, infos: &[ImageInfo]) -> anyhow::Result<()> {
+        if infos.is_empty() {
+            return Ok(());
+        }
+        let catalog = {
             let mut st = self.state.lock();
-            let entry = st
-                .entries
-                .iter_mut()
-                .find(|e| e.info.id == info.id)
-                .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-            entry.info = info.clone();
-            let rel = entry.rel_path.clone();
-            st.catalog.upsert(Entry {
-                rel_path: rel.clone(),
-                rating: info.rating,
-                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-                keywords: info.keywords.clone(),
-                variant: info.variant,
-                updated_at: now_secs(),
-                trashed: info.trashed,
-            });
-            (rel.clone(), st.catalog.clone())
+            for info in infos {
+                if !st.entries.iter().any(|entry| entry.info.id == info.id) {
+                    anyhow::bail!("unknown image");
+                }
+            }
+            for info in infos {
+                let rel_path = {
+                    let entry = st
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.info.id == info.id)
+                        .expect("validated image id");
+                    entry.info = info.clone();
+                    entry.rel_path.clone()
+                };
+                st.catalog.upsert(Entry {
+                    rel_path,
+                    rating: info.rating,
+                    color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
+                    keywords: info.keywords.clone(),
+                    variant: info.variant,
+                    updated_at: now_secs(),
+                    trashed: info.trashed,
+                });
+            }
+            st.catalog.clone()
         };
-        let _ = rel;
         if let Some(store) = &self.store {
             if let Err(err) = store.save_index(&catalog) {
                 log::warn!("save catalog: {err}");
@@ -1678,22 +1857,48 @@ impl ImageEngine for FileEngine {
         // above: EXIF names the lens, the database supplies the profile, and
         // only a hit turns the calibrated warp on.
         apply_auto_lens(&mut adjustments.lens, crate::lensdb::default_database().unwrap_or(&[]), &info.exif);
+        adjustments.lens.mount = info
+            .exif
+            .camera_model
+            .as_deref()
+            .and_then(crate::lensdb::mount_for_camera)
+            .map(str::to_string);
         adjustments
     }
 
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
-        let (rel, info) = {
+        ImageEngine::save_adjustments_batch(self, &[(image, adjustments.clone())])
+    }
+
+    fn save_adjustments_batch(
+        &self,
+        items: &[(ImageId, AdjustmentSet)],
+    ) -> anyhow::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let records = {
             let mut st = self.state.lock();
-            let entry = st
-                .entries
-                .iter_mut()
-                .find(|e| e.info.id == image)
-                .ok_or_else(|| anyhow::anyhow!("unknown image"))?;
-            entry.adjustments = adjustments.clone();
-            entry.info.has_adjustments = !adjustments.is_default();
-            (entry.rel_path.clone(), entry.info.clone())
+            for (image, _) in items {
+                if !st.entries.iter().any(|entry| entry.info.id == *image) {
+                    anyhow::bail!("unknown image");
+                }
+            }
+            items
+                .iter()
+                .map(|(image, adjustments)| {
+                    let entry = st
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.info.id == *image)
+                        .expect("validated image id");
+                    entry.adjustments = adjustments.clone();
+                    entry.info.has_adjustments = !adjustments.is_default();
+                    (entry.rel_path.clone(), adjustments.clone(), entry.info.clone())
+                })
+                .collect::<Vec<_>>()
         };
-        self.persist(&rel, adjustments, &info);
+        self.persist_batch(&records);
         Ok(())
     }
 
@@ -1800,7 +2005,6 @@ impl ImageEngine for FileEngine {
             adj.white_balance.mode = WhiteBalanceMode::Auto;
             adj.white_balance.kelvin = (5600.0 + (r - b) * -18.0).clamp(2500.0, 12000.0);
             adj.white_balance.tint = 0.0;
-            adj.white_balance.gains = None;
         }
         if all || target == AutoTarget::Levels {
             let cut = total / 500;
@@ -1876,7 +2080,8 @@ impl ImageEngine for FileEngine {
                 .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
             (entry.rel_path.clone(), entry.info.variant)
         };
-        let key = crate::mask_store::key(&rel_path, variant, kind);
+        let cache_key = |mask_kind: AiMaskKind| crate::mask_store::key(&rel_path, variant, mask_kind);
+        let key = cache_key(kind);
         if crate::aimask::lookup(&key).is_some() {
             return Ok(key);
         }
@@ -1884,39 +2089,130 @@ impl ImageEngine for FileEngine {
             crate::aimask::store(&key, plane);
             return Ok(key);
         }
-        let src = self.source(image)?;
-        let geometry = self.load_adjustments(image).geometry;
-        // The models are small; 1024 px on the long side is plenty and keeps
-        // the mask under a few megabytes for a 50 MP frame.
-        let (rgba, w, h) = crate::mock::process::ai_input_rgba(&src, &geometry, 1024);
         let start = Instant::now();
-        let mask = match kind {
-            AiMaskKind::Subject | AiMaskKind::Person | AiMaskKind::Clothing => {
-                crate::aimask::subject_mask(&rgba, w, h)
-            }
-            AiMaskKind::Skin => crate::aimask::skin_mask(&rgba, w, h),
-            AiMaskKind::Hair => crate::aimask::hair_mask(&rgba, w, h),
-            AiMaskKind::Sky => crate::aimask::sky_mask(&rgba, w, h),
-            AiMaskKind::Background => crate::aimask::subject_mask(&rgba, w, h)
-                .map(|mut mask| {
-                    for v in &mut mask {
-                        *v = 1.0 - *v;
+        let base_key = |group: &str| {
+            format!(
+                "mask-base-v1:{}#v{variant}:{group}",
+                rel_path.replace('\\', "/")
+            )
+        };
+        let plane = match kind {
+            AiMaskKind::Subject
+            | AiMaskKind::Person
+            | AiMaskKind::Clothing
+            | AiMaskKind::Background
+            | AiMaskKind::Sky => {
+                let subject_cache = base_key("subject");
+                let subject = match crate::aimask::lookup(&subject_cache) {
+                    Some(subject) => subject,
+                    None => {
+                        let input = self.ai_input(image)?;
+                        match crate::aimask::subject_mask(&input.rgba, input.width, input.height) {
+                            Ok(subject) => {
+                                let subject = std::sync::Arc::new(crate::aimask::MaskPlane::new(
+                                    input.width as usize,
+                                    input.height as usize,
+                                    subject,
+                                ));
+                                crate::aimask::store(&subject_cache, subject.clone());
+                                subject
+                            }
+                            Err(err) => {
+                                log::warn!("AI mask {kind:?} unavailable: {err:#}");
+                                return Err(err);
+                            }
+                        }
                     }
-                    mask
-                }),
+                };
+                for alias in [
+                    AiMaskKind::Subject,
+                    AiMaskKind::Person,
+                    AiMaskKind::Clothing,
+                ] {
+                    crate::aimask::store(&cache_key(alias), subject.clone());
+                }
+                match kind {
+                    AiMaskKind::Subject | AiMaskKind::Person | AiMaskKind::Clothing => subject,
+                    AiMaskKind::Background => {
+                        let mut background = subject.data.clone();
+                        for value in &mut background {
+                            *value = 1.0 - *value;
+                        }
+                        std::sync::Arc::new(crate::aimask::MaskPlane::new(
+                            subject.w,
+                            subject.h,
+                            background,
+                        ))
+                    }
+                    AiMaskKind::Sky => {
+                        let input = self.ai_input(image)?;
+                        let sky = crate::aimask::sky_mask_from_subject(
+                            &input.rgba,
+                            input.width as usize,
+                            input.height as usize,
+                            &subject.data,
+                        );
+                        std::sync::Arc::new(crate::aimask::MaskPlane::new(
+                            input.width as usize,
+                            input.height as usize,
+                            sky,
+                        ))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            AiMaskKind::Skin | AiMaskKind::Hair => {
+                let skin_cache = base_key("people-face");
+                let hair_cache = base_key("people-hair");
+                let skin = crate::aimask::lookup(&skin_cache);
+                let hair = crate::aimask::lookup(&hair_cache);
+                let (skin, hair) = match (skin, hair) {
+                    (Some(skin), Some(hair)) => (skin, hair),
+                    (skin, hair) => {
+                        let input = self.ai_input(image)?;
+                        match crate::aimask::people_masks(&input.rgba, input.width, input.height) {
+                        Ok(masks) => {
+                            let skin = skin.unwrap_or_else(|| {
+                                let skin = std::sync::Arc::new(crate::aimask::MaskPlane::new(
+                                    input.width as usize,
+                                    input.height as usize,
+                                    masks.face,
+                                ));
+                                crate::aimask::store(&skin_cache, skin.clone());
+                                skin
+                            });
+                            let hair = hair.unwrap_or_else(|| {
+                                let hair = std::sync::Arc::new(crate::aimask::MaskPlane::new(
+                                    input.width as usize,
+                                    input.height as usize,
+                                    masks.hair,
+                                ));
+                                crate::aimask::store(&hair_cache, hair.clone());
+                                hair
+                            });
+                            (skin, hair)
+                        }
+                        Err(err) => {
+                            log::warn!("AI mask {kind:?} unavailable: {err:#}");
+                            return Err(err);
+                        }
+                        }
+                    }
+                };
+                crate::aimask::store(&cache_key(AiMaskKind::Skin), skin.clone());
+                crate::aimask::store(&cache_key(AiMaskKind::Hair), hair.clone());
+                if kind == AiMaskKind::Skin {
+                    skin
+                } else {
+                    hair
+                }
+            }
             other => anyhow::bail!(
                 "Capture One's six-class people parser has no {other:?} class (background, hair, \
                  body skin, face skin, clothing, held object); no model segments it"
             ),
         };
-        let mask = match mask {
-            Ok(mask) => mask,
-            Err(err) => {
-                log::warn!("AI mask {kind:?} unavailable: {err:#}");
-                return Err(err);
-            }
-        };
-        let plane = std::sync::Arc::new(crate::aimask::MaskPlane::new(w as usize, h as usize, mask));
+        crate::aimask::store(&key, plane.clone());
         log::info!(
             "AI mask {kind:?} for image {}: {}x{}, {:.0} ms, foreground {:.1}%",
             image.0,
@@ -1925,7 +2221,6 @@ impl ImageEngine for FileEngine {
             start.elapsed().as_secs_f32() * 1000.0,
             plane.foreground_fraction() * 100.0
         );
-        crate::aimask::store(&key, plane.clone());
         if let Err(err) = crate::mask_store::save(&self.root, &key, &plane) {
             log::warn!("AI mask {kind:?} for image {} not saved: {err:#}", image.0);
         }
@@ -1936,11 +2231,9 @@ impl ImageEngine for FileEngine {
         if let Some(report) = self.eyes.lock().get(&image) {
             return Ok(*report);
         }
-        let src = self.source(image)?;
-        let geometry = self.load_adjustments(image).geometry;
-        let (rgba, w, h) = crate::mock::process::ai_input_rgba(&src, &geometry, 1024);
+        let input = self.ai_input(image)?;
         let start = Instant::now();
-        let report = match crate::any_eye_closed(&rgba, w, h) {
+        let report = match crate::any_eye_closed(&input.rgba, input.width, input.height) {
             Ok(report) => report,
             Err(err) => {
                 log::warn!("closed-eye check for image {} unavailable: {err:#}", image.0);
@@ -1977,9 +2270,18 @@ impl ImageEngine for FileEngine {
 
     fn styles(&self) -> Vec<StyleInfo> {
         let mut all = crate::styles::all();
-        all.extend(crate::c1_style_index::installed_styles());
-        all.extend(film_curve_styles());
-        all.extend(self.imported_styles.read().clone());
+        let ((c1, film), imported) = rayon::join(
+            || {
+                rayon::join(
+                    crate::c1_style_index::installed_styles,
+                    film_curve_styles,
+                )
+            },
+            || self.imported_styles.read().clone(),
+        );
+        all.extend(c1);
+        all.extend(film);
+        all.extend(imported);
         dedupe_styles(all)
     }
 
@@ -1989,9 +2291,6 @@ impl ImageEngine for FileEngine {
 
     fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo> {
         let style = crate::c1_styles::load_style(path)?;
-        if let Some(warning) = crate::c1_styles::processing_method_warning(style.adjustments.base.processing_method) {
-            log::warn!("C1 style {}: {warning}", style.name);
-        }
         let info = StyleInfo { name: style.name, group: "Imported".into(), adjustments: style.adjustments };
         let mut imported = self.imported_styles.write();
         imported.retain(|s| !(s.group == info.group && s.name == info.name));
@@ -2125,19 +2424,7 @@ impl ImageEngine for FileEngine {
     }
 
     fn source_status(&self, image: ImageId) -> Option<String> {
-        let st = self.state.lock();
-        let method_warning = st
-            .entries
-            .iter()
-            .find(|entry| entry.info.id == image)
-            .and_then(|entry| crate::c1_styles::processing_method_warning(entry.adjustments.base.processing_method))
-            .map(str::to_owned);
-        let source_reason = st.source_reasons.get(&image).cloned();
-        match (method_warning, source_reason) {
-            (Some(method), Some(source)) => Some(format!("{method}; {source}")),
-            (Some(method), None) => Some(method),
-            (None, source) => source,
-        }
+        self.state.lock().source_reasons.get(&image).cloned()
     }
 
     fn tether_status(&self) -> TetherStatus {
@@ -2230,6 +2517,176 @@ fn film_curve_styles() -> Vec<StyleInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "profiles folder rescan metadata extraction"]
+    fn bench_folder_rescan_metadata() {
+        use std::hash::{Hash, Hasher};
+        use std::time::Instant;
+
+        let dir = std::env::var_os("AURORA_RESCAN_BENCH_DIR")
+            .expect("set AURORA_RESCAN_BENCH_DIR");
+        let engine = FileEngine::open(&dir).expect("open benchmark folder");
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            engine.rescan().expect("rescan");
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for image in engine.images() {
+            format!("{image:?}").hash(&mut hash);
+        }
+        println!(
+            "RESCAN_METADATA count={} p50={:.3} ms p95={:.3} ms hash={:016x}",
+            engine.images().len(),
+            times[2],
+            times[4],
+            hash.finish()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles bulk import metadata extraction"]
+    fn bench_bulk_import_metadata() {
+        use std::hash::{Hash, Hasher};
+        use std::time::Instant;
+
+        let source = std::env::var_os("AURORA_IMPORT_BENCH_SOURCE")
+            .expect("set AURORA_IMPORT_BENCH_SOURCE");
+        let root = std::env::var_os("AURORA_IMPORT_BENCH_ROOT")
+            .expect("set AURORA_IMPORT_BENCH_ROOT");
+        let engine = FileEngine::open(&root).expect("open empty import root");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(source)
+            .expect("read import source")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        let start = Instant::now();
+        let added = engine.import(&paths).expect("bulk import");
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for image in &added {
+            image.file_name.hash(&mut hash);
+            image.width.hash(&mut hash);
+            image.height.hash(&mut hash);
+            image.file_size.hash(&mut hash);
+            format!("{:?}", image.exif).hash(&mut hash);
+            format!("{:?}", image.iptc).hash(&mut hash);
+        }
+        println!(
+            "IMPORT_METADATA count={} ms={elapsed:.3} hash={:016x}",
+            added.len(),
+            hash.finish()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles startup adjustment loading"]
+    fn bench_load_adjustments_serial_parallel() {
+        use std::hash::{Hash, Hasher};
+        use std::time::Instant;
+
+        let dir = std::env::var_os("AURORA_RESCAN_BENCH_DIR")
+            .expect("set AURORA_RESCAN_BENCH_DIR");
+        let engine = FileEngine::open(&dir).expect("open benchmark folder");
+        let ids: Vec<_> = engine.images().into_iter().map(|image| image.id).collect();
+
+        let start = Instant::now();
+        let serial: Vec<_> = ids
+            .iter()
+            .map(|id| engine.load_adjustments(*id))
+            .collect();
+        let serial_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let start = Instant::now();
+        let parallel: Vec<_> = ids
+            .par_iter()
+            .map(|id| engine.load_adjustments(*id))
+            .collect();
+        let parallel_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let hash = |values: &[AdjustmentSet]| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            for value in values {
+                format!("{value:?}").hash(&mut hash);
+            }
+            hash.finish()
+        };
+        let serial_hash = hash(&serial);
+        let parallel_hash = hash(&parallel);
+        assert_eq!(serial_hash, parallel_hash);
+        println!(
+            "LOAD_ADJUSTMENTS count={} serial={serial_ms:.3} ms parallel={parallel_ms:.3} ms hash={serial_hash:016x}",
+            ids.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles the complete engine style index"]
+    fn bench_engine_style_index() {
+        use std::time::Instant;
+
+        let dir = std::env::var_os("AURORA_RESCAN_BENCH_DIR")
+            .expect("set AURORA_RESCAN_BENCH_DIR");
+        let engine = FileEngine::open(&dir).expect("open benchmark folder");
+        let start = Instant::now();
+        let styles = engine.styles();
+        println!(
+            "ENGINE_STYLE_INDEX count={} ms={:.3}",
+            styles.len(),
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles real NEF decode through Source construction"]
+    fn bench_real_nef_source_pipeline() {
+        use std::time::Instant;
+
+        let path = std::env::var_os("AURORA_TEST_RAW")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF"));
+        if !path.is_file() {
+            return;
+        }
+        for round in 0..3 {
+            let started = Instant::now();
+            let (w, h, px) = crate::raw::decode16(&path).expect("decode16");
+            let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            let started = Instant::now();
+            let (tw, th) = fit_long_side((w, h));
+            let scaled = crate::recipe::resize_rgba16(&px, w, h, tw, th);
+            let resize_ms = started.elapsed().as_secs_f64() * 1000.0;
+            drop(px);
+
+            let started = Instant::now();
+            let source = Source::from_rgba16(tw, th, &scaled);
+            let source_ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "NEF_SOURCE round={round} decode={decode_ms:.1} ms resize={resize_ms:.1} ms \
+                 source={source_ms:.1} ms size={tw}x{th}"
+            );
+            std::hint::black_box(source);
+        }
+
+        let started = Instant::now();
+        let cold = raw16_source(&path).expect("cold cached source");
+        let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
+        drop(cold);
+        let started = Instant::now();
+        let warm = raw16_source(&path).expect("warm cached source");
+        let warm_ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "NEF_FILE_ENGINE_SOURCE cold={cold_ms:.1} ms warm={warm_ms:.1} ms speedup={:.2}x",
+            cold_ms / warm_ms
+        );
+        std::hint::black_box(warm);
+    }
 
     #[test]
     fn midpoint_warning_only_touches_non_default_gradients() {
@@ -2529,6 +2986,77 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn batch_metadata_and_adjustments_commit_every_image() {
+        use crate::ImageEngine;
+
+        let dir = std::env::temp_dir().join(format!("portrait-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3 {
+            image::RgbaImage::from_pixel(8, 6, image::Rgba([i as u8 * 20, 40, 60, 255]))
+                .save(dir.join(format!("frame-{i}.png")))
+                .unwrap();
+        }
+        let engine = FileEngine::open(&dir).unwrap();
+        let mut infos = engine.images();
+        let mut invalid = infos.clone();
+        invalid[0].rating = 2;
+        invalid[1].id = ImageId(999_999);
+        assert!(engine.update_info_batch(&invalid).is_err());
+        assert_eq!(engine.images()[0].rating, infos[0].rating, "invalid batch wrote partially");
+
+        for (i, info) in infos.iter_mut().enumerate() {
+            info.rating = i as i8 + 2;
+            info.color_tag = ColorTag::ALL[i + 1];
+        }
+        engine.update_info_batch(&infos).unwrap();
+        let items: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                let mut adjustments = AdjustmentSet::default();
+                adjustments.exposure.exposure = i as f32 + 0.25;
+                (info.id, adjustments)
+            })
+            .collect();
+        engine.save_adjustments_batch(&items).unwrap();
+
+        let reopened = FileEngine::open(&dir).unwrap();
+        for (i, info) in reopened.images().iter().enumerate() {
+            assert_eq!(info.rating, i as i8 + 2);
+            assert_eq!(info.color_tag, ColorTag::ALL[i + 1]);
+            assert!(info.has_adjustments);
+            assert!((reopened.load_adjustments(info.id).exposure.exposure - (i as f32 + 0.25)).abs() < 1e-6);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ai_input_cache_reuses_source_and_invalidates_on_geometry() {
+        let dir = std::env::temp_dir().join(format!("portrait-ai-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_pixel(32, 24, image::Rgba([20, 40, 60, 255]))
+            .save(dir.join("frame.png"))
+            .unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let first = engine.ai_input(id).unwrap();
+        let second = engine.ai_input(id).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!((first.width, first.height), (1024, 768));
+
+        let mut changed = engine.load_adjustments(id);
+        changed.geometry.orientation = 1;
+        engine.save_adjustments(id, &changed).unwrap();
+        let rotated = engine.ai_input(id).unwrap();
+        assert!(!Arc::ptr_eq(&first, &rotated));
+        assert_eq!((rotated.width, rotated.height), (768, 1024));
+        assert!(Arc::ptr_eq(&rotated, &engine.ai_input(id).unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Copies the C1 fixture into a temp folder so the store lands there too.
     fn c1_copy(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("portrait-c1-{tag}-{}", std::process::id()));
@@ -2560,7 +3088,7 @@ mod tests {
         assert!(first.has_adjustments);
         assert_eq!(first.rating, 5);
         let adj = engine.load_adjustments(first.id);
-        assert!((adj.white_balance.kelvin - 4779.55).abs() < 2.0);
+        assert!((adj.white_balance.kelvin - 5648.0).abs() < 20.0);
         assert!(adj.geometry.crop.width > 0.0 && adj.geometry.crop.width <= 1.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }

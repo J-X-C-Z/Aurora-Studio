@@ -131,14 +131,30 @@ pub(crate) fn key(
 /// FNV-1a over the serialized adjustment set: stable across runs and Rust
 /// versions, and no per-call `Debug` formatting. A near-miss on one slider
 /// changes the bytes, so it always misses.
-fn params_fingerprint(adj: &AdjustmentSet) -> u64 {
-    let bytes = serde_json::to_vec(adj).unwrap_or_default();
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+pub(crate) fn params_fingerprint(adj: &AdjustmentSet) -> u64 {
+    struct Fnv(u64);
+    impl std::io::Write for Fnv {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for byte in bytes {
+                self.0 ^= *byte as u64;
+                self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    hash
+    let mut hash = Fnv(0xcbf2_9ce4_8422_2325u64);
+    serde_json::to_writer(&mut hash, adj).unwrap_or_default();
+    if let Some(producer) = adj.portrait_producer_inputs.as_deref() {
+        for byte in producer.fingerprint().to_le_bytes() {
+            hash.0 ^= byte as u64;
+            hash.0 = hash.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash.0
 }
 
 /// Package version plus an optional build id, so a rebuilt engine never reuses
@@ -169,6 +185,38 @@ mod tests {
         let mut adj = AdjustmentSet::default();
         adj.exposure.exposure = exposure;
         key(ImageId(image), &adj, NormRect::FULL, 1400, false, None, false)
+    }
+
+    #[test]
+    fn streaming_params_fingerprint_matches_serialized_bytes() {
+        fn reference(adj: &AdjustmentSet) -> u64 {
+            let bytes = serde_json::to_vec(adj).unwrap();
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for byte in bytes {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+        let mut exposure = AdjustmentSet::default();
+        exposure.exposure.exposure = 0.735;
+        exposure.extra.insert("test".into(), 0.4);
+        let mut layered = AdjustmentSet::default();
+        layered.layers.push(crate::Layer {
+            id: 7,
+            mask: crate::Mask {
+                shapes: vec![crate::MaskShape::Linear(crate::LinearGradient {
+                    op: crate::MaskOp::Add,
+                    start: [0.2, 0.3],
+                    end: [0.8, 0.7],
+                })],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        for adj in [AdjustmentSet::default(), exposure, layered] {
+            assert_eq!(params_fingerprint(&adj), reference(&adj));
+        }
     }
 
     fn frame(tag: u8) -> CachedFrame {

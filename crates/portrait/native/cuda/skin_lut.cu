@@ -130,3 +130,143 @@ extern "C" __global__ void skin_adjust_lut_kernel(
   output_rgba[source_index + 2u] = sl_quantize(blended_b);
   output_rgba[source_index + 3u] = source_a;
 }
+
+// PF30096 keeps the CPU `face_detail::skin_temperature` contract exactly:
+// f64 normalized inputs, f64 LUT taps, f64 blend, and ties-to-even bytes.
+// This deliberately does not share the fixed-point `skin_adjust_lut_kernel`
+// arithmetic; only the atlas and RGBA/mask layout are shared.
+
+__device__ __forceinline__ double st_clamp01(double value) {
+  if (value != value) return 0.0;
+  if (value < 0.0) return 0.0;
+  if (value > 1.0) return 1.0;
+  return value;
+}
+
+__device__ __forceinline__ double st_lut_byte(
+    const unsigned char* lut,
+    int x,
+    int y,
+    unsigned int channel) {
+  return ((double)(int)lut[(((unsigned int)y * 512u + (unsigned int)x) * 3u + channel)]) /
+      255.0;
+}
+
+__device__ __forceinline__ double st_lut_sample_2d(
+    const unsigned char* lut,
+    double u,
+    double v,
+    unsigned int channel) {
+  double x = u * 512.0 - 0.5;
+  double y = v * 512.0 - 0.5;
+  int xi = (int)floor(x);
+  int yi = (int)floor(y);
+  double fx = x - (double)xi;
+  double fy = y - (double)yi;
+  int x0 = xi < 0 ? 0 : (xi > 511 ? 511 : xi);
+  int x1 = xi + 1 < 0 ? 0 : (xi + 1 > 511 ? 511 : xi + 1);
+  int y0 = yi < 0 ? 0 : (yi > 511 ? 511 : yi);
+  int y1 = yi + 1 < 0 ? 0 : (yi + 1 > 511 ? 511 : yi + 1);
+  double c00 = st_lut_byte(lut, x0, y0, channel);
+  double c10 = st_lut_byte(lut, x1, y0, channel);
+  double c01 = st_lut_byte(lut, x0, y1, channel);
+  double c11 = st_lut_byte(lut, x1, y1, channel);
+  double top = c00 * (1.0 - fx) + c10 * fx;
+  double bottom = c01 * (1.0 - fx) + c11 * fx;
+  return top * (1.0 - fy) + bottom * fy;
+}
+
+__device__ __forceinline__ double st_lut(
+    const unsigned char* lut,
+    double r,
+    double g,
+    double b,
+    unsigned int channel) {
+  double f = b * 63.0;
+  double fz0 = floor(f);
+  double fz1 = ceil(f);
+  double t0 = floor(fz0 / 8.0);
+  double s0 = fz0 - t0 * 8.0;
+  double t1 = floor(fz1 / 8.0);
+  double s1 = fz1 - t1 * 8.0;
+  double u0 = s0 * 0.125 + 0.0009765625 + 0.123046875 * r;
+  double v0 = t0 * 0.125 + 0.0009765625 + 0.123046875 * g;
+  double u1 = s1 * 0.125 + 0.0009765625 + 0.123046875 * r;
+  double v1 = t1 * 0.125 + 0.0009765625 + 0.123046875 * g;
+  double p0 = st_lut_sample_2d(lut, u0, v0, channel);
+  double p1 = st_lut_sample_2d(lut, u1, v1, channel);
+  double fraction = f - fz0;
+  return p0 * (1.0 - fraction) + p1 * fraction;
+}
+
+__device__ __forceinline__ unsigned char st_byte_even(double value) {
+  double clamped = st_clamp01(value) * 255.0;
+  double floor_value = floor(clamped);
+  double fraction = clamped - floor_value;
+  double rounded;
+  if (fraction > 0.5) {
+    rounded = floor_value + 1.0;
+  } else if (fraction < 0.5) {
+    rounded = floor_value;
+  } else if ((((long long)floor_value) & 1LL) == 0LL) {
+    rounded = floor_value;
+  } else {
+    rounded = floor_value + 1.0;
+  }
+  if (rounded < 0.0) rounded = 0.0;
+  if (rounded > 255.0) rounded = 255.0;
+  return (unsigned char)(int)rounded;
+}
+
+extern "C" __global__ void skin_temperature_kernel(
+    const unsigned char* source_rgba,
+    const unsigned char* mask_r8,
+    const unsigned char* lut_rgb512,
+    unsigned char* output_rgba,
+    SkinLutUniforms uniforms) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= (int)uniforms.width || y >= (int)uniforms.height) return;
+
+  unsigned int source_index = (unsigned int)y * uniforms.stride + (unsigned int)x * 4u;
+  unsigned int mask_index = (unsigned int)y * uniforms.mask_row_bytes + (unsigned int)x;
+  unsigned char source_r = source_rgba[source_index + 0u];
+  unsigned char source_g = source_rgba[source_index + 1u];
+  unsigned char source_b = source_rgba[source_index + 2u];
+  unsigned char source_a = source_rgba[source_index + 3u];
+
+  output_rgba[source_index + 0u] = source_r;
+  output_rgba[source_index + 1u] = source_g;
+  output_rgba[source_index + 2u] = source_b;
+  output_rgba[source_index + 3u] = source_a;
+
+  double ui = (double)uniforms.mix;
+  if (ui < -100.0) ui = -100.0;
+  if (ui > 100.0) ui = 100.0;
+  double engine = (ui + 100.0) / 200.0;
+  double signed_value = 2.0 * engine - 1.0;
+  double degree = fabs(signed_value);
+  if (degree <= 0.001) return;
+
+  double alpha = ((double)(int)mask_r8[mask_index] / 255.0) * degree;
+  if (alpha <= 0.001) return;
+
+  const float inv255 = __uint_as_float(0x3b808081u);
+  double r = st_clamp01((double)__fmul_rn((float)source_r, inv255));
+  double g = st_clamp01((double)__fmul_rn((float)source_g, inv255));
+  double b = st_clamp01((double)__fmul_rn((float)source_b, inv255));
+  double lut_r = st_lut(lut_rgb512, r, g, b, 0u);
+  double lut_g = st_lut(lut_rgb512, r, g, b, 1u);
+  double lut_b = st_lut(lut_rgb512, r, g, b, 2u);
+  double source_r64 = (double)source_r / 255.0;
+  double source_g64 = (double)source_g / 255.0;
+  double source_b64 = (double)source_b / 255.0;
+
+  output_rgba[source_index + 0u] =
+      st_byte_even(source_r64 * (1.0 - alpha) + lut_r * alpha);
+  output_rgba[source_index + 1u] =
+      st_byte_even(source_g64 * (1.0 - alpha) + lut_g * alpha);
+  output_rgba[source_index + 2u] =
+      st_byte_even(source_b64 * (1.0 - alpha) + lut_b * alpha);
+  output_rgba[source_index + 3u] = source_a;
+}

@@ -11,10 +11,12 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 /// Page size; the reader and every Capture One database we have seen use 4096.
 const PAGE: usize = 4096;
+/// Page 1's b-tree header starts after the 100-byte file header.
+const PAGE1_HEADER: usize = 100;
 /// A table-leaf cell larger than this would need an overflow page.
 const MAX_LEAF_CELL: usize = PAGE - 35;
 /// Children per interior page; 32 keeps every interior cell well under a page.
@@ -101,47 +103,27 @@ pub fn sqlite_bytes(tables: &[SynthTable]) -> Result<Vec<u8>> {
     let mut sorted: Vec<&SynthTable> = tables.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut master = Vec::new();
+    let mut master: Vec<(i64, Vec<u8>)> = Vec::new();
     let mut body: Vec<Vec<u8>> = Vec::new();
     for (index, table) in sorted.iter().enumerate() {
         let (pages, root) = table_pages(&table.records()?, 2 + body.len() as u32)?;
         body.extend(pages);
         let sql = format!("CREATE TABLE \"{}\" ({})", table.name, table.columns.join(", "));
-        let payload = record(&[
-            Cell::text("table"),
-            Cell::text(&table.name),
-            Cell::text(&table.name),
-            Cell::Int(i64::from(root)),
-            Cell::Text(sql),
-        ]);
-        let mut cell = varint(payload.len() as u64);
-        cell.extend(varint(index as u64 + 1));
-        cell.extend(payload);
-        master.push(cell);
+        master.push((
+            index as i64 + 1,
+            record(&[
+                Cell::text("table"),
+                Cell::text(&table.name),
+                Cell::text(&table.name),
+                Cell::Int(i64::from(root)),
+                Cell::Text(sql),
+            ]),
+        ));
     }
 
-    // Page 1 starts its b-tree header after the 100-byte file header. A lean
-    // schema fits in one leaf; a full session can push sqlite_master over one
-    // page, so split it and make page 1 an interior root.
-    let master_groups = split_cells(master);
-    let master_first = 2 + body.len() as u32;
-    let (mut file, extra_pages) = if master_groups.len() == 1 {
-        (page(0x0d, 100, &master_groups[0], 0), 0usize)
-    } else {
-        if master_groups.len() > MAX_INTERIOR_CHILDREN {
-            bail!("sqlite_master needs more than {MAX_INTERIOR_CHILDREN} leaves");
-        }
-        let mut children = Vec::with_capacity(master_groups.len() - 1);
-        let mut consumed = 0i64;
-        for (index, group) in master_groups.iter().enumerate().take(master_groups.len() - 1) {
-            consumed += group.len() as i64;
-            let mut cell = (master_first + index as u32).to_be_bytes().to_vec();
-            cell.extend(varint(consumed as u64));
-            children.push(cell);
-        }
-        let right = master_first + master_groups.len() as u32 - 1;
-        (page(0x05, 100, &children, right), master_groups.len())
-    };
+    // A real session's DDL is far wider than one page, so page 1 is an
+    // interior page over leaves written after the table pages.
+    let (mut file, master_leaves) = master_page(&master, 2 + body.len() as u32)?;
     let header = &mut file[..100];
     header[..16].copy_from_slice(b"SQLite format 3\0");
     header[16..18].copy_from_slice(&(PAGE as u16).to_be_bytes());
@@ -151,7 +133,8 @@ pub fn sqlite_bytes(tables: &[SynthTable]) -> Result<Vec<u8>> {
     header[22] = 32;
     header[23] = 32;
     header[24..28].copy_from_slice(&1u32.to_be_bytes());
-    header[28..32].copy_from_slice(&((body.len() + 1 + extra_pages) as u32).to_be_bytes());
+    header[28..32]
+        .copy_from_slice(&((body.len() + 1 + master_leaves.len()) as u32).to_be_bytes());
     header[40..44].copy_from_slice(&1u32.to_be_bytes());
     header[44..48].copy_from_slice(&4u32.to_be_bytes());
     header[56..60].copy_from_slice(&1u32.to_be_bytes());
@@ -161,33 +144,56 @@ pub fn sqlite_bytes(tables: &[SynthTable]) -> Result<Vec<u8>> {
     for page in body {
         file.extend(page);
     }
-    if master_groups.len() > 1 {
-        for group in &master_groups {
-            file.extend(page(0x0d, 0, group, 0));
-        }
+    for page in master_leaves {
+        file.extend(page);
     }
     Ok(file)
 }
 
-/// Splits leaf cells into pages that fit after an 8-byte b-tree header.
-fn split_cells(cells: Vec<Vec<u8>>) -> Vec<Vec<Vec<u8>>> {
-    let mut groups: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut current: Vec<Vec<u8>> = Vec::new();
-    let mut used = 8usize;
-    for cell in cells {
-        if !current.is_empty() && used + 2 + cell.len() > PAGE {
-            groups.push(std::mem::take(&mut current));
-            used = 8;
-        }
-        used += 2 + cell.len();
-        current.push(cell);
+/// Page 1, plus the `sqlite_master` leaves when its rows do not fit one page.
+fn master_page(rows: &[(i64, Vec<u8>)], first_leaf: u32) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let cells: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|(rowid, payload)| table_cell(*rowid, payload))
+        .collect();
+    if fits(PAGE1_HEADER + 8, &cells) {
+        return Ok((page(0x0d, PAGE1_HEADER, &cells, 0)?, Vec::new()));
     }
-    groups.push(current);
-    groups
+    let (leaves, level) = leaf_level(rows, first_leaf)?;
+    if level.len() < 2 {
+        bail!("sqlite_master has one row too large for page 1");
+    }
+    Ok((interior_page(&level, PAGE1_HEADER)?, leaves))
+}
+
+/// Whether `cells` plus their 2-byte pointers fit behind `prefix` bytes.
+fn fits(prefix: usize, cells: &[Vec<u8>]) -> bool {
+    prefix + cells.iter().map(|cell| 2 + cell.len()).sum::<usize>() <= PAGE
 }
 
 /// The pages of one table's b-tree, in page order, plus its root page number.
 fn table_pages(rows: &[(i64, Vec<u8>)], first_page: u32) -> Result<(Vec<Vec<u8>>, u32)> {
+    let (mut pages, mut level) = leaf_level(rows, first_page)?;
+    let mut next_page = first_page + level.len() as u32;
+    while level.len() > 1 {
+        let mut parents = Vec::new();
+        for (index, chunk) in level.chunks(MAX_INTERIOR_CHILDREN).enumerate() {
+            let page = next_page + index as u32;
+            pages.push(interior_page(chunk, 0)?);
+            parents.push((page, chunk[chunk.len() - 1].1));
+        }
+        next_page += parents.len() as u32;
+        level = parents;
+    }
+    Ok((pages, level[0].0))
+}
+
+/// Splits rows into leaf pages and returns the pages plus `(page, last rowid)`
+/// per leaf, which is what an interior level keys on.
+fn leaf_level(
+    rows: &[(i64, Vec<u8>)],
+    first_page: u32,
+) -> Result<(Vec<Vec<u8>>, Vec<(u32, i64)>)> {
     // Split the rows into leaf pages that each fit inside one 4096-byte page.
     let mut groups: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut cells: Vec<Vec<u8>> = Vec::new();
@@ -196,9 +202,7 @@ fn table_pages(rows: &[(i64, Vec<u8>)], first_page: u32) -> Result<(Vec<Vec<u8>>
         if *rowid < 1 {
             bail!("rowid {rowid} is not a positive integer");
         }
-        let mut cell = varint(payload.len() as u64);
-        cell.extend(varint(*rowid as u64));
-        cell.extend_from_slice(payload);
+        let cell = table_cell(*rowid, payload);
         if cell.len() > MAX_LEAF_CELL {
             bail!("row {rowid} is too large for a session table");
         }
@@ -211,11 +215,12 @@ fn table_pages(rows: &[(i64, Vec<u8>)], first_page: u32) -> Result<(Vec<Vec<u8>>
     }
     groups.push(cells);
 
-    let mut pages: Vec<Vec<u8>> = groups.iter().map(|g| leaf_page(g)).collect();
+    let mut pages = Vec::with_capacity(groups.len());
     // A table-interior key is the largest rowid below it.
     let mut level = Vec::with_capacity(groups.len());
     let mut consumed = 0usize;
     for (i, group) in groups.iter().enumerate() {
+        pages.push(leaf_page(group)?);
         consumed += group.len();
         let key = consumed
             .checked_sub(1)
@@ -224,19 +229,15 @@ fn table_pages(rows: &[(i64, Vec<u8>)], first_page: u32) -> Result<(Vec<Vec<u8>>
             .unwrap_or(0);
         level.push((first_page + i as u32, key));
     }
+    Ok((pages, level))
+}
 
-    let mut next_page = first_page + groups.len() as u32;
-    while level.len() > 1 {
-        let mut parents = Vec::new();
-        for (index, chunk) in level.chunks(MAX_INTERIOR_CHILDREN).enumerate() {
-            let page = next_page + index as u32;
-            pages.push(interior_page(chunk));
-            parents.push((page, chunk[chunk.len() - 1].1));
-        }
-        next_page += parents.len() as u32;
-        level = parents;
-    }
-    Ok((pages, level[0].0))
+/// A table-leaf cell: payload length, rowid, payload.
+fn table_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
+    let mut cell = varint(payload.len() as u64);
+    cell.extend(varint(rowid as u64));
+    cell.extend_from_slice(payload);
+    cell
 }
 
 fn record(cells: &[Cell]) -> Vec<u8> {
@@ -283,13 +284,13 @@ fn varint_len(mut v: u64) -> usize {
     len
 }
 
-fn leaf_page(cells: &[Vec<u8>]) -> Vec<u8> {
+fn leaf_page(cells: &[Vec<u8>]) -> Result<Vec<u8>> {
     page(0x0d, 0, cells, 0)
 }
 
 /// One table-interior page: a 4-byte child pointer per cell and the rightmost
 /// child after the header.
-fn interior_page(children: &[(u32, i64)]) -> Vec<u8> {
+fn interior_page(children: &[(u32, i64)], header: usize) -> Result<Vec<u8>> {
     let cells: Vec<Vec<u8>> = children[..children.len() - 1]
         .iter()
         .map(|(page, key)| {
@@ -298,19 +299,24 @@ fn interior_page(children: &[(u32, i64)]) -> Vec<u8> {
             cell
         })
         .collect();
-    page(0x05, 0, &cells, children[children.len() - 1].0)
+    page(0x05, header, &cells, children[children.len() - 1].0)
 }
 
 /// One page; `header` is where its b-tree header starts (100 on page 1).
-fn page(kind: u8, header: usize, cells: &[Vec<u8>], right: u32) -> Vec<u8> {
+fn page(kind: u8, header: usize, cells: &[Vec<u8>], right: u32) -> Result<Vec<u8>> {
     let pointers_at = header + if kind == 0x05 { 12 } else { 8 };
     let mut buf = vec![0u8; PAGE];
     let mut free = PAGE;
     let mut pointers = Vec::with_capacity(cells.len());
     for cell in cells {
-        free -= cell.len();
+        free = free
+            .checked_sub(cell.len())
+            .ok_or_else(|| anyhow!("{} cells do not fit one {PAGE}-byte page", cells.len()))?;
         buf[free..free + cell.len()].copy_from_slice(cell);
         pointers.push(free as u16);
+    }
+    if free < pointers_at + cells.len() * 2 {
+        bail!("{} cells and their pointers do not fit one {PAGE}-byte page", cells.len());
     }
     buf[header] = kind;
     buf[header + 3..header + 5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
@@ -321,7 +327,7 @@ fn page(kind: u8, header: usize, cells: &[Vec<u8>], right: u32) -> Vec<u8> {
     for (i, at) in pointers.into_iter().enumerate() {
         buf[pointers_at + i * 2..pointers_at + i * 2 + 2].copy_from_slice(&at.to_be_bytes());
     }
-    buf
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -349,6 +355,52 @@ mod tests {
         for (row, (pk, value)) in rows.iter().zip(&expected) {
             assert_eq!(row.get("Z_PK"), Some(&Value::Int(*pk)));
             assert_eq!(row.get("ZVALUE"), Some(&Value::Text(value.clone())));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A session's `CREATE TABLE` rows together are wider than page 1; the
+    /// writer used to put them all there and panicked on the subtract.
+    #[test]
+    fn a_session_schema_wider_than_page_one_round_trips() {
+        // The table names and column counts `c1session_export` writes.
+        let schema: [(&str, usize); 12] = [
+            ("ZDOCUMENTCONTENT", 2),
+            ("ZPATHLOCATION", 8),
+            ("ZCOLLECTION", 45),
+            ("ZIMAGE", 27),
+            ("ZVARIANT", 20),
+            ("ZVARIANTLAYER", 49),
+            ("ZVARIANTMETADATA", 8),
+            ("ZKEYWORD", 14),
+            ("ZIMAGEINCOLLECTION", 6),
+            ("ZRETOUCHINGLAYER", 42),
+            ("ZENTITIES", 2),
+            ("ZDOCUMENTSETTING", 4),
+        ];
+        let mut ddl = 0usize;
+        let mut tables = Vec::new();
+        for (index, (name, columns)) in schema.iter().enumerate() {
+            let columns: Vec<String> =
+                (0..*columns).map(|c| format!("ZCAPTURESETTINGC{c} TEXT")).collect();
+            let mut cells = vec![Cell::Null; columns.len()];
+            cells[0] = Cell::text(name);
+            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+            tables.push(SynthTable::new(*name, &refs).row_with_id(index as i64 + 1, cells));
+            ddl += name.len() + columns.iter().map(|c| c.len() + 4).sum::<usize>() + 40;
+        }
+        assert!(ddl > PAGE - PAGE1_HEADER, "the schema must not fit page 1: {ddl} bytes");
+
+        let bytes = sqlite_bytes(&tables).unwrap();
+        let path = std::env::temp_dir().join(format!("sqlite-master-{}.db", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut db = crate::c1catalog::SqliteReader::open(&path).unwrap();
+        for (name, columns) in &schema {
+            assert!(db.has_table(name).unwrap(), "{name} missing from sqlite_master");
+            assert_eq!(db.columns(name).unwrap().len(), *columns, "{name} column count");
+            let rows = db.select(name).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("ZCAPTURESETTINGC0"), Some(&Value::Text((*name).to_string())));
         }
         let _ = std::fs::remove_file(&path);
     }

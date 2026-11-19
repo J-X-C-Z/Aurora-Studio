@@ -178,11 +178,42 @@ pub struct Dispatch {
 pub struct DriverMetrics {
     pub ptx_module_load_calls: usize,
     pub skin_lut_uploads: usize,
+    pub teeth_lut_uploads: usize,
+    pub host_to_device_bytes: usize,
+    pub device_to_host_bytes: usize,
+    pub device_allocations: usize,
+    pub context_syncs: usize,
+}
+
+/// Device-wide memory reported by the CUDA context at the sampling instant.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceMemoryInfo {
+    pub free_bytes: usize,
+    pub total_bytes: usize,
+}
+
+/// One launch in a device-resident staging chain.
+#[cfg(windows)]
+pub(crate) struct ChainStage<'a> {
+    pub kernel: &'static str,
+    pub grid: (u32, u32),
+    pub inputs: &'a [usize],
+    pub output: usize,
+    pub lut: Option<usize>,
+    pub lut_arg: bool,
+    pub init_from: Option<usize>,
+    pub uniforms: &'a [u8],
 }
 
 #[cfg(windows)]
 pub fn driver_metrics() -> DriverMetrics {
     driver::metrics()
+}
+
+#[cfg(windows)]
+pub fn driver_memory_info() -> Result<DeviceMemoryInfo, CudaError> {
+    driver::memory_info()
 }
 
 #[cfg(all(windows, test))]
@@ -219,6 +250,19 @@ pub fn ptx_isa(ptx: &str) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
+/// Highest PTX ISA the driver reported by `cuDriverGetVersion` can JIT.
+///
+/// A driver version is `major * 1000 + minor * 10` and the PTX ISA for it is
+/// `(major - 4, minor)`, so CUDA 13.3 maps to ISA 9.3. Anything below CUDA 4
+/// yields major 0, which `restamp_ptx` refuses rather than over-downgrading.
+pub fn driver_ptx_isa(driver_version: i32) -> (u32, u32) {
+    let version = driver_version.max(0) as u32;
+    (
+        (version / 1000).saturating_sub(4),
+        (version % 1000) / 10,
+    )
+}
+
 /// Re-stamps the ISA header down to `target`.
 ///
 /// The driver's JIT refuses a PTX image newer than its own CUDA version, and a
@@ -240,10 +284,9 @@ pub fn restamp_ptx(ptx: &str, target: (u32, u32)) -> Option<String> {
 #[cfg(windows)]
 mod driver {
     use super::{
-        cpu, ptx_isa, restamp_ptx, CudaError, Dispatch, DriverMetrics, Image, Pass, Refusal,
-        Uniforms, PTX,
+        cpu, driver_ptx_isa, ptx_isa, restamp_ptx, ChainStage, CudaError, DeviceMemoryInfo,
+        Dispatch, DriverMetrics, Image, Pass, Refusal, Uniforms, PTX,
     };
-    use std::cell::RefCell;
     #[cfg(test)]
     use std::cell::Cell;
     use std::ffi::{c_char, c_void, CString, CStr};
@@ -275,24 +318,24 @@ mod driver {
         LIVE_CONTEXTS.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    #[cfg(test)]
     fn count_device_allocation() {
+        DEVICE_ALLOCATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
         DEVICE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     }
 
-    #[cfg(test)]
     pub(crate) fn device_allocations() -> usize {
-        DEVICE_ALLOCATIONS.with(|count| count.get())
+        DEVICE_ALLOCATIONS_TOTAL.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     fn count_context_sync() {
+        CONTEXT_SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
         CONTEXT_SYNCS.with(|count| count.set(count.get() + 1));
     }
 
-    #[cfg(test)]
     pub(crate) fn context_syncs() -> usize {
-        CONTEXT_SYNCS.with(|count| count.get())
+        CONTEXT_SYNCS_TOTAL.load(Ordering::Relaxed)
     }
 
     type CuResult = i32;
@@ -305,8 +348,6 @@ mod driver {
     const ATTR_CC_MAJOR: i32 = 75;
     const ATTR_CC_MINOR: i32 = 76;
     const BLOCK: (u32, u32) = (16, 16);
-    /// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`.
-    const UNSUPPORTED_PTX_VERSION: i32 = 222;
 
     #[link(name = "kernel32")]
       unsafe extern "system" {
@@ -336,6 +377,7 @@ mod driver {
         module_function: unsafe extern "system" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult,
         mem_alloc: unsafe extern "system" fn(*mut CuPtr, usize) -> CuResult,
         mem_free: unsafe extern "system" fn(CuPtr) -> CuResult,
+        mem_get_info: unsafe extern "system" fn(*mut usize, *mut usize) -> CuResult,
         copy_in: unsafe extern "system" fn(CuPtr, *const c_void, usize) -> CuResult,
         copy_out: unsafe extern "system" fn(*mut c_void, CuPtr, usize) -> CuResult,
         copy_device: unsafe extern "system" fn(CuPtr, CuPtr, usize) -> CuResult,
@@ -397,6 +439,7 @@ mod driver {
                 module_function: sym!("cuModuleGetFunction"),
                 mem_alloc: sym2!("cuMemAlloc_v2", "cuMemAlloc"),
                 mem_free: sym2!("cuMemFree_v2", "cuMemFree"),
+                mem_get_info: sym2!("cuMemGetInfo_v2", "cuMemGetInfo"),
                 copy_in: sym2!("cuMemcpyHtoD_v2", "cuMemcpyHtoD"),
                 copy_out: sym2!("cuMemcpyDtoH_v2", "cuMemcpyDtoH"),
                 copy_device: sym2!("cuMemcpyDtoD_v2", "cuMemcpyDtoD"),
@@ -428,6 +471,60 @@ mod driver {
         stride: u32,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct StagingShape {
+        input_count: usize,
+        input_bytes: Vec<usize>,
+        output_bytes: usize,
+        alias_input0: bool,
+    }
+
+    struct CachedStaging {
+        shape: StagingShape,
+        buffers: Vec<(CuPtr, usize)>,
+    }
+
+    struct CachedComposite {
+        shape: BufferShape,
+        buffers: Vec<(CuPtr, usize)>,
+    }
+
+    impl CachedComposite {
+        fn matches(&self, shape: BufferShape, sizes: &[usize; 6]) -> bool {
+            self.shape == shape
+                && self
+                    .buffers
+                    .iter()
+                    .map(|(_, size)| *size)
+                    .eq(sizes.iter().copied())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct LutBufferShape {
+        grid: (u32, u32),
+        source_bytes: usize,
+        mask_bytes: usize,
+    }
+
+    struct CachedLutBuffers {
+        shape: LutBufferShape,
+        buffers: Vec<(CuPtr, usize)>,
+    }
+
+    impl CachedLutBuffers {
+        fn matches(&self, shape: LutBufferShape) -> bool {
+            self.shape == shape
+                && self
+                    .buffers
+                    .iter()
+                    .map(|(_, size)| *size)
+                    .eq([shape.source_bytes, shape.source_bytes, shape.mask_bytes]
+                        .iter()
+                        .copied())
+        }
+    }
+
     /// One process-wide context owns every JIT-compiled PTX module.
     ///
     /// The handle stores no resource and therefore cannot outlive the domain.
@@ -438,7 +535,11 @@ mod driver {
         ctx: usize,
         modules: Vec<LoadedModule>,
         pending: bool,
-        composite_buffers: Option<(BufferShape, Vec<(CuPtr, usize)>)>,
+        composite_buffers: Vec<CachedComposite>,
+        lut_buffers: Vec<CachedLutBuffers>,
+        generic_staging: Vec<CachedStaging>,
+        skin_luts: Vec<CachedLut>,
+        teeth_luts: Vec<CachedLut>,
         name: String,
         compute_cap: (i32, i32),
         driver_version: i32,
@@ -447,7 +548,19 @@ mod driver {
     static DOMAIN: OnceLock<Result<Mutex<Domain>, CudaError>> = OnceLock::new();
     static PTX_MODULE_LOADS: AtomicUsize = AtomicUsize::new(0);
     static SKIN_LUT_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+    static TEETH_LUT_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+    static HOST_TO_DEVICE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static DEVICE_TO_HOST_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static DEVICE_ALLOCATIONS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+    static CONTEXT_SYNCS_TOTAL: AtomicUsize = AtomicUsize::new(0);
     const LUT_CACHE_SLOTS: usize = 2;
+    // Two exact shapes cover preview/export interleaving; eviction waits before freeing.
+    const COMPOSITE_BUFFER_SLOTS: usize = 2;
+    const LUT_BUFFER_SLOTS: usize = 2;
+    const TEETH_LUT_CACHE_SLOTS: usize = 2;
+    // Two slots cover the common single-pass then four-input blend pair.
+    // shortcut: only two exact shapes stay resident, add a byte-budgeted LRU if adapters interleave more.
+    const GENERIC_STAGING_SLOTS: usize = 2;
 
     #[derive(Debug)]
     struct CachedLut {
@@ -470,7 +583,6 @@ mod driver {
         driver_version: i32,
         ptx_isa: (u32, u32),
         image_bytes: usize,
-        lut_cache: RefCell<Vec<CachedLut>>,
     }
 
     impl Domain {
@@ -492,7 +604,11 @@ mod driver {
                 ctx: ctx as usize,
                 modules: Vec::new(),
                 pending: false,
-                composite_buffers: None,
+                composite_buffers: Vec::new(),
+                lut_buffers: Vec::new(),
+                generic_staging: Vec::new(),
+                skin_luts: Vec::new(),
+                teeth_luts: Vec::new(),
                 name: String::new(),
                 compute_cap: (0, 0),
                 driver_version: version,
@@ -558,35 +674,21 @@ mod driver {
             // Module cache hits may run on a different host thread, so binding
             // must precede the lookup rather than only the first JIT load.
             self.bind()?;
-            self.synchronize_pending()?;
             if let Some(module) = self.modules.iter().find(|module| module.image == image) {
                 return Ok(*module);
             }
-            // Only driver error 222 licenses the header-only compatibility retry.
-            let (module, isa, loaded) = match Self::load_module(&self.api, image) {
-                Ok(module) => (
-                    module,
-                    ptx_isa(image).ok_or(CudaError::Unavailable("ptx image"))?,
-                    image.len(),
-                ),
-                Err(CudaError::Driver(_, UNSUPPORTED_PTX_VERSION))
-                    if self.driver_version >= 4000 =>
-                {
-                    let target = (
-                        (self.driver_version as u32 / 1000 - 4),
-                        (self.driver_version as u32 % 1000) / 10,
-                    );
-                    let downgraded =
-                        restamp_ptx(image, target).ok_or(CudaError::Unavailable("ptx image"))?;
-                    let module = Self::load_module(&self.api, &downgraded)?;
-                    (
-                        module,
-                        ptx_isa(&downgraded).unwrap_or(target),
-                        downgraded.len(),
-                    )
-                }
-                Err(error) => return Err(error),
-            };
+            // A toolkit newer than the driver used to make the first load a
+            // guaranteed error-222 round trip before the same text was loaded
+            // again at a supported ISA. Re-stamping the header up front keeps
+            // the cold path to one module load per image.
+            let target = driver_ptx_isa(self.driver_version);
+            let downgraded = restamp_ptx(image, target);
+            let preferred = downgraded.as_deref().unwrap_or(image);
+            let module = Self::load_module(&self.api, preferred)?;
+            let (isa, loaded) = (
+                ptx_isa(preferred).ok_or(CudaError::Unavailable("ptx image"))?,
+                preferred.len(),
+            );
             let loaded_module = LoadedModule {
                 image,
                 module: module as usize,
@@ -599,7 +701,6 @@ mod driver {
 
         fn synchronize_pending(&mut self) -> Result<(), CudaError> {
             if self.pending {
-                #[cfg(test)]
                 count_context_sync();
                 unsafe { check((self.api.ctx_sync)(), "cuCtxSynchronize")? };
                 self.pending = false;
@@ -617,55 +718,231 @@ mod driver {
                 height: uniforms.height,
                 stride: uniforms.stride,
             };
-            let reusable = self
+            if let Some(index) = self
                 .composite_buffers
-                .as_ref()
-                .is_some_and(|(cached_shape, buffers)| {
-                    *cached_shape == shape
-                        && buffers
-                            .iter()
-                            .map(|(_, size)| *size)
-                            .eq(sizes.iter().copied())
-                });
-            if !reusable {
-                if let Some((_, old)) = self.composite_buffers.take() {
-                    for (ptr, _) in old {
-                        unsafe {
-                            let _ = (self.api.mem_free)(ptr);
+                .iter()
+                .position(|entry| entry.matches(shape, &sizes))
+            {
+                let entry = self.composite_buffers.remove(index);
+                let ptrs = std::array::from_fn(|slot| entry.buffers[slot].0);
+                self.composite_buffers.push(entry);
+                return Ok(ptrs);
+            }
+            if self.composite_buffers.len() == COMPOSITE_BUFFER_SLOTS {
+                self.synchronize_pending()?;
+                let evicted = self.composite_buffers.remove(0);
+                self.free_group(evicted.buffers)?;
+            }
+            let mut allocations = Buffers {
+                api: &self.api,
+                ptrs: Vec::new(),
+                pending_launch: false,
+            };
+            for size in sizes {
+                allocations.alloc(size)?;
+            }
+            let buffers: Vec<_> = allocations.ptrs.drain(..).zip(sizes).collect();
+            let ptrs = std::array::from_fn(|slot| buffers[slot].0);
+            self.composite_buffers
+                .push(CachedComposite { shape, buffers });
+            Ok(ptrs)
+        }
+
+        fn free_group(&mut self, buffers: Vec<(CuPtr, usize)>) -> Result<(), CudaError> {
+            let mut first_error = Ok(());
+            for (ptr, _) in buffers {
+                unsafe {
+                    if let Err(error) = check((self.api.mem_free)(ptr), "cuMemFree") {
+                        if first_error.is_ok() {
+                            first_error = Err(error);
                         }
                     }
                 }
-                let mut allocations = Buffers {
-                    api: &self.api,
-                    ptrs: Vec::new(),
-                    pending_launch: false,
-                };
-                for size in sizes {
-                    allocations.alloc(size)?;
-                }
-                self.composite_buffers = Some((
-                    shape,
-                    allocations.ptrs.drain(..).zip(sizes).collect(),
-                ));
             }
-            Ok(std::array::from_fn(|index| {
-                self.composite_buffers
-                    .as_ref()
-                    .expect("composite buffer cache")
-                    .1[index]
-                    .0
-            }))
+            first_error
+        }
+
+        fn lut_buffers(
+            &mut self,
+            grid: (u32, u32),
+            source_bytes: usize,
+            mask_bytes: usize,
+        ) -> Result<[CuPtr; 3], CudaError> {
+            let shape = LutBufferShape {
+                grid,
+                source_bytes,
+                mask_bytes,
+            };
+            if let Some(index) = self
+                .lut_buffers
+                .iter()
+                .position(|entry| entry.matches(shape))
+            {
+                let entry = self.lut_buffers.remove(index);
+                let ptrs = std::array::from_fn(|slot| entry.buffers[slot].0);
+                self.lut_buffers.push(entry);
+                return Ok(ptrs);
+            }
+            if self.lut_buffers.len() == LUT_BUFFER_SLOTS {
+                self.synchronize_pending()?;
+                let evicted = self.lut_buffers.remove(0);
+                self.free_group(evicted.buffers)?;
+            }
+            let sizes = [source_bytes, source_bytes, mask_bytes];
+            let mut allocations = Buffers {
+                api: &self.api,
+                ptrs: Vec::new(),
+                pending_launch: false,
+            };
+            for size in sizes {
+                allocations.alloc(size)?;
+            }
+            let buffers: Vec<_> = allocations.ptrs.drain(..).zip(sizes).collect();
+            let ptrs = std::array::from_fn(|slot| buffers[slot].0);
+            self.lut_buffers.push(CachedLutBuffers { shape, buffers });
+            Ok(ptrs)
+        }
+
+        fn generic_staging(&mut self, shape: &StagingShape) -> Result<Vec<CuPtr>, CudaError> {
+            if let Some(index) = self
+                .generic_staging
+                .iter()
+                .position(|entry| &entry.shape == shape)
+            {
+                let entry = self.generic_staging.remove(index);
+                let ptrs = entry.buffers.iter().map(|(ptr, _)| *ptr).collect();
+                self.generic_staging.push(entry);
+                return Ok(ptrs);
+            }
+
+            if self.generic_staging.len() == GENERIC_STAGING_SLOTS {
+                self.synchronize_pending()?;
+                let evicted = self.generic_staging.remove(0);
+                for (ptr, _) in evicted.buffers {
+                    unsafe {
+                        let _ = (self.api.mem_free)(ptr);
+                    }
+                }
+            }
+            let mut allocations = Buffers {
+                api: &self.api,
+                ptrs: Vec::new(),
+                pending_launch: false,
+            };
+            let mut sizes = shape.input_bytes.clone();
+            if !shape.alias_input0 {
+                sizes.push(shape.output_bytes);
+            }
+            for size in &sizes {
+                allocations.alloc(*size)?;
+            }
+            let ptrs = allocations.ptrs.iter().copied().collect();
+            let buffers = allocations.ptrs.drain(..).zip(sizes).collect();
+            self.generic_staging.push(CachedStaging {
+                shape: shape.clone(),
+                buffers,
+            });
+            Ok(ptrs)
+        }
+
+        fn clear_generic_staging(&mut self) {
+            for entry in self.generic_staging.drain(..) {
+                for (ptr, _) in entry.buffers {
+                    unsafe {
+                        let _ = (self.api.mem_free)(ptr);
+                    }
+                }
+            }
+        }
+
+        fn cached_skin_lut(&mut self, data: &[u8]) -> Result<CuPtr, CudaError> {
+            if let Some(hit) = self.skin_luts.iter().find(|entry| entry.bytes == data) {
+                return Ok(hit.ptr);
+            }
+            if self.skin_luts.len() == LUT_CACHE_SLOTS {
+                self.synchronize_pending()?;
+                let evicted = self.skin_luts.remove(0);
+                unsafe {
+                    let _ = (self.api.mem_free)(evicted.ptr);
+                }
+            }
+            let mut ptr: CuPtr = 0;
+            unsafe {
+                check(
+                    (self.api.mem_alloc)(&mut ptr, data.len().max(1)),
+                    "cuMemAlloc",
+                )?;
+            }
+            count_device_allocation();
+            if let Err(error) = unsafe {
+                check(
+                    (self.api.copy_in)(ptr, data.as_ptr() as *const c_void, data.len()),
+                    "cuMemcpyHtoD",
+                )
+            } {
+                unsafe {
+                    let _ = (self.api.mem_free)(ptr);
+                }
+                return Err(error);
+            }
+            HOST_TO_DEVICE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
+            SKIN_LUT_UPLOADS.fetch_add(1, Ordering::Relaxed);
+            self.skin_luts.push(CachedLut {
+                bytes: data.to_vec(),
+                ptr,
+            });
+            Ok(ptr)
+        }
+
+        fn cached_teeth_lut(&mut self, data: &[u8]) -> Result<CuPtr, CudaError> {
+            if let Some(hit) = self.teeth_luts.iter().find(|entry| entry.bytes == data) {
+                return Ok(hit.ptr);
+            }
+            if self.teeth_luts.len() == TEETH_LUT_CACHE_SLOTS {
+                let evicted = self.teeth_luts.remove(0);
+                unsafe {
+                    let _ = (self.api.mem_free)(evicted.ptr);
+                }
+            }
+            let mut ptr: CuPtr = 0;
+            unsafe {
+                check(
+                    (self.api.mem_alloc)(&mut ptr, data.len().max(1)),
+                    "cuMemAlloc",
+                )?;
+                check(
+                    (self.api.copy_in)(ptr, data.as_ptr() as *const c_void, data.len()),
+                    "cuMemcpyHtoD",
+                )?;
+            }
+            count_device_allocation();
+            TEETH_LUT_UPLOADS.fetch_add(1, Ordering::Relaxed);
+            self.teeth_luts.push(CachedLut {
+                bytes: data.to_vec(),
+                ptr,
+            });
+            Ok(ptr)
         }
     }
 
     impl Drop for Domain {
         fn drop(&mut self) {
             let _ = self.synchronize_pending();
-            if let Some((_, buffers)) = self.composite_buffers.take() {
-                for (ptr, _) in buffers {
-                    unsafe {
-                        let _ = (self.api.mem_free)(ptr);
-                    }
+            for group in std::mem::take(&mut self.composite_buffers) {
+                let _ = self.free_group(group.buffers);
+            }
+            for group in std::mem::take(&mut self.lut_buffers) {
+                let _ = self.free_group(group.buffers);
+            }
+            self.clear_generic_staging();
+            for lut in self.skin_luts.drain(..) {
+                unsafe {
+                    let _ = (self.api.mem_free)(lut.ptr);
+                }
+            }
+            for lut in self.teeth_luts.drain(..) {
+                unsafe {
+                    let _ = (self.api.mem_free)(lut.ptr);
                 }
             }
             unsafe {
@@ -692,7 +969,6 @@ mod driver {
         fn alloc(&mut self, bytes: usize) -> Result<CuPtr, CudaError> {
             let mut ptr: CuPtr = 0;
             unsafe { check((self.api.mem_alloc)(&mut ptr, bytes), "cuMemAlloc")? };
-            #[cfg(test)]
             count_device_allocation();
             self.ptrs.push(ptr);
             Ok(ptr)
@@ -848,7 +1124,6 @@ mod driver {
                 driver_version: domain.driver_version,
                 ptx_isa: module.ptx_isa,
                 image_bytes: module.image_bytes,
-                lut_cache: RefCell::new(Vec::new()),
             })
         }
 
@@ -882,13 +1157,19 @@ mod driver {
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             domain.bind()?;
             domain.synchronize_pending()?;
-            if let Some((_, buffers)) = domain.composite_buffers.take() {
-                for (ptr, _) in buffers {
-                    unsafe {
-                        check((domain.api.mem_free)(ptr), "cuMemFree")?;
-                    }
-                }
+            for group in std::mem::take(&mut domain.composite_buffers) {
+                domain.free_group(group.buffers)?;
             }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn clear_generic_staging(&self) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            domain.synchronize_pending()?;
+            domain.clear_generic_staging();
             Ok(())
         }
 
@@ -919,6 +1200,96 @@ mod driver {
             self.run_u8_with_init(kernel, grid, inputs, uniform_bytes, None)
         }
 
+        /// Runs a chain of kernels over one cached staging group. Only the
+        /// final output returns to the host; intermediate slots stay on device.
+        pub(crate) fn run_u8_chain(
+            &self,
+            stages: &[ChainStage<'_>],
+            slot_bytes: &[usize],
+            uploads: &[(usize, &[u8])],
+            output_slot: usize,
+        ) -> Result<(Vec<u8>, Vec<Dispatch>), CudaError> {
+            if slot_bytes.len() < 2 || output_slot + 1 != slot_bytes.len() {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("chain slots")));
+            }
+            for &(slot, data) in uploads {
+                if slot >= slot_bytes.len() - 1 || data.len() != slot_bytes[slot] {
+                    return Err(CudaError::Refused(Refusal::ShapeMismatch("chain upload")));
+                }
+            }
+            for stage in stages {
+                if stage.uniforms.is_empty() || stage.uniforms.len() % 4 != 0 {
+                    return Err(CudaError::Refused(Refusal::ShapeMismatch("uniforms")));
+                }
+                if stage.output >= slot_bytes.len()
+                    || stage.inputs.iter().any(|&slot| slot >= slot_bytes.len())
+                    || stage.lut.is_some_and(|slot| slot >= slot_bytes.len())
+                    || stage.init_from.is_some_and(|slot| slot >= slot_bytes.len())
+                {
+                    return Err(CudaError::Refused(Refusal::ShapeMismatch("chain stage")));
+                }
+            }
+            let output_bytes = slot_bytes[output_slot];
+            let shape = StagingShape {
+                input_count: slot_bytes.len() - 1,
+                input_bytes: slot_bytes[..slot_bytes.len() - 1].to_vec(),
+                output_bytes,
+                alias_input0: false,
+            };
+
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let api = domain.api;
+            let buffers = domain.generic_staging(&shape)?;
+            for &(slot, data) in uploads {
+                self.upload(buffers[slot], data)?;
+            }
+
+            let mut dispatches = Vec::with_capacity(stages.len());
+            for stage in stages {
+                let mut args: Vec<CuPtr> =
+                    stage.inputs.iter().map(|&slot| buffers[slot]).collect();
+                let mut params: Vec<*mut c_void> = args
+                    .iter_mut()
+                    .map(|arg| arg as *mut CuPtr as *mut c_void)
+                    .collect();
+                if stage.lut_arg {
+                    let mut lut = stage.lut.map_or(0, |slot| buffers[slot]);
+                    params.push(&mut lut as *mut CuPtr as *mut c_void);
+                }
+                if let Some(slot) = stage.init_from {
+                    self.copy_from_device(
+                        buffers[stage.output],
+                        buffers[slot],
+                        slot_bytes[stage.output],
+                    )?;
+                }
+                let mut output = buffers[stage.output];
+                params.push(&mut output as *mut CuPtr as *mut c_void);
+                let mut block = stage.uniforms.to_vec();
+                params.push(block.as_mut_ptr() as *mut c_void);
+                match self.launch_on(&api, module, stage.kernel, stage.grid, BLOCK, &mut params) {
+                    Ok(dispatch) => {
+                        domain.pending = true;
+                        dispatches.push(dispatch);
+                    }
+                    Err(error) => {
+                        let _ = domain.synchronize_pending();
+                        return Err(error);
+                    }
+                }
+            }
+
+            let mut output = vec![0u8; output_bytes];
+            let downloaded = self.download(buffers[output_slot], &mut output);
+            if downloaded.is_ok() {
+                domain.pending = false;
+            }
+            downloaded?;
+            Ok((output, dispatches))
+        }
+
         /// Run RGBA8 + mask + one LUT while retaining the LUT on device.
         pub(crate) fn run_u8_cached_lut(
             &self,
@@ -939,17 +1310,14 @@ mod driver {
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let module = domain.module(self.image)?.module as CuModule;
             let api = domain.api;
-            let mut buffers = Buffers {
-                api: &api,
-                ptrs: Vec::new(),
-                pending_launch: false,
-            };
-            let source_ptr = buffers.alloc(source.len())?;
-            let mask_ptr = buffers.alloc(mask.len())?;
-            let output_ptr = buffers.alloc(source.len())?;
+            let [source_ptr, output_ptr, mask_ptr] = domain.lut_buffers(
+                grid,
+                source.len(),
+                mask.len(),
+            )?;
             self.upload(source_ptr, source)?;
             self.upload(mask_ptr, mask)?;
-            let lut_ptr = self.cached_lut(&domain, lut)?;
+            let lut_ptr = domain.cached_skin_lut(lut)?;
 
             let mut source_arg = source_ptr;
             let mut mask_arg = mask_ptr;
@@ -964,47 +1332,107 @@ mod driver {
                 block.as_mut_ptr() as *mut c_void,
             ];
             let dispatch = self.launch_on(&api, module, kernel, grid, BLOCK, &mut params)?;
-            buffers.pending_launch = true;
             domain.pending = true;
-            domain.synchronize_pending()?;
-            buffers.pending_launch = false;
             let mut output = vec![0u8; source.len()];
-            self.download(output_ptr, &mut output)?;
+            let downloaded = self.download(output_ptr, &mut output);
+            if downloaded.is_ok() {
+                domain.pending = false;
+            }
+            downloaded?;
             Ok((output, dispatch))
         }
 
-        fn cached_lut(&self, domain: &Domain, data: &[u8]) -> Result<CuPtr, CudaError> {
-            let mut cache = self.lut_cache.borrow_mut();
-            if let Some(hit) = cache.iter().find(|entry| entry.bytes == data) {
-                return Ok(hit.ptr);
+        /// Run a byte kernel while retaining selected inputs in the process-wide
+        /// LUT cache. Non-cached inputs still use the exact-shape staging path.
+        pub(crate) fn run_u8_cached_luts(
+            &self,
+            kernel: &'static str,
+            grid: (u32, u32),
+            inputs: &[&[u8]],
+            cached_inputs: &[usize],
+            uniform_bytes: &[u8],
+        ) -> Result<(Vec<u8>, Dispatch), CudaError> {
+            self.run_u8_mode(
+                kernel,
+                grid,
+                inputs,
+                uniform_bytes,
+                None,
+                false,
+                cached_inputs,
+            )
+        }
+
+        /// Run two LUT stages without returning the intermediate image to the host.
+        pub(crate) fn run_u8_cached_lut_chain(
+            &self,
+            kernel: &'static str,
+            grid: (u32, u32),
+            source: &[u8],
+            mask: &[u8],
+            first_lut: &[u8],
+            second_lut: &[u8],
+            first_uniforms: &[u8],
+            second_uniforms: &[u8],
+        ) -> Result<(Vec<u8>, Dispatch), CudaError> {
+            if source.is_empty()
+                || first_uniforms.is_empty()
+                || first_uniforms.len() % 4 != 0
+                || second_uniforms.is_empty()
+                || second_uniforms.len() % 4 != 0
+            {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("buffers")));
             }
-            if cache.len() == LUT_CACHE_SLOTS {
-                let evicted = cache.remove(0);
-                unsafe {
-                    let _ = (domain.api.mem_free)(evicted.ptr);
-                }
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let api = domain.api;
+            // The first kernel writes the scratch image; the second reads it and
+            // writes back into the original allocation for the sole download.
+            let [image_ptr, scratch_ptr, mask_ptr] =
+                domain.lut_buffers(grid, source.len(), mask.len())?;
+            self.upload(image_ptr, source)?;
+            self.upload(mask_ptr, mask)?;
+            let first_lut_ptr = domain.cached_skin_lut(first_lut)?;
+            let second_lut_ptr = domain.cached_skin_lut(second_lut)?;
+
+            let mut first_source = image_ptr;
+            let mut first_mask = mask_ptr;
+            let mut first_lut_arg = first_lut_ptr;
+            let mut first_output = scratch_ptr;
+            let mut first_block = first_uniforms.to_vec();
+            let mut first_params: [*mut c_void; 5] = [
+                &mut first_source as *mut CuPtr as *mut c_void,
+                &mut first_mask as *mut CuPtr as *mut c_void,
+                &mut first_lut_arg as *mut CuPtr as *mut c_void,
+                &mut first_output as *mut CuPtr as *mut c_void,
+                first_block.as_mut_ptr() as *mut c_void,
+            ];
+            self.launch_on(&api, module, kernel, grid, BLOCK, &mut first_params)?;
+
+            let mut second_source = scratch_ptr;
+            let mut second_mask = mask_ptr;
+            let mut second_lut_arg = second_lut_ptr;
+            let mut second_output = image_ptr;
+            let mut second_block = second_uniforms.to_vec();
+            let mut second_params: [*mut c_void; 5] = [
+                &mut second_source as *mut CuPtr as *mut c_void,
+                &mut second_mask as *mut CuPtr as *mut c_void,
+                &mut second_lut_arg as *mut CuPtr as *mut c_void,
+                &mut second_output as *mut CuPtr as *mut c_void,
+                second_block.as_mut_ptr() as *mut c_void,
+            ];
+            let dispatch =
+                self.launch_on(&api, module, kernel, grid, BLOCK, &mut second_params)?;
+
+            domain.pending = true;
+            let mut output = vec![0u8; source.len()];
+            let downloaded = self.download(image_ptr, &mut output);
+            if downloaded.is_ok() {
+                domain.pending = false;
             }
-            let mut ptr: CuPtr = 0;
-            unsafe {
-                check(
-                    (domain.api.mem_alloc)(&mut ptr, data.len().max(1)),
-                    "cuMemAlloc",
-                )?;
-            }
-            #[cfg(test)]
-            count_device_allocation();
-            if let Err(error) = self.upload(ptr, data) {
-                unsafe {
-                    let _ = (domain.api.mem_free)(ptr);
-                }
-                return Err(error);
-            }
-            SKIN_LUT_UPLOADS.fetch_add(1, Ordering::Relaxed);
-            cache.push(CachedLut {
-                bytes: data.to_vec(),
-                ptr,
-            });
-            Ok(ptr)
+            downloaded?;
+            Ok((output, dispatch))
         }
 
         /// Reuse `inputs[0]` as the output allocation. The kernel must read the
@@ -1016,7 +1444,7 @@ mod driver {
             inputs: &[&[u8]],
             uniform_bytes: &[u8],
         ) -> Result<(Vec<u8>, Dispatch), CudaError> {
-            self.run_u8_mode(kernel, grid, inputs, uniform_bytes, None, true)
+            self.run_u8_mode(kernel, grid, inputs, uniform_bytes, None, true, &[])
         }
 
         /// Same as [`Self::run_u8`], but optionally seeds the output buffer from
@@ -1031,21 +1459,36 @@ mod driver {
             uniform_bytes: &[u8],
             init_output_from: Option<usize>,
         ) -> Result<(Vec<u8>, Dispatch), CudaError> {
-            self.run_u8_mode(kernel, grid, inputs, uniform_bytes, init_output_from, false)
+            self.run_u8_mode(
+                kernel,
+                grid,
+                inputs,
+                uniform_bytes,
+                init_output_from,
+                false,
+                &[],
+            )
         }
 
-        fn run_u8_mode(
+        /// Run a kernel whose optional LUT argument follows the regular inputs.
+        pub(crate) fn run_u8_with_init_optional_lut(
             &self,
             kernel: &'static str,
             grid: (u32, u32),
             inputs: &[&[u8]],
+            lut: Option<&[u8]>,
             uniform_bytes: &[u8],
-            init_output_from: Option<usize>,
-            alias_input0: bool,
+            init_output_from: usize,
         ) -> Result<(Vec<u8>, Dispatch), CudaError> {
             let output_bytes = inputs.first().map_or(0, |first| first.len());
             if output_bytes == 0 || uniform_bytes.is_empty() || uniform_bytes.len() % 4 != 0 {
                 return Err(CudaError::Refused(Refusal::ShapeMismatch("buffers")));
+            }
+            let seed = inputs
+                .get(init_output_from)
+                .ok_or(CudaError::Refused(Refusal::ShapeMismatch("init_output_from")))?;
+            if seed.len() != output_bytes {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("init_output_from")));
             }
             let domain = domain()?;
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1056,36 +1499,28 @@ mod driver {
                 ptrs: Vec::new(),
                 pending_launch: false,
             };
-            let mut inputs_on_device: Vec<CuPtr> = Vec::with_capacity(inputs.len());
+            let mut input_ptrs = Vec::with_capacity(inputs.len());
             for input in inputs {
-                inputs_on_device.push(buffers.alloc(input.len())?);
+                let ptr = buffers.alloc(input.len())?;
+                self.upload(ptr, input)?;
+                input_ptrs.push(ptr);
             }
-            let output = if alias_input0 {
-                *inputs_on_device
-                    .first()
-                    .ok_or(CudaError::Refused(Refusal::ShapeMismatch("buffers")))?
+            let output_ptr = buffers.alloc(output_bytes)?;
+            self.copy_from_device(output_ptr, input_ptrs[init_output_from], output_bytes)?;
+            let mut lut_ptr = if let Some(bytes) = lut {
+                let ptr = buffers.alloc(bytes.len())?;
+                self.upload(ptr, bytes)?;
+                ptr
             } else {
-                buffers.alloc(output_bytes)?
+                0
             };
-            for (ptr, input) in inputs_on_device.iter().zip(inputs) {
-                self.upload(*ptr, input)?;
-            }
-            if let Some(index) = init_output_from {
-                let seed = inputs
-                    .get(index)
-                    .ok_or(CudaError::Refused(Refusal::ShapeMismatch("init_output_from")))?;
-                if seed.len() != output_bytes {
-                    return Err(CudaError::Refused(Refusal::ShapeMismatch("init_output_from")));
-                }
-                self.copy_from_device(output, inputs_on_device[index], output_bytes)?;
-            }
 
-            let count = inputs_on_device.len();
-            let mut params: Vec<*mut c_void> = Vec::with_capacity(count + 2);
-            for index in 0..count {
-                params.push(&mut inputs_on_device[index] as *mut CuPtr as *mut c_void);
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(inputs.len() + 3);
+            for ptr in &mut input_ptrs {
+                params.push(ptr as *mut CuPtr as *mut c_void);
             }
-            let mut output_arg = output;
+            params.push(&mut lut_ptr as *mut CuPtr as *mut c_void);
+            let mut output_arg = output_ptr;
             params.push(&mut output_arg as *mut CuPtr as *mut c_void);
             let mut block = uniform_bytes.to_vec();
             params.push(block.as_mut_ptr() as *mut c_void);
@@ -1094,8 +1529,86 @@ mod driver {
             buffers.pending_launch = true;
             domain.pending = true;
             domain.synchronize_pending()?;
+            buffers.pending_launch = false;
+            let mut output = vec![0u8; output_bytes];
+            self.download(output_ptr, &mut output)?;
+            Ok((output, dispatch))
+        }
+
+        fn run_u8_mode(
+            &self,
+            kernel: &'static str,
+            grid: (u32, u32),
+            inputs: &[&[u8]],
+            uniform_bytes: &[u8],
+            init_output_from: Option<usize>,
+            alias_input0: bool,
+            cached_inputs: &[usize],
+        ) -> Result<(Vec<u8>, Dispatch), CudaError> {
+            let output_bytes = inputs.first().map_or(0, |first| first.len());
+            if output_bytes == 0 || uniform_bytes.is_empty() || uniform_bytes.len() % 4 != 0 {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("buffers")));
+            }
+            if cached_inputs.iter().any(|&index| index >= inputs.len()) {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("cached_inputs")));
+            }
+            let domain = domain()?;
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let api = domain.api;
+            let shape = StagingShape {
+                input_count: inputs.len(),
+                input_bytes: inputs.iter().map(|input| input.len()).collect(),
+                output_bytes,
+                alias_input0,
+            };
+            let buffers = domain.generic_staging(&shape)?;
+            let output = if alias_input0 {
+                buffers[0]
+            } else {
+                buffers[shape.input_count]
+            };
+            for (index, (ptr, input)) in buffers.iter().take(shape.input_count).zip(inputs).enumerate() {
+                if !cached_inputs.contains(&index) {
+                    self.upload(*ptr, input)?;
+                }
+            }
+            let mut cached_ptrs = Vec::with_capacity(cached_inputs.len());
+            for &index in cached_inputs {
+                cached_ptrs.push((index, domain.cached_teeth_lut(inputs[index])?));
+            }
+            if let Some(index) = init_output_from {
+                let seed = inputs
+                    .get(index)
+                    .ok_or(CudaError::Refused(Refusal::ShapeMismatch("init_output_from")))?;
+                if seed.len() != output_bytes {
+                    return Err(CudaError::Refused(Refusal::ShapeMismatch("init_output_from")));
+                }
+                self.copy_from_device(output, buffers[index], output_bytes)?;
+            }
+
+            let count = shape.input_count;
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(count + 2);
+            let mut args = buffers[..count].to_vec();
+            for &(index, ptr) in &cached_ptrs {
+                args[index] = ptr;
+            }
+            for arg in &mut args {
+                params.push(arg as *mut CuPtr as *mut c_void);
+            }
+            let mut output_arg = output;
+            params.push(&mut output_arg as *mut CuPtr as *mut c_void);
+            let mut block = uniform_bytes.to_vec();
+            params.push(block.as_mut_ptr() as *mut c_void);
+
+            let dispatch = self.launch_on(&api, module, kernel, grid, BLOCK, &mut params)?;
+            domain.pending = true;
             let mut bytes = vec![0u8; output_bytes];
-            self.download(output, &mut bytes)?;
+            let downloaded = self.download(output, &mut bytes);
+            if downloaded.is_ok() {
+                domain.pending = false;
+            }
+            downloaded?;
             Ok((bytes, dispatch))
         }
 
@@ -1166,13 +1679,17 @@ mod driver {
         }
 
         fn upload(&self, ptr: CuPtr, data: &[u8]) -> Result<(), CudaError> {
-            unsafe { check((self.api.copy_in)(ptr, data.as_ptr() as *const c_void, data.len()), "cuMemcpyHtoD") }
+            unsafe { check((self.api.copy_in)(ptr, data.as_ptr() as *const c_void, data.len()), "cuMemcpyHtoD")? };
+            HOST_TO_DEVICE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
+            Ok(())
         }
 
         fn download(&self, ptr: CuPtr, data: &mut [u8]) -> Result<(), CudaError> {
             unsafe {
                 check((self.api.copy_out)(data.as_mut_ptr() as *mut c_void, ptr, data.len()), "cuMemcpyDtoH")
-            }
+            }?;
+            DEVICE_TO_HOST_BYTES.fetch_add(data.len(), Ordering::Relaxed);
+            Ok(())
         }
 
         fn copy_from_device(&self, dst: CuPtr, src: CuPtr, bytes: usize) -> Result<(), CudaError> {
@@ -1187,7 +1704,6 @@ mod driver {
                 unsafe {
                     check((domain.api.mem_alloc)(&mut ptr, bytes), "cuMemAlloc")?;
                 }
-                #[cfg(test)]
                 count_device_allocation();
                 Ok(DeviceBuffer {
                     ptr,
@@ -1201,7 +1717,6 @@ mod driver {
             let domain = domain()?;
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             domain.bind()?;
-            domain.synchronize_pending()?;
             unsafe {
                 check(
                     (domain.api.copy_in)(
@@ -1219,8 +1734,7 @@ mod driver {
             let domain = domain()?;
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             domain.bind()?;
-            domain.synchronize_pending()?;
-            unsafe {
+            let downloaded = unsafe {
                 check(
                     (domain.api.copy_out)(
                         data.as_mut_ptr() as *mut c_void,
@@ -1229,7 +1743,11 @@ mod driver {
                     ),
                     "cuMemcpyDtoH",
                 )
+            };
+            if downloaded.is_ok() {
+                domain.pending = false;
             }
+            downloaded
         }
 
         /// Crate-private: allocate a group of buffers that can be reused for
@@ -1246,7 +1764,6 @@ mod driver {
                             "cuMemAlloc",
                         )?;
                     }
-                    #[cfg(test)]
                     count_device_allocation();
                     buffers.push((ptr, *size));
                 }
@@ -1262,7 +1779,6 @@ mod driver {
             let domain = domain()?;
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             domain.bind()?;
-            domain.synchronize_pending()?;
             match set.buffers.get(index) {
                 Some((ptr, size)) if data.len() <= *size => unsafe {
                     check(
@@ -1283,8 +1799,7 @@ mod driver {
             let domain = domain()?;
             let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             domain.bind()?;
-            domain.synchronize_pending()?;
-            match set.buffers.get(index) {
+            let downloaded = match set.buffers.get(index) {
                 Some((ptr, size)) if data.len() <= *size => unsafe {
                     check(
                         (domain.api.copy_out)(
@@ -1296,7 +1811,11 @@ mod driver {
                     )
                 },
                 _ => Err(CudaError::Refused(Refusal::ShapeMismatch("buffer"))),
+            };
+            if downloaded.is_ok() {
+                domain.pending = false;
             }
+            downloaded
         }
 
         /// Runs the composite kernel on float32 RGBA buffers already in [0,1].
@@ -1434,9 +1953,13 @@ mod driver {
             )?;
             buffers.pending_launch = true;
             domain.pending = true;
-            domain.synchronize_pending()?;
             let mut output = vec![0f32; len];
-            self.download(device_output, as_bytes_mut(&mut output))?;
+            let downloaded = self.download(device_output, as_bytes_mut(&mut output));
+            if downloaded.is_ok() {
+                domain.pending = false;
+                buffers.pending_launch = false;
+            }
+            downloaded?;
             Ok((output, dispatch))
         }
 
@@ -1491,22 +2014,6 @@ mod driver {
         }
     }
 
-    impl Drop for Nvidia {
-        fn drop(&mut self) {
-            let Ok(domain) = domain() else { return };
-            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if domain.bind().is_err() {
-                return;
-            }
-            let _ = domain.synchronize_pending();
-            for lut in self.lut_cache.get_mut().drain(..) {
-                unsafe {
-                    let _ = (domain.api.mem_free)(lut.ptr);
-                }
-            }
-        }
-    }
-
     fn as_bytes(values: &[f32]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
     }
@@ -1515,11 +2022,162 @@ mod driver {
         unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, values.len() * 4) }
     }
 
+    #[cfg(test)]
+    mod staging_tests {
+        use super::*;
+
+        #[test]
+        fn lut_buffer_pool_key_is_exact_grid_and_bytes() {
+            let shape = LutBufferShape {
+                grid: (375, 250),
+                source_bytes: 96_000_000,
+                mask_bytes: 24_000_000,
+            };
+            let entry = CachedLutBuffers {
+                shape,
+                buffers: vec![
+                    (1, 96_000_000),
+                    (2, 96_000_000),
+                    (3, 24_000_000),
+                ],
+            };
+            assert!(entry.matches(shape));
+            assert!(!entry.matches(LutBufferShape {
+                grid: (32, 32),
+                ..shape
+            }));
+            assert!(!entry.matches(LutBufferShape {
+                source_bytes: 95_999_996,
+                ..shape
+            }));
+            assert!(!entry.matches(LutBufferShape {
+                mask_bytes: 23_999_996,
+                ..shape
+            }));
+        }
+
+        #[test]
+        fn composite_pool_key_is_exact_shape_and_sizes() {
+            let shape = BufferShape {
+                width: 64,
+                height: 64,
+                stride: 64,
+            };
+            let sizes = [16384, 16384, 4096, 16384, 16384, 16384];
+            let entry = CachedComposite {
+                shape,
+                buffers: sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, size)| (index as CuPtr + 1, *size))
+                    .collect(),
+            };
+            assert!(entry.matches(shape, &sizes));
+            assert!(!entry.matches(BufferShape { width: 63, ..shape }, &sizes));
+            let mut changed = sizes;
+            changed[5] -= 4;
+            assert!(!entry.matches(shape, &changed));
+        }
+
+        #[test]
+        fn cache_keys_exact_shape_and_input_count() {
+            let domain = match domain() {
+                Ok(domain) => domain,
+                Err(error) if std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none() => {
+                    eprintln!("SKIPPED (no NVIDIA execution path): {error:?}");
+                    return;
+                }
+                Err(error) => panic!("CUDA required but unavailable: {error:?}"),
+            };
+            {
+                let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                domain.bind().expect("bind shared context");
+                domain.synchronize_pending().expect("sync before cache clear");
+                domain.clear_generic_staging();
+            }
+
+            let one = StagingShape {
+                input_count: 1,
+                input_bytes: vec![3584],
+                output_bytes: 3584,
+                alias_input0: false,
+            };
+            let two = StagingShape {
+                input_count: 2,
+                input_bytes: vec![3584, 1792],
+                output_bytes: 3584,
+                alias_input0: false,
+            };
+            let allocations = || device_allocations();
+            let cache = |shape: &StagingShape| {
+                let mut domain =
+                    domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                domain.bind().expect("bind shared context");
+                domain.generic_staging(shape).expect("staging buffers")
+            };
+
+            let before = allocations();
+            let first = cache(&one);
+            let cold = allocations() - before;
+            let before = allocations();
+            let repeated = cache(&one);
+            let warm = allocations() - before;
+            let before = allocations();
+            let with_two_inputs = cache(&two);
+            let second_shape = allocations() - before;
+            let before = allocations();
+            let repeated_two = cache(&two);
+            let warm_two = allocations() - before;
+
+            assert_eq!(first, repeated);
+            assert_eq!(first.len(), 2);
+            assert_eq!(cold, 2);
+            assert_eq!(warm, 0);
+            assert_eq!(with_two_inputs.len(), 3);
+            assert_eq!(second_shape, 3);
+            assert_eq!(repeated_two, with_two_inputs);
+            assert_eq!(warm_two, 0);
+            assert_eq!(cache(&one), first, "the second cache slot keeps the first shape");
+            eprintln!(
+                "one_input cold_alloc={cold} warm_alloc={warm}; two_inputs cold_alloc={second_shape} warm_alloc={warm_two}; two_slots=true"
+            );
+
+            let mut domain = domain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.synchronize_pending().expect("sync before cache clear");
+            domain.clear_generic_staging();
+        }
+    }
+
     pub(super) fn metrics() -> DriverMetrics {
         DriverMetrics {
             ptx_module_load_calls: PTX_MODULE_LOADS.load(Ordering::Relaxed),
             skin_lut_uploads: SKIN_LUT_UPLOADS.load(Ordering::Relaxed),
+            teeth_lut_uploads: TEETH_LUT_UPLOADS.load(Ordering::Relaxed),
+            host_to_device_bytes: HOST_TO_DEVICE_BYTES.load(Ordering::Relaxed),
+            device_to_host_bytes: DEVICE_TO_HOST_BYTES.load(Ordering::Relaxed),
+            device_allocations: device_allocations(),
+            context_syncs: context_syncs(),
         }
+    }
+
+    pub(super) fn memory_info() -> Result<DeviceMemoryInfo, CudaError> {
+        let domain = domain()?;
+        let mut domain = domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        domain.bind()?;
+        let mut free_bytes = 0usize;
+        let mut total_bytes = 0usize;
+        unsafe {
+            check(
+                (domain.api.mem_get_info)(&mut free_bytes, &mut total_bytes),
+                "cuMemGetInfo",
+            )?;
+        }
+        Ok(DeviceMemoryInfo {
+            free_bytes,
+            total_bytes,
+        })
     }
 }
 
@@ -1589,6 +2247,21 @@ mod tests {
         assert_eq!(lowered.len(), PTX.len());
         assert_eq!(restamp_ptx(PTX, (9, 4)), None);
         assert_eq!(restamp_ptx(PTX, (10, 0)), None);
+    }
+
+    #[test]
+    fn driver_version_maps_to_the_highest_jittable_isa() {
+        // The shipping host: driver API 13030 must accept ISA 9.3, not 9.4.
+        assert_eq!(driver_ptx_isa(13030), (9, 3));
+        assert_eq!(driver_ptx_isa(13040), (9, 4));
+        assert_eq!(driver_ptx_isa(12020), (8, 2));
+        // A driver older than CUDA 4 has no PTX ISA this mapping can name.
+        assert_eq!(driver_ptx_isa(3020), (0, 2));
+        assert_eq!(restamp_ptx(PTX, driver_ptx_isa(3020)), None);
+        // Re-stamping up front is what the loader now does, so the driver that
+        // refuses 9.4 lands on 9.3 directly rather than through error 222.
+        let target = driver_ptx_isa(13030);
+        assert_eq!(restamp_ptx(PTX, target).map(|p| ptx_isa(&p)), Some(Some(target)));
     }
 
     #[test]
@@ -1794,7 +2467,7 @@ mod tests {
             ("constant_64", 64, 64, true, 6usize),
             ("random_64_same_shape", 64, 64, false, 0usize),
             ("random_37x19_shape_change", 37, 19, false, 6usize),
-            ("random_64_return_shape", 64, 64, false, 6usize),
+            ("random_64_return_shape", 64, 64, false, 0usize),
         ];
         for (label, width, height, constant, cold_allocations) in cases {
             let (source, base, residual, mask_r, mask_b, skin) =
@@ -1810,6 +2483,7 @@ mod tests {
             )
             .unwrap();
 
+            let before_syncs = super::driver::context_syncs();
             let before = super::driver::device_allocations();
             let (first, dispatch) = nvidia
                 .facial_smooth(
@@ -1825,7 +2499,9 @@ mod tests {
                 )
                 .expect("real GPU dispatch");
             let cold = super::driver::device_allocations() - before;
+            let cold_syncs = super::driver::context_syncs() - before_syncs;
 
+            let before_syncs = super::driver::context_syncs();
             let before = super::driver::device_allocations();
             let (second, _) = nvidia
                 .facial_smooth(
@@ -1841,20 +2517,74 @@ mod tests {
                 )
                 .expect("warm GPU dispatch");
             let warm = super::driver::device_allocations() - before;
+            let warm_syncs = super::driver::context_syncs() - before_syncs;
 
             assert_eq!(cold, cold_allocations, "{label}: cold allocations");
             assert_eq!(warm, 0, "{label}: warm allocations");
+            assert_eq!(
+                cold_syncs, 0,
+                "{label}: readback owns the cold sync boundary"
+            );
+            assert_eq!(
+                warm_syncs, 0,
+                "{label}: readback owns the warm sync boundary"
+            );
             assert_eq!(dispatch.kernel, COMPOSITE);
             assert_eq!(first.pixels, expected.pixels, "{label}: CPU byte mismatch");
             assert_eq!(second.pixels, expected.pixels, "{label}: warm CPU byte mismatch");
             assert_eq!(first.pixels, second.pixels, "{label}: reuse changed output");
             eprintln!(
-                "{label} {}x{} cold_alloc={cold} warm_alloc={warm} bytes={} exact",
+                "{label} {}x{} cold_alloc={cold} warm_alloc={warm} cold_sync={cold_syncs} warm_sync={warm_syncs} kernel={} device={} bytes={} exact",
                 width,
                 height,
+                dispatch.kernel,
+                dispatch.device,
                 first.pixels.len()
             );
         }
+
+        let (source, base, residual, mask_r, mask_b, skin) = smooth_case(64, 64, false);
+        let expected = cpu::apply(
+            &source,
+            &base,
+            &residual,
+            &mask_r,
+            &mask_b,
+            &skin,
+            samples(),
+        )
+        .unwrap();
+        let before_allocations = super::driver::device_allocations();
+        let before_syncs = super::driver::context_syncs();
+        let mut micros = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = std::time::Instant::now();
+            let (actual, _) = nvidia
+                .facial_smooth(
+                    &source,
+                    &base,
+                    &residual,
+                    &mask_r,
+                    &mask_b,
+                    &skin,
+                    90024,
+                    0.5,
+                    &samples(),
+                )
+                .expect("warm timing dispatch");
+            micros.push(started.elapsed().as_micros() as u64);
+            assert_eq!(actual.pixels, expected.pixels);
+        }
+        assert_eq!(super::driver::device_allocations(), before_allocations);
+        assert_eq!(super::driver::context_syncs(), before_syncs);
+        micros.sort_unstable();
+        eprintln!(
+            "warm_64x64 samples=20 p50_us={} p95_us={} min_us={} max_us={}",
+            micros[micros.len() / 2],
+            micros[micros.len() * 95 / 100 - 1],
+            micros[0],
+            micros[micros.len() - 1],
+        );
     }
 
     #[cfg(windows)]

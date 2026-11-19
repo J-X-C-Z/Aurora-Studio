@@ -111,6 +111,62 @@ impl LensProfile {
     }
 }
 
+/// The profiles `ImgCoreDll` registers in memory before it parses
+/// `lensDatabase.cdx`. A variant can name one by GUID, so opening a profile
+/// has to answer even though the file never contains these rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinProfile {
+    Unsupported,
+    Generic,
+    GenericPincushion,
+    /// type 15: its measured curves are persisted on the variant, not here.
+    Manufacturer,
+}
+
+/// The GUID Capture One stores on a variant that uses its built-in
+/// Manufacturer Profile.
+pub const MANUFACTURER_PROFILE_ID: &str = "2420559E-FE2D-4B13-91BB-E488FFA530E1";
+
+/// `None` for every GUID that is supposed to have a row in the database.
+pub fn builtin_profile(guid: &str) -> Option<BuiltinProfile> {
+    let guid = guid.trim().to_ascii_uppercase();
+    Some(match guid.as_str() {
+        "00000000-0000-0000-0000-000000000000" => BuiltinProfile::Unsupported,
+        "E936EE15-75CA-42EC-9602-629D90D9947E" => BuiltinProfile::Generic,
+        "A4C7C116-2472-4B0F-9C39-5775CDAD2FF1" => BuiltinProfile::GenericPincushion,
+        MANUFACTURER_PROFILE_ID => BuiltinProfile::Manufacturer,
+        _ => return None,
+    })
+}
+
+/// Sensor mount for a camera model. The manufacturer profile's `(r_um, Δr_um)`
+/// curves are normalized against the half diagonal of the sensor they were
+/// measured on, which is the mount's.
+pub fn mount_for_camera(model: &str) -> Option<&'static str> {
+    let model = model.trim().to_ascii_lowercase();
+    let mount = if model.starts_with("nikon z") {
+        "nikon z"
+    } else if model.starts_with("nikon") {
+        "nikon f"
+    } else if model.starts_with("canon") {
+        "canon ef"
+    } else if model.starts_with("sony") {
+        "sony e"
+    } else if model.starts_with("fujifilm gfx") {
+        "fujifilm g"
+    } else if model.starts_with("fujifilm") {
+        "fujifilm x"
+    } else if model.starts_with("olympus")
+        || model.starts_with("om digital")
+        || model.starts_with("panasonic")
+    {
+        "micro four thirds"
+    } else {
+        return None;
+    };
+    Some(mount)
+}
+
 /// Decode the obfuscated `.cdx` payload: every byte is XOR 0x81, then the two
 /// leading `~` characters are dropped. Input that is not obfuscated is
 /// returned unchanged; a truncated tail is tolerated.
@@ -1139,5 +1195,25 @@ mod tests {
         if let Some(d) = sample.distortion_at(12.0) {
             println!("distortion@12mm: {} points", d.shift.len());
         }
+    }
+
+    #[test]
+    fn recognises_the_built_in_profiles() {
+        assert_eq!(
+            builtin_profile("2420559e-fe2d-4b13-91bb-e488ffa530e1"),
+            Some(BuiltinProfile::Manufacturer)
+        );
+        assert_eq!(builtin_profile(" E936EE15-75CA-42EC-9602-629D90D9947E "), Some(BuiltinProfile::Generic));
+        assert_eq!(builtin_profile("6E1F8E5B-0000-0000-0000-000000000000"), None);
+        assert_eq!(builtin_profile(""), None);
+    }
+
+    #[test]
+    fn camera_models_map_to_mounts() {
+        assert_eq!(mount_for_camera("NIKON Z6_3"), Some("nikon z"));
+        assert_eq!(mount_for_camera("NIKON D850"), Some("nikon f"));
+        assert_eq!(mount_for_camera("Canon EOS R5"), Some("canon ef"));
+        assert_eq!(mount_for_camera("Fujifilm GFX100S"), Some("fujifilm g"));
+        assert_eq!(mount_for_camera(""), None);
     }
 }

@@ -17,6 +17,7 @@ mod adjust;
 mod c1catalog;
 mod c1import;
 mod c1_masks;
+pub mod c1_eip;
 mod c1session_export;
 mod sqlite_write;
 mod c1_style_index;
@@ -53,10 +54,28 @@ mod lensdb;
 mod matchlook;
 mod merge_options;
 mod mock;
+
+pub fn prewarm_gpu() {
+    #[cfg(windows)]
+    mock::prewarm_gpu();
+}
+
 pub mod mask_store;
 mod noise_defaults;
 mod output;
 mod portrait_stage;
+pub use aurora_portrait::cuda_pf90021::{
+    Direction as Pf90021Direction, RuntimeScalars as Pf90021RuntimeScalars, VolumeLut64,
+};
+pub use portrait_stage::{
+    HlfBodyAdjustLutProducerInputs, Pf8050AttachReceipt, Pf8050FboReceipt, Pf8050GeometryInputs,
+    Pf8050StageInputs, Pf8050VendorRuntime, Pf30025ProducerInputs, Pf90004ProducerInputs, Pf90021Inputs,
+    Pf90021ProducerInputs, PortraitBackend, PortraitEffectRun, PortraitGeometryRun,
+    PortraitJobInputs, PortraitJobReceipt, PortraitMasks, ProducerInputs, StrayHairProducerInputs,
+    TeethAlignmentProducerInputs, TeethProducerInputs, apply_pf8050_pf8051_geometry,
+    apply_pf8050_pf8051_stage,
+    apply_portrait_effects_with_report_and_inputs,
+};
 mod param_meta;
 mod preview_cache;
 mod presets;

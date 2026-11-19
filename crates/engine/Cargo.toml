@@ -11,7 +11,9 @@ serde_json.workspace = true
 anyhow.workspace = true
 log.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+memmap2 = "0.9"
 rayon = "1.10"
 parking_lot = "0.12"
 roxmltree = "0.20"
+crc32fast = "1"
 aurora-portrait.workspace = true

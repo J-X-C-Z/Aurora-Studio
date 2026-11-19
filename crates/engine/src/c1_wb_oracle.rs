@@ -130,6 +130,58 @@ pub fn kelvin_tint_to_gains(kelvin: f32, tint: f32) -> [f32; 3] {
     [(x + v).exp(), 1.0, v.exp()]
 }
 
+/// How much to trust the displayed Kelvin/Tint for the current body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WbDisplayConfidence {
+    /// The body was sampled: the table is C1's own transform.
+    Exact,
+    /// Another body: values are a Z6III-table estimate, not measured for it.
+    Approximate,
+    /// No camera model/matrix: K/T is a default placeholder, not the image.
+    Unknown,
+}
+
+impl WbDisplayConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Approximate => "approximate",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Bodies whose table is actually sampled. Add a body only after its 861-point
+/// sweep has been validated against `IC_RGBToKelvinTint`.
+fn is_sampled_body(camera: &str) -> bool {
+    let norm: String = camera
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(norm.as_str(), "nikonz63" | "nikonz6iii" | "z63" | "z6iii")
+}
+
+/// K/T for display, tagged with how much the body is covered by the table.
+///
+/// `gains_to_kelvin_tint` remains the raw table lookup; this wrapper is the
+/// display-facing entry point. Rendering must keep using the stored gains and
+/// must not consult this value.
+pub fn gains_to_kelvin_tint_for_body(
+    gains: [f32; 3],
+    camera: Option<&str>,
+) -> (f32, f32, WbDisplayConfidence) {
+    let Some(camera) = camera.map(str::trim).filter(|c| !c.is_empty()) else {
+        return (5600.0, 0.0, WbDisplayConfidence::Unknown);
+    };
+    let (kelvin, tint) = gains_to_kelvin_tint(gains);
+    if is_sampled_body(camera) {
+        (kelvin, tint, WbDisplayConfidence::Exact)
+    } else {
+        (kelvin, tint, WbDisplayConfidence::Approximate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +220,54 @@ mod tests {
             assert!(tint >= previous, "{v}: {tint} < {previous}");
             previous = tint;
         }
+    }
+
+    #[test]
+    fn display_guard_distinguishes_exact_approximate_unknown() {
+        let gains = [1.625, 1.0, 1.412];
+        for camera in ["Nikon Z 6III", "NIKON Z 6_3", "Z6_3"] {
+            let (_, _, state) = gains_to_kelvin_tint_for_body(gains, Some(camera));
+            assert_eq!(state, WbDisplayConfidence::Exact, "{camera}");
+        }
+        for camera in ["Canon EOS R5", "Nikon Z 7", "Sony ILCE-7M3"] {
+            let (_, _, state) = gains_to_kelvin_tint_for_body(gains, Some(camera));
+            assert_eq!(state, WbDisplayConfidence::Approximate, "{camera}");
+        }
+        for camera in [None, Some(""), Some("   ")] {
+            let (kelvin, tint, state) = gains_to_kelvin_tint_for_body(gains, camera);
+            assert_eq!(state, WbDisplayConfidence::Unknown, "{camera:?}");
+            assert_eq!((kelvin, tint), (5600.0, 0.0));
+        }
+        assert_eq!(WbDisplayConfidence::Exact.as_str(), "exact");
+        assert_eq!(WbDisplayConfidence::Approximate.as_str(), "approximate");
+        assert_eq!(WbDisplayConfidence::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn display_state_never_changes_the_render() {
+        // Same gains, exact vs unknown display state: the bytes must match.
+        let rgba: Vec<u8> = (0..16 * 16)
+            .flat_map(|i| [(i % 251) as u8, 128, 200, 255])
+            .collect();
+        let src = crate::Source::from_rgba(16, 16, &rgba);
+        let gains = [1.625, 1.0, 1.412];
+
+        let (kelvin, tint, exact) =
+            gains_to_kelvin_tint_for_body(gains, Some("NIKON Z 6_3"));
+        assert_eq!(exact, WbDisplayConfidence::Exact);
+        let mut a = crate::AdjustmentSet::default();
+        a.white_balance.gains = Some(gains);
+        a.white_balance.kelvin = kelvin;
+        a.white_balance.tint = tint;
+
+        let (kelvin, tint, unknown) = gains_to_kelvin_tint_for_body(gains, None);
+        assert_eq!(unknown, WbDisplayConfidence::Unknown);
+        let mut b = a.clone();
+        b.white_balance.kelvin = kelvin;
+        b.white_balance.tint = tint;
+
+        let ra = crate::render(&src, &a, crate::NormRect::FULL, 16, false, None);
+        let rb = crate::render(&src, &b, crate::NormRect::FULL, 16, false, None);
+        assert_eq!(ra.rgba, rb.rgba);
     }
 }

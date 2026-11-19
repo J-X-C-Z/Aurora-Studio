@@ -56,22 +56,17 @@ pub struct MatrixTrc {
     pub trc: [Curve; 3],
 }
 
-/// True when an A2B input shaper is (within 10% of) the identity curve.
-///
-/// The installed corpus separates cleanly: identity shapers peak at 0.0002,
-/// `PhaseOneH20-Outdoor Daylight` (identity plus a small highlight lift) peaks
-/// at 0.075, and every encode shaper peaks above 0.266. 10% lands in that gap,
-/// so only the boundary profile moves class.
-fn curve_is_linear(curve: &Curve) -> bool {
-    match curve {
-        Curve::Identity => true,
-        Curve::Table(t) if t.len() < 2 => true,
-        Curve::Table(t) => {
-            let last = (t.len() - 1) as f32;
-            t.iter().enumerate().all(|(i, v)| (v - i as f32 / last).abs() < 0.10)
-        }
-        Curve::Gamma(_) => false,
-    }
+#[derive(Debug, Clone, Default)]
+struct SolvePlan {
+    steps: Vec<SolveStep>,
+}
+
+#[derive(Debug, Clone)]
+struct SolveStep {
+    swap: Option<(usize, usize)>,
+    col: usize,
+    divisor: f32,
+    rows: Vec<(usize, f32)>,
 }
 
 /// An `mft2` look-up: shaper curves -> 3D grid -> output curves.
@@ -195,24 +190,10 @@ pub struct Profile {
     pub gray: Option<Curve>,
     pub path: Option<PathBuf>,
     inverse: OnceLock<Option<InverseLut>>,
+    solve: OnceLock<Option<SolvePlan>>,
 }
 
 impl Profile {
-    /// Whether the A2B LUT wants linear device values.
-    ///
-    /// Capture One camera profiles carry an `mft2` shaper that *is* the sRGB
-    /// encode (1440 of the 1555 profiles installed here), so their CLUT is
-    /// indexed in encoded space and the caller has to hand over linear values.
-    /// The Leaf, Mamiya and Phase One backs (103 profiles) ship an identity
-    /// shaper: their CLUT indexes the stored device codes, so the caller encodes
-    /// first. Matrix/TRC profiles have no A2B and always take encoded values.
-    pub fn expects_linear_input(&self) -> bool {
-        match &self.a2b {
-            Some(lut) => lut.input.iter().any(|curve| !curve_is_linear(curve)),
-            None => false,
-        }
-    }
-
     /// Device RGB (0..1, as stored in the file) to linear sRGB.
     pub fn to_linear_srgb(&self, rgb: [f32; 3]) -> [f32; 3] {
         xyz_d50_to_linear_srgb(self.decode(rgb))
@@ -395,6 +376,11 @@ fn srgb_to_xyz_d50(srgb: [f32; 3]) -> [f32; 3] {
     ])
 }
 
+fn srgb_linear_table() -> &'static [f32; 256] {
+    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|i| linearize_srgb(i as f32 / 255.0)))
+}
+
 /// XYZ D50 -> sRGB (0..1, gamma encoded).
 fn xyz_d50_to_srgb(xyz: [f32; 3]) -> [f32; 3] {
     let linear = xyz_d50_to_linear_srgb(xyz);
@@ -540,6 +526,7 @@ pub fn parse_icc(bytes: &[u8]) -> Result<Profile> {
         gray,
         path: None,
         inverse: OnceLock::new(),
+        solve: OnceLock::new(),
     })
 }
 
@@ -1052,12 +1039,15 @@ impl Profile {
                     [m.matrix[0][1], m.matrix[1][1], m.matrix[2][1]],
                     [m.matrix[0][2], m.matrix[1][2], m.matrix[2][2]],
                 ];
-                match solve3(rows, pcs) {
-                    Some(linear) => [
-                        invert_curve(&m.trc[0], linear[0]),
-                        invert_curve(&m.trc[1], linear[1]),
-                        invert_curve(&m.trc[2], linear[2]),
-                    ],
+                match self.solve.get_or_init(|| SolvePlan::new(rows)) {
+                    Some(plan) => {
+                        let linear = plan.apply(pcs);
+                        [
+                            invert_curve(&m.trc[0], linear[0]),
+                            invert_curve(&m.trc[1], linear[1]),
+                            invert_curve(&m.trc[2], linear[2]),
+                        ]
+                    }
                     None => pcs,
                 }
             }
@@ -1090,6 +1080,60 @@ impl Profile {
             }
             _ => rgb,
         }
+    }
+}
+
+impl SolvePlan {
+    fn new(mut a: [[f32; 3]; 3]) -> Option<Self> {
+        let mut plan = SolvePlan::default();
+        for col in 0..3 {
+            let mut pivot = col;
+            for row in (col + 1)..3 {
+                if a[row][col].abs() > a[pivot][col].abs() {
+                    pivot = row;
+                }
+            }
+            if a[pivot][col].abs() < 1e-12 {
+                return None;
+            }
+            let swap = (pivot != col).then_some((col, pivot));
+            if swap.is_some() {
+                a.swap(col, pivot);
+            }
+            let divisor = a[col][col];
+            for k in 0..3 {
+                a[col][k] /= divisor;
+            }
+            let mut rows = Vec::new();
+            for row in 0..3 {
+                if row == col {
+                    continue;
+                }
+                let factor = a[row][col];
+                if factor == 0.0 {
+                    continue;
+                }
+                rows.push((row, factor));
+                for k in 0..3 {
+                    a[row][k] -= factor * a[col][k];
+                }
+            }
+            plan.steps.push(SolveStep { swap, col, divisor, rows });
+        }
+        Some(plan)
+    }
+
+    fn apply(&self, mut b: [f32; 3]) -> [f32; 3] {
+        for step in &self.steps {
+            if let Some((a, c)) = step.swap {
+                b.swap(a, c);
+            }
+            b[step.col] /= step.divisor;
+            for &(row, factor) in &step.rows {
+                b[row] -= factor * b[step.col];
+            }
+        }
+        b
     }
 }
 
@@ -1145,16 +1189,17 @@ pub fn convert_srgb_to_with(rgba: &mut [u8], profile: &Profile, rendering: Rende
     if !rendering.is_supported() || (rendering.black_point_compensation && profile.bkpt.is_none()) {
         return None;
     }
+    let linear = srgb_linear_table();
     rgba.par_chunks_mut(4).for_each(|px| {
         if px.len() < 4 {
             return;
         }
-        let srgb = [
-            px[0] as f32 / 255.0,
-            px[1] as f32 / 255.0,
-            px[2] as f32 / 255.0,
-        ];
-        if let Some(out) = profile.encode_with(srgb_to_xyz_d50(srgb), rendering) {
+        let xyz = linear_srgb_to_xyz_d50([
+            linear[px[0] as usize],
+            linear[px[1] as usize],
+            linear[px[2] as usize],
+        ]);
+        if let Some(out) = profile.encode_with(xyz, rendering) {
             px[0] = to_u8(out[0]);
             px[1] = to_u8(out[1]);
             px[2] = to_u8(out[2]);
@@ -1250,30 +1295,6 @@ mod tests {
         None
     }
 
-    /// The two shaper classes must be told apart by the profile itself, not by
-    /// a hardcoded device brand.
-    #[test]
-    fn shaper_declares_the_input_domain() {
-        match crate::icc::profile("NikonZ6III-ProStandard") {
-            Some(p) => assert!(p.expects_linear_input(), "C1 camera space is encode-shaper"),
-            None => eprintln!("NikonZ6III-ProStandard missing, skipping"),
-        }
-        match crate::icc::profile("LeafLF2-LF2 Portrait 4") {
-            Some(p) => assert!(!p.expects_linear_input(), "Leaf LF2 is identity-shaper"),
-            None => eprintln!("Leaf LF2 missing, skipping"),
-        }
-        // Identity plus a 0.075 highlight lift: the 10% tolerance keeps it on
-        // the encoded path, alongside the other Phase One H20 profiles.
-        match crate::icc::profile("PhaseOneH20-Outdoor Daylight") {
-            Some(p) => assert!(!p.expects_linear_input(), "H20 Outdoor is a boundary identity"),
-            None => eprintln!("PhaseOneH20-Outdoor Daylight missing, skipping"),
-        }
-        if let Some(path) = srgb_profile_path() {
-            let matrix = Profile::from_file(&path).expect("sRGB parses");
-            assert!(!matrix.expects_linear_input(), "matrix/TRC takes encoded values");
-        }
-    }
-
     fn srgb_profile() -> Option<Profile> {
         Profile::from_file(&srgb_profile_path()?).ok()
     }
@@ -1293,6 +1314,7 @@ mod tests {
             path: None,
             bkpt: None,
             inverse: OnceLock::new(),
+            solve: OnceLock::new(),
         }
     }
 
@@ -1539,6 +1561,94 @@ mod tests {
         let mut one = vec![200u8];
         convert_srgb_to(&mut one, &profile);
         assert_eq!(one[0], 200);
+    }
+
+    fn convert_srgb_to_legacy(rgba: &mut [u8], profile: &Profile) {
+        use rayon::prelude::*;
+        let rendering = Rendering::default();
+        rgba.par_chunks_mut(4).for_each(|px| {
+            if px.len() < 4 {
+                return;
+            }
+            let srgb = [
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+            ];
+            if let Some(out) = profile.encode_with(srgb_to_xyz_d50(srgb), rendering) {
+                px[0] = to_u8(out[0]);
+                px[1] = to_u8(out[1]);
+                px[2] = to_u8(out[2]);
+            }
+        });
+    }
+
+    #[test]
+    fn srgb_linear_lookup_matches_the_legacy_conversion_exactly() {
+        let pixels: Vec<u8> = (0..65_536u32)
+            .flat_map(|i| {
+                [
+                    i.wrapping_mul(17) as u8,
+                    i.wrapping_mul(73).wrapping_add(11) as u8,
+                    i.wrapping_mul(131).wrapping_add(29) as u8,
+                    i.wrapping_mul(251) as u8,
+                ]
+            })
+            .collect();
+        let mut profiles = vec![synthetic("Adobe RGB (1998)", 0.5)];
+        for name in ["Adobe RGB (1998)", "NikonZ6III-Generic"] {
+            if let Some(profile) = find_profile(name).and_then(|p| Profile::from_file(&p).ok()) {
+                profiles.push(profile);
+            }
+        }
+        for profile in profiles {
+            let mut expected = pixels.clone();
+            let mut actual = expected.clone();
+            convert_srgb_to_legacy(&mut expected, &profile);
+            convert_srgb_to(&mut actual, &profile);
+            assert_eq!(actual, expected, "{}", profile.description);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_cached_srgb_linearization_24mp() {
+        use std::time::Instant;
+
+        let profile = synthetic("Adobe RGB (1998)", 0.5);
+        let pixels: Vec<u8> = (0..6000u32 * 4000)
+            .flat_map(|i| {
+                [
+                    i.wrapping_mul(17) as u8,
+                    i.wrapping_mul(73).wrapping_add(11) as u8,
+                    i.wrapping_mul(131).wrapping_add(29) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let measure = |legacy: bool| {
+            let mut times = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let mut px = pixels.clone();
+                let started = Instant::now();
+                if legacy {
+                    convert_srgb_to_legacy(&mut px, &profile);
+                } else {
+                    convert_srgb_to(&mut px, &profile);
+                }
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(px);
+            }
+            times.sort_by(f64::total_cmp);
+            (times[times.len() / 2], times[(times.len() * 95 / 100).max(times.len() - 1)])
+        };
+        let (legacy50, legacy95) = measure(true);
+        let (cached50, cached95) = measure(false);
+        println!(
+            "6000x4000 sRGB ICC conversion: legacy {legacy50:.3}/{legacy95:.3} ms, \
+             cached linearization {cached50:.3}/{cached95:.3} ms, {:.2}x P50",
+            legacy50 / cached50
+        );
     }
 
     #[test]

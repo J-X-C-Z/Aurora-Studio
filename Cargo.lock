@@ -484,8 +484,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aurora-portrait",
+ "crc32fast",
  "image",
  "log",
+ "memmap2",
  "parking_lot",
  "rayon",
  "roxmltree 0.20.0",
@@ -4906,6 +4908,7 @@ dependencies = [
  "image",
  "log",
  "raw-window-handle",
+ "rayon",
  "serde",
  "serde_json",
 ]

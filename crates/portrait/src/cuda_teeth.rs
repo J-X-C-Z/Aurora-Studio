@@ -7,8 +7,9 @@
 //! keeps its source bytes; alpha is copied.
 //!
 //! Driver, context, allocation and the 222-only PTX retry live in
-//! [`crate::cuda`]. A [`Session`] keeps the two 786,432-byte atlases resident
-//! and reuses every buffer, so a repeated call pays no allocation.
+//! [`crate::cuda`]. Sessions keep the two 786,432-byte atlases resident; the
+//! one-shot path retains the exact same atlas bytes in the process-wide CUDA
+//! LUT cache while exact-shape staging buffers are reused.
 
 use crate::cuda::{CudaError, Dispatch};
 use crate::{Image, Refusal};
@@ -53,7 +54,6 @@ impl Uniforms {
     }
 }
 
-#[cfg(test)]
 fn as_bytes(value: &Uniforms) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
@@ -131,8 +131,27 @@ impl Teeth {
         deyellow_ui: f32,
     ) -> Result<(Image, Vec<Dispatch>), CudaError> {
         check(source, mask_g, whiten_lut, bright_lut, common_ui, bright_ui, deyellow_ui)?;
-        let session = self.session(source.width, source.height, whiten_lut, bright_lut)?;
-        session.apply(source, mask_g, common_ui, bright_ui, deyellow_ui)
+        let common = common_ui / 100.0;
+        let dz = common * deyellow_ui / 100.0;
+        let ea = common * bright_ui / 100.0;
+        if !(dz > 0.0 || ea > 0.0) {
+            return Ok((source.clone(), Vec::new()));
+        }
+        let uniforms = Uniforms::new(source.width, source.height, dz, ea);
+        let grid = (
+            source.width.div_ceil(BLOCK).max(1),
+            source.height.div_ceil(BLOCK).max(1),
+        );
+        let (pixels_out, dispatch) = self.gpu.run_u8_cached_luts(
+            KERNEL,
+            grid,
+            &[&source.pixels, mask_g, whiten_lut, bright_lut],
+            &[2, 3],
+            as_bytes(&uniforms),
+        )?;
+        let image = Image::new(source.width, source.height, pixels_out)
+            .ok_or(CudaError::Refused(Refusal::ShapeMismatch("output")))?;
+        Ok((image, vec![dispatch]))
     }
 }
 

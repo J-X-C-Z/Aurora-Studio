@@ -12,6 +12,10 @@ mod tools;
 mod ui;
 mod widgets;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static FIRST_PREVIEW_READY: AtomicBool = AtomicBool::new(false);
+
 /// What a host hands the interface when it starts.
 #[derive(Default)]
 pub struct Launch {
@@ -29,6 +33,7 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
     let touch = launch.touch || gpui_kit::is_mobile();
     theme::set_touch(touch);
     let args = launch.paths;
+    prewarm_in_background();
 
     // A folder or a Capture One catalog/session given on the command line opens
     // directly; otherwise the welcome screen offers recent ones (or reopens the
@@ -73,26 +78,44 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
             } else {
                 ui::workspace::open(state, cx);
             }
-            prewarm_ai_in_background();
         });
 }
 
-fn prewarm_ai_in_background() {
+fn prewarm_in_background() {
     if gpui_kit::is_mobile()
         || std::env::var("AURORA_AI_PREWARM").is_ok_and(|value| value == "0")
     {
         return;
     }
     let _ = std::thread::Builder::new()
-        .name("aurora-ai-prewarm".into())
+        .name("aurora-prewarm".into())
         .spawn(|| {
+            lower_current_thread_priority();
+            let gpu_start = std::time::Instant::now();
+            aurora_engine::prewarm_gpu();
+            log::info!(
+                "detail GPU prewarm finished in {:.0} ms",
+                gpu_start.elapsed().as_secs_f64() * 1000.0
+            );
+            // Session creation competes with the first real preview. Let that
+            // frame finish before consuming the same CPU/GPU resources.
+            while !FIRST_PREVIEW_READY.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
             lower_current_thread_priority();
             let start = std::time::Instant::now();
             match aurora_engine::aimask::prewarm_models() {
-                Ok(()) => log::info!("AI sessions ready in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0),
+                Ok(()) => log::info!(
+                    "AI sessions ready in {:.0} ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                ),
                 Err(err) => log::warn!("AI session prewarm skipped: {err:#}"),
             }
         });
+}
+
+pub(crate) fn note_first_preview_ready() {
+    FIRST_PREVIEW_READY.store(true, Ordering::Release);
 }
 
 #[cfg(windows)]
