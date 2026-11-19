@@ -238,8 +238,11 @@ impl WhiteBalance {
     /// and `Custom` keeps the sliders.
     pub fn resolved(&self, exif_gains: Option<[f32; 3]>, mean_rgb: [f32; 3]) -> (f32, f32) {
         match self.mode {
-            WhiteBalanceMode::Shot => exif_gains
+            WhiteBalanceMode::Shot => self
+                .gains
                 .filter(|g| g.iter().all(|v| v.is_finite() && *v > 0.0))
+                .filter(|g| *g != [1.0, 1.0, 1.0])
+                .or(exif_gains.filter(|g| g.iter().all(|v| v.is_finite() && *v > 0.0)))
                 .map(crate::c1_model::gains_to_kelvin_tint)
                 .unwrap_or_else(|| auto_from_mean(mean_rgb)),
             WhiteBalanceMode::Auto => auto_from_mean(mean_rgb),

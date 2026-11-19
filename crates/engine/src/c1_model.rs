@@ -525,6 +525,8 @@ pub struct C1VariantSettings {
     pub vignetting: [f32; 4],
     pub icc_profile: Option<String>,
     pub film_curve: Option<String>,
+    /// `ZLAYERSELECTPOINT`: `x;y` in raw drawing pixels, not normalised.
+    pub layer_select_point: Option<[f32; 2]>,
 
     pub brush: C1Brush,
     pub eraser: C1Eraser,
@@ -813,6 +815,7 @@ impl C1VariantSettings {
             vignetting: [0.0, 1.0, 0.0, 1.0],
             icc_profile: None,
             film_curve: None,
+            layer_select_point: None,
 
             brush: C1Brush::default(),
             eraser: C1Eraser::default(),
@@ -990,6 +993,7 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
 
     s.icc_profile = text(get("ZICCPROFILE"));
     s.film_curve = text(get("ZFILMCURVE"));
+    s.layer_select_point = get("ZLAYERSELECTPOINT").and_then(parse_point);
 
     s.brush.size = fixed(get("ZBRUSHSIZE"), s.brush.size);
     s.brush.hardness = fixed(get("ZBRUSHHARDNESS"), s.brush.hardness);
