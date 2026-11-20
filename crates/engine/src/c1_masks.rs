@@ -51,7 +51,8 @@ use crate::c1_model::{
     gains_to_kelvin_tint, levels_from_c1, C1Brush, C1Eraser, C1EntityKind, ColorCorrection,
 };
 use crate::layers::{
-    BrushStroke, Layer, LayerKind, LocalAdjustments, Mask, MaskOp, MaskShape, RasterMask,
+    BrushStroke, Layer, LayerKind, LayerStyle, LocalAdjustments, Mask, MaskOp, MaskShape,
+    RasterMask,
 };
 
 /// The brush-tool columns of one local mask layer.
@@ -75,6 +76,11 @@ pub struct C1MaskLayer {
     /// Parsed for round-trip bookkeeping; the renderer does not read them.
     pub brush_style_uuid: Option<String>,
     pub brush_style_name: Option<String>,
+    /// `ZSTYLEUUID` / `ZSTYLESOURCE` / `ZSTYLEMODIFIED`: the style this layer
+    /// was applied from. Round-trip bookkeeping only; no pixel path reads it.
+    pub style_uuid: Option<String>,
+    pub style_source: Option<String>,
+    pub style_modified: bool,
     /// The layer's own colour adjustments, already in engine form.
     pub adjustments: LocalAdjustments,
 }
@@ -138,6 +144,8 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
             dehaze: Dehaze {
                 amount: s.dehaze_amount.clamp(0.0, 100.0),
                 shadow_tone: s.dehaze_color,
+                level_low: s.dehaze_level_low,
+                level_high: s.dehaze_level_high,
             },
             curves: (curves != Curves::default()).then_some(curves),
             levels: (levels != Levels::default()).then_some(levels),
@@ -151,6 +159,7 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
             } else {
                 Default::default()
             },
+            ai_color_grade: s.ai_color_grade,
             ..Default::default()
         };
         C1MaskLayer {
@@ -165,6 +174,9 @@ pub fn mask_layer_from_row(row: &HashMap<&str, Option<String>>) -> Option<C1Mask
             eraser: s.eraser,
             brush_style_uuid: row.get("ZBRUSHSTYLEUUID").cloned().flatten(),
             brush_style_name: row.get("ZBRUSHSTYLENAME").cloned().flatten(),
+            style_uuid: s.style_uuid,
+            style_source: s.style_source,
+            style_modified: s.style_modified,
             adjustments,
         }
     })
@@ -243,6 +255,12 @@ impl C1MaskLayer {
                 ..Default::default()
             },
             adjustments: self.adjustments.clone(),
+            style: self.style_uuid.as_ref().map(|uuid| LayerStyle {
+                uuid: uuid.clone(),
+                source: self.style_source.clone(),
+                modified: self.style_modified,
+            }),
+            ..Default::default()
         }
     }
 }
@@ -543,7 +561,7 @@ mod tests {
                 ("ZLEVELSSHADOW", Some("0.100;0.000;0.000;0.000")),
                 ("ZLEVELSHIGHLIGHT", Some("0.900;1.000;1.000;1.000")),
                 ("ZMIDTONE", Some("0.200;0.000;0.000;0.000")),
-                ("ZLEVELSTARGETHIGHLIGHT", Some("1.000;1.000;1.000;0.900")),
+                ("ZLEVELSTARGETHIGHLIGHT", Some("0.900;1.000;1.000;1.000")),
             ],
             &mut m,
         );
@@ -555,7 +573,9 @@ mod tests {
         let levels = a.levels.expect("real levels must reach the layer");
         assert_eq!((levels.rgb.input_black, levels.rgb.input_white), (0.1, 0.9));
         assert!(levels.rgb.gamma > 1.0, "a positive midtone lifts midtones");
-        assert_eq!((levels.rgb.output_white, levels.blue.output_white), (1.0, 0.9));
+        // `ApplyTargetLevelsCommon` reads only the `.x` master component, so the
+        // per-channel slots stay identity even when they carry a value.
+        assert_eq!((levels.rgb.output_white, levels.blue.output_white), (0.9, 1.0));
     }
 
     /// A neutral local row must leave the frame byte-identical; a real curve or
@@ -686,6 +706,7 @@ mod tests {
                 comp_params: vec![1.0, 0.0, 0.0],
                 linear_gradient: Some([1.0, 2.0, 3.0, 4.0, 0.5]),
                 rand_seed: None,
+                cover: None,
                 rasters: Vec::new(),
             }],
         };
@@ -744,6 +765,36 @@ mod tests {
         assert_eq!(summaries[0].kind, LayerKind::Adjustment);
         assert_eq!(summaries[1].name, "Skin Mask 1");
     }
+
+    /// `ZSTYLEUUID/SOURCE/MODIFIED` and `ZAICOLORGRADE` are pass-through: they
+    /// reach the layer model, and nothing in the render path reads them.
+    #[test]
+    fn style_uuid_and_ai_grade_reach_the_layer() {
+        let plain = mask_layer_from_row(&layer_row("0", "Plain", "100")).unwrap();
+        assert_eq!(plain.style_uuid, None);
+        assert!(!plain.adjustments.ai_color_grade);
+
+        let mut m = layer_row("1", "Look", "100");
+        row(
+            &[
+                ("ZSTYLEUUID", Some("4FD0E17F-B1FC-4E78-BEAC-92315B3B15E3")),
+                ("ZSTYLESOURCE", Some("Exposure")),
+                ("ZSTYLEMODIFIED", Some("1")),
+                ("ZAICOLORGRADE", Some("1")),
+            ],
+            &mut m,
+        );
+        let parsed = mask_layer_from_row(&m).unwrap();
+        assert_eq!(parsed.style_uuid.as_deref(), Some("4FD0E17F-B1FC-4E78-BEAC-92315B3B15E3"));
+        assert_eq!(parsed.style_source.as_deref(), Some("Exposure"));
+        assert!(parsed.style_modified);
+        let layer = parsed.to_layer(1, 1000.0, vec![], vec![]);
+        let style = layer.style.expect("style carries through");
+        assert_eq!(style.uuid, "4FD0E17F-B1FC-4E78-BEAC-92315B3B15E3");
+        assert_eq!(style.source.as_deref(), Some("Exposure"));
+        assert!(style.modified);
+        assert!(layer.adjustments.ai_color_grade);
+    }
 }
 
 /// r87: all 16 brush columns are readable and land on the layer.
@@ -794,6 +845,9 @@ mod brush_wire_tests {
             eraser: C1Eraser { use_pen_pressure: true, ..Default::default() },
             brush_style_uuid: None,
             brush_style_name: None,
+            style_uuid: None,
+            style_source: None,
+            style_modified: false,
             adjustments: LocalAdjustments::default(),
         };
         let out = layer.to_layer(1, 1000.0, vec![[0.5, 0.5, 1.0]], vec![[0.2, 0.2, 1.0]]);

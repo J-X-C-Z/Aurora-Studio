@@ -10,7 +10,7 @@ use crate::adjust::{
     AspectRatio, BlackWhite, Clarity, ClarityMethod, ColorBalance, ColorBalanceGains, ColorBand, ColorEditor,
     ColorRange, ColorWheel, Curve, CurvePoint, Curves, Dehaze, Exposure, FilmGrain, Geometry,
     GrainKind, HighDynamicRange, HslShift, HueSector, Keystone, Levels, LevelsChannel,
-    LensCorrection, ManufacturerCurves, Moire, NoiseReduction, NormRect, Sharpening,
+    LensCorrection, ManufacturerCurves, Moire, NoiseReduction, NormRect, RadialBlur, Sharpening,
     SkinUniformity, SplitTone, ToneCurvePreset, VignetteMethod, Vignetting, WhiteBalance,
     WhiteBalanceMode,
     gamma_from_c1_midtone,
@@ -107,6 +107,9 @@ pub static C1_COLUMNS: &[C1Column] = &[
     C1Column { name: "ZGEOMETRYKEYSTONEASPECT", encoding: C1Encoding::Scalar, components: 1 },
     C1Column { name: "ZGEOMETRYKEYSTONETILTX", encoding: C1Encoding::Scalar, components: 1 },
     C1Column { name: "ZGEOMETRYKEYSTONETILTY", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZGEOMETRYKEYSTONEFOCALLENGTH", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZGEOMETRYKEYSTONESKEW", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZFLIP", encoding: C1Encoding::Scalar, components: 1 },
     // ── lens / base (confidence >= 0.55) ─────────────────────────────────────
     C1Column { name: "ZLENSCHROMABRENABLED", encoding: C1Encoding::Scalar, components: 1 },
     C1Column { name: "ZLENSIDGUID", encoding: C1Encoding::Scalar, components: 1 },
@@ -115,15 +118,31 @@ pub static C1_COLUMNS: &[C1Column] = &[
     C1Column { name: "ZLENSFOCALLENGTH", encoding: C1Encoding::Scalar, components: 1 },
     C1Column { name: "ZICCPROFILE", encoding: C1Encoding::Scalar, components: 1 },
     C1Column { name: "ZFILMCURVE", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZTECHNICALPROCESSINGMETHOD", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZSTYLEUUID", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZSTYLESOURCE", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZSTYLEMODIFIED", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZAICOLORGRADE", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLAYERSELECTPOINT", encoding: C1Encoding::Semicolon, components: 2 },
     // ── inferred columns this model still carries ───────────────────────────
     // White balance: R;G;B gains, G is always 1.
     C1Column { name: "ZWHITEBALANCE", encoding: C1Encoding::Semicolon, components: 3 },
     // Levels: four channels (rgb, red, green, blue) of black / white points.
     C1Column { name: "ZLEVELSSHADOW", encoding: C1Encoding::Semicolon, components: 4 },
     C1Column { name: "ZLEVELSHIGHLIGHT", encoding: C1Encoding::Semicolon, components: 4 },
+    C1Column { name: "ZLEVELSTARGETENABLE", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLEVELSTARGETSHADOW", encoding: C1Encoding::Semicolon, components: 4 },
+    C1Column { name: "ZLEVELSTARGETHIGHLIGHT", encoding: C1Encoding::Semicolon, components: 4 },
     C1Column { name: "ZDEHAZECOLOR", encoding: C1Encoding::Semicolon, components: 3 },
+    C1Column { name: "ZCALCULATEDDEHAZECOLOR", encoding: C1Encoding::Semicolon, components: 3 },
+    C1Column { name: "ZDEHAZELEVELHIGH", encoding: C1Encoding::Semicolon, components: 3 },
+    C1Column { name: "ZDEHAZELEVELLOW", encoding: C1Encoding::Semicolon, components: 3 },
     C1Column { name: "ZMOIRE", encoding: C1Encoding::Semicolon, components: 2 },
     C1Column { name: "ZCANVASSIZE", encoding: C1Encoding::Semicolon, components: 2 },
+    // ZSPOTS / ZRELATIVESPOTS: `selected;type,x,y,radius;...`, raw pixels or
+    // numerator/denominator fractions; see `c1_spots`.
+    C1Column { name: "ZSPOTS", encoding: C1Encoding::SemicolonComma, components: 4 },
+    C1Column { name: "ZRELATIVESPOTS", encoding: C1Encoding::SemicolonComma, components: 4 },
     C1Column { name: "ZCOLORBALANCE", encoding: C1Encoding::Semicolon, components: 3 },
     C1Column { name: "ZCOLORBALANCESHADOW", encoding: C1Encoding::Semicolon, components: 3 },
     C1Column { name: "ZCOLORBALANCEMIDTONE", encoding: C1Encoding::Semicolon, components: 3 },
@@ -137,6 +156,14 @@ pub static C1_COLUMNS: &[C1Column] = &[
     C1Column { name: "ZLENSVIGNETTING", encoding: C1Encoding::Pipe, components: 4 },
     C1Column { name: "ZLENSDISTORTION", encoding: C1Encoding::Pipe, components: 5 },
     C1Column { name: "ZLENSLIGHTFALLOFF", encoding: C1Encoding::Pipe, components: 3 },
+    C1Column { name: "ZLENSLCCLIGHTFALLOFF", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSLCCLIGHTFALLOFFAMOUNT", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSDUSTREMOVALENABLED", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSLCC", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSLCCBITMAPHASH", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSRADIALBLUR", encoding: C1Encoding::Pipe, components: 4 },
+    C1Column { name: "ZLENSTILT", encoding: C1Encoding::Scalar, components: 1 },
+    C1Column { name: "ZLENSDIFFRACTIONCORRECTIONENABLED", encoding: C1Encoding::Scalar, components: 1 },
     C1Column { name: "ZLENSDEFAULTCHROMABR", encoding: C1Encoding::Pipe, components: 2 },
     C1Column { name: "ZLENSCUSTOMCHROMABR", encoding: C1Encoding::Pipe, components: 2 },
     C1Column { name: "ZLENSCUSTOMCHROMABRNAME", encoding: C1Encoding::Scalar, components: 1 },
@@ -200,10 +227,19 @@ impl SplineProfile {
         self.params.get(index).copied()
     }
 
-    /// A spline from `|`-field `which`, normalized to the first radius.
+    /// A spline from `|`-field `which`, normalized to its outer radius.
+    ///
+    /// Capture One's CA tables start at radius zero, so the first point cannot
+    /// be the normalizer (it would divide by zero and drop the whole table).
+    /// The largest radius is the table's measured reference; x and y share it,
+    /// which leaves y as a fraction of the radius.
     pub fn scale(&self, which: usize) -> Vec<(f32, f32)> {
         let Some(points) = self.splines.get(which) else { return Vec::new() };
-        let radius = points.first().map(|p| p.0).unwrap_or(0.0);
+        let radius = points
+            .iter()
+            .map(|p| p.0)
+            .filter(|x| x.is_finite())
+            .fold(0.0f32, f32::max);
         if radius <= 0.0 {
             return Vec::new();
         }
@@ -272,6 +308,16 @@ pub fn parse_spline(raw: &str) -> SplineProfile {
         }
     }
     profile
+}
+
+/// Parses `ZLENSRADIALBLUR`: `radialCurve|transverseCurve|amount|valid`.
+pub fn parse_radial_blur(raw: &str) -> (RadialBlur, f32) {
+    let mut fields = clean(raw).split('|');
+    let radial = fields.next().map(parse_curve).unwrap_or_default();
+    let transverse = fields.next().map(parse_curve).unwrap_or_default();
+    let amount = fields.next().and_then(parse_scalar).unwrap_or(0.0);
+    let valid = fields.next().and_then(parse_scalar).is_some_and(|v| v != 0.0);
+    (RadialBlur { radial, transverse, valid }, amount)
 }
 
 /// Parses `ZLENSCHROMAFRINGING`: six `x,y;…` curves ordered red shift, red
@@ -397,6 +443,12 @@ fn fixed(raw: Option<&str>, default: f32) -> f32 {
     raw.and_then(parse_scalar).unwrap_or(default)
 }
 
+/// `x;y` for `ZLAYERSELECTPOINT`, in C1's raw drawing pixels.
+fn parse_point(raw: &str) -> Option<[f32; 2]> {
+    let v = components(Some(raw), 2, f32::NAN);
+    (v[0].is_finite() && v[1].is_finite()).then_some([v[0], v[1]])
+}
+
 pub(crate) fn flag(raw: Option<&str>, default: bool) -> bool {
     match raw.map(parse_scalar) {
         Some(Some(v)) => v != 0.0,
@@ -464,6 +516,9 @@ pub struct C1VariantSettings {
     pub mask_uuid: Option<String>,
     /// `ZTECHNICALPROCESSINGMETHOD`: C1 Base Characteristics mode.
     pub technical_processing_method: i32,
+    /// `settings+0x11008`: C1's negative-pipeline switch. There is no `.cop`
+    /// or catalog column for it, so it is derived from the mode.
+    pub negative_switch: bool,
 
     pub exposure: f32,
     pub contrast: f32,
@@ -483,6 +538,10 @@ pub struct C1VariantSettings {
     pub levels_target_shadow: [f32; 4],
     /// Output white point per channel (rgb, red, green, blue), `0.0 ..= 1.0`.
     pub levels_target_highlight: [f32; 4],
+    /// `ZLEVELSTARGETENABLE`: the model/UI gate for the target-levels stage.
+    /// It is not an `IC_ImageProcessSettings` field; disabling it leaves the
+    /// target values stored but makes the stage identity.
+    pub levels_target_enable: bool,
 
     pub clarity: f32,
     pub clarity_structure: f32,
@@ -498,7 +557,14 @@ pub struct C1VariantSettings {
     pub film_grain: C1FilmGrain,
     pub moire: [f32; 2],
     pub dehaze_amount: f32,
+    /// `ZDEHAZECOLOR`; `0;0;0` means Auto (the colour is not black).
     pub dehaze_color: [f32; 3],
+    /// `ZCALCULATEDDEHAZECOLOR`, written by C1's auto job; read-only for us.
+    pub dehaze_calculated_color: [f32; 3],
+    /// `ZDEHAZELEVELLOW`, auto level black points.
+    pub dehaze_level_low: [f32; 3],
+    /// `ZDEHAZELEVELHIGH`, auto level white points.
+    pub dehaze_level_high: [f32; 3],
 
     pub black_white: C1BlackWhite,
     /// Master, shadow, midtone and highlight colour balance, three components each.
@@ -517,6 +583,12 @@ pub struct C1VariantSettings {
     pub keystone_aspect: f32,
     pub keystone_tilt_x: f32,
     pub keystone_tilt_y: f32,
+    /// `focal_mm / sensor_diagonal_mm`; `0` when unknown.
+    pub keystone_focal_length: f32,
+    /// Degrees, -45 ..= 45.
+    pub keystone_skew: f32,
+    /// `ZFLIP`: 0 none, 1 horizontal, 2 vertical.
+    pub flip: i32,
     pub geometry_canvas_clipping: i32,
     /// Canvas size in pixels, `w;h`; `0` when C1 did not store it on the layer.
     pub canvas_size: [f32; 2],
@@ -525,12 +597,24 @@ pub struct C1VariantSettings {
     pub vignetting: [f32; 4],
     pub icc_profile: Option<String>,
     pub film_curve: Option<String>,
+    /// `ZSTYLEUUID` / `ZSTYLESOURCE` / `ZSTYLEMODIFIED`: the applied style, if any.
+    pub style_uuid: Option<String>,
+    pub style_source: Option<String>,
+    pub style_modified: bool,
+    /// `ZAICOLORGRADE`: this layer is a Match Look / AI Color Grade layer.
+    pub ai_color_grade: bool,
     /// `ZLAYERSELECTPOINT`: `x;y` in raw drawing pixels, not normalised.
     pub layer_select_point: Option<[f32; 2]>,
 
     pub brush: C1Brush,
     pub eraser: C1Eraser,
     pub surface_smoothness: f32,
+    /// `ZSPOTS`, raw image pixels. The catalog reader maps it to
+    /// [`crate::AdjustmentSet::spots`] once the source size and the final
+    /// orientation are known.
+    pub spots: crate::c1_spots::SpotList,
+    /// `ZRELATIVESPOTS`, the area-fraction copy C1 writes for pasting.
+    pub relative_spots: crate::c1_spots::SpotList,
 }
 
 /// C1's sharpening triple.
@@ -557,13 +641,14 @@ pub struct C1NoiseReduction {
     pub method: i32,
     /// `ZCLEANLONGEXPOSUREAMOUNT`, kept separate from `color`.
     pub long_exposure: f32,
-    /// `ZCNRAMOUNT`; C1's split between this and `color` is unproven.
+    /// `ZCNRAMOUNT`, the Color slider (CNR).
     pub cnr: f32,
 }
 
 impl Default for C1NoiseReduction {
     fn default() -> Self {
-        Self { luminance: 50.0, details: 50.0, color: 50.0, method: 0, long_exposure: 0.0, cnr: 0.0 }
+        // C1's BASEDEFAULT `CNRAmount` is 50 like the other three amounts.
+        Self { luminance: 50.0, details: 50.0, color: 50.0, method: 0, long_exposure: 0.0, cnr: 50.0 }
     }
 }
 
@@ -664,6 +749,21 @@ pub struct C1Lens {
     pub distortion: SplineProfile,
     /// `ZLENSLIGHTFALLOFF`: radial spline plus amount / flag.
     pub light_falloff: SplineProfile,
+    /// `ZLENSRADIALBLUR` fields 1 and 2 plus its `valid` flag.
+    pub radial_blur: RadialBlur,
+    /// `ZLENSRADIALBLUR`'s amount (field 3), 0 ..= 120.
+    pub sharpness_falloff: f32,
+    /// `ZLENSLCCLIGHTFALLOFF`: Lens Calibration Uniform Light gate.
+    pub lcc_light_falloff: bool,
+    /// `ZLENSLCCLIGHTFALLOFFAMOUNT`: Uniform Light amount, 0 ..= 120.
+    pub lcc_light_falloff_amount: f32,
+    /// `ZLENSDUSTREMOVALENABLED`: apply the dust patches stored in the LCC.
+    pub dust_removal: bool,
+    /// `ZLENSLCC`: the sidecar id of the lens cast calibration, used by
+    /// [`crate::dust_lcc::sidecar_path`] to find `<raw>.<id>.lcc`.
+    pub lcc_id: Option<String>,
+    /// `ZLENSTILT`, degrees.
+    pub tilt: f32,
     /// `ZLENSDEFAULTCHROMABR`: two radial splines (red and blue).
     pub chromatic_aberration: SplineProfile,
     pub chromatic_aberration_enabled: bool,
@@ -678,6 +778,8 @@ pub struct C1Lens {
     pub profile: Option<String>,
     pub revision_profile: Option<String>,
     pub aperture: f32,
+    /// `ZLENSDIFFRACTIONCORRECTIONENABLED`: aperture-dependent Airy blur.
+    pub diffraction_enabled: bool,
     pub focal_length: f32,
     /// Manual optical centre shift, `x;y` in percent.
     pub shift_xy: [f32; 2],
@@ -750,6 +852,7 @@ impl C1VariantSettings {
             opacity: 100.0,
             mask_uuid: None,
             technical_processing_method: 0,
+            negative_switch: false,
 
             exposure: 0.0,
             contrast: 0.0,
@@ -762,6 +865,7 @@ impl C1VariantSettings {
             levels_midtone: [0.0; 4],
             levels_target_shadow: [0.0; 4],
             levels_target_highlight: [1.0; 4],
+            levels_target_enable: true,
 
             clarity: 0.0,
             clarity_structure: 0.0,
@@ -778,6 +882,9 @@ impl C1VariantSettings {
             moire: [0.0, 8.0],
             dehaze_amount: 0.0,
             dehaze_color: [0.0, 0.0, 0.0],
+            dehaze_calculated_color: [0.0, 0.0, 0.0],
+            dehaze_level_low: [0.0, 0.0, 0.0],
+            dehaze_level_high: [1.0, 1.0, 1.0],
 
             black_white: C1BlackWhite::default(),
             color_balance: [[1.0, 1.0, 1.0]; 4],
@@ -792,12 +899,22 @@ impl C1VariantSettings {
             keystone_aspect: 0.0,
             keystone_tilt_x: 0.0,
             keystone_tilt_y: 0.0,
+            keystone_focal_length: 0.0,
+            keystone_skew: 0.0,
+            flip: 0,
             geometry_canvas_clipping: 2,
             canvas_size: [0.0, 0.0],
 
             lens: C1Lens {
                 distortion: SplineProfile::default(),
                 light_falloff: SplineProfile::default(),
+                radial_blur: RadialBlur::default(),
+                sharpness_falloff: 0.0,
+                lcc_light_falloff: false,
+                lcc_light_falloff_amount: 0.0,
+                dust_removal: false,
+                lcc_id: None,
+                tilt: 0.0,
                 chromatic_aberration: SplineProfile::default(),
                 chromatic_aberration_enabled: false,
                 chromatic_aberration_origin: ChromaAberOrigin::None,
@@ -806,7 +923,9 @@ impl C1VariantSettings {
                 chroma_fringing: ChromaFringing::default(),
                 profile: None,
                 revision_profile: None,
-                aperture: 4.0,
+                // 0 = not recorded; only the diffraction stage consumes it.
+                aperture: 0.0,
+                diffraction_enabled: false,
                 focal_length: 120.0,
                 shift_xy: [0.0, 0.0],
                 purple_fringing: 0.0,
@@ -815,11 +934,17 @@ impl C1VariantSettings {
             vignetting: [0.0, 1.0, 0.0, 1.0],
             icc_profile: None,
             film_curve: None,
+            style_uuid: None,
+            style_source: None,
+            style_modified: false,
+            ai_color_grade: false,
             layer_select_point: None,
 
             brush: C1Brush::default(),
             eraser: C1Eraser::default(),
             surface_smoothness: 0.0,
+            spots: crate::c1_spots::SpotList::default(),
+            relative_spots: crate::c1_spots::SpotList::default(),
         }
     }
 }
@@ -846,6 +971,11 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
         .and_then(parse_scalar)
         .map(|v| v as i32)
         .unwrap_or(s.technical_processing_method);
+    // No column stores C1's `settings+0x11008` switch; Capture One derives it
+    // from the mode and the binary only ever clears the byte (`0x1855D06`), so
+    // mirror the derivation instead of inventing a column.
+    s.negative_switch = crate::TechnicalProcessingMethod::from_code(s.technical_processing_method)
+        .is_film_negative();
 
     s.exposure = fixed(get("ZEXPOSURE"), s.exposure);
     s.contrast = fixed(get("ZCONTRAST"), s.contrast);
@@ -866,6 +996,7 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     let target_highlight = components(get("ZLEVELSTARGETHIGHLIGHT"), 4, 1.0);
     s.levels_target_highlight =
         [target_highlight[0], target_highlight[1], target_highlight[2], target_highlight[3]];
+    s.levels_target_enable = flag(get("ZLEVELSTARGETENABLE"), s.levels_target_enable);
 
     s.clarity = fixed(get("ZCLARITY"), s.clarity);
     s.clarity_structure = fixed(get("ZCLARITYSTRUCTURE"), s.clarity_structure);
@@ -900,6 +1031,12 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.dehaze_amount = fixed(get("ZDEHAZEAMOUNT"), s.dehaze_amount);
     let dehaze = components(get("ZDEHAZECOLOR"), 3, 0.0);
     s.dehaze_color = [dehaze[0], dehaze[1], dehaze[2]];
+    let calculated = components(get("ZCALCULATEDDEHAZECOLOR"), 3, 0.0);
+    s.dehaze_calculated_color = [calculated[0], calculated[1], calculated[2]];
+    let level_high = components(get("ZDEHAZELEVELHIGH"), 3, 1.0);
+    s.dehaze_level_high = [level_high[0], level_high[1], level_high[2]];
+    let level_low = components(get("ZDEHAZELEVELLOW"), 3, 0.0);
+    s.dehaze_level_low = [level_low[0], level_low[1], level_low[2]];
 
     s.black_white.enabled = flag(get("ZBWENABLED"), s.black_white.enabled);
     s.black_white.sensitivity = [
@@ -952,6 +1089,10 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.keystone_aspect = fixed(get("ZGEOMETRYKEYSTONEASPECT"), s.keystone_aspect);
     s.keystone_tilt_x = fixed(get("ZGEOMETRYKEYSTONETILTX"), s.keystone_tilt_x);
     s.keystone_tilt_y = fixed(get("ZGEOMETRYKEYSTONETILTY"), s.keystone_tilt_y);
+    s.keystone_focal_length =
+        fixed(get("ZGEOMETRYKEYSTONEFOCALLENGTH"), s.keystone_focal_length);
+    s.keystone_skew = fixed(get("ZGEOMETRYKEYSTONESKEW"), s.keystone_skew);
+    s.flip = fixed(get("ZFLIP"), s.flip as f32) as i32;
     s.geometry_canvas_clipping =
         fixed(get("ZGEOMETRYCANVASCLIPPING"), s.geometry_canvas_clipping as f32) as i32;
     let canvas = components(get("ZCANVASSIZE"), 2, 0.0);
@@ -959,6 +1100,17 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
 
     s.lens.distortion = get("ZLENSDISTORTION").map(parse_spline).unwrap_or_default();
     s.lens.light_falloff = get("ZLENSLIGHTFALLOFF").map(parse_spline).unwrap_or_default();
+    s.lens.lcc_light_falloff = flag(get("ZLENSLCCLIGHTFALLOFF"), s.lens.lcc_light_falloff);
+    s.lens.lcc_light_falloff_amount =
+        fixed(get("ZLENSLCCLIGHTFALLOFFAMOUNT"), s.lens.lcc_light_falloff_amount);
+    s.lens.dust_removal = flag(get("ZLENSDUSTREMOVALENABLED"), s.lens.dust_removal);
+    s.lens.lcc_id = text(get("ZLENSLCC"));
+    if let Some(raw) = get("ZLENSRADIALBLUR") {
+        let (blur, amount) = parse_radial_blur(raw);
+        s.lens.radial_blur = blur;
+        s.lens.sharpness_falloff = amount;
+    }
+    s.lens.tilt = fixed(get("ZLENSTILT"), s.lens.tilt);
     s.lens.chromatic_aberration = get("ZLENSDEFAULTCHROMABR").map(parse_spline).unwrap_or_default();
     s.lens.chromatic_aberration_enabled =
         flag(get("ZLENSCHROMABRENABLED"), s.lens.chromatic_aberration_enabled);
@@ -973,6 +1125,10 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.lens.profile = text(get("ZLENSIDGUID"));
     s.lens.revision_profile = text(get("ZLENSREVISIONIDGUID"));
     s.lens.aperture = fixed(get("ZLENSAPERTURE"), s.lens.aperture);
+    s.lens.diffraction_enabled = flag(
+        get("ZLENSDIFFRACTIONCORRECTIONENABLED"),
+        s.lens.diffraction_enabled,
+    );
     s.lens.focal_length = fixed(get("ZLENSFOCALLENGTH"), s.lens.focal_length);
     let shift = components(get("ZLENSSHIFTXY"), 2, 0.0);
     s.lens.shift_xy = [shift[0], shift[1]];
@@ -993,6 +1149,10 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
 
     s.icc_profile = text(get("ZICCPROFILE"));
     s.film_curve = text(get("ZFILMCURVE"));
+    s.style_uuid = text(get("ZSTYLEUUID"));
+    s.style_source = text(get("ZSTYLESOURCE"));
+    s.style_modified = flag(get("ZSTYLEMODIFIED"), s.style_modified);
+    s.ai_color_grade = flag(get("ZAICOLORGRADE"), s.ai_color_grade);
     s.layer_select_point = get("ZLAYERSELECTPOINT").and_then(parse_point);
 
     s.brush.size = fixed(get("ZBRUSHSIZE"), s.brush.size);
@@ -1012,6 +1172,9 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.eraser.auto_mask = flag(get("ZERASERAUTOMASK"), s.eraser.auto_mask);
 
     s.surface_smoothness = fixed(get("ZSURFACESMOOTHNESSAMOUNT"), s.surface_smoothness);
+    s.spots = get("ZSPOTS").and_then(crate::c1_spots::parse).unwrap_or_default();
+    s.relative_spots =
+        get("ZRELATIVESPOTS").and_then(crate::c1_spots::parse_relative).unwrap_or_default();
     s
 }
 
@@ -1064,8 +1227,8 @@ fn rgb_to_hue(r: f32, g: f32, b: f32) -> f32 {
 ///
 /// C1 stores its eight basic slices in descending hue order, not in the
 /// engine's Red..Magenta order, so each group is placed by its own color.
-/// `local` separates the global group from slices; `kind` keeps advanced and
-/// skin groups out of the eight basic slots.
+/// `local` separates the global group from slices; `kind` keeps advanced, skin
+/// and max-smooth groups out of the eight basic slots.
 pub fn color_editor_from_c1(rows: &[[f32; 18]]) -> ColorEditor {
     let mut editor = ColorEditor::default();
     let mut basic_used = [false; 8];
@@ -1127,6 +1290,10 @@ pub fn color_editor_from_c1(rows: &[[f32; 18]]) -> ColorEditor {
             };
             if skin {
                 editor.skin.push(range);
+            } else if cc.kind == 3 {
+                // C1's `pie_maxSmooth` runs the basic `pie_smooth` window; keep
+                // it out of the eight-slot basic array so it cannot evict one.
+                editor.max_smooth.push(range);
             } else {
                 editor.advanced.push(range);
             }
@@ -1138,14 +1305,29 @@ pub fn color_editor_from_c1(rows: &[[f32; 18]]) -> ColorEditor {
 
 /// The five `ZLEVELS*` columns in engine form.
 pub fn levels_from_c1(s: &C1VariantSettings) -> Levels {
+    // `ApplyTargetLevelsCommon` is one RGB-master affine map and reads only
+    // the `.x` scalar of targetShadow/targetHighlight. The r/g/b components
+    // are persisted by C1 but have no consuming op in this build.
+    // `ZLEVELSTARGETENABLE` is the model/UI gate: disabled means identity.
+    let (output_black, output_white) = if s.levels_target_enable {
+        (
+            clamp(s.levels_target_shadow[0], 0.0, 1.0),
+            clamp(s.levels_target_highlight[0], 0.0, 1.0),
+        )
+    } else {
+        (0.0, 1.0)
+    };
     let channel = |i: usize| LevelsChannel {
         input_black: clamp(s.levels_shadow[i], 0.0, 1.0),
         input_white: clamp(s.levels_highlight[i], 0.0, 1.0),
         gamma: gamma_from_c1_midtone(s.levels_midtone[i]),
-        output_black: clamp(s.levels_target_shadow[i], 0.0, 1.0),
-        output_white: clamp(s.levels_target_highlight[i], 0.0, 1.0),
+        output_black: 0.0,
+        output_white: 1.0,
     };
-    Levels { rgb: channel(0), red: channel(1), green: channel(2), blue: channel(3) }
+    let mut rgb = channel(0);
+    rgb.output_black = output_black;
+    rgb.output_white = output_white;
+    Levels { rgb, red: channel(1), green: channel(2), blue: channel(3) }
 }
 
 /// The five `ZGRADATIONCURVE*` columns in engine form.
@@ -1180,6 +1362,25 @@ pub fn black_white_from_c1(s: &C1VariantSettings) -> BlackWhite {
     }
 }
 
+/// `DehazeOperations::CalculateInitialAutoHazeColor`: `0.98` where the white
+/// balance gain is below 1, `0.98 / gain` above it.
+fn c1_auto_haze_color(wb: [f32; 3]) -> [f32; 3] {
+    wb.map(|g| 0.98 / g.max(1.0))
+}
+
+/// The live red/blue CA splines: the database copy for `FromLensDB`, the user
+/// copy for `Custom`, nothing for `None`.
+fn active_ca_splines(lens: &C1Lens) -> (Vec<(f32, f32)>, Vec<(f32, f32)>) {
+    let profile = match lens.chromatic_aberration_origin {
+        ChromaAberOrigin::LensDb => &lens.chromatic_aberration,
+        ChromaAberOrigin::Custom => &lens.chromatic_aberration_custom,
+        ChromaAberOrigin::None => return (Vec::new(), Vec::new()),
+    };
+    // `ZLENSDEFAULTCHROMABR` is `red|blue`, the same order as
+    // `IC_ChromAberCurve.RedShift/BlueShift`.
+    (profile.scale(0), profile.scale(1))
+}
+
 pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     let mut set = crate::AdjustmentSet::default();
 
@@ -1206,27 +1407,8 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         blacks: clamp(s.blacks_recovery, -100.0, 100.0),
     };
 
-    let channel = |i: usize| LevelsChannel {
-        input_black: clamp(s.levels_shadow[i], 0.0, 1.0),
-        input_white: clamp(s.levels_highlight[i], 0.0, 1.0),
-        gamma: gamma_from_c1_midtone(s.levels_midtone[i]),
-        output_black: clamp(s.levels_target_shadow[i], 0.0, 1.0),
-        output_white: clamp(s.levels_target_highlight[i], 0.0, 1.0),
-    };
-    set.levels = Levels {
-        rgb: channel(0),
-        red: channel(1),
-        green: channel(2),
-        blue: channel(3),
-    };
-
-    set.curves = Curves {
-        rgb: curve_from(&s.gradation_curves[0]),
-        red: curve_from(&s.gradation_curves[1]),
-        green: curve_from(&s.gradation_curves[2]),
-        blue: curve_from(&s.gradation_curves[3]),
-        luma: curve_from(&s.gradation_curves[4]),
-    };
+    set.levels = levels_from_c1(s);
+    set.curves = curves_from_c1(s);
 
     set.clarity = Clarity {
         method: ClarityMethod::from_c1(s.clarity_method),
@@ -1234,9 +1416,28 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         structure: clamp(s.clarity_structure, -100.0, 100.0),
     };
 
+    // `ZDEHAZECOLOR = 0;0;0` is C1's Auto sentinel, not black haze. Use the
+    // auto-calculated colour when C1 wrote one, else its `0.98 / WB` fallback;
+    // the closed-form auto estimator is not known.
+    let dehaze_color = if s.dehaze_color == [0.0; 3] {
+        if s.dehaze_calculated_color != [0.0; 3] {
+            s.dehaze_calculated_color
+        } else {
+            [0.0; 3]
+        }
+    } else {
+        s.dehaze_color
+    };
+    let dehaze_color = if dehaze_color == [0.0; 3] {
+        c1_auto_haze_color(s.white_balance_gains)
+    } else {
+        dehaze_color
+    };
     set.dehaze = Dehaze {
         amount: clamp(s.dehaze_amount, 0.0, 100.0),
-        shadow_tone: [s.dehaze_color[0], s.dehaze_color[1], s.dehaze_color[2]],
+        shadow_tone: dehaze_color,
+        level_low: s.dehaze_level_low.map(|v| v.clamp(0.0, 1.0)),
+        level_high: s.dehaze_level_high.map(|v| v.clamp(0.0, 1.0)),
     };
 
     set.vignetting = Vignetting {
@@ -1273,23 +1474,21 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     set.noise_reduction = NoiseReduction {
         luminance: clamp(s.noise_reduction.luminance, 0.0, 100.0),
         details: clamp(s.noise_reduction.details, 0.0, 100.0),
-        color: crate::param_meta::clamp("AIDenoiseAmount", s.noise_reduction.color),
-        // ZCLEANLONGEXPOSUREAMOUNT has no field of its own; it is dropped here.
-        single_pixel: 0.0,
+        // The Color slider is CNR (`ZCNRAMOUNT`). `ZAIDENOISEAMOUNT` is the
+        // separate AI denoise amount and has no renderer without its ONNX model.
+        color: crate::param_meta::clamp("ColorNoiseReductionAmount", s.noise_reduction.cnr),
+        single_pixel: crate::param_meta::clamp(
+            "CleanNoiseAmount",
+            s.noise_reduction.long_exposure,
+        ),
     };
 
+    let grain_density = crate::param_meta::clamp("FilmGrainDensity", s.film_grain.density);
     set.film_grain = FilmGrain {
-        kind: match s.film_grain.kind {
-            0 => GrainKind::FineGrain,
-            1 => GrainKind::SilverRich,
-            2 => GrainKind::SoftGrain,
-            3 => GrainKind::CubicGrain,
-            4 => GrainKind::TabularGrain,
-            5 => GrainKind::HarshGrain,
-            _ => GrainKind::FineGrain,
-        },
+        kind: GrainKind::from_c1_type(s.film_grain.kind),
         impact: clamp(s.film_grain.amount, 0.0, 100.0),
         granularity: clamp(s.film_grain.granularity, 0.0, 100.0),
+        density: grain_density,
     };
 
     set.moire = Moire {
@@ -1305,27 +1504,52 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         // a GUID the database does not know leaves the frame unchanged.
         use_profile: s.lens.profile.is_some(),
         distortion: clamp(s.lens.distortion.param(0).unwrap_or(0.0), 0.0, 100.0),
-        // ZLENSLIGHTFALLOFF covers light falloff only; the engine's separate
-        // sharpness-falloff amount has no C1 column and stays at zero.
-        sharpness_falloff: 0.0,
+        sharpness_falloff: clamp(s.lens.sharpness_falloff, 0.0, 120.0),
+        radial_blur: s.lens.radial_blur.clone(),
         light_falloff: clamp(s.lens.light_falloff.param(0).unwrap_or(0.0), 0.0, 100.0),
+        uniform_light: clamp(s.lens.lcc_light_falloff_amount, 0.0, 120.0),
+        uniform_light_enabled: s.lens.lcc_light_falloff,
+        dust_removal_enabled: s.lens.dust_removal,
+        // The LCC file itself carries the patches; without a catalog-side
+        // attachment this stays empty and the stage is inert.
+        dust_patches: Vec::new(),
+        dust_gain: Vec::new(),
         chromatic_aberration: s.lens.chromatic_aberration_enabled,
         // A manufacturer profile's CA lives in `manufacturer`; the raw splines
         // are not normalized to a usable radius, so they must not override it.
+        // The origin decides which pair is live: the lens database copy for
+        // `FromLensDB`, the user's `ZLENSCUSTOMCHROMABR` for `Custom`, nothing
+        // for `None` (C1 keeps the stored curves but does not apply them).
         ca_red_points: if s.lens.manufacturer.is_some() {
             Vec::new()
         } else {
-            s.lens.chromatic_aberration.scale(1)
+            active_ca_splines(&s.lens).0
         },
         ca_blue_points: if s.lens.manufacturer.is_some() {
             Vec::new()
         } else {
-            s.lens.chromatic_aberration.scale(0)
+            active_ca_splines(&s.lens).1
+        },
+        ca_origin: match s.lens.chromatic_aberration_origin {
+            ChromaAberOrigin::None => crate::CaOrigin::None,
+            ChromaAberOrigin::LensDb => crate::CaOrigin::LensDb,
+            ChromaAberOrigin::Custom => crate::CaOrigin::Custom,
+        },
+        ca_fringing: crate::CaFringing {
+            red_shift: s.lens.chroma_fringing.red_shift.clone(),
+            red_ra: s.lens.chroma_fringing.red_ra.clone(),
+            red_strength: s.lens.chroma_fringing.red_strength.clone(),
+            blue_shift: s.lens.chroma_fringing.blue_shift.clone(),
+            blue_ra: s.lens.chroma_fringing.blue_ra.clone(),
+            blue_strength: s.lens.chroma_fringing.blue_strength.clone(),
         },
         purple_fringing: clamp(s.lens.purple_fringing, -100.0, 100.0),
+        diffraction_enabled: s.lens.diffraction_enabled,
+        aperture: s.lens.aperture.max(0.0),
         hide_distorted_areas: true,
         shift_x: clamp(s.lens.shift_xy[0], -100.0, 100.0),
         shift_y: clamp(s.lens.shift_xy[1], -100.0, 100.0),
+        tilt: clamp(s.lens.tilt, -45.0, 45.0),
         manufacturer: s.lens.manufacturer.clone(),
         mount: None,
     };
@@ -1335,11 +1559,14 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     let has_crop = s.crop_px[2] > s.crop_px[0] && s.crop_px[3] > s.crop_px[1];
     let crop = if has_crop && s.canvas_size[0] > 0.0 && s.canvas_size[1] > 0.0 {
         let (w, h) = (s.canvas_size[0], s.canvas_size[1]);
+        // `ZCROPOUTSIDEIMAGE` keeps the stored rectangle even when it reaches
+        // past the image; without it the four values stay inside `0 ..= 1`.
+        let keep = |v: f32, max: f32| if s.crop_outside_image { v } else { clamp(v, 0.0, max) };
         NormRect {
-            x: clamp(s.crop_px[0] / w, 0.0, 1.0),
-            y: clamp(s.crop_px[1] / h, 0.0, 1.0),
-            width: clamp((s.crop_px[2] - s.crop_px[0]) / w, 0.0, 1.0),
-            height: clamp((s.crop_px[3] - s.crop_px[1]) / h, 0.0, 1.0),
+            x: keep(s.crop_px[0] / w, 1.0),
+            y: keep(s.crop_px[1] / h, 1.0),
+            width: keep((s.crop_px[2] - s.crop_px[0]) / w, 1.0),
+            height: keep((s.crop_px[3] - s.crop_px[1]) / h, 1.0),
         }
     } else {
         // Without the canvas size the pixel crop cannot be normalized; C1 keeps it
@@ -1347,12 +1574,35 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         NormRect::FULL
     };
 
+    let flip_horizontal = s.flip == 1;
+    let flip_vertical = s.flip == 2;
+    let mut keystone = Keystone {
+        vertical: clamp(s.keystone_tilt_y, -100.0, 100.0),
+        horizontal: clamp(s.keystone_tilt_x, -100.0, 100.0),
+        amount: crate::param_meta::clamp("KeystoneAmount", s.keystone_amount),
+        aspect: clamp(s.keystone_aspect, -50.0, 50.0),
+        skew: clamp(s.keystone_skew, -45.0, 45.0),
+        focal_length: if s.keystone_focal_length.is_finite() && s.keystone_focal_length > 0.0 {
+            s.keystone_focal_length
+        } else {
+            0.0
+        },
+        // `IC_KeystoneRaw.flags` has no `.cos` column; C1 never writes it.
+        flags: 0,
+    };
+    // Storage is tiltX/tiltY; the sliders show the rotated and flipped H/V frame.
+    let (h, v) = keystone.hv(s.rotation, flip_horizontal, flip_vertical);
+    keystone.horizontal = h;
+    keystone.vertical = v;
+
     set.geometry = Geometry {
         rotation: split_rotation(s.rotation).0,
         orientation: split_rotation(s.rotation).1,
-        flip_horizontal: false,
-        flip_vertical: false,
+        flip_horizontal,
+        flip_vertical,
+        crop_outside_image: s.crop_outside_image,
         crop,
+        canvas: s.canvas_size,
         aspect: match s.crop_aspect_ratio.as_deref() {
             Some("Original") => AspectRatio::Original,
             Some("Square") => AspectRatio::Square,
@@ -1365,12 +1615,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
             _ => AspectRatio::Unconstrained,
         },
         portrait: false,
-        keystone: Keystone {
-            vertical: clamp(s.keystone_tilt_y, -100.0, 100.0),
-            horizontal: clamp(s.keystone_tilt_x, -100.0, 100.0),
-            amount: crate::param_meta::clamp("KeystoneAmount", s.keystone_amount),
-            aspect: clamp(s.keystone_aspect, -50.0, 50.0),
-        },
+        keystone,
     };
 
     // C1 stores file names (`NikonZ6-ProStandard.icm`, `NikonZ6-Auto.fcrv`),
@@ -1379,22 +1624,12 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     set.base.icc_profile = s.icc_profile.clone().filter(|p| p != "EMBEDDED").map(|p| stem_of(&p));
     set.base.film_curve = s.film_curve.clone().map(|p| stem_of(&p));
     set.base.processing_method = crate::TechnicalProcessingMethod::from_code(s.technical_processing_method);
-    set.base.curve = match s.film_curve.as_deref() {
-        Some(name) if name.contains("ExtraShadow") => ToneCurvePreset::FilmExtraShadow,
-        Some(name) if name.contains("HighContrast") => ToneCurvePreset::FilmHighContrast,
-        Some(name) if name.contains("Standard") => ToneCurvePreset::FilmStandard,
-        Some(name) if name.contains("Linear") => ToneCurvePreset::Linear,
-        Some(name) if name.contains("Auto") => ToneCurvePreset::Auto,
-        _ => ToneCurvePreset::Auto,
-    };
+    set.base.curve = ToneCurvePreset::from_film_curve(s.film_curve.as_deref().unwrap_or(""));
 
-    let banding = crate::param_meta::clamp("BandingReductionAmount", s.noise_reduction.cnr);
-    if banding != 0.0 {
-        set.extra.insert("BandingReductionAmount".to_string(), banding);
-    }
-    let density = crate::param_meta::clamp("FilmGrainDensity", s.film_grain.density);
-    if density != 0.0 {
-        set.extra.insert("FilmGrainDensity".to_string(), density);
+    // Kept for documents and callers that still read the raw extra key; the
+    // typed field above is the contract.
+    if grain_density != 0.0 {
+        set.extra.insert("FilmGrainDensity".to_string(), grain_density);
     }
 
     set
@@ -1441,11 +1676,195 @@ mod tests {
     }
 
     #[test]
+    fn clean_noise_amount_reaches_single_pixel() {
+        let set = to_adjustment_set(&from_layer_row(&row(&[(
+            "ZCLEANLONGEXPOSUREAMOUNT",
+            Some("37.5"),
+        )])));
+        assert_eq!(set.noise_reduction.single_pixel, 37.5);
+
+        let off = to_adjustment_set(&from_layer_row(&row(&[])));
+        assert_eq!(off.noise_reduction.single_pixel, 0.0);
+
+        let over = to_adjustment_set(&from_layer_row(&row(&[(
+            "ZCLEANLONGEXPOSUREAMOUNT",
+            Some("150"),
+        )])));
+        assert_eq!(over.noise_reduction.single_pixel, 100.0);
+    }
+
+    #[test]
+    fn cnr_amount_reaches_the_color_slider() {
+        let set = to_adjustment_set(&from_layer_row(&row(&[("ZCNRAMOUNT", Some("37.5"))])));
+        assert_eq!(set.noise_reduction.color, 37.5);
+        assert!(
+            !set.extra.contains_key("BandingReductionAmount"),
+            "CNR must not be carried as banding"
+        );
+
+        let off = to_adjustment_set(&from_layer_row(&row(&[])));
+        assert_eq!(off.noise_reduction.color, 50.0);
+
+        let over = to_adjustment_set(&from_layer_row(&row(&[("ZCNRAMOUNT", Some("150"))])));
+        assert_eq!(over.noise_reduction.color, 100.0);
+    }
+
+    #[test]
+    fn ai_denoise_is_not_the_color_slider() {
+        let set = to_adjustment_set(&from_layer_row(&row(&[(
+            "ZAIDENOISEAMOUNT",
+            Some("80"),
+        )])));
+        assert_eq!(set.noise_reduction.color, 50.0, "AI denoise stays out of CNR");
+    }
+
+    #[test]
+    fn fine_grain_column_is_not_the_grain_amount() {
+        let dead = to_adjustment_set(&from_layer_row(&row(&[(
+            "ZFINEGRAINAMOUNT",
+            Some("90"),
+        )])));
+        assert_eq!(dead.film_grain.impact, 0.0, "ZFINEGRAINAMOUNT is a dead column");
+
+        let real = to_adjustment_set(&from_layer_row(&row(&[(
+            "ZFILMGRAINAMOUNT",
+            Some("90"),
+        )])));
+        assert_eq!(real.film_grain.impact, 90.0);
+    }
+
+    #[test]
+    fn denoise_method_lives_in_zdenoisemethod() {
+        let s = from_layer_row(&row(&[("ZDENOISEMETHOD", Some("1"))]));
+        assert_eq!(s.noise_reduction.method, 1);
+        let off = from_layer_row(&row(&[]));
+        assert_eq!(off.noise_reduction.method, 0);
+    }
+
+    #[test]
+    fn keystone_storage_is_rotated_and_flipped_into_the_slider_frame() {
+        let s = from_layer_row(&row(&[
+            ("ZROTATION", Some("90")),
+            ("ZGEOMETRYKEYSTONETILTX", Some("30")),
+            ("ZGEOMETRYKEYSTONETILTY", Some("-20")),
+            ("ZGEOMETRYKEYSTONESKEW", Some("12")),
+            ("ZGEOMETRYKEYSTONEFOCALLENGTH", Some("0.35")),
+            ("ZFLIP", Some("1")),
+        ]));
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.geometry.orientation, 1);
+        assert!(set.geometry.flip_horizontal && !set.geometry.flip_vertical);
+        let k = set.geometry.keystone;
+        assert!((k.horizontal - 20.0).abs() < 1e-4, "h {}", k.horizontal);
+        assert!((k.vertical + 30.0).abs() < 1e-4, "v {}", k.vertical);
+        assert_eq!(k.skew, 12.0);
+        assert_eq!(k.focal_length, 0.35);
+    }
+
+    #[test]
     fn a_variant_without_a_crop_keeps_the_full_frame() {
         let mut s = from_layer_row(&row(&[]));
         s.canvas_size = [6000.0, 4000.0];
         let set = to_adjustment_set(&s);
         assert_eq!(set.geometry.crop, crate::NormRect::FULL);
+    }
+
+    #[test]
+    fn film_grain_fields_are_typed_and_density_keeps_its_extra_key() {
+        let s = from_layer_row(&row(&[
+            ("ZFILMGRAINAMOUNT", Some("100")),
+            ("ZFILMGRAINDENSITY", Some("40")),
+            ("ZFILMGRAINGRANULARITY", Some("50")),
+            ("ZFILMGRAINTYPE", Some("2")),
+        ]));
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.film_grain.kind, GrainKind::SoftGrain);
+        assert_eq!(set.film_grain.impact, 100.0);
+        assert_eq!(set.film_grain.granularity, 50.0);
+        assert_eq!(set.film_grain.density, 40.0);
+        assert_eq!(set.extra.get("FilmGrainDensity"), Some(&40.0));
+        assert!(!set.film_grain.density_is_effective());
+    }
+
+    #[test]
+    fn film_grain_density_is_effective_only_for_fine_grain() {
+        for (kind, effective) in [
+            ("0", true),
+            ("1", false),
+            ("2", false),
+            ("3", false),
+            ("4", false),
+            ("5", false),
+        ] {
+            let s = from_layer_row(&row(&[("ZFILMGRAINTYPE", Some(kind))]));
+            let set = to_adjustment_set(&s);
+            assert_eq!(set.film_grain.density_is_effective(), effective, "type {kind}");
+        }
+    }
+
+    #[test]
+    fn a_default_layer_row_keeps_default_grain() {
+        let set = to_adjustment_set(&from_layer_row(&row(&[])));
+        assert_eq!(set.film_grain, FilmGrain::default());
+        assert!(!set.extra.contains_key("FilmGrainDensity"));
+    }
+
+    /// `ZDEHAZECOLOR = 0;0;0` is Auto: the calculated colour and both levels win.
+    #[test]
+    fn dehaze_auto_uses_the_calculated_colour_and_levels() {
+        let s = from_layer_row(&row(&[
+            ("ZDEHAZEAMOUNT", Some("40")),
+            ("ZDEHAZECOLOR", Some("0;0;0")),
+            ("ZCALCULATEDDEHAZECOLOR", Some("0.91;0.88;0.84")),
+            ("ZDEHAZELEVELLOW", Some("0.02;0.03;0.04")),
+            ("ZDEHAZELEVELHIGH", Some("0.98;0.97;0.96")),
+        ]));
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.dehaze.amount, 40.0);
+        assert_eq!(set.dehaze.shadow_tone, [0.91, 0.88, 0.84]);
+        assert_eq!(set.dehaze.level_low, [0.02, 0.03, 0.04]);
+        assert_eq!(set.dehaze.level_high, [0.98, 0.97, 0.96]);
+    }
+
+    /// Without a calculated colour the `0.98 / max(WB, 1)` fallback is used.
+    #[test]
+    fn dehaze_auto_without_a_calculated_colour_falls_back_to_the_white_balance() {
+        let s = from_layer_row(&row(&[
+            ("ZDEHAZECOLOR", Some("0;0;0")),
+            ("ZWHITEBALANCE", Some("0.5;1.0;2.0")),
+        ]));
+        let set = to_adjustment_set(&s);
+        assert!((set.dehaze.shadow_tone[0] - 0.98).abs() < 1e-6);
+        assert!((set.dehaze.shadow_tone[1] - 0.98).abs() < 1e-6);
+        assert!((set.dehaze.shadow_tone[2] - 0.49).abs() < 1e-5);
+        assert_eq!(set.dehaze.level_low, [0.0; 3]);
+        assert_eq!(set.dehaze.level_high, [1.0; 3]);
+    }
+
+    /// A manual haze colour is used verbatim, even when the auto column is set.
+    #[test]
+    fn manual_dehaze_colour_wins_over_the_calculated_one() {
+        let s = from_layer_row(&row(&[
+            ("ZDEHAZECOLOR", Some("0.2;0.3;0.4")),
+            ("ZCALCULATEDDEHAZECOLOR", Some("0.9;0.9;0.9")),
+        ]));
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.dehaze.shadow_tone, [0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn zspots_is_read_as_raw_pixels_and_not_as_a_mask() {
+        let s = from_layer_row(&row(&[(
+            "ZSPOTS",
+            Some("-1;2,1000.000000,750.000000,60.000000;3,2000.000000,1500.000000,5.000000"),
+        )]));
+        assert_eq!(s.spots.spots.len(), 2);
+        assert_eq!(s.spots.spots[0].kind, crate::c1_spots::KIND_SPOT);
+        assert_eq!((s.spots.spots[0].x, s.spots.spots[0].radius), (1000.0, 60.0));
+        assert!(s.relative_spots.is_empty());
+        // to_adjustment_set leaves the mapping to the catalog reader, which knows
+        // the source size and the final orientation.
+        assert!(to_adjustment_set(&s).spots.is_empty());
     }
 
     #[test]
@@ -1471,11 +1890,18 @@ mod tests {
             "ZGEOMETRYKEYSTONEASPECT",
             "ZGEOMETRYKEYSTONETILTX",
             "ZGEOMETRYKEYSTONETILTY",
+            "ZGEOMETRYKEYSTONEFOCALLENGTH",
+            "ZGEOMETRYKEYSTONESKEW",
+            "ZFLIP",
             "ZHIGHLIGHTRECOVERY",
             "ZSHADOWRECOVERY",
             "ZWHITERECOVERY",
             "ZBLACKRECOVERY",
             "ZDEHAZEAMOUNT",
+            "ZDEHAZECOLOR",
+            "ZCALCULATEDDEHAZECOLOR",
+            "ZDEHAZELEVELHIGH",
+            "ZDEHAZELEVELLOW",
             "ZFILMGRAINGRANULARITY",
             "ZFILMGRAINTYPE",
             "ZBWENABLED",
@@ -1483,6 +1909,12 @@ mod tests {
             "ZLENSIDGUID",
             "ZICCPROFILE",
             "ZFILMCURVE",
+            "ZTECHNICALPROCESSINGMETHOD",
+            "ZSTYLEUUID",
+            "ZSTYLESOURCE",
+            "ZSTYLEMODIFIED",
+            "ZAICOLORGRADE",
+            "ZLAYERSELECTPOINT",
             "ZOPACITY",
             "ZNAME",
             "ZMASKUUID",
@@ -1674,11 +2106,43 @@ mod tests {
 
         assert_eq!(ce.basic.iter().filter(|s| s.saturation != 0.0).count(), 8);
         assert_eq!(ce.basic[HueSector::Blue as usize].saturation, -10.0);
-        assert_eq!(ce.advanced.len(), 2, "kind 0 and kind 3 are advanced");
+        assert_eq!(ce.advanced.len(), 1, "kind 0 is the only advanced group");
         assert_eq!(ce.skin.len(), 1, "kind 2 is skin");
+        assert_eq!(ce.max_smooth.len(), 1, "kind 3 is MaxSmooth");
         assert_eq!(ce.advanced_bands.len(), 3);
         assert_eq!(ce.skin[0].uniformity.expect("skin uniformity").lightness, 60.0);
         assert!((ce.global_shift.hue - 5.0).abs() < 1e-6);
+    }
+
+    /// The stored `kind` decides the list: 0 advanced, 1 basic, 2 skin,
+    /// 3 max smooth. A regression here silently drops a C1 correction.
+    #[test]
+    fn every_kind_routes_to_its_own_list() {
+        for kind in 0..=3 {
+            let raw = format!("1,1,{kind},5,-10,0,255,0,0,-10,10,-100,100,4,0,0,0,0");
+            let ce = color_editor_from_c1(&parse_color_corrections(&raw));
+            match kind {
+                0 => {
+                    assert_eq!(ce.advanced.len(), 1, "kind 0 must be advanced");
+                    assert!(ce.skin.is_empty() && ce.max_smooth.is_empty());
+                    assert_eq!(ce.basic.iter().filter(|s| **s != HslShift::default()).count(), 0);
+                }
+                1 => {
+                    assert_eq!(ce.basic[HueSector::Red as usize].hue, 5.0);
+                    assert!(ce.advanced.is_empty() && ce.skin.is_empty() && ce.max_smooth.is_empty());
+                }
+                2 => {
+                    assert_eq!(ce.skin.len(), 1, "kind 2 must be skin");
+                    assert!(ce.advanced.is_empty() && ce.max_smooth.is_empty());
+                    assert!(ce.skin[0].uniformity.is_some());
+                }
+                _ => {
+                    assert_eq!(ce.max_smooth.len(), 1, "kind 3 must be max smooth");
+                    assert!(ce.advanced.is_empty() && ce.skin.is_empty());
+                    assert!(ce.max_smooth[0].uniformity.is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1752,8 +2216,8 @@ mod tests {
         assert_eq!(curves.distortion.len(), 3);
         assert!((curves.ca_red[1].1 + 3.9107).abs() < 1e-4);
         assert!((curves.ca_blue[1].1 + 2.0419).abs() < 1e-4);
-        // The raw splines cannot be normalized by their first radius (it is 0),
-        // so they must not shadow the curves above.
+        // A manufacturer profile's CA rides in `manufacturer`; the raw splines
+        // must not shadow it.
         assert!(adj.lens.ca_red_points.is_empty());
         assert!(adj.lens.ca_blue_points.is_empty());
 
@@ -1762,6 +2226,44 @@ mod tests {
             ("ZLENSDISTORTION", Some("0.0,0.0000;742.0,-43.3392|100.0|1|100|-1.00000")),
         ])));
         assert!(unknown.lens.manufacturer.is_none());
+    }
+
+    #[test]
+    fn lens_radial_blur_uniform_light_and_tilt_follow_their_columns() {
+        let adj = to_adjustment_set(&from_layer_row(&row(&[
+            ("ZLENSRADIALBLUR", Some("0,0;32000,20|0,0;32000,10|100.0|1")),
+            ("ZLENSLCCLIGHTFALLOFF", Some("1")),
+            ("ZLENSLCCLIGHTFALLOFFAMOUNT", Some("75")),
+            ("ZLENSTILT", Some("12")),
+        ])));
+        assert_eq!(adj.lens.sharpness_falloff, 100.0);
+        assert!(adj.lens.radial_blur.valid);
+        assert_eq!(adj.lens.radial_blur.radial, vec![(0.0, 0.0), (32000.0, 20.0)]);
+        assert_eq!(adj.lens.radial_blur.transverse, vec![(0.0, 0.0), (32000.0, 10.0)]);
+        assert!(adj.lens.uniform_light_enabled);
+        assert_eq!(adj.lens.uniform_light, 75.0);
+        assert_eq!(adj.lens.tilt, 12.0);
+
+        let gated = to_adjustment_set(&from_layer_row(&row(&[
+            ("ZLENSLCCLIGHTFALLOFF", Some("0")),
+            ("ZLENSLCCLIGHTFALLOFFAMOUNT", Some("75")),
+        ])));
+        assert!(!gated.lens.uniform_light_enabled);
+        assert_eq!(gated.lens.radial_blur, RadialBlur::default());
+        assert_eq!(gated.lens.sharpness_falloff, 0.0);
+    }
+
+    #[test]
+    fn lens_lcc_id_reaches_the_session_path() {
+        let s = from_layer_row(&row(&[("ZLENSLCC", Some("AB12CD34"))]));
+        assert_eq!(s.lens.lcc_id.as_deref(), Some("AB12CD34"));
+        let path = crate::dust_lcc::sidecar_path(
+            std::path::Path::new("C:/session"),
+            "_DSC5673.NEF",
+            "AB12CD34",
+        );
+        assert!(path.ends_with("_DSC5673.NEF.AB12CD34.lcc"));
+        assert_eq!(from_layer_row(&row(&[])).lens.lcc_id, None);
     }
 
     #[test]
@@ -1800,6 +2302,34 @@ mod tests {
         let empty = from_layer_row(&row(&[]));
         assert!(empty.lens.chromatic_aberration_custom.splines.is_empty());
         assert_eq!(empty.lens.chromatic_aberration_custom_name, None);
+    }
+
+    #[test]
+    fn ca_origin_selects_the_live_two_curve_pair() {
+        let default = "0.0,0.0000;1000.0,-2.0000|0.0,0.0000;1000.0,-1.0000";
+        let custom = "0.0,0.0000;1000.0,-4.0000|0.0,0.0000;1000.0,-2.0000";
+        let rows = |origin: &'static str| {
+            to_adjustment_set(&from_layer_row(&row(&[
+                ("ZLENSDEFAULTCHROMABR", Some(default)),
+                ("ZLENSCUSTOMCHROMABR", Some(custom)),
+                ("ZLENSCHROMABRORIGIN", Some(origin)),
+                ("ZLENSCHROMABRENABLED", Some("1")),
+            ])))
+        };
+
+        let lens_db = rows("1");
+        assert_eq!(lens_db.lens.ca_origin, crate::CaOrigin::LensDb);
+        assert!((lens_db.lens.ca_red_points[1].1 + 0.002).abs() < 1e-6);
+        assert!((lens_db.lens.ca_blue_points[1].1 + 0.001).abs() < 1e-6);
+
+        let custom_rows = rows("2");
+        assert_eq!(custom_rows.lens.ca_origin, crate::CaOrigin::Custom);
+        assert!((custom_rows.lens.ca_red_points[1].1 + 0.004).abs() < 1e-6);
+        assert!((custom_rows.lens.ca_blue_points[1].1 + 0.002).abs() < 1e-6);
+
+        let none = rows("0");
+        assert_eq!(none.lens.ca_origin, crate::CaOrigin::None);
+        assert!(none.lens.ca_red_points.is_empty() && none.lens.ca_blue_points.is_empty());
     }
 
     #[test]
@@ -1846,6 +2376,21 @@ mod tests {
     }
 
     #[test]
+    fn diffraction_column_reaches_the_lens() {
+        let lens = to_adjustment_set(&from_layer_row(&row(&[
+            ("ZLENSDIFFRACTIONCORRECTIONENABLED", Some("1")),
+            ("ZLENSAPERTURE", Some("11.0")),
+        ])))
+        .lens;
+        assert!(lens.diffraction_enabled);
+        assert_eq!(lens.aperture, 11.0);
+
+        let off = to_adjustment_set(&from_layer_row(&row(&[]))).lens;
+        assert!(!off.diffraction_enabled);
+        assert_eq!(off.aperture, 0.0);
+    }
+
+    #[test]
     fn missing_components_fall_back_to_defaults() {
         let s = from_layer_row(&row(&[("ZWHITEBALANCE", Some("1.625000"))]));
         assert!((s.white_balance_gains[0] - 1.625).abs() < 1e-6);
@@ -1868,10 +2413,88 @@ mod tests {
         assert!((adj.levels.rgb.gamma - 1.0).abs() < 1e-4);
         assert!((adj.levels.red.gamma - 2.0).abs() < 1e-4);
         assert!((adj.levels.green.gamma - 1.0).abs() < 1e-4);
-        assert!((adj.levels.red.output_black - 0.1).abs() < 1e-6);
-        assert!((adj.levels.red.output_white - 0.9).abs() < 1e-6);
-        assert_eq!(adj.levels.rgb.output_black, 0.0);
-        assert_eq!(adj.levels.rgb.output_white, 1.0);
+        // Only the `.x` component of the target pair is consumed; the stored
+        // r/g/b components do not become per-channel output points.
+        for channel in [&adj.levels.rgb, &adj.levels.red, &adj.levels.green, &adj.levels.blue] {
+            assert!((channel.output_black - 0.0).abs() < 1e-6);
+            assert!((channel.output_white - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn target_levels_use_only_the_master_x_component() {
+        let s = from_layer_row(&row(&[
+            ("ZLEVELSTARGETSHADOW", Some("0.100;0.200;0.300;0.400")),
+            ("ZLEVELSTARGETHIGHLIGHT", Some("0.900;0.800;0.700;0.600")),
+        ]));
+        let levels = levels_from_c1(&s);
+        assert!((levels.rgb.output_black - 0.1).abs() < 1e-6);
+        assert!((levels.rgb.output_white - 0.9).abs() < 1e-6);
+        for channel in [&levels.red, &levels.green, &levels.blue] {
+            assert_eq!((channel.output_black, channel.output_white), (0.0, 1.0));
+        }
+        // The affine map itself: out = in*(0.9-0.1)+0.1.
+        let out = levels.apply([0.0, 0.5, 1.0]);
+        assert!((out[0] - 0.1).abs() < 1e-6);
+        assert!((out[1] - 0.5).abs() < 1e-6);
+        assert!((out[2] - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn target_levels_enable_is_a_stage_gate() {
+        let disabled = from_layer_row(&row(&[
+            ("ZLEVELSTARGETENABLE", Some("0")),
+            ("ZLEVELSTARGETSHADOW", Some("0.200;0.000;0.000;0.000")),
+            ("ZLEVELSTARGETHIGHLIGHT", Some("0.800;1.000;1.000;1.000")),
+        ]));
+        assert!(!disabled.levels_target_enable);
+        let levels = levels_from_c1(&disabled);
+        assert_eq!((levels.rgb.output_black, levels.rgb.output_white), (0.0, 1.0));
+
+        let enabled = from_layer_row(&row(&[
+            ("ZLEVELSTARGETENABLE", Some("1")),
+            ("ZLEVELSTARGETSHADOW", Some("0.200;0.000;0.000;0.000")),
+            ("ZLEVELSTARGETHIGHLIGHT", Some("0.800;1.000;1.000;1.000")),
+        ]));
+        let levels = levels_from_c1(&enabled);
+        assert!((levels.rgb.output_black - 0.2).abs() < 1e-6);
+        assert!((levels.rgb.output_white - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zflip_is_single_axis_and_three_is_a_noop() {
+        for (text, horizontal, vertical) in
+            [("0", false, false), ("1", true, false), ("2", false, true), ("3", false, false)]
+        {
+            let s = from_layer_row(&row(&[("ZFLIP", Some(text))]));
+            let g = to_adjustment_set(&s).geometry;
+            assert_eq!((g.flip_horizontal, g.flip_vertical), (horizontal, vertical));
+        }
+    }
+
+    #[test]
+    fn crop_outside_image_reaches_the_geometry_contract() {
+        let s = from_layer_row(&row(&[
+            ("ZCROPOUTSIDEIMAGE", Some("1")),
+            ("ZCROP", Some("10;10;160;160")),
+            ("ZCANVASSIZE", Some("100;100")),
+        ]));
+        assert!(s.crop_outside_image);
+        let g = to_adjustment_set(&s).geometry;
+        assert!(g.crop_outside_image);
+        // The rectangle reaches past the canvas and keeps its stored bounds.
+        assert_eq!((g.crop.x, g.crop.width), (0.1, 1.5));
+        assert_eq!((g.crop.y, g.crop.height), (0.1, 1.5));
+
+        let clamped = from_layer_row(&row(&[
+            ("ZCROPOUTSIDEIMAGE", Some("0")),
+            ("ZCROP", Some("10;10;160;160")),
+            ("ZCANVASSIZE", Some("100;100")),
+        ]));
+        let g = to_adjustment_set(&clamped).geometry;
+        assert!(!g.crop_outside_image);
+        assert_eq!((g.crop.x, g.crop.width), (0.1, 1.0));
+        assert_eq!((g.crop.y, g.crop.height), (0.1, 1.0));
     }
 
     #[test]
@@ -1913,6 +2536,9 @@ mod tests {
         assert_eq!(s.levels_highlight, [1.0; 4]);
         assert_eq!(s.sharpening.radius, 0.8);
         assert_eq!(s.sharpening.threshold, 1.0);
+        assert_eq!(s.style_uuid, None);
+        assert!(!s.ai_color_grade);
+        assert!(s.layer_select_point.is_none());
         assert!(to_adjustment_set(&s).extra.is_empty());
     }
 
@@ -2062,5 +2688,117 @@ mod tests {
             let s = from_layer_row(&row(&[("ZTECHNICALPROCESSINGMETHOD", Some(text))]));
             assert_eq!(to_adjustment_set(&s).base.processing_method, expected);
         }
+    }
+
+    #[test]
+    fn base_characteristics_columns_round_trip() {
+        let s = from_layer_row(&row(&[
+            ("ZTECHNICALPROCESSINGMETHOD", Some("3")),
+            ("ZFILMCURVE", Some("NikonZ6III-Auto.fcrv")),
+            ("ZSTYLEUUID", Some("4FD0E17F-B1FC-4E78-BEAC-92315B3B15E3")),
+            ("ZSTYLESOURCE", Some("Exposure")),
+            ("ZSTYLEMODIFIED", Some("1")),
+            ("ZAICOLORGRADE", Some("0")),
+            ("ZLAYERSELECTPOINT", Some("778.75641;2700.73657")),
+        ]));
+        assert_eq!(s.style_uuid.as_deref(), Some("4FD0E17F-B1FC-4E78-BEAC-92315B3B15E3"));
+        assert_eq!(s.style_source.as_deref(), Some("Exposure"));
+        assert!(s.style_modified);
+        assert!(!s.ai_color_grade);
+        assert_eq!(s.layer_select_point, Some([778.75641, 2700.73657]));
+
+        let set = to_adjustment_set(&s);
+        assert_eq!(set.base.processing_method, crate::TechnicalProcessingMethod::ReproFilmPositives);
+        assert_eq!(set.base.film_curve.as_deref(), Some("NikonZ6III-Auto"));
+        assert_eq!(set.base.curve, ToneCurvePreset::Auto);
+    }
+
+    #[test]
+    fn processing_method_maps_to_c1_and_imgcore() {
+        use crate::TechnicalProcessingMethod as M;
+        assert_eq!(M::from_code(1), M::Scientific);
+        assert_eq!(M::from_code(9), M::Photography);
+        assert_eq!(M::Scientific.to_c1(), 1);
+        assert_eq!(M::StandardFilmNegatives.imgcore_value(), 4);
+        assert!(M::StandardFilmNegatives.is_film_negative());
+        assert!(M::ReproFilmNegatives.inserts_film_negative_conversion());
+        assert!(!M::ReproFilmPositives.is_film_negative());
+        assert!(M::ReproFilmPositives.forces_color_balance());
+        assert!(!M::Scientific.offered_in_base_characteristics());
+        assert_eq!(M::ALL.len(), 5);
+    }
+
+    #[test]
+    fn dng_film_curve_names_map_to_dng_presets() {
+        assert_eq!(ToneCurvePreset::from_film_curve("DNG Standard"), ToneCurvePreset::DngStandard);
+        assert_eq!(
+            ToneCurvePreset::from_film_curve("Phase One DNG Tone Mapped"),
+            ToneCurvePreset::DngToneMapped
+        );
+    }
+
+    #[test]
+    fn negative_switch_is_derived_from_the_mode() {
+        for (text, negative) in [("0", false), ("1", false), ("2", true), ("3", false), ("4", true)] {
+            let s = from_layer_row(&row(&[("ZTECHNICALPROCESSINGMETHOD", Some(text))]));
+            assert_eq!(s.negative_switch, negative, "method {text}");
+            assert_eq!(to_adjustment_set(&s).base.negative_switch(), negative);
+        }
+    }
+
+    /// Truth table copied from `out/negative-chain.tsv` rows 4, 7 and 9.
+    #[test]
+    fn negative_chain_truth_table_matches_lane_spec() {
+        use crate::{EngineGeneration, TechnicalProcessingMethod};
+        for method in TechnicalProcessingMethod::ALL {
+            assert_eq!(
+                method.offered_in_base_characteristics(),
+                !matches!(method, TechnicalProcessingMethod::Scientific)
+            );
+        }
+        for version in [800u32, 1100, 1300, 1301, 2400] {
+            let generation = EngineGeneration::from_raw(version);
+            for (text, block, cbfn) in [
+                ("0", false, Some(false)),
+                ("1", false, Some(false)),
+                ("2", true, Some(false)),
+                ("3", false, Some(false)),
+                ("4", true, if generation == EngineGeneration::After1300 { Some(false) } else { None }),
+            ] {
+                let s = from_layer_row(&row(&[("ZTECHNICALPROCESSINGMETHOD", Some(text))]));
+                let chain = to_adjustment_set(&s).base.negative_chain(generation);
+                let tag = format!("method {text} version {version}");
+                assert_eq!(chain.film_negative_conversion, block, "{tag}");
+                assert_eq!(chain.clamp_negative, block, "{tag}");
+                assert_eq!(chain.color_balance_film_negative, cbfn, "{tag}");
+            }
+        }
+    }
+
+    /// Almost every file is method 0; nothing may enter the negative block and
+    /// a fresh import must stay byte-for-byte what `AdjustmentSet::default()`
+    /// is, so adding the gate cannot move a single pixel.
+    #[test]
+    fn default_mode_is_inert_and_unchanged() {
+        let fresh = to_adjustment_set(&C1VariantSettings::defaults());
+        let default = crate::AdjustmentSet::default();
+        assert_eq!(default.base.processing_method, fresh.base.processing_method);
+        assert_eq!(default.base.engine_version, fresh.base.engine_version);
+        assert!(!fresh.base.negative_switch());
+        let generation = crate::EngineGeneration::default();
+        assert!(fresh.base.negative_chain(generation).is_inert());
+        assert_eq!(fresh.base.negative_chain(generation), crate::NegativeChain::default());
+        assert_eq!(default.base.negative_chain(generation), crate::NegativeChain::default());
+    }
+
+    #[test]
+    fn engine_generation_boundaries_are_inclusive() {
+        use crate::EngineGeneration;
+        assert_eq!(EngineGeneration::from_raw(0x44B), EngineGeneration::Before1100);
+        assert_eq!(EngineGeneration::from_raw(0x44C), EngineGeneration::V1100ToV1300);
+        assert_eq!(EngineGeneration::from_raw(0x514), EngineGeneration::V1100ToV1300);
+        assert_eq!(EngineGeneration::from_raw(0x515), EngineGeneration::After1300);
+        assert!(EngineGeneration::Before1100.keeps_legacy_color_balance());
+        assert!(!EngineGeneration::V1100ToV1300.keeps_legacy_color_balance());
     }
 }

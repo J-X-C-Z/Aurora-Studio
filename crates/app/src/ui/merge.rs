@@ -13,12 +13,28 @@ use gpui_kit::component::{
 use gpui_kit::{App, Entity, ParentElement, Styled, Window, div, prelude::FluentBuilder as _, px};
 
 use crate::i18n::t;
-use crate::planned::{projection_label, HdrOptions, PanoramaOptions, Projection};
+use crate::planned::{projection_label, DeghostMode, HdrOptions, PanoramaOptions, Projection};
 use crate::state::{AppState, MergeKind};
 use crate::theme::pal;
 use crate::widgets::{ParamSlider, Segmented, row, select, switch_row};
 
-const DEGHOST: [(&str, &str); 4] = [("Off", "关"), ("Low", "低"), ("Medium", "中"), ("High", "高")];
+const DEGHOST: [(&str, &str); 3] = [("Off", "关"), ("Auto", "自动"), ("Manual", "手动")];
+
+fn deghost_index(mode: DeghostMode) -> usize {
+    match mode {
+        DeghostMode::Off => 0,
+        DeghostMode::Auto => 1,
+        DeghostMode::Manual => 2,
+    }
+}
+
+fn deghost_at(index: usize) -> DeghostMode {
+    match index {
+        0 => DeghostMode::Off,
+        2 => DeghostMode::Manual,
+        _ => DeghostMode::Auto,
+    }
+}
 
 pub fn open(state: &Entity<AppState>, kind: MergeKind, window: &mut Window, cx: &mut App) {
     let count = state.read(cx).selection.len();
@@ -42,8 +58,12 @@ pub fn open(state: &Entity<AppState>, kind: MergeKind, window: &mut Window, cx: 
                     }, cx))
                     .child(row(
                         t("Deghosting", "去鬼影"),
-                        DEGHOST.iter().fold(Segmented::new("hdr-deghost", h.deghost as usize), |s, (en, zh)| s.text(t(en, zh))).on_select(move |i, window, _| {
-                            b.borrow_mut().deghost = i as u8;
+                        DEGHOST.iter().fold(Segmented::new("hdr-deghost", deghost_index(h.deghost)), |s, (en, zh)| s.text(t(en, zh))).on_select(move |i, window, _| {
+                            let mode = deghost_at(i);
+                            b.borrow_mut().deghost = mode;
+                            if mode == DeghostMode::Manual {
+                                b.borrow_mut().deghost_reference = Some(0);
+                            }
                             window.refresh();
                         }),
                         cx,

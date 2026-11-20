@@ -70,7 +70,10 @@ pub const DISPLAY_PROFILE: Status = Status::Partial(
 pub const AI_DENOISE: Status = Status::Pending("Saved with the variant; the engine has no AI denoise yet", "随变体保存，引擎尚无 AI 降噪");
 pub const BANDING: Status = Status::Pending("Saved with the variant; the engine has no banding reduction yet", "随变体保存，引擎尚无条纹抑制");
 /// Interface built ahead of the engine (see `planned`).
-pub const MERGE: Status = Status::Partial("Basic HDR and panorama merges are available; projection and deghosting options are still not consumed", "基础 HDR/全景合并可用；投影/去鬼影选项仍未消费");
+pub const MERGE: Status = Status::Partial(
+    "Basic HDR and panorama merges are available; panorama projection (Perspective/Cylindrical/Spherical/Panini) and HDR deghosting (Off/Auto/Manual) are consumed; frame alignment, auto tone, boundary warp and auto crop are not",
+    "基础 HDR/全景合并可用；全景投影（透视/圆柱/球面/Panini）与 HDR 去鬼影（关/自动/手动）已消费；对齐、自动色调、边界变形与自动裁剪尚未消费",
+);
 pub const STYLE_IMPORT: Status = Status::Partial("Imported styles are available for this session", "导入风格在当前会话可用");
 pub const SESSIONS: Status = Status::Partial("Session import is read-only; XMP write-back and .P1X are not connected yet", "Session 支持只读导入；XMP 写回与 .P1X 尚未接入");
 pub const PRINT: Status = Status::Partial("Single-page PDF output is available; system printers, multi-image layouts and ICC proofing are not connected", "单页 PDF 输出可用；系统打印机、多图版式与 ICC 打样尚未接入");

@@ -154,6 +154,14 @@ fn sensor_map() -> &'static std::sync::Mutex<std::collections::HashMap<std::path
 /// cannot be demosaiced (Nikon High Efficiency in this libraw build), or the
 /// result does not resemble the camera preview.
 pub fn decode16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
+    // Opt-in: the C1 chain decodes the same Bayer as LibRaw but demosaics with
+    // Capture One's own stages. Enable once its output has a visual acceptance.
+    if std::env::var("AURORA_C1_RAW").is_ok_and(|value| value == "1") {
+        if let Some(decoded) = crate::c1_raw::decode_he_rgba16(path) {
+            log::info!("C1 RAW chain decoded {}", path.display());
+            return Some(decoded);
+        }
+    }
     match libraw::decode16(path, demosaic_quality()) {
         Ok((width, height, rgba)) if same_picture(&luma_grid16(width, height, &rgba), path) => {
             remember_sensor(path, true);

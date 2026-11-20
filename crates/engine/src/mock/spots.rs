@@ -6,7 +6,7 @@
 //! is sampled at 32 angles.
 //! Limits: radii follow the spot radius fraction of the oriented image's long side.
 
-use crate::{AdjustmentSet, Geometry, Spot, SpotKind};
+use crate::{AdjustmentSet, CoverKind, CoverPatch, Geometry, Spot, SpotKind};
 
 /// What a spot does to the pixels it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub(crate) enum SpotMode {
 const TAU: f32 = std::f32::consts::TAU;
 const RING_SAMPLES: usize = 32;
 const FEATHER_RATIO: f32 = 0.35;
+/// C1 feathers a heal over the two pixels just outside the spot radius.
+const HEAL_FEATHER_PX: f32 = 2.0;
 const DIFFUSE_ITERATIONS: usize = 240;
 
 /// Applies every spot in `adj` to a developed frame of `width` x `height`.
@@ -110,8 +112,10 @@ fn overlaps(a: &Spot, b: &Spot) -> bool {
 
 fn mode_of(kind: SpotKind) -> SpotMode {
     match kind {
-        SpotKind::Dust => SpotMode::Dust,
-        SpotKind::Spot => SpotMode::Heal,
+        // C1's ZSPOTS types 1 (Black), 2 (Spot) and 3 (Dust) all inpaint from
+        // the surrounding ring; only Clone differs. The 3x3 median is left for
+        // AI-detected dust, which is small and fixed-size.
+        SpotKind::Dust | SpotKind::Spot => SpotMode::Heal,
         SpotKind::Clone { .. } => SpotMode::Clone,
     }
 }
@@ -134,11 +138,50 @@ fn spot_geometry(
     width: u32,
     height: u32,
 ) -> Option<FrameSpot> {
+    if !spot.x.is_finite() || !spot.y.is_finite() || !spot.radius.is_finite() {
+        return None;
+    }
+    let (cx, cy, scale) = oriented_to_frame([spot.x, spot.y], geometry, source_size, width, height)?;
+    let (sw, sh) = source_size;
+    let (ow, oh) = if geometry.orientation % 2 == 1 {
+        (sh as f32, sw as f32)
+    } else {
+        (sw as f32, sh as f32)
+    };
+    // Radius is a fraction of the image's long side; convert to frame pixels.
+    let long_side = ow.max(oh);
+    let radius_px = spot.radius * long_side * scale;
+    if !radius_px.is_finite() || radius_px <= 0.0 {
+        return None;
+    }
+    // The source offset lives in the oriented, uncropped image, so it takes the
+    // same quarter turn and crop scale as the centre.
+    let src = match spot.kind {
+        SpotKind::Clone { src_offset } => {
+            let rot = geometry.rotation.to_radians();
+            let (sin, cos) = rot.sin_cos();
+            let (dx, dy) = (src_offset.0 as f32, src_offset.1 as f32);
+            Some(((cos * dx - sin * dy) * scale, (sin * dx + cos * dy) * scale))
+        }
+        _ => None,
+    };
+    Some(FrameSpot { cx, cy, radius: radius_px, src })
+}
+
+/// Normalized oriented point → frame pixels, plus the frame-pixels-per-oriented-
+/// pixel scale. The spot crop/fine-rotation path; keystone is not modelled.
+fn oriented_to_frame(
+    p: [f32; 2],
+    geometry: &Geometry,
+    source_size: (u32, u32),
+    width: u32,
+    height: u32,
+) -> Option<(f32, f32, f32)> {
     let (sw, sh) = source_size;
     if sw == 0 || sh == 0 || width == 0 || height == 0 {
         return None;
     }
-    if !spot.x.is_finite() || !spot.y.is_finite() || !spot.radius.is_finite() {
+    if !p[0].is_finite() || !p[1].is_finite() {
         return None;
     }
     let (ow, oh) = if geometry.orientation % 2 == 1 {
@@ -150,11 +193,10 @@ fn spot_geometry(
     if crop.width <= 0.0 || crop.height <= 0.0 {
         return None;
     }
-    // The spot sits in the oriented image before crop and fine rotation; the
+    // The point sits in the oriented image before crop and fine rotation; the
     // frame shows the crop rotated about the oriented centre, so undo that
     // rotation first and then undo the crop.
-    let qx = spot.x * ow;
-    let qy = spot.y * oh;
+    let (qx, qy) = (p[0] * ow, p[1] * oh);
     let (cx, cy) = (0.5 * ow, 0.5 * oh);
     let rot = geometry.rotation.to_radians();
     let (sin, cos) = rot.sin_cos();
@@ -166,23 +208,153 @@ fn spot_geometry(
     if !fx.is_finite() || !fy.is_finite() {
         return None;
     }
-    // Radius is a fraction of the image's long side; convert to frame pixels.
-    let long_side = ow.max(oh);
     let scale = (width as f32 / (crop.width * ow)).min(height as f32 / (crop.height * oh));
-    let radius_px = spot.radius * long_side * scale;
-    if !radius_px.is_finite() || radius_px <= 0.0 {
-        return None;
+    Some((fx * width as f32, fy * height as f32, scale))
+}
+
+/// Applies the `.comask` Cover arrows of one repair layer.
+///
+/// Each arrow replaces a rectangle at `dst` with the pixels at `src` and feathers
+/// the rim over 2 px outside it, like a spot. Heal adds
+/// `mean(src region) - mean(dst ring)` to every copied pixel: C1's colour
+/// correction for a repair lifted from a differently lit area.
+pub(crate) fn apply_cover_patches(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    geometry: &Geometry,
+    patches: &[CoverPatch],
+    source_size: (u32, u32),
+) {
+    let (sw, sh) = source_size;
+    if patches.is_empty() || width == 0 || height == 0 || sw == 0 || sh == 0 {
+        return;
     }
-    // The source offset lives in the oriented, uncropped image, so it takes the
-    // same quarter turn and crop scale as the centre.
-    let src = match spot.kind {
-        SpotKind::Clone { src_offset } => {
-            let (dx, dy) = (src_offset.0 as f32, src_offset.1 as f32);
-            Some(((cos * dx - sin * dy) * scale, (sin * dx + cos * dy) * scale))
-        }
-        _ => None,
+    let snapshot = rgba.to_vec();
+    let (ow, oh) = if geometry.orientation % 2 == 1 {
+        (sh as f32, sw as f32)
+    } else {
+        (sw as f32, sh as f32)
     };
-    Some(FrameSpot { cx: fx * width as f32, cy: fy * height as f32, radius: radius_px, src })
+    for patch in patches {
+        let Some((dx, dy, scale)) =
+            oriented_to_frame(patch.dst, geometry, source_size, width, height)
+        else {
+            continue;
+        };
+        let Some((sx, sy, _)) =
+            oriented_to_frame(patch.src, geometry, source_size, width, height)
+        else {
+            continue;
+        };
+        let hw = patch.half[0] * ow * scale;
+        let hh = patch.half[1] * oh * scale;
+        if !hw.is_finite() || !hh.is_finite() || hw <= 0.0 || hh <= 0.0 {
+            continue;
+        }
+        let rect = (dx - hw, dy - hh, dx + hw, dy + hh);
+        let offset = (sx - dx, sy - dy);
+        let shift = match patch.kind {
+            CoverKind::Clone => [0.0; 3],
+            CoverKind::Heal => colour_shift(&snapshot, width, height, rect, offset),
+        };
+        cover_rect(rgba, &snapshot, width, height, rect, offset, shift);
+    }
+}
+
+/// Distance from a pixel index to a half-open rectangle `[x0, x1) x [y0, y1)`;
+/// zero inside, one at the first pixel past the edge.
+fn rect_distance(x: f32, y: f32, rect: (f32, f32, f32, f32)) -> f32 {
+    let (x0, y0, x1, y1) = rect;
+    let dx = (x0 - x).max(x - (x1 - 1.0)).max(0.0);
+    let dy = (y0 - y).max(y - (y1 - 1.0)).max(0.0);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// `mean(src) - mean(ring around dst)` per channel, over the 2 px feather band.
+fn colour_shift(
+    snapshot: &[u8],
+    width: u32,
+    height: u32,
+    rect: (f32, f32, f32, f32),
+    offset: (f32, f32),
+) -> [f32; 3] {
+    let (x0, x1) = (rect.0 - HEAL_FEATHER_PX, rect.2 + HEAL_FEATHER_PX);
+    let (y0, y1) = (rect.1 - HEAL_FEATHER_PX, rect.3 + HEAL_FEATHER_PX);
+    let mut src = [0f32; 3];
+    let mut ring = [0f32; 3];
+    let (mut n_src, mut n_ring) = (0f32, 0f32);
+    for py in y0.floor() as i64..=y1.ceil() as i64 {
+        for px in x0.floor() as i64..=x1.ceil() as i64 {
+            let (x, y) = (px as f32, py as f32);
+            let d = rect_distance(x, y, rect);
+            if d <= 0.0 {
+                if let Some(c) = sample(snapshot, width, height, x + offset.0, y + offset.1) {
+                    for k in 0..3 {
+                        src[k] += c[k];
+                    }
+                    n_src += 1.0;
+                }
+            } else if d <= HEAL_FEATHER_PX {
+                if let Some(c) = sample(snapshot, width, height, x, y) {
+                    for k in 0..3 {
+                        ring[k] += c[k];
+                    }
+                    n_ring += 1.0;
+                }
+            }
+        }
+    }
+    if n_src == 0.0 || n_ring == 0.0 {
+        return [0.0; 3];
+    }
+    let mut shift = [0f32; 3];
+    for k in 0..3 {
+        shift[k] = src[k] / n_src - ring[k] / n_ring;
+    }
+    shift
+}
+
+/// Copies the source rectangle over `rect`, feathering the 2 px outside it.
+fn cover_rect(
+    rgba: &mut [u8],
+    snapshot: &[u8],
+    width: u32,
+    height: u32,
+    rect: (f32, f32, f32, f32),
+    offset: (f32, f32),
+    shift: [f32; 3],
+) {
+    let feather = HEAL_FEATHER_PX;
+    let x0 = (rect.0 - feather).floor().max(0.0) as i64;
+    let x1 = (rect.2 + feather).ceil().min(width as f32 - 1.0) as i64;
+    let y0 = (rect.1 - feather).floor().max(0.0) as i64;
+    let y1 = (rect.3 + feather).ceil().min(height as f32 - 1.0) as i64;
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let (x, y) = (px as f32, py as f32);
+            let d = rect_distance(x, y, rect);
+            if d > feather {
+                continue;
+            }
+            let weight = if d <= 0.0 { 1.0 } else { 1.0 - smoothstep(0.0, feather, d) };
+            if weight <= 0.0 {
+                continue;
+            }
+            let p = (py as usize * width as usize + px as usize) * 4;
+            if p + 3 >= rgba.len() {
+                continue;
+            }
+            let Some(c) = sample(snapshot, width, height, x + offset.0, y + offset.1) else {
+                continue;
+            };
+            for k in 0..3 {
+                let repaired = c[k] + shift[k];
+                let orig = snapshot[p + k] as f32;
+                rgba[p + k] = (orig * (1.0 - weight) + repaired * weight).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }
 
 /// Clone: copies the source patch into the disc, feathering its rim into the
@@ -234,7 +406,7 @@ fn clone_patch(
 /// Heal: fills the disc with a diffusion of the surrounding ring.
 fn heal(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32) {
     let radius = radius.max(1.0);
-    let feather = (radius * FEATHER_RATIO).max(1.0);
+    let feather = HEAL_FEATHER_PX;
     let outer = radius + feather;
     let ring_r = (radius * 1.4).clamp(radius + 0.5, radius * 1.6);
 
@@ -844,6 +1016,6 @@ mod tests {
             hash ^= *b as u64;
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
-        assert_eq!(hash, 0xd973_d661_f61a_ba56, "heal output changed: {hash:016x}");
+        assert_eq!(hash, 0x51ee_30b0_e822_fad4, "heal output changed: {hash:016x}");
     }
 }

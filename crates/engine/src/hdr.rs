@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use rayon::prelude::*;
 
 use crate::mock::process::linear_to_srgb;
-use crate::{Exif, Source};
+use crate::{DeghostMode, Exif, HdrOptions, Source};
 
 /// Width of the well-exposedness bell, in linear light.
 const SIGMA: f32 = 0.2;
@@ -56,6 +56,114 @@ pub fn relative_stops(reference: &Exif, frame: &Exif) -> f32 {
 /// Fuses `frames` at their relative `stops`, one `stops` entry per frame.
 pub fn fuse(frames: &[&Source], stops: &[f32]) -> Result<FusedFrame> {
     fuse_with(frames, stops, true)
+}
+
+/// Fuses with the interface's options.
+///
+/// `DeghostMode::Off` takes the legacy no-deghost path unchanged. `Auto` and
+/// `Manual` detect a moving pixel by its median luminance across the bracket
+/// and, where one frame deviates by more than [`DEGHOST_THRESHOLD`], keep only
+/// the reference frame's pixel. `Manual` uses
+/// [`HdrOptions::deghost_reference`] when it is in range; otherwise the median
+/// exposure is the reference.
+pub fn fuse_with_options(
+    frames: &[&Source],
+    stops: &[f32],
+    options: &HdrOptions,
+) -> Result<FusedFrame> {
+    if frames.len() == 1 && stops.len() == 1 {
+        let first = frames[0];
+        let (width, height) = first.size();
+        return Ok(FusedFrame { width, height, rgb: first.levels[0].data.clone() });
+    }
+    if options.deghost == DeghostMode::Off {
+        return fuse_with(frames, stops, false);
+    }
+    let Some(first) = frames.first() else {
+        bail!("HDR merge needs at least one frame");
+    };
+    if frames.len() != stops.len() {
+        bail!("HDR merge: {} frames but {} exposures", frames.len(), stops.len());
+    }
+    let (width, height) = first.size();
+    if frames.iter().any(|f| f.size() != (width, height)) {
+        let (w, h) = frames.iter().find(|f| f.size() != (width, height)).unwrap().size();
+        bail!("HDR merge frames must share one size: {width}x{height} vs {w}x{h}");
+    }
+    let middle = middle_exposure(stops);
+    let reference = match options.deghost {
+        DeghostMode::Manual => {
+            options.deghost_reference.filter(|&index| index < frames.len()).unwrap_or(middle)
+        }
+        _ => middle,
+    };
+    let reference_stops = stops[reference];
+    let gains: Vec<f32> = stops.iter().map(|s| 2f32.powf(reference_stops - s)).collect();
+    let planes: Vec<&crate::mock::process::Plane> = frames.iter().map(|f| &f.levels[0]).collect();
+    let reference_pixel = &planes[reference].data;
+    let reference_gain = gains[reference];
+    let deghost = options.deghost != DeghostMode::Off;
+    let rgb: Vec<[f32; 3]> = (0..(width as usize) * (height as usize))
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = (i as u32 % width, i as u32 / width);
+            if deghost && pixel_moves(&planes, &gains, i) {
+                return reference_pixel[i].map(|v| (v * reference_gain).clamp(0.0, 1.0));
+            }
+            let mut acc = [0.0f32; 3];
+            let mut sum = 0.0f32;
+            for (plane, &gain) in planes.iter().zip(&gains) {
+                let pixel = plane.data[i];
+                let weight = weight(plane, x, y);
+                for k in 0..3 {
+                    acc[k] += pixel[k].clamp(0.0, 1.0) * gain * weight;
+                }
+                sum += weight;
+            }
+            if sum > 0.0 {
+                acc.map(|v| (v / sum).clamp(0.0, 1.0))
+            } else {
+                [0.0; 3]
+            }
+        })
+        .collect();
+    Ok(FusedFrame { width, height, rgb })
+}
+
+/// True when one frame's exposure-normalised luminance is too far from the
+/// bracket's median at this pixel: the signature of a moving object.
+fn pixel_moves(planes: &[&crate::mock::process::Plane], gains: &[f32], index: usize) -> bool {
+    const STACK: usize = 16;
+    let n = planes.len();
+    if n <= STACK {
+        let mut lumas = [0.0f32; STACK];
+        for (slot, (plane, &gain)) in lumas[..n].iter_mut().zip(planes.iter().zip(gains)) {
+            *slot = luma(plane.data[index]) * gain;
+        }
+        sort_f32(&mut lumas[..n]);
+        median_sorted(&lumas[..n])
+    } else {
+        let mut lumas: Vec<f32> = planes
+            .iter()
+            .zip(gains)
+            .map(|(plane, &gain)| luma(plane.data[index]) * gain)
+            .collect();
+        sort_f32(&mut lumas);
+        median_sorted(&lumas)
+    }
+}
+
+fn median_sorted(values: &[f32]) -> bool {
+    let median = if values.len() % 2 == 1 {
+        values[values.len() / 2]
+    } else {
+        (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
+    };
+    values.iter().any(|&value| (value - median).abs() > DEGHOST_THRESHOLD)
+}
+
+fn sort_f32(values: &mut [f32]) {
+    values.sort_by(f32::total_cmp);
 }
 
 fn fuse_with(frames: &[&Source], stops: &[f32], deghost: bool) -> Result<FusedFrame> {
@@ -256,5 +364,94 @@ mod tests {
         let wider = Exif { aperture: Some(2.8), ..base.clone() };
         assert!((relative_stops(&base, &wider) - 1.03).abs() < 0.02);
         assert_eq!(relative_stops(&base, &Exif::default()), 0.0);
+    }
+
+    fn moving_bracket() -> (Source, Source, Source) {
+        let dark = frame(16, 16, |x, _| if (6..10).contains(&x) { [0.2; 3] } else { [0.1; 3] });
+        let middle = frame(16, 16, |x, _| if (6..10).contains(&x) { [0.4; 3] } else { [0.2; 3] });
+        let bright = frame(16, 16, |_x, _y| [0.4; 3]);
+        (dark, middle, bright)
+    }
+
+    #[test]
+    fn deghost_off_is_byte_identical_to_the_legacy_no_deghost_path() {
+        let (dark, middle, bright) = moving_bracket();
+        let frames = [&dark, &middle, &bright];
+        let stops = [-1.0, 0.0, 1.0];
+        let legacy = fuse_with(&frames, &stops, false).unwrap();
+        let off = fuse_with_options(
+            &frames,
+            &stops,
+            &HdrOptions { deghost: DeghostMode::Off, ..HdrOptions::default() },
+        )
+        .unwrap();
+        assert_eq!(legacy.rgb, off.rgb);
+    }
+
+    #[test]
+    fn auto_deghost_keeps_the_median_exposure_reference() {
+        let (dark, middle, bright) = moving_bracket();
+        let frames = [&dark, &middle, &bright];
+        let fused = fuse_with_options(
+            &frames,
+            &[-1.0, 0.0, 1.0],
+            &HdrOptions { deghost: DeghostMode::Auto, ..HdrOptions::default() },
+        )
+        .unwrap();
+        let block = fused.rgb[8 * 16 + 8];
+        let reference = middle.levels[0].data[8 * 16 + 8];
+        assert!((block[0] - reference[0]).abs() < 1e-6, "{block:?} vs {reference:?}");
+        assert!(fused.rgb.iter().all(|p| p.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn manual_deghost_uses_the_selected_reference_frame() {
+        let (dark, middle, bright) = moving_bracket();
+        let frames = [&dark, &middle, &bright];
+        let options = HdrOptions {
+            deghost: DeghostMode::Manual,
+            deghost_reference: Some(0),
+            ..HdrOptions::default()
+        };
+        let fused = fuse_with_options(&frames, &[-1.0, 0.0, 1.0], &options).unwrap();
+        let block = fused.rgb[8 * 16 + 8];
+        let reference = dark.levels[0].data[8 * 16 + 8];
+        assert!((block[0] - reference[0]).abs() < 1e-6, "{block:?} vs {reference:?}");
+
+        let missing = HdrOptions { deghost_reference: Some(99), ..options };
+        let fallback = fuse_with_options(&frames, &[-1.0, 0.0, 1.0], &missing).unwrap();
+        let auto = fuse_with_options(
+            &frames,
+            &[-1.0, 0.0, 1.0],
+            &HdrOptions { deghost: DeghostMode::Auto, ..HdrOptions::default() },
+        )
+        .unwrap();
+        assert_eq!(fallback.rgb, auto.rgb);
+    }
+
+    #[test]
+    fn a_single_frame_with_deghost_options_is_unchanged() {
+        let src = frame(8, 8, |x, y| [x as f32 / 7.0, y as f32 / 7.0, 0.4]);
+        for mode in DeghostMode::ALL {
+            let fused = fuse_with_options(
+                &[&src],
+                &[0.0],
+                &HdrOptions { deghost: mode, ..HdrOptions::default() },
+            )
+            .unwrap();
+            assert_eq!(fused.rgb, src.levels[0].data);
+        }
+    }
+
+    #[test]
+    fn auto_deghost_leaves_a_static_scene_byte_identical() {
+        let dark = frame(16, 16, |x, _| [0.05 + x as f32 * 0.01; 3]);
+        let middle = frame(16, 16, |x, _| [0.1 + x as f32 * 0.02; 3]);
+        let bright = frame(16, 16, |x, _| [0.2 + x as f32 * 0.04; 3]);
+        let frames = [&dark, &middle, &bright];
+        let stops = [-1.0, 0.0, 1.0];
+        let legacy = fuse_with(&frames, &stops, false).unwrap();
+        let auto = fuse_with_options(&frames, &stops, &HdrOptions::default()).unwrap();
+        assert_eq!(legacy.rgb, auto.rgb);
     }
 }

@@ -34,6 +34,10 @@ pub struct AdjustmentSet {
     pub lens: LensCorrection,
     pub geometry: Geometry,
     pub spots: Vec<Spot>,
+    /// Capture One Retouch Faces: one entry per `ZRETOUCHINGLAYER` row, each
+    /// carrying its own masks. Empty for every image that has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retouch: Vec<RetouchFace>,
     pub layers: Vec<crate::Layer>,
     /// Node editor topology; absent in older saved adjustments.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +60,59 @@ impl AdjustmentSet {
     /// True when nothing differs from a freshly imported image.
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// One Capture One retouch face: the sliders of one `ZRETOUCHINGLAYER` row and
+/// the masks that place them.
+///
+/// Amounts are the stored slider values in `0..=100` (EyeBright offsets may be
+/// negative). `impact` is the row's `ZOPACITY`, which C1 multiplies into every
+/// operation's amount; 100 is the variant default. Masks are keyed by C1's
+/// `IC_RetouchingMaskType`: 1 SkinEvening, 2 Sculpting, 8 Teeth, 4 L.Iris,
+/// 5 L.Sclera, 6 R.Iris, 7 R.Sclera.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetouchFace {
+    /// Face rectangle `[x, y, w, h]`, normalized in the oriented, uncropped
+    /// image. Only its long side is used: it scales the skin-evening radius.
+    pub face: [f32; 4],
+    /// `ZOPACITY` in percent; 100 when the row stores no override.
+    pub impact: f32,
+    pub skin_amount: f32,
+    /// Signed, `-100..=100`: negative adds texture, positive smooths.
+    pub skin_texture: f32,
+    pub sculpt: f32,
+    pub teeth_brightness: f32,
+    pub teeth_desaturation: f32,
+    pub iris_left: f32,
+    pub iris_right: f32,
+    pub iris_both: f32,
+    pub sclera_left: f32,
+    pub sclera_right: f32,
+    pub sclera_both: f32,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub masks: std::collections::BTreeMap<u8, crate::RasterMask>,
+}
+
+impl Default for RetouchFace {
+    fn default() -> Self {
+        Self {
+            face: [0.0; 4],
+            impact: 100.0,
+            skin_amount: 0.0,
+            skin_texture: 0.0,
+            sculpt: 0.0,
+            teeth_brightness: 0.0,
+            teeth_desaturation: 0.0,
+            iris_left: 0.0,
+            iris_right: 0.0,
+            iris_both: 0.0,
+            sclera_left: 0.0,
+            sclera_right: 0.0,
+            sclera_both: 0.0,
+            masks: std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -104,6 +161,14 @@ pub enum TechnicalProcessingMethod {
 }
 
 impl TechnicalProcessingMethod {
+    pub const ALL: [Self; 5] = [
+        Self::Photography,
+        Self::Scientific,
+        Self::ReproFilmNegatives,
+        Self::ReproFilmPositives,
+        Self::StandardFilmNegatives,
+    ];
+
     pub fn from_code(code: i32) -> Self {
         match code {
             1 => Self::Scientific,
@@ -114,8 +179,176 @@ impl TechnicalProcessingMethod {
         }
     }
 
+    pub fn to_c1(self) -> i32 {
+        match self {
+            Self::Photography => 0,
+            Self::Scientific => 1,
+            Self::ReproFilmNegatives => 2,
+            Self::ReproFilmPositives => 3,
+            Self::StandardFilmNegatives => 4,
+        }
+    }
+
+    /// C1 and ImageCore share the same 0..4 numbering. The managed bridge enum
+    /// (`IC_TechnicalProcessingMethod`) only names 0..3, but the value crosses
+    /// the boundary as a plain int, and the chain gates on 4 directly
+    /// (`0x183BC19` accepts 2|4, `0x16E85C0` requires 4), so do not fold.
+    pub fn imgcore_value(self) -> i32 {
+        match self {
+            Self::Photography => 0,
+            Self::Scientific => 1,
+            Self::ReproFilmNegatives => 2,
+            Self::ReproFilmPositives => 3,
+            Self::StandardFilmNegatives => 4,
+        }
+    }
+
     pub fn is_film_negative(self) -> bool {
         matches!(self, Self::ReproFilmNegatives | Self::StandardFilmNegatives)
+    }
+
+    /// The negative branch inserts `FilmNegativeConversion`/`ClampNegative` and
+    /// skips the normal exposure/levels pair before `ArtEffects`.
+    pub fn inserts_film_negative_conversion(self) -> bool {
+        self.is_film_negative()
+    }
+
+    /// 1/2/3 insert `ColorBalance` unconditionally; 4 uses
+    /// `ColorBalanceFilmNegative`; 0 only when the variant flag is set.
+    pub fn forces_color_balance(self) -> bool {
+        matches!(
+            self,
+            Self::Scientific | Self::ReproFilmNegatives | Self::ReproFilmPositives
+        )
+    }
+
+    /// The Base Characteristics combo in this build offers 0/3/2/4, never 1.
+    pub fn offered_in_base_characteristics(self) -> bool {
+        !matches!(self, Self::Scientific)
+    }
+}
+
+/// Numeric C1 engine generation, stored at `settings+0x10C90`. The `.costyle`
+/// attribute `<SL Engine="...">` is the same counter: `0x320` is 800, the value
+/// an absent attribute stands for.
+///
+/// Every constant is a literal `cmp dword ptr [<settings> + 0x10C90], imm` in
+/// `ImgCoreDll.dll` (image base `0x180000000`):
+///   `0x320` 800  - RVA `0x1839A15`
+///   `0x44C` 1100 - RVA `0x183BD40` (negative chain), also `0x154E500`, `0x15508C8`
+///   `0x514` 1300 - RVA `0x183C6C8`, `0x16E8480`, `0x1868559`
+/// 0x1100 is *not* a threshold: it is the `+0x11000` field offset the chain
+/// builder also reads. The three real boundaries are the ones above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EngineGeneration {
+    /// `< 0x44C` (1100): the legacy standalone `ColorBalance` op stays in.
+    #[default]
+    Before1100,
+    /// `0x44C ..= 0x514` (1100 through 1300, both inclusive).
+    V1100ToV1300,
+    /// `> 0x514` (1300).
+    After1300,
+}
+
+impl EngineGeneration {
+    pub const RAW_800: u32 = 0x320;
+    pub const RAW_1100: u32 = 0x44C;
+    pub const RAW_1300: u32 = 0x514;
+
+    pub fn from_raw(version: u32) -> Self {
+        if version > Self::RAW_1300 {
+            Self::After1300
+        } else if version >= Self::RAW_1100 {
+            Self::V1100ToV1300
+        } else {
+            Self::Before1100
+        }
+    }
+
+    /// `ColorBalance` is appended when the document predates 1100.
+    pub fn keeps_legacy_color_balance(self) -> bool {
+        matches!(self, Self::Before1100)
+    }
+
+    /// `ColorBalanceFilmNegative` stops being built after 1300 (`0x16E85C0`).
+    pub fn builds_color_balance_film_negative(self) -> bool {
+        !matches!(self, Self::After1300)
+    }
+}
+
+/// The negative-only stages Capture One's chain builder appends. Mirrors the
+/// builder at RVA `0x183BB80`; per-stage conditions are in
+/// `out/negative-chain.tsv`.
+///
+/// Parameter provenance (`out/negative-chain.tsv`, column `params_read`):
+/// `FilmNegativeConversion` reads three channel levels (`settings+0x8A8/AC/B0`,
+/// the film-base triple), a density scalar (`+0x8FC`) and the white-balance
+/// gains; `ColorBalanceFilmNegative` reads 16 per-layer gain triples and 16
+/// mask planes; `UndoFilmcurve` reads a LUT vector.
+///
+/// **None of those is a managed column.** `ZVARIANTLAYER` has no film-base,
+/// density, mask or LUT column, `ZDOCUMENTSETTING` only holds capture/UI keys,
+/// and no installed `.costyle` carries such a key, so the parameters come from
+/// live image state at render time. The field below therefore stays `None`
+/// whenever the answer depends on them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NegativeChain {
+    /// `FilmNegativeConversion`: reciprocal inversion with base subtraction.
+    pub film_negative_conversion: bool,
+    /// `ClampNegative`: `max(x, 0)`.
+    pub clamp_negative: bool,
+    /// `ColorBalanceFilmNegative`: per-layer masked RGB gain. `None` means the
+    /// catalog cannot decide it: `0x16E85C0` also requires non-neutral gains.
+    pub color_balance_film_negative: Option<bool>,
+}
+
+impl Default for NegativeChain {
+    fn default() -> Self {
+        Self {
+            film_negative_conversion: false,
+            clamp_negative: false,
+            color_balance_film_negative: Some(false),
+        }
+    }
+}
+
+impl NegativeChain {
+    /// True when the block cannot change a pixel: both fixed stages are off and
+    /// the colour-balance stage is off or undecidable from catalog data.
+    pub fn is_inert(self) -> bool {
+        !self.film_negative_conversion
+            && !self.clamp_negative
+            && !matches!(self.color_balance_film_negative, Some(true))
+    }
+}
+
+impl BaseCharacteristics {
+    /// The `settings+0x11008` switch. Neither `.cop` nor the catalog carries a
+    /// column for it, so it is derived from the mode; the binary only ever
+    /// clears it (`0x1855D06`), never fills it from a stored value.
+    pub fn negative_switch(&self) -> bool {
+        self.processing_method.inserts_film_negative_conversion()
+    }
+
+    /// Stage gate for the negative block. `generation` is the document's engine
+    /// version. `color_balance_film_negative` is `None` for method 4 inside the
+    /// 1300 window because `0x16E85C0` also tests the per-layer gains, which
+    /// have no catalog column; only the renderer can settle it.
+    pub fn negative_chain(&self, generation: EngineGeneration) -> NegativeChain {
+        let block = self.negative_switch();
+        let color_balance = if block
+            && self.processing_method == TechnicalProcessingMethod::StandardFilmNegatives
+            && generation.builds_color_balance_film_negative()
+        {
+            None
+        } else {
+            Some(false)
+        };
+        NegativeChain {
+            film_negative_conversion: block,
+            clamp_negative: block,
+            color_balance_film_negative: color_balance,
+        }
     }
 }
 
@@ -123,6 +356,8 @@ impl TechnicalProcessingMethod {
 pub enum ToneCurvePreset {
     #[default]
     Auto,
+    DngStandard,
+    DngToneMapped,
     FilmStandard,
     FilmExtraShadow,
     FilmHighContrast,
@@ -130,8 +365,35 @@ pub enum ToneCurvePreset {
 }
 
 impl ToneCurvePreset {
-    pub const ALL: [Self; 5] =
-        [Self::Auto, Self::FilmStandard, Self::FilmExtraShadow, Self::FilmHighContrast, Self::Linear];
+    pub const ALL: [Self; 7] = [
+        Self::Auto,
+        Self::DngStandard,
+        Self::DngToneMapped,
+        Self::FilmStandard,
+        Self::FilmExtraShadow,
+        Self::FilmHighContrast,
+        Self::Linear,
+    ];
+
+    /// The family behind a `.fcrv` filename. `Linear Scientific` is a Linear
+    /// curve; DNG files use their own names.
+    pub fn from_film_curve(name: &str) -> Self {
+        if name.contains("DNG Tone Mapped") {
+            Self::DngToneMapped
+        } else if name.contains("DNG Standard") {
+            Self::DngStandard
+        } else if name.contains("ExtraShadow") {
+            Self::FilmExtraShadow
+        } else if name.contains("HighContrast") {
+            Self::FilmHighContrast
+        } else if name.contains("Film Standard") || name.contains("FilmStandard") {
+            Self::FilmStandard
+        } else if name.contains("Linear") {
+            Self::Linear
+        } else {
+            Self::Auto
+        }
+    }
 }
 
 // ───────────────────────────── White balance ─────────────────────────────
@@ -217,7 +479,7 @@ impl Default for WhiteBalance {
             kelvin: 5600.0,
             tint: 0.0,
             skin_tone: None,
-            gains: Some([1.0, 1.0, 1.0]),
+            gains: None,
         }
     }
 }
@@ -315,9 +577,19 @@ impl LevelsChannel {
     /// Maps a display-referred value through input points, midtone gamma, then
     /// output points. Both ends are clipped to the output range.
     pub fn map(&self, v: f32) -> f32 {
+        self.map_output(self.map_input(v))
+    }
+
+    /// Input points and midtone gamma only; the output pair is left at identity.
+    pub fn map_input(&self, v: f32) -> f32 {
         let span = (self.input_white - self.input_black).max(1e-3);
         let t = ((v - self.input_black) / span).clamp(0.0, 1.0);
-        let t = t.powf(1.0 / self.gamma.clamp(0.1, 10.0));
+        t.powf(1.0 / self.gamma.clamp(0.1, 10.0))
+    }
+
+    /// Output points only. Capture One's target levels are a separate stage
+    /// after the gradation curves, so the pipeline applies this half there.
+    pub fn map_output(&self, t: f32) -> f32 {
         self.output_black + t * (self.output_white - self.output_black)
     }
 }
@@ -349,10 +621,30 @@ impl Levels {
     /// Applies the per-channel levels first and the RGB master last, the order
     /// Capture One and Photoshop use for composite vs. single-channel edits.
     pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        self.apply_output(self.apply_input(rgb))
+    }
+
+    /// The input points and midtone gamma, i.e. everything before the curves.
+    pub fn apply_input(&self, rgb: [f32; 3]) -> [f32; 3] {
         [
-            self.rgb.map(self.red.map(rgb[0])),
-            self.rgb.map(self.green.map(rgb[1])),
-            self.rgb.map(self.blue.map(rgb[2])),
+            self.rgb.map_input(self.red.map_input(rgb[0])),
+            self.rgb.map_input(self.green.map_input(rgb[1])),
+            self.rgb.map_input(self.blue.map_input(rgb[2])),
+        ]
+    }
+
+    /// Capture One's target levels (stage 18, after `GradationCurves`):
+    /// `ApplyTargetLevelsCommon` reads only the `.x` scalar of `targetShadow`
+    /// and `targetHighlight` and applies one RGB-master affine,
+    /// `out = in * (highlight - shadow) + shadow`. The stored r/g/b
+    /// components have no read point in the native op.
+    pub fn apply_output(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let (shadow, highlight) = (self.rgb.output_black, self.rgb.output_white);
+        let gain = highlight - shadow;
+        [
+            rgb[0] * gain + shadow,
+            rgb[1] * gain + shadow,
+            rgb[2] * gain + shadow,
         ]
     }
 
@@ -632,13 +924,23 @@ pub fn c1_clarity_lowres_radius(radius: u32) -> u32 {
 pub struct Dehaze {
     /// 0 ..= 100.
     pub amount: f32,
-    /// Haze color the engine removes, linear sRGB.
+    /// Haze colour the engine removes, linear sRGB. `ZDEHAZECOLOR`, or the
+    /// colour `c1_model` resolved for the auto (`0;0;0`) sentinel.
     pub shadow_tone: [f32; 3],
+    /// `ZDEHAZELEVELLOW`: per-channel black point, 0 neutral.
+    pub level_low: [f32; 3],
+    /// `ZDEHAZELEVELHIGH`: per-channel white point, 1 neutral.
+    pub level_high: [f32; 3],
 }
 
 impl Default for Dehaze {
     fn default() -> Self {
-        Self { amount: 0.0, shadow_tone: [0.0, 0.0, 0.0] }
+        Self {
+            amount: 0.0,
+            shadow_tone: [0.0; 3],
+            level_low: [0.0; 3],
+            level_high: [1.0; 3],
+        }
     }
 }
 
@@ -915,6 +1217,10 @@ pub struct ColorEditor {
     pub advanced_bands: Vec<(u64, ColorBand)>,
     pub advanced: Vec<ColorRange>,
     pub skin: Vec<ColorRange>,
+    /// C1's MaxSmooth groups (`kind=3`). C1 renders them with the basic
+    /// `pie_smooth` window, but they cannot live in [`Self::basic`]: that is a
+    /// fixed eight-slot array and a real layer already fills all eight slots.
+    pub max_smooth: Vec<ColorRange>,
 }
 
 impl Default for ColorEditor {
@@ -930,6 +1236,7 @@ impl Default for ColorEditor {
             advanced_bands: Vec::new(),
             advanced: Vec::new(),
             skin: Vec::new(),
+            max_smooth: Vec::new(),
         }
     }
 }
@@ -1023,34 +1330,164 @@ impl GrainKind {
         Self::TabularGrain,
         Self::HarshGrain,
     ];
+
+    /// C1 runs the erf Gaussian blur for Soft/Cubic/Tabular/Harsh only.
+    /// FineGrain and SilverRich are per-pixel noise and never build that kernel.
+    pub fn uses_erf_blur(self) -> bool {
+        !matches!(self, Self::FineGrain | Self::SilverRich)
+    }
+
+    /// Blur-scale multiplier C1 applies on top of the shared sigma curve:
+    /// Tabular 0.8, Harsh 1.2, everything else 1.0.
+    pub fn sigma_k(self) -> f32 {
+        match self {
+            Self::TabularGrain => 0.8,
+            Self::HarshGrain => 1.2,
+            _ => 1.0,
+        }
+    }
+
+    /// `ZFILMGRAINTYPE`. C1's jump table has six entries; every other value
+    /// (including the >9 some catalogs carry) falls through to type 3.
+    pub fn from_c1_type(value: i32) -> Self {
+        match value {
+            0 => Self::FineGrain,
+            1 => Self::SilverRich,
+            2 => Self::SoftGrain,
+            3 => Self::CubicGrain,
+            4 => Self::TabularGrain,
+            5 => Self::HarshGrain,
+            _ => Self::CubicGrain,
+        }
+    }
+}
+
+fn density_is_zero(value: &f32) -> bool {
+    *value == 0.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FilmGrain {
     pub kind: GrainKind,
-    /// 0 ..= 100.
+    /// `ZFILMGRAINAMOUNT`, 0 ..= 100.
     pub impact: f32,
-    /// 0 ..= 100.
+    /// `ZFILMGRAINGRANULARITY`, 0 ..= 100.
     pub granularity: f32,
+    /// `ZFILMGRAINDENSITY`, 0 ..= 100. C1 reads it only for
+    /// [`GrainKind::FineGrain`]; the other five kinds recompute the internal
+    /// density from `granularity`, so this slider is ignored there.
+    /// See [`Self::density_is_effective`].
+    #[serde(skip_serializing_if = "density_is_zero")]
+    pub density: f32,
 }
 
 impl Default for FilmGrain {
     fn default() -> Self {
-        Self { kind: GrainKind::FineGrain, impact: 0.0, granularity: 50.0 }
+        Self { kind: GrainKind::FineGrain, impact: 0.0, granularity: 50.0, density: 0.0 }
+    }
+}
+
+impl FilmGrain {
+    /// Whether C1 actually feeds `density` into the grain generator.
+    pub fn density_is_effective(&self) -> bool {
+        self.kind == GrainKind::FineGrain
+    }
+
+    /// C1's post-grain erf-blur sigma in image pixels.
+    ///
+    /// `sigma = k * (Amount / 100) * 2^(0.01875 * Granularity - 1.375)`, with
+    /// `k` from [`GrainKind::sigma_k`]. FineGrain and SilverRich do not run the
+    /// blur, and Amount <= 0 disables grain, so both cases return 0.
+    pub fn sigma_px(&self) -> f32 {
+        if !self.kind.uses_erf_blur() || !self.impact.is_finite() || self.impact <= 0.0 {
+            return 0.0;
+        }
+        let amount = (self.impact / 100.0).clamp(0.0, 1.0);
+        let granularity =
+            if self.granularity.is_finite() { self.granularity.clamp(0.0, 100.0) } else { 0.0 };
+        self.kind.sigma_k() * amount * 2f32.powf(0.01875 * granularity - 1.375)
+    }
+
+    /// Visible grain diameter in pixels (Gaussian FWHM = 2.355 sigma).
+    pub fn diameter_px(&self) -> f32 {
+        2.355 * self.sigma_px()
+    }
+
+    /// The internal density C1 actually feeds to the generator. FineGrain uses
+    /// the slider; the other five recompute it from granularity, so moving the
+    /// Density slider changes nothing there.
+    pub fn effective_density(&self) -> f32 {
+        let g = self.granularity.clamp(0.0, 100.0);
+        match self.kind {
+            GrainKind::FineGrain => self.density.clamp(0.0, 100.0),
+            GrainKind::SilverRich => (0.5625 * g + 43.75).trunc(),
+            GrainKind::SoftGrain | GrainKind::TabularGrain => (0.375 * g + 37.5).trunc(),
+            GrainKind::CubicGrain => (0.5625 * g + 18.75).trunc(),
+            GrainKind::HarshGrain => (0.375 * g + 62.5).trunc(),
+        }
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Moire {
-    /// 0 ..= 100.
+    /// `ZMOIRE` component 0, 0 ..= 100.
     pub amount: f32,
-    /// 0 ..= 100.
+    /// `ZMOIRE` component 1. C1 calls this `IB_F_MOIRE_RADIUS`: the filter
+    /// support in image pixels, not a 0..100 strength. The engine clamps it to
+    /// the kernel's 40-sample grid.
     pub pattern: f32,
 }
 
 // ───────────────────────────── Lens / geometry ─────────────────────────────
+
+/// `ZLENSCHROMABRORIGIN`: where the two-curve lateral CA data came from.
+///
+/// `None` means no active source, so the stored curves are not applied; C1's
+/// `ChromaticAberrationOrigin` uses the same 0/1/2 order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaOrigin {
+    #[default]
+    None,
+    LensDb,
+    Custom,
+}
+
+/// `ZLENSCHROMAFRINGING`: six per-channel lateral-fringing curves.
+///
+/// Each curve is `(radius, value)` control points. The radius is normalized to
+/// the frame's half diagonal by the profile reader; `shift` is a radial offset
+/// in reference pixels, `ra` a dimensionless radial gain, and `strength` the
+/// blend weight (0 leaves the pixels alone). C1 stores the six curves for both
+/// channels in `IC_LensChromaFringing`; no kernel that consumes all six has
+/// been recovered, so `ra` and `strength` follow the names only (grade C).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaFringing {
+    pub red_shift: Vec<(f32, f32)>,
+    pub red_ra: Vec<(f32, f32)>,
+    pub red_strength: Vec<(f32, f32)>,
+    pub blue_shift: Vec<(f32, f32)>,
+    pub blue_ra: Vec<(f32, f32)>,
+    pub blue_strength: Vec<(f32, f32)>,
+}
+
+impl CaFringing {
+    /// True when none of the six curves carries a point.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.red_shift,
+            &self.red_ra,
+            &self.red_strength,
+            &self.blue_shift,
+            &self.blue_ra,
+            &self.blue_strength,
+        ]
+        .iter()
+        .all(|curve| curve.is_empty())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1063,23 +1500,57 @@ pub struct LensCorrection {
     pub use_profile: bool,
     /// 0 ..= 100 for the correction amounts.
     pub distortion: f32,
+    /// `ZLENSRADIALBLUR`'s amount, 0 ..= 120; below 0.5 the op is identity.
     pub sharpness_falloff: f32,
+    /// `ZLENSRADIALBLUR`'s two falloff curves and its `valid` flag.
+    pub radial_blur: RadialBlur,
     pub light_falloff: f32,
+    /// `ZLENSLCCLIGHTFALLOFFAMOUNT`: Lens Calibration "Uniform Light", 0 ..= 120.
+    pub uniform_light: f32,
+    /// `ZLENSLCCLIGHTFALLOFF` gates `uniform_light`; off leaves the frame alone.
+    pub uniform_light_enabled: bool,
+    /// `ZLENSDUSTREMOVALENABLED`: apply the LCC dust patches.
+    pub dust_removal_enabled: bool,
+    /// Rectangles read from the LCC's `SpotRemoval.SpotData`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dust_patches: Vec<crate::DustPatch>,
+    /// The LCC's `SpotData` plane: one byte per pixel inside each patch.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dust_gain: Vec<u8>,
     pub chromatic_aberration: bool,
     /// C1's red/blue CA splines, normalized to the first radius.
     pub ca_red_points: Vec<(f32, f32)>,
     pub ca_blue_points: Vec<(f32, f32)>,
+    /// `ZLENSCHROMABRORIGIN`: which spline set supplied the two-curve CA data.
+    pub ca_origin: CaOrigin,
+    /// `ZLENSCHROMAFRINGING`: the profile's six lateral-fringing curves.
+    pub ca_fringing: CaFringing,
     pub purple_fringing: f32,
+    /// `ZLENSDIFFRACTIONCORRECTIONENABLED`: aperture-dependent Airy blur.
+    pub diffraction_enabled: bool,
+    /// f-number for [`Self::diffraction_enabled`]; `0` means the capture has none.
+    pub aperture: f32,
     pub hide_distorted_areas: bool,
     /// -100 ..= 100, a manual movement/shift of the optical center.
     pub shift_x: f32,
     pub shift_y: f32,
+    /// `ZLENSTILT`, degrees; the renderer clamps to +-45.
+    pub tilt: f32,
     /// Curves Capture One's built-in "Manufacturer Profile" (type 15) keeps on
     /// the variant instead of `lensDatabase.cdx`, in sensor-plane micrometres.
     pub manufacturer: Option<ManufacturerCurves>,
     /// Camera mount, so the manufacturer curves have a half diagonal to
     /// normalize against.
     pub mount: Option<String>,
+}
+
+/// Capture One's sharpness-falloff curves, `ZLENSRADIALBLUR` fields 1 and 2.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RadialBlur {
+    pub radial: Vec<(f32, f32)>,
+    pub transverse: Vec<(f32, f32)>,
+    pub valid: bool,
 }
 
 /// `(r_um, Δr_um)` radial curves carried by a Manufacturer Profile variant.
@@ -1098,14 +1569,25 @@ impl Default for LensCorrection {
             use_profile: false,
             distortion: 0.0,
             sharpness_falloff: 0.0,
+            radial_blur: RadialBlur::default(),
             light_falloff: 0.0,
+            uniform_light: 0.0,
+            uniform_light_enabled: false,
+            dust_removal_enabled: false,
+            dust_patches: Vec::new(),
+            dust_gain: Vec::new(),
             chromatic_aberration: false,
             ca_red_points: Vec::new(),
             ca_blue_points: Vec::new(),
+            ca_origin: CaOrigin::None,
+            ca_fringing: CaFringing::default(),
             purple_fringing: 0.0,
+            diffraction_enabled: false,
+            aperture: 0.0,
             hide_distorted_areas: true,
             shift_x: 0.0,
             shift_y: 0.0,
+            tilt: 0.0,
             manufacturer: None,
             mount: None,
         }
@@ -1177,13 +1659,65 @@ impl AspectRatio {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Keystone {
-    /// -100 ..= 100 for both axes.
+    /// Slider values, -100 ..= 100 for both axes. These are C1's H/V frame;
+    /// [`Keystone::set_hv`] converts them to the stored tiltX/tiltY.
     pub vertical: f32,
     pub horizontal: f32,
     /// 0 ..= 100, how strongly the correction is applied.
     pub amount: f32,
     /// -50 ..= 50, compensates the stretch the correction introduces.
     pub aspect: f32,
+    /// `ZGEOMETRYKEYSTONESKEW`, degrees, -45 ..= 45.
+    pub skew: f32,
+    /// `ZGEOMETRYKEYSTONEFOCALLENGTH`: focal mm / sensor diagonal mm. `0`
+    /// means unknown; C1 then uses `1` as the tilt scale.
+    pub focal_length: f32,
+    /// `IC_KeystoneRaw.flags` (`IC_ProcessSettings+0xfa94`). Bit0 makes
+    /// `SetGeoCfg` force `c = 0`, i.e. `UpdateGeo` takes its unnormalised
+    /// branch. No C1 code writes the field and it has no `.cos` key, so it
+    /// stays at `IB_I_KEYSTONE_FLAG_DEFAULT` (0).
+    pub flags: u32,
+}
+
+impl Keystone {
+    /// C1's `c` from `SetGeoCfg`: `fLen > 0 ? fLen : 1`, forced to `0` by
+    /// `flags` bit0. `c = 0` only drops the `fLen` multiply (and the
+    /// `1/sqrt(1+L²)` cosine compensation, which this weak perspective does
+    /// not model), so the scale consumed here is `1`.
+    pub fn tilt_scale(&self) -> f32 {
+        if self.flags & 1 != 0 {
+            return 1.0;
+        }
+        let f = self.focal_length;
+        if f.is_finite() && f > 0.0 { f } else { 1.0 }
+    }
+
+    /// Stored tilt → H/V sliders (`IC_KeystoneGet`). The storage frame is the
+    /// image frame; rotation and the H/V flip sign sit between the two.
+    pub fn hv(&self, rotation_deg: f32, flip_h: bool, flip_v: bool) -> (f32, f32) {
+        let r = if rotation_deg.is_finite() { rotation_deg.to_radians() } else { 0.0 };
+        let (s, c) = r.sin_cos();
+        let h = self.horizontal * c - self.vertical * s;
+        let v = self.horizontal * s + self.vertical * c;
+        (if flip_v { -h } else { h }, if flip_h { -v } else { v })
+    }
+
+    /// H/V sliders → stored tilt (`IC_KeystoneSet`, the inverse of [`Self::hv`]).
+    pub fn set_hv(&mut self, h: f32, v: f32, rotation_deg: f32, flip_h: bool, flip_v: bool) {
+        let r = if rotation_deg.is_finite() { rotation_deg.to_radians() } else { 0.0 };
+        let (s, c) = r.sin_cos();
+        let (h, v) = (if flip_v { -h } else { h }, if flip_h { -v } else { v });
+        self.horizontal = h * c + v * s;
+        self.vertical = v * c - h * s;
+    }
+
+    /// Stored tilt after the `fLen` scale, i.e. the vector the matrix consumes.
+    /// Camera data writes `tilt = 100·tan(pitch)/fLen`, so this cancels back to
+    /// `100·tan(pitch)` and the correction is independent of the lens.
+    pub fn scaled_tilt(&self) -> (f32, f32) {
+        let c = self.tilt_scale();
+        (self.horizontal * c, self.vertical * c)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1195,7 +1729,14 @@ pub struct Geometry {
     pub orientation: u8,
     pub flip_horizontal: bool,
     pub flip_vertical: bool,
+    /// `ZCROPOUTSIDEIMAGE`: C1's `AllowCropOutsideOfImage` gate. When set the
+    /// stored crop rectangle may extend past the image bounds and is not
+    /// clamped; the out-of-image pixels are the renderer's fill.
+    pub crop_outside_image: bool,
     pub crop: NormRect,
+    /// `ZCANVASSIZE`: the pixel frame `crop` is normalized against. `[0, 0]`
+    /// means the canvas is the oriented image.
+    pub canvas: [f32; 2],
     pub aspect: AspectRatio,
     pub portrait: bool,
     pub keystone: Keystone,
@@ -1208,7 +1749,9 @@ impl Default for Geometry {
             orientation: 0,
             flip_horizontal: false,
             flip_vertical: false,
+            crop_outside_image: false,
             crop: NormRect::FULL,
+            canvas: [0.0, 0.0],
             aspect: AspectRatio::Unconstrained,
             portrait: false,
             keystone: Keystone { amount: 100.0, ..Default::default() },
@@ -1616,6 +2159,46 @@ mod tests {
     }
 
     #[test]
+    fn keystone_hv_roundtrips_through_rotation_and_flip() {
+        for rot in [0.0, 90.0, 270.0, 45.0, -12.5] {
+            for (fh, fv) in [(false, false), (true, false), (false, true), (true, true)] {
+                let stored = Keystone { horizontal: 30.0, vertical: -20.0, ..Keystone::default() };
+                let (h, v) = stored.hv(rot, fh, fv);
+                let mut back = Keystone::default();
+                back.set_hv(h, v, rot, fh, fv);
+                assert!((back.horizontal - stored.horizontal).abs() < 1e-4, "{rot} {fh} {fv} h");
+                assert!((back.vertical - stored.vertical).abs() < 1e-4, "{rot} {fh} {fv} v");
+            }
+        }
+        // The 90° sample from the UI report: h = -tiltY, v = tiltX, then flip_h negates v.
+        let stored = Keystone { horizontal: 30.0, vertical: -20.0, ..Keystone::default() };
+        for (got, want) in [
+            (stored.hv(90.0, false, false), (20.0, 30.0)),
+            (stored.hv(90.0, true, false), (20.0, -30.0)),
+            (stored.hv(90.0, false, true), (-20.0, 30.0)),
+        ] {
+            assert!((got.0 - want.0).abs() < 1e-4 && (got.1 - want.1).abs() < 1e-4, "{got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn focal_length_scale_is_c1_fallback_one() {
+        assert_eq!(Keystone { focal_length: 0.0, ..Keystone::default() }.tilt_scale(), 1.0);
+        assert_eq!(Keystone { focal_length: -0.3, ..Keystone::default() }.tilt_scale(), 1.0);
+        assert_eq!(Keystone { focal_length: 0.35, ..Keystone::default() }.tilt_scale(), 0.35);
+    }
+
+    /// `flags` bit0 (`IC_ProcessSettings+0xfa94`) makes `SetGeoCfg` force `c=0`,
+    /// which drops the `fLen` factor in `UpdateGeo`.
+    #[test]
+    fn flags_bit0_drops_the_focal_length_scale() {
+        let k = Keystone { focal_length: 0.35, flags: 1, ..Keystone::default() };
+        assert_eq!(k.tilt_scale(), 1.0);
+        assert_eq!(Keystone { flags: 2, focal_length: 0.35, ..Keystone::default() }.tilt_scale(), 0.35);
+        assert_eq!(Keystone::default().tilt_scale(), 1.0);
+    }
+
+    #[test]
     fn levels_reference_curve_samples_c1_ui() {
         // C1 UI: input 10 / 240, midtone 0.13 (= gamma 1.2), output 0 / 255.
         let channel = LevelsChannel {
@@ -1628,5 +2211,73 @@ mod tests {
         for (input, expected) in samples {
             assert!(close(channel.map(input / 255.0), expected), "{input} -> {}", channel.map(input / 255.0));
         }
+    }
+
+    fn grain(kind: GrainKind, impact: f32, granularity: f32) -> FilmGrain {
+        FilmGrain { kind, impact, granularity, density: 0.0 }
+    }
+
+    #[test]
+    fn grain_sigma_and_diameter_follow_the_c1_curve() {
+        for (granularity, sigma, diameter) in
+            [(0.0, 0.386, 0.91), (50.0, 0.738, 1.74), (100.0, 1.414, 3.33)]
+        {
+            let g = grain(GrainKind::SoftGrain, 100.0, granularity);
+            assert!((g.sigma_px() - sigma).abs() < 0.002, "g={granularity}: {}", g.sigma_px());
+            assert!(
+                (g.diameter_px() - diameter).abs() < 0.01,
+                "g={granularity}: {}",
+                g.diameter_px()
+            );
+        }
+    }
+
+    #[test]
+    fn grain_type_scales_sigma_and_fine_grain_skips_the_blur() {
+        let unit = grain(GrainKind::SoftGrain, 100.0, 50.0).sigma_px();
+        assert!(close(grain(GrainKind::CubicGrain, 100.0, 50.0).sigma_px(), unit));
+        assert!(close(grain(GrainKind::TabularGrain, 100.0, 50.0).sigma_px(), unit * 0.8));
+        assert!(close(grain(GrainKind::HarshGrain, 100.0, 50.0).sigma_px(), unit * 1.2));
+        for kind in [GrainKind::FineGrain, GrainKind::SilverRich] {
+            assert_eq!(grain(kind, 100.0, 50.0).sigma_px(), 0.0, "{kind:?}");
+            assert_eq!(grain(kind, 100.0, 50.0).diameter_px(), 0.0, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn grain_amount_sets_sigma_and_zero_turns_it_off() {
+        let full = grain(GrainKind::SoftGrain, 100.0, 50.0).sigma_px();
+        assert!(close(grain(GrainKind::SoftGrain, 50.0, 50.0).sigma_px(), full * 0.5));
+        assert_eq!(grain(GrainKind::SoftGrain, 0.0, 50.0).sigma_px(), 0.0);
+    }
+
+    #[test]
+    fn grain_density_only_applies_to_fine_grain() {
+        let mut g = FilmGrain { density: 70.0, ..FilmGrain::default() };
+        assert!(g.density_is_effective());
+        for kind in [
+            GrainKind::SilverRich,
+            GrainKind::SoftGrain,
+            GrainKind::CubicGrain,
+            GrainKind::TabularGrain,
+            GrainKind::HarshGrain,
+        ] {
+            g.kind = kind;
+            assert!(!g.density_is_effective(), "{kind:?}");
+        }
+        // Density is not part of the sigma curve; changing it must not move the blur.
+        let mut soft = grain(GrainKind::SoftGrain, 100.0, 50.0);
+        let sigma = soft.sigma_px();
+        soft.density = 100.0;
+        assert_eq!(soft.sigma_px(), sigma);
+    }
+
+    #[test]
+    fn default_grain_is_a_no_op_and_keeps_serialization_stable() {
+        let g = FilmGrain::default();
+        assert_eq!(g.sigma_px(), 0.0);
+        assert_eq!(g.diameter_px(), 0.0);
+        let text = serde_json::to_string(&AdjustmentSet::default()).expect("serializes");
+        assert!(!text.contains("\"density\""), "{text}");
     }
 }
