@@ -6,6 +6,13 @@
 //! `LinearGradient` parameter block. Masks that store pixels carry a `Map`
 //! grid (one byte per 64×64 tile) plus a shared `Blk`/`Idx` block table;
 //! [`read_comask_masks`] turns that into full-canvas planes.
+//!
+//! `ComaskMask::uuid` is the `UserInfo/Info` 36-character UUID that
+//! `ZVARIANTLAYER.ZMASKUUID` (or a `ZRETOUCHINGLAYER.*MASKUUID` column) stores;
+//! `c1_masks::C1MaskLayer::comask_metadata` performs that join. The numeric
+//! `MaskIndex` is only the record ordinal. Repair layers additionally carry a
+//! `Cover` block with heal/clone arrows ([`ComaskCover`]). Nothing in this
+//! module is wired into the render path.
 
 use serde_json::{Map, Value};
 use std::fmt;
@@ -44,8 +51,36 @@ pub struct ComaskMask {
     pub linear_gradient: Option<[f32; 5]>,
     /// Four-byte value following `RandSeed`, when present.
     pub rand_seed: Option<u32>,
+    /// `Cover` block of a repair layer: heal/clone arrows, one per stroke.
+    pub cover: Option<ComaskCover>,
     /// Opaque raster/index section spans; pixels are not decoded.
     pub rasters: Vec<ComaskRaster>,
+}
+
+/// A `Cover` chunk: `Hdr = u16 version, u16 mask_index, u32 cover_type,
+/// u32 count`, followed by `count` pairs of 24-byte `Vec` + `Data`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComaskCover {
+    pub version: u16,
+    pub mask_index: u16,
+    /// `IC_MaskCoverType`: 1 clone, 2 heal.
+    pub cover_type: u32,
+    pub count: u32,
+    pub arrows: Vec<ComaskArrow>,
+}
+
+/// One 24-byte `Cover/Vec`: `u32 type, f32 src.x, src.y, f32 dst.x, dst.y,
+/// u32 flags`. Source and destination are raw image pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ComaskArrow {
+    /// `IC_MaskCoverArrowType`: 1 clone, 2 heal.
+    pub arrow_type: u32,
+    pub src: [f32; 2],
+    pub dst: [f32; 2],
+    /// `IC_MaskCoverArrowFlags` bits (`Approximate=2`, `AutoPlacement=8`, ...).
+    pub flags: u32,
+    /// Byte length of the `Data` chunk that follows this `Vec`.
+    pub data_len: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +203,7 @@ impl ComaskDocument {
             let comp_params = comp_params(segment)?;
             let linear_gradient = linear_gradient(segment)?;
             let rand_seed = rand_seed(segment);
+            let cover = cover(segment);
             let rasters = raster_spans(segment, start);
             masks.push(ComaskMask {
                 index,
@@ -178,6 +214,7 @@ impl ComaskDocument {
                 comp_params,
                 linear_gradient,
                 rand_seed,
+                cover,
                 rasters,
             });
         }
@@ -239,6 +276,11 @@ pub struct MaskPlane {
 }
 
 impl MaskPlane {
+    /// 8-bit alpha plane, the form Capture One's `IC_MaskSampleInt` returns.
+    pub fn to_u8(&self) -> Vec<u8> {
+        self.data.iter().map(|v| (v * 255.0).round() as u8).collect()
+    }
+
     /// Inclusive `(x0, y0, x1, y1)` of non-zero pixels.
     pub fn bbox(&self) -> Option<(usize, usize, usize, usize)> {
         let mut bounds: Option<(usize, usize, usize, usize)> = None;
@@ -269,6 +311,39 @@ fn find_from(bytes: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     bytes.get(start..)?.windows(needle.len()).position(|w| w == needle).map(|i| start + i)
 }
 
+/// Reads the big-endian base-64 varint used by the XCon chunks. `0xFF` bytes
+/// are padding; a first byte below `0x40` (or above `0x7F`) is the whole value,
+/// otherwise bit 6 marks the final group.
+fn read_varint(bytes: &[u8], mut i: usize) -> Option<(usize, usize)> {
+    while *bytes.get(i)? == 0xFF {
+        i += 1;
+    }
+    let first = *bytes.get(i)?;
+    i += 1;
+    if first < 0x40 || first >= 0x80 {
+        return Some((first as usize, i));
+    }
+    let mut value = (first & 0x3F) as usize;
+    for _ in 0..9 {
+        let byte = *bytes.get(i)?;
+        i += 1;
+        value = (value << 6) | (byte & 0x3F) as usize;
+        if byte & 0x40 != 0 {
+            return Some((value, i));
+        }
+    }
+    None
+}
+
+/// Payload of the chunk whose name starts at `at`, skipping the two flag bytes
+/// and the size varint.
+fn chunk_payload_at<'a>(bytes: &'a [u8], at: usize, name_len: usize) -> Option<(&'a [u8], usize)> {
+    let size_at = at.checked_add(name_len)?.checked_add(2)?;
+    let (size, start) = read_varint(bytes, size_at)?;
+    let end = start.checked_add(size)?;
+    Some((bytes.get(start..end)?, end))
+}
+
 /// Payload of a `Hdr` field: `Hdr 00 22 FF <len>` followed by `<len>` bytes.
 fn hdr_payload(bytes: &[u8], at: usize) -> Option<&[u8]> {
     if bytes.get(at..at + 3)? != b"Hdr" {
@@ -280,6 +355,42 @@ fn hdr_payload(bytes: &[u8], at: usize) -> Option<&[u8]> {
     }
     let len = marker[3] as usize;
     bytes.get(at + 7..at + 7 + len)
+}
+
+/// Parses the `Cover` chunk of a heal/clone repair layer.
+///
+/// The header is `u16 version, u16 mask_index, u32 cover_type, u32 count`;
+/// each arrow is a 24-byte `Vec` followed by an opaque `Data` stroke record.
+/// A truncated arrow stops the scan but still returns what was decoded.
+fn cover(segment: &[u8]) -> Option<ComaskCover> {
+    let at = find(segment, b"Cover")?;
+    let hdr_at = find_from(segment, b"Hdr", at)?;
+    let (hdr, mut cursor) = chunk_payload_at(segment, hdr_at, 3)?;
+    if hdr.len() < 12 {
+        return None;
+    }
+    let version = u16::from_le_bytes([hdr[0], hdr[1]]);
+    let mask_index = u16::from_le_bytes([hdr[2], hdr[3]]);
+    let cover_type = u32_at(hdr, 4)?;
+    let count = u32_at(hdr, 8)?;
+    let mut arrows = Vec::new();
+    while arrows.len() < count as usize {
+        let Some(vec_at) = find_from(segment, b"Vec", cursor) else { break };
+        let Some((vec, vec_end)) = chunk_payload_at(segment, vec_at, 3) else { break };
+        if vec.len() < 24 {
+            break;
+        }
+        let Some(arrow_type) = u32_at(vec, 0) else { break };
+        let Some(src) = floats_at::<2>(vec, 4) else { break };
+        let Some(dst) = floats_at::<2>(vec, 12) else { break };
+        let Some(flags) = u32_at(vec, 20) else { break };
+        let data = find_from(segment, b"Data", vec_end)
+            .and_then(|data_at| chunk_payload_at(segment, data_at, 4));
+        let data_len = data.map(|(payload, _)| payload.len()).unwrap_or(0);
+        arrows.push(ComaskArrow { arrow_type, src, dst, flags, data_len });
+        cursor = data.map(|(_, end)| end).unwrap_or(vec_end);
+    }
+    Some(ComaskCover { version, mask_index, cover_type, count, arrows })
 }
 
 /// Decodes every mask that stores a `Map` grid into a full-canvas plane.
@@ -402,10 +513,7 @@ fn fill_gradient(plane: &mut MaskPlane, gradient: [f32; 5]) {
 /// byte as a literal cell value.
 fn decode_mask_grid(segment: &[u8], cols: usize, rows: usize) -> Option<(usize, Vec<u8>)> {
     let at = find(segment, b"Map\x00\x00")?;
-    // shortcut: the chunk header `41 xx yy` precedes the cells in every sample
-    // map; if another producer emits a different header length the cell values
-    // fail validation instead of silently shifting the grid.
-    let cells = segment.get(at + 5 + 3..)?;
+    let (cells, _) = chunk_payload_at(segment, at, 3)?;
     let want = cols.checked_mul(rows)?;
     let mut grid = Vec::with_capacity(want);
     let mut first_block = None;
@@ -596,11 +704,13 @@ fn decode_packbits(src: &[u8]) -> Option<[u8; 4096]> {
         let b = *src.get(i)?;
         i += 1;
         if b < 0x40 {
-            let n = b as usize;
+            // C1 copies `token + 1` bytes and truncates the last run at 4096.
+            let n = b as usize + 1;
             let chunk = src.get(i..i + n)?;
-            out.get_mut(o..o + n)?.copy_from_slice(chunk);
+            let take = n.min(4096 - o);
+            out.get_mut(o..o + take)?.copy_from_slice(&chunk[..take]);
             i += n;
-            o += n;
+            o += take;
         } else if b <= 0x7f {
             let n = (b - 0x3f) as usize;
             let prev = out[o - 1];
@@ -1292,9 +1402,132 @@ mod tests {
 
     #[test]
     fn packbits_variant_decodes_copy_and_repeat() {
-        let tile = decode_block_payload(1, &[0x07, 0x02, 10, 11, 0x41, 0x80]).unwrap();
+        let tile = decode_block_payload(1, &[0x07, 0x01, 10, 11, 0x41, 0x80]).unwrap();
         assert_eq!(&tile[..6], &[7, 10, 11, 11, 11, 0]);
         assert!(tile[5..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn packbits_truncates_the_last_literal_at_the_tile_end() {
+        let mut src = vec![0u8];
+        for _ in 0..63 {
+            src.push(0x3F);
+            src.extend(std::iter::repeat(7).take(64));
+        }
+        src.push(0x3F);
+        src.extend(std::iter::repeat(9).take(64));
+        src.push(0x80);
+        let tile = decode_block_payload(1, &src).unwrap();
+        assert!(tile[..4033].iter().all(|&v| v == 0 || v == 7));
+        assert!(tile[4033..].iter().all(|&v| v == 9));
+    }
+
+    #[test]
+    fn unpack_plane_expands_1_2_and_4_bit_groups() {
+        let mut out = [0u8; 8];
+        assert_eq!(unpack_plane(&[0b1011_0110], 0, 4, 1, &mut out, 0), Some(1));
+        assert_eq!(&out[..4], &[0, 1, 1, 0]);
+        assert_eq!(unpack_plane(&[0b1110_0100], 0, 2, 2, &mut out, 0), Some(1));
+        assert_eq!(&out[..2], &[0, 1]);
+        assert_eq!(unpack_plane(&[0x21], 0, 2, 4, &mut out, 0), Some(1));
+        assert_eq!(&out[..2], &[1, 2]);
+
+        // Exactly one 16-byte block of 2-bit groups exercises the wide loop.
+        let plane: Vec<u8> = (0..16).collect();
+        let mut out = [0u8; 64];
+        assert_eq!(unpack_plane(&plane, 0, 64, 2, &mut out, 0), Some(16));
+        for j in 0..4 {
+            for i in 0..16 {
+                assert_eq!(out[j * 16 + i], ((i >> (j * 2)) & 3) as u8);
+            }
+        }
+    }
+
+    fn cover_fixture(arrow_count: u32, truncated: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        push(&mut b, b"Cover\x00\x22\x00");
+        push(&mut b, b"Hdr\x00\x22\xff\x0c");
+        push(&mut b, &[2, 0, 3, 0]);
+        push(&mut b, &2u32.to_le_bytes());
+        push(&mut b, &arrow_count.to_le_bytes());
+        for (kind, src, dst, flags) in [
+            (1u32, [10.5f32, 20.25], [30.5f32, 40.75], 0x18u32),
+            (2, [1.0, 2.0], [3.0, 4.0], 0),
+        ]
+        .into_iter()
+        .take(arrow_count as usize)
+        {
+            push(&mut b, b"Vec\x00\x22\xff\x18");
+            push(&mut b, &kind.to_le_bytes());
+            push(&mut b, &src[0].to_le_bytes());
+            push(&mut b, &src[1].to_le_bytes());
+            push(&mut b, &dst[0].to_le_bytes());
+            push(&mut b, &dst[1].to_le_bytes());
+            push(&mut b, &flags.to_le_bytes());
+            if !truncated {
+                push(&mut b, b"Data\x00\x22\x03\xaa\xbb\xcc");
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn cover_parses_clone_and_heal_arrows() {
+        let cover = cover(&cover_fixture(2, false)).unwrap();
+        assert_eq!((cover.version, cover.mask_index, cover.cover_type, cover.count), (2, 3, 2, 2));
+        assert_eq!(cover.arrows.len(), 2);
+        let clone = cover.arrows[0];
+        assert_eq!(clone.arrow_type, 1);
+        assert_eq!((clone.src, clone.dst, clone.flags, clone.data_len), ([10.5, 20.25], [30.5, 40.75], 0x18, 3));
+        assert_eq!(cover.arrows[1].arrow_type, 2);
+        assert_eq!(cover.arrows[1].data_len, 3);
+    }
+
+    #[test]
+    fn cover_stops_at_a_truncated_arrow_without_panicking() {
+        let parsed = cover(&cover_fixture(2, true)).unwrap();
+        assert_eq!(parsed.arrows.len(), 2);
+        assert!(parsed.arrows.iter().all(|a| a.data_len == 0));
+        let mut cut = cover_fixture(1, false);
+        cut.truncate(cut.len() - 20);
+        assert_eq!(cover(&cut).map(|c| c.arrows.len()), Some(0));
+        assert!(cover(b"Cover\x00\x22\x00Hdr\x00\x22\xff\x0c\x02\x00").is_none());
+    }
+
+    const FIXTURE: &[u8] = include_bytes!("../testdata/comask/decode-fixture.comask");
+    const FIXTURE_REFS: &[u8] = include_bytes!("../testdata/comask/reference-planes.bin");
+
+    /// Five 192x128 crops of the real sample, decoded against Capture One's
+    /// own `IC_MaskSampleInt` planes. No catalog or installation needed.
+    #[test]
+    fn fixture_planes_match_capture_one_references_byte_for_byte() {
+        let planes = read_comask_masks(FIXTURE).unwrap();
+        let uuids = [
+            "24391591-4129-4c9f-a9f5-bb4dd4c41289",
+            "d7ebf169-4d9f-41fe-b264-87f8cae0f083",
+            "6b96b29b-326f-4914-a7cd-56ffa01c881e",
+            "cf7a832a-6002-4543-aba0-ccdf30d1242b",
+            "7c423e46-c999-440c-a71e-09d1139d8a7e",
+        ];
+        let blocks = [6usize, 6, 5, 6, 6];
+        assert_eq!(planes.len(), 5);
+        let plane_len = 192 * 128;
+        assert_eq!(FIXTURE_REFS.len(), plane_len * planes.len());
+        for (i, plane) in planes.iter().enumerate() {
+            assert_eq!((plane.width, plane.height), (192, 128));
+            assert_eq!(plane.uuid.as_deref(), Some(uuids[i]));
+            assert_eq!((plane.blocks, plane.decoded_blocks, plane.failed_blocks), (blocks[i], blocks[i], 0));
+            let want = &FIXTURE_REFS[i * plane_len..(i + 1) * plane_len];
+            assert_eq!(plane.to_u8(), want, "mask {}", plane.mask_index);
+        }
+        assert_eq!(planes.iter().map(|p| p.mask_index).collect::<Vec<_>>(), vec![0, 1, 2, 5, 6]);
+    }
+
+    #[test]
+    fn truncated_fixture_returns_an_error_instead_of_panicking() {
+        for cut in [0, 16, 200, 1000, FIXTURE.len() - 10] {
+            assert!(read_comask_masks(&FIXTURE[..cut]).is_err(), "cut {cut}");
+        }
     }
 
     #[test]

@@ -52,13 +52,14 @@ pub fn source_status(engine: &dyn ImageEngine, image: ImageId) -> Option<String>
     engine.source_status(image)
 }
 
-pub use aurora_engine::{HdrOptions, PanoramaOptions, Projection};
+pub use aurora_engine::{DeghostMode, HdrOptions, PanoramaOptions, Projection};
 
 pub fn projection_label(projection: Projection) -> &'static str {
     match projection {
         Projection::Spherical => t("Spherical", "球面"),
         Projection::Cylindrical => t("Cylindrical", "圆柱"),
         Projection::Perspective => t("Perspective", "透视"),
+        Projection::Panini => t("Panini", "帕尼尼"),
     }
 }
 
@@ -71,16 +72,17 @@ pub const MERGE_READY: bool = true;
 
 /// `fn merge_hdr_with_options(&self, images: &[ImageId], options: &HdrOptions)`:
 /// writes a 16-bit TIFF beside the first frame and catalogs it. `align: false`
-/// keeps the engine's existing no-alignment path; `deghost` strength and
-/// `auto_tone` are still not consumed by the engine.
+/// keeps the engine's existing no-alignment path; `deghost` (Off/Auto/Manual)
+/// is consumed by the engine; `auto_tone` is still not consumed.
 pub fn merge_hdr(engine: &dyn ImageEngine, images: &[ImageId], options: &HdrOptions) -> anyhow::Result<ImageInfo> {
     engine.merge_hdr_with_options(images, options)
 }
 
 /// `fn merge_panorama_with_options(&self, images: &[ImageId], options: &PanoramaOptions)`:
-/// writes an 8-bit TIFF beside the first frame and catalogs it. `auto_crop:
-/// false` keeps the stitched canvas edges; projection and boundary warp are
-/// still not consumed by the engine.
+/// writes an 8-bit TIFF beside the first frame and catalogs it. `projection`
+/// (Perspective/Cylindrical/Spherical/Panini) is consumed by the engine;
+/// `auto_crop: false` keeps the stitched canvas edges; boundary warp is still
+/// not consumed.
 pub fn merge_panorama(engine: &dyn ImageEngine, images: &[ImageId], options: &PanoramaOptions) -> anyhow::Result<ImageInfo> {
     engine.merge_panorama_with_options(images, options)
 }

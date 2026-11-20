@@ -108,6 +108,8 @@ fn model_candidates(name: &str) -> Vec<PathBuf> {
         "skinMasking.onnx" => "AIModels/Common/PeopleMasking",
         "EyeDetector.onnx" | "DenseNet121_FP32.onnx" => "AIModels/Common/ClosedEyesDetection",
         "autoRotation.onnx" => "AIModels/Common/Rotation",
+        "MatchLookColor.onnx" | "MatchLookBw.onnx" | "MatchLookBrightness.onnx"
+        | "MatchLookExp.onnx" => "AIModels/Common/MatchLook",
         _ => "AIModels/Common",
     };
     let mut paths = Vec::new();

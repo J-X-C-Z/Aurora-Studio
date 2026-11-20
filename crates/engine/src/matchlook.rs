@@ -12,9 +12,9 @@
 //! ([`crate::mock::process::white_balance_gains`]) instead of a second one.
 
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{AdjustmentSet, LevelsChannel, WhiteBalanceMode};
+use crate::{AdjustmentSet, Curve, CurvePoint, LevelsChannel, WhiteBalanceMode};
 
 /// One tool's movement, for the inspector's "what changed" list.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -286,6 +286,346 @@ pub fn match_look(
     Ok(MatchLook { adjustments, report: MatchReport { items, residual } })
 }
 
+// ───────────────────────── Match Look model head (AI Color Grade) ─────────────────────────
+//
+// A style's `<AICGR>` stores only the reference thumbnails (base64 multi-frame
+// TIFF), the 14 switches and `impact`; the parameters come from four ONNX heads
+// under `AIModels/Common/MatchLook`. The layouts below follow the training-label
+// order in `P1.C1.Components.PrivilegedMode.MatchLookTrainingProviders` (see
+// `out/look-vectors.tsv` in the c1_coloreditor_skin_r271 lane).
+
+/// `MatchLookColor.onnx` output length (`[1, 68]`).
+pub const LOOK_COLOR_VECTOR: usize = 68;
+/// `MatchLookBw.onnx` output length (`[1, 7]`).
+pub const LOOK_BW_VECTOR: usize = 7;
+
+/// Runs one Match Look head on an sRGB8 RGBA frame and returns its raw output.
+///
+/// Preprocessing follows the r288 probe: bilinear resize to `size`, planar
+/// NCHW, values normalised to 0..1. The model output is the training-label
+/// vector, not engine fields.
+pub fn run_look_head(
+    model: &std::path::Path,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    size: u32,
+) -> Result<Vec<f32>> {
+    if width == 0 || height == 0 || size == 0 || rgba.len() < (width * height * 4) as usize {
+        bail!("Match Look model needs a non-empty RGBA frame");
+    }
+    let runtime = crate::aimask::Runtime::get()
+        .ok_or_else(|| anyhow::anyhow!("onnxruntime is unavailable"))?;
+    let session = runtime.open_session(model)?;
+    let side = size as usize;
+    let mut input = vec![0f32; 3 * side * side];
+    for y in 0..side {
+        let sy = ((y as f32 + 0.5) * height as f32 / side as f32 - 0.5).max(0.0);
+        let y0 = sy.floor() as u32;
+        let y1 = (y0 + 1).min(height - 1);
+        let fy = sy - y0 as f32;
+        for x in 0..side {
+            let sx = ((x as f32 + 0.5) * width as f32 / side as f32 - 0.5).max(0.0);
+            let x0 = sx.floor() as u32;
+            let x1 = (x0 + 1).min(width - 1);
+            let fx = sx - x0 as f32;
+            let at = |px: u32, py: u32, c: usize| {
+                rgba[((py * width + px) * 4) as usize + c] as f32 / 255.0
+            };
+            let index = y * side + x;
+            for channel in 0..3 {
+                let top = at(x0, y0, channel) * (1.0 - fx) + at(x1, y0, channel) * fx;
+                let bottom = at(x0, y1, channel) * (1.0 - fx) + at(x1, y1, channel) * fx;
+                input[channel * side * side + index] = top * (1.0 - fy) + bottom * fy;
+            }
+        }
+    }
+    let outputs = runtime.run(&session, &mut input, &[1, 3, size as i64, size as i64])?;
+    outputs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Match Look model produced no output"))
+}
+
+/// The 14 `<AICGR>` switches and `impact`.
+///
+/// Every switch defaults to true and `impact` to 100; a false switch keeps that
+/// tool's predicted parameters out of the result.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LookComponents {
+    pub exposure: bool,
+    pub whitebalance: bool,
+    pub brightness: bool,
+    pub contrast: bool,
+    pub hdr_highlight_shadow: bool,
+    pub hdr_white_black: bool,
+    pub target_levels: bool,
+    pub color_balance_master: bool,
+    pub color_balance_hms: bool,
+    pub saturation: bool,
+    pub basic_color_edits: bool,
+    pub luma_curve: bool,
+    pub color_channel_curves: bool,
+    pub black_and_white: bool,
+    /// 0 ..= 100, how much of the looked-up parameters is applied.
+    pub impact: f32,
+}
+
+impl Default for LookComponents {
+    fn default() -> Self {
+        Self {
+            exposure: true,
+            whitebalance: true,
+            brightness: true,
+            contrast: true,
+            hdr_highlight_shadow: true,
+            hdr_white_black: true,
+            target_levels: true,
+            color_balance_master: true,
+            color_balance_hms: true,
+            saturation: true,
+            basic_color_edits: true,
+            luma_curve: true,
+            color_channel_curves: true,
+            black_and_white: true,
+            impact: 100.0,
+        }
+    }
+}
+
+/// One reference frame as C1 feeds the models: 8-bit RGB in Adobe RGB 1998.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookThumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// `<AICGR>`: the reference frames plus the 14 tool switches and `impact`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookReference {
+    pub components: LookComponents,
+    pub thumbnails: Vec<LookThumbnail>,
+}
+
+/// Both heads' raw output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookPrediction {
+    pub color: [f32; LOOK_COLOR_VECTOR],
+    pub bw: [f32; LOOK_BW_VECTOR],
+}
+
+/// The four ONNX heads (`Exp`, `Brightness`, `Color`, `Bw`).
+///
+/// No runtime is linked into this crate, so [`look_adjustments`] reports
+/// [`LookError::NoModel`] until a caller supplies an implementation.
+pub trait LookModel {
+    fn predict(&self, thumbnails: &[LookThumbnail]) -> Result<LookPrediction, LookError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LookError {
+    /// No ONNX runtime is wired in; the reference cannot be evaluated.
+    NoModel,
+    /// `<AICGR>` carried no reference frame.
+    NoThumbnail,
+    /// A thumbnail does not match its own `width × height × 4`.
+    BadThumbnail { index: usize, width: u32, height: u32, bytes: usize },
+}
+
+impl std::fmt::Display for LookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoModel => write!(f, "Match Look needs an ONNX runtime for the four heads; none is linked"),
+            Self::NoThumbnail => write!(f, "the style's <AICGR> carries no reference thumbnail"),
+            Self::BadThumbnail { index, width, height, bytes } => write!(
+                f,
+                "thumbnail {index} is {bytes} bytes, expected {} for {width}x{height} RGBA",
+                *width as usize * *height as usize * 4
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LookError {}
+
+/// Runs the model on a style's reference frames and returns the adjustments.
+pub fn look_adjustments(
+    model: Option<&dyn LookModel>,
+    thumbnails: &[LookThumbnail],
+    components: &LookComponents,
+) -> Result<AdjustmentSet, LookError> {
+    if thumbnails.is_empty() {
+        return Err(LookError::NoThumbnail);
+    }
+    for (index, thumb) in thumbnails.iter().enumerate() {
+        let expected = thumb.width as usize * thumb.height as usize * 4;
+        if thumb.rgba.len() != expected {
+            return Err(LookError::BadThumbnail {
+                index,
+                width: thumb.width,
+                height: thumb.height,
+                bytes: thumb.rgba.len(),
+            });
+        }
+    }
+    let model = model.ok_or(LookError::NoModel)?;
+    let prediction = model.predict(thumbnails)?;
+    let mut out = AdjustmentSet::default();
+    apply_look_color(&prediction.color, components, &mut out);
+    apply_look_bw(&prediction.bw, components, &mut out);
+    Ok(out)
+}
+
+/// Evaluates an `<AICGR>` reference with the four ONNX heads from the Capture
+/// One install and returns the adjustments they imply.
+pub fn look_from_reference(reference: &LookReference) -> Option<AdjustmentSet> {
+    let thumbnail = reference.thumbnails.first()?;
+    let color = crate::aimask::model_path("MatchLookColor.onnx").ok()?;
+    let bw = crate::aimask::model_path("MatchLookBw.onnx").ok()?;
+    let color_values = run_look_head(&color, &thumbnail.rgba, thumbnail.width, thumbnail.height, 384)
+        .map_err(|error| log::warn!("Match Look Color head failed: {error}"))
+        .ok()?;
+    let bw_values = run_look_head(&bw, &thumbnail.rgba, thumbnail.width, thumbnail.height, 224)
+        .map_err(|error| log::warn!("Match Look Bw head failed: {error}"))
+        .ok()?;
+    let color: [f32; LOOK_COLOR_VECTOR] = color_values.try_into().ok()?;
+    let bw: [f32; LOOK_BW_VECTOR] = bw_values.try_into().ok()?;
+    let prediction = LookPrediction { color, bw };
+    let mut out = AdjustmentSet::default();
+    apply_look_color(&prediction.color, &reference.components, &mut out);
+    apply_look_bw(&prediction.bw, &reference.components, &mut out);
+    Some(out)
+}
+
+/// `MatchLookColor` head → [`AdjustmentSet`].
+///
+/// The vector is Capture One's own look parameter array (the same one
+/// `IC_ApplyLook` reads): exposure/warmth deltas, brightness/contrast, HDR,
+/// target levels, four color-balance triples, saturation, the eight basic
+/// color-editor sectors and the four gradation curves. Values are offsets from
+/// neutral; `impact` scales every one of them.
+pub fn apply_look_color(v: &[f32; LOOK_COLOR_VECTOR], c: &LookComponents, out: &mut AdjustmentSet) {
+    let s = (c.impact / 100.0).clamp(0.0, 1.0);
+    let offset = |raw: f32, neutral: f32| (raw - neutral) * s;
+
+    if c.exposure {
+        // C1's exposure slider is ±4 EV while this engine's is ±2.5; the look
+        // head is trained on the former, so keep its range.
+        out.exposure.exposure = (v[0] * 8.0 - 4.0) * s;
+    }
+    if c.whitebalance {
+        // The head predicts deltas; C1 writes gains, so move the current pair
+        // and re-derive them through the engine's own temperature model.
+        let kelvin = (v[1] * 28000.0 - 14000.0) * s;
+        let tint = (v[2] * 200.0 - 100.0) * s;
+        if kelvin.abs() > 1e-4 || tint.abs() > 1e-4 {
+            out.white_balance.kelvin = (out.white_balance.kelvin + kelvin).clamp(2000.0, 50000.0);
+            out.white_balance.tint = (out.white_balance.tint + tint).clamp(-50.0, 50.0);
+            out.white_balance.mode = WhiteBalanceMode::Custom;
+            out.white_balance.gains = Some(crate::mock::process::white_balance_gains(
+                out.white_balance.kelvin,
+                out.white_balance.tint,
+            ));
+        }
+    }
+    if c.brightness {
+        out.exposure.brightness = clamp_to("Brightness", v[3] * 100.0 - 50.0) * s;
+    }
+    if c.contrast {
+        out.exposure.contrast = clamp_to("Contrast", v[4] * 100.0 - 50.0) * s;
+    }
+    if c.hdr_highlight_shadow {
+        out.hdr.highlights = clamp_to("HighlightRecovery", v[5] * 200.0 - 100.0) * s;
+        out.hdr.shadows = clamp_to("ShadowRecovery", v[6] * 200.0 - 100.0) * s;
+    }
+    if c.hdr_white_black {
+        out.hdr.whites = clamp_to("WhiteRecovery", v[7] * 200.0 - 100.0) * s;
+        out.hdr.blacks = clamp_to("BlackRecovery", v[8] * 200.0 - 100.0) * s;
+    }
+    if c.target_levels {
+        // No typed field yet (registry: Target Levels PARTIAL), so they ride the
+        // contract map under the C1 property keys.
+        let shadow = clamp_to("TargetShadowRGB", v[9]);
+        let highlight = clamp_to("TargetHighlightRGB", v[10]);
+        out.extra.insert("TargetShadowRGB".into(), shadow);
+        out.extra.insert("TargetHighlightRGB".into(), highlight);
+    }
+    if c.color_balance_master || c.color_balance_hms {
+        // C1 stores the triple as a 0..1 colour whose neutral is 0.5; the
+        // renderer's multipliers are `1 ± 2·offset`.
+        let gain = |raw: f32| 1.0 + 2.0 * offset(raw, 0.5);
+        let mut gains = out.color_balance_gains.unwrap_or_default();
+        if c.color_balance_master {
+            gains.master = [gain(v[11]), gain(v[12]), gain(v[13])];
+        }
+        if c.color_balance_hms {
+            gains.shadow = [gain(v[14]), gain(v[15]), gain(v[16])];
+            gains.midtone = [gain(v[17]), gain(v[18]), gain(v[19])];
+            gains.highlight = [gain(v[20]), gain(v[21]), gain(v[22])];
+        }
+        out.color_balance_gains = (!gains.is_neutral()).then_some(gains);
+    }
+    if c.saturation {
+        out.exposure.saturation = clamp_to("Saturation", v[23] * 200.0 - 100.0) * s;
+    }
+    if c.basic_color_edits {
+        for (sector, shift) in out.color_editor.basic.iter_mut().enumerate() {
+            let at = 24 + sector * 3;
+            // The sector sliders are UI ranges, not hard limits: C1's own
+            // saturation span here is ±100 while this engine's slider is ±80.
+            shift.hue = (v[at] * 60.0 - 30.0) * s;
+            shift.saturation = (v[at + 1] * 200.0 - 100.0) * s;
+            shift.lightness = (v[at + 2] * 10.0 - 5.0) * s;
+        }
+    }
+    if c.luma_curve {
+        out.curves.luma = look_curve(&v[48..53], s);
+    }
+    if c.color_channel_curves {
+        out.curves.red = look_curve(&v[53..58], s);
+        out.curves.green = look_curve(&v[58..63], s);
+        out.curves.blue = look_curve(&v[63..68], s);
+    }
+}
+
+/// Five control points at `x = 0, ¼, ½, ¾, 1`, moved toward the neutral line by
+/// `impact`.
+fn look_curve(values: &[f32], impact: f32) -> Curve {
+    let points = values
+        .iter()
+        .enumerate()
+        .map(|(i, y)| {
+            let x = i as f32 / 4.0;
+            CurvePoint::new(x, (x + (y - x) * impact).clamp(0.0, 1.0))
+        })
+        .collect();
+    Curve { points }
+}
+
+/// `MatchLookBw` head → [`AdjustmentSet`].
+///
+/// `[0]` is the enable flag (C1's threshold is `> 0.75`), `[1..6]` are the red,
+/// yellow, blue, green, cyan and magenta sensitivities.
+pub fn apply_look_bw(v: &[f32; LOOK_BW_VECTOR], c: &LookComponents, out: &mut AdjustmentSet) {
+    if !c.black_and_white {
+        return;
+    }
+    let s = (c.impact / 100.0).clamp(0.0, 1.0);
+    out.black_white.enabled = v[0] > 0.75;
+    let value = |key: &str, i: usize| clamp_to(key, v[i] * 200.0 - 100.0) * s;
+    // Head order is R, Y, B, G, C, M; the engine field is R, Y, G, C, B, M.
+    out.black_white.sensitivity = [
+        value("BwRed", 1),
+        value("BwYellow", 2),
+        value("BwGreen", 4),
+        value("BwCyan", 5),
+        value("BwBlue", 3),
+        value("BwMagenta", 6),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +764,169 @@ mod tests {
         let look = match_look(&reference, W, H, &target, W, H).unwrap();
         assert!(look.report.items.len() >= 4);
         assert_in_range(&look);
+    }
+
+    /// A vector where every slot carries a distinct value, so a wrong offset or
+    /// a swapped field cannot pass.
+    fn distinct() -> [f32; LOOK_COLOR_VECTOR] {
+        std::array::from_fn(|i| 0.05 + i as f32 * 0.012)
+    }
+
+    #[test]
+    fn color_vector_writes_every_field_from_its_own_slot() {
+        let v = distinct();
+        let mut out = AdjustmentSet::default();
+        apply_look_color(&v, &LookComponents::default(), &mut out);
+
+        assert!((out.exposure.exposure - (v[0] * 8.0 - 4.0)).abs() < 1e-5);
+        let kelvin = (5500.0 + v[1] * 28000.0 - 14000.0).clamp(2000.0, 50000.0);
+        let tint = (v[2] * 200.0 - 100.0).clamp(-50.0, 50.0);
+        assert!((out.white_balance.kelvin - kelvin).abs() < 1e-2);
+        assert!((out.white_balance.tint - tint).abs() < 1e-5);
+        assert!(out.white_balance.gains.is_some(), "a non-zero pair writes gains");
+        assert!((out.exposure.brightness - (v[3] * 100.0 - 50.0)).abs() < 1e-5);
+        assert!((out.exposure.contrast - (v[4] * 100.0 - 50.0)).abs() < 1e-5);
+        assert!((out.hdr.highlights - (v[5] * 200.0 - 100.0)).abs() < 1e-5);
+        assert!((out.hdr.shadows - (v[6] * 200.0 - 100.0)).abs() < 1e-5);
+        assert!((out.hdr.whites - (v[7] * 200.0 - 100.0)).abs() < 1e-5);
+        assert!((out.hdr.blacks - (v[8] * 200.0 - 100.0)).abs() < 1e-5);
+        assert!((out.extra["TargetShadowRGB"] - v[9]).abs() < 1e-6);
+        assert!((out.extra["TargetHighlightRGB"] - v[10]).abs() < 1e-6);
+        let gains = out.color_balance_gains.expect("gains");
+        let g = |slot: usize| 1.0 + 2.0 * (v[slot] - 0.5);
+        for k in 0..3 {
+            assert!((gains.master[k] - g(11 + k)).abs() < 1e-5, "master {k}");
+            assert!((gains.shadow[k] - g(14 + k)).abs() < 1e-5, "shadow {k}");
+            assert!((gains.midtone[k] - g(17 + k)).abs() < 1e-5, "midtone {k}");
+            assert!((gains.highlight[k] - g(20 + k)).abs() < 1e-5, "highlight {k}");
+        }
+        assert!((out.exposure.saturation - (v[23] * 200.0 - 100.0)).abs() < 1e-5);
+        for (sector, shift) in out.color_editor.basic.iter().enumerate() {
+            let at = 24 + sector * 3;
+            assert!((shift.hue - (v[at] * 60.0 - 30.0)).abs() < 1e-5, "sector {sector} hue");
+            assert!((shift.saturation - (v[at + 1] * 200.0 - 100.0)).abs() < 1e-5, "sector {sector} sat");
+            assert!((shift.lightness - (v[at + 2] * 10.0 - 5.0)).abs() < 1e-5, "sector {sector} light");
+        }
+        let channels = [(&out.curves.luma, 48), (&out.curves.red, 53), (&out.curves.green, 58), (&out.curves.blue, 63)];
+        for (curve, base) in channels {
+            assert_eq!(curve.points.len(), 5);
+            for (i, point) in curve.points.iter().enumerate() {
+                assert!((point.x - i as f32 / 4.0).abs() < 1e-6);
+                assert!((point.y - v[base + i]).abs() < 1e-6, "curve {base} point {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn impact_scales_every_offset_and_switches_gate_their_tool() {
+        let v = distinct();
+        let half = LookComponents { impact: 50.0, ..Default::default() };
+        let mut out = AdjustmentSet::default();
+        apply_look_color(&v, &half, &mut out);
+        assert!((out.exposure.exposure - (v[0] * 8.0 - 4.0) * 0.5).abs() < 1e-5);
+        assert!((out.exposure.saturation - (v[23] * 200.0 - 100.0) * 0.5).abs() < 1e-5);
+        assert!((out.color_balance_gains.expect("gains").master[0] - (1.0 + 2.0 * (v[11] - 0.5) * 0.5)).abs() < 1e-5);
+
+        let off = LookComponents {
+            exposure: false,
+            whitebalance: false,
+            brightness: false,
+            contrast: false,
+            hdr_highlight_shadow: false,
+            hdr_white_black: false,
+            target_levels: false,
+            color_balance_master: false,
+            color_balance_hms: false,
+            saturation: false,
+            basic_color_edits: false,
+            luma_curve: false,
+            color_channel_curves: false,
+            black_and_white: false,
+            impact: 100.0,
+        };
+        let mut untouched = AdjustmentSet::default();
+        apply_look_color(&v, &off, &mut untouched);
+        apply_look_bw(&[1.0; LOOK_BW_VECTOR], &off, &mut untouched);
+        assert_eq!(untouched, AdjustmentSet::default());
+    }
+
+    #[test]
+    fn neutral_color_vector_leaves_the_tools_at_rest() {
+        let mut out = AdjustmentSet::default();
+        apply_look_color(&[0.5; LOOK_COLOR_VECTOR], &LookComponents::default(), &mut out);
+        assert_eq!(out.exposure.exposure, 0.0);
+        assert_eq!(out.exposure.brightness, 0.0);
+        assert_eq!(out.exposure.contrast, 0.0);
+        assert_eq!(out.exposure.saturation, 0.0);
+        assert_eq!(out.hdr, crate::HighDynamicRange::default());
+        assert_eq!(out.white_balance, crate::WhiteBalance::default());
+        assert!(out.color_balance_gains.is_none(), "neutral offsets must not enable gains");
+        for shift in &out.color_editor.basic {
+            assert_eq!((shift.hue, shift.saturation, shift.lightness), (0.0, 0.0, 0.0));
+        }
+        // 0.5 everywhere is a flat half-tone curve, not the identity.
+        assert!(out.curves.luma.points.iter().all(|p| (p.y - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn bw_vector_sets_the_flag_and_all_six_filters() {
+        let v = [0.9, 1.0, 0.75, 0.5, 0.25, 0.0, 0.125];
+        let mut out = AdjustmentSet::default();
+        apply_look_bw(&v, &LookComponents::default(), &mut out);
+        assert!(out.black_white.enabled, "0.9 > 0.75 enables B&W");
+        let denorm = |x: f32| x * 200.0 - 100.0;
+        assert_eq!(
+            out.black_white.sensitivity,
+            [denorm(v[1]), denorm(v[2]), denorm(v[4]), denorm(v[5]), denorm(v[3]), denorm(v[6])]
+        );
+        let mut off = out.clone();
+        apply_look_bw(&[0.7; LOOK_BW_VECTOR], &LookComponents::default(), &mut off);
+        assert!(!off.black_white.enabled, "0.7 is below the threshold");
+    }
+
+    struct FixedModel(LookPrediction);
+
+    impl LookModel for FixedModel {
+        fn predict(&self, _thumbnails: &[LookThumbnail]) -> Result<LookPrediction, LookError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn look_adjustments_needs_a_model_and_a_frame() {
+        let components = LookComponents::default();
+        assert_eq!(look_adjustments(None, &[], &components), Err(LookError::NoThumbnail));
+
+        let thumb = LookThumbnail { width: 2, height: 2, rgba: vec![0; 16] };
+        assert_eq!(look_adjustments(None, &[thumb.clone()], &components), Err(LookError::NoModel));
+
+        let short = LookThumbnail { width: 2, height: 2, rgba: vec![0; 8] };
+        assert_eq!(
+            look_adjustments(None, &[short], &components),
+            Err(LookError::BadThumbnail { index: 0, width: 2, height: 2, bytes: 8 })
+        );
+
+        let mut color = [0.5; LOOK_COLOR_VECTOR];
+        color[23] = 0.0; // saturation -100
+        let model = FixedModel(LookPrediction { color, bw: [1.0; LOOK_BW_VECTOR] });
+        let set = look_adjustments(Some(&model), &[thumb], &components).expect("model");
+        assert_eq!(set.exposure.saturation, -100.0);
+        assert!(set.black_white.enabled);
+    }
+
+    #[test]
+    fn color_head_runs_on_a_synthetic_frame() {
+        let model = std::path::Path::new(
+            r"C:\Program Files\Capture One\Capture One\AIModels\Common\MatchLook\MatchLookColor.onnx",
+        );
+        if !model.is_file() || crate::aimask::Runtime::get().is_none() {
+            return;
+        }
+        let rgba: Vec<u8> = (0..32 * 32)
+            .flat_map(|i| [(i % 251) as u8, 128, 200, 255])
+            .collect();
+        let out = run_look_head(model, &rgba, 32, 32, 384).expect("color head");
+        assert_eq!(out.len(), LOOK_COLOR_VECTOR);
+        assert!(out.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)), "{out:?}");
     }
 }

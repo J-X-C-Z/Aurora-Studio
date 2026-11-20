@@ -12,10 +12,10 @@ use std::time::Instant;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
-use crate::adjust::{AdjustmentSet, Geometry, WhiteBalanceMode};
+use crate::adjust::{AdjustmentSet, Curves, Geometry, Levels, NoiseReduction, Sharpening, WhiteBalance, WhiteBalanceMode};
 use crate::catalog::{ColorTag, Exif, FileKind, ImageId, ImageInfo, Iptc};
 use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, RenderQuality, StyleInfo};
-use crate::layers::{Layer, LinearGradient, Mask, MaskOp, MaskShape};
+use crate::layers::{Layer, LinearGradient, LocalAdjustments, Mask, MaskOp, MaskShape};
 use crate::mock::process::{self, Source};
 use crate::preview_cache::{self, CachedFrame, PreviewCache};
 use crate::store::{Catalog, Entry, Store, StoreError};
@@ -167,6 +167,110 @@ fn downscale_rgba(img: &image::RgbaImage, w: u32, h: u32) -> image::RgbaImage {
 /// Capture One preview cache files are JXL, not RAW.
 fn is_cop(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("cop"))
+}
+
+fn is_eip(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("eip"))
+}
+
+/// A C1 `.eip` package's RAW member, and its CoMask sidecar when present,
+/// written under `<root>/.portrait/eip-cache` so the existing path-based
+/// decoders read them unchanged.
+pub struct EipAssets {
+    pub raw: PathBuf,
+    pub settings: Option<PathBuf>,
+    pub comask: Option<PathBuf>,
+    /// `MaskUUID` of each local layer in the packed `.cos`.
+    pub mask_uuids: Vec<String>,
+}
+
+/// A 60 MB RAW per package would pile up when a folder of EIPs is scanned in
+/// parallel, so archive extraction stays single-flight.
+static EIP_EXTRACT: Mutex<()> = Mutex::new(());
+
+fn materialize_eip(root: &Path, package: &Path) -> anyhow::Result<EipAssets> {
+    use std::hash::{Hash, Hasher};
+    let _guard = EIP_EXTRACT.lock();
+    let bytes = std::fs::read(package)?;
+    let pkg = crate::c1_eip::EipPackage::parse(&bytes)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    package.hash(&mut hasher);
+    let stem = format!(
+        "{}-{:016x}",
+        package
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "package".into())
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect::<String>(),
+        hasher.finish()
+    );
+    let dir = root.join(".portrait").join("eip-cache");
+    std::fs::create_dir_all(&dir)?;
+
+    let raw_name = &pkg.manifest.paths["RawPath"];
+    let extension = Path::new(raw_name).extension().and_then(|e| e.to_str()).unwrap_or("raw");
+    let raw = dir.join(format!("{stem}.{extension}"));
+    write_stale(package, &raw, pkg.member(raw_name)?)?;
+    let settings = match pkg.manifest.paths.get("SettingsPath") {
+        Some(name) => match pkg.member(name) {
+            Ok(bytes) => {
+                let path = dir.join(format!("{stem}.cos"));
+                write_stale(package, &path, bytes)?;
+                Some((path, bytes))
+            }
+            Err(err) => {
+                log::warn!("EIP {}: settings member {name}: {err}", package.display());
+                None
+            }
+        },
+        None => None,
+    };
+    let comask = match pkg.manifest.paths.get("CoMaskPath") {
+        Some(name) => match pkg.member(name) {
+            Ok(bytes) => {
+                let path = dir.join(format!("{stem}.comask"));
+                write_stale(package, &path, bytes)?;
+                Some(path)
+            }
+            Err(err) => {
+                log::warn!("EIP {}: CoMask member {name}: {err}", package.display());
+                None
+            }
+        },
+        None => None,
+    };
+    let mask_uuids = settings
+        .as_ref()
+        .and_then(|(_, bytes)| crate::c1_cos::CosDocument::parse(bytes).ok())
+        .and_then(|document| {
+            document
+                .variant()
+                .map(|variant| variant.layers.iter().filter_map(|layer| layer.mask_uuid.clone()).collect())
+        })
+        .unwrap_or_default();
+    Ok(EipAssets {
+        raw,
+        settings: settings.map(|(path, _)| path),
+        comask,
+        mask_uuids,
+    })
+}
+
+/// Rewrites a cached member only when the package is newer than the copy.
+fn write_stale(package: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let stale = match (std::fs::metadata(dest), std::fs::metadata(package)) {
+        (Ok(cached), Ok(source)) => match (cached.modified(), source.modified()) {
+            (Ok(cached), Ok(source)) => cached < source,
+            _ => true,
+        },
+        _ => true,
+    };
+    if stale {
+        std::fs::write(dest, bytes)?;
+    }
+    Ok(())
 }
 
 fn raw16_source(path: &Path) -> Option<Source> {
@@ -336,6 +440,9 @@ fn attach_c1_layers(
                 kind: crate::layers::LayerKind::Adjustment,
                 enabled: layer.enabled,
                 opacity: layer.opacity.clamp(0.0, 100.0),
+                select_point: layer.select_point,
+                style: None,
+                cover: Vec::new(),
                 mask: Mask {
                     shapes: vec![shape],
                     refine: layer.surface_smoothness.clamp(0.0, 100.0),
@@ -349,6 +456,162 @@ fn attach_c1_layers(
     }
     for layer in &variant.local_layers {
         log::warn!("C1 layer {:?}: no .comask mask decoded; not attached", layer.name);
+    }
+}
+
+/// C1's `SessionFileLocationsProvider` puts a per-image `.cos` in
+/// `<raw dir>/CaptureOne/Settings1680/<raw file name>.cos`. Session raws sit in
+/// `Capture/`, so the session root is tried as well.
+fn cos_settings_file(raw: &Path) -> Option<PathBuf> {
+    let dir = raw.parent()?;
+    let mut bases = vec![dir.join("CaptureOne")];
+    if dir.file_name().is_some_and(|name| name.eq_ignore_ascii_case("Capture")) {
+        if let Some(session) = dir.parent() {
+            bases.push(session.join("CaptureOne"));
+        }
+    }
+    let name = raw.file_name()?.to_string_lossy();
+    let stem = raw.file_stem()?.to_string_lossy();
+    for base in bases {
+        for settings in settings_dirs(&base) {
+            // Newest build first; some tools drop the RAW extension.
+            for candidate in [
+                settings.join(format!("{name}.cos")),
+                settings.join(format!("{stem}.cos")),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `CaptureOne/Settings<build>` folders, newest build first.
+fn settings_dirs(capture_one: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<(u32, PathBuf)> = std::fs::read_dir(capture_one)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let build = name.strip_prefix("Settings")?.parse().ok()?;
+            entry.path().is_dir().then_some((build, entry.path()))
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    dirs.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Applies a C1 per-image `.cos`: the `<DL>` global adjustments plus its local
+/// `<AL>` layers that carry a `MaskUUID`. The mask comes from the `.comask`
+/// sidecar beside the settings file, looked up by that UUID.
+fn cos_adjustments(raw: &Path) -> Option<AdjustmentSet> {
+    let settings = cos_settings_file(raw)?;
+    let bytes = std::fs::read(&settings).ok()?;
+    let document = crate::c1_cos::CosDocument::parse(&bytes).ok()?;
+    let variant = document.variant()?;
+    let comask_bytes = std::fs::read(settings.with_extension("comask")).ok();
+    let comask =
+        comask_bytes.as_deref().and_then(|bytes| crate::comask::ComaskDocument::parse(bytes).ok());
+    let mut adjustments = variant.adjustments.clone();
+    let uuids: Vec<&str> =
+        variant.layers.iter().filter_map(|layer| layer.mask_uuid.as_deref()).collect();
+    let planes = match comask_bytes.as_deref() {
+        Some(bytes) if !uuids.is_empty() => {
+            crate::comask::read_comask_masks_for(bytes, &uuids).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let by_uuid: HashMap<&str, &crate::comask::MaskPlane> =
+        planes.iter().filter_map(|plane| plane.uuid.as_deref().map(|uuid| (uuid, plane))).collect();
+    let (w, h) = dimensions(raw);
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+
+    // `Lccid` on the global layer names `<Settings>/<raw name>.<id>.lcc`.
+    if let Some(lcc_id) = variant.lcc_id.as_deref() {
+        let raw_name = raw.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let settings_dir = settings.parent().unwrap_or_else(|| Path::new(""));
+        let path = crate::dust_lcc::sidecar_path(settings_dir, raw_name, lcc_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if let Err(error) = adjustments.lens.load_dust_lcc(&bytes) {
+                    log::warn!("C1 `.lcc` {} ignored: {error}", path.display());
+                }
+            }
+            Err(_) => log::warn!("C1 `.lcc` {} missing", path.display()),
+        }
+    }
+
+    let mut layers = Vec::new();
+    for (index, layer) in variant.layers.iter().enumerate() {
+        let Some(uuid) = layer.mask_uuid.as_deref() else { continue };
+        let record = comask
+            .as_ref()
+            .and_then(|document| document.masks.iter().find(|mask| mask.uuid.as_deref() == Some(uuid)));
+        // Same shape choice as a catalog import: a gradient stays editable and
+        // needs no raster; anything else uses the decoded plane.
+        let shape = if let Some(gradient) = record.and_then(|record| record.linear_gradient) {
+            warn_unverified_midpoint(&format!("Layer {}", index + 1), gradient);
+            let zero_line =
+                source_to_oriented([gradient[0] / w, gradient[1] / h], &adjustments.geometry);
+            let full_line =
+                source_to_oriented([gradient[2] / w, gradient[3] / h], &adjustments.geometry);
+            MaskShape::Linear(LinearGradient { op: MaskOp::Add, start: full_line, end: zero_line })
+        } else if let Some(plane) = by_uuid.get(uuid) {
+            let oriented = oriented_mask_plane(plane, &adjustments.geometry);
+            let raster = crate::c1_masks::raster_shape_from_plane(
+                oriented.w,
+                oriented.h,
+                &oriented.data,
+                MaskOp::Add,
+            )
+            .unwrap_or_else(|| crate::RasterMask::empty(MaskOp::Add));
+            MaskShape::Raster(raster)
+        } else {
+            log::warn!(
+                "C1 `.cos` layer {uuid} in {}: no `.comask` mask; attached without pixels",
+                settings.display()
+            );
+            MaskShape::Raster(crate::RasterMask::empty(MaskOp::Add))
+        };
+        layers.push(Layer {
+            id: index as u64 + 1,
+            name: format!("Layer {}", index + 1),
+            kind: crate::layers::LayerKind::Adjustment,
+            enabled: true,
+            opacity: 100.0,
+            select_point: None,
+            mask: Mask { shapes: vec![shape], ..Default::default() },
+            adjustments: local_adjustments(&layer.adjustments),
+            ..Default::default()
+        });
+    }
+    adjustments.layers.extend(layers);
+    Some(adjustments)
+}
+
+/// A `.cos` layer body is a full [`AdjustmentSet`]; a render layer keeps only
+/// the tools Capture One allows locally.
+fn local_adjustments(a: &AdjustmentSet) -> LocalAdjustments {
+    LocalAdjustments {
+        white_balance: (a.white_balance != WhiteBalance::default()).then(|| a.white_balance.clone()),
+        exposure: a.exposure.clone(),
+        hdr: a.hdr.clone(),
+        clarity: a.clarity.clone(),
+        dehaze: a.dehaze.clone(),
+        curves: (a.curves != Curves::default()).then(|| a.curves.clone()),
+        levels: (a.levels != Levels::default()).then(|| a.levels.clone()),
+        black_white: a.black_white.enabled.then(|| a.black_white.clone()),
+        color_balance: a.color_balance.clone(),
+        color_editor: a.color_editor.clone(),
+        sharpening: (a.sharpening != Sharpening::default()).then(|| a.sharpening.clone()),
+        noise_reduction: (a.noise_reduction != NoiseReduction::default())
+            .then(|| a.noise_reduction.clone()),
+        moire: a.moire.clone(),
+        fill_color: None,
+        ..Default::default()
     }
 }
 
@@ -465,6 +728,17 @@ impl FileEngine {
     /// The folder this engine reads.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The packed RAW, settings and CoMask members of a C1 `.eip` entry,
+    /// materialized on disk for the decoders that take a path. `mask_uuids`
+    /// are what `comask::read_comask_masks_for` needs to find the layers.
+    pub fn eip_assets(&self, image: ImageId) -> Option<EipAssets> {
+        let path = self.state.lock().entries.iter().find(|e| e.info.id == image)?.path.clone();
+        if !is_eip(&path) {
+            return None;
+        }
+        materialize_eip(&self.root, &path).ok()
     }
 
     /// Opens a Capture One catalog or session read-only and imports its images
@@ -746,9 +1020,10 @@ impl FileEngine {
 
         let scanned: Vec<ScannedFile> = found
             .into_par_iter()
-            .map(|(rel, path)| scan_file(rel, path))
+            .map(|(rel, path)| scan_file(&self.root, rel, path))
             .collect();
 
+        let mut from_cos = Vec::new();
         st.entries.clear();
         for scanned in scanned {
             let rel_path = scanned.rel_path;
@@ -761,6 +1036,14 @@ impl FileEngine {
                     if let Ok(saved) = store.load_adjustments(&rel_path) {
                         adjustments = saved;
                     }
+                }
+            }
+            // C1 keeps per-image settings in a `.cos` sidecar; apply it when
+            // neither our store nor this process has edits for the path.
+            if adjustments.is_default() && st.catalog.entry(&rel_path).is_none() {
+                if let Some(cos) = cos_adjustments(&scanned.path) {
+                    from_cos.push((rel_path.clone(), cos.clone()));
+                    adjustments = cos;
                 }
             }
             let mut rating = stored.map(|s| s.1).unwrap_or(0);
@@ -807,12 +1090,23 @@ impl FileEngine {
                 adjustments,
             });
         }
+        // Save the C1 snapshot once, so a later metadata edit and restart does
+        // not fall back to defaults when the catalog entry blocks a re-read.
+        drop(st);
+        if let Some(store) = &self.store {
+            for (rel_path, adjustments) in from_cos {
+                if let Err(err) = store.save_adjustments(&rel_path, &adjustments) {
+                    log::warn!("save `.cos` adjustments {rel_path}: {err}");
+                }
+            }
+        }
         Ok(())
     }
 
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
         let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
-        let scanned = scan_file(rel, path.to_path_buf());
+        let scanned = scan_file(&self.root, rel, path.to_path_buf());
+        let adjustments = cos_adjustments(&scanned.path).unwrap_or_default();
         let mut st = self.state.lock();
         let id = ImageId(st.next_id);
         st.next_id += 1;
@@ -832,14 +1126,14 @@ impl FileEngine {
             rating: 0,
             color_tag: ColorTag::None,
             variant: 1,
-            has_adjustments: false,
+            has_adjustments: !adjustments.is_default(),
             trashed: false,
         };
         st.entries.push(FileEntry {
             info: info.clone(),
             path: scanned.path,
             rel_path: scanned.rel_path,
-            adjustments: AdjustmentSet::default(),
+            adjustments,
         });
         Ok(info)
     }
@@ -877,11 +1171,17 @@ impl FileEngine {
         // thing a concurrent caller waits on.
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
+        // An EIP hides its RAW inside a ZIP; hand every decoder the member.
+        let decoded_path = if is_eip(&path) {
+            materialize_eip(&self.root, &path)?.raw
+        } else {
+            path.clone()
+        };
         let mut decoded_reason = None;
-        let source = match raw16_source(&path) {
+        let source = match raw16_source(&decoded_path) {
             Some(source) => source,
             None => {
-                let img = if is_cop(&path) {
+                let img = if is_cop(&decoded_path) {
                     match crate::jxl::decode_cop(&path) {
                         Ok(img) => img,
                         Err(err) => {
@@ -890,8 +1190,8 @@ impl FileEngine {
                             return Err(anyhow::anyhow!(reason));
                         }
                     }
-                } else if crate::raw::is_raw(&path) {
-                    match crate::raw::decode(&path) {
+                } else if crate::raw::is_raw(&decoded_path) {
+                    match crate::raw::decode(&decoded_path) {
                         Ok(img) => img,
                         Err(err) => {
                             let reason = format!("RAW decode failed: {err:#}");
@@ -899,10 +1199,10 @@ impl FileEngine {
                             return Err(err);
                         }
                     }
-                } else if file_kind(&path) == FileKind::Heif {
-                    match crate::heif::decode(&path) {
+                } else if file_kind(&decoded_path) == FileKind::Heif {
+                    match crate::heif::decode(&decoded_path) {
                         Ok(img) => img,
-                        Err(err) => match image::open(&path) {
+                        Err(err) => match image::open(&decoded_path) {
                             Ok(img) => {
                                 decoded_reason = Some(format!(
                                     "HEIF via libheif failed ({err:#}); used the image crate fallback"
@@ -918,7 +1218,7 @@ impl FileEngine {
                         },
                     }
                 } else {
-                    image::open(&path)?.to_rgba8()
+                    image::open(&decoded_path)?.to_rgba8()
                 };
                 let (w, h) = fit_long_side(img.dimensions());
                 let img = if img.dimensions() != (w, h) {
@@ -930,7 +1230,7 @@ impl FileEngine {
             }
         };
         let camera_preview =
-            crate::raw::is_raw(&path) && crate::raw::from_sensor(&path) == Some(false);
+            crate::raw::is_raw(&decoded_path) && crate::raw::from_sensor(&decoded_path) == Some(false);
         if camera_preview {
             decoded_reason = Some("unsupported RAW compression; showing the camera's embedded preview".into());
         }
@@ -994,8 +1294,8 @@ impl FileEngine {
     }
 
     /// [`Self::merge_hdr_frames`] with the interface's options. `align: false`
-    /// is honoured by keeping the existing no-alignment path; the remaining
-    /// fields are not implemented and are only logged.
+    /// is honoured by keeping the existing no-alignment path; `deghost` is
+    /// consumed by `hdr::fuse_with_options`; `auto_tone` is only logged.
     pub fn merge_hdr_with_options(
         &self,
         ids: &[ImageId],
@@ -1031,7 +1331,8 @@ impl FileEngine {
             .collect();
         let sources: Vec<Arc<Source>> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
         let frames: Vec<&Source> = sources.iter().map(|s| s.as_ref()).collect();
-        let fused = crate::hdr::fuse(&frames, &stops)?;
+        let defaults = HdrOptions::default();
+        let fused = crate::hdr::fuse_with_options(&frames, &stops, options.unwrap_or(&defaults))?;
         let wide = crate::hdr::to_srgb16(&fused);
 
         let dir = first_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1076,8 +1377,9 @@ impl FileEngine {
     }
 
     /// [`Self::merge_panorama_frames`] with the interface's options.
-    /// `auto_crop: false` is honoured by keeping the stitched canvas edges;
-    /// projection, boundary warp and auto crop are not implemented yet.
+    /// `projection` is consumed by `pano::stitch_with_options`; `auto_crop:
+    /// false` keeps the stitched canvas edges; boundary warp and auto crop are
+    /// still not implemented.
     pub fn merge_panorama_with_options(
         &self,
         ids: &[ImageId],
@@ -1105,7 +1407,8 @@ impl FileEngine {
         };
         let sources: Vec<Arc<Source>> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
         let frames: Vec<&Source> = sources.iter().map(|s| s.as_ref()).collect();
-        let fused = crate::pano::stitch(&frames)?;
+        let defaults = PanoramaOptions::default();
+        let fused = crate::pano::stitch_with_options(&frames, options.unwrap_or(&defaults))?;
         let bytes = crate::pano::to_srgb8(&fused);
         self.write_merge(&first_path, "Pano", fused.width, fused.height, &bytes, image::ExtendedColorType::Rgb8)
     }
@@ -1114,20 +1417,12 @@ impl FileEngine {
         if options.align {
             log::warn!("HDR merge: align=true is not applied; frames are never aligned");
         }
-        log::warn!(
-            "HDR merge: deghost={} is not consumed; the engine's built-in deghosting stays on",
-            options.deghost
-        );
         if options.auto_tone {
             log::warn!("HDR merge: auto_tone=true is not applied");
         }
     }
 
     fn warn_panorama_options(options: &PanoramaOptions) {
-        log::warn!(
-            "Panorama merge: projection={:?} is not applied; the stitch is translation only",
-            options.projection
-        );
         if options.boundary_warp != 0.0 {
             log::warn!(
                 "Panorama merge: boundary_warp={} is not applied",
@@ -1406,9 +1701,22 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf
     Ok(())
 }
 
-fn scan_file(rel: String, path: PathBuf) -> ScannedFile {
-    let (width, height) = dimensions(&path);
-    let (exif, iptc) = crate::exif::read_metadata(&path);
+fn scan_file(root: &Path, rel: String, path: PathBuf) -> ScannedFile {
+    // EIP metadata and pixels live in the packed RAW, not in the ZIP header.
+    let packed = if is_eip(&path) {
+        match materialize_eip(root, &path) {
+            Ok(assets) => Some(assets),
+            Err(err) => {
+                log::warn!("EIP {}: {err:#}", path.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let media = packed.as_ref().map_or(path.as_path(), |assets| assets.raw.as_path());
+    let (width, height) = dimensions(media);
+    let (exif, iptc) = crate::exif::read_metadata(media);
     ScannedFile {
         rel_path: rel.replace('\\', "/"),
         file_name: path
@@ -1430,6 +1738,7 @@ fn is_supported(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif")
     ) || is_cop(path)
+        || is_eip(path)
         || crate::raw::is_raw(path)
 }
 
@@ -1661,7 +1970,7 @@ impl ImageEngine for FileEngine {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                scan_file(rel, path)
+                scan_file(&self.root, rel, path)
             })
             .collect();
         let mut st = self.state.lock();
@@ -2046,6 +2355,9 @@ impl ImageEngine for FileEngine {
                 horizontal: suggestion.horizontal,
                 amount: 100.0,
                 aspect: current.geometry.keystone.aspect,
+                skew: current.geometry.keystone.skew,
+                focal_length: current.geometry.keystone.focal_length,
+                flags: current.geometry.keystone.flags,
             };
         }
         Ok(AutoResult { adjustments: adj })
@@ -2315,6 +2627,15 @@ impl ImageEngine for FileEngine {
             };
             (entry.info.exif.camera_model.clone(), entry.info.exif.iso, entry.path.clone())
         };
+        // The Nikon block sits in the packed RAW, not in the EIP container.
+        let path = if is_eip(&path) {
+            match materialize_eip(&self.root, &path) {
+                Ok(assets) => assets.raw,
+                Err(_) => path,
+            }
+        } else {
+            path
+        };
         self.frame_defaults(model.as_deref(), iso, &path)
     }
 
@@ -2517,6 +2838,28 @@ fn film_curve_styles() -> Vec<StyleInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applies_cos_global_and_masked_layers_from_the_settings_folder() {
+        let dir = std::env::temp_dir().join(format!("aurora-cos-{}", std::process::id()));
+        let capture = dir.join("Capture");
+        let settings = dir.join("CaptureOne").join("Settings1680");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::create_dir_all(&capture).unwrap();
+        let raw = capture.join("IMG_0001.IIQ");
+        std::fs::write(&raw, b"not a raw").unwrap();
+        std::fs::write(
+            settings.join("IMG_0001.IIQ.cos"),
+            br#"<IMG><E K="Version" V="1530"/><VAR Engine="600"><DL><E K="Exposure" V="1.25"/></DL><AL><E K="MaskUUID" V="MASK-1"/><E K="Exposure" V="-0.75"/></AL></VAR></IMG>"#,
+        )
+        .unwrap();
+
+        let adjustments = cos_adjustments(&raw).expect("`.cos` applies");
+        assert!((adjustments.exposure.exposure - 1.25).abs() < 1e-6);
+        assert_eq!(adjustments.layers.len(), 1);
+        assert!((adjustments.layers[0].adjustments.exposure.exposure + 0.75).abs() < 1e-6);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     #[ignore = "profiles folder rescan metadata extraction"]
@@ -3520,6 +3863,35 @@ mod tests {
             std::fs::read(&pano_new.path).unwrap(),
             "default panorama options changed the merged TIFF"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eip_packages_scan_and_materialize_their_raw_and_comask() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../04_reference/legacy-root/逆向工程/Capture One/resources/eip_samples/FULL.EIP",
+        );
+        if !fixture.is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("portrait-eip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&fixture, dir.join("FULL.EIP")).unwrap();
+
+        let engine = FileEngine::open(&dir).unwrap();
+        let image = engine
+            .images()
+            .into_iter()
+            .find(|image| image.file_name == "FULL.EIP")
+            .expect("an .eip package is a catalog image");
+        assert_eq!(image.kind, FileKind::Raw);
+        let assets = engine.eip_assets(image.id).expect("packed members materialize");
+        assert_eq!(std::fs::metadata(&assets.raw).unwrap().len(), 128, "the RAW member, not the ZIP");
+        assert_eq!(assets.raw.extension().and_then(|e| e.to_str()), Some("IIQ"));
+        assert_eq!(std::fs::metadata(assets.settings.as_ref().unwrap()).unwrap().len(), 6);
+        let comask = assets.comask.expect("FULL.EIP declares CoMaskPath");
+        assert_eq!(std::fs::read(comask).unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

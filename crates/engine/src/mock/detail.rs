@@ -70,6 +70,13 @@ pub(crate) fn post_process_with_lens(
 
     let nr = &adj.noise_reduction;
     let lens = &adj.lens;
+    let lens_extras = lens.uniform_light_enabled && lens.uniform_light > 0.0
+        || lens.dust_removal_enabled && !lens.dust_patches.is_empty()
+        || lens.sharpness_falloff >= 0.5 && lens.radial_blur.valid
+        || lens.shift_x != 0.0
+        || lens.shift_y != 0.0
+        || lens.tilt != 0.0
+        || lens.diffraction_enabled;
     let any_active = nr.luminance > 0.0
         || nr.color > 0.0
         || nr.single_pixel > 0.0
@@ -78,7 +85,8 @@ pub(crate) fn post_process_with_lens(
         || lens.distortion != 0.0
         || lens.light_falloff != 0.0
         || lens.chromatic_aberration
-        || lens.purple_fringing > 0.0
+        || lens.purple_fringing != 0.0
+        || lens_extras
         || adj.film_grain.impact > 0.0;
     if !any_active {
         return;
@@ -89,19 +97,31 @@ pub(crate) fn post_process_with_lens(
     // measured tables live in the CPU stage. A requested profile therefore
     // stays on the CPU even when no table matched.
     let use_profile = lens.use_profile;
+    // The new stages are CPU-only, so a frame that needs them stays on the CPU.
     let gpu = !use_profile
+        && !lens_extras
+        // The single-pixel stage has no CUDA twin; keep the frame on the CPU.
+        && nr.single_pixel <= 0.0
         && detail_gpu::enabled()
         && detail_gpu::post_process(rgba, w, h, nr, &adj.moire, &adj.sharpening, lens, scale);
     if !gpu {
+        stage_single_pixel(rgba, w, h, nr);
         stage_luminance_nr(rgba, w, h, nr);
         stage_color_nr(rgba, w, h, nr);
         stage_moire(rgba, w, h, &adj.moire);
+        // Capture One applies diffraction blur inside CaptureSharpening; this
+        // CPU stage goes before the USM pass and has no GPU twin.
+        stage_diffraction(rgba, w, h, lens, scale);
         stage_sharpening(rgba, w, h, &adj.sharpening, scale);
     }
     if !gpu {
         stage_lens(rgba, w, h, lens, warp);
+        stage_dust_removal(rgba, w, h, lens);
+        stage_uniform_light(rgba, w, h, lens);
+        stage_movement(rgba, w, h, lens);
+        stage_sharpness_falloff(rgba, w, h, lens);
     }
-    stage_grain(rgba, w, h, &adj.film_grain);
+    super::grain::stage(rgba, w, h, &adj.film_grain, scale);
 }
 
 // ───────────────────────────── shared helpers ─────────────────────────────
@@ -234,15 +254,51 @@ fn mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
 
 // ───────────────────────────── 1. luminance noise reduction ─────────────────────────────
 
+const NEIGHBOURS: [(i32, i32); 8] =
+    [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+
+/// Long-exposure hot-pixel suppression, C1's `ZCLEANLONGEXPOSUREAMOUNT`
+/// ("Single Pixel"). A pixel is a spike when its luma is more than
+/// `threshold(amount)` above the median of its eight neighbours; it is then
+/// replaced with that median. Every other pixel keeps its exact bytes, and the
+/// neighbours of a spike are only read, never written.
+fn stage_single_pixel(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) {
+    let amount = (adj.single_pixel / 100.0).clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
+    // 24 codes at the first notch down to 4 at full strength: more amount
+    // accepts smaller spikes, while a real star stays above the noise floor.
+    let threshold = 24.0 - 20.0 * amount;
+    let pw = w + 2;
+    let pad = padded_luma(buf, w, h);
+    let old = luma_plane(buf, w, h);
+    let mut target = old.clone();
+    target.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let c = old[y * w + x];
+            let mut nb = [0f32; 8];
+            for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
+                nb[k] = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
+            }
+            nb.sort_by(|a, b| a.total_cmp(b));
+            let median = (nb[3] + nb[4]) * 0.5;
+            if c > median + threshold {
+                row[x] = median;
+            }
+        }
+    });
+    // `apply_luma` skips pixels whose target equals their current luma, so
+    // only the spikes are rewritten.
+    apply_luma(buf, w, &old, &target);
+}
+
 /// Radius-1 bilateral filter on luminance: neighbours are weighted by how close
 /// their luminance is to the centre, so edges survive while speckle is averaged
 /// away. `details` narrows the luminance tolerance, which preserves edges more.
-/// `single_pixel` additionally replaces pixels that differ from *all* eight
-/// neighbours (hot pixels) with the median of those neighbours.
 fn stage_luminance_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) {
     let strength = (adj.luminance / 100.0).clamp(0.0, 1.0);
-    let single = (adj.single_pixel / 100.0).clamp(0.0, 1.0);
-    if strength <= 0.0 && single <= 0.0 {
+    if strength <= 0.0 {
         return;
     }
     let details = (adj.details / 100.0).clamp(0.0, 1.0);
@@ -261,7 +317,6 @@ fn stage_luminance_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) 
     // One replicated border removes the per-neighbour clamping.
     let pw = w + 2;
     let pad = padded_luma(buf, w, h);
-    const OFF: [(i32, i32); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
     const SPATIAL: [f32; 8] =
         [1.0 / 3.0, 0.5, 1.0 / 3.0, 0.5, 0.5, 1.0 / 3.0, 0.5, 1.0 / 3.0];
     let row = w * 4;
@@ -272,10 +327,8 @@ fn stage_luminance_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) 
             let c = pad[(y + 1) * pw + x + 1];
             let mut num = 0.0f32;
             let mut den = 0.0f32;
-            let mut neighbours = [0f32; 8];
-            for (k, (dx, dy)) in OFF.iter().enumerate() {
+            for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
                 let l = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
-                neighbours[k] = l;
                 let ad = (l - c).abs() * 4.0;
                 let i0 = (ad as usize).min(LUT_N - 2);
                 let t = ad - i0 as f32;
@@ -286,21 +339,6 @@ fn stage_luminance_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) 
             }
             let mut target = if den > 1e-6 { num / den } else { c };
             target = c + (target - c) * strength;
-            if single > 0.0 {
-                let mut isolated = true;
-                for v in neighbours {
-                    if (v - c).abs() <= 6.0 {
-                        isolated = false;
-                        break;
-                    }
-                }
-                if isolated {
-                    let mut sorted = neighbours;
-                    sorted.sort_by(|a, b| a.total_cmp(b));
-                    let median = (sorted[3] + sorted[4]) * 0.5;
-                    target = target * (1.0 - single) + median * single;
-                }
-            }
             let new_l = target.clamp(0.0, 255.0);
             if (new_l - c).abs() >= 0.05 {
                 let f = if c > 1.0 { new_l / c } else { 1.0 };
@@ -316,6 +354,8 @@ fn stage_luminance_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) 
 
 /// Blurs only the chroma planes of a YCbCr approximation; luminance is copied
 /// through untouched, so colour speckle disappears without softening detail.
+/// `color` is C1's CNR amount (`ZCNRAMOUNT`); the AI denoise amount is a
+/// separate model-backed stage and never reaches this approximation.
 fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) {
     let strength = (adj.color / 100.0).clamp(0.0, 1.0);
     if strength <= 0.0 {
@@ -366,29 +406,92 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) {
 
 // ───────────────────────────── 3. moire ─────────────────────────────
 
-/// A 3x3 variable low-pass that only touches high-frequency luminance, so
-/// regular patterns (screen or fabric moire) are flattened while flat areas
-/// and edges outside the pattern are left alone. `pattern` sets how strong the
-/// low-pass is.
+/// Chroma-only moire suppression, ported from the `Moire` kernel's v4 branch.
+///
+/// C1 converts RGB into `(Y, R-G, B-G)`, smooths only the two chroma channels
+/// over a `2R+1` window sampled every 2 or 4 pixels, keeps a neighbour only
+/// when its luma and luma-scaled chroma are close to the centre, and then
+/// blends the result back by `amount`. Luminance is never filtered, so a
+/// luminance pattern survives and only colour moire disappears.
+///
+/// short cut: v4 is a single-axis pass and the host runs it twice; this CPU
+/// path does a separable H then V pass with the same guard, B-level parity.
 fn stage_moire(buf: &mut [u8], w: usize, h: usize, adj: &Moire) {
     let amount = (adj.amount / 100.0).clamp(0.0, 1.0);
-    if amount <= 0.0 {
+    if amount <= 0.0 || w == 0 || h == 0 || buf.len() < w * h * 4 {
         return;
     }
-    let pattern = (adj.pattern / 100.0).clamp(0.0, 1.0);
-    let weight = amount * (0.25 + 0.75 * pattern);
-    let luma = luma_plane(buf, w, h);
-    let low = mean3x3(&luma, w, h);
-    let mut out = luma.clone();
-    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let i = y * w + x;
-            let hf = (luma[i] - low[i]).abs();
-            let blend = weight * (hf / 10.0).clamp(0.0, 1.0);
-            row[x] = luma[i] + (low[i] - luma[i]) * blend;
+    // Host: radius = round(2*R*zoom + 1) on a 4-grid, then clamp to 37.
+    let radius = adj.pattern.clamp(0.0, 37.0).round() as isize;
+    if radius < 1 {
+        return;
+    }
+    let step = if radius < 6 { 2 } else { 4 };
+    // short cut: v4's three thresholds live in host fields not fully resolved;
+    // these are fixed at roughly 15 and 30 codes of 255.
+    const LUMA_TOL: f32 = 15.0 / 255.0;
+    const CHROMA_TOL: f32 = 30.0 / 255.0;
+
+    let n = w * h;
+    let mut y = vec![0f32; n];
+    let mut cr = vec![0f32; n];
+    let mut cb = vec![0f32; n];
+    for (i, px) in buf.chunks_exact(4).enumerate() {
+        let (r, g, b) = (px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
+        y[i] = (r + 2.0 * g + b) * 0.25;
+        cr[i] = r - g;
+        cb[i] = b - g;
+    }
+    let src = (y.clone(), cr.clone(), cb.clone());
+
+    let mut avg = |input: &[f32], vertical: bool| -> Vec<f32> {
+        let mut out = vec![0f32; n];
+        out.par_chunks_mut(w).enumerate().for_each(|(row, dst)| {
+            for col in 0..w {
+                let (x, yy) = (col as isize, row as isize);
+                let c = row * w + col;
+                let (yc, crc, cbc) = (src.0[c], src.1[c] * src.0[c], src.2[c] * src.0[c]);
+                let mut sum = 0.0;
+                let mut count = 0.0;
+                let mut k = -radius;
+                while k <= radius {
+                    let (sx, sy) = if vertical {
+                        (x, (yy + k).clamp(0, h as isize - 1))
+                    } else {
+                        ((x + k).clamp(0, w as isize - 1), yy)
+                    };
+                    let j = sy as usize * w + sx as usize;
+                    let wgt = if k == 0 {
+                        1.0
+                    } else {
+                        let dy = (src.0[j] - yc).abs();
+                        let dcr = (src.1[j] * src.0[j] - crc).abs();
+                        let dcb = (src.2[j] * src.0[j] - cbc).abs();
+                        if dy < LUMA_TOL && dcr < CHROMA_TOL && dcb < CHROMA_TOL { 1.0 } else { 0.0 }
+                    };
+                    sum += input[j] * wgt;
+                    count += wgt;
+                    k += step;
+                }
+                dst[col] = if count > 0.0 { sum / count } else { input[c] };
+            }
+        });
+        out
+    };
+    let cr_h = avg(&cr, false);
+    let cr_f = avg(&cr_h, true);
+    let cb_h = avg(&cb, false);
+    let cb_f = avg(&cb_h, true);
+
+    for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+        let (c0, c1) =
+            (src.1[i] + (cr_f[i] - src.1[i]) * amount, src.2[i] + (cb_f[i] - src.2[i]) * amount);
+        let g = y[i] - (c0 + c1) * 0.25;
+        let rgb = [g + c0, g, g + c1];
+        for (k, v) in rgb.iter().enumerate() {
+            px[k] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
-    });
-    apply_luma(buf, w, &luma, &out);
+    }
 }
 
 // ───────────────────────────── 4. sharpening ─────────────────────────────
@@ -477,9 +580,11 @@ pub(crate) fn stage_lens(
 ) {
     let distortion = (adj.distortion / 100.0).clamp(-1.0, 1.0);
     let falloff = (adj.light_falloff / 100.0).clamp(0.0, 1.0);
-    let purple = (adj.purple_fringing / 100.0).clamp(0.0, 1.0);
+    let purple = crate::mock::purple_norm(adj.purple_fringing);
     let ca = adj.chromatic_aberration;
-    if distortion == 0.0 && falloff == 0.0 && !ca && purple == 0.0 {
+    // The six-curve profile table is applied after the warp, not inside it.
+    let ca_in_warp = ca && adj.ca_fringing.is_empty();
+    if distortion == 0.0 && falloff == 0.0 && !ca && purple == crate::mock::PURPLE_IDENTITY {
         return;
     }
     if adj.use_profile {
@@ -489,13 +594,15 @@ pub(crate) fn stage_lens(
         let ca_points = ca
             && (!adj.ca_red_points.is_empty()
                 || !adj.ca_blue_points.is_empty()
+                || !adj.ca_fringing.is_empty()
                 || warp.is_some_and(|w| !w.red.is_empty() || !w.blue.is_empty()));
         let usable = warp.is_some_and(|w| !w.distortion.is_empty() || !w.falloff.is_empty()) || ca_points;
         if usable {
             let empty = crate::mock::lens_profile::LensWarp::default();
             let warp = warp.unwrap_or(&empty);
-            stage_lens_profile(buf, w, h, adj, warp, distortion, falloff, ca);
-            if purple > 0.0 {
+            stage_lens_profile(buf, w, h, adj, warp, distortion, falloff, ca_in_warp);
+            stage_ca_fringes(buf, w, h, adj);
+            if purple != crate::mock::PURPLE_IDENTITY {
                 stage_purple_fringing(buf, w, h, purple);
             }
         }
@@ -524,7 +631,7 @@ pub(crate) fn stage_lens(
                 continue;
             }
             let mut rgb = sample_bilinear(&src, w, h, sx, sy);
-            if ca {
+            if ca_in_warp {
                 // Red and blue are sampled at slightly different radii.
                 let amount = 0.004 * r2;
                 let r = sample_bilinear(
@@ -557,9 +664,316 @@ pub(crate) fn stage_lens(
         }
     });
     buf.copy_from_slice(&out);
-    if purple > 0.0 {
+    stage_ca_fringes(buf, w, h, adj);
+    if purple != crate::mock::PURPLE_IDENTITY {
         stage_purple_fringing(buf, w, h, purple);
     }
+}
+
+const DIFFRACTION_LAMBDA_UM: f32 = 0.42;
+/// Used when the mount has no sensor entry; the catalog's `ZPIXELWIDTH` is
+/// 5.94 µm on a full-frame capture, so 4 µm is a deliberately conservative
+/// default that produces a smaller PSF rather than a smeared frame.
+const FALLBACK_PIXEL_PITCH_UM: f32 = 4.0;
+
+/// Bessel J1 from Abramowitz & Stegun 9.4.4 / 9.4.6; accurate to ~1e-7,
+/// which is far below the 8-bit output of the stage.
+fn bessel_j1(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 8.0 {
+        let y = x * x;
+        let num = x
+            * (72_362_614_232.0
+                + y * (-7_895_059_235.0
+                    + y * (242_396_853.1
+                        + y * (-2_972_611.439
+                            + y * (15_704.482_60 + y * (-30.160_366_06))))));
+        let den = 144_725_228_442.0
+            + y * (2_300_535_178.0
+                + y * (18_583_304.74 + y * (99_447.433_94 + y * (376.999_139_7 + y))));
+        num / den
+    } else {
+        let z = 8.0 / ax;
+        let y = z * z;
+        let xx = ax - 2.356_194_491;
+        let p1 = 1.0
+            + y * (0.183_105e-2
+                + y * (-0.351_639_649_6e-4
+                    + y * (0.245_752_017_4e-5 + y * (-0.240_337_019e-6))));
+        let p2 = 0.046_874_999_95
+            + y * (-0.200_269_087_3e-3
+                + y * (0.844_919_909_6e-5
+                    + y * (-0.882_289_87e-6 + y * 0.105_787_412e-6)));
+        let ans = (0.636_619_772 / ax).sqrt() * (xx.cos() * p1 - z * xx.sin() * p2);
+        if x < 0.0 {
+            -ans
+        } else {
+            ans
+        }
+    }
+}
+
+/// Photosite pitch from the mount's sensor diagonal and the buffer size.
+/// On a preview buffer this already yields the scaled PSF radius.
+fn pixel_pitch_um(adj: &LensCorrection, w: usize, h: usize, scale: f32) -> f32 {
+    let diagonal = ((w * w + h * h) as f32).sqrt();
+    if diagonal <= 0.0 {
+        return 0.0;
+    }
+    match adj
+        .mount
+        .as_deref()
+        .and_then(crate::lens_correct::mount_half_diagonal_um)
+    {
+        Some(half) => 2.0 * half / diagonal,
+        // The fallback is a full-resolution pitch, so a preview buffer needs
+        // the matching scale to keep the same angular PSF.
+        None => FALLBACK_PIXEL_PITCH_UM / scale.max(1e-6),
+    }
+}
+
+/// Normalized Airy `(2 J1(v)/v)^2` on a square grid.
+fn airy_kernel(radius: i32, v_per_px: f32) -> Vec<f32> {
+    let n = (radius * 2 + 1) as usize;
+    let mut kernel = vec![0f32; n * n];
+    let mut sum = 0f32;
+    for ky in 0..n {
+        for kx in 0..n {
+            let dx = kx as i32 - radius;
+            let dy = ky as i32 - radius;
+            let r = ((dx * dx + dy * dy) as f32).sqrt();
+            let v = v_per_px * r;
+            let amplitude = if v < 1e-4 { 1.0 } else { 2.0 * bessel_j1(v) / v };
+            let w = (amplitude * amplitude).max(0.0);
+            kernel[ky * n + kx] = w;
+            sum += w;
+        }
+    }
+    if sum > 0.0 {
+        for w in kernel.iter_mut() {
+            *w /= sum;
+        }
+    } else {
+        kernel[(radius as usize) * n + radius as usize] = 1.0;
+    }
+    kernel
+}
+
+/// Capture One gates diffraction on f/1..50 and a real photosite pitch; below
+/// ~0.35 px the Airy core is a delta on an 8-bit buffer, so leave it alone.
+/// shortcut: a limited-radius truncation, not C1's full PSF integration; upgrade
+/// when a lens/aperture sweep can calibrate the kernel radius.
+fn stage_diffraction(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection, scale: f32) {
+    if !adj.diffraction_enabled {
+        return;
+    }
+    let f_number = adj.aperture;
+    if !(1.0..=50.0).contains(&f_number) {
+        return;
+    }
+    let pitch = pixel_pitch_um(adj, w, h, scale);
+    if pitch <= 0.0 || !pitch.is_finite() {
+        return;
+    }
+    let v_per_px = std::f32::consts::PI * pitch / (DIFFRACTION_LAMBDA_UM * f_number);
+    if v_per_px <= 0.0 || !v_per_px.is_finite() {
+        return;
+    }
+    let first_zero_px = 3.831_705_6 / v_per_px;
+    if first_zero_px < 0.35 {
+        return;
+    }
+    let radius = ((first_zero_px * 2.2).ceil() as i32).clamp(1, 6);
+    let kernel = airy_kernel(radius, v_per_px);
+    let n = (radius * 2 + 1) as usize;
+    let src = buf.to_vec();
+    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let i = x * 4;
+            let mut acc = [0f32; 3];
+            for ky in 0..n {
+                let sy = clampi(y as i32 + ky as i32 - radius, 0, h as i32 - 1) as usize;
+                for kx in 0..n {
+                    let sx = clampi(x as i32 + kx as i32 - radius, 0, w as i32 - 1) as usize;
+                    let weight = kernel[ky * n + kx];
+                    let j = (sy * w + sx) * 4;
+                    acc[0] += src[j] as f32 * weight;
+                    acc[1] += src[j + 1] as f32 * weight;
+                    acc[2] += src[j + 2] as f32 * weight;
+                }
+            }
+            for c in 0..3 {
+                row[i + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+}
+
+fn stage_uniform_light(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    // `ZLENSLCCLIGHTFALLOFF` is C1's own gate: without it the amount is inert.
+    if !adj.uniform_light_enabled || w == 0 || h == 0 {
+        return;
+    }
+    let amount = (adj.uniform_light / 100.0).clamp(0.0, 1.2);
+    if amount <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        let dy = (y as f32 + 0.5 - cy) / cy;
+        for x in 0..w {
+            let dx = (x as f32 + 0.5 - cx) / cx;
+            // No `.lcc` LightFalloff table is decoded yet, so the generic corner
+            // gain stands in for the measured model (0 -> identity).
+            let gain = 1.0 + amount * 0.35 * (dx * dx + dy * dy);
+            let i = x * 4;
+            for k in 0..3 {
+                row[i + k] = ((row[i + k] as f32) * gain).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    });
+}
+
+/// `ZLENSDUSTREMOVALENABLED` + the LCC's dust rectangles. Mirrors
+/// `CImgOpApplyLCC::ApplyLCCDust`: a Q12 multiply, nothing when the table is
+/// empty (the common case for a variant without an LCC).
+fn stage_dust_removal(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    if !adj.dust_removal_enabled || adj.dust_patches.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    crate::dust_patch::apply(buf, w, h, &adj.dust_patches, &adj.dust_gain);
+}
+
+/// `ZLENSSHIFTXY` + `ZLENSTILT` as one 3x3 map, following `CResampler::UpdateGeo`:
+/// `tq = atan(m * tan(tilt))`, `k = tan(tq / 2)` shears the perspective rows.
+fn stage_movement(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    let tilt = adj.tilt.clamp(-45.0, 45.0);
+    if w == 0 || h == 0 || (adj.shift_x == 0.0 && adj.shift_y == 0.0 && tilt == 0.0) {
+        return;
+    }
+    let shift_mag = adj.shift_x.hypot(adj.shift_y);
+    // Native multiplies the tilt by the shared movement amount; a variant with
+    // only a tilt keeps unit scale instead of collapsing to no-op.
+    let m = if shift_mag > 0.0 { 0.01 * shift_mag } else { 1.0 };
+    let tq = (m * tilt.to_radians().tan()).atan();
+    let k = (tq * 0.5).tan();
+    let (mut m0, mut m1, mut m2, mut m3, mut m4, mut m5) = (1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0);
+    m0 += k * m4;
+    m1 += k * m4;
+    m2 += k * m4;
+    m3 += k * m0;
+    m4 += k * m1;
+    m5 += k * m2;
+    let diag = (((w * w + h * h) as f32).sqrt()).max(1.0);
+    m2 /= diag;
+    m5 /= diag;
+    let tx = adj.shift_x * 0.01 * w as f32 * 0.5;
+    let ty = adj.shift_y * 0.01 * h as f32 * 0.5;
+    let src = buf.to_vec();
+    let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    let mut out = vec![0u8; w * h * 4];
+    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let xx = x as f32 + 0.5 - cx;
+            let yy = y as f32 + 0.5 - cy;
+            let a = m0 - m2 * xx;
+            let b = m1 - m2 * yy;
+            let c = m3 - m5 * xx;
+            let d = m4 - m5 * yy;
+            let det = d * a - c * b;
+            let (u, v) = if det.abs() < 1e-6 {
+                (xx, yy)
+            } else {
+                ((d * xx - c * yy) / det - tx, (a * yy - b * xx) / det - ty)
+            };
+            let rgb = sample_bilinear(&src, w, h, cx + u, cy + v);
+            let i = x * 4;
+            for k in 0..3 {
+                row[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+            }
+            row[i + 3] = src[(y * w + x) * 4 + 3];
+        }
+    });
+    buf.copy_from_slice(&out);
+}
+
+/// One separable 1D Gaussian gather along `d`, weights `exp(-4 ln2 t^2)` and
+/// `step = min(0.2, 0.5/|d|)` from `CImgOpFixRadialBlur`'s feather kernel.
+fn gauss_gather(src: &[u8], w: usize, h: usize, x: f32, y: f32, d: [f32; 2]) -> [f32; 3] {
+    let mag = d[0].hypot(d[1]);
+    if mag < 0.1 {
+        return sample_bilinear(src, w, h, x, y);
+    }
+    let step = 0.2f32.min(0.5 / mag);
+    let (ux, uy) = (d[0] / mag, d[1] / mag);
+    let mut acc = sample_bilinear(src, w, h, x, y);
+    let mut sum = 1.0;
+    for i in 1..=18 {
+        let t = i as f32 * step;
+        let weight = (-4.0 * std::f32::consts::LN_2 * t * t).exp();
+        if weight < 1e-3 {
+            break;
+        }
+        let plus = sample_bilinear(src, w, h, x + ux * t, y + uy * t);
+        let minus = sample_bilinear(src, w, h, x - ux * t, y - uy * t);
+        for k in 0..3 {
+            acc[k] += (plus[k] + minus[k]) * weight;
+        }
+        sum += 2.0 * weight;
+    }
+    [acc[0] / sum, acc[1] / sum, acc[2] / sum]
+}
+
+/// `ZLENSRADIALBLUR`: radial then transverse 1D Gaussian gathers. `valid == 0`
+/// or `amount < 0.5` is identity, matching `CImgOpFixRadialBlur::IsIdentity`.
+fn stage_sharpness_falloff(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    let curves = &adj.radial_blur;
+    let amount = adj.sharpness_falloff;
+    if !curves.valid || amount < 0.5 || w == 0 || h == 0 {
+        return;
+    }
+    if curves.radial.is_empty() && curves.transverse.is_empty() {
+        return;
+    }
+    let s = std::f32::consts::SQRT_2 / (((w * w + h * h) as f32).sqrt()).max(1.0);
+    let scale = amount * 0.01 * s;
+    let nodes = |points: &[(f32, f32)]| -> Vec<(f32, f32)> {
+        points.iter().map(|&(x, y)| (s * x, scale * y)).collect()
+    };
+    let radial = nodes(&curves.radial);
+    let transverse = nodes(&curves.transverse);
+    let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    for (pass, curve) in [&radial, &transverse].into_iter().enumerate() {
+        if curve.is_empty() {
+            continue;
+        }
+        let src = buf.to_vec();
+        buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let dx = x as f32 + 0.5 - cx;
+                let dy = y as f32 + 0.5 - cy;
+                let r = dx.hypot(dy);
+                let disp = crate::mock::lens_profile::LensWarp::sample_curve(curve, r)
+                    .clamp(0.0, 11.0)
+                    * s;
+                let (ux, uy) = if r > 1e-6 { (dx / r, dy / r) } else { (0.0, 0.0) };
+                let d = if pass == 0 { [disp * ux, disp * uy] } else { [-disp * uy, disp * ux] };
+                let rgb = gauss_gather(&src, w, h, x as f32 + 0.5, y as f32 + 0.5, d);
+                let i = x * 4;
+                for k in 0..3 {
+                    row[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+                }
+                row[i + 3] = src[(y * w + x) * 4 + 3];
+            }
+        });
+    }
+}
+
+/// The lens stages that only exist on the 8-bit preview path.
+pub(crate) fn stage_lens_extras(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    stage_uniform_light(buf, w, h, adj);
+    stage_movement(buf, w, h, adj);
+    stage_sharpness_falloff(buf, w, h, adj);
 }
 
 /// Capture One's measured tables. Radius is measured on the render buffer's half
@@ -577,6 +991,8 @@ fn stage_lens_profile(
 ) {
     use crate::mock::lens_profile::LensWarp;
 
+    // With the six-curve table present the two-curve splines are not applied.
+    let ca = ca && adj.ca_fringing.is_empty();
     let src = buf.to_vec();
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
@@ -676,6 +1092,7 @@ pub(crate) fn stage_lens_profile16(
 ) {
     use crate::mock::lens_profile::LensWarp;
 
+    let ca = ca && adj.ca_fringing.is_empty();
     let src = buf.to_vec();
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
@@ -731,9 +1148,120 @@ pub(crate) fn stage_lens_profile16(
     });
 }
 
+/// Lateral chromatic aberration from the profile's six curves.
+///
+/// C1's recovered kernel (`p_041444160.cl`) resamples red and blue along the
+/// radial direction from the optic centre and leaves green alone; its two
+/// tables are the same shift-vs-radius pair `ZLENSDEFAULTCHROMABR` stores.
+/// `ZLENSCHROMAFRINGING` splits that into shift / `ra` / strength per channel.
+/// The roles of `ra` (dimensionless radial gain) and `strength` (displacement
+/// scale) follow the field names only: no kernel consuming all six curves was
+/// recovered, so those two are grade C. `strength == 0` resamples at the same
+/// position and leaves the frame byte-identical.
+pub(crate) fn stage_ca_fringes(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    use crate::mock::lens_profile::LensWarp;
+
+    if !adj.chromatic_aberration || adj.ca_fringing.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let half_diag = ((w * w + h * h) as f32).sqrt() * 0.5;
+    if half_diag <= 0.0 {
+        return;
+    }
+    // The six tables share one radius axis; normalize x and the shift value by
+    // its outer radius, which leaves the shift as a fraction of the radius
+    // (the stored pairs are µm against µm). `ra` and `strength` stay raw.
+    let mut outer = 0.0f32;
+    for curve in [
+        &adj.ca_fringing.red_shift,
+        &adj.ca_fringing.red_ra,
+        &adj.ca_fringing.red_strength,
+        &adj.ca_fringing.blue_shift,
+        &adj.ca_fringing.blue_ra,
+        &adj.ca_fringing.blue_strength,
+    ] {
+        for &(x, _) in curve {
+            if x.is_finite() {
+                outer = outer.max(x);
+            }
+        }
+    }
+    if outer <= 0.0 {
+        return;
+    }
+    let shift_curve = |curve: &[(f32, f32)]| -> Vec<(f32, f32)> {
+        curve
+            .iter()
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|&(x, y)| (x / outer, y / outer))
+            .collect()
+    };
+    let red_shift = shift_curve(&adj.ca_fringing.red_shift);
+    let blue_shift = shift_curve(&adj.ca_fringing.blue_shift);
+    let sample = |curve: &[(f32, f32)], t: f32| -> f32 {
+        if curve.is_empty() {
+            0.0
+        } else {
+            LensWarp::sample_curve(curve, t)
+        }
+    };
+    let weight = |curve: &[(f32, f32)], t: f32| -> f32 {
+        if curve.is_empty() {
+            1.0
+        } else {
+            sample(curve, t).clamp(0.0, 1.0)
+        }
+    };
+
+    let src = buf.to_vec();
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let i = x * 4;
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r <= 1e-4 {
+                continue;
+            }
+            let t = (r / half_diag).clamp(0.0, 1.0);
+            let (ux, uy) = (dx / r, dy / r);
+            // shift carries the radial displacement, `ra` the dimensionless
+            // radial gain and `strength` scales the move.
+            let red = weight(&adj.ca_fringing.red_strength, t)
+                * (sample(&red_shift, t) + sample(&adj.ca_fringing.red_ra, t))
+                * r;
+            let blue = weight(&adj.ca_fringing.blue_strength, t)
+                * (sample(&blue_shift, t) + sample(&adj.ca_fringing.blue_ra, t))
+                * r;
+            if red.abs() <= 1e-6 && blue.abs() <= 1e-6 {
+                continue;
+            }
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if red.abs() > 1e-6 {
+                row[i] = sample_bilinear(&src, w, h, px + ux * red, py + uy * red)[0]
+                    .clamp(0.0, 255.0)
+                    .round() as u8;
+            }
+            if blue.abs() > 1e-6 {
+                row[i + 2] = sample_bilinear(&src, w, h, px + ux * blue, py + uy * blue)[2]
+                    .clamp(0.0, 255.0)
+                    .round() as u8;
+            }
+        }
+    });
+}
+
 /// Desaturates strongly purple pixels that sit on an edge, which is what a
 /// lateral chromatic fringe looks like. Neutral or non-purple pixels are kept.
 fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
+    // purple is the 0..1 normalised amount; 0.5 is C1's zero.
+    let strength = crate::mock::purple_strength(purple);
+    if strength == 0.0 {
+        return;
+    }
     let src = buf.to_vec();
     buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
         for x in 0..w {
@@ -763,8 +1291,8 @@ fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
                 }
             }
             let edge = ((hi - lo) / 40.0).clamp(0.0, 1.0);
-            let amount = purple * pn * edge;
-            if amount <= 0.0 {
+            let amount = strength * pn * edge;
+            if amount == 0.0 {
                 continue;
             }
             let gray = luma8(p);
@@ -789,57 +1317,12 @@ fn hash_noise(x: u32, y: u32, seed: u32) -> f32 {
     (h & 0x00FF_FFFF) as f32 / 0x00FF_FFFF as f32 * 2.0 - 1.0
 }
 
-fn grain_value(kind: GrainKind, x: u32, y: u32) -> f32 {
-    let h = hash_noise(x, y, 0x9E37);
-    match kind {
-        // Fine, even noise.
-        GrainKind::FineGrain => h,
-        // Two octaves: slightly coarser and denser than fine.
-        GrainKind::SilverRich => (h * 0.7 + hash_noise(x * 2, y * 2, 0x51D3) * 0.3) * 1.1,
-        // Averaged hashes: soft, low-contrast speckle.
-        GrainKind::SoftGrain => {
-            (h + hash_noise(x + 17, y + 31, 0x1234) + hash_noise(x + 91, y + 7, 0x5678)) / 3.0
-        }
-        // Cubic shaping: most values stay close to zero, few large ones.
-        GrainKind::CubicGrain => h * h * h,
-        // Quantised into four levels: tabular, blocky grain.
-        GrainKind::TabularGrain => ((h * 2.0).round() / 2.0).clamp(-1.0, 1.0),
-        // Harsh: high contrast, peaks survive.
-        GrainKind::HarshGrain => h.signum() * h.abs().powf(0.4) * 1.25,
-    }
-}
-
-fn stage_grain(buf: &mut [u8], w: usize, _h: usize, adj: &FilmGrain) {
-    let impact = (adj.impact / 100.0).clamp(0.0, 1.0);
-    if impact <= 0.0 {
-        return;
-    }
-    let granularity = (adj.granularity / 100.0).clamp(0.0, 1.0);
-    let cell = 1 + (granularity * 3.0).round() as u32;
-    let amount = impact * 0.25;
-    let kind = adj.kind;
-    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let i = x * 4;
-            let mut n = grain_value(kind, (x as u32) / cell, (y as u32) / cell);
-            if kind == GrainKind::SilverRich {
-                // Silver-rich grain sits mostly in the midtones.
-                let p = [row[i], row[i + 1], row[i + 2]];
-                let l = luma8(p) / 255.0;
-                n *= 1.0 - (l - 0.5).abs() * 1.2;
-            }
-            let d = (n * amount * 255.0).round();
-            for k in 0..3 {
-                row[i + k] = (row[i + k] as f32 + d).clamp(0.0, 255.0).round() as u8;
-            }
-        }
-    });
-}
 // ───────────────────────────── tests ─────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RadialBlur;
 
     // Fingerprints from the original stages, including clamped edges and alpha.
     #[test]
@@ -848,7 +1331,7 @@ mod tests {
             15226162907845603633, 15226162907845603633, 15226162907845603633,
             418812772922979691, 4342420695348529323, 1578698336601148913,
             41615323049186328, 10717340786263556290, 2697018795909425383,
-            1126012190753934001, 11750616206334758719, 16575147648956657441,
+            17974978512109289819, 11750616206334758719, 16575147648956657441,
         ];
         let mut actual = Vec::new();
         for (w, h) in [(1, 1), (1, 17), (19, 1), (37, 23)] {
@@ -857,7 +1340,7 @@ mod tests {
                 let mut pixels = base.clone();
                 match stage {
                     0 => stage_luminance_nr(&mut pixels, w, h, &NoiseReduction {
-                        luminance: 73.0, details: 41.0, color: 0.0, single_pixel: 87.0,
+                        luminance: 73.0, details: 41.0, color: 0.0, single_pixel: 0.0,
                     }),
                     1 => stage_color_nr(&mut pixels, w, h, &NoiseReduction {
                         luminance: 0.0, details: 0.0, color: 100.0, single_pixel: 0.0,
@@ -937,7 +1420,7 @@ mod tests {
                 luminance: 60.0,
                 details: 35.0,
                 color: 40.0,
-                single_pixel: 20.0,
+                single_pixel: 0.0,
             },
             sharpening: Sharpening {
                 amount: 180.0,
@@ -1006,20 +1489,12 @@ mod tests {
             pattern: 50.0,
         };
         adj.lens = LensCorrection {
-            profile: None,
-            use_profile: false,
             distortion: 30.0,
-            sharpness_falloff: 0.0,
             light_falloff: 30.0,
             chromatic_aberration: true,
             purple_fringing: 40.0,
             hide_distorted_areas: false,
-            ca_red_points: Vec::new(),
-            ca_blue_points: Vec::new(),
-            shift_x: 0.0,
-            shift_y: 0.0,
-            manufacturer: None,
-            mount: None,
+            ..Default::default()
         };
         adj.sharpening = Sharpening {
             amount: 160.0,
@@ -1079,20 +1554,8 @@ mod tests {
             stage_base.moire.amount = 0.0;
             stage_base.sharpening.amount = 0.0;
             stage_base.lens = LensCorrection {
-                profile: None,
-                use_profile: false,
-                distortion: 0.0,
-                sharpness_falloff: 0.0,
-                light_falloff: 0.0,
-                chromatic_aberration: false,
-                purple_fringing: 0.0,
                 hide_distorted_areas: false,
-                ca_red_points: Vec::new(),
-                ca_blue_points: Vec::new(),
-                shift_x: 0.0,
-                shift_y: 0.0,
-                manufacturer: None,
-                mount: None,
+                ..Default::default()
             };
             let stages = [
                 ("luminance", NoiseReduction { luminance: 50.0, details: 50.0, color: 0.0, single_pixel: 0.0 }, Moire::default(), Sharpening { amount: 0.0, ..Default::default() }, stage_base.lens.clone()),
@@ -1140,24 +1603,9 @@ mod tests {
             std::fs::write(dir.join("gpu.rgba"), &gpu_frame).expect("write GPU frame");
         }
 
-        unsafe { std::env::set_var("AURORA_DETAIL_GPU", "1") };
-        let mut production = original.clone();
-        assert!(detail_gpu::post_process(
-            &mut production,
-            w as usize,
-            h as usize,
-            &adj.noise_reduction,
-            &adj.moire,
-            &adj.sharpening,
-            &adj.lens,
-            1.0,
-        ));
-        assert_eq!(production, gpu_frame);
-
         let mut cpu_ms = Vec::new();
         let mut gpu_pool_ms = Vec::new();
         let mut gpu_alloc_ms = Vec::new();
-        let mut gpu_production_ms = Vec::new();
         for _ in 0..3 {
             let start = Instant::now();
             let mut frame = original.clone();
@@ -1185,42 +1633,23 @@ mod tests {
             )
             .expect("CUDA detail allocate-and-run");
             gpu_alloc_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-
-            let start = Instant::now();
-            let mut frame = original.clone();
-            assert!(detail_gpu::post_process(
-                &mut frame,
-                w as usize,
-                h as usize,
-                &adj.noise_reduction,
-                &adj.moire,
-                &adj.sharpening,
-                &adj.lens,
-                1.0,
-            ));
-            gpu_production_ms.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         cpu_ms.sort_by(f64::total_cmp);
         gpu_pool_ms.sort_by(f64::total_cmp);
         gpu_alloc_ms.sort_by(f64::total_cmp);
-        gpu_production_ms.sort_by(f64::total_cmp);
         println!(
             "DETAIL_REAL nef={path} w={w} h={h} cpu_p50_ms={:.1} cpu_p95_ms={:.1} \
 gpu_pool_p50_ms={:.1} gpu_pool_p95_ms={:.1} gpu_alloc_p50_ms={:.1} \
-gpu_alloc_p95_ms={:.1} gpu_prod_p50_ms={:.1} gpu_prod_p95_ms={:.1} \
-speedup_pool_p50={:.2} speedup_alloc_p50={:.2} speedup_prod_p50={:.2} \
-max_diff={max_diff} over1={over1} diff_px={diff_px}",
+gpu_alloc_p95_ms={:.1} speedup_pool_p50={:.2} speedup_alloc_p50={:.2} max_diff={max_diff} \
+over1={over1} diff_px={diff_px}",
             cpu_ms[1],
             cpu_ms[2],
             gpu_pool_ms[1],
             gpu_pool_ms[2],
             gpu_alloc_ms[1],
             gpu_alloc_ms[2],
-            gpu_production_ms[1],
-            gpu_production_ms[2],
             cpu_ms[1] / gpu_pool_ms[1],
             cpu_ms[1] / gpu_alloc_ms[1],
-            cpu_ms[1] / gpu_production_ms[1],
         );
         assert_eq!((max_diff, over1, diff_px), (0, 0, 0));
 
@@ -1270,89 +1699,8 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
         run("moire", &|b| stage_moire(b, w, h, &moire));
         run("sharpening", &|b| stage_sharpening(b, w, h, &adj.sharpening, 1.0));
         run("lens(generic)", &|b| stage_lens(b, w, h, &lens, None));
-        run("grain", &|b| stage_grain(b, w, h, &grain));
-        assert!(detail_gpu::prewarm());
+        run("grain", &|b| crate::mock::grain::stage(b, w, h, &grain, 1.0));
         run("post_process(all on)", &|b| post_process_with_lens(b, w as u32, h as u32, &adj, 1.0, None));
-        run("post_process(all warm)", &|b| post_process_with_lens(b, w as u32, h as u32, &adj, 1.0, None));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "needs an NVIDIA CUDA device and profiles the CPU/GPU crossover"]
-    fn bench_detail_gpu_crossover() {
-        use std::time::Instant;
-
-        let Some(gpu) = detail_gpu::open_for_bench() else { return };
-        let sizes = [(64usize, 64usize), (320, 240), (800, 600), (1400, 933)];
-        let max = sizes.iter().map(|(w, h)| w * h * 4).max().unwrap();
-        let pool = gpu.alloc_buffer(max * 6).expect("CUDA detail pool");
-        let lut = gpu.alloc_buffer(1025 * 4).expect("CUDA detail LUT");
-        let mut adj = crate::AdjustmentSet::default();
-        adj.film_grain.impact = 0.0;
-        let saved = std::env::var_os("AURORA_DETAIL_GPU");
-        for (w, h) in sizes {
-            let base: Vec<u8> = (0..w * h)
-                .flat_map(|i| {
-                    let (x, y) = (i % w, i / w);
-                    [
-                        (x.wrapping_mul(17) + y.wrapping_mul(3)) as u8,
-                        (x.wrapping_mul(5) + y.wrapping_mul(19)) as u8,
-                        (x.wrapping_mul(13) + y.wrapping_mul(7)) as u8,
-                        255,
-                    ]
-                })
-                .collect();
-            let run_cpu = |buf: &mut [u8]| {
-                unsafe { std::env::set_var("AURORA_DETAIL_GPU", "0") };
-                post_process(buf, w as u32, h as u32, &adj, 1.0);
-            };
-            let run_gpu = |buf: &mut [u8]| {
-                detail_gpu::post_process_pool(
-                    &gpu,
-                    buf,
-                    w,
-                    h,
-                    &adj.noise_reduction,
-                    &adj.moire,
-                    &adj.sharpening,
-                    &adj.lens,
-                    1.0,
-                    &pool,
-                    Some(&lut),
-                )
-                .expect("CUDA detail");
-            };
-            let mut cpu_check = base.clone();
-            let mut gpu_check = base.clone();
-            run_cpu(&mut cpu_check);
-            run_gpu(&mut gpu_check);
-            assert_eq!(gpu_check, cpu_check, "{w}x{h}");
-
-            let measure = |run: &dyn Fn(&mut [u8])| {
-                let mut times = Vec::with_capacity(7);
-                for _ in 0..7 {
-                    let mut buf = base.clone();
-                    let started = Instant::now();
-                    run(&mut buf);
-                    times.push(started.elapsed().as_secs_f64() * 1000.0);
-                    std::hint::black_box(buf);
-                }
-                times.sort_by(f64::total_cmp);
-                times[times.len() / 2]
-            };
-            let cpu = measure(&run_cpu);
-            let gpu = measure(&run_gpu);
-            println!(
-                "DETAIL_CROSSOVER {w}x{h} cpu={cpu:.2} gpu={gpu:.2} speedup={:.2}x",
-                cpu / gpu
-            );
-        }
-        unsafe {
-            match saved {
-                Some(value) => std::env::set_var("AURORA_DETAIL_GPU", value),
-                None => std::env::remove_var("AURORA_DETAIL_GPU"),
-            }
-        }
     }
 
     /// An adjustment set with every detail stage switched off.
@@ -1371,22 +1719,11 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
             halo_suppression: 0.0,
         };
         adj.moire = Moire { amount: 0.0, pattern: 0.0 };
-        adj.film_grain = FilmGrain { kind: GrainKind::FineGrain, impact: 0.0, granularity: 50.0 };
+        adj.film_grain =
+            FilmGrain { kind: GrainKind::FineGrain, impact: 0.0, granularity: 50.0, density: 0.0 };
         adj.lens = LensCorrection {
-            profile: None,
-            use_profile: false,
-            distortion: 0.0,
-            sharpness_falloff: 0.0,
-            light_falloff: 0.0,
-            chromatic_aberration: false,
-            purple_fringing: 0.0,
             hide_distorted_areas: false,
-            shift_x: 0.0,
-            shift_y: 0.0,
-            ca_red_points: Vec::new(),
-            ca_blue_points: Vec::new(),
-            manufacturer: None,
-            mount: None,
+            ..Default::default()
         };
         adj
     }
@@ -1395,6 +1732,64 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
         let n = px.len() as f32;
         let mean = px.iter().map(|v| *v as f32).sum::<f32>() / n;
         px.iter().map(|v| (*v as f32 - mean).powi(2)).sum::<f32>() / n
+    }
+
+    #[test]
+    fn diffraction_is_a_noop_when_disabled() {
+        let (w, h) = (32usize, 32usize);
+        let buf: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i % 251) as u8, (i % 97) as u8, (i % 53) as u8, 255])
+            .collect();
+        let mut out = buf.clone();
+        stage_diffraction(&mut out, w, h, &LensCorrection::default(), 1.0);
+        assert_eq!(out, buf, "disabled diffraction must not touch a byte");
+    }
+
+    #[test]
+    fn diffraction_spreads_a_point_and_keeps_the_energy() {
+        let (w, h) = (48usize, 48usize);
+        let mut buf = vec![0u8; w * h * 4];
+        for px in buf.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let center = ((h / 2) * w + w / 2) * 4;
+        buf[center] = 255;
+        buf[center + 1] = 255;
+        buf[center + 2] = 255;
+        let before: u64 = buf.chunks_exact(4).map(|px| px[0] as u64).sum();
+
+        let lens = LensCorrection { diffraction_enabled: true, aperture: 16.0, ..Default::default() };
+        stage_diffraction(&mut buf, w, h, &lens, 1.0);
+        assert!(buf[center] < 255, "centre {}", buf[center]);
+        assert!(
+            buf[center + 4 * 2] > 0 || buf[center - 4 * 2] > 0 || buf[center + 2] > 0,
+            "no light reached the neighbours"
+        );
+        let after: u64 = buf.chunks_exact(4).map(|px| px[0] as u64).sum();
+        assert!(
+            after as f32 >= before as f32 * 0.93,
+            "energy {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn diffraction_gate_requires_a_working_aperture() {
+        let buf = vec![128u8; 16 * 16 * 4];
+        for aperture in [0.0, 0.5, 50.5] {
+            let lens = LensCorrection { diffraction_enabled: true, aperture, ..Default::default() };
+            let mut out = buf.clone();
+            stage_diffraction(&mut out, 16, 16, &lens, 1.0);
+            assert_eq!(out, buf, "aperture {aperture} must be outside the gate");
+        }
+    }
+
+    #[test]
+    fn pixel_pitch_comes_from_the_mount_and_scales_the_fallback() {
+        let mounted = LensCorrection { mount: Some("nikon z".into()), ..Default::default() };
+        let pitch = pixel_pitch_um(&mounted, 6048, 4032, 1.0);
+        assert!((pitch - 5.946).abs() < 0.01, "pitch {pitch}");
+        assert_eq!(pixel_pitch_um(&LensCorrection::default(), 6048, 4032, 1.0), 4.0);
+        assert_eq!(pixel_pitch_um(&LensCorrection::default(), 1000, 1000, 0.5), 8.0);
     }
 
     /// The luma-plane reuse in NR/sharpening must not change a single byte:
@@ -1528,6 +1923,81 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
         assert!(buf[hot] < 130, "hot pixel should be pulled back: {}", buf[hot]);
     }
 
+    /// Dark sky, a few one-pixel stars, one hot pixel and a 3x3 bright plateau
+    /// (a planet-sized object that must not be taken for a spike).
+    fn star_field(size: usize) -> Vec<u8> {
+        let mut buf = flat(size, 18);
+        let mut put = |x: usize, y: usize, v: u8| {
+            let i = (y * size + x) * 4;
+            buf[i] = v;
+            buf[i + 1] = v;
+            buf[i + 2] = v;
+        };
+        put(3, 4, 210);
+        put(11, 2, 180);
+        put(6, 12, 160);
+        put(size / 2, size / 2, 255);
+        for dy in 0..5 {
+            for dx in 0..5 {
+                put(size / 2 - 8 + dx, size / 2 - 8 + dy, 200);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn single_pixel_zero_is_byte_identical() {
+        let (w, h) = (24usize, 24usize);
+        let before = star_field(w);
+        let mut buf = before.clone();
+        let mut adj = off();
+        adj.noise_reduction.single_pixel = 0.0;
+        post_process(&mut buf, w as u32, h as u32, &adj, 1.0);
+        assert_eq!(buf, before, "amount 0 must leave every byte alone");
+        stage_single_pixel(&mut buf, w, h, &adj.noise_reduction);
+        assert_eq!(buf, before, "the stage itself must be a no-op at 0");
+    }
+
+    #[test]
+    fn single_pixel_replaces_the_spike_and_leaves_its_neighbours() {
+        let (w, h) = (24usize, 24usize);
+        let before = star_field(w);
+        let mut buf = before.clone();
+        let mut adj = off();
+        adj.noise_reduction.single_pixel = 100.0;
+        post_process(&mut buf, w as u32, h as u32, &adj, 1.0);
+
+        let hot = ((h / 2) * w + w / 2) * 4;
+        assert!(buf[hot] < 60, "hot pixel should fall to the sky: {}", buf[hot]);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let i = (((h / 2) as i32 + dy) as usize * w
+                    + ((w / 2) as i32 + dx) as usize)
+                    * 4;
+                assert_eq!(&buf[i..i + 3], &before[i..i + 3], "neighbour {dx},{dy} changed");
+            }
+        }
+    }
+
+    #[test]
+    fn single_pixel_keeps_a_bright_plateau() {
+        let (w, h) = (24usize, 24usize);
+        let before = star_field(w);
+        let mut buf = before.clone();
+        let mut adj = off();
+        adj.noise_reduction.single_pixel = 100.0;
+        post_process(&mut buf, w as u32, h as u32, &adj, 1.0);
+        for dy in 0..3 {
+            for dx in 0..3 {
+                let i = ((h / 2 - 7 + dy) * w + (w / 2 - 7 + dx)) * 4;
+                assert_eq!(&buf[i..i + 3], &before[i..i + 3], "plateau {dx},{dy} changed");
+            }
+        }
+    }
+
     #[test]
     fn color_nr_reduces_chroma_variance_only() {
         let mut buf = vec![0u8; 16 * 16 * 4];
@@ -1555,15 +2025,117 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
         );
     }
 
+    fn chroma_speckle(size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; size * size * 4];
+        for i in 0..size * size {
+            let (cb, cr) = match i % 4 {
+                0 => (-24i32, 18i32),
+                1 => (20, -16),
+                2 => (0, 0),
+                _ => (-10, 10),
+            };
+            let y = 118.0f32;
+            let rgb = [
+                y + 1.402 * cr as f32,
+                y - 0.344136 * cb as f32 - 0.714136 * cr as f32,
+                y + 1.772 * cb as f32,
+            ];
+            for (k, v) in rgb.into_iter().enumerate() {
+                buf[i * 4 + k] = v.clamp(0.0, 255.0).round() as u8;
+            }
+            buf[i * 4 + 3] = 255;
+        }
+        buf
+    }
+
+    /// CNR is off at 0, never adds chroma noise as the amount grows, and keeps
+    /// the three channels coupled (luma stays put).
     #[test]
-    fn moire_flattens_checkerboard() {
+    fn cnr_zero_is_identity_and_strength_is_monotonic() {
+        let (w, h) = (24usize, 24usize);
+        let base = chroma_speckle(w);
+        let run = |amount: f32| {
+            let mut adj = off();
+            adj.noise_reduction.color = amount;
+            let mut buf = base.clone();
+            stage_color_nr(&mut buf, w, h, &adj.noise_reduction);
+            buf
+        };
+        assert_eq!(run(0.0), base, "CNR 0 must be byte-identical");
+        let c25 = chroma_variance(&run(25.0));
+        let c50 = chroma_variance(&run(50.0));
+        let c100 = chroma_variance(&run(100.0));
+        assert!(c25 <= chroma_variance(&base));
+        assert!(c50 <= c25 + 1e-3 && c100 <= c50 + 1e-3, "CNR must not add chroma noise");
+        for amount in [25.0, 50.0, 100.0] {
+            let out = run(amount);
+            for (i, px) in out.chunks_exact(4).enumerate() {
+                let l = luma8([px[0], px[1], px[2]]);
+                assert!((l - 118.0).abs() < 6.0, "luma moved at {i}: {l}");
+            }
+        }
+    }
+
+    /// Low-amplitude colour oscillation with a constant luma: the exact shape
+    /// colour moire takes, and what the v4 guard is meant to pass.
+    fn colour_moire(size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; size * size * 4];
+        for y in 0..size {
+            for x in 0..size {
+                let i = (y * size + x) * 4;
+                let (r, b) = if (x / 4 + y / 4) % 2 == 0 { (128, 110) } else { (108, 128) };
+                buf[i] = r;
+                buf[i + 1] = 118;
+                buf[i + 2] = b;
+                buf[i + 3] = 255;
+            }
+        }
+        buf
+    }
+
+    fn chroma_variance(buf: &[u8]) -> f32 {
+        let c: Vec<u8> = buf.chunks_exact(4).map(|p| (p[0] as i16 - p[1] as i16 + 128) as u8).collect();
+        variance(&c)
+    }
+
+    /// The kernel's own luma: `(R + 2G + B) / 4`, before Rec.709 weighting.
+    fn kernel_luma_variance(buf: &[u8]) -> f32 {
+        let y: Vec<u8> = buf
+            .chunks_exact(4)
+            .map(|p| ((p[0] as u32 + 2 * p[1] as u32 + p[2] as u32) / 4) as u8)
+            .collect();
+        variance(&y)
+    }
+
+    #[test]
+    fn moire_flattens_colour_pattern_and_keeps_luminance() {
+        let mut buf = colour_moire(32);
+        let (luma_before, chroma_before) = (kernel_luma_variance(&buf), chroma_variance(&buf));
+        let mut adj = off();
+        adj.moire.amount = 100.0;
+        adj.moire.pattern = 8.0;
+        stage_moire(&mut buf, 32, 32, &adj.moire);
+        assert!(chroma_variance(&buf) < chroma_before * 0.5, "colour moire should drop");
+        assert!((kernel_luma_variance(&buf) - luma_before).abs() < 1e-6, "luminance is not filtered");
+    }
+
+    #[test]
+    fn moire_leaves_a_luminance_checkerboard_alone() {
         let mut buf = checkerboard(16);
         let before = luma_variance(&buf);
         let mut adj = off();
         adj.moire.amount = 100.0;
-        adj.moire.pattern = 100.0;
-        post_process(&mut buf, 16, 16, &adj, 1.0);
-        assert!(luma_variance(&buf) < before, "moire should flatten the pattern");
+        adj.moire.pattern = 8.0;
+        stage_moire(&mut buf, 16, 16, &adj.moire);
+        assert!((luma_variance(&buf) - before).abs() < 1.0, "moire is chroma-only");
+    }
+
+    #[test]
+    fn zero_moire_is_identity() {
+        let base = colour_moire(16);
+        let mut buf = base.clone();
+        stage_moire(&mut buf, 16, 16, &off().moire);
+        assert_eq!(buf, base);
     }
 
     #[test]
@@ -1624,6 +2196,127 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
         let corner = 0;
         let centre = (8 * 16 + 8) * 4;
         assert!(buf[corner] > buf[centre], "falloff correction brightens the edge");
+    }
+
+    #[test]
+    fn uniform_light_gate_off_leaves_the_frame_untouched() {
+        let base = flat(16, 90);
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.uniform_light = 120.0;
+        adj.lens.uniform_light_enabled = false;
+        stage_uniform_light(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(base, buf, "ZLENSLCCLIGHTFALLOFF=0 must keep the amount inert");
+    }
+
+    #[test]
+    fn uniform_light_brightens_corners_when_armed() {
+        let mut buf = flat(16, 80);
+        let mut adj = off();
+        adj.lens.uniform_light = 100.0;
+        adj.lens.uniform_light_enabled = true;
+        post_process(&mut buf, 16, 16, &adj, 1.0);
+        let corner = 0;
+        let centre = (8 * 16 + 8) * 4;
+        assert!(buf[corner] > buf[centre], "uniform light brightens the edge");
+    }
+
+    #[test]
+    fn dust_removal_gate_off_leaves_the_frame_untouched() {
+        let base = flat(16, 90);
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.dust_removal_enabled = false;
+        adj.lens.dust_patches = vec![crate::DustPatch {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+            offset: 0,
+            bias: 0,
+            step: 16,
+        }];
+        post_process(&mut buf, 16, 16, &adj, 1.0);
+        assert_eq!(base, buf, "ZLENSDUSTREMOVALENABLED=0 must keep the patches inert");
+    }
+
+    #[test]
+    fn dust_removal_applies_patches_when_armed() {
+        let mut buf = flat(16, 90);
+        let mut adj = off();
+        adj.lens.dust_removal_enabled = true;
+        adj.lens.dust_patches = vec![crate::DustPatch {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+            offset: 0,
+            bias: 0,
+            step: 16,
+        }];
+        post_process(&mut buf, 16, 16, &adj, 1.0);
+        assert!(buf[0] > 90, "the patch brightens its rectangle");
+        assert_eq!(buf[(12 * 16 + 12) * 4], 90, "outside the patch is untouched");
+    }
+
+    fn sharp_curves() -> RadialBlur {
+        RadialBlur {
+            radial: vec![(0.0, 0.0), (1.0, 200000.0)],
+            transverse: vec![(0.0, 0.0), (1.0, 200000.0)],
+            valid: true,
+        }
+    }
+
+    #[test]
+    fn sharpness_falloff_below_half_amount_leaves_the_frame_untouched() {
+        let base = checkerboard(16);
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.sharpness_falloff = 0.49;
+        adj.lens.radial_blur = sharp_curves();
+        stage_sharpness_falloff(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(base, buf, "amount < 0.5 is CImgOpFixRadialBlur identity");
+    }
+
+    #[test]
+    fn sharpness_falloff_needs_a_valid_curve() {
+        let base = checkerboard(16);
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.sharpness_falloff = 100.0;
+        adj.lens.radial_blur = RadialBlur { valid: false, ..sharp_curves() };
+        stage_sharpness_falloff(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(base, buf, "valid = 0 is identity");
+    }
+
+    #[test]
+    fn sharpness_falloff_with_a_curve_changes_the_frame() {
+        let base = checkerboard(32);
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.sharpness_falloff = 100.0;
+        adj.lens.radial_blur = sharp_curves();
+        post_process(&mut buf, 32, 32, &adj, 1.0);
+        assert_ne!(base, buf, "a valid curve must reach the pixels");
+    }
+
+    #[test]
+    fn zero_shift_and_tilt_leaves_the_frame_untouched() {
+        let base = checkerboard(16);
+        let mut buf = base.clone();
+        let adj = off();
+        stage_movement(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(base, buf, "shift_x = shift_y = tilt = 0 is identity");
+    }
+
+    #[test]
+    fn shift_moves_the_frame() {
+        let base = checkerboard(16);
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.shift_x = 5.0;
+        post_process(&mut buf, 16, 16, &adj, 1.0);
+        assert_ne!(base, buf, "a non-zero shift must resample");
     }
 
     #[test]
@@ -1806,5 +2499,178 @@ max_diff={max_diff} over1={over1} diff_px={diff_px}",
         post_process_with_lens(&mut a, 32, 32, &adj, 1.0, Some(&warp(&[(0.0, 0.0), (0.5, 0.04)], &[])));
         post_process_with_lens(&mut b, 32, 32, &adj, 1.0, Some(&warp(&[(0.0, 0.0), (0.5, 0.04), (1.0, 0.04)], &[])));
         assert_eq!(a, b);
+    }
+
+    // ── purple fringe: signed -100..100, 0 is the identity ──
+
+    #[test]
+    fn purple_norm_maps_the_signed_slider() {
+        assert_eq!(crate::mock::purple_norm(-100.0), 0.0);
+        assert_eq!(crate::mock::purple_norm(0.0), 0.5);
+        assert_eq!(crate::mock::purple_norm(100.0), 1.0);
+        assert!((crate::mock::purple_norm(-50.0) - 0.25).abs() < 1e-6);
+        assert!((crate::mock::purple_norm(50.0) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn purple_strength_is_symmetric_around_zero() {
+        for amount in [5.0f32, 25.0, 50.0, 100.0] {
+            let plus = crate::mock::purple_strength(crate::mock::purple_norm(amount));
+            let minus = crate::mock::purple_strength(crate::mock::purple_norm(-amount));
+            assert!((plus + minus).abs() < 1e-6, "{amount}: {plus} vs {minus}");
+            assert!((plus - amount / 100.0).abs() < 1e-6, "{amount}: {plus}");
+        }
+        assert_eq!(
+            crate::mock::purple_strength(crate::mock::purple_norm(0.0)),
+            0.0
+        );
+    }
+
+    /// 3×3 with a purple centre and black/white neighbours, so `pn` and `edge`
+    /// both sit at their maximum and the arithmetic is easy to assert.
+    fn purple_probe() -> Vec<u8> {
+        let mut buf = vec![0u8; 3 * 3 * 4];
+        for (i, px) in buf.chunks_mut(4).enumerate() {
+            let luma = match i {
+                4 => [180, 100, 180],
+                _ if i % 2 == 0 => [0, 0, 0],
+                _ => [255, 255, 255],
+            };
+            px[..3].copy_from_slice(&luma);
+            px[3] = 255;
+        }
+        buf
+    }
+
+    #[test]
+    fn purple_zero_amount_is_byte_identical() {
+        let mut buf = purple_probe();
+        let base = buf.clone();
+        stage_purple_fringing(&mut buf, 3, 3, crate::mock::purple_norm(0.0));
+        assert_eq!(buf, base);
+
+        let mut adj = off();
+        adj.lens.purple_fringing = 0.0;
+        let mut whole = base.clone();
+        stage_lens(&mut whole, 3, 3, &adj.lens, None);
+        assert_eq!(whole, base);
+    }
+
+    #[test]
+    fn purple_positive_and_negative_are_mirror_images() {
+        let base = purple_probe();
+        let mut up = base.clone();
+        let mut down = base.clone();
+        stage_purple_fringing(&mut up, 3, 3, crate::mock::purple_norm(50.0));
+        stage_purple_fringing(&mut down, 3, 3, crate::mock::purple_norm(-50.0));
+        let centre = 4 * 4;
+        for k in 0..3 {
+            let delta_up = up[centre + k] as i32 - base[centre + k] as i32;
+            let delta_down = down[centre + k] as i32 - base[centre + k] as i32;
+            assert!(delta_up != 0, "channel {k} did not move");
+            assert_eq!(delta_up.signum(), -delta_down.signum(), "channel {k}");
+            assert!(
+                (delta_up.abs() - delta_down.abs()).abs() <= 1,
+                "channel {k}: {delta_up} vs {delta_down}"
+            );
+        }
+        // The neighbours are the edge source and must stay untouched.
+        for i in 0..9 {
+            if i != 4 {
+                assert_eq!(&up[i * 4..i * 4 + 4], &base[i * 4..i * 4 + 4]);
+            }
+        }
+    }
+
+    // ── Lateral chromatic aberration (six-curve profile table) ─────────────
+
+    fn ca_lens(strength: f32, shift: f32, ra: f32) -> LensCorrection {
+        let mut lens = LensCorrection::default();
+        lens.chromatic_aberration = true;
+        lens.ca_fringing.red_shift = vec![(0.0, shift), (1.0, shift)];
+        lens.ca_fringing.blue_shift = vec![(0.0, -shift), (1.0, -shift)];
+        lens.ca_fringing.red_ra = vec![(0.0, ra), (1.0, ra)];
+        lens.ca_fringing.blue_ra = vec![(0.0, -ra), (1.0, -ra)];
+        lens.ca_fringing.red_strength = vec![(0.0, strength), (1.0, strength)];
+        lens.ca_fringing.blue_strength = vec![(0.0, strength), (1.0, strength)];
+        lens
+    }
+
+    fn ca_red_at(buf: &[u8], size: usize, x: usize, y: usize) -> i32 {
+        buf[(y * size + x) * 4] as i32
+    }
+
+    #[test]
+    fn ca_without_curves_or_with_zero_strength_is_byte_identical() {
+        let base = axis_gradient(48);
+        let mut none = base.clone();
+        stage_ca_fringes(&mut none, 48, 48, &ca_lens(1.0, 0.0, 0.0));
+        assert_eq!(none, base, "empty tables resampled the frame");
+
+        let mut zero = base.clone();
+        stage_ca_fringes(&mut zero, 48, 48, &ca_lens(0.0, 0.1, 0.0));
+        assert_eq!(zero, base, "strength 0 moved pixels");
+    }
+
+    #[test]
+    fn ca_shift_moves_the_red_edge_along_the_radius() {
+        let base = axis_gradient(48);
+        let mut half = base.clone();
+        let mut full = base.clone();
+        stage_ca_fringes(&mut half, 48, 48, &ca_lens(0.5, 0.1, 0.0));
+        stage_ca_fringes(&mut full, 48, 48, &ca_lens(1.0, 0.1, 0.0));
+        // R falls with x, so an outward sample lowers R further from the centre.
+        let p = (40, 8);
+        let (b, h, f) =
+            (ca_red_at(&base, 48, p.0, p.1), ca_red_at(&half, 48, p.0, p.1), ca_red_at(&full, 48, p.0, p.1));
+        assert!(h < b, "half strength did not move red: {b} -> {h}");
+        assert!(f < h, "full strength must move red further: {h} -> {f}");
+    }
+
+    #[test]
+    fn ca_shift_grows_with_the_radius_and_leaves_the_centre_alone() {
+        let base = axis_gradient(48);
+        let mut moved = base.clone();
+        stage_ca_fringes(&mut moved, 48, 48, &ca_lens(1.0, 0.1, 0.0));
+        let centre_delta = (ca_red_at(&base, 48, 24, 24) - ca_red_at(&moved, 48, 24, 24)).abs();
+        let corner_delta = (ca_red_at(&base, 48, 44, 44) - ca_red_at(&moved, 48, 44, 44)).abs();
+        assert!(centre_delta <= 1, "the optical centre moved: {centre_delta}");
+        assert!(corner_delta > centre_delta, "the corner moved less than the centre");
+    }
+
+    #[test]
+    fn ca_ra_adds_radial_gain_on_top_of_the_shift() {
+        let base = axis_gradient(48);
+        let mut shifted = base.clone();
+        let mut gained = base.clone();
+        stage_ca_fringes(&mut shifted, 48, 48, &ca_lens(1.0, 0.05, 0.0));
+        stage_ca_fringes(&mut gained, 48, 48, &ca_lens(1.0, 0.05, 0.05));
+        let p = (40, 8);
+        let (s, g) = (ca_red_at(&shifted, 48, p.0, p.1), ca_red_at(&gained, 48, p.0, p.1));
+        assert!(g < s, "ra did not add displacement: {s} -> {g}");
+    }
+
+    #[test]
+    fn purple_fringing_runs_after_the_ca_resample() {
+        let mut base = vec![0u8; 48 * 48 * 4];
+        for y in 0..48 {
+            for x in 0..48 {
+                let i = (y * 48 + x) * 4;
+                if x < 24 {
+                    base[i] = 220; // purple side: red and blue high, green low
+                    base[i + 2] = 220;
+                }
+                base[i + 1] = 10;
+                base[i + 3] = 255;
+            }
+        }
+        let mut ca_only = base.clone();
+        stage_ca_fringes(&mut ca_only, 48, 48, &ca_lens(1.0, 0.1, 0.0));
+        let mut purple_only = base.clone();
+        stage_purple_fringing(&mut purple_only, 48, 48, crate::mock::purple_norm(50.0));
+        let mut both = ca_only.clone();
+        stage_purple_fringing(&mut both, 48, 48, crate::mock::purple_norm(50.0));
+        assert_ne!(both, ca_only, "purple fringing did not run after CA");
+        assert_ne!(both, purple_only, "CA did not change what purple saw");
     }
 }

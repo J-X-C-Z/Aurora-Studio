@@ -14,7 +14,7 @@ use rayon::prelude::*;
 
 use crate::hdr::FusedFrame;
 use crate::mock::process::{linear_to_srgb, Plane};
-use crate::Source;
+use crate::{PanoramaOptions, Projection, Source};
 
 /// Half-width of the offset search around a 50 % overlap, as a fraction of the
 /// narrower frame: 25 % ..= 75 % of the frame width.
@@ -129,6 +129,92 @@ pub fn stitch(frames: &[&Source]) -> Result<FusedFrame> {
     });
 
     Ok(FusedFrame { width: canvas_width, height: canvas_height, rgb })
+}
+
+/// Stitches with the interface's projection.
+///
+/// `Perspective` is the legacy translation stitch, byte for byte. The other
+/// projections first build that canvas and then resample it through the
+/// cylindrical / spherical / Panini inverse map around the panorama centre.
+/// This is a B-level projection: camera pose and per-frame focal length are
+/// not recovered, so the map is applied to the stitched rectilinear canvas
+/// rather than to each input frame.
+pub fn stitch_with_options(frames: &[&Source], options: &PanoramaOptions) -> Result<FusedFrame> {
+    let base = stitch(frames)?;
+    if frames.len() < 2 || options.projection == Projection::Perspective {
+        return Ok(base);
+    }
+    Ok(project(&base, options.projection))
+}
+
+/// Horizontal field of view assumed when converting pixels to angles. C1
+/// takes the focal length from EXIF; the engine has no camera parameters in
+/// `Source`, so the projection starts from one documented constant.
+const ASSUMED_HFOV_DEG: f32 = 60.0;
+
+fn project(base: &FusedFrame, projection: Projection) -> FusedFrame {
+    let (width, height) = (base.width, base.height);
+    if width < 2 || height < 2 || base.rgb.len() < width as usize * height as usize {
+        return FusedFrame { width, height, rgb: base.rgb.clone() };
+    }
+    let f = width as f32 / (2.0 * (ASSUMED_HFOV_DEG * 0.5).to_radians().tan());
+    let cx = (width as f32 - 1.0) * 0.5;
+    let cy = (height as f32 - 1.0) * 0.5;
+    // Keep tan() finite at the vertical poles; 80 degrees is outside any
+    // practical panorama but still short of 90.
+    const ANGLE_LIMIT: f32 = 1.396_263_4;
+
+    let rgb: Vec<[f32; 3]> = (0..width as usize * height as usize)
+        .into_par_iter()
+        .map(|i| {
+            let x = (i % width as usize) as f32;
+            let y = (i / width as usize) as f32;
+            let theta = ((x - cx) / f).clamp(-ANGLE_LIMIT, ANGLE_LIMIT);
+            let phi = ((y - cy) / f).clamp(-ANGLE_LIMIT, ANGLE_LIMIT);
+            let cos_theta = theta.cos().max(1e-3);
+            let (sx, sy) = match projection {
+                Projection::Perspective => (x, y),
+                Projection::Cylindrical => {
+                    (cx + f * theta.tan(), cy + (y - cy) / cos_theta)
+                }
+                Projection::Spherical => {
+                    (cx + f * theta.tan(), cy + f * phi.tan() / cos_theta)
+                }
+                Projection::Panini => {
+                    // Panini compresses the horizontal extremes more than a
+                    // cylinder. The exact OpenCV projector parameter is not
+                    // recovered; this is a stable 35 % edge squeeze.
+                    let t = theta / ANGLE_LIMIT;
+                    let squeezed = theta * (1.0 - 0.35 * t * t);
+                    (cx + f * squeezed.tan(), cy + (y - cy) / squeezed.cos().max(1e-3))
+                }
+            };
+            if !sx.is_finite() || !sy.is_finite() {
+                return [0.0; 3];
+            }
+            sample_bilinear(base, sx, sy)
+        })
+        .collect();
+    FusedFrame { width, height, rgb }
+}
+
+fn sample_bilinear(frame: &FusedFrame, x: f32, y: f32) -> [f32; 3] {
+    let w = frame.width as f32;
+    let h = frame.height as f32;
+    let x = x.clamp(0.0, w - 1.001);
+    let y = y.clamp(0.0, h - 1.001);
+    let (x0, y0) = (x as u32, y as u32);
+    let (x1, y1) = ((x0 + 1).min(frame.width - 1), (y0 + 1).min(frame.height - 1));
+    let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+    let at = |xx: u32, yy: u32| frame.rgb[yy as usize * frame.width as usize + xx as usize];
+    let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+    let mut out = [0.0f32; 3];
+    for k in 0..3 {
+        let top = a[k] + (b[k] - a[k]) * tx;
+        let bottom = c[k] + (d[k] - c[k]) * tx;
+        out[k] = (top + (bottom - top) * ty).clamp(0.0, 1.0);
+    }
+    out
 }
 
 /// 8-bit sRGB samples for a TIFF, using the engine's own transfer function.
@@ -471,5 +557,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn perspective_projection_matches_the_legacy_stitch_byte_for_byte() {
+        let wide = textured_scene(240, 48);
+        let a = crop(&wide, 0, 160);
+        let b = crop(&wide, 80, 160);
+        let legacy = stitch(&[&a, &b]).unwrap();
+        let options = PanoramaOptions {
+            projection: Projection::Perspective,
+            ..PanoramaOptions::default()
+        };
+        let projected = stitch_with_options(&[&a, &b], &options).unwrap();
+        assert_eq!(legacy.width, projected.width);
+        assert_eq!(legacy.height, projected.height);
+        assert_eq!(legacy.rgb, projected.rgb);
+    }
+
+    #[test]
+    fn a_single_frame_is_unchanged_by_every_projection() {
+        let wide = textured_scene(64, 32);
+        for projection in Projection::ALL {
+            let options = PanoramaOptions { projection, ..PanoramaOptions::default() };
+            let fused = stitch_with_options(&[&wide], &options).unwrap();
+            assert_eq!(fused.rgb, wide.levels[0].data, "{projection:?}");
+        }
+    }
+
+    #[test]
+    fn cylindrical_spherical_and_panini_keep_the_canvas_and_stay_finite() {
+        let wide = textured_scene(96, 32);
+        let a = crop(&wide, 0, 64);
+        let b = crop(&wide, 32, 64);
+        let perspective = stitch(&[&a, &b]).unwrap();
+        let mut changed = [false; 3];
+        for (slot, projection) in
+            [Projection::Cylindrical, Projection::Spherical, Projection::Panini]
+                .into_iter()
+                .enumerate()
+        {
+            let options = PanoramaOptions { projection, ..PanoramaOptions::default() };
+            let fused = stitch_with_options(&[&a, &b], &options).unwrap();
+            assert_eq!((fused.width, fused.height), (perspective.width, perspective.height));
+            assert!(
+                fused.rgb.iter().flatten().all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+                "{projection:?} produced a non-finite pixel"
+            );
+            changed[slot] = fused.rgb != perspective.rgb;
+        }
+        assert!(changed.iter().any(|&c| c), "no projection changed the canvas");
+    }
+
+    #[test]
+    fn spherical_poles_never_produce_nan() {
+        // A very narrow frame makes the assumed 60-degree FOV put the top and
+        // bottom rows beyond +/-80 degrees, which is where tan() would blow up.
+        let mut rgba = Vec::new();
+        for y in 0..17u32 {
+            for x in 0..5u32 {
+                rgba.extend_from_slice(&[(x * 50) as u8, (y * 12) as u8, 90, 255]);
+            }
+        }
+        let a = Source::from_rgba(5, 17, &rgba);
+        let mut b = Source::from_rgba(5, 17, &rgba);
+        for pixel in &mut b.levels[0].data {
+            pixel[0] *= 0.9;
+        }
+        let options = PanoramaOptions {
+            projection: Projection::Spherical,
+            ..PanoramaOptions::default()
+        };
+        let fused = stitch_with_options(&[&a, &b], &options).unwrap();
+        assert!(fused.rgb.iter().flatten().all(|v| v.is_finite()));
+        assert!(fused.rgb.iter().flatten().all(|v| (0.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn out_of_range_warp_types_fall_back_to_perspective() {
+        for code in [-2, 0, 1, 2, 6, 99, i32::MAX] {
+            assert_eq!(Projection::from_warp_type(code), Projection::Perspective, "{code}");
+        }
+        assert_eq!(Projection::from_warp_type(3), Projection::Cylindrical);
+        assert_eq!(Projection::from_warp_type(4), Projection::Spherical);
+        assert_eq!(Projection::from_warp_type(5), Projection::Panini);
+        assert_eq!(Projection::Spherical.warp_type(), 4);
     }
 }

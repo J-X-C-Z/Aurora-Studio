@@ -6,11 +6,25 @@
 pub mod process;
 pub(crate) mod scenes;
 pub(crate) mod spots;
+pub(crate) mod grain;
 pub(crate) mod detail;
 #[cfg(windows)]
 pub(crate) mod detail_gpu;
 pub(crate) mod geometry;
 pub(crate) mod lens_profile;
+
+pub(crate) const PURPLE_IDENTITY: f32 = 0.5;
+
+#[inline]
+pub(crate) fn purple_norm(amount: f32) -> f32 {
+    ((amount + 100.0) / 200.0).clamp(0.0, 1.0)
+}
+
+/// Signed effect strength derived from [`purple_norm`]: -1..0..+1.
+#[inline]
+pub(crate) fn purple_strength(norm: f32) -> f32 {
+    (norm * 2.0 - 1.0).clamp(-1.0, 1.0)
+}
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -35,6 +35,9 @@ pub struct LocalAdjustments {
     pub noise_reduction: Option<NoiseReduction>,
     pub moire: Moire,
     pub fill_color: Option<[f32; 3]>,
+    /// `<LA><E K="AIColorGrade">`: this layer is a Match Look layer. The style
+    /// document carries the reference thumbnail in `<AICGR>`, not here.
+    pub ai_color_grade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +51,12 @@ pub struct Layer {
     pub opacity: f32,
     pub mask: Mask,
     pub adjustments: LocalAdjustments,
+    /// `ZSTYLEUUID`/`ZSTYLESOURCE`/`ZSTYLEMODIFIED` when the layer came from a style.
+    pub style: Option<LayerStyle>,
+    /// `LAYERSELECTPOINT`, raw drawing pixels (`x;y`).
+    pub select_point: Option<[f32; 2]>,
+    /// `.comask` Cover arrows of a heal/clone layer, in oriented coordinates.
+    pub cover: Vec<CoverPatch>,
 }
 
 impl Default for Layer {
@@ -60,8 +69,50 @@ impl Default for Layer {
             opacity: 100.0,
             mask: Mask::default(),
             adjustments: LocalAdjustments::default(),
+            style: None,
+            select_point: None,
+            cover: Vec::new(),
         }
     }
+}
+
+/// One `.comask` `Cover` arrow, in the oriented, uncropped image.
+///
+/// C1 keeps only the two points in the arrow; the stroke shape lives in the
+/// layer's mask plane, so `half` is the mask plane's bounding box.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoverPatch {
+    pub kind: CoverKind,
+    /// Source point, normalized.
+    pub src: [f32; 2],
+    /// Destination point, normalized.
+    pub dst: [f32; 2],
+    /// Half extents of the repaired rectangle, fractions of width/height.
+    pub half: [f32; 2],
+}
+
+impl Default for CoverPatch {
+    fn default() -> Self {
+        Self { kind: CoverKind::Clone, src: [0.0; 2], dst: [0.0; 2], half: [0.0; 2] }
+    }
+}
+
+/// `IC_MaskCoverArrowType`: 1 clone, 2 heal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoverKind {
+    #[default]
+    Clone,
+    Heal,
+}
+
+/// The style a layer was applied from. C1 keeps the same UUID on every layer of
+/// a layered style, and `source` is the style folder/tool (`Styles`, `Exposure`, ...).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayerStyle {
+    pub uuid: String,
+    pub source: Option<String>,
+    pub modified: bool,
 }
 
 /// A mask is a stack of shapes combined in order; each shape adds or subtracts.

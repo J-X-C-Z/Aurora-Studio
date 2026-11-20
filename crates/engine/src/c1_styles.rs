@@ -59,6 +59,71 @@ pub struct C1Style {
     /// Raw `ColorCorrections` rows, so writing does not re-encode the editor.
     pub color_corrections: Vec<[f32; 18]>,
     pub adjustments: AdjustmentSet,
+    /// `<AICGR>`: AI Color Grade reference frames and tool switches.
+    pub look: Option<crate::matchlook::LookReference>,
+}
+
+/// Reads a style's `<AICGR>` block: 14 `<E K>` switches, `Impact` and the
+/// base64 TIFF reference frame(s). Keys are the `AIColorGradingReferenceKey`
+/// enum from `P1.AppCore`.
+fn parse_aicgr(text: &str) -> Option<crate::matchlook::LookReference> {
+    let document = roxmltree::Document::parse(text).ok()?;
+    let node = document.descendants().find(|node| node.has_tag_name("AICGR"))?;
+    let mut components = crate::matchlook::LookComponents::default();
+    let mut bitmaps = None;
+    for entry in node.children().filter(|child| child.has_tag_name("E")) {
+        let (Some(key), value) = (entry.attribute("K"), entry.attribute("V").unwrap_or("")) else {
+            continue;
+        };
+        let flag = || value.trim() != "0" && !value.trim().eq_ignore_ascii_case("false");
+        match key {
+            "Bitmaps" => bitmaps = Some(value),
+            "Impact" => {
+                components.impact = value.trim().parse().unwrap_or(100.0);
+            }
+            "BasicColorEdits" => components.basic_color_edits = flag(),
+            "BlackAndWhite" => components.black_and_white = flag(),
+            "Brightness" => components.brightness = flag(),
+            "ColorBalanceHMS" => components.color_balance_hms = flag(),
+            "ColorBalanceMaster" => components.color_balance_master = flag(),
+            "ColorChannelCurves" => components.color_channel_curves = flag(),
+            "Contrast" => components.contrast = flag(),
+            "Exposure" => components.exposure = flag(),
+            "HDRHighlightShadow" => components.hdr_highlight_shadow = flag(),
+            "HDRWhiteBlack" => components.hdr_white_black = flag(),
+            "LumaCurve" => components.luma_curve = flag(),
+            "Saturation" => components.saturation = flag(),
+            "TargetLevels" => components.target_levels = flag(),
+            "Whitebalance" => components.whitebalance = flag(),
+            _ => {}
+        }
+    }
+    let thumbnails = bitmaps.map(decode_look_bitmaps).unwrap_or_default();
+    Some(crate::matchlook::LookReference { components, thumbnails })
+}
+
+/// `Bitmaps` is base64 of a (multi-frame) TIFF; the first frame is decoded.
+// shortcut: later reference frames are ignored, revisit when a multi-reference style appears.
+fn decode_look_bitmaps(encoded: &str) -> Vec<crate::matchlook::LookThumbnail> {
+    use base64::Engine as _;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+        log::warn!("style <AICGR> Bitmaps is not base64");
+        return Vec::new();
+    };
+    match image::load_from_memory_with_format(&bytes, image::ImageFormat::Tiff) {
+        Ok(image) => {
+            let rgba = image.to_rgba8();
+            vec![crate::matchlook::LookThumbnail {
+                width: rgba.width(),
+                height: rgba.height(),
+                rgba: rgba.into_raw(),
+            }]
+        }
+        Err(error) => {
+            log::warn!("style <AICGR> Bitmaps is not a TIFF: {error}");
+            Vec::new()
+        }
+    }
 }
 
 /// Status shown when a C1 style asks for a processing branch this engine does
@@ -111,13 +176,25 @@ pub fn load_style(path: &Path) -> Result<C1Style> {
         settings.white_balance_gains = c1_model::kelvin_tint_to_gains(k, tint.unwrap_or(0.0));
     }
 
-    let adjustments = defined_groups(&settings);
+    let look = parse_aicgr(&text);
+    let mut adjustments = defined_groups(&settings);
+    if let Some(reference) = look.as_ref() {
+        match crate::matchlook::look_from_reference(reference) {
+            Some(predicted) => {
+                adjustments = crate::styles::apply_style(&adjustments, &predicted);
+            }
+            None => log::warn!(
+                "style {stem}: <AICGR> reference present but the Match Look heads are unavailable"
+            ),
+        }
+    }
     Ok(C1Style {
         name: name.unwrap_or_else(|| stem.to_owned()),
         engine: engine_attr(&text).unwrap_or(800),
         original,
         color_corrections: settings.color_corrections,
         adjustments,
+        look,
     })
 }
 
@@ -1053,5 +1130,33 @@ mod tests {
         );
         assert_eq!(StyleImportErrorKind::of(&anyhow!("Unsupported version")), StyleImportErrorKind::Unsupported);
         assert_eq!(StyleImportErrorKind::of(&anyhow!("other")), StyleImportErrorKind::Other);
+    }
+
+    #[test]
+    fn aicgr_switches_impact_and_bitmap_are_parsed() {
+        use base64::Engine as _;
+        use image::ImageEncoder as _;
+        let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::codecs::tiff::TiffEncoder::new(&mut cursor)
+            .write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("tiff");
+        let tiff = cursor.into_inner();
+        let bitmaps = base64::engine::general_purpose::STANDARD.encode(&tiff);
+        let text = format!(
+            r#"<SL Engine="800"><AICGR><E K="Bitmaps" V="{bitmaps}"/><E K="Impact" V="70"/><E K="Saturation" V="0"/></AICGR></SL>"#
+        );
+        let look = parse_aicgr(&text).expect("AICGR");
+        assert_eq!(look.components.impact, 70.0);
+        assert!(!look.components.saturation);
+        assert!(look.components.exposure);
+        assert_eq!(look.thumbnails.len(), 1);
+        assert_eq!((look.thumbnails[0].width, look.thumbnails[0].height), (4, 4));
+        assert_eq!(look.thumbnails[0].rgba.len(), 4 * 4 * 4);
     }
 }

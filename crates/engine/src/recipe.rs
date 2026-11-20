@@ -449,6 +449,17 @@ pub fn parse_output_sharpening_xml(text: &str) -> OutputSharpeningSettings {
     out
 }
 
+/// Explicit `SharpeningOutput*` fields that should actually run.
+///
+/// `SharpeningOutputControl`: 0 = Screen, 1 = Print, 2 = LensAndSharpening,
+/// 3 = Lens, 4 = Disabled. C1 keeps the amount for 2/3/4 and zeroes the
+/// sharpening at export.
+fn explicit_sharpening(recipe: &ProcessRecipe) -> Option<OutputSharpeningSettings> {
+    recipe
+        .output_sharpening_settings
+        .filter(|settings| settings.control <= 1)
+}
+
 /// Reads the `Watermark*` values from a Capture One recipe XML.
 ///
 /// Unknown keys are ignored and missing fields stay `None`. Text and color
@@ -1628,10 +1639,13 @@ fn write_export_pixels(
     // must be folded back into the 16-bit buffer. With no sharpening, watermark
     // or profile the two are identical, so the clone and the fold are skipped.
     let profile = resolve_profile(&recipe.icc_profile);
+    // C1 stores `SharpeningOutputControl = 2` as "no output sharpening": the
+    // amount stays in the recipe, the stage is skipped.
     let edits_8bit = profile.is_some()
         || recipe.watermark.is_some()
-        || match recipe.output_sharpening_settings {
+        || match explicit_sharpening(recipe) {
             Some(settings) => settings.amount > 0.0,
+            None if recipe.output_sharpening_settings.is_some() => false,
             None => !matches!(recipe.output_sharpening, OutputSharpening::Disabled),
         };
     let fold_8bit = wide.is_some() && edits_8bit;
@@ -1640,13 +1654,15 @@ fn write_export_pixels(
         OutputSharpening::Screen => 0.6,
         OutputSharpening::Print => 1.0,
     };
-    if let Some(settings) = recipe.output_sharpening_settings {
-        output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
-    } else {
-        output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0);
+    match explicit_sharpening(recipe) {
+        Some(settings) => {
+            output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
+        }
+        None if recipe.output_sharpening_settings.is_some() => {}
+        None => output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0),
     }
-    // shortcut: Control/Method/viewing distance are saved but not applied; C1
-    // semantics are unproven, revisit with real output pairs.
+    // shortcut: Method/viewing distance are saved but not applied, revisit with
+    // real output pairs.
 
     // The rendered buffer is gamma-encoded sRGB. Converting it into the
     // recipe's profile is what makes the profile take effect.
@@ -2352,6 +2368,27 @@ mod tests {
         let before = px.clone();
         output_sharpen(&mut px, 16, 16, 0.0, 2.0, 0.0);
         assert_eq!(px, before);
+    }
+
+    #[test]
+    fn output_sharpening_modes_two_to_four_skip_the_stage() {
+        let mut recipe = ProcessRecipe {
+            output_sharpening_settings: Some(OutputSharpeningSettings {
+                amount: 80.0,
+                radius: 1.0,
+                threshold: 0.0,
+                control: 2,
+                ..Default::default()
+            }),
+            ..ProcessRecipe::default()
+        };
+        assert!(explicit_sharpening(&recipe).is_none());
+        for control in [2, 3, 4] {
+            recipe.output_sharpening_settings.as_mut().unwrap().control = control;
+            assert!(explicit_sharpening(&recipe).is_none(), "control {control}");
+        }
+        recipe.output_sharpening_settings.as_mut().unwrap().control = 1;
+        assert_eq!(explicit_sharpening(&recipe).unwrap().amount, 80.0);
     }
 
     #[test]
