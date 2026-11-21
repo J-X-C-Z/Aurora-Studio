@@ -1842,6 +1842,7 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     90139,  // Hair smooth
     90160,  // Hair gloss
     90088,  // Stray hair removal
+    30013,  // Neutral grey flattening
     30021,  // High-low frequency face
     30022,  // High-low frequency body
     100007, // Open-mouth smile
@@ -2018,6 +2019,10 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         return report;
     };
 
+    let neutral_grey_original = effects
+        .iter()
+        .any(|&(pf, degree)| pf == 30013 && degree > 0.0 && degree <= 1.0)
+        .then(|| source.clone());
     let mut current = source;
     // Keep the main-session optimization: skin effects share one sampled plane.
     // Non-skin rows receive their own explicit planes from `PortraitJobInputs`.
@@ -2050,6 +2055,42 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 Some("skipped: masks-only entry has no same-job producer".to_string());
             run.refusal = Some(refusal.clone());
             run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal));
+            report.effects.push(run);
+            continue;
+        }
+        if pf == 30013 {
+            let result = (|| {
+                check_degree01(degree, "PF30013 degree")?;
+                let Some(original) = neutral_grey_original.as_ref() else {
+                    return Ok(None);
+                };
+                let mask = required(skin_mask.as_deref(), "PF30013 skin mask")?;
+                // The pre-stack reference is aligned only until a portrait warp runs.
+                if report.effects.iter().any(|effect| {
+                    effect.executed && matches!(effect.pf, 8025 | 8026 | 8050 | 8051)
+                }) {
+                    return Err(Refusal::MissingInput("PF30013 aligned reference after warp"));
+                }
+                if original.pixels == current.pixels || !mask.iter().any(|&weight| weight != 0) {
+                    return Ok(None);
+                }
+                let roi = skin_adjust::Roi { x: 0, y: 0, width, height };
+                let next = skin_adjust::skin_grey_apply(original, &current, mask, roi, degree)?;
+                Ok((next.pixels != current.pixels).then_some(next))
+            })();
+            match result {
+                Ok(Some(next)) => {
+                    current = next;
+                    run.skipped = false;
+                    run.executed = true;
+                }
+                Ok(None) => run.backend = PortraitBackend::Skipped,
+                Err(refusal) => {
+                    run.backend = PortraitBackend::Skipped;
+                    run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                    run.refusal = Some(refusal);
+                }
+            }
             report.effects.push(run);
             continue;
         }

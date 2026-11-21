@@ -102,27 +102,81 @@ fn parse_aicgr(text: &str) -> Option<crate::matchlook::LookReference> {
     Some(crate::matchlook::LookReference { components, thumbnails })
 }
 
-/// `Bitmaps` is base64 of a (multi-frame) TIFF; the first frame is decoded.
-// shortcut: later reference frames are ignored, revisit when a multi-reference style appears.
+/// `Bitmaps` is the base64 TIFF written by Capture One, one page per reference.
 fn decode_look_bitmaps(encoded: &str) -> Vec<crate::matchlook::LookThumbnail> {
+    const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+    let encoded = encoded.trim();
+    if encoded.len() > MAX_ENCODED_BYTES {
+        log::warn!("style <AICGR> Bitmaps exceeds the encoded size limit");
+        return Vec::new();
+    }
+
     use base64::Engine as _;
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
         log::warn!("style <AICGR> Bitmaps is not base64");
         return Vec::new();
     };
-    match image::load_from_memory_with_format(&bytes, image::ImageFormat::Tiff) {
-        Ok(image) => {
-            let rgba = image.to_rgba8();
-            vec![crate::matchlook::LookThumbnail {
-                width: rgba.width(),
-                height: rgba.height(),
-                rgba: rgba.into_raw(),
-            }]
+    let mut thumbnails = Vec::new();
+    if let Err(error) = decode_look_tiff(bytes, &mut thumbnails) {
+        log::warn!("style <AICGR> Bitmaps stopped at frame {}: {error:#}", thumbnails.len() + 1);
+    }
+    thumbnails
+}
+
+fn decode_look_tiff(
+    bytes: Vec<u8>,
+    thumbnails: &mut Vec<crate::matchlook::LookThumbnail>,
+) -> Result<()> {
+    use std::io::Cursor;
+    use tiff::tags::ByteOrder;
+
+    const MAX_FRAMES: usize = 64;
+    const MAX_RGBA_BYTES: u64 = 64 * 1024 * 1024;
+    let mut decoder = tiff::decoder::Decoder::new(Cursor::new(bytes))?;
+    let order = decoder.byte_order();
+    let bytes = decoder.inner().get_ref();
+    let (header_offset, pointer_bytes) = match &bytes[..4] {
+        b"II*\0" | b"MM\0*" => (4, 4),
+        b"II+\0" | b"MM\0+" => (8, 8),
+        _ => bail!("invalid TIFF header"),
+    };
+    let mut remaining = MAX_RGBA_BYTES;
+    loop {
+        if thumbnails.len() == MAX_FRAMES {
+            bail!("too many TIFF reference frames");
         }
-        Err(error) => {
-            log::warn!("style <AICGR> Bitmaps is not a TIFF: {error}");
-            Vec::new()
+        let (width, height) = decoder.dimensions()?;
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels == 0 || pixels > remaining / 4 {
+            bail!("TIFF reference frames exceed the decoded size limit");
         }
+        remaining -= pixels * 4;
+        let ifd = decoder.ifd_pointer().context("missing TIFF image directory")?.0;
+        let header = match (pointer_bytes, order) {
+            (4, ByteOrder::LittleEndian) => u64::from(u32::try_from(ifd)?).to_le_bytes(),
+            (4, ByteOrder::BigEndian) => (u64::from(u32::try_from(ifd)?) << 32).to_be_bytes(),
+            (_, ByteOrder::LittleEndian) => ifd.to_le_bytes(),
+            (_, ByteOrder::BigEndian) => ifd.to_be_bytes(),
+        };
+        let bytes = decoder.inner().get_mut();
+        let pointer = header_offset..header_offset + pointer_bytes;
+        let mut original = [0; 8];
+        original[..pointer_bytes].copy_from_slice(&bytes[pointer.clone()]);
+        // image decodes one page: point its header at the current page without moving TIFF data.
+        bytes[pointer.clone()].copy_from_slice(&header[..pointer_bytes]);
+        let mut reader = image::ImageReader::with_format(Cursor::new(&*bytes), image::ImageFormat::Tiff);
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(MAX_RGBA_BYTES);
+        reader.limits(limits);
+        let decoded = reader.decode();
+        bytes[pointer].copy_from_slice(&original[..pointer_bytes]);
+
+        let rgba = decoded?.into_rgba8();
+        thumbnails.push(crate::matchlook::LookThumbnail { width, height, rgba: rgba.into_raw() });
+        if !decoder.more_images() {
+            return Ok(());
+        }
+        decoder.next_image()?;
     }
 }
 
@@ -1130,6 +1184,33 @@ mod tests {
         );
         assert_eq!(StyleImportErrorKind::of(&anyhow!("Unsupported version")), StyleImportErrorKind::Unsupported);
         assert_eq!(StyleImportErrorKind::of(&anyhow!("other")), StyleImportErrorKind::Other);
+    }
+
+    #[test]
+    fn aicgr_import_preserves_tiff_page_order_and_keeps_valid_prefix() {
+        use base64::Engine as _;
+        use std::io::Cursor;
+        use tiff::encoder::{TiffEncoder, colortype::{RGB8, RGBA16}};
+
+        let mut bytes = Vec::new();
+        let mut encoder = TiffEncoder::new(Cursor::new(&mut bytes)).unwrap();
+        encoder.write_image::<RGB8>(2, 1, &[10, 20, 30, 40, 50, 60]).unwrap();
+        encoder.write_image::<RGBA16>(1, 1, &[0, 65535, 0, 65535]).unwrap();
+
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let text = format!(
+            r#"<SL><AICGR><E K="Bitmaps" V="{}"/></AICGR></SL>"#,
+            encode(&bytes)
+        );
+        let thumbnails = parse_aicgr(&text).unwrap().thumbnails;
+        assert_eq!(thumbnails.len(), 2);
+        assert_eq!((thumbnails[0].width, thumbnails[0].height), (2, 1));
+        assert_eq!(thumbnails[0].rgba, [10, 20, 30, 255, 40, 50, 60, 255]);
+        assert_eq!((thumbnails[1].width, thumbnails[1].height), (1, 1));
+        assert_eq!(thumbnails[1].rgba, [0, 255, 0, 255]);
+
+        bytes.pop();
+        assert_eq!(decode_look_bitmaps(&encode(&bytes)), thumbnails[..1]);
     }
 
     #[test]

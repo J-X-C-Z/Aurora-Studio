@@ -336,6 +336,8 @@ struct SourceRows {
     entities: Vec<HashMap<String, Option<String>>>,
     collection_properties: Vec<HashMap<String, Option<String>>>,
     selected_variants: Vec<HashMap<String, Option<String>>>,
+    compare_variants: Vec<HashMap<String, Option<String>>>,
+    variant_members: Vec<HashMap<String, Option<String>>>,
     version_info: Vec<HashMap<String, Option<String>>>,
     document_settings: Vec<HashMap<String, Option<String>>>,
     output_recipes: Vec<HashMap<String, Option<String>>>,
@@ -356,6 +358,12 @@ impl SourceRows {
             selected_variants: crate::c1catalog::export_table_rows(
                 &import.catalog_path,
                 "ZSELECTEDVARIANTS",
+            )?,
+            compare_variants: crate::c1catalog::export_table_rows(
+                &import.catalog_path, "ZCOMPAREVARIANTS",
+            )?,
+            variant_members: crate::c1catalog::export_table_rows(
+                &import.catalog_path, "ZVARIANTINCOLLECTION",
             )?,
             version_info: crate::c1catalog::export_table_rows(&import.catalog_path, "ZVERSIONINFO")?,
             document_settings: crate::c1catalog::export_table_rows(
@@ -531,12 +539,6 @@ fn session_tables(
     final_root: &Path,
     source: &SourceRows,
 ) -> Result<Vec<SynthTable>> {
-    let document = SynthTable::new(
-        "ZDOCUMENTCONTENT",
-        &["Z_PK INTEGER PRIMARY KEY", "ZDOCUMENTTYPE INTEGER"],
-    )
-    .row_with_id(1, vec![Cell::Null, Cell::Int(2)]);
-
     let session_root = root_prefix(final_root);
     let mut locations = SynthTable::new(
         "ZPATHLOCATION",
@@ -674,31 +676,13 @@ fn session_tables(
         );
     }
 
-    let mut variants = SynthTable::new(
-        "ZVARIANT",
-        &[
-            "Z_PK INTEGER PRIMARY KEY",
-            "ZIMAGE INTEGER",
-            "ZINDEX INTEGER",
-            "ZCANVASSIZE TEXT",
-        ],
-    );
-    for variant in import.variants() {
-        variants = variants.row_with_id(
-            variant.pk,
-            vec![
-                Cell::Null,
-                Cell::Int(variant.image_pk),
-                Cell::Int(variant.index),
-                variant
-                    .canvas
-                    .map(|(w, h)| Cell::Text(format!("{w};{h}")))
-                    .unwrap_or(Cell::Null),
-            ],
-        );
-    }
-
-    let (collections, members) = collection_tables(import, &folder_location);
+    let (variants, layers) = variants_and_layers(import, source)?;
+    let (collections, members, root_pk) = collection_tables(import, &folder_location);
+    let document = SynthTable::new(
+        "ZDOCUMENTCONTENT",
+        &["Z_PK INTEGER PRIMARY KEY", "ZDOCUMENTTYPE INTEGER", "ZROOTCOLLECTION INTEGER"],
+    )
+    .row_with_id(1, vec![Cell::Null, Cell::Int(2), root_pk.map(Cell::Int).unwrap_or(Cell::Null)]);
     Ok(vec![
         document,
         locations,
@@ -708,7 +692,7 @@ fn session_tables(
         members,
         metadata(import, source),
         keywords(import),
-        layers(import, source),
+        layers,
         retouch_table(import),
         entities_table(source),
         copied_table(
@@ -740,6 +724,28 @@ fn session_tables(
                 "ZSELECTEDVARIANTS INTEGER",
             ],
             &source.selected_variants,
+            &[CopyKind::Int, CopyKind::Pk, CopyKind::Int, CopyKind::Int],
+        ),
+        copied_table(
+            "ZCOMPAREVARIANTS",
+            &[
+                "Z_ENT INTEGER",
+                "Z_PK INTEGER PRIMARY KEY",
+                "ZCOMPAREINCOLLECTIONS INTEGER",
+                "ZCOMPAREVARIANTS INTEGER",
+            ],
+            &source.compare_variants,
+            &[CopyKind::Int, CopyKind::Pk, CopyKind::Int, CopyKind::Int],
+        ),
+        copied_table(
+            "ZVARIANTINCOLLECTION",
+            &[
+                "Z_ENT INTEGER NOT NULL",
+                "Z_PK INTEGER PRIMARY KEY NOT NULL",
+                "ZCOLLECTION INTEGER NOT NULL",
+                "ZVARIANT INTEGER NOT NULL",
+            ],
+            &source.variant_members,
             &[CopyKind::Int, CopyKind::Pk, CopyKind::Int, CopyKind::Int],
         ),
         copied_table(
@@ -814,7 +820,7 @@ fn session_tables(
 fn collection_tables(
     import: &C1Import,
     folder_location: &HashMap<i64, i64>,
-) -> (SynthTable, SynthTable) {
+) -> (SynthTable, SynthTable, Option<i64>) {
     let collections = &import.catalog.collections;
     let root_pk = collections.iter().find(|c| c.parent.is_none()).map(|c| c.pk);
     let role = |kind: CollectionKind| {
@@ -881,7 +887,7 @@ fn collection_tables(
             rowid += 1;
         }
     }
-    (table, members)
+    (table, members, root_pk)
 }
 
 /// One `ZVARIANTMETADATA` row per variant: the rating, colour tag and keywords
@@ -991,7 +997,7 @@ const LAYER_COLUMNS: &[&str] = &[
     "ZNOISEREDUCTIONAMOUNT TEXT",
     "ZNOISEDETAILSAMOUNT TEXT",
     "ZAIDENOISEAMOUNT TEXT",
-    "ZDENOISEMETHOD TEXT",
+    "ZDENOISEMETHOD INTEGER",
     "ZDEHAZEAMOUNT TEXT",
     "ZCROP TEXT",
     "ZCROPOUTSIDEIMAGE INTEGER",
@@ -999,6 +1005,8 @@ const LAYER_COLUMNS: &[&str] = &[
     "ZROTATION TEXT",
     "ZICCPROFILE TEXT",
     "ZFILMCURVE TEXT",
+    "ZGEOMETRYKEYSTONEFOCALLENGTH REAL",
+    "ZLENSOPTICCENTER TEXT",
     "ZLENSOPTICCENTERENABLED INTEGER",
     "ZLEVELSTARGETENABLE INTEGER",
     "ZRETOUCHINGBLEMISHREMOVALAMOUNT REAL",
@@ -1060,13 +1068,52 @@ impl LayerExtras {
 
 /// One full-snapshot layer (`Z_ENT` 18), the combined row (20) and the sparse
 /// adjustment delta (17) per variant, plus local mask layers (23).
-fn layers(import: &C1Import, source: &SourceRows) -> SynthTable {
+fn variants_and_layers(import: &C1Import, source: &SourceRows) -> Result<(SynthTable, SynthTable)> {
+    let mut variants = SynthTable::new(
+        "ZVARIANT",
+        &[
+            "Z_PK INTEGER PRIMARY KEY",
+            "ZIMAGE INTEGER",
+            "ZINDEX INTEGER",
+            "ZCANVASSIZE TEXT",
+            "ZVARIANTUUID TEXT",
+            "ZADJUSTMENTLAYER INTEGER",
+            "ZDEFAULTLAYER INTEGER",
+            "ZCOMBINEDSETTINGS INTEGER",
+        ],
+    );
+    let variant_rows = crate::c1catalog::export_table_rows(&import.catalog_path, "ZVARIANT")?;
+    let variant_rows: HashMap<_, _> = variant_rows
+        .iter()
+        .filter_map(|row| Some((row_i64(row, "Z_PK")?, row)))
+        .collect();
     let mut table = SynthTable::new("ZVARIANTLAYER", LAYER_COLUMNS);
     let mut pk = import.variants().iter().map(|v| v.pk).max().unwrap_or(0) + 1;
     for variant in import.variants() {
-        let base = LayerExtras::from_row(source.layer(variant.pk, 18));
-        let combined = source
-            .layer(variant.pk, 20)
+        let combined_pk = pk;
+        let delta_pk = pk + 1;
+        pk += 2;
+        // These references point to rows allocated by this export.
+        variants = variants.row_with_id(
+            variant.pk,
+            vec![
+                Cell::Null,
+                Cell::Int(variant.image_pk),
+                Cell::Int(variant.index),
+                variant
+                    .canvas
+                    .map(|(w, h)| Cell::Text(format!("{w};{h}")))
+                    .unwrap_or(Cell::Null),
+                src_text(variant_rows.get(&variant.pk).copied(), "ZVARIANTUUID"),
+                Cell::Int(delta_pk),
+                Cell::Int(variant.pk),
+                Cell::Int(combined_pk),
+            ],
+        );
+        let base_row = source.layer(variant.pk, 18);
+        let combined_row = source.layer(variant.pk, 20);
+        let base = LayerExtras::from_row(base_row);
+        let combined = combined_row
             .map(|row| LayerExtras::from_row(Some(row)))
             .unwrap_or_else(|| base.clone());
         let delta = LayerExtras::from_row(source.layer(variant.pk, 17));
@@ -1079,16 +1126,17 @@ fn layers(import: &C1Import, source: &SourceRows) -> SynthTable {
                 Some(variant.pk),
                 &variant.settings,
                 &base,
+                base_row,
                 true,
             ),
         );
         table = table.row_with_id(
-            pk,
-            layer_cells(pk, 20, variant.pk, None, &variant.settings, &combined, true),
+            combined_pk,
+            layer_cells(
+                combined_pk, 20, variant.pk, None, &variant.settings, &combined, combined_row, true,
+            ),
         );
-        pk += 1;
-        table = table.row_with_id(pk, delta_layer_cells(pk, variant.pk, &delta));
-        pk += 1;
+        table = table.row_with_id(delta_pk, delta_layer_cells(delta_pk, variant.pk, &delta));
     }
     // Local mask layers are references (`Z_ENT` 23 + `ZMASKUUID`); the mask
     // pixels live in a `.comask` sidecar and are not copied.
@@ -1098,7 +1146,7 @@ fn layers(import: &C1Import, source: &SourceRows) -> SynthTable {
             pk += 1;
         }
     }
-    table
+    Ok((variants, table))
 }
 
 fn local_layer_cells(variant_pk: i64, layer: &C1MaskLayer) -> Vec<Cell> {
@@ -1134,6 +1182,7 @@ fn layer_cells(
     metadata_pk: Option<i64>,
     s: &C1VariantSettings,
     extras: &LayerExtras,
+    source_row: Option<&HashMap<String, Option<String>>>,
     defaults: bool,
 ) -> Vec<Cell> {
     let mut cells = vec![
@@ -1170,7 +1219,7 @@ fn layer_cells(
         scalar(s.noise_reduction.luminance),
         scalar(s.noise_reduction.details),
         scalar(s.noise_reduction.color),
-        Cell::Text(s.noise_reduction.method.to_string()),
+        Cell::Int(i64::from(s.noise_reduction.method)),
         scalar(s.dehaze_amount),
         vector(&s.crop_px),
         Cell::Int(i64::from(s.crop_outside_image)),
@@ -1178,6 +1227,8 @@ fn layer_cells(
         scalar(s.rotation),
         s.icc_profile.as_deref().map(Cell::text).unwrap_or(Cell::Null),
         s.film_curve.as_deref().map(Cell::text).unwrap_or(Cell::Null),
+        src_real(source_row, "ZGEOMETRYKEYSTONEFOCALLENGTH"),
+        src_text(source_row, "ZLENSOPTICCENTER"),
     ];
     cells.extend(extras.cells(defaults));
     cells
@@ -1545,6 +1596,35 @@ mod tests {
     }
 
     #[test]
+    fn collection_queries_find_preserved_variant_links() {
+        let import = C1Import::open(&fixture()).unwrap();
+        let mut source = SourceRows::load(&import).unwrap();
+        assert!(source.compare_variants.is_empty() && source.variant_members.is_empty());
+        let variant = import.variants()[0].pk;
+        let collection = import.catalog.collections[0].pk;
+        let link = |collection_column: &str, variant_column: &str| {
+            [
+                ("Z_ENT", 47),
+                ("Z_PK", 3),
+                (collection_column, collection),
+                (variant_column, variant),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), Some(value.to_string())))
+            .collect()
+        };
+        source.compare_variants.push(link("ZCOMPAREINCOLLECTIONS", "ZCOMPAREVARIANTS"));
+        source.variant_members.push(link("ZCOLLECTION", "ZVARIANT"));
+        let dir = temp_dir("variant-links");
+        let database = dir.join("test.cosessiondb");
+        let tables = session_tables(&import, &media_plan(&import, &source), &dir, &source).unwrap();
+        write_tables(&database, &tables).unwrap();
+        assert_eq!(rows(&database, "ZCOMPAREVARIANTS"), source.compare_variants);
+        assert_eq!(rows(&database, "ZVARIANTINCOLLECTION"), source.variant_members);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn entities_and_display_tables_match_the_source() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("entities-display");
@@ -1729,6 +1809,61 @@ mod tests {
         crate::c1catalog::export_table_rows(path, table).unwrap()
     }
 
+    #[test]
+    fn exported_document_points_to_its_root_collection() {
+        let mut import = C1Import::open(&fixture()).unwrap();
+        let collections = &mut import.catalog.collections;
+        let root_pk = collections.iter().map(|collection| collection.pk).max().unwrap() + 1;
+        let root = collections.iter_mut().find(|collection| collection.parent.is_none()).unwrap();
+        let original_pk = root.pk;
+        root.pk = root_pk;
+        for collection in collections {
+            if collection.parent == Some(original_pk) {
+                collection.parent = Some(root_pk);
+            }
+        }
+
+        let dir = temp_dir("root-collection");
+        let export = export_session(&import, &dir.join("Root.cosessiondb")).unwrap();
+        let document = rows(&export.database, "ZDOCUMENTCONTENT");
+        assert_eq!(document.len(), 1);
+        let referenced_pk = row_i64(&document[0], "ZROOTCOLLECTION").unwrap();
+        assert_eq!(referenced_pk, root_pk);
+        let collections = rows(&export.database, "ZCOLLECTION");
+        let root = collections.iter().find(|row| row_i64(row, "Z_PK") == Some(referenced_pk)).unwrap();
+        assert_eq!(row_i64(root, "Z_ENT"), Some(7));
+        assert_eq!(row_i64(root, "ZPARENT"), Some(-1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exported_variant_references_resolve_to_its_rebuilt_layers() {
+        let (dir, _, export) = export_fixture("layer-references");
+        let source_variants = rows(&fixture(), "ZVARIANT");
+        let exported_variants = rows(&export.database, "ZVARIANT");
+        let exported_layers = rows(&export.database, "ZVARIANTLAYER");
+        let mut remapped = false;
+        assert!(exported_variants.len() > 1);
+        for variant in &exported_variants {
+            let pk = row_i64(variant, "Z_PK").unwrap();
+            let source = source_variants.iter().find(|row| row_i64(row, "Z_PK") == Some(pk)).unwrap();
+            for (column, entity) in [
+                ("ZADJUSTMENTLAYER", 17),
+                ("ZDEFAULTLAYER", 18),
+                ("ZCOMBINEDSETTINGS", 20),
+            ] {
+                let layer_pk = row_i64(variant, column).unwrap();
+                remapped |= row_i64(source, column).is_some_and(|source_pk| source_pk != layer_pk);
+                let layer = exported_layers.iter()
+                    .find(|row| row_i64(row, "Z_PK") == Some(layer_pk)).unwrap();
+                assert_eq!(row_i64(layer, "ZVARIANT"), Some(pk), "{column}");
+                assert_eq!(row_i64(layer, "Z_ENT"), Some(entity), "{column}");
+            }
+        }
+        assert!(remapped, "fixture must exercise changed layer IDs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn same_value(a: Option<&str>, b: Option<&str>) -> bool {
         match (a, b) {
             (None, None) => true,
@@ -1788,6 +1923,8 @@ mod tests {
                 let b = row_by(&out_layers, variant.pk, ent)
                     .unwrap_or_else(|| panic!("layer {}/{ent} missing", variant.pk));
                 for column in [
+                    "ZGEOMETRYKEYSTONEFOCALLENGTH",
+                    "ZLENSOPTICCENTER",
                     "ZLENSOPTICCENTERENABLED",
                     "ZLEVELSTARGETENABLE",
                     "ZRETOUCHINGBLEMISHREMOVALAMOUNT",
@@ -1804,19 +1941,20 @@ mod tests {
             }
         }
 
-        // The two non-evidence columns stay out of the export schema.
-        assert!(out_layers.iter().all(|row| !row.contains_key("ZGEOMETRYKEYSTONEFOCALLENGTH")));
-        assert!(out_layers.iter().all(|row| !row.contains_key("ZLENSOPTICCENTER")));
-        let out_variants = rows(&export.database, "ZVARIANT");
-        for skipped in [
-            "ZVARIANTUUID",
-            "ZADJUSTMENTLAYER",
-            "ZDEFAULTLAYER",
-            "ZCOMBINEDSETTINGS",
-        ] {
-            assert!(out_variants.iter().all(|row| !row.contains_key(skipped)), "{skipped}");
+        for column in ["ZGEOMETRYKEYSTONEFOCALLENGTH", "ZLENSOPTICCENTER"] {
+            assert!(src_layers.iter().any(|row| row_text(row, column).is_some()));
+            for layer in out_layers.iter().filter(|layer| row_i64(layer, "Z_ENT") == Some(23)) {
+                assert_eq!(row_text(layer, column), None);
+            }
         }
-
+        let out_variants = rows(&export.database, "ZVARIANT");
+        let source_variants = rows(&fixture(), "ZVARIANT");
+        assert!(source_variants.iter().any(|row| row_text(row, "ZVARIANTUUID").is_some()));
+        for out in &out_variants {
+            let pk = row_i64(out, "Z_PK").unwrap();
+            let original = source_variants.iter().find(|row| row_i64(row, "Z_PK") == Some(pk)).unwrap();
+            assert_eq!(row_text(out, "ZVARIANTUUID"), row_text(original, "ZVARIANTUUID"));
+        }
         assert!(export_session(&source, &target).is_err(), "overwrite must be refused");
         let _ = std::fs::remove_dir_all(&dir);
     }

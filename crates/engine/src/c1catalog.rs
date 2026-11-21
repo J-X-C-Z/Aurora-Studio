@@ -11,7 +11,7 @@
 //! and a `.readlock` sibling only produces a warning, never a block.
 
 use crate::c1_masks::mask_layers_from_rows;
-use crate::c1_model::{from_layer_row, to_adjustment_set, C1VariantSettings};
+use crate::c1_model::{crop_on_canvas, from_layer_row, to_adjustment_set, C1VariantSettings};
 use crate::c1_retouch::{group_retouching_rows, RetouchingLayer};
 use crate::catalog::CollectionKind;
 use anyhow::{anyhow, bail, Context, Result};
@@ -670,7 +670,12 @@ impl C1Catalog {
         let images = Self::read_images(&mut db, &mut warnings)?;
         let collections = Self::read_collections(&mut db, &mut warnings)?;
         let keywords = Self::read_keywords(&mut db, &mut warnings)?;
-        let variants = Self::read_variants(&mut db, &keywords, &mut warnings)?;
+        let variants = Self::read_variants(
+            &mut db,
+            (document_type == C1DocumentType::Catalog).then(|| path.parent().unwrap_or(Path::new("."))),
+            &keywords,
+            &mut warnings,
+        )?;
         Ok(Self { document_type, images, variants, collections, keywords, warnings, wal })
     }
 
@@ -932,9 +937,29 @@ impl C1Catalog {
 
     fn read_variants(
         db: &mut SqliteReader,
+        catalog_folder: Option<&Path>,
         keywords: &[C1Keyword],
         warnings: &mut Vec<String>,
     ) -> Result<Vec<C1Variant>> {
+        let sidecars: HashMap<String, PathBuf> = if let Some(folder) = catalog_folder {
+            if db.has_table("ZSIDECAR").unwrap_or(false) {
+                optional_rows(db, "ZSIDECAR", warnings)?
+                    .iter()
+                    .filter_map(|row| {
+                        let name = row.get("ZNAME")?.as_str()?;
+                        let Value::Int(kind) = row.get("ZTYPE")? else { return None };
+                        let path = crate::dust_lcc::resolve_lcc_path(
+                            folder, crate::dust_lcc::SidecarRow { name, kind: *kind },
+                        )?;
+                        Some((name.to_owned(), path))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
         let layers = db.select("ZVARIANTLAYER")?;
         // Source pixel size per image, to tell whether a variant's canvas is turned.
         let dims: HashMap<i64, (u32, u32)> = db
@@ -1007,35 +1032,33 @@ impl C1Catalog {
                 merged.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             let local_layers = mask_layers_from_rows(&local_rows);
             let mut settings = from_layer_row(&borrowed);
-            // ZCROP is in canvas pixels and ZCANVASSIZE is only stored on ZVARIANT,
-            // never on the layer row, so the canvas has to come from the variant.
+            // Crop size is in canvas pixels, but the stored center is in raw coordinates.
             let canvas = v.get("ZCANVASSIZE").and_then(Value::as_str).and_then(parse_pair);
             if let Some((w, h)) = canvas {
                 settings.canvas_size = [w, h];
             }
+            let source = v
+                .get("ZIMAGE")
+                .and_then(Value::as_f64)
+                .map(|pk| pk as i64)
+                .and_then(|pk| dims.get(&pk).copied());
             let mut adjustments = to_adjustment_set(&settings);
-            // C1 keeps the crop in the variant's canvas space. A portrait canvas on a
-            // landscape file (or the reverse) means the variant is turned a quarter:
-            // without that turn the crop lands on the wrong pixels.
-            if let Some((cw, ch)) = canvas {
-                let source = v
-                    .get("ZIMAGE")
-                    .and_then(Value::as_f64)
-                    .map(|pk| pk as i64)
-                    .and_then(|pk| dims.get(&pk).copied())
-                    .unwrap_or((0, 0));
-                let portrait_canvas = ch > cw;
-                let portrait_source = source.1 > source.0;
-                if source.0 > 0 && portrait_canvas != portrait_source {
-                    // `orientation` is quarter turns; a raw 90 is read as 90 % 4 == 2
-                    // and turns the frame twice. Only add a quarter turn when the
-                    // current one is even; an odd ZROTATION already has the axis.
-                    let turn = adjustments.geometry.orientation % 4;
-                    if turn % 2 == 0 {
-                        adjustments.geometry.orientation = (turn + 1) % 4;
-                    }
+            if let Some(path) = settings.lens.lcc_id.as_ref().and_then(|id| sidecars.get(id)) {
+                let loaded = std::fs::read(path).map_err(anyhow::Error::from).and_then(|bytes| {
+                    adjustments.lens.load_dust_lcc(&bytes).map_err(anyhow::Error::from)
+                });
+                if let Err(error) = loaded {
+                    warnings.push(format!("could not load Capture One LCC {}: {error}", path.display()));
                 }
             }
+            let geometry = &mut adjustments.geometry;
+            if let (Some((cw, ch)), Some((sw, sh))) = (canvas, source) {
+                // Preserve the catalog's inferred quarter turn for variants that omit it.
+                if sw > 0 && (ch > cw) != (sh > sw) && geometry.orientation % 2 == 0 {
+                    geometry.orientation = (geometry.orientation + 1) % 4;
+                }
+            }
+            geometry.crop = crop_on_canvas(settings.crop_px, geometry, source);
 
             let mut rating = 0i64;
             let mut color_tag = 0i64;
@@ -1374,7 +1397,7 @@ pub(crate) mod test_support {
                 Cell::Null,
                 Cell::Real(0.5),
                 Cell::Real(4.0),
-                Cell::text("1000;500;2000;1500"),
+                Cell::text("2500;1500;1000;1000"),
             ])
             .row(vec![
                 Cell::Int(101),
@@ -1588,6 +1611,99 @@ mod tests {
         std::fs::write(&path, sqlite_file(&tables)).unwrap();
         path
     }
+
+    #[test]
+    fn an_lcc_sidecar_reaches_the_variant_and_bad_files_are_skipped() {
+        use super::test_support::{Cell, SynthTable};
+
+        let dir = temp_dir("lcc-sidecar");
+        std::fs::create_dir_all(dir.join("Adjustments").join("LCC")).unwrap();
+        let id = "0a1b2c3d";
+        let patch =
+            crate::DustPatch { x: 0, y: 0, w: 4, h: 4, offset: 0, bias: 128, step: 8 };
+        let lcc = crate::dust_lcc::lcc_with(&[patch], &[10u8; 16]);
+
+        let tables = || {
+            let mut t: Vec<SynthTable> = session_tables()
+                .into_iter()
+                .filter(|x| !matches!(x.name(), "ZVARIANTLAYER" | "ZDOCUMENTCONTENT"))
+                .collect();
+            t.push(
+                SynthTable::new(
+                    "ZVARIANTLAYER",
+                    &[
+                        "Z_PK INTEGER PRIMARY KEY",
+                        "Z_ENT INTEGER",
+                        "ZVARIANT INTEGER",
+                        "ZEXPOSURE REAL",
+                        "ZLENSLCC TEXT",
+                        "ZLENSDUSTREMOVALENABLED BOOLEAN",
+                    ],
+                )
+                .row(vec![
+                    Cell::Int(900),
+                    Cell::Int(18),
+                    Cell::Int(11),
+                    Cell::Real(0.25),
+                    Cell::text(id),
+                    Cell::Int(1),
+                ]),
+            );
+            t.push(
+                SynthTable::new(
+                    "ZSIDECAR",
+                    &[
+                        "Z_PK INTEGER PRIMARY KEY",
+                        "ZNAME TEXT",
+                        "ZDISPLAYNAME TEXT",
+                        "ZTYPE INTEGER",
+                        "ZFILEHASH TEXT",
+                    ],
+                )
+                .row(vec![
+                    Cell::Int(1),
+                    Cell::text(id),
+                    Cell::text("Night sky"),
+                    Cell::Int(1),
+                    Cell::text("hash"),
+                ]),
+            );
+            t
+        };
+
+        let db = dir.join("Lcc.cocatalogdb");
+        std::fs::write(&db, sqlite_file(&tables())).unwrap();
+        let lcc_file = dir.join("Adjustments").join("LCC").join(format!("{id}.lcc"));
+        std::fs::write(&lcc_file, &lcc).unwrap();
+
+        let variant = |c: &C1Catalog| c.variants.iter().find(|v| v.pk == 11).unwrap().adjustments.clone();
+        let c = C1Catalog::open_ro(&db).unwrap();
+        let adj = variant(&c);
+        assert!(adj.lens.dust_removal_enabled);
+        assert_eq!(adj.lens.dust_patches.len(), 1);
+        assert_eq!(adj.lens.dust_gain.len(), 16);
+
+        std::fs::remove_file(&lcc_file).unwrap();
+        let c = C1Catalog::open_ro(&db).unwrap();
+        let adj = variant(&c);
+        assert!(adj.lens.dust_patches.is_empty());
+        assert!(c.warnings.iter().any(|w| w.contains("LCC")), "{:?}", c.warnings);
+        let mut buf = vec![90u8; 8 * 8 * 4];
+        let before = buf.clone();
+        crate::mock::detail::post_process(&mut buf, 8, 8, &adj, 1.0);
+        assert_eq!(buf, before, "a missing .lcc must stay inert");
+
+        std::fs::write(&lcc_file, b"not an lcc").unwrap();
+        let c = C1Catalog::open_ro(&db).unwrap();
+        assert!(variant(&c).lens.dust_patches.is_empty());
+        assert!(
+            c.warnings.iter().any(|w| w.contains("not a Capture One XCon")),
+            "{:?}",
+            c.warnings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn reads_the_collection_tree() {

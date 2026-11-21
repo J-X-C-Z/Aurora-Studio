@@ -1,10 +1,13 @@
-use std::{collections::BTreeMap, io, str};
+use std::{borrow::Cow, collections::BTreeMap, io, str};
 
 const SCHEMAS: &[&str] = &[
     "1680", "1674", "1670", "1665", "1664", "166", "165", "152", "141", "140", "131", "130", "120",
     "110", "100", "91", "90", "82", "81", "80", "70", "50", "",
 ];
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_DEFLATED_MEMBER_BYTES: usize = 512 * 1024 * 1024;
+const ZIP32_MAX: usize = u32::MAX as usize;
+const ZIP16_MAX: usize = u16::MAX as usize;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -16,6 +19,105 @@ fn word(bytes: &[u8], offset: usize) -> usize {
 
 fn dword(bytes: &[u8], offset: usize) -> usize {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+}
+
+fn zip64_word(bytes: &[u8], offset: usize) -> io::Result<usize> {
+    let word = bytes.get(offset..offset + 8).ok_or_else(|| invalid("truncated ZIP64 field"))?;
+    usize::try_from(u64::from_le_bytes(word.try_into().unwrap()))
+        .map_err(|_| invalid("ZIP64 field exceeds platform size"))
+}
+
+fn directory_bounds(data: &[u8], end: usize) -> io::Result<(usize, usize, usize)> {
+    let footer = &data[end..];
+    let mut count = word(footer, 10);
+    let mut size = dword(footer, 12);
+    let mut start = dword(footer, 16);
+    if word(footer, 4) != 0 || word(footer, 6) != 0 || word(footer, 8) != count {
+        return Err(invalid("unsupported multi-disk EIP"));
+    }
+    let mut directory_end = end;
+    if let Some(locator) = end.checked_sub(20).and_then(|offset| data.get(offset..end))
+        .filter(|locator| locator.starts_with(b"PK\x06\x07"))
+    {
+        if dword(locator, 4) != 0 || dword(locator, 16) != 1 {
+            return Err(invalid("unsupported multi-disk ZIP64 EIP"));
+        }
+        directory_end = zip64_word(locator, 8)?;
+        let record = data.get(directory_end..end - 20)
+            .filter(|record| record.len() >= 56 && record.starts_with(b"PK\x06\x06"))
+            .ok_or_else(|| invalid("invalid ZIP64 end record"))?;
+        if zip64_word(record, 4)?.checked_add(12) != Some(record.len())
+            || dword(record, 16) != 0 || dword(record, 20) != 0
+        {
+            return Err(invalid("unsupported ZIP64 end record"));
+        }
+        let full_count = zip64_word(record, 32)?;
+        let full_size = zip64_word(record, 40)?;
+        let full_start = zip64_word(record, 48)?;
+        if zip64_word(record, 24)? != full_count
+            || (count != ZIP16_MAX && count != full_count)
+            || (size != ZIP32_MAX && size != full_size)
+            || (start != ZIP32_MAX && start != full_start)
+        {
+            return Err(invalid("ZIP and ZIP64 directory records differ"));
+        }
+        (count, size, start) = (full_count, full_size, full_start);
+    } else if count == ZIP16_MAX || start == ZIP32_MAX || size == ZIP32_MAX {
+        return Err(invalid("ZIP64 locator missing"));
+    }
+    if start.checked_add(size) != Some(directory_end) || count > size / 46 {
+        return Err(invalid("invalid ZIP central directory"));
+    }
+    Ok((start, directory_end, count))
+}
+
+fn resolve_zip64_fields(extra: &[u8], fields: &mut [usize; 3]) -> io::Result<()> {
+    let mut tags = extra;
+    while tags.len() >= 4 {
+        let field_end = 4 + word(tags, 2);
+        let value = tags.get(4..field_end).ok_or_else(|| invalid("truncated ZIP extra field"))?;
+        if word(tags, 0) == 1 {
+            let mut offset = 0;
+            for field in fields.iter_mut().filter(|field| **field == ZIP32_MAX) {
+                *field = zip64_word(value, offset)?;
+                offset += 8;
+            }
+            return Ok(());
+        }
+        tags = &tags[field_end..];
+    }
+    Err(invalid("ZIP64 member extra field missing"))
+}
+
+fn inflate(payload: &[u8], size: usize) -> io::Result<Vec<u8>> {
+    if size > MAX_DEFLATED_MEMBER_BYTES {
+        return Err(invalid("deflated EIP member exceeds size limit"));
+    }
+    use flate2::{Decompress, FlushDecompress, Status};
+    let mut decoder = Decompress::new(false);
+    let mut decoded = Vec::new();
+    let mut chunk = [0; 32 * 1024];
+    loop {
+        let input_start = decoder.total_in() as usize;
+        let output_start = decoder.total_out() as usize;
+        let status = decoder.decompress(&payload[input_start..], &mut chunk, FlushDecompress::None)
+            .map_err(|_| invalid("invalid EIP deflate stream"))?;
+        let output_end = decoder.total_out() as usize;
+        if output_end > size {
+            return Err(invalid("EIP deflate length exceeds declared size"));
+        }
+        decoded.extend_from_slice(&chunk[..output_end - output_start]);
+        if status == Status::StreamEnd {
+            return if output_end == size && decoder.total_in() as usize == payload.len() {
+                Ok(decoded)
+            } else {
+                Err(invalid("EIP deflate length mismatch"))
+            };
+        }
+        if output_start == output_end && input_start == decoder.total_in() as usize {
+            return Err(invalid("incomplete EIP deflate stream"));
+        }
+    }
 }
 
 struct Entry<'a> {
@@ -55,21 +157,8 @@ impl<'a> EipPackage<'a> {
                     && footer.len() == 22 + word(footer, 20)
             })
             .ok_or_else(|| invalid("ZIP end record missing"))?;
-        let footer = &data[end..];
-        let count = word(footer, 10);
-        let directory_offset = dword(footer, 16);
-        let directory_size = dword(footer, 12);
-        // shortcut: C1 samples use single-disk ZIP32, extend when a ZIP64 EIP is available.
-        if word(footer, 4) != 0
-            || word(footer, 6) != 0
-            || word(footer, 8) != count
-            || count == u16::MAX as usize
-            || directory_offset.checked_add(directory_size) != Some(end)
-        {
-            return Err(invalid("unsupported ZIP central directory"));
-        }
-
-        let mut directory = &data[directory_offset..end];
+        let (directory_offset, directory_end, count) = directory_bounds(data, end)?;
+        let mut directory = &data[directory_offset..directory_end];
         let mut entries = BTreeMap::new();
         for _ in 0..count {
             if directory.len() < 46 || !directory.starts_with(b"PK\x01\x02") {
@@ -83,8 +172,12 @@ impl<'a> EipPackage<'a> {
             }
             let name = str::from_utf8(&directory[46..name_end])
                 .map_err(|_| invalid("EIP member name is not UTF-8"))?;
-            let expanded_size = dword(directory, 24);
             let extra = &directory[name_end..extra_end];
+            let mut fields = [dword(directory, 24), dword(directory, 20), dword(directory, 42)];
+            if fields.contains(&ZIP32_MAX) {
+                resolve_zip64_fields(extra, &mut fields)?;
+            }
+            let [expanded_size, stored_size, offset] = fields;
             let content_size = match extra {
                 [_, _, _, _] if dword(extra, 0) != 0 => dword(extra, 0),
                 _ => expanded_size,
@@ -93,11 +186,11 @@ impl<'a> EipPackage<'a> {
                 return Err(invalid("EIP content length exceeds expanded length"));
             }
             let entry = Entry {
-                offset: dword(directory, 42),
+                offset,
                 flags: word(directory, 8),
                 method: word(directory, 10),
                 crc: dword(directory, 16) as u32,
-                stored_size: dword(directory, 20),
+                stored_size,
                 expanded_size,
                 content_size,
                 extra,
@@ -136,16 +229,13 @@ impl<'a> EipPackage<'a> {
         Ok(package)
     }
 
-    pub fn member(&self, name: &str) -> io::Result<&'a [u8]> {
+    pub fn member(&self, name: &str) -> io::Result<Cow<'a, [u8]>> {
         let entry = self
             .entries
             .get(name)
             .ok_or_else(|| invalid("EIP member missing"))?;
-        // shortcut: C1 samples store uncompressed members, extend when a compressed EIP is available.
-        if entry.method != 0
-            || entry.flags & !(0x0008 | 0x0800) != 0
-            || entry.stored_size != entry.expanded_size
-        {
+        let allowed_flags = 0x0808 | if entry.method == 8 { 0x0006 } else { 0 };
+        if !matches!(entry.method, 0 | 8) || entry.flags & !allowed_flags != 0 {
             return Err(invalid("unsupported EIP ZIP member encoding"));
         }
         let local = self.data[..self.directory_offset]
@@ -172,10 +262,19 @@ impl<'a> EipPackage<'a> {
         let payload = local
             .get(data_start..data_end)
             .ok_or_else(|| invalid("truncated EIP member"))?;
-        if crc32fast::hash(payload) != entry.crc {
+        let mut decoded = match entry.method {
+            0 if entry.stored_size == entry.expanded_size => Cow::Borrowed(payload),
+            8 => Cow::Owned(inflate(payload, entry.expanded_size)?),
+            _ => return Err(invalid("EIP stored member size mismatch")),
+        };
+        if crc32fast::hash(&decoded) != entry.crc {
             return Err(invalid("EIP member checksum mismatch"));
         }
-        Ok(&payload[..entry.content_size])
+        match &mut decoded {
+            Cow::Borrowed(bytes) => *bytes = &bytes[..entry.content_size],
+            Cow::Owned(bytes) => bytes.truncate(entry.content_size),
+        }
+        Ok(decoded)
     }
 
     pub fn expanded_size(&self, name: &str) -> Option<usize> {
@@ -186,8 +285,8 @@ impl<'a> EipPackage<'a> {
         if self.expanded_size(name).unwrap_or_default() > MAX_MANIFEST_BYTES {
             return Err(invalid("EIP manifest exceeds size limit"));
         }
-        let xml =
-            str::from_utf8(self.member(name)?).map_err(|_| invalid("EIP manifest is not UTF-8"))?;
+        let bytes = self.member(name)?;
+        let xml = str::from_utf8(&bytes).map_err(|_| invalid("EIP manifest is not UTF-8"))?;
         let document = roxmltree::Document::parse(xml)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let root = document.root_element();
@@ -235,6 +334,115 @@ impl<'a> EipPackage<'a> {
 mod tests {
     use super::*;
     use std::{fs, path::Path};
+
+    fn deflated_archive(zip64: bool, corrupt_crc: bool) -> Vec<u8> {
+        use std::io::Write;
+
+        let manifest = b"<Manifest><File><RawPath>photo.IIQ</RawPath></File></Manifest>";
+        let raw = b"packed media fixture";
+        let members: [(&[u8], &[u8]); 2] = [(b"manifest.xml", manifest), (b"photo.IIQ", raw)];
+        let mut archive = Vec::new();
+        let mut directory = Vec::new();
+        for (name, input) in members {
+            let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(input).unwrap();
+            let payload = encoder.finish().unwrap();
+            let crc = crc32fast::hash(input) ^ u32::from(corrupt_crc && name == b"photo.IIQ");
+            let offset = archive.len();
+            let mut local = [0u8; 30];
+            local[..4].copy_from_slice(b"PK\x03\x04");
+            local[4] = if zip64 { 45 } else { 20 };
+            local[8] = 8;
+            local[14..18].copy_from_slice(&crc.to_le_bytes());
+            let stored_size = if zip64 { u32::MAX } else { payload.len() as u32 };
+            let expanded_size = if zip64 { u32::MAX } else { input.len() as u32 };
+            local[18..22].copy_from_slice(&stored_size.to_le_bytes());
+            local[22..26].copy_from_slice(&expanded_size.to_le_bytes());
+            local[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            let mut extra = Vec::new();
+            if zip64 {
+                extra.extend_from_slice(&[1, 0, 16, 0]);
+                extra.extend_from_slice(&(input.len() as u64).to_le_bytes());
+                extra.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            }
+            local[28..30].copy_from_slice(&(extra.len() as u16).to_le_bytes());
+            archive.extend_from_slice(&local);
+            archive.extend_from_slice(name);
+            archive.extend_from_slice(&extra);
+            archive.extend_from_slice(&payload);
+
+            let mut central = [0u8; 46];
+            central[..4].copy_from_slice(b"PK\x01\x02");
+            central[4..6].copy_from_slice(&local[4..6]);
+            central[6..16].copy_from_slice(&local[4..14]);
+            central[16..30].copy_from_slice(&local[14..28]);
+            let legacy_offset = if zip64 { u32::MAX } else { offset as u32 };
+            central[42..46].copy_from_slice(&legacy_offset.to_le_bytes());
+            if zip64 {
+                extra[2] = 24;
+                extra.extend_from_slice(&(offset as u64).to_le_bytes());
+            }
+            central[30..32].copy_from_slice(&(extra.len() as u16).to_le_bytes());
+            directory.extend_from_slice(&central);
+            directory.extend_from_slice(name);
+            directory.extend_from_slice(&extra);
+        }
+        let start = archive.len();
+        archive.extend_from_slice(&directory);
+        let mut footer = [0u8; 22];
+        footer[..4].copy_from_slice(b"PK\x05\x06");
+        if zip64 {
+            let record_offset = archive.len();
+            let mut record = [0u8; 56];
+            record[..4].copy_from_slice(b"PK\x06\x06");
+            record[4..12].copy_from_slice(&44u64.to_le_bytes());
+            record[12] = 45;
+            record[14] = 45;
+            record[24..32].copy_from_slice(&2u64.to_le_bytes());
+            record[32..40].copy_from_slice(&2u64.to_le_bytes());
+            record[40..48].copy_from_slice(&(directory.len() as u64).to_le_bytes());
+            record[48..56].copy_from_slice(&(start as u64).to_le_bytes());
+            archive.extend_from_slice(&record);
+            archive.extend_from_slice(b"PK\x06\x07\0\0\0\0");
+            archive.extend_from_slice(&(record_offset as u64).to_le_bytes());
+            archive.extend_from_slice(&1u32.to_le_bytes());
+            footer[8..20].fill(0xff);
+        } else {
+            footer[8..10].copy_from_slice(&2u16.to_le_bytes());
+            footer[10..12].copy_from_slice(&2u16.to_le_bytes());
+            footer[12..16].copy_from_slice(&(directory.len() as u32).to_le_bytes());
+            footer[16..20].copy_from_slice(&(start as u32).to_le_bytes());
+        }
+        archive.extend_from_slice(&footer);
+        archive
+    }
+
+    #[test]
+    fn deflate_and_zip64_read_manifest_and_media_with_crc_validation() {
+        for zip64 in [false, true] {
+            let bytes = deflated_archive(zip64, false);
+            let package = EipPackage::parse(&bytes).unwrap();
+            assert_eq!(package.manifest.paths["RawPath"], "photo.IIQ");
+            assert_eq!(package.member("photo.IIQ").unwrap().as_ref(), b"packed media fixture");
+            let bytes = deflated_archive(zip64, true);
+            assert_eq!(
+                EipPackage::parse(&bytes).unwrap().member("photo.IIQ").unwrap_err().to_string(),
+                "EIP member checksum mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn deflate_rejects_wrong_length_and_trailing_bytes() {
+        let mut stream = vec![0x73, 0x04, 0x00];
+        assert_eq!(inflate(&stream, 1).unwrap(), b"A");
+        assert!(inflate(&stream, 0).is_err());
+        assert!(inflate(&stream, 2).is_err());
+        assert!(inflate(&stream[..2], 1).is_err());
+        assert!(inflate(&stream, MAX_DEFLATED_MEMBER_BYTES + 1).is_err());
+        stream.push(0);
+        assert!(inflate(&stream, 1).is_err());
+    }
 
     #[test]
     fn original_c1_packages() {
