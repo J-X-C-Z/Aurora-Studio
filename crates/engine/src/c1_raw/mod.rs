@@ -62,7 +62,7 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
     let mut out = Vec::with_capacity(width * height * 4);
     for pixel in rgb.chunks_exact(3) {
         for value in pixel {
-            out.push((value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16);
+            out.push(value.clamp(0.0, 65535.0) as u16);
         }
         out.push(65535);
     }
@@ -80,5 +80,36 @@ mod tests {
             .expect("C1 chain rejected the sample");
         assert!(width.max(height) > 3000, "{width}x{height}");
         assert_eq!(pixels.len(), (width * height * 4) as usize);
+        let mut histogram = vec![0u64; 65536];
+        for pixel in pixels.chunks_exact(4) {
+            for &value in &pixel[..3] {
+                histogram[value as usize] += 1;
+            }
+        }
+        let total = u64::from(width) * u64::from(height) * 3;
+        let at = |fraction: f64| {
+            let target = (fraction * total as f64) as u64;
+            let mut seen = 0;
+            histogram
+                .iter()
+                .position(|&count| {
+                    seen += count;
+                    seen >= target
+                })
+                .unwrap() as u16
+        };
+        let clipped = histogram[65535];
+        let max = histogram.iter().rposition(|&count| count > 0).unwrap();
+        println!(
+            "C1 RAW RGB16 {width}x{height}: min={} p50={} p90={} p99={} p99.9={} max={max} clipped={clipped}/{total} ({:.6}%)",
+            at(0.0),
+            at(0.50),
+            at(0.90),
+            at(0.99),
+            at(0.999),
+            clipped as f64 / total as f64 * 100.0
+        );
+        assert!(at(0.50) < 65535, "median channel clipped to white");
+        assert!(clipped * 2 < total, "clipped channels {clipped}/{total}");
     }
 }
