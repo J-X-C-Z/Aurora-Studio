@@ -1871,8 +1871,9 @@ fn log_report(report: &PortraitRunReport) {
                     .collect::<Vec<_>>()
             ),
             PortraitBackend::Cpu => {
-                if let Some(reason) = &effect.fallback_reason {
-                    log::debug!("portrait PF{} CPU fallback: {reason}", effect.pf);
+                match &effect.fallback_reason {
+                    Some(reason) => log::debug!("portrait PF{} CPU fallback: {reason}", effect.pf),
+                    None => log::debug!("portrait PF{} executed on CPU", effect.pf),
                 }
             }
             PortraitBackend::Skipped => log::debug!(
