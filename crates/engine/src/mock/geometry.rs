@@ -930,11 +930,20 @@ mod tests {
         ] {
             row.insert(k, Some(v.to_string()));
         }
-        let g = crate::c1_model::to_adjustment_set(&crate::c1_model::from_layer_row(&row)).geometry;
+        let settings = crate::c1_model::from_layer_row(&row);
+        let mut g = crate::c1_model::to_adjustment_set(&settings).geometry;
+        g.crop = crate::c1_model::crop_on_canvas(settings.crop_px, &g, Some(DSC5673));
         assert_eq!(g.orientation, 3, "270 is a quarter turn");
         assert!(g.rotation.abs() < 1e-6, "270 must not stay a fine rotation");
         assert_eq!(g.canvas, DSC_CANVAS);
-        assert_dsc_corners(&g, [[3704.2489, 2520.2806], [3704.2489, 3323.3216], [1059.0631, 3323.3216], [1059.0631, 2520.2806]]);
+        let [cx, cy] = [2525.8076, 2348.0876];
+        let [half_width, half_height] = [3328.8486 / 2.0, 4993.2734 / 2.0];
+        assert_dsc_corners(&g, [
+            [cx + half_height, cy - half_width],
+            [cx + half_height, cy + half_width],
+            [cx - half_height, cy + half_width],
+            [cx - half_height, cy - half_width],
+        ]);
     }
 
     /// A stored canvas with no crop must not change an uncropped frame.

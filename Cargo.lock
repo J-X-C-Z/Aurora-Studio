@@ -486,6 +486,7 @@ dependencies = [
  "aurora-portrait",
  "base64 0.22.1",
  "crc32fast",
+ "flate2",
  "image",
  "log",
  "memmap2",
@@ -494,6 +495,7 @@ dependencies = [
  "roxmltree 0.20.0",
  "serde",
  "serde_json",
+ "tiff",
 ]
 
 [[package]]

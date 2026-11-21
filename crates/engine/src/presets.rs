@@ -186,7 +186,7 @@ fn apply_key(set: &mut AdjustmentSet, key: &str, value: &str) -> bool {
                 num().unwrap_or(set.noise_reduction.color),
             )
         }
-        "BandingReductionAmount" => {
+        "BRAmount" | "BandingReductionAmount" => {
             if let Some(v) = num() {
                 set.extra.insert(
                     "BandingReductionAmount".to_string(),
@@ -752,6 +752,13 @@ pub fn grouped(presets: &[C1Preset]) -> HashMap<String, Vec<&C1Preset>> {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn banding_preset_alias_populates_extra() {
+        let mut set = AdjustmentSet::default();
+        assert!(apply_key(&mut set, "BRAmount", "37.5"));
+        assert_eq!(set.extra.get("BandingReductionAmount"), Some(&37.5));
+    }
 
     const EXPOSURE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <SL Engine="600">

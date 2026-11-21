@@ -299,7 +299,12 @@ pub const LOOK_COLOR_VECTOR: usize = 68;
 /// `MatchLookBw.onnx` output length (`[1, 7]`).
 pub const LOOK_BW_VECTOR: usize = 7;
 
-/// Runs one Match Look head on an sRGB8 RGBA frame and returns its raw output.
+fn rgba_len(width: u32, height: u32) -> Option<usize> {
+    (width as usize).checked_mul(height as usize)?.checked_mul(4)
+}
+
+/// Runs one Match Look head on an RGBA8 reference and returns its raw output.
+/// AICGR stores Adobe RGB 1998 samples, which are passed through without conversion.
 ///
 /// Preprocessing follows the r288 probe: bilinear resize to `size`, planar
 /// NCHW, values normalised to 0..1. The model output is the training-label
@@ -311,7 +316,9 @@ pub fn run_look_head(
     height: u32,
     size: u32,
 ) -> Result<Vec<f32>> {
-    if width == 0 || height == 0 || size == 0 || rgba.len() < (width * height * 4) as usize {
+    if width == 0 || height == 0 || size == 0
+        || rgba_len(width, height).is_none_or(|bytes| rgba.len() < bytes)
+    {
         bail!("Match Look model needs a non-empty RGBA frame");
     }
     let runtime = crate::aimask::Runtime::get()
@@ -330,7 +337,7 @@ pub fn run_look_head(
             let x1 = (x0 + 1).min(width - 1);
             let fx = sx - x0 as f32;
             let at = |px: u32, py: u32, c: usize| {
-                rgba[((py * width + px) * 4) as usize + c] as f32 / 255.0
+                rgba[(py as usize * width as usize + px as usize) * 4 + c] as f32 / 255.0
             };
             let index = y * side + x;
             for channel in 0..3 {
@@ -441,8 +448,7 @@ impl std::fmt::Display for LookError {
             Self::NoThumbnail => write!(f, "the style's <AICGR> carries no reference thumbnail"),
             Self::BadThumbnail { index, width, height, bytes } => write!(
                 f,
-                "thumbnail {index} is {bytes} bytes, expected {} for {width}x{height} RGBA",
-                *width as usize * *height as usize * 4
+                "thumbnail {index} has invalid RGBA dimensions or length ({width}x{height}, {bytes} bytes)"
             ),
         }
     }
@@ -460,8 +466,9 @@ pub fn look_adjustments(
         return Err(LookError::NoThumbnail);
     }
     for (index, thumb) in thumbnails.iter().enumerate() {
-        let expected = thumb.width as usize * thumb.height as usize * 4;
-        if thumb.rgba.len() != expected {
+        if thumb.width == 0 || thumb.height == 0
+            || rgba_len(thumb.width, thumb.height) != Some(thumb.rgba.len())
+        {
             return Err(LookError::BadThumbnail {
                 index,
                 width: thumb.width,
@@ -478,8 +485,9 @@ pub fn look_adjustments(
     Ok(out)
 }
 
-/// Evaluates an `<AICGR>` reference with the four ONNX heads from the Capture
-/// One install and returns the adjustments they imply.
+/// Produces the current import approximation from the first `<AICGR>` reference
+/// using the Color and BW heads. Capture One's multi-reference application
+/// computes weights against the destination image, which style import lacks.
 pub fn look_from_reference(reference: &LookReference) -> Option<AdjustmentSet> {
     let thumbnail = reference.thumbnails.first()?;
     let color = crate::aimask::model_path("MatchLookColor.onnx").ok()?;
@@ -912,6 +920,19 @@ mod tests {
         let set = look_adjustments(Some(&model), &[thumb], &components).expect("model");
         assert_eq!(set.exposure.saturation, -100.0);
         assert!(set.black_white.enabled);
+    }
+
+    #[test]
+    fn malformed_reference_is_rejected_before_inference() {
+        for (width, height) in [(0, 1), (1, 1), (u32::MAX, u32::MAX)] {
+            let thumb = LookThumbnail { width, height, rgba: Vec::new() };
+            let error = look_adjustments(None, &[thumb], &LookComponents::default()).unwrap_err();
+            assert_eq!(error, LookError::BadThumbnail { index: 0, width, height, bytes: 0 });
+            assert!(error.to_string().contains("invalid RGBA"));
+            let model = std::path::Path::new("unused.onnx");
+            assert!(run_look_head(model, &[], width, height, 384).unwrap_err()
+                .to_string().contains("non-empty RGBA"));
+        }
     }
 
     #[test]

@@ -1166,7 +1166,7 @@ mod tests {
     }
 
     /// A minimal container with one parameter-only 8x1 gradient mask.
-    fn gradient_container(midpoint: f32) -> Vec<u8> {
+    pub(crate) fn gradient_container(midpoint: f32) -> Vec<u8> {
         let mut b = b"\x04XCon".to_vec();
         push(&mut b, b"TYPE\x00\x0fCaptureOne Mask");
         push(&mut b, b"VER\x00\x00\x02\x03\x00");
@@ -1694,5 +1694,224 @@ mod tests {
         for cut in [0, 100, 1_000, 33_000, bytes.len() - 100_000] {
             assert!(read_comask_bytes(&bytes[..cut]).is_err(), "cut {cut} should fail");
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use tests::gradient_container;
+/// A single parameter-only Capture One gradient in the image's pixel coordinate space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ComaskWriteMask {
+    /// Start x/y, end x/y, midpoint.
+    LinearGradient([f32; 5]),
+    /// Center x/y, first radius vector x/y, second radius vector x/y, inner scale, fill.
+    RadialGradient([f32; 8]),
+    /// Brush and other raster masks require a Map and encoded blocks.
+    Raster,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComaskWriteError {
+    EmptyCanvas,
+    NonFiniteParameter,
+    UnsupportedRaster,
+}
+
+impl std::fmt::Display for ComaskWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyCanvas => f.write_str("Capture One mask canvas must be non-empty"),
+            Self::NonFiniteParameter => {
+                f.write_str("Capture One gradient parameters must be finite")
+            }
+            Self::UnsupportedRaster => {
+                f.write_str("Capture One raster mask encoding is unsupported")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ComaskWriteError {}
+
+/// Serialize one V3 mask at index zero with an empty layer name and UserInfo.
+/// The two RandSeed words are written as supplied by the caller.
+pub fn encode_parameter_comask(
+    width: u32,
+    height: u32,
+    mask: ComaskWriteMask,
+    rand_seed: [u32; 2],
+) -> Result<Vec<u8>, ComaskWriteError> {
+    let (mask_type, name, values, close): (u32, &[u8], &[f32], &[u8]) = match &mask {
+        ComaskWriteMask::LinearGradient(values) => (
+            3,
+            b"LinearGradient",
+            values,
+            b"\xfe\x29\xfe\x42\x73\xfe\x43\x66",
+        ),
+        ComaskWriteMask::RadialGradient(values) => (
+            4,
+            b"RadialGradient",
+            values,
+            b"\xfe\x35\xfe\x42\x7f\xfe\x43\x72",
+        ),
+        ComaskWriteMask::Raster => return Err(ComaskWriteError::UnsupportedRaster),
+    };
+    if width == 0 || height == 0 {
+        return Err(ComaskWriteError::EmptyCanvas);
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(ComaskWriteError::NonFiniteParameter);
+    }
+
+    const HEADER_BYTES: &[u8] = b"\
+        \x04\x58\x43\x6f\x6e\xc0\x42\x06\xbe\xba\xfe\xca\x00\x02\x04\x54\
+        \x59\x50\x45\xc0\x00\x0f\x43\x61\x70\x74\x75\x72\x65\x4f\x6e\x65\
+        \x20\x4d\x61\x73\x6b\xfe\x18\x03\x56\x45\x52\x00\x00\x02\x03\x00\
+        \xfe\x0a\xff\xff\x08\x4d\x61\x73\x6b\x49\x6e\x66\x6f\x00\x22\x00\
+        \x03\x48\x64\x72\x00\x22\xff\x18";
+    const LAYER_BYTES: &[u8] = b"\
+        \xfe\x21\xff\xff\x09\x4d\x61\x73\x6b\x49\x6e\x64\x65\x78\x00\x22\
+        \xff\xff\xff\x04\x00\x00\x00\x00\x08\x55\x73\x65\x72\x49\x6e\x66\
+        \x6f\x00\x22\x00\x04\x49\x6e\x66\x6f\x00\x22\x00\xfe\x09\xff\xff\
+        \x04\x4e\x61\x6d\x65\x00\x22\x00\xfe\x09\xfe\x23\x08\x4d\x61\x73\
+        \x6b\x54\x79\x70\x65\x00\x22\x04";
+    const SEED_BYTES: &[u8] = b"\
+        \xfe\x11\xff\xff\x08\x52\x61\x6e\x64\x53\x65\x65\x64\x00\x22\x08";
+    const COMP_BYTES: &[u8] = b"\
+        \xfe\x15\xff\xff\x09\x43\x6f\x6d\x70\x50\x61\x72\x61\x6d\x00\x22\
+        \xff\xff\xff\x10\x01\x00\x00\x00\x00\x00\x80\x3f\x00\x00\x00\x00\
+        \x00\x00\x00\x00";
+    const EMPTY_BYTES: &[u8] = b"\
+        \x03\x42\x6c\x6b\x00\x22\x00\xff\x03\x48\x64\x72\x00\x22\xff\x10\
+        \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+        \xfe\x19\xff\xff\x03\x49\x64\x78\x00\x22\x00\xfe\x08\x03\x64\x61\
+        \x74\x00\x00\x00\xfe\x08\xfe\x37";
+
+    let mut out = Vec::with_capacity(355);
+    out.extend_from_slice(HEADER_BYTES);
+    for value in [1, width, height, 12, 0, 0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(LAYER_BYTES);
+    out.extend_from_slice(&mask_type.to_le_bytes());
+    out.extend_from_slice(SEED_BYTES);
+    for value in rand_seed {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(COMP_BYTES);
+    out.extend_from_slice(b"\xfe\x21\xff\xff\x0e");
+    out.extend_from_slice(name);
+    out.extend_from_slice(&[0, 0x22, 0xff, 0xff, (values.len() * 4) as u8]);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(close);
+    // Parameter-only records omit Map and end with empty Blk, Idx and dat.
+    out.extend_from_slice(EMPTY_BYTES);
+    let root_length = out.len() + 1;
+    out.extend_from_slice(&[
+        0xfe,
+        0x40 | (root_length >> 6) as u8,
+        0x40 | (root_length & 63) as u8,
+    ]);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod parameter_writer_tests {
+    use super::*;
+
+    fn check(mask: ComaskWriteMask, seed: [u32; 2], golden: &str) {
+        let data = encode_parameter_comask(6048, 4032, mask, seed).unwrap();
+        // Lowercase hex keeps the fixture readable without introducing a test dependency.
+        let golden: Vec<u8> = golden
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(data, golden);
+        let expected: &[f32] = match &mask {
+            ComaskWriteMask::LinearGradient(values) => values,
+            ComaskWriteMask::RadialGradient(values) => values,
+            ComaskWriteMask::Raster => unreachable!(),
+        };
+        let actual: Vec<_> = data[256..256 + expected.len() * 4]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()).to_bits())
+            .collect();
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linear_original_bytes_and_parameter_round_trip() {
+        check(
+            ComaskWriteMask::LinearGradient([0.0, 0.0, 6048.0, 0.0, 0.005]),
+            [1, 1],
+            concat!(
+    "0458436f6ec04206bebafeca00020454595045c0000f436170747572654f6e65204d61736bfe180356455200",
+    "00020300fe0affff084d61736b496e666f002200034864720022ff1801000000a0170000c00f00000c000000",
+    "0000000000000000fe21ffff094d61736b496e6465780022ffffff04000000000855736572496e666f002200",
+    "04496e666f002200fe09ffff044e616d65002200fe09fe23084d61736b5479706500220403000000fe11ffff",
+    "0852616e64536565640022080100000001000000fe15ffff09436f6d70506172616d0022ffffff1001000000",
+    "0000803f0000000000000000fe21ffff0e4c696e6561724772616469656e740022ffff140000000000000000",
+    "0000bd45000000000ad7a33bfe29fe4273fe436603426c6b002200ff034864720022ff100000000000000000",
+    "0000000000000000fe19ffff03496478002200fe0803646174000000fe08fe37fe4555",
+),
+        );
+    }
+
+    #[test]
+    fn radial_original_bytes_and_parameter_round_trip() {
+        check(
+            ComaskWriteMask::RadialGradient([
+                3024.0_f32,
+                2016.0_f32,
+                1299.0380859375_f32,
+                750.0_f32,
+                350.0_f32,
+                -606.2177734375_f32,
+                0.3499999940395355_f32,
+                0.0_f32,
+            ]),
+            [1, 47],
+            concat!(
+    "0458436f6ec04206bebafeca00020454595045c0000f436170747572654f6e65204d61736bfe180356455200",
+    "00020300fe0affff084d61736b496e666f002200034864720022ff1801000000a0170000c00f00000c000000",
+    "0000000000000000fe21ffff094d61736b496e6465780022ffffff04000000000855736572496e666f002200",
+    "04496e666f002200fe09ffff044e616d65002200fe09fe23084d61736b5479706500220404000000fe11ffff",
+    "0852616e6453656564002208010000002f000000fe15ffff09436f6d70506172616d0022ffffff1001000000",
+    "0000803f0000000000000000fe21ffff0e52616469616c4772616469656e740022ffff2000003d450000fc44",
+    "3861a24400803b440000af43f08d17c43333b33e00000000fe35fe427ffe437203426c6b002200ff03486472",
+    "0022ff1000000000000000000000000000000000fe19ffff03496478002200fe0803646174000000fe08fe37",
+    "fe4561",
+),
+        );
+    }
+
+    #[test]
+    fn rejects_raster_and_invalid_parameters() {
+        assert_eq!(
+            encode_parameter_comask(6048, 4032, ComaskWriteMask::Raster, [1, 1]),
+            Err(ComaskWriteError::UnsupportedRaster),
+        );
+        assert_eq!(
+            encode_parameter_comask(0, 4032, ComaskWriteMask::LinearGradient([0.; 5]), [1, 1]),
+            Err(ComaskWriteError::EmptyCanvas),
+        );
+        assert_eq!(
+            encode_parameter_comask(
+                6048,
+                4032,
+                ComaskWriteMask::RadialGradient([f32::NAN; 8]),
+                [1, 1]
+            ),
+            Err(ComaskWriteError::NonFiniteParameter),
+        );
     }
 }

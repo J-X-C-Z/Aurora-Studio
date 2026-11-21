@@ -39,6 +39,7 @@ struct ScannedFile {
     file_size: u64,
     exif: Exif,
     iptc: Iptc,
+    packed: Option<EipAssets>,
 }
 
 /// Stable category for an import/decode failure, so the interface can show a
@@ -212,12 +213,12 @@ fn materialize_eip(root: &Path, package: &Path) -> anyhow::Result<EipAssets> {
     let raw_name = &pkg.manifest.paths["RawPath"];
     let extension = Path::new(raw_name).extension().and_then(|e| e.to_str()).unwrap_or("raw");
     let raw = dir.join(format!("{stem}.{extension}"));
-    write_stale(package, &raw, pkg.member(raw_name)?)?;
+    write_stale(package, &raw, &pkg.member(raw_name)?)?;
     let settings = match pkg.manifest.paths.get("SettingsPath") {
         Some(name) => match pkg.member(name) {
             Ok(bytes) => {
                 let path = dir.join(format!("{stem}.cos"));
-                write_stale(package, &path, bytes)?;
+                write_stale(package, &path, &bytes)?;
                 Some((path, bytes))
             }
             Err(err) => {
@@ -231,7 +232,7 @@ fn materialize_eip(root: &Path, package: &Path) -> anyhow::Result<EipAssets> {
         Some(name) => match pkg.member(name) {
             Ok(bytes) => {
                 let path = dir.join(format!("{stem}.comask"));
-                write_stale(package, &path, bytes)?;
+                write_stale(package, &path, &bytes)?;
                 Some(path)
             }
             Err(err) => {
@@ -243,7 +244,7 @@ fn materialize_eip(root: &Path, package: &Path) -> anyhow::Result<EipAssets> {
     };
     let mask_uuids = settings
         .as_ref()
-        .and_then(|(_, bytes)| crate::c1_cos::CosDocument::parse(bytes).ok())
+        .and_then(|(_, bytes)| crate::c1_cos::CosDocument::parse(bytes.as_ref()).ok())
         .and_then(|document| {
             document
                 .variant()
@@ -509,10 +510,36 @@ fn settings_dirs(capture_one: &Path) -> Vec<PathBuf> {
 /// sidecar beside the settings file, looked up by that UUID.
 fn cos_adjustments(raw: &Path) -> Option<AdjustmentSet> {
     let settings = cos_settings_file(raw)?;
-    let bytes = std::fs::read(&settings).ok()?;
+    read_cos_adjustments(raw, &settings, Some(&settings.with_extension("comask")), true)
+}
+
+impl ScannedFile {
+    fn c1_adjustments(&self) -> Option<AdjustmentSet> {
+        if let Some(assets) = &self.packed {
+            return read_cos_adjustments(
+                &assets.raw,
+                assets.settings.as_deref()?,
+                assets.comask.as_deref(),
+                false,
+            );
+        }
+        if is_eip(&self.path) {
+            return None;
+        }
+        cos_adjustments(&self.path)
+    }
+}
+
+fn read_cos_adjustments(
+    raw: &Path,
+    settings: &Path,
+    mask_path: Option<&Path>,
+    session_lcc: bool,
+) -> Option<AdjustmentSet> {
+    let bytes = std::fs::read(settings).ok()?;
     let document = crate::c1_cos::CosDocument::parse(&bytes).ok()?;
     let variant = document.variant()?;
-    let comask_bytes = std::fs::read(settings.with_extension("comask")).ok();
+    let comask_bytes = mask_path.and_then(|path| std::fs::read(path).ok());
     let comask =
         comask_bytes.as_deref().and_then(|bytes| crate::comask::ComaskDocument::parse(bytes).ok());
     let mut adjustments = variant.adjustments.clone();
@@ -530,7 +557,7 @@ fn cos_adjustments(raw: &Path) -> Option<AdjustmentSet> {
     let (w, h) = (w.max(1) as f32, h.max(1) as f32);
 
     // `Lccid` on the global layer names `<Settings>/<raw name>.<id>.lcc`.
-    if let Some(lcc_id) = variant.lcc_id.as_deref() {
+    if let Some(lcc_id) = variant.lcc_id.as_deref().filter(|_| session_lcc) {
         let raw_name = raw.file_name().and_then(|name| name.to_str()).unwrap_or_default();
         let settings_dir = settings.parent().unwrap_or_else(|| Path::new(""));
         let path = crate::dust_lcc::sidecar_path(settings_dir, raw_name, lcc_id);
@@ -1026,23 +1053,23 @@ impl FileEngine {
         let mut from_cos = Vec::new();
         st.entries.clear();
         for scanned in scanned {
-            let rel_path = scanned.rel_path;
-            let stored = previous.get(&rel_path);
+            let rel_path = &scanned.rel_path;
+            let stored = previous.get(rel_path);
             let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
             // Restore edits saved in a previous process; keep unsaved in-memory
             // edits made before this rescan.
             if adjustments.is_default() {
                 if let Some(store) = &self.store {
-                    if let Ok(saved) = store.load_adjustments(&rel_path) {
+                    if let Ok(saved) = store.load_adjustments(rel_path) {
                         adjustments = saved;
                     }
                 }
             }
             // C1 keeps per-image settings in a `.cos` sidecar; apply it when
             // neither our store nor this process has edits for the path.
-            if adjustments.is_default() && st.catalog.entry(&rel_path).is_none() {
-                if let Some(cos) = cos_adjustments(&scanned.path) {
-                    from_cos.push((rel_path.clone(), cos.clone()));
+            if adjustments.is_default() && st.catalog.entry(rel_path).is_none() {
+                if let Some(cos) = scanned.c1_adjustments() {
+                    from_cos.push((scanned.rel_path.clone(), cos.clone()));
                     adjustments = cos;
                 }
             }
@@ -1053,7 +1080,7 @@ impl FileEngine {
             let mut trashed = false;
 
             // The catalog wins over the in-memory copy: it survives restarts.
-            if let Some(entry) = st.catalog.entry(&rel_path) {
+            if let Some(entry) = st.catalog.entry(rel_path) {
                 rating = entry.rating;
                 color_tag = ColorTag::ALL[(entry.color_tag.clamp(0, 7)) as usize];
                 keywords = entry.keywords.clone();
@@ -1086,7 +1113,7 @@ impl FileEngine {
                     trashed,
                 },
                 path: scanned.path,
-                rel_path,
+                rel_path: scanned.rel_path,
                 adjustments,
             });
         }
@@ -1106,7 +1133,7 @@ impl FileEngine {
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
         let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
         let scanned = scan_file(&self.root, rel, path.to_path_buf());
-        let adjustments = cos_adjustments(&scanned.path).unwrap_or_default();
+        let adjustments = scanned.c1_adjustments().unwrap_or_default();
         let mut st = self.state.lock();
         let id = ImageId(st.next_id);
         st.next_id += 1;
@@ -1730,6 +1757,7 @@ fn scan_file(root: &Path, rel: String, path: PathBuf) -> ScannedFile {
         height,
         exif,
         iptc,
+        packed,
     }
 }
 
@@ -1976,6 +2004,27 @@ impl ImageEngine for FileEngine {
         let mut st = self.state.lock();
         let mut added = Vec::with_capacity(scanned.len());
         for scanned in scanned {
+            let adjustments = if scanned.packed.is_some() {
+                let saved = self.store.as_ref().map(|store| store.load_adjustments(&scanned.rel_path));
+                match saved {
+                    Some(Ok(saved))
+                        if !saved.is_default() || st.catalog.entry(&scanned.rel_path).is_some() => saved,
+                    Some(Ok(_)) => {
+                        let adjustments = scanned.c1_adjustments().unwrap_or_default();
+                        if !adjustments.is_default() {
+                            if let Some(store) = &self.store {
+                                if let Err(err) = store.save_adjustments(&scanned.rel_path, &adjustments) {
+                                    log::warn!("save EIP adjustments {}: {err}", scanned.rel_path);
+                                }
+                            }
+                        }
+                        adjustments
+                    }
+                    _ => scanned.c1_adjustments().unwrap_or_default(),
+                }
+            } else {
+                AdjustmentSet::default()
+            };
             let id = ImageId(st.next_id);
             st.next_id += 1;
             let keywords = scanned.iptc.keywords.clone();
@@ -1994,7 +2043,7 @@ impl ImageEngine for FileEngine {
                 rating: 0,
                 color_tag: ColorTag::None,
                 variant: 1,
-                has_adjustments: false,
+                has_adjustments: !adjustments.is_default(),
                 trashed: false,
             };
             added.push(info.clone());
@@ -2002,7 +2051,7 @@ impl ImageEngine for FileEngine {
                 info,
                 path: scanned.path,
                 rel_path: scanned.rel_path,
-                adjustments: AdjustmentSet::default(),
+                adjustments,
             });
         }
         Ok(added)
@@ -3893,5 +3942,127 @@ mod tests {
         let comask = assets.comask.expect("FULL.EIP declares CoMaskPath");
         assert_eq!(std::fs::read(comask).unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fixture_eip(members: &[(&str, &[u8])], deflated: bool) -> Vec<u8> {
+        use std::io::Write;
+        let mut archive = Vec::new();
+        let mut directory = Vec::new();
+        for (name, bytes) in members {
+            let compressed;
+            let payload = if deflated {
+                let mut encoder = flate2::write::DeflateEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::fast(),
+                );
+                encoder.write_all(bytes).unwrap();
+                compressed = encoder.finish().unwrap();
+                compressed.as_slice()
+            } else {
+                bytes
+            };
+            let offset = (archive.len() as u32).to_le_bytes();
+            let size = (bytes.len() as u32).to_le_bytes();
+            let name_len = (name.len() as u16).to_le_bytes();
+            let crc = crc32fast::hash(bytes).to_le_bytes();
+            let mut local = [0u8; 30];
+            local[..4].copy_from_slice(b"PK\x03\x04");
+            local[4] = 20;
+            local[8] = if deflated { 8 } else { 0 };
+            local[14..18].copy_from_slice(&crc);
+            local[18..22].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            local[22..26].copy_from_slice(&size);
+            local[26..28].copy_from_slice(&name_len);
+            archive.extend_from_slice(&local);
+            archive.extend_from_slice(name.as_bytes());
+            archive.extend_from_slice(payload);
+            let mut central = [0u8; 46];
+            central[..4].copy_from_slice(b"PK\x01\x02");
+            central[4] = 20;
+            central[6..8].copy_from_slice(&local[4..6]);
+            central[10..12].copy_from_slice(&local[8..10]);
+            central[16..30].copy_from_slice(&local[14..28]);
+            central[42..46].copy_from_slice(&offset);
+            directory.extend_from_slice(&central);
+            directory.extend_from_slice(name.as_bytes());
+        }
+        let mut footer = [0u8; 22];
+        let count = (members.len() as u16).to_le_bytes();
+        footer[..4].copy_from_slice(b"PK\x05\x06");
+        footer[8..10].copy_from_slice(&count);
+        footer[10..12].copy_from_slice(&count);
+        footer[12..16].copy_from_slice(&(directory.len() as u32).to_le_bytes());
+        footer[16..20].copy_from_slice(&(archive.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&directory);
+        archive.extend_from_slice(&footer);
+        archive
+    }
+
+    #[test]
+    fn eip_restores_packed_edits_on_import_and_reopen() {
+        assert_packed_edits_on_import_and_reopen(false);
+    }
+
+    #[test]
+    fn eip_restores_deflated_edits_on_import_and_reopen() {
+        assert_packed_edits_on_import_and_reopen(true);
+    }
+
+    fn assert_packed_edits_on_import_and_reopen(deflated: bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "aurora-eip-edits-{}-{deflated}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let path = dir.join("edited.eip");
+        let manifest = br#"<Manifest><File><RawPath>photo.png</RawPath><SettingsPath>settings/inner.cos</SettingsPath><CoMaskPath>masks/another-name.comask</CoMaskPath></File></Manifest>"#;
+        let settings = br#"<IMG><VAR><DL><E K="Exposure" V="1.25"/></DL><AL><E K="MaskUUID" V="24391591-4129-4c9f-a9f5-bb4dd4c41289"/><E K="Exposure" V="-0.75"/></AL></VAR></IMG>"#;
+        let mask = crate::comask::gradient_container(0.5);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 1).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let bytes = fixture_eip(&[
+            ("manifest.xml", manifest),
+            ("photo.png", png.get_ref()),
+            ("settings/inner.cos", settings),
+            ("masks/another-name.comask", &mask),
+        ], deflated);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let assert_edits = |engine: &FileEngine, info: &ImageInfo| {
+            assert!(info.has_adjustments);
+            assert_eq!((info.width, info.height), (8, 1));
+            let adjustments = engine.load_adjustments(info.id);
+            assert_eq!(adjustments.exposure.exposure, 1.25);
+            assert_eq!(adjustments.layers.len(), 1);
+            let layer = &adjustments.layers[0];
+            assert_eq!(layer.adjustments.exposure.exposure, -0.75);
+            let [MaskShape::Linear(gradient)] = layer.mask.shapes.as_slice() else {
+                panic!("packed layer did not resolve its mask UUID");
+            };
+            assert_eq!(gradient.start, [7.0 / 8.0, 0.0]);
+            assert_eq!(gradient.end, [0.0, 0.0]);
+        };
+        let imported = engine.import(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_edits(&engine, &imported[0]);
+        let mut rated = imported[0].clone();
+        rated.rating = 3;
+        engine.update_info(&rated).unwrap();
+        drop(engine);
+
+        let reopened = FileEngine::open(&dir).unwrap();
+        let info = reopened.images().remove(0);
+        assert_edits(&reopened, &info);
+        assert_eq!(info.rating, 3);
+        let mut ours = reopened.load_adjustments(info.id);
+        ours.exposure.exposure = 2.5;
+        reopened.save_adjustments(info.id, &ours).unwrap();
+        drop(reopened);
+        let reopened = FileEngine::open(&dir).unwrap();
+        assert_eq!(reopened.load_adjustments(reopened.images()[0].id).exposure.exposure, 2.5);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

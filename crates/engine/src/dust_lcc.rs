@@ -57,6 +57,10 @@ pub enum DustLccError {
     MissingVersion,
     /// A chunk header, payload or `SpotList` record run is cut short.
     Truncated,
+    /// Invalid or incomplete LightFalloff model.
+    InvalidLightFalloff,
+    /// A LightFalloff encoding whose payload layout has not been verified.
+    UnsupportedLightFalloff,
 }
 
 impl fmt::Display for DustLccError {
@@ -66,6 +70,8 @@ impl fmt::Display for DustLccError {
             Self::BadHeader => write!(f, "XCon header magic/version is not supported"),
             Self::NotLcc => write!(f, "TYPE is not \"CaptureOne LCC\""),
             Self::MissingVersion => write!(f, "VER chunk is missing"),
+            Self::UnsupportedLightFalloff => write!(f, "unsupported LightFalloff encoding"),
+            Self::InvalidLightFalloff => write!(f, "invalid LightFalloff model"),
             Self::Truncated => write!(f, "truncated .lcc chunk or record run"),
         }
     }
@@ -80,10 +86,93 @@ pub struct DustLcc {
     pub gain: Vec<u8>,
 }
 
+/// One six-byte LightFalloff node, before normalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LightFalloffNode {
+    pub luminance: u16,
+    pub dx: i16,
+    pub dy: i16,
+}
+
+/// The original 12- or 16-byte header and its row-major two-dimensional grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LightFalloff {
+    pub header: Vec<u8>,
+    pub columns: u16,
+    pub rows: u16,
+    pub nodes: Vec<LightFalloffNode>,
+}
+
+/// Reads the inline little-endian LightFalloff grid used by the Windows renderer.
+pub fn parse_light_falloff(bytes: &[u8]) -> Result<Option<LightFalloff>, DustLccError> {
+    let (mut header, mut model) = (None, None);
+    parse_chunks(bytes, |group, name, flags, payload, le| {
+        if group != Some(b"LightFalloff") {
+            return Ok(());
+        }
+        let target = match name {
+            b"REF" => return Err(DustLccError::UnsupportedLightFalloff),
+            b"Hdr" => &mut header,
+            b"Model" => &mut model,
+            _ => return Ok(()),
+        };
+        if !le || flags & 0xC0 != 0 {
+            return Err(DustLccError::UnsupportedLightFalloff);
+        }
+        if target.replace(payload).is_some() {
+            return Err(DustLccError::InvalidLightFalloff);
+        }
+        Ok(())
+    })?;
+    let (header, model) = match (header, model) {
+        (None, None) => return Ok(None),
+        (Some(header), Some(model)) => (header, model),
+        _ => return Err(DustLccError::InvalidLightFalloff),
+    };
+    let grid = match header.len() {
+        12 => header,
+        16 => &header[2..14],
+        _ => return Err(DustLccError::InvalidLightFalloff),
+    };
+    let (columns, rows) = (u16_at(grid, 0, true), u16_at(grid, 2, true));
+    let (step_x, step_y) = (u16_at(grid, 8, true), u16_at(grid, 10, true));
+    const NODE_BYTES: usize = 6;
+    if columns < 2 || rows < 2 || step_x == 0 || step_y == 0
+        || model.len() % NODE_BYTES != 0
+        || model.len() / NODE_BYTES != usize::from(columns) * usize::from(rows)
+    {
+        return Err(DustLccError::InvalidLightFalloff);
+    }
+    let nodes = model.chunks_exact(NODE_BYTES).map(|node| LightFalloffNode {
+        luminance: u16_at(node, 0, true),
+        dx: i16_at(node, 2, true),
+        dy: i16_at(node, 4, true),
+    }).collect();
+    Ok(Some(LightFalloff { header: header.to_vec(), columns, rows, nodes }))
+}
+
 /// Reads the `SpotRem` group of an `.lcc` byte image.
 ///
 /// A valid profile without that group yields empty fields.
 pub fn parse(bytes: &[u8]) -> Result<DustLcc, DustLccError> {
+    let mut dust = DustLcc::default();
+    parse_chunks(bytes, |group, name, _, payload, le| {
+        if matches!(group, Some(b"SpotRem" | b"SpotRemoval")) {
+            if name == b"SpotList" {
+                dust.patches = decode_records(payload, le)?;
+            } else if name == b"SpotData" {
+                dust.gain = payload.to_vec();
+            }
+        }
+        Ok(())
+    })?;
+    Ok(dust)
+}
+
+fn parse_chunks<'a>(
+    bytes: &'a [u8],
+    mut visit: impl FnMut(Option<&[u8]>, &[u8], u8, &'a [u8], bool) -> Result<(), DustLccError>,
+) -> Result<(), DustLccError> {
     if !bytes.starts_with(b"\x04XCon") {
         return Err(DustLccError::NotContainer);
     }
@@ -93,7 +182,6 @@ pub fn parse(bytes: &[u8]) -> Result<DustLcc, DustLccError> {
     let mut endian: Option<bool> = None;
     let mut kind_ok = false;
     let mut version_ok = false;
-    let mut dust = DustLcc::default();
 
     while pos < bytes.len() {
         match bytes[pos] {
@@ -150,16 +238,8 @@ pub fn parse(bytes: &[u8]) -> Result<DustLcc, DustLccError> {
                 return Err(DustLccError::MissingVersion);
             }
             version_ok = true;
-        } else if groups.last().is_some_and(|g| *g == b"SpotRem" || *g == b"SpotRemoval")
-            && name == b"SpotList"
-        {
-            let le = endian.ok_or(DustLccError::NotContainer)?;
-            dust.patches = decode_records(payload, le)?;
-        } else if groups.last().is_some_and(|g| *g == b"SpotRem" || *g == b"SpotRemoval")
-            && name == b"SpotData"
-        {
-            dust.gain = payload.to_vec();
         }
+        visit(groups.last().copied(), name, flags, payload, endian.unwrap_or(true))?;
 
         if flags & 1 != 0 || GROUPS.contains(&name) {
             groups.push(name);
@@ -172,7 +252,7 @@ pub fn parse(bytes: &[u8]) -> Result<DustLcc, DustLccError> {
     if !version_ok {
         return Err(DustLccError::MissingVersion);
     }
-    Ok(dust)
+    Ok(())
 }
 
 /// Where Capture One's Session writer puts an LCC: `<raw name>.<lcc id>.lcc`
@@ -200,7 +280,12 @@ pub struct SidecarRow<'a> {
 /// folder, `Adjustments/LCC`, the `ZSIDECAR.ZNAME` file name and the `.lcc`
 /// extension; the same directory is created by `CatalogFolderPaths`.
 pub fn resolve_lcc_path(catalog_folder: &Path, row: SidecarRow<'_>) -> Option<PathBuf> {
-    if row.kind != SIDECAR_TYPE_LCC || row.name.is_empty() {
+    if row.kind != SIDECAR_TYPE_LCC
+        || row.name.is_empty()
+        || row.name == "."
+        || row.name == ".."
+        || row.name.contains(['/', '\\', ':', '\0'])
+    {
         return None;
     }
     let file = if row.name.ends_with(".lcc") { row.name.to_owned() } else { format!("{}.lcc", row.name) };
@@ -398,6 +483,48 @@ mod tests {
             out.extend_from_slice(child);
         }
         out
+    }
+
+    fn light_falloff_profile(le: bool, header: &[u8], model: &[u8]) -> Vec<u8> {
+        profile(le, &[grouped(b"LightFalloff", &[
+            chunk(b"Hdr", false, header),
+            chunk(b"Model", false, model),
+        ])])
+    }
+
+    #[test]
+    fn reads_legacy_and_current_light_falloff_headers() {
+        let legacy: Vec<_> = [3u16, 2, 12, 18, 24, 32].into_iter().flat_map(u16::to_le_bytes).collect();
+        let current = [&[16, 0], legacy.as_slice(), &[1, 0]].concat();
+        let mut model = [0; 36];
+        model[30..].copy_from_slice(&[0xFE, 0xFF, 0xFD, 0xFF, 0x00, 0x80]);
+        for header in [&legacy, &current] {
+            let bytes = light_falloff_profile(true, header, &model);
+            let parsed = parse_light_falloff(&bytes).unwrap().unwrap();
+            assert_eq!(&parsed.header, header);
+            assert_eq!((parsed.columns, parsed.rows, parsed.nodes.len()), (3, 2, 6));
+            assert_eq!(parsed.nodes[0], LightFalloffNode { luminance: 0, dx: 0, dy: 0 });
+            assert_eq!(parsed.nodes[5], LightFalloffNode { luminance: 65_534, dx: -3, dy: i16::MIN });
+        }
+        assert_eq!(parse_light_falloff(&dust_profile(true)), Ok(None));
+    }
+
+    #[test]
+    fn rejects_bad_grid_and_unsupported_references_without_breaking_dust() {
+        let header = [2, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0];
+        for (bad_header, len) in [(header, 23), (header, 30), ([0; 12], 24)] {
+            let bytes = light_falloff_profile(true, &bad_header, &[0; 30][..len]);
+            assert_eq!(parse_light_falloff(&bytes), Err(DustLccError::InvalidLightFalloff));
+            assert_eq!(parse(&bytes), Ok(DustLcc::default()));
+        }
+        let bytes = profile(true, &[grouped(b"LightFalloff", &[
+            chunk(b"Hdr", false, &header),
+            chunk(b"REF", false, &[1]),
+        ])]);
+        assert_eq!(parse_light_falloff(&bytes), Err(DustLccError::UnsupportedLightFalloff));
+        assert_eq!(parse(&bytes), Ok(DustLcc::default()));
+        let bytes = light_falloff_profile(false, &header, &[0; 24]);
+        assert_eq!(parse_light_falloff(&bytes), Err(DustLccError::UnsupportedLightFalloff));
     }
 
     fn dust_profile(le: bool) -> Vec<u8> {

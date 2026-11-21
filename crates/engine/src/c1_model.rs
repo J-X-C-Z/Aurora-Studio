@@ -574,7 +574,7 @@ pub struct C1VariantSettings {
     /// Gradation curves: rgb, red, green, blue, yellow.
     pub gradation_curves: [Vec<(f32, f32)>; 5],
 
-    /// Crop rectangle in pixels: `x1;y1;x2;y2`.
+    /// Stored crop in pixels: raw center X/Y, canvas width/height.
     pub crop_px: [f32; 4],
     pub crop_outside_image: bool,
     pub crop_aspect_ratio: Option<String>,
@@ -1554,26 +1554,6 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         mount: None,
     };
 
-    // A variant without ZCROP stores all four values as 0; that is "no crop",
-    // not a zero-sized rectangle, even though the canvas size is present.
-    let has_crop = s.crop_px[2] > s.crop_px[0] && s.crop_px[3] > s.crop_px[1];
-    let crop = if has_crop && s.canvas_size[0] > 0.0 && s.canvas_size[1] > 0.0 {
-        let (w, h) = (s.canvas_size[0], s.canvas_size[1]);
-        // `ZCROPOUTSIDEIMAGE` keeps the stored rectangle even when it reaches
-        // past the image; without it the four values stay inside `0 ..= 1`.
-        let keep = |v: f32, max: f32| if s.crop_outside_image { v } else { clamp(v, 0.0, max) };
-        NormRect {
-            x: keep(s.crop_px[0] / w, 1.0),
-            y: keep(s.crop_px[1] / h, 1.0),
-            width: keep((s.crop_px[2] - s.crop_px[0]) / w, 1.0),
-            height: keep((s.crop_px[3] - s.crop_px[1]) / h, 1.0),
-        }
-    } else {
-        // Without the canvas size the pixel crop cannot be normalized; C1 keeps it
-        // on ZVARIANT.ZCANVASSIZE, so the engine keeps a full frame here.
-        NormRect::FULL
-    };
-
     let flip_horizontal = s.flip == 1;
     let flip_vertical = s.flip == 2;
     let mut keystone = Keystone {
@@ -1601,7 +1581,6 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         flip_horizontal,
         flip_vertical,
         crop_outside_image: s.crop_outside_image,
-        crop,
         canvas: s.canvas_size,
         aspect: match s.crop_aspect_ratio.as_deref() {
             Some("Original") => AspectRatio::Original,
@@ -1616,7 +1595,9 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         },
         portrait: false,
         keystone,
+        crop: NormRect::FULL,
     };
+    set.geometry.crop = crop_on_canvas(s.crop_px, &set.geometry, None);
 
     // C1 stores file names (`NikonZ6-ProStandard.icm`, `NikonZ6-Auto.fcrv`),
     // but the renderer looks profiles and curves up by stem, so the extension
@@ -1633,6 +1614,67 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     }
 
     set
+}
+
+
+pub(crate) fn crop_on_canvas(
+    crop: [f32; 4],
+    geometry: &Geometry,
+    source: Option<(u32, u32)>,
+) -> NormRect {
+    let [raw_x, raw_y, mut width, mut height] = crop;
+    let [canvas_width, canvas_height] = geometry.canvas;
+    if !crop.iter().chain(&geometry.canvas).all(|v| v.is_finite())
+        || width <= 0.0 || height <= 0.0 || canvas_width <= 0.0 || canvas_height <= 0.0
+    {
+        return NormRect::FULL;
+    }
+
+    let turn = geometry.orientation % 4;
+    // shortcut: use Aurora's affine frame map, replace when native lens/keystone
+    // Raw2Canvas behavior is verified. Canvas dimensions approximate missing raw dimensions.
+    let (source_width, source_height) = source
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .map(|(w, h)| (w as f32, h as f32))
+        .unwrap_or(if turn % 2 == 0 {
+            (canvas_width, canvas_height)
+        } else {
+            (canvas_height, canvas_width)
+        });
+    let (raw_x, raw_y) = (raw_x - source_width / 2.0, raw_y - source_height / 2.0);
+    let (mut x, mut y) = match turn {
+        1 => (-raw_y, raw_x),
+        2 => (-raw_x, -raw_y),
+        3 => (raw_y, -raw_x),
+        _ => (raw_x, raw_y),
+    };
+    if geometry.flip_horizontal {
+        x = -x;
+    }
+    if geometry.flip_vertical {
+        y = -y;
+    }
+    let (sin, cos) = geometry.rotation.to_radians().sin_cos();
+    let (mut x, mut y) = (
+        x * cos - y * sin + canvas_width / 2.0,
+        x * sin + y * cos + canvas_height / 2.0,
+    );
+
+    if !geometry.crop_outside_image {
+        // Fit the rectangle to the rectangular canvas while keeping its aspect.
+        let scale = (canvas_width / width).min(canvas_height / height).min(1.0);
+        width = (width * scale).min(canvas_width);
+        height = (height * scale).min(canvas_height);
+        x = x.clamp(width / 2.0, canvas_width - width / 2.0);
+        y = y.clamp(height / 2.0, canvas_height - height / 2.0);
+    }
+
+    NormRect {
+        x: (x - width / 2.0) / canvas_width,
+        y: (y - height / 2.0) / canvas_height,
+        width: width / canvas_width,
+        height: height / canvas_height,
+    }
 }
 
 /// Capture One stores the display rotation in `ZROTATION`: quarter turns
@@ -2474,27 +2516,41 @@ mod tests {
 
     #[test]
     fn crop_outside_image_reaches_the_geometry_contract() {
-        let s = from_layer_row(&row(&[
-            ("ZCROPOUTSIDEIMAGE", Some("1")),
-            ("ZCROP", Some("10;10;160;160")),
-            ("ZCANVASSIZE", Some("100;100")),
-        ]));
-        assert!(s.crop_outside_image);
-        let g = to_adjustment_set(&s).geometry;
-        assert!(g.crop_outside_image);
-        // The rectangle reaches past the canvas and keeps its stored bounds.
-        assert_eq!((g.crop.x, g.crop.width), (0.1, 1.5));
-        assert_eq!((g.crop.y, g.crop.height), (0.1, 1.5));
+        for (outside, expected) in [("1", (-0.1, 1.1)), ("0", (0.0, 1.0))] {
+            let s = from_layer_row(&row(&[
+                ("ZCROPOUTSIDEIMAGE", Some(outside)),
+                ("ZCROP", Some("30;70;80;80")),
+                ("ZCANVASSIZE", Some("100;100")),
+            ]));
+            let g = to_adjustment_set(&s).geometry;
+            assert_eq!(g.crop_outside_image, outside == "1");
+            assert_eq!((g.crop.x, g.crop.y + g.crop.height), expected);
+            assert_eq!((g.crop.width, g.crop.height), (0.8, 0.8));
+        }
+    }
 
-        let clamped = from_layer_row(&row(&[
-            ("ZCROPOUTSIDEIMAGE", Some("0")),
-            ("ZCROP", Some("10;10;160;160")),
-            ("ZCANVASSIZE", Some("100;100")),
+    #[test]
+    fn real_dsc5673_crop_transforms_the_center_before_normalizing() {
+        let settings = from_layer_row(&row(&[
+            ("ZROTATION", Some("270")),
+            ("ZCROP", Some("2525.8076171875;2348.0876464844;3328.8486328125;4993.2734375000")),
+            ("ZCANVASSIZE", Some("4043.054;6056.673")),
         ]));
-        let g = to_adjustment_set(&clamped).geometry;
-        assert!(!g.crop_outside_image);
-        assert_eq!((g.crop.x, g.crop.width), (0.1, 1.0));
-        assert_eq!((g.crop.y, g.crop.height), (0.1, 1.0));
+        let mut g = to_adjustment_set(&settings).geometry;
+        assert_eq!(settings.crop_px, [2525.8076, 2348.0876, 3328.8486, 4993.2734]);
+        assert_eq!(g.orientation, 3);
+        let rect = crop_on_canvas(settings.crop_px, &g, Some((6048, 4032)));
+        assert!((rect.width * g.canvas[0] - 3328.8486).abs() < 0.01);
+        assert!((rect.height * g.canvas[1] - 4993.2734).abs() < 0.01);
+        let center = |r: NormRect| [r.x + r.width / 2.0, r.y + r.height / 2.0];
+        let [x, y] = center(rect);
+        assert!((x * g.canvas[0] - 2353.6147).abs() < 0.01);
+        assert!((y * g.canvas[1] - 3526.5288).abs() < 0.01);
+
+        g.flip_horizontal = true;
+        let [flipped_x, flipped_y] = center(crop_on_canvas(settings.crop_px, &g, Some((6048, 4032))));
+        assert!((flipped_x - (1.0 - x)).abs() < 1e-6);
+        assert!((flipped_y - y).abs() < 1e-6);
     }
 
     #[test]
@@ -2585,7 +2641,7 @@ mod tests {
     fn crop_is_normalized_when_the_canvas_is_known() {
         let mut s = C1VariantSettings::defaults();
         s.canvas_size = [6000.0, 4000.0];
-        s.crop_px = [1500.0, 1000.0, 4500.0, 3000.0];
+        s.crop_px = [3000.0, 2000.0, 3000.0, 2000.0];
         let set = to_adjustment_set(&s);
         assert!((set.geometry.crop.x - 0.25).abs() < 1e-5);
         assert!((set.geometry.crop.width - 0.5).abs() < 1e-5);

@@ -298,10 +298,11 @@ mod tests {
         for value in [crop.x, crop.y, crop.width, crop.height] {
             assert!((0.0..=1.0).contains(&value), "crop {value} outside the canvas");
         }
-        // ZCROP is 2525.8;2348.1;3328.8;4993.3 on a 4043x6057 canvas, so this only
-        // holds when the variant's ZCANVASSIZE was used: a full frame would be 1.0.
-        assert!((crop.width - 0.1986).abs() < 0.01, "crop width {}", crop.width);
-        assert!(crop.height < 0.5, "crop height {}", crop.height);
+        let (canvas_width, canvas_height) = variant.canvas.unwrap();
+        assert!((crop.width * canvas_width - 3328.8486).abs() < 0.01);
+        assert!((crop.height * canvas_height - 4993.2734).abs() < 0.01);
+        assert!(crop.x + crop.width <= 1.0 + 1e-6);
+        assert!(crop.y + crop.height <= 1.0 + 1e-6);
     }
 
     #[test]
@@ -459,7 +460,7 @@ mod tests {
         assert_eq!(variant.adjustments.exposure.exposure, 0.75);
         assert_eq!(variant.adjustments.exposure.contrast, 20.0);
 
-        // ZCROP is in canvas pixels and only becomes normalized with ZCANVASSIZE.
+        // The fixture has a raw-space center and a 1000px square in the canvas.
         let crop = variant.adjustments.geometry.crop;
         assert!((crop.x - 0.25).abs() < 1e-6, "x {}", crop.x);
         assert!((crop.y - 1.0 / 6.0).abs() < 1e-6, "y {}", crop.y);
