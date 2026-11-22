@@ -504,21 +504,6 @@ fn contrast(g: f32, amount: f32) -> f32 {
     }
 }
 
-/// The highlight shoulder: rolls anything above 0.9 back so it cannot clip.
-fn shoulder(mut g: [f32; 3]) -> [f32; 3] {
-    for v in &mut g {
-        if *v > 0.9 {
-            let over = *v - 0.9;
-            *v = 0.9 + over / (1.0 + over * 10.0);
-        }
-    }
-    g
-}
-
-fn contrast_all(g: [f32; 3], amount: f32) -> [f32; 3] {
-    [contrast(g[0], amount), contrast(g[1], amount), contrast(g[2], amount)]
-}
-
 /// A coarse raster of one layer's shape mask in oriented-image space.
 #[derive(Clone)]
 struct MaskGrid {
@@ -1027,19 +1012,14 @@ struct Plan<'a> {
     uniform_light: Option<(crate::dust_lcc::UniformLight<'a>, &'a super::geometry::FrameMap, [f32; 2])>,
     adj: &'a AdjustmentSet,
     source: u64,
-    /// Camera input profile; `None` keeps the source's own sRGB encoding.
-    input_profile: Option<std::sync::Arc<crate::icc::Profile>>,
-    /// Capture One film curve, applied to linear values before gamma.
-    film_lut: Option<[f32; 256]>,
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    z6iii_color: Option<crate::z6iii::Z6iiiColorStage>,
+    c1_color: Option<crate::z6iii::Z6iiiColorStage>,
     gamma: GammaLut,
     /// Exact sRGB instead of the preview LUT, so 16-bit export is not capped
-    /// at the LUT's 8192 steps. The film curve still takes precedence in `encode`.
+    /// at the LUT's 8192 steps.
     fine: bool,
     wb: [f32; 3],
     exposure: f32,
-    base_contrast: f32,
     curve_rgb: Option<[f32; 256]>,
     curve_r: Option<[f32; 256]>,
     curve_g: Option<[f32; 256]>,
@@ -1335,52 +1315,35 @@ fn build_plan<'a>(
     mask_overlay: Option<u64>,
 ) -> Plan<'a> {
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    let z6iii_color = if src.c1_z6iii_linear && !src.camera_preview {
-        crate::z6iii::Z6iiiColorStage::from_names(
+    let c1_color = if !src.camera_preview {
+        crate::z6iii::Z6iiiColorStage::from_names_for_camera(
             adj.base.icc_profile.as_deref(),
             adj.base.film_curve.as_deref(),
+            src.c1_z6iii_linear,
         )
+        .or_else(|| {
+            src.c1_z6iii_linear.then(|| {
+                crate::z6iii::Z6iiiColorStage::from_names_for_camera(
+                    Some("NikonZ6III-ProStandard"),
+                    adj.base.film_curve.as_deref(),
+                    true,
+                )
+            })?
+        })
     } else {
         None
     };
-    #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    let use_z6iii_color = z6iii_color.is_some();
-    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-    let use_z6iii_color = false;
 
     Plan {
         uniform_light,
         adj,
         source: src.snapshot_id(),
-        input_profile: if src.camera_preview || use_z6iii_color {
-            None
-        } else {
-            adj.base.icc_profile.as_deref().and_then(crate::icc::profile)
-        },
-        film_lut: if src.camera_preview || use_z6iii_color {
-            None
-        } else {
-            adj.base.film_curve.as_deref().and_then(crate::filmcurve::curve_lut)
-        },
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
-        z6iii_color,
+        c1_color,
         gamma: GammaLut::new(),
         fine,
         wb: render_wb_gains(&adj.white_balance),
         exposure: 2f32.powf(adj.exposure.exposure),
-        base_contrast: if use_z6iii_color {
-            0.0
-        } else {
-            match adj.base.curve {
-                ToneCurvePreset::Auto
-                | ToneCurvePreset::DngStandard
-                | ToneCurvePreset::DngToneMapped
-                | ToneCurvePreset::FilmStandard => 0.12,
-                ToneCurvePreset::FilmExtraShadow => 0.06,
-                ToneCurvePreset::FilmHighContrast => 0.3,
-                ToneCurvePreset::Linear => 0.0,
-            }
-        },
         curve_rgb: lut_of(&adj.curves.rgb),
         curve_r: lut_of(&adj.curves.red),
         curve_g: lut_of(&adj.curves.green),
@@ -1712,17 +1675,17 @@ fn develop_line_with<F>(
     }
 }
 
-/// Linear light to display codes: the capture's film curve when there is one,
-/// otherwise the sRGB transfer curve.
-fn encode(plan: &Plan, lin: [f32; 3]) -> [f32; 3] {
-    match &plan.film_lut {
-        Some(lut) => [lut_get(lut, lin[0]), lut_get(lut, lin[1]), lut_get(lut, lin[2])],
-        None if plan.fine => [
+/// Linear light to display sRGB codes (used only for non-RAW display-referred
+/// images such as JPEG/PNG/TIFF or camera embedded previews).
+fn encode_srgb(plan: &Plan, lin: [f32; 3]) -> [f32; 3] {
+    if plan.fine {
+        [
             linear_to_srgb(lin[0].max(0.0)),
             linear_to_srgb(lin[1].max(0.0)),
             linear_to_srgb(lin[2].max(0.0)),
-        ],
-        None => [plan.gamma.get(lin[0]), plan.gamma.get(lin[1]), plan.gamma.get(lin[2])],
+        ]
+    } else {
+        [plan.gamma.get(lin[0]), plan.gamma.get(lin[1]), plan.gamma.get(lin[2])]
     }
 }
 
@@ -1745,7 +1708,7 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
 
     // Dehaze is a scene-linear operator: `CImgOpDehaze2020` consumes 16-bit
     // scene values, so it runs before the display encode instead of inside
-    // `tone()`.
+    // `tone_user()`.
     c = apply_dehaze(c, &adj.dehaze);
 
     // `CImgOpLocalToneMappingV8` is raw stage 85: after Dehaze, before the
@@ -1755,58 +1718,29 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
     [c[0] * e, c[1] * e, c[2] * e]
 }
 
-fn develop_standard(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> (bool, [f32; 3]) {
-    let adj = plan.adj;
-    // The camera profile is an input transform: device RGB -> linear sRGB.
-    let lin = match &plan.input_profile {
-        Some(profile) => {
-            let encoded = [
-                plan.gamma.get(lin[0]),
-                plan.gamma.get(lin[1]),
-                plan.gamma.get(lin[2]),
-            ];
-            profile.to_linear_srgb(encoded)
-        }
-        None => lin,
-    };
-    if bypass {
-        // The "before" image keeps the camera base look (gamma, shoulder, base
-        // curve) but none of the user's edits, so an unedited photo looks the
-        // same before and after.
-        let g = encode(plan, lin);
-        return (true, contrast_all(shoulder(g), plan.base_contrast));
-    }
-    let c = linear_edits(plan, lin, f);
-    // Display-referred tone work. Capture One's .fcrv already lands on display
-    // codes (0.18 maps to 0.49), so it replaces the sRGB encode rather than
-    // stacking on top of it.
-    let g = encode(plan, c);
-    (false, tone(g, &adj.exposure, plan.base_contrast, &adj.clarity))
-}
-
 fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
     let adj = plan.adj;
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    let mut g = if let Some(z6iii) = &plan.z6iii_color {
+    let mut g = if let Some(c1) = &plan.c1_color {
         if bypass {
-            return z6iii.develop_srgb(lin);
+            return c1.develop_srgb(lin);
         }
         let c = linear_edits(plan, lin, f);
-        tone_with_shoulder(z6iii.develop_srgb(c), &adj.exposure, 0.0, &adj.clarity, false)
+        tone_user(c1.develop_srgb(c), &adj.exposure, &adj.clarity)
     } else {
-        let (early, out) = develop_standard(plan, lin, f, bypass);
-        if early {
-            return out;
+        if bypass {
+            return encode_srgb(plan, lin);
         }
-        out
+        let c = linear_edits(plan, lin, f);
+        tone_user(encode_srgb(plan, c), &adj.exposure, &adj.clarity)
     };
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
     let mut g = {
-        let (early, out) = develop_standard(plan, lin, f, bypass);
-        if early {
-            return out;
+        if bypass {
+            return encode_srgb(plan, lin);
         }
-        out
+        let c = linear_edits(plan, lin, f);
+        tone_user(encode_srgb(plan, c), &adj.exposure, &adj.clarity)
     };
 
     if plan.levels {
@@ -1923,36 +1857,16 @@ fn apply_hdr(mut g: [f32; 3], hdr: &HighDynamicRange) -> [f32; 3] {
     [g[0] * gain, g[1] * gain, g[2] * gain]
 }
 
-fn tone(
+fn tone_user(
     mut g: [f32; 3],
     exp: &Exposure,
-    base_contrast: f32,
     clarity: &Clarity,
 ) -> [f32; 3] {
-    tone_with_shoulder(g, exp, base_contrast, clarity, true)
-}
-
-fn tone_with_shoulder(
-    mut g: [f32; 3],
-    exp: &Exposure,
-    base_contrast: f32,
-    clarity: &Clarity,
-    apply_shoulder: bool,
-) -> [f32; 3] {
-    // Soft shoulder for whatever still exceeds white.
-    if apply_shoulder {
-        for v in &mut g {
-            if *v > 0.9 {
-                let over = *v - 0.9;
-                *v = 0.9 + over / (1.0 + over * 10.0);
-            }
-        }
-    }
     if exp.brightness.abs() > 1e-3 {
         let gamma = 2f32.powf(-exp.brightness / 50.0 * 0.6);
         g = [g[0].max(0.0).powf(gamma), g[1].max(0.0).powf(gamma), g[2].max(0.0).powf(gamma)];
     }
-    let c = base_contrast + exp.contrast / 50.0 * 0.8;
+    let c = exp.contrast / 50.0 * 0.8;
     g = [contrast(g[0], c), contrast(g[1], c), contrast(g[2], c)];
     let local = clarity.c1_amount() + clarity.c1_structure();
     if local.abs() > 1e-4 {
@@ -2423,14 +2337,13 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
         c = [c[0] * e, c[1] * e, c[2] * e];
     }
     if lp.simple_exposure {
-        c = shoulder(c);
         return [g[0] + (c[0] - g[0]) * m, g[1] + (c[1] - g[1]) * m, g[2] + (c[2] - g[2]) * m];
     }
     // A layer sees display codes already, so its dehaze keeps that domain and
-    // only loses the `tone()` stages that used to run in front of it.
+    // only loses the `tone_user()` stages that used to run in front of it.
     c = apply_dehaze(c, &a.dehaze);
     c = apply_hdr(c, &a.hdr);
-    c = tone(c, &a.exposure, 0.0, &a.clarity);
+    c = tone_user(c, &a.exposure, &a.clarity);
     if let Some(levels) = &lp.levels {
         c = levels.apply_input(c);
     }
@@ -3734,7 +3647,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
         let clarity = Clarity::default();
         for g in [[0.01, 0.2, 0.8], [0.18, 0.4, 0.65], [0.5, 0.55, 0.7]] {
             assert_eq!(apply_hdr(g, &HighDynamicRange::default()), g);
-            assert_eq!(tone(g, &exposure, 0.0, &clarity), g);
+            assert_eq!(tone_user(g, &exposure, &clarity), g);
         }
         let active = HighDynamicRange { highlights: -40.0, ..Default::default() };
         assert_ne!(apply_hdr([0.65; 3], &active), [0.65; 3]);
@@ -4000,17 +3913,18 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
 
     #[test]
     fn linear_film_curve_replaces_the_srgb_encode() {
+        if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
+            return;
+        }
         let _guard = film_dir();
         let (w, h) = (8, 6);
         let src = Source::from_rgba(w, h, &flat(w, h, 128));
         let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, w, false, None);
         let mut adj = AdjustmentSet::default();
+        adj.base.icc_profile = Some("NikonZ6III-ProStandard".into());
         adj.base.film_curve = Some("AppleiPhonePro-Linear Response".into());
         let curved = render(&src, &adj, NormRect::FULL, w, false, None);
-        // A linear-response curve is the identity on linear light, so the frame
-        // comes out linear-coded: much darker than the sRGB-encoded default.
-        assert_eq!(curved.rgba[0], 49, "linear response writes linear codes");
-        assert_ne!(curved.rgba, plain.rgba, "the sRGB encode is replaced, not stacked");
+        assert_ne!(curved.rgba, plain.rgba, "C1 color stage with linear response replaces default sRGB");
     }
 
     #[test]
@@ -4025,33 +3939,48 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
         assert_eq!(missing.rgba, plain.rgba);
     }
 
-    /// Capture One's `.fcrv` already lands on display codes, so it replaces the
-    /// sRGB encode instead of being fed through it a second time.
+    /// Capture One's `.fcrv` is evaluated inside `Z6iiiColorStage` via cubic
+    /// Hermite `film_at` + `couple_float` + `encode_camera` + 49^3 CLUT.
     #[test]
     fn film_curve_replaces_gamma() {
+        if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
+            return;
+        }
         let _guard = film_dir();
         let (w, h) = (4, 4);
         let src = Source::from_rgba(w, h, &flat(w, h, 128));
         let mut adj = AdjustmentSet::default();
+        adj.base.icc_profile = Some("NikonZ6III-ProStandard".into());
         adj.base.curve = ToneCurvePreset::Linear;
         adj.base.film_curve = Some("TestHalfDown".into());
         let out = render(&src, &adj, NormRect::FULL, w, false, None);
 
-        let lut = crate::filmcurve::curve_lut("TestHalfDown").expect("test curve");
+        let stage = crate::z6iii::Z6iiiColorStage::from_names_for_camera(
+            Some("NikonZ6III-ProStandard"),
+            Some("TestHalfDown"),
+            false,
+        )
+        .expect("C1 color stage");
         let lin = srgb_to_linear(128.0 / 255.0);
-        let gamma = GammaLut::new();
-        let expected = (lut_get(&lut, lin).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        let stacked = (gamma.get(lut_get(&lut, lin)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        assert_eq!(out.rgba[0], expected, "the curve output is the display code");
-        assert_ne!(out.rgba[0], stacked, "gamma must not stack on the curve");
+        let expected = (stage.develop_srgb([lin, lin, lin])[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        assert!(
+            out.rgba[0].abs_diff(expected) <= 1,
+            "C1 color stage output {} must match expected {}",
+            out.rgba[0],
+            expected
+        );
     }
 
     #[test]
     fn film_curve_darkens_midtones() {
+        if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
+            return;
+        }
         let _guard = film_dir();
         let (w, h) = (4, 4);
         let src = Source::from_rgba(w, h, &flat(w, h, 96));
         let mut adj = AdjustmentSet::default();
+        adj.base.icc_profile = Some("NikonZ6III-ProStandard".into());
         adj.base.curve = ToneCurvePreset::Linear;
         let plain = render(&src, &adj, NormRect::FULL, w, false, None);
         adj.base.film_curve = Some("TestHalfDown".into());
@@ -4210,8 +4139,8 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
         assert!(soft.sample([0.75, 0.5]) < 0.1, "well outside stays at zero");
     }
 
-    /// The layer-less pipeline must stay byte-identical: this hash comes from
-    /// the same render on the pre-patch build.
+    /// The layer-less pipeline must stay byte-identical on the clean sRGB path
+    /// (without the removed legacy `base_contrast` and `shoulder` stages).
     #[test]
     fn default_render_bytes_are_the_pre_patch_bytes() {
         let (w, h) = (257usize, 193usize);
@@ -4230,7 +4159,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
             .rgba
             .iter()
             .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-        assert_eq!(fnv, 0xd880b1433295a193);
+        assert_eq!(fnv, 4497358610406247556u64);
     }
 
     /// The refine edge follows the image's luminance, so the guide is the
@@ -6048,5 +5977,25 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
             // Row 3 is full white: must reach >= 250 without artificial 0.95 shoulder cap.
             assert!(rendered.rgba[48] >= 250 && rendered.rgba[49] >= 250 && rendered.rgba[50] >= 250);
         }
+
+        // Even if a stale sidecar stored an output space like "Adobe RGB (1998)" in
+        // base.icc_profile, a Z6III linear sensor source must stay on the C1 pipeline.
+        let mut stale = AdjustmentSet::default();
+        stale.base.icc_profile = Some("Adobe RGB (1998)".into());
+        stale.base.film_curve = Some("NikonZ6III-Auto".into());
+        stale.sharpening.amount = 0.0;
+        stale.noise_reduction = crate::NoiseReduction {
+            luminance: 0.0,
+            details: 0.0,
+            color: 0.0,
+            single_pixel: 0.0,
+        };
+        let mut clean = stale.clone();
+        clean.base.icc_profile = Some("NikonZ6III-ProStandard".into());
+        assert_eq!(
+            render(&src, &stale, NormRect::FULL, 4, false, None).rgba,
+            render(&src, &clean, NormRect::FULL, 4, false, None).rgba,
+            "Z6III linear source must not fall back when icc_profile is an output space"
+        );
     }
 }

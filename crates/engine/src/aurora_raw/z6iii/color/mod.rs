@@ -29,14 +29,21 @@ const Z6III_PRE_MATRIX: [[f32; 3]; 3] = [
     [-0.03, -0.07, 1.10],
 ];
 
+const IDENTITY_PRE_MATRIX: [[f32; 3]; 3] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+];
+
 fn linear_film_nodes() -> Vec<[f32; 3]> {
     vec![[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]
 }
 
-/// C1 Z6III post-demosaic color stage: 3x3 pre-matrix, cubic Hermite film curve,
-/// highlight/hue coupling, camera transfer, and 49^3 ProStandard -> sRGB CLUT.
+/// C1 post-demosaic color stage: 3x3 pre-matrix, cubic Hermite film curve,
+/// highlight/hue coupling, camera transfer, and 49^3 Camera -> sRGB CLUT.
 #[derive(Clone)]
 pub struct Z6iiiColorStage {
+    pre_matrix: [[f32; 3]; 3],
     clut: std::sync::Arc<output::OutputClut>,
     film: std::sync::Arc<Vec<[f32; 3]>>,
 }
@@ -52,23 +59,37 @@ impl Z6iiiColorStage {
             Some(bytes) => film_nodes(bytes)?,
             None => linear_film_nodes(),
         });
-        Some(Self { clut, film })
+        Some(Self { pre_matrix: Z6III_PRE_MATRIX, clut, film })
     }
 
     pub fn from_names(icc_profile: Option<&str>, film_curve: Option<&str>) -> Option<Self> {
+        Self::from_names_for_camera(icc_profile, film_curve, true)
+    }
+
+    pub fn from_names_for_camera(
+        icc_profile: Option<&str>,
+        film_curve: Option<&str>,
+        use_z6iii_pre_matrix: bool,
+    ) -> Option<Self> {
         let profile = crate::icc::profile(icc_profile?)?;
         let camera_path = profile.path.clone()?;
         let srgb_path = crate::icc::profile("sRGB Color Space Profile")
             .or_else(|| crate::icc::profile(crate::icc::DEFAULT_PROFILE))
             .and_then(|profile| profile.path.clone());
         let clut = cached_srgb_clut(camera_path, srgb_path)?;
-        let film = cached_film_nodes(film_curve)?;
-        Some(Self { clut, film })
+        let film = cached_film_nodes(film_curve)
+            .unwrap_or_else(|| std::sync::Arc::new(linear_film_nodes()));
+        let pre_matrix = if use_z6iii_pre_matrix {
+            Z6III_PRE_MATRIX
+        } else {
+            IDENTITY_PRE_MATRIX
+        };
+        Some(Self { pre_matrix, clut, film })
     }
 
     pub fn develop_srgb(&self, rgb: [f32; 3]) -> [f32; 3] {
         let norm = rgb.map(|value| value.max(0.0));
-        let before = Z6III_PRE_MATRIX.map(|[red, green, blue]| {
+        let before = self.pre_matrix.map(|[red, green, blue]| {
             (red * norm[0] + green * norm[1] + blue * norm[2]).max(0.0)
         });
         let curved = before.map(|value| coupled::film_at(&self.film, value));
