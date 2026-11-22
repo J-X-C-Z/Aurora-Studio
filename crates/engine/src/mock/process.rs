@@ -1180,7 +1180,20 @@ pub fn render(
     mask_overlay: Option<u64>,
 ) -> Rendered {
     let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
-    render_sized(src, adj, region, out_w, out_h, scale, level, bypass, mask_overlay, false).0
+    render_sized(
+        src,
+        adj,
+        region,
+        out_w,
+        out_h,
+        scale,
+        level,
+        bypass,
+        mask_overlay,
+        false,
+        true,
+    )
+    .0
 }
 
 /// Export render that keeps the 16-bit quantisation of the developed floats.
@@ -1196,7 +1209,19 @@ pub fn render16(
 ) -> Rendered16 {
     let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
     let (narrow, wide) =
-        render_sized(src, adj, region, out_w, out_h, scale, level, bypass, None, true);
+        render_sized(
+            src,
+            adj,
+            region,
+            out_w,
+            out_h,
+            scale,
+            level,
+            bypass,
+            None,
+            true,
+            false,
+        );
     Rendered16 {
         rgba: wide.expect("a wide render always returns its 16-bit buffer"),
         width: narrow.width,
@@ -1367,6 +1392,7 @@ fn render_sized(
     bypass: bool,
     mask_overlay: Option<u64>,
     wide: bool,
+    with_histogram: bool,
 ) -> (Rendered, Option<Vec<u16>>) {
     let region = clean_region(region);
     let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
@@ -1556,7 +1582,7 @@ fn render_sized(
     if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
         merge_wide_delta(wide, before, &rgba, out_w as usize);
     }
-    let histogram = histogram(&rgba);
+    let histogram = if with_histogram { histogram(&rgba) } else { Histogram::default() };
     (
         Rendered {
             rgba,
@@ -2891,8 +2917,16 @@ pub(crate) fn histogram(rgba: &[u8]) -> Histogram {
     // 1400 px preview otherwise allocates thousands of small vectors.
     type Bins = ([u32; 256], [u32; 256], [u32; 256], [u32; 256], u64, u64);
     let empty = || -> Bins { ([0; 256], [0; 256], [0; 256], [0; 256], 0, 0) };
+    let chunk_bytes = if rgba.is_empty() {
+        4
+    } else {
+        rgba.len()
+            .div_ceil(rayon::current_num_threads().max(1) * 4)
+            .max(4 * 1024)
+            .next_multiple_of(4)
+    };
     let (r, g, b, l, lo, hi) = rgba
-        .par_chunks(4 * 1024)
+        .par_chunks(chunk_bytes)
         .fold(
             empty,
             |mut acc, chunk| {
@@ -5216,6 +5250,89 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
         let d16: BTreeSet<u16> = sixteen.rgba.chunks_exact(4).map(|p| p[1]).collect();
         assert!(d16.len() > d8.len(), "16-bit {} vs 8-bit {}", d16.len(), d8.len());
         assert!(sixteen.rgba.chunks_exact(4).all(|p| p[3] == 65535), "alpha stays opaque");
+    }
+
+    #[test]
+    fn export_render_skips_preview_histogram_without_changing_pixels() {
+        let (w, h) = (67u32, 43u32);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(37) % 251) as u8).collect();
+        let src = Source::from_rgba(w, h, &rgba);
+        let adj = AdjustmentSet::default();
+        let (preview, preview_wide) = render_sized(
+            &src,
+            &adj,
+            NormRect::FULL,
+            w,
+            h,
+            1.0,
+            0,
+            false,
+            None,
+            true,
+            true,
+        );
+        let (export, export_wide) = render_sized(
+            &src,
+            &adj,
+            NormRect::FULL,
+            w,
+            h,
+            1.0,
+            0,
+            false,
+            None,
+            true,
+            false,
+        );
+        assert_ne!(preview.histogram, Histogram::default());
+        assert_eq!(export.histogram, Histogram::default());
+        assert_eq!(export.rgba, preview.rgba);
+        assert_eq!(export_wide, preview_wide);
+    }
+
+    #[test]
+    fn parallel_histogram_matches_serial_exact_counts() {
+        let pixels = 4099usize;
+        let rgba: Vec<u8> = (0..pixels * 4).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
+        let (mut red, mut green, mut blue, mut luma) = ([0u32; 256], [0u32; 256], [0u32; 256], [0u32; 256]);
+        let (mut shadows, mut highlights) = (0u64, 0u64);
+        for pixel in rgba.chunks_exact(4) {
+            red[pixel[0] as usize] += 1;
+            green[pixel[1] as usize] += 1;
+            blue[pixel[2] as usize] += 1;
+            let y = (0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32) as usize;
+            luma[y.min(255)] += 1;
+            shadows += u64::from(pixel[0] <= 1 && pixel[1] <= 1 && pixel[2] <= 1);
+            highlights += u64::from(pixel[0] >= 254 || pixel[1] >= 254 || pixel[2] >= 254);
+        }
+        let expected = Histogram {
+            red: red.to_vec(),
+            green: green.to_vec(),
+            blue: blue.to_vec(),
+            luma: luma.to_vec(),
+            clipped_shadows: shadows as f32 / pixels as f32,
+            clipped_highlights: highlights as f32 / pixels as f32,
+        };
+        assert_eq!(histogram(&rgba), expected);
+    }
+
+    #[test]
+    #[ignore = "profiles 24MP preview histogram"]
+    fn bench_histogram_24mp() {
+        let (w, h) = (6000usize, 4000usize);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(37) % 251) as u8).collect();
+        let mut times = Vec::with_capacity(9);
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(histogram(&rgba));
+            times.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        println!(
+            "24MP histogram P50={:.3} ms P95={:.3} ms",
+            times[4],
+            times[8]
+        );
     }
 
     // ───────────────────────────── zoom regions ─────────────────────────────
