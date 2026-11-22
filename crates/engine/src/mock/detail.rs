@@ -80,6 +80,9 @@ struct DetailStagePlan {
     /// Run the CPU single-pixel stage before the GPU call; the CUDA
     /// `luminance_nr_kernel` law is not byte-identical.
     cpu_single_pixel_first: bool,
+    /// Run Capture One's `ColorNoise2012` (`LABRangeFilter2012`) on CPU; the
+    /// CUDA PTX still carries the legacy 5x5 box blur approximation.
+    cpu_color_nr: bool,
     gpu_sharpen: bool,
     gpu_lens: bool,
     /// Keep the non-parity moire approximation off partially split frames.
@@ -97,19 +100,22 @@ fn detail_stage_plan(adj: &crate::AdjustmentSet, gpu_enabled: bool) -> DetailSta
     // partial-route rule below.
     let diffraction = lens.diffraction_enabled;
     let single_pixel = adj.noise_reduction.single_pixel > 0.0;
-    let partial = lens_cpu || single_pixel || diffraction;
+    let color_nr = adj.noise_reduction.color > 0.0;
+    let partial = lens_cpu || single_pixel || diffraction || color_nr;
+    let cpu_color_nr = gpu_enabled && color_nr;
     let cpu_moire = gpu_enabled && partial && adj.moire.amount > 0.0;
+    let defer_after_nr = cpu_color_nr || diffraction || cpu_moire;
+    let cpu_lens = gpu_enabled && (lens_cpu || cpu_color_nr);
     DetailStagePlan {
         gpu: gpu_enabled,
         cpu_single_pixel_first: gpu_enabled && single_pixel,
-        gpu_sharpen: gpu_enabled && adj.sharpening.amount > 0.0 && !diffraction && !cpu_moire,
-        gpu_lens: gpu_enabled && !lens_cpu,
+        cpu_color_nr,
+        gpu_sharpen: gpu_enabled && adj.sharpening.amount > 0.0 && !defer_after_nr,
+        gpu_lens: gpu_enabled && !lens_cpu && !cpu_color_nr,
         cpu_moire,
         cpu_diffraction: gpu_enabled && diffraction,
-        cpu_sharpen: gpu_enabled
-            && adj.sharpening.amount > 0.0
-            && (diffraction || cpu_moire),
-        cpu_lens: gpu_enabled && lens_cpu,
+        cpu_sharpen: gpu_enabled && adj.sharpening.amount > 0.0 && defer_after_nr,
+        cpu_lens,
     }
 }
 
@@ -159,10 +165,13 @@ fn post_process_impl(
     }
 
     let gpu = if plan.gpu {
-        // The CUDA single-pixel law is a different approximation; when it is
-        // requested the CPU stage above is the oracle, so zero it here.
+        // The CUDA single-pixel and legacy 5x5 color NR kernels are older
+        // approximations; zero them here when CPU runs the C1 oracle stages.
         let mut gpu_nr = nr.clone();
         gpu_nr.single_pixel = 0.0;
+        if plan.cpu_color_nr {
+            gpu_nr.color = 0.0;
+        }
         let mut gpu_sh = adj.sharpening.clone();
         if !plan.gpu_sharpen {
             gpu_sh.amount = 0.0;
@@ -185,6 +194,9 @@ fn post_process_impl(
     };
 
     if gpu {
+        if plan.cpu_color_nr {
+            stage_color_nr(rgba, w, h, nr, scale);
+        }
         if plan.cpu_moire {
             stage_moire(rgba, w, h, &adj.moire);
         }
@@ -214,7 +226,7 @@ fn post_process_impl(
         } else {
             stage_luminance_nr(rgba, w, h, nr);
         }
-        stage_color_nr(rgba, w, h, nr);
+        stage_color_nr(rgba, w, h, nr, scale);
         stage_moire(rgba, w, h, &adj.moire);
         // Capture One applies diffraction blur inside CaptureSharpening; this
         // CPU stage goes before the USM pass and has no GPU twin.
@@ -486,52 +498,138 @@ fn stage_luminance_nr_with_pad(
 
 // ───────────────────────────── 2. colour noise reduction ─────────────────────────────
 
-/// Blurs only the chroma planes of a YCbCr approximation; luminance is copied
-/// through untouched, so colour speckle disappears without softening detail.
-/// `color` is C1's CNR amount (`ZCNRAMOUNT`); the AI denoise amount is a
-/// separate model-backed stage and never reaches this approximation.
-fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction) {
+/// Capture One `ColorNoise2012` (`LABRangeFilter2012`) linear-domain chroma
+/// range filter: encodes linear 16-bit RGB into `(L, (R-G)/L, (B-G)/L)`, runs
+/// separable horizontal and vertical edge-preserving range passes with a
+/// quartic falloff `max(0, T/(D^2 + T) - 0.01)` over a wide strided window
+/// (r=28, s=4 at default `color = 50`, `scale = 1.0`), then reconstructs RGB
+/// with luminance preserved.
+fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scale: f32) {
     let strength = (adj.color / 100.0).clamp(0.0, 1.0);
-    if strength <= 0.0 {
+    if strength <= 0.0 || w == 0 || h == 0 {
         return;
     }
-    let radius = (1.0 + 2.0 * strength).round() as i32;
-    let mut cb = vec![0f32; w * h];
-    let mut cr = vec![0f32; w * h];
-    cb.par_chunks_mut(w)
-        .zip(cr.par_chunks_mut(w))
-        .enumerate()
-        .for_each(|(y, (cbrow, crrow))| {
-            for x in 0..w {
-                let i = (y * w + x) * 4;
-                let r = buf[i] as f32;
-                let g = buf[i + 1] as f32;
-                let b = buf[i + 2] as f32;
-                let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                cbrow[x] = (b - yy) / 1.8556;
-                crrow[x] = (r - yy) / 1.5748;
-            }
-        });
-    let mut tmp = vec![0f32; w * h];
-    box_blur_h(&cb, &mut tmp, w, h, radius);
-    box_blur_v(&tmp, &mut cb, w, h, radius);
-    box_blur_h(&cr, &mut tmp, w, h, radius);
-    box_blur_v(&tmp, &mut cr, w, h, radius);
-    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+
+    // Captured C1 ColorNoise2012 constants (ColorNoiseReductionAmount = 50).
+    const K: [f32; 4] = [0.299, 0.587, 0.114, 35.759_254];
+    const PX: f32 = 0.178_877_62;
+    const PY: f32 = 0.377_672_3;
+    const PZ_BASE: f32 = 0.401_832_58;
+    const PW_BASE: f32 = 2.968_700_4;
+
+    let scale_p = 0.35 + 1.3 * strength;
+    let pz = PZ_BASE * scale_p;
+    let pw = PW_BASE * scale_p;
+
+    let step = (4.0 * scale).round().clamp(1.0, 8.0) as isize;
+    let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as isize;
+    let radius = half_taps * step;
+
+    let mut srgb_to_lin16 = [0.0f32; 256];
+    for (i, slot) in srgb_to_lin16.iter_mut().enumerate() {
+        let v = i as f32 / 255.0;
+        let lin = if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        *slot = lin * 65535.0;
+    }
+
+    // 1. Encode sRGB -> linear 16-bit -> (L, u, v).
+    let n = w * h;
+    let mut encoded = vec![[0.0f32; 3]; n];
+    encoded.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let base = y * w * 4;
         for x in 0..w {
+            let i = base + x * 4;
+            let r = srgb_to_lin16[buf[i] as usize];
+            let g = srgb_to_lin16[buf[i + 1] as usize];
+            let b = srgb_to_lin16[buf[i + 2] as usize];
+            let l = (K[0] * r + K[1] * g + K[2] * b).max(0.0) + K[3];
+            let inv_l = 1.0 / l;
+            row[x] = [l, (r - g) * inv_l, (b - g) * inv_l];
+        }
+    });
+
+    // 2. Horizontal range filter pass.
+    let mut horiz = vec![[0.0f32; 3]; n];
+    horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let src_row = &encoded[y * w..(y + 1) * w];
+        let max_x = (w - 1) as isize;
+        for x in 0..w {
+            let [lc, uc, vc] = src_row[x];
+            let t_root = pz + pw * lc;
+            let t = t_root * t_root;
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -radius;
+            while off <= radius {
+                let nx = (x as isize + off).clamp(0, max_x) as usize;
+                let [li, ui, vi] = src_row[nx];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
+                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += step;
+            }
+            if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                out_row[x] = [lc, sum_u * inv_w, sum_v * inv_w];
+            } else {
+                out_row[x] = [lc, uc, vc];
+            }
+        }
+    });
+
+    // 3. Vertical range filter pass + 4. Linear RGB reconstruction -> sRGB u8.
+    let max_y = (h - 1) as isize;
+    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, out_row)| {
+        for x in 0..w {
+            let [lc, uc, vc] = horiz[y * w + x];
+            let t_root = pz + pw * lc;
+            let t = t_root * t_root;
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -radius;
+            while off <= radius {
+                let ny = (y as isize + off).clamp(0, max_y) as usize;
+                let [li, ui, vi] = horiz[ny * w + x];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
+                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += step;
+            }
+            let (u, v) = if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                (sum_u * inv_w, sum_v * inv_w)
+            } else {
+                (uc, vc)
+            };
+            let ul = u * lc;
+            let vl = v * lc;
+            let g = lc - ul * K[0] - vl * K[2] - K[3];
+            let r0 = (ul + g).max(1.0);
+            let g0 = g.max(1.0);
+            let b0 = (vl + g).max(1.0);
+            let sc = ((lc - (K[3] - 1.0)) / ((K[0] * r0 + K[1] * g0 + K[2] * b0).max(0.0) + 1.0))
+                .min(1.5);
+            let lin = [r0 * sc, g0 * sc, b0 * sc];
             let i = x * 4;
-            let r = row[i] as f32;
-            let g = row[i + 1] as f32;
-            let b = row[i + 2] as f32;
-            let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            let cbl = cb[y * w + x];
-            let crl = cr[y * w + x];
-            let rr = yy + 1.5748 * crl;
-            let bb = yy + 1.8556 * cbl;
-            let gg = (yy - 0.2126 * rr - 0.0722 * bb) / 0.7152;
-            let rgb = [rr, gg, bb];
             for k in 0..3 {
-                row[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+                let srgb = super::process::linear_to_srgb((lin[k] / 65535.0).clamp(0.0, 1.0));
+                out_row[i + k] = (srgb * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             }
         }
     });
@@ -1517,7 +1615,7 @@ mod tests {
             noise_reduction: NoiseReduction {
                 luminance: 60.0,
                 details: 35.0,
-                color: 40.0,
+                color: 0.0,
                 single_pixel: 0.0,
             },
             sharpening: Sharpening {
@@ -1535,6 +1633,7 @@ mod tests {
             DetailStagePlan {
                 gpu: true,
                 cpu_single_pixel_first: false,
+                cpu_color_nr: false,
                 gpu_sharpen: true,
                 gpu_lens: true,
                 cpu_moire: false,
@@ -1548,6 +1647,7 @@ mod tests {
     #[test]
     fn lens_profile_moves_only_lens_to_cpu() {
         let adj = crate::AdjustmentSet {
+            noise_reduction: NoiseReduction { color: 0.0, ..Default::default() },
             lens: LensCorrection { use_profile: true, distortion: 100.0, ..Default::default() },
             ..Default::default()
         };
@@ -1576,6 +1676,7 @@ mod tests {
     #[test]
     fn lens_extras_move_only_lens_to_cpu() {
         let adj = crate::AdjustmentSet {
+            noise_reduction: NoiseReduction { color: 0.0, ..Default::default() },
             sharpening: crate::Sharpening { amount: 50.0, ..Default::default() },
             lens: LensCorrection {
                 uniform_light_enabled: true,
@@ -1597,7 +1698,7 @@ mod tests {
             noise_reduction: NoiseReduction {
                 luminance: 60.0,
                 details: 35.0,
-                color: 40.0,
+                color: 0.0,
                 single_pixel: 100.0,
             },
             ..Default::default()
@@ -1610,8 +1711,28 @@ mod tests {
     }
 
     #[test]
+    fn color_nr_runs_c1_2012_on_cpu_before_sharpening() {
+        let adj = crate::AdjustmentSet {
+            noise_reduction: NoiseReduction {
+                luminance: 50.0,
+                details: 50.0,
+                color: 50.0,
+                single_pixel: 0.0,
+            },
+            sharpening: Sharpening { amount: 180.0, ..Default::default() },
+            ..Default::default()
+        };
+        let plan = detail_plan(&adj, true);
+        assert!(plan.cpu_color_nr);
+        assert!(!plan.gpu_sharpen);
+        assert!(plan.cpu_sharpen);
+        assert!(plan.cpu_lens);
+    }
+
+    #[test]
     fn diffraction_keeps_nr_and_moire_on_gpu_but_sharpens_on_cpu() {
         let adj = crate::AdjustmentSet {
+            noise_reduction: NoiseReduction { color: 0.0, ..Default::default() },
             lens: LensCorrection {
                 diffraction_enabled: true,
                 aperture: 8.0,
@@ -1648,6 +1769,7 @@ mod tests {
             DetailStagePlan {
                 gpu: false,
                 cpu_single_pixel_first: false,
+                cpu_color_nr: false,
                 gpu_sharpen: false,
                 gpu_lens: false,
                 cpu_moire: false,
@@ -1668,7 +1790,7 @@ mod tests {
     ) {
         stage_single_pixel(rgba, w, h, &adj.noise_reduction);
         stage_luminance_nr(rgba, w, h, &adj.noise_reduction);
-        stage_color_nr(rgba, w, h, &adj.noise_reduction);
+        stage_color_nr(rgba, w, h, &adj.noise_reduction, scale);
         stage_moire(rgba, w, h, &adj.moire);
         stage_diffraction(rgba, w, h, &adj.lens, scale);
         stage_sharpening(rgba, w, h, &adj.sharpening, scale);
@@ -1804,9 +1926,9 @@ mod tests {
     fn detail_stages_match_reference_pixels() {
         let expected = [
             15226162907845603633, 15226162907845603633, 15226162907845603633,
-            418812772922979691, 4342420695348529323, 1578698336601148913,
-            41615323049186328, 10717340786263556290, 2697018795909425383,
-            17974978512109289819, 11750616206334758719, 16575147648956657441,
+            418812772922979691, 14188287539090345076, 1578698336601148913,
+            41615323049186328, 17275283751766918384, 2697018795909425383,
+            17974978512109289819, 18074643075832604112, 16575147648956657441,
         ];
         let mut actual = Vec::new();
         for (w, h) in [(1, 1), (1, 17), (19, 1), (37, 23)] {
@@ -1819,7 +1941,7 @@ mod tests {
                     }),
                     1 => stage_color_nr(&mut pixels, w, h, &NoiseReduction {
                         luminance: 0.0, details: 0.0, color: 100.0, single_pixel: 0.0,
-                    }),
+                    }, 1.0),
                     _ => stage_sharpening(&mut pixels, w, h, &Sharpening {
                         amount: 245.0, radius: 2.8, threshold: 1.3, halo_suppression: 37.0,
                     }, 1.5),
@@ -2225,7 +2347,7 @@ over1={over1} diff_px={diff_px}",
             println!("{label:24} {ms:8.2} ms   {:6.1} Mpx/s", pixels / ms / 1000.0);
         };
         run("luminance_nr", &|b| stage_luminance_nr(b, w, h, &adj.noise_reduction));
-        run("color_nr", &|b| stage_color_nr(b, w, h, &adj.noise_reduction));
+        run("color_nr", &|b| stage_color_nr(b, w, h, &adj.noise_reduction, 1.0));
         run("moire", &|b| stage_moire(b, w, h, &moire));
         run("sharpening", &|b| stage_sharpening(b, w, h, &adj.sharpening, 1.0));
         run("lens(generic)", &|b| stage_lens(b, w, h, &lens, None));
@@ -2665,7 +2787,7 @@ over1={over1} diff_px={diff_px}",
             let mut adj = off();
             adj.noise_reduction.color = amount;
             let mut buf = base.clone();
-            stage_color_nr(&mut buf, w, h, &adj.noise_reduction);
+            stage_color_nr(&mut buf, w, h, &adj.noise_reduction, 1.0);
             buf
         };
         assert_eq!(run(0.0), base, "CNR 0 must be byte-identical");
