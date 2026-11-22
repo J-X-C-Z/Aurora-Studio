@@ -2212,7 +2212,14 @@ impl ImageEngine for FileEngine {
             if adjustments.base.film_curve.is_none() {
                 adjustments.base.film_curve = model.and_then(crate::camera_curve::default_curve);
             }
-            if adjustments.base.icc_profile.is_none() {
+            let icc_is_output_space = adjustments.base.icc_profile.as_deref().is_some_and(|name| {
+                let lower = name.trim().to_ascii_lowercase();
+                lower.contains("adobe rgb")
+                    || lower.contains("srgb")
+                    || lower.contains("display p3")
+                    || lower.contains("prophoto")
+            });
+            if adjustments.base.icc_profile.is_none() || icc_is_output_space {
                 adjustments.base.icc_profile = model
                     .and_then(crate::camera_profile::for_camera)
                     .filter(|name| crate::camera_profile::is_available(name))

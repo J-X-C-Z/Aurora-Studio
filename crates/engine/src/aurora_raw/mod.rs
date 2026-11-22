@@ -14,41 +14,162 @@ pub use c1_raw_he::decode_frame_cropped;
 
 use std::path::Path;
 
-/// Full-frame RGB16 through the C1 chain: HE decode, black level, stage 1/2/3
-/// over 128-pixel tiles, then clamp to 16-bit codes.
+/// Full-frame RGB16 through the C1 chain:
+/// 1. Z6III HE NEF -> `z6iii::render_linear_rgba16` (OpenCL full reconstruct + highlight + AA);
+/// 2. Any Bayer RAW decoded by LibRaw 0.23 (Nikon classic NEF, Sony ARW, Canon CR3, etc.)
+///    or Nikon HE fallback -> C1 Stage 1/2/3 over 128-pixel tiles, then clamp to 16-bit codes.
 ///
 /// The tile size is the one the lane proved invariant (256 px whole vs four
-/// 128 px parts: zero differing pixels). Returns `None` for anything that is
-/// not the verified HE variant, so the caller can fall back to LibRaw.
+/// 128 px parts: zero differing pixels). Returns `None` only for non-Bayer
+/// sensors (e.g. X-Trans) or unsupported containers.
 pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
     let bytes = std::fs::read(path).ok()?;
     let orientation = crate::raw::exif_orientation_bytes(&bytes).unwrap_or(1);
-    // Prefer LibRaw's Bayer plane when the loaded build supports the format.
-    // The custom HE decoder remains the fallback for builds without LibRaw 0.23.
-    let libraw_bayer = crate::raw::decode_bayer16(path)
-        .ok()
-        .map(|lib| (lib.raw_width, lib.raw_height, lib.data));
+    let libraw_frame = crate::raw::decode_bayer16(path).ok();
+    let libraw_bayer = libraw_frame
+        .as_ref()
+        .map(|lib| (lib.raw_width, lib.raw_height, lib.data.clone()));
 
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    if let Some((width, height, rgba)) = z6iii::render_linear_rgba16(&bytes, libraw_bayer.clone()) {
+    if let Some((width, height, rgba)) = z6iii::render_linear_rgba16(&bytes, libraw_bayer) {
         return Some(orient_rgba16(rgba, width, height, orientation));
     }
 
-    let fallback = || decode_frame_cropped(&bytes).ok().flatten();
-    let frame = match libraw_bayer {
-        Some((raw_width, raw_height, data)) => match c1_raw_he::nikon_crop(&bytes) {
-            Ok(Some(crop)) => {
-                match c1_raw_he::NikonHeCropFrame::new(crop, raw_width, raw_height, data) {
-                    Ok(frame) => frame,
-                    Err(_) => fallback()?,
-                }
-            }
+    // Try Nikon MakerNote metadata first when present (exact Nikon crop/WB/black),
+    // otherwise construct the C1 Stage 1/2/3 input directly from LibRaw's generic
+    // BayerFrame (covers Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.).
+    let (frame, wb, black) = if let Some((frame, wb, black)) =
+        nikon_c1_stage_input(&bytes, libraw_frame.as_ref())
+    {
+        (frame, wb, black)
+    } else if let Some(bayer) = libraw_frame.as_ref() {
+        generic_bayer_c1_stage_input(bayer)?
+    } else {
+        return None;
+    };
+
+    let (width, height, out) = run_c1_stage123_tiles(&frame, wb, black)?;
+    Some(orient_rgba16(out, width, height, orientation))
+}
+
+fn nikon_c1_stage_input(
+    bytes: &[u8],
+    libraw_frame: Option<&crate::raw::BayerFrame>,
+) -> Option<(c1_raw_he::NikonHeCropFrame, [f32; 3], u32)> {
+    let fallback = || decode_frame_cropped(bytes).ok().flatten();
+    let frame = match libraw_frame {
+        Some(lib) => match c1_raw_he::nikon_crop(bytes) {
+            Ok(Some(crop)) => c1_raw_he::NikonHeCropFrame::new(
+                crop,
+                lib.raw_width,
+                lib.raw_height,
+                lib.data.clone(),
+            )
+            .ok()
+            .or_else(fallback)?,
             _ => fallback()?,
         },
         None => fallback()?,
     };
-    let wb = c1_raw_he::nikon_as_shot_rgb(&bytes).ok()??;
-    let black = c1_raw_he::nikon_black_levels(&bytes).ok()??.capture_one_scalar();
+    let wb = c1_raw_he::nikon_as_shot_rgb(bytes).ok()??;
+    let black = c1_raw_he::nikon_black_levels(bytes).ok()??.capture_one_scalar();
+    Some((frame, wb, black))
+}
+
+/// Align any standard 2x2 Bayer frame (RGGB/GRBG/GBRG/BGGR) from LibRaw to an
+/// RGGB-origin active crop in 14-bit domain for C1 Stage 1/2/3 reconstruction.
+fn generic_bayer_c1_stage_input(
+    bayer: &crate::raw::BayerFrame,
+) -> Option<(c1_raw_he::NikonHeCropFrame, [f32; 3], u32)> {
+    // Reject non-Bayer sensors (e.g. X-Trans uses filters == 9, monochrome == 0).
+    if bayer.colors != 3 || bayer.filters == 0 || bayer.filters == 9 {
+        return None;
+    }
+    let is_green = |c: u8| c == 1 || c == 3;
+    let mut rggb_offset = None;
+    for dy in 0..=1 {
+        for dx in 0..=1 {
+            let x = bayer.left_margin + dx;
+            let y = bayer.top_margin + dy;
+            if bayer.color_at(x, y) == 0
+                && is_green(bayer.color_at(x + 1, y))
+                && is_green(bayer.color_at(x, y + 1))
+                && bayer.color_at(x + 1, y + 1) == 2
+            {
+                rggb_offset = Some((dx, dy));
+                break;
+            }
+        }
+        if rggb_offset.is_some() {
+            break;
+        }
+    }
+    let (dx, dy) = rggb_offset?;
+    let src_left = bayer.left_margin + dx;
+    let src_top = bayer.top_margin + dy;
+    let width = bayer.width.saturating_sub(dx) & !1;
+    let height = bayer.height.saturating_sub(dy) & !1;
+    if width < 16 || height < 16 || src_left + width > bayer.raw_width || src_top + height > bayer.raw_height {
+        return None;
+    }
+    // Extract the active RGGB-aligned plane with origin (0, 0) so `crop.left`
+    // and `crop.top` are always even regardless of sensor CFA phase or margins.
+    let (data, black) = {
+        let mut plane = Vec::with_capacity(width * height);
+        let (shift_left, shift_right, black) = if bayer.bits == 14 || bayer.bits == 0 {
+            (0u32, 0u32, bayer.black)
+        } else if bayer.bits < 14 {
+            let s = 14 - u32::from(bayer.bits);
+            (s, 0, bayer.black << s)
+        } else {
+            let s = u32::from(bayer.bits) - 14;
+            (0, s, bayer.black >> s)
+        };
+        for y in 0..height {
+            let row = (src_top + y) * bayer.raw_width + src_left;
+            for &v in &bayer.data[row..row + width] {
+                let sample = if shift_left > 0 {
+                    ((u32::from(v) << shift_left).min(16383)) as u16
+                } else if shift_right > 0 {
+                    v >> shift_right
+                } else {
+                    v
+                };
+                plane.push(sample);
+            }
+        }
+        (plane, black)
+    };
+    let g = if bayer.cam_mul[1].is_finite() && bayer.cam_mul[1] > 0.0 {
+        bayer.cam_mul[1]
+    } else {
+        1.0
+    };
+    let wb = [
+        if bayer.cam_mul[0].is_finite() && bayer.cam_mul[0] > 0.0 {
+            bayer.cam_mul[0] / g
+        } else {
+            1.0
+        },
+        1.0,
+        if bayer.cam_mul[2].is_finite() && bayer.cam_mul[2] > 0.0 {
+            bayer.cam_mul[2] / g
+        } else {
+            1.0
+        },
+    ];
+    let crop = c1_raw_he::NikonCrop { left: 0, top: 0, width, height };
+    let frame = c1_raw_he::NikonHeCropFrame::new(crop, width, height, data).ok()?;
+    Some((frame, wb, black))
+}
+
+fn run_c1_stage123_tiles(
+    frame: &c1_raw_he::NikonHeCropFrame,
+    wb: [f32; 3],
+    black: u32,
+) -> Option<(usize, usize, Vec<u16>)> {
+    use rayon::prelude::*;
+
     let params = c1_raw_he::Stage1Params::prepare(wb, [12.8, 0.0], black, false);
     let crop = frame.crop();
     let (width, height) = (crop.width, crop.height);
@@ -56,11 +177,15 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
         return None;
     }
 
-    let mut rgb = vec![0f32; width * height * 3];
+    let mut coords = Vec::new();
     for top in (0..height).step_by(128) {
         for left in (0..width).step_by(128) {
-            let tile_width = (width - left).min(128);
-            let tile_height = (height - top).min(128);
+            coords.push((left, top, (width - left).min(128), (height - top).min(128)));
+        }
+    }
+    let tiles: Option<Vec<(usize, usize, usize, usize, Vec<[f32; 3]>)>> = coords
+        .into_par_iter()
+        .map(|(left, top, tile_width, tile_height)| {
             let area = c1_raw_he::NikonCrop {
                 left: crop.left + left,
                 top: crop.top + top,
@@ -68,7 +193,7 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
                 height: tile_height,
             };
             let tile = c1_raw_he::reconstruct_planar_active_mirror_roi(
-                &frame,
+                frame,
                 area,
                 params,
                 Some(black as i32),
@@ -76,24 +201,27 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
                 128.0,
             )
             .ok()?;
-            for y in 0..tile_height {
-                for x in 0..tile_width {
-                    let dst = ((top + y) * width + left + x) * 3;
-                    rgb[dst..dst + 3].copy_from_slice(&tile[y * tile_width + x]);
-                }
+            Some((left, top, tile_width, tile_height, tile))
+        })
+        .collect();
+    let tiles = tiles?;
+
+    let mut out = vec![0u16; width * height * 4];
+    for (left, top, tile_width, tile_height, tile) in tiles {
+        for y in 0..tile_height {
+            let row_dst = ((top + y) * width + left) * 4;
+            let row_src = y * tile_width;
+            for x in 0..tile_width {
+                let px = tile[row_src + x];
+                let d = row_dst + x * 4;
+                out[d] = px[0].clamp(0.0, 65535.0) as u16;
+                out[d + 1] = px[1].clamp(0.0, 65535.0) as u16;
+                out[d + 2] = px[2].clamp(0.0, 65535.0) as u16;
+                out[d + 3] = 65535;
             }
         }
     }
-
-    let mut out = Vec::with_capacity(width * height * 4);
-    for pixel in rgb.chunks_exact(3) {
-        for value in pixel {
-            out.push(value.clamp(0.0, 65535.0) as u16);
-        }
-        out.push(65535);
-    }
-    let orientation = crate::raw::exif_orientation_bytes(&bytes).unwrap_or(1);
-    Some(orient_rgba16(out, width, height, orientation))
+    Some((width, height, out))
 }
 
 /// LibRaw stores sensor frames already turned by EXIF orientation. The C1 HE
@@ -166,5 +294,52 @@ mod tests {
         );
         assert!(at(0.50) < 65535, "median channel clipped to white");
         assert!(clipped * 2 < total, "clipped channels {clipped}/{total}");
+    }
+
+    #[test]
+    fn generic_bayer_aligns_all_cfa_phases_through_c1_stage123() {
+        // LibRaw filter masks for RGGB, GRBG, GBRG, BGGR.
+        let patterns = [0x9494_9494u32, 0x6161_6161, 0x4949_4949, 0x1616_1616];
+        for filters in patterns {
+            let (raw_w, raw_h) = (64usize, 64usize);
+            let mut data = vec![0u16; raw_w * raw_h];
+            for y in 0..raw_h {
+                for x in 0..raw_w {
+                    let c = ((filters >> ((((y << 1) & 14) + (x & 1)) << 1)) & 3) as u8;
+                    data[y * raw_w + x] = match c {
+                        0 => 4000, // R
+                        2 => 3000, // B
+                        _ => 3500, // G
+                    };
+                }
+            }
+            let bayer = crate::raw::BayerFrame {
+                raw_width: raw_w,
+                raw_height: raw_h,
+                width: 48,
+                height: 48,
+                top_margin: 8,
+                left_margin: 8,
+                stride: raw_w * 2,
+                bits: 14,
+                data,
+                filters,
+                colors: 3,
+                black: 1000,
+                maximum: 16383,
+                cam_mul: [2048.0, 1024.0, 1536.0, 1024.0],
+                rgb_cam: [[0.0; 4]; 3],
+            };
+            let (frame, wb, black) = super::generic_bayer_c1_stage_input(&bayer)
+                .expect("generic Bayer frame must align to RGGB");
+            assert_eq!(black, 1000);
+            assert!((wb[0] - 2.0).abs() < 1e-4 && (wb[1] - 1.0).abs() < 1e-4 && (wb[2] - 1.5).abs() < 1e-4);
+            let (w, h, out) = super::run_c1_stage123_tiles(&frame, wb, black)
+                .expect("C1 Stage 1/2/3 must succeed on generic Bayer");
+            assert!(w >= 46 && h >= 46);
+            assert_eq!(out.len(), w * h * 4);
+            let center = ((h / 2) * w + (w / 2)) * 4;
+            assert!(out[center] > 1000 && out[center + 1] > 1000 && out[center + 2] > 1000);
+        }
     }
 }

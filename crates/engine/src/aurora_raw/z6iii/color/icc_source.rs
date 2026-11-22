@@ -2,7 +2,6 @@ use super::camera_clut::lab_v4_to_icc_xyz;
 use super::icc_grid::quantize_output;
 
 const POINTS: usize = 33;
-const CURVE_LEN: usize = 1025;
 
 pub struct CameraPcs {
     curves: [Vec<u16>; 3],
@@ -52,12 +51,17 @@ impl CameraPcs {
             return None;
         }
         let tag = icc_tag(profile, b"A2B0")?;
-        let table_start = 52 + 3 * CURVE_LEN * 2;
+        if tag.len() < 52 || &tag[..4] != b"mft2" || tag[8..11] != [3, 3, POINTS as u8] {
+            return None;
+        }
+        let in_entries = usize::from(be_word(&tag[48..50]));
+        let out_entries = usize::from(be_word(&tag[50..52]));
+        if in_entries < 2 || out_entries != 2 {
+            return None;
+        }
+        let table_start = 52 + 3 * in_entries * 2;
         let table_end = table_start + POINTS.pow(3) * 6;
         if tag.len() != table_end + 12
-            || &tag[..4] != b"mft2"
-            || tag[8..11] != [3, 3, POINTS as u8]
-            || tag[48..52] != [4, 1, 0, 2]
             || tag[12..48].chunks_exact(4).enumerate().any(|(index, word)| {
                 be_u32(word, 0) != Some(if index % 4 == 0 { 65536 } else { 0 })
             })
@@ -66,8 +70,8 @@ impl CameraPcs {
             return None;
         }
         let curves = std::array::from_fn(|channel| {
-            let start = 52 + channel * CURVE_LEN * 2;
-            tag[start..start + CURVE_LEN * 2].chunks_exact(2).map(be_word).collect()
+            let start = 52 + channel * in_entries * 2;
+            tag[start..start + in_entries * 2].chunks_exact(2).map(be_word).collect()
         });
         let nodes = tag[table_start..table_end].chunks_exact(6)
             .map(|words| [be_word(words), be_word(&words[2..]), be_word(&words[4..])]).collect();
