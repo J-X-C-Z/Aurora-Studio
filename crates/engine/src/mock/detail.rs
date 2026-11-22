@@ -31,6 +31,7 @@ mod detail_gpu {
 use crate::{FilmGrain, GrainKind, LensCorrection, Moire, NoiseReduction, Sharpening};
 
 const PURPLE_BAND_ROWS: usize = 128;
+const DIFFRACTION_BAND_ROWS: usize = 128;
 
 /// Applies the detail stages to one sRGB 8-bit RGBA frame, in place.
 ///
@@ -899,6 +900,9 @@ fn stage_diffraction(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection, s
     if !adj.diffraction_enabled {
         return;
     }
+    if w == 0 || h == 0 || buf.len() != w * h * 4 {
+        return;
+    }
     let f_number = adj.aperture;
     if !(1.0..=50.0).contains(&f_number) {
         return;
@@ -918,27 +922,68 @@ fn stage_diffraction(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection, s
     let radius = ((first_zero_px * 2.2).ceil() as i32).clamp(1, 6);
     let kernel = airy_kernel(radius, v_per_px);
     let n = (radius * 2 + 1) as usize;
-    let src = buf.to_vec();
-    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let i = x * 4;
-            let mut acc = [0f32; 3];
-            for ky in 0..n {
-                let sy = clampi(y as i32 + ky as i32 - radius, 0, h as i32 - 1) as usize;
-                for kx in 0..n {
-                    let sx = clampi(x as i32 + kx as i32 - radius, 0, w as i32 - 1) as usize;
-                    let weight = kernel[ky * n + kx];
-                    let j = (sy * w + sx) * 4;
-                    acc[0] += src[j] as f32 * weight;
-                    acc[1] += src[j + 1] as f32 * weight;
-                    acc[2] += src[j + 2] as f32 * weight;
-                }
-            }
-            for c in 0..3 {
-                row[i + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+    let radius_px = radius as usize;
+    let row_bytes = w * 4;
+    let mut source_band = Vec::new();
+    let mut previous = vec![0u8; radius_px * row_bytes];
+    let mut y0 = 0usize;
+    while y0 < h {
+        let y1 = (y0 + DIFFRACTION_BAND_ROWS).min(h);
+        let source_y0 = y0.saturating_sub(radius_px);
+        let source_y1 = (y1 + radius_px).min(h);
+        let source_rows = source_y1 - source_y0;
+        source_band.resize(source_rows * row_bytes, 0);
+
+        for gy in source_y0..source_y1 {
+            let dst = (gy - source_y0) * row_bytes;
+            if gy < y0 {
+                let src = (gy - source_y0) * row_bytes;
+                source_band[dst..dst + row_bytes].copy_from_slice(&previous[src..src + row_bytes]);
+            } else {
+                let src = gy * row_bytes;
+                source_band[dst..dst + row_bytes].copy_from_slice(&buf[src..src + row_bytes]);
             }
         }
-    });
+        if y1 < h {
+            let carry_y0 = y1.saturating_sub(radius_px);
+            for gy in carry_y0..y1 {
+                let dst = (gy - carry_y0) * row_bytes;
+                let src = (gy - source_y0) * row_bytes;
+                previous[dst..dst + row_bytes]
+                    .copy_from_slice(&source_band[src..src + row_bytes]);
+            }
+        }
+
+        let dst_start = y0 * row_bytes;
+        let dst_end = y1 * row_bytes;
+        buf[dst_start..dst_end]
+            .par_chunks_mut(row_bytes)
+            .enumerate()
+            .for_each(|(band_y, row)| {
+                let y = y0 + band_y;
+                for x in 0..w {
+                    let i = x * 4;
+                    let mut acc = [0f32; 3];
+                    for ky in 0..n {
+                        let sy = clampi(y as i32 + ky as i32 - radius, 0, h as i32 - 1) as usize;
+                        let source_row = (sy - source_y0) * row_bytes;
+                        for kx in 0..n {
+                            let sx =
+                                clampi(x as i32 + kx as i32 - radius, 0, w as i32 - 1) as usize;
+                            let weight = kernel[ky * n + kx];
+                            let j = source_row + sx * 4;
+                            acc[0] += source_band[j] as f32 * weight;
+                            acc[1] += source_band[j + 1] as f32 * weight;
+                            acc[2] += source_band[j + 2] as f32 * weight;
+                        }
+                    }
+                    for c in 0..3 {
+                        row[i + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            });
+        y0 = y1;
+    }
 }
 
 /// `ZLENSDUSTREMOVALENABLED` + the LCC's dust rectangles. Mirrors
@@ -2217,6 +2262,83 @@ over1={over1} diff_px={diff_px}",
         let n = px.len() as f32;
         let mean = px.iter().map(|v| *v as f32).sum::<f32>() / n;
         px.iter().map(|v| (*v as f32 - mean).powi(2)).sum::<f32>() / n
+    }
+
+    fn stage_diffraction_full_snapshot_reference(
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        adj: &LensCorrection,
+        scale: f32,
+    ) {
+        if !adj.diffraction_enabled {
+            return;
+        }
+        let f_number = adj.aperture;
+        if !(1.0..=50.0).contains(&f_number) {
+            return;
+        }
+        let pitch = pixel_pitch_um(adj, w, h, scale);
+        if pitch <= 0.0 || !pitch.is_finite() {
+            return;
+        }
+        let v_per_px = std::f32::consts::PI * pitch / (DIFFRACTION_LAMBDA_UM * f_number);
+        if v_per_px <= 0.0 || !v_per_px.is_finite() {
+            return;
+        }
+        let first_zero_px = 3.831_705_6 / v_per_px;
+        if first_zero_px < 0.35 {
+            return;
+        }
+        let radius = ((first_zero_px * 2.2).ceil() as i32).clamp(1, 6);
+        let kernel = airy_kernel(radius, v_per_px);
+        let n = (radius * 2 + 1) as usize;
+        let src = buf.to_vec();
+        buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let i = x * 4;
+                let mut acc = [0f32; 3];
+                for ky in 0..n {
+                    let sy = clampi(y as i32 + ky as i32 - radius, 0, h as i32 - 1) as usize;
+                    for kx in 0..n {
+                        let sx = clampi(x as i32 + kx as i32 - radius, 0, w as i32 - 1) as usize;
+                        let weight = kernel[ky * n + kx];
+                        let j = (sy * w + sx) * 4;
+                        acc[0] += src[j] as f32 * weight;
+                        acc[1] += src[j + 1] as f32 * weight;
+                        acc[2] += src[j + 2] as f32 * weight;
+                    }
+                }
+                for c in 0..3 {
+                    row[i + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn diffraction_band_snapshot_matches_full_frame_reference() {
+        let (w, h) = (137usize, 259usize);
+        let mut base = Vec::with_capacity(w * h * 4);
+        for i in 0..w * h {
+            base.extend_from_slice(&[
+                (i * 73 % 251) as u8,
+                (i * 29 + i / 7) as u8,
+                (i * 17 + i / 11) as u8,
+                255,
+            ]);
+        }
+        let lens = LensCorrection {
+            diffraction_enabled: true,
+            aperture: 16.0,
+            ..Default::default()
+        };
+        let mut expected = base.clone();
+        let mut actual = base.clone();
+        stage_diffraction_full_snapshot_reference(&mut expected, w, h, &lens, 1.0);
+        stage_diffraction(&mut actual, w, h, &lens, 1.0);
+        assert_ne!(actual, base, "the parity fixture must exercise diffraction");
+        assert_eq!(actual, expected);
     }
 
     #[test]
