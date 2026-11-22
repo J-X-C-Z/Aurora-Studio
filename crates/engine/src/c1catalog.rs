@@ -1066,6 +1066,10 @@ impl C1Catalog {
                 settings.geometry_canvas_clipping,
             );
 
+            // Spots are stored in raw `ZIMAGE` pixels; the oriented, uncropped
+            // geometry above is what turns them into `.lumen` coordinates.
+            crate::c1_spots::apply_to_adjustments(&mut adjustments, &settings, source);
+
             let mut rating = 0i64;
             let mut color_tag = 0i64;
             for layer in &mine {

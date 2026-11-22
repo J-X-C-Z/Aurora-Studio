@@ -229,6 +229,27 @@ pub fn to_lumen(list: &SpotList, image: (u32, u32), geometry: &Geometry) -> Lume
     out
 }
 
+/// Fills [`crate::AdjustmentSet::spots`] from `ZSPOTS` / `ZRELATIVESPOTS`.
+///
+/// `image` is the `ZIMAGE` size the absolute list is expressed in; without it
+/// the coordinates cannot be normalised and the spots are left untouched.
+/// `ZSPOTS` wins whenever it names at least one spot, matching C1's paste
+/// rule (see [`effective`]).
+pub fn apply_to_adjustments(
+    adjustments: &mut crate::AdjustmentSet,
+    settings: &crate::c1_model::C1VariantSettings,
+    image: Option<(u32, u32)>,
+) {
+    let Some(image) = image else {
+        return;
+    };
+    if image.0 == 0 || image.1 == 0 {
+        return;
+    }
+    let list = effective(&settings.spots, &settings.relative_spots, image);
+    adjustments.spots = to_lumen(&list, image, &adjustments.geometry).spots;
+}
+
 /// The inverse of [`to_lumen`], for writing `.lumen` edits back to `ZSPOTS`.
 ///
 /// A `.lumen` Clone keeps its source offset, which `ZSPOTS` cannot store, so it
@@ -370,6 +391,44 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "-1;2,1000.000000,750.000000,60.000000;3,2000.000000,1500.000000,5.000000";
+
+    #[test]
+    fn catalog_mapping_fills_the_adjustment_spots() {
+        let mut settings = crate::c1_model::C1VariantSettings::defaults();
+        settings.spots = parse("-1;2,1000.000000,500.000000,60.000000").unwrap();
+        let mut adjustments = crate::AdjustmentSet::default();
+        apply_to_adjustments(&mut adjustments, &settings, Some((6000, 4000)));
+
+        assert_eq!(adjustments.spots.len(), 1);
+        assert!((adjustments.spots[0].x - 1000.0 / 6000.0).abs() < 1e-6);
+        assert!((adjustments.spots[0].y - 500.0 / 4000.0).abs() < 1e-6);
+        assert!((adjustments.spots[0].radius - 60.0 / 6000.0).abs() < 1e-6);
+        assert_eq!(adjustments.spots[0].kind, crate::SpotKind::Spot);
+    }
+
+    #[test]
+    fn catalog_mapping_falls_back_to_relative_spots() {
+        let mut settings = crate::c1_model::C1VariantSettings::defaults();
+        settings.relative_spots =
+            parse_relative("-1;0.500000,0.250000,0.010000").unwrap();
+        let mut adjustments = crate::AdjustmentSet::default();
+        apply_to_adjustments(&mut adjustments, &settings, Some((6000, 4000)));
+
+        assert_eq!(adjustments.spots.len(), 1);
+        assert!((adjustments.spots[0].x - 0.5).abs() < 1e-6);
+        assert!((adjustments.spots[0].y - 0.25).abs() < 1e-6);
+        let expected = (0.01 * 6000.0 * 4000.0 / std::f32::consts::PI).sqrt() / 6000.0;
+        assert!((adjustments.spots[0].radius - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn catalog_mapping_needs_the_source_size() {
+        let mut settings = crate::c1_model::C1VariantSettings::defaults();
+        settings.spots = parse(SAMPLE).unwrap();
+        let mut adjustments = crate::AdjustmentSet::default();
+        apply_to_adjustments(&mut adjustments, &settings, None);
+        assert!(adjustments.spots.is_empty());
+    }
 
     #[test]
     fn parses_the_documented_grammar() {
