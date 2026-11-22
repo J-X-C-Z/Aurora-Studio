@@ -4,13 +4,14 @@ use color::output::OutputClut;
 
 const TILE: usize = 512;
 
-/// Runs the Z6III OpenCL reconstruction + highlight recovery + anti-aliasing
-/// pipeline over 512x512 tiles, invoking `on_tile(left, top, width, height, core)`
-/// for each linear camera-RGB tile.
+/// Runs the Z6III OpenCL reconstruction + optional linear CA (stage 16) +
+/// highlight recovery + anti-aliasing pipeline over 512x512 tiles, invoking
+/// `on_tile(left, top, width, height, core, iso, noise)` for each tile.
 pub(super) fn render_linear_tiles(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
-    mut on_tile: impl FnMut(usize, usize, usize, usize, &[[f32; 3]], u32) -> Result<()>,
+    ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
+    mut on_tile: impl FnMut(usize, usize, usize, usize, &[[f32; 3]], u32, [f32; 2]) -> Result<()>,
 ) -> Result<(usize, usize)> {
     let iso = raw::nikon_exif_sensitivity(nef).map_err(|error| anyhow!("ISO: {error}"))?
         .context("missing NEF ISO")?;
@@ -50,12 +51,24 @@ pub(super) fn render_linear_tiles(
                 width: width + 4, height: height + 4 };
             let mut halo = raw::reconstruct_planar_green_halo_roi(&frame, area, stage1, black as i32, wb, offset, noise[0])
                 .map_err(|error| anyhow!("reconstruction at ({left},{top}): {error}"))?;
+            if let Some(warp) = ca_warp {
+                apply_linear_chromatic_aberration(
+                    &mut halo,
+                    area.width,
+                    area.height,
+                    left as isize - 2,
+                    top as isize - 2,
+                    crop.width,
+                    crop.height,
+                    warp,
+                );
+            }
             raw::recover_highlights(&mut halo, recovery)
                 .with_context(|| format!("OpenCL highlight recovery at ({left},{top})"))?;
             let core = raw::anti_alias_opencl(&halo, area.width, area.height, [0.05_f32.sqrt(), aca_gain])
                 .map_err(|error| anyhow!("OpenCL anti-alias at ({left},{top}): {error}"))?;
             ensure!(core.len() == width * height, "unexpected anti-alias tile size");
-            on_tile(left, top, width, height, &core, iso)?;
+            on_tile(left, top, width, height, &core, iso, noise)?;
         }
     }
     Ok((crop.width, crop.height))
@@ -64,21 +77,44 @@ pub(super) fn render_linear_tiles(
 pub(in crate::aurora_raw) fn linear_rgba16(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
+    ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
 ) -> Result<(usize, usize, Vec<u16>)> {
-    let mut out = vec![0u16; 6048 * 4032 * 4];
-    let (crop_w, crop_h) = render_linear_tiles(nef, bayer, |left, top, width, _height, core, _iso| {
-        for (row, values) in core.chunks_exact(width).enumerate() {
-            let dst_row = ((top + row) * 6048 + left) * 4;
-            for (col, px) in values.iter().enumerate() {
-                let dst = dst_row + col * 4;
-                out[dst] = px[0].clamp(0.0, 65535.0) as u16;
-                out[dst + 1] = px[1].clamp(0.0, 65535.0) as u16;
-                out[dst + 2] = px[2].clamp(0.0, 65535.0) as u16;
-                out[dst + 3] = 65535;
+    let mut linear_rgb = vec![[0.0f32; 3]; 6048 * 4032];
+    let mut detected_iso = 100u32;
+    let mut detected_noise = [0.0f32; 2];
+    let (crop_w, crop_h) = render_linear_tiles(
+        nef,
+        bayer,
+        ca_warp,
+        |left, top, width, _height, core, iso, noise| {
+            detected_iso = iso;
+            detected_noise = noise;
+            for (row, values) in core.chunks_exact(width).enumerate() {
+                let dst = (top + row) * 6048 + left;
+                linear_rgb[dst..dst + width].copy_from_slice(values);
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
+
+    // C1 queue stages 22-38 (after AntiColorAliasingV10, before ClampNegative):
+    // 1. Directional linear-domain luminance NR + LumaTransfer (ISO >= 400).
+    apply_linear_luma_noise_2018(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
+    // 2. Linear-domain ColorNoise2012 (LABRangeFilter2012, zero 8-bit quantization loss).
+    apply_linear_color_noise_2012(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
+
+    let mut out = vec![0u16; crop_w * crop_h * 4];
+    for (dst, px) in out.chunks_exact_mut(4).zip(linear_rgb.iter()) {
+        dst[0] = px[0].clamp(0.0, 65535.0) as u16;
+        dst[1] = px[1].clamp(0.0, 65535.0) as u16;
+        dst[2] = px[2].clamp(0.0, 65535.0) as u16;
+        dst[3] = 65535;
+    }
+
+    // C1 queue stage 77: BandingSuppression (16x16 periodic pattern removal).
+    if let Some(tables) = cached_banding_tables() {
+        apply_banding_rgba16(&mut out, crop_w, detected_iso, [&tables.0, &tables.1, &tables.2]);
+    }
     Ok((crop_w, crop_h, out))
 }
 
@@ -89,7 +125,7 @@ pub(super) fn neutral(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Vec<u16>>
         .context("unsupported Adobe RGB output CLUT")?;
     let mut pixels = vec![[0; 3]; 6048 * 4032];
     let mut detected_iso = 100u32;
-    let (crop_w, _crop_h) = render_linear_tiles(nef, None, |left, top, width, _height, core, iso| {
+    let (crop_w, _crop_h) = render_linear_tiles(nef, None, None, |left, top, width, _height, core, iso, _noise| {
         detected_iso = iso;
         let encoded = raw::export_color(core, &film, output.nodes())
             .with_context(|| format!("OpenCL Auto and Adobe RGB at ({left},{top})"))?;
@@ -163,12 +199,411 @@ fn apply_banding(rgb: &mut [u16], width: usize, iso: u32, tables: [&[u8]; 3]) {
     }
 }
 
+fn apply_banding_rgba16(rgba: &mut [u16], width: usize, iso: u32, tables: [&[u8]; 3]) {
+    let [left, right, packed] = tables;
+    let words: Vec<_> = packed.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+    let factor = match iso {
+        0..=100 => 0.5,
+        101..=200 => iso as f32 / 200.0,
+        201..=1600 => 1.0 + (iso - 200) as f32 / 1400.0,
+        _ => 2.0,
+    };
+    let gain = (((200.0 * factor) * (1.0 / 128.0)) * 1.25 * 65_536.0) as i32;
+    let limit = (gain * 255) >> 16;
+    let strength = (65_536.0_f32 / limit as f32) as i32;
+    for (row, pixels) in rgba.chunks_exact_mut(4 * width).enumerate() {
+        for (column, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let cell = ((column & 14) << 4) | (row & 15);
+            let block = ((column & 255) >> 4) | (row & 240);
+            let pair = words[(block + usize::from(left[cell])) & 255]
+                .wrapping_sub(words[(block + usize::from(right[cell])) & 255]);
+            let half = (pair >> (16 * (column & 1))) & 65_535;
+            let high = (((half >> 8) as i32) * gain) >> 16;
+            let low = (((half & 255) as i32) * gain) >> 16;
+            for code in &mut pixel[..3] {
+                let value = i32::from(*code);
+                let headroom = limit.min(65_535 - value);
+                *code = (value + (((high - low) * headroom * strength) >> 16)).clamp(0, 65_535) as u16;
+            }
+        }
+    }
+}
+
+fn cached_banding_tables() -> Option<&'static ([u8; 256], [u8; 256], [u8; 1024])> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static TABLES: OnceLock<Option<([u8; 256], [u8; 256], [u8; 1024])>> = OnceLock::new();
+    TABLES
+        .get_or_init(|| {
+            let root = std::env::var_os("AURORA_Z6III_C1_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One"));
+            let mut core = std::fs::File::open(root.join("ImgCoreDll.dll")).ok()?;
+            let mut left = [0u8; 256];
+            let mut right = [0u8; 256];
+            let mut packed = [0u8; 1024];
+            for (offset, table) in [
+                (40_613_632, &mut left[..]),
+                (40_614_912, &mut right[..]),
+                (40_613_888, &mut packed[..]),
+            ] {
+                core.seek(SeekFrom::Start(offset)).ok()?;
+                core.read_exact(table).ok()?;
+            }
+            let fingerprint = |bytes: &[u8]| {
+                bytes.iter().fold(0xcbf29ce484222325_u64, |hash, &byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                })
+            };
+            if [fingerprint(&left), fingerprint(&right), fingerprint(&packed)]
+                != [0x0528b3d3556eb0f5, 0x24060a098de1ec13, 0x065f8d932bb7fdef3]
+            {
+                return None;
+            }
+            Some((left, right, packed))
+        })
+        .as_ref()
+}
+
+/// C1 queue stage 16 (`FixChromaticAberration`, `p_041444160.cl`):
+/// radially resamples linear R and B channels along `(p - center) / r` with
+/// shifts clamped to +/-3 px while leaving G untouched.
+pub(in crate::aurora_raw) fn apply_linear_chromatic_aberration(
+    tile: &mut [[f32; 3]],
+    tile_w: usize,
+    tile_h: usize,
+    origin_x: isize,
+    origin_y: isize,
+    full_w: usize,
+    full_h: usize,
+    warp: &crate::mock::lens_profile::LensWarp,
+) {
+    if (warp.red.is_empty() && warp.blue.is_empty()) || tile_w == 0 || tile_h == 0 {
+        return;
+    }
+    let src = tile.to_vec();
+    let cx = full_w as f32 * 0.5;
+    let cy = full_h as f32 * 0.5;
+    let half_diag = (cx * cx + cy * cy).sqrt().max(1.0);
+    let max_x = (tile_w - 1) as f32;
+    let max_y = (tile_h - 1) as f32;
+
+    let sample_ch = |fx: f32, fy: f32, ch: usize| -> f32 {
+        let sx = fx.clamp(0.0, max_x);
+        let sy = fy.clamp(0.0, max_y);
+        let x0 = sx.floor() as usize;
+        let y0 = sy.floor() as usize;
+        let x1 = (x0 + 1).min(tile_w - 1);
+        let y1 = (y0 + 1).min(tile_h - 1);
+        let tx = sx - x0 as f32;
+        let ty = sy - y0 as f32;
+        let p00 = src[y0 * tile_w + x0][ch];
+        let p10 = src[y0 * tile_w + x1][ch];
+        let p01 = src[y1 * tile_w + x0][ch];
+        let p11 = src[y1 * tile_w + x1][ch];
+        let top = p00 + (p10 - p00) * tx;
+        let bot = p01 + (p11 - p01) * tx;
+        top + (bot - top) * ty
+    };
+
+    for y in 0..tile_h {
+        let gy = (origin_y + y as isize) as f32;
+        let dy = gy - cy;
+        for x in 0..tile_w {
+            let gx = (origin_x + x as isize) as f32;
+            let dx = gx - cx;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r < 1e-4 {
+                continue;
+            }
+            let inv_r = 1.0 / r;
+            let dir_x = dx * inv_r;
+            let dir_y = dy * inv_r;
+            let t = (r / half_diag).clamp(0.0, 1.0);
+            let idx = y * tile_w + x;
+            if !warp.red.is_empty() {
+                let shift = (crate::mock::lens_profile::LensWarp::sample(&warp.red, t) * half_diag)
+                    .clamp(-3.0, 3.0);
+                tile[idx][0] = sample_ch(x as f32 + dir_x * shift, y as f32 + dir_y * shift, 0);
+            }
+            if !warp.blue.is_empty() {
+                let shift = (crate::mock::lens_profile::LensWarp::sample(&warp.blue, t) * half_diag)
+                    .clamp(-3.0, 3.0);
+                tile[idx][2] = sample_ch(x as f32 + dir_x * shift, y as f32 + dir_y * shift, 2);
+            }
+        }
+    }
+}
+
+/// C1 queue stages 22-34 (linear-domain directional luminance NR + LumaTransfer):
+/// smooths high-ISO luminance grain along the minimum-gradient orientation in a
+/// 5x5 neighbourhood and scales RGB proportionally to preserve chromaticity.
+pub(in crate::aurora_raw) fn apply_linear_luma_noise_2018(
+    rgb: &mut [[f32; 3]],
+    w: usize,
+    h: usize,
+    iso: u32,
+    noise: [f32; 2],
+) {
+    use rayon::prelude::*;
+
+    if iso < 400 || w < 5 || h < 5 {
+        return;
+    }
+    let iso_strength = ((iso as f32 - 300.0) / 1700.0).clamp(0.0, 1.0);
+    let mix = 0.25 + 0.50 * iso_strength;
+    let slope = noise[0].max(0.5);
+    let floor = noise[1].max(4.0);
+
+    let luma: Vec<f32> = rgb
+        .par_iter()
+        .map(|p| (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).max(0.0))
+        .collect();
+
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let max_x = (w - 1) as isize;
+        let max_y = (h - 1) as isize;
+        let at = |ix: isize, iy: isize| -> f32 {
+            luma[iy.clamp(0, max_y) as usize * w + ix.clamp(0, max_x) as usize]
+        };
+        let yi = y as isize;
+        for x in 0..w {
+            let xi = x as isize;
+            let yc = luma[y * w + x];
+            if yc < 1.0 {
+                continue;
+            }
+            let sigma = (slope * yc + floor).sqrt() * (1.2 + 1.4 * iso_strength);
+            let inv_two_s2 = 1.0 / (2.0 * sigma * sigma + 1e-6);
+
+            // 4-orientation gradient energies (H, V, D1, D2).
+            let gh = (at(xi - 1, yi) - at(xi + 1, yi)).abs()
+                + 0.5 * (at(xi - 2, yi) - at(xi + 2, yi)).abs();
+            let gv = (at(xi, yi - 1) - at(xi, yi + 1)).abs()
+                + 0.5 * (at(xi, yi - 2) - at(xi, yi + 2)).abs();
+            let gd1 = (at(xi - 1, yi - 1) - at(xi + 1, yi + 1)).abs()
+                + 0.5 * (at(xi - 2, yi - 2) - at(xi + 2, yi + 2)).abs();
+            let gd2 = (at(xi - 1, yi + 1) - at(xi + 1, yi - 1)).abs()
+                + 0.5 * (at(xi - 2, yi + 2) - at(xi + 2, yi - 2)).abs();
+            let g_min = gh.min(gv).min(gd1).min(gd2) + sigma * 0.5 + 1.0;
+            let dir_w = [
+                g_min / (gh + g_min),
+                g_min / (gv + g_min),
+                g_min / (gd1 + g_min),
+                g_min / (gd2 + g_min),
+            ];
+            const TAPS: [(isize, isize, usize, f32); 16] = [
+                (-1, 0, 0, 1.0), (1, 0, 0, 1.0), (-2, 0, 0, 0.5), (2, 0, 0, 0.5),
+                (0, -1, 1, 1.0), (0, 1, 1, 1.0), (0, -2, 1, 0.5), (0, 2, 1, 0.5),
+                (-1, -1, 2, 0.85), (1, 1, 2, 0.85), (-2, -2, 2, 0.4), (2, 2, 2, 0.4),
+                (-1, 1, 3, 0.85), (1, -1, 3, 0.85), (-2, 2, 3, 0.4), (2, -2, 3, 0.4),
+            ];
+            let mut sum_y = yc;
+            let mut sum_w = 1.0f32;
+            for &(dx, dy, dir, sp) in &TAPS {
+                let yn = at(xi + dx, yi + dy);
+                let d = yn - yc;
+                let wt = sp * dir_w[dir] * (-(d * d) * inv_two_s2).exp();
+                sum_y += yn * wt;
+                sum_w += wt;
+            }
+            let y_clean = yc + (sum_y / sum_w - yc) * mix;
+            let ratio = (y_clean / yc).clamp(0.5, 1.5);
+            out_row[x] = [
+                out_row[x][0] * ratio,
+                out_row[x][1] * ratio,
+                out_row[x][2] * ratio,
+            ];
+        }
+    });
+}
+
+/// C1 queue stages 35-38 (`ColorNoise2012` / `LABRangeFilter2012`) directly in
+/// linear 16-bit camera RGB space (0..65535), eliminating 8-bit quantization loss.
+/// `t_root` has variance units (`[intensity^2]`) matching `d = PX * du^2`, so it
+/// scales directly with the camera's Poisson + read-noise model `[slope, floor]`.
+pub(in crate::aurora_raw) fn apply_linear_color_noise_2012(
+    rgb: &mut [[f32; 3]],
+    w: usize,
+    h: usize,
+    iso: u32,
+    noise: [f32; 2],
+) {
+    use rayon::prelude::*;
+
+    if w == 0 || h == 0 {
+        return;
+    }
+    const K: [f32; 4] = [0.299, 0.587, 0.114, 35.759_254];
+    const PX: f32 = 0.178_877_62;
+    const PY: f32 = 0.377_672_3;
+    const PZ_BASE: f32 = 0.401_832_58;
+    const PW_BASE: f32 = 2.968_700_4;
+
+    let iso_var = (iso as f32 / 100.0).max(1.0);
+    let pz = (noise[1] * 12.0).max(PZ_BASE * iso_var);
+    let pw = (noise[0] * 4.5).max(PW_BASE * iso_var);
+    const STEP: isize = 4;
+    const RADIUS: isize = 28;
+
+    let n = w * h;
+    let mut encoded = vec![[0.0f32; 3]; n];
+    encoded.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let src = &rgb[y * w..(y + 1) * w];
+        for x in 0..w {
+            let [r, g, b] = src[x];
+            let l = (K[0] * r + K[1] * g + K[2] * b).max(0.0) + K[3];
+            let inv_l = 1.0 / l;
+            row[x] = [l, (r - g) * inv_l, (b - g) * inv_l];
+        }
+    });
+
+    let mut horiz = vec![[0.0f32; 3]; n];
+    horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let src_row = &encoded[y * w..(y + 1) * w];
+        let max_x = (w - 1) as isize;
+        for x in 0..w {
+            let [lc, uc, vc] = src_row[x];
+            let t_root = pz + pw * lc;
+            let t = t_root * t_root;
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -RADIUS;
+            while off <= RADIUS {
+                let nx = (x as isize + off).clamp(0, max_x) as usize;
+                let [li, ui, vi] = src_row[nx];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
+                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += STEP;
+            }
+            if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                out_row[x] = [lc, sum_u * inv_w, sum_v * inv_w];
+            } else {
+                out_row[x] = [lc, uc, vc];
+            }
+        }
+    });
+
+    let max_y = (h - 1) as isize;
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        for x in 0..w {
+            let [lc, uc, vc] = horiz[y * w + x];
+            let t_root = pz + pw * lc;
+            let t = t_root * t_root;
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -RADIUS;
+            while off <= RADIUS {
+                let ny = (y as isize + off).clamp(0, max_y) as usize;
+                let [li, ui, vi] = horiz[ny * w + x];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
+                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += STEP;
+            }
+            let (u, v) = if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                (sum_u * inv_w, sum_v * inv_w)
+            } else {
+                (uc, vc)
+            };
+            let ul = u * lc;
+            let vl = v * lc;
+            let g = lc - ul * K[0] - vl * K[2] - K[3];
+            let r0 = (ul + g).max(1.0);
+            let g0 = g.max(1.0);
+            let b0 = (vl + g).max(1.0);
+            let sc = ((lc - (K[3] - 1.0)) / ((K[0] * r0 + K[1] * g0 + K[2] * b0).max(0.0) + 1.0))
+                .min(1.5);
+            out_row[x] = [r0 * sc, g0 * sc, b0 * sc];
+        }
+    });
+}
+
 #[cfg(test)]
-#[test]
-fn banding_preserves_saturation_and_phase() {
-    let mut words = [0_u8; 1024];
-    words[4..8].copy_from_slice(&0x01ff_ff01_u32.to_le_bytes());
-    let mut pixels = [0, 1_000, 65_535, 0, 1_000, 65_535];
-    apply_banding(&mut pixels, 2, 200, [&[1; 256], &[0; 256], &words]);
-    assert_eq!(pixels, [494, 1_494, 65_535, 0, 505, 65_535]);
+mod tests {
+    use super::*;
+
+    #[test]
+    fn banding_preserves_saturation_and_phase() {
+        let mut words = [0_u8; 1024];
+        words[4..8].copy_from_slice(&0x01ff_ff01_u32.to_le_bytes());
+        let mut pixels = [0, 1_000, 65_535, 0, 1_000, 65_535];
+        apply_banding(&mut pixels, 2, 200, [&[1; 256], &[0; 256], &words]);
+        assert_eq!(pixels, [494, 1_494, 65_535, 0, 505, 65_535]);
+
+        let mut rgba = [0, 1_000, 65_535, 65_535, 0, 1_000, 65_535, 65_535];
+        apply_banding_rgba16(&mut rgba, 2, 200, [&[1; 256], &[0; 256], &words]);
+        assert_eq!(rgba, [494, 1_494, 65_535, 65_535, 0, 505, 65_535, 65_535]);
+    }
+
+    #[test]
+    fn linear_ca_shifts_red_and_blue_leaving_green_unchanged() {
+        let (w, h) = (32, 32);
+        let mut tile = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x * 1000) as f32;
+                tile[y * w + x] = [v, v, v];
+            }
+        }
+        let before = tile.clone();
+        let warp = crate::mock::lens_profile::LensWarp {
+            red: vec![(0.0, 0.0), (1.0, 0.05)],
+            blue: vec![(0.0, 0.0), (1.0, -0.05)],
+            ..Default::default()
+        };
+        apply_linear_chromatic_aberration(&mut tile, w, h, 0, 0, w, h, &warp);
+        let probe = 16 * w + 28;
+        assert!(tile[probe][0] > before[probe][0], "positive red shift moves outward");
+        assert!(tile[probe][2] < before[probe][2], "negative blue shift moves inward");
+        assert_eq!(tile[probe][1], before[probe][1], "green channel must stay untouched");
+    }
+
+    #[test]
+    fn linear_denoise_suppresses_high_iso_blotches_without_shifting_luma() {
+        let (w, h) = (64, 64);
+        let mut rgb = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                // 8px-wide red/green chroma blotches + mild luma grain.
+                let blotch = if ((x / 8) + (y / 8)) % 2 == 0 { 1.0 } else { -1.0 };
+                let grain = if (x + y) % 2 == 0 { 250.0 } else { -250.0 };
+                let base = 8000.0 + grain;
+                rgb[y * w + x] = [base + blotch * 900.0, base - blotch * 450.0, base + blotch * 450.0];
+            }
+        }
+        let chroma_var = |buf: &[[f32; 3]]| -> f32 {
+            let diffs: Vec<f32> = buf.iter().map(|p| p[0] - p[1]).collect();
+            let mean = diffs.iter().sum::<f32>() / diffs.len() as f32;
+            diffs.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / diffs.len() as f32
+        };
+        let before_c = chroma_var(&rgb);
+        apply_linear_luma_noise_2018(&mut rgb, w, h, 1000, [18.0, 200.0]);
+        apply_linear_color_noise_2012(&mut rgb, w, h, 1000, [18.0, 200.0]);
+        let after_c = chroma_var(&rgb);
+        assert!(after_c < before_c * 0.25, "linear ColorNoise2012 must strongly suppress 8px chroma blotches: before={before_c} after={after_c}");
+        let mean_l: f32 = rgb.iter().map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).sum::<f32>() / rgb.len() as f32;
+        assert!((mean_l - 8000.0).abs() < 150.0, "mean luma should stay stable: {mean_l}");
+    }
 }
