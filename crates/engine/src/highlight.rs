@@ -11,6 +11,7 @@
 const KNEE: f32 = 0.75;
 const CLIP: f32 = 0.995;
 const PEAK_CAP: f32 = 4.0;
+const RECONSTRUCT_LOOKBEHIND: usize = 8;
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
@@ -41,19 +42,29 @@ fn ratios(c: [f32; 3]) -> Option<[f32; 3]> {
 }
 
 /// Estimate a clipped pixel's hue and peak from unclipped neighbours.
+#[cfg(test)]
 fn reconstruct(src: &[f32], px: usize) -> Option<(f32, [f32; 3])> {
     let index = px / 3;
     let count = src.len() / 3;
-    let lo = index.saturating_sub(8);
-    let hi = (index + 9).min(count);
+    reconstruct_with(index, count, |j| {
+        let p = j * 3;
+        [src[p], src[p + 1], src[p + 2]]
+    })
+}
+
+fn reconstruct_with<F>(index: usize, count: usize, mut original: F) -> Option<(f32, [f32; 3])>
+where
+    F: FnMut(usize) -> [f32; 3],
+{
+    let lo = index.saturating_sub(RECONSTRUCT_LOOKBEHIND);
+    let hi = (index + RECONSTRUCT_LOOKBEHIND + 1).min(count);
     let mut acc = [0.0f32; 3];
     let mut used = 0u32;
     for j in lo..hi {
         if j == index {
             continue;
         }
-        let p = j * 3;
-        let c = [src[p], src[p + 1], src[p + 2]];
+        let c = original(j);
         if c.iter().all(|v| v.is_finite()) && max3(c) < CLIP {
             if let Some(r) = ratios(c) {
                 for k in 0..3 {
@@ -71,7 +82,7 @@ fn reconstruct(src: &[f32], px: usize) -> Option<(f32, [f32; 3])> {
         return None;
     }
     let ratio = [acc[0] / m, acc[1] / m, acc[2] / m];
-    let own = [src[px], src[px + 1], src[px + 2]];
+    let own = original(index);
     // Each unclipped channel bounds the true peak through its recovered ratio.
     let mut peak = max3(own);
     for k in 0..3 {
@@ -89,12 +100,15 @@ pub fn recover(linear: &mut [f32], highlight: f32, shadow: f32) {
     if h == 0.0 && s == 0.0 {
         return;
     }
-    let src = linear.to_vec();
-    for (index, out) in linear.chunks_exact_mut(3).enumerate() {
+    let count = linear.len() / 3;
+    let mut history = [[0.0f32; 3]; RECONSTRUCT_LOOKBEHIND];
+    for index in 0..count {
         let px = index * 3;
-        let mut c = [src[px], src[px + 1], src[px + 2]];
+        let original = [linear[px], linear[px + 1], linear[px + 2]];
+        let mut c = original;
         if !c.iter().all(|v| v.is_finite()) {
-            out.fill(0.0);
+            linear[px..px + 3].fill(0.0);
+            history[index % RECONSTRUCT_LOOKBEHIND] = original;
             continue;
         }
         // Shadow lift: scale all channels, weighted to deep tones only.
@@ -108,7 +122,16 @@ pub fn recover(linear: &mut [f32], highlight: f32, shadow: f32) {
         if h > 0.0 {
             let clipped = c.iter().any(|v| *v >= CLIP);
             if clipped {
-                if let Some((peak, ratio)) = reconstruct(&src, px) {
+                if let Some((peak, ratio)) =
+                    reconstruct_with(index, count, |j| {
+                        if j < index {
+                            history[j % RECONSTRUCT_LOOKBEHIND]
+                        } else {
+                            let p = j * 3;
+                            [linear[p], linear[p + 1], linear[p + 2]]
+                        }
+                    })
+                {
                     let y = shoulder(peak, h);
                     c = [y * ratio[0], y * ratio[1], y * ratio[2]];
                 } else {
@@ -124,7 +147,8 @@ pub fn recover(linear: &mut [f32], highlight: f32, shadow: f32) {
                 }
             }
         }
-        out.copy_from_slice(&c);
+        linear[px..px + 3].copy_from_slice(&c);
+        history[index % RECONSTRUCT_LOOKBEHIND] = original;
     }
 }
 
@@ -140,6 +164,87 @@ mod tests {
         let mut data = original;
         recover(&mut data, 0.0, 0.0);
         assert_eq!(data, original);
+    }
+
+    fn recover_full_snapshot_reference(linear: &mut [f32], highlight: f32, shadow: f32) {
+        let h = if highlight.is_finite() {
+            (highlight / 100.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let s = if shadow.is_finite() {
+            (shadow / 100.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if h == 0.0 && s == 0.0 {
+            return;
+        }
+        let src = linear.to_vec();
+        for (index, out) in linear.chunks_exact_mut(3).enumerate() {
+            let px = index * 3;
+            let mut c = [src[px], src[px + 1], src[px + 2]];
+            if !c.iter().all(|v| v.is_finite()) {
+                out.fill(0.0);
+                continue;
+            }
+            if s > 0.0 {
+                let l = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).max(0.0);
+                let w = (1.0 - smoothstep(0.0, 0.6, l)).powi(2);
+                let gain = 1.0 + s * 1.5 * w;
+                c = [c[0] * gain, c[1] * gain, c[2] * gain];
+            }
+            if h > 0.0 {
+                let clipped = c.iter().any(|v| *v >= CLIP);
+                if clipped {
+                    if let Some((peak, ratio)) = reconstruct(&src, px) {
+                        let y = shoulder(peak, h);
+                        c = [y * ratio[0], y * ratio[1], y * ratio[2]];
+                    } else {
+                        let m = max3(c);
+                        let k = shoulder(m, h) / m.max(1e-6);
+                        c = [c[0] * k, c[1] * k, c[2] * k];
+                    }
+                } else {
+                    let m = max3(c);
+                    if m > KNEE {
+                        let k = shoulder(m, h) / m;
+                        c = [c[0] * k, c[1] * k, c[2] * k];
+                    }
+                }
+            }
+            out.copy_from_slice(&c);
+        }
+    }
+
+    #[test]
+    fn ring_history_matches_full_snapshot_reference() {
+        let mut data = Vec::new();
+        for i in 0..257usize {
+            let x = i as f32 * 0.137;
+            let mut px = [
+                (x * 0.73).sin() * 1.6 + 0.2,
+                (x * 0.41).cos() * 1.3 + 0.3,
+                (x * 0.91).sin() * 0.9 + 0.1,
+            ];
+            if i % 11 == 0 {
+                px[0] = 1.25;
+            }
+            if i % 17 == 0 {
+                px[1] = 2.5;
+            }
+            if i % 23 == 0 {
+                px[2] = 1.75;
+            }
+            data.extend_from_slice(&px);
+        }
+        data.extend_from_slice(&[42.0, -13.0]);
+
+        let mut expected = data.clone();
+        recover_full_snapshot_reference(&mut expected, 83.0, 41.0);
+        recover(&mut data, 83.0, 41.0);
+
+        assert_eq!(data, expected);
     }
 
     #[test]
