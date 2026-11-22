@@ -30,6 +30,8 @@ mod detail_gpu {
 
 use crate::{FilmGrain, GrainKind, LensCorrection, Moire, NoiseReduction, Sharpening};
 
+const PURPLE_BAND_ROWS: usize = 128;
+
 /// Applies the detail stages to one sRGB 8-bit RGBA frame, in place.
 ///
 /// `rgba` is row-major RGBA with no padding, `scale` is output pixels per source
@@ -1361,49 +1363,83 @@ pub(crate) fn stage_ca_fringes(buf: &mut [u8], w: usize, h: usize, adj: &LensCor
 fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
     // purple is the 0..1 normalised amount; 0.5 is C1's zero.
     let strength = crate::mock::purple_strength(purple);
-    if strength == 0.0 {
+    if strength == 0.0 || w == 0 || h == 0 || buf.len() != w * h * 4 {
         return;
     }
-    let src = buf.to_vec();
-    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let i = x * 4;
-            let j = (y * w + x) * 4;
-            let p = [src[j], src[j + 1], src[j + 2]];
-            let r = p[0] as f32;
-            let g = p[1] as f32;
-            let b = p[2] as f32;
-            let pn = ((r.min(b) - g) / 255.0).clamp(0.0, 1.0);
-            if pn <= 0.0 {
-                continue;
-            }
-            let mut lo = 255.0f32;
-            let mut hi = 0.0f32;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let xx = clampi(x as i32 + dx, 0, w as i32 - 1) as usize;
-                    let yy = clampi(y as i32 + dy, 0, h as i32 - 1) as usize;
-                    let n = (yy * w + xx) * 4;
-                    let l = luma8([src[n], src[n + 1], src[n + 2]]);
-                    lo = lo.min(l);
-                    hi = hi.max(l);
-                }
-            }
-            let edge = ((hi - lo) / 40.0).clamp(0.0, 1.0);
-            let amount = strength * pn * edge;
-            if amount == 0.0 {
-                continue;
-            }
-            let gray = luma8(p);
-            for k in 0..3 {
-                let v = p[k] as f32 * (1.0 - amount) + gray * amount;
-                row[i + k] = v.clamp(0.0, 255.0).round() as u8;
+    let row_bytes = w * 4;
+    let mut source_band = Vec::new();
+    let mut previous = vec![0u8; row_bytes];
+    let mut y0 = 0usize;
+    while y0 < h {
+        let y1 = (y0 + PURPLE_BAND_ROWS).min(h);
+        let source_y0 = y0.saturating_sub(1);
+        let source_y1 = (y1 + 1).min(h);
+        let source_rows = source_y1 - source_y0;
+        source_band.resize(source_rows * row_bytes, 0);
+
+        for gy in source_y0..source_y1 {
+            let dst = (gy - source_y0) * row_bytes;
+            if gy < y0 {
+                source_band[dst..dst + row_bytes].copy_from_slice(&previous);
+            } else {
+                let src = gy * row_bytes;
+                source_band[dst..dst + row_bytes].copy_from_slice(&buf[src..src + row_bytes]);
             }
         }
-    });
+        let last = (y1 - 1 - source_y0) * row_bytes;
+        previous.copy_from_slice(&source_band[last..last + row_bytes]);
+
+        let dst_start = y0 * row_bytes;
+        let dst_end = y1 * row_bytes;
+        buf[dst_start..dst_end]
+            .par_chunks_mut(row_bytes)
+            .enumerate()
+            .for_each(|(band_y, row)| {
+                let y = y0 + band_y;
+                for x in 0..w {
+                    let i = x * 4;
+                    let j = (y - source_y0) * row_bytes + x * 4;
+                    let p = [source_band[j], source_band[j + 1], source_band[j + 2]];
+                    let r = p[0] as f32;
+                    let g = p[1] as f32;
+                    let b = p[2] as f32;
+                    let pn = ((r.min(b) - g) / 255.0).clamp(0.0, 1.0);
+                    if pn <= 0.0 {
+                        continue;
+                    }
+                    let mut lo = 255.0f32;
+                    let mut hi = 0.0f32;
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let xx = clampi(x as i32 + dx, 0, w as i32 - 1) as usize;
+                            let yy = clampi(y as i32 + dy, 0, h as i32 - 1) as usize;
+                            let n = (yy - source_y0) * row_bytes + xx * 4;
+                            let l = luma8([
+                                source_band[n],
+                                source_band[n + 1],
+                                source_band[n + 2],
+                            ]);
+                            lo = lo.min(l);
+                            hi = hi.max(l);
+                        }
+                    }
+                    let edge = ((hi - lo) / 40.0).clamp(0.0, 1.0);
+                    let amount = strength * pn * edge;
+                    if amount == 0.0 {
+                        continue;
+                    }
+                    let gray = luma8(p);
+                    for k in 0..3 {
+                        let v = p[k] as f32 * (1.0 - amount) + gray * amount;
+                        row[i + k] = v.clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+            });
+        y0 = y1;
+    }
 }
 
 // ───────────────────────────── 6. film grain ─────────────────────────────
@@ -3045,6 +3081,85 @@ over1={over1} diff_px={diff_px}",
             px[3] = 255;
         }
         buf
+    }
+
+    fn stage_purple_fringing_full_snapshot_reference(
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        purple: f32,
+    ) {
+        let strength = crate::mock::purple_strength(purple);
+        if strength == 0.0 {
+            return;
+        }
+        let src = buf.to_vec();
+        buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let i = x * 4;
+                let j = (y * w + x) * 4;
+                let p = [src[j], src[j + 1], src[j + 2]];
+                let r = p[0] as f32;
+                let g = p[1] as f32;
+                let b = p[2] as f32;
+                let pn = ((r.min(b) - g) / 255.0).clamp(0.0, 1.0);
+                if pn <= 0.0 {
+                    continue;
+                }
+                let mut lo = 255.0f32;
+                let mut hi = 0.0f32;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let xx = clampi(x as i32 + dx, 0, w as i32 - 1) as usize;
+                        let yy = clampi(y as i32 + dy, 0, h as i32 - 1) as usize;
+                        let n = (yy * w + xx) * 4;
+                        let l = luma8([src[n], src[n + 1], src[n + 2]]);
+                        lo = lo.min(l);
+                        hi = hi.max(l);
+                    }
+                }
+                let edge = ((hi - lo) / 40.0).clamp(0.0, 1.0);
+                let amount = strength * pn * edge;
+                if amount == 0.0 {
+                    continue;
+                }
+                let gray = luma8(p);
+                for k in 0..3 {
+                    let v = p[k] as f32 * (1.0 - amount) + gray * amount;
+                    row[i + k] = v.clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn purple_band_snapshot_matches_full_frame_reference() {
+        let (w, h) = (137usize, 259usize);
+        let mut base = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let dark = (x / 3 + y / 5) % 2 == 0;
+                let g = if dark { 38 } else { 196 };
+                let r = (g + 72 + (x % 31) as u16).min(255);
+                let b = (g + 93 + (y % 37) as u16).min(255);
+                base.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
+            }
+        }
+
+        let mut changed = false;
+        for amount in [50.0f32, -50.0] {
+            let purple = crate::mock::purple_norm(amount);
+            let mut expected = base.clone();
+            let mut actual = base.clone();
+            stage_purple_fringing_full_snapshot_reference(&mut expected, w, h, purple);
+            stage_purple_fringing(&mut actual, w, h, purple);
+            changed |= actual != base;
+            assert_eq!(actual, expected, "amount {amount}");
+        }
+        assert!(changed, "the parity fixture must exercise purple pixels");
     }
 
     #[test]
