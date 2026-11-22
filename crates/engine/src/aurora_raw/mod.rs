@@ -7,6 +7,7 @@
 //! acceptance of its own.
 
 pub mod c1_raw_he;
+pub mod xtrans;
 #[cfg(all(windows, feature = "z6iii-raw-export"))]
 pub mod z6iii;
 
@@ -15,13 +16,11 @@ pub use c1_raw_he::decode_frame_cropped;
 use std::path::Path;
 
 /// Full-frame RGB16 through the C1 chain:
-/// 1. Z6III HE NEF -> `z6iii::render_linear_rgba16` (OpenCL full reconstruct + highlight + AA);
-/// 2. Any Bayer RAW decoded by LibRaw 0.23 (Nikon classic NEF, Sony ARW, Canon CR3, etc.)
-///    or Nikon HE fallback -> C1 Stage 1/2/3 over 128-pixel tiles, then clamp to 16-bit codes.
-///
-/// The tile size is the one the lane proved invariant (256 px whole vs four
-/// 128 px parts: zero differing pixels). Returns `None` only for non-Bayer
-/// sensors (e.g. X-Trans) or unsupported containers.
+/// 1. Z6III HE NEF -> `z6iii::render_linear_rgba16` (OpenCL full reconstruct + linear CA +
+///    highlight recovery + anti-alias + linear LumaNoise/ColorNoise2012 + BandingSuppression);
+/// 2. Fujifilm X-Trans (`filters == 9`) -> `xtrans::demosaic_xtrans` + linear CA + linear denoise;
+/// 3. Any standard 2x2 Bayer RAW (Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.) ->
+///    C1 Stage 1/2/3 over 128-pixel tiles with camera-specific ISO noise + linear CA + linear denoise.
 pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
     let bytes = std::fs::read(path).ok()?;
     let orientation = crate::raw::exif_orientation_bytes(&bytes).unwrap_or(1);
@@ -30,9 +29,30 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
         .as_ref()
         .map(|lib| (lib.raw_width, lib.raw_height, lib.data.clone()));
 
+    let exif = crate::exif::read_exif(path);
+    let ca_warp = crate::mock::lens_profile::LensShot::from_exif(&exif)
+        .and_then(|shot| crate::mock::lens_profile::auto_warp(&shot))
+        .filter(|warp| !warp.red.is_empty() || !warp.blue.is_empty());
+
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    if let Some((width, height, rgba)) = z6iii::render_linear_rgba16(&bytes, libraw_bayer) {
+    if let Some((width, height, rgba)) =
+        z6iii::render_linear_rgba16(&bytes, libraw_bayer, ca_warp.as_ref())
+    {
         return Some(orient_rgba16(rgba, width, height, orientation));
+    }
+
+    let iso = exif.iso.unwrap_or(100);
+    let noise = lookup_camera_noise(exif.camera_model.as_deref(), iso);
+
+    // Fujifilm X-Trans 6x6 sensor path (`filters == 9`).
+    if let Some(bayer) = libraw_frame.as_ref() {
+        if bayer.filters == 9 && bayer.colors == 3 {
+            let (width, height, mut rgb) = decode_xtrans_linear(bayer)?;
+            #[cfg(all(windows, feature = "z6iii-raw-export"))]
+            finish_linear_stages(&mut rgb, width, height, iso, noise, ca_warp.as_ref());
+            let out = pack_rgba16(&rgb);
+            return Some(orient_rgba16(out, width, height, orientation));
+        }
     }
 
     // Try Nikon MakerNote metadata first when present (exact Nikon crop/WB/black),
@@ -48,8 +68,85 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
         return None;
     };
 
-    let (width, height, out) = run_c1_stage123_tiles(&frame, wb, black)?;
+    let (width, height, mut rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    finish_linear_stages(&mut rgb, width, height, iso, noise, ca_warp.as_ref());
+    let out = pack_rgba16(&rgb);
     Some(orient_rgba16(out, width, height, orientation))
+}
+
+fn lookup_camera_noise(model: Option<&str>, iso: u32) -> [f32; 2] {
+    if let Some(name) = model {
+        if let Some(cam) = crate::camera_params::for_camera(name) {
+            if let Some(row) = cam.noise_at(iso) {
+                let slope = row.poisson.unwrap_or(12.8).max(0.5);
+                let floor = row.floor.unwrap_or(0.0).max(0.0);
+                return [slope, floor];
+            }
+        }
+    }
+    let iso_scale = (iso as f32 / 100.0).max(1.0);
+    [2.5 * iso_scale, 8.0 * iso_scale]
+}
+
+fn decode_xtrans_linear(bayer: &crate::raw::BayerFrame) -> Option<(usize, usize, Vec<[f32; 3]>)> {
+    let g = if bayer.cam_mul[1].is_finite() && bayer.cam_mul[1] > 0.0 {
+        bayer.cam_mul[1]
+    } else {
+        1.0
+    };
+    let wb = [
+        if bayer.cam_mul[0].is_finite() && bayer.cam_mul[0] > 0.0 { bayer.cam_mul[0] / g } else { 1.0 },
+        1.0,
+        if bayer.cam_mul[2].is_finite() && bayer.cam_mul[2] > 0.0 { bayer.cam_mul[2] / g } else { 1.0 },
+    ];
+    let (data, black) = if bayer.bits == 14 || bayer.bits == 0 {
+        (bayer.data.clone(), bayer.black as f32)
+    } else if bayer.bits < 14 {
+        let s = 14 - u32::from(bayer.bits);
+        (bayer.data.iter().map(|&v| ((u32::from(v) << s).min(16383)) as u16).collect(), (bayer.black << s) as f32)
+    } else {
+        let s = u32::from(bayer.bits) - 14;
+        (bayer.data.iter().map(|&v| v >> s).collect(), (bayer.black >> s) as f32)
+    };
+    let rgb = xtrans::demosaic_xtrans(
+        &data,
+        bayer.raw_width,
+        bayer.left_margin,
+        bayer.top_margin,
+        bayer.width,
+        bayer.height,
+        black,
+        wb,
+    )?;
+    Some((bayer.width, bayer.height, rgb))
+}
+
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+fn finish_linear_stages(
+    rgb: &mut [[f32; 3]],
+    width: usize,
+    height: usize,
+    iso: u32,
+    noise: [f32; 2],
+    ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
+) {
+    if let Some(warp) = ca_warp {
+        z6iii::apply_linear_chromatic_aberration(rgb, width, height, 0, 0, width, height, warp);
+    }
+    z6iii::apply_linear_luma_noise_2018(rgb, width, height, iso, noise);
+    z6iii::apply_linear_color_noise_2012(rgb, width, height, iso, noise);
+}
+
+fn pack_rgba16(rgb: &[[f32; 3]]) -> Vec<u16> {
+    let mut out = vec![0u16; rgb.len() * 4];
+    for (dst, px) in out.chunks_exact_mut(4).zip(rgb.iter()) {
+        dst[0] = px[0].clamp(0.0, 65535.0) as u16;
+        dst[1] = px[1].clamp(0.0, 65535.0) as u16;
+        dst[2] = px[2].clamp(0.0, 65535.0) as u16;
+        dst[3] = 65535;
+    }
+    out
 }
 
 fn nikon_c1_stage_input(
@@ -163,14 +260,15 @@ fn generic_bayer_c1_stage_input(
     Some((frame, wb, black))
 }
 
-fn run_c1_stage123_tiles(
+fn run_c1_stage123_tiles_f32(
     frame: &c1_raw_he::NikonHeCropFrame,
     wb: [f32; 3],
     black: u32,
-) -> Option<(usize, usize, Vec<u16>)> {
+    noise: [f32; 2],
+) -> Option<(usize, usize, Vec<[f32; 3]>)> {
     use rayon::prelude::*;
 
-    let params = c1_raw_he::Stage1Params::prepare(wb, [12.8, 0.0], black, false);
+    let params = c1_raw_he::Stage1Params::prepare(wb, noise, black, false);
     let crop = frame.crop();
     let (width, height) = (crop.width, crop.height);
     if width == 0 || height == 0 {
@@ -206,22 +304,25 @@ fn run_c1_stage123_tiles(
         .collect();
     let tiles = tiles?;
 
-    let mut out = vec![0u16; width * height * 4];
+    let mut rgb = vec![[0.0f32; 3]; width * height];
     for (left, top, tile_width, tile_height, tile) in tiles {
         for y in 0..tile_height {
-            let row_dst = ((top + y) * width + left) * 4;
-            let row_src = y * tile_width;
-            for x in 0..tile_width {
-                let px = tile[row_src + x];
-                let d = row_dst + x * 4;
-                out[d] = px[0].clamp(0.0, 65535.0) as u16;
-                out[d + 1] = px[1].clamp(0.0, 65535.0) as u16;
-                out[d + 2] = px[2].clamp(0.0, 65535.0) as u16;
-                out[d + 3] = 65535;
-            }
+            let dst = (top + y) * width + left;
+            let src = y * tile_width;
+            rgb[dst..dst + tile_width].copy_from_slice(&tile[src..src + tile_width]);
         }
     }
-    Some((width, height, out))
+    Some((width, height, rgb))
+}
+
+#[cfg(test)]
+fn run_c1_stage123_tiles(
+    frame: &c1_raw_he::NikonHeCropFrame,
+    wb: [f32; 3],
+    black: u32,
+) -> Option<(usize, usize, Vec<u16>)> {
+    let (w, h, rgb) = run_c1_stage123_tiles_f32(frame, wb, black, [12.8, 0.0])?;
+    Some((w, h, pack_rgba16(&rgb)))
 }
 
 /// LibRaw stores sensor frames already turned by EXIF orientation. The C1 HE

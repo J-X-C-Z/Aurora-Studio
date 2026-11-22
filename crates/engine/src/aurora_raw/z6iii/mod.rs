@@ -6,6 +6,9 @@ mod reconstruct;
 mod render;
 
 pub use color::Z6iiiColorStage;
+pub(in crate::aurora_raw) use render::{
+    apply_linear_chromatic_aberration, apply_linear_color_noise_2012, apply_linear_luma_noise_2018,
+};
 
 use anyhow::{Context, Result, ensure};
 use std::io::{Seek, Write};
@@ -54,15 +57,17 @@ pub fn render(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Frame> {
 }
 
 /// Reconstructs linear camera-space RGBA16 via the Z6III OpenCL pipeline
-/// (demosaic + highlight recovery + anti-alias) when an OpenCL GPU is available.
+/// (demosaic + linear CA + highlight recovery + anti-alias + linear LumaNoise/ColorNoise2012
+/// + BandingSuppression) when an OpenCL GPU is available.
 pub(in crate::aurora_raw) fn render_linear_rgba16(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
+    ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
 ) -> Option<(usize, usize, Vec<u16>)> {
     if !reconstruct::is_z6iii_nef(nef) || !reconstruct::gpu_available() {
         return None;
     }
-    match render::linear_rgba16(nef, bayer) {
+    match render::linear_rgba16(nef, bayer, ca_warp) {
         Ok(frame) => Some(frame),
         Err(error) => {
             log::warn!("Z6III OpenCL linear decode fell back to CPU C1 chain: {error:#}");
