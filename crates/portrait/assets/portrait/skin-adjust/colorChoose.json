@@ -1,0 +1,65 @@
+[
+  {
+    "name": "无",
+    "id": 0,
+    "value": 0,
+    "defaultDegree": 0,
+    "iconPath": "skin_icon_disable"
+  },
+  {
+    "name": "01",
+    "id": 1,
+    "value": 1,
+    "iconColor": "#ffffff",
+    "defaultDegree": 60
+  },
+  {
+    "name": "02",
+    "id": 2,
+    "value": 2,
+    "iconColor": "#ecd8da",
+    "defaultDegree": 60
+  },
+  {
+    "name": "03",
+    "id": 3,
+    "value": 3,
+    "iconColor": "#eaf6fb",
+    "defaultDegree": 60
+  },
+  {
+    "name": "04",
+    "id": 4,
+    "value": 4,
+    "iconColor": "#f2e3ce",
+    "defaultDegree": 60
+  },
+  {
+    "name": "06",
+    "id": 6,
+    "value": 6,
+    "iconColor": "#ab8077",
+    "defaultDegree": 50
+  },
+  {
+    "name": "05",
+    "id": 5,
+    "value": 5,
+    "iconColor": "#ae8068",
+    "defaultDegree": 50
+  },
+  {
+    "name": "07",
+    "id": 7,
+    "value": 7,
+    "iconColor": "#6e544d",
+    "defaultDegree": 70
+  },
+  {
+    "name": "08",
+    "id": 8,
+    "value": 8,
+    "iconColor": "#6d463a",
+    "defaultDegree": 50
+  }
+]

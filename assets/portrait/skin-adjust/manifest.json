@@ -1,0 +1,62 @@
+{
+  "schema": "aurora-local-skin-lut-assets/1",
+  "family": "SkinAdjust",
+  "atlas_width": 512,
+  "atlas_height": 512,
+  "decoded_format": "RGB8 encoded values; alpha discarded without premultiplication",
+  "assets": [
+    {
+      "pf": 90005,
+      "file": "whiten.png",
+      "bytes": 100044,
+      "config_field": "WhitenPath",
+      "sha256": "5E2E75A81860A00A9E7EC4AE19898B4AB80B3C5ACCA919F0B4E0BB632F3D721D"
+    },
+    {
+      "pf": 90007,
+      "file": "ruddy_new.png",
+      "bytes": 97292,
+      "config_field": "RuddyPath",
+      "sha256": "F14309BF68B828D5405A8120AD73A9DA704E4EB2C66ED696E915E0705B91C91E"
+    },
+    {
+      "pf": 21015,
+      "file": "TintGreen.png",
+      "bytes": 173386,
+      "config_field": "TintGreen",
+      "sha256": "5CA78DAEC8809F7D4A1867728E9DAAD05E86AAC0D53206CF1CC7C06DB9CBDEDF"
+    },
+    {
+      "pf": 21015,
+      "file": "TintMagenta.png",
+      "bytes": 172007,
+      "config_field": "TintMagenta",
+      "sha256": "258C3FFE83F3E3065A9402E85DD5FBB86E846686E73FE0FED44BF03605A549E0"
+    },
+    {
+      "pf": 30096,
+      "file": "cold.png",
+      "bytes": 123586,
+      "config_field": "TempColdPath",
+      "sha256": "72CB2465E8FB1B7B902AB78922A73B9DF92D4032F4523EDEC852CD6C2D03ECD5"
+    },
+    {
+      "pf": 30096,
+      "file": "warm.png",
+      "bytes": 119136,
+      "config_field": "TempWarmPath",
+      "sha256": "1DD3CD3C226BCA186732BA79DBE3E1A94EB1B4C2A9BCF3DDDBA9D5280D26063D"
+    }
+  ],
+  "color_choose": {
+    "file": "colorChoose.json",
+    "bytes": 1047,
+    "sha256": "2F6E5319C617AE12045C84F9D11003838AEA614346EC1CC1C825A90BCDC308F2"
+  },
+  "skin_choices": {
+    "file": "skin-chooses.json",
+    "bytes": 3564,
+    "entries": 9,
+    "sha256": "CCA4CACC3460D05AA12EF14ED2EE6ED838353783DDC1B63E275B0D7784B13B63"
+  }
+}

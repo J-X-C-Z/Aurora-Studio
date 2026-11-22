@@ -1,0 +1,34 @@
+name: 功能建议
+description: 提议新的用户能力或工程改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 描述使用场景和当前限制。
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 期望行为
+      description: 给出可观察的验收结果。
+    validations:
+      required: true
+
+  - type: textarea
+    id: quality
+    attributes:
+      label: 画质与数据约束
+      description: 是否涉及预览分辨率、像素质量、原图保护、GPU/CPU 或比例。
+
+  - type: checkboxes
+    id: data
+    attributes:
+      label: 数据边界
+      options:
+        - label: 方案不要求上传个人照片、私有测试资产或第三方受限模型
+          required: true

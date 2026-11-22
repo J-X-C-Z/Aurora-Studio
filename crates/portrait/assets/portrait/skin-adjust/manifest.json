@@ -1,0 +1,41 @@
+{
+  "subset": "WhitenPath and RuddyPath only",
+  "assets": [
+    {
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\SkinAdjust\\whiten.png",
+      "pf": 90005,
+      "file": "whiten.png",
+      "bytes": 100044,
+      "config_field": "WhitenPath",
+      "sha256": "5E2E75A81860A00A9E7EC4AE19898B4AB80B3C5ACCA919F0B4E0BB632F3D721D"
+    },
+    {
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\SkinAdjust\\ruddy_new.png",
+      "pf": 90007,
+      "file": "ruddy_new.png",
+      "bytes": 97292,
+      "config_field": "RuddyPath",
+      "sha256": "F14309BF68B828D5405A8120AD73A9DA704E4EB2C66ED696E915E0705B91C91E"
+    }
+  ],
+  "source_effect_config": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\SkinAdjust\\effect.json",
+  "family": "SkinAdjust_PixCook",
+  "atlas_height": 512,
+  "decoded_format": "RGB8 encoded values; alpha discarded without premultiplication",
+  "schema": "aurora-local-skin-lut-assets/1",
+  "source_config_sha256": "6BF5FCA258CB98CB1514E1336EF5993B38C5AAA1424CB9D8FA3CED6CA8B7D062",
+  "atlas_width": 512,
+  "color_choose": {
+    "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\SkinAdjust\\colorChoose.json",
+    "bytes": 1047,
+    "sha256": "2F6E5319C617AE12045C84F9D11003838AEA614346EC1CC1C825A90BCDC308F2",
+    "file": "colorChoose.json"
+  },
+  "skin_choices": {
+    "entries": 9,
+    "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config\\SkinAdjust\\effect.json",
+    "note": "verbatim SkinChooses subset of the decrypted effect config",
+    "sha256": "CCA4CACC3460D05AA12EF14ED2EE6ED838353783DDC1B63E275B0D7784B13B63",
+    "file": "skin-chooses.json"
+  }
+}

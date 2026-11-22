@@ -1,0 +1,1 @@
+{"status":"PASS","device":"NVIDIA GeForce RTX 4070 Ti","compute_cap":"8.9","driver":13030,"ptx_isa":"9.3","kernel":"teeth_whiten_bright_kernel","grid":"32x32","block":"16x16","canvas":"512x512","pixels":262144,"gpu_seconds_cold":0.0009,"gpu_ms_median":0.739,"cpu_ms":63.906,"differing_bytes":0,"alpha_mismatch_pixels":0,"allocations":5}

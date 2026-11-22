@@ -1,0 +1,8 @@
+{
+  "name": "gate_zero_support",
+  "width": 8,
+  "height": 6,
+  "degree": 1,
+  "roi": {"x": 1, "y": 1, "width": 6, "height": 4},
+  "notes": "zero-support pixels inside ROI with huge displacement; must stay source"
+}

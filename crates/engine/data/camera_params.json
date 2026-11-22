@@ -1,0 +1,5323 @@
+{
+  "source": {
+    "c1_version": "16.8.6.3784",
+    "dll_sha256": "CA02B6AC2786E9A100F63221DF7340E5DF210416EB0BD53A4BB1BFC2306A44A4",
+    "snapshot_date": "2026-11-22"
+  },
+  "cameras": {
+    "CanonEOS5DMk4": {
+      "brand": "Canon",
+      "image_rep_class": "CCanon5DMk4ImageRep",
+      "vtable_rva": "0x29CB4C8",
+      "model_id": "0x10000053",
+      "mount": "Canon EF",
+      "pixel_pitch_um": 5.36,
+      "iso_norm": {
+        "min": 50,
+        "max": 102400,
+        "op": "identity",
+        "value": 1.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "CR2",
+        "sRAW",
+        "mRAW"
+      ],
+      "noise": {
+        "source": "coreConfig",
+        "table_rva": null,
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.087109,
+            "poisson": 0.009773
+          },
+          {
+            "iso": 100,
+            "floor": 0.087109,
+            "poisson": 0.009773
+          },
+          {
+            "iso": 125,
+            "floor": 0.087743,
+            "poisson": 0.009808
+          },
+          {
+            "iso": 160,
+            "floor": 0.060949,
+            "poisson": 0.008916
+          },
+          {
+            "iso": 200,
+            "floor": 0.04881,
+            "poisson": 0.008959
+          },
+          {
+            "iso": 320,
+            "floor": 0.030159,
+            "poisson": 0.008859
+          },
+          {
+            "iso": 400,
+            "floor": 0.030159,
+            "poisson": 0.008859
+          },
+          {
+            "iso": 640,
+            "floor": 0.02533,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 800,
+            "floor": 0.02533,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 1250,
+            "floor": 0.020635,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 1600,
+            "floor": 0.020635,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 2500,
+            "floor": 0.017505,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 3200,
+            "floor": 0.017505,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 5000,
+            "floor": 0.015092,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 6400,
+            "floor": 0.015092,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 12800,
+            "floor": 0.015092,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 25600,
+            "floor": 0.015092,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 51200,
+            "floor": 0.015092,
+            "poisson": 0.008517
+          },
+          {
+            "iso": 102400,
+            "floor": 0.015092,
+            "poisson": 0.008517
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "CanonEOS5DMk4-ProStandard.icm",
+      "curve": "CanonEOS5DMk4-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.12,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "A",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "B",
+        "switches": "A"
+      },
+      "notes": "0x2E8=0.5/1.0/2.0 增益选择，非 ISO 归一；0x4B0 为 identity 3x3，颜色在 ICC；0x5B8=sRAW 检查；pixel pitch 为 DLL 常量 槽语义补充：0x4E8=as-shot WB 三通道 double 乘数(首值1.0)；0x4F0=按色温2500-10000K/500K的WB中性表(16x4 double，首值1.03516)；0xC0=白电平(读16bit字左移后减黑，回退65535)；0x278=黑电平tag读取；0x1F0=MakerNote tag 0x4001 枚举(非电平)；0x730=RAW数据块到uint16缓冲的拷贝/解包，非MakerNote。"
+    },
+    "CanonEOSR1": {
+      "brand": "Canon",
+      "image_rep_class": "CCanonEOSR1ImageRep",
+      "vtable_rva": "0x29CCA60",
+      "model_id": "0x10000077",
+      "mount": "Canon RF",
+      "pixel_pitch_um": 6.0,
+      "iso_norm": {
+        "min": 50,
+        "max": 409600,
+        "op": "identity",
+        "value": 1.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "CR3",
+        "CRAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1B925E0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.109525,
+            "poisson": 0.013876
+          },
+          {
+            "iso": 100,
+            "floor": 0.061675,
+            "poisson": 0.006777
+          },
+          {
+            "iso": 125,
+            "floor": 0.072783,
+            "poisson": 0.006877
+          },
+          {
+            "iso": 160,
+            "floor": 0.07884,
+            "poisson": 0.006732
+          },
+          {
+            "iso": 200,
+            "floor": 0.030403,
+            "poisson": 0.006268
+          },
+          {
+            "iso": 250,
+            "floor": 0.036602,
+            "poisson": 0.006336
+          },
+          {
+            "iso": 320,
+            "floor": 0.039449,
+            "poisson": 0.006231
+          },
+          {
+            "iso": 400,
+            "floor": 0.036131,
+            "poisson": 0.006304
+          },
+          {
+            "iso": 500,
+            "floor": 0.038268,
+            "poisson": 0.006322
+          },
+          {
+            "iso": 640,
+            "floor": 0.039101,
+            "poisson": 0.006162
+          },
+          {
+            "iso": 800,
+            "floor": 0.036018,
+            "poisson": 0.006158
+          },
+          {
+            "iso": 1000,
+            "floor": 0.036842,
+            "poisson": 0.006172
+          },
+          {
+            "iso": 1250,
+            "floor": 0.037459,
+            "poisson": 0.00615
+          },
+          {
+            "iso": 1600,
+            "floor": 0.012443,
+            "poisson": 0.005983
+          },
+          {
+            "iso": 2000,
+            "floor": 0.013088,
+            "poisson": 0.006
+          },
+          {
+            "iso": 2500,
+            "floor": 0.013466,
+            "poisson": 0.006015
+          },
+          {
+            "iso": 3200,
+            "floor": 0.012215,
+            "poisson": 0.005958
+          },
+          {
+            "iso": 4000,
+            "floor": 0.012422,
+            "poisson": 0.005981
+          },
+          {
+            "iso": 5000,
+            "floor": 0.012472,
+            "poisson": 0.005962
+          },
+          {
+            "iso": 6400,
+            "floor": 0.011673,
+            "poisson": 0.005809
+          },
+          {
+            "iso": 8000,
+            "floor": 0.011808,
+            "poisson": 0.005832
+          },
+          {
+            "iso": 10000,
+            "floor": 0.011828,
+            "poisson": 0.005848
+          },
+          {
+            "iso": 12800,
+            "floor": 0.010625,
+            "poisson": 0.005577
+          },
+          {
+            "iso": 16000,
+            "floor": 0.010773,
+            "poisson": 0.005603
+          },
+          {
+            "iso": 20000,
+            "floor": 0.010797,
+            "poisson": 0.005643
+          },
+          {
+            "iso": 25600,
+            "floor": 0.010676,
+            "poisson": 0.00557
+          },
+          {
+            "iso": 32000,
+            "floor": 0.010748,
+            "poisson": 0.005598
+          },
+          {
+            "iso": 40000,
+            "floor": 0.010834,
+            "poisson": 0.005616
+          },
+          {
+            "iso": 51200,
+            "floor": 0.010672,
+            "poisson": 0.005508
+          },
+          {
+            "iso": 64000,
+            "floor": 0.010698,
+            "poisson": 0.00553
+          },
+          {
+            "iso": 80000,
+            "floor": 0.010678,
+            "poisson": 0.005516
+          },
+          {
+            "iso": 102400,
+            "floor": 0.010353,
+            "poisson": 0.005317
+          },
+          {
+            "iso": 204800,
+            "floor": 0.005853,
+            "poisson": 0.002989
+          },
+          {
+            "iso": 409600,
+            "floor": 0.004892,
+            "poisson": 0.003076
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "CanonEOSR1-ProStandard.icm",
+      "curve": "CanonEOSR1-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.1,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "C",
+        "noise": "A",
+        "ccm": "A",
+        "defaults": "B",
+        "switches": "A"
+      },
+      "notes": "0x2E8=0.5/1.0/2.0 增益选择，非 ISO 归一；0x4B0 为 identity 3x3，颜色在 ICC；0x5B8=false；pixel pitch 由运算法从元数据得出（C，取公开规格） 槽语义补充：0x4E8=as-shot WB 三通道 double 乘数(首值1.0)；0x4F0=按色温2500-10000K/500K的WB中性表(16x4 double，首值1.03516)；0xC0=白电平(读16bit字左移后减黑，回退65535)；0x278=黑电平tag读取；0x1F0=MakerNote tag 0x4001 枚举(非电平)；0x730=RAW数据块到uint16缓冲的拷贝/解包，非MakerNote。"
+    },
+    "CanonEOSR3": {
+      "brand": "Canon",
+      "image_rep_class": "CCanonEOSR3ImageRep",
+      "vtable_rva": "0x29C1300",
+      "model_id": "0x1000006D",
+      "mount": "Canon RF",
+      "pixel_pitch_um": 5.99288,
+      "iso_norm": {
+        "min": 50,
+        "max": 204800,
+        "op": "identity",
+        "value": 1.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "CR3",
+        "CRAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1B939E0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.053452,
+            "poisson": 0.014473
+          },
+          {
+            "iso": 100,
+            "floor": 0.024672,
+            "poisson": 0.007579
+          },
+          {
+            "iso": 125,
+            "floor": 0.027392,
+            "poisson": 0.007321
+          },
+          {
+            "iso": 160,
+            "floor": 0.036232,
+            "poisson": 0.006897
+          },
+          {
+            "iso": 200,
+            "floor": 0.035448,
+            "poisson": 0.007121
+          },
+          {
+            "iso": 250,
+            "floor": 0.042535,
+            "poisson": 0.006884
+          },
+          {
+            "iso": 320,
+            "floor": 0.047276,
+            "poisson": 0.006539
+          },
+          {
+            "iso": 400,
+            "floor": 0.017231,
+            "poisson": 0.005854
+          },
+          {
+            "iso": 500,
+            "floor": 0.020771,
+            "poisson": 0.005749
+          },
+          {
+            "iso": 640,
+            "floor": 0.0225,
+            "poisson": 0.005564
+          },
+          {
+            "iso": 800,
+            "floor": 0.021336,
+            "poisson": 0.005598
+          },
+          {
+            "iso": 1000,
+            "floor": 0.022533,
+            "poisson": 0.005501
+          },
+          {
+            "iso": 1250,
+            "floor": 0.008348,
+            "poisson": 0.005271
+          },
+          {
+            "iso": 1600,
+            "floor": 0.009011,
+            "poisson": 0.00522
+          },
+          {
+            "iso": 2000,
+            "floor": 0.009647,
+            "poisson": 0.005191
+          },
+          {
+            "iso": 2500,
+            "floor": 0.010122,
+            "poisson": 0.005171
+          },
+          {
+            "iso": 3200,
+            "floor": 0.009409,
+            "poisson": 0.005113
+          },
+          {
+            "iso": 4000,
+            "floor": 0.009666,
+            "poisson": 0.005101
+          },
+          {
+            "iso": 5000,
+            "floor": 0.00987,
+            "poisson": 0.00507
+          },
+          {
+            "iso": 6400,
+            "floor": 0.009483,
+            "poisson": 0.005052
+          },
+          {
+            "iso": 8000,
+            "floor": 0.009577,
+            "poisson": 0.005098
+          },
+          {
+            "iso": 10000,
+            "floor": 0.009641,
+            "poisson": 0.005085
+          },
+          {
+            "iso": 12800,
+            "floor": 0.008893,
+            "poisson": 0.004835
+          },
+          {
+            "iso": 16000,
+            "floor": 0.008997,
+            "poisson": 0.004826
+          },
+          {
+            "iso": 20000,
+            "floor": 0.009043,
+            "poisson": 0.004808
+          },
+          {
+            "iso": 25600,
+            "floor": 0.009036,
+            "poisson": 0.004682
+          },
+          {
+            "iso": 32000,
+            "floor": 0.009105,
+            "poisson": 0.004677
+          },
+          {
+            "iso": 40000,
+            "floor": 0.00915,
+            "poisson": 0.004654
+          },
+          {
+            "iso": 51200,
+            "floor": 0.008979,
+            "poisson": 0.004521
+          },
+          {
+            "iso": 64000,
+            "floor": 0.009027,
+            "poisson": 0.004535
+          },
+          {
+            "iso": 80000,
+            "floor": 0.009019,
+            "poisson": 0.004534
+          },
+          {
+            "iso": 102400,
+            "floor": 0.008776,
+            "poisson": 0.004432
+          },
+          {
+            "iso": 204800,
+            "floor": 0.005149,
+            "poisson": 0.002362
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "CanonEOSR3-ProStandard.icm",
+      "curve": "CanonEOSR3-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.07,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "A",
+        "noise": "A",
+        "ccm": "A",
+        "defaults": "B",
+        "switches": "A"
+      },
+      "notes": "0x2E8=0.5/1.0/2.0 增益选择，非 ISO 归一；0x4B0 为 identity 3x3，颜色在 ICC；0x5B8=false；pixel pitch 为 DLL 常量 槽语义补充：0x4E8=as-shot WB 三通道 double 乘数(首值1.0)；0x4F0=按色温2500-10000K/500K的WB中性表(16x4 double，首值1.03516)；0xC0=白电平(读16bit字左移后减黑，回退65535)；0x278=黑电平tag读取；0x1F0=MakerNote tag 0x4001 枚举(非电平)；0x730=RAW数据块到uint16缓冲的拷贝/解包，非MakerNote。"
+    },
+    "CanonEOSR5": {
+      "brand": "Canon",
+      "image_rep_class": "CCanonEOSR5ImageRep",
+      "vtable_rva": "0x29B6630",
+      "model_id": "0x10000069",
+      "mount": "Canon RF",
+      "pixel_pitch_um": 4.4,
+      "iso_norm": {
+        "min": 50,
+        "max": 102400,
+        "op": "identity",
+        "value": 1.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "CR3",
+        "CRAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1B944E0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.009132,
+            "poisson": 0.044141
+          },
+          {
+            "iso": 100,
+            "floor": 0.006561,
+            "poisson": 0.022298
+          },
+          {
+            "iso": 125,
+            "floor": 0.0005,
+            "poisson": 0.021149
+          },
+          {
+            "iso": 160,
+            "floor": 0.040142,
+            "poisson": 0.019544
+          },
+          {
+            "iso": 200,
+            "floor": 0.043728,
+            "poisson": 0.019196
+          },
+          {
+            "iso": 250,
+            "floor": 0.052438,
+            "poisson": 0.018173
+          },
+          {
+            "iso": 320,
+            "floor": 0.055579,
+            "poisson": 0.016831
+          },
+          {
+            "iso": 400,
+            "floor": 0.001932,
+            "poisson": 0.012678
+          },
+          {
+            "iso": 500,
+            "floor": 0.003351,
+            "poisson": 0.012477
+          },
+          {
+            "iso": 640,
+            "floor": 0.012265,
+            "poisson": 0.012029
+          },
+          {
+            "iso": 800,
+            "floor": 0.019325,
+            "poisson": 0.012402
+          },
+          {
+            "iso": 1000,
+            "floor": 0.021122,
+            "poisson": 0.012264
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0221,
+            "poisson": 0.012184
+          },
+          {
+            "iso": 1600,
+            "floor": 0.019846,
+            "poisson": 0.011704
+          },
+          {
+            "iso": 2000,
+            "floor": 0.020428,
+            "poisson": 0.011614
+          },
+          {
+            "iso": 2500,
+            "floor": 0.020715,
+            "poisson": 0.011559
+          },
+          {
+            "iso": 3200,
+            "floor": 0.019208,
+            "poisson": 0.011325
+          },
+          {
+            "iso": 4000,
+            "floor": 0.019463,
+            "poisson": 0.011315
+          },
+          {
+            "iso": 5000,
+            "floor": 0.019677,
+            "poisson": 0.011271
+          },
+          {
+            "iso": 6400,
+            "floor": 0.018483,
+            "poisson": 0.011011
+          },
+          {
+            "iso": 8000,
+            "floor": 0.01854,
+            "poisson": 0.011026
+          },
+          {
+            "iso": 10000,
+            "floor": 0.018636,
+            "poisson": 0.011058
+          },
+          {
+            "iso": 12800,
+            "floor": 0.018513,
+            "poisson": 0.010941
+          },
+          {
+            "iso": 16000,
+            "floor": 0.01866,
+            "poisson": 0.011053
+          },
+          {
+            "iso": 20000,
+            "floor": 0.018719,
+            "poisson": 0.011011
+          },
+          {
+            "iso": 25600,
+            "floor": 0.018553,
+            "poisson": 0.01095
+          },
+          {
+            "iso": 32000,
+            "floor": 0.018514,
+            "poisson": 0.010893
+          },
+          {
+            "iso": 40000,
+            "floor": 0.018429,
+            "poisson": 0.010714
+          },
+          {
+            "iso": 51200,
+            "floor": 0.017861,
+            "poisson": 0.010277
+          },
+          {
+            "iso": 102400,
+            "floor": 0.014612,
+            "poisson": 0.009357
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "CanonEOSR5-ProStandard.icm",
+      "curve": "CanonEOSR5-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.07,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "A",
+        "noise": "A",
+        "ccm": "A",
+        "defaults": "B",
+        "switches": "A"
+      },
+      "notes": "0x2E8=0.5/1.0/2.0 增益选择，非 ISO 归一；0x4B0 为 identity 3x3，颜色在 ICC；0x5B8=false；pixel pitch 为 DLL 常量 槽语义补充：0x4E8=as-shot WB 三通道 double 乘数(首值1.0)；0x4F0=按色温2500-10000K/500K的WB中性表(16x4 double，首值1.03516)；0xC0=白电平(读16bit字左移后减黑，回退65535)；0x278=黑电平tag读取；0x1F0=MakerNote tag 0x4001 枚举(非电平)；0x730=RAW数据块到uint16缓冲的拷贝/解包，非MakerNote。"
+    },
+    "CanonEOSR5Mk2": {
+      "brand": "Canon",
+      "image_rep_class": "CCanonEOSR5Mk2ImageRep",
+      "vtable_rva": "0x29C6930",
+      "model_id": "0x10000076",
+      "mount": "Canon RF",
+      "pixel_pitch_um": 4.39,
+      "iso_norm": {
+        "min": 50,
+        "max": 102400,
+        "op": "identity",
+        "value": 1.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "CR3",
+        "CRAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1B955B0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.04884,
+            "poisson": 0.025587
+          },
+          {
+            "iso": 100,
+            "floor": 0.029018,
+            "poisson": 0.013213
+          },
+          {
+            "iso": 125,
+            "floor": 0.049012,
+            "poisson": 0.0125
+          },
+          {
+            "iso": 160,
+            "floor": 0.057709,
+            "poisson": 0.012345
+          },
+          {
+            "iso": 200,
+            "floor": 0.050508,
+            "poisson": 0.012442
+          },
+          {
+            "iso": 250,
+            "floor": 0.055815,
+            "poisson": 0.012506
+          },
+          {
+            "iso": 320,
+            "floor": 0.05817,
+            "poisson": 0.012274
+          },
+          {
+            "iso": 400,
+            "floor": 0.054175,
+            "poisson": 0.012576
+          },
+          {
+            "iso": 500,
+            "floor": 0.017122,
+            "poisson": 0.011804
+          },
+          {
+            "iso": 640,
+            "floor": 0.019014,
+            "poisson": 0.011642
+          },
+          {
+            "iso": 800,
+            "floor": 0.017932,
+            "poisson": 0.011775
+          },
+          {
+            "iso": 1000,
+            "floor": 0.019694,
+            "poisson": 0.01161
+          },
+          {
+            "iso": 1250,
+            "floor": 0.02066,
+            "poisson": 0.01166
+          },
+          {
+            "iso": 1600,
+            "floor": 0.019426,
+            "poisson": 0.011334
+          },
+          {
+            "iso": 2000,
+            "floor": 0.019907,
+            "poisson": 0.011385
+          },
+          {
+            "iso": 2500,
+            "floor": 0.020228,
+            "poisson": 0.01143
+          },
+          {
+            "iso": 3200,
+            "floor": 0.020222,
+            "poisson": 0.011288
+          },
+          {
+            "iso": 4000,
+            "floor": 0.020428,
+            "poisson": 0.011346
+          },
+          {
+            "iso": 5000,
+            "floor": 0.02069,
+            "poisson": 0.01136
+          },
+          {
+            "iso": 6400,
+            "floor": 0.019624,
+            "poisson": 0.011189
+          },
+          {
+            "iso": 8000,
+            "floor": 0.019841,
+            "poisson": 0.011235
+          },
+          {
+            "iso": 10000,
+            "floor": 0.019807,
+            "poisson": 0.011266
+          },
+          {
+            "iso": 12800,
+            "floor": 0.019694,
+            "poisson": 0.011125
+          },
+          {
+            "iso": 16000,
+            "floor": 0.019839,
+            "poisson": 0.011211
+          },
+          {
+            "iso": 20000,
+            "floor": 0.019896,
+            "poisson": 0.011159
+          },
+          {
+            "iso": 25600,
+            "floor": 0.019646,
+            "poisson": 0.011014
+          },
+          {
+            "iso": 32000,
+            "floor": 0.019645,
+            "poisson": 0.010829
+          },
+          {
+            "iso": 40000,
+            "floor": 0.019399,
+            "poisson": 0.010551
+          },
+          {
+            "iso": 51200,
+            "floor": 0.018518,
+            "poisson": 0.009941
+          },
+          {
+            "iso": 102400,
+            "floor": 0.015303,
+            "poisson": 0.00897
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "CanonEOSR5Mk2-ProStandard.icm",
+      "curve": "CanonEOSR5Mk2-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.2,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "C",
+        "noise": "A",
+        "ccm": "A",
+        "defaults": "B",
+        "switches": "A"
+      },
+      "notes": "0x2E8=0.5/1.0/2.0 增益选择，非 ISO 归一；0x4B0 为 identity 3x3，颜色在 ICC；0x5B8=false；pixel pitch 由运算法从元数据得出（C，取公开规格） 槽语义补充：0x4E8=as-shot WB 三通道 double 乘数(首值1.0)；0x4F0=按色温2500-10000K/500K的WB中性表(16x4 double，首值1.03516)；0xC0=白电平(读16bit字左移后减黑，回退65535)；0x278=黑电平tag读取；0x1F0=MakerNote tag 0x4001 枚举(非电平)；0x730=RAW数据块到uint16缓冲的拷贝/解包，非MakerNote。"
+    },
+    "CanonEOSR6Mk2": {
+      "brand": "Canon",
+      "image_rep_class": "CCanonEOSR6Mk2ImageRep",
+      "vtable_rva": "0x29B45D8",
+      "model_id": "0x10000073",
+      "mount": "Canon RF",
+      "pixel_pitch_um": 6.0,
+      "iso_norm": {
+        "min": 50,
+        "max": 204800,
+        "op": "identity",
+        "value": 1.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "CR3",
+        "CRAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1B965C0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.062328,
+            "poisson": 0.013002
+          },
+          {
+            "iso": 100,
+            "floor": 0.030599,
+            "poisson": 0.006423
+          },
+          {
+            "iso": 125,
+            "floor": 0.035385,
+            "poisson": 0.007087
+          },
+          {
+            "iso": 160,
+            "floor": 0.041807,
+            "poisson": 0.006843
+          },
+          {
+            "iso": 200,
+            "floor": 0.021025,
+            "poisson": 0.006641
+          },
+          {
+            "iso": 250,
+            "floor": 0.02839,
+            "poisson": 0.006815
+          },
+          {
+            "iso": 320,
+            "floor": 0.032478,
+            "poisson": 0.006728
+          },
+          {
+            "iso": 400,
+            "floor": 0.006314,
+            "poisson": 0.00591
+          },
+          {
+            "iso": 500,
+            "floor": 0.009765,
+            "poisson": 0.006567
+          },
+          {
+            "iso": 640,
+            "floor": 0.012115,
+            "poisson": 0.006596
+          },
+          {
+            "iso": 800,
+            "floor": 0.007445,
+            "poisson": 0.006629
+          },
+          {
+            "iso": 1000,
+            "floor": 0.009327,
+            "poisson": 0.006672
+          },
+          {
+            "iso": 1250,
+            "floor": 0.010469,
+            "poisson": 0.00668
+          },
+          {
+            "iso": 1600,
+            "floor": 0.008263,
+            "poisson": 0.006586
+          },
+          {
+            "iso": 2000,
+            "floor": 0.00911,
+            "poisson": 0.006614
+          },
+          {
+            "iso": 2500,
+            "floor": 0.009675,
+            "poisson": 0.00661
+          },
+          {
+            "iso": 3200,
+            "floor": 0.008082,
+            "poisson": 0.006505
+          },
+          {
+            "iso": 4000,
+            "floor": 0.008369,
+            "poisson": 0.006535
+          },
+          {
+            "iso": 5000,
+            "floor": 0.00851,
+            "poisson": 0.006538
+          },
+          {
+            "iso": 6400,
+            "floor": 0.007204,
+            "poisson": 0.006468
+          },
+          {
+            "iso": 8000,
+            "floor": 0.007302,
+            "poisson": 0.006511
+          },
+          {
+            "iso": 10000,
+            "floor": 0.007335,
+            "poisson": 0.006532
+          },
+          {
+            "iso": 12800,
+            "floor": 0.007256,
+            "poisson": 0.006457
+          },
+          {
+            "iso": 16000,
+            "floor": 0.007304,
+            "poisson": 0.006507
+          },
+          {
+            "iso": 20000,
+            "floor": 0.007382,
+            "poisson": 0.006549
+          },
+          {
+            "iso": 25600,
+            "floor": 0.007264,
+            "poisson": 0.006485
+          },
+          {
+            "iso": 32000,
+            "floor": 0.007308,
+            "poisson": 0.006516
+          },
+          {
+            "iso": 40000,
+            "floor": 0.007405,
+            "poisson": 0.006548
+          },
+          {
+            "iso": 51200,
+            "floor": 0.007348,
+            "poisson": 0.006469
+          },
+          {
+            "iso": 64000,
+            "floor": 0.007381,
+            "poisson": 0.006479
+          },
+          {
+            "iso": 80000,
+            "floor": 0.007432,
+            "poisson": 0.006451
+          },
+          {
+            "iso": 102400,
+            "floor": 0.007354,
+            "poisson": 0.006287
+          },
+          {
+            "iso": 204800,
+            "floor": 0.004793,
+            "poisson": 0.002873
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "CanonEOSR6Mk2-ProStandard.icm",
+      "curve": "CanonEOSR6Mk2-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.07,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "A",
+        "noise": "A",
+        "ccm": "A",
+        "defaults": "B",
+        "switches": "A"
+      },
+      "notes": "0x2E8=0.5/1.0/2.0 增益选择，非 ISO 归一；0x4B0 为 identity 3x3，颜色在 ICC；0x5B8=false；pixel pitch 为 DLL 常量 槽语义补充：0x4E8=as-shot WB 三通道 double 乘数(首值1.0)；0x4F0=按色温2500-10000K/500K的WB中性表(16x4 double，首值1.03516)；0xC0=白电平(读16bit字左移后减黑，回退65535)；0x278=黑电平tag读取；0x1F0=MakerNote tag 0x4001 枚举(非电平)；0x730=RAW数据块到uint16缓冲的拷贝/解包，非MakerNote。"
+    },
+    "NikonD6": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonD6ImageRep",
+      "vtable_rva": "0x28C4860",
+      "model_id": "0x3000004D",
+      "mount": "Nikon F",
+      "pixel_pitch_um": 6.45,
+      "iso_norm": {
+        "min": 50,
+        "max": 80,
+        "op": "piecewise_2pow_ev",
+        "value": null,
+        "points": [
+          {
+            "iso_max": 50,
+            "ev": -1.0
+          },
+          {
+            "iso_max": 64,
+            "ev": -0.7
+          },
+          {
+            "iso_max": 72,
+            "ev": -0.5
+          },
+          {
+            "iso_max": 80,
+            "ev": -0.3
+          }
+        ]
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.4882368,
+            "poisson": 0.0117693
+          },
+          {
+            "iso": 63,
+            "floor": 0.3862475,
+            "poisson": 0.0094429
+          },
+          {
+            "iso": 79,
+            "floor": 0.3067663,
+            "poisson": 0.0075458
+          },
+          {
+            "iso": 100,
+            "floor": 0.2436434,
+            "poisson": 0.0060147
+          },
+          {
+            "iso": 200,
+            "floor": 0.125084,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.126858,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.1242539,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.070795,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0717997,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.046652,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0466632,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0248554,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0244245,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0145844,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0142888,
+            "poisson": null
+          },
+          {
+            "iso": 4000,
+            "floor": 0.014094,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0095237,
+            "poisson": null
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0096543,
+            "poisson": null
+          },
+          {
+            "iso": 10000,
+            "floor": 0.00777,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0074761,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0071717,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.007383,
+            "poisson": null
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0072462,
+            "poisson": null
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0074197,
+            "poisson": null
+          },
+          {
+            "iso": 81200,
+            "floor": 0.0073005,
+            "poisson": null
+          },
+          {
+            "iso": 162550,
+            "floor": 0.0070276,
+            "poisson": null
+          },
+          {
+            "iso": 204800,
+            "floor": 0.0067808,
+            "poisson": 0.0057226
+          },
+          {
+            "iso": 409600,
+            "floor": 0.0062219,
+            "poisson": null
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonD6-Generic.icm",
+      "curve": "NikonD6-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 160.0,
+        "usm_radius": 1.0,
+        "usm_threshold": 1.0,
+        "aca": null,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.09
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "B"
+      },
+      "notes": "iso_norm 0x2E8 是低 ISO 扩展的 EV 补偿，不是线性归一化 ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=false；0x5D0=+0xa60∈{3,4,6,10}；0x4F0=14组色温标定(非噪声)；0x2E8=2^EV(≤50:0.5,51-64:0.61557,65-72:0.70711,73-80:0.81225,>80:1) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonD850": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonD850ImageRep",
+      "vtable_rva": "0x28A7AD0",
+      "model_id": "0x30000045",
+      "mount": "Nikon F",
+      "pixel_pitch_um": 4.35,
+      "iso_norm": {
+        "min": 1,
+        "max": 63,
+        "op": "multiply",
+        "value": 0.015625
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.08693,
+            "poisson": 0.01823
+          },
+          {
+            "iso": 32,
+            "floor": 0.08693,
+            "poisson": null
+          },
+          {
+            "iso": 40,
+            "floor": 0.08478,
+            "poisson": null
+          },
+          {
+            "iso": 50,
+            "floor": 0.08364,
+            "poisson": null
+          },
+          {
+            "iso": 64,
+            "floor": 0.08102,
+            "poisson": null
+          },
+          {
+            "iso": 80,
+            "floor": 0.07798,
+            "poisson": null
+          },
+          {
+            "iso": 100,
+            "floor": 0.07283,
+            "poisson": null
+          },
+          {
+            "iso": 125,
+            "floor": 0.07035,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.06585,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.06317,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.06053,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.05735,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.02491,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.02477,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.02304,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.02206,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.02111,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.02094,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.02298,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0218,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.02131,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.02006,
+            "poisson": null
+          },
+          {
+            "iso": 4000,
+            "floor": 0.02,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.01921,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0184,
+            "poisson": null
+          },
+          {
+            "iso": 8000,
+            "floor": 0.01835,
+            "poisson": null
+          },
+          {
+            "iso": 10000,
+            "floor": 0.01836,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.01817,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": 0.01812,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.01809,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.01776,
+            "poisson": null
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonD850-ProStandard.icm",
+      "curve": "NikonD850-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 120.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "B"
+      },
+      "notes": "ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=false；0x5D0=tag0x93!=8；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ5": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ5ImageRep",
+      "vtable_rva": "0x28A5AC0",
+      "model_id": "0x3000004F",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 5.94,
+      "iso_norm": {
+        "min": null,
+        "max": null,
+        "op": "mode_2pow_ev",
+        "value": null,
+        "points": [
+          {
+            "code": "0x102",
+            "ev": -0.3
+          },
+          {
+            "code": "0x202",
+            "ev": -0.5
+          },
+          {
+            "code": "0x302",
+            "ev": -0.7
+          },
+          {
+            "code": "0x402",
+            "ev": -1.0
+          }
+        ],
+        "note": "0x2E8 reads MakerNote tag 0x25, not ISO"
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M",
+        "RAW lossless compressed",
+        "High efficiency RAW",
+        "High efficiency * RAW"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.0734141,
+            "poisson": 0.0164811
+          },
+          {
+            "iso": 63,
+            "floor": 0.0565565,
+            "poisson": 0.0130625
+          },
+          {
+            "iso": 79,
+            "floor": 0.0509135,
+            "poisson": 0.0102457
+          },
+          {
+            "iso": 100,
+            "floor": 0.0372155,
+            "poisson": 0.0080553
+          },
+          {
+            "iso": 125,
+            "floor": 0.0362645,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.0321572,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.0316912,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.0306555,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.0293187,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0283118,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0263893,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.0251643,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0242307,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0235311,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0230627,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0235667,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0192703,
+            "poisson": 0.008651
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0186711,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0182308,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0174348,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0168214,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0142779,
+            "poisson": 0.0055829
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0140879,
+            "poisson": null
+          },
+          {
+            "iso": 32000,
+            "floor": 0.014241,
+            "poisson": 0.0060927
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0140592,
+            "poisson": null
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ5-Generic.icm",
+      "curve": "NikonZ5-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": null,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "C",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "C"
+      },
+      "notes": "iso_norm 0x2E8 是 MakerNote tag 0x25 的模式 EV，不是 ISO ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声)；0x2E8=tag0x25→2^EV(0x102/202/302/402=-0.3/-0.5/-0.7/-1.0) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ50": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ50ImageRep",
+      "vtable_rva": "0x28A0DF8",
+      "model_id": "0x3000004A",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 4.22,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "divide",
+        "value": 100.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.05735,
+            "poisson": 0.01364
+          },
+          {
+            "iso": 100,
+            "floor": 0.05515,
+            "poisson": null
+          },
+          {
+            "iso": 125,
+            "floor": 0.05331,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.05294,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.05735,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.05636,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.05182,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.03095,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.02654,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0239,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.01857,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.01771,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.01642,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.01553,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.01328,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.01205,
+            "poisson": null
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0114,
+            "poisson": null
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ50-Generic.icm",
+      "curve": "NikonZ50-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "B"
+      },
+      "notes": "ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ6II": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ6IIImageRep",
+      "vtable_rva": "0x289F898",
+      "model_id": "0x30000050",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 5.94,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "divide",
+        "value": 100.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.0962058,
+            "poisson": 0.0144313
+          },
+          {
+            "iso": 63,
+            "floor": 0.0813868,
+            "poisson": 0.0114917
+          },
+          {
+            "iso": 79,
+            "floor": 0.0648887,
+            "poisson": 0.0091453
+          },
+          {
+            "iso": 100,
+            "floor": 0.0525114,
+            "poisson": 0.0072995
+          },
+          {
+            "iso": 125,
+            "floor": 0.0488449,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.046184,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.0436678,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.0428994,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.0396527,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.0387756,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0375186,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0360426,
+            "poisson": 0.0069479
+          },
+          {
+            "iso": 800,
+            "floor": 0.0120021,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0117923,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0113382,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.010757,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0103155,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.009889,
+            "poisson": 0.0073905
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0093721,
+            "poisson": null
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0090379,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0088166,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0085797,
+            "poisson": null
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0084027,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0080428,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0071105,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0072916,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0070833,
+            "poisson": 0.0069814
+          },
+          {
+            "iso": 64508,
+            "floor": 0.0068093,
+            "poisson": null
+          },
+          {
+            "iso": 81275,
+            "floor": 0.0068966,
+            "poisson": null
+          },
+          {
+            "iso": 204800,
+            "floor": 0.00657,
+            "poisson": 0.0065152
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ6II-ProStandard.icm",
+      "curve": "NikonZ6II-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "B"
+      },
+      "notes": "ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ6III": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ6IIIImageRep",
+      "vtable_rva": "0x289EDE8",
+      "model_id": "0x30000057",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 5.94,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "divide",
+        "value": 100.0
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M",
+        "RAW lossless compressed",
+        "High efficiency RAW",
+        "High efficiency * RAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1A752B0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.186008796,
+            "poisson": 0.0104899
+          },
+          {
+            "iso": 64,
+            "floor": 0.149724498,
+            "poisson": 0.0081457
+          },
+          {
+            "iso": 80,
+            "floor": 0.113779299,
+            "poisson": 0.0065412
+          },
+          {
+            "iso": 100,
+            "floor": 0.083435401,
+            "poisson": 0.0055399
+          },
+          {
+            "iso": 125,
+            "floor": 0.079555802,
+            "poisson": 0.0054927
+          },
+          {
+            "iso": 160,
+            "floor": 0.086768299,
+            "poisson": 0.0053869
+          },
+          {
+            "iso": 200,
+            "floor": 0.083004199,
+            "poisson": 0.0053421
+          },
+          {
+            "iso": 250,
+            "floor": 0.0786907,
+            "poisson": 0.0053354
+          },
+          {
+            "iso": 320,
+            "floor": 0.074514799,
+            "poisson": 0.0050889
+          },
+          {
+            "iso": 400,
+            "floor": 0.070302501,
+            "poisson": 0.0051392
+          },
+          {
+            "iso": 500,
+            "floor": 0.067470998,
+            "poisson": 0.0051426
+          },
+          {
+            "iso": 640,
+            "floor": 0.062387399,
+            "poisson": 0.0071112
+          },
+          {
+            "iso": 800,
+            "floor": 0.0147173,
+            "poisson": 0.0073309
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0146324,
+            "poisson": 0.007292
+          },
+          {
+            "iso": 1250,
+            "floor": 0.013939,
+            "poisson": 0.0074411
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0128523,
+            "poisson": 0.0074486
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0124925,
+            "poisson": 0.0074881
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0121481,
+            "poisson": 0.0075674
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0113184,
+            "poisson": 0.0075187
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0109757,
+            "poisson": 0.0076035
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0106261,
+            "poisson": 0.0076644
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0102556,
+            "poisson": 0.0075192
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0101109,
+            "poisson": 0.0075722
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0101602,
+            "poisson": 0.0076455
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0096663,
+            "poisson": 0.0075214
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0086964,
+            "poisson": 0.0076356
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0090433,
+            "poisson": 0.0076915
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0090862,
+            "poisson": 0.0075514
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0092111,
+            "poisson": 0.0076243
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0093683,
+            "poisson": 0.0076854
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0091973,
+            "poisson": 0.0075574
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0093036,
+            "poisson": 0.0076377
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0093614,
+            "poisson": 0.0076918
+          },
+          {
+            "iso": 102400,
+            "floor": 0.0091852,
+            "poisson": 0.007648
+          },
+          {
+            "iso": 128000,
+            "floor": 0.0091896,
+            "poisson": 0.0077587
+          },
+          {
+            "iso": 204800,
+            "floor": 0.0089119,
+            "poisson": 0.0077932
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ6III-ProStandard.icm",
+      "curve": "NikonZ6III-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "B",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "C"
+      },
+      "notes": "noise 表来自 0x310 的 36×16B 连续结构 ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ7II": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ7IIImageRep",
+      "vtable_rva": "0x28C8880",
+      "model_id": "0x30000051",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 4.35,
+      "iso_norm": {
+        "min": 1,
+        "max": 63,
+        "op": "multiply",
+        "value": 0.015625
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.1475028,
+            "poisson": 0.0342098
+          },
+          {
+            "iso": 40,
+            "floor": 0.1237143,
+            "poisson": 0.0263881
+          },
+          {
+            "iso": 50,
+            "floor": 0.1013333,
+            "poisson": 0.0210787
+          },
+          {
+            "iso": 64,
+            "floor": 0.0714779,
+            "poisson": 0.0165594
+          },
+          {
+            "iso": 80,
+            "floor": 0.0688904,
+            "poisson": null
+          },
+          {
+            "iso": 100,
+            "floor": 0.0677528,
+            "poisson": null
+          },
+          {
+            "iso": 125,
+            "floor": 0.065387,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.0628174,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.0598031,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.0569869,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.0535434,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.0239721,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0234884,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0215142,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.0203663,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.019313,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0184351,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0188534,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0179393,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0177334,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0173459,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0165026,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0150665,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.01475,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0151069,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0147459,
+            "poisson": null
+          },
+          {
+            "iso": 32254,
+            "floor": 0.0145728,
+            "poisson": null
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0147806,
+            "poisson": null
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ7II-ProStandard.icm",
+      "curve": "NikonZ7II-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 120.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "B"
+      },
+      "notes": "ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ8": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ8ImageRep",
+      "vtable_rva": "0x28CB360",
+      "model_id": "0x30000055",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 4.35,
+      "iso_norm": {
+        "min": 1,
+        "max": 63,
+        "op": "multiply",
+        "value": 0.015625
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M",
+        "RAW lossless compressed",
+        "High efficiency RAW",
+        "High efficiency * RAW"
+      ],
+      "noise": {
+        "source": "mixed",
+        "table_rva": "0x1A77610",
+        "entries": [
+          {
+            "iso": 32,
+            "floor": 0.223231405,
+            "poisson": 0.030745801
+          },
+          {
+            "iso": 40,
+            "floor": 0.177097693,
+            "poisson": 0.024433199
+          },
+          {
+            "iso": 50,
+            "floor": 0.141034007,
+            "poisson": 0.0197431
+          },
+          {
+            "iso": 64,
+            "floor": 0.100333899,
+            "poisson": 0.0153832
+          },
+          {
+            "iso": 80,
+            "floor": 0.107627302,
+            "poisson": 0.015552
+          },
+          {
+            "iso": 100,
+            "floor": 0.108822502,
+            "poisson": 0.0157235
+          },
+          {
+            "iso": 125,
+            "floor": 0.105165601,
+            "poisson": 0.0158887
+          },
+          {
+            "iso": 160,
+            "floor": 0.1017216,
+            "poisson": 0.0157206
+          },
+          {
+            "iso": 200,
+            "floor": 0.1040003,
+            "poisson": 0.015778201
+          },
+          {
+            "iso": 250,
+            "floor": 0.103967197,
+            "poisson": 0.0159638
+          },
+          {
+            "iso": 320,
+            "floor": 0.095830701,
+            "poisson": 0.015993699
+          },
+          {
+            "iso": 400,
+            "floor": 0.095475197,
+            "poisson": 0.0164096
+          },
+          {
+            "iso": 500,
+            "floor": 0.0195514,
+            "poisson": 0.0167519
+          },
+          {
+            "iso": 640,
+            "floor": 0.0209278,
+            "poisson": 0.0164175
+          },
+          {
+            "iso": 800,
+            "floor": 0.020675,
+            "poisson": 0.0166003
+          },
+          {
+            "iso": 1000,
+            "floor": 0.020380899,
+            "poisson": 0.016803799
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0202114,
+            "poisson": 0.0170973
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0195085,
+            "poisson": 0.016881401
+          },
+          {
+            "iso": 2000,
+            "floor": 0.018810101,
+            "poisson": 0.017105101
+          },
+          {
+            "iso": 2500,
+            "floor": 0.019117599,
+            "poisson": 0.0172095
+          },
+          {
+            "iso": 3200,
+            "floor": 0.018717401,
+            "poisson": 0.0169996
+          },
+          {
+            "iso": 4000,
+            "floor": 0.017345799,
+            "poisson": 0.017142501
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0176035,
+            "poisson": 0.017324099
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0174767,
+            "poisson": 0.017073501
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0176381,
+            "poisson": 0.017162399
+          },
+          {
+            "iso": 10000,
+            "floor": 0.017996799,
+            "poisson": 0.017284101
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0181715,
+            "poisson": 0.017006001
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0169826,
+            "poisson": 0.017303299
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0170017,
+            "poisson": 0.0174514
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0167227,
+            "poisson": 0.0170398
+          },
+          {
+            "iso": 32000,
+            "floor": 0.016889799,
+            "poisson": 0.017023901
+          },
+          {
+            "iso": 40000,
+            "floor": 0.017922699,
+            "poisson": 0.0165233
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0168337,
+            "poisson": 0.016825
+          },
+          {
+            "iso": 102400,
+            "floor": 0.017171601,
+            "poisson": 0.0156505
+          }
+        ],
+        "config_overrides": [
+          {
+            "iso": 500,
+            "floor": null,
+            "poisson": 0.0167854
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ8-ProStandard.icm",
+      "curve": "NikonZ8-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 120.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "B",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "C"
+      },
+      "notes": "noise 为 DLL 表 + coreConfig 单点 Poisson 覆写 ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZ9": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZ9ImageRep",
+      "vtable_rva": "0x28D1EE8",
+      "model_id": "0x30000053",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 4.35,
+      "iso_norm": {
+        "min": 1,
+        "max": 63,
+        "op": "multiply",
+        "value": 0.015625
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M",
+        "RAW lossless compressed",
+        "High efficiency RAW",
+        "High efficiency * RAW"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.210587,
+            "poisson": 0.0304259
+          },
+          {
+            "iso": 40,
+            "floor": 0.1338202,
+            "poisson": 0.0255724
+          },
+          {
+            "iso": 50,
+            "floor": 0.0963703,
+            "poisson": 0.0204589
+          },
+          {
+            "iso": 64,
+            "floor": 0.0853774,
+            "poisson": 0.0157747
+          },
+          {
+            "iso": 80,
+            "floor": 0.0885686,
+            "poisson": null
+          },
+          {
+            "iso": 100,
+            "floor": 0.0955471,
+            "poisson": null
+          },
+          {
+            "iso": 125,
+            "floor": 0.100641,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.0974709,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.09898,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.1014948,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.0938116,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0192622,
+            "poisson": 0.0167854
+          },
+          {
+            "iso": 640,
+            "floor": 0.0202941,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.0200583,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.019824,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0189076,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0182398,
+            "poisson": null
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0169474,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0174737,
+            "poisson": null
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0178285,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0176366,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0167172,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0172951,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0167273,
+            "poisson": null
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0170291,
+            "poisson": null
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0166387,
+            "poisson": null
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0168782,
+            "poisson": null
+          },
+          {
+            "iso": 102400,
+            "floor": 0.016633,
+            "poisson": 0.0155406
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZ9-ProStandard.icm",
+      "curve": "NikonZ9-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 120.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "B",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "C"
+      },
+      "notes": "ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZF": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZFImageRep",
+      "vtable_rva": "0x28C5310",
+      "model_id": "0x30000056",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 5.93,
+      "iso_norm": {
+        "min": 1,
+        "max": 63,
+        "op": "multiply",
+        "value": 0.015625
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M",
+        "RAW lossless compressed",
+        "High efficiency RAW",
+        "High efficiency * RAW"
+      ],
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1A78EB0",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.101220198,
+            "poisson": 0.0116288
+          },
+          {
+            "iso": 64,
+            "floor": 0.075471498,
+            "poisson": 0.0092904
+          },
+          {
+            "iso": 80,
+            "floor": 0.064039901,
+            "poisson": 0.0062769
+          },
+          {
+            "iso": 100,
+            "floor": 0.0519123,
+            "poisson": 0.0045789
+          },
+          {
+            "iso": 125,
+            "floor": 0.0473806,
+            "poisson": 0.0050452
+          },
+          {
+            "iso": 160,
+            "floor": 0.0414549,
+            "poisson": 0.0051174
+          },
+          {
+            "iso": 200,
+            "floor": 0.0474311,
+            "poisson": 0.0054178
+          },
+          {
+            "iso": 250,
+            "floor": 0.045558002,
+            "poisson": 0.0053916
+          },
+          {
+            "iso": 320,
+            "floor": 0.042304099,
+            "poisson": 0.0053694
+          },
+          {
+            "iso": 400,
+            "floor": 0.040556598,
+            "poisson": 0.0053592
+          },
+          {
+            "iso": 500,
+            "floor": 0.037823901,
+            "poisson": 0.0068289
+          },
+          {
+            "iso": 640,
+            "floor": 0.035567999,
+            "poisson": 0.0068262
+          },
+          {
+            "iso": 800,
+            "floor": 0.0119577,
+            "poisson": 0.0069911
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0113063,
+            "poisson": 0.0070004
+          },
+          {
+            "iso": 1250,
+            "floor": 0.011018,
+            "poisson": 0.0071226
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0102707,
+            "poisson": 0.0070901
+          },
+          {
+            "iso": 2000,
+            "floor": 0.009994,
+            "poisson": 0.0072161
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0096259,
+            "poisson": 0.0073129
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0091818,
+            "poisson": 0.0072397
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0089414,
+            "poisson": 0.0074443
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0087558,
+            "poisson": 0.0074823
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0083509,
+            "poisson": 0.0073927
+          },
+          {
+            "iso": 8000,
+            "floor": 0.008172,
+            "poisson": 0.0074436
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0080865,
+            "poisson": 0.0074766
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0077716,
+            "poisson": 0.0073725
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0063189,
+            "poisson": 0.0074451
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0066038,
+            "poisson": 0.0075225
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0067019,
+            "poisson": 0.007382
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0068918,
+            "poisson": 0.0074523
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0069342,
+            "poisson": 0.0075438
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0068984,
+            "poisson": 0.0074492
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0070023,
+            "poisson": 0.007515
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0070544,
+            "poisson": 0.0076074
+          },
+          {
+            "iso": 102400,
+            "floor": 0.006896,
+            "poisson": 0.0075323
+          },
+          {
+            "iso": 128000,
+            "floor": 0.0069568,
+            "poisson": 0.0076171
+          },
+          {
+            "iso": 204800,
+            "floor": 0.0067514,
+            "poisson": 0.0076221
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZF-ProStandard.icm",
+      "curve": "NikonZF-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 120.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "B",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "C"
+      },
+      "notes": "noise 表来自 0x310 的 36×16B 连续结构 ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "NikonZFC": {
+      "brand": "Nikon",
+      "image_rep_class": "CNikonZFCImageRep",
+      "vtable_rva": "0x28A0348",
+      "model_id": "0x30000052",
+      "mount": "Nikon Z",
+      "pixel_pitch_um": 4.22,
+      "iso_norm": {
+        "min": 1,
+        "max": 63,
+        "op": "multiply",
+        "value": 0.015625
+      },
+      "white_level": 65535,
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW S",
+        "RAW M"
+      ],
+      "noise": {
+        "source": "coreconfig",
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.065225,
+            "poisson": 0.0138021
+          },
+          {
+            "iso": 125,
+            "floor": 0.0612171,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.0579897,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.0548351,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.0503973,
+            "poisson": null
+          },
+          {
+            "iso": 320,
+            "floor": 0.0473613,
+            "poisson": 0.0129611
+          },
+          {
+            "iso": 400,
+            "floor": 0.0252724,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0237281,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0219994,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.0216005,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0208961,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0204426,
+            "poisson": 0.012253
+          },
+          {
+            "iso": 1600,
+            "floor": 0.01976,
+            "poisson": 0.0116559
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0186983,
+            "poisson": 0.0126303
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0181008,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0160731,
+            "poisson": 0.0138596
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0158153,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.01496,
+            "poisson": null
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0145251,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.012512,
+            "poisson": 0.0096254
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0121463,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0118577,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0114871,
+            "poisson": null
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0112632,
+            "poisson": null
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0109775,
+            "poisson": null
+          },
+          {
+            "iso": 102400,
+            "floor": 0.0102163,
+            "poisson": 0.0087731
+          },
+          {
+            "iso": 204800,
+            "floor": null,
+            "poisson": 0.0092631
+          }
+        ]
+      },
+      "ccm": [
+        [
+          1.08,
+          -0.07,
+          -0.01
+        ],
+        [
+          -0.03,
+          1.04,
+          -0.01
+        ],
+        [
+          -0.03,
+          -0.07,
+          1.1
+        ]
+      ],
+      "profile": "NikonZFC-ProStandard.icm",
+      "curve": "NikonZFC-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50.0,
+        "nr_details": 50.0,
+        "nr_color": 50.0
+      },
+      "switches": {
+        "g1g2_adaptive_gain": false,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "C",
+        "noise": "B",
+        "ccm": "A",
+        "defaults": "A",
+        "switches": "A",
+        "compression": "B"
+      },
+      "notes": "ccm 来自 0x4B0（0x1A39CA0；D850/D6 为 0x1A40E90 内联同值） 定点: 0x318=独立增益修正；0x5B8=tag0x115==3；0x5D0=true；0x4F0=14组色温标定(非噪声) NR=50/50/50、sensorRangeGain=1.0 为 C1 BASEDEFAULT（该机型无显式节点）。"
+    },
+    "SonyA1": {
+      "brand": "Sony",
+      "image_rep_class": "CSonyA1ImageRep",
+      "vtable_rva": "0x290CDF0",
+      "model_id": "0x75000057",
+      "mount": "Minolta A",
+      "pixel_pitch_um": 4.16,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "threshold",
+        "value": 100.0,
+        "below": 0.5,
+        "above": 1.0,
+        "source": "0x2E8 reads ISO via 0x668",
+        "note": "ISO<100 -> 0.5; ISO>=100 -> 1.0"
+      },
+      "white_level": 65535,
+      "white_level_rule": "((0xFFFF >> (16-BitsPerSample)) - 2*254) << (16-BitsPerSample); BitsPerSample from tag 0x102",
+      "white_level_source": "0xC0 / 0x278",
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW uncompressed",
+        "RAW compressed",
+        "RAW lossless compressed",
+        "MRAW",
+        "SRAW",
+        "RAW compressed HQ"
+      ],
+      "compression_enum": {
+        "1": "RAW uncompressed",
+        "2": "RAW compressed",
+        "3": "RAW lossless compressed",
+        "4": "MRAW",
+        "5": "SRAW",
+        "6": "RAW compressed",
+        "7": "RAW compressed HQ",
+        "fallback": "RAW"
+      },
+      "compression_source": "0x390 (enum from 0x1ab6200; tags 0x2029/0x103/0x202e)",
+      "compression_note": "0x4C8 returns no strings; it reads tag 0xC634 sub-tags 3-6 and returns 4 doubles (role unresolved).",
+      "noise": {
+        "source": "coreConfig.xml",
+        "table_rva": null,
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.1055014,
+            "poisson": 0.0221798
+          },
+          {
+            "iso": 64,
+            "floor": 0.0961188,
+            "poisson": 0.0283024
+          },
+          {
+            "iso": 80,
+            "floor": 0.1050205,
+            "poisson": null
+          },
+          {
+            "iso": 100,
+            "floor": 0.0429215,
+            "poisson": 0.0134442
+          },
+          {
+            "iso": 125,
+            "floor": 0.0493651,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.0536727,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.0580212,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.0628194,
+            "poisson": 0.0148745
+          },
+          {
+            "iso": 320,
+            "floor": 0.0621837,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.0590756,
+            "poisson": null
+          },
+          {
+            "iso": 500,
+            "floor": 0.0098066,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0112887,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.0125187,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0136662,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0141856,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0145688,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0141553,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0144482,
+            "poisson": null
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0142562,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.014425,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0141195,
+            "poisson": null
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0146129,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0143232,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": null,
+            "poisson": 0.0113887
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0141587,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0136157,
+            "poisson": 0.0102012
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0133181,
+            "poisson": null
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0129444,
+            "poisson": 0.0095371
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0120442,
+            "poisson": null
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0115685,
+            "poisson": null
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0111574,
+            "poisson": null
+          },
+          {
+            "iso": 102400,
+            "floor": 0.0108895,
+            "poisson": 0.0087882
+          }
+        ],
+        "coverage": "31/32 floor, 8/32 poisson"
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "SonyA1-ProStandard.icm",
+      "curve": "SonyA1-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "defaults_note": "ISO0 显式值；ACA 缺省取首个 0.5; NR 50/50/50 为 C1 全局缺省，config 无显式项",
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "A",
+        "pixel_pitch": "B",
+        "white_level": "B",
+        "mount": "A",
+        "compression": "B",
+        "noise": "A",
+        "ccm": "B",
+        "defaults": "B",
+        "switches": "B",
+        "cfa": "C"
+      },
+      "notes": "white level uses BitsPerSample formula; 0x848 has 6.4/8.32 mode branches; ISO16000 has poisson but no floor. 0x4C8=as-shot WB 4-channel levels -> 3 normalized RGB multipliers; 0x730=lens correction (0x7031-0x7037), not ISO/unpack; 0x4D0=as-shot WB values, 0x4E0=light-source names.",
+      "mount_note": "literal 0x738 string; A1/A9M3 report Minolta A despite E-mount",
+      "cfa_note": "no RGGB/BGGR/GRBG/GBRG string in DLL or coreConfig; conventional assumption"
+    },
+    "SonyA6700": {
+      "brand": "Sony",
+      "image_rep_class": "CSonyA6700ImageRep",
+      "vtable_rva": "0x2910170",
+      "model_id": "0x7500005E",
+      "mount": "Sony E",
+      "pixel_pitch_um": 3.76,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "threshold",
+        "value": 100.0,
+        "below": 0.5,
+        "above": 1.0,
+        "source": "0x2E8 reads ISO via 0x668",
+        "note": "ISO<100 -> 0.5; ISO>=100 -> 1.0"
+      },
+      "white_level": 65535,
+      "white_level_rule": "65535 - 4*BlackLevel(tag 0x7310); 65535 if tag absent",
+      "white_level_source": "0xC0 / 0x278",
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW uncompressed",
+        "RAW compressed",
+        "RAW lossless compressed",
+        "MRAW",
+        "SRAW",
+        "RAW compressed HQ"
+      ],
+      "compression_enum": {
+        "1": "RAW uncompressed",
+        "2": "RAW compressed",
+        "3": "RAW lossless compressed",
+        "4": "MRAW",
+        "5": "SRAW",
+        "6": "RAW compressed",
+        "7": "RAW compressed HQ",
+        "fallback": "RAW"
+      },
+      "compression_source": "0x390 (enum from 0x1ab6200; tags 0x2029/0x103/0x202e)",
+      "compression_note": "0x4C8 returns no strings; it reads tag 0xC634 sub-tags 3-6 and returns 4 doubles (role unresolved).",
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1AD5BF0",
+        "record_layout": "int32 iso; float floor; float poisson; int32 flags; stride 16",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.0615242,
+            "poisson": 0.0332126
+          },
+          {
+            "iso": 64,
+            "floor": 0.0759218,
+            "poisson": 0.0330871
+          },
+          {
+            "iso": 80,
+            "floor": 0.086518,
+            "poisson": 0.0337306
+          },
+          {
+            "iso": 100,
+            "floor": 0.0344183,
+            "poisson": 0.0162004
+          },
+          {
+            "iso": 125,
+            "floor": 0.0403693,
+            "poisson": 0.0167045
+          },
+          {
+            "iso": 160,
+            "floor": 0.0445566,
+            "poisson": 0.0168682
+          },
+          {
+            "iso": 200,
+            "floor": 0.0432546,
+            "poisson": 0.0173044
+          },
+          {
+            "iso": 250,
+            "floor": 0.0448855,
+            "poisson": 0.0176153
+          },
+          {
+            "iso": 320,
+            "floor": 0.0187768,
+            "poisson": 0.017166
+          },
+          {
+            "iso": 400,
+            "floor": 0.0193743,
+            "poisson": 0.017471
+          },
+          {
+            "iso": 500,
+            "floor": 0.0200841,
+            "poisson": 0.0178315
+          },
+          {
+            "iso": 640,
+            "floor": 0.0201611,
+            "poisson": 0.0176908
+          },
+          {
+            "iso": 800,
+            "floor": 0.0206138,
+            "poisson": 0.0179286
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0212801,
+            "poisson": 0.0181956
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0212116,
+            "poisson": 0.0183632
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0208811,
+            "poisson": 0.0181382
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0206405,
+            "poisson": 0.0183859
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0209582,
+            "poisson": 0.0185131
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0198992,
+            "poisson": 0.0182499
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0200988,
+            "poisson": 0.0185473
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0196979,
+            "poisson": 0.0186204
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0192774,
+            "poisson": 0.0183911
+          },
+          {
+            "iso": 8000,
+            "floor": 0.019046,
+            "poisson": 0.0185224
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0186916,
+            "poisson": 0.0186505
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0182443,
+            "poisson": 0.0185818
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0140917,
+            "poisson": 0.011147
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0133754,
+            "poisson": 0.0111496
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0127161,
+            "poisson": 0.0108524
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0125352,
+            "poisson": 0.010996
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0121026,
+            "poisson": 0.0110572
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0118796,
+            "poisson": 0.0107908
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0118273,
+            "poisson": 0.0109506
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0118984,
+            "poisson": 0.0110649
+          },
+          {
+            "iso": 102400,
+            "floor": 0.0118602,
+            "poisson": 0.0107808
+          }
+        ],
+        "coverage": "34/34 (floor+poisson)"
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "SonyA6700-ProStandard.icm",
+      "curve": "SonyA6700-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 1.0,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "defaults_note": "ISO0 显式值；ACA 缺省取首个 0.5; NR 50/50/50 为 C1 全局缺省，config 无显式项",
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "A",
+        "pixel_pitch": "A",
+        "white_level": "B",
+        "mount": "A",
+        "compression": "B",
+        "noise": "B",
+        "ccm": "B",
+        "defaults": "B",
+        "switches": "B",
+        "cfa": "C"
+      },
+      "notes": "noise table from DLL 0x1AD5BF0 (34 entries); mount string is Sony E. 0x4C8=as-shot WB 4-channel levels -> 3 normalized RGB multipliers; 0x730=lens correction (0x7031-0x7037), not ISO/unpack; 0x4D0=as-shot WB values, 0x4E0=light-source names.",
+      "mount_note": "literal 0x738 string; A1/A9M3 report Minolta A despite E-mount",
+      "cfa_note": "no RGGB/BGGR/GRBG/GBRG string in DLL or coreConfig; conventional assumption"
+    },
+    "SonyA7M4": {
+      "brand": "Sony",
+      "image_rep_class": "CSonyA7M4ImageRep",
+      "vtable_rva": "0x291F8C0",
+      "model_id": "0x7500005A",
+      "mount": "Minolta A",
+      "pixel_pitch_um": 5.12,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "threshold",
+        "value": 100.0,
+        "below": 0.5,
+        "above": 1.0,
+        "source": "0x2E8 reads ISO via 0x668",
+        "note": "ISO<100 -> 0.5; ISO>=100 -> 1.0"
+      },
+      "white_level": 65535,
+      "white_level_rule": "65535 - 4*BlackLevel(tag 0x7310); 65535 if tag absent",
+      "white_level_source": "0xC0 / 0x278",
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW uncompressed",
+        "RAW compressed",
+        "RAW lossless compressed",
+        "MRAW",
+        "SRAW",
+        "RAW compressed HQ"
+      ],
+      "compression_enum": {
+        "1": "RAW uncompressed",
+        "2": "RAW compressed",
+        "3": "RAW lossless compressed",
+        "4": "MRAW",
+        "5": "SRAW",
+        "6": "RAW compressed",
+        "7": "RAW compressed HQ",
+        "fallback": "RAW"
+      },
+      "compression_source": "0x390 (enum from 0x1ab6200; tags 0x2029/0x103/0x202e)",
+      "compression_note": "0x4C8 returns no strings; it reads tag 0xC634 sub-tags 3-6 and returns 4 doubles (role unresolved).",
+      "noise": {
+        "source": "coreConfig.xml",
+        "table_rva": null,
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.0748342,
+            "poisson": 0.0129247
+          },
+          {
+            "iso": 64,
+            "floor": 0.0527214,
+            "poisson": 0.015975
+          },
+          {
+            "iso": 80,
+            "floor": 0.0401431,
+            "poisson": null
+          },
+          {
+            "iso": 100,
+            "floor": 0.0252899,
+            "poisson": 0.0075826
+          },
+          {
+            "iso": 125,
+            "floor": 0.0198548,
+            "poisson": null
+          },
+          {
+            "iso": 160,
+            "floor": 0.0243777,
+            "poisson": null
+          },
+          {
+            "iso": 200,
+            "floor": 0.0262832,
+            "poisson": null
+          },
+          {
+            "iso": 250,
+            "floor": 0.0290583,
+            "poisson": 0.0080831
+          },
+          {
+            "iso": 320,
+            "floor": 0.0294602,
+            "poisson": null
+          },
+          {
+            "iso": 400,
+            "floor": 0.0069342,
+            "poisson": 0.0086446
+          },
+          {
+            "iso": 500,
+            "floor": 0.0086464,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0093138,
+            "poisson": null
+          },
+          {
+            "iso": 800,
+            "floor": 0.0098918,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0102184,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0103779,
+            "poisson": 0.0091764
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0101665,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0105201,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0107789,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0104091,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.010088,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0096629,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0093233,
+            "poisson": null
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0090201,
+            "poisson": null
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0078194,
+            "poisson": 0.0060804
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0074694,
+            "poisson": null
+          },
+          {
+            "iso": 102400,
+            "floor": 0.0070094,
+            "poisson": 0.005766
+          },
+          {
+            "iso": 128000,
+            "floor": 0.0069151,
+            "poisson": null
+          },
+          {
+            "iso": 160000,
+            "floor": 0.0066164,
+            "poisson": null
+          },
+          {
+            "iso": 204800,
+            "floor": 0.0064054,
+            "poisson": null
+          }
+        ],
+        "coverage": "29/29 floor, 8/29 poisson"
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "SonyA7M4-ProStandard.icm",
+      "curve": "SonyA7M4-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "defaults_note": "ISO0 无 USM；取 C1 同代缺省 180/0.8/1.0/0.5; NR 50/50/50 为 C1 全局缺省，config 无显式项",
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "A",
+        "pixel_pitch": "A",
+        "white_level": "B",
+        "mount": "A",
+        "compression": "B",
+        "noise": "A",
+        "ccm": "B",
+        "defaults": "C",
+        "switches": "B",
+        "cfa": "C"
+      },
+      "notes": "config noise has full floor but sparse poisson; USM defaults are global fallback; white level needs tag 0x7310. 0x4C8=as-shot WB 4-channel levels -> 3 normalized RGB multipliers; 0x730=lens correction (0x7031-0x7037), not ISO/unpack; 0x4D0=as-shot WB values, 0x4E0=light-source names.",
+      "mount_note": "literal 0x738 string; A1/A9M3 report Minolta A despite E-mount",
+      "cfa_note": "no RGGB/BGGR/GRBG/GBRG string in DLL or coreConfig; conventional assumption"
+    },
+    "SonyA7RM5": {
+      "brand": "Sony",
+      "image_rep_class": "CSonyA7RM5ImageRep",
+      "vtable_rva": "0x2936BE8",
+      "model_id": "0x7500005B",
+      "mount": "Sony E",
+      "pixel_pitch_um": 3.75,
+      "iso_norm": {
+        "min": 1,
+        "max": 99,
+        "op": "threshold",
+        "value": 100.0,
+        "below": 0.5,
+        "above": 1.0,
+        "source": "0x2E8 reads ISO via 0x668",
+        "note": "ISO<100 -> 0.5; ISO>=100 -> 1.0"
+      },
+      "white_level": 65535,
+      "white_level_rule": "65535 - 4*BlackLevel(tag 0x7310); 65535 if tag absent",
+      "white_level_source": "0xC0 / 0x278",
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW uncompressed",
+        "RAW compressed",
+        "RAW lossless compressed",
+        "MRAW",
+        "SRAW",
+        "RAW compressed HQ"
+      ],
+      "compression_enum": {
+        "1": "RAW uncompressed",
+        "2": "RAW compressed",
+        "3": "RAW lossless compressed",
+        "4": "MRAW",
+        "5": "SRAW",
+        "6": "RAW compressed",
+        "7": "RAW compressed HQ",
+        "fallback": "RAW"
+      },
+      "compression_source": "0x390 (enum from 0x1ab6200; tags 0x2029/0x103/0x202e)",
+      "compression_note": "0x4C8 returns no strings; it reads tag 0xC634 sub-tags 3-6 and returns 4 doubles (role unresolved).",
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1ADB1F0",
+        "record_layout": "int32 iso; float floor; float poisson; int32 flags; stride 16",
+        "entries": [
+          {
+            "iso": 50,
+            "floor": 0.0708154,
+            "poisson": 0.032562
+          },
+          {
+            "iso": 64,
+            "floor": 0.0790738,
+            "poisson": 0.0326063
+          },
+          {
+            "iso": 80,
+            "floor": 0.0828477,
+            "poisson": 0.0333783
+          },
+          {
+            "iso": 100,
+            "floor": 0.0390454,
+            "poisson": 0.015755
+          },
+          {
+            "iso": 125,
+            "floor": 0.0392591,
+            "poisson": 0.0164628
+          },
+          {
+            "iso": 160,
+            "floor": 0.041538,
+            "poisson": 0.0165962
+          },
+          {
+            "iso": 200,
+            "floor": 0.0420459,
+            "poisson": 0.0170014
+          },
+          {
+            "iso": 250,
+            "floor": 0.0424278,
+            "poisson": 0.0174843
+          },
+          {
+            "iso": 320,
+            "floor": 0.0170502,
+            "poisson": 0.0167864
+          },
+          {
+            "iso": 400,
+            "floor": 0.0175427,
+            "poisson": 0.0171747
+          },
+          {
+            "iso": 500,
+            "floor": 0.0181148,
+            "poisson": 0.0175069
+          },
+          {
+            "iso": 640,
+            "floor": 0.0182717,
+            "poisson": 0.0174156
+          },
+          {
+            "iso": 800,
+            "floor": 0.0183228,
+            "poisson": 0.0177168
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0191259,
+            "poisson": 0.017956
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0190154,
+            "poisson": 0.0181865
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0186458,
+            "poisson": 0.0179438
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0186446,
+            "poisson": 0.018124
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0186078,
+            "poisson": 0.018266
+          },
+          {
+            "iso": 3200,
+            "floor": 0.017916,
+            "poisson": 0.0179775
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0183937,
+            "poisson": 0.018233
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0184344,
+            "poisson": 0.0184055
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0176074,
+            "poisson": 0.0181284
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0175652,
+            "poisson": 0.0183211
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0175358,
+            "poisson": 0.0184565
+          },
+          {
+            "iso": 12800,
+            "floor": 0.016895,
+            "poisson": 0.0182163
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0134798,
+            "poisson": 0.010976
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0129604,
+            "poisson": 0.010924
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0121556,
+            "poisson": 0.0107625
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0118283,
+            "poisson": 0.0108695
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0114597,
+            "poisson": 0.010936
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0109709,
+            "poisson": 0.010794
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0111933,
+            "poisson": 0.0108112
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0110954,
+            "poisson": 0.0109953
+          },
+          {
+            "iso": 102400,
+            "floor": 0.0110087,
+            "poisson": 0.0106812
+          }
+        ],
+        "coverage": "34/34 (floor+poisson)"
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "SonyA7RM5-ProStandard.icm",
+      "curve": "SonyA7RM5-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "defaults_note": "ISO0 显式值；ACA 缺省取首个 0.5; NR 50/50/50 为 C1 全局缺省，config 无显式项",
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "A",
+        "pixel_pitch": "A",
+        "white_level": "B",
+        "mount": "A",
+        "compression": "B",
+        "noise": "B",
+        "ccm": "B",
+        "defaults": "B",
+        "switches": "B",
+        "cfa": "C"
+      },
+      "notes": "noise table from DLL 0x1ADB1F0 (34 entries); mount string is Sony E. 0x4C8=as-shot WB 4-channel levels -> 3 normalized RGB multipliers; 0x730=lens correction (0x7031-0x7037), not ISO/unpack; 0x4D0=as-shot WB values, 0x4E0=light-source names.",
+      "mount_note": "literal 0x738 string; A1/A9M3 report Minolta A despite E-mount",
+      "cfa_note": "no RGGB/BGGR/GRBG/GBRG string in DLL or coreConfig; conventional assumption"
+    },
+    "SonyA7SM3": {
+      "brand": "Sony",
+      "image_rep_class": "CSonyA7SM3ImageRep",
+      "vtable_rva": "0x2938AD8",
+      "model_id": "0x75000054",
+      "mount": "Minolta A",
+      "pixel_pitch_um": 8.39,
+      "iso_norm": {
+        "min": 0,
+        "max": 255,
+        "op": "divide",
+        "value": 128.0,
+        "source": "0x2E8 reads tag 0x7316",
+        "note": "tag/128; fallback 1.0"
+      },
+      "white_level": 65535,
+      "white_level_rule": "65535 - 4*BlackLevel(tag 0x7310); 65535 if tag absent",
+      "white_level_source": "0xC0 / 0x278",
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW uncompressed",
+        "RAW compressed",
+        "RAW lossless compressed",
+        "MRAW",
+        "SRAW",
+        "RAW compressed HQ"
+      ],
+      "compression_enum": {
+        "1": "RAW uncompressed",
+        "2": "RAW compressed",
+        "3": "RAW lossless compressed",
+        "4": "MRAW",
+        "5": "SRAW",
+        "6": "RAW compressed",
+        "7": "RAW compressed HQ",
+        "fallback": "RAW"
+      },
+      "compression_source": "0x390 (enum from 0x1ab6200; tags 0x2029/0x103/0x202e)",
+      "compression_note": "0x4C8 returns no strings; it reads tag 0xC634 sub-tags 3-6 and returns 4 doubles (role unresolved).",
+      "noise": {
+        "source": "coreConfig.xml",
+        "table_rva": null,
+        "entries": [
+          {
+            "iso": 0,
+            "floor": 0.0762367,
+            "poisson": 0.005866
+          },
+          {
+            "iso": 50,
+            "floor": 0.0693888,
+            "poisson": null
+          },
+          {
+            "iso": 64,
+            "floor": 0.0659928,
+            "poisson": 0.0061861
+          },
+          {
+            "iso": 80,
+            "floor": 0.0468332,
+            "poisson": 0.0027533
+          },
+          {
+            "iso": 100,
+            "floor": 0.0417416,
+            "poisson": null
+          },
+          {
+            "iso": 125,
+            "floor": 0.036306,
+            "poisson": 0.0030584
+          },
+          {
+            "iso": 160,
+            "floor": 0.0297427,
+            "poisson": 0.0032737
+          },
+          {
+            "iso": 250,
+            "floor": 0.032299,
+            "poisson": 0.00347
+          },
+          {
+            "iso": 400,
+            "floor": 0.0330102,
+            "poisson": null
+          },
+          {
+            "iso": 640,
+            "floor": 0.0325858,
+            "poisson": null
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0322154,
+            "poisson": null
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0317926,
+            "poisson": null
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0029559,
+            "poisson": null
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0033843,
+            "poisson": null
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0034934,
+            "poisson": null
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0035672,
+            "poisson": null
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0030717,
+            "poisson": null
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0032388,
+            "poisson": null
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0033042,
+            "poisson": null
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0032221,
+            "poisson": null
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0031892,
+            "poisson": null
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0031573,
+            "poisson": null
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0030289,
+            "poisson": null
+          },
+          {
+            "iso": 20000,
+            "floor": 0.0030962,
+            "poisson": null
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0029405,
+            "poisson": null
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0028996,
+            "poisson": null
+          },
+          {
+            "iso": 64000,
+            "floor": 0.0027745,
+            "poisson": null
+          },
+          {
+            "iso": 80000,
+            "floor": 0.0027434,
+            "poisson": null
+          },
+          {
+            "iso": 128000,
+            "floor": 0.002555,
+            "poisson": 0.0024773
+          },
+          {
+            "iso": 160000,
+            "floor": 0.0024524,
+            "poisson": 0.0023452
+          },
+          {
+            "iso": 204800,
+            "floor": 0.0023047,
+            "poisson": null
+          },
+          {
+            "iso": 256000,
+            "floor": 0.0022137,
+            "poisson": 0.0022091
+          },
+          {
+            "iso": 320000,
+            "floor": 0.0021184,
+            "poisson": null
+          },
+          {
+            "iso": 409600,
+            "floor": 0.002014,
+            "poisson": null
+          }
+        ],
+        "coverage": "34/34 floor, 9/34 poisson"
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "SonyA7SM3-Generic.icm",
+      "curve": "SonyA7SM3-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 180.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "defaults_note": "ISO0 显式值；ACA 缺省取首个 0.5; NR 50/50/50 为 C1 全局缺省，config 无显式项",
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "A",
+        "white_level": "B",
+        "mount": "A",
+        "compression": "B",
+        "noise": "A",
+        "ccm": "B",
+        "defaults": "B",
+        "switches": "B",
+        "cfa": "C"
+      },
+      "notes": "iso_norm reads tag 0x7316 / 128; config noise 34 entries, 9 poisson. 0x4C8=as-shot WB 4-channel levels -> 3 normalized RGB multipliers; 0x730=lens correction (0x7031-0x7037), not ISO/unpack; 0x4D0=as-shot WB values, 0x4E0=light-source names.",
+      "mount_note": "literal 0x738 string; A1/A9M3 report Minolta A despite E-mount",
+      "cfa_note": "no RGGB/BGGR/GRBG/GBRG string in DLL or coreConfig; conventional assumption"
+    },
+    "SonyA9M3": {
+      "brand": "Sony",
+      "image_rep_class": "CSonyA9M3ImageRep",
+      "vtable_rva": "0x29217B0",
+      "model_id": "0x75000062",
+      "mount": "Minolta A",
+      "pixel_pitch_um": 5.89,
+      "iso_norm": {
+        "min": 0,
+        "max": 255,
+        "op": "divide",
+        "value": 128.0,
+        "source": "0x2E8 reads tag 0x7316",
+        "note": "tag/128; fallback 1.0"
+      },
+      "white_level": 65535,
+      "white_level_rule": "65535 - 4*BlackLevel(tag 0x7310); 65535 if tag absent",
+      "white_level_source": "0xC0 / 0x278",
+      "cfa": "RGGB",
+      "compression": [
+        "RAW",
+        "RAW uncompressed",
+        "RAW compressed",
+        "RAW lossless compressed",
+        "MRAW",
+        "SRAW",
+        "RAW compressed HQ"
+      ],
+      "compression_enum": {
+        "1": "RAW uncompressed",
+        "2": "RAW compressed",
+        "3": "RAW lossless compressed",
+        "4": "MRAW",
+        "5": "SRAW",
+        "6": "RAW compressed",
+        "7": "RAW compressed HQ",
+        "fallback": "RAW"
+      },
+      "compression_source": "0x390 (enum from 0x1ab6200; tags 0x2029/0x103/0x202e)",
+      "compression_note": "0x4C8 returns no strings; it reads tag 0xC634 sub-tags 3-6 and returns 4 doubles (role unresolved).",
+      "noise": {
+        "source": "dll_0x310",
+        "table_rva": "0x1AE7260",
+        "record_layout": "int32 iso; float floor; float poisson; int32 flags; stride 16",
+        "entries": [
+          {
+            "iso": 125,
+            "floor": 0.0857859,
+            "poisson": 0.0142741
+          },
+          {
+            "iso": 160,
+            "floor": 0.0831443,
+            "poisson": 0.0142321
+          },
+          {
+            "iso": 200,
+            "floor": 0.086528,
+            "poisson": 0.014667
+          },
+          {
+            "iso": 250,
+            "floor": 0.0423812,
+            "poisson": 0.0073495
+          },
+          {
+            "iso": 320,
+            "floor": 0.0428359,
+            "poisson": 0.0067825
+          },
+          {
+            "iso": 400,
+            "floor": 0.0434448,
+            "poisson": 0.0069011
+          },
+          {
+            "iso": 500,
+            "floor": 0.0455664,
+            "poisson": 0.0070082
+          },
+          {
+            "iso": 640,
+            "floor": 0.0454545,
+            "poisson": 0.0069357
+          },
+          {
+            "iso": 800,
+            "floor": 0.018464,
+            "poisson": 0.0069383
+          },
+          {
+            "iso": 1000,
+            "floor": 0.0189462,
+            "poisson": 0.0070529
+          },
+          {
+            "iso": 1250,
+            "floor": 0.0195445,
+            "poisson": 0.0071593
+          },
+          {
+            "iso": 1600,
+            "floor": 0.0192144,
+            "poisson": 0.0071045
+          },
+          {
+            "iso": 2000,
+            "floor": 0.0199435,
+            "poisson": 0.0071392
+          },
+          {
+            "iso": 2500,
+            "floor": 0.0199128,
+            "poisson": 0.0072628
+          },
+          {
+            "iso": 3200,
+            "floor": 0.0195751,
+            "poisson": 0.0071458
+          },
+          {
+            "iso": 4000,
+            "floor": 0.0200222,
+            "poisson": 0.007208
+          },
+          {
+            "iso": 5000,
+            "floor": 0.0201531,
+            "poisson": 0.0072662
+          },
+          {
+            "iso": 6400,
+            "floor": 0.0198045,
+            "poisson": 0.007144
+          },
+          {
+            "iso": 8000,
+            "floor": 0.0199398,
+            "poisson": 0.0071777
+          },
+          {
+            "iso": 10000,
+            "floor": 0.0200616,
+            "poisson": 0.007238
+          },
+          {
+            "iso": 12800,
+            "floor": 0.0197548,
+            "poisson": 0.007108
+          },
+          {
+            "iso": 16000,
+            "floor": 0.0151309,
+            "poisson": 0.0041391
+          },
+          {
+            "iso": 20000,
+            "floor": 0.015227,
+            "poisson": 0.0041363
+          },
+          {
+            "iso": 25600,
+            "floor": 0.0149454,
+            "poisson": 0.0040886
+          },
+          {
+            "iso": 32000,
+            "floor": 0.0145767,
+            "poisson": 0.004104
+          },
+          {
+            "iso": 40000,
+            "floor": 0.0145267,
+            "poisson": 0.0041629
+          },
+          {
+            "iso": 51200,
+            "floor": 0.0142649,
+            "poisson": 0.0040846
+          }
+        ],
+        "coverage": "27/27 (floor+poisson)"
+      },
+      "ccm": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "profile": "SonyA9M3-ProStandard.icm",
+      "curve": "SonyA9M3-Auto.fcrv",
+      "defaults": {
+        "usm_amount": 140.0,
+        "usm_radius": 0.8,
+        "usm_threshold": 1.0,
+        "aca": 0.5,
+        "nr_luminance": 50,
+        "nr_details": 50,
+        "nr_color": 50
+      },
+      "defaults_note": "ISO0 显式值；ACA 缺省取首个 0.5; NR 50/50/50 为 C1 全局缺省，config 无显式项",
+      "switches": {
+        "g1g2_adaptive_gain": true,
+        "black_clean": 0.0,
+        "gain": 1.0,
+        "sensor_range_gain": 1.0
+      },
+      "confidence": {
+        "model_id": "A",
+        "iso_norm": "B",
+        "pixel_pitch": "A",
+        "white_level": "B",
+        "mount": "A",
+        "compression": "B",
+        "noise": "B",
+        "ccm": "B",
+        "defaults": "B",
+        "switches": "B",
+        "cfa": "C"
+      },
+      "notes": "noise table starts at ISO 125; iso_norm reads tag 0x7316 / 128. 0x4C8=as-shot WB 4-channel levels -> 3 normalized RGB multipliers; 0x730=lens correction (0x7031-0x7037), not ISO/unpack; 0x4D0=as-shot WB values, 0x4E0=light-source names.",
+      "mount_note": "literal 0x738 string; A1/A9M3 report Minolta A despite E-mount",
+      "cfa_note": "no RGGB/BGGR/GRBG/GBRG string in DLL or coreConfig; conventional assumption"
+    }
+  }
+}
