@@ -733,6 +733,32 @@ pub struct FileEngine {
     imported_styles: RwLock<Vec<StyleInfo>>,
 }
 
+/// Target white balance for Match Look: stored C1 gains when present, the
+/// slider pair otherwise. The K/T table is sampled on the Z6III; other bodies
+/// still use it as the same approximation the ceiling already uses.
+struct CameraWhiteBalance {
+    camera: Option<String>,
+}
+
+impl crate::matchlook::LookWhiteBalanceContext for CameraWhiteBalance {
+    fn target_temperature(&self, target: &crate::WhiteBalance) -> (f32, f32) {
+        let Some(gains) = target.gains else {
+            return (target.kelvin, target.tint);
+        };
+        let (kelvin, tint, confidence) =
+            crate::c1_model::gains_to_kelvin_tint_for_body(gains, self.camera.as_deref());
+        if confidence == crate::c1_model::WbDisplayConfidence::Unknown {
+            crate::c1_model::gains_to_kelvin_tint(gains)
+        } else {
+            (kelvin, tint)
+        }
+    }
+
+    fn temperature_to_gains(&self, kelvin: f32, tint: f32) -> [f32; 3] {
+        crate::c1_model::kelvin_tint_to_gains(kelvin, tint)
+    }
+}
+
 impl FileEngine {
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -2005,6 +2031,53 @@ impl FileEngine {
         }
         overrides
     }
+
+    fn camera_model(&self, image: ImageId) -> Option<String> {
+        let st = self.state.lock();
+        st.entries
+            .iter()
+            .find(|entry| entry.info.id == image)
+            .and_then(|entry| entry.info.exif.camera_model.clone())
+    }
+
+    fn style_for_image_with(
+        &self,
+        image: ImageId,
+        style: &StyleInfo,
+        target: &AdjustmentSet,
+        predict: impl FnOnce(&crate::matchlook::LookReference) -> Option<crate::matchlook::LookPrediction>,
+    ) -> anyhow::Result<AdjustmentSet> {
+        let Some(source) = style.source.as_deref().filter(|_| style.has_look) else {
+            return Ok(style.adjustments.clone());
+        };
+        let white_balance = CameraWhiteBalance { camera: self.camera_model(image) };
+        let mut context = crate::matchlook::LookToneContext {
+            subtract_baseline: [0.0; 5],
+            add_baseline: [0.0; 5],
+            weights: [None; 4],
+            auto_white_balance: false,
+            white_balance: &white_balance,
+        };
+        let mut applied = false;
+        match crate::c1_styles::load_style_for_target_with(
+            source,
+            target,
+            &mut context,
+            predict,
+            &mut applied,
+        ) {
+            Ok(loaded) if applied => Ok(loaded.adjustments),
+            Ok(_) => Ok(style.adjustments.clone()),
+            Err(err) => {
+                log::warn!(
+                    "AICGR style {} for image {}: {err:#}; using the preloaded style",
+                    source.display(),
+                    image.0
+                );
+                Ok(style.adjustments.clone())
+            }
+        }
+    }
 }
 
 impl ImageEngine for FileEngine {
@@ -2699,11 +2772,26 @@ impl ImageEngine for FileEngine {
 
     fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo> {
         let style = crate::c1_styles::load_style(path)?;
-        let info = StyleInfo { name: style.name, group: "Imported".into(), adjustments: style.adjustments };
+        let info = StyleInfo {
+            name: style.name,
+            group: "Imported".into(),
+            adjustments: style.adjustments,
+            source: Some(path.to_path_buf()),
+            has_look: style.look.is_some(),
+        };
         let mut imported = self.imported_styles.write();
         imported.retain(|s| !(s.group == info.group && s.name == info.name));
         imported.push(info.clone());
         Ok(info)
+    }
+
+    fn style_for_image(
+        &self,
+        image: ImageId,
+        style: &StyleInfo,
+        target: &AdjustmentSet,
+    ) -> anyhow::Result<AdjustmentSet> {
+        self.style_for_image_with(image, style, target, crate::matchlook::predict_look_reference)
     }
 
     fn icc_profiles(&self) -> Vec<String> {
@@ -2951,7 +3039,13 @@ fn film_curve_styles() -> Vec<StyleInfo> {
                 .find(|n| n.ends_with(kind) && crate::filmcurve::curve_lut(n).is_some())?;
             let mut adjustments = AdjustmentSet::default();
             adjustments.base.film_curve = Some(name.clone());
-            Some(StyleInfo { name: name.clone(), group: "Film Curve".into(), adjustments })
+            Some(StyleInfo {
+                name: name.clone(),
+                group: "Film Curve".into(),
+                adjustments,
+                source: None,
+                has_look: false,
+            })
         })
         .collect()
 }
@@ -2959,6 +3053,72 @@ fn film_curve_styles() -> Vec<StyleInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aicgr_target_style_changes_exposure_and_white_balance_against_the_old_path() {
+        use base64::Engine as _;
+        use crate::matchlook::{LookPrediction, LOOK_BW_VECTOR, LOOK_COLOR_VECTOR};
+
+        let dir = std::env::temp_dir().join(format!("aurora-aicgr-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Target Look.costyle");
+        let mut tiff = Vec::new();
+        tiff::encoder::TiffEncoder::new(std::io::Cursor::new(&mut tiff))
+            .unwrap()
+            .write_image::<tiff::encoder::colortype::RGB8>(1, 1, &[10, 20, 30])
+            .unwrap();
+        let bitmaps = base64::engine::general_purpose::STANDARD.encode(tiff);
+        std::fs::write(
+            &path,
+            format!(
+                r#"<SL><E K="Name" V="Target Look"/><AICGR><E K="Bitmaps" V="{bitmaps}"/><E K="Impact" V="50"/></AICGR></SL>"#
+            ),
+        )
+        .unwrap();
+
+        let plain = crate::c1_styles::load_style(&path).unwrap();
+        let style = StyleInfo {
+            name: plain.name.clone(),
+            group: "Imported".into(),
+            adjustments: plain.adjustments.clone(),
+            source: Some(path.clone()),
+            has_look: plain.look.is_some(),
+        };
+        let engine = FileEngine::open(&dir).unwrap();
+        let mut target = AdjustmentSet::default();
+        target.exposure.exposure = 1.0;
+        target.white_balance.gains = Some([1.625, 1.0, 1.412]);
+        target.white_balance.kelvin = 4779.55;
+        target.white_balance.tint = -4.4875;
+
+        let adjusted = engine
+            .style_for_image_with(ImageId(1), &style, &target, |reference| {
+                assert_eq!(reference.thumbnails[0].rgba, [10, 20, 30, 255]);
+                let mut color = [0.5; LOOK_COLOR_VECTOR];
+                color[0] = 0.75;
+                color[1] = 0.75;
+                color[2] = 0.6;
+                Some(LookPrediction { color, bw: [0.5; LOOK_BW_VECTOR] })
+            })
+            .unwrap();
+
+        assert!((adjusted.exposure.exposure - 1.9).abs() < 1e-5, "{adjusted:?}");
+        assert_ne!(adjusted.exposure.exposure, plain.adjustments.exposure.exposure);
+        assert_ne!(
+            adjusted.white_balance.gains,
+            plain.adjustments.white_balance.gains,
+            "target-aware WB must differ from the old default-gains path"
+        );
+        assert_ne!(adjusted.white_balance.gains, target.white_balance.gains);
+        assert_eq!(target.exposure.exposure, 1.0);
+
+        let fallback = engine
+            .style_for_image_with(ImageId(1), &style, &target, |_| None)
+            .unwrap();
+        assert_eq!(fallback, style.adjustments, "no model output falls back to the plain style");
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn applies_cos_global_and_masked_layers_from_the_settings_folder() {

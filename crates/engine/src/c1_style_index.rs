@@ -27,6 +27,8 @@ pub(crate) fn installed_styles_from(dirs: &[PathBuf]) -> Vec<StyleInfo> {
                     name: style.name,
                     group,
                     adjustments: style.adjustments,
+                    source: Some(path.clone()),
+                    has_look: style.look.is_some(),
                 }),
                 Ok(_) => {}
                 Err(err) => log::warn!("c1 style {}: {err:#}", path.display()),

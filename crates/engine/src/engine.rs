@@ -539,6 +539,17 @@ pub trait ImageEngine: Send + Sync + 'static {
     fn import_style(&self, _path: &Path) -> anyhow::Result<StyleInfo> {
         anyhow::bail!("style import is not supported by this engine")
     }
+    /// The style's adjustments for `image`. An AICGR style is re-loaded against
+    /// the image's current adjustments and white balance; every other style
+    /// returns its already loaded adjustments.
+    fn style_for_image(
+        &self,
+        _image: ImageId,
+        style: &StyleInfo,
+        _target: &AdjustmentSet,
+    ) -> anyhow::Result<AdjustmentSet> {
+        Ok(style.adjustments.clone())
+    }
     /// Slider ranges and defaults, for drawing the inspector without guessing.
     fn param_metadata(&self) -> &'static [crate::ParamMeta] {
         crate::param_meta::catalog()
@@ -594,6 +605,12 @@ pub struct StyleInfo {
     pub name: String,
     pub group: String,
     pub adjustments: AdjustmentSet,
+    /// The `.costyle` / `.copreset` this style came from, when it has one.
+    #[serde(default)]
+    pub source: Option<PathBuf>,
+    /// `<AICGR>` was present, so applying this style can use the target image.
+    #[serde(default)]
+    pub has_look: bool,
 }
 
 #[cfg(test)]

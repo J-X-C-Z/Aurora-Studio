@@ -1300,7 +1300,72 @@ impl AppState {
     pub fn apply_style(&mut self, style: &StyleInfo, stack: bool, cx: &mut Context<Self>) {
         let style = style.clone();
         self.hover_look = None;
-        self.edit_selected(format!("{} {}", t("Style", "风格"), style.name), move |a| style_onto(a, &style, stack), cx);
+        let label = format!("{} {}", t("Style", "风格"), style.name);
+        if !style.has_look || style.source.is_none() {
+            self.edit_selected(label, move |a| style_onto(a, &style, stack), cx);
+            return;
+        }
+        let targets: Vec<(ImageId, AdjustmentSet)> = self
+            .selection
+            .iter()
+            .copied()
+            .map(|id| {
+                let target = self.edits.get(&id).map(|edit| edit.adj.clone()).unwrap_or_default();
+                (id, target)
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let engine = self.engine.clone();
+        let plain = style.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    targets
+                        .into_iter()
+                        .map(|(id, target)| {
+                            let effective = style_for_target(engine.as_ref(), &style, id, &target);
+                            (id, target, effective)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| this.apply_loaded_style(label, plain, stack, loaded, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn apply_loaded_style(
+        &mut self,
+        label: String,
+        plain: StyleInfo,
+        stack: bool,
+        loaded: Vec<(ImageId, AdjustmentSet, StyleInfo)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = Vec::new();
+        for (id, target, effective) in loaded {
+            let edit = self.edits.entry(id).or_default();
+            let before = edit.adj.clone();
+            if edit.adj == target {
+                style_onto(&mut edit.adj, &effective, stack);
+            } else {
+                // The image changed while the look was being loaded; the old
+                // target no longer describes it, so use the preloaded style.
+                style_onto(&mut edit.adj, &plain, stack);
+            }
+            if before != edit.adj {
+                edit.undo.push((SharedString::from(label.clone()), before));
+                edit.redo.clear();
+                changed.push(id);
+            }
+        }
+        self.after_commit_many(changed, cx);
+        self.preview.before_dirty = true;
+        self.request_render(RenderQuality::Final, cx);
+        cx.notify();
     }
 
     /// Previews a style on the current image while the pointer rests on it, as
@@ -1310,7 +1375,13 @@ impl AppState {
         let adj = look.map(|look| {
             let mut a = self.adj().clone();
             match look {
-                HoverLook::Style(style, stack) => style_onto(&mut a, &style, stack),
+                HoverLook::Style(style, stack) => {
+                    let effective = match self.current {
+                        Some(image) => style_for_target(self.engine.as_ref(), &style, image, &a),
+                        None => style,
+                    };
+                    style_onto(&mut a, &effective, stack);
+                }
                 HoverLook::User(index) => {
                     if let Some(style) = self.settings.user_styles.get(index) {
                         user_style_onto(&mut a, style);
@@ -1902,6 +1973,26 @@ fn style_onto(a: &mut AdjustmentSet, style: &StyleInfo, stack: bool) {
         }
     }
     a.style = Some(style.name.clone());
+}
+
+/// A style's adjustments for one target image. AICGR styles are reloaded
+/// against the target; any failure falls back to the preloaded adjustments.
+fn style_for_target(
+    engine: &dyn ImageEngine,
+    style: &StyleInfo,
+    image: ImageId,
+    target: &AdjustmentSet,
+) -> StyleInfo {
+    if !style.has_look || style.source.is_none() {
+        return style.clone();
+    }
+    match engine.style_for_image(image, style, target) {
+        Ok(adjustments) => StyleInfo { adjustments, ..style.clone() },
+        Err(err) => {
+            log::warn!("style {} for image {}: {err:#}; using the preloaded style", style.name, image.0);
+            style.clone()
+        }
+    }
 }
 
 fn user_style_onto(a: &mut AdjustmentSet, style: &UserStyle) {
