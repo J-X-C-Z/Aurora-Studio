@@ -976,8 +976,7 @@ fn stage_movement(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
     let ty = adj.shift_y * 0.01 * h as f32 * 0.5;
     let src = buf.to_vec();
     let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
-    let mut out = vec![0u8; w * h * 4];
-    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let xx = x as f32 + 0.5 - cx;
             let yy = y as f32 + 0.5 - cy;
@@ -999,7 +998,6 @@ fn stage_movement(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
             row[i + 3] = src[(y * w + x) * 4 + 3];
         }
     });
-    buf.copy_from_slice(&out);
 }
 
 /// One separable 1D Gaussian gather along `d`, weights `exp(-4 ln2 t^2)` and
@@ -2735,6 +2733,85 @@ over1={over1} diff_px={diff_px}",
         let adj = off();
         stage_movement(&mut buf, 16, 16, &adj.lens);
         assert_eq!(base, buf, "shift_x = shift_y = tilt = 0 is identity");
+    }
+
+    fn stage_movement_full_output_reference(
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        adj: &LensCorrection,
+    ) {
+        let tilt = adj.tilt.clamp(-45.0, 45.0);
+        if w == 0 || h == 0 || (adj.shift_x == 0.0 && adj.shift_y == 0.0 && tilt == 0.0) {
+            return;
+        }
+        let shift_mag = adj.shift_x.hypot(adj.shift_y);
+        let m = if shift_mag > 0.0 { 0.01 * shift_mag } else { 1.0 };
+        let tq = (m * tilt.to_radians().tan()).atan();
+        let k = (tq * 0.5).tan();
+        let (mut m0, mut m1, mut m2, mut m3, mut m4, mut m5) =
+            (1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0);
+        m0 += k * m4;
+        m1 += k * m4;
+        m2 += k * m4;
+        m3 += k * m0;
+        m4 += k * m1;
+        m5 += k * m2;
+        let diag = (((w * w + h * h) as f32).sqrt()).max(1.0);
+        m2 /= diag;
+        m5 /= diag;
+        let tx = adj.shift_x * 0.01 * w as f32 * 0.5;
+        let ty = adj.shift_y * 0.01 * h as f32 * 0.5;
+        let src = buf.to_vec();
+        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+        let mut out = vec![0u8; w * h * 4];
+        out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let xx = x as f32 + 0.5 - cx;
+                let yy = y as f32 + 0.5 - cy;
+                let a = m0 - m2 * xx;
+                let b = m1 - m2 * yy;
+                let c = m3 - m5 * xx;
+                let d = m4 - m5 * yy;
+                let det = d * a - c * b;
+                let (u, v) = if det.abs() < 1e-6 {
+                    (xx, yy)
+                } else {
+                    (
+                        (d * xx - c * yy) / det - tx,
+                        (a * yy - b * xx) / det - ty,
+                    )
+                };
+                let rgb = sample_bilinear(&src, w, h, cx + u, cy + v);
+                let i = x * 4;
+                for k in 0..3 {
+                    row[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+                }
+                row[i + 3] = src[(y * w + x) * 4 + 3];
+            }
+        });
+        buf.copy_from_slice(&out);
+    }
+
+    #[test]
+    fn movement_in_place_matches_full_output_reference() {
+        let (w, h) = (97usize, 71usize);
+        let mut base = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x + y) % 2 == 0 { 230 } else { 26 };
+                base.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let mut expected = base.clone();
+        let mut actual = base;
+        let mut adj = off();
+        adj.lens.shift_x = 7.5;
+        adj.lens.shift_y = -3.25;
+        adj.lens.tilt = 11.0;
+        stage_movement_full_output_reference(&mut expected, w, h, &adj.lens);
+        stage_movement(&mut actual, w, h, &adj.lens);
+        assert_eq!(actual, expected);
     }
 
     #[test]
