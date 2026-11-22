@@ -1,0 +1,2404 @@
+{
+  "schema": "aurora.portrait-parse.wl47-makeup-owner-bytes.static-source-map/1",
+  "generated_at_utc": "2026-11-21T23:20:12+00:00",
+  "sources": {
+    "effect_config_root": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\effect-decrypted\\config",
+    "ui_bundle": {
+      "path": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\www\\agent\\assets\\dnd-overlay.vue_vue_type_style_index_0_scoped_e11a735c_lang-Cf6pNYKR.js",
+      "bytes": 700885,
+      "sha256": "969853980A910A5DB631CCF0374554176BDCC3A79210701F1D3CDF3CBFCE8978"
+    }
+  },
+  "ui_keys": {
+    "highlight": 9,
+    "shadowStereo": 8,
+    "eyebrowPath": 90092,
+    "eyebrowDegree_left": 100,
+    "eyebrowDegree_right": 117,
+    "eyelinerPath": 900114,
+    "eyelinerDegree_upper": 103,
+    "eyelinerDegree_lower": 30007,
+    "eyelashPath": 90093,
+    "eyelashDegree_upper": 105,
+    "eyelashDegree_lower": 118,
+    "blusherPath": 90091,
+    "blusherDegree": 106,
+    "lipstickPath": 90095,
+    "lipstickDegree": 107,
+    "lipstickTexture": 90095,
+    "eyePupilPath": 90097,
+    "eyePupilDegree": 111,
+    "eyeMakeupPath": 90094,
+    "eyeMakeupDegree": 90032,
+    "faceDecorationPath": 900110,
+    "faceDecorationDegree": 115,
+    "contourPath": 900111,
+    "contourDegree": 116
+  },
+  "rows": [
+    {
+      "pf": 8,
+      "ui_key": "shadowStereo",
+      "selector": {
+        "path_key": null,
+        "degree_key": "shadowStereo"
+      },
+      "canonical_config": "FaceStereo/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "BlusherImageMakeup",
+      "param_flag": 8,
+      "filter_type": 42,
+      "opacity": 100,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 2,
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "assets": [
+        {
+          "path": "FaceStereo/model_FaceStereoShadow_yy.png",
+          "bytes": 69882,
+          "sha256": "AFD6AAC3CCD39F2E16B1DB54E07A3408E851BEF324CD8DD7905CA846BAB76A66",
+          "format": "png",
+          "width": 901,
+          "height": 1081,
+          "bit_depth": 8,
+          "color_type": 2,
+          "role": "material",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "model_FaceStereoShadow_yy.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            8
+          ],
+          "example_config": "FaceStereo/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "model_FaceStereoShadow_yy_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            8
+          ],
+          "example_config": "FaceStereo/effect.json",
+          "example_effect_index": 1
+        }
+      ]
+    },
+    {
+      "pf": 9,
+      "ui_key": "highlight",
+      "selector": {
+        "path_key": null,
+        "degree_key": "highlight"
+      },
+      "canonical_config": "FaceStereo/effect.json",
+      "canonical_effect_index": 2,
+      "effect_name": "BlusherImageMakeup",
+      "param_flag": 9,
+      "filter_type": 42,
+      "opacity": 100,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 2,
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "assets": [
+        {
+          "path": "FaceStereo/model_FaceStereoShadow_gg.png",
+          "bytes": 113976,
+          "sha256": "00420DE943357325EBEE9B00DC4C8DA62F0E5699B6C5231CCB3FBB04C4973FB4",
+          "format": "png",
+          "width": 901,
+          "height": 1081,
+          "bit_depth": 8,
+          "color_type": 2,
+          "role": "material",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "model_FaceStereoShadow_gg.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            9
+          ],
+          "example_config": "FaceStereo/effect.json",
+          "example_effect_index": 2
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "model_FaceStereoShadow_gg_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            9
+          ],
+          "example_config": "FaceStereo/effect.json",
+          "example_effect_index": 3
+        }
+      ]
+    },
+    {
+      "pf": 100,
+      "ui_key": "eyebrowDegree_left",
+      "selector": {
+        "path_key": "eyebrowPath",
+        "degree_key": "eyebrowDegree_left"
+      },
+      "canonical_config": "Makeups/Eyebrow/MUEB00000010/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "NormalEyeBrowColorMakeup",
+      "param_flag": 100,
+      "filter_type": 11,
+      "opacity": 100,
+      "mix_color": [
+        100,
+        82,
+        70,
+        255
+      ],
+      "roi": [
+        210,
+        410,
+        260,
+        110
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeBrowMaskType": 5
+      },
+      "assets": [
+        {
+          "path": "Makeups/Eyebrow/MUEB00000010/mmz.png",
+          "bytes": 18027,
+          "sha256": "4B7320B6F52CC9D4AE04C205155012EE75520FC75D49D22E6D340FE934917E30",
+          "format": "png",
+          "width": 260,
+          "height": 110,
+          "bit_depth": 8,
+          "color_type": 6,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "NormalEyeBrowColorMakeup",
+          "paths": [
+            "mmz1.png"
+          ],
+          "mask_fields": {
+            "EyeBrowMaskType": 5
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            100
+          ],
+          "example_config": "Makeups/Eyebrow/MUEB00000009/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "NormalEyeBrowColorMakeup",
+          "paths": [
+            "mmz.png"
+          ],
+          "mask_fields": {
+            "EyeBrowMaskType": 5
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            100
+          ],
+          "example_config": "Makeups/Eyebrow/MUEB00000010/effect.json",
+          "example_effect_index": 0
+        }
+      ]
+    },
+    {
+      "pf": 103,
+      "ui_key": "eyelinerDegree_upper",
+      "selector": {
+        "path_key": "eyelinerPath",
+        "degree_key": "eyelinerDegree_upper"
+      },
+      "canonical_config": "Makeups/EyeLiner/MUELR00000001/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "SymEyeColorMakeup",
+      "param_flag": 103,
+      "filter_type": 11,
+      "opacity": 100,
+      "mix_color": [
+        39,
+        15,
+        6,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeMaskType": 4
+      },
+      "assets": [
+        {
+          "path": "Makeups/EyeLiner/MUELR00000001/yxz.png",
+          "bytes": 5880,
+          "sha256": "DAB17F626644FDF408A9E7D62205381A293A717ECAE760079919AD2C66FBE80C",
+          "format": "png",
+          "width": 300,
+          "height": 300,
+          "bit_depth": 8,
+          "color_type": 2,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "SymEyeColorMakeup",
+          "paths": [
+            "yxz.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            103
+          ],
+          "example_config": "Makeups/EyeLiner/MUELR00000001/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "SymEyeColorMakeup",
+          "paths": [
+            "yxzs.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            103
+          ],
+          "example_config": "Makeups/EyeLiner/MUELR00000003/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "SymEyeColorMakeup",
+          "paths": [
+            "yxzx.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            103
+          ],
+          "example_config": "Makeups/EyeLiner/MUELR00000003/effect.json",
+          "example_effect_index": 2
+        }
+      ]
+    },
+    {
+      "pf": 105,
+      "ui_key": "eyelashDegree_upper",
+      "selector": {
+        "path_key": "eyelashPath",
+        "degree_key": "eyelashDegree_upper"
+      },
+      "canonical_config": "Makeups/Eyelash/MUEL00000001/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "SymEyeLashColorMakeup",
+      "param_flag": 105,
+      "filter_type": 11,
+      "opacity": 80,
+      "mix_color": [
+        100,
+        45,
+        43,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeLashMaskType": 4
+      },
+      "assets": [
+        {
+          "path": "Makeups/Eyelash/MUEL00000001/lt.png",
+          "bytes": 38132,
+          "sha256": "64ADE09FCFEE41D9FACC939B074FBECEFF6C865E97973B95E52B7B01A40FCCC3",
+          "format": "png",
+          "width": 1200,
+          "height": 1200,
+          "bit_depth": 8,
+          "color_type": 0,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "SymEyeLashColorMakeup",
+          "paths": [
+            "lt.png"
+          ],
+          "mask_fields": {
+            "EyeLashMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            105
+          ],
+          "example_config": "Makeups/Eyelash/MUEL00000001/effect.json",
+          "example_effect_index": 0
+        }
+      ]
+    },
+    {
+      "pf": 106,
+      "ui_key": "blusherDegree",
+      "selector": {
+        "path_key": "blusherPath",
+        "degree_key": "blusherDegree"
+      },
+      "canonical_config": "Makeups/Blusher/MUBL00000001/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "BlusherColorMakeup",
+      "param_flag": 106,
+      "filter_type": 11,
+      "opacity": 100,
+      "mix_color": [
+        234,
+        112,
+        129,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 3,
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "assets": [
+        {
+          "path": "Makeups/Blusher/MUBL00000001/model_Blusher_4001.png",
+          "bytes": 39582,
+          "sha256": "ABAA1F736D9EBB339D26148B9077E765145F6AB2D77CBD511765836746E7C55B",
+          "format": "png",
+          "width": 901,
+          "height": 1081,
+          "bit_depth": 8,
+          "color_type": 0,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "BlusherColorMakeup",
+          "paths": [
+            "model_Blusher_4001.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 3,
+          "face_3dmm_type": null,
+          "param_flags": [
+            106
+          ],
+          "example_config": "Makeups/Blusher/MUBL00000001/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherColorMakeup",
+          "paths": [
+            "sh2.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 0,
+          "face_3dmm_type": null,
+          "param_flags": [
+            106
+          ],
+          "example_config": "Makeups/Blusher/MUBL000000010/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherColorMakeup",
+          "paths": [
+            "sh.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 3,
+          "face_3dmm_type": null,
+          "param_flags": [
+            106
+          ],
+          "example_config": "Makeups/Blusher/MUBL000000011/effect.json",
+          "example_effect_index": 0
+        }
+      ]
+    },
+    {
+      "pf": 107,
+      "ui_key": "lipstickDegree",
+      "selector": {
+        "path_key": "lipstickPath",
+        "degree_key": "lipstickDegree"
+      },
+      "canonical_config": "Makeups/Lipstick/MULS00000001/Satin/effect.json",
+      "canonical_effect_index": 1,
+      "effect_name": "LipStickImageMakeup",
+      "param_flag": 107,
+      "filter_type": 42,
+      "opacity": 100,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        350,
+        800,
+        300,
+        120
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "LipMaskType": 3
+      },
+      "assets": [
+        {
+          "path": "Makeups/Lipstick/MULS00000001/Satin/staintexture.png",
+          "bytes": 13079,
+          "sha256": "76B32F0FDA9A8D06828F2A4B85ADD158F4C350882B349D0C2642BDB85BA4D2DE",
+          "format": "png",
+          "width": 300,
+          "height": 120,
+          "bit_depth": 8,
+          "color_type": 2,
+          "role": "material",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "LipColor",
+          "paths": [],
+          "mask_fields": {},
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            107
+          ],
+          "example_config": "Makeups/Lipstick/MULS00000001/Creamy/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "LipStickImageMakeup",
+          "paths": [
+            "staintexture.png"
+          ],
+          "mask_fields": {
+            "LipMaskType": 3
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            107
+          ],
+          "example_config": "Makeups/Lipstick/MULS00000001/Satin/effect.json",
+          "example_effect_index": 1
+        }
+      ]
+    },
+    {
+      "pf": 111,
+      "ui_key": "eyePupilDegree",
+      "selector": {
+        "path_key": "eyePupilPath",
+        "degree_key": "eyePupilDegree"
+      },
+      "canonical_config": "Makeups/Eyepupil/MUEP00000010/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "EyePupilMakeup",
+      "param_flag": 111,
+      "filter_type": 40,
+      "opacity": 100,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyePupilMaskType": 0
+      },
+      "assets": [
+        {
+          "path": "Makeups/Eyepupil/MUEP00000010/mt.png",
+          "bytes": 34848,
+          "sha256": "4CC8132262FC8B356081353E8F39D4A5D94EAF92BA9E153D3042E5D48D689417",
+          "format": "png",
+          "width": 150,
+          "height": 150,
+          "bit_depth": 8,
+          "color_type": 6,
+          "role": "material",
+          "exists": true
+        },
+        {
+          "path": "Makeups/Eyepupil/MUEP00000010/eye_mask_left.png",
+          "bytes": 11275,
+          "sha256": "FF1B4B2FAFF82E45777A24FF96F074C8A87E2A59DEB37157F50EB76B52E5487F",
+          "format": "png",
+          "width": 300,
+          "height": 300,
+          "bit_depth": 8,
+          "color_type": 6,
+          "role": "auxiliary_mask_asset",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "zrz.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000001/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "zrz.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000001/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "ysh.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000002/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "ysh.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000002/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "wrhz.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000003/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "wrhz.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000003/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "fzyy.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000004/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "fzyy.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000004/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "lz.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000005/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "lz.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000005/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "hxl.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000006/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "hxl.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000006/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "mt.png",
+            "eye_mask_left.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000007/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "EyePupilMakeup",
+          "paths": [
+            "mt.png",
+            "eye_mask_right.png"
+          ],
+          "mask_fields": {
+            "EyePupilMaskType": 0
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            111
+          ],
+          "example_config": "Makeups/Eyepupil/MUEP00000007/effect.json",
+          "example_effect_index": 1
+        }
+      ]
+    },
+    {
+      "pf": 115,
+      "ui_key": "faceDecorationDegree",
+      "selector": {
+        "path_key": "faceDecorationPath",
+        "degree_key": "faceDecorationDegree"
+      },
+      "canonical_config": "Makeups/FacialDecoration/MUFD00000004/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "BlusherImageMakeup",
+      "param_flag": 115,
+      "filter_type": 41,
+      "opacity": 100,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 2,
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "assets": [
+        {
+          "path": "Makeups/FacialDecoration/MUFD00000004/z01.png",
+          "bytes": 41590,
+          "sha256": "13D810429447307BF3E02224B965E2FB5FC3BCB0FBE056E5C06A119B6F3E9C72",
+          "format": "png",
+          "width": 901,
+          "height": 1081,
+          "bit_depth": 8,
+          "color_type": 6,
+          "role": "material",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "3DMMFaceSticker",
+          "paths": [
+            "01.png"
+          ],
+          "mask_fields": {
+            "MaskType": 15
+          },
+          "mesh_type": null,
+          "face_3dmm_type": 2,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000001/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "3DMMFaceSticker",
+          "paths": [
+            "02.png"
+          ],
+          "mask_fields": {
+            "MaskType": 15
+          },
+          "mesh_type": null,
+          "face_3dmm_type": 2,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000002/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "3DMMFaceSticker",
+          "paths": [
+            "03.png"
+          ],
+          "mask_fields": {
+            "MaskType": 15
+          },
+          "mesh_type": null,
+          "face_3dmm_type": 2,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000003/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "3DMMFaceSticker",
+          "paths": [
+            "04.png"
+          ],
+          "mask_fields": {
+            "MaskType": 15
+          },
+          "mesh_type": null,
+          "face_3dmm_type": 2,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000007/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "3DMMFaceSticker",
+          "paths": [
+            "05.png"
+          ],
+          "mask_fields": {
+            "MaskType": 15
+          },
+          "mesh_type": null,
+          "face_3dmm_type": 2,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000008/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "z01.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000004/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "z02.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000005/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "z03.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            115
+          ],
+          "example_config": "Makeups/FacialDecoration/MUFD00000006/effect.json",
+          "example_effect_index": 0
+        }
+      ]
+    },
+    {
+      "pf": 116,
+      "ui_key": "contourDegree",
+      "selector": {
+        "path_key": "contourPath",
+        "degree_key": "contourDegree"
+      },
+      "canonical_config": "Makeups/Contour/MUCT00000001/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "BlusherImageMakeup",
+      "param_flag": 116,
+      "filter_type": 42,
+      "opacity": 90,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 2,
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "assets": [
+        {
+          "path": "Makeups/Contour/MUCT00000001/01.png",
+          "bytes": 232800,
+          "sha256": "C2BE1E256A08DCF5F7E3F409D727FB9981CF128DE713EB154FA2E60406FBC4B5",
+          "format": "png",
+          "width": 901,
+          "height": 1081,
+          "bit_depth": 8,
+          "color_type": 2,
+          "role": "material",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "01.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000001/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "01_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000001/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "02.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000002/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "02_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000002/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "03.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000003/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "03_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000003/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "04.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000004/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "04_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000004/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "05.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000005/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "05_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000005/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "06.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000006/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "06_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000006/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "07.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 2,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000007/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "BlusherImageMakeup",
+          "paths": [
+            "07_SideFace.png"
+          ],
+          "mask_fields": {
+            "BlusherMaskType": 15
+          },
+          "mesh_type": 4,
+          "face_3dmm_type": null,
+          "param_flags": [
+            116
+          ],
+          "example_config": "Makeups/Contour/MUCT00000007/effect.json",
+          "example_effect_index": 1
+        }
+      ]
+    },
+    {
+      "pf": 117,
+      "ui_key": "eyebrowDegree_right",
+      "selector": {
+        "path_key": "eyebrowPath",
+        "degree_key": "eyebrowDegree_right"
+      },
+      "canonical_config": "Makeups/Eyebrow/MUEB00000010/effect.json",
+      "canonical_effect_index": 1,
+      "effect_name": "NormalEyeBrowColorMakeup",
+      "param_flag": 117,
+      "filter_type": 11,
+      "opacity": 100,
+      "mix_color": [
+        100,
+        82,
+        70,
+        255
+      ],
+      "roi": [
+        540,
+        410,
+        260,
+        110
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeBrowMaskType": 5
+      },
+      "assets": [
+        {
+          "path": "Makeups/Eyebrow/MUEB00000010/mmy.png",
+          "bytes": 18116,
+          "sha256": "A06A062449E9DF0060A9E9DCD10458D65C02DB909FB60A431B317B42E8F8BF5B",
+          "format": "png",
+          "width": 260,
+          "height": 110,
+          "bit_depth": 8,
+          "color_type": 6,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "NormalEyeBrowColorMakeup",
+          "paths": [
+            "mmy1.png"
+          ],
+          "mask_fields": {
+            "EyeBrowMaskType": 5
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            117
+          ],
+          "example_config": "Makeups/Eyebrow/MUEB00000009/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "NormalEyeBrowColorMakeup",
+          "paths": [
+            "mmy.png"
+          ],
+          "mask_fields": {
+            "EyeBrowMaskType": 5
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            117
+          ],
+          "example_config": "Makeups/Eyebrow/MUEB00000010/effect.json",
+          "example_effect_index": 1
+        }
+      ]
+    },
+    {
+      "pf": 118,
+      "ui_key": "eyelashDegree_lower",
+      "selector": {
+        "path_key": "eyelashPath",
+        "degree_key": "eyelashDegree_lower"
+      },
+      "canonical_config": "Makeups/Eyelash/MUEL00000001/effect.json",
+      "canonical_effect_index": 2,
+      "effect_name": "SymEyeLashColorMakeup",
+      "param_flag": 118,
+      "filter_type": 11,
+      "opacity": 80,
+      "mix_color": [
+        142,
+        71,
+        68,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeLashMaskType": 4
+      },
+      "assets": [
+        {
+          "path": "Makeups/Eyelash/MUEL00000001/lb.png",
+          "bytes": 25006,
+          "sha256": "03F824EA0709343DFE0B72F55133BA5634D822497AA7181312929DAA14ABCCA9",
+          "format": "png",
+          "width": 1200,
+          "height": 1200,
+          "bit_depth": 8,
+          "color_type": 0,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "SymEyeLashColorMakeup",
+          "paths": [
+            "lb.png"
+          ],
+          "mask_fields": {
+            "EyeLashMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            118
+          ],
+          "example_config": "Makeups/Eyelash/MUEL00000001/effect.json",
+          "example_effect_index": 2
+        }
+      ]
+    },
+    {
+      "pf": 30007,
+      "ui_key": "eyelinerDegree_lower",
+      "selector": {
+        "path_key": "eyelinerPath",
+        "degree_key": "eyelinerDegree_lower"
+      },
+      "canonical_config": "Makeups/EyeLiner/MUELR00000001/effect.json",
+      "canonical_effect_index": 1,
+      "effect_name": "SymEyeColorMakeup",
+      "param_flag": 30007,
+      "filter_type": 11,
+      "opacity": 100,
+      "mix_color": [
+        39,
+        15,
+        6,
+        255
+      ],
+      "roi": [
+        500,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeMaskType": 4
+      },
+      "assets": [
+        {
+          "path": "Makeups/EyeLiner/MUELR00000001/yxy.png",
+          "bytes": 5842,
+          "sha256": "AA9B9962C068213007423C6C08D782C7EF48B4115327286F7E7EE22B50827BCE",
+          "format": "png",
+          "width": 300,
+          "height": 300,
+          "bit_depth": 8,
+          "color_type": 2,
+          "role": "owner_mask_template",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "SymEyeColorMakeup",
+          "paths": [
+            "yxy.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            30007
+          ],
+          "example_config": "Makeups/EyeLiner/MUELR00000001/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "SymEyeColorMakeup",
+          "paths": [
+            "yxys.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            30007
+          ],
+          "example_config": "Makeups/EyeLiner/MUELR00000003/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "SymEyeColorMakeup",
+          "paths": [
+            "yxyx.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 4
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            30007
+          ],
+          "example_config": "Makeups/EyeLiner/MUELR00000003/effect.json",
+          "example_effect_index": 3
+        }
+      ]
+    },
+    {
+      "pf": 90032,
+      "ui_key": "eyeMakeupDegree",
+      "selector": {
+        "path_key": "eyeMakeupPath",
+        "degree_key": "eyeMakeupDegree"
+      },
+      "canonical_config": "Makeups/Eyemakeup/MUEM00000001/effect.json",
+      "canonical_effect_index": 0,
+      "effect_name": "SymEyeImageMakeup",
+      "param_flag": 90032,
+      "filter_type": 41,
+      "opacity": 100,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "mask_fields": {
+        "EyeMaskType": 10
+      },
+      "assets": [
+        {
+          "path": "Makeups/Eyemakeup/MUEM00000001/yyz.png",
+          "bytes": 110002,
+          "sha256": "E759966200873504E539699618A10A2C1934AF1F874E58384BDFC3AA1DC4469B",
+          "format": "png",
+          "width": 300,
+          "height": 300,
+          "bit_depth": 8,
+          "color_type": 6,
+          "role": "material",
+          "exists": true
+        }
+      ],
+      "model": null,
+      "same_job_owner_mask": "missing",
+      "same_job_vbo": "missing",
+      "same_job_ebo": "missing",
+      "same_job_mask_uv": "missing",
+      "same_job_material_uv": "missing",
+      "observed_variants": [
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yyz.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000001/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yyy.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000001/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "lpz.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000003/effect.json",
+          "example_effect_index": 2
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "lpy.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000003/effect.json",
+          "example_effect_index": 3
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yyz2.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000006/effect.json",
+          "example_effect_index": 0
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yyy2.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000006/effect.json",
+          "example_effect_index": 1
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yytlz.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000006/effect.json",
+          "example_effect_index": 2
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yytly.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000006/effect.json",
+          "example_effect_index": 3
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yyggz.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000007/effect.json",
+          "example_effect_index": 2
+        },
+        {
+          "effect_name": "SymEyeImageMakeup",
+          "paths": [
+            "yyggy.png"
+          ],
+          "mask_fields": {
+            "EyeMaskType": 10
+          },
+          "mesh_type": null,
+          "face_3dmm_type": null,
+          "param_flags": [
+            90032
+          ],
+          "example_config": "Makeups/Eyemakeup/MUEM00000007/effect.json",
+          "example_effect_index": 3
+        }
+      ]
+    }
+  ],
+  "suit_materials": [
+    {
+      "order": 1,
+      "group": "Bronzer",
+      "effect": "BlusherImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Bronzer/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Bronzer/xr.png",
+        "bytes": 933671,
+        "sha256": "3734C9BD8E464162C66929C7A8F2CD1B24A50EB75F2163F432D8C6749DC4C3C6",
+        "format": "png",
+        "width": 901,
+        "height": 1081,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "filter_type": 42,
+      "opacity": 49,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 2,
+      "shelter_type": 7,
+      "force_use_shelter": false
+    },
+    {
+      "order": 2,
+      "group": "Bronzer",
+      "effect": "BlusherImageMakeup",
+      "effect_index": 1,
+      "config": "Makeups/Suit/MU00000001/Bronzer/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Bronzer/xr_SideFace.png",
+        "bytes": 153034,
+        "sha256": "A2415415E4E22A99B0975E69A6859EDEC8ED932D5E1E02763CE2BF6CAAF82EB4",
+        "format": "png",
+        "width": 901,
+        "height": 1081,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "filter_type": 42,
+      "opacity": 49,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 4,
+      "shelter_type": 7,
+      "force_use_shelter": false
+    },
+    {
+      "order": 3,
+      "group": "Blusher",
+      "effect": "BlusherImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Blusher/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Blusher/sh.png",
+        "bytes": 845994,
+        "sha256": "965EB899B392A1F87E47723D943225CD3C6A1666B9035CF3B5FC727CEDEB0831",
+        "format": "png",
+        "width": 901,
+        "height": 1081,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "BlusherMaskType": 15
+      },
+      "filter_type": 41,
+      "opacity": 20,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        95,
+        40,
+        901,
+        1081
+      ],
+      "mesh_type": 3,
+      "shelter_type": 7,
+      "force_use_shelter": false
+    },
+    {
+      "order": 4,
+      "group": "Eyebrow",
+      "effect": "NormalEyeBrowImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Eyebrow/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyebrow/mmz.png",
+        "bytes": 35491,
+        "sha256": "3001CD45B030197EB703B3432355A578C340499CE44FCBE778BD266731281784",
+        "format": "png",
+        "width": 260,
+        "height": 110,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeBrowMaskType": 5
+      },
+      "filter_type": 41,
+      "opacity": 60,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        210,
+        410,
+        260,
+        110
+      ],
+      "mesh_type": null,
+      "shelter_type": 3,
+      "force_use_shelter": true
+    },
+    {
+      "order": 5,
+      "group": "Eyebrow",
+      "effect": "NormalEyeBrowImageMakeup",
+      "effect_index": 1,
+      "config": "Makeups/Suit/MU00000001/Eyebrow/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyebrow/mmy.png",
+        "bytes": 33246,
+        "sha256": "199BF7D04E7A9335DD7F134DA58C49A66166B42A37B74DEA1DD2EDE5FD0DE254",
+        "format": "png",
+        "width": 260,
+        "height": 110,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeBrowMaskType": 5
+      },
+      "filter_type": 41,
+      "opacity": 60,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        540,
+        410,
+        260,
+        110
+      ],
+      "mesh_type": null,
+      "shelter_type": 4,
+      "force_use_shelter": true
+    },
+    {
+      "order": 6,
+      "group": "Eyemakeup",
+      "effect": "SymEyeImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Eyemakeup/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyemakeup/yyz.png",
+        "bytes": 72288,
+        "sha256": "206DCA750F683B2CE53AFE9CCD0A4DC8C694B41FB964C54DD1C080513D80164A",
+        "format": "png",
+        "width": 300,
+        "height": 300,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeMaskType": 10
+      },
+      "filter_type": 41,
+      "opacity": 60,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "shelter_type": 3,
+      "force_use_shelter": true
+    },
+    {
+      "order": 7,
+      "group": "Eyemakeup",
+      "effect": "SymEyeImageMakeup",
+      "effect_index": 1,
+      "config": "Makeups/Suit/MU00000001/Eyemakeup/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyemakeup/yyy.png",
+        "bytes": 71349,
+        "sha256": "4F95ABA69921EA13418E08E37E94A362A57B0D58A43FA048F60BBDA08DE5C15F",
+        "format": "png",
+        "width": 300,
+        "height": 300,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeMaskType": 10
+      },
+      "filter_type": 41,
+      "opacity": 60,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        500,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "shelter_type": 4,
+      "force_use_shelter": true
+    },
+    {
+      "order": 8,
+      "group": "Eyeliner",
+      "effect": "SymEyeImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Eyeliner/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyeliner/yxy.png",
+        "bytes": 18704,
+        "sha256": "19FFFFFC85E6EB93A79B24BEA27FBD2AF05A7BB71859309DEB0309CEF09DC3F5",
+        "format": "png",
+        "width": 300,
+        "height": 300,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeMaskType": 4
+      },
+      "filter_type": 41,
+      "opacity": 56,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        500,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "shelter_type": 4,
+      "force_use_shelter": true
+    },
+    {
+      "order": 9,
+      "group": "Eyeliner",
+      "effect": "SymEyeImageMakeup",
+      "effect_index": 1,
+      "config": "Makeups/Suit/MU00000001/Eyeliner/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyeliner/yxz.png",
+        "bytes": 10955,
+        "sha256": "3106CF6D9E8C8D8CECE07C232D4B6281811D23E99CF86ACF0602E5B9B0CC6BFE",
+        "format": "png",
+        "width": 300,
+        "height": 300,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeMaskType": 4
+      },
+      "filter_type": 41,
+      "opacity": 56,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "shelter_type": 3,
+      "force_use_shelter": true
+    },
+    {
+      "order": 10,
+      "group": "Eyelash",
+      "effect": "SymEyeLashImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Eyelash/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyelash/jmz.png",
+        "bytes": 18576,
+        "sha256": "187994B0E10AC88BB12E4D03C4C402C294F25697AB83D822A905AB6E3E690929",
+        "format": "png",
+        "width": 300,
+        "height": 300,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeLashMaskType": 4
+      },
+      "filter_type": 41,
+      "opacity": 100,
+      "mix_color": [
+        78,
+        30,
+        28,
+        255
+      ],
+      "roi": [
+        200,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "shelter_type": 11,
+      "force_use_shelter": true
+    },
+    {
+      "order": 11,
+      "group": "Eyelash",
+      "effect": "SymEyeLashImageMakeup",
+      "effect_index": 1,
+      "config": "Makeups/Suit/MU00000001/Eyelash/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Eyelash/jmy.png",
+        "bytes": 17480,
+        "sha256": "EEE1CFDCAB1D062301E697BB63B1A8D1B1C2345B2CFF3420A88AFFD938A3A3B8",
+        "format": "png",
+        "width": 300,
+        "height": 300,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "EyeLashMaskType": 4
+      },
+      "filter_type": 41,
+      "opacity": 100,
+      "mix_color": [
+        78,
+        30,
+        28,
+        255
+      ],
+      "roi": [
+        500,
+        400,
+        300,
+        300
+      ],
+      "mesh_type": null,
+      "shelter_type": 12,
+      "force_use_shelter": true
+    },
+    {
+      "order": 12,
+      "group": "Lipstick",
+      "effect": "LipStickImageMakeup",
+      "effect_index": 0,
+      "config": "Makeups/Suit/MU00000001/Lipstick/effect.json",
+      "material": {
+        "path": "Makeups/Suit/MU00000001/Lipstick/zc.png",
+        "bytes": 44747,
+        "sha256": "40C93AC816A04FE875D88D7A50F251E1E0C45D5E005E0ED03A67D7DE1DFA5F3F",
+        "format": "png",
+        "width": 300,
+        "height": 120,
+        "bit_depth": 8,
+        "color_type": 6,
+        "exists": true
+      },
+      "mask_fields": {
+        "LipMaskType": 3
+      },
+      "filter_type": 41,
+      "opacity": 69,
+      "mix_color": [
+        0,
+        0,
+        0,
+        255
+      ],
+      "roi": [
+        350,
+        800,
+        300,
+        120
+      ],
+      "mesh_type": null,
+      "shelter_type": 0,
+      "force_use_shelter": false
+    }
+  ],
+  "same_job_bytes": {
+    "owner_mask": "0/13",
+    "vbo": "0/14",
+    "ebo": "0/14",
+    "mask_uv": "0/13",
+    "material_uv": "0/7",
+    "accepted_files": [],
+    "rejected_candidates": [
+      {
+        "lane": "s811_pf111_material_producer",
+        "path": "package/material_uv.f32le",
+        "bytes": 24576,
+        "reason": "deterministic stage-entry geometry, not same-job bytes"
+      },
+      {
+        "lane": "s970_pf111_same_job_vbo",
+        "path": "work/final-tree/crates/portrait/tests/fixtures/pf8050_candidate_v1/draw_vbo_stage5.bin",
+        "bytes": 2304,
+        "reason": "synthetic or contract fixture"
+      },
+      {
+        "lane": "s970_pf111_same_job_vbo",
+        "path": "work/final-tree/crates/portrait/tests/fixtures/pf8050_candidate_v1/ebo.u16le",
+        "bytes": 1368,
+        "reason": "synthetic or contract fixture"
+      },
+      {
+        "lane": "s970_pf111_same_job_vbo",
+        "path": "work/pristine/crates/portrait/tests/fixtures/pf8050_candidate_v1/draw_vbo_stage5.bin",
+        "bytes": 2304,
+        "reason": "synthetic or contract fixture"
+      },
+      {
+        "lane": "s970_pf111_same_job_vbo",
+        "path": "work/pristine/crates/portrait/tests/fixtures/pf8050_candidate_v1/ebo.u16le",
+        "bytes": 1368,
+        "reason": "synthetic or contract fixture"
+      },
+      {
+        "lane": "wl46-makeup-compile",
+        "path": "crates/portrait/tests/fixtures/pf8050_candidate_v1/draw_vbo_stage5.bin",
+        "bytes": 2304,
+        "reason": "synthetic or contract fixture"
+      },
+      {
+        "lane": "wl46-makeup-compile",
+        "path": "crates/portrait/tests/fixtures/pf8050_candidate_v1/ebo.u16le",
+        "bytes": 1368,
+        "reason": "synthetic or contract fixture"
+      }
+    ]
+  },
+  "counts": {
+    "b3_rows": 14,
+    "suit_materials": 12,
+    "canonical_assets_present": 15,
+    "same_job_owner_masks": 0,
+    "same_job_vbo_streams": 0,
+    "same_job_ebo_streams": 0,
+    "same_job_mask_uv_streams": 0,
+    "same_job_material_uv_streams": 0
+  },
+  "findings": [
+    {
+      "id": "WL47-S-001",
+      "status": "PROVEN",
+      "claim": "PF107 has both LipColor and LipStickImageMakeup variants."
+    },
+    {
+      "id": "WL47-S-002",
+      "status": "PROVEN",
+      "claim": "PF115 has both 3DMMFaceSticker and BlusherImageMakeup variants."
+    },
+    {
+      "id": "WL47-S-003",
+      "status": "PROVEN",
+      "claim": "The twelve MU00000001 material files and mask fields match static effect.json."
+    },
+    {
+      "id": "WL47-S-004",
+      "status": "OPEN",
+      "claim": "No same-job owner-mask or two-path VBO/EBO/UV bytes were found locally."
+    }
+  ]
+}

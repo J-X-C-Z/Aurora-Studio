@@ -1,0 +1,31 @@
+[package]
+name = "aurora-engine"
+description = "Aurora Studio's processing engine: contract between the interface and the image pipeline, plus a mock engine for UI development."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+z6iii-raw-export = []
+
+[[bin]]
+name = "z6iii-export"
+path = "src/aurora_raw/z6iii/cli.rs"
+required-features = ["z6iii-raw-export"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+memmap2 = "0.9"
+rayon = "1.10"
+parking_lot = "0.12"
+roxmltree = "0.20"
+base64 = "0.22"
+tiff = "0.11"
+crc32fast = "1"
+flate2 = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+aurora-portrait.workspace = true

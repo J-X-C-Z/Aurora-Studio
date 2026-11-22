@@ -1,0 +1,77 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.conflict
+
+# Capture One / third-party reference assets are local-only.
+/crates/engine/testdata/
+
+# User media and benchmark inputs.
+/artifacts/
+/bench-data/
+/samples/private/
+*.NEF
+*.nef
+*.DNG
+*.dng
+*.CR2
+*.CR3
+*.cr2
+*.cr3
+*.ARW
+*.arw
+*.RAF
+*.raf
+*.ORF
+*.orf
+*.RW2
+*.rw2
+*.PEF
+*.pef
+
+# Release outputs, logs and local settings.
+/dist/
+/release/
+*.zip
+*.crate
+*.sha256
+*.log
+*.tmp
+crash-*.dmp
+*.dmp
+.env
+.env.*
+!.env.example
+
+# Local handoff files may contain absolute paths or personal data.
+/docs/PROGRESS-*.md
+
+# Merge/intermediate artifacts.
+*.MERGE
+*.conflict
+*.rs.rs
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local runtime, private fixtures, research probes and build caches.
+/vendor/
+/engine/
+/90_work/
+/.build-cache/
+/crates/engine/local-fixtures/
+/crates/engine/examples/
+/crates/engine/src/bin/
+!/crates/engine/src/bin/
+!/crates/engine/src/bin/c1_session_export.rs
+**/target/
+*.rs.rs
+*.dll
+*.exe
+*.pdb

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows build and synthetic tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check manifests
+        run: cargo metadata --locked --no-deps --format-version 1
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run synthetic tests
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: Build Windows release
+        run: cargo build -p lumen-app --release --locked
+
+      - name: Reject private fixture files
+        shell: powershell
+        run: |
+          $tracked = @(git ls-files | Where-Object {
+            $_ -like 'crates/engine/testdata/*' -or
+            $_ -match '(?i)\.(nef|dng|cr[23]|arw|raf|orf|rw2|pef)$'
+          })
+          if ($tracked.Count -gt 0) {
+            $tracked | ForEach-Object { Write-Error "private fixture tracked: $_" }
+            throw "Private media or Capture One testdata must not enter the repository."
+          }
+
+      - name: Check lumen-engine package contents
+        shell: powershell
+        run: |
+          $contents = cargo package -p lumen-engine --list --allow-dirty
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bad = @($contents | Where-Object { $_ -match '(^|[\\/])testdata([\\/]|$)' })
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Error "private fixture packaged: $_" }
+            throw "lumen-engine package contains local-only testdata."
+          }
