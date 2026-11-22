@@ -613,11 +613,38 @@ fn high_pass(rgba: &[u8], width: u32, height: u32, x: f32, y: f32) -> [f32; 3] {
 /// Dust: 3x3 median filter over the disc.
 fn dust(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32) {
     let radius = radius.max(1.0);
-    let src: Vec<u8> = rgba.to_vec();
     let x0 = (cx - radius).floor().max(0.0) as i64;
     let x1 = (cx + radius).ceil().min(width as f32 - 1.0) as i64;
     let y0 = (cy - radius).floor().max(0.0) as i64;
     let y1 = (cy + radius).ceil().min(height as f32 - 1.0) as i64;
+    if x1 < x0 || y1 < y0 {
+        return;
+    }
+
+    // The median needs one source pixel beyond the destination disc. Snapshot
+    // only that bounded neighbourhood so later dust spots never copy the frame
+    // and every write still reads the pre-write image.
+    let sx0 = (x0 - 1).max(0);
+    let sx1 = (x1 + 1).min(width as i64 - 1);
+    let sy0 = (y0 - 1).max(0);
+    let sy1 = (y1 + 1).min(height as i64 - 1);
+    if sx1 < sx0 || sy1 < sy0 {
+        return;
+    }
+    let sw = (sx1 - sx0 + 1) as usize;
+    let sh = (sy1 - sy0 + 1) as usize;
+    let mut src = vec![[0u8; 3]; sw * sh];
+    for sy in sy0..=sy1 {
+        for sx in sx0..=sx1 {
+            let p = (sy as usize * width as usize + sx as usize) * 4;
+            if p + 3 >= rgba.len() {
+                continue;
+            }
+            let i = (sy - sy0) as usize * sw + (sx - sx0) as usize;
+            src[i] = [rgba[p], rgba[p + 1], rgba[p + 2]];
+        }
+    }
+
     for py in y0..=y1 {
         for px in x0..=x1 {
             let d = ((px as f32 - cx).powi(2) + (py as f32 - cy).powi(2)).sqrt();
@@ -633,11 +660,8 @@ fn dust(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32)
                     if sx < 0 || sy < 0 || sx >= width as i64 || sy >= height as i64 {
                         continue;
                     }
-                    let s = (sy as usize * width as usize + sx as usize) * 4;
-                    if s + 3 >= src.len() {
-                        continue;
-                    }
-                    window[count] = [src[s] as f32, src[s + 1] as f32, src[s + 2] as f32];
+                    let i = (sy - sy0) as usize * sw + (sx - sx0) as usize;
+                    window[count] = [src[i][0] as f32, src[i][1] as f32, src[i][2] as f32];
                     count += 1;
                 }
             }
@@ -646,9 +670,13 @@ fn dust(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32)
             }
             let mut median = [0f32; 3];
             for k in 0..3 {
-                let mut v: Vec<f32> = window[..count].iter().map(|c| c[k]).collect();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                median[k] = v[count / 2];
+                let mut channel = [0f32; 9];
+                for (dst, pixel) in window[..count].iter().enumerate() {
+                    channel[dst] = pixel[k];
+                }
+                channel[..count]
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                median[k] = channel[count / 2];
             }
             let p = (py as usize * width as usize + px as usize) * 4;
             if p + 3 >= rgba.len() {
@@ -974,6 +1002,69 @@ mod tests {
         }
     }
 
+    fn dust_full_snapshot_reference(
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+    ) {
+        let radius = radius.max(1.0);
+        let source = rgba.to_vec();
+        let x0 = (cx - radius).floor().max(0.0) as i64;
+        let x1 = (cx + radius).ceil().min(width as f32 - 1.0) as i64;
+        let y0 = (cy - radius).floor().max(0.0) as i64;
+        let y1 = (cy + radius).ceil().min(height as f32 - 1.0) as i64;
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let d = ((px as f32 - cx).powi(2) + (py as f32 - cy).powi(2)).sqrt();
+                if d > radius {
+                    continue;
+                }
+                let mut window = [[0f32; 3]; 9];
+                let mut count = 0usize;
+                for wy in -1i64..=1 {
+                    for wx in -1i64..=1 {
+                        let sx = px + wx;
+                        let sy = py + wy;
+                        if sx < 0 || sy < 0 || sx >= width as i64 || sy >= height as i64 {
+                            continue;
+                        }
+                        let s = (sy as usize * width as usize + sx as usize) * 4;
+                        if s + 3 >= source.len() {
+                            continue;
+                        }
+                        window[count] = [
+                            source[s] as f32,
+                            source[s + 1] as f32,
+                            source[s + 2] as f32,
+                        ];
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    continue;
+                }
+                let mut median = [0f32; 3];
+                for k in 0..3 {
+                    let mut values: Vec<f32> =
+                        window[..count].iter().map(|pixel| pixel[k]).collect();
+                    values
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    median[k] = values[count / 2];
+                }
+                let p = (py as usize * width as usize + px as usize) * 4;
+                if p + 3 >= rgba.len() {
+                    continue;
+                }
+                for k in 0..3 {
+                    rgba[p + k] = median[k].clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+
     #[test]
     fn clone_roi_snapshot_matches_full_frame_reference() {
         let (w, h) = (61u32, 47u32);
@@ -983,6 +1074,27 @@ mod tests {
         clone_patch_full_snapshot_reference(&mut expected, w, h, args.0, args.1, args.2, args.3);
         let mut actual = base;
         clone_patch(&mut actual, w, h, args.0, args.1, args.2, args.3);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dust_roi_snapshot_matches_full_frame_reference() {
+        let (w, h) = (73u32, 59u32);
+        let base = pattern(w, h);
+        let spots = [
+            (31.3f32, 27.8f32, 12.2f32),
+            (4.5, 8.2, 6.0),
+            (70.8, 56.1, 8.0),
+            (33.0, 29.0, 7.0),
+        ];
+
+        let mut expected = base.clone();
+        let mut actual = base;
+        for &(cx, cy, radius) in &spots {
+            dust_full_snapshot_reference(&mut expected, w, h, cx, cy, radius);
+            dust(&mut actual, w, h, cx, cy, radius);
+        }
+
         assert_eq!(actual, expected);
     }
 
