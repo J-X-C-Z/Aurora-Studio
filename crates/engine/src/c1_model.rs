@@ -2621,6 +2621,66 @@ mod tests {
     }
 
     #[test]
+    fn real_dsc5673_crop_row_is_exact() {
+        // Catalog row ZVARIANTLAYER.Z_PK=1 (also row 10): the only non-zero
+        // ZCROP in the sample catalog. 6048x4032 raw, 270 degrees, clipping=2.
+        let settings = from_layer_row(&row(&[
+            ("ZROTATION", Some("270")),
+            ("ZCROP", Some("2525.8076171875;2348.0876464844;3328.8486328125;4993.2734375000")),
+            ("ZCANVASSIZE", Some("4043.054;6056.673")),
+        ]));
+        let geometry = to_adjustment_set(&settings).geometry;
+        let rect = crop_on_canvas(settings.crop_px, &geometry, Some((6048, 4032)));
+        // Pinned f32 results of the verified transform, not a re-derivation.
+        assert_eq!(rect.x.to_bits(), 0x3e2e8dcf);
+        assert_eq!(rect.y.to_bits(), 0x3e2e1fa2);
+        assert_eq!(rect.width.to_bits(), 0x3f52c711);
+        assert_eq!(rect.height.to_bits(), 0x3f530d87);
+        assert_eq!((rect.x + rect.width / 2.0).to_bits(), 0x3f1506fc);
+        assert_eq!((rect.y + rect.height / 2.0).to_bits(), 0x3f150eac);
+    }
+
+    #[test]
+    fn real_dsc5673_lens_distortion_row_is_exact() {
+        // The only non-zero ZLENSDISTORTION in the sample catalog: eight
+        // `radius, delta` pairs followed by amount, enabled, crop type, scale.
+        let settings = from_layer_row(&row(&[(
+            "ZLENSDISTORTION",
+            Some(
+                "0.0,0.0000;742.0,-43.3392;1483.9,-86.4269;2225.9,-129.0114;\
+                 5935.7,-325.4922;14097.2,-526.0558;20032.8,-279.2483;\
+                 23742.6,146.6017|100.0|1|100|-1.00000",
+            ),
+        )]));
+        let profile = &settings.lens.distortion;
+        assert_eq!(profile.points().len(), 8);
+        assert_eq!(profile.points()[0], (0.0, 0.0));
+        assert_eq!(profile.points()[1], (742.0, -43.3392));
+        assert_eq!(profile.points()[7], (23742.6, 146.6017));
+        assert_eq!(profile.param(0), Some(100.0));
+        assert_eq!(profile.param(1), Some(1.0));
+        assert_eq!(profile.param(2), Some(100.0));
+        assert_eq!(profile.param(3), Some(-1.0));
+
+        // 0x14204E0: micrometre radii over sqrt((pitch.x² + pitch.y²)/2) give
+        // the raw-pixel control points. Pinned native bits for node 1 and 7.
+        let pitch = [
+            (35.9f64 * 1000.0 / 6048.0) as f32,
+            (23.9f64 * 1000.0 / 4032.0) as f32,
+        ];
+        let curve = crop_limit::RadialCurve::from_profile(
+            profile.points(),
+            profile.param(0).unwrap_or(0.0),
+            pitch,
+        );
+        assert_eq!(curve.v.len(), 8);
+        assert_eq!(curve.v[1].to_bits(), 0x405f45c7c0000000);
+        assert_eq!(curve.x[1].to_bits(), 0x405d722c80000000);
+        assert_eq!(curve.v[7].to_bits(), 0x40af454ee0000000);
+        assert_eq!(curve.x[7].to_bits(), 0x40af76bce0000000);
+    }
+
+    #[test]
     fn reads_the_real_sample_row() {
         let s = from_layer_row(&row(&[
             ("Z_ENT", Some("17")),
