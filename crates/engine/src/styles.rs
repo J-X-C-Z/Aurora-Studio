@@ -19,7 +19,13 @@ fn builtin_styles() -> &'static [StyleInfo] {
     let mut add = |group: &str, name: &str, f: &dyn Fn(&mut AdjustmentSet)| {
         let mut a = AdjustmentSet::default();
         f(&mut a);
-        out.push(StyleInfo { name: name.into(), group: group.into(), adjustments: a });
+        out.push(StyleInfo {
+            name: name.into(),
+            group: group.into(),
+            adjustments: a,
+            source: None,
+            has_look: false,
+        });
     };
     add("Film", "Portra Warm", &|a| {
         a.white_balance.kelvin = 6200.0;

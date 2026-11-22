@@ -205,7 +205,7 @@ pub fn processing_method_warning(method: crate::TechnicalProcessingMethod) -> Op
 /// or another format — and is an error; a style that defines no tool group
 /// yields the default [`AdjustmentSet`].
 pub fn load_style(path: &Path) -> Result<C1Style> {
-    load_style_impl(path, None, matchlook::predict_look_reference)
+    load_style_impl(path, None, matchlook::predict_look_reference, &mut false)
 }
 
 /// Loads a style onto an existing target. Explicit style groups are overlaid
@@ -215,13 +215,32 @@ pub fn load_style_for_target(
     target: &AdjustmentSet,
     context: &mut LookToneContext<'_>,
 ) -> Result<C1Style> {
-    load_style_impl(path, Some((target, context)), matchlook::predict_look_reference)
+    load_style_for_target_with(
+        path,
+        target,
+        context,
+        matchlook::predict_look_reference,
+        &mut false,
+    )
+}
+
+/// [`load_style_for_target`] with an explicit predictor and an outcome flag,
+/// so the app path can be tested without the installed Match Look models.
+pub(crate) fn load_style_for_target_with(
+    path: &Path,
+    target: &AdjustmentSet,
+    context: &mut LookToneContext<'_>,
+    predict: impl FnOnce(&LookReference) -> Option<LookPrediction>,
+    look_applied: &mut bool,
+) -> Result<C1Style> {
+    load_style_impl(path, Some((target, context)), predict, look_applied)
 }
 
 fn load_style_impl(
     path: &Path,
     target: Option<(&AdjustmentSet, &mut LookToneContext<'_>)>,
     predict: impl FnOnce(&LookReference) -> Option<LookPrediction>,
+    look_applied: &mut bool,
 ) -> Result<C1Style> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
@@ -269,7 +288,7 @@ fn load_style_impl(
         target_context = Some(context);
     }
     if let Some(reference) = look.as_ref() {
-        let applied = if let Some(context) = target_context {
+        let outcome = if let Some(context) = target_context {
             predict(reference).map(|prediction| {
                 let remaining = LookComponents {
                     exposure: false,
@@ -281,13 +300,14 @@ fn load_style_impl(
                 matchlook::apply_look_color(&prediction.color, &remaining, &mut adjustments);
                 matchlook::apply_look_bw(&prediction.bw, &remaining, &mut adjustments);
                 matchlook::apply_look_tone(&prediction, &reference.components, &mut adjustments, context);
+                *look_applied = true;
             })
         } else {
             matchlook::look_from_reference(reference).map(|predicted| {
                 adjustments = crate::styles::apply_style(&adjustments, &predicted);
             })
         };
-        if applied.is_none() {
+        if outcome.is_none() {
             log::warn!("style {stem}: <AICGR> reference present but the Match Look heads are unavailable");
         }
     }
@@ -1301,7 +1321,7 @@ mod tests {
             color[..5].copy_from_slice(&[0.75, 0.5, 0.75, 1.0, 1.0]);
             color[23] = 0.75;
             Some(LookPrediction { color, bw: [0.5; matchlook::LOOK_BW_VECTOR] })
-        }).expect("load onto target");
+        }, &mut false).expect("load onto target");
 
         let out = style.adjustments;
         assert_eq!(out.exposure.exposure, 2.0);

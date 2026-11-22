@@ -645,7 +645,13 @@ fn style_cache() -> std::sync::MutexGuard<'static, Option<Vec<StyleInfo>>> {
         *guard = Some(
             found
                 .into_iter()
-                .map(|p| StyleInfo { name: p.name, group: p.group, adjustments: p.adjustments })
+                .map(|p| StyleInfo {
+                    name: p.name,
+                    group: p.group,
+                    adjustments: p.adjustments,
+                    source: None,
+                    has_look: false,
+                })
                 .collect(),
         );
     }
@@ -725,7 +731,13 @@ pub fn p1x_names(dir: &Path) -> Vec<String> {
 /// Ensures a caller can turn a preset into a style; kept so `styles::apply_style`
 /// is exercised against real Capture One data.
 pub fn as_style(preset: &C1Preset) -> StyleInfo {
-    StyleInfo { name: preset.name.clone(), group: preset.group.clone(), adjustments: preset.adjustments.clone() }
+    StyleInfo {
+        name: preset.name.clone(),
+        group: preset.group.clone(),
+        adjustments: preset.adjustments.clone(),
+        source: None,
+        has_look: false,
+    }
 }
 
 /// Loads one file; exposed for callers that already know the path.
