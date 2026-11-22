@@ -372,11 +372,36 @@ fn clone_patch(
     let radius = radius.max(1.0);
     let feather = (radius * FEATHER_RATIO).max(1.0);
     let outer = radius + feather;
-    let source: Vec<u8> = rgba.to_vec();
     let x0 = (cx - outer).floor().max(0.0) as i64;
     let x1 = (cx + outer).ceil().min(width as f32 - 1.0) as i64;
     let y0 = (cy - outer).floor().max(0.0) as i64;
     let y1 = (cy + outer).ceil().min(height as f32 - 1.0) as i64;
+    let bw = (x1 - x0 + 1).max(0) as usize;
+    let bh = (y1 - y0 + 1).max(0) as usize;
+    if bw == 0 || bh == 0 {
+        return;
+    }
+
+    // Capture only the destination RGB and sampled source colours needed by
+    // this clone. Both are read from the pre-write frame, so an overlapping
+    // source cannot feed on pixels already replaced by this operation.
+    let mut original = vec![[0u8; 3]; bw * bh];
+    let mut sampled = vec![[0.0f32; 3]; bw * bh];
+    for gy in 0..bh {
+        for gx in 0..bw {
+            let px = x0 + gx as i64;
+            let py = y0 + gy as i64;
+            let p = (py as usize * width as usize + px as usize) * 4;
+            if p + 3 >= rgba.len() {
+                continue;
+            }
+            let i = gy * bw + gx;
+            original[i] = [rgba[p], rgba[p + 1], rgba[p + 2]];
+            sampled[i] =
+                sample(rgba, width, height, px as f32 + src.0, py as f32 + src.1).unwrap_or([0.0; 3]);
+        }
+    }
+
     for py in y0..=y1 {
         for px in x0..=x1 {
             let d = ((px as f32 - cx).powi(2) + (py as f32 - cy).powi(2)).sqrt();
@@ -391,12 +416,10 @@ fn clone_patch(
             if p + 3 >= rgba.len() {
                 continue;
             }
-            let Some(c) = sample(&source, width, height, px as f32 + src.0, py as f32 + src.1)
-            else {
-                continue;
-            };
+            let i = (py - y0) as usize * bw + (px - x0) as usize;
+            let c = sampled[i];
             for k in 0..3 {
-                let orig = source[p + k] as f32;
+                let orig = original[i][k] as f32;
                 rgba[p + k] = (orig * (1.0 - w) + c[k] * w).clamp(0.0, 255.0) as u8;
             }
         }
@@ -902,6 +925,65 @@ mod tests {
             }
         }
         buf
+    }
+
+    fn clone_patch_full_snapshot_reference(
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        src: (f32, f32),
+    ) {
+        let radius = radius.max(1.0);
+        let feather = (radius * FEATHER_RATIO).max(1.0);
+        let outer = radius + feather;
+        let source = rgba.to_vec();
+        let x0 = (cx - outer).floor().max(0.0) as i64;
+        let x1 = (cx + outer).ceil().min(width as f32 - 1.0) as i64;
+        let y0 = (cy - outer).floor().max(0.0) as i64;
+        let y1 = (cy + outer).ceil().min(height as f32 - 1.0) as i64;
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let d = ((px as f32 - cx).powi(2) + (py as f32 - cy).powi(2)).sqrt();
+                if d > outer {
+                    continue;
+                }
+                let w = if d <= radius { 1.0 } else { 1.0 - smoothstep(radius, outer, d) };
+                if w <= 0.0 {
+                    continue;
+                }
+                let p = (py as usize * width as usize + px as usize) * 4;
+                if p + 3 >= rgba.len() {
+                    continue;
+                }
+                let c = sample(
+                    &source,
+                    width,
+                    height,
+                    px as f32 + src.0,
+                    py as f32 + src.1,
+                )
+                .unwrap();
+                for k in 0..3 {
+                    let orig = source[p + k] as f32;
+                    rgba[p + k] = (orig * (1.0 - w) + c[k] * w).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clone_roi_snapshot_matches_full_frame_reference() {
+        let (w, h) = (61u32, 47u32);
+        let base = pattern(w, h);
+        let args = (30.3, 23.7, 12.2, (17.25, -8.5));
+        let mut expected = base.clone();
+        clone_patch_full_snapshot_reference(&mut expected, w, h, args.0, args.1, args.2, args.3);
+        let mut actual = base;
+        clone_patch(&mut actual, w, h, args.0, args.1, args.2, args.3);
+        assert_eq!(actual, expected);
     }
 
     #[test]
