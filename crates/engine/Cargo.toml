@@ -13,6 +13,11 @@ name = "z6iii-export"
 path = "src/aurora_raw/z6iii/cli.rs"
 required-features = ["z6iii-raw-export"]
 
+[[bin]]
+name = "z6iii-color-trace"
+path = "src/aurora_raw/z6iii/color_trace_cli.rs"
+required-features = ["z6iii-raw-export"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
