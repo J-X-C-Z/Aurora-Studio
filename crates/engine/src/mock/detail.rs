@@ -520,6 +520,10 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scal
     let scale_p = 0.35 + 1.3 * strength;
     let pz = PZ_BASE * scale_p;
     let pw = PW_BASE * scale_p;
+    // Shadow-aware chroma variance tolerance so high-ISO shadow chroma blotches
+    // are strongly suppressed while luma boundaries stay sharp (no color bleed).
+    let pz_chroma = 2_400.0 + 18_000.0 * strength * strength;
+    let pw_chroma = 12.0 + 36.0 * strength;
 
     let step = (4.0 * scale).round().clamp(1.0, 8.0) as isize;
     let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as isize;
@@ -555,8 +559,9 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scal
         let max_x = (w - 1) as isize;
         for x in 0..w {
             let [lc, uc, vc] = src_row[x];
-            let t_root = pz + pw * lc;
-            let t = t_root * t_root;
+            let t_root = (pz + pw * lc).max(1.0);
+            let t_l2 = t_root * t_root;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
             let u_lc = uc * lc;
             let v_lc = vc * lc;
             let mut sum_u = 0.0f32;
@@ -569,8 +574,11 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scal
                 let dl = lc - li;
                 let du = u_lc - ui * li;
                 let dv = v_lc - vi * li;
-                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
-                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
                 sum_u += ui * wt;
                 sum_v += vi * wt;
                 sum_w += wt;
@@ -590,8 +598,9 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scal
     buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, out_row)| {
         for x in 0..w {
             let [lc, uc, vc] = horiz[y * w + x];
-            let t_root = pz + pw * lc;
-            let t = t_root * t_root;
+            let t_root = (pz + pw * lc).max(1.0);
+            let t_l2 = t_root * t_root;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
             let u_lc = uc * lc;
             let v_lc = vc * lc;
             let mut sum_u = 0.0f32;
@@ -604,8 +613,11 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scal
                 let dl = lc - li;
                 let du = u_lc - ui * li;
                 let dv = v_lc - vi * li;
-                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
-                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
                 sum_u += ui * wt;
                 sum_v += vi * wt;
                 sum_w += wt;
@@ -741,10 +753,15 @@ fn stage_sharpening(buf: &mut [u8], w: usize, h: usize, adj: &Sharpening, scale:
     if amount <= 0.0 || w == 0 || h == 0 {
         return;
     }
-    let radius = ((adj.radius.max(0.1)) * scale).round().max(1.0) as i32;
+    let raw_radius = adj.radius.max(0.1) * scale;
+    let radius = raw_radius.round().max(1.0) as i32;
+    let scale_atten = raw_radius.clamp(0.15, 1.0);
     let threshold_lin = (adj.threshold.max(0.0) / 255.0) * 0.5;
     let halo = (adj.halo_suppression / 100.0).clamp(0.0, 1.0);
-    let gain = amount * 0.75;
+    // Linear-light USM amplifies perceived mid/shadow contrast by ~2.2x after
+    // sRGB encoding; scale gain accordingly and attenuate at zoomed-out previews
+    // where sub-pixel radii would otherwise overshoot as full 1px screen halos.
+    let gain = amount * 0.30 * scale_atten;
 
     let mut srgb_to_lin = [0.0f32; 256];
     for (i, slot) in srgb_to_lin.iter_mut().enumerate() {
@@ -770,8 +787,10 @@ fn stage_sharpening(buf: &mut [u8], w: usize, h: usize, adj: &Sharpening, scale:
             let i = y * w + x;
             let yc = luma[i];
             let mut detail = yc - row[x];
-            if detail.abs() < threshold_lin {
+            if detail.abs() <= threshold_lin {
                 detail = 0.0;
+            } else {
+                detail = detail.signum() * (detail.abs() - threshold_lin);
             }
             let mut v = yc + detail * gain;
             if halo > 0.0 {
@@ -1972,9 +1991,9 @@ mod tests {
     fn detail_stages_match_reference_pixels() {
         let expected = [
             15226162907845603633, 15226162907845603633, 15226162907845603633,
-            418812772922979691, 14188287539090345076, 7459239400495536644,
-            41615323049186328, 17275283751766918384, 13492956222056251262,
-            17974978512109289819, 18074643075832604112, 17066720766183309958,
+            418812772922979691, 14188287539090345076, 12573880948299953647,
+            41615323049186328, 17275283751766918384, 4520033136177982392,
+            17974978512109289819, 18074643075832604112, 18297136219956733841,
         ];
         let mut actual = Vec::new();
         for (w, h) in [(1, 1), (1, 17), (19, 1), (37, 23)] {

@@ -4404,7 +4404,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
             .rgba
             .iter()
             .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-        assert_eq!(fnv, 9542209573099683753u64);
+        assert_eq!(fnv, 3637764891915511363u64);
     }
 
     /// The refine edge follows the image's luminance, so the guide is the

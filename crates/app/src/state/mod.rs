@@ -415,7 +415,7 @@ impl Default for PanelPrefs {
             capture_adjust: 0,
             capture_folder: "Capture".into(),
             portrait_query: String::new(),
-            portrait_open: false,
+            portrait_open: true,
             scope_kind: ScopeKind::Off,
             pick_to_range: false,
             stack_styles: false,
