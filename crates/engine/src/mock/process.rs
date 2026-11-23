@@ -1340,7 +1340,7 @@ fn geometry_for(src: &Source, adj: &AdjustmentSet, region: NormRect, max_size: u
 /// Keeps a region inside the frame: the four corners are baked into the pixel
 /// walks, so an out-of-range request would otherwise size the output up and
 /// paint the empty border as the neutral fill.
-fn clean_region(r: NormRect) -> NormRect {
+pub(crate) fn clean_region(r: NormRect) -> NormRect {
     let width = if r.width.is_finite() { r.width.clamp(0.0, 1.0) } else { 1.0 };
     let height = if r.height.is_finite() { r.height.clamp(0.0, 1.0) } else { 1.0 };
     NormRect {

@@ -288,6 +288,20 @@ fn raw16_source(path: &Path) -> Option<Source> {
     crate::raw_cache::get_or_decode_source16(path, SOURCE_LONG_SIDE)
 }
 
+/// Switch slightly before native 1:1 (rounding and minimum request sizes may
+/// differ between the viewer and the engine). Keep the proxy for fit views.
+fn wants_native_raw(
+    sensor: (u32, u32), geometry: &crate::Geometry, region: NormRect, max_size: u32,
+) -> bool {
+    if sensor.0.max(sensor.1) <= SOURCE_LONG_SIDE || sensor.0 == 0 || sensor.1 == 0 {
+        return false;
+    }
+    let (w, h) = crate::mock::geometry::FrameMap::new(sensor, geometry).frame_size();
+    let region = process::clean_region(region);
+    let footprint = (w * region.width).max(h * region.height).max(1.0);
+    max_size as f32 >= 0.9 * footprint
+}
+
 /// Indexes `<source file name>.comask` sidecars below `Adjustments/LAM`.
 fn collect_comask(dir: &Path, out: &mut HashMap<String, Vec<PathBuf>>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -691,6 +705,8 @@ struct State {
     entries: Vec<FileEntry>,
     next_id: u64,
     sources: HashMap<ImageId, Arc<Source>>,
+    /// At most one full-size RAW; remember failure for the current image too.
+    native_raw: Option<(ImageId, Option<Arc<Source>>)>,
     ai_inputs: HashMap<ImageId, Arc<AiInput>>,
     /// Most recently used last.
     lru: Vec<ImageId>,
@@ -782,6 +798,7 @@ impl FileEngine {
                 entries: Vec::new(),
                 next_id: 1,
                 sources: HashMap::new(),
+                native_raw: None,
                 ai_inputs: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
@@ -849,6 +866,7 @@ impl FileEngine {
                 entries: Vec::new(),
                 next_id: 1,
                 sources: HashMap::new(),
+                native_raw: None,
                 ai_inputs: HashMap::new(),
                 lru: Vec::new(),
                 jobs: HashMap::new(),
@@ -1340,6 +1358,49 @@ impl FileEngine {
         Ok(source)
     }
 
+    fn native_raw_source(&self, image: ImageId, adj: &AdjustmentSet, region: NormRect, max: u32) -> Option<Arc<Source>> {
+        let (path, lens) = {
+            let st = self.state.lock();
+            let entry = st.entries.iter().find(|e| e.info.id == image)?;
+            if !(crate::raw::is_raw(&entry.path) || is_eip(&entry.path))
+                || !wants_native_raw((entry.info.width, entry.info.height), &adj.geometry, region, max)
+            {
+                return None;
+            }
+            if let Some((id, source)) = &st.native_raw {
+                if *id == image {
+                    return source.clone();
+                }
+            }
+            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif))
+        };
+        let _decoding = self.decode.lock();
+        {
+            let mut st = self.state.lock();
+            if let Some((id, source)) = &st.native_raw {
+                if *id == image {
+                    return source.clone();
+                }
+            }
+            // Drop the previous full frame before allocating a new one.
+            st.native_raw = None;
+        }
+        let source = (|| {
+            let path = if is_eip(&path) { materialize_eip(&self.root, &path).ok()?.raw } else { path };
+            let source = crate::raw_cache::get_or_decode_source16(&path, 0)?;
+            #[cfg(all(windows, feature = "z6iii-raw-export"))]
+            let z6iii = crate::raw::c1_raw_enabled() && crate::z6iii::is_z6iii_nef_file(&path);
+            #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+            let z6iii = false;
+            Some(Arc::new(source.with_lens_shot(lens).with_c1_z6iii_linear(z6iii)))
+        })();
+        if source.is_none() {
+            log::warn!("native RAW preview unavailable for {image:?}; using normal preview source");
+        }
+        self.state.lock().native_raw = Some((image, source.clone()));
+        source
+    }
+
     fn ai_input(&self, image: ImageId) -> anyhow::Result<Arc<AiInput>> {
         let source = self.source(image)?;
         let geometry = self.load_adjustments(image).geometry;
@@ -1592,13 +1653,17 @@ impl FileEngine {
     /// Cached preview frame; `fast` renders at half size and upsamples.
     fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
         let start = Instant::now();
-        let src = self.source(request.image)?;
         // Draft and Final must keep the same output size: a lower draft cap made
         // the preview jump when the pointer was released. Draft is cheaper
         // because `fast` renders half size and upsamples, not because it is smaller.
         let max = request.max_size;
         let adj = crate::styles::resolve(&request.adjustments);
-        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let src = match self.native_raw_source(request.image, &adj, request.region, max) {
+            Some(native) => native,
+            None => self.source(request.image)?,
+        };
+        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
+            .with_source(src.snapshot_id());
         let (rendering, intent_note) = crate::engine::request_rendering(request);
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let hit = self.state.lock().preview.get(key);
@@ -3452,6 +3517,46 @@ mod tests {
         let count = engine.styles().iter().filter(|s| s.group == "Imported" && s.name == "Synthetic").count();
         assert_eq!(count, 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated directory with a real RAW above 4096 px"]
+    fn native_raw_preview_real_fixture() {
+        let dir = PathBuf::from(std::env::var_os("AURORA_NATIVE_RAW_TEST_DIR").expect("fixture directory"));
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine.images().into_iter().find(|info| crate::raw::is_raw(&info.path)).expect("RAW fixture");
+        let adj = AdjustmentSet::default();
+        let roi = NormRect { x: 0.25, y: 0.25, width: 0.125, height: 0.125 };
+        assert!(engine.native_raw_source(info.id, &adj, NormRect::FULL, 1024).is_none());
+        let native = engine.native_raw_source(info.id, &adj, roi, 1024).expect("native RAW decode");
+        assert!(native.size().0.max(native.size().1) > SOURCE_LONG_SIDE);
+        let proxy = engine.source(info.id).expect("proxy RAW decode");
+        assert_eq!(proxy.size().0.max(proxy.size().1), SOURCE_LONG_SIDE);
+        assert_eq!(engine.native_raw_source(info.id, &adj, roi, 1536).unwrap().snapshot_id(), native.snapshot_id());
+        let render = |src: &Source| process::render(src, &adj, roi, 1024, true, None);
+        let expected = render(&native);
+        assert_ne!(expected.rgba, render(&proxy).rgba, "fixture must distinguish native from proxy");
+        let preview = engine.preview_frame(&PreviewRequest {
+            image: info.id, adjustments: adj, region: roi, max_size: 1024, bypass: true,
+            quality: crate::RenderQuality::Final, mask_overlay: None, generation: 1,
+            display_profile: None, proof_profile: None, proof_paper_white: 1.0,
+            proof_black_point: 0.0, rendering_intent: None, black_point_compensation: false,
+        }, false).unwrap();
+        assert_eq!((preview.image.width, preview.image.height), (expected.width, expected.height));
+        assert!(preview.image.pixels.as_slice() == expected.rgba.as_slice(), "final viewport did not use the native RAW");
+        eprintln!("native {:?}, proxy {:?}, viewport {}x{}", native.size(), proxy.size(), expected.width, expected.height);
+    }
+
+    #[test]
+    fn native_raw_preview_switches_using_visible_region_and_sensor_resolution() {
+        let g = crate::Geometry::default();
+        let sensor = (6064, 4040);
+        let roi = NormRect { x: 0.25, y: 0.25, width: 0.25, height: 0.25 };
+        assert!(!wants_native_raw(sensor, &g, NormRect::FULL, 1516));
+        assert!(!wants_native_raw(sensor, &g, roi, 758));
+        assert!(wants_native_raw(sensor, &g, roi, 1516));
+        assert!(wants_native_raw(sensor, &g, roi, 3032));
+        assert!(!wants_native_raw((4096, 2730), &g, roi, 3032));
     }
 
     #[test]
