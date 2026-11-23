@@ -70,26 +70,26 @@ pub const HAIRFLY_REGISTERED_MODELS: [HairFlyRegisteredModel; 4] = [
     HairFlyRegisteredModel {
         hash_id: 3_378_116_080,
         slot: HairFlyModelSlot::Large0,
-        width: 512,
-        height: 768,
+        width: 768,
+        height: 512,
     },
     HairFlyRegisteredModel {
         hash_id: 2_127_140_479,
         slot: HairFlyModelSlot::Large1,
-        width: 512,
-        height: 768,
+        width: 768,
+        height: 512,
     },
     HairFlyRegisteredModel {
         hash_id: 4_083_080_210,
         slot: HairFlyModelSlot::Large2,
-        width: 384,
-        height: 512,
+        width: 512,
+        height: 384,
     },
     HairFlyRegisteredModel {
         hash_id: 195_031_232,
         slot: HairFlyModelSlot::Large3,
-        width: 384,
-        height: 512,
+        width: 512,
+        height: 384,
     },
 ];
 
