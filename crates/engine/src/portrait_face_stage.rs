@@ -182,20 +182,41 @@ pub(super) fn pair(pf: u32) -> Option<(u32, u32)> {
 }
 
 fn missing_draw(pf: u32) -> &'static str {
+    match producer_gap(pf) {
+        Some(gap) => gap,
+        None => draw_gap(pf),
+    }
+}
+
+/// Registry rows whose CPU geometry producer is callable but has no stage
+/// route at all. The refusal names the inputs that producer documents, so a
+/// missing producer stays distinguishable from a row with no kernel.
+pub(super) fn producer_gap(pf: u32) -> Option<&'static str> {
+    match pf {
+        202 => Some("PF202 hairLine producer: 194 landmarks + 135 weights + control slots"),
+        232 => Some("PF232 skullEnhance producer: landmarks 192..206 + 15 factors"),
+        _ => None,
+    }
+}
+
+fn draw_gap(pf: u32) -> &'static str {
     match pf {
         30080..=30083 => "PF30080..PF30083 Type1012 texture/V2 handoff",
         30073 | 30079 => "PF30073/PF30079 Type1011 EBO 0x60F2B60 and frame draw",
         44124 | 48019 | 49221 | 41922 => {
             "PF44124/PF48019/PF49221/PF41922 Type1018 EBO 0x7080940 and frame draw"
         }
-        _ => "same-job face geometry",
+        // Every brow/topology row names the exact index buffer the kernel
+        // refuses without, so a refusal states the missing contract instead
+        // of a generic same-job label.
+        _ => eye_geometry::ebo_rva(pf).unwrap_or("same-job face geometry"),
     }
 }
 
 fn is_eye_draw(pf: u32) -> bool {
     matches!(
         pf,
-        8001..=8021 | 30073 | 30079 | 44124 | 48019 | 49221 | 41922
+        8001..=8022 | 30073 | 30079 | 44124 | 48019 | 49221 | 41922
     )
 }
 
@@ -204,6 +225,14 @@ fn remaining_geometry(pf: u32) -> bool {
         pf,
         30073 | 30079 | 44124 | 48019 | 49221 | 41922
     )
+}
+
+/// Rows the CUDA fragment kernel may serve. The fragment emit path takes the
+/// caller's index buffer without any topology assumption (`cuda_mesh` only
+/// validates length and index range), so the recovered eye and brow family
+/// rides the same contract as the WL rows once a same-job EBO is supplied.
+fn prefer_cuda(pf: u32) -> bool {
+    remaining_geometry(pf) || matches!(pf, 8001..=8022)
 }
 
 fn eye_draw(
@@ -434,7 +463,7 @@ pub(super) fn apply(
                 *edge,
                 *defines,
                 *clamp,
-            remaining_geometry(pf),
+            prefer_cuda(pf),
         )?,
         (FaceGeometry::Smile { dx, dy, mask }, 8033) => {
             // The warp samples each color lane independently and copies alpha,

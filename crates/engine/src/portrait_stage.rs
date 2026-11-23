@@ -51,10 +51,48 @@ use crate::NormRect;
 mod portrait_slim_stage;
 pub use portrait_slim_stage::SlimProducerInputs;
 
+#[path = "portrait_landmark_stage.rs"]
+mod portrait_landmark_stage;
+pub use portrait_landmark_stage::{
+    FACE_LANDMARK_52_MODEL_SHA256, FACE_LANDMARK_52_RESOURCE, FaceLandmarkProducerInputs,
+};
+
+#[path = "portrait_face_input_stage.rs"]
+mod portrait_face_input_stage;
+pub use portrait_face_input_stage::{
+    C1FaceDetection, C1FaceMesh, C1FaceParsing, C1_FACE_DETECTION_MODEL_ID,
+    C1_FACE_DETECTION_MODEL_SHA256, C1_FACE_MESH_MODEL_ID, C1_FACE_MESH_MODEL_SHA256,
+    C1_FACE_PARSING_MODEL_ID, C1_FACE_PARSING_MODEL_SHA256,
+    FACE_LANDMARK_1063025060_MODEL_SHA256, FACE_LANDMARK_323773030_MODEL_SHA256,
+    FACE_LANDMARK_CONSTANTS_SHA256, FaceInputBundle, FaceInputModelPaths, FaceInputProducer,
+    FaceInputFileStamp, FaceInputResultKey, FaceInputSession, FaceInputSessionKey,
+    FaceModelIdentity, FaceNormalization, FaceStageTransform, FACE_STAGE_TRANSFORM_REFUSAL,
+};
+
+#[path = "portrait_eye_bag_stage.rs"]
+mod portrait_eye_bag_stage;
+pub use portrait_eye_bag_stage::{
+    EyeBagFrameProducer, Pf90116ColorDomain, Pf90116FrameBinding, Pf90116FrameReceipt,
+    Pf90116InputOrder, Pf90116TensorReceipts, PF90116_ACTIVE_GATE, PF90116_COLOR_NAME,
+    PF90116_COLOR_SHAPE, PF90116_INPUT_MEAN, PF90116_INPUT_NAME, PF90116_INPUT_SCALE,
+    PF90116_INPUT_SHAPE, PF90116_MODEL_HEIGHT, PF90116_MODEL_ID, PF90116_MODEL_NET_SHA256,
+    PF90116_MODEL_PAYLOAD_SHA256, PF90116_MODEL_WIDTH, PF90116_RESPONSE_NAME,
+    PF90116_RESPONSE_SHAPE,
+};
+
 #[path = "portrait_face_stage.rs"]
 mod portrait_face_stage;
 pub use portrait_face_stage::{FaceGeometry, FaceGeometryDraw, FaceGeometryInputs};
 use portrait_face_stage::FaceGeometryRun;
+
+#[path = "portrait_face_geometry_provider.rs"]
+mod portrait_face_geometry_provider;
+pub use portrait_face_geometry_provider::{
+    build_face_geometry_inputs, landmark_receipt_hashes, mesh_receipt, provider_route,
+    FaceGeometryProviderInputs, FaceGeometryProviderMesh, FaceGeometryProviderMeshReceipt,
+    FaceGeometryProviderReceipt, FaceGeometryProviderRoute, FaceGeometryProviderRow,
+    PROVIDER_ROUTED_PFS,
+};
 
 #[path = "portrait_body_stage.rs"]
 mod portrait_body_stage;
@@ -78,13 +116,17 @@ pub use portrait_historical_tone::{
 #[path = "portrait_historical_skin.rs"]
 mod portrait_historical_skin;
 pub use portrait_historical_skin::{
-    HistoricalSkinData, HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass,
-    HistoricalSkinWrinkle,
+    HistoricalSkinData, HistoricalSkinExternalInputs, HistoricalSkinExternalRow,
+    HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass, HistoricalSkinWrinkle,
+    build_historical_skin_inputs,
 };
 
 #[path = "portrait_repair_stage.rs"]
 mod repair_stage;
-pub use repair_stage::{RepairOutput, RepairProducerInputs};
+pub use repair_stage::{
+    RepairModelPlanes, RepairOutput, RepairOutputReceipt, RepairPlaneSha256,
+    RepairProducerInputs,
+};
 
 #[cfg(test)]
 #[path = "portrait_hlf_wrinkle_stage_tests.rs"]
@@ -101,6 +143,11 @@ mod pf8050_stage_tests;
 #[cfg(test)]
 #[path = "portrait_plump_stage_tests.rs"]
 mod plump_stage_tests;
+
+#[cfg(test)]
+#[path = "portrait_body_stage_tests.rs"]
+mod body_geometry_stage_tests;
+
 
 #[cfg(test)]
 const MASK_EDGE: usize = 512;
@@ -1583,11 +1630,14 @@ fn try_cuda_hlf_auto(
     degree: f32,
     region: NormRect,
     masks: &PortraitMasks,
+    fallback_reason: &mut Option<String>,
 ) -> Option<(Image, Vec<Dispatch>)> {
-    if forced_cuda_failure().is_some() {
+    if let Some(error) = forced_cuda_failure() {
+        *fallback_reason = Some(format!("{error:?}"));
         return None;
     }
     if forced_cuda_empty_dispatch() {
+        *fallback_reason = Some("test-forced empty CUDA dispatch".to_string());
         return None;
     }
     let options = HlfAutoProducerOptions::default();
@@ -1608,22 +1658,29 @@ fn try_cuda_hlf_auto(
         source_rgb.push(pixel[2] as f32 / 255.0);
     }
     let roi = hlf_auto_roi(region, current.width, current.height).ok()?;
-    let gpu = aurora_portrait::cuda_hlf::Hlf::open().ok()?;
-    let (next, dispatches) = match pf {
+    let gpu = match aurora_portrait::cuda_hlf::Hlf::open() {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            *fallback_reason = Some(format!("{error:?}"));
+            return None;
+        }
+    };
+    let result = match pf {
         30021 => {
-            let (rgb, dispatches) = gpu
-                .auto_face_apply(
-                    &source_rgb,
-                    &face_mask,
-                    &skin_mask,
-                    current.width,
-                    current.height,
-                    options.median_interval,
-                    options.gauss_interval,
-                    degree * 100.0,
-                )
-                .ok()?;
-            (hlf_rgb_f32_to_image(current, &rgb).ok()?, dispatches)
+            gpu.auto_face_apply(
+                &source_rgb,
+                &face_mask,
+                &skin_mask,
+                current.width,
+                current.height,
+                options.median_interval,
+                options.gauss_interval,
+                degree * 100.0,
+            )
+            .and_then(|(rgb, dispatches)| {
+                let image = hlf_rgb_f32_to_image(current, &rgb).map_err(CudaError::Refused)?;
+                Ok((image, dispatches))
+            })
         }
         30022 => {
             let mut face_rgba = Vec::with_capacity(pixels * 4);
@@ -1641,16 +1698,99 @@ fn try_cuda_hlf_auto(
                 degree * 100.0,
                 hlf_auto_body_uniforms(),
             )
-            .ok()?
         }
         _ => return None,
     };
-    (!dispatches.is_empty()).then_some((next, dispatches))
+    match result {
+        Ok((next, dispatches)) if !dispatches.is_empty() => Some((next, dispatches)),
+        Ok(_) => {
+            *fallback_reason = Some("CUDA returned no dispatch".to_string());
+            None
+        }
+        Err(error) => {
+            *fallback_reason = Some(format!("{error:?}"));
+            None
+        }
+    }
 }
 
 impl ProducerInputs {
     pub fn write_pf30025(&mut self, bundle: Pf30025ProducerInputs) {
         self.pf30025 = Some(bundle);
+    }
+
+    /// Sole runtime entry for the twelve routed body-geometry rows. The job must
+    /// describe this renderer job (`job_id` non-zero, `frame_size` equal to the
+    /// frame the receipt was taken from) and every row must carry the payload
+    /// kind its kernel dispatches on. Absent payload stays absent: nothing here
+    /// fabricates a mask, shift map, UV stream, mesh or control point.
+    pub fn write_body_geometry(
+        &mut self,
+        job: BodyGeometryJob,
+        receipt: &PortraitJobReceipt,
+    ) -> Result<(), Refusal> {
+        if job.job_id == 0 {
+            return Err(Refusal::ValueOutOfRange("body geometry job id"));
+        }
+        if job.job_id != receipt.job_id() {
+            return Err(Refusal::ValueOutOfRange("body geometry job id"));
+        }
+        if job.frame_size != (receipt.width, receipt.height) {
+            return Err(Refusal::ShapeMismatch("body geometry frame"));
+        }
+        for (pf, input) in &job.effects {
+            if !portrait_body_stage::supports(*pf) {
+                return Err(Refusal::UnknownEffect(*pf));
+            }
+            if !portrait_body_stage::accepts(*pf, input) {
+                return Err(Refusal::ShapeMismatch("body geometry effect kind"));
+            }
+        }
+        self.body_geometry = Some(job);
+        Ok(())
+    }
+
+    pub fn body_geometry(&self) -> Option<&BodyGeometryJob> {
+        self.body_geometry.as_ref()
+    }
+
+    /// Sole runtime entry from model planes into the ten repair rows. The planes are
+    /// validated and bound to the exact `source` frame before anything is stored, so a
+    /// refused call leaves the previous binding untouched. Nothing here synthesizes a
+    /// plane: every absent named plane stays a typed refusal.
+    pub fn write_repair_planes(
+        &mut self,
+        ticket: Option<u64>,
+        source: &Image,
+        planes: RepairModelPlanes,
+        receipt: &PortraitJobReceipt,
+    ) -> Result<RepairOutputReceipt, Refusal> {
+        // A zero or foreign ticket is refused before the planes are read, so a stale
+        // producer cannot be masked by an otherwise well-formed payload.
+        let ticket = match ticket {
+            Some(ticket) if ticket == 0 => return Err(Refusal::MissingInput("repair job ticket")),
+            Some(ticket) if ticket == receipt.job_id() => ticket,
+            Some(_) => return Err(Refusal::ValueOutOfRange("repair job ticket")),
+            None => return Err(Refusal::MissingInput("repair job ticket")),
+        };
+        if source.width != receipt.width || source.height != receipt.height {
+            return Err(Refusal::ShapeMismatch("repair source frame size"));
+        }
+        // A stale or foreign frame is named as a frame problem before any plane shape is
+        // consulted, and before the degree gate could turn it into a silent no-op.
+        let frame =
+            PortraitFrameReceipt::from_renderer_frame(&source.pixels, source.width, source.height)?;
+        if frame.fingerprint() != receipt.frame_receipt().fingerprint() {
+            return Err(Refusal::ValueOutOfRange("repair source frame SHA256"));
+        }
+        let mut inputs = self.repairs.clone().unwrap_or_default();
+        let bound = inputs.insert_same_frame(Some(ticket), source, planes)?;
+        self.repairs = Some(inputs);
+        Ok(bound)
+    }
+
+    pub fn repairs(&self) -> Option<&RepairProducerInputs> {
+        self.repairs.as_ref()
     }
 
     pub fn write_parsing(&mut self, bundle: crate::face_parsing::FaceParsingProducerInputs) {
@@ -1663,6 +1803,14 @@ impl ProducerInputs {
 
     pub fn write_wrinkle(&mut self, bundle: WrinkleProducerInputs) {
         self.wrinkle = Some(bundle);
+    }
+
+    pub fn write_external_historical_skin(
+        &mut self,
+        inputs: Option<HistoricalSkinExternalInputs>,
+    ) -> Result<(), Refusal> {
+        self.historical_skin = Some(build_historical_skin_inputs(inputs)?);
+        Ok(())
     }
 
     pub fn write_pf90004(&mut self, bundle: Pf90004ProducerInputs) {
@@ -2920,6 +3068,21 @@ impl<'a> PortraitJobInputs<'a> {
         }
     }
 
+    /// Test-only entry: keeps the receipt so the digest check still runs, but
+    /// labels the job id independently so a stale-producer job id can be tested.
+    #[cfg(test)]
+    pub fn from_renderer_receipt_with_job_id(
+        receipt: PortraitJobReceipt,
+        masks: &'a PortraitMasks,
+        job_id: u64,
+    ) -> Self {
+        Self {
+            origin: PortraitJobInputOrigin::RendererJob { job_id },
+            receipt: Some(receipt),
+            ..Self::masks_only(masks)
+        }
+    }
+
     pub fn fill_from_producer_inputs(&mut self, producer: &'a ProducerInputs) {
         self.parsing = producer.parsing.as_ref();
         self.slim = producer.slim.as_ref();
@@ -3363,13 +3526,29 @@ fn apply_face_mesh_group(
             }
         };
         return match cuda {
-            Ok(output) => FaceMeshStageResult {
+            Ok(output) if !output.dispatches.is_empty() => FaceMeshStageResult {
                 image: (output.image != *source).then_some(output.image),
                 backend: PortraitBackend::Cuda,
                 dispatches: output.dispatches,
                 fallback_reason: None,
                 refusal: None,
             },
+            Ok(_) => {
+                let cuda_fallback = "CUDA face mesh returned no dispatch".to_string();
+                match face_mesh::rasterize(source, &selected_refs) {
+                    Ok(output) => FaceMeshStageResult {
+                        image: (output != *source).then_some(output),
+                        backend: PortraitBackend::Cpu,
+                        dispatches: Vec::new(),
+                        fallback_reason: Some(cuda_fallback),
+                        refusal: None,
+                    },
+                    Err(refusal) => face_mesh_refused(
+                        refusal.clone(),
+                        Some(format!("{cuda_fallback}; CPU {refusal:?}")),
+                    ),
+                }
+            }
             Err(error) => {
                 let cuda_fallback = format!("CUDA face mesh fallback: {error:?}");
                 match face_mesh::rasterize(source, &selected_refs) {
@@ -3614,7 +3793,12 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 "portrait PF{pf} skipped; missing same-job inputs: {:?}",
                 meta.inputs
             );
-            let refusal = Refusal::NotImplemented(pf);
+            // A row with a callable producer reports the inputs that producer
+            // documents; only a row with no kernel at all stays NotImplemented.
+            let refusal = match portrait_face_stage::producer_gap(pf) {
+                Some(gap) => Refusal::MissingInput(gap),
+                None => Refusal::NotImplemented(pf),
+            };
             report.effects.push(PortraitEffectRun {
                 pf,
                 backend: PortraitBackend::Skipped,
@@ -3970,10 +4154,18 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         }
         let needs_hlf_auto = (pf == 30021 && inputs.hlf_face.is_none())
             || (pf == 30022 && inputs.hlf_body.is_none());
+        let mut cuda_hlf_auto_fallback = None;
         #[cfg(windows)]
         if needs_hlf_auto {
             if let Some((next, dispatches)) =
-                try_cuda_hlf_auto(&current, pf, degree, region, inputs.masks)
+                try_cuda_hlf_auto(
+                    &current,
+                    pf,
+                    degree,
+                    region,
+                    inputs.masks,
+                    &mut cuda_hlf_auto_fallback,
+                )
             {
                 current = next;
                 run.backend = PortraitBackend::Cuda;
@@ -3983,6 +4175,9 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 report.effects.push(run);
                 continue;
             }
+        }
+        if let Some(reason) = cuda_hlf_auto_fallback {
+            run.fallback_reason = Some(format!("CUDA HLF auto: {reason}"));
         }
         let hlf_auto = if needs_hlf_auto {
             match produce_hlf_auto(
@@ -3994,7 +4189,11 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 Ok(auto) => Some(auto),
                 Err(refusal) => {
                     run.backend = PortraitBackend::Skipped;
-                    run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                    let reason = format!("input refused: {refusal:?}");
+                    run.fallback_reason = Some(match run.fallback_reason.take() {
+                        Some(previous) => format!("{previous}; {reason}"),
+                        None => reason,
+                    });
                     run.refusal = Some(refusal.clone());
                     run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal));
                     report.effects.push(run);
@@ -4006,7 +4205,11 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         };
         if let Some(auto) = hlf_auto.as_ref() {
             if let Some(reason) = auto.preprocess_fallback.as_ref() {
-                run.fallback_reason = Some(format!("HLF preprocessing CPU fallback: {reason}"));
+                let reason = format!("HLF preprocessing CPU fallback: {reason}");
+                run.fallback_reason = Some(match run.fallback_reason.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason,
+                });
             }
         }
         if let Err(refusal) =
@@ -4020,7 +4223,13 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 hlf_auto.as_ref(),
             )
         {
-            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+            let reason = format!("input refused: {refusal:?}");
+            run.backend = PortraitBackend::Skipped;
+            run.fallback_reason = Some(match run.fallback_reason.take() {
+                Some(previous) => format!("{previous}; {reason}"),
+                None => reason,
+            });
+            run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
             run.refusal = Some(refusal);
             report.effects.push(run);
             continue;
@@ -5055,6 +5264,17 @@ fn find_makeup_input<'a>(
         }
     }
     bundle.makeup_input(pf)
+}
+
+/// Contract-test entry for the external makeup adapter. The runtime path keeps calling
+/// `find_makeup_input` directly; this only exposes the same lookup so a provider test
+/// can prove the bundle it produced is the row the stage actually resolves.
+#[cfg(test)]
+pub(crate) fn find_makeup_input_for_contract_test<'a>(
+    pf: u32,
+    inputs: &PortraitJobInputs<'a>,
+) -> Result<MakeupInput<'a>, Refusal> {
+    find_makeup_input(pf, inputs)
 }
 
 fn resolve_makeup_route(pf: u32, input: MakeupInput<'_>) -> Result<MakeupRoute, Refusal> {
@@ -6119,7 +6339,9 @@ fn apply_suit_effect(
     let resolved = match resolve_suit_passes(passes) {
         Ok(passes) => passes,
         Err(refusal) => {
+            run.backend = PortraitBackend::Skipped;
             run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+            run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
             run.refusal = Some(refusal);
             return (None, run);
         }

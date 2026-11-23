@@ -53,6 +53,7 @@ pub mod tone_unify;
 pub mod plump;
 pub mod plump_pipeline;
 pub mod radiance;
+pub mod remaining_special_provider;
 pub mod moisture;
 pub mod smile_warp;
 pub mod pore;

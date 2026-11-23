@@ -84,7 +84,7 @@ pub struct HistoricalToneFace {
 }
 
 impl HistoricalToneData {
-    fn pf(&self) -> u32 {
+    pub(crate) fn pf(&self) -> u32 {
         match self {
             Self::HairColor { .. } => 30009,
             Self::FlatGray { .. } => 30013,

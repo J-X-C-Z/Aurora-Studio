@@ -15,6 +15,10 @@ use crate::{Image, Refusal};
 
 /// Recovered kernel entry points, in job order.
 pub const COMPOSITE: &str = "p15_facial_smooth_composite_kernel";
+/// Byte-input twin of [`Self::COMPOSITE`]: same alpha law, same per-channel
+/// expression, same float RGBA output, but the five inputs are the caller's own
+/// `u8` buffers expanded in-register. See `composite_u8`.
+pub const COMPOSITE_U8: &str = "p15_facial_smooth_composite_u8_kernel";
 pub const SURFACE: &str = "p15_surface_pass_kernel";
 pub const GAUSS: &str = "p15_gauss_pass_kernel";
 pub const BOX_BLUR: &str = "p15_box_blur_kernel";
@@ -287,6 +291,9 @@ mod driver {
         ChainStage, CudaError, DeviceMemoryInfo, Dispatch, DriverMetrics, Image, PTX, Pass,
         Refusal, Uniforms, cpu, driver_ptx_isa, ptx_isa, restamp_ptx,
     };
+    use crate::cuda_job_upload::{
+        JobBufferPlan, JobBufferRole, JobContentKey, JobShapeKey, JobUploadReceipt,
+    };
     #[cfg(test)]
     use std::cell::Cell;
     use std::ffi::{CStr, CString, c_char, c_void};
@@ -539,6 +546,14 @@ mod driver {
         buffers: Vec<(CuPtr, usize)>,
     }
 
+    struct CachedJobArena {
+        shape: JobShapeKey,
+        ptr: CuPtr,
+        bytes: usize,
+        content_keys: Vec<Option<JobContentKey>>,
+        staging: Vec<u8>,
+    }
+
     impl CachedNamedBuffers {
         fn matches(&self, shape: &NamedBufferShape) -> bool {
             self.shape == *shape
@@ -564,6 +579,7 @@ mod driver {
         lut_buffers: Vec<CachedLutBuffers>,
         generic_staging: Vec<CachedStaging>,
         named_buffers: Vec<CachedNamedBuffers>,
+        job_arenas: Vec<CachedJobArena>,
         skin_luts: Vec<CachedLut>,
         teeth_luts: Vec<CachedLut>,
         name: String,
@@ -588,6 +604,7 @@ mod driver {
     // shortcut: only two exact shapes stay resident, add a byte-budgeted LRU if adapters interleave more.
     const GENERIC_STAGING_SLOTS: usize = 2;
     const NAMED_BUFFER_SLOTS: usize = 8;
+    const JOB_ARENA_SLOTS: usize = 2;
 
     #[derive(Debug)]
     struct CachedLut {
@@ -635,6 +652,7 @@ mod driver {
                 lut_buffers: Vec::new(),
                 generic_staging: Vec::new(),
                 named_buffers: Vec::new(),
+                job_arenas: Vec::new(),
                 skin_luts: Vec::new(),
                 teeth_luts: Vec::new(),
                 name: String::new(),
@@ -753,9 +771,8 @@ mod driver {
                 return Ok(ptrs);
             }
             if self.composite_buffers.len() == COMPOSITE_BUFFER_SLOTS {
-                self.synchronize_pending()?;
                 let evicted = self.composite_buffers.remove(0);
-                self.free_group(evicted.buffers)?;
+                self.free_composite_group(evicted.buffers, true)?;
             }
             let mut allocations = Buffers {
                 api: &self.api,
@@ -784,6 +801,17 @@ mod driver {
                 }
             }
             first_error
+        }
+
+        fn free_composite_group(
+            &mut self,
+            buffers: Vec<(CuPtr, usize)>,
+            sync: bool,
+        ) -> Result<(), CudaError> {
+            if sync {
+                self.synchronize_pending()?;
+            }
+            self.free_group(buffers)
         }
 
         fn lut_buffers(
@@ -914,6 +942,41 @@ mod driver {
             Ok(ptrs)
         }
 
+        fn job_arena(&mut self, plan: &JobBufferPlan<'_>) -> Result<usize, CudaError> {
+            if let Some(index) = self
+                .job_arenas
+                .iter()
+                .position(|entry| entry.shape == plan.shape_key())
+            {
+                let entry = self.job_arenas.remove(index);
+                self.job_arenas.push(entry);
+                return Ok(self.job_arenas.len() - 1);
+            }
+
+            if self.job_arenas.len() == JOB_ARENA_SLOTS {
+                self.synchronize_pending()?;
+                let evicted = self.job_arenas.remove(0);
+                self.free_group(vec![(evicted.ptr, evicted.bytes)])?;
+            }
+
+            let mut ptr: CuPtr = 0;
+            unsafe {
+                check(
+                    (self.api.mem_alloc)(&mut ptr, plan.total_bytes()),
+                    "cuMemAlloc",
+                )?;
+            }
+            count_device_allocation();
+            self.job_arenas.push(CachedJobArena {
+                shape: plan.shape_key(),
+                ptr,
+                bytes: plan.total_bytes(),
+                content_keys: vec![None; plan.len()],
+                staging: vec![0; plan.total_bytes()],
+            });
+            Ok(self.job_arenas.len() - 1)
+        }
+
         fn cached_skin_lut(&mut self, data: &[u8]) -> Result<CuPtr, CudaError> {
             if let Some(hit) = self.skin_luts.iter().find(|entry| entry.bytes == data) {
                 return Ok(hit.ptr);
@@ -996,6 +1059,9 @@ mod driver {
             self.clear_generic_staging();
             for group in std::mem::take(&mut self.named_buffers) {
                 let _ = self.free_group(group.buffers);
+            }
+            for arena in std::mem::take(&mut self.job_arenas) {
+                let _ = self.free_group(vec![(arena.ptr, arena.bytes)]);
             }
             for lut in self.skin_luts.drain(..) {
                 unsafe {
@@ -1161,6 +1227,17 @@ mod driver {
             self.gpu.download(ptr, data)
         }
 
+        pub(crate) fn copy_from_device(
+            &mut self,
+            dst: usize,
+            src: usize,
+            bytes: usize,
+        ) -> Result<(), CudaError> {
+            let dst = self.checked_ptr(dst, bytes)?;
+            let src = self.checked_ptr(src, bytes)?;
+            self.gpu.copy_from_device(dst, src, bytes)
+        }
+
         pub(crate) fn mark_consumed(&mut self) {
             self.domain.pending = false;
         }
@@ -1172,6 +1249,63 @@ mod driver {
                     "reusable buffer",
                 ))),
             }
+        }
+    }
+
+    /// One job-wide view over the shared device arena. The arena is allocated
+    /// and uploaded once before this session is handed to the caller; every
+    /// face/body/repair/historical payload address comes from the same base.
+    pub struct JobBufferSession<'a> {
+        gpu: &'a Nvidia,
+        domain: &'a mut Domain,
+        module: CuModule,
+        arena: CuPtr,
+        roles: Vec<(JobBufferRole, u16)>,
+        offsets: Vec<usize>,
+        sizes: Vec<usize>,
+        receipt: JobUploadReceipt,
+    }
+
+    impl JobBufferSession<'_> {
+        pub fn receipt(&self) -> JobUploadReceipt {
+            self.receipt
+        }
+
+        pub fn handle(&self, role: JobBufferRole, ordinal: u16) -> Result<u64, CudaError> {
+            let index = self
+                .roles
+                .iter()
+                .position(|candidate| *candidate == (role, ordinal))
+                .ok_or(CudaError::Refused(Refusal::MissingInput(
+                    "CUDA job buffer role",
+                )))?;
+            Ok(self.arena + self.offsets[index] as u64)
+        }
+
+        pub fn launch(
+            &mut self,
+            kernel: &'static str,
+            geometry: (u32, u32),
+            block: (u32, u32),
+            params: &mut [*mut c_void],
+        ) -> Result<Dispatch, CudaError> {
+            let api = self.domain.api;
+            let dispatch =
+                self.gpu
+                    .launch_on(&api, self.module, kernel, geometry, block, params)?;
+            self.domain.pending = true;
+            Ok(dispatch)
+        }
+
+        pub fn mark_consumed(&mut self) {
+            self.domain.pending = false;
+        }
+
+        pub fn payload_bytes(&self, role: JobBufferRole, ordinal: u16) -> Option<usize> {
+            self.roles
+                .iter()
+                .position(|candidate| *candidate == (role, ordinal))
+                .map(|index| self.sizes[index])
         }
     }
 
@@ -1633,51 +1767,47 @@ mod driver {
                     "init_output_from",
                 )));
             }
-            let domain = domain()?;
-            let mut domain = domain
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let module = domain.module(self.image)?.module as CuModule;
-            let api = domain.api;
-            let mut buffers = Buffers {
-                api: &api,
-                ptrs: Vec::new(),
-                pending_launch: false,
-            };
-            let mut input_ptrs = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                let ptr = buffers.alloc(input.len())?;
-                self.upload(ptr, input)?;
-                input_ptrs.push(ptr);
+            let output_slot = inputs.len();
+            let lut_slot = lut.map(|_| output_slot + 1);
+            let mut sizes = inputs.iter().map(|input| input.len()).collect::<Vec<_>>();
+            sizes.push(output_bytes);
+            if let Some(lut) = lut {
+                sizes.push(lut.len());
             }
-            let output_ptr = buffers.alloc(output_bytes)?;
-            self.copy_from_device(output_ptr, input_ptrs[init_output_from], output_bytes)?;
-            let mut lut_ptr = if let Some(bytes) = lut {
-                let ptr = buffers.alloc(bytes.len())?;
-                self.upload(ptr, bytes)?;
-                ptr
-            } else {
-                0
-            };
 
-            let mut params: Vec<*mut c_void> = Vec::with_capacity(inputs.len() + 3);
-            for ptr in &mut input_ptrs {
-                params.push(ptr as *mut CuPtr as *mut c_void);
-            }
-            params.push(&mut lut_ptr as *mut CuPtr as *mut c_void);
-            let mut output_arg = output_ptr;
-            params.push(&mut output_arg as *mut CuPtr as *mut c_void);
-            let mut block = uniform_bytes.to_vec();
-            params.push(block.as_mut_ptr() as *mut c_void);
+            self.with_reusable_buffers(
+                "cuda.run_u8_with_init_optional_lut",
+                &sizes,
+                |buffers| {
+                    for (index, input) in inputs.iter().enumerate() {
+                        buffers.upload(index, input)?;
+                    }
+                    buffers.copy_from_device(output_slot, init_output_from, output_bytes)?;
+                    if let (Some(slot), Some(lut)) = (lut_slot, lut) {
+                        buffers.upload(slot, lut)?;
+                    }
 
-            let dispatch = self.launch_on(&api, module, kernel, grid, BLOCK, &mut params)?;
-            buffers.pending_launch = true;
-            domain.pending = true;
-            domain.synchronize_pending()?;
-            buffers.pending_launch = false;
-            let mut output = vec![0u8; output_bytes];
-            self.download(output_ptr, &mut output)?;
-            Ok((output, dispatch))
+                    let mut args = (0..inputs.len())
+                        .map(|index| buffers.handle(index))
+                        .collect::<Vec<_>>();
+                    let mut params = args
+                        .iter_mut()
+                        .map(|arg| arg as *mut CuPtr as *mut c_void)
+                        .collect::<Vec<_>>();
+                    let mut lut_arg = lut_slot.map_or(0, |slot| buffers.handle(slot));
+                    params.push(&mut lut_arg as *mut CuPtr as *mut c_void);
+                    let mut output_arg = buffers.handle(output_slot);
+                    params.push(&mut output_arg as *mut CuPtr as *mut c_void);
+                    let mut block = uniform_bytes.to_vec();
+                    params.push(block.as_mut_ptr() as *mut c_void);
+
+                    let dispatch = buffers.launch(kernel, grid, BLOCK, &mut params)?;
+                    let mut output = vec![0u8; output_bytes];
+                    buffers.download(output_slot, &mut output)?;
+                    buffers.mark_consumed();
+                    Ok((output, dispatch))
+                },
+            )
         }
 
         fn run_u8_mode(
@@ -1861,6 +1991,149 @@ mod driver {
             unsafe { check((self.api.copy_device)(dst, src, bytes), "cuMemcpyDtoD") }
         }
 
+        /// Uploads one complete provider job through the shared CUDA domain.
+        ///
+        /// Shape reuse selects one arena; content keys suppress unchanged H2D
+        /// slices. All changed slices are copied before one explicit context
+        /// synchronisation. The callback receives stable addresses for kernels
+        /// and may mark the final readback as consumed.
+        pub fn with_job_buffers<T>(
+            &self,
+            plan: &JobBufferPlan<'_>,
+            call: impl FnOnce(&mut JobBufferSession<'_>) -> Result<T, CudaError>,
+        ) -> Result<(T, JobUploadReceipt), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let arena_index = domain.job_arena(plan)?;
+
+            let mut changed = Vec::with_capacity(plan.len());
+            {
+                let arena = &mut domain.job_arenas[arena_index];
+                for index in 0..plan.len() {
+                    let content_key = plan.content_key(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job payload index"),
+                    ))?;
+                    let differs = arena.content_keys[index] != Some(content_key);
+                    changed.push(differs);
+                    if !differs {
+                        continue;
+                    }
+                    let offset = plan.offset(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job offset"),
+                    ))?;
+                    let bytes = plan.byte_len(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job payload length"),
+                    ))?;
+                    plan.write_payload(index, &mut arena.staging[offset..offset + bytes])
+                        .map_err(CudaError::Refused)?;
+                }
+            }
+
+            let mut runs = Vec::new();
+            let mut index = 0usize;
+            while index < changed.len() {
+                if !changed[index] {
+                    index += 1;
+                    continue;
+                }
+                let start = plan.offset(index).ok_or(CudaError::Refused(
+                    Refusal::ShapeMismatch("CUDA job offset"),
+                ))?;
+                let mut end = start
+                    + plan.byte_len(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job payload length"),
+                    ))?;
+                index += 1;
+                while index < changed.len() && changed[index] {
+                    let offset = plan.offset(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job offset"),
+                    ))?;
+                    end = offset
+                        + plan.byte_len(index).ok_or(CudaError::Refused(
+                            Refusal::ShapeMismatch("CUDA job payload length"),
+                        ))?;
+                    index += 1;
+                }
+                runs.push((start, end));
+            }
+
+            let arena_ptr = domain.job_arenas[arena_index].ptr;
+            for &(start, end) in &runs {
+                self.upload(
+                    arena_ptr + start as u64,
+                    &domain.job_arenas[arena_index].staging[start..end],
+                )?;
+            }
+            if !runs.is_empty() {
+                domain.pending = true;
+                domain.synchronize_pending()?;
+            }
+
+            let uploaded_payloads = changed.iter().filter(|changed| **changed).count();
+            let h2d_bytes = runs.iter().map(|(start, end)| end - start).sum();
+            let receipt = JobUploadReceipt {
+                shape_key: plan.shape_key(),
+                payloads: plan.len(),
+                uploaded_payloads,
+                deduped_payloads: plan.len() - uploaded_payloads,
+                h2d_copies: runs.len(),
+                h2d_bytes,
+                explicit_syncs: usize::from(!runs.is_empty()),
+                arena_bytes: plan.total_bytes(),
+            };
+
+            let arena = &mut domain.job_arenas[arena_index];
+            for (index, changed) in changed.iter().copied().enumerate() {
+                if changed {
+                    arena.content_keys[index] = plan.content_key(index);
+                }
+            }
+
+            let roles = (0..plan.len())
+                .map(|index| {
+                    let descriptor = plan.descriptor(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job descriptor"),
+                    ))?;
+                    Ok((descriptor.role, descriptor.ordinal))
+                })
+                .collect::<Result<Vec<_>, CudaError>>()?;
+            let offsets = (0..plan.len())
+                .map(|index| {
+                    plan.offset(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job offset"),
+                    ))
+                })
+                .collect::<Result<Vec<_>, CudaError>>()?;
+            let sizes = (0..plan.len())
+                .map(|index| {
+                    plan.byte_len(index).ok_or(CudaError::Refused(
+                        Refusal::ShapeMismatch("CUDA job payload length"),
+                    ))
+                })
+                .collect::<Result<Vec<_>, CudaError>>()?;
+            let mut session = JobBufferSession {
+                gpu: self,
+                domain: &mut domain,
+                module,
+                arena: arena_ptr,
+                roles,
+                offsets,
+                sizes,
+                receipt,
+            };
+            let result = call(&mut session);
+            if result.is_err() && session.domain.pending {
+                let _ = session.domain.synchronize_pending();
+            }
+            match result {
+                Ok(value) => Ok((value, receipt)),
+                Err(error) => Err(error),
+            }
+        }
+
         pub(crate) fn with_reusable_buffers<T>(
             &self,
             pool: &'static str,
@@ -1887,7 +2160,7 @@ mod driver {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     if session.domain.pending {
-                        let _ = session.domain.synchronize_pending();
+                        session.domain.synchronize_pending()?;
                     }
                     Err(error)
                 }
@@ -2109,12 +2382,134 @@ mod driver {
             domain.pending = true;
             let mut output = vec![0f32; len];
             // DtoH copies to pageable host memory wait for prior launches.
-            let downloaded = self.download(device_output, as_bytes_mut(&mut output));
-            if downloaded.is_ok() {
-                domain.pending = false;
+            match self.download(device_output, as_bytes_mut(&mut output)) {
+                Ok(()) => {
+                    domain.pending = false;
+                    Ok((output, dispatch))
+                }
+                Err(error) => {
+                    let _ = domain.synchronize_pending();
+                    Err(error)
+                }
             }
-            downloaded?;
-            Ok((output, dispatch))
+        }
+
+        /// Byte-input twin of [`Self::composite_f32`]: uploads the caller's own
+        /// `u8` RGBA planes and byte mask plane, expands them to f32 inside the
+        /// kernel, and returns the same float RGBA output. Only the five input
+        /// sizes change, so the exact-shape composite pool keeps a separate
+        /// cached group per flavor and both stay resident within the two slots.
+        ///
+        /// Kernel must be [`Self::COMPOSITE_U8`]: the alpha law and the
+        /// per-channel expression are the float kernel's statements unchanged.
+        /// The expansion is `byte * (1/255)`, matching the CPU wrinkle oracle;
+        /// `byte / 255.0` is not bit-identical and must not be substituted.
+        #[allow(clippy::too_many_arguments)]
+        pub fn composite_u8(
+            &self,
+            kernel: &'static str,
+            source: &[u8],
+            mask: &[u8],
+            skin_mask: &[u8],
+            base: &[u8],
+            residual: &[u8],
+            uniforms: &Uniforms,
+        ) -> Result<(Vec<f32>, Dispatch), CudaError> {
+            uniforms.validate()?;
+            if kernel != super::COMPOSITE_U8 {
+                return Err(CudaError::Refused(Refusal::MissingInput(
+                    "p15 composite u8 kernel",
+                )));
+            }
+            let len = uniforms.buffer_f32();
+            let rgba_bytes = uniforms.width as usize * uniforms.height as usize * 4;
+            let plane_bytes = uniforms.width as usize * uniforms.height as usize;
+            // The kernel indexes by `y * stride + x`, so a padded stride would
+            // read past these tightly packed byte planes. `Uniforms::new` always
+            // sets `stride = width`; refuse rather than silently misindex.
+            if uniforms.stride != uniforms.width {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("stride")));
+            }
+            for (field, buffer) in [
+                ("source", source.len()),
+                ("mask_rgba", mask.len()),
+                ("base", base.len()),
+                ("residual", residual.len()),
+            ] {
+                if buffer != rgba_bytes {
+                    return Err(CudaError::Refused(Refusal::ShapeMismatch(field)));
+                }
+            }
+            if skin_mask.len() != plane_bytes {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("skin_mask")));
+            }
+            let out_bytes = len * 4;
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let module = domain.module(self.image)?.module as CuModule;
+            let [
+                device_source,
+                device_mask,
+                device_skin,
+                device_base,
+                device_residual,
+                device_output,
+            ] = domain.composite_buffers(
+                uniforms,
+                [
+                    rgba_bytes,
+                    rgba_bytes,
+                    plane_bytes,
+                    rgba_bytes,
+                    rgba_bytes,
+                    out_bytes,
+                ],
+            )?;
+            self.upload(device_source, source)?;
+            self.upload(device_mask, mask)?;
+            self.upload(device_skin, skin_mask)?;
+            self.upload(device_base, base)?;
+            self.upload(device_residual, residual)?;
+
+            let mut source_arg = device_source;
+            let mut mask_arg = device_mask;
+            let mut skin_arg = device_skin;
+            let mut base_arg = device_base;
+            let mut residual_arg = device_residual;
+            let mut output_arg = device_output;
+            let mut uniforms_arg = *uniforms;
+            let mut params: [*mut c_void; 7] = [
+                &mut source_arg as *mut CuPtr as *mut c_void,
+                &mut mask_arg as *mut CuPtr as *mut c_void,
+                &mut skin_arg as *mut CuPtr as *mut c_void,
+                &mut base_arg as *mut CuPtr as *mut c_void,
+                &mut residual_arg as *mut CuPtr as *mut c_void,
+                &mut output_arg as *mut CuPtr as *mut c_void,
+                &mut uniforms_arg as *mut Uniforms as *mut c_void,
+            ];
+            let dispatch = self.launch_on(
+                &domain.api,
+                module,
+                kernel,
+                grid(uniforms.width, uniforms.height),
+                BLOCK,
+                &mut params,
+            )?;
+            domain.pending = true;
+            let mut output = vec![0f32; len];
+            // DtoH copies to pageable host memory wait for prior launches.
+            match self.download(device_output, as_bytes_mut(&mut output)) {
+                Ok(()) => {
+                    domain.pending = false;
+                    Ok((output, dispatch))
+                }
+                Err(error) => {
+                    let _ = domain.synchronize_pending();
+                    Err(error)
+                }
+            }
         }
 
         /// Runs one blur pass, returning the pass output and its dispatch.
@@ -2444,7 +2839,7 @@ mod driver {
 #[cfg(windows)]
 pub use driver::DeviceBuffer;
 #[cfg(windows)]
-pub use driver::Nvidia;
+pub use driver::{JobBufferSession, Nvidia};
 
 /// Session buffer group, shared by the LUT stages inside this crate.
 #[cfg(windows)]
@@ -2489,6 +2884,148 @@ mod tests {
                 (state >> 24) as u8
             })
             .collect()
+    }
+
+    /// The byte expansion both backends must agree on: the reciprocal rounded
+    /// once, then multiplied. `byte / 255.0` is a different function.
+    const INV255: f32 = 1.0 / 255.0;
+
+    #[test]
+    fn p15_u8_image_declares_the_byte_kernel_and_the_shared_constant() {
+        // No device needed: this pins the ABI the adapter launches against.
+        assert!(
+            PTX.contains(".visible .entry p15_facial_smooth_composite_u8_kernel("),
+            "u8 composite kernel is missing from the P15 image"
+        );
+        assert!(
+            PTX.contains(".visible .entry p15_facial_smooth_composite_kernel("),
+            "float composite kernel must stay in the same image"
+        );
+        let u8_body_start = PTX
+            .find(".visible .entry p15_facial_smooth_composite_u8_kernel(")
+            .expect("u8 entry");
+        let float_body_start = PTX
+            .find(".visible .entry p15_facial_smooth_composite_kernel(")
+            .expect("float entry");
+        assert!(
+            float_body_start < u8_body_start,
+            "float kernel must keep its original position in the image"
+        );
+        let body_after = |start: usize| -> &str {
+            let tail = &PTX[start..];
+            &tail[..tail.find(".visible .entry").unwrap_or(tail.len())]
+        };
+        let u8_body = body_after(u8_body_start);
+        assert!(
+            u8_body.contains("ld.global.u8"),
+            "u8 kernel must load byte inputs, not float"
+        );
+        // The float kernel keeps its original byte-free loads; a swap here would
+        // silently change its input contract.
+        assert!(
+            !body_after(float_body_start).contains("ld.global.u8"),
+            "float kernel must not start loading bytes"
+        );
+        // Same single-rounded reciprocal the CPU oracle multiplies by.
+        let bits = INV255.to_bits();
+        assert_eq!(bits, 0x3B80_8081, "INV255 constant drifted");
+        let literal = format!("0f{:08X}", bits);
+        assert!(
+            u8_body.contains(&literal),
+            "u8 kernel must scale by the byte-identical {literal}"
+        );
+    }
+
+    #[test]
+    fn byte_oracle_expansion_is_not_a_division() {
+        // Guards the premise the u8 kernel is built on: 126 of 256 byte values
+        // differ between the two laws, so a substitution cannot pass silently.
+        let differing = (0u32..=255)
+            .filter(|byte| {
+                let b = *byte as f32;
+                (b * INV255).to_bits() != (b / 255.0f32).to_bits()
+            })
+            .count();
+        assert_eq!(differing, 126, "expansion law changed under us");
+    }
+
+    // Only the gated GPU comparison consumes this; keep it gated so a
+    // non-Windows test build does not report it as dead code.
+    #[cfg(windows)]
+    fn expand_u8_rgba(values: &[u8]) -> Vec<f32> {
+        values.iter().map(|byte| *byte as f32 * INV255).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn composite_u8_matches_composite_f32_bit_for_bit() {
+        let Some(nvidia) = gpu() else { return };
+        nvidia
+            .clear_composite_buffers()
+            .expect("clear composite cache");
+        for (width, height) in [(64u32, 64u32), (37u32, 19u32)] {
+            let (source, base, residual, mask_r, mask_b, skin) = smooth_case(width, height, false);
+            let pixels = width as usize * height as usize;
+            let uniforms = block(width, height);
+            // Float path: exactly what `facial_smooth` builds on the host today.
+            // Built with the same reciprocal law the u8 kernel applies, so any
+            // remaining difference is the kernel and not the expansion. The
+            // division law `facial_smooth` uses is covered separately.
+            let mask_f32: Vec<f32> = (0..pixels)
+                .flat_map(|i| {
+                    [
+                        mask_r[i] as f32 * INV255,
+                        0.0,
+                        mask_b[i] as f32 * INV255,
+                        0.0,
+                    ]
+                })
+                .collect();
+            let skin_f32: Vec<f32> = skin.iter().map(|byte| *byte as f32 * INV255).collect();
+            let (float_out, float_dispatch) = nvidia
+                .composite_f32(
+                    &expand_u8_rgba(&source.pixels),
+                    &mask_f32,
+                    &skin_f32,
+                    &expand_u8_rgba(&base.pixels),
+                    &expand_u8_rgba(&residual.pixels),
+                    &uniforms,
+                )
+                .expect("float composite dispatch");
+            // Byte path: same u8 planes the CPU oracle consumes, no host f32.
+            let mut mask_rgba = Vec::with_capacity(pixels * 4);
+            for i in 0..pixels {
+                mask_rgba.extend_from_slice(&[mask_r[i], 0, mask_b[i], 0]);
+            }
+            let (byte_out, byte_dispatch) = nvidia
+                .composite_u8(
+                    COMPOSITE_U8,
+                    &source.pixels,
+                    &mask_rgba,
+                    &skin,
+                    &base.pixels,
+                    &residual.pixels,
+                    &uniforms,
+                )
+                .expect("u8 composite dispatch");
+            assert_eq!(byte_dispatch.kernel, COMPOSITE_U8);
+            assert_eq!(float_dispatch.kernel, COMPOSITE);
+            assert_eq!(
+                byte_out
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                float_out
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                "{width}x{height}: byte-input output is not bit-identical"
+            );
+        }
     }
 
     #[test]

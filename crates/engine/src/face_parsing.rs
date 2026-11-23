@@ -905,13 +905,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs AURORA_FACE_PARSING_MODEL, AURORA_FACE_PARSING_IMAGE and AURORA_ORT_LIB"]
+    #[ignore = "needs AURORA_AI_PROVIDER=cpu, AURORA_FACE_PARSING_MASK_BACKEND=cpu, AURORA_FACE_PARSING_MODEL, AURORA_FACE_PARSING_IMAGE and AURORA_ORT_LIB"]
     fn real_face_parsing_bundle_executes_pf108_on_cpu() {
         run_real_pf108_backend(true, "CPU");
     }
 
     #[test]
-    #[ignore = "needs CUDA, AURORA_FACE_PARSING_MODEL, AURORA_FACE_PARSING_IMAGE and AURORA_ORT_LIB"]
+    #[ignore = "needs AURORA_AI_PROVIDER=cuda, AURORA_FACE_PARSING_MASK_BACKEND=cuda, CUDA, AURORA_FACE_PARSING_MODEL, AURORA_FACE_PARSING_IMAGE and AURORA_ORT_LIB"]
     fn real_face_parsing_bundle_executes_pf108_on_cuda() {
         run_real_pf108_backend(false, "Cuda");
     }
@@ -953,6 +953,21 @@ mod tests {
             hex(&producer.model_sha256())
         );
         let inference = producer.infer(&frame, 4502, matrix).unwrap();
+        let expected_provider = if force_cpu { "cpu" } else { "cuda" };
+        assert_eq!(
+            inference.provider.to_ascii_lowercase(),
+            expected_provider,
+            "provider={} mask_provider={}",
+            inference.provider,
+            inference.mask_provider
+        );
+        assert_eq!(
+            inference.mask_provider,
+            expected_provider,
+            "provider={} mask_provider={}",
+            inference.provider,
+            inference.mask_provider
+        );
         if let Ok(expected) = std::env::var(FACE_PARSING_V2_EXPECT_PROVIDER_ENV) {
             assert_eq!(
                 inference.provider.to_ascii_lowercase(),

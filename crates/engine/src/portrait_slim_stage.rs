@@ -30,6 +30,49 @@ pub struct SlimProducerInputs {
 }
 
 impl SlimProducerInputs {
+    /// Builds the same-frame face-width producer input from real landmarks.
+    ///
+    /// PF8025/PF8026 require their own recovered V2 mesh payload and therefore
+    /// stay empty here and fail closed.
+    pub fn from_landmarks(
+        job_id: u64,
+        source: &Image,
+        points194: Vec<[f32; 2]>,
+    ) -> Result<Self, Refusal> {
+        source.validate()?;
+        if job_id == 0 {
+            return Err(Refusal::ValueOutOfRange("face landmarks job ticket"));
+        }
+        if points194.len() != 194 {
+            return Err(Refusal::ShapeMismatch("face landmarks 194"));
+        }
+        if points194.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(Refusal::ValueOutOfRange("face landmarks"));
+        }
+        Ok(Self {
+            job_id,
+            width: source.width,
+            height: source.height,
+            source_sha256: sha256_32(&source.pixels),
+            grid: Vec::new(),
+            base: Vec::new(),
+            points194,
+            framebuffer_positions_w1: Vec::new(),
+            texcoord: Vec::new(),
+            offset_texcoord: Vec::new(),
+            face_scales: Vec::new(),
+            ebo: Vec::new(),
+            rules: Rules {
+                winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
+                cull: aurora_portrait::raster::Cull::None,
+                edge: aurora_portrait::raster::Edge::Inclusive,
+                overlap: aurora_portrait::raster::Overlap::Last,
+            },
+            mat2: [1.0, 0.0, 0.0, 1.0],
+            f_o: [0.0, 0.0],
+        })
+    }
+
     pub(super) fn fingerprint(&self) -> u64 {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         self.job_id.hash(&mut hash);
@@ -76,7 +119,7 @@ impl SlimProducerInputs {
         if self.job_id == 0 || Some(self.job_id) != job_id {
             return Err(Refusal::ValueOutOfRange("PF8025/PF8026 job ticket"));
         }
-        if region != NormRect::FULL || (self.width, self.height) != (source.width, source.height) {
+        if (self.width, self.height) != (source.width, source.height) {
             return Err(Refusal::ShapeMismatch("PF8025/PF8026 frame/region"));
         }
         Ok(())
@@ -110,7 +153,7 @@ pub(super) fn apply(
     if input.job_id == 0 || Some(input.job_id) != job_id {
         return Err(Refusal::ValueOutOfRange("PF8025/PF8026 job ticket"));
     }
-    if region != NormRect::FULL || (input.width, input.height) != (source.width, source.height) {
+    if (input.width, input.height) != (source.width, source.height) {
         return Err(Refusal::ShapeMismatch("PF8025/PF8026 frame/region"));
     }
     if input.source_sha256 != sha256_32(&source.pixels) {
