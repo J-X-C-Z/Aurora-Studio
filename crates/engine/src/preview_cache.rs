@@ -26,6 +26,7 @@ const RENDER_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewKey {
     build: u64,
+    source_snapshot: Option<u64>,
     image: ImageId,
     params: u64,
     long_side: u32,
@@ -33,6 +34,14 @@ pub(crate) struct PreviewKey {
     bypass: bool,
     mask_overlay: Option<u64>,
     fast: bool,
+}
+
+impl PreviewKey {
+    /// Separate frames made from different in-memory source resolutions.
+    pub(crate) fn with_source(mut self, snapshot: u64) -> Self {
+        self.source_snapshot = Some(snapshot);
+        self
+    }
 }
 
 /// One cached frame. The pixel buffer is shared, so a hit costs an `Arc` clone.
@@ -118,6 +127,7 @@ pub(crate) fn key(
 ) -> PreviewKey {
     PreviewKey {
         build: build_fingerprint(),
+        source_snapshot: None,
         image,
         params: params_fingerprint(adj),
         long_side: max_size,

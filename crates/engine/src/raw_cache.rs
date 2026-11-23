@@ -20,7 +20,9 @@ use crate::RgbaImage;
 
 /// Only files with this prefix are ever evicted; the caller shares the folder.
 const PREFIX: &str = "raw-";
-const RAW16_MAGIC: &[u8; 8] = b"AUR16B3\0";
+// Bump when decoded pixels change, even if the persisted layout is unchanged.
+// B3 may contain the fixed luminance NR removed by r6 and predates Bayer ACA.
+const RAW16_MAGIC: &[u8; 8] = b"AUR16B4\0";
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
 
@@ -150,7 +152,7 @@ fn cache_key16(path: &Path, dir: &Path, long_side: u32) -> Option<PathBuf> {
     let mut a = DefaultHasher::new();
     let mut b = DefaultHasher::new();
     let source = crate::raw::c1_raw_enabled();
-    (3u8, path, meta.len(), mtime, long_side, demosaic, source).hash(&mut a);
+    (RAW16_MAGIC, path, meta.len(), mtime, long_side, demosaic, source).hash(&mut a);
     (0xa7u8, path, mtime, demosaic, long_side, meta.len(), source).hash(&mut b);
     Some(dir.join(format!(
         "{PREFIX}16b-{:016x}{:016x}-{long_side}.bin",
@@ -486,7 +488,8 @@ mod tests {
     use std::cell::Cell;
 
     fn scratch(name: &str) -> PathBuf {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/raw-cache-tests");
+        let base = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir).join("raw-cache-tests");
         let dir = base.join(format!(
             "{name}-{}-{}",
             std::process::id(),
@@ -516,6 +519,21 @@ mod tests {
         let path = dir.join("source.nef");
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn raw16_obsolete_cache_is_rejected_by_both_readers() {
+        let dir = scratch("legacy-raw16");
+        let file = dir.join("raw-test.bin");
+        store16_binary(&file, 2, 1, &[100, 200, 300, 65535, 400, 500, 600, 65535]);
+        assert!(read_cached16_binary(&file).is_some());
+        assert!(read_cached_source16(&file).is_some());
+        let mut bytes = fs::read(&file).unwrap();
+        bytes[..8].copy_from_slice(b"AUR16B3\0");
+        fs::write(&file, bytes).unwrap();
+        assert!(read_cached16_binary(&file).is_none());
+        assert!(read_cached_source16(&file).is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
