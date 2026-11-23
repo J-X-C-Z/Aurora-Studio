@@ -410,6 +410,106 @@ impl FaceInputBundle {
         Ok(())
     }
 
+    /// Binds caller-produced face-geometry draws to this exact face-input job.
+    /// This is the attachment point for V-face atlases and other same-frame
+    /// producer rows that already carry their captured VBO/EBO/UV bytes.
+    pub fn attach_face_geometry(
+        &self,
+        source: &Image,
+        inputs: super::FaceGeometryInputs,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.validate_ticket(source, Some(self.job_id))?;
+        if inputs.job_id != self.job_id
+            || (inputs.width, inputs.height) != (source.width, source.height)
+            || inputs.draws.is_empty()
+        {
+            return Err(Refusal::ShapeMismatch("face geometry same-frame binding"));
+        }
+        let digest = super::sha256_32(&source.pixels);
+        if inputs.draws.iter().any(|draw| draw.source_sha256 != digest) {
+            return Err(Refusal::ValueOutOfRange("face geometry frame digest"));
+        }
+        producer.face_geometry = Some(inputs);
+        Ok(())
+    }
+
+    /// Builds PF202/PF232 from this bundle's 194/414 points and explicit
+    /// recovered producer coefficients. No weights, factors or EBO are
+    /// synthesized when the caller does not provide them.
+    pub fn attach_face_detail(
+        &self,
+        source: &Image,
+        weights135: &[f32],
+        factors15: &[f32],
+        controls202: [f32; 2],
+        controls232: [f32; 2],
+        symmetric_second_slot: bool,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.validate_ticket(source, Some(self.job_id))?;
+        let hair = aurora_portrait::kernels::face_detail::hair_line(
+            &self.points194,
+            weights135,
+            controls202[0] * 100.0,
+            symmetric_second_slot,
+            source.width,
+            source.height,
+        )?;
+        let skull = aurora_portrait::kernels::face_detail::skull_top(
+            controls232[0] * 100.0,
+            &self.points414,
+            factors15,
+            source.width as f32,
+            source.height as f32,
+        )?;
+        let digest = super::sha256_32(&source.pixels);
+        let rules = aurora_portrait::raster::Rules {
+            winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
+            cull: aurora_portrait::raster::Cull::None,
+            edge: aurora_portrait::raster::Edge::Inclusive,
+            overlap: aurora_portrait::raster::Overlap::Last,
+        };
+        let inputs = super::FaceGeometryInputs {
+            job_id: self.job_id,
+            width: source.width,
+            height: source.height,
+            draws: vec![
+                super::FaceGeometryDraw {
+                    pf: 202,
+                    controls: controls202,
+                    source_sha256: digest,
+                    geometry: super::FaceGeometry::HairLine {
+                        dest: hair.destination,
+                        uv: hair
+                            .source
+                            .iter()
+                            .map(|point| {
+                                [point[0] / source.width as f32, point[1] / source.height as f32]
+                            })
+                            .collect(),
+                        ebo: hair.indices.to_vec(),
+                        rules,
+                        edge: aurora_portrait::raster_fragment::Edge::ReshapeNormal,
+                        defines: aurora_portrait::raster_fragment::Defines::plain(),
+                        clamp: aurora_portrait::raster_fragment::Clamp::disabled(),
+                    },
+                },
+                super::FaceGeometryDraw {
+                    pf: 232,
+                    controls: controls232,
+                    source_sha256: digest,
+                    geometry: super::FaceGeometry::Skull {
+                        anchor: skull.anchor,
+                        source: skull.source,
+                        warped: skull.warped,
+                    },
+                },
+            ],
+        };
+        self.attach_face_geometry(source, inputs, producer)
+    }
+
     pub fn attach_pf108_inputs(
         &self,
         source: &Image,

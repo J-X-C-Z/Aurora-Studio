@@ -49,6 +49,7 @@ use crate::NormRect;
 
 #[path = "portrait_slim_stage.rs"]
 mod portrait_slim_stage;
+mod portrait_v2_mesh;
 pub use portrait_slim_stage::SlimProducerInputs;
 
 #[path = "portrait_landmark_stage.rs"]

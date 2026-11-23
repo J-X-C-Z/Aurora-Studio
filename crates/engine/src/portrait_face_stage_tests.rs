@@ -1,5 +1,34 @@
 use super::*;
 
+fn type1011_input(
+    source: &Image,
+    slim: &SlimProducerInputs,
+    pf: u32,
+) -> FaceGeometryInputs {
+    FaceGeometryInputs {
+        job_id: slim.job_id,
+        width: source.width,
+        height: source.height,
+        draws: vec![FaceGeometryDraw {
+            pf,
+            controls: [0.5, 0.5],
+            source_sha256: sha256_32(&source.pixels),
+            geometry: FaceGeometry::Type1011 {
+                prepared: (0..100)
+                    .map(|index| {
+                        [
+                            0.4 + (index % 10) as f32 * 0.75,
+                            0.4 + (index / 10) as f32 * 0.75,
+                        ]
+                    })
+                    .collect(),
+                param_list: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                center: [0.5, 0.5],
+            },
+        }],
+    }
+}
+
 #[test]
 fn routes_cover_available_face_and_eye_draws() {
     let requested = (8001..=8033)
@@ -51,6 +80,7 @@ fn prepared_draws_change_pixels_and_refuse_stale_bindings() {
             FaceGeometry::VFace {
                 rows: vec![Row::RightPositive],
                 encoded_offset: offset,
+                atlases: Vec::new(),
             },
         ),
         (
@@ -71,6 +101,14 @@ fn prepared_draws_change_pixels_and_refuse_stale_bindings() {
                 dx: vec![2.0; size],
                 dy: vec![0.0; size],
                 mask: vec![255; size],
+                host_split_receipt: super::SmileHostSplitReceipt {
+                    job_id: slim.job_id,
+                    model_output_id: super::super::SmileRgbReconstructionField::OUTPUT_ID,
+                    model_output_sha256: [0; 32],
+                    dx_sha256: super::hash_f32(&vec![2.0; size]),
+                    dy_sha256: super::hash_f32(&vec![0.0; size]),
+                    mask_sha256: super::sha256_32(&vec![255; size]),
+                },
             },
         ),
     ] {
@@ -250,7 +288,7 @@ fn remaining_eye_routes_use_cuda_when_available_and_fallback_matches_bytes() {
         defines: raster_fragment::Defines::plain(),
         clamp: raster_fragment::Clamp::disabled(),
     };
-    for pf in [30073, 30079, 44124, 48019, 49221, 41922] {
+    for pf in [44124, 48019, 49221, 41922] {
         let input = FaceGeometryInputs {
             job_id: slim.job_id,
             width: source.width,
@@ -303,6 +341,47 @@ fn remaining_eye_routes_use_cuda_when_available_and_fallback_matches_bytes() {
                 cuda.fallback_reason
             );
         }
+    }
+}
+
+#[test]
+fn type1011_prepared100_routes_to_face_mesh_without_changing_landmark_domains() {
+    let (source, slim) = super::super::portrait_slim_stage::tests::fixture();
+    for pf in [30073, 30079] {
+        let input = type1011_input(&source, &slim, pf);
+        let run = apply(
+            &source,
+            NormRect::FULL,
+            Some(slim.job_id),
+            Some(&input),
+            Some(&slim),
+            pf,
+            [0.5, 0.5],
+        )
+        .unwrap();
+        assert!(run.image.is_some(), "PF{pf}");
+        if run.backend == PortraitBackend::Cuda {
+            assert!(!run.dispatches.is_empty(), "PF{pf}");
+        } else {
+            assert_eq!(run.backend, PortraitBackend::Cpu, "PF{pf}");
+        }
+
+        let mut wrong_194 = slim.clone();
+        wrong_194.points194.pop();
+        assert_eq!(
+            apply(
+                &source,
+                NormRect::FULL,
+                Some(slim.job_id),
+                Some(&input),
+                Some(&wrong_194),
+                pf,
+                [0.5, 0.5],
+            ),
+            Err(Refusal::ShapeMismatch(
+                "Type1011 same-job 194 landmarks"
+            ))
+        );
     }
 }
 

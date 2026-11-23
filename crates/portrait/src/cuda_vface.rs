@@ -181,6 +181,43 @@ pub fn fuse_offset_cpu(
     Ok(out)
 }
 
+pub fn fuse_offset_f32_cpu(
+    base: &[[f32; 4]],
+    atlas: Atlas<'_>,
+    degree: f32,
+) -> Result<Vec<[f32; 4]>, Refusal> {
+    atlas.validate()?;
+    if base.len() != (OFFSET_EDGE * OFFSET_EDGE) as usize {
+        return Err(Refusal::ShapeMismatch("PF247/248 base 280x280"));
+    }
+    if !degree.is_finite() || !(0.0..=1.0).contains(&degree) {
+        return Err(Refusal::ValueOutOfRange("PF247/248 degree"));
+    }
+    let [x0, y0, width, height] = atlas.row.spec().rectangle;
+    let mut out = base.to_vec();
+    for y in y0..y0 + height {
+        for x in x0..x0 + width {
+            let atlas_uv = [
+                (x - x0) as f32 / width as f32 + 0.5 / width as f32,
+                (y - y0) as f32 / height as f32 + 0.5 / height as f32,
+            ];
+            let source = base[(y * OFFSET_EDGE + x) as usize];
+            let roi = sample_rgba8(atlas.width, atlas.height, atlas.pixels, atlas_uv);
+            let d = [
+                (source[0] - source[1]) * 0.25 + (roi[0] - roi[1]) * 0.25 * degree,
+                (source[2] - source[3]) * 0.25 + (roi[2] - roi[3]) * 0.25 * degree,
+            ];
+            out[(y * OFFSET_EDGE + x) as usize] = [
+                4.0 * d[0].max(0.0),
+                4.0 * (-d[0]).max(0.0),
+                4.0 * d[1].max(0.0),
+                4.0 * (-d[1]).max(0.0),
+            ];
+        }
+    }
+    Ok(out)
+}
+
 pub struct Output {
     pub row: Row,
     pub degree: f32,
