@@ -543,6 +543,114 @@ pub struct ProducerInputs {
     pub wrinkle: Option<WrinkleProducerInputs>,
     pub makeup_bundle: Option<OwnedMakeupBundle>,
     pub plump: Option<PlumpProducerInputs>,
+    pub pf90130: Option<Pf90130ProducerInputs>,
+}
+
+/// Owned same-job PF90130 producer and aligned geometry. The A/B bridge and
+/// tensor identities remain in `Pf90130GlareProducer`; this type only carries
+/// the caller's exact geometry into the normal portrait stage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pf90130ProducerInputs {
+    producer: Pf90130GlareProducer,
+    source_width: u32,
+    source_height: u32,
+    source_roi: aurora_portrait::kernels::pf90130_chain::PixelRect,
+    uv: Vec<[f32; 2]>,
+    src_to_dst: [[f32; 3]; 2],
+    source_rgb8: Vec<u8>,
+    base_rgb8: Vec<u8>,
+    add_rgb_f32: Vec<f32>,
+    strength: f32,
+}
+
+impl Pf90130ProducerInputs {
+    pub fn from_same_job(
+        producer: Pf90130GlareProducer,
+        geometry: Pf90130AlignedGeometry<'_>,
+    ) -> Result<Self, Refusal> {
+        let roi_end_x = u64::from(geometry.source_roi.x) + u64::from(geometry.source_roi.width);
+        let roi_end_y = u64::from(geometry.source_roi.y) + u64::from(geometry.source_roi.height);
+        if geometry.source_width == 0
+            || geometry.source_height == 0
+            || geometry.source_roi.width != PF90130_PLANE_WIDTH
+            || geometry.source_roi.height != PF90130_PLANE_HEIGHT
+            || roi_end_x > u64::from(geometry.source_width)
+            || roi_end_y > u64::from(geometry.source_height)
+        {
+            return Err(Refusal::ValueOutOfRange("PF90130_SOURCE_ROI"));
+        }
+        if geometry.uv.len() != PF90130_PIXELS
+            || geometry
+                .uv
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite())
+            || geometry
+                .src_to_dst
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ValueOutOfRange("PF90130_GEOMETRY"));
+        }
+        if geometry.source_rgb8.len() != PF90130_PIXELS * 3
+            || geometry.base_rgb8.len() != PF90130_PIXELS * 3
+            || geometry.add_rgb_f32.len() != PF90130_PIXELS * 3
+            || geometry
+                .add_rgb_f32
+                .iter()
+                .any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ShapeMismatch("PF90130_GEOMETRY_PLANES"));
+        }
+        if !geometry.strength.is_finite() || !(0.0..=1.0).contains(&geometry.strength) {
+            return Err(Refusal::ValueOutOfRange("PF90130_STRENGTH"));
+        }
+        Ok(Self {
+            producer,
+            source_width: geometry.source_width,
+            source_height: geometry.source_height,
+            source_roi: geometry.source_roi,
+            uv: geometry.uv.to_vec(),
+            src_to_dst: geometry.src_to_dst,
+            source_rgb8: geometry.source_rgb8.to_vec(),
+            base_rgb8: geometry.base_rgb8.to_vec(),
+            add_rgb_f32: geometry.add_rgb_f32.to_vec(),
+            strength: geometry.strength,
+        })
+    }
+
+    pub fn apply(
+        &self,
+        source: &Image,
+        destination: &Image,
+        job_id: Option<u64>,
+        degree: f32,
+    ) -> Pf90130StageRun {
+        if job_id != Some(self.producer.receipt().ticket()) {
+            return Pf90130StageRun::refused(Refusal::ValueOutOfRange("PF90130_JOB"));
+        }
+        if !degree.is_finite() || degree != self.strength {
+            return Pf90130StageRun::refused(Refusal::ValueOutOfRange("PF90130_CONTROL"));
+        }
+        let geometry = Pf90130AlignedGeometry {
+            source_width: self.source_width,
+            source_height: self.source_height,
+            source_roi: self.source_roi,
+            uv: &self.uv,
+            src_to_dst: self.src_to_dst,
+            source_rgb8: &self.source_rgb8,
+            base_rgb8: &self.base_rgb8,
+            add_rgb_f32: &self.add_rgb_f32,
+            strength: self.strength,
+        };
+        apply_pf90130_producer_stage(
+            Some(&self.producer),
+            Some(source),
+            Some(destination),
+            Some(&geometry),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3218,6 +3326,7 @@ pub struct PortraitJobInputs<'a> {
     pub historical_tone: Option<&'a HistoricalToneInputs>,
     pub historical_skin: Option<&'a HistoricalSkinInputs>,
     pub plump: Option<&'a PlumpProducerInputs>,
+    pub pf90130: Option<&'a Pf90130ProducerInputs>,
 }
 
 impl<'a> PortraitJobInputs<'a> {
@@ -3260,6 +3369,7 @@ impl<'a> PortraitJobInputs<'a> {
             historical_tone: None,
             historical_skin: None,
             plump: None,
+            pf90130: None,
         }
     }
 
@@ -3454,6 +3564,7 @@ impl<'a> PortraitJobInputs<'a> {
         }
         self.wrinkle_producer = producer.wrinkle.as_ref();
         self.makeup_bundle = producer.makeup_bundle.as_ref();
+        self.pf90130 = producer.pf90130.as_ref();
     }
 
     fn resolve_wrinkle_inputs(
@@ -3556,6 +3667,7 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     90139,  // Hair smooth
     90160,  // Hair gloss
     90088,  // Stray hair removal
+    90130,  // Glasses glare removal
     30013,  // Neutral grey flattening
     30021,  // High-low frequency face
     30022,  // High-low frequency body
@@ -4824,6 +4936,41 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     run.fallback_reason = Some(format!("input refused: {refusal:?}"));
                     run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
                     run.refusal = Some(refusal);
+                }
+            }
+            report.effects.push(run);
+            continue;
+        }
+        if pf == 90130 {
+            if degree == 0.0 {
+                run.backend = PortraitBackend::Skipped;
+            } else {
+                match inputs.pf90130 {
+                    Some(bundle) => {
+                        let stage = bundle.apply(&current, &current, inputs.job_id(), degree);
+                        run.backend = stage.backend;
+                        if let Some(writeback) = stage.writeback {
+                            current = writeback.rgba8;
+                            run.skipped = false;
+                            run.executed = true;
+                        } else if stage.refusal.is_none() {
+                            run.backend = PortraitBackend::Skipped;
+                        }
+                        if let Some(refusal) = stage.refusal {
+                            run.backend = PortraitBackend::Skipped;
+                            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                            run.skip_reason =
+                                Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                            run.refusal = Some(refusal);
+                        }
+                    }
+                    None => {
+                        let refusal = Refusal::MissingInput("PF90130_TYPED_PRODUCER");
+                        run.backend = PortraitBackend::Skipped;
+                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                        run.refusal = Some(refusal);
+                    }
                 }
             }
             report.effects.push(run);
