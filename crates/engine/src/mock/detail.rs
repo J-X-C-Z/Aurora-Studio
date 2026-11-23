@@ -662,7 +662,9 @@ fn post_process_impl(
         stage_movement(rgba, w, h, lens);
         stage_sharpness_falloff(rgba, w, h, lens);
     }
-    super::grain::stage(rgba, w, h, &adj.film_grain, scale);
+    if !super::pixel_gpu::grain_stage(rgba, w, h, &adj.film_grain, scale) {
+        super::grain::stage(rgba, w, h, &adj.film_grain, scale);
+    }
 }
 
 // ───────────────────────────── shared helpers ─────────────────────────────

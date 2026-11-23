@@ -1086,8 +1086,16 @@ fn layer_plans<'a>(
 }
 
 /// Everything precomputed once per render.
+/// GPU-resident pixel gains for one frame. `vignette` is indexed by output
+/// pixel; `lcc` is a source-resolution gain plane sampled at the source point.
+struct PixelGains {
+    vignette: Option<Arc<Vec<f32>>>,
+    lcc: Option<(Arc<Vec<f32>>, usize, usize)>,
+}
+
 struct Plan<'a> {
     uniform_light: Option<(crate::dust_lcc::UniformLight<'a>, &'a super::geometry::FrameMap, [f32; 2])>,
+    pixel_gains: Option<PixelGains>,
     adj: &'a AdjustmentSet,
     source: u64,
     /// Frame width / height, for the circular vignette metric.
@@ -1510,6 +1518,7 @@ fn build_plan<'a>(
 
     Plan {
         uniform_light,
+        pixel_gains: None,
         adj,
         source: src.snapshot_id(),
         aspect,
@@ -1579,7 +1588,7 @@ fn render_sized(
         strength,
         limit,
     ).map(|prepared| (prepared, &map, [src.size().0 as f32, src.size().1 as f32]));
-    let plan = build_plan(
+    let mut plan = build_plan(
         src,
         adj,
         uniform_light,
@@ -1589,6 +1598,33 @@ fn render_sized(
         guide.as_deref(),
         mask_overlay,
     );
+    if !bypass {
+        // Manual vignette is output-space, LCC is source-space; both are pure
+        // multiplicative gains in scene-linear light, so one GPU plane each
+        // replaces the per-pixel `exp2`/grid work in the develop loop.
+        let vignette = if adj.vignetting.amount.abs() > 1e-3 {
+            let size = [src.size().0 as f32, src.size().1 as f32];
+            super::pixel_gpu::vignette_plane_cached(
+                out_w as usize,
+                out_h as usize,
+                [region.x, region.y, region.width, region.height],
+                adj.vignetting.method,
+                adj.vignetting.amount,
+                aspect,
+                vignette_center(adj, size),
+            )
+        } else {
+            None
+        };
+        let lcc = plan.uniform_light.as_ref().and_then(|(stage, _, _)| {
+            let (sw, sh) = src.size();
+            super::pixel_gpu::lcc_plane_cached(&stage.gpu_grid(), sw as usize, sh as usize)
+                .map(|plane| (plane, sw as usize, sh as usize))
+        });
+        if vignette.is_some() || lcc.is_some() {
+            plan.pixel_gains = Some(PixelGains { vignette, lcc });
+        }
+    }
 
     let len = (out_w * out_h * 4) as usize;
     let row = (out_w * 4) as usize;
@@ -1619,7 +1655,7 @@ fn render_sized(
                     return None;
                 }
                 // Uniform Light is applied once, in `linear_edits`.
-                let g = develop_pre_curve(&plan, s.rgb, [fx, fy], false);
+                let g = develop_pre_curve(&plan, s.rgb, [fx, fy], false, None);
                 Some(0.299 * g[0] + 0.587 * g[1] + 0.114 * g[2])
             },
         )
@@ -1643,17 +1679,23 @@ fn render_sized(
         let sharpen_in_display = f32_includes_sharpen && camera_usm.is_none();
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
         let sharpen_in_display = f32_includes_sharpen;
+        let halo = if region == NormRect::FULL { 0 } else {
+            super::detail::core_halo(adj, scale, f32_includes_sharpen)
+        };
         let develop_detail_input = |sample: SourceSample, point, x: usize, y: usize| {
+            // Halo pixels sit outside the frame; clamp them onto the nearest
+            // in-frame gain so the plane index stays valid.
+            let ix = x.saturating_sub(halo).min(out_w as usize - 1);
+            let iy = y.saturating_sub(halo).min(out_h as usize - 1);
+            let index = iy * out_w as usize + ix;
             #[cfg(all(windows, feature = "z6iii-raw-export"))]
             if let Some(c1) = camera_usm {
                 return prepared_sample(&plan, sample, point)
-                    .map(|rgb| c1.encode_camera_rgb(linear_edits(&plan, rgb, point)))
+                    .map(|rgb| c1.encode_camera_rgb(linear_edits(&plan, rgb, point, Some(index))))
                     .unwrap_or([-1.0; 3]);
             }
-            develop_at(&plan, sample, point, bypass, pre.as_ref(), x, y).map(|v| v.clamp(0.0, 1.0))
-        };
-        let halo = if region == NormRect::FULL { 0 } else {
-            super::detail::core_halo(adj, scale, f32_includes_sharpen)
+            develop_at(&plan, sample, point, bypass, pre.as_ref(), x, y, index)
+                .map(|v| v.clamp(0.0, 1.0))
         };
         let work_w = out_w as usize + 2 * halo;
         let work_h = out_h as usize + 2 * halo;
@@ -2156,7 +2198,8 @@ fn develop_line_with<F>(
         let sample = sample_at(x, fx, f);
         let c = prepared_sample(plan, sample, f)
             .map(|rgb| {
-                let g = develop_pre_curve(plan, rgb, f, bypass);
+                let index = Some(y * xs.len() + x);
+                let g = develop_pre_curve(plan, rgb, f, bypass, index);
                 let g = match pre {
                     Some(pre) => pre.apply(g, x, y),
                     None => g,
@@ -2180,8 +2223,16 @@ fn develop_line_with<F>(
     }
 }
 
-fn develop_sample(plan: &Plan, sample: SourceSample, point: [f32; 2], bypass: bool) -> [f32; 3] {
-    prepared_sample(plan, sample, point).map(|rgb| develop(plan, rgb, point, bypass)).unwrap_or([0.11; 3])
+fn develop_sample(
+    plan: &Plan,
+    sample: SourceSample,
+    point: [f32; 2],
+    bypass: bool,
+    index: Option<usize>,
+) -> [f32; 3] {
+    prepared_sample(plan, sample, point)
+        .map(|rgb| develop(plan, rgb, point, bypass, index))
+        .unwrap_or([0.11; 3])
 }
 
 /// One pixel with clarity inserted between the pre-curve stage and the tone
@@ -2194,10 +2245,11 @@ fn develop_at(
     pre: Option<&super::clarity::PreCurve>,
     x: usize,
     y: usize,
+    index: usize,
 ) -> [f32; 3] {
     prepared_sample(plan, sample, point)
         .map(|rgb| {
-            let g = develop_pre_curve(plan, rgb, point, bypass);
+            let g = develop_pre_curve(plan, rgb, point, bypass, Some(index));
             let g = match pre {
                 Some(pre) => pre.apply(g, x, y),
                 None => g,
@@ -2207,17 +2259,8 @@ fn develop_at(
         .unwrap_or([0.11; 3])
 }
 
-fn prepared_sample(plan: &Plan, sample: SourceSample, point: [f32; 2]) -> Option<[f32; 3]> {
-    if !sample.valid {
-        return None;
-    }
-    let mut rgb = sample.rgb;
-    if let Some((uniform, map, size)) = &plan.uniform_light {
-        let (_, source) = map.map(point);
-        let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
-        rgb = uniform.apply_source_rgb(rgb, source);
-    }
-    Some(rgb)
+fn prepared_sample(_plan: &Plan, sample: SourceSample, _point: [f32; 2]) -> Option<[f32; 3]> {
+    sample.valid.then_some(sample.rgb)
 }
 
 /// Linear light to display sRGB codes (used only for non-RAW display-referred
@@ -2234,7 +2277,7 @@ fn encode_srgb(plan: &Plan, lin: [f32; 3]) -> [f32; 3] {
     }
 }
 
-fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
+fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2], index: Option<usize>) -> [f32; 3] {
     let adj = plan.adj;
     // Linear light: white balance. Exposure is C1's color-stage 3, after the
     // RAW tone map, so it is multiplied in below.
@@ -2246,7 +2289,13 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
     if let Some((uniform, map, size)) = &plan.uniform_light {
         let (_, source) = map.map(f);
         let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
-        c = uniform.apply_source_rgb(c, source);
+        c = match plan.pixel_gains.as_ref().and_then(|gains| gains.lcc.as_ref()) {
+            Some((plane, pw, ph)) => {
+                let gain = super::pixel_gpu::sample_plane(plane, *pw, *ph, source[0], source[1]);
+                c.map(|channel| channel * gain)
+            }
+            None => uniform.apply_source_rgb(c, source),
+        };
     }
 
     // Lens light falloff is corrected toward flat; vignetting adds its own.
@@ -2265,14 +2314,21 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
         } else {
             adj.vignetting.method
         };
-        let v = vignette_gain(
-            f[0],
-            f[1],
-            method,
-            adj.vignetting.amount,
-            plan.aspect,
-            vignette_center(adj, plan.size),
-        );
+        let v = plan
+            .pixel_gains
+            .as_ref()
+            .and_then(|gains| gains.vignette.as_ref())
+            .and_then(|plane| index.and_then(|i| plane.get(i).copied()))
+            .unwrap_or_else(|| {
+                vignette_gain(
+                    f[0],
+                    f[1],
+                    method,
+                    adj.vignetting.amount,
+                    plan.aspect,
+                    vignette_center(adj, plan.size),
+                )
+            });
         c = [c[0] * v, c[1] * v, c[2] * v];
     }
 
@@ -2288,26 +2344,32 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
     [c[0] * e, c[1] * e, c[2] * e]
 }
 
-fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
-    develop_display(plan, develop_pre_curve(plan, lin, f, bypass))
+fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool, index: Option<usize>) -> [f32; 3] {
+    develop_display(plan, develop_pre_curve(plan, lin, f, bypass, index))
 }
 
 /// Everything up to the display encode plus the brightness/contrast stage.
 /// Clarity runs right after this, still before the tone curves, which is
 /// where C1's raw-stage kernel sits.
-fn develop_pre_curve(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
+fn develop_pre_curve(
+    plan: &Plan,
+    lin: [f32; 3],
+    f: [f32; 2],
+    bypass: bool,
+    index: Option<usize>,
+) -> [f32; 3] {
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     let display = if let Some(c1) = &plan.c1_color {
         if bypass {
             return c1.develop_srgb(lin);
         }
-        let c = linear_edits(plan, lin, f);
+        let c = linear_edits(plan, lin, f, index);
         c1.develop_srgb(c)
     } else {
         if bypass {
             return encode_srgb(plan, lin);
         }
-        let c = linear_edits(plan, lin, f);
+        let c = linear_edits(plan, lin, f, index);
         encode_srgb(plan, c)
     };
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
@@ -2315,7 +2377,7 @@ fn develop_pre_curve(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [
         if bypass {
             return encode_srgb(plan, lin);
         }
-        let c = linear_edits(plan, lin, f);
+        let c = linear_edits(plan, lin, f, index);
         encode_srgb(plan, c)
     };
     display
@@ -3609,7 +3671,7 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
     let cell_px = oriented.0 / 256.0;
     let plan = build_plan(src, adj, None, false, aspect, cell_px, None, None);
     let mut g = match src.sample(0, s[0], s[1]) {
-        Some(lin) => develop(&plan, lin, f, false),
+        Some(lin) => develop(&plan, lin, f, false, None),
         None => [0.0; 3],
     };
     // The colour stack of the layers applies to the picked point too; the
@@ -3975,6 +4037,82 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let capped = -vignette_gain(1.0, 1.0, VignetteMethod::Circular, 2.0, 1.0, [0.0, 0.0])
             .log2();
         assert!((capped + 3.0).abs() < 1e-6, "cap: {capped}");
+    }
+
+    /// The render path must consume the CUDA gain planes when they exist; this
+    /// counts the planes the device actually returned. Without a CUDA device the
+    /// test reports a skip instead of failing CI.
+    #[test]
+    fn vignette_and_lcc_planes_reach_the_render_path() {
+        use std::sync::atomic::Ordering;
+        use crate::dust_lcc::{LightFalloff, LightFalloffNode};
+        let (w, h) = (64u32, 48u32);
+        let src = Source::from_rgba(w, h, &gray(w, h, 96));
+        let mut adj = AdjustmentSet::default();
+        adj.vignetting.amount = 2.0;
+        adj.lens.uniform_light_grid = Some(std::sync::Arc::new(LightFalloff {
+            header: vec![2, 0, 2, 0, 0, 0, 0, 0, 32, 0, 32, 0],
+            columns: 2,
+            rows: 2,
+            nodes: vec![
+                LightFalloffNode { luminance: 0, dx: 0, dy: 0 },
+                LightFalloffNode { luminance: 8000, dx: 0, dy: 0 },
+                LightFalloffNode { luminance: 8000, dx: 0, dy: 0 },
+                LightFalloffNode { luminance: 16000, dx: 0, dy: 0 },
+            ],
+        }));
+        adj.lens.uniform_light_enabled = true;
+        adj.lens.uniform_light = 100.0;
+        super::super::pixel_gpu::PLANE_HITS.store(0, Ordering::Relaxed);
+        let _ = render(&src, &adj, NormRect::FULL, w, false, None);
+        let hits = super::super::pixel_gpu::PLANE_HITS.load(Ordering::Relaxed);
+        if hits == 0 {
+            eprintln!("skipped: no CUDA device exposed a gain plane");
+        } else {
+            assert!(hits >= 2, "expected vignette and LCC planes, got {hits}");
+        }
+    }
+
+    /// Dumps one full frame that exercises vignette + LCC + grain, so the same
+    /// render can be produced with and without the CUDA path and diffed.
+    #[test]
+    #[ignore = "manual frame parity probe"]
+    fn pixel_gpu_frame_probe() {
+        use crate::dust_lcc::{LightFalloff, LightFalloffNode};
+        let (w, h) = (512u32, 341u32);
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let base = ((x * 3 + y * 5) % 200 + 20) as u8;
+                pixels.extend_from_slice(&[base, base.wrapping_add(29), base.wrapping_sub(17), 255]);
+            }
+        }
+        let src = Source::from_rgba(w, h, &pixels);
+        let mut adj = AdjustmentSet::default();
+        adj.vignetting.amount = 1.5;
+        adj.lens.uniform_light_grid = Some(std::sync::Arc::new(LightFalloff {
+            header: vec![2, 0, 2, 0, 0, 0, 0, 0, 128, 0, 96, 0],
+            columns: 2,
+            rows: 2,
+            nodes: vec![
+                LightFalloffNode { luminance: 1000, dx: 120, dy: -40 },
+                LightFalloffNode { luminance: 9000, dx: -60, dy: 30 },
+                LightFalloffNode { luminance: 7000, dx: 45, dy: 15 },
+                LightFalloffNode { luminance: 15_000, dx: 0, dy: 0 },
+            ],
+        }));
+        adj.lens.uniform_light_enabled = true;
+        adj.lens.uniform_light = 80.0;
+        adj.film_grain = FilmGrain { kind: GrainKind::SoftGrain, impact: 70.0, granularity: 50.0, density: 0.0 };
+        let out = render(&src, &adj, NormRect::FULL, w, false, None).rgba;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in &out {
+            hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        if let Ok(path) = std::env::var("PIXEL_FRAME_OUT") {
+            std::fs::write(path, &out).expect("write frame");
+        }
+        println!("FRAME_BYTES {} FRAME_HASH {hash:016x}", out.len());
     }
 
     /// The fifth gradation curve scales the frame's luma; an identity curve
