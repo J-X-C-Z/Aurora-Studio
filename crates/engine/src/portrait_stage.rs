@@ -28,7 +28,7 @@ use aurora_portrait::cuda_hair_detail::{
 use aurora_portrait::cuda_makeup::{MakeupRoute, RouteInputs};
 use aurora_portrait::cuda_stray_hair::Params as StrayHairParams;
 use aurora_portrait::kernels::face_detail::{Rect as ToothRect, ToothRepairProducer};
-use aurora_portrait::kernels::{face_geometry, face_mesh, face_width_414};
+use aurora_portrait::kernels::{face_geometry, face_mesh, face_width_414, forehead_common};
 use aurora_portrait::kernels::makeup_material::{
     MakeupLayer, MaskChannel as MakeupMaskChannel, color_makeup, image_makeup,
     image_makeup_unmasked,
@@ -3334,14 +3334,240 @@ impl FaceMeshGroup {
 }
 
 fn face_mesh_group(pf: u32) -> Option<FaceMeshGroup> {
-    matches!(pf, 30092 | 30093).then_some(FaceMeshGroup {
-        left: 30092,
-        right: 30093,
-    })
+    match pf {
+        30092 | 30093 => Some(FaceMeshGroup {
+            left: 30092,
+            right: 30093,
+        }),
+        30080 | 30081 => Some(FaceMeshGroup {
+            left: 30080,
+            right: 30081,
+        }),
+        30082 | 30083 => Some(FaceMeshGroup {
+            left: 30082,
+            right: 30083,
+        }),
+        242 | 243 => Some(FaceMeshGroup {
+            left: 242,
+            right: 243,
+        }),
+        8023 | 8024 => Some(FaceMeshGroup {
+            left: 8023,
+            right: 8024,
+        }),
+        8027 | 8028 => Some(FaceMeshGroup {
+            left: 8027,
+            right: 8028,
+        }),
+        8029 | 8030 => Some(FaceMeshGroup {
+            left: 8029,
+            right: 8030,
+        }),
+        _ => None,
+    }
 }
 
 const FACE_WIDTH_PARTS: &[u8] =
     include_bytes!("../../portrait/assets/portrait/face-width/parts.f32le");
+const FOREHEAD_PARTS: &[u8] =
+    include_bytes!("../../portrait/assets/portrait/forehead/parts.f32le");
+const FACE_RESHAPE_PARTS: &[u8] =
+    include_bytes!("../../portrait/assets/portrait/face-reshape/parts.f32le");
+
+struct FaceReshapePartData {
+    part: u8,
+    parameters: Vec<f32>,
+    factors: Vec<f32>,
+}
+
+fn builtin_face_reshape_parts() -> Result<Vec<FaceReshapePartData>, Refusal> {
+    let bytes = FACE_RESHAPE_PARTS;
+    if bytes.len() < 4 {
+        return Err(Refusal::ShapeMismatch("face reshape parts header"));
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut offset = 4usize;
+    let mut parts = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 8 > bytes.len() {
+            return Err(Refusal::ShapeMismatch("face reshape part header"));
+        }
+        let part = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        let need = len.checked_mul(8).ok_or(Refusal::ShapeMismatch("face reshape len"))?;
+        if offset + need > bytes.len() || part > 255 {
+            return Err(Refusal::ShapeMismatch("face reshape part body"));
+        }
+        let mut parameters = Vec::with_capacity(len);
+        let mut factors = Vec::with_capacity(len);
+        for i in 0..len {
+            let p = f32::from_le_bytes(bytes[offset + i * 4..offset + (i + 1) * 4].try_into().unwrap());
+            let f = f32::from_le_bytes(
+                bytes[offset + len * 4 + i * 4..offset + len * 4 + (i + 1) * 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if !p.is_finite() || !f.is_finite() {
+                return Err(Refusal::ValueOutOfRange("face reshape part values"));
+            }
+            parameters.push(p);
+            factors.push(f);
+        }
+        offset += need;
+        parts.push(FaceReshapePartData {
+            part: part as u8,
+            parameters,
+            factors,
+        });
+    }
+    Ok(parts)
+}
+
+fn rasterize_radial_warps(
+    source: &Image,
+    warps: &[&face_geometry::Warp],
+) -> FaceMeshStageResult {
+    const GRID: usize = 40;
+    let verts = (GRID + 1) * (GRID + 1);
+    let mut dest = Vec::with_capacity(verts);
+    let mut uv = Vec::with_capacity(verts);
+    let w = source.width as f32;
+    let h = source.height as f32;
+    for gy in 0..=GRID {
+        let v = gy as f32 / GRID as f32;
+        for gx in 0..=GRID {
+            let u = gx as f32 / GRID as f32;
+            uv.push([u, v]);
+            if gx == 0 || gx == GRID || gy == 0 || gy == GRID {
+                dest.push([u * w, v * h]);
+            } else {
+                let mut pt = face_geometry::Point::new(u * w, v * h);
+                for warp in warps {
+                    pt = warp.apply(pt);
+                }
+                dest.push([pt.x.clamp(0.0, w), pt.y.clamp(0.0, h)]);
+            }
+        }
+    }
+    let mut ebo = Vec::with_capacity(GRID * GRID * 6);
+    for gy in 0..GRID {
+        for gx in 0..GRID {
+            let i00 = (gy * (GRID + 1) + gx) as u16;
+            let i10 = i00 + 1;
+            let i01 = i00 + (GRID + 1) as u16;
+            let i11 = i01 + 1;
+            ebo.extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
+        }
+    }
+    let mesh = aurora_portrait::raster::Mesh {
+        dest: &dest,
+        source_uv: &uv,
+        ebo: &ebo,
+    };
+    let rules = aurora_portrait::raster::Rules {
+        winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
+        cull: aurora_portrait::raster::Cull::None,
+        edge: aurora_portrait::raster::Edge::Inclusive,
+        overlap: aurora_portrait::raster::Overlap::Last,
+    };
+    let sampler = aurora_portrait::raster::Sampler {
+        wrap: aurora_portrait::raster::Wrap::ClampToEdge,
+    };
+    let edge = aurora_portrait::raster_fragment::Edge::ReshapeNormal;
+    let defines = aurora_portrait::raster_fragment::Defines {
+        clamp_edge: true,
+        uv_map: false,
+        uv_map_ba: false,
+        catmull_rom: false,
+    };
+    let clamp = aurora_portrait::raster_fragment::Clamp::disabled();
+
+    #[cfg(windows)]
+    {
+        let cuda = match forced_cuda_failure() {
+            Some(error) => Err(error),
+            None => MeshRaster::open().and_then(|gpu| {
+                gpu.rasterize_fragment(
+                    source,
+                    mesh,
+                    rules,
+                    sampler,
+                    edge,
+                    defines,
+                    clamp,
+                    aurora_portrait::raster::Tolerance::RESHAPE,
+                )
+            }),
+        };
+        if let Ok(output) = cuda {
+            return FaceMeshStageResult {
+                image: (output.image != *source).then_some(output.image),
+                backend: PortraitBackend::Cuda,
+                dispatches: vec![output.select_dispatch, output.emit_dispatch],
+                fallback_reason: None,
+                refusal: None,
+            };
+        }
+    }
+
+    match aurora_portrait::raster::rasterize_with_fragment(
+        source,
+        mesh,
+        rules,
+        sampler,
+        edge,
+        defines,
+        clamp,
+        aurora_portrait::raster::Tolerance::RESHAPE,
+    ) {
+        Ok(image) => FaceMeshStageResult {
+            image: (image != *source).then_some(image),
+            backend: PortraitBackend::Cpu,
+            dispatches: Vec::new(),
+            fallback_reason: None,
+            refusal: None,
+        },
+        Err(refusal) => face_mesh_refused(refusal, None),
+    }
+}
+
+struct ForeheadPartData {
+    part: u8,
+    weights: [f32; 135],
+}
+
+fn builtin_forehead_parts() -> Result<Vec<ForeheadPartData>, Refusal> {
+    let mut bytes = FOREHEAD_PARTS;
+    let mut parts = Vec::with_capacity(4);
+    while !bytes.is_empty() {
+        if bytes.len() < 544 {
+            return Err(Refusal::ShapeMismatch("forehead parts asset"));
+        }
+        let read =
+            |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let part = read(0);
+        if !part.is_finite() || part.fract() != 0.0 || !(35.0..=38.0).contains(&part) {
+            return Err(Refusal::ValueOutOfRange("forehead part id"));
+        }
+        let mut weights = [0.0; 135];
+        for index in 0..135 {
+            weights[index] = read(4 + index * 4);
+        }
+        if weights.iter().any(|value| !value.is_finite()) {
+            return Err(Refusal::ValueOutOfRange("forehead part values"));
+        }
+        parts.push(ForeheadPartData {
+            part: part as u8,
+            weights,
+        });
+        bytes = &bytes[544..];
+    }
+    if parts.len() != 4 {
+        return Err(Refusal::ShapeMismatch("forehead parts count"));
+    }
+    Ok(parts)
+}
 
 struct FaceWidthPartData {
     part: u8,
@@ -3456,62 +3682,264 @@ fn apply_face_mesh_group(
             )
         }
     };
-    let points: Vec<face_geometry::Point> = points414
-        .iter()
-        .map(|point| face_geometry::Point::new(point[0], point[1]))
-        .collect();
-    let owned_parts = match builtin_face_width_parts() {
-        Ok(parts) => parts,
-        Err(refusal) => return face_mesh_refused(refusal, None),
-    };
-    let arrays: Vec<_> = owned_parts
-        .iter()
-        .map(|part| face_geometry::PartArrays {
-            part: part.part,
-            parameters: &part.parameters,
-            factors: &part.factors,
-        })
-        .collect();
-    let vendor = face_geometry::VendorParts { parts: &arrays };
-    let left = match face_geometry::face_width(
-        controls[0],
-        &points,
-        &vendor,
-        source.width,
-        source.height,
-    ) {
-        Ok(geometry) => geometry,
-        Err(refusal) => return face_mesh_refused(refusal, None),
-    };
-    let right = match face_geometry::face_width(
-        controls[1],
-        &points,
-        &vendor,
-        source.width,
-        source.height,
-    ) {
-        Ok(geometry) => geometry,
-        Err(refusal) => return face_mesh_refused(refusal, None),
-    };
-
-    let mut selected = Vec::with_capacity(face_mesh::FACE_WIDTH_PARTS.len());
-    for &part in &face_mesh::FACE_WIDTH_PARTS {
-        let geometry = if matches!(part, 25 | 27) {
-            &left
-        } else {
-            &right
-        };
-        let Some(part_geometry) = geometry.parts.iter().find(|item| item.part == part) else {
-            return face_mesh_refused(Refusal::MissingInput("face mesh draw part"), None);
-        };
-        let draw = match face_mesh::Draw::from_face_geometry(controls, digest, part_geometry) {
-            Ok(draw) => draw,
+    if matches!(group.left, 242 | 8023 | 8027 | 8029) {
+        let points: Vec<face_geometry::Point> = points414
+            .iter()
+            .map(|point| face_geometry::Point::new(point[0], point[1]))
+            .collect();
+        let center = points[55];
+        let owned_parts = match builtin_face_reshape_parts() {
+            Ok(parts) => parts,
             Err(refusal) => return face_mesh_refused(refusal, None),
         };
-        if !group.contains(draw.pf) {
-            return face_mesh_refused(Refusal::ShapeMismatch("face mesh part group"), None);
+        let arrays: Vec<_> = owned_parts
+            .iter()
+            .map(|part| face_geometry::PartArrays {
+                part: part.part,
+                parameters: &part.parameters,
+                factors: &part.factors,
+            })
+            .collect();
+        let vendor = face_geometry::VendorParts { parts: &arrays };
+        let geometry = match group.left {
+            242 => {
+                let ui = if controls[0].abs() >= controls[1].abs() {
+                    controls[0]
+                } else {
+                    controls[1]
+                };
+                face_geometry::sharp_chin(ui, &points[..33], center, &vendor, source.width, source.height)
+            }
+            8023 => face_geometry::jaw(
+                controls[0],
+                controls[1],
+                &points[..33],
+                center,
+                &vendor,
+                source.width,
+                source.height,
+            ),
+            8027 => {
+                let ui = if controls[0].abs() >= controls[1].abs() {
+                    controls[0]
+                } else {
+                    controls[1]
+                };
+                face_geometry::cheek(&points[..33], center, ui, &vendor, source.width, source.height)
+            }
+            8029 => face_geometry::temple(
+                &points,
+                controls[0],
+                controls[1],
+                &vendor,
+                source.width,
+                source.height,
+            ),
+            _ => unreachable!(),
+        };
+        let geometry = match geometry {
+            Ok(g) => g,
+            Err(refusal) => return face_mesh_refused(refusal, None),
+        };
+        let warps: Vec<&face_geometry::Warp> = geometry
+            .parts
+            .iter()
+            .filter_map(|p| p.warp.as_ref())
+            .collect();
+        if warps.is_empty() {
+            return face_mesh_refused(Refusal::MissingInput("face reshape radial warp"), None);
         }
-        selected.push(draw);
+        return rasterize_radial_warps(source, &warps);
+    }
+
+    if matches!(group.left, 30080 | 30082) {
+        let fh_points: Vec<forehead_common::Point> = points414
+            .iter()
+            .map(|point| forehead_common::Point::new(point[0], point[1]))
+            .collect();
+        let fh_parts = match builtin_forehead_parts() {
+            Ok(parts) => parts,
+            Err(refusal) => return face_mesh_refused(refusal, None),
+        };
+        let native = [
+            (controls[0] + 100.0) / 200.0,
+            (controls[1] + 100.0) / 200.0,
+        ];
+        let part_ids = if group.left == 30080 {
+            &face_mesh::FOREHEAD_WIDTH_PARTS
+        } else {
+            &face_mesh::FOREHEAD_HEIGHT_PARTS
+        };
+        let mut current_img = source.clone();
+        let mut dispatches = Vec::new();
+        let mut used_cuda = false;
+        let rules = aurora_portrait::raster::Rules {
+            winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
+            cull: aurora_portrait::raster::Cull::None,
+            edge: aurora_portrait::raster::Edge::Inclusive,
+            overlap: aurora_portrait::raster::Overlap::Last,
+        };
+        let sampler = aurora_portrait::raster::Sampler {
+            wrap: aurora_portrait::raster::Wrap::ClampToEdge,
+        };
+        let edge = aurora_portrait::raster_fragment::Edge::ReshapeNormal;
+        let defines = aurora_portrait::raster_fragment::Defines {
+            clamp_edge: true,
+            uv_map: false,
+            uv_map_ba: false,
+            catmull_rom: false,
+        };
+        let clamp = aurora_portrait::raster_fragment::Clamp::disabled();
+
+        for &part in part_ids {
+            let Some(part_data) = fh_parts.iter().find(|item| item.part == part) else {
+                return face_mesh_refused(Refusal::MissingInput("forehead part weights"), None);
+            };
+            let direction = if part % 2 == 1 {
+                forehead_common::Direction::Negative
+            } else {
+                forehead_common::Direction::Positive
+            };
+            let mesh_out = match forehead_common::build(&forehead_common::Inputs {
+                points414: &fh_points,
+                weights135: &part_data.weights,
+                direction,
+                native,
+                width: source.width,
+                height: source.height,
+            }) {
+                Ok(mesh) => mesh,
+                Err(_) => {
+                    return face_mesh_refused(
+                        Refusal::ValueOutOfRange("forehead common build"),
+                        None,
+                    )
+                }
+            };
+            let dest: Vec<[f32; 2]> = mesh_out.b.iter().map(|p| [p.x, p.y]).collect();
+            let uv: Vec<[f32; 2]> = mesh_out
+                .a
+                .iter()
+                .map(|p| [p.x / source.width as f32, p.y / source.height as f32])
+                .collect();
+            let r_mesh = aurora_portrait::raster::Mesh {
+                dest: &dest,
+                source_uv: &uv,
+                ebo: &mesh_out.initial_indices,
+            };
+            let mut stepped = None;
+            #[cfg(windows)]
+            {
+                let cuda = match forced_cuda_failure() {
+                    Some(error) => Err(error),
+                    None => MeshRaster::open().and_then(|gpu| {
+                        gpu.rasterize_fragment(
+                            &current_img,
+                            r_mesh,
+                            rules,
+                            sampler,
+                            edge,
+                            defines,
+                            clamp,
+                            aurora_portrait::raster::Tolerance::RESHAPE,
+                        )
+                    }),
+                };
+                if let Ok(output) = cuda {
+                    current_img = output.image;
+                    dispatches.push(output.select_dispatch);
+                    dispatches.push(output.emit_dispatch);
+                    used_cuda = true;
+                    stepped = Some(());
+                }
+            }
+            if stepped.is_none() {
+                match aurora_portrait::raster::rasterize_with_fragment(
+                    &current_img,
+                    r_mesh,
+                    rules,
+                    sampler,
+                    edge,
+                    defines,
+                    clamp,
+                    aurora_portrait::raster::Tolerance::RESHAPE,
+                ) {
+                    Ok(img) => current_img = img,
+                    Err(refusal) => return face_mesh_refused(refusal, None),
+                }
+            }
+        }
+        return FaceMeshStageResult {
+            image: (current_img != *source).then_some(current_img),
+            backend: if used_cuda {
+                PortraitBackend::Cuda
+            } else {
+                PortraitBackend::Cpu
+            },
+            dispatches,
+            fallback_reason: None,
+            refusal: None,
+        };
+    }
+
+    let mut selected = Vec::new();
+    {
+        let points: Vec<face_geometry::Point> = points414
+            .iter()
+            .map(|point| face_geometry::Point::new(point[0], point[1]))
+            .collect();
+        let owned_parts = match builtin_face_width_parts() {
+            Ok(parts) => parts,
+            Err(refusal) => return face_mesh_refused(refusal, None),
+        };
+        let arrays: Vec<_> = owned_parts
+            .iter()
+            .map(|part| face_geometry::PartArrays {
+                part: part.part,
+                parameters: &part.parameters,
+                factors: &part.factors,
+            })
+            .collect();
+        let vendor = face_geometry::VendorParts { parts: &arrays };
+        let left = match face_geometry::face_width(
+            controls[0],
+            &points,
+            &vendor,
+            source.width,
+            source.height,
+        ) {
+            Ok(geometry) => geometry,
+            Err(refusal) => return face_mesh_refused(refusal, None),
+        };
+        let right = match face_geometry::face_width(
+            controls[1],
+            &points,
+            &vendor,
+            source.width,
+            source.height,
+        ) {
+            Ok(geometry) => geometry,
+            Err(refusal) => return face_mesh_refused(refusal, None),
+        };
+
+        for &part in &face_mesh::FACE_WIDTH_PARTS {
+            let geometry = if matches!(part, 25 | 27) {
+                &left
+            } else {
+                &right
+            };
+            let Some(part_geometry) = geometry.parts.iter().find(|item| item.part == part) else {
+                return face_mesh_refused(Refusal::MissingInput("face mesh draw part"), None);
+            };
+            let draw = match face_mesh::Draw::from_face_geometry(controls, digest, part_geometry) {
+                Ok(draw) => draw,
+                Err(refusal) => return face_mesh_refused(refusal, None),
+            };
+            if !group.contains(draw.pf) {
+                return face_mesh_refused(Refusal::ShapeMismatch("face mesh part group"), None);
+            }
+            selected.push(draw);
+        }
     }
     let selected_refs = selected.iter().collect::<Vec<_>>();
 
@@ -3917,8 +4345,14 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         }
         if let Some(group) = face_mesh_group(pf) {
             let controls = [
-                extra.get("pc:30092").copied().unwrap_or_default(),
-                extra.get("pc:30093").copied().unwrap_or_default(),
+                extra
+                    .get(&format!("pc:{}", group.left))
+                    .copied()
+                    .unwrap_or_default(),
+                extra
+                    .get(&format!("pc:{}", group.right))
+                    .copied()
+                    .unwrap_or_default(),
             ];
             let result = face_mesh_results
                 .entry(group.left)
