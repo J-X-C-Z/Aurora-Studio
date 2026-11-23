@@ -292,7 +292,7 @@ impl<'a> UniformLight<'a> {
         self.source_gain(source)
     }
 
-    fn source_gain(&self, source: [f32; 2]) -> f32 {
+    pub(crate) fn source_gain(&self, source: [f32; 2]) -> f32 {
         let [columns, rows] = [self.grid.columns, self.grid.rows].map(usize::from);
         let [x, y] = [source[0] - self.origin[0], source[1] - self.origin[1]];
         let [step_x, step_y] = self.step;
@@ -338,6 +338,48 @@ impl<'a> UniformLight<'a> {
         let gain = self.source_gain(source);
         rgb.map(|channel| channel * gain)
     }
+
+    /// Flat float mirror of the grid for the GPU gain-plane kernel. The kernel
+    /// re-evaluates the same node/slope/bilinear expression per source pixel.
+    pub(crate) fn gpu_grid(&self) -> GpuLccGrid {
+        let count = self.grid.nodes.len();
+        let mut luminance = Vec::with_capacity(count);
+        let mut slope_x = Vec::with_capacity(count);
+        let mut slope_y = Vec::with_capacity(count);
+        for node in &self.grid.nodes {
+            luminance.push(f32::from(node.luminance));
+            slope_x.push(f32::from(node.dx));
+            slope_y.push(f32::from(node.dy));
+        }
+        GpuLccGrid {
+            columns: usize::from(self.grid.columns),
+            rows: usize::from(self.grid.rows),
+            origin: self.origin,
+            step: self.step,
+            max_level: self.max_level,
+            strength: self.strength,
+            limit: self.limit,
+            luminance,
+            slope_x,
+            slope_y,
+        }
+    }
+}
+
+/// Float mirror of one decoded Uniform Light grid, consumed by
+/// [`crate::mock::pixel_gpu::lcc_plane`].
+#[derive(Clone, Debug)]
+pub(crate) struct GpuLccGrid {
+    pub columns: usize,
+    pub rows: usize,
+    pub origin: [f32; 2],
+    pub step: [f32; 2],
+    pub max_level: f32,
+    pub strength: f32,
+    pub limit: LightFalloffLimit,
+    pub luminance: Vec<f32>,
+    pub slope_x: Vec<f32>,
+    pub slope_y: Vec<f32>,
 }
 
 /// Reads the inline little-endian LightFalloff grid used by the Windows renderer.

@@ -22,7 +22,7 @@ const LUT_SCALE: f32 = 1611.0;
 /// plane has sigma 1, so the gain is 8.13 / (255 * 1.0) / 0.5 = 0.0637 — the
 /// extra half because the plane multiplies `1 + weight * plane * gain` and the
 /// visible deviation is measured on the pixel value.
-const GRAIN_GAIN_V1: f32 = 0.0637;
+pub(crate) const GRAIN_GAIN_V1: f32 = 0.0637;
 
 /// Standard deviation of a value plane.
 fn plane_sigma(plane: &[f32]) -> f32 {
@@ -135,7 +135,7 @@ fn gaussian(x: i32, y: i32) -> f32 {
 /// Per-image origin offset. C1 hashes a document string with FNV-1a and adds
 /// the result to the sample coordinates; a fixed string keeps the pattern
 /// stable across renders, which is all the pixel path needs.
-fn noise_offsets() -> (i32, i32) {
+pub(crate) fn noise_offsets() -> (i32, i32) {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0100_0000_01b3;
     let mut h = OFFSET;
@@ -198,7 +198,7 @@ fn erf(x: f32) -> f32 {
 
 /// C1's `0x17507e0` blur kernel: `tap[i] = erf((i+0.5)/(s*sqrt2)) - erf((i-0.5)/(s*sqrt2))`
 /// for `i = -r..=r`, `r = min(8, ceil(3*s))`, normalised to sum 1.
-fn erf_taps(sigma: f32) -> Vec<f32> {
+pub(crate) fn erf_taps(sigma: f32) -> Vec<f32> {
     let r = (3.0 * sigma).ceil().min(8.0) as i32;
     let inv = 1.0 / (sigma * std::f32::consts::SQRT_2);
     let mut taps: Vec<f32> = (-r..=r)
