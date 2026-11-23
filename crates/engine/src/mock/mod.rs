@@ -11,6 +11,30 @@ pub(crate) mod detail;
 pub(crate) mod clarity;
 #[cfg(windows)]
 pub(crate) mod detail_gpu;
+#[cfg(windows)]
+pub(crate) mod nr_gpu;
+#[cfg(not(windows))]
+pub(crate) mod nr_gpu {
+    use crate::NoiseReduction;
+
+    pub(crate) fn enabled() -> bool {
+        false
+    }
+
+    pub(crate) fn prewarm() -> bool {
+        false
+    }
+
+    pub(crate) fn run_f32(
+        _rgb: &mut [[f32; 3]],
+        _w: usize,
+        _h: usize,
+        _nr: &NoiseReduction,
+        _scale: f32,
+    ) -> bool {
+        false
+    }
+}
 pub(crate) mod geometry;
 pub(crate) mod lens_profile;
 
@@ -45,6 +69,9 @@ use scenes::Scene;
 pub(crate) fn prewarm_gpu() {
     if detail_gpu::enabled() {
         let _ = detail_gpu::prewarm();
+    }
+    if nr_gpu::enabled() {
+        let _ = nr_gpu::prewarm();
     }
 }
 
