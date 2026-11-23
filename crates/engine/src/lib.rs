@@ -71,6 +71,7 @@ pub fn prewarm_gpu() {
 pub mod mask_store;
 mod noise_defaults;
 mod output;
+mod body_shader_abi;
 mod portrait_stage;
 pub mod portrait_model_output_provider;
 mod wrinkle_legacy;
@@ -91,8 +92,15 @@ pub use portrait_historical_tone_provider::{
     HistoricalToneProviderPayload, HistoricalToneProviderRow, HistoricalToneRowData,
     HistoricalToneRowJob, HISTORICAL_TONE_PROVIDER_PFS,
 };
+pub use body_shader_abi::{
+    decode_body_geometry, encode_body_geometry, BodyKeypointSet, BodySixPointShaderInput,
+    EncodedBodyGeometry, BODY_EBO_INDEX_BYTES, BODY_LANDMARK_COUNT, BODY_SIX_POINT_SLOTS,
+    BODY_VBO_DESTINATION_XY_OFFSET, BODY_VBO_SOURCE_UV_OFFSET, BODY_VBO_STRIDE_BYTES,
+};
 pub use portrait_stage::{
-    BodyGeometryInput, BodyGeometryJob, BodyShiftInput, FaceGeometry, FaceGeometryDraw,
+    BodyGeometryInput, BodyGeometryJob, BodyGeometryProducerInputs, BodyLandmarkDomain,
+    BodyLandmarkEffect, BodyLandmarkFrame, BodyLandmarkRef, BodyShiftInput, FaceGeometry,
+    FaceGeometryDraw,
     FaceGeometryInputs, FaceGeometryProviderInputs, FaceGeometryProviderMesh,
     FaceGeometryProviderMeshReceipt, FaceGeometryProviderReceipt, FaceGeometryProviderRoute,
     FaceGeometryProviderRow, HistoricalSkinData, HistoricalSkinExternalInputs,

@@ -13,6 +13,7 @@
 //! warning when either is missing; nothing here panics.
 
 mod ort;
+pub mod body_pose;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
