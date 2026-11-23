@@ -1533,35 +1533,54 @@ fn render_sized(
             || adj.noise_reduction.color > 0.0
             || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
     if use_f32_detail {
-        let mut rgb_f32 = vec![[0.0f32; 3]; (out_w * out_h) as usize];
-        let row_f32 = out_w as usize;
-        if streams_source_samples(out_w, out_h) {
-            rgb_f32.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
+        let halo = if region == NormRect::FULL { 0 } else {
+            super::detail::core_halo(adj, scale, f32_includes_sharpen)
+        };
+        let work_w = out_w as usize + 2 * halo;
+        let work_h = out_h as usize + 2 * halo;
+        let mut rgb_f32 = vec![[0.0f32; 3]; work_w * work_h];
+        if halo != 0 {
+            // Preserve the viewport's sample centers and fetch neighbors in the
+            // surrounding image. Clamp only at the developed frame boundary.
+            let coordinate = |origin: f32, span: f32, count: u32, index: usize| {
+                let step = f64::from(span) / f64::from(count);
+                let half = step * 0.5;
+                (f64::from(origin) + (index as f64 - halo as f64 + 0.5) * step)
+                    .clamp(half, 1.0 - half) as f32
+            };
+            let work_x: Vec<_> = (0..work_w)
+                .map(|x| coordinate(region.x, region.width, out_w, x)).collect();
+            rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
+                let fy = coordinate(region.y, region.height, out_h, y);
+                for (pixel, &fx) in line.iter_mut().zip(&work_x) {
+                    let point = [fx, fy];
+                    let sample = source_sample_at(src, &map, level, sharp, point);
+                    *pixel = develop_sample(&plan, sample, point, bypass).map(|v| v.clamp(0.0, 1.0));
+                }
+            });
+        } else if streams_source_samples(out_w, out_h) {
+            rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
                 develop_line_with_f32(&plan, region, out_h, &xs, y, bypass, line, |_, _, point| {
                     source_sample_at(src, &map, level, sharp, point)
                 });
             });
         } else {
-            let samples =
-                source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
-            rgb_f32.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
-                let srow = &samples[y * row_f32..(y + 1) * row_f32];
+            let samples = source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
+            rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
+                let srow = &samples[y * work_w..(y + 1) * work_w];
                 develop_line_with_f32(&plan, region, out_h, &xs, y, bypass, line, |x, _, _| srow[x]);
             });
         }
         super::detail::post_process_core_f32(
-            &mut rgb_f32,
-            out_w,
-            out_h,
-            adj,
-            scale,
-            f32_includes_sharpen,
+            &mut rgb_f32, work_w as u32, work_h as u32, adj, scale, f32_includes_sharpen,
         );
+        let rows = rgb_f32.par_chunks(work_w).skip(halo).take(out_h as usize)
+            .map(|pixels| &pixels[halo..halo + out_w as usize]);
         match rgba16.as_mut() {
             Some(wide_buf) => {
                 rgba.par_chunks_mut(row)
                     .zip(wide_buf.par_chunks_mut(row))
-                    .zip(rgb_f32.par_chunks(row_f32))
+                    .zip(rows)
                     .for_each(|((line8, line16), src_row)| {
                         for (x, &c) in src_row.iter().enumerate() {
                             let i = x * 4;
@@ -1577,7 +1596,7 @@ fn render_sized(
             }
             None => {
                 rgba.par_chunks_mut(row)
-                    .zip(rgb_f32.par_chunks(row_f32))
+                    .zip(rows)
                     .for_each(|(line8, src_row)| {
                         for (x, &c) in src_row.iter().enumerate() {
                             let i = x * 4;
@@ -1925,17 +1944,7 @@ fn develop_line_with_f32<F>(
     for (x, &fx) in xs.iter().enumerate() {
         let f = [fx, fy];
         let sample = sample_at(x, fx, f);
-        let c = if sample.valid {
-            let mut rgb = sample.rgb;
-            if let Some((uniform, map, size)) = &plan.uniform_light {
-                let (_, source) = map.map(f);
-                let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
-                rgb = uniform.apply_source_rgb(rgb, source);
-            }
-            develop(plan, rgb, f, bypass)
-        } else {
-            [0.11, 0.11, 0.11]
-        };
+        let c = develop_sample(plan, sample, f, bypass);
         line[x] = [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)];
     }
 }
@@ -1959,17 +1968,7 @@ fn develop_line_with<F>(
     for (x, &fx) in xs.iter().enumerate() {
         let f = [fx, fy];
         let sample = sample_at(x, fx, f);
-        let c = if sample.valid {
-            let mut rgb = sample.rgb;
-            if let Some((uniform, map, size)) = &plan.uniform_light {
-                let (_, source) = map.map(f);
-                let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
-                rgb = uniform.apply_source_rgb(rgb, source);
-            }
-            develop(plan, rgb, f, bypass)
-        } else {
-            [0.11, 0.11, 0.11]
-        };
+        let c = develop_sample(plan, sample, f, bypass);
         let px = &mut line[x * 4..x * 4 + 4];
         let mut px16 = line16.as_deref_mut().map(|l| &mut l[x * 4..x * 4 + 4]);
         for k in 0..3 {
@@ -1984,6 +1983,19 @@ fn develop_line_with<F>(
             px16[3] = 65535;
         }
     }
+}
+
+fn develop_sample(plan: &Plan, sample: SourceSample, point: [f32; 2], bypass: bool) -> [f32; 3] {
+    if !sample.valid {
+        return [0.11; 3];
+    }
+    let mut rgb = sample.rgb;
+    if let Some((uniform, map, size)) = &plan.uniform_light {
+        let (_, source) = map.map(point);
+        let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
+        rgb = uniform.apply_source_rgb(rgb, source);
+    }
+    develop(plan, rgb, point, bypass)
 }
 
 /// Linear light to display sRGB codes (used only for non-RAW display-referred
@@ -4495,6 +4507,25 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
 
     /// The layer-less pipeline must stay byte-identical on the clean sRGB path
     /// (without the removed legacy `base_contrast` and `shoulder` stages).
+    #[test]
+    fn detail_viewport_edges_match_an_interior_crop_of_the_full_frame() {
+        let size = 256u32;
+        let src = Source::from_rgba(size, size, &synthetic(size, size));
+        let mut adj = AdjustmentSet::default();
+        adj.noise_reduction.single_pixel = 50.0;
+        adj.noise_reduction.luminance = 50.0;
+        adj.noise_reduction.color = 50.0;
+        adj.sharpening.amount = 180.0;
+        adj.sharpening.radius = 0.8;
+        let full = render(&src, &adj, NormRect::FULL, size, false, None);
+        let region = NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        let cropped = render(&src, &adj, region, size / 2, false, None);
+        for (y, row) in cropped.rgba.chunks_exact(128 * 4).enumerate() {
+            let start = ((64 + y) * 256 + 64) * 4;
+            assert_eq!(row, &full.rgba[start..start + row.len()], "row {y}");
+        }
+    }
+
     #[test]
     fn default_render_bytes_are_the_pre_patch_bytes() {
         let (w, h) = (257usize, 193usize);
