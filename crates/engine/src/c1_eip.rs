@@ -330,6 +330,98 @@ impl<'a> EipPackage<'a> {
     }
 }
 
+/// Packs a RAW file and optional C1 settings/sidecars into an uncompressed
+/// (ZIP STORED) Capture One `.eip` archive with a valid `manifest.xml`.
+pub fn pack_eip(
+    raw_name: &str,
+    raw_bytes: &[u8],
+    settings_cos: Option<&[u8]>,
+    extra_files: &[(&str, &[u8])],
+) -> io::Result<Vec<u8>> {
+    let settings_name = settings_cos.map(|_| format!("CaptureOne/Settings1680/{raw_name}.cos"));
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Manifest>\n  <File>\n");
+    xml.push_str(&format!("    <RawPath>{raw_name}</RawPath>\n"));
+    if let Some(ref s) = settings_name {
+        xml.push_str(&format!("    <SettingsPath>{s}</SettingsPath>\n"));
+    }
+    xml.push_str("  </File>\n</Manifest>\n");
+
+    let mut members: Vec<(&str, &[u8])> = Vec::with_capacity(2 + extra_files.len());
+    members.push(("manifest.xml", xml.as_bytes()));
+    members.push((raw_name, raw_bytes));
+    if let (Some(name), Some(bytes)) = (settings_name.as_deref(), settings_cos) {
+        members.push((name, bytes));
+    }
+    members.extend_from_slice(extra_files);
+
+    let mut archive = Vec::new();
+    let mut directory = Vec::new();
+    for (name, payload) in &members {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > ZIP16_MAX || payload.len() > ZIP32_MAX || archive.len() > ZIP32_MAX {
+            return Err(invalid("EIP member exceeds ZIP32 limit"));
+        }
+        let offset = archive.len() as u32;
+        let size = payload.len() as u32;
+        let crc = crc32fast::hash(payload);
+
+        let mut local = [0u8; 30];
+        local[..4].copy_from_slice(b"PK\x03\x04");
+        local[4] = 20; // version needed
+        local[14..18].copy_from_slice(&crc.to_le_bytes());
+        local[18..22].copy_from_slice(&size.to_le_bytes());
+        local[22..26].copy_from_slice(&size.to_le_bytes());
+        local[26..28].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        archive.extend_from_slice(&local);
+        archive.extend_from_slice(name_bytes);
+        archive.extend_from_slice(payload);
+
+        let mut central = [0u8; 46];
+        central[..4].copy_from_slice(b"PK\x01\x02");
+        central[4] = 20;
+        central[6] = 20;
+        central[16..20].copy_from_slice(&crc.to_le_bytes());
+        central[20..24].copy_from_slice(&size.to_le_bytes());
+        central[24..28].copy_from_slice(&size.to_le_bytes());
+        central[28..30].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central[42..46].copy_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(&central);
+        directory.extend_from_slice(name_bytes);
+    }
+    let dir_start = archive.len() as u32;
+    let dir_size = directory.len() as u32;
+    let count = members.len() as u16;
+    archive.extend_from_slice(&directory);
+
+    let mut footer = [0u8; 22];
+    footer[..4].copy_from_slice(b"PK\x05\x06");
+    footer[8..10].copy_from_slice(&count.to_le_bytes());
+    footer[10..12].copy_from_slice(&count.to_le_bytes());
+    footer[12..16].copy_from_slice(&dir_size.to_le_bytes());
+    footer[16..20].copy_from_slice(&dir_start.to_le_bytes());
+    archive.extend_from_slice(&footer);
+    Ok(archive)
+}
+
+/// Writes a packed `.eip` archive to `output_path`.
+pub fn write_eip(
+    raw_path: &std::path::Path,
+    settings_cos_path: Option<&std::path::Path>,
+    output_path: &std::path::Path,
+) -> io::Result<()> {
+    let raw_name = raw_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("invalid RAW file name"))?;
+    let raw_bytes = std::fs::read(raw_path)?;
+    let cos_bytes = match settings_cos_path {
+        Some(p) => Some(std::fs::read(p)?),
+        None => None,
+    };
+    let bytes = pack_eip(raw_name, &raw_bytes, cos_bytes.as_deref(), &[])?;
+    std::fs::write(output_path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +609,17 @@ mod tests {
             package.member(&name).unwrap_err().to_string(),
             "EIP member checksum mismatch"
         );
+    }
+
+    #[test]
+    fn pack_eip_roundtrips_through_reader() {
+        let raw = b"fake-nef-payload-0123456789";
+        let cos = b"<?xml version=\"1.0\"?><IMG></IMG>";
+        let packed = pack_eip("sample.NEF", raw, Some(cos), &[]).expect("pack_eip must succeed");
+        let parsed = EipPackage::parse(&packed).expect("EipPackage::parse must read packed EIP");
+        assert_eq!(parsed.manifest.paths.get("RawPath").map(String::as_str), Some("sample.NEF"));
+        let settings_path = parsed.manifest.paths.get("SettingsPath").expect("SettingsPath");
+        assert_eq!(parsed.member("sample.NEF").unwrap().as_ref(), raw.as_slice());
+        assert_eq!(parsed.member(settings_path).unwrap().as_ref(), cos.as_slice());
     }
 }

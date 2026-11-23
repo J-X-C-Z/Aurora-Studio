@@ -733,26 +733,47 @@ fn stage_moire(buf: &mut [u8], w: usize, h: usize, adj: &Moire) {
 /// boosted. `halo_suppression` pulls the result back inside the local
 /// neighbourhood range, which removes the bright and dark rings a strong
 /// unsharp mask leaves around edges.
+/// Capture One `UnsharpMaskLinear` (queue stages 63-75): performs unsharp
+/// masking in scene-linear light rather than display-gamma sRGB so dark halos
+/// and colour fringing do not amplify high-contrast edges.
 fn stage_sharpening(buf: &mut [u8], w: usize, h: usize, adj: &Sharpening, scale: f32) {
     let amount = adj.amount / 100.0;
-    if amount <= 0.0 {
+    if amount <= 0.0 || w == 0 || h == 0 {
         return;
     }
     let radius = ((adj.radius.max(0.1)) * scale).round().max(1.0) as i32;
-    let threshold = adj.threshold.max(0.0);
+    let threshold_lin = (adj.threshold.max(0.0) / 255.0) * 0.5;
     let halo = (adj.halo_suppression / 100.0).clamp(0.0, 1.0);
     let gain = amount * 0.75;
 
-    let luma = luma_plane(buf, w, h);
+    let mut srgb_to_lin = [0.0f32; 256];
+    for (i, slot) in srgb_to_lin.iter_mut().enumerate() {
+        let v = i as f32 / 255.0;
+        *slot = if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    }
+
+    let mut luma = vec![0.0f32; w * h];
+    luma.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let base = y * w * 4;
+        for x in 0..w {
+            let i = base + x * 4;
+            let r = srgb_to_lin[buf[i] as usize];
+            let g = srgb_to_lin[buf[i + 1] as usize];
+            let b = srgb_to_lin[buf[i + 2] as usize];
+            row[x] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        }
+    });
+
     let mut out = box_blur3(&luma, w, h, radius);
     out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let i = y * w + x;
-            let mut detail = luma[i] - row[x];
-            if detail.abs() < threshold {
+            let yc = luma[i];
+            let mut detail = yc - row[x];
+            if detail.abs() < threshold_lin {
                 detail = 0.0;
             }
-            let mut v = luma[i] + detail * gain;
+            let mut v = yc + detail * gain;
             if halo > 0.0 {
                 let mut lo = f32::MAX;
                 let mut hi = f32::MIN;
@@ -768,10 +789,35 @@ fn stage_sharpening(buf: &mut [u8], w: usize, h: usize, adj: &Sharpening, scale:
                 let clamped = v.clamp(lo, hi);
                 v = v * (1.0 - halo) + clamped * halo;
             }
-            row[x] = v.clamp(0.0, 255.0);
+            row[x] = v.clamp(0.0, 1.0);
         }
     });
-    apply_luma(buf, w, &luma, &out);
+
+    buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        let off = y * w;
+        for x in 0..w {
+            let yc = luma[off + x];
+            let yn = out[off + x];
+            if (yn - yc).abs() < 1e-6 {
+                continue;
+            }
+            let i = x * 4;
+            let r = srgb_to_lin[row[i] as usize];
+            let g = srgb_to_lin[row[i + 1] as usize];
+            let b = srgb_to_lin[row[i + 2] as usize];
+            let scaled = if yc > 1e-4 {
+                let f = (yn / yc).clamp(0.2, 4.0);
+                [r * f, g * f, b * f]
+            } else {
+                let d = yn - yc;
+                [r + d, g + d, b + d]
+            };
+            for k in 0..3 {
+                let srgb = super::process::linear_to_srgb(scaled[k].clamp(0.0, 1.0));
+                row[i + k] = (srgb * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
 }
 
 // ───────────────────────────── 5. lens correction ─────────────────────────────
@@ -1926,9 +1972,9 @@ mod tests {
     fn detail_stages_match_reference_pixels() {
         let expected = [
             15226162907845603633, 15226162907845603633, 15226162907845603633,
-            418812772922979691, 14188287539090345076, 1578698336601148913,
-            41615323049186328, 17275283751766918384, 2697018795909425383,
-            17974978512109289819, 18074643075832604112, 16575147648956657441,
+            418812772922979691, 14188287539090345076, 7459239400495536644,
+            41615323049186328, 17275283751766918384, 13492956222056251262,
+            17974978512109289819, 18074643075832604112, 17066720766183309958,
         ];
         let mut actual = Vec::new();
         for (w, h) in [(1, 1), (1, 17), (19, 1), (37, 23)] {
