@@ -1,0 +1,60 @@
+{
+  "schema": "aurora.portrait.stretchv3.registry.r26.v1",
+  "processor_key": "0x1E9DD78",
+  "effect": {
+    "class": "PixCook::EffectStretchMark",
+    "vtable": "0x1495BF0F8",
+    "init": "0x147CEAB50",
+    "lookup_call": "0x147CEACB0",
+    "pipeline_name": "StretchV3Pipeline",
+    "pipeline_name_va": "0x1497DC3A9",
+    "key_field_offset": "0xB0"
+  },
+  "model": {
+    "class": "PixCook::EffectStretchMarkModel",
+    "vtable": "0x1491C8908",
+    "init": "0x144F1B6F0",
+    "key_field_offset": "0x58",
+    "resource_ids_low32": [
+      "0x15F98",
+      "0x15FB5"
+    ],
+    "encoded_registration_words": [
+      "0x100015F98",
+      "0x100015FB5"
+    ],
+    "variants": [
+      "0x0",
+      "0xFFFFFFFE"
+    ],
+    "semantics": "Exact registration words; high32/variant labels remain unresolved"
+  },
+  "rtti": [
+    "PixCook::EffectStretchMark",
+    "PixCook::EffectStretchMarkModel",
+    "TSAI::StretchV3Params",
+    "TSAI::StretchV3Pipeline"
+  ],
+  "callback_table": {
+    "builder": "0x1448525E7",
+    "keys": [
+      "0x1E9DA58",
+      "0x1E9DE40",
+      "0x1E9DD78",
+      "0x1E9FD80",
+      "0x1EA2A6C",
+      "0x1EA2AD0"
+    ],
+    "ownership_proven_for": "0x1E9DD78"
+  },
+  "payload": {
+    "status": "blocked",
+    "effect_json_path": "Resources/effect/config/StretchMark/effect.json",
+    "effect_json_size": 119,
+    "blocker": "No plaintext StretchV3 tensor/weights or model graph exists in Resources"
+  },
+  "cpu": {
+    "status": "blocked",
+    "reason": "model forward cannot start without the original tensor/weights"
+  }
+}
