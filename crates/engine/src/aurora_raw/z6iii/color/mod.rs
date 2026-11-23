@@ -88,13 +88,20 @@ impl Z6iiiColorStage {
     }
 
     pub fn develop_srgb(&self, rgb: [f32; 3]) -> [f32; 3] {
+        self.apply_camera_icc(self.encode_camera_rgb(rgb))
+    }
+
+    pub(crate) fn encode_camera_rgb(&self, rgb: [f32; 3]) -> [f32; 3] {
         let norm = rgb.map(|value| value.max(0.0));
         let before = self.pre_matrix.map(|[red, green, blue]| {
             (red * norm[0] + green * norm[1] + blue * norm[2]).max(0.0)
         });
         let curved = before.map(|value| coupled::film_at(&self.film, value));
         let coupled = coupled::couple_float(before, curved);
-        let encoded = coupled.map(coupled::encode_camera);
+        coupled.map(coupled::encode_camera)
+    }
+
+    pub(crate) fn apply_camera_icc(&self, encoded: [f32; 3]) -> [f32; 3] {
         self.clut.sample_srgb(encoded).unwrap_or([0.0; 3])
     }
 }

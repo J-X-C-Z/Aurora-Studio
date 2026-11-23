@@ -3545,6 +3545,10 @@ mod tests {
         assert!(engine.native_raw_source(info.id, Some((&adj.geometry, NormRect::FULL, 1024))).is_none());
         let native = engine.native_raw_source(info.id, Some((&adj.geometry, roi, 1024))).expect("native RAW decode");
         assert!(native.size().0.max(native.size().1) > SOURCE_LONG_SIDE);
+        #[cfg(all(windows, feature = "z6iii-raw-export"))]
+        if crate::z6iii::active_size(&info.path).is_some() {
+            assert_eq!((info.width, info.height), native.size(), "viewer and decoded RAW dimensions differ");
+        }
         let proxy = engine.source(info.id).expect("proxy RAW decode");
         assert_eq!(proxy.size().0.max(proxy.size().1), SOURCE_LONG_SIDE);
         assert_eq!(engine.native_raw_source(info.id, Some((&adj.geometry, roi, 1536))).unwrap().snapshot_id(), native.snapshot_id());
