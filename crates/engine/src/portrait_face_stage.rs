@@ -4,10 +4,11 @@ use std::hash::{Hash, Hasher};
 use aurora_portrait::cuda::Dispatch;
 use aurora_portrait::cuda_v2warp::{self, OffsetTexture};
 use aurora_portrait::cuda_vface::{self, Row};
-use aurora_portrait::kernels::{eye_geometry, smile_warp};
+use aurora_portrait::kernels::{eye_geometry, face_detail, face_mesh, smile_warp};
 use aurora_portrait::{Image, Refusal, raster, raster_fragment};
 
 use super::{PortraitBackend, SlimProducerInputs, sha256_32, smile_refusal};
+use super::portrait_v2_mesh::VFaceAtlas;
 use crate::NormRect;
 
 #[cfg(windows)]
@@ -32,6 +33,14 @@ pub enum FaceGeometry {
     VFace {
         rows: Vec<Row>,
         encoded_offset: Vec<[f32; 4]>,
+        atlases: Vec<VFaceAtlas>,
+    },
+    /// Type1011 prepared100 source points and its six vendor weights. The EBO
+    /// is generated at dispatch time from these prepared points.
+    Type1011 {
+        prepared: Vec<[f32; 2]>,
+        param_list: Vec<f32>,
+        center: [f32; 2],
     },
     /// Prepared eye/brow draw, with framebuffer-pixel positions, normalized
     /// UVs and the captured EBO and fragment state.
@@ -49,6 +58,25 @@ pub enum FaceGeometry {
         dx: Vec<f32>,
         dy: Vec<f32>,
         mask: Vec<u8>,
+        host_split_receipt: SmileHostSplitReceipt,
+    },
+    /// PF202 Type1012 draw from the recovered 5x27 producer layout. The EBO
+    /// is the captured 136/705 topology, not a tessellation of source points.
+    HairLine {
+        dest: Vec<[f32; 2]>,
+        uv: Vec<[f32; 2]>,
+        ebo: Vec<u16>,
+        rules: raster::Rules,
+        edge: raster_fragment::Edge,
+        defines: raster_fragment::Defines,
+        clamp: raster_fragment::Clamp,
+    },
+    /// PF232 radial contour from points 192..206 and the fifteen recovered
+    /// factors. This stage has no EBO because the producer is a radial warp.
+    Skull {
+        anchor: [f32; 2],
+        source: Vec<[f32; 2]>,
+        warped: Vec<[f32; 2]>,
     },
 }
 
@@ -58,6 +86,16 @@ pub struct FaceGeometryInputs {
     pub width: u32,
     pub height: u32,
     pub draws: Vec<FaceGeometryDraw>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmileHostSplitReceipt {
+    pub job_id: u64,
+    pub model_output_id: u32,
+    pub model_output_sha256: [u8; 32],
+    pub dx_sha256: [u8; 32],
+    pub dy_sha256: [u8; 32],
+    pub mask_sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,12 +144,29 @@ impl FaceGeometryInputs {
                 FaceGeometry::VFace {
                     rows,
                     encoded_offset,
+                    atlases,
                 } => {
                     rows.len().hash(&mut h);
                     for row in rows {
                         (*row as u8).hash(&mut h);
                     }
                     hash_points(encoded_offset, &mut h);
+                    for atlas in atlases {
+                        (atlas.row as u8, atlas.width, atlas.height).hash(&mut h);
+                        atlas.pixels.hash(&mut h);
+                    }
+                }
+                FaceGeometry::Type1011 {
+                    prepared,
+                    param_list,
+                    center,
+                } => {
+                    hash_points(prepared, &mut h);
+                    param_list.len().hash(&mut h);
+                    for value in param_list {
+                        value.to_bits().hash(&mut h);
+                    }
+                    center.map(f32::to_bits).hash(&mut h);
                 }
                 FaceGeometry::Eye {
                     dest,
@@ -141,7 +196,7 @@ impl FaceGeometryInputs {
                     )
                         .hash(&mut h);
                 }
-                FaceGeometry::Smile { dx, dy, mask } => {
+                FaceGeometry::Smile { dx, dy, mask, .. } => {
                     for plane in [dx, dy] {
                         plane.len().hash(&mut h);
                         for value in plane {
@@ -149,6 +204,43 @@ impl FaceGeometryInputs {
                         }
                     }
                     mask.hash(&mut h);
+                }
+                FaceGeometry::HairLine {
+                    dest,
+                    uv,
+                    ebo,
+                    rules,
+                    edge,
+                    defines,
+                    clamp,
+                } => {
+                    hash_points(dest, &mut h);
+                    hash_points(uv, &mut h);
+                    ebo.hash(&mut h);
+                    (
+                        rules.winding as u8,
+                        rules.cull as u8,
+                        rules.edge as u8,
+                        rules.overlap as u8,
+                        *edge as u8,
+                        defines.clamp_edge,
+                        defines.uv_map,
+                        defines.uv_map_ba,
+                        defines.catmull_rom,
+                        clamp.factor.to_bits(),
+                        clamp.protect_x,
+                        clamp.protect_y,
+                    )
+                        .hash(&mut h);
+                }
+                FaceGeometry::Skull {
+                    anchor,
+                    source,
+                    warped,
+                } => {
+                    anchor.map(f32::to_bits).hash(&mut h);
+                    hash_points(source, &mut h);
+                    hash_points(warped, &mut h);
                 }
             }
         }
@@ -163,8 +255,19 @@ fn hash_points<const N: usize>(points: &[[f32; N]], h: &mut DefaultHasher) {
     }
 }
 
+fn hash_f32(values: &[f32]) -> [u8; 32] {
+    sha256_32(
+        &values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+}
+
 pub(super) fn pair(pf: u32) -> Option<(u32, u32)> {
     match pf {
+        202 => Some((202, 202)),
+        232 => Some((232, 232)),
         242 | 243 => Some((242, 243)),
         247 | 248 => Some((247, 248)),
         30073 | 30079 => Some((30073, 30079)),
@@ -192,11 +295,8 @@ fn missing_draw(pf: u32) -> &'static str {
 /// route at all. The refusal names the inputs that producer documents, so a
 /// missing producer stays distinguishable from a row with no kernel.
 pub(super) fn producer_gap(pf: u32) -> Option<&'static str> {
-    match pf {
-        202 => Some("PF202 hairLine producer: 194 landmarks + 135 weights + control slots"),
-        232 => Some("PF232 skullEnhance producer: landmarks 192..206 + 15 factors"),
-        _ => None,
-    }
+    let _ = pf;
+    None
 }
 
 fn draw_gap(pf: u32) -> &'static str {
@@ -216,7 +316,7 @@ fn draw_gap(pf: u32) -> &'static str {
 fn is_eye_draw(pf: u32) -> bool {
     matches!(
         pf,
-        8001..=8022 | 30073 | 30079 | 44124 | 48019 | 49221 | 41922
+        8001..=8022 | 44124 | 48019 | 49221 | 41922
     )
 }
 
@@ -340,6 +440,362 @@ fn apply_eye(
     }
 }
 
+fn render_v2(
+    source: &Image,
+    offset: OffsetTexture<'_>,
+    mesh: cuda_v2warp::Mesh<'_>,
+    rules: raster::Rules,
+    mat2: [f32; 4],
+    filter_size: [f32; 2],
+) -> Result<FaceGeometryRun, Refusal> {
+    #[cfg(windows)]
+    {
+        let cuda = match super::forced_cuda_failure() {
+            Some(error) => Err(error),
+            None => cuda_v2warp::V2Warp::open()
+                .and_then(|gpu| gpu.render(source, offset, mesh, rules, mat2, filter_size)),
+        };
+        match cuda {
+            Ok(output) => {
+                let changed = output.image != *source;
+                return Ok(FaceGeometryRun {
+                    image: changed.then_some(output.image),
+                    backend: PortraitBackend::Cuda,
+                    dispatches: vec![output.select_dispatch, output.eval_dispatch],
+                    fallback_reason: None,
+                });
+            }
+            Err(error) => {
+                let fallback = format!("CUDA V2Warp fallback: {error:?}");
+                let image = cuda_v2warp::apply_cpu(source, offset, mesh, rules, mat2, filter_size)?;
+                let changed = image != *source;
+                return Ok(FaceGeometryRun {
+                    image: changed.then_some(image),
+                    backend: PortraitBackend::Cpu,
+                    dispatches: Vec::new(),
+                    fallback_reason: Some(fallback),
+                });
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let image = cuda_v2warp::apply_cpu(source, offset, mesh, rules, mat2, filter_size)?;
+        let changed = image != *source;
+        Ok(FaceGeometryRun::cpu(changed.then_some(image)))
+    }
+}
+
+fn render_mesh(
+    source: &Image,
+    dest: &[[f32; 2]],
+    uv: &[[f32; 2]],
+    ebo: &[u16],
+    rules: raster::Rules,
+    edge: raster_fragment::Edge,
+    defines: raster_fragment::Defines,
+    clamp: raster_fragment::Clamp,
+) -> Result<FaceGeometryRun, Refusal> {
+    if dest.is_empty()
+        || dest.len() != uv.len()
+        || ebo.is_empty()
+        || ebo.len() % 3 != 0
+        || ebo.iter().any(|&index| index as usize >= dest.len())
+        || dest.iter().chain(uv).flatten().any(|value| !value.is_finite())
+    {
+        return Err(Refusal::ShapeMismatch("PF202 Type1012 mesh"));
+    }
+    let mesh = raster::Mesh {
+        dest,
+        source_uv: uv,
+        ebo,
+    };
+    let sampler = raster::Sampler {
+        wrap: raster::Wrap::ClampToEdge,
+    };
+    #[cfg(windows)]
+    {
+        let cuda = match super::forced_cuda_failure() {
+            Some(error) => Err(error),
+            None => MeshRaster::open().and_then(|gpu| {
+                gpu.rasterize_fragment(
+                    source,
+                    mesh,
+                    rules,
+                    sampler,
+                    edge,
+                    defines,
+                    clamp,
+                    raster::Tolerance::RESHAPE,
+                )
+            }),
+        };
+        match cuda {
+            Ok(output) => {
+                let changed = output.image != *source;
+                return Ok(FaceGeometryRun {
+                    image: changed.then_some(output.image),
+                    backend: PortraitBackend::Cuda,
+                    dispatches: vec![output.select_dispatch, output.emit_dispatch],
+                    fallback_reason: None,
+                });
+            }
+            Err(error) => {
+                let fallback = format!("CUDA PF202 fallback: {error:?}");
+                let image = raster::rasterize_with_fragment(
+                    source,
+                    mesh,
+                    rules,
+                    sampler,
+                    edge,
+                    defines,
+                    clamp,
+                    raster::Tolerance::RESHAPE,
+                )?;
+                let changed = image != *source;
+                return Ok(FaceGeometryRun {
+                    image: changed.then_some(image),
+                    backend: PortraitBackend::Cpu,
+                    dispatches: Vec::new(),
+                    fallback_reason: Some(fallback),
+                });
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let image = raster::rasterize_with_fragment(
+            source,
+            mesh,
+            rules,
+            sampler,
+            edge,
+            defines,
+            clamp,
+            raster::Tolerance::RESHAPE,
+        )?;
+        let changed = image != *source;
+        Ok(FaceGeometryRun::cpu(changed.then_some(image)))
+    }
+}
+
+fn sample_bilinear(source: &Image, x: f32, y: f32) -> [u8; 4] {
+    let x = x.clamp(0.0, source.width.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, source.height.saturating_sub(1) as f32);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(source.width - 1);
+    let y1 = (y0 + 1).min(source.height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let pixel = |px: u32, py: u32| -> [u8; 4] {
+        let at = (py as usize * source.width as usize + px as usize) * 4;
+        source.pixels[at..at + 4].try_into().unwrap()
+    };
+    let a = pixel(x0, y0);
+    let b = pixel(x1, y0);
+    let c = pixel(x0, y1);
+    let d = pixel(x1, y1);
+    let mut out = [0u8; 4];
+    for channel in 0..3 {
+        let top = a[channel] as f32 * (1.0 - fx) + b[channel] as f32 * fx;
+        let bottom = c[channel] as f32 * (1.0 - fx) + d[channel] as f32 * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out[3] = source.pixels[(y0 as usize * source.width as usize + x0 as usize) * 4 + 3];
+    out
+}
+
+fn render_skull(
+    source: &Image,
+    anchor: [f32; 2],
+    contour_source: &[[f32; 2]],
+    contour_warped: &[[f32; 2]],
+) -> Result<FaceGeometryRun, Refusal> {
+    if contour_source.len() != 15
+        || contour_warped.len() != 15
+        || contour_source
+            .iter()
+            .chain(contour_warped)
+            .flatten()
+            .any(|value| !value.is_finite())
+    {
+        return Err(Refusal::ShapeMismatch("PF232 15-point radial contour"));
+    }
+    let mut min_x = anchor[0];
+    let mut min_y = anchor[1];
+    let mut max_x = anchor[0];
+    let mut max_y = anchor[1];
+    for point in contour_source.iter().chain(contour_warped) {
+        min_x = min_x.min(point[0]);
+        min_y = min_y.min(point[1]);
+        max_x = max_x.max(point[0]);
+        max_y = max_y.max(point[1]);
+    }
+    let x0 = (min_x.floor() as i32 - 5).clamp(0, source.width as i32) as u32;
+    let y0 = (min_y.floor() as i32 - 5).clamp(0, source.height as i32) as u32;
+    let x1 = (max_x.ceil() as i32 + 5).clamp(x0 as i32, source.width as i32) as u32;
+    let y1 = (max_y.ceil() as i32 + 5).clamp(y0 as i32, source.height as i32) as u32;
+    let mut output = source.clone();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let pixel = [x as f32 + 0.5, y as f32 + 0.5];
+            let dx = pixel[0] - anchor[0];
+            let dy = pixel[1] - anchor[1];
+            let radius = (dx * dx + dy * dy).sqrt();
+            if radius < 1e-6 {
+                continue;
+            }
+            let direction = [dx / radius, dy / radius];
+            let mut best = 0usize;
+            let mut best_dot = f32::MIN;
+            for (index, (warped, original)) in contour_warped
+                .iter()
+                .zip(contour_source)
+                .enumerate()
+            {
+                let vx = (warped[0] + original[0]) * 0.5 - anchor[0];
+                let vy = (warped[1] + original[1]) * 0.5 - anchor[1];
+                let norm = (vx * vx + vy * vy).sqrt();
+                let dot = if norm > 1e-6 {
+                    direction[0] * vx / norm + direction[1] * vy / norm
+                } else {
+                    f32::MIN
+                };
+                if dot > best_dot {
+                    best_dot = dot;
+                    best = index;
+                }
+            }
+            let contour_radius = |point: [f32; 2]| {
+                ((point[0] - anchor[0]) * direction[0]
+                    + (point[1] - anchor[1]) * direction[1])
+                    .max(1e-4)
+            };
+            let warped_radius = contour_radius(contour_warped[best]);
+            let source_radius = contour_radius(contour_source[best]);
+            let mapped_radius = radius * source_radius / warped_radius;
+            let sx = anchor[0] + direction[0] * mapped_radius;
+            let sy = anchor[1] + direction[1] * mapped_radius;
+            let at = (y as usize * source.width as usize + x as usize) * 4;
+            output.pixels[at..at + 4].copy_from_slice(&sample_bilinear(source, sx, sy));
+        }
+    }
+    let changed = output != *source;
+    Ok(FaceGeometryRun::cpu(changed.then_some(output)))
+}
+
+fn apply_type1011(
+    source: &Image,
+    pf: u32,
+    controls: [f32; 2],
+    shared: Option<&SlimProducerInputs>,
+    prepared: &[[f32; 2]],
+    param_list: &[f32],
+    center: [f32; 2],
+) -> Result<FaceGeometryRun, Refusal> {
+    let shared = shared.ok_or(Refusal::MissingInput("shared face landmarks"))?;
+    if shared.points194.len() != 194
+        || shared
+            .points194
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+    {
+        return Err(Refusal::ShapeMismatch(
+            "Type1011 same-job 194 landmarks",
+        ));
+    }
+    if source.width == 0 || source.height == 0 || prepared.len() != 100 {
+        return Err(Refusal::ShapeMismatch("Type1011 prepared100 frame"));
+    }
+    let prepared_points: Vec<eye_geometry::Point> = prepared
+        .iter()
+        .map(|point| eye_geometry::Point::new(point[0], point[1]))
+        .collect();
+    let indices = eye_geometry::type1011_indices(&prepared_points)?;
+    let output = eye_geometry::row19_lower_eyelid(
+        &prepared_points,
+        Some(param_list),
+        eye_geometry::Point::new(center[0], center[1]),
+        controls[0],
+        controls[1],
+        Some(&indices),
+    )?;
+    let source_uv = prepared
+        .iter()
+        .map(|point| {
+            [
+                point[0] / source.width as f32,
+                point[1] / source.height as f32,
+            ]
+        })
+        .collect();
+    let positions = output
+        .target
+        .iter()
+        .map(|point| [point.x, point.y])
+        .collect();
+    let part = match pf {
+        30073 => 6,
+        30079 => 7,
+        _ => return Err(Refusal::ValueOutOfRange("Type1011 PF")),
+    };
+    let draw = face_mesh::Draw::from_type1011(
+        part,
+        pf,
+        controls,
+        sha256_32(&source.pixels),
+        prepared,
+        positions,
+        source_uv,
+        indices,
+    )?;
+    let draws = [&draw];
+
+    #[cfg(windows)]
+    {
+        if !prefer_cuda(pf) {
+            let output = face_mesh::rasterize(source, &draws)?;
+            let changed = output != *source;
+            return Ok(FaceGeometryRun::cpu(changed.then_some(output)));
+        }
+        let cuda = match super::forced_cuda_failure() {
+            Some(error) => Err(error),
+            None => MeshRaster::open()
+                .and_then(|gpu| face_mesh::rasterize_cuda_with(&gpu, source, &draws)),
+        };
+        match cuda {
+            Ok(output) => {
+                let changed = output.image != *source;
+                return Ok(FaceGeometryRun {
+                    image: changed.then_some(output.image),
+                    backend: PortraitBackend::Cuda,
+                    dispatches: output.dispatches,
+                    fallback_reason: None,
+                });
+            }
+            Err(error) => {
+                let fallback = format!("CUDA Type1011 face mesh fallback: {error:?}");
+                let output = face_mesh::rasterize(source, &draws)?;
+                let changed = output != *source;
+                return Ok(FaceGeometryRun {
+                    image: changed.then_some(output),
+                    backend: PortraitBackend::Cpu,
+                    dispatches: Vec::new(),
+                    fallback_reason: Some(fallback),
+                });
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let output = face_mesh::rasterize(source, &draws)?;
+        let changed = output != *source;
+        Ok(FaceGeometryRun::cpu(changed.then_some(output)))
+    }
+}
+
 pub(super) fn apply(
     source: &Image,
     region: NormRect,
@@ -394,7 +850,7 @@ pub(super) fn apply(
                 framebuffer_positions_w1: &positions,
                 ..shared.mesh()
             };
-            FaceGeometryRun::cpu(Some(cuda_v2warp::apply_cpu(
+            render_v2(
                 source,
                 OffsetTexture {
                     width: cuda_vface::OFFSET_EDGE,
@@ -405,12 +861,13 @@ pub(super) fn apply(
                 shared.rules,
                 shared.mat2,
                 shared.f_o,
-            )?))
+            )?
         }
         (
             FaceGeometry::VFace {
                 rows,
                 encoded_offset,
+                atlases,
             },
             247,
         ) => {
@@ -429,19 +886,68 @@ pub(super) fn apply(
             if rows.len() != active {
                 return Err(Refusal::ShapeMismatch("V-face active atlas bindings"));
             }
-            FaceGeometryRun::cpu(Some(cuda_v2warp::apply_cpu(
+            let fused = if atlases.is_empty() {
+                encoded_offset.clone()
+            } else {
+                let mut fused = shared.base.clone();
+                for row in cuda_vface::ROWS {
+                    let degree =
+                        cuda_vface::degree_for(row, controls[0] * 100.0, controls[1] * 100.0)?;
+                    if degree == 0.0 {
+                        continue;
+                    }
+                    let atlas = atlases
+                        .iter()
+                        .find(|atlas| atlas.row == row)
+                        .ok_or(Refusal::MissingInput("V-face active atlas bytes"))?;
+                    atlas.validate()?;
+                    fused = cuda_vface::fuse_offset_f32_cpu(
+                        &fused,
+                        cuda_vface::Atlas {
+                            row: atlas.row,
+                            width: atlas.width,
+                            height: atlas.height,
+                            pixels: &atlas.pixels,
+                        },
+                        degree,
+                    )?;
+                }
+                if !encoded_offset.is_empty() && encoded_offset != &fused {
+                    return Err(Refusal::ValueOutOfRange(
+                        "V-face atlas/encoded offset binding",
+                    ));
+                }
+                fused
+            };
+            render_v2(
                 source,
                 OffsetTexture {
                     width: cuda_vface::OFFSET_EDGE,
                     height: cuda_vface::OFFSET_EDGE,
-                    pixels: encoded_offset,
+                    pixels: &fused,
                 },
                 shared.mesh(),
                 shared.rules,
                 shared.mat2,
                 shared.f_o,
-            )?))
+            )?
         }
+        (
+            FaceGeometry::Type1011 {
+                prepared,
+                param_list,
+                center,
+            },
+            30073 | 30079,
+        ) => apply_type1011(
+            source,
+            pf,
+            controls,
+            shared,
+            prepared,
+            param_list,
+            *center,
+        )?,
         (
             FaceGeometry::Eye {
                 dest,
@@ -465,23 +971,103 @@ pub(super) fn apply(
                 *clamp,
             prefer_cuda(pf),
         )?,
-        (FaceGeometry::Smile { dx, dy, mask }, 8033) => {
-            // The warp samples each color lane independently and copies alpha,
-            // so the BGRA-named adapter also preserves RGBA channel order.
-            let pixels = smile_warp::pf8033_dense_warp(
-                &source.pixels,
-                source.width,
-                source.height,
+        (
+            FaceGeometry::HairLine {
+                dest,
+                uv,
+                ebo,
+                rules,
+                edge,
+                defines,
+                clamp,
+            },
+            202,
+        ) => render_mesh(
+            source, dest, uv, ebo, *rules, *edge, *defines, *clamp,
+        )?,
+        (
+            FaceGeometry::Skull {
+                anchor,
+                source: original,
+                warped,
+            },
+            232,
+        ) => render_skull(source, *anchor, original, warped)?,
+        (
+            FaceGeometry::Smile {
                 dx,
                 dy,
                 mask,
-                controls[0],
-            )
-            .map_err(smile_refusal)?;
-            FaceGeometryRun::cpu(Some(
-            Image::new(source.width, source.height, pixels)
-                    .ok_or(Refusal::ShapeMismatch("PF8033 output"))?,
-            ))
+                host_split_receipt,
+            },
+            8033,
+        ) => {
+            if host_split_receipt.job_id != input.job_id
+                || host_split_receipt.model_output_id
+                    != super::SmileRgbReconstructionField::OUTPUT_ID
+                || host_split_receipt.dx_sha256 != hash_f32(dx)
+                || host_split_receipt.dy_sha256 != hash_f32(dy)
+                || host_split_receipt.mask_sha256 != sha256_32(mask)
+            {
+                return Err(Refusal::ValueOutOfRange("PF8033 host split receipt"));
+            }
+            // The warp samples each color lane independently and copies alpha,
+            // so the BGRA-named adapter also preserves RGBA channel order.
+            let cpu = || {
+                let pixels = smile_warp::pf8033_dense_warp(
+                    &source.pixels,
+                    source.width,
+                    source.height,
+                    dx,
+                    dy,
+                    mask,
+                    controls[0],
+                )
+                .map_err(smile_refusal)?;
+                Image::new(source.width, source.height, pixels)
+                    .map(|image| FaceGeometryRun::cpu(Some(image)))
+                    .ok_or(Refusal::ShapeMismatch("PF8033 output"))
+            };
+            #[cfg(windows)]
+            {
+                let cuda = match super::forced_cuda_failure() {
+                    Some(error) => Err(error),
+                    None => aurora_portrait::cuda_smile::Smile::open().and_then(|gpu| {
+                        gpu.apply_pf8033(
+                            &source.pixels,
+                            source.width,
+                            source.height,
+                            dx,
+                            dy,
+                            mask,
+                            controls[0],
+                        )
+                    }),
+                };
+                match cuda {
+                    Ok((pixels, dispatches)) => {
+                        let image = Image::new(source.width, source.height, pixels)
+                            .ok_or(Refusal::ShapeMismatch("PF8033 output"))?;
+                        let changed = image != *source;
+                        FaceGeometryRun {
+                            image: changed.then_some(image),
+                            backend: PortraitBackend::Cuda,
+                            dispatches,
+                            fallback_reason: None,
+                        }
+                    }
+                    Err(error) => {
+                        let mut run = cpu()?;
+                        run.backend = PortraitBackend::Cpu;
+                        run.fallback_reason = Some(format!("CUDA PF8033 fallback: {error:?}"));
+                        run
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                cpu()?
+            }
         }
         _ => return Err(Refusal::ValueOutOfRange("face geometry draw kind")),
     };

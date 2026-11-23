@@ -72,18 +72,36 @@ fn ready_row(pf: u32) -> FaceGeometryProviderRow {
         FaceGeometryProviderRoute::V2Positions => FaceGeometry::V2Positions(vec![(0, [2.0, 1.0])]),
         FaceGeometryProviderRoute::VFace => FaceGeometry::VFace {
             rows: vec![aurora_portrait::cuda_vface::Row::RightPositive],
-            encoded_offset: vec![
-                [0.0; 4];
-                (aurora_portrait::cuda_vface::OFFSET_EDGE
-                    * aurora_portrait::cuda_vface::OFFSET_EDGE)
-                    as usize
-            ],
+            encoded_offset: Vec::new(),
+            atlases: vec![super::super::portrait_v2_mesh::VFaceAtlas::captured(
+                aurora_portrait::cuda_vface::Row::RightPositive,
+            )],
+        },
+        FaceGeometryProviderRoute::Type1011 => FaceGeometry::Type1011 {
+            prepared: (0..100)
+                .map(|index| {
+                    [
+                        0.25 + (index % 10) as f32 * 0.35,
+                        0.25 + (index / 10) as f32 * 0.35,
+                    ]
+                })
+                .collect(),
+            param_list: vec![0.1; 6],
+            center: [2.0, 2.0],
         },
         FaceGeometryProviderRoute::Eye => eye(),
         FaceGeometryProviderRoute::Smile => FaceGeometry::Smile {
             dx: vec![1.0; 16],
             dy: vec![0.0; 16],
             mask: vec![255; 16],
+            host_split_receipt: SmileHostSplitReceipt {
+                job_id: 42,
+                model_output_id: super::super::SmileRgbReconstructionField::OUTPUT_ID,
+                model_output_sha256: [0; 32],
+                dx_sha256: hash_f32(&[1.0; 16]),
+                dy_sha256: hash_f32(&[0.0; 16]),
+                mask_sha256: sha256_32(&[255; 16]),
+            },
         },
         route => panic!("not a ready route: {route:?}"),
     };
@@ -124,6 +142,10 @@ fn route_table_covers_requested_rows_with_named_refusals() {
     assert_eq!(
         provider_route(8025),
         Some(FaceGeometryProviderRoute::SlimContract)
+    );
+    assert_eq!(
+        provider_route(30073),
+        Some(FaceGeometryProviderRoute::Type1011)
     );
     assert_eq!(
         provider_route(30092),
@@ -209,16 +231,16 @@ fn missing_points_or_vbo_bytes_are_named_refusals() {
 }
 
 #[test]
-fn eye_rows_must_use_the_receipt_bound_uv_and_ebo() {
+fn type1011_rows_require_exactly_prepared100() {
     let mut input = base_input();
     input.rows = vec![ready_row(30073)];
-    if let FaceGeometry::Eye { uv, .. } = &mut input.rows[0].geometry {
-        uv[0] = [0.25, 0.25];
+    if let FaceGeometry::Type1011 { prepared, .. } = &mut input.rows[0].geometry {
+        prepared.pop();
     }
     assert_eq!(
         build_face_geometry_inputs(&input),
-        Err(Refusal::ValueOutOfRange(
-            "face geometry provider eye UV/EBO binding"
+        Err(Refusal::ShapeMismatch(
+            "face geometry provider Type1011 prepared100"
         ))
     );
 }

@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use crate::cuda::{CudaError, Dispatch};
 #[cfg(windows)]
 use crate::cuda_mesh::MeshRaster;
-use crate::kernels::{face_detail, face_geometry, forehead_common};
+use crate::kernels::{eye_geometry, face_detail, face_geometry, forehead_common};
 use crate::{Image, Refusal, raster, raster_fragment};
 
 pub const FACE_WIDTH_PARTS: [u8; 4] = [25, 26, 27, 28];
@@ -21,12 +21,14 @@ pub const FOREHEAD_HEIGHT_PARTS: [u8; 2] = [37, 38];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
+    Type1011,
     Type1012,
     Type1016,
 }
 
 pub fn family_for_part(part: u8) -> Option<Family> {
     match part {
+        6 | 7 => Some(Family::Type1011),
         35..=38 => Some(Family::Type1012),
         25..=28 => Some(Family::Type1016),
         _ => None,
@@ -35,6 +37,8 @@ pub fn family_for_part(part: u8) -> Option<Family> {
 
 pub fn pf_for_part(part: u8) -> Option<u32> {
     match part {
+        6 => Some(30073),
+        7 => Some(30079),
         35 => Some(30080),
         36 => Some(30081),
         37 => Some(30082),
@@ -99,6 +103,19 @@ impl Draw {
         }
 
         match family {
+            Family::Type1011 => {
+                if positions.len() != 100 {
+                    return Err(Refusal::ShapeMismatch("Type1011 prepared100 topology"));
+                }
+                let prepared: Vec<eye_geometry::Point> = positions
+                    .iter()
+                    .map(|point| eye_geometry::Point::new(point[0], point[1]))
+                    .collect();
+                let generated = eye_geometry::type1011_indices(&prepared)?;
+                if indices.as_slice() != generated.as_slice() {
+                    return Err(Refusal::ValueOutOfRange("Type1011 prepared100 EBO"));
+                }
+            }
             Family::Type1012 => {
                 if positions.len() != 136 || indices.len() != 705 {
                     return Err(Refusal::ShapeMismatch("Type1012 136/705 topology"));
@@ -123,6 +140,52 @@ impl Draw {
             source_uv,
             indices,
         })
+    }
+
+    /// Consumes the prepared100 source points and the already-deformed target
+    /// points from the Type1011 producer. The EBO must be generated from the
+    /// prepared points, never from the deformed target.
+    pub fn from_type1011(
+        part: u8,
+        pf: u32,
+        controls: [f32; 2],
+        source_sha256: [u8; 32],
+        prepared: &[[f32; 2]],
+        positions: Vec<[f32; 2]>,
+        source_uv: Vec<[f32; 2]>,
+        indices: Vec<u16>,
+    ) -> Result<Self, Refusal> {
+        if prepared.len() != 100 || positions.len() != 100 || source_uv.len() != 100 {
+            return Err(Refusal::ShapeMismatch("Type1011 prepared100 topology"));
+        }
+        if positions
+            .iter()
+            .chain(&source_uv)
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ValueOutOfRange("face mesh vertex"));
+        }
+        let source_positions = prepared;
+        let prepared: Vec<eye_geometry::Point> = prepared
+            .iter()
+            .map(|point| eye_geometry::Point::new(point[0], point[1]))
+            .collect();
+        let generated = eye_geometry::type1011_indices(&prepared)?;
+        if indices.as_slice() != generated.as_slice() {
+            return Err(Refusal::ValueOutOfRange("Type1011 prepared100 EBO"));
+        }
+        let mut draw = Self::new(
+            part,
+            pf,
+            controls,
+            source_sha256,
+            source_positions.to_vec(),
+            source_uv,
+            indices,
+        )?;
+        draw.positions = positions;
+        Ok(draw)
     }
 
     /// Consumes a Type1016 part already produced by `face_geometry::face_width`.
@@ -393,12 +456,72 @@ mod tests {
         .unwrap()
     }
 
+    fn type1011_draw(part: u8, pf: u32) -> Draw {
+        let prepared: Vec<[f32; 2]> = (0..100)
+            .map(|index| {
+                [
+                    0.4 + (index % 10) as f32 * 0.75,
+                    0.4 + (index / 10) as f32 * 0.75,
+                ]
+            })
+            .collect();
+        let points: Vec<eye_geometry::Point> = prepared
+            .iter()
+            .map(|point| eye_geometry::Point::new(point[0], point[1]))
+            .collect();
+        let indices = eye_geometry::type1011_indices(&points).unwrap();
+        let mut target = prepared.clone();
+        target[14][0] += 1.0;
+        target[63][0] -= 1.0;
+        let source_uv = prepared
+            .iter()
+            .map(|point| [point[0] / 8.0, point[1] / 8.0])
+            .collect();
+        Draw::from_type1011(
+            part,
+            pf,
+            [0.5, 0.5],
+            [0; 32],
+            &prepared,
+            target,
+            source_uv,
+            indices,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn face_width_raster_changes_a_non_neutral_frame() {
         let source = source();
         let draw = face_width_draw();
         let output = rasterize(&source, &[&draw]).unwrap();
         assert_ne!(output, source);
+    }
+
+    #[test]
+    fn type1011_prepared_ebo_rasterizes_both_eyelids() {
+        for (part, pf) in [(6, 30073), (7, 30079)] {
+            let draw = type1011_draw(part, pf);
+            assert_eq!(draw.positions.len(), 100);
+            assert_eq!(draw.family(), Family::Type1011);
+            assert_ne!(rasterize(&source(), &[&draw]).unwrap(), source());
+
+            let mut wrong = draw.indices.clone();
+            wrong[0] = 99;
+            assert_eq!(
+                Draw::from_type1011(
+                    part,
+                    pf,
+                    draw.controls,
+                    draw.source_sha256,
+                    &draw.positions,
+                    draw.positions.clone(),
+                    draw.source_uv.clone(),
+                    wrong,
+                ),
+                Err(Refusal::ValueOutOfRange("Type1011 prepared100 EBO"))
+            );
+        }
     }
 
     #[test]

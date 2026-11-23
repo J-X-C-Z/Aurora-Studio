@@ -582,27 +582,59 @@ fn apply_pair5(
 }
 
 // ---------------------------------------------------------------------------
-// Index buffers. Only the recovered 6-entry quad EBO is embedded; every mesh
-// path takes the same-job index buffer explicitly and refuses when absent.
+// Index buffers are explicit. Type1018 has a recovered generator, but it is not
+// admitted as an EBO for the 78-target numeric mesh until their mapping is known.
 // ---------------------------------------------------------------------------
 
 const EBO_14: &str = "TOPO_492_INDEX_TEMPLATE_NOT_EMBEDDED";
 const EBO_15: &str = "PAIR2_RING_INDEX_BUFFER_NOT_CAPTURED";
 const EBO_16: &str = "PAIR5_TOPOLOGY_492_INDEX_TEMPLATE_NOT_EMBEDDED";
-const EBO_19: &str = "0x60F2B60";
+const EBO_19: &str = "0x60F2B60_DYNAMIC_SUBDIV2D_ON_PREPARED100";
 const EBO_20: &str = "BROW_168_INDEX_BUFFER_NOT_CAPTURED";
-const EBO_23: &str = "TYPE1018_INDEX_BUFFER_NOT_CAPTURED_0x7080940";
+const EBO_23: &str = "TYPE1018_GENERATED_EBO_0x707DE40_78_TO_96_MAPPING_UNPROVEN";
+
+pub const TYPE1018_FACTORY_RVA: &str = "0x60F01B0";
+pub const TYPE1018_EBO_GENERATOR_RVA: &str = "0x707DE40";
+pub const TYPE1018_EBO_INSERT_RVA: &str = "0x7080940";
+pub const TYPE1018_DRAW_UPDATE_RVA: &str = "0x707E820";
+pub const TYPE1018_RING_BUILDER_RVA: &str = "0x707F550";
+pub const TYPE1018_OBJECT_VTABLE_RVA: &str = "0x946F040";
+pub const TYPE1018_EBO_INDEX_COUNT: usize = 498;
+pub const TYPE1018_EBO_BYTE_LEN: usize = TYPE1018_EBO_INDEX_COUNT * 2;
+pub const TYPE1018_EBO_BASE_INDEX: u16 = 6;
+pub const TYPE1018_EBO_VERTEX_COUNT: usize = 102;
+pub const TYPE1018_EBO_REFERENCED_SLOTS: usize = 96;
+pub const TYPE1018_EBO_RING_COUNT: usize = 4;
+pub const TYPE1018_TARGET_WINDOW_COUNT: usize = 3;
+pub const TYPE1018_TARGET_WINDOW_SIZE: usize = 24;
+pub const TYPE1018_EBO_U16LE_SHA256: &str =
+    "7BDEC0ECB1FCAA51D4DC42904CFA616536346EF0EC024EA11C6A51AF2836569A";
+pub const TYPE1018_EBO_MAPPING_REFUSAL: &str =
+    "TYPE1018_498_EBO_REFERENCES_4X24_RINGS_BUT_0x707ED50_CONSUMES_3X24_TARGET_WINDOWS_PLUS_6_NO_96_SLOT_EXPANSION";
 
 pub const fn ebo_rva(pf: u32) -> Option<&'static str> {
     match pf {
         8015 | 8016 => Some(EBO_14),
-        8017 | 8018 => Some(EBO_15),
+        8011..=8014 | 8017..=8020 => Some(EBO_15),
         8021 | 8022 => Some(EBO_16),
         30073 | 30079 => Some(EBO_19),
         8001 | 8002 | 8005 | 8006 | 8009 | 8010 => Some(EBO_20),
         44124 | 48019 | 49221 | 41922 => Some(EBO_23),
         _ => None,
     }
+}
+
+/// Type1011 `0x60F2B60`: triangulate the first float2 array owned by the eye
+/// geometry container, then export each int32 triple component as `u16`.
+pub fn type1011_indices(prepared: &[Point]) -> Result<Vec<u16>, Refusal> {
+    if prepared.len() != EYELID_PREPARED {
+        return Err(Refusal::MissingPreparedMesh);
+    }
+    if !all_finite(prepared) {
+        return Err(Refusal::NonFinite("prepared_non_finite"));
+    }
+    let points: Vec<[f32; 2]> = prepared.iter().map(|point| [point.x, point.y]).collect();
+    super::subdiv2d::triangulate(&points).map_err(|_| Refusal::MissingEbo(EBO_19))
 }
 
 pub fn accept_indices(
@@ -620,6 +652,79 @@ pub fn accept_indices(
         return Err(Refusal::OutOfRange("index_out_of_mesh_range"));
     }
     Ok(indices.len() / 3)
+}
+
+/// Admission gate for rows whose executable topology has not yet been sourced.
+/// This runs before either the CPU or CUDA fragment raster.
+pub fn stage_ebo_gate(
+    pf: u32,
+    indices: &[u16],
+    vertices: usize,
+) -> Result<usize, Refusal> {
+    if matches!(pf, 30073 | 30079) {
+        return accept_indices(pf, Some(indices), vertices);
+    }
+    if matches!(pf, 44124 | 48019 | 49221 | 41922) && indices.len() == 498 {
+        return Err(Refusal::MissingEbo(TYPE1018_EBO_MAPPING_REFUSAL));
+    }
+    if let Some(source) = ebo_rva(pf) {
+        return Err(Refusal::MissingEbo(source));
+    }
+    accept_indices(pf, Some(indices), vertices)
+}
+
+/// Reproduces the ordered `u16` triangle list built by the Type1018 constructor.
+///
+/// `0x707DE40` creates four 24-slot rings after the six-slot prefix, emits 498
+/// local indices, then adds the base index 6. `0x7080940` is only its vector
+/// insert helper. The draw update `0x707E820` calls `0x707EA60`, which invokes
+/// ring builder `0x707F550` twice for 24-slot rings, while `0x707ED50` mutates
+/// exactly three 24-target windows after the six-slot prefix. No recovered
+/// instruction expands those 78 targets into the EBO's four-ring 96-slot domain.
+pub fn type1018_ordered_ebo() -> Vec<u16> {
+    const RING: usize = 24;
+    const HALF: usize = RING / 2;
+    let mut local = Vec::with_capacity(TYPE1018_EBO_INDEX_COUNT);
+
+    for i in 0..(RING - HALF - 2) {
+        let next = i + 1;
+        let back = RING - 1 - i;
+        let tail = RING - 2 - i;
+        local.extend([
+            i as u16,
+            next as u16,
+            back as u16,
+            back as u16,
+            next as u16,
+            tail as u16,
+        ]);
+    }
+
+    for i in (RING - HALF - 2)..HALF {
+        local.extend([i as u16, (i + 1) as u16, (HALF + 1) as u16]);
+    }
+
+    for band in 0..3 {
+        let top = band * RING;
+        let bottom = top + RING;
+        for column in 0..RING {
+            let next = (column + 1) % RING;
+            local.extend([
+                (top + column) as u16,
+                (top + next) as u16,
+                (bottom + column) as u16,
+                (bottom + column) as u16,
+                (top + next) as u16,
+                (bottom + next) as u16,
+            ]);
+        }
+    }
+
+    debug_assert_eq!(local.len(), TYPE1018_EBO_INDEX_COUNT);
+    local
+        .into_iter()
+        .map(|index| index + TYPE1018_EBO_BASE_INDEX)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,7 +1285,7 @@ pub fn row19_lower_eyelid(
         target: deformed,
         scalars: vec![EYELID_AMP_SCALE, triangles as f32],
         open: vec![
-            "PASS_BITWISE_PREPARED_AND_DEFORMED_SYNTHETIC_FACE; EBO_CONTRACT_ORACLE_ONLY",
+            "PASS_BITWISE_PREPARED_AND_DEFORMED_SYNTHETIC_FACE; EBO_DYNAMIC_0x60F2B60_LOADER_READY",
             "CENTER_IS_FACE_0x18AC_0x18B0_NOT_A_CENTROID",
         ],
         noop,
@@ -1787,6 +1892,55 @@ mod tests {
         let zero_inputs = BrowLengthInputs { ..inputs };
         let zero = brow_length(23, BrowPartKind::Short, zero_inputs, 0.0, 0.0, 0.0, 0.0, Some(&indices)).unwrap();
         assert!(zero.noop);
+    }
+
+    #[test]
+    fn type1018_generator_is_not_the_78_target_draw_ebo() {
+        let ebo = type1018_ordered_ebo();
+        let prefix: [u16; 18] =
+            [6, 7, 29, 29, 7, 28, 7, 8, 28, 28, 8, 27, 8, 9, 27, 27, 9, 26];
+        let middle: [u16; 16] =
+            [15, 16, 20, 20, 16, 19, 16, 17, 19, 17, 18, 19, 6, 7, 30, 30];
+        let suffix: [u16; 18] =
+            [75, 76, 99, 99, 76, 100, 76, 77, 100, 100, 77, 101, 77, 54, 101, 101, 54, 78];
+        let mut unique = ebo.clone();
+        unique.sort_unstable();
+        unique.dedup();
+
+        assert_eq!(ebo.len(), TYPE1018_EBO_INDEX_COUNT);
+        assert_eq!(ebo.len() * 2, TYPE1018_EBO_BYTE_LEN);
+        assert_eq!(ebo.iter().copied().min(), Some(TYPE1018_EBO_BASE_INDEX));
+        assert_eq!(
+            ebo.iter().copied().max(),
+            Some((TYPE1018_EBO_VERTEX_COUNT - 1) as u16)
+        );
+        assert_eq!(unique.len(), TYPE1018_EBO_REFERENCED_SLOTS);
+        assert_eq!(
+            BROW_TARGETS,
+            TYPE1018_EBO_BASE_INDEX as usize
+                + TYPE1018_TARGET_WINDOW_COUNT * TYPE1018_TARGET_WINDOW_SIZE
+        );
+        assert_eq!(
+            TYPE1018_EBO_REFERENCED_SLOTS,
+            TYPE1018_EBO_RING_COUNT * TYPE1018_TARGET_WINDOW_SIZE
+        );
+        assert_eq!(
+            TYPE1018_EBO_VERTEX_COUNT,
+            TYPE1018_EBO_BASE_INDEX as usize + TYPE1018_EBO_REFERENCED_SLOTS
+        );
+        assert_eq!(TYPE1018_DRAW_UPDATE_RVA, "0x707E820");
+        assert_eq!(TYPE1018_RING_BUILDER_RVA, "0x707F550");
+        assert_eq!(&ebo[..18], &prefix[..]);
+        assert_eq!(&ebo[54..70], &middle[..]);
+        assert_eq!(&ebo[480..], &suffix[..]);
+        assert_eq!(
+            accept_indices(44124, Some(&ebo), BROW_TARGETS),
+            Err(Refusal::OutOfRange("index_out_of_mesh_range"))
+        );
+        assert_eq!(
+            stage_ebo_gate(44124, &ebo, TYPE1018_EBO_VERTEX_COUNT),
+            Err(Refusal::MissingEbo(TYPE1018_EBO_MAPPING_REFUSAL))
+        );
     }
 
     #[test]

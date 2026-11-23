@@ -32,8 +32,8 @@ pub struct SlimProducerInputs {
 impl SlimProducerInputs {
     /// Builds the same-frame face-width producer input from real landmarks.
     ///
-    /// PF8025/PF8026 require their own recovered V2 mesh payload and therefore
-    /// stay empty here and fail closed.
+    /// Recovered 194 -> 526 formulas and captured 2982-index topology fill the
+    /// V2 mesh; the caller still supplies same-job Grid_2005/base.
     pub fn from_landmarks(
         job_id: u64,
         source: &Image,
@@ -49,6 +49,7 @@ impl SlimProducerInputs {
         if points194.iter().flatten().any(|value| !value.is_finite()) {
             return Err(Refusal::ValueOutOfRange("face landmarks"));
         }
+        let mesh = super::portrait_v2_mesh::from_landmarks(&points194, source.width, source.height)?;
         Ok(Self {
             job_id,
             width: source.width,
@@ -57,19 +58,19 @@ impl SlimProducerInputs {
             grid: Vec::new(),
             base: Vec::new(),
             points194,
-            framebuffer_positions_w1: Vec::new(),
-            texcoord: Vec::new(),
-            offset_texcoord: Vec::new(),
-            face_scales: Vec::new(),
-            ebo: Vec::new(),
+            framebuffer_positions_w1: mesh.framebuffer_positions_w1,
+            texcoord: mesh.texcoord,
+            offset_texcoord: mesh.offset_texcoord,
+            face_scales: mesh.face_scales,
+            ebo: mesh.ebo,
             rules: Rules {
                 winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
                 cull: aurora_portrait::raster::Cull::None,
                 edge: aurora_portrait::raster::Edge::Inclusive,
                 overlap: aurora_portrait::raster::Overlap::Last,
             },
-            mat2: [1.0, 0.0, 0.0, 1.0],
-            f_o: [0.0, 0.0],
+            mat2: mesh.mat2,
+            f_o: [source.width as f32, source.height as f32],
         })
     }
 

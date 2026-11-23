@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aurora_portrait::cuda_vface;
+use aurora_portrait::kernels::eye_geometry;
 use aurora_portrait::Refusal;
 
 use super::portrait_face_stage::{FaceGeometry, FaceGeometryDraw, FaceGeometryInputs};
@@ -19,6 +20,7 @@ pub const PROVIDER_ROUTED_PFS: &[u32] = &[
 pub enum FaceGeometryProviderRoute {
     V2Positions,
     VFace,
+    Type1011,
     Eye,
     Smile,
     SlimContract,
@@ -39,12 +41,11 @@ pub fn provider_route(pf: u32) -> Option<FaceGeometryProviderRoute> {
         | 8009
         | 8010
         | 8011..=8022
-        | 30073
-        | 30079
         | 41922
         | 44124
         | 48019
         | 49221 => FaceGeometryProviderRoute::Eye,
+        30073 | 30079 => FaceGeometryProviderRoute::Type1011,
         8033 => FaceGeometryProviderRoute::Smile,
         8025 | 8026 => FaceGeometryProviderRoute::SlimContract,
         30092 | 30093 => FaceGeometryProviderRoute::FaceMeshContract,
@@ -150,6 +151,9 @@ pub fn build_face_geometry_inputs(
             }
             FaceGeometryProviderRoute::VFace => {
                 validate_vface(row, meshes.get(&required_mesh(row)?))?;
+            }
+            FaceGeometryProviderRoute::Type1011 => {
+                validate_type1011(row)?;
             }
             FaceGeometryProviderRoute::Eye => {
                 validate_eye(row, meshes.get(&required_mesh(row)?))?;
@@ -357,6 +361,43 @@ fn validate_v2_positions(
     }
 }
 
+fn validate_type1011(row: &FaceGeometryProviderRow) -> Result<(), Refusal> {
+    validate_controls(row.controls, false)?;
+    let FaceGeometry::Type1011 {
+        prepared,
+        param_list,
+        center,
+    } = &row.geometry
+    else {
+        return Err(Refusal::ValueOutOfRange(
+            "face geometry provider PF/geometry kind",
+        ));
+    };
+    if prepared.len() != 100 {
+        return Err(Refusal::ShapeMismatch(
+            "face geometry provider Type1011 prepared100",
+        ));
+    }
+    if param_list.len() != 6 {
+        return Err(Refusal::MissingInput(
+            "face geometry provider Type1011 six weights",
+        ));
+    }
+    if !finite_points(prepared)
+        || center.iter().any(|value| !value.is_finite())
+        || param_list.iter().any(|value| !value.is_finite())
+    {
+        return Err(Refusal::ValueOutOfRange(
+            "face geometry provider Type1011 values",
+        ));
+    }
+    let prepared: Vec<eye_geometry::Point> = prepared
+        .iter()
+        .map(|point| eye_geometry::Point::new(point[0], point[1]))
+        .collect();
+    eye_geometry::type1011_indices(&prepared).map(|_| ())
+}
+
 fn validate_vface(
     row: &FaceGeometryProviderRow,
     mesh: Option<&&FaceGeometryProviderMesh>,
@@ -369,10 +410,19 @@ fn validate_vface(
         FaceGeometry::VFace {
             rows,
             encoded_offset,
+            atlases,
         } => {
             let edge_pixels = usize::try_from(cuda_vface::OFFSET_EDGE * cuda_vface::OFFSET_EDGE)
                 .map_err(|_| Refusal::ShapeMismatch("face geometry provider V-face atlas"))?;
-            if encoded_offset.len() != edge_pixels {
+            for atlas in atlases {
+                atlas.validate()?;
+                if !rows.contains(&atlas.row) {
+                    return Err(Refusal::ValueOutOfRange(
+                        "face geometry provider V-face atlas row",
+                    ));
+                }
+            }
+            if atlases.is_empty() && encoded_offset.len() != edge_pixels {
                 return Err(Refusal::ShapeMismatch(
                     "face geometry provider V-face atlas",
                 ));
@@ -451,7 +501,9 @@ fn validate_smile(row: &FaceGeometryProviderRow, width: u32, height: u32) -> Res
             "face geometry provider PF8033 frame",
         ))?;
     match &row.geometry {
-        FaceGeometry::Smile { dx, dy, mask } => {
+        FaceGeometry::Smile {
+            dx, dy, mask, ..
+        } => {
             if dx.len() != pixels || dy.len() != pixels || mask.len() != pixels {
                 return Err(Refusal::ShapeMismatch(
                     "face geometry provider PF8033 planes",
