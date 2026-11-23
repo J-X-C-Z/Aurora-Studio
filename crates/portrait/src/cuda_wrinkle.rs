@@ -7,12 +7,17 @@
 //! modes, never an assumed equivalence.
 
 use crate::cuda::{self, CudaError, Dispatch};
+use crate::cuda_job_upload::{
+    JobBufferDesc, JobBufferPlan, JobBufferPurpose, JobBufferRole,
+};
 use crate::kernels::facial_smooth::Uniforms as P15CpuUniforms;
 use crate::kernels::skin_adjust::{self, Roi, StoreMode, WrinkleUniforms};
 use crate::{Image, Refusal};
 
 pub const KERNEL: &str = cuda::COMPOSITE;
+pub const U8_KERNEL: &str = cuda::COMPOSITE_U8;
 pub const ROUTED_PFS: [u32; 4] = [21025, 21069, 21070, 21071];
+pub const HISTORICAL_SKIN_PFS: [u32; 3] = [21024, 90023, 90024];
 const INV255: f32 = 1.0 / 255.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +220,152 @@ impl WrinkleGpu {
                 let destination = (((roi.y + y) * source.width + roi.x + x) as usize) * 4;
                 for channel in 0..3 {
                     out.pixels[destination + channel] = store.quantize(float[local + channel]);
+                }
+            }
+        }
+        Ok((out, vec![dispatch]))
+    }
+
+    /// Runs one historical wrinkle row from the caller's shared job arena.
+    /// P15 consumes the fbe class-1 skin plane, RGBA mask, base/residual and
+    /// control; this ABI has no LUT channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_historical_same_job(
+        &self,
+        job_id: u64,
+        pf: u32,
+        source: &Image,
+        base: &Image,
+        residual: &Image,
+        mask_rgba: &[u8],
+        skin_mask: &[u8],
+        roi: Roi,
+        control: f32,
+        uniforms: WrinkleUniforms,
+        store: StoreMode,
+    ) -> Result<(Image, Vec<Dispatch>), CudaError> {
+        if !HISTORICAL_SKIN_PFS.contains(&pf) {
+            return Err(CudaError::Refused(Refusal::UnknownEffect(pf)));
+        }
+        if !control.is_finite() || !(0.0..=1.0).contains(&control) {
+            return Err(CudaError::Refused(Refusal::ValueOutOfRange(
+                "historical skin control",
+            )));
+        }
+        check(
+            source, base, residual, mask_rgba, skin_mask, roi, uniforms,
+        )
+        .map_err(CudaError::Refused)?;
+        if control <= cuda::GATE {
+            return Ok((source.clone(), Vec::new()));
+        }
+
+        let source_roi = crop_image(source, roi);
+        let base_roi = crop_image(base, roi);
+        let residual_roi = crop_image(residual, roi);
+        let mask_roi = crop_rgba(mask_rgba, source.width, roi);
+        let skin_roi = crop_plane(skin_mask, source.width, roi);
+        let output_seed = vec![0f32; skin_roi.len() * 4];
+        let control_payload = [control];
+        let plan = JobBufferPlan::new(
+            job_id,
+            (roi.width, roi.height),
+            vec![
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 0,
+                    purpose: JobBufferPurpose::ReadOnlyInput,
+                    payload: source_roi.pixels.as_slice(),
+                },
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 1,
+                    purpose: JobBufferPurpose::ReadOnlyInput,
+                    payload: mask_roi.as_slice(),
+                },
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 2,
+                    purpose: JobBufferPurpose::ReadOnlyInput,
+                    payload: skin_roi.as_slice(),
+                },
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 3,
+                    purpose: JobBufferPurpose::ReadOnlyInput,
+                    payload: base_roi.pixels.as_slice(),
+                },
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 4,
+                    purpose: JobBufferPurpose::ReadOnlyInput,
+                    payload: residual_roi.pixels.as_slice(),
+                },
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 5,
+                    purpose: JobBufferPurpose::Seed,
+                    payload: output_seed.as_slice(),
+                },
+                JobBufferDesc {
+                    role: JobBufferRole::HistoricalSkin,
+                    ordinal: 6,
+                    purpose: JobBufferPurpose::ReadOnlyInput,
+                    payload: &control_payload,
+                },
+            ],
+        )
+        .map_err(CudaError::Refused)?;
+        let p15 = cuda::Uniforms::new(
+            roi.width,
+            roi.height,
+            pf,
+            control,
+            &p15_uniforms(uniforms),
+        );
+        let ((float, dispatch), _) = self
+            .gpu
+            .with_job_buffers(&plan, |session| {
+                let mut source_arg = session.handle(JobBufferRole::HistoricalSkin, 0)?;
+                let mut mask_arg = session.handle(JobBufferRole::HistoricalSkin, 1)?;
+                let mut skin_arg = session.handle(JobBufferRole::HistoricalSkin, 2)?;
+                let mut base_arg = session.handle(JobBufferRole::HistoricalSkin, 3)?;
+                let mut residual_arg = session.handle(JobBufferRole::HistoricalSkin, 4)?;
+                let mut output_arg = session.handle(JobBufferRole::HistoricalSkin, 5)?;
+                let mut uniforms_arg = p15;
+                let mut params: [*mut std::ffi::c_void; 7] = [
+                    &mut source_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut mask_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut skin_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut base_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut residual_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut output_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut uniforms_arg as *mut cuda::Uniforms as *mut std::ffi::c_void,
+                ];
+                let dispatch = session.launch(
+                    U8_KERNEL,
+                    (
+                        roi.width.div_ceil(16).max(1),
+                        roi.height.div_ceil(16).max(1),
+                    ),
+                    (16, 16),
+                    &mut params,
+                )?;
+                let mut float = vec![0f32; skin_roi.len() * 4];
+                session.download_f32(JobBufferRole::HistoricalSkin, 5, &mut float)?;
+                session.mark_consumed();
+                Ok((float, dispatch))
+            })?;
+
+        let mut out = source.clone();
+        for y in 0..roi.height {
+            for x in 0..roi.width {
+                let local = ((y * roi.width + x) as usize) * 4;
+                let destination =
+                    (((roi.y + y) * source.width + roi.x + x) as usize) * 4;
+                for channel in 0..3 {
+                    out.pixels[destination + channel] =
+                        store.quantize(float[local + channel]);
                 }
             }
         }

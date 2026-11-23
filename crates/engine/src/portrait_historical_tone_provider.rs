@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use aurora_portrait::model_sha256::sha256;
 use aurora_portrait::kernels::{pore, skin_adjust};
 use aurora_portrait::{Image, Refusal};
 
+use crate::face_parsing::{
+    FaceParsingProducerInputs, FaceParsingRoi, project_face_parsing_skin_mask,
+};
 use crate::portrait_stage::{
     HistoricalToneData, HistoricalToneFace, HistoricalToneInput, HistoricalToneInputs,
 };
@@ -27,6 +31,8 @@ pub struct HistoricalToneRowJob {
 /// One external row: its own frame binding plus owned model/material payloads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HistoricalToneProviderRow {
+    /// Exact immediate frame consumed at this row's stack position.
+    pub frame: Image,
     pub job: HistoricalToneRowJob,
     pub data: HistoricalToneRowData,
 }
@@ -163,6 +169,53 @@ pub struct HistoricalToneBreastRepairPayload {
     pub alternate: bool,
 }
 
+/// Builds the PF30013 row from canonical fbe FaceParsingV2 class 1 (skin).
+///
+/// `face_roi` and `tone_roi` are intentionally explicit: the former is the
+/// exact source-to-crop transform used by inference, while the latter is the
+/// integer PF30013 writeback rectangle. `original` remains the owned HSL source
+/// plane; `frame` is the exact immediate row input used for SHA and size binding.
+pub fn build_pf30013_face_parsing_row(
+    ticket: u64,
+    control: f32,
+    frame: Image,
+    original: Image,
+    face_roi: FaceParsingRoi,
+    tone_roi: skin_adjust::Roi,
+    parsing: &FaceParsingProducerInputs,
+) -> Result<HistoricalToneProviderRow, Refusal> {
+    if ticket == 0 || parsing.job_id != ticket {
+        return Err(Refusal::ValueOutOfRange(
+            "historical tone provider PF30013 fbe job ticket",
+        ));
+    }
+    let source_to_crop = face_roi.source_to_crop()?;
+    if parsing.source_to_crop != source_to_crop {
+        return Err(Refusal::ValueOutOfRange(
+            "historical tone provider PF30013 fbe ROI transform",
+        ));
+    }
+    if [original.width, original.height] != [frame.width, frame.height] {
+        return Err(Refusal::ShapeMismatch(
+            "historical tone provider PF30013 original frame shape",
+        ));
+    }
+    let mask = project_face_parsing_skin_mask(parsing, frame.width, frame.height)?;
+    Ok(HistoricalToneProviderRow {
+        job: HistoricalToneRowJob {
+            source_sha256: sha256(&frame.pixels),
+            size: [frame.width, frame.height],
+            control,
+        },
+        frame,
+        data: HistoricalToneRowData::FlatGray(HistoricalToneFlatGrayPayload {
+            original,
+            mask,
+            roi: tone_roi,
+        }),
+    })
+}
+
 /// Builds the owned row map for all present external rows.
 ///
 /// This is the production entry. Missing fields are rejected by name; no row is
@@ -202,7 +255,7 @@ pub fn build_historical_tone_inputs(
                 "historical tone provider duplicate PF row",
             ));
         }
-        let HistoricalToneProviderRow { job, data } = row;
+        let HistoricalToneProviderRow { frame, job, data } = row;
         let HistoricalToneRowJob {
             source_sha256,
             size,
@@ -212,7 +265,22 @@ pub fn build_historical_tone_inputs(
         if source_sha256 == [0; 32] {
             return Err(Refusal::MissingInput(names.frame_sha));
         }
+        if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
+            return Err(Refusal::MissingInput(names.frame));
+        }
+        if [frame.width, frame.height] != size {
+            return Err(Refusal::ShapeMismatch(names.frame_size));
+        }
         let frame_pixels = checked_pixels(size, names.frame_size)?;
+        let frame_bytes = frame_pixels
+            .checked_mul(4)
+            .ok_or(Refusal::ShapeMismatch(names.frame))?;
+        if frame.pixels.len() != frame_bytes {
+            return Err(Refusal::ShapeMismatch(names.frame));
+        }
+        if sha256(&frame.pixels) != source_sha256 {
+            return Err(Refusal::ValueOutOfRange(names.frame_sha_mismatch));
+        }
         if !control.is_finite() || !(-1.0..=1.0).contains(&control) {
             return Err(Refusal::ValueOutOfRange(names.control));
         }
@@ -762,7 +830,9 @@ fn require_pore_points(points: &[pore::Control]) -> Result<(), Refusal> {
 /// Per-row refusal names, so a rejected frame binding names its owning PF.
 #[derive(Clone, Copy, Debug)]
 struct RowNames {
+    frame: &'static str,
     frame_sha: &'static str,
+    frame_sha_mismatch: &'static str,
     frame_size: &'static str,
     control: &'static str,
     unsigned_control: &'static str,
@@ -771,61 +841,81 @@ struct RowNames {
 fn row_names(pf: u32) -> RowNames {
     match pf {
         30009 => RowNames {
+            frame: "historical tone provider PF30009 frame",
             frame_sha: "historical tone provider PF30009 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30009 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30009 frame size",
             control: "historical tone provider PF30009 control",
             unsigned_control: "historical tone provider PF30009 control for unsigned row",
         },
         30013 => RowNames {
+            frame: "historical tone provider PF30013 frame",
             frame_sha: "historical tone provider PF30013 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30013 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30013 frame size",
             control: "historical tone provider PF30013 control",
             unsigned_control: "historical tone provider PF30013 control for unsigned row",
         },
         30014 => RowNames {
+            frame: "historical tone provider PF30014 frame",
             frame_sha: "historical tone provider PF30014 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30014 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30014 frame size",
             control: "historical tone provider PF30014 control",
             unsigned_control: "historical tone provider PF30014 control for unsigned row",
         },
         30017 => RowNames {
+            frame: "historical tone provider PF30017 frame",
             frame_sha: "historical tone provider PF30017 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30017 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30017 frame size",
             control: "historical tone provider PF30017 control",
             unsigned_control: "historical tone provider PF30017 control for unsigned row",
         },
         30030 => RowNames {
+            frame: "historical tone provider PF30030 frame",
             frame_sha: "historical tone provider PF30030 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30030 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30030 frame size",
             control: "historical tone provider PF30030 control",
             unsigned_control: "historical tone provider PF30030 control for unsigned row",
         },
         30059 => RowNames {
+            frame: "historical tone provider PF30059 frame",
             frame_sha: "historical tone provider PF30059 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30059 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30059 frame size",
             control: "historical tone provider PF30059 control",
             unsigned_control: "historical tone provider PF30059 control for unsigned row",
         },
         30187 => RowNames {
+            frame: "historical tone provider PF30187 frame",
             frame_sha: "historical tone provider PF30187 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30187 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30187 frame size",
             control: "historical tone provider PF30187 control",
             unsigned_control: "historical tone provider PF30187 control for unsigned row",
         },
         30190 => RowNames {
+            frame: "historical tone provider PF30190 frame",
             frame_sha: "historical tone provider PF30190 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF30190 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF30190 frame size",
             control: "historical tone provider PF30190 control",
             unsigned_control: "historical tone provider PF30190 control for unsigned row",
         },
         100004 => RowNames {
+            frame: "historical tone provider PF100004 frame",
             frame_sha: "historical tone provider PF100004 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF100004 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF100004 frame size",
             control: "historical tone provider PF100004 control",
             unsigned_control: "historical tone provider PF100004 control for unsigned row",
         },
         _ => RowNames {
+            frame: "historical tone provider PF100008 frame",
             frame_sha: "historical tone provider PF100008 frame SHA-256",
+            frame_sha_mismatch: "historical tone provider PF100008 frame SHA-256 mismatch",
             frame_size: "historical tone provider PF100008 frame size",
             control: "historical tone provider PF100008 control",
             unsigned_control: "historical tone provider PF100008 control for unsigned row",
@@ -852,8 +942,6 @@ fn missing_row(pf: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SHA: [u8; 32] = [7; 32];
 
     fn image(size: [u32; 2]) -> Image {
         Image::solid(size[0], size[1], [40, 80, 120, 255])
@@ -966,13 +1054,15 @@ mod tests {
 
     fn row(pf: u32, sha: [u8; 32], size: [u32; 2], control: f32) -> HistoricalToneProviderRow {
         HistoricalToneProviderRow {
+            frame: image(size),
             job: job(sha, size, control),
             data: row_data(pf, size),
         }
     }
 
     fn row_at(pf: u32, size: [u32; 2]) -> HistoricalToneProviderRow {
-        row(pf, SHA, size, 0.8)
+        let frame = image(size);
+        row(pf, sha256(&frame.pixels), size, 0.8)
     }
 
     fn payload(rows: Vec<HistoricalToneProviderRow>) -> HistoricalToneProviderPayload {
@@ -1009,15 +1099,20 @@ mod tests {
     fn rows_carry_independent_frame_bindings() {
         // Two ordered rows: the second consumes the frame the first produces, so
         // digest, size and control all differ and must survive the builder.
-        let second_sha = [9; 32];
+        let second_frame = Image::solid(1, 2, [9, 8, 7, 255]);
+        let second_sha = sha256(&second_frame.pixels);
         let inputs = build_historical_tone_inputs(payload(vec![
-            row(30009, SHA, [2, 1], 0.8),
-            row(30059, second_sha, [1, 2], -0.4),
+            row_at(30009, [2, 1]),
+            HistoricalToneProviderRow {
+                frame: second_frame,
+                job: job(second_sha, [1, 2], -0.4),
+                data: row_data(30059, [1, 2]),
+            },
         ]))
         .unwrap();
         let first = inputs.get(&30009).expect("first row");
         let second = inputs.get(&30059).expect("second row");
-        assert_eq!(first.source_sha256, SHA);
+        assert_eq!(first.source_sha256, sha256(&image([2, 1]).pixels));
         assert_eq!(first.size, [2, 1]);
         assert_eq!(first.control, 0.8);
         assert_eq!(second.source_sha256, second_sha);
@@ -1066,7 +1161,8 @@ mod tests {
         }
 
         let empty_rgb = HistoricalToneProviderRow {
-            job: job(SHA, size, 0.8),
+            frame: image(size),
+            job: job(sha256(&image(size).pixels), size, 0.8),
             data: HistoricalToneRowData::HairColor(HistoricalToneHairColorPayload {
                 effect_rgb: Vec::new(),
                 hair_mask: vec![1.0; 2],
@@ -1083,6 +1179,7 @@ mod tests {
     #[test]
     fn each_row_frame_binding_is_validated_by_name() {
         let size = [2, 1];
+        let frame_sha = sha256(&image(size).pixels);
         // A zero digest is a missing binding, named with the owning PF.
         assert_eq!(
             build_historical_tone_inputs(payload(vec![row(30013, [0; 32], size, 0.8)])),
@@ -1092,21 +1189,35 @@ mod tests {
         );
         // A zero frame size is refused and names the owning PF.
         assert_eq!(
-            build_historical_tone_inputs(payload(vec![row(30030, SHA, [0, 0], 0.8)])).unwrap_err(),
+            build_historical_tone_inputs(payload(vec![HistoricalToneProviderRow {
+                frame: image(size),
+                job: job(frame_sha, [0, 0], 0.8),
+                data: row_data(30030, size),
+            }]))
+            .unwrap_err(),
             Refusal::MissingInput("historical tone provider PF30030 frame size")
         );
         // Per-row control range is checked, not shared across rows.
         assert_eq!(
-            build_historical_tone_inputs(payload(vec![row(30017, SHA, size, 1.5)])).unwrap_err(),
+            build_historical_tone_inputs(payload(vec![row(30017, frame_sha, size, 1.5)])).unwrap_err(),
             Refusal::ValueOutOfRange("historical tone provider PF30017 control")
         );
         // Only PF30009 and PF30059 accept a negative (signed) control.
         assert_eq!(
-            build_historical_tone_inputs(payload(vec![row(30187, SHA, size, -0.5)])).unwrap_err(),
+            build_historical_tone_inputs(payload(vec![row(30187, frame_sha, size, -0.5)])).unwrap_err(),
             Refusal::ValueOutOfRange("historical tone provider PF30187 control for unsigned row")
         );
-        assert!(build_historical_tone_inputs(payload(vec![row(30009, SHA, size, -0.5)])).is_ok());
-        assert!(build_historical_tone_inputs(payload(vec![row(30059, SHA, size, -0.5)])).is_ok());
+        assert!(build_historical_tone_inputs(payload(vec![row(30009, frame_sha, size, -0.5)])).is_ok());
+        assert!(build_historical_tone_inputs(payload(vec![row(30059, frame_sha, size, -0.5)])).is_ok());
+
+        let mut wrong_sha = row_at(30013, size);
+        wrong_sha.job.source_sha256[0] ^= 1;
+        assert_eq!(
+            build_historical_tone_inputs(payload(vec![wrong_sha])),
+            Err(Refusal::ValueOutOfRange(
+                "historical tone provider PF30013 frame SHA-256 mismatch"
+            ))
+        );
     }
 
     #[test]

@@ -213,6 +213,249 @@ fn apply_multi_tone(source: &Image, faces: &[HistoricalToneFace], ui: f32) -> Re
     tone_unify::pf30059_apply(source, &passes, ui)
 }
 
+/// Backend that actually produced one historical-tone row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoricalTonePath {
+    Cpu,
+    Gpu,
+}
+
+/// The only historical-tone rows with a checked-in CUDA kernel, CPU oracle and
+/// parity fixture in this tree.
+pub const GPU_PROVEN_HISTORICAL_TONE_PFS: [u32; 2] = [30030, 30187];
+pub const GPU_MATERIALIZED_FIXTURE_ENV: &str = "AURORA_HISTORICAL_TONE_GPU_FIXTURE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoricalToneFixture {
+    Absent,
+    Accepted(&'static str),
+}
+
+impl HistoricalToneFixture {
+    pub fn from_env(pf: u32) -> Self {
+        std::env::var(GPU_MATERIALIZED_FIXTURE_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .any(|value| value.parse::<u32>() == Ok(pf))
+            .then_some(Self::Accepted(GPU_MATERIALIZED_FIXTURE_ENV))
+            .unwrap_or(Self::Absent)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalToneGpuPlan {
+    pub backend: HistoricalTonePath,
+    pub kernel: Option<&'static str>,
+    pub fallback_reason: Option<String>,
+}
+
+impl HistoricalToneGpuPlan {
+    fn cpu(reason: impl Into<String>) -> Self {
+        Self {
+            backend: HistoricalTonePath::Cpu,
+            kernel: None,
+            fallback_reason: Some(reason.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoricalToneRowOutcome {
+    pub image: Option<Image>,
+    pub backend: HistoricalTonePath,
+    pub kernel: Option<&'static str>,
+    pub fallback_reason: Option<String>,
+}
+
+impl HistoricalToneRowOutcome {
+    fn cpu(image: Option<Image>, reason: Option<String>) -> Self {
+        Self {
+            image,
+            backend: HistoricalTonePath::Cpu,
+            kernel: None,
+            fallback_reason: reason,
+        }
+    }
+}
+
+/// Driver binding implemented outside the engine crate. The engine never owns a
+/// CUDA context or silently substitutes a different LUT/plane contract.
+pub trait HistoricalToneGpu {
+    fn run(&self, pf: u32, source: &Image, data: &HistoricalToneData) -> Result<Image, String>;
+}
+
+pub fn gpu_kernel(pf: u32) -> Option<&'static str> {
+    match pf {
+        30030 => Some("pf30030_blue_vein_kernel"),
+        30187 => Some("hand_neutral_gray_kernel"),
+        _ => None,
+    }
+}
+
+fn gpu_shape_reason(pf: u32, size: [u32; 2], data: &HistoricalToneData, pixels: usize) -> Option<String> {
+    match (pf, data) {
+        (30030, HistoricalToneData::HandVeins { mask, rgb, roi, .. }) => {
+            if mask.len() != pixels {
+                return Some(format!(
+                    "PF30030 vein mask has {} values for {pixels} frame pixels",
+                    mask.len()
+                ));
+            }
+            if rgb.len() != pixels * 3 {
+                return Some(format!(
+                    "PF30030 correction rgb has {} values for {pixels} frame pixels",
+                    rgb.len()
+                ));
+            }
+            let (x, y, width, height) = *roi;
+            if width == 0
+                || height == 0
+                || x.saturating_add(width) > size[0]
+                || y.saturating_add(height) > size[1]
+            {
+                return Some(format!(
+                    "PF30030 ROI {roi:?} leaves the {}x{} frame",
+                    size[0], size[1]
+                ));
+            }
+            None
+        }
+        (30187, HistoricalToneData::HandGray { mask, alpha, target }) => {
+            if mask.len() != pixels {
+                return Some(format!(
+                    "PF30187 hand mask has {} values for {pixels} frame pixels",
+                    mask.len()
+                ));
+            }
+            if alpha.len() != pixels {
+                return Some(format!(
+                    "PF30187 model alpha has {} values for {pixels} frame pixels",
+                    alpha.len()
+                ));
+            }
+            if (target.width, target.height) != (size[0], size[1]) {
+                return Some(format!(
+                    "PF30187 neutral target is {}x{} for a {}x{} frame",
+                    target.width, target.height, size[0], size[1]
+                ));
+            }
+            None
+        }
+        _ => Some(format!("PF{pf} payload does not match its proven CUDA channel contract")),
+    }
+}
+
+/// Validates the explicit PF30059 3D LUT even though this tree has no PF30059
+/// CUDA kernel. A real LUT contract alone is not enough to claim GPU execution.
+pub fn gpu_lut_reason(data: &HistoricalToneData) -> Option<String> {
+    let HistoricalToneData::MultiTone(faces) = data else {
+        return None;
+    };
+    for face in faces {
+        let Some((values, grid)) = &face.lut else {
+            continue;
+        };
+        if *grid < 2 {
+            return Some(format!("PF30059 LUT grid {grid} is below 2"));
+        }
+        let expected = grid
+            .checked_mul(*grid)
+            .and_then(|value| value.checked_mul(*grid))
+            .and_then(|value| value.checked_mul(3));
+        match expected {
+            None => return Some(format!("PF30059 LUT grid {grid} overflows its length rule")),
+            Some(expected) if values.len() != expected => {
+                return Some(format!(
+                    "PF30059 LUT has {} values for grid {grid}, expected {expected}",
+                    values.len()
+                ));
+            }
+            Some(_) => {}
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Some("PF30059 LUT has non-finite values".to_string());
+        }
+    }
+    None
+}
+
+/// CUDA requires a proven kernel, exact same-job channels, a valid frame/LUT
+/// shape and an accepted CPU/GPU fixture. Every miss names the CPU fallback.
+pub fn plan_historical_tone_backend(
+    pf: u32,
+    size: [u32; 2],
+    data: &HistoricalToneData,
+    fixture: HistoricalToneFixture,
+) -> HistoricalToneGpuPlan {
+    let Some(kernel) = gpu_kernel(pf) else {
+        return HistoricalToneGpuPlan::cpu(format!("no proven CUDA kernel covers PF{pf}"));
+    };
+    if size[0] == 0 || size[1] == 0 {
+        return HistoricalToneGpuPlan::cpu(format!("PF{pf} has an empty immediate frame"));
+    }
+    let Some(pixels) = (size[0] as usize).checked_mul(size[1] as usize) else {
+        return HistoricalToneGpuPlan::cpu(format!("PF{pf} frame size overflows usize"));
+    };
+    if let Some(reason) = gpu_shape_reason(pf, size, data, pixels) {
+        return HistoricalToneGpuPlan::cpu(reason);
+    }
+    if let Some(reason) = gpu_lut_reason(data) {
+        return HistoricalToneGpuPlan::cpu(reason);
+    }
+    match fixture {
+        HistoricalToneFixture::Accepted(_) => HistoricalToneGpuPlan {
+            backend: HistoricalTonePath::Gpu,
+            kernel: Some(kernel),
+            fallback_reason: None,
+        },
+        HistoricalToneFixture::Absent => HistoricalToneGpuPlan::cpu(format!(
+            "PF{pf} has no accepted CPU/GPU parity fixture"
+        )),
+    }
+}
+
+/// Runs one row against its exact immediate frame. Missing/stale frame bindings
+/// still reach the shared gate, and a missing GPU session or kernel failure runs
+/// the existing CPU oracle.
+pub fn apply_historical_tone_row(
+    source: &Image,
+    ticket: Option<u64>,
+    pf: u32,
+    control: f32,
+    inputs: Option<&HistoricalToneInputs>,
+    gray_3d_controls: [f32; 2],
+    fixture: HistoricalToneFixture,
+    gpu: Option<&dyn HistoricalToneGpu>,
+) -> Result<HistoricalToneRowOutcome, Refusal> {
+    let gate = || apply(source, ticket, pf, control, inputs, gray_3d_controls);
+    let Some(input) = inputs.and_then(|inputs| inputs.get(&pf)) else {
+        return gate().map(|image| HistoricalToneRowOutcome::cpu(image, None));
+    };
+    let plan = plan_historical_tone_backend(pf, input.size, &input.data, fixture);
+    if plan.backend != HistoricalTonePath::Gpu {
+        return Ok(HistoricalToneRowOutcome::cpu(gate()?, plan.fallback_reason));
+    }
+    let launched = match gpu {
+        None => Err("no CUDA session is attached".to_string()),
+        Some(gpu) => gpu.run(pf, source, &input.data),
+    };
+    match launched {
+        Ok(image) => Ok(HistoricalToneRowOutcome {
+            image: (image != *source).then_some(image),
+            backend: HistoricalTonePath::Gpu,
+            kernel: plan.kernel,
+            fallback_reason: None,
+        }),
+        Err(reason) => Ok(HistoricalToneRowOutcome {
+            image: gate()?,
+            backend: HistoricalTonePath::Cpu,
+            kernel: plan.kernel,
+            fallback_reason: Some(format!("PF{pf} stayed on CPU: {reason}")),
+        }),
+    }
+}
+
 pub(super) fn fingerprint(inputs: &HistoricalToneInputs) -> u64 {
     let mut hash = DefaultHasher::new();
     for (pf, input) in inputs {

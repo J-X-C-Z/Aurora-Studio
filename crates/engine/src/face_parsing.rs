@@ -24,6 +24,7 @@ use crate::portrait_stage::{
 pub const FACE_PARSING_V2_MODEL_ID: &str = "2102828093";
 pub const FACE_PARSING_V2_SIDE: u32 = 384;
 pub const FACE_PARSING_V2_CLASSES: usize = 17;
+pub const FACE_PARSING_V2_SKIN_CLASS: usize = 1;
 pub const FACE_PARSING_V2_MODEL_BYTES: u64 = 23_059_132;
 pub const FACE_PARSING_V2_MODEL_ENV: &str = "AURORA_FACE_PARSING_MODEL";
 pub const FACE_PARSING_V2_MODEL_ROOT_ENV: &str = "AURORA_FACE_PARSING_MODEL_ROOT";
@@ -220,6 +221,48 @@ impl FaceParsingProducerInputs {
         let plane = self.width as usize * self.height as usize;
         self.masks.get(class * plane..(class + 1) * plane)
     }
+}
+
+/// Projects canonical fbe class 1 (skin) from the 384px model crop back to the
+/// exact source frame. The canonical model digest and all 17 planes are required.
+pub fn project_face_parsing_skin_mask(
+    parsing: &FaceParsingProducerInputs,
+    source_width: u32,
+    source_height: u32,
+) -> Result<Vec<u8>, Refusal> {
+    if source_width == 0 || source_height == 0 {
+        return Err(Refusal::MissingInput("FaceParsingV2 skin source frame"));
+    }
+    if parsing.channels as usize != FACE_PARSING_V2_CLASSES
+        || parsing.model_sha256 != FACE_PARSING_V2_MODEL_SHA256
+    {
+        return Err(Refusal::ValueOutOfRange(
+            "FaceParsingV2 canonical 17-class fbe model",
+        ));
+    }
+    let plane = (parsing.width as usize)
+        .checked_mul(parsing.height as usize)
+        .ok_or(Refusal::ShapeMismatch("FaceParsingV2 skin plane"))?;
+    if parsing.width == 0
+        || parsing.height == 0
+        || parsing.masks.len() != FACE_PARSING_V2_CLASSES.saturating_mul(plane)
+    {
+        return Err(Refusal::ShapeMismatch("FaceParsingV2 17-class planes"));
+    }
+    let skin = parsing
+        .class(FACE_PARSING_V2_SKIN_CLASS)
+        .ok_or(Refusal::MissingInput("FaceParsingV2 class1 skin mask"))?;
+    let crop_to_source = inverse_native(parsing.source_to_crop)
+        .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 skin crop matrix"))?;
+    project_teeth_mask(
+        skin,
+        parsing.width,
+        parsing.height,
+        crop_to_source,
+        source_width,
+        source_height,
+    )
+    .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 skin mask projection"))
 }
 
 pub struct FaceParsingInference {
@@ -876,6 +919,44 @@ mod tests {
             .map(|value| (value * 255.0).trunc() as u8)
             .collect();
         assert_eq!(quantize_mask_cpu(&probability).unwrap(), expected);
+    }
+
+    #[test]
+    fn canonical_fbe_class1_projects_as_pf30013_skin_mask() {
+        let side = FACE_PARSING_V2_SIDE as usize;
+        let plane = side * side;
+        let mut masks = vec![9u8; FACE_PARSING_V2_CLASSES * plane];
+        masks[FACE_PARSING_V2_SKIN_CLASS * plane..(FACE_PARSING_V2_SKIN_CLASS + 1) * plane]
+            .fill(200);
+        let parsing = FaceParsingProducerInputs {
+            job_id: 17,
+            width: FACE_PARSING_V2_SIDE,
+            height: FACE_PARSING_V2_SIDE,
+            channels: FACE_PARSING_V2_CLASSES as u8,
+            model_sha256: FACE_PARSING_V2_MODEL_SHA256,
+            source_to_crop: FaceParsingRoi {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 1.0,
+                roll_radians: 0.0,
+            }
+            .source_to_crop()
+            .unwrap(),
+            masks,
+            mask_provider: "cpu",
+        };
+        let skin = project_face_parsing_skin_mask(&parsing, 2, 1).unwrap();
+        assert_eq!(skin, [200, 200]);
+
+        let mut stale = parsing;
+        stale.model_sha256 = FACE_PARSING_V2_STALE_MODEL_SHA256;
+        assert_eq!(
+            project_face_parsing_skin_mask(&stale, 2, 1),
+            Err(Refusal::ValueOutOfRange(
+                "FaceParsingV2 canonical 17-class fbe model"
+            ))
+        );
     }
 
     #[test]

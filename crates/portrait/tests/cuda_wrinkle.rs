@@ -5,9 +5,11 @@
 use std::time::{Duration, Instant};
 
 use aurora_portrait::cuda::CudaError;
-use aurora_portrait::cuda_wrinkle::{reference, WrinkleGpu, ROUTED_PFS};
+use aurora_portrait::cuda_wrinkle::{
+    reference, WrinkleGpu, HISTORICAL_SKIN_PFS, ROUTED_PFS, U8_KERNEL,
+};
 use aurora_portrait::kernels::skin_adjust::{
-    Roi, StoreMode, WrinkleUniforms,
+    wrinkle_apply, Roi, StoreMode, WrinkleUniforms,
 };
 use aurora_portrait::Image;
 
@@ -225,6 +227,57 @@ fn four_pf_routes_match_cpu_inside_roi() {
             roi.width,
             roi.height
         );
+    }
+}
+
+#[test]
+fn historical_skin_same_job_routes_match_cpu_inside_roi() {
+    let Some(gpu) = gpu() else { return };
+    let (width, height) = (37, 29);
+    let pixels = width * height;
+    let mut rng = Rng::new(0x21024);
+    let image = |rng: &mut Rng| {
+        Image::new(
+            width,
+            height,
+            (0..pixels * 4).map(|_| rng.byte()).collect(),
+        )
+        .unwrap()
+    };
+    let source = image(&mut rng);
+    let base = image(&mut rng);
+    let residual = image(&mut rng);
+    let mask: Vec<u8> = (0..pixels * 4).map(|_| rng.byte()).collect();
+    let skin: Vec<u8> = (0..pixels).map(|_| rng.byte()).collect();
+    let roi = Roi {
+        x: 5,
+        y: 4,
+        width: 23,
+        height: 17,
+    };
+    let uniforms = active_uniforms();
+    for pf in HISTORICAL_SKIN_PFS {
+        let expected = wrinkle_apply(
+            &source, &base, &residual, &mask, &skin, roi, 0.5, uniforms,
+        )
+        .unwrap();
+        let (actual, dispatch) = gpu
+            .apply_historical_same_job(
+                0xc3_0000 + u64::from(pf),
+                pf,
+                &source,
+                &base,
+                &residual,
+                &mask,
+                &skin,
+                roi,
+                0.5,
+                uniforms,
+                StoreMode::TruncU8,
+            )
+            .unwrap();
+        assert_eq!(actual, expected, "PF{pf} same-job GPU/CPU mismatch");
+        assert_eq!(dispatch[0].kernel, U8_KERNEL, "PF{pf}");
     }
 }
 

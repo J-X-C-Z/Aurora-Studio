@@ -98,14 +98,22 @@ pub use body_shader_abi::{
     BODY_VBO_DESTINATION_XY_OFFSET, BODY_VBO_SOURCE_UV_OFFSET, BODY_VBO_STRIDE_BYTES,
 };
 pub use portrait_stage::{
+    apply_historical_tone_row, gpu_kernel, gpu_lut_reason, plan_historical_skin_backend,
+    plan_historical_tone_backend, HistoricalSkinGpuPlan, HistoricalSkinPath,
+    HistoricalToneFixture, HistoricalToneGpu, HistoricalToneGpuPlan, HistoricalTonePath,
+    HistoricalToneRowOutcome, GPU_MATERIALIZED_FIXTURE_ENV,
+    GPU_PROVEN_HISTORICAL_SKIN_PFS, GPU_PROVEN_HISTORICAL_TONE_PFS,
+};
+pub use portrait_stage::{
     BodyGeometryInput, BodyGeometryJob, BodyGeometryProducerInputs, BodyLandmarkDomain,
     BodyLandmarkEffect, BodyLandmarkFrame, BodyLandmarkRef, BodyShiftInput, FaceGeometry,
     FaceGeometryDraw,
     FaceGeometryInputs, FaceGeometryProviderInputs, FaceGeometryProviderMesh,
     FaceGeometryProviderMeshReceipt, FaceGeometryProviderReceipt, FaceGeometryProviderRoute,
     FaceGeometryProviderRow, HistoricalSkinData, HistoricalSkinExternalInputs,
-    HistoricalSkinExternalRow, HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass,
-    HistoricalSkinWrinkle, HistoricalToneData, HistoricalToneFace,
+    HistoricalSkinExternalRow, HistoricalSkinImmediateInputs, HistoricalSkinImmediateRow,
+    HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass, HistoricalSkinWrinkle,
+    HistoricalToneData, HistoricalToneFace,
     HistoricalToneInput, HistoricalToneInputs,
     HlfBodyAdjustLutProducerInputs, Pf8050AttachReceipt, Pf8050FboReceipt, Pf8050GeometryInputs,
     Pf8050StageInputs, Pf8050VendorRuntime, Pf30025Inputs, Pf30025LiveModelOutputs,
