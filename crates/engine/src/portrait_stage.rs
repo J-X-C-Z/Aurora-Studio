@@ -2750,7 +2750,7 @@ pub struct MoistureFaceInputs<'a> {
     pub width: u32,
     pub height: u32,
     pub mask_rgba: &'a [u8],
-    pub blur_y: &'a [u8],
+    pub blur_alpha: &'a [u8],
     pub channel: MaskChannel,
     pub skin_map_width: u32,
     pub skin_map_height: u32,
@@ -6634,7 +6634,7 @@ fn validate_effect_inputs(
                 return Err(Refusal::ShapeMismatch("moisture face frame"));
             }
             check_plane(face.mask_rgba.len(), pixels.saturating_mul(4), "mask_rgba")?;
-            check_plane(face.blur_y.len(), pixels, "blur_y")?;
+            check_plane(face.blur_alpha.len(), pixels, "blur_alpha")?;
             check_plane(
                 face.skin_map.len(),
                 (face.skin_map_width as usize)
@@ -7212,7 +7212,7 @@ fn apply_moisture_face_cpu(
     aurora_portrait::kernels::moisture::face_apply(
         current,
         input.mask_rgba,
-        input.blur_y,
+        input.blur_alpha,
         &params,
         input.channel,
         &skin_map,
@@ -7958,7 +7958,7 @@ fn try_cuda_same_job_effect(
             Some(gpu.face_apply(
                 current,
                 input.mask_rgba,
-                input.blur_y,
+                input.blur_alpha,
                 &params,
                 input.channel,
                 &skin_map,
@@ -12496,7 +12496,7 @@ mod tests {
                 width,
                 height,
                 mask_rgba: &face_mask,
-                blur_y: &blur_y,
+                blur_alpha: &blur_y,
                 channel: aurora_portrait::kernels::moisture::MaskChannel::R,
                 skin_map_width: 4,
                 skin_map_height: 4,

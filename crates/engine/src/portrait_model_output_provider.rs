@@ -242,7 +242,7 @@ pub const PF90160_HAIR_MASK: &str = "PF90160_HAIR_MASK";
 pub const PF90160_DETAIL: &str = "PF90160_MODEL_DETAIL";
 
 pub const PF90002_MASK_RGBA: &str = "PF90002_MASK_RGBA";
-pub const PF90002_BLUR_Y: &str = "PF90002_BLUR_Y";
+pub const PF90002_BLUR_ALPHA: &str = "PF90002_BLUR_ALPHA";
 pub const PF90002_SKIN_MAP: &str = "PF90002_SKIN_MAP";
 pub const PF90002_HARDLIGHT: &str = "PF90002_HARDLIGHT";
 pub const PF90002_BEAUTY: &str = "PF90002_BEAUTY";
@@ -519,7 +519,7 @@ impl PortraitModelTarget {
             ],
             Self::Pf90002Pf90010 => vec![
                 TensorRequirement::new(PF90002_MASK_RGBA, PF90002_MASK_RGBA, NonEmpty, NonZero, 1),
-                TensorRequirement::new(PF90002_BLUR_Y, PF90002_BLUR_Y, NonEmpty, NonZero, 1),
+                TensorRequirement::new(PF90002_BLUR_ALPHA, PF90002_BLUR_ALPHA, NonEmpty, NonZero, 1),
                 TensorRequirement::new(PF90002_SKIN_MAP, PF90002_SKIN_MAP, NonEmpty, NonZero, 1),
                 TensorRequirement::new(PF90002_HARDLIGHT, PF90002_HARDLIGHT, NonEmpty, NonZero, 1),
                 TensorRequirement::new(PF90002_BEAUTY, PF90002_BEAUTY, NonEmpty, NonZero, 1),
@@ -1351,8 +1351,10 @@ impl<'a> BoundModelOutputs<'a> {
         let mask_rgba = self
             .required(PF90002_MASK_RGBA, "PF90002_MASK_RGBA")?
             .bytes();
-        let blur_y = self.required(PF90002_BLUR_Y, "PF90002_BLUR_Y")?.bytes();
-        if mask_rgba.len() != pixels.saturating_mul(4) || blur_y.len() != pixels {
+        let blur_alpha = self
+            .required(PF90002_BLUR_ALPHA, "PF90002_BLUR_ALPHA")?
+            .bytes();
+        if mask_rgba.len() != pixels.saturating_mul(4) || blur_alpha.len() != pixels {
             return Err(Refusal::ShapeMismatch("PF90002 frame planes"));
         }
         let skin_pixels = (binding.skin_map_width as usize)
@@ -1368,7 +1370,7 @@ impl<'a> BoundModelOutputs<'a> {
             width: binding.width,
             height: binding.height,
             mask_rgba,
-            blur_y,
+            blur_alpha,
             channel: binding.channel,
             skin_map_width: binding.skin_map_width,
             skin_map_height: binding.skin_map_height,

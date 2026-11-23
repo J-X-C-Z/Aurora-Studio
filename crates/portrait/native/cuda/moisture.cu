@@ -105,7 +105,7 @@ __device__ __forceinline__ unsigned char m_byte(float value) {
 extern "C" __global__ void moisture_face_kernel(
     const unsigned char* source_rgba,
     const unsigned char* mask_rgba,
-    const unsigned char* blur_y,
+    const unsigned char* blur_alpha,
     const float* skin_map,
     const float* hardlight,
     const float* beauty,
@@ -129,9 +129,9 @@ extern "C" __global__ void moisture_face_kernel(
   float r = m_div((float)r8, 255.0f);
   float g = m_div((float)g8, 255.0f);
   float b = m_div((float)b8, 255.0f);
-  float blur = m_div((float)blur_y[pixel], 255.0f);
+  float blur = m_div((float)blur_alpha[pixel], 255.0f);
 
-  float source_y = m_forward_y(r, g, b);
+  float source_y = m_div((float)alpha8, 255.0f);
   float skin = m_skin_map(skin_map, uniforms.skin_width, uniforms.skin_height, b, r);
   float dog = 0.0f;
   if (skin > 0.0f) {
