@@ -453,8 +453,14 @@ pub(in crate::aurora_raw) fn apply_linear_color_noise_2012(
     const PW_BASE: f32 = 2.968_700_4;
 
     let iso_var = (iso as f32 / 100.0).max(1.0);
-    let pz = (noise[1] * 12.0).max(PZ_BASE * iso_var);
-    let pw = (noise[0] * 4.5).max(PW_BASE * iso_var);
+    // Separate chroma variance tolerance from luma edge threshold:
+    // dark shadow color blotches at ISO 800-1600 have linear chroma variance
+    // much larger than the ISO 100 read-noise floor, while luma edges must
+    // stay strict to prevent color bleeding across bright/dark boundaries.
+    let pz_luma = (noise[1] * 12.0).max(PZ_BASE * iso_var);
+    let pw_luma = (noise[0] * 4.5).max(PW_BASE * iso_var);
+    let pz_chroma = (noise[1] * 60.0 + 1800.0 * iso_var).max(4000.0 * iso_var);
+    let pw_chroma = (noise[0] * 16.0).max(18.0 * iso_var);
     const STEP: isize = 4;
     const RADIUS: isize = 28;
 
@@ -476,8 +482,9 @@ pub(in crate::aurora_raw) fn apply_linear_color_noise_2012(
         let max_x = (w - 1) as isize;
         for x in 0..w {
             let [lc, uc, vc] = src_row[x];
-            let t_root = pz + pw * lc;
-            let t = t_root * t_root;
+            let t_l = (pz_luma + pw_luma * lc).max(1.0);
+            let t_l2 = t_l * t_l;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
             let u_lc = uc * lc;
             let v_lc = vc * lc;
             let mut sum_u = 0.0f32;
@@ -490,8 +497,11 @@ pub(in crate::aurora_raw) fn apply_linear_color_noise_2012(
                 let dl = lc - li;
                 let du = u_lc - ui * li;
                 let dv = v_lc - vi * li;
-                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
-                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
                 sum_u += ui * wt;
                 sum_v += vi * wt;
                 sum_w += wt;
@@ -507,11 +517,13 @@ pub(in crate::aurora_raw) fn apply_linear_color_noise_2012(
     });
 
     let max_y = (h - 1) as isize;
-    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+    let mut vert = vec![[0.0f32; 3]; n];
+    vert.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
         for x in 0..w {
             let [lc, uc, vc] = horiz[y * w + x];
-            let t_root = pz + pw * lc;
-            let t = t_root * t_root;
+            let t_l = (pz_luma + pw_luma * lc).max(1.0);
+            let t_l2 = t_l * t_l;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
             let u_lc = uc * lc;
             let v_lc = vc * lc;
             let mut sum_u = 0.0f32;
@@ -524,19 +536,119 @@ pub(in crate::aurora_raw) fn apply_linear_color_noise_2012(
                 let dl = lc - li;
                 let du = u_lc - ui * li;
                 let dv = v_lc - vi * li;
-                let d = (PX * du * du).max(PY * dv * dv).max(dl * dl);
-                let wt = (t / (d * d + t) - 0.01).max(0.0);
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
                 sum_u += ui * wt;
                 sum_v += vi * wt;
                 sum_w += wt;
                 off += STEP;
             }
-            let (u, v) = if sum_w > 1e-6 {
+            if sum_w > 1e-6 {
                 let inv_w = 1.0 / sum_w;
-                (sum_u * inv_w, sum_v * inv_w)
+                out_row[x] = [lc, sum_u * inv_w, sum_v * inv_w];
             } else {
-                (uc, vc)
-            };
+                out_row[x] = [lc, uc, vc];
+            }
+        }
+    });
+
+    // Wide-scale second pass for ISO >= 400 to suppress low-frequency
+    // 8-20px chroma blotches in underexposed shadows (e.g. ISO 1000 NEF).
+    if iso >= 400 {
+        let hi_blend = (((iso as f32).log2() - 400.0_f32.log2()) / 3.0).clamp(0.35, 1.0);
+        const HI_STEP: isize = 6;
+        const HI_RADIUS: isize = 42;
+        horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+            let src_row = &vert[y * w..(y + 1) * w];
+            let max_x = (w - 1) as isize;
+            for x in 0..w {
+                let [lc, uc, vc] = src_row[x];
+                let t_l = (pz_luma + pw_luma * lc).max(1.0);
+                let t_l2 = t_l * t_l;
+                let t_c = (pz_chroma * 2.5 + pw_chroma * 1.5 * lc).max(1.0);
+                let u_lc = uc * lc;
+                let v_lc = vc * lc;
+                let mut sum_u = 0.0f32;
+                let mut sum_v = 0.0f32;
+                let mut sum_w = 0.0f32;
+                let mut off = -HI_RADIUS;
+                while off <= HI_RADIUS {
+                    let nx = (x as isize + off).clamp(0, max_x) as usize;
+                    let [li, ui, vi] = src_row[nx];
+                    let dl = lc - li;
+                    let du = u_lc - ui * li;
+                    let dv = v_lc - vi * li;
+                    let dl2 = dl * dl;
+                    let dc = (PX * du * du).max(PY * dv * dv);
+                    let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                    let w_c = t_c / (dc + t_c);
+                    let wt = (w_l * w_c - 0.01).max(0.0);
+                    sum_u += ui * wt;
+                    sum_v += vi * wt;
+                    sum_w += wt;
+                    off += HI_STEP;
+                }
+                if sum_w > 1e-6 {
+                    let inv_w = 1.0 / sum_w;
+                    out_row[x] = [
+                        lc,
+                        uc + (sum_u * inv_w - uc) * hi_blend,
+                        vc + (sum_v * inv_w - vc) * hi_blend,
+                    ];
+                } else {
+                    out_row[x] = [lc, uc, vc];
+                }
+            }
+        });
+        vert.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+            for x in 0..w {
+                let [lc, uc, vc] = horiz[y * w + x];
+                let t_l = (pz_luma + pw_luma * lc).max(1.0);
+                let t_l2 = t_l * t_l;
+                let t_c = (pz_chroma * 2.5 + pw_chroma * 1.5 * lc).max(1.0);
+                let u_lc = uc * lc;
+                let v_lc = vc * lc;
+                let mut sum_u = 0.0f32;
+                let mut sum_v = 0.0f32;
+                let mut sum_w = 0.0f32;
+                let mut off = -HI_RADIUS;
+                while off <= HI_RADIUS {
+                    let ny = (y as isize + off).clamp(0, max_y) as usize;
+                    let [li, ui, vi] = horiz[ny * w + x];
+                    let dl = lc - li;
+                    let du = u_lc - ui * li;
+                    let dv = v_lc - vi * li;
+                    let dl2 = dl * dl;
+                    let dc = (PX * du * du).max(PY * dv * dv);
+                    let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                    let w_c = t_c / (dc + t_c);
+                    let wt = (w_l * w_c - 0.01).max(0.0);
+                    sum_u += ui * wt;
+                    sum_v += vi * wt;
+                    sum_w += wt;
+                    off += HI_STEP;
+                }
+                if sum_w > 1e-6 {
+                    let inv_w = 1.0 / sum_w;
+                    out_row[x] = [
+                        lc,
+                        uc + (sum_u * inv_w - uc) * hi_blend,
+                        vc + (sum_v * inv_w - vc) * hi_blend,
+                    ];
+                } else {
+                    out_row[x] = [lc, uc, vc];
+                }
+            }
+        });
+    }
+
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let src_row = &vert[y * w..(y + 1) * w];
+        for x in 0..w {
+            let [lc, u, v] = src_row[x];
             let ul = u * lc;
             let vl = v * lc;
             let g = lc - ul * K[0] - vl * K[2] - K[3];
