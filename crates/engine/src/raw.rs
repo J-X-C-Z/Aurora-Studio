@@ -454,6 +454,12 @@ pub fn preview_dimensions(path: &Path) -> Option<(u32, u32)> {
 /// libraw reports the sensor size unrotated (6064x4040) while its output follows the
 /// camera's orientation (4040x6064), so the embedded preview settles which one applies.
 pub fn sensor_dimensions(path: &Path) -> Option<(u32, u32)> {
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    if c1_raw_enabled() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nef")) {
+        if let Some(size) = crate::z6iii::active_size(path) {
+            return Some(size);
+        }
+    }
     if let Some((width, height)) = libraw::dimensions(path) {
         // libraw rotates the pixels but reports the sensor size unrotated.
         return Some(match orientation(path) {

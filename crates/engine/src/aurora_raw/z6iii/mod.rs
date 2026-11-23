@@ -77,6 +77,24 @@ pub(in crate::aurora_raw) fn render_linear_rgba16(
     }
 }
 
+/// The active area used by both Z6III RAW reconstruction routes.
+pub(crate) fn active_size(path: &std::path::Path) -> Option<(u32, u32)> {
+    let file = std::fs::File::open(path).ok()?;
+    let nef = unsafe { memmap2::Mmap::map(&file).ok()? };
+    if !reconstruct::is_z6iii_nef(&nef) {
+        return None;
+    }
+    let crop = reconstruct::nikon_crop(&nef).ok()??;
+    if (crop.width, crop.height) != (6048, 4032) {
+        return None;
+    }
+    let size = (crop.width as u32, crop.height as u32);
+    Some(match crate::raw::exif_orientation_bytes(&nef) {
+        Some(6 | 8) => (size.1, size.0),
+        _ => size,
+    })
+}
+
 pub(crate) fn is_z6iii_nef_file(path: &std::path::Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else { return false };
     let Ok(nef) = (unsafe { memmap2::Mmap::map(&file) }) else { return false };

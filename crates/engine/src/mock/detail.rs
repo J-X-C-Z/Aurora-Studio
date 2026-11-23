@@ -405,6 +405,43 @@ fn stage_sharpening_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &Sharpeni
     });
 }
 
+/// Camera-domain USM working shape from C1 variants 1, 2/3, 11 and 10.
+/// Host settings still use Aurora's radius/amount mapping until captured.
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+pub(crate) fn sharpen_camera_rgb(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &Sharpening, scale: f32) {
+    let raw_sigma = adj.radius.max(0.1) * scale;
+    let sigma = raw_sigma.clamp(0.35, 12.0);
+    let gain = (adj.amount / 100.0) * 0.50 * (raw_sigma / 0.8).clamp(0.18, 1.0);
+    let threshold = adj.threshold.max(0.0) / 255.0;
+    let halo = (adj.halo_suppression / 100.0).clamp(0.0, 1.0);
+    let norm: Vec<f32> = rgb.par_iter().map(|&[r, g, b]| {
+        if r < 0.0 { 0.0 } else { (0.2126 * r * r + 0.7152 * g * g + 0.0722 * b * b).sqrt() }
+    }).collect();
+    let blurred = gaussian_blur_sep(&norm, w, h, sigma);
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, pixel) in row.iter_mut().enumerate() {
+            if pixel[0] < 0.0 { continue; }
+            let i = y * w + x;
+            let v = norm[i];
+            let detail = v - blurred[i];
+            let mut sharpened = v + (detail - detail.clamp(-threshold, threshold)) * gain;
+            if halo > 0.0 {
+                let mut lo = v;
+                let mut hi = v;
+                for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+                    for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                        lo = lo.min(norm[ny * w + nx]);
+                        hi = hi.max(norm[ny * w + nx]);
+                    }
+                }
+                sharpened += (sharpened.clamp(lo, hi) - sharpened) * halo;
+            }
+            let factor = (sharpened / v.max(1e-20)).clamp(0.0, 16.0);
+            *pixel = pixel.map(|channel| channel * factor);
+        }
+    });
+}
+
 /// Applies the detail stages to one sRGB 8-bit RGBA frame, in place.
 ///
 /// `rgba` is row-major RGBA with no padding, `scale` is output pixels per source
@@ -2084,6 +2121,20 @@ fn hash_noise(x: u32, y: u32, seed: u32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    #[test]
+    fn camera_usm_keeps_channel_ratios_and_preserves_blank_pixels() {
+        let mut rgb = [[0.125, 0.25, 0.5]; 25];
+        rgb[0] = [-1.0; 3];
+        rgb[12] = [0.25, 0.5, 1.0];
+        let adj = crate::Sharpening { amount: 180.0, radius: 0.8, threshold: 0.0, halo_suppression: 0.0 };
+        sharpen_camera_rgb(&mut rgb, 5, 5, &adj, 1.0);
+        assert_eq!(rgb[0], [-1.0; 3]);
+        assert!(rgb[12][0] > 0.25);
+        assert_eq!(rgb[12][1], rgb[12][0] * 2.0);
+        assert_eq!(rgb[12][2], rgb[12][0] * 4.0);
+    }
+
     use super::*;
     use crate::RadialBlur;
 

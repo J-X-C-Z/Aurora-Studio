@@ -1533,6 +1533,21 @@ fn render_sized(
             || adj.noise_reduction.color > 0.0
             || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
     if use_f32_detail {
+        #[cfg(all(windows, feature = "z6iii-raw-export"))]
+        let camera_usm = plan.c1_color.as_ref().filter(|_| f32_includes_sharpen && adj.sharpening.amount > 0.0);
+        #[cfg(all(windows, feature = "z6iii-raw-export"))]
+        let sharpen_in_display = f32_includes_sharpen && camera_usm.is_none();
+        #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+        let sharpen_in_display = f32_includes_sharpen;
+        let develop_detail_input = |sample: SourceSample, point| {
+            #[cfg(all(windows, feature = "z6iii-raw-export"))]
+            if let Some(c1) = camera_usm {
+                return prepared_sample(&plan, sample, point)
+                    .map(|rgb| c1.encode_camera_rgb(linear_edits(&plan, rgb, point)))
+                    .unwrap_or([-1.0; 3]);
+            }
+            develop_sample(&plan, sample, point, bypass).map(|v| v.clamp(0.0, 1.0))
+        };
         let halo = if region == NormRect::FULL { 0 } else {
             super::detail::core_halo(adj, scale, f32_includes_sharpen)
         };
@@ -1555,12 +1570,12 @@ fn render_sized(
                 for (pixel, &fx) in line.iter_mut().zip(&work_x) {
                     let point = [fx, fy];
                     let sample = source_sample_at(src, &map, level, sharp, point);
-                    *pixel = develop_sample(&plan, sample, point, bypass).map(|v| v.clamp(0.0, 1.0));
+                    *pixel = develop_detail_input(sample, point);
                 }
             });
         } else if streams_source_samples(out_w, out_h) {
             rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
-                develop_line_with_f32(&plan, region, out_h, &xs, y, bypass, line, |_, _, point| {
+                develop_line_with_f32(&develop_detail_input, region, out_h, &xs, y, line, |_, _, point| {
                     source_sample_at(src, &map, level, sharp, point)
                 });
             });
@@ -1568,11 +1583,19 @@ fn render_sized(
             let samples = source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
             rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
                 let srow = &samples[y * work_w..(y + 1) * work_w];
-                develop_line_with_f32(&plan, region, out_h, &xs, y, bypass, line, |x, _, _| srow[x]);
+                develop_line_with_f32(&develop_detail_input, region, out_h, &xs, y, line, |x, _, _| srow[x]);
+            });
+        }
+        #[cfg(all(windows, feature = "z6iii-raw-export"))]
+        if let Some(c1) = camera_usm {
+            super::detail::sharpen_camera_rgb(&mut rgb_f32, work_w, work_h, &adj.sharpening, scale);
+            rgb_f32.par_iter_mut().for_each(|rgb| {
+                *rgb = if rgb[0] < 0.0 { [0.11; 3] }
+                else { develop_display(&plan, c1.apply_camera_icc(*rgb)).map(|v| v.clamp(0.0, 1.0)) };
             });
         }
         super::detail::post_process_core_f32(
-            &mut rgb_f32, work_w as u32, work_h as u32, adj, scale, f32_includes_sharpen,
+            &mut rgb_f32, work_w as u32, work_h as u32, adj, scale, sharpen_in_display,
         );
         let rows = rgb_f32.par_chunks(work_w).skip(halo).take(out_h as usize)
             .map(|pixels| &pixels[halo..halo + out_w as usize]);
@@ -1929,12 +1952,11 @@ fn develop_line_streamed(
 
 #[allow(clippy::too_many_arguments)]
 fn develop_line_with_f32<F>(
-    plan: &Plan,
+    develop_input: &impl Fn(SourceSample, [f32; 2]) -> [f32; 3],
     region: NormRect,
     out_h: u32,
     xs: &[f32],
     y: usize,
-    bypass: bool,
     line: &mut [[f32; 3]],
     mut sample_at: F,
 ) where
@@ -1944,8 +1966,7 @@ fn develop_line_with_f32<F>(
     for (x, &fx) in xs.iter().enumerate() {
         let f = [fx, fy];
         let sample = sample_at(x, fx, f);
-        let c = develop_sample(plan, sample, f, bypass);
-        line[x] = [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)];
+        line[x] = develop_input(sample, f);
     }
 }
 
@@ -1986,8 +2007,12 @@ fn develop_line_with<F>(
 }
 
 fn develop_sample(plan: &Plan, sample: SourceSample, point: [f32; 2], bypass: bool) -> [f32; 3] {
+    prepared_sample(plan, sample, point).map(|rgb| develop(plan, rgb, point, bypass)).unwrap_or([0.11; 3])
+}
+
+fn prepared_sample(plan: &Plan, sample: SourceSample, point: [f32; 2]) -> Option<[f32; 3]> {
     if !sample.valid {
-        return [0.11; 3];
+        return None;
     }
     let mut rgb = sample.rgb;
     if let Some((uniform, map, size)) = &plan.uniform_light {
@@ -1995,7 +2020,7 @@ fn develop_sample(plan: &Plan, sample: SourceSample, point: [f32; 2], bypass: bo
         let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
         rgb = uniform.apply_source_rgb(rgb, source);
     }
-    develop(plan, rgb, point, bypass)
+    Some(rgb)
 }
 
 /// Linear light to display sRGB codes (used only for non-RAW display-referred
@@ -2042,30 +2067,35 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2]) -> [f32; 3] {
 }
 
 fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool) -> [f32; 3] {
-    let adj = plan.adj;
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    let mut g = if let Some(c1) = &plan.c1_color {
+    let display = if let Some(c1) = &plan.c1_color {
         if bypass {
             return c1.develop_srgb(lin);
         }
         let c = linear_edits(plan, lin, f);
-        tone_user(c1.develop_srgb(c), &adj.exposure, &adj.clarity)
+        c1.develop_srgb(c)
     } else {
         if bypass {
             return encode_srgb(plan, lin);
         }
         let c = linear_edits(plan, lin, f);
-        tone_user(encode_srgb(plan, c), &adj.exposure, &adj.clarity)
+        encode_srgb(plan, c)
     };
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-    let mut g = {
+    let display = {
         if bypass {
             return encode_srgb(plan, lin);
         }
         let c = linear_edits(plan, lin, f);
-        tone_user(encode_srgb(plan, c), &adj.exposure, &adj.clarity)
+        encode_srgb(plan, c)
     };
 
+    develop_display(plan, display)
+}
+
+fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
+    let adj = plan.adj;
+    let mut g = tone_user(display, &adj.exposure, &adj.clarity);
     if plan.levels {
         g = adj.levels.apply_input(g);
     }
