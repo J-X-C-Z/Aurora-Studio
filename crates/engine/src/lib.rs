@@ -129,7 +129,7 @@ pub use portrait_stage::{
     FACE_LANDMARK_323773030_MODEL_SHA256, FACE_LANDMARK_CONSTANTS_SHA256,
     FaceInputFileStamp, FaceInputResultKey, FaceInputSession, FaceInputSessionKey,
     FaceModelIdentity, FaceNormalization, FaceStageTransform, FACE_STAGE_TRANSFORM_REFUSAL,
-    EyeBagFrameProducer, Pf90116ColorDomain,
+    EyeBagFrameProducer, Pf90116ColorDomain, Pf90116FrameGeometry,
     Pf90116FrameBinding, Pf90116FrameReceipt, Pf90116InputOrder, Pf90116TensorReceipts,
     PF90116_ACTIVE_GATE, PF90116_COLOR_NAME, PF90116_COLOR_SHAPE, PF90116_INPUT_MEAN,
     PF90116_INPUT_NAME, PF90116_INPUT_SCALE, PF90116_INPUT_SHAPE, PF90116_MODEL_HEIGHT,

@@ -73,7 +73,8 @@ pub use portrait_face_input_stage::{
 #[path = "portrait_eye_bag_stage.rs"]
 mod portrait_eye_bag_stage;
 pub use portrait_eye_bag_stage::{
-    EyeBagFrameProducer, Pf90116ColorDomain, Pf90116FrameBinding, Pf90116FrameReceipt,
+    EyeBagFrameProducer, Pf90116ColorDomain, Pf90116FrameBinding, Pf90116FrameGeometry,
+    Pf90116FrameReceipt,
     Pf90116InputOrder, Pf90116TensorReceipts, PF90116_ACTIVE_GATE, PF90116_COLOR_NAME,
     PF90116_COLOR_SHAPE, PF90116_INPUT_MEAN, PF90116_INPUT_NAME, PF90116_INPUT_SCALE,
     PF90116_INPUT_SHAPE, PF90116_MODEL_HEIGHT, PF90116_MODEL_ID, PF90116_MODEL_NET_SHA256,
