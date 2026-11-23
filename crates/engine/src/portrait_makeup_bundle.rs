@@ -1494,8 +1494,9 @@ pub fn load_owned_suit_bundle() -> Result<OwnedSuitBundle, Refusal> {
         .clone()
 }
 
-/// One PF90033 pass's live payload. The VBO, EBO, mask, material and two UV
-/// streams are copied from the same renderer job as the output frame.
+/// One PF90033 pass's live payload. The VBO, EBO, mask, material and the
+/// separate mask/material UV attribute streams are copied from the same
+/// renderer job as the output frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnedSuitPassJobInput {
     pub preset_id: String,
@@ -1509,6 +1510,7 @@ pub struct OwnedSuitPassJobInput {
     pub size: [i32; 2],
     pub owner_mask: Option<Arc<Image>>,
     pub material: Option<Arc<Image>>,
+    pub mask_uv: Option<OwnedFace2dUvBytes>,
     pub material_uv: Option<OwnedFace2dUvBytes>,
     pub shelter: Option<f32>,
     pub region: Option<f32>,
@@ -1538,24 +1540,41 @@ pub struct OwnedSuitLivePass {
     pub effect: String,
     pub face_id: u32,
     pub draw: OwnedFace2dDrawBytes,
-    pub owner_mask: Arc<Image>,
-    pub mask_uv: MeshMaskPixelUv,
+    pub owner_mask: Option<Arc<Image>>,
+    pub mask_uv: Option<MeshMaskPixelUv>,
     pub material: Arc<Image>,
     pub material_uv: MeshMaskPixelUv,
     pub layer: aurora_portrait::kernels::makeup_material::MakeupLayer,
     pub shelter: f32,
     pub region: f32,
+    pub unmasked: bool,
 }
 
 impl OwnedSuitLivePass {
     pub fn as_suit_pass_input(&self) -> SuitPassInput<'_> {
+        let (kind, mask, mask_uv) = if self.unmasked {
+            (
+                SuitPassKindInput::ImageUnmasked {
+                    material: Some(self.material.as_ref()),
+                    material_uv: Some(self.material_uv.uv()),
+                },
+                None,
+                None,
+            )
+        } else {
+            (
+                SuitPassKindInput::Image {
+                    material: Some(self.material.as_ref()),
+                    material_uv: Some(self.material_uv.uv()),
+                },
+                self.owner_mask.as_deref(),
+                self.mask_uv.as_ref().map(MeshMaskPixelUv::uv),
+            )
+        };
         SuitPassInput {
-            kind: SuitPassKindInput::Image {
-                material: Some(self.material.as_ref()),
-                material_uv: Some(self.material_uv.uv()),
-            },
-            mask: Some(self.owner_mask.as_ref()),
-            mask_uv: Some(self.mask_uv.uv()),
+            kind,
+            mask,
+            mask_uv,
             layer: Some(self.layer),
             shelter: self.shelter,
             region: self.region,
@@ -1600,13 +1619,28 @@ fn suit_live_weight(value: Option<f32>, name: &'static str) -> Result<f32, Refus
     Ok(value)
 }
 
-fn suit_live_mask_channel(field: &str, value: u32) -> Result<MaskChannel, Refusal> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuitLiveMaskProgram {
+    Masked(MaskChannel),
+    Unmasked,
+}
+
+fn suit_live_mask_program(field: &str, value: u32) -> Result<SuitLiveMaskProgram, Refusal> {
     match (field, value) {
-        ("BlusherMaskType", 15) => Ok(MaskChannel::Rgba),
-        ("EyeBrowMaskType", 5) => Ok(MaskChannel::RB),
-        ("EyeMaskType", 10) => Ok(MaskChannel::Rgb),
-        ("EyeMaskType", 4) | ("EyeLashMaskType", 4) => Ok(MaskChannel::RG),
-        ("LipMaskType", 3) => Ok(MaskChannel::R),
+        ("BlusherMaskType", 15) => Ok(SuitLiveMaskProgram::Masked(MaskChannel::Rgba)),
+        ("EyeBrowMaskType", 5) => Ok(SuitLiveMaskProgram::Masked(MaskChannel::RB)),
+        ("EyeMaskType", 10) => Ok(SuitLiveMaskProgram::Masked(MaskChannel::Rgb)),
+        ("EyeMaskType", 4) | ("EyeLashMaskType", 4) => {
+            Ok(SuitLiveMaskProgram::Masked(MaskChannel::RG))
+        }
+        ("LipMaskType", 3) => Ok(SuitLiveMaskProgram::Masked(MaskChannel::R)),
+        ("EyeBrowMaskType", 10) => Err(Refusal::MissingInput(
+            "suit owner-mask EyeBrowMaskType=10 channel",
+        )),
+        ("EyeLashMaskType", 10) => Err(Refusal::MissingInput(
+            "suit owner-mask EyeLashMaskType=10 channel",
+        )),
+        ("EyePupilMaskType", 0) => Ok(SuitLiveMaskProgram::Unmasked),
         _ => Err(Refusal::MissingInput("suit mask channel")),
     }
 }
@@ -1634,11 +1668,11 @@ fn produce_live_suit_pass(
     }
     let positions = input.draw.borrowed().decode_positions()?;
     let indices = input.draw.borrowed().decode_indices()?;
-    let owner_mask = input
-        .owner_mask
-        .as_deref()
-        .ok_or(Refusal::MissingInput(SUIT_MASK_MISSING))?;
-    validate_image(owner_mask, SUIT_MASK_MISSING)?;
+    let (mask_field, mask_value) = match (pass.mask_field.as_deref(), pass.mask_value) {
+        (Some(field), Some(value)) => (field, value),
+        _ => return Err(Refusal::MissingInput("suit mask")),
+    };
+    let mask_program = suit_live_mask_program(mask_field, mask_value)?;
     let material = input
         .material
         .as_deref()
@@ -1660,16 +1694,48 @@ fn produce_live_suit_pass(
             other => other,
         })?;
 
-    let mask_uv = produce_face2d_mask_uv(Some(Face2dMaskUvInputs {
-        ticket: Some(job_id),
-        face_id: Some(face_id),
-        mask_source_points: &positions,
-        indices: &indices,
-        origin: input.origin,
-        size: input.size,
-        width: frame_size[0],
-        height: frame_size[1],
-    }))?;
+    let (owner_mask, mask_uv, unmasked, mask_channel) = match mask_program {
+        SuitLiveMaskProgram::Masked(mask_channel) => {
+            let owner_mask = input
+                .owner_mask
+                .as_deref()
+                .ok_or(Refusal::MissingInput(SUIT_MASK_MISSING))?;
+            validate_image(owner_mask, SUIT_MASK_MISSING)?;
+            let mask_values = input
+                .mask_uv
+                .as_ref()
+                .ok_or(Refusal::MissingInput(D4_CAPTURE_MASK_UV))?
+                .decode()
+                .map_err(|error| match error {
+                    Refusal::MissingInput(MATERIAL_VBO_BYTES_MISSING)
+                    | Refusal::MissingInput(MATERIAL_UV_MISSING) => {
+                        Refusal::MissingInput(D4_CAPTURE_MASK_UV)
+                    }
+                    other => other,
+                })?;
+            if mask_values.len() != positions.len() {
+                return Err(Refusal::ShapeMismatch(D4_CAPTURE_MASK_UV));
+            }
+            let mask_uv = produce_mesh_mask_uv(Some(MeshMaskUvInputs {
+                ticket: Some(job_id),
+                face_id: Some(face_id),
+                positions: &positions,
+                mask_uv: &mask_values,
+                indices: &indices,
+                width: frame_size[0],
+                height: frame_size[1],
+            }))?;
+            (
+                Some(Arc::clone(
+                    input.owner_mask.as_ref().expect("validated owner mask"),
+                )),
+                Some(mask_uv),
+                false,
+                mask_channel,
+            )
+        }
+        SuitLiveMaskProgram::Unmasked => (None, None, true, MaskChannel::A),
+    };
     let material_uv = produce_mesh_mask_uv(Some(MeshMaskUvInputs {
         ticket: Some(job_id),
         face_id: Some(face_id),
@@ -1686,10 +1752,6 @@ fn produce_live_suit_pass(
         other => other,
     })?;
 
-    let (mask_field, mask_value) = match (pass.mask_field.as_deref(), pass.mask_value) {
-        (Some(field), Some(value)) => (field, value),
-        _ => return Err(Refusal::MissingInput("suit mask")),
-    };
     let degree = pass.degree;
     if !degree.is_finite() || !(0.0..=100.0).contains(&degree) {
         return Err(Refusal::ValueOutOfRange("suit degree"));
@@ -1718,7 +1780,7 @@ fn produce_live_suit_pass(
         effect: pass.effect.clone(),
         face_id,
         draw: input.draw.clone(),
-        owner_mask: Arc::clone(input.owner_mask.as_ref().expect("validated owner mask")),
+        owner_mask,
         mask_uv,
         material: Arc::clone(input.material.as_ref().expect("validated material")),
         material_uv,
@@ -1727,10 +1789,11 @@ fn produce_live_suit_pass(
             opacity_percent: opacity,
             degree01: degree / 100.0,
             filter_type,
-            mask_channel: suit_live_mask_channel(mask_field, mask_value)?,
+            mask_channel,
         },
         shelter,
         region,
+        unmasked,
     })
 }
 
@@ -1832,7 +1895,7 @@ pub(crate) mod test_support {
             .into()
     }
 
-    fn draw(frame_size: [u32; 2]) -> OwnedFace2dDrawBytes {
+    pub(crate) fn draw(frame_size: [u32; 2]) -> OwnedFace2dDrawBytes {
         OwnedFace2dDrawBytes {
             vertices: xy_bytes(&[
                 [0.0, 0.0],
@@ -1870,7 +1933,7 @@ pub(crate) mod test_support {
         .unwrap())
     }
 
-    fn material(pf: u32) -> Arc<Image> {
+    pub(crate) fn material(pf: u32) -> Arc<Image> {
         Arc::new(Image::new(
             5,
             4,
@@ -2122,6 +2185,82 @@ mod tests {
                 .unwrap()
                 .mask_channel,
             MaskChannel::RB
+        );
+    }
+
+    #[test]
+    fn live_bundle_admits_fourteen_unmasked_eye_pupil_passes() {
+        let suit = load_owned_suit_bundle().unwrap();
+        let passes = suit
+            .presets
+            .iter()
+            .flat_map(|preset| &preset.passes)
+            .filter(|pass| {
+                pass.pf == 90033
+                    && pass.mask_field.as_deref() == Some("EyePupilMaskType")
+                    && pass.mask_value == Some(0)
+                    && pass.require_executable().is_ok()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(passes.len(), 14);
+        let material_uv = OwnedFace2dUvBytes {
+            vertices: [[0.0f32, 0.0], [1.0, 0.0], [0.0, 1.0]]
+                .into_iter()
+                .flat_map(|point| {
+                    point[0]
+                        .to_le_bytes()
+                        .into_iter()
+                        .chain(point[1].to_le_bytes())
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            vertex_stride: 8,
+            offset: 0,
+        };
+        let inputs = passes
+            .iter()
+            .map(|pass| OwnedSuitPassJobInput {
+                preset_id: pass.preset_id.clone(),
+                order: pass.order,
+                pf: pass.pf,
+                job_id: 7,
+                ticket: Some(7),
+                face_id: Some(0),
+                draw: test_support::draw([32, 24]),
+                origin: [0, 0],
+                size: [32, 24],
+                owner_mask: None,
+                material: Some(test_support::material(111)),
+                mask_uv: None,
+                material_uv: Some(material_uv.clone()),
+                shelter: Some(0.5),
+                region: Some(0.75),
+            })
+            .collect::<Vec<_>>();
+        let live =
+            produce_owned_suit_live_bundle(7, Some(7), [32, 24], [0x51; 32], Some(&inputs))
+                .unwrap();
+        assert_eq!(live.static_executable_passes, 337);
+        assert_eq!(live.live_executable_passes, 14);
+        assert!(live
+            .passes
+            .iter()
+            .all(|pass| pass.unmasked && pass.owner_mask.is_none() && pass.mask_uv.is_none()));
+        assert!(live.passes.iter().all(|pass| matches!(
+            pass.as_suit_pass_input().kind,
+            SuitPassKindInput::ImageUnmasked { .. }
+        )));
+        assert_eq!(
+            suit_live_mask_program("EyeBrowMaskType", 10),
+            Err(Refusal::MissingInput(
+                "suit owner-mask EyeBrowMaskType=10 channel"
+            ))
+        );
+        assert_eq!(
+            suit_live_mask_program("EyeLashMaskType", 10),
+            Err(Refusal::MissingInput(
+                "suit owner-mask EyeLashMaskType=10 channel"
+            ))
         );
     }
 
