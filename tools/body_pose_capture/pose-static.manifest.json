@@ -1,0 +1,102 @@
+{
+  "schema": "aurora/pixcake-pose-static/1",
+  "lane": "B5",
+  "base_commit": "eececfd",
+  "prerequisite_head": "3bf8bdf",
+  "status": "blocked-no-decryptable-pose-model",
+  "source": {
+    "root": "C:\\Program Files\\PixCake\\pixcake_2",
+    "executable": {
+      "path": "C:\\Program Files\\PixCake\\pixcake_2\\pix-worker.exe",
+      "bytes": 235847168,
+      "observed_symbols": [
+        "AIBodyReshapeDetectorV3",
+        "AILimbReshapeDetector",
+        "BodyReshapingV2",
+        "LimbReshapingParams",
+        "pose_points_bucket",
+        "pose_points_original",
+        "jointPoints",
+        "SkeletonFeatures",
+        "TSAI::MissResourceException",
+        "[AIModel] LookupModelPath: model not found, hashId=%u, md5=%s"
+      ]
+    },
+    "container": {
+      "path": "C:\\Program Files\\PixCake\\pixcake_2\\Resources\\pixcook",
+      "bytes": 2071019532,
+      "format": "ustar",
+      "first_header_xor_key_hex": "eccdcadcb",
+      "entries": 3106,
+      "numeric_entries": 2079,
+      "named_entries": 1027
+    }
+  },
+  "decoded_pose_resources": [
+    {
+      "kind": "standalone-effect-config",
+      "path": "C:\\Program Files\\PixCake\\pixcake_2\\Resources\\effect\\config\\PoseRefine\\effect.json",
+      "bytes": 12230,
+      "transform": "repeating-xor; strip 16-byte effect footer",
+      "decrypted_magic": "{",
+      "decrypted_format": "JSON",
+      "semantics": "Body warp/refine effect declarations such as HeadZoom, NeckLength, ShoulderWidth, ArmRefine, WaistRefine and SlimLegRefine",
+      "contains_model_id": false,
+      "contains_resource_id": false,
+      "contains_tensor_contract": false
+    },
+    {
+      "kind": "standalone-effect-config",
+      "path": "C:\\Program Files\\PixCake\\pixcake_2\\Resources\\effect\\config\\SubPoseRefine\\effect.json",
+      "bytes": 1166,
+      "transform": "repeating-xor; strip 16-byte effect footer",
+      "decrypted_magic": "{",
+      "decrypted_format": "JSON",
+      "semantics": "BodyRefine, LengthenLegRefine and HeightenRefine effect declarations",
+      "contains_model_id": false,
+      "contains_resource_id": false,
+      "contains_tensor_contract": false
+    }
+  ],
+  "pose_model": {
+    "model_id": null,
+    "file_name": null,
+    "resource_id": null,
+    "decrypted_magic": null,
+    "decrypted_format": null,
+    "input_tensor": null,
+    "output_tensor": null,
+    "sha256": null,
+    "runtime_integration": "not-attempted"
+  },
+  "known_non_target_model": {
+    "resource_id": "1527454531",
+    "container_offset": 355397632,
+    "bytes": 4042709,
+    "role": "PixCake eye-whiten network",
+    "body_pose": false,
+    "outer_xor_head_hex": "5ecaa2144aeb3e7c4a334cd49e466e5c014a7a36a3fba886",
+    "decoded_format_after_outer_xor": "opaque-or-encrypted"
+  },
+  "blockers": [
+    "No PoseRefine, SubPoseRefine or AIBodyReshapeDetectorV3 model file exists in an AIModels directory.",
+    "The decoded pose effect configs contain warp parameters only; they do not name a model, resource ID, digest or tensor contract.",
+    "The ustar numeric namespace maps IDs to payload bytes, but no static ID-to-model-name table was found.",
+    "The outer ec-cd-ad-cb XOR restores effect JSON and PNG payloads, but numeric binary payloads remain opaque and expose no MNN, ONNX, TFLite or NCNN magic.",
+    "The executable proves hashId-based model lookup but no concrete hashId is linked to the body-pose producer.",
+    "No artifact or tensor metadata is available, so B runtime integration and real keypoint tests remain unavailable."
+  ],
+  "decoder": {
+    "path": "tools/body_pose_capture/decode-pixcook.ps1",
+    "modes": [
+      "inventory",
+      "numeric-resource-by-id",
+      "named-container-entry",
+      "standalone-xored-effect-config"
+    ],
+    "fail_closed": true,
+    "require_model_magic_supported": true
+  },
+  "keypoints": null,
+  "keypoint_status": "not-produced"
+}

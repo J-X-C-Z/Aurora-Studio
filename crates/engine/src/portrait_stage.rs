@@ -113,6 +113,12 @@ mod portrait_body_stage;
 pub use portrait_body_stage::{
     BodyGeometryInput, BodyGeometryJob, BodyShiftInput, SixPointWarp,
 };
+#[path = "portrait_body_producer.rs"]
+mod portrait_body_producer;
+pub use portrait_body_producer::{
+    BodyGeometryProducerInputs, BodyLandmarkDomain, BodyLandmarkEffect, BodyLandmarkFrame,
+    BodyLandmarkRef,
+};
 
 #[path = "portrait_plump_stage.rs"]
 mod portrait_plump_stage;
@@ -4035,6 +4041,108 @@ fn supports_effect(pf: u32) -> bool {
         || portrait_historical_skin::PFS.contains(&pf)
 }
 
+#[cfg(windows)]
+fn try_cuda_body_mesh(
+    source: &Image,
+    pf: u32,
+    job_id: Option<u64>,
+    job: Option<&BodyGeometryJob>,
+) -> Option<Result<(Image, Vec<aurora_portrait::cuda::Dispatch>), String>> {
+    let job = job?;
+    if !matches!(pf, 401 | 406 | 410 | 415) {
+        return None;
+    }
+    if job.job_id == 0 || job_id != Some(job.job_id) {
+        return Some(Err("CUDA body mesh: body geometry job id".to_string()));
+    }
+    if job.frame_size != (source.width, source.height)
+        || job.source_sha256 != sha256_32(&source.pixels)
+    {
+        return Some(Err("CUDA body mesh: body geometry frame".to_string()));
+    }
+    let Some(BodyGeometryInput::Mesh { mesh, passes }) = job.effects.get(&pf) else {
+        return Some(Err("CUDA body mesh: body geometry effect".to_string()));
+    };
+    if passes.is_empty() || passes.iter().any(|pass| pass.defines.uv_map) {
+        return Some(Err("CUDA body mesh: color passes".to_string()));
+    }
+    if let Some(error) = forced_cuda_failure() {
+        return Some(Err(format!("CUDA body mesh fallback: {error:?}")));
+    }
+    let gpu = aurora_portrait::cuda_mesh::MeshRaster::open()
+        .map_err(|error| format!("CUDA body mesh fallback: {error:?}"))?;
+    let mut current = source.clone();
+    let mut dispatches = Vec::new();
+    for pass in passes {
+        let mut dest = Vec::with_capacity(mesh.destination.len());
+        for position in &mesh.destination {
+            let m = &pass.matrix;
+            let clip_x = m[0] * position.x + m[1] * position.y + m[3];
+            let clip_y = m[4] * position.x + m[5] * position.y + m[7];
+            let w = m[12] * position.x + m[13] * position.y + m[15];
+            if !w.is_finite() || w.abs() < 1e-8 {
+                return Some(Err("CUDA body mesh: invalid clip W".to_string()));
+            }
+            dest.push([
+                ((clip_x / w) + 1.0) * 0.5 * source.width as f32,
+                ((clip_y / w) + 1.0) * 0.5 * source.height as f32,
+            ]);
+        }
+        let uv = mesh
+            .source_uv
+            .iter()
+            .map(|point| [point.x, point.y])
+            .collect::<Vec<_>>();
+        let raster_mesh = aurora_portrait::raster::Mesh {
+            dest: &dest,
+            source_uv: &uv,
+            ebo: &mesh.indices,
+        };
+        let edge = match pass.edge {
+            aurora_portrait::kernels::body_geometry::EdgeMode::ReshapeNormal => {
+                aurora_portrait::raster_fragment::Edge::ReshapeNormal
+            }
+            aurora_portrait::kernels::body_geometry::EdgeMode::AdjClampEdge => {
+                aurora_portrait::raster_fragment::Edge::AdjClampEdge
+            }
+        };
+        let defines = aurora_portrait::raster_fragment::Defines {
+            clamp_edge: pass.defines.clamp_edge,
+            uv_map: pass.defines.uv_map,
+            uv_map_ba: pass.defines.uv_map_ba,
+            catmull_rom: pass.defines.catmull_rom,
+        };
+        let clamp = aurora_portrait::raster_fragment::Clamp {
+            factor: pass.clamp.factor,
+            protect_x: pass.clamp.protect_x,
+            protect_y: pass.clamp.protect_y,
+        };
+        let output = gpu
+            .rasterize_fragment(
+                &current,
+                raster_mesh,
+                aurora_portrait::raster::Rules {
+                    winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
+                    cull: aurora_portrait::raster::Cull::None,
+                    edge: aurora_portrait::raster::Edge::Inclusive,
+                    overlap: aurora_portrait::raster::Overlap::Last,
+                },
+                aurora_portrait::raster::Sampler {
+                    wrap: aurora_portrait::raster::Wrap::ClampToEdge,
+                },
+                edge,
+                defines,
+                clamp,
+                aurora_portrait::raster::Tolerance::RESHAPE,
+            )
+            .map_err(|error| format!("CUDA body mesh fallback: {error:?}"))?;
+        dispatches.push(output.select_dispatch);
+        dispatches.push(output.emit_dispatch);
+        current = output.image;
+    }
+    Some(Ok((current, dispatches)))
+}
+
 fn log_report(report: &PortraitRunReport) {
     for effect in &report.effects {
         if let Some(refusal) = &effect.refusal {
@@ -4442,6 +4550,29 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if portrait_body_stage::supports(pf) {
+            #[cfg(windows)]
+            {
+                if let Some(result) =
+                    try_cuda_body_mesh(&current, pf, inputs.job_id(), inputs.body_geometry)
+                {
+                    match result {
+                        Ok((next, dispatches)) if !dispatches.is_empty() => {
+                            current = next;
+                            run.backend = PortraitBackend::Cuda;
+                            run.dispatches = dispatches;
+                            run.skipped = false;
+                            run.executed = true;
+                            report.effects.push(run);
+                            continue;
+                        }
+                        Ok(_) => {
+                            run.fallback_reason =
+                                Some("CUDA body mesh returned no dispatch".to_string());
+                        }
+                        Err(reason) => run.fallback_reason = Some(reason),
+                    }
+                }
+            }
             match portrait_body_stage::apply(
                 &current,
                 pf,
@@ -4451,6 +4582,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             ) {
                 Ok(Some(next)) => {
                     current = next;
+                    run.backend = PortraitBackend::Cpu;
                     run.skipped = false;
                     run.executed = true;
                 }

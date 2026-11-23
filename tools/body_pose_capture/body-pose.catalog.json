@@ -1,0 +1,97 @@
+{
+  "schema": "aurora/body-pose-catalog/1",
+  "target_runtime_contract": {
+    "input": "float32 NCHW [1,3,H,W]",
+    "accepted_outputs": [
+      "[1,K,2]",
+      "[1,K,3]",
+      "[1,2,K]",
+      "[1,3,K]"
+    ],
+    "body_keypoint_count": null,
+    "notes": "K must be closed by the selected model and the native producer; 69 points is the PixCake oriSkeleton consumer format, not proof of a model output."
+  },
+  "sources": [
+    {
+      "id": "capture-one-local",
+      "kind": "local-files",
+      "root": "C:\\Program Files\\Capture One\\Capture One",
+      "model_root": "AIModels",
+      "endpoint": null,
+      "request_format": null,
+      "response_format": null,
+      "body_pose_model_ids": [],
+      "status": "audited-no-pose-onnx",
+      "evidence": "The local AIModels inventory contains face, mask, rotation, similarity, dust, blemish and SAM models; none is named body pose/keypoint/skeleton."
+    },
+    {
+      "id": "pixcake-local-container",
+      "kind": "ustar-container",
+      "executable": {
+        "path": "C:\\Program Files\\PixCake\\pixcake_2\\pixcake.exe",
+        "bytes": 257392640,
+        "sha256": "a84519da489bc52e4e914af7880ede43e3ce58992657723d02197161832464c7"
+      },
+      "container": {
+        "path": "C:\\Program Files\\PixCake\\pixcake_2\\resources\\pixcook",
+        "bytes": 2071019532,
+        "format": "ustar",
+        "first_header_xor_key": "eccdcadcb"
+      },
+      "model_ids": [],
+      "body_pose_model_ids": [],
+      "observed_tokens": [
+        "AVBodyReshapeDetectorV3",
+        "CalculateBodyRoiByAlgorithm",
+        "KeyPoint",
+        "keypoints",
+        "_pose_b1H",
+        "_pose_b1J",
+        "_pose_w1H",
+        "pose_points_bucket",
+        "pose_points_original"
+      ],
+      "status": "container-layout-closed-model-id-open"
+    },
+    {
+      "id": "pixcake-cloud",
+      "kind": "http",
+      "observed_origins": [
+        "https://api.pixcakeai.com",
+        "https://api.pixsoda.com",
+        "https://res.pixcakeai.com",
+        "https://web-editor-api.pixcakeai.com",
+        "https://pixuser-api.pixcakeai.com"
+      ],
+      "observed_response_fields": [
+        "resourceId",
+        "downloadUrl",
+        "modelId",
+        "selectedModelId",
+        "cloudSourceDownloadUrl",
+        "md5",
+        "sha1"
+      ],
+      "request_format": "not closed: origin strings and field names are observed, but no binary evidence yet fixes method, route, query/body schema and authentication.",
+      "response_format": "not closed: downloadUrl is observed; the enclosing JSON object and one concrete response are not captured.",
+      "body_pose_model_ids": [],
+      "status": "endpoint-fields-observed-route-open"
+    }
+  ],
+  "known_non_target_models": [
+    {
+      "model_id": "1527454531",
+      "container_offset": 355397632,
+      "bytes": 4042709,
+      "role": "PixCake eye-whiten network",
+      "body_pose": false
+    }
+  ],
+  "artifacts": [],
+  "unresolved": [
+    "No body-pose ONNX is present in the audited Capture One AIModels tree.",
+    "No numeric PixCake model ID is proven to emit the native 69-point body skeleton.",
+    "The concrete PixCake model-download route, method, auth and complete response schema are not closed.",
+    "No real keypoints were generated; keypoint output remains unavailable until an artifact passes SHA-256 and tensor-contract checks."
+  ]
+}

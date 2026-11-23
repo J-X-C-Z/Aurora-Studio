@@ -524,42 +524,7 @@ fn build_row(
 }
 
 fn mesh_from_vbo_ebo(vbo: &[u8], ebo: &[u8]) -> Result<Mesh, Refusal> {
-    if vbo.is_empty() {
-        return Err(Refusal::MissingInput("body geometry VBO"));
-    }
-    if vbo.len() % 16 != 0 {
-        return Err(Refusal::ShapeMismatch("body geometry VBO"));
-    }
-    if ebo.is_empty() {
-        return Err(Refusal::MissingInput("body geometry EBO"));
-    }
-    if ebo.len() % 2 != 0 {
-        return Err(Refusal::ShapeMismatch("body geometry EBO"));
-    }
-
-    let mut destination = Vec::with_capacity(vbo.len() / 16);
-    let mut source_uv = Vec::with_capacity(vbo.len() / 16);
-    for vertex in vbo.chunks_exact(16) {
-        let value = |offset: usize| {
-            f32::from_le_bytes(
-                vertex[offset..offset + 4]
-                    .try_into()
-                    .expect("fixed VBO field"),
-            )
-        };
-        let values = [value(0), value(4), value(8), value(12)];
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(Refusal::ValueOutOfRange("body geometry VBO"));
-        }
-        destination.push(Vec2::new(values[0], values[1]));
-        source_uv.push(Vec2::new(values[2], values[3]));
-    }
-    let indices = ebo
-        .chunks_exact(2)
-        .map(|index| u16::from_le_bytes([index[0], index[1]]))
-        .collect();
-    Mesh::new(destination, source_uv, indices)
-        .map_err(|_| Refusal::ValueOutOfRange("body geometry VBO/EBO"))
+    crate::body_shader_abi::decode_body_geometry(vbo, ebo)
 }
 
 fn float_hash(hash: &mut DefaultHasher, values: &[f32]) {
