@@ -74,6 +74,7 @@ mod output;
 mod body_shader_abi;
 mod portrait_stage;
 pub mod portrait_model_output_provider;
+pub mod portrait_vendor_models;
 mod wrinkle_legacy;
 pub mod portrait_makeup_bundle;
 pub mod portrait_makeup_suit_inputs;

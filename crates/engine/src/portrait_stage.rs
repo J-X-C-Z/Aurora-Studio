@@ -532,6 +532,8 @@ pub struct ProducerInputs {
     pub teeth: Option<TeethProducerInputs>,
     pub pf30025: Option<Pf30025ProducerInputs>,
     pub teeth_alignment: Option<TeethAlignmentProducerInputs>,
+    pub hair_smooth: Option<HairSmoothProducerInputs>,
+    pub hair_gloss: Option<HairGlossProducerInputs>,
     pub eye_bag: Option<aurora_portrait::eye_bag_alignment::AlignedEyeBagPlanes>,
     pub smile: Option<SmileProducerInputs>,
     pub stray_hair: Option<StrayHairProducerInputs>,
@@ -1752,6 +1754,126 @@ impl ProducerInputs {
         self.pf30025 = Some(bundle);
     }
 
+    /// Bind the PF30026 model/renderer outputs to this exact job before the
+    /// stage can route them to `teeth_alignment`.
+    pub fn write_teeth_alignment(
+        &mut self,
+        bundle: TeethAlignmentProducerInputs,
+        receipt: &PortraitJobReceipt,
+    ) -> Result<(), Refusal> {
+        let gate = bundle
+            .gate_binding
+            .ok_or(Refusal::MissingInput("PF30026 edge gate binding"))?;
+        gate.validate()?;
+        if gate.job_id != receipt.job_id() {
+            return Err(Refusal::ValueOutOfRange("PF30026 edge gate job"));
+        }
+        let effect = bundle
+            .effect_rgb
+            .as_ref()
+            .ok_or(Refusal::MissingInput("PF30026 effect RGB"))?;
+        if (effect.width, effect.height) != (receipt.width, receipt.height) {
+            return Err(Refusal::ShapeMismatch("PF30026 effect RGB"));
+        }
+        let pixels = (receipt.width as usize)
+            .checked_mul(receipt.height as usize)
+            .ok_or(Refusal::ShapeMismatch("PF30026 effect RGB"))?;
+        let mask = bundle
+            .teeth_mask
+            .as_ref()
+            .ok_or(Refusal::MissingInput("PF30026 teeth mask"))?;
+        let edge_a = bundle
+            .edge_plane_a
+            .as_ref()
+            .ok_or(Refusal::MissingInput("PF30026 edge plane A"))?;
+        let edge_b = bundle
+            .edge_plane_b
+            .as_ref()
+            .ok_or(Refusal::MissingInput("PF30026 edge plane B"))?;
+        if mask.len() != pixels || edge_a.len() != pixels || edge_b.len() != pixels {
+            return Err(Refusal::ShapeMismatch("PF30026 model planes"));
+        }
+        if bundle.roi.is_none() {
+            return Err(Refusal::MissingInput("PF30026 ROI"));
+        }
+        self.teeth_alignment = Some(bundle);
+        Ok(())
+    }
+
+    /// Copy the PF90139/PF90140 provider view into owned same-job storage.
+    pub fn write_hair_smooth(
+        &mut self,
+        bundle: HairSmoothInputs<'_>,
+        receipt: &PortraitJobReceipt,
+    ) -> Result<(), Refusal> {
+        if bundle.ticket != receipt.job_id() {
+            return Err(Refusal::ValueOutOfRange("PF90139_PF90140 job"));
+        }
+        if (bundle.width, bundle.height) != (receipt.width, receipt.height) {
+            return Err(Refusal::ShapeMismatch("PF90139_PF90140 frame"));
+        }
+        self.hair_smooth = Some(HairSmoothProducerInputs {
+            ticket: bundle.ticket,
+            width: bundle.width,
+            height: bundle.height,
+            roi: bundle.roi,
+            mix_strength: bundle.mix_strength,
+            hair_mask: bundle
+                .hair_mask
+                .ok_or(Refusal::MissingInput("PF90139_HAIR_MASK"))?
+                .to_vec(),
+            mix_mask: bundle
+                .mix_mask
+                .ok_or(Refusal::MissingInput("PF90139_MIX_MASK"))?
+                .to_vec(),
+            blend_rgb: bundle
+                .blend_rgb
+                .ok_or(Refusal::MissingInput("PF90139_BLEND_SOURCE"))?
+                .to_vec(),
+            detail: bundle
+                .detail
+                .ok_or(Refusal::MissingInput("PF90139_DETAIL"))?
+                .to_vec(),
+            hair_stride: bundle.hair_stride,
+            mix_stride: bundle.mix_stride,
+            blend_stride: bundle.blend_stride,
+            detail_stride: bundle.detail_stride,
+        });
+        Ok(())
+    }
+
+    /// Copy the PF90160 provider view into owned same-job storage.
+    pub fn write_hair_gloss(
+        &mut self,
+        bundle: HairGlossInputs<'_>,
+        receipt: &PortraitJobReceipt,
+    ) -> Result<(), Refusal> {
+        if bundle.ticket != receipt.job_id() {
+            return Err(Refusal::ValueOutOfRange("PF90160 job"));
+        }
+        if (bundle.width, bundle.height) != (receipt.width, receipt.height) {
+            return Err(Refusal::ShapeMismatch("PF90160 frame"));
+        }
+        self.hair_gloss = Some(HairGlossProducerInputs {
+            ticket: bundle.ticket,
+            width: bundle.width,
+            height: bundle.height,
+            roi: bundle.roi,
+            dynamic_scale: bundle.dynamic_scale,
+            hair_mask: bundle
+                .hair_mask
+                .ok_or(Refusal::MissingInput("PF90160_HAIR_MASK"))?
+                .to_vec(),
+            model_detail: bundle
+                .model_detail
+                .ok_or(Refusal::MissingInput("PF90160_MODEL_DETAIL"))?
+                .to_vec(),
+            hair_stride: bundle.hair_stride,
+            detail_stride: bundle.detail_stride,
+        });
+        Ok(())
+    }
+
     /// Sole runtime entry for the twelve routed body-geometry rows. The job must
     /// describe this renderer job (`job_id` non-zero, `frame_size` equal to the
     /// frame the receipt was taken from) and every row must carry the payload
@@ -2510,6 +2632,36 @@ pub struct HairGlossInputs<'a> {
     pub detail_stride: u32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HairSmoothProducerInputs {
+    pub ticket: u64,
+    pub width: u32,
+    pub height: u32,
+    pub roi: (u32, u32, u32, u32),
+    pub mix_strength: f32,
+    pub hair_mask: Vec<u8>,
+    pub mix_mask: Vec<u8>,
+    pub blend_rgb: Vec<u8>,
+    pub detail: Vec<u8>,
+    pub hair_stride: u32,
+    pub mix_stride: u32,
+    pub blend_stride: u32,
+    pub detail_stride: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HairGlossProducerInputs {
+    pub ticket: u64,
+    pub width: u32,
+    pub height: u32,
+    pub roi: (u32, u32, u32, u32),
+    pub dynamic_scale: f32,
+    pub hair_mask: Vec<u8>,
+    pub model_detail: Vec<u8>,
+    pub hair_stride: u32,
+    pub detail_stride: u32,
+}
+
 /// PF90088's two hard producers and the per-face values consumed by the final
 /// composite. `pc:90088` remains the UI gate; native values come from this job.
 #[derive(Clone, Copy, Debug, Default)]
@@ -3220,6 +3372,36 @@ impl<'a> PortraitJobInputs<'a> {
                 edge_plane_b: alignment.edge_plane_b.as_deref(),
                 gate_binding: alignment.gate_binding,
                 roi: alignment.roi,
+            });
+        }
+        if let Some(hair) = producer.hair_smooth.as_ref() {
+            self.hair_smooth = Some(HairSmoothInputs {
+                ticket: hair.ticket,
+                width: hair.width,
+                height: hair.height,
+                roi: hair.roi,
+                mix_strength: hair.mix_strength,
+                hair_mask: Some(&hair.hair_mask),
+                mix_mask: Some(&hair.mix_mask),
+                blend_rgb: Some(&hair.blend_rgb),
+                detail: Some(&hair.detail),
+                hair_stride: hair.hair_stride,
+                mix_stride: hair.mix_stride,
+                blend_stride: hair.blend_stride,
+                detail_stride: hair.detail_stride,
+            });
+        }
+        if let Some(hair) = producer.hair_gloss.as_ref() {
+            self.hair_gloss = Some(HairGlossInputs {
+                ticket: hair.ticket,
+                width: hair.width,
+                height: hair.height,
+                roi: hair.roi,
+                dynamic_scale: hair.dynamic_scale,
+                hair_mask: Some(&hair.hair_mask),
+                model_detail: Some(&hair.model_detail),
+                hair_stride: hair.hair_stride,
+                detail_stride: hair.detail_stride,
             });
         }
         if let Some(eye_bag) = producer.eye_bag.as_ref() {
