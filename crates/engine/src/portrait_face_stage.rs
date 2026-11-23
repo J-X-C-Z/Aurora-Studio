@@ -58,7 +58,7 @@ pub enum FaceGeometry {
         dx: Vec<f32>,
         dy: Vec<f32>,
         mask: Vec<u8>,
-        host_split_receipt: SmileHostSplitReceipt,
+        host_split_receipt: Option<SmileHostSplitReceipt>,
     },
     /// PF202 Type1012 draw from the recovered 5x27 producer layout. The EBO
     /// is the captured 136/705 topology, not a tessellation of source points.
@@ -96,6 +96,50 @@ pub struct SmileHostSplitReceipt {
     pub dx_sha256: [u8; 32],
     pub dy_sha256: [u8; 32],
     pub mask_sha256: [u8; 32],
+}
+
+impl SmileHostSplitReceipt {
+    /// Bind the exact model tensor and the host-split planes derived from it.
+    pub fn from_model_output(
+        job_id: u64,
+        model_output: &super::SmileRgbReconstructionField,
+        dx: &[f32],
+        dy: &[f32],
+        mask: &[u8],
+    ) -> Result<Self, Refusal> {
+        if job_id == 0 {
+            return Err(Refusal::ValueOutOfRange("PF8033 host split ticket"));
+        }
+        let pixels = super::smile_model_pixels(
+            model_output.width,
+            model_output.height,
+            "PF8033 780929437 shape",
+        )?;
+        if model_output.values.len() != pixels.saturating_mul(3)
+            || model_output.values.iter().any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ShapeMismatch("PF8033 780929437 values"));
+        }
+        if dx.len() != pixels || dy.len() != pixels || mask.len() != pixels {
+            return Err(Refusal::ShapeMismatch("PF8033 host split planes"));
+        }
+        if dx.iter().chain(dy).any(|value| !value.is_finite()) {
+            return Err(Refusal::ValueOutOfRange("PF8033 displacement"));
+        }
+        let model_bytes = model_output
+            .values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            job_id,
+            model_output_id: super::SmileRgbReconstructionField::OUTPUT_ID,
+            model_output_sha256: sha256_32(&model_bytes),
+            dx_sha256: hash_f32(dx),
+            dy_sha256: hash_f32(dy),
+            mask_sha256: sha256_32(mask),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -255,7 +299,7 @@ fn hash_points<const N: usize>(points: &[[f32; N]], h: &mut DefaultHasher) {
     }
 }
 
-fn hash_f32(values: &[f32]) -> [u8; 32] {
+pub(super) fn hash_f32(values: &[f32]) -> [u8; 32] {
     sha256_32(
         &values
             .iter()
@@ -805,6 +849,31 @@ pub(super) fn apply(
     pf: u32,
     controls: [f32; 2],
 ) -> Result<FaceGeometryRun, Refusal> {
+    apply_with_mode(source, region, job_id, input, shared, pf, controls, false)
+}
+
+pub(super) fn apply_cpu(
+    source: &Image,
+    region: NormRect,
+    job_id: Option<u64>,
+    input: Option<&FaceGeometryInputs>,
+    shared: Option<&SlimProducerInputs>,
+    pf: u32,
+    controls: [f32; 2],
+) -> Result<FaceGeometryRun, Refusal> {
+    apply_with_mode(source, region, job_id, input, shared, pf, controls, true)
+}
+
+fn apply_with_mode(
+    source: &Image,
+    region: NormRect,
+    job_id: Option<u64>,
+    input: Option<&FaceGeometryInputs>,
+    shared: Option<&SlimProducerInputs>,
+    pf: u32,
+    controls: [f32; 2],
+    cpu_only: bool,
+) -> Result<FaceGeometryRun, Refusal> {
     let min = if pf == 8033 { 0.0 } else { -1.0 };
     if controls.iter().any(|value| !(min..=1.0).contains(value)) {
         return Err(Refusal::ValueOutOfRange("face geometry UI"));
@@ -1002,12 +1071,14 @@ pub(super) fn apply(
             },
             8033,
         ) => {
-            if host_split_receipt.job_id != input.job_id
-                || host_split_receipt.model_output_id
-                    != super::SmileRgbReconstructionField::OUTPUT_ID
-                || host_split_receipt.dx_sha256 != hash_f32(dx)
-                || host_split_receipt.dy_sha256 != hash_f32(dy)
-                || host_split_receipt.mask_sha256 != sha256_32(mask)
+            let receipt = host_split_receipt
+                .as_ref()
+                .ok_or(Refusal::MissingInput("PF8033 host split receipt"))?;
+            if receipt.job_id != input.job_id
+                || receipt.model_output_id != super::SmileRgbReconstructionField::OUTPUT_ID
+                || receipt.dx_sha256 != hash_f32(dx)
+                || receipt.dy_sha256 != hash_f32(dy)
+                || receipt.mask_sha256 != sha256_32(mask)
             {
                 return Err(Refusal::ValueOutOfRange("PF8033 host split receipt"));
             }
@@ -1028,45 +1099,49 @@ pub(super) fn apply(
                     .map(|image| FaceGeometryRun::cpu(Some(image)))
                     .ok_or(Refusal::ShapeMismatch("PF8033 output"))
             };
-            #[cfg(windows)]
-            {
-                let cuda = match super::forced_cuda_failure() {
-                    Some(error) => Err(error),
-                    None => aurora_portrait::cuda_smile::Smile::open().and_then(|gpu| {
-                        gpu.apply_pf8033(
-                            &source.pixels,
-                            source.width,
-                            source.height,
-                            dx,
-                            dy,
-                            mask,
-                            controls[0],
-                        )
-                    }),
-                };
-                match cuda {
-                    Ok((pixels, dispatches)) => {
-                        let image = Image::new(source.width, source.height, pixels)
-                            .ok_or(Refusal::ShapeMismatch("PF8033 output"))?;
-                        let changed = image != *source;
-                        FaceGeometryRun {
-                            image: changed.then_some(image),
-                            backend: PortraitBackend::Cuda,
-                            dispatches,
-                            fallback_reason: None,
+            if cpu_only {
+                cpu()?
+            } else {
+                #[cfg(windows)]
+                {
+                    let cuda = match super::forced_cuda_failure() {
+                        Some(error) => Err(error),
+                        None => aurora_portrait::cuda_smile::Smile::open().and_then(|gpu| {
+                            gpu.apply_pf8033(
+                                &source.pixels,
+                                source.width,
+                                source.height,
+                                dx,
+                                dy,
+                                mask,
+                                controls[0],
+                            )
+                        }),
+                    };
+                    match cuda {
+                        Ok((pixels, dispatches)) => {
+                            let image = Image::new(source.width, source.height, pixels)
+                                .ok_or(Refusal::ShapeMismatch("PF8033 output"))?;
+                            let changed = image != *source;
+                            FaceGeometryRun {
+                                image: changed.then_some(image),
+                                backend: PortraitBackend::Cuda,
+                                dispatches,
+                                fallback_reason: None,
+                            }
+                        }
+                        Err(error) => {
+                            let mut run = cpu()?;
+                            run.backend = PortraitBackend::Cpu;
+                            run.fallback_reason = Some(format!("CUDA PF8033 fallback: {error:?}"));
+                            run
                         }
                     }
-                    Err(error) => {
-                        let mut run = cpu()?;
-                        run.backend = PortraitBackend::Cpu;
-                        run.fallback_reason = Some(format!("CUDA PF8033 fallback: {error:?}"));
-                        run
-                    }
                 }
-            }
-            #[cfg(not(windows))]
-            {
-                cpu()?
+                #[cfg(not(windows))]
+                {
+                    cpu()?
+                }
             }
         }
         _ => return Err(Refusal::ValueOutOfRange("face geometry draw kind")),

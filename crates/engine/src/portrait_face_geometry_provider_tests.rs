@@ -94,14 +94,14 @@ fn ready_row(pf: u32) -> FaceGeometryProviderRow {
             dx: vec![1.0; 16],
             dy: vec![0.0; 16],
             mask: vec![255; 16],
-            host_split_receipt: SmileHostSplitReceipt {
+            host_split_receipt: Some(SmileHostSplitReceipt {
                 job_id: 42,
                 model_output_id: super::super::SmileRgbReconstructionField::OUTPUT_ID,
-                model_output_sha256: [0; 32],
+                model_output_sha256: super::sha256_32(b"780929437 fixture"),
                 dx_sha256: hash_f32(&[1.0; 16]),
                 dy_sha256: hash_f32(&[0.0; 16]),
                 mask_sha256: sha256_32(&[255; 16]),
-            },
+            }),
         },
         route => panic!("not a ready route: {route:?}"),
     };
@@ -276,4 +276,25 @@ fn open_and_contract_split_rows_do_not_emit_face_geometry() {
         }];
         assert_eq!(build_face_geometry_inputs(&input), Err(expected));
     }
+}
+
+#[test]
+fn pf8033_effect_contract_pins_warp_type_flag_and_ranges() {
+    let effect: serde_json::Value =
+        serde_json::from_str(include_str!("../../../assets/portrait/smile/effect.json")).unwrap();
+    let effects = effect["Effects"].as_array().unwrap();
+    assert_eq!(effects.len(), 1);
+    let effect = &effects[0];
+    assert_eq!(effect["EffectName"], "DL3D_Warp");
+    assert_eq!(effect["WarpType"], 1);
+    assert_eq!(effect["ParamFlag"], 8033);
+    assert_eq!(effect["DegreeRange"], serde_json::json!([0, 100]));
+    assert_eq!(
+        effect["AngleRange"],
+        serde_json::json!([28.420000076293945, -28.420000076293945])
+    );
+    assert_eq!(
+        effect["DistRatioRange"],
+        serde_json::json!([5.050000190734863, 0.0009999939939007163])
+    );
 }

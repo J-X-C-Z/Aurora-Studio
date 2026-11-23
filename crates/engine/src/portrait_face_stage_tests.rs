@@ -101,14 +101,14 @@ fn prepared_draws_change_pixels_and_refuse_stale_bindings() {
                 dx: vec![2.0; size],
                 dy: vec![0.0; size],
                 mask: vec![255; size],
-                host_split_receipt: super::SmileHostSplitReceipt {
+                host_split_receipt: Some(super::SmileHostSplitReceipt {
                     job_id: slim.job_id,
                     model_output_id: super::super::SmileRgbReconstructionField::OUTPUT_ID,
-                    model_output_sha256: [0; 32],
+                    model_output_sha256: super::sha256_32(b"780929437 fixture"),
                     dx_sha256: super::hash_f32(&vec![2.0; size]),
                     dy_sha256: super::hash_f32(&vec![0.0; size]),
                     mask_sha256: super::sha256_32(&vec![255; size]),
-                },
+                }),
             },
         ),
     ] {

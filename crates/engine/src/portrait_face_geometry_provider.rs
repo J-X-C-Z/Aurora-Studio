@@ -4,8 +4,10 @@ use aurora_portrait::cuda_vface;
 use aurora_portrait::kernels::eye_geometry;
 use aurora_portrait::Refusal;
 
-use super::portrait_face_stage::{FaceGeometry, FaceGeometryDraw, FaceGeometryInputs};
-use super::sha256_32;
+use super::portrait_face_stage::{
+    hash_f32, FaceGeometry, FaceGeometryDraw, FaceGeometryInputs, SmileHostSplitReceipt,
+};
+use super::{sha256_32, SmileChannelSplit, SmileRgbReconstructionField};
 
 /// Every PF this provider knows about, including rows that can only be
 /// represented by a named refusal.
@@ -125,6 +127,38 @@ pub struct FaceGeometryProviderInputs {
     pub rows: Vec<FaceGeometryProviderRow>,
 }
 
+/// Bind real `780929437` host-split output to the PF8033 forward warp.
+pub fn build_pf8033_smile_row(
+    job_id: u64,
+    controls: [f32; 2],
+    model_output: &SmileRgbReconstructionField,
+    split: &SmileChannelSplit,
+    mask: Vec<u8>,
+) -> Result<FaceGeometryProviderRow, Refusal> {
+    if split.spec.job_id != job_id {
+        return Err(Refusal::ValueOutOfRange("PF8033 host split ticket"));
+    }
+    validate_controls(controls, true)?;
+    let receipt = SmileHostSplitReceipt::from_model_output(
+        job_id,
+        model_output,
+        &split.model_dx,
+        &split.model_dy,
+        &mask,
+    )?;
+    Ok(FaceGeometryProviderRow {
+        pf: 8033,
+        controls,
+        mesh_id: None,
+        geometry: FaceGeometry::Smile {
+            dx: split.model_dx.clone(),
+            dy: split.model_dy.clone(),
+            mask,
+            host_split_receipt: Some(receipt),
+        },
+    })
+}
+
 /// Bind producer rows to one frame and one receipt. No geometry is accepted
 /// from another job, another frame, or a mesh whose bytes differ from receipt.
 pub fn build_face_geometry_inputs(
@@ -159,7 +193,7 @@ pub fn build_face_geometry_inputs(
                 validate_eye(row, meshes.get(&required_mesh(row)?))?;
             }
             FaceGeometryProviderRoute::Smile => {
-                validate_smile(row, input.width, input.height)?;
+                validate_smile(row, input.width, input.height, input.job_id)?;
                 if let Some(mesh_id) = row.mesh_id {
                     if !meshes.contains_key(&mesh_id) {
                         return Err(Refusal::MissingInput("face geometry provider row mesh"));
@@ -488,7 +522,12 @@ fn validate_eye(
     }
 }
 
-fn validate_smile(row: &FaceGeometryProviderRow, width: u32, height: u32) -> Result<(), Refusal> {
+fn validate_smile(
+    row: &FaceGeometryProviderRow,
+    width: u32,
+    height: u32,
+    job_id: u64,
+) -> Result<(), Refusal> {
     validate_controls(row.controls, true)?;
     let pixels = usize::try_from(width)
         .ok()
@@ -502,7 +541,10 @@ fn validate_smile(row: &FaceGeometryProviderRow, width: u32, height: u32) -> Res
         ))?;
     match &row.geometry {
         FaceGeometry::Smile {
-            dx, dy, mask, ..
+            dx,
+            dy,
+            mask,
+            host_split_receipt,
         } => {
             if dx.len() != pixels || dy.len() != pixels || mask.len() != pixels {
                 return Err(Refusal::ShapeMismatch(
@@ -513,6 +555,17 @@ fn validate_smile(row: &FaceGeometryProviderRow, width: u32, height: u32) -> Res
                 return Err(Refusal::ValueOutOfRange(
                     "face geometry provider PF8033 displacement",
                 ));
+            }
+            let receipt = host_split_receipt
+                .as_ref()
+                .ok_or(Refusal::MissingInput("PF8033 host split receipt"))?;
+            if receipt.job_id != job_id
+                || receipt.model_output_id != SmileRgbReconstructionField::OUTPUT_ID
+                || receipt.dx_sha256 != hash_f32(dx)
+                || receipt.dy_sha256 != hash_f32(dy)
+                || receipt.mask_sha256 != sha256_32(mask)
+            {
+                return Err(Refusal::ValueOutOfRange("PF8033 host split receipt"));
             }
             Ok(())
         }
