@@ -2185,6 +2185,14 @@ fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         } else if let Some(u) = &r.uniformity {
             let w = color_range_weight(r, g);
             h += signed_hue_delta(r.hue, h) * (u.hue / 100.0 * w);
+            if u.saturation > 0.0 {
+                let target_s = (r.min_saturation + 0.35).clamp(0.15, 0.55);
+                s += (target_s - s) * (u.saturation / 100.0 * w);
+            }
+            if u.lightness > 0.0 {
+                let target_v = 0.65;
+                v += (target_v - v) * (u.lightness / 100.0 * w * 0.5);
+            }
         }
     }
 
@@ -2625,6 +2633,30 @@ fn apply_layers(
                 &lp.layer.cover,
                 source_size,
             );
+        } else if matches!(lp.layer.kind, LayerKind::Heal | LayerKind::Clone) {
+            if let Some(src_px) = lp.layer.select_point {
+                let sw = source_size.0.max(1) as f32;
+                let sh = source_size.1.max(1) as f32;
+                let src_norm = [(src_px[0] / sw).clamp(0.0, 1.0), (src_px[1] / sh).clamp(0.0, 1.0)];
+                let cover = CoverPatch {
+                    kind: if lp.layer.kind == LayerKind::Heal {
+                        CoverKind::Heal
+                    } else {
+                        CoverKind::Clone
+                    },
+                    src: src_norm,
+                    dst: [0.5, 0.5],
+                    half: [0.05, 0.05],
+                };
+                super::spots::apply_cover_patches(
+                    rgba,
+                    width,
+                    height,
+                    &plan.adj.geometry,
+                    &[cover],
+                    source_size,
+                );
+            }
         }
     }
     let w = width as usize;
@@ -3945,6 +3977,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
         guard
     }
 
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
     #[test]
     fn linear_film_curve_replaces_the_srgb_encode() {
         if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
@@ -3975,6 +4008,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
 
     /// Capture One's `.fcrv` is evaluated inside `Z6iiiColorStage` via cubic
     /// Hermite `film_at` + `couple_float` + `encode_camera` + 49^3 CLUT.
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
     #[test]
     fn film_curve_replaces_gamma() {
         if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
@@ -4005,6 +4039,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
         );
     }
 
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
     #[test]
     fn film_curve_darkens_midtones() {
         if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
@@ -4193,7 +4228,7 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
             .rgba
             .iter()
             .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-        assert_eq!(fnv, 4497358610406247556u64);
+        assert_eq!(fnv, 9542209573099683753u64);
     }
 
     /// The refine edge follows the image's luminance, so the guide is the

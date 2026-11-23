@@ -102,6 +102,16 @@ pub(in crate::aurora_raw) fn linear_rgba16(
     apply_linear_luma_noise_2018(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
     // 2. Linear-domain ColorNoise2012 (LABRangeFilter2012, zero 8-bit quantization loss).
     apply_linear_color_noise_2012(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
+    // 3. High-ISO wide chroma blotch suppression (CImgOpColorNoiseHighISO, ISO >= 1600).
+    if detected_iso >= 1600 {
+        apply_linear_color_noise_2012(
+            &mut linear_rgb,
+            crop_w,
+            crop_h,
+            detected_iso,
+            [detected_noise[0] * 1.6, detected_noise[1] * 2.0],
+        );
+    }
 
     let mut out = vec![0u16; crop_w * crop_h * 4];
     for (dst, px) in out.chunks_exact_mut(4).zip(linear_rgb.iter()) {

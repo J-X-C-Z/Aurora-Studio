@@ -145,6 +145,7 @@ mod xmp;
 pub mod camera_curve;
 pub mod icc;
 pub mod camera_profile;
+pub mod ai_denoise;
 pub mod aimask;
 pub mod dustdetect;
 pub mod autorotate;
