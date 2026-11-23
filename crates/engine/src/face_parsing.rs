@@ -17,11 +17,12 @@ use aurora_portrait::{Image, Refusal};
 
 use crate::aimask::{Runtime, Session};
 use crate::portrait_stage::{
-    PF108_BRIGHT_LUT_IDENTITY, PF108_WHITEN_LUT_IDENTITY, ProducerInputs, TeethMaskFormat,
-    TeethMaskSource, TeethProducerInputs,
+    NormRect, PF108_BRIGHT_LUT_IDENTITY, PF108_WHITEN_LUT_IDENTITY, Pf90004ProducerInputs,
+    ProducerInputs, TeethMaskFormat, TeethMaskSource, TeethProducerInputs,
 };
 
 pub const FACE_PARSING_V2_MODEL_ID: &str = "2102828093";
+pub const FACE_PARSING_V2_MODEL_FILE: &str = "fbe.onnx";
 pub const FACE_PARSING_V2_SIDE: u32 = 384;
 pub const FACE_PARSING_V2_CLASSES: usize = 17;
 pub const FACE_PARSING_V2_SKIN_CLASS: usize = 1;
@@ -61,6 +62,16 @@ const PROBABILITY_QUANT: QuantUniforms = QuantUniforms {
     pad0: 0,
     pad1: 0,
 };
+
+/// PF90004 consumes four recovered class-group planes as RGBA. The first 17
+/// slots remain the model's native classes; these groups are slots 17..=20.
+pub const PF90004_PARSING_RGBA_CLASSES: [&[usize]; 4] = [
+    &[0, 13, 14, 15, 16],
+    &[2, 7, 11, 12],
+    &[4, 5],
+    &[9, 10],
+];
+const PF90004_FACE_CLASSES: &[usize] = &[1];
 const WHITEN_PNG: &[u8] = include_bytes!("../../portrait/assets/portrait/teeth/Whiten.png");
 const BRIGHT_PNG: &[u8] = include_bytes!("../../portrait/assets/portrait/teeth/Bright.png");
 
@@ -429,6 +440,11 @@ impl FaceParsingProducer {
                     .map(PathBuf::from)
                     .flat_map(|root| {
                         [
+                            root.join(FACE_PARSING_V2_MODEL_FILE),
+                            root.join("models").join(FACE_PARSING_V2_MODEL_FILE),
+                            root.join("assets")
+                                .join("models")
+                                .join(FACE_PARSING_V2_MODEL_FILE),
                             root.join("2102828093.onnx"),
                             root.join("models").join("2102828093.onnx"),
                             root.join("assets")
@@ -555,7 +571,83 @@ impl FaceParsingProducer {
         Ok((quantize_mask_cpu(probability)?, "cpu"))
     }
 
-    /// Produces both `ProducerInputs::parsing` and `ProducerInputs::teeth`.
+    fn pf90004_bundle(
+        &self,
+        frame: &Image,
+        parsing: &FaceParsingProducerInputs,
+        crop_to_source: [[f32; 3]; 2],
+    ) -> Result<Pf90004ProducerInputs> {
+        ensure!(
+            parsing.model_sha256 == FACE_PARSING_V2_MODEL_SHA256,
+            "PF90004 requires the canonical FaceParsingV2 model"
+        );
+        ensure!(
+            parsing.width == FACE_PARSING_V2_SIDE
+                && parsing.height == FACE_PARSING_V2_SIDE
+                && usize::from(parsing.channels) == FACE_PARSING_V2_CLASSES,
+            "PF90004 parser grid/classes do not match FaceParsingV2"
+        );
+        let class_planes = pack_class_groups(
+            &parsing.masks,
+            FACE_PARSING_V2_SIDE as usize,
+            FACE_PARSING_V2_SIDE as usize,
+        )?;
+        let projected: Vec<Vec<u8>> = class_planes
+            .iter()
+            .map(|plane| {
+                project_teeth_mask(
+                    plane,
+                    FACE_PARSING_V2_SIDE,
+                    FACE_PARSING_V2_SIDE,
+                    crop_to_source,
+                    frame.width,
+                    frame.height,
+                )
+            })
+            .collect::<Result<_>>()?;
+        let face = project_class_plane(
+            &parsing.masks,
+            PF90004_FACE_CLASSES,
+            FACE_PARSING_V2_SIDE as usize,
+            FACE_PARSING_V2_SIDE as usize,
+            crop_to_source,
+            frame.width,
+            frame.height,
+        )?;
+        let pixels = usize::try_from(frame.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(frame.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| anyhow::anyhow!("PF90004 frame size overflow"))?;
+        let mut parsing_rgba = Vec::with_capacity(pixels.saturating_mul(4));
+        let mut face_rgba = Vec::with_capacity(pixels.saturating_mul(4));
+        for pixel in 0..pixels {
+            parsing_rgba.extend_from_slice(&[
+                projected[0][pixel],
+                projected[1][pixel],
+                projected[2][pixel],
+                projected[3][pixel],
+            ]);
+            let value = face[pixel];
+            face_rgba.extend_from_slice(&[value, value, projected[2][pixel], value]);
+        }
+        let value_mean = pf90004_value_mean(frame, &face)?;
+        Pf90004ProducerInputs::from_same_job(
+            frame.width,
+            frame.height,
+            face,
+            parsing_rgba,
+            face_rgba,
+            value_mean,
+            NormRect::FULL,
+        )
+        .map_err(|refusal| anyhow::anyhow!("PF90004 producer refused: {refusal:?}"))
+    }
+
+    /// Produces `parsing`, `teeth`, and the same-frame PF90004 bundle.
     /// A zero-support teeth plane stays explicit; the caller must not treat it
     /// as a positive PF108 selection.
     pub fn produce(
@@ -584,6 +676,7 @@ impl FaceParsingProducer {
             frame.height,
         )?;
         let mask_sha256 = sha256_32(&mask_g);
+        let pf90004 = self.pf90004_bundle(frame, &inference.parsing, crop_to_source)?;
         Ok(ProducerInputs {
             parsing: Some(inference.parsing),
             teeth: Some(TeethProducerInputs {
@@ -601,6 +694,7 @@ impl FaceParsingProducer {
                 whiten_lut: self.whiten_lut.clone(),
                 bright_lut: self.bright_lut.clone(),
             }),
+            pf90004: Some(pf90004),
             ..ProducerInputs::default()
         })
     }
@@ -637,6 +731,95 @@ impl FaceParsingProducer {
 fn quantize_mask_cpu(probability: &[f32]) -> Result<Vec<u8>> {
     f32_to_u8_cpu(probability, &PROBABILITY_QUANT)
         .map_err(|refusal| anyhow::anyhow!("FaceParsingV2 mask quantization: {refusal:?}"))
+}
+
+fn pack_class_groups(
+    masks: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<[Vec<u8>; 4]> {
+    let plane = width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("FaceParsingV2 plane overflow"))?;
+    ensure!(
+        masks.len()
+            == plane
+                .checked_mul(FACE_PARSING_V2_CLASSES)
+                .ok_or_else(|| anyhow::anyhow!("FaceParsingV2 mask overflow"))?,
+        "FaceParsingV2 class-major plane shape mismatch"
+    );
+    let mut groups = [
+        vec![0u8; plane],
+        vec![0u8; plane],
+        vec![0u8; plane],
+        vec![0u8; plane],
+    ];
+    for (output, classes) in groups.iter_mut().zip(PF90004_PARSING_RGBA_CLASSES) {
+        for (pixel, value) in output.iter_mut().enumerate() {
+            let mut sum = 0u16;
+            for &class in classes {
+                sum = sum.saturating_add(u16::from(masks[class * plane + pixel]));
+            }
+            *value = sum.min(255) as u8;
+        }
+    }
+    Ok(groups)
+}
+
+fn project_class_plane(
+    masks: &[u8],
+    classes: &[usize],
+    width: usize,
+    height: usize,
+    crop_to_source: [[f32; 3]; 2],
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<Vec<u8>> {
+    let plane = width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("FaceParsingV2 plane overflow"))?;
+    ensure!(
+        masks.len() >= plane * FACE_PARSING_V2_CLASSES,
+        "FaceParsingV2 class-major plane shape mismatch"
+    );
+    let mut packed = vec![0u8; plane];
+    for (pixel, value) in packed.iter_mut().enumerate() {
+        let mut sum = 0u16;
+        for &class in classes {
+            sum = sum.saturating_add(u16::from(masks[class * plane + pixel]));
+        }
+        *value = sum.min(255) as u8;
+    }
+    project_teeth_mask(
+        &packed,
+        width as u32,
+        height as u32,
+        crop_to_source,
+        frame_width,
+        frame_height,
+    )
+}
+
+fn pf90004_value_mean(frame: &Image, skin_mask: &[u8]) -> Result<f32> {
+    ensure!(
+        skin_mask.len() == frame.pixel_count(),
+        "PF90004 skin plane shape mismatch"
+    );
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for (pixel, &skin) in skin_mask.iter().enumerate() {
+        if skin == 0 {
+            continue;
+        }
+        let offset = pixel * 4;
+        let value = frame.pixels[offset]
+            .max(frame.pixels[offset + 1])
+            .max(frame.pixels[offset + 2]);
+        sum += u64::from(value);
+        count += 1;
+    }
+    ensure!(count != 0, "PF90004_PARSER_SKIN_EMPTY");
+    Ok(sum as f32 / count as f32)
 }
 
 fn required_face_roi(roi: Option<FaceParsingRoi>) -> Result<FaceParsingRoi> {

@@ -654,6 +654,8 @@ pub struct TeethProducerInputs {
 pub struct SmileProducerInputs {
     pub ticket: u64,
     pub material: Option<String>,
+    pub material_uv: Option<Vec<[f32; 2]>>,
+    pub material_sha256: Option<[u8; 32]>,
     pub roi: Option<(u32, u32, u32, u32)>,
     pub sigmoid_edge_response_3204548346: Option<SmileSigmoidEdgeResponse>,
     pub rgb_reconstruction_780929437: Option<SmileRgbReconstructionField>,

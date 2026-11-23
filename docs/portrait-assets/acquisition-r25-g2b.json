@@ -1,0 +1,142 @@
+{
+  "evidence_files": [
+    {
+      "size": 18217,
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\gpt2-p90002\\EVIDENCE.json",
+      "sha256": "0625a77bc75e1b610cc427994dadfccb7dd6e2e6ca2a10ea49e580569d863a59"
+    },
+    {
+      "size": 98272,
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\gpt1-p90010-assets\\EVIDENCE.json",
+      "sha256": "a30351882eea88186ac86b5bdef685f989206f600829424c861dc95d47d4ab27"
+    },
+    {
+      "size": 4709,
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\gpt1-p21026-oracle\\EVIDENCE.json",
+      "sha256": "936624981b93cca0633e43a5c9f1cbc0e709b0a89a154098dfdfbe9280b1ee38"
+    },
+    {
+      "size": 7431,
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\gpt4-p90088-contract\\EVIDENCE.json",
+      "sha256": "76645b4f102279d4d057d0ac9355a66f304e143d5ceec57355649ae357c07e02"
+    },
+    {
+      "size": 5922,
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\gpt4-p100007-roi\\EVIDENCE.json",
+      "sha256": "43da7e30201be3280b3a8f6e6c8ef5b0521f55618f27876f8dfedcae88726c63"
+    }
+  ],
+  "policy": "Only local attributable assets count; fixtures and consumer contracts are not vendor assets.",
+  "schema": "aurora/portrait-asset-acquisition/1",
+  "prerequisite_commit": "b187198",
+  "roots_checked": [
+    {
+      "path": "C:\\WorkSpace\\Aurora Studio\\model-output",
+      "exists": false
+    },
+    {
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\model-output",
+      "exists": false
+    },
+    {
+      "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\wp7-model-output-provider\\model-output",
+      "exists": false
+    },
+    {
+      "path": "C:\\Users\\Jxcz2\\Documents\\ChatGPT\\像素蛋糕解析\\model-output",
+      "exists": false
+    }
+  ],
+  "base_commit": "eececfd",
+  "targets": [
+    {
+      "pf": 90002,
+      "model_sha256": [],
+      "selector": null,
+      "model_sha_status": "UNPROVEN",
+      "status": "REFUSED_REAL_ASSET_UNPROVEN",
+      "required_roles": [
+        "skin_map",
+        "hardlight_lut",
+        "beauty_lut"
+      ],
+      "named_refusal": "MissingInput(\"PF90002_REAL_MODEL_ASSET\")",
+      "model_ids": []
+    },
+    {
+      "pf": 90010,
+      "model_sha256": [],
+      "selector": null,
+      "model_sha_status": "UNPROVEN",
+      "status": "REFUSED_REAL_ASSET_UNPROVEN",
+      "required_roles": [
+        "beauty_lut",
+        "body_skin_weight"
+      ],
+      "named_refusal": "MissingInput(\"PF90010_REAL_MODEL_ASSET\")",
+      "model_ids": []
+    },
+    {
+      "pf": 21026,
+      "model_sha256": [],
+      "selector": null,
+      "model_sha_status": "UNPROVEN",
+      "status": "REFUSED_REAL_ASSET_UNPROVEN",
+      "required_roles": [
+        "five_beard_model_outputs",
+        "mask_a",
+        "mask_b",
+        "repair_rgb"
+      ],
+      "named_refusal": "MissingInput(\"PF21026_REAL_MODEL_ASSETS\")",
+      "model_ids": [
+        "1655581403",
+        "3378116080",
+        "2127140479",
+        "4083080210",
+        "195031232"
+      ]
+    },
+    {
+      "named_refusal": "MissingInput(\"PF90088_REAL_MODEL_ASSET\")",
+      "model_sha_status": "UNPROVEN",
+      "model_sha256": [],
+      "native_receipt": {
+        "exists": true,
+        "path": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\s1005_pf90088_receipt\\evidence\\native-receipt.json",
+        "sha256": "58c156fda6982c83207e71d02db296f5146b169e9bb6af2158293f7810b1690b"
+      },
+      "status": "REFUSED_REAL_ASSET_UNPROVEN",
+      "model_ids": [
+        "1655581403"
+      ],
+      "pf": 90088,
+      "required_roles": [
+        "native_receipt",
+        "hairfly_v1",
+        "raw_stray_hair_mask",
+        "person_mask",
+        "background_mask"
+      ],
+      "selector": "1644271730"
+    },
+    {
+      "pf": 100007,
+      "model_sha256": [],
+      "selector": null,
+      "model_sha_status": "UNPROVEN",
+      "status": "REFUSED_REAL_ASSET_UNPROVEN",
+      "required_roles": [
+        "material_uv",
+        "lip_mask",
+        "mouth_mask",
+        "model_dx",
+        "model_dy"
+      ],
+      "named_refusal": "MissingInput(\"PF100007_MATERIAL_UV_LIP_MOUTH_MASK\")",
+      "model_ids": []
+    }
+  ],
+  "conclusion": "No real model/binary/UV asset was found. All targets remain unwired with named acquisition refusals.",
+  "task": "r25-G2b-assets"
+}

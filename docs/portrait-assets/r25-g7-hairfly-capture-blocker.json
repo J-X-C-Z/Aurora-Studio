@@ -1,0 +1,47 @@
+{
+  "agent": "G7",
+  "scope": "HairFly/PF21026 same-frame capture",
+  "status": "BLOCKED_NO_READ_ONLY_CAPTURE_CHANNEL",
+  "head": "6b76bd7",
+  "baseline": "eececfd",
+  "fixed_pe_sha256": "a84519da489bc52e4e914af7880ede43e3ce58992657723d02197161832464c7",
+  "pe_edges": {
+    "producer_rva": "0x823A3B0",
+    "output3_lookup_slot": "0x350",
+    "output4_lookup_slot": "0x4B0",
+    "consumer_rva": "0x82AA2E0",
+    "consumer_local_mat_offset": "0x4A8"
+  },
+  "capture_transport": {
+    "debugger_channel": "ABSENT",
+    "cdb": null,
+    "windbg": null,
+    "capture_performed": false
+  },
+  "missing_runtime_inputs": [
+    "module name and image base",
+    "producer post-prologue PC RVA",
+    "consumer local-Mat PC RVA",
+    "same-job job_id runtime location",
+    "HairFly draw-buffer runtime location",
+    "2405607714 data pointer and shape",
+    "PF21026 local Mat header and data pointer"
+  ],
+  "typed_path": {
+    "status": "FAIL_CLOSED",
+    "connected": false,
+    "hairfly_channel_defaulted": false,
+    "repair_output_defaulted": false,
+    "missing_raw_mask_refusal": "PF90088_RAW_MASK_POSTPROCESS_RECEIPT",
+    "output3_refusal": "PF21026_REPAIR_OUTPUT3_NATIVE_U8_CONSUMER"
+  },
+  "ingress_tool": "tools/hairfly_pf21026_capture.py",
+  "verification": {
+    "py_compile": "PASS",
+    "selftest": "PASS",
+    "git_diff_check": "PASS",
+    "cargo": "NOT_RUN",
+    "gpu": "NOT_RUN",
+    "c1_modified": false
+  }
+}

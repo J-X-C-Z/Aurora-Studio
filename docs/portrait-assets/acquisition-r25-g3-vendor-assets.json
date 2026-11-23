@@ -1,0 +1,367 @@
+{
+  "schema": "aurora/portrait-asset-acquisition/1",
+  "task": "r25-G3-vendor-assets",
+  "base_commit": "eececfd",
+  "prerequisite_commit": "8c10fd3",
+  "policy": "Only landed vendor payloads and measured tensor contracts count. Deterministic synthetic forwards, fixtures, and consumer contracts are not vendor same-job outputs.",
+  "summary": {
+    "landed_model_files": 8,
+    "landed_model_bytes": 41588323,
+    "resource_urls_found": 0,
+    "same_job_model_outputs_found": 0,
+    "g2_producers_newly_wired": 0,
+    "executable_pf": [],
+    "status": "MODELS_PARTIALLY_ACQUIRED__NO_SAME_JOB_OUTPUTS__NO_SAFE_G2_WIRING"
+  },
+  "decryption": {
+    "scope": "PF21026/PF90088 private FlatBuffer family",
+    "source_key_files": [
+      {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/keys/native_header_xor.key",
+        "bytes": 256,
+        "sha256": "ff21780d11f1b5b88ad298794e5e8b669edd5cbfbf4c535752c8b97d08fb151d"
+      },
+      {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/keys/native_body_xor.key",
+        "bytes": 256,
+        "sha256": "a47db4d510a796256b4b0f255a2b773ac66427801eae57a20f81c5b16dbac302"
+      }
+    ],
+    "steps": [
+      "XOR bytes [0,256) with native_header_xor.key.",
+      "XOR bytes [256, floor(length/4)*4) with native_body_xor.key at offset modulo 256.",
+      "Apply the final 1-3 byte XOR residue 78, 63 78, or 63 78 6a according to floor(length/4)*4.",
+      "Skip the 77-byte private wrapper and parse the FlatBuffer root/table graph."
+    ],
+    "verified_by": [
+      "private structure parse PASS 5/5",
+      "official MNN VerifyNetBuffer PASS 5/5",
+      "MNN CPU minimal forward runSession code 0 for 5/5"
+    ],
+    "not_equivalent_to": "installed vendor loader or same-job inference"
+  },
+  "vendor_models": [
+    {
+      "id": "1655581403",
+      "family": "HairFlyV1 selector candidate",
+      "file": "extract/pixcook/1655581403",
+      "bytes": 2410861,
+      "encrypted_magic_prefix_hex": "97e4bcac81223d437b63489e285842c9",
+      "sha256": "6a025f05c26aca02def0d81e2c443d0e3dc01e61f2af00a525aca6d4ca60d14d",
+      "private_fb_sha256": "4e34a40ccdd0223160e937876e1c7cd0a57911a024141f3304aa4a169afcf96e",
+      "inputs": [
+        {
+          "name": "1931349712",
+          "shape": [1, 3, 224, 448],
+          "dtype": "float32",
+          "format": "NC4HW4"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "1644271730",
+          "shape": [1, 2],
+          "dtype": "float32",
+          "role_status": "two-value logits; person/background semantics unproven"
+        }
+      ],
+      "derived_mnn": {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/candidates/1655581403/derived_candidate.mnn",
+        "bytes": 8849168,
+        "sha256": "d0e9fc5bac55e4c14c40faa8684138a3e7df3eb24c89bf73aaccdfef6ad3d730",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "3378116080",
+      "family": "HairFlyV1/PF21026 five-head 512x768",
+      "file": "extract/pixcook/3378116080",
+      "bytes": 7318717,
+      "encrypted_magic_prefix_hex": "2cd4feb138e655394ac50deba5b524b4",
+      "sha256": "7d3f2aec4c4f815d758892f7c5a8ad66fff336c5fe9272a05613e0e5aa52a68b",
+      "private_fb_sha256": "9bb50549c57e0c71068e6a036bc8091e7025455d624cb8a069190f8f47d45dd7",
+      "inputs": [
+        {
+          "name": "1931349712",
+          "shape": [1, 3, 512, 768],
+          "dtype": "float32",
+          "format": "NC4HW4"
+        },
+        {
+          "name": "1435772841",
+          "shape": [1, 1, 512, 768],
+          "dtype": "float32",
+          "format": "NC4HW4"
+        }
+      ],
+      "outputs": [
+        {"order": 0, "name": "158607435", "shape": [1, 1, 512, 768], "role": "mask_a"},
+        {"order": 1, "name": "2405607714", "shape": [1, 1, 512, 768], "role": "mask_b"},
+        {"order": 2, "name": "3434589800", "shape": [1, 3, 512, 768], "role": "masked_delta"},
+        {"order": 3, "name": "2977284499", "shape": [1, 3, 512, 768], "role": "graph repair candidate"},
+        {"order": 4, "name": "2892147817", "shape": [1, 3, 512, 768], "role": "coarse repair candidate"}
+      ],
+      "derived_mnn": {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/candidates/3378116080/derived_candidate.mnn",
+        "bytes": 28267268,
+        "sha256": "8fb49c3f87c45724451b358aa5f601fad612165ae635fcb8313b5517df8eb373",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "2127140479",
+      "family": "HairFlyV1/PF21026 five-head 512x768",
+      "file": "extract/pixcook/2127140479",
+      "bytes": 7318717,
+      "encrypted_magic_prefix_hex": "2cd4feb138e655394ac50deba5b524b4",
+      "sha256": "0e027141a594e4a20e01b3fc61cd02c9b1e57c3160488b294a9746dc659c12c6",
+      "private_fb_sha256": "484f501893cbd015f8eb4179264d41982304925df9930b2d647f747cf7f2ee57",
+      "inputs": [
+        {"name": "1931349712", "shape": [1, 3, 512, 768], "dtype": "float32", "format": "NC4HW4"},
+        {"name": "1435772841", "shape": [1, 1, 512, 768], "dtype": "float32", "format": "NC4HW4"}
+      ],
+      "outputs": [
+        {"order": 0, "name": "158607435", "shape": [1, 1, 512, 768], "role": "mask_a"},
+        {"order": 1, "name": "2405607714", "shape": [1, 1, 512, 768], "role": "mask_b"},
+        {"order": 2, "name": "3434589800", "shape": [1, 3, 512, 768], "role": "masked_delta"},
+        {"order": 3, "name": "2977284499", "shape": [1, 3, 512, 768], "role": "graph repair candidate"},
+        {"order": 4, "name": "2892147817", "shape": [1, 3, 512, 768], "role": "coarse repair candidate"}
+      ],
+      "derived_mnn": {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/candidates/2127140479/derived_candidate.mnn",
+        "bytes": 28267268,
+        "sha256": "d5e2e84fea1afa14f2623a99768679098389591ca03bd2a59917157324dc2c70",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "4083080210",
+      "family": "HairFlyV1/PF21026 five-head 384x512",
+      "file": "extract/pixcook/4083080210",
+      "bytes": 7208025,
+      "encrypted_magic_prefix_hex": "69d07a7855b38cfa6e003324a6883e7e",
+      "sha256": "8140003eed6e5606742be72b64ef04ad240a6252fc1ecef71bc556ff6ae668fd",
+      "private_fb_sha256": "d12a7482e25f265890353949bc8ae71ab0b42d635a8896d42d9bc3185519895b",
+      "inputs": [
+        {"name": "1931349712", "shape": [1, 3, 384, 512], "dtype": "float32", "format": "NC4HW4"},
+        {"name": "1435772841", "shape": [1, 1, 384, 512], "dtype": "float32", "format": "NC4HW4"}
+      ],
+      "outputs": [
+        {"order": 0, "name": "158607435", "shape": [1, 1, 384, 512], "role": "mask_a"},
+        {"order": 1, "name": "2405607714", "shape": [1, 1, 384, 512], "role": "mask_b"},
+        {"order": 2, "name": "3434589800", "shape": [1, 3, 384, 512], "role": "masked_delta"},
+        {"order": 3, "name": "2977284499", "shape": [1, 3, 384, 512], "role": "graph repair candidate"},
+        {"order": 4, "name": "2892147817", "shape": [1, 3, 384, 512], "role": "coarse repair candidate"}
+      ],
+      "derived_mnn": {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/candidates/4083080210/derived_candidate.mnn",
+        "bytes": 27824772,
+        "sha256": "b9c47bdbfefb09bfe3e695b4391a955af5b9af92b25c54da7a79ca05aee9b36b",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "195031232",
+      "family": "HairFlyV1/PF21026 five-head 384x512 deep",
+      "file": "extract/pixcook/195031232",
+      "bytes": 7224497,
+      "encrypted_magic_prefix_hex": "110143774de8c5fc31a7c0c03f6237fd",
+      "sha256": "054ad6613315b13688eeb7b159d8c86a0e54969cf3a9c8d15fd350396367f998",
+      "private_fb_sha256": "bfc7533a2b9cb837578a31a42a1e9ee3282166fd37ea27ac9d515b0dc540c29f",
+      "inputs": [
+        {"name": "1931349712", "shape": [1, 3, 384, 512], "dtype": "float32", "format": "NC4HW4"},
+        {"name": "1435772841", "shape": [1, 1, 384, 512], "dtype": "float32", "format": "NC4HW4"}
+      ],
+      "outputs": [
+        {"order": 0, "name": "158607435", "shape": [1, 1, 384, 512], "role": "mask_a"},
+        {"order": 1, "name": "2405607714", "shape": [1, 1, 384, 512], "role": "mask_b"},
+        {"order": 2, "name": "3434589800", "shape": [1, 3, 384, 512], "role": "masked_delta"},
+        {"order": 3, "name": "2977284499", "shape": [1, 3, 384, 512], "role": "graph repair candidate"},
+        {"order": 4, "name": "2892147817", "shape": [1, 3, 384, 512], "role": "coarse repair candidate"}
+      ],
+      "derived_mnn": {
+        "path": "90_work/lanes/portrait-parse/s885_hairfly_model_io/candidates/195031232/derived_candidate.mnn",
+        "bytes": 27879692,
+        "sha256": "175763190cc93fa83ece0da80d84dc53338de986a1325270765d486969b76296",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "806921480",
+      "family": "SmileV1 768x1024 stage 1/2",
+      "file": "extract/pixcook/806921480",
+      "bytes": 2662989,
+      "encrypted_magic_prefix_hex": "7170b3263b48607a1571046e56178d18",
+      "sha256": "87342bf07c1b32bb872277c2d048e3ced15f4416f800f4c1ee2b3e9cb54e7689",
+      "inputs": [
+        {"name": "781141184", "shape": [1, 3, 768, 1024], "dtype": "float32"},
+        {"name": "3595941170", "shape": [1, 1, 768, 1024], "dtype": "float32"},
+        {"name": "3321490283", "shape": [1, 1, 768, 1024], "dtype": "float32"}
+      ],
+      "outputs": [
+        {"name": "3204548346", "shape": [1, 1, 768, 1024], "role": "sigmoid edge response"},
+        {"name": "780929437", "shape": [1, 3, 768, 1024], "role": "RGB-like reconstruction"}
+      ],
+      "derived_mnn": {
+        "sha256": "0b474879c04dddcd4d26177f09580ff1ad5345f8b7a64cc36ee1524c35d47b45",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "1940369920",
+      "family": "SmileV1 768x1024 stage 1/2",
+      "file": "extract/pixcook/1940369920",
+      "bytes": 2662989,
+      "encrypted_magic_prefix_hex": "7170b3263b48607a1571046e56178d18",
+      "sha256": "ed8b7587d71f4c18d37a509829d20b4e9140cb77b4618ee8eb9ffad5fc0c0faf",
+      "inputs": [
+        {"name": "781141184", "shape": [1, 3, 768, 1024], "dtype": "float32"},
+        {"name": "3595941170", "shape": [1, 1, 768, 1024], "dtype": "float32"},
+        {"name": "3321490283", "shape": [1, 1, 768, 1024], "dtype": "float32"}
+      ],
+      "outputs": [
+        {"name": "3204548346", "shape": [1, 1, 768, 1024], "role": "sigmoid edge response"},
+        {"name": "780929437", "shape": [1, 3, 768, 1024], "role": "RGB-like reconstruction"}
+      ],
+      "derived_mnn": {
+        "sha256": "811afd84bc4266821848a65ce3940e533f29d666b0a56f8d2ea261c202bf06b2",
+        "verifier": "PASS"
+      }
+    },
+    {
+      "id": "3157078880",
+      "family": "SmileV1 512x512 residual/refine",
+      "file": "extract/pixcook/3157078880",
+      "bytes": 5024629,
+      "encrypted_magic_prefix_hex": "5a6f3749e71e21283fb8fa64b954d273",
+      "sha256": "eac03538db8e2c93e5db9b33157583064943a99a4afacdf393114d48f10c395a",
+      "inputs": [
+        {"name": "781141184", "shape": [1, 3, 512, 512], "dtype": "float32"}
+      ],
+      "outputs": [
+        {"name": "780929437", "shape": [1, 3, 512, 512], "role": "input plus residual"}
+      ],
+      "derived_mnn": {
+        "sha256": "d5ea7f78d631f6fa2c7949dcf60a895970e58fe349c595c84913335a578ec52c",
+        "verifier": "PASS"
+      }
+    }
+  ],
+  "targets": [
+    {
+      "pf": 90002,
+      "name": "moistureSmoothSkin",
+      "status": "NO_VENDOR_MODEL_OR_LUT_ACQUIRED",
+      "resource_urls": [],
+      "model_ids": [],
+      "files": [],
+      "expected_roles": {
+        "mask_rgba": "u8 full frame x4",
+        "blur_y": "u8 full frame",
+        "skin_map": "float32 64x64 at G2 contract",
+        "hardlight": "float32 1x256 at G2 contract",
+        "beauty": "float32 1x256 at G2 contract"
+      },
+      "contract_evidence_level": "AURORA_PRODUCER_ONLY_NOT_VENDOR_FORMAT",
+      "blocker": "No model id, resource binding, LUT bytes, or same-job output identifies the vendor D3/D5 planes.",
+      "g2_producer": {
+        "entry": "BoundModelOutputs::moisture_face_inputs",
+        "wired": false,
+        "refusal_preserved": "MissingInput(\"PF90002_REAL_MODEL_ASSET\")"
+      }
+    },
+    {
+      "pf": 90010,
+      "name": "moistureSmoothSkin_body",
+      "status": "NO_VENDOR_MODEL_OR_LUT_ACQUIRED",
+      "resource_urls": [],
+      "model_ids": [],
+      "files": [],
+      "known_sampler_bindings": [
+        "b_ hardlight: cell+0x330 / filter+0x98",
+        "bW beauty: cell+0x310 / filter+0x90"
+      ],
+      "expected_roles": {
+        "weight_skin": "float32 full frame",
+        "weight_dog": "float32 full frame",
+        "beauty": "float32 LUT values"
+      },
+      "contract_evidence_level": "AURORA_PRODUCER_ONLY_NOT_VENDOR_FORMAT",
+      "blocker": "No landed asset links to b_ or bW; 2059 opaque numbered bins remain identity-unbound.",
+      "g2_producer": {
+        "entry": "BoundModelOutputs::moisture_body_inputs",
+        "wired": false,
+        "refusal_preserved": "MissingInput(\"PF90010_REAL_MODEL_ASSET\")"
+      }
+    },
+    {
+      "pf": 21026,
+      "name": "removeStubble",
+      "status": "MODELS_ACQUIRED__SAME_JOB_OUTPUTS_AND_REPAIR_PORT_UNPROVEN",
+      "resource_urls": [],
+      "model_ids": ["1655581403", "3378116080", "2127140479", "4083080210", "195031232"],
+      "selected_model": null,
+      "required_roles": ["mask_a", "mask_b", "repair_rgb"],
+      "port_mapping": {
+        "mask_a": "158607435",
+        "mask_b": "2405607714",
+        "repair_conflict": ["2977284499", "2892147817"]
+      },
+      "blocker": "The 512/384 model-family selection is not captured, mask_b runtime channel count conflicts with the graph contract, and native repair consumes output 3 versus 4 unresolved.",
+      "g2_producer": {
+        "entry": "BoundModelOutputs::beard_inputs",
+        "wired": false,
+        "refusal_preserved": "MissingInput(\"PF21026_REAL_MODEL_ASSETS\")"
+      }
+    },
+    {
+      "pf": 90088,
+      "name": "removeStrayHair",
+      "status": "MODELS_ACQUIRED__SELECTOR_AND_SAME_JOB_PLANES_UNPROVEN",
+      "resource_urls": [],
+      "model_ids": ["1655581403", "3378116080", "2127140479", "4083080210", "195031232"],
+      "selector": {
+        "model_id": "1655581403",
+        "output": "1644271730",
+        "shape": [1, 2],
+        "semantics": "UNPROVEN"
+      },
+      "raw_mask_rule": "same-job min(158607435, 2405607714), then unproven feather/ROI/warp/u8 conversion",
+      "missing_native_values": ["person_area", "background_area"],
+      "blocker": "No selector rule, same-job raw mask, or native area receipt.",
+      "g2_producer": {
+        "entry": "BoundModelOutputs::stray_hair_inputs",
+        "wired": false,
+        "refusal_preserved": "MissingInput(\"PF90088_REAL_MODEL_ASSET\")"
+      }
+    },
+    {
+      "pf": 100007,
+      "name": "smileDegree_openMouth",
+      "status": "MODELS_ACQUIRED__OUTPUTS_ARE_NOT_DX_DY__UV_AND_MASKS_MISSING",
+      "resource_urls": [],
+      "model_ids": ["806921480", "1940369920", "3157078880"],
+      "selected_model": null,
+      "required_roles": ["material_uv", "lip_mask", "mouth_mask", "model_dx", "model_dy"],
+      "measured_output_semantics": {
+        "3204548346": "1x1x768x1024 float32 sigmoid response in [0,1]",
+        "780929437": "1x3x768x1024 RGB-like reconstruction",
+        "3157078880": "1x3x512x512 ADD(conv_branch, primary_input)"
+      },
+      "blocker": "No captured signed x/y displacement pair and no vendor material UV/lip/mouth masks.",
+      "g2_producer": {
+        "entry": "BoundModelOutputs::smile_inputs_with_assets",
+        "wired": false,
+        "refusal_preserved": "MissingInput(\"PF100007_MATERIAL_UV_LIP_MOUTH_MASK\")"
+      }
+    }
+  ],
+  "acquisition_result": {
+    "usable_without_inference": [],
+    "landed_weights_only": ["21026", "90088", "100007"],
+    "absent": ["90002", "90010"],
+    "synthetic_forward_rejected_as_same_job": true,
+    "fixture_or_sha_substitution": false
+  },
+  "conclusion": "Eight real private model payloads are now attributed, hashed, decoded and converted. They do not include the same-job output bytes, UV, masks, or selector receipts required by the G2 producer, so no PF is marked executable or newly wired."
+}

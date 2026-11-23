@@ -14,6 +14,11 @@ use aurora_portrait::kernels::plump_pipeline::SessionOutput;
 use aurora_portrait::model_sha256::sha256;
 use aurora_portrait::{Image, Refusal};
 
+use crate::hairfly_selector::{
+    model_for_selector, resolve_hairfly_producer, selector_argmax, HairFlyNativeFaceReceipt,
+    HairFlyProducerRefusal, HairFlyRegisteredModel, HairFlySelectorReceipt, SameJobFace,
+    SELECTOR_MODEL_HASH_ID, SELECTOR_OUTPUT_NAME,
+};
 use crate::portrait_stage::{
     BeardInputs, HairGlossInputs, HairSmoothInputs, MoistureBodyInputs, MoistureFaceInputs,
     Pf30025LiveModelOutputs, Pf30025ProducerInputs, Pf30025SourceSurface, Pf30026EdgeOutput,
@@ -33,14 +38,200 @@ pub const PF21026_MASK_2405607714: &str = "2405607714";
 pub const PF21026_MASK_3434589800: &str = "3434589800";
 pub const PF21026_MASK_2977284499: &str = "2977284499";
 pub const PF21026_MASK_2892147817: &str = "2892147817";
+pub const PF21026_REPAIR_WRITER_RVA: u32 = 0x823A3B0;
+pub const PF21026_REPAIR_OUTPUT3_LOOKUP_SLOT: u16 = 0x350;
+pub const PF21026_REPAIR_OUTPUT4_LOOKUP_SLOT: u16 = 0x4B0;
+pub const PF21026_REPAIR_CONSUMER_RVA: u32 = 0x82AA2E0;
+pub const PF21026_REPAIR_NATIVE_MAT_OFFSET: u16 = 0x4A8;
+
+static HAIRFLY_LARGE_MODEL_IDS: [u64; 4] =
+    [3_378_116_080, 2_127_140_479, 4_083_080_210, 195_031_232];
+static SMILE_STAGE_MODEL_IDS: [u64; 2] = [806_921_480, 1_940_369_920];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VendorModel {
+    pub id: u64,
+    pub family: &'static str,
+    pub source_file: &'static str,
+    pub source_bytes: u64,
+    pub source_sha256: &'static str,
+    pub private_fb_sha256: Option<&'static str>,
+    pub derived_mnn_sha256: Option<&'static str>,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// The eight payloads landed by G3. These hashes identify the encrypted source
+/// files; they are not substitutes for a render-job output receipt.
+pub const VENDOR_MODELS: [VendorModel; 8] = [
+    VendorModel {
+        id: 1_655_581_403,
+        family: "HairFlyV1 selector",
+        source_file: "extract/pixcook/1655581403",
+        source_bytes: 2_410_861,
+        source_sha256: "6a025f05c26aca02def0d81e2c443d0e3dc01e61f2af00a525aca6d4ca60d14d",
+        private_fb_sha256: Some(
+            "4e34a40ccdd0223160e937876e1c7cd0a57911a024141f3304aa4a169afcf96e",
+        ),
+        derived_mnn_sha256: Some(
+            "d0e9fc5bac55e4c14c40faa8684138a3e7df3eb24c89bf73aaccdfef6ad3d730",
+        ),
+        width: 448,
+        height: 224,
+    },
+    VendorModel {
+        id: 3_378_116_080,
+        family: "HairFlyV1/PF21026 five-head",
+        source_file: "extract/pixcook/3378116080",
+        source_bytes: 7_318_717,
+        source_sha256: "7d3f2aec4c4f815d758892f7c5a8ad66fff336c5fe9272a05613e0e5aa52a68b",
+        private_fb_sha256: Some(
+            "9bb50549c57e0c71068e6a036bc8091e7025455d624cb8a069190f8f47d45dd7",
+        ),
+        derived_mnn_sha256: Some(
+            "8fb49c3f87c45724451b358aa5f601fad612165ae635fcb8313b5517df8eb373",
+        ),
+        width: 768,
+        height: 512,
+    },
+    VendorModel {
+        id: 2_127_140_479,
+        family: "HairFlyV1/PF21026 five-head",
+        source_file: "extract/pixcook/2127140479",
+        source_bytes: 7_318_717,
+        source_sha256: "0e027141a594e4a20e01b3fc61cd02c9b1e57c3160488b294a9746dc659c12c6",
+        private_fb_sha256: Some(
+            "484f501893cbd015f8eb4179264d41982304925df9930b2d647f747cf7f2ee57",
+        ),
+        derived_mnn_sha256: Some(
+            "d5e2e84fea1afa14f2623a99768679098389591ca03bd2a59917157324dc2c70",
+        ),
+        width: 768,
+        height: 512,
+    },
+    VendorModel {
+        id: 4_083_080_210,
+        family: "HairFlyV1/PF21026 five-head",
+        source_file: "extract/pixcook/4083080210",
+        source_bytes: 7_208_025,
+        source_sha256: "8140003eed6e5606742be72b64ef04ad240a6252fc1ecef71bc556ff6ae668fd",
+        private_fb_sha256: Some(
+            "d12a7482e25f265890353949bc8ae71ab0b42d635a8896d42d9bc3185519895b",
+        ),
+        derived_mnn_sha256: Some(
+            "b9c47bdbfefb09bfe3e695b4391a955af5b9af92b25c54da7a79ca05aee9b36b",
+        ),
+        width: 512,
+        height: 384,
+    },
+    VendorModel {
+        id: 195_031_232,
+        family: "HairFlyV1/PF21026 five-head deep",
+        source_file: "extract/pixcook/195031232",
+        source_bytes: 7_224_497,
+        source_sha256: "054ad6613315b13688eeb7b159d8c86a0e54969cf3a9c8d15fd350396367f998",
+        private_fb_sha256: Some(
+            "bfc7533a2b9cb837578a31a42a1e9ee3282166fd37ea27ac9d515b0dc540c29f",
+        ),
+        derived_mnn_sha256: Some(
+            "175763190cc93fa83ece0da80d84dc53338de986a1325270765d486969b76296",
+        ),
+        width: 512,
+        height: 384,
+    },
+    VendorModel {
+        id: 806_921_480,
+        family: "SmileV1 768x1024 stage 1/2",
+        source_file: "extract/pixcook/806921480",
+        source_bytes: 2_662_989,
+        source_sha256: "87342bf07c1b32bb872277c2d048e3ced15f4416f800f4c1ee2b3e9cb54e7689",
+        private_fb_sha256: None,
+        derived_mnn_sha256: Some(
+            "0b474879c04dddcd4d26177f09580ff1ad5345f8b7a64cc36ee1524c35d47b45",
+        ),
+        width: 1024,
+        height: 768,
+    },
+    VendorModel {
+        id: 1_940_369_920,
+        family: "SmileV1 768x1024 stage 1/2",
+        source_file: "extract/pixcook/1940369920",
+        source_bytes: 2_662_989,
+        source_sha256: "ed8b7587d71f4c18d37a509829d20b4e9140cb77b4618ee8eb9ffad5fc0c0faf",
+        private_fb_sha256: None,
+        derived_mnn_sha256: Some(
+            "811afd84bc4266821848a65ce3940e533f29d666b0a56f8d2ea261c202bf06b2",
+        ),
+        width: 1024,
+        height: 768,
+    },
+    VendorModel {
+        id: 3_157_078_880,
+        family: "SmileV1 512x512 residual/refine",
+        source_file: "extract/pixcook/3157078880",
+        source_bytes: 5_024_629,
+        source_sha256: "eac03538db8e2c93e5db9b33157583064943a99a4afacdf393114d48f10c395a",
+        private_fb_sha256: None,
+        derived_mnn_sha256: Some(
+            "d5ea7f78d631f6fa2c7949dcf60a895970e58fe349c595c84913335a578ec52c",
+        ),
+        width: 512,
+        height: 512,
+    },
+];
+
+pub fn vendor_model(id: u64) -> Option<&'static VendorModel> {
+    VENDOR_MODELS.iter().find(|model| model.id == id)
+}
 
 pub const PF30026_EFFECT_RGB: &str = "PF30026_EFFECT_RGB";
 pub const PF30026_TEETH_MASK: &str = "PF30026_TEETH_MASK";
 pub const PF30026_EDGE_0: &str = "PF30026_EDGE_0";
 pub const PF30026_EDGE_1: &str = "PF30026_EDGE_1";
 
-pub const PF90088_HAIRFLY_PORT: &str = "PF90088_HAIRFLY_PORT";
-pub const PF90088_RAW_MASK: &str = "PF90088_RAW_STRAY_HAIR_MASK";
+pub const PF90088_SELECTOR: &str = "1644271730";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HairFlyMaskChannel {
+    Ch0,
+    Ch1,
+    Ch2,
+}
+
+impl HairFlyMaskChannel {
+    fn index(self) -> usize {
+        match self {
+            Self::Ch0 => 0,
+            Self::Ch1 => 1,
+            Self::Ch2 => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HairFlyMaskPostprocess {
+    NativeBorderFeatherMinRoiWarpU8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HairFlyRoiWarpDrawBuffer {
+    pub model_roi: [u32; 4],
+    pub frame_roi: [u32; 4],
+    pub warp: [[f32; 3]; 2],
+    pub vertex_count: u32,
+    pub vertex_buffer_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HairFlyMaskDecodeReceipt {
+    pub same_job: SameJobFace,
+    pub model_hash_id: u32,
+    pub channel: HairFlyMaskChannel,
+    pub postprocess: HairFlyMaskPostprocess,
+    pub mask_b_plane_sha256: [u8; 32],
+    pub raw_mask_sha256: [u8; 32],
+    pub draw_buffer: HairFlyRoiWarpDrawBuffer,
+}
 
 pub const PF90139_HAIR_MASK: &str = "PF90139_HAIR_MASK";
 pub const PF90139_MIX_MASK: &str = "PF90139_MIX_MASK";
@@ -116,39 +307,46 @@ impl PortraitModelTarget {
             ],
             Self::Pf21026 => vec![
                 TensorRequirement::new(
+                    PF90088_SELECTOR,
+                    "1644271730",
+                    ExactShape([1, 1, 1, 2]),
+                    Exact(SELECTOR_MODEL_HASH_ID as u64),
+                    1,
+                ),
+                TensorRequirement::new(
                     PF21026_MASK_158607435,
                     PF21026_MASK_158607435,
                     NonEmpty,
-                    Exact(3_378_116_080),
-                    0,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    2,
                 ),
                 TensorRequirement::new(
                     PF21026_MASK_2405607714,
                     PF21026_MASK_2405607714,
                     NonEmpty,
-                    Exact(3_378_116_080),
-                    0,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    2,
                 ),
                 TensorRequirement::new(
                     PF21026_MASK_3434589800,
                     PF21026_MASK_3434589800,
                     NonEmpty,
-                    Exact(3_378_116_080),
-                    0,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    2,
                 ),
                 TensorRequirement::new(
                     PF21026_MASK_2977284499,
                     PF21026_MASK_2977284499,
                     NonEmpty,
-                    Exact(3_378_116_080),
-                    0,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    2,
                 ),
                 TensorRequirement::new(
                     PF21026_MASK_2892147817,
                     PF21026_MASK_2892147817,
                     NonEmpty,
-                    Exact(3_378_116_080),
-                    0,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    2,
                 ),
             ],
             Self::Pf30025 => vec![
@@ -233,24 +431,47 @@ impl PortraitModelTarget {
             ],
             Self::Pf90088 => vec![
                 TensorRequirement::new(
-                    PF90088_HAIRFLY_PORT,
-                    "PF90088_HAIRFLY_PORT",
-                    NonEmpty,
-                    NonZero,
-                    0,
+                    PF90088_SELECTOR,
+                    "1644271730",
+                    ExactShape([1, 1, 1, 2]),
+                    Exact(SELECTOR_MODEL_HASH_ID as u64),
+                    3,
                 ),
                 TensorRequirement::new(
-                    PF90088_RAW_MASK,
-                    "PF90088_RAW_STRAY_HAIR_MASK",
+                    PF21026_MASK_158607435,
+                    PF21026_MASK_158607435,
                     NonEmpty,
-                    NonZero,
-                    0,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    4,
                 ),
-                TensorRequirement::new("158607435", "158607435", NonEmpty, NonZero, 0),
-                TensorRequirement::new("2405607714", "2405607714", NonEmpty, NonZero, 0),
-                TensorRequirement::new("3434589800", "3434589800", NonEmpty, NonZero, 0),
-                TensorRequirement::new("2977284499", "2977284499", NonEmpty, NonZero, 0),
-                TensorRequirement::new("2892147817", "2892147817", NonEmpty, NonZero, 0),
+                TensorRequirement::new(
+                    PF21026_MASK_2405607714,
+                    PF21026_MASK_2405607714,
+                    NonEmpty,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    4,
+                ),
+                TensorRequirement::new(
+                    PF21026_MASK_3434589800,
+                    PF21026_MASK_3434589800,
+                    NonEmpty,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    4,
+                ),
+                TensorRequirement::new(
+                    PF21026_MASK_2977284499,
+                    PF21026_MASK_2977284499,
+                    NonEmpty,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    4,
+                ),
+                TensorRequirement::new(
+                    PF21026_MASK_2892147817,
+                    PF21026_MASK_2892147817,
+                    NonEmpty,
+                    AnyOf(&HAIRFLY_LARGE_MODEL_IDS),
+                    4,
+                ),
             ],
             Self::Pf90139Pf90160 => vec![
                 TensorRequirement::new(
@@ -323,14 +544,14 @@ impl PortraitModelTarget {
                     "780929437",
                     "780929437",
                     ExactShape([1, 3, 768, 1024]),
-                    NonZero,
+                    AnyOf(&SMILE_STAGE_MODEL_IDS),
                     0,
                 ),
                 TensorRequirement::new(
                     "3204548346",
                     "3204548346",
                     ExactShape([1, 1, 768, 1024]),
-                    NonZero,
+                    AnyOf(&SMILE_STAGE_MODEL_IDS),
                     0,
                 ),
             ],
@@ -699,19 +920,134 @@ impl<'a> BoundModelOutputs<'a> {
         })
     }
 
-    pub fn beard<'b>(
-        &'b self,
-        mask_a: &'static str,
-        mask_b: &'static str,
-        repair_rgb: &'b Image,
-    ) -> Result<BeardInputs<'b>, Refusal> {
+    fn hairfly_model(&self, aux_gate_high: bool) -> Result<HairFlyRegisteredModel, Refusal> {
+        let selector = self.required(PF90088_SELECTOR, "PF90088_SELECTOR")?;
+        let logits = selector.values()?;
+        if logits.len() != 2 {
+            return Err(Refusal::ShapeMismatch("PF90088 selector logits"));
+        }
+        let argmax = selector_argmax([logits[0], logits[1]]).map_err(hairfly_refusal)?;
+        model_for_selector(argmax, aux_gate_high)
+            .ok_or(Refusal::ValueOutOfRange("PF90088_SELECTOR_ROUTE"))
+    }
+
+    fn hairfly_tensor(
+        &self,
+        name: &'static str,
+        route: HairFlyRegisteredModel,
+        route_error: &'static str,
+    ) -> Result<&'a SessionTensor, Refusal> {
+        let tensor = self.required(name, name)?;
+        if tensor.model_id != u64::from(route.hash_id) {
+            return Err(Refusal::ValueOutOfRange(route_error));
+        }
+        if tensor.shape[0] != 1
+            || tensor.shape[2] != u32::from(route.height)
+            || tensor.shape[3] != u32::from(route.width)
+        {
+            return Err(Refusal::ShapeMismatch(name));
+        }
+        Ok(tensor)
+    }
+
+    /// Bind PF21026 only after the host has decoded the raw tensors. `mask_b`
+    /// is channel-major `[3, H, W]`; its consumer plane must be named
+    /// explicitly. The repair port is explicit because output 3 is the graph
+    /// repair while only output 4 has a located native u8 conversion.
+    pub fn beard<'b>(&'b self, repair: BeardRepairBinding<'b>) -> Result<BeardInputs<'b>, Refusal> {
         if self.target != PortraitModelTarget::Pf21026 {
             return Err(Refusal::ValueOutOfRange("PF21026 target"));
         }
+        repair
+            .frame
+            .validate_against(self.job_id, self.source_digest)?;
+        repair.repair_rgb.validate()?;
+        if (repair.frame.width, repair.frame.height)
+            != (repair.repair_rgb.width, repair.repair_rgb.height)
+        {
+            return Err(Refusal::ShapeMismatch("PF21026 repair frame"));
+        }
+        let route = self.hairfly_model(repair.aux_gate_high)?;
+        let mask_a_tensor = self.hairfly_tensor(
+            PF21026_MASK_158607435,
+            route,
+            "PF21026_MODEL_ROUTE",
+        )?;
+        let mask_b_tensor = self.hairfly_tensor(
+            PF21026_MASK_2405607714,
+            route,
+            "PF21026_MODEL_ROUTE",
+        )?;
+        let repair_tensor =
+            self.hairfly_tensor(repair.repair_output.tensor_name(), route, "PF21026_MODEL_ROUTE")?;
+        let consumer = repair
+            .consumer
+            .ok_or(Refusal::MissingInput("PF21026_REPAIR_NATIVE_MAT_CONSUMER"))?;
+        if consumer.job_id != self.job_id {
+            return Err(Refusal::ValueOutOfRange("PF21026_REPAIR_CONSUMER_JOB"));
+        }
+        if consumer.output != repair.repair_output {
+            return Err(Refusal::ValueOutOfRange("PF21026_REPAIR_CONSUMER_OUTPUT"));
+        }
+        if consumer.producer_rva != PF21026_REPAIR_WRITER_RVA {
+            return Err(Refusal::ValueOutOfRange("PF21026_REPAIR_WRITER_RECEIPT"));
+        }
+        if consumer.consumer_rva != PF21026_REPAIR_CONSUMER_RVA
+            || consumer.native_mat_offset != PF21026_REPAIR_NATIVE_MAT_OFFSET
+        {
+            return Err(Refusal::MissingInput("PF21026_REPAIR_NATIVE_MAT_EDGE"));
+        }
+        let lookup_slot = match consumer.output {
+            BeardRepairOutput::Output3 => PF21026_REPAIR_OUTPUT3_LOOKUP_SLOT,
+            BeardRepairOutput::Output4 => PF21026_REPAIR_OUTPUT4_LOOKUP_SLOT,
+        };
+        if consumer.producer_lookup_slot != lookup_slot {
+            return Err(Refusal::ValueOutOfRange(
+                "PF21026_REPAIR_LOOKUP_SLOT_RECEIPT",
+            ));
+        }
+        if consumer.output == BeardRepairOutput::Output3 {
+            return Err(Refusal::MissingInput(
+                "PF21026_REPAIR_OUTPUT3_NATIVE_U8_CONSUMER",
+            ));
+        }
+        if mask_a_tensor.shape[1] != 1 {
+            return Err(Refusal::MissingInput("PF21026_MASK_A_CHANNEL_DECODE"));
+        }
+        if mask_b_tensor.shape[1] != 3 {
+            return Err(Refusal::MissingInput("PF21026_MASK_B_CHANNEL_DECODE"));
+        }
+        if repair_tensor.shape[1] != 3 {
+            return Err(Refusal::ShapeMismatch("PF21026 repair RGB"));
+        }
+        if mask_a_tensor.digest != repair.mask_a_source_sha256
+            || mask_b_tensor.digest != repair.mask_b_source_sha256
+            || repair_tensor.digest != repair.repair_source_sha256
+        {
+            return Err(Refusal::ValueOutOfRange("PF21026_DECODE_RECEIPT"));
+        }
+        let pixels = (repair.repair_rgb.width as usize)
+            .checked_mul(repair.repair_rgb.height as usize)
+            .ok_or(Refusal::ShapeMismatch("PF21026 repair RGB"))?;
+        let mask_b_bytes = pixels
+            .checked_mul(3)
+            .ok_or(Refusal::ShapeMismatch("PF21026 mask_b planes"))?;
+        if repair.mask_a.len() != pixels || repair.mask_b.len() != mask_b_bytes {
+            return Err(Refusal::ShapeMismatch("PF21026 masks/repair frame"));
+        }
+        if sha256(repair.mask_b) != repair.mask_b_decoded_sha256 {
+            return Err(Refusal::ValueOutOfRange("PF21026_MASK_B_DECODE_RECEIPT"));
+        }
+        if sha256(&repair.repair_rgb.pixels) != consumer.native_mat_sha256 {
+            return Err(Refusal::ValueOutOfRange(
+                "PF21026_REPAIR_NATIVE_MAT_RECEIPT",
+            ));
+        }
+        let mask_b_start = repair.mask_b_channel.index() * pixels;
         Ok(BeardInputs {
-            mask_a: self.required(mask_a, "PF21026_MASK_A")?.bytes(),
-            mask_b: self.required(mask_b, "PF21026_MASK_B")?.bytes(),
-            repair_rgb,
+            mask_a: repair.mask_a,
+            mask_b: &repair.mask_b[mask_b_start..mask_b_start + pixels],
+            repair_rgb: repair.repair_rgb,
         })
     }
 
@@ -836,33 +1172,108 @@ impl<'a> BoundModelOutputs<'a> {
 
     pub fn stray_hair_inputs(
         &self,
-        width: u32,
-        height: u32,
-        hairfly_port: &'static str,
-        companion_masks: StrayHairCompanions<'_>,
-        native: StrayHairNative,
+        binding: StrayHairModelBinding<'_>,
     ) -> Result<StrayHairProducerInputs, Refusal> {
         if self.target != PortraitModelTarget::Pf90088 {
             return Err(Refusal::ValueOutOfRange("PF90088 target"));
         }
-        let hairfly = self.required(hairfly_port, "PF90088_HAIRFLY_PORT")?;
-        let raw = self.required(PF90088_RAW_MASK, "PF90088_RAW_STRAY_HAIR_MASK")?;
-        if hairfly.bytes().len() != (width as usize) * (height as usize) * 4 {
-            return Err(Refusal::ShapeMismatch("PF90088 hairfly"));
+        binding
+            .frame
+            .validate_against(self.job_id, self.source_digest)?;
+        binding
+            .hairfly_v1
+            .validate()
+            .map_err(|_| Refusal::ShapeMismatch("PF90088 hairfly"))?;
+        if (binding.frame.width, binding.frame.height)
+            != (binding.hairfly_v1.width, binding.hairfly_v1.height)
+        {
+            return Err(Refusal::ShapeMismatch("PF90088 hairfly frame"));
         }
-        let hairfly_v1 = Image::new(width, height, hairfly.bytes().to_vec())
-            .ok_or(Refusal::ShapeMismatch("PF90088 hairfly"))?;
-        if raw.bytes().len() != (width as usize) * (height as usize) {
+        let selector = self.required(PF90088_SELECTOR, "PF90088_SELECTOR")?;
+        let logits = selector.values()?;
+        if logits.len() != 2 {
+            return Err(Refusal::ShapeMismatch("PF90088 selector logits"));
+        }
+        let selector_receipt = HairFlySelectorReceipt {
+            same_job: SameJobFace {
+                job_id: self.job_id,
+                face_index: binding.face_index,
+            },
+            model_hash_id: selector.model_id as u32,
+            output_name: SELECTOR_OUTPUT_NAME,
+            logits: [logits[0], logits[1]],
+            aux_gate_high: binding.aux_gate_high,
+        };
+        let native_receipt = HairFlyNativeFaceReceipt {
+            same_job: selector_receipt.same_job,
+            pf90088: binding.pf90088,
+            pf90113: binding.pf90113,
+            pf90114: binding.pf90114,
+        };
+        let route = resolve_hairfly_producer(&selector_receipt, &native_receipt)
+            .map_err(hairfly_refusal)?;
+        let port =
+            self.hairfly_tensor(binding.port_output.tensor_name(), route.model, "PF90088_MODEL_ROUTE")?;
+        if port.shape[1] != 3 || port.digest != binding.port_source_sha256 {
+            return Err(Refusal::ValueOutOfRange("PF90088_PORT_DECODE_RECEIPT"));
+        }
+        let mask_a =
+            self.hairfly_tensor(PF21026_MASK_158607435, route.model, "PF90088_MODEL_ROUTE")?;
+        let mask_b =
+            self.hairfly_tensor(PF21026_MASK_2405607714, route.model, "PF90088_MODEL_ROUTE")?;
+        let mask_decode = binding
+            .mask_decode
+            .ok_or(Refusal::MissingInput("PF90088_RAW_MASK_CHANNEL_RECEIPT"))?;
+        mask_decode.validate(
+            self.job_id,
+            binding.face_index,
+            route.model,
+            binding.frame.width,
+            binding.frame.height,
+        )?;
+        if mask_a.shape[1] != 1 || mask_b.shape[1] != 3 {
+            return Err(Refusal::MissingInput("PF90088_RAW_MASK_CHANNEL_DECODE"));
+        }
+        if hairfly_mask_plane_sha256(mask_b, mask_decode.channel)?
+            != mask_decode.mask_b_plane_sha256
+        {
+            return Err(Refusal::ValueOutOfRange(
+                "PF90088_RAW_MASK_CHANNEL_RECEIPT",
+            ));
+        }
+        if sha256(binding.raw_mask) != mask_decode.raw_mask_sha256 {
+            return Err(Refusal::ValueOutOfRange(
+                "PF90088_RAW_MASK_POSTPROCESS_RECEIPT",
+            ));
+        }
+        let mut mask_pair = Vec::with_capacity(64);
+        mask_pair.extend_from_slice(&mask_a.digest);
+        mask_pair.extend_from_slice(&mask_b.digest);
+        if sha256(&mask_pair) != binding.raw_mask_source_sha256 {
+            return Err(Refusal::ValueOutOfRange("PF90088_RAW_MASK_DECODE_RECEIPT"));
+        }
+        let pixels = (binding.frame.width as usize)
+            .checked_mul(binding.frame.height as usize)
+            .ok_or(Refusal::ShapeMismatch("PF90088 raw mask"))?;
+        if binding.raw_mask.len() != pixels {
             return Err(Refusal::ShapeMismatch("PF90088 raw mask"));
         }
+        for (mask, role) in [
+            (binding.person_mask, "PF90088_PERSON_MASK"),
+            (binding.background_mask, "PF90088_BACKGROUND_MASK"),
+        ] {
+            if matches!(mask, Some(mask) if mask.len() != pixels) {
+                return Err(Refusal::ShapeMismatch(role));
+            }
+        }
         Ok(StrayHairProducerInputs {
-            hairfly_v1: Some(hairfly_v1),
-            raw_mask: Some(raw.bytes().to_vec()),
-            person_mask: companion_masks.person_mask.map(ToOwned::to_owned),
-            background_mask: companion_masks.background_mask.map(ToOwned::to_owned),
-            native_degree: Some(native.degree),
-            native_person_area: Some(native.person_area),
-            native_background_area: Some(native.background_area),
+            hairfly_v1: Some(binding.hairfly_v1.clone()),
+            raw_mask: Some(binding.raw_mask.to_vec()),
+            person_mask: binding.person_mask.map(ToOwned::to_owned),
+            background_mask: binding.background_mask.map(ToOwned::to_owned),
+            native_degree: Some(route.native_index3.degree),
+            native_person_area: Some(binding.pf90113),
+            native_background_area: Some(binding.pf90114),
         })
     }
 
@@ -929,19 +1340,41 @@ impl<'a> BoundModelOutputs<'a> {
         if self.target != PortraitModelTarget::Pf90002Pf90010 {
             return Err(Refusal::ValueOutOfRange("PF90002 target"));
         }
+        binding
+            .frame
+            .validate_against(self.job_id, self.source_digest)?;
+        let pixels = binding
+            .width
+            .checked_mul(binding.height)
+            .map(|value| value as usize)
+            .ok_or(Refusal::ShapeMismatch("PF90002 frame"))?;
+        let mask_rgba = self
+            .required(PF90002_MASK_RGBA, "PF90002_MASK_RGBA")?
+            .bytes();
+        let blur_y = self.required(PF90002_BLUR_Y, "PF90002_BLUR_Y")?.bytes();
+        if mask_rgba.len() != pixels.saturating_mul(4) || blur_y.len() != pixels {
+            return Err(Refusal::ShapeMismatch("PF90002 frame planes"));
+        }
+        let skin_pixels = (binding.skin_map_width as usize)
+            .checked_mul(binding.skin_map_height as usize)
+            .ok_or(Refusal::ShapeMismatch("PF90002 skin map"))?;
+        let skin_map = self.values(PF90002_SKIN_MAP, "PF90002_SKIN_MAP")?;
+        let hardlight = self.values(PF90002_HARDLIGHT, "PF90002_HARDLIGHT")?;
+        let beauty = self.values(PF90002_BEAUTY, "PF90002_BEAUTY")?;
+        if skin_map.len() != skin_pixels || hardlight.is_empty() || beauty.is_empty() {
+            return Err(Refusal::ShapeMismatch("PF90002 model planes"));
+        }
         Ok(MoistureFaceInputs {
             width: binding.width,
             height: binding.height,
-            mask_rgba: self
-                .required(PF90002_MASK_RGBA, "PF90002_MASK_RGBA")?
-                .bytes(),
-            blur_y: self.required(PF90002_BLUR_Y, "PF90002_BLUR_Y")?.bytes(),
+            mask_rgba,
+            blur_y,
             channel: binding.channel,
             skin_map_width: binding.skin_map_width,
             skin_map_height: binding.skin_map_height,
-            skin_map: self.values(PF90002_SKIN_MAP, "PF90002_SKIN_MAP")?,
-            hardlight: self.values(PF90002_HARDLIGHT, "PF90002_HARDLIGHT")?,
-            beauty: self.values(PF90002_BEAUTY, "PF90002_BEAUTY")?,
+            skin_map,
+            hardlight,
+            beauty,
             pivot: binding.pivot,
             gain: binding.gain,
         })
@@ -954,12 +1387,26 @@ impl<'a> BoundModelOutputs<'a> {
         if self.target != PortraitModelTarget::Pf90002Pf90010 {
             return Err(Refusal::ValueOutOfRange("PF90010 target"));
         }
+        binding
+            .frame
+            .validate_against(self.job_id, self.source_digest)?;
+        let pixels = binding
+            .width
+            .checked_mul(binding.height)
+            .map(|value| value as usize)
+            .ok_or(Refusal::ShapeMismatch("PF90010 frame"))?;
+        let weight_skin = self.values(PF90010_WEIGHT_SKIN, "PF90010_WEIGHT_SKIN")?;
+        let weight_dog = self.values(PF90010_WEIGHT_DOG, "PF90010_WEIGHT_DOG")?;
+        let beauty = self.values(PF90010_BEAUTY, "PF90010_BEAUTY")?;
+        if weight_skin.len() != pixels || weight_dog.len() != pixels || beauty.is_empty() {
+            return Err(Refusal::ShapeMismatch("PF90010 model planes"));
+        }
         Ok(MoistureBodyInputs {
             width: binding.width,
             height: binding.height,
-            weight_skin: self.values(PF90010_WEIGHT_SKIN, "PF90010_WEIGHT_SKIN")?,
-            weight_dog: self.values(PF90010_WEIGHT_DOG, "PF90010_WEIGHT_DOG")?,
-            beauty: self.values(PF90010_BEAUTY, "PF90010_BEAUTY")?,
+            weight_skin,
+            weight_dog,
+            beauty,
             degree: binding.degree,
             roi: binding.roi,
         })
@@ -995,6 +1442,79 @@ impl<'a> BoundModelOutputs<'a> {
             ..SmileProducerInputs::default()
         })
     }
+
+    pub fn smile_inputs_with_assets(
+        &self,
+        assets: SmileAssetBinding<'_>,
+    ) -> Result<SmileProducerInputs, Refusal> {
+        if self.target != PortraitModelTarget::Pf100007 {
+            return Err(Refusal::ValueOutOfRange("PF100007 target"));
+        }
+        assets
+            .frame
+            .validate_against(self.job_id, self.source_digest)?;
+        if assets.material.is_empty() {
+            return Err(Refusal::MissingInput("PF100007_MATERIAL"));
+        }
+        if assets.material_sha256 == [0; 32] {
+            return Err(Refusal::MissingInput("PF100007_MATERIAL_SHA256"));
+        }
+        let material_uv = assets
+            .material_uv
+            .ok_or(Refusal::MissingInput("PF100007_MATERIAL_UV_SOURCE"))?;
+        let pixels = (assets.frame.width as usize)
+            .checked_mul(assets.frame.height as usize)
+            .ok_or(Refusal::ShapeMismatch("PF100007 asset frame"))?;
+        if assets.lip_mask.is_empty() || assets.mouth_mask.is_empty() {
+            return Err(Refusal::MissingInput(if assets.lip_mask.is_empty() {
+                "PF100007_LIP_MASK_SOURCE"
+            } else {
+                "PF100007_MOUTH_MASK_SOURCE"
+            }));
+        }
+        if assets.lip_mask.len() != pixels || assets.mouth_mask.len() != pixels {
+            return Err(Refusal::ShapeMismatch("PF100007 masks/assets"));
+        }
+        if material_uv.len() != pixels
+            || material_uv
+                .iter()
+                .flat_map(|point| point.iter())
+                .any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ShapeMismatch("PF100007 material_uv"));
+        }
+        let (roi_x, roi_y, roi_width, roi_height) = assets.roi;
+        if assets.roi.0 > assets.frame.width
+            || roi_y > assets.frame.height
+            || roi_width > assets.frame.width - roi_x
+            || roi_height > assets.frame.height - roi_y
+        {
+            return Err(Refusal::ValueOutOfRange("PF100007 roi"));
+        }
+        let host_split = assets
+            .host_split_spec
+            .ok_or(Refusal::MissingInput("PF100007_DX_DY_HOST_SPLIT"))?;
+        if (
+            host_split.frame_roi.x,
+            host_split.frame_roi.y,
+            host_split.frame_roi.width,
+            host_split.frame_roi.height,
+        ) != assets.roi
+        {
+            return Err(Refusal::ValueOutOfRange("PF100007_ROI_SPLIT_MISMATCH"));
+        }
+        let mut smile = self.smile_inputs()?;
+        smile.material = Some(assets.material.to_owned());
+        smile.material_uv = Some(material_uv.to_owned());
+        smile.material_sha256 = Some(assets.material_sha256);
+        smile.lip_mask = Some(assets.lip_mask.to_vec());
+        smile.mouth_mask = Some(assets.mouth_mask.to_vec());
+        smile.roi = Some(assets.roi);
+        smile.host_split_spec = Some(host_split);
+        let channel_split = smile.decode_channel_split(assets.frame.width, assets.frame.height)?;
+        smile.channel_split = Some(channel_split);
+        Ok(smile)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1010,17 +1530,39 @@ pub struct TeethMaskBinding<'a> {
     pub deyellow_ui: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StrayHairCompanions<'a> {
-    pub person_mask: Option<&'a [u8]>,
-    pub background_mask: Option<&'a [u8]>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrayHairPortOutput {
+    MaskedDelta,
+    Repair,
+    CoarseRepair,
+}
+
+impl StrayHairPortOutput {
+    fn tensor_name(self) -> &'static str {
+        match self {
+            Self::MaskedDelta => PF21026_MASK_3434589800,
+            Self::Repair => PF21026_MASK_2977284499,
+            Self::CoarseRepair => PF21026_MASK_2892147817,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct StrayHairNative {
-    pub degree: f32,
-    pub person_area: f32,
-    pub background_area: f32,
+pub struct StrayHairModelBinding<'a> {
+    pub frame: SameFrame,
+    pub face_index: u32,
+    pub aux_gate_high: bool,
+    pub pf90088: f32,
+    pub pf90113: f32,
+    pub pf90114: f32,
+    pub port_output: StrayHairPortOutput,
+    pub hairfly_v1: &'a Image,
+    pub raw_mask: &'a [u8],
+    pub port_source_sha256: [u8; 32],
+    pub raw_mask_source_sha256: [u8; 32],
+    pub mask_decode: Option<HairFlyMaskDecodeReceipt>,
+    pub person_mask: Option<&'a [u8]>,
+    pub background_mask: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1047,6 +1589,7 @@ pub struct HairGlossBinding {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MoistureFaceBinding {
+    pub frame: SameFrame,
     pub width: u32,
     pub height: u32,
     pub channel: MaskChannel,
@@ -1058,10 +1601,197 @@ pub struct MoistureFaceBinding {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MoistureBodyBinding {
+    pub frame: SameFrame,
     pub width: u32,
     pub height: u32,
     pub degree: f32,
     pub roi: (u32, u32, u32, u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SameFrame {
+    pub job_id: u64,
+    pub source_digest: [u8; 32],
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SameFrame {
+    fn validate_against(self, job_id: u64, source_digest: [u8; 32]) -> Result<(), Refusal> {
+        if self.job_id != job_id {
+            return Err(Refusal::ValueOutOfRange("same-frame job"));
+        }
+        if self.source_digest != source_digest {
+            return Err(Refusal::ValueOutOfRange("same-frame source"));
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(Refusal::ValueOutOfRange("same-frame dimensions"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BeardRepairBinding<'a> {
+    pub frame: SameFrame,
+    pub aux_gate_high: bool,
+    pub repair_output: BeardRepairOutput,
+    pub mask_a: &'a [u8],
+    pub mask_b: &'a [u8],
+    pub mask_b_channel: HairFlyMaskChannel,
+    pub repair_rgb: &'a Image,
+    pub mask_a_source_sha256: [u8; 32],
+    pub mask_b_source_sha256: [u8; 32],
+    pub mask_b_decoded_sha256: [u8; 32],
+    pub repair_source_sha256: [u8; 32],
+    pub consumer: Option<Pf21026RepairConsumerReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeardRepairOutput {
+    Output3,
+    Output4,
+}
+
+impl BeardRepairOutput {
+    fn tensor_name(self) -> &'static str {
+        match self {
+            Self::Output3 => PF21026_MASK_2977284499,
+            Self::Output4 => PF21026_MASK_2892147817,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pf21026RepairConsumerReceipt {
+    pub job_id: u64,
+    pub output: BeardRepairOutput,
+    pub producer_rva: u32,
+    pub producer_lookup_slot: u16,
+    pub consumer_rva: u32,
+    pub native_mat_offset: u16,
+    pub native_mat_sha256: [u8; 32],
+}
+
+fn hairfly_mask_plane_sha256(
+    tensor: &SessionTensor,
+    channel: HairFlyMaskChannel,
+) -> Result<[u8; 32], Refusal> {
+    if tensor.shape[1] != 3 {
+        return Err(Refusal::ShapeMismatch("PF90088 mask_b channels"));
+    }
+    let pixels = (tensor.shape[2] as usize)
+        .checked_mul(tensor.shape[3] as usize)
+        .ok_or(Refusal::ShapeMismatch("PF90088 mask_b pixels"))?;
+    let values = tensor.values()?;
+    let start = channel.index() * pixels;
+    let plane = values
+        .get(start..start + pixels)
+        .ok_or(Refusal::ShapeMismatch("PF90088 mask_b channel"))?;
+    if plane.iter().any(|value| !value.is_finite()) {
+        return Err(Refusal::ValueOutOfRange("PF90088 mask_b values"));
+    }
+    let mut bytes = Vec::with_capacity(pixels * 4);
+    for value in plane {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(sha256(&bytes))
+}
+
+impl HairFlyMaskDecodeReceipt {
+    fn validate(
+        self,
+        job_id: u64,
+        face_index: u32,
+        route: HairFlyRegisteredModel,
+        frame_width: u32,
+        frame_height: u32,
+    ) -> Result<(), Refusal> {
+        if self.same_job.job_id != job_id || self.same_job.face_index != face_index {
+            return Err(Refusal::ValueOutOfRange("PF90088_ROI_WARP_SAME_JOB"));
+        }
+        if self.model_hash_id != route.hash_id {
+            return Err(Refusal::ValueOutOfRange("PF90088_ROI_WARP_MODEL"));
+        }
+        check_receipt_roi(
+            self.draw_buffer.model_roi,
+            u32::from(route.width),
+            u32::from(route.height),
+            "PF90088_ROI_WARP_MODEL_ROI",
+        )?;
+        check_receipt_roi(
+            self.draw_buffer.frame_roi,
+            frame_width,
+            frame_height,
+            "PF90088_ROI_WARP_FRAME_ROI",
+        )?;
+        if self
+            .draw_buffer
+            .warp
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ValueOutOfRange("PF90088_ROI_WARP_MATRIX"));
+        }
+        if self.draw_buffer.vertex_count == 0
+            || self.draw_buffer.vertex_buffer_sha256 == [0; 32]
+        {
+            return Err(Refusal::MissingInput("PF90088_ROI_WARP_DRAW_BUFFER"));
+        }
+        Ok(())
+    }
+}
+
+fn check_receipt_roi(
+    roi: [u32; 4],
+    frame_width: u32,
+    frame_height: u32,
+    name: &'static str,
+) -> Result<(), Refusal> {
+    let [x, y, width, height] = roi;
+    if width == 0
+        || height == 0
+        || !x.checked_add(width).is_some_and(|right| right <= frame_width)
+        || !y
+            .checked_add(height)
+            .is_some_and(|bottom| bottom <= frame_height)
+    {
+        return Err(Refusal::ValueOutOfRange(name));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SmileAssetBinding<'a> {
+    pub frame: SameFrame,
+    pub material: &'a str,
+    pub material_sha256: [u8; 32],
+    pub material_uv: Option<&'a [[f32; 2]]>,
+    pub lip_mask: &'a [u8],
+    pub mouth_mask: &'a [u8],
+    pub roi: (u32, u32, u32, u32),
+    pub host_split_spec: Option<crate::portrait_stage::SmileHostSplitSpec>,
+}
+
+fn hairfly_refusal(error: HairFlyProducerRefusal) -> Refusal {
+    match error {
+        HairFlyProducerRefusal::JobMismatch => Refusal::ValueOutOfRange("PF90088_NATIVE_JOB"),
+        HairFlyProducerRefusal::FaceMismatch => Refusal::ValueOutOfRange("PF90088_NATIVE_FACE"),
+        HairFlyProducerRefusal::SelectorModelMismatch => {
+            Refusal::ValueOutOfRange("PF90088_SELECTOR_MODEL")
+        }
+        HairFlyProducerRefusal::SelectorOutputMismatch => {
+            Refusal::ValueOutOfRange("PF90088_SELECTOR_OUTPUT")
+        }
+        HairFlyProducerRefusal::NativeNonFinite(field) => Refusal::ValueOutOfRange(field),
+        HairFlyProducerRefusal::NativeOutOfRange(field) => Refusal::ValueOutOfRange(field),
+        HairFlyProducerRefusal::SelectorNonFiniteLogit
+        | HairFlyProducerRefusal::SelectorNotSameJob
+        | HairFlyProducerRefusal::SelectorArgmaxOutOfRange => {
+            Refusal::ValueOutOfRange("PF90088_SELECTOR_RECEIPT")
+        }
+    }
 }
 
 fn checked_len(shape: [u32; 4]) -> Option<usize> {
@@ -1095,16 +1825,13 @@ mod tests {
         SessionTensor::from_f32(job, source, model, name, shape, values).unwrap()
     }
 
-    #[test]
-    fn complete_pf100007_binds_without_rewriting_model_data() {
-        let job = 41;
-        let source = digest(7);
+    fn pf100007_outputs(job: u64, source: [u8; 32]) -> SessionModelOutputs {
         let mut outputs = SessionModelOutputs::new();
         outputs
             .insert(output(
                 job,
                 source,
-                9,
+                806_921_480,
                 "780929437",
                 [1, 3, 768, 1024],
                 &vec![0.25; 3 * 768 * 1024],
@@ -1114,12 +1841,33 @@ mod tests {
             .insert(output(
                 job,
                 source,
-                9,
+                806_921_480,
                 "3204548346",
                 [1, 1, 768, 1024],
                 &vec![0.5; 768 * 1024],
             ))
             .unwrap();
+        outputs
+    }
+
+    #[test]
+    fn vendor_catalog_contains_the_eight_decoded_payloads() {
+        assert_eq!(VENDOR_MODELS.len(), 8);
+        assert_eq!(
+            vendor_model(1_655_581_403).unwrap().source_sha256,
+            "6a025f05c26aca02def0d81e2c443d0e3dc01e61f2af00a525aca6d4ca60d14d"
+        );
+        assert_eq!(
+            vendor_model(3_157_078_880).unwrap().derived_mnn_sha256,
+            Some("d5ea7f78d631f6fa2c7949dcf60a895970e58fe349c595c84913335a578ec52c")
+        );
+    }
+
+    #[test]
+    fn complete_pf100007_binds_without_rewriting_model_data() {
+        let job = 41;
+        let source = digest(7);
+        let outputs = pf100007_outputs(job, source);
         let bound = outputs
             .bind(PortraitModelTarget::Pf100007, job, source)
             .unwrap();
@@ -1128,6 +1876,48 @@ mod tests {
         assert_eq!(
             smile.rgb_reconstruction_780929437.as_ref().unwrap().values[0],
             0.25
+        );
+    }
+
+    #[test]
+    fn pf100007_assets_require_uv_masks_and_host_split() {
+        let job = 43;
+        let source = digest(13);
+        let outputs = pf100007_outputs(job, source);
+        let bound = outputs
+            .bind(PortraitModelTarget::Pf100007, job, source)
+            .unwrap();
+        let frame = SameFrame {
+            job_id: job,
+            source_digest: source,
+            width: 1,
+            height: 1,
+        };
+        let missing_uv = SmileAssetBinding {
+            frame,
+            material: "material",
+            material_sha256: [1; 32],
+            material_uv: None,
+            lip_mask: &[1],
+            mouth_mask: &[1],
+            roi: (0, 0, 1, 1),
+            host_split_spec: None,
+        };
+        assert_eq!(
+            bound.smile_inputs_with_assets(missing_uv),
+            Err(Refusal::MissingInput(
+                "PF100007_MATERIAL_UV_LIP_MOUTH_MASK"
+            ))
+        );
+
+        let uv = [[0.0, 0.0]];
+        let missing_split = SmileAssetBinding {
+            material_uv: Some(&uv),
+            ..missing_uv
+        };
+        assert_eq!(
+            bound.smile_inputs_with_assets(missing_split),
+            Err(Refusal::MissingInput("PF100007_DX_DY_HOST_SPLIT"))
         );
     }
 

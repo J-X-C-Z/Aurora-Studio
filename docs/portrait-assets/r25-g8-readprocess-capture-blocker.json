@@ -1,0 +1,15 @@
+{
+  "agent": "G8",
+  "baseline": "eececfd",
+  "capture_performed": false,
+  "executable_pf_delta": 0,
+  "head": "5035379",
+  "read_only": true,
+  "status": "BLOCKED_NO_CAPTURE_ONE_PROCESS",
+  "unclosed": [
+    "Capture One is not running at verification time",
+    "No accepted same-job Mat/draw-buffer pointer structure was observed",
+    "Producer/consumer post-prologue PCs, job id, output channel, and draw warp remain unproven"
+  ],
+  "tool": "tools/c1_readprocess_capture.py"
+}
