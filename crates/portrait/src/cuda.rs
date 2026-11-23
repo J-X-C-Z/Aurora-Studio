@@ -385,6 +385,8 @@ mod driver {
             unsafe extern "system" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult,
         mem_alloc: unsafe extern "system" fn(*mut CuPtr, usize) -> CuResult,
         mem_free: unsafe extern "system" fn(CuPtr) -> CuResult,
+        mem_alloc_host: unsafe extern "system" fn(*mut *mut c_void, usize) -> CuResult,
+        mem_free_host: unsafe extern "system" fn(*mut c_void) -> CuResult,
         mem_get_info: unsafe extern "system" fn(*mut usize, *mut usize) -> CuResult,
         copy_in: unsafe extern "system" fn(CuPtr, *const c_void, usize) -> CuResult,
         copy_out: unsafe extern "system" fn(*mut c_void, CuPtr, usize) -> CuResult,
@@ -478,6 +480,8 @@ mod driver {
                 module_function: sym!("cuModuleGetFunction"),
                 mem_alloc: sym2!("cuMemAlloc_v2", "cuMemAlloc"),
                 mem_free: sym2!("cuMemFree_v2", "cuMemFree"),
+                mem_alloc_host: sym2!("cuMemAllocHost_v2", "cuMemAllocHost"),
+                mem_free_host: sym!("cuMemFreeHost"),
                 mem_get_info: sym2!("cuMemGetInfo_v2", "cuMemGetInfo"),
                 copy_in: sym2!("cuMemcpyHtoD_v2", "cuMemcpyHtoD"),
                 copy_out: sym2!("cuMemcpyDtoH_v2", "cuMemcpyDtoH"),
@@ -1190,14 +1194,14 @@ mod driver {
     /// Page-locked host allocation (`cuMemAllocHost`): a DMA copy reads and
     /// writes it directly instead of staging through the driver's pageable
     /// bounce buffer.
-    #[allow(dead_code)] // consumed by `nr_gpu`
+    #[allow(dead_code)] // consumed by `nr_gpu` and `blemish_gainmap_cuda`
     pub struct PinnedBuffer<'a> {
         ptr: *mut c_void,
         bytes: usize,
         owner: std::marker::PhantomData<&'a Nvidia>,
     }
 
-    #[allow(dead_code)] // consumed by `nr_gpu`
+    #[allow(dead_code)] // consumed by `nr_gpu` and `blemish_gainmap_cuda`
     impl PinnedBuffer<'_> {
         pub fn bytes(&self) -> usize {
             self.bytes
@@ -1210,6 +1214,20 @@ mod driver {
         pub fn as_mut_slice(&mut self) -> &mut [u8] {
             unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.bytes) }
         }
+
+        pub fn copy_from(&mut self, data: &[u8]) {
+            assert!(data.len() <= self.bytes, "pinned buffer too small");
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), self.ptr as *mut u8, data.len());
+            }
+        }
+
+        pub fn copy_to(&self, out: &mut [u8]) {
+            assert!(out.len() <= self.bytes, "pinned buffer too small");
+            unsafe {
+                ptr::copy_nonoverlapping(self.ptr as *const u8, out.as_mut_ptr(), out.len());
+            }
+        }
     }
 
     impl Drop for PinnedBuffer<'_> {
@@ -1221,6 +1239,7 @@ mod driver {
                 if domain.bind().is_ok()
                     && let Some(free) = domain.api.mem_free_host
                 {
+                    let _ = domain.synchronize_pending();
                     unsafe {
                         let _ = free(self.ptr);
                     }
@@ -1331,7 +1350,7 @@ mod driver {
 
     /// A bounded operation over one exact-shape group from the shared pool.
     /// The domain remains locked until the caller finishes its CPU readback.
-    pub(crate) struct BufferSession<'a> {
+    pub struct BufferSession<'a> {
         gpu: &'a Nvidia,
         domain: &'a mut Domain,
         module: CuModule,
@@ -1340,16 +1359,16 @@ mod driver {
     }
 
     impl BufferSession<'_> {
-        pub(crate) fn handle(&self, index: usize) -> u64 {
+        pub fn handle(&self, index: usize) -> u64 {
             self.ptrs[index]
         }
 
-        pub(crate) fn upload(&mut self, index: usize, data: &[u8]) -> Result<(), CudaError> {
+        pub fn upload(&mut self, index: usize, data: &[u8]) -> Result<(), CudaError> {
             let ptr = self.checked_ptr(index, data.len())?;
             self.gpu.upload(ptr, data)
         }
 
-        pub(crate) fn launch(
+        pub fn launch(
             &mut self,
             kernel: &'static str,
             geometry: (u32, u32),
@@ -1364,12 +1383,46 @@ mod driver {
             Ok(dispatch)
         }
 
-        pub(crate) fn download(&mut self, index: usize, data: &mut [u8]) -> Result<(), CudaError> {
+        pub fn download(&mut self, index: usize, data: &mut [u8]) -> Result<(), CudaError> {
             let ptr = self.checked_ptr(index, data.len())?;
             self.gpu.download(ptr, data)
         }
 
-        pub(crate) fn copy_from_device(
+        pub fn upload_pinned(
+            &mut self,
+            index: usize,
+            data: &PinnedBuffer,
+        ) -> Result<(), CudaError> {
+            let ptr = self.checked_ptr(index, data.bytes)?;
+            let api = self.domain.api;
+            unsafe {
+                check(
+                    (api.copy_in)(ptr, data.ptr as *const c_void, data.bytes),
+                    "cuMemcpyHtoD(pinned)",
+                )
+            }?;
+            HOST_TO_DEVICE_BYTES.fetch_add(data.bytes, Ordering::Relaxed);
+            Ok(())
+        }
+
+        pub fn download_pinned(
+            &mut self,
+            index: usize,
+            data: &mut PinnedBuffer,
+        ) -> Result<(), CudaError> {
+            let ptr = self.checked_ptr(index, data.bytes)?;
+            let api = self.domain.api;
+            unsafe {
+                check(
+                    (api.copy_out)(data.ptr, ptr, data.bytes),
+                    "cuMemcpyDtoH(pinned)",
+                )
+            }?;
+            DEVICE_TO_HOST_BYTES.fetch_add(data.bytes, Ordering::Relaxed);
+            Ok(())
+        }
+
+        pub fn copy_from_device(
             &mut self,
             dst: usize,
             src: usize,
@@ -1380,7 +1433,7 @@ mod driver {
             self.gpu.copy_from_device(dst, src, bytes)
         }
 
-        pub(crate) fn mark_consumed(&mut self) {
+        pub fn mark_consumed(&mut self) {
             self.domain.pending = false;
         }
 
@@ -2320,7 +2373,7 @@ mod driver {
             }
         }
 
-        pub(crate) fn with_reusable_buffers<T>(
+        pub fn with_reusable_buffers<T>(
             &self,
             pool: &'static str,
             sizes: &[usize],
@@ -2366,6 +2419,19 @@ mod driver {
                     ptr,
                     owner: std::marker::PhantomData,
                 })
+            })
+        }
+
+        pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, CudaError> {
+            self.with_domain(|domain, _| {
+                let mut ptr: *mut c_void = ptr::null_mut();
+                unsafe {
+                    check(
+                        (domain.api.mem_alloc_host)(&mut ptr, bytes.max(1)),
+                        "cuMemAllocHost",
+                    )?;
+                }
+                Ok(PinnedBuffer { ptr, bytes })
             })
         }
 
@@ -3192,7 +3258,7 @@ pub use driver::HostRegistration;
 pub use driver::PinnedBuffer;
 pub use driver::Stream;
 #[cfg(windows)]
-pub use driver::{JobBufferSession, Nvidia};
+pub use driver::{BufferSession, JobBufferSession, Nvidia, PinnedBuffer};
 
 /// Session buffer group, shared by the LUT stages inside this crate.
 #[cfg(windows)]

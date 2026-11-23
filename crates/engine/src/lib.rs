@@ -84,6 +84,7 @@ pub mod portrait_makeup_suit_inputs;
 mod portrait_historical_tone_provider;
 pub mod portrait_makeup_provider;
 pub mod blemish_gainmap;
+pub mod blemish_gainmap_cuda;
 pub use blemish_gainmap::*;
 pub use aurora_portrait::cuda_pf90021::{
     Direction as Pf90021Direction, RuntimeScalars as Pf90021RuntimeScalars, VolumeLut64,

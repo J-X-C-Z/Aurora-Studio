@@ -9,6 +9,7 @@
 use aurora_portrait::Refusal;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const MAP_LONG_SIDE: f32 = 450.0;
 pub const TILE_STEP: u32 = 214;
@@ -26,6 +27,38 @@ pub const LUMA_B: f32 = 0.114;
 /// value (including unset) keeps the existing bytes untouched.
 pub fn enabled() -> bool {
     std::env::var("AURORA_BLEMISH_GAINMAP").ok().as_deref() == Some("1")
+}
+
+/// `AURORA_BLEMISH_GPU=0` forces the CPU bytes; `=1` forces the CUDA host
+/// bridge. Unset is auto and stays on the CPU lane: the measured pageable
+/// bridge is 42-53 ms against 22-43 ms CPU at 24 MP, and it is slower per
+/// megapixel at preview sizes too. Callers that already hold pinned or
+/// device-resident frames use [`crate::blemish_gainmap_cuda`] directly.
+pub fn gpu_enabled() -> bool {
+    std::env::var("AURORA_BLEMISH_GPU").ok().as_deref() != Some("0")
+}
+
+pub fn gpu_forced() -> bool {
+    std::env::var("AURORA_BLEMISH_GPU").ok().as_deref() == Some("1")
+}
+
+/// No automatic crossover exists for the pageable bridge on this host.
+pub const GPU_AUTO_MAX_PIXELS: usize = 0;
+
+pub fn gpu_auto(_pixels: usize) -> bool {
+    gpu_enabled() && gpu_forced()
+}
+
+/// 0 = not reported, 1 = CUDA active, 2 = CPU fallback, 3 = auto skipped.
+static GPU_STATE: AtomicU8 = AtomicU8::new(0);
+
+fn report_gpu(state: u8, message: impl FnOnce() -> String) {
+    if GPU_STATE
+        .compare_exchange(0, state, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        eprintln!("{}", message());
+    }
 }
 
 /// Shipped model path. `AURORA_BLEMISH_MODEL` overrides it for tests/fixtures.
@@ -406,7 +439,9 @@ pub fn apply_gainmap_16u(input: &SpotlessGainmapInputs<'_>) -> Result<Vec<u16>, 
     apply_gainmap_16u_gated(input, enabled())
 }
 
-fn validate_gainmap_input(input: &SpotlessGainmapInputs<'_>) -> Result<(usize, usize), Refusal> {
+pub(crate) fn validate_gainmap_input(
+    input: &SpotlessGainmapInputs<'_>,
+) -> Result<(usize, usize), Refusal> {
     let w = input.width as usize;
     let h = input.height as usize;
     if w == 0 || h == 0 || input.rgb16.len() != w * h * 3 {
@@ -435,6 +470,36 @@ pub fn apply_gainmap_16u_gated(
     gate: bool,
 ) -> Result<Vec<u16>, Refusal> {
     if !gate {
+        return apply_gainmap_16u_mode(input, false, false);
+    }
+    let pixels = (input.width as u64 * input.height as u64) as usize;
+    let try_gpu = gpu_auto(pixels);
+    if !try_gpu && gpu_enabled() && !gpu_forced() {
+        report_gpu(3, || {
+            format!(
+                "blemish gain map CUDA auto-skip for {pixels} px (pageable bridge slower than CPU); set AURORA_BLEMISH_GPU=1 to force"
+            )
+        });
+    }
+    apply_gainmap_16u_mode(input, true, try_gpu)
+}
+
+/// Explicit CPU fast lane; this is the byte-identity path used when
+/// `AURORA_BLEMISH_GPU=0`.
+pub fn apply_gainmap_16u_cpu(
+    input: &SpotlessGainmapInputs<'_>,
+) -> Result<Vec<u16>, Refusal> {
+    apply_gainmap_16u_mode(input, true, false)
+}
+
+/// `try_gpu = false` is the byte-identity CPU path used by tests and by
+/// `AURORA_BLEMISH_GPU=0`.
+pub(crate) fn apply_gainmap_16u_mode(
+    input: &SpotlessGainmapInputs<'_>,
+    gate: bool,
+    try_gpu: bool,
+) -> Result<Vec<u16>, Refusal> {
+    if !gate {
         return Ok(input.rgb16.to_vec());
     }
     let (w, h) = validate_gainmap_input(input)?;
@@ -442,6 +507,26 @@ pub fn apply_gainmap_16u_gated(
     // exact no-op before any map sampling or rounding.
     if input.amount == 0.0 {
         return Ok(input.rgb16.to_vec());
+    }
+    if try_gpu {
+        match crate::blemish_gainmap_cuda::apply_16u(input) {
+            Ok((out, dispatch)) => {
+                report_gpu(1, || {
+                    format!(
+                        "blemish gain map CUDA: {} {}x{} on {} (ptx {} B)",
+                        dispatch.kernel,
+                        dispatch.grid.0,
+                        dispatch.grid.1,
+                        dispatch.device,
+                        dispatch.ptx_bytes
+                    )
+                });
+                return Ok(out);
+            }
+            Err(error) => report_gpu(2, || {
+                format!("blemish gain map CUDA unavailable, using CPU: {error:?}")
+            }),
+        }
     }
     let rows = upsample_map_rows(input.gain_map, w);
     Ok(apply_rows_parallel(input, w, h, &rows))
@@ -499,6 +584,163 @@ pub fn apply_gainmap_16u_scalar(
                 let src = input.rgb16[(y * w + x) * 3 + k] as f32 / 65535.0;
                 let v = src * (g[k] * weight + (1.0 - weight));
                 out[(y * w + x) * 3 + k] = (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 8-bit twin of [`SpotlessGainmapInputs`]. Same map, same amount/mask law;
+/// the frame and output are `u8` and the unit interval is 0..=255.
+#[derive(Clone, Copy, Debug)]
+pub struct SpotlessGainmapInputs8<'a> {
+    pub rgb8: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub gain_map: &'a GainMap,
+    pub amount: f32,
+    pub protection_mask: Option<&'a [u8]>,
+}
+
+pub(crate) fn validate_gainmap_input8(
+    input: &SpotlessGainmapInputs8<'_>,
+) -> Result<(usize, usize), Refusal> {
+    let w = input.width as usize;
+    let h = input.height as usize;
+    if w == 0 || h == 0 || input.rgb8.len() != w * h * 3 {
+        return Err(Refusal::ShapeMismatch("blemish gain map frame"));
+    }
+    if !input.amount.is_finite() || !(0.0..=1.0).contains(&input.amount) {
+        return Err(Refusal::ValueOutOfRange("blemish gain map amount"));
+    }
+    if let Some(mask) = input.protection_mask {
+        if mask.len() != w * h {
+            return Err(Refusal::ShapeMismatch("blemish protection mask"));
+        }
+    }
+    let map = input.gain_map;
+    if map.width == 0
+        || map.height == 0
+        || map.rgba.len() != map.width as usize * map.height as usize * 4
+    {
+        return Err(Refusal::ShapeMismatch("blemish gain map"));
+    }
+    Ok((w, h))
+}
+
+/// 8-bit consumer, gated by the same `AURORA_BLEMISH_GAINMAP=1` switch.
+pub fn apply_gainmap_8u(input: &SpotlessGainmapInputs8<'_>) -> Result<Vec<u8>, Refusal> {
+    if !enabled() {
+        return apply_gainmap_8u_mode(input, false, false);
+    }
+    let pixels = (input.width as u64 * input.height as u64) as usize;
+    let try_gpu = gpu_auto(pixels);
+    if !try_gpu && gpu_enabled() && !gpu_forced() {
+        report_gpu(3, || {
+            format!(
+                "blemish gain map CUDA 8u auto-skip for {pixels} px (pageable bridge slower than CPU); set AURORA_BLEMISH_GPU=1 to force"
+            )
+        });
+    }
+    apply_gainmap_8u_mode(input, true, try_gpu)
+}
+
+/// Explicit 8-bit CPU fast lane.
+pub fn apply_gainmap_8u_cpu(input: &SpotlessGainmapInputs8<'_>) -> Result<Vec<u8>, Refusal> {
+    apply_gainmap_8u_mode(input, true, false)
+}
+
+pub(crate) fn apply_gainmap_8u_mode(
+    input: &SpotlessGainmapInputs8<'_>,
+    gate: bool,
+    try_gpu: bool,
+) -> Result<Vec<u8>, Refusal> {
+    if !gate {
+        return Ok(input.rgb8.to_vec());
+    }
+    let (w, h) = validate_gainmap_input8(input)?;
+    if input.amount == 0.0 {
+        return Ok(input.rgb8.to_vec());
+    }
+    if try_gpu {
+        match crate::blemish_gainmap_cuda::apply_8u(
+            input.rgb8,
+            input.width,
+            input.height,
+            input.gain_map,
+            input.amount,
+            input.protection_mask,
+        ) {
+            Ok((out, dispatch)) => {
+                report_gpu(1, || {
+                    format!(
+                        "blemish gain map CUDA 8u: {} {}x{} on {}",
+                        dispatch.kernel, dispatch.grid.0, dispatch.grid.1, dispatch.device
+                    )
+                });
+                return Ok(out);
+            }
+            Err(error) => report_gpu(2, || {
+                format!("blemish gain map CUDA 8u unavailable, using CPU: {error:?}")
+            }),
+        }
+    }
+    let rows = upsample_map_rows(input.gain_map, w);
+    Ok(apply_rows_parallel_8u(input, w, h, &rows))
+}
+
+/// 8-bit scalar oracle, byte-for-byte the law the CUDA kernel implements.
+pub fn apply_gainmap_8u_scalar(
+    input: &SpotlessGainmapInputs8<'_>,
+) -> Result<Vec<u8>, Refusal> {
+    let (w, h) = validate_gainmap_input8(input)?;
+    if input.amount == 0.0 {
+        return Ok(input.rgb8.to_vec());
+    }
+    let map = input.gain_map;
+    let sx = map.width as f32 / w as f32;
+    let sy = map.height as f32 / h as f32;
+    let amount_scale = 1.0 / (1.0 - input.amount).max(0.01);
+    let mut out = vec![0u8; w * h * 3];
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, map.height as f32 - 1.0);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(map.height as usize - 1);
+        let ty = fy - y0 as f32;
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, map.width as f32 - 1.0);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(map.width as usize - 1);
+            let tx = fx - x0 as f32;
+            let at = |xx: usize, yy: usize| {
+                let i = (yy * map.width as usize + xx) * 4;
+                [map.rgba[i], map.rgba[i + 1], map.rgba[i + 2], map.rgba[i + 3]]
+            };
+            let a = at(x0, y0);
+            let b = at(x1, y0);
+            let c = at(x0, y1);
+            let d = at(x1, y1);
+            let mut g = [0.0f32; 3];
+            for k in 0..3 {
+                let top = a[k] + (b[k] - a[k]) * tx;
+                let bottom = c[k] + (d[k] - c[k]) * tx;
+                g[k] = top + (bottom - top) * ty;
+            }
+            let top_c = a[3] + (b[3] - a[3]) * tx;
+            let bottom_c = c[3] + (d[3] - c[3]) * tx;
+            let conf = top_c + (bottom_c - top_c) * ty;
+            let mut weight = (conf * amount_scale).clamp(0.0, 1.0);
+            if input.amount > 0.25 {
+                let t = (4.0 * (input.amount - 0.75)).clamp(0.0, 1.0);
+                weight = weight * (1.0 - t) + t;
+            }
+            if let Some(mask) = input.protection_mask {
+                weight *= (255 - mask[y * w + x] as u32) as f32 / 255.0;
+            }
+            for k in 0..3 {
+                let src = input.rgb8[(y * w + x) * 3 + k] as f32 / 255.0;
+                let v = src * (g[k] * weight + (1.0 - weight));
+                out[(y * w + x) * 3 + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
     }
@@ -594,6 +836,66 @@ pub fn apply_rows_parallel(
                     let src = src_lut[src_row[x * 3 + k] as usize];
                     let v = src * (g[k] * weight + (1.0 - weight));
                     out_row[x * 3 + k] = (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                }
+            }
+        });
+    out
+}
+
+/// 8-bit row pass, the same expressions as [`apply_rows_parallel`].
+pub fn apply_rows_parallel_8u(
+    input: &SpotlessGainmapInputs8<'_>,
+    w: usize,
+    h: usize,
+    rows: &[f32],
+) -> Vec<u8> {
+    let map_h = input.gain_map.height as usize;
+    let sy = map_h as f32 / h as f32;
+    let amount_scale = 1.0 / (1.0 - input.amount).max(0.01);
+    let curve_t = if input.amount > 0.25 {
+        Some((4.0 * (input.amount - 0.75)).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    let src_lut: Vec<f32> = (0..=255u32).map(|v| v as f32 / 255.0).collect();
+    let mask_lut: [f32; 256] = std::array::from_fn(|m| (255 - m as u32) as f32 / 255.0);
+    let mut out = vec![0u8; w * h * 3];
+    out.par_chunks_mut(w * 3)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, map_h as f32 - 1.0);
+            let y0 = fy.floor() as usize;
+            let y1 = (y0 + 1).min(map_h - 1);
+            let ty = fy - y0 as f32;
+            let top = &rows[y0 * w * 4..(y0 + 1) * w * 4];
+            let bottom = &rows[y1 * w * 4..(y1 + 1) * w * 4];
+            let src_row = &input.rgb8[y * w * 3..(y + 1) * w * 3];
+            let mask_row = input
+                .protection_mask
+                .as_ref()
+                .map(|mask| &mask[y * w..(y + 1) * w]);
+            for x in 0..w {
+                let i = x * 4;
+                let mut g = [0.0f32; 3];
+                for k in 0..3 {
+                    let a = top[i + k];
+                    let b = bottom[i + k];
+                    g[k] = a + (b - a) * ty;
+                }
+                let a = top[i + 3];
+                let b = bottom[i + 3];
+                let conf = a + (b - a) * ty;
+                let mut weight = (conf * amount_scale).clamp(0.0, 1.0);
+                if let Some(t) = curve_t {
+                    weight = weight * (1.0 - t) + t;
+                }
+                if let Some(row) = mask_row {
+                    weight *= mask_lut[row[x] as usize];
+                }
+                for k in 0..3 {
+                    let src = src_lut[src_row[x * 3 + k] as usize];
+                    let v = src * (g[k] * weight + (1.0 - weight));
+                    out_row[x * 3 + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
         });
@@ -811,7 +1113,142 @@ mod tests {
             amount: 0.5,
             protection_mask: None,
         };
-        let fast = apply_gainmap_16u_gated(&input, true).unwrap();
-        assert_eq!(fast, golden);
+        let cpu = apply_gainmap_16u_mode(&input, true, false).unwrap();
+        assert_eq!(cpu, golden);
+    }
+
+    #[test]
+    fn golden_9868_gpu_matches_cpu() {
+        let dir = std::path::Path::new(
+            r"C:\Users\Jxcz2\Documents\Codex\2026-11-10\capture-one-rust-gpui-thread-01a1bf2a\90_work\lanes\c1-parse\c1_blemish_model_r280\harness\fixtures\nef_9868",
+        );
+        if !dir.join("engine_9868_blemish.u16").is_file() {
+            return;
+        }
+        let read_u16 = |name: &str| -> Vec<u16> {
+            std::fs::read(dir.join(name))
+                .unwrap()
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect()
+        };
+        let src = read_u16("s1_linear_9868.u16");
+        let golden = read_u16("engine_9868_blemish.u16");
+        let rgba: Vec<f32> = std::fs::read(dir.join("gainmap_9868_450x300.f32"))
+            .unwrap()
+            .chunks_exact(4)
+            .map(|p| f32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+            .collect();
+        let map = GainMap { width: 450, height: 300, rgba };
+        let input = SpotlessGainmapInputs {
+            rgb16: &src,
+            width: 6048,
+            height: 4032,
+            gain_map: &map,
+            amount: 0.5,
+            protection_mask: None,
+        };
+        let (gpu, dispatch) = match crate::blemish_gainmap_cuda::apply_16u(&input) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("SKIP golden_9868_gpu_matches_cpu: {error:?}");
+                return;
+            }
+        };
+        eprintln!(
+            "GPU golden: {} grid={:?} block={:?} device={}",
+            dispatch.kernel, dispatch.grid, dispatch.block, dispatch.device
+        );
+        assert!(dispatch.kernel.contains("16u"));
+        assert_eq!(gpu, golden);
+        let cpu = apply_gainmap_16u_scalar(&input).unwrap();
+        assert_eq!(gpu, cpu);
+        let forced = apply_gainmap_16u_mode(&input, true, true).unwrap();
+        assert_eq!(forced, golden);
+    }
+
+    #[test]
+    fn gpu_off_matches_golden_without_upload() {
+        let src = vec![23456u16; 64 * 48 * 3];
+        let map = GainMap {
+            width: 9,
+            height: 6,
+            rgba: (0..9 * 6 * 4).map(|i| 0.75 + (i % 13) as f32 * 0.05).collect(),
+        };
+        let mask = vec![90u8; 64 * 48];
+        let input = SpotlessGainmapInputs {
+            rgb16: &src,
+            width: 64,
+            height: 48,
+            gain_map: &map,
+            amount: 0.75,
+            protection_mask: Some(&mask),
+        };
+        let cpu = apply_gainmap_16u_scalar(&input).unwrap();
+        let gated = apply_gainmap_16u_mode(&input, true, false).unwrap();
+        assert_eq!(cpu, gated);
+    }
+
+    #[test]
+    fn eight_bit_parallel_matches_scalar() {
+        let w = 37usize;
+        let h = 29usize;
+        let src: Vec<u8> = (0..w * h * 3).map(|i| (i * 197 % 256) as u8).collect();
+        let map = GainMap {
+            width: 7,
+            height: 5,
+            rgba: (0..7 * 5 * 4)
+                .map(|i| 0.5 + (i % 17) as f32 * 0.09)
+                .collect(),
+        };
+        let mask = vec![160u8; w * h];
+        let input = SpotlessGainmapInputs8 {
+            rgb8: &src,
+            width: w as u32,
+            height: h as u32,
+            gain_map: &map,
+            amount: 0.5,
+            protection_mask: Some(&mask),
+        };
+        let scalar = apply_gainmap_8u_scalar(&input).unwrap();
+        let fast = apply_gainmap_8u_mode(&input, true, false).unwrap();
+        assert_eq!(scalar, fast);
+    }
+
+    #[test]
+    fn eight_bit_gpu_matches_cpu() {
+        let w = 512usize;
+        let h = 384usize;
+        let src: Vec<u8> = (0..w * h * 3).map(|i| (i * 91 % 256) as u8).collect();
+        let map = GainMap {
+            width: 450,
+            height: 300,
+            rgba: (0..450 * 300 * 4)
+                .map(|i| 0.5 + (i % 29) as f32 * 0.05)
+                .collect(),
+        };
+        let input = SpotlessGainmapInputs8 {
+            rgb8: &src,
+            width: w as u32,
+            height: h as u32,
+            gain_map: &map,
+            amount: 0.5,
+            protection_mask: None,
+        };
+        let (gpu, dispatch) =
+            match crate::blemish_gainmap_cuda::apply_8u(&src, w as u32, h as u32, &map, 0.5, None)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("SKIP eight_bit_gpu_matches_cpu: {error:?}");
+                    return;
+                }
+            };
+        eprintln!(
+            "GPU 8u: {} grid={:?} device={}",
+            dispatch.kernel, dispatch.grid, dispatch.device
+        );
+        assert!(dispatch.kernel.contains("8u"));
+        assert_eq!(gpu, apply_gainmap_8u_scalar(&input).unwrap());
     }
 }
