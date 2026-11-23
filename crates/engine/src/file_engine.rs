@@ -1358,12 +1358,14 @@ impl FileEngine {
         Ok(source)
     }
 
-    fn native_raw_source(&self, image: ImageId, adj: &AdjustmentSet, region: NormRect, max: u32) -> Option<Arc<Source>> {
+    fn native_raw_source(&self, image: ImageId, viewport: Option<(&crate::Geometry, NormRect, u32)>) -> Option<Arc<Source>> {
         let (path, lens) = {
             let st = self.state.lock();
             let entry = st.entries.iter().find(|e| e.info.id == image)?;
             if !(crate::raw::is_raw(&entry.path) || is_eip(&entry.path))
-                || !wants_native_raw((entry.info.width, entry.info.height), &adj.geometry, region, max)
+                || viewport.is_some_and(|(geometry, region, max)| {
+                    !wants_native_raw((entry.info.width, entry.info.height), geometry, region, max)
+                })
             {
                 return None;
             }
@@ -1395,7 +1397,7 @@ impl FileEngine {
             Some(Arc::new(source.with_lens_shot(lens).with_c1_z6iii_linear(z6iii)))
         })();
         if source.is_none() {
-            log::warn!("native RAW preview unavailable for {image:?}; using normal preview source");
+            log::warn!("native RAW source unavailable for {image:?}");
         }
         self.state.lock().native_raw = Some((image, source.clone()));
         source
@@ -1658,7 +1660,7 @@ impl FileEngine {
         // because `fast` renders half size and upsamples, not because it is smaller.
         let max = request.max_size;
         let adj = crate::styles::resolve(&request.adjustments);
-        let src = match self.native_raw_source(request.image, &adj, request.region, max) {
+        let src = match self.native_raw_source(request.image, Some((&adj.geometry, request.region, max))) {
             Some(native) => native,
             None => self.source(request.image)?,
         };
@@ -2920,7 +2922,21 @@ impl ImageEngine for FileEngine {
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
         let use_standard = true;
         let standard = if use_standard {
-            Some((self.source(job.image)?, self.load_adjustments(job.image)))
+            let adjustments = crate::styles::resolve(&self.load_adjustments(job.image)).into_owned();
+            let (source, max_size, recipe) = if let Some(native) = self.native_raw_source(job.image, None) {
+                // Resolve the recipe against the active image after geometry.
+                // Raw resampling runs before detail; the writer keeps that size.
+                let (w, h) = crate::mock::geometry::FrameMap::new(native.size(), &adjustments.geometry).frame_size();
+                let size = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
+                let (tw, th) = crate::recipe::output_size(&job.recipe, size);
+                let mut recipe = job.recipe.clone();
+                recipe.scale = crate::ScaleMode::Fixed100;
+                (native, tw.max(th), recipe)
+            } else {
+                let (w, h) = crate::recipe::output_size(&job.recipe, (info.width, info.height));
+                (self.source(job.image)?, w.max(h).max(1), job.recipe.clone())
+            };
+            Some((source, adjustments, max_size, recipe))
         } else {
             None
         };
@@ -2939,20 +2955,19 @@ impl ImageEngine for FileEngine {
                 if let Some(exact) = exact {
                     return exact.write(&dir, &info, &job.recipe, || cancelled(&state));
                 }
-                let (src, adjustments) = standard.expect("standard export source");
-                let (tw, th) = crate::recipe::output_size(&job.recipe, (info.width, info.height));
-                if job.recipe.bit_depth == 16 {
+                let (src, adjustments, max_size, recipe) = standard.expect("standard export source");
+                if recipe.bit_depth == 16 {
                 let out = process::render16(
                     &src,
-                    &crate::styles::resolve(&adjustments),
+                    &adjustments,
                     NormRect::FULL,
-                    tw.max(th).max(1),
+                    max_size,
                     false,
                 );
                 crate::recipe::write_export16(
                     &dir,
                     &info,
-                    &job.recipe,
+                    &recipe,
                     info.variant as usize,
                     out.rgba,
                     out.width,
@@ -2966,16 +2981,16 @@ impl ImageEngine for FileEngine {
             } else {
                 let out = process::render(
                     &src,
-                    &crate::styles::resolve(&adjustments),
+                    &adjustments,
                     NormRect::FULL,
-                    tw.max(th).max(1),
+                    max_size,
                     false,
                     None,
                 );
                 crate::recipe::write_export(
                     &dir,
                     &info,
-                    &job.recipe,
+                    &recipe,
                     info.variant as usize,
                     out.rgba,
                     out.width,
@@ -3527,12 +3542,12 @@ mod tests {
         let info = engine.images().into_iter().find(|info| crate::raw::is_raw(&info.path)).expect("RAW fixture");
         let adj = AdjustmentSet::default();
         let roi = NormRect { x: 0.25, y: 0.25, width: 0.125, height: 0.125 };
-        assert!(engine.native_raw_source(info.id, &adj, NormRect::FULL, 1024).is_none());
-        let native = engine.native_raw_source(info.id, &adj, roi, 1024).expect("native RAW decode");
+        assert!(engine.native_raw_source(info.id, Some((&adj.geometry, NormRect::FULL, 1024))).is_none());
+        let native = engine.native_raw_source(info.id, Some((&adj.geometry, roi, 1024))).expect("native RAW decode");
         assert!(native.size().0.max(native.size().1) > SOURCE_LONG_SIDE);
         let proxy = engine.source(info.id).expect("proxy RAW decode");
         assert_eq!(proxy.size().0.max(proxy.size().1), SOURCE_LONG_SIDE);
-        assert_eq!(engine.native_raw_source(info.id, &adj, roi, 1536).unwrap().snapshot_id(), native.snapshot_id());
+        assert_eq!(engine.native_raw_source(info.id, Some((&adj.geometry, roi, 1536))).unwrap().snapshot_id(), native.snapshot_id());
         let render = |src: &Source| process::render(src, &adj, roi, 1024, true, None);
         let expected = render(&native);
         assert_ne!(expected.rgba, render(&proxy).rgba, "fixture must distinguish native from proxy");
@@ -3545,6 +3560,45 @@ mod tests {
         assert_eq!((preview.image.width, preview.image.height), (expected.width, expected.height));
         assert!(preview.image.pixels.as_slice() == expected.rgba.as_slice(), "final viewport did not use the native RAW");
         eprintln!("native {:?}, proxy {:?}, viewport {}x{}", native.size(), proxy.size(), expected.width, expected.height);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated directory with a real RAW above 4096 px"]
+    fn adjusted_raw_export_scales_the_native_source_once() {
+        let dir = PathBuf::from(std::env::var_os("AURORA_NATIVE_RAW_TEST_DIR").expect("fixture directory"));
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine.images().into_iter().find(|info| crate::raw::is_raw(&info.path)).expect("RAW fixture");
+        let native = engine.native_raw_source(info.id, None).expect("native RAW decode");
+        let size = native.size();
+        assert!(size.0.max(size.1) > SOURCE_LONG_SIDE);
+        let mut adj = AdjustmentSet::default();
+        adj.exposure.exposure = 0.25;
+        engine.save_adjustments(info.id, &adj).unwrap();
+        let destination = dir.join("adjusted-export-test");
+        let recipe = crate::ProcessRecipe {
+            format: crate::ExportFormat::Tiff,
+            bit_depth: 16,
+            scale: crate::ScaleMode::Percent,
+            scale_value: (50, 0),
+            destination: Some(destination),
+            include_metadata: crate::MetadataPolicy::StripAll,
+            ..crate::ProcessRecipe::default()
+        };
+        let expected = crate::recipe::output_size(&recipe, size);
+        engine.start_export(ExportJob { job_id: 19, image: info.id, recipe }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let output = loop {
+            match engine.job_status(19) {
+                JobStatus::Done { output } => break output,
+                JobStatus::Failed { message } => panic!("{message}"),
+                _ => {
+                    assert!(std::time::Instant::now() < deadline, "adjusted RAW export timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        };
+        assert_eq!(image::image_dimensions(&output).unwrap(), expected);
+        eprintln!("adjusted TIFF: {}x{} from native {:?}", expected.0, expected.1, size);
     }
 
     #[test]
