@@ -317,25 +317,30 @@ impl ModelPreprocess {
         output_bytes: usize,
         uniforms_ptr: *mut std::ffi::c_void,
     ) -> Result<(Vec<u8>, Dispatch), CudaError> {
-        let input_buf = self.gpu.alloc_buffer(input.len())?;
-        let output_buf = self.gpu.alloc_buffer(output_bytes)?;
-        self.gpu.upload_buffer(&input_buf, input)?;
-        let mut input_arg = input_buf.handle();
-        let mut output_arg = output_buf.handle();
-        let mut params: [*mut std::ffi::c_void; 3] = [
-            &mut input_arg as *mut u64 as *mut std::ffi::c_void,
-            &mut output_arg as *mut u64 as *mut std::ffi::c_void,
-            uniforms_ptr,
-        ];
-        let dispatch = self.gpu.launch_raw(
-            kernel,
-            (pixels.div_ceil(BLOCK as usize) as u32, 1),
-            (BLOCK, 1),
-            &mut params,
-        )?;
-        let mut output = vec![0u8; output_bytes];
-        self.gpu.download_buffer(&output_buf, &mut output)?;
-        Ok((output, dispatch))
+        self.gpu.with_reusable_buffers(
+            "model-preprocess.twoway",
+            &[input.len(), output_bytes],
+            |buffers| {
+                buffers.upload(0, input)?;
+                let mut input_arg = buffers.handle(0);
+                let mut output_arg = buffers.handle(1);
+                let mut params: [*mut std::ffi::c_void; 3] = [
+                    &mut input_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut output_arg as *mut u64 as *mut std::ffi::c_void,
+                    uniforms_ptr,
+                ];
+                let dispatch = buffers.launch(
+                    kernel,
+                    (pixels.div_ceil(BLOCK as usize) as u32, 1),
+                    (BLOCK, 1),
+                    &mut params,
+                )?;
+                let mut output = vec![0u8; output_bytes];
+                buffers.download(1, &mut output)?;
+                buffers.mark_consumed();
+                Ok((output, dispatch))
+            },
+        )
     }
 
     /// GPU twin of `rgba8_to_nchw_cpu`.

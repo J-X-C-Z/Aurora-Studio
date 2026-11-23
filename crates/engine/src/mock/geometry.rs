@@ -440,6 +440,43 @@ impl FrameMap {
         };
         (oriented, finite_pair(s))
     }
+
+    pub(crate) fn frame_from_source(&self, source: [f32; 2]) -> Option<[f32; 2]> {
+        let source = finite_pair(source);
+        let mut frame = source;
+        for _ in 0..16 {
+            let (_, mapped) = self.map(frame);
+            let rx = mapped[0] - source[0];
+            let ry = mapped[1] - source[1];
+            if rx.abs().max(ry.abs()) <= 1e-6 {
+                return Some(frame);
+            }
+            let h = 1e-4;
+            let (_, x_shift) = self.map([frame[0] + h, frame[1]]);
+            let (_, y_shift) = self.map([frame[0], frame[1] + h]);
+            let j00 = (x_shift[0] - mapped[0]) / h;
+            let j10 = (x_shift[1] - mapped[1]) / h;
+            let j01 = (y_shift[0] - mapped[0]) / h;
+            let j11 = (y_shift[1] - mapped[1]) / h;
+            let determinant = j00 * j11 - j01 * j10;
+            if !determinant.is_finite() || determinant.abs() < 1e-8 {
+                return None;
+            }
+            let dx = (j11 * rx - j01 * ry) / determinant;
+            let dy = (-j10 * rx + j00 * ry) / determinant;
+            let next = [frame[0] - dx, frame[1] - dy];
+            if next
+                .iter()
+                .any(|value| !value.is_finite() || !(-4.0..=5.0).contains(value))
+            {
+                return None;
+            }
+            frame = next;
+        }
+        let (_, mapped) = self.map(frame);
+        ((mapped[0] - source[0]).abs().max((mapped[1] - source[1]).abs()) <= 1e-5)
+            .then_some(frame)
+    }
 }
 
 #[cfg(test)]

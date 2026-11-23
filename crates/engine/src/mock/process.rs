@@ -25,6 +25,8 @@ pub struct Source {
     portrait_masks: OnceLock<crate::portrait_stage::PortraitMasks>,
     /// Stable fingerprint of the decoded source snapshot.
     fingerprint: OnceLock<u64>,
+    /// Packed sRGB RGBA for the full decoded source frame.
+    face_rgba8: OnceLock<crate::PortraitImage>,
 }
 
 pub(crate) struct Plane {
@@ -211,6 +213,7 @@ impl Source {
                 c1_z6iii_linear: false,
                 portrait_masks: OnceLock::new(),
                 fingerprint: OnceLock::new(),
+                face_rgba8: OnceLock::new(),
             };
         }
         data.truncate((width as usize) * (height as usize));
@@ -243,11 +246,31 @@ impl Source {
             c1_z6iii_linear: false,
             portrait_masks: OnceLock::new(),
             fingerprint: OnceLock::new(),
+            face_rgba8: OnceLock::new(),
         }
     }
 
     pub(crate) fn size(&self) -> (u32, u32) {
         (self.levels[0].width, self.levels[0].height)
+    }
+
+    pub(crate) fn face_input_image(&self) -> crate::PortraitImage {
+        self.face_rgba8
+            .get_or_init(|| {
+                let plane = &self.levels[0];
+                let mut rgba = Vec::with_capacity((plane.width * plane.height * 4) as usize);
+                for pixel in &plane.data {
+                    for channel in pixel {
+                        rgba.push(
+                            (linear_to_srgb((*channel).clamp(0.0, 1.0)) * 255.0 + 0.5) as u8,
+                        );
+                    }
+                    rgba.push(255);
+                }
+                crate::PortraitImage::new(plane.width, plane.height, rgba)
+                    .expect("the decoded source level has exactly one RGBA plane")
+            })
+            .clone()
     }
 
     /// Marks pixels that came from the camera's embedded preview: they are already
@@ -1154,6 +1177,73 @@ fn portrait_job_id(
     hash.finish() | 1
 }
 
+fn needs_stage_face_input(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    extra.iter().any(|(key, value)| {
+        if value.abs() <= 1.0e-6 {
+            return false;
+        }
+        let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        matches!(
+            pf,
+            242 | 243
+                | 247
+                | 248
+                | 8001..=8033
+                | 30073
+                | 30079..=30093
+                | 41922
+                | 44124
+                | 48019
+                | 49221
+        )
+    })
+}
+
+fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    extra.iter().any(|(key, value)| {
+        if value.abs() <= 1.0e-6 {
+            return false;
+        }
+        let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        matches!(pf, 108 | 109 | 110)
+    })
+}
+
+fn teeth_ui_percent(extra: &std::collections::BTreeMap<String, f32>, key: &str) -> f32 {
+    extra.get(key).copied().unwrap_or(0.7) * 100.0
+}
+
+fn stage_face_bundle(
+    job_id: u64,
+    frame: &crate::PortraitImage,
+    include_parsing: bool,
+) -> Result<crate::FaceInputBundle, aurora_portrait::Refusal> {
+    let session = match crate::FaceInputSession::open_from_env(include_parsing) {
+        Ok(session) => session,
+        Err(refusal) if include_parsing => {
+            log::warn!(
+                "canonical FaceParsingV2 session unavailable; retrying slim-only face input: {refusal:?}"
+            );
+            crate::FaceInputSession::open_from_env(false)?
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    match session.produce(job_id, frame) {
+        Ok(bundle) => Ok(bundle),
+        Err(refusal) if include_parsing => {
+            log::warn!(
+                "canonical FaceParsingV2 unavailable; retrying slim-only face input: {refusal:?}"
+            );
+            crate::FaceInputSession::open_from_env(false)?.produce(job_id, frame)
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
 pub struct Rendered {
     pub rgba: Vec<u8>,
     pub width: u32,
@@ -1563,9 +1653,95 @@ fn render_sized(
             &adj.extra,
             masks,
         );
+        // Face landmarks come from the full decoded source and are mapped
+        // through the renderer's FrameMap into the current out_w/out_h stage.
+        let mut producer_inputs = adj.portrait_producer_inputs.as_deref().cloned();
+        if needs_stage_face_input(&adj.extra) {
+            let geometric_lens = adj.lens.use_profile
+                || adj.lens.distortion.abs() > 1.0e-6
+                || adj.lens.shift_x.abs() > 1.0e-6
+                || adj.lens.shift_y.abs() > 1.0e-6
+                || adj.lens.tilt.abs() > 1.0e-6;
+            if geometric_lens {
+                log::warn!(
+                    "{}: geometric lens transform not recovered",
+                    crate::FACE_STAGE_TRANSFORM_REFUSAL
+                );
+            } else if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
+                let source_frame = src.face_input_image();
+                match stage_face_bundle(receipt.job_id(), &source_frame, false) {
+                    Ok(bundle) => match crate::FaceStageTransform::new(
+                        [src.size().0, src.size().1],
+                        [out_w, out_h],
+                        [region.x, region.y, region.width, region.height],
+                        &adj.geometry,
+                    ) {
+                        Ok(transform) => match bundle.slim_inputs_for_stage(&transform, &stage_frame)
+                        {
+                            Ok(slim) => {
+                                let mut inputs = producer_inputs.take().unwrap_or_default();
+                                inputs.slim = Some(slim);
+                                producer_inputs = Some(inputs);
+                            }
+                            Err(refusal) => {
+                                log::warn!("stage face input refused: {refusal:?}");
+                            }
+                        },
+                        Err(refusal) => {
+                            log::warn!("stage face transform refused: {refusal:?}");
+                        }
+                    },
+                    Err(refusal) => {
+                        log::warn!("stage face inference refused: {refusal:?}");
+                    }
+                }
+            }
+        }
+        // Keep R17's PF108 path on the stage frame; its parsing semantics are
+        // owned by the separate teeth lane.
+        if needs_stage_face_parsing(&adj.extra) && region == NormRect::FULL {
+            if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
+                match stage_face_bundle(receipt.job_id(), &stage_frame, true) {
+                    Ok(bundle) => {
+                        let mut inputs = producer_inputs.take().unwrap_or_default();
+                        let mut attached = false;
+                        if inputs.slim.is_none() {
+                            match bundle.slim_inputs(&stage_frame) {
+                                Ok(slim) => {
+                                    inputs.slim = Some(slim);
+                                    attached = true;
+                                }
+                                Err(refusal) => {
+                                    log::warn!("stage face input refused: {refusal:?}");
+                                }
+                            }
+                        }
+                        let bright_ui = teeth_ui_percent(&adj.extra, "pc:109");
+                        let deyellow_ui = teeth_ui_percent(&adj.extra, "pc:110");
+                        match bundle.attach_pf108_inputs(
+                            &stage_frame,
+                            bright_ui,
+                            deyellow_ui,
+                            &mut inputs,
+                        ) {
+                            Ok(()) => attached = true,
+                            Err(refusal) => {
+                                log::warn!("canonical FaceParsingV2 input refused: {refusal:?}");
+                            }
+                        }
+                        if attached {
+                            producer_inputs = Some(inputs);
+                        }
+                    }
+                    Err(refusal) => {
+                        log::warn!("stage face inference refused: {refusal:?}");
+                    }
+                }
+            }
+        }
         let mut inputs =
             crate::portrait_stage::PortraitJobInputs::from_renderer_receipt(receipt, masks);
-        if let Some(producer) = adj.portrait_producer_inputs.as_deref() {
+        if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
         Some(crate::portrait_stage::apply_portrait_effects_with_job(

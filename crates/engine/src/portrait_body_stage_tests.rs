@@ -104,6 +104,7 @@ fn producer(pf: u32, job_id: u64) -> BodyGeometryJob {
     BodyGeometryJob {
         job_id,
         frame_size: SIZE,
+        source_sha256: sha256_32(&frame().pixels),
         effects: BTreeMap::from([(pf, fixture(pf))]),
     }
 }
@@ -200,7 +201,9 @@ fn body_normal_stage_receipt_and_writeback() {
         );
         let mut owner = ProducerInputs::default();
         if pf != 403 {
-            owner.body_geometry = Some(producer(pf, receipt.job_id()));
+            owner
+                .write_body_geometry(producer(pf, receipt.job_id()), &receipt)
+                .unwrap();
         }
         let mut job = PortraitJobInputs::from_renderer_receipt(receipt, &masks);
         job.fill_from_producer_inputs(&owner);
@@ -258,4 +261,137 @@ fn body_normal_stage_rejects_stale_receipt_and_stale_job() {
         Some(Refusal::ValueOutOfRange("PortraitJobReceipt digest"))
     );
     assert_eq!(pixels, changed);
+}
+
+#[test]
+fn body_producer_entry_accepts_synthetic_jobs_for_each_routed_pf() {
+    let source = frame();
+    let masks = PortraitMasks::default();
+    let region = NormRect::FULL;
+    let mut all: BTreeMap<u32, BodyGeometryInput> = BTreeMap::new();
+    for pf in ROUTED {
+        let extra = BTreeMap::from([(format!("pc:{pf}"), 50.0)]);
+        let receipt = PortraitJobReceipt::from_renderer_receipt(
+            &source.pixels,
+            SIZE.0,
+            SIZE.1,
+            region,
+            &extra,
+            &masks,
+        );
+        let job_id = receipt.job_id();
+        let mut owner = ProducerInputs::default();
+        assert!(owner.body_geometry().is_none(), "PF{pf} unwritten at rest");
+        owner
+            .write_body_geometry(producer(pf, job_id), &receipt)
+            .unwrap();
+        let written = owner.body_geometry().expect("PF{pf} written");
+        assert_eq!((written.job_id, written.frame_size), (job_id, SIZE), "PF{pf}");
+        assert!(written.effects.contains_key(&pf), "PF{pf}");
+        all.insert(pf, fixture(pf));
+
+        let mut job = PortraitJobInputs::from_renderer_receipt(receipt, &masks);
+        job.fill_from_producer_inputs(&owner);
+        let entered = job.body_geometry.expect("PF{pf} reaches PortraitJobInputs");
+        assert_eq!(entered.job_id, job_id, "PF{pf}");
+
+        let mut pixels = source.pixels.clone();
+        let report =
+            apply_portrait_effects_with_job(&mut pixels, SIZE.0, SIZE.1, region, &extra, &job);
+        let run = &report.effects[0];
+        assert!(run.executed && !run.skipped && run.refusal.is_none(), "PF{pf}");
+        assert_eq!(run.backend, PortraitBackend::Cpu, "PF{pf}");
+        assert_ne!(pixels, source.pixels, "PF{pf}");
+    }
+
+    // One job may carry every routed row at once for the same renderer job.
+    let extra: BTreeMap<String, f32> = ROUTED
+        .iter()
+        .map(|pf| (format!("pc:{pf}"), 50.0))
+        .collect();
+    let receipt = PortraitJobReceipt::from_renderer_receipt(
+        &source.pixels,
+        SIZE.0,
+        SIZE.1,
+        region,
+        &extra,
+        &masks,
+    );
+    let mut owner = ProducerInputs::default();
+    owner
+        .write_body_geometry(
+            BodyGeometryJob {
+                job_id: receipt.job_id(),
+                frame_size: SIZE,
+                source_sha256: sha256_32(&source.pixels),
+                effects: all,
+            },
+            &receipt,
+        )
+        .unwrap();
+    assert_eq!(
+        owner.body_geometry().map(|job| job.effects.len()),
+        Some(ROUTED.len())
+    );
+}
+
+#[test]
+fn body_producer_entry_refuses_payloads_it_cannot_honor() {
+    let source = frame();
+    let masks = PortraitMasks::default();
+    let region = NormRect::FULL;
+    let extra = BTreeMap::from([("pc:401".to_string(), 50.0)]);
+    let receipt = PortraitJobReceipt::from_renderer_receipt(
+        &source.pixels,
+        SIZE.0,
+        SIZE.1,
+        region,
+        &extra,
+        &masks,
+    );
+    // A refused write must leave the sole entry point unwritten.
+    let write = |job: BodyGeometryJob| {
+        let mut owner = ProducerInputs::default();
+        let result = owner.write_body_geometry(job, &receipt);
+        assert_eq!(owner.body_geometry().is_none(), result.is_err());
+        result
+    };
+
+    assert_eq!(
+        write(producer(401, 0)),
+        Err(Refusal::ValueOutOfRange("body geometry job id"))
+    );
+    assert_eq!(
+        write(producer(401, receipt.job_id() ^ 1)),
+        Err(Refusal::ValueOutOfRange("body geometry job id"))
+    );
+    assert_eq!(
+        write(BodyGeometryJob {
+            job_id: receipt.job_id(),
+            frame_size: (SIZE.0 + 1, SIZE.1),
+            source_sha256: sha256_32(&source.pixels),
+            effects: BTreeMap::from([(401, fixture(401))]),
+        }),
+        Err(Refusal::ShapeMismatch("body geometry frame"))
+    );
+    // Right job, wrong payload kind for the row.
+    assert_eq!(
+        write(BodyGeometryJob {
+            job_id: receipt.job_id(),
+            frame_size: SIZE,
+            source_sha256: sha256_32(&source.pixels),
+            effects: BTreeMap::from([(401, fixture(400))]),
+        }),
+        Err(Refusal::ShapeMismatch("body geometry effect kind"))
+    );
+    // PF403 stays unrouted: refuse rather than invent a mask contract.
+    assert_eq!(
+        write(BodyGeometryJob {
+            job_id: receipt.job_id(),
+            frame_size: SIZE,
+            source_sha256: sha256_32(&source.pixels),
+            effects: BTreeMap::from([(403, fixture(400))]),
+        }),
+        Err(Refusal::UnknownEffect(403))
+    );
 }

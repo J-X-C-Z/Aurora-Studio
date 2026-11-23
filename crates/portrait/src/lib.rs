@@ -13,6 +13,7 @@ pub mod plump_session;
 pub mod device;
 pub mod eye_bag_alignment;
 pub mod cuda;
+pub mod cuda_job_upload;
 pub mod cuda_lut;
 pub mod cuda_pf90021;
 pub mod cuda_pf8050;

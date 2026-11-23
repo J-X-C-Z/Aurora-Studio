@@ -305,3 +305,114 @@ fn remaining_eye_routes_use_cuda_when_available_and_fallback_matches_bytes() {
         }
     }
 }
+
+/// The recovered eye and brow rows ride the same CUDA fragment contract as the
+/// WL rows once the caller supplies an index buffer, so they must agree with
+/// the CPU raster byte for byte rather than stay pinned to CPU.
+#[cfg(windows)]
+#[test]
+fn eye_and_brow_family_routes_use_cuda_when_available_and_fallback_matches_bytes() {
+    let (source, slim) = super::super::portrait_slim_stage::tests::fixture();
+    let geometry = FaceGeometry::Eye {
+        dest: vec![[0.0, 0.0], [8.0, 0.0], [0.0, 8.0]],
+        uv: vec![[0.25, 0.0], [1.0, 0.0], [0.25, 1.0]],
+        ebo: aurora_portrait::kernels::eye_geometry::QUAD_INDICES[..3].to_vec(),
+        rules: slim.rules,
+        edge: raster_fragment::Edge::ReshapeNormal,
+        defines: raster_fragment::Defines::plain(),
+        clamp: raster_fragment::Clamp::disabled(),
+    };
+    // Only the left row of each pair is dispatched; the right control rides as
+    // `controls[1]`, matching the stage's pair contract.
+    for pf in [8001u32, 8005, 8009, 8011, 8013, 8015, 8017, 8019, 8021] {
+        let input = FaceGeometryInputs {
+            job_id: slim.job_id,
+            width: source.width,
+            height: source.height,
+            draws: vec![FaceGeometryDraw {
+                pf,
+                controls: [0.5, 0.0],
+                source_sha256: sha256_32(&source.pixels),
+                geometry: geometry.clone(),
+            }],
+        };
+        let run = |force_cuda_failure: bool| {
+            if force_cuda_failure {
+                super::super::FORCE_CUDA_FAILURE.with(|flag| flag.set(true));
+            }
+            let result = apply(
+                &source,
+                NormRect::FULL,
+                Some(slim.job_id),
+                Some(&input),
+                Some(&slim),
+                pf,
+                [0.5, 0.0],
+            );
+            if force_cuda_failure {
+                super::super::FORCE_CUDA_FAILURE.with(|flag| flag.set(false));
+            }
+            result.unwrap()
+        };
+        let cpu = run(true);
+        assert_eq!(cpu.backend, PortraitBackend::Cpu, "PF{pf}");
+        assert!(cpu.fallback_reason.is_some(), "PF{pf}");
+
+        let cuda = run(false);
+        if cuda.backend == PortraitBackend::Cuda {
+            assert_eq!(cuda.image, cpu.image, "PF{pf}");
+            assert_eq!(cuda.dispatches.len(), 2, "PF{pf}");
+            eprintln!(
+                "PF{pf}: CUDA {} on {}",
+                cuda.dispatches[0].kernel, cuda.dispatches[0].device
+            );
+        } else {
+            assert_eq!(cuda.image, cpu.image, "PF{pf} fallback bytes differ");
+            assert!(
+                std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
+                "CUDA required but PF{pf} fell back: {:?}",
+                cuda.fallback_reason
+            );
+        }
+    }
+}
+
+/// A registry row whose producer is callable but unrouted must say which
+/// inputs are missing; only a row with no kernel stays `NotImplemented`.
+#[test]
+fn producer_only_rows_report_named_inputs_and_unrouted_rows_stay_unimplemented() {
+    for (pf, inputs) in [
+        (202u32, "194 landmarks + 135 weights + control slots"),
+        (232, "landmarks 192..206 + 15 factors"),
+    ] {
+        let meta = aurora_portrait::lookup(pf).expect("registry row");
+        let gap = producer_gap(pf).expect("named producer gap");
+        for input in inputs.split(" + ") {
+            assert!(
+                meta.inputs.iter().any(|known| *known == input),
+                "PF{pf} {input}"
+            );
+            assert!(gap.contains(input), "PF{pf} gap omits {input}");
+        }
+        assert!(pair(pf).is_none(), "PF{pf} must stay unrouted");
+    }
+    // 8003/8004/8031/8032 have no registry row at all, and the eye/brow family
+    // keeps its kernel-owned EBO names instead of a generic label.
+    for pf in [8003u32, 8004, 8007, 8008, 8031, 8032] {
+        assert!(
+            aurora_portrait::lookup(pf).is_none(),
+            "PF{pf} has no registry row"
+        );
+        assert_eq!(producer_gap(pf), None, "PF{pf}");
+    }
+    for pf in [8001u32, 8005, 8009] {
+        assert_eq!(
+            missing_draw(pf),
+            aurora_portrait::kernels::eye_geometry::ebo_rva(pf).unwrap(),
+            "PF{pf}"
+        );
+    }
+    for pf in [8011u32, 8013, 8019] {
+        assert_eq!(missing_draw(pf), "same-job face geometry", "PF{pf}");
+    }
+}

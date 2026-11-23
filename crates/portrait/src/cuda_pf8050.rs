@@ -791,51 +791,52 @@ impl Pf8050Stage {
             sin_right,
         };
 
-        let mesh_buffer = self.gpu.alloc_buffer(std::mem::size_of_val(resolved.mesh_a))?;
-        let w0_buffer = self
-            .gpu
-            .alloc_buffer(std::mem::size_of_val(&resolved.weights.stage0_raw))?;
-        let w2_buffer = self
-            .gpu
-            .alloc_buffer(std::mem::size_of_val(&resolved.weights.stage2))?;
+        let mesh_bytes = std::mem::size_of_val(resolved.mesh_a);
+        let w0_bytes = std::mem::size_of_val(&resolved.weights.stage0_raw);
+        let w2_bytes = std::mem::size_of_val(&resolved.weights.stage2);
         let output_bytes = STAGE_COUNT * MESH_POINTS * std::mem::size_of::<[f32; 2]>();
-        let output_buffer = self.gpu.alloc_buffer(output_bytes)?;
-        self.gpu.upload_buffer(&mesh_buffer, f32_pair_bytes(resolved.mesh_a))?;
-        self.gpu
-            .upload_buffer(&w0_buffer, f32_bytes(&resolved.weights.stage0_raw))?;
-        self.gpu
-            .upload_buffer(&w2_buffer, f32_bytes(&resolved.weights.stage2))?;
+        self.gpu.with_reusable_buffers(
+            "cuda_pf8050.apply",
+            &[mesh_bytes, w0_bytes, w2_bytes, output_bytes],
+            |buffers| {
+                buffers.upload(0, f32_pair_bytes(resolved.mesh_a))?;
+                buffers.upload(1, f32_bytes(&resolved.weights.stage0_raw))?;
+                buffers.upload(2, f32_bytes(&resolved.weights.stage2))?;
 
-        let mut mesh_arg = mesh_buffer.handle();
-        let mut w0_arg = w0_buffer.handle();
-        let mut w2_arg = w2_buffer.handle();
-        let mut uniform_arg = uniforms;
-        let mut output_arg = output_buffer.handle();
-        let mut params: [*mut std::ffi::c_void; 5] = [
-            &mut mesh_arg as *mut u64 as *mut std::ffi::c_void,
-            &mut w0_arg as *mut u64 as *mut std::ffi::c_void,
-            &mut w2_arg as *mut u64 as *mut std::ffi::c_void,
-            &mut uniform_arg as *mut Uniforms as *mut std::ffi::c_void,
-            &mut output_arg as *mut u64 as *mut std::ffi::c_void,
-        ];
-        let dispatch = self
-            .gpu
-            .launch_raw(KERNEL, (1, 1), (1, 1), &mut params)?;
-        let mut raw = vec![0u8; output_bytes];
-        self.gpu.download_buffer(&output_buffer, &mut raw)?;
-        let mut stages = Vec::with_capacity(STAGE_COUNT);
-        for stage in 0..STAGE_COUNT {
-            let offset = stage * MESH_POINTS * 8;
-            let stage_bytes = &raw[offset..offset + MESH_POINTS * 8];
-            stages.push(std::array::from_fn(|index| {
-                let point = index * 8;
-                [
-                    f32::from_le_bytes(stage_bytes[point..point + 4].try_into().unwrap()),
-                    f32::from_le_bytes(stage_bytes[point + 4..point + 8].try_into().unwrap()),
-                ]
-            }));
-        }
-        Ok((Output { stages }, dispatch))
+                let mut mesh_arg = buffers.handle(0);
+                let mut w0_arg = buffers.handle(1);
+                let mut w2_arg = buffers.handle(2);
+                let mut uniform_arg = uniforms;
+                let mut output_arg = buffers.handle(3);
+                let mut params: [*mut std::ffi::c_void; 5] = [
+                    &mut mesh_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut w0_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut w2_arg as *mut u64 as *mut std::ffi::c_void,
+                    &mut uniform_arg as *mut Uniforms as *mut std::ffi::c_void,
+                    &mut output_arg as *mut u64 as *mut std::ffi::c_void,
+                ];
+                let dispatch = buffers.launch(KERNEL, (1, 1), (1, 1), &mut params)?;
+                let mut raw = vec![0u8; output_bytes];
+                buffers.download(3, &mut raw)?;
+                buffers.mark_consumed();
+
+                let mut stages = Vec::with_capacity(STAGE_COUNT);
+                for stage in 0..STAGE_COUNT {
+                    let offset = stage * MESH_POINTS * 8;
+                    let stage_bytes = &raw[offset..offset + MESH_POINTS * 8];
+                    stages.push(std::array::from_fn(|index| {
+                        let point = index * 8;
+                        [
+                            f32::from_le_bytes(stage_bytes[point..point + 4].try_into().unwrap()),
+                            f32::from_le_bytes(
+                                stage_bytes[point + 4..point + 8].try_into().unwrap(),
+                            ),
+                        ]
+                    }));
+                }
+                Ok((Output { stages }, dispatch))
+            },
+        )
     }
 }
 

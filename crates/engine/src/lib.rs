@@ -72,35 +72,74 @@ pub mod mask_store;
 mod noise_defaults;
 mod output;
 mod portrait_stage;
+pub mod portrait_model_output_provider;
 mod wrinkle_legacy;
 pub mod portrait_makeup_bundle;
+mod portrait_historical_tone_provider;
+pub mod portrait_makeup_provider;
 pub use aurora_portrait::cuda_pf90021::{
     Direction as Pf90021Direction, RuntimeScalars as Pf90021RuntimeScalars, VolumeLut64,
 };
 pub use aurora_portrait::{Image as PortraitImage, Refusal as PortraitRefusal};
+pub use portrait_historical_tone_provider::{
+    build_complete_historical_tone_inputs, build_historical_tone_inputs,
+    HistoricalToneBreastRepairPayload, HistoricalToneCollarbonePayload,
+    HistoricalToneEyeRedVeinsPayload, HistoricalToneFlatGrayPayload,
+    HistoricalToneGray3dPayload, HistoricalToneHairColorPayload,
+    HistoricalToneHandGrayPayload, HistoricalToneHandShapePayload,
+    HistoricalToneHandVeinsPayload, HistoricalToneMultiTonePayload,
+    HistoricalToneProviderPayload, HistoricalToneProviderRow, HistoricalToneRowData,
+    HistoricalToneRowJob, HISTORICAL_TONE_PROVIDER_PFS,
+};
 pub use portrait_stage::{
     BodyGeometryInput, BodyGeometryJob, BodyShiftInput, FaceGeometry, FaceGeometryDraw,
-    FaceGeometryInputs, HistoricalSkinData, HistoricalSkinInput, HistoricalSkinInputs,
-    HistoricalSkinPass, HistoricalSkinWrinkle, HistoricalToneData, HistoricalToneFace,
+    FaceGeometryInputs, FaceGeometryProviderInputs, FaceGeometryProviderMesh,
+    FaceGeometryProviderMeshReceipt, FaceGeometryProviderReceipt, FaceGeometryProviderRoute,
+    FaceGeometryProviderRow, HistoricalSkinData, HistoricalSkinExternalInputs,
+    HistoricalSkinExternalRow, HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass,
+    HistoricalSkinWrinkle, HistoricalToneData, HistoricalToneFace,
     HistoricalToneInput, HistoricalToneInputs,
     HlfBodyAdjustLutProducerInputs, Pf8050AttachReceipt, Pf8050FboReceipt, Pf8050GeometryInputs,
     Pf8050StageInputs, Pf8050VendorRuntime, Pf30025Inputs, Pf30025LiveModelOutputs,
     Pf30025ProducerInputs, Pf30025SameJobReceipt, Pf30025SourceSurface, Pf30026EdgeOutput,
     Pf30026GateBinding, Pf90004ProducerInputs, Pf90021DirectionReceipt, Pf90021Inputs,
     Pf90021MaskSource, Pf90021ProducerInputs, Pf90021RuntimeReceipt, Pf90021SameJobBinding,
-    MakeupInput, PortraitBackend, PortraitEffectRun, PortraitFrameReceipt, PortraitGeometryRun,
-    PortraitJobInputs, PortraitJobReceipt, PortraitMasks, ProducerInputs, PLUMP_PFS,
+    FaceLandmarkProducerInputs, FACE_LANDMARK_52_MODEL_SHA256, FACE_LANDMARK_52_RESOURCE,
+    FaceInputBundle, FaceInputModelPaths, FaceInputProducer, C1FaceDetection,
+    C1FaceMesh, C1FaceParsing, C1_FACE_DETECTION_MODEL_SHA256, C1_FACE_DETECTION_MODEL_ID,
+    C1_FACE_MESH_MODEL_SHA256, C1_FACE_MESH_MODEL_ID, C1_FACE_PARSING_MODEL_SHA256,
+    C1_FACE_PARSING_MODEL_ID, FACE_LANDMARK_1063025060_MODEL_SHA256,
+    FACE_LANDMARK_323773030_MODEL_SHA256, FACE_LANDMARK_CONSTANTS_SHA256,
+    FaceInputFileStamp, FaceInputResultKey, FaceInputSession, FaceInputSessionKey,
+    FaceModelIdentity, FaceNormalization, FaceStageTransform, FACE_STAGE_TRANSFORM_REFUSAL,
+    EyeBagFrameProducer, Pf90116ColorDomain,
+    Pf90116FrameBinding, Pf90116FrameReceipt, Pf90116InputOrder, Pf90116TensorReceipts,
+    PF90116_ACTIVE_GATE, PF90116_COLOR_NAME, PF90116_COLOR_SHAPE, PF90116_INPUT_MEAN,
+    PF90116_INPUT_NAME, PF90116_INPUT_SCALE, PF90116_INPUT_SHAPE, PF90116_MODEL_HEIGHT,
+    PF90116_MODEL_ID, PF90116_MODEL_NET_SHA256, PF90116_MODEL_PAYLOAD_SHA256,
+    PF90116_MODEL_WIDTH, PF90116_RESPONSE_NAME, PF90116_RESPONSE_SHAPE, MakeupInput,
+    PortraitBackend, PortraitEffectRun,
+    PortraitFrameReceipt, PortraitGeometryRun, PortraitJobInputs, PortraitJobReceipt,
+    PortraitMasks, ProducerInputs, PLUMP_PFS,
     PlumpCompositeReceipt, PlumpFinalComposite, PlumpProducerInputs, SmileAxisDecode, SmileAxisSign,
     SmileChannelSplit, SmileFieldChannel, SmileHostSplitSpec,
     SmileProducerInputs, SmileRgbReconstructionField, SmileSigmoidEdgeResponse,
-    RepairOutput, RepairProducerInputs, SixPointWarp, SlimProducerInputs,
-    StrayHairProducerInputs, SuitPassInput, SuitPassKindInput, TeethAlignmentProducerInputs,
-    TeethProducerInputs,
+    BeardInputs, HairGlossInputs, HairSmoothInputs, MoistureBodyInputs, MoistureFaceInputs,
+    RepairModelPlanes, RepairOutput, RepairOutputReceipt, RepairPlaneSha256,
+    RepairProducerInputs, SixPointWarp, SlimProducerInputs,
+    StrayHairInputs, StrayHairProducerInputs, SuitPassInput, SuitPassKindInput,
+    TeethAlignmentProducerInputs, TeethProducerInputs,
     apply_pf8050_pf8051_geometry,
     apply_pf8050_pf8051_stage,
+    build_historical_skin_inputs,
     apply_portrait_effects_with_job,
     apply_portrait_effects_with_report_and_inputs,
+    build_face_geometry_inputs,
     full_face_descriptor_from_ui,
+    landmark_receipt_hashes,
+    mesh_receipt,
+    provider_route,
+    PROVIDER_ROUTED_PFS,
 };
 pub use wrinkle_legacy::{
     WRINKLE_FACEPARSING_MASK_MAPPING_REFUSAL, WRINKLE_FACE_ROI_WRITER_RVA,
@@ -125,6 +164,7 @@ pub use portrait_stage::{
     apply_pf90130_producer_stage, bridge_glare_planes, run_skin_repair,
 };
 pub use portrait_makeup_bundle::*;
+pub use portrait_makeup_provider::*;
 mod param_meta;
 mod preview_cache;
 mod presets;

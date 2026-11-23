@@ -44,6 +44,21 @@ __device__ __forceinline__ float4 p15_load(const float* p, size_t offset) {
   return make_float4(p[offset], p[offset + 1], p[offset + 2], p[offset + 3]);
 }
 
+// Byte-input expansion. `byte * (1/255)` with the reciprocal rounded once at
+// compile time, which is bit-identical to the Rust `byte as f32 * INV255` used
+// by the CPU wrinkle oracle and by cuda_wrinkle::rgba_f32. It is deliberately
+// NOT `byte / 255`: the two differ for 126 of the 256 byte values.
+__device__ __forceinline__ float p15_inv255(unsigned char byte) {
+  const float kInv255 = 1.0f / 255.0f;
+  return p15_mul((float)byte, kInv255);
+}
+
+__device__ __forceinline__ float4 p15_load_u8_rgba(const unsigned char* p,
+                                                   size_t offset) {
+  return make_float4(p15_inv255(p[offset]), p15_inv255(p[offset + 1]),
+                     p15_inv255(p[offset + 2]), p15_inv255(p[offset + 3]));
+}
+
 __device__ __forceinline__ float4 p15_bilinear(
     const float* rgba,
     const P15FacialSmoothUniforms& u,
@@ -218,6 +233,48 @@ extern "C" __global__ void p15_facial_smooth_composite_kernel(
           p15_mul(uniforms.dark_circle_alpha, mask.x),
           p15_mul(uniforms.legal_alpha, mask.z)), 0.0f),
       skin_mask_r[pixel]);
+  float4 result = source;
+  if (alpha > 0.0f) {
+    result.x = p15_composite_channel(
+        source.x, base_color.x, residual.x, alpha, uniforms);
+    result.y = p15_composite_channel(
+        source.y, base_color.y, residual.y, alpha, uniforms);
+    result.z = p15_composite_channel(
+        source.z, base_color.z, residual.z, alpha, uniforms);
+  }
+  result.w = source.w;
+  output_rgba[offset] = result.x;
+  output_rgba[offset + 1] = result.y;
+  output_rgba[offset + 2] = result.z;
+  output_rgba[offset + 3] = result.w;
+}
+
+// Byte-input twin of p15_facial_smooth_composite_kernel. Only the five input
+// pointers change type; the alpha law, the per-channel expression and the
+// float output layout are the same statements in the same order. The caller
+// uploads its own u8 buffers, so no host-side f32 expansion is needed.
+extern "C" __global__ void p15_facial_smooth_composite_u8_kernel(
+    const unsigned char* source_rgba,
+    const unsigned char* mask_rgba,
+    const unsigned char* skin_mask_r,
+    const unsigned char* base_rgba,
+    const unsigned char* residual_base_rgba,
+    float* output_rgba,
+    P15FacialSmoothUniforms uniforms) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= (int)uniforms.width || y >= (int)uniforms.height) return;
+  int pixel = y * (int)uniforms.stride + x;
+  size_t offset = (size_t)pixel * 4u;
+  float4 source = p15_load_u8_rgba(source_rgba, offset);
+  float4 mask = p15_load_u8_rgba(mask_rgba, offset);
+  float4 base_color = p15_load_u8_rgba(base_rgba, offset);
+  float4 residual = p15_load_u8_rgba(residual_base_rgba, offset);
+  float alpha = p15_mul(
+      p15_max(p15_max(
+          p15_mul(uniforms.dark_circle_alpha, mask.x),
+          p15_mul(uniforms.legal_alpha, mask.z)), 0.0f),
+      p15_inv255(skin_mask_r[pixel]));
   float4 result = source;
   if (alpha > 0.0f) {
     result.x = p15_composite_channel(
