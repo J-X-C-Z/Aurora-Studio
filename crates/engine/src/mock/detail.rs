@@ -56,11 +56,17 @@ pub(crate) fn post_process_core_f32(
     if nr.single_pixel > 0.0 {
         stage_single_pixel_f32(rgb, w, h, nr);
     }
-    if nr.luminance > 0.0 {
-        stage_luminance_nr_f32(rgb, w, h, nr);
-    }
-    if nr.color > 0.0 {
-        stage_color_nr_f32(rgb, w, h, nr, scale);
+    if nr.luminance > 0.0 || nr.color > 0.0 {
+        // CUDA runs both stages in one upload/download pair when available;
+        // `AURORA_NR_GPU=0` or any GPU failure keeps the CPU stages below.
+        if !super::nr_gpu::run_f32(rgb, w, h, nr, scale) {
+            if nr.luminance > 0.0 {
+                stage_luminance_nr_f32(rgb, w, h, nr);
+            }
+            if nr.color > 0.0 {
+                stage_color_nr_f32(rgb, w, h, nr, scale);
+            }
+        }
     }
     if include_sharpen && adj.sharpening.amount > 0.0 {
         stage_sharpening_f32(rgb, w, h, &adj.sharpening, scale);
@@ -151,7 +157,12 @@ fn stage_single_pixel_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseR
     });
 }
 
-fn stage_luminance_nr_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseReduction) {
+pub(super) fn stage_luminance_nr_f32(
+    rgb: &mut [[f32; 3]],
+    w: usize,
+    h: usize,
+    adj: &NoiseReduction,
+) {
     let strength = (adj.luminance / 100.0).clamp(0.0, 1.0);
     if strength <= 0.0 {
         return;
@@ -198,7 +209,13 @@ fn stage_luminance_nr_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseR
     });
 }
 
-fn stage_color_nr_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseReduction, scale: f32) {
+pub(super) fn stage_color_nr_f32(
+    rgb: &mut [[f32; 3]],
+    w: usize,
+    h: usize,
+    adj: &NoiseReduction,
+    scale: f32,
+) {
     let strength = (adj.color / 100.0).clamp(0.0, 1.0);
     if strength <= 0.0 || w == 0 || h == 0 {
         return;
@@ -2121,7 +2138,7 @@ fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
 /// Deterministic hash noise (no RNG state, so previews are reproducible).
 /// `granularity` picks the size of the noise cell, `kind` shapes the
 /// distribution and how it is weighted.
-fn hash_noise(x: u32, y: u32, seed: u32) -> f32 {
+pub(super) fn hash_noise(x: u32, y: u32, seed: u32) -> f32 {
     let mut h = x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77) ^ seed.wrapping_mul(0xC2B2_AE3D);
     h ^= h >> 15;
     h = h.wrapping_mul(0x2545_F491);
@@ -2412,6 +2429,41 @@ mod tests {
         post_process_impl(&mut actual, w as u32, h as u32, &adj, 1.0, None, false);
         let mut expected = base.clone();
         cpu_detail_reference(&mut expected, w, h, &adj, 1.0, None);
+        assert_eq!(actual, expected);
+    }
+
+    /// `AURORA_NR_GPU=0` must keep the exact CPU float32 bytes.
+    #[test]
+    fn nr_gpu_disabled_keeps_the_cpu_core_bytes() {
+        let (w, h) = (97usize, 61usize);
+        let base: Vec<[f32; 3]> = (0..w * h)
+            .map(|i| {
+                let v = ((i * 37) % 251) as f32 / 251.0;
+                [v, (v * 0.9 + 0.05).min(1.0), (v * 0.8 + 0.1).min(1.0)]
+            })
+            .collect();
+        let adj = crate::AdjustmentSet {
+            noise_reduction: NoiseReduction {
+                luminance: 60.0,
+                details: 35.0,
+                color: 40.0,
+                single_pixel: 0.0,
+            },
+            ..Default::default()
+        };
+        let saved = std::env::var_os("AURORA_NR_GPU");
+        unsafe { std::env::set_var("AURORA_NR_GPU", "0") };
+        let mut actual = base.clone();
+        post_process_core_f32(&mut actual, w as u32, h as u32, &adj, 1.0, false);
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("AURORA_NR_GPU", value),
+                None => std::env::remove_var("AURORA_NR_GPU"),
+            }
+        }
+        let mut expected = base;
+        stage_luminance_nr_f32(&mut expected, w, h, &adj.noise_reduction);
+        stage_color_nr_f32(&mut expected, w, h, &adj.noise_reduction, 1.0);
         assert_eq!(actual, expected);
     }
 
@@ -2930,6 +2982,52 @@ over1={over1} diff_px={diff_px}",
         run("lens(generic)", &|b| stage_lens(b, w, h, &lens, None));
         run("grain", &|b| crate::mock::grain::stage(b, w, h, &grain, 1.0));
         run("post_process(all on)", &|b| post_process_with_lens(b, w as u32, h as u32, &adj, 1.0, None));
+    }
+
+    /// 24 MP (6048x4032) cost of the two noise stages, CPU reference.
+    /// `cargo test -p aurora-engine --release bench_nr_stages_24mp -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run explicitly with --ignored"]
+    fn bench_nr_stages_24mp() {
+        use std::time::Instant;
+        let (w, h) = (6048usize, 4032usize);
+        let nr = NoiseReduction {
+            luminance: 50.0,
+            details: 50.0,
+            color: 50.0,
+            single_pixel: 0.0,
+        };
+        // Photo-like tones: smooth ramps plus fine hash noise and chroma mottling.
+        let mut rgb: Vec<[f32; 3]> = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x as f32 % 251.0) / 250.0;
+                let n = hash_noise(x as u32, y as u32, 7);
+                let c = (v * 0.7 + n * 0.3).clamp(0.0, 1.0);
+                rgb.push([c, (c * 0.94 + n * 0.02).clamp(0.0, 1.0), (c * 0.9 + n * 0.04).clamp(0.0, 1.0)]);
+            }
+        }
+        let pixels = (w * h) as f64;
+        let timed = |label: &str, src: &[[f32; 3]], f: &dyn Fn(&mut Vec<[f32; 3]>) -> f64| {
+            let mut buf = src.to_vec();
+            let t = Instant::now();
+            let checksum = f(&mut buf);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "{label:24} {ms:8.2} ms  {:6.1} Mpx/s  checksum={checksum:.3}",
+                pixels / ms / 1000.0
+            );
+            ms
+        };
+        let luma_ms = timed("luma_nr_f32", &rgb, &|b| {
+            stage_luminance_nr_f32(b, w, h, &nr);
+            b[0][0] as f64 + b[w * h - 1][2] as f64
+        });
+        let color_ms = timed("color_nr_f32", &rgb, &|b| {
+            stage_color_nr_f32(b, w, h, &nr, 1.0);
+            b[0][0] as f64 + b[w * h - 1][2] as f64
+        });
+        println!("NR_F32_CPU luma_ms={luma_ms:.2} color_ms={color_ms:.2} total_ms={:.2}", luma_ms + color_ms);
     }
 
     /// An adjustment set with every detail stage switched off.

@@ -350,6 +350,7 @@ mod driver {
     type CuModule = *mut c_void;
     type CuFunction = *mut c_void;
     type CuPtr = u64;
+    type CuStream = *mut c_void;
 
     const ATTR_CC_MAJOR: i32 = 75;
     const ATTR_CC_MINOR: i32 = 76;
@@ -388,6 +389,19 @@ mod driver {
         copy_in: unsafe extern "system" fn(CuPtr, *const c_void, usize) -> CuResult,
         copy_out: unsafe extern "system" fn(*mut c_void, CuPtr, usize) -> CuResult,
         copy_device: unsafe extern "system" fn(CuPtr, CuPtr, usize) -> CuResult,
+        /// Optional pinned/async entry points. They are absent on very old
+        /// drivers; callers fall back to the synchronous pageable copies.
+        mem_alloc_host: Option<unsafe extern "system" fn(*mut *mut c_void, usize) -> CuResult>,
+        mem_free_host: Option<unsafe extern "system" fn(*mut c_void) -> CuResult>,
+        mem_host_register: Option<unsafe extern "system" fn(*mut c_void, usize, u32) -> CuResult>,
+        mem_host_unregister: Option<unsafe extern "system" fn(*mut c_void) -> CuResult>,
+        copy_in_async:
+            Option<unsafe extern "system" fn(CuPtr, *const c_void, usize, CuStream) -> CuResult>,
+        copy_out_async:
+            Option<unsafe extern "system" fn(*mut c_void, CuPtr, usize, CuStream) -> CuResult>,
+        stream_create: Option<unsafe extern "system" fn(*mut CuStream, u32) -> CuResult>,
+        stream_destroy: Option<unsafe extern "system" fn(CuStream) -> CuResult>,
+        stream_sync: Option<unsafe extern "system" fn(CuStream) -> CuResult>,
         launch: unsafe extern "system" fn(
             CuFunction,
             u32,
@@ -434,6 +448,21 @@ mod driver {
                     std::mem::transmute::<*mut c_void, _>(address)
                 }};
             }
+            macro_rules! sym_opt {
+                ($v2:literal, $plain:literal) => {{
+                    let mut address =
+                        GetProcAddress(handle, concat!($v2, "\0").as_ptr() as *const c_char);
+                    if address.is_null() {
+                        address =
+                            GetProcAddress(handle, concat!($plain, "\0").as_ptr() as *const c_char);
+                    }
+                    if address.is_null() {
+                        None
+                    } else {
+                        Some(std::mem::transmute::<*mut c_void, _>(address))
+                    }
+                }};
+            }
             Ok(Api {
                 init: sym!("cuInit"),
                 device_get: sym!("cuDeviceGet"),
@@ -453,6 +482,15 @@ mod driver {
                 copy_in: sym2!("cuMemcpyHtoD_v2", "cuMemcpyHtoD"),
                 copy_out: sym2!("cuMemcpyDtoH_v2", "cuMemcpyDtoH"),
                 copy_device: sym2!("cuMemcpyDtoD_v2", "cuMemcpyDtoD"),
+                mem_alloc_host: sym_opt!("cuMemAllocHost_v2", "cuMemAllocHost"),
+                mem_free_host: sym_opt!("cuMemFreeHost", "cuMemFreeHost"),
+                mem_host_register: sym_opt!("cuMemHostRegister_v2", "cuMemHostRegister"),
+                mem_host_unregister: sym_opt!("cuMemHostUnregister", "cuMemHostUnregister"),
+                copy_in_async: sym_opt!("cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync"),
+                copy_out_async: sym_opt!("cuMemcpyDtoHAsync_v2", "cuMemcpyDtoHAsync"),
+                stream_create: sym_opt!("cuStreamCreate", "cuStreamCreate"),
+                stream_destroy: sym_opt!("cuStreamDestroy_v2", "cuStreamDestroy"),
+                stream_sync: sym_opt!("cuStreamSynchronize", "cuStreamSynchronize"),
                 launch: sym!("cuLaunchKernel"),
             })
         }
@@ -1143,6 +1181,110 @@ mod driver {
                     let _ = domain.synchronize_pending();
                     unsafe {
                         let _ = (domain.api.mem_free)(self.ptr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Page-locked host allocation (`cuMemAllocHost`): a DMA copy reads and
+    /// writes it directly instead of staging through the driver's pageable
+    /// bounce buffer.
+    #[allow(dead_code)] // consumed by `nr_gpu`
+    pub struct PinnedBuffer<'a> {
+        ptr: *mut c_void,
+        bytes: usize,
+        owner: std::marker::PhantomData<&'a Nvidia>,
+    }
+
+    #[allow(dead_code)] // consumed by `nr_gpu`
+    impl PinnedBuffer<'_> {
+        pub fn bytes(&self) -> usize {
+            self.bytes
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.bytes) }
+        }
+
+        pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.bytes) }
+        }
+    }
+
+    impl Drop for PinnedBuffer<'_> {
+        fn drop(&mut self) {
+            if let Ok(domain) = domain() {
+                let mut domain = domain
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if domain.bind().is_ok()
+                    && let Some(free) = domain.api.mem_free_host
+                {
+                    unsafe {
+                        let _ = free(self.ptr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A caller-owned host slice pinned in place (`cuMemHostRegister`), so an
+    /// existing `Vec` can feed async copies without a host-side copy.
+    #[allow(dead_code)] // consumed by `nr_gpu`
+    pub struct HostRegistration<'a> {
+        ptr: *mut c_void,
+        bytes: usize,
+        owner: std::marker::PhantomData<&'a mut [u8]>,
+    }
+
+    #[allow(dead_code)] // consumed by `nr_gpu`
+    impl HostRegistration<'_> {
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.bytes) }
+        }
+
+        pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.bytes) }
+        }
+    }
+
+    impl Drop for HostRegistration<'_> {
+        fn drop(&mut self) {
+            if let Ok(domain) = domain() {
+                let mut domain = domain
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if domain.bind().is_ok()
+                    && let Some(unregister) = domain.api.mem_host_unregister
+                {
+                    unsafe {
+                        let _ = unregister(self.ptr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A non-blocking stream so async copies and kernels do not serialise
+    /// against the legacy default stream.
+    #[allow(dead_code)] // consumed by `nr_gpu`
+    pub struct Stream<'a> {
+        ptr: CuStream,
+        owner: std::marker::PhantomData<&'a Nvidia>,
+    }
+
+    impl Drop for Stream<'_> {
+        fn drop(&mut self) {
+            if let Ok(domain) = domain() {
+                let mut domain = domain
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if domain.bind().is_ok()
+                    && let Some(destroy) = domain.api.stream_destroy
+                {
+                    unsafe {
+                        let _ = destroy(self.ptr);
                     }
                 }
             }
@@ -1943,6 +2085,27 @@ mod driver {
             block: (u32, u32),
             params: &mut [*mut c_void],
         ) -> Result<Dispatch, CudaError> {
+            self.launch_on_stream(
+                api,
+                module,
+                kernel,
+                geometry,
+                block,
+                params,
+                ptr::null_mut(),
+            )
+        }
+
+        fn launch_on_stream(
+            &self,
+            api: &Api,
+            module: CuModule,
+            kernel: &'static str,
+            geometry: (u32, u32),
+            block: (u32, u32),
+            params: &mut [*mut c_void],
+            stream: CuStream,
+        ) -> Result<Dispatch, CudaError> {
             let symbol = CString::new(kernel).expect("static kernel name");
             let mut function: CuFunction = ptr::null_mut();
             unsafe {
@@ -1960,7 +2123,7 @@ mod driver {
                         block.1,
                         1,
                         0,
-                        ptr::null_mut(),
+                        stream,
                         params.as_mut_ptr(),
                         ptr::null_mut(),
                     ),
@@ -2246,6 +2409,170 @@ mod driver {
                 domain.pending = false;
             }
             downloaded
+        }
+
+        /// Allocates page-locked host memory. `Unavailable` means the driver
+        /// has no `cuMemAllocHost`; callers then keep the pageable path.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer<'_>, CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let alloc = domain
+                .api
+                .mem_alloc_host
+                .ok_or(CudaError::Unavailable("cuMemAllocHost"))?;
+            let mut ptr: *mut c_void = ptr::null_mut();
+            unsafe {
+                check(alloc(&mut ptr, bytes.max(1)), "cuMemAllocHost")?;
+            }
+            Ok(PinnedBuffer {
+                ptr,
+                bytes,
+                owner: std::marker::PhantomData,
+            })
+        }
+
+        /// Pins a caller-owned slice in place so it can be the direct DMA
+        /// source or sink. The registration lives until the guard is dropped.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn register_host<'a>(
+            &self,
+            data: &'a mut [u8],
+        ) -> Result<HostRegistration<'a>, CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let register = domain
+                .api
+                .mem_host_register
+                .ok_or(CudaError::Unavailable("cuMemHostRegister"))?;
+            let ptr = data.as_mut_ptr() as *mut c_void;
+            unsafe {
+                check(register(ptr, data.len().max(1), 0), "cuMemHostRegister")?;
+            }
+            Ok(HostRegistration {
+                ptr,
+                bytes: data.len(),
+                owner: std::marker::PhantomData,
+            })
+        }
+
+        /// Creates a non-blocking stream for async copies and kernels.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn create_stream(&self) -> Result<Stream<'_>, CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let create = domain
+                .api
+                .stream_create
+                .ok_or(CudaError::Unavailable("cuStreamCreate"))?;
+            const CU_STREAM_NON_BLOCKING: u32 = 1;
+            let mut stream: CuStream = ptr::null_mut();
+            unsafe {
+                check(create(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
+            }
+            Ok(Stream {
+                ptr: stream,
+                owner: std::marker::PhantomData,
+            })
+        }
+
+        /// H2D copy from pinned (or registered) host memory on `stream`.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn upload_async(
+            &self,
+            buffer: &DeviceBuffer<'_>,
+            data: &[u8],
+            stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let copy = domain
+                .api
+                .copy_in_async
+                .ok_or(CudaError::Unavailable("cuMemcpyHtoDAsync"))?;
+            unsafe {
+                check(
+                    copy(buffer.ptr, data.as_ptr() as *const c_void, data.len(), stream.ptr),
+                    "cuMemcpyHtoDAsync",
+                )
+            }
+        }
+
+        /// D2H copy into pinned (or registered) host memory on `stream`.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn download_async(
+            &self,
+            buffer: &DeviceBuffer<'_>,
+            data: &mut [u8],
+            stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let copy = domain
+                .api
+                .copy_out_async
+                .ok_or(CudaError::Unavailable("cuMemcpyDtoHAsync"))?;
+            unsafe {
+                check(
+                    copy(data.as_mut_ptr() as *mut c_void, buffer.ptr, data.len(), stream.ptr),
+                    "cuMemcpyDtoHAsync",
+                )
+            }
+        }
+
+        /// Waits for every async copy and kernel queued on `stream`.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn stream_sync(&self, stream: &Stream<'_>) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let sync = domain
+                .api
+                .stream_sync
+                .ok_or(CudaError::Unavailable("cuStreamSynchronize"))?;
+            unsafe { check(sync(stream.ptr), "cuStreamSynchronize") }
+        }
+
+        /// [`Nvidia::launch_raw`] on an explicit stream.
+        #[allow(dead_code)] // consumed by `nr_gpu`
+        pub fn launch_raw_stream(
+            &self,
+            kernel: &'static str,
+            geometry: (u32, u32),
+            block: (u32, u32),
+            params: &mut [*mut c_void],
+            stream: &Stream<'_>,
+        ) -> Result<Dispatch, CudaError> {
+            self.with_domain(|domain, module| {
+                let dispatch = self.launch_on_stream(
+                    &domain.api,
+                    module,
+                    kernel,
+                    geometry,
+                    block,
+                    params,
+                    stream.ptr,
+                )?;
+                domain.pending = true;
+                Ok(dispatch)
+            })
         }
 
         /// Crate-private: allocate a group of buffers that can be reused for
@@ -2861,6 +3188,9 @@ mod driver {
 
 #[cfg(windows)]
 pub use driver::DeviceBuffer;
+pub use driver::HostRegistration;
+pub use driver::PinnedBuffer;
+pub use driver::Stream;
 #[cfg(windows)]
 pub use driver::{JobBufferSession, Nvidia};
 
