@@ -10,7 +10,7 @@ use aurora_portrait::Refusal;
 use crate::aimask::body_pose::{
     BodyKeypoint, BodyPoseInference, BODY_POSE_KEYPOINT_COUNT,
 };
-use crate::portrait_body_stage::{BodyGeometryInput, SixPointWarp};
+use crate::portrait_stage::{BodyGeometryInput, SixPointWarp};
 
 pub const BODY_LANDMARK_COUNT: usize = BODY_POSE_KEYPOINT_COUNT;
 pub const BODY_SIX_POINT_SLOTS: usize = 6;

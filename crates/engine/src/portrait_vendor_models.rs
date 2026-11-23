@@ -8,8 +8,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-const HAIR_SMOOTH_PFS: &[u16] = &[90139, 90140];
-const HAIR_GLOSS_PFS: &[u16] = &[90160];
+const HAIR_SMOOTH_PFS: &[u32] = &[90139, 90140];
+const HAIR_GLOSS_PFS: &[u32] = &[90160];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VendorModelBlocker {
@@ -21,7 +21,7 @@ pub enum VendorModelBlocker {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VendorModelAsset {
-    pub pfs: &'static [u16],
+    pub pfs: &'static [u32],
     pub stage: &'static str,
     pub model_id: Option<u32>,
     pub bytes: Option<u64>,
@@ -39,7 +39,7 @@ impl VendorModelAsset {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredVendorModel {
     pub asset: VendorModelAsset,
     pub path: PathBuf,
@@ -140,7 +140,7 @@ pub fn discover_in_asset_dir(dir: &Path) -> io::Result<Vec<DiscoveredVendorModel
         };
         if metadata.is_file() && metadata.len() == bytes {
             found.push(DiscoveredVendorModel {
-                asset,
+                asset: *asset,
                 path,
             });
         }

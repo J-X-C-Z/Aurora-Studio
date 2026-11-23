@@ -13,6 +13,7 @@ use aurora_portrait::{Image, Refusal};
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
 
+use crate::portrait_makeup_suit_inputs::D4_CAPTURE_MASK_UV;
 use crate::portrait_stage::{MakeupInput, SuitPassInput, SuitPassKindInput};
 
 pub const B3_MAKEUP_ROWS: [u32; 14] = [
@@ -1327,7 +1328,7 @@ impl OwnedSuitPass {
                 | "SymEyeLashColorMakeup"
                 | "SymEyeLashImageMakeup"
         ) {
-            return Err(Refusal::NotImplemented("suit pass effect"));
+            return Err(Refusal::ValueOutOfRange("suit pass effect"));
         }
         Ok(())
     }
@@ -1685,6 +1686,7 @@ fn produce_live_suit_pass(
         .material_uv
         .as_ref()
         .ok_or(Refusal::MissingInput(SUIT_MATERIAL_UV_MISSING))?
+        .borrowed()
         .decode()
         .map_err(|error| match error {
             Refusal::MissingInput(MATERIAL_VBO_BYTES_MISSING)
@@ -1705,6 +1707,7 @@ fn produce_live_suit_pass(
                 .mask_uv
                 .as_ref()
                 .ok_or(Refusal::MissingInput(D4_CAPTURE_MASK_UV))?
+                .borrowed()
                 .decode()
                 .map_err(|error| match error {
                     Refusal::MissingInput(MATERIAL_VBO_BYTES_MISSING)

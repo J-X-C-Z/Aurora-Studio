@@ -1907,9 +1907,7 @@ mod tests {
         };
         assert_eq!(
             bound.smile_inputs_with_assets(missing_uv),
-            Err(Refusal::MissingInput(
-                "PF100007_MATERIAL_UV_LIP_MOUTH_MASK"
-            ))
+            Err(Refusal::MissingInput("PF100007_MATERIAL_UV_SOURCE"))
         );
 
         let uv = [[0.0, 0.0]];

@@ -111,7 +111,8 @@ impl Draw {
                     .iter()
                     .map(|point| eye_geometry::Point::new(point[0], point[1]))
                     .collect();
-                let generated = eye_geometry::type1011_indices(&prepared)?;
+                let generated = eye_geometry::type1011_indices(&prepared)
+                    .map_err(|_| Refusal::ShapeMismatch("Type1011 prepared100 EBO"))?;
                 if indices.as_slice() != generated.as_slice() {
                     return Err(Refusal::ValueOutOfRange("Type1011 prepared100 EBO"));
                 }
@@ -171,7 +172,8 @@ impl Draw {
             .iter()
             .map(|point| eye_geometry::Point::new(point[0], point[1]))
             .collect();
-        let generated = eye_geometry::type1011_indices(&prepared)?;
+        let generated = eye_geometry::type1011_indices(&prepared)
+            .map_err(|_| Refusal::ShapeMismatch("Type1011 prepared100 EBO"))?;
         if indices.as_slice() != generated.as_slice() {
             return Err(Refusal::ValueOutOfRange("Type1011 prepared100 EBO"));
         }

@@ -106,6 +106,7 @@ pub use portrait_stage::{
     HistoricalToneRowOutcome, GPU_MATERIALIZED_FIXTURE_ENV,
     GPU_PROVEN_HISTORICAL_SKIN_PFS, GPU_PROVEN_HISTORICAL_TONE_PFS,
 };
+pub(crate) use portrait_stage::sha256_32;
 pub use portrait_stage::{
     BodyGeometryInput, BodyGeometryJob, BodyGeometryProducerInputs, BodyLandmarkDomain,
     BodyLandmarkEffect, BodyLandmarkFrame, BodyLandmarkRef, BodyShiftInput, FaceGeometry,

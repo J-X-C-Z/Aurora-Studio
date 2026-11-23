@@ -1089,7 +1089,7 @@ mod tests {
             let input = inputs.get(&pf).expect("built row");
             assert_eq!(input.ticket, 17);
             assert_eq!(input.size, size);
-            assert_eq!(input.source_sha256, SHA);
+            assert_eq!(input.source_sha256, sha256(&image(size).pixels));
             assert_eq!(input.control, 0.8);
             assert_eq!(input.data.pf(), pf);
         }
@@ -1195,7 +1195,7 @@ mod tests {
                 data: row_data(30030, size),
             }]))
             .unwrap_err(),
-            Refusal::MissingInput("historical tone provider PF30030 frame size")
+            Refusal::ShapeMismatch("historical tone provider PF30030 frame size")
         );
         // Per-row control range is checked, not shared across rows.
         assert_eq!(

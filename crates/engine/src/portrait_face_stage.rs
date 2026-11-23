@@ -757,7 +757,8 @@ fn apply_type1011(
         .iter()
         .map(|point| eye_geometry::Point::new(point[0], point[1]))
         .collect();
-    let indices = eye_geometry::type1011_indices(&prepared_points)?;
+    let indices = eye_geometry::type1011_indices(&prepared_points)
+        .map_err(|_| Refusal::ShapeMismatch("Type1011 prepared100 EBO"))?;
     let output = eye_geometry::row19_lower_eyelid(
         &prepared_points,
         Some(param_list),
@@ -765,7 +766,8 @@ fn apply_type1011(
         controls[0],
         controls[1],
         Some(&indices),
-    )?;
+    )
+    .map_err(|_| Refusal::ShapeMismatch("Type1011 prepared100 EBO"))?;
     let source_uv = prepared
         .iter()
         .map(|point| {

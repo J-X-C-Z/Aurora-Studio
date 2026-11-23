@@ -15,9 +15,10 @@ use aurora_portrait::cuda_model_preprocess::{QuantUniforms, f32_to_u8_cpu};
 use aurora_portrait::model_sha256::{hex, sha256 as sha256_32};
 use aurora_portrait::{Image, Refusal};
 
+use crate::NormRect;
 use crate::aimask::{Runtime, Session};
 use crate::portrait_stage::{
-    NormRect, PF108_BRIGHT_LUT_IDENTITY, PF108_WHITEN_LUT_IDENTITY, Pf90004ProducerInputs,
+    PF108_BRIGHT_LUT_IDENTITY, PF108_WHITEN_LUT_IDENTITY, Pf90004ProducerInputs,
     ProducerInputs, TeethMaskFormat, TeethMaskSource, TeethProducerInputs,
 };
 
@@ -288,7 +289,7 @@ impl FaceParsingProducerInputs {
             }
         }
         Image::new(self.width, self.height, rgba)
-            .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 consumer RGBA"))
+            .ok_or(Refusal::ShapeMismatch("FaceParsingV2 consumer RGBA"))
     }
 }
 

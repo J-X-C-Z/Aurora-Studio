@@ -429,7 +429,9 @@ fn validate_type1011(row: &FaceGeometryProviderRow) -> Result<(), Refusal> {
         .iter()
         .map(|point| eye_geometry::Point::new(point[0], point[1]))
         .collect();
-    eye_geometry::type1011_indices(&prepared).map(|_| ())
+    eye_geometry::type1011_indices(&prepared)
+        .map(|_| ())
+        .map_err(|_| Refusal::ShapeMismatch("Type1011 prepared100 EBO"))
 }
 
 fn validate_vface(
