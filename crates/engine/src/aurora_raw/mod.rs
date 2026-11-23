@@ -70,7 +70,13 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
 
     let (width, height, mut rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    finish_linear_stages(&mut rgb, width, height, iso, noise, ca_warp.as_ref());
+    {
+        if let Some(warp) = ca_warp.as_ref() {
+            z6iii::apply_linear_chromatic_aberration(&mut rgb, width, height, 0, 0, width, height, warp);
+        }
+        z6iii::recover_and_antialias_frame(&mut rgb, width, height, black, wb, iso);
+        finish_linear_stages(&mut rgb, width, height, iso, noise, None);
+    }
     let out = pack_rgba16(&rgb);
     Some(orient_rgba16(out, width, height, orientation))
 }
@@ -134,8 +140,18 @@ fn finish_linear_stages(
     if let Some(warp) = ca_warp {
         z6iii::apply_linear_chromatic_aberration(rgb, width, height, 0, 0, width, height, warp);
     }
-    z6iii::apply_linear_luma_noise_2018(rgb, width, height, iso, noise);
+    // Luminance NR is deferred to the full-precision detail stage so it is not
+    // double-applied and stays 100% responsive to the UI slider.
     z6iii::apply_linear_color_noise_2012(rgb, width, height, iso, noise);
+    if iso >= 1600 {
+        z6iii::apply_linear_color_noise_2012(
+            rgb,
+            width,
+            height,
+            iso,
+            [noise[0] * 1.6, noise[1] * 2.0],
+        );
+    }
 }
 
 fn pack_rgba16(rgb: &[[f32; 3]]) -> Vec<u16> {

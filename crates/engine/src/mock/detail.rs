@@ -33,6 +33,355 @@ use crate::{FilmGrain, GrainKind, LensCorrection, Moire, NoiseReduction, Sharpen
 const PURPLE_BAND_ROWS: usize = 128;
 const DIFFRACTION_BAND_ROWS: usize = 128;
 
+/// Full-precision float32 display-sRGB (`0.0..=1.0`) core detail pipeline:
+/// runs single-pixel spike removal, center-weighted edge-preserving luminance NR,
+/// C1 `ColorNoise2012` linear-domain chroma range filter, and (when `include_sharpen`
+/// is true) true separable Gaussian linear-light USM with zero 8-bit quantization
+/// round-trips.
+pub(crate) fn post_process_core_f32(
+    rgb: &mut [[f32; 3]],
+    width: u32,
+    height: u32,
+    adj: &crate::AdjustmentSet,
+    scale: f32,
+    include_sharpen: bool,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || rgb.len() != w * h {
+        return;
+    }
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let nr = &adj.noise_reduction;
+    if nr.single_pixel > 0.0 {
+        stage_single_pixel_f32(rgb, w, h, nr);
+    }
+    if nr.luminance > 0.0 {
+        stage_luminance_nr_f32(rgb, w, h, nr);
+    }
+    if nr.color > 0.0 {
+        stage_color_nr_f32(rgb, w, h, nr, scale);
+    }
+    if include_sharpen && adj.sharpening.amount > 0.0 {
+        stage_sharpening_f32(rgb, w, h, &adj.sharpening, scale);
+    }
+}
+
+#[inline]
+fn srgb_to_linear_f32(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn padded_luma_f32(rgb: &[[f32; 3]], w: usize, h: usize) -> Vec<f32> {
+    let pw = w + 2;
+    let mut pad = vec![0.0f32; pw * (h + 2)];
+    for y in 0..h {
+        let src = &rgb[y * w..(y + 1) * w];
+        let dst = &mut pad[(y + 1) * pw..(y + 2) * pw];
+        for x in 0..w {
+            let p = src[x];
+            dst[x + 1] = (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) * 255.0;
+        }
+        dst[0] = dst[1];
+        dst[w + 1] = dst[w];
+    }
+    let (top, rest) = pad.split_at_mut(pw);
+    top.copy_from_slice(&rest[..pw]);
+    let last_src = h * pw;
+    let (head, bottom) = pad.split_at_mut((h + 1) * pw);
+    bottom.copy_from_slice(&head[last_src..last_src + pw]);
+    pad
+}
+
+fn stage_single_pixel_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseReduction) {
+    let amount = (adj.single_pixel / 100.0).clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
+    let pad = padded_luma_f32(rgb, w, h);
+    let threshold = 24.0 - 20.0 * amount;
+    let pw = w + 2;
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let c = pad[(y + 1) * pw + x + 1];
+            let mut nb = [0f32; 8];
+            for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
+                nb[k] = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
+            }
+            nb.sort_by(|a, b| a.total_cmp(b));
+            let median = (nb[3] + nb[4]) * 0.5;
+            if c > median + threshold {
+                let f = if c > 1.0 { median / c } else { 1.0 };
+                let p = &mut row[x];
+                p[0] = (p[0] * f).clamp(0.0, 1.0);
+                p[1] = (p[1] * f).clamp(0.0, 1.0);
+                p[2] = (p[2] * f).clamp(0.0, 1.0);
+            }
+        }
+    });
+}
+
+fn stage_luminance_nr_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseReduction) {
+    let strength = (adj.luminance / 100.0).clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return;
+    }
+    let pad = padded_luma_f32(rgb, w, h);
+    let details = (adj.details / 100.0).clamp(0.0, 1.0);
+    let sigma = ((2.5 + 26.0 * strength) / (1.0 + 3.5 * details)).max(0.5);
+    let two_sigma2 = 2.0 * sigma * sigma;
+    const LUT_N: usize = 1025;
+    let mut range_lut = [0f32; LUT_N];
+    for (i, v) in range_lut.iter_mut().enumerate() {
+        let d = i as f32 * 0.25;
+        *v = (-(d * d) / two_sigma2).exp();
+    }
+    let pw = w + 2;
+    const SPATIAL: [f32; 8] =
+        [1.0 / 3.0, 0.5, 1.0 / 3.0, 0.5, 0.5, 1.0 / 3.0, 0.5, 1.0 / 3.0];
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        for x in 0..w {
+            let c = pad[(y + 1) * pw + x + 1];
+            let mut num = c;
+            let mut den = 1.0f32;
+            for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
+                let l = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
+                let ad = (l - c).abs() * 4.0;
+                let i0 = (ad as usize).min(LUT_N - 2);
+                let t = ad - i0 as f32;
+                let range = range_lut[i0] + (range_lut[i0 + 1] - range_lut[i0]) * t;
+                let wt = range * SPATIAL[k];
+                num += wt * l;
+                den += wt;
+            }
+            let mut target = if den > 1e-6 { num / den } else { c };
+            target = c + (target - c) * strength;
+            let new_l = target.clamp(0.0, 255.0);
+            if (new_l - c).abs() >= 1e-3 {
+                let f = if c > 1.0 { new_l / c } else { 1.0 };
+                let p = &mut out_row[x];
+                p[0] = (p[0] * f).clamp(0.0, 1.0);
+                p[1] = (p[1] * f).clamp(0.0, 1.0);
+                p[2] = (p[2] * f).clamp(0.0, 1.0);
+            }
+        }
+    });
+}
+
+fn stage_color_nr_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseReduction, scale: f32) {
+    let strength = (adj.color / 100.0).clamp(0.0, 1.0);
+    if strength <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    const K: [f32; 4] = [0.299, 0.587, 0.114, 35.759_254];
+    const PX: f32 = 0.178_877_62;
+    const PY: f32 = 0.377_672_3;
+    const PZ_BASE: f32 = 0.401_832_58;
+    const PW_BASE: f32 = 2.968_700_4;
+
+    let scale_p = 0.35 + 1.3 * strength;
+    let pz = PZ_BASE * scale_p;
+    let pw = PW_BASE * scale_p;
+    let pz_chroma = 2_400.0 + 18_000.0 * strength * strength;
+    let pw_chroma = 12.0 + 36.0 * strength;
+
+    let step = (4.0 * scale).round().clamp(1.0, 8.0) as isize;
+    let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as isize;
+    let radius = half_taps * step;
+
+    let n = w * h;
+    let mut encoded = vec![[0.0f32; 3]; n];
+    encoded.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let src = &rgb[y * w..(y + 1) * w];
+        for x in 0..w {
+            let r = srgb_to_linear_f32(src[x][0]) * 65535.0;
+            let g = srgb_to_linear_f32(src[x][1]) * 65535.0;
+            let b = srgb_to_linear_f32(src[x][2]) * 65535.0;
+            let l = (K[0] * r + K[1] * g + K[2] * b).max(0.0) + K[3];
+            let inv_l = 1.0 / l;
+            row[x] = [l, (r - g) * inv_l, (b - g) * inv_l];
+        }
+    });
+
+    let mut horiz = vec![[0.0f32; 3]; n];
+    horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let src_row = &encoded[y * w..(y + 1) * w];
+        let max_x = (w - 1) as isize;
+        for x in 0..w {
+            let [lc, uc, vc] = src_row[x];
+            let t_root = (pz + pw * lc).max(1.0);
+            let t_l2 = t_root * t_root;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -radius;
+            while off <= radius {
+                let nx = (x as isize + off).clamp(0, max_x) as usize;
+                let [li, ui, vi] = src_row[nx];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += step;
+            }
+            if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                out_row[x] = [lc, sum_u * inv_w, sum_v * inv_w];
+            } else {
+                out_row[x] = [lc, uc, vc];
+            }
+        }
+    });
+
+    let max_y = (h - 1) as isize;
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        for x in 0..w {
+            let [lc, uc, vc] = horiz[y * w + x];
+            let t_root = (pz + pw * lc).max(1.0);
+            let t_l2 = t_root * t_root;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -radius;
+            while off <= radius {
+                let ny = (y as isize + off).clamp(0, max_y) as usize;
+                let [li, ui, vi] = horiz[ny * w + x];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += step;
+            }
+            let (u, v) = if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                (sum_u * inv_w, sum_v * inv_w)
+            } else {
+                (uc, vc)
+            };
+            let ul = u * lc;
+            let vl = v * lc;
+            let g = lc - ul * K[0] - vl * K[2] - K[3];
+            let r0 = (ul + g).max(1.0);
+            let g0 = g.max(1.0);
+            let b0 = (vl + g).max(1.0);
+            let sc = ((lc - (K[3] - 1.0)) / ((K[0] * r0 + K[1] * g0 + K[2] * b0).max(0.0) + 1.0))
+                .min(1.5);
+            let lin = [r0 * sc, g0 * sc, b0 * sc];
+            out_row[x] = [
+                super::process::linear_to_srgb((lin[0] / 65535.0).clamp(0.0, 1.0)),
+                super::process::linear_to_srgb((lin[1] / 65535.0).clamp(0.0, 1.0)),
+                super::process::linear_to_srgb((lin[2] / 65535.0).clamp(0.0, 1.0)),
+            ];
+        }
+    });
+}
+
+fn stage_sharpening_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &Sharpening, scale: f32) {
+    let amount = adj.amount / 100.0;
+    if amount <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    let raw_sigma = adj.radius.max(0.1) * scale;
+    let sigma = raw_sigma.clamp(0.35, 12.0);
+    let scale_atten = (raw_sigma / 0.8).clamp(0.18, 1.0);
+    let threshold_lin = (adj.threshold.max(0.0) / 255.0) * 0.5;
+    let halo = (adj.halo_suppression / 100.0).clamp(0.0, 1.0);
+    let gain = amount * 0.50 * scale_atten;
+
+    let mut luma = vec![0.0f32; w * h];
+    luma.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let src = &rgb[y * w..(y + 1) * w];
+        for x in 0..w {
+            let r = srgb_to_linear_f32(src[x][0]);
+            let g = srgb_to_linear_f32(src[x][1]);
+            let b = srgb_to_linear_f32(src[x][2]);
+            row[x] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        }
+    });
+
+    let mut out = gaussian_blur_sep(&luma, w, h, sigma);
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let i = y * w + x;
+            let yc = luma[i];
+            let mut detail = yc - row[x];
+            if detail.abs() <= threshold_lin {
+                detail = 0.0;
+            } else {
+                detail = detail.signum() * (detail.abs() - threshold_lin);
+            }
+            let mut v = yc + detail * gain;
+            if halo > 0.0 {
+                let mut lo = f32::MAX;
+                let mut hi = f32::MIN;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let xx = clampi(x as i32 + dx, 0, w as i32 - 1) as usize;
+                        let yy = clampi(y as i32 + dy, 0, h as i32 - 1) as usize;
+                        let l = luma[yy * w + xx];
+                        lo = lo.min(l);
+                        hi = hi.max(l);
+                    }
+                }
+                let clamped = v.clamp(lo, hi);
+                v = v * (1.0 - halo) + clamped * halo;
+            }
+            row[x] = v.clamp(0.0, 1.0);
+        }
+    });
+
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let off = y * w;
+        for x in 0..w {
+            let yc = luma[off + x];
+            let yn = out[off + x];
+            if (yn - yc).abs() < 1e-6 {
+                continue;
+            }
+            let r = srgb_to_linear_f32(row[x][0]);
+            let g = srgb_to_linear_f32(row[x][1]);
+            let b = srgb_to_linear_f32(row[x][2]);
+            let scaled = if yc > 1e-4 {
+                let f = (yn / yc).clamp(0.2, 4.0);
+                [r * f, g * f, b * f]
+            } else {
+                let d = yn - yc;
+                [r + d, g + d, b + d]
+            };
+            row[x] = [
+                super::process::linear_to_srgb(scaled[0].clamp(0.0, 1.0)),
+                super::process::linear_to_srgb(scaled[1].clamp(0.0, 1.0)),
+                super::process::linear_to_srgb(scaled[2].clamp(0.0, 1.0)),
+            ];
+        }
+    });
+}
+
 /// Applies the detail stages to one sRGB 8-bit RGBA frame, in place.
 ///
 /// `rgba` is row-major RGBA with no padding, `scale` is output pixels per source

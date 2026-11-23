@@ -70,9 +70,12 @@ fn state() -> &'static Mutex<State> {
 }
 
 pub(crate) fn enabled() -> bool {
+    // Legacy 8-bit CUDA PTX kernels (`luminance_nr_kernel`, `color_nr_kernel`,
+    // `sharpening_kernel`) predate the center-weighted edge-preserving luma NR,
+    // C1 ColorNoise2012, and separable Gaussian linear USM; keep opt-in only.
     match std::env::var_os("AURORA_DETAIL_GPU") {
-        Some(value) => value != "0",
-        None => cfg!(windows),
+        Some(value) => value == "1",
+        None => false,
     }
 }
 
