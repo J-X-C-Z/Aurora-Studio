@@ -11,7 +11,7 @@ use aurora_portrait::{Image, Refusal};
 use crate::aimask::{Provider, Runtime, Session};
 
 use super::{
-    PlumpCompositeReceipt, PlumpFinalComposite, PlumpProducerInputs, PlumpRasterBackend,
+    PlumpCompositeReceipt, PlumpFinalComposite, PlumpProducerInputs,
     PlumpSameFrameEvidence,
 };
 

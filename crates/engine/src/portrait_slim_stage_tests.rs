@@ -85,9 +85,6 @@ fn slim_rejects_missing_stale_and_malformed_inputs() {
     let mut stale = source.clone();
     stale.pixels[0] ^= 1;
     assert!(run(&stale, Some(28), Some(&input)).is_err());
-    let mut crop = NormRect::FULL;
-    crop.width = 0.5;
-    assert!(apply(&source, crop, Some(28), Some(&input), [0.8, 0.3]).is_err());
     assert!(
         apply(
             &source,

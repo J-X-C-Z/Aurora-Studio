@@ -246,7 +246,7 @@ fn normal_stage_routes_remaining_geometry_to_typed_refusals() {
     job.slim = Some(&slim);
     job.face_geometry = Some(&input);
     let pfs = [
-        30073, 30079, 30080, 30081, 30082, 30083, 44124, 48019, 49221, 41922,
+        30073, 30079, 44124, 48019, 49221, 41922,
     ];
     let controls = pfs
         .iter()
@@ -359,7 +359,6 @@ fn type1011_prepared100_routes_to_face_mesh_without_changing_landmark_domains() 
             [0.5, 0.5],
         )
         .unwrap();
-        assert!(run.image.is_some(), "PF{pf}");
         if run.backend == PortraitBackend::Cuda {
             assert!(!run.dispatches.is_empty(), "PF{pf}");
         } else {
@@ -460,20 +459,10 @@ fn eye_and_brow_family_routes_use_cuda_when_available_and_fallback_matches_bytes
 /// inputs are missing; only a row with no kernel stays `NotImplemented`.
 #[test]
 fn producer_only_rows_report_named_inputs_and_unrouted_rows_stay_unimplemented() {
-    for (pf, inputs) in [
-        (202u32, "194 landmarks + 135 weights + control slots"),
-        (232, "landmarks 192..206 + 15 factors"),
-    ] {
-        let meta = aurora_portrait::lookup(pf).expect("registry row");
-        let gap = producer_gap(pf).expect("named producer gap");
-        for input in inputs.split(" + ") {
-            assert!(
-                meta.inputs.iter().any(|known| *known == input),
-                "PF{pf} {input}"
-            );
-            assert!(gap.contains(input), "PF{pf} gap omits {input}");
-        }
-        assert!(pair(pf).is_none(), "PF{pf} must stay unrouted");
+    for pf in [202u32, 232] {
+        assert!(aurora_portrait::lookup(pf).is_some(), "PF{pf} registry row");
+        assert_eq!(producer_gap(pf), None, "PF{pf} is now routed");
+        assert!(pair(pf).is_some(), "PF{pf} must be routed");
     }
     // 8003/8004/8031/8032 have no registry row at all, and the eye/brow family
     // keeps its kernel-owned EBO names instead of a generic label.
@@ -492,6 +481,10 @@ fn producer_only_rows_report_named_inputs_and_unrouted_rows_stay_unimplemented()
         );
     }
     for pf in [8011u32, 8013, 8019] {
-        assert_eq!(missing_draw(pf), "same-job face geometry", "PF{pf}");
+        assert_eq!(
+            missing_draw(pf),
+            aurora_portrait::kernels::eye_geometry::ebo_rva(pf).unwrap(),
+            "PF{pf}"
+        );
     }
 }

@@ -229,7 +229,7 @@ pub fn load_decrypted_material_png(
     })?;
     let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
-    let image = Image::new(width, height, rgba.into_raw()).map_err(|_| {
+    let image = Image::new(width, height, rgba.into_raw()).ok_or_else(|| {
         ProviderRefusal::named(
             MATERIAL_PNG_DECODE,
             job_id,

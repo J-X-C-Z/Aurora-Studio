@@ -12,7 +12,7 @@
 //! `AURORA_ORT_LIB` overrides the ONNX Runtime library. Everything degrades to a
 //! warning when either is missing; nothing here panics.
 
-mod ort;
+pub(crate) mod ort;
 pub mod body_pose;
 
 use std::collections::HashMap;

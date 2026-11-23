@@ -597,13 +597,13 @@ impl WrinkleMaskMiniImageProducer {
 /// input; there is no `WrinklesV1Params` default expansion or shader upload.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WrinkleProducerInputs {
-    ticket: u64,
-    width: u32,
-    height: u32,
+    pub(crate) ticket: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     legacy_skin_mask: Option<WrinkleLegacySkinMaskProducer>,
     mask_mini_image: Option<WrinkleMaskMiniImageProducer>,
-    base_full: Option<Image>,
-    residual_full: Option<Image>,
+    pub(crate) base_full: Option<Image>,
+    pub(crate) residual_full: Option<Image>,
     uniforms: Option<WrinkleUniforms>,
 }
 

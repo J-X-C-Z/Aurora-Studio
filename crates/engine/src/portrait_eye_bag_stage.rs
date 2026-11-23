@@ -476,7 +476,7 @@ impl LoadedEyeBagModel {
         input: &mut [f32],
     ) -> Result<(Vec<f32>, Vec<f32>), Refusal> {
         let shape: [i64; 4] = PF90116_INPUT_SHAPE.map(|value| value as i64);
-        let run = |session: &Session| {
+        let mut run = |session: &Session| {
             validate_model_contract(session)?;
             let outputs = self
                 .runtime
@@ -903,7 +903,7 @@ mod tests {
             vendor_job_id: 1,
             face_record_id: 2,
             landmark_receipt: 3,
-            frame_to_model: [1.0, 0.0, -1.0, 0.0, 1.0, -1.0],
+            frame_to_model: [1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
             model_roi: [1, 1, 1, 1],
             work_width: 1,
             work_height: 1,

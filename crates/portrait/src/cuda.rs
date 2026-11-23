@@ -2936,7 +2936,11 @@ mod tests {
         );
         let body_after = |start: usize| -> &str {
             let tail = &PTX[start..];
-            &tail[..tail.find(".visible .entry").unwrap_or(tail.len())]
+            let end = tail[1..]
+                .find(".visible .entry")
+                .map(|offset| offset + 1)
+                .unwrap_or(tail.len());
+            &tail[..end]
         };
         let u8_body = body_after(u8_body_start);
         assert!(

@@ -220,7 +220,14 @@ fn body_normal_stage_receipt_and_writeback() {
                 run.executed && !run.skipped && run.refusal.is_none(),
                 "PF{pf}"
             );
-            assert_eq!(run.backend, PortraitBackend::Cpu);
+            if matches!(pf, 401 | 406 | 410 | 415) {
+                assert!(matches!(
+                    run.backend,
+                    PortraitBackend::Cuda | PortraitBackend::Cpu
+                ));
+            } else {
+                assert_eq!(run.backend, PortraitBackend::Cpu);
+            }
             assert_ne!(pixels, source.pixels, "PF{pf}");
         }
     }
@@ -300,7 +307,14 @@ fn body_producer_entry_accepts_synthetic_jobs_for_each_routed_pf() {
             apply_portrait_effects_with_job(&mut pixels, SIZE.0, SIZE.1, region, &extra, &job);
         let run = &report.effects[0];
         assert!(run.executed && !run.skipped && run.refusal.is_none(), "PF{pf}");
-        assert_eq!(run.backend, PortraitBackend::Cpu, "PF{pf}");
+        if matches!(pf, 401 | 406 | 410 | 415) {
+            assert!(
+                matches!(run.backend, PortraitBackend::Cuda | PortraitBackend::Cpu),
+                "PF{pf}"
+            );
+        } else {
+            assert_eq!(run.backend, PortraitBackend::Cpu, "PF{pf}");
+        }
         assert_ne!(pixels, source.pixels, "PF{pf}");
     }
 

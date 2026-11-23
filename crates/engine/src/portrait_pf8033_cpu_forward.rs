@@ -474,6 +474,7 @@ pub fn apply_pf8033_cpu_forward(
         NormRect::FULL,
         Some(receipt.job_id),
         Some(&input),
+        None,
         8033,
         controls,
     )?;
@@ -576,13 +577,13 @@ fn parse_network(value: &Value) -> Result<Pf8033NetworkReceipt, Refusal> {
             let input = inputs_object
                 .get(name)
                 .ok_or(Refusal::MissingInput("PF8033 network input values"))?;
-            let shape = shape(entry, "shape")?;
-            if shape(entry, "shape")? != shape(input, "shape")? {
+            let input_shape = shape(entry, "shape")?;
+            if input_shape != shape(input, "shape")? {
                 return Err(Refusal::ShapeMismatch("PF8033 network input shape"));
             }
-            Ok(Pf8033TensorReceipt {
+            Ok::<_, Refusal>(Pf8033TensorReceipt {
                 id: number(entry, "order", "PF8033 network input order")?,
-                shape,
+                shape: input_shape,
                 sha256: sha(input, "sha256")?,
             })
         })
@@ -590,7 +591,7 @@ fn parse_network(value: &Value) -> Result<Pf8033NetworkReceipt, Refusal> {
     let outputs = array(value, "outputs", "PF8033 network outputs")?
         .iter()
         .map(|entry| {
-            Ok(Pf8033TensorReceipt {
+            Ok::<_, Refusal>(Pf8033TensorReceipt {
                 id: number(entry, "id", "PF8033 network output id")?,
                 shape: shape(entry, "shape")?,
                 sha256: sha(entry, "sha256")?,

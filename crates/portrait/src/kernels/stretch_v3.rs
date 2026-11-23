@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn tensor_intake_is_typed_but_refused_without_forward() {
-        let mut ticket = ticket();
+        let mut ticket = tests::ticket();
         ticket.model = ModelInput::Tensor {
             weights: vec![1, 2, 3],
             input: TensorShape {
@@ -513,14 +513,14 @@ mod tests {
 
     #[test]
     fn non_identity_affine_and_unpainted_texture_refuse() {
-        let mut ticket = ticket();
+        let mut ticket = tests::ticket();
         ticket.affine.matrix[2] = 1;
         assert_eq!(
             ticket.execute(&source_stride(), Some(7), 100.0),
             Err(Refusal::MissingInput(AFFINE_BLOCKER))
         );
 
-        let mut ticket = ticket();
+        let mut ticket = tests::ticket();
         if let ModelInput::PrewarpedFrame { degree, .. } = &mut ticket.model {
             *degree = DegreeState::NotApplied;
         }
@@ -536,7 +536,7 @@ mod tests {
             ticket().execute(&source_stride(), Some(7), 0.01),
             Err(Refusal::ValueOutOfRange("PF90008 positive gate"))
         );
-        let mut ticket = ticket();
+        let mut ticket = tests::ticket();
         if let ModelInput::PrewarpedFrame {
             texture_sha256, ..
         } = &mut ticket.model

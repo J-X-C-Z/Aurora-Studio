@@ -121,6 +121,23 @@ impl_primitive_payload!(u16, JobElement::U16);
 impl_primitive_payload!(u32, JobElement::U32);
 impl_primitive_payload!(f32, JobElement::F32);
 
+impl<T> JobPayload for Vec<T>
+where
+    [T]: JobPayload,
+{
+    fn element(&self) -> JobElement {
+        self.as_slice().element()
+    }
+
+    fn byte_len(&self) -> usize {
+        self.as_slice().byte_len()
+    }
+
+    fn for_each_le_bytes(&self, emit: &mut dyn FnMut(&[u8])) {
+        self.as_slice().for_each_le_bytes(emit);
+    }
+}
+
 /// Owned-length bridges so a caller can hand &[T; N] straight to a descriptor.
 /// A &[T; N] only unsizes to &dyn JobPayload in one step, so the array
 /// itself must implement the trait; going via the slice would be two unsizings.

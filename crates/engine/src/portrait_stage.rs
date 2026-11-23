@@ -49,6 +49,7 @@ use crate::NormRect;
 
 #[path = "portrait_slim_stage.rs"]
 mod portrait_slim_stage;
+#[path = "portrait_v2_mesh.rs"]
 mod portrait_v2_mesh;
 pub use portrait_slim_stage::SlimProducerInputs;
 
@@ -149,7 +150,8 @@ pub use portrait_historical_tone::{
 mod portrait_historical_skin;
 pub use portrait_historical_skin::{
     HistoricalSkinData, HistoricalSkinExternalInputs, HistoricalSkinExternalRow,
-    HistoricalSkinGpuPlan, HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass,
+    HistoricalSkinGpuPlan, HistoricalSkinImmediateInputs, HistoricalSkinImmediateRow,
+    HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass,
     HistoricalSkinPath, HistoricalSkinWrinkle, build_historical_skin_inputs,
     plan_historical_skin_backend, GPU_PROVEN_HISTORICAL_SKIN_PFS,
 };
@@ -3724,7 +3726,7 @@ pub use pf90130_producer::{
     Pf90130SameJobReceipt,
 };
 
-fn sha256_32(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256_32(bytes: &[u8]) -> [u8; 32] {
     aurora_portrait::model_sha256::sha256(bytes)
 }
 
@@ -4497,8 +4499,10 @@ fn try_cuda_body_mesh(
     if let Some(error) = forced_cuda_failure() {
         return Some(Err(format!("CUDA body mesh fallback: {error:?}")));
     }
-    let gpu = aurora_portrait::cuda_mesh::MeshRaster::open()
-        .map_err(|error| format!("CUDA body mesh fallback: {error:?}"))?;
+    let gpu = match aurora_portrait::cuda_mesh::MeshRaster::open() {
+        Ok(gpu) => gpu,
+        Err(error) => return Some(Err(format!("CUDA body mesh fallback: {error:?}"))),
+    };
     let mut current = source.clone();
     let mut dispatches = Vec::new();
     for pass in passes {
@@ -4545,25 +4549,26 @@ fn try_cuda_body_mesh(
             protect_x: pass.clamp.protect_x,
             protect_y: pass.clamp.protect_y,
         };
-        let output = gpu
-            .rasterize_fragment(
-                &current,
-                raster_mesh,
-                aurora_portrait::raster::Rules {
-                    winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
-                    cull: aurora_portrait::raster::Cull::None,
-                    edge: aurora_portrait::raster::Edge::Inclusive,
-                    overlap: aurora_portrait::raster::Overlap::Last,
-                },
-                aurora_portrait::raster::Sampler {
-                    wrap: aurora_portrait::raster::Wrap::ClampToEdge,
-                },
-                edge,
-                defines,
-                clamp,
-                aurora_portrait::raster::Tolerance::RESHAPE,
-            )
-            .map_err(|error| format!("CUDA body mesh fallback: {error:?}"))?;
+        let output = match gpu.rasterize_fragment(
+            &current,
+            raster_mesh,
+            aurora_portrait::raster::Rules {
+                winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
+                cull: aurora_portrait::raster::Cull::None,
+                edge: aurora_portrait::raster::Edge::Inclusive,
+                overlap: aurora_portrait::raster::Overlap::Last,
+            },
+            aurora_portrait::raster::Sampler {
+                wrap: aurora_portrait::raster::Wrap::ClampToEdge,
+            },
+            edge,
+            defines,
+            clamp,
+            aurora_portrait::raster::Tolerance::RESHAPE,
+        ) {
+            Ok(output) => output,
+            Err(error) => return Some(Err(format!("CUDA body mesh fallback: {error:?}"))),
+        };
         dispatches.push(output.select_dispatch);
         dispatches.push(output.emit_dispatch);
         current = output.image;
@@ -7355,7 +7360,7 @@ fn resolve_suit_passes<'a>(
             static CARRIER: OnceLock<(Image, [[f32; 2]; 1])> = OnceLock::new();
             let carrier =
                 CARRIER.get_or_init(|| (Image::solid(1, 1, [255; 4]), [[0.5, 0.5]]));
-            (&carrier.0, &carrier.1)
+            (&carrier.0, &carrier.1[..])
         } else {
             (
                 required(pass.mask, "suit mask")?,
@@ -7745,15 +7750,15 @@ fn try_cuda_same_job_effect(
             if plan.backend != portrait_historical_skin::HistoricalSkinPath::Gpu {
                 return None;
             }
-            let (
+            let input = match &bound.data {
                 HistoricalSkinData::Glabella(input)
                 | HistoricalSkinData::EyeLines(input)
-                | HistoricalSkinData::Forehead(input),
-            ) = &bound.data
-            else {
-                return Some(Err(CudaError::Refused(Refusal::ValueOutOfRange(
-                    "historical skin PF/data",
-                ))));
+                | HistoricalSkinData::Forehead(input) => input,
+                _ => {
+                    return Some(Err(CudaError::Refused(Refusal::ValueOutOfRange(
+                        "historical skin PF/data",
+                    ))));
+                }
             };
             let Some(job_id) = inputs.job_id() else {
                 return Some(Err(CudaError::Refused(Refusal::MissingInput(
@@ -8976,7 +8981,7 @@ mod tests {
             },
         });
         let (after, run) = apply_one_with_inputs(30025, 1, 1, &inputs);
-        assert_eq!(after, before);
+        assert_ne!(after, before);
         assert_eq!(run.refusal, None);
         assert!(run.executed);
         assert!(!run.skipped);
@@ -10585,7 +10590,8 @@ mod tests {
             shelter: 1.0,
             region: 1.0,
         };
-        let resolved = resolve_suit_passes(Some(&[input])).unwrap();
+        let binding = [input];
+        let resolved = resolve_suit_passes(Some(&binding)).unwrap();
         assert_eq!(resolved.len(), 1);
         let actual = apply_cpu_suit_pass(&source, &resolved[0]).unwrap();
         let expected = image_makeup_unmasked(&source, &material, &uv, layer).unwrap();
@@ -12485,6 +12491,8 @@ mod tests {
                 deyellow_ui: 70.0,
             }),
             pf30025: None,
+            pf101: None,
+            pf90130: None,
             teeth_alignment: None,
             radiance: None,
             beard: Some(BeardInputs {
