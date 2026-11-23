@@ -449,7 +449,9 @@ fn stage_luminance_nr_with_pad(
         return;
     }
     let details = (adj.details / 100.0).clamp(0.0, 1.0);
-    let sigma = ((4.0 + 60.0 * strength) / (1.0 + 3.0 * details)).max(0.5);
+    // Preserve fine 1-2px hair/feather micro-texture by keeping sigma tight
+    // and including the center pixel's self-weight (1.0) in the bilateral sum.
+    let sigma = ((2.5 + 26.0 * strength) / (1.0 + 3.5 * details)).max(0.5);
     let two_sigma2 = 2.0 * sigma * sigma;
     // The range weight only depends on |l - c| (0 ..= 255). A quarter-step
     // table replaces ten million `expf` calls with two loads and a lerp; the
@@ -471,8 +473,8 @@ fn stage_luminance_nr_with_pad(
             let i = x * 4;
             let p = [out_row[i], out_row[i + 1], out_row[i + 2]];
             let c = pad[(y + 1) * pw + x + 1];
-            let mut num = 0.0f32;
-            let mut den = 0.0f32;
+            let mut num = c;
+            let mut den = 1.0f32;
             for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
                 let l = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
                 let ad = (l - c).abs() * 4.0;
@@ -740,28 +742,73 @@ fn stage_moire(buf: &mut [u8], w: usize, h: usize, adj: &Moire) {
 
 // ───────────────────────────── 4. sharpening ─────────────────────────────
 
-/// Unsharp mask: luminance minus a three-pass box blur (a Gaussian stand-in)
-/// scaled by `amount`, with an absolute `threshold` below which nothing is
-/// boosted. `halo_suppression` pulls the result back inside the local
-/// neighbourhood range, which removes the bright and dark rings a strong
-/// unsharp mask leaves around edges.
+fn gaussian_blur_sep(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    let half = (sigma * 3.0).ceil().clamp(1.0, 24.0) as usize;
+    let mut kernel = vec![0.0f32; half + 1];
+    let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    let mut sum = 1.0f32;
+    kernel[0] = 1.0;
+    for k in 1..=half {
+        let wk = (-((k * k) as f32) * inv2s2).exp();
+        kernel[k] = wk;
+        sum += 2.0 * wk;
+    }
+    let inv_sum = 1.0 / sum;
+    for v in &mut kernel {
+        *v *= inv_sum;
+    }
+
+    let max_x = (w - 1) as isize;
+    let mut horiz = vec![0.0f32; w * h];
+    horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let row = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let mut acc = row[x] * kernel[0];
+            for k in 1..=half {
+                let l = (x as isize - k as isize).clamp(0, max_x) as usize;
+                let r = (x as isize + k as isize).clamp(0, max_x) as usize;
+                acc += (row[l] + row[r]) * kernel[k];
+            }
+            out_row[x] = acc;
+        }
+    });
+
+    let max_y = (h - 1) as isize;
+    let mut out = vec![0.0f32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let c_row = &horiz[y * w..(y + 1) * w];
+        for x in 0..w {
+            out_row[x] = c_row[x] * kernel[0];
+        }
+        for k in 1..=half {
+            let u = (y as isize - k as isize).clamp(0, max_y) as usize;
+            let d = (y as isize + k as isize).clamp(0, max_y) as usize;
+            let wk = kernel[k];
+            let u_row = &horiz[u * w..(u + 1) * w];
+            let d_row = &horiz[d * w..(d + 1) * w];
+            for x in 0..w {
+                out_row[x] += (u_row[x] + d_row[x]) * wk;
+            }
+        }
+    });
+    out
+}
+
 /// Capture One `UnsharpMaskLinear` (queue stages 63-75): performs unsharp
-/// masking in scene-linear light rather than display-gamma sRGB so dark halos
-/// and colour fringing do not amplify high-contrast edges.
+/// masking in scene-linear light with a true continuous separable Gaussian
+/// kernel so sub-pixel radii (`0.8 px`) resolve fine hair/feather micro-texture
+/// without the coarse 1.41px halo of a 3-pass box blur.
 fn stage_sharpening(buf: &mut [u8], w: usize, h: usize, adj: &Sharpening, scale: f32) {
     let amount = adj.amount / 100.0;
     if amount <= 0.0 || w == 0 || h == 0 {
         return;
     }
-    let raw_radius = adj.radius.max(0.1) * scale;
-    let radius = raw_radius.round().max(1.0) as i32;
-    let scale_atten = raw_radius.clamp(0.15, 1.0);
+    let raw_sigma = adj.radius.max(0.1) * scale;
+    let sigma = raw_sigma.clamp(0.35, 12.0);
+    let scale_atten = (raw_sigma / 0.8).clamp(0.18, 1.0);
     let threshold_lin = (adj.threshold.max(0.0) / 255.0) * 0.5;
     let halo = (adj.halo_suppression / 100.0).clamp(0.0, 1.0);
-    // Linear-light USM amplifies perceived mid/shadow contrast by ~2.2x after
-    // sRGB encoding; scale gain accordingly and attenuate at zoomed-out previews
-    // where sub-pixel radii would otherwise overshoot as full 1px screen halos.
-    let gain = amount * 0.30 * scale_atten;
+    let gain = amount * 0.50 * scale_atten;
 
     let mut srgb_to_lin = [0.0f32; 256];
     for (i, slot) in srgb_to_lin.iter_mut().enumerate() {
@@ -781,7 +828,7 @@ fn stage_sharpening(buf: &mut [u8], w: usize, h: usize, adj: &Sharpening, scale:
         }
     });
 
-    let mut out = box_blur3(&luma, w, h, radius);
+    let mut out = gaussian_blur_sep(&luma, w, h, sigma);
     out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let i = y * w + x;
@@ -1991,9 +2038,9 @@ mod tests {
     fn detail_stages_match_reference_pixels() {
         let expected = [
             15226162907845603633, 15226162907845603633, 15226162907845603633,
-            418812772922979691, 14188287539090345076, 12573880948299953647,
-            41615323049186328, 17275283751766918384, 4520033136177982392,
-            17974978512109289819, 18074643075832604112, 18297136219956733841,
+            778449501603359228, 14188287539090345076, 7733125734113225351,
+            7758119668271440554, 17275283751766918384, 15087915455906674826,
+            17729869383540181920, 18074643075832604112, 1221425972588756570,
         ];
         let mut actual = Vec::new();
         for (w, h) in [(1, 1), (1, 17), (19, 1), (37, 23)] {
