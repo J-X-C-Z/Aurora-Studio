@@ -139,6 +139,54 @@ pub fn reference(
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct P15Inputs<'a> {
+    pub pf: u32,
+    pub source: &'a Image,
+    pub base: &'a Image,
+    pub residual: &'a Image,
+    pub mask_rgba: &'a [u8],
+    pub skin_mask: &'a [u8],
+    pub roi: Roi,
+    pub ui: f32,
+    pub uniforms: WrinkleUniforms,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct P15Resolved {
+    pub pf: u32,
+    pub degree: f32,
+    pub roi: Roi,
+    pub uniforms: WrinkleUniforms,
+}
+
+pub fn resolve_p15(inputs: P15Inputs<'_>) -> Result<P15Resolved, Refusal> {
+    if inputs.pf == 21024 {
+        return Err(Refusal::MissingInput(
+            "PF21024 mask.r/mask.b contribution law (r76 s63 U3)",
+        ));
+    }
+    if !matches!(inputs.pf, 90023 | 90024) {
+        return Err(Refusal::UnknownEffect(inputs.pf));
+    }
+    check(
+        inputs.source,
+        inputs.base,
+        inputs.residual,
+        inputs.mask_rgba,
+        inputs.skin_mask,
+        inputs.roi,
+        inputs.uniforms,
+    )?;
+    let degree = skin_adjust::wrinkle_degree(inputs.pf, inputs.ui)?;
+    Ok(P15Resolved {
+        pf: inputs.pf,
+        degree,
+        roi: inputs.roi,
+        uniforms: inputs.uniforms,
+    })
+}
+
 #[cfg(windows)]
 pub struct WrinkleGpu {
     gpu: cuda::Nvidia,
