@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use aurora_portrait::kernels::makeup_material::MaskChannel;
 use aurora_portrait::model_sha256::sha256 as sha256_32;
 use aurora_portrait::Refusal;
 
@@ -43,8 +44,36 @@ pub const SUIT_BFM_LANDMARK_UV_INVALID: &str = "suit BFM landmark vertex UV";
 pub const SUIT_BFM_LANDMARK_REGION_MISMATCH: &str = "suit BFM landmark FaceParsingV2 region";
 pub const SUIT_BFM_SUIT_LOCAL_UV_MISSING: &str = "suit BFM suit-local material UV";
 pub const SUIT_BFM_OWNER_MASK_CLASS_MAP_MISSING: &str = "suit owner-mask 17-class channel map";
+pub const SUIT_FACEPARSING_R_CLASSES: &[u8] = &[0, 13, 14, 15, 16];
+pub const SUIT_FACEPARSING_G_CLASSES: &[u8] = &[2, 7, 11, 12];
+pub const SUIT_FACEPARSING_B_CLASSES: &[u8] = &[4, 5];
+pub const SUIT_FACEPARSING_A_CLASSES: &[u8] = &[9, 10];
+pub const SUIT_FACEPARSING_CLASS_1_MISSING: &str =
+    "suit owner-mask FaceParsingV2 class 1 channel";
+pub const SUIT_FACEPARSING_CLASS_3_MISSING: &str =
+    "suit owner-mask FaceParsingV2 class 3 channel";
+pub const SUIT_FACEPARSING_CLASS_6_MISSING: &str =
+    "suit owner-mask FaceParsingV2 class 6 channel";
+pub const SUIT_FACEPARSING_CLASS_8_MISSING: &str =
+    "suit owner-mask FaceParsingV2 class 8 channel";
 pub const SUIT_BFM_SHELTER_WEIGHT_MISSING: &str = "suit BFM shelter weight";
 pub const SUIT_BFM_REGION_WEIGHT_MISSING: &str = "suit BFM region weight";
+
+/// The recovered consumer RGBA is a saturating bundle, not a dense class
+/// remap. Classes 1, 3, 6 and 8 have no evidenced owner-mask channel.
+pub fn suit_owner_mask_class_channel(class: u8) -> Result<MaskChannel, &'static str> {
+    match class {
+        0 | 13..=16 => Ok(MaskChannel::R),
+        2 | 7 | 11 | 12 => Ok(MaskChannel::G),
+        4 | 5 => Ok(MaskChannel::B),
+        9 | 10 => Ok(MaskChannel::A),
+        1 => Err(SUIT_FACEPARSING_CLASS_1_MISSING),
+        3 => Err(SUIT_FACEPARSING_CLASS_3_MISSING),
+        6 => Err(SUIT_FACEPARSING_CLASS_6_MISSING),
+        8 => Err(SUIT_FACEPARSING_CLASS_8_MISSING),
+        _ => Err(SUIT_BFM_OWNER_MASK_CLASS_MAP_MISSING),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SuitBfmTopology {
@@ -581,6 +610,12 @@ fn first_missing_input_field(
             Refusal::MissingInput(SUIT_MATERIAL_UV_MISSING),
         ));
     }
+    if input.mask_uv.is_none() {
+        return Some((
+            D4_CAPTURE_MASK_UV,
+            Refusal::MissingInput(D4_CAPTURE_MASK_UV),
+        ));
+    }
     if !pass.force_use_shelter && input.shelter.is_none() {
         return Some(("suit shelter", Refusal::MissingInput("suit shelter")));
     }
@@ -776,6 +811,42 @@ mod tests {
                 SUIT_BFM_SHELTER_WEIGHT_MISSING,
                 SUIT_BFM_REGION_WEIGHT_MISSING,
             ]
+        );
+    }
+
+    #[test]
+    fn owner_mask_class_map_is_exact_and_names_the_four_unmapped_classes() {
+        for class in SUIT_FACEPARSING_R_CLASSES {
+            assert_eq!(suit_owner_mask_class_channel(*class), Ok(MaskChannel::R));
+        }
+        for class in SUIT_FACEPARSING_G_CLASSES {
+            assert_eq!(suit_owner_mask_class_channel(*class), Ok(MaskChannel::G));
+        }
+        for class in SUIT_FACEPARSING_B_CLASSES {
+            assert_eq!(suit_owner_mask_class_channel(*class), Ok(MaskChannel::B));
+        }
+        for class in SUIT_FACEPARSING_A_CLASSES {
+            assert_eq!(suit_owner_mask_class_channel(*class), Ok(MaskChannel::A));
+        }
+        assert_eq!(
+            suit_owner_mask_class_channel(1),
+            Err(SUIT_FACEPARSING_CLASS_1_MISSING)
+        );
+        assert_eq!(
+            suit_owner_mask_class_channel(3),
+            Err(SUIT_FACEPARSING_CLASS_3_MISSING)
+        );
+        assert_eq!(
+            suit_owner_mask_class_channel(6),
+            Err(SUIT_FACEPARSING_CLASS_6_MISSING)
+        );
+        assert_eq!(
+            suit_owner_mask_class_channel(8),
+            Err(SUIT_FACEPARSING_CLASS_8_MISSING)
+        );
+        assert_eq!(
+            suit_owner_mask_class_channel(17),
+            Err(SUIT_BFM_OWNER_MASK_CLASS_MAP_MISSING)
         );
     }
 

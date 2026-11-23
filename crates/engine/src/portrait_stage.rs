@@ -2802,6 +2802,10 @@ pub enum SuitPassKindInput<'a> {
         material: Option<&'a Image>,
         material_uv: Option<&'a [[f32; 2]]>,
     },
+    ImageUnmasked {
+        material: Option<&'a Image>,
+        material_uv: Option<&'a [[f32; 2]]>,
+    },
     Unavailable(&'static str),
 }
 
@@ -7187,27 +7191,60 @@ fn resolve_suit_passes<'a>(
     }
     let mut resolved = Vec::with_capacity(passes.len());
     for pass in passes {
-        let mask = required(pass.mask, "suit mask")?;
-        let mask_uv = required(pass.mask_uv, "suit mask uv")?;
         let layer = required(pass.layer, "suit layer")?;
-        let kind = match &pass.kind {
-            SuitPassKindInput::Color => SuitPassKind::Color,
+        let (kind, unmasked) = match &pass.kind {
+            SuitPassKindInput::Color => (SuitPassKind::Color, false),
             SuitPassKindInput::Image {
                 material: Some(material),
                 material_uv: Some(material_uv),
-            } => SuitPassKind::Image {
-                material,
-                material_uv,
-            },
+            } => (
+                SuitPassKind::Image {
+                    material,
+                    material_uv,
+                },
+                false,
+            ),
+            SuitPassKindInput::ImageUnmasked {
+                material: Some(material),
+                material_uv: Some(material_uv),
+            } => (
+                SuitPassKind::Image {
+                    material,
+                    material_uv,
+                },
+                true,
+            ),
             SuitPassKindInput::Image { material: None, .. } => {
                 return Err(Refusal::MissingInput("suit material"));
             }
             SuitPassKindInput::Image {
                 material_uv: None, ..
             } => return Err(Refusal::MissingInput("suit material uv")),
+            SuitPassKindInput::ImageUnmasked { material: None, .. } => {
+                return Err(Refusal::MissingInput("suit material"));
+            }
+            SuitPassKindInput::ImageUnmasked {
+                material_uv: None, ..
+            } => return Err(Refusal::MissingInput("suit material uv")),
             SuitPassKindInput::Unavailable(name) => {
                 return Err(Refusal::MissingInput(name));
             }
+        };
+        let (mask, mask_uv) = if unmasked {
+            if pass.mask.is_some() || pass.mask_uv.is_some() {
+                return Err(Refusal::ValueOutOfRange(
+                    "suit unmasked mask must be absent",
+                ));
+            }
+            static CARRIER: OnceLock<(Image, [[f32; 2]; 1])> = OnceLock::new();
+            let carrier =
+                CARRIER.get_or_init(|| (Image::solid(1, 1, [255; 4]), [[0.5, 0.5]]));
+            (&carrier.0, &carrier.1)
+        } else {
+            (
+                required(pass.mask, "suit mask")?,
+                required(pass.mask_uv, "suit mask uv")?,
+            )
         };
         resolved.push(SuitPass {
             kind,
@@ -7238,6 +7275,15 @@ fn fold_suit_layer(layer: MakeupLayer, shelter: f32, region: f32) -> Result<Make
 
 fn apply_cpu_suit_pass(current: &Image, pass: &SuitPass<'_>) -> Result<Image, Refusal> {
     let layer = fold_suit_layer(pass.layer, pass.shelter, pass.region)?;
+    if pass.layer.mask_channel == MakeupMaskChannel::A {
+        return match &pass.kind {
+            SuitPassKind::Image {
+                material,
+                material_uv,
+            } => image_makeup_unmasked(current, material, material_uv, layer),
+            SuitPassKind::Color => Err(Refusal::ValueOutOfRange("suit unmasked color")),
+        };
+    }
     match &pass.kind {
         SuitPassKind::Color => color_makeup(current, pass.mask, pass.mask_uv, layer),
         SuitPassKind::Image {
@@ -7262,6 +7308,11 @@ fn apply_gpu_suit_pass(
 ) -> Result<(Image, Vec<Dispatch>), CudaError> {
     let layer =
         fold_suit_layer(pass.layer, pass.shelter, pass.region).map_err(CudaError::Refused)?;
+    if pass.layer.mask_channel == MakeupMaskChannel::A {
+        return Err(CudaError::Refused(Refusal::MissingInput(
+            "CUDA suit unmasked pass",
+        )));
+    }
     let params = layer.params_of().map_err(CudaError::Refused)?;
     match &pass.kind {
         SuitPassKind::Image {
@@ -10393,6 +10444,36 @@ mod tests {
             suit_mask_channel("UnknownMaskType", 99),
             Err(Refusal::MissingInput("suit mask channel"))
         );
+    }
+
+    #[test]
+    fn suit_stage_executes_explicit_unmasked_image_pass() {
+        let source = Image::solid(1, 1, [10, 20, 30, 255]);
+        let material = Image::solid(1, 1, [100, 150, 200, 128]);
+        let uv = [[0.5, 0.5]];
+        let layer = MakeupLayer {
+            mix_color: [100, 150, 200, 180],
+            opacity_percent: 80.0,
+            degree01: 0.5,
+            filter_type: 41,
+            mask_channel: MakeupMaskChannel::A,
+        };
+        let input = SuitPassInput {
+            kind: SuitPassKindInput::ImageUnmasked {
+                material: Some(&material),
+                material_uv: Some(&uv),
+            },
+            mask: None,
+            mask_uv: None,
+            layer: Some(layer),
+            shelter: 1.0,
+            region: 1.0,
+        };
+        let resolved = resolve_suit_passes(Some(&[input])).unwrap();
+        assert_eq!(resolved.len(), 1);
+        let actual = apply_cpu_suit_pass(&source, &resolved[0]).unwrap();
+        let expected = image_makeup_unmasked(&source, &material, &uv, layer).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
