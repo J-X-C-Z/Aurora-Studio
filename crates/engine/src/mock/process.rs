@@ -1636,13 +1636,11 @@ fn render_sized(
     // the develop loop uses, so the operator sees raw-stage luma without a
     // full-frame buffer: 2 planes of (out/step)^2 f32.
     let clarity_step = 8usize;
-    let pre = if !bypass && adj.clarity.clarity.abs() > 1e-4 {
-        super::clarity::PreCurve::build(
+    let grid = if !bypass && adj.clarity.clarity.abs() > 1e-4 {
+        super::clarity::Grid::sample(
             out_w as usize,
             out_h as usize,
             clarity_step,
-            adj.clarity.clarity,
-            adj.clarity.method,
             |gx, gy| {
                 let fx = region.x
                     + (gx * clarity_step) as f32 / out_w as f32 * region.width
@@ -1662,6 +1660,13 @@ fn render_sized(
     } else {
         None
     };
+    let gpu_clarity = grid.is_some() && super::clarity_gpu::enabled();
+    let pre = if gpu_clarity {
+        None
+    } else {
+        grid.as_ref()
+            .and_then(|grid| grid.planes(adj.clarity.clarity, adj.clarity.method))
+    };
     // At 50% zoom and above (including 1:1 and magnified inspection), use
     // bicubic sampling to preserve crisp micro-contrast; below 50% the bilinear
     // mip tap is the right anti-aliased filter.
@@ -1672,7 +1677,67 @@ fn render_sized(
             || adj.noise_reduction.luminance > 0.0
             || adj.noise_reduction.color > 0.0
             || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
-    if use_f32_detail {
+    let gpu_two_pass = !bypass && gpu_clarity && region == NormRect::FULL && !has_camera_color(&plan);
+    if gpu_two_pass {
+        let sharpen_in_display = f32_includes_sharpen;
+        let row_f32 = out_w as usize;
+        let mut rgb_pre = vec![[0.0f32; 3]; (out_w * out_h) as usize];
+        if streams_source_samples(out_w, out_h) {
+            rgb_pre.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
+                precurve_line_with(&plan, region, out_h, &xs, y, line, |_, _, point| {
+                    source_sample_at(src, &map, level, sharp, point)
+                });
+            });
+        } else {
+            let samples = source_samples(
+                src,
+                &map,
+                &adj.geometry,
+                region,
+                out_w,
+                out_h,
+                level,
+                sharp,
+                &xs,
+            );
+            rgb_pre.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
+                let srow = &samples[y * row_f32..(y + 1) * row_f32];
+                precurve_line_with(&plan, region, out_h, &xs, y, line, |x, _, _| srow[x]);
+            });
+        }
+        let grid = grid.as_ref().expect("gpu path needs the grid");
+        if !super::clarity_gpu::apply_precurve(
+            &mut rgb_pre,
+            out_w as usize,
+            out_h as usize,
+            grid,
+            adj.clarity.clarity,
+            adj.clarity.method,
+        ) {
+            if let Some(pre) = grid.planes(adj.clarity.clarity, adj.clarity.method) {
+                rgb_pre.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
+                    for (x, px) in line.iter_mut().enumerate() {
+                        *px = pre.apply(*px, x, y);
+                    }
+                });
+            }
+        }
+        rgb_pre.par_chunks_mut(row_f32).for_each(|line| {
+            for px in line.iter_mut() {
+                let c = develop_display(&plan, *px);
+                *px = [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)];
+            }
+        });
+        super::detail::post_process_core_f32(
+            &mut rgb_pre,
+            out_w,
+            out_h,
+            adj,
+            scale,
+            sharpen_in_display,
+        );
+        encode_f32_frame(&rgb_pre, &mut rgba, rgba16.as_deref_mut(), out_w as usize);
+    } else if use_f32_detail {
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
         let camera_usm = plan.c1_color.as_ref().filter(|_| f32_includes_sharpen && adj.sharpening.amount > 0.0);
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
@@ -1838,13 +1903,35 @@ fn render_sized(
     // developed frame; clarity already ran inside the develop loop, before
     // the tone curves, from the coarse planes built above.
     if !bypass {
-        super::clarity::apply_structure(
-            &mut rgba,
-            rgba16.as_deref_mut(),
-            out_w as usize,
-            out_h as usize,
-            &adj.clarity,
-        );
+        let structure = adj.clarity.structure;
+        let gpu_done = if structure.abs() >= 1e-4 && super::clarity_gpu::enabled() {
+            match rgba16.as_deref_mut() {
+                Some(wide) => super::clarity_gpu::apply_structure_wide(
+                    &mut rgba,
+                    wide,
+                    out_w as usize,
+                    out_h as usize,
+                    structure,
+                ),
+                None => super::clarity_gpu::apply_structure_u8(
+                    &mut rgba,
+                    out_w as usize,
+                    out_h as usize,
+                    structure,
+                ),
+            }
+        } else {
+            false
+        };
+        if !gpu_done {
+            super::clarity::apply_structure(
+                &mut rgba,
+                rgba16.as_deref_mut(),
+                out_w as usize,
+                out_h as usize,
+                &adj.clarity,
+            );
+        }
     }
     // Detail, spots and layers are 8-bit stages; keeping their delta lets the
     // wide buffer carry the develop precision through them.
@@ -2092,6 +2179,77 @@ fn render_sized(
         },
         rgba16,
     )
+}
+
+/// Pass 1 of the split Clarity path: source tap plus `develop_pre_curve`.
+#[allow(clippy::too_many_arguments)]
+fn precurve_line_with<F>(
+    plan: &Plan,
+    region: NormRect,
+    out_h: u32,
+    xs: &[f32],
+    y: usize,
+    line: &mut [[f32; 3]],
+    mut sample_at: F,
+) where
+    F: FnMut(usize, f32, [f32; 2]) -> SourceSample,
+{
+    let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
+    for (x, &fx) in xs.iter().enumerate() {
+        let f = [fx, fy];
+        let sample = sample_at(x, fx, f);
+        line[x] = prepared_sample(plan, sample, f)
+            .map(|rgb| develop_pre_curve(plan, rgb, f, false, None))
+            .unwrap_or([0.11; 3]);
+    }
+}
+
+/// Quantises a finished f32 frame into the 8-bit preview and 16-bit export
+/// buffers.
+fn encode_f32_frame(rgb: &[[f32; 3]], rgba: &mut [u8], rgba16: Option<&mut [u16]>, w: usize) {
+    let row = w * 4;
+    match rgba16 {
+        Some(wide_line) => {
+            rgba.par_chunks_mut(row)
+                .zip(wide_line.par_chunks_mut(row))
+                .zip(rgb.par_chunks(w))
+                .for_each(|((line8, line16), src_row)| {
+                    for (x, &c) in src_row.iter().enumerate() {
+                        let i = x * 4;
+                        for k in 0..3 {
+                            let v = c[k].clamp(0.0, 1.0);
+                            line8[i + k] = (v * 255.0 + 0.5) as u8;
+                            line16[i + k] = (v * 65535.0 + 0.5) as u16;
+                        }
+                        line8[i + 3] = 255;
+                        line16[i + 3] = 65535;
+                    }
+                });
+        }
+        None => {
+            rgba.par_chunks_mut(row)
+                .zip(rgb.par_chunks(w))
+                .for_each(|(line8, src_row)| {
+                    for (x, &c) in src_row.iter().enumerate() {
+                        let i = x * 4;
+                        for k in 0..3 {
+                            line8[i + k] = (c[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        }
+                        line8[i + 3] = 255;
+                    }
+                });
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+fn has_camera_color(plan: &Plan) -> bool {
+    plan.c1_color.is_some()
+}
+
+#[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+fn has_camera_color(_plan: &Plan) -> bool {
+    false
 }
 
 fn merge_wide_delta(wide: &mut [u16], before: &[u8], after: &[u8], width: usize) {
