@@ -221,6 +221,64 @@ impl FaceParsingProducerInputs {
         let plane = self.width as usize * self.height as usize;
         self.masks.get(class * plane..(class + 1) * plane)
     }
+
+    /// Expands the canonical 17 FaceParsingV2 planes into the recovered
+    /// 21-slot consumer layout. Slots 17..=20 are saturating bundles of
+    /// `(0,13,14,15,16)`, `(2,7,11,12)`, `(4,5)`, and `(9,10)`.
+    pub fn consumer_slots(&self) -> Result<Vec<Vec<u8>>, Refusal> {
+        if self.job_id == 0
+            || self.width != FACE_PARSING_V2_SIDE
+            || self.height != FACE_PARSING_V2_SIDE
+            || self.channels as usize != FACE_PARSING_V2_CLASSES
+            || self.model_sha256 != FACE_PARSING_V2_MODEL_SHA256
+        {
+            return Err(Refusal::ValueOutOfRange(
+                "FaceParsingV2 canonical 17-class input",
+            ));
+        }
+        let plane = self.width as usize * self.height as usize;
+        if self.masks.len() != FACE_PARSING_V2_CLASSES * plane {
+            return Err(Refusal::ShapeMismatch("FaceParsingV2 17-class masks"));
+        }
+
+        let mut slots = Vec::with_capacity(21);
+        for class in 0..FACE_PARSING_V2_CLASSES {
+            slots.push(self.masks[class * plane..(class + 1) * plane].to_vec());
+        }
+        for members in [
+            &[0usize, 13, 14, 15, 16][..],
+            &[2, 7, 11, 12][..],
+            &[4, 5][..],
+            &[9, 10][..],
+        ] {
+            let mut bundle = vec![0u8; plane];
+            for pixel in 0..plane {
+                let sum = members
+                    .iter()
+                    .map(|class| u16::from(self.masks[class * plane + pixel]))
+                    .sum::<u16>();
+                bundle[pixel] = sum.min(255) as u8;
+            }
+            slots.push(bundle);
+        }
+        Ok(slots)
+    }
+
+    /// Packs recovered consumer slots 17..=20 into RGBA in R,G,B,A order.
+    /// This only transforms canonical fbe output; it does not infer a
+    /// row-specific semantic that was not recovered.
+    pub fn consumer_rgba(&self) -> Result<Image, Refusal> {
+        let slots = self.consumer_slots()?;
+        let pixels = self.width as usize * self.height as usize;
+        let mut rgba = Vec::with_capacity(pixels.saturating_mul(4));
+        for pixel in 0..pixels {
+            for slot in &slots[17..21] {
+                rgba.push(slot[pixel]);
+            }
+        }
+        Image::new(self.width, self.height, rgba)
+            .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 consumer RGBA"))
+    }
 }
 
 /// Projects canonical fbe class 1 (skin) from the 384px model crop back to the
