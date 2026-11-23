@@ -8493,7 +8493,7 @@ mod cuda_router {
                 let routed = router::MoistureFaceInput {
                     source: current,
                     mask_rgba: input.mask_rgba,
-                    blur_y: input.blur_y,
+                    blur_y: input.blur_alpha,
                     ui: degree * 100.0,
                     pivot: input.pivot,
                     gain: input.gain,
