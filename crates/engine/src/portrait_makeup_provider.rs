@@ -6,10 +6,12 @@
 //! the exact payload to `produce_owned_makeup_bundle`.
 
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 use aurora_portrait::cuda_makeup::MakeupRoute;
 use aurora_portrait::kernels::makeup_material::lipstick_blend_mode;
+use aurora_portrait::model_sha256::sha256 as sha256_32;
 use aurora_portrait::{Image, Refusal};
 
 use crate::portrait_makeup_bundle::{
@@ -29,6 +31,8 @@ pub const PROVIDER_MATERIAL_UV_SHAPE: &str = "makeup provider material UV shape"
 pub const PROVIDER_VBO_SHAPE: &str = "makeup provider VBO shape";
 pub const PROVIDER_EBO_SHAPE: &str = "makeup provider EBO shape";
 pub const PROVIDER_OWNER_MASK_UNEXPECTED: &str = "makeup provider owner mask unexpected";
+pub const MATERIAL_PNG_MISSING: &str = "makeup decrypted material PNG";
+pub const MATERIAL_PNG_DECODE: &str = "makeup decrypted material PNG decode";
 
 /// Recovered `FilterType` per B3 row. `FilterType` is the blend macro (40
 /// Normal, 41 Multiply, 42 SoftLight), not a routing tag, so a wrong value
@@ -173,6 +177,71 @@ pub struct ExternalMakeupJob<'a> {
     pub frame_size: [u32; 2],
     pub source_sha256: [u8; 32],
     pub rows: &'a [ExternalMakeupRow<'a>],
+}
+
+/// A decrypted PNG material owned by the provider. The asset remains external;
+/// only decoded RGBA pixels and their SHA-256 cross the job boundary.
+pub struct ExternalMakeupMaterial {
+    image: Arc<Image>,
+    sha256: [u8; 32],
+}
+
+impl ExternalMakeupMaterial {
+    pub fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    pub fn texture(&self, ticket: u64) -> ExternalTexture<'_> {
+        ExternalTexture {
+            ticket,
+            width: self.image.width,
+            height: self.image.height,
+            rgba8: &self.image.pixels,
+        }
+    }
+}
+
+/// Decodes a material that was already decrypted from the vendor container.
+/// Missing, malformed, or empty PNGs stay named provider refusals.
+pub fn load_decrypted_material_png(
+    path: impl AsRef<Path>,
+    job_id: u64,
+    pf: u32,
+) -> Result<ExternalMakeupMaterial, ProviderRefusal> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path).map_err(|_| {
+        ProviderRefusal::named(
+            MATERIAL_PNG_MISSING,
+            job_id,
+            Some(pf),
+            None,
+            Some(Refusal::MissingInput(MATERIAL_PNG_MISSING)),
+        )
+    })?;
+    let decoded = image::load_from_memory(&bytes).map_err(|_| {
+        ProviderRefusal::named(
+            MATERIAL_PNG_DECODE,
+            job_id,
+            Some(pf),
+            None,
+            Some(Refusal::ShapeMismatch(MATERIAL_PNG_DECODE)),
+        )
+    })?;
+    let rgba = decoded.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let image = Image::new(width, height, rgba.into_raw()).map_err(|_| {
+        ProviderRefusal::named(
+            MATERIAL_PNG_DECODE,
+            job_id,
+            Some(pf),
+            None,
+            Some(Refusal::ShapeMismatch(MATERIAL_PNG_DECODE)),
+        )
+    })?;
+    Ok(ExternalMakeupMaterial {
+        image: Arc::new(image),
+        sha256: sha256_32(&bytes),
+    })
 }
 
 pub struct ExternalMakeupProvider;
@@ -939,5 +1008,20 @@ mod tests {
         assert_eq!(error.pf, Some(8));
         assert_eq!(error.job_id, JOB);
         assert_eq!(error.cause, Some(Refusal::MissingInput(MATERIAL_MISSING)));
+    }
+
+    #[test]
+    fn missing_decrypted_material_png_is_named() {
+        let missing = std::env::temp_dir().join("aurora-r25-makeup-no-such-material.png");
+        let error = load_decrypted_material_png(missing, JOB, 116)
+            .err()
+            .expect("missing decrypted PNG must be refused");
+        assert_eq!(error.code, MATERIAL_PNG_MISSING);
+        assert_eq!(error.job_id, JOB);
+        assert_eq!(error.pf, Some(116));
+        assert_eq!(
+            error.cause,
+            Some(Refusal::MissingInput(MATERIAL_PNG_MISSING))
+        );
     }
 }

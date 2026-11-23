@@ -76,6 +76,7 @@ mod portrait_stage;
 pub mod portrait_model_output_provider;
 mod wrinkle_legacy;
 pub mod portrait_makeup_bundle;
+pub mod portrait_makeup_suit_inputs;
 mod portrait_historical_tone_provider;
 pub mod portrait_makeup_provider;
 pub use aurora_portrait::cuda_pf90021::{
