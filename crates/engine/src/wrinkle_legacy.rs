@@ -595,16 +595,16 @@ impl WrinkleMaskMiniImageProducer {
 /// Masks and ROI come only from the captured legacy `+0x6200` texture and the
 /// per-face 1000-square mask path. Uniform values remain an explicit caller
 /// input; there is no `WrinklesV1Params` default expansion or shader upload.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WrinkleProducerInputs {
-    pub ticket: u64,
-    pub width: u32,
-    pub height: u32,
-    pub legacy_skin_mask: Option<WrinkleLegacySkinMaskProducer>,
-    pub mask_mini_image: Option<WrinkleMaskMiniImageProducer>,
-    pub base_full: Option<Image>,
-    pub residual_full: Option<Image>,
-    pub uniforms: Option<WrinkleUniforms>,
+    ticket: u64,
+    width: u32,
+    height: u32,
+    legacy_skin_mask: Option<WrinkleLegacySkinMaskProducer>,
+    mask_mini_image: Option<WrinkleMaskMiniImageProducer>,
+    base_full: Option<Image>,
+    residual_full: Option<Image>,
+    uniforms: Option<WrinkleUniforms>,
 }
 
 #[derive(Debug)]
@@ -618,6 +618,14 @@ pub(crate) struct ResolvedWrinkleInputs<'a> {
 }
 
 impl WrinkleProducerInputs {
+    pub fn ticket(&self) -> u64 {
+        self.ticket
+    }
+
+    pub fn frame_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_same_job(
         receipt: WrinkleSameJobReceipt,

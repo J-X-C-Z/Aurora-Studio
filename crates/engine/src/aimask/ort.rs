@@ -852,6 +852,23 @@ impl Session {
         self.provider
     }
 
+    pub(crate) fn input_contract(&self) -> (&str, &[i64], c_int) {
+        (&self.input.name, &self.input.dims, self.input.element_type)
+    }
+
+    pub(crate) fn output_contract(&self) -> Vec<(&str, &[i64], c_int)> {
+        self.outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.name.as_str(),
+                    output.dims.as_slice(),
+                    output.element_type,
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn end_profiling(&self) -> Result<Option<PathBuf>> {
         let runtime = Runtime::get().context("ONNX Runtime is not available")?;
         runtime.end_profiling(self)

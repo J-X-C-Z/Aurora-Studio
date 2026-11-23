@@ -194,7 +194,7 @@ impl EyeBagVendorGeometryReceipt {
             vendor_job_id,
             face_record_id,
             landmark_receipt,
-            model_tensor_receipt: model_tensor_receipt(tensors),
+            model_tensor_receipt: model_tensor_receipt(job_ticket, tensors),
             host_sha256: VENDOR_PF90116_HOST_SHA256,
             m1_call_site: VENDOR_AFFINE_FIT_M1_CALL_SITE,
             m2_call_site: VENDOR_AFFINE_FIT_M2_CALL_SITE,
@@ -258,7 +258,7 @@ impl EyeBagVendorGeometryReceipt {
             return Some(Refusal::MissingInput("PF90116_GEOMETRY_LANDMARKS"));
         }
         if self.model_tensor_receipt == 0
-            || self.model_tensor_receipt != model_tensor_receipt(tensors)
+            || self.model_tensor_receipt != model_tensor_receipt(ticket, tensors)
         {
             return Some(Refusal::MissingInput("PF90116_MODEL_TENSOR_RECEIPT"));
         }
@@ -279,22 +279,41 @@ impl EyeBagVendorGeometryReceipt {
     }
 }
 
-pub fn model_tensor_receipt(tensors: &EyeBagModelTensors<'_>) -> u64 {
-    let mut hash = FNV1A64_OFFSET_BASIS;
-    hash = fnv_bytes(hash, b"aurora-pf90116-three-tensor-v1");
-    hash = fnv_u64(hash, tensors.model_id);
-    for (tag, plane) in [
-        (1_u64, tensors.input_781141184_rgb_chw),
-        (2_u64, tensors.response_3204548346_hw),
-        (3_u64, tensors.color_780929437_rgb_chw),
-    ] {
+pub fn model_tensor_receipts(
+    job_ticket: u64,
+    tensors: &EyeBagModelTensors<'_>,
+) -> [u64; 4] {
+    let plane_receipt = |tag: u64, plane: &[f32]| {
+        let mut hash = FNV1A64_OFFSET_BASIS;
+        hash = fnv_bytes(hash, b"aurora-pf90116-tensor-v1");
+        hash = fnv_u64(hash, job_ticket);
+        hash = fnv_u64(hash, tensors.model_id);
         hash = fnv_u64(hash, tag);
         hash = fnv_usize(hash, plane.len());
         for value in plane {
             hash = fnv_u64(hash, value.to_bits() as u64);
         }
+        hash
+    };
+    let input = plane_receipt(1, tensors.input_781141184_rgb_chw);
+    let response = plane_receipt(2, tensors.response_3204548346_hw);
+    let color = plane_receipt(3, tensors.color_780929437_rgb_chw);
+    let mut aggregate = FNV1A64_OFFSET_BASIS;
+    aggregate = fnv_bytes(aggregate, b"aurora-pf90116-four-receipt-v1");
+    aggregate = fnv_u64(aggregate, job_ticket);
+    aggregate = fnv_u64(aggregate, tensors.model_id);
+    for receipt in [input, response, color] {
+        aggregate = fnv_u64(aggregate, receipt);
     }
-    hash
+    [input, response, color, aggregate]
+}
+
+pub fn model_tensor_receipt(job_ticket: u64, tensors: &EyeBagModelTensors<'_>) -> u64 {
+    model_tensor_receipts(job_ticket, tensors)[3]
+}
+
+fn raw_model_color_to_source_bytes(value: f32) -> f32 {
+    (value + 1.0) * 127.5
 }
 
 pub fn align_eye_bag(inputs: EyeBagAlignmentInputs<'_>) -> Result<AlignedEyeBagPlanes, Refusal> {
@@ -405,7 +424,7 @@ pub fn align_eye_bag(inputs: EyeBagAlignmentInputs<'_>) -> Result<AlignedEyeBagP
     let mut cropped_color = crop_rgb_chw(inputs.tensors.color_780929437_rgb_chw, crop);
     if inputs.model_color_units == EyeBagColorUnits::RawModel {
         for value in &mut cropped_color {
-            *value = (*value + 1.0) * 127.5;
+            *value = raw_model_color_to_source_bytes(*value);
         }
     }
     let cropped_response = crop_response(inputs.tensors.response_3204548346_hw, crop);
