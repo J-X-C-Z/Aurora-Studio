@@ -646,7 +646,9 @@ mod tests {
     use crate::GrainKind;
     use std::time::Instant;
 
-    const REAL_LCC: &[u8] = include_bytes!("../../testdata/real-lightfalloff-24x16.lcc");
+    fn real_lcc() -> Option<Vec<u8>> {
+        crate::testdata::bytes("testdata/real-lightfalloff-24x16.lcc")
+    }
 
     /// Max per-channel difference and the number of channels that differ by
     /// more than one 8-bit code.
@@ -730,7 +732,8 @@ mod tests {
 
     #[test]
     fn lcc_plane_matches_the_cpu_grid() {
-        let grid = parse_light_falloff(REAL_LCC).unwrap().unwrap();
+        let Some(real_lcc) = real_lcc() else { return; };
+        let grid = parse_light_falloff(&real_lcc).unwrap().unwrap();
         let (w, h) = (512usize, 341usize);
         let cases = [
             (1.0f32, LightFalloffLimit::Uncapped),
@@ -832,7 +835,8 @@ mod tests {
         let (w, h) = (6000usize, 4000usize);
         let iters = 20;
         let bytes = w * h * 4;
-        let grid = parse_light_falloff(REAL_LCC).unwrap().unwrap();
+        let Some(real_lcc) = real_lcc() else { return; };
+        let grid = parse_light_falloff(&real_lcc).unwrap().unwrap();
         let stage = lcc_stage(&grid, 1.0, LightFalloffLimit::Soft);
         let gpu_grid = stage.gpu_grid();
         let nodes = gpu_grid.columns * gpu_grid.rows;

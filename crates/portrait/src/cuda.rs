@@ -385,8 +385,6 @@ mod driver {
             unsafe extern "system" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult,
         mem_alloc: unsafe extern "system" fn(*mut CuPtr, usize) -> CuResult,
         mem_free: unsafe extern "system" fn(CuPtr) -> CuResult,
-        mem_alloc_host: unsafe extern "system" fn(*mut *mut c_void, usize) -> CuResult,
-        mem_free_host: unsafe extern "system" fn(*mut c_void) -> CuResult,
         mem_get_info: unsafe extern "system" fn(*mut usize, *mut usize) -> CuResult,
         copy_in: unsafe extern "system" fn(CuPtr, *const c_void, usize) -> CuResult,
         copy_out: unsafe extern "system" fn(*mut c_void, CuPtr, usize) -> CuResult,
@@ -480,8 +478,6 @@ mod driver {
                 module_function: sym!("cuModuleGetFunction"),
                 mem_alloc: sym2!("cuMemAlloc_v2", "cuMemAlloc"),
                 mem_free: sym2!("cuMemFree_v2", "cuMemFree"),
-                mem_alloc_host: sym2!("cuMemAllocHost_v2", "cuMemAllocHost"),
-                mem_free_host: sym!("cuMemFreeHost"),
                 mem_get_info: sym2!("cuMemGetInfo_v2", "cuMemGetInfo"),
                 copy_in: sym2!("cuMemcpyHtoD_v2", "cuMemcpyHtoD"),
                 copy_out: sym2!("cuMemcpyDtoH_v2", "cuMemcpyDtoH"),
@@ -2422,19 +2418,6 @@ mod driver {
             })
         }
 
-        pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, CudaError> {
-            self.with_domain(|domain, _| {
-                let mut ptr: *mut c_void = ptr::null_mut();
-                unsafe {
-                    check(
-                        (domain.api.mem_alloc_host)(&mut ptr, bytes.max(1)),
-                        "cuMemAllocHost",
-                    )?;
-                }
-                Ok(PinnedBuffer { ptr, bytes })
-            })
-        }
-
         #[allow(dead_code)] // consumed by `cuda_mesh`
         pub fn upload_buffer(
             &self,
@@ -3258,7 +3241,7 @@ pub use driver::HostRegistration;
 pub use driver::PinnedBuffer;
 pub use driver::Stream;
 #[cfg(windows)]
-pub use driver::{BufferSession, JobBufferSession, Nvidia, PinnedBuffer};
+pub use driver::{BufferSession, JobBufferSession, Nvidia};
 
 /// Session buffer group, shared by the LUT stages inside this crate.
 #[cfg(windows)]

@@ -71,11 +71,11 @@ fn clarity_kernel(amount: f32, method: ClarityMethod) -> Kernel {
 }
 
 /// Coarse cell: C1's radius is a fraction of the short side.
-fn coarse_cell(w: usize, h: usize) -> f32 {
+pub(crate) fn coarse_cell(w: usize, h: usize) -> f32 {
     (0.125 * w.min(h) as f32).max(8.0)
 }
 
-fn fine_cell(w: usize) -> f32 {
+pub(crate) fn fine_cell(w: usize) -> f32 {
     (100.0 * w as f32 / 11976.0).max(1.0)
 }
 
@@ -152,30 +152,23 @@ fn box_blur(y: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 /// is slow (50-500 px cells), so it does not need the full frame: the caller
 /// samples the pre-curve luma on a coarse grid (`step` output pixels per cell)
 /// and this struct keeps only the two blurred planes. 1/8 sampling on a
-/// 6048x4032 frame costs 2 x 756 x 504 x 4 B = 3.0 MB.
-pub(crate) struct PreCurve {
-    gw: usize,
-    gh: usize,
-    step: f32,
-    fine: Vec<f32>,
-    coarse: Vec<f32>,
-    k_big: f32,
-    k_fine: f32,
-    chroma: f32,
+pub(crate) struct Grid {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) gw: usize,
+    pub(crate) gh: usize,
+    pub(crate) step: usize,
+    pub(crate) raw: Vec<f32>,
 }
 
-impl PreCurve {
-    /// `luma_at(gx, gy)` returns the pre-curve luma for grid cell `(gx, gy)`,
-    /// or `None` where the frame has no sample.
-    pub(crate) fn build(
+impl Grid {
+    pub(crate) fn sample(
         w: usize,
         h: usize,
         step: usize,
-        amount: f32,
-        method: ClarityMethod,
         mut luma_at: impl FnMut(usize, usize) -> Option<f32>,
     ) -> Option<Self> {
-        if amount.abs() < 1e-4 || w == 0 || h == 0 {
+        if w == 0 || h == 0 {
             return None;
         }
         let step = step.max(1);
@@ -189,23 +182,62 @@ impl PreCurve {
                 }
             }
         }
-        let kernel = clarity_kernel(amount, method);
-        // Same kernel shape as the full-resolution pass: block average over a
-        // `cell` window, then bilinear between block centres. Doing it on the
-        // coarse plane keeps the frequency response aligned with the reference.
-        let fine = plane_low(&raw, gw, gh, cols_for(gw, step, fine_cell(w)));
-        let coarse = plane_low(&raw, gw, gh, cols_for(gw, step, coarse_cell(w, h)));
-        let chroma = if method == ClarityMethod::Punch { 1.0 + 0.0025 * amount } else { 1.0 };
-        Some(Self {
-            gw,
-            gh,
-            step: step as f32,
+        Some(Self { w, h, gw, gh, step, raw })
+    }
+
+    pub(crate) fn planes(&self, amount: f32, method: ClarityMethod) -> Option<PreCurve> {
+        if amount.abs() < 1e-4 {
+            return None;
+        }
+        let (k_big, k_fine, chroma) = PreCurve::params(amount, method);
+        let fine = plane_low(&self.raw, self.gw, self.gh, cols_for(self.gw, self.step, fine_cell(self.w)));
+        let coarse = plane_low(&self.raw, self.gw, self.gh, cols_for(self.gw, self.step, coarse_cell(self.w, self.h)));
+        Some(PreCurve {
+            gw: self.gw,
+            gh: self.gh,
+            step: self.step as f32,
             fine,
             coarse,
-            k_big: kernel.k_big,
-            k_fine: kernel.k_fine,
+            k_big,
+            k_fine,
             chroma,
         })
+    }
+}
+
+/// 6048x4032 frame costs 2 x 756 x 504 x 4 B = 3.0 MB.
+pub(crate) struct PreCurve {
+    gw: usize,
+    gh: usize,
+    step: f32,
+    fine: Vec<f32>,
+    coarse: Vec<f32>,
+    k_big: f32,
+    k_fine: f32,
+    chroma: f32,
+}
+
+impl PreCurve {
+    pub(crate) fn params(amount: f32, method: ClarityMethod) -> (f32, f32, f32) {
+        let kernel = clarity_kernel(amount, method);
+        let chroma = if method == ClarityMethod::Punch { 1.0 + 0.0025 * amount } else { 1.0 };
+        (kernel.k_big, kernel.k_fine, chroma)
+    }
+
+    /// `luma_at(gx, gy)` returns the pre-curve luma for grid cell `(gx, gy)`,
+    /// or `None` where the frame has no sample.
+    pub(crate) fn build(
+        w: usize,
+        h: usize,
+        step: usize,
+        amount: f32,
+        method: ClarityMethod,
+        luma_at: impl FnMut(usize, usize) -> Option<f32>,
+    ) -> Option<Self> {
+        if amount.abs() < 1e-4 {
+            return None;
+        }
+        Grid::sample(w, h, step, luma_at)?.planes(amount, method)
     }
 
     /// Bytes held by the two planes (for the memory assertion).
@@ -242,7 +274,7 @@ impl PreCurve {
 }
 
 /// Plane columns that cover one `cell` of the full frame.
-fn cols_for(gw: usize, step: usize, cell: f32) -> usize {
+pub(crate) fn cols_for(gw: usize, step: usize, cell: f32) -> usize {
     ((gw as f32) * step as f32 / cell.max(1.0)).round().clamp(1.0, gw as f32) as usize
 }
 
@@ -401,9 +433,9 @@ fn shade(p: [f32; 3], d: f32, s: f32, chroma: f32) -> [f32; 3] {
 
 
 
-#[cfg(test)]
 /// Block-average + bilinear low-pass, the full-resolution kernel the
 /// previous patch used. Test-only reference for the pre-curve rewrite.
+#[allow(dead_code)]
 fn grid_low_ref(y: &[f32], w: usize, h: usize, cols: usize) -> Vec<f32> {
     let cols = cols.clamp(1, w);
     let rows = ((cols as f32 * h as f32 / w as f32).round() as usize).clamp(1, h);

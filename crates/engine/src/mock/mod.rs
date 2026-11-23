@@ -13,6 +13,51 @@ pub(crate) mod pixel_gpu;
 #[cfg(windows)]
 pub(crate) mod detail_gpu;
 #[cfg(windows)]
+pub(crate) mod clarity_gpu;
+#[cfg(not(windows))]
+pub(crate) mod clarity_gpu {
+    use super::clarity;
+    use crate::ClarityMethod;
+
+    pub(crate) fn enabled() -> bool {
+        false
+    }
+
+    pub(crate) fn prewarm() -> bool {
+        false
+    }
+
+    pub(crate) fn apply_precurve(
+        _rgb: &mut [[f32; 3]],
+        _w: usize,
+        _h: usize,
+        _grid: &clarity::Grid,
+        _amount: f32,
+        _method: ClarityMethod,
+    ) -> bool {
+        false
+    }
+
+    pub(crate) fn apply_structure_u8(
+        _rgba: &mut [u8],
+        _w: usize,
+        _h: usize,
+        _structure: f32,
+    ) -> bool {
+        false
+    }
+
+    pub(crate) fn apply_structure_wide(
+        _rgba8: &mut [u8],
+        _rgba16: &mut [u16],
+        _w: usize,
+        _h: usize,
+        _structure: f32,
+    ) -> bool {
+        false
+    }
+}
+#[cfg(windows)]
 pub(crate) mod nr_gpu;
 #[cfg(not(windows))]
 pub(crate) mod nr_gpu {
@@ -73,6 +118,9 @@ pub(crate) fn prewarm_gpu() {
     }
     if nr_gpu::enabled() {
         let _ = nr_gpu::prewarm();
+    }
+    if clarity_gpu::enabled() {
+        let _ = clarity_gpu::prewarm();
     }
 }
 
