@@ -15,6 +15,7 @@ use crate::{Image, Refusal};
 /// Recovered kernel entry points.
 pub const FACE_KERNEL: &str = "moisture_face_kernel";
 pub const BODY_KERNEL: &str = "moisture_body_kernel";
+pub const FACE_PTX_BLOCKER: &str = "PF90002_PTX_SOURCE_ALPHA_REBUILD";
 const BLOCK: u32 = 16;
 
 const PTX: &str = include_str!("../native/cuda/moisture.ptx");
@@ -136,7 +137,7 @@ impl Moisture {
         &self,
         source: &Image,
         mask_rgba: &[u8],
-        blur_y: &[u8],
+        blur_alpha: &[u8],
         params: &FaceParams,
         channel: MaskChannel,
         skin_map: &SkinMap<'_>,
@@ -148,8 +149,8 @@ impl Moisture {
         if mask_rgba.len() != pixels * 4 {
             return Err(CudaError::Refused(Refusal::ShapeMismatch("mask_rgba")));
         }
-        if blur_y.len() != pixels {
-            return Err(CudaError::Refused(Refusal::ShapeMismatch("blur_y")));
+        if blur_alpha.len() != pixels {
+            return Err(CudaError::Refused(Refusal::ShapeMismatch("blur_alpha")));
         }
         if !params.ui.is_finite() || !(0.0..=100.0).contains(&params.ui) {
             return Err(CudaError::Refused(Refusal::ValueOutOfRange("ui")));
@@ -163,37 +164,7 @@ impl Moisture {
         if params.ui <= 0.0 {
             return Ok((source.clone(), Vec::new()));
         }
-        let degree = (params.ui / 100.0 - params.pivot) * params.gain + params.pivot;
-        let uniforms = FaceUniforms {
-            width: source.width,
-            height: source.height,
-            stride: source.width * 4,
-            channel: channel_index(channel),
-            degree,
-            skin_width: skin_map.width as u32,
-            skin_height: skin_map.height as u32,
-            hardlight_len: hardlight.samples.len() as u32,
-            beauty_len: beauty.samples.len() as u32,
-            reserved0: 0,
-            reserved1: 0,
-            reserved2: 0,
-        };
-        let (pixels_out, dispatch) = self.gpu.run_u8_inplace(
-            FACE_KERNEL,
-            grid(source.width, source.height),
-            &[
-                &source.pixels,
-                mask_rgba,
-                blur_y,
-                f32_bytes(skin_map.samples),
-                f32_bytes(hardlight.samples),
-                f32_bytes(beauty.samples),
-            ],
-            as_bytes(&uniforms),
-        )?;
-        let image = Image::new(source.width, source.height, pixels_out)
-            .ok_or(CudaError::Refused(Refusal::ShapeMismatch("output")))?;
-        Ok((image, vec![dispatch]))
+        return Err(CudaError::Refused(Refusal::MissingInput(FACE_PTX_BLOCKER)));
     }
 
     /// GPU twin of `moisture::body_apply`.

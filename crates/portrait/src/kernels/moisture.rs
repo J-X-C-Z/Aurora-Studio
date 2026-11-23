@@ -161,11 +161,12 @@ fn pixels_of(image: &Image) -> Result<usize, Refusal> {
 }
 
 /// PF90002 face: `degree=(ui/100-pivot)*gain+pivot`, per-face mask + LUT weight
-/// pass, then the shared process shader. `blur_y` is the bilateral blur Y plane.
+/// pass, then the shared process shader. The vendor weight pass reads the
+/// source alpha and blurred alpha planes, not a reconstructed RGB luma.
 pub fn face_apply(
     source: &Image,
     mask_rgba: &[u8],
-    blur_y: &[u8],
+    blur_alpha: &[u8],
     params: &FaceParams,
     channel: MaskChannel,
     skin_map: &SkinMap<'_>,
@@ -176,8 +177,8 @@ pub fn face_apply(
     if mask_rgba.len() != pixels * 4 {
         return Err(Refusal::ShapeMismatch("mask_rgba"));
     }
-    if blur_y.len() != pixels {
-        return Err(Refusal::ShapeMismatch("blur_y"));
+    if blur_alpha.len() != pixels {
+        return Err(Refusal::ShapeMismatch("blur_alpha"));
     }
     if !params.ui.is_finite() || !(0.0..=100.0).contains(&params.ui) {
         return Err(Refusal::ValueOutOfRange("ui"));
@@ -196,9 +197,9 @@ pub fn face_apply(
         let r = source.pixels[i] as f32 / 255.0;
         let g = source.pixels[i + 1] as f32 / 255.0;
         let b = source.pixels[i + 2] as f32 / 255.0;
-        let blur = blur_y[p] as f32 / 255.0;
+        let source_y = source.pixels[i + 3] as f32 / 255.0;
+        let blur = blur_alpha[p] as f32 / 255.0;
 
-        let source_y = 0.299 * r + 0.587 * g + 0.114 * b;
         let skin = skin_map.sample(b, r)?;
         let mut dog = 0.0;
         if skin > 0.0 {
@@ -285,7 +286,7 @@ pub const META: &[EffectMeta] = &[
         key: "moistureSmoothSkin",
         label: "Moisture smooth (face)",
         access: Access::Cpu,
-        inputs: &["source", "mask rgba", "blur Y", "skin map", "pivot/gain", "beauty LUTs"],
+        inputs: &["source alpha", "blur alpha", "mask rgba", "skin map", "pivot/gain", "beauty LUTs"],
     },
     EffectMeta {
         pf: 90010,
@@ -322,5 +323,34 @@ mod tests {
         assert_eq!(body_apply(&src, &good, &good, &lut, 1.5, (0, 0, 2, 1)),
             Err(Refusal::ValueOutOfRange("degree")));
         assert_eq!(body_apply(&src, &good, &good, &lut, 0.5, (1, 0, 2, 1)).is_err(), true);
+    }
+
+    #[test]
+    fn face_weight_reads_source_and_blur_alpha() {
+        let src = Image::new(1, 1, vec![0, 0, 0, 255]).unwrap();
+        let mask = [255, 0, 0, 255];
+        let skin_map = SkinMap {
+            width: 1,
+            height: 1,
+            samples: &[1.0],
+        };
+        let result = face_apply(
+            &src,
+            &mask,
+            &[128],
+            &FaceParams {
+                ui: 100.0,
+                pivot: 0.0,
+                gain: 1.0,
+            },
+            MaskChannel::R,
+            &skin_map,
+            &Lut1D {
+                samples: &[0.0, 1.0],
+            },
+            &Lut1D { samples: &[1.0] },
+        )
+        .unwrap();
+        assert_eq!(result, src);
     }
 }
