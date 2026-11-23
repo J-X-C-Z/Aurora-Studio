@@ -1,5 +1,5 @@
 use super::NikonCrop;
-use std::{ffi::{c_char, c_void}, io, ptr::{null, null_mut}};
+use std::{cell::RefCell, collections::HashMap, ffi::{c_char, c_void}, io, ptr::{null, null_mut}};
 use super::Stage1Params;
 
 type Handle = *mut c_void;
@@ -12,6 +12,47 @@ use system_opencl::{Api, bindings};
 struct Resource(Handle, unsafe extern "system" fn(Handle) -> i32);
 impl Drop for Resource {
     fn drop(&mut self) { unsafe { (self.1)(self.0); } }
+}
+
+struct Runtime {
+    programs: HashMap<&'static str, Resource>,
+    queue: Resource,
+    context: Resource,
+    device: Handle,
+}
+
+thread_local! {
+    static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+}
+
+impl Runtime {
+    fn new(cl: &Api) -> io::Result<Self> {
+        let device = nvidia_device(cl)?;
+        let mut error = 0;
+        let handle = unsafe { (cl.clCreateContext)(null(), 1, &device, None, null_mut(), &mut error) };
+        check("context", error)?;
+        let context = Resource(handle, cl.clReleaseContext);
+        let handle = unsafe { (cl.clCreateCommandQueue)(context.0, device, 0, &mut error) };
+        check("queue", error)?;
+        let queue = Resource(handle, cl.clReleaseCommandQueue);
+        Ok(Self { programs: HashMap::new(), queue, context, device })
+    }
+
+    fn program(&mut self, cl: &Api, text: &'static str) -> io::Result<Handle> {
+        if let Some(program) = self.programs.get(text) {
+            return Ok(program.0);
+        }
+        let source_code = text.as_ptr().cast::<c_char>();
+        let mut error = 0;
+        let handle = unsafe {
+            (cl.clCreateProgramWithSource)(self.context.0, 1, &source_code, &text.len(), &mut error)
+        };
+        check("program", error)?;
+        let program = Resource(handle, cl.clReleaseProgram);
+        check("build", unsafe { (cl.clBuildProgram)(program.0, 1, &self.device, null(), None, null_mut()) })?;
+        self.programs.insert(text, program);
+        Ok(handle)
+    }
 }
 
 fn check(stage: &str, status: i32) -> io::Result<()> {
@@ -174,43 +215,48 @@ pub(in super::super) fn export_color(pixels: &[[f32; 3]], film: &[[f32; 3]], tab
     Ok(output)
 }
 
-fn process<S, T>(input: &[S], output: &mut [T], text: &str, entry: &std::ffi::CStr,
+fn process<S, T>(input: &[S], output: &mut [T], text: &'static str, entry: &std::ffi::CStr,
               work: [usize; 2], setup: impl FnOnce(Handle, Handle) -> io::Result<()>) -> io::Result<()> {
     process_with_resources(input, output, text, entry, work, |kernel, source, _| setup(kernel, source))
 }
 
-fn process_with_resources<S, T, R>(input: &[S], output: &mut [T], text: &str, entry: &std::ffi::CStr,
+fn process_with_resources<S, T, R>(input: &[S], output: &mut [T], text: &'static str, entry: &std::ffi::CStr,
               work: [usize; 2], setup: impl FnOnce(Handle, Handle, Handle) -> io::Result<R>) -> io::Result<()> {
     let cl = bindings()?;
-    let device = nvidia_device(cl)?;
-    let source_code = text.as_ptr().cast::<c_char>();
+    RUNTIME.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Runtime::new(cl)?);
+        }
+        let runtime = slot.as_mut().expect("OpenCL runtime initialized");
+        let result = dispatch(cl, runtime, text, input, output, entry, work, setup);
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    })
+}
+
+fn dispatch<S, T, R>(cl: &Api, runtime: &mut Runtime, text: &'static str, input: &[S], output: &mut [T],
+              entry: &std::ffi::CStr, work: [usize; 2], setup: impl FnOnce(Handle, Handle, Handle) -> io::Result<R>) -> io::Result<()> {
+    let program = runtime.program(cl, text)?;
     unsafe {
         let mut error = 0;
-        let handle = (cl.clCreateContext)(null(), 1, &device, None, null_mut(), &mut error);
-        check("context", error)?;
-        let context = Resource(handle, cl.clReleaseContext);
-        let handle = (cl.clCreateCommandQueue)(context.0, device, 0, &mut error);
-        check("queue", error)?;
-        let queue = Resource(handle, cl.clReleaseCommandQueue);
-        let handle = (cl.clCreateProgramWithSource)(context.0, 1, &source_code, &text.len(), &mut error);
-        check("program", error)?;
-        let program = Resource(handle, cl.clReleaseProgram);
-        check("build", (cl.clBuildProgram)(program.0, 1, &device, null(), None, null_mut()))?;
-        let handle = (cl.clCreateKernel)(program.0, entry.as_ptr(), &mut error);
+        let handle = (cl.clCreateKernel)(program, entry.as_ptr(), &mut error);
         check("kernel", error)?;
         let kernel = Resource(handle, cl.clReleaseKernel);
         let pointer = output.as_mut_ptr().cast();
-        let handle = (cl.clCreateBuffer)(context.0, 36, size_of_val(input), input.as_ptr().cast_mut().cast(), &mut error);
+        let handle = (cl.clCreateBuffer)(runtime.context.0, 36, size_of_val(input), input.as_ptr().cast_mut().cast(), &mut error);
         check("source buffer", error)?;
         let source = Resource(handle, cl.clReleaseMemObject);
-        let handle = (cl.clCreateBuffer)(context.0, 33, size_of_val(output), pointer, &mut error);
+        let handle = (cl.clCreateBuffer)(runtime.context.0, 33, size_of_val(output), pointer, &mut error);
         check("output buffer", error)?;
         let result = Resource(handle, cl.clReleaseMemObject);
         argument(kernel.0, 0, &source.0)?;
         argument(kernel.0, 1, &result.0)?;
-        let _resources = setup(kernel.0, source.0, context.0)?;
-        check("enqueue", (cl.clEnqueueNDRangeKernel)(queue.0, kernel.0, 2, null(), work.as_ptr(), null(), 0, null(), null_mut()))?;
-        check("readback", (cl.clEnqueueReadBuffer)(queue.0, result.0, 1, 0, size_of_val(output), pointer, 0, null(), null_mut()))?;
+        let _resources = setup(kernel.0, source.0, runtime.context.0)?;
+        check("enqueue", (cl.clEnqueueNDRangeKernel)(runtime.queue.0, kernel.0, 2, null(), work.as_ptr(), null(), 0, null(), null_mut()))?;
+        check("readback", (cl.clEnqueueReadBuffer)(runtime.queue.0, result.0, 1, 0, size_of_val(output), pointer, 0, null(), null_mut()))?;
     }
     Ok(())
 }
