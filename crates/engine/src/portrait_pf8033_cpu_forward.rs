@@ -29,6 +29,8 @@ pub const PF8033_FINAL_TENSOR_FILE: &str = "pf8033-780929437.f32le";
 pub const PF8033_DX_FILE: &str = "pf8033-dx.f32le";
 pub const PF8033_DY_FILE: &str = "pf8033-dy.f32le";
 pub const PF8033_MASK_FILE: &str = "pf8033-mask.u8";
+pub const PF8033_ARTIFACT_CACHE: &str =
+    r"C:\WorkSpace\Aurora Studio\90_work\build-cache\pf8033";
 pub const PF8033_MODEL_WIDTH: u32 = 512;
 pub const PF8033_MODEL_HEIGHT: u32 = 512;
 pub const PF8033_FRAME_WIDTH: u32 = 1024;
@@ -336,8 +338,10 @@ pub fn load_pf8033_cpu_forward_artifacts(
     if source_sha256 != receipt.source_sha256 {
         return Err(Refusal::ValueOutOfRange("PF8033 source RGBA SHA"));
     }
+    let cache = PathBuf::from(PF8033_ARTIFACT_CACHE);
     let root = env::var_os(PF8033_CPU_FORWARD_ARTIFACTS_ENV)
         .map(PathBuf::from)
+        .or_else(|| cache.is_dir().then_some(cache))
         .unwrap_or_else(|| receipt.receipt_path.parent().unwrap_or(Path::new(".")).into());
     let final_bytes = read_exact(
         &root.join(PF8033_FINAL_TENSOR_FILE),
@@ -530,6 +534,7 @@ fn discover_receipt_path() -> Result<PathBuf, Refusal> {
         return Ok(path.into());
     }
     let candidates = [
+        PathBuf::from(PF8033_ARTIFACT_CACHE).join("pf8033-cpu-forward.json"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets/portrait/smile/pf8033-cpu-forward.json"),
         env::current_exe()
