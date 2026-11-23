@@ -14,7 +14,7 @@ pub const PF90001_PIXEL_LAW_OPEN: &str =
 pub const PF90003_PIXEL_LAW_OPEN: &str =
     "PF90003 TradBodySkinTone curve, LUT, shader and writeback are END_STATIC";
 pub const PF101_LIVE_ONLY: &str =
-    "PF101 requires the live Silkworm mask, LUT, blur pass and final shader binding";
+    "PF101 requires the live Silkworm mask, LUT, blur pass and final shader binding; H3 PE candidates RVA 0xB825/0xBAB6/0xC27A are only `cmp al, 0x65` immediates with no semantic xref, program, FBO or readback";
 pub const PF30209_END_STATIC: &str =
     "PF30209 stage +0x3A0/+0x3B8 is not forwarded by the fixed PE";
 

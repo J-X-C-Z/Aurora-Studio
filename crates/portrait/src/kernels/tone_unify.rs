@@ -17,15 +17,17 @@
 
 use crate::{Access, EffectMeta, Image, Refusal};
 
-/// PF90085/PF30059 now have executable CPU pixel stages; the HSL palette
-/// segment of 90085 stays open and is listed in its inputs.
+/// PF90085/PF30059 now have executable CPU geometry stages. PF90085's native
+/// `SkinRetuneHslPalette.frag` law is recovered, but its producer inputs are
+/// absent from the decrypted vendor configuration. The SkinAdjust curves are
+/// PF90005/PF90007 material and must not be substituted for PF90085.
 pub const META: &[EffectMeta] = &[
     EffectMeta {
         pf: 90085,
         key: "skinToneUnifyFace",
         label: "Skin tone unify (face)",
         access: Access::Cpu,
-        inputs: &["source", "per-face target", "skin/face/tooth/instance masks", "model weight", "ui"],
+        inputs: &["source", "per-face target", "skin/face/tooth/instance masks", "model weight", "ui", "GammaMap", "74-sample hue/saturation/lightness curves", "sRGB/ProPhoto matrices"],
     },
     EffectMeta {
         pf: 30059,
@@ -45,6 +47,15 @@ pub const INTERSECTION_THRESHOLD: u8 = 20;
 
 pub const PF90085_RVA: &str = "0x4F1FBAE / 0x7D35F0E / 0x7D35F91 / 0x7D35EA0 / 0x7D410B0 / 0x86ACDB0";
 pub const PF30059_RVA: &str = "0x14815D0B0 / 0x148153990 / 0x14815caf0 / 0x14867b610 / 0x14867b740";
+
+/// Exact producer gap after the H6 shader recovery. These values are not
+/// defaults: the full `ColorTransform` must refuse until all four are bound.
+pub const PF90085_MISSING_PRODUCER_INPUTS: &[&str] = &[
+    "74-sample hue/saturation/lightness controls",
+    "GammaMap LUT",
+    "forward/inverse sRGB/ProPhoto color matrices",
+    "UI/preset-to-PF90085 parameter generator",
+];
 
 fn check_image(image: &Image) -> Result<usize, Refusal> {
     if image.width == 0 || image.height == 0 {
@@ -342,7 +353,9 @@ pub struct Pass90085<'a> {
 }
 
 /// `out = src + (tuned - src) * support * degree * modelWeight`, alpha kept.
-/// The HSL-palette/gamma `ColorTransform` stage stays OPEN: supply a target.
+/// The native HSL-palette/gamma `ColorTransform` is statically recovered, but
+/// remains OPEN until its Palette and GammaMap inputs are bound end to end.
+/// Supply a target only to exercise this reduced CPU tail.
 pub fn pf90085_apply(source: &Image, pass: &Pass90085<'_>, ui: f32) -> Result<Image, Refusal> {
     let count = check_image(source)?;
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {

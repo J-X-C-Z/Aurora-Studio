@@ -60,7 +60,7 @@ pub(super) fn open_reason(pf: u32) -> Option<&'static str> {
         0 => "PF0 final repair RGB blend and composer C binding are unresolved",
         21104 => "PF21104 final placement/composite of the native RGB and A-derived mask pair is unresolved",
         90003 => "PF90003 native Trad curve/LUT and final writeback are unresolved",
-        90085 => "PF90085 native GammaMap and HSL palette transform are unresolved in this tree",
+        90085 => "PF90085 blocked: AISkinUnify/effect.json declares only FaceSkinUnify and SkinUnifyColorPicker/effect.json declares only a callback; no 74-sample controls, GammaMap, sRGB/ProPhoto matrices or preset generator exist, and SkinAdjust curves belong to PF90005/PF90007",
         90130 => "PF90130 native residual producer, A/B bridge, and cross-face writeback order are unresolved",
         _ => return None,
     })
