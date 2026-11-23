@@ -6,7 +6,7 @@ pub(crate) mod geometry16;
 mod reconstruct;
 mod render;
 
-pub use color::Z6iiiColorStage;
+pub use color::{StageTrace, Z6iiiColorStage};
 pub(in crate::aurora_raw) use render::{
     apply_linear_chromatic_aberration, apply_linear_color_noise_2012,
     recover_and_antialias_frame,

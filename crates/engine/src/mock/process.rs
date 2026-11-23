@@ -21,6 +21,9 @@ pub struct Source {
     camera_preview: bool,
     /// True when linear camera-space RGB came from the Z6III C1 RAW pipeline.
     c1_z6iii_linear: bool,
+    /// Capture ISO and body model, for the output-domain BandingSuppression.
+    /// Both stay `None` for non-RAW sources, which disables the stage.
+    banding_identity: Option<(u32, String)>,
     /// Skin/hair/face masks, computed lazily for portrait effects.
     portrait_masks: OnceLock<crate::portrait_stage::PortraitMasks>,
     /// Stable fingerprint of the decoded source snapshot.
@@ -211,6 +214,7 @@ impl Source {
                 lens_auto: None,
                 camera_preview: false,
                 c1_z6iii_linear: false,
+                banding_identity: None,
                 portrait_masks: OnceLock::new(),
                 fingerprint: OnceLock::new(),
                 face_rgba8: OnceLock::new(),
@@ -244,6 +248,7 @@ impl Source {
             lens_auto: None,
             camera_preview: false,
             c1_z6iii_linear: false,
+            banding_identity: None,
             portrait_masks: OnceLock::new(),
             fingerprint: OnceLock::new(),
             face_rgba8: OnceLock::new(),
@@ -282,6 +287,13 @@ impl Source {
 
     pub(crate) fn with_c1_z6iii_linear(mut self, enabled: bool) -> Self {
         self.c1_z6iii_linear = enabled;
+        self
+    }
+
+    /// Records the capture identity the output-domain BandingSuppression needs.
+    /// A missing ISO or model disables the stage rather than guessing one.
+    pub(crate) fn with_banding_identity(mut self, iso: Option<u32>, model: Option<&str>) -> Self {
+        self.banding_identity = iso.zip(model).map(|(iso, model)| (iso, model.to_owned()));
         self
     }
 
@@ -1104,6 +1116,8 @@ struct Plan<'a> {
     size: [f32; 2],
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     c1_color: Option<crate::z6iii::Z6iiiColorStage>,
+    /// Output-domain BandingSuppression, applied to the developed codes.
+    banding: Option<BandingPlan>,
     gamma: GammaLut,
     /// Exact sRGB instead of the preview LUT, so 16-bit export is not capped
     /// at the LUT's 8192 steps.
@@ -1119,6 +1133,17 @@ struct Plan<'a> {
     color_editor: bool,
     color_balance: bool,
     layers: Vec<LayerPlan<'a>>,
+}
+
+/// C1 queue stage 77 on developed output codes: the same kernel the verified
+/// 16-bit export runs on Adobe RGB codes, evaluated per source pixel so the
+/// interactive sampler can apply it out of raster order.
+struct BandingPlan {
+    params: crate::c1_banding::Params,
+    tables: crate::c1_banding::Tables,
+    /// Frame size in source pixels, used to turn a normalized sample position
+    /// back into the device coordinate the pattern is keyed on.
+    frame: [f32; 2],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1485,6 +1510,32 @@ fn upsample(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
     out
 }
 
+/// Resolves the output-domain BandingSuppression for one render.
+///
+/// Disabled unless the source carries both an ISO and a body model, and unless
+/// `c1_banding` can resolve an amount for that body: an unknown body or a zero
+/// amount must not invent a pattern.
+fn banding_plan(src: &Source, adj: &AdjustmentSet) -> Option<BandingPlan> {
+    let (iso, model) = src.banding_identity.as_ref()?;
+    let range = crate::c1_banding::range_for_frame(None, Some(model))?;
+    let amount = if range.is_adjustable() {
+        range.default
+    } else {
+        crate::c1_banding::default_for_iso(model, *iso)?
+    };
+    let params = crate::c1_banding::params_for_amount(amount);
+    if params == crate::c1_banding::Params::OFF {
+        return None;
+    }
+    let (left, right, packed) = crate::c1_banding::vendor_buffers()?;
+    let (width, height) = super::geometry::FrameMap::new(src.size(), &adj.geometry).frame_size();
+    Some(BandingPlan {
+        params,
+        tables: crate::c1_banding::Tables::new([&left[..], &right[..], &packed[..]])?,
+        frame: [width, height],
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_plan<'a>(
     src: &Source,
@@ -1525,6 +1576,7 @@ fn build_plan<'a>(
         size: [src.size().0 as f32, src.size().1 as f32],
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
         c1_color,
+        banding: banding_plan(src, adj),
         gamma: GammaLut::new(),
         fine,
         wb: render_wb_gains(&adj.white_balance),
@@ -2502,8 +2554,24 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2], index: Option<usize>) -
     [c[0] * e, c[1] * e, c[2] * e]
 }
 
+/// Applies C1 queue stage 77 to developed output codes.
+///
+/// The kernel is keyed on the device coordinate, so the normalized sample
+/// position is mapped back through the frame size. Identity geometry makes that
+/// the sensor coordinate the export uses; a crop or rotation would need the
+/// geometry origin, which this path does not carry yet.
+fn output_banding(plan: &Plan, rgb: [f32; 3], f: [f32; 2]) -> [f32; 3] {
+    let Some(banding) = &plan.banding else { return rgb };
+    let x = (f[0] * banding.frame[0]) as i32;
+    let y = (f[1] * banding.frame[1]) as i32;
+    let mut codes = rgb.map(|value| (value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16);
+    banding.tables.apply_pixel(&mut codes, x, y, banding.params);
+    codes.map(|code| f32::from(code) / 65535.0)
+}
+
 fn develop(plan: &Plan, lin: [f32; 3], f: [f32; 2], bypass: bool, index: Option<usize>) -> [f32; 3] {
-    develop_display(plan, develop_pre_curve(plan, lin, f, bypass, index))
+    let display = develop_display(plan, develop_pre_curve(plan, lin, f, bypass, index));
+    output_banding(plan, display, f)
 }
 
 /// Everything up to the display encode plus the brightness/contrast stage.
@@ -2519,7 +2587,7 @@ fn develop_pre_curve(
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     let display = if let Some(c1) = &plan.c1_color {
         if bypass {
-            return c1.develop_srgb(lin);
+            return output_banding(plan, c1.develop_srgb(lin), f);
         }
         let c = linear_edits(plan, lin, f, index);
         c1.develop_srgb(c)
@@ -7663,5 +7731,41 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             render(&src, &clean, NormRect::FULL, 4, false, None).rgba,
             "Z6III linear source must not fall back when icc_profile is an output space"
         );
+    }
+}
+
+#[cfg(test)]
+mod banding_tests {
+    use super::*;
+
+    fn source() -> Source {
+        Source::from_rgb16(4, 4, &vec![1000_u16; 4 * 4 * 3])
+    }
+
+    #[test]
+    fn output_banding_needs_an_iso_and_a_body_with_a_resolved_amount() {
+        let adj = AdjustmentSet::default();
+        assert!(banding_plan(&source(), &adj).is_none(), "no capture identity must not band");
+        assert!(
+            banding_plan(&source().with_banding_identity(None, Some("NIKON Z 6III")), &adj).is_none(),
+            "an unknown ISO must not enable the stage"
+        );
+        assert!(
+            banding_plan(&source().with_banding_identity(Some(320), None), &adj).is_none(),
+            "an unknown body must not enable the stage"
+        );
+        assert!(
+            banding_plan(&source().with_banding_identity(Some(320), Some("SONY ILCE-7M4")), &adj).is_none(),
+            "a body without a measured amount must not borrow the Z6III rule"
+        );
+    }
+
+    #[test]
+    fn zero_amount_renders_the_same_bytes() {
+        let src = source();
+        let adj = AdjustmentSet::default();
+        let before = render(&src, &adj, NormRect::FULL, 4, false, None).rgba;
+        assert!(banding_plan(&src, &adj).is_none());
+        assert_eq!(before, render(&source(), &adj, NormRect::FULL, 4, false, None).rgba);
     }
 }

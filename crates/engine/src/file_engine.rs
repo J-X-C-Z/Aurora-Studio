@@ -1496,11 +1496,19 @@ impl FileEngine {
         if camera_preview {
             decoded_reason = Some("unsupported RAW compression; showing the camera's embedded preview".into());
         }
+        // BandingSuppression is keyed on ISO and body; the stage stays off when
+        // either is missing rather than falling back to a guessed amount.
+        let banding_exif = crate::raw::is_raw(&decoded_path)
+            .then(|| crate::exif::read_exif(&decoded_path));
         let source = Arc::new(
             source
                 .with_lens_shot(lens)
                 .with_camera_preview(camera_preview)
-                .with_c1_z6iii_linear(c1_z6iii_linear),
+                .with_c1_z6iii_linear(c1_z6iii_linear)
+                .with_banding_identity(
+                    banding_exif.as_ref().and_then(|exif| exif.iso),
+                    banding_exif.as_ref().and_then(|exif| exif.camera_model.as_deref()),
+                ),
         );
 
         let mut st = self.state.lock();

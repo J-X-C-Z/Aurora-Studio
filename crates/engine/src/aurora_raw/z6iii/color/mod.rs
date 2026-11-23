@@ -88,7 +88,28 @@ impl Z6iiiColorStage {
     }
 
     pub fn develop_srgb(&self, rgb: [f32; 3]) -> [f32; 3] {
-        self.apply_camera_icc(self.encode_camera_rgb(rgb))
+        self.trace(rgb).output
+    }
+
+    /// Intermediate values of the colour stage for one pixel, in chain order.
+    ///
+    /// `linear` is the post-black/white-balance camera value, `matrix` the
+    /// 3x3 pre-matrix, `film` the `.fcrv` node evaluation, `coupled` the
+    /// highlight/hue coupling blend, `camera` the camera transfer encode and
+    /// `output` the 49^3 Camera -> working-RGB CLUT. Same per-pixel math as
+    /// [`Self::encode_camera_rgb`] + [`Self::apply_camera_icc`]; exposed for the
+    /// `z6iii-color-trace` diagnostic binary.
+    #[doc(hidden)]
+    pub fn trace(&self, rgb: [f32; 3]) -> StageTrace {
+        let linear = rgb.map(|value| value.max(0.0));
+        let matrix = self.pre_matrix.map(|[red, green, blue]| {
+            (red * linear[0] + green * linear[1] + blue * linear[2]).max(0.0)
+        });
+        let film = matrix.map(|value| coupled::film_at(&self.film, value));
+        let coupled = coupled::couple_float(matrix, film);
+        let camera = coupled.map(coupled::encode_camera);
+        let output = self.apply_camera_icc(camera);
+        StageTrace { linear, matrix, film, coupled, camera, output }
     }
 
     pub(crate) fn encode_camera_rgb(&self, rgb: [f32; 3]) -> [f32; 3] {
@@ -104,6 +125,18 @@ impl Z6iiiColorStage {
     pub(crate) fn apply_camera_icc(&self, encoded: [f32; 3]) -> [f32; 3] {
         self.clut.sample_srgb(encoded).unwrap_or([0.0; 3])
     }
+}
+
+/// One pixel's values at every stage of [`Z6iiiColorStage`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct StageTrace {
+    pub linear: [f32; 3],
+    pub matrix: [f32; 3],
+    pub film: [f32; 3],
+    pub coupled: [f32; 3],
+    pub camera: [f32; 3],
+    pub output: [f32; 3],
 }
 
 fn cached_srgb_clut(
