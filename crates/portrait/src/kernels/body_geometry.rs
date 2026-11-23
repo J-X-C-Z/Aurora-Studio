@@ -13,6 +13,13 @@
 
 use crate::{Access, EffectMeta, Image, Refusal};
 
+/// PF403's recovered tensor is only the source-mask producer. The product
+/// identity reaches `PoseRefine/BreastRefine` and the `RepairBreast`
+/// `EffectCallback`, but that callback's shader/material and RGBA writeback
+/// remain unbound.
+pub const PF403_FINAL_CONSUMER_OPEN: &str =
+    "PF403 source mask is recovered. enhanceBreast(403) is BreastRefine in PoseRefine/effect.json and RepairBreast/effect.json declares EffectCallback/RepairBreast, but the callback-to-30-body-shader/material/pass, BodyFaceSculpt vtable slot, and final RGBA writeback binding are absent";
+
 /// `ShaderPi` from the recovered 6-point shaders.
 const SHADER_PI: f32 = 3.141_592_653_59;
 
@@ -43,7 +50,7 @@ pub const META: &[EffectMeta] = &[
     EffectMeta {
         pf: 403,
         key: "enhanceBreastMask",
-        label: "EnhanceBreast source mask (row 106)",
+        label: "EnhanceBreast source mask producer only (row 106)",
         access: Access::Cpu,
         inputs: &["source_mask", "radius01"],
     },

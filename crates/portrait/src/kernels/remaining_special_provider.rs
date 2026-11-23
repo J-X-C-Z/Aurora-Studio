@@ -56,7 +56,7 @@ pub const CONTRACTS: [RemainingSpecialContract; 7] = [
         pf: 403,
         status: ProviderStatus::TypedProducer,
         required_same_job_inputs: &["source_mask", "radius01"],
-        reason: "PF403 uses the recovered Dilate -> Gaussian -> MeanBlur mask kernel",
+        reason: body_geometry::PF403_FINAL_CONSUMER_OPEN,
     },
     RemainingSpecialContract {
         pf: 101,
