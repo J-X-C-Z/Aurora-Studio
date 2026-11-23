@@ -1615,7 +1615,19 @@ fn stage_dust_removal(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) 
 
 /// `ZLENSSHIFTXY` + `ZLENSTILT` as one 3x3 map, following `CResampler::UpdateGeo`:
 /// `tq = atan(m * tan(tilt))`, `k = tan(tq / 2)` shears the perspective rows.
-fn stage_movement(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+pub(crate) fn stage_movement(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    stage_movement_impl(buf, w, h, adj, sample_bilinear, |v| v.clamp(0.0, 255.0).round() as u8);
+}
+
+pub(crate) fn stage_movement16(buf: &mut [u16], w: usize, h: usize, adj: &LensCorrection) {
+    stage_movement_impl(buf, w, h, adj, sample_bilinear16, |v| v.clamp(0.0, 65535.0).round() as u16);
+}
+
+fn stage_movement_impl<T: Copy + Send + Sync>(
+    buf: &mut [T], w: usize, h: usize, adj: &LensCorrection,
+    sample: impl Fn(&[T], usize, usize, f32, f32) -> [f32; 3] + Sync,
+    quantize: impl Fn(f32) -> T + Sync,
+) {
     let tilt = adj.tilt.clamp(-45.0, 45.0);
     if w == 0 || h == 0 || (adj.shift_x == 0.0 && adj.shift_y == 0.0 && tilt == 0.0) {
         return;
@@ -1654,10 +1666,10 @@ fn stage_movement(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
             } else {
                 ((d * xx - c * yy) / det - tx, (a * yy - b * xx) / det - ty)
             };
-            let rgb = sample_bilinear(&src, w, h, cx + u, cy + v);
+            let rgb = sample(&src, w, h, cx + u, cy + v);
             let i = x * 4;
             for k in 0..3 {
-                row[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+                row[i + k] = quantize(rgb[k]);
             }
             row[i + 3] = src[(y * w + x) * 4 + 3];
         }
@@ -1693,7 +1705,7 @@ fn gauss_gather(src: &[u8], w: usize, h: usize, x: f32, y: f32, d: [f32; 2]) -> 
 
 /// `ZLENSRADIALBLUR`: radial then transverse 1D Gaussian gathers. `valid == 0`
 /// or `amount < 0.5` is identity, matching `CImgOpFixRadialBlur::IsIdentity`.
-fn stage_sharpness_falloff(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+pub(crate) fn stage_sharpness_falloff(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
     let curves = &adj.radial_blur;
     let amount = adj.sharpness_falloff;
     if !curves.valid || amount < 0.5 || w == 0 || h == 0 {
@@ -1736,10 +1748,11 @@ fn stage_sharpness_falloff(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrect
     }
 }
 
-/// The lens stages that only exist on the 8-bit preview path.
+/// Color and dust stages still evaluated in the narrow working buffer.
 pub(crate) fn stage_lens_extras(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
-    stage_movement(buf, w, h, adj);
-    stage_sharpness_falloff(buf, w, h, adj);
+    stage_ca_fringes(buf, w, h, adj);
+    stage_purple_fringing(buf, w, h, crate::mock::purple_norm(adj.purple_fringing));
+    stage_dust_removal(buf, w, h, adj);
 }
 
 /// Capture One's measured tables. Radius is measured on the render buffer's half

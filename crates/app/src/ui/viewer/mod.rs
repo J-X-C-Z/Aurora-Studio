@@ -52,6 +52,36 @@ impl Placement {
     }
 }
 
+/// Pick a pixel from the rendered BGRA tile, using its own frame region.
+fn pick_rendered_color(bytes: &[u8], size: (usize, usize), region: NormRect, point: [f32; 2]) -> Option<[f32; 3]> {
+    let (w, h) = size;
+    if w == 0 || h == 0 || region.width <= 0.0 || region.height <= 0.0 {
+        return None;
+    }
+    let x = (point[0] - region.x) / region.width;
+    let y = (point[1] - region.y) / region.height;
+    if !(0.0..1.0).contains(&x) || !(0.0..1.0).contains(&y) {
+        return None;
+    }
+    let index = ((y * h as f32) as usize).min(h - 1) * w + ((x * w as f32) as usize).min(w - 1);
+    let pixel = bytes.get(index * 4..index * 4 + 4)?;
+    Some([pixel[2], pixel[1], pixel[0]].map(|code| f32::from(code) / 255.0))
+}
+
+#[cfg(test)]
+mod color_pick_tests {
+    use super::*;
+
+    #[test]
+    fn samples_bgra_pixels_in_the_rendered_subregion() {
+        let bytes = [30, 20, 10, 255, 60, 50, 40, 255];
+        let r = NormRect { x: 0.25, y: 0.125, width: 0.5, height: 0.25 };
+        assert_eq!(pick_rendered_color(&bytes, (2, 1), r, [0.375, 0.25]), Some([10., 20., 30.].map(|v| v / 255.0)));
+        assert_eq!(pick_rendered_color(&bytes, (2, 1), r, [0.625, 0.25]), Some([40., 50., 60.].map(|v| v / 255.0)));
+        assert!(pick_rendered_color(&bytes, (2, 1), r, [0.75, 0.25]).is_none());
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Drag {
     Pan { start: (f32, f32), center: (f32, f32) },
@@ -240,6 +270,23 @@ impl Viewer {
                 let at = [f.0, f.1];
                 state.update(cx, |s, cx| {
                     let Some(id) = s.current else { return };
+                    let frame = if compare == CompareMode::Split && v.0 < split * self.placement.vw {
+                        s.preview.before.as_ref().filter(|frame| frame.image_id == id)
+                    } else { None }.or_else(|| s.preview.frame.as_ref().filter(|frame| frame.image_id == id));
+                    // Color Editor ranges need the engine's working color, not monitor codes.
+                    if !s.panels.pick_to_range {
+                        if let Some(frame) = frame {
+                            let size = frame.image.size(0);
+                            if let Some(color) = frame.image.as_bytes(0).and_then(|bytes| {
+                                pick_rendered_color(bytes, (size.width.0 as usize, size.height.0 as usize), frame.region, at)
+                            }) {
+                                s.sampled_color = Some(color);
+                                s.picker_point = Some(at);
+                                cx.notify();
+                            }
+                        }
+                        return;
+                    }
                     let adj = crate::state::flattened(s.adj());
                     match s.engine.sample_color(id, &adj, at) {
                         Ok(c) => {

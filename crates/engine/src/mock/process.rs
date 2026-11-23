@@ -1711,6 +1711,7 @@ fn render_sized(
             Some(warp) if rgba16.is_some() => {
                 let mut preview = detail_adj.clone();
                 preview.lens.distortion = 0.0;
+                preview.lens.dust_removal_enabled = false;
                 preview.lens.light_falloff = 0.0;
                 preview.lens.uniform_light = 0.0;
                 preview.lens.uniform_light_enabled = false;
@@ -1725,10 +1726,14 @@ fn render_sized(
                 if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
                     merge_wide_delta(wide, before, &rgba, out_w as usize);
                 }
-                super::detail::stage_lens(&mut rgba, out_w as usize, out_h as usize, &detail_adj.lens, Some(warp));
-                // The extras are 8-bit stages; the wide buffer keeps the profile
-                // warp but not these (documented gap).
-                super::detail::stage_lens_extras(&mut rgba, out_w as usize, out_h as usize, &detail_adj.lens);
+                let lens = &detail_adj.lens;
+                let mut base_lens = lens.clone();
+                base_lens.purple_fringing = 0.0;
+                base_lens.ca_fringing = Default::default();
+                if !lens.ca_fringing.is_empty() { base_lens.chromatic_aberration = false; }
+                super::detail::stage_lens(&mut rgba, out_w as usize, out_h as usize, &base_lens, Some(warp));
+                let before_extras = rgba.clone();
+                super::detail::stage_lens_extras(&mut rgba, out_w as usize, out_h as usize, lens);
                 if let Some(wide) = rgba16.as_mut() {
                     super::detail::stage_lens_profile16(
                         wide,
@@ -1740,6 +1745,14 @@ fn render_sized(
                         (detail_adj.lens.light_falloff / 100.0).clamp(0.0, 1.0),
                         detail_adj.lens.chromatic_aberration,
                     );
+                    merge_wide_delta(wide, &before_extras, &rgba, out_w as usize);
+                }
+                super::detail::stage_movement(&mut rgba, out_w as usize, out_h as usize, lens);
+                let before_falloff = rgba.clone();
+                super::detail::stage_sharpness_falloff(&mut rgba, out_w as usize, out_h as usize, lens);
+                if let Some(wide) = rgba16.as_mut() {
+                    super::detail::stage_movement16(wide, out_w as usize, out_h as usize, lens);
+                    merge_wide_delta(wide, &before_falloff, &rgba, out_w as usize);
                 }
                 // Everything after this point (spots, layers) is local and can
                 // merge as before.
@@ -5617,6 +5630,19 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
     }
 
     /// The export render must keep shadow codes the 8-bit preview quantises away.
+    #[test]
+    fn render16_keeps_lens_movement_with_a_matched_profile() {
+        let (w, h) = (64, 48);
+        let mut src = Source::from_rgba(w, h, &synthetic(w, h));
+        src.lens_auto = Some(super::super::lens_profile::LensWarp::default());
+        let mut adj = AdjustmentSet::default();
+        adj.lens.use_profile = true;
+        let before = render16(&src, &adj, NormRect::FULL, w, false);
+        adj.lens.shift_x = 25.0;
+        let after = render16(&src, &adj, NormRect::FULL, w, false);
+        assert_ne!(after.rgba, before.rgba);
+    }
+
     #[test]
     fn render16_keeps_more_shadow_codes_than_render() {
         use std::collections::BTreeSet;
