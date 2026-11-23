@@ -79,51 +79,26 @@ pub(in crate::aurora_raw) fn linear_rgba16(
     bayer: Option<(usize, usize, Vec<u16>)>,
     ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
 ) -> Result<(usize, usize, Vec<u16>)> {
-    let mut linear_rgb = vec![[0.0f32; 3]; 6048 * 4032];
-    let mut detected_iso = 100u32;
-    let mut detected_noise = [0.0f32; 2];
+    // Both the neutral export and the editable source start at the same
+    // reconstructed pixels. Color noise is an adjustment, so the source cache
+    // must be independent of it.
+    let mut out = vec![65535u16; 6048 * 4032 * 4];
     let (crop_w, crop_h) = render_linear_tiles(
         nef,
         bayer,
         ca_warp,
-        |left, top, width, _height, core, iso, noise| {
-            detected_iso = iso;
-            detected_noise = noise;
-            for (row, values) in core.chunks_exact(width).enumerate() {
-                let dst = (top + row) * 6048 + left;
-                linear_rgb[dst..dst + width].copy_from_slice(values);
+        |left, top, width, _height, core, _iso, _noise| {
+            for (y, row) in core.chunks_exact(width).enumerate() {
+                let offset = ((top + y) * 6048 + left) * 4;
+                for (dst, pixel) in out[offset..offset + width * 4].chunks_exact_mut(4).zip(row) {
+                    for (channel, &value) in dst[..3].iter_mut().zip(pixel) {
+                        *channel = value.clamp(0.0, 65535.0) as u16;
+                    }
+                }
             }
             Ok(())
         },
     )?;
-
-    // C1 queue stages 22-38 (after AntiColorAliasingV10, before ClampNegative):
-    // Luminance NR is controlled exclusively by the full-precision develop/detail
-    // stage so the UI luminance slider (0..100) has exact single-pass control
-    // without double-smoothing fine hair/feather micro-texture.
-    // 1. Linear-domain ColorNoise2012 (LABRangeFilter2012, zero 8-bit quantization loss).
-    apply_linear_color_noise_2012(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
-    // 2. High-ISO wide chroma blotch suppression (CImgOpColorNoiseHighISO, ISO >= 1600).
-    if detected_iso >= 1600 {
-        apply_linear_color_noise_2012(
-            &mut linear_rgb,
-            crop_w,
-            crop_h,
-            detected_iso,
-            [detected_noise[0] * 1.6, detected_noise[1] * 2.0],
-        );
-    }
-
-    let mut out = vec![0u16; crop_w * crop_h * 4];
-    for (dst, px) in out.chunks_exact_mut(4).zip(linear_rgb.iter()) {
-        dst[0] = px[0].clamp(0.0, 65535.0) as u16;
-        dst[1] = px[1].clamp(0.0, 65535.0) as u16;
-        dst[2] = px[2].clamp(0.0, 65535.0) as u16;
-        dst[3] = 65535;
-    }
-
-    // The verified export applies banding after output color encoding.
-    // Applying those output codes to camera RGB injects strong shadow noise.
     Ok((crop_w, crop_h, out))
 }
 

@@ -17,7 +17,7 @@ use std::path::Path;
 
 /// Full-frame RGB16 through the C1 chain:
 /// 1. Z6III HE NEF -> `z6iii::render_linear_rgba16` (OpenCL full reconstruct + linear CA +
-///    highlight recovery + anti-alias + linear LumaNoise/ColorNoise2012 + BandingSuppression);
+///    highlight recovery + anti-alias);
 /// 2. Fujifilm X-Trans (`filters == 9`) -> `xtrans::demosaic_xtrans` + linear CA + linear denoise;
 /// 3. Any standard 2x2 Bayer RAW (Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.) ->
 ///    C1 Stage 1/2/3 over 128-pixel tiles with camera-specific ISO noise + linear CA + linear denoise.

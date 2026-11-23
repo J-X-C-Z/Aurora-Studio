@@ -21,8 +21,8 @@ use crate::RgbaImage;
 /// Only files with this prefix are ever evicted; the caller shares the folder.
 const PREFIX: &str = "raw-";
 // Bump when decoded pixels change, even if the persisted layout is unchanged.
-// B4 may contain output banding offsets baked into camera RGB.
-const RAW16_MAGIC: &[u8; 8] = b"AUR16B5\0";
+// B5 may contain fixed chroma filtering baked into Z6III camera RGB.
+const RAW16_MAGIC: &[u8; 8] = b"AUR16B6\0";
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
 
@@ -529,7 +529,7 @@ mod tests {
         assert!(read_cached16_binary(&file).is_some());
         assert!(read_cached_source16(&file).is_some());
         let mut bytes = fs::read(&file).unwrap();
-        bytes[..8].copy_from_slice(b"AUR16B4\0");
+        bytes[..8].copy_from_slice(b"AUR16B5\0");
         fs::write(&file, bytes).unwrap();
         assert!(read_cached16_binary(&file).is_none());
         assert!(read_cached_source16(&file).is_none());
