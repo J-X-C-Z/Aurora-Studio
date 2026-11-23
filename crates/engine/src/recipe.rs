@@ -1695,14 +1695,11 @@ fn write_export_pixels(
     let profile = resolve_profile(&recipe.icc_profile);
     // C1 stores `SharpeningOutputControl = 2` as "no output sharpening": the
     // amount stays in the recipe, the stage is skipped.
-    let edits_8bit = profile.is_some()
-        || recipe.watermark.is_some()
-        || match explicit_sharpening(recipe) {
-            Some(settings) => settings.amount > 0.0,
-            None if recipe.output_sharpening_settings.is_some() => false,
-            None => !matches!(recipe.output_sharpening, OutputSharpening::Disabled),
-        };
-    let fold_8bit = wide.is_some() && edits_8bit;
+    let sharpen_8bit = match explicit_sharpening(recipe) {
+        Some(settings) => settings.amount > 0.0,
+        None if recipe.output_sharpening_settings.is_some() => false,
+        None => !matches!(recipe.output_sharpening, OutputSharpening::Disabled),
+    };
     let amount = match recipe.output_sharpening {
         OutputSharpening::Disabled => 0.0,
         OutputSharpening::Screen => 0.6,
@@ -1723,14 +1720,24 @@ fn write_export_pixels(
     if profile.is_none() {
         log::warn!("export: ICC profile '{}' not found, writing untagged sRGB", recipe.icc_profile);
     }
+    if let Some(wide) = wide.as_mut().filter(|_| sharpen_8bit) {
+        fold_eight_bit_edits(wide, &rgba);
+    }
     if let Some(target) = profile.as_ref() {
-        convert_to_profile(&mut rgba, &target.profile, &target.path);
+        if let Some(wide) = wide.as_mut() {
+            if !is_srgb(&target.profile, &target.path) {
+                icc::convert_srgb16_to(wide, &target.profile);
+                rgba = narrow_from_wide(wide);
+            }
+        } else {
+            convert_to_profile(&mut rgba, &target.profile, &target.path);
+        }
     }
     if let Some(mark) = recipe.watermark.as_ref() {
         draw_watermark(&mut rgba, tw, th, mark);
-    }
-    if let Some(wide) = wide.as_mut().filter(|_| fold_8bit) {
-        fold_eight_bit_edits(wide, &rgba);
+        if let Some(wide) = wide.as_mut() {
+            fold_eight_bit_edits(wide, &rgba);
+        }
     }
 
     let icc_bytes = profile.as_ref().and_then(|target| std::fs::read(&target.path).ok());

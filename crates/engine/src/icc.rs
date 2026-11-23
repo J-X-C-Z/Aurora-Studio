@@ -1208,6 +1208,17 @@ pub fn convert_srgb_to_with(rgba: &mut [u8], profile: &Profile, rendering: Rende
     Some(())
 }
 
+/// Apply the output profile directly to 16-bit sRGB, preserving alpha.
+pub(crate) fn convert_srgb16_to(rgba: &mut [u16], profile: &Profile) {
+    rgba.par_chunks_exact_mut(4).for_each(|px| {
+        let xyz = srgb_to_xyz_d50([px[0], px[1], px[2]].map(|v| v as f32 / 65535.0));
+        let out = profile.encode(xyz);
+        for k in 0..3 {
+            px[k] = (out[k].clamp(0.0, 1.0) * 65535.0).round() as u16;
+        }
+    });
+}
+
 /// Convert an RGBA buffer in the profile's device space into sRGB.
 pub fn convert_to_srgb(rgba: &mut [u8], profile: &Profile) {
     let _ = convert_to_srgb_with(rgba, profile, Rendering::default());
@@ -1316,6 +1327,18 @@ mod tests {
             inverse: OnceLock::new(),
             solve: OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn wide_profile_conversion_uses_sub_byte_values_and_keeps_alpha() {
+        let mut profile = synthetic("linear", 1.0);
+        profile.gray = Some(Curve::Identity);
+        let mut rgba = [32768, 32768, 32768, 777, 32824, 32824, 32824, 1234];
+        convert_srgb16_to(&mut rgba, &profile);
+        assert_eq!(rgba[3], 777);
+        assert_eq!(rgba[7], 1234);
+        assert!(rgba[4] > rgba[0]);
+        assert!(rgba[0] < 20000);
     }
 
     #[test]
