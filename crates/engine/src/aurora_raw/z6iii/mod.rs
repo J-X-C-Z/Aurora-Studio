@@ -58,8 +58,8 @@ pub fn render(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Frame> {
 }
 
 /// Reconstructs linear camera-space RGBA16 via the Z6III OpenCL pipeline
-/// (demosaic + linear CA + highlight recovery + anti-alias + linear LumaNoise/ColorNoise2012
-/// + BandingSuppression) when an OpenCL GPU is available.
+/// (demosaic, linear CA, highlight recovery, anti-aliasing and chroma filtering)
+/// when an OpenCL GPU is available.
 pub(in crate::aurora_raw) fn render_linear_rgba16(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,

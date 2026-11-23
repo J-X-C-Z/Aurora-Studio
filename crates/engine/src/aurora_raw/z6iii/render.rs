@@ -122,10 +122,8 @@ pub(in crate::aurora_raw) fn linear_rgba16(
         dst[3] = 65535;
     }
 
-    // C1 queue stage 77: BandingSuppression (16x16 periodic pattern removal).
-    if let Some(tables) = cached_banding_tables() {
-        apply_banding_rgba16(&mut out, crop_w, detected_iso, [&tables.0, &tables.1, &tables.2]);
-    }
+    // The verified export applies banding after output color encoding.
+    // Applying those output codes to camera RGB injects strong shadow noise.
     Ok((crop_w, crop_h, out))
 }
 
@@ -270,74 +268,6 @@ fn apply_banding(rgb: &mut [u16], width: usize, iso: u32, tables: [&[u8]; 3]) {
             }
         }
     }
-}
-
-fn apply_banding_rgba16(rgba: &mut [u16], width: usize, iso: u32, tables: [&[u8]; 3]) {
-    let [left, right, packed] = tables;
-    let words: Vec<_> = packed.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
-    let factor = match iso {
-        0..=100 => 0.5,
-        101..=200 => iso as f32 / 200.0,
-        201..=1600 => 1.0 + (iso - 200) as f32 / 1400.0,
-        _ => 2.0,
-    };
-    let gain = (((200.0 * factor) * (1.0 / 128.0)) * 1.25 * 65_536.0) as i32;
-    let limit = (gain * 255) >> 16;
-    let strength = (65_536.0_f32 / limit as f32) as i32;
-    for (row, pixels) in rgba.chunks_exact_mut(4 * width).enumerate() {
-        for (column, pixel) in pixels.chunks_exact_mut(4).enumerate() {
-            let cell = ((column & 14) << 4) | (row & 15);
-            let block = ((column & 255) >> 4) | (row & 240);
-            let pair = words[(block + usize::from(left[cell])) & 255]
-                .wrapping_sub(words[(block + usize::from(right[cell])) & 255]);
-            let half = (pair >> (16 * (column & 1))) & 65_535;
-            let high = (((half >> 8) as i32) * gain) >> 16;
-            let low = (((half & 255) as i32) * gain) >> 16;
-            for code in &mut pixel[..3] {
-                let value = i32::from(*code);
-                let headroom = limit.min(65_535 - value);
-                *code = (value + (((high - low) * headroom * strength) >> 16)).clamp(0, 65_535) as u16;
-            }
-        }
-    }
-}
-
-fn cached_banding_tables() -> Option<&'static ([u8; 256], [u8; 256], [u8; 1024])> {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
-
-    static TABLES: OnceLock<Option<([u8; 256], [u8; 256], [u8; 1024])>> = OnceLock::new();
-    TABLES
-        .get_or_init(|| {
-            let root = std::env::var_os("AURORA_Z6III_C1_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One"));
-            let mut core = std::fs::File::open(root.join("ImgCoreDll.dll")).ok()?;
-            let mut left = [0u8; 256];
-            let mut right = [0u8; 256];
-            let mut packed = [0u8; 1024];
-            for (offset, table) in [
-                (40_613_632, &mut left[..]),
-                (40_614_912, &mut right[..]),
-                (40_613_888, &mut packed[..]),
-            ] {
-                core.seek(SeekFrom::Start(offset)).ok()?;
-                core.read_exact(table).ok()?;
-            }
-            let fingerprint = |bytes: &[u8]| {
-                bytes.iter().fold(0xcbf29ce484222325_u64, |hash, &byte| {
-                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-                })
-            };
-            if [fingerprint(&left), fingerprint(&right), fingerprint(&packed)]
-                != [0x0528b3d3556eb0f5, 0x24060a098de1ec13, 0x065f8d932bb7fdef3]
-            {
-                return None;
-            }
-            Some((left, right, packed))
-        })
-        .as_ref()
 }
 
 /// C1 queue stage 16 (`FixChromaticAberration`, `p_041444160.cl`):
@@ -738,9 +668,6 @@ mod tests {
         apply_banding(&mut pixels, 2, 200, [&[1; 256], &[0; 256], &words]);
         assert_eq!(pixels, [494, 1_494, 65_535, 0, 505, 65_535]);
 
-        let mut rgba = [0, 1_000, 65_535, 65_535, 0, 1_000, 65_535, 65_535];
-        apply_banding_rgba16(&mut rgba, 2, 200, [&[1; 256], &[0; 256], &words]);
-        assert_eq!(rgba, [494, 1_494, 65_535, 65_535, 0, 505, 65_535, 65_535]);
     }
 
     #[test]

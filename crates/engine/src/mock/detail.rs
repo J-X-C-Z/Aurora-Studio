@@ -67,6 +67,31 @@ pub(crate) fn post_process_core_f32(
     }
 }
 
+/// Support of successive neighborhood stages in output pixels.
+pub(crate) fn core_halo(adj: &crate::AdjustmentSet, scale: f32, sharpen: bool) -> usize {
+    let nr = &adj.noise_reduction;
+    let mut radius = usize::from(nr.single_pixel > 0.0) + usize::from(nr.luminance > 0.0);
+    if nr.color > 0.0 {
+        radius += color_filter_support(nr.color, scale).0 as usize;
+    }
+    if sharpen && adj.sharpening.amount > 0.0 {
+        let sigma = (adj.sharpening.radius.max(0.1) * scale).clamp(0.35, 12.0);
+        radius += gaussian_support(sigma);
+    }
+    radius
+}
+
+fn color_filter_support(amount: f32, scale: f32) -> (isize, isize) {
+    let strength = (amount / 100.0).clamp(0.0, 1.0);
+    let step = (4.0 * scale).round().clamp(1.0, 8.0) as isize;
+    let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as isize;
+    (half_taps * step, step)
+}
+
+fn gaussian_support(sigma: f32) -> usize {
+    (sigma * 3.0).ceil().clamp(1.0, 24.0) as usize
+}
+
 #[inline]
 fn srgb_to_linear_f32(v: f32) -> f32 {
     let v = v.clamp(0.0, 1.0);
@@ -190,9 +215,7 @@ fn stage_color_nr_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseReduc
     let pz_chroma = 2_400.0 + 18_000.0 * strength * strength;
     let pw_chroma = 12.0 + 36.0 * strength;
 
-    let step = (4.0 * scale).round().clamp(1.0, 8.0) as isize;
-    let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as isize;
-    let radius = half_taps * step;
+    let (radius, step) = color_filter_support(adj.color, scale);
 
     let n = w * h;
     let mut encoded = vec![[0.0f32; 3]; n];
@@ -876,9 +899,7 @@ fn stage_color_nr(buf: &mut [u8], w: usize, h: usize, adj: &NoiseReduction, scal
     let pz_chroma = 2_400.0 + 18_000.0 * strength * strength;
     let pw_chroma = 12.0 + 36.0 * strength;
 
-    let step = (4.0 * scale).round().clamp(1.0, 8.0) as isize;
-    let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as isize;
-    let radius = half_taps * step;
+    let (radius, step) = color_filter_support(adj.color, scale);
 
     let mut srgb_to_lin16 = [0.0f32; 256];
     for (i, slot) in srgb_to_lin16.iter_mut().enumerate() {
@@ -1092,7 +1113,7 @@ fn stage_moire(buf: &mut [u8], w: usize, h: usize, adj: &Moire) {
 // ───────────────────────────── 4. sharpening ─────────────────────────────
 
 fn gaussian_blur_sep(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
-    let half = (sigma * 3.0).ceil().clamp(1.0, 24.0) as usize;
+    let half = gaussian_support(sigma);
     let mut kernel = vec![0.0f32; half + 1];
     let inv2s2 = 1.0 / (2.0 * sigma * sigma);
     let mut sum = 1.0f32;
