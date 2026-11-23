@@ -7,7 +7,8 @@ mod render;
 
 pub use color::Z6iiiColorStage;
 pub(in crate::aurora_raw) use render::{
-    apply_linear_chromatic_aberration, apply_linear_color_noise_2012, apply_linear_luma_noise_2018,
+    apply_linear_chromatic_aberration, apply_linear_color_noise_2012,
+    recover_and_antialias_frame,
 };
 
 use anyhow::{Context, Result, ensure};

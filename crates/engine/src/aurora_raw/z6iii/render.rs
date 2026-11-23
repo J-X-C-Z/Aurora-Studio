@@ -98,11 +98,12 @@ pub(in crate::aurora_raw) fn linear_rgba16(
     )?;
 
     // C1 queue stages 22-38 (after AntiColorAliasingV10, before ClampNegative):
-    // 1. Directional linear-domain luminance NR + LumaTransfer (ISO >= 400).
-    apply_linear_luma_noise_2018(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
-    // 2. Linear-domain ColorNoise2012 (LABRangeFilter2012, zero 8-bit quantization loss).
+    // Luminance NR is controlled exclusively by the full-precision develop/detail
+    // stage so the UI luminance slider (0..100) has exact single-pass control
+    // without double-smoothing fine hair/feather micro-texture.
+    // 1. Linear-domain ColorNoise2012 (LABRangeFilter2012, zero 8-bit quantization loss).
     apply_linear_color_noise_2012(&mut linear_rgb, crop_w, crop_h, detected_iso, detected_noise);
-    // 3. High-ISO wide chroma blotch suppression (CImgOpColorNoiseHighISO, ISO >= 1600).
+    // 2. High-ISO wide chroma blotch suppression (CImgOpColorNoiseHighISO, ISO >= 1600).
     if detected_iso >= 1600 {
         apply_linear_color_noise_2012(
             &mut linear_rgb,
@@ -177,6 +178,68 @@ fn highlight_parameters(black: u32, mut gains: [f32; 3]) -> [f32; 16] {
     settings[7..10].copy_from_slice(&gains.map(|gain| 1.0 / gain));
     settings[10] = (0.125 / threshold) * (1.0 / 3.0);
     settings
+}
+
+/// Runs Capture One's OpenCL highlight recovery (`recover_highlights`) and
+/// `AntiColorAliasingV10` (`anti_alias_opencl`) on any generic Bayer linear
+/// RGB frame in 512x512 tiles with a 2-pixel clamped halo. Falls back silently
+/// when OpenCL is unavailable.
+pub(in crate::aurora_raw) fn recover_and_antialias_frame(
+    rgb: &mut [[f32; 3]],
+    width: usize,
+    height: usize,
+    black: u32,
+    wb: [f32; 3],
+    iso: u32,
+) {
+    if width < 4 || height < 4 || rgb.len() != width * height || !raw::gpu_available() {
+        return;
+    }
+    if black >= 65_535 || !wb.into_iter().all(|g| g.is_finite() && g > 0.0) {
+        return;
+    }
+    let recovery = highlight_parameters(black, wb);
+    let aca_gain = if iso >= 3200 { 1.0 } else if iso >= 1600 { 0.75 } else { 0.5 };
+    let max_x = (width - 1) as isize;
+    let max_y = (height - 1) as isize;
+    let mut out = vec![[0.0f32; 3]; width * height];
+
+    for top in (0..height).step_by(TILE) {
+        let th = TILE.min(height - top);
+        for left in (0..width).step_by(TILE) {
+            let tw = TILE.min(width - left);
+            let hw = tw + 4;
+            let hh = th + 4;
+            let mut halo = vec![[0.0f32; 3]; hw * hh];
+            for y in 0..hh {
+                let sy = (top as isize + y as isize - 2).clamp(0, max_y) as usize;
+                let src_row = &rgb[sy * width..(sy + 1) * width];
+                let dst_row = &mut halo[y * hw..(y + 1) * hw];
+                for x in 0..hw {
+                    let sx = (left as isize + x as isize - 2).clamp(0, max_x) as usize;
+                    dst_row[x] = src_row[sx];
+                }
+            }
+            if let Err(err) = raw::recover_highlights(&mut halo, recovery) {
+                log::warn!("generic Bayer OpenCL highlight recovery skipped: {err:#}");
+                return;
+            }
+            let core = match raw::anti_alias_opencl(&halo, hw, hh, [0.05_f32.sqrt(), aca_gain]) {
+                Ok(core) if core.len() == tw * th => core,
+                Ok(_) => return,
+                Err(err) => {
+                    log::warn!("generic Bayer OpenCL anti-alias skipped: {err:#}");
+                    return;
+                }
+            };
+            for row in 0..th {
+                let dst = (top + row) * width + left;
+                let src = row * tw;
+                out[dst..dst + tw].copy_from_slice(&core[src..src + tw]);
+            }
+        }
+    }
+    rgb.copy_from_slice(&out);
 }
 
 fn apply_banding(rgb: &mut [u16], width: usize, iso: u32, tables: [&[u8]; 3]) {
@@ -350,6 +413,7 @@ pub(in crate::aurora_raw) fn apply_linear_chromatic_aberration(
 /// C1 queue stages 22-34 (linear-domain directional luminance NR + LumaTransfer):
 /// smooths high-ISO luminance grain along the minimum-gradient orientation in a
 /// 5x5 neighbourhood and scales RGB proportionally to preserve chromaticity.
+#[allow(dead_code)]
 pub(in crate::aurora_raw) fn apply_linear_luma_noise_2018(
     rgb: &mut [[f32; 3]],
     w: usize,

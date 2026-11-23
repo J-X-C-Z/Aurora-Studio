@@ -1522,10 +1522,74 @@ fn render_sized(
     let mut rgba16 = wide.then(|| vec![0u16; len]);
     let xs: Vec<f32> =
         (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
-    // Above 1:1 the region is magnified, so a bicubic tap keeps the detail the
-    // zoom is for; at or below 1:1 the bilinear mip sample is the correct filter.
-    let sharp = scale > 1.0;
-    if streams_source_samples(out_w, out_h) {
+    // At 50% zoom and above (including 1:1 and magnified inspection), use
+    // bicubic sampling to preserve crisp micro-contrast; below 50% the bilinear
+    // mip tap is the right anti-aliased filter.
+    let sharp = scale >= 0.5;
+    let f32_includes_sharpen = adj.moire.amount <= 0.0 && !adj.lens.diffraction_enabled;
+    let use_f32_detail = !bypass
+        && (adj.noise_reduction.single_pixel > 0.0
+            || adj.noise_reduction.luminance > 0.0
+            || adj.noise_reduction.color > 0.0
+            || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
+    if use_f32_detail {
+        let mut rgb_f32 = vec![[0.0f32; 3]; (out_w * out_h) as usize];
+        let row_f32 = out_w as usize;
+        if streams_source_samples(out_w, out_h) {
+            rgb_f32.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
+                develop_line_with_f32(&plan, region, out_h, &xs, y, bypass, line, |_, _, point| {
+                    source_sample_at(src, &map, level, sharp, point)
+                });
+            });
+        } else {
+            let samples =
+                source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
+            rgb_f32.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
+                let srow = &samples[y * row_f32..(y + 1) * row_f32];
+                develop_line_with_f32(&plan, region, out_h, &xs, y, bypass, line, |x, _, _| srow[x]);
+            });
+        }
+        super::detail::post_process_core_f32(
+            &mut rgb_f32,
+            out_w,
+            out_h,
+            adj,
+            scale,
+            f32_includes_sharpen,
+        );
+        match rgba16.as_mut() {
+            Some(wide_buf) => {
+                rgba.par_chunks_mut(row)
+                    .zip(wide_buf.par_chunks_mut(row))
+                    .zip(rgb_f32.par_chunks(row_f32))
+                    .for_each(|((line8, line16), src_row)| {
+                        for (x, &c) in src_row.iter().enumerate() {
+                            let i = x * 4;
+                            for k in 0..3 {
+                                let v = c[k].clamp(0.0, 1.0);
+                                line8[i + k] = (v * 255.0 + 0.5) as u8;
+                                line16[i + k] = (v * 65535.0 + 0.5) as u16;
+                            }
+                            line8[i + 3] = 255;
+                            line16[i + 3] = 65535;
+                        }
+                    });
+            }
+            None => {
+                rgba.par_chunks_mut(row)
+                    .zip(rgb_f32.par_chunks(row_f32))
+                    .for_each(|(line8, src_row)| {
+                        for (x, &c) in src_row.iter().enumerate() {
+                            let i = x * 4;
+                            for k in 0..3 {
+                                line8[i + k] = (c[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                            }
+                            line8[i + 3] = 255;
+                        }
+                    });
+            }
+        }
+    } else if streams_source_samples(out_w, out_h) {
         match rgba16.as_mut() {
             Some(wide_line) => {
                 rgba.par_chunks_mut(row)
@@ -1579,8 +1643,21 @@ fn render_sized(
     // wide buffer carry the develop precision through them.
     let mut develop8 = rgba16.is_some().then(|| rgba.clone());
     if !bypass {
-        let warp = if adj.lens.use_profile {
-            super::lens_profile::warp_for(&adj.lens, src.lens_shot.as_ref(), src.lens_auto.as_ref())
+        let mut detail_adj_owned;
+        let detail_adj = if use_f32_detail {
+            detail_adj_owned = adj.clone();
+            detail_adj_owned.noise_reduction.single_pixel = 0.0;
+            detail_adj_owned.noise_reduction.luminance = 0.0;
+            detail_adj_owned.noise_reduction.color = 0.0;
+            if f32_includes_sharpen {
+                detail_adj_owned.sharpening.amount = 0.0;
+            }
+            &detail_adj_owned
+        } else {
+            adj
+        };
+        let warp = if detail_adj.lens.use_profile {
+            super::lens_profile::warp_for(&detail_adj.lens, src.lens_shot.as_ref(), src.lens_auto.as_ref())
         } else {
             None
         };
@@ -1590,7 +1667,7 @@ fn render_sized(
             // a delta would replace the export's 16-bit detail with 8-bit
             // quantisation noise wherever the warp moves pixels.
             Some(warp) if rgba16.is_some() => {
-                let mut preview = adj.clone();
+                let mut preview = detail_adj.clone();
                 preview.lens.distortion = 0.0;
                 preview.lens.light_falloff = 0.0;
                 preview.lens.uniform_light = 0.0;
@@ -1606,28 +1683,28 @@ fn render_sized(
                 if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
                     merge_wide_delta(wide, before, &rgba, out_w as usize);
                 }
-                super::detail::stage_lens(&mut rgba, out_w as usize, out_h as usize, &adj.lens, Some(warp));
+                super::detail::stage_lens(&mut rgba, out_w as usize, out_h as usize, &detail_adj.lens, Some(warp));
                 // The extras are 8-bit stages; the wide buffer keeps the profile
                 // warp but not these (documented gap).
-                super::detail::stage_lens_extras(&mut rgba, out_w as usize, out_h as usize, &adj.lens);
+                super::detail::stage_lens_extras(&mut rgba, out_w as usize, out_h as usize, &detail_adj.lens);
                 if let Some(wide) = rgba16.as_mut() {
                     super::detail::stage_lens_profile16(
                         wide,
                         out_w as usize,
                         out_h as usize,
-                        &adj.lens,
+                        &detail_adj.lens,
                         warp,
-                        (adj.lens.distortion / 100.0).clamp(-1.0, 1.0),
-                        (adj.lens.light_falloff / 100.0).clamp(0.0, 1.0),
-                        adj.lens.chromatic_aberration,
+                        (detail_adj.lens.distortion / 100.0).clamp(-1.0, 1.0),
+                        (detail_adj.lens.light_falloff / 100.0).clamp(0.0, 1.0),
+                        detail_adj.lens.chromatic_aberration,
                     );
                 }
                 // Everything after this point (spots, layers) is local and can
                 // merge as before.
                 develop8 = Some(rgba.clone());
             }
-            Some(warp) => super::detail::post_process_with_lens(&mut rgba, out_w, out_h, adj, scale, Some(warp)),
-            None => super::detail::post_process(&mut rgba, out_w, out_h, adj, scale),
+            Some(warp) => super::detail::post_process_with_lens(&mut rgba, out_w, out_h, detail_adj, scale, Some(warp)),
+            None => super::detail::post_process(&mut rgba, out_w, out_h, detail_adj, scale),
         }
     }
     if !adj.spots.is_empty() && !bypass {
@@ -1829,6 +1906,38 @@ fn develop_line_streamed(
     develop_line_with(plan, region, out_h, xs, y, bypass, line, line16, |_, _, point| {
         source_sample_at(src, map, level, cubic, point)
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn develop_line_with_f32<F>(
+    plan: &Plan,
+    region: NormRect,
+    out_h: u32,
+    xs: &[f32],
+    y: usize,
+    bypass: bool,
+    line: &mut [[f32; 3]],
+    mut sample_at: F,
+) where
+    F: FnMut(usize, f32, [f32; 2]) -> SourceSample,
+{
+    let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
+    for (x, &fx) in xs.iter().enumerate() {
+        let f = [fx, fy];
+        let sample = sample_at(x, fx, f);
+        let c = if sample.valid {
+            let mut rgb = sample.rgb;
+            if let Some((uniform, map, size)) = &plan.uniform_light {
+                let (_, source) = map.map(f);
+                let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
+                rgb = uniform.apply_source_rgb(rgb, source);
+            }
+            develop(plan, rgb, f, bypass)
+        } else {
+            [0.11, 0.11, 0.11]
+        };
+        line[x] = [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)];
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4404,7 +4513,9 @@ uncapped	10	20	0	0	1	3	1	uncapped	0	0	6	6	64
             .rgba
             .iter()
             .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
-        assert_eq!(fnv, 17493580292662123701u64);
+        // Updated after bicubic sampling at scale >= 0.5 and full-precision f32
+        // core detail stages (single-pixel, luminance NR, color NR, linear USM).
+        assert_eq!(fnv, 13055407866942492615u64);
     }
 
     /// The refine edge follows the image's luminance, so the guide is the
