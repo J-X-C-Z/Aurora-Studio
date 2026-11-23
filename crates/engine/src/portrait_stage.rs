@@ -543,7 +543,87 @@ pub struct ProducerInputs {
     pub wrinkle: Option<WrinkleProducerInputs>,
     pub makeup_bundle: Option<OwnedMakeupBundle>,
     pub plump: Option<PlumpProducerInputs>,
+    pub pf101: Option<Pf101ProducerInputs>,
     pub pf90130: Option<Pf90130ProducerInputs>,
+}
+
+/// Owned same-job inputs for the recovered PF101 FilterType 41/42/43/44 stage.
+/// The mask wrapper can only name face-mask input id 0x15; no eye-white,
+/// eye-bag, material-alpha or RGBA-sum mask is accepted as a substitute.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pf101ProducerInputs {
+    ticket: u64,
+    material: Image,
+    face_mask: Image,
+    mask_uv: Vec<[f32; 2]>,
+    material_uv: Vec<[f32; 2]>,
+    params: aurora_portrait::kernels::pf101_silkworm::SilkwormParams,
+}
+
+impl Pf101ProducerInputs {
+    pub fn from_same_job(
+        ticket: u64,
+        material: Image,
+        face_mask: Image,
+        mask_uv: Vec<[f32; 2]>,
+        material_uv: Vec<[f32; 2]>,
+        params: aurora_portrait::kernels::pf101_silkworm::SilkwormParams,
+    ) -> Result<Self, Refusal> {
+        if ticket == 0 {
+            return Err(Refusal::MissingInput("PF101_SAME_JOB_TICKET"));
+        }
+        material.validate()?;
+        face_mask.validate()?;
+        if mask_uv.is_empty() || material_uv.is_empty() {
+            return Err(Refusal::ShapeMismatch("PF101_UV"));
+        }
+        if mask_uv
+            .iter()
+            .chain(&material_uv)
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
+            return Err(Refusal::ValueOutOfRange("PF101_UV"));
+        }
+        params
+            .layer()
+            .map_err(|_| Refusal::MissingInput("PF101_FILTERTYPE_SAME_JOB_RECORD"))?;
+        Ok(Self {
+            ticket,
+            material,
+            face_mask,
+            mask_uv,
+            material_uv,
+            params,
+        })
+    }
+
+    pub fn apply(
+        &self,
+        source: &Image,
+        job_id: Option<u64>,
+        degree: f32,
+    ) -> Result<Image, Refusal> {
+        if job_id != Some(self.ticket) {
+            return Err(Refusal::ValueOutOfRange("PF101_JOB"));
+        }
+        let expected = self.params.degree01()?;
+        if !degree.is_finite() || degree != expected {
+            return Err(Refusal::ValueOutOfRange("PF101_CONTROL"));
+        }
+        let pixels = source.pixel_count();
+        if self.mask_uv.len() != pixels || self.material_uv.len() != pixels {
+            return Err(Refusal::ShapeMismatch("PF101_UV"));
+        }
+        aurora_portrait::kernels::pf101_silkworm::apply_image_layer(
+            source,
+            &self.material,
+            aurora_portrait::kernels::pf101_silkworm::SilkwormMask::face_0x15(&self.face_mask),
+            &self.mask_uv,
+            &self.material_uv,
+            self.params,
+        )
+    }
 }
 
 /// Owned same-job PF90130 producer and aligned geometry. The A/B bridge and
@@ -3330,6 +3410,7 @@ pub struct PortraitJobInputs<'a> {
     pub historical_tone: Option<&'a HistoricalToneInputs>,
     pub historical_skin: Option<&'a HistoricalSkinInputs>,
     pub plump: Option<&'a PlumpProducerInputs>,
+    pub pf101: Option<&'a Pf101ProducerInputs>,
     pub pf90130: Option<&'a Pf90130ProducerInputs>,
 }
 
@@ -3373,6 +3454,7 @@ impl<'a> PortraitJobInputs<'a> {
             historical_tone: None,
             historical_skin: None,
             plump: None,
+            pf101: None,
             pf90130: None,
         }
     }
@@ -3568,6 +3650,7 @@ impl<'a> PortraitJobInputs<'a> {
         }
         self.wrinkle_producer = producer.wrinkle.as_ref();
         self.makeup_bundle = producer.makeup_bundle.as_ref();
+        self.pf101 = producer.pf101.as_ref();
         self.pf90130 = producer.pf90130.as_ref();
     }
 
@@ -3647,6 +3730,7 @@ fn sha256_32(bytes: &[u8]) -> [u8; 32] {
 
 /// Effects that can run from the frame, a mask and bundled LUT bytes today.
 const SUPPORTED_EFFECTS: &[u32] = &[
+    101,    // Silkworm material
     108,    // Teeth whitening
     30025,  // Tooth repair
     30026,  // Teeth alignment final blend
@@ -4940,6 +5024,38 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     run.fallback_reason = Some(format!("input refused: {refusal:?}"));
                     run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
                     run.refusal = Some(refusal);
+                }
+            }
+            report.effects.push(run);
+            continue;
+        }
+        if pf == 101 {
+            if degree == 0.0 {
+                run.backend = PortraitBackend::Skipped;
+            } else {
+                match inputs.pf101 {
+                    Some(bundle) => match bundle.apply(&current, inputs.job_id(), degree) {
+                        Ok(next) => {
+                            current = next;
+                            run.backend = PortraitBackend::Cpu;
+                            run.skipped = false;
+                            run.executed = true;
+                        }
+                        Err(refusal) => {
+                            run.backend = PortraitBackend::Skipped;
+                            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                            run.skip_reason =
+                                Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                            run.refusal = Some(refusal);
+                        }
+                    },
+                    None => {
+                        let refusal = Refusal::MissingInput("PF101_TYPED_PRODUCER");
+                        run.backend = PortraitBackend::Skipped;
+                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                        run.refusal = Some(refusal);
+                    }
                 }
             }
             report.effects.push(run);
