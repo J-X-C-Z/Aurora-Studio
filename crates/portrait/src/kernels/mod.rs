@@ -58,6 +58,7 @@ pub mod remaining_special_provider;
 pub mod moisture;
 pub mod smile_warp;
 pub mod pore;
+pub mod pf101_silkworm;
 pub mod pf111_uv;
 pub mod uvmap_color;
 
@@ -68,6 +69,7 @@ fn registry_impl() -> Vec<EffectMeta> {
     all.extend_from_slice(facial_smooth::META);
     all.extend_from_slice(face_geometry::META);
     all.extend_from_slice(face_detail::META);
+    all.extend_from_slice(pf101_silkworm::META);
     all.extend_from_slice(eye_geometry::META);
     all.extend_from_slice(body_geometry::META);
     all.extend_from_slice(hair_body::META);
