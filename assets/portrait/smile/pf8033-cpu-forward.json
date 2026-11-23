@@ -1,0 +1,617 @@
+{
+  "schema": "aurora-pf8033-cpu-forward-receipt/1",
+  "job_id": 3621424029303566009,
+  "source": {
+    "path": "assets\\portrait\\skin-adjust\\warm.png",
+    "sha256_rgba": "14869917dafa75be5a0666d854e566c6cfc39ee4a9d034bb7f8afbf0e8c4b45a",
+    "width": 1024,
+    "height": 768
+  },
+  "models": [
+    {
+      "id": 806921480,
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\素材池_全量\\806921480.bin",
+      "raw_sha256": "87342bf07c1b32bb872277c2d048e3ced15f4416f800f4c1ee2b3e9cb54e7689",
+      "decoded_sha256": "5e0405127a0f53e2b893d6ceaf943ae6c027b3d8be57d7e5b160aabd258e3b41",
+      "candidate": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\r25-A1d-smile-capture\\repo\\.pf8033-cpu-forward\\candidates\\806921480\\derived_candidate.mnn",
+      "candidate_sha256": "0b474879c04dddcd4d26177f09580ff1ad5345f8b7a64cc36ee1524c35d47b45",
+      "official_verifier": {
+        "returncode": 0,
+        "stdout": "PASS\n",
+        "stderr": ""
+      },
+      "external_inputs": [
+        {
+          "order": 0,
+          "name": "781141184",
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 1,
+          "name": "3595941170",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 2,
+          "name": "3321490283",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        }
+      ],
+      "declared_outputs": [
+        "3204548346",
+        "780929437"
+      ]
+    },
+    {
+      "id": 1940369920,
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\素材池_全量\\1940369920.bin",
+      "raw_sha256": "ed8b7587d71f4c18d37a509829d20b4e9140cb77b4618ee8eb9ffad5fc0c0faf",
+      "decoded_sha256": "fa362953541788a6497531aa63b26761b2db15613f6a06567fb7d3052a376764",
+      "candidate": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\r25-A1d-smile-capture\\repo\\.pf8033-cpu-forward\\candidates\\1940369920\\derived_candidate.mnn",
+      "candidate_sha256": "811afd84bc4266821848a65ce3940e533f29d666b0a56f8d2ea261c202bf06b2",
+      "official_verifier": {
+        "returncode": 0,
+        "stdout": "PASS\n",
+        "stderr": ""
+      },
+      "external_inputs": [
+        {
+          "order": 0,
+          "name": "781141184",
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 1,
+          "name": "3595941170",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 2,
+          "name": "3321490283",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        }
+      ],
+      "declared_outputs": [
+        "3204548346",
+        "780929437"
+      ]
+    },
+    {
+      "id": 3157078880,
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\素材池_全量\\3157078880.bin",
+      "raw_sha256": "eac03538db8e2c93e5db9b33157583064943a99a4afacdf393114d48f10c395a",
+      "decoded_sha256": "39052c665195a87bd551423d666ff164773b2d13f5f8b23da27113b9dac65719",
+      "candidate": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\r25-A1d-smile-capture\\repo\\.pf8033-cpu-forward\\candidates\\3157078880\\derived_candidate.mnn",
+      "candidate_sha256": "d5ea7f78d631f6fa2c7949dcf60a895970e58fe349c595c84913335a578ec52c",
+      "official_verifier": {
+        "returncode": 0,
+        "stdout": "PASS\n",
+        "stderr": ""
+      },
+      "external_inputs": [
+        {
+          "order": 0,
+          "name": "781141184",
+          "shape": [
+            1,
+            3,
+            512,
+            512
+          ],
+          "dtype": "float32"
+        }
+      ],
+      "declared_outputs": [
+        "780929437"
+      ]
+    }
+  ],
+  "runtime": {
+    "backend": "MNN CPU interpreter",
+    "module": "C:\\WorkSpace\\Aurora Studio\\04_reference\\legacy-root\\逆向工程\\像素蛋糕\\analysis\\model-recovery-inference\\deps\\MNN\\__init__.py",
+    "mnn_version": "3.6.1",
+    "threads": 2,
+    "precision": "high"
+  },
+  "network_runs": [
+    {
+      "id": 806921480,
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\素材池_全量\\806921480.bin",
+      "raw_sha256": "87342bf07c1b32bb872277c2d048e3ced15f4416f800f4c1ee2b3e9cb54e7689",
+      "decoded_sha256": "5e0405127a0f53e2b893d6ceaf943ae6c027b3d8be57d7e5b160aabd258e3b41",
+      "candidate": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\r25-A1d-smile-capture\\repo\\.pf8033-cpu-forward\\candidates\\806921480\\derived_candidate.mnn",
+      "candidate_sha256": "0b474879c04dddcd4d26177f09580ff1ad5345f8b7a64cc36ee1524c35d47b45",
+      "official_verifier": {
+        "returncode": 0,
+        "stdout": "PASS\n",
+        "stderr": ""
+      },
+      "external_inputs": [
+        {
+          "order": 0,
+          "name": "781141184",
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 1,
+          "name": "3595941170",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 2,
+          "name": "3321490283",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        }
+      ],
+      "declared_outputs": [
+        "3204548346",
+        "780929437"
+      ],
+      "inputs": {
+        "781141184": {
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 0.0,
+          "max": 1.0,
+          "mean": 0.5263489484786987,
+          "sha256": "e6bf37f7ee7c13fa6c14803b7fb233b7f068068f61146ae5d1a42b6862466264"
+        },
+        "3595941170": {
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 0.0,
+          "max": 0.9908496737480164,
+          "mean": 0.526348888874054,
+          "sha256": "e89ab56bdd5d5dd5e165b7453808500ec795c07704cf6268c2e33f4c4b9e89c3"
+        },
+        "3321490283": {
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 0.0,
+          "max": 1.0,
+          "mean": 0.044090840965509415,
+          "sha256": "3c38c8f991764bd837064d2fde32171fddf9789f6370fad6598ed1e031f89c7b"
+        }
+      },
+      "outputs": [
+        {
+          "order": 0,
+          "id": 3204548346,
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 2.8025342544424348e-06,
+          "max": 0.2106672078371048,
+          "mean": 0.0024771722964942455,
+          "sha256": "6a237ea7eaac4b944d70cbf286066fe7979c7cbda9d83989bb8860ec98034ce0"
+        },
+        {
+          "order": 1,
+          "id": 780929437,
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": -0.41030293703079224,
+          "max": 1.4276646375656128,
+          "mean": 0.354205846786499,
+          "sha256": "552cced4e6b53a952a163e1451e1310bd07f1a6f30c904bfb135eee5d50fa040"
+        }
+      ]
+    },
+    {
+      "id": 1940369920,
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\素材池_全量\\1940369920.bin",
+      "raw_sha256": "ed8b7587d71f4c18d37a509829d20b4e9140cb77b4618ee8eb9ffad5fc0c0faf",
+      "decoded_sha256": "fa362953541788a6497531aa63b26761b2db15613f6a06567fb7d3052a376764",
+      "candidate": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\r25-A1d-smile-capture\\repo\\.pf8033-cpu-forward\\candidates\\1940369920\\derived_candidate.mnn",
+      "candidate_sha256": "811afd84bc4266821848a65ce3940e533f29d666b0a56f8d2ea261c202bf06b2",
+      "official_verifier": {
+        "returncode": 0,
+        "stdout": "PASS\n",
+        "stderr": ""
+      },
+      "external_inputs": [
+        {
+          "order": 0,
+          "name": "781141184",
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 1,
+          "name": "3595941170",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        },
+        {
+          "order": 2,
+          "name": "3321490283",
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "float32"
+        }
+      ],
+      "declared_outputs": [
+        "3204548346",
+        "780929437"
+      ],
+      "inputs": {
+        "781141184": {
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 0.0,
+          "max": 1.0,
+          "mean": 0.5263489484786987,
+          "sha256": "e6bf37f7ee7c13fa6c14803b7fb233b7f068068f61146ae5d1a42b6862466264"
+        },
+        "3595941170": {
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 2.8025342544424348e-06,
+          "max": 0.2106672078371048,
+          "mean": 0.0024771722964942455,
+          "sha256": "6a237ea7eaac4b944d70cbf286066fe7979c7cbda9d83989bb8860ec98034ce0"
+        },
+        "3321490283": {
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": -0.2434988170862198,
+          "max": 1.0472079515457153,
+          "mean": 0.354205846786499,
+          "sha256": "12763df9ef015649c49c5eb37822f1c7ad9d6ffb397bfeb34a7893316fc2b204"
+        }
+      },
+      "outputs": [
+        {
+          "order": 0,
+          "id": 3204548346,
+          "shape": [
+            1,
+            1,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": 0.00029631430516019464,
+          "max": 0.4415212571620941,
+          "mean": 0.020593350753188133,
+          "sha256": "9b992ce9a29b40820ab20cb3bf6797f801e9dc82d3d1ce536c1d1c4fe210edd4"
+        },
+        {
+          "order": 1,
+          "id": 780929437,
+          "shape": [
+            1,
+            3,
+            768,
+            1024
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": -0.3928116261959076,
+          "max": 1.1425303220748901,
+          "mean": 0.483662486076355,
+          "sha256": "d5ecd1a17d5a3d8aee70ac395325e62aa9534c5ea10fa164255f98df9dc7ca7e"
+        }
+      ]
+    },
+    {
+      "id": 3157078880,
+      "source": "C:\\WorkSpace\\自研图像编辑软件\\逆向工程\\像素蛋糕\\素材池_全量\\3157078880.bin",
+      "raw_sha256": "eac03538db8e2c93e5db9b33157583064943a99a4afacdf393114d48f10c395a",
+      "decoded_sha256": "39052c665195a87bd551423d666ff164773b2d13f5f8b23da27113b9dac65719",
+      "candidate": "C:\\WorkSpace\\Aurora Studio\\90_work\\lanes\\portrait-parse\\r25-A1d-smile-capture\\repo\\.pf8033-cpu-forward\\candidates\\3157078880\\derived_candidate.mnn",
+      "candidate_sha256": "d5ea7f78d631f6fa2c7949dcf60a895970e58fe349c595c84913335a578ec52c",
+      "official_verifier": {
+        "returncode": 0,
+        "stdout": "PASS\n",
+        "stderr": ""
+      },
+      "external_inputs": [
+        {
+          "order": 0,
+          "name": "781141184",
+          "shape": [
+            1,
+            3,
+            512,
+            512
+          ],
+          "dtype": "float32"
+        }
+      ],
+      "declared_outputs": [
+        "780929437"
+      ],
+      "inputs": {
+        "781141184": {
+          "shape": [
+            1,
+            3,
+            512,
+            512
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": -0.13141919672489166,
+          "max": 1.0697245597839355,
+          "mean": 0.48368778824806213,
+          "sha256": "1a11430d3afeb8a9290ea6badb0021970e684b8507dbe9fddfbdf4dd2a199e38"
+        }
+      },
+      "outputs": [
+        {
+          "order": 0,
+          "id": 780929437,
+          "shape": [
+            1,
+            3,
+            512,
+            512
+          ],
+          "dtype": "DT_FLOAT",
+          "numpy_dtype": "float32",
+          "finite": true,
+          "min": -0.2175837606191635,
+          "max": 1.051055669784546,
+          "mean": 0.46721717715263367,
+          "sha256": "39cac54ffbf00921ab2814356fe3ce8f54097a4bdab2729ead2d57ef805b8d67"
+        }
+      ]
+    }
+  ],
+  "tensor_outputs": {
+    "3204548346": [
+      {
+        "order": 0,
+        "id": 3204548346,
+        "shape": [
+          1,
+          1,
+          768,
+          1024
+        ],
+        "dtype": "DT_FLOAT",
+        "numpy_dtype": "float32",
+        "finite": true,
+        "min": 2.8025342544424348e-06,
+        "max": 0.2106672078371048,
+        "mean": 0.0024771722964942455,
+        "sha256": "6a237ea7eaac4b944d70cbf286066fe7979c7cbda9d83989bb8860ec98034ce0"
+      },
+      {
+        "order": 0,
+        "id": 3204548346,
+        "shape": [
+          1,
+          1,
+          768,
+          1024
+        ],
+        "dtype": "DT_FLOAT",
+        "numpy_dtype": "float32",
+        "finite": true,
+        "min": 0.00029631430516019464,
+        "max": 0.4415212571620941,
+        "mean": 0.020593350753188133,
+        "sha256": "9b992ce9a29b40820ab20cb3bf6797f801e9dc82d3d1ce536c1d1c4fe210edd4"
+      }
+    ],
+    "780929437": [
+      {
+        "order": 1,
+        "id": 780929437,
+        "shape": [
+          1,
+          3,
+          768,
+          1024
+        ],
+        "dtype": "DT_FLOAT",
+        "numpy_dtype": "float32",
+        "finite": true,
+        "min": -0.41030293703079224,
+        "max": 1.4276646375656128,
+        "mean": 0.354205846786499,
+        "sha256": "552cced4e6b53a952a163e1451e1310bd07f1a6f30c904bfb135eee5d50fa040"
+      },
+      {
+        "order": 1,
+        "id": 780929437,
+        "shape": [
+          1,
+          3,
+          768,
+          1024
+        ],
+        "dtype": "DT_FLOAT",
+        "numpy_dtype": "float32",
+        "finite": true,
+        "min": -0.3928116261959076,
+        "max": 1.1425303220748901,
+        "mean": 0.483662486076355,
+        "sha256": "d5ecd1a17d5a3d8aee70ac395325e62aa9534c5ea10fa164255f98df9dc7ca7e"
+      },
+      {
+        "order": 0,
+        "id": 780929437,
+        "shape": [
+          1,
+          3,
+          512,
+          512
+        ],
+        "dtype": "DT_FLOAT",
+        "numpy_dtype": "float32",
+        "finite": true,
+        "min": -0.2175837606191635,
+        "max": 1.051055669784546,
+        "mean": 0.46721717715263367,
+        "sha256": "39cac54ffbf00921ab2814356fe3ce8f54097a4bdab2729ead2d57ef805b8d67"
+      }
+    ]
+  },
+  "host_split": {
+    "status": "EXECUTED_CANDIDATE__VENDOR_CHANNEL_SEMANTICS_UNPROVEN",
+    "final_output_id": 780929437,
+    "channels": {
+      "dx": 0,
+      "dy": 1,
+      "mask": 2
+    },
+    "center": "per-channel median",
+    "scale": {
+      "dx": 0.5401937365531921,
+      "dy": 0.4641819894313812,
+      "pixels": 16.0
+    },
+    "model_output_sha256": "39cac54ffbf00921ab2814356fe3ce8f54097a4bdab2729ead2d57ef805b8d67",
+    "dx_sha256": "7f02584e838c1491ecaa5da3da2314660f3d4470d70ab10898366d93336cf3d5",
+    "dy_sha256": "ba5e73c6c824e1f7a9023c8617897ca913c5b407dbac8b2b8ecb47aa09e47161",
+    "mask_sha256": "be2740f155d7a43ef4aa1be74aebe5bab5f1907a1728adb6910129ea8433c3d3"
+  },
+  "warp": {
+    "entry": "pf8033_dense_warp equivalent",
+    "degree": 0.3499999940395355,
+    "changed_pixels": 762262,
+    "output_sha256_rgba": "764b6ee8cbb390d65acaf1fc808ddddddbe76d114027358a43c704ae6f5fa51c",
+    "preview": "assets/portrait/smile/pf8033-warp-preview.png"
+  },
+  "evidence_level": {
+    "decoded_model_bytes": true,
+    "mnn_verify": true,
+    "cpu_forward": true,
+    "real_source_image": true,
+    "same_job_vendor_inputs": false,
+    "vendor_golden_outputs": false,
+    "host_proven_dx_dy_channels": false,
+    "pf8033_warp_executed": true
+  },
+  "remaining_blocker": "No same-job vendor capture proves the two auxiliary inputs, network scheduling, 780929437 channel semantics, or golden parity."
+}

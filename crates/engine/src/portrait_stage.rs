@@ -86,6 +86,19 @@ mod portrait_face_stage;
 pub use portrait_face_stage::{FaceGeometry, FaceGeometryDraw, FaceGeometryInputs};
 use portrait_face_stage::FaceGeometryRun;
 
+#[path = "portrait_pf8033_cpu_forward.rs"]
+mod portrait_pf8033_cpu_forward;
+pub use portrait_pf8033_cpu_forward::{
+    apply_pf8033_cpu_forward, build_pf8033_cpu_forward_row, load_pf8033_cpu_forward_artifacts,
+    pf8033_cpu_forward_cpu_oracle, Pf8033CpuForwardArtifacts, Pf8033CpuForwardReceipt,
+    Pf8033CpuForwardRun, Pf8033HostSplitReceiptData, Pf8033ModelReceipt, Pf8033NetworkReceipt,
+    Pf8033TensorReceipt, Pf8033WarpReceipt, PF8033_CPU_FORWARD_ARTIFACTS_ENV,
+    PF8033_CPU_FORWARD_RECEIPT_ENV, PF8033_DX_FILE, PF8033_DY_FILE, PF8033_FINAL_MODEL_ID,
+    PF8033_FINAL_TENSOR_FILE, PF8033_FINAL_TENSOR_ID, PF8033_FRAME_HEIGHT, PF8033_FRAME_WIDTH,
+    PF8033_MASK_FILE, PF8033_MODEL_HEIGHT, PF8033_MODEL_IDS, PF8033_MODEL_ROOT_ENV,
+    PF8033_MODEL_WIDTH,
+};
+
 #[path = "portrait_face_geometry_provider.rs"]
 mod portrait_face_geometry_provider;
 pub use portrait_face_geometry_provider::{

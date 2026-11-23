@@ -1,0 +1,26 @@
+{
+  "schema": "aurora-pf8033-smile-capture-manifest/2",
+  "pf": 8033,
+  "effect": "DL3D_Warp",
+  "status": "FORWARD_EXECUTED__VENDOR_PARITY_UNPROVEN",
+  "blocker": "pf8033_vendor_golden_and_same_job_channel_binding_absent",
+  "real_source_image": true,
+  "pixel_or_tensor_data_synthesized": false,
+  "host_split_receipt_written": true,
+  "host_split_receipt_level": "candidate_unproven",
+  "smile_warp_bound": true,
+  "forward_receipt": "assets/portrait/smile/pf8033-cpu-forward.json",
+  "warp_preview": "assets/portrait/smile/pf8033-warp-preview.png",
+  "model_ids": [
+    806921480,
+    1940369920,
+    3157078880
+  ],
+  "outputs": [
+    "3204548346",
+    "780929437",
+    "dx",
+    "dy",
+    "mask"
+  ]
+}
