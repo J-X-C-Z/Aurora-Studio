@@ -1307,6 +1307,29 @@ mod driver {
                 .position(|candidate| *candidate == (role, ordinal))
                 .map(|index| self.sizes[index])
         }
+
+        pub fn download_f32(
+            &mut self,
+            role: JobBufferRole,
+            ordinal: u16,
+            values: &mut [f32],
+        ) -> Result<(), CudaError> {
+            let ptr = self.handle(role, ordinal)?;
+            if self.payload_bytes(role, ordinal) != values.len().checked_mul(4) {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch(
+                    "CUDA job f32 readback",
+                )));
+            }
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    values.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of_val(values),
+                )
+            };
+            self.gpu.download(ptr, bytes)?;
+            self.domain.pending = false;
+            Ok(())
+        }
     }
 
     fn grid(width: u32, height: u32) -> (u32, u32) {

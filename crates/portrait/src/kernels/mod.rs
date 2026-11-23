@@ -38,6 +38,7 @@ pub mod mask_compose;
 pub mod neck_repair;
 pub mod neck_paste;
 pub mod skin_adjust;
+pub mod stretch_v3;
 pub mod skin_color;
 pub mod sticker;
 pub mod subdiv2d;

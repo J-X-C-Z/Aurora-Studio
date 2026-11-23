@@ -130,15 +130,20 @@ pub use portrait_plump_stage::{
 #[path = "portrait_historical_tone.rs"]
 mod portrait_historical_tone;
 pub use portrait_historical_tone::{
-    HistoricalToneData, HistoricalToneFace, HistoricalToneInput, HistoricalToneInputs,
+    HistoricalToneData, HistoricalToneFace, HistoricalToneFixture, HistoricalToneGpu,
+    HistoricalToneGpuPlan, HistoricalToneInput, HistoricalToneInputs, HistoricalTonePath,
+    HistoricalToneRowOutcome, apply_historical_tone_row, gpu_kernel, gpu_lut_reason,
+    plan_historical_tone_backend, GPU_MATERIALIZED_FIXTURE_ENV,
+    GPU_PROVEN_HISTORICAL_TONE_PFS,
 };
 
 #[path = "portrait_historical_skin.rs"]
 mod portrait_historical_skin;
 pub use portrait_historical_skin::{
     HistoricalSkinData, HistoricalSkinExternalInputs, HistoricalSkinExternalRow,
-    HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass, HistoricalSkinWrinkle,
-    build_historical_skin_inputs,
+    HistoricalSkinGpuPlan, HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass,
+    HistoricalSkinPath, HistoricalSkinWrinkle, build_historical_skin_inputs,
+    plan_historical_skin_backend, GPU_PROVEN_HISTORICAL_SKIN_PFS,
 };
 
 #[path = "portrait_repair_stage.rs"]
@@ -1830,6 +1835,33 @@ impl ProducerInputs {
         inputs: Option<HistoricalSkinExternalInputs>,
     ) -> Result<(), Refusal> {
         self.historical_skin = Some(build_historical_skin_inputs(inputs)?);
+        Ok(())
+    }
+
+    pub fn write_immediate_historical_skin(
+        &mut self,
+        frame: &Image,
+        parsing: &crate::face_parsing::FaceParsingProducerInputs,
+        inputs: portrait_historical_skin::HistoricalSkinImmediateInputs,
+    ) -> Result<(), Refusal> {
+        self.historical_skin = Some(
+            portrait_historical_skin::build_immediate_historical_skin_inputs(
+                frame, parsing, inputs,
+            )?,
+        );
+        Ok(())
+    }
+
+    pub fn write_historical_tone(
+        &mut self,
+        payload: crate::portrait_historical_tone_provider::HistoricalToneProviderPayload,
+        complete: bool,
+    ) -> Result<(), Refusal> {
+        self.historical_tone = Some(if complete {
+            crate::portrait_historical_tone_provider::build_complete_historical_tone_inputs(payload)?
+        } else {
+            crate::portrait_historical_tone_provider::build_historical_tone_inputs(payload)?
+        });
         Ok(())
     }
 
@@ -4645,6 +4677,16 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if portrait_historical_skin::PFS.contains(&pf) {
+            if let Some(input) = inputs
+                .historical_skin
+                .and_then(|inputs| inputs.get(&pf))
+            {
+                let plan =
+                    portrait_historical_skin::plan_historical_skin_backend(pf, &input.data);
+                if plan.backend == portrait_historical_skin::HistoricalSkinPath::Cpu {
+                    run.fallback_reason = plan.fallback_reason;
+                }
+            }
             match portrait_historical_skin::apply(
                 &current,
                 inputs.job_id(),
@@ -7168,6 +7210,56 @@ fn try_cuda_same_job_effect(
                 input.skin_mask_full,
                 input.roi,
                 degree * 100.0,
+                input.uniforms,
+                StoreMode::TruncU8,
+            ))
+        }
+        21024 | 90023 | 90024 => {
+            let bound = match portrait_historical_skin::gpu_bound_input(
+                current,
+                inputs.job_id(),
+                pf,
+                degree,
+                inputs.historical_skin,
+            ) {
+                Ok(Some(bound)) => bound,
+                Ok(None) => return None,
+                Err(refusal) => return Some(Err(CudaError::Refused(refusal))),
+            };
+            let plan =
+                portrait_historical_skin::plan_historical_skin_backend(pf, &bound.data);
+            if plan.backend != portrait_historical_skin::HistoricalSkinPath::Gpu {
+                return None;
+            }
+            let (
+                HistoricalSkinData::Glabella(input)
+                | HistoricalSkinData::EyeLines(input)
+                | HistoricalSkinData::Forehead(input),
+            ) = &bound.data
+            else {
+                return Some(Err(CudaError::Refused(Refusal::ValueOutOfRange(
+                    "historical skin PF/data",
+                ))));
+            };
+            let Some(job_id) = inputs.job_id() else {
+                return Some(Err(CudaError::Refused(Refusal::MissingInput(
+                    "historical skin CUDA job id",
+                ))));
+            };
+            let gpu = match aurora_portrait::cuda_wrinkle::WrinkleGpu::open() {
+                Ok(gpu) => gpu,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(gpu.apply_historical_same_job(
+                job_id,
+                pf,
+                current,
+                &input.base,
+                &input.residual,
+                &input.mask_rgba,
+                &input.skin_mask,
+                input.roi,
+                degree,
                 input.uniforms,
                 StoreMode::TruncU8,
             ))

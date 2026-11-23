@@ -1,0 +1,194 @@
+{
+  "schema": "aurora.portrait.historical-skin.abi-fixture.v1",
+  "pfs": [
+    {
+      "pf": 21105,
+      "status": "cpu_executable_gpu_refused",
+      "evidence": {
+        "blend_rva": "0x46E4D80",
+        "compose_routes": ["0x8145BCF", "0x8152C17"],
+        "source_data_offset": "0x38",
+        "source_stride_offset": "0x58",
+        "mask_data_offset": "0xD8",
+        "mask_stride_offset": "0xF8",
+        "effect_offset": "0x50",
+        "width_offset": "0x238",
+        "height_offset": "0x23C",
+        "width_step_offset": "0x240",
+        "channels_offset": "0x244",
+        "color_domain": "encoded BGRA8 in the recovered CPU blend; native float effect slot not proven byte-identical"
+      },
+      "fixture": {
+        "shape": [2, 1],
+        "source_stride": 8,
+        "mask_stride": 2,
+        "effect_channels": 4,
+        "roi": null,
+        "degree": 0.5
+      },
+      "cpu": {
+        "stage": "face_detail::body_skin_unify",
+        "kernel": "0x46E4D80 exact byte blend",
+        "status": "executable"
+      },
+      "gpu": {
+        "status": "refused",
+        "candidate_kernel": "texture_mask_blend_kernel",
+        "reason": "no byte-exact mapping for native strides, float effect slot, or parity"
+      }
+    },
+    {
+      "pf": 90008,
+      "status": "conditional_frame_oracle_cpu_only_gpu_refused",
+      "evidence": {
+        "owner": "PixCook::EffectStretchMark",
+        "pipeline": "StretchV3Pipeline",
+        "processor_order": "0x1E9DD78",
+        "render_slot": "0x7CEBF00",
+        "model_slot": "0x7CEBCF0",
+        "positive_gate": 0.0001,
+        "model_sha256": null,
+        "cpu_executor": {
+          "path": "crates/portrait/src/kernels/stretch_v3.rs",
+          "entry": "StretchV3StageTicket::execute",
+          "status": "conditional_existing_oracle_only",
+          "requires": [
+            "SHA-256-bound prewarped frame texture",
+            "identity affine",
+            "DegreeState::Applied",
+            "source and mask ROI",
+            "shared 0x5B8CEA0 mask compose"
+          ]
+        },
+        "c7_forward_audit": {
+          "result": "exact_blocker",
+          "tensor_or_weights": null,
+          "non_identity_affine": null,
+          "degree_to_output": null,
+          "pf_final_blend": null,
+          "blockers": [
+            "PF90008 original tensor/weights absent; StretchV3 model forward is refused",
+            "PF90008 non-identity affine mapping is not recovered; transform execution is refused",
+            "PF90008 degree-to-model-output law is not recovered; unpainted model texture is refused",
+            "PF90008 PF-specific final blend is not recovered; shared 0x5B8CEA0 mask compose is oracle-only"
+          ]
+        },
+        "private_resource_audit": {
+          "worker": {
+            "path": "C:/Program Files/PixCake/pixcake_2/pix-worker.exe",
+            "sha256": "509d22938469906d353d44c355f4aa1e445f81ea56ca288a540ae5553cc96b84",
+            "text": [
+              "EffectStretchMark@PixCook",
+              "StretchV3Params@TSAI",
+              "StretchV3Pipeline@TSAI"
+            ]
+          },
+          "main_pe": {
+            "path": "C:/Program Files/PixCake/pixcake_2/pixcake.exe",
+            "sha256": "a84519da489bc52e4e914af7880ede43e3ce58992657723d02197161832464c7",
+            "text": [
+              "EffectStretchMark@PixCook",
+              "StretchV3Params@TSAI",
+              "StretchV3Pipeline@TSAI"
+            ]
+          },
+          "effect_config": {
+            "path": "C:/Program Files/PixCake/pixcake_2/Resources/effect/config/StretchMark/effect.json",
+            "bytes": 119,
+            "sha256": "d9cdc8928db048b3c50d22f04e03c77b7625306e9ca8036b6f4a202bd8257f50",
+            "header_hex": "97c0a7ebccefe8ad8aa8cebf9fef97ebb7c0a7ebcced8db0e1c78debcced8debce88cbad89aed9858da0c8e9d6efe8ad8aa8cebfafacc1a78eaccea0cee1a0c1cced8debcced8f9f95bdc8e9d6effebf9ea8d9a88480"
+          },
+          "pixcook": {
+            "path": "C:/Program Files/PixCake/pixcake_2/Resources/pixcook",
+            "bytes": 2071019532,
+            "sha256": "50eab3c3efd946400f7b9abea6021b50ceb3d6798e1b948eac6fd04a800ff96f",
+            "header32_hex": "ddfd9dfbdff89af9d8faadcbeccdadcbeccdadcbeccdadcbeccdadcbeccdadcb"
+          },
+          "tensor_or_weights": null,
+          "affine": null,
+          "degree_law": null,
+          "final_blend": null
+        }
+      },
+      "fixture": {
+        "shape": [2, 1],
+        "source_stride": 8,
+        "roi": [0, 0, 1, 1],
+        "mask_stride": null,
+        "model_sha256": null,
+        "model_output": null,
+        "affine": null,
+        "color_domain": null
+      },
+      "cpu": {
+        "stage": "stretch_v3::StretchV3StageTicket::execute",
+        "status": "conditional_existing_oracle_only",
+        "reason": "executable only with an external SHA-256-bound frame texture, identity affine, DegreeState::Applied and the shared composer; no vendor model forward",
+        "model_sha256": null
+      },
+      "gpu": {
+        "status": "refused",
+        "candidate_kernel": null,
+        "reason": "StretchV3 ABI and blend law unresolved"
+      }
+    },
+    {
+      "pf": 90037,
+      "status": "refused",
+      "evidence": {
+        "family_linkage": "none recovered",
+        "token_audit": "The only 90037 token in pixcake.exe is embedded in an SVG coordinate string; it has no EffectStretchMark/StretchV3 adjacency."
+      },
+      "fixture": {
+        "shape": [2, 1],
+        "source_stride": 8,
+        "roi": [0, 0, 1, 1],
+        "mask_stride": null,
+        "model_output": null,
+        "affine": null,
+        "color_domain": null
+      },
+      "cpu": {
+        "stage": "unresolved",
+        "status": "refused",
+        "reason": "no StretchV3 family linkage, model, affine, degree law, or final blend recovered"
+      },
+      "gpu": {
+        "status": "refused",
+        "candidate_kernel": null,
+        "reason": "no proven PF90037 ABI or kernel mapping"
+      }
+    },
+    {
+      "pf": 90086,
+      "status": "cpu_executable_gpu_refused",
+      "evidence": {
+        "ui_key": "skinToneUnifyBody",
+        "native_effect": "EffectAIBodySkinToneUnify",
+        "plane_evidence": "M/O 3xf32 values per pixel in the existing CPU payload",
+        "enable_key": "0x15FE6",
+        "gate": "enable epsilon 0.001"
+      },
+      "fixture": {
+        "shape": [2, 1],
+        "source_stride": 8,
+        "roi": null,
+        "mask_stride": null,
+        "m_shape": [2, 1, 3],
+        "o_shape": [2, 1, 3],
+        "color_domain": null,
+        "degree_to_weight": null
+      },
+      "cpu": {
+        "stage": "makeup::body_tone_unify",
+        "status": "executable",
+        "reason": "caller must supply explicit M/O planes and weights"
+      },
+      "gpu": {
+        "status": "refused",
+        "candidate_kernel": null,
+        "reason": "stride/ROI/color-domain, degree multiplication, real model tensors and pass parity unresolved"
+      }
+    }
+  ]
+}

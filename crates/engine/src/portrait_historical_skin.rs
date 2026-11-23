@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
 use aurora_portrait::kernels::{face_detail, makeup, skin_adjust};
+use aurora_portrait::kernels::stretch_v3::StretchV3StageTicket;
 use aurora_portrait::{Image, Refusal};
 use skin_adjust::{Roi, WrinkleUniforms};
 
 use super::sha256_32;
+use crate::face_parsing::{FaceParsingProducerInputs, project_face_parsing_skin_mask};
 
 pub type HistoricalSkinInputs = BTreeMap<u32, HistoricalSkinInput>;
 
@@ -40,12 +42,7 @@ pub enum HistoricalSkinData {
     Forehead(HistoricalSkinWrinkle),
     EyeLines(HistoricalSkinWrinkle),
     BodySkin(Vec<HistoricalSkinPass>),
-    StretchMark {
-        model: Image,
-        mask: Vec<u8>,
-        roi: Roi,
-        alternate: bool,
-    },
+    StretchMark(StretchV3StageTicket),
     BodyTone {
         m: Vec<f32>,
         o: Vec<f32>,
@@ -55,6 +52,7 @@ pub enum HistoricalSkinData {
 }
 
 pub const HISTORICAL_SKIN_EXTERNAL_PFS: [u32; 6] = [21024, 21105, 90008, 90023, 90024, 90086];
+pub const GPU_PROVEN_HISTORICAL_SKIN_PFS: [u32; 3] = [21024, 90023, 90024];
 pub(super) const PFS: &[u32] = &HISTORICAL_SKIN_EXTERNAL_PFS;
 
 pub(super) fn open_reason(pf: u32) -> Option<&'static str> {
@@ -73,7 +71,7 @@ impl HistoricalSkinData {
         match self {
             Self::Glabella(_) => 21024,
             Self::BodySkin(_) => 21105,
-            Self::StretchMark { .. } => 90008,
+            Self::StretchMark(_) => 90008,
             Self::EyeLines(_) => 90023,
             Self::Forehead(_) => 90024,
             Self::BodyTone { .. } => 90086,
@@ -99,10 +97,85 @@ pub struct HistoricalSkinExternalInputs {
     pub rows: Vec<HistoricalSkinExternalRow>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoricalSkinImmediateRow {
+    pub pf: u32,
+    pub ticket: u64,
+    pub control: f32,
+    pub data: HistoricalSkinData,
+}
+
+/// Same-job planes whose source digest is bound at each PF's execution point.
+/// Wrinkle skin masks are projected from the canonical fbe class 1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoricalSkinImmediateInputs {
+    pub ticket: u64,
+    pub rows: Vec<HistoricalSkinImmediateRow>,
+}
+
 impl HistoricalSkinExternalInputs {
     pub fn build(self) -> Result<HistoricalSkinInputs, Refusal> {
         build_historical_skin_inputs(Some(self))
     }
+}
+
+pub fn build_immediate_historical_skin_inputs(
+    frame: &Image,
+    parsing: &FaceParsingProducerInputs,
+    inputs: HistoricalSkinImmediateInputs,
+) -> Result<HistoricalSkinInputs, Refusal> {
+    if inputs.ticket == 0 {
+        return Err(Refusal::MissingInput("historical skin immediate ticket"));
+    }
+    if inputs.rows.is_empty() {
+        return Err(Refusal::MissingInput("historical skin immediate rows"));
+    }
+    frame.validate()?;
+    let size = [frame.width, frame.height];
+    let parsed_skin = project_face_parsing_skin_mask(parsing, frame.width, frame.height)?;
+    let mut built = BTreeMap::new();
+    for mut row in inputs.rows {
+        let pf = row.pf;
+        if !PFS.contains(&pf) {
+            return Err(Refusal::UnknownEffect(pf));
+        }
+        if built.contains_key(&pf) {
+            return Err(Refusal::ValueOutOfRange("historical skin immediate duplicate PF"));
+        }
+        if row.data.pf() != pf {
+            return Err(Refusal::ValueOutOfRange(
+                "historical skin immediate row PF/data",
+            ));
+        }
+        if row.ticket == 0 || row.ticket != inputs.ticket {
+            return Err(Refusal::MissingInput("historical skin immediate row ticket"));
+        }
+        if !row.control.is_finite() || !(0.0..=1.0).contains(&row.control) {
+            return Err(Refusal::ValueOutOfRange(external_control_invalid(pf)));
+        }
+        match &mut row.data {
+            HistoricalSkinData::Glabella(input)
+            | HistoricalSkinData::Forehead(input)
+            | HistoricalSkinData::EyeLines(input)
+                if input.skin_mask.is_empty() =>
+            {
+                input.skin_mask.clone_from(&parsed_skin);
+            }
+            _ => {}
+        }
+        validate_external_data(pf, size, &row.data)?;
+        built.insert(
+            pf,
+            HistoricalSkinInput {
+                ticket: row.ticket,
+                size,
+                source_sha256: [0; 32],
+                control: row.control,
+                data: row.data,
+            },
+        );
+    }
+    Ok(built)
 }
 
 /// Builds the owned map from an external producer payload. Every row carries
@@ -336,14 +409,8 @@ fn validate_external_data(
                 )?;
             }
         }
-        (90008, HistoricalSkinData::StretchMark { model, mask, roi, .. }) => {
-            require_image(model, size, "historical skin external PF90008 model")?;
-            require_roi(*roi, size, "historical skin external PF90008 roi")?;
-            require_len(
-                mask.as_slice(),
-                (roi.width as usize) * (roi.height as usize),
-                "historical skin external PF90008 roi mask",
-            )?;
+        (90008, HistoricalSkinData::StretchMark(ticket)) => {
+            ticket.validate_for_size(size)?;
         }
         (90086, HistoricalSkinData::BodyTone { m, o, w_m, w_o }) => {
             require_len(
@@ -402,7 +469,7 @@ pub(super) fn apply(
     if input.control != control {
         return Err(Refusal::ValueOutOfRange("historical skin payload control"));
     }
-    if input.source_sha256 != sha256_32(&source.pixels) {
+    if input.source_sha256 != [0; 32] && input.source_sha256 != sha256_32(&source.pixels) {
         return Err(Refusal::ValueOutOfRange("historical skin frame digest"));
     }
 
@@ -427,14 +494,111 @@ pub(super) fn apply(
             }).collect();
             face_detail::body_skin_unify(source, ui, &passes)?.output
         }
-        HistoricalSkinData::StretchMark { model, mask, roi, alternate } => {
-            skin_adjust::masked_model_output(source, model, *roi, mask, *alternate)?
-        }
+        HistoricalSkinData::StretchMark(stage) => stage.execute_image(source, ticket, ui)?,
         HistoricalSkinData::BodyTone { m, o, w_m, w_o } => {
             makeup::body_tone_unify(source, m, o, *w_m, *w_o)?
         }
     };
     Ok((output != *source).then_some(output))
+}
+
+pub(super) fn gpu_bound_input<'a>(
+    source: &Image,
+    ticket: Option<u64>,
+    pf: u32,
+    control: f32,
+    inputs: Option<&'a HistoricalSkinInputs>,
+) -> Result<Option<&'a HistoricalSkinInput>, Refusal> {
+    if !(0.0..=1.0).contains(&control) {
+        return Err(Refusal::ValueOutOfRange("historical skin control"));
+    }
+    if control == 0.0
+        || (matches!(pf, 21024 | 90023 | 90024) && control <= 0.001)
+        || (pf == 90008 && !skin_adjust::stretch_mark_degree(control * 100.0)?.1)
+    {
+        return Ok(None);
+    }
+    let input = inputs
+        .and_then(|inputs| inputs.get(&pf))
+        .ok_or(Refusal::MissingInput("historical skin same-job payload"))?;
+    if input.data.pf() != pf {
+        return Err(Refusal::ValueOutOfRange("historical skin payload PF"));
+    }
+    if input.ticket == 0 || Some(input.ticket) != ticket {
+        return Err(Refusal::ValueOutOfRange("historical skin ticket"));
+    }
+    if input.size != [source.width, source.height] {
+        return Err(Refusal::ShapeMismatch("historical skin frame size"));
+    }
+    if input.control != control {
+        return Err(Refusal::ValueOutOfRange("historical skin payload control"));
+    }
+    if input.source_sha256 != [0; 32] && input.source_sha256 != sha256_32(&source.pixels) {
+        return Err(Refusal::ValueOutOfRange("historical skin frame digest"));
+    }
+    Ok(Some(input))
+}
+
+/// Backend that produced one historical-skin row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoricalSkinPath {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalSkinGpuPlan {
+    pub backend: HistoricalSkinPath,
+    pub kernel: Option<&'static str>,
+    pub fallback_reason: Option<String>,
+}
+
+pub const PF21105_GPU_REFUSAL: &str =
+    "PF21105 0x46E4D80 BGRA8 blend is CPU-executable, but CUDA is refused: the native source/mask strides and float effect slot have no byte-exact kernel/parity";
+pub const PF90008_GPU_REFUSAL: &str =
+    "PF90008 CUDA refused: StretchV3 nOrder 0x1E9DD78 model/mask/ROI/affine/output-texture ABI and blend law remain unresolved";
+pub const PF90086_GPU_REFUSAL: &str =
+    "PF90086 CUDA refused: M/O 3xf32 planes are partial evidence; stride/ROI/color-domain, degree multiplication and pass parity remain unresolved";
+
+/// P15 has an exact native plane ABI for the three wrinkle rows. The remaining
+/// rows keep the exact CPU oracle but name the first missing GPU-boundary fact.
+pub fn plan_historical_skin_backend(pf: u32, data: &HistoricalSkinData) -> HistoricalSkinGpuPlan {
+    let matched = matches!(
+        (pf, data),
+        (21024, HistoricalSkinData::Glabella(_))
+            | (90023, HistoricalSkinData::EyeLines(_))
+            | (90024, HistoricalSkinData::Forehead(_))
+    );
+    if matched && GPU_PROVEN_HISTORICAL_SKIN_PFS.contains(&pf) {
+        return HistoricalSkinGpuPlan {
+            backend: HistoricalSkinPath::Gpu,
+            kernel: Some(aurora_portrait::cuda_wrinkle::U8_KERNEL),
+            fallback_reason: None,
+        };
+    }
+    let fallback_reason = match pf {
+        21105 => PF21105_GPU_REFUSAL.to_owned(),
+        90008 => PF90008_GPU_REFUSAL.to_owned(),
+        90086 => PF90086_GPU_REFUSAL.to_owned(),
+        _ => {
+            let stage = match data {
+        HistoricalSkinData::Glabella(_) => "glabella wrinkle base/residual/mask",
+        HistoricalSkinData::BodySkin(_) => "body-skin unify mask/effect passes",
+        HistoricalSkinData::StretchMark(_) => "stretch-mark model/mask/ROI",
+        HistoricalSkinData::EyeLines(_) => "eye-line wrinkle base/residual/mask",
+        HistoricalSkinData::Forehead(_) => "forehead wrinkle base/residual/mask",
+        HistoricalSkinData::BodyTone { .. } => "body-tone M/O weighted planes",
+            };
+            format!(
+                "PF{pf} {stage} refused on CUDA: no matching ABI/kernel/parity; CPU fallback"
+            )
+        }
+    };
+    HistoricalSkinGpuPlan {
+        backend: HistoricalSkinPath::Cpu,
+        kernel: None,
+        fallback_reason: Some(fallback_reason),
+    }
 }
 
 pub(super) fn fingerprint(inputs: &HistoricalSkinInputs) -> u64 {
@@ -468,11 +632,7 @@ pub(super) fn fingerprint(inputs: &HistoricalSkinInputs) -> u64 {
                     image(&pass.effect, &mut hash);
                 }
             }
-            HistoricalSkinData::StretchMark { model, mask, roi: rect, alternate } => {
-                image(model, &mut hash);
-                roi(rect, &mut hash);
-                (mask, alternate).hash(&mut hash);
-            }
+            HistoricalSkinData::StretchMark(ticket) => ticket.hash_into(&mut hash),
             HistoricalSkinData::BodyTone { m, o, w_m, w_o } => {
                 [w_m.to_bits(), w_o.to_bits()].hash(&mut hash);
                 for plane in [m, o] {
@@ -526,9 +686,13 @@ mod tests {
             HistoricalSkinData::BodySkin(vec![HistoricalSkinPass {
                 mask: vec![255, 0], effect: model.clone(),
             }]),
-            HistoricalSkinData::StretchMark {
-                model, mask: vec![255], roi, alternate: false,
-            },
+            HistoricalSkinData::StretchMark(StretchV3StageTicket::shared_oracle(
+                model,
+                vec![255],
+                roi,
+                false,
+                source.width * 4,
+            )),
             HistoricalSkinData::BodyTone {
                 m: vec![0.5, -0.5, 0.0, 0.0, 0.0, 0.0],
                 o: vec![0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
@@ -616,12 +780,13 @@ mod tests {
             external_row(
                 90008,
                 &source,
-                HistoricalSkinData::StretchMark {
-                    model: model.clone(),
-                    mask: vec![255, 255],
+                HistoricalSkinData::StretchMark(StretchV3StageTicket::shared_oracle(
+                    model.clone(),
+                    vec![255, 255],
                     roi,
-                    alternate: false,
-                },
+                    false,
+                    source.width * 4,
+                )),
             ),
             external_row(90023, &source, HistoricalSkinData::EyeLines(wrinkle.clone())),
             external_row(90024, &source, HistoricalSkinData::Forehead(wrinkle)),
@@ -648,6 +813,76 @@ mod tests {
         assert_eq!(built[&90023].source_sha256, sha256_32(&source.pixels));
         assert!(apply(&source, Some(7), 90023, 1.0, Some(&built)).is_ok());
         assert_eq!(fingerprint(&built), fingerprint(&built.clone()));
+    }
+
+    #[test]
+    fn backend_plan_routes_only_the_three_p15_wrinkle_rows() {
+        let source = Image::new(1, 1, vec![100, 150, 200, 77]).unwrap();
+        let model = Image::new(1, 1, vec![200, 100, 50, 91]).unwrap();
+        let wrinkle = external_wrinkle(&source, &model);
+        for (pf, data) in [
+            (21024, HistoricalSkinData::Glabella(wrinkle.clone())),
+            (90023, HistoricalSkinData::EyeLines(wrinkle.clone())),
+            (90024, HistoricalSkinData::Forehead(wrinkle.clone())),
+        ] {
+            let plan = plan_historical_skin_backend(pf, &data);
+            assert_eq!(plan.backend, HistoricalSkinPath::Gpu, "PF{pf}");
+            assert_eq!(
+                plan.kernel,
+                Some(aurora_portrait::cuda_wrinkle::U8_KERNEL),
+                "PF{pf}"
+            );
+            assert_eq!(plan.fallback_reason, None, "PF{pf}");
+        }
+        for (pf, data) in [
+            (
+                21105,
+                HistoricalSkinData::BodySkin(vec![HistoricalSkinPass {
+                    mask: vec![255],
+                    effect: model.clone(),
+                }]),
+            ),
+            (
+                90008,
+                HistoricalSkinData::StretchMark(StretchV3StageTicket::shared_oracle(
+                    model.clone(),
+                    vec![255],
+                    Roi {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    false,
+                    source.width * 4,
+                )),
+            ),
+            (
+                90086,
+                HistoricalSkinData::BodyTone {
+                    m: vec![0.0; 3],
+                    o: vec![0.0; 3],
+                    w_m: 1.0,
+                    w_o: 1.0,
+                },
+            ),
+        ] {
+            let plan = plan_historical_skin_backend(pf, &data);
+            assert_eq!(plan.backend, HistoricalSkinPath::Cpu, "PF{pf}");
+            assert_eq!(plan.kernel, None, "PF{pf}");
+            let expected = match pf {
+                21105 => "0x46E4D80",
+                90008 => "0x1E9DD78",
+                90086 => "M/O 3xf32",
+                _ => unreachable!(),
+            };
+            assert!(
+                plan.fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "PF{pf}"
+            );
+        }
     }
 
     #[test]
