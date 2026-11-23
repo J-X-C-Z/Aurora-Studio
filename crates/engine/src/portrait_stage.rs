@@ -124,7 +124,14 @@ pub use portrait_body_producer::{
 mod portrait_plump_stage;
 pub use portrait_plump_stage::{
     PLUMP_PFS, PlumpCompositeReceipt, PlumpFinalComposite, PlumpGroupRun, PlumpProducerInputs,
-    full_face_descriptor_from_ui,
+    full_face_descriptor_from_ui, PlumpSameFrameEvidence, PLUMP_LANDMARK_COUNT,
+};
+
+#[path = "portrait_plump_onnx.rs"]
+mod portrait_plump_onnx;
+pub use portrait_plump_onnx::{
+    build_plump_producer_inputs, discover_plump_onnx_models, plump_raster_with_cpu_fallback,
+    PlumpBuildRequest, PlumpOnnxAsset, PlumpRasterBackend, PlumpRasterOutcome, PlumpRasterReceipt,
 };
 
 #[path = "portrait_historical_tone.rs"]
@@ -1824,6 +1831,10 @@ impl ProducerInputs {
 
     pub fn write_teeth(&mut self, bundle: TeethProducerInputs) {
         self.teeth = Some(bundle);
+    }
+
+    pub fn write_plump(&mut self, bundle: PlumpProducerInputs) {
+        self.plump = Some(bundle);
     }
 
     pub fn write_wrinkle(&mut self, bundle: WrinkleProducerInputs) {
@@ -4443,7 +4454,11 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 }
             };
             match result {
-                Ok(_) => {
+                Ok(group) => {
+                    run.backend = match group.backend {
+                        PlumpRasterBackend::Cuda => PortraitBackend::Cuda,
+                        PlumpRasterBackend::Cpu => PortraitBackend::Cpu,
+                    };
                     run.skipped = false;
                     run.executed = true;
                 }

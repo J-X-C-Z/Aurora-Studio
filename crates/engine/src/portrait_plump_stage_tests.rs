@@ -89,6 +89,7 @@ fn final_composite(
             face_id: 2,
             requested_pfs: requested_pfs.to_vec(),
             source_sha256: sha256(&source.pixels),
+            backend: PlumpRasterBackend::Cpu,
             model_id: model_output.stamp.model_id,
             net_sha256: model_output.stamp.net_sha256,
             model_input_digest: model_input.digest,
@@ -101,13 +102,28 @@ fn final_composite(
 fn producer(source: &Image, requested_pfs: &[u32]) -> PlumpProducerInputs {
     let model_input = model_input();
     let model_output = model_output();
+    let roi = Roi {
+        x: 0,
+        y: 0,
+        width: SIZE.0,
+        height: SIZE.1,
+    };
+    let same_frame = PlumpSameFrameEvidence::from_same_frame(
+        source,
+        &vec![[1.0, 2.0]; PLUMP_LANDMARK_COUNT],
+        roi,
+        [1.0; 17],
+        None,
+    )
+    .expect("fixture same-frame evidence");
     PlumpProducerInputs {
         ticket: TICKET,
         face_id: 2,
         slots: [1.0; 17],
         requested_pfs: requested_pfs.to_vec(),
-        full_face_descriptor: requested_pfs.contains(&30_210).then_some(1.0),
+        full_face_descriptor: requested_pfs.contains(&30_210).then_some(4.0),
         session: binding(),
+        backend: PlumpRasterBackend::Cpu,
         final_composite: Some(final_composite(
             source,
             requested_pfs,
@@ -121,12 +137,8 @@ fn producer(source: &Image, requested_pfs: &[u32]) -> PlumpProducerInputs {
             split_mask: 3,
         },
         color_encoding: ColorEncoding::Unit,
-        roi: Roi {
-            x: 0,
-            y: 0,
-            width: SIZE.0,
-            height: SIZE.1,
-        },
+        roi,
+        same_frame: Some(same_frame),
     }
 }
 
@@ -411,5 +423,65 @@ fn fractional_full_face_ui_is_refused() {
     assert_eq!(
         full_face_descriptor_from_ui(2.5),
         Err(Refusal::ValueOutOfRange("PF30210 UI"))
+    );
+}
+
+#[test]
+fn full_face_ui_accepts_only_integer_zero_through_four() {
+    assert_eq!(full_face_descriptor_from_ui(0.0), Ok(0.0));
+    assert_eq!(full_face_descriptor_from_ui(4.0), Ok(4.0));
+    for value in [-1.0, 5.0, 2.5, f32::NAN, f32::INFINITY] {
+        assert_eq!(
+            full_face_descriptor_from_ui(value),
+            Err(Refusal::ValueOutOfRange("PF30210 UI"))
+        );
+    }
+}
+
+#[test]
+fn same_frame_evidence_rejects_414_point_roi_and_weight_drift() {
+    let source = frame();
+    let landmarks = vec![[1.0, 2.0]; PLUMP_LANDMARK_COUNT];
+    let roi = Roi {
+        x: 0,
+        y: 0,
+        width: SIZE.0,
+        height: SIZE.1,
+    };
+    let evidence =
+        PlumpSameFrameEvidence::from_same_frame(&source, &landmarks, roi, [1.0; 17], None)
+            .unwrap();
+    assert_eq!(evidence.validate(&source, roi, [1.0; 17]), Ok(()));
+
+    let mut stale_source = source.clone();
+    stale_source.pixels[0] ^= 1;
+    assert_eq!(
+        evidence.validate(&stale_source, roi, [1.0; 17]),
+        Err(Refusal::ValueOutOfRange("FacePlump same-frame source"))
+    );
+    assert_eq!(
+        evidence.validate(
+            &source,
+            Roi {
+                x: 1,
+                ..roi
+            },
+            [1.0; 17],
+        ),
+        Err(Refusal::ValueOutOfRange("FacePlump same-frame ROI"))
+    );
+    assert_eq!(
+        evidence.validate(&source, roi, [2.0; 17]),
+        Err(Refusal::ValueOutOfRange("FacePlump same-frame weights"))
+    );
+    assert_eq!(
+        PlumpSameFrameEvidence::from_same_frame(
+            &source,
+            &landmarks[..PLUMP_LANDMARK_COUNT - 1],
+            roi,
+            [1.0; 17],
+            None,
+        ),
+        Err(Refusal::ShapeMismatch("FacePlump 414 landmarks"))
     );
 }
