@@ -51,6 +51,9 @@ pub struct Layer {
     pub opacity: f32,
     pub mask: Mask,
     pub adjustments: LocalAdjustments,
+    /// `ZVARIANTLAYER.ZMASKUUID`, the `.cos` layer's `MaskUUID`: the key that
+    /// links this layer to its `.comask` mask record.
+    pub mask_uuid: Option<String>,
     /// `ZSTYLEUUID`/`ZSTYLESOURCE`/`ZSTYLEMODIFIED` when the layer came from a style.
     pub style: Option<LayerStyle>,
     /// `LAYERSELECTPOINT`, raw drawing pixels (`x;y`).
@@ -69,6 +72,7 @@ impl Default for Layer {
             opacity: 100.0,
             mask: Mask::default(),
             adjustments: LocalAdjustments::default(),
+            mask_uuid: None,
             style: None,
             select_point: None,
             cover: Vec::new(),

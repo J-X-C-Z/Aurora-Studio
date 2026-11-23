@@ -12,7 +12,7 @@ use crate::kernels::texture_mask_blend::NormalBlend;
 use crate::{Image, Refusal};
 
 #[cfg(windows)]
-use crate::cuda::CudaError;
+use crate::cuda::{CudaError, Dispatch};
 #[cfg(windows)]
 use crate::cuda::Nvidia;
 
@@ -103,6 +103,21 @@ impl Blend {
         effect_uv: Option<&[[f32; 2]]>,
         params: NormalBlend,
     ) -> Result<Image, CudaError> {
+        self.apply_with_dispatch(original, effect, mask, effect_uv, params)
+            .map(|(image, _dispatch)| image)
+    }
+
+    /// Same call as [`Blend::apply`], but returns the dispatch that proves the
+    /// kernel really ran. Callers that report backend provenance must use this
+    /// entry instead of treating a successful `apply` as GPU evidence.
+    pub fn apply_with_dispatch(
+        &self,
+        original: &Image,
+        effect: &Image,
+        mask: &[u8],
+        effect_uv: Option<&[[f32; 2]]>,
+        params: NormalBlend,
+    ) -> Result<(Image, Dispatch), CudaError> {
         check(original, effect, mask, effect_uv, params)?;
         let uniforms = Uniforms {
             width: original.width as i32,
@@ -123,14 +138,15 @@ impl Blend {
             original.width.div_ceil(BLOCK).max(1),
             original.height.div_ceil(BLOCK).max(1),
         );
-        let (pixels, _dispatch) = self.gpu.run_u8(
+        let (pixels, dispatch) = self.gpu.run_u8(
             KERNEL,
             grid,
             &[&original.pixels, &effect.pixels, mask, uv_plane],
             as_bytes(&uniforms),
         )?;
-        Image::new(original.width, original.height, pixels)
-            .ok_or(CudaError::Refused(Refusal::ShapeMismatch("output")))
+        let image = Image::new(original.width, original.height, pixels)
+            .ok_or(CudaError::Refused(Refusal::ShapeMismatch("output")))?;
+        Ok((image, dispatch))
     }
 }
 

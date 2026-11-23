@@ -19,6 +19,7 @@ mod c1import;
 mod c1_masks;
 pub mod c1_cos;
 pub mod c1_eip;
+pub mod c1_writeback;
 pub mod c1_spots;
 pub mod dust_lcc;
 pub mod dust_patch;
@@ -27,7 +28,7 @@ mod c1session_export;
 mod sqlite_write;
 mod c1_style_index;
 mod c1_styles;
-mod c1_model;
+pub(crate) mod c1_model;
 pub mod c1_nef_lensdata;
 mod c1_wb_oracle;
 pub mod c1_retouch;
@@ -60,7 +61,9 @@ mod lens_correct;
 mod layer_graph;
 mod lensdb;
 mod matchlook;
+mod merge_async;
 mod merge_options;
+mod panel_commands;
 mod mock;
 
 pub fn prewarm_gpu() {
@@ -80,6 +83,8 @@ pub mod portrait_makeup_bundle;
 pub mod portrait_makeup_suit_inputs;
 mod portrait_historical_tone_provider;
 pub mod portrait_makeup_provider;
+pub mod blemish_gainmap;
+pub use blemish_gainmap::*;
 pub use aurora_portrait::cuda_pf90021::{
     Direction as Pf90021Direction, RuntimeScalars as Pf90021RuntimeScalars, VolumeLut64,
 };
@@ -205,9 +210,10 @@ pub use portrait_stage::{
     PF90130_NORMALIZE_SUB, PF90130_PIXELS, PF90130_PLANE_HEIGHT, PF90130_PLANE_WIDTH,
     Pf101ProducerInputs, Pf90130AlignedGeometry, Pf90130GlareProducer, Pf90130ProducerInputs,
     Pf90130SameJobReceipt, Pf90130StageRun,
-    SkinRepairData, SkinRepairOutput, SkinRepairProducerInputs, SpotlessInputs,
+    SkinRepairData, SkinRepairOutput, SkinRepairProducerInputs, SpotlessGainmapJob, SpotlessInputs,
     apply_glare_chain_final_writeback, apply_glare_final_writeback, apply_glare_stage_writeback,
     apply_pf90130_producer_stage, bridge_glare_planes, run_skin_repair,
+    resolve_spotless_gainmap_amount, run_spotless_gainmap_16u,
 };
 pub use portrait_makeup_bundle::*;
 pub use portrait_makeup_provider::*;
@@ -226,6 +232,7 @@ mod recipe;
 mod scopes;
 mod store;
 mod styles;
+mod testdata;
 mod tether;
 mod xmp;
 pub mod camera_curve;
@@ -234,6 +241,7 @@ pub mod camera_profile;
 pub mod ai_denoise;
 pub mod aimask;
 pub mod dustdetect;
+pub mod beautymarks;
 pub mod autorotate;
 pub mod keystone;
 
@@ -270,13 +278,20 @@ pub use filmcurve::{curve_dir, parse_film_curves, FilmCurve};
 pub use layers::*;
 pub use lens_correct::*;
 pub use dust_patch::{DustDetector, DustError, DustPatch};
-pub use dust_lcc::DustLccError;
+pub use dust_lcc::{DustLccError, LccLoadError};
 pub use layer_graph::*;
 pub use lensdb::*;
 pub use matchlook::*;
+pub use merge_async::{
+    MergeError, MergeErrorCode, MergeJobId, MergeKind, MergeOutcome, MergeProgress, MergeRequest,
+    MergeStage, SoftProofSettings,
+};
 pub use merge_options::*;
 pub use mock::MockEngine;
 pub use output::*;
+pub use panel_commands::{
+    CaptureDevice, PortraitCapability, PrintLayout, PrintPreview, PrintRequest,
+};
 #[doc(hidden)]
 pub use mock::process::{render, render16, Rendered, Rendered16, Source};
 pub use param_meta::*;

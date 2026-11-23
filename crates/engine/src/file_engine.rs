@@ -22,6 +22,9 @@ use crate::store::{Catalog, Entry, Store, StoreError};
 use crate::tether::{self, TetherStatus};
 use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, HdrOptions, JobStatus, NormRect, PanoramaOptions, RgbaImage};
 
+#[path = "library_ops.rs"]
+mod library_ops;
+
 /// Longest side kept for a decoded source; larger files are downscaled.
 const SOURCE_LONG_SIDE: u32 = 4096;
 /// How many decoded sources stay in memory at once.
@@ -460,6 +463,7 @@ fn attach_c1_layers(
                 enabled: layer.enabled,
                 opacity: layer.opacity.clamp(0.0, 100.0),
                 select_point: layer.select_point,
+                mask_uuid: Some(uuid.to_owned()),
                 style: None,
                 cover: Vec::new(),
                 mask: Mask {
@@ -505,6 +509,20 @@ fn cos_settings_file(raw: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn lcc_id_for(grid: &crate::dust_lcc::LightFalloff) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    grid.header.hash(&mut hash);
+    grid.columns.hash(&mut hash);
+    grid.rows.hash(&mut hash);
+    for node in &grid.nodes {
+        node.luminance.hash(&mut hash);
+        node.dx.hash(&mut hash);
+        node.dy.hash(&mut hash);
+    }
+    format!("{:016x}", hash.finish())
 }
 
 /// `CaptureOne/Settings<build>` folders, newest build first.
@@ -686,6 +704,28 @@ fn local_adjustments(a: &AdjustmentSet) -> LocalAdjustments {
     }
 }
 
+/// [`local_adjustments`] in reverse: a render layer's tools as a full set.
+fn layer_adjustments(layer: &crate::Layer) -> AdjustmentSet {
+    let local = &layer.adjustments;
+    AdjustmentSet {
+        white_balance: local.white_balance.clone().unwrap_or_default(),
+        exposure: local.exposure.clone(),
+        hdr: local.hdr.clone(),
+        clarity: local.clarity.clone(),
+        dehaze: local.dehaze.clone(),
+        curves: local.curves.clone().unwrap_or_default(),
+        levels: local.levels.clone().unwrap_or_default(),
+        black_white: local.black_white.clone().unwrap_or_default(),
+        color_balance: local.color_balance.clone(),
+        color_editor: local.color_editor.clone(),
+        sharpening: local.sharpening.clone().unwrap_or_default(),
+        noise_reduction: local.noise_reduction.clone().unwrap_or_default(),
+        moire: local.moire.clone(),
+        ..Default::default()
+    }
+}
+
+#[derive(Clone)]
 struct FileEntry {
     info: ImageInfo,
     path: PathBuf,
@@ -742,11 +782,15 @@ pub struct FileEngine {
     store: Option<Store>,
     /// A C1 catalog is read-only: opening it must not save the imported index.
     c1_catalog: bool,
+    /// The database `open_c1_catalog` read, for the write-back entry point.
+    c1_catalog_path: Option<PathBuf>,
     /// Camera defaults from Capture One's `coreConfig.cdx`, read once.
     camera_defaults: std::sync::OnceLock<Option<crate::CameraDefaults>>,
     /// Closed-eye results, computed once per image.
     eyes: Mutex<HashMap<ImageId, crate::EyeReport>>,
     imported_styles: RwLock<Vec<StyleInfo>>,
+    merge_registry: Arc<crate::merge_async::MergeRegistry>,
+    soft_proof: RwLock<crate::SoftProofSettings>,
 }
 
 /// Target white balance for Match Look: stored C1 gains when present, the
@@ -776,9 +820,115 @@ impl crate::matchlook::LookWhiteBalanceContext for CameraWhiteBalance {
 }
 
 impl FileEngine {
+    fn image_path(&self, image: ImageId) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.info.id == image)
+            .map(|entry| entry.path.clone())
+    }
+
+    fn lcc_files(&self, image: ImageId) -> Option<(PathBuf, PathBuf)> {
+        Some((self.image_path(image)?, self.c1_settings_path(image)?))
+    }
+
+    /// The `.cos` sidecar that belongs to `image`: `<stem>.cos` beside the raw,
+    /// or in a `Settings*` folder beside or above it (Capture One's layout).
+    pub fn c1_settings_path(&self, image: ImageId) -> Option<PathBuf> {
+        let raw = {
+            let st = self.state.lock();
+            st.entries
+                .iter()
+                .find(|entry| entry.info.id == image)
+                .map(|entry| entry.path.clone())?
+        };
+        cos_settings_file(&raw)
+    }
+
+    /// Writes the image's adjustments back into its Capture One `.cos`.
+    ///
+    /// The global `<DL>` layer is compared to `adjustments`; every local layer
+    /// is matched by `MaskUUID` and must have a `.comask` record in the same
+    /// folder. Unmatched layers are reported, never silently dropped.
+    /// Writes the image's adjustments into the catalog `open_c1_catalog` read.
+    ///
+    /// This is the database route; [`Self::save_to_c1_settings`] is the
+    /// file-sidecar route and stays independent of it.
+    pub fn save_to_c1_catalog(
+        &self,
+        image: ImageId,
+        adjustments: &AdjustmentSet,
+    ) -> anyhow::Result<crate::c1_writeback::CatalogSaveOutcome> {
+        use crate::c1_writeback::{CatalogSaveOutcome, WriteOutcome};
+        let (database, file_name, variant_index) = {
+            let st = self.state.lock();
+            let Some(database) = self.c1_catalog_path.clone() else {
+                return Ok(CatalogSaveOutcome::NotACatalog);
+            };
+            let Some(entry) = st.entries.iter().find(|entry| entry.info.id == image) else {
+                anyhow::bail!("image {} is not in this engine", image.0);
+            };
+            (database, entry.info.file_name.clone(), entry.info.variant)
+        };
+        let import = crate::c1import::C1Import::open(&database)?;
+        let Some(c1_image) = import
+            .catalog
+            .images
+            .iter()
+            .find(|row| row.file_name == file_name)
+        else {
+            anyhow::bail!("{file_name} has no row in {}", database.display());
+        };
+        let mut variants: Vec<_> = import
+            .catalog
+            .variants
+            .iter()
+            .filter(|variant| variant.image_pk == c1_image.pk)
+            .collect();
+        variants.sort_by_key(|variant| variant.pk);
+        let Some(variant) = variants
+            .get((variant_index.max(1) as usize - 1).min(variants.len().saturating_sub(1)))
+        else {
+            anyhow::bail!("{file_name} has no variant in the catalog");
+        };
+        match crate::c1_writeback::write_variant_with_source(
+            &database,
+            variant.pk,
+            adjustments,
+            Some((c1_image.width, c1_image.height)),
+        )? {
+            WriteOutcome::Unchanged { warnings } => Ok(CatalogSaveOutcome::Unchanged { warnings }),
+            WriteOutcome::Written { columns, .. } => {
+                let mut name = database.as_os_str().to_os_string();
+                name.push(".bak");
+                Ok(CatalogSaveOutcome::Saved { columns, backup: PathBuf::from(name) })
+            }
+        }
+    }
+
+    pub fn save_to_c1_settings(
+        &self,
+        image: ImageId,
+        adjustments: &AdjustmentSet,
+    ) -> anyhow::Result<crate::c1_cos::CosSaveOutcome> {
+        let path = self.c1_settings_path(image).ok_or_else(|| {
+            anyhow::anyhow!("no `.cos` settings file was found for image {}", image.0)
+        })?;
+        let layers: Vec<crate::c1_cos::CosLayerWrite> = adjustments
+            .layers
+            .iter()
+            .map(|layer| crate::c1_cos::CosLayerWrite {
+                mask_uuid: None,
+                adjustments: layer_adjustments(layer),
+            })
+            .collect();
+        crate::c1_cos::save_adjustments(&path, adjustments, &layers)
+    }
+
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root = root.as_ref().to_path_buf();
+        let root = library_ops::canonical_root(root.as_ref())?;
         let store = match Store::open(&root) {
             Ok(store) => Some(store),
             Err(err) => {
@@ -792,6 +942,7 @@ impl FileEngine {
             }
         };
         let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
+        let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
         let engine = Self {
             root,
             state: Arc::new(Mutex::new(State {
@@ -816,9 +967,12 @@ impl FileEngine {
             decode: Mutex::new(()),
             store,
             c1_catalog: false,
+            c1_catalog_path: None,
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
             imported_styles: RwLock::new(Vec::new()),
+            merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
+            soft_proof: RwLock::new(soft_proof),
         };
         engine.rescan()?;
         engine.preload_ai_masks();
@@ -858,8 +1012,10 @@ impl FileEngine {
         }) {
             root = root.parent().unwrap_or(Path::new(".")).to_path_buf();
         }
+        let root = library_ops::canonical_root(&root)?;
         let store = Store::open(&root).ok();
         let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
+        let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
         let engine = Self {
             root,
             state: Arc::new(Mutex::new(State {
@@ -884,9 +1040,12 @@ impl FileEngine {
             decode: Mutex::new(()),
             store,
             c1_catalog: true,
+            c1_catalog_path: Some(import.catalog_path.clone()),
             camera_defaults: std::sync::OnceLock::new(),
             eyes: Mutex::new(HashMap::new()),
             imported_styles: RwLock::new(Vec::new()),
+            merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
+            soft_proof: RwLock::new(soft_proof),
         };
         engine.import_c1(&import);
         engine.preload_ai_masks();
@@ -1094,6 +1253,8 @@ impl FileEngine {
         let mut found = Vec::new();
         collect(&self.root, &self.root, 0, &mut found)?;
         found.sort_by(|a, b| a.0.cmp(&b.0));
+        let excluded: std::collections::HashSet<PathBuf> =
+            self.store.as_ref().map(|store| store.load_excluded().into_iter().collect()).unwrap_or_default();
 
         let mut st = self.state.lock();
         let previous: HashMap<String, (AdjustmentSet, i8, ColorTag, Vec<String>, u32)> = st
@@ -1114,7 +1275,11 @@ impl FileEngine {
 
         let mut from_cos = Vec::new();
         st.entries.clear();
-        for scanned in scanned.into_iter().flat_map(ScannedFile::library_variants) {
+        for scanned in scanned
+            .into_iter()
+            .filter(|scanned| !excluded.contains(&scanned.path))
+            .flat_map(ScannedFile::library_variants)
+        {
             let rel_path = &scanned.rel_path;
             let stored = previous.get(rel_path);
             let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
@@ -1437,7 +1602,7 @@ impl FileEngine {
     /// catalogs it. The first frame's exposure is the reference the result is
     /// rendered at; frames must share one size.
     pub fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
-        self.merge_hdr(ids, None)
+        self.merge_hdr_impl(ids, None)
     }
 
     /// [`Self::merge_hdr_frames`] with the interface's options. `align: false`
@@ -1448,10 +1613,46 @@ impl FileEngine {
         ids: &[ImageId],
         options: &HdrOptions,
     ) -> anyhow::Result<ImageInfo> {
-        self.merge_hdr(ids, Some(options))
+        self.merge_hdr_impl(ids, Some(options))
     }
 
-    fn merge_hdr(&self, ids: &[ImageId], options: Option<&HdrOptions>) -> anyhow::Result<ImageInfo> {
+    fn start_merge(
+        &self,
+        kind: crate::merge_async::MergeKind,
+        images: &[ImageId],
+        options: &crate::MergeRequest,
+    ) -> anyhow::Result<crate::MergeJobId> {
+        anyhow::ensure!(!images.is_empty(), "merge needs at least one image");
+        let mut sources = Vec::with_capacity(images.len());
+        let mut stops = Vec::with_capacity(images.len());
+        let first_path;
+        {
+            let st = self.state.lock();
+            let mut exif = Vec::with_capacity(images.len());
+            let mut paths = Vec::with_capacity(images.len());
+            for id in images {
+                let entry = st
+                    .entries
+                    .iter()
+                    .find(|entry| entry.info.id == *id)
+                    .ok_or_else(|| anyhow::anyhow!("merge: unknown image {id:?}"))?;
+                paths.push(entry.path.clone());
+                exif.push(entry.info.exif.clone());
+            }
+            first_path = paths.first().cloned().ok_or_else(|| anyhow::anyhow!("merge: no first frame"))?;
+            if let Some(first) = exif.first() {
+                stops = exif.iter().map(|frame| crate::hdr::relative_stops(first, frame)).collect();
+            }
+        }
+        for id in images {
+            sources.push(self.source(*id)?);
+        }
+        let mut request = options.clone();
+        request.images = images.to_vec();
+        Ok(self.merge_registry.start(kind, sources, stops, first_path, request))
+    }
+
+    fn merge_hdr_impl(&self, ids: &[ImageId], options: Option<&HdrOptions>) -> anyhow::Result<ImageInfo> {
         if let Some(options) = options {
             Self::warn_hdr_options(options);
         }
@@ -1520,7 +1721,7 @@ impl FileEngine {
     /// aligned by a horizontal SAD search and the overlap is feathered.
     /// Distortion, perspective and exposure matching are not applied yet.
     pub fn merge_panorama_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
-        self.merge_panorama(ids, None)
+        self.merge_panorama_impl(ids, None)
     }
 
     /// [`Self::merge_panorama_frames`] with the interface's options.
@@ -1532,10 +1733,10 @@ impl FileEngine {
         ids: &[ImageId],
         options: &PanoramaOptions,
     ) -> anyhow::Result<ImageInfo> {
-        self.merge_panorama(ids, Some(options))
+        self.merge_panorama_impl(ids, Some(options))
     }
 
-    fn merge_panorama(
+    fn merge_panorama_impl(
         &self,
         ids: &[ImageId],
         options: Option<&PanoramaOptions>,
@@ -2152,6 +2353,22 @@ impl ImageEngine for FileEngine {
         format!("Portrait File Engine ({})", self.root.display())
     }
 
+    fn save_c1_settings(
+        &self,
+        image: ImageId,
+        adjustments: &AdjustmentSet,
+    ) -> anyhow::Result<crate::c1_cos::CosSaveOutcome> {
+        self.save_to_c1_settings(image, adjustments)
+    }
+
+    fn save_c1_catalog(
+        &self,
+        image: ImageId,
+        adjustments: &AdjustmentSet,
+    ) -> anyhow::Result<crate::c1_writeback::CatalogSaveOutcome> {
+        self.save_to_c1_catalog(image, adjustments)
+    }
+
     fn images(&self) -> Vec<ImageInfo> {
         self.state.lock().entries.iter().map(|e| e.info.clone()).collect()
     }
@@ -2244,6 +2461,65 @@ impl ImageEngine for FileEngine {
         } else {
             c1
         }
+    }
+
+    fn library_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+
+    fn collection_path(&self, id: u64) -> Option<PathBuf> {
+        let index = id.checked_sub(FOLDER_BASE)? as usize;
+        let (dir, _) = self.folder_dirs().get(index)?.clone();
+        Some(if dir.is_empty() { self.root.clone() } else { self.root.join(dir) })
+    }
+
+    fn user_collections(&self) -> Vec<crate::UserCollection> {
+        self.store.as_ref().map(|store| store.load_user_collections()).unwrap_or_default()
+    }
+
+    fn manage_files(&self, action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
+        self.manage_library(action)
+    }
+
+    fn set_lcc_calibration(
+        &self,
+        image: ImageId,
+        calibration: Option<crate::dust_lcc::LightFalloff>,
+    ) -> anyhow::Result<()> {
+        let (raw, settings) = self
+            .lcc_files(image)
+            .ok_or_else(|| anyhow::anyhow!("image {} has no Capture One .cos settings file", image.0))?;
+        let Some(calibration) = calibration else {
+            return crate::c1_cos::write_global_lcc_id(&settings, None);
+        };
+        let existing = std::fs::read(&settings)
+            .ok()
+            .and_then(|bytes| crate::c1_cos::CosDocument::parse(&bytes).ok())
+            .and_then(|document| document.variant().and_then(|variant| variant.lcc_id.clone()));
+        let id = existing.unwrap_or_else(|| lcc_id_for(&calibration));
+        let bytes = crate::dust_lcc::write_light_falloff(&calibration)?;
+        let settings_dir = settings
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("settings path has no parent: {}", settings.display()))?;
+        let raw_name = raw
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("raw path has no UTF-8 file name: {}", raw.display()))?;
+        let path = crate::dust_lcc::sidecar_path(settings_dir, raw_name, &id);
+        std::fs::write(&path, bytes)
+            .map_err(|error| anyhow::anyhow!("writing {}: {error}", path.display()))?;
+        crate::c1_cos::write_global_lcc_id(&settings, Some(&id))
+    }
+
+    fn lcc_calibration(&self, image: ImageId) -> Option<crate::dust_lcc::LightFalloff> {
+        let (raw, settings) = self.lcc_files(image)?;
+        let bytes = std::fs::read(&settings).ok()?;
+        let document = crate::c1_cos::CosDocument::parse(&bytes).ok()?;
+        let id = document.variant()?.lcc_id.as_deref()?;
+        let settings_dir = settings.parent()?;
+        let raw_name = raw.file_name()?.to_str()?;
+        let path = crate::dust_lcc::sidecar_path(settings_dir, raw_name, id);
+        crate::dust_lcc::load_light_falloff(&path).ok()
     }
 
     // Without this the trait default (`None`) hides the folder membership from the
@@ -2492,6 +2768,64 @@ impl ImageEngine for FileEngine {
         options: &PanoramaOptions,
     ) -> anyhow::Result<ImageInfo> {
         FileEngine::merge_panorama_with_options(self, ids, options)
+    }
+
+    fn merge_hdr(&self, images: &[ImageId], options: &crate::MergeRequest) -> anyhow::Result<crate::MergeJobId> {
+        self.start_merge(crate::merge_async::MergeKind::Hdr, images, options)
+    }
+
+    fn merge_panorama(&self, images: &[ImageId], options: &crate::MergeRequest) -> anyhow::Result<crate::MergeJobId> {
+        self.start_merge(crate::merge_async::MergeKind::Panorama, images, options)
+    }
+
+    fn merge_progress(&self, job_id: crate::MergeJobId) -> Option<crate::MergeProgress> {
+        self.merge_registry.progress(job_id)
+    }
+
+    fn cancel_merge(&self, job_id: crate::MergeJobId) -> bool {
+        self.merge_registry.cancel(job_id)
+    }
+
+    fn merge_result(&self, job_id: crate::MergeJobId) -> Option<std::result::Result<crate::MergeOutcome, crate::MergeError>> {
+        self.merge_registry.result(job_id)
+    }
+
+    fn set_soft_proof_profile(&self, profile: Option<String>, intent: u8) -> anyhow::Result<()> {
+        let settings = crate::merge_async::settings_with_profile(profile, intent)?;
+        *self.soft_proof.write() = settings.clone();
+        if let Some(store) = &self.store {
+            store.save_soft_proof(&settings)?;
+        }
+        Ok(())
+    }
+
+    fn soft_proof_profile(&self) -> crate::SoftProofSettings {
+        self.soft_proof.read().clone()
+    }
+
+    fn soft_proof_preview(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<PreviewFrame> {
+        let settings = self.soft_proof.read().clone();
+        let request = PreviewRequest {
+            image,
+            adjustments: adjustments.clone(),
+            region: NormRect::FULL,
+            max_size: max_size.max(1),
+            quality: RenderQuality::Final,
+            bypass: false,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: settings.profile,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: Some(settings.intent),
+            black_point_compensation: false,
+        };
+        self.render_preview(&request)
+    }
+
+    fn soft_proof_gamut_warning(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<Option<crate::GamutWarning>> {
+        Ok(self.soft_proof_preview(image, adjustments, max_size)?.gamut_warning)
     }
 
     fn thumbnail(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<RgbaImage> {
@@ -3040,6 +3374,12 @@ impl ImageEngine for FileEngine {
     fn tether_status(&self) -> TetherStatus {
         tether::probe()
     }
+    fn capture_devices(&self) -> Vec<crate::CaptureDevice> {
+        tether::devices()
+    }
+    fn portrait_capabilities(&self) -> Vec<crate::PortraitCapability> {
+        crate::panel_commands::portrait_capabilities()
+    }
     fn layer_summaries(&self, image: ImageId) -> Vec<crate::engine::LayerSummary> {
         self.state.lock().layers.get(&image).cloned().unwrap_or_default()
     }
@@ -3061,6 +3401,8 @@ impl ImageEngine for FileEngine {
             auto_rotate: true,
             match_look: true,
             tether: cfg!(windows),
+            blemish_gainmap: true,
+            blemish_gainmap_model: crate::blemish_gainmap::model_available(),
             export_formats: crate::output::ExportFormat::ALL
                 .into_iter()
                 .filter(|format| format.is_supported())
@@ -3219,6 +3561,73 @@ mod tests {
         assert!((adjustments.exposure.exposure - 1.25).abs() < 1e-6);
         assert_eq!(adjustments.layers.len(), 1);
         assert!((adjustments.layers[0].adjustments.exposure.exposure + 0.75).abs() < 1e-6);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn lcc_fixture(name: &str) -> (PathBuf, PathBuf, crate::dust_lcc::LightFalloff) {
+        let dir = std::env::temp_dir().join(format!("aurora-lcc-command-{}-{name}", std::process::id()));
+        let settings = dir.join("CaptureOne").join("Settings1680");
+        std::fs::create_dir_all(&settings).unwrap();
+        let raw = dir.join("a.png");
+        image::RgbaImage::from_pixel(4, 3, image::Rgba([20, 40, 60, 255]))
+            .save(&raw)
+            .unwrap();
+        std::fs::write(
+            settings.join("a.png.cos"),
+            br#"<IMG><VAR Engine="600"><DL><E K="Exposure" V="0"/></DL></VAR></IMG>"#,
+        )
+        .unwrap();
+        let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/lcc/vignette-1ev-1500x1000.lcc");
+        let grid = crate::dust_lcc::load_light_falloff(&sample).unwrap();
+        (dir, settings, grid)
+    }
+
+    #[test]
+    fn lcc_calibration_round_trips_through_cos_lccid_and_sidecar() {
+        let (dir, settings, grid) = lcc_fixture("round-trip");
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        engine.set_lcc_calibration(id, Some(grid.clone())).unwrap();
+        assert_eq!(engine.lcc_calibration(id), Some(grid.clone()));
+
+        let document = crate::c1_cos::CosDocument::parse(&std::fs::read(settings.join("a.png.cos")).unwrap())
+            .unwrap();
+        assert!(document.variant().unwrap().lcc_id.is_some());
+        let sidecars: Vec<_> = std::fs::read_dir(&settings)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "lcc"))
+            .collect();
+        assert_eq!(sidecars.len(), 1);
+
+        drop(engine);
+        let reopened = FileEngine::open(&dir).unwrap();
+        let id = reopened.images()[0].id;
+        assert_eq!(reopened.lcc_calibration(id), Some(grid));
+        assert!(reopened.load_adjustments(id).lens.uniform_light_grid.is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn clearing_lcc_calibration_removes_the_cos_pointer() {
+        let (dir, settings, grid) = lcc_fixture("clear");
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        engine.set_lcc_calibration(id, Some(grid)).unwrap();
+        engine.set_lcc_calibration(id, None).unwrap();
+        assert_eq!(engine.lcc_calibration(id), None);
+        let document = crate::c1_cos::CosDocument::parse(&std::fs::read(settings.join("a.png.cos")).unwrap())
+            .unwrap();
+        assert_eq!(document.variant().unwrap().lcc_id, None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn setting_lcc_on_an_unknown_image_is_an_error() {
+        let (dir, _settings, grid) = lcc_fixture("unknown");
+        let engine = FileEngine::open(&dir).unwrap();
+        assert!(engine.set_lcc_calibration(ImageId(999), Some(grid)).is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3425,6 +3834,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let caps = FileEngine::open(&dir).unwrap().capabilities();
         assert!(caps.eye_report && caps.auto_rotate && caps.match_look);
+        assert!(caps.blemish_gainmap);
+        assert_eq!(
+            caps.blemish_gainmap_model,
+            crate::blemish_gainmap::model_available()
+        );
         assert!(caps.ai_mask_kinds.contains(&AiMaskKind::Subject));
         assert!(!caps.ai_mask_kinds.contains(&AiMaskKind::Eyes));
         let expected: Vec<_> = crate::output::ExportFormat::ALL

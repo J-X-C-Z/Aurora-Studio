@@ -8,6 +8,62 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ImageId(pub u64);
 
+/// Explicit catalog and filesystem operations, matching Levin's
+/// `lumen_engine::LibraryAction`.
+///
+/// `Forget` never deletes originals. `Copy` and `Delete` are additive Windows
+/// extensions: the live Levin frontend has no call site for them yet, and its
+/// own "Move to Trash" uses `set_trashed` (soft delete) instead.
+#[derive(Clone, Debug)]
+pub enum LibraryAction {
+    Synchronize {
+        folder: PathBuf,
+        recursive: bool,
+    },
+    Move {
+        images: Vec<ImageId>,
+        destination: PathBuf,
+    },
+    MoveFolder {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Rename {
+        image: ImageId,
+        name: String,
+    },
+    RenameMany {
+        names: Vec<(ImageId, String)>,
+    },
+    Locate {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    LocateImage {
+        image: ImageId,
+        to: PathBuf,
+    },
+    Forget {
+        images: Vec<ImageId>,
+    },
+    CreateFolder {
+        path: PathBuf,
+    },
+    /// Copy originals and their XMP sidecars into `destination`. No-clobber:
+    /// the whole batch is rejected if any destination already exists.
+    Copy {
+        images: Vec<ImageId>,
+        destination: PathBuf,
+    },
+    /// Delete originals and their XMP sidecars. `permanent = false` sends them
+    /// to the Windows Recycle Bin; `true` deletes them permanently. The flag is
+    /// explicit so no caller can delete by accident.
+    Delete {
+        images: Vec<ImageId>,
+        permanent: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ColorTag {
     #[default]

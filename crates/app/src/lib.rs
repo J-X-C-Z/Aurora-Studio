@@ -91,6 +91,12 @@ fn prewarm_in_background() {
         .name("aurora-prewarm".into())
         .spawn(|| {
             lower_current_thread_priority();
+            if std::env::var_os("AURORA_GPU_SELFCHECK").is_some() {
+                match aurora_engine::aimask::gpu_selfcheck() {
+                    Ok(()) => log::info!("GPU selfcheck finished"),
+                    Err(error) => log::warn!("GPU selfcheck failed: {error:#}"),
+                }
+            }
             let gpu_start = std::time::Instant::now();
             aurora_engine::prewarm_gpu();
             log::info!(

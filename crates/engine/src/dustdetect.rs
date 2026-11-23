@@ -1,14 +1,13 @@
-//! AI dust detection: the `dust.onnx` model that Capture One's Spot Removal
-//! uses for automatic dust/spot picking.
+//! AI dust detection: `dust.onnx`, the model behind Capture One's
+//! `IC_DetectDust` automatic dust picking.
 //!
-//! Input is one `[1,3,416,416]` float32 tensor of RGB values in 0..255 (the
-//! model has its own normalisation; feeding 0..1 collapses to noise). Output is
-//! `[1,3549,6]`: three YOLO anchor grids (52/26/13 cells at strides 8/16/32),
-//! each row `cx, cy, w, h, objectness, class`. Centres are cell offsets in
-//! `(cell + raw) * stride` pixels, sizes are `raw * stride` pixels.
-//!
-//! Nothing here panics: a missing model or runtime, a buffer smaller than
-//! `w * h * 4`, or a bad tensor shape all come back as `Err`.
+//! Contract recovered from `ImgCoreDll.dll` (see `analysis/ai_models.md`):
+//! input `[1,3,416,416]` float32 RGB in 0..255; output `[1,3549,6]`.  The
+//! three grids are strides 8/16/32, 52²/26²/13² cells.  A row is
+//! `cx_in_cell, cy_in_cell, log(w/stride), log(h/stride), objectness, class`.
+//! The image is scaled by `f = 416/min_side + 0.1` (floor 0.5 under 80 MP,
+//! 0.25 above), tiled 416 with 100 px overlap, and the last tile is flush with
+//! the right/bottom edge.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -18,23 +17,59 @@ use anyhow::{Result, bail};
 use crate::aimask::{Runtime, Session};
 use crate::{Spot, SpotKind};
 
-/// Longest side the model sees; inputs are stretched to this square.
 pub const INPUT_SIDE: usize = 416;
-/// Anchors per detection grid (52² + 26² + 13²).
 pub const ANCHORS: usize = 52 * 52 + 26 * 26 + 13 * 13;
-/// Most spots one call returns.
 pub const MAX_SPOTS: usize = 200;
-/// Smallest spot radius in source pixels; dust is rarely under 1.5 px.
-const MIN_RADIUS_PX: f32 = 1.5;
-/// Two boxes overlap when their intersection over union exceeds this.
-const NMS_IOU: f32 = 0.45;
-const GRIDS: [(usize, usize, f32); 3] = [(52, 52, 8.0), (26, 26, 16.0), (13, 13, 32.0)];
+/// `DAT_182a2bc70`; the old 0.3 dropped faint dust.
+pub const DEFAULT_CONFIDENCE: f32 = 0.15;
+const TILE_STEP: usize = INPUT_SIDE - 100;
+pub(crate) const MIN_RADIUS_PX: f32 = 1.5;
+pub(crate) const MAX_RADIUS_PX: f32 = 100.0;
+pub(crate) const NMS_IOU: f32 = 0.45;
+const STRIDES: [usize; 3] = [8, 16, 32];
 
-/// Detects dust spots in a developed RGBA frame.
-///
-/// `rgba` is tightly packed `w * h * 4`. Returned spots are normalised like
-/// every other engine spot: `x`/`y` in `0..=1` of the frame, `radius` as a
-/// fraction of its long side. Results are sorted by confidence, best first.
+/// `AURORA_DUST_ONNX=1` turns automatic detection on.
+pub fn enabled() -> bool {
+    std::env::var("AURORA_DUST_ONNX").ok().as_deref() == Some("1")
+}
+
+pub fn min_confidence() -> f32 {
+    std::env::var("AURORA_DUST_CONF")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(DEFAULT_CONFIDENCE)
+}
+
+/// Image-to-canvas scale.  `None` means C1 itself rejects the image as too
+/// small (`Dust detection rejected image because it is too small`).
+fn spot_scale(w: u32, h: u32) -> Option<f32> {
+    let min_side = w.min(h) as f32;
+    let floor = if (w as u64) * (h as u64) < 80_000_001 { 0.5 } else { 0.25 };
+    let f = (INPUT_SIDE as f32 / min_side + 0.1).max(floor);
+    (f <= 1.0).then_some(f)
+}
+
+pub(crate) fn spot_tiles(n: usize) -> Vec<usize> {
+    if n <= INPUT_SIDE {
+        return vec![0];
+    }
+    let mut out: Vec<usize> = (0..=n - INPUT_SIDE).step_by(TILE_STEP).collect();
+    if out.last().copied() != Some(n - INPUT_SIDE) {
+        out.push(n - INPUT_SIDE);
+    }
+    out
+}
+
+pub(crate) struct RawSpot {
+    pub score: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub side: f32,
+}
+
+/// Detects dust spots in a developed RGBA frame.  Returned coordinates are
+/// normalised like every other `Spot`; `radius` is a fraction of the long side.
 pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<Vec<Spot>> {
     if w == 0 || h == 0 {
         return Ok(Vec::new());
@@ -43,15 +78,57 @@ pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<V
     if rgba.len() < need {
         bail!("dust detection: buffer has {} bytes, need {need} for {w}x{h}", rgba.len());
     }
+    let Some(scale) = spot_scale(w, h) else {
+        bail!("Dust detection rejected image because it is too small");
+    };
+    let canvas_w = ((w as f32 * scale).ceil() as usize).max(INPUT_SIDE);
+    let canvas_h = ((h as f32 * scale).ceil() as usize).max(INPUT_SIDE);
+    let canvas = resize_canvas(rgba, w as usize, h as usize, canvas_w, canvas_h);
     let session = &session()?.session;
     let runtime = Runtime::get()
         .ok_or_else(|| anyhow::anyhow!("ONNX Runtime is not available for dust detection"))?;
-    let mut input = input_tensor(rgba, w as usize, h as usize);
-    let planes = runtime.run(session, &mut input, &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64])?;
-    let rows = planes
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("dust model returned no output"))?;
-    decode(rows, min_confidence, w, h)
+    let mut found = Vec::new();
+    for ty in spot_tiles(canvas_h) {
+        for tx in spot_tiles(canvas_w) {
+            let mut input = tile_tensor(&canvas, canvas_w, canvas_h, tx, ty);
+            let planes = runtime.run(
+                session,
+                &mut input,
+                &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64],
+            )?;
+            let rows = planes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("dust model returned no output"))?;
+            found.extend(decode_tile(rows, tx, ty, scale, min_confidence)?);
+        }
+    }
+    found.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    let mut kept: Vec<RawSpot> = Vec::new();
+    for spot in found {
+        if kept.len() >= MAX_SPOTS {
+            break;
+        }
+        let radius = spot.side * 0.5;
+        if !(MIN_RADIUS_PX..=MAX_RADIUS_PX).contains(&radius) {
+            continue;
+        }
+        if kept.iter().any(|k| iou(&spot, k) > NMS_IOU) {
+            continue;
+        }
+        kept.push(spot);
+    }
+    let long = w.max(h) as f32;
+    Ok(kept
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| Spot {
+            id: i as u64 + 1,
+            kind: SpotKind::Dust,
+            x: (s.cx / w as f32).clamp(0.0, 1.0),
+            y: (s.cy / h as f32).clamp(0.0, 1.0),
+            radius: (s.side * 0.5 / long).clamp(0.0, 1.0),
+        })
+        .collect())
 }
 
 struct Loaded {
@@ -78,8 +155,8 @@ fn session() -> Result<&'static Loaded> {
     }
 }
 
-/// `AURORA_DUST_MODEL` wins, then `AURORA_AIMODELS/dust.onnx`, then the Capture
-/// One install the other AI models come from.
+/// `AURORA_DUST_MODEL` wins, then `AURORA_AIMODELS`, then the Capture One
+/// install.  The real model lives in `AIModels/Common/DustRemoval/dust.onnx`.
 fn model_path() -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(path) = std::env::var_os("AURORA_DUST_MODEL") {
@@ -87,9 +164,11 @@ fn model_path() -> Result<PathBuf> {
     }
     if let Some(dir) = std::env::var_os("AURORA_AIMODELS") {
         candidates.push(PathBuf::from(&dir).join("dust.onnx"));
-        candidates.push(PathBuf::from(&dir).join("AIModels/Common/dust.onnx"));
+        candidates.push(PathBuf::from(&dir).join("Common/DustRemoval/dust.onnx"));
+        candidates.push(PathBuf::from(&dir).join("AIModels/Common/DustRemoval/dust.onnx"));
     }
     for root in crate::aimask::c1_roots() {
+        candidates.push(root.join("AIModels/Common/DustRemoval/dust.onnx"));
         candidates.push(root.join("AIModels/Common/dust.onnx"));
         candidates.push(root.join("dust.onnx"));
     }
@@ -102,112 +181,104 @@ fn model_path() -> Result<PathBuf> {
     )
 }
 
-/// Bilinear resize to 416×416, RGB, 0..255 — the range the model was trained on.
-fn input_tensor(rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
-    let side = INPUT_SIDE;
-    let mut tensor = vec![0.0f32; 3 * side * side];
-    for y in 0..side {
-        let sy = (y as f32 + 0.5) * h as f32 / side as f32 - 0.5;
+/// Bilinear resize to the C1 canvas, RGB 0..255 (the model's trained range).
+pub(crate) fn resize_canvas(rgba: &[u8], w: usize, h: usize, cw: usize, ch: usize) -> Vec<f32> {
+    let mut canvas = vec![0.0f32; cw * ch * 3];
+    for y in 0..ch {
+        let sy = (y as f32 + 0.5) * h as f32 / ch as f32 - 0.5;
         let y0 = sy.floor().max(0.0) as usize;
         let y1 = (y0 + 1).min(h - 1);
         let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..side {
-            let sx = (x as f32 + 0.5) * w as f32 / side as f32 - 0.5;
+        for x in 0..cw {
+            let sx = (x as f32 + 0.5) * w as f32 / cw as f32 - 0.5;
             let x0 = sx.floor().max(0.0) as usize;
             let x1 = (x0 + 1).min(w - 1);
             let fx = (sx - x0 as f32).clamp(0.0, 1.0);
             let at = |xx: usize, yy: usize, c: usize| rgba[(yy * w + xx) * 4 + c] as f32;
-            let i = y * side + x;
+            let d = (y * cw + x) * 3;
             for c in 0..3 {
                 let top = at(x0, y0, c) * (1.0 - fx) + at(x1, y0, c) * fx;
                 let bottom = at(x0, y1, c) * (1.0 - fx) + at(x1, y1, c) * fx;
-                tensor[c * side * side + i] = top * (1.0 - fy) + bottom * fy;
+                canvas[d + c] = top * (1.0 - fy) + bottom * fy;
             }
         }
     }
-    tensor
+    canvas
 }
 
-/// Decodes the raw `[3549,6]` head into normalised spots.
-fn decode(rows: &[f32], min_confidence: f32, w: u32, h: u32) -> Result<Vec<Spot>> {
+pub(crate) fn tile_tensor(canvas: &[f32], cw: usize, ch: usize, tx: usize, ty: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; 3 * INPUT_SIDE * INPUT_SIDE];
+    for y in 0..INPUT_SIDE {
+        let sy = ty + y;
+        if sy >= ch {
+            continue;
+        }
+        for x in 0..INPUT_SIDE {
+            let sx = tx + x;
+            if sx >= cw {
+                continue;
+            }
+            let si = (sy * cw + sx) * 3;
+            let di = y * INPUT_SIDE + x;
+            for c in 0..3 {
+                out[c * INPUT_SIDE * INPUT_SIDE + di] = canvas[si + c];
+            }
+        }
+    }
+    out
+}
+
+/// `FUN_181435ef0`: anchors 8/16/32, `w=exp(col2)*stride`, `conf=col4*col5`.
+pub(crate) fn decode_tile(
+    rows: &[f32],
+    x_off: usize,
+    y_off: usize,
+    scale: f32,
+    min_confidence: f32,
+) -> Result<Vec<RawSpot>> {
     if rows.len() < ANCHORS * 6 {
         bail!("dust model returned {} values, expected {}", rows.len(), ANCHORS * 6);
     }
-    if w == 0 || h == 0 {
-        return Ok(Vec::new());
-    }
-    let long_side = w.max(h) as f32;
-    let (sx, sy) = (w as f32 / INPUT_SIDE as f32, h as f32 / INPUT_SIDE as f32);
-    let min_confidence = if min_confidence.is_finite() { min_confidence } else { 0.0 };
-
-    let mut found: Vec<(f32, [f32; 4])> = Vec::new();
+    let threshold = if min_confidence.is_finite() { min_confidence } else { 0.0 };
+    let mut found = Vec::new();
     let mut index = 0usize;
-    for (gw, gh, stride) in GRIDS {
-        for gy in 0..gh {
-            for gx in 0..gw {
-                let row = &rows[index * 6..index * 6 + 6];
+    for stride in STRIDES {
+        let grid = INPUT_SIDE / stride;
+        for gy in 0..grid {
+            for gx in 0..grid {
+                let p = &rows[index * 6..index * 6 + 6];
                 index += 1;
-                let confidence = row[4] * row[5];
-                if !confidence.is_finite() || confidence < min_confidence {
+                let score = p[4] * p[5];
+                if !score.is_finite() || score <= threshold {
                     continue;
                 }
-                // A head can predict outside its cell; keep the centre on the canvas.
-                let cx = ((gx as f32 + row[0]) * stride).clamp(0.0, INPUT_SIDE as f32);
-                let cy = ((gy as f32 + row[1]) * stride).clamp(0.0, INPUT_SIDE as f32);
-                let (bw, bh) = (row[2] * stride, row[3] * stride);
-                if !cx.is_finite() || !cy.is_finite() || !(bw > 0.0) || !(bh > 0.0) {
+                let bw = p[2].exp() * stride as f32;
+                let bh = p[3].exp() * stride as f32;
+                if !bw.is_finite() || !bh.is_finite() || bw <= 0.0 || bh <= 0.0 {
                     continue;
                 }
-                let half_w = bw.min(INPUT_SIDE as f32 * 2.0) * 0.5;
-                let half_h = bh.min(INPUT_SIDE as f32 * 2.0) * 0.5;
-                let box_ = [
-                    (cx - half_w).clamp(0.0, INPUT_SIDE as f32),
-                    (cy - half_h).clamp(0.0, INPUT_SIDE as f32),
-                    (cx + half_w).clamp(0.0, INPUT_SIDE as f32),
-                    (cy + half_h).clamp(0.0, INPUT_SIDE as f32),
-                ];
-                if box_[2] <= box_[0] || box_[3] <= box_[1] {
-                    continue;
+                let cx = (x_off as f32 + (gx as f32 + p[0]) * stride as f32) / scale;
+                let cy = (y_off as f32 + (gy as f32 + p[1]) * stride as f32) / scale;
+                let side = bw.max(bh) / scale;
+                if cx.is_finite() && cy.is_finite() && side.is_finite() && side > 0.0 {
+                    found.push(RawSpot { score, cx, cy, side });
                 }
-                found.push((confidence, box_));
             }
         }
     }
-    found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut kept: Vec<(f32, [f32; 4])> = Vec::new();
-    for (confidence, box_) in found {
-        if kept.len() >= MAX_SPOTS {
-            break;
-        }
-        if kept.iter().any(|(_, k)| iou(k, &box_) > NMS_IOU) {
-            continue;
-        }
-        kept.push((confidence, box_));
-    }
-
-    let mut spots = Vec::with_capacity(kept.len());
-    for (i, (_, b)) in kept.into_iter().enumerate() {
-        let cx = (b[0] + b[2]) * 0.5;
-        let cy = (b[1] + b[3]) * 0.5;
-        let r_px = (0.5 * (b[2] - b[0]) * sx).max(0.5 * (b[3] - b[1]) * sy);
-        spots.push(Spot {
-            id: i as u64 + 1,
-            kind: SpotKind::Dust,
-            x: (cx / INPUT_SIDE as f32).clamp(0.0, 1.0),
-            y: (cy / INPUT_SIDE as f32).clamp(0.0, 1.0),
-            radius: r_px.max(MIN_RADIUS_PX) / long_side,
-        });
-    }
-    Ok(spots)
+    Ok(found)
 }
 
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let w = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
-    let h = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+pub(crate) fn iou(a: &RawSpot, b: &RawSpot) -> f32 {
+    let ah = a.side * 0.5;
+    let bh = b.side * 0.5;
+    let w = (a.cx + ah).min(b.cx + bh) - (a.cx - ah).max(b.cx - bh);
+    let h = (a.cy + ah).min(b.cy + bh) - (a.cy - ah).max(b.cy - bh);
+    if w <= 0.0 || h <= 0.0 {
+        return 0.0;
+    }
     let inter = w * h;
-    let union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
+    inter / (a.side * a.side + b.side * b.side - inter).max(f32::MIN_POSITIVE)
 }
 
 #[cfg(test)]
@@ -224,138 +295,112 @@ mod tests {
 
     #[test]
     fn empty_result_when_nothing_passes_the_threshold() {
-        let rows = rows_with(&[(0, [0.5, 0.5, 0.2, 0.2, 0.1, 0.1])]);
-        assert!(decode(&rows, 0.3, 416, 416).unwrap().is_empty());
-        assert!(decode(&rows, 0.0, 416, 416).unwrap().len() == 1);
+        let rows = rows_with(&[(0, [0.5, 0.5, 0.0, 0.0, 0.1, 0.1])]);
+        assert!(decode_tile(&rows, 0, 0, 1.0, 0.15).unwrap().is_empty());
+        assert_eq!(decode_tile(&rows, 0, 0, 1.0, 0.0).unwrap().len(), 1);
     }
 
     #[test]
-    fn cell_offsets_become_normalized_coordinates() {
-        // Grid 0, cell (10, 5), centre half a cell in, box 0.1 cell = 0.8 px.
-        let rows = rows_with(&[(5 * 52 + 10, [0.5, 0.5, 0.1, 0.1, 0.9, 0.9])]);
-        let spots = decode(&rows, 0.5, 416, 416).unwrap();
+    fn exp_size_and_cell_offsets_are_decoded() {
+        let rows = rows_with(&[(5 * 52 + 10, [0.5, 0.5, 0.0, 0.0, 0.9, 0.9])]);
+        let spots = decode_tile(&rows, 0, 0, 1.0, 0.15).unwrap();
         assert_eq!(spots.len(), 1);
-        let s = &spots[0];
-        assert!((s.x - (10.5 * 8.0 / 416.0)).abs() < 1e-5, "x = {}", s.x);
-        assert!((s.y - (5.5 * 8.0 / 416.0)).abs() < 1e-5, "y = {}", s.y);
-        assert_eq!(s.kind, SpotKind::Dust);
+        assert!((spots[0].cx - 10.5 * 8.0).abs() < 1e-4);
+        assert!((spots[0].cy - 5.5 * 8.0).abs() < 1e-4);
+        assert!((spots[0].side - 8.0).abs() < 1e-4);
     }
 
     #[test]
-    fn radius_never_drops_below_the_floor() {
-        let rows = rows_with(&[(0, [0.5, 0.5, 1e-6, 1e-6, 0.9, 0.9])]);
-        let spots = decode(&rows, 0.5, 4000, 3000).unwrap();
-        let radius_px = spots[0].radius * 4000.0;
-        assert!(radius_px >= MIN_RADIUS_PX - 1e-3, "radius {radius_px} px");
-    }
-
-    #[test]
-    fn out_of_range_centres_are_clamped() {
-        let rows = rows_with(&[
-            (0, [-3.0, -3.0, 0.5, 0.5, 0.9, 0.9]),
-            (ANCHORS - 1, [9.0, 9.0, 0.5, 0.5, 0.9, 0.9]),
-        ]);
-        let spots = decode(&rows, 0.5, 416, 416).unwrap();
-        assert_eq!(spots.len(), 2);
-        for s in &spots {
-            assert!((0.0..=1.0).contains(&s.x), "x = {}", s.x);
-            assert!((0.0..=1.0).contains(&s.y), "y = {}", s.y);
-            assert!(s.radius.is_finite() && s.radius > 0.0);
-        }
+    fn tile_offsets_and_scale_return_to_image_pixels() {
+        let rows = rows_with(&[(0, [0.5, 0.5, 0.0, 0.0, 0.9, 0.9])]);
+        let spots = decode_tile(&rows, 316, 100, 0.5, 0.15).unwrap();
+        assert!((spots[0].cx - (316.0 + 4.0) / 0.5).abs() < 1e-3);
+        assert!((spots[0].cy - (100.0 + 4.0) / 0.5).abs() < 1e-3);
+        assert!((spots[0].side - 16.0).abs() < 1e-3);
     }
 
     #[test]
     fn non_positive_boxes_are_rejected() {
-        let rows = rows_with(&[(0, [0.5, 0.5, -0.7, 0.2, 0.9, 0.9])]);
-        assert!(decode(&rows, 0.0, 416, 416).unwrap().is_empty());
+        let rows = rows_with(&[(0, [0.5, 0.5, f32::NEG_INFINITY, 0.0, 0.9, 0.9])]);
+        assert!(decode_tile(&rows, 0, 0, 1.0, 0.0).unwrap().is_empty());
     }
 
     #[test]
-    fn overlapping_grids_are_deduplicated() {
-        // Same spot seen by the 8 px and 16 px heads: cell (12,12) and (6,6).
-        let rows = rows_with(&[
-            (12 * 52 + 12, [0.4, 0.4, 1.0, 1.0, 0.8, 0.8]),
-            (52 * 52 + 6 * 26 + 6, [0.2, 0.2, 0.5, 0.5, 0.7, 0.7]),
-        ]);
-        let spots = decode(&rows, 0.3, 416, 416).unwrap();
-        assert_eq!(spots.len(), 1);
+    fn overlapping_tiles_are_deduplicated() {
+        let a = RawSpot { score: 0.9, cx: 100.0, cy: 100.0, side: 20.0 };
+        let b = RawSpot { score: 0.8, cx: 102.0, cy: 99.0, side: 20.0 };
+        assert!(iou(&a, &b) > NMS_IOU);
     }
 
     #[test]
-    fn results_are_sorted_and_capped() {
-        let mut detections = Vec::new();
-        for i in 0..300usize {
-            let row = 40 + (i / 52) as usize;
-            let col = i % 52;
-            detections.push((row * 52 + col, [0.5, 0.5, 0.01, 0.01, (i as f32 / 300.0).min(0.99), 1.0]));
-        }
-        let rows = rows_with(&detections);
-        let spots = decode(&rows, 0.0, 416, 416).unwrap();
-        assert_eq!(spots.len(), MAX_SPOTS);
-        let ids: Vec<u64> = spots.iter().map(|s| s.id).collect();
-        assert_eq!(ids, (1..=MAX_SPOTS as u64).collect::<Vec<_>>());
-        // Highest anchor (bottom/right) has the highest confidence, so it comes first.
-        assert!(spots[0].x > 0.5);
-    }
-
-    #[test]
-    fn wrong_output_size_is_an_error() {
-        assert!(decode(&[0.0; 12], 0.0, 416, 416).is_err());
+    fn scale_and_tiles_match_c1() {
+        assert!(spot_scale(416, 416).is_none());
+        let f = spot_scale(6048, 4032).unwrap();
+        assert!((f - 0.5).abs() < 1e-6);
+        let tiles = spot_tiles(2016);
+        assert_eq!(tiles.first(), Some(&0));
+        assert_eq!(tiles.last(), Some(&(2016 - 416)));
     }
 
     #[test]
     fn short_buffer_is_an_error() {
-        assert!(detect_dust(&[0u8; 16], 8, 8, 0.3).is_err());
+        assert!(detect_dust(&[0u8; 16], 8, 8, 0.15).is_err());
     }
 
-    /// Real model run. Needs `AURORA_DUST_MODEL` (and ONNX Runtime) on the host.
+    /// Real model: 600×600 with three dark dots, C1 scale/tile path.
     #[test]
     #[ignore]
     fn detect_synthetic_dots_with_the_real_model() {
-        let (w, h) = (416u32, 416u32);
+        let (w, h) = (600u32, 600u32);
         let mut buf = vec![153u8; (w * h * 4) as usize];
-        for (cx, cy) in [(100i64, 100i64), (200, 100), (300, 300)] {
-            for y in cy - 9..=cy + 9 {
-                for x in cx - 9..=cx + 9 {
-                    if (x - cx).pow(2) + (y - cy).pow(2) > 81 {
-                        continue;
+        let mut dots = Vec::new();
+        for (cx, cy) in [(150i64, 150i64), (300, 150), (450, 450)] {
+            dots.push((cx, cy));
+            for y in cy - 12..=cy + 12 {
+                for x in cx - 12..=cx + 12 {
+                    if (x - cx).pow(2) + (y - cy).pow(2) <= 144 {
+                        let p = ((y as u32 * w + x as u32) * 4) as usize;
+                        buf[p..p + 3].fill(0);
                     }
-                    let p = ((y as u32 * w + x as u32) * 4) as usize;
-                    buf[p..p + 3].fill(0);
                 }
             }
         }
         let start = std::time::Instant::now();
-        let spots = detect_dust(&buf, w, h, 0.3).expect("detection");
-        let elapsed = start.elapsed();
-        let warm = std::time::Instant::now();
-        let again = detect_dust(&buf, w, h, 0.3).expect("detection");
-        println!(
-            "detected {} spots in {elapsed:?} (first call, includes model load); \
-             {} in {:?} warm",
-            spots.len(),
-            again.len(),
-            warm.elapsed()
-        );
-        for s in spots.iter().take(12) {
-            println!(
-                "  x={:.4} y={:.4} r={:.4} (px {:.1})",
-                s.x,
-                s.y,
-                s.radius,
-                s.radius * w.max(h) as f32
+        let spots = detect_dust(&buf, w, h, 0.15).expect("detection");
+        println!("detected {} spots in {:?}", spots.len(), start.elapsed());
+        for s in &spots {
+            println!("  x={:.4} y={:.4} r={:.4} (px {:.1})", s.x, s.y, s.radius, s.radius * 600.0);
+        }
+        for (cx, cy) in dots {
+            assert!(
+                spots.iter().any(|s| (s.x * 600.0 - cx as f32).abs() < 25.0
+                    && (s.y * 600.0 - cy as f32).abs() < 25.0),
+                "missing dot at ({cx},{cy})"
             );
         }
-        assert!(!spots.is_empty(), "no dust found on a synthetic test pattern");
-        assert!(spots.len() <= MAX_SPOTS);
-        assert!(spots.iter().any(|s| (s.x - 100.0 / 416.0).abs() < 0.05 && (s.y - 100.0 / 416.0).abs() < 0.05));
     }
 
-    /// Run where neither `AURORA_DUST_MODEL` nor a Capture One install exists.
     #[test]
     #[ignore]
-    fn a_missing_model_is_an_error_not_a_panic() {
-        let buf = vec![0u8; 16 * 16 * 4];
-        assert!(detect_dust(&buf, 16, 16, 0.3).is_err());
+    fn flat_image_has_no_spots_with_the_real_model() {
+        let buf = vec![153u8; 600 * 600 * 4];
+        let spots = detect_dust(&buf, 600, 600, 0.15).expect("detection");
+        assert!(spots.is_empty(), "flat frame produced {spots:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn detect_real_9868_frame() {
+        let path = r"C:\WorkSpace\Aurora Studio\90_work\build-cache\z6iii-desktop-smoke-a88d98b0\output\DSC_9868.tif";
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let image = image::open(path).unwrap().to_rgba8();
+        let (w, h) = image.dimensions();
+        let spots = detect_dust(image.as_raw(), w, h, 0.15).expect("detection");
+        println!("real 9868: {} spots in {w}x{h}", spots.len());
+        for s in spots.iter().take(20) {
+            println!("  x={:.4} y={:.4} r={:.4}", s.x, s.y, s.radius);
+        }
     }
 }

@@ -3,10 +3,49 @@ use aurora_portrait::kernels::{blemish, face_detail, pf90130_chain, skin_color};
 use aurora_portrait::{Image, Refusal};
 use std::collections::BTreeMap;
 
+pub use crate::blemish_gainmap::{
+    apply_gainmap_16u, GainMap, SpotlessGainmapInputs,
+};
+
+/// Real blemish stage consumer for the 16-bit linear frame.  The existing
+/// 8-bit `Spotless` row is untouched; this entry is the gain-map path and is
+/// gated by `AURORA_BLEMISH_GAINMAP=1`.
+pub fn run_spotless_gainmap_16u(
+    rgb16: &[u16],
+    width: u32,
+    height: u32,
+    gain_map: &GainMap,
+    amount: f32,
+    protection_mask: Option<&[u8]>,
+) -> Result<Vec<u16>, Refusal> {
+    apply_gainmap_16u(&SpotlessGainmapInputs {
+        rgb16,
+        width,
+        height,
+        gain_map,
+        amount,
+        protection_mask,
+    })
+}
+
+/// Resolves the existing blemish slider to the consumer's 0..=1 amount.
+/// `ZRETOUCHING...BLEMISHREMOVALAMOUNT` wins when present; otherwise the PF /
+/// contract key `BlemishRemovalAmount` is used; absent means C1's default 0.
+pub fn resolve_spotless_gainmap_amount(
+    adjust: &crate::AdjustmentSet,
+    retouch_percent: Option<f32>,
+) -> f32 {
+    match retouch_percent {
+        Some(percent) => crate::blemish_gainmap::amount_from_retouch_layer(Some(percent)),
+        None => crate::blemish_gainmap::amount_from_adjustments(adjust),
+    }
+}
+
 /// Same-job inputs for the three skin-repair rows left open after wl32.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SkinRepairData {
     Spotless(SpotlessInputs),
+    SpotlessGainmap(SpotlessGainmapJob),
     Nostril(NostrilInputs),
     Glare(GlareInputs),
 }
@@ -14,7 +53,7 @@ pub enum SkinRepairData {
 impl SkinRepairData {
     fn pf(&self) -> u32 {
         match self {
-            Self::Spotless(_) => 0,
+            Self::Spotless(_) | Self::SpotlessGainmap(_) => 0,
             Self::Nostril(_) => 21104,
             Self::Glare(_) => 90130,
         }
@@ -37,6 +76,19 @@ pub struct SpotlessInputs {
     pub blemish_model_output: Vec<u8>,
     pub repair_model_output: Vec<u8>,
     pub composition_flag: u8,
+}
+
+/// 16-bit linear blemish job.  The gain map is produced by
+/// `produce_gain_map_16u` and consumed by `apply_gainmap_16u`; `source` is
+/// still the same frame descriptor for ticket/size/digest binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpotlessGainmapJob {
+    pub rgb16: Vec<u16>,
+    pub width: u32,
+    pub height: u32,
+    pub gain_map: GainMap,
+    pub amount: f32,
+    pub protection_mask: Option<Vec<u8>>,
 }
 
 /// PF21104 consumer planes. They are full-frame after the same-face producer.
@@ -68,6 +120,9 @@ pub enum SkinRepairOutput {
         mask8: Vec<u8>,
         repair_rgb8: Vec<u8>,
         changed: bool,
+    },
+    SpotlessGainmap {
+        rgb16: Vec<u16>,
     },
     Nostril {
         rgb8: Vec<u8>,
@@ -179,6 +234,20 @@ pub fn run(
                 repair_rgb8: inputs.repair_model_output.clone(),
                 changed: result.changed,
             }
+        }
+        SkinRepairData::SpotlessGainmap(job) => {
+            if job.width != source.width || job.height != source.height {
+                return Err(Refusal::ShapeMismatch("blemish gain map frame"));
+            }
+            let rgb16 = apply_gainmap_16u(&SpotlessGainmapInputs {
+                rgb16: &job.rgb16,
+                width: job.width,
+                height: job.height,
+                gain_map: &job.gain_map,
+                amount: job.amount,
+                protection_mask: job.protection_mask.as_deref(),
+            })?;
+            SkinRepairOutput::SpotlessGainmap { rgb16 }
         }
         SkinRepairData::Nostril(inputs) => {
             let rgb = rgba_rgb(&source.pixels);

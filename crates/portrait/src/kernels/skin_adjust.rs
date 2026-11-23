@@ -248,14 +248,24 @@ fn neutral_wrinkle_uniforms() -> WrinkleUniforms {
 
 /// `PF21070`/`PF21025` scale UI by 100; `PF21069`/`PF21071` keep the native
 /// unscaled getter value.
+/// Recovers the per-PF UI-to-native conversion.
+///
+/// 90023 follows `native = ui / 100` (r76 s63 U2). 90024 is recorded as
+/// `native = ui`; the `/100` is explicitly unproven, so it is not applied.
+/// 21024 is absent on purpose: its `mask.r`/`mask.b` contribution law is
+/// missing, so `cuda_wrinkle::resolve_p15` refuses it before this point.
 pub fn wrinkle_degree(pf: u32, ui: f32) -> Result<f32, Refusal> {
-    if !matches!(pf, 21025 | 21069 | 21070 | 21071) {
+    if !matches!(pf, 21025 | 21069 | 21070 | 21071 | 90023 | 90024) {
         return Err(Refusal::UnknownEffect(pf));
     }
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
         return Err(Refusal::ValueOutOfRange("ui"));
     }
-    Ok(if matches!(pf, 21025 | 21070) { ui / 100.0 } else { ui })
+    Ok(if matches!(pf, 21025 | 21070 | 90023) {
+        ui / 100.0
+    } else {
+        ui
+    })
 }
 
 /// `alpha = max(dark_circle * mask.r, legal * mask.b, 0) * skin_mask`, skipping

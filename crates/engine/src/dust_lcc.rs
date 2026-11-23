@@ -17,6 +17,7 @@
 //! container's byte order, and `SpotData` is the per-pixel gain plane those
 //! offsets index. This reader returns the records; see [`crate::DustPatch`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +80,37 @@ impl fmt::Display for DustLccError {
 
 impl std::error::Error for DustLccError {}
 
+/// Why [`load_light_falloff`] could not return a calibration.
+#[derive(Debug)]
+pub enum LccLoadError {
+    /// The file could not be read.
+    Read { path: PathBuf, source: std::io::Error },
+    /// The file exists but its XCon/LightFalloff payload is invalid.
+    Parse(DustLccError),
+    /// The file is a valid `.lcc` but carries no Uniform Light grid.
+    NoLightFalloff,
+}
+
+impl fmt::Display for LccLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(f, "reading {}: {source}", path.display()),
+            Self::Parse(error) => write!(f, "{error}"),
+            Self::NoLightFalloff => write!(f, "the .lcc has no LightFalloff grid"),
+        }
+    }
+}
+
+impl std::error::Error for LccLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Parse(error) => Some(error),
+            Self::NoLightFalloff => None,
+        }
+    }
+}
+
 /// The dust half of an `.lcc`: its patch records and their `SpotData` plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DustLcc {
@@ -109,6 +141,107 @@ pub enum LightFalloffLimit {
     Hard,
     Soft,
     Uncapped,
+}
+
+/// The kernel's `mode` argument: how the calibrated EV is limited.
+///
+/// Capture One's own OpenCL consumer (`LensLightLCC`, kernel `z5523e58be8`)
+/// switches on `mode`: 0 applies the soft knee, 1 pins at 3 EV, every other
+/// value leaves the EV alone. There is **no per-variant column or SDK field**
+/// for it — the catalog only stores the gate, the amount and the LCC id — so
+/// the only persisted source is the calibration file's `Hdr` flags word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LightFalloffMode {
+    #[default]
+    Soft,
+    Hard,
+    Uncapped,
+}
+
+impl LightFalloffMode {
+    /// `Hdr` flags bit 0 selects the limiter: 1 keeps the soft knee, 0 hard
+    /// cuts at 3 EV (`mode = 1 - (flags & 1)`).
+    ///
+    /// Measured against Capture One's own renderer: a 6 EV calibration whose
+    /// flags word is 1 reaches 4 EV at the corner, clearing bit 0 lands on the
+    /// 3 EV plateau and matches the flagged file at amount 50.4. Both renders
+    /// are identical below 3 EV. `LCC_CREATE_TECHNICAL_CAM` writes the same
+    /// flags word, so it is not a second knob.
+    pub fn from_lcc_flags(flags: u16) -> Self {
+        if flags & 1 == 1 {
+            Self::Soft
+        } else {
+            Self::Hard
+        }
+    }
+
+    /// The kernel's integer argument.
+    pub fn kernel_index(self) -> i32 {
+        match self {
+            Self::Soft => 0,
+            Self::Hard => 1,
+            Self::Uncapped => 2,
+        }
+    }
+
+    /// Anything outside 0..=2 is treated as "not recognised" and falls back to
+    /// the soft knee, which is what an ordinary variant gets. The kernel itself
+    /// would leave the EV unlimited for such a value; the fallback is a
+    /// conservative choice and is logged.
+    pub fn from_kernel_index(index: i32) -> Self {
+        match index {
+            0 => Self::Soft,
+            1 => Self::Hard,
+            2 => Self::Uncapped,
+            other => {
+                log::warn!(
+                    "uniform light: unknown kernel mode {other}, falling back to the soft cap"
+                );
+                Self::Soft
+            }
+        }
+    }
+
+    fn limit(self) -> LightFalloffLimit {
+        match self {
+            Self::Soft => LightFalloffLimit::Soft,
+            Self::Hard => LightFalloffLimit::Hard,
+            Self::Uncapped => LightFalloffLimit::Uncapped,
+        }
+    }
+}
+
+impl LightFalloff {
+    /// The `Hdr` flags word. A 12-byte legacy header has no such field.
+    pub fn flags(&self) -> Option<u16> {
+        match self.header.len() {
+            16 => Some(u16_at(&self.header, 14, true)),
+            _ => None,
+        }
+    }
+
+    /// The limiter this calibration asks for. Legacy headers, and anything
+    /// C1 has not written a mode into, keep the soft knee.
+    pub fn mode(&self) -> LightFalloffMode {
+        self.flags()
+            .map(LightFalloffMode::from_lcc_flags)
+            .unwrap_or_default()
+    }
+}
+
+/// Maps Capture One's 0..120 Light Falloff slider onto the kernel's strength.
+///
+/// The shipped consumer (`LensLightLCC`, kernel `z5523e58be8` inside
+/// `ImgCoreDll.dll`) computes `ev = (max_level - field)/8192 * strength` and
+/// `gain = exp2(ev)`, so the slider blends **in EV**, not toward identity:
+/// `gain(amount) = gain(100) ^ (amount/100)`. A measured render confirms it —
+/// amount 50 gives `sqrt` of the full-strength gain at every radius, while a
+/// linear gain blend would be ~1.4% brighter at the corner.
+///
+/// The second half of the result is the cap policy the mode selects, so a
+/// caller cannot accidentally pair one mode's strength with another's limit.
+pub fn strength_from_amount(amount: f32, mode: LightFalloffMode) -> (f32, LightFalloffLimit) {
+    ((amount / 100.0).clamp(0.0, 1.2), mode.limit())
 }
 
 /// A decoded, enabled Uniform Light correction prepared once per lens stage.
@@ -210,24 +343,46 @@ impl<'a> UniformLight<'a> {
 /// Reads the inline little-endian LightFalloff grid used by the Windows renderer.
 pub fn parse_light_falloff(bytes: &[u8]) -> Result<Option<LightFalloff>, DustLccError> {
     let (mut header, mut model) = (None, None);
-    parse_chunks(bytes, |group, name, flags, payload, le| {
-        if group != Some(b"LightFalloff") {
+    let (mut header_ref, mut model_ref) = (None, None);
+    let mut bins: HashMap<u32, &[u8]> = HashMap::new();
+    let mut dat: Option<u32> = None;
+    parse_chunks(bytes, |groups, name, flags, payload, le| {
+        if name == b"DAT" {
+            dat = varint_value(payload);
             return Ok(());
         }
-        let target = match name {
-            b"REF" => return Err(DustLccError::UnsupportedLightFalloff),
-            b"Hdr" => &mut header,
-            b"Model" => &mut model,
-            _ => return Ok(()),
-        };
-        if !le || flags & 0xC0 != 0 {
+        if name == b"BIN" {
+            if let Some(id) = dat.take() {
+                bins.insert(id, payload);
+            }
+            return Ok(());
+        }
+        if !groups.iter().any(|group| *group == b"LightFalloff".as_slice()) {
+            return Ok(());
+        }
+        if !le {
             return Err(DustLccError::UnsupportedLightFalloff);
         }
-        if target.replace(payload).is_some() {
-            return Err(DustLccError::InvalidLightFalloff);
+        let parent = groups.last().copied();
+        match name {
+            b"Hdr" if parent == Some(b"LightFalloff".as_slice()) && flags & 1 == 0 => {
+                if header.replace(payload).is_some() {
+                    return Err(DustLccError::InvalidLightFalloff);
+                }
+            }
+            b"Model" if parent == Some(b"LightFalloff".as_slice()) && flags & 1 == 0 => {
+                if model.replace(payload).is_some() {
+                    return Err(DustLccError::InvalidLightFalloff);
+                }
+            }
+            b"REF" if parent == Some(b"Hdr".as_slice()) => header_ref = varint_value(payload),
+            b"REF" if parent == Some(b"Model".as_slice()) => model_ref = varint_value(payload),
+            _ => {}
         }
         Ok(())
     })?;
+    let header = header.or_else(|| header_ref.and_then(|id| bins.get(&id).copied()));
+    let model = model.or_else(|| model_ref.and_then(|id| bins.get(&id).copied()));
     let (header, model) = match (header, model) {
         (None, None) => return Ok(None),
         (Some(header), Some(model)) => (header, model),
@@ -255,33 +410,146 @@ pub fn parse_light_falloff(bytes: &[u8]) -> Result<Option<LightFalloff>, DustLcc
     Ok(Some(LightFalloff { header: header.to_vec(), columns, rows, nodes }))
 }
 
+/// Reads and parses a `.lcc` file. A missing file is [`LccLoadError::Read`],
+/// malformed bytes are [`LccLoadError::Parse`], and a valid profile without a
+/// Uniform Light grid is [`LccLoadError::NoLightFalloff`].
+pub fn load_light_falloff(path: &Path) -> Result<LightFalloff, LccLoadError> {
+    let bytes = std::fs::read(path).map_err(|source| LccLoadError::Read { path: path.to_path_buf(), source })?;
+    match parse_light_falloff(&bytes) {
+        Ok(Some(grid)) => Ok(grid),
+        Ok(None) => Err(LccLoadError::NoLightFalloff),
+        Err(error) => Err(LccLoadError::Parse(error)),
+    }
+}
+
+fn encode_varint(mut value: usize) -> Vec<u8> {
+    if value < 0x40 {
+        return vec![value as u8];
+    }
+    let mut groups = Vec::new();
+    while value != 0 {
+        groups.push((value & 0x3F) as u8);
+        value >>= 6;
+    }
+    groups.reverse();
+    let last = groups.len() - 1;
+    groups[0] |= 0x40;
+    groups[last] |= 0x40;
+    groups
+}
+
+fn encode_chunk(name: &[u8], group: bool, payload: &[u8]) -> Vec<u8> {
+    let mut out = encode_varint(name.len());
+    out.extend_from_slice(name);
+    out.push(u8::from(group));
+    out.push(0);
+    if !group {
+        out.extend_from_slice(&encode_varint(payload.len()));
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
+fn encode_group(name: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = encode_chunk(name, true, &[]);
+    for child in children {
+        out.extend_from_slice(child);
+    }
+    out.push(0xFE);
+    out.push(0);
+    out
+}
+
+/// Encodes a decoded LightFalloff grid as a standalone `.lcc` container.
+///
+/// The output keeps the original 12/16-byte `Hdr` and writes the grid as the
+/// same direct `LightFalloff/Hdr` + `LightFalloff/Model` pair the reader accepts.
+/// It is deliberately limited to the Uniform Light payload; dust records are
+/// not synthesized.
+pub fn write_light_falloff(grid: &LightFalloff) -> Result<Vec<u8>, DustLccError> {
+    let node_count = usize::from(grid.columns) * usize::from(grid.rows);
+    if !matches!(grid.header.len(), 12 | 16)
+        || grid.columns < 2
+        || grid.rows < 2
+        || grid.nodes.len() != node_count
+    {
+        return Err(DustLccError::InvalidLightFalloff);
+    }
+    let mut model = Vec::with_capacity(node_count * 6);
+    for node in &grid.nodes {
+        model.extend_from_slice(&node.luminance.to_le_bytes());
+        model.extend_from_slice(&node.dx.to_le_bytes());
+        model.extend_from_slice(&node.dy.to_le_bytes());
+    }
+    let mut out = encode_chunk(b"XCon", false, &[0xBE, 0xBA, 0xFE, 0xCA, 0, 2]);
+    out.extend(encode_chunk(b"TYPE", false, LCC_TYPE));
+    out.extend(encode_chunk(b"VER", false, &[6, 0]));
+    out.extend(encode_group(
+        b"LightFalloff",
+        &[
+            encode_chunk(b"Hdr", false, &grid.header),
+            encode_chunk(b"Model", false, &model),
+        ],
+    ));
+    Ok(out)
+}
+
 /// Reads the `SpotRem` group of an `.lcc` byte image.
 ///
 /// A valid profile without that group yields empty fields.
 pub fn parse(bytes: &[u8]) -> Result<DustLcc, DustLccError> {
-    let mut dust = DustLcc::default();
-    parse_chunks(bytes, |group, name, _, payload, le| {
-        if matches!(group, Some(b"SpotRem" | b"SpotRemoval")) {
-            if name == b"SpotList" {
-                dust.patches = decode_records(payload, le)?;
-            } else if name == b"SpotData" {
-                dust.gain = payload.to_vec();
+    let (mut patches, mut gain) = (None, None);
+    let (mut list_ref, mut data_ref) = (None, None);
+    let mut bins: HashMap<u32, &[u8]> = HashMap::new();
+    let mut dat: Option<u32> = None;
+    let mut le = true;
+    parse_chunks(bytes, |groups, name, flags, payload, endian| {
+        le = endian;
+        if name == b"DAT" {
+            dat = varint_value(payload);
+            return Ok(());
+        }
+        if name == b"BIN" {
+            if let Some(id) = dat.take() {
+                bins.insert(id, payload);
             }
+            return Ok(());
+        }
+        if !groups.iter().any(|group| {
+            *group == b"SpotRem".as_slice() || *group == b"SpotRemoval".as_slice()
+        }) {
+            return Ok(());
+        }
+        let parent = groups.last().copied();
+        match name {
+            b"SpotList" if flags & 1 == 0 => patches = Some(decode_records(payload, endian)?),
+            b"SpotData" if flags & 1 == 0 => gain = Some(payload.to_vec()),
+            b"REF" if parent == Some(b"SpotList".as_slice()) => list_ref = varint_value(payload),
+            b"REF" if parent == Some(b"SpotData".as_slice()) => data_ref = varint_value(payload),
+            _ => {}
         }
         Ok(())
     })?;
-    Ok(dust)
+    if patches.is_none() {
+        if let Some(payload) = list_ref.and_then(|id| bins.get(&id).copied()) {
+            patches = Some(decode_records(payload, le)?);
+        }
+    }
+    if gain.is_none() {
+        gain = data_ref.and_then(|id| bins.get(&id).map(|payload| payload.to_vec()));
+    }
+    Ok(DustLcc { patches: patches.unwrap_or_default(), gain: gain.unwrap_or_default() })
 }
 
 fn parse_chunks<'a>(
     bytes: &'a [u8],
-    mut visit: impl FnMut(Option<&[u8]>, &[u8], u8, &'a [u8], bool) -> Result<(), DustLccError>,
+    mut visit: impl FnMut(&[&'a [u8]], &[u8], u8, &'a [u8], bool) -> Result<(), DustLccError>,
 ) -> Result<(), DustLccError> {
     if !bytes.starts_with(b"\x04XCon") {
         return Err(DustLccError::NotContainer);
     }
     let mut pos = 0usize;
-    let mut groups: Vec<&[u8]> = Vec::new();
+    let mut groups: Vec<(&'a [u8], usize)> = Vec::new();
     let mut first = true;
     let mut endian: Option<bool> = None;
     let mut kind_ok = false;
@@ -294,19 +562,32 @@ fn parse_chunks<'a>(
                 continue;
             }
             0xFE => {
+                let marker = pos;
                 pos += 1;
-                read_varint(bytes, &mut pos)?;
-                groups.pop();
+                skip_padding(bytes, &mut pos);
+                // `FE` is followed by the byte length of the block it closes,
+                // counted from the block's first byte through the `FE`.
+                let length = read_varint(bytes, &mut pos)?;
+                if length == 0 {
+                    groups.pop();
+                } else {
+                    let start = marker.saturating_sub(length.saturating_sub(1));
+                    while groups.last().is_some_and(|(_, section)| *section >= start) {
+                        groups.pop();
+                    }
+                }
                 continue;
             }
             _ => {}
         }
+        let chunk_start = pos;
         let name_len = read_varint(bytes, &mut pos)?;
         let name = bytes.get(pos..pos + name_len).ok_or(DustLccError::Truncated)?;
         pos += name_len;
         let flags = *bytes.get(pos).ok_or(DustLccError::Truncated)?;
         pos += 2;
         let payload = if flags & 1 == 0 {
+            skip_padding(bytes, &mut pos);
             let size = read_varint(bytes, &mut pos)?;
             let body = bytes.get(pos..pos + size).ok_or(DustLccError::Truncated)?;
             pos += size;
@@ -343,10 +624,11 @@ fn parse_chunks<'a>(
             }
             version_ok = true;
         }
-        visit(groups.last().copied(), name, flags, payload, endian.unwrap_or(true))?;
+        let parents: Vec<&[u8]> = groups.iter().map(|(group, _)| *group).collect();
+        visit(&parents, name, flags, payload, endian.unwrap_or(true))?;
 
         if flags & 1 != 0 || GROUPS.contains(&name) {
-            groups.push(name);
+            groups.push((name, chunk_start));
         }
     }
 
@@ -357,6 +639,17 @@ fn parse_chunks<'a>(
         return Err(DustLccError::MissingVersion);
     }
     Ok(())
+}
+
+fn skip_padding(bytes: &[u8], pos: &mut usize) {
+    while bytes.get(*pos) == Some(&0xFF) {
+        *pos += 1;
+    }
+}
+
+fn varint_value(bytes: &[u8]) -> Option<u32> {
+    let mut pos = 0;
+    read_varint(bytes, &mut pos).ok().and_then(|value| u32::try_from(value).ok())
 }
 
 /// Where Capture One's Session writer puts an LCC: `<raw name>.<lcc id>.lcc`
@@ -510,8 +803,9 @@ impl crate::LensCorrection {
     /// The `ZLENSDUSTREMOVALENABLED` gate is left alone: a profile loaded while
     /// the gate is off stays inert until the variant turns it on.
     pub fn load_dust_lcc(&mut self, bytes: &[u8]) -> Result<usize, DustLccError> {
-        self.uniform_light_grid = parse_light_falloff(bytes).ok().flatten().map(std::sync::Arc::new);
+        let grid = parse_light_falloff(bytes).ok().flatten().map(std::sync::Arc::new);
         let dust = parse(bytes)?;
+        self.uniform_light_grid = grid;
         let count = dust.patches.len();
         self.dust_patches = dust.patches;
         self.dust_gain = dust.gain;
@@ -615,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_grid_and_unsupported_references_without_breaking_dust() {
+    fn rejects_bad_grid_and_missing_references_without_breaking_dust() {
         let header = [2, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0];
         for (bad_header, len) in [(header, 23), (header, 30), ([0; 12], 24)] {
             let bytes = light_falloff_profile(true, &bad_header, &[0; 30][..len]);
@@ -626,7 +920,7 @@ mod tests {
             chunk(b"Hdr", false, &header),
             chunk(b"REF", false, &[1]),
         ])]);
-        assert_eq!(parse_light_falloff(&bytes), Err(DustLccError::UnsupportedLightFalloff));
+        assert_eq!(parse_light_falloff(&bytes), Err(DustLccError::InvalidLightFalloff));
         assert_eq!(parse(&bytes), Ok(DustLcc::default()));
         let bytes = light_falloff_profile(false, &header, &[0; 24]);
         assert_eq!(parse_light_falloff(&bytes), Err(DustLccError::UnsupportedLightFalloff));
@@ -783,5 +1077,220 @@ mod tests {
         );
         assert!(resolve_lcc_path(folder, SidecarRow { name: "prof", kind: 0 }).is_none());
         assert!(resolve_lcc_path(folder, SidecarRow { name: "", kind: 1 }).is_none());
+    }
+
+    /// `real-lightfalloff-24x16.lcc` is a prefix of a profile that Capture One
+    /// itself wrote through `ICP_CreateLCCBuffer` from a Sony A7 II ARW. It is
+    /// not a hand-built test vector: the LightFalloff `Hdr` is a direct chunk,
+    /// the `Model` is an `REF`/`DAT`/`BIN` block, and C1's writer pads the
+    /// lengths with `0xFF`.
+    /// Read at run time: the fixture is git-ignored, so `include_bytes!` would
+    /// make a clean checkout fail to compile.
+    fn real_lcc() -> Option<Vec<u8>> {
+        crate::testdata::bytes("testdata/real-lightfalloff-24x16.lcc")
+    }
+
+    #[test]
+    fn real_capture_one_profile_resolves_the_referenced_24x16_grid() {
+        let Some(real_lcc) = real_lcc() else { return };
+        let grid = parse_light_falloff(&real_lcc).unwrap().unwrap();
+        assert_eq!((grid.columns, grid.rows), (24, 16));
+        assert_eq!(grid.header.len(), 16);
+        assert_eq!(grid.nodes.len(), 24 * 16);
+        assert_eq!(grid.nodes[0], LightFalloffNode { luminance: 44_209, dx: 679, dy: 1_239 });
+        assert_eq!(grid.nodes[23], LightFalloffNode { luminance: 13_310, dx: -1_307, dy: 420 });
+        assert_eq!(
+            grid.nodes[23 + 15 * 24],
+            LightFalloffNode { luminance: 15_888, dx: -831, dy: -686 }
+        );
+        assert_eq!(
+            grid.nodes[12 + 8 * 24],
+            LightFalloffNode { luminance: 33_470, dx: -1_181, dy: -308 }
+        );
+        assert_eq!(parse(&real_lcc), Ok(DustLcc::default()), "the prefix has no SpotRemoval");
+    }
+
+    #[test]
+    fn real_capture_one_uniform_light_gains_match_the_reference() {
+        let Some(real_lcc) = real_lcc() else { return };
+        let grid = parse_light_falloff(&real_lcc).unwrap().unwrap();
+        let stage = UniformLight::prepare(Some(&grid), true, 1.0, LightFalloffLimit::Uncapped)
+            .expect("a real grid and a positive strength prepare a consumer");
+        let gains = [
+            ([124, 124], 1.949_046_560),
+            ([5_874, 124], 26.623_330_247),
+            ([124, 3_874], 1.583_332_076),
+            ([5_874, 3_874], 21.405_681_682),
+            ([3_124, 2_124], 4.835_555_524),
+            ([3_000, 2_000], 4.538_449_314),
+            ([1_124, 1_000], 1.228_025_630),
+        ];
+        for (source, expected) in gains {
+            let got = stage.gain(source, [0, 0], 1.0);
+            assert!(
+                (got - expected).abs() <= expected * 1e-5,
+                "gain at {source:?}: got {got}, want {expected}"
+            );
+            let rgb = stage.apply_source_rgb([0.125, 0.25, 0.75], source.map(|value| value as f32));
+            for (channel, value) in rgb.into_iter().enumerate() {
+                let want = [0.125, 0.25, 0.75][channel] * expected;
+                assert!((value - want).abs() <= want * 1e-5, "{source:?} channel {channel}");
+            }
+        }
+        assert!(UniformLight::prepare(Some(&grid), false, 1.0, LightFalloffLimit::Soft).is_none());
+        assert!(UniformLight::prepare(Some(&grid), true, 0.0, LightFalloffLimit::Soft).is_none());
+        assert!(UniformLight::prepare(None, true, 1.0, LightFalloffLimit::Soft).is_none());
+    }
+
+    /// A 2x2 grid whose top-left corner sits `max_level` above the field, i.e.
+    /// `max_level/8192` EV of calibrated correction, with unit node spacing.
+    fn pole_grid(max_level: u16, flags: u16) -> LightFalloff {
+        let [flag_lo, flag_hi] = flags.to_le_bytes();
+        let header =
+            [16u8, 0, 2, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, flag_lo, flag_hi].to_vec();
+        let half = max_level / 2;
+        LightFalloff {
+            header,
+            columns: 2,
+            rows: 2,
+            nodes: vec![
+                LightFalloffNode { luminance: 0, dx: 0, dy: 0 },
+                LightFalloffNode { luminance: half, dx: 0, dy: 0 },
+                LightFalloffNode { luminance: half, dx: 0, dy: 0 },
+                LightFalloffNode { luminance: max_level, dx: 0, dy: 0 },
+            ],
+        }
+    }
+
+    /// The 0/50/100 slider positions of the shipped 0..120 parameter. Half
+    /// strength is the square root of the full gain because the kernel
+    /// multiplies the EV, not the gain.
+    #[test]
+    fn uniform_light_amount_vectors_blend_the_calibrated_ev() {
+        let grid = pole_grid(16_384, 1);
+        assert_eq!(
+            strength_from_amount(0.0, LightFalloffMode::Soft),
+            (0.0, LightFalloffLimit::Soft)
+        );
+        assert_eq!(
+            strength_from_amount(50.0, LightFalloffMode::Soft),
+            (0.5, LightFalloffLimit::Soft)
+        );
+        assert_eq!(
+            strength_from_amount(100.0, LightFalloffMode::Soft),
+            (1.0, LightFalloffLimit::Soft)
+        );
+        assert_eq!(
+            strength_from_amount(120.0, LightFalloffMode::Hard),
+            (1.2, LightFalloffLimit::Hard)
+        );
+        assert_eq!(
+            strength_from_amount(100.0, LightFalloffMode::Uncapped).1,
+            LightFalloffLimit::Uncapped
+        );
+        assert!(
+            UniformLight::prepare(
+                Some(&grid),
+                true,
+                strength_from_amount(0.0, grid.mode()).0,
+                strength_from_amount(0.0, grid.mode()).1
+            )
+            .is_none(),
+            "amount 0 is identity"
+        );
+        let half =
+            UniformLight::prepare(Some(&grid), true, 0.5, grid.mode().limit())
+                .expect("amount 50 opens the gate");
+        let full =
+            UniformLight::prepare(Some(&grid), true, 1.0, grid.mode().limit())
+                .expect("amount 100 opens the gate");
+        // Corner EV, then the pixel that reaches it: top-left 2.0, the other
+        // two corners 1.0, bottom-right 0.0.
+        let cases = [([0u32, 0u32], 2.0f32), ([1, 0], 1.0), ([0, 1], 1.0), ([1, 1], 0.0)];
+        for (pixel, ev) in cases {
+            let want_full = ev.exp2();
+            let want_half = (ev * 0.5).exp2();
+            for (stage, want) in [(&full, want_full), (&half, want_half)] {
+                let got = stage.gain([0, 0], pixel, 1.0);
+                assert!((got - want).abs() <= want * 1e-6, "pixel {pixel:?}: {got} != {want}");
+            }
+            // A linear-toward-identity blend would be `1 + (g-1)/2`; make sure
+            // the two laws are distinguishable at the strongest corner.
+            if ev > 0.0 {
+                assert!((half.gain([0, 0], pixel, 1.0) - (1.0 + (want_full - 1.0) / 2.0)).abs() > 1e-3);
+            }
+        }
+    }
+
+    /// Soft has three tiers in the shipped kernel: below 3 EV nothing is
+    /// limited, 3..5 EV subtracts `0.25*(ev-3)^2`, above 5 EV it pins at 4.
+    #[test]
+    fn uniform_light_soft_limit_keeps_its_three_tiers() {
+        // max_level/8192 is the corner EV; 8192 is one stop.
+        for (max_level, ev) in [(16_384u16, 2.0f32), (32_768, 4.0), (40_960, 5.0), (49_152, 6.0)] {
+            let grid = pole_grid(max_level, 1);
+            let stage = UniformLight::prepare(Some(&grid), true, 1.0, LightFalloffLimit::Soft)
+                .expect("soft stage");
+            let want_ev = if ev > 3.0 {
+                if ev > 5.0 { 4.0 } else { ev - 0.25 * (ev - 3.0) * (ev - 3.0) }
+            } else {
+                ev
+            };
+            let got = stage.gain([0, 0], [0, 0], 1.0);
+            let want = want_ev.exp2();
+            assert!((got - want).abs() <= want * 1e-6, "{ev} EV -> {got}, want {want}");
+        }
+        let hard_grid = pole_grid(32_768, 0);
+        let hard = UniformLight::prepare(Some(&hard_grid), true, 1.0, LightFalloffLimit::Hard)
+            .expect("hard stage");
+        assert!((hard.gain([0, 0], [0, 0], 1.0) - 8.0).abs() <= 8.0 * 1e-6);
+        let uncapped_grid = pole_grid(49_152, 1);
+        let uncapped =
+            UniformLight::prepare(Some(&uncapped_grid), true, 1.0, LightFalloffLimit::Uncapped)
+                .expect("uncapped stage");
+        assert!((uncapped.gain([0, 0], [0, 0], 1.0) - 64.0).abs() <= 64.0 * 1e-6);
+    }
+
+    /// The only persisted mode input is the calibration's `Hdr` flags word.
+    #[test]
+    fn uniform_light_mode_comes_from_the_lcc_flags_word() {
+        let soft = pole_grid(49_152, 1);
+        assert_eq!(soft.flags(), Some(1));
+        assert_eq!(soft.mode(), LightFalloffMode::Soft);
+        let hard = pole_grid(49_152, 0);
+        assert_eq!(hard.flags(), Some(0));
+        assert_eq!(hard.mode(), LightFalloffMode::Hard);
+        // Legacy 12-byte headers carry no flags word and keep the soft knee.
+        let legacy = LightFalloff {
+            header: vec![0; 12],
+            columns: 2,
+            rows: 2,
+            nodes: soft.nodes.clone(),
+        };
+        assert_eq!(legacy.flags(), None);
+        assert_eq!(legacy.mode(), LightFalloffMode::Soft);
+        // The mode decides both the strength scale and the limiter.
+        assert_eq!(
+            strength_from_amount(100.0, soft.mode()),
+            (1.0, LightFalloffLimit::Soft)
+        );
+        assert_eq!(
+            strength_from_amount(100.0, hard.mode()),
+            (1.0, LightFalloffLimit::Hard)
+        );
+    }
+
+    #[test]
+    fn uniform_light_unknown_kernel_modes_fall_back_to_soft() {
+        for (index, want) in [
+            (0, LightFalloffMode::Soft),
+            (1, LightFalloffMode::Hard),
+            (2, LightFalloffMode::Uncapped),
+        ] {
+            assert_eq!(LightFalloffMode::from_kernel_index(index), want);
+            assert_eq!(want.kernel_index(), index);
+        }
+        assert_eq!(LightFalloffMode::from_kernel_index(3), LightFalloffMode::Soft);
+        assert_eq!(LightFalloffMode::from_kernel_index(-1), LightFalloffMode::Soft);
     }
 }

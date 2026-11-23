@@ -29,17 +29,37 @@ const MIN_ORT_API_VERSION: u32 = 18;
 const OPT_ENABLE_ALL: c_int = 99;
 #[cfg(windows)]
 const ORT_RUNTIME_DIRS_ENV: &str = "AURORA_ORT_RUNTIME_DIRS";
+/// Project-relative GPU runtime. A bare `onnxruntime.dll` is never attempted:
+/// Windows ships an incompatible 1.17 build in System32 and it wins the search.
+const PROJECT_ORT_RELATIVE: &str =
+    "90_work/gpu-runtime/python/onnxruntime/capi/onnxruntime.dll";
+/// Comma-separated provider order, e.g. `tensorrt,cuda,cpu`.
+const PROVIDERS_ENV: &str = "AURORA_ORT_PROVIDERS";
+/// Extra DLL directories (semicolon-separated) for cuDNN / TensorRT / CUDA.
+const DLL_DIRS_ENV: &str = "AURORA_GPU_DLL_DIRS";
 #[cfg(windows)]
 const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
 #[cfg(windows)]
 const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
 #[cfg(windows)]
 const CUDA_RUNTIME_DLLS: &[&str] = &[
+    "cudart64_13.dll",
+    "cublasLt64_13.dll",
+    "cublas64_13.dll",
     "cudart64_12.dll",
     "cublasLt64_12.dll",
     "cublas64_12.dll",
+    "cufft64_12.dll",
     "cufft64_11.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_ops64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_graph64_9.dll",
     "cudnn64_9.dll",
+    "cudnn_engines_tensor_ir64_9.dll",
 ];
 
 // OrtApi field indices (see module comment).
@@ -149,13 +169,32 @@ fn provider_symbol(provider: Provider) -> Option<&'static str> {
     }
 }
 
-/// GPU providers in preference order, then CPU as the fallback every session
-/// ends on. Kept pure so the order is testable without a GPU build.
-fn providers_from(has_tensor_rt: bool, has_cuda: bool, has_direct_ml: bool) -> Vec<Provider> {
-    let mut out = Vec::new();
-    if has_tensor_rt {
-        out.push(Provider::TensorRt);
+/// Symbol spellings to try when appending a provider. ORT <= 1.22 exports
+/// `_TensorRT`, ORT >= 1.23 exports `_Tensorrt`; `GetProcAddress` is case
+/// sensitive, so both are probed and the PE export table is scanned
+/// case-insensitively on Windows.
+fn append_symbol_candidates(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::TensorRt => &[
+            "OrtSessionOptionsAppendExecutionProvider_Tensorrt",
+            "OrtSessionOptionsAppendExecutionProvider_TensorRT",
+        ],
+        Provider::Cuda => &["OrtSessionOptionsAppendExecutionProvider_CUDA"],
+        Provider::DirectMl => &["OrtSessionOptionsAppendExecutionProvider_DML"],
+        Provider::Cpu => &[],
     }
+}
+
+fn export_name_matches(export: &str, wanted: &str) -> bool {
+    export.eq_ignore_ascii_case(wanted)
+}
+
+/// Default provider order: CUDA first for interactive latency, then DirectML,
+/// then CPU. TensorRT is deliberately absent: a cold engine build measured
+/// 40-190 s per model (2026-11-23, RTX 4070 Ti), so it is prepended only when
+/// a cache is present or the operator asks for it. Kept pure for tests.
+fn providers_from(has_cuda: bool, has_direct_ml: bool) -> Vec<Provider> {
+    let mut out = Vec::new();
     if has_cuda {
         out.push(Provider::Cuda);
     }
@@ -166,11 +205,14 @@ fn providers_from(has_tensor_rt: bool, has_cuda: bool, has_direct_ml: bool) -> V
     out
 }
 
-/// `AURORA_AI_PROVIDER` pins the provider, for A/B measurement and for machines
-/// where the automatic pick misbehaves. Names are case-insensitive; an
-/// unrecognised name means automatic.
-fn forced_provider() -> Option<Provider> {
-    let raw = std::env::var("AURORA_AI_PROVIDER").ok()?;
+fn with_tensor_rt_first(mut providers: Vec<Provider>) -> Vec<Provider> {
+    if !providers.contains(&Provider::TensorRt) {
+        providers.insert(0, Provider::TensorRt);
+    }
+    providers
+}
+
+fn provider_from_name(raw: &str) -> Option<Provider> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "tensorrt" | "trt" => Some(Provider::TensorRt),
         "cuda" => Some(Provider::Cuda),
@@ -178,6 +220,94 @@ fn forced_provider() -> Option<Provider> {
         "cpu" => Some(Provider::Cpu),
         _ => None,
     }
+}
+
+/// `AURORA_ORT_PROVIDERS=tensorrt,cuda,cpu` wins over `AURORA_AI_PROVIDER`.
+/// CPU is always kept as the final fallback; unknown names are logged and
+/// skipped rather than silently disabling AI.
+fn providers_from_override(raw: &str) -> Vec<Provider> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        if part.trim().is_empty() {
+            continue;
+        }
+        match provider_from_name(part) {
+            Some(Provider::Cpu) => {}
+            Some(provider) if !out.contains(&provider) => out.push(provider),
+            Some(_) => {}
+            None => log::warn!("{PROVIDERS_ENV}: ignoring unknown provider {:?}", part.trim()),
+        }
+    }
+    out.push(Provider::Cpu);
+    out
+}
+
+fn provider_labels(providers: &[Provider]) -> Vec<&'static str> {
+    providers.iter().map(|provider| provider.label()).collect()
+}
+
+/// Directory the operator pre-populated with TensorRT engine files.
+fn trt_cache_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("AURORA_TRT_CACHE_DIR")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(raw);
+    dir.is_dir().then_some(dir)
+}
+
+/// ORT's TensorRT EP writes `<prefix>.engine`, `.profile` and `.timing` files.
+fn dir_has_engine_cache(dir: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth > 0 && dir_has_engine_cache(&path, depth - 1) {
+                return true;
+            }
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if name.ends_with(".engine") || name.ends_with(".profile") || name.ends_with(".timing") {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `AURORA_TRT_CACHE_DIR` exists, is non-empty and already holds an
+/// engine/profile/timing artifact. Cached once: `available_providers` runs per
+/// session and should not rescan the disk.
+pub(crate) fn trt_cache_present() -> bool {
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    *PRESENT.get_or_init(|| trt_cache_dir().is_some_and(|dir| dir_has_engine_cache(&dir, 2)))
+}
+
+pub(crate) fn trt_first_allowed() -> bool {
+    if forced_provider() == Some(Provider::TensorRt) {
+        return true;
+    }
+    if std::env::var(PROVIDERS_ENV)
+        .ok()
+        .is_some_and(|raw| raw.split(',').any(|part| provider_from_name(part) == Some(Provider::TensorRt)))
+    {
+        return true;
+    }
+    trt_cache_present()
+}
+
+/// `AURORA_AI_PROVIDER` pins the provider, for A/B measurement and for machines
+/// where the automatic pick misbehaves. Names are case-insensitive; an
+/// unrecognised name means automatic.
+fn forced_provider() -> Option<Provider> {
+    let raw = std::env::var("AURORA_AI_PROVIDER").ok()?;
+    provider_from_name(&raw)
 }
 
 /// Narrows a probed list to the forced provider. An unavailable forced provider
@@ -242,7 +372,12 @@ impl Runtime {
     }
 
     unsafe fn load() -> Result<Self> {
-        let (library, handle) = unsafe { open_library()? };
+        let library = resolve_library()?;
+        let dll_dirs = configure_gpu_dll_directories(&library);
+        if !dll_dirs.is_empty() {
+            log::info!("GPU DLL dirs: {dll_dirs:?}");
+        }
+        let handle = unsafe { load_library(&library)? };
         log::info!("ONNX Runtime from {}", library.display());
         let symbol = CString::new("OrtGetApiBase")?;
         #[cfg(target_os = "linux")]
@@ -297,7 +432,7 @@ impl Runtime {
         let mut memory_info = ptr::null_mut();
         unsafe { check(allocator_info(allocator, &mut memory_info), api)? };
         #[cfg(windows)]
-        let (runtime_modules, cuda_runtime_error) = unsafe { preload_cuda_runtime() };
+        let (runtime_modules, cuda_runtime_error) = unsafe { preload_cuda_runtime(&library) };
         Ok(Self {
             api,
             env,
@@ -332,28 +467,173 @@ impl Runtime {
         }
     }
 
+    /// Case-insensitive lookup in the loaded module's PE export table.
+    #[cfg(windows)]
+    unsafe fn symbol_ignore_case(&self, wanted: &str) -> *mut c_void {
+        let base = self.handle as *const u8;
+        if base.is_null() {
+            return ptr::null_mut();
+        }
+        let e_lfanew = unsafe { *(base.add(0x3C) as *const u32) } as usize;
+        let nt = unsafe { base.add(e_lfanew) };
+        if unsafe { *(nt as *const u32) } != 0x0000_4550 {
+            return ptr::null_mut();
+        }
+        let optional = unsafe { nt.add(24) };
+        let magic = unsafe { *(optional as *const u16) };
+        let (export_rva, export_size) = match magic {
+            0x20b => (
+                unsafe { *(optional.add(112) as *const u32) },
+                unsafe { *(optional.add(116) as *const u32) },
+            ),
+            0x10b => (
+                unsafe { *(optional.add(96) as *const u32) },
+                unsafe { *(optional.add(100) as *const u32) },
+            ),
+            _ => return ptr::null_mut(),
+        };
+        if export_rva == 0 || export_size == 0 {
+            return ptr::null_mut();
+        }
+        let export = unsafe { base.add(export_rva as usize) };
+        let name_count = unsafe { *(export.add(24) as *const u32) } as usize;
+        let names = unsafe { *(export.add(32) as *const u32) } as usize;
+        let ordinals = unsafe { *(export.add(36) as *const u32) } as usize;
+        let functions = unsafe { *(export.add(28) as *const u32) } as usize;
+        for index in 0..name_count {
+            let name_rva = unsafe { *(base.add(names + index * 4) as *const u32) } as usize;
+            if name_rva == 0 {
+                continue;
+            }
+            let entry = unsafe { CStr::from_ptr(base.add(name_rva) as *const c_char) };
+            let Ok(entry) = entry.to_str() else {
+                continue;
+            };
+            if !export_name_matches(entry, wanted) {
+                continue;
+            }
+            let ordinal = unsafe { *(base.add(ordinals + index * 2) as *const u16) } as usize;
+            let function_rva =
+                unsafe { *(base.add(functions + ordinal * 4) as *const u32) } as usize;
+            if function_rva == 0 {
+                return ptr::null_mut();
+            }
+            return unsafe { base.add(function_rva) } as *mut c_void;
+        }
+        ptr::null_mut()
+    }
+
+    /// First append symbol this library really exports for `provider`.
+    fn provider_append_symbol(&self, provider: Provider) -> *mut c_void {
+        for candidate in append_symbol_candidates(provider) {
+            let pointer = self.symbol(candidate);
+            if !pointer.is_null() {
+                return pointer;
+            }
+            #[cfg(windows)]
+            {
+                let pointer = unsafe { self.symbol_ignore_case(candidate) };
+                if !pointer.is_null() {
+                    return pointer;
+                }
+            }
+        }
+        ptr::null_mut()
+    }
+
     /// Providers this library can really append. The C API exports one
     /// `OrtSessionOptionsAppendExecutionProvider_<name>` symbol per provider it
     /// was built with, so probing the symbols reflects the build, not a wish.
     pub(crate) fn available_providers(&self) -> Vec<Provider> {
-        let has = |provider: Provider| match provider_symbol(provider) {
-            Some(name) => !self.symbol(name).is_null(),
-            None => true,
-        };
-        let probed =
-            providers_from(has(Provider::TensorRt), has(Provider::Cuda), has(Provider::DirectMl));
-        let forced = forced_provider();
-        let chosen = apply_override(probed.clone(), forced);
-        if let Some(forced) = forced {
-            if probed.contains(&forced) {
-                log::info!("AURORA_AI_PROVIDER pins {}", forced.label());
-            } else {
-                log::warn!(
-                    "AURORA_AI_PROVIDER asked for {}, which this ONNX Runtime does not export; \
-                     using CPU instead",
-                    forced.label()
-                );
+        let has_trt = !self.provider_append_symbol(Provider::TensorRt).is_null();
+        let has_cuda = !self.provider_append_symbol(Provider::Cuda).is_null();
+        let has_dml = !self.provider_append_symbol(Provider::DirectMl).is_null();
+        let base = providers_from(has_cuda, has_dml);
+        let mut exported = base.clone();
+        if has_trt {
+            exported.insert(0, Provider::TensorRt);
+        }
+
+        let override_raw = std::env::var(PROVIDERS_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let explicit_trt = override_raw.as_deref().is_some_and(|raw| {
+            raw.split(',')
+                .any(|part| provider_from_name(part) == Some(Provider::TensorRt))
+        }) || forced_provider() == Some(Provider::TensorRt);
+        let cache_present = trt_cache_present();
+
+        let (chosen, trt_reason) = match override_raw {
+            Some(raw) => {
+                let requested = providers_from_override(&raw);
+                let mut selected = Vec::with_capacity(requested.len());
+                for provider in requested {
+                    if provider == Provider::Cpu || exported.contains(&provider) {
+                        selected.push(provider);
+                    } else {
+                        log::warn!(
+                            "{PROVIDERS_ENV} asked for {}, which this ONNX Runtime does not export",
+                            provider.label()
+                        );
+                    }
+                }
+                let reason = if selected.contains(&Provider::TensorRt) {
+                    "explicit"
+                } else {
+                    "not-requested"
+                };
+                (selected, reason)
             }
+            None => {
+                let mut selected = base.clone();
+                let reason = if has_trt && (cache_present || explicit_trt) {
+                    selected = with_tensor_rt_first(selected);
+                    if cache_present { "cache" } else { "explicit" }
+                } else {
+                    "no-cache"
+                };
+                let chosen = apply_override(selected.clone(), forced_provider());
+                if let Some(forced) = forced_provider() {
+                    if chosen != selected {
+                        log::info!("AURORA_AI_PROVIDER pins {}", forced.label());
+                    } else if !exported.contains(&forced) {
+                        log::warn!(
+                            "AURORA_AI_PROVIDER asked for {}, which this ONNX Runtime does not export; \
+                             using CPU instead",
+                            forced.label()
+                        );
+                    }
+                }
+                (chosen, reason)
+            }
+        };
+        log::info!(
+            "ONNX Runtime providers: exported {:?}, selected {:?}",
+            provider_labels(&exported),
+            provider_labels(&chosen)
+        );
+        for provider in [
+            Provider::TensorRt,
+            Provider::Cuda,
+            Provider::DirectMl,
+            Provider::Cpu,
+        ] {
+            let state = match provider {
+                Provider::Cpu => "enabled (fallback)",
+                Provider::TensorRt if !has_trt => "not exported by this ONNX Runtime",
+                Provider::TensorRt if chosen.contains(&Provider::TensorRt) => match trt_reason {
+                    "cache" => "enabled first (engine cache present)",
+                    _ => "enabled first (explicit request)",
+                },
+                Provider::TensorRt => {
+                    "skipped (no engine cache; set AURORA_TRT_CACHE_DIR or \
+                     AURORA_ORT_PROVIDERS=tensorrt,...)"
+                }
+                _ if !exported.contains(&provider) => "not exported by this ONNX Runtime",
+                _ if chosen.contains(&provider) => "enabled",
+                _ => "available but not selected",
+            };
+            log::info!("provider {}: {}", provider.label(), state);
         }
         chosen
     }
@@ -362,17 +642,27 @@ impl Runtime {
         if provider == Provider::Cpu {
             return Ok(());
         }
-        let Some(name) = provider_symbol(provider) else {
-            return Ok(());
-        };
-        let pointer = self.symbol(name);
+        let pointer = self.provider_append_symbol(provider);
         if pointer.is_null() {
             bail!("{} is not exported by this ONNX Runtime", provider.label());
         }
         let append: unsafe extern "C" fn(*mut c_void, c_int) -> Status =
             unsafe { std::mem::transmute_copy(&pointer) };
-        unsafe { check(append(options, 0), self.api) }
-            .with_context(|| format!("enabling {}", provider.label()))
+        let result = unsafe { check(append(options, 0), self.api) }
+            .with_context(|| format!("enabling {}", provider.label()));
+        if result.is_ok() {
+            match provider {
+                Provider::TensorRt => log::info!(
+                    "TensorRT EP enabled on device 0 (legacy options: fp16=0, int8=0; \
+                     strict FP32 needs NVIDIA_TF32_OVERRIDE=0 before process start)"
+                ),
+                Provider::Cuda => log::info!(
+                    "CUDA EP enabled on device 0 (TF32 follows NVIDIA_TF32_OVERRIDE)"
+                ),
+                _ => {}
+            }
+        }
+        result
     }
 
     fn provider_blocker(&self, provider: Provider) -> Option<&str> {
@@ -393,15 +683,11 @@ impl Runtime {
     /// stricter than `open_session`: callers that require a GPU cannot receive
     /// a CPU session by accident.
     pub(crate) fn open_session_on(&self, path: &Path, providers: &[Provider]) -> Result<Session> {
-        let mut last = None;
+        let mut failures: Vec<String> = Vec::new();
         for &provider in providers {
             if provider != Provider::Cpu {
-                let Some(symbol) = provider_symbol(provider) else {
-                    last = Some(anyhow!("{} has no provider entry point", provider.label()));
-                    continue;
-                };
-                if self.symbol(symbol).is_null() {
-                    last = Some(anyhow!(
+                if self.provider_append_symbol(provider).is_null() {
+                    failures.push(format!(
                         "{} is not exported by this ONNX Runtime",
                         provider.label()
                     ));
@@ -414,7 +700,7 @@ impl Runtime {
                     provider.label(),
                     path.display()
                 );
-                last = Some(anyhow!("{} provider unavailable: {blocker}", provider.label()));
+                failures.push(format!("{} provider unavailable: {blocker}", provider.label()));
                 continue;
             }
             let cached = optimized_model_cache_path(path, provider, graph_optimization_level())
@@ -439,23 +725,37 @@ impl Runtime {
                         match self.open_session_with(path, provider, false) {
                             Ok(session) => return Ok(session),
                             Err(rebuild_err) => {
-                                last = Some(rebuild_err.context("rebuilding the optimized model cache"));
+                                let reason = format!(
+                                    "rebuilding the optimized model cache: {rebuild_err:#}"
+                                );
+                                log::warn!(
+                                    "{} rebuild failed for {}: {reason}",
+                                    provider.label(),
+                                    path.display()
+                                );
+                                failures.push(format!("{}: {reason}", provider.label()));
                             }
                         }
                     } else {
-                        last = Some(err);
-                    }
-                    if provider != Provider::Cpu {
+                        let reason = format!("{err:#}");
                         log::warn!(
-                            "{} session failed for {}; trying the next requested provider",
+                            "{} session failed for {}: {reason}",
                             provider.label(),
                             path.display(),
                         );
+                        failures.push(format!("{}: {reason}", provider.label()));
                     }
                 }
             }
         }
-        Err(last.unwrap_or_else(|| anyhow!("no requested execution provider available")))
+        if failures.is_empty() {
+            return Err(anyhow!("no requested execution provider available"));
+        }
+        Err(anyhow!(
+            "no requested execution provider could open {} ({})",
+            path.display(),
+            failures.join("; ")
+        ))
     }
 
     pub(crate) fn open_cpu_session(&self, path: &Path) -> Result<Session> {
@@ -688,21 +988,24 @@ fn runtime_dirs_from(raw: &std::ffi::OsStr) -> Result<Vec<PathBuf>> {
 }
 
 #[cfg(windows)]
-unsafe fn preload_cuda_runtime() -> (Vec<*mut c_void>, Option<String>) {
+unsafe fn preload_cuda_runtime(library: &Path) -> (Vec<*mut c_void>, Option<String>) {
     if forced_provider() == Some(Provider::Cpu) {
         return (Vec::new(), None);
     }
-    let Some(raw) = std::env::var_os(ORT_RUNTIME_DIRS_ENV) else {
+    let dirs = match std::env::var_os(ORT_RUNTIME_DIRS_ENV) {
+        Some(raw) => match runtime_dirs_from(&raw) {
+            Ok(dirs) => dirs,
+            Err(error) => {
+                let message = format!("{error:#}");
+                log::warn!("CUDA runtime preload disabled: {message}");
+                return (Vec::new(), Some(message));
+            }
+        },
+        None => derived_runtime_dirs(library),
+    };
+    if dirs.is_empty() {
         return (Vec::new(), None);
-    };
-    let dirs = match runtime_dirs_from(&raw) {
-        Ok(dirs) => dirs,
-        Err(error) => {
-            let message = format!("{error:#}");
-            log::warn!("CUDA runtime preload disabled: {message}");
-            return (Vec::new(), Some(message));
-        }
-    };
+    }
 
     let mut modules = Vec::new();
     let mut failures = Vec::new();
@@ -712,7 +1015,6 @@ unsafe fn preload_cuda_runtime() -> (Vec<*mut c_void>, Option<String>) {
             .map(|dir| dir.join(name))
             .find(|path| path.is_file())
         else {
-            failures.push(format!("{name} was not found in {ORT_RUNTIME_DIRS_ENV}"));
             continue;
         };
         let path_wide = ort_path(&path);
@@ -731,25 +1033,72 @@ unsafe fn preload_cuda_runtime() -> (Vec<*mut c_void>, Option<String>) {
         }
     }
 
+    if modules.is_empty() {
+        let message = if failures.is_empty() {
+            "no CUDA runtime DLLs were found next to the ONNX Runtime".to_string()
+        } else {
+            format!("CUDA runtime preload failed: {}", failures.join("; "))
+        };
+        log::warn!("{message}");
+        return (Vec::new(), Some(message));
+    }
     if failures.is_empty() {
         return (modules, None);
     }
-    for module in modules.drain(..).rev() {
-        unsafe { FreeLibrary(module) };
-    }
-    let message = format!("CUDA runtime preload failed: {}", failures.join("; "));
-    log::warn!("{message}");
-    (Vec::new(), Some(message))
+    log::warn!("CUDA runtime preload partially failed: {}", failures.join("; "));
+    (modules, None)
 }
 
-unsafe fn open_library() -> Result<(PathBuf, *mut c_void)> {
+#[cfg(windows)]
+fn derived_runtime_dirs(library: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(capi) = library.parent() {
+        dirs.push(capi.to_path_buf());
+        if let Some(python_root) = capi.parent().and_then(Path::parent) {
+            dirs.push(python_root.join("nvidia").join("cudnn").join("bin"));
+            dirs.push(python_root.join("tensorrt_libs"));
+        }
+    }
+    if let Some(cuda) = std::env::var_os("CUDA_PATH") {
+        let cuda = PathBuf::from(cuda);
+        dirs.push(cuda.join("bin").join("x64"));
+        dirs.push(cuda.join("bin"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| dir.is_dir() && seen.insert(dir.clone()));
+    dirs
+}
+
+/// Every path is explicit. A bare `onnxruntime.dll` is never attempted because
+/// `C:\Windows\System32\onnxruntime.dll` (1.17, API 17) would win the search and
+/// is too old for this module (`MIN_ORT_API_VERSION` is 18).
+fn library_candidates() -> Vec<PathBuf> {
+    library_candidates_from(|key| std::env::var_os(key), &project_roots())
+}
+
+fn library_candidates_from(
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+    roots: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path) = std::env::var_os("AURORA_ORT_LIB") {
+    if let Some(path) = get("AURORA_ORT_LIB") {
         candidates.push(PathBuf::from(path));
     }
     if cfg!(windows) {
-        candidates.extend(crate::aimask::c1_roots().into_iter().map(|r| r.join("onnxruntime.dll")));
-        candidates.push(PathBuf::from("onnxruntime.dll"));
+        for root in roots {
+            candidates.push(root.join(PROJECT_ORT_RELATIVE));
+        }
+        if let Some(dir) = get("AURORA_ORT_DIR") {
+            let dir = PathBuf::from(dir);
+            candidates.push(dir.join("onnxruntime.dll"));
+            candidates.push(dir.join("onnxruntime").join("capi").join("onnxruntime.dll"));
+            candidates.push(
+                dir.join("python")
+                    .join("onnxruntime")
+                    .join("capi")
+                    .join("onnxruntime.dll"),
+            );
+        }
     } else {
         candidates.extend(
             ["libonnxruntime.so.1.23", "libonnxruntime.so.1", "libonnxruntime.so"]
@@ -760,35 +1109,129 @@ unsafe fn open_library() -> Result<(PathBuf, *mut c_void)> {
             "/usr/lib/x86_64-linux-gnu/libonnxruntime.so.1.23",
         ));
     }
-    for path in candidates {
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(name) = CString::new(path.as_os_str().to_string_lossy().as_bytes()) {
-                let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
-                if !handle.is_null() {
-                    return Ok((path, handle));
-                }
-            }
-        }
-        #[cfg(windows)]
-        {
-            let wide: Vec<u16> = path
-                .as_os_str()
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
-            if !handle.is_null() {
-                return Ok((path, handle));
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|path| seen.insert(path.clone()));
+    candidates
+}
+
+/// Working directory and every executable ancestor, so a checkout works both
+/// from a console in the repo root and from `90_work/build-cache/.../release`.
+fn project_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut current = exe.parent();
+        let mut depth = 0;
+        while let Some(dir) = current {
+            roots.push(dir.to_path_buf());
+            current = dir.parent();
+            depth += 1;
+            if depth > 8 {
+                break;
             }
         }
     }
-    #[cfg(target_os = "linux")]
-    let reason = unsafe { CStr::from_ptr(dlerror()) }.to_string_lossy().into_owned();
-    #[cfg(windows)]
-    let reason = "LoadLibraryW failed".to_string();
-    Err(anyhow!("no ONNX Runtime library found ({reason})"))
+    let mut seen = std::collections::HashSet::new();
+    roots.retain(|path| seen.insert(path.clone()));
+    roots
+}
+
+fn resolve_library() -> Result<PathBuf> {
+    let candidates = library_candidates();
+    if candidates.is_empty() {
+        bail!("no ONNX Runtime candidate; set AURORA_ORT_LIB");
+    }
+    for path in &candidates {
+        if path.is_file() {
+            return Ok(path.clone());
+        }
+    }
+    bail!(
+        "ONNX Runtime not found; set AURORA_ORT_LIB to an absolute onnxruntime.dll \
+         (looked in {})",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+#[cfg(windows)]
+unsafe fn load_library(path: &Path) -> Result<*mut c_void> {
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle =
+        unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
+    if handle.is_null() {
+        bail!(
+            "LoadLibraryExW({}) failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(handle)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn load_library(path: &Path) -> Result<*mut c_void> {
+    let name = CString::new(path.as_os_str().to_string_lossy().as_bytes())?;
+    let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
+    if handle.is_null() {
+        let reason = unsafe { CStr::from_ptr(dlerror()) }.to_string_lossy().into_owned();
+        bail!("dlopen({}) failed: {reason}", path.display());
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn configure_gpu_dll_directories(library: &Path) -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
+        fn AddDllDirectory(new_directory: *const u16) -> *mut c_void;
+    }
+    const LOAD_LIBRARY_SEARCH_USER_DIRS: u32 = 0x0400;
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x1000;
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(list) = std::env::var_os(DLL_DIRS_ENV) {
+        dirs.extend(std::env::split_paths(&list));
+    }
+    dirs.extend(derived_runtime_dirs(library));
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| dir.is_dir() && seen.insert(dir.clone()));
+
+    let flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS;
+    if unsafe { SetDefaultDllDirectories(flags) } == 0 {
+        log::warn!(
+            "SetDefaultDllDirectories failed ({}); relying on AddDllDirectory and preloads",
+            std::io::Error::last_os_error()
+        );
+    }
+    for dir in &dirs {
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if unsafe { AddDllDirectory(wide.as_ptr()) }.is_null() {
+            log::debug!("AddDllDirectory({}) failed", dir.display());
+        }
+    }
+    dirs
+}
+
+#[cfg(not(windows))]
+fn configure_gpu_dll_directories(_library: &Path) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 unsafe fn check(status: Status, api: ApiPtr) -> Result<()> {
@@ -999,18 +1442,28 @@ mod tests {
 
     #[test]
     fn providers_prefer_gpu_and_always_end_with_cpu() {
-        assert_eq!(providers_from(false, false, false), vec![Provider::Cpu]);
+        assert_eq!(providers_from(false, false), vec![Provider::Cpu]);
         assert_eq!(
-            providers_from(true, true, true),
+            providers_from(true, true),
+            vec![Provider::Cuda, Provider::DirectMl, Provider::Cpu]
+        );
+        assert_eq!(providers_from(true, false), vec![Provider::Cuda, Provider::Cpu]);
+        assert_eq!(providers_from(false, true), vec![Provider::DirectMl, Provider::Cpu]);
+    }
+
+    #[test]
+    fn tensorrt_is_not_in_the_default_order_but_can_be_prepended() {
+        let default = providers_from(true, true);
+        assert!(!default.contains(&Provider::TensorRt));
+        assert_eq!(
+            with_tensor_rt_first(default),
             vec![Provider::TensorRt, Provider::Cuda, Provider::DirectMl, Provider::Cpu]
         );
-        assert_eq!(providers_from(false, true, false), vec![Provider::Cuda, Provider::Cpu]);
-        assert_eq!(providers_from(false, false, true), vec![Provider::DirectMl, Provider::Cpu]);
     }
 
     #[test]
     fn override_pins_one_provider_and_keeps_cpu_as_fallback() {
-        let probed = providers_from(false, false, true); // [DirectMl, Cpu]
+        let probed = providers_from(false, true); // [DirectMl, Cpu]
         assert_eq!(apply_override(probed.clone(), None), probed);
         assert_eq!(
             apply_override(probed.clone(), Some(Provider::DirectMl)),

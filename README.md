@@ -37,10 +37,11 @@ cargo build -p portrait-app --release --locked
 ## GPU 适配
 
 - **CUDA 细节阶段**：`AURORA_DETAIL_GPU=1` 启用亮度降噪、颜色降噪与锐化 CUDA 路径；与 CPU 阶段逐字节一致，本机 RTX 4070 Ti / 610.88 通过。CUDA 不可用时自动回退 CPU。
-- **ONNX Runtime provider**：按运行时真实导出的符号自动选择 TensorRT → CUDA → DirectML → CPU；`AURORA_AI_PROVIDER` 可固定 provider。本机 Capture One ONNX Runtime 1.22.1 实际导出 DirectML + CPU，人像探针走 DirectML。
+- **ONNX Runtime provider**：默认 **CUDA → DirectML → CPU**，交互优先低延迟。TensorRT 只在两种情况下置顶：`AURORA_TRT_CACHE_DIR` 指向的目录已有 `.engine/.profile/.timing` 缓存，或显式设置 `AURORA_ORT_PROVIDERS=tensorrt,cuda,cpu`。`AURORA_ORT_PROVIDERS` 可覆盖任意顺序，未导出的 provider 会被记录并跳过。TRT 冷构建实测 40–190 s/模型（2026-11-23，RTX 4070 Ti），所以不做默认首选。
+- **FP16 精度**：实测 TRT FP16 对 subject/skin 的 mask IoU 0.998–0.9998，但原始概率最大差 6–8%。FP16 只建议用于 0.5 阈值掩膜；**不要用 FP16 原始概率做羽化 alpha**。blemish（最大差 5e-4）与 face parsing（8e-3，IoU 0.99969）可以直接用 FP16。
 - **人像 CUDA kernel**：`aurora-portrait` 已有 LUT、mesh、teeth、smile、gloss、moisture、makeup 等 CUDA 路径，本机 16 个 CUDA 测试文件、84 个测试通过；尚未接入应用的人像预览主路径。
 - **Metal**：保留为 macOS 真机目标，本 Windows 版本未验证，不宣称可用。
-- 本构建没有 TensorRT 缓存预热/指纹匹配策略；自动模式是 provider 偏好顺序，不是“TensorRT 已加速”。CUDA/TensorRT provider 需要本机 ONNX Runtime 自己导出对应符号。
+- 本构建没有 TensorRT 缓存预热/指纹匹配策略；自动模式是 provider 偏好顺序，不是“TensorRT 已加速”。CUDA/TensorRT provider 需要本机 ONNX Runtime 自己导出对应符号。TRT 的 engine cache 路径目前由部署脚本/外部工具准备，legacy append 还不能把 cache 目录传给 EP（V2 options 未接线，见 `REPORT.md`）。
 
 ## 已知限制
 

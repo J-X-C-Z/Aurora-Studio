@@ -1212,4 +1212,84 @@ mod tests {
         }
         assert_eq!(hash, 0x51ee_30b0_e822_fad4, "heal output changed: {hash:016x}");
     }
+
+    #[test]
+    fn empty_detected_dust_is_identical_to_manual_spots() {
+        let (w, h) = (64u32, 64u32);
+        let mut base = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let v = (80 + x + y) as u8;
+                base.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let mut adj = AdjustmentSet::default();
+        adj.spots.push(spot(SpotKind::Spot, 0.5, 0.5, 0.08));
+        let mut manual = base.clone();
+        apply_spots(&mut manual, w, h, &adj, (w, h));
+        let mut gated = base;
+        apply_detected_spots(
+            &mut gated,
+            w,
+            h,
+            &adj,
+            &Geometry::default(),
+            &[],
+            (w, h),
+        );
+        assert_eq!(manual, gated, "empty detection must leave manual spots byte-identical");
+    }
+
+    /// Real-frame audit: C1 SDK dust point vs the Rust detector point, applied
+    /// through the same type-3 dust path.
+    #[test]
+    #[ignore]
+    fn real_dust_c1_vs_rust_applied_pixels() {
+        let path = r"C:\WorkSpace\Aurora Studio\90_work\build-cache\z6iii-desktop-smoke-a88d98b0\output\DSC_9868.tif";
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let image = image::open(path).unwrap().to_rgba8();
+        let (w, h) = image.dimensions();
+        let mut c1 = image.as_raw().clone();
+        let mut rust = image.as_raw().clone();
+        let c1_spot = Spot {
+            id: 1,
+            kind: SpotKind::Dust,
+            x: 5899.4 / 6048.0,
+            y: 2649.5 / 4032.0,
+            radius: 40.6 / 6048.0,
+        };
+        let rust_spot = Spot {
+            id: 1,
+            kind: SpotKind::Dust,
+            x: 0.9754,
+            y: 0.6568,
+            radius: 0.0068,
+        };
+        apply_detected_spots(
+            &mut c1,
+            w,
+            h,
+            &AdjustmentSet::default(),
+            &Geometry::default(),
+            &[c1_spot],
+            (w, h),
+        );
+        apply_detected_spots(
+            &mut rust,
+            w,
+            h,
+            &AdjustmentSet::default(),
+            &Geometry::default(),
+            &[rust_spot],
+            (w, h),
+        );
+        let diff: Vec<u8> = c1.iter().zip(&rust).map(|(a, b)| a.abs_diff(*b)).collect();
+        let max = diff.iter().copied().max().unwrap_or(0);
+        let changed = diff.iter().filter(|d| **d != 0).count();
+        let mean = diff.iter().map(|d| *d as f64).sum::<f64>() / diff.len() as f64;
+        println!("C1 vs Rust applied: max={max} changed={changed}/{} mean={mean:.6}", diff.len());
+        assert!(max <= 16, "applied pixel max diff {max}");
+    }
 }

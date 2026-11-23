@@ -3713,9 +3713,9 @@ pub use repair_skin_stage::{
     GlareInputs, GlarePlanarBundle, GlarePlanarInputs, GlarePlanarReceipts, GlareWritebackInputs,
     GlareWritebackOutput, PF90130_A_PLANAR_BYTES, PF90130_B_PLANAR_BYTES,
     PF90130_PIXELS, PF90130_PLANE_HEIGHT, PF90130_PLANE_WIDTH, SkinRepairData, SkinRepairOutput,
-    SkinRepairProducerInputs, SpotlessInputs, apply_glare_chain_final_writeback,
+    SkinRepairProducerInputs, SpotlessGainmapJob, SpotlessInputs, apply_glare_chain_final_writeback,
     apply_glare_final_writeback, apply_glare_stage_writeback, bridge_glare_planes,
-    run as run_skin_repair,
+    resolve_spotless_gainmap_amount, run as run_skin_repair, run_spotless_gainmap_16u,
 };
 
 #[path = "portrait_pf90130_producer.rs"]
@@ -3770,6 +3770,13 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     118,    // Lower eyelash color makeup
     30007,  // Lower eyeliner color makeup
 ];
+
+/// Effect ids the Windows bridge can currently run from a frame, a mask and
+/// bundled LUT bytes. This is the read-only capability registry; it does not
+/// imply automatic landmark or model generation.
+pub fn supported_effects() -> &'static [u32] {
+    SUPPORTED_EFFECTS
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FaceMeshGroup {
@@ -6743,7 +6750,7 @@ fn validate_effect_inputs(
                 inputs,
             )?;
         }
-        21025 | 21069 | 21070 | 21071 => {
+        21025 | 21069 | 21070 | 21071 | 90023 | 90024 => {
             check_degree01(
                 extra.get(&format!("pc:{pf}")).copied().unwrap_or_default(),
                 "wrinkle ui",
@@ -6832,7 +6839,9 @@ fn apply_cpu_effect(
         }
         108 => apply_teeth_cpu(current, degree, inputs),
         30025 => apply_pf30025_cpu(current, degree, inputs),
-        21025 | 21069 | 21070 | 21071 => apply_wrinkle_cpu(current, pf, degree, inputs),
+        21025 | 21069 | 21070 | 21071 | 90023 | 90024 => {
+            apply_wrinkle_cpu(current, pf, degree, inputs)
+        }
         30021 => apply_hlf_face_cpu(current, degree, inputs, hlf_auto),
         30022 => apply_hlf_body_cpu(current, degree, inputs, hlf_auto),
         8068 => apply_skin_gloss(current, degree, skin_mask),
@@ -6958,6 +6967,31 @@ fn apply_wrinkle_cpu(
 ) -> Result<Image, Refusal> {
     let input = inputs.resolve_wrinkle_inputs(current)?;
     validate_wrinkle(current, input)?;
+    if p15_handles(pf) {
+        let resolved = aurora_portrait::cuda_wrinkle::resolve_p15(
+            aurora_portrait::cuda_wrinkle::P15Inputs {
+                pf,
+                source: current,
+                base: input.base_full,
+                residual: input.residual_full,
+                mask_rgba: input.mask_rgba_full,
+                skin_mask: input.skin_mask_full,
+                roi: input.roi,
+                ui: degree * 100.0,
+                uniforms: input.uniforms,
+            },
+        )?;
+        return skin_adjust::wrinkle_apply(
+            current,
+            input.base_full,
+            input.residual_full,
+            input.mask_rgba_full,
+            input.skin_mask_full,
+            resolved.roi,
+            resolved.degree,
+            resolved.uniforms,
+        );
+    }
     let degree = skin_adjust::wrinkle_degree(pf, degree * 100.0)?;
     skin_adjust::wrinkle_apply(
         current,
@@ -7439,25 +7473,27 @@ fn apply_gpu_suit_pass(
         SuitPassKind::Image {
             material,
             material_uv,
-        } => gpu.apply_image_layer_dual(
+        } => cuda_router::suit_pass(
             current,
             material,
             pass.mask,
             pass.mask_uv,
             material_uv,
             params,
+            gpu,
         ),
         SuitPassKind::Color => {
             let [r, g, b, _] = layer.mix_color;
             let material = Image::solid(1, 1, [r, g, b, 255]);
             let flat_uv = vec![[0.5f32, 0.5f32]; current.pixel_count()];
-            gpu.apply_image_layer_dual(
+            cuda_router::suit_pass(
                 current,
                 &material,
                 pass.mask,
                 pass.mask_uv,
                 &flat_uv,
                 params,
+                gpu,
             )
         }
     }
@@ -7595,6 +7631,20 @@ fn forced_cuda_empty_dispatch() -> bool {
     false
 }
 
+/// PF90023/PF90024 are the two P15 rows whose mask law is recovered.
+///
+/// PF21024 is deliberately absent: r76 s63 U3 records that its
+/// `mask.r`/`mask.b` contribution was never observed.
+fn p15_handles(pf: u32) -> bool {
+    matches!(pf, 90023 | 90024)
+}
+
+/// The CPU lane always serves the two P15 rows; CUDA is opt-in.
+#[cfg(windows)]
+fn p15_cuda_enabled() -> bool {
+    std::env::var_os("AURORA_PORTRAIT_P15_CUDA").is_some()
+}
+
 #[derive(Clone, Copy)]
 struct StrayHairJob<'a> {
     params: StrayHairParams,
@@ -7683,6 +7733,9 @@ fn try_cuda_same_job_effect(
     if forced_cuda_empty_dispatch() {
         return Some(Ok((current.clone(), Vec::new())));
     }
+    if let Some(result) = cuda_router::same_job(pf, current, degree, inputs) {
+        return Some(result);
+    }
     match pf {
         90004 => {
             let resolved =
@@ -7710,6 +7763,13 @@ fn try_cuda_same_job_effect(
                 })
                 .map(|(image, dispatch)| (image, dispatch.into_iter().collect())),
             )
+        }
+        pf if p15_handles(pf) && p15_cuda_enabled() => {
+            let input = inputs
+                .resolve_wrinkle_inputs(current)
+                .expect("validated P15 same-job inputs");
+            validate_wrinkle(current, input).expect("validated P15 inputs");
+            Some(cuda_router::p15(pf, current, degree, input))
         }
         21025 | 21069 | 21070 | 21071 => {
             let input = inputs
@@ -7890,30 +7950,6 @@ fn try_cuda_same_job_effect(
                 Ok((next, dispatches))
             }))
         }
-        108 => {
-            let teeth = inputs.teeth.expect("validated PF108 teeth input");
-            let whiten = inputs
-                .assets
-                .teeth_whiten_lut
-                .expect("validated PF108 whiten LUT");
-            let bright = inputs
-                .assets
-                .teeth_bright_lut
-                .expect("validated PF108 bright LUT");
-            let gpu = match aurora_portrait::cuda_teeth::Teeth::open() {
-                Ok(gpu) => gpu,
-                Err(error) => return Some(Err(error)),
-            };
-            Some(gpu.apply(
-                current,
-                teeth.mask_g,
-                whiten,
-                bright,
-                degree * 100.0,
-                teeth.bright_ui,
-                teeth.deyellow_ui,
-            ))
-        }
         30025 => {
             let input = inputs.pf30025.expect("validated PF30025 repair input");
             let gpu = match aurora_portrait::cuda_pf30025::ToothRepair::open() {
@@ -8080,47 +8116,850 @@ fn try_cuda_same_job_effect(
                 job.background_mask,
             ))
         }
-        100007 => {
-            let material = inputs.smile.material.expect("validated PF100007 material");
-            let (active, degree) = match smile_warp::pf100007_gate(degree * 100.0, Some(material)) {
-                Ok(value) => value,
-                Err(error) => return Some(Err(CudaError::Refused(smile_refusal(error)))),
-            };
-            if !active {
-                return Some(Ok((current.clone(), Vec::new())));
+        _ => None,
+    }
+}
+
+/// Product dispatch through `aurora_portrait::effect_router`.
+///
+/// Each arm forwards the same arguments the previous direct adapter call used,
+/// so the CPU and CUDA pixels do not change. `Backend::Cuda` keeps the stage
+/// rule that a CUDA result without a dispatch is not evidence: the router turns
+/// that case into an error and the stage falls back to the CPU kernel.
+#[cfg(windows)]
+mod cuda_router {
+    use super::*;
+    use aurora_portrait::effect_router::{self as router, Backend, CudaEffect, RouteError};
+
+    /// Every PF this stage dispatches through the router.
+    #[allow(dead_code)]
+    pub(super) const ROUTED_PFS: &[(u32, &str)] = &[
+        (108, "teeth_whiten"),
+        (8068, "gloss_pass"),
+        (21015, "skin_tint_pf21015"),
+        (90005, "skin_adjust_lut"),
+        (90007, "skin_adjust_lut"),
+        (21026, "beard_blend"),
+        (90002, "moisture_face"),
+        (90010, "moisture_body"),
+        (90033, "makeup_layer"),
+        (100007, "smile_pf100007"),
+        (90116, "eye_bag_compose"),
+    ];
+
+    /// Router adapters that are real but must not be bound to these PFs.
+    ///
+    /// `portrait_map.rs` states the product meaning of each PF. An adapter
+    /// whose kernel family does not match that meaning stays unbound instead of
+    /// silently changing the effect.
+    #[allow(dead_code)]
+    pub(super) const BLOCKED_PFS: &[(u32, &str, &str)] = &[
+        (
+            407,
+            "uvmap_type143",
+            "PF407 is legLengthen (portrait_map.rs:211) and runs through portrait_body_stage's UV warp; the router adapter is a general UV colour sampler. Missing: a PF407 field_xyzw/channel/catmull producer.",
+        ),
+        (
+            90023,
+            "p15_facial_smooth",
+            "PF90023 is removeEyeLines; cuda_wrinkle::WrinkleRoute resolves only 21025/21069/21070/21071. Missing: the per-PF ROI, mask channel and uniform set.",
+        ),
+        (
+            90024,
+            "p15_facial_smooth",
+            "PF90024 is removeForeheadLines; same missing per-PF wrinkle route as 90023.",
+        ),
+        (
+            21024,
+            "p15_facial_smooth",
+            "PF21024 is removeGlabellaLines; same missing per-PF wrinkle route as 90023.",
+        ),
+        (
+            30009,
+            "texture_blend",
+            "PF30009 is hairColorUnify (kernels/hair_body.rs:441) and has no CUDA kernel; the router adapter is a different pixel primitive that happens to carry the same PF label.",
+        ),
+        (
+            8033,
+            "mesh_attribute",
+            "PF8033 is smileMouthCorner; the attribute rasterizer needs dest/attr/faces, while FaceGeometry::Smile carries dx/dy/mask only. Missing: an attribute-pair producer. The smile half (smile_pf8033) is wired in portrait_face_stage.",
+        ),
+    ];
+
+    /// Reachable adapters that keep their direct call because the router
+    /// adapter wraps a different GPU entry point.
+    #[allow(dead_code)]
+    pub(super) const DIRECT_PFS: &[(u32, &str, &str)] = &[(
+        30026,
+        "teeth_blend",
+        "The stage calls cuda_teeth_blend::apply_alignment_final_blend (Job -> AlignmentFinalBlendGpu); the router adapter wraps TeethBlend::apply(original, effect, mask). Same kernel, different entry.",
+    )];
+
+    /// Runs one adapter on the CUDA lane and flattens the router report back
+    /// into the stage's `(Image, dispatches)` contract.
+    fn run<E: CudaEffect>(
+        input: &E::Input<'_>,
+    ) -> Result<(E::Output, Vec<Dispatch>), CudaError> {
+        match router::route::<E>(input, Backend::Cuda) {
+            Ok(routed) => Ok((routed.output, routed.dispatches)),
+            Err(RouteError::Cuda(error)) => Err(error),
+            Err(RouteError::Cpu(refusal)) => Err(CudaError::Refused(refusal)),
+            Err(RouteError::MissingDispatchEvidence(_)) => Err(CudaError::Unavailable(
+                "effect_router: CUDA returned no dispatch",
+            )),
+        }
+    }
+
+    /// PF21015/90005/90007 adapter that borrows the thread-local `SkinLut`
+    /// session, so routing does not reopen the PTX module on every frame.
+    struct CachedSkinLut;
+
+    enum SkinLutJob<'a> {
+        Tint {
+            source: &'a Image,
+            mask_r: &'a [u8],
+            tint_green: &'a [u8],
+            tint_magenta: &'a [u8],
+            ui: f32,
+            gpu: &'a aurora_portrait::cuda_lut::SkinLut,
+        },
+        Adjust {
+            source: &'a Image,
+            mask_r: &'a [u8],
+            lut_rgb512: &'a [u8],
+            mix: f32,
+            pf: u32,
+            gpu: &'a aurora_portrait::cuda_lut::SkinLut,
+        },
+    }
+
+    impl CudaEffect for CachedSkinLut {
+        const NAME: &'static str = "skin_lut_cached";
+        const PFS: &'static [u32] = &[21015, 90005, 90007];
+        const KERNELS: &'static [&'static str] = &[aurora_portrait::cuda_lut::KERNEL];
+        const CPU_ENTRY: &'static str = "kernels::makeup::skin_adjust_lut";
+
+        type Input<'a> = SkinLutJob<'a>;
+        type Output = Image;
+
+        fn cpu(input: &Self::Input<'_>) -> Result<Image, Refusal> {
+            match input {
+                SkinLutJob::Tint {
+                    source,
+                    mask_r,
+                    tint_green,
+                    tint_magenta,
+                    ui,
+                    ..
+                } => aurora_portrait::kernels::face_detail::skin_tint(
+                    source,
+                    mask_r,
+                    tint_green,
+                    tint_magenta,
+                    *ui,
+                ),
+                SkinLutJob::Adjust {
+                    source,
+                    mask_r,
+                    lut_rgb512,
+                    mix,
+                    ..
+                } => aurora_portrait::kernels::makeup::skin_adjust_lut(
+                    source,
+                    mask_r,
+                    lut_rgb512,
+                    *mix,
+                ),
             }
-            let lip_mask = inputs.smile.lip_mask.expect("validated PF100007 lip mask");
-            let mouth_mask = inputs
-                .smile
-                .mouth_mask
-                .expect("validated PF100007 mouth mask");
-            let model_dx = inputs.smile.model_dx.expect("validated PF100007 dx");
-            let model_dy = inputs.smile.model_dy.expect("validated PF100007 dy");
-            let roi = inputs.smile.roi.expect("validated PF100007 roi");
-            let gpu = match aurora_portrait::cuda_smile::Smile::open() {
-                Ok(gpu) => gpu,
-                Err(error) => return Some(Err(error)),
-            };
-            Some(
-                gpu.apply(
-                    &current.pixels,
-                    current.width,
-                    current.height,
+        }
+
+        fn cuda(input: &Self::Input<'_>) -> Result<(Image, Vec<Dispatch>), CudaError> {
+            match input {
+                SkinLutJob::Tint {
+                    source,
+                    mask_r,
+                    tint_green,
+                    tint_magenta,
+                    ui,
+                    gpu,
+                } => gpu
+                    .tint(source, mask_r, tint_green, tint_magenta, *ui)
+                    .map(|(image, dispatch)| (image, vec![dispatch])),
+                SkinLutJob::Adjust {
+                    source,
+                    mask_r,
+                    lut_rgb512,
+                    mix,
+                    pf,
+                    gpu,
+                } => gpu
+                    .skin_adjust(source, mask_r, lut_rgb512, *mix, *pf)
+                    .map(|(image, dispatch)| (image, vec![dispatch])),
+            }
+        }
+    }
+
+    /// PFs that only need a skin mask, previously handled inline by
+    /// `try_cuda_effect`. This predicate is the single gate used by the
+    /// dispatcher and by its tests.
+    pub(super) fn skin_effect_handles(pf: u32) -> bool {
+        matches!(pf, 8068 | 21015 | 90005 | 90007)
+    }
+
+    pub(super) fn skin_effect(
+        pf: u32,
+        current: &Image,
+        degree: f32,
+        mask: &[u8],
+    ) -> Option<Result<(Image, Vec<Dispatch>), CudaError>> {
+        if !skin_effect_handles(pf) {
+            return None;
+        }
+        match pf {
+            8068 => {
+                let extra = vec![255u8; mask.len()];
+                let input = router::GlossInput {
+                    source: current,
+                    masks_r: [mask, mask, mask],
+                    extra_masks_r: [&extra, &extra, &extra],
+                    native_percent: (degree * 100.0).clamp(0.0, 100.0),
+                };
+                Some(run::<router::Gloss>(&input))
+            }
+            21015 => {
+                let (Some(green), Some(magenta)) = (tint_green(), tint_magenta()) else {
+                    return Some(Err(CudaError::Refused(Refusal::MissingInput(
+                        "skin tint LUT",
+                    ))));
+                };
+                let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
+                Some(with_skin_lut(|gpu| {
+                    let input = SkinLutJob::Tint {
+                        source: current,
+                        mask_r: mask,
+                        tint_green: green,
+                        tint_magenta: magenta,
+                        ui,
+                        gpu,
+                    };
+                    run::<CachedSkinLut>(&input)
+                }))
+            }
+            90005 | 90007 => {
+                let (lut, missing) = if pf == 90005 {
+                    (whiten_lut(), "whiten LUT")
+                } else {
+                    (ruddy_lut(), "ruddy LUT")
+                };
+                let Some(lut) = lut else {
+                    return Some(Err(CudaError::Refused(Refusal::MissingInput(missing))));
+                };
+                Some(with_skin_lut(|gpu| {
+                    let input = SkinLutJob::Adjust {
+                        source: current,
+                        mask_r: mask,
+                        lut_rgb512: lut,
+                        mix: degree.clamp(0.0, 1.0),
+                        pf,
+                        gpu,
+                    };
+                    run::<CachedSkinLut>(&input)
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// One PF90033 suit pass, routed while borrowing the session's
+    /// `MakeupLayer` so a multi-pass suit still opens the module once.
+    struct CachedMakeup;
+
+    struct MakeupJob<'a> {
+        source: &'a Image,
+        material: &'a Image,
+        owner_mask: &'a Image,
+        mask_uv: &'a [[f32; 2]],
+        material_uv: &'a [[f32; 2]],
+        params: aurora_portrait::kernels::makeup_material::ColorMaterialParams,
+        gpu: &'a aurora_portrait::cuda_makeup::MakeupLayer,
+    }
+
+    impl CudaEffect for CachedMakeup {
+        const NAME: &'static str = "makeup_layer_cached";
+        const PFS: &'static [u32] = &[90033];
+        const KERNELS: &'static [&'static str] = &[aurora_portrait::cuda_makeup::KERNEL];
+        const CPU_ENTRY: &'static str = "kernels::makeup_material::apply_image_layer_dual";
+
+        type Input<'a> = MakeupJob<'a>;
+        type Output = Image;
+
+        fn cpu(input: &Self::Input<'_>) -> Result<Image, Refusal> {
+            aurora_portrait::kernels::makeup_material::apply_image_layer_dual(
+                input.source,
+                input.material,
+                input.owner_mask,
+                input.mask_uv,
+                input.material_uv,
+                input.params,
+            )
+        }
+
+        fn cuda(input: &Self::Input<'_>) -> Result<(Image, Vec<Dispatch>), CudaError> {
+            input.gpu.apply_image_layer_dual(
+                input.source,
+                input.material,
+                input.owner_mask,
+                input.mask_uv,
+                input.material_uv,
+                input.params,
+            )
+        }
+    }
+
+    /// Runs one suit pass through the router on the CUDA lane.
+    pub(super) fn suit_pass(
+        current: &Image,
+        material: &Image,
+        mask: &Image,
+        mask_uv: &[[f32; 2]],
+        material_uv: &[[f32; 2]],
+        params: aurora_portrait::kernels::makeup_material::ColorMaterialParams,
+        gpu: &aurora_portrait::cuda_makeup::MakeupLayer,
+    ) -> Result<(Image, Vec<Dispatch>), CudaError> {
+        let input = MakeupJob {
+            source: current,
+            material,
+            owner_mask: mask,
+            mask_uv,
+            material_uv,
+            params,
+            gpu,
+        };
+        run::<CachedMakeup>(&input)
+    }
+
+    /// PFs that read their planes from `PortraitJobInputs`. This predicate is
+    /// the single gate used by the dispatcher and by its tests.
+    pub(super) fn same_job_handles(pf: u32) -> bool {
+        matches!(pf, 108 | 21026 | 90002 | 90010 | 100007 | 90116)
+    }
+
+    pub(super) fn same_job(
+        pf: u32,
+        current: &Image,
+        degree: f32,
+        inputs: &PortraitJobInputs<'_>,
+    ) -> Option<Result<(Image, Vec<Dispatch>), CudaError>> {
+        if !same_job_handles(pf) {
+            return None;
+        }
+        match pf {
+            108 => {
+                let teeth = inputs.teeth.expect("validated PF108 teeth input");
+                let whiten = inputs
+                    .assets
+                    .teeth_whiten_lut
+                    .expect("validated PF108 whiten LUT");
+                let bright = inputs
+                    .assets
+                    .teeth_bright_lut
+                    .expect("validated PF108 bright LUT");
+                let input = router::TeethInput {
+                    source: current,
+                    mask_g: teeth.mask_g,
+                    whiten_lut: whiten,
+                    bright_lut: bright,
+                    common_ui: degree * 100.0,
+                    bright_ui: teeth.bright_ui,
+                    deyellow_ui: teeth.deyellow_ui,
+                };
+                Some(run::<router::TeethWhiten>(&input))
+            }
+            21026 => {
+                let beard = inputs.beard.expect("validated PF21026 beard input");
+                let input = router::BeardInput {
+                    source: current,
+                    repair: beard.repair_rgb,
+                    mask_a: beard.mask_a,
+                    mask_b: beard.mask_b,
+                    strength: degree.clamp(0.0, 1.0),
+                };
+                Some(run::<router::Beard>(&input))
+            }
+            90002 => {
+                let input = inputs
+                    .moisture_face
+                    .expect("validated PF90002 moisture input");
+                let routed = router::MoistureFaceInput {
+                    source: current,
+                    mask_rgba: input.mask_rgba,
+                    blur_y: input.blur_y,
+                    ui: degree * 100.0,
+                    pivot: input.pivot,
+                    gain: input.gain,
+                    channel: input.channel,
+                    skin_map_width: input.skin_map_width as usize,
+                    skin_map_height: input.skin_map_height as usize,
+                    skin_map: input.skin_map,
+                    hardlight: input.hardlight,
+                    beauty: input.beauty,
+                };
+                Some(run::<router::MoistureFace>(&routed))
+            }
+            90010 => {
+                let input = inputs
+                    .moisture_body
+                    .expect("validated PF90010 moisture input");
+                let native_degree = if degree > 0.0 { input.degree } else { 0.0 };
+                let routed = router::MoistureBodyInput {
+                    source: current,
+                    weight_skin: input.weight_skin,
+                    weight_dog: input.weight_dog,
+                    beauty: input.beauty,
+                    degree: native_degree,
+                    roi: input.roi,
+                };
+                Some(run::<router::MoistureBody>(&routed))
+            }
+            90116 => {
+                let input = inputs.eye_bag.expect("validated PF90116 eye-bag input");
+                let routed = router::EyeBagInput {
+                    source: current,
+                    color3: input.aligned_color_field_rgb_f32,
+                    response: input.aligned_response_mask,
+                    degree,
+                };
+                Some(run::<router::EyeBag>(&routed))
+            }
+            100007 => {
+                let material = inputs.smile.material.expect("validated PF100007 material");
+                let (active, degree) = match smile_warp::pf100007_gate(
+                    degree * 100.0,
+                    Some(material),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Some(Err(CudaError::Refused(smile_refusal(error))));
+                    }
+                };
+                if !active {
+                    return Some(Ok((current.clone(), Vec::new())));
+                }
+                let lip_mask = inputs.smile.lip_mask.expect("validated PF100007 lip mask");
+                let mouth_mask = inputs
+                    .smile
+                    .mouth_mask
+                    .expect("validated PF100007 mouth mask");
+                let model_dx = inputs.smile.model_dx.expect("validated PF100007 dx");
+                let model_dy = inputs.smile.model_dy.expect("validated PF100007 dy");
+                let roi = inputs.smile.roi.expect("validated PF100007 roi");
+                let routed = router::SmileInput {
+                    source_bgra: &current.pixels,
+                    width: current.width,
+                    height: current.height,
                     degree,
                     lip_mask,
                     mouth_mask,
                     model_dx,
                     model_dy,
                     roi,
+                };
+                Some(
+                    run::<router::SmilePf100007>(&routed).and_then(|(pixels, dispatches)| {
+                        let image = Image::new(current.width, current.height, pixels).ok_or(
+                            CudaError::Refused(Refusal::ShapeMismatch("pf100007 bgra")),
+                        )?;
+                        Ok((image, dispatches))
+                    }),
                 )
-                .and_then(|(pixels, dispatches)| {
-                    let image = Image::new(current.width, current.height, pixels)
-                        .ok_or(CudaError::Refused(Refusal::ShapeMismatch("pf100007 bgra")))?;
-                    Ok((image, dispatches))
-                }),
+            }
+            _ => None,
+        }
+    }
+
+    /// PF90023/PF90024 P15 rows: ROI-limited, degree-gated, same composite.
+    struct P15Wrinkle;
+
+    struct P15Job<'a> {
+        pf: u32,
+        source: &'a Image,
+        base: &'a Image,
+        residual: &'a Image,
+        mask_rgba: &'a [u8],
+        skin_mask: &'a [u8],
+        roi: Roi,
+        ui: f32,
+        uniforms: WrinkleUniforms,
+    }
+
+    fn p15_inputs<'a>(job: &P15Job<'a>) -> aurora_portrait::cuda_wrinkle::P15Inputs<'a> {
+        aurora_portrait::cuda_wrinkle::P15Inputs {
+            pf: job.pf,
+            source: job.source,
+            base: job.base,
+            residual: job.residual,
+            mask_rgba: job.mask_rgba,
+            skin_mask: job.skin_mask,
+            roi: job.roi,
+            ui: job.ui,
+            uniforms: job.uniforms,
+        }
+    }
+
+    impl CudaEffect for P15Wrinkle {
+        const NAME: &'static str = "p15_facial_smooth";
+        const PFS: &'static [u32] = &[90023, 90024];
+        const KERNELS: &'static [&'static str] = &[aurora_portrait::cuda_wrinkle::KERNEL];
+        const CPU_ENTRY: &'static str = "kernels::skin_adjust::wrinkle_apply";
+
+        type Input<'a> = P15Job<'a>;
+        type Output = Image;
+
+        fn cpu(input: &Self::Input<'_>) -> Result<Image, Refusal> {
+            let resolved = aurora_portrait::cuda_wrinkle::resolve_p15(p15_inputs(input))?;
+            aurora_portrait::kernels::skin_adjust::wrinkle_apply(
+                input.source,
+                input.base,
+                input.residual,
+                input.mask_rgba,
+                input.skin_mask,
+                resolved.roi,
+                resolved.degree,
+                resolved.uniforms,
             )
         }
-        _ => None,
+
+        fn cuda(input: &Self::Input<'_>) -> Result<(Image, Vec<Dispatch>), CudaError> {
+            aurora_portrait::cuda_wrinkle::WrinkleGpu::open()?.apply_route(
+                input.pf,
+                input.source,
+                input.base,
+                input.residual,
+                input.mask_rgba,
+                input.skin_mask,
+                input.roi,
+                input.ui,
+                input.uniforms,
+                StoreMode::TruncU8,
+            )
+        }
+    }
+
+    /// Builds one P15 job from the wrinkle producer and routes it on CUDA.
+    pub(super) fn p15(
+        pf: u32,
+        current: &Image,
+        degree: f32,
+        input: WrinkleInputs<'_>,
+    ) -> Result<(Image, Vec<Dispatch>), CudaError> {
+        let job = P15Job {
+            pf,
+            source: current,
+            base: input.base_full,
+            residual: input.residual_full,
+            mask_rgba: input.mask_rgba_full,
+            skin_mask: input.skin_mask_full,
+            roi: input.roi,
+            ui: degree * 100.0,
+            uniforms: input.uniforms,
+        };
+        run::<P15Wrinkle>(&job)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use aurora_portrait::effect_router::{
+            MeshAttributeInput, SmileMaskInput, TextureBlendInput, UvMapInput,
+        };
+        use aurora_portrait::kernels::texture_mask_blend::NormalBlend;
+        use aurora_portrait::kernels::uvmap_color::Channel;
+
+        fn route_cpu<E: CudaEffect>(input: &E::Input<'_>) -> E::Output {
+            router::route::<E>(input, Backend::Cpu)
+                .expect("router CPU lane")
+                .output
+        }
+
+        #[test]
+        fn routed_pfs_name_real_router_adapters() {
+            assert_eq!(ROUTED_PFS.len(), 11);
+            for (pf, name) in ROUTED_PFS {
+                assert!(router::adapter(name).is_some(), "PF{pf} names {name}");
+            }
+        }
+
+        #[test]
+        fn every_routed_pf_hits_a_dispatch_gate() {
+            for (pf, _) in ROUTED_PFS {
+                assert!(
+                    skin_effect_handles(*pf) || same_job_handles(*pf) || *pf == 90033,
+                    "PF{pf} has no dispatch gate"
+                );
+            }
+            assert!(!skin_effect_handles(9999));
+            assert!(!same_job_handles(9999));
+        }
+
+        #[test]
+        fn blocked_pfs_keep_their_adapter_but_are_not_dispatched() {
+            for (pf, name, reason) in BLOCKED_PFS {
+                assert!(router::adapter(name).is_some(), "{name} is a real adapter");
+                assert!(!reason.is_empty(), "PF{pf} needs a stated gap");
+                assert!(
+                    !ROUTED_PFS.iter().any(|(routed, _)| routed == pf),
+                    "PF{pf} must not be routed from this stage"
+                );
+            }
+        }
+
+        #[test]
+        fn direct_only_adapter_is_not_claimed_as_routed() {
+            for (pf, name, reason) in DIRECT_PFS {
+                assert!(router::adapter(name).is_some(), "{name} is a real adapter");
+                assert!(!reason.is_empty(), "PF{pf} needs a stated reason");
+                assert!(
+                    !ROUTED_PFS.iter().any(|(routed, _)| routed == pf),
+                    "PF{pf} keeps its direct entry"
+                );
+            }
+        }
+
+        #[test]
+        fn texture_blend_degree_is_forwarded() {
+            let original = Image::solid(2, 2, [10, 20, 30, 255]);
+            let effect = Image::solid(2, 2, [200, 210, 220, 255]);
+            let mask = vec![255u8; 4];
+            let run = |degree: f32| {
+                route_cpu::<router::TextureBlend>(&TextureBlendInput {
+                    original: &original,
+                    effect: &effect,
+                    mask: &mask,
+                    effect_uv: None,
+                    params: NormalBlend {
+                        degree,
+                        reverse_alpha: false,
+                    },
+                })
+            };
+            assert_eq!(run(0.0), original);
+            assert_eq!(run(1.0), effect);
+        }
+
+        #[test]
+        fn smile_pf8033_degree_and_displacement_are_forwarded() {
+            let source = Image::new(
+                2,
+                1,
+                vec![10, 20, 30, 255, 40, 50, 60, 255],
+            )
+            .expect("2x1 image");
+            let dx = [1.0f32, 0.0];
+            let dy = [0.0f32, 0.0];
+            let mask = [255u8, 255];
+            let run = |degree01: f32| {
+                route_cpu::<router::SmilePf8033>(&SmileMaskInput {
+                    source_bgra: &source.pixels,
+                    width: 2,
+                    height: 1,
+                    dx: &dx,
+                    dy: &dy,
+                    mask: &mask,
+                    degree01,
+                })
+            };
+            assert_eq!(run(0.0), source.pixels);
+            assert_ne!(run(1.0), source.pixels);
+        }
+
+        #[test]
+        fn uvmap_field_is_forwarded() {
+            let source =
+                Image::new(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).expect("2x1 image");
+            let low = [[0.0f32, 0.0, 0.0, 0.0]; 2];
+            let high = [[1.0f32, 1.0, 1.0, 1.0]; 2];
+            let run = |field: &[[f32; 4]]| {
+                route_cpu::<router::UvMap>(&UvMapInput {
+                    source: &source,
+                    field,
+                    channel: Channel::Rg,
+                    catmull: None,
+                })
+            };
+            assert_ne!(run(&low), run(&high));
+        }
+
+        #[test]
+        fn mesh_attribute_rasterizes_and_reports_writes() {
+            let dest = [[0.0f32, 0.0], [2.0, 0.0], [0.0, 2.0]];
+            let attr = [[1.0f32, 10.0], [3.0, 30.0], [5.0, 50.0]];
+            let faces = [0u32, 1, 2];
+            let out = route_cpu::<router::MeshAttribute>(&MeshAttributeInput {
+                width: 1,
+                height: 1,
+                dest: &dest,
+                attr: &attr,
+                faces: &faces,
+            });
+            assert!(out.writes[0] >= 1, "triangle must cover the pixel");
+            assert!(out.values[0][0] > 0.0);
+        }
+
+        fn p15_uniforms() -> WrinkleUniforms {
+            WrinkleUniforms {
+                legal_alpha: 1.0,
+                dark_circle_alpha: 1.0,
+                diff_factor: 1.0,
+                diff_factor2: 0.0,
+                color_threshold_factor: 0.0,
+                mix_alpha: 1.0,
+                diff_min_threshold: -1.0,
+                diff_max_threshold: 1.0,
+                high_freq_min_threshold: -1.0,
+                high_freq_max_threshold: 1.0,
+            }
+        }
+
+        fn p15_job<'a>(
+            pf: u32,
+            source: &'a Image,
+            base: &'a Image,
+            residual: &'a Image,
+            mask_rgba: &'a [u8],
+            skin_mask: &'a [u8],
+            roi: Roi,
+            uniforms: WrinkleUniforms,
+        ) -> P15Job<'a> {
+            P15Job {
+                pf,
+                source,
+                base,
+                residual,
+                mask_rgba,
+                skin_mask,
+                roi,
+                ui: 50.0,
+                uniforms,
+            }
+        }
+
+        #[test]
+        fn p15_handles_only_the_two_recovered_rows() {
+            assert!(super::super::p15_handles(90023));
+            assert!(super::super::p15_handles(90024));
+            assert!(!super::super::p15_handles(21024));
+            assert!(router::adapter("p15_facial_smooth").is_some());
+        }
+
+        #[test]
+        fn p15_cpu_lane_matches_the_wrinkle_kernel() {
+            let source = Image::solid(4, 4, [120, 130, 140, 255]);
+            let base = Image::solid(4, 4, [100, 110, 120, 255]);
+            let residual = Image::solid(4, 4, [60, 70, 80, 255]);
+            let mask = vec![200u8; 16 * 4];
+            let skin = vec![255u8; 16];
+            let roi = Roi {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            };
+            let uniforms = p15_uniforms();
+            for pf in [90023u32, 90024] {
+                let job = p15_job(
+                    pf, &source, &base, &residual, &mask, &skin, roi, uniforms,
+                );
+                let routed = router::route::<P15Wrinkle>(&job, Backend::Cpu)
+                    .expect("P15 CPU lane")
+                    .output;
+                let resolved =
+                    aurora_portrait::cuda_wrinkle::resolve_p15(p15_inputs(&job)).unwrap();
+                let direct = aurora_portrait::kernels::skin_adjust::wrinkle_apply(
+                    &source,
+                    &base,
+                    &residual,
+                    &mask,
+                    &skin,
+                    resolved.roi,
+                    resolved.degree,
+                    resolved.uniforms,
+                )
+                .unwrap();
+                assert_eq!(routed, direct, "PF{pf} CPU bytes");
+                assert_eq!(resolved.roi, roi, "PF{pf} ROI");
+                assert_eq!(resolved.uniforms, uniforms, "PF{pf} uniforms");
+            }
+        }
+
+        #[test]
+        fn p15_uniform_values_drive_the_cpu_lane() {
+            let source = Image::solid(4, 4, [120, 130, 140, 255]);
+            let base = Image::solid(4, 4, [100, 110, 120, 255]);
+            let residual = Image::solid(4, 4, [60, 70, 80, 255]);
+            let mask = vec![200u8; 16 * 4];
+            let skin = vec![255u8; 16];
+            let roi = Roi {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            };
+            let mut silent = p15_uniforms();
+            silent.legal_alpha = 0.0;
+            silent.dark_circle_alpha = 0.0;
+            let silent = p15_job(90023, &source, &base, &residual, &mask, &skin, roi, silent);
+            let silent = router::route::<P15Wrinkle>(&silent, Backend::Cpu)
+                .expect("CPU lane")
+                .output;
+            assert_eq!(silent, source, "zero alpha must be identity");
+
+            let active = p15_job(
+                90023,
+                &source,
+                &base,
+                &residual,
+                &mask,
+                &skin,
+                roi,
+                p15_uniforms(),
+            );
+            let active = router::route::<P15Wrinkle>(&active, Backend::Cpu)
+                .expect("CPU lane")
+                .output;
+            assert_ne!(active, source, "non-zero alpha must composite");
+        }
+
+        #[test]
+        fn p15_glabella_is_refused_by_the_producer() {
+            let source = Image::solid(2, 2, [120, 130, 140, 255]);
+            let base = Image::solid(2, 2, [100, 110, 120, 255]);
+            let residual = Image::solid(2, 2, [60, 70, 80, 255]);
+            let mask = vec![200u8; 4 * 4];
+            let skin = vec![255u8; 4];
+            let error = aurora_portrait::cuda_wrinkle::resolve_p15(
+                aurora_portrait::cuda_wrinkle::P15Inputs {
+                    pf: 21024,
+                    source: &source,
+                    base: &base,
+                    residual: &residual,
+                    mask_rgba: &mask,
+                    skin_mask: &skin,
+                    roi: Roi {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    },
+                    ui: 50.0,
+                    uniforms: p15_uniforms(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                Refusal::MissingInput("PF21024 mask.r/mask.b contribution law (r76 s63 U3)")
+            );
+        }
     }
 }
 
@@ -8176,18 +9015,6 @@ fn try_cuda_effect(
                 4.68,
             ))
         }
-        21015 => {
-            let (Some(green), Some(magenta)) = (tint_green(), tint_magenta()) else {
-                return Some(Err(CudaError::Refused(Refusal::MissingInput(
-                    "skin tint LUT",
-                ))));
-            };
-            let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
-            Some(with_skin_lut(|gpu| {
-                gpu.tint(current, mask, green, magenta, ui)
-                    .map(|(image, dispatch)| (image, vec![dispatch]))
-            }))
-        }
         30096 => {
             let (Some(cold), Some(warm)) = (cold_lut(), warm_lut()) else {
                 return Some(Err(CudaError::Refused(Refusal::MissingInput(
@@ -8200,41 +9027,7 @@ fn try_cuda_effect(
                     .map(|(image, dispatch)| (image, vec![dispatch]))
             }))
         }
-        8068 => {
-            let extra = vec![255u8; mask.len()];
-            let gpu = match aurora_portrait::cuda_gloss::Gloss::open() {
-                Ok(gpu) => gpu,
-                Err(err) => return Some(Err(err)),
-            };
-            Some(gpu.apply(
-                current,
-                [&mask, &mask, &mask],
-                [&extra, &extra, &extra],
-                (degree * 100.0).clamp(0.0, 100.0),
-            ))
-        }
-        90005 => {
-            let Some(lut) = whiten_lut() else {
-                return Some(Err(CudaError::Refused(
-                    aurora_portrait::Refusal::MissingInput("whiten LUT"),
-                )));
-            };
-            Some(with_skin_lut(|gpu| {
-                gpu.skin_adjust(current, &mask, lut, degree.clamp(0.0, 1.0), pf)
-                    .map(|(image, dispatch)| (image, vec![dispatch]))
-            }))
-        }
-        90007 => {
-            let Some(lut) = ruddy_lut() else {
-                return Some(Err(CudaError::Refused(
-                    aurora_portrait::Refusal::MissingInput("ruddy LUT"),
-                )));
-            };
-            Some(with_skin_lut(|gpu| {
-                gpu.skin_adjust(current, &mask, lut, degree.clamp(0.0, 1.0), pf)
-                    .map(|(image, dispatch)| (image, vec![dispatch]))
-            }))
-        }
+        8068 | 21015 | 90005 | 90007 => cuda_router::skin_effect(pf, current, degree, mask),
         _ => None,
     }
 }

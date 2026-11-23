@@ -13,9 +13,49 @@ use crate::FilmGrain;
 /// v8 weight divisor (`op+0x2aa`).
 const LUT_SCALE: f32 = 1611.0;
 
-/// Noise amplitude at Amount = 100, as a fraction of the pixel value.
-/// shortcut: heuristic gain, C1's plane normalisation is B-level evidence.
-const GRAIN_GAIN: f32 = 0.25;
+/// Noise amplitude at Amount = 100 for the v1 path (FineGrain, SilverRich),
+/// as a fraction of the pixel value.
+///
+/// Calibrated against Capture One 16.8.6.3784: a flat 32896 field with
+/// `filmFineGrain`, Amount 100, any Granularity renders with a standard
+/// deviation of 2089 codes out of 65535 (8.13 of 255 in 8-bit). Our per-pixel
+/// plane has sigma 1, so the gain is 8.13 / (255 * 1.0) / 0.5 = 0.0637 — the
+/// extra half because the plane multiplies `1 + weight * plane * gain` and the
+/// visible deviation is measured on the pixel value.
+const GRAIN_GAIN_V1: f32 = 0.0637;
+
+/// Standard deviation of a value plane.
+fn plane_sigma(plane: &[f32]) -> f32 {
+    if plane.is_empty() {
+        return 0.0;
+    }
+    let mean = plane.iter().sum::<f32>() / plane.len() as f32;
+    let var = plane.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / plane.len() as f32;
+    var.sqrt()
+}
+
+impl crate::GrainKind {
+    /// Native v8 deviation at Amount 100 and `w = 1`, in 8-bit codes.
+    ///
+    /// Capture One on a 512x512 flat 32896 field renders 558.8 / 727.4 /
+    /// 1036.5 / 1469.2 codes of 65535 for Soft / Cubic / Tabular / Harsh at
+    /// Granularity 50. Dividing by 257 and by the visibility weight at code
+    /// 128 (`880 / 1611`) gives the amplitudes below; the slopes come from the
+    /// same three Granularity samples (Soft 293.2→1071.3, Cubic 371.9→1469.2,
+    /// Tabular 454.2→2257.5, Harsh 767.0→2817.4 over g 0..100).
+    pub(crate) fn v8_amplitude(self, granularity: f32) -> f32 {
+        use crate::GrainKind::*;
+        let (at_50, slope) = match self {
+            SoftGrain => (7.96, 0.0187),
+            CubicGrain => (10.36, 0.0198),
+            TabularGrain => (14.78, 0.0231),
+            HarshGrain => (20.94, 0.0188),
+            FineGrain | SilverRich => (1.0, 0.01875),
+        };
+        let g = if granularity.is_finite() { granularity.clamp(0.0, 100.0) } else { 50.0 };
+        at_50 * 2f32.powf(slope * (g - 50.0))
+    }
+}
 
 /// `z94048668db` — v8's visibility LUT, 257 entries as dumped from the kernel.
 /// Only indices 0..=255 are read (`p >> 8`); 256 is the array sentinel.
@@ -219,7 +259,16 @@ pub(crate) fn stage(buf: &mut [u8], w: usize, h: usize, adj: &FilmGrain, scale: 
     if composite && sigma > 0.0 {
         blur(&mut plane, w, h, sigma);
     }
-    let gain = amount * GRAIN_GAIN;
+    let mut gain = amount * GRAIN_GAIN_V1;
+    if composite {
+        // v8 composites `1 + w * plane` where `w` is the visibility weight, and
+        // the plane arrives at unit sigma: Capture One's visible deviation is
+        // proportional to the blur radius (Soft 293/559/1071 at g 0/50/100 is
+        // the 2^(0.01875 g) ratio), so the amplitude is folded in here instead
+        // of a fixed gain on a blur-weakened plane.
+        let sd = plane_sigma(&plane).max(1e-6);
+        gain = amount * adj.kind.v8_amplitude(adj.granularity) / (sd * 257.0);
+    }
     buf.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let i = x * 4;
@@ -338,6 +387,68 @@ mod tests {
             stage(&mut buf, 16, 16, &adj, 1.0);
         }
         assert_eq!(buf, base);
+    }
+
+    /// FineGrain at Amount 100 on a flat mid-grey field, measured from Capture
+    /// One: standard deviation 2089 codes of 65535 = 8.13 of 255.
+    #[test]
+    fn fine_grain_matches_the_native_deviation() {
+        let sd = |buf: &[u8]| {
+            let v: Vec<f32> = buf.chunks(4).map(|p| p[0] as f32).collect();
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+        };
+        let mut full = flat(128, 128);
+        stage(&mut full, 128, 128, &grain(GrainKind::FineGrain, 100.0, 50.0), 1.0);
+        let s100 = sd(&full);
+        assert!((s100 - 8.13).abs() < 0.4, "amount 100 std {s100}");
+        let mut half = flat(128, 128);
+        stage(&mut half, 128, 128, &grain(GrainKind::FineGrain, 50.0, 50.0), 1.0);
+        let s50 = sd(&half);
+        assert!((s50 - s100 * 0.5).abs() < 0.1, "amount 50 std {s50}");
+        // Granularity does not touch the per-pixel path.
+        let mut other = flat(128, 128);
+        stage(&mut other, 128, 128, &grain(GrainKind::FineGrain, 100.0, 100.0), 1.0);
+        assert!((sd(&other) - s100).abs() < 1e-6);
+    }
+
+    /// v8 amplitude must grow with Granularity the way Capture One does:
+    /// 293.2/558.8/1071.3 (Soft), 371.9/727.4/1469.2 (Cubic),
+    /// 454.2/1036.5/2257.5 (Tabular), 767.0/1469.2/2817.4 (Harsh) at g 0/50/100.
+    #[test]
+    fn v8_granularity_ratios_match_the_native_renders() {
+        let sd = |buf: &[u8]| {
+            let v: Vec<f32> = buf.chunks(4).map(|p| p[0] as f32).collect();
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+        };
+        let cases = [
+            (GrainKind::SoftGrain, [0.525f32, 1.0, 1.917]),
+            (GrainKind::CubicGrain, [0.511, 1.0, 2.020]),
+            (GrainKind::TabularGrain, [0.438, 1.0, 2.178]),
+            (GrainKind::HarshGrain, [0.522, 1.0, 1.917]),
+        ];
+        for (kind, want) in cases {
+            let mut got = [0.0f32; 3];
+            for (i, g) in [0.0f32, 50.0, 100.0].into_iter().enumerate() {
+                let mut buf = flat(96, 128);
+                stage(&mut buf, 96, 96, &grain(kind, 100.0, g), 1.0);
+                got[i] = sd(&buf);
+            }
+            for i in 0..3 {
+                let ratio = got[i] / got[1];
+                assert!(
+                    (ratio - want[i]).abs() < want[i] * 0.10,
+                    "{kind:?} g{}: ratio {ratio} vs {}",
+                    [0, 50, 100][i],
+                    want[i]
+                );
+            }
+            // The slider still scales the v8 path linearly.
+            let mut half = flat(96, 128);
+            stage(&mut half, 96, 96, &grain(kind, 50.0, 50.0), 1.0);
+            assert!((sd(&half) - got[1] * 0.5).abs() < got[1] * 0.05, "{kind:?} amount 50");
+        }
     }
 
     #[test]

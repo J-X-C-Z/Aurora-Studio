@@ -433,6 +433,40 @@ fn preserve_unchanged_values(text: &str, original: &[(String, String)]) -> Strin
     out
 }
 
+/// The `.cos` edits that turn a layer's current `K`/`V` pairs into
+/// `adjustments`. Reuses the `.costyle` writer's number spelling; `Name` is
+/// skipped because `.cos` layers do not carry it.
+pub fn cos_edits(
+    tag: &str,
+    adjustments: &AdjustmentSet,
+    original: &[(String, String)],
+) -> Vec<crate::c1_cos::CosEdit> {
+    let preset = C1Preset {
+        id: String::new(),
+        name: String::new(),
+        group: String::new(),
+        kind: PresetKind::Style,
+        adjustments: adjustments.clone(),
+        unmapped: Vec::new(),
+        orig: original.to_vec(),
+        color_corrections: Vec::new(),
+    };
+    let text = preserve_unchanged_values(&crate::presets::sl_text(&preset), original);
+    let mapped = crate::presets::mapped_values(adjustments, &[]);
+    crate::presets::parse_sl(&text)
+        .into_iter()
+        .filter(|(key, _)| key != "Name")
+        .filter(|(_, value)| !value.is_empty())
+        .filter(|(key, value)| match original.iter().find(|(existing, _)| existing == key) {
+            Some((_, existing)) => existing != value,
+            None => mapped
+                .iter()
+                .any(|(mapped, text, is_default)| mapped == key && text == value && !*is_default),
+        })
+        .map(|(key, value)| crate::c1_cos::CosEdit::new(tag, key, value))
+        .collect()
+}
+
 /// The text between `prefix` and the next `"` in a generated `<E/>` line.
 fn attribute<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     let start = line.find(prefix)? + prefix.len();
@@ -684,6 +718,28 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn cos_edits_only_report_values_that_changed() {
+        let original = vec![
+            ("Exposure".to_string(), "1.25".to_string()),
+            ("Contrast".to_string(), "-8".to_string()),
+        ];
+        let mut adjustments = AdjustmentSet::default();
+        adjustments.exposure.exposure = -0.25;
+        adjustments.exposure.contrast = -8.0;
+
+        let edits = cos_edits("DL", &adjustments, &original);
+        let exposure: Vec<&crate::c1_cos::CosEdit> =
+            edits.iter().filter(|edit| edit.key == "Exposure").collect();
+        assert_eq!(exposure.len(), 1);
+        assert_eq!(exposure[0].tag, "DL");
+        assert_eq!(exposure[0].value, "-0.25");
+
+        // The untouched value keeps the file's own spelling and is not an edit.
+        assert!(!edits.iter().any(|edit| edit.key == "Contrast"));
+        assert!(!edits.iter().any(|edit| edit.key == "Name"));
+    }
+
     fn testdata(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-styles").join(name)
     }
@@ -693,8 +749,12 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str, body: &[u8]) -> Self {
+            // Tests run in parallel; two files with the same name would let one
+            // `Drop` delete the other's file mid-read.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir()
-                .join(format!("portrait-c1-style-{}-{name}", std::process::id()));
+                .join(format!("portrait-c1-style-{}-{n}-{name}", std::process::id()));
             std::fs::write(&path, body).expect("temp file");
             Self(path)
         }

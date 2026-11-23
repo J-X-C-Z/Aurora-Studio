@@ -399,7 +399,7 @@ fn escape(value: &str) -> String {
 
 /// The mapped keys of an adjustment set, in the encoding `parse_sl` reads,
 /// each with whether it still holds the engine's default value.
-fn mapped_values(a: &AdjustmentSet, corrections: &[[f32; 18]]) -> Vec<(String, String, bool)> {
+pub(crate) fn mapped_values(a: &AdjustmentSet, corrections: &[[f32; 18]]) -> Vec<(String, String, bool)> {
     let d = AdjustmentSet::default();
     let mut out: Vec<(String, String, bool)> = Vec::new();
     macro_rules! num {
