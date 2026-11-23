@@ -1,0 +1,5987 @@
+{
+  "blocker": {
+    "detail": "No assets/PE path exists in the public Resources tree, pixcook tar names, Qt RCC names, independent PAK names, or PE overlay bytes.",
+    "exact": "assets/PE",
+    "kind": "namespace"
+  },
+  "candidate_paths": [],
+  "install_root": "C:\\Program Files\\PixCake\\pixcake_2",
+  "moisture_bindings": {
+    "beauty": {
+      "named_refusal": "MissingInput(\"PF90002_BEAUTY\")",
+      "status": "MISSING_VENDOR_ASSET"
+    },
+    "blur_alpha": {
+      "named_refusal": "MissingInput(\"PF90002_BLUR_ALPHA\")",
+      "status": "MISSING_VENDOR_ASSET"
+    },
+    "hardlight": {
+      "named_refusal": "MissingInput(\"PF90002_HARDLIGHT\")",
+      "status": "MISSING_VENDOR_ASSET"
+    },
+    "skin_map": {
+      "named_refusal": "MissingInput(\"PF90002_SKIN_MAP\")",
+      "status": "MISSING_VENDOR_ASSET"
+    }
+  },
+  "namespace": "assets/PE",
+  "namespace_matches": [],
+  "pe_overlays": [
+    {
+      "namespace_matches": [],
+      "overlay_head_hex": "002a000000020200308229ee06092a864886f70d010702a08229df308229db02",
+      "overlay_offset": 257381888,
+      "overlay_sha256": "291e3b241d48cd5cba8d20a505bf0c67773791f4504643e942b0fffab4be4177",
+      "overlay_size": 10752,
+      "path": "pixcake.exe",
+      "sha256": "a84519da489bc52e4e914af7880ede43e3ce58992657723d02197161832464c7",
+      "size": 257392640
+    },
+    {
+      "namespace_matches": [],
+      "overlay_head_hex": "002a000000020200308229ee06092a864886f70d010702a08229df308229db02",
+      "overlay_offset": 235836416,
+      "overlay_sha256": "af6d1648cfdd28fcc6b1a67fb03697999ba26e74606ca68bb7b5d2aa11ae80fa",
+      "overlay_size": 10752,
+      "path": "pix-worker.exe",
+      "sha256": "509d22938469906d353d44c355f4aa1e445f81ea56ca288a540ae5553cc96b84",
+      "size": 235847168
+    }
+  ],
+  "pixcook": {
+    "candidate_entries": [],
+    "entries": 3106,
+    "namespace_matches": [],
+    "path": "pixcook",
+    "roots": {
+      "<root>": 2080,
+      "Configure": 22,
+      "InnerMaterial": 4,
+      "glsl": 1000
+    },
+    "samplers": {
+      "s_beauty_map_texture": [
+        {
+          "data_offset": 2068168192,
+          "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcess.frag",
+          "sha256": "1831a8c37e54a7ecad45abe89d8bb984dd97ec0571237d8631bacf41a4f1f0f8",
+          "size": 1654
+        },
+        {
+          "data_offset": 2068171776,
+          "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithMask.frag",
+          "sha256": "0c7735a8bc8b84eecc2b09238d3ef815e2e86b5b89690ddaae7aa343345af3db",
+          "size": 3008
+        },
+        {
+          "data_offset": 2068175360,
+          "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithTwoMask.frag",
+          "sha256": "58af7a0c8d579f1ca58222a4613202ddd576c3580f1ac74eda73f1a1078cdf3a",
+          "size": 4478
+        },
+        {
+          "data_offset": 2068527104,
+          "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcess.frag",
+          "sha256": "1831a8c37e54a7ecad45abe89d8bb984dd97ec0571237d8631bacf41a4f1f0f8",
+          "size": 1654
+        },
+        {
+          "data_offset": 2068530688,
+          "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithMask.frag",
+          "sha256": "0c7735a8bc8b84eecc2b09238d3ef815e2e86b5b89690ddaae7aa343345af3db",
+          "size": 3008
+        },
+        {
+          "data_offset": 2068534272,
+          "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithTwoMask.frag",
+          "sha256": "58af7a0c8d579f1ca58222a4613202ddd576c3580f1ac74eda73f1a1078cdf3a",
+          "size": 4478
+        }
+      ],
+      "s_blur_texture": [
+        {
+          "data_offset": 2068180480,
+          "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+          "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+          "size": 1510
+        },
+        {
+          "data_offset": 2068539392,
+          "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+          "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+          "size": 1510
+        },
+        {
+          "data_offset": 2069040128,
+          "path": "glsl/glsl/LipColor/LipMultiColors.frag",
+          "sha256": "627fc41016da343ac0afd591f7685fbcd65ff09d73da96d5e2e6729d6e70bb09",
+          "size": 5625
+        },
+        {
+          "data_offset": 2069579776,
+          "path": "glsl/glsl/Sharpness/Sharpness.frag",
+          "sha256": "298ab3b69a5b8e297348cc09c398c7af19e001e5ec490789e3d15961820925c8",
+          "size": 1526
+        },
+        {
+          "data_offset": 2069726208,
+          "path": "glsl/glsl/Spotless/SpotlessProcessNormal.frag",
+          "sha256": "d23e69c49295a40cb1f9f4f005d0ed78cb128a3f8f3eab11dc6b9fad0c22f36d",
+          "size": 3895
+        },
+        {
+          "data_offset": 2069730816,
+          "path": "glsl/glsl/Spotless/SpotlessProcessWithSkinMask.frag",
+          "sha256": "b049130c80ffc3af87b8b516ffd6f37eac89b1af4e05a34020beacb84170f568",
+          "size": 2686
+        },
+        {
+          "data_offset": 2070106112,
+          "path": "glsl/LipColor/LipMultiColors.frag",
+          "sha256": "627fc41016da343ac0afd591f7685fbcd65ff09d73da96d5e2e6729d6e70bb09",
+          "size": 5625
+        },
+        {
+          "data_offset": 2070426112,
+          "path": "glsl/Sharpness/Sharpness.frag",
+          "sha256": "298ab3b69a5b8e297348cc09c398c7af19e001e5ec490789e3d15961820925c8",
+          "size": 1526
+        },
+        {
+          "data_offset": 2070572544,
+          "path": "glsl/Spotless/SpotlessProcessNormal.frag",
+          "sha256": "d23e69c49295a40cb1f9f4f005d0ed78cb128a3f8f3eab11dc6b9fad0c22f36d",
+          "size": 3895
+        },
+        {
+          "data_offset": 2070577152,
+          "path": "glsl/Spotless/SpotlessProcessWithSkinMask.frag",
+          "sha256": "b049130c80ffc3af87b8b516ffd6f37eac89b1af4e05a34020beacb84170f568",
+          "size": 2686
+        }
+      ],
+      "s_hardlight_map_texture": [
+        {
+          "data_offset": 2068180480,
+          "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+          "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+          "size": 1510
+        },
+        {
+          "data_offset": 2068539392,
+          "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+          "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+          "size": 1510
+        }
+      ],
+      "s_skin_map_texture": [
+        {
+          "data_offset": 2068180480,
+          "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+          "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+          "size": 1510
+        },
+        {
+          "data_offset": 2068539392,
+          "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+          "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+          "size": 1510
+        }
+      ]
+    },
+    "sha256": "50eab3c3efd946400f7b9abea6021b50ceb3d6798e1b948eac6fd04a800ff96f",
+    "size": 2071019532
+  },
+  "rcc_packages": [
+    {
+      "candidate_entries": [],
+      "data_offset": 24,
+      "entries": 751,
+      "namespace_matches": [],
+      "path": "PixCakeMaterial.rcc",
+      "sha256": "43730e7ec95a88097e9580fa4af274d9765539e6a7c398ffcfd56e5e1afd7af8",
+      "size": 13772398
+    },
+    {
+      "candidate_entries": [],
+      "data_offset": 24,
+      "entries": 3950,
+      "namespace_matches": [],
+      "path": "PixCakeSequenceFrame.rcc",
+      "sha256": "93a4f83ecc3ec0f1e34b59da8ac98c409885d0ec892f2996dbf220fa13579c4e",
+      "size": 108015402
+    }
+  ],
+  "resources_tree": {
+    "candidate_files": [
+      {
+        "path": "effect/config/BgEnhance/filter.png",
+        "roles": [],
+        "size": 181425
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000001/bg.jxl",
+        "roles": [],
+        "size": 1842
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000002/bg.jxl",
+        "roles": [],
+        "size": 39091
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000003/bg.jxl",
+        "roles": [],
+        "size": 1606
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000004/bg.jxl",
+        "roles": [],
+        "size": 1577
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000005/bg.jxl",
+        "roles": [],
+        "size": 197118
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000006/bg.jxl",
+        "roles": [],
+        "size": 2307
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000007/bg.jxl",
+        "roles": [],
+        "size": 270944
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000008/bg.jxl",
+        "roles": [],
+        "size": 238777
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000009/bg.jxl",
+        "roles": [],
+        "size": 251014
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000010/bg.jxl",
+        "roles": [],
+        "size": 179921
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000011/bg.jxl",
+        "roles": [],
+        "size": 262220
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000012/bg.jxl",
+        "roles": [],
+        "size": 239946
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000013/bg.jxl",
+        "roles": [],
+        "size": 249951
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000014/bg.jxl",
+        "roles": [],
+        "size": 233102
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000015/bg.jxl",
+        "roles": [],
+        "size": 265450
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000016/bg.jxl",
+        "roles": [],
+        "size": 2334
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000017/bg.jxl",
+        "roles": [],
+        "size": 361888
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000018/bg.jxl",
+        "roles": [],
+        "size": 214438
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000019/bg.jxl",
+        "roles": [],
+        "size": 263528
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000020/bg.jxl",
+        "roles": [],
+        "size": 242548
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000021/bg.jxl",
+        "roles": [],
+        "size": 2535
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000022/bg.jxl",
+        "roles": [],
+        "size": 2479
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000023/bg.jxl",
+        "roles": [],
+        "size": 2502
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000024/bg.jxl",
+        "roles": [],
+        "size": 2496
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000025/bg.jxl",
+        "roles": [],
+        "size": 2503
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000026/bg.jxl",
+        "roles": [],
+        "size": 2506
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000027/bg.jxl",
+        "roles": [],
+        "size": 264865
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000028/bg.jxl",
+        "roles": [],
+        "size": 2502
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000029/bg.jxl",
+        "roles": [],
+        "size": 274011
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000030/bg.jxl",
+        "roles": [],
+        "size": 2529
+      },
+      {
+        "path": "effect/config/BgReplace/BG00000031/bg.jxl",
+        "roles": [],
+        "size": 2491
+      },
+      {
+        "path": "effect/config/BrightEye/eye_pupil.png",
+        "roles": [],
+        "size": 10397
+      },
+      {
+        "path": "effect/config/BrightEye/left_eye.png",
+        "roles": [],
+        "size": 14381
+      },
+      {
+        "path": "effect/config/BrightEye/ly.png",
+        "roles": [],
+        "size": 61914
+      },
+      {
+        "path": "effect/config/BrightEye/right_eye.png",
+        "roles": [],
+        "size": 14087
+      },
+      {
+        "path": "effect/config/Craft/IdPhoto/resource/model_fake_neck_mask.png",
+        "roles": [],
+        "size": 18015
+      },
+      {
+        "path": "effect/config/Craft/IdPhoto/resource/model_fake_neck_shadow.png",
+        "roles": [],
+        "size": 111026
+      },
+      {
+        "path": "effect/config/FaceStereo/model_FaceStereoShadow_gg.png",
+        "roles": [],
+        "size": 113988
+      },
+      {
+        "path": "effect/config/FaceStereo/model_FaceStereoShadow_gg_SideFace.png",
+        "roles": [],
+        "size": 153562
+      },
+      {
+        "path": "effect/config/FaceStereo/model_FaceStereoShadow_yy.png",
+        "roles": [],
+        "size": 69894
+      },
+      {
+        "path": "effect/config/FaceStereo/model_FaceStereoShadow_yy_SideFace.png",
+        "roles": [],
+        "size": 128130
+      },
+      {
+        "path": "effect/config/FaceSurgery/V1/face/Grid_2004_Negative.png",
+        "roles": [],
+        "size": 5751
+      },
+      {
+        "path": "effect/config/FaceSurgery/V1/face/smface.png",
+        "roles": [],
+        "size": 8046
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2004.png",
+        "roles": [],
+        "size": 8046
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2004_Negative.png",
+        "roles": [],
+        "size": 5751
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2005.png",
+        "roles": [],
+        "size": 9769
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2006_Negative.png",
+        "roles": [],
+        "size": 2022
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2006_Positive.png",
+        "roles": [],
+        "size": 2135
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2007_Negative.png",
+        "roles": [],
+        "size": 2365
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2007_Positive.png",
+        "roles": [],
+        "size": 2403
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2008_Negative.png",
+        "roles": [],
+        "size": 3547
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2008_Positive.png",
+        "roles": [],
+        "size": 3328
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2009_Negative.png",
+        "roles": [],
+        "size": 3425
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2009_Positive.png",
+        "roles": [],
+        "size": 3106
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2010_Negative.png",
+        "roles": [],
+        "size": 1073
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2010_Positive.png",
+        "roles": [],
+        "size": 1348
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2011_Negative.png",
+        "roles": [],
+        "size": 1019
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/Grid_2011_Positive.png",
+        "roles": [],
+        "size": 1310
+      },
+      {
+        "path": "effect/config/FaceSurgery/V2/face/M_Mouth_Positive.png",
+        "roles": [],
+        "size": 621
+      },
+      {
+        "path": "effect/config/Filters/FT00000001/filter.png",
+        "roles": [],
+        "size": 95539
+      },
+      {
+        "path": "effect/config/Filters/FT00000002/filter.png",
+        "roles": [],
+        "size": 167427
+      },
+      {
+        "path": "effect/config/Filters/FT00000003/filter.png",
+        "roles": [],
+        "size": 130857
+      },
+      {
+        "path": "effect/config/Filters/FT00000004/filter.png",
+        "roles": [],
+        "size": 212813
+      },
+      {
+        "path": "effect/config/Filters/FT00000005/filter.png",
+        "roles": [],
+        "size": 223816
+      },
+      {
+        "path": "effect/config/Filters/FT00000006/filter.png",
+        "roles": [],
+        "size": 320295
+      },
+      {
+        "path": "effect/config/Filters/FT00000007/filter.png",
+        "roles": [],
+        "size": 282310
+      },
+      {
+        "path": "effect/config/Filters/FT00000008/filter.png",
+        "roles": [],
+        "size": 112020
+      },
+      {
+        "path": "effect/config/Filters/FT00000009/filter.png",
+        "roles": [],
+        "size": 262757
+      },
+      {
+        "path": "effect/config/Filters/FT00000010/filter.png",
+        "roles": [],
+        "size": 321996
+      },
+      {
+        "path": "effect/config/Filters/FT00000011/filter.png",
+        "roles": [],
+        "size": 243055
+      },
+      {
+        "path": "effect/config/Filters/FT00000012/filter.png",
+        "roles": [],
+        "size": 259323
+      },
+      {
+        "path": "effect/config/Filters/FT00000013/filter.png",
+        "roles": [],
+        "size": 240530
+      },
+      {
+        "path": "effect/config/Filters/FT00000014/filter.png",
+        "roles": [],
+        "size": 252805
+      },
+      {
+        "path": "effect/config/Filters/FT00000015/filter.png",
+        "roles": [],
+        "size": 218687
+      },
+      {
+        "path": "effect/config/Filters/FT00000016/filter.png",
+        "roles": [],
+        "size": 96920
+      },
+      {
+        "path": "effect/config/Filters/FT00000017/filter.png",
+        "roles": [],
+        "size": 243454
+      },
+      {
+        "path": "effect/config/Filters/FT00000018/filter.png",
+        "roles": [],
+        "size": 254398
+      },
+      {
+        "path": "effect/config/Filters/FT00000019/filter.png",
+        "roles": [],
+        "size": 147058
+      },
+      {
+        "path": "effect/config/Filters/FT00000020/filter.png",
+        "roles": [],
+        "size": 206844
+      },
+      {
+        "path": "effect/config/Filters/FT00000021/filter.png",
+        "roles": [],
+        "size": 274896
+      },
+      {
+        "path": "effect/config/Filters/FT00000022/filter.png",
+        "roles": [],
+        "size": 226536
+      },
+      {
+        "path": "effect/config/Filters/FT00000023/filter.png",
+        "roles": [],
+        "size": 249534
+      },
+      {
+        "path": "effect/config/Filters/FT00000024/filter.png",
+        "roles": [],
+        "size": 215593
+      },
+      {
+        "path": "effect/config/Filters/FT00000025/filter.png",
+        "roles": [],
+        "size": 205872
+      },
+      {
+        "path": "effect/config/Filters/FT00000026/filter.png",
+        "roles": [],
+        "size": 232863
+      },
+      {
+        "path": "effect/config/Filters/FT00000027/filter.png",
+        "roles": [],
+        "size": 254495
+      },
+      {
+        "path": "effect/config/Filters/FT00000028/filter.png",
+        "roles": [],
+        "size": 237623
+      },
+      {
+        "path": "effect/config/Filters/FT00000029/filter.png",
+        "roles": [],
+        "size": 267240
+      },
+      {
+        "path": "effect/config/Filters/FT00000030/filter.png",
+        "roles": [],
+        "size": 129524
+      },
+      {
+        "path": "effect/config/Filters/FT00000031/filter.png",
+        "roles": [],
+        "size": 253947
+      },
+      {
+        "path": "effect/config/Filters/FT00000032/filter.png",
+        "roles": [],
+        "size": 266575
+      },
+      {
+        "path": "effect/config/Filters/FT00000033/filter.png",
+        "roles": [],
+        "size": 203804
+      },
+      {
+        "path": "effect/config/Filters/FT00000034/filter.png",
+        "roles": [],
+        "size": 181211
+      },
+      {
+        "path": "effect/config/Filters/FT00000035/filter.png",
+        "roles": [],
+        "size": 242594
+      },
+      {
+        "path": "effect/config/Filters/FT00000036/filter.png",
+        "roles": [],
+        "size": 208147
+      },
+      {
+        "path": "effect/config/Filters/FT00000037/filter.png",
+        "roles": [],
+        "size": 310059
+      },
+      {
+        "path": "effect/config/Filters/FT00000038/filter.png",
+        "roles": [],
+        "size": 259971
+      },
+      {
+        "path": "effect/config/Filters/FT00000039/filter.png",
+        "roles": [],
+        "size": 256469
+      },
+      {
+        "path": "effect/config/Filters/FT00000040/filter.png",
+        "roles": [],
+        "size": 241033
+      },
+      {
+        "path": "effect/config/Filters/FT00000041/filter.png",
+        "roles": [],
+        "size": 264636
+      },
+      {
+        "path": "effect/config/Filters/FT00000042/filter.png",
+        "roles": [],
+        "size": 285581
+      },
+      {
+        "path": "effect/config/Filters/FT00000043/filter.png",
+        "roles": [],
+        "size": 264851
+      },
+      {
+        "path": "effect/config/Filters/FT00000044/filter.png",
+        "roles": [],
+        "size": 310420
+      },
+      {
+        "path": "effect/config/Filters/FT00000045/filter.png",
+        "roles": [],
+        "size": 306480
+      },
+      {
+        "path": "effect/config/Filters/FT00000046/filter.png",
+        "roles": [],
+        "size": 265407
+      },
+      {
+        "path": "effect/config/Filters/FT00000047/filter.png",
+        "roles": [],
+        "size": 220028
+      },
+      {
+        "path": "effect/config/Filters/FT00000048/filter.png",
+        "roles": [],
+        "size": 309065
+      },
+      {
+        "path": "effect/config/Filters/FT00000049/filter.png",
+        "roles": [],
+        "size": 287230
+      },
+      {
+        "path": "effect/config/Filters/FT00000050/filter.png",
+        "roles": [],
+        "size": 312010
+      },
+      {
+        "path": "effect/config/Filters/FT00000051/filter.png",
+        "roles": [],
+        "size": 266854
+      },
+      {
+        "path": "effect/config/Filters/FT00000052/filter.png",
+        "roles": [],
+        "size": 309594
+      },
+      {
+        "path": "effect/config/Filters/FT00000053/filter.png",
+        "roles": [],
+        "size": 276232
+      },
+      {
+        "path": "effect/config/Filters/FT00000054/filter.png",
+        "roles": [],
+        "size": 225523
+      },
+      {
+        "path": "effect/config/Filters/FT00000055/filter.png",
+        "roles": [],
+        "size": 226664
+      },
+      {
+        "path": "effect/config/Filters/FT00000056/filter.png",
+        "roles": [],
+        "size": 284467
+      },
+      {
+        "path": "effect/config/Filters/FT00000057/filter.png",
+        "roles": [],
+        "size": 301695
+      },
+      {
+        "path": "effect/config/Filters/FT00000058/filter.png",
+        "roles": [],
+        "size": 293942
+      },
+      {
+        "path": "effect/config/Filters/FT00000059/filter.png",
+        "roles": [],
+        "size": 312562
+      },
+      {
+        "path": "effect/config/Filters/FT00000060/filter.png",
+        "roles": [],
+        "size": 267145
+      },
+      {
+        "path": "effect/config/Filters/FT00000061/filter.png",
+        "roles": [],
+        "size": 328864
+      },
+      {
+        "path": "effect/config/Filters/FT00000062/filter.png",
+        "roles": [],
+        "size": 246238
+      },
+      {
+        "path": "effect/config/Filters/FT00000063/filter.png",
+        "roles": [],
+        "size": 269025
+      },
+      {
+        "path": "effect/config/Filters/FT00000064/filter.png",
+        "roles": [],
+        "size": 288526
+      },
+      {
+        "path": "effect/config/Filters/FT00000065/filter.png",
+        "roles": [],
+        "size": 323654
+      },
+      {
+        "path": "effect/config/Filters/FT00000066/filter.png",
+        "roles": [],
+        "size": 231933
+      },
+      {
+        "path": "effect/config/Filters/FT00000067/filter.png",
+        "roles": [],
+        "size": 286451
+      },
+      {
+        "path": "effect/config/Filters/FT00000068/filter.png",
+        "roles": [],
+        "size": 284252
+      },
+      {
+        "path": "effect/config/Filters/FT00000069/filter.png",
+        "roles": [],
+        "size": 295786
+      },
+      {
+        "path": "effect/config/Filters/FT00000070/filter.png",
+        "roles": [],
+        "size": 281511
+      },
+      {
+        "path": "effect/config/Filters/FT00000071/filter.png",
+        "roles": [],
+        "size": 257234
+      },
+      {
+        "path": "effect/config/Filters/FT00000072/filter.png",
+        "roles": [],
+        "size": 308356
+      },
+      {
+        "path": "effect/config/Filters/FT00000073/filter.png",
+        "roles": [],
+        "size": 202478
+      },
+      {
+        "path": "effect/config/Filters/FT00000074/filter.png",
+        "roles": [],
+        "size": 301376
+      },
+      {
+        "path": "effect/config/Filters/FT00000075/filter.png",
+        "roles": [],
+        "size": 88681
+      },
+      {
+        "path": "effect/config/Filters/FT00000076/filter.png",
+        "roles": [],
+        "size": 122181
+      },
+      {
+        "path": "effect/config/Filters/FT00000077/filter.png",
+        "roles": [],
+        "size": 222997
+      },
+      {
+        "path": "effect/config/Filters/FT00000078/filter.png",
+        "roles": [],
+        "size": 225864
+      },
+      {
+        "path": "effect/config/Filters/FT00000079/filter.png",
+        "roles": [],
+        "size": 235225
+      },
+      {
+        "path": "effect/config/Filters/FT00000080/filter.png",
+        "roles": [],
+        "size": 237357
+      },
+      {
+        "path": "effect/config/Filters/FT00000081/filter.png",
+        "roles": [],
+        "size": 231501
+      },
+      {
+        "path": "effect/config/Filters/FT00000082/filter.png",
+        "roles": [],
+        "size": 232635
+      },
+      {
+        "path": "effect/config/Filters/FT00000083/filter.png",
+        "roles": [],
+        "size": 224714
+      },
+      {
+        "path": "effect/config/Filters/FT00000084/filter.png",
+        "roles": [],
+        "size": 230451
+      },
+      {
+        "path": "effect/config/Filters/FT00000085/filter.png",
+        "roles": [],
+        "size": 239659
+      },
+      {
+        "path": "effect/config/Filters/FT00000086/filter.png",
+        "roles": [],
+        "size": 232628
+      },
+      {
+        "path": "effect/config/Filters/FT00000087/filter.png",
+        "roles": [],
+        "size": 242810
+      },
+      {
+        "path": "effect/config/Filters/FT00000088/filter.png",
+        "roles": [],
+        "size": 237960
+      },
+      {
+        "path": "effect/config/Filters/FT00000089/filter.png",
+        "roles": [],
+        "size": 251909
+      },
+      {
+        "path": "effect/config/Filters/FT00000090/filter.png",
+        "roles": [],
+        "size": 235043
+      },
+      {
+        "path": "effect/config/Filters/FT00000091/filter.png",
+        "roles": [],
+        "size": 241259
+      },
+      {
+        "path": "effect/config/Filters/FT00000092/filter.png",
+        "roles": [],
+        "size": 245603
+      },
+      {
+        "path": "effect/config/LensBlur/color_img.jpg",
+        "roles": [],
+        "size": 16081
+      },
+      {
+        "path": "effect/config/LensBlur/Kernel/cataeye.png",
+        "roles": [],
+        "size": 21621
+      },
+      {
+        "path": "effect/config/LensBlur/Kernel/circular.png",
+        "roles": [],
+        "size": 16725
+      },
+      {
+        "path": "effect/config/LensBlur/Kernel/Disk.png",
+        "roles": [],
+        "size": 4671
+      },
+      {
+        "path": "effect/config/LensBlur/Kernel/octagon.png",
+        "roles": [],
+        "size": 14990
+      },
+      {
+        "path": "effect/config/LensBlur/Kernel/pentagon.png",
+        "roles": [],
+        "size": 19356
+      },
+      {
+        "path": "effect/config/MakeupEnhance/0000.png",
+        "roles": [],
+        "size": 16419
+      },
+      {
+        "path": "effect/config/MakeupEnhance/111.png",
+        "roles": [],
+        "size": 25366
+      },
+      {
+        "path": "effect/config/MakeupEnhance/222.png",
+        "roles": [],
+        "size": 25228
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeBrowDodgeLUT.jpg",
+        "roles": [],
+        "size": 429146
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeBrowLUT.jpg",
+        "roles": [],
+        "size": 417282
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeLeftMask.png",
+        "roles": [],
+        "size": 51842
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeLumaNegative.png",
+        "roles": [],
+        "size": 66290
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeLumaPositive.png",
+        "roles": [],
+        "size": 44231
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeRightMask.png",
+        "roles": [],
+        "size": 47455
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeSaturationNegative.png",
+        "roles": [],
+        "size": 216806
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeSaturationPositive.png",
+        "roles": [],
+        "size": 140993
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeShadowDodgeLUT.png",
+        "roles": [],
+        "size": 70504
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeShadowLUT.jpg",
+        "roles": [],
+        "size": 477325
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeStereoLeft.png",
+        "roles": [],
+        "size": 56671
+      },
+      {
+        "path": "effect/config/MakeupEnhance/EyeStereoRight.png",
+        "roles": [],
+        "size": 55808
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipDodgeLUT.png",
+        "roles": [],
+        "size": 138299
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipLumaNegitive.png",
+        "roles": [],
+        "size": 53547
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipLumaPositive.png",
+        "roles": [],
+        "size": 27235
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipMask.png",
+        "roles": [],
+        "size": 10070
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipSaturationNegitive.png",
+        "roles": [],
+        "size": 148263
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipSaturationPositive.png",
+        "roles": [],
+        "size": 140710
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipsLUT.png",
+        "roles": [],
+        "size": 174180
+      },
+      {
+        "path": "effect/config/MakeupEnhance/LipStereo.png",
+        "roles": [],
+        "size": 9771
+      },
+      {
+        "path": "effect/config/MakeupEnhance/mmy.png",
+        "roles": [],
+        "size": 16807
+      },
+      {
+        "path": "effect/config/MakeupEnhance/mmz.png",
+        "roles": [],
+        "size": 15628
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000001/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000001/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000001/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000001/hw1.png",
+        "roles": [],
+        "size": 8544
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000002/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000002/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000002/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000002/hw2.png",
+        "roles": [],
+        "size": 11844
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000003/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000003/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000003/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000003/hw3.png",
+        "roles": [],
+        "size": 10873
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000004/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000004/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000004/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000004/pp1.png",
+        "roles": [],
+        "size": 7484
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000005/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000005/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000005/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000005/pp2.png",
+        "roles": [],
+        "size": 11420
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000006/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000006/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000006/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000006/pp3.png",
+        "roles": [],
+        "size": 6713
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000007/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000007/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000007/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000007/pp4.png",
+        "roles": [],
+        "size": 9169
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000008/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000008/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000008/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000008/pp5.png",
+        "roles": [],
+        "size": 9897
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000009/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000009/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000009/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000009/ty1.png",
+        "roles": [],
+        "size": 3906
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000010/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000010/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000010/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000010/ty2.png",
+        "roles": [],
+        "size": 3650
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000011/eye_mask_left.png",
+        "roles": [],
+        "size": 18278
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000011/eye_mask_right.png",
+        "roles": [],
+        "size": 18105
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000011/eye_pupil.png",
+        "roles": [],
+        "size": 13409
+      },
+      {
+        "path": "effect/config/Makeups/AnimalCatchlights/MUACL0000011/ty3.png",
+        "roles": [],
+        "size": 5783
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000001/model_Blusher_4001.png",
+        "roles": [],
+        "size": 39594
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL000000010/sh2.png",
+        "roles": [],
+        "size": 52420
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL000000011/sh.png",
+        "roles": [],
+        "size": 45667
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL000000012/sh.png",
+        "roles": [],
+        "size": 38469
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000002/model_Blusher_4001.png",
+        "roles": [],
+        "size": 45082
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000003/model_Blusher_4001.png",
+        "roles": [],
+        "size": 30789
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000004/model_Blusher_4001.png",
+        "roles": [],
+        "size": 42671
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000005/model_Blusher_4001.png",
+        "roles": [],
+        "size": 55962
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000006/model_Blusher_4001.png",
+        "roles": [],
+        "size": 44805
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000007/model_Blusher_4001.png",
+        "roles": [],
+        "size": 32226
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000008/model_Blusher_4001.png",
+        "roles": [],
+        "size": 81452
+      },
+      {
+        "path": "effect/config/Makeups/Blusher/MUBL00000009/model_Blusher_4001.png",
+        "roles": [],
+        "size": 79246
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000001/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000001/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000001/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000001/yx.png",
+        "roles": [],
+        "size": 174589
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000002/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000002/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000002/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000002/sgy.png",
+        "roles": [],
+        "size": 99717
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000003/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000003/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000003/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000003/tyjfg.png",
+        "roles": [],
+        "size": 117199
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000004/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000004/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000004/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000004/zrjyfg.png",
+        "roles": [],
+        "size": 79531
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000005/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000005/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000005/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000005/zyfx.png",
+        "roles": [],
+        "size": 167311
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000006/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000006/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000006/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000006/zylhd.png",
+        "roles": [],
+        "size": 78610
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000007/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000007/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000007/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000007/ldjyfg.png",
+        "roles": [],
+        "size": 84751
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000008/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000008/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000008/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000008/pwx.png",
+        "roles": [],
+        "size": 127156
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000009/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000009/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000009/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000009/sbbx.png",
+        "roles": [],
+        "size": 118611
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000010/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000010/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000010/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000010/ysx.png",
+        "roles": [],
+        "size": 263297
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000011/cfx.png",
+        "roles": [],
+        "size": 126131
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000011/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000011/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000011/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000012/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000012/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000012/eye_pupil.png",
+        "roles": [],
+        "size": 8575
+      },
+      {
+        "path": "effect/config/Makeups/Catchlights/MUCL00000012/zybj.png",
+        "roles": [],
+        "size": 112005
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000001/01.png",
+        "roles": [],
+        "size": 232812
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000001/01_SideFace.png",
+        "roles": [],
+        "size": 215774
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000002/02.png",
+        "roles": [],
+        "size": 285774
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000002/02_SideFace.png",
+        "roles": [],
+        "size": 429204
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000003/03.png",
+        "roles": [],
+        "size": 201810
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000003/03_SideFace.png",
+        "roles": [],
+        "size": 320291
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000004/04.png",
+        "roles": [],
+        "size": 179277
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000004/04_SideFace.png",
+        "roles": [],
+        "size": 344533
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000005/05.png",
+        "roles": [],
+        "size": 229949
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000005/05_SideFace.png",
+        "roles": [],
+        "size": 353759
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000006/06.png",
+        "roles": [],
+        "size": 96467
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000006/06_SideFace.png",
+        "roles": [],
+        "size": 271638
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000007/07.png",
+        "roles": [],
+        "size": 690922
+      },
+      {
+        "path": "effect/config/Makeups/Contour/MUCT00000007/07_SideFace.png",
+        "roles": [],
+        "size": 683270
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000001/mmz.png",
+        "roles": [],
+        "size": 17395
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000002/mmz.png",
+        "roles": [],
+        "size": 19566
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000003/mmz.png",
+        "roles": [],
+        "size": 17081
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000004/mmz.png",
+        "roles": [],
+        "size": 15173
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000005/mmz.png",
+        "roles": [],
+        "size": 19596
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000006/mmz.png",
+        "roles": [],
+        "size": 19776
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000007/mmz.png",
+        "roles": [],
+        "size": 13357
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000008/mmz.png",
+        "roles": [],
+        "size": 13725
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000009/mmy1.png",
+        "roles": [],
+        "size": 16408
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000009/mmz1.png",
+        "roles": [],
+        "size": 16337
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000010/mmy.png",
+        "roles": [],
+        "size": 18128
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000010/mmz.png",
+        "roles": [],
+        "size": 18039
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000011/mmy.png",
+        "roles": [],
+        "size": 17019
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000011/mmz.png",
+        "roles": [],
+        "size": 17311
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000012/mmy.png",
+        "roles": [],
+        "size": 14542
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000012/mmz.png",
+        "roles": [],
+        "size": 13989
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000013/mmz.png",
+        "roles": [],
+        "size": 10879
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000014/mmy.png",
+        "roles": [],
+        "size": 15799
+      },
+      {
+        "path": "effect/config/Makeups/Eyebrow/MUEB00000014/mmz.png",
+        "roles": [],
+        "size": 16449
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000001/lb.png",
+        "roles": [],
+        "size": 25018
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000001/lt.png",
+        "roles": [],
+        "size": 38144
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000001/rb.png",
+        "roles": [],
+        "size": 24985
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000001/rt.png",
+        "roles": [],
+        "size": 37745
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000002/lb.png",
+        "roles": [],
+        "size": 27690
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000002/lt.png",
+        "roles": [],
+        "size": 27879
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000002/rb.png",
+        "roles": [],
+        "size": 27624
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000002/rt.png",
+        "roles": [],
+        "size": 27886
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000003/lb.png",
+        "roles": [],
+        "size": 24323
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000003/lt.png",
+        "roles": [],
+        "size": 39033
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000003/rb.png",
+        "roles": [],
+        "size": 24314
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000003/rt.png",
+        "roles": [],
+        "size": 39021
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000004/lb.png",
+        "roles": [],
+        "size": 18850
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000004/lt.png",
+        "roles": [],
+        "size": 36507
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000004/rb.png",
+        "roles": [],
+        "size": 18837
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000004/rt.png",
+        "roles": [],
+        "size": 36508
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000005/lb.png",
+        "roles": [],
+        "size": 24851
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000005/lt.png",
+        "roles": [],
+        "size": 34290
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000005/rb.png",
+        "roles": [],
+        "size": 24868
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000005/rt.png",
+        "roles": [],
+        "size": 34276
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000006/lb.png",
+        "roles": [],
+        "size": 33166
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000006/lt.png",
+        "roles": [],
+        "size": 47388
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000006/rb.png",
+        "roles": [],
+        "size": 33148
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000006/rt.png",
+        "roles": [],
+        "size": 47361
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000007/lb.png",
+        "roles": [],
+        "size": 10871
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000007/lt.png",
+        "roles": [],
+        "size": 29107
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000007/rb.png",
+        "roles": [],
+        "size": 10515
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000007/rt.png",
+        "roles": [],
+        "size": 26146
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000008/lb.png",
+        "roles": [],
+        "size": 10106
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000008/lt.png",
+        "roles": [],
+        "size": 23369
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000008/rb.png",
+        "roles": [],
+        "size": 9513
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000008/rt.png",
+        "roles": [],
+        "size": 21724
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000009/lb.png",
+        "roles": [],
+        "size": 9742
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000009/lt.png",
+        "roles": [],
+        "size": 13990
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000009/rb.png",
+        "roles": [],
+        "size": 8930
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000009/rt.png",
+        "roles": [],
+        "size": 13059
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000010/lb.png",
+        "roles": [],
+        "size": 6584
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000010/lt.png",
+        "roles": [],
+        "size": 12719
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000010/rb.png",
+        "roles": [],
+        "size": 6155
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000010/rt.png",
+        "roles": [],
+        "size": 11581
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000011/lb.png",
+        "roles": [],
+        "size": 13368
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000011/lt.png",
+        "roles": [],
+        "size": 26502
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000011/rb.png",
+        "roles": [],
+        "size": 13002
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000011/rt.png",
+        "roles": [],
+        "size": 25558
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000012/lb.png",
+        "roles": [],
+        "size": 19214
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000012/lt.png",
+        "roles": [],
+        "size": 33256
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000012/rb.png",
+        "roles": [],
+        "size": 17945
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000012/rt.png",
+        "roles": [],
+        "size": 32795
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000013/lb.png",
+        "roles": [],
+        "size": 13223
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000013/lt.png",
+        "roles": [],
+        "size": 23639
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000013/rb.png",
+        "roles": [],
+        "size": 20953
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000013/rt.png",
+        "roles": [],
+        "size": 22659
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000014/lb.png",
+        "roles": [],
+        "size": 15077
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000014/lt.png",
+        "roles": [],
+        "size": 42804
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000014/rb.png",
+        "roles": [],
+        "size": 13598
+      },
+      {
+        "path": "effect/config/Makeups/Eyelash/MUEL00000014/rt.png",
+        "roles": [],
+        "size": 41093
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000001/yxy.png",
+        "roles": [],
+        "size": 5854
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000001/yxz.png",
+        "roles": [],
+        "size": 5892
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000002/yxy.png",
+        "roles": [],
+        "size": 5682
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000002/yxz.png",
+        "roles": [],
+        "size": 6028
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000003/yxys.png",
+        "roles": [],
+        "size": 6413
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000003/yxyx.png",
+        "roles": [],
+        "size": 3660
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000003/yxzs.png",
+        "roles": [],
+        "size": 6428
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000003/yxzx.png",
+        "roles": [],
+        "size": 3578
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000004/yxys.png",
+        "roles": [],
+        "size": 6116
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000004/yxyx.png",
+        "roles": [],
+        "size": 4811
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000004/yxzs.png",
+        "roles": [],
+        "size": 6967
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000004/yxzx.png",
+        "roles": [],
+        "size": 5166
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000005/yxys.png",
+        "roles": [],
+        "size": 7796
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000005/yxyx.png",
+        "roles": [],
+        "size": 3657
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000005/yxzs.png",
+        "roles": [],
+        "size": 7978
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000005/yxzx.png",
+        "roles": [],
+        "size": 3568
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000006/yxys.png",
+        "roles": [],
+        "size": 7141
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000006/yxyx.png",
+        "roles": [],
+        "size": 4513
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000006/yxzs.png",
+        "roles": [],
+        "size": 7291
+      },
+      {
+        "path": "effect/config/Makeups/EyeLiner/MUELR00000006/yxzx.png",
+        "roles": [],
+        "size": 3689
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000001/yyy.png",
+        "roles": [],
+        "size": 102714
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000001/yyz.png",
+        "roles": [],
+        "size": 110014
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000002/yyy.png",
+        "roles": [],
+        "size": 124021
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000002/yyz.png",
+        "roles": [],
+        "size": 127746
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000003/lpy.png",
+        "roles": [],
+        "size": 10658
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000003/lpz.png",
+        "roles": [],
+        "size": 9571
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000003/yyy.png",
+        "roles": [],
+        "size": 84806
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000003/yyz.png",
+        "roles": [],
+        "size": 128423
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000004/yyy.png",
+        "roles": [],
+        "size": 71296
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000004/yyz.png",
+        "roles": [],
+        "size": 72182
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000005/yyy.png",
+        "roles": [],
+        "size": 100000
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000005/yyz.png",
+        "roles": [],
+        "size": 101702
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000006/yytly.png",
+        "roles": [],
+        "size": 9552
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000006/yytlz.png",
+        "roles": [],
+        "size": 9474
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000006/yyy2.png",
+        "roles": [],
+        "size": 58667
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000006/yyz2.png",
+        "roles": [],
+        "size": 59733
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000007/yyggy.png",
+        "roles": [],
+        "size": 31377
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000007/yyggz.png",
+        "roles": [],
+        "size": 18663
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000007/yyy.png",
+        "roles": [],
+        "size": 105042
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000007/yyz.png",
+        "roles": [],
+        "size": 69678
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000008/yyy.png",
+        "roles": [],
+        "size": 58290
+      },
+      {
+        "path": "effect/config/Makeups/Eyemakeup/MUEM00000008/yyz.png",
+        "roles": [],
+        "size": 58338
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000001/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000001/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000001/zrz.png",
+        "roles": [],
+        "size": 45186
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000002/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000002/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000002/ysh.png",
+        "roles": [],
+        "size": 29051
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000003/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000003/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000003/wrhz.png",
+        "roles": [],
+        "size": 77669
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000004/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000004/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000004/fzyy.png",
+        "roles": [],
+        "size": 62437
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000005/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000005/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000005/lz.png",
+        "roles": [],
+        "size": 72624
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000006/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000006/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000006/hxl.png",
+        "roles": [],
+        "size": 76807
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000007/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000007/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000007/mt.png",
+        "roles": [],
+        "size": 22424
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000008/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000008/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000008/mt.png",
+        "roles": [],
+        "size": 24227
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000009/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000009/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000009/mt.png",
+        "roles": [],
+        "size": 30757
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000010/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000010/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000010/mt.png",
+        "roles": [],
+        "size": 34860
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000011/eye_mask_left.png",
+        "roles": [],
+        "size": 11287
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000011/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Eyepupil/MUEP00000011/mt.png",
+        "roles": [],
+        "size": 29217
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000001/01.png",
+        "roles": [],
+        "size": 115925
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000002/02.png",
+        "roles": [],
+        "size": 164764
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000003/03.png",
+        "roles": [],
+        "size": 114129
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000004/z01.png",
+        "roles": [],
+        "size": 41602
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000005/z02.png",
+        "roles": [],
+        "size": 42388
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000006/z03.png",
+        "roles": [],
+        "size": 40765
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000007/04.png",
+        "roles": [],
+        "size": 222783
+      },
+      {
+        "path": "effect/config/Makeups/FacialDecoration/MUFD00000008/05.png",
+        "roles": [],
+        "size": 348594
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000001/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000001/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000002/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000002/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000003/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000003/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000004/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000004/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000005/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000005/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000006/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000006/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000007/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000007/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000008/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000008/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000009/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000009/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000010/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000010/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000011/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000011/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000012/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000012/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000013/Satin/staintexture.png",
+        "roles": [],
+        "size": 13091
+      },
+      {
+        "path": "effect/config/Makeups/Lipstick/MULS00000013/Shimmer/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000001/wcy1.png",
+        "roles": [],
+        "size": 12889
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000001/wcz1.png",
+        "roles": [],
+        "size": 12816
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000002/wcy2.png",
+        "roles": [],
+        "size": 13617
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000002/wcz2.png",
+        "roles": [],
+        "size": 14018
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000003/wcy3-1.png",
+        "roles": [],
+        "size": 17331
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000003/wcy3.png",
+        "roles": [],
+        "size": 18595
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000003/wcz3-1.png",
+        "roles": [],
+        "size": 16151
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000003/wcz3.png",
+        "roles": [],
+        "size": 19203
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000004/wcy4-1.png",
+        "roles": [],
+        "size": 20408
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000004/wcy4.png",
+        "roles": [],
+        "size": 30613
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000004/wcz4-1.png",
+        "roles": [],
+        "size": 24486
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000004/wcz4.png",
+        "roles": [],
+        "size": 32954
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000005/wcy5-1.png",
+        "roles": [],
+        "size": 12303
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000005/wcy5.png",
+        "roles": [],
+        "size": 19629
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000005/wcz5-1.png",
+        "roles": [],
+        "size": 11576
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000005/wcz5.png",
+        "roles": [],
+        "size": 20384
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000006/wcy6-1.png",
+        "roles": [],
+        "size": 9951
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000006/wcy6.png",
+        "roles": [],
+        "size": 23962
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000006/wcz6-1.png",
+        "roles": [],
+        "size": 11147
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000006/wcz6.png",
+        "roles": [],
+        "size": 26200
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000007/wcy4-1.png",
+        "roles": [],
+        "size": 8353
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000007/wcy4-2.png",
+        "roles": [],
+        "size": 5049
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000007/wcy4.png",
+        "roles": [],
+        "size": 20497
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000007/wcz4-1.png",
+        "roles": [],
+        "size": 5031
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000007/wcz4-2.png",
+        "roles": [],
+        "size": 3954
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000007/wcz4.png",
+        "roles": [],
+        "size": 20604
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000008/wcy5-1.png",
+        "roles": [],
+        "size": 8756
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000008/wcy5.png",
+        "roles": [],
+        "size": 10200
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000008/wcz5-1.png",
+        "roles": [],
+        "size": 8006
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000008/wcz5.png",
+        "roles": [],
+        "size": 10872
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000009/wcy6-1.png",
+        "roles": [],
+        "size": 9951
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000009/wcy6.png",
+        "roles": [],
+        "size": 31203
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000009/wcz6-1.png",
+        "roles": [],
+        "size": 11147
+      },
+      {
+        "path": "effect/config/Makeups/Silkworm/SILK00000009/wcz6.png",
+        "roles": [],
+        "size": 29877
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Blusher/sh.png",
+        "roles": [],
+        "size": 846006
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Bronzer/xr.png",
+        "roles": [],
+        "size": 933683
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 33258
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 35503
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyelash/jmy.png",
+        "roles": [],
+        "size": 17492
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyelash/jmz.png",
+        "roles": [],
+        "size": 18588
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 18716
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 10967
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 71361
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 72300
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000001/Lipstick/zc.png",
+        "roles": [],
+        "size": 44759
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Blusher/sh.png",
+        "roles": [],
+        "size": 864025
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Bronzer/xr.png",
+        "roles": [],
+        "size": 976812
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 44695
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyelash/yzy_3d.png",
+        "roles": [],
+        "size": 26576
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyelash/yzz_3d.png",
+        "roles": [],
+        "size": 26651
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 22719
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 23536
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyemakeup/left.png",
+        "roles": [],
+        "size": 10916
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyemakeup/right.png",
+        "roles": [],
+        "size": 11775
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 79768
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 82318
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000002/Lipstick/zc.png",
+        "roles": [],
+        "size": 55433
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Blusher/sh.png",
+        "roles": [],
+        "size": 717671
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Bronzer/xr.png",
+        "roles": [],
+        "size": 316694
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 41959
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Eyelash/yzy_3d.png",
+        "roles": [],
+        "size": 19052
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Eyelash/yzz_3d.png",
+        "roles": [],
+        "size": 22376
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 101389
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 68821
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000003/Lipstick/zc.png",
+        "roles": [],
+        "size": 58727
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Blusher/sh.png",
+        "roles": [],
+        "size": 519674
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Bronzer/xr.png",
+        "roles": [],
+        "size": 441374
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 35746
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 33780
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyelash/jmy.png",
+        "roles": [],
+        "size": 30075
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyelash/jmz.png",
+        "roles": [],
+        "size": 30388
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 20300
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 27299
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyemakeup/yyggy.png",
+        "roles": [],
+        "size": 25685
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyemakeup/yyggz.png",
+        "roles": [],
+        "size": 27524
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 133831
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 92767
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Lipstick/zc.png",
+        "roles": [],
+        "size": 51018
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000004/Lipstick/zcgg.png",
+        "roles": [],
+        "size": 10664
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Blusher/sh.png",
+        "roles": [],
+        "size": 1292721
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Bronzer/gg.png",
+        "roles": [],
+        "size": 278493
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Bronzer/xr.png",
+        "roles": [],
+        "size": 247346
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 24623
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyelash/jmy.png",
+        "roles": [],
+        "size": 19501
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyelash/jmz.png",
+        "roles": [],
+        "size": 19644
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 28478
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 28568
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 82987
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 84274
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Lipstick/zc.png",
+        "roles": [],
+        "size": 55029
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000005/Lipstick/zcgg.png",
+        "roles": [],
+        "size": 11720
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Blusher/sh.png",
+        "roles": [],
+        "size": 606814
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Bronzer/xr.png",
+        "roles": [],
+        "size": 953255
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 32649
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyelash/jmy.png",
+        "roles": [],
+        "size": 15640
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyelash/jmz.png",
+        "roles": [],
+        "size": 12995
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 20692
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 20662
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 82983
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 56485
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000006/Lipstick/zc.png",
+        "roles": [],
+        "size": 70202
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Blusher/sh.png",
+        "roles": [],
+        "size": 565735
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Bronzer/gg.png",
+        "roles": [],
+        "size": 111635
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Bronzer/xr.png",
+        "roles": [],
+        "size": 250433
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 40636
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 40418
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyelash/jmy.png",
+        "roles": [],
+        "size": 23640
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyelash/jmz.png",
+        "roles": [],
+        "size": 23861
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 21725
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 18714
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyemakeup/lpy.png",
+        "roles": [],
+        "size": 18603
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyemakeup/lpz.png",
+        "roles": [],
+        "size": 19874
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 105907
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 106055
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Lipstick/ShimmerMaterial.jpg",
+        "roles": [],
+        "size": 584001
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000007/Lipstick/zc.png",
+        "roles": [],
+        "size": 53804
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Blusher/sh.png",
+        "roles": [],
+        "size": 280754
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Bronzer/gg.png",
+        "roles": [],
+        "size": 54437
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Bronzer/xr.png",
+        "roles": [],
+        "size": 480495
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 39257
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 39135
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyelash/jmy.png",
+        "roles": [],
+        "size": 34810
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyelash/jmz.png",
+        "roles": [],
+        "size": 26476
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 10505
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 10704
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyemakeup/lpy.png",
+        "roles": [],
+        "size": 27430
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyemakeup/lpz.png",
+        "roles": [],
+        "size": 33865
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 89979
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 95752
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Lipstick/zc.png",
+        "roles": [],
+        "size": 51378
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000008/Lipstick/zcgg.png",
+        "roles": [],
+        "size": 20661
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Blusher/qb4.png",
+        "roles": [],
+        "size": 248413
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Blusher/sh.png",
+        "roles": [],
+        "size": 391256
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Bronzer/xr.png",
+        "roles": [],
+        "size": 438057
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 55660
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 55359
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyelash/jmy.png",
+        "roles": [],
+        "size": 29262
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyelash/jmz.png",
+        "roles": [],
+        "size": 31228
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 19015
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 18286
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 78755
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 73788
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000009/Lipstick/zc.png",
+        "roles": [],
+        "size": 50512
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Blusher/sh.png",
+        "roles": [],
+        "size": 175490
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Bronzer/gg.png",
+        "roles": [],
+        "size": 14677
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Bronzer/xr.png",
+        "roles": [],
+        "size": 522290
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 31443
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 54615
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyelash/lb.png",
+        "roles": [],
+        "size": 42197
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyelash/lt.png",
+        "roles": [],
+        "size": 80170
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyelash/rb.png",
+        "roles": [],
+        "size": 43551
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyelash/rt.png",
+        "roles": [],
+        "size": 82432
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 17046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 16182
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 48690
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 48312
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Eyepupil/mt.png",
+        "roles": [],
+        "size": 48239
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000010/Lipstick/zc.png",
+        "roles": [],
+        "size": 60874
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Blusher/gg.png",
+        "roles": [],
+        "size": 19016
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Blusher/sh.png",
+        "roles": [],
+        "size": 156152
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Bronzer/xr.png",
+        "roles": [],
+        "size": 160807
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 31740
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyebrow/mmyd.png",
+        "roles": [],
+        "size": 27308
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 25933
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyebrow/mmzd.png",
+        "roles": [],
+        "size": 13610
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyelash/lb.png",
+        "roles": [],
+        "size": 60667
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyelash/lt.png",
+        "roles": [],
+        "size": 65462
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyelash/rb.png",
+        "roles": [],
+        "size": 61770
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyelash/rt.png",
+        "roles": [],
+        "size": 68276
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 15912
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 15870
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyemakeup/lpy.png",
+        "roles": [],
+        "size": 10951
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyemakeup/lpz.png",
+        "roles": [],
+        "size": 11049
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 70780
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 72087
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Eyepupil/mt.png",
+        "roles": [],
+        "size": 30806
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Lipstick/zc.png",
+        "roles": [],
+        "size": 38617
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000011/Lipstick/zcgg.png",
+        "roles": [],
+        "size": 7190
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Blusher/sh.png",
+        "roles": [],
+        "size": 176945
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Bronzer/xr.png",
+        "roles": [],
+        "size": 268737
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 27242
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 28090
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyelash/lb.png",
+        "roles": [],
+        "size": 60723
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyelash/lt.png",
+        "roles": [],
+        "size": 68450
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyelash/rb.png",
+        "roles": [],
+        "size": 45304
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyelash/rt.png",
+        "roles": [],
+        "size": 68340
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 21423
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 21405
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyemakeup/lpy.png",
+        "roles": [],
+        "size": 9323
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyemakeup/lpz.png",
+        "roles": [],
+        "size": 9191
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 73543
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 74847
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Eyepupil/mt.png",
+        "roles": [],
+        "size": 35838
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Lipstick/zc.png",
+        "roles": [],
+        "size": 35934
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000012/Lipstick/zcgg.png",
+        "roles": [],
+        "size": 6156
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Blusher/sh.png",
+        "roles": [],
+        "size": 220301
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Bronzer/gg.png",
+        "roles": [],
+        "size": 14677
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Bronzer/xr.png",
+        "roles": [],
+        "size": 659030
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 25727
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 40378
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyelash/lb.png",
+        "roles": [],
+        "size": 30081
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyelash/lt.png",
+        "roles": [],
+        "size": 65670
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyelash/rb.png",
+        "roles": [],
+        "size": 30251
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyelash/rt.png",
+        "roles": [],
+        "size": 65045
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 13004
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 13088
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 63329
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 102314
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Eyepupil/mt.png",
+        "roles": [],
+        "size": 42656
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000013/Lipstick/zc.png",
+        "roles": [],
+        "size": 65292
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Blusher/sh.png",
+        "roles": [],
+        "size": 240987
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Bronzer/xr.png",
+        "roles": [],
+        "size": 207087
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 25146
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 25913
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyelash/lb.png",
+        "roles": [],
+        "size": 36300
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyelash/lt.png",
+        "roles": [],
+        "size": 68605
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyelash/rb.png",
+        "roles": [],
+        "size": 35920
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyelash/rt.png",
+        "roles": [],
+        "size": 68076
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 24013
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 19184
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 71157
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 71319
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 9835
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Eyepupil/mt.png",
+        "roles": [],
+        "size": 42357
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000014/Lipstick/zc.png",
+        "roles": [],
+        "size": 33434
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Bronzer/xr.png",
+        "roles": [],
+        "size": 440039
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 26898
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 25137
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 11896
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 7130
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 106107
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 105021
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000015/Lipstick/zc.png",
+        "roles": [],
+        "size": 37726
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Blusher/sh.png",
+        "roles": [],
+        "size": 275481
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Bronzer/gg.png",
+        "roles": [],
+        "size": 211600
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Bronzer/xr.png",
+        "roles": [],
+        "size": 273555
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 21629
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyelash/lb.png",
+        "roles": [],
+        "size": 7514
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyelash/lt.png",
+        "roles": [],
+        "size": 7748
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyelash/rb.png",
+        "roles": [],
+        "size": 7509
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyelash/rt.png",
+        "roles": [],
+        "size": 7798
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 12561
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 12688
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyemakeup/yxy.png",
+        "roles": [],
+        "size": 12561
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyemakeup/yxz.png",
+        "roles": [],
+        "size": 12688
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 100341
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 100522
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000016/Lipstick/zc.png",
+        "roles": [],
+        "size": 31358
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Bronzer/gg.png",
+        "roles": [],
+        "size": 317679
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Bronzer/xr.png",
+        "roles": [],
+        "size": 334611
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 33225
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 33536
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 100970
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 104276
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Lipstick/zc.png",
+        "roles": [],
+        "size": 39733
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000017/Lipstick/zcgg.png",
+        "roles": [],
+        "size": 18577
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Blusher/sh.png",
+        "roles": [],
+        "size": 210874
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Bronzer/gg.png",
+        "roles": [],
+        "size": 196564
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Bronzer/xr.png",
+        "roles": [],
+        "size": 365221
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 29041
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyelash/jmys.png",
+        "roles": [],
+        "size": 40076
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyelash/jmyx.png",
+        "roles": [],
+        "size": 16751
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyelash/jmzs.png",
+        "roles": [],
+        "size": 42933
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyelash/jmzx.png",
+        "roles": [],
+        "size": 16450
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 15013
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 17270
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyemakeup/yyggy.png",
+        "roles": [],
+        "size": 9412
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyemakeup/yyggz.png",
+        "roles": [],
+        "size": 9618
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 79747
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 83044
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000018/Lipstick/zc.png",
+        "roles": [],
+        "size": 31082
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Blusher/sh.png",
+        "roles": [],
+        "size": 226342
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Bronzer/gg.png",
+        "roles": [],
+        "size": 292921
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Bronzer/xr.png",
+        "roles": [],
+        "size": 215287
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 51469
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyelash/lb.png",
+        "roles": [],
+        "size": 67783
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyelash/lt.png",
+        "roles": [],
+        "size": 27425
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyelash/rb.png",
+        "roles": [],
+        "size": 18691
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyelash/rt.png",
+        "roles": [],
+        "size": 25592
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyemakeup/yyggy.png",
+        "roles": [],
+        "size": 38586
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyemakeup/yyggz.png",
+        "roles": [],
+        "size": 38534
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 83716
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 83840
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000019/Lipstick/zc.png",
+        "roles": [],
+        "size": 43985
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Blusher/sh.png",
+        "roles": [],
+        "size": 478069
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Bronzer/gg.png",
+        "roles": [],
+        "size": 247055
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Bronzer/xr.png",
+        "roles": [],
+        "size": 273619
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 23677
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 14591
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 15504
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyemakeup/yyggy.png",
+        "roles": [],
+        "size": 22811
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyemakeup/yyggz.png",
+        "roles": [],
+        "size": 22920
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 93597
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 94632
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000020/Lipstick/zc.png",
+        "roles": [],
+        "size": 38666
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Blusher/sh.png",
+        "roles": [],
+        "size": 265246
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Bronzer/gg.png",
+        "roles": [],
+        "size": 373891
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Bronzer/xr.png",
+        "roles": [],
+        "size": 451050
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 30200
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 29692
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyelash/lb.png",
+        "roles": [],
+        "size": 17103
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyelash/lt.png",
+        "roles": [],
+        "size": 37239
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyelash/rb.png",
+        "roles": [],
+        "size": 17087
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyelash/rt.png",
+        "roles": [],
+        "size": 36167
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyeliner/yxsy.png",
+        "roles": [],
+        "size": 8332
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyeliner/yxsz.png",
+        "roles": [],
+        "size": 8813
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyeliner/yxxy.png",
+        "roles": [],
+        "size": 5704
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyeliner/yxxz.png",
+        "roles": [],
+        "size": 5696
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyemakeup/lpy.png",
+        "roles": [],
+        "size": 19369
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyemakeup/lpz.png",
+        "roles": [],
+        "size": 19327
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 122777
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 124221
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Eyepupil/mt.png",
+        "roles": [],
+        "size": 31522
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000021/Lipstick/zc.png",
+        "roles": [],
+        "size": 34623
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Bronzer/gg.png",
+        "roles": [],
+        "size": 476477
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Bronzer/xr.png",
+        "roles": [],
+        "size": 672960
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 28687
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyelash/jmy.png",
+        "roles": [],
+        "size": 6736
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyelash/jmz.png",
+        "roles": [],
+        "size": 6554
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 8255
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 8237
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 67450
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 69652
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000022/Lipstick/zc.png",
+        "roles": [],
+        "size": 29217
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Blusher/sh.png",
+        "roles": [],
+        "size": 296123
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Bronzer/gg.png",
+        "roles": [],
+        "size": 315934
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Bronzer/xr.png",
+        "roles": [],
+        "size": 537571
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 21604
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 22056
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyelash/lb.png",
+        "roles": [],
+        "size": 13433
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyelash/lt.png",
+        "roles": [],
+        "size": 11436
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyelash/rb.png",
+        "roles": [],
+        "size": 13508
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyelash/rt.png",
+        "roles": [],
+        "size": 11677
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyeliner/yxy.png",
+        "roles": [],
+        "size": 23266
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyeliner/yxz.png",
+        "roles": [],
+        "size": 22244
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 61242
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 57680
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000023/Lipstick/zc.png",
+        "roles": [],
+        "size": 31050
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Blusher/blush.png",
+        "roles": [],
+        "size": 238441
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Bronzer/gg.png",
+        "roles": [],
+        "size": 225239
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Bronzer/xr.png",
+        "roles": [],
+        "size": 746731
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Bronzer/xr_SideFace.png",
+        "roles": [],
+        "size": 153046
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyebrow/mmy.png",
+        "roles": [],
+        "size": 21668
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyebrow/mmz.png",
+        "roles": [],
+        "size": 21374
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyelash/lb.png",
+        "roles": [],
+        "size": 14813
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyelash/lt.png",
+        "roles": [],
+        "size": 33006
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyelash/rb.png",
+        "roles": [],
+        "size": 15004
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyelash/rt.png",
+        "roles": [],
+        "size": 31440
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyeliner/yxsy.png",
+        "roles": [],
+        "size": 7345
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyeliner/yxsz.png",
+        "roles": [],
+        "size": 7290
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyeliner/yxxy.png",
+        "roles": [],
+        "size": 11663
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyeliner/yxxz.png",
+        "roles": [],
+        "size": 11637
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyemakeup/yyy.png",
+        "roles": [],
+        "size": 60886
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyemakeup/yyz.png",
+        "roles": [],
+        "size": 59299
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyepupil/eye_mask_left.png",
+        "roles": [],
+        "size": 10280
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyepupil/eye_mask_right.png",
+        "roles": [],
+        "size": 10345
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Eyepupil/mt.png",
+        "roles": [],
+        "size": 31522
+      },
+      {
+        "path": "effect/config/Makeups/Suit/MU00000024/Lipstick/zc.png",
+        "roles": [],
+        "size": 24659
+      },
+      {
+        "path": "effect/config/PetBrightEye/eye_pupil.png",
+        "roles": [],
+        "size": 10397
+      },
+      {
+        "path": "effect/config/PetBrightEye/left_eye.png",
+        "roles": [],
+        "size": 23686
+      },
+      {
+        "path": "effect/config/PetBrightEye/right_eye.png",
+        "roles": [],
+        "size": 23086
+      },
+      {
+        "path": "effect/config/SkinAdjust/1.png",
+        "roles": [],
+        "size": 36116
+      },
+      {
+        "path": "effect/config/SkinAdjust/2.png",
+        "roles": [],
+        "size": 159082
+      },
+      {
+        "path": "effect/config/SkinAdjust/3.png",
+        "roles": [],
+        "size": 146387
+      },
+      {
+        "path": "effect/config/SkinAdjust/4.png",
+        "roles": [],
+        "size": 181954
+      },
+      {
+        "path": "effect/config/SkinAdjust/5.png",
+        "roles": [],
+        "size": 82761
+      },
+      {
+        "path": "effect/config/SkinAdjust/6.png",
+        "roles": [],
+        "size": 72294
+      },
+      {
+        "path": "effect/config/SkinAdjust/7.png",
+        "roles": [],
+        "size": 117472
+      },
+      {
+        "path": "effect/config/SkinAdjust/8.png",
+        "roles": [],
+        "size": 84028
+      },
+      {
+        "path": "effect/config/SkinAdjust/cold.png",
+        "roles": [],
+        "size": 123598
+      },
+      {
+        "path": "effect/config/SkinAdjust/darkness.png",
+        "roles": [],
+        "size": 226565
+      },
+      {
+        "path": "effect/config/SkinAdjust/lightness.png",
+        "roles": [],
+        "size": 158926
+      },
+      {
+        "path": "effect/config/SkinAdjust/ruddy_new.png",
+        "roles": [],
+        "size": 97304
+      },
+      {
+        "path": "effect/config/SkinAdjust/TintGreen.png",
+        "roles": [],
+        "size": 173398
+      },
+      {
+        "path": "effect/config/SkinAdjust/TintMagenta.png",
+        "roles": [],
+        "size": 172019
+      },
+      {
+        "path": "effect/config/SkinAdjust/toothMask.png",
+        "roles": [],
+        "size": 1862
+      },
+      {
+        "path": "effect/config/SkinAdjust/warm.png",
+        "roles": [],
+        "size": 119148
+      },
+      {
+        "path": "effect/config/SkinAdjust/whiten.png",
+        "roles": [],
+        "size": 100056
+      },
+      {
+        "path": "effect/config/SkinTexture/FaceMask.png",
+        "roles": [],
+        "size": 791209
+      },
+      {
+        "path": "effect/config/SkinTexture/texture.png",
+        "roles": [],
+        "size": 3595664
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000001/blue_og_2.jxl",
+        "roles": [],
+        "size": 392716
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000002/blue_og_5.jxl",
+        "roles": [],
+        "size": 639878
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000003/blue_og_6.jxl",
+        "roles": [],
+        "size": 331005
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000004/blue_og_8.jxl",
+        "roles": [],
+        "size": 391169
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000005/blue_og_7.jxl",
+        "roles": [],
+        "size": 566011
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000006/blue_og_9.jxl",
+        "roles": [],
+        "size": 322146
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000007/blue_pexels_2.jxl",
+        "roles": [],
+        "size": 526381
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000008/blue_pexels_5.jxl",
+        "roles": [],
+        "size": 557833
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000009/blue_pexels_6.jxl",
+        "roles": [],
+        "size": 772573
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000010/blue_pexels_9.jxl",
+        "roles": [],
+        "size": 219626
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000011/blue_pexels_10.jxl",
+        "roles": [],
+        "size": 163097
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000012/blue_og_10.jxl",
+        "roles": [],
+        "size": 410297
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000013/P1111548.jxl",
+        "roles": [],
+        "size": 703290
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000014/P1111450.jxl",
+        "roles": [],
+        "size": 880906
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000015/P1111557.jxl",
+        "roles": [],
+        "size": 502861
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000016/DJI_0826.jxl",
+        "roles": [],
+        "size": 512229
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000017/P1100086.jxl",
+        "roles": [],
+        "size": 465789
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000018/P1100064-3.jxl",
+        "roles": [],
+        "size": 475310
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000019/IMG_9817.jxl",
+        "roles": [],
+        "size": 622962
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000020/IMG_9860.jxl",
+        "roles": [],
+        "size": 810750
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000021/P1111827.jxl",
+        "roles": [],
+        "size": 1061811
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000022/IMG_3582.jxl",
+        "roles": [],
+        "size": 1227505
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000023/IMG_5587.jxl",
+        "roles": [],
+        "size": 1247100
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000024/IMG_9401.jxl",
+        "roles": [],
+        "size": 534292
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000025/VCG211189424098.jxl",
+        "roles": [],
+        "size": 712301
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000026/VCG211371083763.jxl",
+        "roles": [],
+        "size": 847844
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000027/VCG211403078448.jxl",
+        "roles": [],
+        "size": 1544039
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000028/VCG211403078460.jxl",
+        "roles": [],
+        "size": 2319402
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000029/VCG211403855859.jxl",
+        "roles": [],
+        "size": 1431925
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000030/VCG211404339041.jxl",
+        "roles": [],
+        "size": 1714961
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000031/VCG211404735322.jxl",
+        "roles": [],
+        "size": 1304080
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000032/VCG211503755405.jxl",
+        "roles": [],
+        "size": 914476
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000033/VCG211503755616.jxl",
+        "roles": [],
+        "size": 1447238
+      },
+      {
+        "path": "effect/config/Sky/BLUESKY00000034/VCG211346702090.jxl",
+        "roles": [],
+        "size": 1844904
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000001/blue_og_1.jxl",
+        "roles": [],
+        "size": 396604
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000002/blue_og_3.jxl",
+        "roles": [],
+        "size": 288861
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000003/blue_og_4.jxl",
+        "roles": [],
+        "size": 637451
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000004/blue_pexels_1.jxl",
+        "roles": [],
+        "size": 91425
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000005/blue_pexels_3.jxl",
+        "roles": [],
+        "size": 714150
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000006/blue_pexels_4.jxl",
+        "roles": [],
+        "size": 433696
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000007/blue_pexels_7.jxl",
+        "roles": [],
+        "size": 498672
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000008/blue_pexels_8.jxl",
+        "roles": [],
+        "size": 356151
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000009/blue_pexels_11.jxl",
+        "roles": [],
+        "size": 173583
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000010/blue_pexels_12.jxl",
+        "roles": [],
+        "size": 520999
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000011/blue_og_11.jxl",
+        "roles": [],
+        "size": 376232
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000012/blue_og_12.jxl",
+        "roles": [],
+        "size": 375026
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000013/IMG_6157.jxl",
+        "roles": [],
+        "size": 1364613
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000014/IMG_9813.jxl",
+        "roles": [],
+        "size": 1207089
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000015/IMG_8963.jxl",
+        "roles": [],
+        "size": 362415
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000016/IMG_9401.jxl",
+        "roles": [],
+        "size": 3860393
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000017/VCG366A6009.jxl",
+        "roles": [],
+        "size": 1131290
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000018/VCG211401625766.jxl",
+        "roles": [],
+        "size": 1515273
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000019/VCG211440708264.jxl",
+        "roles": [],
+        "size": 1464394
+      },
+      {
+        "path": "effect/config/Sky/BRIGHTSKY00000020/VCG211555530246.jxl",
+        "roles": [],
+        "size": 1121893
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000001/other_pexels_2.jxl",
+        "roles": [],
+        "size": 369948
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000002/other_pexels_3.jxl",
+        "roles": [],
+        "size": 583748
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000003/other_og_1.jxl",
+        "roles": [],
+        "size": 491174
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000004/other_og_2.jxl",
+        "roles": [],
+        "size": 426013
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000005/other_og_5.jxl",
+        "roles": [],
+        "size": 2739919
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000006/other_og_6.jxl",
+        "roles": [],
+        "size": 1457596
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000007/other_og_7.jxl",
+        "roles": [],
+        "size": 758385
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000008/other_og_8.jxl",
+        "roles": [],
+        "size": 1658821
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000009/other_og_9.jxl",
+        "roles": [],
+        "size": 1450327
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000010/VCG211248320147.jxl",
+        "roles": [],
+        "size": 1329433
+      },
+      {
+        "path": "effect/config/Sky/STARSKY00000011/VCG211419856375.jxl",
+        "roles": [],
+        "size": 1343509
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000001/other_pexels_1.jxl",
+        "roles": [],
+        "size": 52595
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000002/sunset_og_1.jxl",
+        "roles": [],
+        "size": 232785
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000003/sunset_og_2.jxl",
+        "roles": [],
+        "size": 421784
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000004/sunset_og_3.jxl",
+        "roles": [],
+        "size": 419370
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000005/sunset_pexels_1.jxl",
+        "roles": [],
+        "size": 422586
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000006/sunset_pexels_2.jxl",
+        "roles": [],
+        "size": 329971
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000007/sunset_pexels_3.jxl",
+        "roles": [],
+        "size": 183207
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000008/sunset_pexels_4.jxl",
+        "roles": [],
+        "size": 531863
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000009/sunset_pexels_5.jxl",
+        "roles": [],
+        "size": 399280
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000010/P1111842.jxl",
+        "roles": [],
+        "size": 640490
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000011/P1099245.jxl",
+        "roles": [],
+        "size": 442238
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000012/P1100135.jxl",
+        "roles": [],
+        "size": 565531
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000013/P1100103.jxl",
+        "roles": [],
+        "size": 567457
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000014/DSC_0024.jxl",
+        "roles": [],
+        "size": 608893
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000015/P1111727.jxl",
+        "roles": [],
+        "size": 715109
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000016/P1100097.jxl",
+        "roles": [],
+        "size": 438188
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000017/P1111758.jxl",
+        "roles": [],
+        "size": 635653
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000018/P1111690.jxl",
+        "roles": [],
+        "size": 664012
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000019/P1099102.jxl",
+        "roles": [],
+        "size": 619255
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000020/IMG_3279.jxl",
+        "roles": [],
+        "size": 1986907
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000021/IMG_3785.jxl",
+        "roles": [],
+        "size": 385402
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000022/IMG_7979.jxl",
+        "roles": [],
+        "size": 1717724
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000023/IMG_3259.jxl",
+        "roles": [],
+        "size": 1523236
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000024/IMG_4626.jxl",
+        "roles": [],
+        "size": 814539
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000025/IMG_4979.jxl",
+        "roles": [],
+        "size": 514650
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000026/IMG_5677.jxl",
+        "roles": [],
+        "size": 919789
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000027/IMG_7918.jxl",
+        "roles": [],
+        "size": 1028697
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000028/IMG_9270.jxl",
+        "roles": [],
+        "size": 813102
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000029/MG_3617.jxl",
+        "roles": [],
+        "size": 650984
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000030/366A1880.jxl",
+        "roles": [],
+        "size": 1433293
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000031/VCG211161392050.jxl",
+        "roles": [],
+        "size": 866739
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000032/VCG211403990649.jxl",
+        "roles": [],
+        "size": 718967
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000033/VCG211404077429.jxl",
+        "roles": [],
+        "size": 464744
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000034/VCG211404339034.jxl",
+        "roles": [],
+        "size": 1265711
+      },
+      {
+        "path": "effect/config/Sky/SUNGLOW00000035/VCG211503428067.jxl",
+        "roles": [],
+        "size": 1458835
+      },
+      {
+        "path": "effect/config/TeethWhitenV3/Bright.png",
+        "roles": [],
+        "size": 196357
+      },
+      {
+        "path": "effect/config/TeethWhitenV3/Whiten.png",
+        "roles": [],
+        "size": 99666
+      },
+      {
+        "path": "effect/config/ToothBeauty/effect.json",
+        "roles": [
+          "beauty"
+        ],
+        "size": 119
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000001/bg.png",
+        "roles": [],
+        "size": 15572
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000021/bg.png",
+        "roles": [],
+        "size": 37412
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000022/bg.png",
+        "roles": [],
+        "size": 1608651
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000023/bg.png",
+        "roles": [],
+        "size": 505607
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000024/bg.png",
+        "roles": [],
+        "size": 822151
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000025/bg.png",
+        "roles": [],
+        "size": 553980
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000026/bg.png",
+        "roles": [],
+        "size": 1322216
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000027/bg.png",
+        "roles": [],
+        "size": 962145
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000028/bg.png",
+        "roles": [],
+        "size": 540146
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000029/bg.png",
+        "roles": [],
+        "size": 540772
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000030/bg.png",
+        "roles": [],
+        "size": 764042
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000031/bg.png",
+        "roles": [],
+        "size": 785454
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000032/bg.png",
+        "roles": [],
+        "size": 750161
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000033/bg.png",
+        "roles": [],
+        "size": 754640
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000034/bg.png",
+        "roles": [],
+        "size": 395933
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000035/bg.png",
+        "roles": [],
+        "size": 583687
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000036/bg.png",
+        "roles": [],
+        "size": 417067
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000037/bg.png",
+        "roles": [],
+        "size": 967559
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000038/bg.png",
+        "roles": [],
+        "size": 1534221
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000039/bg.png",
+        "roles": [],
+        "size": 929024
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000040/bg.png",
+        "roles": [],
+        "size": 1131820
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000041/bg.png",
+        "roles": [],
+        "size": 813239
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000042/bg.png",
+        "roles": [],
+        "size": 650012
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000043/bg.png",
+        "roles": [],
+        "size": 738870
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000044/bg.png",
+        "roles": [],
+        "size": 464085
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000045/bg.png",
+        "roles": [],
+        "size": 1542026
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000046/bg.png",
+        "roles": [],
+        "size": 946182
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000047/bg.png",
+        "roles": [],
+        "size": 1039047
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000048/bg.png",
+        "roles": [],
+        "size": 1293477
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000049/bg.png",
+        "roles": [],
+        "size": 1290254
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000050/bg.png",
+        "roles": [],
+        "size": 1356497
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000051/bg.png",
+        "roles": [],
+        "size": 1915049
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000052/bg.png",
+        "roles": [],
+        "size": 504989
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000053/bg.png",
+        "roles": [],
+        "size": 514748
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000054/bg.png",
+        "roles": [],
+        "size": 1811120
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000055/bg.png",
+        "roles": [],
+        "size": 1115957
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000056/bg.png",
+        "roles": [],
+        "size": 39094
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000057/bg.png",
+        "roles": [],
+        "size": 438251
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000058/bg.png",
+        "roles": [],
+        "size": 518417
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000059/bg.png",
+        "roles": [],
+        "size": 458682
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000060/bg.png",
+        "roles": [],
+        "size": 474508
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000061/bg.png",
+        "roles": [],
+        "size": 33788
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000062/bg.png",
+        "roles": [],
+        "size": 405398
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000063/bg.png",
+        "roles": [],
+        "size": 505420
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000064/bg.png",
+        "roles": [],
+        "size": 1614878
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000065/bg.png",
+        "roles": [],
+        "size": 723332
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000066/bg.png",
+        "roles": [],
+        "size": 1023929
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000067/bg.png",
+        "roles": [],
+        "size": 653742
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000068/bg.png",
+        "roles": [],
+        "size": 655486
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000069/bg.png",
+        "roles": [],
+        "size": 668327
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000070/bg.png",
+        "roles": [],
+        "size": 927840
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000071/bg.png",
+        "roles": [],
+        "size": 966787
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000072/bg.png",
+        "roles": [],
+        "size": 572390
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000073/bg.png",
+        "roles": [],
+        "size": 268333
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000074/bg.png",
+        "roles": [],
+        "size": 664668
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000075/bg.png",
+        "roles": [],
+        "size": 529422
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000076/bg.png",
+        "roles": [],
+        "size": 599157
+      },
+      {
+        "path": "effect/configure-t/BgReplace/BG00000077/bg.png",
+        "roles": [],
+        "size": 666121
+      },
+      {
+        "path": "materials/BgReplace/BG00000001/icon.png",
+        "roles": [],
+        "size": 2823
+      },
+      {
+        "path": "materials/BgReplace/BG00000002/icon.png",
+        "roles": [],
+        "size": 2615
+      },
+      {
+        "path": "materials/BgReplace/BG00000003/icon.png",
+        "roles": [],
+        "size": 98
+      },
+      {
+        "path": "materials/BgReplace/BG00000004/icon.png",
+        "roles": [],
+        "size": 98
+      },
+      {
+        "path": "materials/BgReplace/BG00000005/icon.png",
+        "roles": [],
+        "size": 3485
+      },
+      {
+        "path": "materials/BgReplace/BG00000006/icon.png",
+        "roles": [],
+        "size": 98
+      },
+      {
+        "path": "materials/BgReplace/BG00000007/icon.png",
+        "roles": [],
+        "size": 3220
+      },
+      {
+        "path": "materials/BgReplace/BG00000008/icon.png",
+        "roles": [],
+        "size": 3728
+      },
+      {
+        "path": "materials/BgReplace/BG00000009/icon.png",
+        "roles": [],
+        "size": 3830
+      },
+      {
+        "path": "materials/BgReplace/BG00000010/icon.png",
+        "roles": [],
+        "size": 3559
+      },
+      {
+        "path": "materials/BgReplace/BG00000011/icon.png",
+        "roles": [],
+        "size": 3166
+      },
+      {
+        "path": "materials/BgReplace/BG00000012/icon.png",
+        "roles": [],
+        "size": 2679
+      },
+      {
+        "path": "materials/BgReplace/BG00000013/icon.png",
+        "roles": [],
+        "size": 3540
+      },
+      {
+        "path": "materials/BgReplace/BG00000014/icon.png",
+        "roles": [],
+        "size": 1944
+      },
+      {
+        "path": "materials/BgReplace/BG00000015/icon.png",
+        "roles": [],
+        "size": 2893
+      },
+      {
+        "path": "materials/BgReplace/BG00000016/icon.png",
+        "roles": [],
+        "size": 98
+      },
+      {
+        "path": "materials/BgReplace/BG00000017/icon.png",
+        "roles": [],
+        "size": 3297
+      },
+      {
+        "path": "materials/BgReplace/BG00000018/icon.png",
+        "roles": [],
+        "size": 2953
+      },
+      {
+        "path": "materials/BgReplace/BG00000019/icon.png",
+        "roles": [],
+        "size": 2144
+      },
+      {
+        "path": "materials/BgReplace/BG00000020/icon.png",
+        "roles": [],
+        "size": 3829
+      },
+      {
+        "path": "materials/BgReplace/BG00000021/icon.png",
+        "roles": [],
+        "size": 918
+      },
+      {
+        "path": "materials/BgReplace/BG00000022/icon.png",
+        "roles": [],
+        "size": 916
+      },
+      {
+        "path": "materials/BgReplace/BG00000023/icon.png",
+        "roles": [],
+        "size": 919
+      },
+      {
+        "path": "materials/BgReplace/BG00000024/icon.png",
+        "roles": [],
+        "size": 1568
+      },
+      {
+        "path": "materials/BgReplace/BG00000025/icon.png",
+        "roles": [],
+        "size": 582
+      },
+      {
+        "path": "materials/BgReplace/BG00000026/icon.png",
+        "roles": [],
+        "size": 919
+      },
+      {
+        "path": "materials/BgReplace/BG00000027/icon.png",
+        "roles": [],
+        "size": 29925
+      },
+      {
+        "path": "materials/BgReplace/BG00000028/icon.png",
+        "roles": [],
+        "size": 920
+      },
+      {
+        "path": "materials/BgReplace/BG00000029/icon.png",
+        "roles": [],
+        "size": 26447
+      },
+      {
+        "path": "materials/BgReplace/BG00000030/icon.png",
+        "roles": [],
+        "size": 925
+      },
+      {
+        "path": "materials/BgReplace/BG00000031/icon.png",
+        "roles": [],
+        "size": 918
+      },
+      {
+        "path": "qtwebengine_devtools_resources.pak",
+        "roles": [],
+        "size": 2204511
+      },
+      {
+        "path": "qtwebengine_resources.pak",
+        "roles": [],
+        "size": 2502554
+      },
+      {
+        "path": "qtwebengine_resources_100p.pak",
+        "roles": [],
+        "size": 195621
+      },
+      {
+        "path": "qtwebengine_resources_200p.pak",
+        "roles": [],
+        "size": 256762
+      },
+      {
+        "path": "UIResources/SodaUpgrade/Win/1.jpg",
+        "roles": [],
+        "size": 34037
+      },
+      {
+        "path": "UIResources/SodaUpgrade/Win/2.jpg",
+        "roles": [],
+        "size": 105324
+      },
+      {
+        "path": "UIResources/SodaUpgrade/Win/3.jpg",
+        "roles": [],
+        "size": 69918
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/1.jpg",
+        "roles": [],
+        "size": 106877
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/10.jpg",
+        "roles": [],
+        "size": 1508684
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/11.jpg",
+        "roles": [],
+        "size": 1101479
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/12.jpg",
+        "roles": [],
+        "size": 1956759
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/13.jpg",
+        "roles": [],
+        "size": 974564
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/14.jpg",
+        "roles": [],
+        "size": 1448515
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/15.jpg",
+        "roles": [],
+        "size": 1703232
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/16.jpg",
+        "roles": [],
+        "size": 803027
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/17.jpg",
+        "roles": [],
+        "size": 2332837
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/18.jpg",
+        "roles": [],
+        "size": 1916250
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/2.jpg",
+        "roles": [],
+        "size": 266858
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/3.jpg",
+        "roles": [],
+        "size": 78283
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/4.jpg",
+        "roles": [],
+        "size": 85867
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/5.jpg",
+        "roles": [],
+        "size": 1662037
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/6.jpg",
+        "roles": [],
+        "size": 1520940
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/7.jpg",
+        "roles": [],
+        "size": 1600204
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/8.jpg",
+        "roles": [],
+        "size": 1584938
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/9.jpg",
+        "roles": [],
+        "size": 1315533
+      },
+      {
+        "path": "UIResources/VersionGuide/images/Win/last.jpg",
+        "roles": [],
+        "size": 953342
+      },
+      {
+        "path": "www/agent/assets/arm-hair-BPhVjPn7.jpg",
+        "roles": [],
+        "size": 6526
+      },
+      {
+        "path": "www/agent/assets/image_0-p8zNxi90.png",
+        "roles": [],
+        "size": 401772
+      },
+      {
+        "path": "www/agent/assets/snow-sun-D3vkJJ5b.png",
+        "roles": [],
+        "size": 9837
+      },
+      {
+        "path": "www/agent/assets/spring-cherry-DZQ0hB08.png",
+        "roles": [],
+        "size": 11825
+      },
+      {
+        "path": "www/agent/assets/task-progress-star-apng-C5Eozcpp.png",
+        "roles": [],
+        "size": 5105428
+      }
+    ],
+    "files_considered": 2027,
+    "independent_paks": [
+      {
+        "path": "qtwebengine_devtools_resources.pak",
+        "sha256": "05236dbad9bcb5e74d678deb35b9d9b18088589c54ca404b57a990b29ef9189d",
+        "size": 2204511
+      },
+      {
+        "path": "qtwebengine_resources.pak",
+        "sha256": "4ed3a10f1bbc40b9a2ce3b8cb6dab6f00fe922d0c0e1c6ab5adfd8617cec9389",
+        "size": 2502554
+      },
+      {
+        "path": "qtwebengine_resources_100p.pak",
+        "sha256": "e7e2cd13fa9fbaa33c537e8eecfd542e4ce4a621bc0b94159ef9e6e4541652a6",
+        "size": 195621
+      },
+      {
+        "path": "qtwebengine_resources_200p.pak",
+        "sha256": "669f9d3388438377c440419e5c62973362e33e84a5b247ddd0dd4568da75eb13",
+        "size": 256762
+      }
+    ],
+    "namespace_matches": []
+  },
+  "schema": "aurora/pixcake-pe-assets/1",
+  "shader_samplers": {
+    "s_beauty_map_texture": [
+      {
+        "data_offset": 2068168192,
+        "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcess.frag",
+        "sha256": "1831a8c37e54a7ecad45abe89d8bb984dd97ec0571237d8631bacf41a4f1f0f8",
+        "size": 1654
+      },
+      {
+        "data_offset": 2068171776,
+        "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithMask.frag",
+        "sha256": "0c7735a8bc8b84eecc2b09238d3ef815e2e86b5b89690ddaae7aa343345af3db",
+        "size": 3008
+      },
+      {
+        "data_offset": 2068175360,
+        "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithTwoMask.frag",
+        "sha256": "58af7a0c8d579f1ca58222a4613202ddd576c3580f1ac74eda73f1a1078cdf3a",
+        "size": 4478
+      },
+      {
+        "data_offset": 2068527104,
+        "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcess.frag",
+        "sha256": "1831a8c37e54a7ecad45abe89d8bb984dd97ec0571237d8631bacf41a4f1f0f8",
+        "size": 1654
+      },
+      {
+        "data_offset": 2068530688,
+        "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithMask.frag",
+        "sha256": "0c7735a8bc8b84eecc2b09238d3ef815e2e86b5b89690ddaae7aa343345af3db",
+        "size": 3008
+      },
+      {
+        "data_offset": 2068534272,
+        "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingProcessWithTwoMask.frag",
+        "sha256": "58af7a0c8d579f1ca58222a4613202ddd576c3580f1ac74eda73f1a1078cdf3a",
+        "size": 4478
+      }
+    ],
+    "s_blur_texture": [
+      {
+        "data_offset": 2068180480,
+        "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+        "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+        "size": 1510
+      },
+      {
+        "data_offset": 2068539392,
+        "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+        "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+        "size": 1510
+      },
+      {
+        "data_offset": 2069040128,
+        "path": "glsl/glsl/LipColor/LipMultiColors.frag",
+        "sha256": "627fc41016da343ac0afd591f7685fbcd65ff09d73da96d5e2e6729d6e70bb09",
+        "size": 5625
+      },
+      {
+        "data_offset": 2069579776,
+        "path": "glsl/glsl/Sharpness/Sharpness.frag",
+        "sha256": "298ab3b69a5b8e297348cc09c398c7af19e001e5ec490789e3d15961820925c8",
+        "size": 1526
+      },
+      {
+        "data_offset": 2069726208,
+        "path": "glsl/glsl/Spotless/SpotlessProcessNormal.frag",
+        "sha256": "d23e69c49295a40cb1f9f4f005d0ed78cb128a3f8f3eab11dc6b9fad0c22f36d",
+        "size": 3895
+      },
+      {
+        "data_offset": 2069730816,
+        "path": "glsl/glsl/Spotless/SpotlessProcessWithSkinMask.frag",
+        "sha256": "b049130c80ffc3af87b8b516ffd6f37eac89b1af4e05a34020beacb84170f568",
+        "size": 2686
+      },
+      {
+        "data_offset": 2070106112,
+        "path": "glsl/LipColor/LipMultiColors.frag",
+        "sha256": "627fc41016da343ac0afd591f7685fbcd65ff09d73da96d5e2e6729d6e70bb09",
+        "size": 5625
+      },
+      {
+        "data_offset": 2070426112,
+        "path": "glsl/Sharpness/Sharpness.frag",
+        "sha256": "298ab3b69a5b8e297348cc09c398c7af19e001e5ec490789e3d15961820925c8",
+        "size": 1526
+      },
+      {
+        "data_offset": 2070572544,
+        "path": "glsl/Spotless/SpotlessProcessNormal.frag",
+        "sha256": "d23e69c49295a40cb1f9f4f005d0ed78cb128a3f8f3eab11dc6b9fad0c22f36d",
+        "size": 3895
+      },
+      {
+        "data_offset": 2070577152,
+        "path": "glsl/Spotless/SpotlessProcessWithSkinMask.frag",
+        "sha256": "b049130c80ffc3af87b8b516ffd6f37eac89b1af4e05a34020beacb84170f568",
+        "size": 2686
+      }
+    ],
+    "s_hardlight_map_texture": [
+      {
+        "data_offset": 2068180480,
+        "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+        "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+        "size": 1510
+      },
+      {
+        "data_offset": 2068539392,
+        "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+        "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+        "size": 1510
+      }
+    ],
+    "s_skin_map_texture": [
+      {
+        "data_offset": 2068180480,
+        "path": "glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+        "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+        "size": 1510
+      },
+      {
+        "data_offset": 2068539392,
+        "path": "glsl/glsl/FaceRetouch/RetouchMoisturizing/RetouchMoisturizingWeightData.frag",
+        "sha256": "33018dcc9c13c892dde4bc6da9a66632225822bcd0ffc6a8b8622db826a7692b",
+        "size": 1510
+      }
+    ]
+  },
+  "status": "BLOCKED_NO_ASSETS_PE_NAMESPACE"
+}
