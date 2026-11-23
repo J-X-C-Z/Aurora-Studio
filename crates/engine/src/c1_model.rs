@@ -5,7 +5,7 @@
 //! into pixels still has to be re-derived (or measured) separately.
 
 #[path = "c1_crop_limit.rs"]
-mod crop_limit;
+pub(crate) mod crop_limit;
 
 use std::collections::HashMap;
 
@@ -294,6 +294,22 @@ pub fn parse_curve(raw: &str) -> Vec<(f32, f32)> {
         out.push((x, y));
     }
     out
+}
+
+/// Wire `ZLENSDISTORTION` into the geometry stage.
+///
+/// `pitch` is `IC_SensorGeometry.rawPixelWidth/rawPixelHeight` in micrometres
+/// per pixel, so the curve lands in source pixels — the frame `FrameMap` maps
+/// through. The four catalog disable paths leave `distortion` empty, which
+/// keeps the geometry stage on its identity radial path.
+pub fn apply_lens_distortion(geometry: &mut crate::Geometry, lens: &C1Lens, pitch: [f32; 2]) {
+    geometry.distortion = crop_limit::RadialCurve::from_row(
+        lens.distortion.points(),
+        lens.distortion.param(0).unwrap_or(0.0),
+        lens.distortion.param(1).unwrap_or(0.0) != 0.0,
+        pitch,
+    );
+    geometry.optical_center = lens.optic_center;
 }
 
 /// Parses a pipe-separated lens profile. Fields that hold `x,y` pairs become
@@ -750,6 +766,8 @@ impl ChromaFringing {
 pub struct C1Lens {
     /// `ZLENSDISTORTION`: radial spline plus amount / flag / amount / centre.
     pub distortion: SplineProfile,
+    /// `ZLENSOPTICCENTER`: optical centre in source pixels.
+    pub optic_center: [f32; 2],
     /// `ZLENSLIGHTFALLOFF`: radial spline plus amount / flag.
     pub light_falloff: SplineProfile,
     /// `ZLENSRADIALBLUR` fields 1 and 2 plus its `valid` flag.
@@ -910,6 +928,7 @@ impl C1VariantSettings {
 
             lens: C1Lens {
                 distortion: SplineProfile::default(),
+                optic_center: [0.0, 0.0],
                 light_falloff: SplineProfile::default(),
                 radial_blur: RadialBlur::default(),
                 sharpness_falloff: 0.0,
@@ -1102,6 +1121,13 @@ pub fn from_layer_row(row: &HashMap<&str, Option<String>>) -> C1VariantSettings 
     s.canvas_size = [canvas[0], canvas[1]];
 
     s.lens.distortion = get("ZLENSDISTORTION").map(parse_spline).unwrap_or_default();
+    if let Some(raw) = get("ZLENSOPTICCENTER") {
+        // `ZLENSOPTICCENTER` is pipe-separated: `x|y`.
+        let v: Vec<f32> = clean(raw).split('|').filter_map(parse_scalar).collect();
+        if v.len() >= 2 && v[0] > 0.0 && v[1] > 0.0 {
+            s.lens.optic_center = [v[0], v[1]];
+        }
+    }
     s.lens.light_falloff = get("ZLENSLIGHTFALLOFF").map(parse_spline).unwrap_or_default();
     s.lens.lcc_light_falloff = flag(get("ZLENSLCCLIGHTFALLOFF"), s.lens.lcc_light_falloff);
     s.lens.lcc_light_falloff_amount =
@@ -1446,6 +1472,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
     set.vignetting = Vignetting {
         amount: clamp(s.vignetting[0], -4.0, 4.0),
         method: VignetteMethod::EllipticOnCrop,
+        ..Vignetting::default()
     };
 
     // C1's three numbers per zone are RGB multipliers: 1;1;1 is neutral and the
@@ -1551,6 +1578,7 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         diffraction_enabled: s.lens.diffraction_enabled,
         aperture: s.lens.aperture.max(0.0),
         hide_distorted_areas: true,
+        optic_center: (s.lens.optic_center != [0.0, 0.0]).then_some(s.lens.optic_center),
         shift_x: clamp(s.lens.shift_xy[0], -100.0, 100.0),
         shift_y: clamp(s.lens.shift_xy[1], -100.0, 100.0),
         tilt: clamp(s.lens.tilt, -45.0, 45.0),
@@ -1600,6 +1628,10 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         portrait: false,
         keystone,
         crop: NormRect::FULL,
+        // The radial curve needs the sensor pitch, so it is attached where the
+        // capture geometry is known (`apply_lens_distortion`).
+        distortion: crop_limit::RadialCurve::default(),
+        optical_center: s.lens.optic_center,
     };
     set.geometry.crop = crop_on_canvas_with_clipping(s.crop_px, &set.geometry, None, s.geometry_canvas_clipping);
 
@@ -2678,6 +2710,29 @@ mod tests {
         assert_eq!(curve.x[1].to_bits(), 0x405d722c80000000);
         assert_eq!(curve.v[7].to_bits(), 0x40af454ee0000000);
         assert_eq!(curve.x[7].to_bits(), 0x40af76bce0000000);
+    }
+
+    #[test]
+    fn real_dsc5673_lens_wires_into_the_geometry_stage() {
+        let settings = from_layer_row(&row(&[
+            (
+                "ZLENSDISTORTION",
+                Some(
+                    "0.0,0.0000;742.0,-43.3392;1483.9,-86.4269;2225.9,-129.0114;\
+                     5935.7,-325.4922;14097.2,-526.0558;20032.8,-279.2483;\
+                     23742.6,146.6017|100.0|1|100|-1.00000",
+                ),
+            ),
+            ("ZLENSOPTICCENTER", Some("3067.851562|1920.515625")),
+        ]));
+        assert_eq!(settings.lens.optic_center, [3067.851_562, 1920.515_625]);
+        let mut geometry = to_adjustment_set(&settings).geometry;
+        assert!(geometry.distortion.is_empty(), "the catalog alone has no pixel pitch");
+        apply_lens_distortion(&mut geometry, &settings.lens, [5.935_846_3, 5.927_579_4]);
+        assert_eq!(geometry.optical_center, [3067.851_562, 1920.515_625]);
+        assert_eq!(geometry.distortion.v.len(), 8);
+        assert_eq!(geometry.distortion.v[7].to_bits(), 0x40af454ee0000000);
+        assert_eq!(geometry.distortion.x[7].to_bits(), 0x40af76bce0000000);
     }
 
     #[test]

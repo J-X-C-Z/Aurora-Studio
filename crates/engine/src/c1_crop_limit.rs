@@ -261,6 +261,19 @@ impl RadialCurve {
         Self { v, x, m }
     }
 
+    /// A catalog row with its own `enable` flag (`ZLENSDISTORTION` field 3).
+    pub fn from_row(points: &[(f32, f32)], amount: f32, enable: bool, pitch: [f32; 2]) -> Self {
+        if !enable {
+            return Self::default();
+        }
+        Self::from_profile(points, amount, pitch)
+    }
+
+    /// No usable curve: the radial stage is the identity.
+    pub fn is_empty(&self) -> bool {
+        self.v.len() < 2 || self.v.len() != self.x.len() || self.v.len() != self.m.len()
+    }
+
     /// `0x14278D0`: the interior rows of C1's `CSpline::UpdateDerivatives`,
     /// with the first node clamped to the native start slope of 1 and a natural
     /// end row.  The native end row is not reproduced bit for bit yet, so the
@@ -348,6 +361,15 @@ impl RadialCurve {
         if self.v.len() < 2 {
             return corrected;
         }
+        let last = self.v.len() - 1;
+        // Past the last node the native solver extrapolates the final cubic;
+        // its tangent is the node derivative, which is what the corners need.
+        if corrected >= self.x[last] {
+            return self.v[last] + (corrected - self.x[last]) / self.m[last];
+        }
+        if corrected <= self.x[0] {
+            return self.v[0] + (corrected - self.x[0]) / self.m[0];
+        }
         let i = Self::segment(&self.x, corrected);
         let (mut lo, mut hi) = (self.v[i], self.v[i + 1]);
         for _ in 0..200 {
@@ -359,6 +381,40 @@ impl RadialCurve {
             }
         }
         (lo + hi) * 0.5
+    }
+
+    /// Newton refinement of [`Self::inverse`]; the derivative is taken from the
+    /// same cubic, so this converges in three or four steps inside a segment.
+    pub fn inverse_newton(&self, corrected: f64) -> f64 {
+        if self.v.len() < 2 {
+            return corrected;
+        }
+        let i = Self::segment(&self.x, corrected);
+        let (v0, x0, m0) = (self.v[i], self.x[i], self.m[i]);
+        let (v1, x1, m1) = (self.v[i + 1], self.x[i + 1], self.m[i + 1]);
+        let h = v1 - v0;
+        let mut t = if h == 0.0 { 0.0 } else { (self.inverse(corrected) - v0) / h };
+        let poly = |t: f64| {
+            let a = (t - 1.0) * m0 + m1 * t;
+            let b = t * t * (x1 - x0);
+            (
+                a * t * (t - 1.0) * h + b * (3.0 - (t + t)) + x0 - corrected,
+                ((m0 + m1) * t * (t - 1.0) + a * (2.0 * t - 1.0)) * h
+                    + 2.0 * t * (x1 - x0) * (3.0 - (t + t)) - 2.0 * b,
+            )
+        };
+        for _ in 0..12 {
+            let (f, d) = poly(t);
+            if d.abs() < 1e-18 {
+                break;
+            }
+            let step = f / d;
+            t -= step;
+            if step.abs() < 1e-14 {
+                break;
+            }
+        }
+        v0 + t * h
     }
 }
 
@@ -372,6 +428,35 @@ pub fn mode6_curve(point: [f64; 2], optical_center: [f64; 2], curve: &RadialCurv
 /// coordinates, evaluated through [`RadialCurve::forward`].
 pub fn mode7_curve(point: [f64; 2], optical_center: [f64; 2], curve: &RadialCurve) -> [f64; 2] {
     mode7(point, optical_center, |r| curve.forward(r))
+}
+
+/// `mode 6` with the Newton inverse (`0x14296C0`).
+pub fn mode6_curve_newton(
+    point: [f64; 2],
+    optical_center: [f64; 2],
+    curve: &RadialCurve,
+) -> [f64; 2] {
+    mode6(point, optical_center, |r| curve.inverse_newton(r))
+}
+
+/// Fallback for a crop solver whose anchor precheck rejects the rectangle: map
+/// the four corners with the real radial pair and return their axis-aligned box
+/// as `[cx, cy, w, h]`. Every input edge starts and ends on an image edge for a
+/// crop that is inside the frame, so the box is the same field's limit.
+pub fn four_corner_box(rect: [f64; 4], map: impl Fn([f64; 2]) -> [f64; 2]) -> [f64; 4] {
+    let [cx, cy, w, h] = rect;
+    let corners = [
+        [cx - w * 0.5, cy - h * 0.5],
+        [cx + w * 0.5, cy - h * 0.5],
+        [cx + w * 0.5, cy + h * 0.5],
+        [cx - w * 0.5, cy + h * 0.5],
+    ]
+    .map(map);
+    let x0 = corners.iter().fold(f64::INFINITY, |m, p| m.min(p[0]));
+    let y0 = corners.iter().fold(f64::INFINITY, |m, p| m.min(p[1]));
+    let x1 = corners.iter().fold(f64::NEG_INFINITY, |m, p| m.max(p[0]));
+    let y1 = corners.iter().fold(f64::NEG_INFINITY, |m, p| m.max(p[1]));
+    [(x0 + x1) * 0.5, (y0 + y1) * 0.5, x1 - x0, y1 - y0]
 }
 
 fn search_side(span: f64, mut distance: impl FnMut(f64) -> f64) -> f64 {
@@ -635,5 +720,41 @@ mod tests {
             assert_eq!((got[0] as f32).to_bits(), want, "source {source}");
             assert_eq!(got[1], 0.0);
         }
+    }
+
+    #[test]
+    fn real_dsc5673_mode6_then_mode7_round_trips() {
+        // Forward mode 6 (corrected -> source), reverse mode 7 (source -> corrected).
+        let curve = dsc5673_curve();
+        let c = DSC5673_OPTIC_CENTER;
+        for radius in [150.0f64, 742.0, 1483.9, 3000.0, 3600.0] {
+            let corrected = [c[0] + radius, c[1]];
+            let source = mode6_curve(corrected, c, &curve);
+            // mode 6 already returns centred coordinates.
+            let back = mode7_curve(source, c, &curve);
+            let dx = back[0] - c[0] - radius;
+            assert!(dx.abs() < 1e-3, "radius {radius}: round trip off by {dx}");
+            let newton = mode6_curve_newton(corrected, c, &curve);
+            assert!((newton[0] - source[0]).abs() < 1e-6, "newton vs bisection");
+        }
+    }
+
+    #[test]
+    fn real_dsc5673_four_corner_box() {
+        // The geometry-6 solver's anchor precheck rejects most real rectangles;
+        // the fallback maps the four crop corners and takes their box.
+        let curve = dsc5673_curve();
+        let c = DSC5673_OPTIC_CENTER;
+        let rect = [4190.23193359375, 4844.7243652344, 3328.8486328125, 4993.2734375];
+        let bbox = four_corner_box(rect, |p| {
+            let q = mode6_curve(p, c, &curve);
+            [q[0] + c[0], q[1] + c[1]]
+        });
+        // Native box in centre/size form: corners (2493.183, 2373.823),
+        // (5930.413, 2359.711), (5720.622, 7080.641), (2546.614, 7133.280).
+        assert!((bbox[0] - 4211.7979001298495).abs() < 1e-5, "cx {}", bbox[0]);
+        assert!((bbox[1] - 4746.495179066703).abs() < 1e-5, "cy {}", bbox[1]);
+        assert!((bbox[2] - 3437.230344277653).abs() < 1e-5, "w {}", bbox[2]);
+        assert!((bbox[3] - 4773.568730190901).abs() < 1e-5, "h {}", bbox[3]);
     }
 }

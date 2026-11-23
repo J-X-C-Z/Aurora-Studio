@@ -297,6 +297,11 @@ fn map_frame(f: [f32; 2], g: &Geometry, crop: NormRect, source_size: (u32, u32))
         3 => [1.0 - q[1], q[0]],
         _ => q,
     };
+    let s = if g.distortion.is_empty() {
+        s
+    } else {
+        apply_radial(s, &g.distortion, g.optical_center, (source_size.0 as f32, source_size.1 as f32))
+    };
     (oriented, finite_pair(s))
 }
 
@@ -316,6 +321,7 @@ pub(crate) fn frame_to_source(f: [f32; 2], g: &crate::Geometry, source_size: (u3
 /// `new`, so the per-pixel `map` is only interpolation and a rotation.
 pub(crate) struct FrameMap {
     oriented: (f32, f32),
+    source: (f32, f32),
     canvas: (f32, f32),
     canvas_stored: bool,
     crop: NormRect,
@@ -331,6 +337,9 @@ pub(crate) struct FrameMap {
     orientation: u8,
     flip_h: bool,
     flip_v: bool,
+    /// `ZLENSDISTORTION` in source pixels; `None` keeps the old identity path.
+    distortion: Option<crate::c1_model::crop_limit::RadialCurve>,
+    optical_center: [f32; 2],
 }
 
 impl FrameMap {
@@ -344,6 +353,7 @@ impl FrameMap {
         let canvas_stored = canvas != oriented_size(g, source_size);
         Self {
             oriented: oriented_size(g, source_size),
+            source: (source_size.0 as f32, source_size.1 as f32),
             canvas,
             canvas_stored,
             crop: crop_for_aspect(g, source_size),
@@ -357,6 +367,8 @@ impl FrameMap {
             orientation: g.orientation % 4,
             flip_h: g.flip_horizontal,
             flip_v: g.flip_vertical,
+            distortion: (!g.distortion.is_empty()).then(|| g.distortion.clone()),
+            optical_center: g.optical_center,
         }
     }
 
@@ -394,6 +406,21 @@ impl FrameMap {
             if self.stretch_x { w /= self.stretch } else { h /= self.stretch };
         }
         (finite(w), finite(h))
+    }
+
+    /// Nothing to resample: no lens curve, no keystone, no turn, no crop and no
+    /// stretched canvas. The 16-bit stage uses this to keep the frame byte for
+    /// byte when the geometry is empty.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.distortion.is_none()
+            && self.keystone.is_none()
+            && (self.stretch - 1.0).abs() <= EPS
+            && self.crop == NormRect::FULL
+            && self.orientation == 0
+            && !self.flip_h
+            && !self.flip_v
+            && self.rotation.abs() < 1e-6
+            && !self.canvas_stored
     }
 
     /// Oriented (after quarter turns and rotation, before crop) size, for aspect-dependent masks.
@@ -438,7 +465,14 @@ impl FrameMap {
             3 => [1.0 - q[1], q[0]],
             _ => q,
         };
-        (oriented, finite_pair(s))
+        (oriented, finite_pair(self.apply_distortion(s)))
+    }
+
+    fn apply_distortion(&self, s: [f32; 2]) -> [f32; 2] {
+        match &self.distortion {
+            Some(curve) => apply_radial(s, curve, self.optical_center, self.source),
+            None => s,
+        }
     }
 
     pub(crate) fn frame_from_source(&self, source: [f32; 2]) -> Option<[f32; 2]> {
@@ -477,6 +511,32 @@ impl FrameMap {
         ((mapped[0] - source[0]).abs().max((mapped[1] - source[1]).abs()) <= 1e-5)
             .then_some(frame)
     }
+}
+
+/// The lens profile lives in source pixels; radii at or below one pixel are the
+/// native identity path, and an empty curve never enters here.
+fn apply_radial(
+    s: [f32; 2],
+    curve: &crate::c1_model::crop_limit::RadialCurve,
+    optical_center: [f32; 2],
+    size: (f32, f32),
+) -> [f32; 2] {
+    let (sw, sh) = size;
+    if !(sw > EPS && sh > EPS) {
+        return s;
+    }
+    let px = [s[0] * sw, s[1] * sh];
+    let d = [px[0] - optical_center[0], px[1] - optical_center[1]];
+    let r = (d[0] * d[0] + d[1] * d[1]).sqrt();
+    if !(r > 1.0) || !r.is_finite() {
+        return s;
+    }
+    let k = (curve.inverse(f64::from(r)) / f64::from(r)) as f32;
+    let out = [
+        (optical_center[0] + d[0] * k) / sw,
+        (optical_center[1] + d[1] * k) / sh,
+    ];
+    finite_pair(out)
 }
 
 #[cfg(test)]
@@ -992,5 +1052,70 @@ mod tests {
         for f in [[0.0, 0.0], [0.3, 0.7], [0.5, 0.5], [1.0, 1.0]] {
             assert_eq!(map.map(f), (f, f));
         }
+    }
+
+    const LENS_PITCH: [f32; 2] = [5.935_846_3, 5.927_579_4];
+    const LENS_POINTS: [(f32, f32); 8] = [
+        (0.0, 0.0),
+        (742.0, -43.3392),
+        (1483.9, -86.4269),
+        (2225.9, -129.0114),
+        (5935.7, -325.4922),
+        (14097.2, -526.0558),
+        (20032.8, -279.2483),
+        (23742.6, 146.6017),
+    ];
+    const PROBE_POINTS: [[f32; 2]; 6] =
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5], [0.25, 0.75]];
+
+    fn lens_geometry(curve: crate::c1_model::crop_limit::RadialCurve) -> Geometry {
+        Geometry {
+            distortion: curve,
+            optical_center: [3067.851_562, 1920.515_625],
+            ..dsc5673()
+        }
+    }
+
+    /// `ZLENSDISTORTION`'s four disable paths must leave every mapped point bit
+    /// for bit identical to the old identity-radial stage.
+    #[test]
+    fn distortion_disabled_paths_are_bit_identical() {
+        use crate::c1_model::crop_limit::RadialCurve;
+        let base = dsc5673();
+        let reference = FrameMap::new(DSC5673, &base);
+        let mut inverted = LENS_POINTS;
+        inverted.swap(1, 2);
+        let cases = [
+            ("enable 0", RadialCurve::from_row(&LENS_POINTS, 100.0, false, LENS_PITCH)),
+            ("one node", RadialCurve::from_row(&LENS_POINTS[..1], 100.0, true, LENS_PITCH)),
+            ("not increasing", RadialCurve::from_row(&inverted, 100.0, true, LENS_PITCH)),
+            ("amount < 1", RadialCurve::from_row(&LENS_POINTS, 0.9, true, LENS_PITCH)),
+        ];
+        for (name, curve) in cases {
+            assert!(curve.is_empty(), "{name} must be the empty curve");
+            let map = FrameMap::new(DSC5673, &lens_geometry(curve));
+            for f in PROBE_POINTS {
+                assert_eq!(map.map(f), reference.map(f), "{name} at {f:?}");
+            }
+        }
+    }
+
+    /// The real row does move the source sample, and the moved value is stable.
+    #[test]
+    fn real_dsc5673_lens_curve_moves_the_corner() {
+        use crate::c1_model::crop_limit::RadialCurve;
+        let curve = RadialCurve::from_row(&LENS_POINTS, 100.0, true, LENS_PITCH);
+        assert!(!curve.is_empty());
+        let plain = FrameMap::new(DSC5673, &dsc5673());
+        let lensed = FrameMap::new(DSC5673, &lens_geometry(curve));
+        let corner = [0.0, 1.0];
+        let (a, b) = (plain.map(corner).1, lensed.map(corner).1);
+        assert_ne!(a, b, "the radial stage must run");
+        // The frame corner maps to a far crop corner, so the displacement is in
+        // the hundreds of pixels for the real row — the native mode-6 corner
+        // sweep moves some corners by ~292 px. Pin the measured delta instead
+        // of guessing a magnitude range.
+        let (dx, dy) = ((b[0] - a[0]) * DSC5673.0 as f32, (b[1] - a[1]) * DSC5673.1 as f32);
+        assert!((dx - (-84.885_49)).abs() < 1e-3 && (dy - 25.344_292).abs() < 1e-3, "moved {dx},{dy} px");
     }
 }

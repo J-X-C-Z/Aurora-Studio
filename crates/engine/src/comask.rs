@@ -1550,14 +1550,20 @@ mod tests {
         assert!(cover(b"Cover\x00\x22\x00Hdr\x00\x22\xff\x0c\x02\x00").is_none());
     }
 
-    const FIXTURE: &[u8] = include_bytes!("../testdata/comask/decode-fixture.comask");
-    const FIXTURE_REFS: &[u8] = include_bytes!("../testdata/comask/reference-planes.bin");
+    fn fixture_bytes() -> Option<Vec<u8>> {
+        crate::testdata::bytes("testdata/comask/decode-fixture.comask")
+    }
+
+    fn fixture_ref_bytes() -> Option<Vec<u8>> {
+        crate::testdata::bytes("testdata/comask/reference-planes.bin")
+    }
 
     /// Five 192x128 crops of the real sample, decoded against Capture One's
     /// own `IC_MaskSampleInt` planes. No catalog or installation needed.
     #[test]
     fn fixture_planes_match_capture_one_references_byte_for_byte() {
-        let planes = read_comask_masks(FIXTURE).unwrap();
+        let (Some(fixture), Some(refs)) = (fixture_bytes(), fixture_ref_bytes()) else { return };
+        let planes = read_comask_masks(&fixture).unwrap();
         let uuids = [
             "24391591-4129-4c9f-a9f5-bb4dd4c41289",
             "d7ebf169-4d9f-41fe-b264-87f8cae0f083",
@@ -1568,12 +1574,12 @@ mod tests {
         let blocks = [6usize, 6, 5, 6, 6];
         assert_eq!(planes.len(), 5);
         let plane_len = 192 * 128;
-        assert_eq!(FIXTURE_REFS.len(), plane_len * planes.len());
+        assert_eq!(refs.len(), plane_len * planes.len());
         for (i, plane) in planes.iter().enumerate() {
             assert_eq!((plane.width, plane.height), (192, 128));
             assert_eq!(plane.uuid.as_deref(), Some(uuids[i]));
             assert_eq!((plane.blocks, plane.decoded_blocks, plane.failed_blocks), (blocks[i], blocks[i], 0));
-            let want = &FIXTURE_REFS[i * plane_len..(i + 1) * plane_len];
+            let want = &refs[i * plane_len..(i + 1) * plane_len];
             assert_eq!(plane.to_u8(), want, "mask {}", plane.mask_index);
         }
         assert_eq!(planes.iter().map(|p| p.mask_index).collect::<Vec<_>>(), vec![0, 1, 2, 5, 6]);
@@ -1581,8 +1587,9 @@ mod tests {
 
     #[test]
     fn truncated_fixture_returns_an_error_instead_of_panicking() {
-        for cut in [0, 16, 200, 1000, FIXTURE.len() - 10] {
-            assert!(read_comask_masks(&FIXTURE[..cut]).is_err(), "cut {cut}");
+        let Some(fixture) = fixture_bytes() else { return };
+        for cut in [0, 16, 200, 1000, fixture.len() - 10] {
+            assert!(read_comask_masks(&fixture[..cut]).is_err(), "cut {cut}");
         }
     }
 

@@ -2,6 +2,7 @@
 
 mod color;
 pub(crate) mod desktop;
+pub(crate) mod geometry16;
 mod reconstruct;
 mod render;
 

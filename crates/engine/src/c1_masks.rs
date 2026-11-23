@@ -255,6 +255,7 @@ impl C1MaskLayer {
                 ..Default::default()
             },
             adjustments: self.adjustments.clone(),
+            mask_uuid: self.mask_uuid.clone(),
             style: self.style_uuid.as_ref().map(|uuid| LayerStyle {
                 uuid: uuid.clone(),
                 source: self.style_source.clone(),

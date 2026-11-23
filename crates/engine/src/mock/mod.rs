@@ -8,6 +8,7 @@ pub(crate) mod scenes;
 pub(crate) mod spots;
 pub(crate) mod grain;
 pub(crate) mod detail;
+pub(crate) mod clarity;
 #[cfg(windows)]
 pub(crate) mod detail_gpu;
 pub(crate) mod geometry;

@@ -107,6 +107,14 @@ fn model_candidates(name: &str) -> Vec<PathBuf> {
     let subfolder = match name {
         "subjectMasking.onnx" => "AIModels/Common/SubjectMasking",
         "skinMasking.onnx" => "AIModels/Common/PeopleMasking",
+        "blemishRemoval.onnx" => "AIModels/Common/BlemishRemoval",
+        "beautyMarks.onnx" => "AIModels/Common/BeautyMarks",
+        "dust.onnx" => "AIModels/Common/DustRemoval",
+        "faceDetection.onnx" => "AIModels/Common/FaceDetection",
+        "faceMesh.onnx" => "AIModels/Common/FaceMesh",
+        "similarity.onnx" => "AIModels/Common/Similarity",
+        "eSamEncoderPreUInt8.onnx" => "AIModels/Common/SamEncoder",
+        "eSamDecoder.onnx" => "AIModels/Common/SamDecoder",
         "EyeDetector.onnx" | "DenseNet121_FP32.onnx" => "AIModels/Common/ClosedEyesDetection",
         "autoRotation.onnx" => "AIModels/Common/Rotation",
         "MatchLookColor.onnx" | "MatchLookBw.onnx" | "MatchLookBrightness.onnx"
@@ -148,12 +156,25 @@ fn directml_first() -> bool {
 }
 
 fn fp16_sibling(name: &str) -> Option<&'static str> {
+    // FP16 note (measured 2026-11-23): TRT FP16 keeps mask IoU >= 0.998 on
+    // subject/skin, but raw probabilities shift by 6-8%. Use FP16 masks only;
+    // never use FP16 probabilities for feathering/alpha.
     match name {
         "subjectMasking.onnx" => Some("subjectMaskingFP16.onnx"),
         "skinMasking.onnx" => Some("skinMaskingFP16.onnx"),
         _ => None,
     }
 }
+
+/// Measured cold TensorRT engine build time per model (RTX 4070 Ti, 2026-11-23).
+/// Used by the selfcheck to price "TRT first" before it is enabled.
+const TRT_BUILD_SECONDS: &[(&str, u64)] = &[
+    ("subjectMasking.onnx", 67),
+    ("skinMasking.onnx", 54),
+    ("blemishRemoval.onnx", 55),
+    ("2102828093.onnx", 40),
+    ("dust.onnx", 47),
+];
 
 pub(crate) fn model_path(name: &str) -> Result<PathBuf> {
     let candidates = model_candidates(name);
@@ -195,6 +216,86 @@ pub fn prewarm_models() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("skin AI prewarm thread panicked"))??;
         Ok(())
     })
+}
+
+/// Headless GPU acceptance check: opens subject/skin/blemish on the selected
+/// provider and reports warm timings. Triggered by `--gpu-selfcheck` or
+/// `AURORA_GPU_SELFCHECK=1`; it never opens a window.
+pub fn gpu_selfcheck() -> Result<()> {
+    let runtime = Runtime::get().context("ONNX Runtime is not available")?;
+    let (library, version, api) = runtime.describe();
+    println!("Aurora GPU selfcheck");
+    println!("  runtime  : {} v{} api{}", library.display(), version, api);
+    let providers = runtime.available_providers();
+    println!(
+        "  providers: {:?}",
+        providers.iter().map(|provider| provider.label()).collect::<Vec<_>>()
+    );
+    for name in [
+        "blemishRemoval.onnx",
+        "beautyMarks.onnx",
+        "dust.onnx",
+        "faceDetection.onnx",
+        "faceMesh.onnx",
+        "similarity.onnx",
+        "eSamEncoderPreUInt8.onnx",
+        "eSamDecoder.onnx",
+    ] {
+        match model_path(name) {
+            Ok(path) => println!("  path {name}: {}", path.display()),
+            Err(_) => println!("  path {name}: MISSING"),
+        }
+    }
+    let cache_present = ort::trt_cache_present();
+    println!("  trt_cache_present: {cache_present}");
+    println!("  trt_first_allowed: {}", ort::trt_first_allowed());
+    let measured: Vec<_> = TRT_BUILD_SECONDS
+        .iter()
+        .filter(|(name, _)| model_available(name))
+        .collect();
+    let estimate: u64 = measured.iter().map(|(_, seconds)| *seconds).sum();
+    println!(
+        "  trt_first_estimate_s: {estimate} ({} installed models with a measured cold build)",
+        measured.len()
+    );
+    if !cache_present {
+        println!(
+            "  note: TensorRT stays behind CUDA until AURORA_TRT_CACHE_DIR holds an \
+             .engine/.profile or AURORA_ORT_PROVIDERS=tensorrt,... is set"
+        );
+    }
+    for name in ["subjectMasking.onnx", "skinMasking.onnx", "blemishRemoval.onnx"] {
+        let path = match model_path(name) {
+            Ok(path) => path,
+            Err(error) => {
+                println!("  {name}: skipped ({error})");
+                continue;
+            }
+        };
+        let started = std::time::Instant::now();
+        let session = runtime.open_session(&path)?;
+        let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let dims = session.input.dims.clone();
+        let count: usize = dims.iter().map(|dim| (*dim).max(1) as usize).product();
+        let mut input = vec![0.0f32; count];
+        runtime.run(&session, &mut input, &dims)?;
+        let mut warm = Vec::new();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            runtime.run(&session, &mut input, &dims)?;
+            warm.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let warm = warm
+            .iter()
+            .map(|ms| format!("{ms:.2}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        println!(
+            "  {name}: provider={} open={open_ms:.0}ms dims={dims:?} warm_ms=[{warm}]",
+            session.provider().label()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

@@ -182,6 +182,14 @@ impl Store {
         self.root.join("catalog.json")
     }
 
+    fn excluded_path(&self) -> PathBuf {
+        self.root.join("excluded.json")
+    }
+
+    fn soft_proof_path(&self) -> PathBuf {
+        self.root.join("soft_proof.json")
+    }
+
     fn adjust_path(&self, rel_path: &str) -> Result<PathBuf> {
         validate_rel_path(rel_path)?;
         Ok(self.root.join("adjust").join(format!("{}.json", fnv1a_hex(rel_path))))
@@ -251,6 +259,55 @@ impl Store {
         let file = AdjustFile { schema_version: SCHEMA_VERSION, adjustments };
         let bytes = serde_json::to_vec_pretty(&file)?;
         write_atomic(&path, &bytes)
+    }
+
+    /// Removes an adjustment record, for a Forget or a move that changed the
+    /// relative key. A missing record is not an error.
+    pub fn remove_adjustments(&self, rel_path: &str) -> Result<()> {
+        let path = self.adjust_path(rel_path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::Io(e).into()),
+        }
+    }
+
+    /// Absolute source paths that `Forget` removed from the catalog. `rescan`
+    /// skips them so a forgotten file does not come back on reopen.
+    pub fn load_excluded(&self) -> Vec<PathBuf> {
+        let Ok(text) = fs::read_to_string(self.excluded_path()) else {
+            return Vec::new();
+        };
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    /// Persists the exclusion list. Duplicates are removed and the list is
+    /// sorted so repeated Forget calls produce stable bytes.
+    pub fn save_excluded(&self, paths: &[PathBuf]) -> Result<()> {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        let bytes = serde_json::to_vec_pretty(&paths)?;
+        write_atomic(&self.excluded_path(), &bytes)
+    }
+
+    /// Soft-proof profile and rendering intent for this library. A missing or
+    /// damaged file falls back to no proofing rather than failing the open.
+    pub fn load_soft_proof(&self) -> Result<crate::SoftProofSettings> {
+        let text = match fs::read_to_string(self.soft_proof_path()) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(crate::SoftProofSettings::default());
+            }
+            Err(error) => return Err(StoreError::Io(error).into()),
+        };
+        Ok(serde_json::from_str(&text).unwrap_or_default())
+    }
+
+    /// Persists soft-proof settings atomically.
+    pub fn save_soft_proof(&self, settings: &crate::SoftProofSettings) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(settings)?;
+        write_atomic(&self.soft_proof_path(), &bytes)
     }
 
     /// `<stem>.xmp` next to the image, never inside `.portrait`.

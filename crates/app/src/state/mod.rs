@@ -562,6 +562,12 @@ pub struct AppState {
     /// The current image with a hovered style applied, shown instead of its own
     /// adjustments until the pointer leaves the style.
     pub hover_look: Option<AdjustmentSet>,
+    /// Result of the last "save to Capture One" action.
+    pub c1_save_status: Option<C1SaveStatus>,
+    /// Keys or layers the last save refused to write.
+    pub c1_save_warnings: Vec<SharedString>,
+    /// True while a C1 save runs; a second action is ignored.
+    pub c1_save_busy: bool,
     /// AI mask kinds the engine refused this session (no model, no runtime).
     pub ai_unavailable: HashSet<AiMaskKind>,
     /// Closed-eye results for this session, shown on the thumbnails.
@@ -699,6 +705,9 @@ impl AppState {
             notice: None,
             ai_busy: false,
             hover_look: None,
+            c1_save_status: None,
+            c1_save_warnings: Vec::new(),
+            c1_save_busy: false,
             welcome: source == Source::Demo,
             source,
             opening: None,
@@ -1404,6 +1413,56 @@ impl AppState {
         matches!(self.tether, Some(TetherStatus::Available { .. }))
     }
 
+    /// Saves the current image's adjustments into its Capture One `.cos`.
+    pub fn save_to_c1_settings(&mut self, cx: &mut Context<Self>) {
+        self.save_c1(false, cx);
+    }
+
+    /// Saves the current image's adjustments into the open Capture One catalog.
+    pub fn save_to_c1_catalog(&mut self, cx: &mut Context<Self>) {
+        self.save_c1(true, cx);
+    }
+
+    fn save_c1(&mut self, catalog: bool, cx: &mut Context<Self>) {
+        let is_catalog = matches!(self.source, Source::Catalog(_));
+        if !c1_save_enabled(self.c1_save_busy, self.current.is_some(), catalog, is_catalog) {
+            let reason = if self.c1_save_busy {
+                t("A Capture One save is already running", "已有 Capture One 保存在进行")
+            } else if self.current.is_none() {
+                t("Open an image first", "请先打开图像")
+            } else {
+                t("This window has no Capture One catalog open", "当前窗口没有打开 C1 catalog")
+            };
+            self.notify(reason, cx);
+            return;
+        }
+        let Some(image) = self.current else { return };
+        let adjustments = self.adj().clone();
+        let engine = self.engine.clone();
+        self.c1_save_busy = true;
+        self.c1_save_warnings.clear();
+        cx.spawn(async move |this, cx| {
+            let (status, warnings) = cx
+                .background_spawn(async move {
+                    if catalog {
+                        catalog_save_status(&engine.save_c1_catalog(image, &adjustments))
+                    } else {
+                        cos_save_status(&engine.save_c1_settings(image, &adjustments))
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.c1_save_busy = false;
+                this.c1_save_warnings = warnings.into_iter().map(SharedString::from).collect();
+                let message = status.message();
+                this.c1_save_status = Some(status);
+                this.notify(message, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Why capture is not offered right now, for disabled controls and notices.
     pub fn tether_note(&self) -> &'static str {
         match self.tether {
@@ -1962,6 +2021,62 @@ pub enum HoverLook {
     User(usize),
 }
 
+/// Outcome of one "save to Capture One" action, for the status bar and any
+/// detail strip the menus build on top of it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum C1SaveStatus {
+    Unchanged,
+    Saved { cells: usize },
+    NotACatalog,
+    Failed { message: String },
+}
+
+impl C1SaveStatus {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Unchanged => t("Nothing changed", "没有变化").to_owned(),
+            Self::Saved { cells } => format!("{} {cells}", t("Saved to Capture One", "已保存到 Capture One")),
+            Self::NotACatalog => t("No Capture One catalog is open", "当前没有打开的 C1 catalog").to_owned(),
+            Self::Failed { message } => format!("{}: {message}", t("Save failed", "保存失败")),
+        }
+    }
+}
+
+/// The action runs only with an image, a free busy flag and, for the catalog
+/// route, an engine that was opened on a catalog.
+pub fn c1_save_enabled(busy: bool, has_image: bool, wants_catalog: bool, is_catalog: bool) -> bool {
+    !busy && has_image && (!wants_catalog || is_catalog)
+}
+
+pub fn cos_save_status(
+    result: &anyhow::Result<aurora_engine::c1_cos::CosSaveOutcome>,
+) -> (C1SaveStatus, Vec<String>) {
+    match result {
+        Ok(aurora_engine::c1_cos::CosSaveOutcome::Unchanged(report)) => {
+            (C1SaveStatus::Unchanged, report.warnings.clone())
+        }
+        Ok(aurora_engine::c1_cos::CosSaveOutcome::Written(report)) => (
+            C1SaveStatus::Saved { cells: report.edits },
+            report.warnings.clone(),
+        ),
+        Err(error) => (C1SaveStatus::Failed { message: format!("{error:#}") }, Vec::new()),
+    }
+}
+
+pub fn catalog_save_status(
+    result: &anyhow::Result<aurora_engine::c1_writeback::CatalogSaveOutcome>,
+) -> (C1SaveStatus, Vec<String>) {
+    use aurora_engine::c1_writeback::CatalogSaveOutcome;
+    match result {
+        Ok(CatalogSaveOutcome::Unchanged { warnings }) => (C1SaveStatus::Unchanged, warnings.clone()),
+        Ok(CatalogSaveOutcome::Saved { columns, .. }) => {
+            (C1SaveStatus::Saved { cells: *columns }, Vec::new())
+        }
+        Ok(CatalogSaveOutcome::NotACatalog) => (C1SaveStatus::NotACatalog, Vec::new()),
+        Err(error) => (C1SaveStatus::Failed { message: format!("{error:#}") }, Vec::new()),
+    }
+}
+
 /// What applying `style` does to one image's adjustments.
 fn style_onto(a: &mut AdjustmentSet, style: &StyleInfo, stack: bool) {
     for g in ClipGroup::ALL {
@@ -2130,5 +2245,57 @@ with zipfile.ZipFile(root / "variants.eip", "w") as package:
         assert!(single_edit.adj.is_default());
         drop(engine);
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod c1_save_tests {
+    use super::*;
+    use aurora_engine::c1_cos::{CosSaveOutcome, CosSaveReport};
+    use aurora_engine::c1_writeback::CatalogSaveOutcome;
+
+    #[test]
+    fn catalog_outcomes_map_to_statuses() {
+        let saved = Ok(CatalogSaveOutcome::Saved {
+            columns: 3,
+            backup: std::path::PathBuf::from("x.bak"),
+        });
+        assert_eq!(catalog_save_status(&saved), (C1SaveStatus::Saved { cells: 3 }, Vec::new()));
+        let unchanged = Ok(CatalogSaveOutcome::Unchanged { warnings: vec!["w".to_owned()] });
+        assert_eq!(
+            catalog_save_status(&unchanged),
+            (C1SaveStatus::Unchanged, vec!["w".to_owned()])
+        );
+        assert_eq!(catalog_save_status(&Ok(CatalogSaveOutcome::NotACatalog)).0, C1SaveStatus::NotACatalog);
+        let error: anyhow::Result<CatalogSaveOutcome> = Err(anyhow::anyhow!("boom"));
+        assert!(matches!(catalog_save_status(&error).0, C1SaveStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn settings_outcomes_map_to_statuses() {
+        let written = Ok(CosSaveOutcome::Written(CosSaveReport {
+            edits: 2,
+            layers: vec!["AL".to_owned()],
+            warnings: Vec::new(),
+        }));
+        assert_eq!(cos_save_status(&written), (C1SaveStatus::Saved { cells: 2 }, Vec::new()));
+        let unchanged = Ok(CosSaveOutcome::Unchanged(CosSaveReport::default()));
+        assert_eq!(cos_save_status(&unchanged).0, C1SaveStatus::Unchanged);
+        let error: anyhow::Result<CosSaveOutcome> = Err(anyhow::anyhow!("boom"));
+        assert!(matches!(cos_save_status(&error).0, C1SaveStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn the_action_needs_an_image_and_a_catalog() {
+        assert!(c1_save_enabled(false, true, false, false));
+        assert!(!c1_save_enabled(false, false, false, false));
+        assert!(!c1_save_enabled(false, true, true, false));
+        assert!(c1_save_enabled(false, true, true, true));
+    }
+
+    #[test]
+    fn a_running_save_ignores_a_second_call() {
+        assert!(!c1_save_enabled(true, true, true, true));
+        assert!(!c1_save_enabled(true, true, false, false));
     }
 }

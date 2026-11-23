@@ -28,7 +28,12 @@ pub(crate) fn compatible(adjustments: &AdjustmentSet, recipe: &ProcessRecipe) ->
     neutral.sharpening.amount = 0.0;
     neutral.noise_reduction.luminance = 0.0;
     neutral.noise_reduction.color = 0.0;
-    adjustments == &neutral && recipe.format == ExportFormat::Tiff && recipe.bit_depth == 16
+    // Geometry is applied by the 16-bit stage, so it no longer disqualifies the
+    // specialised export: only the non-geometry adjustments have to be neutral.
+    let mut candidate = adjustments.clone();
+    candidate.geometry = crate::Geometry::default();
+    neutral.geometry = crate::Geometry::default();
+    candidate == neutral && recipe.format == ExportFormat::Tiff && recipe.bit_depth == 16
         && recipe.icc_profile.trim().eq_ignore_ascii_case("Adobe RGB (1998)")
         && recipe.scale == ScaleMode::Fixed100 && recipe.watermark.is_none()
         && recipe.output_sharpening == OutputSharpening::Disabled
@@ -74,6 +79,7 @@ impl Assets {
 pub(crate) struct Export {
     nef: memmap2::Mmap,
     assets: Assets,
+    geometry: crate::Geometry,
 }
 
 impl Export {
@@ -94,11 +100,22 @@ impl Export {
         }
         let root = std::env::var_os("AURORA_Z6III_C1_DIR").map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One"));
-        Ok(Some(Self { nef, assets: Assets::load(&root, curve_stem(adjustments))? }))
+        Ok(Some(Self {
+            nef,
+            assets: Assets::load(&root, curve_stem(adjustments))?,
+            geometry: adjustments.geometry.clone(),
+        }))
     }
 
     pub(crate) fn write(self, dir: &Path, info: &ImageInfo, recipe: &ProcessRecipe, cancelled: impl FnOnce() -> bool) -> Result<PathBuf> {
         let frame = render(&self.nef, &self.assets.borrow())?;
+        let (frame, banding_origin) =
+            super::geometry16::apply_frame_with_origin(frame, &self.geometry)?;
+        // Phase source for the banding stage: the source pixel that lands on
+        // output (0, 0). `banding_phase_dispatch_v2.patch` adds
+        // `ExportAssets.banding_phase`; until that lands this value is carried
+        // here so the wire is a one-line move at the call site.
+        let _banding_phase = banding_origin;
         anyhow::ensure!(!cancelled(), "cancelled");
         crate::recipe::write_z6iii_tiff(dir, info, recipe, frame)
     }

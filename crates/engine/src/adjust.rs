@@ -956,12 +956,32 @@ impl VignetteMethod {
     pub const ALL: [Self; 3] = [Self::EllipticOnCrop, Self::Circular, Self::CircularCrop];
 }
 
+/// `IC_Vignetting.center`: which point the falloff is measured from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VignetteCenter {
+    /// `artCenterCam`: the sensor centre, i.e. the canvas centre unless the
+    /// frame is cropped.
+    #[default]
+    Cam,
+    /// `artCenterCrop`: the rendered crop's own centre.
+    Crop,
+    /// `artCenterLens`: the optical centre from `ZLENSOPTICCENTER`.
+    Lens,
+    /// `artCenterCustom`: the canvas pixels in [`Vignetting::x`]/[`Vignetting::y`].
+    Custom,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Vignetting {
-    /// -4 ..= 4 EV.
+    /// -4 ..= 4 EV at the frame corner; positive lightens (`lightAmount`).
     pub amount: f32,
     pub method: VignetteMethod,
+    pub center: VignetteCenter,
+    /// Custom centre in canvas pixels, `IC_Vignetting.x`.
+    pub x: f32,
+    /// Custom centre in canvas pixels, `IC_Vignetting.y`.
+    pub y: f32,
 }
 
 // ───────────────────────────── Color ─────────────────────────────
@@ -1534,6 +1554,8 @@ pub struct LensCorrection {
     /// f-number for [`Self::diffraction_enabled`]; `0` means the capture has none.
     pub aperture: f32,
     pub hide_distorted_areas: bool,
+    /// `ZLENSOPTICCENTER`, canvas pixels; the vignette's `center = lens` uses it.
+    pub optic_center: Option<[f32; 2]>,
     /// -100 ..= 100, a manual movement/shift of the optical center.
     pub shift_x: f32,
     pub shift_y: f32,
@@ -1589,6 +1611,7 @@ impl Default for LensCorrection {
             diffraction_enabled: false,
             aperture: 0.0,
             hide_distorted_areas: true,
+            optic_center: None,
             shift_x: 0.0,
             shift_y: 0.0,
             tilt: 0.0,
@@ -1744,6 +1767,15 @@ pub struct Geometry {
     pub aspect: AspectRatio,
     pub portrait: bool,
     pub keystone: Keystone,
+    /// `ZLENSDISTORTION`: the real radial curve in source pixels. An empty
+    /// curve keeps the geometry stage on its old identity path byte for byte.
+    /// Derived from the catalog plus the capture's pixel pitch, so it is not
+    /// serialized.
+    #[serde(skip)]
+    pub distortion: crate::c1_model::crop_limit::RadialCurve,
+    /// `ZLENSOPTICCENTER` in source pixels; only read when `distortion` is set.
+    #[serde(skip)]
+    pub optical_center: [f32; 2],
 }
 
 impl Default for Geometry {
@@ -1759,6 +1791,8 @@ impl Default for Geometry {
             aspect: AspectRatio::Unconstrained,
             portrait: false,
             keystone: Keystone { amount: 100.0, ..Default::default() },
+            distortion: crate::c1_model::crop_limit::RadialCurve::default(),
+            optical_center: [0.0, 0.0],
         }
     }
 }

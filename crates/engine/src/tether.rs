@@ -132,6 +132,19 @@ pub fn camera_settings() -> Option<crate::CameraSettings> {
     }
 }
 
+/// Devices the platform backend can enumerate. This is separate from a live
+/// capture session; WIA enumeration does not keep a camera open.
+pub fn devices() -> Vec<crate::CaptureDevice> {
+    #[cfg(windows)]
+    {
+        wia::capture_devices()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 /// Captures a still and downloads it, returning the JPEG and its dimensions.
 pub fn capture_frame() -> Result<CapturedFrame> {
     capture_frame_with_timeout(CAPTURE_TIMEOUT)
@@ -816,6 +829,14 @@ mod wia {
             devices = enumerate_devices(devmgr.ptr(), WIA_DEVICE_TYPE_ALL)?;
         }
         Ok(devices)
+    }
+
+    pub(super) fn capture_devices() -> Vec<crate::CaptureDevice> {
+        list_devices()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|device| crate::CaptureDevice { id: device.id, name: device.name })
+            .collect()
     }
 
     #[cfg(test)]

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdjustmentSet, AiMaskKind, Collection, ExportFormat, ExportJob, ImageId, ImageInfo, JobStatus,
-    HdrOptions, MatchLook, NormRect, PanoramaOptions, TetherStatus, UserCollection,
+    CaptureDevice, HdrOptions, MatchLook, MergeError, MergeJobId, MergeOutcome, MergeProgress,
+    MergeRequest, NormRect, PanoramaOptions, PortraitCapability, PrintLayout, PrintPreview,
+    PrintRequest, SoftProofSettings, TetherStatus, UserCollection,
 };
 
 /// 8-bit straight-alpha RGBA pixels, row-major, no padding.
@@ -371,6 +373,11 @@ pub struct EngineCapabilities {
     pub match_look: bool,
     /// Whether this platform has a tether backend, regardless of a connected camera.
     pub tether: bool,
+    /// The 16-bit gain-map blemish path is compiled and can be enabled.
+    pub blemish_gainmap: bool,
+    /// The shipped `blemishRemoval.onnx` is present; false means the engine
+    /// must refuse/degrade the gain-map path instead of silently skipping it.
+    pub blemish_gainmap_model: bool,
     pub export_formats: Vec<ExportFormat>,
 }
 
@@ -436,6 +443,29 @@ pub trait ImageEngine: Send + Sync + 'static {
     /// Adds files (or every image in a folder) and returns what was added.
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>>;
     fn collections(&self) -> Vec<Collection>;
+    /// The library root this engine reads. `None` for engines with no on-disk
+    /// library (the demo/mock engine).
+    ///
+    /// The root is set by [`crate::FileEngine::open`] / [`crate::FileEngine::open_c1_catalog`];
+    /// changing it means reopening the library, not mutating a live engine.
+    fn library_root(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Absolute folder path behind a folder collection id. `None` for a
+    /// C1-only album/project, which has no filesystem path.
+    fn collection_path(&self, _id: u64) -> Option<PathBuf> {
+        None
+    }
+    /// Albums, projects and groups the user made, read back from the store.
+    fn user_collections(&self) -> Vec<UserCollection> {
+        Vec::new()
+    }
+    /// Move, copy, rename, relink, forget or create a library folder. The
+    /// operation is all-or-nothing: any collision or I/O failure rolls back
+    /// every file already changed in the batch.
+    fn manage_files(&self, _action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
+        anyhow::bail!("library filesystem operations are unsupported by this engine")
+    }
     /// Images listed by one engine collection; `None` when the interface should
     /// derive membership itself (all images, recent imports, folders).
     fn collection_images(&self, _collection: u64) -> Option<Vec<ImageId>> {
@@ -473,6 +503,167 @@ pub trait ImageEngine: Send + Sync + 'static {
     }
     /// Creates a new variant of `image` with the given adjustments; returns its info.
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo>;
+
+    /// Write the image's adjustments into its Capture One `.cos` sidecar.
+    fn save_c1_settings(
+        &self,
+        _image: ImageId,
+        _adjustments: &AdjustmentSet,
+    ) -> anyhow::Result<crate::c1_cos::CosSaveOutcome> {
+        anyhow::bail!("this engine cannot write Capture One `.cos` sidecars")
+    }
+
+    /// Write the image's adjustments into the open Capture One catalog.
+    fn save_c1_catalog(
+        &self,
+        _image: ImageId,
+        _adjustments: &AdjustmentSet,
+    ) -> anyhow::Result<crate::c1_writeback::CatalogSaveOutcome> {
+        Ok(crate::c1_writeback::CatalogSaveOutcome::NotACatalog)
+    }
+
+    // ── Lens cast calibration ──
+
+    /// Reads a `.lcc` and returns its Uniform Light grid. This is intentionally
+    /// stateless: `set_lcc_calibration` is the only command that changes the
+    /// image's persisted calibration.
+    fn load_lcc_calibration(
+        &self,
+        path: &Path,
+    ) -> Result<crate::dust_lcc::LightFalloff, crate::dust_lcc::LccLoadError> {
+        crate::dust_lcc::load_light_falloff(path)
+    }
+
+    /// Stores the grid as the image's `.lcc` sidecar and points the C1 `.cos`
+    /// global layer at it through `Lccid`. `None` clears that pointer.
+    fn set_lcc_calibration(
+        &self,
+        _image: ImageId,
+        _calibration: Option<crate::dust_lcc::LightFalloff>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("lens cast calibration persistence is unsupported by this engine")
+    }
+
+    /// Returns the calibration referenced by the image's `.cos` `Lccid`.
+    fn lcc_calibration(&self, _image: ImageId) -> Option<crate::dust_lcc::LightFalloff> {
+        None
+    }
+
+    // ── Async merge / soft proof ──
+
+    /// Starts a background HDR merge and returns its job id. The worker thread
+    /// checks cancellation at stage boundaries and after each source load.
+    fn merge_hdr(&self, images: &[ImageId], options: &MergeRequest) -> anyhow::Result<MergeJobId> {
+        let _ = (images, options);
+        anyhow::bail!("async merge is unsupported by this engine")
+    }
+
+    /// Starts a background panorama merge and returns its job id.
+    fn merge_panorama(&self, images: &[ImageId], options: &MergeRequest) -> anyhow::Result<MergeJobId> {
+        let _ = (images, options);
+        anyhow::bail!("async panorama merge is unsupported by this engine")
+    }
+
+    fn merge_progress(&self, _job_id: MergeJobId) -> Option<MergeProgress> {
+        None
+    }
+
+    fn cancel_merge(&self, _job_id: MergeJobId) -> bool {
+        false
+    }
+
+    fn merge_result(&self, _job_id: MergeJobId) -> Option<std::result::Result<MergeOutcome, MergeError>> {
+        None
+    }
+
+    /// Persist the soft-proof profile stem and rendering intent. The engine
+    /// stores them beside the library; the app settings still own the display
+    /// profile separately.
+    fn set_soft_proof_profile(&self, _profile: Option<String>, _intent: u8) -> anyhow::Result<()> {
+        anyhow::bail!("soft-proof persistence is unsupported by this engine")
+    }
+
+    fn soft_proof_profile(&self) -> SoftProofSettings {
+        SoftProofSettings::default()
+    }
+
+    /// Render with the persisted proof profile. Missing profile files do not
+    /// fail the frame: the engine returns sRGB pixels plus `degraded`.
+    fn soft_proof_preview(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<PreviewFrame> {
+        let request = PreviewRequest {
+            image,
+            adjustments: adjustments.clone(),
+            region: NormRect::FULL,
+            max_size: max_size.max(1),
+            quality: RenderQuality::Final,
+            bypass: false,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: Some(1),
+            black_point_compensation: false,
+        };
+        self.render_preview(&request)
+    }
+
+    fn soft_proof_gamut_warning(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<Option<GamutWarning>> {
+        Ok(self.soft_proof_preview(image, adjustments, max_size)?.gamut_warning)
+    }
+
+    /// Pure paper/grid calculation for the print dialog.
+    fn print_layout(&self, request: &PrintRequest) -> anyhow::Result<PrintLayout> {
+        Ok(crate::panel_commands::print_template(request)?.1)
+    }
+
+    /// Render one print page to RGBA for the dialog's page preview.
+    fn print_preview(&self, request: &PrintRequest, page: usize) -> anyhow::Result<PrintPreview> {
+        crate::panel_commands::print_preview(self, request, page)
+    }
+
+    /// Write one print page as a PDF. Only the first page is written; the
+    /// current `write_image_pdf` path is single-page.
+    fn print_to_pdf(&self, request: &PrintRequest, output: &Path) -> anyhow::Result<crate::print::RenderedPage> {
+        crate::panel_commands::print_to_pdf(self, request, output)
+    }
+
+    /// Print one rendered page to a system printer. Multi-page requests return
+    /// `Unsupported` until the print module grows a page queue.
+    fn print_to_printer(
+        &self,
+        request: &PrintRequest,
+        printer: Option<&str>,
+    ) -> Result<(), crate::print::PrintError> {
+        crate::panel_commands::print_to_printer(self, request, printer)
+    }
+
+    /// Devices WIA/libgphoto2 can enumerate, independent of a connected session.
+    fn capture_devices(&self) -> Vec<CaptureDevice> {
+        Vec::new()
+    }
+
+    /// Start a capture session. The Windows backend has one-shot capture but no
+    /// persistent WIA session, so engines that cannot do this must say so.
+    fn capture_start(&self) -> anyhow::Result<()> {
+        anyhow::bail!("capture session persistence is not implemented; use capture() for a one-shot capture")
+    }
+
+    /// Stop a capture session. One-shot engines make this a no-op.
+    fn capture_stop(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Poll the next captured frame. One-shot engines return `None`.
+    fn capture_arrived(&self) -> Option<ImageInfo> {
+        None
+    }
+
+    /// Read-only portrait stage registry: what can run with explicit inputs.
+    fn portrait_capabilities(&self) -> Vec<PortraitCapability> {
+        Vec::new()
+    }
 
     // ── Rendering ──
 

@@ -9,6 +9,350 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, RgbImage, RgbaImage};
 
+/// Why a system-printer request could not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrintError {
+    /// No system printer is installed or the named printer is unavailable.
+    NoPrinter,
+    /// The current printer path only renders one page.
+    Unsupported { page_count: usize },
+    /// The print request itself is invalid.
+    Invalid(String),
+    /// Rendering the page failed before it reached the printer.
+    Render(String),
+    /// A Win32 call failed.
+    Win32 { context: &'static str, code: u32 },
+}
+
+impl std::fmt::Display for PrintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPrinter => write!(f, "no system printer is available"),
+            Self::Unsupported { page_count } => {
+                write!(f, "printing {page_count} pages is not supported by this build")
+            }
+            Self::Invalid(message) => write!(f, "invalid print request: {message}"),
+            Self::Render(message) => write!(f, "render failed: {message}"),
+            Self::Win32 { context, code } => write!(f, "{context} failed (Win32 {code})"),
+        }
+    }
+}
+
+impl std::error::Error for PrintError {}
+
+/// Names visible to the Windows spooler. Non-Windows builds return an empty
+/// list, which lets the frontend show the same `NoPrinter` state.
+#[cfg(windows)]
+pub fn printer_names() -> Vec<String> {
+    win::printer_names()
+}
+
+#[cfg(not(windows))]
+pub fn printer_names() -> Vec<String> {
+    Vec::new()
+}
+
+/// Prints one already-composited page. Callers must reject multi-page requests
+/// before this function; it prints exactly the bitmap it receives.
+#[cfg(windows)]
+pub fn print_rgb_page(page: &RgbImage, _spec: &PageSpec, printer: Option<&str>) -> std::result::Result<(), PrintError> {
+    win::print_page(page, printer)
+}
+
+#[cfg(not(windows))]
+pub fn print_rgb_page(_page: &RgbImage, _spec: &PageSpec, _printer: Option<&str>) -> std::result::Result<(), PrintError> {
+    Err(PrintError::NoPrinter)
+}
+
+#[cfg(windows)]
+mod win {
+    use super::{PrintError, RgbImage};
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+
+    const PRINTER_ENUM_LOCAL: u32 = 2;
+    const PRINTER_ENUM_CONNECTIONS: u32 = 4;
+    const HORZRES: i32 = 8;
+    const VERTRES: i32 = 10;
+    const HALFTONE: i32 = 4;
+    const SRCCOPY: u32 = 0x00CC_0020;
+
+    #[repr(C)]
+    struct PrinterInfo4W {
+        printer_name: *mut u16,
+        server_name: *mut u16,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct DocInfoW {
+        cb_size: i32,
+        doc_name: *const u16,
+        output: *const u16,
+        datatype: *const u16,
+        fw_type: u32,
+    }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_pels_per_meter: i32,
+        y_pels_per_meter: i32,
+        clr_used: u32,
+        clr_important: u32,
+    }
+
+    #[repr(C)]
+    struct RgbQuad {
+        blue: u8,
+        green: u8,
+        red: u8,
+        reserved: u8,
+    }
+
+    #[repr(C)]
+    struct BitmapInfo {
+        header: BitmapInfoHeader,
+        colors: [RgbQuad; 1],
+    }
+
+    #[link(name = "winspool")]
+    unsafe extern "system" {
+        fn EnumPrintersW(
+            flags: u32,
+            name: *const u16,
+            level: u32,
+            buffer: *mut u8,
+            buffer_size: u32,
+            needed: *mut u32,
+            returned: *mut u32,
+        ) -> i32;
+        fn GetDefaultPrinterW(buffer: *mut u16, size: *mut u32) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateDCW(
+            driver: *const u16,
+            device: *const u16,
+            port: *const u16,
+            dev_mode: *const c_void,
+        ) -> *mut c_void;
+        fn DeleteDC(hdc: *mut c_void) -> i32;
+        fn StartDocW(hdc: *mut c_void, info: *const DocInfoW) -> i32;
+        fn EndDoc(hdc: *mut c_void) -> i32;
+        fn StartPage(hdc: *mut c_void) -> i32;
+        fn EndPage(hdc: *mut c_void) -> i32;
+        fn SetStretchBltMode(hdc: *mut c_void, mode: i32) -> i32;
+        fn GetDeviceCaps(hdc: *mut c_void, index: i32) -> i32;
+        fn StretchDIBits(
+            hdc: *mut c_void,
+            x_dest: i32,
+            y_dest: i32,
+            w_dest: i32,
+            h_dest: i32,
+            x_src: i32,
+            y_src: i32,
+            w_src: i32,
+            h_src: i32,
+            bits: *const c_void,
+            info: *const BitmapInfo,
+            usage: u32,
+            rop: u32,
+        ) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    unsafe fn wide_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+
+    fn last_error(context: &'static str) -> PrintError {
+        PrintError::Win32 {
+            context,
+            code: std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(0) as u32,
+        }
+    }
+
+    pub(super) fn printer_names() -> Vec<String> {
+        unsafe {
+            let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+            let mut needed = 0u32;
+            let mut returned = 0u32;
+            let _ = EnumPrintersW(flags, null(), 4, null_mut(), 0, &mut needed, &mut returned);
+            if needed == 0 {
+                return Vec::new();
+            }
+            let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0usize; words];
+            if EnumPrintersW(
+                flags,
+                null(),
+                4,
+                buffer.as_mut_ptr() as *mut u8,
+                needed,
+                &mut needed,
+                &mut returned,
+            ) == 0
+            {
+                return Vec::new();
+            }
+            let infos = buffer.as_ptr() as *const PrinterInfo4W;
+            (0..returned as usize)
+                .filter_map(|index| {
+                    let name = wide_string((*infos.add(index)).printer_name);
+                    (!name.is_empty()).then_some(name)
+                })
+                .collect()
+        }
+    }
+
+    fn default_printer() -> Option<String> {
+        unsafe {
+            let mut size = 0u32;
+            let _ = GetDefaultPrinterW(null_mut(), &mut size);
+            if size == 0 {
+                return None;
+            }
+            let mut buffer = vec![0u16; size as usize];
+            if GetDefaultPrinterW(buffer.as_mut_ptr(), &mut size) == 0 {
+                return None;
+            }
+            let len = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+            Some(String::from_utf16_lossy(&buffer[..len]))
+        }
+    }
+
+    pub(super) fn print_page(page: &RgbImage, printer: Option<&str>) -> Result<(), PrintError> {
+        let names = printer_names();
+        if names.is_empty() {
+            return Err(PrintError::NoPrinter);
+        }
+        let name = match printer.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => name.to_owned(),
+            None => default_printer().ok_or(PrintError::NoPrinter)?,
+        };
+        if !names.iter().any(|candidate| candidate.eq_ignore_ascii_case(&name)) {
+            return Err(PrintError::NoPrinter);
+        }
+
+        let (width, height) = page.dimensions();
+        if width == 0 || height == 0 {
+            return Err(PrintError::Invalid("the print page is empty".into()));
+        }
+        let driver = wide("WINSPOOL");
+        let device = wide(&name);
+        unsafe {
+            let hdc = CreateDCW(driver.as_ptr(), device.as_ptr(), null(), null());
+            if hdc.is_null() {
+                return Err(PrintError::NoPrinter);
+            }
+            let dest_width = GetDeviceCaps(hdc, HORZRES);
+            let dest_height = GetDeviceCaps(hdc, VERTRES);
+            if dest_width <= 0 || dest_height <= 0 {
+                let error = last_error("GetDeviceCaps");
+                DeleteDC(hdc);
+                return Err(error);
+            }
+
+            let doc_name = wide("Aurora Studio print");
+            let info = DocInfoW {
+                cb_size: std::mem::size_of::<DocInfoW>() as i32,
+                doc_name: doc_name.as_ptr(),
+                output: null(),
+                datatype: null(),
+                fw_type: 0,
+            };
+            if StartDocW(hdc, &info) <= 0 {
+                let error = last_error("StartDoc");
+                DeleteDC(hdc);
+                return Err(error);
+            }
+            if StartPage(hdc) <= 0 {
+                let error = last_error("StartPage");
+                EndDoc(hdc);
+                DeleteDC(hdc);
+                return Err(error);
+            }
+
+            SetStretchBltMode(hdc, HALFTONE);
+            let mut bits = Vec::with_capacity((width * height * 4) as usize);
+            for pixel in page.pixels() {
+                bits.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+            }
+            let bitmap = BitmapInfo {
+                header: BitmapInfoHeader {
+                    size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                    width: width as i32,
+                    height: -(height as i32),
+                    planes: 1,
+                    bit_count: 32,
+                    compression: 0,
+                    size_image: 0,
+                    x_pels_per_meter: 0,
+                    y_pels_per_meter: 0,
+                    clr_used: 0,
+                    clr_important: 0,
+                },
+                colors: [RgbQuad { blue: 0, green: 0, red: 0, reserved: 0 }],
+            };
+            let drawn = StretchDIBits(
+                hdc,
+                0,
+                0,
+                dest_width,
+                dest_height,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                bits.as_ptr() as *const c_void,
+                &bitmap,
+                0,
+                SRCCOPY,
+            );
+            if drawn <= 0 {
+                let error = last_error("StretchDIBits");
+                let _ = EndPage(hdc);
+                EndDoc(hdc);
+                DeleteDC(hdc);
+                return Err(error);
+            }
+            if EndPage(hdc) <= 0 {
+                let error = last_error("EndPage");
+                EndDoc(hdc);
+                DeleteDC(hdc);
+                return Err(error);
+            }
+            if EndDoc(hdc) <= 0 {
+                let error = last_error("EndDoc");
+                DeleteDC(hdc);
+                return Err(error);
+            }
+            DeleteDC(hdc);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PageSpec {
     pub width_mm: f32,
@@ -193,7 +537,7 @@ pub fn render_template_page(template: &PrintTemplate, images: &[DynamicImage], p
     Ok(build_pdf(&jpeg, (canvas.width(), canvas.height()), spec.points()))
 }
 
-fn compose_template_page(template: &PrintTemplate, images: &[DynamicImage], page: usize) -> Result<(RgbImage, PageSpec)> {
+pub fn compose_template_page(template: &PrintTemplate, images: &[DynamicImage], page: usize) -> Result<(RgbImage, PageSpec)> {
     let spec = template_page_spec(template)?;
     let (page_w, page_h) = spec.px()?;
     let rows = template.layout.rows as usize;
@@ -537,5 +881,12 @@ mod tests {
         assert!((page.page_pt.0 - 595.28).abs() < 0.2 && (page.page_pt.1 - 841.89).abs() < 0.2);
         assert!(page.layout.image_px.0 > 0 && page.layout.image_px.1 > 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn printer_enumeration_returns_only_named_printers() {
+        for name in printer_names() {
+            assert!(!name.trim().is_empty(), "EnumPrinters returned an empty name");
+        }
     }
 }

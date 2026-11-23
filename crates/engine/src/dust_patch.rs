@@ -167,7 +167,13 @@ pub struct OnnxDustDetector;
 
 impl DustDetector for OnnxDustDetector {
     fn detect(&self, rgba: &[u8], w: u32, h: u32) -> Result<Vec<DustPatch>, DustError> {
-        let spots = crate::dustdetect::detect_dust(rgba, w, h, 0.3).map_err(|e| {
+        let spots = crate::dustdetect::detect_dust(
+            rgba,
+            w,
+            h,
+            crate::dustdetect::min_confidence(),
+        )
+        .map_err(|e| {
             let s = format!("{e:#}");
             // shortcut: errors come back as strings from the ONNX wrapper;
             // match the two prefixes it owns and treat the rest as shape errors.
