@@ -586,7 +586,12 @@ impl FaceInputBundle {
         }
         let full_face_level = if requested_pfs.contains(&30_210) {
             let raw = extra.get("pc:30210").copied().unwrap_or(0.0);
-            let desc = super::full_face_descriptor_from_ui(raw)?;
+            let normalized = if raw > 0.0 && raw < 1.0 {
+                (raw * 4.0).round().clamp(1.0, 4.0)
+            } else {
+                raw
+            };
+            let desc = super::full_face_descriptor_from_ui(normalized)?;
             Some(desc as u8)
         } else {
             None
@@ -622,6 +627,366 @@ impl FaceInputBundle {
         })?;
         producer.write_plump(plump);
         Ok(())
+    }
+
+    /// Attaches PF8033 (微笑嘴角) from discovered local CPU-forward artifacts
+    /// (`780929437`, `dx`, `dy`, `mask`) when the same-frame receipt matches.
+    pub fn attach_pf8033_from_extra(
+        &self,
+        source: &Image,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.validate_ticket(source, Some(self.job_id))?;
+        let c8033 = extra.get("pc:8033").copied().unwrap_or(0.0);
+        if c8033 == 0.0 {
+            return Ok(());
+        }
+        let receipt_path = std::env::var_os(
+            super::portrait_pf8033_cpu_forward::PF8033_CPU_FORWARD_RECEIPT_ENV,
+        )
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/portrait/smile/pf8033-cpu-forward.json")
+        });
+        let receipt_bytes = std::fs::read(&receipt_path)
+            .map_err(|_| Refusal::MissingInput("PF8033 CPU forward receipt"))?;
+        let receipt = super::portrait_pf8033_cpu_forward::Pf8033CpuForwardReceipt::parse(
+            receipt_path,
+            &receipt_bytes,
+        )?;
+        let mut artifacts =
+            super::portrait_pf8033_cpu_forward::load_pf8033_cpu_forward_artifacts(&receipt, source)?;
+        artifacts.host_split_receipt.job_id = self.job_id;
+        let inputs = super::FaceGeometryInputs {
+            job_id: self.job_id,
+            width: source.width,
+            height: source.height,
+            draws: vec![super::FaceGeometryDraw {
+                pf: 8033,
+                controls: [c8033, 0.0],
+                source_sha256: sha256_32(&source.pixels),
+                geometry: super::FaceGeometry::Smile {
+                    dx: artifacts.dx,
+                    dy: artifacts.dy,
+                    mask: artifacts.mask,
+                    host_split_receipt: Some(artifacts.host_split_receipt),
+                },
+            }],
+        };
+        self.attach_face_geometry(source, inputs, producer)
+    }
+
+    /// Attaches same-frame historical-tone rows (`PF30009` hair color, `PF30014`
+    /// 3D neutral gray, `PF100004` eye red-vein removal) when active in `extra`.
+    pub fn attach_historical_tone_from_extra(
+        &self,
+        source: &Image,
+        masks: Option<&super::PortraitMasks>,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        use crate::portrait_historical_tone_provider::{
+            build_historical_tone_inputs, HistoricalToneEyeRedVeinsPayload,
+            HistoricalToneGray3dPayload, HistoricalToneHairColorPayload,
+            HistoricalToneProviderPayload, HistoricalToneProviderRow, HistoricalToneRowData,
+            HistoricalToneRowJob,
+        };
+
+        self.validate_ticket(source, Some(self.job_id))?;
+        let control = |pf: u32| extra.get(&format!("pc:{pf}")).copied().unwrap_or(0.0);
+        let c30009 = control(30009);
+        let c30014 = control(30014);
+        let c100004 = control(100004);
+        if c30009 == 0.0 && c30014 == 0.0 && c100004 == 0.0 {
+            return Ok(());
+        }
+
+        let pixels = source.pixel_count();
+        let digest = sha256_32(&source.pixels);
+        let size = [source.width, source.height];
+        let mut rows = Vec::new();
+
+        if c30009 != 0.0 {
+            if let Some(hair_mask) = masks.and_then(|m| {
+                m.hair
+                    .as_ref()
+                    .map(|plane| sample_mask_plane(plane, m.width, m.height, source.width, source.height))
+            }) {
+                let mut sum = [0.0f64; 3];
+                let mut wsum = 0.0f64;
+                for (i, &w) in hair_mask.iter().enumerate() {
+                    if w > 0.05 {
+                        let wf = f64::from(w);
+                        sum[0] += f64::from(source.pixels[i * 4]) * wf;
+                        sum[1] += f64::from(source.pixels[i * 4 + 1]) * wf;
+                        sum[2] += f64::from(source.pixels[i * 4 + 2]) * wf;
+                        wsum += wf;
+                    }
+                }
+                if wsum > 1.0 {
+                    let avg = [
+                        (sum[0] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[1] / wsum).round().clamp(0.0, 255.0) as u8,
+                        (sum[2] / wsum).round().clamp(0.0, 255.0) as u8,
+                    ];
+                    let mut effect_rgb = Vec::with_capacity(pixels * 3);
+                    for px in source.pixels.chunks_exact(4) {
+                        effect_rgb.push(((f32::from(px[0]) * 0.65 + f32::from(avg[0]) * 0.35).round()) as u8);
+                        effect_rgb.push(((f32::from(px[1]) * 0.65 + f32::from(avg[1]) * 0.35).round()) as u8);
+                        effect_rgb.push(((f32::from(px[2]) * 0.65 + f32::from(avg[2]) * 0.35).round()) as u8);
+                    }
+                    rows.push(HistoricalToneProviderRow {
+                        frame: source.clone(),
+                        job: HistoricalToneRowJob {
+                            source_sha256: digest,
+                            size,
+                            control: c30009.clamp(0.0, 1.0),
+                        },
+                        data: HistoricalToneRowData::HairColor(HistoricalToneHairColorPayload {
+                            effect_rgb,
+                            hair_mask,
+                        }),
+                    });
+                }
+            }
+        }
+
+        if c30014 != 0.0 {
+            if let Some(parsing) = self.model_inputs.as_ref().and_then(|m| m.parsing.as_ref()) {
+                let mut p = parsing.clone();
+                p.job_id = self.job_id;
+                let skin_u8 = crate::face_parsing::project_face_parsing_skin_mask(
+                    &p,
+                    source.width,
+                    source.height,
+                )?;
+                let mut src_rgb = Vec::with_capacity(pixels * 3);
+                for px in source.pixels.chunks_exact(4) {
+                    src_rgb.push(px[0] as f32 / 255.0);
+                    src_rgb.push(px[1] as f32 / 255.0);
+                    src_rgb.push(px[2] as f32 / 255.0);
+                }
+                let (_median, gauss, _, _) = super::hlf_preprocess(
+                    &src_rgb,
+                    source.width,
+                    source.height,
+                    super::HlfAutoProducerOptions::default(),
+                );
+                let mut light = Vec::with_capacity(pixels);
+                let mut dark = Vec::with_capacity(pixels);
+                let mut alpha = Vec::with_capacity(pixels);
+                let mut mask = Vec::with_capacity(pixels);
+                for i in 0..pixels {
+                    let l_src = 0.299 * src_rgb[i * 3] + 0.587 * src_rgb[i * 3 + 1] + 0.114 * src_rgb[i * 3 + 2];
+                    let l_ref = 0.299 * gauss[i * 3] + 0.587 * gauss[i * 3 + 1] + 0.114 * gauss[i * 3 + 2];
+                    let diff = l_ref - l_src;
+                    light.push(diff.max(0.0).clamp(0.0, 1.0));
+                    dark.push((-diff).max(0.0).clamp(0.0, 1.0));
+                    let m = f32::from(skin_u8[i]) / 255.0;
+                    alpha.push(m);
+                    mask.push(m);
+                }
+                rows.push(HistoricalToneProviderRow {
+                    frame: source.clone(),
+                    job: HistoricalToneRowJob {
+                        source_sha256: digest,
+                        size,
+                        control: c30014.clamp(0.0, 1.0),
+                    },
+                    data: HistoricalToneRowData::Gray3d(HistoricalToneGray3dPayload {
+                        light,
+                        dark,
+                        alpha,
+                        mask,
+                    }),
+                });
+            }
+        }
+
+        if c100004 != 0.0 {
+            if let Some(parsing) = self.model_inputs.as_ref().and_then(|m| m.parsing.as_ref()) {
+                let mut p = parsing.clone();
+                p.job_id = self.job_id;
+                let eye_alpha = crate::face_parsing::project_face_parsing_skin_mask(
+                    &p,
+                    source.width,
+                    source.height,
+                )?;
+                let mut rgb = Vec::with_capacity(pixels * 3);
+                for px in source.pixels.chunks_exact(4) {
+                    let luma = (0.299 * f32::from(px[0]) + 0.587 * f32::from(px[1]) + 0.114 * f32::from(px[2]))
+                        .clamp(0.0, 255.0);
+                    // Suppress excess red relative to local luma for red-vein reduction.
+                    rgb.push((f32::from(px[0]) * 0.5 + luma * 0.5).round().clamp(0.0, 255.0) as u8);
+                    rgb.push(px[1]);
+                    rgb.push(px[2]);
+                }
+                let mut eye_mask = vec![0u8; pixels];
+                // Restrict to the eye bounding boxes from 194 landmarks.
+                let mut boxes = Vec::new();
+                for (a, b) in [(57usize, 63usize), (77, 83)] {
+                    let cx = (self.points194[a][0] + self.points194[b][0]) * 0.5;
+                    let cy = (self.points194[a][1] + self.points194[b][1]) * 0.5;
+                    let rx = ((self.points194[b][0] - self.points194[a][0]).abs() * 0.65).max(6.0);
+                    let ry = (rx * 0.55).max(4.0);
+                    boxes.push((cx, cy, rx, ry));
+                }
+                for y in 0..source.height as usize {
+                    for x in 0..source.width as usize {
+                        let fx = x as f32;
+                        let fy = y as f32;
+                        let inside = boxes.iter().any(|&(cx, cy, rx, ry)| {
+                            ((fx - cx) / rx).powi(2) + ((fy - cy) / ry).powi(2) <= 1.0
+                        });
+                        if inside {
+                            let idx = y * source.width as usize + x;
+                            eye_mask[idx] = eye_alpha[idx].max(160);
+                        }
+                    }
+                }
+                rows.push(HistoricalToneProviderRow {
+                    frame: source.clone(),
+                    job: HistoricalToneRowJob {
+                        source_sha256: digest,
+                        size,
+                        control: c100004.clamp(0.0, 1.0),
+                    },
+                    data: HistoricalToneRowData::EyeRedVeins(HistoricalToneEyeRedVeinsPayload {
+                        effect_rgb: rgb,
+                        alpha: eye_mask,
+                        strength: c100004.clamp(0.0, 1.0),
+                    }),
+                });
+            }
+        }
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let gray_3d_controls = [
+            control(30015).clamp(-1.0, 1.0),
+            control(30016).clamp(-1.0, 1.0),
+        ];
+        let built = build_historical_tone_inputs(HistoricalToneProviderPayload {
+            ticket: self.job_id,
+            gray_3d_controls,
+            rows,
+        })?;
+        match producer.historical_tone.as_mut() {
+            Some(existing) => {
+                for (pf, input) in built {
+                    existing.insert(pf, input);
+                }
+            }
+            None => producer.historical_tone = Some(built),
+        }
+        Ok(())
+    }
+
+    /// Attaches same-frame historical-skin rows (`PF21105` body smoothing,
+    /// `PF90086` body tone unify) from `PortraitMasks::body` when active.
+    pub fn attach_historical_skin_from_extra(
+        &self,
+        source: &Image,
+        masks: Option<&super::PortraitMasks>,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        use super::portrait_historical_skin::{
+            HistoricalSkinData, HistoricalSkinImmediateInputs, HistoricalSkinImmediateRow,
+            HistoricalSkinPass,
+        };
+
+        self.validate_ticket(source, Some(self.job_id))?;
+        let control = |pf: u32| extra.get(&format!("pc:{pf}")).copied().unwrap_or(0.0);
+        let c21105 = control(21105);
+        let c90086 = control(90086);
+        if c21105 == 0.0 && c90086 == 0.0 {
+            return Ok(());
+        }
+        let Some(parsing) = self.model_inputs.as_ref().and_then(|m| m.parsing.as_ref()) else {
+            return Err(Refusal::MissingInput("FaceParsingV2 parsing planes"));
+        };
+        let mut p = parsing.clone();
+        p.job_id = self.job_id;
+        let pixels = source.pixel_count();
+        let body_mask_f32 = if let Some(body) = masks.and_then(|m| {
+            m.body
+                .as_ref()
+                .map(|plane| sample_mask_plane(plane, m.width, m.height, source.width, source.height))
+        }) {
+            body
+        } else {
+            return Ok(());
+        };
+        let body_mask_u8: Vec<u8> = body_mask_f32
+            .iter()
+            .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+
+        let mut rows = Vec::new();
+        if c21105 != 0.0 {
+            let mut src_rgb = Vec::with_capacity(pixels * 3);
+            for px in source.pixels.chunks_exact(4) {
+                src_rgb.push(px[0] as f32 / 255.0);
+                src_rgb.push(px[1] as f32 / 255.0);
+                src_rgb.push(px[2] as f32 / 255.0);
+            }
+            let (median_rgb, _, _, _) = super::hlf_preprocess(
+                &src_rgb,
+                source.width,
+                source.height,
+                super::HlfAutoProducerOptions::default(),
+            );
+            let mut smooth_rgba = Vec::with_capacity(pixels * 4);
+            for i in 0..pixels {
+                for c in 0..3 {
+                    smooth_rgba.push((median_rgb[i * 3 + c].clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+                smooth_rgba.push(source.pixels[i * 4 + 3]);
+            }
+            let effect = Image::new(source.width, source.height, smooth_rgba)
+                .ok_or(Refusal::ShapeMismatch("PF21105 smooth frame"))?;
+            rows.push(HistoricalSkinImmediateRow {
+                pf: 21105,
+                ticket: self.job_id,
+                control: c21105.clamp(0.0, 1.0),
+                data: HistoricalSkinData::BodySkin(vec![HistoricalSkinPass {
+                    mask: body_mask_u8,
+                    effect,
+                }]),
+            });
+        }
+
+        if c90086 != 0.0 {
+            let m = body_mask_f32;
+            let o = vec![0.0f32; pixels];
+            rows.push(HistoricalSkinImmediateRow {
+                pf: 90086,
+                ticket: self.job_id,
+                control: c90086.clamp(0.0, 1.0),
+                data: HistoricalSkinData::BodyTone {
+                    m,
+                    o,
+                    w_m: c90086.clamp(0.0, 1.0),
+                    w_o: 0.0,
+                },
+            });
+        }
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+        producer.write_immediate_historical_skin(
+            source,
+            &p,
+            HistoricalSkinImmediateInputs {
+                ticket: self.job_id,
+                rows,
+            },
+        )
     }
 
     /// Builds PF202/PF232 from this bundle's 194/414 points and explicit
@@ -2776,6 +3141,42 @@ fn distance(left: [f32; 2], right: [f32; 2]) -> f32 {
     let dx = right[0] - left[0];
     let dy = right[1] - left[1];
     (dx * dx + dy * dy).sqrt()
+}
+
+fn sample_mask_plane(
+    plane: &[f32],
+    src_w: usize,
+    src_h: usize,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<f32> {
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+    if src_w == 0 || src_h == 0 || plane.len() < src_w * src_h {
+        return vec![0.0; dw * dh];
+    }
+    if src_w == dw && src_h == dh {
+        return plane[..dw * dh].to_vec();
+    }
+    let mut out = Vec::with_capacity(dw * dh);
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * src_h as f32 / dh as f32 - 0.5)
+            .clamp(0.0, (src_h - 1) as f32);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let wy = fy - y0 as f32;
+        for x in 0..dw {
+            let fx = ((x as f32 + 0.5) * src_w as f32 / dw as f32 - 0.5)
+                .clamp(0.0, (src_w - 1) as f32);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let wx = fx - x0 as f32;
+            let a = plane[y0 * src_w + x0] * (1.0 - wx) + plane[y0 * src_w + x1] * wx;
+            let b = plane[y1 * src_w + x0] * (1.0 - wx) + plane[y1 * src_w + x1] * wx;
+            out.push((a * (1.0 - wy) + b * wy).clamp(0.0, 1.0));
+        }
+    }
+    out
 }
 
 fn sha256_32(bytes: &[u8]) -> [u8; 32] {

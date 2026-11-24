@@ -1341,8 +1341,8 @@ fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> 
         };
         matches!(
             pf,
-            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 30013 | 90004 | 90021 | 90023
-                | 90024
+            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 21105 | 30013 | 30014 | 90004
+                | 90021 | 90023 | 90024 | 90086 | 100004
         )
     })
 }
@@ -1372,7 +1372,7 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 101 | 90002 | 90010 | 90021)
+        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90021 | 90086 | 100004)
             || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
@@ -2107,7 +2107,18 @@ fn render_sized(
                 if !lens.ca_fringing.is_empty() { base_lens.chromatic_aberration = false; }
                 super::detail::stage_lens(&mut rgba, out_w as usize, out_h as usize, &base_lens, Some(warp));
                 let before_extras = rgba.clone();
-                super::detail::stage_lens_extras(&mut rgba, out_w as usize, out_h as usize, lens);
+                // The 8-bit preview keeps the original extras sequence; the wide
+                // buffer runs native 16-bit twins so purple, dust and sharpness
+                // falloff no longer feed an 8-bit delta back through ×257.
+                super::detail::stage_ca_fringes(&mut rgba, out_w as usize, out_h as usize, lens);
+                let after_ca = rgba.clone();
+                super::detail::stage_purple_fringing(
+                    &mut rgba,
+                    out_w as usize,
+                    out_h as usize,
+                    super::purple_norm(lens.purple_fringing),
+                );
+                super::detail::stage_dust_removal(&mut rgba, out_w as usize, out_h as usize, lens);
                 if let Some(wide) = rgba16.as_mut() {
                     super::detail::stage_lens_profile16(
                         wide,
@@ -2119,14 +2130,21 @@ fn render_sized(
                         (detail_adj.lens.light_falloff / 100.0).clamp(0.0, 1.0),
                         detail_adj.lens.chromatic_aberration,
                     );
-                    merge_wide_delta(wide, &before_extras, &rgba, out_w as usize);
+                    // CA fringes have no 16-bit twin yet; keep their 8-bit delta.
+                    merge_wide_delta(wide, &before_extras, &after_ca, out_w as usize);
+                    super::detail::stage_purple_fringing16(
+                        wide,
+                        out_w as usize,
+                        out_h as usize,
+                        super::purple_norm(lens.purple_fringing),
+                    );
+                    super::detail::stage_dust_removal16(wide, out_w as usize, out_h as usize, lens);
                 }
                 super::detail::stage_movement(&mut rgba, out_w as usize, out_h as usize, lens);
-                let before_falloff = rgba.clone();
                 super::detail::stage_sharpness_falloff(&mut rgba, out_w as usize, out_h as usize, lens);
                 if let Some(wide) = rgba16.as_mut() {
                     super::detail::stage_movement16(wide, out_w as usize, out_h as usize, lens);
-                    merge_wide_delta(wide, &before_falloff, &rgba, out_w as usize);
+                    super::detail::stage_sharpness_falloff16(wide, out_w as usize, out_h as usize, lens);
                 }
                 // Everything after this point (spots, layers) is local and can
                 // merge as before.
@@ -2372,6 +2390,34 @@ fn render_sized(
                             && bundle
                                 .attach_moisture_inputs(&stage_frame, masks, &mut inputs)
                                 .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_pf8033_from_extra(&stage_frame, &adj.extra, &mut inputs)
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_historical_tone_from_extra(
+                                &stage_frame,
+                                Some(masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_historical_skin_from_extra(
+                                &stage_frame,
+                                Some(masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
                         {
                             attached = true;
                         }
@@ -7127,6 +7173,66 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         adj.lens.shift_x = 25.0;
         let after = render16(&src, &adj, NormRect::FULL, w, false);
         assert_ne!(after.rgba, before.rgba);
+    }
+
+    /// The wide lens branch must apply purple, dust and sharpness falloff at
+    /// 16 bits. Against the same render without those extras, the delta must not
+    /// be a multiple of 257 (the old 8-bit `merge_wide_delta` step).
+    #[test]
+    fn wide_lens_extras_keep_bits_below_the_eight_bit_steps() {
+        let (w, h) = (64u32, 48u32);
+        let mut src = Source::from_rgba(w, h, &synthetic(w, h));
+        src.lens_auto = Some(super::super::lens_profile::LensWarp::default());
+        let mut base_adj = AdjustmentSet::default();
+        base_adj.lens.use_profile = true;
+        let base = render16(&src, &base_adj, NormRect::FULL, w, false);
+
+        let mut adj = base_adj.clone();
+        adj.lens.purple_fringing = 70.0;
+        adj.lens.sharpness_falloff = 100.0;
+        adj.lens.radial_blur = RadialBlur {
+            radial: vec![(0.0, 0.0), (1.0, 200_000.0)],
+            transverse: vec![(0.0, 0.0), (1.0, 200_000.0)],
+            valid: true,
+        };
+        adj.lens.dust_removal_enabled = true;
+        adj.lens.dust_patches = vec![DustPatch {
+            x: 8,
+            y: 8,
+            w: 24,
+            h: 24,
+            offset: 0,
+            bias: 0,
+            step: 1,
+        }];
+        let extras = render16(&src, &adj, NormRect::FULL, w, false);
+        assert_ne!(extras.rgba, base.rgba, "the extras must reach the wide buffer");
+        let low_bit_deltas = extras
+            .rgba
+            .chunks_exact(4)
+            .zip(base.rgba.chunks_exact(4))
+            .flat_map(|(after, before)| (0..3).map(move |k| after[k] as i32 - before[k] as i32))
+            .filter(|delta| *delta != 0 && delta.rem_euclid(257) != 0)
+            .count();
+        assert!(
+            low_bit_deltas > 0,
+            "wide lens extras must not move in 257-sized 8-bit steps"
+        );
+    }
+
+    /// Zero settings must leave the wide lens branch byte-identical to a render
+    /// that does not enter it at all.
+    #[test]
+    fn wide_lens_branch_zero_settings_is_identity() {
+        let (w, h) = (32u32, 32u32);
+        let mut src = Source::from_rgba(w, h, &synthetic(w, h));
+        src.lens_auto = Some(super::super::lens_profile::LensWarp::default());
+        let mut adj = AdjustmentSet::default();
+        adj.lens.use_profile = true;
+        let with_branch = render16(&src, &adj, NormRect::FULL, w, false).rgba;
+        adj.lens.use_profile = false;
+        let without_branch = render16(&src, &adj, NormRect::FULL, w, false).rgba;
+        assert_eq!(with_branch, without_branch);
     }
 
     #[test]
