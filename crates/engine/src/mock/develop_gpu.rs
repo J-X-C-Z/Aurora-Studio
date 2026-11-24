@@ -1582,6 +1582,181 @@ pub(crate) fn fallback_reason(
     None
 }
 
+/// Retained device bytes for one develop frame: the 4-float IO frame, the
+/// 4-byte gain plane and the colour-editor table. `None` on overflow.
+pub(crate) fn retained_bytes(width: usize, height: usize, params: &DevelopParams) -> Option<usize> {
+    let pixels = width.checked_mul(height)?;
+    if pixels == 0 {
+        return None;
+    }
+    let editor_bytes = params
+        .editor
+        .as_ref()
+        .map(|e| e.floats.len().saturating_mul(4))
+        .unwrap_or(0)
+        .max(4);
+    pixels
+        .checked_mul(16)?
+        .checked_add(pixels.checked_mul(4)?)?
+        .checked_add(editor_bytes)
+}
+
+/// The retained-frame budget the device path enforces.
+pub(crate) const fn develop_budget() -> usize {
+    MAX_RETAINED_BYTES
+}
+
+/// Non-allocating admission check.
+///
+/// Nothing frame-sized may be prepared before this returns `true`: no host
+/// sample array, no gain plane, no CUDA module, no host IO frame. The caller
+/// runs it once per render, before `prewarm()` and before the gain plane, so a
+/// frame that would exceed the budget goes straight to the CPU with its old
+/// buffers untouched.
+pub(crate) fn can_run_develop_gpu(
+    width: usize,
+    height: usize,
+    params: &DevelopParams,
+    budget: usize,
+) -> bool {
+    if !enabled() {
+        return false;
+    }
+    retained_bytes(width, height, params).is_some_and(|bytes| bytes <= budget)
+}
+
+/// End-to-end CPU/GPU crossover policy of the point chain, in output pixels.
+///
+/// S6 measured the LCC/vignette gain planes end to end, not this kernel, so
+/// these rows are a **policy table**, not measured develop timings: 256² and
+/// 720p stay on the CPU, 1080p and above are admitted. `AURORA_DEVELOP_MIN_PIXELS`
+/// overrides the floor; a real develop crossing has to be measured before any
+/// row is quoted as a result.
+const CROSSOVER_TABLE: [(u64, bool); 6] = [
+    (65_536, false),       // 256×256
+    (921_600, false),      // 1280×720
+    (2_073_600, true),     // 1920×1080
+    (8_294_400, true),     // 3840×2160
+    (24_385_536, true),    // 6048×4032 (24.4 MP)
+    (44_761_088, true),    // 8192×5464 (44.8 MP)
+];
+
+fn crossover_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let measured = CROSSOVER_TABLE
+            .iter()
+            .find(|(_, wins)| *wins)
+            .map(|(pixels, _)| *pixels)
+            .unwrap_or(u64::MAX);
+        std::env::var("AURORA_DEVELOP_MIN_PIXELS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|pixels| *pixels > 0)
+            .unwrap_or(measured)
+    })
+}
+
+/// `false` when the output is below the measured CPU/GPU crossover.
+pub(crate) fn crossover_admits(width: usize, height: usize) -> bool {
+    (width as u64).saturating_mul(height as u64) >= crossover_floor()
+}
+
+/// Host IO frames are reused between bands and frames. Bands are a few MiB, so
+/// keeping one buffer resident removes the per-band allocator round trip without
+/// pinning a whole 45 MP frame.
+const HOST_IO_POOL_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn host_io_pool() -> &'static Mutex<Option<Vec<f32>>> {
+    static POOL: OnceLock<Mutex<Option<Vec<f32>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(None))
+}
+
+fn take_io(len: usize) -> Vec<f32> {
+    let mut slot = host_io_pool().lock().unwrap_or_else(|error| error.into_inner());
+    match slot.take() {
+        Some(mut buffer) => {
+            buffer.resize(len, 0.0);
+            buffer
+        }
+        None => vec![0.0f32; len],
+    }
+}
+
+fn give_io(buffer: Vec<f32>) {
+    if buffer.capacity().saturating_mul(4) > HOST_IO_POOL_MAX_BYTES {
+        return;
+    }
+    let mut slot = host_io_pool().lock().unwrap_or_else(|error| error.into_inner());
+    *slot = Some(buffer);
+}
+
+fn fill_io<F>(io: &mut [f32], width: usize, sampler: &F)
+where
+    F: Fn(usize, usize) -> Option<[f32; 3]> + Sync,
+{
+    use rayon::prelude::*;
+    io.par_chunks_exact_mut(4).enumerate().for_each(|(index, dst)| {
+        match sampler(index % width, index / width) {
+            Some(rgb) => {
+                dst[0] = rgb[0];
+                dst[1] = rgb[1];
+                dst[2] = rgb[2];
+                dst[3] = 1.0;
+            }
+            None => {
+                dst[0] = 0.0;
+                dst[1] = 0.0;
+                dst[2] = 0.0;
+                dst[3] = 0.0;
+            }
+        }
+    });
+}
+
+/// Samples straight into the pooled host IO frame and runs the kernel on it.
+///
+/// This is the allocation-light entry point: no `Sample` / `SourceSample`
+/// array is built, and `consume` receives the developed frame in place
+/// (4 floats per pixel, row-major) before the buffer returns to the pool.
+/// `None` means the caller must run the CPU path; nothing was left allocated.
+pub(crate) fn develop_band_sampled<F, R>(
+    width: usize,
+    height: usize,
+    region: [f32; 4],
+    params: &DevelopParams,
+    gain_plane: Option<&[f32]>,
+    sampler: F,
+    consume: impl FnOnce(&[f32]) -> R,
+) -> Option<R>
+where
+    F: Fn(usize, usize) -> Option<[f32; 3]> + Sync,
+{
+    let pixels = width.checked_mul(height)?;
+    if pixels == 0 || !can_run_develop_gpu(width, height, params, MAX_RETAINED_BYTES) {
+        return None;
+    }
+    if gain_plane.is_some_and(|plane| plane.len() != pixels) {
+        return None;
+    }
+    let mut io = take_io(pixels * 4);
+    fill_io(&mut io, width, &sampler);
+    match run_io(&mut io, width, height, region, params, gain_plane) {
+        Ok(()) => {
+            #[cfg(test)]
+            GPU_PLANES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let out = consume(&io);
+            give_io(io);
+            Some(out)
+        }
+        Err(err) => {
+            log::warn!("develop_gpu: {err:?}; staying on CPU");
+            give_io(io);
+            None
+        }
+    }
+}
+
 /// Runs the point chain on the GPU. `false` means the caller must run the CPU
 /// path: the switch is off, the driver/PTX is missing, or a launch failed.
 pub(crate) fn develop_plane(
@@ -1597,14 +1772,45 @@ pub(crate) fn develop_plane(
     if pixels == 0 || samples.len() != pixels || out.len() != pixels {
         return false;
     }
-    if let Some(plane) = gain_plane {
-        if plane.len() != pixels {
-            return false;
-        }
-    }
-    if !enabled() {
+    if gain_plane.is_some_and(|plane| plane.len() != pixels) {
         return false;
     }
+    if !can_run_develop_gpu(width, height, params, MAX_RETAINED_BYTES) {
+        return false;
+    }
+
+    let mut io = take_io(pixels * 4);
+    for (dst, sample) in io.chunks_exact_mut(4).zip(samples) {
+        dst.copy_from_slice(&[sample.rgb[0], sample.rgb[1], sample.rgb[2], if sample.valid { 1.0 } else { 0.0 }]);
+    }
+    match run_io(&mut io, width, height, region, params, gain_plane) {
+        Ok(()) => {
+            #[cfg(test)]
+            GPU_PLANES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (dst, src) in out.iter_mut().zip(io.chunks_exact(4)) {
+                *dst = [src[0], src[1], src[2]];
+            }
+            give_io(io);
+            true
+        }
+        Err(err) => {
+            log::warn!("develop_gpu: {err:?}; staying on CPU");
+            give_io(io);
+            false
+        }
+    }
+}
+
+/// Uploads the prepared IO frame, launches the point chain and downloads it.
+fn run_io(
+    io: &mut [f32],
+    width: usize,
+    height: usize,
+    region: [f32; 4],
+    params: &DevelopParams,
+    gain_plane: Option<&[f32]>,
+) -> Result<(), CudaError> {
+    let pixels = width * height;
     let io_bytes = pixels.saturating_mul(16);
     let gain_bytes = pixels.saturating_mul(4);
     let editor_bytes = params
@@ -1613,14 +1819,6 @@ pub(crate) fn develop_plane(
         .map(|e| e.floats.len().saturating_mul(4))
         .unwrap_or(0)
         .max(4);
-    if io_bytes.saturating_add(gain_bytes).saturating_add(editor_bytes) > MAX_RETAINED_BYTES {
-        return false;
-    }
-
-    let mut io = vec![0.0f32; pixels * 4];
-    for (dst, sample) in io.chunks_exact_mut(4).zip(samples) {
-        dst.copy_from_slice(&[sample.rgb[0], sample.rgb[1], sample.rgb[2], if sample.valid { 1.0 } else { 0.0 }]);
-    }
     let mut floats = params_floats(params);
     floats[P_W] = width as f32;
     floats[P_H] = height as f32;
@@ -1643,21 +1841,20 @@ pub(crate) fn develop_plane(
         .unwrap_or_else(|| vec![0u8; 1536]);
 
     let mut lock = state().lock().unwrap_or_else(|error| error.into_inner());
-    let result = match &mut *lock {
-        State::Unavailable => return false,
+    match &mut *lock {
+        State::Unavailable => Err(CudaError::Unavailable("CUDA develop path is unavailable")),
         State::NotTried => {
             let mut pool = match Pool::open(width, height) {
                 Ok(pool) => pool,
                 Err(err) => {
-                    log::warn!("develop_gpu: {err:?}; staying on CPU");
                     *lock = State::Unavailable;
-                    return false;
+                    return Err(err);
                 }
             };
             let result = pool
                 .ensure(io_bytes, gain_bytes, editor_bytes)
                 .and_then(|()| {
-                    run_pool(&pool, &mut io, &floats, &luts, c1.as_deref(), &editor, &banding, gain_plane, width, height)
+                    run_pool(&pool, io, &floats, &luts, c1.as_deref(), &editor, &banding, gain_plane, width, height)
                 });
             match result {
                 Ok(()) => {
@@ -1673,29 +1870,15 @@ pub(crate) fn develop_plane(
         State::Ready(pool) => pool
             .ensure(io_bytes, gain_bytes, editor_bytes)
             .and_then(|()| {
-                run_pool(pool, &mut io, &floats, &luts, c1.as_deref(), &editor, &banding, gain_plane, width, height)
+                run_pool(pool, io, &floats, &luts, c1.as_deref(), &editor, &banding, gain_plane, width, height)
             }),
-    };
-    match result {
-        Ok(()) => {
-            #[cfg(test)]
-            GPU_PLANES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for (dst, src) in out.iter_mut().zip(io.chunks_exact(4)) {
-                *dst = [src[0], src[1], src[2]];
-            }
-            true
-        }
-        Err(err) => {
-            log::warn!("develop_gpu: {err:?}; staying on CPU");
-            false
-        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_pool(
     pool: &Pool,
-    io: &mut Vec<f32>,
+    io: &mut [f32],
     floats: &[f32],
     luts: &[f32],
     c1: Option<&[u8]>,
@@ -1706,7 +1889,7 @@ fn run_pool(
     height: usize,
 ) -> Result<(), CudaError> {
     let gpu = pool.gpu.as_ref();
-    gpu.upload_buffer(&pool.io.0, as_bytes(io.as_slice()))?;
+    gpu.upload_buffer(&pool.io.0, as_bytes(io))?;
     gpu.upload_buffer(&pool.params.0, as_bytes(floats))?;
     gpu.upload_buffer(&pool.luts.0, as_bytes(luts))?;
     gpu.upload_buffer(&pool.editor.0, as_bytes(editor))?;
