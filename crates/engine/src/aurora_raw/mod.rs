@@ -14,6 +14,7 @@ pub mod z6iii;
 pub use c1_raw_he::decode_frame_cropped;
 
 use std::path::Path;
+use std::time::Instant;
 
 /// How the Z6III OpenCL reconstruction attempt ended.
 ///
@@ -70,24 +71,40 @@ pub fn decode_he_rgba16_traced(
     path: &Path,
 ) -> Option<(u32, u32, Vec<u16>, AuroraRoute)> {
     let bytes = std::fs::read(path).ok()?;
-    let orientation = crate::raw::exif_orientation_bytes(&bytes).unwrap_or(1);
+    let exif = crate::exif::parse_exif(&bytes);
     let libraw_frame = crate::raw::decode_bayer16(path).ok();
+    let mut timings = crate::raw::RawStageTimings::default();
+    decode_he_rgba16_with(&bytes, &exif, libraw_frame.as_ref(), &mut timings)
+}
+
+/// The same chain over a caller-provided decode context: the file bytes, the
+/// EXIF parsed from them and the LibRaw Bayer frame are reused instead of read
+/// again. Stage wall times are added to `timings` for the per-format report.
+pub(crate) fn decode_he_rgba16_with(
+    bytes: &[u8],
+    exif: &crate::Exif,
+    libraw_frame: Option<&crate::raw::BayerFrame>,
+    timings: &mut crate::raw::RawStageTimings,
+) -> Option<(u32, u32, Vec<u16>, AuroraRoute)> {
+    let orientation = crate::raw::exif_orientation_bytes(bytes).unwrap_or(1);
     let libraw_bayer = libraw_frame
-        .as_ref()
         .map(|lib| (lib.raw_width, lib.raw_height, lib.data.clone()));
 
-    let exif = crate::exif::read_exif(path);
-    let ca_warp = crate::mock::lens_profile::LensShot::from_exif(&exif)
+    let ca_warp = crate::mock::lens_profile::LensShot::from_exif(exif)
         .and_then(|shot| crate::mock::lens_profile::auto_warp(&shot))
         .filter(|warp| !warp.red.is_empty() || !warp.blue.is_empty());
 
+    let z6iii_started = Instant::now();
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     let (z6iii_frame, opencl) =
-        z6iii::render_linear_rgba16_traced(&bytes, libraw_bayer, ca_warp.as_ref());
+        z6iii::render_linear_rgba16_traced(bytes, libraw_bayer, ca_warp.as_ref());
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-    let (z6iii_frame, opencl) = (None, OpenClRoute::NotZ6iii);
+    let (z6iii_frame, opencl): (Option<(usize, usize, Vec<u16>)>, OpenClRoute) =
+        (None, OpenClRoute::NotZ6iii);
+    timings.z6iii_ms += z6iii_started.elapsed().as_millis() as u64;
 
     if let Some((width, height, rgba)) = z6iii_frame {
+        timings.note_bytes((rgba.len() as u64) * 2);
         let (width, height, pixels) = orient_rgba16(rgba, width, height, orientation);
         return Some((width, height, pixels, AuroraRoute::Z6iiiOpenCl));
     }
@@ -99,9 +116,12 @@ pub fn decode_he_rgba16_traced(
     let noise = lookup_camera_noise(exif.camera_model.as_deref(), iso);
 
     // Fujifilm X-Trans 6x6 sensor path (`filters == 9`).
-    if let Some(bayer) = libraw_frame.as_ref() {
+    if let Some(bayer) = libraw_frame {
         if bayer.filters == 9 && bayer.colors == 3 {
+            let demosaic_started = Instant::now();
             let (width, height, mut rgb) = decode_xtrans_linear(bayer)?;
+            timings.demosaic_ms += demosaic_started.elapsed().as_millis() as u64;
+            timings.note_bytes((rgb.len() as u64) * 12);
             #[cfg(all(windows, feature = "z6iii-raw-export"))]
             finish_linear_stages(&mut rgb, width, height, iso, noise, ca_warp.as_ref());
             let out = pack_rgba16(&rgb);
@@ -110,20 +130,31 @@ pub fn decode_he_rgba16_traced(
         }
     }
 
+    // Cheap gate for cameras the C1 chain cannot serve: it needs a 3-colour
+    // 2x2 CFA. Anything else goes straight to libraw's own demosaic instead of
+    // running the expensive tile pipeline first.
+    if let Some(bayer) = libraw_frame {
+        if bayer.colors != 3 || bayer.filters == 0 {
+            return None;
+        }
+    }
+
     // Try Nikon MakerNote metadata first when present (exact Nikon crop/WB/black),
     // otherwise construct the C1 Stage 1/2/3 input directly from LibRaw's generic
     // BayerFrame (covers Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.).
+    let c1_started = Instant::now();
     let (frame, wb, black) = if let Some((frame, wb, black)) =
-        nikon_c1_stage_input(&bytes, libraw_frame.as_ref())
+        nikon_c1_stage_input(bytes, libraw_frame)
     {
         (frame, wb, black)
-    } else if let Some(bayer) = libraw_frame.as_ref() {
+    } else if let Some(bayer) = libraw_frame {
         generic_bayer_c1_stage_input(bayer)?
     } else {
         return None;
     };
 
     let (width, height, mut rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
+    timings.note_bytes((rgb.len() as u64) * 12);
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     {
         if let Some(warp) = ca_warp.as_ref() {
@@ -132,6 +163,7 @@ pub fn decode_he_rgba16_traced(
         z6iii::recover_and_antialias_frame(&mut rgb, width, height, black, wb, iso);
         finish_linear_stages(&mut rgb, width, height, iso, noise, None);
     }
+    timings.c1_stages_ms += c1_started.elapsed().as_millis() as u64;
     let out = pack_rgba16(&rgb);
     let (width, height, pixels) = orient_rgba16(out, width, height, orientation);
     Some((width, height, pixels, cpu_route))

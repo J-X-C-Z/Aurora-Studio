@@ -10,6 +10,7 @@
 
 use std::io::{BufReader, ErrorKind, Read};
 use std::path::Path;
+use std::time::Instant;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use image::{ImageFormat, RgbaImage};
@@ -31,17 +32,25 @@ const MAX_SEGMENT: usize = 96 << 20;
 /// bytes cannot make the scan quadratic.
 const MAX_ATTEMPTS: usize = 64;
 
+fn evaluate_preview(segment: &[u8]) -> Option<(u64, RgbaImage)> {
+    let decoded = image::load_from_memory_with_format(segment, ImageFormat::Jpeg).ok()?;
+    let (w, h) = (decoded.width(), decoded.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((u64::from(w) * u64::from(h), decoded.to_rgba8()))
+}
+
 /// Returns the largest embedded JPEG preview, decoded.
 pub fn embedded_preview(path: &Path) -> anyhow::Result<RgbaImage> {
-    let found = scan_best(path, |segment| {
-        let decoded = image::load_from_memory_with_format(segment, ImageFormat::Jpeg).ok()?;
-        let (w, h) = (decoded.width(), decoded.height());
-        if w == 0 || h == 0 {
-            return None;
-        }
-        Some((u64::from(w) * u64::from(h), decoded.to_rgba8()))
-    })?;
+    let found = scan_best(path, evaluate_preview)?;
     found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))
+}
+
+/// [`embedded_preview`] over bytes we already hold: the sensor/preview sanity
+/// check must not read the RAW a second time.
+fn embedded_preview_bytes(bytes: &[u8]) -> Option<RgbaImage> {
+    scan_best_bytes(bytes, evaluate_preview)
 }
 
 /// The sRGB transfer curve on linear light 0..=1.
@@ -157,23 +166,146 @@ pub fn decode16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
     decode16_traced(path).map(|(width, height, pixels, _)| (width, height, pixels))
 }
 
+/// One RAW decode's shared inputs: the file is read once, EXIF is parsed from
+/// those bytes, and the LibRaw handle is opened on the same buffer so the
+/// fallback never has to decode the file again.
+struct RawDecodeContext {
+    bytes: Vec<u8>,
+    exif: crate::Exif,
+    timings: RawStageTimings,
+}
+
+impl RawDecodeContext {
+    fn read(path: &Path) -> Option<Self> {
+        let read_started = Instant::now();
+        let bytes = std::fs::read(path).ok()?;
+        let read_ms = read_started.elapsed().as_millis() as u64;
+        let exif_started = Instant::now();
+        let exif = crate::exif::parse_exif(&bytes);
+        let exif_ms = exif_started.elapsed().as_millis() as u64;
+        let len = bytes.len() as u64;
+        Some(Self {
+            bytes,
+            exif,
+            timings: RawStageTimings {
+                bytes_read: len,
+                read_ms,
+                exif_ms,
+                peak_tracked_bytes: len,
+                ..RawStageTimings::default()
+            },
+        })
+    }
+}
+
 /// [`decode16`] plus the provenance of the branch that actually produced the
 /// pixels. Cache headers persist it so a hit can still route the colour
 /// pipeline (the Z6III pre-matrix must never run on a LibRaw/preview fallback).
 pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    let started = Instant::now();
     // The Aurora Raw chain decodes the same Bayer as LibRaw but demosaics with
     // Aurora Raw's own stages. It handles the verified HE variant; `AURORA_C1_RAW=0`
     // is an escape hatch back to the LibRaw path.
     if c1_raw_enabled() {
-        if let Some((width, height, rgba, route)) = crate::aurora_raw::decode_he_rgba16_traced(path) {
-            log::info!("Aurora Raw decoded {}", path.display());
-            remember_sensor(path, true);
-            return Some((width, height, rgba, DecodeProvenance::aurora(route)));
+        if let Some(mut ctx) = RawDecodeContext::read(path) {
+            let open_started = Instant::now();
+            let mut session = libraw::Session::open(path, &ctx.bytes, demosaic_quality()).ok();
+            ctx.timings.libraw_open_ms = open_started.elapsed().as_millis() as u64;
+            let bayer = session.as_mut().and_then(|session| {
+                let unpack_started = Instant::now();
+                let unpacked = session.unpack().is_ok();
+                ctx.timings.libraw_unpack_ms = unpack_started.elapsed().as_millis() as u64;
+                if !unpacked {
+                    return None;
+                }
+                let bayer_started = Instant::now();
+                let bayer = session.bayer().ok();
+                ctx.timings.bayer_ms = bayer_started.elapsed().as_millis() as u64;
+                bayer
+            });
+            if let Some(bayer) = bayer.as_ref() {
+                ctx.timings
+                    .note_bytes(ctx.bytes.len() as u64 + (bayer.data.len() as u64) * 2);
+            }
+            let mut kind = RawKind::classify(path, bayer.as_ref(), ctx.exif.camera_model.as_deref());
+            if let Some((width, height, rgba, route)) = crate::aurora_raw::decode_he_rgba16_with(
+                &ctx.bytes,
+                &ctx.exif,
+                bayer.as_ref(),
+                &mut ctx.timings,
+            ) {
+                log::info!("Aurora Raw decoded {}", path.display());
+                remember_sensor(path, true);
+                if matches!(
+                    route,
+                    crate::aurora_raw::AuroraRoute::Z6iiiOpenCl
+                        | crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClUnavailable
+                        | crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed
+                ) {
+                    kind = RawKind::Z6iiiHe;
+                }
+                ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+                record_raw_decode(kind, ctx.timings);
+                return Some((width, height, rgba, DecodeProvenance::aurora(route)));
+            }
+            if let Some(session) = session.as_mut() {
+                // The same unpacked handle serves libraw's own demosaic, so the
+                // fallback no longer reads and decodes the file a second time.
+                let fallback_started = Instant::now();
+                let decoded = session.process16();
+                ctx.timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
+                match decoded {
+                    Ok((width, height, rgba)) => {
+                        ctx.timings
+                            .note_bytes(ctx.bytes.len() as u64 + (rgba.len() as u64) * 2);
+                        if same_picture_bytes(&luma_grid16(width, height, &rgba), &ctx.bytes) {
+                            remember_sensor(path, true);
+                            ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+                            record_raw_decode(kind, ctx.timings);
+                            return Some((width, height, rgba, DecodeProvenance::libraw16()));
+                        }
+                        log::warn!(
+                            "libraw {}: the 16-bit sensor decode does not resemble the camera's \
+                             own preview (unsupported compression?); falling back to the 8-bit path",
+                            path.display()
+                        );
+                    }
+                    Err(err) => log::warn!(
+                        "libraw {}: 16-bit {err}; falling back to the 8-bit path",
+                        path.display()
+                    ),
+                }
+                ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+                record_raw_decode(kind, ctx.timings);
+                return None;
+            }
+            // No libraw handle at all (library missing, or the format needs a
+            // file handle): keep the historic path and record its cost.
+            let fallback_started = Instant::now();
+            let decoded = libraw::decode16(path, demosaic_quality());
+            ctx.timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
+            if let Ok((width, height, rgba)) = decoded {
+                if same_picture_bytes(&luma_grid16(width, height, &rgba), &ctx.bytes) {
+                    remember_sensor(path, true);
+                    ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+                    record_raw_decode(kind, ctx.timings);
+                    return Some((width, height, rgba, DecodeProvenance::libraw16()));
+                }
+            }
+            ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+            record_raw_decode(kind, ctx.timings);
+            return None;
         }
     }
-    match libraw::decode16(path, demosaic_quality()) {
+    let mut timings = RawStageTimings::default();
+    let fallback_started = Instant::now();
+    let decoded = libraw::decode16(path, demosaic_quality());
+    timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
+    match decoded {
         Ok((width, height, rgba)) if same_picture(&luma_grid16(width, height, &rgba), path) => {
             remember_sensor(path, true);
+            timings.total_ms = started.elapsed().as_millis() as u64;
+            record_raw_decode(RawKind::classify(path, None, None), timings);
             return Some((width, height, rgba, DecodeProvenance::libraw16()));
         }
         Ok(_) => log::warn!(
@@ -295,6 +427,144 @@ impl DecodeStageRevisions {
             provenance.z6iii_linear,
         ))
     }
+}
+
+/// Wall time of one RAW decode, split by the stage that spent it, plus the
+/// largest tracked buffer the path held (not process RSS).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawStageTimings {
+    pub bytes_read: u64,
+    pub read_ms: u64,
+    pub exif_ms: u64,
+    pub libraw_open_ms: u64,
+    pub libraw_unpack_ms: u64,
+    pub bayer_ms: u64,
+    pub z6iii_ms: u64,
+    pub demosaic_ms: u64,
+    pub c1_stages_ms: u64,
+    pub fallback_ms: u64,
+    pub total_ms: u64,
+    pub peak_tracked_bytes: u64,
+}
+
+impl RawStageTimings {
+    fn add(&mut self, other: &Self) {
+        self.bytes_read += other.bytes_read;
+        self.read_ms += other.read_ms;
+        self.exif_ms += other.exif_ms;
+        self.libraw_open_ms += other.libraw_open_ms;
+        self.libraw_unpack_ms += other.libraw_unpack_ms;
+        self.bayer_ms += other.bayer_ms;
+        self.z6iii_ms += other.z6iii_ms;
+        self.demosaic_ms += other.demosaic_ms;
+        self.c1_stages_ms += other.c1_stages_ms;
+        self.fallback_ms += other.fallback_ms;
+        self.total_ms += other.total_ms;
+        self.peak_tracked_bytes = self.peak_tracked_bytes.max(other.peak_tracked_bytes);
+    }
+
+    pub(crate) fn note_bytes(&mut self, bytes: u64) {
+        self.peak_tracked_bytes = self.peak_tracked_bytes.max(bytes);
+    }
+}
+
+/// Camera/format bucket the per-stage numbers are aggregated under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RawKind {
+    Z6iiiHe,
+    Nef,
+    Arw,
+    XTrans,
+    Dng,
+    Other,
+}
+
+impl RawKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RawKind::Z6iiiHe => "z6iii-he",
+            RawKind::Nef => "nef",
+            RawKind::Arw => "arw",
+            RawKind::XTrans => "x-trans",
+            RawKind::Dng => "dng",
+            RawKind::Other => "other",
+        }
+    }
+
+    fn classify(path: &Path, bayer: Option<&BayerFrame>, model: Option<&str>) -> Self {
+        if bayer.is_some_and(|bayer| bayer.filters == 9) {
+            return RawKind::XTrans;
+        }
+        // Nikon writes "NIKON Z 6_3" (and some bodies "Z 6III"); both are HE
+        // candidates even when this build has no Z6III reconstruction feature.
+        if let Some(model) = model {
+            let model = model.to_ascii_lowercase();
+            if model.contains("z 6_3") || model.contains("z6iii") || model.contains("z 6iii") {
+                return RawKind::Z6iiiHe;
+            }
+        }
+        match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("nef") => RawKind::Nef,
+            Some("arw") => RawKind::Arw,
+            Some("dng") => RawKind::Dng,
+            _ => RawKind::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawDecodeAggregate {
+    pub decodes: u64,
+    pub timings: RawStageTimings,
+}
+
+static RAW_DECODE_STATS: std::sync::Mutex<Vec<(RawKind, RawDecodeAggregate)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Per-format decode timings since the last reset, one entry per kind that ran.
+pub fn raw_decode_stats() -> Vec<(RawKind, RawDecodeAggregate)> {
+    RAW_DECODE_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn reset_raw_decode_stats() {
+    RAW_DECODE_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn record_raw_decode(kind: RawKind, timings: RawStageTimings) {
+    {
+        let mut stats = RAW_DECODE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match stats.iter_mut().find(|(stored, _)| *stored == kind) {
+            Some(slot) => slot,
+            None => {
+                stats.push((kind, RawDecodeAggregate::default()));
+                stats.last_mut().expect("just pushed")
+            }
+        };
+        slot.1.decodes += 1;
+        slot.1.timings.add(&timings);
+    }
+    log::debug!(
+        "raw decode {} bytes={} read={}ms exif={}ms open={}ms unpack={}ms bayer={}ms \
+         z6iii={}ms demosaic={}ms c1={}ms fallback={}ms total={}ms peak={}B",
+        kind.label(),
+        timings.bytes_read,
+        timings.read_ms,
+        timings.exif_ms,
+        timings.libraw_open_ms,
+        timings.libraw_unpack_ms,
+        timings.bayer_ms,
+        timings.z6iii_ms,
+        timings.demosaic_ms,
+        timings.c1_stages_ms,
+        timings.fallback_ms,
+        timings.total_ms,
+        timings.peak_tracked_bytes
+    );
 }
 
 /// Which decoder produced a frame.
@@ -711,6 +981,12 @@ fn same_picture(a: &[f32], path: &Path) -> bool {
     };
     similar(a, &luma_grid(&preview))
 }
+fn same_picture_bytes(a: &[f32], bytes: &[u8]) -> bool {
+    match embedded_preview_bytes(bytes) {
+        Some(preview) => similar(a, &luma_grid(&preview)),
+        None => true,
+    }
+}
 fn similar(a: &[f32], preview: &[f32]) -> bool {
     // Rank correlation of 2x2-averaged cells: the sensor decode is linear light
     // and the preview is display-encoded and tone-mapped, so the same picture can
@@ -987,6 +1263,9 @@ mod libraw {
         open: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
         #[cfg(target_os = "windows")]
         open_w: unsafe extern "C" fn(*mut c_void, *const u16) -> c_int,
+        /// Reads from the buffer we already hold instead of opening the path a
+        /// second time. Optional: older builds fall back to `open_file`.
+        open_buffer: Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int>,
         unpack_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
         unpack: unsafe extern "C" fn(*mut c_void) -> c_int,
         process: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -1050,6 +1329,7 @@ mod libraw {
             open: symbol(handle, "libraw_open_file")?,
             #[cfg(target_os = "windows")]
             open_w: symbol(handle, "libraw_open_wfile")?,
+            open_buffer: symbol(handle, "libraw_open_buffer"),
             unpack_name: symbol(handle, "libraw_unpack_function_name")?,
             unpack: symbol(handle, "libraw_unpack")?,
             process: symbol(handle, "libraw_dcraw_process")?,
@@ -1139,10 +1419,9 @@ mod libraw {
         Ok((data, api, path))
     }
 
-    /// libraw opened, unpacked and processed; the memory image is in `pixels`.
-    fn processed(path: &Path, quality: i32) -> Result<Guard, String> {
-        let (data, api, path) = start(path)?;
-        let mut guard = Guard { api, data, pixels: std::ptr::null_mut() };
+    /// Output settings shared by every libraw decode. `processed` and the
+    /// reused [`Session`] must apply exactly the same ones or their pixels differ.
+    fn apply_output_settings(api: &Api, data: *mut c_void, quality: i32) {
         unsafe {
             (api.output_bps)(data, 16);
             (api.no_auto_bright)(data, 1);
@@ -1155,6 +1434,13 @@ mod libraw {
             // Must land before dcraw_process; the call is legal right after open.
             (api.demosaic)(data, quality);
         }
+    }
+
+    /// libraw opened, unpacked and processed; the memory image is in `pixels`.
+    fn processed(path: &Path, quality: i32) -> Result<Guard, String> {
+        let (data, api, path) = start(path)?;
+        let mut guard = Guard { api, data, pixels: std::ptr::null_mut() };
+        apply_output_settings(api, data, quality);
         #[cfg(target_os = "windows")]
         let code = unsafe { (api.open_w)(data, path.as_ptr()) };
         #[cfg(not(target_os = "windows"))]
@@ -1199,7 +1485,13 @@ mod libraw {
 
     /// The memory image, its sample bytes and its dimensions.
     fn view<'a>(guard: &'a Guard) -> Result<(&'a Processed, &'a [u8], (u32, u32)), String> {
-        let out = unsafe { &*guard.pixels };
+        view_ptr(guard.pixels)
+    }
+
+    fn view_ptr<'a>(
+        pixels: *mut Processed,
+    ) -> Result<(&'a Processed, &'a [u8], (u32, u32)), String> {
+        let out = unsafe { &*pixels };
         let (width, height) = (u32::from(out.width), u32::from(out.height));
         if width == 0 || height == 0 {
             return Err("empty image".into());
@@ -1219,8 +1511,109 @@ mod libraw {
         }
         let offset = std::mem::offset_of!(Processed, data);
         let raw =
-            unsafe { std::slice::from_raw_parts((guard.pixels as *const u8).add(offset), bytes) };
+            unsafe { std::slice::from_raw_parts((pixels as *const u8).add(offset), bytes) };
         Ok((out, raw, (width, height)))
+    }
+
+    /// One libraw handle for one decode. Opening, unpacking and the Bayer read
+    /// happen once; if the Aurora chain declines, `process16` runs libraw's own
+    /// demosaic on the *same* unpacked handle instead of decoding again.
+    pub(super) struct Session<'a> {
+        api: &'static Api,
+        data: *mut c_void,
+        /// libraw reads from this buffer for as long as the handle lives.
+        _buffer: Option<&'a [u8]>,
+        unpacked: bool,
+    }
+
+    impl Drop for Session<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.api.close)(self.data) };
+        }
+    }
+
+    impl<'a> Session<'a> {
+        /// Opens `path`, preferring the bytes the caller already read.
+        pub(super) fn open(path: &Path, bytes: &'a [u8], quality: i32) -> Result<Self, String> {
+            let api = api().ok_or("libraw library not found")?;
+            if let Some(open_buffer) = api.open_buffer {
+                let data = unsafe { (api.init)(0) };
+                if data.is_null() {
+                    return Err("libraw_init returned null".into());
+                }
+                apply_output_settings(api, data, quality);
+                let code =
+                    unsafe { open_buffer(data, bytes.as_ptr() as *const c_void, bytes.len()) };
+                if code == 0 {
+                    return Ok(Self {
+                        api,
+                        data,
+                        _buffer: Some(bytes),
+                        unpacked: false,
+                    });
+                }
+                unsafe { (api.close)(data) };
+                raw_trace!("RAWTRACE open_buffer code {code}; retrying as a file");
+            }
+            let (data, api, path) = start(path)?;
+            apply_output_settings(api, data, quality);
+            #[cfg(target_os = "windows")]
+            let code = unsafe { (api.open_w)(data, path.as_ptr()) };
+            #[cfg(not(target_os = "windows"))]
+            let code = unsafe { (api.open)(data, path.as_ptr()) };
+            if code != 0 {
+                unsafe { (api.close)(data) };
+                return Err(format!("open_file code {code}"));
+            }
+            Ok(Self { api, data, _buffer: None, unpacked: false })
+        }
+
+        pub(super) fn unpack(&mut self) -> Result<(), super::BayerError> {
+            let code = unsafe { (self.api.unpack)(self.data) };
+            if code == -2 {
+                return Err(super::BayerError::Unsupported);
+            }
+            if code != 0 {
+                return Err(super::BayerError::Other(format!(
+                    "libraw unpack {code}: {}",
+                    error_text(self.api, code)
+                )));
+            }
+            self.unpacked = true;
+            Ok(())
+        }
+
+        pub(super) fn bayer(&self) -> Result<super::BayerFrame, super::BayerError> {
+            let version = unsafe { (self.api.version_number)() };
+            let layout = layout(version)?;
+            unsafe { read_bayer(self.api, self.data, layout) }
+        }
+
+        /// libraw's own demosaic on this already-unpacked handle.
+        pub(super) fn process16(&mut self) -> Result<(u32, u32, Vec<u16>), String> {
+            if !self.unpacked {
+                return Err("libraw handle is not unpacked".into());
+            }
+            let api = self.api;
+            let code = unsafe { (api.process)(self.data) };
+            if code != 0 {
+                return Err(format!("dcraw_process code {code}"));
+            }
+            let mut code = 0;
+            let pixels = unsafe { (api.make)(self.data, &mut code) };
+            if pixels.is_null() {
+                return Err(format!("dcraw_make_mem_image code {code}"));
+            }
+            let result = view_ptr(pixels).and_then(|(out, raw, (width, height))| {
+                if out.bits != 16 {
+                    return Err(format!("bits {} where 16 were requested", out.bits));
+                }
+                expand_raw16(raw, out.colors, width as usize * height as usize)
+                    .map(|rgba| (width, height, rgba))
+            });
+            unsafe { (api.clear)(pixels) };
+            result
+        }
     }
 
     pub fn decode(path: &Path, quality: i32) -> Result<RgbaImage, String> {
@@ -1363,19 +1756,19 @@ mod libraw {
         }
         let version = unsafe { (guard.api.version_number)() };
         let layout = layout(version)?;
-        unsafe { read_bayer(&guard, layout) }
+        unsafe { read_bayer(guard.api, guard.data, layout) }
     }
 
     unsafe fn read_bayer(
-        guard: &Guard,
+        api: &'static Api,
+        data: *mut c_void,
         layout: Layout,
     ) -> Result<super::BayerFrame, super::BayerError> {
-        let api = guard.api;
-        let base = guard.data as *const u8;
+        let base = data as *const u8;
         let raw_width = usize::from(unsafe { read_u16(base, OFF_RAW_WIDTH) });
         let raw_height = usize::from(unsafe { read_u16(base, OFF_RAW_HEIGHT) });
-        let got_width = unsafe { (api.raw_width)(guard.data) };
-        let got_height = unsafe { (api.raw_height)(guard.data) };
+        let got_width = unsafe { (api.raw_width)(data) };
+        let got_height = unsafe { (api.raw_height)(data) };
         if raw_width == 0
             || raw_height == 0
             || got_width as usize != raw_width
@@ -1592,6 +1985,20 @@ fn scan_best<T>(
         }
     }
     Ok(best.map(|(_, value)| value))
+}
+
+/// [`scan_best`] over a buffer the caller already read. Same chunking as the
+/// streaming reader, so both find the same preview.
+fn scan_best_bytes<T>(
+    bytes: &[u8],
+    mut evaluate: impl FnMut(&[u8]) -> Option<(u64, T)>,
+) -> Option<T> {
+    let mut state = ScanState::default();
+    let mut best: Option<(u64, T)> = None;
+    for chunk in bytes.chunks(CHUNK) {
+        feed(&mut state, chunk, &mut evaluate, &mut best);
+    }
+    best.map(|(_, value)| value)
 }
 
 #[derive(Default)]
@@ -2430,6 +2837,118 @@ mod tests {
         assert_eq!(fingerprints.len(), 4, "every provenance shape is distinct");
         assert!(!DecodeProvenance { pipeline_fingerprint: 0, ..z6iii }.is_current());
         assert!(!DecodeProvenance { pipeline_fingerprint: 0, ..preview }.is_current());
+    }
+
+    /// P-05 manual benchmark: same file, same build profile. Prints the exact
+    /// pixel hash so the pre/post trees can be compared byte for byte.
+    #[test]
+    #[ignore = "manual P-05 bench: set AURORA_TEST_RAW"]
+    fn bench_p05_decode_path() {
+        use std::time::Instant;
+        let path = std::env::var_os("AURORA_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF")
+            });
+        if !path.is_file() {
+            return;
+        }
+        let mut best = f64::MAX;
+        for round in 0..3 {
+            let started = Instant::now();
+            let (width, height, pixels, provenance) =
+                decode16_traced(&path).expect("decode");
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            best = best.min(ms);
+            let hash = pixels.iter().fold(0xcbf2_9ce4_8422_2325u64, |mut hash, &value| {
+                hash ^= u64::from(value);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                hash
+            });
+            println!(
+                "P05 round={round} {width}x{height} backend={:?} px={} ms={ms:.1} best={best:.1} hash={hash:016x}",
+                provenance.backend,
+                pixels.len()
+            );
+        }
+        for (kind, aggregate) in raw_decode_stats() {
+            println!(
+                "P05 stats {} decodes={} timings={:?}",
+                kind.label(),
+                aggregate.decodes,
+                aggregate.timings
+            );
+        }
+        reset_raw_decode_stats();
+    }
+
+    #[test]
+    fn preview_scan_over_bytes_matches_the_file_scan() {
+        let dir = std::env::temp_dir().join(format!("p05-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg_path = dir.join("preview.jpg");
+        let pixels: Vec<u8> = (0..64 * 48 * 3).map(|i| (i % 251) as u8).collect();
+        image::save_buffer_with_format(
+            &jpeg_path,
+            &pixels,
+            64,
+            48,
+            image::ExtendedColorType::Rgb8,
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        let jpeg = std::fs::read(&jpeg_path).unwrap();
+        let mut container = vec![0u8; 4096];
+        container.extend_from_slice(&jpeg);
+        container.extend(vec![0u8; 4096]);
+        let container_path = dir.join("container.nef");
+        std::fs::write(&container_path, &container).unwrap();
+
+        let from_file = embedded_preview(&container_path).unwrap();
+        let from_bytes = embedded_preview_bytes(&container).unwrap();
+        assert_eq!(
+            (from_file.width(), from_file.height()),
+            (from_bytes.width(), from_bytes.height())
+        );
+        assert_eq!(from_file.as_raw(), from_bytes.as_raw());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn raw_decode_stats_aggregate_by_kind() {
+        reset_raw_decode_stats();
+        record_raw_decode(
+            RawKind::Nef,
+            RawStageTimings { read_ms: 3, c1_stages_ms: 10, ..RawStageTimings::default() },
+        );
+        record_raw_decode(
+            RawKind::Nef,
+            RawStageTimings { read_ms: 5, ..RawStageTimings::default() },
+        );
+        let stats = raw_decode_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].0, RawKind::Nef);
+        assert_eq!(stats[0].1.decodes, 2);
+        assert_eq!(stats[0].1.timings.read_ms, 8);
+        assert_eq!(stats[0].1.timings.c1_stages_ms, 10);
+        reset_raw_decode_stats();
+        assert!(raw_decode_stats().is_empty());
+    }
+
+    #[test]
+    fn raw_kind_classifies_extension_and_z6iii_models() {
+        assert_eq!(RawKind::classify(Path::new("a.nef"), None, None), RawKind::Nef);
+        assert_eq!(RawKind::classify(Path::new("a.ARW"), None, None), RawKind::Arw);
+        assert_eq!(RawKind::classify(Path::new("a.dng"), None, None), RawKind::Dng);
+        assert_eq!(RawKind::classify(Path::new("a.cr3"), None, None), RawKind::Other);
+        assert_eq!(
+            RawKind::classify(Path::new("a.nef"), None, Some("NIKON Z 6_3")),
+            RawKind::Z6iiiHe
+        );
+        assert_eq!(
+            RawKind::classify(Path::new("a.nef"), None, Some("NIKON Z 8")),
+            RawKind::Nef
+        );
     }
 }
 
