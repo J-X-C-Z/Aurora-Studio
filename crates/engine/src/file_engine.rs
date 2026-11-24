@@ -1861,14 +1861,15 @@ impl FileEngine {
     /// Cached preview frame; `fast` renders at half size and upsamples.
     fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
         let start = Instant::now();
+        let perf = std::env::var_os("AURORA_PERF_REPLAY").is_some();
         // Draft and Final must keep the same output size: a lower draft cap made
         // the preview jump when the pointer was released. Draft is cheaper
         // because `fast` renders half size and upsamples, not because it is smaller.
         let max = request.max_size;
         let adj = crate::styles::resolve(&request.adjustments);
-        let src = match self.native_raw_source(request.image, Some((&adj.geometry, request.region, max))) {
-            Some(native) => native,
-            None => self.source(request.image)?,
+        let (src, source_kind) = match self.native_raw_source(request.image, Some((&adj.geometry, request.region, max))) {
+            Some(native) => (native, "native_raw"),
+            None => (self.source(request.image)?, "source"),
         };
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
             .with_source(src.snapshot_id());
@@ -1878,17 +1879,23 @@ impl FileEngine {
         if let Some(hit) = hit {
             let histogram = hit.histogram.clone();
             let source = hit.into_image();
+            let (width, height) = (source.width, source.height);
             let gamut_warning = request
                 .proof_profile
                 .as_deref()
                 .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
             let (image, degraded) = self.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
             let degraded = degraded.or(intent_note);
+            let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+            if perf {
+                eprintln!("AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":true,\"fast\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
+                    request.generation, request.image.0, fast, width, height, elapsed_ms, source_kind, request.bypass);
+            }
             return Ok(PreviewFrame {
                 histogram,
                 image,
                 generation: request.generation,
-                elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+                elapsed_ms,
                 degraded,
                 gamut_warning,
             });
@@ -1908,11 +1915,16 @@ impl FileEngine {
             .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
         let (image, degraded) = self.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let degraded = degraded.or(intent_note);
+        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+        if perf {
+            eprintln!("AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":false,\"fast\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
+                request.generation, request.image.0, fast, out.width, out.height, elapsed_ms, source_kind, request.bypass);
+        }
         Ok(PreviewFrame {
             image,
             histogram: out.histogram,
             generation: request.generation,
-            elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            elapsed_ms,
             degraded,
             gamut_warning,
         })
