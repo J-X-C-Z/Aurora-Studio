@@ -5,13 +5,16 @@
 //! CPU stages of the display-sRGB float core. The kernels here mirror their
 //! arithmetic; `AURORA_NR_GPU=0` keeps the CPU stages and leaves every byte
 //! untouched. Any driver, module or launch failure also falls back to CPU.
+//!
+//! This is the only stage that uses the shared non-blocking stream and pins the
+//! caller's frame in place; both come from [`super::gpu_runtime::Gpu`].
 
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia, Stream};
+use super::gpu_runtime::{self, Failure, Gpu, Slot};
 
-use crate::NoiseReduction;
+use crate::{NoiseReduction};
 
 const PTX: &str = include_str!("../../native/cuda/nr_gpu.ptx");
 const BLOCK: (u32, u32) = (32, 8);
@@ -47,55 +50,28 @@ fn layout(w: usize, h: usize) -> Option<Layout> {
     })
 }
 
-struct SendBuffer(DeviceBuffer<'static>);
-
-// `DeviceBuffer` only needs the driver table to move; the owning `Nvidia`
-// object stays boxed and `State` serializes every use.
-unsafe impl Send for SendBuffer {}
-
-struct SendStream(Stream<'static>);
-
-unsafe impl Send for SendStream {}
-
-/// The boxed driver table never moves, and `NrPool` owns it for its whole
-/// allocation lifetime, so the buffers can safely outlive the short borrow.
-fn alloc_static(gpu: &Nvidia, bytes: usize) -> Result<DeviceBuffer<'static>, CudaError> {
-    let buffer = gpu.alloc_buffer(bytes)?;
-    Ok(unsafe { std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer) })
-}
-
 struct NrPool {
-    gpu: Box<Nvidia>,
-    buffer: SendBuffer,
-    lut: SendBuffer,
-    stream: Option<SendStream>,
+    gpu: Gpu,
     lut_sigma: Option<f32>,
     bytes: usize,
 }
 
 impl NrPool {
-    fn open(w: usize, h: usize) -> Result<Self, CudaError> {
-        let l = layout(w, h).ok_or(CudaError::Unavailable("nr frame size"))?;
-        let gpu = Box::new(Nvidia::open_ptx(PTX)?);
-        let stream = gpu
-            .create_stream()
-            .ok()
-            .map(|stream| unsafe {
-                SendStream(std::mem::transmute::<Stream<'_>, Stream<'static>>(stream))
-            });
+    fn open(w: usize, h: usize) -> Result<Self, Failure> {
+        let l = layout(w, h).ok_or(Failure::Invalid("nr frame size"))?;
+        let mut gpu = Gpu::open("nr", PTX)?.with_stream();
+        gpu.reserve(Slot::Frame, l.total, MAX_POOL_BYTES)?;
+        gpu.reserve(Slot::Aux0, 1025 * 4, MAX_POOL_BYTES)?;
         Ok(Self {
-            buffer: SendBuffer(alloc_static(&gpu, l.total)?),
-            lut: SendBuffer(alloc_static(&gpu, 1025 * 4)?),
-            stream,
-            lut_sigma: None,
             gpu,
+            lut_sigma: None,
             bytes: l.total,
         })
     }
 
-    fn ensure(&mut self, total: usize) -> Result<(), CudaError> {
+    fn ensure(&mut self, total: usize) -> Result<(), Failure> {
         if total > self.bytes {
-            self.buffer = SendBuffer(alloc_static(&self.gpu, total)?);
+            self.gpu.reserve(Slot::Frame, total, MAX_POOL_BYTES)?;
             self.bytes = total;
         }
         Ok(())
@@ -137,8 +113,9 @@ pub(crate) fn prewarm() -> bool {
                 log::info!("CUDA noise-reduction path ready");
                 true
             }
-            Err(err) => {
-                log::warn!("nr_gpu: {err:?}; staying on CPU");
+            Err(failure) => {
+                log::warn!("nr_gpu: {failure:?}; staying on CPU");
+                gpu_runtime::note_fallback("nr", &failure);
                 *state = State::Unavailable;
                 false
             }
@@ -165,42 +142,35 @@ pub(crate) fn run_f32(
         return false;
     }
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    match &mut *state {
-        State::Unavailable => false,
-        State::NotTried => {
-            let mut pool = match NrPool::open(w, h) {
-                Ok(pool) => pool,
-                Err(err) => {
-                    log::warn!("nr_gpu: {err:?}; staying on CPU");
-                    *state = State::Unavailable;
-                    return false;
-                }
-            };
-            let result = pool
-                .ensure(l.total)
-                .and_then(|()| run_pool(&mut pool, rgb, w, h, nr, scale, luma, color));
-            match result {
-                Ok(()) => {
+    let result = match &mut *state {
+        State::Unavailable => return false,
+        State::NotTried => match NrPool::open(w, h) {
+            Ok(mut pool) => {
+                let result = pool
+                    .ensure(l.total)
+                    .and_then(|()| run_pool(&mut pool, rgb, w, h, nr, scale, luma, color));
+                if result.is_ok() {
                     *state = State::Ready(pool);
-                    true
                 }
-                Err(err) => {
-                    log::warn!("nr_gpu: {err:?}; staying on CPU");
-                    false
-                }
+                result
             }
-        }
-        State::Ready(pool) => {
-            let result = pool
-                .ensure(l.total)
-                .and_then(|()| run_pool(pool, rgb, w, h, nr, scale, luma, color));
-            match result {
-                Ok(()) => true,
-                Err(err) => {
-                    log::warn!("nr_gpu: {err:?}; staying on CPU");
-                    false
-                }
+            Err(failure) => {
+                log::warn!("nr_gpu: {failure:?}; staying on CPU");
+                gpu_runtime::note_fallback("nr", &failure);
+                *state = State::Unavailable;
+                return false;
             }
+        },
+        State::Ready(pool) => pool
+            .ensure(l.total)
+            .and_then(|()| run_pool(pool, rgb, w, h, nr, scale, luma, color)),
+    };
+    match result {
+        Ok(()) => true,
+        Err(failure) => {
+            log::warn!("nr_gpu: {failure:?}; staying on CPU");
+            gpu_runtime::note_fallback("nr", &failure);
+            false
         }
     }
 }
@@ -214,25 +184,24 @@ fn run_pool(
     scale: f32,
     luma: bool,
     color: bool,
-) -> Result<(), CudaError> {
+) -> Result<(), Failure> {
     ensure_lut(pool, nr, luma)?;
-    let gpu = pool.gpu.as_ref();
-    let l = layout(w, h).ok_or(CudaError::Unavailable("nr frame size"))?;
+    let l = layout(w, h).ok_or(Failure::Invalid("nr frame size"))?;
     let host = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    if let Some(stream) = pool.stream.as_ref().map(|stream| &stream.0)
-        && let Ok(mut registration) = gpu.register_host(host)
+    if pool.gpu.stream().is_some()
+        && let Ok(mut registration) = pool.gpu.register_host(host)
     {
         // Pinned in place: the DMA engine reads and writes the caller's frame
         // directly, with no 290 MB host-to-host staging copy.
-        gpu.upload_async(&pool.buffer.0, registration.as_slice(), stream)?;
-        launch_stages(pool, w, h, nr, scale, luma, color, Some(stream))?;
-        gpu.download_async(&pool.buffer.0, registration.as_mut_slice(), stream)?;
-        gpu.stream_sync(stream)?;
+        pool.gpu.upload_async(Slot::Frame, registration.as_slice())?;
+        launch_stages(&mut pool.gpu, w, h, nr, scale, luma, color)?;
+        pool.gpu.download_async(Slot::Frame, registration.as_mut_slice())?;
+        pool.gpu.sync()?;
         return Ok(());
     }
-    gpu.upload_buffer(&pool.buffer.0, host)?;
-    launch_stages(pool, w, h, nr, scale, luma, color, None)?;
-    gpu.download_buffer(&pool.buffer.0, host)?;
+    pool.gpu.upload(Slot::Frame, host)?;
+    launch_stages(&mut pool.gpu, w, h, nr, scale, luma, color)?;
+    pool.gpu.download(Slot::Frame, host)?;
     Ok(())
 }
 
@@ -242,7 +211,7 @@ fn ensure_lut(
     pool: &mut NrPool,
     nr: &NoiseReduction,
     luma: bool,
-) -> Result<(), CudaError> {
+) -> Result<(), Failure> {
     if !luma {
         return Ok(());
     }
@@ -261,24 +230,22 @@ fn ensure_lut(
         .collect();
     let table_bytes =
         unsafe { std::slice::from_raw_parts(table.as_ptr() as *const u8, table.len() * 4) };
-    pool.gpu.upload_buffer(&pool.lut.0, table_bytes)?;
+    pool.gpu.upload(Slot::Aux0, table_bytes)?;
     pool.lut_sigma = Some(sigma);
     Ok(())
 }
 
 fn launch_stages(
-    pool: &NrPool,
+    gpu: &mut Gpu,
     w: usize,
     h: usize,
     nr: &NoiseReduction,
     scale: f32,
     luma: bool,
     color: bool,
-    stream: Option<&Stream<'_>>,
-) -> Result<(), CudaError> {
-    let gpu = pool.gpu.as_ref();
-    let l = layout(w, h).ok_or(CudaError::Unavailable("nr frame size"))?;
-    let base = pool.buffer.0.handle();
+) -> Result<(), Failure> {
+    let l = layout(w, h).ok_or(Failure::Invalid("nr frame size"))?;
+    let base = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("nr frame slot"))?;
     let mut p_rgb = base;
     let mut p_pad = base + l.rgb as u64;
     // `p_l` aliases the luma pad: the luma pass has already finished.
@@ -292,7 +259,7 @@ fn launch_stages(
 
     if luma {
         let strength = (nr.luminance / 100.0).clamp(0.0, 1.0);
-        let mut p_lut = pool.lut.0.handle();
+        let mut p_lut = gpu.handle(Slot::Aux0).ok_or(Failure::Invalid("nr lut slot"))?;
         let mut strength_f = strength;
 
         launch2(
@@ -306,7 +273,6 @@ fn launch_stages(
                 ptr(&mut w_i),
                 ptr(&mut h_i),
             ],
-            stream,
         )?;
         launch2(
             gpu,
@@ -321,7 +287,6 @@ fn launch_stages(
                 ptr(&mut h_i),
                 ptr(&mut strength_f),
             ],
-            stream,
         )?;
     }
 
@@ -352,7 +317,6 @@ fn launch_stages(
                 ptr(&mut p_v),
                 ptr(&mut n_i),
             ],
-            stream,
         )?;
         launch2(
             gpu,
@@ -374,7 +338,6 @@ fn launch_stages(
                 ptr(&mut pz_chroma),
                 ptr(&mut pw_chroma),
             ],
-            stream,
         )?;
         launch2(
             gpu,
@@ -395,7 +358,6 @@ fn launch_stages(
                 ptr(&mut pz_chroma),
                 ptr(&mut pw_chroma),
             ],
-            stream,
         )?;
     }
 
@@ -407,248 +369,22 @@ fn ptr<T>(value: &mut T) -> *mut c_void {
 }
 
 fn launch2<const N: usize>(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     kernel: &'static str,
     w: usize,
     h: usize,
     mut args: [*mut c_void; N],
-    stream: Option<&Stream<'_>>,
-) -> Result<(), CudaError> {
-    let grid = (
-        ((w as u32) + BLOCK.0 - 1) / BLOCK.0,
-        ((h as u32) + BLOCK.1 - 1) / BLOCK.1,
-    );
-    match stream {
-        Some(stream) => gpu.launch_raw_stream(kernel, grid, BLOCK, &mut args, stream)?,
-        None => gpu.launch_raw(kernel, grid, BLOCK, &mut args)?,
-    };
-    Ok(())
+) -> Result<(), Failure> {
+    gpu.launch(kernel, gpu_runtime::grid2(w, h, BLOCK), BLOCK, &mut args)
 }
 
 fn launch1<const N: usize>(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     kernel: &'static str,
     n: usize,
     mut args: [*mut c_void; N],
-    stream: Option<&Stream<'_>>,
-) -> Result<(), CudaError> {
-    let grid = (((n as u32) + 255) / 256, 1);
-    match stream {
-        Some(stream) => gpu.launch_raw_stream(kernel, grid, (256, 1), &mut args, stream)?,
-        None => gpu.launch_raw(kernel, grid, (256, 1), &mut args)?,
-    };
-    Ok(())
-}
-
-/// Device-only time: `iters` passes are queued, then one readback (the only
-/// synchronisation this driver wrapper exposes) drains them; the calibrated
-/// idle readback is subtracted, so the result is kernel execution time.
-#[cfg(test)]
-fn device_time(
-    rgb: &mut [[f32; 3]],
-    w: usize,
-    h: usize,
-    nr: &NoiseReduction,
-    scale: f32,
-    luma: bool,
-    color: bool,
-    iters: usize,
-) -> Option<f64> {
-    use std::time::Instant;
-    let l = layout(w, h)?;
-    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    let State::Ready(pool) = &mut *state else {
-        return None;
-    };
-    pool.ensure(l.total).ok()?;
-    ensure_lut(pool, nr, luma).ok()?;
-    let bytes = unsafe { std::slice::from_raw_parts(rgb.as_ptr() as *const u8, l.n * 12) };
-    pool.gpu.upload_buffer(&pool.buffer.0, bytes).ok()?;
-    launch_stages(pool, w, h, nr, scale, luma, color, None).ok()?;
-    let out = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    pool.gpu.download_buffer(&pool.buffer.0, out).ok()?;
-    // Calibrate an idle readback of the same size.
-    let start = Instant::now();
-    pool.gpu.download_buffer(&pool.buffer.0, out).ok()?;
-    let idle = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    for _ in 0..iters.max(1) {
-        launch_stages(pool, w, h, nr, scale, luma, color, None).ok()?;
-    }
-    pool.gpu.download_buffer(&pool.buffer.0, out).ok()?;
-    let per_pass = start.elapsed().as_secs_f64() * 1000.0 / iters.max(1) as f64;
-    Some((per_pass - idle / iters.max(1) as f64).max(0.0))
-}
-
-/// Upload and download cost for one 24 MP frame, measured separately.
-#[cfg(test)]
-fn io_time(rgb: &mut [[f32; 3]], w: usize, h: usize) -> Option<(f64, f64)> {
-    use std::time::Instant;
-    let l = layout(w, h)?;
-    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    let State::Ready(pool) = &mut *state else {
-        return None;
-    };
-    pool.ensure(l.total).ok()?;
-    let bytes = unsafe { std::slice::from_raw_parts(rgb.as_ptr() as *const u8, l.n * 12) };
-    let start = Instant::now();
-    pool.gpu.upload_buffer(&pool.buffer.0, bytes).ok()?;
-    let up = start.elapsed().as_secs_f64() * 1000.0;
-    let out = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    let start = Instant::now();
-    pool.gpu.download_buffer(&pool.buffer.0, out).ok()?;
-    let down = start.elapsed().as_secs_f64() * 1000.0;
-    Some((up, down))
-}
-
-/// Pinned/async staging cost split for one frame.
-#[cfg(test)]
-fn staging_time(rgb: &mut [[f32; 3]], w: usize, h: usize) -> Option<(f64, f64, f64, f64)> {
-    use std::time::Instant;
-    let l = layout(w, h)?;
-    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    let State::Ready(pool) = &mut *state else {
-        return None;
-    };
-    pool.ensure(l.total).ok()?;
-    let gpu = pool.gpu.as_ref();
-    let stream = pool.stream.as_ref().map(|stream| &stream.0)?;
-    let host = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    let start = Instant::now();
-    let mut registration = gpu.register_host(host).ok()?;
-    let register = start.elapsed().as_secs_f64() * 1000.0;
-    // First touch faults the newly pinned pages; measure the steady state.
-    gpu.upload_async(&pool.buffer.0, registration.as_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let start = Instant::now();
-    gpu.upload_async(&pool.buffer.0, registration.as_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let up = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    gpu.download_async(&pool.buffer.0, registration.as_mut_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let down = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    drop(registration);
-    let unregister = start.elapsed().as_secs_f64() * 1000.0;
-    Some((register, up, down, unregister))
-}
-
-/// `cuMemAllocHost` staging: allocation, host copy, async up/down.
-#[cfg(test)]
-fn pinned_time(rgb: &mut [[f32; 3]], w: usize, h: usize) -> Option<(f64, f64, f64, f64)> {
-    use std::time::Instant;
-    let l = layout(w, h)?;
-    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    let State::Ready(pool) = &mut *state else {
-        return None;
-    };
-    pool.ensure(l.total).ok()?;
-    let gpu = pool.gpu.as_ref();
-    let stream = pool.stream.as_ref().map(|stream| &stream.0)?;
-    let start = Instant::now();
-    let mut pinned = gpu.alloc_pinned(l.n * 12).ok()?;
-    let alloc = start.elapsed().as_secs_f64() * 1000.0;
-    let host = unsafe { std::slice::from_raw_parts(rgb.as_ptr() as *const u8, l.n * 12) };
-    let start = Instant::now();
-    pinned.as_mut_slice().copy_from_slice(host);
-    let host_in = start.elapsed().as_secs_f64() * 1000.0;
-    gpu.upload_async(&pool.buffer.0, pinned.as_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let start = Instant::now();
-    gpu.upload_async(&pool.buffer.0, pinned.as_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let up = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    gpu.download_async(&pool.buffer.0, pinned.as_mut_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let down = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    let out = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    out.copy_from_slice(pinned.as_slice());
-    let host_out = start.elapsed().as_secs_f64() * 1000.0;
-    Some((alloc, host_in + host_out, up, down))
-}
-
-/// Whether H2D and D2H actually overlap on two streams.
-#[cfg(test)]
-fn bidirectional_time(rgb: &mut [[f32; 3]], w: usize, h: usize) -> Option<(f64, f64)> {
-    use std::time::Instant;
-    let l = layout(w, h)?;
-    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    let State::Ready(pool) = &mut *state else {
-        return None;
-    };
-    pool.ensure(l.total).ok()?;
-    let gpu = pool.gpu.as_ref();
-    let up_stream = pool.stream.as_ref().map(|stream| &stream.0)?;
-    let down_stream = gpu.create_stream().ok()?;
-    let host = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    let mut registration = gpu.register_host(host).ok()?;
-    let mut sink = vec![0u8; l.n * 12];
-    let mut sink_registration = gpu.register_host(&mut sink).ok()?;
-    // Distinct source and destination buffers so neither direction waits on a
-    // read-after-write hazard inside the same allocation.
-    let temp_up = gpu.alloc_buffer(l.n * 12).ok()?;
-    let temp_down = gpu.alloc_buffer(l.n * 12).ok()?;
-    gpu.upload_async(&temp_up, registration.as_slice(), up_stream).ok()?;
-    gpu.stream_sync(up_stream).ok()?;
-    let start = Instant::now();
-    gpu.upload_async(&temp_up, registration.as_slice(), up_stream).ok()?;
-    gpu.download_async(&temp_down, sink_registration.as_mut_slice(), &down_stream).ok()?;
-    gpu.stream_sync(up_stream).ok()?;
-    gpu.stream_sync(&down_stream).ok()?;
-    let both = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    gpu.upload_async(&temp_up, registration.as_slice(), up_stream).ok()?;
-    gpu.stream_sync(up_stream).ok()?;
-    let up = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    gpu.download_async(&temp_down, sink_registration.as_mut_slice(), &down_stream).ok()?;
-    gpu.stream_sync(&down_stream).ok()?;
-    let down = start.elapsed().as_secs_f64() * 1000.0;
-    Some((both, up + down))
-}
-
-/// Step split of the real `run_pool` path: register, upload, kernels,
-/// download, unregister.
-#[cfg(test)]
-fn split_run(
-    rgb: &mut [[f32; 3]],
-    w: usize,
-    h: usize,
-    nr: &NoiseReduction,
-    scale: f32,
-) -> Option<(f64, f64, f64, f64, f64)> {
-    use std::time::Instant;
-    let l = layout(w, h)?;
-    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    let State::Ready(pool) = &mut *state else {
-        return None;
-    };
-    pool.ensure(l.total).ok()?;
-    ensure_lut(pool, nr, true).ok()?;
-    let gpu = pool.gpu.as_ref();
-    let stream = pool.stream.as_ref().map(|stream| &stream.0)?;
-    let host = unsafe { std::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, l.n * 12) };
-    let start = Instant::now();
-    let mut registration = gpu.register_host(host).ok()?;
-    let register = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    gpu.upload_async(&pool.buffer.0, registration.as_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let up = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    launch_stages(pool, w, h, nr, scale, true, true, Some(stream)).ok()?;
-    let kernels = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    gpu.download_async(&pool.buffer.0, registration.as_mut_slice(), stream).ok()?;
-    gpu.stream_sync(stream).ok()?;
-    let down = start.elapsed().as_secs_f64() * 1000.0;
-    let start = Instant::now();
-    drop(registration);
-    let unregister = start.elapsed().as_secs_f64() * 1000.0;
-    Some((register, up, kernels, down, unregister))
+) -> Result<(), Failure> {
+    gpu.launch(kernel, gpu_runtime::grid1(n, 256), (256, 1), &mut args)
 }
 
 #[cfg(test)]
@@ -751,6 +487,26 @@ mod tests {
         }
     }
 
+    /// Device-only time: `iters` passes are queued, then one 4-byte readback
+    /// drains them; the calibrated idle readback is subtracted.
+    fn device_time(pool: &mut NrPool, w: usize, h: usize, nr: &NoiseReduction, luma: bool, color: bool, iters: usize) -> Option<f64> {
+        use std::time::Instant;
+        ensure_lut(pool, nr, luma).ok()?;
+        let mut sink = [0u8; 4];
+        let idle = {
+            let started = Instant::now();
+            pool.gpu.download(Slot::Aux0, &mut sink).ok()?;
+            started.elapsed().as_secs_f64() * 1000.0
+        };
+        let started = Instant::now();
+        for _ in 0..iters.max(1) {
+            launch_stages(&mut pool.gpu, w, h, nr, 1.0, luma, color).ok()?;
+        }
+        pool.gpu.download(Slot::Aux0, &mut sink).ok()?;
+        let per_pass = started.elapsed().as_secs_f64() * 1000.0 / iters.max(1) as f64;
+        Some((per_pass - idle / iters.max(1) as f64).max(0.0))
+    }
+
     #[test]
     #[ignore = "timing benchmark, run explicitly with --ignored"]
     fn bench_nr_gpu_24mp() {
@@ -793,8 +549,7 @@ mod tests {
         let t = Instant::now();
         assert!(run_f32(&mut buf, w, h, &both_nr, 1.0));
         let gpu_both = t.elapsed().as_secs_f64() * 1000.0;
-        // Same allocation reused (the viewer's "adjust and re-render" case)
-        // versus a fresh Vec per frame (what the pipeline does today).
+        // Same allocation reused (the viewer's "adjust and re-render" case).
         let mut reused = base.clone();
         let mut reused_ms = Vec::new();
         for _ in 0..5 {
@@ -811,46 +566,29 @@ mod tests {
             fresh_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         fresh_ms.sort_by(f64::total_cmp);
-        let mut buf = base.clone();
-        let t = Instant::now();
-        assert!(run_f32(&mut buf, w, h, &luma_nr, 1.0));
-        let gpu_luma = t.elapsed().as_secs_f64() * 1000.0;
-        let mut buf = base.clone();
-        let t = Instant::now();
-        assert!(run_f32(&mut buf, w, h, &color_nr, 1.0));
-        let gpu_color = t.elapsed().as_secs_f64() * 1000.0;
-        let dev_luma = device_time(&mut buf, w, h, &luma_nr, 1.0, true, false, 10).unwrap_or(-1.0);
-        let dev_color =
-            device_time(&mut buf, w, h, &color_nr, 1.0, false, true, 10).unwrap_or(-1.0);
-        let dev_both = device_time(&mut buf, w, h, &both_nr, 1.0, true, true, 10).unwrap_or(-1.0);
-        let (up, down) = io_time(&mut buf, w, h).unwrap_or((-1.0, -1.0));
-        let staging = staging_time(&mut buf, w, h);
-        let (reg_ms, async_up, async_down, unreg_ms) = staging.unwrap_or((-1.0, -1.0, -1.0, -1.0));
-        let pinned = pinned_time(&mut buf, w, h);
-        let (pin_alloc, pin_host, pin_up, pin_down) = pinned.unwrap_or((-1.0, -1.0, -1.0, -1.0));
-        let (bidir, seq) = bidirectional_time(&mut buf, w, h).unwrap_or((-1.0, -1.0));
-        let split = split_run(&mut buf, w, h, &both_nr, 1.0);
-        let (s_reg, s_up, s_k, s_down, s_unreg) = split.unwrap_or((-1.0, -1.0, -1.0, -1.0, -1.0));
+
+        let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+        let State::Ready(pool) = &mut *state else { return };
+        let dev_luma = device_time(pool, w, h, &luma_nr, true, false, 10).unwrap_or(-1.0);
+        let dev_color = device_time(pool, w, h, &color_nr, false, true, 10).unwrap_or(-1.0);
+        let dev_both = device_time(pool, w, h, &both_nr, true, true, 10).unwrap_or(-1.0);
+        let counters = pool.gpu.counters();
+        let kernels: Vec<&'static str> = pool.gpu.kernels().iter().map(|k| k.kernel).collect();
 
         println!(
             "NR_GPU_24MP cpu_luma_ms={cpu_luma:.2} cpu_color_ms={cpu_color:.2} \
-cpu_total_ms={:.2} gpu_luma_ms={gpu_luma:.2} gpu_color_ms={gpu_color:.2} \
-gpu_total_ms={gpu_both:.2} dev_luma_ms={dev_luma:.2} dev_color_ms={dev_color:.2} \
-dev_total_ms={dev_both:.2} up_ms={up:.2} down_ms={down:.2} reg_ms={reg_ms:.2} \
-async_up_ms={async_up:.2} async_down_ms={async_down:.2} unreg_ms={unreg_ms:.2} \
-pin_alloc_ms={pin_alloc:.2} pin_host_ms={pin_host:.2} pin_up_ms={pin_up:.2} \
-pin_down_ms={pin_down:.2} bidir_ms={bidir:.2} seq_ms={seq:.2} mpx={:.1}",
+cpu_total_ms={:.2} gpu_total_ms={gpu_both:.2} dev_luma_ms={dev_luma:.2} \
+dev_color_ms={dev_color:.2} dev_total_ms={dev_both:.2} mpx={:.1} \
+h2d_bytes={} d2h_bytes={} launches={} kernels={kernels:?}",
             cpu_luma + cpu_color,
-            pixels / gpu_both / 1000.0
+            pixels / gpu_both / 1000.0,
+            counters.h2d_bytes,
+            counters.d2h_bytes,
+            counters.launches,
         );
         println!(
             "NR_GPU_REUSE reused_p50_ms={:.2} fresh_p50_ms={:.2}",
             reused_ms[2], fresh_ms[1]
-        );
-        println!(
-            "NR_GPU_SPLIT reg={s_reg:.2} up={s_up:.2} kernels={s_k:.2} down={s_down:.2} \
-unreg={s_unreg:.2} sum={:.2}",
-            s_reg + s_up + s_k + s_down + s_unreg
         );
     }
 

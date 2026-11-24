@@ -9,6 +9,7 @@ pub(crate) mod spots;
 pub(crate) mod grain;
 pub(crate) mod detail;
 pub(crate) mod clarity;
+pub(crate) mod gpu_runtime;
 pub(crate) mod pixel_gpu;
 #[cfg(windows)]
 pub(crate) mod detail_gpu;

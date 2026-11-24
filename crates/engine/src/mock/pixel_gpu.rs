@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 
-use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia};
+use aurora_portrait::cuda::DeviceBuffer;
 
 use crate::dust_lcc::{GpuLccGrid, LightFalloffLimit};
 use crate::{FilmGrain, VignetteCenter, VignetteMethod};
@@ -130,65 +130,80 @@ pub(crate) fn sample_plane(plane: &[f32], w: usize, h: usize, x: f32, y: f32) ->
 
 // ─────────────────────────────── CUDA pool ────────────────────────────────
 
+/// Device slots this stage uses. `Frame` is the RGBA frame, `Scratch` the gain
+/// plane, `Aux0` the grain blur temporary, `Aux2` the LCC node table or grain
+/// row totals. The tiny tap array and the 4-byte statistics word are owned
+/// buffers because they are uploaded/read at whole-buffer granularity.
 struct SendBuffer(DeviceBuffer<'static>);
 
-// The driver table each buffer borrows is boxed inside `Pool` and outlives it;
-// `State` serialises every use, so a raw handle never moves concurrently.
+// The driver table the buffer borrows lives inside `Pool.gpu`, which outlives
+// it; `State` serialises every use.
 unsafe impl Send for SendBuffer {}
 
 struct Pool {
-    gpu: Box<Nvidia>,
-    rgba: SendBuffer,
-    plane: SendBuffer,
-    tmp: SendBuffer,
+    gpu: Gpu,
     taps: SendBuffer,
-    nodes: SendBuffer,
     stats: SendBuffer,
-    bytes: usize,
-    node_bytes: usize,
-}
-
-fn alloc_static(gpu: &Nvidia, bytes: usize) -> Result<DeviceBuffer<'static>, CudaError> {
-    let buffer = gpu.alloc_buffer(bytes)?;
-    Ok(unsafe { std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer) })
+    taps_bytes: usize,
 }
 
 impl Pool {
-    fn open(bytes: usize, node_bytes: usize) -> Result<Self, CudaError> {
-        let gpu = Box::new(Nvidia::open_ptx(PTX)?);
-        Ok(Self {
-            rgba: SendBuffer(alloc_static(&gpu, bytes)?),
-            plane: SendBuffer(alloc_static(&gpu, bytes)?),
-            tmp: SendBuffer(alloc_static(&gpu, bytes)?),
-            taps: SendBuffer(alloc_static(&gpu, 68)?),
-            nodes: SendBuffer(alloc_static(&gpu, node_bytes.max(12))?),
-            stats: SendBuffer(alloc_static(&gpu, 4)?),
-            gpu,
-            bytes,
-            node_bytes,
-        })
+    fn open(bytes: usize, node_bytes: usize, taps_bytes: usize) -> Result<Self, Failure> {
+        let mut gpu = Gpu::open("pixel", PTX)?;
+        for slot in [Slot::Frame, Slot::Scratch, Slot::Aux0] {
+            gpu.reserve(slot, bytes, MAX_RETAINED_BYTES)?;
+        }
+        gpu.reserve(Slot::Aux2, node_bytes.max(12), MAX_RETAINED_BYTES)?;
+        let taps_bytes = taps_bytes.max(68);
+        let taps = SendBuffer(gpu_runtime::static_buffer(&gpu, taps_bytes)?);
+        let stats = SendBuffer(gpu_runtime::static_buffer(&gpu, 4)?);
+        Ok(Self { gpu, taps, stats, taps_bytes })
     }
 
-    fn ensure(&mut self, bytes: usize, node_bytes: usize) -> Result<(), CudaError> {
-        if bytes > self.bytes {
-            self.rgba = SendBuffer(alloc_static(&self.gpu, bytes)?);
-            self.plane = SendBuffer(alloc_static(&self.gpu, bytes)?);
-            self.tmp = SendBuffer(alloc_static(&self.gpu, bytes)?);
-            self.bytes = bytes;
+    fn ensure(&mut self, bytes: usize, node_bytes: usize, taps_bytes: usize) -> Result<(), Failure> {
+        for slot in [Slot::Frame, Slot::Scratch, Slot::Aux0] {
+            self.gpu.reserve(slot, bytes, MAX_RETAINED_BYTES)?;
         }
-        if node_bytes > self.node_bytes {
-            self.nodes = SendBuffer(alloc_static(&self.gpu, node_bytes)?);
-            self.node_bytes = node_bytes;
+        self.gpu.reserve(Slot::Aux2, node_bytes.max(12), MAX_RETAINED_BYTES)?;
+        if taps_bytes > self.taps_bytes {
+            self.taps = SendBuffer(gpu_runtime::static_buffer(&self.gpu, taps_bytes)?);
+            self.taps_bytes = taps_bytes;
         }
         Ok(())
     }
 
+    fn taps(&self) -> u64 {
+        self.taps.0.handle()
+    }
+
+    fn stats(&self) -> u64 {
+        self.stats.0.handle()
+    }
 }
 
 enum State {
     NotTried,
     Ready(Pool),
     Unavailable,
+}
+
+/// Test-only snapshot of the pixel stage's runtime counters and kernels.
+#[cfg(test)]
+pub(crate) fn stage_snapshot() -> Option<(
+    String,
+    (i32, i32),
+    super::gpu_runtime::Counters,
+    Vec<(&'static str, u64)>,
+)> {
+    let state = state().lock().unwrap_or_else(|error| error.into_inner());
+    let State::Ready(pool) = &*state else { return None };
+    let (device, cc) = pool.gpu.device().unwrap_or(("unknown", (0, 0)));
+    Some((
+        device.to_owned(),
+        cc,
+        pool.gpu.counters(),
+        pool.gpu.kernels().iter().map(|entry| (entry.kernel, entry.count)).collect(),
+    ))
 }
 
 fn state() -> &'static Mutex<State> {
@@ -201,64 +216,176 @@ fn state() -> &'static Mutex<State> {
 fn with_pool<T>(
     bytes: usize,
     node_bytes: usize,
-    body: impl FnOnce(&Pool) -> Result<T, CudaError>,
+    taps_bytes: usize,
+    body: impl FnOnce(&mut Pool) -> Result<T, Failure>,
 ) -> Option<T> {
     if bytes.saturating_mul(3).saturating_add(node_bytes) > MAX_RETAINED_BYTES {
+        super::gpu_runtime::note_fallback(
+            "pixel",
+            &Failure::TooLarge {
+                need: bytes.saturating_mul(3).saturating_add(node_bytes),
+                cap: MAX_RETAINED_BYTES,
+            },
+        );
         return None;
     }
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     match &mut *state {
         State::Unavailable => None,
-        State::NotTried => match Pool::open(bytes, node_bytes) {
+        State::NotTried => match Pool::open(bytes, node_bytes, taps_bytes) {
             Ok(mut pool) => {
                 let result = pool
-                    .ensure(bytes, node_bytes)
-                    .and_then(|()| body(&pool));
+                    .ensure(bytes, node_bytes, taps_bytes)
+                    .and_then(|()| body(&mut pool));
                 match result {
                     Ok(value) => {
                         *state = State::Ready(pool);
                         Some(value)
                     }
-                    Err(error) => {
-                        log::warn!("pixel_gpu: {error:?}; staying on CPU");
+                    Err(failure) => {
+                        log::warn!("pixel_gpu: {failure:?}; staying on CPU");
+                        super::gpu_runtime::note_fallback("pixel", &failure);
                         *state = State::Unavailable;
                         None
                     }
                 }
             }
-            Err(error) => {
-                log::warn!("pixel_gpu: {error:?}; staying on CPU");
+            Err(failure) => {
+                log::warn!("pixel_gpu: {failure:?}; staying on CPU");
+                super::gpu_runtime::note_fallback("pixel", &failure);
                 *state = State::Unavailable;
                 None
             }
         },
         State::Ready(pool) => match pool
-            .ensure(bytes, node_bytes)
+            .ensure(bytes, node_bytes, taps_bytes)
             .and_then(|()| body(pool))
         {
             Ok(value) => Some(value),
-            Err(error) => {
-                log::warn!("pixel_gpu: {error:?}; staying on CPU");
+            Err(failure) => {
+                log::warn!("pixel_gpu: {failure:?}; staying on CPU");
+                super::gpu_runtime::note_fallback("pixel", &failure);
                 None
             }
         },
     }
 }
 
-fn ptr<T>(value: &mut T) -> *mut c_void {
-    value as *mut T as *mut c_void
-}
+use super::gpu_runtime::{self, Failure, Gpu, Slot};
+use super::gpu_runtime::{grid2, ptr};
 
 fn launch2<const N: usize>(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     kernel: &'static str,
     w: usize,
     h: usize,
     mut args: [*mut c_void; N],
-) -> Result<(), CudaError> {
-    let grid = (((w as u32) + 15) / 16, ((h as u32) + 15) / 16);
-    gpu.launch_raw(kernel, grid, BLOCK, &mut args)?;
-    Ok(())
+) -> Result<(), Failure> {
+    gpu.launch(kernel, grid2(w, h, BLOCK), BLOCK, &mut args)
+}
+
+/// Launches `vignette_gain_kernel` into `plane`. Shared by the production
+/// entry point and the P-08 benchmark so both measure the same kernel.
+#[allow(clippy::too_many_arguments)]
+fn launch_vignette(
+    gpu: &mut Gpu,
+    plane: u64,
+    width: usize,
+    height: usize,
+    region: [f32; 4],
+    method: i32,
+    amount: f32,
+    aspect: f32,
+    center: [f32; 2],
+) -> Result<(), Failure> {
+    let (mut w_i, mut h_i) = (width as i32, height as i32);
+    let (mut ox, mut sx) = (region[0], region[2]);
+    let (mut oy, mut sy) = (region[1], region[3]);
+    let (mut amount, mut aspect) = (amount, aspect);
+    let (mut cx, mut cy) = (center[0], center[1]);
+    let mut method = method;
+    let mut plane = plane;
+    launch2(
+        gpu,
+        "vignette_gain_kernel",
+        width,
+        height,
+        [
+            ptr(&mut plane),
+            ptr(&mut w_i),
+            ptr(&mut h_i),
+            ptr(&mut ox),
+            ptr(&mut sx),
+            ptr(&mut oy),
+            ptr(&mut sy),
+            ptr(&mut amount),
+            ptr(&mut aspect),
+            ptr(&mut cx),
+            ptr(&mut cy),
+            ptr(&mut method),
+        ],
+    )
+}
+
+/// Packs the three grid arrays into the node buffer layout the kernel expects.
+fn pack_lcc_nodes(grid: &GpuLccGrid, nodes: usize) -> Vec<f32> {
+    let mut packed = Vec::with_capacity(nodes * 3);
+    packed.extend_from_slice(&grid.luminance[..nodes]);
+    packed.extend_from_slice(&grid.slope_x[..nodes]);
+    packed.extend_from_slice(&grid.slope_y[..nodes]);
+    packed
+}
+
+/// Launches `lcc_gain_kernel` from a node buffer holding luminance, slope_x,
+/// slope_y back to back.
+fn launch_lcc(
+    gpu: &mut Gpu,
+    plane: u64,
+    node_handle: u64,
+    grid: &GpuLccGrid,
+    nodes: usize,
+    width: usize,
+    height: usize,
+) -> Result<(), Failure> {
+    let (mut columns, mut rows) = (grid.columns as i32, grid.rows as i32);
+    let (mut ox, mut oy) = (grid.origin[0], grid.origin[1]);
+    let (mut sx, mut sy) = (grid.step[0], grid.step[1]);
+    let (mut max_level, mut strength) = (grid.max_level, grid.strength);
+    let mut limit = match grid.limit {
+        LightFalloffLimit::Soft => 0,
+        LightFalloffLimit::Hard => 1,
+        LightFalloffLimit::Uncapped => 2,
+    };
+    // C is `(const float*, ...)`; the driver still wants addresses of the
+    // argument values, so keep them in locals.
+    let mut lum = node_handle;
+    let mut slope_x = node_handle + nodes as u64 * 4;
+    let mut slope_y = node_handle + nodes as u64 * 8;
+    let mut plane = plane;
+    let (mut w_i, mut h_i) = (width as i32, height as i32);
+    launch2(
+        gpu,
+        "lcc_gain_kernel",
+        width,
+        height,
+        [
+            ptr(&mut plane),
+            ptr(&mut w_i),
+            ptr(&mut h_i),
+            ptr(&mut columns),
+            ptr(&mut rows),
+            ptr(&mut ox),
+            ptr(&mut oy),
+            ptr(&mut sx),
+            ptr(&mut sy),
+            ptr(&mut max_level),
+            ptr(&mut strength),
+            ptr(&mut limit),
+            ptr(&mut lum),
+            ptr(&mut slope_x),
+            ptr(&mut slope_y),
+        ],
+    )
 }
 
 // ─────────────────────────── vignette gain plane ──────────────────────────
@@ -317,9 +444,29 @@ fn cache_store(
     }
 }
 
+/// Production switch for the "device plane, CPU consume" shape.
+///
+/// P-08 measured this path end to end (generation + upload + kernel + download
+/// + CPU consume) against the CPU `exp2` formula: it is 1.3–3.1× slower at
+/// every tested size (256²…45 MP) because the D2H copy of a 4 B/pixel plane
+/// dominates a very cheap per-pixel formula. The shipped default therefore
+/// declines; `AURORA_PIXEL_VIGNETTE_GPU=1` (plus the master switch) restores it
+/// for parity probes and for a future device-resident develop (P-07), where the
+/// plane never comes back to host.
+fn vignette_plane_shipped() -> bool {
+    match std::env::var_os("AURORA_PIXEL_VIGNETTE_GPU") {
+        Some(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
+        None => false,
+    }
+}
+
 /// Cached vignette plane. The whole-operator cost is `exp2` per pixel; the
 /// cache exists because a slider drag that does not touch vignetting should not
 /// recompute (or re-copy) the plane.
+///
+/// A cache hit is always served: the measured warm path is at or below the CPU
+/// formula (0.32–1.05×). Only a cold generation is gated by
+/// [`vignette_plane_shipped`].
 pub(crate) fn vignette_plane_cached(
     width: usize,
     height: usize,
@@ -340,6 +487,13 @@ pub(crate) fn vignette_plane_cached(
     });
     if let Some(plane) = cache_lookup(|cache| &mut cache.vignette, key) {
         return Some(plane);
+    }
+    if !vignette_plane_shipped() {
+        super::gpu_runtime::note_fallback(
+            "pixel_vignette",
+            &super::gpu_runtime::Failure::Disabled("vignette plane end-to-end"),
+        );
+        return None;
     }
     let plane = Arc::new(vignette_plane(width, height, region, method, amount, aspect, center)?);
     cache_store(|cache| &mut cache.vignette, key, Arc::clone(&plane));
@@ -394,36 +548,10 @@ pub(crate) fn vignette_plane(
     let mut out = vec![0.0f32; width * height];
     let out_bytes =
         unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4) };
-    let done = with_pool(bytes, 0, |pool| {
-        let gpu = pool.gpu.as_ref();
-        let (mut w_i, mut h_i) = (width as i32, height as i32);
-        let (mut ox, mut sx) = (region[0], region[2]);
-        let (mut oy, mut sy) = (region[1], region[3]);
-        let (mut amount, mut aspect) = (amount, aspect);
-        let (mut cx, mut cy) = (center[0], center[1]);
-        let mut method = method;
-        let mut plane = pool.plane.0.handle();
-        launch2(
-            gpu,
-            "vignette_gain_kernel",
-            width,
-            height,
-            [
-                ptr(&mut plane),
-                ptr(&mut w_i),
-                ptr(&mut h_i),
-                ptr(&mut ox),
-                ptr(&mut sx),
-                ptr(&mut oy),
-                ptr(&mut sy),
-                ptr(&mut amount),
-                ptr(&mut aspect),
-                ptr(&mut cx),
-                ptr(&mut cy),
-                ptr(&mut method),
-            ],
-        )?;
-        gpu.download_buffer(&pool.plane.0, out_bytes)
+    let done = with_pool(bytes, 0, 0, |pool| {
+        let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+        launch_vignette(&mut pool.gpu, plane, width, height, region, method, amount, aspect, center)?;
+        pool.gpu.download(Slot::Scratch, out_bytes)
     });
     done.map(|()| {
         #[cfg(test)]
@@ -455,55 +583,22 @@ pub(crate) fn lcc_plane(grid: &GpuLccGrid, width: usize, height: usize) -> Optio
     let node_bytes_slice = |values: &[f32]| unsafe {
         std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
     };
-    let done = with_pool(bytes, node_bytes, |pool| {
-        let gpu = pool.gpu.as_ref();
+    let done = with_pool(bytes, node_bytes, 0, |pool| {
         // Three arrays in one node buffer: luminance, then slope_x, then slope_y.
-        let node_handle = pool.nodes.0.handle();
-        let mut packed = Vec::with_capacity(nodes * 3);
-        packed.extend_from_slice(&grid.luminance[..nodes]);
-        packed.extend_from_slice(&grid.slope_x[..nodes]);
-        packed.extend_from_slice(&grid.slope_y[..nodes]);
-        gpu.upload_buffer(&pool.nodes.0, node_bytes_slice(&packed))?;
-        let (mut columns, mut rows) = (grid.columns as i32, grid.rows as i32);
-        let (mut ox, mut oy) = (grid.origin[0], grid.origin[1]);
-        let (mut sx, mut sy) = (grid.step[0], grid.step[1]);
-        let (mut max_level, mut strength) = (grid.max_level, grid.strength);
-        let mut limit = match grid.limit {
-            LightFalloffLimit::Soft => 0,
-            LightFalloffLimit::Hard => 1,
-            LightFalloffLimit::Uncapped => 2,
-        };
-        // C is `(const float*, ...)`; the driver still wants addresses of the
-        // argument values, so keep them in locals.
-        let mut lum = node_handle;
-        let mut slope_x = node_handle + nodes as u64 * 4;
-        let mut slope_y = node_handle + nodes as u64 * 8;
-        let mut plane = pool.plane.0.handle();
-        let (mut w_i, mut h_i) = (width as i32, height as i32);
-        launch2(
-            gpu,
-            "lcc_gain_kernel",
+        let packed = pack_lcc_nodes(grid, nodes);
+        pool.gpu.upload(Slot::Aux2, node_bytes_slice(&packed))?;
+        let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+        let nodes_handle = pool.gpu.handle(Slot::Aux2).expect("node slot");
+        launch_lcc(
+            &mut pool.gpu,
+            plane,
+            nodes_handle,
+            grid,
+            nodes,
             width,
             height,
-            [
-                ptr(&mut plane),
-                ptr(&mut w_i),
-                ptr(&mut h_i),
-                ptr(&mut columns),
-                ptr(&mut rows),
-                ptr(&mut ox),
-                ptr(&mut oy),
-                ptr(&mut sx),
-                ptr(&mut sy),
-                ptr(&mut max_level),
-                ptr(&mut strength),
-                ptr(&mut limit),
-                ptr(&mut lum),
-                ptr(&mut slope_x),
-                ptr(&mut slope_y),
-            ],
         )?;
-        gpu.download_buffer(&pool.plane.0, out_bytes)
+        pool.gpu.download(Slot::Scratch, out_bytes)
     });
     done.map(|()| {
         #[cfg(test)]
@@ -545,25 +640,25 @@ pub(crate) fn grain_stage(
     let node_bytes = (h * 8).max(12);
     let (ox, oy) = super::grain::noise_offsets();
 
-    with_pool(bytes, node_bytes, |pool| {
-        let gpu = pool.gpu.as_ref();
-        let rgba_handle = pool.rgba.0.handle();
-        let tap_handle = pool.taps.0.handle();
-        gpu.upload_buffer(&pool.rgba.0, rgba)?;
+    with_pool(bytes, node_bytes, taps.len() * 4, |pool| {
+        let rgba_handle = pool.gpu.handle(Slot::Frame).expect("frame slot");
+        let tap_handle = pool.taps();
+        let stats_handle = pool.stats();
+        pool.gpu.upload(Slot::Frame, rgba)?;
         if !taps.is_empty() {
             let tap_slice = unsafe {
                 std::slice::from_raw_parts(taps.as_ptr() as *const u8, taps.len() * 4)
             };
-            gpu.upload_buffer(&pool.taps.0, tap_slice)?;
+            pool.gpu.upload_to(&pool.taps.0, tap_slice)?;
         }
         let (mut w_i, mut h_i) = (w as i32, h as i32);
         let (mut ox, mut oy) = (ox, oy);
         let mut rgba_ptr = rgba_handle;
-        let mut plane = pool.plane.0.handle();
-        let mut tmp = pool.tmp.0.handle();
+        let mut plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+        let mut tmp = pool.gpu.handle(Slot::Aux0).expect("tmp slot");
         if !composite {
             let mut gain = amount * super::grain::GRAIN_GAIN_V1;
-            launch2(gpu, "grain_v1_kernel", w, h, [
+            launch2(&mut pool.gpu, "grain_v1_kernel", w, h, [
                 ptr(&mut rgba_ptr),
                 ptr(&mut w_i),
                 ptr(&mut h_i),
@@ -571,10 +666,10 @@ pub(crate) fn grain_stage(
                 ptr(&mut ox),
                 ptr(&mut oy),
             ])?;
-            gpu.download_buffer(&pool.rgba.0, rgba)
+            pool.gpu.download(Slot::Frame, rgba)
         } else {
             launch2(
-                gpu,
+                &mut pool.gpu,
                 "grain_plane_kernel",
                 w,
                 h,
@@ -583,7 +678,7 @@ pub(crate) fn grain_stage(
             if !taps.is_empty() {
                 let mut r = radius;
                 let mut tap_ptr = tap_handle;
-                launch2(gpu, "grain_blur_h_kernel", w, h, [
+                launch2(&mut pool.gpu, "grain_blur_h_kernel", w, h, [
                     ptr(&mut plane),
                     ptr(&mut tmp),
                     ptr(&mut w_i),
@@ -591,7 +686,7 @@ pub(crate) fn grain_stage(
                     ptr(&mut r),
                     ptr(&mut tap_ptr),
                 ])?;
-                launch2(gpu, "grain_blur_v_kernel", w, h, [
+                launch2(&mut pool.gpu, "grain_blur_v_kernel", w, h, [
                     ptr(&mut tmp),
                     ptr(&mut plane),
                     ptr(&mut w_i),
@@ -601,37 +696,47 @@ pub(crate) fn grain_stage(
                 ])?;
             }
             // Row totals, then one block over the rows: deterministic order.
-            let stats = pool.nodes.0.handle();
-            let mut row_sum = stats;
-            let mut row_sq = stats + h as u64 * 4;
-            gpu.launch_raw("grain_row_stats_kernel", (h as u32, 1), (256, 1), &mut [
-                ptr(&mut plane),
-                ptr(&mut row_sum),
-                ptr(&mut row_sq),
-                ptr(&mut w_i),
-                ptr(&mut h_i),
-            ])?;
+            let row_base = pool.gpu.handle(Slot::Aux2).expect("row totals slot");
+            let mut row_sum = row_base;
+            let mut row_sq = row_base + h as u64 * 4;
+            pool.gpu.launch(
+                "grain_row_stats_kernel",
+                (h as u32, 1),
+                (256, 1),
+                &mut [
+                    ptr(&mut plane),
+                    ptr(&mut row_sum),
+                    ptr(&mut row_sq),
+                    ptr(&mut w_i),
+                    ptr(&mut h_i),
+                ],
+            )?;
             let mut inv_n = 1.0f32 / (w * h) as f32;
-            let mut sd_out = pool.stats.0.handle();
-            gpu.launch_raw("grain_reduce_stats_kernel", (1, 1), (256, 1), &mut [
-                ptr(&mut row_sum),
-                ptr(&mut row_sq),
-                ptr(&mut h_i),
-                ptr(&mut inv_n),
-                ptr(&mut sd_out),
-            ])?;
+            let mut sd_out = stats_handle;
+            pool.gpu.launch(
+                "grain_reduce_stats_kernel",
+                (1, 1),
+                (256, 1),
+                &mut [
+                    ptr(&mut row_sum),
+                    ptr(&mut row_sq),
+                    ptr(&mut h_i),
+                    ptr(&mut inv_n),
+                    ptr(&mut sd_out),
+                ],
+            )?;
             let mut sd_bytes = [0u8; 4];
-            gpu.download_buffer(&pool.stats.0, &mut sd_bytes)?;
+            pool.gpu.download_from(&pool.stats.0, &mut sd_bytes)?;
             let sd = f32::from_le_bytes(sd_bytes).max(1e-6);
             let mut gain = amount * adj.kind.v8_amplitude(adj.granularity) / (sd * 257.0);
-            launch2(gpu, "grain_v8_kernel", w, h, [
+            launch2(&mut pool.gpu, "grain_v8_kernel", w, h, [
                 ptr(&mut rgba_ptr),
                 ptr(&mut plane),
                 ptr(&mut w_i),
                 ptr(&mut h_i),
                 ptr(&mut gain),
             ])?;
-            gpu.download_buffer(&pool.rgba.0, rgba)
+            pool.gpu.download(Slot::Frame, rgba)
         }
     })
     .is_some()
@@ -798,278 +903,467 @@ mod tests {
         assert!(worst <= 1, "grain GPU/CPU difference {worst}/255");
     }
 
-    fn timed(iters: usize, mut run: impl FnMut()) -> f64 {
-        let started = Instant::now();
-        for _ in 0..iters {
-            run();
+    // ────────────────── P-08: five-segment end-to-end benchmark ──────────────────
+
+    /// 256², 1080p, 4K, 24 MP, 45 MP.
+    const P08_SIZES: [(usize, usize); 5] = [
+        (256, 256),
+        (1920, 1080),
+        (3840, 2160),
+        (6048, 4032),
+        (8192, 5464),
+    ];
+
+    fn p08_frame(w: usize, h: usize) -> Vec<[f32; 3]> {
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x * 13 + y * 7) % 251) as f32 / 255.0;
+                out.push([v, (v * 0.9 + 0.05).min(1.0), (v * 0.8 + 0.1).min(1.0)]);
+            }
         }
-        started.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        out
     }
 
-    fn sync(gpu: &Nvidia, pool: &Pool) -> Result<(), CudaError> {
-        let mut sink = [0u8; 4];
-        gpu.download_buffer(&pool.stats.0, &mut sink)
+    fn xs_table(w: usize, region: [f32; 4]) -> Vec<f32> {
+        (0..w)
+            .map(|x| region[0] + (x as f32 + 0.5) / w as f32 * region[2])
+            .collect()
     }
 
-    /// Queue `iters` launches and wait for the device before stopping the
-    /// clock, so the result is execution time rather than enqueue time.
-    fn timed_synced(
-        gpu: &Nvidia,
-        pool: &Pool,
-        iters: usize,
-        mut run: impl FnMut(),
-    ) -> f64 {
-        let started = Instant::now();
-        for _ in 0..iters {
-            run();
-        }
-        sync(gpu, pool).expect("sync");
-        started.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    fn ms(started: std::time::Instant) -> f64 {
+        started.elapsed().as_secs_f64() * 1000.0
     }
 
-    /// Kernel-only 24 MP timings. Uploads and the final download are outside
-    /// the loop, so the numbers are device execution time.
+    fn p50_p95(mut values: Vec<f64>) -> (f64, f64) {
+        values.sort_by(f64::total_cmp);
+        let pick = |q: f64| {
+            let index = ((values.len() as f64 - 1.0) * q).round() as usize;
+            values[index.min(values.len() - 1)]
+        };
+        (pick(0.5), pick(0.95))
+    }
+
+    /// The shipped default declines the cold vignette plane and says so; the
+    /// kernel itself stays callable (parity probes, future device develop).
     #[test]
-    #[ignore = "manual 24MP CUDA benchmark"]
-    fn bench_24mp() {
-        let (w, h) = (6000usize, 4000usize);
-        let iters = 20;
-        let bytes = w * h * 4;
-        let Some(real_lcc) = real_lcc() else { return; };
-        let grid = parse_light_falloff(&real_lcc).unwrap().unwrap();
-        let stage = lcc_stage(&grid, 1.0, LightFalloffLimit::Soft);
-        let gpu_grid = stage.gpu_grid();
-        let nodes = gpu_grid.columns * gpu_grid.rows;
-        let node_bytes = nodes * 12;
-        let grain = FilmGrain {
-            kind: GrainKind::SoftGrain,
-            impact: 100.0,
-            granularity: 50.0,
-            density: 0.0,
-        };
-        let rgba = gradient_rgba(w, h);
-
-        let mut results = Vec::new();
-        with_pool(bytes, node_bytes.max(h * 8), |pool| {
-            let gpu = pool.gpu.as_ref();
-            let (mut w_i, mut h_i) = (w as i32, h as i32);
-            let mut plane = pool.plane.0.handle();
-
-            // Vignette kernel.
-            let (mut vox, mut vsx) = (0.0f32, 1.0f32);
-            let (mut voy, mut vsy) = (0.0f32, 1.0f32);
-            let (mut amount, mut aspect) = (2.0f32, 1.5f32);
-            let (mut cx, mut cy) = (0.5f32, 0.5f32);
-            let mut method = 0i32;
-            let mut plane = plane;
-            let ms = timed_synced(gpu, pool, iters, || {
-                launch2(gpu, "vignette_gain_kernel", w, h, [
-                    super::ptr(&mut plane), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                    super::ptr(&mut vox), super::ptr(&mut vsx), super::ptr(&mut voy),
-                    super::ptr(&mut vsy), super::ptr(&mut amount), super::ptr(&mut aspect),
-                    super::ptr(&mut cx), super::ptr(&mut cy), super::ptr(&mut method),
-                ]).unwrap();
-            });
-            results.push(("vignette", ms));
-
-            // LCC kernel.
-            let mut packed = Vec::with_capacity(nodes * 3);
-            packed.extend_from_slice(&gpu_grid.luminance);
-            packed.extend_from_slice(&gpu_grid.slope_x);
-            packed.extend_from_slice(&gpu_grid.slope_y);
-            let raw = unsafe {
-                std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 4)
-            };
-            gpu.upload_buffer(&pool.nodes.0, raw).unwrap();
-            let node_handle = pool.nodes.0.handle();
-            let (mut columns, mut rows) = (gpu_grid.columns as i32, gpu_grid.rows as i32);
-            let (mut gox, mut goy) = (gpu_grid.origin[0], gpu_grid.origin[1]);
-            let (mut gsx, mut gsy) = (gpu_grid.step[0], gpu_grid.step[1]);
-            let (mut max_level, mut strength) = (gpu_grid.max_level, gpu_grid.strength);
-            let mut limit = 0i32;
-            let mut lum = node_handle;
-            let (mut slope_x, mut slope_y) =
-                (node_handle + nodes as u64 * 4, node_handle + nodes as u64 * 8);
-            let mut plane2 = plane;
-            let ms = timed_synced(gpu, pool, iters, || {
-                launch2(gpu, "lcc_gain_kernel", w, h, [
-                    super::ptr(&mut plane2), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                    super::ptr(&mut columns), super::ptr(&mut rows), super::ptr(&mut gox),
-                    super::ptr(&mut goy), super::ptr(&mut gsx), super::ptr(&mut gsy),
-                    super::ptr(&mut max_level), super::ptr(&mut strength), super::ptr(&mut limit),
-                    super::ptr(&mut lum), super::ptr(&mut slope_x), super::ptr(&mut slope_y),
-                ]).unwrap();
-            });
-            results.push(("lcc", ms));
-
-            // Grain chain: hash, blur h, blur v, stats, apply.
-            gpu.upload_buffer(&pool.rgba.0, &rgba).unwrap();
-            let sigma = grain.sigma_px();
-            let taps = super::super::grain::erf_taps(sigma);
-            let tap_raw = unsafe {
-                std::slice::from_raw_parts(taps.as_ptr() as *const u8, taps.len() * 4)
-            };
-            gpu.upload_buffer(&pool.taps.0, tap_raw).unwrap();
-            let mut rgba_handle = pool.rgba.0.handle();
-            let mut tmp = pool.tmp.0.handle();
-            let mut tap_handle = pool.taps.0.handle();
-            let mut r = (taps.len() / 2) as i32;
-            let (ox, oy) = super::super::grain::noise_offsets();
-            let (mut nox, mut noy) = (ox, oy);
-            let stats = pool.nodes.0.handle();
-            let mut row_sum = stats;
-            let mut row_sq = stats + h as u64 * 4;
-            let mut sd_out = pool.stats.0.handle();
-            let mut inv_n = 1.0f32 / (w * h) as f32;
-            let mut vgain = 0.1f32;
-            let ms = timed_synced(gpu, pool, iters, || {
-                launch2(gpu, "grain_plane_kernel", w, h, [
-                    super::ptr(&mut plane), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                    super::ptr(&mut nox), super::ptr(&mut noy),
-                ]).unwrap();
-                launch2(gpu, "grain_blur_h_kernel", w, h, [
-                    super::ptr(&mut plane), super::ptr(&mut tmp), super::ptr(&mut w_i),
-                    super::ptr(&mut h_i), super::ptr(&mut r), super::ptr(&mut tap_handle),
-                ]).unwrap();
-                launch2(gpu, "grain_blur_v_kernel", w, h, [
-                    super::ptr(&mut tmp), super::ptr(&mut plane), super::ptr(&mut w_i),
-                    super::ptr(&mut h_i), super::ptr(&mut r), super::ptr(&mut tap_handle),
-                ]).unwrap();
-                gpu.launch_raw("grain_row_stats_kernel", (h as u32, 1), (256, 1), &mut [
-                    super::ptr(&mut plane), super::ptr(&mut row_sum),
-                    super::ptr(&mut row_sq), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                ]).unwrap();
-                gpu.launch_raw("grain_reduce_stats_kernel", (1, 1), (256, 1), &mut [
-                    super::ptr(&mut row_sum), super::ptr(&mut row_sq),
-                    super::ptr(&mut h_i), super::ptr(&mut inv_n), super::ptr(&mut sd_out),
-                ]).unwrap();
-                launch2(gpu, "grain_v8_kernel", w, h, [
-                    super::ptr(&mut rgba_handle), super::ptr(&mut plane), super::ptr(&mut w_i),
-                    super::ptr(&mut h_i), super::ptr(&mut vgain),
-                ]).unwrap();
-            });
-            results.push(("grain(v8)", ms));
-
-            // Chained: vignette, lcc, grain in one queue.
-            let ms = timed_synced(gpu, pool, iters, || {
-                launch2(gpu, "vignette_gain_kernel", w, h, [
-                    super::ptr(&mut plane), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                    super::ptr(&mut vox), super::ptr(&mut vsx), super::ptr(&mut voy),
-                    super::ptr(&mut vsy), super::ptr(&mut amount), super::ptr(&mut aspect),
-                    super::ptr(&mut cx), super::ptr(&mut cy), super::ptr(&mut method),
-                ]).unwrap();
-                launch2(gpu, "lcc_gain_kernel", w, h, [
-                    super::ptr(&mut plane2), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                    super::ptr(&mut columns), super::ptr(&mut rows), super::ptr(&mut gox),
-                    super::ptr(&mut goy), super::ptr(&mut gsx), super::ptr(&mut gsy),
-                    super::ptr(&mut max_level), super::ptr(&mut strength), super::ptr(&mut limit),
-                    super::ptr(&mut lum), super::ptr(&mut slope_x), super::ptr(&mut slope_y),
-                ]).unwrap();
-                launch2(gpu, "grain_plane_kernel", w, h, [
-                    super::ptr(&mut plane), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                    super::ptr(&mut nox), super::ptr(&mut noy),
-                ]).unwrap();
-                launch2(gpu, "grain_blur_h_kernel", w, h, [
-                    super::ptr(&mut plane), super::ptr(&mut tmp), super::ptr(&mut w_i),
-                    super::ptr(&mut h_i), super::ptr(&mut r), super::ptr(&mut tap_handle),
-                ]).unwrap();
-                launch2(gpu, "grain_blur_v_kernel", w, h, [
-                    super::ptr(&mut tmp), super::ptr(&mut plane), super::ptr(&mut w_i),
-                    super::ptr(&mut h_i), super::ptr(&mut r), super::ptr(&mut tap_handle),
-                ]).unwrap();
-                gpu.launch_raw("grain_row_stats_kernel", (h as u32, 1), (256, 1), &mut [
-                    super::ptr(&mut plane), super::ptr(&mut row_sum),
-                    super::ptr(&mut row_sq), super::ptr(&mut w_i), super::ptr(&mut h_i),
-                ]).unwrap();
-                gpu.launch_raw("grain_reduce_stats_kernel", (1, 1), (256, 1), &mut [
-                    super::ptr(&mut row_sum), super::ptr(&mut row_sq),
-                    super::ptr(&mut h_i), super::ptr(&mut inv_n), super::ptr(&mut sd_out),
-                ]).unwrap();
-                launch2(gpu, "grain_v8_kernel", w, h, [
-                    super::ptr(&mut rgba_handle), super::ptr(&mut plane), super::ptr(&mut w_i),
-                    super::ptr(&mut h_i), super::ptr(&mut vgain),
-                ]).unwrap();
-            });
-            results.push(("chain", ms));
-            Ok(())
-        })
-        .expect("24MP pool");
-
-        for (name, ms) in results {
-            println!("{name}: {ms:.2} ms / 24MP");
+    fn shipped_vignette_plane_declines_and_reports() {
+        if std::env::var_os("AURORA_PIXEL_VIGNETTE_GPU").is_some() {
+            eprintln!("skipping: AURORA_PIXEL_VIGNETTE_GPU is set");
+            return;
         }
-        let end_to_end = {
-            let ms = |run: &mut dyn FnMut()| timed(3, || run());
-            let mut plane = || {
-                let _ = vignette_plane(
-                    w, h, [0.0, 0.0, 1.0, 1.0],
-                    VignetteMethod::EllipticOnCrop, 2.0, 1.5, [0.5, 0.5],
-                );
-            };
-            let mut lcc = || {
-                let _ = lcc_plane(&gpu_grid, w, h);
-            };
-            let mut grain_run = || {
-                let mut buf = rgba.clone();
-                grain_stage(&mut buf, w, h, &grain, 1.0);
-            };
-            (
-                ms(&mut plane),
-                ms(&mut lcc),
-                ms(&mut grain_run),
-            )
-        };
-        println!(
-            "end-to-end vignette {:.2} ms, lcc {:.2} ms, grain {:.2} ms (incl. copies)",
-            end_to_end.0, end_to_end.1, end_to_end.2
-        );
-        // Warm-cache path: a slider that does not move the gain planes.
-        let _ = vignette_plane_cached(
+        super::super::gpu_runtime::reset_fallback();
+        let (w, h) = (97usize, 61usize);
+        let plane = vignette_plane_cached(
             w, h, [0.0, 0.0, 1.0, 1.0],
             VignetteMethod::EllipticOnCrop, 2.0, 1.5, [0.5, 0.5],
         );
-        let _ = lcc_plane_cached(&gpu_grid, w, h);
-        let warm_vignette = timed(5, || {
-            let _ = vignette_plane_cached(
-                w, h, [0.0, 0.0, 1.0, 1.0],
-                VignetteMethod::EllipticOnCrop, 2.0, 1.5, [0.5, 0.5],
-            );
-        });
-        let warm_lcc = timed(5, || {
-            let _ = lcc_plane_cached(&gpu_grid, w, h);
-        });
-        println!(
-            "cached-hit vignette {warm_vignette:.3} ms, lcc {warm_lcc:.3} ms (no copy)"
+        assert!(plane.is_none(), "shipped default must stay on the CPU formula");
+        let report = super::super::gpu_runtime::fallback_snapshot();
+        assert_eq!(
+            report.last.iter().find(|(name, _)| *name == "pixel_vignette").unwrap().1,
+            "disabled"
         );
-        let cpu_vignette = timed(1, || {
-            let mut sink = 0.0f32;
-            for y in 0..h {
-                let fy = (y as f32 + 0.5) / h as f32;
-                for x in 0..w {
-                    let fx = (x as f32 + 0.5) / w as f32;
-                    sink += vignette_gain(
-                        fx, fy, VignetteMethod::EllipticOnCrop, 2.0, 1.5, [0.5, 0.5],
-                    );
-                }
-            }
-            std::hint::black_box(sink);
-        });
-        let cpu_lcc = timed(1, || {
-            let mut sink = 0.0f32;
-            for y in 0..h {
-                for x in 0..w {
-                    sink += stage.source_gain([x as f32, y as f32]);
-                }
-            }
-            std::hint::black_box(sink);
-        });
-        let mut cpu_grain_buf = rgba.clone();
-        let cpu_grain = timed(1, || {
-            super::super::grain::stage(&mut cpu_grain_buf, w, h, &grain, 1.0);
-        });
-        println!(
-            "CPU single-thread vignette {cpu_vignette:.2} ms, lcc {cpu_lcc:.2} ms; rayon grain {cpu_grain:.2} ms"
-        );
+        // The direct entry point is not gated: parity/tests can still ask.
+        assert!(vignette_plane(
+            w, h, [0.0, 0.0, 1.0, 1.0],
+            VignetteMethod::EllipticOnCrop, 2.0, 1.5, [0.5, 0.5],
+        )
+        .is_some());
+        super::super::gpu_runtime::reset_fallback();
     }
 
+    /// Real develop-loop consumption shape: formula inline, three multiplies.
+    fn cpu_vignette_fused(
+        frame: &mut [[f32; 3]],
+        w: usize,
+        h: usize,
+        region: [f32; 4],
+        xs: &[f32],
+        method: VignetteMethod,
+        amount: f32,
+        aspect: f32,
+        center: [f32; 2],
+    ) -> f64 {
+        use rayon::prelude::*;
+        let started = Instant::now();
+        frame.par_chunks_mut(w).enumerate().for_each(|(y, line)| {
+            let fy = region[1] + (y as f32 + 0.5) / h as f32 * region[3];
+            for (x, px) in line.iter_mut().enumerate() {
+                let g = vignette_gain(xs[x], fy, method, amount, aspect, center);
+                *px = [px[0] * g, px[1] * g, px[2] * g];
+            }
+        });
+        ms(started)
+    }
+
+    fn cpu_vignette_plane(
+        w: usize,
+        h: usize,
+        region: [f32; 4],
+        xs: &[f32],
+        method: VignetteMethod,
+        amount: f32,
+        aspect: f32,
+        center: [f32; 2],
+    ) -> (Vec<f32>, f64) {
+        use rayon::prelude::*;
+        let started = Instant::now();
+        let mut plane = vec![0.0f32; w * h];
+        plane.par_chunks_mut(w).enumerate().for_each(|(y, line)| {
+            let fy = region[1] + (y as f32 + 0.5) / h as f32 * region[3];
+            for (x, value) in line.iter_mut().enumerate() {
+                *value = vignette_gain(xs[x], fy, method, amount, aspect, center);
+            }
+        });
+        (plane, ms(started))
+    }
+
+    fn consume_plane(frame: &mut [[f32; 3]], plane: &[f32], w: usize) -> f64 {
+        use rayon::prelude::*;
+        let started = Instant::now();
+        frame
+            .par_chunks_mut(w)
+            .enumerate()
+            .for_each(|(y, line)| {
+                let base = y * w;
+                for (x, px) in line.iter_mut().enumerate() {
+                    let g = plane[base + x];
+                    *px = [px[0] * g, px[1] * g, px[2] * g];
+                }
+            });
+        ms(started)
+    }
+
+    fn consume_lcc_plane(frame: &mut [[f32; 3]], plane: &[f32], w: usize, h: usize) -> f64 {
+        use rayon::prelude::*;
+        let started = Instant::now();
+        frame.par_chunks_mut(w).enumerate().for_each(|(y, line)| {
+            for (x, px) in line.iter_mut().enumerate() {
+                let g = sample_plane(plane, w, h, x as f32, y as f32);
+                *px = [px[0] * g, px[1] * g, px[2] * g];
+            }
+        });
+        ms(started)
+    }
+
+    fn cpu_lcc_fused(
+        frame: &mut [[f32; 3]],
+        w: usize,
+        stage: &UniformLight<'_>,
+    ) -> f64 {
+        use rayon::prelude::*;
+        let started = Instant::now();
+        frame.par_chunks_mut(w).enumerate().for_each(|(y, line)| {
+            for (x, px) in line.iter_mut().enumerate() {
+                let g = stage.source_gain([x as f32, y as f32]);
+                *px = [px[0] * g, px[1] * g, px[2] * g];
+            }
+        });
+        ms(started)
+    }
+
+    /// Device-side segments: kernel-only time (queued launches + one 4 B sync),
+    /// then a measured plane download. Upload is measured by the caller.
+    #[cfg(windows)]
+    #[allow(clippy::type_complexity)]
+    fn gpu_vignette_segments(
+        w: usize,
+        h: usize,
+        region: [f32; 4],
+        method: VignetteMethod,
+        amount: f32,
+        aspect: f32,
+        center: [f32; 2],
+        iters: usize,
+    ) -> Option<(f64, f64, Vec<f32>)> {
+        let code = match method {
+            VignetteMethod::EllipticOnCrop => 0,
+            VignetteMethod::Circular | VignetteMethod::CircularCrop => 1,
+        };
+        let bytes = w * h * 4;
+        with_pool(bytes, 0, 0, |pool| {
+            let mut sink = [0u8; 4];
+            let idle = {
+                let started = Instant::now();
+                pool.gpu.download_from(&pool.stats.0, &mut sink)?;
+                ms(started)
+            };
+            let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+            let started = Instant::now();
+            for _ in 0..iters {
+                launch_vignette(&mut pool.gpu, plane, w, h, region, code, amount, aspect, center)?;
+            }
+            pool.gpu.download_from(&pool.stats.0, &mut sink)?;
+            let kernel = (ms(started) / iters as f64 - idle).max(0.0);
+            launch_vignette(&mut pool.gpu, plane, w, h, region, code, amount, aspect, center)?;
+            pool.gpu.download_from(&pool.stats.0, &mut sink)?;
+            let mut out = vec![0.0f32; w * h];
+            let out_bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4)
+            };
+            let started = Instant::now();
+            pool.gpu.download(Slot::Scratch, out_bytes)?;
+            let download = ms(started);
+            Ok((kernel, download, out))
+        })
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::type_complexity)]
+    fn gpu_lcc_segments(
+        grid: &GpuLccGrid,
+        w: usize,
+        h: usize,
+        iters: usize,
+    ) -> Option<(f64, f64, f64, Vec<f32>)> {
+        let bytes = w * h * 4;
+        let nodes = grid.columns * grid.rows;
+        let node_bytes = nodes * 12;
+        with_pool(bytes, node_bytes, 0, |pool| {
+            let packed = pack_lcc_nodes(grid, nodes);
+            let raw = unsafe {
+                std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 4)
+            };
+            let started = Instant::now();
+            pool.gpu.upload(Slot::Aux2, raw)?;
+            let upload = ms(started);
+            let mut sink = [0u8; 4];
+            let idle = {
+                let started = Instant::now();
+                pool.gpu.download_from(&pool.stats.0, &mut sink)?;
+                ms(started)
+            };
+            let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+            let nodes_handle = pool.gpu.handle(Slot::Aux2).expect("node slot");
+            let started = Instant::now();
+            for _ in 0..iters {
+                launch_lcc(&mut pool.gpu, plane, nodes_handle, grid, nodes, w, h)?;
+            }
+            pool.gpu.download_from(&pool.stats.0, &mut sink)?;
+            let kernel = (ms(started) / iters as f64 - idle).max(0.0);
+            launch_lcc(&mut pool.gpu, plane, nodes_handle, grid, nodes, w, h)?;
+            pool.gpu.download_from(&pool.stats.0, &mut sink)?;
+            let mut out = vec![0.0f32; w * h];
+            let out_bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4)
+            };
+            let started = Instant::now();
+            pool.gpu.download(Slot::Scratch, out_bytes)?;
+            let download = ms(started);
+            Ok((upload, kernel, download, out))
+        })
+    }
+
+    /// P-08: vignette/LCC gain plane, five segments, cold parameter change,
+    /// CPU formula vs GPU plane, 256²…45 MP. Release-mode numbers only.
+    ///
+    /// `cargo test -p aurora-engine --release --lib bench_p08_gain_plane \
+    ///  -- --ignored --nocapture --test-threads=1`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "P-08 end-to-end gain-plane benchmark; run in Release with --ignored"]
+    fn bench_p08_gain_plane() {
+        use crate::testdata;
+        // Measure the GPU path itself, independent of the shipped default.
+        unsafe { std::env::set_var("AURORA_PIXEL_VIGNETTE_GPU", "1") };
+        let region = [0.0f32, 0.0, 1.0, 1.0];
+        let (method, amount, aspect, center) =
+            (VignetteMethod::EllipticOnCrop, 2.0f32, 1.5f32, [0.5f32, 0.5f32]);
+        let lcc_source = testdata::bytes("testdata/real-lightfalloff-24x16.lcc");
+        let lcc_grid = lcc_source
+            .as_deref()
+            .and_then(|bytes| parse_light_falloff(bytes).ok().flatten());
+        let lcc_stage = lcc_grid.as_ref().and_then(|grid| {
+            UniformLight::prepare(Some(grid), true, 1.0, LightFalloffLimit::Soft)
+        });
+        let runs = 5usize;
+        let metrics = aurora_portrait::cuda::driver_metrics();
+        println!(
+            "P08 start runs={runs} kernel_loads={} h2d={} d2h={}",
+            metrics.ptx_module_load_calls, metrics.host_to_device_bytes, metrics.device_to_host_bytes
+        );
+        for (w, h) in P08_SIZES {
+            let base = p08_frame(w, h);
+            let xs = xs_table(w, region);
+            let px = (w * h) as f64 / 1e6;
+            // Warm the pool, the module and the plane cache so p50 is a
+            // steady-state number (the first call pays JIT + first-touch).
+            let _ = vignette_plane(w, h, region, method, amount, aspect, center);
+            let _ = vignette_plane_cached(w, h, region, method, amount, aspect, center);
+
+            // CPU: fused formula (production shape) and split generation/consume.
+            let mut cpu_fused = Vec::new();
+            let mut cpu_gen = Vec::new();
+            let mut cpu_cons = Vec::new();
+            for _ in 0..runs {
+                let mut frame = base.clone();
+                cpu_fused.push(cpu_vignette_fused(
+                    &mut frame, w, h, region, &xs, method, amount, aspect, center,
+                ));
+                let (plane, gen_ms) =
+                    cpu_vignette_plane(w, h, region, &xs, method, amount, aspect, center);
+                cpu_gen.push(gen_ms);
+                let mut frame = base.clone();
+                cpu_cons.push(consume_plane(&mut frame, &plane, w));
+            }
+            let (cpu_fused_p50, cpu_fused_p95) = p50_p95(cpu_fused);
+            let (cpu_gen_p50, _) = p50_p95(cpu_gen);
+            let (cpu_cons_p50, _) = p50_p95(cpu_cons);
+
+            // GPU: cold plane call (alloc + kernel + sync D2H) + consume.
+            let mut gpu_e2e = Vec::new();
+            let mut gpu_kernel = 0.0;
+            let mut gpu_download = 0.0;
+            let mut gpu_cons = 0.0;
+            let mut gpu_plane_call = 0.0;
+            for _ in 0..runs {
+                let mut frame = base.clone();
+                let started = Instant::now();
+                let plane = vignette_plane(w, h, region, method, amount, aspect, center)
+                    .expect("CUDA vignette plane");
+                gpu_plane_call = ms(started);
+                gpu_cons = consume_plane(&mut frame, &plane, w);
+                gpu_e2e.push(gpu_plane_call + gpu_cons);
+            }
+            if let Some((kernel, download, _plane)) =
+                gpu_vignette_segments(w, h, region, method, amount, aspect, center, 8)
+            {
+                gpu_kernel = kernel;
+                gpu_download = download;
+            }
+            let (gpu_p50, gpu_p95) = p50_p95(gpu_e2e);
+            // Warm cache: a slider that does not touch the plane.
+            let mut warm_e2e = Vec::new();
+            let mut warm_hit = 0.0;
+            for _ in 0..runs {
+                let mut frame = base.clone();
+                let started = Instant::now();
+                let plane =
+                    vignette_plane_cached(w, h, region, method, amount, aspect, center)
+                        .expect("cached vignette plane");
+                warm_hit = ms(started);
+                let consumed = consume_plane(&mut frame, &plane, w);
+                warm_e2e.push(warm_hit + consumed);
+            }
+            let (warm_p50, _) = p50_p95(warm_e2e);
+            println!(
+                "P08 vignette {w}x{h} ({px:.1} MP) cpu_fused p50={cpu_fused_p50:.2} p95={cpu_fused_p95:.2} | \
+cpu_gen={cpu_gen_p50:.2} consume={cpu_cons_p50:.2} | gpu kernel={gpu_kernel:.2} \
+download={gpu_download:.2} consume={gpu_cons:.2} planecall={gpu_plane_call:.2} \
+e2e p50={gpu_p50:.2} p95={gpu_p95:.2} | warm_hit={warm_hit:.3} warm_e2e p50={warm_p50:.2} | \
+h2d=0 d2h={} | gpu/cpu={:.2} warm/cpu={:.2}",
+                w * h * 4,
+                gpu_p50 / cpu_fused_p50,
+                warm_p50 / cpu_fused_p50,
+            );
+
+            // LCC: plane is per source pixel, so 1:1 frame == source size.
+            if let Some(stage) = lcc_stage.as_ref() {
+                let gpu_grid = stage.gpu_grid();
+                let _ = lcc_plane(&gpu_grid, w, h);
+                let _ = lcc_plane_cached(&gpu_grid, w, h);
+                let mut cpu_fused = Vec::new();
+                for _ in 0..runs {
+                    let mut frame = base.clone();
+                    cpu_fused.push(cpu_lcc_fused(&mut frame, w, stage));
+                }
+                let (cpu_p50, cpu_p95) = p50_p95(cpu_fused);
+                let mut gpu_e2e = Vec::new();
+                let mut gpu_cons = 0.0;
+                let mut gpu_call = 0.0;
+                for _ in 0..runs {
+                    let mut frame = base.clone();
+                    let started = Instant::now();
+                    let plane = lcc_plane(&gpu_grid, w, h).expect("CUDA LCC plane");
+                    gpu_call = ms(started);
+                    gpu_cons = consume_lcc_plane(&mut frame, &plane, w, h);
+                    gpu_e2e.push(gpu_call + gpu_cons);
+                }
+                let segments = gpu_lcc_segments(&gpu_grid, w, h, 8);
+                let (upload, kernel, download) = segments
+                    .as_ref()
+                    .map(|(u, k, d, _)| (*u, *k, *d))
+                    .unwrap_or((0.0, 0.0, 0.0));
+                let (gpu_p50, gpu_p95) = p50_p95(gpu_e2e);
+                let mut warm_e2e = Vec::new();
+                let mut warm_hit = 0.0;
+                for _ in 0..runs {
+                    let mut frame = base.clone();
+                    let started = Instant::now();
+                    let plane =
+                        lcc_plane_cached(&gpu_grid, w, h).expect("cached LCC plane");
+                    warm_hit = ms(started);
+                    let consumed = consume_lcc_plane(&mut frame, &plane, w, h);
+                    warm_e2e.push(warm_hit + consumed);
+                }
+                let (warm_p50, _) = p50_p95(warm_e2e);
+                println!(
+                    "P08 lcc {w}x{h} ({px:.1} MP) cpu_fused p50={cpu_p50:.2} p95={cpu_p95:.2} | \
+gpu upload={upload:.2} kernel={kernel:.2} download={download:.2} consume={gpu_cons:.2} \
+planecall={gpu_call:.2} e2e p50={gpu_p50:.2} p95={gpu_p95:.2} | warm_hit={warm_hit:.3} \
+warm_e2e p50={warm_p50:.2} | h2d={} d2h={} | gpu/cpu={:.2} warm/cpu={:.2}",
+                    gpu_grid.columns * gpu_grid.rows * 12,
+                    w * h * 4,
+                    gpu_p50 / cpu_p50,
+                    warm_p50 / cpu_p50,
+                );
+            }
+        }
+
+        // Preview shape: a 24 MP LCC plane consumed at 1080p output vs the CPU
+        // grid formula at 1080p (what `linear_edits` really runs today).
+        if let Some(stage) = lcc_stage.as_ref() {
+            let gpu_grid = stage.gpu_grid();
+            let (sw, sh) = (6048usize, 4032usize);
+            let (ow, oh) = (1920usize, 1080usize);
+            let out = p08_frame(ow, oh);
+            let _ = lcc_plane(&gpu_grid, sw, sh);
+            let _ = lcc_plane_cached(&gpu_grid, sw, sh);
+            let mut cpu = Vec::new();
+            for _ in 0..5 {
+                let mut frame = out.clone();
+                cpu.push(cpu_lcc_fused(&mut frame, ow, stage));
+            }
+            let mut gpu = Vec::new();
+            for _ in 0..5 {
+                let mut frame = out.clone();
+                let started = Instant::now();
+                let plane = lcc_plane(&gpu_grid, sw, sh).expect("CUDA LCC plane");
+                let produced = ms(started);
+                let consumed = consume_lcc_plane(&mut frame, &plane, ow, oh);
+                gpu.push(produced + consumed);
+            }
+            let mut warm = Vec::new();
+            for _ in 0..5 {
+                let mut frame = out.clone();
+                let started = Instant::now();
+                let plane = lcc_plane_cached(&gpu_grid, sw, sh).expect("cached LCC plane");
+                let hit = ms(started);
+                let consumed = consume_lcc_plane(&mut frame, &plane, ow, oh);
+                warm.push(hit + consumed);
+            }
+            let (cpu_p50, _) = p50_p95(cpu);
+            let (gpu_p50, _) = p50_p95(gpu);
+            let (warm_p50, _) = p50_p95(warm);
+            println!(
+                "P08 lcc preview 24MP plane -> 1080p out: cpu_grid p50={cpu_p50:.2} gpu p50={gpu_p50:.2} \
+warm p50={warm_p50:.2} cold_ratio={:.2} warm_ratio={:.2}",
+                gpu_p50 / cpu_p50,
+                warm_p50 / cpu_p50
+            );
+        }
+
+        if let Some((device, cc, counters, kernels)) = stage_snapshot() {
+            println!(
+                "P08 runtime device={device} cc={cc:?} uploads={} downloads={} h2d_bytes={} d2h_bytes={} launches={} syncs={} kernels={kernels:?}",
+                counters.uploads,
+                counters.downloads,
+                counters.h2d_bytes,
+                counters.d2h_bytes,
+                counters.launches,
+                counters.syncs,
+            );
+        }
+    }
 }
