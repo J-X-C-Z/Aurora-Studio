@@ -44,7 +44,9 @@ use aurora_portrait::kernels::teeth_blend::AlignmentFinalBlendJob;
 use aurora_portrait::{Access, Image, Refusal};
 
 use crate::wrinkle_legacy::WrinkleProducerInputs;
-use crate::portrait_makeup_bundle::{B3_MAKEUP_ROWS, OwnedMakeupBundle};
+use crate::portrait_makeup_bundle::{
+    B3_MAKEUP_ROWS, OwnedMakeupBundle, suit_pass_kind_for_effect,
+};
 use crate::NormRect;
 
 #[path = "portrait_slim_stage.rs"]
@@ -3006,12 +3008,10 @@ pub fn produce_suit_pass<'a>(
         mask_channel,
     };
 
-    let kind = match plan.effect {
-        "BlusherImageMakeup"
-        | "NormalEyeBrowImageMakeup"
-        | "SymEyeImageMakeup"
-        | "SymEyeLashImageMakeup"
-        | "LipStickImageMakeup" => {
+    let kind = match suit_pass_kind_for_effect(plan.effect)
+        .map_err(|_| Refusal::ValueOutOfRange("suit pass effect"))?
+    {
+        SuitPassKindInput::Image { .. } => {
             required(plan.material_path, "suit material path")?;
             let material = required(inputs.material, "suit material")?;
             material.validate()?;
@@ -3022,8 +3022,10 @@ pub fn produce_suit_pass<'a>(
                 material_uv: Some(material_uv),
             }
         }
-        "LipColor" => SuitPassKindInput::Color,
-        _ => SuitPassKindInput::Unavailable("suit pass effect"),
+        SuitPassKindInput::Color => SuitPassKindInput::Color,
+        // The shared router never returns Unavailable; keep the arm so the
+        // match is exhaustive if a future route adds a new kind.
+        other => other,
     };
 
     let skip_shelter_query = plan.force_use_shelter == Some(true)

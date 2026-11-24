@@ -71,6 +71,40 @@ pub fn recovered_filter_type(pf: u32, source_effect: &str) -> Option<u32> {
         .map(|(_, filter_type)| *filter_type)
 }
 
+/// Preset rows whose `FilterType` is not fixed for the PF. A vendor PF can
+/// ship several preset rows that select different blend macros, so the macro is
+/// per preset, not per PF. PF90032 eye makeup presets use Multiply 41, SoftLight
+/// 42 and Screen 44 (`cfg:Makeups/Eyemakeup/...`).
+pub const PRESET_FILTER_TYPE_SETS: [(u32, &str, &[u32]); 1] =
+    [(90032, "SymEyeImageMakeup", &[41, 42, 44])];
+
+/// Accepted `FilterType` values for one `(pf, selected preset variant)`.
+///
+/// When the caller supplies a preset macro this is the set it must belong to,
+/// which keeps a foreign macro from silently changing pixels. Rows without an
+/// explicit multi-value entry accept the single recovered value. `None` means
+/// the variant has no recovered preset macro; a route-valid caller-supplied one
+/// is then required (PF107 `LipColor`).
+pub fn preset_filter_types(pf: u32, source_effect: &str) -> Option<&'static [u32]> {
+    for (row_pf, effect, values) in PRESET_FILTER_TYPE_SETS {
+        if row_pf == pf && effect == source_effect {
+            return Some(values);
+        }
+    }
+    const ONLY_11: &[u32] = &[11];
+    const ONLY_40: &[u32] = &[40];
+    const ONLY_41: &[u32] = &[41];
+    const ONLY_42: &[u32] = &[42];
+    let single: &'static [u32] = match recovered_filter_type(pf, source_effect)? {
+        11 => ONLY_11,
+        40 => ONLY_40,
+        41 => ONLY_41,
+        42 => ONLY_42,
+        _ => return None,
+    };
+    Some(single)
+}
+
 /// A named rejection from the external provider boundary. `code` is stable for
 /// host/UI reporting; `job_id` and `pf` identify the rejected row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,12 +514,19 @@ fn check_filter_type(
         )
     };
 
+    let preset_filter_type = preset_filter_types(row.pf, row.source_effect);
+
     // Zero is the "caller did not select a preset macro" sentinel. The route
     // rejects it outright for preset-driven rows, so it is only ever usable as
-    // an injection request.
+    // an injection request. Fall back to the recovered single-value table only
+    // when there is no preset macro to read.
     let effective = if row.filter_type == 0 {
-        recovered_filter_type(row.pf, row.source_effect)
-            .ok_or_else(|| refuse(Refusal::MissingInput(PROVIDER_FILTER_TYPE)))?
+        if let Some(preset) = preset_filter_type {
+            preset[0]
+        } else {
+            recovered_filter_type(row.pf, row.source_effect)
+                .ok_or_else(|| refuse(Refusal::MissingInput(PROVIDER_FILTER_TYPE)))?
+        }
     } else {
         row.filter_type
     };
@@ -507,8 +548,12 @@ fn check_filter_type(
         return Err(refuse(Refusal::ValueOutOfRange(PROVIDER_FILTER_TYPE)));
     }
 
-    if let Some(expected) = recovered_filter_type(row.pf, row.source_effect) {
-        if effective != expected {
+    // The preset's own macro is authoritative when it is available; the
+    // single-value table is the fallback for rows without per-preset data.
+    // A macro outside the accepted set gets a named refusal instead of being
+    // rewritten, so a wrong value can never silently change pixels.
+    if let Some(accepted) = preset_filter_type {
+        if !accepted.contains(&effective) {
             return Err(refuse(Refusal::ValueOutOfRange(PROVIDER_FILTER_TYPE)));
         }
     }
@@ -1023,5 +1068,105 @@ mod tests {
             error.cause,
             Some(Refusal::MissingInput(MATERIAL_PNG_MISSING))
         );
+    }
+
+    // --- per-preset FilterType (loader wiring) -------------------------------
+
+    /// Sets the PF90032 row in a complete 14-row job to a preset macro.
+    fn with_pf90032_filter_type(rows: &mut [ExternalMakeupRow<'static>], filter_type: u32) {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.pf == 90032)
+            .expect("PF90032 row");
+        row.source_effect = "SymEyeImageMakeup";
+        row.filter_type = filter_type;
+    }
+
+    #[test]
+    fn pf90032_accepts_vendor_preset_filter_types_42_and_44() {
+        for filter_type in [42, 44] {
+            let mut rows = complete_rows();
+            with_pf90032_filter_type(&mut rows, filter_type);
+            let bundle = ExternalMakeupProvider::build(Some(job(&rows)))
+                .unwrap_or_else(|error| panic!("preset FilterType {filter_type} refused: {error}"));
+            let row = bundle
+                .rows
+                .iter()
+                .find(|row| row.profile.pf == 90032)
+                .expect("PF90032 row");
+            assert_eq!(row.filter_type, filter_type);
+        }
+        // The old single-value table did not contain either value.
+        assert_eq!(recovered_filter_type(90032, "SymEyeImageMakeup"), Some(41));
+    }
+
+    #[test]
+    fn pf90032_unknown_preset_filter_type_is_named_refused() {
+        let mut rows = complete_rows();
+        with_pf90032_filter_type(&mut rows, 99);
+        let error = ExternalMakeupProvider::build(Some(job(&rows))).unwrap_err();
+        assert_eq!(error.code, PROVIDER_FILTER_TYPE);
+        assert_eq!(error.pf, Some(90032));
+        assert_eq!(error.job_id, JOB);
+        assert_eq!(error.cause, Some(Refusal::ValueOutOfRange(PROVIDER_FILTER_TYPE)));
+    }
+
+    #[test]
+    fn rows_without_preset_data_fall_back_to_the_single_value_table() {
+        // PF111 has one recovered macro and no per-preset set: a foreign value
+        // must still be refused, and zero still injects 40.
+        assert_eq!(preset_filter_types(111, "EyePupilMakeup"), Some(&[40][..]));
+        let rows = complete_rows();
+        let bundle = ExternalMakeupProvider::build(Some(job(&rows))).unwrap();
+        let pf111 = bundle
+            .rows
+            .iter()
+            .find(|row| row.profile.pf == 111)
+            .expect("PF111 row");
+        assert_eq!(pf111.filter_type, 40);
+        let mut rows = complete_rows();
+        rows.iter_mut()
+            .find(|row| row.pf == 111)
+            .expect("PF111 row")
+            .filter_type = 11;
+        assert_eq!(
+            ExternalMakeupProvider::build(Some(job(&rows))).unwrap_err().code,
+            PROVIDER_FILTER_TYPE
+        );
+    }
+
+    #[test]
+    fn decoded_loader_value_feeds_preset_filter_lookup() {
+        // Inline decoded effect.json row: the loader owns parsing, the provider
+        // owns acceptance. A PF90032 row carrying FilterType=44 must pass.
+        const EFFECT_JSON: &str = r#"{
+          "Effects": [
+            {"EffectName":"SymEyeImageMakeup","ParamFlag":90032,"FilterType":44,
+             "Paths":["yyz.png"],"ROIRect":[200,400,300,300],
+             "Opacity":80,"DefaultDegree":70}
+          ]
+        }"#;
+        let effects = crate::portrait_vendor_config::parse_config(
+            "Makeups/Eyemakeup/MUEM00000003/effect.json",
+            EFFECT_JSON,
+        )
+        .expect("inline effect.json");
+        let index = crate::portrait_vendor_config::VendorConfigIndex::from_effects(effects);
+        let effect = index
+            .for_pf(90032)
+            .next()
+            .expect("PF90032 entry from decoded config");
+        let filter_type = effect.filter_type.expect("preset FilterType") as u32;
+        assert_eq!(filter_type, 44);
+        assert_eq!(effect.effect_name, "SymEyeImageMakeup");
+        let mut rows = complete_rows();
+        with_pf90032_filter_type(&mut rows, filter_type);
+        let bundle = ExternalMakeupProvider::build(Some(job(&rows))).expect("loader-driven macro");
+        let row = bundle
+            .rows
+            .iter()
+            .find(|row| row.profile.pf == 90032)
+            .expect("PF90032 row");
+        assert_eq!(row.filter_type, 44);
     }
 }

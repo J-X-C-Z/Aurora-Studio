@@ -1256,6 +1256,34 @@ pub struct SuitPassBindingContract {
     pub region: &'static str,
 }
 
+/// The pass kind each declared effect family resolves to at production time.
+///
+/// A name is admitted only when a matching image or color pass consumer exists.
+/// Families without a consumer are refused by name in `require_executable`, so
+/// a static executable count can no longer overstate what can be produced.
+pub fn suit_pass_kind_for_effect(effect: &str) -> Result<SuitPassKindInput<'static>, Refusal> {
+    Ok(match effect {
+        "BlusherImageMakeup"
+        | "NormalEyeBrowImageMakeup"
+        | "NormalEyeImageMakeup"
+        | "NormalEyeLashImageMakeup"
+        | "SymEyeImageMakeup"
+        | "SymEyeLashImageMakeup"
+        | "SymEyeLashColorMakeup"
+        | "EyePupilMakeup"
+        | "LipStickImageMakeup" => SuitPassKindInput::Image {
+            material: None,
+            material_uv: None,
+        },
+        "LipColor" => SuitPassKindInput::Color,
+        // Declared in the vendor presets but never dispatched to a pixel
+        // consumer: SilkWorm, SymEyeBrowImageMakeup, 3DMMFaceSticker. The
+        // refusal is returned by the static gate; the producer keeps an
+        // explicit Unavailable arm for defence in depth.
+        _ => return Err(Refusal::ValueOutOfRange("suit pass effect")),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnedSuitPass {
     pub preset_id: String,
@@ -1313,23 +1341,12 @@ impl OwnedSuitPass {
         if self.material_paths.is_empty() {
             return Err(Refusal::MissingInput("suit material"));
         }
-        if !matches!(
-            self.effect.as_str(),
-            "BlusherImageMakeup"
-                | "EyePupilMakeup"
-                | "LipColor"
-                | "LipStickImageMakeup"
-                | "NormalEyeBrowImageMakeup"
-                | "NormalEyeImageMakeup"
-                | "NormalEyeLashImageMakeup"
-                | "SilkWorm"
-                | "SymEyeBrowImageMakeup"
-                | "SymEyeImageMakeup"
-                | "SymEyeLashColorMakeup"
-                | "SymEyeLashImageMakeup"
-        ) {
-            return Err(Refusal::ValueOutOfRange("suit pass effect"));
-        }
+        // Only refuse an effect family when no consumer exists. Previously the
+        // gate's flat allowlist accepted names the producer could not build;
+        // production then failed late with `Unavailable("suit pass effect")`.
+        // The families below are the ones the image/color pass producers can
+        // actually dispatch; every other declared name gets a named refusal.
+        suit_pass_kind_for_effect(&self.effect)?;
         Ok(())
     }
 
@@ -2174,6 +2191,53 @@ mod tests {
             executable.require_live_weights(None),
             Err(Refusal::MissingInput("suit live weights"))
         );
+    }
+
+    #[test]
+    fn suit_effect_router_admits_real_consumers_and_names_the_rest() {
+        for effect in [
+            "BlusherImageMakeup",
+            "NormalEyeBrowImageMakeup",
+            "NormalEyeImageMakeup",
+            "NormalEyeLashImageMakeup",
+            "SymEyeImageMakeup",
+            "SymEyeLashImageMakeup",
+            "SymEyeLashColorMakeup",
+            "EyePupilMakeup",
+            "LipStickImageMakeup",
+        ] {
+            assert!(
+                matches!(
+                    suit_pass_kind_for_effect(effect),
+                    Ok(SuitPassKindInput::Image { .. })
+                ),
+                "{effect} has an image consumer"
+            );
+        }
+        assert!(matches!(
+            suit_pass_kind_for_effect("LipColor"),
+            Ok(SuitPassKindInput::Color)
+        ));
+        // Declared but never dispatched: refused by name, not silently enabled.
+        for effect in ["SilkWorm", "SymEyeBrowImageMakeup", "3DMMFaceSticker"] {
+            assert!(
+                matches!(
+                    suit_pass_kind_for_effect(effect),
+                    Err(Refusal::ValueOutOfRange("suit pass effect"))
+                ),
+                "{effect}"
+            );
+        }
+        let suit = load_owned_suit_bundle().unwrap();
+        let producer_ready = suit
+            .presets
+            .iter()
+            .flat_map(|preset| &preset.passes)
+            .filter(|pass| pass.pf == 90033 && suit_pass_kind_for_effect(&pass.effect).is_ok())
+            .count();
+        // 9 SilkWorm/SymEyeBrowImageMakeup rows are refused by name; 344 of
+        // 353 PF90033 rows have a declared consumer family.
+        assert_eq!(producer_ready, 344);
     }
 
     #[test]
