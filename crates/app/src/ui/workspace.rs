@@ -458,7 +458,7 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &NewLayer, _, cx| {
                 this.with_state(cx, |s, cx| {
                     s.add_layer(aurora_engine::LayerKind::Adjustment, None, None, cx);
-                    s.tool_tab = ToolTab::Layers;
+                    s.tool_tab = ToolTab::Grading;
                 })
             }))
             .on_action(cx.listener(|this, a: &SetRating, _, cx| {

@@ -5,6 +5,7 @@ pub mod capture;
 pub mod color;
 pub mod details;
 pub mod exposure;
+pub mod grading;
 pub mod layers;
 pub mod lens;
 pub mod library;
@@ -20,11 +21,9 @@ use crate::state::{AppState, ToolTab};
 
 pub fn render_tab(tab: ToolTab, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     match tab {
-        ToolTab::Exposure => exposure::render(state, window, cx),
-        ToolTab::Color => color::render(state, window, cx),
+        ToolTab::Grading => grading::render(state, window, cx),
         ToolTab::Lens => lens::render(state, window, cx),
         ToolTab::Details => details::render(state, window, cx),
-        ToolTab::Layers => layers::render(state, window, cx),
         ToolTab::Portrait => portrait::render(state, window, cx),
         ToolTab::Library => library::render(state, window, cx),
         ToolTab::Capture => capture::render(state, window, cx),

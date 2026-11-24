@@ -181,7 +181,7 @@ pub fn inspector(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
     let tab = s.tool_tab;
     let scope = s.scope();
     let layer_name = s.active_layer_ref().map(|l| l.name.clone());
-    let layered = matches!(tab, ToolTab::Color | ToolTab::Exposure | ToolTab::Details | ToolTab::Layers | ToolTab::Quick);
+    let layered = matches!(tab, ToolTab::Grading | ToolTab::Details | ToolTab::Quick);
 
     let content = tools::render_tab(tab, state, window, cx);
     let st = state.clone();

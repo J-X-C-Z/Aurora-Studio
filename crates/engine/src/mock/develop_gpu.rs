@@ -38,13 +38,29 @@ use std::sync::{Mutex, OnceLock};
 
 use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia};
 
+use super::gpu_runtime::{self, VramLease};
+
 use crate::*;
 
 const PTX: &str = include_str!("../../native/cuda/develop_gpu.ptx");
 const BLOCK: (u32, u32) = (16, 16);
 const PREWARM: (usize, usize) = (1400, 933);
-/// One 24-32 MP frame is 16 bytes/pixel in, plus a 4-byte gain plane.
-const MAX_RETAINED_BYTES: usize = 768 * 1024 * 1024;
+/// Reclaim priority: develop is the interactive main path, so its retained
+/// frame is evicted last.
+const RECLAIM_PRIORITY: u8 = 30;
+
+/// Device bytes this module keeps resident no matter the frame size: the
+/// parameter block, the film/gamma LUTs, the C1 colour tables, the colour-editor
+/// skin table and the output-banding table. Mirrors `Pool::open` exactly.
+fn fixed_bytes() -> usize {
+    P_SIZE * 4 + (1280 + GAMMA_SIZE) * 4 + (FILM_MAX * 3 * 4 + CLUT_NODES * 3 * 2) + E_SKIN_BASE * 4
+        + (256 * 4 + 512)
+}
+
+fn budget_error(failure: gpu_runtime::Failure) -> CudaError {
+    log::warn!("develop_gpu: {failure:?}; over the shared VRAM budget");
+    CudaError::Unavailable("vram budget")
+}
 
 const FILM_MAX: usize = 16;
 const CLUT_N: usize = 49;
@@ -1301,6 +1317,25 @@ struct Pool {
     io_bytes: usize,
     gain_bytes: usize,
     editor_bytes: usize,
+    tables: TableCache,
+    /// Reservation in the shared ledger; dropping the pool gives it back.
+    lease: VramLease,
+}
+
+/// The source fingerprints of the static tables that are resident on the
+/// device right now.
+///
+/// The curve LUTs, the colour-editor table, the banding words and the C1
+/// tables do not depend on the band, so they stay on the device until the
+/// data behind them changes. A fingerprint is the exact source bytes of one
+/// table, so a resident copy is only reused when the source is byte for byte
+/// the one that produced it.
+#[derive(Default)]
+struct TableCache {
+    luts: Option<Vec<u8>>,
+    editor: Option<Vec<u8>>,
+    banding: Option<Vec<u8>>,
+    c1: Option<Vec<u8>>,
 }
 
 impl Pool {
@@ -1313,6 +1348,13 @@ impl Pool {
             .checked_mul(height)
             .and_then(|n| n.checked_mul(4))
             .ok_or(CudaError::Unavailable("develop gain size"))?;
+        let editor_bytes = E_SKIN_BASE * 4;
+        let lease = VramLease::acquire(
+            "develop",
+            fixed_bytes() + io_bytes + gain_bytes + editor_bytes,
+            true,
+        )
+        .map_err(budget_error)?;
         let gpu = Box::new(Nvidia::open_ptx(PTX)?);
         Ok(Self {
             io: SendBuffer(alloc_static(&gpu, io_bytes.max(16))?),
@@ -1323,29 +1365,113 @@ impl Pool {
                 &gpu,
                 FILM_MAX * 3 * 4 + CLUT_NODES * 3 * 2,
             )?),
-            editor: SendBuffer(alloc_static(&gpu, E_SKIN_BASE * 4)?),
+            editor: SendBuffer(alloc_static(&gpu, editor_bytes)?),
             banding: SendBuffer(alloc_static(&gpu, 256 * 4 + 512)?),
             gpu,
             io_bytes,
             gain_bytes,
-            editor_bytes: E_SKIN_BASE * 4,
+            editor_bytes,
+            tables: TableCache::default(),
+            lease,
         })
     }
 
+    /// Grows the frame buffers inside the shared budget. The lease is resized
+    /// before allocating, and rolled back if the driver allocation fails, so
+    /// the ledger never claims bytes that are not really resident.
     fn ensure(&mut self, io_bytes: usize, gain_bytes: usize, editor_bytes: usize) -> Result<(), CudaError> {
-        if io_bytes > self.io_bytes {
-            self.io = SendBuffer(alloc_static(&self.gpu, io_bytes)?);
-            self.io_bytes = io_bytes;
+        let next_io = io_bytes.max(self.io_bytes);
+        let next_gain = gain_bytes.max(self.gain_bytes);
+        let next_editor = editor_bytes.max(self.editor_bytes);
+        if next_io == self.io_bytes && next_gain == self.gain_bytes && next_editor == self.editor_bytes {
+            return Ok(());
         }
-        if gain_bytes > self.gain_bytes {
-            self.gain = SendBuffer(alloc_static(&self.gpu, gain_bytes)?);
-            self.gain_bytes = gain_bytes;
+        let old_total = self.lease.bytes();
+        self.lease
+            .resize(fixed_bytes() + next_io + next_gain + next_editor, true)
+            .map_err(budget_error)?;
+        let result = (|| {
+            if next_io > self.io_bytes {
+                self.io = SendBuffer(alloc_static(&self.gpu, next_io)?);
+                self.io_bytes = next_io;
+            }
+            if next_gain > self.gain_bytes {
+                self.gain = SendBuffer(alloc_static(&self.gpu, next_gain)?);
+                self.gain_bytes = next_gain;
+            }
+            if next_editor > self.editor_bytes {
+                self.editor = SendBuffer(alloc_static(&self.gpu, next_editor)?);
+                self.editor_bytes = next_editor;
+                // A fresh buffer holds no table, so the fingerprint that claimed
+                // a resident copy is no longer true.
+                self.tables.editor = None;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.lease.resize(old_total, true);
         }
-        if editor_bytes > self.editor_bytes {
-            self.editor = SendBuffer(alloc_static(&self.gpu, editor_bytes)?);
-            self.editor_bytes = editor_bytes;
+        result
+    }
+
+    /// Uploads the static tables whose source changed since the last band.
+    ///
+    /// The curve LUTs, the colour-editor table, the banding words and the C1
+    /// tables are the same for every band of a frame and for every frame
+    /// that keeps the same adjustments. They are compared byte for byte
+    /// against the source that produced the resident copy, so an unchanged
+    /// table is not rebuilt and not uploaded again.
+    ///
+    /// The per-band parameters (frame size, region, gain flag) are not part
+    /// of any fingerprint: they live in the parameter table, which is
+    /// uploaded for every band.
+    fn upload_static_tables(&mut self, params: &DevelopParams) -> Result<(), CudaError> {
+        let luts = luts_parts(params);
+        if !source_matches(self.tables.luts.as_deref(), &luts) {
+            let table = luts_floats(params);
+            let outcome = self.gpu.upload_buffer(&self.luts.0, as_bytes(&table));
+            commit_upload(&mut self.tables.luts, &luts, outcome)?;
+        }
+
+        let editor = editor_parts(params);
+        if !source_matches(self.tables.editor.as_deref(), &editor) {
+            let table = params
+                .editor
+                .as_ref()
+                .map(|e| e.floats.clone())
+                .unwrap_or_else(|| vec![0.0; E_SKIN_BASE]);
+            let outcome = self.gpu.upload_buffer(&self.editor.0, as_bytes(&table));
+            commit_upload(&mut self.tables.editor, &editor, outcome)?;
+        }
+
+        let banding = banding_parts(params);
+        if !source_matches(self.tables.banding.as_deref(), &banding) {
+            let table = params
+                .banding
+                .as_ref()
+                .map(banding_bytes)
+                .unwrap_or_else(|| vec![0u8; 256 * 4 + 512]);
+            let outcome = self.gpu.upload_buffer(&self.banding.0, &table);
+            commit_upload(&mut self.tables.banding, &banding, outcome)?;
+        }
+
+        // An absent C1 stage passes a null handle and P_C1 stays 0, so the
+        // buffer is never read. The fingerprint is left untouched: it keeps
+        // describing whatever the device still holds, which stays valid for
+        // the next frame that asks for the same C1 tables again.
+        if let Some(stage) = params.c1.as_ref() {
+            let c1 = c1_parts(params);
+            if !source_matches(self.tables.c1.as_deref(), &c1) {
+                let table = c1_bytes(stage);
+                let outcome = self.gpu.upload_buffer(&self.c1.0, &table);
+                commit_upload(&mut self.tables.c1, &c1, outcome)?;
+            }
         }
         Ok(())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.lease.bytes()
     }
 }
 
@@ -1377,10 +1503,35 @@ pub(crate) fn enabled() -> bool {
     }
 }
 
+/// Drops the retained develop frame so another stage can use the budget.
+/// `try_lock` only: a render in progress owns the pool and must not be touched.
+fn release_retained() -> usize {
+    let mut state = match state().try_lock() {
+        Ok(state) => state,
+        Err(_) => return 0,
+    };
+    let freed = match &*state {
+        State::Ready(pool) => pool.retained_bytes(),
+        _ => 0,
+    };
+    if freed > 0 {
+        *state = State::NotTried;
+    }
+    freed
+}
+
+fn register_reclaimer() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        gpu_runtime::vram_register_reclaimer("develop", RECLAIM_PRIORITY, release_retained)
+    });
+}
+
 pub(crate) fn prewarm() -> bool {
     if !enabled() {
         return false;
     }
+    register_reclaimer();
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     match &mut *state {
         State::Ready(_) => true,
@@ -1393,11 +1544,19 @@ pub(crate) fn prewarm() -> bool {
             }
             Err(err) => {
                 log::warn!("develop_gpu: {err:?}; staying on CPU");
-                *state = State::Unavailable;
+                // A budget refusal is transient; retry on the next render
+                // instead of disabling develop for the process.
+                if !budget_refused(&err) {
+                    *state = State::Unavailable;
+                }
                 false
             }
         },
     }
+}
+
+fn budget_refused(err: &CudaError) -> bool {
+    matches!(err, CudaError::Unavailable("vram budget"))
 }
 
 fn as_bytes<T>(value: &[T]) -> &[u8] {
@@ -1407,6 +1566,118 @@ fn as_bytes<T>(value: &[T]) -> &[u8] {
 fn as_bytes_mut<T>(value: &mut [T]) -> &mut [u8] {
     unsafe {
         std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, std::mem::size_of_val(value))
+    }
+}
+
+/// One part of a static table's source data.
+///
+/// The static tables are identified by their exact source bytes: the witness
+/// stores the same tags and bytes, so an unchanged source is recognised by a
+/// plain byte comparison and the table is neither rebuilt nor uploaded again.
+struct SourcePart<'a> {
+    /// `true` when the source has this part at all.
+    present: bool,
+    /// The exact bytes of the part. Empty when `present` is `false`.
+    bytes: &'a [u8],
+}
+
+/// Exact comparison of a witnessed source with the current source parts.
+///
+/// `witness` is `None` when the device buffer was never written, so the
+/// source always counts as changed. The comparison is byte for byte: two
+/// sources that produce different bytes never share a witness.
+fn source_matches(witness: Option<&[u8]>, parts: &[SourcePart<'_>]) -> bool {
+    let Some(witness) = witness else { return false };
+    let mut at = 0usize;
+    for part in parts {
+        if witness.get(at) != Some(&(part.present as u8)) {
+            return false;
+        }
+        at += 1;
+        if part.present {
+            let end = at.saturating_add(part.bytes.len());
+            if witness.get(at..end) != Some(part.bytes) {
+                return false;
+            }
+            at = end;
+        }
+    }
+    at == witness.len()
+}
+
+/// The witness bytes for a source.
+fn build_witness(parts: &[SourcePart<'_>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        out.push(part.present as u8);
+        if part.present {
+            out.extend_from_slice(part.bytes);
+        }
+    }
+    out
+}
+
+/// Records one static-table upload.
+///
+/// The witness is cleared *before* the copy runs: a failed `upload_buffer`
+/// can leave the device buffer partially written, and an error on the
+/// `State::Ready` path keeps the pool alive, so the previous witness must
+/// never keep claiming the buffer still holds the old table. It is set again
+/// only after the copy reported success.
+fn commit_upload(
+    witness: &mut Option<Vec<u8>>,
+    source: &[SourcePart<'_>],
+    outcome: Result<(), CudaError>,
+) -> Result<(), CudaError> {
+    *witness = None;
+    outcome?;
+    *witness = Some(build_witness(source));
+    Ok(())
+}
+
+/// The five curve LUTs of one parameter set, as source parts.
+fn luts_parts(p: &DevelopParams) -> [SourcePart<'_>; 5] {
+    std::array::from_fn(|index| match &p.curves[index] {
+        Some(lut) => SourcePart { present: true, bytes: as_bytes(&lut[..]) },
+        None => SourcePart { present: false, bytes: &[] },
+    })
+}
+
+/// The colour-editor table of one parameter set, as source parts.
+fn editor_parts(p: &DevelopParams) -> [SourcePart<'_>; 1] {
+    match &p.editor {
+        Some(editor) => [SourcePart { present: true, bytes: as_bytes(&editor.floats) }],
+        None => [SourcePart { present: false, bytes: &[] }],
+    }
+}
+
+/// The banding words of one parameter set, as source parts.
+fn banding_parts(p: &DevelopParams) -> [SourcePart<'_>; 3] {
+    match &p.banding {
+        Some(banding) => [
+            SourcePart { present: true, bytes: as_bytes(&banding.words[..]) },
+            SourcePart { present: true, bytes: &banding.left[..] },
+            SourcePart { present: true, bytes: &banding.right[..] },
+        ],
+        None => [
+            SourcePart { present: false, bytes: &[] },
+            SourcePart { present: false, bytes: &[] },
+            SourcePart { present: false, bytes: &[] },
+        ],
+    }
+}
+
+/// The C1 colour tables of one parameter set, as source parts.
+fn c1_parts(p: &DevelopParams) -> [SourcePart<'_>; 2] {
+    match &p.c1 {
+        Some(c1) => [
+            SourcePart { present: true, bytes: as_bytes(&c1.film) },
+            SourcePart { present: true, bytes: as_bytes(&c1.clut) },
+        ],
+        None => [
+            SourcePart { present: false, bytes: &[] },
+            SourcePart { present: false, bytes: &[] },
+        ],
     }
 }
 
@@ -1601,9 +1872,10 @@ pub(crate) fn retained_bytes(width: usize, height: usize, params: &DevelopParams
         .checked_add(editor_bytes)
 }
 
-/// The retained-frame budget the device path enforces.
-pub(crate) const fn develop_budget() -> usize {
-    MAX_RETAINED_BYTES
+/// The retained-frame budget the device path enforces: now the shared ledger
+/// budget instead of a private 768 MiB constant.
+pub(crate) fn develop_budget() -> usize {
+    gpu_runtime::vram_budget()
 }
 
 /// Non-allocating admission check.
@@ -1622,7 +1894,13 @@ pub(crate) fn can_run_develop_gpu(
     if !enabled() {
         return false;
     }
-    retained_bytes(width, height, params).is_some_and(|bytes| bytes <= budget)
+    let Some(bytes) = retained_bytes(width, height, params) else { return false };
+    if bytes > budget {
+        return false;
+    }
+    // Unified admission: the shared ledger decides whether the whole engine can
+    // hold this frame, counting rebuildable buffers other stages could release.
+    gpu_runtime::vram_can_allocate("develop", fixed_bytes() + bytes)
 }
 
 /// End-to-end CPU/GPU crossover policy of the point chain, in output pixels.
@@ -1733,7 +2011,7 @@ where
     F: Fn(usize, usize) -> Option<[f32; 3]> + Sync,
 {
     let pixels = width.checked_mul(height)?;
-    if pixels == 0 || !can_run_develop_gpu(width, height, params, MAX_RETAINED_BYTES) {
+    if pixels == 0 || !can_run_develop_gpu(width, height, params, develop_budget()) {
         return None;
     }
     if gain_plane.is_some_and(|plane| plane.len() != pixels) {
@@ -1775,7 +2053,7 @@ pub(crate) fn develop_plane(
     if gain_plane.is_some_and(|plane| plane.len() != pixels) {
         return false;
     }
-    if !can_run_develop_gpu(width, height, params, MAX_RETAINED_BYTES) {
+    if !can_run_develop_gpu(width, height, params, develop_budget()) {
         return false;
     }
 
@@ -1827,52 +2105,65 @@ fn run_io(
     floats[P_RW] = region[2];
     floats[P_RH] = region[3];
     floats[P_HAS_GAIN] = if gain_plane.is_some() { 1.0 } else { 0.0 };
-    let luts = luts_floats(params);
-    let c1 = params.c1.as_ref().map(c1_bytes);
-    let editor = params
-        .editor
-        .as_ref()
-        .map(|e| e.floats.clone())
-        .unwrap_or_else(|| vec![0.0; E_SKIN_BASE]);
-    let banding = params
-        .banding
-        .as_ref()
-        .map(banding_bytes)
-        .unwrap_or_else(|| vec![0u8; 1536]);
 
     let mut lock = state().lock().unwrap_or_else(|error| error.into_inner());
-    match &mut *lock {
+    let result = match &mut *lock {
         State::Unavailable => Err(CudaError::Unavailable("CUDA develop path is unavailable")),
         State::NotTried => {
+            register_reclaimer();
             let mut pool = match Pool::open(width, height) {
                 Ok(pool) => pool,
                 Err(err) => {
-                    *lock = State::Unavailable;
+                    if !budget_refused(&err) {
+                        *lock = State::Unavailable;
+                    }
                     return Err(err);
                 }
             };
-            let result = pool
-                .ensure(io_bytes, gain_bytes, editor_bytes)
-                .and_then(|()| {
-                    run_pool(&pool, io, &floats, &luts, c1.as_deref(), &editor, &banding, gain_plane, width, height)
-                });
+            let result = run_with_pool(
+                &mut pool, io, &floats, params, gain_plane, width, height, io_bytes, gain_bytes,
+                editor_bytes,
+            );
             match result {
                 Ok(()) => {
                     *lock = State::Ready(pool);
                     Ok(())
                 }
                 Err(err) => {
-                    *lock = State::Unavailable;
+                    if !budget_refused(&err) {
+                        *lock = State::Unavailable;
+                    }
                     Err(err)
                 }
             }
         }
-        State::Ready(pool) => pool
-            .ensure(io_bytes, gain_bytes, editor_bytes)
-            .and_then(|()| {
-                run_pool(pool, io, &floats, &luts, c1.as_deref(), &editor, &banding, gain_plane, width, height)
-            }),
-    }
+        State::Ready(pool) => run_with_pool(
+            pool, io, &floats, params, gain_plane, width, height, io_bytes, gain_bytes,
+            editor_bytes,
+        ),
+    };
+    // One throttled `AURORA_PERF {"event":"gpu_vram",...}` line when replaying.
+    gpu_runtime::vram_maybe_emit_perf("develop");
+    result
+}
+
+/// Grows the pool, refreshes the static tables and runs one band.
+#[allow(clippy::too_many_arguments)]
+fn run_with_pool(
+    pool: &mut Pool,
+    io: &mut [f32],
+    floats: &[f32],
+    params: &DevelopParams,
+    gain_plane: Option<&[f32]>,
+    width: usize,
+    height: usize,
+    io_bytes: usize,
+    gain_bytes: usize,
+    editor_bytes: usize,
+) -> Result<(), CudaError> {
+    pool.ensure(io_bytes, gain_bytes, editor_bytes)?;
+    pool.upload_static_tables(params)?;
+    run_pool(pool, io, floats, gain_plane, width, height, params.c1.is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1880,23 +2171,14 @@ fn run_pool(
     pool: &Pool,
     io: &mut [f32],
     floats: &[f32],
-    luts: &[f32],
-    c1: Option<&[u8]>,
-    editor: &[f32],
-    banding: &[u8],
     gain_plane: Option<&[f32]>,
     width: usize,
     height: usize,
+    c1_present: bool,
 ) -> Result<(), CudaError> {
     let gpu = pool.gpu.as_ref();
     gpu.upload_buffer(&pool.io.0, as_bytes(io))?;
     gpu.upload_buffer(&pool.params.0, as_bytes(floats))?;
-    gpu.upload_buffer(&pool.luts.0, as_bytes(luts))?;
-    gpu.upload_buffer(&pool.editor.0, as_bytes(editor))?;
-    gpu.upload_buffer(&pool.banding.0, banding)?;
-    if let Some(raw) = c1 {
-        gpu.upload_buffer(&pool.c1.0, raw)?;
-    }
     if let Some(plane) = gain_plane {
         gpu.upload_buffer(&pool.gain.0, as_bytes(plane))?;
     }
@@ -1905,7 +2187,7 @@ fn run_pool(
     let mut p_handle = pool.params.0.handle();
     let mut lut_handle = pool.luts.0.handle();
     let mut gain_handle = if gain_plane.is_some() { pool.gain.0.handle() } else { 0 };
-    let mut c1_handle = if c1.is_some() { pool.c1.0.handle() } else { 0 };
+    let mut c1_handle = if c1_present { pool.c1.0.handle() } else { 0 };
     let mut editor_handle = pool.editor.0.handle();
     let mut words = pool.banding.0.handle();
     let mut left = words + 1024;
@@ -2211,5 +2493,132 @@ mod tests {
         let mut params = default;
         params.c1 = Some(nonlinear);
         run(&samples, 31, 19, [0.0, 0.0, 1.0, 1.0], &params, None, "c1-nonlinear-film");
+    }
+
+    // Static-table fingerprints: the device copy is reused only while the
+    // source is byte for byte the one that produced it.
+
+    fn table_params() -> DevelopParams {
+        let mut params = DevelopParams::from_adjustments(
+            &tone_color_adjustments(),
+            [1.85, 1.0, 0.72],
+            2f32.powf(0.35),
+            false,
+        );
+        params.editor = Some(EditorParams::from_editor(&editor_adjustments().color_editor));
+        params.banding = Some(banding_params(64, 48));
+        params.c1 = C1ColorParams::new(IDENTITY_PRE_MATRIX, LINEAR_FILM.to_vec(), synthetic_clut());
+        params
+    }
+
+    #[test]
+    fn static_table_fingerprint_is_byte_exact() {
+        let params = table_params();
+        let luts = luts_parts(&params);
+        let witness = build_witness(&luts);
+        assert!(source_matches(Some(&witness[..]), &luts), "the same source must match");
+
+        // One changed curve bit must invalidate the LUT table.
+        let mut changed = params.clone();
+        let curve = changed.curves[0].as_mut().expect("rgb curve");
+        curve[97] = f32::from_bits(curve[97].to_bits() ^ 1);
+        let changed_luts = luts_parts(&changed);
+        assert!(!source_matches(Some(&witness[..]), &changed_luts), "one bit changed");
+
+        // A whole missing curve is a different table too.
+        let mut removed = params.clone();
+        removed.curves[1] = None;
+        assert!(!source_matches(Some(&witness[..]), &luts_parts(&removed)));
+    }
+
+    #[test]
+    fn static_table_fingerprint_covers_editor_banding_and_c1() {
+        let params = table_params();
+
+        let editor = build_witness(&editor_parts(&params));
+        let mut changed = params.clone();
+        changed.editor.as_mut().expect("editor").floats[7] += 0.5;
+        assert!(!source_matches(Some(&editor[..]), &editor_parts(&changed)));
+
+        let banding = build_witness(&banding_parts(&params));
+        let mut changed = params.clone();
+        changed.banding.as_mut().expect("banding").words[3] ^= 1;
+        assert!(!source_matches(Some(&banding[..]), &banding_parts(&changed)));
+
+        let c1 = build_witness(&c1_parts(&params));
+        let mut changed = params.clone();
+        let node = changed.c1.as_mut().expect("c1");
+        node.clut[42][1] = node.clut[42][1].wrapping_add(1);
+        assert!(!source_matches(Some(&c1[..]), &c1_parts(&changed)));
+    }
+
+    #[test]
+    fn static_table_fingerprint_never_matches_absent_copies() {
+        let params = table_params();
+        let luts = luts_parts(&params);
+        assert!(!source_matches(None, &luts), "no resident copy yet");
+
+        // A truncated witness must not be accepted as the full source.
+        let mut witness = build_witness(&luts);
+        witness.pop();
+        assert!(!source_matches(Some(&witness[..]), &luts));
+    }
+
+    #[test]
+    fn failed_upload_drops_the_previous_witness() {
+        // A -> B fails -> A: the pool survives an error on the `State::Ready`
+        // path, so the failed copy must not leave A's witness in place.
+        let params = table_params();
+        let luts_a = luts_parts(&params);
+        let mut witness = None;
+        commit_upload(&mut witness, &luts_a, Ok(())).expect("A uploads");
+        assert!(source_matches(witness.as_deref(), &luts_a));
+
+        let mut params_b = params.clone();
+        params_b.curves[0] = None;
+        let luts_b = luts_parts(&params_b);
+        assert!(!source_matches(witness.as_deref(), &luts_b), "B is a new table");
+
+        let failed = commit_upload(
+            &mut witness,
+            &luts_b,
+            Err(CudaError::Unavailable("injected copy failure")),
+        );
+        assert!(failed.is_err());
+        assert!(witness.is_none(), "a failed copy must not claim any table");
+        assert!(
+            !source_matches(witness.as_deref(), &luts_a),
+            "asking for A again must upload instead of hitting"
+        );
+
+        // A successful retry re-establishes exactly A's witness.
+        commit_upload(&mut witness, &luts_a, Ok(())).expect("A re-uploads");
+        assert!(source_matches(witness.as_deref(), &luts_a));
+    }
+
+    #[test]
+    fn static_tables_ignore_per_band_parameters() {
+        // Exposure, region and frame size live in the parameter table, which is
+        // uploaded for every band. They must never invalidate a static table.
+        let params = table_params();
+        let mut changed = params.clone();
+        changed.exposure *= 1.5;
+        changed.wb = [1.2, 0.9, 1.05];
+        changed.contrast += 0.1;
+
+        assert_eq!(build_witness(&luts_parts(&params)), build_witness(&luts_parts(&changed)));
+        assert_eq!(
+            build_witness(&editor_parts(&params)),
+            build_witness(&editor_parts(&changed))
+        );
+        assert_eq!(
+            build_witness(&banding_parts(&params)),
+            build_witness(&banding_parts(&changed))
+        );
+        assert_eq!(build_witness(&c1_parts(&params)), build_witness(&c1_parts(&changed)));
+
+        // The per-band parameter table itself does change, so the dynamic
+        // values are still uploaded with every band.
+        assert_ne!(params_floats(&params), params_floats(&changed));
     }
 }

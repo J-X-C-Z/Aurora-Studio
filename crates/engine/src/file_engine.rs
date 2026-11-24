@@ -2356,7 +2356,7 @@ impl FileEngine {
         if slot {
             if let Some(slot) = st.native_raw.as_mut() {
                 slot.identity = verified;
-                if metadata_changed {
+                if due {
                     slot.last_verified = Instant::now();
                     slot.hits_since_verify = 0;
                 } else {
@@ -2365,7 +2365,7 @@ impl FileEngine {
             }
         } else if let Some(entry) = st.sources.get_mut(&image) {
             entry.identity = verified;
-            if metadata_changed {
+            if due {
                 entry.last_verified = Instant::now();
                 entry.hits_since_verify = 0;
             } else {
@@ -6931,6 +6931,57 @@ mod tests {
         assert_eq!(engine.state.lock().preview.len(), 0, "rescan did not clear previews");
         let kept: Vec<ImageId> = engine.images().iter().map(|info| info.id).collect();
         assert_eq!(kept, vec![before[1].1], "unchanged file lost its id");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn source_identity_recheck_restarts_the_budget_for_proxy_and_native() {
+        let dir = s2_test_dir("identity-recheck");
+        let path = write_test_png(&dir, "shot.png", 48, 32, 1);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        engine.source(id).unwrap();
+
+        let mut st = engine.state.lock();
+        let identity = st.sources[&id].identity;
+        st.native_raw = Some(NativeRawSlot {
+            image: id,
+            source: None,
+            bytes: 0,
+            last_used: 0,
+            identity,
+            last_verified: Instant::now(),
+            hits_since_verify: 0,
+        });
+        for native in [false, true] {
+            for by_time in [false, true] {
+                let last_verified = if by_time { Instant::now() - SOURCE_IDENTITY_RECHECK } else { Instant::now() };
+                let hits = if by_time { 0 } else { SOURCE_IDENTITY_RECHECK_HITS };
+                if native {
+                    let slot = st.native_raw.as_mut().unwrap();
+                    slot.last_verified = last_verified;
+                    slot.hits_since_verify = hits;
+                } else {
+                    let entry = st.sources.get_mut(&id).unwrap();
+                    entry.last_verified = last_verified;
+                    entry.hits_since_verify = hits;
+                }
+
+                for expected_hits in [0, 1] {
+                    assert!(FileEngine::refresh_source_identity(&mut st, id, &path, native));
+                    let (verified_at, hits_since_verify) = if native {
+                        let slot = st.native_raw.as_ref().unwrap();
+                        (slot.last_verified, slot.hits_since_verify)
+                    } else {
+                        let entry = &st.sources[&id];
+                        (entry.last_verified, entry.hits_since_verify)
+                    };
+                    assert_eq!(hits_since_verify, expected_hits);
+                    assert!(verified_at >= last_verified);
+                }
+            }
+        }
+        drop(st);
         std::fs::remove_dir_all(&dir).ok();
     }
 

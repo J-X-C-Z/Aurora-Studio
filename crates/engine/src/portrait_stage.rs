@@ -3988,7 +3988,7 @@ fn rasterize_radial_warps(source: &Image, parts: &[&face_geometry::PartGeometry]
     let clamp = aurora_portrait::raster_fragment::Clamp::disabled();
 
     #[cfg(windows)]
-    {
+    let cuda_fallback = {
         let cuda = match forced_cuda_failure() {
             Some(error) => Err(error),
             None => MeshRaster::open().and_then(|gpu| {
@@ -4004,16 +4004,21 @@ fn rasterize_radial_warps(source: &Image, parts: &[&face_geometry::PartGeometry]
                 )
             }),
         };
-        if let Ok(output) = cuda {
-            return FaceMeshStageResult {
-                image: (output.image != *source).then_some(output.image),
-                backend: PortraitBackend::Cuda,
-                dispatches: vec![output.select_dispatch, output.emit_dispatch],
-                fallback_reason: None,
-                refusal: None,
-            };
+        match cuda {
+            Ok(output) => {
+                return FaceMeshStageResult {
+                    image: (output.image != *source).then_some(output.image),
+                    backend: PortraitBackend::Cuda,
+                    dispatches: vec![output.select_dispatch, output.emit_dispatch],
+                    fallback_reason: None,
+                    refusal: None,
+                };
+            }
+            Err(error) => Some(format!("CUDA radial warp fallback: {error:?}")),
         }
-    }
+    };
+    #[cfg(not(windows))]
+    let cuda_fallback: Option<String> = None;
 
     match aurora_portrait::raster::rasterize_with_fragment(
         source,
@@ -4029,10 +4034,13 @@ fn rasterize_radial_warps(source: &Image, parts: &[&face_geometry::PartGeometry]
             image: (image != *source).then_some(image),
             backend: PortraitBackend::Cpu,
             dispatches: Vec::new(),
-            fallback_reason: None,
+            fallback_reason: cuda_fallback,
             refusal: None,
         },
-        Err(refusal) => face_mesh_refused(refusal, None),
+        Err(refusal) => {
+            let reason = cuda_fallback.map(|fb| format!("{fb}; CPU {refusal:?}"));
+            face_mesh_refused(refusal, reason)
+        }
     }
 }
 
@@ -4384,9 +4392,7 @@ fn apply_face_mesh_group(
         };
     }
 
-    let digest = sha256_32(&source.pixels);
-    let mut selected = Vec::new();
-    {
+    let selected = {
         let points: Vec<face_geometry::Point> = points414
             .iter()
             .map(|point| face_geometry::Point::new(point[0], point[1]))
@@ -4425,6 +4431,7 @@ fn apply_face_mesh_group(
             Err(refusal) => return face_mesh_refused(refusal, None),
         };
 
+        let mut selected = Vec::new();
         for &part in &face_mesh::FACE_WIDTH_PARTS {
             let geometry = if matches!(part, 25 | 27) {
                 &left
@@ -4434,81 +4441,13 @@ fn apply_face_mesh_group(
             let Some(part_geometry) = geometry.parts.iter().find(|item| item.part == part) else {
                 return face_mesh_refused(Refusal::MissingInput("face mesh draw part"), None);
             };
-            let draw = match face_mesh::Draw::from_face_geometry(controls, digest, part_geometry) {
-                Ok(draw) => draw,
-                Err(refusal) => return face_mesh_refused(refusal, None),
-            };
-            if !group.contains(draw.pf) {
-                return face_mesh_refused(Refusal::ShapeMismatch("face mesh part group"), None);
+            if part_geometry.degree != 0.0 {
+                selected.push(part_geometry.clone());
             }
-            selected.push(draw);
         }
-    }
-    let selected_refs = selected.iter().collect::<Vec<_>>();
-
-    #[cfg(windows)]
-    {
-        let cuda = match forced_cuda_failure() {
-            Some(error) => Err(error),
-            None => {
-                MeshRaster::open().and_then(|gpu| {
-                    face_mesh::rasterize_cuda_with(&gpu, source, &selected_refs)
-                })
-            }
-        };
-        return match cuda {
-            Ok(output) if !output.dispatches.is_empty() => FaceMeshStageResult {
-                image: (output.image != *source).then_some(output.image),
-                backend: PortraitBackend::Cuda,
-                dispatches: output.dispatches,
-                fallback_reason: None,
-                refusal: None,
-            },
-            Ok(_) => {
-                let cuda_fallback = "CUDA face mesh returned no dispatch".to_string();
-                match face_mesh::rasterize(source, &selected_refs) {
-                    Ok(output) => FaceMeshStageResult {
-                        image: (output != *source).then_some(output),
-                        backend: PortraitBackend::Cpu,
-                        dispatches: Vec::new(),
-                        fallback_reason: Some(cuda_fallback),
-                        refusal: None,
-                    },
-                    Err(refusal) => face_mesh_refused(
-                        refusal.clone(),
-                        Some(format!("{cuda_fallback}; CPU {refusal:?}")),
-                    ),
-                }
-            }
-            Err(error) => {
-                let cuda_fallback = format!("CUDA face mesh fallback: {error:?}");
-                match face_mesh::rasterize(source, &selected_refs) {
-                    Ok(output) => FaceMeshStageResult {
-                        image: (output != *source).then_some(output),
-                        backend: PortraitBackend::Cpu,
-                        dispatches: Vec::new(),
-                        fallback_reason: Some(cuda_fallback),
-                        refusal: None,
-                    },
-                    Err(refusal) => face_mesh_refused(
-                        refusal.clone(),
-                        Some(format!("{cuda_fallback}; CPU {refusal:?}")),
-                    ),
-                }
-            }
-        };
-    }
-    #[cfg(not(windows))]
-    match face_mesh::rasterize(source, &selected_refs) {
-        Ok(output) => FaceMeshStageResult {
-            image: (output != *source).then_some(output),
-            backend: PortraitBackend::Cpu,
-            dispatches: Vec::new(),
-            fallback_reason: None,
-            refusal: None,
-        },
-        Err(refusal) => face_mesh_refused(refusal, None),
-    }
+        selected
+    };
+    rasterize_radial_warps(source, &selected.iter().collect::<Vec<_>>())
 }
 
 fn supports_effect(pf: u32) -> bool {
@@ -14559,7 +14498,7 @@ mod tests {
         assert_eq!(cuda_frame, cpu_frame, "CUDA and CPU face-width bytes differ");
         for run in &cuda_report.effects {
             assert!(run.executed, "PF{} did not execute", run.pf);
-            assert_eq!(run.dispatches.len(), 16, "PF{}", run.pf);
+            assert_eq!(run.dispatches.len(), 2, "PF{}", run.pf);
             assert!(run.fallback_reason.is_none(), "PF{}", run.pf);
             let device = &run.dispatches[0].device;
             assert!(!device.is_empty());
@@ -14569,7 +14508,7 @@ mod tests {
                         || dispatch.kernel.contains("mesh_raster_fragment_emit"))
             }));
             eprintln!(
-                "WL48_STAGE_BACKEND pf={} backend=Cuda dispatches=16 device={device}",
+                "WL48_STAGE_BACKEND pf={} backend=Cuda dispatches=2 device={device}",
                 run.pf
             );
         }

@@ -128,9 +128,9 @@ fn node_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> im
         (Some(NodeKind::Parallel), _) => note(t("Parallel mixer: blends branches that grade the same image.", "并行混合器：混合对同一图像调色的各分支。")),
         (Some(NodeKind::LayerMixer), _) => note(t("Layer mixer: stacks its inputs, the lowest on top.", "图层混合器：叠加各输入，越靠下的越在上层。")),
         (Some(NodeKind::Output), _) => note(t("Output: what reaches it is the image.", "输出：到达这里的就是最终图像。")),
-        _ => note(t("Base: the global adjustments from the other tabs. Select a node to grade it.", "基础：其他工具页的全局调整。选中一个节点即可单独调色。")),
+        _ => note(t("Base: the global grading adjustments. Select a node to grade it locally.", "基础：全局调色。选中一个节点（图层）即可进行局部调色。")),
     };
-    ToolPanel::new(state, "nodes", t("Nodes", "节点"))
+    ToolPanel::new(state, "nodes", t("Layers (Nodes)", "图层（节点）"))
         .status(crate::contract::NODE_GRAPH)
         .badge(format!("{count}"))
         .child(super::nodes::toolbar(state, docked, cx))

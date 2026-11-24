@@ -292,11 +292,8 @@ impl super::Preview {
     /// Marks the running request finished and returns the newest coalesced one.
     pub(super) fn finish_request(&mut self) -> Option<(RenderQuality, std::time::Instant)> {
         self.in_flight = false;
-        let next = self.pending.take();
-        if next.is_none() {
-            self.rendering = false;
-        }
-        next
+        self.rendering = false;
+        self.pending.take()
     }
 
     /// Whether a finished after frame may replace the one on screen: only for
@@ -981,6 +978,7 @@ impl AppState {
                     let (region, image_id) = (request.region, request.image);
                     after_engine.render_preview(&request).map(move |f| {
                         let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                        let source_status = crate::planned::source_status(after_engine.as_ref(), image_id);
                         let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
                         let (width, height) = (image.width, image.height);
                         let analysis_at = std::time::Instant::now();
@@ -1024,13 +1022,13 @@ impl AppState {
                             });
                         }
                         let PreparedDisplay { image: img, source_pixels, reused, .. } = display;
-                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, region, image_id, request)
+                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, region, image_id, request, source_status)
                     })
                 })
                 .await;
             let Ok(render_before) = this.update(cx, |this, cx| {
                 match frame {
-                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id, request)) => {
+                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id, request, source_status)) => {
                         if this.preview.may_install(this.current, image_id, stamp.id) {
                             this.preview.last_request = Some(request);
                             this.preview.last_overlay = placed_overlay;
@@ -1039,7 +1037,7 @@ impl AppState {
                                 cx.drop_image(old, None);
                             }
                             this.preview.error = None;
-                            this.source_note = crate::planned::source_status(this.engine.as_ref(), image_id).map(|n| {
+                            this.source_note = source_status.map(|n| {
                                 log::warn!("source status: {n}");
                                 let summary = match SourceStatusKind::of(&n) {
                                     SourceStatusKind::DecodeFailed => t("RAW decode failed; showing the embedded preview", "RAW 解码失败，显示嵌入预览"),
@@ -1132,9 +1130,8 @@ impl AppState {
                 crate::note_first_preview_ready();
                 if let Some((next, requested_at)) = this.preview.finish_request() {
                     this.enqueue_render(next, requested_at, cx);
-                } else {
-                    this.start_queued_thumbs(cx);
                 }
+                this.start_queued_thumbs(cx);
                 cx.notify();
             })
             .ok();
@@ -1696,6 +1693,16 @@ mod ordering_tests {
         assert!(!preview.thumbs_allowed(false, false));
         assert_eq!(preview.finish_request(), None);
         assert!(preview.thumbs_allowed(false, false), "resumed when idle");
+    }
+
+    #[test]
+    fn coalesced_request_can_finish_without_starting_another_render() {
+        let mut preview = Preview::default();
+        preview.start_request();
+        assert_eq!(preview.accept_request(RenderQuality::Final, Instant::now()), PreviewRequested::Coalesced);
+        assert!(preview.finish_request().is_some());
+        assert!(!preview.rendering, "a final request that reuses the shown frame must leave preview idle");
+        assert!(preview.thumbs_allowed(false, false));
     }
 
     /// Overlay-only handling needs identical engine inputs; generation and

@@ -83,7 +83,7 @@ impl MobileShell {
             s.view.show_info_overlay = false;
             s.view.multi = false;
             if !s.visible_tabs().contains(&s.tool_tab) || matches!(s.tool_tab, ToolTab::Library) {
-                s.tool_tab = ToolTab::Exposure;
+                s.tool_tab = ToolTab::Grading;
             }
             cx.notify();
         });

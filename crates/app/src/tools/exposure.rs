@@ -12,6 +12,7 @@ use crate::theme::{hex, pal};
 use crate::widgets::*;
 use crate::{global, scoped};
 
+#[allow(dead_code)]
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let s = state.read(cx);
     let scope = s.scope();
@@ -48,7 +49,7 @@ pub fn panel(id: &str, state: &Entity<AppState>, window: &mut Window, cx: &mut A
 
 /// Waveform, RGB parade and vectorscope of the preview. Off by default so a
 /// frame costs nothing extra until someone looks.
-fn scopes_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn scopes_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let kind = s.panels.scope_kind;
     let image = s.preview.scope.clone().filter(|_| kind != crate::state::ScopeKind::Off);
@@ -140,7 +141,7 @@ pub fn histogram_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement +
         )
 }
 
-fn exposure_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn exposure_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let e = read_scoped(state.read(cx).adj(), scope, |a| &a.exposure, |l| &l.exposure).cloned().unwrap_or_default();
     let modified = e != Exposure::default();
     let st = state.clone();
@@ -163,7 +164,7 @@ fn exposure_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl Into
         )
 }
 
-fn hdr_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn hdr_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let h = read_scoped(state.read(cx).adj(), scope, |a| &a.hdr, |l| &l.hdr).cloned().unwrap_or_default();
     let st = state.clone();
     let st2 = state.clone();
@@ -201,7 +202,7 @@ fn channel_bins(h: &Histogram, c: ToneChannel) -> Vec<f32> {
     crate::widgets::paint::normalize_bins(bins, 96)
 }
 
-fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let channel = s.panels.levels_channel;
     let levels = read_scoped_optional(s.adj(), scope, |a| &a.levels, |l| &l.levels);
@@ -251,7 +252,7 @@ fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx
         )
 }
 
-fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let channel = s.panels.curve_channel;
     let curves = read_scoped_optional(s.adj(), scope, |a| &a.curves, |l| &l.curves);
@@ -316,7 +317,7 @@ fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoEle
         )
 }
 
-fn clarity_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn clarity_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let c = read_scoped(state.read(cx).adj(), scope, |a| &a.clarity, |l| &l.clarity).cloned().unwrap_or_default();
     let (st, st2) = (state.clone(), state.clone());
     let method_names = [t("Natural", "自然"), t("Punch", "强烈"), t("Neutral", "中性"), t("Classic", "经典")];
@@ -347,7 +348,7 @@ fn clarity_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoE
         .child(param_c1(state, "clarity-structure", "ClarityStructure", scoped!(scope, clarity.structure), cx).range(-100.0, 100.0).default_value(0.0))
 }
 
-fn dehaze_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn dehaze_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let d = read_scoped(state.read(cx).adj(), scope, |a| &a.dehaze, |l| &l.dehaze).cloned().unwrap_or_default();
     let st = state.clone();
     ToolPanel::new(state, "dehaze", t("Dehaze", "去雾"))
@@ -361,7 +362,7 @@ fn dehaze_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoEl
         .child(param_c1(state, "dehaze-amount", "DehazeAmount", scoped!(scope, dehaze.amount), cx))
 }
 
-fn vignetting_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn vignetting_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let v = state.read(cx).adj().vignetting.clone();
     let (st, st2) = (state.clone(), state.clone());
     let names = [t("Elliptic on Crop", "裁剪椭圆"), t("Circular", "圆形"), t("Circular Crop", "圆形裁剪")];

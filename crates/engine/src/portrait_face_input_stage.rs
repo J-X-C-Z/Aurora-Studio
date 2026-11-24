@@ -76,6 +76,7 @@ struct SharedFaceInputKey {
 
 struct SharedFaceInputImage {
     image: Arc<Image>,
+    sha256: Arc<OnceLock<[u8; 32]>>,
     key: SharedFaceInputKey,
     stamp: u64,
 }
@@ -138,6 +139,7 @@ pub(crate) fn register_face_input_image(
         key,
         SharedFaceInputImage {
             image: Arc::clone(&image),
+            sha256: Arc::new(OnceLock::new()),
             key,
             stamp,
         },
@@ -158,10 +160,10 @@ pub(crate) fn register_face_input_image(
     image
 }
 
-/// Trusted identity for an image produced by this process's Source cache.
+/// Shared SHA-256 for an immutable image produced by this process's Source cache.
 /// The `Arc` pointer check makes this sound even if the allocator reuses the
 /// plane address for a different image.
-fn trusted_source_fingerprint(image: &Image) -> Option<u64> {
+fn shared_source_digest(image: &Image) -> Option<Arc<OnceLock<[u8; 32]>>> {
     let guard = shared_face_inputs()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -173,12 +175,11 @@ fn trusted_source_fingerprint(image: &Image) -> Option<u64> {
                 && entry.image.pixels.len() == image.pixels.len()
                 && std::ptr::eq(Arc::as_ptr(&entry.image), image)
         })
-        .map(|entry| entry.key.fingerprint)
+        .map(|entry| Arc::clone(&entry.sha256))
 }
 
-/// Internal cache identity. A trusted snapshot fingerprint lets a cache hit
-/// skip the full-frame scan; untrusted images keep a real content SHA-256, and
-/// the produced bundle still stores that SHA for the cross-process receipt.
+/// The session cache uses exact content SHA-256; shared source images compute
+/// it only once per immutable allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FaceInputSourceIdentity {
     Snapshot {
@@ -195,13 +196,6 @@ impl FaceInputSourceIdentity {
     fn size(self) -> [u32; 2] {
         match self {
             Self::Snapshot { size, .. } | Self::ContentSha256 { size, .. } => size,
-        }
-    }
-
-    fn sha256(self) -> Option<[u8; 32]> {
-        match self {
-            Self::Snapshot { .. } => None,
-            Self::ContentSha256 { sha256, .. } => Some(sha256),
         }
     }
 }
@@ -233,7 +227,12 @@ impl FaceInputModelPaths {
             .map(PathBuf::from)
             .or_else(default_face_landmark_root)
             .ok_or(Refusal::MissingInput("AURORA_FACE_LANDMARK_ROOT"))?;
-        let paths = Self::from_c1_and_landmark_roots(c1_root, landmark_root);
+        let parsing = if include_parsing {
+            face_parsing_v2_model_path().unwrap_or_default()
+        } else {
+            PathBuf::new()
+        };
+        let paths = Self::from_roots(c1_root.as_ref(), landmark_root.as_ref(), parsing);
         if include_parsing && !paths.parsing.is_file() {
             return Err(Refusal::MissingInput(FACE_PARSING_V2_MODEL_ENV));
         }
@@ -244,8 +243,14 @@ impl FaceInputModelPaths {
         c1_root: impl AsRef<Path>,
         landmark_root: impl AsRef<Path>,
     ) -> Self {
-        let c1_root = c1_root.as_ref();
-        let landmark_root = landmark_root.as_ref();
+        Self::from_roots(
+            c1_root.as_ref(),
+            landmark_root.as_ref(),
+            face_parsing_v2_model_path().unwrap_or_default(),
+        )
+    }
+
+    fn from_roots(c1_root: &Path, landmark_root: &Path, parsing: PathBuf) -> Self {
         let extra52_local = landmark_root.join("2722162333").join("model.onnx");
         let extra52 = if extra52_local.is_file() {
             extra52_local
@@ -265,7 +270,7 @@ impl FaceInputModelPaths {
                 .join("Common")
                 .join("FaceMesh")
                 .join("faceMesh.onnx"),
-            parsing: face_parsing_v2_model_path().unwrap_or_default(),
+            parsing,
             coarse: landmark_root.join("assets").join("1063025060.onnx"),
             dense: landmark_root.join("assets").join("323773030.onnx"),
             extra52,
@@ -292,17 +297,58 @@ fn default_face_landmark_root() -> Option<PathBuf> {
     })
 }
 
+type ParsingModelChecks = Mutex<HashMap<PathBuf, (FaceInputFileStamp, bool)>>;
+
 fn is_canonical_face_parsing_v2(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
+    static CHECKS: OnceLock<ParsingModelChecks> = OnceLock::new();
+    matches_parsing_model(
+        path,
+        crate::face_parsing::FACE_PARSING_V2_MODEL_BYTES,
+        crate::face_parsing::FACE_PARSING_V2_MODEL_SHA256,
+        CHECKS.get_or_init(|| Mutex::new(HashMap::new())),
+    )
+}
+
+fn matches_parsing_model(
+    path: &Path,
+    expected_bytes: u64,
+    expected_sha256: [u8; 32],
+    checks: &ParsingModelChecks,
+) -> bool {
+    let Ok(absolute_path) = std::path::absolute(path) else {
         return false;
     };
-    if meta.len() != crate::face_parsing::FACE_PARSING_V2_MODEL_BYTES {
+    let path = absolute_path.as_path();
+    let Ok(stamp) = file_stamp(path) else {
         return false;
+    };
+    if stamp.bytes != expected_bytes {
+        return false;
+    }
+    if let Some((_, verified)) = checks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .filter(|(cached, _)| *cached == stamp)
+    {
+        return *verified;
     }
     let Ok(bytes) = fs::read(path) else {
         return false;
     };
-    sha256_32(&bytes) == crate::face_parsing::FACE_PARSING_V2_MODEL_SHA256
+    let verified = sha256_32(&bytes) == expected_sha256;
+    if file_stamp(path) != Ok(stamp) {
+        return false;
+    }
+    if stamp.modified_nanos == 0 {
+        return verified;
+    }
+    let mut checks = checks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if checks.len() >= 32 {
+        checks.clear();
+    }
+    checks.insert(absolute_path, (stamp, verified));
+    verified
 }
 
 fn face_parsing_v2_model_path() -> Option<PathBuf> {
@@ -478,14 +524,35 @@ pub struct FaceInputBundle {
 }
 
 impl FaceInputBundle {
+    fn reticket(&mut self, job_id: u64) {
+        self.job_id = job_id;
+        if let Some(inputs) = self.model_inputs.as_mut() {
+            if let Some(parsing) = inputs.parsing.as_mut() {
+                parsing.job_id = job_id;
+            }
+            if let Some(teeth) = inputs.teeth.as_mut() {
+                teeth.job_id = job_id;
+            }
+        }
+    }
+
     pub fn validate_ticket(&self, source: &Image, job_id: Option<u64>) -> Result<(), Refusal> {
+        self.validate_ticket_with_digest(source, job_id, || sha256_32(&source.pixels))
+    }
+
+    fn validate_ticket_with_digest(
+        &self,
+        source: &Image,
+        job_id: Option<u64>,
+        digest: impl FnOnce() -> [u8; 32],
+    ) -> Result<(), Refusal> {
         if self.job_id == 0 || Some(self.job_id) != job_id {
             return Err(Refusal::ValueOutOfRange("face input job ticket"));
         }
         if self.source_size != [source.width, source.height] {
             return Err(Refusal::ShapeMismatch("face input source size"));
         }
-        if self.source_sha256 != sha256_32(&source.pixels) {
+        if self.source_sha256 != digest() {
             return Err(Refusal::ValueOutOfRange("face input source digest"));
         }
         if self.points194.len() != 194
@@ -2263,10 +2330,7 @@ impl FaceInputProducer {
         self.produce_with_sha(job_id, source, None)
     }
 
-    /// PF-F: an untrusted caller has already paid for the content SHA-256 when
-    /// it built the cache identity; pass it here so a cache miss does not scan
-    /// the same frame twice. A trusted snapshot passes `None` and the receipt
-    /// SHA is computed once, exactly as before.
+    /// Reuse the exact SHA-256 computed for the session's cache identity.
     fn produce_with_sha(
         &self,
         job_id: u64,
@@ -2337,7 +2401,7 @@ impl FaceInputProducer {
             landmark_producer,
             model_inputs,
         };
-        bundle.validate_ticket(source, Some(job_id))?;
+        bundle.validate_ticket_with_digest(source, Some(job_id), || bundle.source_sha256)?;
         Ok(bundle)
     }
 
@@ -2901,19 +2965,14 @@ impl FaceInputResultCache {
     }
 }
 
-/// Cheap structural check for a result-cache hit.
-///
-/// `validate_ticket` is deliberately not used here: it hashes the whole frame,
-/// which is exactly the scan `FaceInputSourceIdentity::Snapshot` exists to
-/// avoid. Shape, finiteness and the teeth-mask size still catch a corrupt or
-/// truncated bundle without touching pixels.
 fn cached_bundle_matches(bundle: &FaceInputBundle, identity: FaceInputSourceIdentity) -> bool {
+    let FaceInputSourceIdentity::ContentSha256 { sha256, .. } = identity else {
+        return false;
+    };
     let size = identity.size();
     let frame_pixels = size[0] as usize * size[1] as usize;
     bundle.source_size == size
-        && identity
-            .sha256()
-            .map_or(true, |sha| bundle.source_sha256 == sha)
+        && bundle.source_sha256 == sha256
         && bundle.points194.len() == 194
         && bundle.points414.len() == 414
         && bundle
@@ -3120,18 +3179,12 @@ impl FaceInputSession {
         if job_id == 0 {
             return Err(Refusal::ValueOutOfRange("face input job ticket"));
         }
-        // PF-F P-12: a Source-produced image carries a trusted snapshot
-        // fingerprint, so a cache hit never scans the full frame. Any other
-        // image keeps a real content SHA-256 for both the cache key and the
-        // bundle receipt.
         let size = [source.width, source.height];
-        let identity = match trusted_source_fingerprint(source) {
-            Some(fingerprint) => FaceInputSourceIdentity::Snapshot { fingerprint, size },
-            None => FaceInputSourceIdentity::ContentSha256 {
-                sha256: sha256_32(&source.pixels),
-                size,
-            },
+        let digest = match shared_source_digest(source) {
+            Some(sha256) => *sha256.get_or_init(|| sha256_32(&source.pixels)),
+            None => sha256_32(&source.pixels),
         };
+        let identity = FaceInputSourceIdentity::ContentSha256 { sha256: digest, size };
         let alias = FaceInputAliasKey {
             session_fingerprint: self.key.fingerprint(),
             source: identity,
@@ -3143,29 +3196,8 @@ impl FaceInputSession {
         if let Some(cached) = cached {
             if cached_bundle_matches(&cached, identity) {
                 let mut bundle = (*cached).clone();
-                bundle.job_id = job_id;
-                match bundle.validate_ticket(source, Some(job_id)) {
-                    Ok(()) => {
-                        if let Some(inputs) = bundle.model_inputs.as_mut() {
-                            if let Some(parsing) = inputs.parsing.as_mut() {
-                                parsing.job_id = job_id;
-                            }
-                            if let Some(teeth) = inputs.teeth.as_mut() {
-                                teeth.job_id = job_id;
-                            }
-                        }
-                        return Ok(bundle);
-                    }
-                    Err(refusal) => {
-                        let mut cache = result_cache()
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if let Some(alias_entry) = cache.aliases.remove(&alias) {
-                            cache.remove_result(&alias_entry.result);
-                        }
-                        return Err(refusal);
-                    }
-                }
+                bundle.reticket(job_id);
+                return Ok(bundle);
             }
             let mut cache = result_cache()
                 .lock()
@@ -3184,14 +3216,12 @@ impl FaceInputSession {
         // run, so no lock is held while the leader is in `produce_uncached`.
         let outcome = flight
             .cell
-            .get_or_init(|| self.produce_uncached(job_id, source, identity, &alias));
+            .get_or_init(|| self.produce_uncached(job_id, source, digest, &alias));
         release_result_flight(&alias, &flight);
         match outcome {
             Ok(bundle) => {
-                // The cached bundle keeps the producer's ticket; callers get
-                // the ticket they asked for.
                 let mut bundle = (**bundle).clone();
-                bundle.job_id = job_id;
+                bundle.reticket(job_id);
                 Ok(bundle)
             }
             Err(refusal) => Err(refusal.clone()),
@@ -3205,7 +3235,7 @@ impl FaceInputSession {
         &self,
         job_id: u64,
         source: &Image,
-        identity: FaceInputSourceIdentity,
+        digest: [u8; 32],
         alias: &FaceInputAliasKey,
     ) -> Result<Arc<FaceInputBundle>, Refusal> {
         let cached = result_cache()
@@ -3213,7 +3243,7 @@ impl FaceInputSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .lookup(alias);
         if let Some(cached) = cached {
-            if cached_bundle_matches(&cached, identity) {
+            if cached_bundle_matches(&cached, alias.source) {
                 return Ok(cached);
             }
             let mut cache = result_cache()
@@ -3225,8 +3255,8 @@ impl FaceInputSession {
         }
         let bundle = self
             .producer
-            .produce_with_sha(job_id, source, identity.sha256())?;
-        let result_key = FaceInputResultKey::from_bundle(&self.key, &bundle, identity)?;
+            .produce_with_sha(job_id, source, Some(digest))?;
+        let result_key = FaceInputResultKey::from_bundle(&self.key, &bundle, alias.source)?;
         let bundle = Arc::new(bundle);
         result_cache()
             .lock()
@@ -3803,21 +3833,58 @@ mod pff_tests {
     }
 
     #[test]
+    fn parsing_model_checks_revalidate_replacements_and_preserve_sha() {
+        let path = std::env::temp_dir().join(format!(
+            "aurora-face-model-{}-{}.onnx",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let checks = Mutex::new(HashMap::new());
+        let valid = b"known";
+        let expected = sha256_32(valid);
+        let matches = || matches_parsing_model(&path, valid.len() as u64, expected, &checks);
+        let replace = |bytes: &[u8], seconds| {
+            use std::io::Write;
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(bytes).unwrap();
+            file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds)).unwrap();
+        };
+        replace(b"wrong", 1_700_000_000);
+        assert!(!matches());
+        assert!(!matches());
+        replace(valid, 1_700_000_002);
+        assert!(matches());
+        assert!(matches());
+        replace(b"wrong", 1_700_000_004);
+        assert!(!matches());
+        fs::remove_file(&path).unwrap();
+        assert!(!matches());
+    }
+
+    #[test]
     fn shared_face_input_reuses_one_arc_and_bounds_entries() {
         clear_shared();
         let first = Arc::new(Image::new(2, 2, vec![7; 16]).expect("image"));
         let registered = register_face_input_image((0x1000, 16, 11, 2, 2), Arc::clone(&first));
         let reused = shared_face_input_image((0x1000, 16, 11, 2, 2)).expect("shared");
         assert!(Arc::ptr_eq(&registered, &reused));
-        assert_eq!(trusted_source_fingerprint(&reused), Some(11));
+        let digest = shared_source_digest(&reused).expect("registered image");
+        assert_eq!(digest.get(), None);
+        let expected = sha256_32(&reused.pixels);
+        assert_eq!(*digest.get_or_init(|| expected), expected);
+        let warm = shared_source_digest(&reused).expect("same registered image");
+        assert_eq!(warm.get(), Some(&expected));
 
         // A different allocation is never trusted by address alone.
         let other = Arc::new(Image::new(2, 2, vec![9; 16]).expect("image"));
-        assert_eq!(trusted_source_fingerprint(&other), None);
+        assert!(shared_source_digest(&other).is_none());
 
         // At most two sources stay resident; the oldest is evicted.
         let second = Arc::new(Image::new(2, 2, vec![8; 16]).expect("image"));
         register_face_input_image((0x2000, 16, 12, 2, 2), Arc::clone(&second));
+        let second_digest = shared_source_digest(&second).expect("second image");
+        assert_eq!(second_digest.get(), None);
+        assert_ne!(*second_digest.get_or_init(|| sha256_32(&second.pixels)), expected);
         let third = Arc::new(Image::new(2, 2, vec![6; 16]).expect("image"));
         register_face_input_image((0x3000, 16, 13, 2, 2), Arc::clone(&third));
         assert!(shared_face_input_image((0x1000, 16, 11, 2, 2)).is_none());
@@ -3880,18 +3947,18 @@ mod pff_tests {
     }
 
     #[test]
-    fn content_identity_only_exposes_its_sha() {
+    fn content_and_snapshot_identities_are_distinct() {
         let snapshot = FaceInputSourceIdentity::Snapshot {
             fingerprint: 7,
             size: [2, 1],
         };
-        assert_eq!(snapshot.sha256(), None);
         assert_eq!(snapshot.size(), [2, 1]);
         let content = FaceInputSourceIdentity::ContentSha256 {
             sha256: [3; 32],
             size: [2, 1],
         };
-        assert_eq!(content.sha256(), Some([3; 32]));
+        assert_eq!(content.size(), [2, 1]);
+        assert_ne!(snapshot, content);
     }
 
     /// PF-F acceptance microbenchmark: 24MP, ten consecutive requests.
