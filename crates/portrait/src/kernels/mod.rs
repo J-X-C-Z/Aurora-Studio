@@ -5,6 +5,8 @@
 
 pub mod body_geometry;
 pub mod body_geometry_params;
+pub mod body_pose_adapter;
+pub mod body_region_geometry;
 pub mod blemish;
 pub mod blemish_blend;
 pub mod beard_transform;

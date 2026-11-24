@@ -213,12 +213,13 @@ fn needs_before(
 }
 
 /// Whether two requests would produce the same engine frame. The generation
-/// differs by definition and the quality does not change interactive pixels
-/// (both go through the exact `render_preview` path).
+/// differs by definition. Draft frames use the half-size fast path, so quality
+/// is part of the pixels and a release must not reuse a draft.
 fn same_render_inputs(a: &PreviewRequest, b: &PreviewRequest) -> bool {
     a.image == b.image
         && a.region == b.region
         && a.max_size == b.max_size
+        && a.quality == b.quality
         && a.bypass == b.bypass
         && a.mask_overlay == b.mask_overlay
         && a.display_profile == b.display_profile
@@ -925,6 +926,7 @@ impl AppState {
     }
 
     fn enqueue_render(&mut self, quality: RenderQuality, requested_at: std::time::Instant, cx: &mut Context<Self>) {
+        self.preview.draft = quality == RenderQuality::Draft;
         // A new drag supersedes an older release's pending final frame.
         if self.preview.accept_request(quality, requested_at) == PreviewRequested::Coalesced {
             return;
@@ -937,14 +939,15 @@ impl AppState {
         request.generation = self.preview.generation;
         let stamp = crate::perf::Stamp::new(request.generation, quality, requested_at);
         let requested_image = request.image;
-        let before = needs_before(
-            self.view.compare != super::CompareMode::Off,
-            self.preview.before_dirty,
-            self.preview.before.as_ref(),
-            request.image,
-            &request.adjustments.geometry,
-            request.region,
-        )
+        let before = (quality == RenderQuality::Final
+            && needs_before(
+                self.view.compare != super::CompareMode::Off,
+                self.preview.before_dirty,
+                self.preview.before.as_ref(),
+                request.image,
+                &request.adjustments.geometry,
+                request.region,
+            ))
         .then(|| self.preview_request(RenderQuality::Final, true))
         .flatten();
         if before.is_some() {
@@ -969,6 +972,7 @@ impl AppState {
         });
         cx.spawn(async move |this, cx| {
             let after_engine = engine.clone();
+            let fast = quality == RenderQuality::Draft;
             let frame = cx
                 .background_spawn(async move {
                     let started_at = std::time::Instant::now();
@@ -976,7 +980,7 @@ impl AppState {
                         .then(crate::perf::working_set_bytes)
                         .flatten();
                     let (region, image_id) = (request.region, request.image);
-                    after_engine.render_preview(&request).map(move |f| {
+                    after_engine.render_preview_fast(&request, fast).map(move |f| {
                         let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                         let source_status = crate::planned::source_status(after_engine.as_ref(), image_id);
                         let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
@@ -1710,10 +1714,13 @@ mod ordering_tests {
     #[test]
     fn overlay_only_requests_share_render_inputs() {
         let a = request(1, 5, FULL);
-        let mut newer = a.clone();
-        newer.generation = 99;
-        newer.quality = RenderQuality::Draft;
-        assert!(same_render_inputs(&a, &newer));
+        let mut newer_generation = a.clone();
+        newer_generation.generation = 99;
+        assert!(same_render_inputs(&a, &newer_generation));
+
+        let mut draft = a.clone();
+        draft.quality = RenderQuality::Draft;
+        assert!(!same_render_inputs(&a, &draft), "a release must replace the draft");
 
         let mut region = a.clone();
         region.region = TILE;

@@ -21,6 +21,7 @@ mod meta;
 mod nef;
 mod orf;
 mod packbits;
+mod raf;
 mod rw2;
 mod tiff;
 
@@ -77,7 +78,7 @@ pub(crate) fn decode_bytes(bytes: &[u8]) -> NativeResult<BayerFrame> {
         return cr3::decode(bytes);
     }
     if bytes.starts_with(b"FUJIFILMCCD-RAW") {
-        return Err(NativeError::unsupported("Fujifilm RAF is stage 2"));
+        return raf::decode(bytes);
     }
     if bytes.starts_with(b"IIRO") || bytes.starts_with(b"IIRS") {
         return orf::decode(bytes);
