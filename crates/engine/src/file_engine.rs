@@ -124,14 +124,76 @@ fn source_cache_bytes(source: &Source) -> usize {
     })
 }
 
+/// How a file is decoded, for working-set estimation only. Proxy/native RAW and
+/// raster decoders allocate very different intermediates at the *source*
+/// resolution, so admission must not be based on the retained 4096 proxy alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeFormat {
+    /// RAW/EIP decoded at source resolution, then downscaled to the 4096 proxy.
+    RawProxy,
+    /// RAW/EIP decoded at full source resolution and retained 1:1.
+    RawNative,
+    /// JPEG/PNG/TIFF/HEIF/COP and any other raster decoded through `image`.
+    Raster,
+}
+
+impl DecodeFormat {
+    fn is_native(self) -> bool {
+        matches!(self, DecodeFormat::RawNative)
+    }
+
+    /// Transient bytes per *source* pixel while decoding, from the buffers each
+    /// pipeline holds at peak. RAW: Bayer16 plane 2 B/px + demosaiced RGB16
+    /// 6 B/px + demosaic intermediates 4 B/px = 12 B/px. Raster: `DynamicImage`
+    /// 4 B/px + RGBA8/RGBA16 copy 8 B/px + downscaled frame 4 B/px = 16 B/px.
+    /// These cover the whole decode, not the retained proxy. They are the
+    /// admission envelope; re-check against Release peak RSS whenever the
+    /// decoder pipeline or libraw/image versions change.
+    fn transient_bytes_per_px(self) -> usize {
+        match self {
+            DecodeFormat::RawProxy | DecodeFormat::RawNative => RAW_DECODE_TRANSIENT_BYTES_PER_PX,
+            DecodeFormat::Raster => RASTER_DECODE_TRANSIENT_BYTES_PER_PX,
+        }
+    }
+}
+
+/// F32 RGB bytes per retained proxy pixel (the mip pyramid stores `[f32; 3]`).
+const RETAINED_BYTES_PER_PX: usize = std::mem::size_of::<[f32; 3]>();
+/// Decoder intermediates per source pixel for RAW/EIP (see `DecodeFormat`).
+const RAW_DECODE_TRANSIENT_BYTES_PER_PX: usize = 12;
+/// Decoder intermediates per source pixel for raster formats.
+const RASTER_DECODE_TRANSIENT_BYTES_PER_PX: usize = 16;
+
 /// Rough working set of one decode: the retained mip pyramid plus the decoder's
-/// transient frame. Used only for admission control, not for cache accounting.
-fn estimated_decode_bytes(width: u32, height: u32, native: bool) -> usize {
-    let (w, h) = if native { (width, height) } else { fit_long_side((width, height)) };
-    let px = (w as usize).saturating_mul(h as usize);
-    let retained = px.saturating_mul(std::mem::size_of::<[f32; 3]>()).saturating_mul(4) / 3;
-    let transient = px.saturating_mul(if native { 10 } else { 6 });
+/// transient frame at the source resolution. Used only for admission control,
+/// not for cache accounting. The proxy is capped to 4096, but the decoder still
+/// touches every source pixel, so only the retained part uses `fit_long_side`.
+fn estimated_decode_bytes(width: u32, height: u32, format: DecodeFormat) -> usize {
+    let source_px = (width as usize).saturating_mul(height as usize);
+    let (kept_w, kept_h) = if format.is_native() {
+        (width, height)
+    } else {
+        fit_long_side((width, height))
+    };
+    let kept_px = (kept_w as usize).saturating_mul(kept_h as usize);
+    let retained = kept_px.saturating_mul(RETAINED_BYTES_PER_PX).saturating_mul(4) / 3;
+    let transient = source_px.saturating_mul(format.transient_bytes_per_px());
     retained.saturating_add(transient)
+}
+
+/// Decode-format class for a proxy decode of `path`; native RAW decodes pass
+/// `RawNative` explicitly.
+fn proxy_decode_format(path: &Path) -> DecodeFormat {
+    if crate::raw::is_raw(path) || is_eip(path) {
+        DecodeFormat::RawProxy
+    } else {
+        DecodeFormat::Raster
+    }
+}
+
+/// Admission units both decode gates are sized to for a byte budget.
+fn decode_gate_units(cache_bytes: usize) -> usize {
+    (cache_bytes / DECODE_UNIT_BYTES).clamp(2, 6)
 }
 
 /// Admission units one decode reserves: its estimated working set in 256 MiB
@@ -1149,7 +1211,9 @@ impl Drop for GatePermit<'_> {
 
 /// RAW proxy/native decodes and light JPEG/PNG decodes have separate admission,
 /// so a 45MP native frame cannot block a filmstrip thumbnail behind it. Within
-/// each gate, preview work outranks thumbnails.
+/// each gate, preview work outranks thumbnails. Both gates are sized from the
+/// byte budget and every request reserves units for its estimated working set,
+/// so neither channel can bypass the memory budget.
 struct DecodeGates {
     heavy: DecodeGate,
     light: DecodeGate,
@@ -1157,11 +1221,8 @@ struct DecodeGates {
 
 impl DecodeGates {
     fn new(cache_bytes: usize) -> Self {
-        let cores = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
-        Self {
-            heavy: DecodeGate::new((cache_bytes / DECODE_UNIT_BYTES).clamp(2, 6)),
-            light: DecodeGate::new((cores / 2).clamp(2, 6)),
-        }
+        let units = decode_gate_units(cache_bytes);
+        Self { heavy: DecodeGate::new(units), light: DecodeGate::new(units) }
     }
 }
 
@@ -1971,13 +2032,14 @@ impl FileEngine {
     }
 
     /// One decode per image: callers that arrive mid-decode wait on the same
-    /// flight. Different images run in parallel, bounded by the heavy gate and
-    /// the RAM-derived units that image needs; thumbnails queue behind previews.
+    /// flight. Different images run in parallel, bounded by their gate (heavy
+    /// for RAW/EIP/COP/HEIF, light for other rasters) and the RAM-derived units
+    /// the source-resolution estimate needs; thumbnails queue behind previews.
     fn source_with_priority(&self, image: ImageId, priority: DecodePriority) -> anyhow::Result<Arc<Source>> {
         if let Some(src) = self.cached_source(image) {
             return Ok(src);
         }
-        let (path, lens, width, height, heavy) = {
+        let (path, lens, width, height, heavy, format) = {
             let st = self.state.lock();
             let entry = st
                 .entries
@@ -1994,6 +2056,7 @@ impl FileEngine {
                 entry.info.width,
                 entry.info.height,
                 heavy,
+                proxy_decode_format(&entry.path),
             )
         };
         let key = SourceKey::Proxy(image);
@@ -2004,11 +2067,13 @@ impl FileEngine {
             }
             FlightRole::Leader(leader) => leader,
         };
+        let bytes = estimated_decode_bytes(width, height, format);
         let _permit = if heavy {
-            let units = decode_units(self.decode_gates.heavy.total_units(), estimated_decode_bytes(width, height, false));
+            let units = decode_units(self.decode_gates.heavy.total_units(), bytes);
             self.decode_gates.heavy.acquire(priority, units)
         } else {
-            self.decode_gates.light.acquire(priority, 1)
+            let units = decode_units(self.decode_gates.light.total_units(), bytes);
+            self.decode_gates.light.acquire(priority, units)
         };
         // A decode that was already in flight may have finished while this
         // request waited for admission; take its result instead of decoding.
@@ -2168,7 +2233,10 @@ impl FileEngine {
                     st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(previous.bytes);
                 }
             }
-            let units = decode_units(self.decode_gates.heavy.total_units(), estimated_decode_bytes(width, height, true));
+            let units = decode_units(
+                self.decode_gates.heavy.total_units(),
+                estimated_decode_bytes(width, height, DecodeFormat::RawNative),
+            );
             let _permit = self.decode_gates.heavy.acquire(DecodePriority::Interactive, units);
             self.state.lock().source_cache.misses += 1;
             let decoded = (|| {
@@ -2244,7 +2312,9 @@ impl FileEngine {
         let max_bytes = if max_bytes == 0 { default_source_cache_bytes() } else { max_bytes };
         // Concurrency follows the budget: a smaller cache admits fewer large
         // decodes at once. Gate before state, matching decoders' lock order.
-        self.decode_gates.heavy.set_total_units((max_bytes / DECODE_UNIT_BYTES).clamp(2, 6));
+        let units = decode_gate_units(max_bytes);
+        self.decode_gates.heavy.set_total_units(units);
+        self.decode_gates.light.set_total_units(units);
         let mut st = self.state.lock();
         st.source_cache.max_bytes = max_bytes;
         evict_sources_to_budget(&mut st, None);
@@ -6111,8 +6181,54 @@ mod tests {
         assert_eq!(decode_units(6, 1), 1);
         assert_eq!(decode_units(6, DECODE_UNIT_BYTES * 3), 3);
         assert_eq!(decode_units(2, DECODE_UNIT_BYTES * 99), 2);
-        // A 24MP RAW proxy and a 45MP native view reserve different shares.
-        assert!(estimated_decode_bytes(8256, 5504, true) > estimated_decode_bytes(8256, 5504, false));
+        // A 45MP RAW proxy and a 45MP native view reserve different shares.
+        assert!(
+            estimated_decode_bytes(8256, 5504, DecodeFormat::RawNative)
+                > estimated_decode_bytes(8256, 5504, DecodeFormat::RawProxy)
+        );
+    }
+
+    #[test]
+    fn decode_estimate_uses_source_resolution_for_transient_work() {
+        // 45MP RAW proxy: the retained proxy is 4096-long-side, but the decoder
+        // still touches every source pixel, so the estimate must not collapse
+        // to the ~11MP proxy size (the old bug underestimated ~3x).
+        let (w, h) = (8256u32, 5504u32);
+        let source_px = w as usize * h as usize;
+        let proxy = estimated_decode_bytes(w, h, DecodeFormat::RawProxy);
+        let native = estimated_decode_bytes(w, h, DecodeFormat::RawNative);
+        let raster = estimated_decode_bytes(w, h, DecodeFormat::Raster);
+        assert!(proxy >= source_px * RAW_DECODE_TRANSIENT_BYTES_PER_PX, "{proxy}");
+        assert!(native > proxy, "native {native} should exceed proxy {proxy}");
+        assert!(raster > proxy, "raster {raster} should exceed proxy {proxy}");
+        // The retained mip is sized from the 4096 proxy, not the source.
+        let kept = fit_long_side((w, h));
+        let kept_px = kept.0 as usize * kept.1 as usize;
+        assert!(kept_px < source_px / 3, "proxy should retain far fewer pixels");
+        assert_eq!(proxy, kept_px * RETAINED_BYTES_PER_PX * 4 / 3 + source_px * RAW_DECODE_TRANSIENT_BYTES_PER_PX);
+        assert_eq!(native, source_px * RETAINED_BYTES_PER_PX * 4 / 3 + source_px * RAW_DECODE_TRANSIENT_BYTES_PER_PX);
+        // 100MP raster: full DynamicImage + RGBA copy + downscale frame.
+        let (w, h) = (12288u32, 8192u32);
+        let source_px = w as usize * h as usize;
+        let raster = estimated_decode_bytes(w, h, DecodeFormat::Raster);
+        assert!(raster >= source_px * 14, "{raster} vs {}", source_px * 14);
+    }
+
+    #[test]
+    fn decode_gate_units_follow_byte_budget() {
+        let mib = 1024 * 1024usize;
+        assert_eq!(decode_gate_units(512 * mib), 2);
+        assert_eq!(decode_gate_units(4 * 1024 * mib), 6);
+        let gates = DecodeGates::new(512 * mib);
+        assert_eq!(gates.heavy.total_units(), 2);
+        assert_eq!(gates.light.total_units(), 2);
+    }
+
+    #[test]
+    fn large_raster_reserves_most_of_a_full_gate() {
+        // A ~64MP raster cannot be admitted several times at once.
+        let bytes = estimated_decode_bytes(8000, 8000, DecodeFormat::Raster);
+        assert!(decode_units(6, bytes) >= 5, "{bytes}");
     }
 
     #[test]
