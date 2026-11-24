@@ -211,6 +211,7 @@ impl BodyGeometryProducerInputs {
             job_id: self.job_id,
             frame_size: self.frame_size,
             source_sha256: self.source_sha256,
+            body_params: super::portrait_body_stage::BodyVendorParams::for_effects(&effects),
             effects,
         })
     }

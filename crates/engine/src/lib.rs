@@ -123,6 +123,7 @@ pub use portrait_stage::{
 pub(crate) use portrait_stage::sha256_32;
 pub use portrait_stage::{
     BodyGeometryInput, BodyGeometryJob, BodyGeometryProducerInputs, BodyLandmarkDomain,
+    BodyVendorParams,
     BodyLandmarkEffect, BodyLandmarkFrame, BodyLandmarkRef, BodyShiftInput, FaceGeometry,
     FaceGeometryDraw,
     FaceGeometryInputs, FaceGeometryProviderInputs, FaceGeometryProviderMesh,

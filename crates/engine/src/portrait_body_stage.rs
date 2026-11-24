@@ -4,6 +4,9 @@ use std::hash::{Hash, Hasher};
 use aurora_portrait::kernels::body_geometry::{
     self as geometry, Brush, Mesh, Pass, PassDefines, Vec2,
 };
+use aurora_portrait::kernels::body_geometry_params::{
+    self as vendor_params, HeadZoomParams, LegFactors,
+};
 use aurora_portrait::kernels::hair_body::{self, PackedShiftMap};
 use aurora_portrait::kernels::{leg_refine, leg_refine_uv::LegColumn};
 use aurora_portrait::{Image, Refusal};
@@ -20,6 +23,40 @@ pub struct BodyGeometryJob {
     /// SHA-256 of the exact RGBA8 source bytes for this ticket.
     pub source_sha256: [u8; 32],
     pub effects: BTreeMap<u32, BodyGeometryInput>,
+    /// Vendor geometry factors for the effects present in `effects`.
+    ///
+    /// These are data receipts, not warp formulas. A missing entry means the
+    /// caller has not supplied the decoded vendor config; it never falls back
+    /// to an invented value.
+    pub body_params: BodyVendorParams,
+}
+
+/// Typed static factors decoded from `PoseRefine` / `SubPoseRefine`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BodyVendorParams {
+    /// PF406 `HeadZoom` radial factors, when PF406 is present.
+    pub head_zoom: Option<HeadZoomParams>,
+    /// PF407 `LengthenLegRefine` thigh/shank weights, when PF407 is present.
+    pub leg_factors: Option<LegFactors>,
+}
+
+impl BodyVendorParams {
+    pub fn for_effects(effects: &BTreeMap<u32, BodyGeometryInput>) -> Self {
+        Self {
+            head_zoom: effects.contains_key(&406).then_some(vendor_params::HEAD_ZOOM),
+            leg_factors: effects.contains_key(&407).then_some(vendor_params::LEG_FACTORS),
+        }
+    }
+
+    pub fn check(&self, effects: &BTreeMap<u32, BodyGeometryInput>) -> Result<(), Refusal> {
+        if effects.contains_key(&406) && self.head_zoom.is_none() {
+            return Err(Refusal::MissingInput("PF406 vendor HeadZoom factors"));
+        }
+        if effects.contains_key(&407) && self.leg_factors.is_none() {
+            return Err(Refusal::MissingInput("PF407 vendor leg factors"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +191,7 @@ impl BodyGeometryJob {
         if frame.rows.is_empty() {
             return Err(Refusal::MissingInput("body geometry provider rows"));
         }
+        let mut vendor_pfs = BTreeMap::new();
 
         let pixel_count = usize::try_from(source.width)
             .ok()
@@ -163,7 +201,6 @@ impl BodyGeometryJob {
                     .and_then(|height| width.checked_mul(height))
             })
             .ok_or(Refusal::ShapeMismatch("body geometry provider frame"))?;
-        let mut effects = BTreeMap::new();
         for row in frame.rows {
             if row.ticket != frame.ticket {
                 return Err(Refusal::ValueOutOfRange(
@@ -184,7 +221,7 @@ impl BodyGeometryJob {
             if !supports(row.pf) {
                 return Err(Refusal::ValueOutOfRange("body geometry provider PF"));
             }
-            if effects.contains_key(&row.pf) {
+            if vendor_pfs.contains_key(&row.pf) {
                 return Err(Refusal::ValueOutOfRange(
                     "body geometry provider duplicate PF",
                 ));
@@ -192,18 +229,27 @@ impl BodyGeometryJob {
             let input = row
                 .input
                 .ok_or(Refusal::MissingInput("body geometry provider input"))?;
-            effects.insert(
-                row.pf,
-                build_row(row.pf, input, &row.evidence, pixel_count)?,
-            );
+            let built = build_row(row.pf, input, &row.evidence, pixel_count)?;
+            vendor_pfs.insert(row.pf, built);
         }
+        let body_params = BodyVendorParams::for_effects(&vendor_pfs);
+        body_params.check(&vendor_pfs)?;
 
         Ok(Self {
             job_id: frame.ticket,
             frame_size: frame.frame_size,
             source_sha256: frame.source_sha256,
-            effects,
+            effects: vendor_pfs,
+            body_params,
         })
+    }
+
+    /// PF406 `DefaultDegree=50` under `DegreeRange=[0,100]` and
+    /// `EnableDegreeRemap=true`. Returns `None` unless PF406 is present.
+    pub fn head_zoom_degree(&self) -> Option<f32> {
+        let params = self.body_params.head_zoom?;
+        let [lo, hi] = params.ui_range;
+        Some(((params.default_ui - lo) / (hi - lo)).clamp(0.0, 1.0))
     }
 
     pub(super) fn fingerprint(&self) -> u64 {
@@ -212,6 +258,8 @@ impl BodyGeometryJob {
         self.frame_size.hash(&mut hash);
         self.source_sha256.hash(&mut hash);
         self.effects.len().hash(&mut hash);
+        self.head_zoom_degree().map(|degree| degree.to_bits()).hash(&mut hash);
+        self.body_params.leg_factors.map(|factors| (factors.thigh.to_bits(), factors.shank.to_bits(), factors.use_ba_channel)).hash(&mut hash);
         for (pf, input) in &self.effects {
             pf.hash(&mut hash);
             std::mem::discriminant(input).hash(&mut hash);
@@ -601,6 +649,7 @@ pub(super) fn apply(
     if job.source_sha256 != sha256_32(&source.pixels) {
         return Err(Refusal::ValueOutOfRange("body geometry frame digest"));
     }
+    job.body_params.check(&job.effects)?;
     let input = job
         .effects
         .get(&pf)
