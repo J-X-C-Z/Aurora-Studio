@@ -291,6 +291,13 @@ fn raw16_source(path: &Path) -> Option<(Source, crate::raw::DecodeProvenance)> {
     crate::raw_cache::get_or_decode_source16(path, SOURCE_LONG_SIDE)
 }
 
+/// Capture ISO and body model for the output-domain BandingSuppression.
+/// Proxy and native RAW sources must use the same fields; when either is
+/// missing the stage stays off instead of guessing an amount.
+fn raw_banding_identity(exif: &crate::Exif) -> (Option<u32>, Option<String>) {
+    (exif.iso, exif.camera_model.clone())
+}
+
 /// Switch slightly before native 1:1 (rounding and minimum request sizes may
 /// differ between the viewer and the engine). Keep the proxy for fit views.
 fn wants_native_raw(
@@ -1495,16 +1502,17 @@ impl FileEngine {
         }
         // BandingSuppression is keyed on ISO and body; the stage stays off when
         // either is missing rather than falling back to a guessed amount.
-        let banding_exif = crate::raw::is_raw(&decoded_path)
-            .then(|| crate::exif::read_exif(&decoded_path));
+        let banding_identity = crate::raw::is_raw(&decoded_path)
+            .then(|| crate::exif::read_exif(&decoded_path))
+            .map(|exif| raw_banding_identity(&exif));
         let source = Arc::new(
             source
                 .with_lens_shot(lens)
                 .with_camera_preview(camera_preview)
                 .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear())
                 .with_banding_identity(
-                    banding_exif.as_ref().and_then(|exif| exif.iso),
-                    banding_exif.as_ref().and_then(|exif| exif.camera_model.as_deref()),
+                    banding_identity.as_ref().and_then(|(iso, _)| *iso),
+                    banding_identity.as_ref().and_then(|(_, model)| model.as_deref()),
                 ),
         );
 
@@ -1529,7 +1537,7 @@ impl FileEngine {
     }
 
     fn native_raw_source(&self, image: ImageId, viewport: Option<(&crate::Geometry, NormRect, u32)>) -> Option<Arc<Source>> {
-        let (path, lens) = {
+        let (path, lens, banding_identity) = {
             let st = self.state.lock();
             let entry = st.entries.iter().find(|e| e.info.id == image)?;
             if !(crate::raw::is_raw(&entry.path) || is_eip(&entry.path))
@@ -1544,7 +1552,11 @@ impl FileEngine {
                     return source.clone();
                 }
             }
-            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif))
+            (
+                entry.path.clone(),
+                crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif),
+                raw_banding_identity(&entry.info.exif),
+            )
         };
         let _decoding = self.decode.lock();
         {
@@ -1563,7 +1575,11 @@ impl FileEngine {
             Some(Arc::new(
                 source
                     .with_lens_shot(lens)
-                    .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear()),
+                    .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear())
+                    .with_banding_identity(
+                        banding_identity.0,
+                        banding_identity.1.as_deref(),
+                    ),
             ))
         })();
         if source.is_none() {
@@ -2936,15 +2952,21 @@ impl ImageEngine for FileEngine {
                 false,
                 None,
             );
-            let suggestion = crate::keystone::detect(&frame.rgba, frame.width, frame.height);
+            // `auto_keystone` converts the detector's degrees into the
+            // renderer's percentage controls; keep the user's aspect/skew/
+            // focal_length/flags.
+            let suggestion = crate::keystone::auto_keystone(
+                current.geometry.keystone.aspect,
+                &frame.rgba,
+                frame.width,
+                frame.height,
+            );
             adj.geometry.keystone = crate::Keystone {
-                vertical: suggestion.vertical,
-                horizontal: suggestion.horizontal,
-                amount: 100.0,
                 aspect: current.geometry.keystone.aspect,
                 skew: current.geometry.keystone.skew,
                 focal_length: current.geometry.keystone.focal_length,
                 flags: current.geometry.keystone.flags,
+                ..suggestion
             };
         }
         Ok(AutoResult { adjustments: adj })
@@ -3553,6 +3575,37 @@ mod tests {
         let generic = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Cpu);
         assert_eq!(generic.pixel_space, PixelSpace::CameraLinear16);
         assert!(!generic.unlocks_c1_z6iii_linear());
+    }
+
+    #[test]
+    fn native_and_proxy_raw_sources_share_banding_identity() {
+        // Synthetic capture metadata: no NEF or C1 install involved. The proxy
+        // source() reads the file EXIF; native_raw_source() reads entry.info.exif.
+        // Both funnel the same ISO/model fields through raw_banding_identity().
+        let exif = crate::Exif {
+            camera_model: Some("NIKON Z 6III".to_owned()),
+            iso: Some(320),
+            ..Default::default()
+        };
+        let proxy_identity = raw_banding_identity(&exif);
+        let native_identity = raw_banding_identity(&exif);
+        assert_eq!(native_identity, proxy_identity);
+        assert_eq!(proxy_identity, (Some(320), Some("NIKON Z 6III".to_owned())));
+
+        // The identity is resolution-independent: the full-size native shape and
+        // the 4096 proxy shape are built through the same metadata helper.
+        let decorate = |source: Source, identity: &(Option<u32>, Option<String>)| {
+            source.with_banding_identity(identity.0, identity.1.as_deref())
+        };
+        let native_shape = decorate(Source::from_rgba16(8, 6, &[0u16; 8 * 6 * 4]), &native_identity);
+        let proxy_shape = decorate(Source::from_rgba16(4, 3, &[0u16; 4 * 3 * 4]), &proxy_identity);
+        std::hint::black_box((native_shape, proxy_shape));
+
+        // Either field missing keeps BandingSuppression off for both paths.
+        let missing_model = crate::Exif { iso: Some(320), ..Default::default() };
+        assert_eq!(raw_banding_identity(&missing_model), (Some(320), None));
+        let missing_iso = crate::Exif { camera_model: Some("NIKON Z 6III".to_owned()), ..Default::default() };
+        assert_eq!(raw_banding_identity(&missing_iso), (None, Some("NIKON Z 6III".to_owned())));
     }
 
     #[test]

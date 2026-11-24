@@ -14,6 +14,8 @@ pub(crate) mod pixel_gpu;
 pub(crate) mod detail_gpu;
 #[cfg(windows)]
 pub(crate) mod clarity_gpu;
+#[cfg(windows)]
+pub(crate) mod develop_gpu;
 #[cfg(not(windows))]
 pub(crate) mod clarity_gpu {
     use super::clarity;

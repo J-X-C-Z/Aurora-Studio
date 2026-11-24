@@ -5,8 +5,8 @@
 //! out; a converging pair leaves half the convergence in each half. The result
 //! is only a suggestion: nothing here writes adjustments.
 
-/// Suggested keystone correction in degrees, matching [`crate::Keystone`]'s
-/// vertical/horizontal controls.
+/// Suggested keystone correction in degrees. [`auto_keystone`] converts them to
+/// [`crate::Keystone`]'s percentage controls (the renderer's 0.35-inset scale).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Suggestion {
     pub vertical: f32,
@@ -185,6 +185,31 @@ pub fn detect(rgba: &[u8], w: u32, h: u32) -> Suggestion {
     zero
 }
 
+/// How far one [`crate::Keystone`] unit moves a frame corner, as a fraction of
+/// the frame width (`KeystoneMap` in `mock/geometry.rs`). The detector works in
+/// pixels, so its degrees have to go back through the same scale.
+const INSET_PER_UNIT: f32 = 0.35;
+
+/// Full [`crate::Keystone`] for the Auto button: absolute (the caller renders
+/// the frame with the current keystone removed) and at full amount. `aspect`
+/// only passes the user's stretch compensation through.
+pub fn auto_keystone(aspect: f32, rgba: &[u8], w: u32, h: u32) -> crate::Keystone {
+    let half = detect(rgba, w, h);
+    let (wu, hu) = (w.max(1) as f32, h.max(1) as f32);
+    // A normalized inset `a` tilts the edge by `atan(a * w / h)`, so the inverse
+    // is `tan(angle) * h / w` on the vertical axis and `w / h` on the horizontal.
+    let units = |deg: f32, other_over_this: f32| {
+        (deg.to_radians().tan() * other_over_this / INSET_PER_UNIT * 100.0).clamp(-100.0, 100.0)
+    };
+    crate::Keystone {
+        vertical: units(half.vertical, hu / wu),
+        horizontal: units(half.horizontal, wu / hu),
+        amount: 100.0,
+        aspect,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +328,45 @@ mod tests {
     fn flat_image_returns_defaults() {
         let img = vec![128u8; 320 * 240 * 4];
         assert_eq!(detect(&img, 320, 240), Suggestion::default());
+    }
+
+    /// The Auto button writes `Keystone` units, not degrees: a 7° half-angle
+    /// must land on the renderer's 0.35-inset scale for this frame's aspect.
+    #[test]
+    fn auto_keystone_converts_degrees_to_keystone_units() {
+        let (w, h) = (512, 384);
+        let mut img = canvas(w, h);
+        line(&mut img, w, h, (0.30 * w as f32, 0.0), (0.20 * w as f32, h as f32 - 1.0));
+        line(&mut img, w, h, (0.50 * w as f32, 0.0), (0.60 * w as f32, h as f32 - 1.0));
+        let half = detect(&img, w, h);
+        assert!(half.vertical > 3.0, "fixture must converge, got {}", half.vertical);
+
+        let k = auto_keystone(20.0, &img, w, h);
+        let want = (half.vertical.to_radians().tan() * h as f32 / w as f32 / INSET_PER_UNIT * 100.0)
+            .clamp(-100.0, 100.0);
+        assert!((k.vertical - want).abs() < 1e-3, "vertical {} want {want}", k.vertical);
+        assert!((k.vertical - half.vertical).abs() > 1.0, "degrees leaked into the field: {}", k.vertical);
+        assert_ne!(k.vertical, half.vertical, "degrees leaked into the field");
+        assert_eq!(k.horizontal, 0.0);
+        assert_eq!(k.amount, 100.0);
+        assert_eq!(k.aspect, 20.0);
+        assert_eq!((k.skew, k.focal_length, k.flags), (0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn auto_keystone_on_a_flat_frame_is_neutral() {
+        let img = vec![128u8; 320 * 240 * 4];
+        let k = auto_keystone(-3.0, &img, 320, 240);
+        assert_eq!(
+            k,
+            crate::Keystone {
+                vertical: 0.0,
+                horizontal: 0.0,
+                amount: 100.0,
+                aspect: -3.0,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
