@@ -136,7 +136,7 @@ pub use portrait_stage::{
     HlfBodyAdjustLutProducerInputs, Pf8050AttachReceipt, Pf8050FboReceipt, Pf8050GeometryInputs,
     Pf8050StageInputs, Pf8050VendorRuntime, Pf30025Inputs, Pf30025LiveModelOutputs,
     Pf30025ProducerInputs, Pf30025SameJobReceipt, Pf30025SourceSurface, Pf30026EdgeOutput,
-    Pf30026GateBinding, Pf90004ProducerInputs, Pf90021DirectionReceipt, Pf90021Inputs,
+    Pf30026GateBinding, Pf8069PositiveInputs, Pf90004ProducerInputs, Pf90021DirectionReceipt, Pf90021Inputs,
     Pf90021MaskSource, Pf90021ProducerInputs, Pf90021RuntimeReceipt, Pf90021SameJobBinding,
     FaceLandmarkProducerInputs, FACE_LANDMARK_52_MODEL_SHA256, FACE_LANDMARK_52_RESOURCE,
     FaceInputBundle, FaceInputModelPaths, FaceInputProducer, C1FaceDetection,

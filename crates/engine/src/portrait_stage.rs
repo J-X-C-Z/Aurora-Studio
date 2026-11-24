@@ -3379,6 +3379,15 @@ pub enum PortraitJobInputOrigin {
     RendererJob { job_id: u64 },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Pf8069PositiveInputs<'a> {
+    pub job_id: u64,
+    pub frame: PortraitFrameReceipt,
+    pub material_layer: &'a Image,
+    pub mask_r: &'a [u8],
+    pub extra_mask_r: &'a [u8],
+}
+
 /// Backend input container for effects whose producer is outside this stage.
 pub struct PortraitJobInputs<'a> {
     pub origin: PortraitJobInputOrigin,
@@ -3405,6 +3414,7 @@ pub struct PortraitJobInputs<'a> {
     pub hlf_body: Option<HlfBodyInputs<'a>>,
     pub wrinkle: Option<WrinkleInputs<'a>>,
     pub wrinkle_producer: Option<&'a WrinkleProducerInputs>,
+    pub pf8069_positive: Option<Pf8069PositiveInputs<'a>>,
     pub pf90021: Option<Pf90021Inputs<'a>>,
     pub slim: Option<&'a SlimProducerInputs>,
     pub face_geometry: Option<&'a FaceGeometryInputs>,
@@ -3449,6 +3459,7 @@ impl<'a> PortraitJobInputs<'a> {
             hlf_body: None,
             wrinkle: None,
             wrinkle_producer: None,
+            pf8069_positive: None,
             pf90021: None,
             slim: None,
             face_geometry: None,
@@ -3753,7 +3764,7 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     21070,  // Nose-back wrinkle
     21071,  // Perioral wrinkle
     8068,   // Skin gloss
-    8069,   // Skin texture (negative surface-blur branch)
+    8069,   // Skin texture
     8070,   // Skin clarity
     21015,  // Skin color hue
     21026,  // Stubble removal
@@ -6580,6 +6591,32 @@ fn validate_effect_inputs(
     hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<(), Refusal> {
     let pixels = current.pixel_count();
+    if pf == 8069 {
+        let degree = extra.get("pc:8069").copied().unwrap_or(0.5);
+        check_degree01(degree, "PF8069 degree")?;
+        if degree > 0.5 {
+            let input = required(inputs.pf8069_positive, "PF8069_POSITIVE_MATERIAL_LAYER")?;
+            if input.job_id == 0 || inputs.job_id() != Some(input.job_id) {
+                return Err(Refusal::ValueOutOfRange("PF8069_JOB_RECEIPT"));
+            }
+            let frame = PortraitFrameReceipt::from_renderer_frame(
+                &current.pixels, current.width, current.height,
+            )?;
+            if input.frame != frame {
+                return Err(Refusal::ValueOutOfRange("PF8069_CURRENT_FRAME_RECEIPT"));
+            }
+            input.material_layer.validate()?;
+            if input.material_layer.width != current.width || input.material_layer.height != current.height {
+                return Err(Refusal::ShapeMismatch("PF8069_POSITIVE_MATERIAL_LAYER"));
+            }
+            check_plane(input.mask_r.len(), pixels, "PF8069_MASK_R")?;
+            check_plane(input.extra_mask_r.len(), pixels, "PF8069_EXTRA_MASK_R")?;
+            return Ok(());
+        }
+        if degree == 0.5 {
+            return Ok(());
+        }
+    }
     if pf == 90004 {
         check_degree01(
             extra.get("pc:90004").copied().unwrap_or_default(),
@@ -6926,6 +6963,13 @@ fn apply_cpu_effect(
         30021 => apply_hlf_face_cpu(current, degree, inputs, hlf_auto),
         30022 => apply_hlf_body_cpu(current, degree, inputs, hlf_auto),
         8068 => apply_skin_gloss(current, degree, skin_mask),
+        8069 if degree > 0.5 => {
+            let input = required(inputs.pf8069_positive, "PF8069_POSITIVE_MATERIAL_LAYER")?;
+            let ui = ((degree - 0.5) * 200.0).clamp(0.0, 100.0);
+            aurora_portrait::kernels::texture_material::face_sticker_apply(
+                current, input.material_layer, input.mask_r, input.extra_mask_r, ui,
+            )
+        }
         8069 => apply_skin_texture(current, degree, skin_mask),
         8070 => apply_skin_clarity(current, degree, skin_mask, width, height),
         21015 => apply_skin_tint(current, degree, skin_mask),
@@ -9051,6 +9095,9 @@ fn try_cuda_effect(
     degree: f32,
     skin_mask: Option<&[u8]>,
 ) -> Option<Result<(Image, Vec<Dispatch>), CudaError>> {
+    if pf == 8069 && degree >= 0.5 {
+        return None;
+    }
     if let Some(error) = forced_cuda_failure() {
         return Some(Err(error));
     }
@@ -9068,9 +9115,6 @@ fn try_cuda_effect(
     match pf {
         8069 => {
             let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
-            if ui >= 0.0 {
-                return None;
-            }
             let extra = vec![255u8; mask.len()];
             let gpu = match aurora_portrait::cuda_skin_models::SkinModels::open() {
                 Ok(gpu) => gpu,
@@ -9363,8 +9407,11 @@ fn apply_skin_texture(
     mask: Option<&[u8]>,
 ) -> Result<Image, aurora_portrait::Refusal> {
     let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
-    if ui >= 0.0 {
+    if ui == 0.0 {
         return Ok(current.clone());
+    }
+    if ui > 0.0 {
+        return Err(Refusal::MissingInput("PF8069_POSITIVE_MATERIAL_LAYER"));
     }
     let Some(mask) = mask else {
         return Err(aurora_portrait::Refusal::MissingInput("skin mask"));
@@ -13466,6 +13513,7 @@ mod tests {
             hlf_body: None,
             wrinkle: None,
             wrinkle_producer: None,
+            pf8069_positive: None,
             pf90021: None,
             slim: None,
             face_geometry: None,
@@ -13679,6 +13727,50 @@ mod tests {
         let original = rgba.clone();
         apply(&mut rgba, 64, 64, &[("pc:8069", 0.5)]);
         assert_eq!(rgba, original);
+    }
+
+    #[test]
+    fn skin_texture_positive_requires_and_consumes_same_frame_projection() {
+        let width = 8;
+        let height = 8;
+        let source = frame(width, height);
+        let masks = PortraitMasks::solid(1.0);
+        let mut inputs = PortraitJobInputs::from_renderer_job(1, &masks);
+        let (unchanged, absent) = apply_one_with_inputs(8069, width, height, &inputs);
+        assert_eq!(unchanged, source);
+        assert_eq!(absent.backend, PortraitBackend::Skipped);
+        assert_eq!(absent.refusal, Some(Refusal::MissingInput("PF8069_POSITIVE_MATERIAL_LAYER")));
+        assert!(!absent.executed);
+
+        let projected = Image::solid(width, height, [200, 150, 100, 255]);
+        let mask = vec![255; (width * height) as usize];
+        let bound_frame = PortraitFrameReceipt::from_renderer_frame(&source, width, height).unwrap();
+        let captured = Pf8069PositiveInputs {
+            job_id: 1,
+            frame: bound_frame,
+            material_layer: &projected,
+            mask_r: &mask,
+            extra_mask_r: &mask,
+        };
+        inputs.pf8069_positive = Some(captured);
+        let (rendered, applied) = apply_one_with_inputs(8069, width, height, &inputs);
+        let expected = aurora_portrait::kernels::texture_material::face_sticker_apply(
+            &Image::new(width, height, source.clone()).unwrap(),
+            &projected, &mask, &mask, ((0.8f32 - 0.5) * 200.0).clamp(0.0, 100.0),
+        ).unwrap();
+        assert!(applied.executed);
+        assert_eq!(applied.backend, PortraitBackend::Cpu);
+        assert_eq!(rendered, expected.pixels);
+        assert_ne!(rendered, source);
+
+        let stale_frame = PortraitFrameReceipt::from_renderer_frame(
+            &projected.pixels, width, height,
+        ).unwrap();
+        inputs.pf8069_positive = Some(Pf8069PositiveInputs { frame: stale_frame, ..captured });
+        let (unchanged, stale) = apply_one_with_inputs(8069, width, height, &inputs);
+        assert_eq!(unchanged, source);
+        assert_eq!(stale.backend, PortraitBackend::Skipped);
+        assert_eq!(stale.refusal, Some(Refusal::ValueOutOfRange("PF8069_CURRENT_FRAME_RECEIPT")));
     }
 
     #[test]
