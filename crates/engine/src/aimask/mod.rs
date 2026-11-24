@@ -346,35 +346,42 @@ fn model_lock(name: &str) -> Arc<Mutex<()>> {
 
 impl Segmenter {
     fn load(name: &str) -> Result<Arc<Segmenter>> {
+        Self::load_with_cpu_fallback(name, false)
+    }
+
+    fn load_with_cpu_fallback(name: &str, cpu_only: bool) -> Result<Arc<Segmenter>> {
         let load_lock = model_lock(name);
         let _loading = load_lock.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(model) = model_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(name)
+            .filter(|model| !cpu_only || model.session.provider() == Provider::Cpu)
         {
             return Ok(model.clone());
         }
-        let mut path = model_path(name)?;
+        let full_precision_path = || model_candidates(name)
+            .into_iter()
+            .find(|candidate| candidate.file_name().is_some_and(|file| file == name) && candidate.is_file());
         let runtime = Runtime::get().context("ONNX Runtime is not available")?;
-        let session = match runtime.open_session(&path) {
-            Ok(session) => session,
-            Err(error) if path.to_string_lossy().contains("FP16.onnx") => {
-                let Some(fallback) = model_candidates(name)
-                    .into_iter()
-                    .find(|candidate| candidate.is_file() && !candidate.to_string_lossy().contains("FP16.onnx"))
-                else {
-                    return Err(error);
-                };
-                log::warn!(
-                    "DirectML float16 model failed for {}; retrying {}",
-                    path.display(),
-                    fallback.display()
-                );
-                path = fallback;
-                runtime.open_session(&path)?
+        let (path, session) = if cpu_only {
+            let path = full_precision_path().with_context(|| format!("missing CPU model {name}"))?;
+            let session = runtime.open_cpu_session(&path)?;
+            (path, session)
+        } else {
+            let path = model_path(name)?;
+            match runtime.open_session(&path) {
+                Ok(session) => (path, session),
+                Err(error) if path.file_name().is_some_and(|file| fp16_sibling(name).is_some_and(|fp16| file == fp16)) => {
+                    let Some(fallback) = full_precision_path() else {
+                        return Err(error);
+                    };
+                    log::warn!("DirectML float16 model failed for {}; retrying {}", path.display(), fallback.display());
+                    let session = runtime.open_session(&fallback)?;
+                    (fallback, session)
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
         let dims = &session.input.dims;
         if dims.len() != 4 || session.input.element_type != 1 {
@@ -395,12 +402,28 @@ impl Segmenter {
             .find(|d| *d > 1 && *d < 64)
             .unwrap_or(1) as usize;
         let out_nchw = channels > 1 && out_dims.get(1) == Some(&(channels as i64));
-        let model = Arc::new(Segmenter { session, path: path.clone(), in_w, in_h, nchw, channels, out_nchw });
+        let model = Arc::new(Segmenter { session, path, in_w, in_h, nchw, channels, out_nchw });
         model_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(name.to_string(), model.clone());
         Ok(model)
+    }
+
+    fn run_on_image(name: &str, rgba: &[u8], width: usize, height: usize) -> Result<(Arc<Self>, Vec<f32>)> {
+        let model = Self::load(name)?;
+        match model.run(&mut model.input_tensor(rgba, width, height)) {
+            Ok(output) => Ok((model, output)),
+            Err(error) if model.session.provider() != Provider::Cpu => {
+                log::warn!("{name} inference failed on {}: {error:#}; retrying on CPU", model.session.provider().label());
+                let cpu = Self::load_with_cpu_fallback(name, true)
+                    .with_context(|| format!("{name} CPU session after GPU inference failure: {error:#}"))?;
+                let output = cpu.run(&mut cpu.input_tensor(rgba, width, height))
+                    .with_context(|| format!("{name} CPU retry after GPU inference failure: {error:#}"))?;
+                Ok((cpu, output))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn input_tensor(&self, rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
@@ -532,9 +555,7 @@ pub fn people_class_mask(rgba: &[u8], w: u32, h: u32, class: PeopleClass) -> Res
     if w == 0 || h == 0 {
         return Ok(Vec::new());
     }
-    let model = Segmenter::load("skinMasking.onnx")?;
-    let mut input = model.input_tensor(rgba, w, h);
-    let out = model.run(&mut input)?;
+    let (model, out) = Segmenter::run_on_image("skinMasking.onnx", rgba, w, h)?;
     let pixels = model.in_w * model.in_h;
     let classes = model.channels.max(1);
     if out.len() < pixels * classes {
@@ -562,9 +583,7 @@ pub fn people_masks(rgba: &[u8], w: u32, h: u32) -> Result<PeopleMasks> {
             hair: Vec::new(),
         });
     }
-    let model = Segmenter::load("skinMasking.onnx")?;
-    let mut input = model.input_tensor(rgba, w, h);
-    let out = model.run(&mut input)?;
+    let (model, out) = Segmenter::run_on_image("skinMasking.onnx", rgba, w, h)?;
     let pixels = model.in_w * model.in_h;
     let classes = model.channels.max(1);
     if out.len() < pixels * classes {
