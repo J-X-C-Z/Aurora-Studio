@@ -2869,13 +2869,10 @@ mod tests {
         let mut cpu = original.clone();
         post_process(&mut cpu, w, h, &adj, 1.0);
 
-        let gpu = detail_gpu::open_for_bench().expect("CUDA context");
-        let pixels = w as usize * h as usize;
-        let pool = gpu.alloc_buffer(pixels * 4 * 6).expect("device pool");
-        let lut = gpu.alloc_buffer(1025 * 4).expect("device lut");
-        let run_gpu_adj = |buf: &mut [u8], case: &crate::AdjustmentSet| {
-            detail_gpu::post_process_pool(
-                &gpu,
+        let mut gpu = detail_gpu::open_for_bench().expect("CUDA context");
+        let run_gpu_adj = |gpu: &mut crate::mock::gpu_runtime::Gpu, buf: &mut [u8], case: &crate::AdjustmentSet| {
+            detail_gpu::post_process_bench(
+                gpu,
                 buf,
                 w as usize,
                 h as usize,
@@ -2884,14 +2881,11 @@ mod tests {
                 &case.sharpening,
                 &case.lens,
                 1.0,
-                &pool,
-                Some(&lut),
             )
             .expect("CUDA detail launch");
         };
-        let run_gpu = |buf: &mut [u8]| run_gpu_adj(buf, &adj);
         let mut gpu_frame = original.clone();
-        run_gpu(&mut gpu_frame);
+        run_gpu_adj(&mut gpu, &mut gpu_frame, &adj);
 
         let (mut max_diff, mut over1, mut diff_px) = (0i32, 0usize, 0usize);
         for (a, b) in cpu.chunks_exact(4).zip(gpu_frame.chunks_exact(4)) {
@@ -2939,7 +2933,7 @@ mod tests {
                 unsafe { std::env::set_var("AURORA_DETAIL_GPU", "0") };
                 post_process(&mut stage_cpu, w, h, &case, 1.0);
                 let mut stage_gpu = original.clone();
-                run_gpu_adj(&mut stage_gpu, &case);
+                run_gpu_adj(&mut gpu, &mut stage_gpu, &case);
                 let (mut stage_max, mut stage_over1, mut stage_px) = (0i32, 0usize, 0usize);
                 for (a, b) in stage_cpu.chunks_exact(4).zip(stage_gpu.chunks_exact(4)) {
                     let mut different = false;
@@ -2976,13 +2970,13 @@ mod tests {
 
             let start = Instant::now();
             let mut frame = original.clone();
-            run_gpu(&mut frame);
+            run_gpu_adj(&mut gpu, &mut frame, &adj);
             gpu_pool_ms.push(start.elapsed().as_secs_f64() * 1000.0);
 
             let start = Instant::now();
             let mut frame = original.clone();
             detail_gpu::post_process_with(
-                &gpu,
+                &mut gpu,
                 &mut frame,
                 w as usize,
                 h as usize,

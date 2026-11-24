@@ -3,10 +3,14 @@
 //! It mirrors `stage_luminance_nr`, `stage_color_nr`, `stage_moire` and
 //! `stage_sharpening` byte-for-byte; the CPU path stays the default and is used
 //! whenever the driver, PTX or `AURORA_DETAIL_GPU` is absent.
+//!
+//! Device memory comes from the shared [`super::gpu_runtime::Gpu`]: one
+//! six-plane `Frame` slot, one LUT slot, grow-only and accounted.
 
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
-use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia};
+
+use super::gpu_runtime::{self, Failure, Gpu, Slot};
 
 use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
 
@@ -19,43 +23,25 @@ const PREWARM_BYTES: usize = 1400 * 933 * 4;
 const MAX_RETAINED_BYTES: usize = 768 * 1024 * 1024;
 
 struct DetailPool {
-    gpu: Box<Nvidia>,
-    pool: SendBuffer,
-    lut: SendBuffer,
-    bytes: usize,
+    gpu: Gpu,
 }
 
 impl DetailPool {
-    fn open(bytes: usize) -> Result<Self, CudaError> {
-        let gpu = Box::new(Nvidia::open_ptx(PTX)?);
-        Ok(Self {
-            pool: SendBuffer(alloc_static(&gpu, bytes * 6)?),
-            lut: SendBuffer(alloc_static(&gpu, 1025 * 4)?),
-            gpu,
-            bytes,
-        })
+    fn open(bytes: usize) -> Result<Self, Failure> {
+        let mut gpu = Gpu::open("detail", PTX)?;
+        reserve(&mut gpu, bytes, MAX_RETAINED_BYTES)?;
+        Ok(Self { gpu })
     }
 
-    fn ensure(&mut self, bytes: usize) -> Result<(), CudaError> {
-        if bytes > self.bytes {
-            self.pool = SendBuffer(alloc_static(&self.gpu, bytes * 6)?);
-            self.bytes = bytes;
-        }
-        Ok(())
+    fn ensure(&mut self, bytes: usize) -> Result<(), Failure> {
+        reserve(&mut self.gpu, bytes, MAX_RETAINED_BYTES)
     }
 }
 
-struct SendBuffer(DeviceBuffer<'static>);
-
-// `DeviceBuffer` only needs the driver table to move; the owning `Nvidia`
-// object stays boxed and `State` serializes every use.
-unsafe impl Send for SendBuffer {}
-
-/// The boxed driver table never moves, and `DetailPool` owns it for its whole
-/// allocation lifetime, so the buffers can safely outlive the short borrow.
-fn alloc_static(gpu: &Nvidia, bytes: usize) -> Result<DeviceBuffer<'static>, CudaError> {
-    let buffer = gpu.alloc_buffer(bytes)?;
-    Ok(unsafe { std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer) })
+fn reserve(gpu: &mut Gpu, bytes: usize, cap: usize) -> Result<(), Failure> {
+    gpu.reserve(Slot::Frame, bytes.saturating_mul(6), cap)?;
+    gpu.reserve(Slot::Aux0, 1025 * 4, cap)?;
+    Ok(())
 }
 
 enum State {
@@ -90,8 +76,9 @@ pub(crate) fn prewarm() -> bool {
                 log::info!("CUDA detail path ready");
                 true
             }
-            Err(err) => {
-                log::warn!("detail_gpu: {err:?}; staying on CPU");
+            Err(failure) => {
+                log::warn!("detail_gpu: {failure:?}; staying on CPU");
+                gpu_runtime::note_fallback("detail", &failure);
                 *state = State::Unavailable;
                 false
             }
@@ -99,8 +86,9 @@ pub(crate) fn prewarm() -> bool {
     }
 }
 
-/// Runs the NR + colour NR + moire + sharpening stages on the GPU. `false` means the
-/// caller must use the CPU stages (no driver, no context, or an invalid frame).
+/// Runs the NE + colour NR + moire + sharpening + lens stages on the GPU.
+/// `false` means the caller must use the CPU stages (no driver, no context, or
+/// an invalid frame).
 pub(crate) fn post_process(
     rgba: &mut [u8],
     w: usize,
@@ -114,76 +102,39 @@ pub(crate) fn post_process(
     let Some(pixels) = w.checked_mul(h) else { return false };
     let bytes = pixels.saturating_mul(4);
     if bytes == 0 || rgba.len() != bytes || bytes.saturating_mul(6) > MAX_RETAINED_BYTES {
-        return post_process_alloc(
-            rgba, w, h, nr, moire, sh, lens, scale,
-        );
+        return post_process_owned(rgba, w, h, nr, moire, sh, lens, scale);
     }
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
-    match &mut *state {
-        State::Unavailable => false,
-        State::NotTried => {
-            let mut pool = match DetailPool::open(bytes) {
-                Ok(pool) => pool,
-                Err(err) => {
-                    log::warn!("detail_gpu: {err:?}; staying on CPU");
-                    *state = State::Unavailable;
-                    return false;
-                }
-            };
-            let result = pool
-                .ensure(bytes)
-                .and_then(|()| post_process_pool(
-                    pool.gpu.as_ref(),
-                    rgba,
-                    w,
-                    h,
-                    nr,
-                    moire,
-                    sh,
-                    lens,
-                    scale,
-                    &pool.pool.0,
-                    Some(&pool.lut.0),
-                ));
-            match result {
-                Ok(()) => {
+    let result = match &mut *state {
+        State::Unavailable => Err(Failure::Unavailable("detail_gpu")),
+        State::NotTried => match DetailPool::open(bytes) {
+            Ok(mut pool) => {
+                let result = pool
+                    .ensure(bytes)
+                    .and_then(|()| post_process_pool(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale));
+                if result.is_ok() {
                     *state = State::Ready(pool);
-                    true
                 }
-                Err(err) => {
-                    log::warn!("detail_gpu: {err:?}; staying on CPU");
-                    false
-                }
+                result
             }
-        }
-        State::Ready(pool) => {
-            let result = pool
-                .ensure(bytes)
-                .and_then(|()| post_process_pool(
-                    pool.gpu.as_ref(),
-                    rgba,
-                    w,
-                    h,
-                    nr,
-                    moire,
-                    sh,
-                    lens,
-                    scale,
-                    &pool.pool.0,
-                    Some(&pool.lut.0),
-                ));
-            match result {
-                Ok(()) => true,
-                Err(err) => {
-                    log::warn!("detail_gpu: {err:?}; staying on CPU");
-                    false
-                }
-            }
+            Err(failure) => Err(failure),
+        },
+        State::Ready(pool) => pool
+            .ensure(bytes)
+            .and_then(|()| post_process_pool(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale)),
+    };
+    match result {
+        Ok(()) => true,
+        Err(failure) => {
+            log::warn!("detail_gpu: {failure:?}; staying on CPU");
+            gpu_runtime::note_fallback("detail", &failure);
+            false
         }
     }
 }
 
-fn post_process_alloc(
+/// Per-call allocation for frames above the retained cap.
+fn post_process_owned(
     rgba: &mut [u8],
     w: usize,
     h: usize,
@@ -193,23 +144,32 @@ fn post_process_alloc(
     lens: &LensCorrection,
     scale: f32,
 ) -> bool {
-    match Nvidia::open_ptx(PTX) {
-        Ok(gpu) => match post_process_with(&gpu, rgba, w, h, nr, moire, sh, lens, scale) {
-            Ok(()) => true,
-            Err(err) => {
-                log::warn!("detail_gpu: {err:?}; staying on CPU");
-                false
-            }
-        },
-        Err(err) => {
-            log::warn!("detail_gpu: {err:?}; staying on CPU");
+    let mut gpu = match Gpu::open("detail", PTX) {
+        Ok(gpu) => gpu,
+        Err(failure) => {
+            log::warn!("detail_gpu: {failure:?}; staying on CPU");
+            gpu_runtime::note_fallback("detail", &failure);
+            return false;
+        }
+    };
+    let Some(pixels) = w.checked_mul(h) else { return false };
+    let bytes = pixels.saturating_mul(4);
+    let result = reserve(&mut gpu, bytes, usize::MAX).and_then(|()| {
+        post_process_pool(&mut gpu, rgba, w, h, nr, moire, sh, lens, scale)
+    });
+    match result {
+        Ok(()) => true,
+        Err(failure) => {
+            log::warn!("detail_gpu: {failure:?}; staying on CPU");
+            gpu_runtime::note_fallback("detail", &failure);
             false
         }
     }
 }
 
+/// Same as [`post_process`] but on a caller-owned context (benchmarks/tests).
 pub(crate) fn post_process_with(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     rgba: &mut [u8],
     w: usize,
     h: usize,
@@ -218,30 +178,33 @@ pub(crate) fn post_process_with(
     sh: &Sharpening,
     lens: &LensCorrection,
     scale: f32,
-) -> Result<(), CudaError> {
-    let lum_active = nr.luminance > 0.0 || nr.single_pixel > 0.0;
-    let color_active = nr.color > 0.0;
-    let moire_active = moire.amount > 0.0;
-    let sharp_active = sh.amount > 0.0;
-    let lens_active = lens.distortion != 0.0
-        || lens.light_falloff != 0.0
-        || lens.chromatic_aberration
-        || lens.purple_fringing > 0.0;
-    if !lum_active && !color_active && !moire_active && !sharp_active && !lens_active {
-        return Ok(());
-    }
+) -> Result<(), Failure> {
     let Some(pixels) = w.checked_mul(h) else { return Ok(()) };
     if pixels == 0 || rgba.len() != pixels.saturating_mul(4) {
         return Ok(());
     }
-    let bytes = pixels * 4;
-    let pool = gpu.alloc_buffer(bytes * 6)?;
-    let lut = lum_active.then(|| gpu.alloc_buffer(1025 * 4)).transpose()?;
-    post_process_pool(gpu, rgba, w, h, nr, moire, sh, lens, scale, &pool, lut.as_ref())
+    reserve(gpu, pixels * 4, usize::MAX)?;
+    post_process_pool(gpu, rgba, w, h, nr, moire, sh, lens, scale)
+}
+
+/// Bench entry point: reserves the slots it needs on `gpu`.
+#[cfg(test)]
+pub(crate) fn post_process_bench(
+    gpu: &mut Gpu,
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    moire: &Moire,
+    sh: &Sharpening,
+    lens: &LensCorrection,
+    scale: f32,
+) -> Result<(), Failure> {
+    post_process_with(gpu, rgba, w, h, nr, moire, sh, lens, scale)
 }
 
 pub(crate) fn post_process_pool(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     rgba: &mut [u8],
     w: usize,
     h: usize,
@@ -250,9 +213,7 @@ pub(crate) fn post_process_pool(
     sh: &Sharpening,
     lens: &LensCorrection,
     scale: f32,
-    pool: &DeviceBuffer<'_>,
-    lut_buf: Option<&DeviceBuffer<'_>>,
-) -> Result<(), CudaError> {
+) -> Result<(), Failure> {
     let lum_active = nr.luminance > 0.0 || nr.single_pixel > 0.0;
     let color_active = nr.color > 0.0;
     let moire_active = moire.amount > 0.0;
@@ -270,14 +231,14 @@ pub(crate) fn post_process_pool(
     }
     let bytes = pixels * 4;
 
-    let base = pool.handle();
+    let base = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("detail frame slot"))?;
     let mut p_rgba = base;
     let mut p_luma = base + bytes as u64;
     let mut p_blur = base + (bytes * 2) as u64;
     let mut p_tmp = base + (bytes * 3) as u64;
     let mut p_cb = base + (bytes * 4) as u64;
     let mut p_cr = base + (bytes * 5) as u64;
-    gpu.upload_buffer(pool, rgba)?;
+    gpu.upload(Slot::Frame, rgba)?;
 
     let (mut w_i, mut h_i) = (w as i32, h as i32);
 
@@ -300,15 +261,12 @@ pub(crate) fn post_process_pool(
                 (-(d * d) / two_sigma2).exp()
             })
             .collect();
-        let Some(lut_buf) = lut_buf else {
-            return Err(CudaError::Unavailable("detail lut buffer"));
-        };
         let lut_bytes = unsafe {
             std::slice::from_raw_parts(lut.as_ptr() as *const u8, lut.len() * 4)
         };
-        gpu.upload_buffer(lut_buf, lut_bytes)?;
+        gpu.upload(Slot::Aux0, lut_bytes)?;
 
-        let mut p_lut = lut_buf.handle();
+        let mut p_lut = gpu.handle(Slot::Aux0).ok_or(Failure::Invalid("detail lut slot"))?;
         let mut strength_f = strength;
         let mut single_f = (nr.single_pixel / 100.0).clamp(0.0, 1.0);
         launch2(
@@ -429,7 +387,7 @@ pub(crate) fn post_process_pool(
         ])?;
     }
 
-    gpu.download_buffer(pool, rgba)?;
+    gpu.download(Slot::Frame, rgba)?;
     Ok(())
 }
 
@@ -438,29 +396,25 @@ fn ptr<T>(value: &mut T) -> *mut c_void {
 }
 
 fn launch2<const N: usize>(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     kernel: &'static str,
     w: usize,
     h: usize,
     mut args: [*mut c_void; N],
-) -> Result<(), CudaError> {
-    let grid = (((w as u32) + 15) / 16, ((h as u32) + 15) / 16);
-    gpu.launch_raw(kernel, grid, BLOCK, &mut args)?;
-    Ok(())
+) -> Result<(), Failure> {
+    gpu.launch(kernel, gpu_runtime::grid2(w, h, BLOCK), BLOCK, &mut args)
 }
 
 fn launch1<const N: usize>(
-    gpu: &Nvidia,
+    gpu: &mut Gpu,
     kernel: &'static str,
     n: usize,
     mut args: [*mut c_void; N],
-) -> Result<(), CudaError> {
-    let grid = (((n as u32) + 255) / 256, 1);
-    gpu.launch_raw(kernel, grid, (256, 1), &mut args)?;
-    Ok(())
+) -> Result<(), Failure> {
+    gpu.launch(kernel, gpu_runtime::grid1(n, 256), (256, 1), &mut args)
 }
 
 #[cfg(test)]
-pub(crate) fn open_for_bench() -> Option<Nvidia> {
-    Nvidia::open_ptx(PTX).ok()
+pub(crate) fn open_for_bench() -> Option<Gpu> {
+    Gpu::open("detail", PTX).ok()
 }
