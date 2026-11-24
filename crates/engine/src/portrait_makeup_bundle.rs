@@ -8,7 +8,11 @@ use aurora_portrait::kernels::makeup_mask_uv::{
     Face2dMaskUvInputs, MeshMaskPixelUv, MeshMaskUvInputs, produce_face2d_mask_uv,
     produce_mesh_mask_uv,
 };
-use aurora_portrait::kernels::makeup_material::MaskChannel;
+use aurora_portrait::kernels::makeup_material::{
+    FACE_STEREO_EFFECT, FACE_STEREO_FILTER_TYPE, FACE_STEREO_HIGHLIGHT_PF, FACE_STEREO_MASK_FIELD,
+    FACE_STEREO_MASK_VALUE, FACE_STEREO_MIX_COLOR, FACE_STEREO_ROI_XYWH, FACE_STEREO_SHADOW_PF,
+    MaskChannel,
+};
 use aurora_portrait::{Image, Refusal};
 use serde::Deserialize;
 use std::path::Path;
@@ -21,6 +25,126 @@ pub const B3_MAKEUP_ROWS: [u32; 14] = [
     8, 9, 100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032,
 ];
 pub const SUIT_MATERIAL_MASK_COUNT: usize = 12;
+
+/// One static `FaceStereo/effect.json` material. `path` is relative to the
+/// decoded `effect/config` root (`AURORA_MAKEUP_ASSET_ROOT`); the SHA-256 is
+/// the manifest value of the shipped PNG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaceStereoMaterial {
+    pub pf: u32,
+    /// Recovered `MeshType`: `2` front, `4` SideFace.
+    pub mesh_type: u32,
+    pub role: &'static str,
+    pub path: &'static str,
+    pub sha256: &'static str,
+}
+
+pub static FACESTEREO_SHADOW_MATERIALS: [FaceStereoMaterial; 2] = [
+    FaceStereoMaterial {
+        pf: FACE_STEREO_SHADOW_PF,
+        mesh_type: 2,
+        role: "front",
+        path: "FaceStereo/model_FaceStereoShadow_yy.png",
+        sha256: "afd6aac3ccd39f2e16b1db54e07a3408e851bef324cd8dd7905ca846bab76a66",
+    },
+    FaceStereoMaterial {
+        pf: FACE_STEREO_SHADOW_PF,
+        mesh_type: 4,
+        role: "side_face",
+        path: "FaceStereo/model_FaceStereoShadow_yy_SideFace.png",
+        sha256: "1932ccfd785a92846f800dec261e421f4bbddf5103a35b230580b96d03fa0b1a",
+    },
+];
+
+pub static FACESTEREO_HIGHLIGHT_MATERIALS: [FaceStereoMaterial; 2] = [
+    FaceStereoMaterial {
+        pf: FACE_STEREO_HIGHLIGHT_PF,
+        mesh_type: 2,
+        role: "front",
+        path: "FaceStereo/model_FaceStereoShadow_gg.png",
+        sha256: "00420de943357325ebee9b00dc4c8da62f0e5699b6c5231ccb3fbb04c4973fb4",
+    },
+    FaceStereoMaterial {
+        pf: FACE_STEREO_HIGHLIGHT_PF,
+        mesh_type: 4,
+        role: "side_face",
+        path: "FaceStereo/model_FaceStereoShadow_gg_SideFace.png",
+        sha256: "bdf109c75290b6e36597e06ac4a182e6758b4151fe68f5f86b0be4da30a0fcc1",
+    },
+];
+
+/// Static preset row for the two FaceStereo PFs. Masks are `BlusherMaskType=15`
+/// owner-mask pixels and are never synthesized by this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaceStereoPresetRow {
+    pub pf: u32,
+    pub ui_key: &'static str,
+    pub label: &'static str,
+    pub source_effect: &'static str,
+    pub filter_type: u32,
+    pub roi: [i32; 4],
+    pub mask_field: &'static str,
+    pub mask_value: u32,
+    pub mask_channel: MaskChannel,
+    pub mix_color: [u8; 4],
+    pub opacity_percent: u32,
+    pub default_degree_percent: u32,
+    pub materials: &'static [FaceStereoMaterial],
+}
+
+pub static FACESTEREO_PRESET_ROWS: [FaceStereoPresetRow; 2] = [
+    FaceStereoPresetRow {
+        pf: FACE_STEREO_SHADOW_PF,
+        ui_key: "shadowStereo",
+        label: "Stereo shadow volume",
+        source_effect: FACE_STEREO_EFFECT,
+        filter_type: FACE_STEREO_FILTER_TYPE,
+        roi: FACE_STEREO_ROI_XYWH,
+        mask_field: FACE_STEREO_MASK_FIELD,
+        mask_value: FACE_STEREO_MASK_VALUE,
+        mask_channel: MaskChannel::Rgba,
+        mix_color: FACE_STEREO_MIX_COLOR,
+        opacity_percent: 100,
+        default_degree_percent: 100,
+        materials: &FACESTEREO_SHADOW_MATERIALS,
+    },
+    FaceStereoPresetRow {
+        pf: FACE_STEREO_HIGHLIGHT_PF,
+        ui_key: "highlight",
+        label: "Stereo highlight volume",
+        source_effect: FACE_STEREO_EFFECT,
+        filter_type: FACE_STEREO_FILTER_TYPE,
+        roi: FACE_STEREO_ROI_XYWH,
+        mask_field: FACE_STEREO_MASK_FIELD,
+        mask_value: FACE_STEREO_MASK_VALUE,
+        mask_channel: MaskChannel::Rgba,
+        mix_color: FACE_STEREO_MIX_COLOR,
+        opacity_percent: 100,
+        default_degree_percent: 100,
+        materials: &FACESTEREO_HIGHLIGHT_MATERIALS,
+    },
+];
+
+/// First-class PF8/PF9 preset row, keyed by PF.
+pub fn facestereo_preset_row(pf: u32) -> Result<&'static FaceStereoPresetRow, Refusal> {
+    FACESTEREO_PRESET_ROWS
+        .iter()
+        .find(|row| row.pf == pf)
+        .ok_or(Refusal::UnknownEffect(pf))
+}
+
+/// Resolves the material for the recovered `MeshType`. Other mesh values are a
+/// named refusal rather than a silent fallback to the front asset.
+pub fn facestereo_material(
+    pf: u32,
+    mesh_type: u32,
+) -> Result<&'static FaceStereoMaterial, Refusal> {
+    facestereo_preset_row(pf)?
+        .materials
+        .iter()
+        .find(|material| material.mesh_type == mesh_type)
+        .ok_or(Refusal::MissingInput("FaceStereo MeshType"))
+}
 
 pub const BUNDLE_MISSING: &str = "makeup bundle";
 pub const VBO_BYTES_MISSING: &str = "makeup VBO bytes";
@@ -122,13 +246,13 @@ pub fn row_profile(pf: u32) -> Result<MakeupRowProfile, Refusal> {
         ),
         8 => (
             MakeupRowKind::HistoricalImage,
-            "face-parsing RGBA",
+            "FaceStereo shadow; BlusherMaskType=15 owner mask RGBA",
             Some(MaskChannel::Rgba),
             true,
         ),
         9 => (
             MakeupRowKind::HistoricalImage,
-            "blusher RGBA",
+            "FaceStereo highlight; BlusherMaskType=15 owner mask RGBA",
             Some(MaskChannel::Rgba),
             true,
         ),
@@ -2762,5 +2886,79 @@ mod tests {
         assert!(!bundle.rows[0].profile.requires_material);
         assert!(bundle.rows[0].material.is_none());
         assert!(bundle.rows[0].material_uv.is_none());
+    }
+}
+
+#[cfg(test)]
+mod facestereo_preset_tests {
+    use super::*;
+
+    #[test]
+    fn rows_resolve_by_pf_with_vendor_preset_values() {
+        assert_eq!(B3_MAKEUP_ROWS, [
+            8, 9, 100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032
+        ]);
+        for row in FACESTEREO_PRESET_ROWS {
+            let resolved = facestereo_preset_row(row.pf).expect("first-class FaceStereo row");
+            assert_eq!(*resolved, row);
+            assert_eq!(resolved.source_effect, "BlusherImageMakeup");
+            assert_eq!(resolved.filter_type, 42);
+            assert_eq!(resolved.roi, [95, 40, 901, 1081]);
+            assert_eq!(resolved.mask_field, "BlusherMaskType");
+            assert_eq!(resolved.mask_value, 15);
+            assert_eq!(resolved.mask_channel, MaskChannel::Rgba);
+            assert_eq!(resolved.mix_color, [0, 0, 0, 255]);
+            assert_eq!(resolved.opacity_percent, 100);
+            assert_eq!(resolved.default_degree_percent, 100);
+            assert_eq!(resolved.materials.len(), 2);
+            // The resolved profile must stay consistent with the static preset.
+            let profile = row_profile_for_effect(row.pf, row.source_effect).unwrap();
+            assert_eq!(profile.declared_mask_channel, Some(resolved.mask_channel));
+            assert!(profile.requires_material);
+            assert!(profile.requires_owner_mask());
+        }
+        assert_eq!(FACESTEREO_PRESET_ROWS[0].ui_key, "shadowStereo");
+        assert_eq!(FACESTEREO_PRESET_ROWS[1].ui_key, "highlight");
+        assert_eq!(
+            facestereo_preset_row(115).unwrap_err(),
+            Refusal::UnknownEffect(115)
+        );
+    }
+
+    #[test]
+    fn materials_are_bound_to_the_recovered_mesh_types() {
+        for row in FACESTEREO_PRESET_ROWS {
+            let front = facestereo_material(row.pf, 2).unwrap();
+            let side = facestereo_material(row.pf, 4).unwrap();
+            assert_eq!(front.role, "front");
+            assert_eq!(side.role, "side_face");
+            assert!(front.path.ends_with(".png"));
+            assert!(side.path.ends_with("_SideFace.png"));
+            assert_eq!(front.sha256.len(), 64);
+            assert_eq!(side.sha256.len(), 64);
+            assert_ne!(front.sha256, side.sha256);
+            assert_eq!(
+                facestereo_material(row.pf, 3).unwrap_err(),
+                Refusal::MissingInput("FaceStereo MeshType")
+            );
+        }
+        assert_eq!(
+            FACESTEREO_SHADOW_MATERIALS[0].path,
+            "FaceStereo/model_FaceStereoShadow_yy.png"
+        );
+        assert_eq!(
+            FACESTEREO_HIGHLIGHT_MATERIALS[0].path,
+            "FaceStereo/model_FaceStereoShadow_gg.png"
+        );
+    }
+
+    #[test]
+    fn pf8_pf9_profiles_name_the_blusher_mask_family() {
+        for pf in [8, 9] {
+            let profile = row_profile(pf).unwrap();
+            assert!(profile.mask_semantic.contains("BlusherMaskType=15"));
+            assert_eq!(profile.declared_mask_channel, Some(MaskChannel::Rgba));
+            assert_eq!(allowed_source_effects(pf).unwrap(), &["BlusherImageMakeup"]);
+        }
     }
 }

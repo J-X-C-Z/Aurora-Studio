@@ -56,6 +56,39 @@ pub const BLUSHER_IMAGE_FILTER_TYPE: u32 = 42;
 pub const BLUSHER_IMAGE_SHADER: &str = "glsl/OverLay/BlendImageLayerWithMask.frag";
 pub const BLUSHER_IMAGE_BLEND_BINDING: &str = "CELL_BLEND_MACRO_OPEN";
 
+// --- PF8 `shadowStereo` / PF9 `highlight` (FaceStereo/effect.json) ----------
+//
+// The four decoded rows are two presets per PF: `model_FaceStereoShadow_yy*`
+// carries `ParamFlag=8` (shadow volume) and `model_FaceStereoShadow_gg*`
+// carries `ParamFlag=9` (highlight volume). Every row shares:
+// `EffectName=BlusherImageMakeup`, `FilterType=42` (SOFT_LIGHT),
+// `ROIRect=[95,40,901,1081]`, `MixColor=[0,0,0,255]`, `Opacity=100`,
+// `BlusherMaskType=15` -> `MASK_RGBA`, `MeshType=2` (front) / `4` (SideFace),
+// `DefaultDegree=100`, `DegreeRange=[0,100]`, `ShelterType=-1`.
+
+pub const FACE_STEREO_SHADOW_PF: u32 = 8;
+pub const FACE_STEREO_HIGHLIGHT_PF: u32 = 9;
+pub const FACE_STEREO_EFFECT: &str = "BlusherImageMakeup";
+/// `FilterType=42` resolves to `SOFT_LIGHT` through `lipstick_blend_mode`.
+pub const FACE_STEREO_FILTER_TYPE: u32 = 42;
+/// Recovered `ROIRect` as `[x, y, width, height]`.
+pub const FACE_STEREO_ROI_XYWH: [i32; 4] = [95, 40, 901, 1081];
+pub const FACE_STEREO_MIX_COLOR: [u8; 4] = [0, 0, 0, 255];
+pub const FACE_STEREO_OPACITY_PERCENT: f32 = 100.0;
+/// `DefaultDegree=100` over `DegreeRange=[0,100]` -> `degree01`.
+pub const FACE_STEREO_DEFAULT_DEGREE01: f32 = 1.0;
+pub const FACE_STEREO_MESH_TYPES: [u32; 2] = [2, 4];
+pub const FACE_STEREO_MASK_FIELD: &str = "BlusherMaskType";
+pub const FACE_STEREO_MASK_VALUE: u32 = 15;
+pub const FACE_STEREO_SHADER: &str = "glsl/OverLay/BlendImageLayerWithMask.frag";
+
+/// Named refusals: the FaceStereo owner-mask source is not produced by this
+/// tree, so an absent mask must stay a name instead of being synthesized.
+pub const FACE_STEREO_SHADOW_MASK_MISSING: &str = "PF8_FACE_STEREO_OWNER_MASK";
+pub const FACE_STEREO_HIGHLIGHT_MASK_MISSING: &str = "PF9_FACE_STEREO_OWNER_MASK";
+pub const FACE_STEREO_SHADOW_MATERIAL_MISSING: &str = "PF8_FACE_STEREO_MATERIAL";
+pub const FACE_STEREO_HIGHLIGHT_MATERIAL_MISSING: &str = "PF9_FACE_STEREO_MATERIAL";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaskChannel {
     R,
@@ -932,6 +965,84 @@ pub fn blusher_image_makeup(
     )
 }
 
+/// `BlusherMaskType=15` is the recovered mask family for both FaceStereo rows.
+pub fn face_stereo_mask_channel() -> Result<MaskChannel, Refusal> {
+    blusher_mask_channel(FACE_STEREO_MASK_VALUE)
+}
+
+/// Stable name for an absent FaceStereo owner mask. `None` for non-FaceStereo
+/// PFs so callers can fall back to their generic row refusal.
+pub fn face_stereo_mask_missing(pf: u32) -> Option<&'static str> {
+    match pf {
+        FACE_STEREO_SHADOW_PF => Some(FACE_STEREO_SHADOW_MASK_MISSING),
+        FACE_STEREO_HIGHLIGHT_PF => Some(FACE_STEREO_HIGHLIGHT_MASK_MISSING),
+        _ => None,
+    }
+}
+
+/// Stable name for an absent FaceStereo material PNG.
+pub fn face_stereo_material_missing(pf: u32) -> Option<&'static str> {
+    match pf {
+        FACE_STEREO_SHADOW_PF => Some(FACE_STEREO_SHADOW_MATERIAL_MISSING),
+        FACE_STEREO_HIGHLIGHT_PF => Some(FACE_STEREO_HIGHLIGHT_MATERIAL_MISSING),
+        _ => None,
+    }
+}
+
+/// Host composition of `u_mix_color.a` for PF8/PF9. The OverLay shader
+/// (`BlendImageLayerWithMask.frag`) reads `u_mix_color.a` exactly once:
+///
+/// ```text
+/// u_mix_color.a = MixColor.a / 255 * Opacity / 100 * degree01
+/// factor        = material.a * u_mix_color.a * mask_weight
+/// ```
+///
+/// `degree01` is applied here and nowhere else; the pixel entry point must not
+/// multiply it again.
+pub fn face_stereo_mix_alpha(
+    mix_color: [u8; 4],
+    opacity_percent: f32,
+    degree01: f32,
+) -> Result<f32, Refusal> {
+    if !opacity_percent.is_finite() || !(0.0..=100.0).contains(&opacity_percent) {
+        return Err(Refusal::ValueOutOfRange("opacity_percent"));
+    }
+    if !degree01.is_finite() || !(0.0..=1.0).contains(&degree01) {
+        return Err(Refusal::ValueOutOfRange("degree01"));
+    }
+    Ok(mix_color[3] as f32 / 255.0 * opacity_percent / 100.0 * degree01)
+}
+
+/// PF8/PF9 `BlendImageLayerWithMask.frag` pixel law.
+///
+/// The mask is the same-job `BlusherMaskType=15` RGBA owner mask and the
+/// material is one of the two FaceStereo PNGs for the selected `MeshType`.
+/// This function never creates either input; callers supply them and keep the
+/// named refusals above for their absence.
+pub fn face_stereo_image_layer(
+    source: &Image,
+    material: &Image,
+    owner_mask: &Image,
+    mask_uv: &[[f32; 2]],
+    material_uv: &[[f32; 2]],
+    mix_color: [u8; 4],
+    opacity_percent: f32,
+    degree01: f32,
+) -> Result<Image, Refusal> {
+    // Resolve the single host factor first so a bad scalar is refused before
+    // any pixel work; `apply_image_layer_dual` then uses exactly one multiply.
+    face_stereo_mix_alpha(mix_color, opacity_percent, degree01)?;
+    let params = ColorMaterialParams {
+        mix_color,
+        opacity_percent,
+        degree01,
+        blend_mode: lipstick_blend_mode(FACE_STEREO_FILTER_TYPE)?,
+        mask_channel: face_stereo_mask_channel()?,
+        blend_alpha: false,
+    };
+    apply_image_layer_dual(source, material, owner_mask, mask_uv, material_uv, params)
+}
+
 /// Shared parameters for the makeup cells whose class and FilterType are known
 /// but whose material/mask come from the same-job resources.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1490,5 +1601,79 @@ mod tests {
             &source, &material, &main, &green, &uv, &uv, params).unwrap();
         assert_eq!(dual_zero, source);
         assert_ne!(dual_green, source);
+    }
+
+    #[test]
+    fn face_stereo_prefers_one_single_mix_alpha_factor() {
+        // `MixColor.a * Opacity/100 * degree01` is composed once.
+        let alpha = face_stereo_mix_alpha([0, 0, 0, 128], 50.0, 0.5).unwrap();
+        assert!((alpha - (128.0 / 255.0) * 0.25).abs() < 1.0e-6);
+        assert_eq!(
+            face_stereo_mix_alpha([0, 0, 0, 255], 100.0, 1.0).unwrap(),
+            1.0
+        );
+        // A squared degree would land here instead, and must not.
+        assert!((alpha - (128.0 / 255.0) * 0.125).abs() > 1.0e-6);
+        assert_eq!(
+            face_stereo_mix_alpha([0, 0, 0, 255], 101.0, 1.0).unwrap_err(),
+            Refusal::ValueOutOfRange("opacity_percent")
+        );
+        assert_eq!(
+            face_stereo_mix_alpha([0, 0, 0, 255], 100.0, f32::NAN).unwrap_err(),
+            Refusal::ValueOutOfRange("degree01")
+        );
+    }
+
+    #[test]
+    fn face_stereo_shader_factor_is_material_alpha_times_one_mix_alpha() {
+        let source = pixel([64, 64, 64, 255]);
+        let material = pixel([64, 64, 64, 128]);
+        let mask = pixel([255, 255, 255, 255]);
+        let uv = [[0.5, 0.5]];
+        let degree01 = 0.5_f32;
+        let out = face_stereo_image_layer(
+            &source,
+            &material,
+            &mask,
+            &uv,
+            &uv,
+            FACE_STEREO_MIX_COLOR,
+            FACE_STEREO_OPACITY_PERCENT,
+            degree01,
+        )
+        .unwrap();
+
+        let src = 64.0 / 255.0;
+        let blend = 64.0 / 255.0;
+        // u_mix_color.a = MixColor.a(1.0) * Opacity(1.0) * degree01(0.5).
+        let mix_alpha = 0.5_f32;
+        // factor = material.a(128/255) * u_mix_color.a(0.5) * mask(1.0).
+        let factor = (128.0 / 255.0) * mix_alpha;
+        let expected = byte_even(src * (1.0 - factor) + soft_light(src, blend) * factor);
+        assert_eq!(out.pixel(0, 0)[0], expected);
+        // A second degree multiply would square the degree to 0.25.
+        let squared = (128.0 / 255.0) * (degree01 * degree01);
+        let wrong = byte_even(src * (1.0 - squared) + soft_light(src, blend) * squared);
+        assert_ne!(expected, wrong);
+    }
+
+    #[test]
+    fn face_stereo_mask_family_is_blusher_15_rgba() {
+        assert_eq!(FACE_STEREO_MASK_FIELD, BLUSHER_MASK_FIELD);
+        assert_eq!(FACE_STEREO_MASK_VALUE, BLUSHER_MASK_VALUE);
+        assert_eq!(face_stereo_mask_channel(), Ok(MaskChannel::Rgba));
+        assert_eq!(
+            lipstick_blend_mode(FACE_STEREO_FILTER_TYPE),
+            Ok(BlendMode::SoftLight)
+        );
+        assert_eq!(
+            face_stereo_mask_missing(FACE_STEREO_SHADOW_PF),
+            Some(FACE_STEREO_SHADOW_MASK_MISSING)
+        );
+        assert_eq!(
+            face_stereo_material_missing(FACE_STEREO_HIGHLIGHT_PF),
+            Some(FACE_STEREO_HIGHLIGHT_MATERIAL_MISSING)
+        );
+        assert_eq!(face_stereo_mask_missing(116), None);
     }
 }

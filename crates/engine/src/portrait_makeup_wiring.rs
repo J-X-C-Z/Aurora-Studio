@@ -22,8 +22,11 @@
 //! remain blocked until `AURORA_MAKEUP_ASSET_ROOT` supplies decrypted PNGs; the
 //! assembler skips them instead of failing the whole bundle.
 //!
-//! PF8 and PF9 remain outside this wiring: they are FaceStereo rows whose owner
-//! mask is a different captured pipeline, not a 194-landmark 2D region. PF115
+//! PF8 and PF9 are first-class FaceStereo preset rows in
+//! `portrait_makeup_bundle::FACESTEREO_PRESET_ROWS`, but their owner mask comes
+//! from a different captured pipeline. Requesting them through these 2D
+//! landmark bindings is refused by name (`FACESTEREO_OWNER_MASK_UNSUPPORTED`);
+//! no mask is synthesized. PF115
 //! `3DMMFaceSticker` is refused upstream by `row_profile_for_effect`; this
 //! module only selects the 2D `BlusherImageMakeup` branch.
 
@@ -47,6 +50,9 @@ use crate::portrait_stage::ProducerInputs;
 pub const MAKEUP_ASSET_ROOT_ENV: &str = "AURORA_MAKEUP_ASSET_ROOT";
 pub const MAKEUP_ASSET_ROOT_MISSING: &str = "makeup asset root (AURORA_MAKEUP_ASSET_ROOT)";
 pub const MAKEUP_2D_ROW_UNSUPPORTED: &str = "makeup 2D row (FaceStereo excluded)";
+/// Named refusal: the 2D landmark wiring does not produce the FaceStereo
+/// whole-face owner mask. It must arrive as a same-job capture instead.
+pub const FACESTEREO_OWNER_MASK_UNSUPPORTED: &str = "FaceStereo owner mask (no 2D producer)";
 
 /// One planned 2D row. `roi` is the recovered `[x, y, width, height]` region used
 /// for draw-time mask UV. `material` is relative to `MAKEUP_ASSET_ROOT_ENV`.
@@ -126,8 +132,9 @@ pub fn makeup_rows_2d_available() -> &'static [u32] {
     &[100, 103, 105, 106, 117, 118, 30007]
 }
 
-/// Rows this wiring knows how to assemble once the data-availability blocker is
-/// cleared, in canonical B3 order. PF8/PF9 stay out (FaceStereo).
+/// Rows this wiring knows how to declare/assemble once the data-availability
+/// blocker is cleared, in canonical B3 order. PF8/PF9 are declared but their
+/// owner mask cannot be assembled from 2D landmarks (named refusal).
 #[allow(dead_code)]
 pub fn makeup_rows_2d_declared() -> &'static [u32] {
     &[100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032]
@@ -151,6 +158,9 @@ fn selected_rows(requested: &[u32]) -> Result<Vec<u32>, Refusal> {
     for pf in requested {
         if !B3_MAKEUP_ROWS.contains(pf) {
             return Err(Refusal::UnknownEffect(*pf));
+        }
+        if *pf == 8 || *pf == 9 {
+            return Err(Refusal::MissingInput(FACESTEREO_OWNER_MASK_UNSUPPORTED));
         }
         if !selected.contains(pf) {
             selected.push(*pf);
@@ -631,11 +641,16 @@ mod tests {
     #[test]
     fn assembly_skips_material_rows_and_keeps_mask_rows() {
         let points = synthetic_points194();
+        let selectable: Vec<u32> = makeup_rows_2d_declared()
+            .iter()
+            .copied()
+            .filter(|pf| *pf != 8 && *pf != 9)
+            .collect();
         let (rows, skipped) = assemble_constructible_rows(
             7,
             [901, 1081],
             &points,
-            makeup_rows_2d_declared(),
+            &selectable,
             |_| Ok(None),
         )
         .unwrap();
@@ -657,19 +672,26 @@ mod tests {
     #[test]
     fn request_order_is_canonical_and_deduped() {
         assert_eq!(
-            selected_rows(&[90032, 100, 8, 100, 115]).unwrap(),
-            vec![8, 100, 115, 90032],
-            "8 stays in B3 order here and is filtered by row_contract"
+            selected_rows(&[90032, 100, 115]).unwrap(),
+            vec![100, 115, 90032],
+            "2D order stays canonical and deduped"
         );
         assert_eq!(
-            selected_rows(&[106, 9]).unwrap(),
-            vec![9, 106],
+            selected_rows(&[90032, 106]).unwrap(),
+            vec![106, 90032],
             "B3 order is preserved, not request order"
         );
         assert_eq!(
             selected_rows(&[999]).unwrap_err(),
             Refusal::UnknownEffect(999)
         );
+        for pf in [8, 9] {
+            assert_eq!(
+                selected_rows(&[pf]).unwrap_err(),
+                Refusal::MissingInput(FACESTEREO_OWNER_MASK_UNSUPPORTED),
+                "PF{pf} has no 2D owner-mask producer"
+            );
+        }
     }
 
     #[test]
@@ -732,5 +754,35 @@ mod tests {
                 assert!(contract.owner_mask_missing.is_empty());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod facestereo_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn facestereo_rows_have_no_2d_owner_mask_producer() {
+        // The first-class preset/material contract lives in
+        // `portrait_makeup_bundle::FACESTEREO_PRESET_ROWS`; this 2D wiring
+        // cannot synthesize its whole-face mask.
+        for pf in [8, 9] {
+            assert_eq!(
+                selected_rows(&[pf]).unwrap_err(),
+                Refusal::MissingInput(FACESTEREO_OWNER_MASK_UNSUPPORTED)
+            );
+            assert!(!makeup_rows_2d_declared().contains(&pf));
+        }
+    }
+
+    #[test]
+    fn no_landmark_based_owner_mask_is_generated_for_facestereo() {
+        let profile = row_profile_for_effect(8, "BlusherImageMakeup").unwrap();
+        assert!(profile.requires_owner_mask());
+        assert!(profile.mask_semantic.contains("BlusherMaskType=15"));
+        assert_eq!(
+            profile.declared_mask_channel,
+            Some(aurora_portrait::kernels::makeup_material::MaskChannel::Rgba)
+        );
     }
 }

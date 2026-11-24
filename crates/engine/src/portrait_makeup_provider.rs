@@ -10,7 +10,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aurora_portrait::cuda_makeup::MakeupRoute;
-use aurora_portrait::kernels::makeup_material::lipstick_blend_mode;
+use aurora_portrait::kernels::makeup_material::{
+    FACE_STEREO_EFFECT, FACE_STEREO_FILTER_TYPE, FACE_STEREO_MIX_COLOR, FACE_STEREO_OPACITY_PERCENT,
+    face_stereo_material_missing, face_stereo_mask_missing, face_stereo_mix_alpha,
+    lipstick_blend_mode,
+};
 use aurora_portrait::model_sha256::sha256 as sha256_32;
 use aurora_portrait::{Image, Refusal};
 
@@ -18,7 +22,8 @@ use crate::portrait_makeup_bundle::{
     B3_MAKEUP_ROWS, EBO_BYTES_MISSING, MATERIAL_MISSING, MATERIAL_UV_MISSING, MakeupRowProfile,
     OWNER_MASK_MISSING, OwnedFace2dDrawBytes, OwnedFace2dUvBytes, OwnedMakeupBundle,
     OwnedMakeupBundleInputRow, OwnedMakeupBundleInputs, SOURCE_SHA_MISSING, VBO_BYTES_MISSING,
-    produce_owned_makeup_bundle, row_profile_for_effect,
+    facestereo_material, facestereo_preset_row, produce_owned_makeup_bundle,
+    row_profile_for_effect,
 };
 
 pub const PROVIDER_ROWS: &str = "makeup provider rows";
@@ -204,6 +209,22 @@ pub struct ExternalMakeupRow<'a> {
     pub filter_type: u32,
 }
 
+/// One `FaceStereo/effect.json` preset selection from an external producer.
+/// PF8/PF9 are already first-class `ExternalMakeupRow`s; this selection only
+/// carries the vendor `MeshType`/degree that the generic row does not model.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalFaceStereoRow<'a> {
+    pub pf: u32,
+    pub ticket: u64,
+    /// Vendor `MeshType` (2 front, 4 SideFace).
+    pub mesh_type: u32,
+    /// `DefaultDegree` over `DegreeRange=[0,100]`.
+    pub degree_percent: f32,
+    /// Same-job capture name for the owner mask. No producer exists in this
+    /// tree; a missing or unknown source is refused by name.
+    pub owner_mask_source: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalMakeupJob<'a> {
     pub job_id: u64,
@@ -211,6 +232,10 @@ pub struct ExternalMakeupJob<'a> {
     pub frame_size: [u32; 2],
     pub source_sha256: [u8; 32],
     pub rows: &'a [ExternalMakeupRow<'a>],
+    /// Optional FaceStereo preset selections. `None` means the caller does not
+    /// supply the capture-side metadata; the generic rows still carry the
+    /// preset ROI/FilterType.
+    pub facestereo: Option<&'a [ExternalFaceStereoRow<'a>]>,
 }
 
 /// A decrypted PNG material owned by the provider. The asset remains external;
@@ -304,6 +329,7 @@ pub fn produce_external_owned_makeup_bundle(
 
     check_job_identity(&job)?;
     check_row_coverage(job.job_id, job.rows)?;
+    check_facestereo_presets(&job)?;
 
     let mut owned_rows = Vec::with_capacity(job.rows.len());
     for row in job.rows {
@@ -370,6 +396,77 @@ fn check_row_coverage(job_id: u64, rows: &[ExternalMakeupRow<'_>]) -> Result<(),
                 Some(row.ticket),
                 Some(Refusal::ValueOutOfRange(PROVIDER_ROWS)),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates PF8/PF9 preset selections against the static FaceStereo table.
+/// The material name is resolved here so an unknown `MeshType` is a named
+/// refusal. Owner-mask pixels and their producer are still caller-owned: a
+/// missing capture source is refused by name, never synthesized.
+fn check_facestereo_presets(job: &ExternalMakeupJob<'_>) -> Result<(), ProviderRefusal> {
+    let Some(selections) = job.facestereo else {
+        return Ok(());
+    };
+    let refuse = |code: &'static str, pf: u32, cause: Refusal| {
+        ProviderRefusal::named(code, job.job_id, Some(pf), Some(job.ticket), Some(cause))
+    };
+    let mut seen = [false; 2];
+    for selection in selections {
+        let index = match selection.pf {
+            8 => 0,
+            9 => 1,
+            other => return Err(refuse(PROVIDER_ROWS, other, Refusal::UnknownEffect(other))),
+        };
+        if seen[index] {
+            return Err(refuse(PROVIDER_ROWS, selection.pf, Refusal::ShapeMismatch(PROVIDER_ROWS)));
+        }
+        seen[index] = true;
+        if selection.ticket != job.job_id {
+            return Err(refuse(PROVIDER_TICKET, selection.pf, Refusal::ValueOutOfRange(PROVIDER_TICKET)));
+        }
+        let preset = facestereo_preset_row(selection.pf).map_err(|cause| {
+            refuse(PROVIDER_ROWS, selection.pf, cause)
+        })?;
+        if preset.mix_color != FACE_STEREO_MIX_COLOR
+            || preset.opacity_percent as f32 != FACE_STEREO_OPACITY_PERCENT
+        {
+            return Err(refuse(PROVIDER_ROWS, selection.pf, Refusal::ValueOutOfRange(PROVIDER_ROWS)));
+        }
+
+        if !selection.degree_percent.is_finite() || !(0.0..=100.0).contains(&selection.degree_percent) {
+            return Err(refuse(PROVIDER_ROWS, selection.pf, Refusal::ValueOutOfRange("FaceStereo DefaultDegree")));
+        }
+        let _material = facestereo_material(selection.pf, selection.mesh_type).map_err(|cause| {
+            let name = face_stereo_material_missing(selection.pf).unwrap_or(MATERIAL_MISSING);
+            refuse(name, selection.pf, cause)
+        })?;
+        let _mix_alpha = face_stereo_mix_alpha(
+            preset.mix_color,
+            preset.opacity_percent as f32,
+            selection.degree_percent / 100.0,
+        )
+        .map_err(|cause| refuse(PROVIDER_FILTER_TYPE, selection.pf, cause))?;
+
+        let missing_name = face_stereo_mask_missing(selection.pf).unwrap_or(OWNER_MASK_MISSING);
+        let source = selection.owner_mask_source.filter(|name| !name.is_empty()).ok_or_else(|| {
+            refuse(missing_name, selection.pf, Refusal::MissingInput(missing_name))
+        })?;
+        if !source.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+            return Err(refuse(missing_name, selection.pf, Refusal::ValueOutOfRange(missing_name)));
+        }
+        let row = job
+            .rows
+            .iter()
+            .find(|row| row.pf == selection.pf)
+            .ok_or_else(|| refuse(PROVIDER_ROWS, selection.pf, Refusal::MissingInput(PROVIDER_ROWS)))?;
+        if row.source_effect != FACE_STEREO_EFFECT
+            || row.filter_type != FACE_STEREO_FILTER_TYPE
+            || row.owner_mask.is_none()
+            || row.material.is_none()
+        {
+            return Err(refuse(PROVIDER_ROWS, selection.pf, Refusal::ValueOutOfRange(PROVIDER_ROWS)));
         }
     }
     Ok(())
@@ -764,7 +861,7 @@ mod tests {
         }
     }
 
-    fn complete_rows() -> Vec<ExternalMakeupRow<'static>> {
+    pub(super) fn complete_rows() -> Vec<ExternalMakeupRow<'static>> {
         B3_MAKEUP_ROWS
             .into_iter()
             .map(|pf| {
@@ -786,13 +883,22 @@ mod tests {
                     ticket: JOB,
                     source_sha256: SHA,
                     draw: draw(),
-                    origin: [0, 0],
-                    size: [1, 1],
+                    origin: match crate::portrait_makeup_bundle::facestereo_preset_row(pf) {
+                        Ok(preset) => [preset.roi[0], preset.roi[1]],
+                        Err(_) => [0, 0],
+                    },
+                    size: match crate::portrait_makeup_bundle::facestereo_preset_row(pf) {
+                        Ok(preset) => [preset.roi[2], preset.roi[3]],
+                        Err(_) => [1, 1],
+                    },
                     owner_mask: profile.requires_owner_mask().then(texture),
                     extra_owner_mask: None,
                     material: profile.requires_material.then(texture),
                     material_uv: profile.requires_material.then(uv),
-                    mix_color: [0; 4],
+                    mix_color: match crate::portrait_makeup_bundle::facestereo_preset_row(pf) {
+                        Ok(preset) => preset.mix_color,
+                        Err(_) => [0; 4],
+                    },
                     opacity_percent: 100.0,
                     // The recovered per-row macro, not one blanket value: PF111
                     // is 40 and the image rows are 41/42.
@@ -809,6 +915,33 @@ mod tests {
             frame_size: [4, 4],
             source_sha256: SHA,
             rows,
+            facestereo: None,
+        }
+    }
+
+    pub(super) fn facestereo<'a>(rows: &'a [ExternalMakeupRow<'a>]) -> ExternalMakeupJob<'a> {
+        ExternalMakeupJob {
+            job_id: JOB,
+            ticket: JOB,
+            frame_size: [4, 4],
+            source_sha256: SHA,
+            rows,
+            facestereo: Some(&[
+                ExternalFaceStereoRow {
+                    pf: 8,
+                    ticket: JOB,
+                    mesh_type: 2,
+                    degree_percent: 100.0,
+                    owner_mask_source: Some("capture:faceparsing_rgba"),
+                },
+                ExternalFaceStereoRow {
+                    pf: 9,
+                    ticket: JOB,
+                    mesh_type: 4,
+                    degree_percent: 100.0,
+                    owner_mask_source: Some("capture:blusher_rgba"),
+                },
+            ]),
         }
     }
 
@@ -1168,5 +1301,99 @@ mod tests {
             .find(|row| row.profile.pf == 90032)
             .expect("PF90032 row");
         assert_eq!(row.filter_type, 44);
+    }
+}
+
+#[cfg(test)]
+mod facestereo_provider_tests {
+    use super::*;
+    use super::tests::{complete_rows, facestereo};
+    use crate::portrait_makeup_bundle::facestereo_preset_row;
+    use crate::portrait_makeup_wiring::MAKEUP_2D_ROWS;
+
+    fn pf_row<'a>(rows: &'a [ExternalMakeupRow<'a>], pf: u32) -> &'a ExternalMakeupRow<'a> {
+        rows.iter().find(|row| row.pf == pf).expect("row")
+    }
+
+    #[test]
+    fn facestereo_rows_resolve_with_recovered_preset_values() {
+        let rows = complete_rows();
+        for pf in [8, 9] {
+            let preset = facestereo_preset_row(pf).unwrap();
+            let row = pf_row(&rows, pf);
+            assert_eq!(row.source_effect, preset.source_effect);
+            assert_eq!(row.filter_type, preset.filter_type);
+            assert_eq!(row.origin, [preset.roi[0], preset.roi[1]]);
+            assert_eq!(row.size, [preset.roi[2], preset.roi[3]]);
+            assert_eq!(row.mix_color, preset.mix_color);
+            assert_eq!(row.opacity_percent, preset.opacity_percent as f32);
+        }
+        // The first-class static rows are separate from the 12-row 2D wiring:
+        // FaceStereo mask capture cannot be synthesized from landmarks.
+        for pf in [8, 9] {
+            assert!(!MAKEUP_2D_ROWS.iter().any(|row| row.pf == pf));
+        }
+        let bundle = ExternalMakeupProvider::build(Some(facestereo(&rows))).unwrap();
+        for pf in [8, 9] {
+            let resolved = bundle
+                .rows
+                .iter()
+                .find(|row| row.profile.pf == pf)
+                .expect("FaceStereo row survives the provider");
+            assert_eq!(resolved.filter_type, 42);
+            assert!(resolved.owner_mask.is_some());
+            assert!(resolved.material.is_some());
+        }
+    }
+
+    #[test]
+    fn missing_face_stereo_mask_source_is_named_per_pf() {
+        let rows = complete_rows();
+        for (pf, expected) in [(8, "PF8_FACE_STEREO_OWNER_MASK"), (9, "PF9_FACE_STEREO_OWNER_MASK")] {
+            let mut job = facestereo(&rows);
+            let mut selections = job.facestereo.unwrap().to_vec();
+            let selection = selections.iter_mut().find(|selection| selection.pf == pf).unwrap();
+            selection.owner_mask_source = None;
+            job.facestereo = Some(&selections);
+            let error = ExternalMakeupProvider::build(Some(job)).unwrap_err();
+            assert_eq!(error.code, expected);
+            assert_eq!(error.pf, Some(pf));
+            assert_eq!(error.cause, Some(Refusal::MissingInput(expected)));
+        }
+    }
+
+    #[test]
+    fn unknown_mesh_type_and_bad_degree_are_named_refusals() {
+        let rows = complete_rows();
+        let mut job = facestereo(&rows);
+        let mut selections = job.facestereo.unwrap().to_vec();
+        selections[0].mesh_type = 3;
+        job.facestereo = Some(&selections);
+        let error = ExternalMakeupProvider::build(Some(job)).unwrap_err();
+        assert_eq!(error.code, "PF8_FACE_STEREO_MATERIAL");
+        assert_eq!(error.pf, Some(8));
+
+        let mut job = facestereo(&rows);
+        let mut selections = job.facestereo.unwrap().to_vec();
+        selections[1].degree_percent = 101.0;
+        job.facestereo = Some(&selections);
+        let error = ExternalMakeupProvider::build(Some(job)).unwrap_err();
+        assert_eq!(error.code, PROVIDER_ROWS);
+        assert_eq!(error.pf, Some(9));
+    }
+
+    #[test]
+    fn facestereo_job_preserves_recovered_scalar_factors() {
+        assert_eq!(
+            face_stereo_mix_alpha(FACE_STEREO_MIX_COLOR, FACE_STEREO_OPACITY_PERCENT, 1.0),
+            Ok(1.0)
+        );
+        assert_eq!(
+            face_stereo_mix_alpha(FACE_STEREO_MIX_COLOR, FACE_STEREO_OPACITY_PERCENT, 0.5),
+            Ok(0.5)
+        );
+        // Both the preset and the provider agree on the one-factor law.
+        assert_eq!(FACE_STEREO_FILTER_TYPE, 42);
+        assert_eq!(lipstick_blend_mode(FACE_STEREO_FILTER_TYPE).is_ok(), true);
     }
 }
