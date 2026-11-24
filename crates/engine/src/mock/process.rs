@@ -2145,17 +2145,16 @@ fn develop_gpu_gain_plane(
 /// CPU until a halo-aware GPU stage exists.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-fn gpu_develop_context(
+fn gpu_develop_preflight(
     plan: &Plan,
     adj: &AdjustmentSet,
     bypass: bool,
     region: NormRect,
     out_w: u32,
     out_h: u32,
-    xs: &[f32],
     camera_usm_path: bool,
     region_backed: bool,
-) -> Option<(super::develop_gpu::DevelopParams, Option<Vec<f32>>)> {
+) -> Option<super::develop_gpu::DevelopParams> {
     use super::develop_gpu;
     if !develop_gpu::enabled() {
         return None;
@@ -2215,12 +2214,7 @@ fn gpu_develop_context(
         log_develop_gpu_fallback("CUDA device/PTX unavailable");
         return None;
     }
-    let gain = if bypass {
-        None
-    } else {
-        develop_gpu_gain_plane(plan, adj, region, out_w, out_h, xs)
-    };
-    Some((params, gain))
+    Some(params)
 }
 
 /// Identity of what the dust model is shown: the source snapshot, its geometry,
@@ -2490,6 +2484,41 @@ fn render_sized(
         guide.as_deref(),
         mask_overlay,
     );
+
+    // Decide whether the GPU point chain can run before building optional
+    // gain planes or allocating output-sized buffers. These flags depend only
+    // on the adjustment set and the already-built plan.
+    let f32_includes_sharpen = adj.moire.amount <= 0.0 && !adj.lens.diffraction_enabled;
+    let use_f32_detail = !bypass
+        && (adj.noise_reduction.single_pixel > 0.0
+            || adj.noise_reduction.luminance > 0.0
+            || adj.noise_reduction.color > 0.0
+            || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    let camera_usm_path = use_f32_detail
+        && plan.c1_color.is_some()
+        && f32_includes_sharpen
+        && adj.sharpening.amount > 0.0;
+    #[cfg(all(windows, not(feature = "z6iii-raw-export")))]
+    let camera_usm_path = false;
+    let region_backed = region == NormRect::FULL || !use_f32_detail;
+    #[cfg(windows)]
+    let gpu_develop_params = gpu_develop_preflight(
+        &plan,
+        adj,
+        bypass,
+        region,
+        out_w,
+        out_h,
+        camera_usm_path,
+        region_backed,
+    );
+
+    // The x-coordinate table is only O(width), unlike the frame-sized buffers
+    // below, and is shared by the CPU and GPU gain calculations.
+    let xs: Vec<f32> =
+        (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
+
     if !bypass {
         // Manual vignette is output-space, LCC is source-space; both are pure
         // multiplicative gains in scene-linear light, so one GPU plane each
@@ -2527,12 +2556,22 @@ fn render_sized(
         }
     }
 
+    #[cfg(windows)]
+    let gpu_develop = gpu_develop_params.map(|params| {
+        // Gain generation now happens only after the non-allocating GPU
+        // admission check has accepted this frame.
+        let gain = if bypass {
+            None
+        } else {
+            develop_gpu_gain_plane(&plan, adj, region, out_w, out_h, &xs)
+        };
+        (params, gain)
+    });
+
     let len = (out_w * out_h * 4) as usize;
     let row = (out_w * 4) as usize;
     let mut rgba = vec![0u8; len];
     let mut rgba16 = wide.then(|| vec![0u16; len]);
-    let xs: Vec<f32> =
-        (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
     // Clarity's low-frequency planes. Sampled from the same pre-curve stage
     // the develop loop uses, so the operator sees raw-stage luma without a
     // full-frame buffer: 2 planes of (out/step)^2 f32.
@@ -2572,35 +2611,7 @@ fn render_sized(
     // bicubic sampling to preserve crisp micro-contrast; below 50% the bilinear
     // mip tap is the right anti-aliased filter.
     let sharp = scale >= 0.5;
-    let f32_includes_sharpen = adj.moire.amount <= 0.0 && !adj.lens.diffraction_enabled;
-    let use_f32_detail = !bypass
-        && (adj.noise_reduction.single_pixel > 0.0
-            || adj.noise_reduction.luminance > 0.0
-            || adj.noise_reduction.color > 0.0
-            || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
     let gpu_two_pass = !bypass && gpu_clarity && region == NormRect::FULL && !has_camera_color(&plan);
-    #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    let camera_usm_path = use_f32_detail
-        && plan.c1_color.is_some()
-        && f32_includes_sharpen
-        && adj.sharpening.amount > 0.0;
-    #[cfg(all(windows, not(feature = "z6iii-raw-export")))]
-    let camera_usm_path = false;
-    // The F32 detail path needs a halo outside a partial region, so it keeps
-    // the full-frame requirement until a halo-aware GPU stage exists.
-    let region_backed = region == NormRect::FULL || !use_f32_detail;
-    #[cfg(windows)]
-    let gpu_develop = gpu_develop_context(
-        &plan,
-        adj,
-        bypass,
-        region,
-        out_w,
-        out_h,
-        &xs,
-        camera_usm_path,
-        region_backed,
-    );
     // Band-sampled CPU path: one tile row at a time, never a full-frame sample
     // array. The GPU path below reuses exactly the same bands.
     let bands = BandSampler {
