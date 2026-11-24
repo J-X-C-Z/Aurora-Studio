@@ -4768,10 +4768,16 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         super::super::pixel_gpu::PLANE_HITS.store(0, Ordering::Relaxed);
         let _ = render(&src, &adj, NormRect::FULL, w, false, None);
         let hits = super::super::pixel_gpu::PLANE_HITS.load(Ordering::Relaxed);
+        // P-08 (S6) measured the cold vignette plane as slower end to end than
+        // the CPU `exp2` formula at every size, so the shipped default declines
+        // it; `AURORA_PIXEL_VIGNETTE_GPU=1` restores the plane for this probe.
+        let vignette_opt_in = std::env::var_os("AURORA_PIXEL_VIGNETTE_GPU")
+            .is_some_and(|value| value != "0");
+        let expected = if vignette_opt_in { 2 } else { 1 };
         if hits == 0 {
             eprintln!("skipped: no CUDA device exposed a gain plane");
         } else {
-            assert!(hits >= 2, "expected vignette and LCC planes, got {hits}");
+            assert!(hits >= expected, "expected at least {expected} gain plane(s), got {hits}");
         }
     }
 
