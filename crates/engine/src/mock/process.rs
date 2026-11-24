@@ -2214,7 +2214,25 @@ fn render_sized(
                 || adj.lens.shift_x.abs() > 1.0e-6
                 || adj.lens.shift_y.abs() > 1.0e-6
                 || adj.lens.tilt.abs() > 1.0e-6;
-            if geometric_lens {
+            if geometric_lens && region == NormRect::FULL {
+                if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
+                    match stage_face_bundle(receipt.job_id(), &stage_frame, false) {
+                        Ok(bundle) => match bundle.slim_inputs(&stage_frame) {
+                            Ok(slim) => {
+                                let mut inputs = producer_inputs.take().unwrap_or_default();
+                                inputs.slim = Some(slim);
+                                producer_inputs = Some(inputs);
+                            }
+                            Err(refusal) => {
+                                log::warn!("stage face input refused: {refusal:?}");
+                            }
+                        },
+                        Err(refusal) => {
+                            log::warn!("stage face inference refused: {refusal:?}");
+                        }
+                    }
+                }
+            } else if geometric_lens {
                 log::warn!(
                     "{}: geometric lens transform not recovered",
                     crate::FACE_STAGE_TRANSFORM_REFUSAL
