@@ -1521,6 +1521,11 @@ pub struct Pf90004ProducerInputs {
 }
 
 impl Pf90004ProducerInputs {
+    /// Heap bytes held by this bundle, for the face-input result cache budget.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        self.skin_mask.len() + self.parsing_rgba.len() + self.face_rgba.len()
+    }
+
     pub fn from_same_job(
         width: u32,
         height: u32,

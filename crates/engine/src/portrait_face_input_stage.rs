@@ -3,6 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
@@ -54,6 +55,143 @@ const FACE_PARSING_V2_MODEL_ERROR: &str = "FaceParsingV2 canonical model";
 const FACE_PARSING_V2_ROI_ERROR: &str = "FaceParsingV2 ROI";
 const FACE_PARSING_V2_PRODUCE_ERROR: &str = "FaceParsingV2 canonical producer";
 const FACE_STAGE_TRANSFORM_ERROR: &str = "face input source-to-stage transform";
+
+/// PF-F: bounded same-process bridge between `Source::face_input_image()` and the
+/// session cache. `Source`'s own image field is outside that accessor's edit
+/// boundary, so the shared `Arc` lives here. Entries are keyed by the immutable
+/// decoded plane pointer, its length, and the Source's cached snapshot
+/// fingerprint; the inner `Arc` pointer check keeps allocator reuse from
+/// matching a stale entry. The table is bounded to two sources.
+const MAX_SHARED_FACE_INPUT_IMAGES: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SharedFaceInputKey {
+    plane_ptr: usize,
+    plane_len: usize,
+    fingerprint: u64,
+    /// Dimensions are part of the key: two equal-length planes at one address
+    /// can otherwise differ by width/height after allocator reuse.
+    size: [u32; 2],
+}
+
+struct SharedFaceInputImage {
+    image: Arc<Image>,
+    key: SharedFaceInputKey,
+    stamp: u64,
+}
+
+type SharedFaceInputTable = Mutex<(HashMap<SharedFaceInputKey, SharedFaceInputImage>, u64)>;
+
+fn shared_face_inputs() -> &'static SharedFaceInputTable {
+    static CACHE: OnceLock<SharedFaceInputTable> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new((HashMap::new(), 0)))
+}
+
+/// Returns the already-shared image for `key`, if this process still holds it.
+pub(crate) fn shared_face_input_image(key: (usize, usize, u64, u32, u32)) -> Option<Arc<Image>> {
+    let key = SharedFaceInputKey {
+        plane_ptr: key.0,
+        plane_len: key.1,
+        fingerprint: key.2,
+        size: [key.3, key.4],
+    };
+    let mut guard = shared_face_inputs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.1 += 1;
+    let stamp = guard.1;
+    let entry = guard.0.get_mut(&key)?;
+    entry.stamp = stamp;
+    Some(Arc::clone(&entry.image))
+}
+
+/// Publishes `image` as the shared input for `key` and returns it unchanged.
+pub(crate) fn register_face_input_image(
+    key: (usize, usize, u64, u32, u32),
+    image: Arc<Image>,
+) -> Arc<Image> {
+    let key = SharedFaceInputKey {
+        plane_ptr: key.0,
+        plane_len: key.1,
+        fingerprint: key.2,
+        size: [key.3, key.4],
+    };
+    let mut guard = shared_face_inputs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.1 += 1;
+    let stamp = guard.1;
+    guard.0.insert(
+        key,
+        SharedFaceInputImage {
+            image: Arc::clone(&image),
+            key,
+            stamp,
+        },
+    );
+    while guard.0.len() > MAX_SHARED_FACE_INPUT_IMAGES {
+        let victim = guard
+            .0
+            .values()
+            .min_by_key(|entry| entry.stamp)
+            .map(|entry| entry.key);
+        match victim {
+            Some(victim) => {
+                guard.0.remove(&victim);
+            }
+            None => break,
+        }
+    }
+    image
+}
+
+/// Trusted identity for an image produced by this process's Source cache.
+/// The `Arc` pointer check makes this sound even if the allocator reuses the
+/// plane address for a different image.
+fn trusted_source_fingerprint(image: &Image) -> Option<u64> {
+    let guard = shared_face_inputs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .0
+        .values()
+        .find(|entry| {
+            entry.image.pixels.as_ptr() as usize == image.pixels.as_ptr() as usize
+                && entry.image.pixels.len() == image.pixels.len()
+                && std::ptr::eq(Arc::as_ptr(&entry.image), image)
+        })
+        .map(|entry| entry.key.fingerprint)
+}
+
+/// Internal cache identity. A trusted snapshot fingerprint lets a cache hit
+/// skip the full-frame scan; untrusted images keep a real content SHA-256, and
+/// the produced bundle still stores that SHA for the cross-process receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaceInputSourceIdentity {
+    Snapshot {
+        fingerprint: u64,
+        size: [u32; 2],
+    },
+    ContentSha256 {
+        sha256: [u8; 32],
+        size: [u32; 2],
+    },
+}
+
+impl FaceInputSourceIdentity {
+    fn size(self) -> [u32; 2] {
+        match self {
+            Self::Snapshot { size, .. } | Self::ContentSha256 { size, .. } => size,
+        }
+    }
+
+    fn sha256(self) -> Option<[u8; 32]> {
+        match self {
+            Self::Snapshot { .. } => None,
+            Self::ContentSha256 { sha256, .. } => Some(sha256),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaceModelIdentity {
@@ -2109,6 +2247,19 @@ impl FaceInputProducer {
     }
 
     pub fn produce(&self, job_id: u64, source: &Image) -> Result<FaceInputBundle, Refusal> {
+        self.produce_with_sha(job_id, source, None)
+    }
+
+    /// PF-F: an untrusted caller has already paid for the content SHA-256 when
+    /// it built the cache identity; pass it here so a cache miss does not scan
+    /// the same frame twice. A trusted snapshot passes `None` and the receipt
+    /// SHA is computed once, exactly as before.
+    fn produce_with_sha(
+        &self,
+        job_id: u64,
+        source: &Image,
+        source_sha256: Option<[u8; 32]>,
+    ) -> Result<FaceInputBundle, Refusal> {
         if job_id == 0 {
             return Err(Refusal::ValueOutOfRange("face input job ticket"));
         }
@@ -2161,7 +2312,7 @@ impl FaceInputProducer {
         let bundle = FaceInputBundle {
             job_id,
             source_size: [source.width, source.height],
-            source_sha256: sha256_32(&source.pixels),
+            source_sha256: source_sha256.unwrap_or_else(|| sha256_32(&source.pixels)),
             detection,
             mesh,
             roi_xywh,
@@ -2507,7 +2658,15 @@ impl FaceInputProducer {
 
 const MAX_CACHED_FACE_PRODUCERS: usize = 8;
 const MAX_CACHED_FACE_RESULTS: usize = 32;
+/// PF-F: byte budget for cached face-input bundles. A single bundle larger than
+/// this is returned to the caller but not cached, so one huge frame cannot
+/// evict the whole working set.
+const MAX_CACHED_FACE_RESULT_BYTES: usize = 256 * 1024 * 1024;
 const ROI_CACHE_SCALE: f64 = 1_000_000.0;
+/// PF-F producer identity. The ORT runtime does not expose its version, so the
+/// key pins the model SHA-256 set, provider intent, resolved runtime
+/// directories, and this session-option revision instead.
+const FACE_INPUT_SESSION_OPTIONS_REVISION: &str = "pff-face-input-session-options-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaceInputFileStamp {
@@ -2521,6 +2680,8 @@ pub struct FaceInputSessionKey {
     pub include_parsing: bool,
     backend: FaceInputBackend,
     pub stamps: Vec<FaceInputFileStamp>,
+    model_fingerprint: u64,
+    runtime_fingerprint: u64,
 }
 
 impl FaceInputSessionKey {
@@ -2558,6 +2719,8 @@ impl FaceInputSessionKey {
             include_parsing,
             backend,
             stamps,
+            model_fingerprint: model_set_fingerprint(include_parsing),
+            runtime_fingerprint: runtime_identity_fingerprint(backend),
         })
     }
 
@@ -2572,11 +2735,51 @@ impl FaceInputSessionKey {
     }
 }
 
+fn model_set_fingerprint(include_parsing: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for sha in [
+        C1_FACE_DETECTION_MODEL_SHA256,
+        C1_FACE_MESH_MODEL_SHA256,
+        FACE_LANDMARK_1063025060_MODEL_SHA256,
+        FACE_LANDMARK_323773030_MODEL_SHA256,
+        super::FACE_LANDMARK_52_MODEL_SHA256,
+        FACE_LANDMARK_CONSTANTS_SHA256,
+    ] {
+        sha.hash(&mut hasher);
+    }
+    if include_parsing {
+        C1_FACE_PARSING_MODEL_SHA256.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn runtime_identity_fingerprint(backend: FaceInputBackend) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    backend.label().hash(&mut hasher);
+    FACE_INPUT_SESSION_OPTIONS_REVISION.hash(&mut hasher);
+    if let Some(runtime) = Runtime::get() {
+        let (library, version, api) = runtime.describe();
+        library.to_string_lossy().hash(&mut hasher);
+        version.hash(&mut hasher);
+        api.hash(&mut hasher);
+    }
+    for name in [
+        "AURORA_ORT_RUNTIME_DIRS",
+        "AURORA_ORT_DIR",
+        "AURORA_GPU_DLL_DIRS",
+        "AURORA_FACE_INPUT_BACKEND",
+    ] {
+        std::env::var_os(name)
+            .map(|value| value.to_string_lossy().into_owned())
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FaceInputResultKey {
     pub session_fingerprint: u64,
-    pub source_sha256: [u8; 32],
-    pub source_size: [u32; 2],
+    pub source: FaceInputSourceIdentity,
     pub roi_quantized: [i64; 4],
 }
 
@@ -2584,13 +2787,12 @@ impl FaceInputResultKey {
     fn from_bundle(
         session: &FaceInputSessionKey,
         bundle: &FaceInputBundle,
+        source: FaceInputSourceIdentity,
     ) -> Result<Self, Refusal> {
-        let roi_quantized = quantize_roi(bundle.roi_normalized_xywh)?;
         Ok(Self {
             session_fingerprint: session.fingerprint(),
-            source_sha256: bundle.source_sha256,
-            source_size: bundle.source_size,
-            roi_quantized,
+            source,
+            roi_quantized: quantize_roi(bundle.roi_normalized_xywh)?,
         })
     }
 }
@@ -2598,18 +2800,179 @@ impl FaceInputResultKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FaceInputAliasKey {
     session_fingerprint: u64,
-    source_sha256: [u8; 32],
-    source_size: [u32; 2],
+    source: FaceInputSourceIdentity,
+}
+
+struct FaceInputResultEntry {
+    bundle: Arc<FaceInputBundle>,
+    bytes: usize,
+    last_used: u64,
+}
+
+struct FaceInputAliasEntry {
+    result: FaceInputResultKey,
+    last_used: u64,
 }
 
 #[derive(Default)]
 struct FaceInputResultCache {
-    results: HashMap<FaceInputResultKey, Arc<FaceInputBundle>>,
-    aliases: HashMap<FaceInputAliasKey, FaceInputResultKey>,
+    results: HashMap<FaceInputResultKey, FaceInputResultEntry>,
+    aliases: HashMap<FaceInputAliasKey, FaceInputAliasEntry>,
+    bytes: usize,
+    clock: u64,
 }
 
-fn producer_cache() -> &'static Mutex<HashMap<FaceInputSessionKey, Arc<FaceInputProducer>>> {
-    static CACHE: OnceLock<Mutex<HashMap<FaceInputSessionKey, Arc<FaceInputProducer>>>> =
+impl FaceInputResultCache {
+    fn lookup(&mut self, alias: &FaceInputAliasKey) -> Option<Arc<FaceInputBundle>> {
+        let key = self.aliases.get(alias)?.result.clone();
+        self.clock += 1;
+        let stamp = self.clock;
+        let entry = self.results.get_mut(&key)?;
+        entry.last_used = stamp;
+        let bundle = Arc::clone(&entry.bundle);
+        if let Some(alias_entry) = self.aliases.get_mut(alias) {
+            alias_entry.last_used = stamp;
+        }
+        Some(bundle)
+    }
+
+    fn remove_result(&mut self, key: &FaceInputResultKey) {
+        if let Some(entry) = self.results.remove(key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+        self.aliases.retain(|_, alias| alias.result != *key);
+    }
+
+    fn insert(
+        &mut self,
+        alias: FaceInputAliasKey,
+        key: FaceInputResultKey,
+        bundle: Arc<FaceInputBundle>,
+    ) {
+        let bytes = bundle_bytes(&bundle);
+        if bytes > MAX_CACHED_FACE_RESULT_BYTES {
+            return;
+        }
+        self.remove_result(&key);
+        self.clock += 1;
+        let stamp = self.clock;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.results.insert(
+            key.clone(),
+            FaceInputResultEntry {
+                bundle,
+                bytes,
+                last_used: stamp,
+            },
+        );
+        self.aliases.insert(
+            alias,
+            FaceInputAliasEntry {
+                result: key,
+                last_used: stamp,
+            },
+        );
+        while self.results.len() > MAX_CACHED_FACE_RESULTS
+            || self.bytes > MAX_CACHED_FACE_RESULT_BYTES
+        {
+            let victim = lru_key(
+                self.results
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.last_used)),
+            );
+            match victim {
+                Some(victim) => self.remove_result(&victim),
+                None => break,
+            }
+        }
+    }
+}
+
+/// Cheap structural check for a result-cache hit.
+///
+/// `validate_ticket` is deliberately not used here: it hashes the whole frame,
+/// which is exactly the scan `FaceInputSourceIdentity::Snapshot` exists to
+/// avoid. Shape, finiteness and the teeth-mask size still catch a corrupt or
+/// truncated bundle without touching pixels.
+fn cached_bundle_matches(bundle: &FaceInputBundle, identity: FaceInputSourceIdentity) -> bool {
+    let size = identity.size();
+    let frame_pixels = size[0] as usize * size[1] as usize;
+    bundle.source_size == size
+        && identity
+            .sha256()
+            .map_or(true, |sha| bundle.source_sha256 == sha)
+        && bundle.points194.len() == 194
+        && bundle.points414.len() == 414
+        && bundle
+            .points194
+            .iter()
+            .chain(&bundle.points414)
+            .flatten()
+            .all(|value| value.is_finite())
+        && bundle.model_inputs.as_ref().map_or(true, |inputs| {
+            inputs.teeth.as_ref().map_or(true, |teeth| {
+                teeth.mask_width == size[0]
+                    && teeth.mask_height == size[1]
+                    && teeth.mask_g.len() == frame_pixels
+            })
+        })
+}
+
+fn lru_key<K: Clone>(items: impl Iterator<Item = (K, u64)>) -> Option<K> {
+    items.min_by_key(|(_, stamp)| *stamp).map(|(key, _)| key)
+}
+
+fn bundle_bytes(bundle: &FaceInputBundle) -> usize {
+    let mut bytes = std::mem::size_of::<FaceInputBundle>();
+    let points = |values: &[[f32; 2]]| std::mem::size_of_val(values);
+    bytes += points(&bundle.points17)
+        + points(&bundle.points142)
+        + points(&bundle.points194)
+        + points(&bundle.points414);
+    let landmark = &bundle.landmark_producer;
+    bytes += points(&landmark.points142)
+        + landmark.crop_bgr.len() * std::mem::size_of::<f32>()
+        + points(&landmark.raw52)
+        + points(&landmark.points52)
+        + points(&landmark.points194);
+    if let Some(inputs) = bundle.model_inputs.as_ref() {
+        if let Some(parsing) = inputs.parsing.as_ref() {
+            bytes += parsing.masks.len();
+        }
+        // A parsing bundle also carries a full-frame teeth mask, two LUTs and
+        // the five PF90004 planes. Without these the 256 MiB budget only saw a
+        // few MiB and could admit several GB of bundles.
+        if let Some(teeth) = inputs.teeth.as_ref() {
+            bytes += teeth.mask_g.len() + teeth.whiten_lut.len() + teeth.bright_lut.len();
+        }
+        if let Some(pf90004) = inputs.pf90004.as_ref() {
+            bytes += pf90004.owned_bytes();
+        }
+    }
+    bytes
+}
+
+struct FaceInputProducerSlot {
+    cell: OnceLock<Result<Arc<FaceInputProducer>, Refusal>>,
+    last_used: AtomicU64,
+}
+
+impl FaceInputProducerSlot {
+    fn new(stamp: u64) -> Self {
+        Self {
+            cell: OnceLock::new(),
+            last_used: AtomicU64::new(stamp),
+        }
+    }
+}
+
+fn next_producer_stamp() -> u64 {
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    CLOCK.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn producer_cache() -> &'static Mutex<HashMap<FaceInputSessionKey, Arc<FaceInputProducerSlot>>> {
+    static CACHE: OnceLock<Mutex<HashMap<FaceInputSessionKey, Arc<FaceInputProducerSlot>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -2617,6 +2980,47 @@ fn producer_cache() -> &'static Mutex<HashMap<FaceInputSessionKey, Arc<FaceInput
 fn result_cache() -> &'static Mutex<FaceInputResultCache> {
     static CACHE: OnceLock<Mutex<FaceInputResultCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(FaceInputResultCache::default()))
+}
+
+/// PF-F §11: one in-flight result build per (session, source) alias.
+///
+/// Two preview threads that miss the result cache at the same time used to run
+/// the same detection/mesh/landmark inference twice. The first caller owns the
+/// `OnceLock`; the others wait on it without holding either cache mutex. The
+/// slot is dropped as soon as the result is in the cache (or the build failed,
+/// so a later call can retry).
+struct FaceInputResultFlight {
+    cell: OnceLock<Result<Arc<FaceInputBundle>, Refusal>>,
+}
+
+fn result_flights(
+) -> &'static Mutex<HashMap<FaceInputAliasKey, Arc<FaceInputResultFlight>>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<FaceInputAliasKey, Arc<FaceInputResultFlight>>>> =
+        OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn result_flight(alias: &FaceInputAliasKey) -> Arc<FaceInputResultFlight> {
+    let mut flights = result_flights()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        flights
+            .entry(alias.clone())
+            .or_insert_with(|| Arc::new(FaceInputResultFlight { cell: OnceLock::new() })),
+    )
+}
+
+fn release_result_flight(alias: &FaceInputAliasKey, flight: &Arc<FaceInputResultFlight>) {
+    let mut flights = result_flights()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ours = flights
+        .get(alias)
+        .is_some_and(|current| Arc::ptr_eq(current, flight));
+    if ours {
+        flights.remove(alias);
+    }
 }
 
 /// Process-local, thread-safe owner for the five ORT sessions and successful
@@ -2636,22 +3040,59 @@ impl FaceInputSession {
 
     pub fn open(paths: FaceInputModelPaths, include_parsing: bool) -> Result<Self, Refusal> {
         let key = FaceInputSessionKey::from_paths(paths.clone(), include_parsing)?;
-        let mut cache = producer_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(producer) = cache.get(&key).cloned() {
-            return Ok(Self { key, producer });
+        let slot = {
+            let mut cache = producer_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let stamp = next_producer_stamp();
+            match cache.get_mut(&key) {
+                Some(slot) => {
+                    slot.last_used.store(stamp, Ordering::Relaxed);
+                    Arc::clone(slot)
+                }
+                None => {
+                    let slot = Arc::new(FaceInputProducerSlot::new(stamp));
+                    cache.insert(key.clone(), Arc::clone(&slot));
+                    while cache.len() > MAX_CACHED_FACE_PRODUCERS {
+                        let victim = cache
+                            .iter()
+                            .min_by_key(|(_, slot)| slot.last_used.load(Ordering::Relaxed))
+                            .map(|(key, _)| key.clone());
+                        match victim {
+                            Some(victim) => {
+                                cache.remove(&victim);
+                            }
+                            None => break,
+                        }
+                    }
+                    slot
+                }
+            }
+        };
+        // PF-F P-15: the potentially slow session open runs outside the global
+        // cache mutex. `OnceLock::get_or_init` makes same-key callers wait on
+        // this slot instead of racing or blocking every other session.
+        let created = slot.cell.get_or_init(|| {
+            FaceInputProducer::open_with_backend(key.paths.clone(), include_parsing, key.backend)
+                .map(Arc::new)
+        });
+        match created {
+            Ok(producer) => Ok(Self {
+                key,
+                producer: Arc::clone(producer),
+            }),
+            Err(refusal) => {
+                let mut cache = producer_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(current) = cache.get(&key) {
+                    if Arc::ptr_eq(current, &slot) {
+                        cache.remove(&key);
+                    }
+                }
+                Err(refusal.clone())
+            }
         }
-        let producer = Arc::new(FaceInputProducer::open_with_backend(
-            key.paths.clone(),
-            include_parsing,
-            key.backend,
-        )?);
-        if cache.len() >= MAX_CACHED_FACE_PRODUCERS {
-            cache.clear();
-        }
-        cache.insert(key.clone(), Arc::clone(&producer));
-        Ok(Self { key, producer })
     }
 
     pub fn producer(&self) -> Arc<FaceInputProducer> {
@@ -2666,80 +3107,118 @@ impl FaceInputSession {
         if job_id == 0 {
             return Err(Refusal::ValueOutOfRange("face input job ticket"));
         }
-        let source_sha256 = sha256_32(&source.pixels);
-        let source_size = [source.width, source.height];
+        // PF-F P-12: a Source-produced image carries a trusted snapshot
+        // fingerprint, so a cache hit never scans the full frame. Any other
+        // image keeps a real content SHA-256 for both the cache key and the
+        // bundle receipt.
+        let size = [source.width, source.height];
+        let identity = match trusted_source_fingerprint(source) {
+            Some(fingerprint) => FaceInputSourceIdentity::Snapshot { fingerprint, size },
+            None => FaceInputSourceIdentity::ContentSha256 {
+                sha256: sha256_32(&source.pixels),
+                size,
+            },
+        };
         let alias = FaceInputAliasKey {
             session_fingerprint: self.key.fingerprint(),
-            source_sha256,
-            source_size,
+            source: identity,
         };
-        let result_key = result_cache()
+        let cached = result_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .aliases
-            .get(&alias)
-            .cloned();
-        if let Some(result_key) = result_key {
-            let cached = result_cache()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .results
-                .get(&result_key)
-                .cloned();
-            if let Some(cached) = cached {
-                if FaceInputResultKey::from_bundle(&self.key, cached.as_ref()).ok()
-                    == Some(result_key.clone())
-                {
-                    let mut bundle = (*cached).clone();
-                    bundle.job_id = job_id;
-                    match bundle.validate_ticket(source, Some(job_id)) {
-                        Ok(()) => {
-                            if let Some(inputs) = bundle.model_inputs.as_mut() {
-                                if let Some(parsing) = inputs.parsing.as_mut() {
-                                    parsing.job_id = job_id;
-                                }
-                                if let Some(teeth) = inputs.teeth.as_mut() {
-                                    teeth.job_id = job_id;
-                                }
+            .lookup(&alias);
+        if let Some(cached) = cached {
+            if cached_bundle_matches(&cached, identity) {
+                let mut bundle = (*cached).clone();
+                bundle.job_id = job_id;
+                match bundle.validate_ticket(source, Some(job_id)) {
+                    Ok(()) => {
+                        if let Some(inputs) = bundle.model_inputs.as_mut() {
+                            if let Some(parsing) = inputs.parsing.as_mut() {
+                                parsing.job_id = job_id;
                             }
-                            return Ok(bundle);
+                            if let Some(teeth) = inputs.teeth.as_mut() {
+                                teeth.job_id = job_id;
+                            }
                         }
-                        Err(refusal) => {
-                            let mut cache = result_cache()
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            cache.results.remove(&result_key);
-                            cache.aliases.remove(&alias);
-                            return Err(refusal);
+                        return Ok(bundle);
+                    }
+                    Err(refusal) => {
+                        let mut cache = result_cache()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(alias_entry) = cache.aliases.remove(&alias) {
+                            cache.remove_result(&alias_entry.result);
                         }
+                        return Err(refusal);
                     }
                 }
-                let mut cache = result_cache()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                cache.results.remove(&result_key);
-                cache.aliases.remove(&alias);
             }
-            result_cache()
+            let mut cache = result_cache()
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .aliases
-                .remove(&alias);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(alias_entry) = cache.aliases.remove(&alias) {
+                cache.remove_result(&alias_entry.result);
+            }
         }
 
-        let bundle = self.producer.produce(job_id, source)?;
-        let result_key = FaceInputResultKey::from_bundle(&self.key, &bundle)?;
-        let mut cache = result_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cache.results.len() >= MAX_CACHED_FACE_RESULTS {
-            cache.results.clear();
-            cache.aliases.clear();
+        // PF-F §11: result single-flight. Concurrent misses on the same alias
+        // share one inference; the winner publishes into the result cache and
+        // then drops the slot.
+        let flight = result_flight(&alias);
+        // The `OnceLock` is owned by the flight slot, which is removed from
+        // the map only after this call returns. A waiter's closure is never
+        // run, so no lock is held while the leader is in `produce_uncached`.
+        let outcome = flight
+            .cell
+            .get_or_init(|| self.produce_uncached(job_id, source, identity, &alias));
+        release_result_flight(&alias, &flight);
+        match outcome {
+            Ok(bundle) => {
+                // The cached bundle keeps the producer's ticket; callers get
+                // the ticket they asked for.
+                let mut bundle = (**bundle).clone();
+                bundle.job_id = job_id;
+                Ok(bundle)
+            }
+            Err(refusal) => Err(refusal.clone()),
         }
-        cache
-            .results
-            .insert(result_key.clone(), Arc::new(bundle.clone()));
-        cache.aliases.insert(alias, result_key);
+    }
+
+    /// Slow path shared by the winner of [`Self::produce`]'s single-flight
+    /// slot: re-check the result cache (another alias may have completed while
+    /// this thread was queued), run the producer, and publish the bundle.
+    fn produce_uncached(
+        &self,
+        job_id: u64,
+        source: &Image,
+        identity: FaceInputSourceIdentity,
+        alias: &FaceInputAliasKey,
+    ) -> Result<Arc<FaceInputBundle>, Refusal> {
+        let cached = result_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lookup(alias);
+        if let Some(cached) = cached {
+            if cached_bundle_matches(&cached, identity) {
+                return Ok(cached);
+            }
+            let mut cache = result_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(alias_entry) = cache.aliases.remove(alias) {
+                cache.remove_result(&alias_entry.result);
+            }
+        }
+        let bundle = self
+            .producer
+            .produce_with_sha(job_id, source, identity.sha256())?;
+        let result_key = FaceInputResultKey::from_bundle(&self.key, &bundle, identity)?;
+        let bundle = Arc::new(bundle);
+        result_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(alias.clone(), result_key, Arc::clone(&bundle));
         Ok(bundle)
     }
 
@@ -2753,6 +3232,12 @@ impl FaceInputSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         results.results.clear();
         results.aliases.clear();
+        results.bytes = 0;
+        drop(results);
+        result_flights()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
@@ -3289,5 +3774,140 @@ mod tests {
         let left = quantize_roi([0.125, 0.25, 0.5, 0.5]).unwrap();
         let right = quantize_roi([0.125001, 0.25, 0.5, 0.5]).unwrap();
         assert_ne!(left, right);
+    }
+}
+
+#[cfg(test)]
+mod pff_tests {
+    use super::*;
+
+    fn clear_shared() {
+        let mut guard = shared_face_inputs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.0.clear();
+        guard.1 = 0;
+    }
+
+    #[test]
+    fn shared_face_input_reuses_one_arc_and_bounds_entries() {
+        clear_shared();
+        let first = Arc::new(Image::new(2, 2, vec![7; 16]).expect("image"));
+        let registered = register_face_input_image((0x1000, 16, 11, 2, 2), Arc::clone(&first));
+        let reused = shared_face_input_image((0x1000, 16, 11, 2, 2)).expect("shared");
+        assert!(Arc::ptr_eq(&registered, &reused));
+        assert_eq!(trusted_source_fingerprint(&reused), Some(11));
+
+        // A different allocation is never trusted by address alone.
+        let other = Arc::new(Image::new(2, 2, vec![9; 16]).expect("image"));
+        assert_eq!(trusted_source_fingerprint(&other), None);
+
+        // At most two sources stay resident; the oldest is evicted.
+        let second = Arc::new(Image::new(2, 2, vec![8; 16]).expect("image"));
+        register_face_input_image((0x2000, 16, 12, 2, 2), Arc::clone(&second));
+        let third = Arc::new(Image::new(2, 2, vec![6; 16]).expect("image"));
+        register_face_input_image((0x3000, 16, 13, 2, 2), Arc::clone(&third));
+        assert!(shared_face_input_image((0x1000, 16, 11, 2, 2)).is_none());
+        // Same bytes at the same address with swapped dimensions is a miss.
+        assert!(shared_face_input_image((0x2000, 16, 12, 4, 1)).is_none());
+        assert!(shared_face_input_image((0x2000, 16, 12, 2, 2)).is_some());
+        assert!(shared_face_input_image((0x3000, 16, 13, 2, 2)).is_some());
+    }
+
+    #[test]
+    fn lru_key_picks_the_oldest_stamp() {
+        assert_eq!(
+            lru_key(vec![(1u8, 5u64), (2, 3), (3, 9)].into_iter()),
+            Some(2)
+        );
+        assert_eq!(lru_key(std::iter::empty::<(u8, u64)>()), None);
+    }
+
+    #[test]
+    fn result_flights_share_one_slot_per_alias_and_release_safely() {
+        let alias = FaceInputAliasKey {
+            session_fingerprint: 1,
+            source: FaceInputSourceIdentity::Snapshot {
+                fingerprint: 9,
+                size: [2, 2],
+            },
+        };
+        let other = FaceInputAliasKey {
+            session_fingerprint: 1,
+            source: FaceInputSourceIdentity::Snapshot {
+                fingerprint: 10,
+                size: [2, 2],
+            },
+        };
+        result_flights()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let first = result_flight(&alias);
+        let second = result_flight(&alias);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &result_flight(&other)));
+
+        release_result_flight(&alias, &first);
+        let rebuilt = result_flight(&alias);
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        // A stale waiter must not evict the slot that replaced it.
+        release_result_flight(&alias, &first);
+        assert!(
+            result_flights()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&alias)
+        );
+        release_result_flight(&alias, &rebuilt);
+        result_flights()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    #[test]
+    fn content_identity_only_exposes_its_sha() {
+        let snapshot = FaceInputSourceIdentity::Snapshot {
+            fingerprint: 7,
+            size: [2, 1],
+        };
+        assert_eq!(snapshot.sha256(), None);
+        assert_eq!(snapshot.size(), [2, 1]);
+        let content = FaceInputSourceIdentity::ContentSha256 {
+            sha256: [3; 32],
+            size: [2, 1],
+        };
+        assert_eq!(content.sha256(), Some([3; 32]));
+    }
+
+    /// PF-F acceptance microbenchmark: 24MP, ten consecutive requests.
+    /// Run with `cargo test --release -p aurora-engine --lib pff_tests
+    /// -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn face_input_image_ten_calls_are_shared() {
+        let (w, h) = (6000u32, 4000u32);
+        let rgba = vec![128u8; (w as usize) * (h as usize) * 4];
+        let source = crate::mock::process::Source::from_rgba(w, h, &rgba);
+        let first_start = std::time::Instant::now();
+        let first = source.face_input_image();
+        let first_time = first_start.elapsed();
+        let hits_start = std::time::Instant::now();
+        let mut shared = 0usize;
+        for _ in 0..9 {
+            let next = source.face_input_image();
+            if Arc::ptr_eq(&first, &next) {
+                shared += 1;
+            }
+        }
+        eprintln!(
+            "PFF after: first={first_time:?} hits={:?} total={:?} shared={}/9 bytes={}",
+            hits_start.elapsed(),
+            first_time + hits_start.elapsed(),
+            shared,
+            first.pixels.len()
+        );
+        assert_eq!(shared, 9);
     }
 }
