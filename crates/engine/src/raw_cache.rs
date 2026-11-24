@@ -42,10 +42,10 @@ const IDENTITY_SAMPLES: u64 = 9;
 /// Files at or below this size are hashed whole: cheaper than the bookkeeping
 /// and immune to changes between windows.
 const IDENTITY_FULL_BELOW: u64 = 2 << 20;
-/// One full-sensor frame kept after a cold proxy decode. The fit view already
-/// paid for that decode and then discarded the native pixels, which made the
-/// first 1:1 zoom decode the same sensor again. 256 MiB covers a 24 MP RGBA16
-/// frame; larger sensors keep the old decode-on-zoom path.
+/// Default bytes of full-sensor frames kept after cold proxy decodes. The fit
+/// view already paid for that decode and then discarded the native pixels,
+/// which made the first 1:1 zoom decode the same sensor again. 256 MiB covers a
+/// 24 MP RGBA16 frame; `AURORA_RAW_PENDING_BYTES` overrides it.
 const MAX_PENDING_NATIVE_BYTES: usize = 256 << 20;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -128,18 +128,75 @@ pub(crate) fn get_or_decode_source16(
     };
     let key = cache_name16_for_identity(path, long_side, route, identity);
     let file = dir.join(&key);
+    let source_of = |(width, height, pixels, provenance): Frame16| {
+        (Source::from_rgba16(width, height, &pixels), provenance)
+    };
     if let Some(source) = read_cached_source16(&file, &route, &identity) {
         return Some(source);
     }
     if let Some(frame) = take_pending_native(path, long_side, route, identity) {
-        return Some((Source::from_rgba16(frame.0, frame.1, &frame.2), frame.3));
+        return Some(source_of(frame));
     }
-    let image = match cached_full_frame16(path, &dir, long_side, route, identity) {
-        Some(image) => image,
-        None => decode_frame16(path, long_side, route, identity)?,
-    };
-    store16_binary(&file, image.0, image.1, &image.2, image.3, identity, &route);
-    Some((Source::from_rgba16(image.0, image.1, &image.2), image.3))
+    if let Some(frame) = cached_full_frame16(path, &dir, long_side, route, identity) {
+        return Some(source_of(frame));
+    }
+
+    let mut decode = Some(crate::raw::decode16_traced);
+    for _ in 0..3 {
+        match acquire_flight(&key) {
+            FlightTicket::Leader(flight) => {
+                let result = (|| {
+                    // A previous leader for this key may have stored the entry
+                    // just before we acquired the lead.
+                    if let Some(source) = read_cached_source16(&file, &route, &identity) {
+                        return Some(source);
+                    }
+                    if let Some(frame) = take_pending_native(path, long_side, route, identity) {
+                        return Some(source_of(frame));
+                    }
+                    if let Some(frame) =
+                        cached_full_frame16(path, &dir, long_side, route, identity)
+                    {
+                        return Some(source_of(frame));
+                    }
+                    let native_key = cache_name16_for_identity(path, 0, route, identity);
+                    let image = decode_and_fit(
+                        path,
+                        Some(native_key),
+                        &file,
+                        long_side,
+                        &route,
+                        identity,
+                        |path| decode.take()?(path),
+                    )?;
+                    Some(source_of(image))
+                })();
+                release_flight(&key, &flight);
+                return result;
+            }
+            FlightTicket::Follower(flight) => {
+                count_waiter();
+                flight.wait();
+                if let Some(source) = read_cached_source16(&file, &route, &identity) {
+                    return Some(source);
+                }
+                if let Some(frame) = take_pending_native(path, long_side, route, identity) {
+                    return Some(source_of(frame));
+                }
+            }
+        }
+    }
+    let native_key = cache_name16_for_identity(path, 0, route, identity);
+    let image = decode_and_fit(
+        path,
+        Some(native_key),
+        &file,
+        long_side,
+        &route,
+        identity,
+        |path| decode.take()?(path),
+    )?;
+    Some(source_of(image))
 }
 
 fn decode_source16(
@@ -181,32 +238,29 @@ where
         return Some((width, height, fitted, provenance));
     };
     let key = cache_name16_for_identity(path, long_side, route, identity);
-    if let Some(file) = read_cached16_binary(&dir.join(&key), &route, &identity) {
-        return Some(file);
-    }
-    if let Some(image) = take_pending_native(path, long_side, route, identity) {
-        return Some(image);
-    }
-    let image = match cached_full_frame16(path, dir, long_side, route, identity) {
-        Some(image) => image,
-        None => {
-            let native_key = cache_name16_for_identity(path, 0, route, identity);
-            let (w, h, pixels, provenance) = decode(path)?;
-            fit16_keep_native(
-                Some(native_key),
-                path,
-                w,
-                h,
-                pixels,
-                long_side,
-                provenance,
-                identity,
-                &route,
-            )
-        }
+    let file = dir.join(&key);
+    let mut recheck = || {
+        read_cached16_binary(&file, &route, &identity)
+            .or_else(|| take_pending_native(path, long_side, route, identity))
+            .or_else(|| cached_full_frame16(path, dir, long_side, route, identity))
     };
-    store16_binary(&dir.join(&key), image.0, image.1, &image.2, image.3, identity, &route);
-    Some(image)
+    if let Some(hit) = recheck() {
+        return Some(hit);
+    }
+    let mut decode = Some(decode);
+    let native_key = cache_name16_for_identity(path, 0, route, identity);
+    let mut work = || {
+        decode_and_fit(
+            path,
+            Some(native_key.clone()),
+            &file,
+            long_side,
+            &route,
+            identity,
+            |path| decode.take()?(path),
+        )
+    };
+    with_single_flight(&key, &mut recheck, &mut work)
 }
 
 fn get_or_decode_with<F>(path: &Path, dir: &Path, long_side: u32, decode: F) -> Result<RgbaImage>
@@ -411,9 +465,7 @@ fn note_source_identity(path: &Path, identity: SourceIdentity) -> bool {
 fn invalidate_source(path: &Path) {
     {
         let mut pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.as_ref().is_some_and(|(stored, ..)| stored == path) {
-            *pending = None;
-        }
+        pending.remove_path(path);
     }
     crate::preview_cache::invalidate_source_identity();
 }
@@ -479,11 +531,241 @@ fn fit16_keep_native(
     (target_width, target_height, proxy, provenance)
 }
 
-/// One full-sensor frame kept after a cold proxy decode: path, cache name,
-/// width, height, pixels, provenance and source identity.
-static PENDING_NATIVE: Mutex<
-    Option<(PathBuf, String, u32, u32, Vec<u16>, DecodeProvenance, SourceIdentity)>,
-> = Mutex::new(None);
+/// Decodes under one decode slot, fits the result and stores it under the
+/// requested key. A native request (long side 0) stores the full frame; a proxy
+/// request stores the proxy and retains the native samples in memory.
+fn decode_and_fit<F>(
+    path: &Path,
+    native_key: Option<String>,
+    probe_file: &Path,
+    long_side: u32,
+    route: &DecodeRoute,
+    identity: SourceIdentity,
+    decode: F,
+) -> Option<Frame16>
+where
+    F: FnOnce(&Path) -> Option<Frame16>,
+{
+    let (width, height, pixels, provenance) = {
+        let _slot = enter_decode_slot();
+        count_decode();
+        decode(path)?
+    };
+    let image = fit16_keep_native(
+        native_key,
+        path,
+        width,
+        height,
+        pixels,
+        long_side,
+        provenance,
+        identity,
+        route,
+    );
+    store16_binary(probe_file, image.0, image.1, &image.2, image.3, identity, route);
+    Some(image)
+}
+
+/// Counters for the pending-native LRU and its single-flight decode gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingNativeStats {
+    /// 1:1 requests served from a retained native frame.
+    pub hits: u64,
+    /// 1:1 requests that had to decode.
+    pub misses: u64,
+    pub inserts: u64,
+    /// A newer frame replaced one already retained under the same key.
+    pub overwrites: u64,
+    /// A frame was dropped because the byte budget was exceeded.
+    pub evictions: u64,
+    pub rejected_too_large: u64,
+    /// Decodes that actually ran under the gate.
+    pub decodes: u64,
+    /// Requests that waited for another request's decode of the same key.
+    pub decode_waiters: u64,
+    pub peak_bytes: usize,
+    pub bytes: usize,
+    pub entries: usize,
+}
+
+impl PendingNativeStats {
+    const fn empty() -> Self {
+        Self {
+            hits: 0,
+            misses: 0,
+            inserts: 0,
+            overwrites: 0,
+            evictions: 0,
+            rejected_too_large: 0,
+            decodes: 0,
+            decode_waiters: 0,
+            peak_bytes: 0,
+            bytes: 0,
+            entries: 0,
+        }
+    }
+}
+
+struct PendingEntry {
+    path: PathBuf,
+    key: String,
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    provenance: DecodeProvenance,
+    identity: SourceIdentity,
+}
+
+impl PendingEntry {
+    fn bytes(&self) -> usize {
+        self.pixels.len().saturating_mul(2)
+    }
+}
+
+/// Least-recently-used table of full-sensor frames retained for the first 1:1
+/// request of each image, bounded by total frame bytes rather than entry count.
+struct PendingNative {
+    entries: std::collections::VecDeque<PendingEntry>,
+    bytes: usize,
+    stats: PendingNativeStats,
+}
+
+impl PendingNative {
+    const fn new() -> Self {
+        Self { entries: std::collections::VecDeque::new(), bytes: 0, stats: PendingNativeStats::empty() }
+    }
+
+    /// Drops every retained frame decoded from `path`. Returns how many were
+    /// removed.
+    fn remove_path(&mut self, path: &Path) -> usize {
+        let before = self.entries.len();
+        let mut removed_bytes = 0;
+        self.entries.retain(|entry| {
+            let keep = entry.path != path;
+            if !keep {
+                removed_bytes += entry.bytes();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+        self.stats.bytes = self.bytes;
+        self.stats.entries = self.entries.len();
+        before - self.entries.len()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &mut self,
+        native_key: Option<String>,
+        path: &Path,
+        width: u32,
+        height: u32,
+        pixels: Vec<u16>,
+        provenance: DecodeProvenance,
+        identity: SourceIdentity,
+        route: &DecodeRoute,
+        budget: usize,
+    ) {
+        let Some(key) = native_key else { return };
+        if !provenance.consistent_with(route) {
+            return;
+        }
+        let frame_bytes = pixels.len().saturating_mul(2);
+        if frame_bytes > budget {
+            self.stats.rejected_too_large += 1;
+            return;
+        }
+        if let Some(pos) = self.entries.iter().position(|entry| entry.key == key) {
+            self.bytes -= self.entries.remove(pos).map_or(0, |entry| entry.bytes());
+            self.stats.overwrites += 1;
+        }
+        self.entries.push_back(PendingEntry {
+            path: path.to_path_buf(),
+            key,
+            width,
+            height,
+            pixels,
+            provenance,
+            identity,
+        });
+        self.bytes += frame_bytes;
+        self.stats.inserts += 1;
+        // Evict least-recently-used frames until the budget fits; never drop
+        // the frame that was just inserted.
+        while self.bytes > budget && self.entries.len() > 1 {
+            if let Some(entry) = self.entries.pop_front() {
+                self.bytes = self.bytes.saturating_sub(entry.bytes());
+                self.stats.evictions += 1;
+            }
+        }
+        self.stats.peak_bytes = self.stats.peak_bytes.max(self.bytes);
+        self.stats.bytes = self.bytes;
+        self.stats.entries = self.entries.len();
+    }
+
+    fn take(
+        &mut self,
+        path: &Path,
+        long_side: u32,
+        route: DecodeRoute,
+        identity: SourceIdentity,
+    ) -> Option<Frame16> {
+        if long_side != 0 {
+            return None;
+        }
+        let key = cache_name16_for_identity(path, 0, route, identity);
+        let pos = self.entries.iter().position(|entry| {
+            entry.key == key
+                && entry.path == path
+                && entry.identity == identity
+                && entry.provenance.consistent_with(&route)
+        });
+        let Some(pos) = pos else {
+            self.stats.misses += 1;
+            return None;
+        };
+        let entry = self.entries.remove(pos)?;
+        self.bytes = self.bytes.saturating_sub(entry.bytes());
+        self.stats.hits += 1;
+        self.stats.bytes = self.bytes;
+        self.stats.entries = self.entries.len();
+        Some((entry.width, entry.height, entry.pixels, entry.provenance))
+    }
+}
+
+static PENDING_NATIVE: Mutex<PendingNative> = Mutex::new(PendingNative::new());
+
+/// Retained-frame budget in bytes. `AURORA_RAW_PENDING_BYTES` overrides the
+/// 256 MiB default; a zero or unparsable value keeps the default.
+fn pending_native_budget_bytes() -> usize {
+    std::env::var("AURORA_RAW_PENDING_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(MAX_PENDING_NATIVE_BYTES)
+}
+
+/// Snapshot of the pending cache counters and current occupancy. Exposed for
+/// diagnostics and the A/B/C acceptance tests.
+#[allow(dead_code)]
+pub fn pending_native_stats() -> PendingNativeStats {
+    let pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+    PendingNativeStats {
+        bytes: pending.bytes,
+        entries: pending.entries.len(),
+        ..pending.stats
+    }
+}
+
+/// Clears the counters but keeps the retained frames.
+#[allow(dead_code)]
+pub fn reset_pending_native_stats() {
+    let mut pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+    pending.stats = PendingNativeStats::empty();
+    pending.stats.bytes = pending.bytes;
+    pending.stats.entries = pending.entries.len();
+    pending.stats.peak_bytes = pending.bytes;
+}
 
 fn remember_native(
     native_key: Option<String>,
@@ -495,15 +777,10 @@ fn remember_native(
     identity: SourceIdentity,
     route: &DecodeRoute,
 ) {
-    if pixels.capacity().saturating_mul(2) > MAX_PENDING_NATIVE_BYTES {
-        return;
-    }
-    let Some(key) = native_key else { return };
-    if !provenance.consistent_with(route) {
-        return;
-    }
-    *PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((path.to_path_buf(), key, width, height, pixels, provenance, identity));
+    let budget = pending_native_budget_bytes();
+    PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        native_key, path, width, height, pixels, provenance, identity, route, budget,
+    );
 }
 
 fn take_pending_native(
@@ -512,26 +789,134 @@ fn take_pending_native(
     route: DecodeRoute,
     identity: SourceIdentity,
 ) -> Option<Frame16> {
-    if long_side != 0 {
-        return None;
+    PENDING_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(path, long_side, route, identity)
+}
+
+/// One in-flight decode per cache key.
+struct Flight {
+    done: Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+impl Flight {
+    fn new() -> Self {
+        Self { done: Mutex::new(false), ready: std::sync::Condvar::new() }
     }
-    let key = cache_name16_for_identity(path, 0, route, identity);
-    let mut pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
-    if pending
-        .as_ref()
-        .is_some_and(|(stored_path, stored, _, _, _, provenance, stored_identity)| {
-            *stored == key
-                && *stored_path == path
-                && *stored_identity == identity
-                && provenance.consistent_with(&route)
-        })
-    {
-        pending.take().map(|(_, _, width, height, pixels, provenance, _)| {
-            (width, height, pixels, provenance)
-        })
+
+    fn wait(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = self.ready.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finish(&self) {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.ready.notify_all();
+    }
+}
+
+enum FlightTicket {
+    Leader(std::sync::Arc<Flight>),
+    Follower(std::sync::Arc<Flight>),
+}
+
+fn flights() -> &'static Mutex<std::collections::HashMap<String, std::sync::Arc<Flight>>> {
+    static FLIGHTS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, std::sync::Arc<Flight>>>,
+    > = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn acquire_flight(key: &str) -> FlightTicket {
+    let mut map = flights().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(flight) = map.get(key) {
+        FlightTicket::Follower(flight.clone())
     } else {
-        None
+        let flight = std::sync::Arc::new(Flight::new());
+        map.insert(key.to_string(), flight.clone());
+        FlightTicket::Leader(flight)
     }
+}
+
+fn release_flight(key: &str, flight: &std::sync::Arc<Flight>) {
+    // Remove first: a new request after this point becomes a leader instead of
+    // observing a finished flight.
+    flights().lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+    flight.finish();
+}
+
+/// Decodes that may run at once across different cache keys.
+/// `AURORA_RAW_DECODE_CONCURRENCY` overrides the default of 2.
+fn decode_concurrency() -> usize {
+    std::env::var("AURORA_RAW_DECODE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8)
+}
+
+struct DecodeSlot;
+
+impl Drop for DecodeSlot {
+    fn drop(&mut self) {
+        let mut active = DECODE_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        DECODE_SLOT_READY.notify_one();
+    }
+}
+
+static DECODE_ACTIVE: Mutex<usize> = Mutex::new(0);
+static DECODE_SLOT_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+fn enter_decode_slot() -> DecodeSlot {
+    let limit = decode_concurrency();
+    let mut active = DECODE_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    while *active >= limit {
+        active = DECODE_SLOT_READY.wait(active).unwrap_or_else(|e| e.into_inner());
+    }
+    *active += 1;
+    DecodeSlot
+}
+
+fn count_decode() {
+    PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).stats.decodes += 1;
+}
+
+fn count_waiter() {
+    PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).stats.decode_waiters += 1;
+}
+
+/// Runs `work` as the single leader for `key`, or waits for the current leader
+/// and retries `recheck`. Both closures may run at most a few times; `work` is
+/// only entered by the leader, holding one decode slot.
+fn with_single_flight(
+    key: &str,
+    recheck: &mut dyn FnMut() -> Option<Frame16>,
+    work: &mut dyn FnMut() -> Option<Frame16>,
+) -> Option<Frame16> {
+    for _ in 0..3 {
+        match acquire_flight(key) {
+            FlightTicket::Leader(flight) => {
+                let result = recheck().or_else(|| work());
+                release_flight(key, &flight);
+                return result;
+            }
+            FlightTicket::Follower(flight) => {
+                count_waiter();
+                flight.wait();
+                if let Some(hit) = recheck() {
+                    return Some(hit);
+                }
+                // The leader decoded nothing (failure or cancellation); take
+                // the lead ourselves.
+            }
+        }
+    }
+    work()
 }
 
 fn cached_full_frame16(
@@ -571,7 +956,11 @@ fn decode_frame16(
         return Some(pending);
     }
     let native_key = cache_name16_for_identity(path, 0, route, identity);
-    let (width, height, pixels, provenance) = crate::raw::decode16_traced(path)?;
+    let (width, height, pixels, provenance) = {
+        let _slot = enter_decode_slot();
+        count_decode();
+        crate::raw::decode16_traced(path)?
+    };
     Some(fit16_keep_native(
         // No cache directory: nothing to persist, but the pending frame is
         // still keyed by the native name.
@@ -1677,4 +2066,182 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_lru_evicts_by_bytes_and_counts() {
+        let route = test_route(true, false);
+        let identity = test_identity(21);
+        let provenance = DecodeProvenance::libraw16();
+        let path = PathBuf::from("lru.nef");
+        let mut pending = PendingNative::new();
+        // 100 u16 = 200 bytes per frame.
+        for key in ["raw-a-0.bin", "raw-b-0.bin"] {
+            pending.insert(
+                Some(key.to_string()), &path, 10, 10, vec![0; 100], provenance, identity, &route,
+                400,
+            );
+        }
+        assert_eq!(pending.entries.len(), 2);
+        assert_eq!(pending.bytes, 400);
+
+        pending.insert(
+            Some("raw-c-0.bin".to_string()), &path, 10, 10, vec![0; 100], provenance, identity,
+            &route, 400,
+        );
+        assert_eq!(pending.entries.len(), 2, "the byte budget bounds the table");
+        assert_eq!(pending.stats.evictions, 1);
+        assert_eq!(pending.entries.front().unwrap().key, "raw-b-0.bin");
+
+        pending.insert(
+            Some("raw-b-0.bin".to_string()), &path, 10, 10, vec![0; 100], provenance, identity,
+            &route, 400,
+        );
+        assert_eq!(pending.stats.overwrites, 1);
+        assert_eq!(pending.bytes, 400);
+
+        pending.insert(
+            Some("raw-d-0.bin".to_string()), &path, 10, 10, vec![0; 300], provenance, identity,
+            &route, 400,
+        );
+        assert_eq!(pending.stats.rejected_too_large, 1);
+        assert_eq!(pending.entries.len(), 2);
+        assert_eq!(pending.stats.peak_bytes, 400);
+    }
+
+    #[test]
+    fn pending_take_matches_only_the_same_identity_and_size() {
+        let route = test_route(true, false);
+        let identity = test_identity(22);
+        let provenance = DecodeProvenance::libraw16();
+        let path = PathBuf::from("take.nef");
+        let name = cache_name16_for_identity(&path, 0, route, identity);
+        let mut pending = PendingNative::new();
+        pending.insert(
+            Some(name), &path, 10, 10, vec![0; 100], provenance, identity, &route, 1 << 20,
+        );
+        assert!(pending.take(&path, 20, route, identity).is_none(), "only 1:1 takes");
+        let mut other = identity;
+        other.content = 99;
+        assert!(pending.take(&path, 0, route, other).is_none());
+        // Proxy requests are not counted; only 1:1 misses are.
+        assert_eq!(pending.stats.misses, 1);
+        let frame = pending.take(&path, 0, route, identity).expect("hit");
+        assert_eq!(frame.0, 10);
+        assert_eq!(pending.stats.hits, 1);
+        assert!(pending.entries.is_empty());
+    }
+
+    #[test]
+    fn three_images_alternate_proxy_and_full_size_without_cross_overwrites() {
+        let dir = scratch("raw16-abc");
+        let provenance = DecodeProvenance::libraw16();
+        let mut paths = Vec::new();
+        let mut frames = Vec::new();
+        for tag in 0..3u16 {
+            let path = dir.join(format!("img{tag}.nef"));
+            fs::write(&path, format!("raw-image-{tag}")).unwrap();
+            frames.push(vec![tag + 1; 80 * 40 * 4]);
+            paths.push(path);
+        }
+        for (index, path) in paths.iter().enumerate() {
+            let pixels = frames[index].clone();
+            let proxy = get_or_decode16_with(path, &dir, 40, move |_| {
+                Some((80, 40, pixels, provenance))
+            })
+            .expect("proxy decode");
+            assert_eq!((proxy.0, proxy.1), (40, 20));
+        }
+        // 1:1 in reverse order: every proxy decode must still have its native
+        // frame, and one image's work must not drop another's.
+        for index in [2usize, 0, 1] {
+            let pixels = frames[index].clone();
+            let calls = Cell::new(0);
+            let full = get_or_decode16_with(&paths[index], &dir, 0, |_| {
+                calls.set(calls.get() + 1);
+                Some((80, 40, pixels.clone(), provenance))
+            })
+            .expect("full-size request");
+            assert_eq!(calls.get(), 0, "image {index} must reuse its pending frame");
+            assert_eq!(full.2, frames[index]);
+        }
+    }
+
+    #[test]
+    fn concurrent_requests_for_one_key_decode_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+
+        let dir = scratch("raw16-single-flight");
+        let path = source(&dir, b"flight");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let provenance = DecodeProvenance::libraw16();
+        // The cache stores RGB only and reconstructs alpha as opaque, so the
+        // synthetic frame must be opaque for the waiter's disk hit to match.
+        let pixels: Vec<u16> = (0..80 * 40 * 4)
+            .map(|i| if i % 4 == 3 { 65535 } else { i as u16 })
+            .collect();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let dir = dir.clone();
+                let path = path.clone();
+                let calls = calls.clone();
+                let barrier = barrier.clone();
+                let pixels = pixels.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    get_or_decode16_with(&path, &dir, 20, |_| {
+                        calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        Some((80, 40, pixels.clone(), provenance))
+                    })
+                    .expect("decode")
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "one decode per key");
+        assert_eq!(results[0], results[1], "waiters see the leader's pixels");
+    }
+
+    #[test]
+    fn a_slow_decode_for_one_image_leaves_another_images_frame_intact() {
+        let dir = scratch("raw16-late");
+        let provenance = DecodeProvenance::libraw16();
+        let slow_path = dir.join("slow.nef");
+        let fast_path = dir.join("fast.nef");
+        fs::write(&slow_path, b"slow-image").unwrap();
+        fs::write(&fast_path, b"fast-image").unwrap();
+        let slow_pixels = vec![7u16; 80 * 40 * 4];
+        let fast_pixels = vec![9u16; 80 * 40 * 4];
+
+        let slow = {
+            let dir = dir.clone();
+            let path = slow_path.clone();
+            let pixels = slow_pixels.clone();
+            std::thread::spawn(move || {
+                get_or_decode16_with(&path, &dir, 40, |_| {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    Some((80, 40, pixels, provenance))
+                })
+                .expect("slow proxy decode")
+            })
+        };
+        let proxy = get_or_decode16_with(&fast_path, &dir, 40, |_| {
+            Some((80, 40, fast_pixels.clone(), provenance))
+        })
+        .expect("fast proxy decode");
+        assert_eq!((proxy.0, proxy.1), (40, 20));
+        slow.join().unwrap();
+
+        // The slow request finished after the fast one; the fast image's native
+        // frame must still be there for its first 1:1.
+        let calls = Cell::new(0);
+        let full = get_or_decode16_with(&fast_path, &dir, 0, |_| {
+            calls.set(calls.get() + 1);
+            Some((80, 40, fast_pixels.clone(), provenance))
+        })
+        .expect("full-size request");
+        assert_eq!(calls.get(), 0, "a late unrelated decode must not evict this frame");
+        assert_eq!(full.2, fast_pixels);
+    }
 }
