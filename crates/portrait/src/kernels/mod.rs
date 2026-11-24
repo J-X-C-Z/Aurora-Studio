@@ -45,6 +45,7 @@ pub mod sticker;
 pub mod subdiv2d;
 pub mod sweat;
 pub mod skin_models;
+pub mod spotless;
 pub mod texture_material;
 pub mod texture_mask_blend;
 pub mod teeth_gray;
