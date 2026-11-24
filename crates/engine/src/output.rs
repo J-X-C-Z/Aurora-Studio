@@ -572,24 +572,25 @@ fn not_same_device(error: &io::Error) -> bool {
     }
 }
 
-/// Renames `temp` onto `target`; when the two are on different volumes the
-/// rename fails and the bytes are copied into a sibling temp of `target`,
-/// synced, and renamed there. The source temp is removed on success.
-pub(crate) fn publish(temp: &Path, target: &Path) -> io::Result<()> {
-    publish_using(temp, target, &mut |from, to| std::fs::rename(from, to))
+/// Publishes a same-directory temp for a caller that owns the target and may
+/// replace its own previous bytes (the test-only atomic writer).
+#[cfg(test)]
+fn publish_replace(temp: &Path, target: &Path) -> io::Result<()> {
+    publish_using(temp, target, &mut |from, to| std::fs::rename(from, to), true)
 }
 
 fn publish_using(
     temp: &Path,
     target: &Path,
     rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    replace: bool,
 ) -> io::Result<()> {
     match rename(temp, target) {
         Ok(()) => {
             sync_parent(target);
             Ok(())
         }
-        Err(error) if not_same_device(&error) => copy_publish(temp, target),
+        Err(error) if not_same_device(&error) => copy_publish(temp, target, replace),
         Err(error) => Err(error),
     }
 }
@@ -608,12 +609,19 @@ fn publish_no_clobber(temp: &Path, target: &Path) -> io::Result<()> {
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
-        Err(_) => publish(temp, target),
+        Err(_) => {
+            // Filesystems without hard links fall back to a rename, which
+            // replaces on POSIX: refuse an existing target first.
+            if target.exists() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            publish_using(temp, target, &mut |from, to| std::fs::rename(from, to), false)
+        }
     }
 }
 
 /// Cross-volume degradation: copy beside the target, sync, then rename.
-fn copy_publish(temp: &Path, target: &Path) -> io::Result<()> {
+fn copy_publish(temp: &Path, target: &Path, replace: bool) -> io::Result<()> {
     let staged = sibling_temp(target, "vol")?;
     let result = (|| {
         let mut source = File::open(temp)?;
@@ -622,6 +630,9 @@ fn copy_publish(temp: &Path, target: &Path) -> io::Result<()> {
         dest.flush()?;
         dest.sync_all()?;
         drop(dest);
+        if !replace && target.exists() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
         std::fs::rename(&staged, target)?;
         sync_parent(target);
         Ok(())
@@ -659,7 +670,7 @@ pub(crate) fn write_atomic_with(
         file.flush()?;
         file.sync_all()?;
         drop(file);
-        publish(&temp, target)
+        publish_replace(&temp, target)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -1045,7 +1056,7 @@ mod tests {
             } else {
                 std::fs::rename(from, to)
             }
-        })
+        }, true)
         .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"bytes from another volume");
         assert!(!source.exists(), "the cross-volume temp is consumed");
@@ -1062,9 +1073,29 @@ mod tests {
         // copy fallback fails and the existing target keeps its bytes.
         let result = publish_using(&source, &target, &mut |_, _| {
             Err(io::Error::from_raw_os_error(if cfg!(windows) { 17 } else { 18 }))
-        });
+        }, false);
         assert!(result.is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_cross_volume_fallback_never_replaces_an_existing_target() {
+        let temp = TempFolder::new();
+        let source = temp.path().join("elsewhere.tmp");
+        let target = temp.path().join("out.jpg");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&target, b"old").unwrap();
+
+        let error = publish_using(
+            &source,
+            &target,
+            &mut |_, _| Err(io::Error::from_raw_os_error(if cfg!(windows) { 17 } else { 18 })),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(source.exists(), "the staged file is kept for a retry");
     }
 
     #[test]

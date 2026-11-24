@@ -311,8 +311,8 @@ fn precurve_runs(
     };
     with_pool(frame, scratch, |gpu| {
         gpu.upload(Slot::Scratch, grid_u8)?;
-        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch"))?;
-        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame"))?;
+        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch slot"))?;
+        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame slot"))?;
         let (fine_off, coarse_off) =
             build_planes(gpu, scratch_base, 0, grid.gw, grid.gh, grid.w, grid.h, grid.step, 2)?;
         gpu.upload(Slot::Frame, rgb_u8)?;
@@ -387,8 +387,8 @@ fn structure_u8_runs(
     let k = 0.0028 * structure;
     with_pool(frame, scratch, |gpu| {
         gpu.upload(Slot::Frame, rgba)?;
-        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame"))?;
-        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch"))?;
+        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame slot"))?;
+        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch slot"))?;
         let mut p_rgba = frame_handle;
         let mut p_y = scratch_base;
         let mut p_tmp = scratch_base + (pixels * 4) as u64;
@@ -466,8 +466,8 @@ pub(crate) fn apply_structure_wide(
     with_pool(frame, scratch, |gpu| {
         gpu.upload(Slot::Frame, wide_bytes)?;
         gpu.upload(Slot::Scratch, rgba8)?;
-        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame"))?;
-        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch"))?;
+        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame slot"))?;
+        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch slot"))?;
         let mut p_wide = frame_handle;
         let mut p_rgba = scratch_base;
         let mut p_y = scratch_base + (pixels * 4) as u64;
@@ -561,8 +561,8 @@ fn frame_u8_runs(
     let (k_big, k_fine, chroma) = clarity::PreCurve::params(amount, method);
     with_pool(frame, scratch, |gpu| {
         gpu.upload(Slot::Frame, rgba)?;
-        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame"))?;
-        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch"))?;
+        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame slot"))?;
+        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch slot"))?;
         let mut p_rgba = frame_handle;
         let mut p_grid = scratch_base;
         let mut w_i = w as i32;
@@ -661,8 +661,8 @@ fn frame_wide_runs(
     with_pool(frame, scratch, |gpu| {
         gpu.upload(Slot::Frame, wide_bytes)?;
         gpu.upload(Slot::Scratch, rgba8)?;
-        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame"))?;
-        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch"))?;
+        let frame_handle = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("frame slot"))?;
+        let scratch_base = gpu.handle(Slot::Scratch).ok_or(Failure::Invalid("scratch slot"))?;
         let mut p_wide = frame_handle;
         let mut p_rgba = scratch_base;
         let mut p_grid = scratch_base + (pixels * 4) as u64;

@@ -117,7 +117,12 @@ pub(crate) fn post_process(
                 }
                 result
             }
-            Err(failure) => Err(failure),
+            Err(failure) => {
+                // Baseline semantics: a failed first open disables the stage
+                // for the process instead of retrying the driver every frame.
+                *state = State::Unavailable;
+                Err(failure)
+            }
         },
         State::Ready(pool) => pool
             .ensure(bytes)

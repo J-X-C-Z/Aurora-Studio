@@ -604,6 +604,30 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_sidecar_is_kept_and_the_new_copy_is_rolled_back() {
+        let temp = Temp::new("sidecar-exists");
+        let src = source(temp.path(), "src.jpg", b"image bytes");
+        let dest = temp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        // A sidecar left by an earlier export: it must survive, never be
+        // replaced by this run's JSON.
+        std::fs::write(dest.join("shot.jpg.portrait.json"), b"{\"old\":true}").unwrap();
+
+        let items = [item(src, "shot.jpg", Some("{\"new\":true}"))];
+        let (done, errors) = export_originals(&dest, &items);
+
+        assert_eq!(done, 0);
+        assert_eq!(errors.len(), 1);
+        assert!(!dest.join("shot.jpg").exists(), "the image is rolled back");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("shot.jpg.portrait.json")).unwrap(),
+            "{\"old\":true}",
+            "an existing sidecar is never overwritten"
+        );
+        assert!(temporaries(&dest).is_empty());
+    }
+
+    #[test]
     fn stale_copy_temporaries_are_swept_and_user_files_kept() {
         let temp = Temp::new("sweep");
         let dest = temp.path().join("out");
