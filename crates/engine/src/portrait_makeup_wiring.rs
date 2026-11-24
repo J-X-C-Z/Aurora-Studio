@@ -121,12 +121,14 @@ const fn row(
 /// Their owner masks are rasterized from the bundle's own 194 landmarks, so the
 /// seven mask-only color rows run today. Material rows stay out until
 /// `AURORA_MAKEUP_ASSET_ROOT` supplies decrypted PNGs.
+#[allow(dead_code)]
 pub fn makeup_rows_2d_available() -> &'static [u32] {
     &[100, 103, 105, 106, 117, 118, 30007]
 }
 
 /// Rows this wiring knows how to assemble once the data-availability blocker is
 /// cleared, in canonical B3 order. PF8/PF9 stay out (FaceStereo).
+#[allow(dead_code)]
 pub fn makeup_rows_2d_declared() -> &'static [u32] {
     &[100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032]
 }
