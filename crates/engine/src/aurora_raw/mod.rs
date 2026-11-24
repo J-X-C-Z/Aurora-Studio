@@ -8,6 +8,7 @@
 
 pub mod c1_raw_he;
 pub mod xtrans;
+pub(crate) mod rust_raw;
 #[cfg(all(windows, feature = "z6iii-raw-export"))]
 pub mod z6iii;
 
