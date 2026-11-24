@@ -40,3 +40,44 @@
    `out = I + Σ_i m_i · (B_i − I)`（单个全画面分支时等于该分支）。
 3. **图层混合器**：`out = B_0；对 i = 1..n：out = lerp(out, B_i, m_i)`。
 4. 完成 2/3 后告诉前端，把 `contract.rs` 里的 `NODE_GRAPH` 状态改为 Ready。
+
+## 2026-11-24：引擎侧剪枝与拒绝语义（已实现）
+
+第 1 条现在由引擎自己保证，不再依赖前端先 `flattened()`：
+
+- **`NodeGraph::plan() -> Result<GraphPlan, GraphError>`**
+  - `plan.order`：OUTPUT 依赖的节点，拓扑序（每个节点排在其输入之后）。
+  - `plan.layers`：其中 `Layer` 节点，即渲染顺序。
+  - `plan.pruned`：图中存在、但输出不依赖（或不能追溯到 INPUT）的 `Layer` 节点。**这些层不得渲染。**
+  - `plan.warnings`：不拒绝、但需要提示的结构问题（见下）。
+- **`NodeGraph::inspect(&[Layer])`**：`plan()` 加行匹配检查，额外报告
+  `LayerWithoutRow` / `RowWithoutNode`。
+- **`layered(&AdjustmentSet) -> Result<Vec<&Layer>, GraphError>`**：渲染、导出、批量、缩略图、取色共用的选层入口。没有存图时返回全部行（按存储顺序）；有存图时返回 `plan.layers` 对应的行，**顺序以图为准**。
+- **`render_layers(&AdjustmentSet)`**：渲染热路径的包装。图被拒绝时只渲染背景并记一次 `log::error!`，不猜测顺序。
+
+### 拒绝（错误）
+
+| 错误 | 含义 | 前端应做 |
+|---|---|---|
+| `GraphError::Cycle { nodes }` | OUTPUT 依赖的节点成环，无求值顺序 | 高亮 `nodes`，禁止渲染该图；不要假定引擎会挑一条边断开 |
+| `GraphError::MissingNode { link }` | 连线指向图中不存在的节点 | 提示并断开该连线 |
+
+- 环**只在 OUTPUT 侧**才算错误：与输出无关的环不影响画面，只进 `pruned`。
+- `render_order()` 仍是界面用的“尽力而为”排序（环在闭合处截断），只为编号/整理服务；渲染和导出不得以它为准。
+
+### 警告（不拒绝）
+
+| 警告 | 含义 |
+|---|---|
+| `MissingInput { node, input }` | mixer 缺某个输入，但更高编号的输入已连 |
+| `EmptyMixer { node }` | 渲染路径上的 mixer 没有任何输入 |
+| `LayerWithoutRow { id }` | 路径上的 `Layer` 节点没有对应 `Layer` 行 |
+| `RowWithoutNode { id }` | `Layer` 行不是图中的节点，永不渲染 |
+| `NoInputNode` | 图里没有输入节点，无法判定「是否接到底图」；输出可达的层都按已连接处理（并保留此警告） |
+
+mixer 语义仍未实现；出现 mixer 时引擎按串联渲染，并把结构问题放在 `warnings` 里，不静默吞掉。
+
+### 前端侧对应变化
+
+- `state::flattened(adj)`：改为调用 `flattened_checked(adj)`；图被拒绝时返回**无层**的调整集（只画背景），并记一次错误。
+- `state::flattened_checked(adj) -> Result<AdjustmentSet, GraphError>`：新增，供需要展示错误的面板使用。

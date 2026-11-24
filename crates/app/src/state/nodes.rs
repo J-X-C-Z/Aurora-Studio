@@ -5,7 +5,7 @@
 //! its render order, so engines that only read the list still draw it.
 
 use gpui_kit::{Context, SharedString};
-use aurora_engine::{AdjustmentSet, GraphNode, Layer, LayerKind, Mask, MaskOp, MaskShape, NodeGraph, NodeKind, NodeLink, RadialGradient};
+use aurora_engine::{AdjustmentSet, GraphError, GraphNode, Layer, LayerKind, Mask, MaskOp, MaskShape, NodeGraph, NodeKind, NodeLink, RadialGradient};
 
 use super::AppState;
 use crate::i18n::t;
@@ -165,49 +165,42 @@ impl GraphExt for NodeGraph {
 /// The graph for a set of adjustments, repaired to match its layers: removed
 /// layers are bypassed, layers it does not know yet join in series before the
 /// output. Without a stored graph, the layers form one serial chain.
+///
+/// The repair itself lives in the engine (`NodeGraph::repaired`), so the
+/// interface and the render/export path cannot disagree about which layers a
+/// stored document has.
 pub fn normalized(adj: &AdjustmentSet) -> NodeGraph {
-    let mut g = adj.nodes.clone().unwrap_or_default();
-    let fresh = !g.has(INPUT) && !g.has(OUTPUT);
-    if !g.has(INPUT) {
-        g.nodes.insert(0, GraphNode { id: INPUT, kind: NodeKind::Input, pos: [0.0, 0.0] });
-    }
-    if !g.has(OUTPUT) {
-        let x = g.nodes.iter().map(|n| n.pos[0]).fold(0.0, f32::max) + COL;
-        g.nodes.push(GraphNode { id: OUTPUT, kind: NodeKind::Output, pos: [x, 0.0] });
-    }
-    if fresh {
-        g.link(INPUT, OUTPUT, 0);
-    }
-    let gone: Vec<u64> = g.nodes.iter().filter(|n| n.kind == NodeKind::Layer && !adj.layers.iter().any(|l| l.id == n.id)).map(|n| n.id).collect();
-    for id in gone {
-        g.bypass(id);
-    }
-    let ids: Vec<u64> = g.nodes.iter().map(|n| n.id).collect();
-    g.links.retain(|l| ids.contains(&l.from) && ids.contains(&l.to));
-    for layer in &adj.layers {
-        if g.has(layer.id) {
-            continue;
-        }
-        let tail = g.source(OUTPUT, 0).unwrap_or(INPUT);
-        let at = g.pos(tail);
-        g.nodes.push(GraphNode { id: layer.id, kind: NodeKind::Layer, pos: [at[0] + COL, at[1]] });
-        g.link(tail, layer.id, 0);
-        g.link(layer.id, OUTPUT, 0);
-        let out = g.pos(OUTPUT);
-        g.set_pos(OUTPUT, [out[0].max(at[0] + 2.0 * COL), out[1]]);
-    }
-    g
+    adj.nodes.clone().unwrap_or_default().repaired(&adj.layers)
 }
 
 /// The adjustments as they should render: only the layers on the graph's
 /// path, in its order. Disconnected nodes stay in the saved list.
+///
+/// A graph the engine refuses (a cycle) renders the background only: inventing
+/// an order would show a frame the graph cannot explain. Callers that can
+/// report the reason use [`flattened_checked`].
 pub fn flattened(adj: &AdjustmentSet) -> AdjustmentSet {
+    match flattened_checked(adj) {
+        Ok(out) => out,
+        Err(error) => {
+            static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if LOGGED.set(()).is_ok() {
+                log::error!("node graph refused: {error}; showing the background only");
+            }
+            AdjustmentSet { layers: Vec::new(), ..adj.clone() }
+        }
+    }
+}
+
+/// [`flattened`], with the graph's refusal instead of a fallback frame.
+pub fn flattened_checked(adj: &AdjustmentSet) -> Result<AdjustmentSet, GraphError> {
     let mut out = adj.clone();
     if adj.nodes.is_some() {
-        let order = normalized(adj).render_order();
-        out.layers = order.iter().filter_map(|id| adj.layers.iter().find(|l| l.id == *id).cloned()).collect();
+        out.nodes = Some(normalized(adj));
+        let order: Vec<u64> = aurora_engine::layered(&out)?.iter().map(|layer| layer.id).collect();
+        out.layers = order.iter().filter_map(|id| out.layers.iter().find(|l| l.id == *id).cloned()).collect();
     }
-    out
+    Ok(out)
 }
 
 /// Stores `g` and puts the layer list in its render order, disconnected
@@ -446,6 +439,40 @@ mod tests {
         a.layers.retain(|l| l.id != 2);
         let g = normalized(&a);
         assert_eq!(g.render_order(), vec![1, 3]);
+    }
+
+    fn graph_with(links: &[(u64, u64, u32)], ids: &[u64]) -> NodeGraph {
+        let mut nodes = vec![
+            GraphNode { id: INPUT, kind: NodeKind::Input, pos: [0.0; 2] },
+            GraphNode { id: OUTPUT, kind: NodeKind::Output, pos: [0.0; 2] },
+        ];
+        nodes.extend(ids.iter().map(|id| GraphNode { id: *id, kind: NodeKind::Layer, pos: [0.0; 2] }));
+        NodeGraph {
+            nodes,
+            links: links.iter().map(|&(from, to, input)| NodeLink { from, to, input }).collect(),
+        }
+    }
+
+    #[test]
+    fn flattened_follows_the_graph_order_and_prunes_detached_rows() {
+        // Stored list says 3, 1, 2; the graph says 1 -> 2 -> output and keeps 3
+        // as a detached node.
+        let mut a = layers(&[3, 1, 2]);
+        a.nodes = Some(graph_with(&[(INPUT, 1, 0), (1, 2, 0), (2, OUTPUT, 0)], &[1, 2, 3]));
+        let ids: Vec<u64> = flattened(&a).layers.iter().map(|l| l.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(flattened_checked(&a).unwrap().layers.len(), 2);
+    }
+
+    #[test]
+    fn a_cyclic_graph_flattens_to_the_background_only() {
+        let mut a = layers(&[1, 2]);
+        a.nodes = Some(graph_with(
+            &[(INPUT, 1, 0), (1, 2, 0), (2, 1, 1), (2, OUTPUT, 0)],
+            &[1, 2],
+        ));
+        assert!(flattened_checked(&a).is_err());
+        assert!(flattened(&a).layers.is_empty());
     }
 
     #[test]
