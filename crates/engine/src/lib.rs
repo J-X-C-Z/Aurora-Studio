@@ -89,6 +89,7 @@ mod portrait_eye_bag_inputs;
 mod portrait_makeup_mesh2d;
 mod portrait_makeup_wiring;
 mod portrait_moisture_inputs;
+pub mod portrait_pf115_pf107;
 mod portrait_pf90021_input;
 pub use portrait_stage::portrait_face_input_stage;
 pub mod blemish_gainmap;
