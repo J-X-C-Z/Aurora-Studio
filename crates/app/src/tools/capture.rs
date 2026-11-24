@@ -16,13 +16,12 @@ use crate::theme::pal;
 use crate::widgets::*;
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
-    v_flex()
-        .w_full()
-        .child(camera_panel(state, cx))
-        .child(settings_panel(state, cx))
-        .child(naming_panel(state, window, cx))
-        .child(adjust_panel(state, cx))
-        .into_any_element()
+    PanelStack::new(state)
+        .panel("camera", camera_panel(state, cx))
+        .panel("camera-settings", settings_panel(state, cx))
+        .panel("capture-naming", naming_panel(state, window, cx))
+        .panel("capture-adjust", adjust_panel(state, cx))
+        .render(cx)
 }
 
 fn camera_panel(state: &Entity<AppState>, cx: &App) -> AnyElement {
@@ -30,7 +29,10 @@ fn camera_panel(state: &Entity<AppState>, cx: &App) -> AnyElement {
     let p = pal(cx).clone();
     // No platform backend: neither probing nor "check again" can help.
     if !s.capabilities.tether {
-        return v_flex().px_3().gap_2().child(div().text_xs().text_color(p.text_muted).child(s.tether_note())).into_any_element();
+        return ToolPanel::new(state, "camera", t("Camera", "相机"))
+            .status(crate::contract::TETHER)
+            .child(v_flex().px_3().gap_2().child(div().text_xs().text_color(p.text_muted).child(s.tether_note())))
+            .into_any_element();
     }
     let capturing = s.capturing;
     let probing = s.tether_probing;

@@ -19,12 +19,11 @@ use crate::theme::pal;
 use crate::widgets::*;
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
-    v_flex()
-        .w_full()
-        .child(recipes_panel(state, cx))
-        .child(recipe_panel(state, window, cx))
-        .child(summary_panel(state, cx))
-        .into_any_element()
+    PanelStack::new(state)
+        .panel("recipes", recipes_panel(state, cx))
+        .panel("recipe", recipe_panel(state, window, cx))
+        .panel("summary", summary_panel(state, cx))
+        .render(cx)
 }
 
 pub fn render_batch(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {

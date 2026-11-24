@@ -16,13 +16,12 @@ use crate::theme::pal;
 use crate::widgets::*;
 
 pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {
-    v_flex()
-        .w_full()
-        .child(lens_panel(state, cx))
-        .child(rotation_panel(state, cx))
-        .child(crop_panel(state, cx))
-        .child(keystone_panel(state, cx))
-        .into_any_element()
+    PanelStack::new(state)
+        .panel("lens", lens_panel(state, cx))
+        .panel("rotation", rotation_panel(state, cx))
+        .panel("crop", crop_panel(state, cx))
+        .panel("keystone", keystone_panel(state, cx))
+        .render(cx)
 }
 
 /// One panel of this tab by id, for the Quick tab.

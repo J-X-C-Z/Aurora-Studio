@@ -50,6 +50,11 @@ pub struct WorkspaceLayout {
     pub tab_order: Vec<String>,
     /// Tool panel ids on the Quick tab, top to bottom.
     pub quick_tools: Vec<String>,
+    /// Panel ids per tab id in the order the user dragged them into; panels a
+    /// list does not name keep their built-in place.
+    pub panel_order: BTreeMap<String, Vec<String>>,
+    /// Panels pinned to the top of every tab that shows them, in pin order.
+    pub pinned_panels: Vec<String>,
     pub tab: String,
     pub inspector_width: f32,
     pub filmstrip_height: f32,
@@ -63,10 +68,12 @@ impl Default for WorkspaceLayout {
             inspector_right: false,
             show_inspector: true,
             browser: "filmstrip".into(),
-            // Nothing on the Portrait tab renders yet; the Portrait Retouch workspace shows it.
+            // The Portrait tab is partly rendered; the Portrait Retouch workspace shows it.
             hidden_tabs: vec![tab_id(ToolTab::Portrait)],
             tab_order: Vec::new(),
             quick_tools: ["wb", "exposure", "hdr", "clarity"].map(String::from).to_vec(),
+            panel_order: Default::default(),
+            pinned_panels: Vec::new(),
             tab: "Exposure".into(),
             inspector_width: 320.0,
             filmstrip_height: 132.0,
@@ -714,6 +721,7 @@ mod tab_tests {
     fn old_workspaces_still_load() {
         let w: WorkspaceLayout = serde_json::from_str(r#"{"name":"Mine","hidden_tabs":["Batch"]}"#).unwrap();
         assert!(w.tab_order.is_empty());
+        assert!(w.panel_order.is_empty() && w.pinned_panels.is_empty());
         assert_eq!(w.hidden_tabs, vec!["Batch".to_string()]);
     }
 

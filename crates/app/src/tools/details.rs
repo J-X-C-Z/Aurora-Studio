@@ -20,14 +20,16 @@ use crate::{global, scoped};
 
 pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {
     let scope = state.read(cx).scope();
-    v_flex()
-        .w_full()
-        .child(navigator_panel(state, cx))
-        .child(sharpening_panel(state, scope, cx))
-        .child(noise_panel(state, scope, cx))
-        .child(moire_panel(state, scope, cx))
-        .when(scope == Scope::Global, |d| d.child(grain_panel(state, cx)).child(lens_blur_panel(state, cx)).child(spots_panel(state, cx)))
-        .into_any_element()
+    let global = scope == Scope::Global;
+    PanelStack::new(state)
+        .panel("navigator", navigator_panel(state, cx))
+        .panel("sharpening", sharpening_panel(state, scope, cx))
+        .panel("noise", noise_panel(state, scope, cx))
+        .panel("moire", moire_panel(state, scope, cx))
+        .panel_when(global, "grain", || grain_panel(state, cx).into_any_element())
+        .panel_when(global, "lens-blur", || lens_blur_panel(state, cx).into_any_element())
+        .panel_when(global, "spots", || spots_panel(state, cx).into_any_element())
+        .render(cx)
 }
 
 /// One panel of this tab by id, for the Quick tab.

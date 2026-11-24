@@ -7,12 +7,12 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
-    menu::{DropdownMenu as _, PopupMenuItem},
+    tooltip::Tooltip,
     spinner::Spinner,
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, Focusable as _, InteractiveElement, IntoElement, ParentElement, SharedString,
+    App, AppContext as _, Entity, Focusable as _, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use aurora_engine::*;
@@ -22,15 +22,6 @@ use crate::layer_field;
 use crate::state::{AppState, CursorTool};
 use crate::theme::pal;
 use crate::widgets::*;
-
-pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
-    let layer = state.read(cx).active_layer_ref().cloned();
-    v_flex()
-        .w_full()
-        .child(node_panel(state, window, cx))
-        .when_some(layer, |d, l| d.child(mask_panel(state, &l, cx)).child(luma_panel(state, &l, cx)).child(color_range_panel(state, &l, cx)).child(brush_panel(state, cx)))
-        .into_any_element()
-}
 
 pub(crate) fn rename(state: &Entity<AppState>, id: u64, current: String, window: &mut Window, cx: &mut App) {
     let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
@@ -55,7 +46,7 @@ pub(crate) fn rename(state: &Entity<AppState>, id: u64, current: String, window:
 
 /// The node editor (or a note when it is docked under the viewer) and the
 /// selected node's switch, name and key opacity.
-fn node_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement + use<> {
+pub(crate) fn node_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
     let docked = s.view.node_dock;
@@ -152,7 +143,7 @@ fn ai_name(k: AiMaskKind) -> &'static str {
     }
 }
 
-fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
     let id = layer.id;
@@ -178,33 +169,83 @@ fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoEle
         IconBtn::new(SharedString::from(format!("mask-{key}")), icon, tip).on_click(move |_, cx| st.update(cx, |s, cx| s.edit_layer(tip, id, false, |l| f(&mut l.mask), cx)))
     };
     let st_overlay = state.clone();
-    let st_ai = state.clone();
 
-    let (ai_busy, ai_failed) = {
+    // AI masks: tick any number of kinds, then create them in one go.
+    let (ai_failed, pick) = {
         let s = state.read(cx);
-        (s.ai_busy, s.ai_unavailable.clone())
+        (s.ai_unavailable.clone(), s.panels.ai_pick.clone())
     };
-    let ai_menu = Button::new("ai-mask")
-        .xsmall()
-        .outline()
-        .icon(Icon::new(IconName::Sparkles))
-        .label(t("AI Mask", "AI 蒙版"))
-        .loading(ai_busy)
-        .disabled(ai_busy)
-        .tooltip(crate::contract::AI_MASK.note().unwrap_or_default())
-        .dropdown_menu(move |mut menu, _, _| {
-            for k in AiMaskKind::ALL {
-                let st = st_ai.clone();
-                // A kind the engine refused this session stays listed, marked, so the
-                // reason can be read again by choosing it.
-                let label = match ai_failed.contains(&k) {
-                    true => format!("{} · {}", ai_name(k), t("unavailable", "不可用")),
-                    false => ai_name(k).to_string(),
-                };
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| st.update(cx, |s, cx| s.compute_ai_mask(k, cx))));
-            }
-            menu
-        });
+    let chips = AiMaskKind::ALL.into_iter().map(|k| {
+        let on = pick.contains(&k);
+        let failed = ai_failed.contains(&k);
+        let st = state.clone();
+        h_flex()
+            .id(SharedString::from(format!("ai-pick-{k:?}")))
+            .h(px(22.0))
+            .px_2()
+            .gap_1()
+            .rounded(px(11.0))
+            .border_1()
+            .text_xs()
+            .cursor_pointer()
+            .when(on, |d| d.bg(p.accent_soft).border_color(p.accent).text_color(p.accent))
+            .when(!on, |d| d.border_color(p.edge).text_color(if failed { p.text_disabled } else { p.text_muted }).hover(|s| s.bg(p.hover).text_color(p.text)))
+            .when(busy, |d| d.opacity(0.5))
+            .when(on, |d| d.child(Icon::new(IconName::Check).xsmall()))
+            .child(ai_name(k))
+            // A kind the engine refused this session stays pickable, marked, so the
+            // reason can be read again by trying it.
+            .when(failed, |d| {
+                d.child(Icon::new(IconName::TriangleAlert).xsmall().text_color(p.warning))
+                    .tooltip(|window, cx| Tooltip::new(t("Unavailable last time; pick it to try again", "上次不可用，勾选可重试")).build(window, cx))
+            })
+            .when(!busy, |d| d.on_click(move |_, _, cx| st.update(cx, |s, cx| s.toggle_ai_pick(k, cx))))
+    });
+    let n = pick.len();
+    let (st_go, st_clear) = (state.clone(), state.clone());
+    let ai_row = v_flex()
+        .px_3()
+        .py_1()
+        .gap_1p5()
+        .child(
+            h_flex()
+                .gap_1()
+                .text_xs()
+                .text_color(p.text_subtle)
+                .child(Icon::new(IconName::Sparkles).xsmall())
+                .child(div().flex_1().child(t("AI Mask — pick one or more", "AI 蒙版 · 可多选")))
+                .when(n > 0 && !busy, |d| {
+                    d.child(
+                        div()
+                            .id("ai-pick-clear")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(p.text))
+                            .child(t("Clear", "清除"))
+                            .on_click(move |_, _, cx| st_clear.update(cx, |s, cx| {
+                                s.panels.ai_pick.clear();
+                                cx.notify();
+                            })),
+                    )
+                }),
+        )
+        .child(h_flex().flex_wrap().gap_1().children(chips))
+        .child(
+            h_flex().gap_2().child(
+                Button::new("ai-mask-create")
+                    .xsmall()
+                    .primary()
+                    .icon(Icon::new(IconName::Sparkles))
+                    .label(if n > 0 { format!("{} ({n})", t("Create", "生成")) } else { t("Create", "生成").to_string() })
+                    .loading(busy)
+                    .disabled(busy || n == 0)
+                    .tooltip(crate::contract::AI_MASK.note().unwrap_or_default())
+                    .on_click(move |_, _, cx| st_go.update(cx, |s, cx| {
+                        let kinds = s.panels.ai_pick.clone();
+                        s.compute_ai_masks(kinds, cx)
+                    })),
+            )
+            .when(busy, |d| d.child(h_flex().gap_1().text_xs().text_color(p.text_muted).child(Spinner::new().xsmall()).child(t("Analyzing…", "正在分析…")))),
+        );
 
     let shapes = mask.shapes.iter().enumerate().map(|(i, shape)| {
         let (icon, label) = match shape {
@@ -267,9 +308,7 @@ fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoEle
                         }),
                 ),
         )
-        .child(h_flex().px_3().py_1().gap_2().child(ai_menu).when(busy, |d| {
-            d.child(h_flex().gap_1().text_xs().text_color(p.text_muted).child(Spinner::new().xsmall()).child(t("Analyzing…", "正在分析…")))
-        }))
+        .child(ai_row)
         .children(shapes)
         .child(div().h(px(4.0)))
         .child(param(state, format!("mask-feather-{id}"), t("Feather", "羽化"), layer_field!(id, mask.feather), 0.0, 1000.0, cx).unit(" px"))
@@ -277,7 +316,7 @@ fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoEle
         .child(param(state, format!("mask-density-{id}"), t("Density", "密度"), layer_field!(id, mask.density), 0.0, 100.0, cx).default_value(100.0).unit("%"))
 }
 
-fn luma_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn luma_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoElement + use<> {
     let id = layer.id;
     let range = layer.mask.luma_range;
     let st = state.clone();
@@ -304,7 +343,7 @@ fn luma_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoEle
 }
 
 /// Restricts the mask to a hue band, as Capture One's color range masks do.
-fn color_range_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn color_range_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl IntoElement + use<> {
     let id = layer.id;
     let range = layer.mask.color_range.clone();
     let off = range.is_none();
@@ -332,7 +371,7 @@ fn color_range_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> impl 
         .child(field(t("Min. Saturation", "最低饱和度"), "ms", 0.0, 1.0, |r| r.min_saturation, |r, v| r.min_saturation = v).decimals(2))
 }
 
-fn brush_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn brush_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let pr = state.read(cx).panels.clone();
     let slider = |id: &'static str, label: &'static str, value: f32, min: f32, max: f32, default: f32, unit: &'static str, f: fn(&mut crate::state::PanelPrefs, f32)| {
         let st = state.clone();

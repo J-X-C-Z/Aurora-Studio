@@ -5,7 +5,7 @@ use gpui_kit::component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
-    h_flex, v_flex,
+    h_flex,
 };
 use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
@@ -18,13 +18,12 @@ use crate::theme::pal;
 use crate::widgets::*;
 
 pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {
-    v_flex()
-        .w_full()
-        .child(user_styles_panel(state, cx))
-        .child(styles_panel(state, cx))
-        .child(clipboard_panel(state, cx))
-        .child(history_panel(state, cx))
-        .into_any_element()
+    PanelStack::new(state)
+        .panel("user-styles", user_styles_panel(state, cx))
+        .panel("styles", styles_panel(state, cx))
+        .panel("clipboard", clipboard_panel(state, cx))
+        .panel("history", history_panel(state, cx))
+        .render(cx)
 }
 
 /// Styles the user saved from their own adjustments: apply, rename, delete.

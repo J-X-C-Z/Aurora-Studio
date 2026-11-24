@@ -27,15 +27,14 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             .child(ely_core::feedback::EmptyState::new("meta-empty", ely_core::primitives::IconName::Image, t("No image selected", "未选择图像")))
             .into_any_element();
     };
-    v_flex()
-        .w_full()
-        .child(presets_panel(state, cx))
-        .child(rating_panel(state, &info, cx))
-        .child(file_panel(state, &info, cx))
-        .child(exif_panel(state, &info, cx))
-        .child(iptc_panel(state, &info, window, cx))
-        .child(keywords_panel(state, &info, window, cx))
-        .into_any_element()
+    PanelStack::new(state)
+        .panel("metadata-presets", presets_panel(state, cx))
+        .panel("rating", rating_panel(state, &info, cx))
+        .panel("file", file_panel(state, &info, cx))
+        .panel("exif", exif_panel(state, &info, cx))
+        .panel("iptc", iptc_panel(state, &info, window, cx))
+        .panel("keywords", keywords_panel(state, &info, window, cx))
+        .render(cx)
 }
 
 /// Metadata presets: IPTC fields and keywords saved from one image and stamped

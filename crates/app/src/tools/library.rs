@@ -22,12 +22,11 @@ use crate::theme::{hex, pal};
 use crate::widgets::*;
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
-    v_flex()
-        .w_full()
-        .child(collections_panel(state, window, cx))
-        .child(filters_panel(state, window, cx))
-        .child(catalog_panel(state, cx))
-        .into_any_element()
+    PanelStack::new(state)
+        .panel("collections", collections_panel(state, window, cx))
+        .panel("filters", filters_panel(state, window, cx))
+        .panel("catalog", catalog_panel(state, cx))
+        .render(cx)
 }
 
 fn kind_icon(k: CollectionKind) -> IconName {
