@@ -186,9 +186,116 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
     None
 }
 
-/// Revision of every pixel algorithm behind [`decode16_traced`] and the Aurora
-/// Raw chain. Bump it whenever decoded samples change so old cache entries miss.
-pub const DECODE_ALGORITHM_REVISION: u32 = 1;
+/// Revision of each independent stage of the RAW pipeline.
+///
+/// Bump only the stage whose algorithm changed. A cache key is built from the
+/// stages a [`DecodeRoute`] actually runs, so an unrelated bump neither
+/// invalidates every entry nor hides a changed stage behind a stale one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DecodeStageRevisions {
+    pub demosaic: u16,
+    pub highlight_recovery: u16,
+    pub chromatic_aberration: u16,
+    pub noise_model: u16,
+    pub z6iii_reconstruction: u16,
+    pub orientation_active_area: u16,
+    pub output_packing: u16,
+}
+
+/// Current revision of every decode stage. The values start at 1 at the split
+/// from the former single `DECODE_ALGORITHM_REVISION` constant.
+pub const DECODE_STAGE_REVISIONS: DecodeStageRevisions = DecodeStageRevisions {
+    demosaic: 1,
+    highlight_recovery: 1,
+    chromatic_aberration: 1,
+    noise_model: 1,
+    z6iii_reconstruction: 1,
+    orientation_active_area: 1,
+    output_packing: 1,
+};
+
+/// Which stages a decode ran. `LibRaw` runs the always-on stages inside the
+/// library; a camera preview or a non-RAW source runs no decode stage at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum StageShape {
+    None,
+    LibRaw,
+    AuroraGeneric,
+    AuroraZ6iii,
+}
+
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const PIPELINE_DOMAIN: u64 = 0xD3C0_DE00_0000_0001;
+
+impl DecodeStageRevisions {
+    fn shape_for(backend: DecodeBackend, z6iii_linear: bool) -> StageShape {
+        match backend {
+            DecodeBackend::AuroraZ6iiiOpenCl => StageShape::AuroraZ6iii,
+            DecodeBackend::AuroraCpuChain if z6iii_linear => StageShape::AuroraZ6iii,
+            DecodeBackend::AuroraCpuChain => StageShape::AuroraGeneric,
+            DecodeBackend::LibRaw => StageShape::LibRaw,
+            DecodeBackend::CameraPreview | DecodeBackend::Other => StageShape::None,
+        }
+    }
+
+    fn fingerprint_of(&self, shape: StageShape) -> u64 {
+        fn stage(mut hash: u64, tag: u8, value: u16) -> u64 {
+            hash ^= u64::from(tag);
+            hash = hash.wrapping_mul(FNV_PRIME);
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+
+        let mut hash = stage(PIPELINE_DOMAIN, 0, shape as u16);
+        if matches!(shape, StageShape::None) {
+            return hash ^ (hash >> 32);
+        }
+        // Always-on stages: demosaic, orientation/active area, output packing.
+        hash = stage(hash, 1, self.demosaic);
+        hash = stage(hash, 2, self.orientation_active_area);
+        hash = stage(hash, 3, self.output_packing);
+        if matches!(shape, StageShape::AuroraGeneric | StageShape::AuroraZ6iii) {
+            hash = stage(hash, 4, self.highlight_recovery);
+            hash = stage(hash, 5, self.chromatic_aberration);
+            hash = stage(hash, 6, self.noise_model);
+        }
+        if matches!(shape, StageShape::AuroraZ6iii) {
+            hash = stage(hash, 7, self.z6iii_reconstruction);
+        }
+        hash ^ (hash >> 32)
+    }
+
+    fn route_shape(route: &DecodeRoute) -> StageShape {
+        if !route.c1_raw_enabled {
+            StageShape::LibRaw
+        } else if route.z6iii_nef && route.z6iii_feature {
+            StageShape::AuroraZ6iii
+        } else {
+            StageShape::AuroraGeneric
+        }
+    }
+
+    /// Stable fingerprint of the stages `route` may run before a decode.
+    ///
+    /// It goes into the RAW16 cache key, so a changed but *used* stage lands on
+    /// a new file while a changed unused stage leaves older entries alone.
+    pub fn pipeline_fingerprint(&self, route: &DecodeRoute) -> u64 {
+        self.fingerprint_of(Self::route_shape(route))
+    }
+
+    /// Stable fingerprint of the stages that produced `provenance`'s pixels,
+    /// recomputed from the current constants. A persisted header that carries a
+    /// different value was written by an older pipeline and must miss.
+    pub fn provenance_fingerprint(&self, provenance: &DecodeProvenance) -> u64 {
+        self.fingerprint_of(Self::shape_for(
+            provenance.backend,
+            provenance.z6iii_linear,
+        ))
+    }
+}
 
 /// Which decoder produced a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -237,7 +344,9 @@ pub enum OpenClStatus {
 /// the Z6III pre-matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DecodeProvenance {
-    pub revision: u32,
+    /// [`DecodeStageRevisions::provenance_fingerprint`] of the stages that
+    /// produced these pixels. Compared on every cache hit.
+    pub pipeline_fingerprint: u64,
     pub backend: DecodeBackend,
     pub opencl: OpenClStatus,
     pub pixel_space: PixelSpace,
@@ -246,7 +355,12 @@ pub struct DecodeProvenance {
 }
 
 impl DecodeProvenance {
-    pub const fn aurora(route: crate::aurora_raw::AuroraRoute) -> Self {
+    fn with_fingerprint(mut self) -> Self {
+        self.pipeline_fingerprint = DECODE_STAGE_REVISIONS.provenance_fingerprint(&self);
+        self
+    }
+
+    pub fn aurora(route: crate::aurora_raw::AuroraRoute) -> Self {
         use crate::aurora_raw::AuroraRoute as Route;
         let (backend, opencl, z6iii_linear) = match route {
             Route::Z6iiiOpenCl => {
@@ -261,52 +375,57 @@ impl DecodeProvenance {
             Route::Cpu => (DecodeBackend::AuroraCpuChain, OpenClStatus::NotAttempted, false),
         };
         Self {
-            revision: DECODE_ALGORITHM_REVISION,
+            pipeline_fingerprint: 0,
             backend,
             opencl,
             pixel_space: PixelSpace::CameraLinear16,
             z6iii_linear,
         }
+        .with_fingerprint()
     }
 
-    pub const fn libraw16() -> Self {
+    pub fn libraw16() -> Self {
         Self {
-            revision: DECODE_ALGORITHM_REVISION,
+            pipeline_fingerprint: 0,
             backend: DecodeBackend::LibRaw,
             opencl: OpenClStatus::NotAttempted,
             pixel_space: PixelSpace::LibRawLinear16,
             z6iii_linear: false,
         }
+        .with_fingerprint()
     }
 
-    pub const fn libraw_srgb8() -> Self {
+    pub fn libraw_srgb8() -> Self {
         Self {
-            revision: DECODE_ALGORITHM_REVISION,
+            pipeline_fingerprint: 0,
             backend: DecodeBackend::LibRaw,
             opencl: OpenClStatus::NotAttempted,
             pixel_space: PixelSpace::Srgb8,
             z6iii_linear: false,
         }
+        .with_fingerprint()
     }
 
-    pub const fn camera_preview() -> Self {
+    pub fn camera_preview() -> Self {
         Self {
-            revision: DECODE_ALGORITHM_REVISION,
+            pipeline_fingerprint: 0,
             backend: DecodeBackend::CameraPreview,
             opencl: OpenClStatus::NotAttempted,
             pixel_space: PixelSpace::EmbeddedPreview,
             z6iii_linear: false,
         }
+        .with_fingerprint()
     }
 
-    pub const fn other_srgb8() -> Self {
+    pub fn other_srgb8() -> Self {
         Self {
-            revision: DECODE_ALGORITHM_REVISION,
+            pipeline_fingerprint: 0,
             backend: DecodeBackend::Other,
             opencl: OpenClStatus::NotAttempted,
             pixel_space: PixelSpace::Srgb8,
             z6iii_linear: false,
         }
+        .with_fingerprint()
     }
 
     /// The only condition that may enable the C1 Z6III pre-matrix.
@@ -349,7 +468,7 @@ impl DecodeProvenance {
 
     /// Inverse of the cache header codes. Unknown codes reject the entry.
     pub fn from_codes(
-        revision: u32,
+        pipeline_fingerprint: u64,
         backend: u8,
         opencl: u8,
         pixel_space: u8,
@@ -359,7 +478,7 @@ impl DecodeProvenance {
             return None;
         }
         Some(Self {
-            revision,
+            pipeline_fingerprint,
             backend: match backend {
                 0 => DecodeBackend::AuroraZ6iiiOpenCl,
                 1 => DecodeBackend::AuroraCpuChain,
@@ -386,9 +505,18 @@ impl DecodeProvenance {
         })
     }
 
+    /// Whether these pixels were produced by the current stage revisions.
+    ///
+    /// Recomputed from the stage constants instead of trusting the header, so a
+    /// header written before a stage bump is rejected even if it was copied
+    /// under a newer key.
+    pub fn is_current(&self) -> bool {
+        self.pipeline_fingerprint == DECODE_STAGE_REVISIONS.provenance_fingerprint(self)
+    }
+
     /// Rejects a cached entry whose provenance cannot belong to `route`.
     pub fn consistent_with(&self, route: &DecodeRoute) -> bool {
-        self.revision == route.revision
+        self.is_current()
             && !(self.z6iii_linear && !route.z6iii_nef)
             && !(matches!(self.pixel_space, PixelSpace::CameraLinear16)
                 && !route.c1_raw_enabled)
@@ -399,7 +527,9 @@ impl DecodeProvenance {
 /// decode runs. Any change here must produce a different cache entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DecodeRoute {
-    pub revision: u32,
+    /// [`DecodeStageRevisions::pipeline_fingerprint`] for this route's stage
+    /// mix. Combined with the other fields by the cache key.
+    pub pipeline_fingerprint: u64,
     pub c1_raw_enabled: bool,
     /// The file is a recognisable Z6III HE NEF and C1 RAW is enabled.
     pub z6iii_nef: bool,
@@ -433,15 +563,17 @@ pub fn decode_route(path: &Path) -> DecodeRoute {
         && crate::z6iii::is_z6iii_nef_file(path);
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
     let z6iii_nef = false;
-    DecodeRoute {
-        revision: DECODE_ALGORITHM_REVISION,
+    let mut route = DecodeRoute {
+        pipeline_fingerprint: 0,
         c1_raw_enabled,
         z6iii_nef,
         z6iii_feature,
         libraw_available: libraw::available(),
         opencl: opencl_route_state(),
         demosaic: demosaic_quality(),
-    }
+    };
+    route.pipeline_fingerprint = DECODE_STAGE_REVISIONS.pipeline_fingerprint(&route);
+    route
 }
 
 fn opencl_route_state() -> OpenClRouteState {
@@ -2179,7 +2311,7 @@ mod tests {
             DecodeProvenance::camera_preview(),
         ] {
             let decoded = DecodeProvenance::from_codes(
-                provenance.revision,
+                provenance.pipeline_fingerprint,
                 provenance.backend_code(),
                 provenance.opencl_code(),
                 provenance.pixel_space_code(),
@@ -2197,7 +2329,7 @@ mod tests {
     #[test]
     fn decode_route_changes_with_behavioural_inputs() {
         let base = DecodeRoute {
-            revision: DECODE_ALGORITHM_REVISION,
+            pipeline_fingerprint: 0,
             c1_raw_enabled: true,
             z6iii_nef: true,
             z6iii_feature: true,
@@ -2213,13 +2345,91 @@ mod tests {
         no_opencl.opencl = OpenClRouteState::Unavailable;
         let mut not_z6iii = base;
         not_z6iii.z6iii_nef = false;
-        let mut revision = base;
-        revision.revision += 1;
+        let mut fingerprint = base;
+        fingerprint.pipeline_fingerprint += 1;
         let mut demosaic = base;
         demosaic.demosaic = 0;
-        for variant in [disabled, no_libraw, no_opencl, not_z6iii, revision, demosaic] {
+        for variant in [disabled, no_libraw, no_opencl, not_z6iii, fingerprint, demosaic] {
             assert_ne!(base, variant);
         }
+    }
+
+    #[test]
+    fn stage_revisions_only_invalidate_the_routes_that_run_them() {
+        let z6iii = DecodeRoute {
+            pipeline_fingerprint: 0,
+            c1_raw_enabled: true,
+            z6iii_nef: true,
+            z6iii_feature: true,
+            libraw_available: true,
+            opencl: OpenClRouteState::Available,
+            demosaic: 3,
+        };
+        let libraw_only = DecodeRoute { c1_raw_enabled: false, ..z6iii };
+        let base = DECODE_STAGE_REVISIONS;
+        assert_eq!(base.pipeline_fingerprint(&z6iii), base.pipeline_fingerprint(&z6iii));
+        assert_eq!(
+            base.pipeline_fingerprint(&libraw_only),
+            base.pipeline_fingerprint(&libraw_only)
+        );
+
+        // A stage only the Aurora chain runs must leave a LibRaw-only route
+        // fingerprint alone, and a Z6III-only stage must not touch the generic
+        // Aurora route.
+        let chroma = DecodeStageRevisions { chromatic_aberration: 2, ..base };
+        let generic = DecodeRoute { z6iii_nef: false, ..z6iii };
+        assert_ne!(chroma.pipeline_fingerprint(&z6iii), base.pipeline_fingerprint(&z6iii));
+        assert_ne!(
+            chroma.pipeline_fingerprint(&generic),
+            base.pipeline_fingerprint(&generic),
+            "the generic Aurora route runs the same chromatic aberration stage"
+        );
+        assert_eq!(
+            chroma.pipeline_fingerprint(&libraw_only),
+            base.pipeline_fingerprint(&libraw_only),
+            "a LibRaw-only route never runs our chromatic aberration stage"
+        );
+        let z6iii_bump =
+            DecodeStageRevisions { z6iii_reconstruction: 2, ..base };
+        assert_ne!(
+            z6iii_bump.pipeline_fingerprint(&z6iii),
+            base.pipeline_fingerprint(&z6iii)
+        );
+        assert_eq!(
+            z6iii_bump.pipeline_fingerprint(&generic),
+            base.pipeline_fingerprint(&generic),
+            "the generic Aurora route does not run the Z6III reconstruction"
+        );
+        let demosaic_bump = DecodeStageRevisions { demosaic: 2, ..base };
+        assert_ne!(
+            demosaic_bump.pipeline_fingerprint(&libraw_only),
+            base.pipeline_fingerprint(&libraw_only),
+            "demosaic runs on every route"
+        );
+    }
+
+    #[test]
+    fn persisted_provenance_must_carry_the_current_stage_fingerprint() {
+        let libraw = DecodeProvenance::libraw16();
+        assert!(libraw.is_current());
+        assert_eq!(
+            libraw.pipeline_fingerprint,
+            DECODE_STAGE_REVISIONS.provenance_fingerprint(&libraw)
+        );
+        let z6iii = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl);
+        let generic = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Cpu);
+        let preview = DecodeProvenance::camera_preview();
+        let mut fingerprints = vec![
+            libraw.pipeline_fingerprint,
+            z6iii.pipeline_fingerprint,
+            generic.pipeline_fingerprint,
+            preview.pipeline_fingerprint,
+        ];
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        assert_eq!(fingerprints.len(), 4, "every provenance shape is distinct");
+        assert!(!DecodeProvenance { pipeline_fingerprint: 0, ..z6iii }.is_current());
+        assert!(!DecodeProvenance { pipeline_fingerprint: 0, ..preview }.is_current());
     }
 }
 

@@ -22,13 +22,14 @@ use crate::RgbaImage;
 
 /// Only files with this prefix are ever evicted; the caller shares the folder.
 const PREFIX: &str = "raw-";
-// Bump when the persisted layout changes. B7 adds the provenance header
-// (revision, backend, OpenCL status, pixel space) at bytes 32..40, so B6 files
-// miss naturally.
-const RAW16_MAGIC: &[u8; 8] = b"AUR16B7\0";
-/// magic(8) width(4) height(4) body bytes(8) image hash(8) revision(4)
-/// backend(1) opencl(1) pixel_space(1) flags(1).
-const HEADER16: usize = 40;
+// Bump when the persisted layout changes. B8 replaces the single algorithm
+// revision with the 64-bit stage-mix pipeline fingerprint, so B7 files miss
+// naturally.
+const RAW16_MAGIC: &[u8; 8] = b"AUR16B8\0";
+/// magic(8) width(4) height(4) body bytes(8) image hash(8)
+/// pipeline fingerprint(8) backend(1) opencl(1) pixel_space(1) flags(1)
+/// reserved(4, must be zero).
+const HEADER16: usize = 48;
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
 /// One full-sensor frame kept after a cold proxy decode. The fit view already
@@ -203,9 +204,10 @@ where
 
 /// Cache key from the file identity plus every input that chooses a decoder.
 ///
-/// `route` carries the algorithm revision, C1 switch, Z6III detection, libraw
-/// availability, OpenCL state and demosaic filter, so any backend change lands
-/// on a different file instead of reusing pixels from another route.
+/// `route` carries the stage-mix pipeline fingerprint, C1 switch, Z6III
+/// detection, libraw availability, OpenCL state and demosaic filter, so a
+/// backend change or a bump of a stage that route runs lands on a different
+/// file instead of reusing pixels from another pipeline.
 fn cache_key16_for_route(
     path: &Path,
     dir: &Path,
@@ -399,12 +401,15 @@ fn read_cached16_binary(
     {
         return None;
     }
+    if header[44..48] != [0u8; 4] {
+        return None;
+    }
     let provenance = DecodeProvenance::from_codes(
-        u32::from_le_bytes(header[32..36].try_into().ok()?),
-        header[36],
-        header[37],
-        header[38],
-        header[39],
+        u64::from_le_bytes(header[32..40].try_into().ok()?),
+        header[40],
+        header[41],
+        header[42],
+        header[43],
     )?;
     if !provenance.consistent_with(route) {
         return None;
@@ -454,19 +459,22 @@ fn read_cached_source16(
     if width == 0 || height == 0 || bytes != expected_bytes || map.len() != HEADER16 + bytes {
         return None;
     }
+    if map[44..48] != [0u8; 4] {
+        return None;
+    }
     let provenance = DecodeProvenance::from_codes(
-        u32::from_le_bytes(map[32..36].try_into().ok()?),
-        map[36],
-        map[37],
-        map[38],
-        map[39],
+        u64::from_le_bytes(map[32..40].try_into().ok()?),
+        map[40],
+        map[41],
+        map[42],
+        map[43],
     )?;
     if !provenance.consistent_with(route) {
         return None;
     }
     let stored_hash = u64::from_le_bytes(map[24..32].try_into().ok()?);
     let body = &map[HEADER16..];
-    // SAFETY: the mapping starts page-aligned and HEADER16 is 40 bytes, so the
+    // SAFETY: the mapping starts page-aligned and HEADER16 is 48 bytes, so the
     // body is u16-aligned. `align_to` checks and reports any residual bytes.
     let (before, pixels, after) = unsafe { body.align_to::<u16>() };
     if !before.is_empty() || !after.is_empty() || pixels.len() != expected_bytes / 2 {
@@ -553,11 +561,12 @@ fn store16_binary(
     data.extend_from_slice(&height.to_le_bytes());
     data.extend_from_slice(&(body.len() as u64).to_le_bytes());
     data.extend_from_slice(&image_hash(width, height, &body).to_le_bytes());
-    data.extend_from_slice(&provenance.revision.to_le_bytes());
+    data.extend_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
     data.push(provenance.backend_code());
     data.push(provenance.opencl_code());
     data.push(provenance.pixel_space_code());
     data.push(provenance.flags());
+    data.extend_from_slice(&[0u8; 4]);
     data.extend_from_slice(&body);
     if fs::write(&temp, &data).is_err() || fs::rename(&temp, file).is_err() {
         let _ = fs::remove_file(&temp);
@@ -742,15 +751,18 @@ mod tests {
 
     /// A route a synthetic LibRaw-only entry is consistent with.
     fn test_route(c1_raw_enabled: bool, z6iii_nef: bool) -> DecodeRoute {
-        DecodeRoute {
-            revision: crate::raw::DECODE_ALGORITHM_REVISION,
+        let mut route = DecodeRoute {
+            pipeline_fingerprint: 0,
             c1_raw_enabled,
             z6iii_nef,
             z6iii_feature: true,
             libraw_available: true,
             opencl: crate::raw::OpenClRouteState::Available,
             demosaic: crate::raw::DEMOSAIC_DEFAULT,
-        }
+        };
+        route.pipeline_fingerprint =
+            crate::raw::DECODE_STAGE_REVISIONS.pipeline_fingerprint(&route);
+        route
     }
 
     fn store_libraw(file: &Path, width: u32, height: u32, pixels: &[u16]) {
@@ -765,8 +777,9 @@ mod tests {
         store_libraw(&file, 2, 1, &[100, 200, 300, 65535, 400, 500, 600, 65535]);
         assert!(read_cached16_binary(&file, &route).is_some());
         assert!(read_cached_source16(&file, &route).is_some());
-        // B6 had no provenance header and must miss; B5 is older still.
-        for magic in [b"AUR16B6\0", b"AUR16B5\0"] {
+        // B7 carried the single algorithm revision instead of the stage-mix
+        // fingerprint; B6 had no provenance header and B5 is older still.
+        for magic in [b"AUR16B7\0", b"AUR16B6\0", b"AUR16B5\0"] {
             let mut bytes = fs::read(&file).unwrap();
             bytes[..8].copy_from_slice(magic);
             fs::write(&file, bytes).unwrap();
@@ -792,11 +805,11 @@ mod tests {
         no_libraw.libraw_available = false;
         let mut opencl_flipped = base;
         opencl_flipped.opencl = crate::raw::OpenClRouteState::Unavailable;
-        let mut revision = base;
-        revision.revision += 1;
+        let mut fingerprint = base;
+        fingerprint.pipeline_fingerprint += 1;
         let mut demosaic = base;
         demosaic.demosaic = 0;
-        for route in [c1_off, z6iii_off, no_libraw, opencl_flipped, revision, demosaic] {
+        for route in [c1_off, z6iii_off, no_libraw, opencl_flipped, fingerprint, demosaic] {
             assert_ne!(baseline, key(route), "a route change must land on a new key");
         }
         assert_eq!(baseline, key(base), "the same route must be stable");
@@ -804,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn raw16_header_rejects_route_mismatches_and_stale_revisions() {
+    fn raw16_header_rejects_route_mismatches_and_stale_fingerprints() {
         let dir = scratch("header-route");
         let file = dir.join("raw-header.bin");
         let pixels = vec![7u16; 4 * 4];
@@ -829,7 +842,17 @@ mod tests {
         );
 
         let mut bytes = fs::read(&file).unwrap();
-        bytes[32..36].copy_from_slice(&(provenance.revision + 1).to_le_bytes());
+        bytes[32..40]
+            .copy_from_slice(&provenance.pipeline_fingerprint.wrapping_add(1).to_le_bytes());
+        fs::write(&file, bytes).unwrap();
+        assert!(read_cached16_binary(&file, &z6iii_route).is_none());
+        assert!(read_cached_source16(&file, &z6iii_route).is_none());
+
+        // The reserved word must stay zero: a header from a newer layout is not
+        // reinterpreted as this one.
+        let mut bytes = fs::read(&file).unwrap();
+        bytes[32..40].copy_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
+        bytes[44] = 1;
         fs::write(&file, bytes).unwrap();
         assert!(read_cached16_binary(&file, &z6iii_route).is_none());
         assert!(read_cached_source16(&file, &z6iii_route).is_none());
