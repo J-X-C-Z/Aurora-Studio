@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -30,8 +31,15 @@ const RAW16_MAGIC: &[u8; 8] = b"AUR16B7\0";
 const HEADER16: usize = 40;
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
+/// One full-sensor frame kept after a cold proxy decode. The fit view already
+/// paid for that decode and then discarded the native pixels, which made the
+/// first 1:1 zoom decode the same sensor again. 256 MiB covers a 24 MP RGBA16
+/// frame; larger sensors keep the old decode-on-zoom path.
+const MAX_PENDING_NATIVE_BYTES: usize = 256 << 20;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PENDING_NATIVE: Mutex<Option<(String, u32, u32, Vec<u16>, DecodeProvenance)>> =
+    Mutex::new(None);
 
 /// Decoded pixels for `path`, at most `long_side` on the longest edge.
 ///
@@ -87,11 +95,9 @@ pub fn get_or_decode16_traced(
     path: &Path,
     long_side: u32,
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    let route = crate::raw::decode_route(path);
     let Some(dir) = default_raw16_dir() else {
-        return crate::raw::decode16_traced(path).map(|(w, h, px, provenance)| {
-            let (w, h, px) = fit16(w, h, px, long_side);
-            (w, h, px, provenance)
-        });
+        return decode_frame16(path, long_side, route);
     };
     get_or_decode16_with(path, &dir, long_side, crate::raw::decode16_traced)
 }
@@ -100,26 +106,34 @@ pub(crate) fn get_or_decode_source16(
     path: &Path,
     long_side: u32,
 ) -> Option<(Source, DecodeProvenance)> {
-    let Some(dir) = default_raw16_dir() else {
-        return decode_source16(path, long_side);
-    };
     let route = crate::raw::decode_route(path);
+    let Some(dir) = default_raw16_dir() else {
+        return decode_source16(path, long_side, route);
+    };
     let key = cache_key16_for_route(path, &dir, long_side, route);
     if let Some(source) = key.as_deref().and_then(|file| read_cached_source16(file, &route)) {
         return Some(source);
     }
-    let (w, h, pixels, provenance) = crate::raw::decode16_traced(path)?;
-    let image = fit16(w, h, pixels, long_side);
-    if let Some(file) = key {
-        store16_binary(&file, image.0, image.1, &image.2, provenance);
+    if let Some((width, height, pixels, provenance)) = take_pending_native(path, long_side, route) {
+        return Some((Source::from_rgba16(width, height, &pixels), provenance));
     }
-    Some((Source::from_rgba16(image.0, image.1, &image.2), provenance))
+    let image = match cached_full_frame16(path, &dir, long_side, route) {
+        Some(image) => image,
+        None => decode_frame16(path, long_side, route)?,
+    };
+    if let Some(file) = key {
+        store16_binary(&file, image.0, image.1, &image.2, image.3);
+    }
+    Some((Source::from_rgba16(image.0, image.1, &image.2), image.3))
 }
 
-fn decode_source16(path: &Path, long_side: u32) -> Option<(Source, DecodeProvenance)> {
-    let (w, h, pixels, provenance) = crate::raw::decode16_traced(path)?;
-    let image = fit16(w, h, pixels, long_side);
-    Some((Source::from_rgba16(image.0, image.1, &image.2), provenance))
+fn decode_source16(
+    path: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+) -> Option<(Source, DecodeProvenance)> {
+    let image = decode_frame16(path, long_side, route)?;
+    Some((Source::from_rgba16(image.0, image.1, &image.2), image.3))
 }
 
 fn get_or_decode16_with<F>(
@@ -152,12 +166,21 @@ where
     {
         return Some(file);
     }
-    let (w, h, pixels, provenance) = decode(path)?;
-    let image = fit16(w, h, pixels, long_side);
-    if let Some(file) = key {
-        store16_binary(&file, image.0, image.1, &image.2, provenance);
+    if let Some(image) = take_pending_native(path, long_side, route) {
+        return Some(image);
     }
-    Some((image.0, image.1, image.2, provenance))
+    let image = match cached_full_frame16(path, dir, long_side, route) {
+        Some(image) => image,
+        None => {
+            let native_key = cache_name16_for_route(path, 0, route);
+            let (w, h, pixels, provenance) = decode(path)?;
+            fit16_keep_native(native_key, w, h, pixels, long_side, provenance)
+        }
+    };
+    if let Some(file) = key {
+        store16_binary(&file, image.0, image.1, &image.2, image.3);
+    }
+    Some(image)
 }
 
 fn get_or_decode_with<F>(path: &Path, dir: &Path, long_side: u32, decode: F) -> Result<RgbaImage>
@@ -189,6 +212,11 @@ fn cache_key16_for_route(
     long_side: u32,
     route: DecodeRoute,
 ) -> Option<PathBuf> {
+    Some(dir.join(cache_name16_for_route(path, long_side, route)?))
+}
+
+/// The flat name from the file identity and decoder route.
+fn cache_name16_for_route(path: &Path, long_side: u32, route: DecodeRoute) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -199,11 +227,11 @@ fn cache_key16_for_route(
     let mut b = DefaultHasher::new();
     (RAW16_MAGIC, path, meta.len(), mtime, long_side, route).hash(&mut a);
     (0xa7u8, path, mtime, long_side, meta.len(), route).hash(&mut b);
-    Some(dir.join(format!(
+    Some(format!(
         "{PREFIX}16b-{:016x}{:016x}-{long_side}.bin",
         a.finish(),
         b.finish()
-    )))
+    ))
 }
 
 #[cfg(test)]
@@ -216,9 +244,21 @@ fn read_cached16_png(file: &Path) -> Option<(u32, u32, Vec<u16>)> {
 }
 
 fn fit16(width: u32, height: u32, pixels: Vec<u16>, long_side: u32) -> (u32, u32, Vec<u16>) {
+    match resized16(width, height, &pixels, long_side) {
+        Some((target_width, target_height, resized)) => (target_width, target_height, resized),
+        None => (width, height, pixels),
+    }
+}
+
+fn resized16(
+    width: u32,
+    height: u32,
+    pixels: &[u16],
+    long_side: u32,
+) -> Option<(u32, u32, Vec<u16>)> {
     let longest = width.max(height);
     if long_side == 0 || longest <= long_side {
-        return (width, height, pixels);
+        return None;
     }
     let scale = long_side as f32 / longest as f32;
     let short = ((if width <= height { width } else { height }) as f32 * scale)
@@ -226,17 +266,111 @@ fn fit16(width: u32, height: u32, pixels: Vec<u16>, long_side: u32) -> (u32, u32
         .max(1.0) as u32;
     let (target_width, target_height) =
         if width >= height { (long_side, short) } else { (short, long_side) };
-    (
+    Some((
         target_width,
         target_height,
-        crate::recipe::resize_rgba16(
-            &pixels,
-            width,
-            height,
-            target_width,
-            target_height,
-        ),
-    )
+        crate::recipe::resize_rgba16(pixels, width, height, target_width, target_height),
+    ))
+}
+
+/// Downscales a full sensor frame and keeps its native samples for the first
+/// zoom request. The pending frame is one slot and never triggers extra work.
+fn fit16_keep_native(
+    native_key: Option<String>,
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    long_side: u32,
+    provenance: DecodeProvenance,
+) -> (u32, u32, Vec<u16>, DecodeProvenance) {
+    let Some((target_width, target_height, proxy)) =
+        resized16(width, height, &pixels, long_side)
+    else {
+        return (width, height, pixels, provenance);
+    };
+    remember_native(native_key, width, height, pixels, provenance);
+    (target_width, target_height, proxy, provenance)
+}
+
+fn remember_native(
+    native_key: Option<String>,
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    provenance: DecodeProvenance,
+) {
+    if pixels.capacity().saturating_mul(2) > MAX_PENDING_NATIVE_BYTES {
+        return;
+    }
+    let Some(key) = native_key else { return };
+    *PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((key, width, height, pixels, provenance));
+}
+
+fn take_pending_native(
+    path: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    if long_side != 0 {
+        return None;
+    }
+    let key = cache_name16_for_route(path, 0, route)?;
+    let mut pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if pending
+        .as_ref()
+        .is_some_and(|(stored, _, _, _, provenance)| {
+            *stored == key && provenance.consistent_with(&route)
+        })
+    {
+        pending
+            .take()
+            .map(|(_, width, height, pixels, provenance)| (width, height, pixels, provenance))
+    } else {
+        None
+    }
+}
+
+fn cached_full_frame16(
+    path: &Path,
+    dir: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    if long_side == 0 {
+        return None;
+    }
+    let native_key = cache_name16_for_route(path, 0, route)?;
+    let (width, height, pixels, provenance) =
+        read_cached16_binary(&dir.join(&native_key), &route)?;
+    Some(fit16_keep_native(
+        Some(native_key),
+        width,
+        height,
+        pixels,
+        long_side,
+        provenance,
+    ))
+}
+
+fn decode_frame16(
+    path: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    if let Some(pending) = take_pending_native(path, long_side, route) {
+        return Some(pending);
+    }
+    let native_key = cache_name16_for_route(path, 0, route);
+    let (width, height, pixels, provenance) = crate::raw::decode16_traced(path)?;
+    Some(fit16_keep_native(
+        native_key,
+        width,
+        height,
+        pixels,
+        long_side,
+        provenance,
+    ))
 }
 
 /// Reads one RAW16 entry and rejects it unless its provenance belongs to
@@ -978,6 +1112,84 @@ mod tests {
         assert_eq!(cache_files(&dir).len(), 2);
         enforce_limits(&dir, 10, 15);
         assert_eq!(cache_files(&dir).len(), 1);
+    }
+
+    #[test]
+    fn proxy_decode_feeds_the_first_full_size_request_without_decoding() {
+        let dir = scratch("raw16-pending");
+        let path = source(&dir, b"raw16-pending");
+        let pixels: Vec<u16> = (0..80u32 * 40 * 4)
+            .map(|i| if i % 4 == 3 { 65535 } else { i.wrapping_mul(40503) as u16 })
+            .collect();
+        let expected_proxy = fit16(80, 40, pixels.clone(), 40);
+        let provenance = DecodeProvenance::libraw16();
+        let calls = Cell::new(0);
+        let proxy = get_or_decode16_with(&path, &dir, 40, |_| {
+            calls.set(calls.get() + 1);
+            Some((80, 40, pixels.clone(), provenance))
+        })
+        .expect("proxy decode");
+        assert_eq!((proxy.0, proxy.1, proxy.2.clone()), expected_proxy);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache_files(&dir).len(), 1, "only the proxy is persisted");
+
+        let full = get_or_decode16_with(&path, &dir, 0, |_| {
+            calls.set(calls.get() + 1);
+            None
+        })
+        .expect("full-size request must reuse the cold decode");
+        assert_eq!(calls.get(), 1, "the first 1:1 view must not decode again");
+        assert_eq!((full.0, full.1, full.2), (80, 40, pixels));
+        assert_eq!(full.3, provenance);
+        assert_eq!(cache_files(&dir).len(), 1, "consuming the frame must not write the native cache");
+    }
+
+    #[test]
+    fn cached_full_frame_feeds_a_proxy_without_decoding() {
+        let dir = scratch("raw16-native-fallback");
+        let path = source(&dir, b"raw16-native");
+        let pixels: Vec<u16> = (0..80u32 * 40 * 4)
+            .map(|i| if i % 4 == 3 { 65535 } else { i.wrapping_mul(40503) as u16 })
+            .collect();
+        let provenance = DecodeProvenance::libraw16();
+        let calls = Cell::new(0);
+        let full = get_or_decode16_with(&path, &dir, 0, |_| {
+            calls.set(calls.get() + 1);
+            Some((80, 40, pixels.clone(), provenance))
+        })
+        .expect("native cache decode");
+        assert_eq!((full.0, full.1, full.2.clone()), (80, 40, pixels.clone()));
+        assert_eq!(calls.get(), 1);
+
+        let proxy = get_or_decode16_with(&path, &dir, 40, |_| {
+            calls.set(calls.get() + 1);
+            None
+        })
+        .expect("proxy from the native cache");
+        assert_eq!(calls.get(), 1, "a native cache hit must not decode");
+        assert_eq!((proxy.0, proxy.1, proxy.2), fit16(80, 40, pixels, 40));
+        assert_eq!(proxy.3, provenance);
+    }
+
+    #[test]
+    fn replaced_source_is_not_served_from_the_pending_frame() {
+        let dir = scratch("raw16-pending-stale");
+        let path = source(&dir, b"first");
+        let provenance = DecodeProvenance::libraw16();
+        get_or_decode16_with(&path, &dir, 40, |_| {
+            Some((80, 40, vec![1000; 80 * 40 * 4], provenance))
+        })
+        .expect("proxy decode");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, b"second").unwrap();
+        let calls = Cell::new(0);
+        let full = get_or_decode16_with(&path, &dir, 0, |_| {
+            calls.set(calls.get() + 1);
+            Some((80, 40, vec![50000; 80 * 40 * 4], provenance))
+        })
+        .expect("full decode after replacement");
+        assert_eq!(calls.get(), 1, "a replaced file must not use stale pixels");
+        assert_eq!(full.2[0], 50000);
     }
 
     /// Manual measurement against a real file: set `AURORA_RAW_CACHE_BENCH`.
