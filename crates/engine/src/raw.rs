@@ -962,7 +962,41 @@ impl std::error::Error for BayerError {}
 /// (classic NEF, ARW, CR3).  Nikon HE/HE* returns [`BayerError::Unsupported`];
 /// use [`crate::aurora_raw::decode_he_rgba16`] for those.
 pub fn decode_bayer16(path: &Path) -> Result<BayerFrame, BayerError> {
-    libraw::unpack_bayer(path)
+    decode_bayer16_with(path, libraw::unpack_bayer)
+}
+
+/// Native front-end switch.
+///
+/// `AURORA_USE_LIBRAW=1` forces the DLL path; `AURORA_NO_LIBRAW=1` forbids the
+/// fallback so an unsupported or corrupt container fails loudly instead of
+/// silently depending on the DLL.  With neither set the native decoder runs
+/// first and LibRaw covers what it does not reproduce yet.
+pub(crate) fn decode_bayer16_with(
+    path: &Path,
+    libraw: impl FnOnce(&Path) -> Result<BayerFrame, BayerError>,
+) -> Result<BayerFrame, BayerError> {
+    let forced = std::env::var("AURORA_USE_LIBRAW").is_ok_and(|value| value == "1");
+    let forbidden = std::env::var("AURORA_NO_LIBRAW").is_ok_and(|value| value == "1");
+    if !forced {
+        match crate::aurora_raw::rust_raw::decode(path) {
+            Ok(frame) => {
+                raw_trace!("RAWTRACE native {} {}x{}", path.display(), frame.raw_width, frame.raw_height);
+                return Ok(frame);
+            }
+            Err(error) => {
+                raw_trace!("RAWTRACE native {}: {error}", path.display());
+                if forbidden {
+                    return Err(match error {
+                        crate::aurora_raw::rust_raw::NativeError::Unsupported(_) => {
+                            BayerError::Unsupported
+                        }
+                        other => BayerError::Other(format!("native RAW: {other}")),
+                    });
+                }
+            }
+        }
+    }
+    libraw(path)
 }
 
 /// Whether a sensor decode looks like the same picture as the embedded preview.
@@ -2950,5 +2984,232 @@ mod tests {
             RawKind::Nef
         );
     }
+    /// Real-sample acceptance for the native front-end: every metadata field
+    /// and every sensor sample compared with LibRaw on the same file.
+    /// `AURORA_TEST_RAW=<NEF/ARW/CR2/DNG> cargo test -p aurora-engine --lib
+    ///  native_bayer_matches_libraw -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real RAW file (AURORA_TEST_RAW) and libraw"]
+    fn native_bayer_matches_libraw() {
+        let path = std::env::var("AURORA_TEST_RAW").expect("set AURORA_TEST_RAW");
+        let path = PathBuf::from(path);
+        let native = crate::aurora_raw::rust_raw::decode(&path).expect("native decode");
+        let oracle = libraw::unpack_bayer(&path).expect("LibRaw unpack");
+        eprintln!(
+            "native: {}x{} active {}x{}+{}+{} bits {} filters {:#x} colors {} black {} max {} cam_mul {:?} rgb_cam {:?}",
+            native.raw_width, native.raw_height, native.width, native.height,
+            native.left_margin, native.top_margin, native.bits, native.filters, native.colors,
+            native.black, native.maximum, native.cam_mul, native.rgb_cam
+        );
+        eprintln!(
+            "libraw: {}x{} active {}x{}+{}+{} bits {} filters {:#x} colors {} black {} max {} cam_mul {:?} rgb_cam {:?}",
+            oracle.raw_width, oracle.raw_height, oracle.width, oracle.height,
+            oracle.left_margin, oracle.top_margin, oracle.bits, oracle.filters, oracle.colors,
+            oracle.black, oracle.maximum, oracle.cam_mul, oracle.rgb_cam
+        );
+        assert_eq!(
+            (native.raw_width, native.raw_height, native.width, native.height, native.left_margin, native.top_margin),
+            (oracle.raw_width, oracle.raw_height, oracle.width, oracle.height, oracle.left_margin, oracle.top_margin),
+            "native geometry differs: native {}x{} active {}x{}+{}+{}, libraw {}x{} active {}x{}+{}+{}",
+            native.raw_width,
+            native.raw_height,
+            native.width,
+            native.height,
+            native.left_margin,
+            native.top_margin,
+            oracle.raw_width,
+            oracle.raw_height,
+            oracle.width,
+            oracle.height,
+            oracle.left_margin,
+            oracle.top_margin
+        );
+        assert_eq!(native.bits, oracle.bits, "bit depth");
+        assert_eq!(native.filters, oracle.filters, "CFA filters");
+        assert_eq!(native.colors, oracle.colors, "colour count");
+        assert_eq!(native.black, oracle.black, "black level");
+        assert_eq!(native.maximum, oracle.maximum, "white level");
+        eprintln!(
+            "native cam_mul {:?} rgb_cam {:?}\nlibraw cam_mul {:?} rgb_cam {:?}",
+            native.cam_mul, native.rgb_cam, oracle.cam_mul, oracle.rgb_cam
+        );
+        assert_eq!(native.data.len(), oracle.data.len(), "plane length");
+        let mut mismatches = 0usize;
+        let mut maximum = 0u16;
+        let mut first = None;
+        for (index, (&a, &b)) in native.data.iter().zip(&oracle.data).enumerate() {
+            if a != b {
+                mismatches += 1;
+                maximum = maximum.max(a.abs_diff(b));
+                first.get_or_insert((index / native.raw_width, index % native.raw_width, a, b));
+            }
+        }
+        eprintln!(
+            "{path:?}: {} samples, {mismatches} mismatches, max diff {maximum}, first {first:?}",
+            native.data.len()
+        );
+        assert_eq!(mismatches, 0, "native Bayer differs from LibRaw");
+    }
+
+    /// Batch acceptance over a folder of real camera files.
+    ///
+    /// `AURORA_TEST_RAW_DIR=<folder> cargo test -p aurora-engine --lib
+    ///  native_bayer_matches_libraw_batch -- --ignored --nocapture`
+    ///
+    /// Walks the folder (8 levels), decodes every supported RAW with the native
+    /// front-end and LibRaw, and prints a TSV table. Formats the native side
+    /// intentionally rejects are reported as SKIP, not silently ignored.
+    #[test]
+    #[ignore = "needs a folder of real RAW files (AURORA_TEST_RAW_DIR) and libraw"]
+    fn native_bayer_matches_libraw_batch() {
+        fn collect(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+            if depth > 8 {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, depth + 1, out);
+                } else if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+                    if matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "nef" | "arw" | "cr2" | "cr3" | "dng" | "raf" | "orf" | "rw2"
+                    ) {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+
+        let dir = std::env::var("AURORA_TEST_RAW_DIR").expect("set AURORA_TEST_RAW_DIR");
+        let mut files = Vec::new();
+        collect(Path::new(&dir), 0, &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "no supported RAW files under {dir}");
+
+        println!("file\tdims\tbits\tfilters\tblack\tmax\ttags\tpixel_mismatch\tmax_diff\tresult");
+        let mut checked = 0usize;
+        let mut failed = 0usize;
+        for path in &files {
+            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("?");
+            let native = match crate::aurora_raw::rust_raw::decode(path) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    println!("{name}\t-\t-\t-\t-\t-\t-\t-\t-\tSKIP: {error}");
+                    continue;
+                }
+            };
+            let oracle = match libraw::unpack_bayer(path) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    println!("{name}\t-\t-\t-\t-\t-\t-\t-\t-\tSKIP libraw: {error}");
+                    continue;
+                }
+            };
+            let tags_equal = native.raw_width == oracle.raw_width
+                && native.raw_height == oracle.raw_height
+                && native.width == oracle.width
+                && native.height == oracle.height
+                && native.left_margin == oracle.left_margin
+                && native.top_margin == oracle.top_margin
+                && native.bits == oracle.bits
+                && native.filters == oracle.filters
+                && native.colors == oracle.colors
+                && native.black == oracle.black
+                && native.maximum == oracle.maximum
+                && native.cam_mul == oracle.cam_mul
+                && native.rgb_cam == oracle.rgb_cam;
+            let (mut mismatches, mut maximum) = (0usize, 0u16);
+            if native.data.len() == oracle.data.len() {
+                for (&a, &b) in native.data.iter().zip(&oracle.data) {
+                    if a != b {
+                        mismatches += 1;
+                        maximum = maximum.max(a.abs_diff(b));
+                    }
+                }
+            } else {
+                mismatches = native.data.len().max(oracle.data.len());
+                maximum = u16::MAX;
+            }
+            let ok = tags_equal && mismatches == 0;
+            if !ok {
+                failed += 1;
+                eprintln!(
+                    "  first native {:?}",
+                    &native.data[..16.min(native.data.len())]
+                );
+                eprintln!(
+                    "  first libraw {:?}",
+                    &oracle.data[..16.min(oracle.data.len())]
+                );
+                let mut shown = 0usize;
+                for (index, (&a, &b)) in native.data.iter().zip(&oracle.data).enumerate() {
+                    if a != b {
+                        eprintln!(
+                            "  at {index} ({}, {}): native {a} libraw {b}",
+                            index / native.raw_width,
+                            index % native.raw_width
+                        );
+                        shown += 1;
+                        if shown >= 6 {
+                            break;
+                        }
+                    }
+                }
+            }
+            checked += 1;
+            println!(
+                "{name}\t{}x{}\t{}\t{:#x}\t{}\t{}\t{}\t{mismatches}\t{maximum}\t{}",
+                native.raw_width,
+                native.raw_height,
+                native.bits,
+                native.filters,
+                native.black,
+                native.maximum,
+                if tags_equal { "equal" } else { "DIFF" },
+                if ok { "PASS" } else { "FAIL" }
+            );
+        }
+        eprintln!("{checked}/{} files compared, {failed} failed", files.len());
+        assert_eq!(failed, 0, "native Bayer differs from LibRaw on {failed} file(s)");
+    }
+
+    /// Pixel-only acceptance, useful while metadata fields are still being
+    /// ported. `AURORA_TEST_RAW=<CR3/ARW/...> cargo test ... -- --exact --ignored`
+    #[test]
+    #[ignore = "needs a real RAW file (AURORA_TEST_RAW) and libraw"]
+    fn native_pixels_match_libraw() {
+        let path = std::env::var("AURORA_TEST_RAW").expect("set AURORA_TEST_RAW");
+        let path = PathBuf::from(path);
+        let native = crate::aurora_raw::rust_raw::decode(&path).expect("native decode");
+        let oracle = libraw::unpack_bayer(&path).expect("LibRaw unpack");
+        let mut mismatches = 0usize;
+        let mut maximum = 0u16;
+        let mut first = None;
+        for (index, (&a, &b)) in native.data.iter().zip(&oracle.data).enumerate() {
+            if a != b {
+                mismatches += 1;
+                maximum = maximum.max(a.abs_diff(b));
+                first.get_or_insert((index / native.raw_width, index % native.raw_width, a, b));
+            }
+        }
+        // Samples past the common prefix have no counterpart to match, so each
+        // one is a mismatch; `maximum` stays the largest measured sample diff.
+        mismatches += native.data.len().abs_diff(oracle.data.len());
+        eprintln!(
+            "{path:?}: native {}x{} libraw {}x{}, {} native vs {} libraw samples, {mismatches} mismatches, max diff {maximum}, first {first:?}",
+            native.raw_width,
+            native.raw_height,
+            oracle.raw_width,
+            oracle.raw_height,
+            native.data.len(),
+            oracle.data.len()
+        );
+        assert_eq!(mismatches, 0, "native sensor pixels differ from LibRaw");
+    }
+
 }
 
