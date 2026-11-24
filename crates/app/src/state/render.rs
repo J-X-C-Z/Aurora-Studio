@@ -73,13 +73,35 @@ pub(crate) struct PreparedDisplay {
 fn into_bgra_pixels(img: RgbaImage) -> (u32, u32, Vec<u8>, f64, f64) {
     let width = img.width;
     let height = img.height;
-    let copy_at = std::time::Instant::now();
-    let mut pixels = Arc::try_unwrap(img.pixels).unwrap_or_else(|shared| (*shared).clone());
-    let copy_ms = copy_at.elapsed().as_secs_f64() * 1000.0;
     let convert_at = std::time::Instant::now();
-    pixels.par_chunks_exact_mut(4).for_each(|pixel| pixel.swap(0, 2));
+    let pixels = match Arc::try_unwrap(img.pixels) {
+        Ok(mut pixels) => {
+            // Sole owner (thumbnails): swap in place, no second buffer.
+            pixels.par_chunks_exact_mut(4).for_each(|pixel| pixel.swap(0, 2));
+            pixels
+        }
+        Err(shared) => {
+            // The preview cache keeps its own Arc of the engine's RGBA frame,
+            // so the display needs a private BGRA buffer. Read and write once:
+            // the old path cloned the whole frame and swapped in a second pass.
+            let row = (width as usize * 4).max(4);
+            let mut pixels = vec![0u8; shared.len()];
+            pixels
+                .par_chunks_mut(row)
+                .zip(shared.par_chunks(row))
+                .for_each(|(dst, src)| {
+                    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                        d[0] = s[2];
+                        d[1] = s[1];
+                        d[2] = s[0];
+                        d[3] = s[3];
+                    }
+                });
+            pixels
+        }
+    };
     let convert_ms = convert_at.elapsed().as_secs_f64() * 1000.0;
-    (width, height, pixels, copy_ms, convert_ms)
+    (width, height, pixels, 0.0, convert_ms)
 }
 
 pub(crate) fn to_render_image(img: RgbaImage) -> Arc<RenderImage> {
@@ -335,6 +357,24 @@ mod display_tests {
     }
 
     #[test]
+    fn shared_pixels_convert_in_one_pass_without_touching_the_cache_copy() {
+        let (w, h) = (37u32, 23u32);
+        let rgba: Vec<u8> = (0..(w * h * 4) as usize).map(|i| (i * 37 % 251) as u8).collect();
+        let mut reference = rgba.clone();
+        for pixel in reference.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+
+        let shared = Arc::new(rgba.clone());
+        let source = RgbaImage::from_shared(w, h, Arc::clone(&shared));
+        let (cw, ch, converted, copy_ms, _) = into_bgra_pixels(source);
+        assert_eq!((cw, ch), (w, h));
+        assert_eq!(converted, reference);
+        assert_eq!(copy_ms, 0.0, "no separate clone pass remains");
+        assert_eq!(shared.as_slice(), rgba.as_slice(), "the cache keeps RGBA");
+    }
+
+    #[test]
     fn identical_engine_pixels_reuse_the_prepared_display_image() {
         let pixels = Arc::new(vec![1u8, 2, 3, 255, 4, 5, 6, 255]);
         let source = RgbaImage::from_shared(2, 1, Arc::clone(&pixels));
@@ -458,6 +498,41 @@ mod display_tests {
             serial[1],
             parallel[1],
             serial[1] / parallel[1].max(f64::EPSILON),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiles 24MP clone-then-swap vs fused BGRA conversion"]
+    fn bench_fused_bgra_conversion_24mp() {
+        let (w, h) = (6000u32, 4000u32);
+        let template: Arc<Vec<u8>> = Arc::new(
+            (0..(w * h * 4) as usize).map(|i| (i * 37 % 251) as u8).collect(),
+        );
+        let old = || {
+            let start = std::time::Instant::now();
+            let mut pixels = (*template).clone();
+            pixels.par_chunks_exact_mut(4).for_each(|pixel| pixel.swap(0, 2));
+            std::hint::black_box(pixels);
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let new = || {
+            let source = RgbaImage::from_shared(w, h, Arc::clone(&template));
+            let start = std::time::Instant::now();
+            std::hint::black_box(into_bgra_pixels(source));
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let (mut old_ms, mut new_ms) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            old_ms.push(old());
+            new_ms.push(new());
+        }
+        old_ms.sort_by(f64::total_cmp);
+        new_ms.sort_by(f64::total_cmp);
+        println!(
+            "24MP BGRA: clone+swap={:.1} ms fused={:.1} ms ({:.2}x)",
+            old_ms[1],
+            new_ms[1],
+            old_ms[1] / new_ms[1].max(f64::EPSILON),
         );
     }
 
