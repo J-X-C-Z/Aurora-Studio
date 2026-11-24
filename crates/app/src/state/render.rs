@@ -82,9 +82,52 @@ fn prepare_display_image(
     (to_render_image(image), source_pixels, false)
 }
 
+fn full_frame_action(previous: Option<(ImageId, NormRect)>, image: ImageId, region: NormRect) -> (bool, bool) {
+    let retain = region != NormRect::FULL && previous == Some((image, NormRect::FULL));
+    (region == NormRect::FULL || retain, retain)
+}
+
+fn display_frame(slot: &mut Option<Frame>, full: &mut Option<Frame>, next: Frame, cx: &mut gpui_kit::App) {
+    let (clear_full, keep_previous) = full_frame_action(
+        slot.as_ref().map(|frame| (frame.image_id, frame.region)), next.image_id, next.region,
+    );
+    let next_image = Arc::clone(&next.image);
+    if clear_full {
+        if let Some(old) = full.take() {
+            if Arc::ptr_eq(&old.image, &next_image) || slot.as_ref().is_some_and(|frame| Arc::ptr_eq(&old.image, &frame.image)) {
+                old.release_reusing_image(cx);
+            } else {
+                old.release(cx);
+            }
+        }
+    }
+    if let Some(mut old) = slot.replace(next) {
+        if keep_previous {
+            for overlay in [old.warning.take(), old.focus.take()].into_iter().flatten() {
+                cx.drop_image(overlay, None);
+            }
+            *full = Some(old);
+        } else if Arc::ptr_eq(&old.image, &next_image) || full.as_ref().is_some_and(|frame| Arc::ptr_eq(&old.image, &frame.image)) {
+            old.release_reusing_image(cx);
+        } else {
+            old.release(cx);
+        }
+    }
+}
+
 #[cfg(test)]
 mod display_tests {
     use super::*;
+
+    #[test]
+    fn retains_only_full_frames_of_the_same_image_across_pan_updates() {
+        let full = NormRect::FULL;
+        let tile = NormRect { x: 0.5, y: 0.25, width: 0.5, height: 0.5 };
+        assert_eq!(full_frame_action(Some((ImageId(1), full)), ImageId(1), tile), (true, true));
+        assert_eq!(full_frame_action(Some((ImageId(1), tile)), ImageId(1), tile), (false, false));
+        assert_eq!(full_frame_action(Some((ImageId(1), full)), ImageId(2), tile), (false, false));
+        assert_eq!(full_frame_action(Some((ImageId(1), tile)), ImageId(1), full), (true, false));
+    }
 
     fn serial_overlays(
         img: &RgbaImage,
@@ -503,9 +546,15 @@ impl AppState {
         let Some(request) = self.preview_request(quality, false) else { return };
         let stamp = crate::perf::Stamp::new(request.generation, quality, requested_at);
         let requested_image = request.image;
-        let before = (self.view.compare != super::CompareMode::Off && (self.preview.before_dirty || self.preview.before.is_none()))
+        let before = (self.view.compare != super::CompareMode::Off && (self.preview.before_dirty
+            || self.preview.before.as_ref().is_none_or(|frame| frame.image_id != request.image
+                || frame.geometry != request.adjustments.geometry || frame.region != request.region)))
             .then(|| self.preview_request(RenderQuality::Final, true))
             .flatten();
+        if before.is_some() {
+            self.preview.before_dirty = false;
+        }
+        let geometry = request.adjustments.geometry.clone();
         self.preview.in_flight = true;
         self.preview.rendering = true;
         let engine = self.engine.clone();
@@ -520,10 +569,11 @@ impl AppState {
             (frame.source_pixels, Arc::clone(&frame.image), frame.image_id)
         });
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let after_engine = engine.clone();
+            let frame = cx
                 .background_spawn(async move {
                     let started_at = std::time::Instant::now();
-                    let frame = engine.render_preview(&request).map(|f| {
+                    after_engine.render_preview(&request).map(|f| {
                         let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
                         let (width, height) = (image.width, image.height);
                         let prepared_at = std::time::Instant::now();
@@ -542,22 +592,10 @@ impl AppState {
                             previous.as_ref().map(|(key, image, _)| (*key, image)),
                         );
                         (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, request.region, request.image)
-                    });
-                    let before = before.map(|b| {
-                        engine.render_preview(&b).map(|f| {
-                            let (img, source_pixels, reused) = prepare_display_image(
-                                f.image,
-                                previous_before.as_ref().map(|(key, image, _)| (*key, image)),
-                            );
-                            (img, source_pixels, reused, b.region, b.image)
-                        })
-                    });
-                    (frame, before)
+                    })
                 })
                 .await;
-            this.update(cx, |this, cx| {
-                this.preview.in_flight = false;
-                let (frame, before) = result;
+            let Ok(render_before) = this.update(cx, |this, cx| {
                 match frame {
                     Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id)) => {
                         let stale = this.preview.frame.as_ref().is_some_and(|old| old.image_id == image_id && old.stamp.id > stamp.id);
@@ -575,23 +613,17 @@ impl AppState {
                                 };
                                 (image_id, summary.into())
                             });
-                            let old = this.preview.frame.replace(Frame {
+                            display_frame(&mut this.preview.frame, &mut this.preview.full_after, Frame {
                                 image: img,
                                 source_pixels,
                                 region,
+                                geometry: geometry.clone(),
                                 image_id,
                                 warning,
                                 focus,
                                 degraded: degraded.map(SharedString::from),
                                 stamp,
-                            });
-                            if let Some(old) = old {
-                                if reused {
-                                    old.release_reusing_image(cx);
-                                } else {
-                                    old.release(cx);
-                                }
-                            }
+                            }, cx);
                             log::debug!("preview: {}×{} in {:.1} ms", width, height, elapsed_ms);
                             this.preview.histogram = histogram;
                             this.preview.elapsed_ms = elapsed_ms;
@@ -606,40 +638,56 @@ impl AppState {
                     }
                     Err(err) => {
                         log::error!("preview: render failed: {err}");
-                        this.preview.error = Some((requested_image, err.to_string().into()));
+                        if this.current == Some(requested_image) {
+                            this.preview.error = Some((requested_image, err.to_string().into()));
+                        }
                     }
                 }
-                if let Some(Ok((img, source_pixels, reused, region, image_id))) = before {
-                    if this.current != Some(image_id) {
-                        if !reused {
-                            cx.drop_image(img, None);
-                        }
-                    } else {
-                        this.preview.before_dirty = false;
-                        let old = this.preview.before.replace(Frame {
+                let render_before = before.is_some() && this.current == Some(requested_image)
+                    && this.view.compare != super::CompareMode::Off;
+                if render_before {
+                    cx.notify();
+                }
+                render_before
+            }) else { return };
+            let before = if let Some(request) = before.filter(|_| render_before) {
+                Some(cx.background_spawn(async move {
+                    engine.render_preview(&request).map(|frame| {
+                        let (img, source_pixels, reused) = prepare_display_image(
+                            frame.image, previous_before.as_ref().map(|(key, image, _)| (*key, image)),
+                        );
+                        (img, source_pixels, reused, request.region, request.image)
+                    })
+                }).await)
+            } else {
+                None
+            };
+            this.update(cx, |this, cx| {
+                match before {
+                    Some(Ok((img, source_pixels, _, region, image_id))) if this.current == Some(image_id) => {
+                        display_frame(&mut this.preview.before, &mut this.preview.full_before, Frame {
                             image: img,
                             source_pixels,
                             region,
+                            geometry,
                             image_id,
                             warning: None,
                             focus: None,
                             degraded: None,
                             stamp,
-                        });
-                        if let Some(old) = old {
-                            if reused {
-                                old.release_reusing_image(cx);
-                            } else {
-                                old.release(cx);
-                            }
-                        }
+                        }, cx);
                     }
+                    Some(Ok((img, _, false, _, _))) => cx.drop_image(img, None),
+                    Some(Err(_)) if this.current == Some(requested_image) => this.preview.before_dirty = true,
+                    _ => {}
                 }
                 crate::note_first_preview_ready();
+                this.preview.in_flight = false;
                 if let Some((next, requested_at)) = this.preview.pending.take() {
                     this.enqueue_render(next, requested_at, cx);
                 } else {
                     this.preview.rendering = false;
+                    this.start_queued_thumbs(cx);
                 }
                 cx.notify();
             })
@@ -650,7 +698,11 @@ impl AppState {
 
     pub fn queue_thumbs(&mut self, ids: Vec<ImageId>, cx: &mut Context<Self>) {
         self.thumb_queue.push(ids, self.current);
-        if self.thumb_task.is_some() {
+        self.start_queued_thumbs(cx);
+    }
+
+    fn start_queued_thumbs(&mut self, cx: &mut Context<Self>) {
+        if self.thumb_task.is_some() || self.preview.in_flight || self.thumb_queue.is_empty() {
             return;
         }
         let rev = self.thumb_rev;
@@ -658,7 +710,7 @@ impl AppState {
             loop {
                 let next = this
                     .update(cx, |this, _| {
-                        if this.thumb_rev != rev {
+                        if this.thumb_rev != rev || this.preview.in_flight {
                             return None;
                         }
                         if this.thumb_queue.is_empty() {
@@ -700,9 +752,10 @@ impl AppState {
                 })
                 .ok();
             }
-            this.update(cx, |this, _| {
+            this.update(cx, |this, cx| {
                 if this.thumb_rev == rev {
                     this.thumb_task = None;
+                    this.start_queued_thumbs(cx);
                 }
             })
             .ok();

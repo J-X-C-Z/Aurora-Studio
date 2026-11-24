@@ -52,6 +52,10 @@ impl Placement {
     }
 }
 
+fn backing_matches_tile(base: (ImageId, &Geometry), tile: (ImageId, &Geometry, NormRect)) -> bool {
+    (tile.0, tile.1) == base && tile.2 != NormRect::FULL
+}
+
 /// Pick a pixel from the rendered BGRA tile, using its own frame region.
 fn pick_rendered_color(bytes: &[u8], size: (usize, usize), region: NormRect, point: [f32; 2]) -> Option<[f32; 3]> {
     let (w, h) = size;
@@ -71,6 +75,18 @@ fn pick_rendered_color(bytes: &[u8], size: (usize, usize), region: NormRect, poi
 #[cfg(test)]
 mod color_pick_tests {
     use super::*;
+
+    #[test]
+    fn pan_backing_never_uses_another_image_or_crop() {
+        let geometry = Geometry::default();
+        let tile = NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        let cropped = Geometry { crop: tile, ..geometry.clone() };
+        let base = (ImageId(1), &geometry);
+        assert!(backing_matches_tile(base, (ImageId(1), &geometry, tile)));
+        assert!(!backing_matches_tile(base, (ImageId(1), &cropped, tile)));
+        assert!(!backing_matches_tile(base, (ImageId(2), &geometry, tile)));
+        assert!(!backing_matches_tile(base, (ImageId(1), &geometry, NormRect::FULL)));
+    }
 
     #[test]
     fn samples_bgra_pixels_in_the_rendered_subregion() {
@@ -691,6 +707,16 @@ impl Render for Viewer {
         let after = s.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.current).map(frame_el);
         let before = s.preview.before.as_ref().filter(|f| Some(f.image_id) == s.current).map(frame_el);
         let (rl, rt, rw, rh) = pl.frame_rect();
+        let backing = |frame: &crate::state::Frame| {
+            div().absolute().left(px(rl)).top(px(rt)).w(px(rw)).h(px(rh))
+                .child(img(frame.image.clone()).absolute().size_full().object_fit(ObjectFit::Fill))
+        };
+        let matching_backing = |base: &&crate::state::Frame, current: Option<&crate::state::Frame>| {
+            current.is_some_and(|tile| Some(tile.image_id) == s.current
+                && backing_matches_tile((base.image_id, &base.geometry), (tile.image_id, &tile.geometry, tile.region)))
+        };
+        let after_backing = s.preview.full_after.as_ref().filter(|base| matching_backing(base, s.preview.frame.as_ref())).map(backing);
+        let before_backing = s.preview.full_before.as_ref().filter(|base| matching_backing(base, s.preview.before.as_ref())).map(backing);
         let info = s.current_info().cloned();
         let cursor = s.cursor;
         let show_info = s.view.show_info_overlay && !s.presenting();
@@ -760,13 +786,14 @@ impl Render for Viewer {
                             // Drop shadow under the image.
                             div().absolute().left(px(rl)).top(px(rt)).w(px(rw)).h(px(rh)).shadow_lg(),
                         )
+                        .when_some(after_backing, |this, image| this.child(image))
                         .when_some(after, |this, a| {
                             this.child(motion::enter(SharedString::from(format!("viewer-img-{image_key}")), div().absolute().size_full().child(a), 0.0))
                         })
                         .when(compare == CompareMode::Split, |this| {
-                            this.when_some(before, |this, b| {
-                                this.child(div().absolute().top_0().left_0().bottom_0().w(px(split * pl.vw)).overflow_hidden().child(b))
-                            })
+                            this.child(div().absolute().top_0().left_0().bottom_0().w(px(split * pl.vw)).overflow_hidden()
+                                .when_some(before_backing, |layer, image| layer.child(image))
+                                .when_some(before, |layer, image| layer.child(image)))
                             .child(div().absolute().top_0().bottom_0().left(px(split * pl.vw - 1.0)).w(px(2.0)).bg(hexa(0xffffff, 0.85)))
                             .child(
                                 div()
