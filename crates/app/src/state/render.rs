@@ -55,31 +55,65 @@ impl ThumbQueue {
     }
 }
 
-fn into_bgra_pixels(img: RgbaImage) -> (u32, u32, Vec<u8>) {
+/// The display-side conversion of one engine frame, with its cost split.
+pub(crate) struct PreparedDisplay {
+    pub image: Arc<RenderImage>,
+    /// Identity of the engine RGBA buffer used to build `image`.
+    pub source_pixels: usize,
+    /// The previous display image already matched these pixels.
+    pub reused: bool,
+    /// Time materialising a private pixel buffer (the cache keeps its Arc).
+    pub copy_ms: f64,
+    /// Time swapping R/B for GPUI's BGRA contract.
+    pub convert_ms: f64,
+    /// Time building the `RenderImage` around the pixels.
+    pub create_ms: f64,
+}
+
+fn into_bgra_pixels(img: RgbaImage) -> (u32, u32, Vec<u8>, f64, f64) {
     let width = img.width;
     let height = img.height;
+    let copy_at = std::time::Instant::now();
     let mut pixels = Arc::try_unwrap(img.pixels).unwrap_or_else(|shared| (*shared).clone());
+    let copy_ms = copy_at.elapsed().as_secs_f64() * 1000.0;
+    let convert_at = std::time::Instant::now();
     pixels.par_chunks_exact_mut(4).for_each(|pixel| pixel.swap(0, 2));
-    (width, height, pixels)
+    let convert_ms = convert_at.elapsed().as_secs_f64() * 1000.0;
+    (width, height, pixels, copy_ms, convert_ms)
 }
 
 pub(crate) fn to_render_image(img: RgbaImage) -> Arc<RenderImage> {
-    let (width, height, pixels) = into_bgra_pixels(img);
+    to_render_image_timed(img).0
+}
+
+fn to_render_image_timed(img: RgbaImage) -> (Arc<RenderImage>, f64, f64, f64) {
+    let (width, height, pixels, copy_ms, convert_ms) = into_bgra_pixels(img);
+    let create_at = std::time::Instant::now();
     let buffer = image::RgbaImage::from_raw(width, height, pixels).expect("engine returned a buffer of the wrong size");
-    Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+    let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+    let create_ms = create_at.elapsed().as_secs_f64() * 1000.0;
+    (image, copy_ms, convert_ms, create_ms)
 }
 
 fn prepare_display_image(
     image: RgbaImage,
     previous: Option<(usize, &Arc<RenderImage>)>,
-) -> (Arc<RenderImage>, usize, bool) {
+) -> PreparedDisplay {
     let source_pixels = Arc::as_ptr(&image.pixels) as usize;
     if let Some((key, prepared)) = previous {
         if key == source_pixels {
-            return (Arc::clone(prepared), source_pixels, true);
+            return PreparedDisplay {
+                image: Arc::clone(prepared),
+                source_pixels,
+                reused: true,
+                copy_ms: 0.0,
+                convert_ms: 0.0,
+                create_ms: 0.0,
+            };
         }
     }
-    (to_render_image(image), source_pixels, false)
+    let (image, copy_ms, convert_ms, create_ms) = to_render_image_timed(image);
+    PreparedDisplay { image, source_pixels, reused: false, copy_ms, convert_ms, create_ms }
 }
 
 fn full_frame_action(previous: Option<(ImageId, NormRect)>, image: ImageId, region: NormRect) -> (bool, bool) {
@@ -169,13 +203,13 @@ mod display_tests {
     #[test]
     fn bgra_conversion_swaps_only_red_and_blue() {
         let image = RgbaImage::new(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let (w, h, pixels) = into_bgra_pixels(image);
+        let (w, h, pixels, _, _) = into_bgra_pixels(image);
         assert_eq!((w, h), (2, 1));
         assert_eq!(pixels, vec![3, 2, 1, 4, 7, 6, 5, 8]);
 
         let shared = Arc::new(vec![9, 8, 7, 6, 5, 4, 3, 2]);
         let source = RgbaImage::from_shared(2, 1, shared.clone());
-        let (_, _, converted) = into_bgra_pixels(source);
+        let (_, _, converted, _, _) = into_bgra_pixels(source);
         assert_eq!(converted, vec![7, 8, 9, 6, 3, 4, 5, 2]);
         assert_eq!(shared.as_slice(), &[9, 8, 7, 6, 5, 4, 3, 2]);
     }
@@ -188,16 +222,15 @@ mod display_tests {
         let prepared = to_render_image(source);
 
         let same = RgbaImage::from_shared(2, 1, Arc::clone(&pixels));
-        let (reused, key, hit) =
-            prepare_display_image(same, Some((source_key, &prepared)));
-        assert!(hit);
-        assert_eq!(key, source_key);
-        assert!(Arc::ptr_eq(&prepared, &reused));
+        let display = prepare_display_image(same, Some((source_key, &prepared)));
+        assert!(display.reused);
+        assert_eq!(display.source_pixels, source_key);
+        assert!(Arc::ptr_eq(&prepared, &display.image));
 
         let distinct = RgbaImage::new(2, 1, pixels.as_ref().clone());
-        let (_, key, hit) = prepare_display_image(distinct, Some((source_key, &prepared)));
-        assert!(!hit);
-        assert_ne!(key, source_key);
+        let display = prepare_display_image(distinct, Some((source_key, &prepared)));
+        assert!(!display.reused);
+        assert_ne!(display.source_pixels, source_key);
     }
 
     #[test]
@@ -573,24 +606,54 @@ impl AppState {
             let frame = cx
                 .background_spawn(async move {
                     let started_at = std::time::Instant::now();
+                    let ram_before = crate::perf::enabled()
+                        .then(crate::perf::working_set_bytes)
+                        .flatten();
                     after_engine.render_preview(&request).map(|f| {
+                        let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                         let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
                         let (width, height) = (image.width, image.height);
-                        let prepared_at = std::time::Instant::now();
-                        let (overlays, scope) = rayon::join(
-                            || analysis(&image, want_warning, want_focus),
-                            || super::scopes::render(&image, want_scope),
+                        let analysis_at = std::time::Instant::now();
+                        let ((overlays, overlay_ms), (scope, scope_ms)) = rayon::join(
+                            || {
+                                let at = std::time::Instant::now();
+                                (analysis(&image, want_warning, want_focus), at.elapsed().as_secs_f64() * 1000.0)
+                            },
+                            || {
+                                let at = std::time::Instant::now();
+                                (super::scopes::render(&image, want_scope), at.elapsed().as_secs_f64() * 1000.0)
+                            },
                         );
-                        if crate::perf::enabled() { crate::perf::record(serde_json::json!({
-                            "event": "prepared", "id": stamp.id, "quality": format!("{:?}", quality),
-                            "queue_ms": started_at.duration_since(requested_at).as_secs_f64() * 1000.0,
-                            "engine_ms": elapsed_ms, "prepare_ms": prepared_at.elapsed().as_secs_f64() * 1000.0,
-                            "width": image.width, "height": image.height,
-                        })); }
-                        let (img, source_pixels, reused) = prepare_display_image(
+                        let analysis_ms = analysis_at.elapsed().as_secs_f64() * 1000.0;
+                        let display = prepare_display_image(
                             image,
                             previous.as_ref().map(|(key, image, _)| (*key, image)),
                         );
+                        if crate::perf::enabled() {
+                            crate::perf::record_prepared(crate::perf::PreparedTiming {
+                                id: stamp.id,
+                                image_id: request.image.0,
+                                quality: format!("{quality:?}"),
+                                width,
+                                height,
+                                display_reused: display.reused,
+                                queue_ms: started_at.duration_since(requested_at).as_secs_f64() * 1000.0,
+                                engine_ms: elapsed_ms as f64,
+                                engine_wall_ms,
+                                analysis_ms,
+                                overlay_ms,
+                                scope_ms,
+                                display_copy_ms: display.copy_ms,
+                                display_channel_convert_ms: display.convert_ms,
+                                render_image_create_ms: display.create_ms,
+                                prepare_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                                total_frame_ms: requested_at.elapsed().as_secs_f64() * 1000.0,
+                                ram_before_bytes: ram_before,
+                                ram_after_bytes: crate::perf::working_set_bytes(),
+                                peak_ram_bytes: crate::perf::peak_working_set_bytes(),
+                            });
+                        }
+                        let PreparedDisplay { image: img, source_pixels, reused, .. } = display;
                         (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, request.region, request.image)
                     })
                 })
@@ -653,10 +716,10 @@ impl AppState {
             let before = if let Some(request) = before.filter(|_| render_before) {
                 Some(cx.background_spawn(async move {
                     engine.render_preview(&request).map(|frame| {
-                        let (img, source_pixels, reused) = prepare_display_image(
+                        let display = prepare_display_image(
                             frame.image, previous_before.as_ref().map(|(key, image, _)| (*key, image)),
                         );
-                        (img, source_pixels, reused, request.region, request.image)
+                        (display.image, display.source_pixels, display.reused, request.region, request.image)
                     })
                 }).await)
             } else {
