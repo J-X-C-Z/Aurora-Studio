@@ -4,12 +4,13 @@
 //! before an engine exists. This one reads an actual folder: it scans it,
 //! reads EXIF, keeps ratings and keywords, and writes adjustments back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rayon::prelude::*;
 
 use crate::adjust::{AdjustmentSet, Curves, Geometry, Levels, NoiseReduction, Sharpening, WhiteBalance, WhiteBalanceMode};
@@ -27,10 +28,165 @@ mod library_ops;
 
 /// Longest side kept for a decoded source; larger files are downscaled.
 const SOURCE_LONG_SIDE: u32 = 4096;
-/// How many decoded sources stay in memory at once.
-const CACHED_SOURCES: usize = 8;
+/// Bounds for the decoded-source working set. A source is charged for every
+/// mip level it really owns, so one 4096-long-side RAW is ~170 MiB while a
+/// thumbnail-sized JPEG is ~1 MiB. The default budget is derived from this
+/// machine's memory at engine start, never from a fixed image count.
+const SOURCE_CACHE_MIN_BYTES: usize = 256 * 1024 * 1024;
+const SOURCE_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Used only when the platform cannot report memory and no env override is set.
+const SOURCE_CACHE_FALLBACK_BYTES: usize = 768 * 1024 * 1024;
+/// One admission unit for a decode. A request reserves as many units as its
+/// estimated working set needs, so large frames reduce concurrency while small
+/// JPEGs still run several at a time.
+const DECODE_UNIT_BYTES: usize = 256 * 1024 * 1024;
+/// Interactive sources kept pinned around the current image (current plus the
+/// two most recently visited neighbours). Pins survive byte-budget eviction.
+const RECENT_SOURCE_PINS: usize = 3;
 /// Folder collection ids start here; the index into `folder_dirs()` is added.
 const FOLDER_BASE: u64 = 1000;
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.trim().parse::<usize>().ok()
+}
+
+/// Total and currently available physical memory, in bytes.
+#[cfg(windows)]
+fn system_memory_bytes() -> Option<(u64, u64)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, ..Default::default() };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0 && status.total_phys > 0).then_some((status.total_phys, status.avail_phys))
+}
+
+/// Linux fallback so the engine still derives a budget off Windows.
+#[cfg(not(windows))]
+fn system_memory_bytes() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+    };
+    Some((field("MemTotal:")?, field("MemAvailable:")?))
+}
+
+/// Source-cache budget in bytes. Env overrides:
+/// `AURORA_SOURCE_CACHE_BYTES` (exact), `AURORA_SOURCE_CACHE_MB` (MiB).
+fn default_source_cache_bytes() -> usize {
+    if let Some(bytes) = env_usize("AURORA_SOURCE_CACHE_BYTES") {
+        return bytes.max(64 * 1024 * 1024);
+    }
+    if let Some(mib) = env_usize("AURORA_SOURCE_CACHE_MB") {
+        return mib.saturating_mul(1024 * 1024).max(64 * 1024 * 1024);
+    }
+    system_memory_bytes().map_or(SOURCE_CACHE_FALLBACK_BYTES, |(total, available)| {
+        source_cache_budget_from_memory(total, available)
+    })
+}
+
+/// ~8.3% of installed RAM, and never more than half of what is free:
+/// 16 GiB → ~1.33 GiB, 32 GiB → ~2.67 GiB. The installed size keeps the budget
+/// predictable; the available-memory term only shrinks it under real pressure.
+fn source_cache_budget_from_memory(total: u64, available: u64) -> usize {
+    let bytes = (total / 12).min(available / 2);
+    usize::try_from(bytes)
+        .map(|bytes| bytes.clamp(SOURCE_CACHE_MIN_BYTES, SOURCE_CACHE_MAX_BYTES))
+        .unwrap_or(SOURCE_CACHE_FALLBACK_BYTES)
+}
+
+fn recent_source_pins() -> usize {
+    env_usize("AURORA_SOURCE_CACHE_RECENT_PINS").unwrap_or(RECENT_SOURCE_PINS).min(8)
+}
+
+/// Bytes a decoded source really owns: every mip level's allocated capacity.
+fn source_cache_bytes(source: &Source) -> usize {
+    source.levels.iter().fold(0usize, |total, plane| {
+        total.saturating_add(plane.data.capacity().saturating_mul(std::mem::size_of::<[f32; 3]>()))
+    })
+}
+
+/// Rough working set of one decode: the retained mip pyramid plus the decoder's
+/// transient frame. Used only for admission control, not for cache accounting.
+fn estimated_decode_bytes(width: u32, height: u32, native: bool) -> usize {
+    let (w, h) = if native { (width, height) } else { fit_long_side((width, height)) };
+    let px = (w as usize).saturating_mul(h as usize);
+    let retained = px.saturating_mul(std::mem::size_of::<[f32; 3]>()).saturating_mul(4) / 3;
+    let transient = px.saturating_mul(if native { 10 } else { 6 });
+    retained.saturating_add(transient)
+}
+
+/// Admission units one decode reserves: its estimated working set in 256 MiB
+/// units, never more than the gate can grant.
+fn decode_units(total_units: usize, bytes: usize) -> usize {
+    bytes.div_ceil(DECODE_UNIT_BYTES).clamp(1, total_units.max(1))
+}
+
+/// Evicts oldest unpinned sources (and the native slot) until the byte budget
+/// holds. `protect` is the source that was just requested.
+fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
+    while st.source_cache.current_bytes > st.source_cache.max_bytes {
+        let victim = {
+            let cache = &st.source_cache;
+            let mut best: Option<(u64, bool, ImageId)> = None;
+            for (id, entry) in st.sources.iter() {
+                if Some(*id) == protect || cache.is_pinned(*id) || Arc::strong_count(&entry.source) > 1 {
+                    continue;
+                }
+                if best.is_none_or(|(last, _, _)| entry.last_used < last) {
+                    best = Some((entry.last_used, false, *id));
+                }
+            }
+            if let Some(slot) = &st.native_raw {
+                if slot.bytes > 0
+                    && Some(slot.image) != protect
+                    && !cache.is_pinned(slot.image)
+                    && slot.source.as_ref().is_none_or(|source| Arc::strong_count(source) <= 1)
+                    && best.is_none_or(|(last, _, _)| slot.last_used < last)
+                {
+                    best = Some((slot.last_used, true, slot.image));
+                }
+            }
+            best
+        };
+        let Some((_, is_native, image)) = victim else {
+            log::debug!("source cache over budget with nothing evictable: {} bytes", st.source_cache.current_bytes);
+            break;
+        };
+        if is_native {
+            if let Some(slot) = st.native_raw.take() {
+                st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(slot.bytes);
+                st.source_cache.evictions += 1;
+                log::debug!("evicted native RAW {image:?}: {} bytes", slot.bytes);
+            }
+        } else if let Some(removed) = st.sources.remove(&image) {
+            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(removed.bytes);
+            st.source_cache.evictions += 1;
+            st.ai_inputs.remove(&image);
+            log::debug!("evicted source {image:?}: {} bytes", removed.bytes);
+        } else {
+            break;
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ScannedFile {
@@ -748,15 +904,338 @@ struct AiInput {
     height: u32,
 }
 
+/// One decoded image in the source cache, charged by its real mip bytes.
+struct CachedSource {
+    source: Arc<Source>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// At most one full-size RAW; a `None` source remembers a failure for that image.
+struct NativeRawSlot {
+    image: ImageId,
+    source: Option<Arc<Source>>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Byte-budgeted LRU for decoded sources. `native_raw` shares the same bytes.
+struct SourceCacheBudget {
+    max_bytes: usize,
+    current_bytes: usize,
+    peak_bytes: usize,
+    hits: u64,
+    native_hits: u64,
+    misses: u64,
+    evictions: u64,
+    single_flight_waits: u64,
+    recent_pins: usize,
+    /// Explicit pins, e.g. images an export is still reading.
+    pins: HashMap<ImageId, u32>,
+    /// Current image and its recently visited neighbours: implicit pins.
+    recent: VecDeque<ImageId>,
+    tick: u64,
+}
+
+impl SourceCacheBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            current_bytes: 0,
+            peak_bytes: 0,
+            hits: 0,
+            native_hits: 0,
+            misses: 0,
+            evictions: 0,
+            single_flight_waits: 0,
+            recent_pins: recent_source_pins(),
+            pins: HashMap::new(),
+            recent: VecDeque::new(),
+            tick: 0,
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    fn note_use(&mut self, image: ImageId) {
+        if self.recent_pins == 0 {
+            return;
+        }
+        self.recent.retain(|id| *id != image);
+        self.recent.push_front(image);
+        while self.recent.len() > self.recent_pins {
+            self.recent.pop_back();
+        }
+    }
+
+    fn is_pinned(&self, image: ImageId) -> bool {
+        self.pins.get(&image).is_some_and(|count| *count > 0) || self.recent.contains(&image)
+    }
+}
+
+/// Snapshot of the decoded-source cache for the performance log and for the
+/// unified memory budget in S7.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceCacheStats {
+    pub max_bytes: usize,
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+    pub cached_sources: usize,
+    pub pinned_sources: usize,
+    pub native_bytes: usize,
+    pub hits: u64,
+    pub native_hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub single_flight_waits: u64,
+    pub decode_waits: u64,
+    pub decode_wait_ms: u64,
+    pub decode_peak_concurrency: usize,
+    pub heavy_units: usize,
+    pub light_units: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DecodePriority {
+    /// The visible preview, 1:1 zoom, sampling and export.
+    Interactive = 0,
+    /// Grid and filmstrip thumbnails: never ahead of the visible frame.
+    Thumbnail = 1,
+}
+
+struct GateWaiter {
+    ticket: u64,
+    priority: DecodePriority,
+    units: usize,
+    granted: bool,
+}
+
+struct GateInner {
+    total_units: usize,
+    free_units: usize,
+    next_ticket: u64,
+    waiters: Vec<GateWaiter>,
+    active: usize,
+    peak_active: usize,
+}
+
+/// A priority-aware counting semaphore. A decode reserves units proportional to
+/// its estimated working set; callers with `Interactive` priority are admitted
+/// before thumbnails, and large RAW frames simply take more units.
+struct DecodeGate {
+    inner: Mutex<GateInner>,
+    released: Condvar,
+    waits: AtomicU64,
+    wait_nanos: AtomicU64,
+}
+
+struct GatePermit<'a> {
+    gate: &'a DecodeGate,
+    units: usize,
+}
+
+/// Grants every waiter that fits, highest priority first, then oldest ticket.
+fn dispatch_gate(inner: &mut GateInner) -> bool {
+    let mut granted = false;
+    loop {
+        let Some(index) = inner
+            .waiters
+            .iter()
+            .enumerate()
+            .filter(|(_, waiter)| !waiter.granted && waiter.units <= inner.free_units)
+            .min_by_key(|(_, waiter)| (waiter.priority, waiter.ticket))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let units = inner.waiters[index].units;
+        inner.waiters[index].granted = true;
+        inner.free_units -= units;
+        inner.active += 1;
+        inner.peak_active = inner.peak_active.max(inner.active);
+        granted = true;
+    }
+    granted
+}
+
+impl DecodeGate {
+    fn new(total_units: usize) -> Self {
+        let total_units = total_units.max(1);
+        Self {
+            inner: Mutex::new(GateInner {
+                total_units,
+                free_units: total_units,
+                next_ticket: 0,
+                waiters: Vec::new(),
+                active: 0,
+                peak_active: 0,
+            }),
+            released: Condvar::new(),
+            waits: AtomicU64::new(0),
+            wait_nanos: AtomicU64::new(0),
+        }
+    }
+
+    fn total_units(&self) -> usize {
+        self.inner.lock().total_units
+    }
+
+    /// Retunes admission when the RAM budget changes. Queued requests are
+    /// clamped to the new total so none can wait for units that no longer exist.
+    fn set_total_units(&self, total_units: usize) {
+        let total_units = total_units.max(1);
+        let mut inner = self.inner.lock();
+        inner.free_units = inner
+            .free_units
+            .saturating_add(total_units)
+            .saturating_sub(inner.total_units)
+            .min(total_units);
+        inner.total_units = total_units;
+        for waiter in &mut inner.waiters {
+            waiter.units = waiter.units.min(total_units);
+        }
+        if dispatch_gate(&mut inner) {
+            self.released.notify_all();
+        }
+    }
+
+    fn acquire(&self, priority: DecodePriority, units: usize) -> GatePermit<'_> {
+        let mut inner = self.inner.lock();
+        let units = units.clamp(1, inner.total_units);
+        let ticket = inner.next_ticket;
+        inner.next_ticket = inner.next_ticket.wrapping_add(1);
+        inner.waiters.push(GateWaiter { ticket, priority, units, granted: false });
+        dispatch_gate(&mut inner);
+        let granted_now = inner.waiters.iter().find(|waiter| waiter.ticket == ticket).is_some_and(|waiter| waiter.granted);
+        if !granted_now {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            let start = Instant::now();
+            while !inner.waiters.iter().find(|waiter| waiter.ticket == ticket).is_some_and(|waiter| waiter.granted) {
+                self.released.wait(&mut inner);
+            }
+            let waited = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            self.wait_nanos.fetch_add(waited, Ordering::Relaxed);
+        }
+        inner.waiters.retain(|waiter| waiter.ticket != ticket);
+        GatePermit { gate: self, units }
+    }
+
+    fn peak_active(&self) -> usize {
+        self.inner.lock().peak_active
+    }
+
+    fn waits(&self) -> u64 {
+        self.waits.load(Ordering::Relaxed)
+    }
+
+    fn wait_nanos(&self) -> u64 {
+        self.wait_nanos.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for GatePermit<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.gate.inner.lock();
+        inner.free_units = (inner.free_units + self.units).min(inner.total_units);
+        inner.active = inner.active.saturating_sub(1);
+        if dispatch_gate(&mut inner) {
+            self.gate.released.notify_all();
+        }
+    }
+}
+
+/// RAW proxy/native decodes and light JPEG/PNG decodes have separate admission,
+/// so a 45MP native frame cannot block a filmstrip thumbnail behind it. Within
+/// each gate, preview work outranks thumbnails.
+struct DecodeGates {
+    heavy: DecodeGate,
+    light: DecodeGate,
+}
+
+impl DecodeGates {
+    fn new(cache_bytes: usize) -> Self {
+        let cores = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
+        Self {
+            heavy: DecodeGate::new((cache_bytes / DECODE_UNIT_BYTES).clamp(2, 6)),
+            light: DecodeGate::new((cores / 2).clamp(2, 6)),
+        }
+    }
+}
+
+/// Single-flight key: the 4096 proxy and the full native frame decode separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SourceKey {
+    Proxy(ImageId),
+    Native(ImageId),
+}
+
+#[derive(Default)]
+struct Flight {
+    result: Mutex<Option<Result<Arc<Source>, String>>>,
+    ready: Condvar,
+}
+
+impl Flight {
+    fn publish(&self, result: Result<Arc<Source>, String>) {
+        *self.result.lock() = Some(result);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> Result<Arc<Source>, String> {
+        let mut slot = self.result.lock();
+        loop {
+            if let Some(result) = slot.as_ref() {
+                return result.clone();
+            }
+            self.ready.wait(&mut slot);
+        }
+    }
+}
+
+/// The thread that owns a decode. If it unwinds, waiters are released with an
+/// error instead of hanging on the flight forever.
+struct FlightLeader<'a> {
+    engine: &'a FileEngine,
+    key: SourceKey,
+    flight: Arc<Flight>,
+    finished: bool,
+}
+
+impl FlightLeader<'_> {
+    fn finish(mut self, result: Result<Arc<Source>, String>) -> Result<Arc<Source>, String> {
+        self.flight.publish(result.clone());
+        self.engine.flights.lock().remove(&self.key);
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for FlightLeader<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.flight.publish(Err("decode aborted".into()));
+            self.engine.flights.lock().remove(&self.key);
+        }
+    }
+}
+
+enum FlightRole<'a> {
+    Leader(FlightLeader<'a>),
+    Waiter(Arc<Flight>),
+}
+
 struct State {
     entries: Vec<FileEntry>,
     next_id: u64,
-    sources: HashMap<ImageId, Arc<Source>>,
+    sources: HashMap<ImageId, CachedSource>,
     /// At most one full-size RAW; remember failure for the current image too.
-    native_raw: Option<(ImageId, Option<Arc<Source>>)>,
+    native_raw: Option<NativeRawSlot>,
     ai_inputs: HashMap<ImageId, Arc<AiInput>>,
-    /// Most recently used last.
-    lru: Vec<ImageId>,
+    /// Byte budget, LRU bookkeeping, pins and counters for `sources` + `native_raw`.
+    source_cache: SourceCacheBudget,
     jobs: HashMap<u64, JobStatus>,
     /// Jobs whose worker must not overwrite the cancelled status.
     cancelled: std::collections::HashSet<u64>,
@@ -783,9 +1262,14 @@ pub struct FileEngine {
     /// Gamut counts are tiny compared with the frame; keep recent proof results
     /// so a repaint does not repeat the full round trip.
     gamut: Mutex<Vec<(preview_cache::PreviewKey, String, crate::GamutWarning)>>,
-    /// One decode at a time. Waiters re-check the source cache after taking it,
-    /// so concurrent requests for the same image decode it once.
-    decode: Mutex<()>,
+    /// One in-flight decode per `SourceKey`; later callers wait for that result
+    /// instead of decoding the same image again.
+    flights: Mutex<HashMap<SourceKey, Arc<Flight>>>,
+    /// One full-size RAW at a time: the native slot holds a single frame, so a
+    /// second native decode would only overwrite the first.
+    native_decode: Mutex<()>,
+    /// Bounded, priority-aware admission per decode class.
+    decode_gates: DecodeGates,
     store: Option<Store>,
     /// A C1 catalog is read-only: opening it must not save the imported index.
     c1_catalog: bool,
@@ -950,6 +1434,8 @@ impl FileEngine {
         };
         let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
         let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
+        let cache_bytes = default_source_cache_bytes();
+        log::debug!("source cache budget: {cache_bytes} bytes");
         let engine = Self {
             root,
             state: Arc::new(Mutex::new(State {
@@ -958,7 +1444,7 @@ impl FileEngine {
                 sources: HashMap::new(),
                 native_raw: None,
                 ai_inputs: HashMap::new(),
-                lru: Vec::new(),
+                source_cache: SourceCacheBudget::new(cache_bytes),
                 jobs: HashMap::new(),
                 cancelled: Default::default(),
                 source_reasons: HashMap::new(),
@@ -971,7 +1457,9 @@ impl FileEngine {
             })),
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
-            decode: Mutex::new(()),
+            flights: Mutex::new(HashMap::new()),
+            native_decode: Mutex::new(()),
+            decode_gates: DecodeGates::new(cache_bytes),
             store,
             c1_catalog: false,
             c1_catalog_path: None,
@@ -1023,6 +1511,8 @@ impl FileEngine {
         let store = Store::open(&root).ok();
         let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
         let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
+        let cache_bytes = default_source_cache_bytes();
+        log::debug!("source cache budget: {cache_bytes} bytes");
         let engine = Self {
             root,
             state: Arc::new(Mutex::new(State {
@@ -1031,7 +1521,7 @@ impl FileEngine {
                 sources: HashMap::new(),
                 native_raw: None,
                 ai_inputs: HashMap::new(),
-                lru: Vec::new(),
+                source_cache: SourceCacheBudget::new(cache_bytes),
                 jobs: HashMap::new(),
                 cancelled: Default::default(),
                 source_reasons: HashMap::new(),
@@ -1044,7 +1534,9 @@ impl FileEngine {
             })),
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
-            decode: Mutex::new(()),
+            flights: Mutex::new(HashMap::new()),
+            native_decode: Mutex::new(()),
+            decode_gates: DecodeGates::new(cache_bytes),
             store,
             c1_catalog: true,
             c1_catalog_path: Some(import.catalog_path.clone()),
@@ -1399,42 +1891,134 @@ impl FileEngine {
         Ok(info)
     }
 
-    fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
-        {
-            let mut st = self.state.lock();
-            if let Some(src) = st.sources.get(&image).cloned() {
-                st.lru.retain(|i| *i != image);
-                st.lru.push(image);
-                return Ok(src);
-            }
+    /// A cached source, charged to the byte budget and refreshed in the LRU.
+    fn cached_source(&self, image: ImageId) -> Option<Arc<Source>> {
+        let mut st = self.state.lock();
+        if !st.sources.contains_key(&image) {
+            return None;
         }
-        let (path, lens) = {
+        let tick = st.source_cache.next_tick();
+        let source = {
+            let entry = st.sources.get_mut(&image)?;
+            entry.last_used = tick;
+            Arc::clone(&entry.source)
+        };
+        st.source_cache.hits += 1;
+        st.source_cache.note_use(image);
+        Some(source)
+    }
+
+    /// Stores a decoded source and evicts the oldest unpinned entries until the
+    /// byte budget holds. The entry being stored, the current/neighbour images,
+    /// and sources another caller still holds (strong_count > 1) are kept.
+    fn store_cached_source(&self, image: ImageId, source: Arc<Source>) {
+        let bytes = source_cache_bytes(&source);
+        let mut st = self.state.lock();
+        let tick = st.source_cache.next_tick();
+        if let Some(old) = st.sources.insert(image, CachedSource { source, bytes, last_used: tick }) {
+            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(old.bytes);
+        }
+        st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_add(bytes);
+        st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
+        st.source_cache.note_use(image);
+        evict_sources_to_budget(&mut st, Some(image));
+        log::debug!(
+            "source {image:?}: {bytes} bytes; cache {}/{} bytes, {} sources",
+            st.source_cache.current_bytes,
+            st.source_cache.max_bytes,
+            st.sources.len()
+        );
+    }
+
+    /// A cached native RAW frame, or a remembered failure for that image.
+    fn cached_native(&self, image: ImageId) -> Option<Option<Arc<Source>>> {
+        let mut st = self.state.lock();
+        if st.native_raw.as_ref().is_none_or(|slot| slot.image != image) {
+            return None;
+        }
+        let tick = st.source_cache.next_tick();
+        let cached = {
+            let slot = st.native_raw.as_mut()?;
+            slot.last_used = tick;
+            slot.source.clone()
+        };
+        st.source_cache.native_hits += 1;
+        st.source_cache.note_use(image);
+        Some(cached)
+    }
+
+    fn join_flight(&self, key: SourceKey) -> FlightRole<'_> {
+        let mut flights = self.flights.lock();
+        if let Some(flight) = flights.get(&key).cloned() {
+            FlightRole::Waiter(flight)
+        } else {
+            let flight = Arc::new(Flight::default());
+            flights.insert(key, Arc::clone(&flight));
+            FlightRole::Leader(FlightLeader { engine: self, key, flight, finished: false })
+        }
+    }
+
+    fn note_flight_wait(&self) {
+        self.state.lock().source_cache.single_flight_waits += 1;
+    }
+
+    fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
+        self.source_with_priority(image, DecodePriority::Interactive)
+    }
+
+    /// One decode per image: callers that arrive mid-decode wait on the same
+    /// flight. Different images run in parallel, bounded by the heavy gate and
+    /// the RAM-derived units that image needs; thumbnails queue behind previews.
+    fn source_with_priority(&self, image: ImageId, priority: DecodePriority) -> anyhow::Result<Arc<Source>> {
+        if let Some(src) = self.cached_source(image) {
+            return Ok(src);
+        }
+        let (path, lens, width, height, heavy) = {
             let st = self.state.lock();
             let entry = st
                 .entries
                 .iter()
                 .find(|e| e.info.id == image)
                 .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
-            (entry.path.clone(), crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif))
+            let heavy = crate::raw::is_raw(&entry.path)
+                || is_eip(&entry.path)
+                || is_cop(&entry.path)
+                || file_kind(&entry.path) == FileKind::Heif;
+            (
+                entry.path.clone(),
+                crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif),
+                entry.info.width,
+                entry.info.height,
+                heavy,
+            )
         };
-        // Single flight: the first request decodes while the rest wait here,
-        // then find the finished source in the cache instead of decoding again.
-        let _decoding = self.decode.lock();
-        {
-            let mut st = self.state.lock();
-            if let Some(src) = st.sources.get(&image).cloned() {
-                st.lru.retain(|i| *i != image);
-                st.lru.push(image);
-                return Ok(src);
+        let key = SourceKey::Proxy(image);
+        let leader = match self.join_flight(key) {
+            FlightRole::Waiter(flight) => {
+                self.note_flight_wait();
+                return flight.wait().map_err(|message| anyhow::anyhow!(message));
             }
+            FlightRole::Leader(leader) => leader,
+        };
+        let _permit = if heavy {
+            let units = decode_units(self.decode_gates.heavy.total_units(), estimated_decode_bytes(width, height, false));
+            self.decode_gates.heavy.acquire(priority, units)
+        } else {
+            self.decode_gates.light.acquire(priority, 1)
+        };
+        // A decode that was already in flight may have finished while this
+        // request waited for admission; take its result instead of decoding.
+        if let Some(src) = self.cached_source(image) {
+            return leader.finish(Ok(src)).map_err(|message| anyhow::anyhow!(message));
         }
-        // Decoding happens outside the state lock; the decode lock is the only
-        // thing a concurrent caller waits on.
+        self.state.lock().source_cache.misses += 1;
+        let decoded = (|| -> Result<Arc<Source>, String> {
+        // Decoding happens outside the state lock.
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
         // An EIP hides its RAW inside a ZIP; hand every decoder the member.
         let decoded_path = if is_eip(&path) {
-            materialize_eip(&self.root, &path)?.raw
+            materialize_eip(&self.root, &path).map_err(|err| format!("{err:#}"))?.raw
         } else {
             path.clone()
         };
@@ -1448,7 +2032,7 @@ impl FileEngine {
                         Err(err) => {
                             let reason = format!(".cop decode failed: {err:#}");
                             self.state.lock().source_reasons.insert(image, reason.clone());
-                            return Err(anyhow::anyhow!(reason));
+                            return Err(reason);
                         }
                     }
                 } else if crate::raw::is_raw(&decoded_path) {
@@ -1456,8 +2040,8 @@ impl FileEngine {
                         Ok(img) => img,
                         Err(err) => {
                             let reason = format!("RAW decode failed: {err:#}");
-                            self.state.lock().source_reasons.insert(image, reason);
-                            return Err(err);
+                            self.state.lock().source_reasons.insert(image, reason.clone());
+                            return Err(reason);
                         }
                     }
                 } else if file_kind(&decoded_path) == FileKind::Heif {
@@ -1474,12 +2058,12 @@ impl FileEngine {
                                 let reason =
                                     format!("HEIF decode failed: libheif: {err:#}; image crate: {fallback}");
                                 self.state.lock().source_reasons.insert(image, reason.clone());
-                                return Err(anyhow::anyhow!(reason));
+                                return Err(reason);
                             }
                         },
                     }
                 } else {
-                    image::open(&decoded_path)?.to_rgba8()
+                    image::open(&decoded_path).map_err(|err| format!("{err:#}"))?.to_rgba8()
                 };
                 let (w, h) = fit_long_side(img.dimensions());
                 let img = if img.dimensions() != (w, h) {
@@ -1516,28 +2100,28 @@ impl FileEngine {
                 ),
         );
 
-        let mut st = self.state.lock();
-        match decoded_reason {
-            Some(reason) => {
-                st.source_reasons.insert(image, reason);
-            }
-            None => {
-                st.source_reasons.remove(&image);
+        {
+            let mut st = self.state.lock();
+            match decoded_reason {
+                Some(reason) => {
+                    st.source_reasons.insert(image, reason);
+                }
+                None => {
+                    st.source_reasons.remove(&image);
+                }
             }
         }
-        st.sources.insert(image, source.clone());
-        st.lru.retain(|i| *i != image);
-        st.lru.push(image);
-        while st.lru.len() > CACHED_SOURCES {
-            let old = st.lru.remove(0);
-            st.sources.remove(&old);
-            st.ai_inputs.remove(&old);
-        }
+        self.store_cached_source(image, Arc::clone(&source));
         Ok(source)
+        })();
+        let result = leader.finish(decoded);
+        result.map_err(|message| anyhow::anyhow!(message))
     }
 
+    /// Full-size RAW for 1:1 zoom and export. The native slot holds one frame,
+    /// so native decodes are serialized; same-image callers share one flight.
     fn native_raw_source(&self, image: ImageId, viewport: Option<(&crate::Geometry, NormRect, u32)>) -> Option<Arc<Source>> {
-        let (path, lens, banding_identity) = {
+        let (path, lens, width, height, banding_identity) = {
             let st = self.state.lock();
             let entry = st.entries.iter().find(|e| e.info.id == image)?;
             if !(crate::raw::is_raw(&entry.path) || is_eip(&entry.path))
@@ -1547,46 +2131,164 @@ impl FileEngine {
             {
                 return None;
             }
-            if let Some((id, source)) = &st.native_raw {
-                if *id == image {
-                    return source.clone();
-                }
-            }
             (
                 entry.path.clone(),
                 crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif),
+                entry.info.width,
+                entry.info.height,
                 raw_banding_identity(&entry.info.exif),
             )
         };
-        let _decoding = self.decode.lock();
-        {
-            let mut st = self.state.lock();
-            if let Some((id, source)) = &st.native_raw {
-                if *id == image {
-                    return source.clone();
+        if let Some(cached) = self.cached_native(image) {
+            return cached;
+        }
+        let key = SourceKey::Native(image);
+        let leader = match self.join_flight(key) {
+            FlightRole::Waiter(flight) => {
+                self.note_flight_wait();
+                return flight.wait().ok();
+            }
+            FlightRole::Leader(leader) => leader,
+        };
+        let decoded = (|| -> Option<Arc<Source>> {
+            // Only one native frame is kept, so one native decode at a time.
+            let _native = self.native_decode.lock();
+            if let Some(cached) = self.cached_native(image) {
+                return cached;
+            }
+            // Drop the previous full frame before allocating a new one, so the
+            // peak never holds two native frames at once.
+            {
+                let mut st = self.state.lock();
+                if let Some(previous) = st.native_raw.take() {
+                    st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(previous.bytes);
                 }
             }
-            // Drop the previous full frame before allocating a new one.
-            st.native_raw = None;
-        }
-        let source = (|| {
-            let path = if is_eip(&path) { materialize_eip(&self.root, &path).ok()?.raw } else { path };
-            let (source, provenance) = crate::raw_cache::get_or_decode_source16(&path, 0)?;
-            Some(Arc::new(
-                source
-                    .with_lens_shot(lens)
-                    .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear())
-                    .with_banding_identity(
-                        banding_identity.0,
-                        banding_identity.1.as_deref(),
-                    ),
-            ))
+            let units = decode_units(self.decode_gates.heavy.total_units(), estimated_decode_bytes(width, height, true));
+            let _permit = self.decode_gates.heavy.acquire(DecodePriority::Interactive, units);
+            self.state.lock().source_cache.misses += 1;
+            let decoded = (|| {
+                let path = if is_eip(&path) { materialize_eip(&self.root, &path).ok()?.raw } else { path.clone() };
+                let (source, provenance) = crate::raw_cache::get_or_decode_source16(&path, 0)?;
+                Some(Arc::new(
+                    source
+                        .with_lens_shot(lens)
+                        .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear())
+                        .with_banding_identity(
+                            banding_identity.0,
+                            banding_identity.1.as_deref(),
+                        ),
+                ))
+            })();
+            if decoded.is_none() {
+                log::warn!("native RAW source unavailable for {image:?}");
+            }
+            let bytes = decoded.as_ref().map_or(0, |source| source_cache_bytes(source));
+            {
+                let mut st = self.state.lock();
+                let tick = st.source_cache.next_tick();
+                st.native_raw = Some(NativeRawSlot { image, source: decoded.clone(), bytes, last_used: tick });
+                st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_add(bytes);
+                st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
+                st.source_cache.note_use(image);
+                evict_sources_to_budget(&mut st, Some(image));
+            }
+            decoded
         })();
-        if source.is_none() {
-            log::warn!("native RAW source unavailable for {image:?}");
+        let flight_result = match decoded {
+            Some(source) => Ok(source),
+            None => Err(format!("native RAW source unavailable for {image:?}")),
+        };
+        leader.finish(flight_result).ok()
+    }
+
+    /// Current source-cache bytes, pins and counters. The app's performance log
+    /// and the unified budget (S7) read this; it never decodes anything.
+    pub fn source_cache_stats(&self) -> SourceCacheStats {
+        // Gate locks are taken before the state lock: a decoder holds a gate
+        // permit while it stores its result, so the reverse order could deadlock.
+        let heavy_units = self.decode_gates.heavy.total_units();
+        let light_units = self.decode_gates.light.total_units();
+        let decode_waits = self.decode_gates.heavy.waits() + self.decode_gates.light.waits();
+        let decode_wait_ms = (self.decode_gates.heavy.wait_nanos() + self.decode_gates.light.wait_nanos()) / 1_000_000;
+        let decode_peak_concurrency = self.decode_gates.heavy.peak_active().max(self.decode_gates.light.peak_active());
+        let st = self.state.lock();
+        let cache = &st.source_cache;
+        SourceCacheStats {
+            max_bytes: cache.max_bytes,
+            current_bytes: cache.current_bytes,
+            peak_bytes: cache.peak_bytes,
+            cached_sources: st.sources.len(),
+            pinned_sources: st.sources.keys().filter(|image| cache.is_pinned(**image)).count(),
+            native_bytes: st.native_raw.as_ref().map_or(0, |slot| slot.bytes),
+            hits: cache.hits,
+            native_hits: cache.native_hits,
+            misses: cache.misses,
+            evictions: cache.evictions,
+            single_flight_waits: cache.single_flight_waits,
+            decode_waits,
+            decode_wait_ms,
+            decode_peak_concurrency,
+            heavy_units,
+            light_units,
         }
-        self.state.lock().native_raw = Some((image, source.clone()));
-        source
+    }
+
+    /// Sets the byte budget; `0` recomputes the machine-derived default. Returns
+    /// the budget in effect. Pinned sources can keep the cache above it.
+    pub fn set_source_cache_budget_bytes(&self, max_bytes: usize) -> usize {
+        let max_bytes = if max_bytes == 0 { default_source_cache_bytes() } else { max_bytes };
+        // Concurrency follows the budget: a smaller cache admits fewer large
+        // decodes at once. Gate before state, matching decoders' lock order.
+        self.decode_gates.heavy.set_total_units((max_bytes / DECODE_UNIT_BYTES).clamp(2, 6));
+        let mut st = self.state.lock();
+        st.source_cache.max_bytes = max_bytes;
+        evict_sources_to_budget(&mut st, None);
+        log::info!(
+            "source cache budget {max_bytes} bytes; now {} bytes in {} sources",
+            st.source_cache.current_bytes,
+            st.sources.len()
+        );
+        max_bytes
+    }
+
+    pub fn source_cache_budget_bytes(&self) -> usize {
+        self.state.lock().source_cache.max_bytes
+    }
+
+    /// Pins an image so budget eviction keeps it (exports hold sources this way).
+    /// Counts are per image; repeat pins before each independent holder.
+    pub fn pin_source(&self, image: ImageId) -> usize {
+        let mut st = self.state.lock();
+        let count = st.source_cache.pins.entry(image).or_insert(0);
+        *count = count.saturating_add(1);
+        *count as usize
+    }
+
+    pub fn unpin_source(&self, image: ImageId) -> usize {
+        let mut st = self.state.lock();
+        let remaining = match st.source_cache.pins.get_mut(&image) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count
+            }
+            None => 0,
+        };
+        if remaining == 0 {
+            st.source_cache.pins.remove(&image);
+        }
+        remaining as usize
+    }
+
+    /// Drops every cached source now. Callers still holding an `Arc` keep their
+    /// pixels; the cache simply stops charging for them. Used by diagnostics and
+    /// the cold/warm benchmark harness, not by the render path.
+    pub fn clear_source_cache(&self) {
+        let mut st = self.state.lock();
+        st.sources.clear();
+        st.ai_inputs.clear();
+        st.native_raw = None;
+        st.source_cache.current_bytes = 0;
     }
 
     fn ai_input(&self, image: ImageId) -> anyhow::Result<Arc<AiInput>> {
@@ -2862,7 +3564,8 @@ impl ImageEngine for FileEngine {
     }
 
     fn thumbnail(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<RgbaImage> {
-        let src = self.source(image)?;
+        // Thumbnails queue behind the visible preview on the decode gate.
+        let src = self.source_with_priority(image, DecodePriority::Thumbnail)?;
         let out = process::render(&src, &crate::styles::resolve(adjustments), NormRect::FULL, max_size, false, None);
         Ok(RgbaImage::new(out.width, out.height, out.rgba))
     }
@@ -5242,5 +5945,213 @@ mod tests {
         assert_eq!(message, "export job 9 for shot.jpg failed: copying <path> to <path>");
         assert!(!message.contains("alice"));
         assert!(!message.contains(r"C:\"));
+    }
+
+    // ---- S2: decoded-source byte budget + per-image single-flight ----
+
+    fn s2_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aurora-s2-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_test_png(dir: &Path, name: &str, width: u32, height: u32, seed: u8) -> PathBuf {
+        let path = dir.join(name);
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([(x as u8).wrapping_add(seed), (y as u8).wrapping_mul(3), seed, 255])
+        });
+        image.save(&path).unwrap();
+        path
+    }
+
+    fn pixel_hash(rgba: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in rgba {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    #[test]
+    fn source_cache_bytes_count_every_mip_level() {
+        let rgba = vec![128u8; 1024 * 768 * 4];
+        let source = Source::from_rgba(1024, 768, &rgba);
+        let expected: usize = source
+            .levels
+            .iter()
+            .map(|level| level.data.capacity() * std::mem::size_of::<[f32; 3]>())
+            .sum();
+        assert_eq!(source_cache_bytes(&source), expected);
+        assert!(source.levels.len() > 1, "mip pyramid missing");
+        assert!(source_cache_bytes(&source) >= 1024 * 768 * std::mem::size_of::<[f32; 3]>());
+    }
+
+    #[test]
+    fn source_cache_budget_follows_installed_memory() {
+        let mib = 1024 * 1024usize;
+        let small = source_cache_budget_from_memory(16 * 1024 * mib as u64, 8 * 1024 * mib as u64);
+        assert!((1024 * mib..=1536 * mib).contains(&small), "16 GiB → {small}");
+        let large = source_cache_budget_from_memory(32 * 1024 * mib as u64, 20 * 1024 * mib as u64);
+        assert!((2048 * mib..=3072 * mib).contains(&large), "32 GiB → {large}");
+        assert_eq!(
+            source_cache_budget_from_memory(2 * 1024 * mib as u64, 1024 * mib as u64),
+            SOURCE_CACHE_MIN_BYTES
+        );
+        assert_eq!(
+            source_cache_budget_from_memory(128 * 1024 * mib as u64, 100 * 1024 * mib as u64),
+            SOURCE_CACHE_MAX_BYTES
+        );
+        if std::env::var_os("AURORA_SOURCE_CACHE_BYTES").is_none()
+            && std::env::var_os("AURORA_SOURCE_CACHE_MB").is_none()
+        {
+            let default = default_source_cache_bytes();
+            assert!((SOURCE_CACHE_MIN_BYTES..=SOURCE_CACHE_MAX_BYTES).contains(&default), "{default}");
+        }
+    }
+
+    #[test]
+    fn decode_gate_admits_preview_before_thumbnail() {
+        let gate = Arc::new(DecodeGate::new(1));
+        let first = gate.acquire(DecodePriority::Interactive, 1);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for priority in [DecodePriority::Thumbnail, DecodePriority::Interactive] {
+                let gate = Arc::clone(&gate);
+                let order = Arc::clone(&order);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let permit = gate.acquire(priority, 1);
+                    order.lock().push(priority);
+                    drop(permit);
+                });
+            }
+            barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(first);
+        });
+        assert_eq!(*order.lock(), vec![DecodePriority::Interactive, DecodePriority::Thumbnail]);
+    }
+
+    #[test]
+    fn decode_units_shrink_concurrency_for_large_frames() {
+        assert_eq!(decode_units(6, 1), 1);
+        assert_eq!(decode_units(6, DECODE_UNIT_BYTES * 3), 3);
+        assert_eq!(decode_units(2, DECODE_UNIT_BYTES * 99), 2);
+        // A 24MP RAW proxy and a 45MP native view reserve different shares.
+        assert!(estimated_decode_bytes(8256, 5504, true) > estimated_decode_bytes(8256, 5504, false));
+    }
+
+    #[test]
+    fn source_cache_evicts_by_bytes_and_keeps_recent_pins() {
+        let dir = s2_test_dir("evict");
+        for index in 0..6 {
+            write_test_png(&dir, &format!("evict-{index}.png"), 400, 300, index as u8);
+        }
+        let engine = FileEngine::open(&dir).unwrap();
+        let ids: Vec<ImageId> = engine.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids.len(), 6);
+        let adjustments = AdjustmentSet::default();
+        engine.thumbnail(ids[0], &adjustments, 64).unwrap();
+        let one = engine.source_cache_stats().current_bytes;
+        assert!(one > 0);
+        engine.set_source_cache_budget_bytes(one * 2);
+        for id in &ids {
+            engine.thumbnail(*id, &adjustments, 64).unwrap();
+        }
+        let stats = engine.source_cache_stats();
+        eprintln!("eviction stats: {stats:?}");
+        assert!(stats.evictions >= 1, "{stats:?}");
+        assert!(stats.cached_sources <= 4, "{stats:?}");
+        assert!(stats.pinned_sources >= 3, "{stats:?}");
+        assert_eq!(stats.max_bytes, one * 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_image_concurrent_requests_decode_once() {
+        let dir = s2_test_dir("flight");
+        write_test_png(&dir, "same.png", 1600, 1200, 7);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let adjustments = AdjustmentSet::default();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    engine.thumbnail(id, &adjustments, 64).unwrap();
+                });
+            }
+        });
+        let stats = engine.source_cache_stats();
+        eprintln!("single-flight stats: {stats:?}");
+        assert_eq!(stats.misses, 1, "the same image decoded more than once: {stats:?}");
+        assert_eq!(stats.hits + stats.single_flight_waits, 7, "{stats:?}");
+        assert_eq!(stats.cached_sources, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn different_images_decode_in_parallel() {
+        let dir = s2_test_dir("parallel");
+        for index in 0..3 {
+            write_test_png(&dir, &format!("parallel-{index}.png"), 2400, 1600, index as u8);
+        }
+        let engine = FileEngine::open(&dir).unwrap();
+        let ids: Vec<ImageId> = engine.images().iter().map(|image| image.id).collect();
+        let adjustments = AdjustmentSet::default();
+        let barrier = std::sync::Barrier::new(ids.len());
+        std::thread::scope(|scope| {
+            for id in &ids {
+                scope.spawn(|| {
+                    barrier.wait();
+                    engine.thumbnail(*id, &adjustments, 64).unwrap();
+                });
+            }
+        });
+        let stats = engine.source_cache_stats();
+        eprintln!("parallel decode stats: {stats:?}");
+        assert_eq!(stats.misses, 3, "{stats:?}");
+        assert!(stats.decode_peak_concurrency >= 2, "decodes never overlapped: {stats:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn source_cache_eviction_does_not_change_pixels() {
+        let dir = s2_test_dir("pixels");
+        write_test_png(&dir, "pixels.png", 800, 600, 21);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let adjustments = AdjustmentSet::default();
+        let before = pixel_hash(&engine.thumbnail(id, &adjustments, 128).unwrap().pixels);
+        engine.clear_source_cache();
+        assert_eq!(engine.source_cache_stats().current_bytes, 0);
+        let after = pixel_hash(&engine.thumbnail(id, &adjustments, 128).unwrap().pixels);
+        assert_eq!(before, after, "cache eviction changed the rendered pixels");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "requires AURORA_NATIVE_RAW_TEST_DIR with a real RAW"]
+    fn native_raw_is_charged_to_the_same_budget() {
+        let dir = PathBuf::from(std::env::var_os("AURORA_NATIVE_RAW_TEST_DIR").expect("fixture directory"));
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine.images().into_iter().find(|info| crate::raw::is_raw(&info.path)).expect("RAW fixture");
+        let adjustments = AdjustmentSet::default();
+        let roi = NormRect { x: 0.25, y: 0.25, width: 0.125, height: 0.125 };
+        let native = engine
+            .native_raw_source(info.id, Some((&adjustments.geometry, roi, 1536)))
+            .expect("native RAW decode");
+        let expected = source_cache_bytes(&native);
+        let stats = engine.source_cache_stats();
+        eprintln!("native budget stats: {stats:?}, native {expected} bytes");
+        assert_eq!(stats.native_bytes, expected);
+        assert!(stats.current_bytes >= stats.native_bytes);
+        assert_eq!(engine.native_raw_source(info.id, Some((&adjustments.geometry, roi, 1536))).unwrap().snapshot_id(), native.snapshot_id());
+        assert_eq!(engine.source_cache_stats().native_hits, 1);
     }
 }

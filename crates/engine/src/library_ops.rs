@@ -541,7 +541,11 @@ impl FileEngine {
         state.entries = entries;
         state.sources.clear();
         state.ai_inputs.clear();
-        state.lru.clear();
+        state.native_raw = None;
+        // Ids were reassigned, so every pin would point at the wrong image.
+        state.source_cache.pins.clear();
+        state.source_cache.recent.clear();
+        state.source_cache.current_bytes = 0;
         state.preview = PreviewCache::default();
         if let Some(store) = &self.store {
             store.save_index(&state.catalog)?;
