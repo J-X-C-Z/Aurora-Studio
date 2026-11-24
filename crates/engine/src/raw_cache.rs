@@ -16,13 +16,18 @@ use anyhow::Result;
 use image::{ImageFormat, RgbaImage as ImageBuffer};
 
 use crate::mock::process::Source;
+use crate::raw::{DecodeProvenance, DecodeRoute};
 use crate::RgbaImage;
 
 /// Only files with this prefix are ever evicted; the caller shares the folder.
 const PREFIX: &str = "raw-";
-// Bump when decoded pixels change, even if the persisted layout is unchanged.
-// B5 may contain fixed chroma filtering baked into Z6III camera RGB.
-const RAW16_MAGIC: &[u8; 8] = b"AUR16B6\0";
+// Bump when the persisted layout changes. B7 adds the provenance header
+// (revision, backend, OpenCL status, pixel space) at bytes 32..40, so B6 files
+// miss naturally.
+const RAW16_MAGIC: &[u8; 8] = b"AUR16B7\0";
+/// magic(8) width(4) height(4) body bytes(8) image hash(8) revision(4)
+/// backend(1) opencl(1) pixel_space(1) flags(1).
+const HEADER16: usize = 40;
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
 
@@ -74,32 +79,47 @@ pub fn default_raw16_dir() -> Option<PathBuf> {
 /// The returned dimensions are already capped to `long_side`. Cache failures
 /// only fall back to a fresh decode; they never change the pixels.
 pub fn get_or_decode16(path: &Path, long_side: u32) -> Option<(u32, u32, Vec<u16>)> {
-    let Some(dir) = default_raw16_dir() else {
-        return crate::raw::decode16(path).map(|(w, h, px)| fit16(w, h, px, long_side));
-    };
-    get_or_decode16_with(path, &dir, long_side, |path| crate::raw::decode16(path))
+    get_or_decode16_traced(path, long_side).map(|(w, h, px, _)| (w, h, px))
 }
 
-pub(crate) fn get_or_decode_source16(path: &Path, long_side: u32) -> Option<Source> {
+/// [`get_or_decode16`] plus the provenance stored with the cached samples.
+pub fn get_or_decode16_traced(
+    path: &Path,
+    long_side: u32,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    let Some(dir) = default_raw16_dir() else {
+        return crate::raw::decode16_traced(path).map(|(w, h, px, provenance)| {
+            let (w, h, px) = fit16(w, h, px, long_side);
+            (w, h, px, provenance)
+        });
+    };
+    get_or_decode16_with(path, &dir, long_side, crate::raw::decode16_traced)
+}
+
+pub(crate) fn get_or_decode_source16(
+    path: &Path,
+    long_side: u32,
+) -> Option<(Source, DecodeProvenance)> {
     let Some(dir) = default_raw16_dir() else {
         return decode_source16(path, long_side);
     };
-    let key = cache_key16(path, &dir, long_side);
-    if let Some(source) = key.as_deref().and_then(read_cached_source16) {
+    let route = crate::raw::decode_route(path);
+    let key = cache_key16_for_route(path, &dir, long_side, route);
+    if let Some(source) = key.as_deref().and_then(|file| read_cached_source16(file, &route)) {
         return Some(source);
     }
-    let (w, h, pixels) = crate::raw::decode16(path)?;
+    let (w, h, pixels, provenance) = crate::raw::decode16_traced(path)?;
     let image = fit16(w, h, pixels, long_side);
     if let Some(file) = key {
-        store16_binary(&file, image.0, image.1, &image.2);
+        store16_binary(&file, image.0, image.1, &image.2, provenance);
     }
-    Some(Source::from_rgba16(image.0, image.1, &image.2))
+    Some((Source::from_rgba16(image.0, image.1, &image.2), provenance))
 }
 
-fn decode_source16(path: &Path, long_side: u32) -> Option<Source> {
-    let (w, h, pixels) = crate::raw::decode16(path)?;
+fn decode_source16(path: &Path, long_side: u32) -> Option<(Source, DecodeProvenance)> {
+    let (w, h, pixels, provenance) = crate::raw::decode16_traced(path)?;
     let image = fit16(w, h, pixels, long_side);
-    Some(Source::from_rgba16(image.0, image.1, &image.2))
+    Some((Source::from_rgba16(image.0, image.1, &image.2), provenance))
 }
 
 fn get_or_decode16_with<F>(
@@ -107,20 +127,37 @@ fn get_or_decode16_with<F>(
     dir: &Path,
     long_side: u32,
     decode: F,
-) -> Option<(u32, u32, Vec<u16>)>
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)>
 where
-    F: FnOnce(&Path) -> Option<(u32, u32, Vec<u16>)>,
+    F: FnOnce(&Path) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)>,
 {
-    let key = cache_key16(path, dir, long_side);
-    if let Some(file) = key.as_deref().and_then(read_cached16_binary) {
+    let route = crate::raw::decode_route(path);
+    get_or_decode16_with_route(path, dir, long_side, route, decode)
+}
+
+fn get_or_decode16_with_route<F>(
+    path: &Path,
+    dir: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+    decode: F,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)>
+where
+    F: FnOnce(&Path) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)>,
+{
+    let key = cache_key16_for_route(path, dir, long_side, route);
+    if let Some(file) = key
+        .as_deref()
+        .and_then(|file| read_cached16_binary(file, &route))
+    {
         return Some(file);
     }
-    let (w, h, pixels) = decode(path)?;
+    let (w, h, pixels, provenance) = decode(path)?;
     let image = fit16(w, h, pixels, long_side);
     if let Some(file) = key {
-        store16_binary(&file, image.0, image.1, &image.2);
+        store16_binary(&file, image.0, image.1, &image.2, provenance);
     }
-    Some(image)
+    Some((image.0, image.1, image.2, provenance))
 }
 
 fn get_or_decode_with<F>(path: &Path, dir: &Path, long_side: u32, decode: F) -> Result<RgbaImage>
@@ -141,19 +178,27 @@ where
     Ok(image)
 }
 
-fn cache_key16(path: &Path, dir: &Path, long_side: u32) -> Option<PathBuf> {
+/// Cache key from the file identity plus every input that chooses a decoder.
+///
+/// `route` carries the algorithm revision, C1 switch, Z6III detection, libraw
+/// availability, OpenCL state and demosaic filter, so any backend change lands
+/// on a different file instead of reusing pixels from another route.
+fn cache_key16_for_route(
+    path: &Path,
+    dir: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+) -> Option<PathBuf> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
-    let demosaic = crate::raw::demosaic_quality();
     let mut a = DefaultHasher::new();
     let mut b = DefaultHasher::new();
-    let source = crate::raw::c1_raw_enabled();
-    (RAW16_MAGIC, path, meta.len(), mtime, long_side, demosaic, source).hash(&mut a);
-    (0xa7u8, path, mtime, demosaic, long_side, meta.len(), source).hash(&mut b);
+    (RAW16_MAGIC, path, meta.len(), mtime, long_side, route).hash(&mut a);
+    (0xa7u8, path, mtime, long_side, meta.len(), route).hash(&mut b);
     Some(dir.join(format!(
         "{PREFIX}16b-{:016x}{:016x}-{long_side}.bin",
         a.finish(),
@@ -194,13 +239,17 @@ fn fit16(width: u32, height: u32, pixels: Vec<u16>, long_side: u32) -> (u32, u32
     )
 }
 
-fn read_cached16_binary(file: &Path) -> Option<(u32, u32, Vec<u16>)> {
+/// Reads one RAW16 entry and rejects it unless its provenance belongs to
+/// `route`. Revision, magic, enum codes and route consistency are all checked.
+fn read_cached16_binary(
+    file: &Path,
+    route: &DecodeRoute,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
     use rayon::prelude::*;
 
-    const HEADER: usize = 32;
     let mut reader = fs::File::open(file).ok()?;
     let size = reader.metadata().ok()?.len();
-    let mut header = [0u8; HEADER];
+    let mut header = [0u8; HEADER16];
     reader.read_exact(&mut header).ok()?;
     if &header[..8] != RAW16_MAGIC {
         return None;
@@ -212,8 +261,18 @@ fn read_cached16_binary(file: &Path) -> Option<(u32, u32, Vec<u16>)> {
     if width == 0
         || height == 0
         || bytes != expected_bytes
-        || size != (HEADER + bytes) as u64
+        || size != (HEADER16 + bytes) as u64
     {
+        return None;
+    }
+    let provenance = DecodeProvenance::from_codes(
+        u32::from_le_bytes(header[32..36].try_into().ok()?),
+        header[36],
+        header[37],
+        header[38],
+        header[39],
+    )?;
+    if !provenance.consistent_with(route) {
         return None;
     }
     let stored_hash = u64::from_le_bytes(header[24..32].try_into().ok()?);
@@ -237,31 +296,43 @@ fn read_cached16_binary(file: &Path) -> Option<(u32, u32, Vec<u16>)> {
         .par_chunks_exact_mut(4)
         .zip(rgb.par_chunks_exact(3))
         .for_each(|(dst, src)| dst[..3].copy_from_slice(src));
-    Some((width, height, pixels))
+    Some((width, height, pixels, provenance))
 }
 
 #[cfg(target_endian = "little")]
-fn read_cached_source16(file: &Path) -> Option<Source> {
+fn read_cached_source16(
+    file: &Path,
+    route: &DecodeRoute,
+) -> Option<(Source, DecodeProvenance)> {
     use memmap2::MmapOptions;
 
-    const HEADER: usize = 32;
     let file = fs::File::open(file).ok()?;
     // SAFETY: the cache file is read-only for the lifetime of the mapping and
     // all mutations replace it atomically through rename.
     let map = unsafe { MmapOptions::new().map(&file).ok()? };
-    if map.len() < HEADER || &map[..8] != RAW16_MAGIC {
+    if map.len() < HEADER16 || &map[..8] != RAW16_MAGIC {
         return None;
     }
     let width = u32::from_le_bytes(map[8..12].try_into().ok()?);
     let height = u32::from_le_bytes(map[12..16].try_into().ok()?);
     let bytes = u64::from_le_bytes(map[16..24].try_into().ok()?) as usize;
     let expected_bytes = width as usize * height as usize * 6;
-    if width == 0 || height == 0 || bytes != expected_bytes || map.len() != HEADER + bytes {
+    if width == 0 || height == 0 || bytes != expected_bytes || map.len() != HEADER16 + bytes {
+        return None;
+    }
+    let provenance = DecodeProvenance::from_codes(
+        u32::from_le_bytes(map[32..36].try_into().ok()?),
+        map[36],
+        map[37],
+        map[38],
+        map[39],
+    )?;
+    if !provenance.consistent_with(route) {
         return None;
     }
     let stored_hash = u64::from_le_bytes(map[24..32].try_into().ok()?);
-    let body = &map[HEADER..];
-    // SAFETY: the mapping starts page-aligned and HEADER is 32 bytes, so the
+    let body = &map[HEADER16..];
+    // SAFETY: the mapping starts page-aligned and HEADER16 is 40 bytes, so the
     // body is u16-aligned. `align_to` checks and reports any residual bytes.
     let (before, pixels, after) = unsafe { body.align_to::<u16>() };
     if !before.is_empty() || !after.is_empty() || pixels.len() != expected_bytes / 2 {
@@ -271,13 +342,16 @@ fn read_cached_source16(file: &Path) -> Option<Source> {
         || image_hash(width, height, body) == stored_hash,
         || Source::from_rgb16(width, height, pixels),
     );
-    valid.then_some(source)
+    valid.then_some((source, provenance))
 }
 
 #[cfg(not(target_endian = "little"))]
-fn read_cached_source16(file: &Path) -> Option<Source> {
-    let (width, height, pixels) = read_cached16_binary(file)?;
-    Some(Source::from_rgba16(width, height, &pixels))
+fn read_cached_source16(
+    file: &Path,
+    route: &DecodeRoute,
+) -> Option<(Source, DecodeProvenance)> {
+    let (width, height, pixels, provenance) = read_cached16_binary(file, route)?;
+    Some((Source::from_rgba16(width, height, &pixels), provenance))
 }
 
 #[cfg(test)]
@@ -313,7 +387,13 @@ fn store16_png(file: &Path, width: u32, height: u32, pixels: &[u16]) {
     enforce_limits(dir, MAX_ENTRIES, MAX_BYTES);
 }
 
-fn store16_binary(file: &Path, width: u32, height: u32, pixels: &[u16]) {
+fn store16_binary(
+    file: &Path,
+    width: u32,
+    height: u32,
+    pixels: &[u16],
+    provenance: DecodeProvenance,
+) {
     use rayon::prelude::*;
 
     let Some(dir) = file.parent() else { return };
@@ -333,12 +413,17 @@ fn store16_binary(file: &Path, width: u32, height: u32, pixels: &[u16]) {
             dst[2..4].copy_from_slice(&src[1].to_le_bytes());
             dst[4..6].copy_from_slice(&src[2].to_le_bytes());
         });
-    let mut data = Vec::with_capacity(32 + body.len());
+    let mut data = Vec::with_capacity(HEADER16 + body.len());
     data.extend_from_slice(RAW16_MAGIC);
     data.extend_from_slice(&width.to_le_bytes());
     data.extend_from_slice(&height.to_le_bytes());
     data.extend_from_slice(&(body.len() as u64).to_le_bytes());
     data.extend_from_slice(&image_hash(width, height, &body).to_le_bytes());
+    data.extend_from_slice(&provenance.revision.to_le_bytes());
+    data.push(provenance.backend_code());
+    data.push(provenance.opencl_code());
+    data.push(provenance.pixel_space_code());
+    data.push(provenance.flags());
     data.extend_from_slice(&body);
     if fs::write(&temp, &data).is_err() || fs::rename(&temp, file).is_err() {
         let _ = fs::remove_file(&temp);
@@ -521,18 +606,115 @@ mod tests {
         path
     }
 
+    /// A route a synthetic LibRaw-only entry is consistent with.
+    fn test_route(c1_raw_enabled: bool, z6iii_nef: bool) -> DecodeRoute {
+        DecodeRoute {
+            revision: crate::raw::DECODE_ALGORITHM_REVISION,
+            c1_raw_enabled,
+            z6iii_nef,
+            z6iii_feature: true,
+            libraw_available: true,
+            opencl: crate::raw::OpenClRouteState::Available,
+            demosaic: crate::raw::DEMOSAIC_DEFAULT,
+        }
+    }
+
+    fn store_libraw(file: &Path, width: u32, height: u32, pixels: &[u16]) {
+        store16_binary(file, width, height, pixels, DecodeProvenance::libraw16());
+    }
+
     #[test]
     fn raw16_obsolete_cache_is_rejected_by_both_readers() {
         let dir = scratch("legacy-raw16");
         let file = dir.join("raw-test.bin");
-        store16_binary(&file, 2, 1, &[100, 200, 300, 65535, 400, 500, 600, 65535]);
-        assert!(read_cached16_binary(&file).is_some());
-        assert!(read_cached_source16(&file).is_some());
+        let route = test_route(true, false);
+        store_libraw(&file, 2, 1, &[100, 200, 300, 65535, 400, 500, 600, 65535]);
+        assert!(read_cached16_binary(&file, &route).is_some());
+        assert!(read_cached_source16(&file, &route).is_some());
+        // B6 had no provenance header and must miss; B5 is older still.
+        for magic in [b"AUR16B6\0", b"AUR16B5\0"] {
+            let mut bytes = fs::read(&file).unwrap();
+            bytes[..8].copy_from_slice(magic);
+            fs::write(&file, bytes).unwrap();
+            assert!(read_cached16_binary(&file, &route).is_none(), "{magic:?}");
+            assert!(read_cached_source16(&file, &route).is_none(), "{magic:?}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn route_fingerprint_changes_the_raw16_key() {
+        let dir = scratch("route-key");
+        let path = source(&dir, b"route");
+        let base = test_route(true, true);
+        let key = |route| cache_key16_for_route(&path, &dir, 80, route).unwrap();
+        let baseline = key(base);
+
+        let mut c1_off = base;
+        c1_off.c1_raw_enabled = false;
+        let mut z6iii_off = base;
+        z6iii_off.z6iii_nef = false;
+        let mut no_libraw = base;
+        no_libraw.libraw_available = false;
+        let mut opencl_flipped = base;
+        opencl_flipped.opencl = crate::raw::OpenClRouteState::Unavailable;
+        let mut revision = base;
+        revision.revision += 1;
+        let mut demosaic = base;
+        demosaic.demosaic = 0;
+        for route in [c1_off, z6iii_off, no_libraw, opencl_flipped, revision, demosaic] {
+            assert_ne!(baseline, key(route), "a route change must land on a new key");
+        }
+        assert_eq!(baseline, key(base), "the same route must be stable");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raw16_header_rejects_route_mismatches_and_stale_revisions() {
+        let dir = scratch("header-route");
+        let file = dir.join("raw-header.bin");
+        let pixels = vec![7u16; 4 * 4];
+        let provenance = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl);
+        store16_binary(&file, 4, 1, &pixels, provenance);
+        let z6iii_route = test_route(true, true);
+        let read = read_cached16_binary(&file, &z6iii_route).expect("consistent route");
+        assert_eq!(read.3, provenance);
+        assert!(read_cached_source16(&file, &z6iii_route).is_some());
+
+        let not_z6iii = test_route(true, false);
+        assert!(
+            read_cached16_binary(&file, &not_z6iii).is_none(),
+            "a Z6III pre-matrix entry must not serve a non-Z6III route"
+        );
+        assert!(read_cached_source16(&file, &not_z6iii).is_none());
+
+        let c1_off = test_route(false, true);
+        assert!(
+            read_cached16_binary(&file, &c1_off).is_none(),
+            "camera-linear 16-bit must not serve a LibRaw-only route"
+        );
+
         let mut bytes = fs::read(&file).unwrap();
-        bytes[..8].copy_from_slice(b"AUR16B5\0");
+        bytes[32..36].copy_from_slice(&(provenance.revision + 1).to_le_bytes());
         fs::write(&file, bytes).unwrap();
-        assert!(read_cached16_binary(&file).is_none());
-        assert!(read_cached_source16(&file).is_none());
+        assert!(read_cached16_binary(&file, &z6iii_route).is_none());
+        assert!(read_cached_source16(&file, &z6iii_route).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raw16_header_keeps_the_opencl_failure_state() {
+        let dir = scratch("opencl-state");
+        let file = dir.join("raw-opencl.bin");
+        let pixels = vec![9u16; 2 * 4];
+        let provenance =
+            DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed);
+        store16_binary(&file, 2, 1, &pixels, provenance);
+        let route = test_route(true, true);
+        let read = read_cached16_binary(&file, &route).expect("read");
+        assert_eq!(read.3.opencl, crate::raw::OpenClStatus::Failed);
+        assert_eq!(read.3.backend, crate::raw::DecodeBackend::AuroraCpuChain);
+        assert!(read.3.unlocks_c1_z6iii_linear());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -566,14 +748,16 @@ mod tests {
             .map(|i| if i % 4 == 3 { 65535 } else { i.wrapping_mul(40503) as u16 })
             .collect();
         let expected = fit16(80, 40, pixels.clone(), 80);
+        let provenance = DecodeProvenance::libraw16();
         let calls = Cell::new(0);
         let first = get_or_decode16_with(&path, &dir, 80, |_| {
             calls.set(calls.get() + 1);
-            Some((80, 40, pixels.clone()))
+            Some((80, 40, pixels.clone(), provenance))
         })
         .unwrap();
         assert_eq!(calls.get(), 1);
-        assert_eq!(first, expected);
+        assert_eq!((first.0, first.1, first.2.clone()), expected);
+        assert_eq!(first.3, provenance);
         assert_eq!(cache_files(&dir).len(), 1);
 
         let cached = get_or_decode16_with(&path, &dir, 80, |_| {
@@ -582,7 +766,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(calls.get(), 1, "the second call must hit the 16-bit cache");
-        assert_eq!(cached, first);
+        assert_eq!(cached, first, "the provenance must survive the cache");
     }
 
     #[test]
@@ -594,8 +778,9 @@ mod tests {
         let pixels: Vec<u16> = (0..width as usize * height as usize * 4)
             .map(|i| i.wrapping_mul(40503) as u16)
             .collect();
-        store16_binary(&file, width, height, &pixels);
-        let mapped = read_cached_source16(&file).expect("mapped source");
+        store_libraw(&file, width, height, &pixels);
+        let route = test_route(true, false);
+        let mapped = read_cached_source16(&file, &route).expect("mapped source").0;
         let expected = Source::from_rgba16(width, height, &pixels);
         let render = |src: &Source| {
             crate::render(
@@ -615,15 +800,16 @@ mod tests {
     fn raw16_cache_invalidates_changed_files_and_rebuilds_corruption() {
         let dir = scratch("raw16-invalid");
         let path = source(&dir, b"a");
+        let provenance = DecodeProvenance::libraw16();
         let first = get_or_decode16_with(&path, &dir, 20, |_| {
-            Some((20, 10, vec![1000; 20 * 10 * 4]))
+            Some((20, 10, vec![1000; 20 * 10 * 4], provenance))
         })
         .unwrap();
         assert_eq!(first.2[0], 1000);
 
         fs::write(&path, b"changed-size").unwrap();
         let second = get_or_decode16_with(&path, &dir, 20, |_| {
-            Some((20, 10, vec![50000; 20 * 10 * 4]))
+            Some((20, 10, vec![50000; 20 * 10 * 4], provenance))
         })
         .unwrap();
         assert_eq!(second.2[0], 50000);
@@ -634,7 +820,7 @@ mod tests {
             .unwrap();
         fs::write(&file, b"broken").unwrap();
         let rebuilt = get_or_decode16_with(&path, &dir, 20, |_| {
-            Some((20, 10, vec![12345; 20 * 10 * 4]))
+            Some((20, 10, vec![12345; 20 * 10 * 4], provenance))
         })
         .unwrap();
         assert_eq!(rebuilt.2[0], 12345);
@@ -659,7 +845,7 @@ mod tests {
 
         let started = Instant::now();
         let first = get_or_decode16_with(&path, &dir, 4096, |path| {
-            crate::raw::decode16(path)
+            crate::raw::decode16_traced(path)
         })
         .expect("first decode");
         let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -704,10 +890,11 @@ mod tests {
         assert_eq!(png_read_data.2, pixels);
 
         let started = Instant::now();
-        store16_binary(&bin, width, height, &pixels);
+        store_libraw(&bin, width, height, &pixels);
         let bin_write = started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();
-        let bin_read_data = read_cached16_binary(&bin).expect("binary read");
+        let bin_route = test_route(true, false);
+        let bin_read_data = read_cached16_binary(&bin, &bin_route).expect("binary read");
         let bin_read = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(bin_read_data.2, pixels);
 

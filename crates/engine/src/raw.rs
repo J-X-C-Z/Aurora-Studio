@@ -154,20 +154,27 @@ fn sensor_map() -> &'static std::sync::Mutex<std::collections::HashMap<std::path
 /// cannot be demosaiced (Nikon High Efficiency in this libraw build), or the
 /// result does not resemble the camera preview.
 pub fn decode16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
+    decode16_traced(path).map(|(width, height, pixels, _)| (width, height, pixels))
+}
+
+/// [`decode16`] plus the provenance of the branch that actually produced the
+/// pixels. Cache headers persist it so a hit can still route the colour
+/// pipeline (the Z6III pre-matrix must never run on a LibRaw/preview fallback).
+pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
     // The Aurora Raw chain decodes the same Bayer as LibRaw but demosaics with
     // Aurora Raw's own stages. It handles the verified HE variant; `AURORA_C1_RAW=0`
     // is an escape hatch back to the LibRaw path.
     if c1_raw_enabled() {
-        if let Some(decoded) = crate::aurora_raw::decode_he_rgba16(path) {
+        if let Some((width, height, rgba, route)) = crate::aurora_raw::decode_he_rgba16_traced(path) {
             log::info!("Aurora Raw decoded {}", path.display());
             remember_sensor(path, true);
-            return Some(decoded);
+            return Some((width, height, rgba, DecodeProvenance::aurora(route)));
         }
     }
     match libraw::decode16(path, demosaic_quality()) {
         Ok((width, height, rgba)) if same_picture(&luma_grid16(width, height, &rgba), path) => {
             remember_sensor(path, true);
-            return Some((width, height, rgba));
+            return Some((width, height, rgba, DecodeProvenance::libraw16()));
         }
         Ok(_) => log::warn!(
             "libraw {}: the 16-bit sensor decode does not resemble the camera's own preview \
@@ -177,6 +184,291 @@ pub fn decode16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
         Err(err) => log::warn!("libraw {}: 16-bit {err}; falling back to the 8-bit path", path.display()),
     }
     None
+}
+
+/// Revision of every pixel algorithm behind [`decode16_traced`] and the Aurora
+/// Raw chain. Bump it whenever decoded samples change so old cache entries miss.
+pub const DECODE_ALGORITHM_REVISION: u32 = 1;
+
+/// Which decoder produced a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeBackend {
+    /// Z6III HE reconstruction through the OpenCL pipeline.
+    AuroraZ6iiiOpenCl,
+    /// Aurora Raw's CPU C1 chain (Z6III fallback or generic Bayer / X-Trans).
+    AuroraCpuChain,
+    /// LibRaw demosaic.
+    LibRaw,
+    /// The camera's embedded JPEG, already developed.
+    CameraPreview,
+    /// A non-RAW path (HEIF, JPEG, `.cop`, ...).
+    Other,
+}
+
+/// Colour space of the decoded samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelSpace {
+    /// C1 camera-linear 16-bit samples from the Aurora Raw chain.
+    CameraLinear16,
+    /// LibRaw's camera-linear 16-bit samples.
+    LibRawLinear16,
+    /// The camera-embedded preview, already developed.
+    EmbeddedPreview,
+    /// Display-encoded 8-bit samples widened to [`RgbaImage`].
+    Srgb8,
+}
+
+/// Outcome of the Z6III OpenCL attempt for one decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenClStatus {
+    NotAttempted,
+    Succeeded,
+    Unavailable,
+    Failed,
+}
+
+/// What actually produced a decoded frame.
+///
+/// `z6iii_linear` is kept separate from [`PixelSpace::CameraLinear16`] because
+/// generic Bayer / X-Trans frames are also camera-linear but must not receive
+/// the Z6III pre-matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DecodeProvenance {
+    pub revision: u32,
+    pub backend: DecodeBackend,
+    pub opencl: OpenClStatus,
+    pub pixel_space: PixelSpace,
+    /// Samples need the C1 Z6III pre-matrix.
+    pub z6iii_linear: bool,
+}
+
+impl DecodeProvenance {
+    pub const fn aurora(route: crate::aurora_raw::AuroraRoute) -> Self {
+        use crate::aurora_raw::AuroraRoute as Route;
+        let (backend, opencl, z6iii_linear) = match route {
+            Route::Z6iiiOpenCl => {
+                (DecodeBackend::AuroraZ6iiiOpenCl, OpenClStatus::Succeeded, true)
+            }
+            Route::Z6iiiCpuOpenClUnavailable => {
+                (DecodeBackend::AuroraCpuChain, OpenClStatus::Unavailable, true)
+            }
+            Route::Z6iiiCpuOpenClFailed => {
+                (DecodeBackend::AuroraCpuChain, OpenClStatus::Failed, true)
+            }
+            Route::Cpu => (DecodeBackend::AuroraCpuChain, OpenClStatus::NotAttempted, false),
+        };
+        Self {
+            revision: DECODE_ALGORITHM_REVISION,
+            backend,
+            opencl,
+            pixel_space: PixelSpace::CameraLinear16,
+            z6iii_linear,
+        }
+    }
+
+    pub const fn libraw16() -> Self {
+        Self {
+            revision: DECODE_ALGORITHM_REVISION,
+            backend: DecodeBackend::LibRaw,
+            opencl: OpenClStatus::NotAttempted,
+            pixel_space: PixelSpace::LibRawLinear16,
+            z6iii_linear: false,
+        }
+    }
+
+    pub const fn libraw_srgb8() -> Self {
+        Self {
+            revision: DECODE_ALGORITHM_REVISION,
+            backend: DecodeBackend::LibRaw,
+            opencl: OpenClStatus::NotAttempted,
+            pixel_space: PixelSpace::Srgb8,
+            z6iii_linear: false,
+        }
+    }
+
+    pub const fn camera_preview() -> Self {
+        Self {
+            revision: DECODE_ALGORITHM_REVISION,
+            backend: DecodeBackend::CameraPreview,
+            opencl: OpenClStatus::NotAttempted,
+            pixel_space: PixelSpace::EmbeddedPreview,
+            z6iii_linear: false,
+        }
+    }
+
+    pub const fn other_srgb8() -> Self {
+        Self {
+            revision: DECODE_ALGORITHM_REVISION,
+            backend: DecodeBackend::Other,
+            opencl: OpenClStatus::NotAttempted,
+            pixel_space: PixelSpace::Srgb8,
+            z6iii_linear: false,
+        }
+    }
+
+    /// The only condition that may enable the C1 Z6III pre-matrix.
+    pub const fn unlocks_c1_z6iii_linear(&self) -> bool {
+        self.z6iii_linear && matches!(self.pixel_space, PixelSpace::CameraLinear16)
+    }
+
+    /// Stable byte codes persisted in the RAW16 cache header.
+    pub const fn backend_code(&self) -> u8 {
+        match self.backend {
+            DecodeBackend::AuroraZ6iiiOpenCl => 0,
+            DecodeBackend::AuroraCpuChain => 1,
+            DecodeBackend::LibRaw => 2,
+            DecodeBackend::CameraPreview => 3,
+            DecodeBackend::Other => 4,
+        }
+    }
+
+    pub const fn opencl_code(&self) -> u8 {
+        match self.opencl {
+            OpenClStatus::NotAttempted => 0,
+            OpenClStatus::Succeeded => 1,
+            OpenClStatus::Unavailable => 2,
+            OpenClStatus::Failed => 3,
+        }
+    }
+
+    pub const fn pixel_space_code(&self) -> u8 {
+        match self.pixel_space {
+            PixelSpace::CameraLinear16 => 0,
+            PixelSpace::LibRawLinear16 => 1,
+            PixelSpace::EmbeddedPreview => 2,
+            PixelSpace::Srgb8 => 3,
+        }
+    }
+
+    pub const fn flags(&self) -> u8 {
+        self.z6iii_linear as u8
+    }
+
+    /// Inverse of the cache header codes. Unknown codes reject the entry.
+    pub fn from_codes(
+        revision: u32,
+        backend: u8,
+        opencl: u8,
+        pixel_space: u8,
+        flags: u8,
+    ) -> Option<Self> {
+        if flags & !1 != 0 {
+            return None;
+        }
+        Some(Self {
+            revision,
+            backend: match backend {
+                0 => DecodeBackend::AuroraZ6iiiOpenCl,
+                1 => DecodeBackend::AuroraCpuChain,
+                2 => DecodeBackend::LibRaw,
+                3 => DecodeBackend::CameraPreview,
+                4 => DecodeBackend::Other,
+                _ => return None,
+            },
+            opencl: match opencl {
+                0 => OpenClStatus::NotAttempted,
+                1 => OpenClStatus::Succeeded,
+                2 => OpenClStatus::Unavailable,
+                3 => OpenClStatus::Failed,
+                _ => return None,
+            },
+            pixel_space: match pixel_space {
+                0 => PixelSpace::CameraLinear16,
+                1 => PixelSpace::LibRawLinear16,
+                2 => PixelSpace::EmbeddedPreview,
+                3 => PixelSpace::Srgb8,
+                _ => return None,
+            },
+            z6iii_linear: flags & 1 != 0,
+        })
+    }
+
+    /// Rejects a cached entry whose provenance cannot belong to `route`.
+    pub fn consistent_with(&self, route: &DecodeRoute) -> bool {
+        self.revision == route.revision
+            && !(self.z6iii_linear && !route.z6iii_nef)
+            && !(matches!(self.pixel_space, PixelSpace::CameraLinear16)
+                && !route.c1_raw_enabled)
+    }
+}
+
+/// Inputs that decide which backend [`decode16_traced`] selects *before* a
+/// decode runs. Any change here must produce a different cache entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecodeRoute {
+    pub revision: u32,
+    pub c1_raw_enabled: bool,
+    /// The file is a recognisable Z6III HE NEF and C1 RAW is enabled.
+    pub z6iii_nef: bool,
+    /// This build contains the Z6III OpenCL/CPU reconstruction.
+    pub z6iii_feature: bool,
+    /// The libraw shared library resolves in this process.
+    pub libraw_available: bool,
+    pub opencl: OpenClRouteState,
+    pub demosaic: i32,
+}
+
+/// Known OpenCL capability for the current build/machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OpenClRouteState {
+    /// This build cannot run the OpenCL reconstruction.
+    NotCompiled,
+    /// The build supports it and a compatible device was found.
+    Available,
+    /// The build supports it but no compatible device is present.
+    Unavailable,
+}
+
+/// The route inputs for `path`, suitable for hashing into a cache key.
+pub fn decode_route(path: &Path) -> DecodeRoute {
+    let c1_raw_enabled = c1_raw_enabled();
+    let z6iii_feature = cfg!(all(windows, feature = "z6iii-raw-export"));
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    let z6iii_nef = c1_raw_enabled
+        && z6iii_feature
+        && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nef"))
+        && crate::z6iii::is_z6iii_nef_file(path);
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    let z6iii_nef = false;
+    DecodeRoute {
+        revision: DECODE_ALGORITHM_REVISION,
+        c1_raw_enabled,
+        z6iii_nef,
+        z6iii_feature,
+        libraw_available: libraw::available(),
+        opencl: opencl_route_state(),
+        demosaic: demosaic_quality(),
+    }
+}
+
+fn opencl_route_state() -> OpenClRouteState {
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    {
+        static STATE: std::sync::OnceLock<OpenClRouteState> = std::sync::OnceLock::new();
+        *STATE.get_or_init(|| {
+            if crate::z6iii::opencl_available() {
+                OpenClRouteState::Available
+            } else {
+                OpenClRouteState::Unavailable
+            }
+        })
+    }
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    {
+        OpenClRouteState::NotCompiled
+    }
+}
+
+/// Provenance for the 8-bit fallback in the file engine, after [`decode`] ran.
+pub fn decode_fallback_provenance(path: &Path) -> DecodeProvenance {
+    match from_sensor(path) {
+        Some(false) => DecodeProvenance::camera_preview(),
+        _ if is_raw(path) => DecodeProvenance::libraw_srgb8(),
+        _ => DecodeProvenance::other_srgb8(),
+    }
 }
 
 pub(crate) fn c1_raw_enabled() -> bool {
@@ -605,6 +897,11 @@ mod libraw {
     fn api() -> Option<&'static Api> {
         static API: OnceLock<Option<Api>> = OnceLock::new();
         API.get_or_init(load).as_ref()
+    }
+
+    /// Whether the shared library resolved. Used by the decode-route fingerprint.
+    pub(super) fn available() -> bool {
+        api().is_some()
     }
 
     fn load() -> Option<Api> {
@@ -1832,6 +2129,97 @@ mod tests {
             &c1_samples[..8.min(c1_samples.len())]
         );
         assert_eq!(mismatches, 0, "LibRaw and C1 Bayer differ");
+    }
+
+    #[test]
+    fn fallback_provenance_never_unlocks_the_c1_z6iii_pre_matrix() {
+        let libraw = DecodeProvenance::libraw16();
+        let libraw8 = DecodeProvenance::libraw_srgb8();
+        let preview = DecodeProvenance::camera_preview();
+        for provenance in [libraw, libraw8, preview] {
+            assert!(!provenance.unlocks_c1_z6iii_linear(), "{provenance:?}");
+        }
+        assert_eq!(libraw.pixel_space, PixelSpace::LibRawLinear16);
+        assert_eq!(preview.pixel_space, PixelSpace::EmbeddedPreview);
+
+        // The Aurora chain unlocks it, whether OpenCL or the CPU fallback ran.
+        let opencl = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl);
+        let cpu = DecodeProvenance::aurora(
+            crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClUnavailable,
+        );
+        assert!(opencl.unlocks_c1_z6iii_linear());
+        assert!(cpu.unlocks_c1_z6iii_linear());
+        // A generic Bayer frame is camera-linear but not Z6III.
+        let generic = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Cpu);
+        assert_eq!(generic.pixel_space, PixelSpace::CameraLinear16);
+        assert!(!generic.unlocks_c1_z6iii_linear());
+    }
+
+    #[test]
+    fn opencl_failure_states_stay_distinguishable() {
+        use crate::aurora_raw::AuroraRoute as Route;
+        let succeeded = DecodeProvenance::aurora(Route::Z6iiiOpenCl);
+        let unavailable = DecodeProvenance::aurora(Route::Z6iiiCpuOpenClUnavailable);
+        let failed = DecodeProvenance::aurora(Route::Z6iiiCpuOpenClFailed);
+        assert_eq!(succeeded.opencl, OpenClStatus::Succeeded);
+        assert_eq!(unavailable.opencl, OpenClStatus::Unavailable);
+        assert_eq!(failed.opencl, OpenClStatus::Failed);
+        assert_eq!(succeeded.backend, DecodeBackend::AuroraZ6iiiOpenCl);
+        assert_eq!(unavailable.backend, DecodeBackend::AuroraCpuChain);
+        assert_eq!(failed.backend, DecodeBackend::AuroraCpuChain);
+        assert_ne!(unavailable.opencl_code(), failed.opencl_code());
+    }
+
+    #[test]
+    fn provenance_header_codes_round_trip_and_reject_unknown_values() {
+        for provenance in [
+            DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl),
+            DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed),
+            DecodeProvenance::libraw16(),
+            DecodeProvenance::camera_preview(),
+        ] {
+            let decoded = DecodeProvenance::from_codes(
+                provenance.revision,
+                provenance.backend_code(),
+                provenance.opencl_code(),
+                provenance.pixel_space_code(),
+                provenance.flags(),
+            )
+            .expect("known codes");
+            assert_eq!(decoded, provenance);
+        }
+        assert!(DecodeProvenance::from_codes(1, 9, 0, 0, 0).is_none());
+        assert!(DecodeProvenance::from_codes(1, 0, 9, 0, 0).is_none());
+        assert!(DecodeProvenance::from_codes(1, 0, 0, 9, 0).is_none());
+        assert!(DecodeProvenance::from_codes(1, 0, 0, 0, 0b10).is_none());
+    }
+
+    #[test]
+    fn decode_route_changes_with_behavioural_inputs() {
+        let base = DecodeRoute {
+            revision: DECODE_ALGORITHM_REVISION,
+            c1_raw_enabled: true,
+            z6iii_nef: true,
+            z6iii_feature: true,
+            libraw_available: true,
+            opencl: OpenClRouteState::Available,
+            demosaic: 3,
+        };
+        let mut disabled = base;
+        disabled.c1_raw_enabled = false;
+        let mut no_libraw = base;
+        no_libraw.libraw_available = false;
+        let mut no_opencl = base;
+        no_opencl.opencl = OpenClRouteState::Unavailable;
+        let mut not_z6iii = base;
+        not_z6iii.z6iii_nef = false;
+        let mut revision = base;
+        revision.revision += 1;
+        let mut demosaic = base;
+        demosaic.demosaic = 0;
+        for variant in [disabled, no_libraw, no_opencl, not_z6iii, revision, demosaic] {
+            assert_ne!(base, variant);
+        }
     }
 }
 
