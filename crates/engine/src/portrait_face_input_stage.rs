@@ -843,8 +843,7 @@ impl FaceInputBundle {
             if c_left == 0.0 && c_right == 0.0 {
                 continue;
             }
-            let l_deg = c_left * 100.0;
-            let r_deg = c_right * 100.0;
+            let (l_deg, r_deg) = eye_pair_args(mode, c_left, c_right);
             let quads = match mode {
                 0 => eye_geometry::row11_pupil_size(
                     &points194,
@@ -895,7 +894,7 @@ impl FaceInputBundle {
                     base + 2,
                     base + 3,
                 ]);
-                let deg01 = if side_idx == 0 { c_left } else { c_right };
+                let deg01 = eye_pair_deg01(quads.quads.len(), side_idx, c_left, c_right);
                 let center_uv = Point::new(
                     (quad.uv[0].x + quad.uv[1].x + quad.uv[2].x + quad.uv[3].x) * 0.25,
                     (quad.uv[0].y + quad.uv[1].y + quad.uv[2].y + quad.uv[3].y) * 0.25,
@@ -1541,6 +1540,31 @@ impl FaceInputBundle {
         }
         Ok(())
     }
+}
+
+/// PF8013/PF8014 (`row12_eye_height`) only emits when both eye quads exist. When one side has no
+/// control, feed that side a tiny nonzero degree so the pair-validation path sees two quads; its
+/// UV warp stays identity because `eye_pair_deg01` uses the real (zero) control downstream.
+const EYE_PAIR_SINGLE_SIDE_EPSILON_DEG: f32 = 1e-4;
+
+/// Args passed to row11/row12/row13 (`c * 100` degrees). For mode 1 only, an inactive side
+/// (control exactly 0.0 while the other side is nonzero) is substituted with an epsilon degree.
+fn eye_pair_args(mode: u8, c_left: f32, c_right: f32) -> (f32, f32) {
+    let l_deg = c_left * 100.0;
+    let r_deg = c_right * 100.0;
+    if mode == 1 && (c_left == 0.0) != (c_right == 0.0) {
+        return if c_left == 0.0 { (EYE_PAIR_SINGLE_SIDE_EPSILON_DEG, r_deg) } else { (l_deg, EYE_PAIR_SINGLE_SIDE_EPSILON_DEG) };
+    }
+    (l_deg, r_deg)
+}
+
+/// Selects the real control for a single emitted quad: with one quad it belongs to whichever side
+/// has nonzero control (row11/row13 skip zero-degree sides), regardless of `side_idx`.
+fn eye_pair_deg01(quad_count: usize, side_idx: usize, c_left: f32, c_right: f32) -> f32 {
+    if quad_count == 1 {
+        return if c_left != 0.0 { c_left } else { c_right };
+    }
+    if side_idx == 0 { c_left } else { c_right }
 }
 
 pub const FACE_STAGE_TRANSFORM_REFUSAL: &str = FACE_STAGE_TRANSFORM_ERROR;
@@ -2809,6 +2833,23 @@ mod tests {
         assert_eq!(reflect101(-1, 5), 1);
         assert_eq!(reflect101(5, 5), 3);
         assert_eq!(reflect101(-3, 5), 3);
+    }
+
+    #[test]
+    fn eye_pair_deg01_follows_the_emitted_quad_side() {
+        assert_eq!(eye_pair_deg01(2, 0, 0.25, 0.5), 0.25);
+        assert_eq!(eye_pair_deg01(2, 1, 0.25, 0.5), 0.5);
+        assert_eq!(eye_pair_deg01(1, 0, 0.0, 0.5), 0.5);
+        assert_eq!(eye_pair_deg01(1, 0, 0.25, 0.0), 0.25);
+    }
+
+    #[test]
+    fn eye_pair_args_adds_epsilon_only_for_single_side_eye_height() {
+        assert_eq!(eye_pair_args(1, 0.0, 0.5), (EYE_PAIR_SINGLE_SIDE_EPSILON_DEG, 50.0));
+        assert_eq!(eye_pair_args(1, 0.5, 0.0), (50.0, EYE_PAIR_SINGLE_SIDE_EPSILON_DEG));
+        assert_eq!(eye_pair_args(1, 0.5, 0.25), (50.0, 25.0));
+        assert_eq!(eye_pair_args(0, 0.0, 0.5), (0.0, 50.0));
+        assert_eq!(eye_pair_args(2, 0.5, 0.0), (50.0, 0.0));
     }
 
     #[test]
