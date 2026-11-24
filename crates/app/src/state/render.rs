@@ -121,31 +121,151 @@ fn full_frame_action(previous: Option<(ImageId, NormRect)>, image: ImageId, regi
     (region == NormRect::FULL || retain, retain)
 }
 
-fn display_frame(slot: &mut Option<Frame>, full: &mut Option<Frame>, next: Frame, cx: &mut gpui_kit::App) {
+/// What a placement hands back to the caller.
+pub(super) enum FrameDisposal {
+    /// The frame is no longer shown. `true` when its display image is shared
+    /// with a frame that stays, so only overlays are released.
+    Frame(Frame, bool),
+    /// An overlay of the frame retained as the full backing.
+    Overlay(Arc<RenderImage>),
+}
+
+/// Places a finished frame into the shown slot, keeping the previous full
+/// backing as `full` when a tile replaces it. Disposals run through a callback
+/// so the ordering can be exercised without a GPUI app.
+pub(super) fn place_frame(
+    slot: &mut Option<Frame>,
+    full: &mut Option<Frame>,
+    next: Frame,
+    dispose: &mut impl FnMut(FrameDisposal),
+) {
     let (clear_full, keep_previous) = full_frame_action(
         slot.as_ref().map(|frame| (frame.image_id, frame.region)), next.image_id, next.region,
     );
     let next_image = Arc::clone(&next.image);
     if clear_full {
         if let Some(old) = full.take() {
-            if Arc::ptr_eq(&old.image, &next_image) || slot.as_ref().is_some_and(|frame| Arc::ptr_eq(&old.image, &frame.image)) {
-                old.release_reusing_image(cx);
-            } else {
-                old.release(cx);
-            }
+            let reused = Arc::ptr_eq(&old.image, &next_image)
+                || slot.as_ref().is_some_and(|frame| Arc::ptr_eq(&old.image, &frame.image));
+            dispose(FrameDisposal::Frame(old, reused));
         }
     }
     if let Some(mut old) = slot.replace(next) {
         if keep_previous {
             for overlay in [old.warning.take(), old.focus.take()].into_iter().flatten() {
-                cx.drop_image(overlay, None);
+                dispose(FrameDisposal::Overlay(overlay));
             }
             *full = Some(old);
-        } else if Arc::ptr_eq(&old.image, &next_image) || full.as_ref().is_some_and(|frame| Arc::ptr_eq(&old.image, &frame.image)) {
-            old.release_reusing_image(cx);
         } else {
-            old.release(cx);
+            let reused = Arc::ptr_eq(&old.image, &next_image)
+                || full.as_ref().is_some_and(|frame| Arc::ptr_eq(&old.image, &frame.image));
+            dispose(FrameDisposal::Frame(old, reused));
         }
+    }
+}
+
+fn display_frame(slot: &mut Option<Frame>, full: &mut Option<Frame>, next: Frame, cx: &mut gpui_kit::App) {
+    place_frame(slot, full, next, &mut |disposal| match disposal {
+        FrameDisposal::Frame(frame, true) => frame.release_reusing_image(cx),
+        FrameDisposal::Frame(frame, false) => frame.release(cx),
+        FrameDisposal::Overlay(overlay) => {
+            cx.drop_image(overlay, None);
+        }
+    });
+}
+
+/// Whether a before/after request still has to render the bypass frame.
+fn needs_before(
+    compare_on: bool,
+    before_dirty: bool,
+    before: Option<&Frame>,
+    image: ImageId,
+    geometry: &Geometry,
+    region: NormRect,
+) -> bool {
+    compare_on
+        && (before_dirty
+            || before.is_none_or(|frame| {
+                frame.image_id != image || &frame.geometry != geometry || frame.region != region
+            }))
+}
+
+/// What the scheduler did with a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreviewRequested {
+    /// The engine will run it now.
+    Started,
+    /// One preview is already in flight; this request waits as the newest value.
+    Coalesced,
+}
+
+impl super::Preview {
+    /// Accepts a request. While one is in flight the newest request replaces
+    /// the pending one instead of starting a second engine call.
+    pub(super) fn accept_request(
+        &mut self,
+        quality: RenderQuality,
+        requested_at: std::time::Instant,
+    ) -> PreviewRequested {
+        if self.in_flight {
+            self.pending = Some((quality, requested_at));
+            PreviewRequested::Coalesced
+        } else {
+            PreviewRequested::Started
+        }
+    }
+
+    /// Marks the accepted request as handed to the engine.
+    pub(super) fn start_request(&mut self) {
+        self.in_flight = true;
+        self.rendering = true;
+    }
+
+    /// Marks the running request finished and returns the newest coalesced one.
+    pub(super) fn finish_request(&mut self) -> Option<(RenderQuality, std::time::Instant)> {
+        self.in_flight = false;
+        let next = self.pending.take();
+        if next.is_none() {
+            self.rendering = false;
+        }
+        next
+    }
+
+    /// Whether a finished after frame may replace the one on screen: only for
+    /// the current image, and never for a generation the shown frame outranks.
+    pub(super) fn may_install(
+        &self,
+        current: Option<ImageId>,
+        image_id: ImageId,
+        generation: u64,
+    ) -> bool {
+        let superseded = self
+            .frame
+            .as_ref()
+            .is_some_and(|old| old.image_id == image_id && old.stamp.id > generation);
+        current == Some(image_id) && !superseded
+    }
+
+    /// Whether the bypass frame requested alongside this one may be installed.
+    pub(super) fn may_install_before(&self, current: Option<ImageId>, image_id: ImageId) -> bool {
+        current == Some(image_id)
+    }
+
+    /// Whether the bypass frame should still be rendered now that the after
+    /// frame is done. Turning compare off or changing images drops it.
+    pub(super) fn wants_before(
+        &self,
+        compare_on: bool,
+        current: Option<ImageId>,
+        image_id: ImageId,
+        scheduled: bool,
+    ) -> bool {
+        scheduled && compare_on && current == Some(image_id)
+    }
+
+    /// Thumbnails run only while no preview is in flight and the queue has work.
+    pub(super) fn thumbs_allowed(&self, thumb_running: bool, queue_empty: bool) -> bool {
+        !thumb_running && !self.in_flight && !queue_empty
     }
 }
 
@@ -571,25 +691,28 @@ impl AppState {
     }
 
     fn enqueue_render(&mut self, quality: RenderQuality, requested_at: std::time::Instant, cx: &mut Context<Self>) {
-        if self.preview.in_flight {
-            // A new drag supersedes an older release's pending final frame.
-            self.preview.pending = Some((quality, requested_at));
+        // A new drag supersedes an older release's pending final frame.
+        if self.preview.accept_request(quality, requested_at) == PreviewRequested::Coalesced {
             return;
         }
         let Some(request) = self.preview_request(quality, false) else { return };
         let stamp = crate::perf::Stamp::new(request.generation, quality, requested_at);
         let requested_image = request.image;
-        let before = (self.view.compare != super::CompareMode::Off && (self.preview.before_dirty
-            || self.preview.before.as_ref().is_none_or(|frame| frame.image_id != request.image
-                || frame.geometry != request.adjustments.geometry || frame.region != request.region)))
-            .then(|| self.preview_request(RenderQuality::Final, true))
-            .flatten();
+        let before = needs_before(
+            self.view.compare != super::CompareMode::Off,
+            self.preview.before_dirty,
+            self.preview.before.as_ref(),
+            request.image,
+            &request.adjustments.geometry,
+            request.region,
+        )
+        .then(|| self.preview_request(RenderQuality::Final, true))
+        .flatten();
         if before.is_some() {
             self.preview.before_dirty = false;
         }
         let geometry = request.adjustments.geometry.clone();
-        self.preview.in_flight = true;
-        self.preview.rendering = true;
+        self.preview.start_request();
         let engine = self.engine.clone();
         let st = &self.settings;
         let want_warning = self.view.exposure_warning.then_some((st.warn_high, st.warn_low, st.warn_shadows));
@@ -661,8 +784,7 @@ impl AppState {
             let Ok(render_before) = this.update(cx, |this, cx| {
                 match frame {
                     Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id)) => {
-                        let stale = this.preview.frame.as_ref().is_some_and(|old| old.image_id == image_id && old.stamp.id > stamp.id);
-                        if this.current == Some(image_id) && !stale {
+                        if this.preview.may_install(this.current, image_id, stamp.id) {
                             if let Some(old) = std::mem::replace(&mut this.preview.scope, scope) {
                                 cx.drop_image(old, None);
                             }
@@ -706,8 +828,12 @@ impl AppState {
                         }
                     }
                 }
-                let render_before = before.is_some() && this.current == Some(requested_image)
-                    && this.view.compare != super::CompareMode::Off;
+                let render_before = this.preview.wants_before(
+                    this.view.compare != super::CompareMode::Off,
+                    this.current,
+                    requested_image,
+                    before.is_some(),
+                );
                 if render_before {
                     cx.notify();
                 }
@@ -727,7 +853,7 @@ impl AppState {
             };
             this.update(cx, |this, cx| {
                 match before {
-                    Some(Ok((img, source_pixels, _, region, image_id))) if this.current == Some(image_id) => {
+                    Some(Ok((img, source_pixels, _, region, image_id))) if this.preview.may_install_before(this.current, image_id) => {
                         display_frame(&mut this.preview.before, &mut this.preview.full_before, Frame {
                             image: img,
                             source_pixels,
@@ -745,11 +871,9 @@ impl AppState {
                     _ => {}
                 }
                 crate::note_first_preview_ready();
-                this.preview.in_flight = false;
-                if let Some((next, requested_at)) = this.preview.pending.take() {
+                if let Some((next, requested_at)) = this.preview.finish_request() {
                     this.enqueue_render(next, requested_at, cx);
                 } else {
-                    this.preview.rendering = false;
                     this.start_queued_thumbs(cx);
                 }
                 cx.notify();
@@ -765,7 +889,7 @@ impl AppState {
     }
 
     fn start_queued_thumbs(&mut self, cx: &mut Context<Self>) {
-        if self.thumb_task.is_some() || self.preview.in_flight || self.thumb_queue.is_empty() {
+        if !self.preview.thumbs_allowed(self.thumb_task.is_some(), self.thumb_queue.is_empty()) {
             return;
         }
         let rev = self.thumb_rev;
@@ -839,3 +963,502 @@ impl AppState {
     }
 }
 
+
+/// Preview ordering tests: fake engine + controllable gate.
+///
+/// These drive the same decision helpers `enqueue_render` uses (`accept_request`,
+/// `may_install`, `needs_before`, `wants_before`, `finish_request`,
+/// `thumbs_allowed`, `place_frame`) while real engine calls run on threads whose
+/// finish order the test chooses. GPUI's `WeakEntity::update` and the image
+/// upload path are not exercised here; the session report records that boundary.
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use crate::state::Preview;
+    use std::{
+        collections::HashMap,
+        sync::{
+            mpsc::{self, Receiver, Sender},
+            Arc, Mutex,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const FULL: NormRect = NormRect::FULL;
+    const TILE: NormRect = NormRect { x: 0.5, y: 0.5, width: 0.5, height: 0.5 };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeReply {
+        Frame,
+        Fail,
+    }
+
+    /// An engine whose preview calls park until the test releases their gate.
+    struct FakeEngine {
+        pixels: Arc<Vec<u8>>,
+        started: Sender<u64>,
+        started_rx: Mutex<Receiver<u64>>,
+        gates: Mutex<HashMap<u64, Receiver<FakeReply>>>,
+        releases: Mutex<HashMap<u64, Sender<FakeReply>>>,
+        calls: Mutex<Vec<PreviewRequest>>,
+    }
+
+    impl FakeEngine {
+        fn new() -> Arc<Self> {
+            let (started, started_rx) = mpsc::channel();
+            Arc::new(Self {
+                pixels: Arc::new(vec![10, 20, 30, 255, 40, 50, 60, 255]),
+                started,
+                started_rx: Mutex::new(started_rx),
+                gates: Mutex::new(HashMap::new()),
+                releases: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Registers where call `generation` waits. Call before spawning it.
+        fn gate(&self, generation: u64) {
+            let (tx, rx) = mpsc::channel();
+            assert!(self.gates.lock().unwrap().insert(generation, rx).is_none(), "one gate per generation");
+            self.releases.lock().unwrap().insert(generation, tx);
+        }
+
+        fn release(&self, generation: u64, reply: FakeReply) {
+            let tx = self.releases.lock().unwrap().remove(&generation).expect("gate registered");
+            tx.send(reply).expect("the engine is waiting");
+        }
+
+        fn wait_started(&self, generation: u64) {
+            let seen = self
+                .started_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("engine was called");
+            assert_eq!(seen, generation);
+        }
+
+        fn calls(&self) -> Vec<PreviewRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ImageEngine for FakeEngine {
+        fn name(&self) -> String {
+            "fake".into()
+        }
+        fn images(&self) -> Vec<ImageInfo> {
+            Vec::new()
+        }
+        fn import(&self, _paths: &[std::path::PathBuf]) -> anyhow::Result<Vec<ImageInfo>> {
+            anyhow::bail!("fake engine does not import")
+        }
+        fn collections(&self) -> Vec<Collection> {
+            Vec::new()
+        }
+        fn update_info(&self, _info: &ImageInfo) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn load_adjustments(&self, _image: ImageId) -> AdjustmentSet {
+            AdjustmentSet::default()
+        }
+        fn save_adjustments(&self, _image: ImageId, _adjustments: &AdjustmentSet) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn new_variant(&self, _image: ImageId, _adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
+            anyhow::bail!("fake engine has no variants")
+        }
+        fn thumbnail(&self, _image: ImageId, _adjustments: &AdjustmentSet, _max_size: u32) -> anyhow::Result<RgbaImage> {
+            Ok(RgbaImage::from_shared(2, 1, Arc::clone(&self.pixels)))
+        }
+        fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
+            self.calls.lock().unwrap().push(request.clone());
+            self.started.send(request.generation).ok();
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .remove(&request.generation)
+                .expect("test registered this gate");
+            let reply = gate.recv().expect("test released this gate");
+            match reply {
+                FakeReply::Frame => Ok(PreviewFrame {
+                    image: RgbaImage::from_shared(2, 1, Arc::clone(&self.pixels)),
+                    histogram: Histogram::default(),
+                    generation: request.generation,
+                    elapsed_ms: 0.0,
+                    degraded: None,
+                    gamut_warning: None,
+                }),
+                FakeReply::Fail => anyhow::bail!("fake engine failure"),
+            }
+        }
+        fn sample_color(&self, _image: ImageId, _adjustments: &AdjustmentSet, _point: [f32; 2]) -> anyhow::Result<[f32; 3]> {
+            Ok([0.0; 3])
+        }
+        fn auto_adjust(&self, _image: ImageId, _current: &AdjustmentSet, _target: AutoTarget) -> anyhow::Result<AutoResult> {
+            anyhow::bail!("fake engine does not auto adjust")
+        }
+        fn pick_white_balance(&self, _image: ImageId, _point: [f32; 2]) -> anyhow::Result<(f32, f32)> {
+            Ok((5500.0, 0.0))
+        }
+        fn compute_ai_mask(&self, _image: ImageId, _kind: AiMaskKind) -> anyhow::Result<String> {
+            anyhow::bail!("fake engine has no AI masks")
+        }
+        fn icc_profiles(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn lens_profiles(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn styles(&self) -> Vec<StyleInfo> {
+            Vec::new()
+        }
+        fn start_export(&self, _job: ExportJob) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn job_status(&self, _job_id: u64) -> JobStatus {
+            JobStatus::Queued
+        }
+    }
+
+    fn request(image: u64, generation: u64, region: NormRect) -> PreviewRequest {
+        PreviewRequest {
+            image: ImageId(image),
+            adjustments: AdjustmentSet::default(),
+            region,
+            max_size: 64,
+            quality: RenderQuality::Final,
+            bypass: false,
+            mask_overlay: None,
+            generation,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
+        }
+    }
+
+    fn frame(image_id: u64, generation: u64, region: NormRect, tag: u8) -> Frame {
+        Frame {
+            image: to_render_image(RgbaImage::new(2, 1, vec![tag; 8])),
+            source_pixels: 0,
+            region,
+            geometry: Geometry::default(),
+            image_id: ImageId(image_id),
+            warning: None,
+            focus: None,
+            degraded: None,
+            stamp: crate::perf::Stamp::new(generation, RenderQuality::Final, Instant::now()),
+        }
+    }
+
+    fn frame_for(image: RgbaImage, request: &PreviewRequest) -> Frame {
+        Frame {
+            image: to_render_image(image),
+            source_pixels: 0,
+            region: request.region,
+            geometry: request.adjustments.geometry.clone(),
+            image_id: request.image,
+            warning: None,
+            focus: None,
+            degraded: None,
+            stamp: crate::perf::Stamp::new(request.generation, request.quality, Instant::now()),
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Released {
+        /// Image id, region, and whether the display image was shared.
+        Frame(u64, NormRect, bool),
+        Overlay,
+    }
+
+    fn record(log: &mut Vec<Released>, disposal: FrameDisposal) {
+        match disposal {
+            FrameDisposal::Frame(frame, reused) => {
+                log.push(Released::Frame(frame.image_id.0, frame.region, reused))
+            }
+            FrameDisposal::Overlay(_) => log.push(Released::Overlay),
+        }
+    }
+
+    /// Same install decision and placement as the completion closure.
+    fn deliver(
+        preview: &mut Preview,
+        current: Option<ImageId>,
+        request: &PreviewRequest,
+        image: RgbaImage,
+    ) -> (bool, Vec<Released>) {
+        let mut log = Vec::new();
+        if !preview.may_install(current, request.image, request.generation) {
+            return (false, log);
+        }
+        preview.error = None;
+        let next = frame_for(image, request);
+        place_frame(&mut preview.frame, &mut preview.full_after, next, &mut |disposal| {
+            record(&mut log, disposal)
+        });
+        (true, log)
+    }
+
+    fn spawn_render(engine: &Arc<FakeEngine>, request: PreviewRequest) -> thread::JoinHandle<anyhow::Result<PreviewFrame>> {
+        let engine = Arc::clone(engine);
+        thread::spawn(move || engine.render_preview(&request))
+    }
+
+    /// Scenario A: switching to B while A renders coalesces B, and A's frame
+    /// is discarded instead of covering B.
+    #[test]
+    fn switching_images_while_a_renders_drops_a_and_runs_b() {
+        let engine = FakeEngine::new();
+        let mut preview = Preview::default();
+        let mut current = Some(ImageId(1));
+
+        assert_eq!(preview.accept_request(RenderQuality::Final, Instant::now()), PreviewRequested::Started);
+        preview.start_request();
+        let first = request(1, 1, FULL);
+        engine.gate(1);
+        let job = spawn_render(&engine, first.clone());
+        engine.wait_started(1);
+
+        // The user picks B while A is still rendering.
+        current = Some(ImageId(2));
+        assert_eq!(preview.accept_request(RenderQuality::Final, Instant::now()), PreviewRequested::Coalesced);
+        assert_eq!(preview.pending.map(|(quality, _)| quality), Some(RenderQuality::Final));
+
+        engine.release(1, FakeReply::Frame);
+        let a_frame = job.join().unwrap().unwrap();
+        let (installed, _) = deliver(&mut preview, current, &first, a_frame.image);
+        assert!(!installed, "A must not replace B");
+        assert!(preview.frame.is_none());
+
+        let queued = preview.finish_request().expect("B waited as the newest value");
+        assert_eq!(queued.0, RenderQuality::Final);
+        assert_eq!(preview.accept_request(queued.0, queued.1), PreviewRequested::Started);
+        preview.start_request();
+        let second = request(2, 2, FULL);
+        engine.gate(2);
+        let job = spawn_render(&engine, second.clone());
+        engine.wait_started(2);
+        engine.release(2, FakeReply::Frame);
+        let b_frame = job.join().unwrap().unwrap();
+        let (installed, _) = deliver(&mut preview, current, &second, b_frame.image);
+        assert!(installed);
+        assert_eq!(preview.frame.as_ref().map(|f| f.image_id), Some(ImageId(2)));
+        assert_eq!(engine.calls().len(), 2);
+        assert_eq!(preview.finish_request(), None);
+        assert!(!preview.rendering);
+    }
+
+    /// Scenario B: a frame from an older generation arriving after a newer one
+    /// must be discarded, for the same image or after the user moved on.
+    #[test]
+    fn older_generation_never_overwrites_a_newer_frame() {
+        let mut preview = Preview::default();
+        let newer = request(1, 7, FULL);
+        let (installed, _) = deliver(&mut preview, Some(ImageId(1)), &newer, RgbaImage::new(2, 1, vec![1; 8]));
+        assert!(installed);
+
+        let late = request(1, 6, FULL);
+        assert!(!preview.may_install(Some(ImageId(1)), late.image, late.generation));
+        let (installed, _) = deliver(&mut preview, Some(ImageId(1)), &late, RgbaImage::new(2, 1, vec![2; 8]));
+        assert!(!installed);
+        assert_eq!(preview.frame.as_ref().map(|f| f.stamp.id), Some(7));
+
+        // A stale frame for A arriving while B is current is dropped too.
+        let other = request(1, 8, FULL);
+        assert!(!preview.may_install(Some(ImageId(2)), other.image, other.generation));
+    }
+
+    /// Scenario C: closing compare while the bypass request is running drops
+    /// it; it is never installed behind the after frame.
+    #[test]
+    fn closing_compare_drops_the_bypass_frame() {
+        let preview = Preview::default();
+        let after = request(1, 3, FULL);
+        assert!(preview.wants_before(true, Some(ImageId(1)), after.image, true));
+        assert!(!preview.wants_before(false, Some(ImageId(1)), after.image, true), "compare closed");
+        assert!(!preview.wants_before(true, Some(ImageId(2)), after.image, true), "image changed");
+        assert!(!preview.wants_before(true, Some(ImageId(1)), after.image, false), "not scheduled");
+
+        assert!(preview.may_install_before(Some(ImageId(1)), after.image));
+        assert!(!preview.may_install_before(Some(ImageId(2)), after.image));
+        assert!(!preview.may_install_before(None, after.image));
+    }
+
+    /// Scenario D: a full backing is kept behind a tile and replaced when the
+    /// full frame returns; shared display images are not released twice.
+    #[test]
+    fn full_backing_survives_a_tile_and_is_released_on_return() {
+        let mut slot = Some(frame(1, 1, FULL, 1));
+        let mut full = None;
+
+        // Tile replaces the full frame: it is retained as the backing.
+        let mut log = Vec::new();
+        place_frame(&mut slot, &mut full, frame(1, 2, TILE, 2), &mut |disposal| {
+            record(&mut log, disposal)
+        });
+        assert!(log.is_empty(), "the full backing must not be released");
+        assert_eq!(slot.as_ref().map(|f| f.region), Some(TILE));
+        assert_eq!(full.as_ref().map(|f| f.region), Some(FULL));
+
+        // Full returns: the backing and the tile are both released.
+        let mut log = Vec::new();
+        place_frame(&mut slot, &mut full, frame(1, 3, FULL, 3), &mut |disposal| {
+            record(&mut log, disposal)
+        });
+        assert_eq!(
+            log,
+            vec![
+                Released::Frame(1, FULL, false),
+                Released::Frame(1, TILE, false),
+            ]
+        );
+        assert_eq!(slot.as_ref().map(|f| f.region), Some(FULL));
+        assert!(full.is_none());
+
+        // Shared display image (the engine reused the pixel buffer): once.
+        let mut slot = Some(frame(1, 4, FULL, 4));
+        let mut full = None;
+        let shared_image = Arc::clone(&slot.as_ref().unwrap().image);
+        let mut tile = frame(1, 5, TILE, 5);
+        tile.image = shared_image;
+        place_frame(&mut slot, &mut full, tile, &mut |_| {});
+        let mut log = Vec::new();
+        place_frame(&mut slot, &mut full, frame(1, 6, FULL, 6), &mut |disposal| {
+            record(&mut log, disposal)
+        });
+        assert_eq!(log[0], Released::Frame(1, FULL, true));
+        assert_eq!(log[1], Released::Frame(1, TILE, false));
+    }
+
+    /// Scenario E: crop/geometry changes reuse the source image but request a
+    /// new after frame and a new bypass frame; an unchanged view does not.
+    #[test]
+    fn geometry_only_changes_request_new_frames() {
+        let mut before = frame(1, 1, FULL, 1);
+        before.geometry = Geometry { crop: NormRect { x: 0.0, y: 0.0, width: 0.5, height: 0.5 }, ..Geometry::default() };
+        let new_geometry = Geometry { crop: NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 }, ..Geometry::default() };
+
+        assert!(needs_before(true, false, Some(&before), ImageId(1), &new_geometry, FULL), "geometry changed");
+        assert!(!needs_before(true, false, Some(&before), ImageId(1), &before.geometry, FULL), "unchanged");
+        assert!(needs_before(true, false, Some(&before), ImageId(2), &before.geometry, FULL), "other image");
+        assert!(!needs_before(false, true, Some(&before), ImageId(1), &new_geometry, FULL), "compare off");
+        assert!(needs_before(true, true, Some(&before), ImageId(1), &before.geometry, FULL), "dirty");
+
+        let mut preview = Preview::default();
+        let (installed, _) = deliver(&mut preview, Some(ImageId(1)), &request(1, 2, FULL), RgbaImage::new(2, 1, vec![9; 8]));
+        assert!(installed);
+        // Same image, newer generation, different geometry: still installs.
+        assert!(preview.may_install(Some(ImageId(1)), ImageId(1), 3));
+    }
+
+    /// Scenario F: a failed preview clears its in-flight slot and the newest
+    /// pending request still runs.
+    #[test]
+    fn a_failed_preview_keeps_the_pending_request_running() {
+        let engine = FakeEngine::new();
+        let mut preview = Preview::default();
+        let current = Some(ImageId(1));
+
+        assert_eq!(preview.accept_request(RenderQuality::Final, Instant::now()), PreviewRequested::Started);
+        preview.start_request();
+        let first = request(1, 1, FULL);
+        engine.gate(1);
+        let job = spawn_render(&engine, first.clone());
+        engine.wait_started(1);
+        assert_eq!(preview.accept_request(RenderQuality::Final, Instant::now()), PreviewRequested::Coalesced);
+
+        engine.release(1, FakeReply::Fail);
+        let error = job.join().unwrap().unwrap_err();
+        // Production records the error only for the current image.
+        assert_eq!(current, Some(first.image));
+        preview.error = Some((first.image, error.to_string().into()));
+
+        let queued = preview.finish_request().expect("pending survives the failure");
+        assert_eq!(queued.0, RenderQuality::Final);
+        assert_eq!(preview.accept_request(queued.0, queued.1), PreviewRequested::Started);
+        preview.start_request();
+        let second = request(1, 2, FULL);
+        engine.gate(2);
+        let job = spawn_render(&engine, second.clone());
+        engine.wait_started(2);
+        engine.release(2, FakeReply::Frame);
+        let frame = job.join().unwrap().unwrap();
+        let (installed, _) = deliver(&mut preview, current, &second, frame.image);
+        assert!(installed);
+        assert!(preview.error.is_none());
+        assert_eq!(preview.frame.as_ref().map(|f| f.stamp.id), Some(2));
+    }
+
+    /// Scenario G: a superseded generation's display image is released and
+    /// nothing is installed; the reuse path does not release it twice.
+    #[test]
+    fn superseded_generation_releases_the_prepared_image() {
+        let mut preview = Preview::default();
+        let shown = request(1, 5, FULL);
+        let (installed, _) = deliver(&mut preview, Some(ImageId(1)), &shown, RgbaImage::new(2, 1, vec![1; 8]));
+        assert!(installed);
+
+        let late = request(1, 4, FULL);
+        let image = RgbaImage::new(2, 1, vec![2; 8]);
+        let pixels = Arc::clone(&image.pixels);
+        assert!(!preview.may_install(Some(ImageId(1)), late.image, late.generation));
+        // The production discard branch drops the display image unless the
+        // engine reused the previous one.
+        drop(to_render_image(image));
+        assert_eq!(Arc::strong_count(&pixels), 1, "the discarded frame owns no pixels");
+
+        let image = RgbaImage::new(2, 1, vec![3; 8]);
+        let pixels = Arc::clone(&image.pixels);
+        assert!(!preview.may_install(Some(ImageId(1)), late.image, late.generation));
+        assert_eq!(Arc::strong_count(&pixels), 2, "a reused result is not released here");
+    }
+
+    /// Scenario H: thumbnails pause while a preview is in flight and resume
+    /// once the queue has no pending preview.
+    #[test]
+    fn thumbnails_pause_for_a_preview_and_resume_after_it() {
+        let mut preview = Preview::default();
+        assert!(preview.thumbs_allowed(false, false));
+        assert!(!preview.thumbs_allowed(true, false), "a thumbnail task is running");
+        assert!(!preview.thumbs_allowed(false, true), "nothing queued");
+
+        preview.start_request();
+        assert!(!preview.thumbs_allowed(false, false), "preview in flight");
+        assert_eq!(preview.accept_request(RenderQuality::Draft, Instant::now()), PreviewRequested::Coalesced);
+        assert!(preview.finish_request().is_some());
+        // The coalesced request is starting, so thumbnails stay paused.
+        assert!(!preview.in_flight);
+        assert_eq!(preview.accept_request(RenderQuality::Draft, Instant::now()), PreviewRequested::Started);
+        preview.start_request();
+        assert!(!preview.thumbs_allowed(false, false));
+        assert_eq!(preview.finish_request(), None);
+        assert!(preview.thumbs_allowed(false, false), "resumed when idle");
+    }
+
+    /// Scenario I: a viewer destroyed while a render is running retains no
+    /// frame, and the late result is released without touching state.
+    #[test]
+    fn a_destroyed_viewer_does_not_retain_the_background_result() {
+        let engine = FakeEngine::new();
+        let request = request(1, 1, FULL);
+        engine.gate(1);
+        let job = spawn_render(&engine, request.clone());
+        engine.wait_started(1);
+
+        // The viewer goes away; the task's WeakEntity update would fail here.
+        let viewer = Preview::default();
+        drop(viewer);
+
+        engine.release(1, FakeReply::Frame);
+        let result = job.join().unwrap().unwrap();
+        assert_eq!(Arc::strong_count(&engine.pixels), 2, "engine + the late frame");
+        drop(result);
+        assert_eq!(Arc::strong_count(&engine.pixels), 1, "the late frame released its pixels");
+    }
+}
