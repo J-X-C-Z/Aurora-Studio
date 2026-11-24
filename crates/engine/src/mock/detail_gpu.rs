@@ -17,10 +17,16 @@ use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
 const PTX: &str = include_str!("../../native/cuda/detail_gpu.ptx");
 const BLOCK: (u32, u32) = (16, 16);
 const PREWARM_BYTES: usize = 1400 * 933 * 4;
-// Keep one 24-32 MP render resident so slider refinements do not reallocate the
-// six-plane pool. Larger frames release after each call instead of pinning
-// unbounded GPU memory.
-const MAX_RETAINED_BYTES: usize = 768 * 1024 * 1024;
+/// Retained cap is the shared ledger budget, not a private 768 MiB constant.
+fn retained_cap() -> usize {
+    gpu_runtime::vram_budget()
+}
+/// Reclaimed before clarity but after develop.
+const RECLAIM_PRIORITY: u8 = 10;
+/// Six RGBA planes plus the 1025-entry luma LUT.
+fn retained_bytes(pixels: usize) -> Option<usize> {
+    pixels.checked_mul(24)?.checked_add(1025 * 4)
+}
 
 struct DetailPool {
     gpu: Gpu,
@@ -29,12 +35,12 @@ struct DetailPool {
 impl DetailPool {
     fn open(bytes: usize) -> Result<Self, Failure> {
         let mut gpu = Gpu::open("detail", PTX)?;
-        reserve(&mut gpu, bytes, MAX_RETAINED_BYTES)?;
+        reserve(&mut gpu, bytes, retained_cap())?;
         Ok(Self { gpu })
     }
 
     fn ensure(&mut self, bytes: usize) -> Result<(), Failure> {
-        reserve(&mut self.gpu, bytes, MAX_RETAINED_BYTES)
+        reserve(&mut self.gpu, bytes, retained_cap())
     }
 }
 
@@ -65,7 +71,32 @@ pub(crate) fn enabled() -> bool {
     }
 }
 
+/// Drops this stage's retained pools so another stage can use the budget.
+/// `try_lock` only: a busy stage is in use and must not be touched.
+fn release_retained() -> usize {
+    let mut state = match state().try_lock() {
+        Ok(state) => state,
+        Err(_) => return 0,
+    };
+    let freed = match &*state {
+        State::Ready(pool) => pool.gpu.resident_bytes(),
+        _ => 0,
+    };
+    if freed > 0 {
+        *state = State::NotTried;
+    }
+    freed
+}
+
+fn register_reclaimer() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        gpu_runtime::vram_register_reclaimer("detail", RECLAIM_PRIORITY, release_retained)
+    });
+}
+
 pub(crate) fn prewarm() -> bool {
+    register_reclaimer();
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     match &mut *state {
         State::Ready(_) => true,
@@ -101,9 +132,20 @@ pub(crate) fn post_process(
 ) -> bool {
     let Some(pixels) = w.checked_mul(h) else { return false };
     let bytes = pixels.saturating_mul(4);
-    if bytes == 0 || rgba.len() != bytes || bytes.saturating_mul(6) > MAX_RETAINED_BYTES {
-        return post_process_owned(rgba, w, h, nr, moire, sh, lens, scale);
+    if bytes == 0 || rgba.len() != bytes {
+        return false;
     }
+    // Non-allocating admission against the shared ledger before any device
+    // memory exists; a refusal is a CPU fallback, not a broken stage.
+    let Some(need) = retained_bytes(pixels) else { return false };
+    if need > retained_cap() || !gpu_runtime::vram_can_allocate("detail", need) {
+        gpu_runtime::note_fallback(
+            "detail",
+            &Failure::TooLarge { need, cap: retained_cap() },
+        );
+        return false;
+    }
+    register_reclaimer();
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     let result = match &mut *state {
         State::Unavailable => Err(Failure::Unavailable("detail_gpu")),
@@ -128,40 +170,6 @@ pub(crate) fn post_process(
             .ensure(bytes)
             .and_then(|()| post_process_pool(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale)),
     };
-    match result {
-        Ok(()) => true,
-        Err(failure) => {
-            log::warn!("detail_gpu: {failure:?}; staying on CPU");
-            gpu_runtime::note_fallback("detail", &failure);
-            false
-        }
-    }
-}
-
-/// Per-call allocation for frames above the retained cap.
-fn post_process_owned(
-    rgba: &mut [u8],
-    w: usize,
-    h: usize,
-    nr: &NoiseReduction,
-    moire: &Moire,
-    sh: &Sharpening,
-    lens: &LensCorrection,
-    scale: f32,
-) -> bool {
-    let mut gpu = match Gpu::open("detail", PTX) {
-        Ok(gpu) => gpu,
-        Err(failure) => {
-            log::warn!("detail_gpu: {failure:?}; staying on CPU");
-            gpu_runtime::note_fallback("detail", &failure);
-            return false;
-        }
-    };
-    let Some(pixels) = w.checked_mul(h) else { return false };
-    let bytes = pixels.saturating_mul(4);
-    let result = reserve(&mut gpu, bytes, usize::MAX).and_then(|()| {
-        post_process_pool(&mut gpu, rgba, w, h, nr, moire, sh, lens, scale)
-    });
     match result {
         Ok(()) => true,
         Err(failure) => {

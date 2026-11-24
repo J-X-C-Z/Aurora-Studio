@@ -1381,7 +1381,6 @@ pub(crate) fn stage_lens(
         }
         return;
     }
-    let src = buf.to_vec();
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
     let mut out = vec![0u8; w * h * 4];
@@ -1403,19 +1402,19 @@ pub(crate) fn stage_lens(
                 row[i + 3] = 255;
                 continue;
             }
-            let mut rgb = sample_bilinear(&src, w, h, sx, sy);
+            let mut rgb = sample_bilinear(buf, w, h, sx, sy);
             if ca_in_warp {
                 // Red and blue are sampled at slightly different radii.
                 let amount = 0.004 * r2;
                 let r = sample_bilinear(
-                    &src,
+                    buf,
                     w,
                     h,
                     cx + (sx - cx) * (1.0 + amount),
                     cy + (sy - cy) * (1.0 + amount),
                 );
                 let b = sample_bilinear(
-                    &src,
+                    buf,
                     w,
                     h,
                     cx + (sx - cx) * (1.0 - amount),
@@ -1829,7 +1828,6 @@ fn stage_lens_profile(
 
     // With the six-curve table present the two-curve splines are not applied.
     let ca = ca && adj.ca_fringing.is_empty();
-    let src = buf.to_vec();
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
     let half_diag = ((w * w + h * h) as f32).sqrt() * 0.5;
@@ -1853,7 +1851,7 @@ fn stage_lens_profile(
                 row[i + 3] = 255;
                 continue;
             }
-            let mut rgb = sample_bilinear(&src, w, h, sx, sy);
+            let mut rgb = sample_bilinear(buf, w, h, sx, sy);
             if ca && r_px > 1e-4 {
                 let red_points = if adj.ca_red_points.is_empty() { &warp.red } else { &adj.ca_red_points };
                 let blue_points = if adj.ca_blue_points.is_empty() { &warp.blue } else { &adj.ca_blue_points };
@@ -1866,11 +1864,11 @@ fn stage_lens_profile(
                 let blue_offset = offset(blue_points);
                 if (red_offset - k).abs() > 1e-5 {
                     rgb[0] =
-                        sample_bilinear(&src, w, h, cx + dx * red_offset, cy + dy * red_offset)[0];
+                        sample_bilinear(buf, w, h, cx + dx * red_offset, cy + dy * red_offset)[0];
                 }
                 if (blue_offset - k).abs() > 1e-5 {
                     rgb[2] =
-                        sample_bilinear(&src, w, h, cx + dx * blue_offset, cy + dy * blue_offset)[2];
+                        sample_bilinear(buf, w, h, cx + dx * blue_offset, cy + dy * blue_offset)[2];
                 }
             }
             if falloff > 0.0 {
@@ -4466,5 +4464,30 @@ over1={over1} diff_px={diff_px}",
         stage_purple_fringing(&mut both, 48, 48, crate::mock::purple_norm(50.0));
         assert_ne!(both, ca_only, "purple fringing did not run after CA");
         assert_ne!(both, purple_only, "CA did not change what purple saw");
+    }
+
+    /// The profile remap must sample the frame it was given: with blue-only CA,
+    /// red stays on the distortion's radius, so the ring moves outward by the
+    /// table's shift instead of sitting still or collapsing to zero.
+    #[test]
+    fn lens_remap_samples_the_input_frame() {
+        let mut profiled = ring(64, 0.5);
+        let before = brightest_t(&profiled, 64);
+        let mut adj = off();
+        adj.lens.use_profile = true;
+        adj.lens.distortion = 100.0;
+        adj.lens.chromatic_aberration = true;
+        adj.lens.ca_blue_points = vec![(0.0, 0.0), (1.0, -0.03)];
+        stage_lens(&mut profiled, 64, 64, &adj.lens, Some(&warp(&[(0.0, 0.0), (1.0, 0.05)], &[])));
+        let after = brightest_t(&profiled, 64);
+        assert!(after > before + 0.02 && after < before + 0.10, "ring {before} -> {after}");
+
+        let mut generic = ring(64, 0.5);
+        let mut adj = off();
+        adj.lens.distortion = 60.0;
+        adj.lens.light_falloff = 40.0;
+        adj.lens.chromatic_aberration = true;
+        stage_lens(&mut generic, 64, 64, &adj.lens, None);
+        assert!(generic.iter().step_by(4).copied().max().unwrap_or(0) > 200, "generic remap blanked the frame");
     }
 }

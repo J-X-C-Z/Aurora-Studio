@@ -48,10 +48,8 @@ pub enum ToolTab {
     Library,
     Capture,
     Lens,
-    Color,
-    Exposure,
+    Grading,
     Details,
-    Layers,
     Portrait,
     Adjustments,
     Metadata,
@@ -63,14 +61,12 @@ pub enum ToolTab {
 
 impl ToolTab {
     /// Last of all is Quick, so the Ctrl+1…9 shortcuts keep their tabs.
-    pub const ALL: [ToolTab; 13] = [
+    pub const ALL: [ToolTab; 11] = [
         ToolTab::Library,
         ToolTab::Capture,
         ToolTab::Lens,
-        ToolTab::Color,
-        ToolTab::Exposure,
+        ToolTab::Grading,
         ToolTab::Details,
-        ToolTab::Layers,
         ToolTab::Portrait,
         ToolTab::Adjustments,
         ToolTab::Metadata,
@@ -84,10 +80,8 @@ impl ToolTab {
             ToolTab::Library => t("Library", "图库"),
             ToolTab::Capture => t("Capture", "拍摄"),
             ToolTab::Lens => t("Lens", "镜头"),
-            ToolTab::Color => t("Color", "色彩"),
-            ToolTab::Exposure => t("Exposure", "曝光"),
+            ToolTab::Grading => t("Grading", "调色"),
             ToolTab::Details => t("Details", "细节"),
-            ToolTab::Layers => t("Nodes", "节点"),
             ToolTab::Portrait => t("Portrait", "人像"),
             ToolTab::Adjustments => t("Adjustments", "调整"),
             ToolTab::Metadata => t("Metadata", "元数据"),
@@ -103,10 +97,8 @@ impl ToolTab {
             ToolTab::Library => I::LibraryBig,
             ToolTab::Capture => I::Camera,
             ToolTab::Lens => I::Aperture,
-            ToolTab::Color => I::Palette,
-            ToolTab::Exposure => I::SunMedium,
+            ToolTab::Grading => I::Palette,
             ToolTab::Details => I::ScanSearch,
-            ToolTab::Layers => I::Workflow,
             ToolTab::Portrait => I::ScanFace,
             ToolTab::Adjustments => I::SlidersHorizontal,
             ToolTab::Metadata => I::Info,
@@ -685,7 +677,7 @@ impl AppState {
             edits,
             active_layer: None,
             active_node: None,
-            tool_tab: tab_from(&settings.workspace.tab).unwrap_or(ToolTab::Exposure),
+            tool_tab: tab_from(&settings.workspace.tab).unwrap_or(ToolTab::Grading),
             cursor: CursorTool::Select,
             spot_anchor: None,
             view: ViewPrefs::default(),
@@ -1916,7 +1908,7 @@ impl AppState {
             self.tool_tab = tab;
         }
         if self.tab_hidden(self.tool_tab) {
-            self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Exposure);
+            self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Grading);
         }
     }
 
@@ -1962,7 +1954,12 @@ impl AppState {
     }
 
     pub fn tab_order(&self) -> Vec<ToolTab> {
-        let mut order: Vec<ToolTab> = self.settings.workspace.tab_order.iter().filter_map(|id| tab_from(id)).collect();
+        let mut order: Vec<ToolTab> = Vec::new();
+        for tab in self.settings.workspace.tab_order.iter().filter_map(|id| tab_from(id)) {
+            if !order.contains(&tab) {
+                order.push(tab);
+            }
+        }
         for (i, tab) in default_tab_order().into_iter().enumerate() {
             if !order.contains(&tab) {
                 order.insert(i.min(order.len()), tab);
@@ -2022,7 +2019,7 @@ impl AppState {
         if hidden && self.visible_tabs().len() > 1 {
             self.settings.workspace.hidden_tabs.push(id);
             if self.tool_tab == tab {
-                self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Exposure);
+                self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Grading);
             }
         }
         self.save_settings();

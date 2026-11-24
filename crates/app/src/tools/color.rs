@@ -20,6 +20,7 @@ use crate::theme::{hex, hue_color, pal};
 use crate::widgets::*;
 use crate::{global, scoped};
 
+#[allow(dead_code)]
 pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {
     let scope = state.read(cx).scope();
     v_flex()
@@ -51,7 +52,7 @@ pub fn hue_stops() -> Vec<gpui_kit::Hsla> {
     (0..=6).map(|i| hue_color(i as f32 * 60.0, 0.75, 0.55)).collect()
 }
 
-fn base_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn base_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let base = s.adj().base.clone();
     let profiles = s.icc_picker(base.icc_profile.as_deref(), "");
@@ -172,7 +173,7 @@ fn wb_mode_name(m: WhiteBalanceMode) -> &'static str {
     }
 }
 
-fn white_balance_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn white_balance_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let wb = match scope {
         Scope::Global => s.adj().white_balance.clone(),
@@ -300,7 +301,7 @@ fn wheel_for(
         .on_commit(move |_, cx| st2.update(cx, |s, cx| s.end_gesture(cx)))
 }
 
-fn color_balance_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn color_balance_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let cb = read_scoped(s.adj(), scope, |a| &a.color_balance, |l| &l.color_balance).cloned().unwrap_or_default();
     let mode = s.panels.color_balance_mode;
@@ -445,7 +446,7 @@ pub(crate) fn hue_range_bar(range: &ColorRange, cx: &App) -> impl IntoElement + 
         )
 }
 
-fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let ce = read_scoped(s.adj(), scope, |a| &a.color_editor, |l| &l.color_editor).cloned().unwrap_or_default();
     let mode = s.panels.color_editor_mode;
@@ -656,7 +657,7 @@ fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl 
         .child(body)
 }
 
-fn black_white_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn black_white_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let bw = state.read(cx).adj().black_white.clone();
     let (st, st2) = (state.clone(), state.clone());
     let hues = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
@@ -683,7 +684,7 @@ fn black_white_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
         .child(param_c1(state, "bw-ss", "BwDarkSaturation", global!(black_white.shadow_tone.saturation), cx))
 }
 
-fn readout_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn readout_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
     let c = s.sampled_color;

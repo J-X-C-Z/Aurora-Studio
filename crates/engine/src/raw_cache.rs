@@ -1416,43 +1416,60 @@ fn max_native_bytes() -> u64 {
 /// Applies the proxy and native budgets independently, so a folder full of
 /// native frames cannot evict the proxies the viewer needs.
 fn enforce_limits(dir: &Path) {
-    enforce_budget(dir, false, MAX_ENTRIES, MAX_BYTES);
-    enforce_budget(dir, true, MAX_NATIVE_ENTRIES, max_native_bytes());
+    let (mut proxies, mut natives) = scan_cache_entries(dir);
+    enforce_items(&mut proxies, MAX_ENTRIES, MAX_BYTES);
+    enforce_items(&mut natives, MAX_NATIVE_ENTRIES, max_native_bytes());
+}
+
+/// One directory pass, partitioned by budget kind. Same name and regular-file
+/// checks as before, so foreign files in the shared folder stay untouched.
+fn scan_cache_entries(
+    dir: &Path,
+) -> (Vec<(PathBuf, u64, SystemTime)>, Vec<(PathBuf, u64, SystemTime)>) {
+    let mut proxies = Vec::new();
+    let mut natives = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else { return (proxies, natives) };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(PREFIX) || !(name.ends_with(".png") || name.ends_with(".bin")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let item = (entry.path(), meta.len(), meta.modified().unwrap_or(UNIX_EPOCH));
+        if is_native_entry(&name) {
+            natives.push(item);
+        } else {
+            proxies.push(item);
+        }
+    }
+    (proxies, natives)
 }
 
 /// Removes the oldest entries of one kind until both budgets fit.
-fn enforce_budget(dir: &Path, native: bool, max_entries: usize, max_bytes: u64) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut items: Vec<(PathBuf, u64, SystemTime)> = entries
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            is_native_entry(&name) == native
-                && name.starts_with(PREFIX)
-                && (name.ends_with(".png") || name.ends_with(".bin"))
-        })
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-            Some((e.path(), meta.len(), modified))
-        })
-        .collect();
+fn enforce_items(items: &mut Vec<(PathBuf, u64, SystemTime)>, max_entries: usize, max_bytes: u64) {
     items.sort_by_key(|(_, _, modified)| *modified);
     let mut count = items.len();
     let mut bytes: u64 = items.iter().map(|(_, size, _)| size).sum();
-    for (file, size, _) in items {
+    for (file, size, _) in items.iter() {
         if count <= max_entries && bytes <= max_bytes {
             break;
         }
-        if fs::remove_file(&file).is_ok() {
+        if fs::remove_file(file).is_ok() {
             count -= 1;
-            bytes = bytes.saturating_sub(size);
+            bytes = bytes.saturating_sub(*size);
         }
     }
+}
+
+/// Single-kind view kept for the eviction tests.
+#[cfg(test)]
+fn enforce_budget(dir: &Path, native: bool, max_entries: usize, max_bytes: u64) {
+    let (mut proxies, mut natives) = scan_cache_entries(dir);
+    enforce_items(if native { &mut natives } else { &mut proxies }, max_entries, max_bytes);
 }
 
 /// Whether a freshly decoded full-sensor frame is also worth an on-disk copy.
@@ -2271,6 +2288,34 @@ mod tests {
         assert_eq!(remaining, vec!["raw-a-0.bin".to_string(), "raw-b-0.bin".to_string()]);
         enforce_budget(&dir, true, 1, u64::MAX);
         assert_eq!(cache_files(&dir).len(), 1);
+    }
+
+    #[test]
+    fn one_scan_applies_both_budgets_and_spares_foreign_files() {
+        let dir = scratch("one-scan");
+        for name in ["raw-p1-100.bin", "raw-p2-100.bin", "raw-p3-100.bin", "raw-n1-0.bin", "raw-n2-0.bin"] {
+            fs::write(dir.join(name), vec![0u8; 10]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(dir.join("external.bin"), b"keep").unwrap();
+        fs::create_dir(dir.join("raw-dir-0.bin")).unwrap();
+
+        let (mut proxies, mut natives) = scan_cache_entries(&dir);
+        assert_eq!((proxies.len(), natives.len()), (3, 2));
+        enforce_items(&mut proxies, 2, u64::MAX);
+        enforce_items(&mut natives, 1, u64::MAX);
+
+        let mut remaining: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(PREFIX))
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["raw-n2-0.bin", "raw-p2-100.bin", "raw-p3-100.bin"]);
+        assert!(dir.join("external.bin").is_file());
+        assert!(dir.join("raw-dir-0.bin").is_dir());
     }
 
     #[test]

@@ -450,7 +450,10 @@ pub fn default_tab_order() -> Vec<ToolTab> {
 }
 
 pub fn tab_from(id: &str) -> Option<ToolTab> {
-    ToolTab::ALL.into_iter().find(|t| tab_id(*t) == id)
+    match id {
+        "Color" | "Exposure" | "Layers" => Some(ToolTab::Grading),
+        _ => ToolTab::ALL.into_iter().find(|t| tab_id(*t) == id),
+    }
 }
 
 /// Workspaces that ship with Aurora, in the order of View → Workspace.
@@ -467,14 +470,14 @@ pub fn builtin_workspaces() -> Vec<WorkspaceLayout> {
         },
         WorkspaceLayout {
             name: t("Tethering", "联机拍摄").into(),
-            hidden_tabs: hide(&[ToolTab::Capture, ToolTab::Library, ToolTab::Exposure, ToolTab::Color, ToolTab::Adjustments, ToolTab::Output]),
+            hidden_tabs: hide(&[ToolTab::Capture, ToolTab::Library, ToolTab::Grading, ToolTab::Adjustments, ToolTab::Output]),
             tab: "Capture".into(),
             filmstrip_height: 150.0,
             ..Default::default()
         },
         WorkspaceLayout {
             name: t("Portrait Retouch", "人像精修").into(),
-            hidden_tabs: hide(&[ToolTab::Color, ToolTab::Exposure, ToolTab::Details, ToolTab::Layers, ToolTab::Portrait, ToolTab::Adjustments]),
+            hidden_tabs: hide(&[ToolTab::Grading, ToolTab::Details, ToolTab::Portrait, ToolTab::Adjustments]),
             tab: "Portrait".into(),
             inspector_width: 360.0,
             multi: false,

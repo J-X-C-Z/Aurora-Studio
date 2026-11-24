@@ -185,7 +185,7 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
     }
     cx.spawn(async move |cx| {
         state.update(cx, |s, cx| {
-            s.tool_tab = ToolTab::Exposure;
+            s.tool_tab = ToolTab::Grading;
             cx.notify();
         });
         for _ in 0..300 {

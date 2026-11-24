@@ -6,15 +6,16 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     Icon, Sizable as _, VirtualListScrollHandle, h_flex, h_virtual_list,
-    menu::{ContextMenuExt as _, PopupMenuItem},
     input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt as _, PopupMenuItem},
+    scroll::{ScrollableElement as _, ScrollbarHandle as _},
     tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ObjectFit, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Window, div, img,
-    prelude::FluentBuilder as _, px, size,
+    ScrollEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Window, div,
+    img, point, prelude::FluentBuilder as _, px, size,
 };
 use aurora_engine::{ColorTag, ImageId, ImageInfo};
 
@@ -520,6 +521,7 @@ impl Render for Browser {
             }
         };
 
+        let filmstrip = mode == BrowserMode::Filmstrip;
         use gpui_kit::base::ElementExt as _;
         v_flex()
             .size_full()
@@ -531,7 +533,30 @@ impl Render for Browser {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .child(body)
+                    .when(filmstrip && count > 0, |d| {
+                        d.horizontal_scrollbar(&self.scroll).on_scroll(cx.listener(
+                            |this, e: &ScrollEvent, _, cx| {
+                                if this.state.read(cx).view.browser != BrowserMode::Filmstrip {
+                                    return;
+                                }
+                                let delta = e.delta.pixel_delta(px(72.0));
+                                let dx = f32::from(delta.x);
+                                let dy = f32::from(delta.y);
+                                if dx.abs() < 0.01 && dy.abs() > 0.01 {
+                                    let cur = this.scroll.offset();
+                                    let content_w = f32::from(this.scroll.content_size().width);
+                                    let view_w = f32::from(this.scroll.viewport_bounds().size.width).max(this.width);
+                                    let min_x = -(content_w - view_w).max(0.0);
+                                    let next_x = (f32::from(cur.x) + dy).clamp(min_x, 0.0);
+                                    this.scroll.set_offset(point(px(next_x), cur.y));
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }
+                            },
+                        ))
+                    })
                     .on_prepaint(width_probe)
                     .when(count == 0, |d| {
                         let st = self.state.clone();
