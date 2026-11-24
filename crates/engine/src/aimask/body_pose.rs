@@ -15,6 +15,14 @@ pub const BODY_POSE_ACQUISITION_REFUSAL: &str = "body pose model acquisition";
 pub const BODY_POSE_SHA256_REFUSAL: &str = "body pose model SHA-256 manifest";
 pub const BODY_POSE_TENSOR_CONTRACT_REFUSAL: &str = "body pose tensor contract";
 pub const BODY_POSE_KEYPOINT_COUNT: usize = 69;
+/// Smallest keypoint count this loader accepts from a non-native model.
+/// The 69-slot ABI stays fail-closed: `BodyPoseInference::landmarks()` still
+/// refuses anything other than exactly `BODY_POSE_KEYPOINT_COUNT`; an adapter
+/// owns the K -> 69 mapping and must be identified in the inference receipt.
+pub const BODY_POSE_MIN_KEYPOINTS: usize = 17;
+/// Upper bound accepted from a single pose tensor, so a malformed shape cannot
+/// make the parser allocate an unreasonable keypoint vector.
+pub const BODY_POSE_MAX_KEYPOINTS: usize = 256;
 
 const MODEL_NAMES: [&str; 5] = [
     "bodyPose.onnx",
@@ -145,7 +153,7 @@ impl BodyPoseModel {
         );
         let input_size = input_size(&session.input.dims)?;
         let (output, output_layout, keypoints) =
-            keypoint_contract(&session.outputs).context(BODY_POSE_TENSOR_CONTRACT_REFUSAL)?;
+            keypoint_contract_any(&session.outputs).context(BODY_POSE_TENSOR_CONTRACT_REFUSAL)?;
         let contract = BodyPoseTensorContract {
             input_name: session.input.name.clone(),
             input_dims: session
@@ -325,6 +333,38 @@ fn prepare(source: &Image, target: (u32, u32)) -> Result<(Vec<f32>, Letterbox)> 
     ))
 }
 
+/// Accept any static `[1,K,2|3]` / `[1,2|3,K]` keypoint tensor whose `K` lies in
+/// `BODY_POSE_MIN_KEYPOINTS..=BODY_POSE_MAX_KEYPOINTS`. `K` may differ from the
+/// native 69: the caller is then responsible for an explicit K -> 69 adapter and
+/// for carrying `keypoint_semantics_version` in its receipt. Nothing here
+/// synthesizes missing slots.
+fn keypoint_contract_any(
+    outputs: &[TensorMeta],
+) -> Option<(&TensorMeta, BodyPoseOutputLayout, usize)> {
+    let min = BODY_POSE_MIN_KEYPOINTS as i64;
+    let max = BODY_POSE_MAX_KEYPOINTS as i64;
+    outputs.iter().find_map(|output| {
+        if output.element_type != 1 || output.dims.len() != 3 || output.dims[0] != 1 {
+            return None;
+        }
+        if matches!(output.dims[2], 2 | 3) && (min..=max).contains(&output.dims[1]) {
+            return Some((
+                output,
+                BodyPoseOutputLayout::KeypointXyz,
+                output.dims[1] as usize,
+            ));
+        }
+        if matches!(output.dims[1], 2 | 3) && (min..=max).contains(&output.dims[2]) {
+            return Some((
+                output,
+                BodyPoseOutputLayout::XyzKeypoint,
+                output.dims[2] as usize,
+            ));
+        }
+        None
+    })
+}
+
 fn keypoint_contract(outputs: &[TensorMeta]) -> Option<(&TensorMeta, BodyPoseOutputLayout, usize)> {
     outputs.iter().find_map(|output| {
         if output.element_type != 1 || output.dims.len() != 3 || output.dims[0] != 1 {
@@ -489,6 +529,35 @@ mod tests {
             element_type: 1,
         }];
         assert!(keypoint_contract(&wrong).is_none());
+    }
+
+    #[test]
+    fn any_layout_accepts_k_in_bounds_and_the_69_gate_stays_strict() {
+        let meta = |dims: Vec<i64>| TensorMeta {
+            name: "pose".into(),
+            dims,
+            element_type: 1,
+        };
+        for k in [17i64, 26, 33, 133] {
+            let outputs = [meta(vec![1, k, 3])];
+            let (_, layout, count) = keypoint_contract_any(&outputs).unwrap();
+            assert_eq!(layout, BodyPoseOutputLayout::KeypointXyz);
+            assert_eq!(count, k as usize);
+            assert!(keypoint_contract(&outputs).is_none(), "K={k} must not pass the 69 gate");
+        }
+        let transposed = [meta(vec![1, 3, 133])];
+        assert_eq!(
+            keypoint_contract_any(&transposed).unwrap().1,
+            BodyPoseOutputLayout::XyzKeypoint
+        );
+        assert!(keypoint_contract_any(&[meta(vec![1, 8, 3])]).is_none());
+        assert!(keypoint_contract_any(&[meta(vec![1, 300, 3])]).is_none());
+        let native = [meta(vec![1, 69, 3])];
+        assert_eq!(keypoint_contract(&native).unwrap().2, 69);
+        assert_eq!(
+            keypoint_contract_any(&native).unwrap().1,
+            BodyPoseOutputLayout::KeypointXyz
+        );
     }
 
     #[test]
