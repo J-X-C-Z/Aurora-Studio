@@ -33,6 +33,16 @@ const RAW16_MAGIC: &[u8; 8] = b"AUR16B9\0";
 const HEADER16: usize = 96;
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
+/// Full-sensor entries get their own budget: they are what a second open of
+/// the app would otherwise decode again, but they are also the large files.
+const MAX_NATIVE_ENTRIES: usize = 16;
+const MAX_NATIVE_BYTES: u64 = 2 << 30;
+/// Below this many free bytes on the cache volume, an automatic native cache
+/// write is skipped instead of filling the disk.
+const NATIVE_DISK_RESERVE: u64 = 1 << 30;
+/// Decodes at least this long (or this many pixels) are worth a native copy.
+const NATIVE_PERSIST_MIN_MILLIS: u64 = 250;
+const NATIVE_PERSIST_MIN_BYTES: u64 = 48 << 20;
 /// Bytes read at each of [`IDENTITY_SAMPLES`] evenly spread windows when the
 /// source is too large to hash whole.
 const IDENTITY_WINDOW: usize = 16 << 10;
@@ -159,10 +169,11 @@ pub(crate) fn get_or_decode_source16(
                     {
                         return Some(source_of(frame));
                     }
-                    let native_key = cache_name16_for_identity(path, 0, route, identity);
+                    let native_file =
+                        dir.join(cache_name16_for_identity(path, 0, route, identity));
                     let image = decode_and_fit(
                         path,
-                        Some(native_key),
+                        Some(&native_file),
                         &file,
                         long_side,
                         &route,
@@ -186,10 +197,10 @@ pub(crate) fn get_or_decode_source16(
             }
         }
     }
-    let native_key = cache_name16_for_identity(path, 0, route, identity);
+    let native_file = dir.join(cache_name16_for_identity(path, 0, route, identity));
     let image = decode_and_fit(
         path,
-        Some(native_key),
+        Some(&native_file),
         &file,
         long_side,
         &route,
@@ -248,11 +259,11 @@ where
         return Some(hit);
     }
     let mut decode = Some(decode);
-    let native_key = cache_name16_for_identity(path, 0, route, identity);
+    let native_file = dir.join(cache_name16_for_identity(path, 0, route, identity));
     let mut work = || {
         decode_and_fit(
             path,
-            Some(native_key.clone()),
+            Some(&native_file),
             &file,
             long_side,
             &route,
@@ -512,6 +523,7 @@ fn resized16(
 /// Downscales a full sensor frame and keeps its native samples for the first
 /// zoom request. The pending frame never triggers extra work.
 fn fit16_keep_native(
+    native_file: Option<&Path>,
     native_key: Option<String>,
     path: &Path,
     width: u32,
@@ -521,22 +533,50 @@ fn fit16_keep_native(
     provenance: DecodeProvenance,
     identity: SourceIdentity,
     route: &DecodeRoute,
+    decode_millis: Option<u64>,
+    explicit_native: bool,
 ) -> Frame16 {
     let Some((target_width, target_height, proxy)) =
         resized16(width, height, &pixels, long_side)
     else {
         return (width, height, pixels, provenance);
     };
+    // A cold proxy decode is the only place that can persist the native frame
+    // for the next session. Pixels read back from disk (`None`) are already
+    // persisted and are not rewritten.
+    if let (Some(file), Some(millis)) = (native_file, decode_millis) {
+        let input = NativePersistInput {
+            explicit_native,
+            decode_millis: millis,
+            frame_bytes: (pixels.len() as u64).saturating_mul(2),
+            // Only the Z6III reconstruction makes a re-decode expensive; a
+            // LibRaw fallback on the same route is cheap and must not trigger
+            // the expensive-path policy.
+            z6iii: provenance.unlocks_c1_z6iii_linear(),
+            free_disk: free_disk_bytes(file.parent().unwrap_or(Path::new("."))),
+        };
+        persist_native_entry(
+            file,
+            width,
+            height,
+            &pixels,
+            provenance,
+            identity,
+            route,
+            input.z6iii,
+            input,
+        );
+    }
     remember_native(native_key, path, width, height, pixels, provenance, identity, route);
     (target_width, target_height, proxy, provenance)
 }
 
-/// Decodes under one decode slot, fits the result and stores it under the
-/// requested key. A native request (long side 0) stores the full frame; a proxy
-/// request stores the proxy and retains the native samples in memory.
+/// Decodes under one decode slot, fits the result, and applies the proxy/native
+/// persistence split: proxies always persist, native frames only when
+/// [`native_persist_decision`] says the write is worth it.
 fn decode_and_fit<F>(
     path: &Path,
-    native_key: Option<String>,
+    native_file: Option<&Path>,
     probe_file: &Path,
     long_side: u32,
     route: &DecodeRoute,
@@ -546,12 +586,18 @@ fn decode_and_fit<F>(
 where
     F: FnOnce(&Path) -> Option<Frame16>,
 {
+    let started = std::time::Instant::now();
     let (width, height, pixels, provenance) = {
         let _slot = enter_decode_slot();
         count_decode();
         decode(path)?
     };
+    let millis = started.elapsed().as_millis() as u64;
+    let native_key = native_file
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
     let image = fit16_keep_native(
+        native_file,
         native_key,
         path,
         width,
@@ -561,8 +607,36 @@ where
         provenance,
         identity,
         route,
+        Some(millis),
+        long_side == 0,
     );
-    store16_binary(probe_file, image.0, image.1, &image.2, image.3, identity, route);
+    if long_side == 0 {
+        // The requested frame is the native frame, so `fit16_keep_native`
+        // returned early and persistence is decided here.
+        let z6iii = provenance.unlocks_c1_z6iii_linear();
+        let input = NativePersistInput {
+            explicit_native: true,
+            decode_millis: millis,
+            frame_bytes: (image.2.len() as u64).saturating_mul(2),
+            z6iii,
+            free_disk: free_disk_bytes(
+                native_file.and_then(Path::parent).unwrap_or(Path::new(".")),
+            ),
+        };
+        persist_native_entry(
+            probe_file,
+            image.0,
+            image.1,
+            &image.2,
+            image.3,
+            identity,
+            route,
+            z6iii,
+            input,
+        );
+    } else {
+        store16_binary(probe_file, image.0, image.1, &image.2, image.3, identity, route);
+    }
     Some(image)
 }
 
@@ -934,6 +1008,7 @@ fn cached_full_frame16(
     let (width, height, pixels, provenance) =
         read_cached16_binary(&native_file, &route, &identity)?;
     Some(fit16_keep_native(
+        Some(&native_file),
         Some(native_key),
         path,
         width,
@@ -943,6 +1018,9 @@ fn cached_full_frame16(
         provenance,
         identity,
         &route,
+        // Already persisted; never count a disk read as a fresh decode.
+        None,
+        false,
     ))
 }
 
@@ -964,6 +1042,7 @@ fn decode_frame16(
     Some(fit16_keep_native(
         // No cache directory: nothing to persist, but the pending frame is
         // still keyed by the native name.
+        None,
         Some(native_key),
         path,
         width,
@@ -973,6 +1052,8 @@ fn decode_frame16(
         provenance,
         identity,
         &route,
+        None,
+        false,
     ))
 }
 
@@ -1156,7 +1237,7 @@ fn store16_png(file: &Path, width: u32, height: u32, pixels: &[u16]) {
         let _ = fs::remove_file(&temp);
         return;
     }
-    enforce_limits(dir, MAX_ENTRIES, MAX_BYTES);
+    enforce_limits(dir);
 }
 
 fn store16_binary(
@@ -1212,7 +1293,7 @@ fn store16_binary(
         let _ = fs::remove_file(&temp);
         return false;
     }
-    enforce_limits(dir, MAX_ENTRIES, MAX_BYTES);
+    enforce_limits(dir);
     true
 }
 
@@ -1315,18 +1396,41 @@ fn store(file: &Path, image: &RgbaImage) {
         let _ = fs::remove_file(&temp);
         return;
     }
-    enforce_limits(dir, MAX_ENTRIES, MAX_BYTES);
+    enforce_limits(dir);
 }
 
-/// Removes the oldest entries until both budgets fit.
-fn enforce_limits(dir: &Path, max_entries: usize, max_bytes: u64) {
+/// Full-sensor entries end in `-0.bin` (long side 0); proxies carry the
+/// requested long side and are the cheap, always-worth-keeping half.
+fn is_native_entry(name: &str) -> bool {
+    name.starts_with(PREFIX) && name.ends_with("-0.bin")
+}
+
+fn max_native_bytes() -> u64 {
+    std::env::var("AURORA_RAW_NATIVE_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(MAX_NATIVE_BYTES)
+}
+
+/// Applies the proxy and native budgets independently, so a folder full of
+/// native frames cannot evict the proxies the viewer needs.
+fn enforce_limits(dir: &Path) {
+    enforce_budget(dir, false, MAX_ENTRIES, MAX_BYTES);
+    enforce_budget(dir, true, MAX_NATIVE_ENTRIES, max_native_bytes());
+}
+
+/// Removes the oldest entries of one kind until both budgets fit.
+fn enforce_budget(dir: &Path, native: bool, max_entries: usize, max_bytes: u64) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     let mut items: Vec<(PathBuf, u64, SystemTime)> = entries
         .flatten()
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            name.starts_with(PREFIX) && (name.ends_with(".png") || name.ends_with(".bin"))
+            is_native_entry(&name) == native
+                && name.starts_with(PREFIX)
+                && (name.ends_with(".png") || name.ends_with(".bin"))
         })
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
@@ -1348,6 +1452,197 @@ fn enforce_limits(dir: &Path, max_entries: usize, max_bytes: u64) {
             count -= 1;
             bytes = bytes.saturating_sub(size);
         }
+    }
+}
+
+/// Whether a freshly decoded full-sensor frame is also worth an on-disk copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeCachePolicy {
+    /// Never write the native frame.
+    Off,
+    /// Write it when the decode was expensive or the caller explicitly asked
+    /// for the native size.
+    Auto,
+    /// Always write it while the disk has room.
+    Always,
+}
+
+impl NativeCachePolicy {
+    fn from_env() -> Self {
+        match std::env::var("AURORA_RAW_NATIVE_CACHE").ok().as_deref() {
+            Some("0") | Some("off") | Some("OFF") => Self::Off,
+            Some("1") | Some("on") | Some("always") => Self::Always,
+            _ => Self::Auto,
+        }
+    }
+}
+
+fn native_persist_min_millis() -> u64 {
+    std::env::var("AURORA_RAW_NATIVE_CACHE_MIN_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(NATIVE_PERSIST_MIN_MILLIS)
+}
+
+fn z6iii_native_persist_enabled() -> bool {
+    !std::env::var("AURORA_RAW_NATIVE_CACHE_Z6III")
+        .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("off"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativePersist {
+    Write,
+    Skip(NativeSkipReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeSkipReason {
+    PolicyOff,
+    Z6iiiDisabled,
+    CheapDecode,
+    LowDisk,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativePersistInput {
+    explicit_native: bool,
+    decode_millis: u64,
+    frame_bytes: u64,
+    z6iii: bool,
+    free_disk: Option<u64>,
+}
+
+/// Pure decision, so the policy matrix is testable without the file system.
+fn native_persist_decision(
+    policy: NativeCachePolicy,
+    z6iii_enabled: bool,
+    min_millis: u64,
+    input: NativePersistInput,
+) -> NativePersist {
+    if policy == NativeCachePolicy::Off {
+        return NativePersist::Skip(NativeSkipReason::PolicyOff);
+    }
+    if input.z6iii && !z6iii_enabled {
+        return NativePersist::Skip(NativeSkipReason::Z6iiiDisabled);
+    }
+    let worth_it = input.explicit_native
+        || input.z6iii
+        || input.decode_millis >= min_millis
+        || input.frame_bytes >= NATIVE_PERSIST_MIN_BYTES;
+    if policy == NativeCachePolicy::Auto && !worth_it {
+        return NativePersist::Skip(NativeSkipReason::CheapDecode);
+    }
+    if let Some(free) = input.free_disk {
+        if free < input.frame_bytes.saturating_add(NATIVE_DISK_RESERVE) {
+            return NativePersist::Skip(NativeSkipReason::LowDisk);
+        }
+    }
+    NativePersist::Write
+}
+
+/// Free bytes on the volume holding `dir` (or its nearest existing parent).
+#[cfg(windows)]
+fn free_disk_bytes(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    let existing = dir.ancestors().find(|path| path.exists())?;
+    let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
+    // the two totals are allowed to be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(windows))]
+fn free_disk_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Counters for the native-cache policy decisions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeCacheStats {
+    pub written: u64,
+    pub skipped_policy_off: u64,
+    pub skipped_z6iii_disabled: u64,
+    pub skipped_cheap: u64,
+    pub skipped_low_disk: u64,
+    pub write_failed: u64,
+}
+
+impl NativeCacheStats {
+    const fn empty() -> Self {
+        Self {
+            written: 0,
+            skipped_policy_off: 0,
+            skipped_z6iii_disabled: 0,
+            skipped_cheap: 0,
+            skipped_low_disk: 0,
+            write_failed: 0,
+        }
+    }
+}
+
+static NATIVE_STATS: Mutex<NativeCacheStats> = Mutex::new(NativeCacheStats::empty());
+
+#[allow(dead_code)]
+pub fn native_cache_stats() -> NativeCacheStats {
+    *NATIVE_STATS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[allow(dead_code)]
+pub fn reset_native_cache_stats() {
+    *NATIVE_STATS.lock().unwrap_or_else(|e| e.into_inner()) = NativeCacheStats::empty();
+}
+
+/// Decides and performs the native copy for a fresh decode. Proxies are stored
+/// unconditionally elsewhere; only full-sensor entries pass through here.
+#[allow(clippy::too_many_arguments)]
+fn persist_native_entry(
+    file: &Path,
+    width: u32,
+    height: u32,
+    pixels: &[u16],
+    provenance: DecodeProvenance,
+    identity: SourceIdentity,
+    route: &DecodeRoute,
+    z6iii: bool,
+    input: NativePersistInput,
+) {
+    let decision = native_persist_decision(
+        NativeCachePolicy::from_env(),
+        z6iii_native_persist_enabled(),
+        native_persist_min_millis(),
+        input,
+    );
+    {
+        let mut stats = NATIVE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        match decision {
+            NativePersist::Write => stats.written += 1,
+            NativePersist::Skip(reason) => match reason {
+                NativeSkipReason::PolicyOff => stats.skipped_policy_off += 1,
+                NativeSkipReason::Z6iiiDisabled => stats.skipped_z6iii_disabled += 1,
+                NativeSkipReason::CheapDecode => stats.skipped_cheap += 1,
+                NativeSkipReason::LowDisk => stats.skipped_low_disk += 1,
+            },
+        }
+    }
+    if decision == NativePersist::Write
+        && !store16_binary(file, width, height, pixels, provenance, identity, route)
+    {
+        NATIVE_STATS.lock().unwrap_or_else(|e| e.into_inner()).write_failed += 1;
     }
 }
 
@@ -1954,9 +2249,27 @@ mod tests {
             fs::write(dir.join(format!("{PREFIX}{i}.png")), vec![0u8; 10]).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        enforce_limits(&dir, 2, u64::MAX);
+        enforce_budget(&dir, false, 2, u64::MAX);
         assert_eq!(cache_files(&dir).len(), 2);
-        enforce_limits(&dir, 10, 15);
+        enforce_budget(&dir, false, 10, 15);
+        assert_eq!(cache_files(&dir).len(), 1);
+    }
+
+    #[test]
+    fn native_and_proxy_budgets_are_separate() {
+        let dir = scratch("evict-split");
+        // Two proxies and two native entries; a proxy-only budget must not
+        // touch the native files.
+        for name in ["raw-a-100.png", "raw-b-100.png", "raw-a-0.bin", "raw-b-0.bin"] {
+            fs::write(dir.join(name), vec![0u8; 10]).unwrap();
+        }
+        enforce_budget(&dir, false, 0, u64::MAX);
+        let remaining: Vec<String> = cache_files(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining, vec!["raw-a-0.bin".to_string(), "raw-b-0.bin".to_string()]);
+        enforce_budget(&dir, true, 1, u64::MAX);
         assert_eq!(cache_files(&dir).len(), 1);
     }
 
@@ -2243,5 +2556,181 @@ mod tests {
         .expect("full-size request");
         assert_eq!(calls.get(), 0, "a late unrelated decode must not evict this frame");
         assert_eq!(full.2, fast_pixels);
+    }
+
+    /// Runs `f` with `AURORA_RAW_NATIVE_CACHE` (and the Z6III switch) pinned,
+    /// restoring the environment afterwards. The cache tests that depend on the
+    /// policy hold the same lock, so no other test observes the override.
+    fn with_native_policy<T>(
+        policy: Option<&str>,
+        z6iii: Option<&str>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
+        let previous_policy = std::env::var_os("AURORA_RAW_NATIVE_CACHE");
+        let previous_z6iii = std::env::var_os("AURORA_RAW_NATIVE_CACHE_Z6III");
+        // SAFETY: every test that reads these variables or writes native cache
+        // entries holds the same serial lock.
+        unsafe {
+            match policy {
+                Some(value) => std::env::set_var("AURORA_RAW_NATIVE_CACHE", value),
+                None => std::env::remove_var("AURORA_RAW_NATIVE_CACHE"),
+            }
+            match z6iii {
+                Some(value) => std::env::set_var("AURORA_RAW_NATIVE_CACHE_Z6III", value),
+                None => std::env::remove_var("AURORA_RAW_NATIVE_CACHE_Z6III"),
+            }
+        }
+        let result = f();
+        // SAFETY: as above; the lock is still held.
+        unsafe {
+            match previous_policy {
+                Some(value) => std::env::set_var("AURORA_RAW_NATIVE_CACHE", value),
+                None => std::env::remove_var("AURORA_RAW_NATIVE_CACHE"),
+            }
+            match previous_z6iii {
+                Some(value) => std::env::set_var("AURORA_RAW_NATIVE_CACHE_Z6III", value),
+                None => std::env::remove_var("AURORA_RAW_NATIVE_CACHE_Z6III"),
+            }
+        }
+        result
+    }
+
+    fn z6iii_proxy_entry(dir: &Path) -> (PathBuf, DecodeRoute, DecodeProvenance, Vec<u16>) {
+        let path = dir.join("z6iii.nef");
+        fs::write(&path, b"z6iii-he-source").unwrap();
+        let route = test_route(true, true);
+        let provenance = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl);
+        (path, route, provenance, vec![4321u16; 80 * 40 * 4])
+    }
+
+    #[test]
+    fn z6iii_proxy_decode_persists_the_native_frame_by_default() {
+        with_native_policy(None, None, || {
+            let dir = scratch("raw16-z6iii-native");
+            let (path, route, provenance, pixels) = z6iii_proxy_entry(&dir);
+            reset_native_cache_stats();
+            get_or_decode16_with_route(&path, &dir, 40, route, |_| {
+                Some((80, 40, pixels.clone(), provenance))
+            })
+            .expect("proxy decode");
+            assert_eq!(
+                cache_files(&dir).len(),
+                2,
+                "the proxy and the expensive native frame are both persisted"
+            );
+            assert!(native_cache_stats().written >= 1);
+        });
+    }
+
+    #[test]
+    fn native_cache_off_keeps_only_the_proxy() {
+        with_native_policy(Some("off"), None, || {
+            let dir = scratch("raw16-native-off");
+            let (path, route, provenance, pixels) = z6iii_proxy_entry(&dir);
+            reset_native_cache_stats();
+            get_or_decode16_with_route(&path, &dir, 40, route, |_| {
+                Some((80, 40, pixels.clone(), provenance))
+            })
+            .expect("proxy decode");
+            assert_eq!(cache_files(&dir).len(), 1);
+            assert!(native_cache_stats().skipped_policy_off >= 1);
+        });
+    }
+
+    #[test]
+    fn z6iii_native_switch_keeps_only_the_proxy() {
+        with_native_policy(None, Some("0"), || {
+            let dir = scratch("raw16-z6iii-switch");
+            let (path, route, provenance, pixels) = z6iii_proxy_entry(&dir);
+            reset_native_cache_stats();
+            get_or_decode16_with_route(&path, &dir, 40, route, |_| {
+                Some((80, 40, pixels.clone(), provenance))
+            })
+            .expect("proxy decode");
+            assert_eq!(cache_files(&dir).len(), 1);
+            assert!(native_cache_stats().skipped_z6iii_disabled >= 1);
+        });
+    }
+
+    #[test]
+    fn native_policy_matrix() {
+        let base = NativePersistInput {
+            explicit_native: false,
+            decode_millis: 10,
+            frame_bytes: 1000,
+            z6iii: false,
+            free_disk: Some(u64::MAX),
+        };
+        let write = NativePersist::Write;
+        assert_eq!(
+            native_persist_decision(NativeCachePolicy::Off, true, 250, base),
+            NativePersist::Skip(NativeSkipReason::PolicyOff)
+        );
+        assert_eq!(
+            native_persist_decision(NativeCachePolicy::Auto, true, 250, base),
+            NativePersist::Skip(NativeSkipReason::CheapDecode)
+        );
+        assert_eq!(
+            native_persist_decision(
+                NativeCachePolicy::Auto,
+                true,
+                250,
+                NativePersistInput { explicit_native: true, ..base }
+            ),
+            write
+        );
+        assert_eq!(
+            native_persist_decision(
+                NativeCachePolicy::Auto,
+                true,
+                250,
+                NativePersistInput { decode_millis: 300, ..base }
+            ),
+            write
+        );
+        assert_eq!(
+            native_persist_decision(
+                NativeCachePolicy::Auto,
+                true,
+                250,
+                NativePersistInput { z6iii: true, ..base }
+            ),
+            write
+        );
+        assert_eq!(
+            native_persist_decision(
+                NativeCachePolicy::Auto,
+                false,
+                250,
+                NativePersistInput { z6iii: true, ..base }
+            ),
+            NativePersist::Skip(NativeSkipReason::Z6iiiDisabled)
+        );
+        assert_eq!(
+            native_persist_decision(NativeCachePolicy::Always, true, 250, base),
+            write
+        );
+        assert_eq!(
+            native_persist_decision(
+                NativeCachePolicy::Always,
+                true,
+                250,
+                NativePersistInput {
+                    free_disk: Some(1000 + NATIVE_DISK_RESERVE - 1),
+                    ..base
+                }
+            ),
+            NativePersist::Skip(NativeSkipReason::LowDisk)
+        );
+        assert_eq!(
+            native_persist_decision(
+                NativeCachePolicy::Auto,
+                true,
+                250,
+                NativePersistInput { frame_bytes: NATIVE_PERSIST_MIN_BYTES, ..base }
+            ),
+            write
+        );
     }
 }
