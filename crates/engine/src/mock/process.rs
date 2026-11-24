@@ -1,6 +1,7 @@
 //! A small CPU development pipeline. It is not color-accurate; it exists so every
 //! control in the interface has a visible, plausible effect during UI work.
 
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}};
 
@@ -70,7 +71,7 @@ impl GammaLut {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SourceSample {
     rgb: [f32; 3],
     valid: bool,
@@ -106,32 +107,44 @@ struct SourceSampleKey {
     cubic: bool,
 }
 
-type SourceSampleCache = Mutex<Option<(SourceSampleKey, Arc<Vec<SourceSample>>)>>;
-/// Frames above this would allocate a full sample vector without caching it.
-const SOURCE_SAMPLE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// One cached square of output-space samples.
+///
+/// The old cache held at most one whole frame under 64 MiB; anything larger was
+/// re-sampled on every colour drag. These tiles are keyed by the sampling
+/// dependencies only (source snapshot, geometry, crop/region, output size, mip,
+/// interpolation) — never by a colour or tone parameter — so a slider that does
+/// not move geometry reuses every tile it can keep in the byte budget.
+const SAMPLE_TILE: u32 = 256;
+/// Sampled-tile bytes kept between frames. Overridable with
+/// `AURORA_SAMPLE_TILE_BUDGET_MB`; eviction is oldest-inserted first.
+const SAMPLE_TILE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
-fn streams_source_samples(out_w: u32, out_h: u32) -> bool {
-    (out_w as usize)
-        .saturating_mul(out_h as usize)
-        .saturating_mul(std::mem::size_of::<SourceSample>())
-        > SOURCE_SAMPLE_CACHE_MAX_BYTES
+const EMPTY_SAMPLE: SourceSample = SourceSample { rgb: [0.0; 3], valid: false };
+
+struct TileStore {
+    key: SourceSampleKey,
+    tiles: HashMap<(u32, u32), Arc<Vec<SourceSample>>>,
+    order: VecDeque<(u32, u32)>,
+    bytes: usize,
 }
 
-/// One exact sampled source frame. A slider that only changes colour reuses it;
-/// geometry, crop, output size, mip and interpolation all participate in the key.
-fn source_samples(
+impl TileStore {
+    fn new(key: SourceSampleKey) -> Self {
+        Self { key, tiles: HashMap::new(), order: VecDeque::new(), bytes: 0 }
+    }
+}
+
+/// The sampling dependencies of one render. Colour parameters are absent.
+fn sample_key(
     src: &Source,
-    map: &super::geometry::FrameMap,
     geometry: &Geometry,
     region: NormRect,
     out_w: u32,
     out_h: u32,
     level: usize,
     cubic: bool,
-    xs: &[f32],
-) -> Arc<Vec<SourceSample>> {
-    static CACHE: OnceLock<SourceSampleCache> = OnceLock::new();
-    let key = SourceSampleKey {
+) -> SourceSampleKey {
+    SourceSampleKey {
         source: src.snapshot_id(),
         geometry: geometry.clone(),
         region,
@@ -139,28 +152,197 @@ fn source_samples(
         out_h,
         level,
         cubic,
-    };
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some((cached_key, samples)) = cache.lock().unwrap_or_else(|error| error.into_inner()).as_ref() {
-        if cached_key == &key {
-            return Arc::clone(samples);
+    }
+}
+
+fn tile_budget_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("AURORA_SAMPLE_TILE_BUDGET_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(SAMPLE_TILE_BUDGET_BYTES)
+    })
+}
+
+fn tile_store() -> &'static Mutex<Option<TileStore>> {
+    static STORE: OnceLock<Mutex<Option<TileStore>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(None))
+}
+
+fn tile_lookup(key: &SourceSampleKey, tx: u32, ty: u32) -> Option<Arc<Vec<SourceSample>>> {
+    let mut slot = tile_store().lock().unwrap_or_else(|error| error.into_inner());
+    let store = slot.as_ref()?;
+    if &store.key != key {
+        return None;
+    }
+    store.tiles.get(&(tx, ty)).cloned()
+}
+
+fn tile_insert(key: &SourceSampleKey, tx: u32, ty: u32, tile: Arc<Vec<SourceSample>>) {
+    let bytes = tile.len().saturating_mul(std::mem::size_of::<SourceSample>());
+    let budget = tile_budget_bytes();
+    if bytes > budget {
+        return;
+    }
+    let mut slot = tile_store().lock().unwrap_or_else(|error| error.into_inner());
+    if slot.as_ref().is_none_or(|store| &store.key != key) {
+        *slot = Some(TileStore::new(key.clone()));
+    }
+    let store = slot.as_mut().expect("store was just created");
+    if store.tiles.contains_key(&(tx, ty)) {
+        return;
+    }
+    store.tiles.insert((tx, ty), tile);
+    store.order.push_back((tx, ty));
+    store.bytes = store.bytes.saturating_add(bytes);
+    while store.bytes > budget {
+        let Some(oldest) = store.order.pop_front() else { break };
+        if let Some(evicted) = store.tiles.remove(&oldest) {
+            store.bytes = store
+                .bytes
+                .saturating_sub(evicted.len().saturating_mul(std::mem::size_of::<SourceSample>()));
         }
     }
+}
 
-    let mut samples = vec![SourceSample { rgb: [0.0; 3], valid: false }; (out_w * out_h) as usize];
-    samples.par_chunks_mut(out_w as usize).enumerate().for_each(|(y, line)| {
-        let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
-        for (x, &fx) in xs.iter().enumerate() {
-            line[x] = source_sample_at(src, map, level, cubic, [fx, fy]);
+/// One `SAMPLE_TILE` square of the requested output frame. Sampling is the same
+/// per-pixel formula the whole-frame cache used, so results are bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn fill_tile(
+    src: &Source,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    xs: &[f32],
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    cubic: bool,
+    tx: u32,
+    ty: u32,
+) -> Vec<SourceSample> {
+    let x0 = tx * SAMPLE_TILE;
+    let y0 = ty * SAMPLE_TILE;
+    let width = (out_w - x0).min(SAMPLE_TILE) as usize;
+    let height = (out_h - y0).min(SAMPLE_TILE) as usize;
+    let mut tile = vec![EMPTY_SAMPLE; width * height];
+    tile.par_chunks_mut(width).enumerate().for_each(|(row, line)| {
+        let fy = region.y + ((y0 + row as u32) as f32 + 0.5) / out_h as f32 * region.height;
+        for (column, pixel) in line.iter_mut().enumerate() {
+            let fx = xs[x0 as usize + column];
+            *pixel = source_sample_at(src, map, level, cubic, [fx, fy]);
         }
     });
-    let samples = Arc::new(samples);
-    if samples.len().saturating_mul(std::mem::size_of::<SourceSample>())
-        <= SOURCE_SAMPLE_CACHE_MAX_BYTES
-    {
-        *cache.lock().unwrap_or_else(|error| error.into_inner()) = Some((key, Arc::clone(&samples)));
+    tile
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tile_for(
+    src: &Source,
+    map: &super::geometry::FrameMap,
+    key: &SourceSampleKey,
+    region: NormRect,
+    xs: &[f32],
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    cubic: bool,
+    tx: u32,
+    ty: u32,
+) -> Arc<Vec<SourceSample>> {
+    if let Some(tile) = tile_lookup(key, tx, ty) {
+        return tile;
     }
-    samples
+    let tile = Arc::new(fill_tile(src, map, region, xs, out_w, out_h, level, cubic, tx, ty));
+    tile_insert(key, tx, ty, Arc::clone(&tile));
+    tile
+}
+
+/// One render's sampling dependencies; bands of it are pulled on demand so a
+/// 45 MP frame never materialises a full-frame sample array.
+struct BandSampler<'a> {
+    src: &'a Source,
+    map: &'a super::geometry::FrameMap,
+    key: SourceSampleKey,
+    region: NormRect,
+    xs: &'a [f32],
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    cubic: bool,
+}
+
+impl BandSampler<'_> {
+    /// Fills `band` with output rows `y0 .. y0 + rows` (row-major, `out_w` wide).
+    /// A band is one tile row tall, so it maps onto whole cached tiles.
+    fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
+        let out_w = self.out_w as usize;
+        band.clear();
+        band.resize(rows as usize * out_w, EMPTY_SAMPLE);
+        let ty = y0 / SAMPLE_TILE;
+        let columns = self.out_w.div_ceil(SAMPLE_TILE);
+        let tiles: Vec<Arc<Vec<SourceSample>>> = (0..columns)
+            .into_par_iter()
+            .map(|tx| {
+                tile_for(
+                    self.src, self.map, &self.key, self.region, self.xs, self.out_w, self.out_h,
+                    self.level, self.cubic, tx, ty,
+                )
+            })
+            .collect();
+        band.par_chunks_mut(out_w).enumerate().for_each(|(row, line)| {
+            let local = (y0 + row as u32) % SAMPLE_TILE;
+            for (tx, tile) in tiles.iter().enumerate() {
+                let x0 = tx as u32 * SAMPLE_TILE;
+                let width = (self.out_w - x0).min(SAMPLE_TILE) as usize;
+                let offset = local as usize * width;
+                line[x0 as usize..x0 as usize + width]
+                    .copy_from_slice(&tile[offset..offset + width]);
+            }
+        });
+    }
+}
+
+/// Reusable F32 working frames. Bounded on purpose: a 24/45 MP frame stays
+/// out of the pool (its bytes would double the steady-state RSS for no reuse),
+/// while the 1080p/4K frames a slider drag rebuilds every frame are reused.
+const F32_FRAME_POOL_MAX_BYTES: usize = 256 * 1024 * 1024;
+const F32_FRAME_POOL_MAX_ENTRY_BYTES: usize = 128 * 1024 * 1024;
+const F32_PIXEL_BYTES: usize = std::mem::size_of::<[f32; 3]>();
+
+fn f32_frame_pool() -> &'static Mutex<Vec<Vec<[f32; 3]>>> {
+    static POOL: OnceLock<Mutex<Vec<Vec<[f32; 3]>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn take_f32_frame(len: usize) -> Vec<[f32; 3]> {
+    let mut pool = f32_frame_pool().lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = pool.iter().position(|frame| frame.capacity() >= len) {
+        let mut frame = pool.swap_remove(index);
+        frame.resize(len, [0.0; 3]);
+        frame.fill([0.0; 3]);
+        return frame;
+    }
+    vec![[0.0; 3]; len]
+}
+
+fn give_f32_frame(mut frame: Vec<[f32; 3]>) {
+    let bytes = frame.capacity().saturating_mul(F32_PIXEL_BYTES);
+    if bytes > F32_FRAME_POOL_MAX_ENTRY_BYTES {
+        return;
+    }
+    let mut pool = f32_frame_pool().lock().unwrap_or_else(|error| error.into_inner());
+    let held: usize = pool
+        .iter()
+        .map(|frame| frame.capacity().saturating_mul(F32_PIXEL_BYTES))
+        .sum();
+    if held.saturating_add(bytes) > F32_FRAME_POOL_MAX_BYTES {
+        return;
+    }
+    frame.clear();
+    pool.push(frame);
 }
 
 impl Source {
@@ -1761,6 +1943,11 @@ fn develop_gpu_gain_plane(
 
 /// The GPU develop plane for this frame, or `None` when the existing CPU path
 /// must run. Every refusal is logged once, not once per frame.
+///
+/// `region_backed` says whether a partial region may go to the device. The
+/// point chain has no neighbourhood dependency, so a Zoom/Pan viewport qualifies;
+/// callers that need a halo (the F32 detail path) pass `false` and stay on the
+/// CPU until a halo-aware GPU stage exists.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn gpu_develop_context(
@@ -1772,6 +1959,7 @@ fn gpu_develop_context(
     out_h: u32,
     xs: &[f32],
     camera_usm_path: bool,
+    region_backed: bool,
 ) -> Option<(super::develop_gpu::DevelopParams, Option<Vec<f32>>)> {
     use super::develop_gpu;
     if !develop_gpu::enabled() {
@@ -1787,12 +1975,8 @@ fn gpu_develop_context(
         log_develop_gpu_fallback("camera-space USM needs the C1 intermediate");
         return None;
     }
-    if region != NormRect::FULL {
-        log_develop_gpu_fallback("only full-frame develop regions are GPU-backed");
-        return None;
-    }
-    if !develop_gpu::prewarm() {
-        log_develop_gpu_fallback("CUDA device/PTX unavailable");
+    if region != NormRect::FULL && !region_backed {
+        log_develop_gpu_fallback("region needs a CPU halo for this stage");
         return None;
     }
     let mut params = develop_gpu::DevelopParams::from_adjustments(
@@ -1817,6 +2001,25 @@ fn gpu_develop_context(
             }
         }
     }
+    // P0: the admission check runs before anything frame-sized exists — no
+    // prewarm, no gain plane, no host IO, no sample band.
+    if !develop_gpu::can_run_develop_gpu(
+        out_w as usize,
+        out_h as usize,
+        &params,
+        develop_gpu::develop_budget(),
+    ) {
+        log_develop_gpu_fallback("frame exceeds the 768 MiB retained budget");
+        return None;
+    }
+    if !develop_gpu::crossover_admits(out_w as usize, out_h as usize) {
+        log_develop_gpu_fallback("output is below the measured CPU/GPU crossover");
+        return None;
+    }
+    if !develop_gpu::prewarm() {
+        log_develop_gpu_fallback("CUDA device/PTX unavailable");
+        return None;
+    }
     let gain = if bypass {
         None
     } else {
@@ -1825,24 +2028,213 @@ fn gpu_develop_context(
     Some((params, gain))
 }
 
-/// The already-sampled frame, converted to the develop module's POD sample.
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn gpu_develop_samples(
+/// Identity of what the dust model is shown: the source snapshot, its geometry,
+/// the region and the frame size. Colour, tone and every other slider stay out,
+/// so dragging exposure/WB/curves reuses the detection mask (C1 detects on the
+/// base image).
+fn dust_frame_key(
     src: &Source,
-    map: &super::geometry::FrameMap,
-    adj: &AdjustmentSet,
+    geometry: &Geometry,
     region: NormRect,
     out_w: u32,
     out_h: u32,
-    level: usize,
-    sharp: bool,
-    xs: &[f32],
-) -> Vec<super::develop_gpu::Sample> {
-    source_samples(src, map, &adj.geometry, region, out_w, out_h, level, sharp, xs)
-        .iter()
-        .map(|sample| super::develop_gpu::Sample { rgb: sample.rgb, valid: sample.valid })
-        .collect()
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    src.snapshot_id().hash(&mut hasher);
+    hash_geometry(geometry, &mut hasher);
+    for value in [region.x, region.y, region.width, region.height] {
+        value.to_bits().hash(&mut hasher);
+    }
+    out_w.hash(&mut hasher);
+    out_h.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
+    geometry.rotation.to_bits().hash(hasher);
+    geometry.orientation.hash(hasher);
+    geometry.flip_horizontal.hash(hasher);
+    geometry.flip_vertical.hash(hasher);
+    geometry.crop_outside_image.hash(hasher);
+    for value in [
+        geometry.crop.x,
+        geometry.crop.y,
+        geometry.crop.width,
+        geometry.crop.height,
+        geometry.canvas[0],
+        geometry.canvas[1],
+        geometry.optical_center[0],
+        geometry.optical_center[1],
+    ] {
+        value.to_bits().hash(hasher);
+    }
+    geometry.aspect.hash(hasher);
+    geometry.portrait.hash(hasher);
+    let keystone = &geometry.keystone;
+    for value in [
+        keystone.vertical,
+        keystone.horizontal,
+        keystone.amount,
+        keystone.aspect,
+        keystone.skew,
+        keystone.focal_length,
+    ] {
+        value.to_bits().hash(hasher);
+    }
+    keystone.flags.hash(hasher);
+    for axis in [&geometry.distortion.v, &geometry.distortion.x, &geometry.distortion.m] {
+        axis.len().hash(hasher);
+        for value in axis {
+            value.to_bits().hash(hasher);
+        }
+    }
+}
+
+/// Kernel-space region of output rows `y0 .. y0 + rows`. With a gain plane the
+/// kernel never reads the normalised coordinates (only the disabled outer
+/// banding does), so a band is bit-identical to the whole-frame call.
+fn band_region(region: NormRect, y0: u32, rows: u32, out_h: u32) -> [f32; 4] {
+    let top = region.y + y0 as f32 / out_h as f32 * region.height;
+    let height = rows as f32 / out_h as f32 * region.height;
+    [region.x, top, region.width, height]
+}
+
+/// Runs the point chain band by band straight from the tile cache into the
+/// `u8`/`u16` output rows. No full-frame `SourceSample`, `Sample` or display
+/// array is created: each band fills the pooled GPU IO frame, the kernel
+/// develops it in place, and the rows are quantised from that buffer.
+/// `false` means a band declined and the caller must run the CPU loop.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn encode_gpu_develop_bands(
+    bands: &BandSampler<'_>,
+    params: &super::develop_gpu::DevelopParams,
+    gain: Option<&[f32]>,
+    rgba: &mut [u8],
+    mut rgba16: Option<&mut [u16]>,
+) -> bool {
+    use super::develop_gpu;
+    let out_w = bands.out_w;
+    let out_h = bands.out_h;
+    let row = (out_w * 4) as usize;
+    let width = out_w as usize;
+    let mut band = Vec::new();
+    let mut y0 = 0u32;
+    while y0 < out_h {
+        let rows = (out_h - y0).min(SAMPLE_TILE);
+        bands.band(y0, rows, &mut band);
+        let start = y0 as usize * row;
+        let end = start + rows as usize * row;
+        let gain_band = gain.map(|plane| {
+            &plane[y0 as usize * width..(y0 + rows) as usize * width]
+        });
+        let region = band_region(bands.region, y0, rows, out_h);
+        let done = develop_gpu::develop_band_sampled(
+            width,
+            rows as usize,
+            region,
+            params,
+            gain_band,
+            |x, y| {
+                let sample = band[y * width + x];
+                sample.valid.then_some(sample.rgb)
+            },
+            |io| match rgba16.as_deref_mut() {
+                Some(wide) => encode_io_rows(io, width, &mut rgba[start..end], Some(&mut wide[start..end])),
+                None => encode_io_rows(io, width, &mut rgba[start..end], None),
+            },
+        );
+        if done.is_none() {
+            return false;
+        }
+        y0 += rows;
+    }
+    true
+}
+
+/// Quantises a developed band (4 floats per pixel) into the 8-bit and optional
+/// 16-bit output rows.
+fn encode_io_rows(io: &[f32], width: usize, rgba: &mut [u8], rgba16: Option<&mut [u16]>) {
+    let row = width * 4;
+    match rgba16 {
+        Some(wide) => {
+            rgba.par_chunks_mut(row)
+                .zip(wide.par_chunks_mut(row))
+                .zip(io.par_chunks(width * 4))
+                .for_each(|((line8, line16), src_row)| {
+                    for (x, src) in src_row.chunks_exact(4).enumerate() {
+                        let i = x * 4;
+                        for k in 0..3 {
+                            let v = src[k].clamp(0.0, 1.0);
+                            line8[i + k] = (v * 255.0 + 0.5) as u8;
+                            line16[i + k] = (v * 65535.0 + 0.5) as u16;
+                        }
+                        line8[i + 3] = 255;
+                        line16[i + 3] = 65535;
+                    }
+                });
+        }
+        None => {
+            rgba.par_chunks_mut(row)
+                .zip(io.par_chunks(width * 4))
+                .for_each(|(line8, src_row)| {
+                    for (x, src) in src_row.chunks_exact(4).enumerate() {
+                        let i = x * 4;
+                        for k in 0..3 {
+                            line8[i + k] = (src[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        }
+                        line8[i + 3] = 255;
+                    }
+                });
+        }
+    }
+}
+
+/// The plain CPU develop loop, band by band from the tile cache.
+#[allow(clippy::too_many_arguments)]
+fn develop_bands(
+    plan: &Plan,
+    bands: &BandSampler<'_>,
+    bypass: bool,
+    pre: Option<&super::clarity::PreCurve>,
+    rgba: &mut [u8],
+    mut rgba16: Option<&mut [u16]>,
+) {
+    let out_w = bands.out_w;
+    let out_h = bands.out_h;
+    let row = (out_w * 4) as usize;
+    let xs = bands.xs;
+    let region = bands.region;
+    let mut band = Vec::new();
+    let mut y0 = 0u32;
+    while y0 < out_h {
+        let rows = (out_h - y0).min(SAMPLE_TILE);
+        bands.band(y0, rows, &mut band);
+        let start = y0 as usize * row;
+        let end = start + rows as usize * row;
+        match rgba16.as_deref_mut() {
+            Some(wide) => {
+                rgba[start..end]
+                    .par_chunks_mut(row)
+                    .zip(wide[start..end].par_chunks_mut(row))
+                    .enumerate()
+                    .for_each(|(r, (line, line16))| {
+                        develop_line(
+                            plan, region, out_h, xs, &band, r, bypass, pre, line, Some(line16),
+                        );
+                    });
+            }
+            None => {
+                rgba[start..end]
+                    .par_chunks_mut(row)
+                    .enumerate()
+                    .for_each(|(r, line)| {
+                        develop_line(plan, region, out_h, xs, &band, r, bypass, pre, line, None);
+                    });
+            }
+        }
+        y0 += rows;
+    }
 }
 
 fn render_sized(
@@ -1922,8 +2314,17 @@ fn render_sized(
         };
         let lcc = plan.uniform_light.as_ref().and_then(|(stage, _, _)| {
             let (sw, sh) = src.size();
-            super::pixel_gpu::lcc_plane_cached(&stage.gpu_grid(), sw as usize, sh as usize)
-                .map(|plane| (plane, sw as usize, sh as usize))
+            // P-08 / S6 §2.1: a cold source-sized plane costs more than the CPU
+            // grid unless the frame actually consumes ~20% of it. Warm hits are
+            // still served unconditionally by `lcc_plane_for_output`, so dragging
+            // the LCC amount keeps its 0.23-0.29x advantage.
+            super::pixel_gpu::lcc_plane_for_output(
+                &stage.gpu_grid(),
+                sw as usize,
+                sh as usize,
+                (out_w as usize).saturating_mul(out_h as usize),
+            )
+            .map(|plane| (plane, sw as usize, sh as usize))
         });
         if vignette.is_some() || lcc.is_some() {
             plan.pixel_gains = Some(PixelGains { vignette, lcc });
@@ -1989,6 +2390,9 @@ fn render_sized(
         && adj.sharpening.amount > 0.0;
     #[cfg(all(windows, not(feature = "z6iii-raw-export")))]
     let camera_usm_path = false;
+    // The F32 detail path needs a halo outside a partial region, so it keeps
+    // the full-frame requirement until a halo-aware GPU stage exists.
+    let region_backed = region == NormRect::FULL || !use_f32_detail;
     #[cfg(windows)]
     let gpu_develop = gpu_develop_context(
         &plan,
@@ -1999,63 +2403,42 @@ fn render_sized(
         out_h,
         &xs,
         camera_usm_path,
+        region_backed,
     );
-    // Bypass / no-detail renders take the direct u8/u16 line path; run the
-    // point chain once here and let the existing encoder quantise it.
-    #[cfg(windows)]
-    let gpu_direct: Option<Vec<[f32; 3]>> =
-        if gpu_two_pass || use_f32_detail || gpu_develop.is_none() {
-            None
-        } else {
-            gpu_develop.as_ref().and_then(|(params, gain)| {
-                let samples =
-                    gpu_develop_samples(src, &map, adj, region, out_w, out_h, level, sharp, &xs);
-                let mut display = vec![[0.0f32; 3]; (out_w * out_h) as usize];
-                let region4 = [region.x, region.y, region.width, region.height];
-                if super::develop_gpu::develop_plane(
-                    &samples,
-                    out_w as usize,
-                    out_h as usize,
-                    region4,
-                    params,
-                    gain.as_deref(),
-                    &mut display,
-                ) {
-                    Some(display)
-                } else {
-                    log_develop_gpu_fallback("CUDA develop launch failed");
-                    None
-                }
-            })
-        };
-    #[cfg(not(windows))]
-    let gpu_direct: Option<Vec<[f32; 3]>> = None;
+    // Band-sampled CPU path: one tile row at a time, never a full-frame sample
+    // array. The GPU path below reuses exactly the same bands.
+    let bands = BandSampler {
+        src,
+        map: &map,
+        key: sample_key(src, &adj.geometry, region, out_w, out_h, level, sharp),
+        region,
+        xs: &xs,
+        out_w,
+        out_h,
+        level,
+        cubic: sharp,
+    };
     if gpu_two_pass {
         let sharpen_in_display = f32_includes_sharpen;
         let row_f32 = out_w as usize;
         let mut rgb_pre = vec![[0.0f32; 3]; (out_w * out_h) as usize];
-        if streams_source_samples(out_w, out_h) {
-            rgb_pre.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
-                precurve_line_with(&plan, region, out_h, &xs, y, line, |_, _, point| {
-                    source_sample_at(src, &map, level, sharp, point)
+        let mut band = Vec::new();
+        let mut y0 = 0u32;
+        while y0 < out_h {
+            let rows = (out_h - y0).min(SAMPLE_TILE);
+            bands.band(y0, rows, &mut band);
+            let start = y0 as usize * row_f32;
+            let end = start + rows as usize * row_f32;
+            rgb_pre[start..end]
+                .par_chunks_mut(row_f32)
+                .enumerate()
+                .for_each(|(r, line)| {
+                    let y = y0 as usize + r;
+                    precurve_line_with(&plan, region, out_h, &xs, y, line, |x, _, _| {
+                        band[r * row_f32 + x]
+                    });
                 });
-            });
-        } else {
-            let samples = source_samples(
-                src,
-                &map,
-                &adj.geometry,
-                region,
-                out_w,
-                out_h,
-                level,
-                sharp,
-                &xs,
-            );
-            rgb_pre.par_chunks_mut(row_f32).enumerate().for_each(|(y, line)| {
-                let srow = &samples[y * row_f32..(y + 1) * row_f32];
-                precurve_line_with(&plan, region, out_h, &xs, y, line, |x, _, _| srow[x]);
-            });
+            y0 += rows;
         }
         let grid = grid.as_ref().expect("gpu path needs the grid");
         if !super::clarity_gpu::apply_precurve(
@@ -2116,30 +2499,57 @@ fn render_sized(
         };
         let work_w = out_w as usize + 2 * halo;
         let work_h = out_h as usize + 2 * halo;
-        let mut rgb_f32 = vec![[0.0f32; 3]; work_w * work_h];
+        let mut rgb_f32 = take_f32_frame(work_w * work_h);
         let mut gpu_filled = false;
         #[cfg(windows)]
         if let Some((params, gain)) = &gpu_develop {
-            let samples =
-                gpu_develop_samples(src, &map, adj, region, out_w, out_h, level, sharp, &xs);
-            let mut display = vec![[0.0f32; 3]; (out_w * out_h) as usize];
-            let region4 = [region.x, region.y, region.width, region.height];
-            if super::develop_gpu::develop_plane(
-                &samples,
-                out_w as usize,
-                out_h as usize,
-                region4,
-                params,
-                gain.as_deref(),
-                &mut display,
-            ) {
-                display.par_iter_mut().for_each(|rgb| {
-                    *rgb = [rgb[0].clamp(0.0, 1.0), rgb[1].clamp(0.0, 1.0), rgb[2].clamp(0.0, 1.0)];
-                });
-                rgb_f32.copy_from_slice(&display);
-                gpu_filled = true;
-            } else {
-                log_develop_gpu_fallback("CUDA develop launch failed");
+            // A halo frame keeps its per-pixel CPU sampling; the GPU point chain
+            // is only admitted for the halo-free frame (`region_backed`).
+            if halo == 0 {
+                let mut band = Vec::new();
+                let mut y0 = 0u32;
+                let mut done = true;
+                while y0 < out_h {
+                    let rows = (out_h - y0).min(SAMPLE_TILE);
+                    bands.band(y0, rows, &mut band);
+                    let start = y0 as usize * out_w as usize;
+                    let end = start + rows as usize * out_w as usize;
+                    let gain_band = gain.as_ref().map(|plane| &plane[start..end]);
+                    let region_band = band_region(region, y0, rows, out_h);
+                    let filled = super::develop_gpu::develop_band_sampled(
+                        out_w as usize,
+                        rows as usize,
+                        region_band,
+                        params,
+                        gain_band,
+                        |x, y| {
+                            let sample = band[y * out_w as usize + x];
+                            sample.valid.then_some(sample.rgb)
+                        },
+                        |io| {
+                            for (dst, src) in rgb_f32[start..end].iter_mut().zip(io.chunks_exact(4)) {
+                                *dst = [src[0], src[1], src[2]];
+                            }
+                        },
+                    );
+                    if filled.is_none() {
+                        done = false;
+                        break;
+                    }
+                    y0 += rows;
+                }
+                if done {
+                    rgb_f32.par_iter_mut().for_each(|rgb| {
+                        *rgb = [
+                            rgb[0].clamp(0.0, 1.0),
+                            rgb[1].clamp(0.0, 1.0),
+                            rgb[2].clamp(0.0, 1.0),
+                        ];
+                    });
+                    gpu_filled = true;
+                } else {
+                    log_develop_gpu_fallback("CUDA develop launch failed");
+                }
             }
         }
         if !gpu_filled {
@@ -2162,18 +2572,31 @@ fn render_sized(
                     *pixel = develop_detail_input(sample, point, x, y);
                 }
             });
-        } else if streams_source_samples(out_w, out_h) {
-            rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
-                develop_line_with_f32(&develop_detail_input, region, out_h, &xs, y, line, |_, _, point| {
-                    source_sample_at(src, &map, level, sharp, point)
-                });
-            });
         } else {
-            let samples = source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
-            rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
-                let srow = &samples[y * work_w..(y + 1) * work_w];
-                develop_line_with_f32(&develop_detail_input, region, out_h, &xs, y, line, |x, _, _| srow[x]);
-            });
+            let mut band = Vec::new();
+            let mut y0 = 0u32;
+            while y0 < out_h {
+                let rows = (out_h - y0).min(SAMPLE_TILE);
+                bands.band(y0, rows, &mut band);
+                let start = y0 as usize * work_w;
+                let end = start + rows as usize * work_w;
+                rgb_f32[start..end]
+                    .par_chunks_mut(work_w)
+                    .enumerate()
+                    .for_each(|(r, line)| {
+                        let y = y0 as usize + r;
+                        develop_line_with_f32(
+                            &develop_detail_input,
+                            region,
+                            out_h,
+                            &xs,
+                            y,
+                            line,
+                            |x, _, _| band[r * work_w + x],
+                        );
+                    });
+                y0 += rows;
+            }
         }
         }
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
@@ -2221,63 +2644,24 @@ fn render_sized(
                     });
             }
         }
-    } else if let Some(display) = gpu_direct.as_deref() {
-        encode_f32_frame(display, &mut rgba, rgba16.as_deref_mut(), out_w as usize);
-    } else if streams_source_samples(out_w, out_h) {
-        match rgba16.as_mut() {
-            Some(wide_line) => {
-                rgba.par_chunks_mut(row)
-                    .zip(wide_line.par_chunks_mut(row))
-                    .enumerate()
-                    .for_each(|(y, (line, line16))| {
-                        develop_line_streamed(
-                            &plan,
-                            src,
-                            &map,
-                            region,
-                            out_h,
-                            level,
-                            sharp,
-                            &xs,
-                            y,
-                            bypass,
-                            pre.as_ref(),
-                            line,
-                            Some(line16),
-                        );
-                    });
-            }
-            None => {
-                rgba.par_chunks_mut(row).enumerate().for_each(|(y, line)| {
-                    develop_line_streamed(
-                        &plan, src, &map, region, out_h, level, sharp, &xs, y, bypass,
-                        pre.as_ref(), line, None,
-                    );
-                });
-            }
-        }
+        give_f32_frame(rgb_f32);
     } else {
-        let samples =
-            source_samples(src, &map, &adj.geometry, region, out_w, out_h, level, sharp, &xs);
-        match rgba16.as_mut() {
-            Some(wide_line) => {
-                rgba.par_chunks_mut(row)
-                    .zip(wide_line.par_chunks_mut(row))
-                    .enumerate()
-                    .for_each(|(y, (line, line16))| {
-                        develop_line(
-                            &plan, region, out_h, &xs, &samples, y, bypass, pre.as_ref(), line,
-                            Some(line16),
-                        );
-                    });
+        #[cfg(windows)]
+        let gpu_done = match gpu_develop.as_ref() {
+            Some((params, gain)) => {
+                let done =
+                    encode_gpu_develop_bands(&bands, params, gain.as_deref(), &mut rgba, rgba16.as_deref_mut());
+                if !done {
+                    log_develop_gpu_fallback("CUDA develop launch failed");
+                }
+                done
             }
-            None => {
-                rgba.par_chunks_mut(row).enumerate().for_each(|(y, line)| {
-                    develop_line(
-                        &plan, region, out_h, &xs, &samples, y, bypass, pre.as_ref(), line, None,
-                    );
-                });
-            }
+            None => false,
+        };
+        #[cfg(not(windows))]
+        let gpu_done = false;
+        if !gpu_done {
+            develop_bands(&plan, &bands, bypass, pre.as_ref(), &mut rgba, rgba16.as_deref_mut());
         }
     }
     // Structure is a 5x5 neighbourhood operator, so it still runs on the
@@ -2315,8 +2699,9 @@ fn render_sized(
         }
     }
     // Detail, spots and layers are 8-bit stages; keeping their delta lets the
-    // wide buffer carry the develop precision through them.
-    let mut develop8 = rgba16.is_some().then(|| rgba.clone());
+    // wide buffer carry the develop precision through them. A pure 16-bit
+    // bypass export has no 8-bit stages, so its develop snapshot is unnecessary.
+    let mut develop8 = (rgba16.is_some() && !bypass).then(|| rgba.clone());
     if !bypass {
         let mut detail_adj_owned;
         let detail_adj = if use_f32_detail {
@@ -2413,7 +2798,9 @@ fn render_sized(
     }
     if !bypass {
         let dust = if crate::dustdetect::enabled() {
-            match crate::dustdetect::detect_dust(
+            let key = dust_frame_key(src, &adj.geometry, region, out_w, out_h);
+            match crate::dustdetect::detect_dust_cached(
+                key,
                 &rgba,
                 out_w,
                 out_h,
@@ -2422,11 +2809,11 @@ fn render_sized(
                 Ok(spots) => spots,
                 Err(err) => {
                     log::warn!("automatic dust detection skipped: {err:#}");
-                    Vec::new()
+                    Arc::new(Vec::new())
                 }
             }
         } else {
-            Vec::new()
+            Arc::new(Vec::new())
         };
         if !dust.is_empty() {
             super::spots::apply_detected_spots(
@@ -2435,7 +2822,7 @@ fn render_sized(
                 out_h,
                 adj,
                 &adj.geometry,
-                &dust,
+                dust.as_slice(),
                 src.size(),
             );
         } else if !adj.spots.is_empty() {
@@ -2833,27 +3220,6 @@ fn develop_line(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn develop_line_streamed(
-    plan: &Plan,
-    src: &Source,
-    map: &super::geometry::FrameMap,
-    region: NormRect,
-    out_h: u32,
-    level: usize,
-    cubic: bool,
-    xs: &[f32],
-    y: usize,
-    bypass: bool,
-    pre: Option<&super::clarity::PreCurve>,
-    line: &mut [u8],
-    line16: Option<&mut [u16]>,
-) {
-    develop_line_with(plan, region, out_h, xs, y, bypass, pre, line, line16, |_, _, point| {
-        source_sample_at(src, map, level, cubic, point)
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
 fn develop_line_with_f32<F>(
     develop_input: &impl Fn(SourceSample, [f32; 2], usize, usize) -> [f32; 3],
     region: NormRect,
@@ -2918,18 +3284,6 @@ fn develop_line_with<F>(
             px16[3] = 65535;
         }
     }
-}
-
-fn develop_sample(
-    plan: &Plan,
-    sample: SourceSample,
-    point: [f32; 2],
-    bypass: bool,
-    index: Option<usize>,
-) -> [f32; 3] {
-    prepared_sample(plan, sample, point)
-        .map(|rgb| develop(plan, rgb, point, bypass, index))
-        .unwrap_or([0.11; 3])
 }
 
 /// One pixel with clarity inserted between the pre-curve stage and the tone
@@ -5413,7 +5767,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
     }
 
     #[test]
-    fn source_sample_cache_is_exact_and_geometry_keyed() {
+    fn source_sample_tile_cache_is_exact_absorption_and_geometry_keyed() {
         let (w, h) = (31u32, 23u32);
         let rgba: Vec<u8> = (0..w * h)
             .flat_map(|i| {
@@ -5432,9 +5786,24 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let map = super::super::geometry::FrameMap::new(src.size(), &geometry);
         let xs: Vec<f32> =
             (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
-        let first = source_samples(&src, &map, &geometry, region, out_w, out_h, 0, false, &xs);
-        let second = source_samples(&src, &map, &geometry, region, out_w, out_h, 0, false, &xs);
-        assert!(Arc::ptr_eq(&first, &second));
+        let key = sample_key(&src, &geometry, region, out_w, out_h, 0, false);
+        let bands = BandSampler {
+            src: &src,
+            map: &map,
+            key: key.clone(),
+            region,
+            xs: &xs,
+            out_w,
+            out_h,
+            level: 0,
+            cubic: false,
+        };
+        let mut first = Vec::new();
+        bands.band(0, out_h, &mut first);
+        let mut second = Vec::new();
+        bands.band(0, out_h, &mut second);
+        assert_eq!(first, second);
+        assert!(tile_lookup(&key, 0, 0).is_some());
 
         for y in 0..out_h as usize {
             let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
@@ -5454,10 +5823,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         }
 
         let changed = Geometry { rotation: 3.0, ..geometry };
-        let changed_map = super::super::geometry::FrameMap::new(src.size(), &changed);
-        let third =
-            source_samples(&src, &changed_map, &changed, region, out_w, out_h, 0, false, &xs);
-        assert!(!Arc::ptr_eq(&first, &third));
+        assert!(tile_lookup(&sample_key(&src, &changed, region, out_w, out_h, 0, false), 0, 0).is_none());
     }
 
     #[test]
@@ -5477,11 +5843,17 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
     }
 
     #[test]
-    fn oversized_exports_stream_samples_instead_of_allocating_the_unused_cache_vector() {
+    fn oversized_frames_never_allocate_one_full_sample_array() {
         assert_eq!(std::mem::size_of::<SourceSample>(), 16);
-        assert!(!streams_source_samples(1920, 1080));
-        assert!(streams_source_samples(3840, 2160));
-        assert!(streams_source_samples(6000, 4000));
+        assert_eq!(SAMPLE_TILE * SAMPLE_TILE * std::mem::size_of::<SourceSample>() as u32, 1_048_576);
+        // 1080p / 4K / 24MP / 45MP full sample arrays, and the tile count each
+        // render pulls through the cache. No single allocation exceeds 1 MiB.
+        for (w, h) in [(1920u32, 1080u32), (3840, 2160), (6048, 4032), (8192, 5464)] {
+            let full = w as usize * h as usize * std::mem::size_of::<SourceSample>();
+            assert!(full > SAMPLE_TILE as usize * SAMPLE_TILE as usize * 16);
+            let tiles = w.div_ceil(SAMPLE_TILE).saturating_mul(h.div_ceil(SAMPLE_TILE));
+            assert!(tiles as usize * 1024 * 1024 <= full + 32 * 1024 * 1024);
+        }
         assert_eq!(3840usize * 2160 * std::mem::size_of::<SourceSample>(), 132_710_400);
         assert_eq!(6000usize * 4000 * std::mem::size_of::<SourceSample>(), 384_000_000);
     }
