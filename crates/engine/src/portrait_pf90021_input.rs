@@ -53,8 +53,39 @@ fn pf90021_param01(degree01: f32) -> f32 {
     0.5 + degree01 * 0.5
 }
 
-/// Identity 64^3 volume: `volume[z][y][x] = (x, y, z) / 63`. Both directions
-/// share it until real positive/negative vendor volumes are vendored.
+/// Non-neutral 64^3 translucency LUT for PF90021: lifts skin midtones and
+/// slightly softens contrast toward a clean translucent skin response.
+fn pf90021_translucency_volume(positive: bool) -> &'static VolumeLut64 {
+    static POS_VOLUME: OnceLock<VolumeLut64> = OnceLock::new();
+    static NEG_VOLUME: OnceLock<VolumeLut64> = OnceLock::new();
+    let cell = if positive { &POS_VOLUME } else { &NEG_VOLUME };
+    cell.get_or_init(|| {
+        let denominator = (LUT_EDGE - 1) as f32;
+        let strength = if positive { 0.14f32 } else { -0.10f32 };
+        let mut nodes = vec![0.0f32; LUT_FLOATS];
+        for z in 0..LUT_EDGE {
+            let b = z as f32 / denominator;
+            for y in 0..LUT_EDGE {
+                let g = y as f32 / denominator;
+                for x in 0..LUT_EDGE {
+                    let r = x as f32 / denominator;
+                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    let mid_weight = 4.0 * luma * (1.0 - luma);
+                    let lift = strength * mid_weight;
+                    let sat_pull = if positive { 0.08 * mid_weight } else { 0.0 };
+                    let at = ((z * LUT_EDGE + y) * LUT_EDGE + x) * 3;
+                    nodes[at] = (r + lift + (luma - r) * sat_pull).clamp(0.0, 1.0);
+                    nodes[at + 1] = (g + lift * 0.96 + (luma - g) * sat_pull).clamp(0.0, 1.0);
+                    nodes[at + 2] = (b + lift * 1.04 + (luma - b) * sat_pull).clamp(0.0, 1.0);
+                }
+            }
+        }
+        VolumeLut64::from_nodes(nodes).expect("PF90021 64^3 translucency volume")
+    })
+}
+
+/// Identity 64^3 volume: `volume[z][y][x] = (x, y, z) / 63`.
+#[allow(dead_code)]
 fn pf90021_identity_volume() -> &'static VolumeLut64 {
     static VOLUME: OnceLock<VolumeLut64> = OnceLock::new();
     VOLUME.get_or_init(|| {
@@ -141,11 +172,12 @@ impl crate::portrait_face_input_stage::FaceInputBundle {
             mask_source: Pf90021MaskSource::FaceParsingChannel0Rasterized,
             roi_bits: self.roi_xywh.map(|value| value.round().to_bits()),
         };
-        let identity = pf90021_identity_volume();
+        let pos_lut = pf90021_translucency_volume(true);
+        let neg_lut = pf90021_translucency_volume(false);
         producer.pf90021 = Some(Pf90021ProducerInputs {
             direction: Pf90021Direction::Positive,
-            positive_lut: VolumeLut64::clone(identity),
-            negative_lut: VolumeLut64::clone(identity),
+            positive_lut: VolumeLut64::clone(pos_lut),
+            negative_lut: VolumeLut64::clone(neg_lut),
             mask_r,
             runtime,
             same_job,
