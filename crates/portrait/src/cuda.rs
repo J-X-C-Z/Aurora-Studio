@@ -285,6 +285,127 @@ pub fn restamp_ptx(ptx: &str, target: (u32, u32)) -> Option<String> {
     Some(ptx.replacen(&header, &replacement, 1))
 }
 
+/// PP-2: bridge between this driver layer and the engine's unified GPU runtime.
+///
+/// The dependency can only point `aurora-engine -> aurora-portrait`, so the
+/// engine's `mock::gpu_runtime` cannot be named from here. Instead the engine
+/// runtime installs one [`Observer`] and receives the same events its own
+/// stages report: cached module loads, kernel dispatches, transfers, context
+/// syncs and typed failures. Nothing is duplicated: there is still exactly one
+/// process context, one JIT module per PTX image and one buffer pool (this
+/// module's `Domain`); the observer only makes that work visible.
+///
+/// With no observer installed every hook is one relaxed atomic load, so the
+/// CPU/GPU byte-parity paths and the refusal paths are unchanged.
+pub mod runtime_bridge {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    /// One observable GPU-runtime event from this crate's driver layer.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum GpuEvent {
+        /// First use of a PTX image in this process; later opens are cache hits.
+        ModuleLoaded {
+            image: &'static str,
+            bytes: usize,
+            ptx_isa: (u32, u32),
+        },
+        /// One real `cuLaunchKernel` on the shared context, on its stream or
+        /// the default stream (`grid`/`block` are the CUDA launch geometry).
+        Launched {
+            image: &'static str,
+            kernel: &'static str,
+            grid: (u32, u32),
+            block: (u32, u32),
+        },
+        /// `cuCtxSynchronize` actually drained pending work. The context is
+        /// process-wide, so the event names no single image.
+        Synchronized,
+        Uploaded { image: &'static str, bytes: usize },
+        Downloaded { image: &'static str, bytes: usize },
+        /// A driver call returned a non-zero `CUresult`.
+        Failed {
+            image: &'static str,
+            call: &'static str,
+            code: i32,
+        },
+        /// No driver/device/entry point, or the PTX image is unusable.
+        Unavailable {
+            image: &'static str,
+            what: &'static str,
+        },
+        /// The wrapper refused the work before touching the driver.
+        Refused {
+            image: &'static str,
+            tag: &'static str,
+        },
+    }
+
+    /// Sink for [`GpuEvent`]s. Implementations must not call back into this
+    /// crate's GPU API (the domain mutex is held on some paths).
+    pub trait Observer: Send + Sync {
+        fn observe(&self, event: &GpuEvent);
+    }
+
+    static OBSERVER: OnceLock<Arc<dyn Observer>> = OnceLock::new();
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    /// Installs the process-wide observer. Only the first install wins, which
+    /// keeps accounting for one owner; a second attempt gets its handle back.
+    pub fn install(observer: Arc<dyn Observer>) -> Result<(), Arc<dyn Observer>> {
+        OBSERVER.set(observer)?;
+        ENABLED.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// True once an observer is installed.
+    pub fn installed() -> bool {
+        ENABLED.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn emit(event: GpuEvent) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(observer) = OBSERVER.get() {
+            observer.observe(&event);
+        }
+    }
+
+    /// Stable tag for the refusal classes the CPU lane also returns, so a
+    /// report can separate "not implemented" from "bad input".
+    pub(crate) fn refusal_tag(refusal: &crate::Refusal) -> &'static str {
+        match refusal {
+            crate::Refusal::UnknownEffect(_) => "unknown_effect",
+            crate::Refusal::MissingInput(_) => "missing_input",
+            crate::Refusal::ShapeMismatch(_) => "shape_mismatch",
+            crate::Refusal::ValueOutOfRange(_) => "value_out_of_range",
+            crate::Refusal::NotImplemented(_) => "not_implemented",
+        }
+    }
+
+    pub(crate) fn note_failure(image: &'static str, error: &super::CudaError) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        match error {
+            super::CudaError::Unavailable(what) => emit(GpuEvent::Unavailable {
+                image,
+                what,
+            }),
+            super::CudaError::Driver(call, code) => emit(GpuEvent::Failed {
+                image,
+                call,
+                code: *code,
+            }),
+            super::CudaError::Refused(refusal) => emit(GpuEvent::Refused {
+                image,
+                tag: refusal_tag(refusal),
+            }),
+        }
+    }
+}
+
 #[cfg(windows)]
 mod driver {
     use super::{
@@ -797,14 +918,24 @@ mod driver {
                 image_bytes: loaded,
             };
             self.modules.push(loaded_module);
+            super::runtime_bridge::emit(super::runtime_bridge::GpuEvent::ModuleLoaded {
+                image,
+                bytes: loaded_module.image_bytes,
+                ptx_isa: loaded_module.ptx_isa,
+            });
             Ok(loaded_module)
         }
 
         fn synchronize_pending(&mut self) -> Result<(), CudaError> {
             if self.pending {
                 count_context_sync();
-                unsafe { check((self.api.ctx_sync)(), "cuCtxSynchronize")? };
+                let image = self.modules.last().map_or(PTX, |module| module.image);
+                unsafe { check((self.api.ctx_sync)(), "cuCtxSynchronize") }.map_err(|error| {
+                    super::runtime_bridge::note_failure(image, &error);
+                    error
+                })?;
                 self.pending = false;
+                super::runtime_bridge::emit(super::runtime_bridge::GpuEvent::Synchronized);
             }
             Ok(())
         }
@@ -1619,11 +1750,17 @@ mod driver {
 
         /// Returns a handle after ensuring this PTX image is in the cached domain.
         pub(crate) fn open_image(image: &'static str) -> Result<Self, CudaError> {
-            let domain = domain()?;
+            let domain = domain().map_err(|error| {
+                super::runtime_bridge::note_failure(image, &error);
+                error
+            })?;
             let mut domain = domain
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let module = domain.module(image)?;
+            let module = domain.module(image).map_err(|error| {
+                super::runtime_bridge::note_failure(image, &error);
+                error
+            })?;
             Ok(Self {
                 image,
                 api: domain.api,
@@ -2204,7 +2341,11 @@ mod driver {
                 check(
                     (api.module_function)(&mut function, module, symbol.as_ptr()),
                     "cuModuleGetFunction",
-                )?;
+                )
+                .map_err(|error| {
+                    super::runtime_bridge::note_failure(self.image, &error);
+                    error
+                })?;
                 check(
                     (api.launch)(
                         function,
@@ -2220,8 +2361,18 @@ mod driver {
                         ptr::null_mut(),
                     ),
                     "cuLaunchKernel",
-                )?;
+                )
+                .map_err(|error| {
+                    super::runtime_bridge::note_failure(self.image, &error);
+                    error
+                })?;
             }
+            super::runtime_bridge::emit(super::runtime_bridge::GpuEvent::Launched {
+                image: self.image,
+                kernel,
+                grid: geometry,
+                block,
+            });
             Ok(self.dispatch(kernel, geometry, block))
         }
 
@@ -2248,9 +2399,17 @@ mod driver {
                 check(
                     (self.api.copy_in)(ptr, data.as_ptr() as *const c_void, data.len()),
                     "cuMemcpyHtoD",
-                )?
+                )
+                .map_err(|error| {
+                    super::runtime_bridge::note_failure(self.image, &error);
+                    error
+                })?
             };
             HOST_TO_DEVICE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
+            super::runtime_bridge::emit(super::runtime_bridge::GpuEvent::Uploaded {
+                image: self.image,
+                bytes: data.len(),
+            });
             Ok(())
         }
 
@@ -2260,8 +2419,16 @@ mod driver {
                     (self.api.copy_out)(data.as_mut_ptr() as *mut c_void, ptr, data.len()),
                     "cuMemcpyDtoH",
                 )
+                .map_err(|error| {
+                    super::runtime_bridge::note_failure(self.image, &error);
+                    error
+                })
             }?;
             DEVICE_TO_HOST_BYTES.fetch_add(data.len(), Ordering::Relaxed);
+            super::runtime_bridge::emit(super::runtime_bridge::GpuEvent::Downloaded {
+                image: self.image,
+                bytes: data.len(),
+            });
             Ok(())
         }
 
@@ -3317,6 +3484,47 @@ pub(crate) use driver::DeviceSet;
 mod tests {
     use super::*;
     use std::mem::{align_of, size_of};
+
+    /// PP-2: the observer sink is process-wide and installed at most once, so
+    /// this test proves the contract that matters: once installed, events reach
+    /// exactly one sink and a second install is refused with its handle back.
+    #[test]
+    fn runtime_bridge_delivers_events_to_one_observer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(AtomicUsize);
+        impl runtime_bridge::Observer for Counter {
+            fn observe(&self, _event: &runtime_bridge::GpuEvent) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let counter = std::sync::Arc::new(Counter(AtomicUsize::new(0)));
+        match runtime_bridge::install(counter.clone()) {
+            Ok(()) => {
+                assert!(runtime_bridge::installed());
+                runtime_bridge::emit(runtime_bridge::GpuEvent::Uploaded {
+                    image: "bridge-test",
+                    bytes: 4,
+                });
+                runtime_bridge::emit(runtime_bridge::GpuEvent::Failed {
+                    image: "bridge-test",
+                    call: "cuLaunchKernel",
+                    code: 700,
+                });
+                assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+                let second = std::sync::Arc::new(Counter(AtomicUsize::new(0)));
+                assert!(runtime_bridge::install(second).is_err());
+            }
+            Err(returned) => {
+                // Another test owns the sink; the bridge is still enabled and
+                // the refusal hands the caller's handle back.
+                assert!(runtime_bridge::installed());
+                let ours: std::sync::Arc<dyn runtime_bridge::Observer> = counter;
+                assert!(std::sync::Arc::ptr_eq(&returned, &ours));
+            }
+        }
+    }
 
     fn samples() -> cpu::Uniforms {
         cpu::Uniforms {
