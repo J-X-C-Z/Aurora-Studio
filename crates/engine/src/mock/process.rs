@@ -457,23 +457,38 @@ impl Source {
         face.saturating_add(masks)
     }
 
-    pub(crate) fn face_input_image(&self) -> crate::PortraitImage {
-        self.face_rgba8
-            .get_or_init(|| {
-                let plane = &self.levels[0];
-                let mut rgba = Vec::with_capacity((plane.width * plane.height * 4) as usize);
-                for pixel in &plane.data {
-                    for channel in pixel {
-                        rgba.push(
-                            (linear_to_srgb((*channel).clamp(0.0, 1.0)) * 255.0 + 0.5) as u8,
-                        );
-                    }
-                    rgba.push(255);
-                }
-                crate::PortraitImage::new(plane.width, plane.height, rgba)
-                    .expect("the decoded source level has exactly one RGBA plane")
-            })
-            .clone()
+    pub(crate) fn face_input_image(&self) -> std::sync::Arc<crate::PortraitImage> {
+        // PF-F P-11/P-12: `face_rgba8` is declared outside this accessor's edit
+        // boundary, so the shared `Arc` and its trusted snapshot fingerprint
+        // live in the stage's bounded table. The key is the immutable decoded
+        // plane pointer plus the Source's cached snapshot fingerprint, so a
+        // second call returns the same allocation without rebuilding or copying.
+        let key = (
+            self.levels[0].data.as_ptr() as usize,
+            self.levels[0].data.len(),
+            self.fingerprint(),
+            self.levels[0].width,
+            self.levels[0].height,
+        );
+        if let Some(image) = crate::portrait_face_input_stage::shared_face_input_image(key) {
+            return image;
+        }
+        let plane = &self.levels[0];
+        let mut rgba = Vec::with_capacity((plane.width * plane.height * 4) as usize);
+        for pixel in &plane.data {
+            for channel in pixel {
+                rgba.push((linear_to_srgb((*channel).clamp(0.0, 1.0)) * 255.0 + 0.5) as u8);
+            }
+            rgba.push(255);
+        }
+        let image = std::sync::Arc::new(
+            crate::PortraitImage::new(plane.width, plane.height, rgba)
+                .expect("the decoded source level has exactly one RGBA plane"),
+        );
+        crate::portrait_face_input_stage::register_face_input_image(
+            key,
+            std::sync::Arc::clone(&image),
+        )
     }
 
     /// Marks pixels that came from the camera's embedded preview: they are already
@@ -1610,6 +1625,23 @@ fn stage_face_bundle(
             crate::FaceInputSession::open_from_env(false)?.produce(job_id, frame)
         }
         Err(refusal) => Err(refusal),
+    }
+}
+
+/// Borrow the one Stage Frame inference result shared by both portrait blocks.
+///
+/// The cell keeps the inference lazy (the slim-only path only pays it when the
+/// source-frame path refuses) while guaranteeing that the two blocks see the
+/// same bundle, and therefore the same detection/mesh/landmark pass.
+fn stage_bundle_cached<'a>(
+    cell: &'a OnceLock<Result<crate::FaceInputBundle, aurora_portrait::Refusal>>,
+    frame: &'a crate::PortraitImage,
+    job_id: u64,
+    include_parsing: bool,
+) -> Result<&'a crate::FaceInputBundle, aurora_portrait::Refusal> {
+    match cell.get_or_init(|| stage_face_bundle(job_id, frame, include_parsing)) {
+        Ok(bundle) => Ok(bundle),
+        Err(refusal) => Err(refusal.clone()),
     }
 }
 
@@ -2857,30 +2889,57 @@ fn render_sized(
         // Face landmarks come from the full decoded source and are mapped
         // through the renderer's FrameMap into the current out_w/out_h stage.
         let mut producer_inputs = adj.portrait_producer_inputs.as_deref().cloned();
-        if needs_stage_face_input(&adj.extra) {
+        // PF-F §11: one Stage Frame per rendered frame. Both portrait blocks
+        // below used to rebuild the same RGBA stage image from `rgba.clone()`;
+        // build it once here and let both read it.
+        let want_stage_slim = needs_stage_face_input(&adj.extra);
+        let want_stage_parsing = needs_stage_face_parsing(&adj.extra);
+        let want_stage_attachments = (want_stage_parsing
+            || needs_stage_face_bundle_direct(&adj.extra)
+            || needs_producer_attach(&adj.extra))
+            && region == NormRect::FULL;
+        let stage_frame = if want_stage_slim || want_stage_attachments {
+            crate::PortraitImage::new(out_w, out_h, rgba.clone())
+        } else {
+            None
+        };
+        // PF-F §11: both blocks consume the same frame and job ticket, so the
+        // stage inference is computed at most once. It stays lazy: when only
+        // the slim path is active, the rendered frame was historically a
+        // fallback after the source path refused, and an eager call would add
+        // one inference to every frame. Parsing is requested only when the
+        // attachment block will run, because it costs a further model pass.
+        let stage_bundle = OnceLock::new();
+        let stage_include_parsing = want_stage_parsing && want_stage_attachments;
+        if want_stage_slim {
             let geometric_lens = adj.lens.use_profile
                 || adj.lens.distortion.abs() > 1.0e-6
                 || adj.lens.shift_x.abs() > 1.0e-6
                 || adj.lens.shift_y.abs() > 1.0e-6
                 || adj.lens.tilt.abs() > 1.0e-6;
-            if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
+            if let Some(stage_frame) = stage_frame.as_ref() {
                 let on_stage = || {
-                    stage_face_bundle(receipt.job_id(), &stage_frame, false)?
-                        .slim_inputs(&stage_frame)
+                    stage_bundle_cached(
+                        &stage_bundle,
+                        stage_frame,
+                        receipt.job_id(),
+                        stage_include_parsing,
+                    )?
+                    .slim_inputs(stage_frame)
                 };
                 let slim = if geometric_lens {
                     on_stage()
                 } else {
                     let from_source = || {
                         let source_frame = src.face_input_image();
-                        let bundle = stage_face_bundle(receipt.job_id(), &source_frame, false)?;
+                        let bundle = stage_face_bundle(receipt.job_id(), source_frame.as_ref(), false)?;
                         let transform = crate::FaceStageTransform::new(
                             [src.size().0, src.size().1],
                             [out_w, out_h],
                             [region.x, region.y, region.width, region.height],
                             &adj.geometry,
                         )?;
-                        bundle.slim_inputs_for_stage(&transform, &stage_frame)
+                        bundle.slim_inputs_for_stage(&transform, stage_frame)
                     };
                     from_source().or_else(|refusal| {
                         log::debug!("source face input refused; trying rendered frame: {refusal:?}");
@@ -2901,19 +2960,20 @@ fn render_sized(
         }
         // Keep R17's PF108 path on the stage frame; its parsing semantics are
         // owned by the separate teeth lane.
-        if (needs_stage_face_parsing(&adj.extra)
-            || needs_stage_face_bundle_direct(&adj.extra)
-            || needs_producer_attach(&adj.extra))
-            && region == NormRect::FULL
-        {
-            let want_parsing = needs_stage_face_parsing(&adj.extra);
-            if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
-                match stage_face_bundle(receipt.job_id(), &stage_frame, want_parsing) {
+        if want_stage_attachments {
+            let want_parsing = want_stage_parsing;
+            if let Some(stage_frame) = stage_frame.as_ref() {
+                match stage_bundle_cached(
+                    &stage_bundle,
+                    stage_frame,
+                    receipt.job_id(),
+                    stage_include_parsing,
+                ) {
                     Ok(bundle) => {
                         let mut inputs = producer_inputs.take().unwrap_or_default();
                         let mut attached = false;
                         if inputs.slim.is_none() {
-                            match bundle.slim_inputs(&stage_frame) {
+                            match bundle.slim_inputs(stage_frame) {
                                 Ok(slim) => {
                                     inputs.slim = Some(slim);
                                     attached = true;
@@ -2928,7 +2988,7 @@ fn render_sized(
                         if c202 != 0.0 || c232 != 0.0 {
                             if bundle
                                 .attach_default_face_detail(
-                                    &stage_frame,
+                                    stage_frame,
                                     [c202, 0.0],
                                     [c232, 0.0],
                                     &mut inputs,
@@ -2942,20 +3002,20 @@ fn render_sized(
                         let c248 = adj.extra.get("pc:248").copied().unwrap_or(0.0);
                         if c247 != 0.0 || c248 != 0.0 {
                             if bundle
-                                .attach_vface(&stage_frame, [c247, c248], &mut inputs)
+                                .attach_vface(stage_frame, [c247, c248], &mut inputs)
                                 .is_ok()
                             {
                                 attached = true;
                             }
                         }
                         if bundle
-                            .attach_plump_from_extra(&stage_frame, &adj.extra, &mut inputs)
+                            .attach_plump_from_extra(stage_frame, &adj.extra, &mut inputs)
                             .is_ok()
                         {
                             attached = true;
                         }
                         if bundle
-                            .attach_eye_and_brow_geometry(&stage_frame, &adj.extra, &mut inputs)
+                            .attach_eye_and_brow_geometry(stage_frame, &adj.extra, &mut inputs)
                             .is_ok()
                         {
                             attached = true;
@@ -2964,7 +3024,7 @@ fn render_sized(
                             let bright_ui = teeth_ui_percent(&adj.extra, "pc:109");
                             let deyellow_ui = teeth_ui_percent(&adj.extra, "pc:110");
                             match bundle.attach_pf108_inputs(
-                                &stage_frame,
+                                stage_frame,
                                 bright_ui,
                                 deyellow_ui,
                                 &mut inputs,
@@ -2975,7 +3035,7 @@ fn render_sized(
                                 }
                             }
                             if bundle
-                                .attach_wrinkle_from_extra(&stage_frame, &adj.extra, &mut inputs)
+                                .attach_wrinkle_from_extra(stage_frame, &adj.extra, &mut inputs)
                                 .is_ok()
                             {
                                 attached = true;
@@ -2988,7 +3048,7 @@ fn render_sized(
                                 ];
                                 if bundle
                                     .attach_pf30013_inputs(
-                                        &stage_frame,
+                                        stage_frame,
                                         c30013,
                                         gray_3d_controls,
                                         &mut inputs,
@@ -3002,7 +3062,7 @@ fn render_sized(
                         // Same-frame attachments added after the existing
                         // parsing/geometry rows; their order above is unchanged.
                         if let Some(&c90021) = adj.extra.get("pc:90021") {
-                            match bundle.attach_pf90021_inputs(&stage_frame, c90021, &mut inputs) {
+                            match bundle.attach_pf90021_inputs(stage_frame, c90021, &mut inputs) {
                                 Ok(()) => attached = true,
                                 Err(refusal) => {
                                     log::warn!("PF90021 same-frame input refused: {refusal:?}");
@@ -3012,7 +3072,7 @@ fn render_sized(
                         if any_makeup_row_active(&adj.extra)
                             && bundle
                                 .attach_makeup_bundle(
-                                    &stage_frame,
+                                    stage_frame,
                                     &crate::portrait_makeup_bundle::B3_MAKEUP_ROWS,
                                     &mut inputs,
                                 )
@@ -3023,7 +3083,7 @@ fn render_sized(
                         let c101 = adj.extra.get("pc:101").copied().unwrap_or(0.0);
                         if c101 != 0.0 {
                             if bundle
-                                .attach_pf101_inputs(&stage_frame, c101, &mut inputs)
+                                .attach_pf101_inputs(stage_frame, c101, &mut inputs)
                                 .is_ok()
                             {
                                 attached = true;
@@ -3037,20 +3097,20 @@ fn render_sized(
                             || adj.extra.get("pc:90010").copied().unwrap_or(0.0) != 0.0;
                         if moisture_active
                             && bundle
-                                .attach_moisture_inputs(&stage_frame, masks, &mut inputs)
+                                .attach_moisture_inputs(stage_frame, masks, &mut inputs)
                                 .is_ok()
                         {
                             attached = true;
                         }
                         if bundle
-                            .attach_pf8033_from_extra(&stage_frame, &adj.extra, &mut inputs)
+                            .attach_pf8033_from_extra(stage_frame, &adj.extra, &mut inputs)
                             .is_ok()
                         {
                             attached = true;
                         }
                         if bundle
                             .attach_historical_tone_from_extra(
-                                &stage_frame,
+                                stage_frame,
                                 Some(masks),
                                 &adj.extra,
                                 &mut inputs,
@@ -3061,7 +3121,7 @@ fn render_sized(
                         }
                         if bundle
                             .attach_historical_skin_from_extra(
-                                &stage_frame,
+                                stage_frame,
                                 Some(masks),
                                 &adj.extra,
                                 &mut inputs,
