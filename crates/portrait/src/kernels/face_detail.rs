@@ -13,8 +13,8 @@ const INV255: f32 = 1.0 / 255.0;
 /// Registry rows for this lane. `mod.rs` is owned by the integration lane, so
 /// this module is compiled through the candidate harness until it is registered.
 pub const META: &[EffectMeta] = &[
-    EffectMeta { pf: 8, key: "PF8_UI_KEY_NOT_RECOVERED", label: "Stereo shadow volume", access: Access::Cpu, inputs: &["material RGBA", "face-parsing RGBA mask", "ROI"] },
-    EffectMeta { pf: 9, key: "PF9_UI_KEY_NOT_RECOVERED", label: "Stereo highlight volume", access: Access::Cpu, inputs: &["material RGBA", "blusher RGBA mask", "ROI"] },
+    EffectMeta { pf: 8, key: "shadowStereo", label: "Stereo shadow volume", access: Access::Cpu, inputs: &["material RGBA (FaceStereo model_FaceStereoShadow_yy*)", "BlusherMaskType=15 owner mask RGBA", "ROI [95,40,901,1081]", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 42"] },
+    EffectMeta { pf: 9, key: "highlight", label: "Stereo highlight volume", access: Access::Cpu, inputs: &["material RGBA (FaceStereo model_FaceStereoShadow_gg*)", "BlusherMaskType=15 owner mask RGBA", "ROI [95,40,901,1081]", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 42"] },
     EffectMeta { pf: 100, key: "eyebrowDegree_left", label: "Eyebrow color makeup (left)", access: Access::Cpu, inputs: &["EyeBrowMaskType=5 mask (RB)", "UV", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 11"] },
     EffectMeta { pf: 103, key: "eyelinerDegree_upper", label: "Upper eyeliner color makeup", access: Access::Cpu, inputs: &["EyeMaskType=4 mask (RG)", "UV", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 11"] },
     EffectMeta { pf: 105, key: "eyelashDegree_upper", label: "Upper eyelash color makeup", access: Access::Cpu, inputs: &["EyeLashMaskType=4 L mask as RGBA (GL_LUMINANCE, RG=min(2L,1))", "UV", "MixColor RGBA", "opacity", "degree01", "FilterType 11"] },
@@ -3960,3 +3960,21 @@ mod hair_seam_contract_tests {
     }
 }
 
+
+#[cfg(test)]
+mod face_stereo_meta_tests {
+    use super::META;
+
+    #[test]
+    fn pf8_pf9_use_the_shipped_ui_keys_and_blusher_mask_family() {
+        let shadow = META.iter().find(|row| row.pf == 8).expect("PF8 meta");
+        let highlight = META.iter().find(|row| row.pf == 9).expect("PF9 meta");
+        assert_eq!(shadow.key, "shadowStereo");
+        assert_eq!(highlight.key, "highlight");
+        for row in [shadow, highlight] {
+            assert!(row.inputs.iter().any(|input| input.contains("BlusherMaskType=15")));
+            assert!(row.inputs.iter().any(|input| input.contains("ROI [95,40,901,1081]")));
+            assert!(row.inputs.iter().any(|input| input.contains("FilterType 42")));
+        }
+    }
+}

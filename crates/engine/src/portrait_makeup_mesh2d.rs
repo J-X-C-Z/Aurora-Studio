@@ -145,7 +145,12 @@ fn region_geometry(
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    if semantic.contains("EyeBrow") {
+    if semantic.contains("FaceStereo") {
+        // PF8/PF9 are whole-face FaceStereo volumes: the recovered
+        // `ROIRect=[95,40,901,1081]` spans the full 194-point silhouette.
+        let all: Vec<usize> = (0..POINTS194).collect();
+        push_hull(points194, &all, &mut vertices, &mut indices)?;
+    } else if semantic.contains("EyeBrow") {
         push_ring(points194, &BROW_LEFT, &mut vertices, &mut indices)?;
         push_ring(points194, &BROW_RIGHT, &mut vertices, &mut indices)?;
     } else if semantic.contains("EyeLash")
