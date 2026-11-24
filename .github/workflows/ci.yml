@@ -4,18 +4,28 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      skip_testdata:
+        description: "Append --skip filters from scripts/testdata-skips.txt (tests that need local-only fixtures)"
+        type: boolean
+        default: false
+  schedule:
+    # Weekly full audit (advisories include unmaintained/yanked warnings).
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   windows:
     name: Windows build and synthetic tests
     runs-on: windows-latest
     timeout-minutes: 45
+    if: github.event_name != 'schedule'
 
     steps:
       - name: Checkout
@@ -34,10 +44,29 @@ jobs:
         run: cargo check --workspace --all-targets --locked
 
       - name: Run synthetic tests
-        run: cargo test --workspace --locked -- --test-threads=1
+        shell: pwsh
+        env:
+          # Opt-in only. The default run is never silently filtered.
+          AURORA_CI_SKIP_TESTDATA: ${{ github.event.inputs.skip_testdata == 'true' && '1' || '0' }}
+        run: |
+          $testArgs = @('test', '--workspace', '--locked', '--', '--test-threads=1')
+          if ($env:AURORA_CI_SKIP_TESTDATA -eq '1') {
+            $skipFile = Join-Path $PWD 'scripts/testdata-skips.txt'
+            if (-not (Test-Path $skipFile)) { throw "missing $skipFile" }
+            $skips = @(Get-Content $skipFile | ForEach-Object {
+              $name = ($_ -split '#', 2)[0].Trim()
+              if ($name) { $name }
+            })
+            foreach ($name in $skips) { $testArgs += @('--skip', $name) }
+            Write-Host "AURORA_CI_SKIP_TESTDATA=1: applying $($skips.Count) skip filters from scripts/testdata-skips.txt"
+          } else {
+            Write-Host 'AURORA_CI_SKIP_TESTDATA is not enabled; running the full default test set.'
+          }
+          & cargo @testArgs
+          exit $LASTEXITCODE
 
       - name: Build Windows release
-        run: cargo build -p lumen-app --release --locked
+        run: cargo build -p portrait-app --release --locked
 
       - name: Reject private fixture files
         shell: powershell
@@ -51,13 +80,96 @@ jobs:
             throw "Private media or Capture One testdata must not enter the repository."
           }
 
-      - name: Check lumen-engine package contents
-        shell: powershell
+      - name: Check package allowlist
+        shell: pwsh
+        # Strict by default. aurora-portrait currently packages work/ and
+        # testdata/, so this step is expected to fail until portrait-parse
+        # moves them out (see 06_reports/SESSION-integration-rv24-ci.md).
+        # Use -Mode warn for an advisory-only run.
+        run: ./scripts/check-package-allowlist.ps1 -Mode strict
+
+  supply-chain:
+    name: Licenses, sources and advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name != 'schedule'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      - name: cargo deny check
+        # D-1 is still open: licenses only enforce a permissive baseline plus
+        # deny-unlicensed; this is not a final license decision.
+        run: cargo deny check licenses bans sources advisories
+
+      - name: cargo audit (vulnerabilities block, warnings do not)
+        run: cargo audit
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate SBOM
+        shell: pwsh
+        # Configured but not yet verified against this workspace's toolchain;
+        # remove continue-on-error once a run produces artifacts.
+        continue-on-error: true
         run: |
-          $contents = cargo package -p lumen-engine --list --allow-dirty
+          New-Item -ItemType Directory -Force -Path artifacts/sbom | Out-Null
+          cargo cyclonedx --all --format json --spec-version 1.5 --no-build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $bad = @($contents | Where-Object { $_ -match '(^|[\\/])testdata([\\/]|$)' })
-          if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { Write-Error "private fixture packaged: $_" }
-            throw "lumen-engine package contains local-only testdata."
-          }
+          Get-ChildItem -Path . -Recurse -Filter *.cdx.json |
+            Where-Object { $_.FullName -notmatch '\\target\\' } |
+            ForEach-Object { Copy-Item $_.FullName (Join-Path 'artifacts/sbom' $_.Name) -Force }
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: artifacts/sbom
+          if-no-files-found: warn
+
+  nightly-audit:
+    name: Nightly full audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      - name: cargo deny check (all)
+        run: cargo deny check
+
+      - name: cargo audit (warnings also block)
+        run: cargo audit --deny warnings
