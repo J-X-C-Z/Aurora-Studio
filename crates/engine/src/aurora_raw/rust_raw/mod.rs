@@ -19,6 +19,7 @@ mod dng;
 mod ljpeg;
 mod meta;
 mod nef;
+mod orf;
 mod packbits;
 mod tiff;
 
@@ -78,7 +79,7 @@ pub(crate) fn decode_bytes(bytes: &[u8]) -> NativeResult<BayerFrame> {
         return Err(NativeError::unsupported("Fujifilm RAF is stage 2"));
     }
     if bytes.starts_with(b"IIRO") || bytes.starts_with(b"IIRS") {
-        return Err(NativeError::unsupported("Olympus ORF is stage 2"));
+        return orf::decode(bytes);
     }
     if bytes.get(..4) == Some(b"IIU\0") {
         return Err(NativeError::unsupported("Panasonic RW2 is stage 2"));
