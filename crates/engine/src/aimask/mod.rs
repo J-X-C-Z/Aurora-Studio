@@ -16,6 +16,7 @@ pub(crate) mod ort;
 pub mod body_pose;
 
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -29,6 +30,89 @@ pub(crate) use ort::{Provider, Runtime, Session};
 pub fn runtime_info() -> Option<(String, String, u32)> {
     let (path, version, api) = Runtime::get()?.describe();
     Some((path.display().to_string(), version.to_string(), api))
+}
+
+/// Snapshot of the provider selection this process actually made. `requested`
+/// is the plan; a session's `provider()` is what was really opened.
+#[derive(Clone, Debug)]
+pub struct ProviderStatus {
+    pub exported: Vec<String>,
+    pub requested: Vec<String>,
+}
+
+pub fn provider_status() -> Option<ProviderStatus> {
+    let runtime = Runtime::get()?;
+    let plan = runtime.provider_plan();
+    Some(ProviderStatus {
+        exported: plan.exported.iter().map(|p| p.label().to_string()).collect(),
+        requested: plan.labels().into_iter().map(str::to_string).collect(),
+    })
+}
+
+/// Per-session identity, execution and timing report. All static verification
+/// only; GPU node placement inside a session needs an ORT profile on real
+/// hardware and is not claimed here.
+#[derive(Clone, Debug)]
+pub struct SessionStatus {
+    pub key: String,
+    pub provider: String,
+    pub requested: String,
+    pub fallback: Option<String>,
+    pub input: (String, Vec<i64>, String),
+    pub outputs: Vec<(String, Vec<i64>, String, String)>,
+    pub cold_ms: f64,
+    pub warmup_ms: f64,
+    /// Per-run microseconds: input preparation, inference, output conversion.
+    pub stages_us: (u64, u64, u64),
+    pub measured_runs: u64,
+}
+
+fn session_status(session: &Session) -> SessionStatus {
+    let (dtype, dims, layout) = session.input_layout();
+    let timing = session.timing();
+    let stages = timing.stages();
+    let (requested, fallback) = session.provider_trace();
+    SessionStatus {
+        key: session.session_key().short(),
+        provider: session.provider().label().to_string(),
+        requested,
+        fallback,
+        input: (dtype, dims.to_vec(), layout.to_string()),
+        outputs: session
+            .output_layouts()
+            .into_iter()
+            .map(|(name, dims, dtype, layout)| (name, dims, dtype, layout.to_string()))
+            .collect(),
+        cold_ms: timing.cold_us() as f64 / 1000.0,
+        warmup_ms: timing.warmup_us() as f64 / 1000.0,
+        stages_us: stages,
+        measured_runs: timing.measured_runs(),
+    }
+}
+
+/// Status of a loaded model's session, including what provider it opened on
+/// and the recorded cold/warm timings. `None` when the model cannot be loaded.
+pub fn model_session_status(name: &str) -> Option<SessionStatus> {
+    Segmenter::load(name).ok().map(|model| session_status(&model.session))
+}
+
+/// Format a status line for probe binaries and selfcheck logs.
+pub fn format_session_status(name: &str, status: &SessionStatus) -> String {
+    format!(
+        "{name}: key={} provider={} requested=[{}] fallback={:?} input={:?} {:?} {} \
+         cold={:.3}ms warmup={:.3}ms stages_us={:?} runs={}",
+        status.key,
+        status.provider,
+        status.requested,
+        status.fallback,
+        status.input.1,
+        status.input.0,
+        status.input.2,
+        status.cold_ms,
+        status.warmup_ms,
+        status.stages_us,
+        status.measured_runs
+    )
 }
 
 /// The model's output for one image, sampled in normalized image coordinates.
@@ -193,6 +277,13 @@ pub fn model_available(name: &str) -> bool {
     model_candidates(name).iter().any(|path| path.is_file())
 }
 
+/// Whether prewarm runs one zero inference per model.
+fn warmup_enabled() -> bool {
+    !std::env::var("AURORA_AI_WARMUP")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"))
+}
+
 /// Builds the reusable ONNX sessions ahead of the first interactive mask.
 /// Subject and skin are independent models, so they load in parallel on
 /// below-normal-priority threads. A per-model lock prevents duplicate sessions
@@ -201,7 +292,16 @@ pub fn prewarm_models() -> Result<()> {
     fn prewarm(name: &str) -> Result<()> {
         lower_current_thread_priority();
         if model_available(name) {
-            Segmenter::load(name)?;
+            let model = Segmenter::load(name)?;
+            // First Run on the prewarm thread: allocator and kernel setup for
+            // the EP happens here instead of on the first mask. A failure is
+            // logged but does not fail prewarm; the first real mask retries.
+            // `AURORA_AI_WARMUP=0` skips it for low-power machines and A/B runs.
+            if warmup_enabled() {
+                if let Err(error) = model.warmup() {
+                    log::warn!("{name} warmup failed: {error:#}");
+                }
+            }
         }
         Ok(())
     }
@@ -290,10 +390,22 @@ pub fn gpu_selfcheck() -> Result<()> {
             .map(|ms| format!("{ms:.2}"))
             .collect::<Vec<_>>()
             .join("/");
+        let (requested, fallback) = session.provider_trace();
+        let timing = session.timing();
         println!(
-            "  {name}: provider={} open={open_ms:.0}ms dims={dims:?} warm_ms=[{warm}]",
-            session.provider().label()
+            "  {name}: provider={} key={} requested=[{requested}] fallback={fallback:?} \
+             open={open_ms:.0}ms cold={:.1}ms warmup={:.1}ms dims={dims:?} warm_ms=[{warm}]",
+            session.provider().label(),
+            session.session_key().short(),
+            timing.cold_us() as f64 / 1000.0,
+            timing.warmup_us() as f64 / 1000.0,
         );
+    }
+    if let Some(status) = model_session_status("subjectMasking.onnx") {
+        println!("  status {}", format_session_status("subjectMasking.onnx", &status));
+    }
+    if let Some(status) = model_session_status("skinMasking.onnx") {
+        println!("  status {}", format_session_status("skinMasking.onnx", &status));
     }
     Ok(())
 }
@@ -313,6 +425,96 @@ fn lower_current_thread_priority() {
 
 #[cfg(not(windows))]
 fn lower_current_thread_priority() {}
+
+/// Segment timings for one mask run. `load_ms` is the lookup/load cost (near
+/// zero after prewarm); `cold_ms` is the session creation this session paid,
+/// reported again on every run so a cold first mask is attributable.
+#[derive(Clone, Debug)]
+pub struct MaskTiming {
+    pub model: String,
+    pub provider: &'static str,
+    pub session_key: String,
+    pub load_ms: f64,
+    pub cold_ms: f64,
+    pub preprocess_ms: f64,
+    pub infer_ms: f64,
+    pub postprocess_ms: f64,
+    pub output_dtype: String,
+}
+
+fn mask_timings() -> &'static Mutex<HashMap<String, MaskTiming>> {
+    static TIMINGS: OnceLock<Mutex<HashMap<String, MaskTiming>>> = OnceLock::new();
+    TIMINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Last recorded segment timings for a model, for `--gpu-selfcheck` and tests.
+pub fn last_mask_timing(model: &str) -> Option<MaskTiming> {
+    mask_timings()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(model)
+        .cloned()
+}
+
+fn record_mask_timing(timing: MaskTiming) {
+    log::info!(
+        "AI mask {}: provider={} key={} load={:.2}ms cold={:.1}ms preprocess={:.2}ms \
+         infer={:.2}ms post={:.2}ms dtype={}",
+        timing.model,
+        timing.provider,
+        timing.session_key,
+        timing.load_ms,
+        timing.cold_ms,
+        timing.preprocess_ms,
+        timing.infer_ms,
+        timing.postprocess_ms,
+        timing.output_dtype
+    );
+    mask_timings()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(timing.model.clone(), timing);
+}
+
+/// A model output may only feed feathering when it is a finite probability.
+/// FP16 outputs go through the same gate: half-float rounding is acceptable,
+/// NaN/Inf and logits are not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaneCheck {
+    Probability,
+    Finite,
+}
+
+fn validate_plane(name: &str, plane: &[f32], dtype: c_int, check: PlaneCheck) -> Result<()> {
+    let mut non_finite = 0usize;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &value in plane {
+        if !value.is_finite() {
+            non_finite += 1;
+            continue;
+        }
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if non_finite != 0 {
+        bail!(
+            "{name}: {non_finite} non-finite values in {} output",
+            ort::dtype_name(dtype)
+        );
+    }
+    if plane.is_empty() {
+        bail!("{name}: model returned an empty output");
+    }
+    if check == PlaneCheck::Probability && (min < -0.02 || max > 1.02) {
+        bail!(
+            "{name}: {} output range [{min:.4}, {max:.4}] is not a probability mask; \
+             refusing to feather",
+            ort::dtype_name(dtype)
+        );
+    }
+    Ok(())
+}
 
 /// A loaded model plus what its metadata says about the tensors.
 pub(crate) struct Segmenter {
@@ -384,8 +586,14 @@ impl Segmenter {
             }
         };
         let dims = &session.input.dims;
-        if dims.len() != 4 || session.input.element_type != 1 {
-            bail!("{name}: expected one float32 NCHW/NHWC input, got {dims:?}");
+        if dims.len() != 4
+            || (session.input.element_type != ort::DT_FLOAT
+                && session.input.element_type != ort::DT_FLOAT16)
+        {
+            bail!(
+                "{name}: expected one float32/float16 NCHW/NHWC input, got {dims:?} dtype {}",
+                ort::dtype_name(session.input.element_type)
+            );
         }
         // [1,3,H,W] is NCHW, [1,H,W,3] is NHWC.
         let nchw = dims[1] == 3;
@@ -402,7 +610,33 @@ impl Segmenter {
             .find(|d| *d > 1 && *d < 64)
             .unwrap_or(1) as usize;
         let out_nchw = channels > 1 && out_dims.get(1) == Some(&(channels as i64));
-        let model = Arc::new(Segmenter { session, path, in_w, in_h, nchw, channels, out_nchw });
+        let output_dtype = session.outputs[0].element_type;
+        if output_dtype != ort::DT_FLOAT && output_dtype != ort::DT_FLOAT16 {
+            bail!(
+                "{name}: output dtype {} is neither float32 nor float16",
+                ort::dtype_name(output_dtype)
+            );
+        }
+        log::info!(
+            "AI session {name}: provider={} key={} input {:?} {} {} output {:?} {} {}",
+            session.provider().label(),
+            session.session_key().short(),
+            dims,
+            ort::dtype_name(session.input.element_type),
+            if nchw { "NCHW" } else { "NHWC" },
+            out_dims,
+            ort::dtype_name(output_dtype),
+            if out_nchw { "NCHW" } else { "NHWC" }
+        );
+        let model = Arc::new(Segmenter {
+            session,
+            path,
+            in_w,
+            in_h,
+            nchw,
+            channels,
+            out_nchw,
+        });
         model_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -410,20 +644,56 @@ impl Segmenter {
         Ok(model)
     }
 
-    fn run_on_image(name: &str, rgba: &[u8], width: usize, height: usize) -> Result<(Arc<Self>, Vec<f32>)> {
+    /// Loads the model and runs it on `rgba`, retrying on the CPU session when
+    /// the GPU session fails or returns a plane that fails `check`. Returns the
+    /// output plus the timing segments; the caller times post-processing.
+    fn run_on_image(
+        name: &str,
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        check: PlaneCheck,
+    ) -> Result<MaskRun> {
+        let load_started = std::time::Instant::now();
         let model = Self::load(name)?;
-        match model.run(&mut model.input_tensor(rgba, width, height)) {
-            Ok(output) => Ok((model, output)),
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let attempt = |model: &Arc<Segmenter>| -> Result<(Vec<f32>, c_int, f64, f64)> {
+            let preprocess_started = std::time::Instant::now();
+            let mut input = model.input_tensor(rgba, width, height);
+            let preprocess_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
+            let infer_started = std::time::Instant::now();
+            let (output, dtype) = model.run_typed(&mut input)?;
+            let infer_ms = infer_started.elapsed().as_secs_f64() * 1000.0;
+            validate_plane(name, &output, dtype, check)?;
+            Ok((output, dtype, preprocess_ms, infer_ms))
+        };
+        let (model, output, dtype, preprocess_ms, infer_ms) = match attempt(&model) {
+            Ok(result) => (model, result.0, result.1, result.2, result.3),
             Err(error) if model.session.provider() != Provider::Cpu => {
-                log::warn!("{name} inference failed on {}: {error:#}; retrying on CPU", model.session.provider().label());
+                log::warn!(
+                    "{name} failed on {}: {error:#}; retrying on CPU",
+                    model.session.provider().label()
+                );
                 let cpu = Self::load_with_cpu_fallback(name, true)
-                    .with_context(|| format!("{name} CPU session after GPU inference failure: {error:#}"))?;
-                let output = cpu.run(&mut cpu.input_tensor(rgba, width, height))
-                    .with_context(|| format!("{name} CPU retry after GPU inference failure: {error:#}"))?;
-                Ok((cpu, output))
+                    .with_context(|| format!("{name} CPU session after failure: {error:#}"))?;
+                let (output, dtype, preprocess_ms, infer_ms) = attempt(&cpu)
+                    .with_context(|| format!("{name} CPU retry after failure: {error:#}"))?;
+                (cpu, output, dtype, preprocess_ms, infer_ms)
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        let timing = MaskTiming {
+            model: name.to_string(),
+            provider: model.session.provider().label(),
+            session_key: model.session.session_key().short(),
+            load_ms,
+            cold_ms: model.session.timing().cold_us() as f64 / 1000.0,
+            preprocess_ms,
+            infer_ms,
+            postprocess_ms: 0.0,
+            output_dtype: ort::dtype_name(dtype),
+        };
+        Ok(MaskRun { model, output, timing })
     }
 
     fn input_tensor(&self, rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
@@ -472,19 +742,70 @@ impl Segmenter {
         tensor
     }
 
-    /// Runs the model and returns its first output at model resolution.
-    fn run(&self, input: &mut [f32]) -> Result<Vec<f32>> {
+    /// Runs the model and returns its first output plus that output's dtype.
+    fn run_typed(&self, input: &mut [f32]) -> Result<(Vec<f32>, c_int)> {
         let runtime = Runtime::get().context("ONNX Runtime is not available")?;
         let shape: [i64; 4] = if self.nchw {
             [1, 3, self.in_h as i64, self.in_w as i64]
         } else {
             [1, self.in_h as i64, self.in_w as i64, 3]
         };
-        let mut outputs = runtime.run(&self.session, input, &shape)?;
+        let mut outputs = runtime.run_typed(&self.session, input, &shape)?;
         if outputs.is_empty() {
             bail!("{}: model returned no outputs", self.path.display());
         }
-        Ok(outputs.swap_remove(0))
+        let plane = outputs.swap_remove(0);
+        if !plane.dims.is_empty() && plane.dims.iter().all(|dim| *dim > 0) {
+            let expected: i64 = plane.dims.iter().product();
+            if expected as usize != plane.values.len() {
+                bail!(
+                    "{}: output shape {:?} implies {expected} values, got {}",
+                    self.path.display(),
+                    plane.dims,
+                    plane.values.len()
+                );
+            }
+        }
+        Ok((plane.values, plane.dtype))
+    }
+
+    /// Runs the model and returns its first output at model resolution.
+    fn run(&self, input: &mut [f32]) -> Result<Vec<f32>> {
+        self.run_typed(input).map(|(values, _)| values)
+    }
+
+    /// One inference on a zero tensor at model resolution. Called from the
+    /// prewarm thread (below normal priority) so the first interactive mask
+    /// does not pay allocator/kernel setup; the session records the warmup time.
+    fn warmup(&self) -> Result<f64> {
+        let started = std::time::Instant::now();
+        self.run(&mut vec![0.0f32; 3 * self.in_w * self.in_h])?;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        log::info!(
+            "AI warmup {}: provider={} {ms:.2} ms",
+            self.path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.display().to_string()),
+            self.session.provider().label()
+        );
+        Ok(ms)
+    }
+}
+
+/// One inference result plus the segments its caller should extend with the
+/// post-processing time it measures itself.
+struct MaskRun {
+    model: Arc<Segmenter>,
+    output: Vec<f32>,
+    timing: MaskTiming,
+}
+
+impl MaskRun {
+    fn finish(mut self, postprocess_ms: f64) -> Arc<Segmenter> {
+        self.timing.postprocess_ms = postprocess_ms;
+        record_mask_timing(self.timing);
+        self.model
     }
 }
 
@@ -527,14 +848,19 @@ pub fn subject_mask(rgba: &[u8], w: u32, h: u32) -> Result<Vec<f32>> {
     if w == 0 || h == 0 {
         return Ok(Vec::new());
     }
-    let model = Segmenter::load("subjectMasking.onnx")?;
-    let mut input = model.input_tensor(rgba, w, h);
-    let out = model.run(&mut input)?;
+    let run = Segmenter::run_on_image("subjectMasking.onnx", rgba, w, h, PlaneCheck::Probability)?;
+    let model = run.model.clone();
+    let post_started = std::time::Instant::now();
     let expected = model.in_w * model.in_h;
-    if out.len() < expected {
-        bail!("subjectMasking.onnx returned {} values, expected {expected}", out.len());
+    if run.output.len() < expected {
+        bail!(
+            "subjectMasking.onnx returned {} values, expected {expected}",
+            run.output.len()
+        );
     }
-    Ok(resample(&out[..expected], model.in_w, model.in_h, w, h))
+    let mask = resample(&run.output[..expected], model.in_w, model.in_h, w, h);
+    run.finish(post_started.elapsed().as_secs_f64() * 1000.0);
+    Ok(mask)
 }
 
 /// The six classes the people parser scores per pixel.
@@ -555,14 +881,22 @@ pub fn people_class_mask(rgba: &[u8], w: u32, h: u32, class: PeopleClass) -> Res
     if w == 0 || h == 0 {
         return Ok(Vec::new());
     }
-    let (model, out) = Segmenter::run_on_image("skinMasking.onnx", rgba, w, h)?;
+    let run = Segmenter::run_on_image("skinMasking.onnx", rgba, w, h, PlaneCheck::Finite)?;
+    let model = run.model.clone();
+    let post_started = std::time::Instant::now();
     let pixels = model.in_w * model.in_h;
     let classes = model.channels.max(1);
-    if out.len() < pixels * classes {
-        bail!("skinMasking.onnx returned {} values, expected {}", out.len(), pixels * classes);
+    if run.output.len() < pixels * classes {
+        bail!(
+            "skinMasking.onnx returned {} values, expected {}",
+            run.output.len(),
+            pixels * classes
+        );
     }
-    let plane = class_plane(&out, pixels, classes, model.out_nchw, class as usize);
-    Ok(resample(&plane, model.in_w, model.in_h, w, h))
+    let plane = class_plane(&run.output, pixels, classes, model.out_nchw, class as usize);
+    let mask = resample(&plane, model.in_w, model.in_h, w, h);
+    run.finish(post_started.elapsed().as_secs_f64() * 1000.0);
+    Ok(mask)
 }
 
 /// Face skin, body skin and hair from one parser inference.
@@ -583,18 +917,20 @@ pub fn people_masks(rgba: &[u8], w: u32, h: u32) -> Result<PeopleMasks> {
             hair: Vec::new(),
         });
     }
-    let (model, out) = Segmenter::run_on_image("skinMasking.onnx", rgba, w, h)?;
+    let run = Segmenter::run_on_image("skinMasking.onnx", rgba, w, h, PlaneCheck::Finite)?;
+    let model = run.model.clone();
+    let post_started = std::time::Instant::now();
     let pixels = model.in_w * model.in_h;
     let classes = model.channels.max(1);
-    if out.len() < pixels * classes {
+    if run.output.len() < pixels * classes {
         bail!(
             "skinMasking.onnx returned {} values, expected {}",
-            out.len(),
+            run.output.len(),
             pixels * classes
         );
     }
     let [face, body, hair] = class_planes(
-        &out,
+        &run.output,
         pixels,
         classes,
         model.out_nchw,
@@ -613,6 +949,7 @@ pub fn people_masks(rgba: &[u8], w: u32, h: u32) -> Result<PeopleMasks> {
             )
         },
     );
+    run.finish(post_started.elapsed().as_secs_f64() * 1000.0);
     Ok(PeopleMasks {
         face,
         body,
@@ -736,14 +1073,27 @@ pub fn model_summary(name: &str) -> Result<Vec<String>> {
     let model = Segmenter::load(name)?;
     let dims = |d: &[i64]| d.iter().map(i64::to_string).collect::<Vec<_>>().join("x");
     let mut lines = vec![format!(
-        "{} input {:?} [{}] float32",
+        "{} input {:?} [{}] {}",
         model.path.display(),
         model.session.input.name,
-        dims(&model.session.input.dims)
+        dims(&model.session.input.dims),
+        ort::dtype_name(model.session.input.element_type)
     )];
     lines.extend(model.session.outputs.iter().map(|o| {
-        format!("  output {:?} [{}]", o.name, dims(&o.dims))
+        format!(
+            "  output {:?} [{}] {}",
+            o.name,
+            dims(&o.dims),
+            ort::dtype_name(o.element_type)
+        )
     }));
+    lines.push(format!(
+        "  provider={} requested=[{}] fallback={:?} key={}",
+        model.session.provider().label(),
+        model.session.provider_trace().0,
+        model.session.provider_trace().1,
+        model.session.session_key().short()
+    ));
     Ok(lines)
 }
 
@@ -1155,5 +1505,87 @@ mod tests {
         assert!(err.to_string().contains("no Lips class"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cold-start accounting per model, sequentially: session creation and the
+    /// zero-tensor warmup separately. Useful before/after ORT cache changes.
+    #[test]
+    #[ignore = "needs Capture One's ONNX models; prints load and warmup segments"]
+    fn real_models_load_and_warmup_segments() {
+        if Runtime::get().is_none() {
+            println!("ONNX Runtime unavailable");
+            return;
+        }
+        for name in ["subjectMasking.onnx", "skinMasking.onnx"] {
+            if !model_available(name) {
+                println!("{name}: not installed");
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let model = Segmenter::load(name).expect("model");
+            let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            let warm_ms = model.warmup().expect("warmup") ;
+            let timing = model.session.timing();
+            println!(
+                "{name}: provider={} load={load_ms:.1}ms warmup={warm_ms:.1}ms \
+                 session_cold={:.1}ms",
+                model.session.provider().label(),
+                timing.cold_us() as f64 / 1000.0
+            );
+        }
+    }
+
+    #[test]
+    fn probability_validation_rejects_non_finite_and_out_of_range_planes() {
+        assert!(validate_plane("m", &[0.0, 0.5, 1.0], ort::DT_FLOAT, PlaneCheck::Probability).is_ok());
+        assert!(validate_plane("m", &[0.0, 1.0], ort::DT_FLOAT16, PlaneCheck::Probability).is_ok());
+        let nan = validate_plane("m", &[0.5, f32::NAN], ort::DT_FLOAT, PlaneCheck::Probability)
+            .unwrap_err();
+        assert!(nan.to_string().contains("non-finite"), "{nan}");
+        let inf = validate_plane("m", &[f32::INFINITY], ort::DT_FLOAT16, PlaneCheck::Probability)
+            .unwrap_err();
+        assert!(inf.to_string().contains("non-finite"), "{inf}");
+        let logits = validate_plane("m", &[-3.0, 4.0], ort::DT_FLOAT16, PlaneCheck::Probability)
+            .unwrap_err();
+        assert!(logits.to_string().contains("not a probability mask"), "{logits}");
+        // Logits are legal for the people parser as long as they are finite.
+        assert!(validate_plane("m", &[-30.0, 4.0], ort::DT_FLOAT16, PlaneCheck::Finite).is_ok());
+        let empty = validate_plane("m", &[], ort::DT_FLOAT, PlaneCheck::Finite).unwrap_err();
+        assert!(empty.to_string().contains("empty"), "{empty}");
+    }
+
+    #[test]
+    fn fp16_rounded_probabilities_still_pass_the_feather_gate() {
+        // A probability rounded to half precision must be accepted; rejecting
+        // it would make FP16 providers unusable, accepting NaN/Inf would let
+        // garbage into feathering.
+        let rounded: Vec<f32> = [0.0f32, 0.001, 0.5, 0.999, 1.0]
+            .into_iter()
+            .map(|value| ort::half_to_f32(ort::float_to_half(value)))
+            .collect();
+        assert!(validate_plane("m", &rounded, ort::DT_FLOAT16, PlaneCheck::Probability).is_ok());
+    }
+
+    #[test]
+    fn mask_timings_are_recorded_per_model() {
+        let name = "test-mask-timing";
+        let timing = MaskTiming {
+            model: name.to_string(),
+            provider: "CPU",
+            session_key: "0000000000000000".to_string(),
+            load_ms: 1.5,
+            cold_ms: 2.5,
+            preprocess_ms: 3.5,
+            infer_ms: 4.5,
+            postprocess_ms: 5.5,
+            output_dtype: "float32".to_string(),
+        };
+        record_mask_timing(timing);
+        let stored = last_mask_timing(name).expect("timing stored");
+        assert_eq!(stored.model, name);
+        assert_eq!(stored.output_dtype, "float32");
+        assert_eq!(stored.postprocess_ms, 5.5);
+        assert!(last_mask_timing("never-recorded").is_none());
     }
 }

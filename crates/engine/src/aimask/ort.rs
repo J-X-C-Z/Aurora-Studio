@@ -6,12 +6,13 @@
 //! the 1.23.2 header (`ORT_API_VERSION 23`, package `libonnxruntime-dev`) and
 //! were confirmed by opening both models and reading their tensor metadata.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{OnceLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +21,9 @@ type Status = *mut c_void;
 type ApiPtr = *const *const c_void;
 
 const FLOAT: c_int = 1;
+/// `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16`. DirectML's FP16 model siblings use
+/// it for both the input and the output tensor.
+const FLOAT16: c_int = 10;
 const LOG_ERROR: c_int = 3;
 const RTLD_NOW: c_int = 2;
 const ORT_API_VERSION: u32 = 23;
@@ -160,6 +164,24 @@ impl Provider {
     }
 }
 
+/// What the runtime can export and what the selection logic asked for. This is
+/// a *plan*, not evidence of execution: [`Session`] reports the provider a
+/// session really opened on, and [`Session::provider_trace`] why the first
+/// choices were skipped. GPU nodes can still fall back to CPU inside one
+/// session, so "opened on" is not the same as "every node ran there".
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderPlan {
+    pub(crate) exported: Vec<Provider>,
+    pub(crate) selected: Vec<Provider>,
+    pub(crate) trt_reason: &'static str,
+}
+
+impl ProviderPlan {
+    pub(crate) fn labels(&self) -> Vec<&'static str> {
+        provider_labels(&self.selected)
+    }
+}
+
 fn provider_symbol(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::TensorRt => Some("OrtSessionOptionsAppendExecutionProvider_Tensorrt"),
@@ -244,6 +266,42 @@ fn providers_from_override(raw: &str) -> Vec<Provider> {
 
 fn provider_labels(providers: &[Provider]) -> Vec<&'static str> {
     providers.iter().map(|provider| provider.label()).collect()
+}
+
+fn log_provider_plan(plan: &ProviderPlan) {
+    log::info!(
+        "ONNX Runtime providers: exported {:?}, selected {:?}, trt {:?}",
+        provider_labels(&plan.exported),
+        provider_labels(&plan.selected),
+        plan.trt_reason
+    );
+    for provider in [
+        Provider::TensorRt,
+        Provider::Cuda,
+        Provider::DirectMl,
+        Provider::Cpu,
+    ] {
+        let state = match provider {
+            Provider::Cpu => "enabled (fallback)",
+            Provider::TensorRt if !plan.exported.contains(&provider) => {
+                "not exported by this ONNX Runtime"
+            }
+            Provider::TensorRt if plan.selected.contains(&Provider::TensorRt) => {
+                match plan.trt_reason {
+                    "cache" => "enabled first (engine cache present)",
+                    _ => "enabled first (explicit request)",
+                }
+            }
+            Provider::TensorRt => {
+                "skipped (no engine cache; set AURORA_TRT_CACHE_DIR or \
+                 AURORA_ORT_PROVIDERS=tensorrt,...)"
+            }
+            _ if !plan.exported.contains(&provider) => "not exported by this ONNX Runtime",
+            _ if plan.selected.contains(&provider) => "enabled",
+            _ => "available but not selected",
+        };
+        log::info!("provider {}: {}", provider.label(), state);
+    }
 }
 
 /// Directory the operator pre-populated with TensorRT engine files.
@@ -334,23 +392,292 @@ fn graph_optimization_level() -> c_int {
     }
 }
 
-fn optimized_model_cache_path(path: &Path, provider: Provider, optimization: c_int) -> Option<PathBuf> {
-    let dir = std::env::var_os("AURORA_ORT_CACHE_DIR")?;
-    let metadata = std::fs::metadata(path).ok()?;
+/// Intra-op threads the session options use. Part of the session identity: a
+/// cached optimized graph and a running session are only equivalent when the
+/// thread count matches.
+fn intra_op_threads() -> c_int {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) as c_int
+}
+
+/// Everything that changes how ORT executes a model, in a stable order. Kept
+/// as one string so it can be hashed into [`SessionKey`] and printed in logs.
+fn provider_options_fingerprint() -> String {
+    let tf32 = std::env::var("NVIDIA_TF32_OVERRIDE").unwrap_or_else(|_| "-".to_string());
+    let trt_dir = std::env::var("AURORA_TRT_CACHE_DIR").unwrap_or_else(|_| "-".to_string());
+    format!(
+        "opt={};threads={};tf32={tf32};trt_dir={trt_dir};trt_present={}",
+        graph_optimization_level(),
+        intra_op_threads(),
+        trt_cache_present()
+    )
+}
+
+/// Stable 64-bit FNV-1a. Used for session/cache names so they stay identical
+/// across processes and Rust upgrades (unlike `DefaultHasher`, whose output is
+/// not a documented artifact).
+fn fnv64(bytes: &[u8]) -> u64 {
+    fnv64_with(bytes, FNV_OFFSET)
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv64_with(bytes: &[u8], seed: u64) -> u64 {
+    let mut hash = seed;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Content fingerprint of a model, plus its length. `crc32` over the whole file
+/// (fast) folded with the length, the head and the tail. Models are tens of
+/// megabytes, so a full cryptographic digest would cost more cold-start time
+/// than it buys; this is an identity check, not a security boundary.
+fn model_fingerprint(path: &Path) -> Result<(u64, u64)> {
+    type FingerprintCache = Mutex<HashMap<(PathBuf, u64, u128), u64>>;
+    static CACHE: OnceLock<FingerprintCache> = OnceLock::new();
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading model metadata {}", path.display()))?;
+    let len = metadata.len();
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hash);
-    metadata.len().hash(&mut hash);
-    modified.hash(&mut hash);
-    provider.label().hash(&mut hash);
-    optimization.hash(&mut hash);
+    let cache_key = (path.to_path_buf(), len, modified);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hash) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&cache_key)
+    {
+        return Ok((*hash, len));
+    }
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening model {}", path.display()))?;
+    let mut crc = crc32fast::Hasher::new();
+    let mut head = crc32fast::Hasher::new();
+    let mut tail = crc32fast::Hasher::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    let mut ring: Vec<u8> = Vec::new();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        crc.update(chunk);
+        if offset < 64 << 10 {
+            let keep = ((64 << 10) - offset as usize).min(read);
+            head.update(&chunk[..keep]);
+        }
+        // Keep the last 64 KiB seen so far.
+        ring.extend_from_slice(chunk);
+        if ring.len() > 64 << 10 {
+            let drop = ring.len() - (64 << 10);
+            ring.drain(..drop);
+        }
+        offset += read as u64;
+    }
+    tail.update(&ring);
+    let mut hash = FNV_OFFSET;
+    for value in [
+        u64::from(crc.finalize()),
+        len,
+        u64::from(head.finalize()),
+        u64::from(tail.finalize()),
+    ] {
+        hash = fnv64_with(&value.to_le_bytes(), hash);
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(cache_key, hash);
+    Ok((hash, len))
+}
+
+/// Identity of one reusable ONNX session. A session may be reused only when
+/// every component matches: the model content, the ORT build, the execution
+/// provider and the options that change execution (thread count, graph
+/// optimization, TensorRT cache, TF32).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionKey {
+    model_hash: u64,
+    model_len: u64,
+    ort_version: String,
+    ort_api: u32,
+    providers: String,
+    options: String,
+}
+
+impl SessionKey {
+    /// Same model and runtime, restricted to one provider, for per-EP
+    /// optimized-model files and per-EP open attempts.
+    pub(crate) fn for_provider(&self, provider: Provider) -> SessionKey {
+        let mut key = self.clone();
+        key.providers = provider.label().to_string();
+        key
+    }
+
+    fn canonical(&self) -> String {
+        format!(
+            "v1|model={:016x}|len={}|ort={}|api={}|eps={}|opts={}",
+            self.model_hash, self.model_len, self.ort_version, self.ort_api, self.providers,
+            self.options
+        )
+    }
+
+    pub(crate) fn digest(&self) -> u64 {
+        fnv64(self.canonical().as_bytes())
+    }
+
+    /// Identity used by the in-process session registry and its creation locks.
+    pub(crate) fn registry_id(&self) -> String {
+        self.canonical()
+    }
+
+    pub(crate) fn short(&self) -> String {
+        format!("{:016x}", self.digest())
+    }
+}
+
+/// Where ORT writes its optimized graph. `AURORA_ORT_CACHE_DIR` wins; without
+/// it the per-user cache is used, because re-running graph optimization on
+/// every launch is the largest single part of the 0.8-1.5 s cold start.
+fn optimized_cache_dir() -> Option<PathBuf> {
+    if std::env::var_os("AURORA_DISABLE_ORT_CACHE").is_some() {
+        return None;
+    }
+    if let Some(dir) = std::env::var_os("AURORA_ORT_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(|dir| {
+            PathBuf::from(dir)
+                .join("Aurora Studio")
+                .join("Cache")
+                .join("onnxruntime")
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|dir| PathBuf::from(dir).join(".cache")))
+            .map(|dir| dir.join("aurora-studio").join("onnxruntime"))
+    }
+}
+
+fn optimized_model_cache_path(path: &Path, key: &SessionKey) -> Option<PathBuf> {
+    Some(optimized_model_cache_path_in(&optimized_cache_dir()?, path, key))
+}
+
+fn optimized_model_cache_path_in(dir: &Path, path: &Path, key: &SessionKey) -> PathBuf {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
-    Some(PathBuf::from(dir).join(format!("{stem}-{:016x}.onnx", hash.finish())))
+    dir.join(format!("{stem}-{}.onnx", key.short()))
+}
+
+type SessionRegistry = Mutex<HashMap<String, Session>>;
+
+fn session_registry() -> &'static SessionRegistry {
+    static REGISTRY: OnceLock<SessionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// In-flight session creations, keyed by [`SessionKey::registry_id`].
+fn session_flights() -> &'static OnceLock<Mutex<HashMap<String, Arc<Flight<Session>>>>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Flight<Session>>>>> = OnceLock::new();
+    &FLIGHTS
+}
+
+fn registry_lookup(id: &str) -> Option<Session> {
+    session_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(id)
+        .cloned()
+}
+
+fn registry_insert(id: String, session: Session) {
+    let mut registry = session_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // Unlike the mask cache, sessions are cheap to reopen and expensive to keep
+    // alive on a GPU; a large registry is a leak, not a cache.
+    if registry.len() > 64 {
+        registry.clear();
+    }
+    registry.insert(id, session);
+}
+
+/// One in-flight creation. `done` is signalled after `result` is written.
+struct Flight<V> {
+    result: Mutex<Option<Result<V, String>>>,
+    done: std::sync::Condvar,
+}
+
+/// Runs `work` once per key. Concurrent callers with the same key wait for the
+/// leader and receive a clone of its result. Failures are shared with the
+/// waiters but not cached: the next call after a failure starts a new attempt.
+/// A panicking leader becomes an error instead of hanging waiters.
+fn single_flight<V: Clone>(
+    store: &'static OnceLock<Mutex<HashMap<String, Arc<Flight<V>>>>>,
+    key: String,
+    work: impl FnOnce() -> Result<V>,
+) -> Result<V> {
+    let flights = store.get_or_init(|| Mutex::new(HashMap::new()));
+    // Only one thread may install a flight per key. If a caller arrives after
+    // a previous flight was removed, it joins that (already finished) flight
+    // instead of starting a second creation for the same generation.
+    let (flight, leader) = {
+        let mut flights = flights.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(flight) = flights.get(&key) {
+            (flight.clone(), false)
+        } else {
+            let flight = Arc::new(Flight {
+                result: Mutex::new(None),
+                done: std::sync::Condvar::new(),
+            });
+            flights.insert(key.clone(), flight.clone());
+            (flight, true)
+        }
+    };
+    if leader {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            .unwrap_or_else(|_| Err(anyhow!("session creation panicked")))
+            .map_err(|error| format!("{error:#}"));
+        *flight
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+        flight.done.notify_all();
+        // Keep the finished flight under the same lock that installs new
+        // flights. Removing it here would let a late caller start a second
+        // creation and race the waiters that are still reading this result.
+    }
+    let mut result = flight
+        .result
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while result.is_none() {
+        result = flight
+            .done
+            .wait(result)
+            .unwrap_or_else(|error| error.into_inner());
+    }
+    match result
+        .clone()
+        .expect("single_flight result is written before any waiter returns")
+    {
+        Ok(value) => Ok(value),
+        Err(message) => Err(anyhow!("{message}")),
+    }
 }
 
 // ORT objects are internally synchronised; `Run` may be called from any thread.
@@ -453,6 +780,22 @@ impl Runtime {
         (&self.library, &self.version, self.api_version)
     }
 
+    /// Identity of a session on `path` with this runtime and provider list.
+    /// The list is part of the key because a different order can open a
+    /// different provider; [`SessionKey::for_provider`] narrows it to one EP
+    /// for per-provider optimized-model files.
+    pub(crate) fn session_key(&self, path: &Path, providers: &[Provider]) -> Result<SessionKey> {
+        let (model_hash, model_len) = model_fingerprint(path)?;
+        Ok(SessionKey {
+            model_hash,
+            model_len,
+            ort_version: self.version.clone(),
+            ort_api: self.api_version,
+            providers: provider_labels(providers).join(","),
+            options: provider_options_fingerprint(),
+        })
+    }
+
     fn symbol(&self, name: &str) -> *mut c_void {
         let Ok(name) = CString::new(name) else {
             return ptr::null_mut();
@@ -544,7 +887,25 @@ impl Runtime {
     /// Providers this library can really append. The C API exports one
     /// `OrtSessionOptionsAppendExecutionProvider_<name>` symbol per provider it
     /// was built with, so probing the symbols reflects the build, not a wish.
+    ///
+    /// The plan is computed once per process: it scans the export table, the
+    /// TensorRT cache directory and the provider environment variables, and
+    /// every session open used to repeat that scan (and its log lines) during
+    /// the cold start it was supposed to reduce.
+    pub(crate) fn provider_plan(&self) -> &'static ProviderPlan {
+        static PLAN: OnceLock<ProviderPlan> = OnceLock::new();
+        PLAN.get_or_init(|| {
+            let plan = self.compute_provider_plan();
+            log_provider_plan(&plan);
+            plan
+        })
+    }
+
     pub(crate) fn available_providers(&self) -> Vec<Provider> {
+        self.provider_plan().selected.clone()
+    }
+
+    fn compute_provider_plan(&self) -> ProviderPlan {
         let has_trt = !self.provider_append_symbol(Provider::TensorRt).is_null();
         let has_cuda = !self.provider_append_symbol(Provider::Cuda).is_null();
         let has_dml = !self.provider_append_symbol(Provider::DirectMl).is_null();
@@ -607,36 +968,9 @@ impl Runtime {
                 (chosen, reason)
             }
         };
-        log::info!(
-            "ONNX Runtime providers: exported {:?}, selected {:?}",
-            provider_labels(&exported),
-            provider_labels(&chosen)
-        );
-        for provider in [
-            Provider::TensorRt,
-            Provider::Cuda,
-            Provider::DirectMl,
-            Provider::Cpu,
-        ] {
-            let state = match provider {
-                Provider::Cpu => "enabled (fallback)",
-                Provider::TensorRt if !has_trt => "not exported by this ONNX Runtime",
-                Provider::TensorRt if chosen.contains(&Provider::TensorRt) => match trt_reason {
-                    "cache" => "enabled first (engine cache present)",
-                    _ => "enabled first (explicit request)",
-                },
-                Provider::TensorRt => {
-                    "skipped (no engine cache; set AURORA_TRT_CACHE_DIR or \
-                     AURORA_ORT_PROVIDERS=tensorrt,...)"
-                }
-                _ if !exported.contains(&provider) => "not exported by this ONNX Runtime",
-                _ if chosen.contains(&provider) => "enabled",
-                _ => "available but not selected",
-            };
-            log::info!("provider {}: {}", provider.label(), state);
-        }
-        chosen
+        ProviderPlan { exported, selected: chosen, trt_reason }
     }
+
 
     unsafe fn append_provider(&self, options: *mut c_void, provider: Provider) -> Result<()> {
         if provider == Provider::Cpu {
@@ -682,7 +1016,47 @@ impl Runtime {
     /// Opens a session using only the requested providers, in order. This is
     /// stricter than `open_session`: callers that require a GPU cannot receive
     /// a CPU session by accident.
+    ///
+    /// The returned session names the provider it *opened on* and, when an
+    /// earlier provider was skipped or failed, why. Callers must not treat the
+    /// plan's first entry as the effective provider.
     pub(crate) fn open_session_on(&self, path: &Path, providers: &[Provider]) -> Result<Session> {
+        let base_key = self
+            .session_key(path, providers)
+            .with_context(|| format!("identifying model {}", path.display()))?;
+        let id = base_key.registry_id();
+        self.session_slot(id, || self.open_session_uncached_on(path, &base_key, providers))
+    }
+
+    /// Session creation single-flight. Waiters on the same key block on a
+    /// per-key lock and then reuse the leader's session; different models or
+    /// providers never queue behind one global lock. The registry holds one
+    /// session per key, which also bounds GPU session memory to the number of
+    /// distinct (model, runtime, EP, options) tuples actually used.
+    fn session_slot(
+        &self,
+        id: String,
+        open: impl FnOnce() -> Result<Session>,
+    ) -> Result<Session> {
+        if let Some(session) = registry_lookup(&id) {
+            return Ok(session);
+        }
+        single_flight(session_flights(), id.clone(), || {
+            if let Some(session) = registry_lookup(&id) {
+                return Ok(session);
+            }
+            let session = open()?;
+            registry_insert(id.clone(), session.clone());
+            Ok(session)
+        })
+    }
+
+    fn open_session_uncached_on(
+        &self,
+        path: &Path,
+        base_key: &SessionKey,
+        providers: &[Provider],
+    ) -> Result<Session> {
         let mut failures: Vec<String> = Vec::new();
         for &provider in providers {
             if provider != Provider::Cpu {
@@ -703,48 +1077,50 @@ impl Runtime {
                 failures.push(format!("{} provider unavailable: {blocker}", provider.label()));
                 continue;
             }
-            let cached = optimized_model_cache_path(path, provider, graph_optimization_level())
-                .is_some_and(|path| path.is_file());
-            match self.open_session_with(path, provider, cached) {
+            let key = base_key.for_provider(provider);
+            let cached = optimized_model_cache_path(path, &key).is_some_and(|path| path.is_file());
+            let opened = match self.open_session_with(path, provider, &key, cached) {
+                Ok(session) => Ok(session),
+                Err(err) if cached => {
+                    log::warn!(
+                        "{} cached model failed for {}, rebuilding from source: {err:#}",
+                        provider.label(),
+                        path.display()
+                    );
+                    self.open_session_with(path, provider, &key, false)
+                        .map_err(|rebuild_err| {
+                            anyhow!("rebuilding the optimized model cache: {rebuild_err:#}")
+                        })
+                }
+                Err(err) => Err(err),
+            };
+            match opened {
                 Ok(session) => {
+                    if !failures.is_empty() {
+                        log::warn!(
+                            "{} opened on {}, after: {}",
+                            path.display(),
+                            provider.label(),
+                            failures.join("; ")
+                        );
+                        session.set_fallback(Some(failures.join("; ")));
+                    }
                     log::info!(
-                        "ONNX Runtime opened {} with requested provider {}; \
-                         unsupported nodes may still run on CPU",
+                        "ONNX Runtime opened {} on {} (key {}); unsupported nodes may still run on CPU",
                         path.display(),
-                        provider.label()
+                        provider.label(),
+                        key.short()
                     );
                     return Ok(session);
                 }
                 Err(err) => {
-                    if cached {
-                        log::warn!(
-                            "{} cached model failed for {}, rebuilding from source: {err:#}",
-                            provider.label(),
-                            path.display()
-                        );
-                        match self.open_session_with(path, provider, false) {
-                            Ok(session) => return Ok(session),
-                            Err(rebuild_err) => {
-                                let reason = format!(
-                                    "rebuilding the optimized model cache: {rebuild_err:#}"
-                                );
-                                log::warn!(
-                                    "{} rebuild failed for {}: {reason}",
-                                    provider.label(),
-                                    path.display()
-                                );
-                                failures.push(format!("{}: {reason}", provider.label()));
-                            }
-                        }
-                    } else {
-                        let reason = format!("{err:#}");
-                        log::warn!(
-                            "{} session failed for {}: {reason}",
-                            provider.label(),
-                            path.display(),
-                        );
-                        failures.push(format!("{}: {reason}", provider.label()));
-                    }
+                    let reason = format!("{err:#}");
+                    log::warn!(
+                        "{} session failed for {}: {reason}",
+                        provider.label(),
+                        path.display(),
+                    );
+                    failures.push(format!("{}: {reason}", provider.label()));
                 }
             }
         }
@@ -759,11 +1135,24 @@ impl Runtime {
     }
 
     pub(crate) fn open_cpu_session(&self, path: &Path) -> Result<Session> {
-        self.open_session_with(path, Provider::Cpu, false)
-            .with_context(|| format!("opening CPU model {}", path.display()))
+        let key = self
+            .session_key(path, &[Provider::Cpu])
+            .with_context(|| format!("identifying model {}", path.display()))?;
+        let id = key.registry_id();
+        self.session_slot(id, || {
+            self.open_session_with(path, Provider::Cpu, &key, false)
+                .with_context(|| format!("opening CPU model {}", path.display()))
+        })
     }
 
-    fn open_session_with(&self, path: &Path, provider: Provider, use_cached_model: bool) -> Result<Session> {
+    fn open_session_with(
+        &self,
+        path: &Path,
+        provider: Provider,
+        key: &SessionKey,
+        use_cached_model: bool,
+    ) -> Result<Session> {
+        let cold_started = std::time::Instant::now();
         let api = self.api;
         let create_options: unsafe extern "C" fn(*mut *mut c_void) -> Status =
             unsafe { function(api, CREATE_SESSION_OPTIONS) };
@@ -785,7 +1174,7 @@ impl Runtime {
             unsafe { function(api, RELEASE_SESSION_OPTIONS) };
         let mut options = ptr::null_mut();
         unsafe { check(create_options(&mut options), api)? };
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) as c_int;
+        let threads = intra_op_threads();
         // The cache already contains ORT's optimized graph; re-running transforms only adds latency.
         let optimization = if use_cached_model { 0 } else { graph_optimization_level() };
         let result = unsafe {
@@ -794,17 +1183,30 @@ impl Runtime {
             });
             result
         };
-        let cache_path = optimized_model_cache_path(path, provider, graph_optimization_level());
+        let cache_path = optimized_model_cache_path(path, key);
         let result = result.and_then(|()| {
             let Some(cache_path) = cache_path.as_ref().filter(|_| !use_cached_model) else {
                 return Ok(());
             };
-            if let Some(dir) = cache_path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let cache_path = ort_path(cache_path);
-            unsafe { check(set_optimized_path(options, cache_path.as_ptr() as *const c_void), api) }
+            // The per-user cache is an optimization, never a prerequisite: an
+            // unwritable profile must still open the model from source.
+            let setup = (|| -> Result<()> {
+                if let Some(dir) = cache_path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let cache_path = ort_path(cache_path);
+                unsafe {
+                    check(set_optimized_path(options, cache_path.as_ptr() as *const c_void), api)
+                }
                 .context("setting the optimized model cache path")
+            })();
+            if let Err(error) = setup {
+                log::warn!(
+                    "optimized model cache disabled for {}: {error:#}",
+                    cache_path.display()
+                );
+            }
+            Ok(())
         });
         let result = result.and_then(|()| unsafe { self.append_provider(options, provider) });
         let profile_prefix = std::env::var_os("AURORA_ORT_PROFILE_DIR").map(|dir| {
@@ -846,19 +1248,37 @@ impl Runtime {
                 format!("opening {}", path.display())
             }
         })?;
-        let session = Session {
-            api,
-            ptr: session,
-            provider,
-            profile_active: AtomicBool::new(profile_prefix.is_some()),
-            input: TensorMeta { name: String::new(), dims: Vec::new(), element_type: 0 },
-            outputs: Vec::new(),
+        let cold_us = cold_started.elapsed().as_micros() as u64;
+        let (input, outputs) = match unsafe { Session::read_metadata(api, session) } {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let release: unsafe extern "C" fn(*mut c_void) =
+                    unsafe { function(api, RELEASE_SESSION) };
+                unsafe { release(session) };
+                return Err(error)
+                    .with_context(|| format!("reading tensor metadata for {}", path.display()));
+            }
         };
-        Ok(unsafe { session.with_metadata() }?)
+        Ok(Session {
+            inner: Arc::new(SessionInner {
+                api,
+                ptr: session,
+                provider,
+                key: key.clone(),
+                fallback: Mutex::new(None),
+                profile_active: AtomicBool::new(profile_prefix.is_some()),
+                timing: Mutex::new(SessionTiming {
+                    cold_us,
+                    ..SessionTiming::default()
+                }),
+            }),
+            input,
+            outputs,
+        })
     }
 
     pub(crate) fn end_profiling(&self, session: &Session) -> Result<Option<PathBuf>> {
-        if !session.profile_active.swap(false, Ordering::AcqRel) {
+        if !session.inner.profile_active.swap(false, Ordering::AcqRel) {
             return Ok(None);
         }
         let end: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_char) -> Status =
@@ -866,7 +1286,7 @@ impl Runtime {
         let free: unsafe extern "C" fn(*mut c_void, *mut c_void) -> Status =
             unsafe { function(self.api, ALLOCATOR_FREE) };
         let mut raw = ptr::null_mut();
-        unsafe { check(end(session.ptr, self.allocator, &mut raw), self.api) }
+        unsafe { check(end(session.inner.ptr, self.allocator, &mut raw), self.api) }
             .context("ending ONNX Runtime profiling")?;
         if raw.is_null() {
             return Ok(None);
@@ -877,7 +1297,28 @@ impl Runtime {
         Ok(Some(PathBuf::from(path)))
     }
 
-    pub(crate) fn run(&self, session: &Session, input: &mut [f32], shape: &[i64]) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn run(
+        &self,
+        session: &Session,
+        input: &mut [f32],
+        shape: &[i64],
+    ) -> Result<Vec<Vec<f32>>> {
+        Ok(self
+            .run_typed(session, input, shape)?
+            .into_iter()
+            .map(|plane| plane.values)
+            .collect())
+    }
+
+    /// Runs the model. `input` is always f32 on the host; a float16 model input
+    /// is converted here, so callers do not need a second tensor type. Outputs
+    /// are converted back to f32 but keep their dtype for the caller's checks.
+    pub(crate) fn run_typed(
+        &self,
+        session: &Session,
+        input: &mut [f32],
+        shape: &[i64],
+    ) -> Result<Vec<OutputPlane>> {
         let api = self.api;
         let create_tensor: unsafe extern "C" fn(
             *const c_void,
@@ -900,16 +1341,38 @@ impl Runtime {
         ) -> Status = unsafe { function(api, RUN) };
         let release_value: unsafe extern "C" fn(*mut c_void) = unsafe { function(api, RELEASE_VALUE) };
 
+        let prepared = std::time::Instant::now();
+        let mut half_input: Vec<u16> = Vec::new();
+        let (data, byte_len, input_dtype) = match session.input.element_type {
+            FLOAT => (
+                input.as_mut_ptr().cast::<c_void>(),
+                std::mem::size_of_val(input),
+                FLOAT,
+            ),
+            FLOAT16 => {
+                half_input.extend(input.iter().map(|value| float_to_half(*value)));
+                (
+                    half_input.as_mut_ptr().cast::<c_void>(),
+                    half_input.len() * std::mem::size_of::<u16>(),
+                    FLOAT16,
+                )
+            }
+            other => bail!(
+                "model input dtype {} is neither float32 nor float16 (shape {:?})",
+                dtype_name(other),
+                shape
+            ),
+        };
         let mut value = ptr::null_mut();
         unsafe {
             check(
                 create_tensor(
                     self.memory_info,
-                    input.as_mut_ptr() as *mut c_void,
-                    std::mem::size_of_val(input),
+                    data,
+                    byte_len,
                     shape.as_ptr(),
                     shape.len(),
-                    FLOAT,
+                    input_dtype,
                     &mut value,
                 ),
                 api,
@@ -925,9 +1388,11 @@ impl Runtime {
         let input_values = [value as *const c_void];
         let output_ptrs: Vec<*const c_char> = output_names.iter().map(|n| n.as_ptr()).collect();
         let mut outputs: Vec<*mut c_void> = vec![ptr::null_mut(); output_names.len()];
+        let infer_started = std::time::Instant::now();
+        let prepared_us = infer_started.saturating_duration_since(prepared).as_micros() as u64;
         let status = unsafe {
             run(
-                session.ptr,
+                session.inner.ptr,
                 ptr::null(),
                 input_names.as_ptr(),
                 input_values.as_ptr(),
@@ -937,16 +1402,20 @@ impl Runtime {
                 outputs.as_mut_ptr(),
             )
         };
+        let infer_us = infer_started.elapsed().as_micros() as u64;
         let result = unsafe { check(status, api) };
         unsafe { release_value(value) };
         result.context("running the model")?;
 
+        let post_started = std::time::Instant::now();
         let mut planes = Vec::with_capacity(outputs.len());
         for output in outputs {
             let plane = unsafe { read_tensor(api, output) };
             unsafe { release_value(output) };
             planes.push(plane?);
         }
+        let post_us = post_started.elapsed().as_micros() as u64;
+        session.record_run(prepared_us, infer_us, post_us);
         Ok(planes)
     }
 }
@@ -1246,27 +1715,154 @@ unsafe fn check(status: Status, api: ApiPtr) -> Result<()> {
     Err(anyhow!("{text}"))
 }
 
-unsafe fn read_tensor(api: ApiPtr, value: *const c_void) -> Result<Vec<f32>> {
+/// One model output: f32 values plus the dtype and shape they came from.
+pub(crate) struct OutputPlane {
+    pub(crate) values: Vec<f32>,
+    pub(crate) dtype: c_int,
+    pub(crate) dims: Vec<i64>,
+}
+
+unsafe fn read_tensor(api: ApiPtr, value: *const c_void) -> Result<OutputPlane> {
     let type_and_shape: unsafe extern "C" fn(*const c_void, *mut *mut c_void) -> Status =
         unsafe { function(api, GET_TENSOR_TYPE_AND_SHAPE) };
     let element_count: unsafe extern "C" fn(*const c_void, *mut usize) -> Status =
         unsafe { function(api, GET_TENSOR_SHAPE_ELEMENT_COUNT) };
+    let element_type: unsafe extern "C" fn(*const c_void, *mut c_int) -> Status =
+        unsafe { function(api, GET_TENSOR_ELEMENT_TYPE) };
     let data: unsafe extern "C" fn(*const c_void, *mut *mut c_void) -> Status =
         unsafe { function(api, GET_TENSOR_MUTABLE_DATA) };
+    let dim_count: unsafe extern "C" fn(*const c_void, *mut usize) -> Status =
+        unsafe { function(api, GET_DIMENSIONS_COUNT) };
+    let dims_fn: unsafe extern "C" fn(*const c_void, *mut i64, usize) -> Status =
+        unsafe { function(api, GET_DIMENSIONS) };
     let release_info: unsafe extern "C" fn(*mut c_void) =
         unsafe { function(api, RELEASE_TENSOR_TYPE_AND_SHAPE) };
     let mut info = ptr::null_mut();
     unsafe { check(type_and_shape(value, &mut info), api)? };
     let mut count = 0usize;
-    let status = unsafe { element_count(info, &mut count) };
+    let mut dtype = -1;
+    let mut dim_count_value = 0usize;
+    let count_status = unsafe { element_count(info, &mut count) };
+    let dtype_status = unsafe { element_type(info, &mut dtype) };
+    let dims_status = unsafe { dim_count(info, &mut dim_count_value) };
+    let mut dims = vec![0i64; dim_count_value];
+    let read_status = unsafe { dims_fn(info, dims.as_mut_ptr(), dims.len()) };
     unsafe { release_info(info) };
-    unsafe { check(status, api)? };
+    unsafe { check(dtype_status, api)? };
+    unsafe { check(count_status, api)? };
+    unsafe { check(dims_status, api)? };
+    unsafe { check(read_status, api)? };
+    if dtype != FLOAT && dtype != FLOAT16 {
+        bail!(
+            "model output dtype {} is neither float32 nor float16",
+            dtype_name(dtype)
+        );
+    }
     let mut pointer = ptr::null_mut();
     unsafe { check(data(value, &mut pointer), api)? };
     if pointer.is_null() {
         bail!("model output has no data");
     }
-    Ok(unsafe { std::slice::from_raw_parts(pointer as *const f32, count) }.to_vec())
+    let values = if dtype == FLOAT16 {
+        // FP16 logits must never reach feathering/alpha unvalidated: ORT's
+        // half-float has the same alignment as u16, and converting it as f32
+        // would read past the buffer on odd element counts and produce garbage
+        // probabilities. Convert with finite checks right here.
+        let raw = unsafe { std::slice::from_raw_parts(pointer as *const u16, count) };
+        raw.iter()
+            .map(|&bits| {
+                let value = half_to_f32(bits);
+                if !value.is_finite() {
+                    bail!("model FP16 output is not finite");
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<f32>>>()?
+    } else {
+        let floats = unsafe { std::slice::from_raw_parts(pointer as *const f32, count) };
+        if floats.iter().any(|value| !value.is_finite()) {
+            bail!("model float32 output is not finite");
+        }
+        floats.to_vec()
+    };
+    Ok(OutputPlane { values, dtype, dims })
+}
+
+/// Exact IEEE-754 binary16 → binary32 conversion, without depending on a
+/// half-float crate. Subnormals, infinities and NaNs are handled by the bit
+/// layout; [`read_tensor`] rejects the last two before any consumer sees them.
+/// Element types this module can feed and read. Mirrors the ONNX Runtime enum.
+pub(crate) const DT_FLOAT: c_int = FLOAT;
+pub(crate) const DT_FLOAT16: c_int = FLOAT16;
+
+pub(crate) fn dtype_name(dtype: c_int) -> String {
+    match dtype {
+        FLOAT => "float32".to_string(),
+        FLOAT16 => "float16".to_string(),
+        other => format!("dtype({other})"),
+    }
+}
+
+fn dtype_label(dtype: c_int) -> String {
+    dtype_name(dtype)
+}
+
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = (bits >> 10) & 0x1F;
+    let mantissa = u32::from(bits & 0x03FF) << 13;
+    match exponent {
+        0 => {
+            // Subnormal: (mant/1024) * 2^-14, computed by subtracting 2^-14
+            // from the same bit pattern read as a normal f32 with exponent 113.
+            let base = f32::from_bits(sign | (113 << 23) | mantissa);
+            base - f32::from_bits(sign | (113 << 23))
+        }
+        31 => f32::from_bits(sign | (255 << 23) | mantissa),
+        _ => f32::from_bits(sign | ((u32::from(exponent) + 127 - 15) << 23) | mantissa),
+    }
+}
+
+/// f32 → IEEE-754 binary16 with round-to-nearest-even. Values beyond half's
+/// range become infinities and NaN payloads are kept as quiet NaN.
+pub(crate) fn float_to_half(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+    if exponent == 0xFF {
+        let payload = if mantissa != 0 {
+            0x200 | ((mantissa >> 13) as u16 & 0x3FF)
+        } else {
+            0
+        };
+        return sign | 0x7C00 | payload;
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        let mantissa = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut half = (mantissa >> shift) as u16;
+        let round_bit = 1u32 << (shift - 1);
+        if mantissa & round_bit != 0
+            && ((mantissa & (round_bit - 1)) != 0 || half & 1 != 0)
+        {
+            half += 1;
+        }
+        return sign | half;
+    }
+    let mut half = (((half_exponent as u32) << 10) as u16) | ((mantissa >> 13) as u16);
+    let round = mantissa & 0x1FFF;
+    if round > 0x1000 || (round == 0x1000 && half & 1 != 0) {
+        half += 1;
+    }
+    sign | half
 }
 
 #[derive(Clone, Debug)]
@@ -1276,23 +1872,167 @@ pub(crate) struct TensorMeta {
     pub(crate) element_type: c_int,
 }
 
-pub(crate) struct Session {
+/// Cumulative timings (microseconds) for one session. `cold_us` is the whole
+/// `OrtCreateSession` + metadata read; `warmup_us` is the first `Run`, and the
+/// inference/post counters include it. `runs` excludes the warmup.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SessionTiming {
+    cold_us: u64,
+    warmup_us: u64,
+    prepared_us: u64,
+    infer_us: u64,
+    post_us: u64,
+    runs: u64,
+}
+
+impl SessionTiming {
+    /// Per-inference stage timings, excluding the warmup run.
+    pub(crate) fn stages(&self) -> (u64, u64, u64) {
+        let runs = self.measured_runs().max(1);
+        (
+            self.prepared_us / runs,
+            self.infer_us / runs,
+            self.post_us / runs,
+        )
+    }
+
+    pub(crate) fn cold_us(&self) -> u64 {
+        self.cold_us
+    }
+
+    pub(crate) fn warmup_us(&self) -> u64 {
+        self.warmup_us
+    }
+
+    /// `Run` calls after the first one; the first is the warmup.
+    pub(crate) fn measured_runs(&self) -> u64 {
+        self.runs.saturating_sub(1)
+    }
+}
+
+struct SessionInner {
     api: ApiPtr,
     ptr: *mut c_void,
     provider: Provider,
+    key: SessionKey,
+    /// Human-readable reasons earlier provider choices failed, if any.
+    fallback: Mutex<Option<String>>,
     profile_active: AtomicBool,
+    timing: Mutex<SessionTiming>,
+}
+
+unsafe impl Send for SessionInner {}
+unsafe impl Sync for SessionInner {}
+
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        let release: unsafe extern "C" fn(*mut c_void) = unsafe { function(self.api, RELEASE_SESSION) };
+        unsafe { release(self.ptr) };
+    }
+}
+
+/// A reference to one ORT session. Cloning is cheap and results in the same
+/// underlying session: session creation is single-flight per [`SessionKey`], so
+/// concurrent callers share one open (and its GPU memory) instead of racing.
+#[derive(Clone)]
+pub(crate) struct Session {
+    inner: Arc<SessionInner>,
     pub(crate) input: TensorMeta,
     pub(crate) outputs: Vec<TensorMeta>,
 }
 
-unsafe impl Send for Session {}
-unsafe impl Sync for Session {}
-
 impl Session {
-    /// The provider the session was opened on. Nodes the provider does not
-    /// support can still run on CPU inside the same session.
+    /// The provider the session was opened on. This is the *effective* EP in
+    /// the sense that it was actually appended and accepted by ORT; nodes the
+    /// provider does not support can still run on CPU inside the same session.
     pub(crate) fn provider(&self) -> Provider {
-        self.provider
+        self.inner.provider
+    }
+
+    /// Provider selection order actually attempted and the reason for a
+    /// fallback, if the first choice was skipped or failed.
+    pub(crate) fn provider_trace(&self) -> (String, Option<String>) {
+        (
+            self.inner.key.providers.clone(),
+            self.inner
+                .fallback
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        )
+    }
+
+    fn set_fallback(&self, reason: Option<String>) {
+        *self
+            .inner
+            .fallback
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = reason;
+    }
+
+    pub(crate) fn session_key(&self) -> &SessionKey {
+        &self.inner.key
+    }
+
+    /// Shape/dtype/layout of the single input, as reported by ORT. The layout
+    /// is inferred from the NCHW/NHWC position of the 3-channel dimension.
+    pub(crate) fn input_layout(&self) -> (String, &[i64], &'static str) {
+        let dims = &self.input.dims;
+        let layout = if dims.len() == 4 && dims.get(1) == Some(&3) {
+            "NCHW"
+        } else if dims.len() == 4 && dims.get(3) == Some(&3) {
+            "NHWC"
+        } else {
+            "unknown"
+        };
+        (dtype_label(self.input.element_type), dims, layout)
+    }
+
+    pub(crate) fn output_layouts(&self) -> Vec<(String, Vec<i64>, String, String)> {
+        self.outputs
+            .iter()
+            .map(|output| {
+                let dims = &output.dims;
+                let layout = if dims.len() == 4 && dims.get(1).is_some_and(|d| *d > 1 && *d < 64) {
+                    "NCHW"
+                } else if dims.len() == 4 && dims.get(3).is_some_and(|d| *d > 1 && *d < 64) {
+                    "NHWC"
+                } else {
+                    "unknown"
+                };
+                (
+                    output.name.clone(),
+                    dims.clone(),
+                    dtype_label(output.element_type),
+                    layout.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn timing(&self) -> SessionTiming {
+        *self
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn record_run(&self, prepared_us: u64, infer_us: u64, post_us: u64) {
+        let mut timing = self
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if timing.runs == 0 {
+            timing.warmup_us = infer_us + prepared_us + post_us;
+            timing.runs = 1;
+            return;
+        }
+        timing.prepared_us += prepared_us;
+        timing.infer_us += infer_us;
+        timing.post_us += post_us;
+        timing.runs += 1;
     }
 
     pub(crate) fn input_contract(&self) -> (&str, &[i64], c_int) {
@@ -1317,8 +2057,13 @@ impl Session {
         runtime.end_profiling(self)
     }
 
-    unsafe fn with_metadata(self) -> Result<Self> {
-        let api = self.api;
+    /// Reads the single input and every output tensor's shape and dtype. Kept
+    /// separate from construction so a failed metadata read releases the ORT
+    /// session exactly once.
+    unsafe fn read_metadata(
+        api: ApiPtr,
+        session: *mut c_void,
+    ) -> Result<(TensorMeta, Vec<TensorMeta>)> {
         let input_count: unsafe extern "C" fn(*mut c_void, *mut usize) -> Status =
             unsafe { function(api, SESSION_GET_INPUT_COUNT) };
         let output_count: unsafe extern "C" fn(*mut c_void, *mut usize) -> Status =
@@ -1349,13 +2094,12 @@ impl Session {
 
         let mut inputs = 0usize;
         let mut outputs = 0usize;
-        unsafe { check(input_count(self.ptr, &mut inputs), api)? };
-        unsafe { check(output_count(self.ptr, &mut outputs), api)? };
+        unsafe { check(input_count(session, &mut inputs), api)? };
+        unsafe { check(output_count(session, &mut outputs), api)? };
         if inputs != 1 || outputs == 0 {
             bail!("expected one input and at least one output, got {inputs}/{outputs}");
         }
 
-        let session = self.ptr;
         let read = |index: usize, is_input: bool| -> Result<TensorMeta> {
             let mut raw_name: *mut c_char = ptr::null_mut();
             let name_status = unsafe {
@@ -1401,17 +2145,7 @@ impl Session {
 
         let input_meta = read(0, true)?;
         let output_meta = (0..outputs).map(|i| read(i, false)).collect::<Result<Vec<_>>>()?;
-        let mut session = self;
-        session.input = input_meta;
-        session.outputs = output_meta;
-        Ok(session)
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let release: unsafe extern "C" fn(*mut c_void) = unsafe { function(self.api, RELEASE_SESSION) };
-        unsafe { release(self.ptr) };
+        Ok((input_meta, output_meta))
     }
 }
 
@@ -1510,6 +2244,173 @@ mod tests {
             api
         );
         assert_eq!(providers.last(), Some(&Provider::Cpu), "CPU is the mandatory fallback");
+    }
+
+    fn key_for(model_hash: u64, providers: &str, options: &str) -> SessionKey {
+        SessionKey {
+            model_hash,
+            model_len: 1024,
+            ort_version: "1.31.1".to_string(),
+            ort_api: 23,
+            providers: providers.to_string(),
+            options: options.to_string(),
+        }
+    }
+
+    #[test]
+    fn session_key_changes_with_every_component() {
+        let base = key_for(7, "CUDA,CPU", "opt=99;threads=8");
+        assert_eq!(base.digest(), base.clone().digest(), "digest must be stable");
+        assert_ne!(base.digest(), key_for(8, "CUDA,CPU", "opt=99;threads=8").digest());
+        assert_ne!(base.digest(), key_for(7, "DirectML,CPU", "opt=99;threads=8").digest());
+        assert_ne!(base.digest(), key_for(7, "CUDA,CPU", "opt=0;threads=8").digest());
+        let mut other_runtime = base.clone();
+        other_runtime.ort_version = "1.30.0".to_string();
+        assert_ne!(base.digest(), other_runtime.digest());
+        let mut other_api = base.clone();
+        other_api.ort_api = 22;
+        assert_ne!(base.digest(), other_api.digest());
+        let mut other_len = base.clone();
+        other_len.model_len = 2048;
+        assert_ne!(base.digest(), other_len.digest());
+
+        let cpu = base.for_provider(Provider::Cpu);
+        assert_eq!(cpu.providers, "CPU");
+        assert_ne!(cpu.digest(), base.digest(), "per-EP cache must not collide");
+    }
+
+    #[test]
+    fn optimized_cache_path_is_namespaced_by_the_session_key() {
+        let dir = Path::new("C:/cache");
+        let base = key_for(7, "CUDA", "opt=99");
+        let path = optimized_model_cache_path_in(dir, Path::new("subjectMasking.onnx"), &base);
+        let other = optimized_model_cache_path_in(
+            dir,
+            Path::new("subjectMasking.onnx"),
+            &key_for(8, "CUDA", "opt=99"),
+        );
+        assert_eq!(path.parent(), Some(dir));
+        assert_ne!(path, other);
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("subjectMasking-"), "{name}");
+        assert!(name.ends_with(".onnx"), "{name}");
+    }
+
+    #[test]
+    fn model_fingerprint_tracks_content_and_length() {
+        let dir = std::env::temp_dir().join(format!("bo8-fingerprint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.onnx");
+        std::fs::write(&path, b"first model body").unwrap();
+        let (first, first_len) = model_fingerprint(&path).unwrap();
+        let (again, again_len) = model_fingerprint(&path).unwrap();
+        assert_eq!((first, first_len), (again, again_len), "fingerprint is cached and stable");
+        std::fs::write(&path, b"second model body with a different length").unwrap();
+        let (second, second_len) = model_fingerprint(&path).unwrap();
+        assert_ne!(first_len, second_len);
+        assert_ne!(first, second, "content change must change the fingerprint");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn half_precision_conversion_matches_the_ieee_patterns() {
+        assert_eq!(float_to_half(1.0), 0x3C00);
+        assert_eq!(float_to_half(-2.0), 0xC000);
+        assert_eq!(float_to_half(0.5), 0x3800);
+        assert_eq!(float_to_half(0.0), 0x0000);
+        assert_eq!(float_to_half(-0.0), 0x8000);
+        assert_eq!(float_to_half(65504.0), 0x7BFF, "largest finite half");
+        assert_eq!(float_to_half(65_520.0), 0x7C00, "rounds to infinity");
+        assert_eq!(float_to_half(f32::INFINITY), 0x7C00);
+        assert_eq!(float_to_half(f32::NEG_INFINITY), 0xFC00);
+        assert_eq!(float_to_half(2.0f32.powi(-24)), 0x0001, "smallest subnormal");
+        assert_eq!(float_to_half(2.0f32.powi(-26)), 0x0000, "underflow to zero");
+        assert!(half_to_f32(float_to_half(f32::NAN)).is_nan());
+
+        assert_eq!(half_to_f32(0x3C00), 1.0);
+        assert_eq!(half_to_f32(0xC000), -2.0);
+        assert_eq!(half_to_f32(0x0001), 2.0f32.powi(-24));
+        assert_eq!(half_to_f32(0x7BFF), 65504.0);
+        assert_eq!(half_to_f32(0xFC00), f32::NEG_INFINITY);
+
+        // A probability roundtrip through FP16 stays finite and in range.
+        for value in [0.0f32, 0.001, 0.25, 0.5, 0.75, 0.999] {
+            let roundtrip = half_to_f32(float_to_half(value));
+            assert!((roundtrip - value).abs() < 0.001, "{value} -> {roundtrip}");
+            assert!((0.0..=1.0).contains(&roundtrip));
+        }
+    }
+
+    #[test]
+    fn dtype_names_use_the_onnx_wire_values() {
+        assert_eq!(dtype_name(1), "float32");
+        assert_eq!(dtype_name(10), "float16");
+        assert_eq!(dtype_name(7), "dtype(7)");
+        assert_eq!(DT_FLOAT, 1);
+        assert_eq!(DT_FLOAT16, 10);
+    }
+
+    #[test]
+    fn single_flight_runs_one_leader_and_shares_the_result() {
+        static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    single_flight(&FLIGHTS, "same-key".to_string(), || {
+                        CALLS.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok(42u32)
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), 42);
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "waiters must share the leader's work");
+    }
+
+    #[test]
+    fn single_flight_shares_errors_but_retries_the_next_call() {
+        static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    single_flight(&FLIGHTS, "error-key".to_string(), || {
+                        CALLS.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        Err(anyhow!("open failed"))
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_err());
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        // A new generation (new key) starts a fresh attempt.
+        let retry = single_flight(&FLIGHTS, "error-key-retry".to_string(), || {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(7u32)
+        });
+        assert_eq!(retry.unwrap(), 7);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    #[test]
+    fn single_flight_turns_a_panicking_leader_into_an_error() {
+        static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();
+        let result = single_flight(&FLIGHTS, "panic-key".to_string(), || panic!("boom"));
+        // `single_flight` catches the panic itself, so no unwind escapes.
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("session creation panicked"), "{error}");
+        let next = single_flight(&FLIGHTS, "panic-key-2".to_string(), || Ok(3u32));
+        assert_eq!(next.unwrap(), 3, "a panic must not poison later keys");
     }
 
     #[test]
