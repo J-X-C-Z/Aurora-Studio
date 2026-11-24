@@ -1,9 +1,11 @@
 //! Sequential batch export on top of [`ImageEngine`].
 //!
 //! One worker thread runs one image at a time and reports through an atomic
-//! progress snapshot. The engine keeps its existing per-image contract: it
-//! writes `<output>.tmp` and renames it, so a failed image leaves no partial
-//! file behind except that temp, which this module deletes.
+//! progress snapshot. The engine writes each image into a staging folder on the
+//! destination's volume and renames the finished file; a failed or cancelled
+//! image therefore leaves the existing output untouched. Cancelling a batch
+//! also cancels the in-flight job, and the final progress says which image was
+//! interrupted and how many were never started.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,6 +42,11 @@ pub struct BatchProgress {
     pub cancelled: bool,
     pub finished: bool,
     pub failures: Vec<(ImageId, String)>,
+    /// The image whose export was running when the batch was cancelled; it is
+    /// neither `done` nor `failed`.
+    pub interrupted: Option<ImageId>,
+    /// Images the batch never started because it was cancelled before them.
+    pub not_started: usize,
 }
 
 struct BatchState {
@@ -102,6 +109,8 @@ enum Outcome {
 
 fn run(engine: Arc<dyn ImageEngine>, job: BatchJob, state: &BatchState) {
     let infos = engine.images();
+    let total = job.images.len();
+    let mut interrupted = None;
     for image in job.images.iter().copied() {
         if state.cancel.load(Ordering::SeqCst) {
             break;
@@ -126,13 +135,21 @@ fn run(engine: Arc<dyn ImageEngine>, job: BatchJob, state: &BatchState) {
                     p.failures.push((image, message));
                 });
             }
-            Outcome::Cancelled => break,
+            Outcome::Cancelled => {
+                // The engine keeps rendering for a moment; `cancel_job` makes
+                // it discard the staged file instead of publishing it.
+                engine.cancel_job(job_id);
+                interrupted = Some(image);
+                break;
+            }
         }
     }
     let cancelled = state.cancel.load(Ordering::SeqCst);
     state.update(|p| {
         p.current = None;
         p.cancelled = cancelled;
+        p.interrupted = interrupted;
+        p.not_started = total.saturating_sub(p.done + p.failed + usize::from(interrupted.is_some()));
         p.finished = true;
     });
 }
@@ -144,6 +161,8 @@ fn wait(engine: &dyn ImageEngine, job_id: u64, state: &BatchState) -> Outcome {
             JobStatus::Failed { message } => return Outcome::Failed(message),
             JobStatus::Queued | JobStatus::Running { .. } => {
                 if state.cancel.load(Ordering::SeqCst) {
+                    // Ask the engine to drop the staged output as well.
+                    engine.cancel_job(job_id);
                     return Outcome::Cancelled;
                 }
                 std::thread::sleep(POLL);
@@ -152,7 +171,9 @@ fn wait(engine: &dyn ImageEngine, job_id: u64, state: &BatchState) -> Outcome {
     }
 }
 
-/// The engine writes through `<output>.tmp`; a failed image must not leave it.
+/// Engines that stage their output need no cleanup here; this removes the
+/// legacy `<name>.<ext>.tmp` a foreign [`ImageEngine`] implementation may
+/// leave after a failed image.
 fn remove_partial(recipe: &ProcessRecipe, info: Option<&ImageInfo>) {
     let Some(info) = info else { return };
     let dir = recipe
@@ -176,6 +197,7 @@ mod tests {
         fail: Vec<u64>,
         delay: Duration,
         started: Mutex<Vec<u64>>,
+        cancelled: Mutex<Vec<u64>>,
         jobs: Mutex<HashMap<u64, (u64, Instant)>>,
     }
 
@@ -206,12 +228,17 @@ mod tests {
                 fail: fail.to_vec(),
                 delay: Duration::from_millis(delay_ms),
                 started: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
                 jobs: Mutex::new(HashMap::new()),
             })
         }
 
         fn started(&self) -> Vec<u64> {
             self.started.lock().unwrap().clone()
+        }
+
+        fn cancelled(&self) -> Vec<u64> {
+            self.cancelled.lock().unwrap().clone()
         }
     }
 
@@ -288,6 +315,11 @@ mod tests {
             self.started.lock().unwrap().push(job.image.0);
             self.jobs.lock().unwrap().insert(job.job_id, (job.image.0, Instant::now()));
             Ok(())
+        }
+
+        fn cancel_job(&self, job_id: u64) -> bool {
+            self.cancelled.lock().unwrap().push(job_id);
+            true
         }
 
         fn job_status(&self, job_id: u64) -> JobStatus {
@@ -412,5 +444,55 @@ mod tests {
         assert_eq!(progress.failed, 1);
         assert!(!tmp.exists(), "the failed image's .tmp file must be deleted");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancel_reports_the_interrupted_image_and_the_never_started_ones() {
+        let engine = MockEngine::new(6, &[], 300);
+        let id = Batch::start(engine.clone(), job(&[1, 2, 3, 4, 5, 6]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.started().is_empty() {
+            assert!(Instant::now() < deadline, "the batch never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(Batch::cancel(id));
+
+        let progress = wait_done(id);
+        assert!(progress.cancelled);
+        assert_eq!(progress.total, 6);
+        assert_eq!(progress.current, None);
+        let interrupted = progress.interrupted.expect("the in-flight image is named");
+        assert_eq!(
+            progress.done + progress.failed + progress.not_started + 1,
+            6,
+            "done + failed + never started + the in-flight image must account for every image"
+        );
+        assert_eq!(
+            engine.started().last().copied(),
+            Some(interrupted.0),
+            "the interrupted image is the last one handed to the engine"
+        );
+
+        // No further image is started after the cancel settles.
+        let started_after_cancel = engine.started().len();
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(engine.started().len(), started_after_cancel);
+    }
+
+    #[test]
+    fn cancel_asks_the_engine_to_drop_the_in_flight_output() {
+        let engine = MockEngine::new(4, &[], 300);
+        let id = Batch::start(engine.clone(), job(&[1, 2, 3, 4]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.started().is_empty() {
+            assert!(Instant::now() < deadline, "the batch never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(Batch::cancel(id));
+        let _ = wait_done(id);
+        assert!(
+            !engine.cancelled().is_empty(),
+            "a cancelled batch cancels the running job so the engine discards its staged file"
+        );
     }
 }

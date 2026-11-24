@@ -3258,7 +3258,13 @@ impl ImageEngine for FileEngine {
             let exact = (entry.path.clone(), entry.adjustments.clone());
             (entry.info.clone(), #[cfg(all(windows, feature = "z6iii-raw-export"))] exact)
         };
-        let dir = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
+        let destination = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
+        // Canonicalize and prove the destination is a folder before a single
+        // pixel is rendered, so a bad recipe fails at `start_export` rather
+        // than after minutes of work.
+        let dir = crate::output::resolve_output_dir(&destination)?;
+        // A crashed export leaves a staging folder behind; reclaim it here.
+        crate::output::sweep_stale_staging(&dir);
         let info = render.0;
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
         let exact = match crate::z6iii::desktop::Export::prepare(&render.1.0, &render.1.1, &job.recipe) {
@@ -3302,65 +3308,89 @@ impl ImageEngine for FileEngine {
                 st.jobs.insert(job_id, JobStatus::Running { progress: 0.05 });
             }
             let result = (|| {
-                #[cfg(all(windows, feature = "z6iii-raw-export"))]
-                if let Some(exact) = exact {
-                    return exact.write(&dir, &info, &job.recipe, || cancelled(&state));
+                // Every format renders into a staging folder on the target's
+                // own volume. The finished file is synced and only then renamed
+                // to its final name, so cancel or failure never truncates (or
+                // touches) an existing output.
+                let staged = crate::output::StagedExport::new(&dir, job_id)?;
+                let written = (|| {
+                    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+                    if let Some(exact) = exact {
+                        return exact.write(staged.dir(), &info, &job.recipe, || cancelled(&state));
+                    }
+                    let (src, adjustments, max_size, recipe) = standard.expect("standard export source");
+                    if recipe.bit_depth == 16 {
+                        let out = process::render16(
+                            &src,
+                            &adjustments,
+                            NormRect::FULL,
+                            max_size,
+                            false,
+                        );
+                        crate::recipe::write_export16(
+                            staged.dir(),
+                            &info,
+                            &recipe,
+                            info.variant as usize,
+                            out.rgba,
+                            out.width,
+                            out.height,
+                            |p| {
+                                if !cancelled(&state) {
+                                    state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
+                                }
+                            },
+                        )
+                    } else {
+                        let out = process::render(
+                            &src,
+                            &adjustments,
+                            NormRect::FULL,
+                            max_size,
+                            false,
+                            None,
+                        );
+                        crate::recipe::write_export(
+                            staged.dir(),
+                            &info,
+                            &recipe,
+                            info.variant as usize,
+                            out.rgba,
+                            out.width,
+                            out.height,
+                            |p| {
+                                if !cancelled(&state) {
+                                    state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
+                                }
+                            },
+                        )
+                    }
+                })();
+                let written = written?;
+                if cancelled(&state) {
+                    anyhow::bail!("cancelled");
                 }
-                let (src, adjustments, max_size, recipe) = standard.expect("standard export source");
-                if recipe.bit_depth == 16 {
-                let out = process::render16(
-                    &src,
-                    &adjustments,
-                    NormRect::FULL,
-                    max_size,
-                    false,
-                );
-                crate::recipe::write_export16(
-                    &dir,
-                    &info,
-                    &recipe,
-                    info.variant as usize,
-                    out.rgba,
-                    out.width,
-                    out.height,
-                    |p| {
-                        if !cancelled(&state) {
-                            state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
-                        }
-                    },
-                )
-            } else {
-                let out = process::render(
-                    &src,
-                    &adjustments,
-                    NormRect::FULL,
-                    max_size,
-                    false,
-                    None,
-                );
-                crate::recipe::write_export(
-                    &dir,
-                    &info,
-                    &recipe,
-                    info.variant as usize,
-                    out.rgba,
-                    out.width,
-                    out.height,
-                    |p| {
-                        if !cancelled(&state) {
-                            state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
-                        }
-                    },
-                )
-                }
+                staged.publish(&written)
             })();
             let mut state = state.lock();
             if !state.cancelled.contains(&job_id) {
                 state.jobs.insert(
                     job_id,
                     match result {
-                        Ok(output) => JobStatus::Done { output },
-                        Err(err) => JobStatus::Failed { message: err.to_string() },
+                        Ok(output) => {
+                            // File name only: an export log must not reveal the
+                            // folder a photograph lives in.
+                            log::info!("export job {job_id} wrote {}", crate::output::log_name(&output));
+                            JobStatus::Done { output }
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "export job {job_id} for {} failed: {}",
+                                info.file_name,
+                                crate::output::sanitize_log_text(&err.to_string())
+                            );
+                            JobStatus::Failed { message: err.to_string() }
+                        }
                     },
                 );
             }
@@ -5005,5 +5035,159 @@ mod tests {
         assert_eq!(first.exposure.exposure, 1.25);
         assert!(matches!(first.layers[0].mask.shapes.as_slice(), [MaskShape::Linear(_)]));
         assert_eq!(capture.load_adjustments(packed[1].id).exposure.exposure, -2.0);
+    }
+
+    // ---- BO-4: export writes atomically through a staging folder ------------
+
+    struct ExportFixture {
+        dir: PathBuf,
+        engine: FileEngine,
+        image: ImageId,
+    }
+
+    impl Drop for ExportFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn export_fixture(tag: &str) -> ExportFixture {
+        let dir = std::env::temp_dir()
+            .join(format!("aurora-export-bo4-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbImage::from_pixel(8, 6, image::Rgb([30, 60, 90]))
+            .save(dir.join("shot.jpg"))
+            .unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let image = engine.images()[0].id;
+        ExportFixture { dir, engine, image }
+    }
+
+    fn wait_export(engine: &FileEngine, job_id: u64) -> JobStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match engine.job_status(job_id) {
+                JobStatus::Queued | JobStatus::Running { .. } => {
+                    assert!(std::time::Instant::now() < deadline, "export job timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                status => return status,
+            }
+        }
+    }
+
+    fn jpeg_recipe(destination: PathBuf) -> crate::ProcessRecipe {
+        crate::ProcessRecipe {
+            destination: Some(destination),
+            include_metadata: crate::MetadataPolicy::StripAll,
+            ..crate::ProcessRecipe::default()
+        }
+    }
+
+    fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| crate::output::is_staging_path(path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn export_publishes_through_a_staging_folder_and_leaves_no_temp() {
+        let fixture = export_fixture("publish");
+        let out = fixture.dir.join("Output");
+        let recipe = jpeg_recipe(out.clone());
+        fixture.engine.start_export(ExportJob { job_id: 41, image: fixture.image, recipe }).unwrap();
+        let JobStatus::Done { output } = wait_export(&fixture.engine, 41) else {
+            panic!("export did not finish: {:?}", fixture.engine.job_status(41));
+        };
+        assert!(output.is_file());
+        assert_eq!(output.file_name().and_then(|n| n.to_str()), Some("shot.jpg"));
+        assert!(staging_leftovers(&out).is_empty(), "the staging folder must be removed");
+        assert!(image::image_dimensions(&output).is_ok(), "a complete JPEG was published");
+    }
+
+    #[test]
+    fn export_never_overwrites_an_existing_output() {
+        let fixture = export_fixture("collision");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("shot.jpg"), b"previous output").unwrap();
+
+        let recipe = jpeg_recipe(out.clone());
+        fixture.engine.start_export(ExportJob { job_id: 42, image: fixture.image, recipe }).unwrap();
+        let JobStatus::Done { output } = wait_export(&fixture.engine, 42) else {
+            panic!("export did not finish: {:?}", fixture.engine.job_status(42));
+        };
+
+        assert_eq!(output.file_name().and_then(|n| n.to_str()), Some("shot-1.jpg"));
+        assert_eq!(std::fs::read(out.join("shot.jpg")).unwrap(), b"previous output");
+        assert!(output.is_file());
+    }
+
+    #[test]
+    fn cancelling_at_the_publish_point_keeps_the_existing_output_bytes() {
+        let fixture = export_fixture("cancel");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("shot.jpg"), b"keep these bytes").unwrap();
+
+        let recipe = jpeg_recipe(out.clone());
+        fixture.engine.start_export(ExportJob { job_id: 43, image: fixture.image, recipe }).unwrap();
+        let cancelled = fixture.engine.cancel_job(43);
+
+        // Whether the cancel won the race or the tiny render finished first,
+        // the pre-existing target keeps its bytes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !staging_leftovers(&out).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "cancelled export kept its staging folder");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(out.join("shot.jpg")).unwrap(), b"keep these bytes");
+        if cancelled {
+            assert!(matches!(fixture.engine.job_status(43), JobStatus::Failed { .. }));
+            assert!(
+                std::fs::read_dir(&out).unwrap().flatten().count() == 1,
+                "a cancelled export publishes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_destination_that_is_a_file_is_refused_before_rendering() {
+        let fixture = export_fixture("bad-destination");
+        let not_a_folder = fixture.dir.join("not-a-folder.jpg");
+        std::fs::write(&not_a_folder, b"x").unwrap();
+
+        let recipe = jpeg_recipe(not_a_folder.clone());
+        let error = fixture
+            .engine
+            .start_export(ExportJob { job_id: 44, image: fixture.image, recipe })
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::output::OutputPathRefusal>(),
+            Some(&crate::output::OutputPathRefusal::NotADirectory)
+        );
+        assert_eq!(std::fs::read(&not_a_folder).unwrap(), b"x");
+    }
+
+    #[test]
+    fn export_log_lines_do_not_carry_the_photo_folder() {
+        // The message the exporter logs goes through the sanitizer; the file
+        // name stays, the folder never does.
+        let message = format!(
+            "export job 9 for shot.jpg failed: {}",
+            crate::output::sanitize_log_text(
+                r"copying C:\Users\alice\Pictures\Shoot\shot.jpg to O:\out\shot.jpg"
+            )
+        );
+        assert_eq!(message, "export job 9 for shot.jpg failed: copying <path> to <path>");
+        assert!(!message.contains("alice"));
+        assert!(!message.contains(r"C:\"));
     }
 }

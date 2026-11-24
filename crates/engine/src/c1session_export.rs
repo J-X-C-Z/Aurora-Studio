@@ -135,9 +135,25 @@ pub fn export_session_with_edits_and_mapping(
             return Err(err);
         }
     };
+    // The database, copied media and the small Adjustments subtree are flushed
+    // to disk before the bundle becomes visible, so a crash after the rename
+    // cannot expose a truncated catalog.
+    let synced = crate::output::sync_file(&staging.join(&database))
+        .and_then(|()| {
+            for path in &media.copied_paths {
+                crate::output::sync_file(path)?;
+            }
+            Ok(())
+        })
+        .and_then(|()| crate::output::sync_tree(&staging.join("Adjustments")));
+    if let Err(err) = synced {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(err).with_context(|| "flushing the staged session");
+    }
     std::fs::rename(&staging, target).with_context(|| {
         format!("moving {} to {}", staging.display(), target.display())
     })?;
+    crate::output::sync_parent(target);
     Ok(SessionExport {
         session_dir: target.to_path_buf(),
         database: target.join(database),
@@ -173,6 +189,9 @@ struct Media {
     missing: usize,
     selected: usize,
     trashed: usize,
+    /// Copies that must be flushed before the bundle is renamed into place.
+    /// Hard links share the source's already-durable data and need no sync.
+    copied_paths: Vec<PathBuf>,
 }
 
 fn write_bundle(
@@ -673,11 +692,10 @@ fn media_plan(import: &C1Import, source: &SourceRows) -> MediaPlan {
     let mut plan = MediaPlan::new();
     let mut taken: HashMap<String, ()> = HashMap::new();
     for image in import.images() {
-        let mut name = if image.file_name.is_empty() {
-            format!("image_{}.bin", image.pk)
-        } else {
-            image.file_name.clone()
-        };
+        // `ZIMAGE.ZFILENAME` is untrusted text from the catalog: a name such as
+        // `..\..\evil.exe` must become one harmless component, not a path.
+        let mut name = crate::output::sanitize_file_name(&image.file_name)
+            .unwrap_or_else(|| format!("image_{}.bin", image.pk));
         if taken.contains_key(&name.to_lowercase()) {
             name = suffixed(&name, image.pk);
         }
@@ -743,6 +761,7 @@ fn place_one(source: &Path, dest: &Path, media: &mut Media) -> Result<()> {
     }
     std::fs::copy(source, dest)
         .with_context(|| format!("copying {} to {}", source.display(), dest.display()))?;
+    media.copied_paths.push(dest.to_path_buf());
     if dest.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(MEDIA_DIR)) {
         media.copied += 1;
     }
@@ -3274,6 +3293,7 @@ mod mask_copy_tests {
 #[cfg(test)]
 mod gradient_writeback_tests {
     use super::*;
+    use crate::engine::ImageEngine;
     use crate::layers::{LinearGradient, MaskOp, MaskShape, RadialGradient};
 
     #[test]
@@ -3465,5 +3485,114 @@ mod gradient_writeback_tests {
                 }
             }
         }
+    }
+
+    // ---- BO-4: Catalog/Session are read-only inputs -------------------------
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "portrait-bo4-session-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn staging_entries(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        crate::output::is_staging_path(path)
+                            || path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with('.') && name.contains(".partial-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn read_only_open_and_export_leave_the_catalog_database_byte_identical() {
+        let dir = scratch_dir("read-only-source");
+        let bundle = dir.join("Source.cocatalogdb");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let database = bundle.join("Source.cocatalogdb");
+        std::fs::write(&database, crate::c1catalog::test_support::synthetic_session()).unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let before_crc = crc32fast::hash(&before);
+
+        {
+            let engine = crate::FileEngine::open_c1_catalog(&database).unwrap();
+            assert!(!engine.images().is_empty(), "the synthetic catalog has images");
+            let _ = engine.load_adjustments(engine.images()[0].id);
+        }
+        let after_open = std::fs::read(&database).unwrap();
+        assert_eq!(crc32fast::hash(&after_open), before_crc);
+        assert_eq!(after_open, before, "opening a catalog read-only writes nothing to it");
+
+        let import = C1Import::open(&database).unwrap();
+        let target = dir.join("Bundle.cosessiondb");
+        export_session(&import, &target).unwrap();
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            before,
+            "exporting a session leaves the source catalog byte-identical"
+        );
+        assert!(staging_entries(&dir).is_empty(), "no staging folder survives a finished export");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_session_export_keeps_the_existing_folder_and_leaves_no_staging() {
+        let dir = scratch_dir("refuse-overwrite");
+        let database = dir.join("Source.cocatalogdb");
+        std::fs::write(&database, crate::c1catalog::test_support::synthetic_session()).unwrap();
+        let import = C1Import::open(&database).unwrap();
+
+        let target = dir.join("Existing.cosessiondb");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep this folder").unwrap();
+
+        let error = export_session(&import, &target).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep this folder");
+        assert!(staging_entries(&dir).is_empty(), "a refused export creates no staging folder");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_catalog_file_name_cannot_leave_the_bundle() {
+        let dir = scratch_dir("traversal-name");
+        let database = dir.join("Source.cocatalogdb");
+        std::fs::write(&database, crate::c1catalog::test_support::synthetic_session()).unwrap();
+        let mut import = C1Import::open(&database).unwrap();
+
+        // A hostile catalog can name an image however it likes.
+        let media = dir.join("outside-media.bin");
+        std::fs::write(&media, b"media bytes").unwrap();
+        let image = import.catalog.images.first_mut().unwrap();
+        image.file_name = "..\\..\\escape.jpg".into();
+        image.abs_path = media.to_string_lossy().into_owned();
+
+        let target = dir.join("Bundle.cosessiondb");
+        let export = export_session(&import, &target).unwrap();
+        assert!(export.media_linked + export.media_copied >= 1);
+        assert!(
+            !dir.join("escape.jpg").exists(),
+            "nothing may be written outside the bundle"
+        );
+        assert!(
+            target.join("Capture/.._.._escape.jpg").is_file()
+                || target.join("Capture").join(".._.._escape.jpg").is_file(),
+            "the name becomes one harmless component inside Capture/"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
