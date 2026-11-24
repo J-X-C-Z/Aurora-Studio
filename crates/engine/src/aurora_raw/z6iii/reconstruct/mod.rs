@@ -357,10 +357,10 @@ fn reconstruct_planar_roi_with(
     };
     let stage2 = reconstruct_basic_roi(frame, support, params, rgb_black)?;
     if support.width.is_multiple_of(2) && !matches!(finish, Some(c1_stage3_planar::Finish::Diagnostic { .. })) {
-        let reconstructed = c1_adaptive_opencl::stage3(&stage2, support.width, support.height, scale, offset)?;
         if let Some(c1_stage3_planar::Finish::GgBlurComp { noise }) = finish {
-            return c1_adaptive_opencl::gg_compensate(&reconstructed, support.width, support.height, scale, offset, noise);
+            return c1_adaptive_opencl::stage3_gg(&stage2, support.width, support.height, scale, offset, noise);
         }
+        let reconstructed = c1_adaptive_opencl::stage3(&stage2, support.width, support.height, scale, offset)?;
         let planes = std::array::from_fn(|channel| reconstructed.iter().map(|pixel| pixel[channel]).collect());
         return Ok(c1_stage3_planar::finish_planar(planes, support.width, area.width, area.height, scale, offset, finish));
     }
