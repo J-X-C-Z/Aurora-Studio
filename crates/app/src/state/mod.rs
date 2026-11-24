@@ -339,6 +339,13 @@ pub struct Preview {
     pub scope: Option<std::sync::Arc<RenderImage>>,
     /// Why the latest render of an image failed; cleared by its next frame.
     pub error: Option<(ImageId, SharedString)>,
+    /// Inputs of the request that produced the shown after frame. Toggling
+    /// warning/focus reuses that frame instead of rendering it again.
+    pub(crate) last_request: Option<PreviewRequest>,
+    /// Overlay settings used for the shown frame's warning and focus layers.
+    pub(crate) last_overlay: (Option<(u8, u8, bool)>, Option<f32>),
+    /// Scope kind drawn for the shown frame.
+    pub(crate) last_scope: ScopeKind,
 }
 
 #[derive(Clone, Debug)]

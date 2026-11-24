@@ -212,6 +212,24 @@ fn needs_before(
             }))
 }
 
+/// Whether two requests would produce the same engine frame. The generation
+/// differs by definition and the quality does not change interactive pixels
+/// (both go through the exact `render_preview` path).
+fn same_render_inputs(a: &PreviewRequest, b: &PreviewRequest) -> bool {
+    a.image == b.image
+        && a.region == b.region
+        && a.max_size == b.max_size
+        && a.bypass == b.bypass
+        && a.mask_overlay == b.mask_overlay
+        && a.display_profile == b.display_profile
+        && a.proof_profile == b.proof_profile
+        && a.proof_paper_white == b.proof_paper_white
+        && a.proof_black_point == b.proof_black_point
+        && a.rendering_intent == b.rendering_intent
+        && a.black_point_compensation == b.black_point_compensation
+        && a.adjustments == b.adjustments
+}
+
 /// What the scheduler did with a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreviewRequested {
@@ -630,53 +648,110 @@ mod display_tests {
 /// This is display analysis of the pixels the engine returned, so it lives here.
 /// Exposure-warning and focus-mask overlays for a rendered frame. `warn` is
 /// (highlight level, shadow level, mark shadows); `focus` the edge threshold.
-pub(crate) fn analysis(img: &RgbaImage, warn: Option<(u8, u8, bool)>, focus: Option<f32>) -> (Option<Arc<RenderImage>>, Option<Arc<RenderImage>>) {
-    let (w, h) = (img.width as usize, img.height as usize);
-    let px = img.pixels.as_ref();
-    let make = |data: Vec<u8>| {
-        let buffer = image::RgbaImage::from_raw(w as u32, h as u32, data).expect("overlay buffer size");
+/// A single-channel overlay mask. One byte per pixel: warning stores 1 for a
+/// clipped highlight and 2 for a clipped shadow, focus stores its alpha.
+/// GPUI's `RenderImage` only takes BGRA and has no tint, so the mask is
+/// colorized once into the image the viewer draws.
+pub(crate) struct OverlayMask {
+    width: usize,
+    height: usize,
+    values: Vec<u8>,
+    kind: OverlayKind,
+}
+
+#[derive(Clone, Copy)]
+enum OverlayKind {
+    Warning,
+    Focus,
+}
+
+impl OverlayMask {
+    fn colorized(&self) -> Arc<RenderImage> {
+        let mut out = vec![0u8; self.width * self.height * 4];
+        out.par_chunks_mut(4)
+            .zip(self.values.par_iter())
+            .for_each(|(o, &value)| {
+                if value == 0 {
+                    return;
+                }
+                match self.kind {
+                    // BGRA, as GPUI draws it.
+                    OverlayKind::Warning if value == 1 => o.copy_from_slice(&[40, 40, 255, 200]),
+                    OverlayKind::Warning => o.copy_from_slice(&[255, 120, 40, 200]),
+                    OverlayKind::Focus => o.copy_from_slice(&[80, 255, 80, value]),
+                }
+            });
+        let buffer = image::RgbaImage::from_raw(self.width as u32, self.height as u32, out)
+            .expect("overlay buffer size");
         Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+    }
+}
+
+fn warning_mask(
+    px: &[u8],
+    w: usize,
+    h: usize,
+    (high, low, shadows): (u8, u8, bool),
+    (r, b): (usize, usize),
+) -> OverlayMask {
+    let mut values = vec![0u8; w * h];
+    values.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let i = y * w + x;
+            let p = &px[i * 4..i * 4 + 4];
+            if p[r] >= high || p[1] >= high || p[b] >= high {
+                row[x] = 1;
+            } else if shadows && p[r] <= low && p[1] <= low && p[b] <= low {
+                row[x] = 2;
+            }
+        }
+    });
+    OverlayMask { width: w, height: h, values, kind: OverlayKind::Warning }
+}
+
+fn focus_mask(px: &[u8], w: usize, h: usize, threshold: f32, (r, b): (usize, usize)) -> OverlayMask {
+    let luma = |x: usize, y: usize| {
+        let p = &px[(y * w + x) * 4..];
+        0.2126 * p[r] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[b] as f32
     };
-    let warning = || warn.map(|(high, low, shadows)| {
-        let mut out = vec![0u8; w * h * 4];
-        out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-            for x in 0..w {
-                let i = y * w + x;
-                let p = &px[i * 4..i * 4 + 4];
-                let o = &mut row[x * 4..x * 4 + 4];
-                // BGRA.
-                if p[0] >= high || p[1] >= high || p[2] >= high {
-                    o.copy_from_slice(&[40, 40, 255, 200]);
-                } else if shadows && p[0] <= low && p[1] <= low && p[2] <= low {
-                    o.copy_from_slice(&[255, 120, 40, 200]);
-                }
+    let mut values = vec![0u8; w * h];
+    values.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        if y == 0 || y + 1 >= h {
+            return;
+        }
+        for x in 1..w.saturating_sub(1) {
+            let gx = luma(x + 1, y) - luma(x - 1, y);
+            let gy = luma(x, y + 1) - luma(x, y - 1);
+            let g = (gx * gx + gy * gy).sqrt();
+            if g > threshold {
+                row[x] = ((g - threshold) * 5.0).min(230.0) as u8;
             }
-        });
-        make(out)
+        }
     });
-    let focus = || focus.map(|threshold| {
-        let luma = |x: usize, y: usize| {
-            let p = &px[(y * w + x) * 4..];
-            0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
-        };
-        let mut out = vec![0u8; w * h * 4];
-        out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-            if y == 0 || y + 1 >= h {
-                return;
-            }
-            for x in 1..w.saturating_sub(1) {
-                let gx = luma(x + 1, y) - luma(x - 1, y);
-                let gy = luma(x, y + 1) - luma(x, y - 1);
-                let g = (gx * gx + gy * gy).sqrt();
-                if g > threshold {
-                    let a = ((g - threshold) * 5.0).min(230.0) as u8;
-                    row[x * 4..x * 4 + 4].copy_from_slice(&[80, 255, 80, a]);
-                }
-            }
-        });
-        make(out)
-    });
-    rayon::join(warning, focus)
+    OverlayMask { width: w, height: h, values, kind: OverlayKind::Focus }
+}
+
+/// Builds both overlays from `px`, which is RGBA or BGRA (GPUI display image).
+fn analysis_pixels(
+    px: &[u8],
+    w: usize,
+    h: usize,
+    bgra: bool,
+    warn: Option<(u8, u8, bool)>,
+    focus: Option<f32>,
+) -> (Option<Arc<RenderImage>>, Option<Arc<RenderImage>>) {
+    if w == 0 || h == 0 || px.len() < w * h * 4 {
+        return (None, None);
+    }
+    let channels = if bgra { (2, 0) } else { (0, 2) };
+    rayon::join(
+        || warn.map(|settings| warning_mask(px, w, h, settings, channels).colorized()),
+        || focus.map(|threshold| focus_mask(px, w, h, threshold, channels).colorized()),
+    )
+}
+
+pub(crate) fn analysis(img: &RgbaImage, warn: Option<(u8, u8, bool)>, focus: Option<f32>) -> (Option<Arc<RenderImage>>, Option<Arc<RenderImage>>) {
+    analysis_pixels(img.pixels.as_ref(), img.width as usize, img.height as usize, false, warn, focus)
 }
 
 impl AppState {
@@ -734,13 +809,13 @@ impl AppState {
         self.zoom.center = (r.x + r.width / 2.0, r.y + r.height / 2.0);
     }
 
-    fn preview_request(&mut self, quality: RenderQuality, bypass: bool) -> Option<PreviewRequest> {
+    /// The request inputs without consuming a generation.
+    fn preview_inputs(&self, quality: RenderQuality, bypass: bool) -> Option<PreviewRequest> {
         let image = self.current?;
         let region = self.visible_region();
         let (fw, fh) = self.frame_size();
         let scale = self.effective_scale();
         let max_size = ((fw * region.width).max(fh * region.height) * scale).clamp(64.0, 8192.0) as u32;
-        self.preview.generation += 1;
         let mask_overlay = if self.panels.mask_overlay || self.cursor.is_mask_tool() { self.active_layer } else { None };
         Some(PreviewRequest {
             image,
@@ -760,6 +835,66 @@ impl AppState {
         })
     }
 
+    fn preview_request(&mut self, quality: RenderQuality, bypass: bool) -> Option<PreviewRequest> {
+        let request = self.preview_inputs(quality, bypass)?;
+        self.preview.generation += 1;
+        Some(PreviewRequest { generation: self.preview.generation, ..request })
+    }
+
+    fn warning_settings(&self) -> Option<(u8, u8, bool)> {
+        self.view
+            .exposure_warning
+            .then_some((self.settings.warn_high, self.settings.warn_low, self.settings.warn_shadows))
+    }
+
+    fn focus_threshold(&self) -> Option<f32> {
+        self.view.focus_mask.then_some(self.settings.focus_threshold)
+    }
+
+    /// Handles a request whose engine inputs match the shown frame: toggling
+    /// the exposure warning or focus mask, or changing their thresholds, only
+    /// rebuilds those overlays. Returns true when no render is needed.
+    fn refresh_overlays_if_unchanged(&mut self, request: &PreviewRequest, cx: &mut Context<Self>) -> bool {
+        if self.preview.error.is_some() || self.view.compare != super::CompareMode::Off {
+            return false;
+        }
+        // Scopes are drawn with the frame; a scope toggle needs a normal render.
+        if self.panels.scope_kind != super::ScopeKind::Off || self.preview.last_scope != super::ScopeKind::Off {
+            return false;
+        }
+        let Some(shown) = self.preview.last_request.as_ref() else { return false };
+        if !same_render_inputs(shown, request) {
+            return false;
+        }
+        let warning = self.warning_settings();
+        let focus = self.focus_threshold();
+        if (warning, focus) != self.preview.last_overlay {
+            self.rebuild_overlays(warning, focus, cx);
+        }
+        true
+    }
+
+    /// Rebuilds warning/focus from the frame already on screen, in display
+    /// (BGRA) order, without asking the engine for the same pixels again.
+    fn rebuild_overlays(&mut self, warning: Option<(u8, u8, bool)>, focus: Option<f32>, cx: &mut Context<Self>) {
+        let rebuilt = {
+            let Some(frame) = self.preview.frame.as_ref() else { return };
+            let size = frame.image.size(0);
+            let (w, h) = (size.width.0.max(0) as usize, size.height.0.max(0) as usize);
+            let Some(bytes) = frame.image.as_bytes(0) else { return };
+            analysis_pixels(bytes, w, h, true, warning, focus)
+        };
+        let Some(frame) = self.preview.frame.as_mut() else { return };
+        if let Some(old) = std::mem::replace(&mut frame.warning, rebuilt.0) {
+            cx.drop_image(old, None);
+        }
+        if let Some(old) = std::mem::replace(&mut frame.focus, rebuilt.1) {
+            cx.drop_image(old, None);
+        }
+        self.preview.last_overlay = (warning, focus);
+        cx.notify();
+    }
+
     pub fn request_render(&mut self, quality: RenderQuality, cx: &mut Context<Self>) {
         self.preview.draft = quality == RenderQuality::Draft;
         self.enqueue_render(quality, std::time::Instant::now(), cx);
@@ -770,7 +905,12 @@ impl AppState {
         if self.preview.accept_request(quality, requested_at) == PreviewRequested::Coalesced {
             return;
         }
-        let Some(request) = self.preview_request(quality, false) else { return };
+        let Some(mut request) = self.preview_inputs(quality, false) else { return };
+        if self.refresh_overlays_if_unchanged(&request, cx) {
+            return;
+        }
+        self.preview.generation += 1;
+        request.generation = self.preview.generation;
         let stamp = crate::perf::Stamp::new(request.generation, quality, requested_at);
         let requested_image = request.image;
         let before = needs_before(
@@ -793,6 +933,9 @@ impl AppState {
         let want_warning = self.view.exposure_warning.then_some((st.warn_high, st.warn_low, st.warn_shadows));
         let want_focus = self.view.focus_mask.then_some(st.focus_threshold);
         let want_scope = self.panels.scope_kind;
+        // Recorded with the installed frame so overlay toggles can reuse it.
+        let placed_overlay = (want_warning, want_focus);
+        let placed_scope = want_scope;
         let previous = self.preview.frame.as_ref().map(|frame| {
             (frame.source_pixels, Arc::clone(&frame.image), frame.image_id)
         });
@@ -807,7 +950,8 @@ impl AppState {
                     let ram_before = crate::perf::enabled()
                         .then(crate::perf::working_set_bytes)
                         .flatten();
-                    after_engine.render_preview(&request).map(|f| {
+                    let (region, image_id) = (request.region, request.image);
+                    after_engine.render_preview(&request).map(move |f| {
                         let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                         let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
                         let (width, height) = (image.width, image.height);
@@ -852,14 +996,17 @@ impl AppState {
                             });
                         }
                         let PreparedDisplay { image: img, source_pixels, reused, .. } = display;
-                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, request.region, request.image)
+                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, region, image_id, request)
                     })
                 })
                 .await;
             let Ok(render_before) = this.update(cx, |this, cx| {
                 match frame {
-                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id)) => {
+                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id, request)) => {
                         if this.preview.may_install(this.current, image_id, stamp.id) {
+                            this.preview.last_request = Some(request);
+                            this.preview.last_overlay = placed_overlay;
+                            this.preview.last_scope = placed_scope;
                             if let Some(old) = std::mem::replace(&mut this.preview.scope, scope) {
                                 cx.drop_image(old, None);
                             }
@@ -1514,6 +1661,59 @@ mod ordering_tests {
         assert!(!preview.thumbs_allowed(false, false));
         assert_eq!(preview.finish_request(), None);
         assert!(preview.thumbs_allowed(false, false), "resumed when idle");
+    }
+
+    /// Overlay-only handling needs identical engine inputs; generation and
+    /// quality differ per request but do not change interactive pixels.
+    #[test]
+    fn overlay_only_requests_share_render_inputs() {
+        let a = request(1, 5, FULL);
+        let mut newer = a.clone();
+        newer.generation = 99;
+        newer.quality = RenderQuality::Draft;
+        assert!(same_render_inputs(&a, &newer));
+
+        let mut region = a.clone();
+        region.region = TILE;
+        assert!(!same_render_inputs(&a, &region));
+
+        let mut edited = a.clone();
+        edited.adjustments.exposure.exposure = 0.5;
+        assert!(!same_render_inputs(&a, &edited));
+
+        let mut profile = a.clone();
+        profile.display_profile = Some(std::path::PathBuf::from("display.icc"));
+        assert!(!same_render_inputs(&a, &profile));
+    }
+
+    /// The overlay-only path reads GPUI's BGRA display frame; it must produce
+    /// the same layers as the RGBA engine path.
+    #[test]
+    fn bgra_analysis_matches_rgba_analysis() {
+        let (w, h) = (37u32, 23u32);
+        let rgba: Vec<u8> = (0..(w * h) as usize)
+            .flat_map(|i| {
+                [
+                    (i * 37 % 251) as u8,
+                    (i * 73 % 241) as u8,
+                    (i * 109 % 239) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let settings = (210, 30, true);
+        let expected = analysis(&RgbaImage::new(w, h, rgba.clone()), Some(settings), Some(7.5));
+
+        let (_, _, bgra, _, _) = into_bgra_pixels(RgbaImage::new(w, h, rgba));
+        let (warning, focus) = analysis_pixels(&bgra, w as usize, h as usize, true, Some(settings), Some(7.5));
+        assert_eq!(
+            expected.0.expect("rgba warning").as_bytes(0).unwrap(),
+            warning.expect("bgra warning").as_bytes(0).unwrap()
+        );
+        assert_eq!(
+            expected.1.expect("rgba focus").as_bytes(0).unwrap(),
+            focus.expect("bgra focus").as_bytes(0).unwrap()
+        );
     }
 
     /// Scenario I: a viewer destroyed while a render is running retains no
