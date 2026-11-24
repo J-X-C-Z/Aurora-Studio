@@ -131,36 +131,59 @@ pub(super) fn stage1(input: &[u16], width: usize, height: usize, params: Stage1P
 }
 
 pub(super) fn stage3(input: &[[f32; 3]], width: usize, height: usize, scale: [f32; 3], floor: f32) -> io::Result<Vec<[f32; 4]>> {
-    assert_eq!(input.len(), width * height);
-    assert!(width > 12 && height > 12 && width.is_multiple_of(2));
-    let input: Vec<_> = input.iter().map(|pixel| {
-        [pixel[0] * scale[0], pixel[1] * scale[1], pixel[2] * scale[2], 0.0]
-    }).collect();
+    let input = stage3_input(input, width, height, scale);
     let mut diagonal = vec![[0.0; 4]; input.len()];
     let mut output = vec![[0.0; 4]; input.len()];
     let text = program_source(2);
-    let setup = |kernel, _| {
-        argument(kernel, 2, &(width as i32))?;
-        argument(kernel, 3, &(height as i32))?;
-        argument(kernel, 4, &floor)
-    };
+    let setup = |kernel, _| stage3_args(kernel, width, height, floor);
     process(&input, &mut diagonal, text, c"reconstruct_diagonal", [(width - 4) / 2, height - 4], setup)?;
     process(&diagonal, &mut output, text, c"reconstruct_green", [(width - 8) / 2, height - 8], setup)?;
     Ok(output)
 }
 
-pub(super) fn gg_compensate(input: &[[f32; 4]], width: usize, height: usize,
-                            scale: [f32; 3], threshold: f32, noise: f32) -> io::Result<Vec<[f32; 3]>> {
+fn stage3_input(input: &[[f32; 3]], width: usize, height: usize, scale: [f32; 3]) -> Vec<[f32; 4]> {
+    assert_eq!(input.len(), width * height);
+    assert!(width > 12 && height > 12 && width.is_multiple_of(2));
+    input.iter().map(|pixel| [pixel[0] * scale[0], pixel[1] * scale[1], pixel[2] * scale[2], 0.0]).collect()
+}
+
+fn stage3_args(kernel: Handle, width: usize, height: usize, floor: f32) -> io::Result<()> {
+    argument(kernel, 2, &(width as i32))?;
+    argument(kernel, 3, &(height as i32))?;
+    argument(kernel, 4, &floor)
+}
+
+pub(super) fn stage3_gg(input: &[[f32; 3]], width: usize, height: usize,
+                        scale: [f32; 3], threshold: f32, noise: f32) -> io::Result<Vec<[f32; 3]>> {
+    let input = stage3_input(input, width, height, scale);
     let work = [width - 12, height - 12];
     let mut output = vec![[0.0; 4]; work[0] * work[1]];
     let [red, green, blue] = scale.map(f32::recip);
-    process(input, &mut output, program_source(3), c"gg_compensate", work, |kernel, _| {
-        argument(kernel, 2, &(width as i32))?;
-        argument(kernel, 3, &6_i32)?;
-        argument(kernel, 4, &(work[0] as i32))?;
-        argument(kernel, 5, &0_i32)?;
-        argument(kernel, 6, &[red, green, blue, 1.0])?;
-        argument(kernel, 7, &[noise, threshold])
+    with_runtime(|cl, runtime| {
+        let stage3 = runtime.program(cl, program_source(2))?;
+        let gg = runtime.program(cl, program_source(3))?;
+        let bytes = size_of_val(input.as_slice());
+        let source = buffer(cl, runtime, 36, bytes, input.as_ptr().cast_mut().cast())?;
+        let diagonal = buffer(cl, runtime, 1, bytes, null_mut())?;
+        let green_plane = buffer(cl, runtime, 1, bytes, null_mut())?;
+        let result = buffer(cl, runtime, 1, size_of_val(output.as_slice()), null_mut())?;
+        for (entry, from, to, work) in [
+            (c"reconstruct_diagonal", &source, &diagonal, [(width - 4) / 2, height - 4]),
+            (c"reconstruct_green", &diagonal, &green_plane, [(width - 8) / 2, height - 8]),
+        ] {
+            let kernel = kernel(cl, stage3, entry, from, to)?;
+            stage3_args(kernel.0, width, height, threshold)?;
+            enqueue(cl, runtime, &kernel, work)?;
+        }
+        let kernel = kernel(cl, gg, c"gg_compensate", &green_plane, &result)?;
+        argument(kernel.0, 2, &(width as i32))?;
+        argument(kernel.0, 3, &6_i32)?;
+        argument(kernel.0, 4, &(work[0] as i32))?;
+        argument(kernel.0, 5, &0_i32)?;
+        argument(kernel.0, 6, &[red, green, blue, 1.0])?;
+        argument(kernel.0, 7, &[noise, threshold])?;
+        enqueue(cl, runtime, &kernel, work)?;
+        readback(cl, runtime, &result, &mut output)
     })?;
     Ok(output.into_iter().map(|[red, green, blue, _]| [red, green, blue]).collect())
 }
@@ -222,6 +245,18 @@ fn process<S, T>(input: &[S], output: &mut [T], text: &'static str, entry: &std:
 
 fn process_with_resources<S, T, R>(input: &[S], output: &mut [T], text: &'static str, entry: &std::ffi::CStr,
               work: [usize; 2], setup: impl FnOnce(Handle, Handle, Handle) -> io::Result<R>) -> io::Result<()> {
+    with_runtime(|cl, runtime| {
+        let program = runtime.program(cl, text)?;
+        let source = buffer(cl, runtime, 36, size_of_val(input), input.as_ptr().cast_mut().cast())?;
+        let result = buffer(cl, runtime, 33, size_of_val(output), output.as_mut_ptr().cast())?;
+        let kernel = kernel(cl, program, entry, &source, &result)?;
+        let _resources = setup(kernel.0, source.0, runtime.context.0)?;
+        enqueue(cl, runtime, &kernel, work)?;
+        readback(cl, runtime, &result, output)
+    })
+}
+
+fn with_runtime<T>(run: impl FnOnce(&Api, &mut Runtime) -> io::Result<T>) -> io::Result<T> {
     let cl = bindings()?;
     RUNTIME.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -229,7 +264,7 @@ fn process_with_resources<S, T, R>(input: &[S], output: &mut [T], text: &'static
             *slot = Some(Runtime::new(cl)?);
         }
         let runtime = slot.as_mut().expect("OpenCL runtime initialized");
-        let result = dispatch(cl, runtime, text, input, output, entry, work, setup);
+        let result = run(cl, runtime);
         if result.is_err() {
             *slot = None;
         }
@@ -237,26 +272,31 @@ fn process_with_resources<S, T, R>(input: &[S], output: &mut [T], text: &'static
     })
 }
 
-fn dispatch<S, T, R>(cl: &Api, runtime: &mut Runtime, text: &'static str, input: &[S], output: &mut [T],
-              entry: &std::ffi::CStr, work: [usize; 2], setup: impl FnOnce(Handle, Handle, Handle) -> io::Result<R>) -> io::Result<()> {
-    let program = runtime.program(cl, text)?;
+fn buffer(cl: &Api, runtime: &Runtime, flags: u64, bytes: usize, host: Handle) -> io::Result<Resource> {
+    let mut error = 0;
+    let handle = unsafe { (cl.clCreateBuffer)(runtime.context.0, flags, bytes, host, &mut error) };
+    check("buffer", error)?;
+    Ok(Resource(handle, cl.clReleaseMemObject))
+}
+
+fn kernel(cl: &Api, program: Handle, entry: &std::ffi::CStr, source: &Resource, result: &Resource) -> io::Result<Resource> {
+    let mut error = 0;
+    let handle = unsafe { (cl.clCreateKernel)(program, entry.as_ptr(), &mut error) };
+    check("kernel", error)?;
+    let kernel = Resource(handle, cl.clReleaseKernel);
+    argument(kernel.0, 0, &source.0)?;
+    argument(kernel.0, 1, &result.0)?;
+    Ok(kernel)
+}
+
+fn enqueue(cl: &Api, runtime: &Runtime, kernel: &Resource, work: [usize; 2]) -> io::Result<()> {
     unsafe {
-        let mut error = 0;
-        let handle = (cl.clCreateKernel)(program, entry.as_ptr(), &mut error);
-        check("kernel", error)?;
-        let kernel = Resource(handle, cl.clReleaseKernel);
-        let pointer = output.as_mut_ptr().cast();
-        let handle = (cl.clCreateBuffer)(runtime.context.0, 36, size_of_val(input), input.as_ptr().cast_mut().cast(), &mut error);
-        check("source buffer", error)?;
-        let source = Resource(handle, cl.clReleaseMemObject);
-        let handle = (cl.clCreateBuffer)(runtime.context.0, 33, size_of_val(output), pointer, &mut error);
-        check("output buffer", error)?;
-        let result = Resource(handle, cl.clReleaseMemObject);
-        argument(kernel.0, 0, &source.0)?;
-        argument(kernel.0, 1, &result.0)?;
-        let _resources = setup(kernel.0, source.0, runtime.context.0)?;
-        check("enqueue", (cl.clEnqueueNDRangeKernel)(runtime.queue.0, kernel.0, 2, null(), work.as_ptr(), null(), 0, null(), null_mut()))?;
-        check("readback", (cl.clEnqueueReadBuffer)(runtime.queue.0, result.0, 1, 0, size_of_val(output), pointer, 0, null(), null_mut()))?;
+        check("enqueue", (cl.clEnqueueNDRangeKernel)(runtime.queue.0, kernel.0, 2, null(), work.as_ptr(), null(), 0, null(), null_mut()))
     }
-    Ok(())
+}
+
+fn readback<T>(cl: &Api, runtime: &Runtime, result: &Resource, output: &mut [T]) -> io::Result<()> {
+    unsafe {
+        check("readback", (cl.clEnqueueReadBuffer)(runtime.queue.0, result.0, 1, 0, size_of_val(output), output.as_mut_ptr().cast(), 0, null(), null_mut()))
+    }
 }
