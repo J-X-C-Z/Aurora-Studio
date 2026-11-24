@@ -134,6 +134,96 @@ impl TileStore {
     }
 }
 
+/// One cache entry per sampling configuration. Keeping several active keys
+/// avoids throwing away every tile when the user switches between photographs
+/// and then returns to a recently viewed image.
+const MAX_SAMPLE_CACHE_KEYS: usize = 8;
+
+#[derive(Default)]
+struct TileCache {
+    /// Most recently used sampling key is at the front.
+    stores: VecDeque<TileStore>,
+    total_bytes: usize,
+}
+
+impl TileCache {
+    fn lookup(&mut self, key: &SourceSampleKey, tx: u32, ty: u32) -> Option<Arc<Vec<SourceSample>>> {
+        let index = self.stores.iter().position(|store| &store.key == key)?;
+        let mut store = self.stores.remove(index)?;
+        let coord = (tx, ty);
+        let found = store.tiles.get(&coord).cloned();
+        if found.is_some() {
+            if let Some(at) = store.order.iter().position(|entry| *entry == coord) {
+                store.order.remove(at);
+                store.order.push_back(coord);
+            }
+        }
+        self.stores.push_front(store);
+        found
+    }
+
+    fn insert(
+        &mut self,
+        key: &SourceSampleKey,
+        tx: u32,
+        ty: u32,
+        tile: Arc<Vec<SourceSample>>,
+        budget: usize,
+    ) {
+        let coord = (tx, ty);
+        let bytes = tile.len().saturating_mul(std::mem::size_of::<SourceSample>());
+        if bytes == 0 || bytes > budget {
+            return;
+        }
+
+        let index = self.stores.iter().position(|store| &store.key == key);
+        let mut store = index
+            .and_then(|index| self.stores.remove(index))
+            .unwrap_or_else(|| TileStore::new(key.clone()));
+
+        if store.tiles.contains_key(&coord) {
+            self.stores.push_front(store);
+            return;
+        }
+
+        store.tiles.insert(coord, tile);
+        store.order.push_back(coord);
+        store.bytes = store.bytes.saturating_add(bytes);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.stores.push_front(store);
+
+        // Bound the number of independent image/geometry configurations even
+        // when their tiles are tiny. Removing a key releases all of its tiles.
+        while self.stores.len() > MAX_SAMPLE_CACHE_KEYS {
+            if let Some(evicted) = self.stores.pop_back() {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
+            }
+        }
+
+        // Global byte-budget eviction: remove the least-recently-used tile
+        // from the least-recently-used key, retaining the rest of that key.
+        while self.total_bytes > budget {
+            let Some(mut lru_store) = self.stores.pop_back() else { break };
+            let removed_bytes = lru_store
+                .order
+                .pop_front()
+                .and_then(|oldest| lru_store.tiles.remove(&oldest))
+                .map(|evicted| {
+                    evicted.len().saturating_mul(std::mem::size_of::<SourceSample>())
+                })
+                .unwrap_or(0);
+            lru_store.bytes = lru_store.bytes.saturating_sub(removed_bytes);
+            self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+            if !lru_store.tiles.is_empty() {
+                self.stores.push_back(lru_store);
+            }
+            if removed_bytes == 0 {
+                break;
+            }
+        }
+    }
+}
+
 /// The sampling dependencies of one render. Colour parameters are absent.
 fn sample_key(
     src: &Source,
@@ -167,44 +257,82 @@ fn tile_budget_bytes() -> usize {
     })
 }
 
-fn tile_store() -> &'static Mutex<Option<TileStore>> {
-    static STORE: OnceLock<Mutex<Option<TileStore>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(None))
+fn tile_store() -> &'static Mutex<TileCache> {
+    static STORE: OnceLock<Mutex<TileCache>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(TileCache::default()))
 }
 
 fn tile_lookup(key: &SourceSampleKey, tx: u32, ty: u32) -> Option<Arc<Vec<SourceSample>>> {
-    let mut slot = tile_store().lock().unwrap_or_else(|error| error.into_inner());
-    let store = slot.as_ref()?;
-    if &store.key != key {
-        return None;
-    }
-    store.tiles.get(&(tx, ty)).cloned()
+    tile_store()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .lookup(key, tx, ty)
 }
 
 fn tile_insert(key: &SourceSampleKey, tx: u32, ty: u32, tile: Arc<Vec<SourceSample>>) {
-    let bytes = tile.len().saturating_mul(std::mem::size_of::<SourceSample>());
-    let budget = tile_budget_bytes();
-    if bytes > budget {
-        return;
-    }
-    let mut slot = tile_store().lock().unwrap_or_else(|error| error.into_inner());
-    if slot.as_ref().is_none_or(|store| &store.key != key) {
-        *slot = Some(TileStore::new(key.clone()));
-    }
-    let store = slot.as_mut().expect("store was just created");
-    if store.tiles.contains_key(&(tx, ty)) {
-        return;
-    }
-    store.tiles.insert((tx, ty), tile);
-    store.order.push_back((tx, ty));
-    store.bytes = store.bytes.saturating_add(bytes);
-    while store.bytes > budget {
-        let Some(oldest) = store.order.pop_front() else { break };
-        if let Some(evicted) = store.tiles.remove(&oldest) {
-            store.bytes = store
-                .bytes
-                .saturating_sub(evicted.len().saturating_mul(std::mem::size_of::<SourceSample>()));
+    tile_store()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, tx, ty, tile, tile_budget_bytes());
+}
+
+#[cfg(test)]
+mod sample_tile_cache_tests {
+    use super::*;
+
+    fn key(source: u64) -> SourceSampleKey {
+        SourceSampleKey {
+            source,
+            geometry: Geometry::default(),
+            region: NormRect::FULL,
+            out_w: SAMPLE_TILE,
+            out_h: SAMPLE_TILE,
+            level: 0,
+            cubic: false,
         }
+    }
+
+    fn tile() -> Arc<Vec<SourceSample>> {
+        Arc::new(vec![EMPTY_SAMPLE; 16])
+    }
+
+    #[test]
+    fn retains_tiles_for_multiple_sampling_keys() {
+        let mut cache = TileCache::default();
+        let a = key(1);
+        let b = key(2);
+        cache.insert(&a, 0, 0, tile(), 1024);
+        cache.insert(&b, 0, 0, tile(), 1024);
+
+        assert!(cache.lookup(&a, 0, 0).is_some());
+        assert!(cache.lookup(&b, 0, 0).is_some());
+        assert_eq!(cache.stores.len(), 2);
+    }
+
+    #[test]
+    fn evicts_least_recent_key_when_key_limit_is_exceeded() {
+        let mut cache = TileCache::default();
+        for source in 0..=MAX_SAMPLE_CACHE_KEYS as u64 {
+            cache.insert(&key(source), 0, 0, tile(), 1024 * 1024);
+        }
+
+        assert!(cache.lookup(&key(0), 0, 0).is_none());
+        assert!(cache.lookup(&key(MAX_SAMPLE_CACHE_KEYS as u64), 0, 0).is_some());
+        assert_eq!(cache.stores.len(), MAX_SAMPLE_CACHE_KEYS);
+    }
+
+    #[test]
+    fn enforces_one_global_byte_budget_across_keys() {
+        let mut cache = TileCache::default();
+        let a = key(1);
+        let b = key(2);
+        let tile_bytes = tile().len() * std::mem::size_of::<SourceSample>();
+        cache.insert(&a, 0, 0, tile(), tile_bytes);
+        cache.insert(&b, 0, 0, tile(), tile_bytes);
+
+        assert!(cache.lookup(&a, 0, 0).is_none());
+        assert!(cache.lookup(&b, 0, 0).is_some());
+        assert!(cache.total_bytes <= tile_bytes);
     }
 }
 
