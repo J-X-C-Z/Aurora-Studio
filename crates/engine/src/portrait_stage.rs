@@ -1436,12 +1436,11 @@ impl PortraitFrameReceipt {
     }
 }
 
-/// Static PF90021 writer candidates. The recovered row is `LipMaskType=3`
-/// (mask index 0 -> `MASK_R`), so the producer contract names that layer even
-/// though this tree has no lip-layer producer yet.
+/// Source of the PF90021 R plane, kept in the render receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pf90021MaskSource {
     LipMaskType3ChannelR,
+    FaceParsingV2Class8Candidate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2540,13 +2539,10 @@ impl ProducerInputs {
             hash = fnv_u64(hash, pf90021.same_job.frame.fingerprint());
             hash = fnv_u64(hash, pf90021.same_job.mask_texture_id);
             hash = fnv_u64(hash, u64::from(pf90021.same_job.mask_channel));
-            hash = fnv_u64(
-                hash,
-                u64::from(
-                    pf90021.same_job.mask_source
-                        == Pf90021MaskSource::LipMaskType3ChannelR,
-                ),
-            );
+            hash = fnv_u64(hash, match pf90021.same_job.mask_source {
+                Pf90021MaskSource::LipMaskType3ChannelR => 1,
+                Pf90021MaskSource::FaceParsingV2Class8Candidate => 2,
+            });
             for bits in pf90021.same_job.roi_bits {
                 hash = fnv_u64(hash, u64::from(bits));
             }
@@ -4125,6 +4121,17 @@ fn face_mesh_refused(refusal: Refusal, fallback_reason: Option<String>) -> FaceM
     }
 }
 
+fn type1015_landmarks(
+    points194: &[[f32; 2]],
+) -> Result<([face_geometry::Point; 33], face_geometry::Point), Refusal> {
+    if points194.len() != face_width_414::INPUT_COUNT {
+        return Err(Refusal::ShapeMismatch("Type1015 194 landmarks"));
+    }
+    let to_point = |[x, y]: [f32; 2]| face_geometry::Point::new(x, y);
+    let contour = std::array::from_fn(|index| to_point(points194[109 + index]));
+    Ok((contour, to_point(points194[54])))
+}
+
 fn apply_face_mesh_group(
     source: &Image,
     landmark_frame_digest: Option<[u8; 32]>,
@@ -4175,11 +4182,6 @@ fn apply_face_mesh_group(
         }
     };
     if matches!(group.left, 242 | 8023 | 8027 | 8029) {
-        let points: Vec<face_geometry::Point> = points414
-            .iter()
-            .map(|point| face_geometry::Point::new(point[0], point[1]))
-            .collect();
-        let center = points[55];
         let owned_parts = match builtin_face_reshape_parts() {
             Ok(parts) => parts,
             Err(refusal) => return face_mesh_refused(refusal, None),
@@ -4193,31 +4195,33 @@ fn apply_face_mesh_group(
             })
             .collect();
         let vendor = face_geometry::VendorParts { parts: &arrays };
-        let geometry = match group.left {
-            242 => face_geometry::sharp_chin_sides(
-                controls, &points[..33], center, &vendor, source.width, source.height,
-            ),
-            8023 => face_geometry::jaw(
-                controls[0],
-                controls[1],
-                &points[..33],
-                center,
-                &vendor,
-                source.width,
-                source.height,
-            ),
-            8027 => face_geometry::cheek_sides(
-                &points[..33], center, controls, &vendor, source.width, source.height,
-            ),
-            8029 => face_geometry::temple(
+        let geometry = if group.left == 8029 {
+            let points = points414.map(|[x, y]| face_geometry::Point::new(x, y));
+            face_geometry::temple(
                 &points,
                 controls[0],
                 controls[1],
                 &vendor,
                 source.width,
                 source.height,
-            ),
-            _ => unreachable!(),
+            )
+        } else {
+            let (contour, center) = match type1015_landmarks(&slim.points194) {
+                Ok(landmarks) => landmarks,
+                Err(refusal) => return face_mesh_refused(refusal, None),
+            };
+            match group.left {
+                242 => face_geometry::sharp_chin_sides(
+                    controls, &contour, center, &vendor, source.width, source.height,
+                ),
+                8023 => face_geometry::jaw(
+                    controls[0], controls[1], &contour, center, &vendor, source.width, source.height,
+                ),
+                8027 => face_geometry::cheek_sides(
+                    &contour, center, controls, &vendor, source.width, source.height,
+                ),
+                _ => unreachable!(),
+            }
         };
         let geometry = match geometry {
             Ok(g) => g,
@@ -5260,6 +5264,11 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if pf == 90021 {
+            if degree == 0.5 && inputs.pf90021.is_none() {
+                run.backend = PortraitBackend::Skipped;
+                report.effects.push(run);
+                continue;
+            }
             let (next, pf90021_run) = apply_pf90021_stage(
                 &current,
                 inputs.receipt.as_ref(),
@@ -5893,9 +5902,6 @@ fn resolve_pf90021<'a>(
     }
     if same_job.mask_channel != 0 {
         return Err(Refusal::ValueOutOfRange("PF90021_MASK_CHANNEL"));
-    }
-    match same_job.mask_source {
-        Pf90021MaskSource::LipMaskType3ChannelR => {}
     }
     let direction_receipt =
         required(input.direction_receipt, "PF90021_DIRECTION_RECEIPT")?;
@@ -9469,6 +9475,18 @@ fn apply_skin_radiance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type1015_reads_the_original_194_point_contour() {
+        let points = std::array::from_fn::<_, 194, _>(|index| [index as f32, -(index as f32)]);
+        let (contour, center) = type1015_landmarks(&points).unwrap();
+        assert_eq!(center, face_geometry::Point::new(54.0, -54.0));
+        for (index, point) in contour.into_iter().enumerate() {
+            let source = (109 + index) as f32;
+            assert_eq!(point, face_geometry::Point::new(source, -source));
+        }
+        assert!(type1015_landmarks(&points[..193]).is_err());
+    }
 
     fn pf30026_binding(job_id: u64) -> Pf30026GateBinding {
         // Synthetic role receipt for consumer tests. It does not infer vendor

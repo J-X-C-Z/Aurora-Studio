@@ -1108,7 +1108,7 @@ impl FaceInputBundle {
     }
 
     /// Attaches PF30013 (中性灰磨皮 FlatGray) using the canonical `fbe.onnx`
-    /// FaceParsingV2 class-1 skin mask projected to the full source frame.
+    /// FaceParsingV2 facial-skin mask projected to the full source frame.
     pub fn attach_pf30013_inputs(
         &self,
         source: &Image,
@@ -1713,7 +1713,7 @@ impl FaceInputBundle {
     }
 
     /// Builds same-job wrinkle and historical-skin wrinkle inputs (`PF21024, 21025, 21069, 21070, 21071, 90023, 90024`)
-    /// from the source frame's frequency-separated Gaussian/median base and `fbe.onnx` class-1 skin mask.
+    /// from the source frame's frequency-separated Gaussian/median base and `fbe.onnx` facial-skin mask.
     pub fn attach_wrinkle_from_extra(
         &self,
         source: &Image,
@@ -2693,7 +2693,17 @@ impl FaceInputSession {
                     let mut bundle = (*cached).clone();
                     bundle.job_id = job_id;
                     match bundle.validate_ticket(source, Some(job_id)) {
-                        Ok(()) => return Ok(bundle),
+                        Ok(()) => {
+                            if let Some(inputs) = bundle.model_inputs.as_mut() {
+                                if let Some(parsing) = inputs.parsing.as_mut() {
+                                    parsing.job_id = job_id;
+                                }
+                                if let Some(teeth) = inputs.teeth.as_mut() {
+                                    teeth.job_id = job_id;
+                                }
+                            }
+                            return Ok(bundle);
+                        }
                         Err(refusal) => {
                             let mut cache = result_cache()
                                 .lock()

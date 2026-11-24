@@ -169,7 +169,7 @@ pub struct HistoricalToneBreastRepairPayload {
     pub alternate: bool,
 }
 
-/// Builds the PF30013 row from canonical fbe FaceParsingV2 class 1 (skin).
+/// Builds the PF30013 row from the canonical fbe FaceParsingV2 facial-skin plane.
 ///
 /// `face_roi` and `tone_roi` are intentionally explicit: the former is the
 /// exact source-to-crop transform used by inference, while the latter is the
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn pf30013_builder_projects_canonical_class1_mask_and_binds_frame() {
+    fn pf30013_builder_projects_facial_skin_mask_and_binds_frame() {
         let frame = Image::new(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).unwrap();
         let original = Image::new(2, 1, vec![70, 80, 90, 255, 100, 110, 120, 255]).unwrap();
         let face_roi = FaceParsingRoi {

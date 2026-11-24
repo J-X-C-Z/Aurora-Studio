@@ -1349,6 +1349,9 @@ fn needs_stage_face_bundle_direct(extra: &std::collections::BTreeMap<String, f32
 
 fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> bool {
     extra.iter().any(|(key, value)| {
+        if key == "pc:90021" {
+            return value.is_finite() && value.clamp(0.0, 1.0) != 0.5;
+        }
         if value.abs() <= 1.0e-6 {
             return false;
         }
@@ -1358,7 +1361,7 @@ fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> 
         matches!(
             pf,
             108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 21105 | 30013 | 30014 | 90004
-                | 90021 | 90023 | 90024 | 90086 | 100004
+                | 90023 | 90024 | 90086 | 100004
         )
     })
 }
@@ -1388,7 +1391,7 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90021 | 90086 | 100004)
+        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90086 | 100004)
             || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
@@ -2606,8 +2609,7 @@ fn render_sized(
                         }
                         // Same-frame attachments added after the existing
                         // parsing/geometry rows; their order above is unchanged.
-                        let c90021 = adj.extra.get("pc:90021").copied().unwrap_or(0.0);
-                        if c90021 != 0.0 {
+                        if let Some(&c90021) = adj.extra.get("pc:90021") {
                             match bundle.attach_pf90021_inputs(&stage_frame, c90021, &mut inputs) {
                                 Ok(()) => attached = true,
                                 Err(refusal) => {

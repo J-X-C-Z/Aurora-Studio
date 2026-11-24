@@ -26,7 +26,7 @@ pub const FACE_PARSING_V2_MODEL_ID: &str = "2102828093";
 pub const FACE_PARSING_V2_MODEL_FILE: &str = "fbe.onnx";
 pub const FACE_PARSING_V2_SIDE: u32 = 384;
 pub const FACE_PARSING_V2_CLASSES: usize = 17;
-pub const FACE_PARSING_V2_SKIN_CLASS: usize = 1;
+pub const FACE_PARSING_V2_SKIN_CLASS: usize = 2;
 pub const FACE_PARSING_V2_MODEL_BYTES: u64 = 23_059_132;
 pub const FACE_PARSING_V2_MODEL_ENV: &str = "AURORA_FACE_PARSING_MODEL";
 pub const FACE_PARSING_V2_MODEL_ROOT_ENV: &str = "AURORA_FACE_PARSING_MODEL_ROOT";
@@ -293,7 +293,7 @@ impl FaceParsingProducerInputs {
     }
 }
 
-/// Projects canonical fbe class 1 (skin) from the 384px model crop back to the
+/// Projects canonical fbe class 2 (facial skin) from the 384px model crop back to the
 /// exact source frame. The canonical model digest and all 17 planes are required.
 pub fn project_face_parsing_skin_mask(
     parsing: &FaceParsingProducerInputs,
@@ -321,7 +321,7 @@ pub fn project_face_parsing_skin_mask(
     }
     let skin = parsing
         .class(FACE_PARSING_V2_SKIN_CLASS)
-        .ok_or(Refusal::MissingInput("FaceParsingV2 class1 skin mask"))?;
+        .ok_or(Refusal::MissingInput("FaceParsingV2 skin mask"))?;
     let crop_to_source = inverse_native(parsing.source_to_crop)
         .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 skin crop matrix"))?;
     project_teeth_mask(
@@ -333,6 +333,38 @@ pub fn project_face_parsing_skin_mask(
         source_height,
     )
     .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 skin mask projection"))
+}
+
+const FACE_PARSING_V2_LIP_CLASS: usize = 8;
+
+pub(crate) fn project_face_parsing_lip_mask(
+    parsing: &FaceParsingProducerInputs,
+    job_id: u64,
+    source_width: u32,
+    source_height: u32,
+) -> Result<Vec<u8>, Refusal> {
+    if parsing.job_id != job_id {
+        return Err(Refusal::ValueOutOfRange("FaceParsingV2 lip job ticket"));
+    }
+    if parsing.model_sha256 != FACE_PARSING_V2_MODEL_SHA256
+        || parsing.channels as usize != FACE_PARSING_V2_CLASSES
+    {
+        return Err(Refusal::ValueOutOfRange("FaceParsingV2 canonical 17-class fbe model"));
+    }
+    if parsing.width != FACE_PARSING_V2_SIDE
+        || parsing.height != FACE_PARSING_V2_SIDE
+        || parsing.masks.len() != FACE_PARSING_V2_CLASSES * (FACE_PARSING_V2_SIDE as usize).pow(2)
+        || source_width == 0
+        || source_height == 0
+    {
+        return Err(Refusal::ShapeMismatch("FaceParsingV2 lip plane/frame"));
+    }
+    let plane = parsing.class(FACE_PARSING_V2_LIP_CLASS)
+        .ok_or(Refusal::MissingInput("FaceParsingV2 lip plane"))?;
+    let crop_to_source = inverse_native(parsing.source_to_crop)
+        .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 lip crop matrix"))?;
+    project_teeth_mask(plane, parsing.width, parsing.height, crop_to_source, source_width, source_height)
+        .map_err(|_| Refusal::ShapeMismatch("FaceParsingV2 lip mask projection"))
 }
 
 pub struct FaceParsingInference {
@@ -1164,12 +1196,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fbe_class1_projects_as_pf30013_skin_mask() {
+    fn canonical_fbe_projects_facial_skin_without_hair() {
         let side = FACE_PARSING_V2_SIDE as usize;
         let plane = side * side;
         let mut masks = vec![9u8; FACE_PARSING_V2_CLASSES * plane];
-        masks[FACE_PARSING_V2_SKIN_CLASS * plane..(FACE_PARSING_V2_SKIN_CLASS + 1) * plane]
-            .fill(200);
+        masks[plane..2 * plane].fill(61);
+        masks[2 * plane..3 * plane].fill(200);
         let parsing = FaceParsingProducerInputs {
             job_id: 17,
             width: FACE_PARSING_V2_SIDE,

@@ -9,16 +9,14 @@
 //!
 //! Both 512x512 vendor atlases decode through
 //! [`VolumeLut64::from_atlas_rgb8`] into 64^3 float volumes. Their paths come
-//! from [`PF90021_LUT_POSITIVE_ENV`] / [`PF90021_LUT_NEGATIVE_ENV`]; a missing
-//! or undecodable file is cached and falls back to the synthetic volume so the
-//! two-pass contract still runs without inventing vendor bytes.
+//! from [`PF90021_LUT_POSITIVE_ENV`] / [`PF90021_LUT_NEGATIVE_ENV`] or the
+//! decoded vendor effect root. Non-neutral effects require both vendor atlases.
 //!
-//! The effect region must be the recovered `LipMaskType=3` lip mask. This tree
-//! has no lip-layer producer: FaceParsingV2 has 17 planes but no recovered lip
-//! label, and the suit owner-mask map explicitly refuses classes 1/3/6/8. The
-//! producer therefore reports `PF90021_LIP_MASK` instead of silently reusing
-//! the class-1 skin plane.
+//! The verified renderer input is `LipMaskType=3`. The optional FaceParsingV2
+//! class-8 route is separately identified because the original live mask
+//! texture and projection are still unverified.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use aurora_portrait::cuda_pf90021::{
@@ -41,8 +39,8 @@ const FNV1A64_PRIME: u64 = 0x100000001b3;
 pub const PF90021_LUT_POSITIVE_ENV: &str = "AURORA_PF90021_LUT_POSITIVE";
 /// Environment override for the negative `LipDodgeLUT` atlas (PNG or JPEG).
 pub const PF90021_LUT_NEGATIVE_ENV: &str = "AURORA_PF90021_LUT_NEGATIVE";
-/// Named refusal: the recovered `LipMaskType=3` lip layer has no producer yet.
 pub const PF90021_LIP_MASK: &str = "PF90021_LIP_MASK";
+pub const PF90021_FACE_PARSING_LIP_ENV: &str = "AURORA_PF90021_FACE_PARSING_LIP";
 
 /// Recovered `Opacity: 80` (percent, not 0..1).
 pub const PF90021_OPACITY_PERCENT: f32 = 80.0;
@@ -134,18 +132,18 @@ fn pf90021_decode_lut_atlas(bytes: &[u8]) -> Result<VolumeLut64, Refusal> {
     VolumeLut64::from_atlas_rgb8(rgb.as_raw())
 }
 
-/// Reads and decodes one env-rooted atlas. Every failure path returns `None`
-/// after a warning; callers cache that `None` so a bad path is read once.
-fn pf90021_lut_from_env_value(env: &str) -> Option<VolumeLut64> {
-    let path = std::env::var_os(env)?;
-    if path.is_empty() {
-        return None;
-    }
-    let path = std::path::PathBuf::from(path);
-    let bytes = match std::fs::read(&path) {
+fn pf90021_lut_path(override_path: Option<PathBuf>, root: Option<&Path>, positive: bool) -> Option<PathBuf> {
+    override_path.filter(|path| !path.as_os_str().is_empty()).or_else(|| {
+        let name = if positive { "LipsLUT.png" } else { "LipDodgeLUT.png" };
+        root.map(|root| root.join("MakeupEnhance").join(name))
+    })
+}
+
+fn pf90021_read_lut(path: &Path) -> Option<VolumeLut64> {
+    let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            log::warn!("PF90021 {env}: cannot read {}: {error}", path.display());
+            log::warn!("PF90021: cannot read {}: {error}", path.display());
             return None;
         }
     };
@@ -153,7 +151,7 @@ fn pf90021_lut_from_env_value(env: &str) -> Option<VolumeLut64> {
         Ok(volume) => Some(volume),
         Err(refusal) => {
             log::warn!(
-                "PF90021 {env}: {} is not a 512x512 LUT atlas ({refusal:?})",
+                "PF90021: {} is not a 512x512 LUT atlas ({refusal:?})",
                 path.display()
             );
             None
@@ -162,7 +160,7 @@ fn pf90021_lut_from_env_value(env: &str) -> Option<VolumeLut64> {
 }
 
 /// Caches the env-rooted atlas, including a failed/missing lookup.
-fn pf90021_env_volume(positive: bool) -> Option<&'static VolumeLut64> {
+fn pf90021_vendor_volume(positive: bool) -> Option<&'static VolumeLut64> {
     static POS_VOLUME: OnceLock<Option<VolumeLut64>> = OnceLock::new();
     static NEG_VOLUME: OnceLock<Option<VolumeLut64>> = OnceLock::new();
     let cell: &'static OnceLock<Option<VolumeLut64>> = if positive {
@@ -175,56 +173,28 @@ fn pf90021_env_volume(positive: bool) -> Option<&'static VolumeLut64> {
     } else {
         PF90021_LUT_NEGATIVE_ENV
     };
-    cell.get_or_init(|| pf90021_lut_from_env_value(env))
-        .as_ref()
-}
-
-/// Picks the real atlas when present, otherwise the synthetic fallback.
-fn pf90021_select_volume<'a>(
-    loaded: Option<&'a VolumeLut64>,
-    positive: bool,
-) -> &'a VolumeLut64 {
-    loaded.unwrap_or_else(|| pf90021_synthetic_volume(positive))
-}
-
-fn pf90021_volume(positive: bool) -> &'static VolumeLut64 {
-    pf90021_select_volume(pf90021_env_volume(positive), positive)
-}
-
-/// Synthetic fallback used only when the vendor atlas is absent. It is a mild
-/// lip midtone lift, not the vendor transfer; the receipt still records the
-/// real config row, so the substitution is visible.
-fn pf90021_synthetic_volume(positive: bool) -> &'static VolumeLut64 {
-    static POS_VOLUME: OnceLock<VolumeLut64> = OnceLock::new();
-    static NEG_VOLUME: OnceLock<VolumeLut64> = OnceLock::new();
-    let cell = if positive { &POS_VOLUME } else { &NEG_VOLUME };
     cell.get_or_init(|| {
-        let denominator = (LUT_EDGE - 1) as f32;
-        let strength = if positive { 0.14f32 } else { -0.10f32 };
-        let mut nodes = vec![0.0f32; LUT_FLOATS];
-        for z in 0..LUT_EDGE {
-            let b = z as f32 / denominator;
-            for y in 0..LUT_EDGE {
-                let g = y as f32 / denominator;
-                for x in 0..LUT_EDGE {
-                    let r = x as f32 / denominator;
-                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    let mid_weight = 4.0 * luma * (1.0 - luma);
-                    let lift = strength * mid_weight;
-                    let sat_pull = if positive { 0.08 * mid_weight } else { 0.0 };
-                    let at = ((z * LUT_EDGE + y) * LUT_EDGE + x) * 3;
-                    nodes[at] = (r + lift + (luma - r) * sat_pull).clamp(0.0, 1.0);
-                    nodes[at + 1] = (g + lift * 0.96 + (luma - g) * sat_pull).clamp(0.0, 1.0);
-                    nodes[at + 2] = (b + lift * 1.04 + (luma - b) * sat_pull).clamp(0.0, 1.0);
-                }
-            }
-        }
-        VolumeLut64::from_nodes(nodes).expect("PF90021 64^3 synthetic volume")
-    })
+        let explicit = std::env::var_os(env).map(PathBuf::from);
+        let root = crate::portrait_vendor_config::root_from_env();
+        let path = pf90021_lut_path(explicit, root.as_deref(), positive)?;
+        pf90021_read_lut(&path)
+    }).as_ref()
+}
+
+fn pf90021_volumes(
+    direction: Pf90021Direction,
+    load: impl Fn(bool) -> Option<&'static VolumeLut64>,
+) -> Result<(&'static VolumeLut64, &'static VolumeLut64), Refusal> {
+    if direction == Pf90021Direction::Neutral {
+        let neutral = pf90021_identity_volume();
+        return Ok((neutral, neutral));
+    }
+    let positive = load(true).ok_or(Refusal::MissingInput("PF90021_POSITIVE_LUT64"))?;
+    let negative = load(false).ok_or(Refusal::MissingInput("PF90021_NEGATIVE_LUT64"))?;
+    Ok((positive, negative))
 }
 
 /// Identity 64^3 volume: `volume[z][y][x] = (x, y, z) / 63`.
-#[allow(dead_code)]
 fn pf90021_identity_volume() -> &'static VolumeLut64 {
     static VOLUME: OnceLock<VolumeLut64> = OnceLock::new();
     VOLUME.get_or_init(|| {
@@ -244,11 +214,15 @@ fn pf90021_identity_volume() -> &'static VolumeLut64 {
     })
 }
 
-/// The recovered `LipMaskType=3` main mask is a lip plane. No producer exists
-/// in this tree (FaceParsingV2 has no recovered lip label), so refuse by name
-/// rather than substitute the class-1 skin plane.
-fn pf90021_lip_mask() -> Result<Vec<u8>, Refusal> {
-    Err(Refusal::MissingInput(PF90021_LIP_MASK))
+fn pf90021_lip_mask(
+    enabled: bool,
+    parsing: Option<&crate::face_parsing::FaceParsingProducerInputs>,
+    job_id: u64,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Refusal> {
+    let parsing = parsing.filter(|_| enabled).ok_or(Refusal::MissingInput(PF90021_LIP_MASK))?;
+    crate::face_parsing::project_face_parsing_lip_mask(parsing, job_id, width, height)
 }
 
 /// Stable face identity for the same-job receipt. `C1FaceDetection` has no
@@ -295,13 +269,15 @@ impl crate::portrait_face_input_stage::FaceInputBundle {
             region: PF90021_REGION01,
         };
         runtime.u_alpha()?;
-        // Load both real atlases (or their cached fallback) before the mask
-        // gate so the env wiring is exercised on the same call path.
-        let pos_lut = pf90021_volume(true);
-        let neg_lut = pf90021_volume(false);
-        let mask_r = match direction {
-            Pf90021Direction::Neutral => Vec::new(),
-            Pf90021Direction::Positive | Pf90021Direction::Negative => pf90021_lip_mask()?,
+        let (pos_lut, neg_lut) = pf90021_volumes(direction, pf90021_vendor_volume)?;
+        let (mask_r, mask_source) = match direction {
+            Pf90021Direction::Neutral => (Vec::new(), Pf90021MaskSource::LipMaskType3ChannelR),
+            Pf90021Direction::Positive | Pf90021Direction::Negative => {
+                let enabled = std::env::var_os(PF90021_FACE_PARSING_LIP_ENV).is_some_and(|value| value == "1");
+                let parsing = self.model_inputs.as_ref().and_then(|inputs| inputs.parsing.as_ref());
+                (pf90021_lip_mask(enabled, parsing, self.job_id, source.width, source.height)?,
+                    Pf90021MaskSource::FaceParsingV2Class8Candidate)
+            }
         };
         let same_job = Pf90021SameJobBinding {
             job_id: self.job_id,
@@ -310,7 +286,7 @@ impl crate::portrait_face_input_stage::FaceInputBundle {
             frame,
             mask_texture_id: pf90021_mask_texture_id(self.job_id, frame, &mask_r),
             mask_channel: MASK_CHANNEL,
-            mask_source: Pf90021MaskSource::LipMaskType3ChannelR,
+            mask_source,
             roi_bits: PF90021_ROI_XYWH.map(f32::to_bits),
         };
         producer.pf90021 = Some(Pf90021ProducerInputs {
@@ -418,37 +394,64 @@ mod tests {
     }
 
     #[test]
-    fn missing_env_lut_selects_the_cached_synthetic_fallback() {
-        let env = "AURORA_PF90021_LUT_POSITIVE_TEST_MISSING_9C1D";
-        assert!(std::env::var_os(env).is_none());
-        assert!(pf90021_lut_from_env_value(env).is_none());
-
-        let synthetic = pf90021_synthetic_volume(true);
-        assert!(std::ptr::eq(
-            pf90021_select_volume(None, true),
-            synthetic
-        ));
-        assert_ne!(
-            pf90021_synthetic_volume(true).nodes(),
-            pf90021_synthetic_volume(false).nodes(),
-            "the fallback must not collapse both directions into identity"
-        );
+    fn vendor_root_resolves_both_atlases_and_preserves_explicit_override() {
+        let root = Path::new("decoded/config");
+        assert_eq!(pf90021_lut_path(None, Some(root), true), Some(root.join("MakeupEnhance").join("LipsLUT.png")));
+        assert_eq!(pf90021_lut_path(None, Some(root), false), Some(root.join("MakeupEnhance").join("LipDodgeLUT.png")));
+        let override_path = PathBuf::from("custom/vendor.png");
+        assert_eq!(pf90021_lut_path(Some(override_path.clone()), Some(root), false), Some(override_path));
+        assert_eq!(pf90021_lut_path(None, None, true), None);
     }
 
     #[test]
-    fn volume_loader_returns_a_typed_64_cube_for_both_directions() {
-        assert_eq!(pf90021_volume(true).nodes().len(), LUT_FLOATS);
-        assert_eq!(pf90021_volume(false).nodes().len(), LUT_FLOATS);
-        // The second call hits the cached slot instead of re-reading the env.
-        assert!(std::ptr::eq(pf90021_volume(true), pf90021_volume(true)));
+    fn non_neutral_requires_both_vendor_atlases() {
+        for direction in [Pf90021Direction::Positive, Pf90021Direction::Negative] {
+            assert!(matches!(
+                pf90021_volumes(direction, |_| None),
+                Err(Refusal::MissingInput("PF90021_POSITIVE_LUT64"))
+            ));
+            assert!(matches!(
+                pf90021_volumes(direction, |positive| positive.then(pf90021_identity_volume)),
+                Err(Refusal::MissingInput("PF90021_NEGATIVE_LUT64"))
+            ));
+        }
+        assert!(pf90021_volumes(Pf90021Direction::Neutral, |_| panic!("neutral should not load a LUT")).is_ok());
     }
 
     #[test]
     fn non_neutral_controls_refuse_the_missing_lip_layer() {
         assert_eq!(
-            pf90021_lip_mask(),
+            pf90021_lip_mask(true, None, 17, 2, 1),
             Err(Refusal::MissingInput(PF90021_LIP_MASK))
         );
+    }
+
+    #[test]
+    fn class8_lip_candidate_requires_opt_in_and_matching_frame_ticket() {
+        use crate::face_parsing::{FaceParsingProducerInputs, FaceParsingRoi, FACE_PARSING_V2_CLASSES,
+            FACE_PARSING_V2_MODEL_SHA256, FACE_PARSING_V2_SIDE};
+        let pixels = (FACE_PARSING_V2_SIDE as usize).pow(2);
+        let mut masks = vec![0; FACE_PARSING_V2_CLASSES * pixels];
+        masks[7 * pixels..8 * pixels].fill(255);
+        masks[8 * pixels..9 * pixels].fill(201);
+        masks[9 * pixels..10 * pixels].fill(255);
+        let parsing = FaceParsingProducerInputs {
+            job_id: 17,
+            width: FACE_PARSING_V2_SIDE,
+            height: FACE_PARSING_V2_SIDE,
+            channels: FACE_PARSING_V2_CLASSES as u8,
+            model_sha256: FACE_PARSING_V2_MODEL_SHA256,
+            source_to_crop: FaceParsingRoi { x: 0.0, y: 0.0, width: 2.0, height: 1.0, roll_radians: 0.0 }
+                .source_to_crop().unwrap(),
+            masks,
+            mask_provider: "cpu",
+        };
+        assert_eq!(pf90021_lip_mask(false, Some(&parsing), 17, 2, 1), Err(Refusal::MissingInput(PF90021_LIP_MASK)));
+        assert_eq!(pf90021_lip_mask(true, Some(&parsing), 18, 2, 1), Err(Refusal::ValueOutOfRange("FaceParsingV2 lip job ticket")));
+        assert_eq!(pf90021_lip_mask(true, Some(&parsing), 17, 2, 1).unwrap(), vec![201, 201]);
+        let mut stale = parsing;
+        stale.model_sha256 = [0; 32];
+        assert!(matches!(pf90021_lip_mask(true, Some(&stale), 17, 2, 1), Err(Refusal::ValueOutOfRange(_))));
     }
 
     #[test]
