@@ -30,6 +30,7 @@ pub mod hair_color;
 pub mod hair_material;
 pub mod leg_refine_uv;
 pub mod leg_refine;
+pub mod lip_color;
 pub mod makeup;
 pub mod makeup_material;
 pub mod makeup_mask_uv;
