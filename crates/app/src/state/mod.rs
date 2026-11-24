@@ -283,6 +283,7 @@ pub struct Frame {
     pub(crate) source_pixels: usize,
     /// The developed-frame region this frame shows.
     pub region: NormRect,
+    pub(crate) geometry: Geometry,
     pub image_id: ImageId,
     /// Clipped highlights (red) and shadows (blue), when the exposure warning is on.
     pub warning: Option<Arc<RenderImage>>,
@@ -323,6 +324,8 @@ impl Frame {
 pub struct Preview {
     pub frame: Option<Frame>,
     pub before: Option<Frame>,
+    pub(crate) full_after: Option<Frame>,
+    pub(crate) full_before: Option<Frame>,
     pub histogram: Histogram,
     pub elapsed_ms: f32,
     pub(crate) generation: u64,
@@ -813,6 +816,9 @@ impl AppState {
             self.active_node = None;
             self.zoom = ViewZoom::default();
             self.preview.before_dirty = true;
+            for frame in [self.preview.full_after.take(), self.preview.full_before.take()].into_iter().flatten() {
+                frame.release(cx);
+            }
             self.sampled_color = None;
             self.picker_point = None;
             cx.emit(StateEvent::CurrentChanged);
@@ -1107,14 +1113,18 @@ impl AppState {
     /// Applies a change while a control is being dragged. The first call of a gesture
     /// records the state to undo to; [`Self::end_gesture`] commits it as one step.
     pub fn edit_live(&mut self, label: impl Into<SharedString>, f: impl FnOnce(&mut AdjustmentSet), cx: &mut Context<Self>) {
+        self.apply_gesture_edit(label, f);
+        self.request_render(RenderQuality::Draft, cx);
+        cx.notify();
+    }
+
+    fn apply_gesture_edit(&mut self, label: impl Into<SharedString>, f: impl FnOnce(&mut AdjustmentSet)) {
         let Some(id) = self.current else { return };
         let edit = self.edits.entry(id).or_default();
         if edit.gesture.is_none() {
             edit.gesture = Some((label.into(), edit.adj.clone()));
         }
         f(&mut edit.adj);
-        self.request_render(RenderQuality::Draft, cx);
-        cx.notify();
     }
 
     /// Ends the current gesture, if any, as a single undo step.
@@ -1147,7 +1157,7 @@ impl AppState {
     /// A discrete change: one undo step, final-quality render.
     pub fn edit(&mut self, label: impl Into<SharedString>, f: impl FnOnce(&mut AdjustmentSet), cx: &mut Context<Self>) {
         self.end_gesture(cx);
-        self.edit_live(label, f, cx);
+        self.apply_gesture_edit(label, f);
         self.end_gesture(cx);
     }
 
