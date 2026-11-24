@@ -1436,11 +1436,12 @@ impl PortraitFrameReceipt {
     }
 }
 
-/// Static PF90021 writer candidates all resolve to the FaceParsing channel-0
-/// raster path; the map-offset conflict remains a live-receipt gate.
+/// Static PF90021 writer candidates. The recovered row is `LipMaskType=3`
+/// (mask index 0 -> `MASK_R`), so the producer contract names that layer even
+/// though this tree has no lip-layer producer yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pf90021MaskSource {
-    FaceParsingChannel0Rasterized,
+    LipMaskType3ChannelR,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1481,7 +1482,7 @@ fn pf90021_direction_from_effect_range(
     }
 }
 
-fn pf90021_degree_remap(direction: Pf90021Direction, input01: f32) -> f32 {
+pub(crate) fn pf90021_degree_remap(direction: Pf90021Direction, input01: f32) -> f32 {
     match direction {
         Pf90021Direction::Neutral => 0.0,
         Pf90021Direction::Positive => {
@@ -2543,7 +2544,7 @@ impl ProducerInputs {
                 hash,
                 u64::from(
                     pf90021.same_job.mask_source
-                        == Pf90021MaskSource::FaceParsingChannel0Rasterized,
+                        == Pf90021MaskSource::LipMaskType3ChannelR,
                 ),
             );
             for bits in pf90021.same_job.roi_bits {
@@ -5890,7 +5891,7 @@ fn resolve_pf90021<'a>(
         return Err(Refusal::ValueOutOfRange("PF90021_MASK_CHANNEL"));
     }
     match same_job.mask_source {
-        Pf90021MaskSource::FaceParsingChannel0Rasterized => {}
+        Pf90021MaskSource::LipMaskType3ChannelR => {}
     }
     let direction_receipt =
         required(input.direction_receipt, "PF90021_DIRECTION_RECEIPT")?;
@@ -11642,7 +11643,7 @@ mod tests {
                 frame: receipt.frame_receipt(),
                 mask_texture_id: 0x6200,
                 mask_channel: 0,
-                mask_source: Pf90021MaskSource::FaceParsingChannel0Rasterized,
+                mask_source: Pf90021MaskSource::LipMaskType3ChannelR,
                 roi_bits: [
                     0.0f32.to_bits(),
                     0.0f32.to_bits(),
