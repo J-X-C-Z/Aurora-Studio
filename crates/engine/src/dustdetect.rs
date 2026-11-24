@@ -10,9 +10,10 @@
 //! the right/bottom edge.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 
 use crate::aimask::{Runtime, Session};
 use crate::{Spot, SpotKind};
@@ -68,6 +69,79 @@ pub(crate) struct RawSpot {
     pub side: f32,
 }
 
+#[derive(Clone, PartialEq)]
+struct CacheKey {
+    frame: u64,
+    threshold_bits: u32,
+    model: Vec<u8>,
+}
+
+struct CacheEntry {
+    key: CacheKey,
+    spots: Arc<Vec<Spot>>,
+}
+
+const DUST_CACHE_ENTRIES: usize = 8;
+
+fn cache() -> &'static Mutex<Vec<CacheEntry>> {
+    static CACHE: OnceLock<Mutex<Vec<CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Model identity: the file's metadata and first/middle/last KiB. A model
+/// replacement changes this even when the path is reused, so stale inference
+/// results cannot be served after an ONNX update.
+fn model_fingerprint() -> Vec<u8> {
+    let mut out = Vec::new();
+    let Ok(path) = model_path() else { return out };
+    let Ok(meta) = std::fs::metadata(&path) else { return out };
+    out.extend_from_slice(&meta.len().to_le_bytes());
+    out.extend_from_slice(&meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|t| t.as_secs().to_le_bytes()).unwrap_or([0; 8]));
+    use std::io::{Read, Seek, SeekFrom};
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        for at in [SeekFrom::Start(0), SeekFrom::End(-1024), SeekFrom::End(-2048)] {
+            let mut bytes = [0u8; 1024];
+            if file.seek(at).is_ok() && file.read(&mut bytes).unwrap_or(0) > 0 {
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Cached automatic dust detection. `frame` must identify the source snapshot,
+/// geometry and output frame; colour sliders are deliberately absent. The
+/// threshold and the model bytes are part of the key so changing either
+/// re-detects, while dragging an unrelated slider hits the cache.
+pub fn detect_dust_cached(
+    frame: u64,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    min_confidence: f32,
+) -> Result<Arc<Vec<Spot>>> {
+    let key = CacheKey {
+        frame,
+        threshold_bits: min_confidence.to_bits(),
+        model: model_fingerprint(),
+    };
+    {
+        let entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(found) = entries.iter().find(|entry| entry.key == key) {
+            return Ok(Arc::clone(&found.spots));
+        }
+    }
+    let spots = Arc::new(detect_dust(rgba, w, h, min_confidence)?);
+    let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+    entries.retain(|entry| entry.key != key);
+    if entries.len() >= DUST_CACHE_ENTRIES {
+        entries.remove(0);
+    }
+    entries.push(CacheEntry { key, spots: Arc::clone(&spots) });
+    Ok(spots)
+}
+
 /// Detects dust spots in a developed RGBA frame.  Returned coordinates are
 /// normalised like every other `Spot`; `radius` is a fraction of the long side.
 pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<Vec<Spot>> {
@@ -87,21 +161,30 @@ pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<V
     let session = &session()?.session;
     let runtime = Runtime::get()
         .ok_or_else(|| anyhow::anyhow!("ONNX Runtime is not available for dust detection"))?;
-    let mut found = Vec::new();
-    for ty in spot_tiles(canvas_h) {
-        for tx in spot_tiles(canvas_w) {
-            let mut input = tile_tensor(&canvas, canvas_w, canvas_h, tx, ty);
-            let planes = runtime.run(
-                session,
-                &mut input,
-                &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64],
-            )?;
-            let rows = planes
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("dust model returned no output"))?;
-            found.extend(decode_tile(rows, tx, ty, scale, min_confidence)?);
-        }
-    }
+    let tiles_x = spot_tiles(canvas_w);
+    let tiles_y = spot_tiles(canvas_h);
+    let tensor_len = 3 * INPUT_SIDE * INPUT_SIDE;
+    let found: Result<Vec<Vec<RawSpot>>> = tiles_y
+        .par_iter()
+        .map(|&ty| {
+            let mut tile_input = vec![0.0f32; tensor_len];
+            let mut row = Vec::new();
+            for &tx in &tiles_x {
+                fill_tile_tensor(&mut tile_input, &canvas, canvas_w, canvas_h, tx, ty);
+                let planes = runtime.run(
+                    session,
+                    &mut tile_input,
+                    &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64],
+                )?;
+                let rows = planes
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("dust model returned no output"))?;
+                row.extend(decode_tile(rows, tx, ty, scale, min_confidence)?);
+            }
+            Ok(row)
+        })
+        .collect();
+    let mut found: Vec<RawSpot> = found?.into_iter().flatten().collect();
     found.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     let mut kept: Vec<RawSpot> = Vec::new();
     for spot in found {
@@ -184,30 +267,34 @@ fn model_path() -> Result<PathBuf> {
 /// Bilinear resize to the C1 canvas, RGB 0..255 (the model's trained range).
 pub(crate) fn resize_canvas(rgba: &[u8], w: usize, h: usize, cw: usize, ch: usize) -> Vec<f32> {
     let mut canvas = vec![0.0f32; cw * ch * 3];
-    for y in 0..ch {
-        let sy = (y as f32 + 0.5) * h as f32 / ch as f32 - 0.5;
-        let y0 = sy.floor().max(0.0) as usize;
-        let y1 = (y0 + 1).min(h - 1);
-        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..cw {
-            let sx = (x as f32 + 0.5) * w as f32 / cw as f32 - 0.5;
-            let x0 = sx.floor().max(0.0) as usize;
-            let x1 = (x0 + 1).min(w - 1);
-            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let at = |xx: usize, yy: usize, c: usize| rgba[(yy * w + xx) * 4 + c] as f32;
-            let d = (y * cw + x) * 3;
-            for c in 0..3 {
-                let top = at(x0, y0, c) * (1.0 - fx) + at(x1, y0, c) * fx;
-                let bottom = at(x0, y1, c) * (1.0 - fx) + at(x1, y1, c) * fx;
-                canvas[d + c] = top * (1.0 - fy) + bottom * fy;
+    canvas
+        .par_chunks_mut(cw * 3)
+        .enumerate()
+        .for_each(|(y, line)| {
+            let sy = (y as f32 + 0.5) * h as f32 / ch as f32 - 0.5;
+            let y0 = sy.floor().max(0.0) as usize;
+            let y1 = (y0 + 1).min(h - 1);
+            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+            for (x, pixel) in line.chunks_exact_mut(3).enumerate() {
+                let sx = (x as f32 + 0.5) * w as f32 / cw as f32 - 0.5;
+                let x0 = sx.floor().max(0.0) as usize;
+                let x1 = (x0 + 1).min(w - 1);
+                let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+                let at = |xx: usize, yy: usize, c: usize| rgba[(yy * w + xx) * 4 + c] as f32;
+                for c in 0..3 {
+                    let top = at(x0, y0, c) * (1.0 - fx) + at(x1, y0, c) * fx;
+                    let bottom = at(x0, y1, c) * (1.0 - fx) + at(x1, y1, c) * fx;
+                    pixel[c] = top * (1.0 - fy) + bottom * fy;
+                }
             }
-        }
-    }
+        });
     canvas
 }
 
-pub(crate) fn tile_tensor(canvas: &[f32], cw: usize, ch: usize, tx: usize, ty: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; 3 * INPUT_SIDE * INPUT_SIDE];
+/// Fills a reusable tile tensor in place (the caller zero-fills once and keeps
+/// it for the rest of the row), avoiding a 1.9 MiB allocation per inference.
+fn fill_tile_tensor(out: &mut [f32], canvas: &[f32], cw: usize, ch: usize, tx: usize, ty: usize) {
+    out.fill(0.0);
     for y in 0..INPUT_SIDE {
         let sy = ty + y;
         if sy >= ch {
@@ -225,6 +312,11 @@ pub(crate) fn tile_tensor(canvas: &[f32], cw: usize, ch: usize, tx: usize, ty: u
             }
         }
     }
+}
+
+pub(crate) fn tile_tensor(canvas: &[f32], cw: usize, ch: usize, tx: usize, ty: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; 3 * INPUT_SIDE * INPUT_SIDE];
+    fill_tile_tensor(&mut out, canvas, cw, ch, tx, ty);
     out
 }
 
