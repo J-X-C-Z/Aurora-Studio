@@ -17,6 +17,7 @@ use gpui_kit::{
 
 use super::{row, select, switch_row};
 use crate::contract::{Control, PortraitParam};
+use crate::evidence::{self, Availability};
 use crate::i18n::t;
 use crate::state::{AppState, Binding, extra_binding};
 use crate::theme::pal;
@@ -27,12 +28,35 @@ use crate::theme::pal;
 pub fn param_portrait(state: &Entity<AppState>, param: &'static PortraitParam, cx: &App) -> AnyElement {
     let p = pal(cx).clone();
     let row = control(state, param, cx);
+    let available = evidence::availability(param.id);
     let shared = (!param.shared.is_empty()).then(|| param.shared.join(" · "));
-    let tip = format!("#{} {} · {} {:.2}\n{}", param.id, param.key, t("confidence", "置信度"), param.confidence, param.evidence);
+    let evidence_line = match evidence::for_pf(param.id) {
+        Some(effect) => format!("\n{} · {}", t("Evidence", "证据"), effect.state_line()),
+        None => format!("\n{}", t("No capability registry row; do not infer backend support", "能力表无对应项，不推断后端支持")),
+    };
+    let tip = format!("#{} {} · {} {:.2}\n{}{}", param.id, param.key, t("confidence", "置信度"), param.confidence, param.evidence, evidence_line);
+    let state = match available {
+        Availability::Preview => t("Available in main preview", "应用主预览可用"),
+        Availability::Registered => t("Not wired into main preview — stored only", "未接入应用主预览，仅保存"),
+        Availability::Unregistered => t("No registry entry for this parameter — support not inferred", "能力表无对应项，不推断后端支持"),
+    };
+    let evidence_chip = match evidence::for_pf(param.id) {
+        Some(effect) => format!("{tip}\n\n{}", effect.tooltip()),
+        None => format!("{tip}\n\n{}", t("Seven-level evidence: unverified", "七级证据：均未验证")),
+    };
     v_flex()
         .id(SharedString::from(format!("pc-row-{}", param.id)))
-        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(evidence_chip.clone()).build(window, cx))
         .when(param.child, |d| d.pl_3().border_l_2().border_color(p.divider).ml_3())
+        .child(
+            h_flex()
+                .px_3()
+                .pt_1()
+                .gap_1p5()
+                .text_size(px(10.0))
+                .text_color(if available == Availability::Preview { p.success } else { p.text_disabled })
+                .child(div().flex_1().min_w_0().child(state)),
+        )
         .child(row)
         .when_some(shared, |d, effects| {
             d.child(

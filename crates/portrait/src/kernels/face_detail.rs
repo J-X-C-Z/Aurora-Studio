@@ -33,7 +33,7 @@ pub const META: &[EffectMeta] = &[
     EffectMeta { pf: 30025, key: "teethBlemishRemoval", label: "Tooth repair", access: Access::Cpu, inputs: &["teeth mask", "repair layer", "ROI"] },
     EffectMeta { pf: 30096, key: "sediao", label: "Skin temperature", access: Access::Cpu, inputs: &["skin mask", "cold LUT", "warm LUT"] },
     EffectMeta { pf: 90003, key: "skinColorUniform", label: "Body skin color uniform", access: Access::Refused, inputs: &["native 0x15F93 value", "body mask", "ROI mask", "TradBodySkinTone curve/LUT/writeback (open)"] },
-    EffectMeta { pf: 90021, key: "PF90021_UI_KEY_NOT_RECOVERED", label: "Lip makeup enhance", access: Access::Cpu, inputs: &["mouth mask", "LipsLUT", "LipDodgeLUT"] },
+    EffectMeta { pf: 90021, key: "lipMakeupEnhance", label: "Lip makeup enhance", access: Access::Cpu, inputs: &["mouth mask", "LipsLUT", "LipDodgeLUT"] },
     EffectMeta { pf: 90032, key: "eyeMakeupDegree", label: "Eye image makeup", access: Access::Cpu, inputs: &["material RGBA texture", "EyeMaskType=10 mask (RGB)", "mask/material UV", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 41/42/43/44"] },
     EffectMeta { pf: 90033, key: "suitMakeupDegree", label: "Suit makeup (ordered passes)", access: Access::Cpu, inputs: &["ordered pass list", "per-pass material RGBA", "per-pass mask + UV", "MixColor/opacity/degree/shelter/region", "FilterType"] },
     EffectMeta { pf: 90087, key: "PF90087_UI_KEY_NOT_RECOVERED", label: "Hair seam fill", access: Access::Cpu, inputs: &["part-line mask", "hair mask"] },

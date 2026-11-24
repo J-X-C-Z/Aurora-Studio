@@ -122,6 +122,12 @@ mod format_tests {
 pub const SOFT_PROOF: Status = Status::Partial("Proofs through the chosen ICC profile; a missing profile falls back with no gamut warning", "按所选 ICC 配置文件校样；缺配置文件时回退且不提示色域");
 /// Lens blur: stored with the variant; the engine has no depth map or blur yet.
 pub const LENS_BLUR: Status = Status::Pending("Saved with the variant; the engine has no depth estimation or lens blur yet", "随变体保存，引擎尚无景深估计与镜头模糊");
+/// Apple-Silicon GPU path: roadmap only. No backend, no on-device run, no
+/// measurement exists, so nothing may be presented as verified.
+pub const METAL: Status = Status::Missing(
+    "Roadmap only: no Metal backend and no on-device verification; inference is CPU or the Windows CUDA/DirectML path",
+    "仅为路线图：尚无 Metal 后端，也没有真机验证；推理走 CPU 或 Windows 的 CUDA/DirectML",
+);
 
 /// The unit suffix a slider shows for a `ParamMeta::unit`.
 pub fn unit_suffix(unit: &str) -> &'static str {
@@ -232,6 +238,8 @@ impl PortraitParam {
 /// One ID band of `catalog.md`'s portrait table.
 pub struct Band {
     pub id: &'static str,
+    /// Panel id for the band's registry-only effects (registered but no slider).
+    pub evidence_id: &'static str,
     pub en: &'static str,
     pub zh: &'static str,
     pub lo: i64,
@@ -239,14 +247,14 @@ pub struct Band {
 }
 
 pub const BANDS: [Band; 8] = [
-    Band { id: "pc-blemish", en: "Blemish Removal", zh: "瑕疵去除", lo: 0, hi: 999 },
-    Band { id: "pc-face", en: "Face Reshaping", zh: "面部重塑", lo: 21000, hi: 21999 },
-    Band { id: "pc-skin", en: "Skin, Makeup & Body", zh: "皮肤/妆容/身体", lo: 30000, hi: 39999 },
-    Band { id: "pc-makeup", en: "Makeup Details", zh: "妆容细节", lo: 40000, hi: 49999 },
-    Band { id: "pc-smart", en: "Smart Recognition", zh: "智能识别", lo: 80000, hi: 89999 },
-    Band { id: "pc-material", en: "Materials, Looks & Sky", zh: "素材/样式/天空替换", lo: 90000, hi: 90999 },
-    Band { id: "pc-placement", en: "Placement & Edges", zh: "素材定位/边缘调整", lo: 100000, hi: 899999 },
-    Band { id: "pc-local", en: "Local Blemish Removal", zh: "局部去瑕疵", lo: 900000, hi: i64::MAX },
+    Band { id: "pc-blemish", evidence_id: "pc-blemish-evidence", en: "Blemish Removal", zh: "瑕疵去除", lo: 0, hi: 999 },
+    Band { id: "pc-face", evidence_id: "pc-face-evidence", en: "Face Reshaping", zh: "面部重塑", lo: 21000, hi: 21999 },
+    Band { id: "pc-skin", evidence_id: "pc-skin-evidence", en: "Skin, Makeup & Body", zh: "皮肤/妆容/身体", lo: 30000, hi: 39999 },
+    Band { id: "pc-makeup", evidence_id: "pc-makeup-evidence", en: "Makeup Details", zh: "妆容细节", lo: 40000, hi: 49999 },
+    Band { id: "pc-smart", evidence_id: "pc-smart-evidence", en: "Smart Recognition", zh: "智能识别", lo: 80000, hi: 89999 },
+    Band { id: "pc-material", evidence_id: "pc-material-evidence", en: "Materials, Looks & Sky", zh: "素材/样式/天空替换", lo: 90000, hi: 90999 },
+    Band { id: "pc-placement", evidence_id: "pc-placement-evidence", en: "Placement & Edges", zh: "素材定位/边缘调整", lo: 100000, hi: 899999 },
+    Band { id: "pc-local", evidence_id: "pc-local-evidence", en: "Local Blemish Removal", zh: "局部去瑕疵", lo: 900000, hi: i64::MAX },
 ];
 
 impl Band {
@@ -303,10 +311,10 @@ pub static PORTRAIT: LazyLock<Vec<PortraitParam>> = LazyLock::new(|| {
                     default_color[i] = c.as_f64().unwrap_or(0.0) as f32;
                 }
             }
-            let (en, zh) = label_for(&key);
+            let (en, zh) = label_for_key(&key);
             let side = side_of(&key);
-            let label_zh = p.ui_label.clone().or(zh.map(str::to_owned)).unwrap_or_else(|| humanize(&key));
-            let label_en = en.map(str::to_owned).unwrap_or_else(|| humanize(&key));
+            let label_zh = p.ui_label.clone().or(zh.map(str::to_owned)).unwrap_or_else(|| humanized_key(&key));
+            let label_en = en.map(str::to_owned).unwrap_or_else(|| humanized_key(&key));
             let (label_en, label_zh) = match side {
                 Some((se, sz)) if !label_zh.contains(sz) => (format!("{label_en} ({se})"), format!("{label_zh}（{sz}）")),
                 _ => (label_en, label_zh),
@@ -339,7 +347,7 @@ fn side_of(key: &str) -> Option<(&'static str, &'static str)> {
 }
 
 /// `removeGlabellaLines` → `Remove glabella lines`.
-fn humanize(key: &str) -> String {
+pub fn humanized_key(key: &str) -> String {
     let mut out = String::new();
     for (i, ch) in key.chars().enumerate() {
         if ch == '_' {
@@ -356,9 +364,9 @@ fn humanize(key: &str) -> String {
     out
 }
 
-/// Labels for parameters the vendor UI registry left unnamed, and English
-/// labels for the pinyin keys.
-fn label_for(key: &str) -> (Option<&'static str>, Option<&'static str>) {
+/// Labels for a UI key, shared with the capability registry rows that have no
+/// parameter control.
+pub fn label_for_key(key: &str) -> (Option<&'static str>, Option<&'static str>) {
     let base = key.trim_end_matches("_left").trim_end_matches("_right");
     let hit = LABELS.iter().find(|(k, _, _)| *k == key).or_else(|| LABELS.iter().find(|(k, _, _)| *k == base));
     match hit {
@@ -450,7 +458,7 @@ const LABELS: &[(&str, &str, &str)] = &[
     ("lipstickColor", "Lipstick color", "口红颜色"),
     ("skinToneUnifyMulti", "Unify skin (group)", "多人肤色统一"),
     ("smileMaterialPath", "Smile material", "微笑素材"),
-    ("sediao", "Tone", "色调"),
+    ("sediao", "Skin temperature", "肤色温度"),
     ("handNeutralGray", "Hand dodge & burn", "手部中性灰"),
     ("removeDoubleChin_degree", "Amount", "祛除程度"),
     ("removeDoubleChin_shadow", "Shadow", "阴影程度"),
@@ -496,7 +504,7 @@ const LABELS: &[(&str, &str, &str)] = &[
     ("makeupRemovalEyeDegree", "Eye makeup amount", "眼妆卸除程度"),
     ("makeupRemovalFullFaceDegree", "Full face amount", "全脸卸妆程度"),
     ("makeupRemovalFullFaceEnable", "Full face", "全脸卸妆"),
-    ("removeBlueVeins", "Blue veins", "祛青筋"),
+    ("removeBlueVeins", "Hand blue veins", "祛手部青筋"),
     ("eyeholeCornerSwitch", "Eye corners", "眼角"),
     ("skinToneSelect_path", "Skin tone", "肤色选择"),
     ("skinToneSelect_degree", "Skin tone amount", "肤色程度"),

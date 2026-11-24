@@ -3,6 +3,7 @@ name = "aurora-portrait"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+exclude = ["work/**", "testdata/**", "examples/**", "scripts/**"]
 
 [dependencies]
 

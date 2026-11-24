@@ -21,6 +21,7 @@ mod meta;
 mod nef;
 mod orf;
 mod packbits;
+mod rw2;
 mod tiff;
 
 use std::path::Path;
@@ -82,7 +83,7 @@ pub(crate) fn decode_bytes(bytes: &[u8]) -> NativeResult<BayerFrame> {
         return orf::decode(bytes);
     }
     if bytes.get(..4) == Some(b"IIU\0") {
-        return Err(NativeError::unsupported("Panasonic RW2 is stage 2"));
+        return rw2::decode(bytes);
     }
 
     let tiff = tiff::Tiff::parse(bytes, 0)?;

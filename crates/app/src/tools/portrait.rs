@@ -11,9 +11,13 @@ use gpui_kit::component::{
     button::Button,
     h_flex, v_flex,
 };
-use gpui_kit::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, Window, div, px};
+use gpui_kit::{
+    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px,
+};
 
 use crate::contract::{self, BANDS, Band, PortraitParam, Status};
+use crate::evidence;
 use crate::i18n::t;
 use crate::state::{AppState, Binding, extra_binding};
 use crate::theme::pal;
@@ -134,9 +138,26 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                         .child(Icon::new(IconName::Info).xsmall().text_color(p.accent))
                         .items_start()
                         .child(div().flex_1().min_w_0().text_xs().text_color(p.text_muted).child(t(
-                            "Adjustments are saved with the variant. Effects that need detection, masks or materials apply only when those inputs are available.",
-                            "调整随变体保存。需要人脸检测、遮罩或材质的效果，仅在输入可用时生效。",
+                            "Each effect shows its seven-level evidence state. Only effects with evidence at ev5 (main preview) may be called available; stored parameters alone do not change the preview.",
+                            "每个效果都显示七级证据状态；只有达到 ev5（应用主预览接入）才可标为可用。仅保存参数不会改变预览。",
                         ))),
+                )
+                .child(
+                    div()
+                        .id("portrait-registry")
+                        .text_size(px(10.0))
+                        .text_color(p.text_disabled)
+                        .child(format!(
+                            "{} {}… · {} {}",
+                            t("Evidence registry", "证据表"),
+                            &evidence::REGISTRY_SHA256[..12],
+                            evidence::all().count(),
+                            t("registered effects", "个已登记效果"),
+                        ))
+                        .tooltip({
+                            let tip = format!("{}\n{}", evidence::REGISTRY_SOURCE, evidence::REGISTRY_SHA256);
+                            move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                        }),
                 )
                 .child(div().text_xs().text_color(p.text_subtle).child(format!(
                     "{} {}",
@@ -196,6 +217,7 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
     col = col.child(caption(t("Portrait algorithms", "人像算法"), cx));
     for band in BANDS.iter() {
         col = col.child(band_panel(state, band, &query, cx));
+        col = col.child(registry_panel(state, band, &query, cx));
     }
     col.into_any_element()
 }
@@ -344,7 +366,7 @@ fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &A
     let open = !query.is_empty() || !s.panels.collapsed.contains(band.id);
     let st = state.clone();
     let mut panel = ToolPanel::new(state, band.id, band.title())
-        .status(Status::Partial("Skin effects render; face geometry and model-dependent effects need live inputs", "皮肤类效果已接入；面部几何与依赖模型输出的效果需要实时输入"))
+        .status(band_status(band))
         .badge(if set > 0 { format!("{set}/{}", params.len()) } else { format!("{}", params.len()) })
         .modified(set > 0)
         .force_open(!query.is_empty())
@@ -378,5 +400,58 @@ fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &A
         }
     }
     panel.into_any_element()
+}
+
+/// 段内证据摘要：达到 ev5 的项也只标“部分”，因为 ev6/ev7 仍无证据；
+/// 其余一律“未接入”。
+fn band_status(band: &'static Band) -> Status {
+    let (wired, _total) = evidence::preview_count(band.lo, band.hi);
+    if wired > 0 {
+        Status::Partial(
+            "Only ev5 (main preview) effects are presented as available; vendor parity and real-photo acceptance are unverified",
+            "只有达到 ev5（应用主预览接入）的效果才标为可用；原厂对拍与真实照片验收未验证",
+        )
+    } else {
+        Status::Missing(
+            "No effect in this group has ev5 (main preview) evidence; parameters are parsed and stored only",
+            "本组没有效果达到 ev5（应用主预览接入）；参数仅解析并保存",
+        )
+    }
+}
+
+/// 能力表里有登记、但没有参数控件可显示的效果。它们不能被省略：
+/// 例如 PF30096（sediao）、PF90021（lipMakeupEnhance）与 PF44297（祛青筋）。
+fn registry_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &App) -> AnyElement {
+    let unlisted: Vec<_> = evidence::without_control(band.lo, band.hi)
+        .into_iter()
+        .filter(|effect| matches(query, &effect.display_label(), effect.key, Some(i64::from(effect.pf))))
+        .collect();
+    if unlisted.is_empty() {
+        return div().into_any_element();
+    }
+    let p = pal(cx).clone();
+    let title = format!("{} · {}", band.title(), t("registered effects without a slider", "已登记但无参数控件的效果"));
+    let rows = unlisted.into_iter().map(|effect| {
+        let label = effect.display_label();
+        let detail = effect.state_line();
+        let tip = effect.tooltip();
+        h_flex()
+            .id(SharedString::from(format!("reg-{}-{}", band.evidence_id, effect.pf)))
+            .px_3()
+            .py_1()
+            .gap_2()
+            .items_start()
+            .text_size(px(10.0))
+            .text_color(if effect.preview_connected() { p.success } else { p.text_muted })
+            .child(div().flex_1().min_w_0().child(label))
+            .child(div().flex_shrink_0().child(format!("PF{}", effect.pf)))
+            .child(div().flex_shrink_0().child(detail))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+            .into_any_element()
+    });
+    ToolPanel::new(state, band.evidence_id, title)
+        .status(band_status(band))
+        .children(rows)
+        .into_any_element()
 }
 
