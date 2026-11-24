@@ -11,6 +11,7 @@ use aurora_portrait::kernels::makeup_mask_uv::{
 use aurora_portrait::kernels::makeup_material::MaskChannel;
 use aurora_portrait::{Image, Refusal};
 use serde::Deserialize;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use crate::portrait_makeup_suit_inputs::D4_CAPTURE_MASK_UV;
@@ -1436,9 +1437,77 @@ const SUIT_PRESETS_JSON: &str =
     include_str!("../../../assets/portrait/suit/presets.json");
 static SUIT_BUNDLE: OnceLock<Result<OwnedSuitBundle, Refusal>> = OnceLock::new();
 
+fn vendor_suit_field<T: serde::de::DeserializeOwned>(
+    effect: &crate::portrait_vendor_config::VendorEffect,
+    field: &str,
+) -> anyhow::Result<Option<T>> {
+    use anyhow::Context;
+    match effect.raw().get(field) {
+        None => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .with_context(|| format!("{}: invalid {field}", effect.config_rel_path)),
+    }
+}
+
+fn apply_vendor_suit_group(
+    config_path: &str,
+    json: &str,
+    passes: &mut [SuitPassSource],
+) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let effects = crate::portrait_vendor_config::parse_config(config_path, json)?;
+    ensure!(passes.len() == effects.len(), "{config_path}: pass count mismatch");
+    let prefix = config_path.strip_suffix("/effect.json").context("suit effect path")?;
+    for (pass, effect) in passes.iter_mut().zip(&effects) {
+        ensure!(
+            pass.effect == effect.effect_name
+                && effect.param_flag.is_none_or(|pf| pf == i64::from(pass.pf)),
+            "{config_path}: effect identity mismatch at pass {}", pass.order,
+        );
+        let paths: Vec<String> = vendor_suit_field(effect, "Paths")?.unwrap_or_default();
+        ensure!(
+            paths.iter().map(|path| format!("Resources/effect/config/{prefix}/{path}"))
+                .eq(pass.material_paths.iter().cloned()),
+            "{config_path}: material identity mismatch at pass {}", pass.order,
+        );
+        pass.degree = vendor_suit_field(effect, "DefaultDegree")?
+            .with_context(|| format!("{config_path}: missing DefaultDegree at pass {}", pass.order))?;
+        pass.opacity = vendor_suit_field(effect, "Opacity")?;
+        pass.filter_type = vendor_suit_field(effect, "FilterType")?;
+        pass.mix_color = vendor_suit_field(effect, "MixColor")?;
+        pass.region_rect = vendor_suit_field(effect, "ROIRect")?;
+        pass.shelter_type = vendor_suit_field(effect, "ShelterType")?;
+        pass.force_use_shelter = vendor_suit_field(effect, "ForceUseShelter")?;
+        if let Some(mask) = &mut pass.mask {
+            mask.value = vendor_suit_field(effect, &mask.field)?
+                .with_context(|| format!("{config_path}: missing {} at pass {}", mask.field, pass.order))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_vendor_suit_parameters(root: &Path, document: &mut SuitPresetDocument) -> anyhow::Result<()> {
+    use anyhow::Context;
+    for preset in &mut document.presets {
+        for passes in preset.passes.chunk_by_mut(|left, right| left.group == right.group) {
+            let config_path = format!("Makeups/Suit/{}/{}/effect.json", preset.id, passes[0].group);
+            let json = std::fs::read_to_string(root.join(&config_path))
+                .with_context(|| format!("reading {config_path}"))?;
+            apply_vendor_suit_group(&config_path, &json, passes)?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_owned_suit_bundle() -> Result<OwnedSuitBundle, Refusal> {
-    let document: SuitPresetDocument = serde_json::from_str(SUIT_PRESETS_JSON)
+    let mut document: SuitPresetDocument = serde_json::from_str(SUIT_PRESETS_JSON)
         .map_err(|_| Refusal::ShapeMismatch(SUIT_PRESETS_INVALID))?;
+    if let Some(root) = crate::portrait_vendor_config::root_from_env() {
+        read_vendor_suit_parameters(&root, &mut document).map_err(|error| {
+            log::warn!("suit vendor preset root {}: {error:#}", root.display());
+            Refusal::ShapeMismatch("suit vendor presets")
+        })?;
+    }
     let mut presets = Vec::with_capacity(document.presets.len());
     let mut separate_passes = Vec::new();
     let mut total_passes = 0usize;
@@ -2127,6 +2196,25 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         (vertices, indices)
+    }
+
+    #[test]
+    fn vendor_suit_group_applies_distinct_values_to_the_exact_passes() {
+        let mut document: SuitPresetDocument = serde_json::from_str(SUIT_PRESETS_JSON).unwrap();
+        let passes = &mut document.presets[0].passes[..2];
+        let path = "Makeups/Suit/MU00000001/Bronzer/effect.json";
+        let json = r#"{"Effects":[
+            {"EffectName":"BlusherImageMakeup","ParamFlag":90033,"Paths":["xr.png"],
+            "DefaultDegree":60,"Opacity":12,"FilterType":41,"BlusherMaskType":15},
+            {"EffectName":"BlusherImageMakeup","ParamFlag":90033,"Paths":["xr_SideFace.png"],
+            "DefaultDegree":50,"Opacity":34,"FilterType":42,"BlusherMaskType":16}
+        ]}"#;
+        apply_vendor_suit_group(path, json, passes).unwrap();
+        assert_eq!((passes[0].degree, passes[0].opacity, passes[0].filter_type), (60.0, Some(12.0), Some(41)));
+        assert_eq!((passes[1].degree, passes[1].opacity, passes[1].filter_type), (50.0, Some(34.0), Some(42)));
+        assert_eq!(passes[1].mask.as_ref().unwrap().value, 16);
+        let mismatched = json.replace("xr_SideFace.png", "wrong.png");
+        assert!(apply_vendor_suit_group(path, &mismatched, passes).is_err());
     }
 
     #[test]
