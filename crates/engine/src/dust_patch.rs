@@ -129,6 +129,61 @@ pub fn apply(rgba: &mut [u8], w: usize, h: usize, patches: &[DustPatch], gain: &
     touched
 }
 
+/// Wide-buffer twin of [`apply`]: the same rectangles and Q12 multiplier, but
+/// `out = saturate((src * gain) >> 12)` runs on `u16` samples.
+///
+/// The gain plane is still the LCC's one-byte-per-pixel `SpotData` plane, and
+/// the `bias`/`step` curve is a record expressed against 8-bit levels
+/// ([`DustPatch::gain_q12`] takes `u8`). When no plane is present a wide sample
+/// is therefore mapped back to that recording domain first; the multiply itself
+/// stays at 16 bits, so the exported buffer keeps its low bits.
+pub fn apply16(rgba: &mut [u16], w: usize, h: usize, patches: &[DustPatch], gain: &[u8]) -> usize {
+    if w == 0 || h == 0 || patches.is_empty() || rgba.len() < w * h * 4 {
+        return 0;
+    }
+    let mut touched = 0;
+    for p in patches {
+        if p.w == 0 || p.h == 0 {
+            continue;
+        }
+        let plane = p
+            .offset
+            .checked_add((p.w as u32) * (p.h as u32))
+            .and_then(|end| gain.get(p.offset as usize..end as usize));
+        let x0 = (p.x as usize).min(w);
+        let y0 = (p.y as usize).min(h);
+        let x1 = (p.x as usize + p.w as usize).min(w);
+        let y1 = (p.y as usize + p.h as usize).min(h);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * w + x) * 4;
+                for k in 0..3 {
+                    let v = rgba[i + k];
+                    let g = match &plane {
+                        Some(plane) => {
+                            p.gain_q12_at(plane[(y - y0) * p.w as usize + (x - x0)]) as u32
+                        }
+                        None => p.gain_q12(level8(v)) as u32,
+                    };
+                    rgba[i + k] = ((v as u32 * g) >> 12).min(65535) as u16;
+                }
+            }
+        }
+        touched += 1;
+    }
+    touched
+}
+
+/// Maps a 16-bit level onto the 8-bit domain the LCC dust records were
+/// authored in (round-to-nearest, `255/65535`).
+#[inline]
+fn level8(v: u16) -> u8 {
+    ((v as u32 * 255 + 32_767) / 65_535) as u8
+}
+
 /// Why dust detection could not produce patches.
 ///
 /// Kept structured so the UI can say "install the model" instead of dumping a
@@ -330,6 +385,54 @@ mod tests {
             (50, 25),
             "the rectangle must stay on the detected centre"
         );
+    }
+
+    #[test]
+    fn apply16_leaves_empty_input_untouched() {
+        let mut buf: Vec<u16> = (0..8 * 8 * 4).map(|i| ((i * 977) % 65536) as u16).collect();
+        let before = buf.clone();
+        assert_eq!(apply16(&mut buf, 8, 8, &[], &[]), 0);
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn apply16_runs_the_same_q12_multiply_on_u16() {
+        let mut buf = vec![32896u16; 4 * 4 * 4];
+        let p = patch(1, 0);
+        assert_eq!(apply16(&mut buf, 4, 4, &[p], &[]), 1);
+        let inside = (1 * 4 + 1) * 4;
+        let gain = p.gain_q12(128) as u32;
+        let want = ((32896u32 * gain) >> 12).min(65535) as u16;
+        assert_eq!(buf[inside], want);
+        assert_eq!(buf[0], 32896, "outside the rectangle must not change");
+        assert_ne!(want % 257, 0, "a wide Q12 gain must not snap to 8-bit steps");
+    }
+
+    #[test]
+    fn apply16_matches_apply_on_eight_bit_equivalent_inputs() {
+        let mut rgba8: Vec<u8> = (0..4 * 4 * 4).map(|i| ((i * 37 + i / 3) % 256) as u8).collect();
+        for px in rgba8.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let p = patch(8, 10);
+        for plane in [Vec::new(), vec![128u8, 200, 64, 250]] {
+            let mut narrow = rgba8.clone();
+            let mut wide: Vec<u16> = rgba8.iter().map(|&v| v as u16 * 257).collect();
+            let plane_arg = if plane.is_empty() { &[][..] } else { &plane[..] };
+            apply(&mut narrow, 4, 4, &[p], plane_arg);
+            apply16(&mut wide, 4, 4, &[p], plane_arg);
+            for (n, w) in narrow.chunks_exact(4).zip(wide.chunks_exact(4)) {
+                for k in 0..3 {
+                    // The 8-bit path truncates once; the 16-bit path truncates
+                    // after the same multiply, so the two stay within the one
+                    // 8-bit level that re-quantisation can cost.
+                    let diff = (w[k] as i32 - n[k] as i32 * 257).abs();
+                    assert!(diff <= 256, "channel {k}: {} vs {}", w[k], n[k] as i32 * 257);
+                }
+                assert_eq!(n[3], 255);
+                assert_eq!(w[3], 255 * 257);
+            }
+        }
     }
 
     #[test]

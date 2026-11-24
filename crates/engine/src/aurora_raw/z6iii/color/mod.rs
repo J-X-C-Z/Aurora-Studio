@@ -91,6 +91,21 @@ impl Z6iiiColorStage {
         self.trace(rgb).output
     }
 
+    /// Read-only accessors for the optional CUDA develop path. Read-only
+    /// copies of the same constants the CPU stage evaluates; no pixel math or
+    /// public signature changes.
+    pub(crate) fn pre_matrix(&self) -> [[f32; 3]; 3] {
+        self.pre_matrix
+    }
+
+    pub(crate) fn film_nodes(&self) -> &[[f32; 3]] {
+        &self.film
+    }
+
+    pub(crate) fn clut_nodes(&self) -> &[[u16; 3]] {
+        self.clut.nodes()
+    }
+
     /// Intermediate values of the colour stage for one pixel, in chain order.
     ///
     /// `linear` is the post-black/white-balance camera value, `matrix` the

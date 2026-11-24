@@ -675,6 +675,11 @@ fn luma8(p: [u8; 3]) -> f32 {
 }
 
 #[inline]
+fn luma_rgb(p: [f32; 3]) -> f32 {
+    0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
+}
+
+#[inline]
 fn clampi(v: i32, lo: i32, hi: i32) -> i32 {
     if v < lo {
         lo
@@ -1624,11 +1629,21 @@ fn stage_diffraction(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection, s
 /// `ZLENSDUSTREMOVALENABLED` + the LCC's dust rectangles. Mirrors
 /// `CImgOpApplyLCC::ApplyLCCDust`: a Q12 multiply, nothing when the table is
 /// empty (the common case for a variant without an LCC).
-fn stage_dust_removal(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+pub(crate) fn stage_dust_removal(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
     if !adj.dust_removal_enabled || adj.dust_patches.is_empty() || w == 0 || h == 0 {
         return;
     }
     crate::dust_patch::apply(buf, w, h, &adj.dust_patches, &adj.dust_gain);
+}
+
+/// 16-bit twin of [`stage_dust_removal`]: the same Q12 multiply, evaluated on
+/// the wide buffer instead of feeding an 8-bit delta back through
+/// `merge_wide_delta`.
+pub(crate) fn stage_dust_removal16(buf: &mut [u16], w: usize, h: usize, adj: &LensCorrection) {
+    if !adj.dust_removal_enabled || adj.dust_patches.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    crate::dust_patch::apply16(buf, w, h, &adj.dust_patches, &adj.dust_gain);
 }
 
 /// `ZLENSSHIFTXY` + `ZLENSTILT` as one 3x3 map, following `CResampler::UpdateGeo`:
@@ -1696,14 +1711,25 @@ fn stage_movement_impl<T: Copy + Send + Sync>(
 
 /// One separable 1D Gaussian gather along `d`, weights `exp(-4 ln2 t^2)` and
 /// `step = min(0.2, 0.5/|d|)` from `CImgOpFixRadialBlur`'s feather kernel.
-fn gauss_gather(src: &[u8], w: usize, h: usize, x: f32, y: f32, d: [f32; 2]) -> [f32; 3] {
+fn gauss_gather<T, F>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    x: f32,
+    y: f32,
+    d: [f32; 2],
+    sample: F,
+) -> [f32; 3]
+where
+    F: Fn(&[T], usize, usize, f32, f32) -> [f32; 3],
+{
     let mag = d[0].hypot(d[1]);
     if mag < 0.1 {
-        return sample_bilinear(src, w, h, x, y);
+        return sample(src, w, h, x, y);
     }
     let step = 0.2f32.min(0.5 / mag);
     let (ux, uy) = (d[0] / mag, d[1] / mag);
-    let mut acc = sample_bilinear(src, w, h, x, y);
+    let mut acc = sample(src, w, h, x, y);
     let mut sum = 1.0;
     for i in 1..=18 {
         let t = i as f32 * step;
@@ -1711,8 +1737,8 @@ fn gauss_gather(src: &[u8], w: usize, h: usize, x: f32, y: f32, d: [f32; 2]) -> 
         if weight < 1e-3 {
             break;
         }
-        let plus = sample_bilinear(src, w, h, x + ux * t, y + uy * t);
-        let minus = sample_bilinear(src, w, h, x - ux * t, y - uy * t);
+        let plus = sample(src, w, h, x + ux * t, y + uy * t);
+        let minus = sample(src, w, h, x - ux * t, y - uy * t);
         for k in 0..3 {
             acc[k] += (plus[k] + minus[k]) * weight;
         }
@@ -1724,6 +1750,26 @@ fn gauss_gather(src: &[u8], w: usize, h: usize, x: f32, y: f32, d: [f32; 2]) -> 
 /// `ZLENSRADIALBLUR`: radial then transverse 1D Gaussian gathers. `valid == 0`
 /// or `amount < 0.5` is identity, matching `CImgOpFixRadialBlur::IsIdentity`.
 pub(crate) fn stage_sharpness_falloff(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
+    stage_sharpness_falloff_impl(buf, w, h, adj, sample_bilinear, |v| {
+        v.clamp(0.0, 255.0).round() as u8
+    });
+}
+
+/// 16-bit twin of [`stage_sharpness_falloff`] for the wide export buffer.
+pub(crate) fn stage_sharpness_falloff16(buf: &mut [u16], w: usize, h: usize, adj: &LensCorrection) {
+    stage_sharpness_falloff_impl(buf, w, h, adj, sample_bilinear16, |v| {
+        v.clamp(0.0, 65535.0).round() as u16
+    });
+}
+
+fn stage_sharpness_falloff_impl<T: Copy + Send + Sync>(
+    buf: &mut [T],
+    w: usize,
+    h: usize,
+    adj: &LensCorrection,
+    sample: impl Fn(&[T], usize, usize, f32, f32) -> [f32; 3] + Sync,
+    quantize: impl Fn(f32) -> T + Sync,
+) {
     let curves = &adj.radial_blur;
     let amount = adj.sharpness_falloff;
     if !curves.valid || amount < 0.5 || w == 0 || h == 0 {
@@ -1755,22 +1801,15 @@ pub(crate) fn stage_sharpness_falloff(buf: &mut [u8], w: usize, h: usize, adj: &
                     * s;
                 let (ux, uy) = if r > 1e-6 { (dx / r, dy / r) } else { (0.0, 0.0) };
                 let d = if pass == 0 { [disp * ux, disp * uy] } else { [-disp * uy, disp * ux] };
-                let rgb = gauss_gather(&src, w, h, x as f32 + 0.5, y as f32 + 0.5, d);
+                let rgb = gauss_gather(&src, w, h, x as f32 + 0.5, y as f32 + 0.5, d, &sample);
                 let i = x * 4;
                 for k in 0..3 {
-                    row[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+                    row[i + k] = quantize(rgb[k]);
                 }
                 row[i + 3] = src[(y * w + x) * 4 + 3];
             }
         });
     }
-}
-
-/// Color and dust stages still evaluated in the narrow working buffer.
-pub(crate) fn stage_lens_extras(buf: &mut [u8], w: usize, h: usize, adj: &LensCorrection) {
-    stage_ca_fringes(buf, w, h, adj);
-    stage_purple_fringing(buf, w, h, crate::mock::purple_norm(adj.purple_fringing));
-    stage_dust_removal(buf, w, h, adj);
 }
 
 /// Capture One's measured tables. Radius is measured on the render buffer's half
@@ -2053,22 +2092,60 @@ pub(crate) fn stage_ca_fringes(buf: &mut [u8], w: usize, h: usize, adj: &LensCor
 
 /// Desaturates strongly purple pixels that sit on an edge, which is what a
 /// lateral chromatic fringe looks like. Neutral or non-purple pixels are kept.
-fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
+pub(crate) fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
+    stage_purple_fringing_impl(
+        buf,
+        w,
+        h,
+        purple,
+        255.0,
+        |v| v as f32,
+        |v| v.clamp(0.0, 255.0).round() as u8,
+    );
+}
+
+/// 16-bit twin of [`stage_purple_fringing`] for the wide export buffer. The
+/// `pn`/`edge` thresholds scale with the buffer's full range, so the 16-bit
+/// result matches the 8-bit preview instead of keeping only 257-multiples.
+pub(crate) fn stage_purple_fringing16(buf: &mut [u16], w: usize, h: usize, purple: f32) {
+    stage_purple_fringing_impl(
+        buf,
+        w,
+        h,
+        purple,
+        65535.0,
+        |v| v as f32,
+        |v| v.clamp(0.0, 65535.0).round() as u16,
+    );
+}
+
+fn stage_purple_fringing_impl<T: Copy + Default + Send + Sync>(
+    buf: &mut [T],
+    w: usize,
+    h: usize,
+    purple: f32,
+    full_scale: f32,
+    to_f32: impl Fn(T) -> f32 + Sync,
+    quantize: impl Fn(f32) -> T + Sync,
+) {
     // purple is the 0..1 normalised amount; 0.5 is C1's zero.
     let strength = crate::mock::purple_strength(purple);
     if strength == 0.0 || w == 0 || h == 0 || buf.len() != w * h * 4 {
         return;
     }
+    // `40` is the edge knee measured in 8-bit levels; express it in the
+    // buffer's own scale so the wide path sees the same visual threshold.
+    let edge_knee = 40.0 * full_scale / 255.0;
     let row_bytes = w * 4;
     let mut source_band = Vec::new();
-    let mut previous = vec![0u8; row_bytes];
+    let mut previous = vec![T::default(); row_bytes];
     let mut y0 = 0usize;
     while y0 < h {
         let y1 = (y0 + PURPLE_BAND_ROWS).min(h);
         let source_y0 = y0.saturating_sub(1);
         let source_y1 = (y1 + 1).min(h);
         let source_rows = source_y1 - source_y0;
-        source_band.resize(source_rows * row_bytes, 0);
+        source_band.resize(source_rows * row_bytes, T::default());
 
         for gy in source_y0..source_y1 {
             let dst = (gy - source_y0) * row_bytes;
@@ -2092,15 +2169,16 @@ fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
                 for x in 0..w {
                     let i = x * 4;
                     let j = (y - source_y0) * row_bytes + x * 4;
-                    let p = [source_band[j], source_band[j + 1], source_band[j + 2]];
-                    let r = p[0] as f32;
-                    let g = p[1] as f32;
-                    let b = p[2] as f32;
-                    let pn = ((r.min(b) - g) / 255.0).clamp(0.0, 1.0);
+                    let p = [
+                        to_f32(source_band[j]),
+                        to_f32(source_band[j + 1]),
+                        to_f32(source_band[j + 2]),
+                    ];
+                    let pn = ((p[0].min(p[2]) - p[1]) / full_scale).clamp(0.0, 1.0);
                     if pn <= 0.0 {
                         continue;
                     }
-                    let mut lo = 255.0f32;
+                    let mut lo = full_scale;
                     let mut hi = 0.0f32;
                     for dy in -1i32..=1 {
                         for dx in -1i32..=1 {
@@ -2110,24 +2188,24 @@ fn stage_purple_fringing(buf: &mut [u8], w: usize, h: usize, purple: f32) {
                             let xx = clampi(x as i32 + dx, 0, w as i32 - 1) as usize;
                             let yy = clampi(y as i32 + dy, 0, h as i32 - 1) as usize;
                             let n = (yy - source_y0) * row_bytes + xx * 4;
-                            let l = luma8([
-                                source_band[n],
-                                source_band[n + 1],
-                                source_band[n + 2],
+                            let l = luma_rgb([
+                                to_f32(source_band[n]),
+                                to_f32(source_band[n + 1]),
+                                to_f32(source_band[n + 2]),
                             ]);
                             lo = lo.min(l);
                             hi = hi.max(l);
                         }
                     }
-                    let edge = ((hi - lo) / 40.0).clamp(0.0, 1.0);
+                    let edge = ((hi - lo) / edge_knee).clamp(0.0, 1.0);
                     let amount = strength * pn * edge;
                     if amount == 0.0 {
                         continue;
                     }
-                    let gray = luma8(p);
+                    let gray = luma_rgb(p);
                     for k in 0..3 {
-                        let v = p[k] as f32 * (1.0 - amount) + gray * amount;
-                        row[i + k] = v.clamp(0.0, 255.0).round() as u8;
+                        let v = p[k] * (1.0 - amount) + gray * amount;
+                        row[i + k] = quantize(v);
                     }
                 }
             });
@@ -3642,6 +3720,42 @@ over1={over1} diff_px={diff_px}",
         assert_eq!(buf[(12 * 16 + 12) * 4], 90, "outside the patch is untouched");
     }
 
+    #[test]
+    fn dust_removal16_is_identity_when_disabled_or_empty() {
+        let base: Vec<u16> = (0..16 * 16 * 4).map(|i| ((i * 331) % 65536) as u16).collect();
+        let mut buf = base.clone();
+        let mut adj = off();
+        stage_dust_removal16(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(buf, base, "unarmed dust removal is identity");
+        adj.lens.dust_removal_enabled = true;
+        stage_dust_removal16(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(buf, base, "an empty patch list is identity");
+    }
+
+    #[test]
+    fn dust_removal16_keeps_bits_below_the_eight_bit_steps() {
+        let mut adj = off();
+        adj.lens.dust_removal_enabled = true;
+        adj.lens.dust_patches = vec![crate::DustPatch {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+            offset: 0,
+            bias: 0,
+            // ~1.02x at mid-grey: small enough that 8-bit quantisation would
+            // swallow most of it, but visible in the 16-bit buffer.
+            step: 1,
+        }];
+        let base: Vec<u16> = vec![128 * 257; 16 * 16 * 4];
+        let mut buf = base.clone();
+        stage_dust_removal16(&mut buf, 16, 16, &adj.lens);
+        let inside = buf[0];
+        assert!(inside > base[0], "the patch must brighten mid-grey");
+        assert_ne!(inside % 257, 0, "the Q12 multiply must not snap to 8-bit steps");
+        assert_eq!(buf[(12 * 16 + 12) * 4], base[(12 * 16 + 12) * 4]);
+    }
+
     fn sharp_curves() -> RadialBlur {
         RadialBlur {
             radial: vec![(0.0, 0.0), (1.0, 200000.0)],
@@ -3681,6 +3795,124 @@ over1={over1} diff_px={diff_px}",
         adj.lens.radial_blur = sharp_curves();
         post_process(&mut buf, 32, 32, &adj, 1.0);
         assert_ne!(base, buf, "a valid curve must reach the pixels");
+    }
+
+    /// The pre-16-bit body, serial, kept as the byte-exact counterpart of the
+    /// generic stage so the 8-bit preview path cannot drift.
+    fn sharpness_falloff_u8_reference(
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        adj: &LensCorrection,
+    ) {
+        let curves = &adj.radial_blur;
+        let amount = adj.sharpness_falloff;
+        if !curves.valid || amount < 0.5 || w == 0 || h == 0 {
+            return;
+        }
+        if curves.radial.is_empty() && curves.transverse.is_empty() {
+            return;
+        }
+        let s = std::f32::consts::SQRT_2 / (((w * w + h * h) as f32).sqrt()).max(1.0);
+        let scale = amount * 0.01 * s;
+        let nodes = |points: &[(f32, f32)]| -> Vec<(f32, f32)> {
+            points.iter().map(|&(x, y)| (s * x, scale * y)).collect()
+        };
+        let radial = nodes(&curves.radial);
+        let transverse = nodes(&curves.transverse);
+        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+        let gather = |src: &[u8], x: f32, y: f32, d: [f32; 2]| -> [f32; 3] {
+            let mag = d[0].hypot(d[1]);
+            if mag < 0.1 {
+                return sample_bilinear(src, w, h, x, y);
+            }
+            let step = 0.2f32.min(0.5 / mag);
+            let (ux, uy) = (d[0] / mag, d[1] / mag);
+            let mut acc = sample_bilinear(src, w, h, x, y);
+            let mut sum = 1.0;
+            for i in 1..=18 {
+                let t = i as f32 * step;
+                let weight = (-4.0 * std::f32::consts::LN_2 * t * t).exp();
+                if weight < 1e-3 {
+                    break;
+                }
+                let plus = sample_bilinear(src, w, h, x + ux * t, y + uy * t);
+                let minus = sample_bilinear(src, w, h, x - ux * t, y - uy * t);
+                for k in 0..3 {
+                    acc[k] += (plus[k] + minus[k]) * weight;
+                }
+                sum += 2.0 * weight;
+            }
+            [acc[0] / sum, acc[1] / sum, acc[2] / sum]
+        };
+        for (pass, curve) in [&radial, &transverse].into_iter().enumerate() {
+            if curve.is_empty() {
+                continue;
+            }
+            let src = buf.to_vec();
+            for y in 0..h {
+                for x in 0..w {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dy = y as f32 + 0.5 - cy;
+                    let r = dx.hypot(dy);
+                    let disp = crate::mock::lens_profile::LensWarp::sample_curve(curve, r)
+                        .clamp(0.0, 11.0)
+                        * s;
+                    let (ux, uy) = if r > 1e-6 { (dx / r, dy / r) } else { (0.0, 0.0) };
+                    let d = if pass == 0 { [disp * ux, disp * uy] } else { [-disp * uy, disp * ux] };
+                    let rgb = gather(&src, x as f32 + 0.5, y as f32 + 0.5, d);
+                    let i = (y * w + x) * 4;
+                    for k in 0..3 {
+                        buf[i + k] = rgb[k].clamp(0.0, 255.0).round() as u8;
+                    }
+                    buf[i + 3] = src[i + 3];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sharpness_falloff_u8_matches_the_pre_16_bit_reference() {
+        let (w, h) = (41usize, 37usize);
+        let base: Vec<u8> = (0..w * h * 4).map(|i| ((i * 53 + i / 9) % 256) as u8).collect();
+        let mut adj = off();
+        adj.lens.sharpness_falloff = 100.0;
+        adj.lens.radial_blur = sharp_curves();
+        let mut expected = base.clone();
+        let mut actual = base;
+        sharpness_falloff_u8_reference(&mut expected, w, h, &adj.lens);
+        stage_sharpness_falloff(&mut actual, w, h, &adj.lens);
+        assert_eq!(actual, expected, "the 8-bit preview path must stay byte-identical");
+    }
+
+    #[test]
+    fn sharpness_falloff16_zero_and_invalid_are_identity() {
+        let base: Vec<u16> = checkerboard(16).iter().map(|&v| v as u16 * 257).collect();
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.sharpness_falloff = 0.0;
+        adj.lens.radial_blur = sharp_curves();
+        stage_sharpness_falloff16(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(buf, base);
+        adj.lens.sharpness_falloff = 100.0;
+        adj.lens.radial_blur = RadialBlur { valid: false, ..sharp_curves() };
+        stage_sharpness_falloff16(&mut buf, 16, 16, &adj.lens);
+        assert_eq!(buf, base);
+    }
+
+    #[test]
+    fn sharpness_falloff16_keeps_bits_below_the_eight_bit_steps() {
+        let base: Vec<u16> = checkerboard(32).iter().map(|&v| v as u16 * 257).collect();
+        let mut buf = base.clone();
+        let mut adj = off();
+        adj.lens.sharpness_falloff = 100.0;
+        adj.lens.radial_blur = sharp_curves();
+        stage_sharpness_falloff16(&mut buf, 32, 32, &adj.lens);
+        assert_ne!(buf, base, "a valid curve must reach the wide pixels");
+        assert!(
+            buf.iter().zip(&base).any(|(a, b)| a != b && a % 257 != 0),
+            "the 16-bit gather must keep low bits"
+        );
     }
 
     #[test]
@@ -4121,6 +4353,33 @@ over1={over1} diff_px={diff_px}",
                 assert_eq!(&up[i * 4..i * 4 + 4], &base[i * 4..i * 4 + 4]);
             }
         }
+    }
+
+    #[test]
+    fn purple16_zero_amount_is_byte_identical() {
+        let mut buf: Vec<u16> = purple_probe().iter().map(|&v| v as u16 * 257).collect();
+        let base = buf.clone();
+        stage_purple_fringing16(&mut buf, 3, 3, crate::mock::purple_norm(0.0));
+        assert_eq!(buf, base, "0 is C1's purple identity");
+    }
+
+    #[test]
+    fn purple16_keeps_bits_below_the_eight_bit_steps() {
+        // Purple centre on a black/white ring: strength, pn and edge are all
+        // near their maximum, so the desaturation is the only thing changing.
+        let mut buf: Vec<u16> = purple_probe()
+            .iter()
+            .map(|&v| (v as u32 * 257 + 13).min(65535) as u16)
+            .collect();
+        let base = buf.clone();
+        stage_purple_fringing16(&mut buf, 3, 3, crate::mock::purple_norm(50.0));
+        let centre = 4 * 4;
+        assert_ne!(&buf[centre..centre + 3], &base[centre..centre + 3]);
+        assert!(
+            (0..3).any(|k| buf[centre + k] != base[centre + k] && buf[centre + k] % 257 != 0),
+            "the 16-bit blend must keep low bits: {:?}",
+            &buf[centre..centre + 3]
+        );
     }
 
     // ── Lateral chromatic aberration (six-curve profile table) ─────────────

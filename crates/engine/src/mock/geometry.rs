@@ -187,8 +187,11 @@ impl KeystoneMap {
         }
         let (a, b) = (vertical * amount * 0.35, horizontal * amount * 0.35);
         // Frame corners are the unit square; they sample a trapezoid in the source.
+        // Vertical insets the top edge symmetrically; horizontal shortens the
+        // left edge, so the output's left-side rows stretch — the sign measured
+        // from C1's `kx-0.4.tif` (wider left span, shorter left source edge).
         let from = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let to = [[a, b], [1.0 - a, 0.0], [1.0, 1.0 - b], [0.0, 1.0]];
+        let to = [[a, b], [1.0 - a, 0.0], [1.0, 1.0], [0.0, 1.0 - b]];
         let m = solve_homography(from, to).unwrap_or(IDENTITY);
         Self { m, stretch, stretch_x, shear }
     }
@@ -927,8 +930,92 @@ mod tests {
         let (a, b) = (0.6 * 0.35, -0.4 * 0.35);
         assert_near(frame_to_source([0.0, 0.0], &g, SRC), [a, b]);
         assert_near(frame_to_source([1.0, 0.0], &g, SRC), [1.0 - a, 0.0]);
-        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.0, 1.0 - b]);
+        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.0, 1.0]);
+        assert_near(frame_to_source([0.0, 1.0], &g, SRC), [0.0, 1.0 - b]);
+    }
+
+    /// A positive horizontal keystone shortens the *source* left edge, which
+    /// stretches rows on the output's left side. C1's `kx-0.4.tif` shows that
+    /// sign: the left column spans 900.5 px and the right one 898 px, while
+    /// the vertical lines stay upright. The engine must use the same sign.
+    #[test]
+    fn horizontal_keystone_shortens_the_left_source_edge() {
+        let g = Geometry {
+            keystone: Keystone { horizontal: 40.0, amount: 100.0, ..Default::default() },
+            ..Default::default()
+        };
+        let map = FrameMap::new(SRC, &g);
+        let left = [map.map([0.0, 0.0]).1, map.map([0.0, 1.0]).1];
+        let right = [map.map([1.0, 0.0]).1, map.map([1.0, 1.0]).1];
+        let left_height = (left[1][1] - left[0][1]).abs();
+        let right_height = (right[1][1] - right[0][1]).abs();
+        assert!(left_height < right_height - 1e-3, "left {left_height} right {right_height}");
+
+        // Source rows keep their spacing; on the output the left side spans a
+        // shorter source segment, so those rows spread further apart.
+        let left_top = map.frame_from_source([0.0, 0.25]).expect("left edge")[1];
+        let left_bottom = map.frame_from_source([0.0, 0.75]).expect("left edge")[1];
+        let right_top = map.frame_from_source([1.0, 0.25]).expect("right edge")[1];
+        let right_bottom = map.frame_from_source([1.0, 0.75]).expect("right edge")[1];
+        assert!(
+            left_bottom - left_top > right_bottom - right_top + 1e-3,
+            "left {left_top}..{left_bottom} right {right_top}..{right_bottom}"
+        );
+        assert!(frame_to_source([0.0, 0.0], &g, SRC)[1] > 0.0);
+        assert!(frame_to_source([0.0, 1.0], &g, SRC)[1] < 1.0);
+    }
+
+    /// Vertical-only keystones must keep the exact corners the old quad had;
+    /// only the horizontal (`b`) terms changed.
+    #[test]
+    fn vertical_only_keystone_keeps_the_old_corners() {
+        let g = Geometry {
+            keystone: Keystone { vertical: 60.0, amount: 100.0, ..Default::default() },
+            ..Default::default()
+        };
+        let a = 0.6 * 0.35;
+        assert_near(frame_to_source([0.0, 0.0], &g, SRC), [a, 0.0]);
+        assert_near(frame_to_source([1.0, 0.0], &g, SRC), [1.0 - a, 0.0]);
+        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.0, 1.0]);
         assert_near(frame_to_source([0.0, 1.0], &g, SRC), [0.0, 1.0]);
+    }
+
+    #[test]
+    fn horizontal_keystone_non_finite_inputs_stay_finite() {
+        for horizontal in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e9, -1e9] {
+            let g = Geometry {
+                keystone: Keystone {
+                    vertical: f32::NAN,
+                    horizontal,
+                    amount: 100.0,
+                    aspect: f32::NAN,
+                    skew: f32::NAN,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let map = FrameMap::new(SRC, &g);
+            for f in [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [0.0, 1.0],
+                [0.5, 0.5],
+                [f32::NAN, 0.5],
+                [0.5, f32::INFINITY],
+            ] {
+                let (oriented, source) = map.map(f);
+                assert!(
+                    oriented[0].is_finite()
+                        && oriented[1].is_finite()
+                        && source[0].is_finite()
+                        && source[1].is_finite(),
+                    "{horizontal} at {f:?}: {oriented:?} {source:?}"
+                );
+            }
+            let (w, h) = map.frame_size();
+            assert!(w.is_finite() && h.is_finite(), "{horizontal}: {w}x{h}");
+        }
     }
 
     #[test]
