@@ -15,6 +15,46 @@ pub use c1_raw_he::decode_frame_cropped;
 
 use std::path::Path;
 
+/// How the Z6III OpenCL reconstruction attempt ended.
+///
+/// This is finer than [`AuroraRoute`]: it keeps "no device" distinct from
+/// "device present, reconstruction failed" so a decode can report the truth
+/// rather than just "not OpenCL".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OpenClRoute {
+    /// The file is not a recognised Z6III HE NEF.
+    NotZ6iii,
+    /// The OpenCL pipeline produced the frame.
+    Succeeded,
+    /// This machine has no compatible OpenCL device.
+    Unavailable,
+    /// The device was present but the reconstruction failed.
+    Failed,
+}
+
+/// Which branch of [`decode_he_rgba16_traced`] produced the samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AuroraRoute {
+    /// Z6III HE NEF reconstructed through OpenCL.
+    Z6iiiOpenCl,
+    /// Z6III HE NEF detected, but OpenCL was unavailable; the CPU C1 chain ran.
+    Z6iiiCpuOpenClUnavailable,
+    /// Z6III HE NEF detected, but the OpenCL reconstruction failed; CPU C1 ran.
+    Z6iiiCpuOpenClFailed,
+    /// Generic Bayer or X-Trans CPU C1 chain.
+    Cpu,
+}
+
+impl AuroraRoute {
+    fn cpu_fallback(opencl: OpenClRoute) -> Self {
+        match opencl {
+            OpenClRoute::Unavailable => Self::Z6iiiCpuOpenClUnavailable,
+            OpenClRoute::Failed => Self::Z6iiiCpuOpenClFailed,
+            _ => Self::Cpu,
+        }
+    }
+}
+
 /// Full-frame RGB16 through the C1 chain:
 /// 1. Z6III HE NEF -> `z6iii::render_linear_rgba16` (OpenCL full reconstruct + linear CA +
 ///    highlight recovery + anti-alias);
@@ -22,6 +62,13 @@ use std::path::Path;
 /// 3. Any standard 2x2 Bayer RAW (Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.) ->
 ///    C1 Stage 1/2/3 over 128-pixel tiles with camera-specific ISO noise + linear CA + linear denoise.
 pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
+    decode_he_rgba16_traced(path).map(|(width, height, pixels, _)| (width, height, pixels))
+}
+
+/// [`decode_he_rgba16`] plus which branch produced the pixels.
+pub fn decode_he_rgba16_traced(
+    path: &Path,
+) -> Option<(u32, u32, Vec<u16>, AuroraRoute)> {
     let bytes = std::fs::read(path).ok()?;
     let orientation = crate::raw::exif_orientation_bytes(&bytes).unwrap_or(1);
     let libraw_frame = crate::raw::decode_bayer16(path).ok();
@@ -35,11 +82,18 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
         .filter(|warp| !warp.red.is_empty() || !warp.blue.is_empty());
 
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    if let Some((width, height, rgba)) =
-        z6iii::render_linear_rgba16(&bytes, libraw_bayer, ca_warp.as_ref())
-    {
-        return Some(orient_rgba16(rgba, width, height, orientation));
+    let (z6iii_frame, opencl) =
+        z6iii::render_linear_rgba16_traced(&bytes, libraw_bayer, ca_warp.as_ref());
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    let (z6iii_frame, opencl) = (None, OpenClRoute::NotZ6iii);
+
+    if let Some((width, height, rgba)) = z6iii_frame {
+        let (width, height, pixels) = orient_rgba16(rgba, width, height, orientation);
+        return Some((width, height, pixels, AuroraRoute::Z6iiiOpenCl));
     }
+    // `Succeeded` cannot reach here: the frame moved out above. Any other
+    // non-`NotZ6iii` value means the CPU C1 chain is the fallback.
+    let cpu_route = AuroraRoute::cpu_fallback(opencl);
 
     let iso = exif.iso.unwrap_or(100);
     let noise = lookup_camera_noise(exif.camera_model.as_deref(), iso);
@@ -51,7 +105,8 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
             #[cfg(all(windows, feature = "z6iii-raw-export"))]
             finish_linear_stages(&mut rgb, width, height, iso, noise, ca_warp.as_ref());
             let out = pack_rgba16(&rgb);
-            return Some(orient_rgba16(out, width, height, orientation));
+            let (width, height, pixels) = orient_rgba16(out, width, height, orientation);
+            return Some((width, height, pixels, cpu_route));
         }
     }
 
@@ -78,7 +133,8 @@ pub fn decode_he_rgba16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
         finish_linear_stages(&mut rgb, width, height, iso, noise, None);
     }
     let out = pack_rgba16(&rgb);
-    Some(orient_rgba16(out, width, height, orientation))
+    let (width, height, pixels) = orient_rgba16(out, width, height, orientation);
+    Some((width, height, pixels, cpu_route))
 }
 
 fn lookup_camera_noise(model: Option<&str>, iso: u32) -> [f32; 2] {

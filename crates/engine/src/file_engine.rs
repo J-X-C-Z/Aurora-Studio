@@ -281,7 +281,7 @@ fn write_stale(package: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn raw16_source(path: &Path) -> Option<Source> {
+fn raw16_source(path: &Path) -> Option<(Source, crate::raw::DecodeProvenance)> {
     if is_cop(path) {
         return None;
     }
@@ -1432,16 +1432,8 @@ impl FileEngine {
             path.clone()
         };
         let mut decoded_reason = None;
-        let (source, c1_z6iii_linear) = match raw16_source(&decoded_path) {
-            Some(source) => {
-                #[cfg(all(windows, feature = "z6iii-raw-export"))]
-                let z6iii = crate::raw::c1_raw_enabled()
-                    && decoded_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nef"))
-                    && crate::z6iii::is_z6iii_nef_file(&decoded_path);
-                #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-                let z6iii = false;
-                (source, z6iii)
-            }
+        let (source, provenance) = match raw16_source(&decoded_path) {
+            Some((source, provenance)) => (source, provenance),
             None => {
                 let img = if is_cop(&decoded_path) {
                     match crate::jxl::decode_cop(&path) {
@@ -1488,11 +1480,16 @@ impl FileEngine {
                 } else {
                     img
                 };
-                (Source::from_rgba(w, h, img.as_raw()), false)
+                (
+                    Source::from_rgba(w, h, img.as_raw()),
+                    crate::raw::decode_fallback_provenance(&decoded_path),
+                )
             }
         };
-        let camera_preview =
-            crate::raw::is_raw(&decoded_path) && crate::raw::from_sensor(&decoded_path) == Some(false);
+        // The decoded provenance is the only authority for the preview flag and
+        // for the C1 Z6III pre-matrix: a LibRaw or embedded-preview fallback
+        // must never take the camera-linear path.
+        let camera_preview = provenance.pixel_space == crate::raw::PixelSpace::EmbeddedPreview;
         if camera_preview {
             decoded_reason = Some("unsupported RAW compression; showing the camera's embedded preview".into());
         }
@@ -1504,7 +1501,7 @@ impl FileEngine {
             source
                 .with_lens_shot(lens)
                 .with_camera_preview(camera_preview)
-                .with_c1_z6iii_linear(c1_z6iii_linear)
+                .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear())
                 .with_banding_identity(
                     banding_exif.as_ref().and_then(|exif| exif.iso),
                     banding_exif.as_ref().and_then(|exif| exif.camera_model.as_deref()),
@@ -1562,12 +1559,12 @@ impl FileEngine {
         }
         let source = (|| {
             let path = if is_eip(&path) { materialize_eip(&self.root, &path).ok()?.raw } else { path };
-            let source = crate::raw_cache::get_or_decode_source16(&path, 0)?;
-            #[cfg(all(windows, feature = "z6iii-raw-export"))]
-            let z6iii = crate::raw::c1_raw_enabled() && crate::z6iii::is_z6iii_nef_file(&path);
-            #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-            let z6iii = false;
-            Some(Arc::new(source.with_lens_shot(lens).with_c1_z6iii_linear(z6iii)))
+            let (source, provenance) = crate::raw_cache::get_or_decode_source16(&path, 0)?;
+            Some(Arc::new(
+                source
+                    .with_lens_shot(lens)
+                    .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear()),
+            ))
         })();
         if source.is_none() {
             log::warn!("native RAW source unavailable for {image:?}");
@@ -3485,6 +3482,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decode_provenance_is_the_only_c1_z6iii_linear_switch() {
+        use crate::raw::{DecodeBackend, DecodeProvenance, OpenClStatus, PixelSpace};
+
+        let opencl =
+            DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl);
+        assert!(opencl.unlocks_c1_z6iii_linear());
+        assert_eq!(opencl.pixel_space, PixelSpace::CameraLinear16);
+
+        // OpenCL failing into the CPU C1 chain still yields camera-linear Z6III
+        // samples, but the failure state stays visible.
+        let cpu_failed = DecodeProvenance::aurora(
+            crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed,
+        );
+        assert!(cpu_failed.unlocks_c1_z6iii_linear());
+        assert_eq!(cpu_failed.opencl, OpenClStatus::Failed);
+
+        // LibRaw and preview fallbacks must never unlock the pre-matrix.
+        let libraw = DecodeProvenance::libraw16();
+        assert_eq!(libraw.backend, DecodeBackend::LibRaw);
+        assert_eq!(libraw.pixel_space, PixelSpace::LibRawLinear16);
+        assert!(!libraw.unlocks_c1_z6iii_linear());
+        let preview = DecodeProvenance::camera_preview();
+        assert_eq!(preview.pixel_space, PixelSpace::EmbeddedPreview);
+        assert!(!preview.unlocks_c1_z6iii_linear());
+
+        // Generic Bayer is camera-linear but not Z6III.
+        let generic = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Cpu);
+        assert_eq!(generic.pixel_space, PixelSpace::CameraLinear16);
+        assert!(!generic.unlocks_c1_z6iii_linear());
+    }
+
+    #[test]
     fn aicgr_target_style_changes_exposure_and_white_balance_against_the_old_path() {
         use base64::Engine as _;
         use crate::matchlook::{LookPrediction, LOOK_BW_VECTOR, LOOK_COLOR_VECTOR};
@@ -3796,11 +3825,11 @@ mod tests {
         }
 
         let started = Instant::now();
-        let cold = raw16_source(&path).expect("cold cached source");
+        let cold = raw16_source(&path).expect("cold cached source").0;
         let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
         drop(cold);
         let started = Instant::now();
-        let warm = raw16_source(&path).expect("warm cached source");
+        let warm = raw16_source(&path).expect("warm cached source").0;
         let warm_ms = started.elapsed().as_secs_f64() * 1000.0;
         println!(
             "NEF_FILE_ENGINE_SOURCE cold={cold_ms:.1} ms warm={warm_ms:.1} ms speedup={:.2}x",
