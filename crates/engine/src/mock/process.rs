@@ -116,7 +116,7 @@ struct SourceSampleKey {
 /// not move geometry reuses every tile it can keep in the byte budget.
 const SAMPLE_TILE: u32 = 256;
 /// Sampled-tile bytes kept between frames. Overridable with
-/// `AURORA_SAMPLE_TILE_BUDGET_MB`; eviction is oldest-inserted first.
+/// `AURORA_SAMPLE_TILE_BUDGET_MB`; tiles and sampling keys use LRU eviction.
 const SAMPLE_TILE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
 const EMPTY_SAMPLE: SourceSample = SourceSample { rgb: [0.0; 3], valid: false };
@@ -319,6 +319,28 @@ mod sample_tile_cache_tests {
         assert!(cache.lookup(&key(0), 0, 0).is_none());
         assert!(cache.lookup(&key(MAX_SAMPLE_CACHE_KEYS as u64), 0, 0).is_some());
         assert_eq!(cache.stores.len(), MAX_SAMPLE_CACHE_KEYS);
+    }
+
+    #[test]
+    fn cache_hit_promotes_key_before_key_limit_eviction() {
+        let mut cache = TileCache::default();
+        for source in 0..MAX_SAMPLE_CACHE_KEYS as u64 {
+            cache.insert(&key(source), 0, 0, tile(), 1024 * 1024);
+        }
+
+        // Refresh the oldest key, then insert one more key. Key 1, not key 0,
+        // must be evicted.
+        assert!(cache.lookup(&key(0), 0, 0).is_some());
+        cache.insert(
+            &key(MAX_SAMPLE_CACHE_KEYS as u64),
+            0,
+            0,
+            tile(),
+            1024 * 1024,
+        );
+
+        assert!(cache.lookup(&key(0), 0, 0).is_some());
+        assert!(cache.lookup(&key(1), 0, 0).is_none());
     }
 
     #[test]
