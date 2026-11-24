@@ -1270,6 +1270,8 @@ pub struct FileEngine {
     native_decode: Mutex<()>,
     /// Bounded, priority-aware admission per decode class.
     decode_gates: DecodeGates,
+    /// Serializes the final cancel check against export publication (`gate -> state`).
+    publish_gate: Arc<Mutex<()>>,
     store: Option<Store>,
     /// A C1 catalog is read-only: opening it must not save the imported index.
     c1_catalog: bool,
@@ -1460,6 +1462,7 @@ impl FileEngine {
             flights: Mutex::new(HashMap::new()),
             native_decode: Mutex::new(()),
             decode_gates: DecodeGates::new(cache_bytes),
+            publish_gate: Arc::new(Mutex::new(())),
             store,
             c1_catalog: false,
             c1_catalog_path: None,
@@ -1537,6 +1540,7 @@ impl FileEngine {
             flights: Mutex::new(HashMap::new()),
             native_decode: Mutex::new(()),
             decode_gates: DecodeGates::new(cache_bytes),
+            publish_gate: Arc::new(Mutex::new(())),
             store,
             c1_catalog: true,
             c1_catalog_path: Some(import.catalog_path.clone()),
@@ -3974,6 +3978,7 @@ impl ImageEngine for FileEngine {
         job.recipe.format.ensure_supported()?;
         job.recipe.format.supports_bit_depth(job.recipe.bit_depth)?;
         let state = self.state.clone();
+        let publish_gate = self.publish_gate.clone();
         let job_id = job.job_id;
         let render = {
             let st = state.lock();
@@ -4091,10 +4096,18 @@ impl ImageEngine for FileEngine {
                     }
                 })();
                 let written = written?;
+                // The gate makes the final cancel check and the publish one
+                // step: `cancel_job` takes the same gate, so a cancel that
+                // returns `true` happened before this publish and the job is
+                // dropped below; a publish that got here first records `Done`
+                // under the gate and `cancel_job` then reports `false`.
+                let _gate = publish_gate.lock();
                 if cancelled(&state) {
                     anyhow::bail!("cancelled");
                 }
-                staged.publish(&written)
+                let output = staged.publish(&written)?;
+                state.lock().jobs.insert(job_id, JobStatus::Done { output: output.clone() });
+                Ok(output)
             })();
             let mut state = state.lock();
             if !state.cancelled.contains(&job_id) {
@@ -4127,6 +4140,10 @@ impl ImageEngine for FileEngine {
     }
 
     fn cancel_job(&self, job_id: u64) -> bool {
+        // Same gate as the export's publish point: either the cancel lands
+        // before the publish (and the job is dropped) or the publish lands
+        // first and the job is already `Done` here. Lock order: gate, state.
+        let _gate = self.publish_gate.lock();
         let mut st = self.state.lock();
         match st.jobs.get(&job_id) {
             Some(JobStatus::Queued) | Some(JobStatus::Running { .. }) => {
@@ -5932,6 +5949,38 @@ mod tests {
                 std::fs::read_dir(&out).unwrap().flatten().count() == 1,
                 "a cancelled export publishes nothing"
             );
+        }
+    }
+
+    #[test]
+    fn a_cancel_that_reports_true_never_leaves_a_published_file() {
+        // The publish gate makes this a two-outcome guarantee: either
+        // `cancel_job` wins and no file appears, or the publish wins and the
+        // job is already `Done` when `cancel_job` runs (it returns false).
+        for attempt in 0..8 {
+            let fixture = export_fixture(&format!("cancel-gate-{attempt}"));
+            let out = fixture.dir.join("Output");
+            std::fs::create_dir_all(&out).unwrap();
+            fixture
+                .engine
+                .start_export(ExportJob { job_id: 1, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(attempt as u64 * 400));
+            let cancelled = fixture.engine.cancel_job(1);
+            let status = wait_export(&fixture.engine, 1);
+            let published = std::fs::read_dir(&out)
+                .unwrap()
+                .flatten()
+                .filter(|entry| !crate::output::is_staging_path(&entry.path()))
+                .count();
+
+            if cancelled {
+                assert!(matches!(status, JobStatus::Failed { .. }), "cancelled job must not be Done");
+                assert_eq!(published, 0, "cancel_job == true must publish nothing (attempt {attempt})");
+            } else {
+                assert!(matches!(status, JobStatus::Done { .. }), "uncancelled job must finish");
+                assert_eq!(published, 1, "a finished export publishes exactly one file");
+            }
         }
     }
 

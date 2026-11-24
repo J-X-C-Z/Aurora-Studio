@@ -549,7 +549,10 @@ pub(crate) fn vignette_plane(
     let out_bytes =
         unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4) };
     let done = with_pool(bytes, 0, 0, |pool| {
-        let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+        let plane = pool
+            .gpu
+            .handle(Slot::Scratch)
+            .ok_or(Failure::Invalid("plane slot"))?;
         launch_vignette(&mut pool.gpu, plane, width, height, region, method, amount, aspect, center)?;
         pool.gpu.download(Slot::Scratch, out_bytes)
     });
@@ -587,8 +590,14 @@ pub(crate) fn lcc_plane(grid: &GpuLccGrid, width: usize, height: usize) -> Optio
         // Three arrays in one node buffer: luminance, then slope_x, then slope_y.
         let packed = pack_lcc_nodes(grid, nodes);
         pool.gpu.upload(Slot::Aux2, node_bytes_slice(&packed))?;
-        let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
-        let nodes_handle = pool.gpu.handle(Slot::Aux2).expect("node slot");
+        let plane = pool
+            .gpu
+            .handle(Slot::Scratch)
+            .ok_or(Failure::Invalid("plane slot"))?;
+        let nodes_handle = pool
+            .gpu
+            .handle(Slot::Aux2)
+            .ok_or(Failure::Invalid("node slot"))?;
         launch_lcc(
             &mut pool.gpu,
             plane,
@@ -641,7 +650,10 @@ pub(crate) fn grain_stage(
     let (ox, oy) = super::grain::noise_offsets();
 
     with_pool(bytes, node_bytes, taps.len() * 4, |pool| {
-        let rgba_handle = pool.gpu.handle(Slot::Frame).expect("frame slot");
+        let rgba_handle = pool
+            .gpu
+            .handle(Slot::Frame)
+            .ok_or(Failure::Invalid("frame slot"))?;
         let tap_handle = pool.taps();
         let stats_handle = pool.stats();
         pool.gpu.upload(Slot::Frame, rgba)?;
@@ -654,8 +666,14 @@ pub(crate) fn grain_stage(
         let (mut w_i, mut h_i) = (w as i32, h as i32);
         let (mut ox, mut oy) = (ox, oy);
         let mut rgba_ptr = rgba_handle;
-        let mut plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
-        let mut tmp = pool.gpu.handle(Slot::Aux0).expect("tmp slot");
+        let mut plane = pool
+            .gpu
+            .handle(Slot::Scratch)
+            .ok_or(Failure::Invalid("plane slot"))?;
+        let mut tmp = pool
+            .gpu
+            .handle(Slot::Aux0)
+            .ok_or(Failure::Invalid("tmp slot"))?;
         if !composite {
             let mut gain = amount * super::grain::GRAIN_GAIN_V1;
             launch2(&mut pool.gpu, "grain_v1_kernel", w, h, [
@@ -696,7 +714,10 @@ pub(crate) fn grain_stage(
                 ])?;
             }
             // Row totals, then one block over the rows: deterministic order.
-            let row_base = pool.gpu.handle(Slot::Aux2).expect("row totals slot");
+            let row_base = pool
+                .gpu
+                .handle(Slot::Aux2)
+                .ok_or(Failure::Invalid("row totals slot"))?;
             let mut row_sum = row_base;
             let mut row_sq = row_base + h as u64 * 4;
             pool.gpu.launch(
@@ -1089,7 +1110,10 @@ mod tests {
                 pool.gpu.download_from(&pool.stats.0, &mut sink)?;
                 ms(started)
             };
-            let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
+            let plane = pool
+            .gpu
+            .handle(Slot::Scratch)
+            .ok_or(Failure::Invalid("plane slot"))?;
             let started = Instant::now();
             for _ in 0..iters {
                 launch_vignette(&mut pool.gpu, plane, w, h, region, code, amount, aspect, center)?;
@@ -1134,8 +1158,14 @@ mod tests {
                 pool.gpu.download_from(&pool.stats.0, &mut sink)?;
                 ms(started)
             };
-            let plane = pool.gpu.handle(Slot::Scratch).expect("plane slot");
-            let nodes_handle = pool.gpu.handle(Slot::Aux2).expect("node slot");
+            let plane = pool
+            .gpu
+            .handle(Slot::Scratch)
+            .ok_or(Failure::Invalid("plane slot"))?;
+            let nodes_handle = pool
+            .gpu
+            .handle(Slot::Aux2)
+            .ok_or(Failure::Invalid("node slot"))?;
             let started = Instant::now();
             for _ in 0..iters {
                 launch_lcc(&mut pool.gpu, plane, nodes_handle, grid, nodes, w, h)?;

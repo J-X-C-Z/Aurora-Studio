@@ -150,6 +150,13 @@ pub fn export_session_with_edits_and_mapping(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(err).with_context(|| "flushing the staged session");
     }
+    // The initial `target.exists()` check happened before rendering; repeat it
+    // right before the rename so a folder created meanwhile is not replaced
+    // (rename over an empty folder succeeds on POSIX).
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+        bail!("{} already exists; refusing to overwrite it", target.display());
+    }
     std::fs::rename(&staging, target).with_context(|| {
         format!("moving {} to {}", staging.display(), target.display())
     })?;
@@ -3499,6 +3506,22 @@ mod gradient_writeback_tests {
         dir
     }
 
+    fn snapshot_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(snapshot_files(&path));
+                } else {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     fn staging_entries(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -3526,6 +3549,7 @@ mod gradient_writeback_tests {
         std::fs::write(&database, crate::c1catalog::test_support::synthetic_session()).unwrap();
         let before = std::fs::read(&database).unwrap();
         let before_crc = crc32fast::hash(&before);
+        let before_bundle = snapshot_files(&bundle);
 
         {
             let engine = crate::FileEngine::open_c1_catalog(&database).unwrap();
@@ -3535,6 +3559,11 @@ mod gradient_writeback_tests {
         let after_open = std::fs::read(&database).unwrap();
         assert_eq!(crc32fast::hash(&after_open), before_crc);
         assert_eq!(after_open, before, "opening a catalog read-only writes nothing to it");
+        assert_eq!(
+            snapshot_files(&bundle),
+            before_bundle,
+            "no file inside the source bundle is created or rewritten"
+        );
 
         let import = C1Import::open(&database).unwrap();
         let target = dir.join("Bundle.cosessiondb");
@@ -3544,6 +3573,11 @@ mod gradient_writeback_tests {
             std::fs::read(&database).unwrap(),
             before,
             "exporting a session leaves the source catalog byte-identical"
+        );
+        assert_eq!(
+            snapshot_files(&bundle),
+            before_bundle,
+            "exporting a session leaves the whole source bundle untouched"
         );
         assert!(staging_entries(&dir).is_empty(), "no staging folder survives a finished export");
         let _ = std::fs::remove_dir_all(dir);

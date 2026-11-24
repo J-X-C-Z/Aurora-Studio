@@ -485,11 +485,18 @@ impl Gpu {
         let failure = Failure::from(error);
         if let Failure::Driver { code, .. } = failure {
             mark_lost(code);
+            if is_device_lost(code) {
+                return Failure::DeviceLost(code);
+            }
         }
         failure
     }
 
     /// Drops every device allocation and the stream, then re-opens the module.
+    ///
+    /// Not called automatically: stage owners decide whether to retry once or
+    /// stay on CPU after a lost device, since a destroyed CUDA context cannot
+    /// be recovered by reopening just the module handle.
     ///
     /// The wrapper caches one module per PTX image for the process. That cache
     /// is still valid for a recovered driver context in the common TDR case,
