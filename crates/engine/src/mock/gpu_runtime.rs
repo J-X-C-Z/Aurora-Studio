@@ -15,7 +15,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aurora_portrait::Refusal;
 use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia, Stream};
@@ -561,6 +561,124 @@ pub(crate) fn grid2(w: usize, h: usize, block: (u32, u32)) -> (u32, u32) {
 /// Shared 1D launch geometry helper.
 pub(crate) fn grid1(n: usize, block: u32) -> (u32, u32) {
     (((n as u32) + block - 1) / block, 1)
+}
+
+// ───────────────────────── portrait runtime bridge (PP-2) ─────────────────
+
+/// Accounting for the portrait side of the same process context.
+///
+/// `crates/portrait` owns the driver layer this runtime is built on, so the
+/// dependency can only point `aurora-engine -> aurora-portrait`. Portrait
+/// exposes an observer hook (`cuda::runtime_bridge`); installing it here keeps
+/// one report for every kernel the process runs: the four engine stages and
+/// every portrait provider, with the same counters and the same fallback
+/// reasons.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PortraitCounters {
+    pub module_loads: u64,
+    pub launches: u64,
+    pub syncs: u64,
+    pub uploads: u64,
+    pub downloads: u64,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub failures: u64,
+    pub last_failure: Option<(&'static str, &'static str)>,
+    pub kernels: Vec<Launch>,
+}
+
+fn portrait_report() -> &'static Mutex<PortraitCounters> {
+    static REPORT: OnceLock<Mutex<PortraitCounters>> = OnceLock::new();
+    REPORT.get_or_init(|| Mutex::new(PortraitCounters::default()))
+}
+
+struct PortraitObserver;
+
+impl aurora_portrait::cuda::runtime_bridge::Observer for PortraitObserver {
+    fn observe(&self, event: &aurora_portrait::cuda::runtime_bridge::GpuEvent) {
+        use aurora_portrait::cuda::runtime_bridge::GpuEvent as E;
+        let mut report = portrait_report()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match event {
+            E::ModuleLoaded { .. } => report.module_loads += 1,
+            E::Launched {
+                kernel,
+                grid,
+                block,
+                ..
+            } => {
+                report.launches += 1;
+                match report
+                    .kernels
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.kernel == *kernel && entry.grid == *grid && entry.block == *block
+                    })
+                {
+                    Some(entry) => entry.count += 1,
+                    None => report.kernels.push(Launch {
+                        kernel: *kernel,
+                        grid: *grid,
+                        block: *block,
+                        count: 1,
+                    }),
+                }
+            }
+            E::Synchronized => report.syncs += 1,
+            E::Uploaded { bytes, .. } => {
+                report.uploads += 1;
+                report.h2d_bytes += *bytes as u64;
+            }
+            E::Downloaded { bytes, .. } => {
+                report.downloads += 1;
+                report.d2h_bytes += *bytes as u64;
+            }
+            E::Failed { image, call, code } => {
+                report.failures += 1;
+                report.last_failure = Some((*image, *call));
+                note_fallback(
+                    "portrait",
+                    &Failure::Driver { call, code: *code },
+                );
+            }
+            E::Unavailable { image, what } => {
+                report.failures += 1;
+                report.last_failure = Some((*image, *what));
+                note_fallback("portrait", &Failure::Unavailable(*what));
+            }
+            E::Refused { image, tag } => {
+                report.failures += 1;
+                report.last_failure = Some((*image, *tag));
+                note_fallback("portrait", &Failure::Refused(*tag));
+            }
+        }
+    }
+}
+
+/// Installs the portrait observer once per process. Called from the portrait
+/// stage entry so every provider that runs after it is accounted for.
+///
+/// Lock order: the observer runs while the portrait driver `Domain` is held.
+/// It acquires `portrait_report` and, on failure, `fallback_report`. Neither
+/// lock may ever be held while calling back into a portrait GPU API.
+pub(crate) fn install_portrait_bridge() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = aurora_portrait::cuda::runtime_bridge::install(Arc::new(PortraitObserver));
+    });
+}
+
+/// Snapshot of the portrait counters; `kernels` lists the real dispatches.
+///
+/// Read by the merge gate and the report surface; kept callable so a session
+/// can prove portrait kernels ran without touching the per-stage APIs.
+#[allow(dead_code)]
+pub(crate) fn portrait_snapshot() -> PortraitCounters {
+    portrait_report()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[cfg(test)]
