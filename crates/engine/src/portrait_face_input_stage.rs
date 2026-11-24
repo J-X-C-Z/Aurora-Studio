@@ -42,7 +42,6 @@ const PARSING_SIDE: usize = 513;
 const MESH_POINTS: usize = 478;
 const DETECTION_SCORE_MIN: f32 = 0.5;
 const MESH_SCORE_MIN: f32 = 0.5;
-const DENSE_SCORE_MIN: f32 = 0.5;
 
 const MODEL_INPUT_ERROR: &str = "C1 face model input";
 const MODEL_OUTPUT_ERROR: &str = "C1 face model output";
@@ -2457,7 +2456,7 @@ impl FaceInputProducer {
             return Err(Refusal::ShapeMismatch(MODEL_OUTPUT_ERROR));
         }
         let score = outputs[1][1];
-        if !score.is_finite() || score < DENSE_SCORE_MIN {
+        if !score.is_finite() {
             return Err(Refusal::MissingInput("C1 face 142 landmark score"));
         }
         let inverse_matrix = inverse(fit)?;
