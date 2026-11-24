@@ -105,6 +105,19 @@ pub(crate) fn shared_face_input_image(key: (usize, usize, u64, u32, u32)) -> Opt
     Some(Arc::clone(&entry.image))
 }
 
+/// Returns the RGBA8 pixel capacity currently held in the shared input table
+/// for `plane_ptr`/`plane_len` without computing a fingerprint or allocating.
+pub(crate) fn shared_face_input_bytes_for_plane(plane_ptr: usize, plane_len: usize) -> usize {
+    let guard = shared_face_inputs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .0
+        .iter()
+        .find(|(k, _)| k.plane_ptr == plane_ptr && k.plane_len == plane_len)
+        .map_or(0, |(_, entry)| entry.image.pixels.capacity())
+}
+
 /// Publishes `image` as the shared input for `key` and returns it unchanged.
 pub(crate) fn register_face_input_image(
     key: (usize, usize, u64, u32, u32),

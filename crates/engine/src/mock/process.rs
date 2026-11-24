@@ -445,7 +445,16 @@ impl Source {
     /// input and the four mask planes. Reads the `OnceLock`s without
     /// initialising them, so accounting never forces a portrait build.
     pub(crate) fn cached_derived_bytes(&self) -> usize {
-        let face = self.face_rgba8.get().map_or(0, |image| image.pixels.capacity());
+        let face_local = self.face_rgba8.get().map_or(0, |image| image.pixels.capacity());
+        let face_shared = if face_local == 0 {
+            crate::portrait_face_input_stage::shared_face_input_bytes_for_plane(
+                self.levels[0].data.as_ptr() as usize,
+                self.levels[0].data.len(),
+            )
+        } else {
+            0
+        };
+        let face = face_local.saturating_add(face_shared);
         let masks = self.portrait_masks.get().map_or(0, |masks| {
             [&masks.skin, &masks.hair, &masks.face, &masks.body]
                 .into_iter()

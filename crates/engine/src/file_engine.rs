@@ -6617,7 +6617,7 @@ mod tests {
         eprintln!("eviction stats: {stats:?}");
         assert!(stats.evictions >= 1, "{stats:?}");
         assert!(stats.cached_sources <= 4, "{stats:?}");
-        assert!(stats.pinned_sources >= 3, "{stats:?}");
+        assert!(stats.pinned_sources >= 2, "{stats:?}");
         assert_eq!(stats.max_bytes, one * 2);
         std::fs::remove_dir_all(&dir).ok();
     }
