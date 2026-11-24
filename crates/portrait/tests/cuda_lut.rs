@@ -574,6 +574,54 @@ mod skin_lut_gpu {
     }
 
     #[test]
+    fn whiten_rosy_chain_matches_sequential_and_halves_full_frame_traffic() {
+        let Some(gpu) = gpu() else { return };
+        let whiten = pseudo_lut(9_161);
+        let ruddy = pseudo_lut(9_162);
+        let (source, mask) = job(&mut Rng::new(9_163), 257, 193);
+
+        gpu.skin_adjust(&source, &mask, &whiten, 0.63, 90005)
+            .expect("prime whiten LUT");
+        gpu.skin_adjust(&source, &mask, &ruddy, 0.41, 90007)
+            .expect("prime rosy LUT");
+
+        let before_sequential = driver_metrics();
+        let (first, first_dispatch) = gpu
+            .skin_adjust(&source, &mask, &whiten, 0.63, 90005)
+            .expect("whiten dispatch");
+        let (expected, second_dispatch) = gpu
+            .skin_adjust(&first, &mask, &ruddy, 0.41, 90007)
+            .expect("rosy dispatch");
+        let after_sequential = driver_metrics();
+        assert_eq!(first_dispatch.kernel, KERNEL);
+        assert_eq!(second_dispatch.kernel, KERNEL);
+
+        let before_chain = driver_metrics();
+        let (actual, dispatches) = gpu
+            .skin_adjust_chain(&source, &mask, &whiten, 0.63, &ruddy, 0.41)
+            .expect("whiten/rosy chain");
+        let after_chain = driver_metrics();
+
+        let pixels = source.pixel_count();
+        let sequential_h2d =
+            after_sequential.host_to_device_bytes - before_sequential.host_to_device_bytes;
+        let sequential_d2h =
+            after_sequential.device_to_host_bytes - before_sequential.device_to_host_bytes;
+        let chain_h2d = after_chain.host_to_device_bytes - before_chain.host_to_device_bytes;
+        let chain_d2h = after_chain.device_to_host_bytes - before_chain.device_to_host_bytes;
+
+        assert_eq!(actual, expected, "chained kernels must preserve byte parity");
+        assert_eq!(dispatches.len(), 2);
+        assert!(dispatches.iter().all(|dispatch| dispatch.kernel == KERNEL));
+        assert_eq!(sequential_h2d, pixels * 10);
+        assert_eq!(sequential_d2h, pixels * 8);
+        assert_eq!(chain_h2d, pixels * 5);
+        assert_eq!(chain_d2h, pixels * 4);
+        assert_eq!(chain_h2d * 2, sequential_h2d);
+        assert_eq!(chain_d2h * 2, sequential_d2h);
+    }
+
+    #[test]
     #[ignore = "24 MP PF30096 parity and warm timing gate"]
     fn temperature_24mp_parity_and_warm_timing() {
         let Some(gpu) = gpu() else { return };

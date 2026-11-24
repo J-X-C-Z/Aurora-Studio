@@ -532,8 +532,10 @@ mod driver {
         buffers: Vec<(CuPtr, usize)>,
     }
 
+    // One arena backs all six logical P15 slots for an exact image shape.
     struct CachedComposite {
         shape: BufferShape,
+        allocation: CuPtr,
         buffers: Vec<(CuPtr, usize)>,
     }
 
@@ -636,6 +638,7 @@ mod driver {
     const LUT_CACHE_SLOTS: usize = 2;
     // Two exact shapes cover preview/export interleaving; eviction waits before freeing.
     const COMPOSITE_BUFFER_SLOTS: usize = 2;
+    const COMPOSITE_ARENA_ALIGN: usize = 256;
     const LUT_BUFFER_SLOTS: usize = 2;
     const TEETH_LUT_CACHE_SLOTS: usize = 2;
     // Two slots cover the common single-pass then four-input blend pair.
@@ -643,6 +646,24 @@ mod driver {
     const GENERIC_STAGING_SLOTS: usize = 2;
     const NAMED_BUFFER_SLOTS: usize = 8;
     const JOB_ARENA_SLOTS: usize = 2;
+
+    fn composite_arena_layout(
+        sizes: [usize; 6],
+    ) -> Result<(usize, [usize; 6]), CudaError> {
+        let mut offsets = [0usize; 6];
+        let mut allocation_bytes = 0usize;
+        for (slot, size) in sizes.iter().copied().enumerate() {
+            offsets[slot] = allocation_bytes;
+            allocation_bytes = size
+                .checked_add(COMPOSITE_ARENA_ALIGN - 1)
+                .map(|value| value & !(COMPOSITE_ARENA_ALIGN - 1))
+                .and_then(|aligned| allocation_bytes.checked_add(aligned))
+                .ok_or(CudaError::Refused(Refusal::ValueOutOfRange(
+                    "composite arena",
+                )))?;
+        }
+        Ok((allocation_bytes, offsets))
+    }
 
     #[derive(Debug)]
     struct CachedLut {
@@ -810,20 +831,29 @@ mod driver {
             }
             if self.composite_buffers.len() == COMPOSITE_BUFFER_SLOTS {
                 let evicted = self.composite_buffers.remove(0);
-                self.free_composite_group(evicted.buffers, true)?;
+                self.free_composite_group(evicted, true)?;
             }
-            let mut allocations = Buffers {
-                api: &self.api,
-                ptrs: Vec::new(),
-                pending_launch: false,
-            };
-            for size in sizes {
-                allocations.alloc(size)?;
+            let (allocation_bytes, offsets) = composite_arena_layout(sizes)?;
+            let mut allocation: CuPtr = 0;
+            unsafe {
+                check(
+                    (self.api.mem_alloc)(&mut allocation, allocation_bytes.max(1)),
+                    "cuMemAlloc",
+                )?;
             }
-            let buffers: Vec<_> = allocations.ptrs.drain(..).zip(sizes).collect();
+            count_device_allocation();
+            let buffers: Vec<(CuPtr, usize)> = sizes
+                .iter()
+                .copied()
+                .zip(offsets)
+                .map(|(size, offset)| (allocation + offset as CuPtr, size))
+                .collect();
             let ptrs = std::array::from_fn(|slot| buffers[slot].0);
-            self.composite_buffers
-                .push(CachedComposite { shape, buffers });
+            self.composite_buffers.push(CachedComposite {
+                shape,
+                allocation,
+                buffers,
+            });
             Ok(ptrs)
         }
 
@@ -843,13 +873,13 @@ mod driver {
 
         fn free_composite_group(
             &mut self,
-            buffers: Vec<(CuPtr, usize)>,
+            group: CachedComposite,
             sync: bool,
         ) -> Result<(), CudaError> {
             if sync {
                 self.synchronize_pending()?;
             }
-            self.free_group(buffers)
+            unsafe { check((self.api.mem_free)(group.allocation), "cuMemFree") }
         }
 
         fn lut_buffers(
@@ -1642,7 +1672,7 @@ mod driver {
             domain.bind()?;
             domain.synchronize_pending()?;
             for group in std::mem::take(&mut domain.composite_buffers) {
-                domain.free_group(group.buffers)?;
+                domain.free_composite_group(group, false)?;
             }
             Ok(())
         }
@@ -1859,7 +1889,7 @@ mod driver {
             second_lut: &[u8],
             first_uniforms: &[u8],
             second_uniforms: &[u8],
-        ) -> Result<(Vec<u8>, Dispatch), CudaError> {
+        ) -> Result<(Vec<u8>, Vec<Dispatch>), CudaError> {
             if source.is_empty()
                 || first_uniforms.is_empty()
                 || first_uniforms.len() % 4 != 0
@@ -1895,7 +1925,15 @@ mod driver {
                 &mut first_output as *mut CuPtr as *mut c_void,
                 first_block.as_mut_ptr() as *mut c_void,
             ];
-            self.launch_on(&api, module, kernel, grid, BLOCK, &mut first_params)?;
+            let first_dispatch =
+                match self.launch_on(&api, module, kernel, grid, BLOCK, &mut first_params) {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => {
+                        let _ = domain.synchronize_pending();
+                        return Err(error);
+                    }
+                };
+            domain.pending = true;
 
             let mut second_source = scratch_ptr;
             let mut second_mask = mask_ptr;
@@ -1909,16 +1947,21 @@ mod driver {
                 &mut second_output as *mut CuPtr as *mut c_void,
                 second_block.as_mut_ptr() as *mut c_void,
             ];
-            let dispatch = self.launch_on(&api, module, kernel, grid, BLOCK, &mut second_params)?;
-
-            domain.pending = true;
+            let second_dispatch =
+                match self.launch_on(&api, module, kernel, grid, BLOCK, &mut second_params) {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => {
+                        let _ = domain.synchronize_pending();
+                        return Err(error);
+                    }
+                };
             let mut output = vec![0u8; source.len()];
             let downloaded = self.download(image_ptr, &mut output);
             if downloaded.is_ok() {
                 domain.pending = false;
             }
             downloaded?;
-            Ok((output, dispatch))
+            Ok((output, vec![first_dispatch, second_dispatch]))
         }
 
         /// Reuse `inputs[0]` as the output allocation. The kernel must read the
@@ -3063,6 +3106,7 @@ mod driver {
             let sizes = [16384, 16384, 4096, 16384, 16384, 16384];
             let entry = CachedComposite {
                 shape,
+                allocation: 1,
                 buffers: sizes
                     .iter()
                     .enumerate()
@@ -3074,6 +3118,27 @@ mod driver {
             let mut changed = sizes;
             changed[5] -= 4;
             assert!(!entry.matches(shape, &changed));
+        }
+
+        #[test]
+        fn composite_arena_keeps_six_aligned_slots_in_one_allocation() {
+            let sizes = [16_384, 16_384, 703, 16_384, 16_384, 16_384];
+            let (allocation_bytes, offsets) =
+                composite_arena_layout(sizes).expect("composite arena layout");
+            assert_eq!(offsets[0], 0);
+            let mut expected = 0;
+            for (slot, size) in sizes.iter().copied().enumerate() {
+                assert_eq!(offsets[slot], expected);
+                expected += (size + COMPOSITE_ARENA_ALIGN - 1) & !(COMPOSITE_ARENA_ALIGN - 1);
+            }
+            assert_eq!(allocation_bytes, expected);
+            let skin_padding =
+                ((sizes[2] + COMPOSITE_ARENA_ALIGN - 1) & !(COMPOSITE_ARENA_ALIGN - 1))
+                    - sizes[2];
+            assert_eq!(
+                allocation_bytes - sizes.iter().sum::<usize>(),
+                skin_padding
+            );
         }
 
         #[test]
@@ -3724,9 +3789,9 @@ mod tests {
             .clear_composite_buffers()
             .expect("clear composite cache");
         let cases = [
-            ("constant_64", 64, 64, true, 6usize),
+            ("constant_64", 64, 64, true, 1usize),
             ("random_64_same_shape", 64, 64, false, 0usize),
-            ("random_37x19_shape_change", 37, 19, false, 6usize),
+            ("random_37x19_shape_change", 37, 19, false, 1usize),
             ("random_64_return_shape", 64, 64, false, 0usize),
         ];
         for (label, width, height, constant, cold_allocations) in cases {

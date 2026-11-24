@@ -232,6 +232,7 @@ impl SkinLut {
     }
 
     /// Run PF90005 -> PF90007 with one source/mask upload and one final download.
+    /// Both real launches are returned so the caller can report each effect.
     pub fn skin_adjust_chain(
         &self,
         source: &Image,
@@ -240,7 +241,7 @@ impl SkinLut {
         first_mix: f32,
         second_lut_rgb512: &[u8],
         second_mix: f32,
-    ) -> Result<(Image, Dispatch), CudaError> {
+    ) -> Result<(Image, Vec<Dispatch>), CudaError> {
         check(source, mask_r, first_lut_rgb512, first_mix, 90005)?;
         check(source, mask_r, second_lut_rgb512, second_mix, 90007)?;
         let first_uniforms = Uniforms::new(source.width, source.height, first_mix);
@@ -249,7 +250,7 @@ impl SkinLut {
             source.width.div_ceil(BLOCK.0).max(1),
             source.height.div_ceil(BLOCK.1).max(1),
         );
-        let (pixels, dispatch) = self.0.run_u8_cached_lut_chain(
+        let (pixels, dispatches) = self.0.run_u8_cached_lut_chain(
             KERNEL,
             grid,
             &source.pixels,
@@ -265,7 +266,7 @@ impl SkinLut {
                 height: source.height,
                 pixels,
             },
-            dispatch,
+            dispatches,
         ))
     }
 
