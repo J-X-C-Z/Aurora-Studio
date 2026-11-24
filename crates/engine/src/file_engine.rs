@@ -2267,8 +2267,8 @@ impl FileEngine {
     /// Derived buffers are accounted again on every hit because they are built
     /// lazily after the source was stored.
     fn cached_source(&self, image: ImageId) -> Option<Arc<Source>> {
-        let mut st = self.state.lock();
         let path = self.image_path(image)?;
+        let mut st = self.state.lock();
         if !Self::refresh_source_identity(&mut st, image, &path, false) {
             return None;
         }
