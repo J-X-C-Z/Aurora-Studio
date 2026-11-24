@@ -16,9 +16,12 @@ use std::time::Duration;
 use crate::{ExportJob, ImageEngine, ImageId, ImageInfo, JobStatus, ProcessRecipe};
 
 const POLL: Duration = Duration::from_millis(5);
+/// Retain recent completion details without unbounded growth in long sessions.
+const MAX_RETAINED_FINISHED_BATCHES: usize = 128;
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(1);
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
+static NEXT_COMPLETED: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: OnceLock<Mutex<HashMap<BatchId, Arc<BatchState>>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -52,6 +55,8 @@ pub struct BatchProgress {
 struct BatchState {
     progress: Mutex<BatchProgress>,
     cancel: AtomicBool,
+    /// Monotonic completion order; zero while the batch is still active.
+    completed_order: AtomicU64,
 }
 
 impl BatchState {
@@ -74,6 +79,7 @@ impl Batch {
         let state = Arc::new(BatchState {
             progress: Mutex::new(BatchProgress { total: job.images.len(), ..Default::default() }),
             cancel: AtomicBool::new(false),
+            completed_order: AtomicU64::new(0),
         });
         registry().lock().unwrap().insert(id, state.clone());
         std::thread::spawn(move || run(engine, job, &state));
@@ -99,6 +105,35 @@ impl Batch {
 
 fn registry() -> &'static Mutex<HashMap<BatchId, Arc<BatchState>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Evict the oldest completed batches while retaining every active batch.
+/// This bounds registry metadata and potentially large failure messages.
+fn prune_finished_registry(entries: &mut HashMap<BatchId, Arc<BatchState>>) {
+    let mut finished: Vec<(u64, BatchId)> = entries
+        .iter()
+        .filter_map(|(id, state)| {
+            let is_finished = state.progress.lock().unwrap().finished;
+            if !is_finished {
+                return None;
+            }
+            Some((state.completed_order.load(Ordering::Acquire), *id))
+        })
+        .collect();
+
+    if finished.len() <= MAX_RETAINED_FINISHED_BATCHES {
+        return;
+    }
+    finished.sort_unstable_by_key(|(order, _)| *order);
+    let remove_count = finished.len() - MAX_RETAINED_FINISHED_BATCHES;
+    for (_, id) in finished.into_iter().take(remove_count) {
+        entries.remove(&id);
+    }
+}
+
+fn prune_global_registry() {
+    let mut entries = registry().lock().unwrap();
+    prune_finished_registry(&mut entries);
 }
 
 enum Outcome {
@@ -145,6 +180,7 @@ fn run(engine: Arc<dyn ImageEngine>, job: BatchJob, state: &BatchState) {
         }
     }
     let cancelled = state.cancel.load(Ordering::SeqCst);
+    state.completed_order.store(NEXT_COMPLETED.fetch_add(1, Ordering::Relaxed), Ordering::Release);
     state.update(|p| {
         p.current = None;
         p.cancelled = cancelled;
@@ -152,6 +188,7 @@ fn run(engine: Arc<dyn ImageEngine>, job: BatchJob, state: &BatchState) {
         p.not_started = total.saturating_sub(p.done + p.failed + usize::from(interrupted.is_some()));
         p.finished = true;
     });
+    prune_global_registry();
 }
 
 fn wait(engine: &dyn ImageEngine, job_id: u64, state: &BatchState) -> Outcome {
@@ -191,6 +228,36 @@ mod tests {
     use std::time::Instant;
 
     use crate::{AdjustmentSet, AutoResult, AutoTarget, Collection, PreviewFrame, PreviewRequest, RgbaImage};
+
+    #[test]
+    fn registry_prunes_oldest_finished_batches_but_keeps_active_batches() {
+        let mut entries = HashMap::new();
+        for id in 1..=(MAX_RETAINED_FINISHED_BATCHES as u64 + 2) {
+            let state = Arc::new(BatchState {
+                progress: Mutex::new(BatchProgress { finished: true, ..Default::default() }),
+                cancel: AtomicBool::new(false),
+                completed_order: AtomicU64::new(id),
+            });
+            entries.insert(BatchId(id), state);
+        }
+        let active = Arc::new(BatchState {
+            progress: Mutex::new(BatchProgress::default()),
+            cancel: AtomicBool::new(false),
+            completed_order: AtomicU64::new(0),
+        });
+        entries.insert(BatchId(10_000), active);
+
+        prune_finished_registry(&mut entries);
+
+        assert_eq!(
+            entries.values().filter(|state| state.progress.lock().unwrap().finished).count(),
+            MAX_RETAINED_FINISHED_BATCHES
+        );
+        assert!(!entries.contains_key(&BatchId(1)));
+        assert!(!entries.contains_key(&BatchId(2)));
+        assert!(entries.contains_key(&BatchId(3)));
+        assert!(entries.contains_key(&BatchId(10_000)));
+    }
 
     struct MockEngine {
         infos: Vec<ImageInfo>,
