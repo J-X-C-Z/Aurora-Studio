@@ -115,7 +115,7 @@ pub use portrait_face_geometry_provider::{
 #[path = "portrait_body_stage.rs"]
 mod portrait_body_stage;
 pub use portrait_body_stage::{
-    BodyGeometryInput, BodyGeometryJob, BodyShiftInput, SixPointWarp,
+    BodyGeometryInput, BodyGeometryJob, BodyShiftInput, BodyVendorParams, SixPointWarp,
 };
 #[path = "portrait_body_producer.rs"]
 mod portrait_body_producer;

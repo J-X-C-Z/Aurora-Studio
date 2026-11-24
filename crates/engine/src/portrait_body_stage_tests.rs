@@ -1,4 +1,5 @@
 use super::*;
+use super::portrait_body_stage::BodyVendorParams;
 use aurora_portrait::kernels::body_geometry::{Brush, Clamp, EdgeMode, Pass, PassDefines, Vec2};
 use aurora_portrait::kernels::leg_refine_uv::LegColumn;
 
@@ -106,6 +107,7 @@ fn producer(pf: u32, job_id: u64) -> BodyGeometryJob {
         frame_size: SIZE,
         source_sha256: sha256_32(&frame().pixels),
         effects: BTreeMap::from([(pf, fixture(pf))]),
+        body_params: BodyVendorParams::for_effects(&BTreeMap::from([(pf, fixture(pf))])),
     }
 }
 
@@ -180,6 +182,44 @@ fn body_adapter_checks_job_payload_and_color_passes() {
         Err(Refusal::ValueOutOfRange(
             "body geometry requires color passes"
         ))
+    );
+}
+
+#[test]
+fn body_vendor_params_are_typed_and_not_invented() {
+    use aurora_portrait::kernels::body_geometry_params::{control_curve, HEAD_ZOOM, LEG_FACTORS};
+
+    // Every routed PF except PF90041 has a decoded vendor control curve in the
+    // two PoseRefine configs. PF90041 has no ParamFlag in the decoded tree.
+    for pf in ROUTED {
+        if pf != 90041 {
+            assert!(control_curve(pf).is_some(), "PF{pf}");
+        }
+    }
+    assert!(control_curve(90041).is_none());
+    assert_eq!(control_curve(406).unwrap().default_degree(), Ok(0.0));
+    assert_eq!(control_curve(407).unwrap().default_degree(), Ok(1.0));
+    assert_eq!(control_curve(400).unwrap().default_degree(), Ok(0.0));
+    assert_eq!(control_curve(405).unwrap().default_degree(), Ok(0.0));
+
+    let body = producer(406, 7);
+    assert_eq!(body.body_params.head_zoom, Some(HEAD_ZOOM));
+    assert_eq!(body.head_zoom_degree(), Some(0.5));
+    let body = producer(407, 7);
+    assert_eq!(body.body_params.leg_factors, Some(LEG_FACTORS));
+
+    let source = frame();
+    let mut missing = producer(406, 7);
+    missing.body_params.head_zoom = None;
+    assert_eq!(
+        portrait_body_stage::apply(&source, 406, 50.0, Some(7), Some(&missing)),
+        Err(Refusal::MissingInput("PF406 vendor HeadZoom factors"))
+    );
+    let mut missing = producer(407, 7);
+    missing.body_params.leg_factors = None;
+    assert_eq!(
+        portrait_body_stage::apply(&source, 407, 50.0, Some(7), Some(&missing)),
+        Err(Refusal::MissingInput("PF407 vendor leg factors"))
     );
 }
 
@@ -338,6 +378,7 @@ fn body_producer_entry_accepts_synthetic_jobs_for_each_routed_pf() {
                 job_id: receipt.job_id(),
                 frame_size: SIZE,
                 source_sha256: sha256_32(&source.pixels),
+                body_params: BodyVendorParams::for_effects(&all),
                 effects: all,
             },
             &receipt,
@@ -384,6 +425,7 @@ fn body_producer_entry_refuses_payloads_it_cannot_honor() {
             job_id: receipt.job_id(),
             frame_size: (SIZE.0 + 1, SIZE.1),
             source_sha256: sha256_32(&source.pixels),
+            body_params: BodyVendorParams::default(),
             effects: BTreeMap::from([(401, fixture(401))]),
         }),
         Err(Refusal::ShapeMismatch("body geometry frame"))
@@ -394,6 +436,7 @@ fn body_producer_entry_refuses_payloads_it_cannot_honor() {
             job_id: receipt.job_id(),
             frame_size: SIZE,
             source_sha256: sha256_32(&source.pixels),
+            body_params: BodyVendorParams::default(),
             effects: BTreeMap::from([(401, fixture(400))]),
         }),
         Err(Refusal::ShapeMismatch("body geometry effect kind"))
@@ -404,6 +447,7 @@ fn body_producer_entry_refuses_payloads_it_cannot_honor() {
             job_id: receipt.job_id(),
             frame_size: SIZE,
             source_sha256: sha256_32(&source.pixels),
+            body_params: BodyVendorParams::default(),
             effects: BTreeMap::from([(403, fixture(400))]),
         }),
         Err(Refusal::UnknownEffect(403))

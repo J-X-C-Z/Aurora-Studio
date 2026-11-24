@@ -4,6 +4,7 @@
 //! have no effect entry. This is the single registry integration point.
 
 pub mod body_geometry;
+pub mod body_geometry_params;
 pub mod blemish;
 pub mod blemish_blend;
 pub mod beard_transform;
