@@ -386,9 +386,12 @@ pub enum GraphWarning {
     MissingInput { node: u64, input: u32 },
     /// A mixer on the render path has no connected inputs.
     EmptyMixer { node: u64 },
-    /// A layer node on the render path has no `Layer` row to grade with.
+    /// A `Layer` node has no row, so [`repaired`](NodeGraph::repaired) bypasses
+    /// it and nothing grades with it.
     LayerWithoutRow { id: u64 },
-    /// A `Layer` row is not a node in the graph, so it never renders.
+    /// A `Layer` row has no node in the stored graph; repair appends it in
+    /// series, so it renders (and exports) at the tail. This is a hint to add
+    /// the node, not a "never renders" report.
     RowWithoutNode { id: u64 },
     /// The graph has no input node, so there is no base image marker to test
     /// reachability against; every layer the output reaches is treated as
@@ -619,15 +622,15 @@ impl NodeGraph {
         Ok(())
     }
 
-    /// [`plan`](Self::plan), plus the checks that need the layer rows: a layer
-    /// node without a `Layer` cannot grade, and a `Layer` that is not a node
-    /// never renders. Both are warnings, not errors, because a stored document
-    /// may carry either while the user repairs it.
+    /// [`plan`](Self::plan) for the repaired graph, plus the row/node checks
+    /// that repair papers over. Both are warnings, not errors, and neither
+    /// changes what renders: a row the graph does not know is appended in
+    /// series, and a node with no row is bypassed.
     pub fn inspect(&self, rows: &[Layer]) -> Result<GraphPlan, GraphError> {
-        let mut plan = self.plan()?;
-        for id in &plan.layers {
-            if !rows.iter().any(|row| row.id == *id) {
-                plan.warnings.push(GraphWarning::LayerWithoutRow { id: *id });
+        let mut plan = self.repaired(rows).plan()?;
+        for node in &self.nodes {
+            if node.kind == NodeKind::Layer && !rows.iter().any(|row| row.id == node.id) {
+                plan.warnings.push(GraphWarning::LayerWithoutRow { id: node.id });
             }
         }
         for row in rows {

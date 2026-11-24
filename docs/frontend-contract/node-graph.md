@@ -50,19 +50,19 @@
   - `plan.layers`：其中 `Layer` 节点，即渲染顺序。
   - `plan.pruned`：图中存在、但输出不依赖（或不能追溯到 INPUT）的 `Layer` 节点。**这些层不得渲染。**
   - `plan.warnings`：不拒绝、但需要提示的结构问题（见下）。
-- **`NodeGraph::inspect(&[Layer])`**：`plan()` 加行匹配检查，额外报告
-  `LayerWithoutRow` / `RowWithoutNode`。
-- **`layered(&AdjustmentSet) -> Result<Vec<&Layer>, GraphError>`**：渲染、导出、批量、缩略图、取色共用的选层入口。没有存图时返回全部行（按存储顺序）；有存图时返回 `plan.layers` 对应的行，**顺序以图为准**。
+- **`NodeGraph::repaired(&[Layer]) -> NodeGraph`**：按行修复图——缺 INPUT/OUTPUT 补上，空图先连 INPUT→OUTPUT，无对应行的 Layer 节点绕过，图里没有的 `Layer` 行按串联补到输出前。**界面与渲染/导出共用这一份修复**。
+- **`NodeGraph::inspect(&[Layer])`**：对修复后的图取 `plan()`，再额外报告 `LayerWithoutRow` / `RowWithoutNode`（都只影响提示，不改变渲染结果）。
+- **`layered(&AdjustmentSet) -> Result<Vec<&Layer>, GraphError>`**：渲染、导出、批量、缩略图、取色共用的选层入口。没有存图时返回全部行（按存储顺序）；有存图时先 `repaired(&rows)` 再取 `plan.layers`，**顺序以图为准**，所以新建但还没写进图的层仍会渲染。
 - **`render_layers(&AdjustmentSet)`**：渲染热路径的包装。图被拒绝时只渲染背景并记一次 `log::error!`，不猜测顺序。
 
 ### 拒绝（错误）
 
 | 错误 | 含义 | 前端应做 |
 |---|---|---|
-| `GraphError::Cycle { nodes }` | OUTPUT 依赖的节点成环，无求值顺序 | 高亮 `nodes`，禁止渲染该图；不要假定引擎会挑一条边断开 |
-| `GraphError::MissingNode { link }` | 连线指向图中不存在的节点 | 提示并断开该连线 |
+| `GraphError::Cycle { nodes }` | OUTPUT 依赖的节点成环，无求值顺序；`nodes` 只含环上节点 | 高亮 `nodes`，提示断开其中一条边；引擎此时只画背景，不会自行选边 |
 
 - 环**只在 OUTPUT 侧**才算错误：与输出无关的环不影响画面，只进 `pruned`。
+- 悬空连线（端点不存在）**不是错误**：引擎丢弃该边并给 `DanglingLink` 警告，输出其余部分照常渲染。
 - `render_order()` 仍是界面用的“尽力而为”排序（环在闭合处截断），只为编号/整理服务；渲染和导出不得以它为准。
 
 ### 警告（不拒绝）
@@ -71,9 +71,10 @@
 |---|---|
 | `MissingInput { node, input }` | mixer 缺某个输入，但更高编号的输入已连 |
 | `EmptyMixer { node }` | 渲染路径上的 mixer 没有任何输入 |
-| `LayerWithoutRow { id }` | 路径上的 `Layer` 节点没有对应 `Layer` 行 |
-| `RowWithoutNode { id }` | `Layer` 行不是图中的节点，永不渲染 |
+| `LayerWithoutRow { id }` | `Layer` 节点没有对应行；修复时被绕过，不参与渲染 |
+| `RowWithoutNode { id }` | `Layer` 行在存储的图里没有节点；修复时按串联补到输出前，**仍会渲染与导出**（提示补节点即可） |
 | `NoInputNode` | 图里没有输入节点，无法判定「是否接到底图」；输出可达的层都按已连接处理（并保留此警告） |
+| `DanglingLink { link }` | 连线端点不存在；已丢弃该边，其余照常渲染 |
 
 mixer 语义仍未实现；出现 mixer 时引擎按串联渲染，并把结构问题放在 `warnings` 里，不静默吞掉。
 
