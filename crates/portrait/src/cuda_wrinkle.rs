@@ -531,7 +531,7 @@ mod tests {
             assert_eq!(current[0], 1, "PF{pf} must share one context");
             assert_eq!(
                 current[1] - previous[1],
-                if index == 0 { 6 } else { 0 },
+                if index == 0 { 1 } else { 0 },
                 "PF{pf} composite allocation count"
             );
             assert_eq!(

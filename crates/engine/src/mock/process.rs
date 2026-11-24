@@ -1279,16 +1279,54 @@ fn needs_stage_face_input(extra: &std::collections::BTreeMap<String, f32>) -> bo
         };
         matches!(
             pf,
-            242 | 243
+            202 | 232
+                | 242
+                | 243
                 | 247
                 | 248
                 | 8001..=8033
                 | 30073
                 | 30079..=30093
+                | 30191
+                | 30194
+                | 30197
+                | 30198
+                | 30203
+                | 30204
+                | 30207
+                | 30210
                 | 41922
                 | 44124
                 | 48019
                 | 49221
+        )
+    })
+}
+
+fn needs_stage_face_bundle_direct(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    extra.iter().any(|(key, value)| {
+        if value.abs() <= 1.0e-6 {
+            return false;
+        }
+        let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        matches!(
+            pf,
+            202 | 232
+                | 247
+                | 248
+                | 8001..=8022
+                | 30073
+                | 30079
+                | 30191
+                | 30194
+                | 30197
+                | 30198
+                | 30203
+                | 30204
+                | 30207
+                | 30210
         )
     })
 }
@@ -1301,7 +1339,10 @@ fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> 
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 108 | 109 | 110)
+        matches!(
+            pf,
+            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 30013 | 90004 | 90023 | 90024
+        )
     })
 }
 
@@ -2161,9 +2202,12 @@ fn render_sized(
         }
         // Keep R17's PF108 path on the stage frame; its parsing semantics are
         // owned by the separate teeth lane.
-        if needs_stage_face_parsing(&adj.extra) && region == NormRect::FULL {
+        if (needs_stage_face_parsing(&adj.extra) || needs_stage_face_bundle_direct(&adj.extra))
+            && region == NormRect::FULL
+        {
+            let want_parsing = needs_stage_face_parsing(&adj.extra);
             if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
-                match stage_face_bundle(receipt.job_id(), &stage_frame, true) {
+                match stage_face_bundle(receipt.job_id(), &stage_frame, want_parsing) {
                     Ok(bundle) => {
                         let mut inputs = producer_inputs.take().unwrap_or_default();
                         let mut attached = false;
@@ -2178,17 +2222,80 @@ fn render_sized(
                                 }
                             }
                         }
-                        let bright_ui = teeth_ui_percent(&adj.extra, "pc:109");
-                        let deyellow_ui = teeth_ui_percent(&adj.extra, "pc:110");
-                        match bundle.attach_pf108_inputs(
-                            &stage_frame,
-                            bright_ui,
-                            deyellow_ui,
-                            &mut inputs,
-                        ) {
-                            Ok(()) => attached = true,
-                            Err(refusal) => {
-                                log::warn!("canonical FaceParsingV2 input refused: {refusal:?}");
+                        let c202 = adj.extra.get("pc:202").copied().unwrap_or(0.0);
+                        let c232 = adj.extra.get("pc:232").copied().unwrap_or(0.0);
+                        if c202 != 0.0 || c232 != 0.0 {
+                            if bundle
+                                .attach_default_face_detail(
+                                    &stage_frame,
+                                    [c202, 0.0],
+                                    [c232, 0.0],
+                                    &mut inputs,
+                                )
+                                .is_ok()
+                            {
+                                attached = true;
+                            }
+                        }
+                        let c247 = adj.extra.get("pc:247").copied().unwrap_or(0.0);
+                        let c248 = adj.extra.get("pc:248").copied().unwrap_or(0.0);
+                        if c247 != 0.0 || c248 != 0.0 {
+                            if bundle
+                                .attach_vface(&stage_frame, [c247, c248], &mut inputs)
+                                .is_ok()
+                            {
+                                attached = true;
+                            }
+                        }
+                        if bundle
+                            .attach_plump_from_extra(&stage_frame, &adj.extra, &mut inputs)
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_eye_and_brow_geometry(&stage_frame, &adj.extra, &mut inputs)
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if want_parsing {
+                            let bright_ui = teeth_ui_percent(&adj.extra, "pc:109");
+                            let deyellow_ui = teeth_ui_percent(&adj.extra, "pc:110");
+                            match bundle.attach_pf108_inputs(
+                                &stage_frame,
+                                bright_ui,
+                                deyellow_ui,
+                                &mut inputs,
+                            ) {
+                                Ok(()) => attached = true,
+                                Err(refusal) => {
+                                    log::warn!("canonical FaceParsingV2 input refused: {refusal:?}");
+                                }
+                            }
+                            if bundle
+                                .attach_wrinkle_from_extra(&stage_frame, &adj.extra, &mut inputs)
+                                .is_ok()
+                            {
+                                attached = true;
+                            }
+                            let c30013 = adj.extra.get("pc:30013").copied().unwrap_or(0.0);
+                            if c30013 > 0.0 {
+                                let gray_3d_controls = [
+                                    adj.extra.get("pc:30015").copied().unwrap_or(0.0),
+                                    adj.extra.get("pc:30016").copied().unwrap_or(0.0),
+                                ];
+                                if bundle
+                                    .attach_pf30013_inputs(
+                                        &stage_frame,
+                                        c30013,
+                                        gray_3d_controls,
+                                        &mut inputs,
+                                    )
+                                    .is_ok()
+                                {
+                                    attached = true;
+                                }
                             }
                         }
                         if attached {

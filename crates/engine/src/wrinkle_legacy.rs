@@ -27,6 +27,10 @@ impl WrinkleSameJobReceipt {
         }
     }
 
+    pub fn from_job_id(job_id: u64) -> Self {
+        Self { job_id }
+    }
+
     pub fn job_id(self) -> u64 {
         self.job_id
     }

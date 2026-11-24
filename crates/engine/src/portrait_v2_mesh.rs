@@ -13,12 +13,15 @@ pub const TRIANGLE_WEIGHTS_SHA256: &str =
     "0F3EB71525714617C16D2D855D77FADC89D9290A9DA12C63A97089E1866CC422";
 pub const OFFSET_UV_SHA256: &str =
     "24734F9CA9ABA22C86E571E085DC46122200F0D55E8951EADA118D7A2F1C613D";
+pub const GRID_2005_SHA256: &str =
+    "8051D0EBB85B8007AC4190BE28E9DCBDB671A480F589FF36D92A8A0AA1CF8548";
 
 const TOPOLOGY: &[u8] = include_bytes!("../assets/portrait/vface/topology2982.u16le");
 const FACE_COEFF: &[u8] = include_bytes!("../assets/portrait/vface/face_coeff526.f32le");
 const TRIANGLE_WEIGHTS: &[u8] =
     include_bytes!("../assets/portrait/vface/triangle_weights994.f32le");
 const OFFSET_UV: &[u8] = include_bytes!("../assets/portrait/vface/uv526.f32le");
+const GRID_2005: &[u8] = include_bytes!("../assets/portrait/vface/atlas/Grid_2005.rgba8");
 const GRID_2010_POSITIVE: &[u8] =
     include_bytes!("../assets/portrait/vface/atlas/Grid_2010_Positive.rgba8");
 const GRID_2011_POSITIVE: &[u8] =
@@ -27,6 +30,14 @@ const GRID_2010_NEGATIVE: &[u8] =
     include_bytes!("../assets/portrait/vface/atlas/Grid_2010_Negative.rgba8");
 const GRID_2011_NEGATIVE: &[u8] =
     include_bytes!("../assets/portrait/vface/atlas/Grid_2011_Negative.rgba8");
+
+pub fn captured_grid_2005() -> Vec<u8> {
+    GRID_2005.to_vec()
+}
+
+pub fn zero_base_280() -> Vec<[f32; 4]> {
+    vec![[0.0; 4]; 280 * 280]
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct V2MeshGeometry {

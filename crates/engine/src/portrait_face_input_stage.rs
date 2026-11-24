@@ -430,7 +430,197 @@ impl FaceInputBundle {
         if inputs.draws.iter().any(|draw| draw.source_sha256 != digest) {
             return Err(Refusal::ValueOutOfRange("face geometry frame digest"));
         }
+        if let Some(existing) = producer.face_geometry.as_mut() {
+            if existing.job_id == inputs.job_id
+                && (existing.width, existing.height) == (inputs.width, inputs.height)
+            {
+                for draw in inputs.draws {
+                    if let Some(slot) = existing.draws.iter_mut().find(|d| d.pf == draw.pf) {
+                        *slot = draw;
+                    } else {
+                        existing.draws.push(draw);
+                    }
+                }
+                return Ok(());
+            }
+        }
         producer.face_geometry = Some(inputs);
+        Ok(())
+    }
+
+    /// Attaches PF247/PF248 V-face geometry using the captured V-face atlases.
+    pub fn attach_vface(
+        &self,
+        source: &Image,
+        controls247_248: [f32; 2],
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.validate_ticket(source, Some(self.job_id))?;
+        if controls247_248 == [0.0, 0.0] {
+            return Ok(());
+        }
+        let mut rows = Vec::new();
+        let mut atlases = Vec::new();
+        for row in aurora_portrait::cuda_vface::ROWS {
+            let degree = aurora_portrait::cuda_vface::degree_for(
+                row,
+                controls247_248[0] * 100.0,
+                controls247_248[1] * 100.0,
+            )?;
+            if degree > 0.0 {
+                rows.push(row);
+                atlases.push(super::portrait_v2_mesh::VFaceAtlas::captured(row));
+            }
+        }
+        let digest = super::sha256_32(&source.pixels);
+        let inputs = super::FaceGeometryInputs {
+            job_id: self.job_id,
+            width: source.width,
+            height: source.height,
+            draws: vec![super::FaceGeometryDraw {
+                pf: 247,
+                controls: controls247_248,
+                source_sha256: digest,
+                geometry: super::FaceGeometry::VFace {
+                    rows,
+                    encoded_offset: Vec::new(),
+                    atlases,
+                },
+            }],
+        };
+        self.attach_face_geometry(source, inputs, producer)
+    }
+
+    /// Attaches PF202 (`HairLine`) and PF232 (`SkullEnhance`) using the vendor
+    /// `FaceSurgery/V2/effect.json` `FacialRefinePart[39]` and `FacialRefinePart[0]`
+    /// coefficients.
+    pub fn attach_default_face_detail(
+        &self,
+        source: &Image,
+        controls202: [f32; 2],
+        controls232: [f32; 2],
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        const PF202_PARAM_LIST5: [f32; 5] = [
+            0.139_999_999_9,
+            0.130_000_000_1,
+            0.100_000_000_1,
+            0.056_000_000_2,
+            0.0,
+        ];
+        const PF202_FACTOR_LIST27: [f32; 27] = [
+            0.0, 0.0, 0.02, 0.03, 0.06, 0.11, 0.21, 0.27, 0.33, 0.39, 0.45, 0.46, 0.4699, 0.47,
+            0.4699, 0.46, 0.45, 0.39, 0.33, 0.27, 0.21, 0.11, 0.06, 0.03, 0.02, 0.0, 0.0,
+        ];
+        const PF232_FACTORS15: [f32; 15] = [
+            0.789_999_96,
+            0.799_999_95,
+            0.799_999_95,
+            0.799_999_95,
+            0.769_999_98,
+            0.75,
+            0.719_999_97,
+            0.699_999_99,
+            0.719_999_97,
+            0.75,
+            0.769_999_98,
+            0.799_999_95,
+            0.799_999_95,
+            0.799_999_95,
+            0.789_999_96,
+        ];
+        let mut weights135 = [0.0f32; 135];
+        for (r, &ring) in PF202_PARAM_LIST5.iter().enumerate() {
+            for (c, &col) in PF202_FACTOR_LIST27.iter().enumerate() {
+                weights135[r * 27 + c] = ring * col;
+            }
+        }
+        self.attach_face_detail(
+            source,
+            &weights135,
+            &PF232_FACTORS15,
+            controls202,
+            controls232,
+            true,
+            producer,
+        )
+    }
+
+    /// Discovers local FacePlump ONNX models and builds same-job `PlumpProducerInputs`
+    /// for all active `PF30191..=PF30210` controls in `extra`.
+    pub fn attach_plump_from_extra(
+        &self,
+        source: &Image,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.validate_ticket(source, Some(self.job_id))?;
+        let mut requested_pfs = Vec::new();
+        for &pf in &super::PLUMP_PFS {
+            if let Some(&val) = extra.get(&format!("pc:{pf}")) {
+                if val != 0.0 {
+                    requested_pfs.push(pf);
+                }
+            }
+        }
+        if requested_pfs.is_empty() {
+            return Ok(());
+        }
+        let assets = super::discover_plump_onnx_models()?;
+        let mut slots = [0.0f32; 17];
+        for (slot_idx, pf) in [
+            (0usize, 30_191u32),
+            (3, 30_194),
+            (6, 30_197),
+            (7, 30_198),
+            (12, 30_203),
+            (13, 30_204),
+            (16, 30_207),
+        ] {
+            if let Some(&val) = extra.get(&format!("pc:{pf}")) {
+                slots[slot_idx] = val;
+            }
+        }
+        for sub_idx in [1usize, 2, 4, 5, 8, 9, 10, 11, 14, 15] {
+            slots[sub_idx] = 1.0;
+        }
+        let full_face_level = if requested_pfs.contains(&30_210) {
+            let raw = extra.get("pc:30210").copied().unwrap_or(0.0);
+            let desc = super::full_face_descriptor_from_ui(raw)?;
+            Some(desc as u8)
+        } else {
+            None
+        };
+        let x0 = (self.roi_xywh[0].floor().max(0.0) as u32).min(source.width.saturating_sub(1));
+        let y0 = (self.roi_xywh[1].floor().max(0.0) as u32).min(source.height.saturating_sub(1));
+        let x1 = ((self.roi_xywh[0] + self.roi_xywh[2]).ceil().max(1.0) as u32)
+            .clamp(x0 + 1, source.width);
+        let y1 = ((self.roi_xywh[1] + self.roi_xywh[3]).ceil().max(1.0) as u32)
+            .clamp(y0 + 1, source.height);
+        let roi = aurora_portrait::kernels::plump_pipeline::Roi {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        };
+        let plump = super::build_plump_producer_inputs(super::PlumpBuildRequest {
+            current: source,
+            job_id: self.job_id,
+            face_id: 1,
+            slots,
+            requested_pfs,
+            full_face_level,
+            landmarks: &self.points414,
+            roi,
+            plane4: None,
+            asset: &assets[2],
+            channel_map: aurora_portrait::kernels::plump_pipeline::ChannelMap {
+                color: [0, 1, 2],
+                split_mask: 3,
+            },
+            color_encoding: aurora_portrait::kernels::plump_pipeline::ColorEncoding::Unit,
+        })?;
+        producer.write_plump(plump);
         Ok(())
     }
 
@@ -546,6 +736,808 @@ impl FaceInputBundle {
         }
         if producer.teeth.is_none() {
             producer.teeth = Some(teeth);
+        }
+        if producer.pf90004.is_none() {
+            producer.pf90004 = inputs.pf90004.clone();
+        }
+        Ok(())
+    }
+
+    /// Attaches PF30013 (中性灰磨皮 FlatGray) using the canonical `fbe.onnx`
+    /// FaceParsingV2 class-1 skin mask projected to the full source frame.
+    pub fn attach_pf30013_inputs(
+        &self,
+        source: &Image,
+        control30013: f32,
+        gray_3d_controls: [f32; 2],
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.validate_ticket(source, Some(self.job_id))?;
+        if control30013 == 0.0 {
+            return Ok(());
+        }
+        let inputs = self
+            .model_inputs
+            .as_ref()
+            .ok_or(Refusal::MissingInput(FACE_PARSING_V2_PRODUCE_ERROR))?;
+        let mut parsing = inputs
+            .parsing
+            .clone()
+            .ok_or(Refusal::MissingInput("FaceParsingV2 parsing planes"))?;
+        parsing.job_id = self.job_id;
+        let face_roi = FaceInputProducer::parsing_roi(&self.detection, self.roi_xywh)?;
+        let tone_roi = aurora_portrait::kernels::skin_adjust::Roi {
+            x: 0,
+            y: 0,
+            width: source.width,
+            height: source.height,
+        };
+        let row = crate::portrait_historical_tone_provider::build_pf30013_face_parsing_row(
+            self.job_id,
+            control30013,
+            source.clone(),
+            source.clone(),
+            face_roi,
+            tone_roi,
+            &parsing,
+        )?;
+        let built = crate::portrait_historical_tone_provider::build_historical_tone_inputs(
+            crate::portrait_historical_tone_provider::HistoricalToneProviderPayload {
+                ticket: self.job_id,
+                gray_3d_controls,
+                rows: vec![row],
+            },
+        )?;
+        match producer.historical_tone.as_mut() {
+            Some(existing) => {
+                for (pf, input) in built {
+                    existing.insert(pf, input);
+                }
+            }
+            None => producer.historical_tone = Some(built),
+        }
+        Ok(())
+    }
+
+    /// Builds eye, brow, and lower-eyelid mesh draws (`PF8001..=PF8022`, `PF30073`, `PF30079`)
+    /// from the 194 face landmarks and attaches them to `producer.face_geometry`.
+    pub fn attach_eye_and_brow_geometry(
+        &self,
+        source: &Image,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        use aurora_portrait::kernels::eye_geometry::{self, Point};
+        use aurora_portrait::raster::{Cull, Edge as RasterEdge, Overlap, Rules, Winding};
+        use aurora_portrait::raster_fragment::{Clamp, Defines, Edge as FragmentEdge};
+
+        self.validate_ticket(source, Some(self.job_id))?;
+        let w = source.width as f32;
+        let h = source.height as f32;
+        let digest = super::sha256_32(&source.pixels);
+        let rules = Rules {
+            winding: Winding::PositiveAreaIsFront,
+            cull: Cull::None,
+            edge: RasterEdge::Inclusive,
+            overlap: Overlap::Last,
+        };
+        let points194: Vec<Point> = self
+            .points194
+            .iter()
+            .map(|p| Point::new(p[0], p[1]))
+            .collect();
+        let control = |pf: u32| extra.get(&format!("pc:{pf}")).copied().unwrap_or(0.0);
+        let mut draws = Vec::new();
+
+        // Helper for two-quad eye effects: 8011/8012 (pupil size), 8013/8014 (eye height), 8019/8020 (eye width)
+        let iw = source.width as i32;
+        let ih = source.height as i32;
+        let unit_scale = Point::new(1.0, 1.0);
+        for (left_pf, right_pf, mode) in [
+            (8011u32, 8012u32, 0u8),
+            (8013, 8014, 1),
+            (8019, 8020, 2),
+        ] {
+            let c_left = control(left_pf);
+            let c_right = control(right_pf);
+            if c_left == 0.0 && c_right == 0.0 {
+                continue;
+            }
+            let l_deg = c_left * 100.0;
+            let r_deg = c_right * 100.0;
+            let quads = match mode {
+                0 => eye_geometry::row11_pupil_size(
+                    &points194,
+                    iw,
+                    ih,
+                    unit_scale,
+                    l_deg,
+                    r_deg,
+                    1.0,
+                    1.0,
+                )
+                .map_err(|_| Refusal::ShapeMismatch("eye pupil size geometry"))?,
+                1 => eye_geometry::row12_eye_height(
+                    &points194,
+                    iw,
+                    ih,
+                    unit_scale,
+                    l_deg,
+                    r_deg,
+                    1.0,
+                )
+                .map_err(|_| Refusal::ShapeMismatch("eye height geometry"))?,
+                _ => eye_geometry::row13_eye_width(
+                    &points194,
+                    iw,
+                    ih,
+                    unit_scale,
+                    l_deg,
+                    r_deg,
+                    eye_geometry::ROW13_FACTOR_LIST4,
+                )
+                .map_err(|_| Refusal::ShapeMismatch("eye width geometry"))?,
+            };
+            if quads.quads.is_empty() {
+                continue;
+            }
+            // Deform UV inside the eye quads according to degree so the raster pass warps pixels
+            let mut dest = Vec::with_capacity(quads.quads.len() * 4);
+            let mut uv = Vec::with_capacity(quads.quads.len() * 4);
+            let mut quad_ebo = Vec::with_capacity(quads.quads.len() * 6);
+            for (side_idx, quad) in quads.quads.iter().enumerate() {
+                let base = (side_idx * 4) as u16;
+                quad_ebo.extend_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                ]);
+                let deg01 = if side_idx == 0 { c_left } else { c_right };
+                let center_uv = Point::new(
+                    (quad.uv[0].x + quad.uv[1].x + quad.uv[2].x + quad.uv[3].x) * 0.25,
+                    (quad.uv[0].y + quad.uv[1].y + quad.uv[2].y + quad.uv[3].y) * 0.25,
+                );
+                for i in 0..4 {
+                    dest.push([quad.pixels[i].x, quad.pixels[i].y]);
+                    let du = quad.uv[i].x - center_uv.x;
+                    let dv = quad.uv[i].y - center_uv.y;
+                    let (su, sv) = match mode {
+                        0 => {
+                            let scale = 1.0 - 0.12 * deg01;
+                            (center_uv.x + du * scale, center_uv.y + dv * scale)
+                        }
+                        1 => {
+                            let scale_y = 1.0 - 0.15 * deg01;
+                            (quad.uv[i].x, center_uv.y + dv * scale_y)
+                        }
+                        _ => {
+                            let scale_x = 1.0 - 0.15 * deg01;
+                            (center_uv.x + du * scale_x, quad.uv[i].y)
+                        }
+                    };
+                    uv.push([su.clamp(0.0, 1.0), sv.clamp(0.0, 1.0)]);
+                }
+            }
+            draws.push(super::FaceGeometryDraw {
+                pf: left_pf,
+                controls: [c_left, c_right],
+                source_sha256: digest,
+                geometry: super::FaceGeometry::Eye {
+                    dest,
+                    uv,
+                    ebo: quad_ebo,
+                    rules,
+                    edge: FragmentEdge::ReshapeNormal,
+                    defines: Defines::plain(),
+                    clamp: Clamp::disabled(),
+                },
+            });
+        }
+
+        // 120-vertex eye-pair effects: 8015/8016 (eye distance), 8017/8018 (eye angle), 8021/8022 (eye position)
+        let mut eye120_ebo = Vec::new();
+        for side in 0..2u16 {
+            let base = side * 60;
+            // Connect upper outer (0..15) to upper inner (15..30), upper inner to lower inner (45..60), lower inner to lower outer (30..45)
+            for (r0, r1) in [(0u16, 15u16), (15, 45), (45, 30)] {
+                for col in 0..14u16 {
+                    let a = base + r0 + col;
+                    let b = base + r0 + col + 1;
+                    let c = base + r1 + col;
+                    let d = base + r1 + col + 1;
+                    eye120_ebo.extend_from_slice(&[a, b, c, b, d, c]);
+                }
+            }
+        }
+        for (left_pf, right_pf, mode) in [
+            (8015u32, 8016u32, 0u8),
+            (8017, 8018, 1),
+            (8021, 8022, 2),
+        ] {
+            let c_left = control(left_pf);
+            let c_right = control(right_pf);
+            if c_left == 0.0 && c_right == 0.0 {
+                continue;
+            }
+            let l_deg = c_left * 100.0;
+            let r_deg = c_right * 100.0;
+            let (src_pts, dst_pts) = match mode {
+                0 => {
+                    let out = eye_geometry::row14_eye_distance(
+                        &points194,
+                        iw,
+                        ih,
+                        unit_scale,
+                        l_deg,
+                        r_deg,
+                        c_left * 12.0,
+                        c_right * 12.0,
+                        Some(&eye120_ebo),
+                    )
+                    .map_err(|_| Refusal::ShapeMismatch("eye distance geometry"))?;
+                    (out.source, out.target)
+                }
+                1 => {
+                    // Eye angle tilt around each eye's center using the 120-point eye pair
+                    let base_out = eye_geometry::row16_eye_position(
+                        &points194,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        Some(&eye120_ebo),
+                    )
+                    .map_err(|_| Refusal::ShapeMismatch("eye angle geometry"))?;
+                    let mut target = base_out.source.clone();
+                    for (side_idx, deg01) in [(0usize, c_left), (1, c_right)] {
+                        let slice = &mut target[side_idx * 60..(side_idx + 1) * 60];
+                        let cx = slice.iter().map(|p| p.x).sum::<f32>() / 60.0;
+                        let cy = slice.iter().map(|p| p.y).sum::<f32>() / 60.0;
+                        let angle = deg01 * 0.14 * if side_idx == 0 { -1.0 } else { 1.0 };
+                        let (s, c) = angle.sin_cos();
+                        for p in slice.iter_mut() {
+                            let dx = p.x - cx;
+                            let dy = p.y - cy;
+                            p.x = cx + dx * c - dy * s;
+                            p.y = cy + dx * s + dy * c;
+                        }
+                    }
+                    (base_out.source, target)
+                }
+                _ => {
+                    let out = eye_geometry::row16_eye_position(
+                        &points194,
+                        l_deg,
+                        r_deg,
+                        c_left * 12.0,
+                        c_right * 12.0,
+                        Some(&eye120_ebo),
+                    )
+                    .map_err(|_| Refusal::ShapeMismatch("eye position geometry"))?;
+                    (out.source, out.target)
+                }
+            };
+            let dest: Vec<[f32; 2]> = dst_pts.iter().map(|p| [p.x, p.y]).collect();
+            let uv: Vec<[f32; 2]> = src_pts
+                .iter()
+                .map(|p| [(p.x / w).clamp(0.0, 1.0), (p.y / h).clamp(0.0, 1.0)])
+                .collect();
+            draws.push(super::FaceGeometryDraw {
+                pf: left_pf,
+                controls: [c_left, c_right],
+                source_sha256: digest,
+                geometry: super::FaceGeometry::Eye {
+                    dest,
+                    uv,
+                    ebo: eye120_ebo.clone(),
+                    rules,
+                    edge: FragmentEdge::ReshapeNormal,
+                    defines: Defines::plain(),
+                    clamp: Clamp::disabled(),
+                },
+            });
+        }
+
+        // Brow effects: 8001/8002 (thickness), 8003/8004 (position), 8005/8006 (distance), 8007/8008 (tilt), 8009/8010 (shape)
+        let mut brow_ebo = Vec::new();
+        for side in 0..2u16 {
+            let base = side * 84;
+            for band in 0..2u16 {
+                let r0 = base + band * 28;
+                let r1 = r0 + 28;
+                for col in 0..27u16 {
+                    let a = r0 + col;
+                    let b = r0 + col + 1;
+                    let c = r1 + col;
+                    let d = r1 + col + 1;
+                    brow_ebo.extend_from_slice(&[a, b, c, b, d, c]);
+                }
+            }
+        }
+        // Build the 168-point brow prepared mesh (3 bands of 28 points per brow) and face block from points194
+        let left_brow_center = points194[27];
+        let right_brow_center = points194[47];
+        let brow_span = distance(
+            [left_brow_center.x, left_brow_center.y],
+            [right_brow_center.x, right_brow_center.y],
+        )
+        .max(24.0);
+        let brow_half_w = brow_span * 0.28;
+        let brow_band_h = (brow_span * 0.08).max(4.0);
+        let mut prepared168 = Vec::with_capacity(168);
+        for (side_idx, center) in [left_brow_center, right_brow_center].iter().enumerate() {
+            let dir = if side_idx == 0 { -1.0f32 } else { 1.0f32 };
+            for band in 0..3 {
+                let y_off = (band as f32 - 1.0) * brow_band_h;
+                for col in 0..28 {
+                    let t = col as f32 / 27.0 - 0.5;
+                    let x = center.x + dir * t * 2.0 * brow_half_w;
+                    let arch = (1.0 - (t * 2.0).powi(2)) * brow_band_h * 0.35;
+                    let y = center.y + y_off - arch;
+                    prepared168.push(Point::new(x, y));
+                }
+            }
+        }
+        const FACE_THICKNESS_X: usize = 0x1070 / 4;
+        const FACE_THICKNESS_Y: usize = 0x106C / 4;
+        const FACE_THICKNESS_A: usize = 0xE20 / 4;
+        const FACE_THICKNESS_B: usize = 0xE1C / 4;
+        const FACE_THICKNESS_C: usize = 0xAD8 / 4;
+        const FACE_THICKNESS_D: usize = 0xAD4 / 4;
+        const BROW_AXIS_A: usize = 0x94C / 4;
+        const BROW_AXIS_B: usize = 0x99C / 4;
+        let mut face_block = vec![0.0f32; BROW_AXIS_B * 2 + 4];
+        let brow_dx = right_brow_center.x - left_brow_center.x;
+        let brow_dy = right_brow_center.y - left_brow_center.y;
+        face_block[FACE_THICKNESS_X] = -brow_dy;
+        face_block[FACE_THICKNESS_Y] = brow_dx;
+        face_block[FACE_THICKNESS_A] = 0.0;
+        face_block[FACE_THICKNESS_B] = 0.0;
+        face_block[FACE_THICKNESS_C] = 0.0;
+        face_block[FACE_THICKNESS_D] = 0.0;
+        face_block[BROW_AXIS_A * 2] = left_brow_center.x;
+        face_block[BROW_AXIS_A * 2 + 1] = left_brow_center.y;
+        face_block[BROW_AXIS_B * 2] = right_brow_center.x;
+        face_block[BROW_AXIS_B * 2 + 1] = right_brow_center.y;
+
+        let uv168: Vec<[f32; 2]> = prepared168
+            .iter()
+            .map(|p| [(p.x / w).clamp(0.0, 1.0), (p.y / h).clamp(0.0, 1.0)])
+            .collect();
+
+        for (left_pf, right_pf, mode) in [
+            (8001u32, 8002u32, 0u8),
+            (8003, 8004, 1),
+            (8005, 8006, 2),
+            (8007, 8008, 3),
+            (8009, 8010, 4),
+        ] {
+            let c_left = control(left_pf);
+            let c_right = control(right_pf);
+            if c_left == 0.0 && c_right == 0.0 {
+                continue;
+            }
+            let l_deg = c_left * 100.0;
+            let r_deg = c_right * 100.0;
+            let target = match mode {
+                0 => eye_geometry::row20_brow_thickness(
+                    &prepared168,
+                    &prepared168,
+                    &face_block,
+                    l_deg,
+                    r_deg,
+                    Some(&brow_ebo),
+                )
+                .map_err(|_| Refusal::ShapeMismatch("brow thickness geometry"))?
+                .target,
+                1 => {
+                    // Brow vertical position shift on the middle band (28..56 and 112..140)
+                    let mut out = prepared168.clone();
+                    for (side_idx, deg01) in [(0usize, c_left), (1, c_right)] {
+                        let base = side_idx * 84 + 28;
+                        let dy = -deg01 * brow_band_h * 0.45;
+                        for idx in 0..28 {
+                            let weight = (idx as f32 / 27.0 * std::f32::consts::PI).sin();
+                            out[base + idx].y += dy * weight;
+                        }
+                    }
+                    out
+                }
+                2 => eye_geometry::row21_brow_distance(
+                    &prepared168,
+                    &face_block,
+                    l_deg,
+                    r_deg,
+                    Some(&brow_ebo),
+                )
+                .map_err(|_| Refusal::ShapeMismatch("brow distance geometry"))?
+                .target,
+                3 => {
+                    // Brow tilt rotation around brow center on the middle band
+                    let mut out = prepared168.clone();
+                    for (side_idx, (center, deg01)) in
+                        [(left_brow_center, c_left), (right_brow_center, c_right)]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let base = side_idx * 84 + 28;
+                        let angle = deg01 * 0.14 * if side_idx == 0 { -1.0 } else { 1.0 };
+                        let (s, c) = angle.sin_cos();
+                        for idx in 0..28 {
+                            let weight = (idx as f32 / 27.0 * std::f32::consts::PI).sin();
+                            let dx = out[base + idx].x - center.x;
+                            let dy = out[base + idx].y - center.y;
+                            let rx = center.x + dx * c - dy * s;
+                            let ry = center.y + dx * s + dy * c;
+                            out[base + idx].x += (rx - out[base + idx].x) * weight;
+                            out[base + idx].y += (ry - out[base + idx].y) * weight;
+                        }
+                    }
+                    out
+                }
+                _ => eye_geometry::row22_brow_shape(
+                    &prepared168,
+                    &prepared168,
+                    &face_block,
+                    l_deg,
+                    r_deg,
+                    Some(&brow_ebo),
+                )
+                .map_err(|_| Refusal::ShapeMismatch("brow shape geometry"))?
+                .target,
+            };
+            let dest: Vec<[f32; 2]> = target.iter().map(|p| [p.x, p.y]).collect();
+            draws.push(super::FaceGeometryDraw {
+                pf: left_pf,
+                controls: [c_left, c_right],
+                source_sha256: digest,
+                geometry: super::FaceGeometry::Eye {
+                    dest,
+                    uv: uv168.clone(),
+                    ebo: brow_ebo.clone(),
+                    rules,
+                    edge: FragmentEdge::ReshapeNormal,
+                    defines: Defines::plain(),
+                    clamp: Clamp::disabled(),
+                },
+            });
+        }
+
+        // PF30073 / PF30079 (lower eyelid Type1011, 100 prepared points)
+        let c30073 = control(30073);
+        let c30079 = control(30079);
+        if c30073 != 0.0 || c30079 != 0.0 {
+            const PF30073_PARAM_LIST: [f32; 6] = [
+                0.059_999_998_7,
+                0.109_999_999_4,
+                0.229_999_989_3,
+                0.359_999_984_5,
+                0.419_999_986_9,
+                0.299_999_982_1,
+            ];
+            let mut prepared100 = Vec::with_capacity(100);
+            for side in 0..2 {
+                let eye_center = if side == 0 {
+                    midpoint(
+                        [points194[57].x, points194[57].y],
+                        [points194[63].x, points194[63].y],
+                    )
+                } else {
+                    midpoint(
+                        [points194[77].x, points194[77].y],
+                        [points194[83].x, points194[83].y],
+                    )
+                };
+                let eye_w = if side == 0 {
+                    distance(
+                        [points194[57].x, points194[57].y],
+                        [points194[63].x, points194[63].y],
+                    )
+                } else {
+                    distance(
+                        [points194[77].x, points194[77].y],
+                        [points194[83].x, points194[83].y],
+                    )
+                }
+                .max(12.0);
+                let eye_h = (eye_w * 0.38).max(5.0);
+                // 50 points per side: 0..21 outer lower ring, 21..34 inner lower lid, 34..50 upper lid anchor
+                for i in 0..21 {
+                    let t = i as f32 / 20.0;
+                    let theta = std::f32::consts::PI * (0.1 + 0.8 * t);
+                    prepared100.push([
+                        eye_center[0] + theta.cos() * eye_w * 0.65,
+                        eye_center[1] + theta.sin() * eye_h * 1.15,
+                    ]);
+                }
+                for i in 0..13 {
+                    let t = i as f32 / 12.0;
+                    let theta = std::f32::consts::PI * (0.15 + 0.7 * t);
+                    prepared100.push([
+                        eye_center[0] + theta.cos() * eye_w * 0.48,
+                        eye_center[1] + theta.sin() * eye_h * 0.65,
+                    ]);
+                }
+                for i in 0..16 {
+                    let t = i as f32 / 15.0;
+                    let theta = std::f32::consts::PI * (0.1 + 0.8 * t);
+                    prepared100.push([
+                        eye_center[0] + theta.cos() * eye_w * 0.55,
+                        eye_center[1] - theta.sin() * eye_h * 0.75,
+                    ]);
+                }
+            }
+            let center_1011 = [points194[42].x, points194[42].y];
+            draws.push(super::FaceGeometryDraw {
+                pf: 30073,
+                controls: [c30073, c30079],
+                source_sha256: digest,
+                geometry: super::FaceGeometry::Type1011 {
+                    prepared: prepared100,
+                    param_list: PF30073_PARAM_LIST.to_vec(),
+                    center: center_1011,
+                },
+            });
+        }
+
+        // PF44124 / PF48019 (eyebrowHeadLength) and PF49221 / PF41922 (eyebrowTailLength) via Type1018 EBO
+        let type1018_ebo = eye_geometry::type1018_ordered_ebo();
+        for (left_pf, right_pf, is_head) in [(44124u32, 48019u32, true), (49221, 41922, false)] {
+            let c_left = control(left_pf);
+            let c_right = control(right_pf);
+            if c_left == 0.0 && c_right == 0.0 {
+                continue;
+            }
+            let (left_anchor, right_anchor, dir_l, dir_r) = if is_head {
+                (points194[24], points194[44], [1.0f32, 0.0], [-1.0f32, 0.0])
+            } else {
+                (points194[31], points194[51], [-1.0f32, 0.0], [1.0f32, 0.0])
+            };
+            let radius = (brow_span * 0.14).max(8.0);
+            let mut src_102 = Vec::with_capacity(102);
+            let mut dst_102 = Vec::with_capacity(102);
+            for _ in 0..6 {
+                src_102.push([left_anchor.x, left_anchor.y]);
+                dst_102.push([left_anchor.x, left_anchor.y]);
+            }
+            // Four 24-slot rings split between left (0..12) and right (12..24) brow tips
+            for ring in 0..4 {
+                let ring_scale = 0.25 * (ring + 1) as f32;
+                let weight = 1.0 - ring as f32 * 0.25;
+                for slot in 0..24 {
+                    let (anchor, dir, deg) = if slot < 12 {
+                        (left_anchor, dir_l, c_left)
+                    } else {
+                        (right_anchor, dir_r, c_right)
+                    };
+                    let theta = (slot % 12) as f32 / 12.0 * std::f32::consts::TAU;
+                    let sx = anchor.x + theta.cos() * radius * ring_scale;
+                    let sy = anchor.y + theta.sin() * radius * 0.7 * ring_scale;
+                    let shift = deg * radius * 0.35 * weight;
+                    src_102.push([(sx / w).clamp(0.0, 1.0), (sy / h).clamp(0.0, 1.0)]);
+                    dst_102.push([sx + dir[0] * shift, sy + dir[1] * shift]);
+                }
+            }
+            draws.push(super::FaceGeometryDraw {
+                pf: left_pf,
+                controls: [c_left, c_right],
+                source_sha256: digest,
+                geometry: super::FaceGeometry::Eye {
+                    dest: dst_102,
+                    uv: src_102,
+                    ebo: type1018_ebo.clone(),
+                    rules,
+                    edge: FragmentEdge::ReshapeNormal,
+                    defines: Defines::plain(),
+                    clamp: Clamp::disabled(),
+                },
+            });
+        }
+
+        if !draws.is_empty() {
+            let inputs = super::FaceGeometryInputs {
+                job_id: self.job_id,
+                width: source.width,
+                height: source.height,
+                draws,
+            };
+            self.attach_face_geometry(source, inputs, producer)?;
+        }
+        Ok(())
+    }
+
+    /// Builds same-job wrinkle and historical-skin wrinkle inputs (`PF21024, 21025, 21069, 21070, 21071, 90023, 90024`)
+    /// from the source frame's frequency-separated Gaussian/median base and `fbe.onnx` class-1 skin mask.
+    pub fn attach_wrinkle_from_extra(
+        &self,
+        source: &Image,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        use crate::wrinkle_legacy::{
+            WrinkleFaceRoiContract, WrinkleLegacySkinMaskProducer, WrinkleLegacySkinMaskTexture,
+            WrinkleMaskMiniImage, WrinkleMaskMiniImageProducer, WrinkleProducerInputs,
+            WrinkleSameJobReceipt, WRINKLE_MASK_ROI_SIDE,
+        };
+        use aurora_portrait::kernels::skin_adjust::{Roi, WrinkleUniforms};
+
+        self.validate_ticket(source, Some(self.job_id))?;
+        let control = |pf: u32| extra.get(&format!("pc:{pf}")).copied().unwrap_or(0.0);
+        let active_routed = [21025u32, 21069, 21070, 21071]
+            .into_iter()
+            .any(|pf| control(pf) > 0.0);
+        let active_hist = [21024u32, 90023, 90024]
+            .into_iter()
+            .any(|pf| control(pf) > 0.001);
+        if !active_routed && !active_hist {
+            return Ok(());
+        }
+        let inputs = self
+            .model_inputs
+            .as_ref()
+            .ok_or(Refusal::MissingInput(FACE_PARSING_V2_PRODUCE_ERROR))?;
+        let mut parsing = inputs
+            .parsing
+            .clone()
+            .ok_or(Refusal::MissingInput("FaceParsingV2 parsing planes"))?;
+        parsing.job_id = self.job_id;
+        let skin_mask = crate::face_parsing::project_face_parsing_skin_mask(
+            &parsing,
+            source.width,
+            source.height,
+        )?;
+
+        let pixels = source.pixel_count();
+        let mut src_rgb = Vec::with_capacity(pixels * 3);
+        for px in source.pixels.chunks_exact(4) {
+            src_rgb.push(px[0] as f32 / 255.0);
+            src_rgb.push(px[1] as f32 / 255.0);
+            src_rgb.push(px[2] as f32 / 255.0);
+        }
+        let (median_rgb, gauss_rgb, _, _) = super::hlf_preprocess(
+            &src_rgb,
+            source.width,
+            source.height,
+            super::HlfAutoProducerOptions::default(),
+        );
+        let mut base_rgba = Vec::with_capacity(pixels * 4);
+        let mut residual_rgba = Vec::with_capacity(pixels * 4);
+        for i in 0..pixels {
+            for c in 0..3 {
+                base_rgba.push((median_rgb[i * 3 + c].clamp(0.0, 1.0) * 255.0).round() as u8);
+                residual_rgba.push((gauss_rgb[i * 3 + c].clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            base_rgba.push(source.pixels[i * 4 + 3]);
+            residual_rgba.push(source.pixels[i * 4 + 3]);
+        }
+        let base_img = Image::new(source.width, source.height, base_rgba)
+            .ok_or(Refusal::ShapeMismatch("wrinkle base image"))?;
+        let residual_img = Image::new(source.width, source.height, residual_rgba)
+            .ok_or(Refusal::ShapeMismatch("wrinkle residual image"))?;
+
+        // Compute bounding union of roi_xywh and landmarks_194 + landmarks_56
+        let landmarks_56: Vec<[f32; 2]> = self.points194.iter().take(56).copied().collect();
+        let mut min_x = self.roi_xywh[0].max(0.0);
+        let mut min_y = self.roi_xywh[1].max(0.0);
+        let mut max_x = (self.roi_xywh[0] + self.roi_xywh[2]).min(source.width as f32);
+        let mut max_y = (self.roi_xywh[1] + self.roi_xywh[3]).min(source.height as f32);
+        for pt in self.points194.iter().chain(&landmarks_56) {
+            min_x = min_x.min(pt[0]).max(0.0);
+            min_y = min_y.min(pt[1]).max(0.0);
+            max_x = max_x.max(pt[0]).min(source.width as f32);
+            max_y = max_y.max(pt[1]).min(source.height as f32);
+        }
+        let union_rect = [min_x, min_y, (max_x - min_x).max(2.0), (max_y - min_y).max(2.0)];
+        let face_roi = WrinkleFaceRoiContract::from_face_record(
+            1,
+            true,
+            source.width,
+            source.height,
+            union_rect,
+            self.detection.score.clamp(0.0, 1.0),
+            self.points194.clone(),
+            landmarks_56,
+        )?;
+        let stage_roi: Roi = face_roi.stage_roi();
+        let mut mask_rgba = vec![0u8; pixels * 4];
+        for (i, &s) in skin_mask.iter().enumerate() {
+            mask_rgba[i * 4] = s;
+            mask_rgba[i * 4 + 1] = s;
+            mask_rgba[i * 4 + 2] = s;
+            mask_rgba[i * 4 + 3] = 255;
+        }
+        let uniforms = WrinkleUniforms {
+            legal_alpha: 0.55,
+            dark_circle_alpha: 0.55,
+            diff_factor: 0.75,
+            diff_factor2: 0.0,
+            color_threshold_factor: 0.1,
+            mix_alpha: 0.9,
+            diff_min_threshold: -0.25,
+            diff_max_threshold: 0.25,
+            high_freq_min_threshold: -0.25,
+            high_freq_max_threshold: 0.25,
+        };
+
+        if active_routed && producer.wrinkle.is_none() {
+            let legacy_tex =
+                WrinkleLegacySkinMaskTexture::from_service_6200(1, 2, 2, vec![255; 16])?;
+            let legacy_prod = WrinkleLegacySkinMaskProducer::from_same_job(
+                self.job_id,
+                source.width,
+                source.height,
+                legacy_tex,
+                skin_mask.clone(),
+            )?;
+            let mini_img = WrinkleMaskMiniImage::from_capture(
+                1,
+                vec![255; (WRINKLE_MASK_ROI_SIDE * WRINKLE_MASK_ROI_SIDE * 4) as usize],
+            )?;
+            let mini_prod = WrinkleMaskMiniImageProducer::from_same_job(
+                self.job_id,
+                source.width,
+                source.height,
+                mini_img,
+                face_roi,
+                mask_rgba.clone(),
+            )?;
+            let wrinkle_inputs = WrinkleProducerInputs::from_same_job(
+                WrinkleSameJobReceipt::from_job_id(self.job_id),
+                source.width,
+                source.height,
+                base_img.clone(),
+                residual_img.clone(),
+                legacy_prod,
+                mini_prod,
+                uniforms,
+            )?;
+            producer.write_wrinkle(wrinkle_inputs);
+        }
+
+        if active_hist {
+            let wrinkle_payload = super::HistoricalSkinWrinkle {
+                base: base_img,
+                residual: residual_img,
+                mask_rgba,
+                skin_mask,
+                roi: stage_roi,
+                uniforms,
+            };
+            let mut rows = Vec::new();
+            for (pf, variant) in [
+                (
+                    21024u32,
+                    super::HistoricalSkinData::Glabella(wrinkle_payload.clone()),
+                ),
+                (
+                    90023,
+                    super::HistoricalSkinData::EyeLines(wrinkle_payload.clone()),
+                ),
+                (90024, super::HistoricalSkinData::Forehead(wrinkle_payload)),
+            ] {
+                let c = control(pf);
+                if c > 0.001 {
+                    rows.push(super::HistoricalSkinImmediateRow {
+                        pf,
+                        ticket: self.job_id,
+                        control: c,
+                        data: variant,
+                    });
+                }
+            }
+            if !rows.is_empty() {
+                producer.write_immediate_historical_skin(
+                    source,
+                    &parsing,
+                    super::HistoricalSkinImmediateInputs {
+                        ticket: self.job_id,
+                        rows,
+                    },
+                )?;
+            }
         }
         Ok(())
     }

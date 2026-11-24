@@ -4774,7 +4774,8 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     let mut face_results: BTreeMap<u32, Result<FaceGeometryRun, Refusal>> = BTreeMap::new();
     let mut face_mesh_results: BTreeMap<u32, FaceMeshStageResult> = BTreeMap::new();
     let mut plump_result: Option<Result<PlumpGroupRun, Refusal>> = None;
-    for (pf, degree) in effects {
+    let mut effects = effects.into_iter().peekable();
+    while let Some((pf, degree)) = effects.next() {
         let Some(meta) = aurora_portrait::lookup(pf) else {
             continue;
         };
@@ -5252,6 +5253,47 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             }
             report.effects.push(suit_run);
             continue;
+        }
+        #[cfg(windows)]
+        if pf == 90005 {
+            if let Some(&(next_pf, next_degree)) = effects.peek() {
+                if next_pf == 90007 {
+                    if let Some(mask) = skin_mask.as_deref() {
+                        if let Some(Ok((next, dispatches))) = try_cuda_skin_adjust_chain(
+                            &current,
+                            degree,
+                            next_degree,
+                            mask,
+                        ) {
+                            if dispatches.len() == 2 {
+                                effects.next();
+                                current = next;
+                                report.effects.push(PortraitEffectRun {
+                                    pf,
+                                    backend: PortraitBackend::Cuda,
+                                    dispatches: vec![dispatches[0].clone()],
+                                    fallback_reason: None,
+                                    skipped: false,
+                                    executed: true,
+                                    refusal: None,
+                                    skip_reason: None,
+                                });
+                                report.effects.push(PortraitEffectRun {
+                                    pf: next_pf,
+                                    backend: PortraitBackend::Cuda,
+                                    dispatches: vec![dispatches[1].clone()],
+                                    fallback_reason: None,
+                                    skipped: false,
+                                    executed: true,
+                                    refusal: None,
+                                    skip_reason: None,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
         }
         let needs_hlf_auto = (pf == 30021 && inputs.hlf_face.is_none())
             || (pf == 30022 && inputs.hlf_body.is_none());
@@ -9030,6 +9072,34 @@ fn try_cuda_effect(
         8068 | 21015 | 90005 | 90007 => cuda_router::skin_effect(pf, current, degree, mask),
         _ => None,
     }
+}
+
+#[cfg(windows)]
+fn try_cuda_skin_adjust_chain(
+    current: &Image,
+    first_degree: f32,
+    second_degree: f32,
+    mask: &[u8],
+) -> Option<Result<(Image, Vec<Dispatch>), CudaError>> {
+    if let Some(error) = forced_cuda_failure() {
+        return Some(Err(error));
+    }
+    if forced_cuda_empty_dispatch() {
+        return Some(Ok((current.clone(), Vec::new())));
+    }
+    let (Some(first_lut), Some(second_lut)) = (whiten_lut(), ruddy_lut()) else {
+        return None;
+    };
+    Some(with_skin_lut(|gpu| {
+        gpu.skin_adjust_chain(
+            current,
+            mask,
+            first_lut,
+            first_degree.clamp(0.0, 1.0),
+            second_lut,
+            second_degree.clamp(0.0, 1.0),
+        )
+    }))
 }
 
 #[cfg(windows)]

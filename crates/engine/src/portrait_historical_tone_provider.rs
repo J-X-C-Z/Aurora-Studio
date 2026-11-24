@@ -1122,6 +1122,56 @@ mod tests {
     }
 
     #[test]
+    fn pf30013_builder_projects_canonical_class1_mask_and_binds_frame() {
+        let frame = Image::new(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).unwrap();
+        let original = Image::new(2, 1, vec![70, 80, 90, 255, 100, 110, 120, 255]).unwrap();
+        let face_roi = FaceParsingRoi {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 1.0,
+            roll_radians: 0.0,
+        };
+        let mut masks = vec![0; crate::face_parsing::FACE_PARSING_V2_CLASSES * 2];
+        masks[crate::face_parsing::FACE_PARSING_V2_SKIN_CLASS * 2..][..2].fill(200);
+        let parsing = FaceParsingProducerInputs {
+            job_id: 17,
+            width: 2,
+            height: 1,
+            channels: crate::face_parsing::FACE_PARSING_V2_CLASSES as u8,
+            model_sha256: crate::face_parsing::FACE_PARSING_V2_MODEL_SHA256,
+            source_to_crop: face_roi.source_to_crop().unwrap(),
+            masks,
+            mask_provider: "cpu",
+        };
+        let row = build_pf30013_face_parsing_row(
+            17,
+            0.8,
+            frame.clone(),
+            original,
+            face_roi,
+            skin_adjust::Roi {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            &parsing,
+        )
+        .unwrap();
+        assert_eq!(row.pf(), 30013);
+        assert_eq!(row.frame, frame);
+        assert_eq!(row.job.source_sha256, sha256(&frame.pixels));
+        let HistoricalToneRowData::FlatGray(data) = &row.data else {
+            panic!("PF30013 row variant");
+        };
+        assert_eq!(data.mask, [200, 200]);
+
+        let built = build_historical_tone_inputs(payload(vec![row])).unwrap();
+        assert_eq!(built[&30013].source_sha256, sha256(&frame.pixels));
+    }
+
+    #[test]
     fn complete_builder_names_each_absent_row() {
         let size = [2, 1];
         let error =
@@ -1195,7 +1245,7 @@ mod tests {
                 data: row_data(30030, size),
             }]))
             .unwrap_err(),
-            Refusal::ShapeMismatch("historical tone provider PF30030 frame size")
+            Refusal::MissingInput("historical tone provider PF30030 frame size")
         );
         // Per-row control range is checked, not shared across rows.
         assert_eq!(

@@ -130,8 +130,14 @@ pub fn build_immediate_historical_skin_inputs(
     if inputs.rows.is_empty() {
         return Err(Refusal::MissingInput("historical skin immediate rows"));
     }
+    if parsing.job_id != inputs.ticket {
+        return Err(Refusal::ValueOutOfRange(
+            "historical skin immediate parsing ticket",
+        ));
+    }
     frame.validate()?;
     let size = [frame.width, frame.height];
+    let frame_sha256 = sha256_32(&frame.pixels);
     let parsed_skin = project_face_parsing_skin_mask(parsing, frame.width, frame.height)?;
     let mut built = BTreeMap::new();
     for mut row in inputs.rows {
@@ -169,7 +175,7 @@ pub fn build_immediate_historical_skin_inputs(
             HistoricalSkinInput {
                 ticket: row.ticket,
                 size,
-                source_sha256: [0; 32],
+                source_sha256: frame_sha256,
                 control: row.control,
                 data: row.data,
             },

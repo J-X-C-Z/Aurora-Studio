@@ -343,6 +343,18 @@ fn infer_onnx(
     input_digest: [u8; 32],
     output_tensor: &'static str,
 ) -> Result<PlumpRasterOutcome<SessionOutput>, Refusal> {
+    static LAST_INFER: std::sync::OnceLock<
+        std::sync::Mutex<Option<(u32, [u8; 32], PlumpRasterOutcome<SessionOutput>)>>,
+    > = std::sync::OnceLock::new();
+    let cache = LAST_INFER.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_id, cached_digest, ref cached_out)) = *guard {
+            if cached_id == asset.model_id && cached_digest == input_digest {
+                return Ok(cached_out.clone());
+            }
+        }
+    }
+
     let runtime = Runtime::get()
         .ok_or(Refusal::MissingInput("FacePlump ONNX Runtime"))?;
     let cuda = || {
@@ -375,7 +387,11 @@ fn infer_onnx(
             asset.net_sha256,
         )
     };
-    plump_raster_with_cpu_fallback(cuda, cpu)
+    let outcome = plump_raster_with_cpu_fallback(cuda, cpu)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((asset.model_id, input_digest, outcome.clone()));
+    }
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
