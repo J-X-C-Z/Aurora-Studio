@@ -4005,20 +4005,19 @@ impl ImageEngine for FileEngine {
         let use_standard = true;
         let standard = if use_standard {
             let adjustments = crate::styles::resolve(&self.load_adjustments(job.image)).into_owned();
-            let (source, max_size, recipe) = if let Some(native) = self.native_raw_source(job.image, None) {
-                // Resolve the recipe against the active image after geometry.
-                // Raw resampling runs before detail; the writer keeps that size.
-                let (w, h) = crate::mock::geometry::FrameMap::new(native.size(), &adjustments.geometry).frame_size();
-                let size = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
-                let (tw, th) = crate::recipe::output_size(&job.recipe, size);
-                let mut recipe = job.recipe.clone();
-                recipe.scale = crate::ScaleMode::Fixed100;
-                (native, tw.max(th), recipe)
+            let (source, source_size) = if let Some(native) = self.native_raw_source(job.image, None) {
+                let size = native.size();
+                (native, size)
             } else {
-                let (w, h) = crate::recipe::output_size(&job.recipe, (info.width, info.height));
-                (self.source(job.image)?, w.max(h).max(1), job.recipe.clone())
+                (self.source(job.image)?, (info.width, info.height))
             };
-            Some((source, adjustments, max_size, recipe))
+            let (width, height) =
+                crate::mock::geometry::FrameMap::new(source_size, &adjustments.geometry).frame_size();
+            let edited_size = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+            let (width, height) = crate::recipe::output_size(&job.recipe, edited_size);
+            let mut recipe = job.recipe.clone();
+            recipe.scale = crate::ScaleMode::Fixed100;
+            Some((source, adjustments, width.max(height), recipe))
         } else {
             None
         };
@@ -5866,6 +5865,28 @@ mod tests {
         assert_eq!(output.file_name().and_then(|n| n.to_str()), Some("shot.jpg"));
         assert!(staging_leftovers(&out).is_empty(), "the staging folder must be removed");
         assert!(image::image_dimensions(&output).is_ok(), "a complete JPEG was published");
+    }
+
+    #[test]
+    fn standard_percent_export_scales_the_edited_frame_once() {
+        let fixture = export_fixture("percent");
+        let mut adjustments = fixture.engine.load_adjustments(fixture.image);
+        for (job_id, crop, expected) in [
+            (47, NormRect::FULL, (4, 3)),
+            (48, NormRect { x: 0.125, y: 0.0, width: 0.75, height: 2.0 / 3.0 }, (3, 2)),
+        ] {
+            adjustments.geometry.crop = crop;
+            fixture.engine.save_adjustments(fixture.image, &adjustments).unwrap();
+            let recipe = crate::ProcessRecipe {
+                scale: crate::ScaleMode::Percent,
+                scale_value: (50, 0),
+                ..jpeg_recipe(fixture.dir.join(format!("Output-{job_id}")))
+            };
+            fixture.engine.start_export(ExportJob { job_id, image: fixture.image, recipe }).unwrap();
+            let status = wait_export(&fixture.engine, job_id);
+            let JobStatus::Done { output } = status else { panic!("export failed: {status:?}") };
+            assert_eq!(image::image_dimensions(output).unwrap(), expected);
+        }
     }
 
     #[test]

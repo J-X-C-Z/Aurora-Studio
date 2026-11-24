@@ -67,6 +67,33 @@ const WIRED_FACE_GEOMETRY_EFFECTS: &[(&str, &str, &str)] = &[
 const WIRED_TOTAL: usize =
     WIRED_SKIN_EFFECTS.len() + WIRED_TEETH_EFFECTS.len() + WIRED_FACE_GEOMETRY_EFFECTS.len();
 
+pub(crate) fn has_face_reshape(adjustments: &aurora_engine::AdjustmentSet) -> bool {
+    WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|(key, ..)| {
+        adjustments.extra.get(*key).is_some_and(|amount| amount.abs() > 1.0e-6)
+    })
+}
+
+pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSet) -> bool {
+    has_face_reshape(adjustments)
+        || WIRED_SKIN_EFFECTS.iter().chain(WIRED_TEETH_EFFECTS).any(|(key, _, _, neutral)| {
+            adjustments.extra.get(*key).is_some_and(|amount| (amount - neutral).abs() > 1.0e-6)
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn live_portrait_backing_excludes_neutral_values() {
+    let mut adjustments = aurora_engine::AdjustmentSet::default();
+    adjustments.extra.insert("pc:8069".into(), 0.5);
+    adjustments.extra.insert("pc:242".into(), 0.0);
+    assert!(!has_live_portrait_effect(&adjustments));
+    adjustments.extra.insert("pc:90005".into(), 0.5);
+    assert!(has_live_portrait_effect(&adjustments));
+    adjustments.extra.remove("pc:90005");
+    adjustments.extra.insert("pc:242".into(), -25.0);
+    assert!(has_live_portrait_effect(&adjustments));
+}
+
 /// Catalogue bands must not duplicate a control that already has a dedicated
 /// wired panel: both rows would use the same `pc:<id>` key and reset together.
 fn is_wired_key(key: &str) -> bool {

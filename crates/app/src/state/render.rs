@@ -230,6 +230,34 @@ fn same_render_inputs(a: &PreviewRequest, b: &PreviewRequest) -> bool {
         && a.adjustments == b.adjustments
 }
 
+fn face_reshape_region(region: NormRect) -> NormRect {
+    if region == NormRect::FULL {
+        return region;
+    }
+    let pad_x = region.width * 0.25;
+    let pad_y = region.height * 0.25;
+    let x = (region.x - pad_x).max(0.0);
+    let y = (region.y - pad_y).max(0.0);
+    NormRect {
+        x,
+        y,
+        width: (region.x + region.width + pad_x).min(1.0) - x,
+        height: (region.y + region.height + pad_y).min(1.0) - y,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn face_reshape_padding_keeps_visible_pixels_inside_the_request() {
+    assert_eq!(face_reshape_region(NormRect::FULL), NormRect::FULL);
+    let viewport = NormRect { x: 0.0, y: 0.78, width: 0.2, height: 0.2 };
+    let padded = face_reshape_region(viewport);
+    assert_eq!(padded.x, 0.0);
+    assert_eq!(padded.y + padded.height, 1.0);
+    assert!(padded.y < viewport.y);
+    assert!(padded.width > viewport.width);
+}
+
 /// What the scheduler did with a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreviewRequested {
@@ -284,11 +312,6 @@ impl super::Preview {
             .as_ref()
             .is_some_and(|old| old.image_id == image_id && old.stamp.id > generation);
         current == Some(image_id) && !superseded
-    }
-
-    /// Whether the bypass frame requested alongside this one may be installed.
-    pub(super) fn may_install_before(&self, current: Option<ImageId>, image_id: ImageId) -> bool {
-        current == Some(image_id)
     }
 
     /// Whether the bypass frame should still be rendered now that the after
@@ -812,14 +835,18 @@ impl AppState {
     /// The request inputs without consuming a generation.
     fn preview_inputs(&self, quality: RenderQuality, bypass: bool) -> Option<PreviewRequest> {
         let image = self.current?;
-        let region = self.visible_region();
+        let adjustments = self.display_adjustments();
+        let mut region = self.visible_region();
+        if crate::tools::portrait::has_face_reshape(&adjustments) {
+            region = face_reshape_region(region);
+        }
         let (fw, fh) = self.frame_size();
         let scale = self.effective_scale();
         let max_size = ((fw * region.width).max(fh * region.height) * scale).clamp(64.0, 8192.0) as u32;
         let mask_overlay = if self.panels.mask_overlay || self.cursor.is_mask_tool() { self.active_layer } else { None };
         Some(PreviewRequest {
             image,
-            adjustments: self.display_adjustments(),
+            adjustments,
             region,
             max_size,
             quality,
@@ -927,6 +954,7 @@ impl AppState {
             self.preview.before_dirty = false;
         }
         let geometry = request.adjustments.geometry.clone();
+        let portrait_applied = !request.bypass && crate::tools::portrait::has_live_portrait_effect(&request.adjustments);
         self.preview.start_request();
         let engine = self.engine.clone();
         let st = &self.settings;
@@ -1025,6 +1053,7 @@ impl AppState {
                                 source_pixels,
                                 region,
                                 geometry: geometry.clone(),
+                                portrait_applied,
                                 image_id,
                                 warning,
                                 focus,
@@ -1067,7 +1096,7 @@ impl AppState {
                         let display = prepare_display_image(
                             frame.image, previous_before.as_ref().map(|(key, image, _)| (*key, image)),
                         );
-                        (display.image, display.source_pixels, display.reused, request.region, request.image)
+                        (display.image, display.source_pixels, display.reused, request.region, request.image, request.max_size)
                     })
                 }).await)
             } else {
@@ -1075,12 +1104,20 @@ impl AppState {
             };
             this.update(cx, |this, cx| {
                 match before {
-                    Some(Ok((img, source_pixels, _, region, image_id))) if this.preview.may_install_before(this.current, image_id) => {
+                    Some(Ok((img, source_pixels, _, region, image_id, max_size))) if this.preview.wants_before(
+                        this.view.compare != super::CompareMode::Off,
+                        this.current,
+                        image_id,
+                        !this.preview.before_dirty,
+                    ) && this.preview_inputs(RenderQuality::Final, true).is_some_and(|latest| {
+                        latest.region == region && latest.max_size == max_size && latest.adjustments.geometry == geometry
+                    }) => {
                         display_frame(&mut this.preview.before, &mut this.preview.full_before, Frame {
                             image: img,
                             source_pixels,
                             region,
                             geometry,
+                            portrait_applied: false,
                             image_id,
                             warning: None,
                             focus: None,
@@ -1088,7 +1125,7 @@ impl AppState {
                             stamp,
                         }, cx);
                     }
-                    Some(Ok((img, _, false, _, _))) => cx.drop_image(img, None),
+                    Some(Ok((img, _, false, _, _, _))) => cx.drop_image(img, None),
                     Some(Err(_)) if this.current == Some(requested_image) => this.preview.before_dirty = true,
                     _ => {}
                 }
@@ -1370,6 +1407,7 @@ mod ordering_tests {
             source_pixels: 0,
             region,
             geometry: Geometry::default(),
+            portrait_applied: false,
             image_id: ImageId(image_id),
             warning: None,
             focus: None,
@@ -1384,6 +1422,7 @@ mod ordering_tests {
             source_pixels: 0,
             region: request.region,
             geometry: request.adjustments.geometry.clone(),
+            portrait_applied: !request.bypass && crate::tools::portrait::has_live_portrait_effect(&request.adjustments),
             image_id: request.image,
             warning: None,
             focus: None,
@@ -1506,10 +1545,6 @@ mod ordering_tests {
         assert!(!preview.wants_before(false, Some(ImageId(1)), after.image, true), "compare closed");
         assert!(!preview.wants_before(true, Some(ImageId(2)), after.image, true), "image changed");
         assert!(!preview.wants_before(true, Some(ImageId(1)), after.image, false), "not scheduled");
-
-        assert!(preview.may_install_before(Some(ImageId(1)), after.image));
-        assert!(!preview.may_install_before(Some(ImageId(2)), after.image));
-        assert!(!preview.may_install_before(None, after.image));
     }
 
     /// Scenario D: a full backing is kept behind a tile and replaced when the

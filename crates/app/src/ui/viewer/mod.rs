@@ -52,8 +52,8 @@ impl Placement {
     }
 }
 
-fn backing_matches_tile(base: (ImageId, &Geometry), tile: (ImageId, &Geometry, NormRect)) -> bool {
-    (tile.0, tile.1) == base && tile.2 != NormRect::FULL
+fn backing_matches_tile(base: (ImageId, &Geometry, bool), tile: (ImageId, &Geometry, NormRect, bool)) -> bool {
+    tile.0 == base.0 && tile.1 == base.1 && tile.2 != NormRect::FULL && !base.2 && !tile.3
 }
 
 /// Pick a pixel from the rendered BGRA tile, using its own frame region.
@@ -81,11 +81,14 @@ mod color_pick_tests {
         let geometry = Geometry::default();
         let tile = NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
         let cropped = Geometry { crop: tile, ..geometry.clone() };
-        let base = (ImageId(1), &geometry);
-        assert!(backing_matches_tile(base, (ImageId(1), &geometry, tile)));
-        assert!(!backing_matches_tile(base, (ImageId(1), &cropped, tile)));
-        assert!(!backing_matches_tile(base, (ImageId(2), &geometry, tile)));
-        assert!(!backing_matches_tile(base, (ImageId(1), &geometry, NormRect::FULL)));
+        let base = (ImageId(1), &geometry, false);
+        assert!(backing_matches_tile(base, (ImageId(1), &geometry, tile, false)));
+        assert!(!backing_matches_tile(base, (ImageId(1), &cropped, tile, false)));
+        assert!(!backing_matches_tile(base, (ImageId(2), &geometry, tile, false)));
+        assert!(!backing_matches_tile(base, (ImageId(1), &geometry, NormRect::FULL, false)));
+        assert!(!backing_matches_tile(base, (ImageId(1), &geometry, tile, true)));
+        assert!(!backing_matches_tile((ImageId(1), &geometry, true), (ImageId(1), &geometry, tile, false)));
+        assert!(!backing_matches_tile((ImageId(1), &geometry, true), (ImageId(1), &geometry, tile, true)));
     }
 
     #[test]
@@ -704,8 +707,13 @@ impl Render for Viewer {
             let profile = s.settings.proof_profile.clone().unwrap_or_else(|| t("No proof profile selected", "未选择打样配置文件").into());
             (profile, crate::planned::PROOF_READY)
         });
-        let after = s.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.current).map(frame_el);
-        let before = s.preview.before.as_ref().filter(|f| Some(f.image_id) == s.current).map(frame_el);
+        let after_frame = s.preview.frame.as_ref().filter(|frame| Some(frame.image_id) == s.current);
+        let before_frame = s.preview.before.as_ref().filter(|before| after_frame.is_some_and(|after| {
+            before.image_id == after.image_id && before.geometry == after.geometry && before.region == after.region
+        }));
+        let after = after_frame.map(frame_el);
+        let before = before_frame.map(frame_el);
+        let show_split = compare == CompareMode::Split && before.is_some();
         let (rl, rt, rw, rh) = pl.frame_rect();
         let backing = |frame: &crate::state::Frame| {
             div().absolute().left(px(rl)).top(px(rt)).w(px(rw)).h(px(rh))
@@ -713,10 +721,12 @@ impl Render for Viewer {
         };
         let matching_backing = |base: &&crate::state::Frame, current: Option<&crate::state::Frame>| {
             current.is_some_and(|tile| Some(tile.image_id) == s.current
-                && backing_matches_tile((base.image_id, &base.geometry), (tile.image_id, &tile.geometry, tile.region)))
+                && backing_matches_tile((base.image_id, &base.geometry, base.portrait_applied), (tile.image_id, &tile.geometry, tile.region, tile.portrait_applied)))
         };
-        let after_backing = s.preview.full_after.as_ref().filter(|base| matching_backing(base, s.preview.frame.as_ref())).map(backing);
-        let before_backing = s.preview.full_before.as_ref().filter(|base| matching_backing(base, s.preview.before.as_ref())).map(backing);
+        let after_backing = s.preview.full_after.as_ref().filter(|base| matching_backing(base, after_frame)).map(backing);
+        let before_backing = s.preview.full_before.as_ref().filter(|base| {
+            after_frame.is_some_and(|after| !after.portrait_applied) && matching_backing(base, before_frame)
+        }).map(backing);
         let info = s.current_info().cloned();
         let cursor = s.cursor;
         let show_info = s.view.show_info_overlay && !s.presenting();
@@ -790,7 +800,7 @@ impl Render for Viewer {
                         .when_some(after, |this, a| {
                             this.child(motion::enter(SharedString::from(format!("viewer-img-{image_key}")), div().absolute().size_full().child(a), 0.0))
                         })
-                        .when(compare == CompareMode::Split, |this| {
+                        .when(show_split, |this| {
                             this.child(div().absolute().top_0().left_0().bottom_0().w(px(split * pl.vw)).overflow_hidden()
                                 .when_some(before_backing, |layer, image| layer.child(image))
                                 .when_some(before, |layer, image| layer.child(image)))

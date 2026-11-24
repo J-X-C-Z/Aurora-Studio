@@ -284,6 +284,7 @@ pub struct Frame {
     /// The developed-frame region this frame shows.
     pub region: NormRect,
     pub(crate) geometry: Geometry,
+    pub(crate) portrait_applied: bool,
     pub image_id: ImageId,
     /// Clipped highlights (red) and shadows (blue), when the exposure warning is on.
     pub warning: Option<Arc<RenderImage>>,
