@@ -36,7 +36,7 @@ pub use speed::{SpeedEdit, SpeedParam};
 pub use cull::Cull;
 pub use ahead::MergeKind;
 pub use scopes::ScopeKind;
-pub use nodes::{GraphExt, NewNode, add_shape, flattened, is_full};
+pub use nodes::{GraphExt, NewNode, add_shape, flattened, flattened_checked, is_full};
 pub mod open {
     pub use super::source::{demo, display_name, is_catalog, open};
 }

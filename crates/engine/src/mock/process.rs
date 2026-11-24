@@ -897,6 +897,7 @@ struct MaskGridCacheKey {
 fn cached_mask_grids(
     src: &Source,
     adj: &AdjustmentSet,
+    active: &[&Layer],
     aspect: f32,
     cell_px: f32,
     guide: Option<&[f32]>,
@@ -906,8 +907,6 @@ fn cached_mask_grids(
         Mutex<Vec<(MaskGridCacheKey, Arc<Vec<Option<Arc<MaskGrid>>>>)>>,
     > =
         OnceLock::new();
-    let active: Vec<&Layer> =
-        adj.layers.iter().filter(|layer| layer.enabled && layer.opacity > 0.0).collect();
     let key = MaskGridCacheKey {
         source: src.snapshot_id(),
         geometry: adj.geometry.clone(),
@@ -1286,10 +1285,15 @@ fn layer_plans<'a>(
     guide: Option<&[f32]>,
     mask_overlay: Option<u64>,
 ) -> Vec<LayerPlan<'a>> {
-    let grids = cached_mask_grids(src, adj, aspect, cell_px, guide);
-    adj.layers
-        .iter()
+    // A stored node graph prunes here, not only in the interface: export,
+    // batch, thumbnails and the picker all reach this same list.
+    let active: Vec<&'a Layer> = crate::render_layers(adj)
+        .into_iter()
         .filter(|layer| layer.enabled && layer.opacity > 0.0)
+        .collect();
+    let grids = cached_mask_grids(src, adj, &active, aspect, cell_px, guide);
+    active
+        .iter()
         .zip(grids.iter().cloned())
         .map(|(layer, grid)| layer_plan(layer, adj, grid, mask_overlay))
         .collect()
@@ -2259,7 +2263,8 @@ fn render_sized(
     let cell_px = oriented.0 / 256.0;
     let (gw, gh) = grid_dims(aspect);
     // The refine edge only needs the luminance guide when a layer asks for it.
-    let needs_guide = adj.layers.iter().any(|l| {
+    // Pruned layers cannot ask, so the guide follows the render list.
+    let needs_guide = crate::render_layers(adj).iter().any(|l| {
         l.enabled && l.opacity > 0.0 && l.mask.refine > 0.0 && !l.mask.shapes.is_empty()
     });
     let guide = needs_guide.then(|| luma_guide(src, &adj.geometry, gw, gh));
@@ -6792,8 +6797,12 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             });
         }
 
-        let first = cached_mask_grids(&src, &adj, 4.0 / 3.0, 4.0, None);
-        let second = cached_mask_grids(&src, &adj, 4.0 / 3.0, 4.0, None);
+        let active: Vec<&Layer> = crate::render_layers(&adj)
+            .into_iter()
+            .filter(|layer| layer.enabled && layer.opacity > 0.0)
+            .collect();
+        let first = cached_mask_grids(&src, &adj, &active, 4.0 / 3.0, 4.0, None);
+        let second = cached_mask_grids(&src, &adj, &active, 4.0 / 3.0, 4.0, None);
         assert!(Arc::ptr_eq(&first, &second));
 
         for (a, b) in first.iter().zip(second.iter()) {
@@ -7142,6 +7151,77 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let a = render(&src, &ab, NormRect::FULL, w, false, None);
         let b = render(&src, &ba, NormRect::FULL, w, false, None);
         assert_ne!(a.rgba, b.rgba, "layer order must change the result");
+    }
+
+    fn graph_of(layers: &[u64], path: &[u64]) -> crate::NodeGraph {
+        let mut nodes = vec![
+            crate::GraphNode {
+                id: crate::NodeGraph::INPUT,
+                kind: crate::NodeKind::Input,
+                pos: [0.0; 2],
+            },
+            crate::GraphNode {
+                id: crate::NodeGraph::OUTPUT,
+                kind: crate::NodeKind::Output,
+                pos: [0.0; 2],
+            },
+        ];
+        nodes.extend(layers.iter().map(|id| crate::GraphNode {
+            id: *id,
+            kind: crate::NodeKind::Layer,
+            pos: [0.0; 2],
+        }));
+        let mut links = Vec::new();
+        let mut from = crate::NodeGraph::INPUT;
+        for id in path {
+            links.push(crate::NodeLink { from, to: *id, input: 0 });
+            from = *id;
+        }
+        links.push(crate::NodeLink { from, to: crate::NodeGraph::OUTPUT, input: 0 });
+        crate::NodeGraph { nodes, links }
+    }
+
+    /// A graph stored in the document prunes like the live interface: a layer
+    /// the output does not use must not reach the pixels even when the engine
+    /// is called directly (export, batch, thumbnails, the picker).
+    #[test]
+    fn stored_graph_prunes_layers_that_do_not_feed_the_output() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let mut adj = AdjustmentSet::default();
+        adj.layers = vec![tone_layer(1, 0.8, 0.0), tone_layer(2, -1.5, 0.0)];
+        // 1 -> output; row 2 is stored but nothing renders it.
+        adj.nodes = Some(graph_of(&[1, 2], &[1]));
+        let pruned = render(&src, &adj, NormRect::FULL, w, false, None).rgba;
+
+        let mut only_one = adj.clone();
+        only_one.nodes = None;
+        only_one.layers.retain(|layer| layer.id == 1);
+        assert_eq!(pruned, render(&src, &only_one, NormRect::FULL, w, false, None).rgba);
+
+        let mut both = adj.clone();
+        both.nodes = None;
+        assert_ne!(pruned, render(&src, &both, NormRect::FULL, w, false, None).rgba);
+    }
+
+    /// The stored list may be unsorted; the graph's order is the draw order.
+    #[test]
+    fn a_stored_graph_sets_the_layer_order() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let mut adj = AdjustmentSet::default();
+        adj.layers = vec![tone_layer(2, 0.0, 30.0), tone_layer(1, 0.8, 0.0)];
+        adj.nodes = Some(graph_of(&[1, 2], &[1, 2]));
+        let graphed = render(&src, &adj, NormRect::FULL, w, false, None).rgba;
+
+        let mut forward = adj.clone();
+        forward.nodes = None;
+        forward.layers = vec![tone_layer(1, 0.8, 0.0), tone_layer(2, 0.0, 30.0)];
+        assert_eq!(graphed, render(&src, &forward, NormRect::FULL, w, false, None).rgba);
+
+        let mut reversed = forward.clone();
+        reversed.layers = vec![tone_layer(2, 0.0, 30.0), tone_layer(1, 0.8, 0.0)];
+        assert_ne!(graphed, render(&src, &reversed, NormRect::FULL, w, false, None).rgba);
     }
 
     /// A layer with a curve and a hard-edged mask on the left half.

@@ -54,8 +54,8 @@ pub const KEYSTONE: Status = Status::Partial("Direction assumed, not verified ag
 pub const LOCAL_ADJUSTMENTS: Status = Status::Partial("Copied shapes carry zero weight", "复制形状权重为 0");
 /// The node graph is stored with the variant; engines still render the layer list in series.
 pub const NODE_GRAPH: Status = Status::Partial(
-    "Parallel and layer mixers render their branches in series; export still includes disconnected nodes",
-    "并行与图层混合器暂按串联渲染分支；导出暂仍包含未连接的节点",
+    "Parallel and layer mixers render their branches in series; disconnected nodes are pruned from render and export alike",
+    "并行与图层混合器暂按串联渲染分支；未连接的节点在渲染与导出中都会被剪掉",
 );
 pub const SPOTS: Status = Status::Partial("Healing is approximate", "修复为近似实现");
 pub const C1_CATALOG: Status = Status::Partial("Collections and WAL only", "仅集合与 WAL");
