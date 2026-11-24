@@ -37,16 +37,44 @@ const WIRED_SKIN_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:30096", "Skin temperature", "色调", 0.5),
     ("pc:90005", "Whitening", "美白", 0.0),
     ("pc:90007", "Rosy", "红润", 0.0),
+    ("pc:90004", "Skin radiance", "皮肤透亮", 0.0),
     ("pc:8068", "Skin gloss", "皮肤光泽", 0.5),
     ("pc:8069", "Skin texture", "肤质", 0.5),
     ("pc:8070", "Skin clarity", "清晰度", 0.0),
     ("pc:30021", "Face smooth (HLF)", "中性灰/高低频磨皮", 0.0),
     ("pc:30022", "Body smooth (HLF)", "全身磨皮", 0.0),
+    ("pc:30013", "Neutral grey flat", "中性灰平", 0.0),
+    ("pc:30014", "Neutral grey 3D", "中性灰 3D", 0.0),
+    ("pc:90002", "Moisture smooth (face)", "水润磨皮（脸部）", 0.0),
+    ("pc:90010", "Moisture smooth (body)", "水润磨皮（身体）", 0.0),
+    ("pc:21105", "AI body skin tone unify", "AI 身体肤色统一", 0.0),
+    ("pc:90086", "Body skin tone unify", "肤色统一（身体）", 0.0),
+    ("pc:90023", "Eye wrinkles", "祛眼纹", 0.0),
+    ("pc:90024", "Forehead wrinkles", "祛抬头纹", 0.0),
+    ("pc:21024", "Glabella wrinkles", "祛眉间纹", 0.0),
+    ("pc:21025", "Puppet wrinkles", "祛木偶纹", 0.0),
+    ("pc:21069", "Cheek wrinkles", "祛面颊纹", 0.0),
+    ("pc:21070", "Nose back wrinkles", "祛鼻背纹", 0.0),
+    ("pc:21071", "Perioral wrinkles", "祛口周纹", 0.0),
+    ("pc:90021", "Lip makeup enhance", "唇妆增强", 0.5),
+];
+
+/// Eye effects wired to FaceParsingV2 / face-input pipeline.
+const WIRED_EYES_EFFECTS: &[(&str, &str, &str, f32)] = &[
+    ("pc:100004", "Red blood removal", "去红血丝", 0.0),
+    ("pc:101", "Silkworm", "卧蚕", 0.0),
+];
+
+/// Hair effects wired to FaceParsingV2 / same-job producer inputs.
+const WIRED_HAIR_EFFECTS: &[(&str, &str, &str, f32)] = &[
+    ("pc:30009", "Hair color unify", "统一发色", 0.0),
 ];
 
 /// Teeth effects wired to canonical FaceParsingV2 (`fbe.onnx`) on CUDA.
 const WIRED_TEETH_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:108", "Teeth whitening", "美牙/牙齿美白", 0.0),
+    ("pc:109", "Teeth brightness", "牙齿亮白", 0.0),
+    ("pc:110", "Teeth de-yellow", "牙齿去黄", 0.0),
 ];
 
 /// Face geometry reshape effects wired to real 194->414 landmarks + CUDA mesh raster.
@@ -54,6 +82,8 @@ const WIRED_TEETH_EFFECTS: &[(&str, &str, &str, f32)] = &[
 const WIRED_FACE_GEOMETRY_EFFECTS: &[(&str, &str, &str)] = &[
     ("pc:30092", "Face width (L)", "窄脸（左）"),
     ("pc:30093", "Face width (R)", "窄脸（右）"),
+    ("pc:247", "V-face (L)", "V 脸（左）"),
+    ("pc:248", "V-face (R)", "V 脸（右）"),
     ("pc:242", "Sharp chin (L)", "尖下巴（左）"),
     ("pc:243", "Sharp chin (R)", "尖下巴（右）"),
     ("pc:8023", "Jawline (L)", "下颌角（左）"),
@@ -66,22 +96,74 @@ const WIRED_FACE_GEOMETRY_EFFECTS: &[(&str, &str, &str)] = &[
     ("pc:30081", "Forehead width (R)", "额头宽窄（右）"),
     ("pc:30082", "Forehead height (L)", "额头高低（左）"),
     ("pc:30083", "Forehead height (R)", "额头高低（右）"),
+    ("pc:202", "Hairline", "发际线"),
+    ("pc:232", "Skull top enhance", "高颅顶"),
+    ("pc:8033", "Smile mouth corner", "微笑嘴角"),
+    ("pc:8019", "Eye width (L)", "眼宽（左）"),
+    ("pc:8020", "Eye width (R)", "眼宽（右）"),
+    ("pc:8013", "Eye height (L)", "眼高（左）"),
+    ("pc:8014", "Eye height (R)", "眼高（右）"),
+    ("pc:8015", "Eye distance (L)", "眼距（左）"),
+    ("pc:8016", "Eye distance (R)", "眼距（右）"),
+    ("pc:8017", "Eye tilt (L)", "眼角倾斜（左）"),
+    ("pc:8018", "Eye tilt (R)", "眼角倾斜（右）"),
+    ("pc:8011", "Pupil size (L)", "眼瞳大小（左）"),
+    ("pc:8012", "Pupil size (R)", "眼瞳大小（右）"),
+    ("pc:30073", "Lower eyelid (L)", "眼睑下至（左）"),
+    ("pc:30079", "Lower eyelid (R)", "眼睑下至（右）"),
+    ("pc:8001", "Brow thickness (L)", "眉粗细（左）"),
+    ("pc:8002", "Brow thickness (R)", "眉粗细（右）"),
+    ("pc:8005", "Brow distance (L)", "眉距（左）"),
+    ("pc:8006", "Brow distance (R)", "眉距（右）"),
+    ("pc:8009", "Brow shape (L)", "眉形（左）"),
+    ("pc:8010", "Brow shape (R)", "眉形（右）"),
+    ("pc:8021", "Brow position (L)", "眉位（左）"),
+    ("pc:8022", "Brow position (R)", "眉位（右）"),
+    ("pc:44124", "Brow head length (L)", "眉头长短（左）"),
+    ("pc:48019", "Brow head length (R)", "眉头长短（右）"),
+    ("pc:41922", "Brow tail length (L)", "眉尾长短（左）"),
+    ("pc:49221", "Brow tail length (R)", "眉尾长短（右）"),
 ];
 
-const WIRED_TOTAL: usize =
-    WIRED_SKIN_EFFECTS.len() + WIRED_TEETH_EFFECTS.len() + WIRED_FACE_GEOMETRY_EFFECTS.len();
+/// Facial plumpness effects wired to `attach_plump_from_extra`.
+/// Stored as -100..=100 in `AdjustmentSet::extra`.
+const WIRED_PLUMP_EFFECTS: &[(&str, &str, &str)] = &[
+    ("pc:30210", "Full face plump", "全脸丰盈"),
+    ("pc:30191", "Forehead plump", "额头丰盈"),
+    ("pc:30194", "Mid-face plump", "面中丰盈"),
+    ("pc:30197", "Cheek plump", "面颊丰盈"),
+    ("pc:30198", "Nasal base plump", "鼻基底丰盈"),
+    ("pc:30203", "Brow arch plump", "眉弓丰盈"),
+    ("pc:30204", "Chin plump", "下巴丰盈"),
+    ("pc:30207", "Mouth corner lift", "嘴角上扬"),
+];
+
+const WIRED_TOTAL: usize = WIRED_SKIN_EFFECTS.len()
+    + WIRED_EYES_EFFECTS.len()
+    + WIRED_HAIR_EFFECTS.len()
+    + WIRED_TEETH_EFFECTS.len()
+    + WIRED_FACE_GEOMETRY_EFFECTS.len()
+    + WIRED_PLUMP_EFFECTS.len();
 
 pub(crate) fn has_face_reshape(adjustments: &aurora_engine::AdjustmentSet) -> bool {
-    WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|(key, ..)| {
-        adjustments.extra.get(*key).is_some_and(|amount| amount.abs() > 1.0e-6)
-    })
+    WIRED_FACE_GEOMETRY_EFFECTS
+        .iter()
+        .chain(WIRED_PLUMP_EFFECTS)
+        .any(|(key, ..)| {
+            adjustments.extra.get(*key).is_some_and(|amount| amount.abs() > 1.0e-6)
+        })
 }
 
 pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSet) -> bool {
     has_face_reshape(adjustments)
-        || WIRED_SKIN_EFFECTS.iter().chain(WIRED_TEETH_EFFECTS).any(|(key, _, _, neutral)| {
-            adjustments.extra.get(*key).is_some_and(|amount| (amount - neutral).abs() > 1.0e-6)
-        })
+        || WIRED_SKIN_EFFECTS
+            .iter()
+            .chain(WIRED_EYES_EFFECTS)
+            .chain(WIRED_HAIR_EFFECTS)
+            .chain(WIRED_TEETH_EFFECTS)
+            .any(|(key, _, _, neutral)| {
+                adjustments.extra.get(*key).is_some_and(|amount| (amount - neutral).abs() > 1.0e-6)
+            })
 }
 
 #[cfg(test)]
@@ -89,6 +171,7 @@ pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSe
 fn live_portrait_backing_excludes_neutral_values() {
     let mut adjustments = aurora_engine::AdjustmentSet::default();
     adjustments.extra.insert("pc:8069".into(), 0.5);
+    adjustments.extra.insert("pc:90021".into(), 0.5);
     adjustments.extra.insert("pc:242".into(), 0.0);
     assert!(!has_live_portrait_effect(&adjustments));
     adjustments.extra.insert("pc:90005".into(), 0.5);
@@ -96,14 +179,23 @@ fn live_portrait_backing_excludes_neutral_values() {
     adjustments.extra.remove("pc:90005");
     adjustments.extra.insert("pc:242".into(), -25.0);
     assert!(has_live_portrait_effect(&adjustments));
+    adjustments.extra.remove("pc:242");
+    adjustments.extra.insert("pc:30210".into(), 20.0);
+    assert!(has_live_portrait_effect(&adjustments));
+    adjustments.extra.remove("pc:30210");
+    adjustments.extra.insert("pc:90023".into(), 0.3);
+    assert!(has_live_portrait_effect(&adjustments));
 }
 
 /// Catalogue bands must not duplicate a control that already has a dedicated
 /// wired panel: both rows would use the same `pc:<id>` key and reset together.
 fn is_wired_key(key: &str) -> bool {
     WIRED_SKIN_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_EYES_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_HAIR_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_TEETH_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_PLUMP_EFFECTS.iter().any(|row| row.0 == key)
 }
 
 fn portrait_amount_binding(key: &'static str, default: f32) -> Binding {
@@ -210,7 +302,9 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             .into_any_element();
     }
 
-    col = col.child(wired_face_geometry_panel(state, &query, cx));
+    col = col
+        .child(wired_face_geometry_panel(state, &query, cx))
+        .child(wired_plump_panel(state, &query, cx));
     for (group, en, zh) in RETOUCH_GROUPS {
         col = col.child(retouch_panel(state, group, t(en, zh), &query, cx));
     }
@@ -272,11 +366,62 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
         .into_any_element()
 }
 
+fn wired_plump_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
+    let s = state.read(cx);
+    let shown: Vec<_> = WIRED_PLUMP_EFFECTS
+        .iter()
+        .filter(|(key, en, zh)| matches(query, t(*en, *zh), *key, None))
+        .collect();
+    if shown.is_empty() && !query.is_empty() {
+        return div().into_any_element();
+    }
+    let keys: Vec<&'static str> = WIRED_PLUMP_EFFECTS.iter().map(|(k, ..)| *k).collect();
+    let modified = keys.iter().any(|k| s.adj().extra.contains_key(*k));
+    let st = state.clone();
+    ToolPanel::new(state, "retouch-face-plump", t("Facial Plumpness", "面部丰盈"))
+        .status(Status::Partial(
+            "Facial plumpness requires face landmarks and plump ONNX models",
+            "面部丰盈需要检测到面部关键点并加载丰盈模型",
+        ))
+        .modified(modified)
+        .on_reset(move |_, cx| {
+            let keys = keys.clone();
+            st.update(cx, |s, cx| {
+                s.edit(t("Reset plumpness", "复位面部丰盈"), |a| {
+                    for k in &keys {
+                        a.extra.remove(*k);
+                    }
+                }, cx)
+            })
+        })
+        .children(shown.into_iter().map(|(key, en, zh)| {
+            param(
+                state,
+                format!("fp-{key}"),
+                t(*en, *zh),
+                extra_binding(*key, 0.0),
+                -100.0,
+                100.0,
+                cx,
+            )
+            .default_value(0.0)
+        }))
+        .into_any_element()
+}
+
 fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static str, query: &str, cx: &App) -> AnyElement {
     let s = state.read(cx);
     let metas: Vec<_> = s.engine.param_metadata().iter().filter(|m| m.group == group).collect();
     let wired: Vec<_> = match group {
         "RetouchFaceSkin" => WIRED_SKIN_EFFECTS
+            .iter()
+            .filter(|(key, en, zh, _)| matches(query, t(*en, *zh), *key, None))
+            .collect(),
+        "RetouchEyes" => WIRED_EYES_EFFECTS
+            .iter()
+            .filter(|(key, en, zh, _)| matches(query, t(*en, *zh), *key, None))
+            .collect(),
+        "RetouchHair" => WIRED_HAIR_EFFECTS
             .iter()
             .filter(|(key, en, zh, _)| matches(query, t(*en, *zh), *key, None))
             .collect(),
@@ -302,13 +447,25 @@ fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static 
                 "皮肤效果需要有效输入；旧版滑块尚未接入渲染",
             ),
         ),
-        "RetouchEyes" => ("retouch-eyes", contract::RETOUCH),
-        "RetouchHair" => ("retouch-hair", contract::RETOUCH),
+        "RetouchEyes" => (
+            "retouch-eyes",
+            Status::Partial(
+                "Eye enhancement requires FaceParsingV2 / face input on this photo",
+                "眼部修饰需要在当前照片中检测到有效的分割与面部输入",
+            ),
+        ),
+        "RetouchHair" => (
+            "retouch-hair",
+            Status::Partial(
+                "Hair color unify requires hair segmentation input on this photo",
+                "统一发色需要在当前照片中检测到有效的头发分割输入",
+            ),
+        ),
         _ => (
             "retouch-teeth",
             Status::Partial(
-                "PF108 teeth whitening renders live via FaceParsingV2 on CUDA",
-                "美牙（PF108）已通过 FaceParsingV2 实时渲染",
+                "Teeth whitening (PF108/109/110) renders live via FaceParsingV2 on CUDA",
+                "美牙（PF108/109/110）已通过 FaceParsingV2 实时渲染",
             ),
         ),
     };
