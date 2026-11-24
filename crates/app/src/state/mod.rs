@@ -11,6 +11,7 @@ pub(crate) mod render;
 mod settings;
 mod source;
 mod arrange;
+mod panel_order;
 mod speed;
 mod show;
 mod nodes;
@@ -388,8 +389,13 @@ pub struct PanelPrefs {
     pub pick_to_range: bool,
     /// Filter typed into the Portrait tab's search field.
     pub portrait_query: String,
-    /// The portrait parameters are shown although nothing renders them yet.
+    /// The Portrait tab shows the whole parameter catalogue ("All"), not only
+    /// the controls the renderer uses ("Live").
     pub portrait_open: bool,
+    /// Face reshape moves left and right together.
+    pub portrait_link_lr: bool,
+    /// AI mask kinds ticked in the mask panel, waiting for "Create".
+    pub ai_pick: Vec<AiMaskKind>,
     /// What the scopes panel draws; `Off` costs nothing per frame.
     pub scope_kind: ScopeKind,
 }
@@ -418,7 +424,9 @@ impl Default for PanelPrefs {
             capture_adjust: 0,
             capture_folder: "Capture".into(),
             portrait_query: String::new(),
-            portrait_open: true,
+            portrait_open: false,
+            portrait_link_lr: true,
+            ai_pick: Vec::new(),
             scope_kind: ScopeKind::Off,
             pick_to_range: false,
             stack_styles: false,
@@ -1656,32 +1664,79 @@ impl AppState {
         if live { self.edit_live(label, apply, cx) } else { self.edit(label, apply, cx) }
     }
 
-    pub fn compute_ai_mask(&mut self, kind: AiMaskKind, cx: &mut Context<Self>) {
+    /// Ticks or unticks an AI mask kind for the next "Create" in the mask panel.
+    pub fn toggle_ai_pick(&mut self, kind: AiMaskKind, cx: &mut Context<Self>) {
+        let pick = &mut self.panels.ai_pick;
+        if let Some(i) = pick.iter().position(|k| *k == kind) {
+            pick.remove(i);
+        } else {
+            pick.push(kind);
+            pick.sort_by_key(|k| AiMaskKind::ALL.iter().position(|a| a == k));
+        }
+        cx.notify();
+    }
+
+    /// Computes every ticked AI mask, one after another off the UI thread, and
+    /// adds them to the layer that was selected when this started as one undo
+    /// step (from the base, they go on one new layer). A result for an image
+    /// no longer shown, or a layer since deleted, is dropped.
+    pub fn compute_ai_masks(&mut self, kinds: Vec<AiMaskKind>, cx: &mut Context<Self>) {
         let Some(image) = self.current else { return };
+        if kinds.is_empty() || self.ai_busy {
+            return;
+        }
         let engine = self.engine.clone();
+        let scope = self.scope();
         self.ai_busy = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { engine.compute_ai_mask(image, kind) }).await;
+            let results = cx
+                .background_spawn(async move { kinds.into_iter().map(|k| (k, engine.compute_ai_mask(image, k))).collect::<Vec<_>>() })
+                .await;
             this.update(cx, |this, cx| {
                 this.ai_busy = false;
-                match result {
-                    Ok(key) => {
-                        this.ai_unavailable.remove(&kind);
-                        let shape = MaskShape::Ai(AiMask { op: MaskOp::Add, kind, cache_key: Some(key) });
-                        match this.scope() {
-                            Scope::Layer(id) => this.edit_layer(t("AI mask", "AI 蒙版"), id, false, |l| nodes::add_shape(&mut l.mask, shape), cx),
-                            Scope::Global => {
-                                let mask = Mask { shapes: vec![shape], ..Default::default() };
-                                this.add_layer(LayerKind::Adjustment, Some(format!("AI · {kind:?}")), Some(mask), cx);
-                            }
+                if this.current != Some(image) {
+                    cx.notify();
+                    return;
+                }
+                let mut shapes = Vec::new();
+                let mut failed = Vec::new();
+                for (kind, result) in results {
+                    match result {
+                        Ok(key) => {
+                            this.ai_unavailable.remove(&kind);
+                            shapes.push((kind, MaskShape::Ai(AiMask { op: MaskOp::Add, kind, cache_key: Some(key) })));
+                        }
+                        Err(err) => {
+                            this.ai_unavailable.insert(kind);
+                            failed.push(format!("{kind:?}: {err}"));
                         }
                     }
-                    Err(err) => {
-                        this.ai_unavailable.insert(kind);
-                        this.notify(format!("{}: {err}", t("AI mask unavailable", "AI 蒙版不可用")), cx);
+                }
+                this.panels.ai_pick.clear();
+                if !shapes.is_empty() {
+                    let label = t("AI mask", "AI 蒙版");
+                    match scope {
+                        Scope::Layer(id) if this.adj().layers.iter().any(|l| l.id == id) => this.edit_layer(label, id, false, |l| {
+                            for (_, shape) in shapes {
+                                nodes::add_shape(&mut l.mask, shape);
+                            }
+                        }, cx),
+                        Scope::Layer(_) => {}
+                        Scope::Global => {
+                            let name = format!("AI · {}", shapes.iter().map(|(k, _)| format!("{k:?}")).collect::<Vec<_>>().join(" + "));
+                            let mut mask = Mask::default();
+                            for (_, shape) in shapes {
+                                nodes::add_shape(&mut mask, shape);
+                            }
+                            this.add_layer(LayerKind::Adjustment, Some(name), Some(mask), cx);
+                        }
                     }
                 }
+                if !failed.is_empty() {
+                    this.notify(format!("{}: {}", t("AI mask unavailable", "AI 蒙版不可用"), failed.join("; ")), cx);
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -1889,6 +1944,8 @@ impl AppState {
             hidden_tabs: self.settings.workspace.hidden_tabs.clone(),
             tab_order: self.settings.workspace.tab_order.clone(),
             quick_tools: self.settings.workspace.quick_tools.clone(),
+            panel_order: self.settings.workspace.panel_order.clone(),
+            pinned_panels: self.settings.workspace.pinned_panels.clone(),
             tab: tab_id(self.tool_tab),
             inspector_width: self.view.inspector_width,
             filmstrip_height: self.view.filmstrip_height,
@@ -1999,18 +2056,6 @@ impl AppState {
         }
         self.save_settings();
         cx.notify();
-    }
-
-    /// Moves a panel up (`-1`) or down (`1`) within the Quick tab.
-    pub fn move_quick(&mut self, panel: &str, delta: isize, cx: &mut Context<Self>) {
-        let tools = &mut self.settings.workspace.quick_tools;
-        let Some(i) = tools.iter().position(|p| p == panel) else { return };
-        let j = i as isize + delta;
-        if (0..tools.len() as isize).contains(&j) {
-            tools.swap(i, j as usize);
-            self.save_settings();
-            cx.notify();
-        }
     }
 
     pub fn set_tab_hidden(&mut self, tab: ToolTab, hidden: bool, cx: &mut Context<Self>) {

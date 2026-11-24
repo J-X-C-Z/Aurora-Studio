@@ -17,7 +17,7 @@ pub use controls::{IconBtn, Segmented, select, switch_row};
 pub use curve::CurveEditor;
 pub use histogram::{HistogramMode, HistogramView};
 pub use levels::LevelsView;
-pub use panel::{HeaderAction, ToolPanel, caption, row};
+pub use panel::{HeaderAction, PanelStack, ToolPanel, caption, row};
 pub use param_c1::param_c1;
 pub use param_portrait::param_portrait;
 pub use slider::{ParamSlider, Scale, Track, param};
