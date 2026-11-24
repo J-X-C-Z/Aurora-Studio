@@ -1665,6 +1665,167 @@ fn build_plan<'a>(
     }
 }
 
+/// Logs the first reason the develop plane cannot use CUDA, once per process.
+#[cfg(windows)]
+fn log_develop_gpu_fallback(reason: &str) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    if LOGGED.set(()).is_ok() {
+        log::info!("develop GPU: {reason}; using the CPU path");
+    }
+}
+
+/// CPU-computed per-output-pixel product of the LCC and manual-vignette gains.
+///
+/// The CPU path multiplies these into the linear pixel one after the other; a
+/// single plane is the same operator because both are scalar gains. LCC needs
+/// the source-coordinate `FrameMap`, which the GPU does not carry, so it is
+/// resolved here exactly as `linear_edits` does.
+#[cfg(windows)]
+fn develop_gpu_gain_plane(
+    plan: &Plan,
+    adj: &AdjustmentSet,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    xs: &[f32],
+) -> Option<Vec<f32>> {
+    let vignette_active = adj.vignetting.amount.abs() > 1e-3;
+    if plan.uniform_light.is_none() && !vignette_active {
+        return None;
+    }
+    let width = out_w as usize;
+    let mut out = vec![1.0f32; width * out_h as usize];
+    out.par_chunks_mut(width).enumerate().for_each(|(y, line)| {
+        let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
+        for (x, gain_out) in line.iter_mut().enumerate() {
+            let f = [xs[x], fy];
+            let mut gain = 1.0f32;
+            if let Some((uniform, map, size)) = &plan.uniform_light {
+                let (_, source) = map.map(f);
+                let source = [source[0] * size[0] - 0.5, source[1] * size[1] - 0.5];
+                gain = match plan.pixel_gains.as_ref().and_then(|gains| gains.lcc.as_ref()) {
+                    Some((plane, pw, ph)) => {
+                        super::pixel_gpu::sample_plane(plane, *pw, *ph, source[0], source[1])
+                    }
+                    None => uniform.source_gain(source),
+                };
+            }
+            if vignette_active {
+                let method = if adj.vignetting.center == VignetteCenter::Custom {
+                    VignetteMethod::Circular
+                } else {
+                    adj.vignetting.method
+                };
+                let index = y * width + x;
+                let v = plan
+                    .pixel_gains
+                    .as_ref()
+                    .and_then(|gains| gains.vignette.as_ref())
+                    .and_then(|plane| plane.get(index).copied())
+                    .unwrap_or_else(|| {
+                        vignette_gain(
+                            f[0],
+                            f[1],
+                            method,
+                            adj.vignetting.amount,
+                            plan.aspect,
+                            vignette_center(adj, plan.size),
+                        )
+                    });
+                gain *= v;
+            }
+            *gain_out = gain;
+        }
+    });
+    Some(out)
+}
+
+/// The GPU develop plane for this frame, or `None` when the existing CPU path
+/// must run. Every refusal is logged once, not once per frame.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gpu_develop_context(
+    plan: &Plan,
+    adj: &AdjustmentSet,
+    bypass: bool,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    xs: &[f32],
+    camera_usm_path: bool,
+) -> Option<(super::develop_gpu::DevelopParams, Option<Vec<f32>>)> {
+    use super::develop_gpu;
+    if !develop_gpu::enabled() {
+        return None;
+    }
+    if let Some(reason) =
+        develop_gpu::fallback_reason(adj, adj.clarity.clarity.abs() > 1e-4, false)
+    {
+        log_develop_gpu_fallback(reason);
+        return None;
+    }
+    if camera_usm_path {
+        log_develop_gpu_fallback("camera-space USM needs the C1 intermediate");
+        return None;
+    }
+    if region != NormRect::FULL {
+        log_develop_gpu_fallback("only full-frame develop regions are GPU-backed");
+        return None;
+    }
+    if !develop_gpu::prewarm() {
+        log_develop_gpu_fallback("CUDA device/PTX unavailable");
+        return None;
+    }
+    let mut params = develop_gpu::DevelopParams::from_adjustments(
+        adj,
+        render_wb_gains(&adj.white_balance),
+        plan.exposure,
+        plan.fine,
+    );
+    params.bypass = bypass;
+    // The streamed and `develop_at` paths never run the outer banding stage.
+    params.banding_outer = false;
+    if let Some(banding) = &plan.banding {
+        params.banding = develop_gpu::BandingParams::from_vendor(banding.params, banding.frame);
+    }
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    if let Some(stage) = &plan.c1_color {
+        match develop_gpu::C1ColorParams::from_stage(stage) {
+            Some(c1) => params.c1 = Some(c1),
+            None => {
+                log_develop_gpu_fallback("C1 colour tables are not GPU-compatible");
+                return None;
+            }
+        }
+    }
+    let gain = if bypass {
+        None
+    } else {
+        develop_gpu_gain_plane(plan, adj, region, out_w, out_h, xs)
+    };
+    Some((params, gain))
+}
+
+/// The already-sampled frame, converted to the develop module's POD sample.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gpu_develop_samples(
+    src: &Source,
+    map: &super::geometry::FrameMap,
+    adj: &AdjustmentSet,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    sharp: bool,
+    xs: &[f32],
+) -> Vec<super::develop_gpu::Sample> {
+    source_samples(src, map, &adj.geometry, region, out_w, out_h, level, sharp, xs)
+        .iter()
+        .map(|sample| super::develop_gpu::Sample { rgb: sample.rgb, valid: sample.valid })
+        .collect()
+}
+
 fn render_sized(
     src: &Source,
     adj: &AdjustmentSet,
@@ -1802,6 +1963,54 @@ fn render_sized(
             || adj.noise_reduction.color > 0.0
             || (f32_includes_sharpen && adj.sharpening.amount > 0.0));
     let gpu_two_pass = !bypass && gpu_clarity && region == NormRect::FULL && !has_camera_color(&plan);
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    let camera_usm_path = use_f32_detail
+        && plan.c1_color.is_some()
+        && f32_includes_sharpen
+        && adj.sharpening.amount > 0.0;
+    #[cfg(all(windows, not(feature = "z6iii-raw-export")))]
+    let camera_usm_path = false;
+    #[cfg(windows)]
+    let gpu_develop = gpu_develop_context(
+        &plan,
+        adj,
+        bypass,
+        region,
+        out_w,
+        out_h,
+        &xs,
+        camera_usm_path,
+    );
+    // Bypass / no-detail renders take the direct u8/u16 line path; run the
+    // point chain once here and let the existing encoder quantise it.
+    #[cfg(windows)]
+    let gpu_direct: Option<Vec<[f32; 3]>> =
+        if gpu_two_pass || use_f32_detail || gpu_develop.is_none() {
+            None
+        } else {
+            gpu_develop.as_ref().and_then(|(params, gain)| {
+                let samples =
+                    gpu_develop_samples(src, &map, adj, region, out_w, out_h, level, sharp, &xs);
+                let mut display = vec![[0.0f32; 3]; (out_w * out_h) as usize];
+                let region4 = [region.x, region.y, region.width, region.height];
+                if super::develop_gpu::develop_plane(
+                    &samples,
+                    out_w as usize,
+                    out_h as usize,
+                    region4,
+                    params,
+                    gain.as_deref(),
+                    &mut display,
+                ) {
+                    Some(display)
+                } else {
+                    log_develop_gpu_fallback("CUDA develop launch failed");
+                    None
+                }
+            })
+        };
+    #[cfg(not(windows))]
+    let gpu_direct: Option<Vec<[f32; 3]>> = None;
     if gpu_two_pass {
         let sharpen_in_display = f32_includes_sharpen;
         let row_f32 = out_w as usize;
@@ -1889,6 +2098,32 @@ fn render_sized(
         let work_w = out_w as usize + 2 * halo;
         let work_h = out_h as usize + 2 * halo;
         let mut rgb_f32 = vec![[0.0f32; 3]; work_w * work_h];
+        let mut gpu_filled = false;
+        #[cfg(windows)]
+        if let Some((params, gain)) = &gpu_develop {
+            let samples =
+                gpu_develop_samples(src, &map, adj, region, out_w, out_h, level, sharp, &xs);
+            let mut display = vec![[0.0f32; 3]; (out_w * out_h) as usize];
+            let region4 = [region.x, region.y, region.width, region.height];
+            if super::develop_gpu::develop_plane(
+                &samples,
+                out_w as usize,
+                out_h as usize,
+                region4,
+                params,
+                gain.as_deref(),
+                &mut display,
+            ) {
+                display.par_iter_mut().for_each(|rgb| {
+                    *rgb = [rgb[0].clamp(0.0, 1.0), rgb[1].clamp(0.0, 1.0), rgb[2].clamp(0.0, 1.0)];
+                });
+                rgb_f32.copy_from_slice(&display);
+                gpu_filled = true;
+            } else {
+                log_develop_gpu_fallback("CUDA develop launch failed");
+            }
+        }
+        if !gpu_filled {
         if halo != 0 {
             // Preserve the viewport's sample centers and fetch neighbors in the
             // surrounding image. Clamp only at the developed frame boundary.
@@ -1920,6 +2155,7 @@ fn render_sized(
                 let srow = &samples[y * work_w..(y + 1) * work_w];
                 develop_line_with_f32(&develop_detail_input, region, out_h, &xs, y, line, |x, _, _| srow[x]);
             });
+        }
         }
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
         if let Some(c1) = camera_usm {
@@ -1966,6 +2202,8 @@ fn render_sized(
                     });
             }
         }
+    } else if let Some(display) = gpu_direct.as_deref() {
+        encode_f32_frame(display, &mut rgba, rgba16.as_deref_mut(), out_w as usize);
     } else if streams_source_samples(out_w, out_h) {
         match rgba16.as_mut() {
             Some(wide_line) => {
@@ -2214,55 +2452,38 @@ fn render_sized(
                 || adj.lens.shift_x.abs() > 1.0e-6
                 || adj.lens.shift_y.abs() > 1.0e-6
                 || adj.lens.tilt.abs() > 1.0e-6;
-            if geometric_lens && region == NormRect::FULL {
-                if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
-                    match stage_face_bundle(receipt.job_id(), &stage_frame, false) {
-                        Ok(bundle) => match bundle.slim_inputs(&stage_frame) {
-                            Ok(slim) => {
-                                let mut inputs = producer_inputs.take().unwrap_or_default();
-                                inputs.slim = Some(slim);
-                                producer_inputs = Some(inputs);
-                            }
-                            Err(refusal) => {
-                                log::warn!("stage face input refused: {refusal:?}");
-                            }
-                        },
-                        Err(refusal) => {
-                            log::warn!("stage face inference refused: {refusal:?}");
-                        }
+            if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
+                let on_stage = || {
+                    stage_face_bundle(receipt.job_id(), &stage_frame, false)?
+                        .slim_inputs(&stage_frame)
+                };
+                let slim = if geometric_lens {
+                    on_stage()
+                } else {
+                    let from_source = || {
+                        let source_frame = src.face_input_image();
+                        let bundle = stage_face_bundle(receipt.job_id(), &source_frame, false)?;
+                        let transform = crate::FaceStageTransform::new(
+                            [src.size().0, src.size().1],
+                            [out_w, out_h],
+                            [region.x, region.y, region.width, region.height],
+                            &adj.geometry,
+                        )?;
+                        bundle.slim_inputs_for_stage(&transform, &stage_frame)
+                    };
+                    from_source().or_else(|refusal| {
+                        log::debug!("source face input refused; trying rendered frame: {refusal:?}");
+                        on_stage()
+                    })
+                };
+                match slim {
+                    Ok(slim) => {
+                        let mut inputs = producer_inputs.take().unwrap_or_default();
+                        inputs.slim = Some(slim);
+                        producer_inputs = Some(inputs);
                     }
-                }
-            } else if geometric_lens {
-                log::warn!(
-                    "{}: geometric lens transform not recovered",
-                    crate::FACE_STAGE_TRANSFORM_REFUSAL
-                );
-            } else if let Some(stage_frame) = crate::PortraitImage::new(out_w, out_h, rgba.clone()) {
-                let source_frame = src.face_input_image();
-                match stage_face_bundle(receipt.job_id(), &source_frame, false) {
-                    Ok(bundle) => match crate::FaceStageTransform::new(
-                        [src.size().0, src.size().1],
-                        [out_w, out_h],
-                        [region.x, region.y, region.width, region.height],
-                        &adj.geometry,
-                    ) {
-                        Ok(transform) => match bundle.slim_inputs_for_stage(&transform, &stage_frame)
-                        {
-                            Ok(slim) => {
-                                let mut inputs = producer_inputs.take().unwrap_or_default();
-                                inputs.slim = Some(slim);
-                                producer_inputs = Some(inputs);
-                            }
-                            Err(refusal) => {
-                                log::warn!("stage face input refused: {refusal:?}");
-                            }
-                        },
-                        Err(refusal) => {
-                            log::warn!("stage face transform refused: {refusal:?}");
-                        }
-                    },
                     Err(refusal) => {
-                        log::warn!("stage face inference refused: {refusal:?}");
+                        log::warn!("stage face input refused: {refusal:?}");
                     }
                 }
             }
@@ -8169,5 +8390,310 @@ mod banding_tests {
         let before = render(&src, &adj, NormRect::FULL, 4, false, None).rgba;
         assert!(banding_plan(&src, &adj).is_none());
         assert_eq!(before, render(&source(), &adj, NormRect::FULL, 4, false, None).rgba);
+    }
+}
+
+/// End-to-end parity for the CUDA develop plane.
+///
+/// The test re-executes this test binary twice, once with
+/// `AURORA_DEVELOP_GPU=0` and once with `=1`, so the process-wide switch cannot
+/// leak into the other tests and no `std::env::set_var` is needed. The child
+/// writes every rendered frame; the parent compares 8-bit and 16-bit output and
+/// skips (with a reason) when the GPU child reports zero GPU planes.
+#[cfg(all(test, windows))]
+mod develop_gpu_integration_tests {
+    use super::*;
+
+    const TEST_NAME: &str =
+        "mock::process::develop_gpu_integration_tests::develop_gpu_end_to_end_matches_cpu";
+    const W: u32 = 64;
+    const H: u32 = 48;
+
+    fn synthetic(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let base = ((x * 251 + y * 97) % 256) as u8;
+                buf[i] = base;
+                buf[i + 1] = base.wrapping_add(37);
+                buf[i + 2] = base.wrapping_mul(3).wrapping_add(11);
+                buf[i + 3] = 255;
+            }
+        }
+        buf
+    }
+
+    fn lcc_grid() -> std::sync::Arc<crate::dust_lcc::LightFalloff> {
+        use crate::dust_lcc::{LightFalloff, LightFalloffNode};
+        std::sync::Arc::new(LightFalloff {
+            header: vec![16, 0, 2, 0, 2, 0, 0, 0, 0, 0, 7, 0, 7, 0, 1, 0],
+            columns: 2,
+            rows: 2,
+            nodes: vec![
+                LightFalloffNode { luminance: 1000, dx: 120, dy: -40 },
+                LightFalloffNode { luminance: 9000, dx: -60, dy: 30 },
+                LightFalloffNode { luminance: 7000, dx: 45, dy: 15 },
+                LightFalloffNode { luminance: 15_000, dx: 0, dy: 0 },
+            ],
+        })
+    }
+
+    fn cases() -> Vec<(&'static str, AdjustmentSet, bool)> {
+        let mut cases = Vec::new();
+        cases.push(("default", AdjustmentSet::default(), false));
+
+        let mut tone = AdjustmentSet::default();
+        tone.exposure.exposure = 0.35;
+        tone.exposure.brightness = 14.0;
+        tone.exposure.contrast = 22.0;
+        tone.exposure.saturation = 18.0;
+        tone.hdr = HighDynamicRange { highlights: -35.0, shadows: 28.0, whites: 12.0, blacks: -9.0 };
+        tone.dehaze = Dehaze {
+            amount: 55.0,
+            shadow_tone: [0.62, 0.66, 0.71],
+            level_low: [0.02, 0.03, 0.04],
+            level_high: [0.96, 0.95, 0.94],
+        };
+        tone.levels.rgb.input_black = 0.02;
+        tone.levels.rgb.input_white = 0.94;
+        tone.levels.rgb.gamma = 1.15;
+        tone.levels.red.gamma = 0.92;
+        tone.levels.blue.gamma = 1.21;
+        tone.curves.rgb = Curve {
+            points: vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(0.4, 0.48), CurvePoint::new(1.0, 1.0)],
+        };
+        tone.curves.luma = Curve {
+            points: vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(0.5, 0.56), CurvePoint::new(1.0, 1.0)],
+        };
+        cases.push(("tone-levels-curves", tone, false));
+
+        let mut color = AdjustmentSet::default();
+        color.color_balance.master = ColorWheel { hue: 210.0, saturation: 0.06, lightness: 0.02 };
+        color.color_balance.shadow = ColorWheel { hue: 30.0, saturation: 0.08, lightness: -0.01 };
+        color.color_balance_gains = Some(ColorBalanceGains {
+            master: [1.02, 1.0, 0.98],
+            shadow: [1.01, 0.99, 1.02],
+            midtone: [1.0, 1.01, 0.99],
+            highlight: [0.99, 1.0, 1.02],
+        });
+        let mut ce = ColorEditor::default();
+        ce.global.enabled = true;
+        ce.global.smoothness = 12.0;
+        ce.global_shift = HslShift { hue: 4.0, saturation: 8.0, lightness: 2.0 };
+        ce.basic[3] = HslShift { hue: 12.0, saturation: 30.0, lightness: -8.0 };
+        ce.bands[3].enabled = true;
+        ce.skin.push(ColorRange {
+            id: 8,
+            hue: 25.0,
+            width: 45.0,
+            smoothness: 15.0,
+            min_saturation: 0.1,
+            shift: HslShift { hue: 5.0, saturation: 12.0, lightness: 4.0 },
+            uniformity: Some(SkinUniformity { hue: 40.0, saturation: 25.0, lightness: 15.0 }),
+        });
+        color.color_editor = ce;
+        cases.push(("color-balance-editor", color, false));
+
+        let mut bw = AdjustmentSet::default();
+        bw.black_white = BlackWhite {
+            enabled: true,
+            sensitivity: [18.0, -22.0, 30.0, -15.0, 12.0, -8.0],
+            highlight_tone: SplitTone { hue: 45.0, saturation: 30.0 },
+            shadow_tone: SplitTone { hue: 220.0, saturation: 25.0 },
+        };
+        cases.push(("black-white", bw, false));
+
+        let mut vignette = AdjustmentSet::default();
+        vignette.vignetting.amount = 1.25;
+        vignette.vignetting.method = VignetteMethod::Circular;
+        vignette.vignetting.center = VignetteCenter::Cam;
+        cases.push(("vignette", vignette, false));
+
+        let mut lcc = AdjustmentSet::default();
+        lcc.lens.uniform_light_grid = Some(lcc_grid());
+        lcc.lens.uniform_light_enabled = true;
+        lcc.lens.uniform_light = 80.0;
+        cases.push(("lcc", lcc, false));
+
+        let mut bypass = AdjustmentSet::default();
+        bypass.exposure.exposure = 0.4;
+        bypass.curves.rgb = Curve {
+            points: vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(0.6, 0.5), CurvePoint::new(1.0, 1.0)],
+        };
+        cases.push(("bypass", bypass, true));
+
+        #[cfg(feature = "z6iii-raw-export")]
+        {
+            let mut c1 = AdjustmentSet::default();
+            c1.base.icc_profile = Some("NikonZ6III-ProStandard".into());
+            // Avoid the camera-space USM branch so the GPU sees the ordinary
+            // C1 develop plane.
+            c1.sharpening.amount = 0.0;
+            cases.push(("c1-colour", c1, false));
+        }
+        cases
+    }
+
+    fn c1_available() -> bool {
+        #[cfg(feature = "z6iii-raw-export")]
+        {
+            crate::icc::profile("NikonZ6III-ProStandard").is_some()
+        }
+        #[cfg(not(feature = "z6iii-raw-export"))]
+        {
+            false
+        }
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn child() -> std::io::Result<()> {
+        let out_path = std::env::var("AURORA_GPU_PARITY_OUT").expect("child output path");
+        let src = Source::from_rgba(W, H, &synthetic(W, H));
+        let cases = cases();
+        let mut dump = Vec::new();
+        push_u32(&mut dump, cases.len() as u32);
+        for (name, adj, bypass) in &cases {
+            let narrow = render(&src, adj, NormRect::FULL, W, *bypass, None).rgba;
+            let wide = render16(&src, adj, NormRect::FULL, W, *bypass).rgba;
+            push_u32(&mut dump, name.len() as u32);
+            dump.extend_from_slice(name.as_bytes());
+            push_u32(&mut dump, W);
+            push_u32(&mut dump, H);
+            push_u32(&mut dump, narrow.len() as u32);
+            dump.extend_from_slice(&narrow);
+            push_u32(&mut dump, wide.len() as u32);
+            for code in &wide {
+                dump.extend_from_slice(&code.to_le_bytes());
+            }
+        }
+        let hits = super::super::develop_gpu::GPU_PLANES
+            .load(std::sync::atomic::Ordering::Relaxed);
+        dump.extend_from_slice(&hits.to_le_bytes());
+        dump.push(u8::from(c1_available()));
+        std::fs::write(out_path, dump)
+    }
+
+    struct FrameDump {
+        cases: Vec<(String, Vec<u8>, Vec<u16>)>,
+        gpu_hits: u64,
+        c1: bool,
+    }
+
+    fn parse(bytes: &[u8]) -> FrameDump {
+        let mut at = 0usize;
+        let take = |at: &mut usize, n: usize| {
+            let slice = &bytes[*at..*at + n];
+            *at += n;
+            slice
+        };
+        let take_u32 = |at: &mut usize| {
+            u32::from_le_bytes(take(at, 4).try_into().unwrap())
+        };
+        let count = take_u32(&mut at) as usize;
+        let mut cases = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_len = take_u32(&mut at) as usize;
+            let name = String::from_utf8(take(&mut at, name_len).to_vec()).unwrap();
+            let _w = take_u32(&mut at);
+            let _h = take_u32(&mut at);
+            let n8 = take_u32(&mut at) as usize;
+            let narrow = take(&mut at, n8).to_vec();
+            let n16 = take_u32(&mut at) as usize;
+            let raw = take(&mut at, n16 * 2);
+            let wide = raw
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes(pair.try_into().unwrap()))
+                .collect();
+            cases.push((name, narrow, wide));
+        }
+        let hits = u64::from_le_bytes(take(&mut at, 8).try_into().unwrap());
+        let c1 = take(&mut at, 1)[0] != 0;
+        FrameDump { cases, gpu_hits: hits, c1 }
+    }
+
+    fn run_child(mode: &str, path: &std::path::Path) {
+        let exe = std::env::current_exe().expect("test executable");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env("AURORA_GPU_PARITY_CHILD", "1")
+            .env("AURORA_GPU_PARITY_MODE", mode)
+            .env("AURORA_GPU_PARITY_OUT", path)
+            .env("AURORA_DEVELOP_GPU", if mode == "gpu" { "1" } else { "0" })
+            .output()
+            .expect("spawn parity child");
+        assert!(
+            output.status.success(),
+            "parity child {mode} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn develop_gpu_end_to_end_matches_cpu() {
+        if std::env::var_os("AURORA_GPU_PARITY_CHILD").is_some() {
+            child().expect("write parity dump");
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let gpu_path = dir.join(format!("aurora-develop-parity-{pid}-gpu.bin"));
+        let cpu_path = dir.join(format!("aurora-develop-parity-{pid}-cpu.bin"));
+        run_child("gpu", &gpu_path);
+        let gpu = parse(&std::fs::read(&gpu_path).expect("gpu dump"));
+        let _ = std::fs::remove_file(&gpu_path);
+        if gpu.gpu_hits == 0 {
+            let _ = std::fs::remove_file(&cpu_path);
+            eprintln!(
+                "skipping develop GPU parity: the AURORA_DEVELOP_GPU=1 child ran no GPU plane \
+                 (no NVIDIA device, PTX or driver)"
+            );
+            return;
+        }
+        run_child("cpu", &cpu_path);
+        let cpu = parse(&std::fs::read(&cpu_path).expect("cpu dump"));
+        let _ = std::fs::remove_file(&cpu_path);
+        assert_eq!(cpu.gpu_hits, 0, "AURORA_DEVELOP_GPU=0 must not launch the kernel");
+        assert_eq!(cpu.cases.len(), gpu.cases.len());
+        if !cpu.c1 {
+            eprintln!("C1 colour case skipped: NikonZ6III-ProStandard profile is unavailable");
+        }
+        let (mut worst8, mut worst16) = (0u8, 0u16);
+        for ((name, cpu8, cpu16), (gpu_name, gpu8, gpu16)) in cpu.cases.iter().zip(&gpu.cases) {
+            assert_eq!(name, gpu_name);
+            assert_eq!(cpu8.len(), gpu8.len(), "{name}: 8-bit size");
+            assert_eq!(cpu16.len(), gpu16.len(), "{name}: 16-bit size");
+            let (mut max8, mut over8) = (0u8, 0usize);
+            for (&a, &b) in cpu8.iter().zip(gpu8) {
+                let d = a.abs_diff(b);
+                max8 = max8.max(d);
+                if d > 1 {
+                    over8 += 1;
+                }
+            }
+            let (mut max16, mut over16) = (0u16, 0usize);
+            for (&a, &b) in cpu16.iter().zip(gpu16) {
+                let d = a.abs_diff(b);
+                max16 = max16.max(d);
+                if d > 257 {
+                    over16 += 1;
+                }
+            }
+            worst8 = worst8.max(max8);
+            worst16 = worst16.max(max16);
+            println!(
+                "develop GPU parity {name}: max8={max8} over1={over8} max16={max16} over257={over16}"
+            );
+            assert!(over8 == 0, "{name}: {over8} 8-bit samples differ by more than 1");
+            assert!(over16 == 0, "{name}: {over16} 16-bit samples differ by more than 257");
+        }
+        println!(
+            "develop GPU parity summary: worst8={worst8} worst16={worst16} gpu_planes={} c1={}",
+            gpu.gpu_hits, gpu.c1
+        );
     }
 }

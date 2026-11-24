@@ -799,6 +799,17 @@ pub fn cheek(
     width: u32,
     height: u32,
 ) -> Result<Geometry, Refusal> {
+    cheek_sides(points, center, [ui, ui], vendor, width, height)
+}
+
+pub fn cheek_sides(
+    points: &[Point],
+    center: Point,
+    controls: [f32; 2],
+    vendor: &VendorParts<'_>,
+    width: u32,
+    height: u32,
+) -> Result<Geometry, Refusal> {
     if points.len() < 33 {
         return Err(Refusal::MissingInput("cheek 33 points"));
     }
@@ -808,17 +819,19 @@ pub fn cheek(
     if width == 0 || height == 0 {
         return Err(Refusal::ValueOutOfRange("image_dimensions"));
     }
-    let parameter = signed_ui(ui, "cheek_ui")?;
-    let arrays = vendor
-        .get(33)
-        .ok_or(Refusal::MissingInput("effect.json cheek part 33"))?;
-    vendor
-        .get(34)
-        .ok_or(Refusal::MissingInput("effect.json cheek part 34"))?;
-    let degree = check_degree(map(parameter, &KNOTS, &[1.0, 0.0, -1.0]), "cheek_degree")?;
-    build_type1015_pair(
-        points, center, arrays, 33, 34, 8027, 8028, degree, degree, width, height,
-    )
+    let mut parts = Vec::with_capacity(2);
+    for (index, ui) in controls.into_iter().enumerate() {
+        let part = 33 + index as u8;
+        let arrays = vendor.get(part).ok_or(Refusal::MissingInput(if index == 0 {
+            "effect.json cheek part 33"
+        } else {
+            "effect.json cheek part 34"
+        }))?;
+        let parameter = signed_ui(ui, "cheek_ui")?;
+        let degree = check_degree(map(parameter, &KNOTS, &[1.0, 0.0, -1.0]), "cheek_degree")?;
+        parts.push(build_type1015(points, center, arrays, part, 8027 + index as u32, degree, width, height)?);
+    }
+    Ok(Geometry { priority: 3, parts, offsets: Vec::new() })
 }
 
 // ------------------------------------------------- row 4: jaw PF8023/PF8024
@@ -1027,6 +1040,17 @@ pub fn sharp_chin(
     width: u32,
     height: u32,
 ) -> Result<Geometry, Refusal> {
+    sharp_chin_sides([ui, ui], points, center, vendor, width, height)
+}
+
+pub fn sharp_chin_sides(
+    controls: [f32; 2],
+    points: &[Point],
+    center: Point,
+    vendor: &VendorParts<'_>,
+    width: u32,
+    height: u32,
+) -> Result<Geometry, Refusal> {
     if points.len() < 33 {
         return Err(Refusal::MissingInput("chin 33 points"));
     }
@@ -1036,14 +1060,14 @@ pub fn sharp_chin(
     if width == 0 || height == 0 {
         return Err(Refusal::ValueOutOfRange("image_dimensions"));
     }
-    let p = signed_ui(ui, "chin_ui")?;
+    let parameters = [signed_ui(controls[0], "chin_ui")?, signed_ui(controls[1], "chin_ui")?];
     let mut parts = Vec::with_capacity(4);
     for i in 0..4usize {
         let arrays = vendor
             .get(17 + i as u8)
             .ok_or(Refusal::MissingInput("effect.json chin parts 17..20"))?;
         let degree = check_degree(
-            map(p, &KNOTS, if i < 2 { &[0.0, 0.0, 0.85] } else { &NEGATIVE }),
+            map(parameters[i % 2], &KNOTS, if i < 2 { &[0.0, 0.0, 0.85] } else { &NEGATIVE }),
             "chin_degree",
         )?;
         parts.push(build_type1015(
@@ -1347,33 +1371,6 @@ fn patch_deltas(patch: &[Point], center: Point, scale: f32) -> Vec<VertexDelta> 
 }
 
 // ------------------------------------------------- shared Type1015 builder
-
-fn build_type1015_pair(
-    points: &[Point],
-    center: Point,
-    arrays: &PartArrays<'_>,
-    first_part: u8,
-    second_part: u8,
-    first_pf: u32,
-    second_pf: u32,
-    first_degree: f32,
-    second_degree: f32,
-    width: u32,
-    height: u32,
-) -> Result<Geometry, Refusal> {
-    Ok(Geometry {
-        priority: 3,
-        parts: vec![
-            build_type1015(
-                points, center, arrays, first_part, first_pf, first_degree, width, height,
-            )?,
-            build_type1015(
-                points, center, arrays, second_part, second_pf, second_degree, width, height,
-            )?,
-        ],
-        offsets: Vec::new(),
-    })
-}
 
 #[allow(clippy::too_many_arguments)]
 fn build_type1015(
@@ -1768,6 +1765,22 @@ mod tests {
         assert!(close(at(100.0).parts[0].degree, -1.0));
         assert_eq!(at(0.0).parts[0].part, 33);
         assert_eq!(at(0.0).parts[1].part, 34);
+    }
+
+    #[test]
+    fn cheek_uses_each_sides_control_and_weights() {
+        let points = uniform_points(33);
+        let mut left = [0.0; 33];
+        let mut right = [0.0; 33];
+        left[4] = 0.1;
+        right[28] = 0.2;
+        let factors = [1.0; 33];
+        let parts = cheek_vendor(&left, &factors, &right);
+        let result = cheek_sides(&points, p(50.0, 50.0), [-100.0, 100.0], &VendorParts { parts: &parts }, 100, 100).unwrap();
+        assert_eq!(result.parts[0].degree, 1.0);
+        assert_eq!(result.parts[1].degree, -1.0);
+        assert_eq!(result.parts[0].deltas[0].index, 4);
+        assert_eq!(result.parts[1].deltas[0].index, 28);
     }
 
     #[test]
