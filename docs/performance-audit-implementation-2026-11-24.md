@@ -82,3 +82,33 @@ P2:
 - Main baseline: https://github.com/J-X-C-Z/Aurora-Studio/tree/99ec192e17cbe7b58ccf701530dd3790c40a92bf
 - Working branch: https://github.com/J-X-C-Z/Aurora-Studio/tree/perf/full-audit-2026-11-24
 - First implementation commit: https://github.com/J-X-C-Z/Aurora-Studio/commit/b1b0b549c561e33ef014df6cfcd33b366e84934f
+
+
+## Follow-up implementation (branch continuation)
+
+### GPU Develop preflight moved ahead of gain/output allocation
+
+File: `crates/engine/src/mock/process.rs`
+
+- Split the former `gpu_develop_context()` into an admission/prewarm step (`gpu_develop_preflight()`) and later gain-plane preparation.
+- The admission decision now runs immediately after the Render Plan is built, before optional Vignette/LCC GPU gain-plane generation and before allocating RGBA8/RGBA16 output buffers.
+- Gain-plane construction happens only after GPU Develop has passed the device/budget/crossover checks.
+- Pixel math, sample centers, output quantization, CPU fallback, and the CPU Reference path are unchanged.
+
+This specifically removes the previous ordering where a frame could spend time constructing GPU gain planes and output buffers before the GPU Develop admission decision. It does not yet provide a whole-render memory planner: Clarity Guide/Plan preparation and the separate Pixel GPU path still need independent accounting.
+
+### Batch registry bounded retention
+
+File: `crates/engine/src/batch.rs`
+
+- Completed Batch states previously remained in a process-global HashMap indefinitely, including per-image failure strings.
+- The registry now retains at most 128 completed batches, evicting the oldest completion first while never evicting active batches.
+- Added a unit test covering oldest-completed eviction and active-batch retention.
+- Callers should stop polling after `finished == true`; older completed progress may no longer be available after the retention window is exceeded.
+
+### Validation status of follow-up changes
+
+- Source changes committed to the isolated branch: yes.
+- New batch-registry unit test added: yes.
+- GPU preflight refactor: static call-order review completed.
+- `cargo fmt`, `cargo check`, `cargo test`, Windows Release build and RTX benchmark: not run in this environment. No measured speedup is claimed.
