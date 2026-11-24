@@ -153,7 +153,8 @@ pub(crate) fn crop_for_aspect(g: &Geometry, source_size: (u32, u32)) -> NormRect
 /// stored tilt is written as `100·tan(pitch)/fLen`, so scaling it back cancels
 /// the lens and leaves the physical angle.
 pub(crate) struct KeystoneMap {
-    /// Row-major 3x3 mapping a crop-space point to its source-crop point.
+    /// Row-major 3x3 mapping a centred crop-space point (`p - 0.5`) to its
+    /// centred source-crop point: C1's exact `CResampler::UpdateGeo` basis.
     m: [f32; 9],
     stretch: f32,
     /// C1 divides X for a negative `aspect` and Y for a positive one.
@@ -162,38 +163,98 @@ pub(crate) struct KeystoneMap {
 }
 
 impl KeystoneMap {
-    pub(crate) fn new(k: &Keystone, rotation_deg: f32, flip_h: bool, flip_v: bool) -> Self {
+    /// C1's `CResampler::UpdateGeo` (ImgCoreDll.dll 0x18141d980 in the 2026-09
+    /// build, 0x18141da30 after the 2026-11 update; identical instructions).
+    ///
+    /// `frame_aspect` is the crop's width/height in canvas pixels. UpdateGeo
+    /// divides the perspective column by `c·hypot(w, h)`; once the map is on
+    /// 0..1 frame coordinates only `w/hypot` and `h/hypot` survive, i.e. the
+    /// aspect ratio.
+    pub(crate) fn new(
+        k: &Keystone,
+        rotation_deg: f32,
+        flip_h: bool,
+        flip_v: bool,
+        frame_aspect: f32,
+    ) -> Self {
         let mut stored = k.clone();
         stored.set_hv(k.horizontal, k.vertical, rotation_deg, flip_h, flip_v);
         let amount = (finite(k.amount) / 100.0).clamp(0.0, 1.2);
         // `aspectF = 1 + |aspect|/100`; a negative aspect swaps the axis via
-        // `.dca = (0,1)` (UpdateGeo 0x141DB06/0x141DB0A).
+        // `.dca = (0,1)` (UpdateGeo 0x18141db06/0x18141db0a).
         let aspect = finite(k.aspect);
         let stretch = (1.0 + aspect.abs() / 100.0).clamp(0.1, 10.0);
         let stretch_x = aspect < 0.0;
-        let scale = stored.tilt_scale();
-        let vertical = (finite(stored.vertical) / 100.0 * scale).clamp(-1.0, 1.0);
-        let horizontal = (finite(stored.horizontal) / 100.0 * scale).clamp(-1.0, 1.0);
         let skew = finite(k.skew).clamp(-45.0, 45.0);
         let shear = if amount < EPS || skew.abs() < EPS {
             0.0
         } else {
             ((skew.to_radians().tan() * amount).atan() * 0.5).tan()
         };
-        if amount < EPS || (vertical.abs() < EPS && horizontal.abs() < EPS && shear.abs() < EPS) {
-            // `amount` only scales tilt and skew; `aspectF` is read straight
-            // from the settings, so it survives a zero amount.
-            return Self { m: IDENTITY, stretch, stretch_x, shear: 0.0 };
+
+        // `c` is `fLen > 0 ? fLen : 1` (0x18141d6c0), and
+        // `keystoneFlagIgnoreFocalLength` forces it to 0 (0x18141d6f9).
+        let c = if k.flags & 1 == 0 && k.focal_length.is_finite() && k.focal_length > 0.0 {
+            k.focal_length
+        } else {
+            0.0
+        };
+        // 0x182a37a08 is `double(float(0.01))`, not the exact decimal 0.01.
+        const TILT: f32 = 0.009_999_999_776_482_582;
+        // The engine keeps `amount` as its own slider while C1's update path
+        // writes `tilt*amount/100` into the settings block (0x18141db70), so
+        // fold it here to keep `amount == 0` an exact no-op.
+        let a = finite(stored.horizontal) * TILT * amount;
+        let b = finite(stored.vertical) * TILT * amount;
+        let (x, y) = if c > 0.0 { (c * a, c * b) } else { (a, b) };
+        let l = x.hypot(y);
+        let (s1, s2) = if l > 1e-8 { (x / l, -y / l) } else { (0.0, 1.0) };
+        // 0x18141db1d normalises the basis. The c <= 0 path (0x18141dcad)
+        // computes a 1e-8-scaled vector and its length only to pick a helper;
+        // 0x18141ddef then discards both and rebuilds the raw vector, so that
+        // branch is *not* normalised.
+        let n = if c > 0.0 {
+            let z = s1 * x - s2 * y;
+            let len = (s1 * s1 + s2 * s2 + z * z).sqrt();
+            if len > 0.0 {
+                [-s1 / len, s2 / len, z / len]
+            } else {
+                [0.0, 0.0, 0.0]
+            }
+        } else {
+            [-s1, s2, s1 * x - s2 * y]
+        };
+        // 0x18141de12: rotate the basis by `-atan2(s1, s2)`.
+        let (sn, cs) = (-s1.atan2(s2)).sin_cos();
+        let c0 = [n[0] * sn + cs * s2, n[1] * sn + cs * s1, n[2] * sn];
+        let c1 = [n[0] * cs - sn * s2, n[1] * cs - sn * s1, n[2] * cs];
+        let ar = if frame_aspect.is_finite() && frame_aspect > 1e-6 {
+            frame_aspect
+        } else {
+            1.0
+        };
+        let inv_hypot = 1.0 / (1.0 + ar * ar).sqrt();
+        let d = if c > 0.0 { c } else { 1.0 };
+        // 0x18141e00b: divide the perspective column by `c·hypot(w, h)`.
+        let p0 = c0[2] * ar * inv_hypot / d;
+        let p1 = c1[2] * inv_hypot / d;
+        let m = [
+            c0[0],
+            c1[0] / ar,
+            0.0,
+            c0[1] * ar,
+            c1[1],
+            0.0,
+            p0,
+            p1,
+            1.0,
+        ];
+        Self {
+            m,
+            stretch,
+            stretch_x,
+            shear,
         }
-        let (a, b) = (vertical * amount * 0.35, horizontal * amount * 0.35);
-        // Frame corners are the unit square; they sample a trapezoid in the source.
-        // Vertical insets the top edge symmetrically; horizontal shortens the
-        // left edge, so the output's left-side rows stretch — the sign measured
-        // from C1's `kx-0.4.tif` (wider left span, shorter left source edge).
-        let from = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let to = [[a, b], [1.0 - a, 0.0], [1.0, 1.0], [0.0, 1.0 - b]];
-        let m = solve_homography(from, to).unwrap_or(IDENTITY);
-        Self { m, stretch, stretch_x, shear }
     }
 
     fn is_identity(&self) -> bool {
@@ -202,15 +263,19 @@ impl KeystoneMap {
 
     fn apply(&self, p: [f32; 2]) -> [f32; 2] {
         let m = &self.m;
-        let w = m[6] * p[0] + m[7] * p[1] + m[8];
+        // UpdateGeo maps centre-relative pixels; frame coordinates are 0..1.
+        let (px, py) = (p[0] - 0.5, p[1] - 0.5);
+        let w = m[6] * px + m[7] * py + m[8];
         if !w.is_finite() || w.abs() < EPS {
             return finite_pair(p);
         }
-        let x = (m[0] * p[0] + m[1] * p[1] + m[2]) / w;
-        let y = (m[3] * p[0] + m[4] * p[1] + m[5]) / w;
-        // Symmetric shear about the centre; C1 applies `basisX + t·basisY` on
-        // both bases, so each axis is pushed by the other one.
-        [finite(x + self.shear * (y - 0.5)), finite(y + self.shear * (x - 0.5))]
+        let x = (m[0] * px + m[1] * py + m[2]) / w;
+        let y = (m[3] * px + m[4] * py + m[5]) / w;
+        // Symmetric shear about the centre, unchanged from the previous model.
+        [
+            finite(x + self.shear * y + 0.5),
+            finite(y + self.shear * x + 0.5),
+        ]
     }
 }
 
@@ -269,7 +334,13 @@ fn map_frame(f: [f32; 2], g: &Geometry, crop: NormRect, source_size: (u32, u32))
     let f = finite_pair(f);
     let (ow, oh) = oriented_size(g, source_size);
     let (cw, ch) = canvas_size(g, source_size);
-    let keystone = KeystoneMap::new(&g.keystone, total_rotation(g), g.flip_horizontal, g.flip_vertical);
+    let keystone = KeystoneMap::new(
+        &g.keystone,
+        total_rotation(g),
+        g.flip_horizontal,
+        g.flip_vertical,
+        cw / ch.max(EPS),
+    );
     let mut p = [crop.x + f[0] * crop.width, crop.y + f[1] * crop.height];
     if !keystone.is_identity() {
         p = keystone.apply(p);
@@ -349,10 +420,16 @@ impl FrameMap {
     pub(crate) fn new(source_size: (u32, u32), g: &Geometry) -> Self {
         let rotation = finite(g.rotation).to_radians();
         let (rotation_sin, rotation_cos) = (-rotation).sin_cos();
-        let keystone = KeystoneMap::new(&g.keystone, total_rotation(g), g.flip_horizontal, g.flip_vertical);
+        let canvas = canvas_size(g, source_size);
+        let keystone = KeystoneMap::new(
+            &g.keystone,
+            total_rotation(g),
+            g.flip_horizontal,
+            g.flip_vertical,
+            canvas.0 / canvas.1.max(EPS),
+        );
         let stretch = keystone.stretch;
         let stretch_x = keystone.stretch_x;
-        let canvas = canvas_size(g, source_size);
         let canvas_stored = canvas != oriented_size(g, source_size);
         Self {
             oriented: oriented_size(g, source_size),
@@ -570,7 +647,7 @@ mod tests {
             assert_eq!(map.map(f), (f, f));
         }
         assert_eq!(map.frame_size(), (400.0, 300.0));
-        assert!(KeystoneMap::new(&g.keystone, 0.0, false, false).is_identity());
+        assert!(KeystoneMap::new(&g.keystone, 0.0, false, false, 1.5).is_identity());
     }
 
     #[test]
@@ -662,7 +739,7 @@ mod tests {
     #[test]
     fn skew_twenty_degrees_is_tan_ten() {
         let k = Keystone { skew: 20.0, amount: 100.0, ..Default::default() };
-        let map = KeystoneMap::new(&k, 0.0, false, false);
+        let map = KeystoneMap::new(&k, 0.0, false, false, 1.5);
         assert_near(map.apply([0.5, 0.5]), [0.5, 0.5]);
         let t = 10.0f32.to_radians().tan();
         let got = map.apply([0.6, 0.5]);
