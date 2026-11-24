@@ -2246,16 +2246,17 @@ impl FaceInputProducer {
             (cell % grid) as f32 * stride as f32,
             (cell / grid) as f32 * stride as f32,
         ];
+        let source_to_input = [[scale, 0.0, left as f32], [0.0, scale, top as f32]];
+        let input_to_source = inverse(source_to_input)?;
         let mut landmarks = [[0.0f32; 2]; 5];
         for (index, point) in landmarks.iter_mut().enumerate() {
-            for axis in 0..2 {
-                let value = outputs[2][best * 10 + index * 2 + axis];
-                if !value.is_finite() {
-                    return Err(Refusal::ValueOutOfRange(FACE_LANDMARK_ERROR));
-                }
-                *point.get_mut(axis).unwrap() =
-                    ((value * stride as f32) + anchor[axis] - left as f32) / scale;
-            }
+            let offset = best * 10 + index * 2;
+            *point = decode_detection_point(
+                [outputs[2][offset], outputs[2][offset + 1]],
+                anchor,
+                stride as f32,
+                input_to_source,
+            );
             if point.iter().any(|value| !value.is_finite()) {
                 return Err(Refusal::ValueOutOfRange(FACE_LANDMARK_ERROR));
             }
@@ -2267,7 +2268,7 @@ impl FaceInputProducer {
         Ok(C1FaceDetection {
             score: best_score,
             landmarks_source: landmarks,
-            source_to_input: [[scale, 0.0, left as f32], [0.0, scale, top as f32]],
+            source_to_input,
             input_size: [DETECTION_SIDE as u32, DETECTION_SIDE as u32],
             normalization: FaceNormalization {
                 channel_order: "BGR",
@@ -2869,6 +2870,16 @@ fn verify_file(path: &Path, expected: [u8; 32]) -> Result<(), Refusal> {
     Ok(())
 }
 
+fn decode_detection_point(
+    offsets: [f32; 2],
+    anchor: [f32; 2],
+    stride: f32,
+    input_to_source: [[f32; 3]; 2],
+) -> [f32; 2] {
+    let point = std::array::from_fn(|axis| offsets[axis] * stride + anchor[axis]);
+    map_point(point, input_to_source)
+}
+
 fn anchor_layout(index: usize) -> (usize, usize, usize) {
     let first = 2 * (DETECTION_SIDE / 8).pow(2);
     let second = 2 * (DETECTION_SIDE / 16).pow(2);
@@ -3205,6 +3216,17 @@ const fn hex32(hex: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_undoes_letterboxing_on_each_axis() {
+        for (left, top) in [(0.0, 0.0), (100.0, 0.0), (0.0, 100.0)] {
+            let inverse = inverse([[0.5, 0.0, left], [0.0, 0.5, top]]).unwrap();
+            assert_eq!(
+                decode_detection_point([1.5, -1.0], [32.0 + left, 40.0 + top], 8.0, inverse),
+                [88.0, 64.0],
+            );
+        }
+    }
 
     #[test]
     fn similarity_recovers_rotation_and_scale() {

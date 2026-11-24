@@ -67,6 +67,14 @@ const WIRED_FACE_GEOMETRY_EFFECTS: &[(&str, &str, &str)] = &[
 const WIRED_TOTAL: usize =
     WIRED_SKIN_EFFECTS.len() + WIRED_TEETH_EFFECTS.len() + WIRED_FACE_GEOMETRY_EFFECTS.len();
 
+/// Catalogue bands must not duplicate a control that already has a dedicated
+/// wired panel: both rows would use the same `pc:<id>` key and reset together.
+fn is_wired_key(key: &str) -> bool {
+    WIRED_SKIN_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_TEETH_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|row| row.0 == key)
+}
+
 fn portrait_amount_binding(key: &'static str, default: f32) -> Binding {
     let inner = extra_binding(key, default);
     let (get, set) = (inner.get.clone(), inner.set.clone());
@@ -99,16 +107,16 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                         .child(Icon::new(IconName::Info).xsmall().text_color(p.accent))
                         .items_start()
                         .child(div().flex_1().min_w_0().text_xs().text_color(p.text_muted).child(t(
-                            "Parameters follow the frontend contract and are saved with the variant. Skin hue, whitening, rosy, gloss, texture, clarity and radiance render; effects needing face geometry or model output stay marked.",
-                            "参数按前端契约解析，可调并随变体保存；肤色色相、美白、红润、光泽、肤质、清晰度和透亮已接入，需要面部几何或模型输出的效果会标记缺输入。",
+                            "Adjustments are saved with the variant. Effects that need detection, masks or materials apply only when those inputs are available.",
+                            "调整随变体保存。需要人脸检测、遮罩或材质的效果，仅在输入可用时生效。",
                         ))),
                 )
                 .child(div().text_xs().text_color(p.text_subtle).child(format!(
                     "{} {}",
                     WIRED_TOTAL,
                     t(
-                        "effects render live on CUDA/CPU (skin, teeth, 414-pt face reshape); the rest need extra models",
-                        "个效果已实时接入 CUDA/CPU 渲染（皮肤、美牙、414点面部精修）；其余待接入专用模型"
+                        "controls are connected to the renderer",
+                        "个控件已接入渲染流程"
                     ),
                 )))
                 .child(h_flex().gap_1p5().child(Icon::new(IconName::Search).xsmall().text_color(p.text_subtle)).child(div().flex_1().child(search))),
@@ -185,7 +193,10 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
     let modified = keys.iter().any(|k| s.adj().extra.contains_key(*k));
     let st = state.clone();
     ToolPanel::new(state, "retouch-face-geometry", t("Face Reshape (CUDA)", "面部精修（实时）"))
-        .status(Status::Ready)
+        .status(Status::Partial(
+            "Face reshape requires usable landmarks on this photo",
+            "面部精修需要在当前照片中检测到可用的面部关键点",
+        ))
         .modified(modified)
         .on_reset(move |_, cx| {
             let keys = keys.clone();
@@ -238,8 +249,8 @@ fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static 
         "RetouchFaceSkin" => (
             "retouch-face",
             Status::Partial(
-                "9 skin effects render live on CUDA/CPU; C1 legacy sliders await binding",
-                "9 项皮肤效果已实时渲染；其余旧版滑块待绑定",
+                "Skin effects require suitable input; legacy sliders are not wired",
+                "皮肤效果需要有效输入；旧版滑块尚未接入渲染",
             ),
         ),
         "RetouchEyes" => ("retouch-eyes", contract::RETOUCH),
@@ -267,7 +278,7 @@ fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static 
         })
         .children(shown.into_iter().map(|m| param_c1(state, format!("rt-{}", m.key), m.key, extra_binding(m.key, m.default), cx)))
         .children(wired.into_iter().map(|(key, en, zh, default)| {
-            param(
+            let mut slider = param(
                 state,
                 format!("rt-{key}"),
                 t(*en, *zh),
@@ -275,15 +286,27 @@ fn retouch_panel(state: &Entity<AppState>, group: &'static str, title: &'static 
                 0.0,
                 100.0,
                 cx,
-            )
-            .default_value(*default * 100.0)
+            );
+            if *key == "pc:8069" {
+                slider = slider
+                    .label(t("Skin texture (smoothing)", "肤质（柔化）"))
+                    .range(0.0, 50.0)
+                    .flag(Status::Partial(
+                        "Lower values smooth texture; 50 is neutral. Texture enhancement is not available yet.",
+                        "向左调低可柔化肤质，50 为中性；增强纹理尚未接入。",
+                    ));
+            }
+            slider.default_value(*default * 100.0)
         }))
         .into_any_element()
 }
 
 fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &App) -> AnyElement {
     let s = state.read(cx);
-    let params: Vec<&'static PortraitParam> = band.params().collect();
+    let params: Vec<&'static PortraitParam> = band
+        .params()
+        .filter(|param| !is_wired_key(&param.store_key()))
+        .collect();
     let keys: Vec<String> = params.iter().map(|p| p.store_key()).collect();
     let set = s.adj().extra.keys().filter(|k| keys.iter().any(|p| *k == p || k.starts_with(&format!("{p}:")))).count();
     let shown: Vec<_> = params.iter().copied().filter(|p| matches(query, &p.label(), &p.key, Some(p.id))).collect();

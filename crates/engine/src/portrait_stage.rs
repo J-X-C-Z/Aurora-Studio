@@ -3894,38 +3894,57 @@ fn builtin_face_reshape_parts() -> Result<Vec<FaceReshapePartData>, Refusal> {
     Ok(parts)
 }
 
-fn rasterize_radial_warps(
-    source: &Image,
-    warps: &[&face_geometry::Warp],
-) -> FaceMeshStageResult {
-    const GRID: usize = 40;
-    let verts = (GRID + 1) * (GRID + 1);
-    let mut dest = Vec::with_capacity(verts);
-    let mut uv = Vec::with_capacity(verts);
+fn radial_mesh_axes(parts: &[&face_geometry::PartGeometry], width: f32, height: f32) -> [Vec<f32>; 2] {
+    let axis = |extent: f32| (0..=40).map(|i| i as f32 / 40.0 * extent).collect::<Vec<_>>();
+    let [mut xs, mut ys] = [axis(width), axis(height)];
+    for part in parts {
+        for delta in &part.deltas {
+            let radius = (delta.target.x - delta.source.x).hypot(delta.target.y - delta.source.y);
+            if radius > 0.0 {
+                for fraction in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+                    xs.push((delta.source.x + fraction * radius).clamp(0.0, width));
+                    ys.push((delta.source.y + fraction * radius).clamp(0.0, height));
+                }
+            }
+        }
+    }
+    for axis in [&mut xs, &mut ys] {
+        axis.sort_unstable_by(f32::total_cmp);
+        axis.dedup_by(|left, right| (*left - *right).abs() < 1.0e-4);
+    }
+    [xs, ys]
+}
+
+fn rasterize_radial_warps(source: &Image, parts: &[&face_geometry::PartGeometry]) -> FaceMeshStageResult {
     let w = source.width as f32;
     let h = source.height as f32;
-    for gy in 0..=GRID {
-        let v = gy as f32 / GRID as f32;
-        for gx in 0..=GRID {
-            let u = gx as f32 / GRID as f32;
-            uv.push([u, v]);
-            if gx == 0 || gx == GRID || gy == 0 || gy == GRID {
-                dest.push([u * w, v * h]);
+    let [xs, ys] = radial_mesh_axes(parts, w, h);
+    let verts = xs.len() * ys.len();
+    if verts > usize::from(u16::MAX) + 1 {
+        return face_mesh_refused(Refusal::ValueOutOfRange("face reshape radial grid"), None);
+    }
+    let mut dest = Vec::with_capacity(verts);
+    let mut uv = Vec::with_capacity(verts);
+    for (gy, &y) in ys.iter().enumerate() {
+        for (gx, &x) in xs.iter().enumerate() {
+            uv.push([x / w, y / h]);
+            if gx == 0 || gx + 1 == xs.len() || gy == 0 || gy + 1 == ys.len() {
+                dest.push([x, y]);
             } else {
-                let mut pt = face_geometry::Point::new(u * w, v * h);
-                for warp in warps {
+                let mut pt = face_geometry::Point::new(x, y);
+                for warp in parts.iter().filter_map(|part| part.warp.as_ref()) {
                     pt = warp.apply(pt);
                 }
                 dest.push([pt.x.clamp(0.0, w), pt.y.clamp(0.0, h)]);
             }
         }
     }
-    let mut ebo = Vec::with_capacity(GRID * GRID * 6);
-    for gy in 0..GRID {
-        for gx in 0..GRID {
-            let i00 = (gy * (GRID + 1) + gx) as u16;
+    let mut ebo = Vec::with_capacity((xs.len() - 1) * (ys.len() - 1) * 6);
+    for gy in 0..ys.len() - 1 {
+        for gx in 0..xs.len() - 1 {
+            let i00 = (gy * xs.len() + gx) as u16;
             let i10 = i00 + 1;
-            let i01 = i00 + (GRID + 1) as u16;
+            let i01 = i00 + xs.len() as u16;
             let i11 = i01 + 1;
             ebo.extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
         }
@@ -4105,6 +4124,7 @@ fn face_mesh_refused(refusal: Refusal, fallback_reason: Option<String>) -> FaceM
 
 fn apply_face_mesh_group(
     source: &Image,
+    landmark_frame_digest: Option<[u8; 32]>,
     region: NormRect,
     job_id: Option<u64>,
     slim: Option<&SlimProducerInputs>,
@@ -4133,8 +4153,7 @@ fn apply_face_mesh_group(
     if let Err(refusal) = slim.validate_ticket(source, region, job_id) {
         return face_mesh_refused(refusal, None);
     }
-    let digest = sha256_32(&source.pixels);
-    if slim.source_sha256 != digest {
+    if Some(slim.source_sha256) != landmark_frame_digest {
         return face_mesh_refused(Refusal::ValueOutOfRange("face mesh frame digest"), None);
     }
     let points414 = match face_width_414::produce(&slim.points194, 0.0) {
@@ -4172,14 +4191,9 @@ fn apply_face_mesh_group(
             .collect();
         let vendor = face_geometry::VendorParts { parts: &arrays };
         let geometry = match group.left {
-            242 => {
-                let ui = if controls[0].abs() >= controls[1].abs() {
-                    controls[0]
-                } else {
-                    controls[1]
-                };
-                face_geometry::sharp_chin(ui, &points[..33], center, &vendor, source.width, source.height)
-            }
+            242 => face_geometry::sharp_chin_sides(
+                controls, &points[..33], center, &vendor, source.width, source.height,
+            ),
             8023 => face_geometry::jaw(
                 controls[0],
                 controls[1],
@@ -4189,14 +4203,9 @@ fn apply_face_mesh_group(
                 source.width,
                 source.height,
             ),
-            8027 => {
-                let ui = if controls[0].abs() >= controls[1].abs() {
-                    controls[0]
-                } else {
-                    controls[1]
-                };
-                face_geometry::cheek(&points[..33], center, ui, &vendor, source.width, source.height)
-            }
+            8027 => face_geometry::cheek_sides(
+                &points[..33], center, controls, &vendor, source.width, source.height,
+            ),
             8029 => face_geometry::temple(
                 &points,
                 controls[0],
@@ -4211,15 +4220,15 @@ fn apply_face_mesh_group(
             Ok(g) => g,
             Err(refusal) => return face_mesh_refused(refusal, None),
         };
-        let warps: Vec<&face_geometry::Warp> = geometry
+        let parts: Vec<_> = geometry
             .parts
             .iter()
-            .filter_map(|p| p.warp.as_ref())
+            .filter(|part| part.warp.is_some())
             .collect();
-        if warps.is_empty() {
+        if parts.is_empty() {
             return face_mesh_refused(Refusal::MissingInput("face reshape radial warp"), None);
         }
-        return rasterize_radial_warps(source, &warps);
+        return rasterize_radial_warps(source, &parts);
     }
 
     if matches!(group.left, 30080 | 30082) {
@@ -4352,6 +4361,7 @@ fn apply_face_mesh_group(
         };
     }
 
+    let digest = sha256_32(&source.pixels);
     let mut selected = Vec::new();
     {
         let points: Vec<face_geometry::Point> = points414
@@ -4759,6 +4769,9 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     let Some(source) = Image::new(width, height, std::mem::take(portrait)) else {
         return report;
     };
+    let landmark_frame_digest = (inputs.slim.is_some()
+        && effects.iter().any(|(pf, degree)| *degree != 0.0 && face_mesh_group(*pf).is_some()))
+        .then(|| sha256_32(&source.pixels));
 
     let neutral_grey_original = effects
         .iter()
@@ -4938,7 +4951,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 .entry(group.left)
                 .or_insert_with(|| {
                     let result =
-                        apply_face_mesh_group(&current, region, inputs.job_id(), inputs.slim, group, controls);
+                        apply_face_mesh_group(&current, landmark_frame_digest, region, inputs.job_id(), inputs.slim, group, controls);
                     if let Some(next) = result.image.as_ref() {
                         current = next.clone();
                     }
