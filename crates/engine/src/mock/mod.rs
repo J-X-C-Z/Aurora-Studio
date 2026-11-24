@@ -125,6 +125,12 @@ pub(crate) fn prewarm_gpu() {
     if clarity_gpu::enabled() {
         let _ = clarity_gpu::prewarm();
     }
+    // The app already calls this on a low-priority startup thread. Adding the
+    // develop module means the first eligible preview no longer pays the CUDA
+    // module-load synchronously; a refusal leaves the CPU path untouched.
+    if develop_gpu::enabled() {
+        let _ = develop_gpu::prewarm();
+    }
 }
 
 enum Origin {
