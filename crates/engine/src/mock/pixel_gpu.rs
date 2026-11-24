@@ -500,9 +500,11 @@ pub(crate) fn vignette_plane_cached(
     Some(plane)
 }
 
-/// Cached LCC plane, keyed by the grid contents and the slider strength.
-pub(crate) fn lcc_plane_cached(grid: &GpuLccGrid, width: usize, height: usize) -> Option<Arc<Vec<f32>>> {
-    let key = hashed(|hasher| {
+/// Cache key for an LCC gain plane. The bytes depend only on the grid and the
+/// plane size; the consumer's output size is a policy input and stays out of the
+/// key (see [`lcc_plane_for_output`]).
+fn lcc_plane_key(grid: &GpuLccGrid, width: usize, height: usize) -> u64 {
+    hashed(|hasher| {
         width.hash(hasher);
         height.hash(hasher);
         grid.columns.hash(hasher);
@@ -514,11 +516,63 @@ pub(crate) fn lcc_plane_cached(grid: &GpuLccGrid, width: usize, height: usize) -
         grid.luminance.iter().for_each(|value| hash_f32(hasher, *value));
         grid.slope_x.iter().for_each(|value| hash_f32(hasher, *value));
         grid.slope_y.iter().for_each(|value| hash_f32(hasher, *value));
-    });
+    })
+}
+
+/// Cached LCC plane, keyed by the grid contents and the slider strength.
+pub(crate) fn lcc_plane_cached(grid: &GpuLccGrid, width: usize, height: usize) -> Option<Arc<Vec<f32>>> {
+    let key = lcc_plane_key(grid, width, height);
     if let Some(plane) = cache_lookup(|cache| &mut cache.lcc, key) {
         return Some(plane);
     }
     let plane = Arc::new(lcc_plane(grid, width, height)?);
+    cache_store(|cache| &mut cache.lcc, key, Arc::clone(&plane));
+    Some(plane)
+}
+
+/// Cold-plane admission: consumed output pixels per plane pixel.
+///
+/// 0.2 is the P-08 gate for three reuses of one plane; a single cold frame only
+/// breaks even near 0.5-0.7. `AURORA_PIXEL_LCC_MIN_OUT_RATIO` overrides it.
+const LCC_PLANE_MIN_OUT_RATIO: f64 = 0.2;
+
+fn lcc_min_out_ratio() -> f64 {
+    std::env::var("AURORA_PIXEL_LCC_MIN_OUT_RATIO")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+        .unwrap_or(LCC_PLANE_MIN_OUT_RATIO)
+}
+
+fn lcc_output_admitted(plane_w: usize, plane_h: usize, out_pixels: usize) -> bool {
+    if out_pixels == 0 {
+        return false;
+    }
+    let plane_pixels = plane_w as f64 * plane_h as f64;
+    out_pixels as f64 >= plane_pixels * lcc_min_out_ratio()
+}
+
+/// Cached LCC plane for one output size.
+///
+/// A hit is served unconditionally: warm consumption measures 0.23-0.29x the
+/// CPU grid, so a preview still benefits from a plane an earlier 1:1 or export
+/// render cached. Only a cold build is gated; below the ratio the caller falls
+/// back to `UniformLight::source_gain` for this frame and no negative entry is
+/// written.
+pub(crate) fn lcc_plane_for_output(
+    grid: &GpuLccGrid,
+    plane_w: usize,
+    plane_h: usize,
+    out_pixels: usize,
+) -> Option<Arc<Vec<f32>>> {
+    let key = lcc_plane_key(grid, plane_w, plane_h);
+    if let Some(plane) = cache_lookup(|cache| &mut cache.lcc, key) {
+        return Some(plane);
+    }
+    if !lcc_output_admitted(plane_w, plane_h, out_pixels) {
+        return None;
+    }
+    let plane = Arc::new(lcc_plane(grid, plane_w, plane_h)?);
     cache_store(|cache| &mut cache.lcc, key, Arc::clone(&plane));
     Some(plane)
 }
