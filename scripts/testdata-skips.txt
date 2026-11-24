@@ -1,0 +1,123 @@
+# CI-only skip list for tests that need local, gitignored fixtures.
+#
+# Default CI does NOT read this file: enable with workflow_dispatch input
+# skip_testdata=true (or set AURORA_CI_SKIP_TESTDATA=1 and run the same command
+# locally). One test-name substring per line; '#' starts a comment.
+#
+# Source: 90_work/build-cache/integration/failures.txt (108 failures from a
+# clean `git archive` export of 9966a47; all need crates/engine/testdata/ which
+# is gitignored). Authoritative grouping/recommendations live in
+# 06_reports/CI-TESTDATA-SKIPS-20261124.tsv (owned by another lane).
+#
+# Deliberately NOT skipped (real code/test mismatches, must be fixed):
+#   portrait_historical_tone_provider::tests::each_row_frame_binding_is_validated_by_name
+#   portrait_historical_tone_provider::tests::pf30013_builder_projects_canonical_class1_mask_and_binds_frame
+# Also note: this list only covers aurora-engine --lib. Integration targets
+# (crates/engine/tests/*.rs) were not executed in the clean-export run.
+
+adjust::tests::as_shot_reads_the_real_nef_gains
+c1_banding::tests::z6iii_reports_an_empty_range
+c1_cos::tests::one_layer_exposure_is_written
+c1_cos::tests::unchanged_adjustments_leave_the_file_alone
+c1_masks::brush_wire_tests::all_sixteen_columns_exist_and_parse
+c1_styles::tests::a_failed_save_keeps_the_existing_path
+c1_styles::tests::a_real_style_maps_its_tools
+c1_styles::tests::edited_values_are_written_canonically
+c1_styles::tests::every_real_sample_parses
+c1_styles::tests::save_replaces_an_existing_style_without_leaving_temp_files
+c1_styles::tests::writer_field_diff_against_real_sample
+c1_styles::tests::writer_omits_metadata_and_unmapped_keys
+c1_styles::tests::writer_reproduces_capture_one_number_spelling
+c1_styles::tests::written_style_round_trips_mapped_values
+c1_writeback::tests::a_clamped_crop_write_leaves_the_row_alone_and_warns
+c1_writeback::tests::a_corrupt_catalog_is_refused_before_any_write
+c1_writeback::tests::an_unchanged_variant_is_not_rewritten
+c1_writeback::tests::an_unclamped_crop_is_written_as_pixels
+c1_writeback::tests::exposure_round_trips_through_the_catalog
+c1_writeback::tests::the_engine_entry_point_reports_unchanged
+c1_writeback::tests::the_engine_entry_point_writes_and_rereads
+c1catalog::tests::a_truncated_wal_is_reported_not_ignored
+c1catalog::tests::a_wal_header_that_is_truncated_is_reported
+c1catalog::tests::a_wal_is_replayed_in_memory_and_the_database_is_not_written
+c1catalog::tests::a_wal_with_a_broken_checksum_names_the_frames_that_cannot_be_replayed
+c1catalog::tests::base_layer_becomes_adjustments
+c1catalog::tests::chromatic_aberration_columns_reach_the_model
+c1catalog::tests::keyword_names_are_qualified_with_their_parent
+c1catalog::tests::mask_layers_are_parsed_but_not_merged_globally
+c1catalog::tests::ratings_take_the_max_of_the_layer_chain
+c1catalog::tests::reading_does_not_modify_the_database
+c1catalog::tests::reads_all_variants
+c1catalog::tests::reads_collections_kinds_from_the_entity_table
+c1catalog::tests::reads_images_with_paths_and_exif
+c1catalog::tests::reads_the_collection_tree
+c1catalog::tests::the_minimal_session_fixture_opens_as_a_session
+c1catalog::tests::the_real_catalog_has_no_keyword_rows
+c1catalog::tests::utf8_text_survives
+c1import::tests::a_bundle_directory_opens_like_the_file
+c1import::tests::a_catalog_reports_its_document_type
+c1import::tests::a_folder_with_one_catalog_opens
+c1import::tests::a_session_bundle_opens_with_its_mac_paths
+c1import::tests::an_unknown_document_type_is_an_error
+c1import::tests::crop_is_normalized_inside_the_variants_canvas
+c1import::tests::every_variant_carries_a_non_default_adjustment_set
+c1import::tests::keywords_are_empty_in_the_real_catalog
+c1import::tests::opens_the_fixture
+c1import::tests::ratings_tags_and_keywords_are_read
+c1import::tests::the_catalog_tree_becomes_engine_collections
+c1import::tests::variants_are_grouped_per_image_in_index_order
+c1session_export::tests::a_columns_all_23_round_trip_and_retouch_rows
+c1session_export::tests::a_columns_first_eight_round_trip
+c1session_export::tests::an_exported_session_reads_back_with_the_same_images_and_edits
+c1session_export::tests::collection_queries_find_preserved_variant_links
+c1session_export::tests::entities_and_display_tables_match_the_source
+c1session_export::tests::exported_document_points_to_its_root_collection
+c1session_export::tests::exported_variant_references_resolve_to_its_rebuilt_layers
+c1session_export::tests::full_session_matrix_round_trip
+c1session_export::tests::local_mask_layers_survive_as_references
+c1session_export::tests::path_locations_are_winroot_plus_relative
+c1session_export::tests::rated_images_are_linked_into_selects_only
+c1session_export::tests::renamed_capture_media_keeps_its_mask_sidecar
+c1session_export::tests::session_export_writes_requested_gradient_and_preserves_other_record
+c1session_export::tests::session_mapping_modes_reimport_linear_and_radial_across_canvas_orientations
+c1session_export::tests::template_export_has_no_dangling_source_collection_ids
+c1session_export::tests::the_collection_tree_survives_the_round_trip
+camera_curve::tests::both_exif_spellings_reach_the_same_curve
+camera_curve::tests::maps_z_series_models
+camera_curve::tests::parses_real_z6_3_curve
+camera_curve::tests::real_z6_3_lut_is_monotonic
+camera_defaults::tests::real_nef_fields_are_read_and_mapped
+exif::tests::exif_is_found_in_the_file_head_without_reading_the_rest
+exif::tests::exif_past_the_head_still_falls_back_to_a_full_read
+exif::tests::real_sample_carries_exif_and_iptc
+fcrv_index::tests::bad_file_is_reported_not_fatal
+fcrv_index::tests::bare_stem_sorts_before_its_variants
+fcrv_index::tests::rows_are_sorted_by_name
+file_engine::tests::c1_bundle_leaves_no_portrait_inside_the_package
+file_engine::tests::c1_catalog_imports_every_variant_once
+file_engine::tests::c1_collections_replace_the_folder_tree
+file_engine::tests::c1_import_keeps_adjustments_and_metadata
+file_engine::tests::c1_import_keeps_portrait_edits_on_reopen
+file_engine::tests::c1_import_saves_to_portrait_not_the_catalog
+file_engine::tests::c1_layers_without_a_mask_stay_out_of_the_render
+file_engine::tests::clearing_lcc_calibration_removes_the_cos_pointer
+file_engine::tests::eip_restores_packed_edits_on_import_and_reopen
+file_engine::tests::lcc_calibration_round_trips_through_cos_lccid_and_sidecar
+file_engine::tests::setting_lcc_on_an_unknown_image_is_an_error
+heif::tests::real_sample_auxiliary_counts_are_readable
+mock::process::tests::film_curve_darkens_midtones
+presets::tests::a_preset_can_be_applied_as_a_style
+presets::tests::a_saved_file_is_a_plain_sl_document
+presets::tests::a_saved_file_keeps_the_metadata_and_the_order
+presets::tests::a_saved_preset_carries_every_mapped_key_of_a_bw_preset
+presets::tests::an_edited_adjustment_is_written_out
+presets::tests::every_real_preset_survives_a_round_trip
+presets::tests::maps_a_bundled_exposure_preset
+presets::tests::maps_a_bundled_style_curve_and_film_curve
+presets::tests::maps_a_bw_preset_onto_the_six_sensitivities
+presets::tests::saves_a_preset_that_reads_back_the_same
+presets::tests::scans_the_bundled_folder_once
+rawinfo::tests::lens_model_comes_from_the_exif_ifd
+rawinfo::tests::nikon_makernote_wb_and_shutter_count
+rawinfo::tests::real_nef_matches_capture_ones_stored_white_balance
+recipe::tests::parses_real_recipe_output_sharpening_keys
+recipe::tests::watermark_parse_local_c1_recipes

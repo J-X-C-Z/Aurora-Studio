@@ -6,7 +6,7 @@
 
 - [ ] `cargo check --workspace --all-targets --locked`
 - [ ] `cargo test --workspace --locked -- --test-threads=1`（默认关闭 `external-fixtures`）
-- [ ] `cargo build -p lumen-app --release --locked`
+- [ ] `cargo build -p portrait-app --release --locked`
 - [ ] 涉及预览性能时附 Windows 原生 Release 冷暖帧、P50/P95 和画质证据
 - [ ] 涉及拖动/静止时确认同分辨率、同像素质量
 - [ ] 比例测试覆盖 1:1、4:3、3:2、16:9 和竖幅
