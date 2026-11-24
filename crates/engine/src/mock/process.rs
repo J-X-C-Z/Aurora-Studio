@@ -1341,8 +1341,39 @@ fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> 
         };
         matches!(
             pf,
-            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 30013 | 90004 | 90023 | 90024
+            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 30013 | 90004 | 90021 | 90023
+                | 90024
         )
+    })
+}
+
+/// True when a B3 makeup row has a non-zero `pc:<pf>` control. The makeup
+/// bundle is same-frame work, so it is only attached for rows that will run.
+fn any_makeup_row_active(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    extra.iter().any(|(key, value)| {
+        if value.abs() <= 1.0e-6 {
+            return false;
+        }
+        let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
+    })
+}
+
+/// True when any same-frame producer attachment has work: a B3 makeup row, or
+/// PF101 / PF90002 / PF90010 / PF90021. This only widens the stage-face guard so
+/// those rows reach their attach calls; it does not itself force parsing.
+fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    extra.iter().any(|(key, value)| {
+        if value.abs() <= 1.0e-6 {
+            return false;
+        }
+        let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        matches!(pf, 101 | 90002 | 90010 | 90021)
+            || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
 
@@ -2202,7 +2233,9 @@ fn render_sized(
         }
         // Keep R17's PF108 path on the stage frame; its parsing semantics are
         // owned by the separate teeth lane.
-        if (needs_stage_face_parsing(&adj.extra) || needs_stage_face_bundle_direct(&adj.extra))
+        if (needs_stage_face_parsing(&adj.extra)
+            || needs_stage_face_bundle_direct(&adj.extra)
+            || needs_producer_attach(&adj.extra))
             && region == NormRect::FULL
         {
             let want_parsing = needs_stage_face_parsing(&adj.extra);
@@ -2297,6 +2330,50 @@ fn render_sized(
                                     attached = true;
                                 }
                             }
+                        }
+                        // Same-frame attachments added after the existing
+                        // parsing/geometry rows; their order above is unchanged.
+                        let c90021 = adj.extra.get("pc:90021").copied().unwrap_or(0.0);
+                        if c90021 != 0.0 {
+                            match bundle.attach_pf90021_inputs(&stage_frame, c90021, &mut inputs) {
+                                Ok(()) => attached = true,
+                                Err(refusal) => {
+                                    log::warn!("PF90021 same-frame input refused: {refusal:?}");
+                                }
+                            }
+                        }
+                        if any_makeup_row_active(&adj.extra)
+                            && bundle
+                                .attach_makeup_bundle(
+                                    &stage_frame,
+                                    &crate::portrait_makeup_bundle::B3_MAKEUP_ROWS,
+                                    &mut inputs,
+                                )
+                                .is_ok()
+                        {
+                            attached = true;
+                        }
+                        let c101 = adj.extra.get("pc:101").copied().unwrap_or(0.0);
+                        if c101 != 0.0 {
+                            if bundle
+                                .attach_pf101_inputs(&stage_frame, c101, &mut inputs)
+                                .is_ok()
+                            {
+                                attached = true;
+                            }
+                        }
+                        // The apply path needs moisture planes only for
+                        // PF90002 (face) or PF90010 (body); both live in the
+                        // same producer call.
+                        let moisture_active = adj.extra.get("pc:90002").copied().unwrap_or(0.0)
+                            != 0.0
+                            || adj.extra.get("pc:90010").copied().unwrap_or(0.0) != 0.0;
+                        if moisture_active
+                            && bundle
+                                .attach_moisture_inputs(&stage_frame, masks, &mut inputs)
+                                .is_ok()
+                        {
+                            attached = true;
                         }
                         if attached {
                             producer_inputs = Some(inputs);
@@ -3261,6 +3338,11 @@ fn bw_split_tone(y: f32, bw: &BlackWhite) -> [f32; 3] {
 /// `[red, yellow, green, cyan, blue, magenta]`; each unit is `0.01` of full
 /// scale, i.e. `10.24` Q10 counts. The two tables are complementary at zero:
 /// `sum = 1024`, based on the tonemap's own luma basis (not Rec.601).
+///
+/// The min-side slot is the channel that is *darkest* in that colour, so the
+/// secondaries pair with their missing channel: cyan owns min R, magenta min
+/// G, yellow min B. Assigning yellow to min G (or magenta to min B) instead
+/// makes the matching slider inert on its own colour.
 fn bw_weights(sensitivity: &[f32; 6]) -> ([i32; 3], [i32; 3]) {
     const BASE: [f64; 3] = [340.7872, 626.7904, 56.4224];
     let luma = [
@@ -3270,8 +3352,8 @@ fn bw_weights(sensitivity: &[f32; 6]) -> ([i32; 3], [i32; 3]) {
     ];
     let comp = [
         (1024.0 - BASE[0]) + 10.24 * sensitivity[3] as f64,
-        (1024.0 - BASE[1]) + 10.24 * sensitivity[1] as f64,
-        (1024.0 - BASE[2]) + 10.24 * sensitivity[5] as f64,
+        (1024.0 - BASE[1]) + 10.24 * sensitivity[5] as f64,
+        (1024.0 - BASE[2]) + 10.24 * sensitivity[1] as f64,
     ];
     let q = |w: [f64; 3]| w.map(|v| v as i32);
     (q(comp), q(luma))
@@ -3285,7 +3367,9 @@ fn bw_sector_y(g: [f32; 3], sensitivity: &[f32; 6]) -> f32 {
     let (w_min, w_max) = bw_weights(sensitivity);
     let q = g.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as i32);
     // The host's argmax favours R unless B >= R, and argmin favours R unless
-    // G < R; ties therefore pick R. Keep that order so sector boundaries match.
+    // G < R. On a tie the tied channel is the mid one for every pure primary
+    // and secondary, so its `max - mid` / `mid - min` term is zero and the
+    // choice cannot move the result; keep the order for the other sectors.
     let (i_max, max) = if q[0] > q[2] { (0, q[0]) } else { (2, q[2]) };
     let (i_max, max) = if q[1] > max { (1, q[1]) } else { (i_max, max) };
     let (i_min, min) = if q[1] < q[0] { (1, q[1]) } else { (0, q[0]) };
@@ -4781,6 +4865,14 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
         let (comp, _) = bw_weights(&[0.0, 0.0, 0.0, 100.0, 0.0, 0.0]);
         assert_eq!(comp[0], 1707, "cyan drives the min-side weight");
+
+        // The min-side slot belongs to the channel the colour is missing:
+        // magenta (no G) drives min G, yellow (no B) drives min B. Swapping
+        // these makes each slider inert on its own colour.
+        let (comp, _) = bw_weights(&[0.0, 0.0, 0.0, 0.0, 0.0, 100.0]);
+        assert_eq!(comp[1], 1421, "magenta drives the min-side G weight");
+        let (comp, _) = bw_weights(&[0.0, 100.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(comp[2], 1991, "yellow drives the min-side B weight");
     }
 
     /// Saturated primaries and secondaries at zero sliders resolve to the
@@ -4824,6 +4916,85 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
         let neutral = BlackWhite { enabled: true, ..BlackWhite::default() };
         assert_eq!(black_white([0.5, 0.5, 0.5], &neutral), [luma([0.5; 3]); 3]);
+    }
+
+    /// Pure primaries have `min == mid` and pure secondaries have `mid == max`,
+    /// so this is the tie case that a synthetic narrow-gamut gradient hits. The
+    /// sector kernel must still desaturate all six and every owning slider
+    /// (red, yellow, green, cyan, blue, magenta) must move its own colour.
+    #[test]
+    fn bw_pure_colour_gradients_turn_grey_and_follow_their_slider() {
+        let zero = [0.0; 6];
+        let axes = [
+            ("red", [1.0, 0.0, 0.0], 0usize),
+            ("yellow", [1.0, 1.0, 0.0], 1),
+            ("green", [0.0, 1.0, 0.0], 2),
+            ("cyan", [0.0, 1.0, 1.0], 3),
+            ("blue", [0.0, 0.0, 1.0], 4),
+            ("magenta", [1.0, 0.0, 1.0], 5),
+        ];
+        let bw = BlackWhite { enabled: true, ..BlackWhite::default() };
+        for (name, dir, slider) in axes {
+            let mut prev = -1.0f32;
+            for v in [0.0625f32, 0.25, 0.5, 1.0] {
+                let g = dir.map(|c| c * v);
+                let y = bw_sector_y(g, &zero);
+                assert!(y > prev, "{name} v={v}: {y} did not grow from {prev}");
+                assert!((0.0..=1.0).contains(&y), "{name} v={v}: {y}");
+                prev = y;
+                let out = black_white(g, &bw);
+                assert_eq!(out, [out[0]; 3], "{name} v={v}: {out:?} is not grey");
+            }
+            let g = dir.map(|c| c * 0.5);
+            let base = bw_sector_y(g, &zero);
+            let mut up = zero;
+            up[slider] = 40.0;
+            let mut down = zero;
+            down[slider] = -40.0;
+            let hi = bw_sector_y(g, &up);
+            let lo = bw_sector_y(g, &down);
+            assert!(hi > base + 1e-3, "{name}: +40 gave {hi}, base {base}");
+            assert!(lo < base - 1e-3, "{name}: -40 gave {lo}, base {base}");
+            assert!((0.0..=1.0).contains(&hi) && (0.0..=1.0).contains(&lo), "{name}: {lo}..{hi}");
+        }
+    }
+
+    /// B&W must not be short-circuited on a pure-colour gradient that only has
+    /// one non-zero source channel. The frame, the slider sweep and the colour
+    /// picker (`sample_point` -> `render_single`) must all see the same stage.
+    #[test]
+    fn bw_render_and_picker_are_grey_on_pure_colour_gradients() {
+        let w = 8u32;
+        let mut red = Vec::new();
+        let mut blue = Vec::new();
+        for i in 0..w {
+            let v = (16 + i * 32) as u8;
+            red.extend_from_slice(&[v, 0, 0, 255]);
+            blue.extend_from_slice(&[0, 0, v, 255]);
+        }
+        for (name, rgba, slider) in [("red", red, 0usize), ("blue", blue, 4usize)] {
+            let src = Source::from_rgba(w, 1, &rgba);
+            let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, w, false, None);
+            let mut bw = AdjustmentSet::default();
+            bw.black_white.enabled = true;
+            let grey = render(&src, &bw, NormRect::FULL, w, false, None);
+            assert_ne!(plain.rgba, grey.rgba, "{name}: B&W enable had no effect");
+            for px in grey.rgba.chunks_exact(4) {
+                assert_eq!(px[0], px[1], "{name}: {px:?} is not grey");
+                assert_eq!(px[1], px[2], "{name}: {px:?} is not grey");
+            }
+
+            let mut swept = bw.clone();
+            swept.black_white.sensitivity[slider] = -60.0;
+            let dark = render(&src, &swept, NormRect::FULL, w, false, None);
+            assert_ne!(grey.rgba, dark.rgba, "{name}: slider had no effect");
+
+            let picked = sample_point(&src, &bw, [0.5, 0.5]);
+            assert!((picked[0] - picked[1]).abs() < 1e-5, "{name}: picker {picked:?}");
+            assert!((picked[1] - picked[2]).abs() < 1e-5, "{name}: picker {picked:?}");
+            let picked_swept = sample_point(&src, &swept, [0.5, 0.5]);
+            assert!(picked_swept[0] < picked[0] - 1e-3, "{name}: picker ignored slider");
+        }
     }
 
     /// Neutral `ColorBalance*` values (the `1;1;1` default) must not move a pixel.

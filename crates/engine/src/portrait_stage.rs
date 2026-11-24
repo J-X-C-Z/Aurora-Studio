@@ -60,7 +60,7 @@ pub use portrait_landmark_stage::{
 };
 
 #[path = "portrait_face_input_stage.rs"]
-mod portrait_face_input_stage;
+pub mod portrait_face_input_stage;
 pub use portrait_face_input_stage::{
     C1FaceDetection, C1FaceMesh, C1FaceParsing, C1_FACE_DETECTION_MODEL_ID,
     C1_FACE_DETECTION_MODEL_SHA256, C1_FACE_MESH_MODEL_ID, C1_FACE_MESH_MODEL_SHA256,
@@ -547,6 +547,8 @@ pub struct ProducerInputs {
     pub plump: Option<PlumpProducerInputs>,
     pub pf101: Option<Pf101ProducerInputs>,
     pub pf90130: Option<Pf90130ProducerInputs>,
+    pub moisture_face: Option<crate::portrait_moisture_inputs::OwnedMoistureFaceInputs>,
+    pub moisture_body: Option<crate::portrait_moisture_inputs::OwnedMoistureBodyInputs>,
 }
 
 /// Owned same-job inputs for the recovered PF101 FilterType 41/42/43/44 stage.
@@ -3654,6 +3656,17 @@ impl<'a> PortraitJobInputs<'a> {
         self.makeup_bundle = producer.makeup_bundle.as_ref();
         self.pf101 = producer.pf101.as_ref();
         self.pf90130 = producer.pf90130.as_ref();
+        // Borrow the owned same-frame planes back out of `producer`, which lives
+        // for `'a` like `self`. A missing owned bundle stays `None`, so the
+        // PF90002/PF90010 rows still refuse with their own MissingInput names.
+        self.moisture_face = producer
+            .moisture_face
+            .as_ref()
+            .map(|value| value.as_borrowed());
+        self.moisture_body = producer
+            .moisture_body
+            .as_ref()
+            .map(|value| value.as_borrowed());
     }
 
     fn resolve_wrinkle_inputs(
@@ -14425,5 +14438,38 @@ mod tests {
                 run.pf
             );
         }
+    }
+
+    #[test]
+    fn owned_moisture_face_borrows_with_identical_geometry() {
+        use crate::portrait_moisture_inputs::OwnedMoistureFaceInputs;
+        let width = 8u32;
+        let height = 6u32;
+        let owned = OwnedMoistureFaceInputs {
+            width,
+            height,
+            mask_rgba: vec![0u8; (width * height * 4) as usize],
+            blur_alpha: vec![0u8; (width * height) as usize],
+            channel: aurora_portrait::kernels::moisture::MaskChannel::R,
+            skin_map_width: 2,
+            skin_map_height: 2,
+            skin_map: vec![0.0f32; 4],
+            hardlight: vec![1.0f32; 256],
+            beauty: vec![1.0f32; 256],
+            pivot: 0.5,
+            gain: 1.0,
+        };
+        let borrowed = owned.as_borrowed();
+        assert_eq!((borrowed.width, borrowed.height), (owned.width, owned.height));
+        assert_eq!(
+            (borrowed.skin_map_width, borrowed.skin_map_height),
+            (owned.skin_map_width, owned.skin_map_height)
+        );
+        assert_eq!(borrowed.mask_rgba.len(), owned.mask_rgba.len());
+        assert_eq!(borrowed.blur_alpha.len(), owned.blur_alpha.len());
+        assert_eq!(borrowed.skin_map.len(), owned.skin_map.len());
+        assert_eq!(borrowed.hardlight.len(), owned.hardlight.len());
+        assert_eq!(borrowed.beauty.len(), owned.beauty.len());
+        assert_eq!((borrowed.pivot, borrowed.gain), (owned.pivot, owned.gain));
     }
 }
