@@ -22,16 +22,26 @@ use crate::RgbaImage;
 
 /// Only files with this prefix are ever evicted; the caller shares the folder.
 const PREFIX: &str = "raw-";
-// Bump when the persisted layout changes. B8 replaces the single algorithm
-// revision with the 64-bit stage-mix pipeline fingerprint, so B7 files miss
-// naturally.
-const RAW16_MAGIC: &[u8; 8] = b"AUR16B8\0";
-/// magic(8) width(4) height(4) body bytes(8) image hash(8)
-/// pipeline fingerprint(8) backend(1) opencl(1) pixel_space(1) flags(1)
-/// reserved(4, must be zero).
-const HEADER16: usize = 48;
+// Bump when the persisted layout changes. B9 persists the source content
+// identity and the route digest next to the B8 stage-mix fingerprint, so B8 and
+// older files miss naturally.
+const RAW16_MAGIC: &[u8; 8] = b"AUR16B9\0";
+/// magic(8) width(4) height(4) body bytes(8) image hash(8) body crc32(4)
+/// pad(4) pipeline fingerprint(8) source len(8) source content(8)
+/// source mtime(8) route digest(8) identity flags(1) backend(1) opencl(1)
+/// pixel_space(1) flags(1) reserved(11, must be zero).
+const HEADER16: usize = 96;
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: u64 = 1 << 30;
+/// Bytes read at each of [`IDENTITY_SAMPLES`] evenly spread windows when the
+/// source is too large to hash whole.
+const IDENTITY_WINDOW: usize = 16 << 10;
+/// Windows at 0, 1/8, ..., 7/8 and the tail. The middle window straddles the
+/// exact file midpoint, so a changed header, middle or tail always misses.
+const IDENTITY_SAMPLES: u64 = 9;
+/// Files at or below this size are hashed whole: cheaper than the bookkeeping
+/// and immune to changes between windows.
+const IDENTITY_FULL_BELOW: u64 = 2 << 20;
 /// One full-sensor frame kept after a cold proxy decode. The fit view already
 /// paid for that decode and then discarded the native pixels, which made the
 /// first 1:1 zoom decode the same sensor again. 256 MiB covers a 24 MP RGBA16
@@ -39,8 +49,9 @@ const MAX_BYTES: u64 = 1 << 30;
 const MAX_PENDING_NATIVE_BYTES: usize = 256 << 20;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-static PENDING_NATIVE: Mutex<Option<(String, u32, u32, Vec<u16>, DecodeProvenance)>> =
-    Mutex::new(None);
+
+/// A decoded frame: width, height, RGBA16 pixels, provenance.
+type Frame16 = (u32, u32, Vec<u16>, DecodeProvenance);
 
 /// Decoded pixels for `path`, at most `long_side` on the longest edge.
 ///
@@ -98,7 +109,8 @@ pub fn get_or_decode16_traced(
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
     let route = crate::raw::decode_route(path);
     let Some(dir) = default_raw16_dir() else {
-        return decode_frame16(path, long_side, route);
+        let identity = tracked_identity(path).unwrap_or(SourceIdentity::UNKNOWN);
+        return decode_frame16(path, long_side, route, identity);
     };
     get_or_decode16_with(path, &dir, long_side, crate::raw::decode16_traced)
 }
@@ -111,20 +123,22 @@ pub(crate) fn get_or_decode_source16(
     let Some(dir) = default_raw16_dir() else {
         return decode_source16(path, long_side, route);
     };
-    let key = cache_key16_for_route(path, &dir, long_side, route);
-    if let Some(source) = key.as_deref().and_then(|file| read_cached_source16(file, &route)) {
+    let Some(identity) = tracked_identity(path) else {
+        return decode_source16(path, long_side, route);
+    };
+    let key = cache_name16_for_identity(path, long_side, route, identity);
+    let file = dir.join(&key);
+    if let Some(source) = read_cached_source16(&file, &route, &identity) {
         return Some(source);
     }
-    if let Some((width, height, pixels, provenance)) = take_pending_native(path, long_side, route) {
-        return Some((Source::from_rgba16(width, height, &pixels), provenance));
+    if let Some(frame) = take_pending_native(path, long_side, route, identity) {
+        return Some((Source::from_rgba16(frame.0, frame.1, &frame.2), frame.3));
     }
-    let image = match cached_full_frame16(path, &dir, long_side, route) {
+    let image = match cached_full_frame16(path, &dir, long_side, route, identity) {
         Some(image) => image,
-        None => decode_frame16(path, long_side, route)?,
+        None => decode_frame16(path, long_side, route, identity)?,
     };
-    if let Some(file) = key {
-        store16_binary(&file, image.0, image.1, &image.2, image.3);
-    }
+    store16_binary(&file, image.0, image.1, &image.2, image.3, identity, &route);
     Some((Source::from_rgba16(image.0, image.1, &image.2), image.3))
 }
 
@@ -133,7 +147,8 @@ fn decode_source16(
     long_side: u32,
     route: DecodeRoute,
 ) -> Option<(Source, DecodeProvenance)> {
-    let image = decode_frame16(path, long_side, route)?;
+    let identity = tracked_identity(path).unwrap_or(SourceIdentity::UNKNOWN);
+    let image = decode_frame16(path, long_side, route, identity)?;
     Some((Source::from_rgba16(image.0, image.1, &image.2), image.3))
 }
 
@@ -160,27 +175,37 @@ fn get_or_decode16_with_route<F>(
 where
     F: FnOnce(&Path) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)>,
 {
-    let key = cache_key16_for_route(path, dir, long_side, route);
-    if let Some(file) = key
-        .as_deref()
-        .and_then(|file| read_cached16_binary(file, &route))
-    {
+    let Some(identity) = tracked_identity(path) else {
+        let (w, h, pixels, provenance) = decode(path)?;
+        let (width, height, fitted) = fit16(w, h, pixels, long_side);
+        return Some((width, height, fitted, provenance));
+    };
+    let key = cache_name16_for_identity(path, long_side, route, identity);
+    if let Some(file) = read_cached16_binary(&dir.join(&key), &route, &identity) {
         return Some(file);
     }
-    if let Some(image) = take_pending_native(path, long_side, route) {
+    if let Some(image) = take_pending_native(path, long_side, route, identity) {
         return Some(image);
     }
-    let image = match cached_full_frame16(path, dir, long_side, route) {
+    let image = match cached_full_frame16(path, dir, long_side, route, identity) {
         Some(image) => image,
         None => {
-            let native_key = cache_name16_for_route(path, 0, route);
+            let native_key = cache_name16_for_identity(path, 0, route, identity);
             let (w, h, pixels, provenance) = decode(path)?;
-            fit16_keep_native(native_key, w, h, pixels, long_side, provenance)
+            fit16_keep_native(
+                Some(native_key),
+                path,
+                w,
+                h,
+                pixels,
+                long_side,
+                provenance,
+                identity,
+                &route,
+            )
         }
     };
-    if let Some(file) = key {
-        store16_binary(&file, image.0, image.1, &image.2, image.3);
-    }
+    store16_binary(&dir.join(&key), image.0, image.1, &image.2, image.3, identity, &route);
     Some(image)
 }
 
@@ -214,26 +239,183 @@ fn cache_key16_for_route(
     long_side: u32,
     route: DecodeRoute,
 ) -> Option<PathBuf> {
-    Some(dir.join(cache_name16_for_route(path, long_side, route)?))
+    let identity = source_identity(path)?;
+    Some(dir.join(cache_name16_for_identity(path, long_side, route, identity)))
 }
 
-/// The flat name from the file identity and decoder route.
-fn cache_name16_for_route(path: &Path, long_side: u32, route: DecodeRoute) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
+/// The flat name from the content identity and decoder route.
+///
+/// The content hash means a same-path, same-length replacement with a restored
+/// mtime lands on a different file instead of reusing the old pixels.
+fn cache_name16_for_identity(
+    path: &Path,
+    long_side: u32,
+    route: DecodeRoute,
+    identity: SourceIdentity,
+) -> String {
     let mut a = DefaultHasher::new();
     let mut b = DefaultHasher::new();
-    (RAW16_MAGIC, path, meta.len(), mtime, long_side, route).hash(&mut a);
-    (0xa7u8, path, mtime, long_side, meta.len(), route).hash(&mut b);
-    Some(format!(
+    (
+        RAW16_MAGIC,
+        path,
+        identity.len,
+        identity.mtime_nanos,
+        identity.content,
+        identity.full,
+        long_side,
+        route,
+    )
+        .hash(&mut a);
+    (0xa7u8, path, identity.content, identity.mtime_nanos, long_side, identity.len, route)
+        .hash(&mut b);
+    format!(
         "{PREFIX}16b-{:016x}{:016x}-{long_side}.bin",
         a.finish(),
         b.finish()
-    ))
+    )
+}
+
+/// Quick content identity of a RAW source, read alongside its metadata.
+///
+/// Path + length + mtime alone cannot distinguish a same-size replacement that
+/// preserved the timestamp (sync tools, unpack-over semantics). The content
+/// fingerprint covers the file header, the tail and seven evenly spread
+/// windows; small files (`AURORA_RAW_CACHE_IDENTITY=full` forces this for every
+/// file) are hashed whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SourceIdentity {
+    len: u64,
+    mtime_nanos: u64,
+    content: u64,
+    full: bool,
+}
+
+impl SourceIdentity {
+    /// Used when the metadata cannot be read: the pending frame is then keyed
+    /// by path alone.
+    const UNKNOWN: Self = Self { len: 0, mtime_nanos: 0, content: 0, full: false };
+
+    fn flags(self) -> u8 {
+        self.full as u8
+    }
+}
+
+const IDENTITY_PRIME: u64 = 0x0000_0100_0000_01b3;
+const IDENTITY_DOMAIN: u64 = 0xA9C1_3E00_0000_0001;
+
+fn identity_mode_full() -> bool {
+    std::env::var("AURORA_RAW_CACHE_IDENTITY")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("full"))
+}
+
+fn fnv_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(IDENTITY_PRIME);
+    }
+    hash
+}
+
+fn source_identity(path: &Path) -> Option<SourceIdentity> {
+    let meta = fs::metadata(path).ok()?;
+    let len = meta.len();
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let full = identity_mode_full() || len <= IDENTITY_FULL_BELOW;
+    let content = content_fingerprint(path, len, full)?;
+    Some(SourceIdentity { len, mtime_nanos, content, full })
+}
+
+fn content_fingerprint(path: &Path, len: u64, full: bool) -> Option<u64> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).ok()?;
+    let mut hash = fnv_bytes(IDENTITY_DOMAIN, &len.to_le_bytes());
+    if full {
+        let mut buffer = vec![0u8; 1 << 20];
+        let mut remaining = len;
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..take]).ok()?;
+            hash = fnv_bytes(hash, &buffer[..take]);
+            remaining -= take as u64;
+        }
+        return Some(hash ^ (hash >> 32));
+    }
+    let window = (IDENTITY_WINDOW as u64).min(len);
+    let last = len - window;
+    let mut buffer = vec![0u8; window as usize];
+    for sample in 0..IDENTITY_SAMPLES {
+        let offset = (last * sample) / (IDENTITY_SAMPLES - 1);
+        hash = fnv_bytes(hash, &offset.to_le_bytes());
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.read_exact(&mut buffer).ok()?;
+        hash = fnv_bytes(hash, &buffer);
+    }
+    Some(hash ^ (hash >> 32))
+}
+
+/// Stable hash of the route fields, persisted so a renamed or copied cache file
+/// cannot serve a different decoder.
+fn route_digest(route: &DecodeRoute) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    route.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// [`source_identity`] for a lookup that also invalidates stale pending frames
+/// and rendered previews when the bytes behind a path changed.
+fn tracked_identity(path: &Path) -> Option<SourceIdentity> {
+    let identity = source_identity(path)?;
+    if note_source_identity(path, identity) {
+        invalidate_source(path);
+    }
+    Some(identity)
+}
+
+/// Content fingerprint for callers that keep decoded sources of their own (the
+/// file engine's native source slot). `None` when the file cannot be read.
+///
+/// This is the invalidation hook for `FileEngine::state.native_raw`: compare
+/// the token it was built from and drop the slot when it changes.
+#[allow(dead_code)] // the file-engine wiring lands with the merge of BO-1
+pub fn source_identity_token(path: &Path) -> Option<u64> {
+    source_identity(path).map(|identity| identity.content)
+}
+
+/// Remembers the last identity seen for a path. Returns true when the bytes
+/// behind a known path changed.
+fn note_source_identity(path: &Path, identity: SourceIdentity) -> bool {
+    static SEEN: Mutex<Option<std::collections::HashMap<PathBuf, SourceIdentity>>> =
+        Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let map = seen.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() > 256 {
+        map.clear();
+    }
+    match map.insert(path.to_path_buf(), identity) {
+        Some(previous) if previous != identity => {
+            log::info!(
+                "raw cache: source identity changed for a tracked path; \
+                 dropping its pending frame and rendered previews"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn invalidate_source(path: &Path) {
+    {
+        let mut pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.as_ref().is_some_and(|(stored, ..)| stored == path) {
+            *pending = None;
+        }
+    }
+    crate::preview_cache::invalidate_source_identity();
 }
 
 #[cfg(test)]
@@ -276,58 +458,77 @@ fn resized16(
 }
 
 /// Downscales a full sensor frame and keeps its native samples for the first
-/// zoom request. The pending frame is one slot and never triggers extra work.
+/// zoom request. The pending frame never triggers extra work.
 fn fit16_keep_native(
     native_key: Option<String>,
+    path: &Path,
     width: u32,
     height: u32,
     pixels: Vec<u16>,
     long_side: u32,
     provenance: DecodeProvenance,
-) -> (u32, u32, Vec<u16>, DecodeProvenance) {
+    identity: SourceIdentity,
+    route: &DecodeRoute,
+) -> Frame16 {
     let Some((target_width, target_height, proxy)) =
         resized16(width, height, &pixels, long_side)
     else {
         return (width, height, pixels, provenance);
     };
-    remember_native(native_key, width, height, pixels, provenance);
+    remember_native(native_key, path, width, height, pixels, provenance, identity, route);
     (target_width, target_height, proxy, provenance)
 }
 
+/// One full-sensor frame kept after a cold proxy decode: path, cache name,
+/// width, height, pixels, provenance and source identity.
+static PENDING_NATIVE: Mutex<
+    Option<(PathBuf, String, u32, u32, Vec<u16>, DecodeProvenance, SourceIdentity)>,
+> = Mutex::new(None);
+
 fn remember_native(
     native_key: Option<String>,
+    path: &Path,
     width: u32,
     height: u32,
     pixels: Vec<u16>,
     provenance: DecodeProvenance,
+    identity: SourceIdentity,
+    route: &DecodeRoute,
 ) {
     if pixels.capacity().saturating_mul(2) > MAX_PENDING_NATIVE_BYTES {
         return;
     }
     let Some(key) = native_key else { return };
+    if !provenance.consistent_with(route) {
+        return;
+    }
     *PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((key, width, height, pixels, provenance));
+        Some((path.to_path_buf(), key, width, height, pixels, provenance, identity));
 }
 
 fn take_pending_native(
     path: &Path,
     long_side: u32,
     route: DecodeRoute,
-) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    identity: SourceIdentity,
+) -> Option<Frame16> {
     if long_side != 0 {
         return None;
     }
-    let key = cache_name16_for_route(path, 0, route)?;
+    let key = cache_name16_for_identity(path, 0, route, identity);
     let mut pending = PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
     if pending
         .as_ref()
-        .is_some_and(|(stored, _, _, _, provenance)| {
-            *stored == key && provenance.consistent_with(&route)
+        .is_some_and(|(stored_path, stored, _, _, _, provenance, stored_identity)| {
+            *stored == key
+                && *stored_path == path
+                && *stored_identity == identity
+                && provenance.consistent_with(&route)
         })
     {
-        pending
-            .take()
-            .map(|(_, width, height, pixels, provenance)| (width, height, pixels, provenance))
+        pending.take().map(|(_, _, width, height, pixels, provenance, _)| {
+            (width, height, pixels, provenance)
+        })
     } else {
         None
     }
@@ -338,20 +539,25 @@ fn cached_full_frame16(
     dir: &Path,
     long_side: u32,
     route: DecodeRoute,
+    identity: SourceIdentity,
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
     if long_side == 0 {
         return None;
     }
-    let native_key = cache_name16_for_route(path, 0, route)?;
+    let native_key = cache_name16_for_identity(path, 0, route, identity);
+    let native_file = dir.join(&native_key);
     let (width, height, pixels, provenance) =
-        read_cached16_binary(&dir.join(&native_key), &route)?;
+        read_cached16_binary(&native_file, &route, &identity)?;
     Some(fit16_keep_native(
         Some(native_key),
+        path,
         width,
         height,
         pixels,
         long_side,
         provenance,
+        identity,
+        &route,
     ))
 }
 
@@ -359,27 +565,107 @@ fn decode_frame16(
     path: &Path,
     long_side: u32,
     route: DecodeRoute,
+    identity: SourceIdentity,
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
-    if let Some(pending) = take_pending_native(path, long_side, route) {
+    if let Some(pending) = take_pending_native(path, long_side, route, identity) {
         return Some(pending);
     }
-    let native_key = cache_name16_for_route(path, 0, route);
+    let native_key = cache_name16_for_identity(path, 0, route, identity);
     let (width, height, pixels, provenance) = crate::raw::decode16_traced(path)?;
     Some(fit16_keep_native(
-        native_key,
+        // No cache directory: nothing to persist, but the pending frame is
+        // still keyed by the native name.
+        Some(native_key),
+        path,
         width,
         height,
         pixels,
         long_side,
         provenance,
+        identity,
+        &route,
     ))
 }
 
-/// Reads one RAW16 entry and rejects it unless its provenance belongs to
-/// `route`. Revision, magic, enum codes and route consistency are all checked.
+/// The validated fields every reader needs from the entry header.
+struct Raw16Header {
+    width: u32,
+    height: u32,
+    body_bytes: usize,
+    image_hash: u64,
+    crc32: u32,
+    provenance: DecodeProvenance,
+}
+
+/// Validates magic, length, source identity, route digest, stage fingerprint and
+/// provenance codes. A truncated, tampered or older entry returns `None`, which
+/// makes the caller rebuild it.
+fn parse_header(
+    header: &[u8],
+    file_len: u64,
+    route: &DecodeRoute,
+    identity: &SourceIdentity,
+) -> Option<Raw16Header> {
+    if header.len() != HEADER16 || &header[..8] != RAW16_MAGIC {
+        return None;
+    }
+    let width = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let height = u32::from_le_bytes(header[12..16].try_into().ok()?);
+    let body_bytes = u64::from_le_bytes(header[16..24].try_into().ok()?) as usize;
+    let expected_bytes = width as usize * height as usize * 6;
+    if width == 0
+        || height == 0
+        || body_bytes != expected_bytes
+        || file_len != (HEADER16 + body_bytes) as u64
+    {
+        return None;
+    }
+    if header[36..40] != [0u8; 4] || header[85..96] != [0u8; 11] {
+        return None;
+    }
+    let stored_len = u64::from_le_bytes(header[48..56].try_into().ok()?);
+    let stored_content = u64::from_le_bytes(header[56..64].try_into().ok()?);
+    let stored_mtime = u64::from_le_bytes(header[64..72].try_into().ok()?);
+    let stored_route = u64::from_le_bytes(header[72..80].try_into().ok()?);
+    if stored_len != identity.len
+        || stored_content != identity.content
+        || stored_mtime != identity.mtime_nanos
+        || header[80] != identity.flags()
+        || stored_route != route_digest(route)
+    {
+        return None;
+    }
+    let provenance = DecodeProvenance::from_codes(
+        u64::from_le_bytes(header[40..48].try_into().ok()?),
+        header[81],
+        header[82],
+        header[83],
+        header[84],
+    )?;
+    if !provenance.consistent_with(route) {
+        return None;
+    }
+    Some(Raw16Header {
+        width,
+        height,
+        body_bytes,
+        image_hash: u64::from_le_bytes(header[24..32].try_into().ok()?),
+        crc32: u32::from_le_bytes(header[32..36].try_into().ok()?),
+        provenance,
+    })
+}
+
+fn body_matches(header: &Raw16Header, body: &[u8]) -> bool {
+    crc32fast::hash(body) == header.crc32
+        && image_hash(header.width, header.height, body) == header.image_hash
+}
+
+/// Reads one RAW16 entry and rejects it unless its source identity, route and
+/// provenance all match the current request.
 fn read_cached16_binary(
     file: &Path,
     route: &DecodeRoute,
+    identity: &SourceIdentity,
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
     use rayon::prelude::*;
 
@@ -387,61 +673,35 @@ fn read_cached16_binary(
     let size = reader.metadata().ok()?.len();
     let mut header = [0u8; HEADER16];
     reader.read_exact(&mut header).ok()?;
-    if &header[..8] != RAW16_MAGIC {
-        return None;
-    }
-    let width = u32::from_le_bytes(header[8..12].try_into().ok()?);
-    let height = u32::from_le_bytes(header[12..16].try_into().ok()?);
-    let bytes = u64::from_le_bytes(header[16..24].try_into().ok()?) as usize;
-    let expected_bytes = width as usize * height as usize * 6;
-    if width == 0
-        || height == 0
-        || bytes != expected_bytes
-        || size != (HEADER16 + bytes) as u64
-    {
-        return None;
-    }
-    if header[44..48] != [0u8; 4] {
-        return None;
-    }
-    let provenance = DecodeProvenance::from_codes(
-        u64::from_le_bytes(header[32..40].try_into().ok()?),
-        header[40],
-        header[41],
-        header[42],
-        header[43],
-    )?;
-    if !provenance.consistent_with(route) {
-        return None;
-    }
-    let stored_hash = u64::from_le_bytes(header[24..32].try_into().ok()?);
-    let mut rgb = vec![0u16; expected_bytes / 2];
+    let header = parse_header(&header, size, route, identity)?;
+    let mut rgb = vec![0u16; header.body_bytes / 2];
     // SAFETY: `u8` has weaker alignment than `u16`, and the complete zeroed
     // allocation is written from disk before any `u16` is read.
     let (before, body, after) = unsafe { rgb.align_to_mut::<u8>() };
     if !before.is_empty() || !after.is_empty() {
         return None;
     }
-    reader.read_exact(&mut body[..expected_bytes]).ok()?;
-    if image_hash(width, height, &body[..expected_bytes]) != stored_hash {
+    reader.read_exact(&mut body[..header.body_bytes]).ok()?;
+    if !body_matches(&header, &body[..header.body_bytes]) {
         return None;
     }
     #[cfg(target_endian = "big")]
     for sample in &mut rgb {
         *sample = u16::from_le(*sample);
     }
-    let mut pixels = vec![65535u16; width as usize * height as usize * 4];
+    let mut pixels = vec![65535u16; header.width as usize * header.height as usize * 4];
     pixels
         .par_chunks_exact_mut(4)
         .zip(rgb.par_chunks_exact(3))
         .for_each(|(dst, src)| dst[..3].copy_from_slice(src));
-    Some((width, height, pixels, provenance))
+    Some((header.width, header.height, pixels, header.provenance))
 }
 
 #[cfg(target_endian = "little")]
 fn read_cached_source16(
     file: &Path,
     route: &DecodeRoute,
+    identity: &SourceIdentity,
 ) -> Option<(Source, DecodeProvenance)> {
     use memmap2::MmapOptions;
 
@@ -449,50 +709,31 @@ fn read_cached_source16(
     // SAFETY: the cache file is read-only for the lifetime of the mapping and
     // all mutations replace it atomically through rename.
     let map = unsafe { MmapOptions::new().map(&file).ok()? };
-    if map.len() < HEADER16 || &map[..8] != RAW16_MAGIC {
+    if map.len() < HEADER16 {
         return None;
     }
-    let width = u32::from_le_bytes(map[8..12].try_into().ok()?);
-    let height = u32::from_le_bytes(map[12..16].try_into().ok()?);
-    let bytes = u64::from_le_bytes(map[16..24].try_into().ok()?) as usize;
-    let expected_bytes = width as usize * height as usize * 6;
-    if width == 0 || height == 0 || bytes != expected_bytes || map.len() != HEADER16 + bytes {
-        return None;
-    }
-    if map[44..48] != [0u8; 4] {
-        return None;
-    }
-    let provenance = DecodeProvenance::from_codes(
-        u64::from_le_bytes(map[32..40].try_into().ok()?),
-        map[40],
-        map[41],
-        map[42],
-        map[43],
-    )?;
-    if !provenance.consistent_with(route) {
-        return None;
-    }
-    let stored_hash = u64::from_le_bytes(map[24..32].try_into().ok()?);
+    let header = parse_header(&map[..HEADER16], map.len() as u64, route, identity)?;
     let body = &map[HEADER16..];
-    // SAFETY: the mapping starts page-aligned and HEADER16 is 48 bytes, so the
+    // SAFETY: the mapping starts page-aligned and HEADER16 is 96 bytes, so the
     // body is u16-aligned. `align_to` checks and reports any residual bytes.
     let (before, pixels, after) = unsafe { body.align_to::<u16>() };
-    if !before.is_empty() || !after.is_empty() || pixels.len() != expected_bytes / 2 {
+    if !before.is_empty() || !after.is_empty() || pixels.len() != header.body_bytes / 2 {
         return None;
     }
     let (valid, source) = rayon::join(
-        || image_hash(width, height, body) == stored_hash,
-        || Source::from_rgb16(width, height, pixels),
+        || body_matches(&header, body),
+        || Source::from_rgb16(header.width, header.height, pixels),
     );
-    valid.then_some((source, provenance))
+    valid.then_some((source, header.provenance))
 }
 
 #[cfg(not(target_endian = "little"))]
 fn read_cached_source16(
     file: &Path,
     route: &DecodeRoute,
+    identity: &SourceIdentity,
 ) -> Option<(Source, DecodeProvenance)> {
-    let (width, height, pixels, provenance) = read_cached16_binary(file, route)?;
+    let (width, height, pixels, provenance) = read_cached16_binary(file, route, identity)?;
     Some((Source::from_rgba16(width, height, &pixels), provenance))
 }
 
@@ -535,12 +776,14 @@ fn store16_binary(
     height: u32,
     pixels: &[u16],
     provenance: DecodeProvenance,
-) {
+    identity: SourceIdentity,
+    route: &DecodeRoute,
+) -> bool {
     use rayon::prelude::*;
 
-    let Some(dir) = file.parent() else { return };
+    let Some(dir) = file.parent() else { return false };
     if fs::create_dir_all(dir).is_err() {
-        return;
+        return false;
     }
     let temp = dir.join(format!(
         ".tmp16b-{}-{}",
@@ -561,18 +804,27 @@ fn store16_binary(
     data.extend_from_slice(&height.to_le_bytes());
     data.extend_from_slice(&(body.len() as u64).to_le_bytes());
     data.extend_from_slice(&image_hash(width, height, &body).to_le_bytes());
+    data.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+    data.extend_from_slice(&[0u8; 4]);
     data.extend_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
+    data.extend_from_slice(&identity.len.to_le_bytes());
+    data.extend_from_slice(&identity.content.to_le_bytes());
+    data.extend_from_slice(&identity.mtime_nanos.to_le_bytes());
+    data.extend_from_slice(&route_digest(route).to_le_bytes());
+    data.push(identity.flags());
     data.push(provenance.backend_code());
     data.push(provenance.opencl_code());
     data.push(provenance.pixel_space_code());
     data.push(provenance.flags());
-    data.extend_from_slice(&[0u8; 4]);
+    data.extend_from_slice(&[0u8; 11]);
+    debug_assert_eq!(data.len(), HEADER16);
     data.extend_from_slice(&body);
     if fs::write(&temp, &data).is_err() || fs::rename(&temp, file).is_err() {
         let _ = fs::remove_file(&temp);
-        return;
+        return false;
     }
     enforce_limits(dir, MAX_ENTRIES, MAX_BYTES);
+    true
 }
 
 fn image_hash(width: u32, height: u32, body: &[u8]) -> u64 {
@@ -765,8 +1017,19 @@ mod tests {
         route
     }
 
-    fn store_libraw(file: &Path, width: u32, height: u32, pixels: &[u16]) {
-        store16_binary(file, width, height, pixels, DecodeProvenance::libraw16());
+    fn test_identity(content: u64) -> SourceIdentity {
+        SourceIdentity { len: 4096, mtime_nanos: 7, content, full: true }
+    }
+
+    fn store_libraw(
+        file: &Path,
+        width: u32,
+        height: u32,
+        pixels: &[u16],
+        identity: SourceIdentity,
+        route: &DecodeRoute,
+    ) {
+        store16_binary(file, width, height, pixels, DecodeProvenance::libraw16(), identity, route);
     }
 
     #[test]
@@ -774,17 +1037,18 @@ mod tests {
         let dir = scratch("legacy-raw16");
         let file = dir.join("raw-test.bin");
         let route = test_route(true, false);
-        store_libraw(&file, 2, 1, &[100, 200, 300, 65535, 400, 500, 600, 65535]);
-        assert!(read_cached16_binary(&file, &route).is_some());
-        assert!(read_cached_source16(&file, &route).is_some());
-        // B7 carried the single algorithm revision instead of the stage-mix
-        // fingerprint; B6 had no provenance header and B5 is older still.
-        for magic in [b"AUR16B7\0", b"AUR16B6\0", b"AUR16B5\0"] {
+        let identity = test_identity(1);
+        store_libraw(&file, 2, 1, &[100, 200, 300, 65535, 400, 500, 600, 65535], identity, &route);
+        assert!(read_cached16_binary(&file, &route, &identity).is_some());
+        assert!(read_cached_source16(&file, &route, &identity).is_some());
+        // B8 carried the stage fingerprint but no source identity; B7 carried
+        // the single algorithm revision; B6 had no provenance header at all.
+        for magic in [b"AUR16B8\0", b"AUR16B7\0", b"AUR16B6\0", b"AUR16B5\0"] {
             let mut bytes = fs::read(&file).unwrap();
             bytes[..8].copy_from_slice(magic);
             fs::write(&file, bytes).unwrap();
-            assert!(read_cached16_binary(&file, &route).is_none(), "{magic:?}");
-            assert!(read_cached_source16(&file, &route).is_none(), "{magic:?}");
+            assert!(read_cached16_binary(&file, &route, &identity).is_none(), "{magic:?}");
+            assert!(read_cached_source16(&file, &route, &identity).is_none(), "{magic:?}");
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -822,40 +1086,41 @@ mod tests {
         let file = dir.join("raw-header.bin");
         let pixels = vec![7u16; 4 * 4];
         let provenance = DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiOpenCl);
-        store16_binary(&file, 4, 1, &pixels, provenance);
         let z6iii_route = test_route(true, true);
-        let read = read_cached16_binary(&file, &z6iii_route).expect("consistent route");
+        let identity = test_identity(2);
+        store16_binary(&file, 4, 1, &pixels, provenance, identity, &z6iii_route);
+        let read = read_cached16_binary(&file, &z6iii_route, &identity).expect("consistent route");
         assert_eq!(read.3, provenance);
-        assert!(read_cached_source16(&file, &z6iii_route).is_some());
+        assert!(read_cached_source16(&file, &z6iii_route, &identity).is_some());
 
         let not_z6iii = test_route(true, false);
         assert!(
-            read_cached16_binary(&file, &not_z6iii).is_none(),
+            read_cached16_binary(&file, &not_z6iii, &identity).is_none(),
             "a Z6III pre-matrix entry must not serve a non-Z6III route"
         );
-        assert!(read_cached_source16(&file, &not_z6iii).is_none());
+        assert!(read_cached_source16(&file, &not_z6iii, &identity).is_none());
 
         let c1_off = test_route(false, true);
         assert!(
-            read_cached16_binary(&file, &c1_off).is_none(),
+            read_cached16_binary(&file, &c1_off, &identity).is_none(),
             "camera-linear 16-bit must not serve a LibRaw-only route"
         );
 
         let mut bytes = fs::read(&file).unwrap();
-        bytes[32..40]
+        bytes[40..48]
             .copy_from_slice(&provenance.pipeline_fingerprint.wrapping_add(1).to_le_bytes());
         fs::write(&file, bytes).unwrap();
-        assert!(read_cached16_binary(&file, &z6iii_route).is_none());
-        assert!(read_cached_source16(&file, &z6iii_route).is_none());
+        assert!(read_cached16_binary(&file, &z6iii_route, &identity).is_none());
+        assert!(read_cached_source16(&file, &z6iii_route, &identity).is_none());
 
-        // The reserved word must stay zero: a header from a newer layout is not
-        // reinterpreted as this one.
+        // The reserved words must stay zero: a header from a newer layout is
+        // not reinterpreted as this one.
         let mut bytes = fs::read(&file).unwrap();
-        bytes[32..40].copy_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
-        bytes[44] = 1;
+        bytes[40..48].copy_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
+        bytes[85] = 1;
         fs::write(&file, bytes).unwrap();
-        assert!(read_cached16_binary(&file, &z6iii_route).is_none());
-        assert!(read_cached_source16(&file, &z6iii_route).is_none());
+        assert!(read_cached16_binary(&file, &z6iii_route, &identity).is_none());
+        assert!(read_cached_source16(&file, &z6iii_route, &identity).is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -866,9 +1131,10 @@ mod tests {
         let pixels = vec![9u16; 2 * 4];
         let provenance =
             DecodeProvenance::aurora(crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed);
-        store16_binary(&file, 2, 1, &pixels, provenance);
         let route = test_route(true, true);
-        let read = read_cached16_binary(&file, &route).expect("read");
+        let identity = test_identity(3);
+        store16_binary(&file, 2, 1, &pixels, provenance, identity, &route);
+        let read = read_cached16_binary(&file, &route, &identity).expect("read");
         assert_eq!(read.3.opencl, crate::raw::OpenClStatus::Failed);
         assert_eq!(read.3.backend, crate::raw::DecodeBackend::AuroraCpuChain);
         assert!(read.3.unlocks_c1_z6iii_linear());
@@ -935,9 +1201,10 @@ mod tests {
         let pixels: Vec<u16> = (0..width as usize * height as usize * 4)
             .map(|i| i.wrapping_mul(40503) as u16)
             .collect();
-        store_libraw(&file, width, height, &pixels);
         let route = test_route(true, false);
-        let mapped = read_cached_source16(&file, &route).expect("mapped source").0;
+        let identity = test_identity(4);
+        store_libraw(&file, width, height, &pixels, identity, &route);
+        let mapped = read_cached_source16(&file, &route, &identity).expect("mapped source").0;
         let expected = Source::from_rgba16(width, height, &pixels);
         let render = |src: &Source| {
             crate::render(
@@ -955,6 +1222,7 @@ mod tests {
 
     #[test]
     fn raw16_cache_invalidates_changed_files_and_rebuilds_corruption() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
         let dir = scratch("raw16-invalid");
         let path = source(&dir, b"a");
         let provenance = DecodeProvenance::libraw16();
@@ -981,6 +1249,170 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rebuilt.2[0], 12345);
+    }
+
+    #[test]
+    fn same_path_same_length_and_restored_mtime_still_redecodes() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
+        let dir = scratch("raw16-same-len");
+        let path = dir.join("source.nef");
+        let len = 4096usize;
+        let original = vec![b'a'; len];
+        fs::write(&path, &original).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let provenance = DecodeProvenance::libraw16();
+        let calls = Cell::new(0);
+
+        let first = get_or_decode16_with(&path, &dir, 20, |_| {
+            calls.set(calls.get() + 1);
+            Some((20, 10, vec![1000; 20 * 10 * 4], provenance))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first.2[0], 1000);
+
+        // Same length, different bytes, original mtime restored: only the
+        // content fingerprint can tell these apart.
+        let mut replaced = original;
+        replaced[len / 2] = b'b';
+        fs::write(&path, &replaced).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), len as u64);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            modified,
+            "the test must actually restore the mtime"
+        );
+
+        let second = get_or_decode16_with(&path, &dir, 20, |_| {
+            calls.set(calls.get() + 1);
+            Some((20, 10, vec![2000; 20 * 10 * 4], provenance))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "a same-length replacement must re-decode");
+        assert_eq!(second.2[0], 2000);
+    }
+
+    #[test]
+    fn header_middle_and_tail_changes_each_miss() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
+        let dir = scratch("raw16-windows");
+        let path = dir.join("source.nef");
+        // Above the whole-file threshold, so the sampled-window path runs.
+        let len = (IDENTITY_FULL_BELOW * 2 + 4096) as usize;
+        let mut bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        let provenance = DecodeProvenance::libraw16();
+        let calls = Cell::new(0);
+
+        for (round, offset) in [0usize, len / 2, len - 1].into_iter().enumerate() {
+            let tag = (round + 1) as u16;
+            let image = get_or_decode16_with(&path, &dir, 20, |_| {
+                calls.set(calls.get() + 1);
+                Some((20, 10, vec![tag; 20 * 10 * 4], provenance))
+            })
+            .unwrap();
+            assert_eq!(image.2[0], tag);
+            assert_eq!(calls.get(), round + 1, "change at byte {offset} must re-decode");
+            bytes[offset] ^= 0xff;
+            fs::write(&path, &bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_header_from_another_source_is_rejected() {
+        let dir = scratch("raw16-foreign-header");
+        let file = dir.join("entry.bin");
+        let route = test_route(true, false);
+        let identity = test_identity(11);
+        store_libraw(&file, 2, 1, &[1, 2, 3, 65535, 4, 5, 6, 65535], identity, &route);
+        let mut other = identity;
+        other.content = 12;
+        assert!(read_cached16_binary(&file, &route, &other).is_none());
+        assert!(read_cached_source16(&file, &route, &other).is_none());
+        let mut other = identity;
+        other.len += 1;
+        assert!(read_cached16_binary(&file, &route, &other).is_none());
+        let mut other = identity;
+        other.full = false;
+        assert!(read_cached16_binary(&file, &route, &other).is_none());
+
+        // Route digest mismatch: the file was copied from another route.
+        let other_route = test_route(true, true);
+        assert!(read_cached16_binary(&file, &other_route, &identity).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn truncated_and_tampered_cache_entries_are_rebuilt() {
+        let dir = scratch("raw16-tamper");
+        let path = source(&dir, b"tamper-source");
+        let provenance = DecodeProvenance::libraw16();
+        let pixels: Vec<u16> = (0..80 * 40 * 4).map(|i| i as u16).collect();
+        let first = get_or_decode16_with(&path, &dir, 20, |_| {
+            Some((80, 40, pixels.clone(), provenance))
+        })
+        .unwrap();
+        assert_eq!((first.0, first.1), (20, 10));
+
+        let file = cache_files(&dir).pop().unwrap();
+        let bytes = fs::read(&file).unwrap();
+        fs::write(&file, &bytes[..HEADER16 + 64]).unwrap();
+        let rebuilt = get_or_decode16_with(&path, &dir, 20, |_| {
+            Some((80, 40, vec![7; 80 * 40 * 4], provenance))
+        })
+        .unwrap();
+        assert_eq!(rebuilt.2[0], 7, "a truncated entry must be rebuilt");
+
+        let file = cache_files(&dir)
+            .into_iter()
+            .max_by_key(|p| fs::metadata(p).unwrap().modified().unwrap())
+            .unwrap();
+        let mut bytes = fs::read(&file).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x5a;
+        fs::write(&file, bytes).unwrap();
+        let rebuilt = get_or_decode16_with(&path, &dir, 20, |_| {
+            Some((80, 40, vec![8; 80 * 40 * 4], provenance))
+        })
+        .unwrap();
+        assert_eq!(rebuilt.2[0], 8, "a tampered body must be rebuilt");
+    }
+
+    #[test]
+    fn replacing_a_tracked_source_drops_pending_and_bumps_preview_epoch() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
+        let dir = scratch("raw16-epoch");
+        let path = dir.join("source.nef");
+        fs::write(&path, vec![b'a'; 4096]).unwrap();
+        let provenance = DecodeProvenance::libraw16();
+        let before = crate::preview_cache::source_epoch();
+        let calls = Cell::new(0);
+        get_or_decode16_with(&path, &dir, 20, |_| {
+            calls.set(calls.get() + 1);
+            Some((80, 40, vec![1000; 80 * 40 * 4], provenance))
+        })
+        .unwrap();
+        assert_eq!(crate::preview_cache::source_epoch(), before, "first sighting is not a change");
+
+        // Same length, so the pending slot's key differs only by content.
+        fs::write(&path, vec![b'b'; 4096]).unwrap();
+        let full = get_or_decode16_with(&path, &dir, 0, |_| {
+            calls.set(calls.get() + 1);
+            Some((80, 40, vec![50000; 80 * 40 * 4], provenance))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "the replaced file must not reuse the pending frame");
+        assert_eq!(full.2[0], 50000);
+        assert!(
+            crate::preview_cache::source_epoch() > before,
+            "a replaced source must invalidate rendered previews"
+        );
     }
 
     #[test]
@@ -1046,12 +1478,14 @@ mod tests {
         let png_read = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(png_read_data.2, pixels);
 
+        let bin_route = test_route(true, false);
+        let bin_identity = test_identity(5);
         let started = Instant::now();
-        store_libraw(&bin, width, height, &pixels);
+        store_libraw(&bin, width, height, &pixels, bin_identity, &bin_route);
         let bin_write = started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();
-        let bin_route = test_route(true, false);
-        let bin_read_data = read_cached16_binary(&bin, &bin_route).expect("binary read");
+        let bin_read_data = read_cached16_binary(&bin, &bin_route, &bin_identity)
+            .expect("binary read");
         let bin_read = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(bin_read_data.2, pixels);
 
@@ -1139,6 +1573,7 @@ mod tests {
 
     #[test]
     fn proxy_decode_feeds_the_first_full_size_request_without_decoding() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
         let dir = scratch("raw16-pending");
         let path = source(&dir, b"raw16-pending");
         let pixels: Vec<u16> = (0..80u32 * 40 * 4)
@@ -1169,6 +1604,7 @@ mod tests {
 
     #[test]
     fn cached_full_frame_feeds_a_proxy_without_decoding() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
         let dir = scratch("raw16-native-fallback");
         let path = source(&dir, b"raw16-native");
         let pixels: Vec<u16> = (0..80u32 * 40 * 4)
@@ -1196,6 +1632,7 @@ mod tests {
 
     #[test]
     fn replaced_source_is_not_served_from_the_pending_frame() {
+        let _serial = crate::preview_cache::test_source_epoch_lock();
         let dir = scratch("raw16-pending-stale");
         let path = source(&dir, b"first");
         let provenance = DecodeProvenance::libraw16();
@@ -1239,4 +1676,5 @@ mod tests {
             second.height
         );
     }
+
 }

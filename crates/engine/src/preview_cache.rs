@@ -5,10 +5,33 @@
 //! lands on a value already rendered (or a repaint of an unchanged frame) can
 //! reuse the pixels instead of running the pipeline again.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::{AdjustmentSet, Histogram, ImageId, NormRect, RgbaImage};
+
+/// Bumped by the RAW cache when the bytes behind a source path change. Every
+/// cache drops its frames on the next access, so a rendered frame from the
+/// replaced file can never be served again.
+static SOURCE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn invalidate_source_identity() {
+    SOURCE_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Serialises tests that inspect a cache with tests (in other modules) that
+/// replace a source file and therefore bump [`SOURCE_EPOCH`].
+#[cfg(test)]
+pub(crate) fn test_source_epoch_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn source_epoch() -> u64 {
+    SOURCE_EPOCH.load(Ordering::Relaxed)
+}
 
 /// Keeps every frame the viewer is likely to bounce between (drag back and
 /// forth, before/after, resize).
@@ -65,6 +88,8 @@ pub(crate) struct PreviewCache {
     capacity: usize,
     max_bytes: usize,
     bytes: usize,
+    /// [`SOURCE_EPOCH`] at the last access; a newer epoch clears the cache.
+    source_epoch: u64,
 }
 
 impl Default for PreviewCache {
@@ -79,7 +104,13 @@ impl PreviewCache {
     }
 
     fn with_budget(capacity: usize, max_bytes: usize) -> Self {
-        Self { entries: Vec::with_capacity(capacity), capacity, max_bytes, bytes: 0 }
+        Self {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+            max_bytes,
+            bytes: 0,
+            source_epoch: SOURCE_EPOCH.load(Ordering::Relaxed),
+        }
     }
 
     #[cfg(test)]
@@ -87,7 +118,19 @@ impl PreviewCache {
         self.entries.len()
     }
 
+    /// Drops every frame when a source file's bytes changed since the last
+    /// access. Cheap to call on every hit.
+    fn sync_source_epoch(&mut self) {
+        let epoch = SOURCE_EPOCH.load(Ordering::Relaxed);
+        if epoch != self.source_epoch {
+            self.source_epoch = epoch;
+            self.entries.clear();
+            self.bytes = 0;
+        }
+    }
+
     pub(crate) fn get(&mut self, key: PreviewKey) -> Option<CachedFrame> {
+        self.sync_source_epoch();
         let pos = self.entries.iter().position(|(k, _)| *k == key)?;
         let (key, frame) = self.entries.remove(pos);
         self.entries.push((key, frame.clone()));
@@ -95,6 +138,7 @@ impl PreviewCache {
     }
 
     pub(crate) fn insert(&mut self, key: PreviewKey, frame: CachedFrame) {
+        self.sync_source_epoch();
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
             self.bytes -= self.entries.remove(pos).1.pixels.len();
         }
@@ -191,6 +235,12 @@ fn build_fingerprint_of(id: &str, render_version: u32) -> u64 {
 mod tests {
     use super::*;
 
+    /// Tests that touch the process-wide source epoch run one at a time: a bump
+    /// in one test must not clear a cache another test is inspecting.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        test_source_epoch_lock()
+    }
+
     fn key_for(image: u64, exposure: f32) -> PreviewKey {
         let mut adj = AdjustmentSet::default();
         adj.exposure.exposure = exposure;
@@ -199,6 +249,7 @@ mod tests {
 
     #[test]
     fn streaming_params_fingerprint_matches_serialized_bytes() {
+        let _serial = serial();
         fn reference(adj: &AdjustmentSet) -> u64 {
             let bytes = serde_json::to_vec(adj).unwrap();
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -240,6 +291,7 @@ mod tests {
 
     #[test]
     fn one_parameter_change_misses() {
+        let _serial = serial();
         assert_eq!(key_for(1, 0.5), key_for(1, 0.5));
         assert_ne!(key_for(1, 0.5), key_for(1, 0.500_001));
         assert_ne!(key_for(1, 0.5), key_for(2, 0.5));
@@ -247,6 +299,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_the_least_recently_used() {
+        let _serial = serial();
         let mut cache = PreviewCache::new(2);
         cache.insert(key_for(1, 0.0), frame(1));
         cache.insert(key_for(2, 0.0), frame(2));
@@ -261,6 +314,7 @@ mod tests {
 
     #[test]
     fn the_byte_budget_evicts_before_the_entry_limit() {
+        let _serial = serial();
         let mut cache = PreviewCache::with_budget(8, 20);
         cache.insert(key_for(1, 0.0), frame(1));
         cache.insert(key_for(2, 0.0), frame(2));
@@ -271,6 +325,7 @@ mod tests {
 
     #[test]
     fn the_same_build_fingerprint_hits() {
+        let _serial = serial();
         let mut cache = PreviewCache::new(4);
         cache.insert(key_for(1, 0.0), frame(1));
         assert_eq!(key_for(1, 0.0).build, build_fingerprint());
@@ -279,6 +334,7 @@ mod tests {
 
     #[test]
     fn a_different_build_fingerprint_misses() {
+        let _serial = serial();
         let mut cache = PreviewCache::new(4);
         let cached = key_for(1, 0.0);
         cache.insert(cached, frame(1));
@@ -288,7 +344,24 @@ mod tests {
     }
 
     #[test]
+    fn a_source_identity_change_drops_rendered_frames() {
+        let _serial = serial();
+        let mut cache = PreviewCache::new(4);
+        let key = key_for(1, 0.0);
+        cache.insert(key, frame(1));
+        assert!(cache.get(key).is_some());
+        invalidate_source_identity();
+        assert!(
+            cache.get(key).is_none(),
+            "a frame rendered from replaced source bytes must not be served"
+        );
+        cache.insert(key, frame(2));
+        assert_eq!(cache.get(key).unwrap().pixels[0], 2);
+    }
+
+    #[test]
     fn the_build_fingerprint_tracks_the_version_text() {
+        let _serial = serial();
         assert_eq!(build_fingerprint_of("1.2.3", 1), build_fingerprint_of("1.2.3", 1));
         assert_ne!(build_fingerprint_of("1.2.3", 1), build_fingerprint_of("1.2.4", 1));
         assert_ne!(build_fingerprint_of("1.2.3", 1), build_fingerprint_of("1.2.3", 2));
@@ -296,6 +369,7 @@ mod tests {
 
     #[test]
     fn clear_drops_every_frame() {
+        let _serial = serial();
         let mut cache = PreviewCache::new(4);
         cache.insert(key_for(1, 0.0), frame(1));
         cache.insert(key_for(2, 0.0), frame(2));
