@@ -750,6 +750,10 @@ pub trait ImageEngine: Send + Sync + 'static {
     fn param_overrides(&self, _image: ImageId) -> crate::ParamOverrides {
         crate::ParamOverrides::default()
     }
+    /// Runtime portrait capability registry table (TSV) for frontend capability discovery.
+    fn portrait_capability_registry_tsv(&self) -> &'static str {
+        aurora_portrait::capability_registry::REGISTRY_TSV
+    }
 
     // ── Output ──
 

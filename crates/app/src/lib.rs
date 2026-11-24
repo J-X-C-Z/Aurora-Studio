@@ -2,6 +2,7 @@
 
 mod actions;
 mod contract;
+mod evidence;
 mod i18n;
 mod motion;
 mod perf;

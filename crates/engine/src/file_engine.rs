@@ -1391,6 +1391,138 @@ impl DecodeGates {
     }
 }
 
+fn default_export_concurrency() -> usize {
+    if let Some(n) = env_usize("AURORA_EXPORT_CONCURRENCY") {
+        return n.max(1);
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 4)
+        .min(2)
+}
+
+fn default_export_memory_budget() -> usize {
+    const MIN_BUDGET: usize = 512 * 1024 * 1024;
+    const MAX_BUDGET: usize = 1536 * 1024 * 1024;
+    const FALLBACK: usize = 1024 * 1024 * 1024;
+    match system_memory_bytes() {
+        Some((total, avail)) => {
+            let basis = avail.max(total / 2);
+            ((basis / 4) as usize).clamp(MIN_BUDGET, MAX_BUDGET)
+        }
+        None => FALLBACK,
+    }
+}
+
+/// Rough peak working-set estimate for one export job based on output dimensions
+/// and bit depth, used to serialize large-frame (e.g. 24MP/45MP) exports.
+fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let bytes_per_px = if bit_depth == 16 { 36usize } else { 24usize };
+    pixels.saturating_mul(bytes_per_px).max(1)
+}
+
+struct ExportSchedulerInner {
+    max_slots: usize,
+    memory_budget_bytes: usize,
+    active_slots: usize,
+    used_bytes: usize,
+    next_ticket: u64,
+    queue: VecDeque<u64>,
+    peak_active: usize,
+}
+
+/// Global bounded-concurrency and memory-budget admission gate for exports.
+struct ExportScheduler {
+    inner: Mutex<ExportSchedulerInner>,
+    cv: Condvar,
+}
+
+/// RAII permit that releases an export slot and memory quota on drop/panic.
+struct ExportPermit<'a> {
+    scheduler: &'a ExportScheduler,
+    charge_bytes: usize,
+}
+
+impl ExportScheduler {
+    fn with_limits(max_slots: usize, memory_budget_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(ExportSchedulerInner {
+                max_slots: max_slots.max(1),
+                memory_budget_bytes: memory_budget_bytes.max(1),
+                active_slots: 0,
+                used_bytes: 0,
+                next_ticket: 0,
+                queue: VecDeque::new(),
+                peak_active: 0,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire_cancellable(
+        &self,
+        estimated_bytes: usize,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Option<ExportPermit<'_>> {
+        if is_cancelled() {
+            return None;
+        }
+        let mut inner = self.inner.lock();
+        let charge_bytes = estimated_bytes.clamp(1, inner.memory_budget_bytes);
+        let ticket = inner.next_ticket;
+        inner.next_ticket = inner.next_ticket.wrapping_add(1);
+        inner.queue.push_back(ticket);
+        loop {
+            if is_cancelled() {
+                inner.queue.retain(|&t| t != ticket);
+                self.cv.notify_all();
+                return None;
+            }
+            let at_front = inner.queue.front() == Some(&ticket);
+            let fits_slots = inner.active_slots < inner.max_slots;
+            let fits_mem = inner.active_slots == 0
+                || inner.used_bytes.saturating_add(charge_bytes) <= inner.memory_budget_bytes;
+            if at_front && fits_slots && fits_mem {
+                inner.queue.pop_front();
+                inner.active_slots += 1;
+                inner.used_bytes = inner.used_bytes.saturating_add(charge_bytes);
+                inner.peak_active = inner.peak_active.max(inner.active_slots);
+                self.cv.notify_all();
+                return Some(ExportPermit { scheduler: self, charge_bytes });
+            }
+            self.cv.wait_for(&mut inner, std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn notify_all(&self) {
+        self.cv.notify_all();
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize, usize) {
+        let inner = self.inner.lock();
+        (inner.active_slots, inner.used_bytes, inner.peak_active)
+    }
+}
+
+impl Drop for ExportPermit<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.scheduler.inner.lock();
+        inner.active_slots = inner.active_slots.saturating_sub(1);
+        inner.used_bytes = inner.used_bytes.saturating_sub(self.charge_bytes);
+        self.scheduler.cv.notify_all();
+    }
+}
+
+fn export_scheduler() -> &'static ExportScheduler {
+    static SCHEDULER: std::sync::OnceLock<ExportScheduler> = std::sync::OnceLock::new();
+    SCHEDULER.get_or_init(|| {
+        ExportScheduler::with_limits(default_export_concurrency(), default_export_memory_budget())
+    })
+}
+
 /// Single-flight key: the 4096 proxy and the full native frame decode separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SourceKey {
@@ -4443,7 +4575,7 @@ impl ImageEngine for FileEngine {
         let use_standard = exact.is_none();
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
         let use_standard = true;
-        let standard = if use_standard {
+        let (standard, export_dims) = if use_standard {
             let adjustments = crate::styles::resolve(&self.load_adjustments(job.image)).into_owned();
             let (source, source_size) = if let Some(native) = self.native_raw_source(job.image, None) {
                 let size = native.size();
@@ -4457,13 +4589,19 @@ impl ImageEngine for FileEngine {
             let (width, height) = crate::recipe::output_size(&job.recipe, edited_size);
             let mut recipe = job.recipe.clone();
             recipe.scale = crate::ScaleMode::Fixed100;
-            Some((source, adjustments, width.max(height), recipe))
+            (Some((source, adjustments, width.max(height), recipe)), (width, height))
         } else {
-            None
+            (None, (info.width, info.height))
         };
+        let estimated_bytes = estimated_export_bytes(export_dims.0, export_dims.1, job.recipe.bit_depth);
         state.lock().jobs.insert(job_id, JobStatus::Queued);
         std::thread::spawn(move || {
             let cancelled = |state: &Mutex<State>| state.lock().cancelled.contains(&job_id);
+            let Some(_export_permit) =
+                export_scheduler().acquire_cancellable(estimated_bytes, || cancelled(&state))
+            else {
+                return;
+            };
             {
                 let mut st = state.lock();
                 if st.cancelled.contains(&job_id) {
@@ -4584,6 +4722,8 @@ impl ImageEngine for FileEngine {
             Some(JobStatus::Queued) | Some(JobStatus::Running { .. }) => {
                 st.cancelled.insert(job_id);
                 st.jobs.insert(job_id, JobStatus::Failed { message: "cancelled".into() });
+                drop(st);
+                export_scheduler().notify_all();
                 true
             }
             _ => false,
@@ -6826,5 +6966,121 @@ mod tests {
         }
         assert_eq!(engine.source_cache_stats().identity_invalidations, 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_scheduler_bounds_concurrent_slots_and_releases_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let scheduler = Arc::new(ExportScheduler::with_limits(2, 1024 * 1024 * 1024));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let scheduler = Arc::clone(&scheduler);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            handles.push(std::thread::spawn(move || {
+                let _permit = scheduler
+                    .acquire_cancellable(16 * 1024 * 1024, || false)
+                    .expect("permit should be granted");
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "concurrent exports exceeded max_slots=2");
+        let (left_active, left_bytes, recorded_peak) = scheduler.stats();
+        assert_eq!(left_active, 0);
+        assert_eq!(left_bytes, 0);
+        assert!(recorded_peak <= 2);
+    }
+
+    #[test]
+    fn export_scheduler_serializes_large_frames_by_memory_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 4 slots available, but 1 GiB budget forces 24MP/45MP 16-bit exports to serialize.
+        let scheduler = Arc::new(ExportScheduler::with_limits(4, 1024 * 1024 * 1024));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let bytes_24mp = estimated_export_bytes(6000, 4000, 16);
+        let bytes_45mp = estimated_export_bytes(8256, 5504, 16);
+
+        let mut handles = Vec::new();
+        for bytes in [bytes_24mp, bytes_45mp, bytes_24mp] {
+            let scheduler = Arc::clone(&scheduler);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            handles.push(std::thread::spawn(move || {
+                let _permit = scheduler
+                    .acquire_cancellable(bytes, || false)
+                    .expect("large frame should still acquire when idle");
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "24MP/45MP exports must serialize under 1 GiB budget");
+        let (left_active, left_bytes, _) = scheduler.stats();
+        assert_eq!(left_active, 0);
+        assert_eq!(left_bytes, 0);
+    }
+
+    #[test]
+    fn export_scheduler_aborts_wait_when_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scheduler = Arc::new(ExportScheduler::with_limits(1, 512 * 1024 * 1024));
+        let held = scheduler.acquire_cancellable(1024, || false).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiting = Arc::new(AtomicBool::new(false));
+
+        let s2 = Arc::clone(&scheduler);
+        let c2 = Arc::clone(&cancelled);
+        let w2 = Arc::clone(&waiting);
+        let waiter = std::thread::spawn(move || {
+            w2.store(true, Ordering::SeqCst);
+            s2.acquire_cancellable(1024, || c2.load(Ordering::SeqCst)).is_some()
+        });
+
+        while !waiting.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cancelled.store(true, Ordering::SeqCst);
+        scheduler.notify_all();
+
+        let acquired = waiter.join().unwrap();
+        assert!(!acquired, "cancelled job must abort waiting without acquiring permit");
+        assert_eq!(scheduler.stats().0, 1);
+
+        drop(held);
+        let (left_active, left_bytes, _) = scheduler.stats();
+        assert_eq!(left_active, 0);
+        assert_eq!(left_bytes, 0);
+    }
+
+    #[test]
+    fn export_scheduler_releases_slot_on_panic_unwind() {
+        let scheduler = ExportScheduler::with_limits(1, 512 * 1024 * 1024);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = scheduler.acquire_cancellable(4096, || false).unwrap();
+            panic!("simulated export panic");
+        }));
+        assert!(res.is_err());
+        let (left_active, left_bytes, _) = scheduler.stats();
+        assert_eq!(left_active, 0);
+        assert_eq!(left_bytes, 0);
+        assert!(scheduler.acquire_cancellable(4096, || false).is_some());
     }
 }

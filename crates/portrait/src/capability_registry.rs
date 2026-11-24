@@ -11,8 +11,6 @@
 //! callable kernel does not prove same-job input wiring, preview integration,
 //! vendor parity, or real-photo acceptance.
 
-use crate::catalog;
-
 pub const REGISTRY_SCHEMA: &str = "aurora/portrait-capability-registry/1";
 pub const UNVERIFIED: &str = "未验证";
 const COLUMN_COUNT: usize = 18;
@@ -168,6 +166,7 @@ pub fn to_json() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog;
     use std::collections::BTreeSet;
 
     #[test]

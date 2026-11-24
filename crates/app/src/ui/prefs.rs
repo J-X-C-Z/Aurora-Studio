@@ -241,6 +241,15 @@ impl PrefsView {
                 t2.update(cx, |p, cx| p.edit(cx, |s| s.settings.undo_levels = v.round() as usize))
             }))
             .child(note(t("Per image; older steps are dropped first.", "按图像计；超出后最早的步骤先被丢弃。"), cx))
+            .child(caption(t("Backend roadmap", "后端路线图"), cx))
+            .child(note(
+                t(
+                    "Metal: roadmap only — no Metal backend and no on-device verification. GPU inference currently uses the Windows CUDA/DirectML path; everything else runs on CPU.",
+                    "Metal：仅为路线图——没有 Metal 后端，也没有真机验证。当前 GPU 推理走 Windows 的 CUDA/DirectML 路径，其余仍由 CPU 处理。",
+                ),
+                cx,
+            ))
+            .child(note(crate::contract::METAL.note().unwrap_or_default(), cx))
             .child(caption(t("Capture & Output", "拍摄与输出"), cx))
             .child(switch_row("pref-newcap", t("Select each new capture", "自动选中新拍摄的图像"), s.select_new_capture, move |v, _, cx| {
                 t3.update(cx, |p, cx| p.edit(cx, |s| s.settings.select_new_capture = v))
