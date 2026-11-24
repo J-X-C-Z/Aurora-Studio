@@ -4668,6 +4668,10 @@ pub fn apply_portrait_effects_with_job(
     extra: &BTreeMap<String, f32>,
     inputs: &PortraitJobInputs<'_>,
 ) -> PortraitRunReport {
+    // PP-2: portrait providers dispatch on the same process CUDA context as the
+    // engine stages. Install the observer once so those kernels land in the
+    // unified gpu_runtime report instead of an unreported side channel.
+    crate::mock::gpu_runtime::install_portrait_bridge();
     let report = apply_portrait_effects_with_report_and_inputs(
         portrait, width, height, region, extra, inputs,
     );
