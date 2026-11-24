@@ -117,11 +117,67 @@ fn recent_source_pins() -> usize {
     env_usize("AURORA_SOURCE_CACHE_RECENT_PINS").unwrap_or(RECENT_SOURCE_PINS).min(8)
 }
 
-/// Bytes a decoded source really owns: every mip level's allocated capacity.
+/// A cached source's content token stays trusted while its metadata is
+/// unchanged for this long before it is re-hashed.
+const SOURCE_IDENTITY_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+/// Hits allowed between content-token re-hashes while the metadata is unchanged.
+const SOURCE_IDENTITY_RECHECK_HITS: u32 = 8;
+
+/// Bytes a decoded source really owns: every mip level's allocated capacity
+/// plus the lazily built portrait derivatives (RGBA8 face input and masks).
 fn source_cache_bytes(source: &Source) -> usize {
-    source.levels.iter().fold(0usize, |total, plane| {
-        total.saturating_add(plane.data.capacity().saturating_mul(std::mem::size_of::<[f32; 3]>()))
-    })
+    source
+        .levels
+        .iter()
+        .fold(0usize, |total, plane| {
+            total.saturating_add(plane.data.capacity().saturating_mul(std::mem::size_of::<[f32; 3]>()))
+        })
+        .saturating_add(source.cached_derived_bytes())
+}
+
+/// Bytes one AI input keeps alive: its RGBA frame plus the struct itself.
+fn ai_input_bytes(input: &AiInput) -> usize {
+    input.rgba.capacity().saturating_add(std::mem::size_of::<AiInput>())
+}
+
+/// `(len, mtime nanos)`; `None` when the file is gone or unreadable.
+fn file_metadata_stamp(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
+    Some((meta.len(), mtime_nanos))
+}
+
+/// Identity of the file a cached source was decoded from. The metadata is
+/// checked on every cache hit; the content token is taken at decode time and
+/// re-taken when the metadata changes or the recheck interval elapses, so a
+/// same-size replacement that preserved the timestamp still invalidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceFileIdentity {
+    len: u64,
+    mtime_nanos: u64,
+    token: Option<u64>,
+}
+
+impl SourceFileIdentity {
+    fn read(path: &Path) -> Option<Self> {
+        let (len, mtime_nanos) = file_metadata_stamp(path)?;
+        Some(Self { len, mtime_nanos, token: None })
+    }
+
+    /// Adds the content fingerprint from `raw_cache`; a decode-time cost.
+    fn with_token(mut self, path: &Path) -> Self {
+        self.token = crate::raw_cache::source_identity_token(path);
+        self
+    }
+
+    /// `true` when the stored identity holds no usable provenance.
+    fn is_unknown(&self) -> bool {
+        self.len == 0 && self.mtime_nanos == 0 && self.token.is_none()
+    }
 }
 
 /// How a file is decoded, for working-set estimation only. Proxy/native RAW and
@@ -202,9 +258,52 @@ fn decode_units(total_units: usize, bytes: usize) -> usize {
     bytes.div_ceil(DECODE_UNIT_BYTES).clamp(1, total_units.max(1))
 }
 
-/// Evicts oldest unpinned sources (and the native slot) until the byte budget
-/// holds. `protect` is the source that was just requested.
+/// Removes a cached source and everything charged alongside it. Returns the
+/// bytes released from `current_bytes`.
+fn evict_cached_source(st: &mut State, image: ImageId) -> usize {
+    let mut released = 0usize;
+    if let Some(removed) = st.sources.remove(&image) {
+        released = released.saturating_add(removed.bytes);
+        st.source_cache.evictions += 1;
+    }
+    if let Some(input) = st.ai_inputs.remove(&image) {
+        released = released.saturating_add(ai_input_bytes(&input));
+    }
+    st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(released);
+    released
+}
+
+/// Evicts under budget pressure in a fixed order, never looping forever:
+/// 1. AI inputs are pure derived data, so unpinned ones go first (no Source
+///    is dropped for them);
+/// 2. then the LRU of unpinned, unshared sources and the native slot;
+/// 3. then the implicit "recent" pins are degraded oldest-first, keeping
+///    `protect` and explicit pins;
+/// 4. anything still over budget is protected by an explicit pin or a caller
+///    holding the `Arc`; the peak is recorded and logged.
+/// `protect` is the image that was just requested.
 fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
+    if st.source_cache.current_bytes <= st.source_cache.max_bytes {
+        return;
+    }
+    // 1) Drop unpinned AI inputs. They are recomputable and never a Source.
+    let ai_victims: Vec<ImageId> = st
+        .ai_inputs
+        .keys()
+        .copied()
+        .filter(|image| Some(*image) != protect && !st.source_cache.is_pinned(*image))
+        .collect();
+    for image in ai_victims {
+        if st.source_cache.current_bytes <= st.source_cache.max_bytes {
+            break;
+        }
+        if let Some(input) = st.ai_inputs.remove(&image) {
+            let bytes = ai_input_bytes(&input);
+            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(bytes);
+            log::debug!("dropped AI input {image:?} under budget pressure: {bytes} bytes");
+        }
+    }
+    // 2) LRU over unpinned sources and the native slot.
     while st.source_cache.current_bytes > st.source_cache.max_bytes {
         let victim = {
             let cache = &st.source_cache;
@@ -229,24 +328,64 @@ fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
             }
             best
         };
-        let Some((_, is_native, image)) = victim else {
-            log::debug!("source cache over budget with nothing evictable: {} bytes", st.source_cache.current_bytes);
-            break;
-        };
+        let Some((_, is_native, image)) = victim else { break };
         if is_native {
             if let Some(slot) = st.native_raw.take() {
                 st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(slot.bytes);
                 st.source_cache.evictions += 1;
                 log::debug!("evicted native RAW {image:?}: {} bytes", slot.bytes);
+            } else {
+                break;
             }
-        } else if let Some(removed) = st.sources.remove(&image) {
-            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(removed.bytes);
-            st.source_cache.evictions += 1;
-            st.ai_inputs.remove(&image);
-            log::debug!("evicted source {image:?}: {} bytes", removed.bytes);
         } else {
-            break;
+            let released = evict_cached_source(st, image);
+            if released == 0 {
+                break;
+            }
+            log::debug!("evicted source {image:?}: {released} bytes");
         }
+    }
+    // 3) Degrade the oldest implicit recent pins; explicit pins and `protect`
+    //    stay. Each candidate is visited at most once.
+    if st.source_cache.current_bytes > st.source_cache.max_bytes {
+        let candidates: Vec<ImageId> = st.source_cache.recent.iter().rev().copied().collect();
+        for image in candidates {
+            if st.source_cache.current_bytes <= st.source_cache.max_bytes {
+                break;
+            }
+            if Some(image) == protect || st.source_cache.pins.get(&image).is_some_and(|count| *count > 0) {
+                continue;
+            }
+            let evictable_source = st
+                .sources
+                .get(&image)
+                .is_some_and(|entry| Arc::strong_count(&entry.source) <= 1);
+            let evictable_native = st.native_raw.as_ref().is_some_and(|slot| {
+                slot.image == image && slot.source.as_ref().is_none_or(|source| Arc::strong_count(source) <= 1)
+            });
+            st.source_cache.recent.retain(|id| *id != image);
+            if evictable_source {
+                let released = evict_cached_source(st, image);
+                log::debug!("dropped recent pin and evicted source {image:?} under pressure: {released} bytes");
+            } else if evictable_native {
+                if let Some(slot) = st.native_raw.take() {
+                    st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(slot.bytes);
+                    st.source_cache.evictions += 1;
+                    log::debug!("dropped recent pin and evicted native RAW {image:?}: {} bytes", slot.bytes);
+                }
+            }
+        }
+    }
+    // 4) Still over: explicit pins or caller-held Arcs are hard protection.
+    let over = st.source_cache.current_bytes.saturating_sub(st.source_cache.max_bytes);
+    if over > 0 {
+        st.source_cache.over_budget_peak = st.source_cache.over_budget_peak.max(over);
+        log::debug!(
+            "source cache over budget by {over} bytes after pressure eviction: {}/{} bytes, {} sources",
+            st.source_cache.current_bytes,
+            st.source_cache.max_bytes,
+            st.sources.len()
+        );
     }
 }
 
@@ -966,11 +1105,17 @@ struct AiInput {
     height: u32,
 }
 
-/// One decoded image in the source cache, charged by its real mip bytes.
+/// One decoded image in the source cache, charged by its real mip bytes plus
+/// any portrait derivatives it has built.
 struct CachedSource {
     source: Arc<Source>,
     bytes: usize,
     last_used: u64,
+    /// Library file this source was decoded from, for identity checks.
+    path: PathBuf,
+    identity: SourceFileIdentity,
+    last_verified: Instant,
+    hits_since_verify: u32,
 }
 
 /// At most one full-size RAW; a `None` source remembers a failure for that image.
@@ -979,17 +1124,26 @@ struct NativeRawSlot {
     source: Option<Arc<Source>>,
     bytes: usize,
     last_used: u64,
+    identity: SourceFileIdentity,
+    last_verified: Instant,
+    hits_since_verify: u32,
 }
 
-/// Byte-budgeted LRU for decoded sources. `native_raw` shares the same bytes.
+/// Byte-budgeted LRU for decoded sources. `native_raw` and `ai_inputs` share
+/// the same bytes.
 struct SourceCacheBudget {
     max_bytes: usize,
     current_bytes: usize,
     peak_bytes: usize,
+    /// Largest observed `current_bytes - max_bytes` while pinned data held the
+    /// cache over budget.
+    over_budget_peak: usize,
     hits: u64,
     native_hits: u64,
     misses: u64,
     evictions: u64,
+    /// Cached sources dropped because the file behind them changed.
+    identity_invalidations: u64,
     single_flight_waits: u64,
     recent_pins: usize,
     /// Explicit pins, e.g. images an export is still reading.
@@ -1005,10 +1159,12 @@ impl SourceCacheBudget {
             max_bytes,
             current_bytes: 0,
             peak_bytes: 0,
+            over_budget_peak: 0,
             hits: 0,
             native_hits: 0,
             misses: 0,
             evictions: 0,
+            identity_invalidations: 0,
             single_flight_waits: 0,
             recent_pins: recent_source_pins(),
             pins: HashMap::new(),
@@ -1048,6 +1204,15 @@ pub struct SourceCacheStats {
     pub cached_sources: usize,
     pub pinned_sources: usize,
     pub native_bytes: usize,
+    /// Bytes charged to `State::ai_inputs`.
+    pub ai_input_bytes: usize,
+    /// Portrait RGBA/mask buffers currently held by cached sources.
+    pub derived_bytes: usize,
+    /// Bytes of cached sources an explicit or recent pin protects.
+    pub pinned_bytes: usize,
+    pub over_budget_bytes: usize,
+    pub over_budget_peak: usize,
+    pub identity_invalidations: u64,
     pub hits: u64,
     pub native_hits: u64,
     pub misses: u64,
@@ -1831,6 +1996,18 @@ impl FileEngine {
                 )
             })
             .collect();
+        // Keep an unchanged file's ImageId so its cached source, AI input,
+        // pins and preview frames stay valid across a rescan.
+        let previous_ids: HashMap<String, (ImageId, u64, u32, u32, FileKind)> = st
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.rel_path.clone(),
+                    (e.info.id, e.info.file_size, e.info.width, e.info.height, e.info.kind),
+                )
+            })
+            .collect();
 
         let scanned: Vec<ScannedFile> = found
             .into_par_iter()
@@ -1838,6 +2015,8 @@ impl FileEngine {
             .collect();
 
         let mut from_cos = Vec::new();
+        let mut reassigned = false;
+        let mut removed_any = false;
         st.entries.clear();
         for scanned in scanned
             .into_iter()
@@ -1845,6 +2024,21 @@ impl FileEngine {
             .flat_map(ScannedFile::library_variants)
         {
             let rel_path = &scanned.rel_path;
+            let id = previous_ids
+                .get(rel_path)
+                .filter(|(_, file_size, width, height, kind)| {
+                    *file_size == scanned.file_size
+                        && *width == scanned.width
+                        && *height == scanned.height
+                        && *kind == scanned.kind
+                })
+                .map(|(id, ..)| *id)
+                .unwrap_or_else(|| {
+                    reassigned = true;
+                    let id = ImageId(st.next_id);
+                    st.next_id += 1;
+                    id
+                });
             let stored = previous.get(rel_path);
             let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
             // Restore edits saved in a previous process; keep unsaved in-memory
@@ -1882,8 +2076,6 @@ impl FileEngine {
             if keywords.is_empty() {
                 keywords = scanned.iptc.keywords.clone();
             }
-            let id = ImageId(st.next_id);
-            st.next_id += 1;
             st.entries.push(FileEntry {
                 info: ImageInfo {
                     id,
@@ -1907,6 +2099,37 @@ impl FileEngine {
                 rel_path: scanned.rel_path,
                 adjustments,
             });
+        }
+        // Drop every cached resource whose id is no longer in the library.
+        // IDs are stable for unchanged files, so hot sources and pins survive
+        // a rescan; removed or rewritten files release their bytes at once.
+        let living: std::collections::HashSet<ImageId> = st.entries.iter().map(|entry| entry.info.id).collect();
+        let mut removed_bytes = 0usize;
+        let stale_sources: Vec<ImageId> = st.sources.keys().copied().filter(|id| !living.contains(id)).collect();
+        for id in stale_sources {
+            removed_bytes = removed_bytes.saturating_add(evict_cached_source(&mut st, id));
+        }
+        let stale_ai: Vec<ImageId> = st.ai_inputs.keys().copied().filter(|id| !living.contains(id)).collect();
+        for id in stale_ai {
+            if let Some(input) = st.ai_inputs.remove(&id) {
+                removed_bytes = removed_bytes.saturating_add(ai_input_bytes(&input));
+            }
+        }
+        if st.native_raw.as_ref().is_some_and(|slot| !living.contains(&slot.image)) {
+            if let Some(slot) = st.native_raw.take() {
+                removed_bytes = removed_bytes.saturating_add(slot.bytes);
+            }
+        }
+        removed_any |= removed_bytes > 0;
+        st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(removed_bytes);
+        let pins_before = st.source_cache.pins.len();
+        st.source_cache.pins.retain(|id, _| living.contains(id));
+        st.source_cache.recent.retain(|id| living.contains(id));
+        st.source_reasons.retain(|id, _| living.contains(id));
+        removed_any |= reassigned || pins_before != st.source_cache.pins.len();
+        if removed_any {
+            // Rendered frames of a rewritten or removed file must never be hit.
+            st.preview.clear();
         }
         // Save the C1 snapshot once, so a later metadata edit and restart does
         // not fall back to defaults when the catalog entry blocks a re-read.
@@ -1956,18 +2179,114 @@ impl FileEngine {
         Ok(info)
     }
 
+    /// Verifies a cached identity against the current file. Returns `false`
+    /// when the file is gone or its content changed. Metadata is read on every
+    /// hit; the content token is re-read on metadata changes and after
+    /// [`SOURCE_IDENTITY_RECHECK`] / [`SOURCE_IDENTITY_RECHECK_HITS`].
+    fn refresh_source_identity(st: &mut State, image: ImageId, path: &Path, slot: bool) -> bool {
+        let current = match SourceFileIdentity::read(path) {
+            Some(current) => current,
+            None => {
+                Self::invalidate_cached_source(st, image, slot, "file stat failed");
+                return false;
+            }
+        };
+        let provenance = if slot {
+            st.native_raw
+                .as_ref()
+                .map(|slot| (slot.identity, slot.last_verified, slot.hits_since_verify))
+        } else {
+            st.sources
+                .get(&image)
+                .map(|entry| (entry.identity, entry.last_verified, entry.hits_since_verify))
+        };
+        let Some((identity, last_verified, hits_since_verify)) = provenance else {
+            return false;
+        };
+        if identity.is_unknown() {
+            Self::invalidate_cached_source(st, image, slot, "no source identity");
+            return false;
+        }
+        let metadata_changed = current.len != identity.len || current.mtime_nanos != identity.mtime_nanos;
+        let due = metadata_changed
+            || last_verified.elapsed() >= SOURCE_IDENTITY_RECHECK
+            || hits_since_verify >= SOURCE_IDENTITY_RECHECK_HITS;
+        let mut verified = current;
+        if due {
+            verified.token = crate::raw_cache::source_identity_token(path);
+            if verified.token != identity.token {
+                Self::invalidate_cached_source(st, image, slot, "source content changed");
+                return false;
+            }
+        } else {
+            verified.token = identity.token;
+        }
+        if slot {
+            if let Some(slot) = st.native_raw.as_mut() {
+                slot.identity = verified;
+                if metadata_changed {
+                    slot.last_verified = Instant::now();
+                    slot.hits_since_verify = 0;
+                } else {
+                    slot.hits_since_verify = slot.hits_since_verify.saturating_add(1);
+                }
+            }
+        } else if let Some(entry) = st.sources.get_mut(&image) {
+            entry.identity = verified;
+            if metadata_changed {
+                entry.last_verified = Instant::now();
+                entry.hits_since_verify = 0;
+            } else {
+                entry.hits_since_verify = entry.hits_since_verify.saturating_add(1);
+            }
+        }
+        true
+    }
+
+    /// Removes a source/native slot (and the AI input that depends on it) after
+    /// its file identity no longer matches.
+    fn invalidate_cached_source(st: &mut State, image: ImageId, slot: bool, reason: &str) {
+        if slot {
+            let mut released = 0usize;
+            if let Some(evicted) = st.native_raw.take() {
+                released = released.saturating_add(evicted.bytes);
+            }
+            if let Some(input) = st.ai_inputs.remove(&image) {
+                released = released.saturating_add(ai_input_bytes(&input));
+            }
+            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(released);
+        } else {
+            evict_cached_source(st, image);
+        }
+        st.source_reasons.remove(&image);
+        st.source_cache.identity_invalidations += 1;
+        log::debug!("source {image:?} invalidated: {reason}");
+    }
+
     /// A cached source, charged to the byte budget and refreshed in the LRU.
+    /// Derived buffers are accounted again on every hit because they are built
+    /// lazily after the source was stored.
     fn cached_source(&self, image: ImageId) -> Option<Arc<Source>> {
         let mut st = self.state.lock();
-        if !st.sources.contains_key(&image) {
+        let path = self.image_path(image)?;
+        if !Self::refresh_source_identity(&mut st, image, &path, false) {
             return None;
         }
         let tick = st.source_cache.next_tick();
-        let source = {
+        let (source, old_bytes, new_bytes) = {
             let entry = st.sources.get_mut(&image)?;
             entry.last_used = tick;
-            Arc::clone(&entry.source)
+            (Arc::clone(&entry.source), entry.bytes, source_cache_bytes(&entry.source))
         };
+        if new_bytes != old_bytes {
+            if let Some(entry) = st.sources.get_mut(&image) {
+                entry.bytes = new_bytes;
+            }
+            st.source_cache.current_bytes = st.source_cache.current_bytes
+                .saturating_add(new_bytes)
+                .saturating_sub(old_bytes);
+            st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
+        }
         st.source_cache.hits += 1;
         st.source_cache.note_use(image);
         Some(source)
@@ -1976,13 +2295,26 @@ impl FileEngine {
     /// Stores a decoded source and evicts the oldest unpinned entries until the
     /// byte budget holds. The entry being stored, the current/neighbour images,
     /// and sources another caller still holds (strong_count > 1) are kept.
-    fn store_cached_source(&self, image: ImageId, source: Arc<Source>) {
+    fn store_cached_source(&self, image: ImageId, path: &Path, source: Arc<Source>) {
         let bytes = source_cache_bytes(&source);
+        let identity = SourceFileIdentity::read(path).unwrap_or(SourceFileIdentity { len: 0, mtime_nanos: 0, token: None }).with_token(path);
         let mut st = self.state.lock();
         let tick = st.source_cache.next_tick();
-        if let Some(old) = st.sources.insert(image, CachedSource { source, bytes, last_used: tick }) {
+        if let Some(old) = st.sources.remove(&image) {
             st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(old.bytes);
         }
+        st.sources.insert(
+            image,
+            CachedSource {
+                source,
+                bytes,
+                last_used: tick,
+                path: path.to_path_buf(),
+                identity,
+                last_verified: Instant::now(),
+                hits_since_verify: 0,
+            },
+        );
         st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_add(bytes);
         st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
         st.source_cache.note_use(image);
@@ -1996,9 +2328,12 @@ impl FileEngine {
     }
 
     /// A cached native RAW frame, or a remembered failure for that image.
-    fn cached_native(&self, image: ImageId) -> Option<Option<Arc<Source>>> {
+    fn cached_native(&self, image: ImageId, path: &Path) -> Option<Option<Arc<Source>>> {
         let mut st = self.state.lock();
         if st.native_raw.as_ref().is_none_or(|slot| slot.image != image) {
+            return None;
+        }
+        if !Self::refresh_source_identity(&mut st, image, path, true) {
             return None;
         }
         let tick = st.source_cache.next_tick();
@@ -2180,7 +2515,7 @@ impl FileEngine {
                 }
             }
         }
-        self.store_cached_source(image, Arc::clone(&source));
+        self.store_cached_source(image, &path, Arc::clone(&source));
         Ok(source)
         })();
         let result = leader.finish(decoded);
@@ -2208,7 +2543,7 @@ impl FileEngine {
                 raw_banding_identity(&entry.info.exif),
             )
         };
-        if let Some(cached) = self.cached_native(image) {
+        if let Some(cached) = self.cached_native(image, &path) {
             return cached;
         }
         let key = SourceKey::Native(image);
@@ -2222,7 +2557,7 @@ impl FileEngine {
         let decoded = (|| -> Option<Arc<Source>> {
             // Only one native frame is kept, so one native decode at a time.
             let _native = self.native_decode.lock();
-            if let Some(cached) = self.cached_native(image) {
+            if let Some(cached) = self.cached_native(image, &path) {
                 return cached;
             }
             // Drop the previous full frame before allocating a new one, so the
@@ -2256,10 +2591,21 @@ impl FileEngine {
                 log::warn!("native RAW source unavailable for {image:?}");
             }
             let bytes = decoded.as_ref().map_or(0, |source| source_cache_bytes(source));
+            let identity = SourceFileIdentity::read(&path)
+                .unwrap_or(SourceFileIdentity { len: 0, mtime_nanos: 0, token: None })
+                .with_token(&path);
             {
                 let mut st = self.state.lock();
                 let tick = st.source_cache.next_tick();
-                st.native_raw = Some(NativeRawSlot { image, source: decoded.clone(), bytes, last_used: tick });
+                st.native_raw = Some(NativeRawSlot {
+                    image,
+                    source: decoded.clone(),
+                    bytes,
+                    last_used: tick,
+                    identity,
+                    last_verified: Instant::now(),
+                    hits_since_verify: 0,
+                });
                 st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_add(bytes);
                 st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
                 st.source_cache.note_use(image);
@@ -2286,6 +2632,15 @@ impl FileEngine {
         let decode_peak_concurrency = self.decode_gates.heavy.peak_active().max(self.decode_gates.light.peak_active());
         let st = self.state.lock();
         let cache = &st.source_cache;
+        let ai_input_bytes_total = st.ai_inputs.values().fold(0usize, |total, input| {
+            total.saturating_add(ai_input_bytes(input))
+        });
+        let derived_bytes = st.sources.values().fold(0usize, |total, entry| {
+            total.saturating_add(entry.source.cached_derived_bytes())
+        });
+        let pinned_bytes = st.sources.iter().filter(|(image, _)| cache.is_pinned(**image)).fold(0usize, |total, (_, entry)| {
+            total.saturating_add(entry.bytes)
+        });
         SourceCacheStats {
             max_bytes: cache.max_bytes,
             current_bytes: cache.current_bytes,
@@ -2293,6 +2648,12 @@ impl FileEngine {
             cached_sources: st.sources.len(),
             pinned_sources: st.sources.keys().filter(|image| cache.is_pinned(**image)).count(),
             native_bytes: st.native_raw.as_ref().map_or(0, |slot| slot.bytes),
+            ai_input_bytes: ai_input_bytes_total,
+            derived_bytes,
+            pinned_bytes,
+            over_budget_bytes: cache.current_bytes.saturating_sub(cache.max_bytes),
+            over_budget_peak: cache.over_budget_peak,
+            identity_invalidations: cache.identity_invalidations,
             hits: cache.hits,
             native_hits: cache.native_hits,
             misses: cache.misses,
@@ -2387,10 +2748,14 @@ impl FileEngine {
             width,
             height,
         });
-        self.state
-            .lock()
-            .ai_inputs
-            .insert(image, input.clone());
+        let mut st = self.state.lock();
+        let bytes = ai_input_bytes(&input);
+        if let Some(old) = st.ai_inputs.insert(image, input.clone()) {
+            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(ai_input_bytes(&old));
+        }
+        st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_add(bytes);
+        st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
+        evict_sources_to_budget(&mut st, Some(image));
         Ok(input)
     }
 
@@ -6339,5 +6704,127 @@ mod tests {
         assert!(stats.current_bytes >= stats.native_bytes);
         assert_eq!(engine.native_raw_source(info.id, Some((&adjustments.geometry, roi, 1536))).unwrap().snapshot_id(), native.snapshot_id());
         assert_eq!(engine.source_cache_stats().native_hits, 1);
+    }
+
+    #[test]
+    fn source_cache_bytes_count_lazy_portrait_derivatives() {
+        let rgba = vec![96u8; 320 * 240 * 4];
+        let source = Source::from_rgba(320, 240, &rgba);
+        let before = source_cache_bytes(&source);
+        let _face = source.face_input_image();
+        let after = source_cache_bytes(&source);
+        assert!(
+            after >= before + 320 * 240 * 4,
+            "face input not charged: {before} -> {after}"
+        );
+        assert!(source.cached_derived_bytes() >= 320 * 240 * 4);
+    }
+
+    #[test]
+    fn ai_input_is_charged_to_the_source_cache() {
+        let dir = s2_test_dir("ai-bytes");
+        write_test_png(&dir, "ai.png", 64, 48, 5);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let input = engine.ai_input(id).unwrap();
+        let pixels = (input.width as usize) * (input.height as usize) * 4;
+        let stats = engine.source_cache_stats();
+        eprintln!("ai input stats: {stats:?}");
+        assert!(stats.ai_input_bytes >= pixels, "{stats:?}");
+        assert!(stats.current_bytes >= stats.ai_input_bytes, "{stats:?}");
+        assert_eq!(stats.ai_input_bytes, ai_input_bytes(&input));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rescan_keeps_unchanged_ids_and_drops_removed_sources() {
+        let dir = s2_test_dir("rescan");
+        write_test_png(&dir, "keep.png", 96, 64, 1);
+        write_test_png(&dir, "drop.png", 96, 64, 2);
+        let engine = FileEngine::open(&dir).unwrap();
+        let adjustments = AdjustmentSet::default();
+        let before: Vec<(String, ImageId)> = engine
+            .images()
+            .into_iter()
+            .map(|info| (info.file_name.clone(), info.id))
+            .collect();
+        for (_, id) in &before {
+            engine.thumbnail(*id, &adjustments, 64).unwrap();
+        }
+        let bytes = engine.source_cache_stats().current_bytes;
+        assert!(bytes > 0);
+
+        engine.rescan().unwrap();
+        let after: Vec<(String, ImageId)> = engine
+            .images()
+            .into_iter()
+            .map(|info| (info.file_name.clone(), info.id))
+            .collect();
+        assert_eq!(before, after, "rescan reassigned an unchanged image id");
+        assert_eq!(engine.source_cache_stats().current_bytes, bytes, "rescan lost cached bytes");
+
+        // Fill the preview cache so the removal path is observable.
+        engine.preview_frame(&PreviewRequest {
+            image: before[1].1,
+            adjustments: adjustments.clone(),
+            region: NormRect::FULL,
+            max_size: 64,
+            quality: RenderQuality::Final,
+            bypass: false,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
+        }, false).unwrap();
+        assert!(engine.state.lock().preview.len() > 0);
+
+        std::fs::remove_file(dir.join("drop.png")).unwrap();
+        engine.rescan().unwrap();
+        let stats = engine.source_cache_stats();
+        eprintln!("rescan removal stats: {stats:?}");
+        assert_eq!(stats.cached_sources, 1, "{stats:?}");
+        assert!(stats.current_bytes < bytes, "{stats:?}");
+        assert_eq!(engine.state.lock().preview.len(), 0, "rescan did not clear previews");
+        let kept: Vec<ImageId> = engine.images().iter().map(|info| info.id).collect();
+        assert_eq!(kept, vec![before[1].1], "unchanged file lost its id");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replaced_source_file_invalidates_the_cache() {
+        let dir = s2_test_dir("identity");
+        let path = write_test_png(&dir, "shot.png", 48, 32, 1);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let adjustments = AdjustmentSet::default();
+        engine.thumbnail(id, &adjustments, 64).unwrap();
+        let first = engine.source(id).unwrap().snapshot_id();
+        assert_eq!(engine.source_cache_stats().identity_invalidations, 0);
+
+        // Same dimensions, different pixels. The trailing byte forces a length
+        // change as well, so the identity check cannot depend on mtime alone.
+        let rewritten = image::RgbaImage::from_fn(48, 32, |x, y| {
+            image::Rgba([(255 - x) as u8, (y * 7) as u8, 200, 255])
+        });
+        rewritten.save(&path).unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"x").unwrap();
+        }
+        let second = engine.source(id).unwrap().snapshot_id();
+        assert_ne!(first, second, "rewritten file served the old cached source");
+        assert!(engine.source_cache_stats().identity_invalidations >= 1);
+
+        // Repeated hits on an unchanged file must not invalidate it.
+        for _ in 0..10 {
+            engine.source(id).unwrap();
+        }
+        assert_eq!(engine.source_cache_stats().identity_invalidations, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

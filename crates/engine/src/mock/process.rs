@@ -259,6 +259,22 @@ impl Source {
         (self.levels[0].width, self.levels[0].height)
     }
 
+    /// Bytes held by the lazily built portrait derivatives: the full RGBA8 face
+    /// input and the four mask planes. Reads the `OnceLock`s without
+    /// initialising them, so accounting never forces a portrait build.
+    pub(crate) fn cached_derived_bytes(&self) -> usize {
+        let face = self.face_rgba8.get().map_or(0, |image| image.pixels.capacity());
+        let masks = self.portrait_masks.get().map_or(0, |masks| {
+            [&masks.skin, &masks.hair, &masks.face, &masks.body]
+                .into_iter()
+                .flatten()
+                .fold(0usize, |total, plane| {
+                    total.saturating_add(plane.capacity().saturating_mul(std::mem::size_of::<f32>()))
+                })
+        });
+        face.saturating_add(masks)
+    }
+
     pub(crate) fn face_input_image(&self) -> crate::PortraitImage {
         self.face_rgba8
             .get_or_init(|| {
