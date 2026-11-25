@@ -628,7 +628,13 @@ impl Render for Viewer {
                 if frame.stamp.id != self.last_frame {
                     self.last_frame = frame.stamp.id;
                     let stamp = frame.stamp;
-                    crate::perf::record(serde_json::json!({"event": "viewer", "id": stamp.id, "input_to_viewer_ms": stamp.requested_at.elapsed().as_secs_f64() * 1000.0}));
+                    crate::perf::record(serde_json::json!({
+                        "event": "viewer", "id": stamp.id,
+                        "input_to_viewer_ms": stamp.requested_at.elapsed().as_secs_f64() * 1000.0,
+                        "display_profile_degraded": frame.degraded.is_some(),
+                        "embedded_source_fallback": s.source_note.as_ref().is_some_and(|(id, _)| *id == frame.image_id),
+                        "portrait_applied": frame.portrait_applied,
+                    }));
                     window.on_next_frame(move |_, _| crate::perf::record(serde_json::json!({
                         "event": "next_frame", "id": stamp.id, "quality": format!("{:?}", stamp.quality),
                         "input_to_next_frame_ms": stamp.requested_at.elapsed().as_secs_f64() * 1000.0,

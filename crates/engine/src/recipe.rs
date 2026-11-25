@@ -1159,14 +1159,17 @@ fn pack_ifd(
 /// Rewrites the encoder's last IFD with `extra` tags appended and `exif_ifd`
 /// / `gps_ifd` as its Exif and GPS sub-IFDs. The image crate's `TiffEncoder`
 /// has no metadata API, but its output keeps the IFD at the end, so a new IFD
-/// can point at the untouched pixel data. `None` when the layout is not the
-/// one it writes.
-fn tiff_add_tags(
+/// can point at the untouched pixel data.
+///
+/// Returns the new IFD offset field and the bytes to append after the encoded
+/// file, so the exporter writes the pixel data it already holds instead of
+/// copying the whole file. `None` when the layout is not the one it writes.
+fn tiff_tag_suffix(
     tiff: &[u8],
     extra: &[(u16, u16, u32, Vec<u8>)],
     exif_ifd: &[(u16, u16, u32, Vec<u8>)],
     gps_ifd: &[(u16, u16, u32, Vec<u8>)],
-) -> Option<Vec<u8>> {
+) -> Option<([u8; 4], Vec<u8>)> {
     let le = match tiff.get(..2)? {
         b"II" => true,
         b"MM" => false,
@@ -1212,11 +1215,11 @@ fn tiff_add_tags(
         entries.push((0x8825, make_entry(0x8825, TIFF_LONG, 1, &[0; 4], le)?));
     }
     entries.sort_by_key(|(tag, _)| *tag);
-    let mut out = tiff.to_vec();
-    if out.len() % 2 == 1 {
+    let mut out = Vec::new();
+    if tiff.len() % 2 == 1 {
         out.push(0);
     }
-    let new_ifd = out.len();
+    let new_ifd = tiff.len() + out.len();
     let count = entries.len();
     let data_at = new_ifd + 2 + count * 12 + 4;
     let mut data: Vec<u8> = Vec::new();
@@ -1251,7 +1254,6 @@ fn tiff_add_tags(
             entry[8..12].copy_from_slice(&u32b(gps_at as u32));
         }
     }
-    out[4..8].copy_from_slice(&u32b(new_ifd as u32));
     out.extend_from_slice(&u16b(count as u16));
     for (_, entry) in &entries {
         out.extend_from_slice(entry);
@@ -1262,7 +1264,7 @@ fn tiff_add_tags(
     out.extend_from_slice(&exif_data);
     out.extend_from_slice(&gps_blob);
     out.extend_from_slice(&gps_data);
-    Some(out)
+    Some((u32b(new_ifd as u32), out))
 }
 
 fn policy_exif(info: &ImageInfo, policy: MetadataPolicy) -> Option<Vec<u8>> {
@@ -1556,15 +1558,6 @@ fn narrow_from_wide(rgba: &[u16]) -> Vec<u8> {
     rgba.par_iter().map(|&v| ((v as u32 * 255 + 32767) / 65535) as u8).collect()
 }
 
-fn wide_to_ne_bytes(wide: &[u16]) -> Vec<u8> {
-    use rayon::prelude::*;
-    let mut bytes = vec![0u8; wide.len() * 2];
-    bytes.par_chunks_exact_mut(2).zip(wide.par_iter()).for_each(|(dst, src)| {
-        dst.copy_from_slice(&src.to_ne_bytes());
-    });
-    bytes
-}
-
 fn fold_eight_bit_edits(wide: &mut [u16], edited8: &[u8]) {
     use rayon::prelude::*;
     wide.par_chunks_exact_mut(4).zip(edited8.par_chunks_exact(4)).for_each(|(px, after)| {
@@ -1591,6 +1584,22 @@ fn drop_alpha(rgba: &[u8]) -> Vec<u8> {
     rgb
 }
 
+/// Packs the RGB channels of `rgba` to the front and drops the alpha bytes, so
+/// the JPEG encoder reads the frame the exporter already owns instead of a
+/// second full-size buffer. Later pixels sit at higher offsets, so a forward
+/// pass cannot read a byte it has already overwritten.
+fn compact_rgba_to_rgb(rgba: &mut Vec<u8>) {
+    let pixels = rgba.len() / 4;
+    let mut sample = [0u8; 3];
+    for index in 1..pixels {
+        let source = index * 4;
+        sample.copy_from_slice(&rgba[source..source + 3]);
+        let target = index * 3;
+        rgba[target..target + 3].copy_from_slice(&sample);
+    }
+    rgba.truncate(pixels * 3);
+}
+
 #[cfg(all(windows, feature = "z6iii-raw-export"))]
 pub(crate) fn write_z6iii_tiff(
     dir: &Path,
@@ -1601,11 +1610,14 @@ pub(crate) fn write_z6iii_tiff(
     use std::io::Write;
     let mut encoded = std::io::Cursor::new(Vec::new());
     frame.write_tiff_with_resolution(&mut encoded, Some(recipe.resolution_ppi.max(1)))?;
-    let bytes = encoded.into_inner();
+    let mut bytes = encoded.into_inner();
     let exif = export_exif(info, recipe.include_metadata);
     let xmp = policy_xmp(info, recipe.include_metadata);
-    let tagged = export_tiff_tags(&bytes, exif.as_deref(), xmp.as_deref());
-    let bytes = tagged.as_deref().unwrap_or(&bytes);
+    let mut tag_suffix = Vec::new();
+    if let Some((field, suffix)) = export_tiff_tags(&bytes, exif.as_deref(), xmp.as_deref()) {
+        bytes[4..8].copy_from_slice(&field);
+        tag_suffix = suffix;
+    }
     std::fs::create_dir_all(dir)?;
     let name = output_name(recipe, info, info.variant as usize);
     loop {
@@ -1613,7 +1625,9 @@ pub(crate) fn write_z6iii_tiff(
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             result => {
-                result?.write_all(bytes)?;
+                let mut file = result?;
+                file.write_all(&bytes)?;
+                file.write_all(&tag_suffix)?;
                 return Ok(path);
             }
         }
@@ -1627,7 +1641,11 @@ fn export_exif(info: &ImageInfo, policy: MetadataPolicy) -> Option<Vec<u8>> {
     }
 }
 
-fn export_tiff_tags(bytes: &[u8], exif: Option<&[u8]>, xmp: Option<&str>) -> Option<Vec<u8>> {
+fn export_tiff_tags(
+    bytes: &[u8],
+    exif: Option<&[u8]>,
+    xmp: Option<&str>,
+) -> Option<([u8; 4], Vec<u8>)> {
     let mut tags = exif.map(ifd0_entries).unwrap_or_default();
     if let Some(packet) = xmp {
         tags.push((700, TIFF_BYTE, packet.len() as u32, packet.as_bytes().to_vec()));
@@ -1637,7 +1655,7 @@ fn export_tiff_tags(bytes: &[u8], exif: Option<&[u8]>, xmp: Option<&str>) -> Opt
     if tags.is_empty() && exif_ifd.is_empty() && gps_ifd.is_empty() {
         return None;
     }
-    let tagged = tiff_add_tags(bytes, &tags, &exif_ifd, &gps_ifd);
+    let tagged = tiff_tag_suffix(bytes, &tags, &exif_ifd, &gps_ifd);
     if tagged.is_none() {
         log::warn!("export: could not add the EXIF tags to the TIFF");
     }
@@ -1672,8 +1690,11 @@ fn write_export_pixels(
             if rgba.len() != checked_len(width, height)? {
                 anyhow::bail!("engine returned a buffer of the wrong size");
             }
-            let narrow = narrow_from_wide(&rgba);
-            (narrow, Some(rgba))
+            // The 8-bit mirror of a 16-bit frame is only read by the stages
+            // that edit 8-bit pixels, and the ICC stage rewrites the 16-bit
+            // frame, so the mirror is built where it is read instead of twice
+            // up front.
+            (Vec::new(), Some(rgba))
         }
     };
     let (tw, th) = output_size(recipe, (width, height));
@@ -1681,7 +1702,7 @@ fn write_export_pixels(
         if (tw, th) != (width, height) {
             *wide = resize_rgba16(&std::mem::take(wide), width, height, tw, th);
         }
-        narrow_from_wide(wide)
+        Vec::new()
     } else if (tw, th) != (width, height) {
         let img = image::RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| anyhow::anyhow!("engine returned a buffer of the wrong size"))?;
@@ -1689,6 +1710,9 @@ fn write_export_pixels(
     } else {
         rgba
     };
+    // True while `rgba` is the 8-bit mirror of `wide`. The 8-bit path has no
+    // mirror: `rgba` *is* the frame there.
+    let mut mirror = false;
     // The 8-bit frame is only needed when a later stage edits it and the change
     // must be folded back into the 16-bit buffer. With no sharpening, watermark
     // or profile the two are identical, so the clone and the fold are skipped.
@@ -1705,12 +1729,20 @@ fn write_export_pixels(
         OutputSharpening::Screen => 0.6,
         OutputSharpening::Print => 1.0,
     };
-    match explicit_sharpening(recipe) {
-        Some(settings) => {
-            output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
+    // `sharpen_8bit` is true exactly when the sharpening stage would change
+    // pixels, so the 8-bit mirror it works on is only built then.
+    if sharpen_8bit {
+        if let Some(wide) = wide.as_ref() {
+            rgba = narrow_from_wide(wide);
+            mirror = true;
         }
-        None if recipe.output_sharpening_settings.is_some() => {}
-        None => output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0),
+        match explicit_sharpening(recipe) {
+            Some(settings) => {
+                output_sharpen(&mut rgba, tw, th, settings.amount, settings.radius, settings.threshold);
+            }
+            None if recipe.output_sharpening_settings.is_some() => {}
+            None => output_sharpen(&mut rgba, tw, th, amount, 1.0, 0.0),
+        }
     }
     // shortcut: Method/viewing distance are saved but not applied, revisit with
     // real output pairs.
@@ -1727,13 +1759,20 @@ fn write_export_pixels(
         if let Some(wide) = wide.as_mut() {
             if !is_srgb(&target.profile, &target.path) {
                 icc::convert_srgb16_to(wide, &target.profile);
-                rgba = narrow_from_wide(wide);
+                // The 16-bit frame changed, so the mirror is stale now.
+                mirror = false;
             }
         } else {
             convert_to_profile(&mut rgba, &target.profile, &target.path);
         }
     }
     if let Some(mark) = recipe.watermark.as_ref() {
+        if let Some(wide) = wide.as_ref() {
+            if !mirror {
+                rgba = narrow_from_wide(wide);
+                mirror = true;
+            }
+        }
         draw_watermark(&mut rgba, tw, th, mark);
         if let Some(wide) = wide.as_mut() {
             fold_eight_bit_edits(wide, &rgba);
@@ -1767,8 +1806,15 @@ fn write_export_pixels(
         return Ok(path);
     }
 
+    // JPEG needs RGB, not RGBA: compact in place so the encoder reads this
+    // frame instead of a second full-size copy.
+    if wide.is_none() && recipe.format == ExportFormat::Jpeg {
+        compact_rgba_to_rgb(&mut rgba);
+    }
+    let rgb8 = (wide.is_none() && recipe.format == ExportFormat::Jpeg).then(|| rgba.as_slice());
     let (mut bytes, extension) = encode(
         &rgba,
+        rgb8,
         wide.as_deref(),
         tw,
         th,
@@ -1779,9 +1825,13 @@ fn write_export_pixels(
     )?;
     // `image`'s TIFF encoder has no metadata API, so the EXIF tags go in by
     // rewriting its last IFD. Sub-IFDs (Exif, GPS) are not carried over.
+    let mut tag_suffix = Vec::new();
     if extension == "tif" {
-        if let Some(tagged) = export_tiff_tags(&bytes, exif_bytes.as_deref(), xmp_packet.as_deref()) {
-            bytes = tagged;
+        if let Some((field, suffix)) =
+            export_tiff_tags(&bytes, exif_bytes.as_deref(), xmp_packet.as_deref())
+        {
+            bytes[4..8].copy_from_slice(&field);
+            tag_suffix = suffix;
         }
     }
     if let Some(packet) = xmp_packet {
@@ -1794,6 +1844,11 @@ fn write_export_pixels(
     let mut file = std::fs::File::create(&path)?;
     let mut written = 0u64;
     for chunk in bytes.chunks(256 * 1024) {
+        file.write_all(chunk)?;
+        written += chunk.len() as u64;
+        progress((written as f32 / estimate as f32).min(1.0));
+    }
+    for chunk in tag_suffix.chunks(256 * 1024) {
         file.write_all(chunk)?;
         written += chunk.len() as u64;
         progress((written as f32 / estimate as f32).min(1.0));
@@ -1845,6 +1900,7 @@ fn write_heif_file(
 /// runtime libheif encoder when it is installed.
 fn encode(
     rgba: &[u8],
+    rgb8: Option<&[u8]>,
     wide: Option<&[u16]>,
     w: u32,
     h: u32,
@@ -1853,7 +1909,7 @@ fn encode(
     exif: Option<&[u8]>,
     xmp: Option<&[u8]>,
 ) -> anyhow::Result<(Vec<u8>, &'static str)> {
-    use image::ImageEncoder as _;
+    use image::{EncodableLayout as _, ImageEncoder as _};
 
     // `TiffEncoder` seeks, so the sink is a cursor rather than a bare `Vec`.
     let mut out = std::io::Cursor::new(Vec::new());
@@ -1864,7 +1920,6 @@ fn encode(
         }
         let wide_color = image::ExtendedColorType::Rgba16;
         // The 16-bit encoders take bytes and expect native-endian samples.
-        let bytes = wide_to_ne_bytes(wide);
         match recipe.format {
             ExportFormat::Png => {
                 let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
@@ -1874,7 +1929,7 @@ fn encode(
                 if let Some(exif) = exif {
                     encoder.set_exif_metadata(exif.to_vec())?;
                 }
-                encoder.write_image(&bytes, w, h, wide_color)?;
+                encoder.write_image(wide.as_bytes(), w, h, wide_color)?;
                 return Ok((out.into_inner(), "png"));
             }
             ExportFormat::Tiff => {
@@ -1882,7 +1937,7 @@ fn encode(
                 if let Some(icc) = icc {
                     encoder.set_icc_profile(icc.to_vec())?;
                 }
-                encoder.write_image(&bytes, w, h, wide_color)?;
+                encoder.write_image(wide.as_bytes(), w, h, wide_color)?;
                 return Ok((out.into_inner(), "tif"));
             }
             ExportFormat::Heif => {
@@ -1944,8 +1999,16 @@ fn encode(
             Ok((out.into_inner(), "webp"))
         }
         ExportFormat::Jpeg => {
-            // JPEG has no alpha channel; drop it rather than fail the job.
-            let rgb = drop_alpha(rgba);
+            // JPEG has no alpha channel; drop it rather than fail the job. The
+            // exporter already compacted the frame when it had one to give.
+            let dropped;
+            let rgb = match rgb8 {
+                Some(rgb) => rgb,
+                None => {
+                    dropped = drop_alpha(rgba);
+                    dropped.as_slice()
+                }
+            };
             {
                 let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
                 // The recipe's ppi becomes the JFIF density of the file.
@@ -1957,7 +2020,7 @@ fn encode(
                 if let Some(exif) = exif {
                     encoder.set_exif_metadata(exif.to_vec())?;
                 }
-                encoder.write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)?;
+                encoder.write_image(rgb, w, h, image::ExtendedColorType::Rgb8)?;
             }
             Ok((out.into_inner(), "jpg"))
         }
@@ -2513,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_wide_conversions_match_the_serial_original_exactly() {
+    fn wide_conversions_match_the_serial_original_exactly() {
         let wide: Vec<u16> = (0..4099u32).map(|i| i.wrapping_mul(7919) as u16).collect();
         let narrow_serial: Vec<u8> =
             wide.iter().map(|&v| ((v as u32 * 255 + 32767) / 65535) as u8).collect();
@@ -2523,7 +2586,7 @@ mod tests {
         for v in &wide {
             bytes.extend_from_slice(&v.to_ne_bytes());
         }
-        assert_eq!(wide_to_ne_bytes(&wide), bytes);
+        assert_eq!(image::EncodableLayout::as_bytes(wide.as_slice()), bytes);
 
         let before: Vec<u8> =
             wide.iter().map(|&v| ((v as u32 * 255 + 32767) / 65535) as u8).collect();
@@ -2628,31 +2691,10 @@ mod tests {
         let (sn50, sn95) = p50(serial_narrow);
         let (pn50, pn95) = p50(parallel_narrow);
 
-        let mut serial_bytes = Vec::with_capacity(9);
-        for _ in 0..9 {
-            let started = Instant::now();
-            let mut out = Vec::with_capacity(wide.len() * 2);
-            for v in &wide {
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            serial_bytes.push(started.elapsed().as_secs_f64() * 1000.0);
-            std::hint::black_box(out);
-        }
-        let mut parallel_bytes = Vec::with_capacity(9);
-        for _ in 0..9 {
-            let started = Instant::now();
-            let out = wide_to_ne_bytes(&wide);
-            parallel_bytes.push(started.elapsed().as_secs_f64() * 1000.0);
-            std::hint::black_box(out);
-        }
-        let (sb50, sb95) = p50(serial_bytes);
-        let (pb50, pb95) = p50(parallel_bytes);
         println!(
             "6000x4000 RGBA16 narrow: serial {sn50:.3}/{sn95:.3} ms, parallel \
-             {pn50:.3}/{pn95:.3} ms, {:.2}x; native bytes: serial {sb50:.3}/{sb95:.3} ms, \
-             parallel {pb50:.3}/{pb95:.3} ms, {:.2}x",
-            sn50 / pn50,
-            sb50 / pb50
+             {pn50:.3}/{pn95:.3} ms, {:.2}x",
+            sn50 / pn50
         );
 
         let before: Vec<u8> =
@@ -3945,6 +3987,167 @@ mod tests {
         assert!(err.is_err(), "16-bit WebP must be an error, not a 8-bit downgrade");
         assert!(err.unwrap_err().to_string().contains("16-bit"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// R1: the 8-bit mirror is now built only where it is read, so an export
+    /// with no 8-bit stage must write the 16-bit frame untouched and still
+    /// produce exactly the same file as the eager path.
+    #[test]
+    fn deferred_mirror_keeps_an_unedited_16_bit_export_byte_identical() {
+        let dir = scratch_dir("r1-noedits16");
+        let (w, h) = (8u32, 4u32);
+        let wide = wide_image(w, h);
+        for format in [ExportFormat::Png, ExportFormat::Tiff] {
+            let path =
+                write_export16(&dir, &info(), &recipe16(format), 0, wide.clone(), w, h, |_| {})
+                    .unwrap();
+            let back = image::open(&path).unwrap().to_rgba16();
+            assert_eq!(
+                back.as_raw(),
+                &wide,
+                "{format:?}: with no 8-bit stage the 16-bit samples must be untouched"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// R1: output sharpening happens on the 8-bit mirror and is folded back
+    /// into the 16-bit frame. Deferring the mirror must not drop or reorder
+    /// that fold.
+    #[test]
+    fn deferred_mirror_folds_output_sharpening_back_into_the_16_bit_frame() {
+        let dir = scratch_dir("r1-sharpen16");
+        let (w, h) = (16u32, 8u32);
+        // A smooth ramp has no detail for the box blur to subtract, so the
+        // sharpening stage would be a no-op and the test would pass for the
+        // wrong reason. Use a checkerboard so the stage has something to do.
+        let wide = textured_image(w, h);
+        let mut r = recipe16(ExportFormat::Png);
+        r.output_sharpening_settings = Some(OutputSharpeningSettings {
+            amount: 80.0,
+            radius: 1.0,
+            threshold: 0.0,
+            ..Default::default()
+        });
+        let path =
+            write_export16(&dir, &info(), &r, 0, wide.clone(), w, h, |_| {}).unwrap();
+        let back = image::open(&path).unwrap().to_rgba16().into_raw();
+
+        // The eager reference: mirror, sharpen it, fold it back.
+        let mut expected = wide.clone();
+        let mut mirror = narrow_from_wide(&wide);
+        output_sharpen(&mut mirror, w, h, 80.0, 1.0, 0.0);
+        assert_ne!(mirror, narrow_from_wide(&wide), "the fixture must have detail to sharpen");
+        fold_eight_bit_edits(&mut expected, &mirror);
+        assert_eq!(back, expected, "sharpened 16-bit output must match the eager fold");
+        assert_ne!(back, wide, "the sharpening stage must actually run");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// High-frequency fixture: a smooth ramp is invisible to a box blur, so
+    /// anything that has to *change* pixels needs structure.
+    fn textured_image(w: u32, h: u32) -> Vec<u16> {
+        (0..(w * h) as usize)
+            .flat_map(|i| {
+                let x = (i as u32) % w;
+                let y = (i as u32) / w;
+                let base = if (x + y) % 2 == 0 { 40u32 } else { 215u32 };
+                [
+                    ((base + 3 * x).min(255) * 257) as u16,
+                    ((base + 5 * y).min(255) * 257) as u16,
+                    40000,
+                    65535,
+                ]
+            })
+            .collect()
+    }
+
+    /// R1: the watermark is drawn on the 8-bit mirror and folded back too.
+    #[test]
+    fn deferred_mirror_folds_a_watermark_back_into_the_16_bit_frame() {
+        let dir = scratch_dir("r1-watermark16");
+        let (w, h) = (32u32, 16u32);
+        let wide = wide_image(w, h);
+        let mark = Watermark { text: "R1".into(), opacity: 70.0, scale: 1.0, position: [0.5, 0.5] };
+        let mut r = recipe16(ExportFormat::Png);
+        r.watermark = Some(mark.clone());
+        let path =
+            write_export16(&dir, &info(), &r, 0, wide.clone(), w, h, |_| {}).unwrap();
+        let back = image::open(&path).unwrap().to_rgba16().into_raw();
+
+        let mut expected = wide.clone();
+        let mut mirror = narrow_from_wide(&wide);
+        draw_watermark(&mut mirror, w, h, &mark);
+        fold_eight_bit_edits(&mut expected, &mirror);
+        assert_eq!(back, expected, "watermarked 16-bit output must match the eager fold");
+        assert_ne!(back, wide, "the watermark stage must actually run");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// R1: a non-sRGB profile rewrites the 16-bit frame, so the mirror the
+    /// watermark later reads must be rebuilt from the converted frame. This
+    /// guards the ICC -> watermark ordering the C1 lane fixed.
+    #[test]
+    fn deferred_mirror_rebuilds_after_a_sixteen_bit_icc_conversion() {
+        let Some((target, name)) = non_srgb_profile() else { return };
+        let (w, h) = (32u32, 16u32);
+        let wide = wide_image(w, h);
+
+        let mut expected = wide.clone();
+        icc::convert_srgb16_to(&mut expected, &target.profile);
+        if expected == wide {
+            // The profile is effectively a no-op here, so there is no
+            // conversion order to pin down.
+            return;
+        }
+
+        let dir = scratch_dir("r1-icc16");
+        let mark = Watermark { text: "R1".into(), opacity: 60.0, scale: 1.0, position: [0.5, 0.5] };
+        let mut r = recipe16(ExportFormat::Png);
+        r.icc_profile = name.clone();
+        r.watermark = Some(mark.clone());
+        let path =
+            write_export16(&dir, &info(), &r, 0, wide.clone(), w, h, |_| {}).unwrap();
+        let back = image::open(&path).unwrap().to_rgba16().into_raw();
+
+        let mut mirror = narrow_from_wide(&expected);
+        draw_watermark(&mut mirror, w, h, &mark);
+        fold_eight_bit_edits(&mut expected, &mirror);
+        assert_eq!(
+            back, expected,
+            "{name}: the watermark must be folded into the ICC-converted 16-bit frame"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Any non-sRGB profile the exporter can resolve, as the recipe name and
+    /// the parsed profile. `None` when this machine has none installed.
+    fn non_srgb_profile() -> Option<(OutputProfile, String)> {
+        // The crate's own testdata first, then whatever `resolve_profile`
+        // would search, so the test stays fast on a machine with a vendor
+        // profile library installed.
+        let testdata = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let mut budget = 200usize;
+        for dir in [testdata, icc::profile_dir()] {
+            for (stem, path) in icc::scan_profiles(&[dir]) {
+                if budget == 0 {
+                    return None;
+                }
+                budget -= 1;
+                let Ok(profile) = icc::Profile::from_file(&path) else { continue };
+                // Only a device RGB profile can act as an output profile here.
+                if &profile.data_space != b"RGB " || is_srgb(&profile, &path) {
+                    continue;
+                }
+                // Resolve it back the way the exporter does, so the test can
+                // never pick a profile `resolve_profile` would not find.
+                let Some(found) = resolve_profile(&stem) else { continue };
+                if !is_srgb(&found.profile, &found.path) {
+                    return Some((found, stem));
+                }
+            }
+        }
+        None
     }
 
     #[test]

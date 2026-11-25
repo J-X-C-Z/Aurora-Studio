@@ -9845,6 +9845,7 @@ mod tests {
             pf,
             backend,
             dispatches: Vec::new(),
+            metal_dispatches: Vec::new(),
             fallback_reason: fallback_reason.map(str::to_string),
             skipped: !executed,
             executed,

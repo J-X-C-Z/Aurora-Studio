@@ -401,12 +401,15 @@ fn tile_for(
     cubic: bool,
     tx: u32,
     ty: u32,
+    cache: bool,
 ) -> Arc<Vec<SourceSample>> {
     if let Some(tile) = tile_lookup(key, tx, ty) {
         return tile;
     }
     let tile = Arc::new(fill_tile(src, map, region, xs, out_w, out_h, level, cubic, tx, ty));
-    tile_insert(key, tx, ty, Arc::clone(&tile));
+    if cache {
+        tile_insert(key, tx, ty, Arc::clone(&tile));
+    }
     tile
 }
 
@@ -422,6 +425,7 @@ struct BandSampler<'a> {
     out_h: u32,
     level: usize,
     cubic: bool,
+    cache: bool,
 }
 
 impl BandSampler<'_> {
@@ -429,7 +433,6 @@ impl BandSampler<'_> {
     /// A band is one tile row tall, so it maps onto whole cached tiles.
     fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
         let out_w = self.out_w as usize;
-        band.clear();
         band.resize(rows as usize * out_w, EMPTY_SAMPLE);
         let ty = y0 / SAMPLE_TILE;
         let columns = self.out_w.div_ceil(SAMPLE_TILE);
@@ -438,7 +441,7 @@ impl BandSampler<'_> {
             .map(|tx| {
                 tile_for(
                     self.src, self.map, &self.key, self.region, self.xs, self.out_w, self.out_h,
-                    self.level, self.cubic, tx, ty,
+                    self.level, self.cubic, tx, ty, self.cache,
                 )
             })
             .collect();
@@ -952,20 +955,6 @@ fn wheel_offset(w: &ColorWheel, strength: f32) -> [f32; 3] {
     [(c[0] - mean) * s + l, (c[1] - mean) * s + l, (c[2] - mean) * s + l]
 }
 
-fn contrast(g: f32, amount: f32) -> f32 {
-    if amount.abs() < 1e-4 {
-        return g;
-    }
-    let k = 1.0 + amount;
-    if k >= 1.0 {
-        // Sigmoid-ish S curve that does not clip hard.
-        let x = (g - 0.5) * k;
-        0.5 + x / (1.0 + (x.abs() * (k - 1.0) * 0.8))
-    } else {
-        0.5 + (g - 0.5) * k
-    }
-}
-
 /// A coarse raster of one layer's shape mask in oriented-image space.
 #[derive(Clone)]
 struct MaskGrid {
@@ -1382,6 +1371,8 @@ struct LayerPlan<'a> {
     levels: Option<Levels>,
     /// Constants a per-pixel `local()` would otherwise recompute every time.
     exposure_gain: f32,
+    tone: TonePlan,
+    hdr: HdrPlan,
     saturation: f32,
     simple_exposure: bool,
     opacity: f32,
@@ -1442,6 +1433,8 @@ fn layer_plan<'a>(
         curve_luma: a.curves.as_ref().and_then(|c| lut_of(&c.luma)),
         levels: a.levels.clone(),
         exposure_gain: 2f32.powf(a.exposure.exposure * 0.6),
+        tone: TonePlan::new(&a.exposure),
+        hdr: HdrPlan::new(&a.hdr),
         saturation: 1.0 + a.exposure.saturation / 100.0,
         simple_exposure,
         opacity,
@@ -1500,6 +1493,9 @@ struct Plan<'a> {
     fine: bool,
     wb: [f32; 3],
     exposure: f32,
+    tone: TonePlan,
+    hdr: HdrPlan,
+    saturation: f32,
     curve_rgb: Option<[f32; 256]>,
     curve_r: Option<[f32; 256]>,
     curve_g: Option<[f32; 256]>,
@@ -1532,7 +1528,7 @@ struct LayerOutputWeightKey {
     height: usize,
 }
 
-fn cached_layer_weights(
+fn cached_layer_coverage(
     plan: &Plan<'_>,
     map: &super::geometry::FrameMap,
     region: NormRect,
@@ -1582,10 +1578,9 @@ fn cached_layer_weights(
         for (x, &fx) in xs.iter().enumerate() {
             let (p, _) = map.map([fx, fy]);
             for (layer_index, layer) in plan.layers.iter().enumerate() {
-                row[x * n + layer_index] = layer_mask_weight(
+                row[x * n + layer_index] = layer_mask_coverage(
                     &layer.layer.mask,
                     layer.grid.as_deref(),
-                    layer.opacity,
                     p,
                     [0.0; 3],
                 );
@@ -2049,6 +2044,9 @@ fn build_plan<'a>(
         fine,
         wb: render_wb_gains(&adj.white_balance),
         exposure: 2f32.powf(adj.exposure.exposure),
+        tone: TonePlan::new(&adj.exposure),
+        hdr: HdrPlan::new(&adj.hdr),
+        saturation: 1.0 + adj.exposure.saturation / 100.0,
         curve_rgb: lut_of(&adj.curves.rgb),
         curve_r: lut_of(&adj.curves.red),
         curve_g: lut_of(&adj.curves.green),
@@ -2624,6 +2622,9 @@ fn render_sized(
         out_h,
         level,
         cubic: sharp,
+    // A wide render is a one-shot export. Caching its samples would evict the
+    // preview's tiles and raise peak RSS while the whole frame is inserted.
+    cache: !wide,
     };
     if gpu_two_pass {
         let sharpen_in_display = f32_includes_sharpen;
@@ -3635,7 +3636,7 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2], index: Option<usize>) -
 
     // `CImgOpLocalToneMappingV8` is raw stage 85: after Dehaze, before the
     // color list's `ApplyExposure`.
-    c = apply_hdr(c, &adj.hdr);
+    c = plan.hdr.apply(c);
     let e = plan.exposure;
     [c[0] * e, c[1] * e, c[2] * e]
 }
@@ -3697,7 +3698,7 @@ fn develop_pre_curve(
 
 fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     let adj = plan.adj;
-    let mut g = tone_user_core(display, &adj.exposure);
+    let mut g = plan.tone.apply(display);
     if plan.levels {
         g = adj.levels.apply_input(g);
     }
@@ -3724,7 +3725,7 @@ fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     }
 
     // Color.
-    let sat = 1.0 + adj.exposure.saturation / 100.0;
+    let sat = plan.saturation;
     if (sat - 1.0).abs() > 1e-4 {
         let l = luma(g);
         g = [l + (g[0] - l) * sat, l + (g[1] - l) * sat, l + (g[2] - l) * sat];
@@ -3768,62 +3769,103 @@ fn hdr_inv_toe(x: f32, k: f32) -> f32 {
 const HDR_K_SHADOW: f32 = 1.0;
 const HDR_K_HIGHLIGHT: f32 = 1.0;
 
-/// `CImgOpLocalToneMappingV8`: one gain per pixel from a single luma plane,
-/// then `out = rgb * gain`, so the panel is channel-neutral.
-///
-/// Highlight and shadow are kernel-exact. Whites/blacks still use the old
-/// zone-window approximation: their branch needs `op+0x94` (white curve) and
-/// `op+0xb4` (white offset), which are not recovered yet.
-///
-/// shortcut: whites/blacks stay approximate until those two fields are read
-/// from a C1 export; see `SESSION-c1-parse-hdr-highlights.md`.
-fn apply_hdr(mut g: [f32; 3], hdr: &HighDynamicRange) -> [f32; 3] {
-    let x = luma(g);
-    let mut shift = 0.0;
-    if hdr.whites != 0.0 {
-        shift += hdr.whites / 100.0 * 0.2 * sstep(0.65, 1.0, x);
+struct HdrPlan {
+    whites: Option<f32>,
+    blacks: Option<f32>,
+    highlights: f32,
+    shadows: f32,
+    toe_active: bool,
+}
+
+impl HdrPlan {
+    fn new(hdr: &HighDynamicRange) -> Self {
+        Self {
+            whites: (hdr.whites != 0.0).then(|| hdr.whites / 100.0 * 0.2),
+            blacks: (hdr.blacks != 0.0).then(|| hdr.blacks / 100.0 * 0.12),
+            highlights: (hdr.highlights / 100.0).clamp(-1.0, 1.0),
+            shadows: (hdr.shadows / 100.0).clamp(-1.0, 1.0),
+            toe_active: hdr.highlights != 0.0 || hdr.shadows != 0.0,
+        }
     }
-    if hdr.blacks != 0.0 {
-        shift += hdr.blacks / 100.0 * 0.12 * (1.0 - sstep(0.0, 0.25, x));
+
+    /// `CImgOpLocalToneMappingV8`: one gain per pixel from a single luma plane,
+    /// then `out = rgb * gain`, so the panel is channel-neutral.
+    ///
+    /// Highlight and shadow are kernel-exact. Whites/blacks still use the old
+    /// zone-window approximation: their branch needs `op+0x94` (white curve) and
+    /// `op+0xb4` (white offset), which are not recovered yet.
+    ///
+    /// shortcut: whites/blacks stay approximate until those two fields are read
+    /// from a C1 export; see `SESSION-c1-parse-hdr-highlights.md`.
+    fn apply(&self, mut g: [f32; 3]) -> [f32; 3] {
+        if self.whites.is_some() || self.blacks.is_some() {
+            let x = luma(g);
+            let mut shift = 0.0;
+            if let Some(whites) = self.whites {
+                shift += whites * sstep(0.65, 1.0, x);
+            }
+            if let Some(blacks) = self.blacks {
+                shift += blacks * (1.0 - sstep(0.0, 0.25, x));
+            }
+            if shift.abs() > 1e-5 {
+                let scale = (x + shift).max(0.0) / x.max(1e-4);
+                g = [g[0] * scale, g[1] * scale, g[2] * scale];
+            }
+        }
+        if !self.toe_active {
+            return g;
+        }
+        let x = luma(g);
+        let highlights = self.highlights;
+        let bright = if highlights != 0.0 {
+            let toe = hdr_toe(x, HDR_K_HIGHLIGHT);
+            2f32.powf(if highlights < 0.0 { -toe } else { toe }) * highlights.abs()
+                + (1.0 - highlights.abs())
+        } else {
+            1.0
+        };
+        let shadows = self.shadows;
+        let dark = if shadows != 0.0 {
+            let toe = hdr_inv_toe(x, HDR_K_SHADOW);
+            2f32.powf(if shadows < 0.0 { -toe } else { toe }) * shadows.abs() + (1.0 - shadows.abs())
+        } else {
+            1.0
+        };
+        let gain = dark / bright;
+        [g[0] * gain, g[1] * gain, g[2] * gain]
     }
-    if shift.abs() > 1e-5 {
-        let k = (x + shift).max(0.0) / x.max(1e-4);
-        g = [g[0] * k, g[1] * k, g[2] * k];
-    }
-    if hdr.highlights == 0.0 && hdr.shadows == 0.0 {
-        return g;
-    }
-    let x = luma(g);
-    let m = (hdr.highlights / 100.0).clamp(-1.0, 1.0);
-    let b = if m != 0.0 {
-        let t = hdr_toe(x, HDR_K_HIGHLIGHT);
-        2f32.powf(if m < 0.0 { -t } else { t }) * m.abs() + (1.0 - m.abs())
-    } else {
-        1.0
-    };
-    let m = (hdr.shadows / 100.0).clamp(-1.0, 1.0);
-    let a = if m != 0.0 {
-        let t = hdr_inv_toe(x, HDR_K_SHADOW);
-        2f32.powf(if m < 0.0 { -t } else { t }) * m.abs() + (1.0 - m.abs())
-    } else {
-        1.0
-    };
-    let gain = a / b;
-    [g[0] * gain, g[1] * gain, g[2] * gain]
 }
 
 /// Brightness and contrast, the per-pixel part of the tone stage.
-fn tone_user_core(
-    mut g: [f32; 3],
-    exp: &Exposure,
-) -> [f32; 3] {
-    if exp.brightness.abs() > 1e-3 {
-        let gamma = 2f32.powf(-exp.brightness / 50.0 * 0.6);
-        g = [g[0].max(0.0).powf(gamma), g[1].max(0.0).powf(gamma), g[2].max(0.0).powf(gamma)];
+struct TonePlan {
+    gamma: Option<f32>,
+    contrast_scale: Option<f32>,
+}
+
+impl TonePlan {
+    fn new(exp: &Exposure) -> Self {
+        let contrast = exp.contrast / 50.0 * 0.8;
+        Self {
+            gamma: (exp.brightness.abs() > 1e-3).then(|| 2f32.powf(-exp.brightness / 50.0 * 0.6)),
+            contrast_scale: if contrast.abs() < 1e-4 { None } else { Some(1.0 + contrast) },
+        }
     }
-    let c = exp.contrast / 50.0 * 0.8;
-    g = [contrast(g[0], c), contrast(g[1], c), contrast(g[2], c)];
-    g
+
+    fn apply(&self, mut g: [f32; 3]) -> [f32; 3] {
+        if let Some(gamma) = self.gamma {
+            g = g.map(|channel| channel.max(0.0).powf(gamma));
+        }
+        let Some(scale) = self.contrast_scale else { return g };
+        if scale >= 1.0 {
+            let knee = scale - 1.0;
+            g.map(|channel| {
+                let x = (channel - 0.5) * scale;
+                0.5 + x / (1.0 + (x.abs() * knee * 0.8))
+            })
+        } else {
+            g.map(|channel| 0.5 + (channel - 0.5) * scale)
+        }
+    }
 }
 
 /// The old point-operation clarity. The frame-wide stage is
@@ -3831,10 +3873,10 @@ fn tone_user_core(
 /// no frame-sized neighbourhood to filter, and for the tone-stage test.
 fn tone_user(
     g: [f32; 3],
-    exp: &Exposure,
+    tone: &TonePlan,
     clarity: &Clarity,
 ) -> [f32; 3] {
-    let mut g = tone_user_core(g, exp);
+    let mut g = tone.apply(g);
     let local = clarity.c1_amount() + clarity.c1_structure();
     if local.abs() > 1e-4 {
         let l = luma(g);
@@ -4324,8 +4366,8 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
     // A layer sees display codes already, so its dehaze keeps that domain and
     // only loses the `tone_user()` stages that used to run in front of it.
     c = apply_dehaze(c, &a.dehaze);
-    c = apply_hdr(c, &a.hdr);
-    c = tone_user(c, &a.exposure, &a.clarity);
+    c = lp.hdr.apply(c);
+    c = tone_user(c, &lp.tone, &a.clarity);
     if let Some(levels) = &lp.levels {
         c = levels.apply_input(c);
     }
@@ -4369,13 +4411,12 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
 /// The mask weight of one layer at a point, including invert, the luma and
 /// colour windows, the layer opacity and the mask density.
 fn layer_weight(lp: &LayerPlan, p: [f32; 2], g: [f32; 3]) -> f32 {
-    layer_mask_weight(&lp.layer.mask, lp.grid.as_deref(), lp.opacity, p, g)
+    layer_mask_coverage(&lp.layer.mask, lp.grid.as_deref(), p, g) * lp.opacity
 }
 
-fn layer_mask_weight(
+fn layer_mask_coverage(
     mask: &Mask,
     grid: Option<&MaskGrid>,
-    opacity: f32,
     p: [f32; 2],
     g: [f32; 3],
 ) -> f32 {
@@ -4389,7 +4430,7 @@ fn layer_mask_weight(
     if let Some(r) = &mask.color_range {
         m *= color_range_weight(r, g);
     }
-    m * opacity
+    m
 }
 
 /// One layer's contribution to a pixel: the colour adjustments, blended in by
@@ -4639,7 +4680,7 @@ fn apply_layers(
     let n = plan.layers.len();
     let xs: Vec<f32> =
         (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
-    let static_weights = cached_layer_weights(plan, map, region, w, h);
+    let static_weights = cached_layer_coverage(plan, map, region, w, h);
     // Luma/colour windows depend on the stack at the moment this layer ran, so
     // only those layers need a full-frame weight recording.
     let record_dynamic = static_weights.is_none()
@@ -4707,7 +4748,7 @@ fn apply_layers(
                 static_weights.as_ref().is_some_and(|weights| {
                     (0..w * h)
                         .into_par_iter()
-                        .all(|i| weights[i * n + li] <= 1e-4)
+                        .all(|i| weights[i * n + li] * lp.opacity <= 1e-4)
                 })
             },
             |weights| weights.iter().all(|value| *value <= 1e-4),
@@ -4767,7 +4808,7 @@ fn apply_layers(
                 let weight = static_weights
                     .as_ref()
                     .map_or_else(|| wgt.as_ref().expect("spatial weights")[i], |weights| {
-                        weights[i * n + li]
+                        weights[i * n + li] * lp.opacity
                     });
                 if weight <= 1e-4 {
                     continue;
@@ -4823,7 +4864,7 @@ fn apply_layer_color_row(
             .then(|| map.map([xs[x], fy]).0);
         for (li, lp) in plan.layers.iter().enumerate() {
             let m = if let Some(weights) = static_weights {
-                weights[x * n + li]
+                weights[x * n + li] * lp.opacity
             } else {
                 layer_weight(lp, p.expect("layer positions"), g)
             };
@@ -6027,7 +6068,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = Source::from_rgba(w, h, &rgba);
         let geometry = Geometry::default();
         let region = NormRect { x: 0.13, y: 0.21, width: 0.67, height: 0.55 };
-        let (out_w, out_h) = (17, 13);
+        let (out_w, out_h) = (SAMPLE_TILE + 17, SAMPLE_TILE + 13);
         let map = super::super::geometry::FrameMap::new(src.size(), &geometry);
         let xs: Vec<f32> =
             (0..out_w).map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width).collect();
@@ -6042,27 +6083,35 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             out_h,
             level: 0,
             cubic: false,
+    cache: true,
         };
-        let mut first = Vec::new();
-        bands.band(0, out_h, &mut first);
-        let mut second = Vec::new();
-        bands.band(0, out_h, &mut second);
-        assert_eq!(first, second);
-        assert!(tile_lookup(&key, 0, 0).is_some());
+        let mut first = vec![EMPTY_SAMPLE; SAMPLE_TILE as usize * out_w as usize];
+        for y0 in [0, SAMPLE_TILE, 0] {
+            let rows = (out_h - y0).min(SAMPLE_TILE);
+            first.fill(SourceSample { rgb: [f32::NAN; 3], valid: true });
+            bands.band(y0, rows, &mut first);
+            let mut second = Vec::new();
+            bands.band(y0, rows, &mut second);
+            assert_eq!(first, second);
+            for column in 0..out_w.div_ceil(SAMPLE_TILE) {
+                assert!(tile_lookup(&key, column, y0 / SAMPLE_TILE).is_some());
+            }
 
-        for y in 0..out_h as usize {
-            let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
-            for (x, &fx) in xs.iter().enumerate() {
-                let (_, s) = map.map([fx, fy]);
-                let expected = src.sample(0, s[0], s[1]);
-                let actual = first[y * out_w as usize + x];
-                assert_eq!(actual.valid, expected.is_some());
-                if let Some(rgb) = expected {
-                    assert_eq!(
-                        actual.rgb.map(f32::to_bits),
-                        rgb.map(f32::to_bits),
-                        "sample {x},{y}"
-                    );
+            for row in 0..rows as usize {
+                let y = y0 as usize + row;
+                let fy = region.y + (y as f32 + 0.5) / out_h as f32 * region.height;
+                for (x, &fx) in xs.iter().enumerate() {
+                    let (_, point) = map.map([fx, fy]);
+                    let expected = src.sample(0, point[0], point[1]);
+                    let actual = first[row * out_w as usize + x];
+                    assert_eq!(actual.valid, expected.is_some());
+                    if let Some(rgb) = expected {
+                        assert_eq!(
+                            actual.rgb.map(f32::to_bits),
+                            rgb.map(f32::to_bits),
+                            "sample {x},{y}"
+                        );
+                    }
                 }
             }
         }
@@ -6117,14 +6166,15 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
     #[test]
     fn zero_hdr_does_not_change_the_tone_path() {
-        let exposure = Exposure::default();
+        let tone = TonePlan::new(&Exposure::default());
+        let hdr = HdrPlan::new(&HighDynamicRange::default());
         let clarity = Clarity::default();
         for g in [[0.01, 0.2, 0.8], [0.18, 0.4, 0.65], [0.5, 0.55, 0.7]] {
-            assert_eq!(apply_hdr(g, &HighDynamicRange::default()), g);
-            assert_eq!(tone_user(g, &exposure, &clarity), g);
+            assert_eq!(hdr.apply(g), g);
+            assert_eq!(tone_user(g, &tone, &clarity), g);
         }
         let active = HighDynamicRange { highlights: -40.0, ..Default::default() };
-        assert_ne!(apply_hdr([0.65; 3], &active), [0.65; 3]);
+        assert_ne!(HdrPlan::new(&active).apply([0.65; 3]), [0.65; 3]);
     }
 
     /// `CImgOpLocalToneMappingV8`: highlight+ recovers brights, shadow+ lifts
@@ -6135,14 +6185,16 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let bright = [0.85; 3];
         let hi = HighDynamicRange { highlights: 100.0, ..Default::default() };
         let sh = HighDynamicRange { shadows: 100.0, ..Default::default() };
-        let hi_dark = apply_hdr(dark, &hi)[0] / dark[0];
-        let hi_bright = apply_hdr(bright, &hi)[0] / bright[0];
-        let sh_dark = apply_hdr(dark, &sh)[0] / dark[0];
-        let sh_bright = apply_hdr(bright, &sh)[0] / bright[0];
+        let hi = HdrPlan::new(&hi);
+        let sh = HdrPlan::new(&sh);
+        let hi_dark = hi.apply(dark)[0] / dark[0];
+        let hi_bright = hi.apply(bright)[0] / bright[0];
+        let sh_dark = sh.apply(dark)[0] / dark[0];
+        let sh_bright = sh.apply(bright)[0] / bright[0];
         assert!(hi_bright < hi_dark && hi_bright < 1.0, "{hi_bright} vs {hi_dark}");
         assert!(sh_dark > sh_bright && sh_dark > 1.0, "{sh_dark} vs {sh_bright}");
         let tinted = [0.6, 0.3, 0.15];
-        let out = apply_hdr(tinted, &hi);
+        let out = hi.apply(tinted);
         assert!((out[0] / out[1] - tinted[0] / tinted[1]).abs() < 1e-5);
     }
 
@@ -7079,6 +7131,40 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         layer.opacity = 25.0;
         let quarter = layer_weight(&plan_with(&layer, &adj), [0.5, 0.5], [0.0; 3]);
         assert!((quarter - 0.25).abs() < 1e-6, "25% opacity must quarter the weight, got {quarter}");
+    }
+
+    #[test]
+    fn layer_opacity_updates_with_warm_output_mask() {
+        let (width, height) = (160, 120);
+        let source = Source::from_rgba(width, height, &synthetic(width, height));
+        let mut layer = Layer {
+            id: 1,
+            opacity: 100.0,
+            mask: Mask { density: 83.0, invert: true, ..hard_disc(0.32) },
+            ..Default::default()
+        };
+        layer.adjustments.exposure.exposure = 0.5;
+        layer.adjustments.sharpening = Some(Sharpening { amount: 130.0, ..Default::default() });
+        let mut cached = AdjustmentSet::default();
+        cached.layers.push(layer);
+        let mut recorded = cached.clone();
+        recorded.layers[0].mask.luma_range = Some(LumaRange {
+            low_outer: 0.0, low_inner: 0.0, high_inner: 1.0, high_outer: 1.0,
+            ..Default::default()
+        });
+        let mut previous = None;
+        for opacity in [100.0, 25.0, 76.0, 0.01, 100.0] {
+            cached.layers[0].opacity = opacity;
+            recorded.layers[0].opacity = opacity;
+            let actual = render(&source, &cached, NormRect::FULL, 150, false, None);
+            let expected = render(&source, &recorded, NormRect::FULL, 150, false, None);
+            assert_eq!(actual.rgba, expected.rgba, "opacity {opacity}");
+            assert_eq!(actual.histogram, expected.histogram, "opacity {opacity}");
+            if let Some(last) = previous {
+                assert_ne!(actual.rgba, last, "opacity {opacity}");
+            }
+            previous = Some(actual.rgba);
+        }
     }
 
     #[test]
