@@ -618,7 +618,10 @@ mod wia {
         let mut out: *mut c_void = ptr::null_mut();
         let hr = unsafe { CoCreateInstance(clsid, ptr::null_mut(), CLSCTX_ALL, iid, &mut out) };
         if hr < 0 || out.is_null() {
-            bail!("WIA device manager is unavailable (CoCreateInstance HRESULT {})", hr_text(hr));
+            bail!(
+                "NoCamera: WIA device manager is unavailable (CoCreateInstance HRESULT {})",
+                hr_text(hr)
+            );
         }
         Ok(ComPtr::new(out))
     }
