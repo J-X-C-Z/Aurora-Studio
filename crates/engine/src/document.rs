@@ -9,14 +9,17 @@
 //!
 //! # Status
 //!
-//! This module is vocabulary plus fingerprints, **not** a wired render path.
-//! The types below are not threaded through `file_engine`/`preview_cache` yet.
-//! Producer bytes have been removed from `AdjustmentSet`: [`RuntimeInputs`] is
-//! now their sole owner, and [`RenderRequest`] carries one for the exact job.
-//! The document struct still holds the remaining `#[serde(skip)]` runtime fields
-//! (`LensCorrection::uniform_light_grid`, `Geometry::distortion`,
-//! `Geometry::optical_center`); moving those into `RuntimeInputs` so the
-//! document struct contains persistent state only is the next extraction step.
+//! Producer bytes and lens/geometry calibration are now owned by
+//! [`RuntimeInputs`] and threaded explicitly through the real render path:
+//! `FileEngine` stores one per image, `RenderService`/`ExportService` pass it
+//! into `mock::process`, and the preview cache mixes its fingerprint into the
+//! key. [`RenderRequest`] remains the vocabulary carrier for job-shaped code.
+//! [`AdjustmentSet`] therefore contains persistent state only.
+//!
+//! Rehydrated calibration (`Geometry::distortion`, `Geometry::optical_center`
+//! and `LensCorrection::uniform_light_grid` before this move) never enters a
+//! saved file, an undo step, equality or `document_fingerprint`; see
+//! [`LensRuntime`].
 //!
 //! Producer inputs were never attached in production (the only writer,
 //! `FaceParsingProducer::produce_bundle`, had no callers), so removing the
@@ -173,10 +176,12 @@ impl DocumentSnapshot {
 /// A render request skeleton: which source, which document revision, which
 /// region, which generation, which intent and which per-job runtime inputs.
 ///
-/// This is vocabulary only in this round; no renderer consumes it yet. It is
-/// `Clone` and lock-free by design so callers can hand it to a render queue.
-/// The document ([`DocumentSnapshot`]) stays document-only; the ephemeral
-/// producer bundle for *this* job travels in `runtime`.
+/// This is the job-shaped carrier: document-only state stays in
+/// [`DocumentSnapshot`], and the ephemeral calibration/producer bundle for
+/// *this* job travels in `runtime`. `FileEngine` currently constructs the
+/// equivalent runtime inputs from its per-image entry and passes them to the
+/// renderer directly; this type remains the public vocabulary for a future
+/// queue that owns requests end to end. It is `Clone` and lock-free by design.
 #[derive(Clone, Debug)]
 pub struct RenderRequest {
     pub source: SourceId,
@@ -189,49 +194,160 @@ pub struct RenderRequest {
     pub runtime: RuntimeInputs,
 }
 
+/// Lens and geometry calibration that is rehydrated at load time but must never
+/// be written back to a document, an undo step or a saved file.
+///
+/// These are exactly the values that used to sit on [`AdjustmentSet`] as
+/// `#[serde(skip)]` fields: the C1 radial distortion curve, its optical centre
+/// and the `.lcc` uniform-light grid. They are derived from the source/lens
+/// database, the `.lcc` sidecar or a `.cos` file, so they describe *this render*
+/// of *this source*, not the user's saved edit. They are owned here so the
+/// document is persistent state only.
+///
+/// The type is deliberately `pub(crate)`: the curve type lives in the private
+/// `c1_model` module, and no public API needs to name calibration directly. A
+/// public field of this type would be an E0446 private-in-public-interface
+/// error. The outer [`RuntimeInputs`] keeps a `pub(crate)` field and the
+/// crate-private accessors below are the only way to reach it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LensRuntime {
+    /// `ZLENSDISTORTION` as a source-pixel radial curve. Empty is the identity.
+    pub(crate) distortion: crate::c1_model::crop_limit::RadialCurve,
+    /// `ZLENSOPTICCENTER` in source pixels; only read when `distortion` is set.
+    pub(crate) optical_center: [f32; 2],
+    /// The `.lcc` uniform-light grid, shared so cloning stays cheap.
+    pub(crate) uniform_light_grid: Option<Arc<crate::dust_lcc::LightFalloff>>,
+}
+
+impl LensRuntime {
+    /// True when the calibration cannot change a pixel.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.distortion.is_empty()
+            && self.optical_center == [0.0, 0.0]
+            && self.uniform_light_grid.is_none()
+    }
+
+    /// Stable FNV-1a fingerprint of the calibration, or `None` when empty.
+    ///
+    /// Uses the raw bit patterns of the curve/centre and the grid nodes, so it
+    /// is independent of `serde` shape and of `Debug` formatting. This is a
+    /// cache hint, not an integrity hash.
+    pub(crate) fn fingerprint(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut hash = FNV1A64_OFFSET_BASIS;
+        hash = fnv1a64(hash, &self.distortion.v.len().to_le_bytes());
+        for value in &self.distortion.v {
+            hash = fnv1a64(hash, &value.to_bits().to_le_bytes());
+        }
+        hash = fnv1a64(hash, &self.distortion.x.len().to_le_bytes());
+        for value in &self.distortion.x {
+            hash = fnv1a64(hash, &value.to_bits().to_le_bytes());
+        }
+        hash = fnv1a64(hash, &self.distortion.m.len().to_le_bytes());
+        for value in &self.distortion.m {
+            hash = fnv1a64(hash, &value.to_bits().to_le_bytes());
+        }
+        for value in self.optical_center {
+            hash = fnv1a64(hash, &value.to_bits().to_le_bytes());
+        }
+        match self.uniform_light_grid.as_deref() {
+            None => hash = fnv1a64(hash, &[0]),
+            Some(grid) => {
+                hash = fnv1a64(hash, &[1]);
+                hash = fnv1a64(hash, &grid.columns.to_le_bytes());
+                hash = fnv1a64(hash, &grid.rows.to_le_bytes());
+                hash = fnv1a64(hash, &(grid.header.len() as u64).to_le_bytes());
+                for value in &grid.header {
+                    hash = fnv1a64(hash, &value.to_le_bytes());
+                }
+                for node in &grid.nodes {
+                    hash = fnv1a64(hash, &node.luminance.to_le_bytes());
+                    hash = fnv1a64(hash, &node.dx.to_le_bytes());
+                    hash = fnv1a64(hash, &node.dy.to_le_bytes());
+                }
+            }
+        }
+        Some(hash)
+    }
+}
+
 /// The ephemeral per-job inputs that are not document state.
 ///
-/// This is the sole owner of producer bytes. They belong to one render job and
-/// must never live on [`AdjustmentSet`], an undo identity or equality. Nothing
-/// wired today constructs one outside tests; when a render path does, it must
-/// pass it in [`RenderRequest::runtime`].
+/// This is the sole owner of producer bytes and of the rehydrated lens
+/// calibration. Both belong to one render job and must never live on
+/// [`AdjustmentSet`], an undo identity, equality or `document_fingerprint`.
+/// The real render path (`FileEngine` -> `RenderService`/`ExportService`) reads
+/// the calibration from its per-image entry and passes it explicitly into
+/// `mock::process`; there is no global or thread-local fallback.
 ///
-/// Today this is only the portrait producer bundle. Cancellation is
-/// intentionally not modelled here: no cancellation type exists yet, and
-/// inventing one now would be a guess. Model outputs, device handles, model
-/// version, device policy and algorithm version are also not represented; see
-/// the module status note. Keep this cheap to clone: the producer bundle is
-/// shared behind [`Arc`].
+/// Cancellation is intentionally not modelled here: no cancellation type exists
+/// yet, and inventing one now would be a guess. Model outputs, device handles,
+/// model version, device policy and algorithm version are also not represented;
+/// see the module status note. Keep this cheap to clone: the producer bundle is
+/// behind [`Arc`] and so is the light-falloff grid.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeInputs {
     pub producer_inputs: Option<Arc<ProducerInputs>>,
+    /// Rehydrated lens/geometry calibration. Crate-private because its curve
+    /// type is not publicly reachable; document identity never names it.
+    pub(crate) lens: LensRuntime,
 }
 
 impl RuntimeInputs {
     /// Wraps an optional producer bundle.
     pub fn new(producer_inputs: Option<Arc<ProducerInputs>>) -> Self {
-        Self { producer_inputs }
+        Self { producer_inputs, lens: LensRuntime::default() }
     }
 
     /// No runtime inputs; the same as `RuntimeInputs::default()`.
     pub fn none() -> Self {
-        Self { producer_inputs: None }
+        Self { producer_inputs: None, lens: LensRuntime::default() }
     }
 
-    /// Fingerprint of the producer inputs, or `None` when absent.
+    /// Builds a runtime context from calibration alone.
+    pub(crate) fn from_lens(lens: LensRuntime) -> Self {
+        Self { producer_inputs: None, lens }
+    }
+
+    /// Attaches calibration to this context, replacing any existing one.
+    pub(crate) fn with_lens(mut self, lens: LensRuntime) -> Self {
+        self.lens = lens;
+        self
+    }
+
+    /// The rehydrated calibration. Empty for sources without a lens profile.
+    pub(crate) fn lens(&self) -> &LensRuntime {
+        &self.lens
+    }
+
+    /// Fingerprint of all runtime inputs, or `None` when nothing is present.
     ///
-    /// Delegates to [`ProducerInputs::fingerprint`], which selects the fields
-    /// that affect rendered output. A render cache key must include **both**
-    /// this and [`document_fingerprint`] whenever producer inputs affect output;
-    /// including only one can serve a frame rendered with different masks, model
-    /// outputs or material planes.
+    /// Combines [`ProducerInputs::fingerprint`] with the calibration
+    /// fingerprint. A render cache key must include this alongside
+    /// [`document_fingerprint`] whenever runtime inputs affect output;
+    /// including only one can serve a frame rendered with different masks,
+    /// model outputs, material planes or lens calibration.
     pub fn fingerprint(&self) -> Option<u64> {
-        self.producer_inputs.as_deref().map(ProducerInputs::fingerprint)
+        let producer = self.producer_inputs.as_deref().map(ProducerInputs::fingerprint);
+        let lens = self.lens.fingerprint();
+        match (producer, lens) {
+            (None, None) => None,
+            (Some(producer), None) => Some(producer),
+            (None, Some(lens)) => Some(lens),
+            (Some(producer), Some(lens)) => {
+                let mut hash = FNV1A64_OFFSET_BASIS;
+                hash = fnv1a64(hash, &producer.to_le_bytes());
+                hash = fnv1a64(hash, &lens.to_le_bytes());
+                Some(hash)
+            }
+        }
     }
 
     /// True when no runtime input is present.
     pub fn is_empty(&self) -> bool {
-        self.producer_inputs.is_none()
+        self.producer_inputs.is_none() && self.lens.is_empty()
     }
 }
 

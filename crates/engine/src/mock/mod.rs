@@ -489,12 +489,16 @@ impl ImageEngine for MockEngine {
 
     fn sample_color(&self, image: ImageId, adjustments: &AdjustmentSet, point: [f32; 2]) -> anyhow::Result<[f32; 3]> {
         let src = self.source(image)?;
-        Ok(process::sample_point(&src, &crate::styles::resolve(adjustments), point))
+        // Procedural sources carry no lens calibration, so there is no runtime
+        // input to thread.
+        let runtime = crate::document::RuntimeInputs::none();
+        Ok(process::sample_point(&src, &crate::styles::resolve(adjustments), &runtime, point))
     }
 
     fn auto_adjust(&self, image: ImageId, current: &AdjustmentSet, target: AutoTarget) -> anyhow::Result<AutoResult> {
         let src = self.source(image)?;
-        let probe = process::render(&src, &AdjustmentSet { geometry: current.geometry.clone(), ..Default::default() }, NormRect::FULL, 256, false, None);
+        let runtime = crate::document::RuntimeInputs::none();
+        let probe = process::render_with_runtime(&src, &AdjustmentSet { geometry: current.geometry.clone(), ..Default::default() }, &runtime, NormRect::FULL, 256, false, None);
         let h = &probe.histogram;
         let total: u32 = h.luma.iter().sum();
         let mean = h.luma.iter().enumerate().map(|(i, c)| i as f32 * *c as f32).sum::<f32>() / total.max(1) as f32 / 255.0;
@@ -541,7 +545,8 @@ impl ImageEngine for MockEngine {
 
     fn pick_white_balance(&self, image: ImageId, point: [f32; 2]) -> anyhow::Result<(f32, f32)> {
         let src = self.source(image)?;
-        let c = process::sample_point(&src, &AdjustmentSet::default(), point);
+        let runtime = crate::document::RuntimeInputs::none();
+        let c = process::sample_point(&src, &AdjustmentSet::default(), &runtime, point);
         let warm = (c[0] - c[2]) / (c[0] + c[1] + c[2]).max(1e-3);
         let green = (c[1] - (c[0] + c[2]) / 2.0) / (c[0] + c[1] + c[2]).max(1e-3);
         Ok(((5600.0 - warm * 9000.0).clamp(2000.0, 15000.0), (green * 120.0).clamp(-50.0, 50.0)))

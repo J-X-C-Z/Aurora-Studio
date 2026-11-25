@@ -47,13 +47,11 @@ const RENDER_VERSION: u32 = 1;
 /// Everything that changes the rendered bytes. `generation` is deliberately
 /// absent: a redraw of the same content must hit.
 ///
-/// This key is **document-only**. Producer/runtime inputs are not fields of
-/// `AdjustmentSet` (they live in `crate::document::RuntimeInputs`), so they are
-/// not covered here. When a render path starts threading runtime inputs into
-/// previews, it MUST add them to this key (for example a
-/// `RuntimeInputs::fingerprint` field) in the same change; otherwise a frame
-/// rendered with different masks could be served from cache. No production path
-/// attaches producer inputs today, so the current omission is not a regression.
+/// The persistent document is covered by `params`; per-job runtime inputs
+/// (`crate::document::RuntimeInputs`: lens/geometry calibration and producer
+/// bytes) are covered by `runtime`. A render path that supplies runtime inputs
+/// must call [`PreviewKey::with_runtime`]; otherwise two frames with different
+/// calibration could share a cache entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewKey {
     build: u64,
@@ -65,12 +63,22 @@ pub(crate) struct PreviewKey {
     bypass: bool,
     mask_overlay: Option<u64>,
     fast: bool,
+    /// Fingerprint of the per-job runtime inputs (lens calibration, producer
+    /// bytes). `None` when the job supplied none.
+    runtime: Option<u64>,
 }
 
 impl PreviewKey {
     /// Separate frames made from different in-memory source resolutions.
     pub(crate) fn with_source(mut self, snapshot: u64) -> Self {
         self.source_snapshot = Some(snapshot);
+        self
+    }
+
+    /// Mix the runtime-input fingerprint into the key. A frame rendered with a
+    /// different lens calibration or producer bundle must not be served here.
+    pub(crate) fn with_runtime(mut self, fingerprint: Option<u64>) -> Self {
+        self.runtime = fingerprint;
         self
     }
 }
@@ -187,6 +195,7 @@ pub(crate) fn key(
         bypass,
         mask_overlay,
         fast,
+        runtime: None,
     }
 }
 

@@ -36,14 +36,22 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 standalone word `Plan` 命中（实测 10 passed / 1 failed）。随后同一组类型移到
 `crates/engine/src/render_plan_types.rs`，规则恢复 11/0；**没有削弱规则 8**。
 
+最新全量（2026-11-26，应用 `scripts/testdata-skips.txt` 的 106 个过滤器）：engine
+**1911 passed / 29 failed / 94 ignored / 105 filtered**（失败集与既有 29 项一致）；app
+**99 passed / 1 failed / 5 ignored**（既有 EIP fixture）。portrait 套件本轮未重跑。
+
 ## 已关闭（本轮并发/同步落地，不再作为任务）
 
 | ID | 事项 | 当前证据 | 观察结果 |
 |---|---|---|---|
 | G1 | 计划类型移出 `mock/process.rs` | `Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 在 `crates/engine/src/render_plan_types.rs:24/268/354/359/392`；`lib.rs:260` `pub(crate) mod render_plan_types;`；`mock/process.rs` 用 `use` 保持原名 | 规则 8 11/0；计划类型已在渲染计划层，不在 `processing`。验证：`cargo test -p aurora-engine --test architecture_rules --locked`。建议 lane：`crates/engine` |
-| G4 | `LibraryState` 提取 | `crates/app/src/state/library.rs:22`；`AppState.library` 在 `state/mod.rs:513`；字段 `images`/`selection`/`current`/`recent_imports`/`recent_captures`/`trash`/`active_collection`/`active_collection_name`/`annotations`/`custom_order`/`stacks`/`open_stacks` | app suite 96 passed / 1 failed / 5 ignored（同一 EIP fixture 失败）；`filter`/`sort`/`sort_desc`/`nodes` 仍在 `AppState`（见 G13） |
+| G4 | `LibraryState` 提取 | `crates/app/src/state/library.rs`；`AppState.library` 在 `state/mod.rs`；字段 `images`/`selection`/`current`/`recent_imports`/`recent_captures`/`trash`/`active_collection`/`active_collection_name`/`annotations`/`custom_order`/`stacks`/`open_stacks` | app suite 99 passed / 1 failed / 5 ignored（同一 EIP fixture 失败）；`filter`/`sort`/`sort_desc`/`nodes` 已随后由 G13 并入 |
 | G11 | `save_queue` 头注释与源码不一致 | `save_queue.rs:67` 现写 “this queue is the production save path”；`file_engine.rs:2141/3051/3072/3077` 接线；app `state/mod.rs:1203/1252`、`lib.rs:72` | 已修复，不再是缺口。验证：`cargo test -p aurora-engine --lib save_queue --locked` 与 `queued_save_tests`。建议 lane：`crates/engine` storage |
+| G5 | history/undo 纯状态转移 | `crates/app/src/state/editor.rs` 新增 `can_undo`/`can_redo`/`history_entries`/`undo_step`/`redo_step`/`jump_history_step`；`AppState` 保留同名薄协调层（`state/mod.rs`），顺序仍为 end_gesture → 状态转移 → after_commit → render/notify | 行为不变；`commit_invariant` 6、`state::editor::tests` 3 通过；app 99/1/5。建议 lane：`crates/app` |
+| G13 | `filter`/`sort`/`sort_desc`/`nodes` 分组 | 已移入 `crates/app/src/state/library.rs`（类型/可见性/default 不变）；只改写真正指向 `AppState` 的接收者，未动 `NodeGraph.nodes` 等同名无关字段 | workspace check exit 0；app 99/1/5；`state::render` 19 passed / 5 ignored。建议 lane：`crates/app` |
+| G10 | `write_atomic` 临时名与持久性 | `crates/engine/src/store.rs`：`.<file>.<pid>-<seq>.tmp` + `create_new` 重试，失败删除临时文件；新增 `write_atomic_durable`（Unix `sync_all` + 目录同步，best-effort，尚未接线）；批量保存仍明确非事务 | 新增 4 个测试（唯一临时名、8 线程同目标并发整块落盘、失败清理、durable 路径）；G10 当次 engine 1897/29/94/105（基线 1893 + 4）；最终全量见门禁快照；失败集不变，规则 11/0。Windows rename 与断电持久性未验证 |
 
+| G3 | 运行时几何字段迁入 `RuntimeInputs` | `document::LensRuntime` 持有 `distortion`/`optical_center`/`uniform_light_grid`；`LensCorrection`/`Geometry` 已删除这些字段；`FileEngine::runtime_inputs` 按图提供；`render_with_runtime`/`render16_with_runtime`/`render_at_with_runtime`/`sample_point` 显式接收；`PreviewKey::with_runtime` 与 `dust_frame_key` 混入镜头指纹 | engine **1911 passed / 29 failed / 94 ignored / 105 filtered**（失败集不变）；app 99/1/5；规则 11/0；`mock::process::tests` 116 passed。旧 `.portrait` 仍可读（字段原本 `serde(skip)`）。建议 lane：`crates/engine` |
 ## 待接手项
 
 全局约束（每项都适用）：
@@ -57,57 +65,23 @@ standalone word `Plan` 命中（实测 10 passed / 1 failed）。随后同一组
 
 ### G2 — 把 `render_sized`、layer 合成与 retouch 决策迁出 `mock`
 
+- 进展（2026-11-26）：
+  - **已迁出且已接线**：`clean_region` → `crates/engine/src/processing/sizing.rs`（`mock/process.rs` 现委托）；`luma_range_weight` → `crates/engine/src/processing/layer_weight.rs`（渲染器现委托）。两模块带自身单测，`cargo test -p aurora-engine --lib mock::process::tests` 116 passed。
+  - **已迁出、待接线**：`crates/engine/src/processing/retouch_stage.rs`（`retouch_plane`/`union_plane`/`apply_retouch`，含测试）；渲染器仍走本地实现，接线前必须先做字节对拍。
+  - **仍在 `mock/process.rs`**：`render_sized`、`layer_plans`、`cached_layer_weights`、`apply_layers`；`mock/retouch.rs` 仍未在 `mock/mod.rs` 声明。
 - 目标：纯 sizing/layer 权重/retouch 逻辑不再定义在 `mock/process.rs` 或孤儿文件里。
-- 触碰点（2026-11-25 快照）：`render_sized` `crates/engine/src/mock/process.rs:1764`；
-  `layer_plans` `:937`；`cached_layer_weights` `:959`；`apply_layers` `:3479`；
-  `crates/engine/src/mock/retouch.rs`（674 行，`mock/mod.rs` 未声明 `mod retouch`）。
+- 触碰点（2026-11-26 快照，行号会漂移，先 grep）：`render_sized` `mock/process.rs`；
+  `layer_plans`；`cached_layer_weights`；`apply_layers`；
+  `crates/engine/src/mock/retouch.rs`（674 行，未被 `mock/mod.rs` 声明）。
 - 验收：`render_sized`/layer 权重逻辑位于非 `mock` 模块并通过默认帧字节对拍；
   `retouch.rs` 要么被明确接线并有测试，要么作为 dead code 删除（先由 owner 裁决）。
-- 验证：`cargo test -p aurora-engine --lib mock::process --locked`；
+- 验证：`cargo test -p aurora-engine --lib mock::process::tests --locked`；
   `cargo test -p aurora-engine --lib processing:: --locked`；
   默认帧字节测试（`default_render_bytes_are_the_pre_patch_bytes`）；
   `cargo test -p aurora-engine --test architecture_rules --locked`。
-- 约束：先补 parity 测试再移动；不改混合顺序/像素；不把活跃 GPU 文件当机械搬迁对象。
+- 约束：先补 parity 测试再移动；不改混合顺序/像素；不把活跃 GPU 文件当机械搬迁对象；
+  不要把 `Plan`/`Source` 词汇放进 `processing/`（规则 8）。
 - 建议 lane：`crates/engine`（渲染/性能），与 backend-opt 协调。
-
-### G3 — 把运行时几何字段移出持久化 `AdjustmentSet`
-
-- 目标：`distortion`/`optical_center`/`uniform_light_grid` 只存在于运行时输入，不进入存档身份与相等性。
-- 触碰点：`LensCorrection.distortion` `crates/engine/src/adjust.rs:1578`；
-  `uniform_light_grid` `:1590`；`Geometry.distortion` `:1865`；`Geometry.optical_center`
-  `:1868`；`PartialEq` 已排除（`:75-80`、`:1628`、`:1871`）；`RuntimeInputs` 目前只有
-  `producer_inputs`（`crates/engine/src/document.rs:206-207`）。
-- 验收：字段从 `AdjustmentSet` 删除并由 `RuntimeInputs` 唯一持有；`RenderRequest.runtime`
-  消费；预览缓存 key 混入 `RuntimeInputs::fingerprint` 或来源身份；存档 schema 仍可读。
-- 验证：`cargo test -p aurora-engine --lib runtime_identity_tests --locked`；
-  `cargo test -p aurora-engine --lib document:: --locked`；
-  `cargo test -p aurora-engine --lib preview_cache --locked`；
-  `cargo test -p aurora-engine --lib adjust:: --locked`。
-- 约束：先确认渲染路径显式接收运行时输入，再删字段；旧 `.portrait` 文件必须可读。
-- 建议 lane：`crates/engine`（document/render）。
-
-### G5 — 把 history/undo 命名操作移出 `AppState`（并处理 G13 的库字段）
-
-- 目标：undo/redo/history 的纯状态转移有独立归属；`AppState` 只协调渲染/保存回调。
-- 触碰点：`can_undo` `crates/app/src/state/mod.rs:1044`；`history` `:1052`；
-  `undo` `:1262`；`undo_inner` `:1267`；`redo` `:1282`；`redo_inner` `:1287`；
-  `jump_history` `:1323`；undo/redo 栈在 `crates/app/src/state/editor.rs:15-24`。
-- 验收：命名操作委托给独立 helper；gesture 仍是一步 undo/一次保存；行为与现在一致。
-- 验证：`cargo test -p portrait-app --lib commit_invariant --locked`；
-  `cargo test -p portrait-app --lib task_center --locked`；
-  `cargo test -p portrait-app --lib state::render --locked`；
-  `cargo test -p portrait-app --lib --locked`（记录既有 EIP fixture 失败）。
-- 约束：改 UI 行为需单独 patch；app 只经 `ImageEngine`。
-- 建议 lane：`crates/app`（frontend patch）。
-
-### G13 — `AppState` 的 `filter`/`sort`/`sort_desc`/`nodes` 仍未分组
-
-- 目标：浏览器过滤/排序/collection 树归入 `LibraryState` 或独立 `BrowserState`。
-- 触碰点：`crates/app/src/state/mod.rs:514-517`；`LibraryState` 在
-  `crates/app/src/state/library.rs:22`。
-- 验收：字段迁移后 UI 读取路径不变，selection/current 不变量测试通过。
-- 验证：`cargo test -p portrait-app --lib --locked`；`state::render`、commit invariants。
-- 建议 lane：`crates/app`（frontend patch）。
 
 ### G6 — Windows 原生、GPU 真机与 ONNX Runtime 未验证
 
@@ -144,17 +118,6 @@ standalone word `Plan` 命中（实测 10 passed / 1 failed）。随后同一组
 - 约束：不改 `crates/engine/testdata/` 外部资产、不把资产提交 Git；不把失败写成通过。
 - 建议 lane：infra / owner（资产授权）。
 
-### G10 — `write_atomic` 不是事务
-
-- 目标：同目标并发写不再共用固定临时名；可选持久性增强。
-- 触碰点：`crates/engine/src/store.rs:599-605`（固定 `<file>.tmp`、`fs::write`、`fs::rename`；
-  无 `fsync`/目录同步）。
-- 验收：临时名含 PID/序号；同目录并发写不互相覆盖；单文件 rename 原子语义保留；
-  批量仍明确“非事务”。
-- 验证：`cargo test -p aurora-engine --lib store --locked`；新增并发同目标写测试。
-- 约束：Windows rename 语义需真机核对；不声称断电持久性除非有 fsync 证据。
-- 建议 lane：`crates/engine`（storage）。
-
 ### G12 — 公共面仍暴露内部类型
 
 - 目标：公共 API 与内部实现分离，trait 领域方法可评审。
@@ -187,10 +150,9 @@ standalone word `Plan` 命中（实测 10 passed / 1 failed）。随后同一组
    测试作前提；先做收益最高，但必须先让渲染路径显式接收运行时输入。
 2. **G2（`render_sized`/layer/retouch）**：机械迁移依赖 G3 的边界稳定；retouch
    先做 dead/alive 裁决。
-3. **G5 + G13（app history / 库排序字段）**：纯 app 侧，行为保持，风险低；放在
-   引擎边界稳定之后，避免 app patch 与引擎 patch 交叉。
-4. **G10、G12（storage 临时名、公共面收窄）**：小而独立，可并行；G10 需 Windows
-   rename 真机核对。
+3. **G5 + G13（app history / 库排序字段）**：已完成（app 99/1/5）。
+4. **G12（公共面收窄）**：小而独立；G10（storage 临时名）已完成，仅 Windows
+   rename 真机核对未验证。
 5. **G6/G7/G9：blocked / unverifiable / needs-owner**。G6/G7 缺 Windows 真机、GPU 与
    Metal；G9 必须 owner 裁决。没有证据前只能保持 Unverified，不能写成通过。
 6. **G8**：与 G6 一并由 infra/owner 处理；默认 CI 保持 synthetic，外部 fixture

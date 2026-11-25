@@ -155,3 +155,23 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 5. native RAW 取源移入 worker 并计入 scheduler；`keystone.rs` 0.35 换算重推导。
 6. Windows 真机验证构建/GPU/导出；Mac Agent 替换 jxl/heif/ORT 并验证 Metal；补外部 fixture 或显式 `#[ignore]`。
 7. 许可证与 `00_admin` ownership 文档由仓库所有者裁决/补齐。
+
+
+## 2026-11-26 追加：G3/G5/G10/G13 落地
+
+- **G3 运行时几何字段**：`Geometry.distortion`/`optical_center`、`LensCorrection.uniform_light_grid`
+  已从 `AdjustmentSet` 删除，由 `document::LensRuntime` 经 `RuntimeInputs` 持有；
+  `FileEngine::runtime_inputs(image)` 提供，`render_with_runtime`/`render16_with_runtime`/
+  `render_at_with_runtime`/`sample_point` 显式接收；`PreviewKey::with_runtime` 与
+  `dust_frame_key` 混入镜头指纹；旧 `.portrait` 仍可读（字段原本 `serde(skip)`）。
+- **G5/G13 app 状态**：history/undo 纯状态转移进 `EditorState`；`filter/sort/sort_desc/nodes`
+  进 `LibraryState`；app **99 passed / 1 failed / 5 ignored**（既有 EIP fixture）。
+- **G10 `write_atomic`**：唯一临时名（pid+序号）、失败清理、可选 `write_atomic_durable`
+  （Unix fsync + 目录同步，未接线）；新增 4 个并发/失败测试。Windows rename 与断电持久性未验证。
+- **G2 部分**：`clean_region`、`luma_range_weight` 已落 `processing/{sizing,layer_weight}.rs`
+  并由渲染器委托；`retouch_stage.rs` 已迁移但尚未接线；`render_sized`/layer/retouch 仍在 `mock`。
+- **G12** 审计未完成（lane 中断），公共面未收窄。
+
+最新全量（macOS arm64）：engine **1911 passed / 29 failed / 94 ignored / 105 filtered**（失败集不变）；
+app **99 / 1 / 5**；architecture rules **11 passed / 0 failed**；`cargo check --workspace
+--all-targets --locked` exit 0。Windows/GPU/Metal/性能与外部 fixture 仍为未验证。

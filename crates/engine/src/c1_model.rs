@@ -296,20 +296,42 @@ pub fn parse_curve(raw: &str) -> Vec<(f32, f32)> {
     out
 }
 
-/// Wire `ZLENSDISTORTION` into the geometry stage.
+/// Wire `ZLENSDISTORTION` into the runtime lens calibration.
 ///
 /// `pitch` is `IC_SensorGeometry.rawPixelWidth/rawPixelHeight` in micrometres
 /// per pixel, so the curve lands in source pixels — the frame `FrameMap` maps
 /// through. The four catalog disable paths leave `distortion` empty, which
-/// keeps the geometry stage on its identity radial path.
-pub fn apply_lens_distortion(geometry: &mut crate::Geometry, lens: &C1Lens, pitch: [f32; 2]) {
-    geometry.distortion = crop_limit::RadialCurve::from_row(
+/// keeps the geometry stage on its identity radial path. This calibration is
+/// runtime input, not document state: it never enters `AdjustmentSet`,
+/// equality or a saved `.portrait`.
+pub(crate) fn apply_lens_distortion(
+    runtime: &mut crate::document::LensRuntime,
+    lens: &C1Lens,
+    pitch: [f32; 2],
+) {
+    runtime.distortion = crop_limit::RadialCurve::from_row(
         lens.distortion.points(),
         lens.distortion.param(0).unwrap_or(0.0),
         lens.distortion.param(1).unwrap_or(0.0) != 0.0,
         pitch,
     );
-    geometry.optical_center = lens.optic_center;
+    runtime.optical_center = lens.optic_center;
+}
+
+/// The runtime lens calibration implied by a catalog row.
+///
+/// Only the optical centre is known before the sensor pitch is attached; the
+/// radial curve stays empty, exactly as `to_adjustment_set` left it. Capture One
+/// callers use this to seed `document::RuntimeInputs` instead of writing these
+/// values back into the document.
+pub(crate) fn lens_runtime_from_settings(
+    s: &C1VariantSettings,
+) -> crate::document::LensRuntime {
+    crate::document::LensRuntime {
+        distortion: crop_limit::RadialCurve::default(),
+        optical_center: s.lens.optic_center,
+        uniform_light_grid: None,
+    }
 }
 
 /// Parses a pipe-separated lens profile. Fields that hold `x,y` pairs become
@@ -1539,7 +1561,6 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         light_falloff: clamp(s.lens.light_falloff.param(0).unwrap_or(0.0), 0.0, 100.0),
         uniform_light: clamp(s.lens.lcc_light_falloff_amount, 0.0, 120.0),
         uniform_light_enabled: s.lens.lcc_light_falloff,
-        uniform_light_grid: None,
         dust_removal_enabled: s.lens.dust_removal,
         // The LCC file itself carries the patches; without a catalog-side
         // attachment this stays empty and the stage is inert.
@@ -1628,10 +1649,6 @@ pub fn to_adjustment_set(s: &C1VariantSettings) -> crate::AdjustmentSet {
         portrait: false,
         keystone,
         crop: NormRect::FULL,
-        // The radial curve needs the sensor pitch, so it is attached where the
-        // capture geometry is known (`apply_lens_distortion`).
-        distortion: crop_limit::RadialCurve::default(),
-        optical_center: s.lens.optic_center,
     };
     set.geometry.crop = crop_on_canvas_with_clipping(s.crop_px, &set.geometry, None, s.geometry_canvas_clipping);
 
@@ -2713,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn real_dsc5673_lens_wires_into_the_geometry_stage() {
+    fn real_dsc5673_lens_wires_into_the_runtime_calibration() {
         let settings = from_layer_row(&row(&[
             (
                 "ZLENSDISTORTION",
@@ -2726,13 +2743,17 @@ mod tests {
             ("ZLENSOPTICCENTER", Some("3067.851562|1920.515625")),
         ]));
         assert_eq!(settings.lens.optic_center, [3067.851_562, 1920.515_625]);
-        let mut geometry = to_adjustment_set(&settings).geometry;
-        assert!(geometry.distortion.is_empty(), "the catalog alone has no pixel pitch");
-        apply_lens_distortion(&mut geometry, &settings.lens, [5.935_846_3, 5.927_579_4]);
-        assert_eq!(geometry.optical_center, [3067.851_562, 1920.515_625]);
-        assert_eq!(geometry.distortion.v.len(), 8);
-        assert_eq!(geometry.distortion.v[7].to_bits(), 0x40af454ee0000000);
-        assert_eq!(geometry.distortion.x[7].to_bits(), 0x40af76bce0000000);
+        // The document carries no calibration: neither the curve nor the centre.
+        let geometry = to_adjustment_set(&settings).geometry;
+        let runtime_json = serde_json::to_string(&geometry).unwrap();
+        assert!(!runtime_json.contains("distortion") && !runtime_json.contains("optical_center"));
+        let mut runtime = lens_runtime_from_settings(&settings);
+        assert!(runtime.distortion.is_empty(), "the catalog alone has no pixel pitch");
+        apply_lens_distortion(&mut runtime, &settings.lens, [5.935_846_3, 5.927_579_4]);
+        assert_eq!(runtime.optical_center, [3067.851_562, 1920.515_625]);
+        assert_eq!(runtime.distortion.v.len(), 8);
+        assert_eq!(runtime.distortion.v[7].to_bits(), 0x40af454ee0000000);
+        assert_eq!(runtime.distortion.x[7].to_bits(), 0x40af76bce0000000);
     }
 
     #[test]

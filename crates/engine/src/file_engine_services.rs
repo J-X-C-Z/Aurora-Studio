@@ -344,9 +344,11 @@ impl<'a> RenderService<'a> {
     ) -> anyhow::Result<RgbaImage> {
         // Thumbnails queue behind the visible preview on the decode gate.
         let src = self.engine.source_with_priority(image, DecodePriority::Thumbnail)?;
-        let out = process::render(
+        let runtime = self.engine.runtime_inputs(image);
+        let out = process::render_with_runtime(
             &src,
             &crate::styles::resolve(adjustments),
+            &runtime,
             NormRect::FULL,
             max_size,
             false,
@@ -420,8 +422,10 @@ impl<'a> RenderService<'a> {
             Some(native) => (native, "native_raw"),
             None => (engine.source(request.image)?, "source"),
         };
+        let runtime = engine.runtime_inputs(request.image);
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
-            .with_source(src.snapshot_id());
+            .with_source(src.snapshot_id())
+            .with_runtime(runtime.fingerprint());
         let (rendering, intent_note) = crate::engine::request_rendering(request);
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let hit = engine.state.lock().preview.get(key);
@@ -449,7 +453,7 @@ impl<'a> RenderService<'a> {
                 gamut_warning,
             });
         }
-        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let out = process::render_at_with_runtime(&src, &adj, &runtime, request.region, max, request.bypass, request.mask_overlay, fast);
         let frame = CachedFrame {
             width: out.width,
             height: out.height,
@@ -979,6 +983,10 @@ impl<'a> ExportService<'a> {
         let registry = engine.export_jobs.clone();
         let job_ids = Arc::clone(&engine.export_job_ids);
         let outputs = Arc::clone(&engine.export_outputs);
+        // Runtime calibration is captured before the worker starts: the worker
+        // must not read engine state after admission (the job may outlive the
+        // caller's borrow).
+        let runtime = engine.runtime_inputs(job.image);
         std::thread::spawn(move || {
             let is_cancelled = || token.is_cancelled();
             let Some(_export_permit) =
@@ -1021,9 +1029,10 @@ impl<'a> ExportService<'a> {
                     // first) is intentionally ignored; progress is cosmetic and
                     // must never overwrite a terminal state.
                     if recipe.bit_depth == 16 {
-                        let out = process::render16(
+                        let out = process::render16_with_runtime(
                             &src,
                             &adjustments,
+                            &runtime,
                             NormRect::FULL,
                             max_size,
                             false,
@@ -1043,9 +1052,10 @@ impl<'a> ExportService<'a> {
                             },
                         )
                     } else {
-                        let out = process::render(
+                        let out = process::render_with_runtime(
                             &src,
                             &adjustments,
+                            &runtime,
                             NormRect::FULL,
                             max_size,
                             false,
@@ -1941,10 +1951,12 @@ impl<'a> ImportService<'a> {
             }
             // C1 keeps per-image settings in a `.cos` sidecar; apply it when
             // neither our store nor this process has edits for the path.
+            let mut runtime = crate::document::RuntimeInputs::none();
             if adjustments.is_default() && st.catalog.entry(rel_path).is_none() {
-                if let Some(cos) = scanned.c1_adjustments() {
+                if let Some((cos, cos_runtime)) = scanned.c1_adjustments() {
                     from_cos.push((scanned.rel_path.clone(), cos.clone()));
                     adjustments = cos;
+                    runtime = cos_runtime;
                 }
             }
             let mut rating = stored.map(|s| s.1).unwrap_or(0);
@@ -1987,6 +1999,7 @@ impl<'a> ImportService<'a> {
                 path: scanned.path,
                 rel_path: scanned.rel_path,
                 adjustments,
+                runtime,
             });
         }
         // Drop every cached resource whose id is no longer in the library.
@@ -2066,13 +2079,17 @@ impl<'a> ImportService<'a> {
             if st.entries.iter().any(|entry| entry.rel_path == scanned.rel_path) {
                 continue;
             }
-            let adjustments = if scanned.packed.is_some() {
+            let (adjustments, runtime) = if scanned.packed.is_some() {
                 let saved = engine.store.as_ref().map(|store| store.load_adjustments(&scanned.rel_path));
                 match saved {
                     Some(Ok(saved))
-                        if !saved.is_default() || st.catalog.entry(&scanned.rel_path).is_some() => saved,
-                    Some(Ok(_)) => {
-                        let adjustments = scanned.c1_adjustments().unwrap_or_default();
+                        if !saved.is_default() || st.catalog.entry(&scanned.rel_path).is_some() => {
+                        (saved, crate::document::RuntimeInputs::none())
+                    }
+                    _ => {
+                        let (adjustments, runtime) = scanned
+                            .c1_adjustments()
+                            .unwrap_or_else(|| (AdjustmentSet::default(), crate::document::RuntimeInputs::none()));
                         if !adjustments.is_default() {
                             if let Some(store) = &engine.store {
                                 if let Err(err) = store.save_adjustments(&scanned.rel_path, &adjustments) {
@@ -2080,12 +2097,11 @@ impl<'a> ImportService<'a> {
                                 }
                             }
                         }
-                        adjustments
+                        (adjustments, runtime)
                     }
-                    _ => scanned.c1_adjustments().unwrap_or_default(),
                 }
             } else {
-                AdjustmentSet::default()
+                (AdjustmentSet::default(), crate::document::RuntimeInputs::none())
             };
             let id = ImageId(st.next_id);
             st.next_id += 1;
@@ -2114,6 +2130,7 @@ impl<'a> ImportService<'a> {
                 path: scanned.path,
                 rel_path: scanned.rel_path,
                 adjustments,
+                runtime,
             });
         }
         Ok(added)

@@ -511,10 +511,6 @@ pub struct AppState {
     pub engine: Arc<dyn ImageEngine>,
     /// The catalog's images, selection, current image and browser arrangement.
     pub library: LibraryState,
-    pub nodes: Vec<CollNode>,
-    pub filter: Filter,
-    pub sort: SortKey,
-    pub sort_desc: bool,
     /// Per-image edits with undo history, and the editor's own selection.
     pub editor: EditorState,
     pub tool_tab: ToolTab,
@@ -623,26 +619,24 @@ impl AppState {
         let camera_settings = engine.camera_settings();
         let engine_name = engine.name();
         let capabilities = crate::planned::capabilities(engine.as_ref());
+        let collection_nodes = collections::flatten(engine.as_ref(), &engine.collections());
         let mut this = Self {
             styles: engine.styles(),
             icc_profiles: engine.icc_profiles(),
             icc_group: settings.icc_group.min(3) as usize,
             icc_query: String::new(),
             lens_profiles: engine.lens_profiles(),
-            nodes: collections::flatten(engine.as_ref(), &engine.collections()),
             ai_unavailable: HashSet::new(),
             eyes: HashMap::new(),
             thumb_failed: HashSet::new(),
             engine,
             library: LibraryState {
                 images,
+                nodes: collection_nodes,
                 selection: current.into_iter().collect(),
                 current,
                 ..LibraryState::default()
             },
-            filter: Filter::default(),
-            sort: SortKey::Name,
-            sort_desc: false,
             editor: EditorState::with_edits(edits),
             tool_tab: tab_from(&settings.workspace.tab).unwrap_or(ToolTab::Grading),
             cursor: CursorTool::Select,
@@ -696,7 +690,7 @@ impl AppState {
 
     /// Images passing the filter, in sort order.
     pub fn visible_images(&self) -> Vec<&ImageInfo> {
-        let f = &self.filter;
+        let f = &self.library.filter;
         let search = f.search.to_lowercase();
         let in_trash = self.node(self.library.active_collection).is_some_and(|n| n.kind == CollectionKind::Trash);
         let members = self.members(self.library.active_collection);
@@ -714,7 +708,7 @@ impl AppState {
                     || i.keywords.iter().any(|k| k.contains(&search))
             })
             .collect();
-        match self.sort {
+        match self.library.sort {
             SortKey::Name => out.sort_by(|a, b| a.file_name.cmp(&b.file_name)),
             SortKey::CaptureDate => out.sort_by(|a, b| a.exif.captured_at.cmp(&b.exif.captured_at)),
             SortKey::Rating => out.sort_by(|a, b| b.rating.cmp(&a.rating)),
@@ -722,7 +716,7 @@ impl AppState {
             SortKey::FileSize => out.sort_by_key(|i| i.file_size),
             SortKey::Custom => out.sort_by_key(|i| (self.custom_rank(i.id), i.file_name.clone())),
         }
-        if self.sort_desc {
+        if self.library.sort_desc {
             out.reverse();
         }
         self.fold_stacks(out)
@@ -1042,18 +1036,15 @@ impl AppState {
     }
 
     pub fn can_undo(&self) -> bool {
-        self.library.current.and_then(|id| self.editor.edit_for(id)).is_some_and(|e| !e.undo.is_empty())
+        self.library.current.is_some_and(|id| self.editor.can_undo(id))
     }
 
     pub fn can_redo(&self) -> bool {
-        self.library.current.and_then(|id| self.editor.edit_for(id)).is_some_and(|e| !e.redo.is_empty())
+        self.library.current.is_some_and(|id| self.editor.can_redo(id))
     }
 
     pub fn history(&self) -> (Vec<SharedString>, Vec<SharedString>) {
-        self.library.current
-            .and_then(|id| self.editor.edit_for(id))
-            .map(|e| (e.undo.iter().map(|u| u.0.clone()).collect(), e.redo.iter().map(|u| u.0.clone()).collect()))
-            .unwrap_or_default()
+        self.library.current.map(|id| self.editor.history_entries(id)).unwrap_or_default()
     }
 
     /// Applies a change while a control is being dragged. The first call of a gesture
@@ -1267,15 +1258,11 @@ impl AppState {
     fn undo_inner(&mut self, mut cx: Option<&mut Context<Self>>) {
         self.end_gesture_inner(cx.as_deref_mut());
         let Some(id) = self.library.current else { return };
-        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
-        if let Some((label, prev)) = edit.undo.pop() {
-            let now = std::mem::replace(&mut edit.adj, prev);
-            edit.redo.push((label.clone(), now));
-            self.after_commit_inner(id, cx.as_deref_mut());
-            if let Some(cx) = cx {
-                self.request_render(RenderQuality::Final, cx);
-                self.notify(format!("{} {label}", t("Undo", "撤销")), cx);
-            }
+        let Some(label) = self.editor.undo_step(id) else { return };
+        self.after_commit_inner(id, cx.as_deref_mut());
+        if let Some(cx) = cx {
+            self.request_render(RenderQuality::Final, cx);
+            self.notify(format!("{} {label}", t("Undo", "撤销")), cx);
         }
     }
 
@@ -1287,15 +1274,11 @@ impl AppState {
     fn redo_inner(&mut self, mut cx: Option<&mut Context<Self>>) {
         self.end_gesture_inner(cx.as_deref_mut());
         let Some(id) = self.library.current else { return };
-        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
-        if let Some((label, next)) = edit.redo.pop() {
-            let now = std::mem::replace(&mut edit.adj, next);
-            edit.undo.push((label.clone(), now));
-            self.after_commit_inner(id, cx.as_deref_mut());
-            if let Some(cx) = cx {
-                self.request_render(RenderQuality::Final, cx);
-                self.notify(format!("{} {label}", t("Redo", "重做")), cx);
-            }
+        let Some(label) = self.editor.redo_step(id) else { return };
+        self.after_commit_inner(id, cx.as_deref_mut());
+        if let Some(cx) = cx {
+            self.request_render(RenderQuality::Final, cx);
+            self.notify(format!("{} {label}", t("Redo", "重做")), cx);
         }
     }
 
@@ -1323,16 +1306,8 @@ impl AppState {
     pub fn jump_history(&mut self, undo_len: usize, cx: &mut Context<Self>) {
         self.end_gesture(cx);
         let Some(id) = self.library.current else { return };
-        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
-        while edit.undo.len() > undo_len {
-            let Some((label, prev)) = edit.undo.pop() else { break };
-            let now = std::mem::replace(&mut edit.adj, prev);
-            edit.redo.push((label, now));
-        }
-        while edit.undo.len() < undo_len {
-            let Some((label, next)) = edit.redo.pop() else { break };
-            let now = std::mem::replace(&mut edit.adj, next);
-            edit.undo.push((label, now));
+        if !self.editor.jump_history_step(id, undo_len) {
+            return;
         }
         self.after_commit(id, cx);
         self.request_render(RenderQuality::Final, cx);
@@ -1891,11 +1866,11 @@ impl AppState {
     }
 
     pub fn filter_active(&self) -> bool {
-        self.filter != Filter::default()
+        self.library.filter != Filter::default()
     }
 
     pub fn clear_filter(&mut self, cx: &mut Context<Self>) {
-        self.filter = Filter::default();
+        self.library.filter = Filter::default();
         cx.notify();
     }
 

@@ -2335,35 +2335,24 @@ mod tests {
     fn uniform_light_stays_in_the_develop_stage_and_does_not_force_cpu() {
         // ColorNoise2012 defaults to 50 and runs on the CPU, which also takes
         // lens off the GPU; zero it so the plan reports the lens route alone.
-        let mut lens = LensCorrection {
+        let lens = LensCorrection {
             uniform_light_enabled: true,
             uniform_light: 100.0,
             ..Default::default()
         };
-        let mut adj = crate::AdjustmentSet {
+        let adj = crate::AdjustmentSet {
             noise_reduction: NoiseReduction { color: 0.0, ..Default::default() },
-            lens: lens.clone(),
+            lens,
             ..Default::default()
         };
         let plan = detail_plan(&adj, true);
         assert!(plan.gpu_lens, "a gate on without a grid still renders on the GPU");
         assert!(!plan.cpu_lens);
 
-        lens.uniform_light_grid = Some(std::sync::Arc::new(crate::dust_lcc::LightFalloff {
-            header: vec![16, 0, 2, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0],
-            columns: 2,
-            rows: 2,
-            nodes: vec![
-                crate::dust_lcc::LightFalloffNode { luminance: 0, dx: 0, dy: 0 },
-                crate::dust_lcc::LightFalloffNode { luminance: 8192, dx: 0, dy: 0 },
-                crate::dust_lcc::LightFalloffNode { luminance: 8192, dx: 0, dy: 0 },
-                crate::dust_lcc::LightFalloffNode { luminance: 16384, dx: 0, dy: 0 },
-            ],
-        }));
-        adj.lens = lens;
-        let plan = detail_plan(&adj, true);
-        assert!(plan.gpu_lens, "the grid is consumed in develop, not in detail");
-        assert!(!plan.cpu_lens);
+        // The `.lcc` grid is runtime calibration (`document::RuntimeInputs`),
+        // so it cannot change the detail-stage routing: the grid is consumed in
+        // develop, not in detail. The assertion above is therefore the whole
+        // contract this test pins.
     }
 
     #[test]

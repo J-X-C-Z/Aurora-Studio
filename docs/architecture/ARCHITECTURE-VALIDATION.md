@@ -63,8 +63,11 @@
 | HEIF 读取器（macOS） | `cargo test -p aurora-engine --lib heif` | **27 passed / 1 ignored**（真实 libheif 1.23.7；3 个回归修复） |
 | 迁移：color | `cargo test -p aurora-engine --lib mock::process` | **122 passed / 10 ignored**；21 个原语迁移，函数体对比一致 |
 | 迁移：tone/statistics | 同上 + HDR/dehaze/histogram 对拍 | tone 9 项、statistics 6 项迁移；`mock::process` 122 passed；`parallel_histogram...` 等通过 |
-| 运行时字段身份 | `cargo test -p aurora-engine --lib runtime_identity_tests` | **2 passed**；LCC grid / distortion / optical_center 不再影响文档相等性 |
-| FileEngine 服务 | 全量 suite + source/preview/export/merge/save/inference/capture/import/library 定向测试 | Catalog/Source/Render/Export/Merge/Persistence/Inference/Capture/Import/Library 全部拆出；**1893 passed / 29 failed**，失败集不变 |
+| 运行时字段身份 | `cargo test -p aurora-engine --lib runtime_identity_tests` | **3 passed**；LCC grid / distortion / optical_center 不再影响文档相等性 |
+| 运行时字段迁移（G3） | `cargo test -p aurora-engine --lib document:: adjust:: processing::frame_map preview_cache`；`mock::process::tests` | 字段已从 `AdjustmentSet` 删除，由 `document::LensRuntime` 持有并经 `render_with_runtime`/`sample_point` 显式传入；`PreviewKey::with_runtime`/`dust_frame_key` 混入指纹；document 11、frame_map 33、preview_cache 9、process 116 passed；adjust 仅既有 NEF fixture 1 failed |
+| App 状态分组（G5/G13） | `cargo test -p portrait-app --lib` | **99 passed / 1 failed / 5 ignored**（既有 EIP fixture）；history/undo 纯状态转移 + `LibraryState` 浏览器字段 |
+| 原子写临时名（G10） | `cargo test -p aurora-engine --lib store::tests` | **34 passed / 1 ignored**；唯一临时名、8 线程同目标并发、失败清理、durable 路径 |
+| FileEngine 服务 | 全量 suite + source/preview/export/merge/save/inference/capture/import/library 定向测试 | Catalog/Source/Render/Export/Merge/Persistence/Inference/Capture/Import/Library 全部拆出；**1911 passed / 29 failed**（2026-11-26 全量），失败集不变 |
 | 迁移：frame_map | `cargo test -p aurora-engine --lib frame_map` | **33 passed**；`mock::geometry` 兼容别名；规则 8 通过 |
 | Z6III 平台分层 | `cargo test -p aurora-engine --lib aurora_raw` | **83 passed / 13 ignored**（中性算法在 macOS 编译/测试；Windows/OpenCL 仍 gate） |
 | 迁移：color helpers | `mock::process` + `color_editor_*` | 6 个纯色彩 helper 迁移，字节一致 |
@@ -78,10 +81,10 @@
 
 ## 3. 既有测试套件（本机、原生链接）
 
-### 3.1 `aurora-engine --lib`（状态：Verified locally，既有运行；本轮未重跑）
+### 3.1 `aurora-engine --lib`（状态：Verified locally，2026-11-26 重跑）
 
 - 不加过滤：**1749 passed / 136 failed / 83 ignored**。
-- 应用 `scripts/testdata-skips.txt` 的 106 个过滤器：**1893 passed / 29 failed / 94 ignored / 105 filtered**。
+- 应用 `scripts/testdata-skips.txt` 的 106 个过滤器：**1911 passed / 29 failed / 94 ignored / 105 filtered**（2026-11-26；较 1893 增加 18 个新测试，失败集不变）。
 - 剩余 **29** 个失败按原因分类（均为本机环境或既有问题，不在本轮改动路径；表内合计 15+7+3+0+2+2=29）：
 
 | 类别 | 数量 | 例子 | 是否本轮引入 |

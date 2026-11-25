@@ -76,10 +76,9 @@ impl PartialEq for AdjustmentSet {
     fn eq(&self, other: &Self) -> bool {
         // Every persistent field participates. Per-job runtime inputs are not
         // fields of this struct: they live in `crate::document::RuntimeInputs`.
-        // `uniform_light_grid`, `Geometry::distortion` and
-        // `Geometry::optical_center` are `#[serde(skip)]`, but they are still
-        // compared here to keep this change minimal; migrating them out of the
-        // document struct is the next extraction step.
+        // Rehydrated lens calibration used to be `#[serde(skip)]` here; it now
+        // lives in `RuntimeInputs`, so there is no runtime-only field left to
+        // exclude from this comparison.
         self.base == other.base
             && self.white_balance == other.white_balance
             && self.exposure == other.exposure
@@ -1585,9 +1584,9 @@ pub struct LensCorrection {
     pub uniform_light: f32,
     /// `ZLENSLCCLIGHTFALLOFF` gates `uniform_light`; off leaves the frame alone.
     pub uniform_light_enabled: bool,
-    /// Rehydrated from the Capture One calibration sidecar.
-    #[serde(skip)]
-    pub uniform_light_grid: Option<std::sync::Arc<crate::dust_lcc::LightFalloff>>,
+    // The `.lcc` uniform-light grid is rehydrated calibration. It lives in
+    // `crate::document::RuntimeInputs` (see `LensRuntime`), never here, so it
+    // cannot enter equality, `document_fingerprint` or a saved file.
     /// `ZLENSDUSTREMOVALENABLED`: apply the LCC dust patches.
     pub dust_removal_enabled: bool,
     /// Rectangles read from the LCC's `SpotRemoval.SpotData`.
@@ -1626,9 +1625,10 @@ pub struct LensCorrection {
 }
 
 impl PartialEq for LensCorrection {
-    /// Document identity: every persisted field participates; the
-    /// sidecar-rehydrated `uniform_light_grid` is runtime calibration data and
-    /// is excluded so two documents with the same stored edits compare equal.
+    /// Document identity: every persisted field participates. The `.lcc`
+    /// uniform-light grid is runtime calibration and now lives in
+    /// `document::RuntimeInputs`, so there is nothing runtime-only left to
+    /// exclude here.
     fn eq(&self, other: &Self) -> bool {
         self.profile == other.profile
             && self.use_profile == other.use_profile
@@ -1688,7 +1688,6 @@ impl Default for LensCorrection {
             light_falloff: 0.0,
             uniform_light: 0.0,
             uniform_light_enabled: false,
-            uniform_light_grid: None,
             dust_removal_enabled: false,
             dust_patches: Vec::new(),
             dust_gain: Vec::new(),
@@ -1857,21 +1856,16 @@ pub struct Geometry {
     pub aspect: AspectRatio,
     pub portrait: bool,
     pub keystone: Keystone,
-    /// `ZLENSDISTORTION`: the real radial curve in source pixels. An empty
-    /// curve keeps the geometry stage on its old identity path byte for byte.
-    /// Derived from the catalog plus the capture's pixel pitch, so it is not
-    /// serialized.
-    #[serde(skip)]
-    pub distortion: crate::c1_model::crop_limit::RadialCurve,
-    /// `ZLENSOPTICCENTER` in source pixels; only read when `distortion` is set.
-    #[serde(skip)]
-    pub optical_center: [f32; 2],
+    // `ZLENSDISTORTION` (`distortion`) and `ZLENSOPTICCENTER`
+    // (`optical_center`) are rehydrated lens calibration in source pixels. They
+    // now live in `crate::document::RuntimeInputs` (see `LensRuntime`), so the
+    // document keeps only persisted crop/rotation/keystone state.
 }
 
 impl PartialEq for Geometry {
-    /// Document identity: the persisted crop/rotation/keystone fields compare;
-    /// `distortion` and `optical_center` are rehydrated lens calibration and
-    /// belong to the runtime context, not to the saved document.
+    /// Document identity: the persisted crop/rotation/keystone fields compare.
+    /// The radial distortion curve and optical centre are rehydrated lens
+    /// calibration and live in `document::RuntimeInputs`, not on the document.
     fn eq(&self, other: &Self) -> bool {
         self.rotation == other.rotation
             && self.orientation == other.orientation
@@ -1899,8 +1893,6 @@ impl Default for Geometry {
             aspect: AspectRatio::Unconstrained,
             portrait: false,
             keystone: Keystone { amount: 100.0, ..Default::default() },
-            distortion: crate::c1_model::crop_limit::RadialCurve::default(),
-            optical_center: [0.0, 0.0],
         }
     }
 }
@@ -2481,40 +2473,59 @@ mod unknown_field_tests {
 #[cfg(test)]
 mod runtime_identity_tests {
     use super::{Geometry, LensCorrection};
+    use crate::document::{LensRuntime, RuntimeInputs};
 
     #[test]
-    fn geometry_equality_ignores_rehydrated_lens_calibration() {
-        let mut a = Geometry::default();
-        let mut b = Geometry::default();
-        b.distortion = crate::c1_model::crop_limit::RadialCurve {
-            v: vec![1.0],
-            x: vec![0.0],
-            m: vec![],
+    fn geometry_document_identity_ignores_runtime_lens_calibration() {
+        let a = Geometry::default();
+        let b = Geometry::default();
+        let mut lens = LensRuntime::default();
+        lens.distortion = crate::c1_model::crop_limit::RadialCurve {
+            v: vec![0.0, 1.0],
+            x: vec![0.0, 1.0],
+            m: vec![1.0, 1.0],
         };
-        b.optical_center = [12.0, 34.0];
+        lens.optical_center = [12.0, 34.0];
+        // Calibration is not a field of the document at all; the runtime context
+        // carries it and does not make the two geometries differ.
+        let runtime = RuntimeInputs::from_lens(lens);
+        assert!(runtime.fingerprint().is_some());
         assert_eq!(a, b, "lens calibration is runtime, not document identity");
 
-        a.rotation = 1.5;
-        assert_ne!(a, b, "persisted geometry must still compare");
+        let mut c = a.clone();
+        c.rotation = 1.5;
+        assert_ne!(a, c, "persisted geometry must still compare");
     }
 
     #[test]
-    fn lens_equality_ignores_the_sidecar_grid() {
-        let mut a = LensCorrection::default();
+    fn lens_document_identity_compares_the_persisted_amount() {
+        let a = LensCorrection::default();
         let mut b = LensCorrection::default();
-        b.uniform_light_grid = Some(std::sync::Arc::new(crate::dust_lcc::LightFalloff {
+        // The LCC grid moved to `RuntimeInputs`; the slider amount is persisted
+        // user state and must keep participating in equality.
+        assert_eq!(a, b, "two untouched lens corrections are equal");
+
+        b.distortion = 50.0;
+        assert_ne!(a, b, "the persisted amount must still compare");
+    }
+
+    #[test]
+    fn lens_runtime_fingerprint_tracks_grid_and_curve() {
+        use std::sync::Arc;
+        let grid = Arc::new(crate::dust_lcc::LightFalloff {
             header: vec![1, 2],
             columns: 1,
             rows: 1,
-            nodes: vec![crate::dust_lcc::LightFalloffNode {
-                luminance: 1000,
-                dx: 0,
-                dy: 0,
-            }],
-        }));
-        assert_eq!(a, b, "the LCC grid is runtime calibration");
+            nodes: vec![crate::dust_lcc::LightFalloffNode { luminance: 1000, dx: 0, dy: 0 }],
+        });
+        let empty = RuntimeInputs::from_lens(LensRuntime::default());
+        assert_eq!(empty.fingerprint(), None);
 
-        a.uniform_light = 50.0;
-        assert_ne!(a, b, "the persisted amount must still compare");
+        let with_grid = RuntimeInputs::from_lens(LensRuntime {
+            uniform_light_grid: Some(grid),
+            ..Default::default()
+        });
+        assert!(with_grid.fingerprint().is_some());
+        assert_ne!(empty.fingerprint(), with_grid.fingerprint());
     }
 }

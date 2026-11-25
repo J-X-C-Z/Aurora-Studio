@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::adjust::{AdjustmentSet, Curves, Geometry, Levels, NoiseReduction, Sharpening, WhiteBalance, WhiteBalanceMode};
 use crate::catalog::{ColorTag, Exif, FileKind, ImageId, ImageInfo, Iptc};
-use crate::document::DocumentRevision;
+use crate::document::{DocumentRevision, RuntimeInputs};
 use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, RenderQuality, StyleInfo};
 use crate::job_lifecycle::{CancelToken, JobId, JobRegistry, JobScope, JobState};
 use crate::layers::{Layer, LinearGradient, LocalAdjustments, Mask, MaskOp, MaskShape};
@@ -1100,7 +1100,7 @@ fn settings_dirs(capture_one: &Path) -> Vec<PathBuf> {
 /// Applies a C1 per-image `.cos`: the `<DL>` global adjustments plus its local
 /// `<AL>` layers that carry a `MaskUUID`. The mask comes from the `.comask`
 /// sidecar beside the settings file, looked up by that UUID.
-fn cos_adjustments(raw: &Path) -> Option<AdjustmentSet> {
+fn cos_adjustments(raw: &Path) -> Option<(AdjustmentSet, RuntimeInputs)> {
     let settings = cos_settings_file(raw)?;
     read_cos_adjustments(raw, &settings, Some(&settings.with_extension("comask")), true)
 }
@@ -1120,7 +1120,7 @@ impl ScannedFile {
         std::iter::once(self).chain(additional)
     }
 
-    fn c1_adjustments(&self) -> Option<AdjustmentSet> {
+    fn c1_adjustments(&self) -> Option<(AdjustmentSet, RuntimeInputs)> {
         if let Some(assets) = &self.packed {
             let document = self.packed_document.as_ref()?;
             let variant = document.variants.get(self.packed_variant as usize - 1)?;
@@ -1144,7 +1144,7 @@ fn read_cos_adjustments(
     settings: &Path,
     mask_path: Option<&Path>,
     session_lcc: bool,
-) -> Option<AdjustmentSet> {
+) -> Option<(AdjustmentSet, RuntimeInputs)> {
     let bytes = std::fs::read(settings).ok()?;
     let document = crate::c1_cos::CosDocument::parse(&bytes).ok()?;
     Some(cos_variant_adjustments(raw, settings, mask_path, session_lcc, document.variant()?))
@@ -1156,11 +1156,19 @@ fn cos_variant_adjustments(
     mask_path: Option<&Path>,
     session_lcc: bool,
     variant: &crate::c1_cos::CosVariant,
-) -> AdjustmentSet {
+) -> (AdjustmentSet, RuntimeInputs) {
     let comask_bytes = mask_path.and_then(|path| std::fs::read(path).ok());
     let comask =
         comask_bytes.as_deref().and_then(|bytes| crate::comask::ComaskDocument::parse(bytes).ok());
     let mut adjustments = variant.adjustments.clone();
+    // Rehydrated lens calibration is runtime input, never document state. The
+    // `.cos` `<DL>` row carries `ZLENSDISTORTION`/`ZLENSOPTICCENTER`; the `.lcc`
+    // sidecar carries the uniform-light grid.
+    let mut lens_runtime = {
+        let borrowed: HashMap<&str, Option<String>> =
+            variant.dl_entries.iter().map(|(key, value)| (key.as_str(), Some(value.clone()))).collect();
+        crate::c1_model::lens_runtime_from_settings(&crate::c1_model::from_layer_row(&borrowed))
+    };
     let uuids: Vec<&str> =
         variant.layers.iter().filter_map(|layer| layer.mask_uuid.as_deref()).collect();
     let planes = match comask_bytes.as_deref() {
@@ -1183,6 +1191,9 @@ fn cos_variant_adjustments(
             Ok(bytes) => {
                 if let Err(error) = adjustments.lens.load_dust_lcc(&bytes) {
                     log::warn!("C1 `.lcc` {} ignored: {error}", path.display());
+                }
+                if let Ok(Some(grid)) = crate::dust_lcc::parse_light_falloff(&bytes) {
+                    lens_runtime.uniform_light_grid = Some(std::sync::Arc::new(grid));
                 }
             }
             Err(_) => log::warn!("C1 `.lcc` {} missing", path.display()),
@@ -1234,7 +1245,7 @@ fn cos_variant_adjustments(
         });
     }
     adjustments.layers.extend(layers);
-    adjustments
+    (adjustments, RuntimeInputs::from_lens(lens_runtime))
 }
 
 /// A `.cos` layer body is a full [`AdjustmentSet`]; a render layer keeps only
@@ -1287,6 +1298,10 @@ struct FileEntry {
     path: PathBuf,
     rel_path: String,
     adjustments: AdjustmentSet,
+    /// Rehydrated per-image runtime inputs (lens/geometry calibration).
+    /// Deliberately outside `adjustments`, so it never reaches a save, undo,
+    /// equality or `document_fingerprint`.
+    runtime: RuntimeInputs,
 }
 
 struct AiInput {
@@ -2006,6 +2021,19 @@ impl FileEngine {
             .map(|entry| entry.path.clone())
     }
 
+    /// Rehydrated runtime inputs for one image: the lens/geometry calibration
+    /// that is derived from the source, C1 catalog or `.lcc` sidecar and must
+    /// never be written into the saved document.
+    pub(crate) fn runtime_inputs(&self, image: ImageId) -> RuntimeInputs {
+        self.state
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.info.id == image)
+            .map(|entry| entry.runtime.clone())
+            .unwrap_or_default()
+    }
+
     fn lcc_files(&self, image: ImageId) -> Option<(PathBuf, PathBuf)> {
         Some((self.image_path(image)?, self.c1_settings_path(image)?))
     }
@@ -2345,6 +2373,7 @@ impl FileEngine {
                     }
                 };
                 let mut render_adjustments = adjustments.clone();
+                let runtime = RuntimeInputs::from_lens(variant.lens_runtime.clone());
                 let mut retouch_documents = Vec::new();
                 if !variant.local_layers.is_empty() {
                     attach_c1_layers(
@@ -2431,6 +2460,7 @@ impl FileEngine {
                     path: path.clone(),
                     rel_path: rel_path.clone(),
                     adjustments: render_adjustments,
+                    runtime,
                 });
                 if fresh {
                     imported.push((rel_path, adjustments, info));
@@ -2498,7 +2528,9 @@ impl FileEngine {
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
         let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/");
         let scanned = scan_file(&self.root, rel, path.to_path_buf());
-        let adjustments = scanned.c1_adjustments().unwrap_or_default();
+        let (adjustments, runtime) = scanned
+            .c1_adjustments()
+            .unwrap_or_else(|| (AdjustmentSet::default(), RuntimeInputs::none()));
         let mut st = self.state.lock();
         let id = ImageId(st.next_id);
         st.next_id += 1;
@@ -2526,6 +2558,7 @@ impl FileEngine {
             path: scanned.path,
             rel_path: scanned.rel_path,
             adjustments,
+            runtime,
         });
         Ok(info)
     }
@@ -3878,6 +3911,9 @@ impl ImageEngine for FileEngine {
             path: st.entries[pos].path.clone(),
             rel_path: st.entries[pos].rel_path.clone(),
             adjustments: adjustments.clone(),
+            // A new variant of the same source shares that source's lens
+            // calibration; it is not part of the copied edit document.
+            runtime: st.entries[pos].runtime.clone(),
         };
         st.entries.insert(pos + 1, entry);
         Ok(info)
@@ -3979,14 +4015,17 @@ impl ImageEngine for FileEngine {
 
     fn sample_color(&self, image: ImageId, adjustments: &AdjustmentSet, point: [f32; 2]) -> anyhow::Result<[f32; 3]> {
         let src = self.source(image)?;
-        Ok(process::sample_point(&src, &crate::styles::resolve(adjustments), point))
+        let runtime = self.runtime_inputs(image);
+        Ok(process::sample_point(&src, &crate::styles::resolve(adjustments), &runtime, point))
     }
 
     fn auto_adjust(&self, image: ImageId, current: &AdjustmentSet, target: AutoTarget) -> anyhow::Result<AutoResult> {
         let src = self.source(image)?;
-        let probe = process::render(
+        let runtime = self.runtime_inputs(image);
+        let probe = process::render_with_runtime(
             &src,
             &AdjustmentSet { geometry: current.geometry.clone(), ..Default::default() },
+            &runtime,
             NormRect::FULL,
             256,
             false,
@@ -4046,9 +4085,10 @@ impl ImageEngine for FileEngine {
             // Existing keystone is excluded so the suggestion is absolute.
             let mut geometry = current.geometry.clone();
             geometry.keystone = crate::Keystone::default();
-            let frame = process::render(
+            let frame = process::render_with_runtime(
                 &src,
                 &AdjustmentSet { geometry, ..Default::default() },
+                &runtime,
                 NormRect::FULL,
                 768,
                 false,
@@ -4076,7 +4116,8 @@ impl ImageEngine for FileEngine {
 
     fn pick_white_balance(&self, image: ImageId, point: [f32; 2]) -> anyhow::Result<(f32, f32)> {
         let src = self.source(image)?;
-        let c = process::sample_point(&src, &AdjustmentSet::default(), point);
+        let runtime = self.runtime_inputs(image);
+        let c = process::sample_point(&src, &AdjustmentSet::default(), &runtime, point);
         let warm = (c[0] - c[2]) / (c[0] + c[1] + c[2]).max(1e-3);
         let green = (c[1] - (c[0] + c[2]) / 2.0) / (c[0] + c[1] + c[2]).max(1e-3);
         Ok((((5600.0f32 - warm * 9000.0f32).clamp(2000.0f32, 15000.0f32)), ((green * 120.0f32).clamp(-50.0f32, 50.0f32))))
@@ -4086,7 +4127,8 @@ impl ImageEngine for FileEngine {
         // 512 px is plenty for histogram statistics and keeps the second decode cheap.
         let probe = |id| -> anyhow::Result<process::Rendered> {
             let src = self.source(id)?;
-            Ok(process::render(&src, &AdjustmentSet::default(), NormRect::FULL, 512, false, None))
+            let runtime = self.runtime_inputs(id);
+            Ok(process::render_with_runtime(&src, &AdjustmentSet::default(), &runtime, NormRect::FULL, 512, false, None))
         };
         let r = probe(reference)?;
         let t = probe(target)?;
@@ -4447,7 +4489,7 @@ mod tests {
         )
         .unwrap();
 
-        let adjustments = cos_adjustments(&raw).expect("`.cos` applies");
+        let (adjustments, _runtime) = cos_adjustments(&raw).expect("`.cos` applies");
         assert!((adjustments.exposure.exposure - 1.25).abs() < 1e-6);
         assert_eq!(adjustments.layers.len(), 1);
         assert!((adjustments.layers[0].adjustments.exposure.exposure + 0.75).abs() < 1e-6);
@@ -4494,8 +4536,14 @@ mod tests {
         drop(engine);
         let reopened = FileEngine::open(&dir).unwrap();
         let id = reopened.images()[0].id;
-        assert_eq!(reopened.lcc_calibration(id), Some(grid));
-        assert!(reopened.load_adjustments(id).lens.uniform_light_grid.is_some());
+        assert_eq!(reopened.lcc_calibration(id), Some(grid.clone()));
+        // The grid is runtime calibration now; it is not part of the document
+        // that `load_adjustments` returns, but it reaches the renderer through
+        // the per-image runtime inputs.
+        assert_eq!(
+            reopened.runtime_inputs(id).lens().uniform_light_grid.as_deref(),
+            Some(&grid)
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

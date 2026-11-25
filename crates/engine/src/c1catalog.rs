@@ -567,6 +567,10 @@ pub struct C1Variant {
     /// geometry is available.
     pub local_layers: Vec<crate::c1_masks::C1MaskLayer>,
     pub adjustments: crate::AdjustmentSet,
+    /// Rehydrated lens/geometry calibration (`ZLENSDISTORTION`,
+    /// `ZLENSOPTICCENTER` and the `.lcc` grid). Runtime input: never saved into
+    /// a `.portrait`, never part of document identity.
+    pub lens_runtime: crate::document::LensRuntime,
     pub rating: i64,
     pub color_tag: i64,
     pub keywords: Vec<String>,
@@ -1044,9 +1048,16 @@ impl C1Catalog {
                 .map(|pk| pk as i64)
                 .and_then(|pk| dims.get(&pk).copied());
             let mut adjustments = to_adjustment_set(&settings);
+            // Rehydrated calibration is runtime input, not document state.
+            let mut lens_runtime = crate::c1_model::lens_runtime_from_settings(&settings);
             if let Some(path) = settings.lens.lcc_id.as_ref().and_then(|id| sidecars.get(id)) {
                 let loaded = std::fs::read(path).map_err(anyhow::Error::from).and_then(|bytes| {
-                    adjustments.lens.load_dust_lcc(&bytes).map_err(anyhow::Error::from)
+                    let count =
+                        adjustments.lens.load_dust_lcc(&bytes).map_err(anyhow::Error::from)?;
+                    if let Ok(Some(grid)) = crate::dust_lcc::parse_light_falloff(&bytes) {
+                        lens_runtime.uniform_light_grid = Some(std::sync::Arc::new(grid));
+                    }
+                    Ok(count)
                 });
                 if let Err(error) = loaded {
                     warnings.push(format!("could not load Capture One LCC {}: {error}", path.display()));
@@ -1101,6 +1112,7 @@ impl C1Catalog {
                 settings,
                 local_layers,
                 adjustments,
+                lens_runtime,
                 rating,
                 color_tag,
                 keywords: keyword_list,

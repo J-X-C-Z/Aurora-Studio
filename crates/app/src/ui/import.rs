@@ -284,6 +284,7 @@ impl Render for ImportDialog {
             .chain(
                 self.state
                     .read(cx)
+                    .library
                     .nodes
                     .iter()
                     .filter(|n| n.kind == aurora_engine::CollectionKind::Album)

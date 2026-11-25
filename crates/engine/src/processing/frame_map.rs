@@ -245,7 +245,13 @@ fn solve_homography(from: [[f32; 2]; 4], to: [[f32; 2]; 4]) -> Option<[f32; 9]> 
 
 /// The inverse chain, with an explicit crop rect so both public entry points share it.
 #[cfg(test)]
-fn map_frame(f: [f32; 2], g: &Geometry, crop: NormRect, source_size: (u32, u32)) -> ([f32; 2], [f32; 2]) {
+fn map_frame(
+    f: [f32; 2],
+    g: &Geometry,
+    lens: &crate::document::LensRuntime,
+    crop: NormRect,
+    source_size: (u32, u32),
+) -> ([f32; 2], [f32; 2]) {
     let f = finite_pair(f);
     let (ow, oh) = oriented_size(g, source_size);
     let (cw, ch) = canvas_size(g, source_size);
@@ -286,10 +292,15 @@ fn map_frame(f: [f32; 2], g: &Geometry, crop: NormRect, source_size: (u32, u32))
         3 => [1.0 - q[1], q[0]],
         _ => q,
     };
-    let s = if g.distortion.is_empty() {
+    let s = if lens.distortion.is_empty() {
         s
     } else {
-        apply_radial(s, &g.distortion, g.optical_center, (source_size.0 as f32, source_size.1 as f32))
+        apply_radial(
+            s,
+            &lens.distortion,
+            lens.optical_center,
+            (source_size.0 as f32, source_size.1 as f32),
+        )
     };
     (oriented, finite_pair(s))
 }
@@ -297,13 +308,20 @@ fn map_frame(f: [f32; 2], g: &Geometry, crop: NormRect, source_size: (u32, u32))
 /// Maps a developed-frame point (0..1) back to an oriented-image point (0..1).
 #[cfg(test)]
 pub(crate) fn frame_to_oriented(f: [f32; 2], g: &crate::Geometry) -> [f32; 2] {
-    map_frame(f, g, clean_rect(g), (1, 1)).0
+    map_frame(f, g, &crate::document::LensRuntime::default(), clean_rect(g), (1, 1)).0
 }
 
 /// Maps a developed-frame point back to the source image (after orientation/flip).
 #[cfg(test)]
 pub(crate) fn frame_to_source(f: [f32; 2], g: &crate::Geometry, source_size: (u32, u32)) -> [f32; 2] {
-    map_frame(f, g, crop_for_aspect(g, source_size), source_size).1
+    map_frame(
+        f,
+        g,
+        &crate::document::LensRuntime::default(),
+        crop_for_aspect(g, source_size),
+        source_size,
+    )
+    .1
 }
 
 /// The inverse map built once per frame: the keystone homography is solved in
@@ -332,7 +350,25 @@ pub(crate) struct FrameMap {
 }
 
 impl FrameMap {
+    /// Builds the map without lens calibration.
+    ///
+    /// Lens calibration is runtime input, so production callers that have it
+    /// use [`Self::new_with_lens`]. The identity behaviour of this constructor
+    /// is byte-for-byte the old one for sources with no radial curve.
     pub(crate) fn new(source_size: (u32, u32), g: &Geometry) -> Self {
+        Self::new_with_lens(source_size, g, &crate::document::LensRuntime::default())
+    }
+
+    /// Builds the map with rehydrated lens calibration.
+    ///
+    /// `lens` owns the `ZLENSDISTORTION` curve and `ZLENSOPTICCENTER`; the
+    /// document no longer carries them. An empty curve keeps the old identity
+    /// path.
+    pub(crate) fn new_with_lens(
+        source_size: (u32, u32),
+        g: &Geometry,
+        lens: &crate::document::LensRuntime,
+    ) -> Self {
         let rotation = finite(g.rotation).to_radians();
         let (rotation_sin, rotation_cos) = (-rotation).sin_cos();
         let canvas = canvas_size(g, source_size);
@@ -362,8 +398,8 @@ impl FrameMap {
             orientation: g.orientation % 4,
             flip_h: g.flip_horizontal,
             flip_v: g.flip_vertical,
-            distortion: (!g.distortion.is_empty()).then(|| g.distortion.clone()),
-            optical_center: g.optical_center,
+            distortion: (!lens.distortion.is_empty()).then(|| lens.distortion.clone()),
+            optical_center: lens.optical_center,
         }
     }
 
@@ -954,7 +990,7 @@ mod tests {
         for (i, g) in cases.into_iter().enumerate() {
             let map = FrameMap::new(SRC, &g);
             for f in points {
-                let reference = map_frame(f, &g, crop_for_aspect(&g, SRC), SRC);
+                let reference = map_frame(f, &g, &crate::document::LensRuntime::default(), crop_for_aspect(&g, SRC), SRC);
                 assert_eq!(map.map(f), reference, "case {i}, point {f:?}");
             }
         }
@@ -1212,11 +1248,11 @@ mod tests {
     const PROBE_POINTS: [[f32; 2]; 6] =
         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5], [0.25, 0.75]];
 
-    fn lens_geometry(curve: crate::c1_model::crop_limit::RadialCurve) -> Geometry {
-        Geometry {
+    fn lens_runtime(curve: crate::c1_model::crop_limit::RadialCurve) -> crate::document::LensRuntime {
+        crate::document::LensRuntime {
             distortion: curve,
             optical_center: [3067.851_562, 1920.515_625],
-            ..dsc5673()
+            uniform_light_grid: None,
         }
     }
 
@@ -1237,7 +1273,7 @@ mod tests {
         ];
         for (name, curve) in cases {
             assert!(curve.is_empty(), "{name} must be the empty curve");
-            let map = FrameMap::new(DSC5673, &lens_geometry(curve));
+            let map = FrameMap::new_with_lens(DSC5673, &base, &lens_runtime(curve));
             for f in PROBE_POINTS {
                 assert_eq!(map.map(f), reference.map(f), "{name} at {f:?}");
             }
@@ -1251,7 +1287,7 @@ mod tests {
         let curve = RadialCurve::from_row(&LENS_POINTS, 100.0, true, LENS_PITCH);
         assert!(!curve.is_empty());
         let plain = FrameMap::new(DSC5673, &dsc5673());
-        let lensed = FrameMap::new(DSC5673, &lens_geometry(curve));
+        let lensed = FrameMap::new_with_lens(DSC5673, &dsc5673(), &lens_runtime(curve));
         let corner = [0.0, 1.0];
         let (a, b) = (plain.map(corner).1, lensed.map(corner).1);
         assert_ne!(a, b, "the radial stage must run");

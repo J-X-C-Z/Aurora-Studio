@@ -10,12 +10,16 @@
 //! [`Store::save_xmp`] or [`Store::save_metadata`]. Rating, label and keywords
 //! live in both places: `save_metadata` keeps them in step, and loading prefers
 //! the sidecar when somebody edited it after Portrait's last write. Adjustments
-//! never touch XMP. Every write is atomic (write `.tmp`, then rename) so a
-//! crash cannot leave a half-written file.
+//! never touch XMP. Every write is atomic (write a uniquely named `.tmp` in the
+//! same directory, then rename) so a crash cannot leave a half-written file and
+//! concurrent writers to the same target never share a temp name. Each file is
+//! all-or-nothing; a multi-file batch is still not a transaction.
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -594,25 +598,120 @@ fn fnv1a_hex(value: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Writes bytes to a `.tmp` sibling and renames it over the target, so a
-/// reader never sees a partial file.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Process-local sequence that, together with the PID, makes every temp name
+/// unique. `Relaxed` is enough: the value only needs to differ, not order.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+/// How hard a single-file write works to survive a crash or power loss.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// Write and rename only. A reader never sees a partial file; the newest
+    /// bytes may still live in the OS cache if the machine loses power.
+    Cheap,
+    /// Also `sync_all` the temp before the rename and the parent directory
+    /// after it (Unix). This is still one file, not a batch transaction.
+    Durable,
+}
+
+/// Opens a new, uniquely named temp file in `dir`.
+///
+/// The name embeds the process id and a monotonic counter, so two writers to
+/// the same target (same process or not) never open the same path. `create_new`
+/// makes that a hard guarantee: a stale temp left by a crashed process can
+/// never be appended to (we retry with the next counter instead).
+fn create_temp_file(dir: &Path, file_name: &str) -> io::Result<(PathBuf, File)> {
+    const ATTEMPTS: usize = 32;
+    for _ in 0..ATTEMPTS {
+        let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{file_name}.{}-{seq}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique temp file after 32 attempts",
+    ))
+}
+
+/// `sync_all` on a directory after the rename; Unix only, best effort.
+///
+/// Windows has no portable directory handle to flush, so this is a no-op
+/// there and the durability claim stops at the file contents.
+#[cfg(unix)]
+fn sync_parent_dir(dir: &Path) {
+    if let Ok(handle) = File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_dir: &Path) {}
+
+fn write_atomic_impl(path: &Path, bytes: &[u8], durability: Durability) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let tmp = dir.join(format!("{file_name}.tmp"));
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    let (tmp, mut file) =
+        create_temp_file(dir, &file_name).with_context(|| format!("creating temp for {}", path.display()))?;
+
+    let write_result = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        if durability == Durability::Durable {
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e)).with_context(|| format!("writing {}", tmp.display()));
+    }
+    // Close the handle before rename; Windows cannot rename an open file.
+    drop(file);
+
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(StoreError::Io(e).into());
     }
+    if durability == Durability::Durable {
+        sync_parent_dir(dir);
+    }
     Ok(())
+}
+
+/// Writes bytes to a uniquely named `.tmp` sibling and renames it over the
+/// target, so a reader never sees a partial file and two writers to the same
+/// target cannot share a temp name.
+///
+/// This is the cheap path: no fsync. A batch of these calls is still not a
+/// transaction — some files can land while another fails (see `save_report`).
+/// Callers that need the bytes to survive a crash can use
+/// [`write_atomic_durable`].
+///
+/// Windows rename semantics: Rust `fs::rename` replaces an existing target
+/// via `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, and the temp lives in the same
+/// directory so the rename cannot cross a volume. Concurrent-replace and
+/// power-loss behavior on Windows has **not** been verified on a real machine.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_impl(path, bytes, Durability::Cheap)
+}
+
+/// Same as [`write_atomic`], plus `sync_all` on the temp before the rename and
+/// a best-effort parent-directory sync after it (Unix). Opt in per write; do
+/// not use it for every save in a batch, which would turn the batch into many
+/// disk barriers without making it transactional.
+#[allow(dead_code)] // no in-tree caller yet; available for durable callers.
+pub(crate) fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_impl(path, bytes, Durability::Durable)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -825,6 +924,100 @@ mod tests {
         }
         assert!(store.root().join("catalog.json").exists());
         assert!(store.root().join("adjust").exists());
+    }
+
+    #[test]
+    fn temp_names_carry_the_pid_and_a_counter_and_are_unique() {
+        let temp = TempFolder::new();
+        let (first, first_file) = create_temp_file(temp.path(), "catalog.json").unwrap();
+        let (second, second_file) = create_temp_file(temp.path(), "catalog.json").unwrap();
+        assert_ne!(first, second, "two writes must not share a temp name");
+        for tmp in [&first, &second] {
+            let name = tmp.file_name().unwrap().to_string_lossy();
+            assert!(name.contains(&std::process::id().to_string()), "temp name carries the PID: {name}");
+            assert!(name.ends_with(".tmp"), "temp name stays recognizable: {name}");
+            assert_eq!(tmp.parent(), Some(temp.path()), "temp lives beside the target");
+        }
+        drop((first_file, second_file));
+        for tmp in [&first, &second] {
+            fs::remove_file(tmp).unwrap();
+        }
+    }
+
+    fn leftover_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_writes_to_the_same_target_land_one_whole_payload() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempFolder::new();
+        let target = temp.path().join("shared.json");
+        let writers = 8;
+        let rounds = 20;
+        let payload_len = 64 * 1024;
+        // Every writer uses one repeated byte, so a truncated or interleaved
+        // result cannot match any writer's payload exactly.
+        let payloads: Vec<Vec<u8>> =
+            (0..writers).map(|i| vec![b'A' + i as u8; payload_len]).collect();
+
+        let barrier = Arc::new(Barrier::new(writers));
+        let mut handles = Vec::new();
+        for payload in payloads.clone() {
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..rounds {
+                    write_atomic(&target, &payload).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let final_bytes = fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), payload_len, "final file is one complete payload");
+        assert!(
+            payloads.iter().any(|payload| payload == &final_bytes),
+            "final file must equal exactly one writer's bytes, not a mix"
+        );
+        assert!(leftover_temp_files(temp.path()).is_empty(), "no temp files after concurrent writes");
+    }
+
+    #[test]
+    fn a_failed_rename_removes_the_temp_file() {
+        // A directory at the target path makes the final rename fail after the
+        // temp was written; the temp must not survive the error.
+        let temp = TempFolder::new();
+        let target = temp.path().join("blocked");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"untouched").unwrap();
+
+        let error = write_atomic(&target, b"new bytes").unwrap_err();
+        assert!(matches!(error.downcast_ref::<StoreError>(), Some(StoreError::Io(_))));
+        assert!(target.is_dir(), "the blocking directory is left in place");
+        assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"untouched");
+        assert!(
+            leftover_temp_files(temp.path()).is_empty(),
+            "a failed rename must remove its temp file"
+        );
+    }
+
+    #[test]
+    fn durable_write_keeps_the_same_bytes_and_leaves_no_temps() {
+        let temp = TempFolder::new();
+        let target = temp.path().join("durable.json");
+        write_atomic_durable(&target, b"durable payload").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"durable payload");
+        assert!(leftover_temp_files(temp.path()).is_empty());
     }
 
     #[test]

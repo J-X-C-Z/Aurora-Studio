@@ -924,14 +924,7 @@ fn luma_guide(src: &Source, g: &Geometry, w: usize, h: usize) -> Vec<f32> {
 }
 
 fn luma_range_weight(r: &LumaRange, l: f32) -> f32 {
-    let w = if l < r.low_inner {
-        sstep(r.low_outer, r.low_inner.max(r.low_outer + 1e-3), l)
-    } else if l > r.high_inner {
-        1.0 - sstep(r.high_inner, r.high_outer.max(r.high_inner + 1e-3), l)
-    } else {
-        1.0
-    };
-    if r.invert { 1.0 - w } else { w }
+    crate::processing::layer_weight::luma_range_weight(r, l)
 }
 
 fn layer_plans<'a>(
@@ -1242,10 +1235,37 @@ pub fn render(
     bypass: bool,
     mask_overlay: Option<u64>,
 ) -> Rendered {
-    let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
+    render_with_runtime(
+        src,
+        adj,
+        &crate::document::RuntimeInputs::none(),
+        region,
+        max_size,
+        bypass,
+        mask_overlay,
+    )
+}
+
+/// [`render`] with explicit per-job runtime inputs (lens calibration).
+///
+/// The document (`adj`) stays persistent state only; the rehydrated
+/// `ZLENSDISTORTION` curve, optical centre and `.lcc` grid travel here. Passing
+/// an empty context is identical to the old [`render`].
+#[doc(hidden)]
+pub fn render_with_runtime(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    region: NormRect,
+    max_size: u32,
+    bypass: bool,
+    mask_overlay: Option<u64>,
+) -> Rendered {
+    let (out_w, out_h, scale, level) = geometry_for(src, adj, runtime, region, max_size);
     render_sized(
         src,
         adj,
+        runtime,
         region,
         out_w,
         out_h,
@@ -1270,11 +1290,32 @@ pub fn render16(
     max_size: u32,
     bypass: bool,
 ) -> Rendered16 {
-    let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
+    render16_with_runtime(
+        src,
+        adj,
+        &crate::document::RuntimeInputs::none(),
+        region,
+        max_size,
+        bypass,
+    )
+}
+
+/// [`render16`] with explicit per-job runtime inputs (lens calibration).
+#[doc(hidden)]
+pub fn render16_with_runtime(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    region: NormRect,
+    max_size: u32,
+    bypass: bool,
+) -> Rendered16 {
+    let (out_w, out_h, scale, level) = geometry_for(src, adj, runtime, region, max_size);
     let (narrow, wide) =
         render_sized(
             src,
             adj,
+            runtime,
             region,
             out_w,
             out_h,
@@ -1294,9 +1335,15 @@ pub fn render16(
 }
 
 /// Output size and source mip level a request at `max_size` resolves to.
-fn geometry_for(src: &Source, adj: &AdjustmentSet, region: NormRect, max_size: u32) -> (u32, u32, f32, usize) {
+fn geometry_for(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    region: NormRect,
+    max_size: u32,
+) -> (u32, u32, f32, usize) {
     let region = clean_region(region);
-    let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
+    let map = super::geometry::FrameMap::new_with_lens(src.size(), &adj.geometry, runtime.lens());
     let (fw, fh) = map.frame_size();
     let (rw, rh) = (fw * region.width, fh * region.height);
     let scale = max_size as f32 / rw.max(rh).max(1.0);
@@ -1314,19 +1361,18 @@ fn geometry_for(src: &Source, adj: &AdjustmentSet, region: NormRect, max_size: u
 /// walks, so an out-of-range request would otherwise size the output up and
 /// paint the empty border as the neutral fill.
 pub(crate) fn clean_region(r: NormRect) -> NormRect {
-    let width = if r.width.is_finite() { r.width.clamp(0.0, 1.0) } else { 1.0 };
-    let height = if r.height.is_finite() { r.height.clamp(0.0, 1.0) } else { 1.0 };
-    NormRect {
-        x: if r.x.is_finite() { r.x.clamp(0.0, 1.0 - width) } else { 0.0 },
-        y: if r.y.is_finite() { r.y.clamp(0.0, 1.0 - height) } else { 0.0 },
-        width,
-        height,
-    }
+    crate::processing::sizing::clean_region(r)
 }
 
 /// Output size a full render at `max_size` would have.
-pub(crate) fn preview_size(src: &Source, adj: &AdjustmentSet, region: NormRect, max_size: u32) -> (u32, u32) {
-    let (w, h, _, _) = geometry_for(src, adj, region, max_size);
+fn preview_size(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    region: NormRect,
+    max_size: u32,
+) -> (u32, u32) {
+    let (w, h, _, _) = geometry_for(src, adj, runtime, region, max_size);
     (w, h)
 }
 
@@ -1341,11 +1387,35 @@ pub(crate) fn render_at(
     mask_overlay: Option<u64>,
     fast: bool,
 ) -> Rendered {
+    render_at_with_runtime(
+        src,
+        adj,
+        &crate::document::RuntimeInputs::none(),
+        region,
+        max_size,
+        bypass,
+        mask_overlay,
+        fast,
+    )
+}
+
+/// [`render_at`] with explicit per-job runtime inputs (lens calibration).
+pub(crate) fn render_at_with_runtime(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    region: NormRect,
+    max_size: u32,
+    bypass: bool,
+    mask_overlay: Option<u64>,
+    fast: bool,
+) -> Rendered {
     if !fast {
-        return render(src, adj, region, max_size, bypass, mask_overlay);
+        return render_with_runtime(src, adj, runtime, region, max_size, bypass, mask_overlay);
     }
-    let (tw, th) = preview_size(src, adj, region, max_size);
-    let small = render(src, adj, region, max_size.div_ceil(2).max(1), bypass, mask_overlay);
+    let (tw, th) = preview_size(src, adj, runtime, region, max_size);
+    let small =
+        render_with_runtime(src, adj, runtime, region, max_size.div_ceil(2).max(1), bypass, mask_overlay);
     if (small.width, small.height) == (tw, th) {
         return small;
     }
@@ -1606,13 +1676,14 @@ fn gpu_develop_preflight(
 fn dust_frame_key(
     src: &Source,
     geometry: &Geometry,
+    runtime: &crate::document::RuntimeInputs,
     region: NormRect,
     out_w: u32,
     out_h: u32,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     src.snapshot_id().hash(&mut hasher);
-    hash_geometry(geometry, &mut hasher);
+    hash_geometry(geometry, runtime, &mut hasher);
     for value in [region.x, region.y, region.width, region.height] {
         value.to_bits().hash(&mut hasher);
     }
@@ -1621,7 +1692,11 @@ fn dust_frame_key(
     hasher.finish()
 }
 
-fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
+fn hash_geometry(
+    geometry: &Geometry,
+    runtime: &crate::document::RuntimeInputs,
+    hasher: &mut impl Hasher,
+) {
     geometry.rotation.to_bits().hash(hasher);
     geometry.orientation.hash(hasher);
     geometry.flip_horizontal.hash(hasher);
@@ -1634,8 +1709,6 @@ fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
         geometry.crop.height,
         geometry.canvas[0],
         geometry.canvas[1],
-        geometry.optical_center[0],
-        geometry.optical_center[1],
     ] {
         value.to_bits().hash(hasher);
     }
@@ -1653,12 +1726,10 @@ fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
         value.to_bits().hash(hasher);
     }
     keystone.flags.hash(hasher);
-    for axis in [&geometry.distortion.v, &geometry.distortion.x, &geometry.distortion.m] {
-        axis.len().hash(hasher);
-        for value in axis {
-            value.to_bits().hash(hasher);
-        }
-    }
+    // Radial distortion and the optical centre are runtime calibration now, so
+    // the frame key must include their fingerprint; otherwise a cached dust
+    // mask could be reused across two different lens profiles.
+    runtime.lens().fingerprint().hash(hasher);
 }
 
 /// Runs the point chain band by band straight from the tile cache into the
@@ -1764,6 +1835,7 @@ fn develop_bands(
 fn render_sized(
     src: &Source,
     adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
     region: NormRect,
     out_w: u32,
     out_h: u32,
@@ -1775,7 +1847,7 @@ fn render_sized(
     with_histogram: bool,
 ) -> (Rendered, Option<Vec<u16>>) {
     let region = clean_region(region);
-    let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
+    let map = super::geometry::FrameMap::new_with_lens(src.size(), &adj.geometry, runtime.lens());
     let oriented = map.oriented();
     let aspect = oriented.0 / oriented.1;
     // One mask-grid cell covers `cell_px` source pixels, so the mask's pixel
@@ -1792,15 +1864,15 @@ fn render_sized(
     // There is no per-variant mode column; the calibration file's `Hdr` flags
     // bit 0 is the only persisted source, and a missing grid means nothing is
     // calibrated yet, so the soft knee applies.
-    let mode = adj
-        .lens
+    let mode = runtime
+        .lens()
         .uniform_light_grid
         .as_deref()
         .map(crate::dust_lcc::LightFalloff::mode)
         .unwrap_or_default();
     let (strength, limit) = crate::dust_lcc::strength_from_amount(adj.lens.uniform_light, mode);
     let uniform_light = crate::dust_lcc::UniformLight::prepare(
-        adj.lens.uniform_light_grid.as_deref(),
+        runtime.lens().uniform_light_grid.as_deref(),
         !bypass && adj.lens.uniform_light_enabled,
         // `ZLENSLCCLIGHTFALLOFFAMOUNT` is 0..120 with 100 = the full model.
         // The shipped kernel multiplies the calibrated EV by amount/100, so
@@ -2340,7 +2412,7 @@ fn render_sized(
     }
     if !bypass {
         let dust = if crate::dustdetect::enabled() {
-            let key = dust_frame_key(src, &adj.geometry, region, out_w, out_h);
+            let key = dust_frame_key(src, &adj.geometry, runtime, region, out_w, out_h);
             match crate::dustdetect::detect_dust_cached(
                 key,
                 &rgba,
@@ -3734,15 +3806,27 @@ fn apply_layer_color_row(
 }
 
 /// Processed color at a frame point, for the color picker readout.
-pub(crate) fn sample_point(src: &Source, adj: &AdjustmentSet, f: [f32; 2]) -> [f32; 3] {
-    let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
+pub(crate) fn sample_point(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    f: [f32; 2],
+) -> [f32; 3] {
+    let map = super::geometry::FrameMap::new_with_lens(src.size(), &adj.geometry, runtime.lens());
     let (p, s) = map.map(f);
-    let plan_out = render_single(src, adj, p, s, f);
+    let plan_out = render_single(src, adj, runtime, p, s, f);
     [plan_out[0].clamp(0.0, 1.0), plan_out[1].clamp(0.0, 1.0), plan_out[2].clamp(0.0, 1.0)]
 }
 
-fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f: [f32; 2]) -> [f32; 3] {
-    let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
+fn render_single(
+    src: &Source,
+    adj: &AdjustmentSet,
+    runtime: &crate::document::RuntimeInputs,
+    p: [f32; 2],
+    s: [f32; 2],
+    f: [f32; 2],
+) -> [f32; 3] {
+    let map = super::geometry::FrameMap::new_with_lens(src.size(), &adj.geometry, runtime.lens());
     let oriented = map.oriented();
     let aspect = oriented.0 / oriented.1;
     let cell_px = oriented.0 / 256.0;
@@ -3766,30 +3850,50 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
 #[cfg(test)]
 mod tests {
 
+    /// Per-job lens calibration for tests that used to attach a grid to
+    /// `AdjustmentSet` before it became runtime input.
+    fn lens_runtime(
+        grid: Option<std::sync::Arc<crate::dust_lcc::LightFalloff>>,
+    ) -> crate::document::RuntimeInputs {
+        crate::document::RuntimeInputs::from_lens(crate::document::LensRuntime {
+            distortion: Default::default(),
+            optical_center: [0.0, 0.0],
+            uniform_light_grid: grid,
+        })
+    }
+
     #[test]
     fn lcc_uniform_light_lens_stage_uses_source_coordinates_and_identity_gates() {
         let fixture = [4, 88, 67, 111, 110, 0, 0, 6, 190, 186, 254, 202, 0, 2, 4, 84, 89, 80, 69, 0, 0, 14, 67, 97, 112, 116, 117, 114, 101, 79, 110, 101, 32, 76, 67, 67, 3, 86, 69, 82, 0, 0, 2, 6, 0, 12, 76, 105, 103, 104, 116, 70, 97, 108, 108, 111, 102, 102, 1, 0, 3, 72, 100, 114, 0, 0, 16, 16, 0, 2, 0, 2, 0, 10, 0, 20, 0, 4, 0, 8, 0, 1, 0, 5, 77, 111, 100, 101, 108, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 254, 65, 72];
         let src = Source::from_linear(32, 32, vec![[0.025; 3]; 32 * 32]);
         let mut adj = AdjustmentSet::default();
-        let render_bytes = |adj: &AdjustmentSet| render(&src, adj, NormRect::FULL, 32, false, None).rgba;
-        let before = render_bytes(&adj);
+        let grid = std::sync::Arc::new(
+            crate::dust_lcc::parse_light_falloff(&fixture)
+                .expect("the fixture parses")
+                .expect("the fixture carries a light-falloff grid"),
+        );
+        let render_bytes = |adj: &AdjustmentSet, grid: Option<std::sync::Arc<crate::dust_lcc::LightFalloff>>| {
+            let runtime = lens_runtime(grid);
+            render_with_runtime(&src, adj, &runtime, NormRect::FULL, 32, false, None).rgba
+        };
+        let before = render_bytes(&adj, None);
         adj.lens.uniform_light_enabled = true;
         adj.lens.uniform_light = 100.0;
-        assert_eq!(render_bytes(&adj), before, "missing grid");
+        assert_eq!(render_bytes(&adj, None), before, "missing grid");
         adj.lens.load_dust_lcc(&fixture).unwrap();
         adj.lens.uniform_light_enabled = false;
-        assert_eq!(render_bytes(&adj), before, "disabled gate");
+        assert_eq!(render_bytes(&adj, Some(grid.clone())), before, "disabled gate");
         adj.lens.uniform_light_enabled = true;
         adj.lens.uniform_light = 0.0;
-        assert_eq!(render_bytes(&adj), before, "zero strength");
+        assert_eq!(render_bytes(&adj, Some(grid.clone())), before, "zero strength");
         adj.lens.uniform_light = 100.0;
-        let after = render_bytes(&adj);
+        let after = render_bytes(&adj, Some(grid.clone()));
         let at = |x: usize, y: usize| (y * 32 + x) * 4;
         assert!(after[at(10, 20)] > before[at(10, 20)]);
         assert_eq!(after[at(14, 28)], before[at(14, 28)]);
         assert_eq!(after[at(10, 20) + 3], before[at(10, 20) + 3]);
 
-        let base = adj.lens.uniform_light_grid.as_deref().unwrap();
+        let base = grid.as_ref();
         let vectors = r#"case	tile_x	tile_y	local_x	local_y	inverse_scale	strength	gate	mode	override_dx_00	field_ev	raw_ev	limited_ev	gain
 top_left	10	20	0	0	1	1	1	uncapped	0	0	2	2	4
 top_right	10	20	4	0	1	1	1	uncapped	0	1	1	1	2
@@ -3858,10 +3962,14 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let mut adj = AdjustmentSet::default();
         adj.lens.uniform_light_enabled = true;
         adj.lens.uniform_light = 100.0;
-        adj.lens.uniform_light_grid = Some(grid(1));
-        let soft = render(&src, &adj, NormRect::FULL, 8, false, None).rgba;
-        adj.lens.uniform_light_grid = Some(grid(0));
-        let hard = render(&src, &adj, NormRect::FULL, 8, false, None).rgba;
+        let soft = {
+            let runtime = lens_runtime(Some(grid(1)));
+            render_with_runtime(&src, &adj, &runtime, NormRect::FULL, 8, false, None).rgba
+        };
+        let hard = {
+            let runtime = lens_runtime(Some(grid(0)));
+            render_with_runtime(&src, &adj, &runtime, NormRect::FULL, 8, false, None).rgba
+        };
         // Soft caps at 4 EV (x16), hard at 3 (x8). The film curve is monotone,
         // so the wider correction must never come out darker.
         let sum = |buf: &[u8]| buf.iter().map(|v| u64::from(*v)).sum::<u64>();
@@ -4127,7 +4235,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = Source::from_rgba(w, h, &gray(w, h, 96));
         let mut adj = AdjustmentSet::default();
         adj.vignetting.amount = 2.0;
-        adj.lens.uniform_light_grid = Some(std::sync::Arc::new(LightFalloff {
+        let grid = std::sync::Arc::new(LightFalloff {
             header: vec![2, 0, 2, 0, 0, 0, 0, 0, 32, 0, 32, 0],
             columns: 2,
             rows: 2,
@@ -4137,11 +4245,12 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
                 LightFalloffNode { luminance: 8000, dx: 0, dy: 0 },
                 LightFalloffNode { luminance: 16000, dx: 0, dy: 0 },
             ],
-        }));
+        });
         adj.lens.uniform_light_enabled = true;
         adj.lens.uniform_light = 100.0;
+        let runtime = lens_runtime(Some(grid));
         super::super::pixel_gpu::PLANE_HITS.store(0, Ordering::Relaxed);
-        let _ = render(&src, &adj, NormRect::FULL, w, false, None);
+        let _ = render_with_runtime(&src, &adj, &runtime, NormRect::FULL, w, false, None);
         let hits = super::super::pixel_gpu::PLANE_HITS.load(Ordering::Relaxed);
         // P-08 (S6) measured the cold vignette plane as slower end to end than
         // the CPU `exp2` formula at every size, so the shipped default declines
@@ -4173,7 +4282,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = Source::from_rgba(w, h, &pixels);
         let mut adj = AdjustmentSet::default();
         adj.vignetting.amount = 1.5;
-        adj.lens.uniform_light_grid = Some(std::sync::Arc::new(LightFalloff {
+        let grid = std::sync::Arc::new(LightFalloff {
             header: vec![2, 0, 2, 0, 0, 0, 0, 0, 128, 0, 96, 0],
             columns: 2,
             rows: 2,
@@ -4183,11 +4292,12 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
                 LightFalloffNode { luminance: 7000, dx: 45, dy: 15 },
                 LightFalloffNode { luminance: 15_000, dx: 0, dy: 0 },
             ],
-        }));
+        });
         adj.lens.uniform_light_enabled = true;
         adj.lens.uniform_light = 80.0;
         adj.film_grain = FilmGrain { kind: GrainKind::SoftGrain, impact: 70.0, granularity: 50.0, density: 0.0 };
-        let out = render(&src, &adj, NormRect::FULL, w, false, None).rgba;
+        let runtime = lens_runtime(Some(grid));
+        let out = render_with_runtime(&src, &adj, &runtime, NormRect::FULL, w, false, None).rgba;
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for &byte in &out {
             hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
@@ -4655,10 +4765,11 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             let dark = render(&src, &swept, NormRect::FULL, w, false, None);
             assert_ne!(grey.rgba, dark.rgba, "{name}: slider had no effect");
 
-            let picked = sample_point(&src, &bw, [0.5, 0.5]);
+            let runtime = crate::document::RuntimeInputs::none();
+            let picked = sample_point(&src, &bw, &runtime, [0.5, 0.5]);
             assert!((picked[0] - picked[1]).abs() < 1e-5, "{name}: picker {picked:?}");
             assert!((picked[1] - picked[2]).abs() < 1e-5, "{name}: picker {picked:?}");
-            let picked_swept = sample_point(&src, &swept, [0.5, 0.5]);
+            let picked_swept = sample_point(&src, &swept, &runtime, [0.5, 0.5]);
             assert!(picked_swept[0] < picked[0] - 1e-3, "{name}: picker ignored slider");
         }
     }
@@ -6972,9 +7083,11 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i.wrapping_mul(37) % 251) as u8).collect();
         let src = Source::from_rgba(w, h, &rgba);
         let adj = AdjustmentSet::default();
+        let runtime = crate::document::RuntimeInputs::none();
         let (preview, preview_wide) = render_sized(
             &src,
             &adj,
+            &runtime,
             NormRect::FULL,
             w,
             h,
@@ -6988,6 +7101,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let (export, export_wide) = render_sized(
             &src,
             &adj,
+            &runtime,
             NormRect::FULL,
             w,
             h,
@@ -7063,7 +7177,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         assert!(src.levels.len() > 2, "the source needs a mip chain for this test");
         let adj = AdjustmentSet::default();
         let region = NormRect { x: 0.5, y: 0.5, width: 1.0 / 8.0, height: 1.0 / 8.0 };
-        let (ow, oh, scale, level) = geometry_for(&src, &adj, region, 256);
+        let (ow, oh, scale, level) = geometry_for(&src, &adj, &crate::document::RuntimeInputs::none(), region, 256);
         assert!((scale - 1.0).abs() < 1e-6, "2048/8 = 256 region pixels at 256 out is 1:1");
         assert_eq!((ow, oh), (256, 171));
         assert_eq!(level, 0, "1:1 zoom must not fall into a mip");
@@ -7076,7 +7190,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = flat_source(2048, 1365);
         let adj = AdjustmentSet::default();
         let region = NormRect { x: 0.0, y: 0.0, width: 0.25, height: 0.25 };
-        let (_, _, scale, level) = geometry_for(&src, &adj, region, 128);
+        let (_, _, scale, level) = geometry_for(&src, &adj, &crate::document::RuntimeInputs::none(), region, 128);
         assert!((scale - 0.25).abs() < 1e-6, "512 region pixels into 128 px");
         assert_eq!(level, 2);
     }
@@ -7087,7 +7201,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = flat_source(2048, 1365);
         let adj = AdjustmentSet::default();
         let region = NormRect { x: 0.25, y: 0.5, width: 0.25, height: 0.1 };
-        let (ow, oh, _, _) = geometry_for(&src, &adj, region, 600);
+        let (ow, oh, _, _) = geometry_for(&src, &adj, &crate::document::RuntimeInputs::none(), region, 600);
         assert_eq!((ow, oh), (600, 160));
         let out = render(&src, &adj, region, 600, true, None);
         assert_eq!((out.width, out.height), (600, 160));
@@ -7101,7 +7215,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let adj = AdjustmentSet::default();
         let wild = NormRect { x: 0.9, y: 0.8, width: 0.5, height: 0.5 };
         let clean = NormRect { x: 0.5, y: 0.5, width: 0.5, height: 0.5 };
-        assert_eq!(geometry_for(&src, &adj, wild, 400), geometry_for(&src, &adj, clean, 400));
+        assert_eq!(geometry_for(&src, &adj, &crate::document::RuntimeInputs::none(), wild, 400), geometry_for(&src, &adj, &crate::document::RuntimeInputs::none(), clean, 400));
         let out = render(&src, &adj, wild, 400, true, None);
         assert_eq!((out.width, out.height), (400, 400));
         assert!(
@@ -7157,7 +7271,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let region = NormRect { x: 0.5 - eighth / 2.0, y: 0.5 - eighth / 2.0, width: eighth, height: eighth };
         // 750 px is 1:1 (bilinear), 1200 px is the reported 1.6x magnification.
         for max in [750u32, 1200] {
-            let (ow, oh, scale, level) = geometry_for(&src, &adj, region, max);
+            let (ow, oh, scale, level) = geometry_for(&src, &adj, &crate::document::RuntimeInputs::none(), region, max);
             let t = Instant::now();
             let out = render(&src, &adj, region, max, false, None);
             let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -7985,7 +8099,6 @@ mod develop_gpu_integration_tests {
         cases.push(("vignette", vignette, false));
 
         let mut lcc = AdjustmentSet::default();
-        lcc.lens.uniform_light_grid = Some(lcc_grid());
         lcc.lens.uniform_light_enabled = true;
         lcc.lens.uniform_light = 80.0;
         cases.push(("lcc", lcc, false));
@@ -8031,8 +8144,15 @@ mod develop_gpu_integration_tests {
         let mut dump = Vec::new();
         push_u32(&mut dump, cases.len() as u32);
         for (name, adj, bypass) in &cases {
-            let narrow = render(&src, adj, NormRect::FULL, W, *bypass, None).rgba;
-            let wide = render16(&src, adj, NormRect::FULL, W, *bypass).rgba;
+            // The lcc case carries its calibration per job; every other case
+            // renders without runtime lens inputs.
+            let runtime = if *name == "lcc" {
+                lens_runtime(Some(lcc_grid()))
+            } else {
+                lens_runtime(None)
+            };
+            let narrow = render_with_runtime(&src, adj, &runtime, NormRect::FULL, W, *bypass, None).rgba;
+            let wide = render16_with_runtime(&src, adj, &runtime, NormRect::FULL, W, *bypass).rgba;
             push_u32(&mut dump, name.len() as u32);
             dump.extend_from_slice(name.as_bytes());
             push_u32(&mut dump, W);

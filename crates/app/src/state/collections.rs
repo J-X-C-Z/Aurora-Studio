@@ -74,11 +74,11 @@ pub fn rule_matches(rule: &SmartRule, info: &ImageInfo, edited: bool) -> bool {
 
 impl AppState {
     pub fn node(&self, id: u64) -> Option<&CollNode> {
-        self.nodes.iter().find(|n| n.id == id)
+        self.library.nodes.iter().find(|n| n.id == id)
     }
 
     pub fn child_nodes(&self, parent: Option<u64>) -> Vec<&CollNode> {
-        self.nodes.iter().filter(|n| n.parent == parent).collect()
+        self.library.nodes.iter().filter(|n| n.parent == parent).collect()
     }
 
     fn edited(&self, id: ImageId) -> bool {
@@ -152,6 +152,7 @@ impl AppState {
 
     fn persist_collections(&mut self, cx: &mut Context<Self>) {
         let user: Vec<UserCollection> = self
+            .library
             .nodes
             .iter()
             .filter(|n| n.user)
@@ -172,7 +173,7 @@ impl AppState {
     }
 
     pub fn create_collection(&mut self, parent: Option<u64>, kind: CollectionKind, name: Option<String>, cx: &mut Context<Self>) -> u64 {
-        let id = self.nodes.iter().map(|n| n.id).max().unwrap_or(0).max(USER_BASE) + 1;
+        let id = self.library.nodes.iter().map(|n| n.id).max().unwrap_or(0).max(USER_BASE) + 1;
         let name = name.unwrap_or_else(|| {
             match kind {
                 CollectionKind::SmartAlbum => t("New Smart Album", "新建智能相册"),
@@ -184,7 +185,7 @@ impl AppState {
         });
         // Albums and smart albums may live in projects and groups; projects only in groups.
         let parent = parent.filter(|p| self.node(*p).is_some_and(|n| matches!(n.kind, CollectionKind::Group | CollectionKind::Project) && !(kind == CollectionKind::Project && n.kind == CollectionKind::Project)));
-        self.nodes.push(CollNode {
+        self.library.nodes.push(CollNode {
             id,
             parent,
             name,
@@ -214,7 +215,7 @@ impl AppState {
     }
 
     pub fn rename_collection(&mut self, id: u64, name: String, cx: &mut Context<Self>) {
-        if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id && n.user) {
+        if let Some(n) = self.library.nodes.iter_mut().find(|n| n.id == id && n.user) {
             n.name = name;
         }
         self.persist_collections(cx);
@@ -225,10 +226,10 @@ impl AppState {
         let mut i = 0;
         while i < doomed.len() {
             let p = doomed[i];
-            doomed.extend(self.nodes.iter().filter(|n| n.parent == Some(p)).map(|n| n.id));
+            doomed.extend(self.library.nodes.iter().filter(|n| n.parent == Some(p)).map(|n| n.id));
             i += 1;
         }
-        self.nodes.retain(|n| !(n.user && doomed.contains(&n.id)));
+        self.library.nodes.retain(|n| !(n.user && doomed.contains(&n.id)));
         if doomed.contains(&self.library.active_collection) {
             self.library.active_collection = 1;
         }
@@ -236,7 +237,7 @@ impl AppState {
     }
 
     pub fn add_to_album(&mut self, id: u64, images: &[ImageId], cx: &mut Context<Self>) {
-        let Some(n) = self.nodes.iter_mut().find(|n| n.id == id && n.kind == CollectionKind::Album) else { return };
+        let Some(n) = self.library.nodes.iter_mut().find(|n| n.id == id && n.kind == CollectionKind::Album) else { return };
         let members = n.members.get_or_insert_with(BTreeSet::new);
         let before = members.len();
         members.extend(images.iter().copied());
@@ -247,7 +248,7 @@ impl AppState {
     }
 
     pub fn remove_from_album(&mut self, id: u64, images: &[ImageId], cx: &mut Context<Self>) {
-        if let Some(m) = self.nodes.iter_mut().find(|n| n.id == id).and_then(|n| n.members.as_mut()) {
+        if let Some(m) = self.library.nodes.iter_mut().find(|n| n.id == id).and_then(|n| n.members.as_mut()) {
             for i in images {
                 m.remove(i);
             }
@@ -256,7 +257,7 @@ impl AppState {
     }
 
     pub fn set_smart_rules(&mut self, id: u64, rules: Vec<SmartRule>, match_all: bool, cx: &mut Context<Self>) {
-        if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
+        if let Some(n) = self.library.nodes.iter_mut().find(|n| n.id == id) {
             n.rules = rules;
             n.match_all = match_all;
         }

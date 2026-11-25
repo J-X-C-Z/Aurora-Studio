@@ -124,14 +124,14 @@ impl AppState {
         if before.is_some_and(|b| ids.contains(&b)) {
             return;
         }
-        if self.sort != SortKey::Custom {
+        if self.library.sort != SortKey::Custom {
             // Start from what the user is looking at.
             let shown: Vec<ImageId> = self.visible_images().iter().map(|i| i.id).collect();
             let mut order = shown.clone();
             order.extend(self.library.images.iter().map(|i| i.id).filter(|id| !shown.contains(id)));
             self.library.custom_order = order;
-            self.sort = SortKey::Custom;
-            self.sort_desc = false;
+            self.library.sort = SortKey::Custom;
+            self.library.sort_desc = false;
         }
         for id in self.library.images.iter().map(|i| i.id) {
             if !self.library.custom_order.contains(&id) {

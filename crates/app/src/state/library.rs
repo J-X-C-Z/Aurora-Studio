@@ -1,20 +1,20 @@
 //! Catalog, selection and browser-arrangement state split out of
 //! [`super::AppState`].
 //!
-//! This is a plain data holder, not a second model: the image list, which one
-//! is current, the selection, the recent/trash sets, annotations, the custom
-//! order and the stacks live here, but the UI still observes `AppState` and all
-//! transitions stay on the named `AppState` methods. Field semantics are
-//! unchanged from the former `AppState` fields: the built-in "All Images"
-//! collection (`1`) starts active and a fresh viewer has no image
-//! (`current == None`).
+//! This is a plain data holder, not a second model: the image list, the
+//! collection tree, the browser filter/sort, which one is current, the
+//! selection, the recent/trash sets, annotations, the custom order and the
+//! stacks live here, but the UI still observes `AppState` and all transitions
+//! stay on the named `AppState` methods. Field semantics are unchanged from the
+//! former `AppState` fields: the built-in "All Images" collection (`1`) starts
+//! active and a fresh viewer has no image (`current == None`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use aurora_engine::{ImageId, ImageInfo};
 use gpui_kit::SharedString;
 
-use super::Stack;
+use super::{CollNode, Filter, SortKey, Stack};
 use crate::i18n::t;
 
 /// The catalog's images plus what the browser currently selects, orders and
@@ -22,6 +22,14 @@ use crate::i18n::t;
 pub struct LibraryState {
     /// Every image the engine has for this window.
     pub images: Vec<ImageInfo>,
+    /// The collection tree (engine folders plus user collections) flattened.
+    pub nodes: Vec<CollNode>,
+    /// Which images the browser shows.
+    pub filter: Filter,
+    /// How the browser orders them.
+    pub sort: SortKey,
+    /// Whether that order is reversed.
+    pub sort_desc: bool,
     /// The images the tools and batch actions apply to.
     pub selection: BTreeSet<ImageId>,
     /// The image the tools edit.
@@ -50,6 +58,10 @@ impl Default for LibraryState {
     fn default() -> Self {
         Self {
             images: Vec::new(),
+            nodes: Vec::new(),
+            filter: Filter::default(),
+            sort: SortKey::Name,
+            sort_desc: false,
             selection: BTreeSet::new(),
             current: None,
             recent_imports: BTreeSet::new(),

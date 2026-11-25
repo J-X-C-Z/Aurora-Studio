@@ -220,7 +220,7 @@ fn collections_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App
 fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let f = s.filter.clone();
+    let f = s.library.filter.clone();
     let counts: Vec<usize> = (-1..=5).map(|r| s.library.images.iter().filter(|i| i.rating == r).count()).collect();
     let tag_counts: Vec<usize> = ColorTag::ALL.iter().map(|t| s.library.images.iter().filter(|i| i.color_tag == *t).count()).collect();
     let (st, st2, st3) = (state.clone(), state.clone(), state.clone());
@@ -230,7 +230,7 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
         t("Search", "搜索"),
         move |text, _, cx| {
             st3.update(cx, |s, cx| {
-                s.filter.search = text;
+                s.library.filter.search = text;
                 cx.notify();
             })
         },
@@ -252,7 +252,7 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
             .hover(|d| d.bg(p.hover))
             .on_click(move |_, _, cx| {
                 st.update(cx, |s, cx| {
-                    s.filter.min_rating = if s.filter.min_rating == r { -1 } else { r };
+                    s.library.filter.min_rating = if s.library.filter.min_rating == r { -1 } else { r };
                     cx.notify();
                 })
             })
@@ -271,7 +271,7 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
         .modified(f != crate::state::Filter::default())
         .on_reset(move |_, cx| {
             st.update(cx, |s, cx| {
-                s.filter = Default::default();
+                s.library.filter = Default::default();
                 cx.notify();
             })
         })
@@ -295,7 +295,7 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
                 .child(div().text_xs().text_color(p.text_muted).child(format!("{}", tag_counts[i])))
                 .on_click(move |_, _, cx| {
                     st.update(cx, |s, cx| {
-                        s.filter.color_tag = if s.filter.color_tag == Some(tag) { None } else { Some(tag) };
+                        s.library.filter.color_tag = if s.library.filter.color_tag == Some(tag) { None } else { Some(tag) };
                         cx.notify();
                     })
                 })
@@ -303,7 +303,7 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
         .child(div().h(px(4.0)))
         .child(switch_row("edited-only", t("Edited images only", "仅已编辑图像"), f.edited_only, move |v, _, cx| {
             st2.update(cx, |s, cx| {
-                s.filter.edited_only = v;
+                s.library.filter.edited_only = v;
                 cx.notify();
             })
         }, cx))

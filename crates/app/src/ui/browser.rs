@@ -41,7 +41,7 @@ impl Browser {
                 if let InputEvent::Change = e {
                     let text = input.read(cx).value().to_string();
                     this.state.update(cx, |s, cx| {
-                        s.filter.search = text;
+                        s.library.filter.search = text;
                         cx.notify();
                     });
                 }
@@ -56,9 +56,9 @@ impl Browser {
         let total = s.library.images.len();
         let shown = s.visible_images().len();
         let selected = s.library.selection.len();
-        let filter = s.filter.clone();
-        let sort = s.sort;
-        let desc = s.sort_desc;
+        let filter = s.library.filter.clone();
+        let sort = s.library.sort;
+        let desc = s.library.sort_desc;
         let thumb = s.prefs.view.thumb_size;
         let (st1, st2, st3, st4, st5) = (self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone());
         let sorts = vec![
@@ -93,7 +93,7 @@ impl Browser {
             }))
             .child(div().w(px(130.0)).child(select("sort", sorts, sort, move |k, _, cx| {
                 st1.update(cx, |s, cx| {
-                    s.sort = k;
+                    s.library.sort = k;
                     cx.notify();
                 })
             })))
@@ -102,14 +102,14 @@ impl Browser {
                     .size(22.0)
                     .on_click(move |_, cx| {
                         st2.update(cx, |s, cx| {
-                            s.sort_desc = !s.sort_desc;
+                            s.library.sort_desc = !s.library.sort_desc;
                             cx.notify();
                         })
                     }),
             )
             .child(div().w(px(110.0)).child(select("rating-filter", ratings, filter.min_rating, move |r, _, cx| {
                 st3.update(cx, |s, cx| {
-                    s.filter.min_rating = r;
+                    s.library.filter.min_rating = r;
                     cx.notify();
                 })
             })))
@@ -128,7 +128,7 @@ impl Browser {
                     .when(tag != ColorTag::None, |d| d.bg(hex(tag.rgb())))
                     .on_click(move |_, _, cx| {
                         st.update(cx, |s, cx| {
-                            s.filter.color_tag = if s.filter.color_tag == Some(tag) { None } else { Some(tag) };
+                            s.library.filter.color_tag = if s.library.filter.color_tag == Some(tag) { None } else { Some(tag) };
                             cx.notify();
                         })
                     })

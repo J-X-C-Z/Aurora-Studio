@@ -843,11 +843,12 @@ impl crate::LensCorrection {
     /// Replaces `dust_patches`/`dust_gain` with the fields of `bytes`.
     ///
     /// The `ZLENSDUSTREMOVALENABLED` gate is left alone: a profile loaded while
-    /// the gate is off stays inert until the variant turns it on.
+    /// the gate is off stays inert until the variant turns it on. The
+    /// uniform-light grid is *runtime* calibration and is owned by
+    /// `document::RuntimeInputs`; callers that need it use
+    /// [`parse_light_falloff`] separately, so nothing here enters the document.
     pub fn load_dust_lcc(&mut self, bytes: &[u8]) -> Result<usize, DustLccError> {
-        let grid = parse_light_falloff(bytes).ok().flatten().map(std::sync::Arc::new);
         let dust = parse(bytes)?;
-        self.uniform_light_grid = grid;
         let count = dust.patches.len();
         self.dust_patches = dust.patches;
         self.dust_gain = dust.gain;
