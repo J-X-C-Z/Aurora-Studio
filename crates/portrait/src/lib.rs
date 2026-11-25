@@ -55,6 +55,7 @@ pub mod metal;
 pub mod metal_mesh;
 pub mod metal_smile;
 pub mod effect_router;
+pub mod native_infer;
 
 /// Packed RGBA8 image, row-major, four bytes per pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]
