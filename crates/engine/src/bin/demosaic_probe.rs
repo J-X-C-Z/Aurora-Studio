@@ -1,6 +1,6 @@
 //! Compares libraw demosaic filters on one RAW file with quality numbers.
 //!
-//! Usage: `cargo run --release -p lumen-engine --bin demosaic_probe [raw] [out_dir]`
+//! Usage: `cargo run --release -p aurora-engine --bin demosaic_probe [raw] [out_dir]`
 
 use std::path::PathBuf;
 use std::time::Instant;

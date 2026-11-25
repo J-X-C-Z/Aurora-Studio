@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! LUMEN_AIMODELS=~/agents/evidence \
-//!   cargo run -p lumen-engine --bin aimask_probe -- photo.jpg /tmp
+//!   cargo run -p aurora-engine --bin aimask_probe -- photo.jpg /tmp
 //! ```
 
 use std::time::Instant;
