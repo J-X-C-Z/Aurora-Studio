@@ -34,11 +34,11 @@ pub fn render(state: &Entity<AppState>, viewer: &Entity<Viewer>, _window: &mut W
     let s = state.read(cx);
     let Some(show) = s.slideshow.clone() else { return div().into_any_element() };
     let ids: Vec<_> = s.visible_images().iter().map(|i| i.id).collect();
-    let at = s.current.and_then(|c| ids.iter().position(|i| *i == c)).map(|i| i + 1).unwrap_or(0);
+    let at = s.library.current.and_then(|c| ids.iter().position(|i| *i == c)).map(|i| i + 1).unwrap_or(0);
     let name = s.current_info().map(|i| i.file_name.clone()).unwrap_or_default();
     // Fade each image up when its own preview arrives, not when it is selected,
     // so the previous picture never flashes at full strength.
-    let frame_id = s.preview.frame.as_ref().map(|f| f.image_id.0).unwrap_or(0);
+    let frame_id = s.preview_state.preview.frame.as_ref().map(|f| f.image_id.0).unwrap_or(0);
 
     let (st_prev, st_play, st_next, st_exit) = (state.clone(), state.clone(), state.clone(), state.clone());
     let pace = |secs: f32| {

@@ -1528,16 +1528,28 @@ pub(crate) fn exif_orientation_bytes(bytes: &[u8]) -> Option<u16> {
 mod libraw {
     use super::*;
     use std::ffi::{c_char, c_int, c_void, CString};
+    use std::path::PathBuf;
     use std::sync::OnceLock;
 
     const RTLD_NOW: c_int = 2;
 
     #[cfg(target_os = "windows")]
     const LIBRARY_NAMES: [&str; 1] = ["libraw.dll\0"];
+    /// macOS ships the ABI in a versioned dylib (`libraw.25.dylib` for 0.22.x);
+    /// newest first, then the unversioned symlink Homebrew also creates.
     #[cfg(target_os = "macos")]
-    const LIBRARY_NAMES: [&str; 3] = ["libraw.dylib\0", "libraw.23.dylib\0", "libraw.dylib.23\0"];
+    const POSIX_LIBRARY_NAMES: [&str; 4] =
+        ["libraw.25.dylib", "libraw.24.dylib", "libraw.23.dylib", "libraw.dylib"];
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    const LIBRARY_NAMES: [&str; 2] = ["libraw.so.23\0", "libraw.so\0"];
+    const POSIX_LIBRARY_NAMES: [&str; 2] = ["libraw.so.23", "libraw.so"];
+    /// Directories `dlopen` does not search on its own. Homebrew on Apple
+    /// silicon installs into `/opt/homebrew/lib`; Intel and source builds use
+    /// `/usr/local/lib`. Linux gets the common multi-arch directories.
+    #[cfg(target_os = "macos")]
+    const LIBRARY_PREFIXES: [&str; 2] = ["/opt/homebrew/lib", "/usr/local/lib"];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    const LIBRARY_PREFIXES: [&str; 3] =
+        ["/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib"];
 
     unsafe extern "C" {
         #[cfg(not(target_os = "windows"))]
@@ -1612,8 +1624,14 @@ mod libraw {
     }
 
     fn api() -> Option<&'static Api> {
-        static API: OnceLock<Option<Api>> = OnceLock::new();
-        API.get_or_init(load).as_ref()
+        api_or_error().ok()
+    }
+
+    /// The load result, including why the library is unavailable. The reason is
+    /// cached with the API so a failed `dlopen` is not retried per decode.
+    fn api_or_error() -> Result<&'static Api, String> {
+        static API: OnceLock<Result<Api, String>> = OnceLock::new();
+        API.get_or_init(load).as_ref().map_err(|message| message.clone())
     }
 
     /// Whether the shared library resolved. Used by the decode-route fingerprint.
@@ -1621,39 +1639,130 @@ mod libraw {
         api().is_some()
     }
 
-    fn load() -> Option<Api> {
+    /// The loaded library's version number, or `None` when it is absent.
+    /// Exposed so tests can exercise real discovery without a RAW fixture.
+    pub(super) fn version() -> Option<i32> {
+        let api = api()?;
+        Some(unsafe { (api.version_number)() })
+    }
+
+    fn load() -> Result<Api, String> {
         // The handle stays loaded for the process lifetime: the function pointers
         // below would dangle after a `dlclose`.
-        let handle = LIBRARY_NAMES
+        //
+        // Windows keeps its DLL search (vendor folder then PATH). Every other
+        // platform walks an explicit candidate list because `dlopen` does not
+        // search Homebrew's prefix on its own.
+        #[cfg(target_os = "windows")]
+        let (handle, loaded_from) = LIBRARY_NAMES
             .into_iter()
             .find_map(|name| {
                 let handle = load_library(name);
-                (!handle.is_null()).then_some(handle)
-            })?;
-        Some(Api {
-            init: symbol(handle, "libraw_init")?,
-            open: symbol(handle, "libraw_open_file")?,
+                (!handle.is_null()).then(|| (handle, name.trim_end_matches('\0').to_string()))
+            })
+            .ok_or_else(missing_library_error)?;
+        #[cfg(not(target_os = "windows"))]
+        let (handle, loaded_from) = {
+            let candidates = library_candidates();
+            let mut loaded = None;
+            for candidate in &candidates {
+                let handle = load_library(candidate);
+                if !handle.is_null() {
+                    loaded = Some((handle, candidate.display().to_string()));
+                    break;
+                }
+            }
+            loaded.ok_or_else(|| missing_library_error(&candidates))?
+        };
+        build_api(handle, &loaded_from)
+    }
+
+    fn build_api(handle: *mut c_void, loaded_from: &str) -> Result<Api, String> {
+        macro_rules! required {
+            ($name:literal) => {
+                symbol(handle, $name).ok_or_else(|| {
+                    format!("libraw loaded from {loaded_from} is missing export {}", $name)
+                })?
+            };
+        }
+        Ok(Api {
+            init: required!("libraw_init"),
+            open: required!("libraw_open_file"),
             #[cfg(target_os = "windows")]
-            open_w: symbol(handle, "libraw_open_wfile")?,
+            open_w: required!("libraw_open_wfile"),
             open_buffer: symbol(handle, "libraw_open_buffer"),
-            unpack_name: symbol(handle, "libraw_unpack_function_name")?,
-            unpack: symbol(handle, "libraw_unpack")?,
-            process: symbol(handle, "libraw_dcraw_process")?,
-            make: symbol(handle, "libraw_dcraw_make_mem_image")?,
-            clear: symbol(handle, "libraw_dcraw_clear_mem")?,
-            close: symbol(handle, "libraw_close")?,
-            output_bps: symbol(handle, "libraw_set_output_bps")?,
-            no_auto_bright: symbol(handle, "libraw_set_no_auto_bright")?,
-            output_color: symbol(handle, "libraw_set_output_color")?,
-            gamma: symbol(handle, "libraw_set_gamma")?,
-            demosaic: symbol(handle, "libraw_set_demosaic")?,
-            iwidth: symbol(handle, "libraw_get_iwidth")?,
-            iheight: symbol(handle, "libraw_get_iheight")?,
-            raw_width: symbol(handle, "libraw_get_raw_width")?,
-            raw_height: symbol(handle, "libraw_get_raw_height")?,
-            strerror: symbol(handle, "libraw_strerror")?,
-            version_number: symbol(handle, "libraw_versionNumber")?,
+            unpack_name: required!("libraw_unpack_function_name"),
+            unpack: required!("libraw_unpack"),
+            process: required!("libraw_dcraw_process"),
+            make: required!("libraw_dcraw_make_mem_image"),
+            clear: required!("libraw_dcraw_clear_mem"),
+            close: required!("libraw_close"),
+            output_bps: required!("libraw_set_output_bps"),
+            no_auto_bright: required!("libraw_set_no_auto_bright"),
+            output_color: required!("libraw_set_output_color"),
+            gamma: required!("libraw_set_gamma"),
+            demosaic: required!("libraw_set_demosaic"),
+            iwidth: required!("libraw_get_iwidth"),
+            iheight: required!("libraw_get_iheight"),
+            raw_width: required!("libraw_get_raw_width"),
+            raw_height: required!("libraw_get_raw_height"),
+            strerror: required!("libraw_strerror"),
+            version_number: required!("libraw_versionNumber"),
         })
+    }
+
+    /// Empty result when no candidate is present, never a panic.
+    #[cfg(target_os = "windows")]
+    fn missing_library_error() -> String {
+        format!(
+            "libraw library not found; searched: {}",
+            LIBRARY_NAMES
+                .iter()
+                .map(|name| name.trim_end_matches('\0'))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub(super) fn missing_library_error(candidates: &[PathBuf]) -> String {
+        format!(
+            "libraw library not found; searched: {}",
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    /// The library names to try, and the directories `dlopen` will not search
+    /// by itself. A caller-set `AURORA_LIBRAW_LIB` is tried before any of them.
+    #[cfg(not(target_os = "windows"))]
+    fn library_candidates() -> Vec<PathBuf> {
+        let override_path = std::env::var_os("AURORA_LIBRAW_LIB").map(PathBuf::from);
+        candidate_paths(override_path.as_deref())
+    }
+
+    /// Pure, deterministic and de-duplicated search order: the explicit
+    /// override first, then each known directory crossed with the versioned
+    /// names, then the bare sonames for the platform loader's own path.
+    #[cfg(not(target_os = "windows"))]
+    pub(super) fn candidate_paths(override_path: Option<&Path>) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(path) = override_path {
+            candidates.push(path.to_path_buf());
+        }
+        for prefix in LIBRARY_PREFIXES {
+            for name in POSIX_LIBRARY_NAMES {
+                candidates.push(Path::new(prefix).join(name));
+            }
+        }
+        for name in POSIX_LIBRARY_NAMES {
+            candidates.push(PathBuf::from(name));
+        }
+        let mut seen = std::collections::HashSet::new();
+        candidates.into_iter().filter(|path| seen.insert(path.clone())).collect()
     }
 
     #[cfg(target_os = "windows")]
@@ -1693,49 +1802,14 @@ mod libraw {
         std::ptr::null_mut()
     }
 
-    #[cfg(target_os = "macos")]
-    fn load_library(name: &str) -> *mut c_void {
-        use std::os::unix::ffi::OsStrExt as _;
-        let name = name.trim_end_matches('\0');
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        // 1. Explicit override.
-        if let Some(dir) = std::env::var_os("AURORA_LIBRAW_DIR") {
-            dirs.push(dir.into());
-        }
-        // 2. App bundle: Contents/MacOS/<exe> -> Contents/Frameworks.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                dirs.push(parent.join("../Frameworks"));
-                dirs.push(parent.join("Frameworks"));
-                dirs.push(parent.to_path_buf());
-                dirs.push(parent.join("../Resources"));
-            }
-        }
-        dirs.push(std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../vendor/libraw/lib"
-        )));
-        for dir in dirs {
-            let candidate = dir.join(name);
-            if !candidate.is_file() {
-                continue;
-            }
-            if let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) {
-                let handle = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
-                if !handle.is_null() {
-                    return handle;
-                }
-            }
-        }
-        // 3. Standard macOS name and the dynamic loader's own search path.
-        match CString::new(name) {
-            Ok(c) => unsafe { dlopen(c.as_ptr(), RTLD_NOW) },
-            Err(_) => std::ptr::null_mut(),
-        }
-    }
-
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    fn load_library(name: &str) -> *mut c_void {
+    #[cfg(not(target_os = "windows"))]
+    fn load_library(path: &Path) -> *mut c_void {
+        // `dlopen` needs a NUL-terminated path; a path with an interior NUL
+        // cannot name a library, so treat it as "not found" instead of
+        // aborting.
+        let Ok(name) = CString::new(path.to_string_lossy().as_bytes()) else {
+            return std::ptr::null_mut();
+        };
         unsafe { dlopen(name.as_ptr() as *const c_char, RTLD_NOW) }
     }
 
@@ -1750,20 +1824,22 @@ mod libraw {
         (!ptr.is_null()).then(|| unsafe { std::mem::transmute_copy(&ptr) })
     }
 
+    /// The argument type `libraw_open_wfile` / `libraw_open_file` expects.
     #[cfg(target_os = "windows")]
-    type PathArg = Vec<u16>;
+    type LoadPath = Vec<u16>;
     #[cfg(not(target_os = "windows"))]
-    type PathArg = CString;
+    type LoadPath = CString;
 
-    fn start(path: &Path) -> Result<(*mut c_void, &'static Api, PathArg), String> {
-        let api = api().ok_or("libraw library not found")?;
+    fn start(path: &Path) -> Result<(*mut c_void, &'static Api, LoadPath), String> {
+        let api = api_or_error()?;
         #[cfg(target_os = "windows")]
-        let path = {
+        let path: LoadPath = {
             use std::os::windows::ffi::OsStrExt;
             path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>()
         };
         #[cfg(not(target_os = "windows"))]
-        let path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| "path has a NUL")?;
+        let path: LoadPath =
+            CString::new(path.to_string_lossy().as_bytes()).map_err(|_| "path has a NUL")?;
         let data = unsafe { (api.init)(0) };
         if data.is_null() {
             return Err("libraw_init returned null".into());
@@ -1887,7 +1963,7 @@ mod libraw {
     impl<'a> Session<'a> {
         /// Opens `path`, preferring the bytes the caller already read.
         pub(super) fn open(path: &Path, bytes: &'a [u8], quality: i32) -> Result<Self, String> {
-            let api = api().ok_or("libraw library not found")?;
+            let api = api_or_error()?;
             if let Some(open_buffer) = api.open_buffer {
                 let data = unsafe { (api.init)(0) };
                 if data.is_null() {
@@ -2522,6 +2598,71 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn candidates_put_the_override_first_then_platform_names() {
+        let override_path = PathBuf::from("/definitely/custom/libraw.dylib");
+        let candidates = libraw::candidate_paths(Some(&override_path));
+        assert_eq!(candidates.first(), Some(&override_path));
+
+        #[cfg(target_os = "macos")]
+        let expected = [
+            "/opt/homebrew/lib/libraw.25.dylib",
+            "/usr/local/lib/libraw.24.dylib",
+            "libraw.23.dylib",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = [
+            "/usr/local/lib/libraw.so.23",
+            "/usr/lib/libraw.so.23",
+            "libraw.so",
+        ];
+        for name in expected {
+            assert!(
+                candidates.iter().any(|path| path.as_path() == Path::new(name)),
+                "missing {name} in {candidates:?}"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn candidates_drop_a_duplicate_override() {
+        #[cfg(target_os = "macos")]
+        let duplicate = PathBuf::from("/opt/homebrew/lib/libraw.25.dylib");
+        #[cfg(not(target_os = "macos"))]
+        let duplicate = PathBuf::from("/usr/local/lib/libraw.so.23");
+
+        let candidates = libraw::candidate_paths(Some(&duplicate));
+        assert_eq!(candidates.first(), Some(&duplicate));
+        assert_eq!(
+            candidates.iter().filter(|path| **path == duplicate).count(),
+            1,
+            "override must not repeat the same default candidate: {candidates:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn missing_library_message_lists_every_candidate() {
+        let candidates = libraw::candidate_paths(Some(Path::new("/no/such/libraw.dylib")));
+        let message = libraw::missing_library_error(&candidates);
+        assert!(message.contains("libraw library not found"), "{message}");
+        for candidate in &candidates {
+            assert!(message.contains(&candidate.display().to_string()), "{message}");
+        }
+    }
+
+    #[test]
+    fn real_libraw_probe_is_conditional() {
+        // No assertion when the host has no library: this only exercises the
+        // real loader path (Homebrew here, absent on the default CI runner).
+        match libraw::version() {
+            Some(version) => assert!(version > 0, "unexpected libraw version {version:#x}"),
+            None => eprintln!("libraw is not installed on this host; skipping real-library probe"),
+        }
     }
 
     #[test]

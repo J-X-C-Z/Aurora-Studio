@@ -5,6 +5,10 @@
 //! Approximation only — no seam matching or source-point search, and the ring
 //! is sampled at 32 angles.
 //! Limits: radii follow the spot radius fraction of the oriented image's long side.
+//!
+//! It depends only on adjustment data (`AdjustmentSet`, `Spot`) and the geometry
+//! value type, so it lives in `processing`; `crate::mock` re-exports it so the
+//! existing render call sites keep compiling unchanged.
 
 use crate::{AdjustmentSet, CoverKind, CoverPatch, Geometry, Spot, SpotKind};
 

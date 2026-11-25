@@ -19,6 +19,11 @@
 //! Both are applied to luma and then carried to R/G/B (clarity adds the same
 //! delta to all three, structure multiplies all three by the same gain), which
 //! is what the Y/Cb/Cr round trip in the native kernel amounts to.
+//!
+//! This CPU kernel depends only on [`Clarity`]/[`ClarityMethod`], so it lives
+//! in `processing` rather than `mock`; `crate::mock` re-exports it so existing
+//! call sites and the GPU module keep compiling unchanged.
+
 use rayon::prelude::*;
 
 use crate::{Clarity, ClarityMethod};
@@ -584,6 +589,10 @@ mod tests {
         }
     }
 
+    // Test-only: `crate::Source` and `crate::render` are the crate-root
+    // re-exports of the legacy renderer in `mock`. The production clarity
+    // stage above never touches the renderer; only this ignored benchmark
+    // builds a `Source` and calls `render`.
     /// Full-frame CPU cost of the two halves of the stage. Run with
     /// `cargo test --release -p aurora-engine --lib --features z6iii-raw-export
     ///  clarity_stage_bench -- --ignored --nocapture`.
@@ -667,14 +676,14 @@ mod tests {
             px[2] = v.wrapping_add(91);
             px[3] = 255;
         }
-        let src = crate::mock::process::Source::from_rgba(sw, sh, &rgba);
+        let src = crate::Source::from_rgba(sw, sh, &rgba);
         let render_ms = |clarity: f32| -> (f64, Vec<u8>) {
             let adj = crate::AdjustmentSet {
                 clarity: mk(clarity, 0.0),
                 ..Default::default()
             };
             let t = std::time::Instant::now();
-            let out = crate::mock::process::render(
+            let out = crate::render(
                 &src,
                 &adj,
                 crate::NormRect::FULL,

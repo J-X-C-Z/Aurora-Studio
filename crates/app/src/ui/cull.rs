@@ -42,7 +42,7 @@ pub fn render(state: &Entity<AppState>, viewer: &Entity<Viewer>, _window: &mut W
     let Some(cull) = s.cull.clone() else { return div().into_any_element() };
     let p = pal(cx).clone();
     let images = s.cull_images();
-    let at = s.current.and_then(|c| images.iter().position(|(i, _)| *i == c)).unwrap_or(0);
+    let at = s.library.current.and_then(|c| images.iter().position(|(i, _)| *i == c)).unwrap_or(0);
     let info = s.current_info().cloned();
     let rating = info.as_ref().map(|i| i.rating).unwrap_or(0);
     let name = info.as_ref().map(|i| i.file_name.clone()).unwrap_or_default();
@@ -104,7 +104,7 @@ pub fn render(state: &Entity<AppState>, viewer: &Entity<Viewer>, _window: &mut W
     let hi = (at + AROUND + 1).min(images.len());
     let strip = images[lo..hi].iter().map(|(id, r)| {
         let (id, r) = (*id, *r);
-        let current = Some(id) == s.current;
+        let current = Some(id) == s.library.current;
         let st = state.clone();
         v_flex()
             .id(SharedString::from(format!("cull-thumb-{}", id.0)))
@@ -121,7 +121,7 @@ pub fn render(state: &Entity<AppState>, viewer: &Entity<Viewer>, _window: &mut W
                     .border_color(if current { gpui_kit::white() } else { hexa(0xffffff, 0.0) })
                     .bg(hexa(0xffffff, 0.06))
                     .overflow_hidden()
-                    .when_some(s.thumbs.get(&id).cloned(), |d, thumb| d.child(img(thumb).size_full().object_fit(ObjectFit::Contain))),
+                    .when_some(s.preview_state.thumbs.get(&id).cloned(), |d, thumb| d.child(img(thumb).size_full().object_fit(ObjectFit::Contain))),
             )
             .child(div().text_xs().text_color(if r < 0 { p.danger } else { hexa(0xffffff, 0.7) }).child(match r {
                 r if r < 0 => "✕".to_string(),

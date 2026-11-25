@@ -164,7 +164,7 @@ pub fn render(
     let pl = *pl;
     let adj = s.adj();
     let cursor = s.cursor;
-    let view = s.view.clone();
+    let view = s.prefs.view.clone();
     let crop = adj.geometry.crop;
     let in_crop = cursor == CursorTool::Crop;
     let shown_crop = if in_crop { NormRect::FULL } else { crop };
@@ -178,20 +178,20 @@ pub fn render(
     };
 
     let layer = s.active_layer_ref().cloned();
-    let notes: Vec<Vec<(f32, f32)>> = s.current.and_then(|id| s.annotations.get(&id).cloned()).unwrap_or_default();
+    let notes: Vec<Vec<(f32, f32)>> = s.library.current.and_then(|id| s.library.annotations.get(&id).cloned()).unwrap_or_default();
     let keystone_guides = cursor == CursorTool::Keystone;
     let ks = adj.geometry.keystone.clone();
-    let show_shapes = cursor.is_mask_tool() || s.panels.mask_overlay;
+    let show_shapes = cursor.is_mask_tool() || s.prefs.panels.mask_overlay;
     let spots = if cursor == CursorTool::Spot { adj.spots.clone() } else { Vec::new() };
-    let picker = s.picker_point.zip(s.sampled_color).filter(|_| cursor == CursorTool::ColorPicker);
+    let picker = s.preview_state.picker_point.zip(s.preview_state.sampled_color).filter(|_| cursor == CursorTool::ColorPicker);
     let image_w_view = fw / shown_crop.width.max(1e-4);
-    let brush_r = s.panels.brush_size * image_w_view.max(fh / shown_crop.height.max(1e-4));
+    let brush_r = s.prefs.panels.brush_size * image_w_view.max(fh / shown_crop.height.max(1e-4));
 
     let (cl, ct) = pl.to_view((crop.x, crop.y));
     let (cw, ch) = (crop.width * fw, crop.height * fh);
-    let dim = hexa(0x000000, s.settings.crop_mask);
-    let crop_guide = s.settings.crop_guide;
-    let divisions = s.settings.grid_divisions.max(2) as usize;
+    let dim = hexa(0x000000, s.prefs.settings.crop_mask);
+    let crop_guide = s.prefs.settings.crop_guide;
+    let divisions = s.prefs.settings.grid_divisions.max(2) as usize;
 
     div()
         .absolute()

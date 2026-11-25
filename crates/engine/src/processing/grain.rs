@@ -5,6 +5,11 @@
 //! composites an erf-Gaussian-blurred noise plane through the 257-entry
 //! visibility LUT. Both planes come from the same integer hash family, with
 //! every constant copied from `grains.cl`.
+//!
+//! This stage is a pure pixel operation that depends only on adjustment data
+//! ([`crate::FilmGrain`]), so it lives in `processing` rather than `mock`.
+//! `crate::mock` re-exports it so pre-existing call sites keep compiling while
+//! the production renderer is migrated out of the mock module.
 
 use rayon::prelude::*;
 

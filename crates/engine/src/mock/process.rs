@@ -89,36 +89,39 @@ fn box_downscale(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32
         .collect()
 }
 
-fn srgb_to_linear(v: f32) -> f32 {
-    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-}
+// Color/tone primitives are defined in `processing::color`; imported here so
+// this renderer and its tests keep the unqualified names.
+#[cfg(test)]
+use crate::processing::color::GAMMA_LUT_SIZE;
+use crate::processing::color::{
+    GammaLut, catmull_rom, color_balance_zone_weights, color_editor, color_range_weight, lut_get,
+    lut_of, luma, luma601, render_wb_gains, srgb_to_linear, sstep, vignette_center, vignette_gain,
+    wheel_offset,
+};
+#[cfg(test)]
+use crate::processing::color::{
+    band_weight, hue_distance, hue_rgb, hsv_to_rgb, rgb_to_hsv, signed_hue_delta,
+};
+pub(crate) use crate::processing::color::{linear_to_srgb, white_balance_gains};
 
-pub(crate) fn linear_to_srgb(v: f32) -> f32 {
-    if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
-}
+// Tone and statistics stages live in `processing`; imported here so this
+// renderer and its tests keep the unqualified names.
+use crate::processing::statistics::{box_blur3, histogram, luma_plane, mean3x3};
+#[cfg(test)]
+use crate::processing::statistics::{box_blur_h, box_blur_v};
+use crate::processing::tone::{apply_dehaze, apply_hdr, tone_user, tone_user_core};
 
-/// Linear → sRGB over `0 ..= 4` linear, so highlight recovery has headroom to pull from.
-const GAMMA_LUT_SIZE: usize = 8192;
-struct GammaLut(&'static [f32; GAMMA_LUT_SIZE]);
-
-impl GammaLut {
-    const SIZE: usize = GAMMA_LUT_SIZE;
-    const RANGE: f32 = 4.0;
-
-    fn new() -> Self {
-        static TABLE: OnceLock<[f32; GammaLut::SIZE]> = OnceLock::new();
-        Self(TABLE.get_or_init(|| {
-            std::array::from_fn(|i| {
-                linear_to_srgb(i as f32 / (Self::SIZE - 1) as f32 * Self::RANGE)
-            })
-        }))
-    }
-
-    fn get(&self, v: f32) -> f32 {
-        let i = (v.max(0.0) / Self::RANGE * (Self::SIZE - 1) as f32) as usize;
-        self.0[i.min(Self::SIZE - 1)]
-    }
-}
+// Encoding/banding quantisers live in `processing::encoding`; imported here so
+// this renderer and its tests keep the unqualified names.
+use crate::processing::encoding::{encode_f32_frame, merge_wide_delta, upsample};
+#[cfg(windows)]
+use crate::processing::encoding::{band_region, encode_io_rows};
+use super::plan::{
+    BandingPlan, LayerOutputWeightKey, LayerPlan, MaskGrid, MaskGridCacheKey, PixelGains, Plan,
+    grid_dims, layer_has_spatial, layer_plan,
+};
+#[cfg(test)]
+use super::plan::shape_value;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SourceSample {
@@ -942,280 +945,6 @@ impl Source {
     }
 }
 
-/// Catmull-Rom blend of `b` and `c` at `t`, steering with the outer taps.
-fn catmull_rom(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-    let (t2, t3) = (t * t, t * t * t);
-    0.5 * (2.0 * b + (c - a) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (3.0 * b - 3.0 * c + d - a) * t3)
-}
-
-/// Approximate white point of a black body at `kelvin`, normalized to green.
-fn kelvin_rgb(kelvin: f32) -> [f32; 3] {
-    let t = kelvin.clamp(1000.0, 40000.0) / 100.0;
-    let r = if t <= 66.0 { 255.0 } else { 329.698_73 * (t - 60.0).powf(-0.133_204_76) };
-    let g = if t <= 66.0 { 99.470_8 * t.ln() - 161.119_57 } else { 288.122_16 * (t - 60.0).powf(-0.075_514_85) };
-    let b = if t >= 66.0 {
-        255.0
-    } else if t <= 19.0 {
-        0.0
-    } else {
-        138.517_73 * (t - 10.0).ln() - 305.044_8
-    };
-    let (r, g, b) = (r.clamp(1.0, 255.0), g.clamp(1.0, 255.0), b.clamp(1.0, 255.0));
-    [srgb_to_linear(r / 255.0) / srgb_to_linear(g / 255.0), 1.0, srgb_to_linear(b / 255.0) / srgb_to_linear(g / 255.0)]
-}
-
-pub(crate) fn white_balance_gains(kelvin: f32, tint: f32) -> [f32; 3] {
-    let shot = kelvin_rgb(5600.0);
-    let set = kelvin_rgb(kelvin);
-    let tint_gain = 1.0 - tint / 100.0 * 0.6;
-    [shot[0] / set[0], tint_gain, shot[2] / set[2]]
-}
-
-/// Pixel gains: exact stored C1 gains when the import had them, otherwise the
-/// Kelvin/Tint approximation. K/T is display-only once exact gains exist.
-fn render_wb_gains(w: &crate::WhiteBalance) -> [f32; 3] {
-    w.gains
-        .filter(|g| g.iter().all(|v| v.is_finite() && *v > 0.0))
-        .unwrap_or_else(|| white_balance_gains(w.kelvin, w.tint))
-}
-
-fn luma(c: [f32; 3]) -> f32 {
-    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
-}
-
-/// Rec.601 luma, the weight Capture One's `ZGRADATIONCURVEY` stage uses.
-fn luma601(c: [f32; 3]) -> f32 {
-    0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
-}
-
-fn sstep(a: f32, b: f32, x: f32) -> f32 {
-    if b <= a {
-        return if x < a { 0.0 } else { 1.0 };
-    }
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// `CImgOpLensLight`'s manual branch, from the OpenCL kernel
-/// `z181b8373ba` (`LensLightRadial.cl` inside `ImgCoreDll.dll`).
-///
-/// The kernel computes `r = length(scale * (tile + pixel) - centre)`, looks the
-/// EV up in a 16-knot spline and returns `exp(-ln2 * ev)`. Measured against
-/// Capture One's own renderer, that spline tracks a plain quadratic in the
-/// normalised radius to within 0.06 EV of a 2 EV slider:
-///
-/// ```text
-/// elliptic : ev = amount * 2 * ((x-1/2)^2 + (y-1/2)^2)
-/// circular : ev = amount * 4 * ((x-1/2)^2*a^2 + (y-1/2)^2) / (a^2 + 1)
-/// ```
-///
-/// with `a` the frame aspect. Both put `amount` EV at the frame corner and
-/// nothing at the centre, which is what the slider means. `x` and `y` are
-/// normalised to the rendered frame, so the metric follows the crop.
-///
-/// The sign is Capture One's: `IC_Vignetting.lightAmount` is a *lightening*
-/// amount, so +2 EV takes the corner from 6070 to 13107 in that renderer and
-/// -2 EV down to 2824.
-fn vignette_gain(
-    x: f32,
-    y: f32,
-    method: VignetteMethod,
-    amount: f32,
-    aspect: f32,
-    center: [f32; 2],
-) -> f32 {
-    if amount == 0.0 || !amount.is_finite() {
-        return 1.0;
-    }
-    let (dx, dy) = (x - center[0], y - center[1]);
-    let a2 = if aspect.is_finite() && aspect > 0.0 { aspect * aspect } else { 1.0 };
-    let rho2 = match method {
-        // Corner-normalised ellipse: the corner sits at 1.0.
-        VignetteMethod::EllipticOnCrop => 2.0 * (dx * dx + dy * dy),
-        // Circle in pixel space, scaled so the frame corner is again 1.0.
-        VignetteMethod::Circular | VignetteMethod::CircularCrop => {
-            4.0 * (dx * dx * a2 + dy * dy) / (a2 + 1.0)
-        }
-    };
-    // Measured against the native renderer: the slider is capped at 3 EV in
-    // both directions, so a custom centre far from the frame corner cannot
-    // push the falloff past that.
-    (amount * rho2).clamp(-3.0, 3.0).exp2()
-}
-
-/// Resolves `IC_Vignetting.center` into normalised frame coordinates.
-///
-/// `cam` and `crop` both land on the rendered frame's centre (the sensor centre
-/// is the canvas centre until the frame is cropped). `lens` uses
-/// `ZLENSOPTICCENTER`, stored in canvas pixels, and falls back to the centre
-/// when the lens database had no measurement. `custom` is `IC_Vignetting.x/y`,
-/// also canvas pixels. Every result is clamped to the frame, which is what the
-/// native renderer does with an out-of-range centre.
-fn vignette_center(adj: &AdjustmentSet, size: [f32; 2]) -> [f32; 2] {
-    let (w, h) = (size[0].max(1.0), size[1].max(1.0));
-    let center = match adj.vignetting.center {
-        VignetteCenter::Cam | VignetteCenter::Crop => [0.5, 0.5],
-        VignetteCenter::Lens => adj
-            .lens
-            .optic_center
-            .map(|p| [p[0] / w, p[1] / h])
-            .unwrap_or([0.5, 0.5]),
-        VignetteCenter::Custom => [adj.vignetting.x / w, adj.vignetting.y / h],
-    };
-    center.map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.5 })
-}
-
-pub(crate) fn hue_rgb(hue: f32) -> [f32; 3] {
-    let h = (hue.rem_euclid(360.0)) / 60.0;
-    let x = 1.0 - (h % 2.0 - 1.0).abs();
-    match h as u32 {
-        0 => [1.0, x, 0.0],
-        1 => [x, 1.0, 0.0],
-        2 => [0.0, 1.0, x],
-        3 => [0.0, x, 1.0],
-        4 => [x, 0.0, 1.0],
-        _ => [1.0, 0.0, x],
-    }
-}
-
-fn rgb_to_hsv(c: [f32; 3]) -> (f32, f32, f32) {
-    let max = c[0].max(c[1]).max(c[2]);
-    let min = c[0].min(c[1]).min(c[2]);
-    let d = max - min;
-    let h = if d < 1e-6 {
-        0.0
-    } else if max == c[0] {
-        60.0 * ((c[1] - c[2]) / d).rem_euclid(6.0)
-    } else if max == c[1] {
-        60.0 * ((c[2] - c[0]) / d + 2.0)
-    } else {
-        60.0 * ((c[0] - c[1]) / d + 4.0)
-    };
-    let s = if max < 1e-6 { 0.0 } else { d / max };
-    (h, s, max)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let base = hue_rgb(h);
-    [v * (1.0 - s + s * base[0]), v * (1.0 - s + s * base[1]), v * (1.0 - s + s * base[2])]
-}
-
-fn hue_distance(a: f32, b: f32) -> f32 {
-    let d = (a - b).rem_euclid(360.0);
-    d.min(360.0 - d)
-}
-
-/// Offset a color wheel adds, centered on neutral.
-fn wheel_offset(w: &ColorWheel, strength: f32) -> [f32; 3] {
-    let c = hue_rgb(w.hue);
-    let mean = (c[0] + c[1] + c[2]) / 3.0;
-    let s = w.saturation * strength;
-    let l = w.lightness * 0.25;
-    [(c[0] - mean) * s + l, (c[1] - mean) * s + l, (c[2] - mean) * s + l]
-}
-
-/// A coarse raster of one layer's shape mask in oriented-image space.
-#[derive(Clone)]
-struct MaskGrid {
-    w: usize,
-    h: usize,
-    data: Vec<f32>,
-}
-
-impl MaskGrid {
-    /// `cell_px` is the size of one grid cell in source pixels, so the mask's
-    /// pixel radii (`feather`, `refine`) convert to grid pixels.
-    /// `guide` is an optional luminance grid (same layout) used by `refine`.
-    ///
-    /// `built` holds the masks of the layers already planned, in draw order;
-    /// a [`MaskShape::Copy`] reads its source from there.
-    fn build(
-        mask: &Mask,
-        aspect: f32,
-        cell_px: f32,
-        guide: Option<&[f32]>,
-        built: &[(u64, std::sync::Arc<MaskGrid>)],
-    ) -> Self {
-        let (w, h) = grid_dims(aspect);
-        let mut data = vec![0.0f32; w * h];
-        // Resolve each AI shape's cached plane once, not per grid cell.
-        let planes: Vec<Option<std::sync::Arc<crate::aimask::MaskPlane>>> = mask
-            .shapes
-            .iter()
-            .map(|shape| match shape {
-                MaskShape::Ai(ai) => ai.cache_key.as_deref().and_then(crate::aimask::lookup),
-                _ => None,
-            })
-            .collect();
-        for (i, v) in data.iter_mut().enumerate() {
-            let p = [((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32];
-            let mut m = 0.0f32;
-            for (shape, plane) in mask.shapes.iter().zip(&planes) {
-                let (op, value) = match shape {
-                    MaskShape::Copy { from_layer, op } => (
-                        *op,
-                        built
-                            .iter()
-                            .find(|(id, _)| id == from_layer)
-                            .map_or(0.0, |(_, g)| g.sample(p)),
-                    ),
-                    other => shape_value(other, p, aspect, plane.as_deref()),
-                };
-                m = match op {
-                    MaskOp::Add => m + value,
-                    MaskOp::Subtract => m - value,
-                }
-                .clamp(0.0, 1.0);
-            }
-            *v = m;
-        }
-        let mut grid = Self { w, h, data };
-        if mask.feather > 0.0 {
-            let r = (mask.feather / cell_px.max(1e-3)).round() as i32;
-            if r > 0 {
-                grid.data = box_blur_grid(&grid.data, w, h, r);
-            }
-        }
-        if mask.refine > 0.0 {
-            let r = (mask.refine / cell_px.max(1e-3)).round() as i32;
-            if r > 0 {
-                grid.data = match guide {
-                    Some(guide) => guided_filter_grid(&grid.data, guide, w, h, r),
-                    None => box_blur_grid(&grid.data, w, h, r),
-                };
-            }
-        }
-        grid
-    }
-
-    fn sample(&self, p: [f32; 2]) -> f32 {
-        let x = (p[0] * self.w as f32 - 0.5).clamp(0.0, self.w as f32 - 1.001);
-        let y = (p[1] * self.h as f32 - 0.5).clamp(0.0, self.h as f32 - 1.001);
-        let (x0, y0) = (x as usize, y as usize);
-        let (tx, ty) = (x - x0 as f32, y - y0 as f32);
-        let at = |xx: usize, yy: usize| self.data[yy * self.w + xx];
-        let top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
-        let bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
-        top + (bottom - top) * ty
-    }
-}
-
-/// Grid resolution of a mask raster: 256 cells across, the height follows the
-/// oriented aspect.
-fn grid_dims(aspect: f32) -> (usize, usize) {
-    let w = 256usize;
-    let h = ((256.0 / aspect).round() as usize).clamp(32, 512);
-    (w, h)
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct MaskGridCacheKey {
-    source: u64,
-    geometry: Geometry,
-    layers: Vec<(u64, Mask)>,
-    has_guide: bool,
-}
-
 fn cached_mask_grids(
     src: &Source,
     adj: &AdjustmentSet,
@@ -1286,150 +1015,6 @@ fn cached_mask_grids(
         entries.push((key, Arc::clone(&grids)));
     }
     grids
-}
-
-/// The ellipse fallback looks like a real mask in the viewer, so say once why
-/// it is being used.
-fn warn_missing_ai_mask(ai: &AiMask) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            "no segmentation plane for the {:?} AI mask (cache key {:?}); using the placeholder shape",
-            ai.kind,
-            ai.cache_key
-        );
-    }
-}
-
-fn shape_value(
-    shape: &MaskShape,
-    p: [f32; 2],
-    aspect: f32,
-    plane: Option<&crate::aimask::MaskPlane>,
-) -> (MaskOp, f32) {
-    match shape {
-        MaskShape::Brush(stroke) => {
-            let mut best = 0.0f32;
-            // `size` is a fraction of the long side; distance is measured in
-            // short-side units so aspect and size share one scale.
-            let long = aspect.max(1.0);
-            let r = (stroke.size * long).max(1e-4);
-            let hard = (stroke.hardness / 100.0).clamp(0.0, 0.99);
-            for pt in &stroke.points {
-                let dx = (p[0] - pt[0]) * aspect;
-                let dy = p[1] - pt[1];
-                let d = (dx * dx + dy * dy).sqrt() / r;
-                let v = 1.0 - sstep(hard, 1.0, d);
-                best = best.max(v * pt[2].max(0.05));
-            }
-            (stroke.op, best * stroke.opacity / 100.0)
-        }
-        MaskShape::Linear(g) => {
-            let d = [g.end[0] - g.start[0], g.end[1] - g.start[1]];
-            let len2 = (d[0] * d[0] + d[1] * d[1]).max(1e-6);
-            let t = ((p[0] - g.start[0]) * d[0] + (p[1] - g.start[1]) * d[1]) / len2;
-            (g.op, 1.0 - sstep(0.0, 1.0, t))
-        }
-        MaskShape::Radial(g) => {
-            let (s, c) = g.rotation.to_radians().sin_cos();
-            let dx = (p[0] - g.center[0]) * aspect;
-            let dy = p[1] - g.center[1];
-            let rx = (dx * c + dy * s) / (g.radius[0] * aspect).max(1e-4);
-            let ry = (-dx * s + dy * c) / g.radius[1].max(1e-4);
-            let d = (rx * rx + ry * ry).sqrt();
-            let inner = 1.0 - (g.feather / 100.0).clamp(0.0, 1.0);
-            let v = 1.0 - sstep(inner, 1.0, d);
-            (g.op, if g.inverted { 1.0 - v } else { v })
-        }
-        MaskShape::Raster(r) => (r.op, r.sample(p)),
-        MaskShape::Ai(ai) => {
-            if let Some(plane) = plane {
-                return (ai.op, plane.sample(p));
-            }
-            warn_missing_ai_mask(ai);
-            let subject = {
-                let dx = (p[0] - 0.5) / 0.28;
-                let dy = (p[1] - 0.58) / 0.42;
-                1.0 - sstep(0.85, 1.0, (dx * dx + dy * dy).sqrt())
-            };
-            let v = match ai.kind {
-                AiMaskKind::Subject | AiMaskKind::Person | AiMaskKind::Clothing => subject,
-                AiMaskKind::Background => 1.0 - subject,
-                AiMaskKind::Sky => 1.0 - sstep(0.35, 0.5, p[1]),
-                AiMaskKind::Skin | AiMaskKind::Eyes | AiMaskKind::Lips => {
-                    let dx = (p[0] - 0.5) / 0.15;
-                    let dy = (p[1] - 0.42) / 0.2;
-                    1.0 - sstep(0.8, 1.0, (dx * dx + dy * dy).sqrt())
-                }
-                AiMaskKind::Hair => {
-                    let dx = (p[0] - 0.5) / 0.2;
-                    let dy = (p[1] - 0.3) / 0.15;
-                    1.0 - sstep(0.8, 1.0, (dx * dx + dy * dy).sqrt())
-                }
-            };
-            (ai.op, v)
-        }
-        // Copies are resolved by `MaskGrid::build`, which has the other layers.
-        MaskShape::Copy { op, .. } => (*op, 0.0),
-    }
-}
-
-/// Separable box blur over a grid, radius `r` cells, edges clamped.
-fn box_blur_grid(src: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
-    if r <= 0 {
-        return src.to_vec();
-    }
-    let mut tmp = vec![0.0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut sum = 0.0f32;
-            for k in -r..=r {
-                sum += src[y * w + (x as i32 + k).clamp(0, w as i32 - 1) as usize];
-            }
-            tmp[y * w + x] = sum / (2 * r + 1) as f32;
-        }
-    }
-    let mut out = vec![0.0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut sum = 0.0f32;
-            for k in -r..=r {
-                sum += tmp[(y as i32 + k).clamp(0, h as i32 - 1) as usize * w + x];
-            }
-            out[y * w + x] = sum / (2 * r + 1) as f32;
-        }
-    }
-    out
-}
-
-/// One guided filter pass: the mask is smoothed toward the guide's luminance
-/// edges, so a refine radius snaps the mask to the object boundary instead of
-/// smearing across it. `guide` holds luminance in 0..1.
-///
-/// This is the two-window He et al. filter: the local means come from box
-/// blurs, the linear coefficients are averaged over the same window, and the
-/// result is the filtered mask.
-fn guided_filter_grid(mask: &[f32], guide: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
-    let mean_mask = box_blur_grid(mask, w, h, r);
-    let mean_guide = box_blur_grid(guide, w, h, r);
-    let prod: Vec<f32> = mask.iter().zip(guide).map(|(a, b)| a * b).collect();
-    let mean_prod = box_blur_grid(&prod, w, h, r);
-    let sq: Vec<f32> = guide.iter().map(|v| v * v).collect();
-    let mean_sq = box_blur_grid(&sq, w, h, r);
-    let eps = 1e-3;
-    let mut av = vec![0.0f32; w * h];
-    let mut bv = vec![0.0f32; w * h];
-    for i in 0..w * h {
-        let cov = mean_prod[i] - mean_mask[i] * mean_guide[i];
-        let var = (mean_sq[i] - mean_guide[i] * mean_guide[i]).max(0.0);
-        let a = cov / (var + eps);
-        av[i] = a;
-        bv[i] = mean_mask[i] - a * mean_guide[i];
-    }
-    let mean_a = box_blur_grid(&av, w, h, r);
-    let mean_b = box_blur_grid(&bv, w, h, r);
-    (0..w * h).map(|i| (mean_a[i] * mask[i] + mean_b[i]).clamp(0.0, 1.0)).collect()
 }
 
 /// Oriented-image point to source-image point: flips first, then the
@@ -1515,101 +1100,6 @@ fn luma_range_weight(r: &LumaRange, l: f32) -> f32 {
     if r.invert { 1.0 - w } else { w }
 }
 
-fn color_range_weight(r: &ColorRange, c: [f32; 3]) -> f32 {
-    let (h, s, _) = rgb_to_hsv(c);
-    let half = r.width / 2.0;
-    let d = hue_distance(h, r.hue);
-    let hue_w = 1.0 - sstep(half, half + r.smoothness.max(0.1), d);
-    hue_w * sstep(r.min_saturation * 0.5, r.min_saturation + 0.05, s)
-}
-
-struct LayerPlan<'a> {
-    layer: &'a Layer,
-    grid: Option<Arc<MaskGrid>>,
-    overlay: bool,
-    wb_gains: Option<[f32; 3]>,
-    /// The layer's curves, precomputed as 256-entry LUTs.
-    curve_rgb: Option<[f32; 256]>,
-    curve_r: Option<[f32; 256]>,
-    curve_g: Option<[f32; 256]>,
-    curve_b: Option<[f32; 256]>,
-    curve_luma: Option<[f32; 256]>,
-    levels: Option<Levels>,
-    /// Constants a per-pixel `local()` would otherwise recompute every time.
-    exposure_gain: f32,
-    tone: TonePlan,
-    hdr: HdrPlan,
-    saturation: f32,
-    simple_exposure: bool,
-    opacity: f32,
-    /// Spatial operators; they need neighbours, so they run on the whole
-    /// frame after the layers have been mixed.
-    moire: Moire,
-    sharpening: Option<Sharpening>,
-    noise_reduction: Option<NoiseReduction>,
-}
-
-fn layer_has_spatial(a: &LocalAdjustments) -> bool {
-    a.moire.amount > 0.0
-        || a.sharpening.as_ref().is_some_and(|sharp| sharp.amount > 0.0)
-        || a.noise_reduction.as_ref().is_some_and(|nr| {
-            nr.luminance > 0.0 || nr.color > 0.0 || nr.single_pixel > 0.0
-        })
-}
-
-/// Builds the per-layer plan in draw order. Each mask is rasterized before the
-/// next layer starts, so a copy mask can read the layers below it.
-fn layer_plan<'a>(
-    l: &'a Layer,
-    adj: &AdjustmentSet,
-    grid: Option<Arc<MaskGrid>>,
-    mask_overlay: Option<u64>,
-) -> LayerPlan<'a> {
-    let a = &l.adjustments;
-    let opacity = (l.opacity / 100.0) * (l.mask.density.clamp(0.0, 100.0) / 100.0);
-    let simple_exposure = a.fill_color.is_none()
-        && a.hdr.highlights == 0.0
-        && a.hdr.shadows == 0.0
-        && a.hdr.whites == 0.0
-        && a.hdr.blacks == 0.0
-        && a.exposure.brightness == 0.0
-        && a.exposure.contrast == 0.0
-        && a.clarity.clarity == 0.0
-        && a.clarity.structure == 0.0
-        && a.dehaze.amount <= 0.0
-        && a.levels.is_none()
-        && a.curves.is_none()
-        && a.exposure.saturation == 0.0
-        && a.color_balance == ColorBalance::default()
-        && a.color_editor == ColorEditor::default()
-        && !a.black_white.as_ref().is_some_and(|bw| bw.enabled);
-    LayerPlan {
-        layer: l,
-        grid,
-        overlay: mask_overlay == Some(l.id),
-        wb_gains: a.white_balance.as_ref().map(|w| {
-            let g = render_wb_gains(w);
-            let base = render_wb_gains(&adj.white_balance);
-            [g[0] / base[0], g[1] / base[1], g[2] / base[2]]
-        }),
-        curve_rgb: a.curves.as_ref().and_then(|c| lut_of(&c.rgb)),
-        curve_r: a.curves.as_ref().and_then(|c| lut_of(&c.red)),
-        curve_g: a.curves.as_ref().and_then(|c| lut_of(&c.green)),
-        curve_b: a.curves.as_ref().and_then(|c| lut_of(&c.blue)),
-        curve_luma: a.curves.as_ref().and_then(|c| lut_of(&c.luma)),
-        levels: a.levels.clone(),
-        exposure_gain: 2f32.powf(a.exposure.exposure * 0.6),
-        tone: TonePlan::new(&a.exposure),
-        hdr: HdrPlan::new(&a.hdr),
-        saturation: 1.0 + a.exposure.saturation / 100.0,
-        simple_exposure,
-        opacity,
-        moire: a.moire.clone(),
-        sharpening: a.sharpening.clone(),
-        noise_reduction: a.noise_reduction.clone(),
-    }
-}
-
 fn layer_plans<'a>(
     src: &Source,
     adj: &'a AdjustmentSet,
@@ -1636,68 +1126,6 @@ fn layer_plans<'a>(
         .zip(grids.iter().cloned())
         .map(|(layer, grid)| layer_plan(layer, adj, grid, mask_overlay))
         .collect()
-}
-
-/// Everything precomputed once per render.
-/// GPU-resident pixel gains for one frame. `vignette` is indexed by output
-/// pixel; `lcc` is a source-resolution gain plane sampled at the source point.
-struct PixelGains {
-    vignette: Option<Arc<Vec<f32>>>,
-    lcc: Option<(Arc<Vec<f32>>, usize, usize)>,
-}
-
-struct Plan<'a> {
-    uniform_light: Option<(crate::dust_lcc::UniformLight<'a>, &'a super::geometry::FrameMap, [f32; 2])>,
-    pixel_gains: Option<PixelGains>,
-    adj: &'a AdjustmentSet,
-    source: u64,
-    /// Frame width / height, for the circular vignette metric.
-    aspect: f32,
-    /// Source canvas in pixels, for the vignette's pixel-space centres.
-    size: [f32; 2],
-    #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    c1_color: Option<crate::z6iii::Z6iiiColorStage>,
-    /// Output-domain BandingSuppression, applied to the developed codes.
-    banding: Option<BandingPlan>,
-    gamma: GammaLut,
-    /// Exact sRGB instead of the preview LUT, so 16-bit export is not capped
-    /// at the LUT's 8192 steps.
-    fine: bool,
-    wb: [f32; 3],
-    exposure: f32,
-    tone: TonePlan,
-    hdr: HdrPlan,
-    saturation: f32,
-    curve_rgb: Option<[f32; 256]>,
-    curve_r: Option<[f32; 256]>,
-    curve_g: Option<[f32; 256]>,
-    curve_b: Option<[f32; 256]>,
-    curve_luma: Option<[f32; 256]>,
-    levels: bool,
-    color_editor: bool,
-    color_balance: bool,
-    layers: Vec<LayerPlan<'a>>,
-}
-
-/// C1 queue stage 77 on developed output codes: the same kernel the verified
-/// 16-bit export runs on Adobe RGB codes, evaluated per source pixel so the
-/// interactive sampler can apply it out of raster order.
-struct BandingPlan {
-    params: crate::c1_banding::Params,
-    tables: crate::c1_banding::Tables,
-    /// Frame size in source pixels, used to turn a normalized sample position
-    /// back into the device coordinate the pattern is keyed on.
-    frame: [f32; 2],
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct LayerOutputWeightKey {
-    source: u64,
-    geometry: Geometry,
-    layers: Vec<(u64, Mask)>,
-    region: NormRect,
-    width: usize,
-    height: usize,
 }
 
 fn cached_layer_coverage(
@@ -1775,17 +1203,6 @@ fn cached_layer_coverage(
         entries.push((key, Arc::clone(&weights)));
     }
     Some(weights)
-}
-
-fn lut_of(c: &Curve) -> Option<[f32; 256]> {
-    (!c.is_identity()).then(|| c.lut())
-}
-
-fn lut_get(lut: &[f32; 256], v: f32) -> f32 {
-    let x = v.clamp(0.0, 1.0) * 255.0;
-    let i = (x as usize).min(254);
-    let t = x - i as f32;
-    lut[i] + (lut[i + 1] - lut[i]) * t
 }
 
 fn portrait_job_id(
@@ -2154,38 +1571,7 @@ pub(crate) fn render_at(
     }
 }
 
-/// Bilinear upsample. `image`'s resize costs more than the half-size render it
-/// would be scaling up, so the fast path does it here in parallel.
-fn upsample(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
-    // The horizontal tap positions are the same for every row.
-    let xs: Vec<(u32, u32, f32)> = (0..tw)
-        .map(|x| {
-            let sx = ((x as f32 + 0.5) * w as f32 / tw as f32 - 0.5).clamp(0.0, w as f32 - 1.0);
-            let x0 = sx.floor() as u32;
-            (x0, (x0 + 1).min(w - 1), sx - x0 as f32)
-        })
-        .collect();
-    let mut out = vec![0u8; (tw * th * 4) as usize];
-    out.par_chunks_mut((tw * 4) as usize).enumerate().for_each(|(y, line)| {
-        let sy = ((y as f32 + 0.5) * h as f32 / th as f32 - 0.5).clamp(0.0, h as f32 - 1.0);
-        let y0 = sy.floor() as u32;
-        let y1 = (y0 + 1).min(h - 1);
-        let ty = sy - y0 as f32;
-        for (x, &(x0, x1, tx)) in xs.iter().enumerate() {
-            let at = |xx: u32, yy: u32| ((yy * w + xx) * 4) as usize;
-            let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            for k in 0..4 {
-                let top = rgba[a + k] as f32 + (rgba[b + k] as f32 - rgba[a + k] as f32) * tx;
-                let bottom = rgba[c + k] as f32 + (rgba[d + k] as f32 - rgba[c + k] as f32) * tx;
-                let v = top + (bottom - top) * ty + 0.5;
-                line[x * 4 + k] = v as u8;
-            }
-        }
-    });
-    out
-}
-
-/// Resolves the output-domain BandingSuppression amount for one render.
+/// Resolves the output-domain BandingSuppression for one render.
 ///
 /// The adjustment `extra` key `BandingReductionAmount` is Capture One's
 /// settings field: a positive value is the user's amplitude and replaces the
@@ -2260,9 +1646,6 @@ fn build_plan<'a>(
         fine,
         wb: render_wb_gains(&adj.white_balance),
         exposure: 2f32.powf(adj.exposure.exposure),
-        tone: TonePlan::new(&adj.exposure),
-        hdr: HdrPlan::new(&adj.hdr),
-        saturation: 1.0 + adj.exposure.saturation / 100.0,
         curve_rgb: lut_of(&adj.curves.rgb),
         curve_r: lut_of(&adj.curves.red),
         curve_g: lut_of(&adj.curves.green),
@@ -2477,15 +1860,6 @@ fn dust_input_key(
     }
 }
 
-/// Kernel-space region of output rows `y0 .. y0 + rows`. With a gain plane the
-/// kernel never reads the normalised coordinates (only the disabled outer
-/// banding does), so a band is bit-identical to the whole-frame call.
-fn band_region(region: NormRect, y0: u32, rows: u32, out_h: u32) -> [f32; 4] {
-    let top = region.y + y0 as f32 / out_h as f32 * region.height;
-    let height = rows as f32 / out_h as f32 * region.height;
-    [region.x, top, region.width, height]
-}
-
 /// Runs the point chain band by band straight from the tile cache into the
 /// `u8`/`u16` output rows. No full-frame `SourceSample`, `Sample` or display
 /// array is created: each band fills the pooled GPU IO frame, the kernel
@@ -2537,44 +1911,6 @@ fn encode_gpu_develop_bands(
         y0 += rows;
     }
     true
-}
-
-/// Quantises a developed band (4 floats per pixel) into the 8-bit and optional
-/// 16-bit output rows.
-fn encode_io_rows(io: &[f32], width: usize, rgba: &mut [u8], rgba16: Option<&mut [u16]>) {
-    let row = width * 4;
-    match rgba16 {
-        Some(wide) => {
-            rgba.par_chunks_mut(row)
-                .zip(wide.par_chunks_mut(row))
-                .zip(io.par_chunks(width * 4))
-                .for_each(|((line8, line16), src_row)| {
-                    for (x, src) in src_row.chunks_exact(4).enumerate() {
-                        let i = x * 4;
-                        for k in 0..3 {
-                            let v = src[k].clamp(0.0, 1.0);
-                            line8[i + k] = (v * 255.0 + 0.5) as u8;
-                            line16[i + k] = (v * 65535.0 + 0.5) as u16;
-                        }
-                        line8[i + 3] = 255;
-                        line16[i + 3] = 65535;
-                    }
-                });
-        }
-        None => {
-            rgba.par_chunks_mut(row)
-                .zip(io.par_chunks(width * 4))
-                .for_each(|(line8, src_row)| {
-                    for (x, src) in src_row.chunks_exact(4).enumerate() {
-                        let i = x * 4;
-                        for k in 0..3 {
-                            line8[i + k] = (src[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        }
-                        line8[i + 3] = 255;
-                    }
-                });
-        }
-    }
 }
 
 /// The plain CPU develop loop, band by band from the tile cache.
@@ -2671,7 +2007,6 @@ fn portrait_stage_cache() -> &'static Mutex<Option<PortraitStageEntry>> {
 fn portrait_stage_adjustments(adj: &AdjustmentSet) -> AdjustmentSet {
     let mut key = adj.clone();
     key.extra.retain(|name, _| !name.starts_with("pc:"));
-    key.portrait_producer_inputs = None;
     key
 }
 
@@ -3833,7 +3168,7 @@ fn render_sized(
             );
         // Face landmarks come from the full decoded source and are mapped
         // through the renderer's FrameMap into the current out_w/out_h stage.
-        let mut producer_inputs = adj.portrait_producer_inputs.as_deref().cloned();
+        let mut producer_inputs: Option<ProducerInputs> = None;
         // PF-F §11: one Stage Frame per rendered frame. Both portrait blocks
         // below used to rebuild the same RGBA stage image from `rgba.clone()`;
         // build it once here and let both read it.
@@ -4190,44 +3525,6 @@ fn precurve_line_with<F>(
     }
 }
 
-/// Quantises a finished f32 frame into the 8-bit preview and 16-bit export
-/// buffers.
-fn encode_f32_frame(rgb: &[[f32; 3]], rgba: &mut [u8], rgba16: Option<&mut [u16]>, w: usize) {
-    let row = w * 4;
-    match rgba16 {
-        Some(wide_line) => {
-            rgba.par_chunks_mut(row)
-                .zip(wide_line.par_chunks_mut(row))
-                .zip(rgb.par_chunks(w))
-                .for_each(|((line8, line16), src_row)| {
-                    for (x, &c) in src_row.iter().enumerate() {
-                        let i = x * 4;
-                        for k in 0..3 {
-                            let v = c[k].clamp(0.0, 1.0);
-                            line8[i + k] = (v * 255.0 + 0.5) as u8;
-                            line16[i + k] = (v * 65535.0 + 0.5) as u16;
-                        }
-                        line8[i + 3] = 255;
-                        line16[i + 3] = 65535;
-                    }
-                });
-        }
-        None => {
-            rgba.par_chunks_mut(row)
-                .zip(rgb.par_chunks(w))
-                .for_each(|(line8, src_row)| {
-                    for (x, &c) in src_row.iter().enumerate() {
-                        let i = x * 4;
-                        for k in 0..3 {
-                            line8[i + k] = (c[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        }
-                        line8[i + 3] = 255;
-                    }
-                });
-        }
-    }
-}
-
 #[cfg(all(windows, feature = "z6iii-raw-export"))]
 fn has_camera_color(plan: &Plan) -> bool {
     plan.c1_color.is_some()
@@ -4236,39 +3533,6 @@ fn has_camera_color(plan: &Plan) -> bool {
 #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
 fn has_camera_color(_plan: &Plan) -> bool {
     false
-}
-
-fn merge_wide_delta(wide: &mut [u16], before: &[u8], after: &[u8], width: usize) {
-    if width == 0 {
-        return;
-    }
-    let row = width * 4;
-    wide.par_chunks_mut(row)
-        .zip(before.par_chunks(row))
-        .zip(after.par_chunks(row))
-        .for_each(|((wide_line, base_line), after_line)| {
-            // Stay on whole pixels, exactly like the old `chunks_exact(4)`
-            // loop, in case a caller ever passes a short trailing chunk.
-            let n = wide_line.len().min(base_line.len()).min(after_line.len()) & !3;
-            // One branch-free integer map over the whole row. i32 keeps every
-            // intermediate exact: `(after-base)*257` is in [-65535, 65535] and
-            // adding the u16 value stays in [-65535, 131070].
-            for i in 0..n {
-                let delta = (i32::from(after_line[i]) - i32::from(base_line[i])) * 257;
-                wide_line[i] = (i32::from(wide_line[i]) + delta).clamp(0, 65535) as u16;
-            }
-            // The uniform map leaves alpha untouched when the 8-bit alphas
-            // match (delta 0); only the changed pixels need the old override.
-            for ((px, base), aft) in wide_line
-                .chunks_exact_mut(4)
-                .zip(base_line.chunks_exact(4))
-                .zip(after_line.chunks_exact(4))
-            {
-                if aft[3] != base[3] {
-                    px[3] = u16::from(aft[3]) * 257;
-                }
-            }
-        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4460,7 +3724,7 @@ fn linear_edits(plan: &Plan, lin: [f32; 3], f: [f32; 2], index: Option<usize>) -
 
     // `CImgOpLocalToneMappingV8` is raw stage 85: after Dehaze, before the
     // color list's `ApplyExposure`.
-    c = plan.hdr.apply(c);
+    c = apply_hdr(c, &adj.hdr);
     let e = plan.exposure;
     [c[0] * e, c[1] * e, c[2] * e]
 }
@@ -4522,7 +3786,7 @@ fn develop_pre_curve(
 
 fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     let adj = plan.adj;
-    let mut g = plan.tone.apply(display);
+    let mut g = tone_user_core(display, &adj.exposure);
     if plan.levels {
         g = adj.levels.apply_input(g);
     }
@@ -4549,7 +3813,7 @@ fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     }
 
     // Color.
-    let sat = plan.saturation;
+    let sat = 1.0 + adj.exposure.saturation / 100.0;
     if (sat - 1.0).abs() > 1e-4 {
         let l = luma(g);
         g = [l + (g[0] - l) * sat, l + (g[1] - l) * sat, l + (g[2] - l) * sat];
@@ -4568,258 +3832,6 @@ fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     }
 
     g
-}
-
-/// The hard toe of `CImgOpLocalToneMappingV8`: kernel `z2714f67010` in the
-/// OpenCL blob at ImgCoreDll file offset 41,541,440 (`z3dbd1ff682 == 13`).
-/// `k` is the op's curve strength; the kernel applies it to `0.9`.
-fn hdr_toe(x: f32, k: f32) -> f32 {
-    let u = x * (2.0 * 0.9);
-    let v = u.abs() + 1.0;
-    let r = (u * v) / (v + u * u) * 0.5 + 0.5;
-    let r = r.max(u - r + 1.0) * (1.0 / (2.0 * k));
-    let s = r * r;
-    let num = (1.0 + r + s) * (r + s * s);
-    num / (1.0 + num) * k
-}
-
-/// `z386cc3479b` — the mirrored toe the shadow and white branches use.
-fn hdr_inv_toe(x: f32, k: f32) -> f32 {
-    hdr_toe(-x, k)
-}
-
-/// Curve strengths `op+0x8c` / `op+0x90`. The kernel scales, it does not
-/// change the shape's sign, so a placeholder of 1 keeps every branch monotone.
-const HDR_K_SHADOW: f32 = 1.0;
-const HDR_K_HIGHLIGHT: f32 = 1.0;
-
-struct HdrPlan {
-    whites: Option<f32>,
-    blacks: Option<f32>,
-    highlights: f32,
-    shadows: f32,
-    toe_active: bool,
-}
-
-impl HdrPlan {
-    fn new(hdr: &HighDynamicRange) -> Self {
-        Self {
-            whites: (hdr.whites != 0.0).then(|| hdr.whites / 100.0 * 0.2),
-            blacks: (hdr.blacks != 0.0).then(|| hdr.blacks / 100.0 * 0.12),
-            highlights: (hdr.highlights / 100.0).clamp(-1.0, 1.0),
-            shadows: (hdr.shadows / 100.0).clamp(-1.0, 1.0),
-            toe_active: hdr.highlights != 0.0 || hdr.shadows != 0.0,
-        }
-    }
-
-    /// `CImgOpLocalToneMappingV8`: one gain per pixel from a single luma plane,
-    /// then `out = rgb * gain`, so the panel is channel-neutral.
-    ///
-    /// Highlight and shadow are kernel-exact. Whites/blacks still use the old
-    /// zone-window approximation: their branch needs `op+0x94` (white curve) and
-    /// `op+0xb4` (white offset), which are not recovered yet.
-    ///
-    /// shortcut: whites/blacks stay approximate until those two fields are read
-    /// from a C1 export; see `SESSION-c1-parse-hdr-highlights.md`.
-    fn apply(&self, mut g: [f32; 3]) -> [f32; 3] {
-        if self.whites.is_some() || self.blacks.is_some() {
-            let x = luma(g);
-            let mut shift = 0.0;
-            if let Some(whites) = self.whites {
-                shift += whites * sstep(0.65, 1.0, x);
-            }
-            if let Some(blacks) = self.blacks {
-                shift += blacks * (1.0 - sstep(0.0, 0.25, x));
-            }
-            if shift.abs() > 1e-5 {
-                let scale = (x + shift).max(0.0) / x.max(1e-4);
-                g = [g[0] * scale, g[1] * scale, g[2] * scale];
-            }
-        }
-        if !self.toe_active {
-            return g;
-        }
-        let x = luma(g);
-        let highlights = self.highlights;
-        let bright = if highlights != 0.0 {
-            let toe = hdr_toe(x, HDR_K_HIGHLIGHT);
-            2f32.powf(if highlights < 0.0 { -toe } else { toe }) * highlights.abs()
-                + (1.0 - highlights.abs())
-        } else {
-            1.0
-        };
-        let shadows = self.shadows;
-        let dark = if shadows != 0.0 {
-            let toe = hdr_inv_toe(x, HDR_K_SHADOW);
-            2f32.powf(if shadows < 0.0 { -toe } else { toe }) * shadows.abs() + (1.0 - shadows.abs())
-        } else {
-            1.0
-        };
-        let gain = dark / bright;
-        [g[0] * gain, g[1] * gain, g[2] * gain]
-    }
-}
-
-/// Brightness and contrast, the per-pixel part of the tone stage.
-struct TonePlan {
-    gamma: Option<f32>,
-    contrast_scale: Option<f32>,
-}
-
-impl TonePlan {
-    fn new(exp: &Exposure) -> Self {
-        let contrast = exp.contrast / 50.0 * 0.8;
-        Self {
-            gamma: (exp.brightness.abs() > 1e-3).then(|| 2f32.powf(-exp.brightness / 50.0 * 0.6)),
-            contrast_scale: if contrast.abs() < 1e-4 { None } else { Some(1.0 + contrast) },
-        }
-    }
-
-    fn apply(&self, mut g: [f32; 3]) -> [f32; 3] {
-        if let Some(gamma) = self.gamma {
-            g = g.map(|channel| channel.max(0.0).powf(gamma));
-        }
-        let Some(scale) = self.contrast_scale else { return g };
-        if scale >= 1.0 {
-            let knee = scale - 1.0;
-            g.map(|channel| {
-                let x = (channel - 0.5) * scale;
-                0.5 + x / (1.0 + (x.abs() * knee * 0.8))
-            })
-        } else {
-            g.map(|channel| 0.5 + (channel - 0.5) * scale)
-        }
-    }
-}
-
-/// The old point-operation clarity. The frame-wide stage is
-/// [`super::clarity::apply`]; this stays for layer colour stacks, which have
-/// no frame-sized neighbourhood to filter, and for the tone-stage test.
-fn tone_user(
-    g: [f32; 3],
-    tone: &TonePlan,
-    clarity: &Clarity,
-) -> [f32; 3] {
-    let mut g = tone.apply(g);
-    let local = clarity.c1_amount() + clarity.c1_structure();
-    if local.abs() > 1e-4 {
-        let l = luma(g);
-        let mid = 4.0 * l * (1.0 - l);
-        let k = 1.0 + local * 0.6 * mid;
-        g = [0.5 + (g[0] - 0.5) * k, 0.5 + (g[1] - 0.5) * k, 0.5 + (g[2] - 0.5) * k];
-        if matches!(clarity.method, ClarityMethod::Punch) {
-            let l = luma(g);
-            let s = 1.0 + local * 0.25;
-            g = [l + (g[0] - l) * s, l + (g[1] - l) * s, l + (g[2] - l) * s];
-        }
-    }
-    g
-}
-
-/// Capture One's `soft(x,a)` knee: `max(x,0) + max(a-|x|,0)³/(6a²)`.
-fn dehaze_soft(x: f32, a: f32) -> f32 {
-    if a <= 0.0 {
-        return x.max(0.0);
-    }
-    let t = (a - x.abs()).max(0.0);
-    x.max(0.0) + t * t * t / (6.0 * a * a)
-}
-
-/// The `CImgOpDehaze2020` kernel (`__kernel void zec60c625ee` in the OpenCL
-/// source embedded at `ImgCoreDll!0x277a0d8`). `ZDEHAZECOLOR` is the haze
-/// colour `C` (0..1); the host packs `A = 65535 * W * C`.
-///
-/// The knee radius is `Ah = C * min(1, 2*omega)` — the *colour*, not the
-/// 16-bit `A`. With `C` around 0.6 the `soft()` knee is inert for normal
-/// pixels; using `A` there shifts every pixel down by the whole atmospheric
-/// light and crushes the frame.
-///
-/// `level_low/high` are the per-channel black/white points (auto levels,
-/// 0/1 by default). `omega` is `DehazeAmount * 0.01`.
-fn apply_dehaze(g: [f32; 3], d: &Dehaze) -> [f32; 3] {
-    let omega = d.amount / 100.0;
-    if omega <= 0.0 || !omega.is_finite() {
-        return g;
-    }
-    let c = d.shadow_tone.map(|v| v.max(0.0));
-    let a = c.map(|v| v * 65535.0);
-    if a.iter().all(|v| *v <= f32::EPSILON) {
-        return g;
-    }
-    // Auto levels normalise the plane before the atmospheric-light estimate.
-    let level: [(bool, f32, f32); 3] = std::array::from_fn(|c| {
-        let (lo, hi) = (d.level_low[c], d.level_high[c]);
-        (hi - lo > 1e-3, lo, hi - lo)
-    });
-    let i: [f32; 3] = std::array::from_fn(|c| {
-        if level[c].0 {
-            (g[c] - level[c].1) / level[c].2 * 65535.0
-        } else {
-            g[c] * 65535.0
-        }
-    });
-    let eps = 1e-6;
-    let delta = (2.0 * omega).min(1.0);
-    let ah = c.map(|v| v * delta);
-    let mut i1 = [0.0f32; 3];
-    let mut a1 = [0.0f32; 3];
-    for c in 0..3 {
-        i1[c] = dehaze_soft(i[c] - ah[c], ah[c]);
-        a1[c] = dehaze_soft(a[c] - ah[c], ah[c]);
-    }
-    let mut recovered = [0.0f32; 3];
-    let li = luma(i1);
-    let la = luma(a1);
-    let keep = la / (li + la).max(eps);
-    for c in 0..3 {
-        recovered[c] = (1.0 - keep) * i1[c];
-        i1[c] *= keep;
-    }
-    let m_raw = (i1[0] / a1[0].max(eps))
-        .min(i1[1] / a1[1].max(eps))
-        .min(i1[2] / a1[2].max(eps));
-    let m0 = m_raw.clamp(0.0, 1.0);
-    let mag = (i1[0] * i1[0] + i1[1] * i1[1] + i1[2] * i1[2]).sqrt();
-    let dvec = a1.map(|v| m0 * v);
-    let mag_d =
-        ((i1[0] - dvec[0]).powi(2) + (i1[1] - dvec[1]).powi(2) + (i1[2] - dvec[2]).powi(2))
-            .sqrt();
-    let ratio = (mag + eps).max(eps);
-    let val = (ratio * 0.375 - (mag_d + eps) * (4.0 / 7.0)) / ratio;
-    let t = 1.0 / (1.0 + ((0.5 - val) * 4.0).exp());
-    let m = m0 * t;
-    for c in 0..3 {
-        recovered[c] += (1.0 - t) * i1[c];
-        i1[c] *= t;
-    }
-    let t0 = (1.0 - omega * m).max(0.05);
-    let mut out = [0.0f32; 3];
-    for c in 0..3 {
-        out[c] = (i1[c] - a1[c]) / t0 + a1[c] + recovered[c];
-    }
-    // Saturation guard: never add more chroma than `sqrt(1+(0.5+2m)²)` allows.
-    let max_i = i1[0].max(i1[1]).max(i1[2]);
-    if max_i > eps {
-        let sat_i = (max_i - i1[0].min(i1[1]).min(i1[2])) / max_i;
-        // The kernel anchors the guard on the *unclamped* ratio.
-        let limit = sat_i * (1.0 + (0.5 + 2.0 * m_raw).powi(2)).sqrt();
-        let max_o = out[0].max(out[1]).max(out[2]);
-        if max_o > eps {
-            let sat_o = (max_o - out[0].min(out[1]).min(out[2])) / max_o;
-            if sat_o > limit {
-                let k = limit / sat_o;
-                let l = luma(out);
-                out = [k * out[0] + (1.0 - k) * l, k * out[1] + (1.0 - k) * l, k * out[2] + (1.0 - k) * l];
-            }
-        }
-    }
-    std::array::from_fn(|c| {
-        if level[c].0 {
-            (level[c].1 + out[c] * level[c].2 / 65535.0).max(0.0)
-        } else {
-            (out[c] / 65535.0).max(0.0)
-        }
-    })
 }
 
 fn color_balance(g: [f32; 3], cb: &ColorBalance, k: f32) -> [f32; 3] {
@@ -4885,167 +3897,6 @@ fn color_balance_gains(g: [f32; 3], gains: &ColorBalanceGains) -> [f32; 3] {
         out = [out[0] * k, out[1] * k, out[2] * k];
     }
     out.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })
-}
-
-/// `wH = L²·protect`, `wM = (4L(1-L))³/2`, `wS = (1-L)²/2` at maximum channel `l`.
-fn color_balance_zone_weights(l: f32) -> [f32; 3] {
-    // shortcut: the ramp end `.sf` is unresolved; SDR pixels (`l <= 1`) use protect = 1.
-    let protect = if l <= 1.0 { 1.0 } else { (2.0 - l).clamp(0.0, 1.0) };
-    let bell = 4.0 * l * (1.0 - l);
-    [l * l * protect, bell * bell * bell * 0.5, (1.0 - l) * (1.0 - l) * 0.5]
-}
-
-fn signed_hue_delta(h: f32, center: f32) -> f32 {
-    let d = (h - center).rem_euclid(360.0);
-    if d > 180.0 {
-        d - 360.0
-    } else {
-        d
-    }
-}
-
-/// Coverage of one color-editor band for a pixel at hue `h`, saturation `s`,
-/// value `v`. `extra_feather` widens every band edge (the global group's
-/// smoothness).
-fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32, v: f32) -> f32 {
-    let d = signed_hue_delta(h, b.center_hue);
-    let feather = b.smoothness.max(0.1) + extra_feather;
-    let hue_w = if d < b.hue_low {
-        sstep(b.hue_low - feather, b.hue_low, d)
-    } else if d > b.hue_high {
-        1.0 - sstep(b.hue_high, b.hue_high + feather, d)
-    } else {
-        1.0
-    };
-    let ds = (s - b.center_saturation) * 100.0;
-    let sat_feather = 10.0f32.max(b.smoothness);
-    let sat_w = if ds < b.sat_low {
-        sstep(b.sat_low - sat_feather, b.sat_low, ds)
-    } else if ds > b.sat_high {
-        1.0 - sstep(b.sat_high, b.sat_high + sat_feather, ds)
-    } else {
-        1.0
-    };
-    // Fixed 0.05 V feather: C1 has no value band, so there is no stored unit to borrow.
-    let v = v.clamp(0.0, 1.0);
-    let value_w = if v < b.value_low {
-        sstep(b.value_low - 0.05, b.value_low, v)
-    } else if v > b.value_high {
-        1.0 - sstep(b.value_high, b.value_high + 0.05, v)
-    } else {
-        1.0
-    };
-    (hue_w * sat_w * value_w).clamp(0.0, 1.0)
-}
-
-fn apply_homogeneity(b: &ColorBand, w: f32, h: &mut f32, s: &mut f32, v: &mut f32) {
-    let hue = b.homogeneity[0] / 100.0 * w;
-    if hue != 0.0 {
-        *h += signed_hue_delta(b.center_hue, *h) * hue;
-    }
-    let sat = b.homogeneity[1] / 100.0 * w;
-    if sat != 0.0 {
-        *s += (b.center_saturation - *s) * sat;
-    }
-    let light = b.homogeneity[2] / 100.0 * w;
-    if light != 0.0 {
-        *v += (b.center_value - *v) * light;
-    }
-}
-
-fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
-    let (h0, s0, v0) = rgb_to_hsv([g[0].max(0.0), g[1].max(0.0), g[2].max(0.0)]);
-    if s0 < 0.02 {
-        return g;
-    }
-    let extra = ce.global.smoothness.max(0.0) * 0.5;
-    let mut h = h0;
-    let mut s = s0;
-    let mut v = v0;
-    let mut dh = 0.0;
-    let mut ds = 0.0;
-    let mut dl = 0.0;
-
-    if ce.global.enabled {
-        let mut w = band_weight(&ce.global, 0.0, h0, s0, v0);
-        if ce.global.inverted {
-            w = 1.0 - w;
-        }
-        dh += ce.global_shift.hue * w;
-        ds += ce.global_shift.saturation * w;
-        dl += ce.global_shift.lightness * w;
-    }
-
-    // Homogeneity is a skin term only. C1's `pie_skin` branch pulls toward the
-    // selected Lab chroma/L*; the basic, advanced and max-smooth branches never
-    // read their homogeneity fields.
-    for r in &ce.skin {
-        if let Some((_, band)) = ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
-            if !band.enabled {
-                continue;
-            }
-            let mut w = band_weight(band, 0.0, h0, s0, v0);
-            if band.inverted {
-                w = 1.0 - w;
-            }
-            apply_homogeneity(band, w, &mut h, &mut s, &mut v);
-        } else if let Some(u) = &r.uniformity {
-            let w = color_range_weight(r, g);
-            h += signed_hue_delta(r.hue, h) * (u.hue / 100.0 * w);
-            if u.saturation > 0.0 {
-                let target_s = (r.min_saturation + 0.35).clamp(0.15, 0.55);
-                s += (target_s - s) * (u.saturation / 100.0 * w);
-            }
-            if u.lightness > 0.0 {
-                let target_v = 0.65;
-                v += (target_v - v) * (u.lightness / 100.0 * w * 0.5);
-            }
-        }
-    }
-
-    for (i, shift) in ce.basic.iter().enumerate() {
-        if *shift == HslShift::default() {
-            continue;
-        }
-        let band = &ce.bands[i];
-        if !band.enabled {
-            continue;
-        }
-        let mut w = band_weight(band, extra, h, s, v);
-        if band.inverted {
-            w = 1.0 - w;
-        }
-        dh += shift.hue * w;
-        ds += shift.saturation * w;
-        dl += shift.lightness * w;
-    }
-
-    // MaxSmooth (`kind=3`) runs C1's basic `pie_smooth` window, hence `extra`.
-    for (r, extra_feather) in ce
-        .advanced
-        .iter()
-        .map(|r| (r, 0.0))
-        .chain(ce.skin.iter().map(|r| (r, 0.0)))
-        .chain(ce.max_smooth.iter().map(|r| (r, extra)))
-    {
-        let w = match ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
-            Some((_, band)) if band.enabled => {
-                let w = band_weight(band, extra_feather, h0, s0, v0);
-                if band.inverted { 1.0 - w } else { w }
-            }
-            Some(_) => 0.0,
-            None => color_range_weight(r, g),
-        };
-        dh += r.shift.hue * w;
-        ds += r.shift.saturation * w;
-        dl += r.shift.lightness * w;
-    }
-    let dh = dh.clamp(-180.0, 180.0);
-    let ds = ds.clamp(-100.0, 100.0);
-    let dl = dl.clamp(-100.0, 100.0);
-    let s2 = (s * (1.0 + ds / 100.0 * k)).clamp(0.0, 1.0);
-    let v2 = (v * (1.0 + dl / 100.0 * 0.5 * s * k)).max(0.0);
-    hsv_to_rgb(h + dh * k, s2, v2)
 }
 
 fn black_white(g: [f32; 3], bw: &BlackWhite) -> [f32; 3] {
@@ -5180,18 +4031,15 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
     if let Some(wb) = lp.wb_gains {
         c = [c[0] * wb[0], c[1] * wb[1], c[2] * wb[2]];
     }
-    if lp.exposure_gain != 1.0 {
-        let e = lp.exposure_gain;
+    if a.exposure.exposure != 0.0 {
+        let e = 2f32.powf(a.exposure.exposure * 0.6);
         c = [c[0] * e, c[1] * e, c[2] * e];
-    }
-    if lp.simple_exposure {
-        return [g[0] + (c[0] - g[0]) * m, g[1] + (c[1] - g[1]) * m, g[2] + (c[2] - g[2]) * m];
     }
     // A layer sees display codes already, so its dehaze keeps that domain and
     // only loses the `tone_user()` stages that used to run in front of it.
     c = apply_dehaze(c, &a.dehaze);
-    c = lp.hdr.apply(c);
-    c = tone_user(c, &lp.tone, &a.clarity);
+    c = apply_hdr(c, &a.hdr);
+    c = tone_user(c, &a.exposure, &a.clarity);
     if let Some(levels) = &lp.levels {
         c = levels.apply_input(c);
     }
@@ -5215,7 +4063,7 @@ fn local(g: [f32; 3], lp: &LayerPlan, m: f32) -> [f32; 3] {
     if let Some(levels) = &lp.levels {
         c = levels.apply_output(c);
     }
-    let sat = lp.saturation;
+    let sat = 1.0 + a.exposure.saturation / 100.0;
     if (sat - 1.0).abs() > 1e-4 {
         let l = luma(c);
         c = [l + (c[0] - l) * sat, l + (c[1] - l) * sat, l + (c[2] - l) * sat];
@@ -5703,140 +4551,6 @@ fn apply_layer_color_row(
         for k in 0..3 {
             line[px + k] = (g[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
-    }
-}
-
-/// Luminance of the frame, 0..255.
-fn luma_plane(rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
-    let mut plane = vec![0f32; w * h];
-    plane.par_iter_mut().enumerate().for_each(|(i, p)| {
-        let j = i * 4;
-        *p = 0.2126 * rgba[j] as f32 + 0.7152 * rgba[j + 1] as f32 + 0.0722 * rgba[j + 2] as f32;
-    });
-    plane
-}
-
-/// 3x3 mean of a plane.
-fn mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
-    let mut out = vec![0f32; w * h];
-    if w == 0 || h == 0 {
-        return out;
-    }
-    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let mut sum = 0.0f32;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
-                    let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
-                    sum += src[yy * w + xx];
-                }
-            }
-            row[x] = sum / 9.0;
-        }
-    });
-    out
-}
-
-/// Three box passes approximate a Gaussian of a comparable radius.
-fn box_blur3(src: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
-    let mut a = src.to_vec();
-    let mut b = vec![0f32; w * h];
-    for _ in 0..3 {
-        box_blur_h(&a, &mut b, w, h, r);
-        std::mem::swap(&mut a, &mut b);
-        box_blur_v(&a, &mut b, w, h, r);
-        std::mem::swap(&mut a, &mut b);
-    }
-    a
-}
-
-fn box_blur_h(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: i32) {
-    let inv = 1.0 / (2 * r + 1) as f32;
-    if w == 0 || h == 0 {
-        return;
-    }
-    dst.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        let base = y * w;
-        for x in 0..w {
-            let mut sum = 0.0f32;
-            for k in -r..=r {
-                sum += src[base + (x as i32 + k).clamp(0, w as i32 - 1) as usize];
-            }
-            row[x] = sum * inv;
-        }
-    });
-}
-
-fn box_blur_v(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: i32) {
-    let inv = 1.0 / (2 * r + 1) as f32;
-    if w == 0 || h == 0 {
-        return;
-    }
-    dst.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let mut sum = 0.0f32;
-            for k in -r..=r {
-                sum += src[(y as i32 + k).clamp(0, h as i32 - 1) as usize * w + x];
-            }
-            row[x] = sum * inv;
-        }
-    });
-}
-
-pub(crate) fn histogram(rgba: &[u8]) -> Histogram {
-    // Fixed arrays keep the per-chunk fold off the heap; a ray working on a
-    // 1400 px preview otherwise allocates thousands of small vectors.
-    type Bins = ([u32; 256], [u32; 256], [u32; 256], [u32; 256], u64, u64);
-    let empty = || -> Bins { ([0; 256], [0; 256], [0; 256], [0; 256], 0, 0) };
-    let chunk_bytes = if rgba.is_empty() {
-        4
-    } else {
-        rgba.len()
-            .div_ceil(rayon::current_num_threads().max(1) * 4)
-            .max(4 * 1024)
-            .next_multiple_of(4)
-    };
-    let (r, g, b, l, lo, hi) = rgba
-        .par_chunks(chunk_bytes)
-        .fold(
-            empty,
-            |mut acc, chunk| {
-                for p in chunk.chunks_exact(4) {
-                    acc.0[p[0] as usize] += 1;
-                    acc.1[p[1] as usize] += 1;
-                    acc.2[p[2] as usize] += 1;
-                    let y = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) as usize;
-                    acc.3[y.min(255)] += 1;
-                    if p[0] <= 1 && p[1] <= 1 && p[2] <= 1 {
-                        acc.4 += 1;
-                    }
-                    if p[0] >= 254 || p[1] >= 254 || p[2] >= 254 {
-                        acc.5 += 1;
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(empty, |mut a, b| {
-                for i in 0..256 {
-                    a.0[i] += b.0[i];
-                    a.1[i] += b.1[i];
-                    a.2[i] += b.2[i];
-                    a.3[i] += b.3[i];
-                }
-                a.4 += b.4;
-                a.5 += b.5;
-                a
-            });
-    let total = (rgba.len() / 4).max(1) as f32;
-    Histogram {
-        red: r.to_vec(),
-        green: g.to_vec(),
-        blue: b.to_vec(),
-        luma: l.to_vec(),
-        clipped_shadows: lo as f32 / total,
-        clipped_highlights: hi as f32 / total,
     }
 }
 
@@ -7054,15 +5768,15 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
     #[test]
     fn zero_hdr_does_not_change_the_tone_path() {
-        let tone = TonePlan::new(&Exposure::default());
-        let hdr = HdrPlan::new(&HighDynamicRange::default());
+        let exp = Exposure::default();
+        let hdr = HighDynamicRange::default();
         let clarity = Clarity::default();
         for g in [[0.01, 0.2, 0.8], [0.18, 0.4, 0.65], [0.5, 0.55, 0.7]] {
-            assert_eq!(hdr.apply(g), g);
-            assert_eq!(tone_user(g, &tone, &clarity), g);
+            assert_eq!(apply_hdr(g, &hdr), g);
+            assert_eq!(tone_user(g, &exp, &clarity), g);
         }
         let active = HighDynamicRange { highlights: -40.0, ..Default::default() };
-        assert_ne!(HdrPlan::new(&active).apply([0.65; 3]), [0.65; 3]);
+        assert_ne!(apply_hdr([0.65; 3], &active), [0.65; 3]);
     }
 
     /// `CImgOpLocalToneMappingV8`: highlight+ recovers brights, shadow+ lifts
@@ -7073,16 +5787,14 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let bright = [0.85; 3];
         let hi = HighDynamicRange { highlights: 100.0, ..Default::default() };
         let sh = HighDynamicRange { shadows: 100.0, ..Default::default() };
-        let hi = HdrPlan::new(&hi);
-        let sh = HdrPlan::new(&sh);
-        let hi_dark = hi.apply(dark)[0] / dark[0];
-        let hi_bright = hi.apply(bright)[0] / bright[0];
-        let sh_dark = sh.apply(dark)[0] / dark[0];
-        let sh_bright = sh.apply(bright)[0] / bright[0];
+        let hi_dark = apply_hdr(dark, &hi)[0] / dark[0];
+        let hi_bright = apply_hdr(bright, &hi)[0] / bright[0];
+        let sh_dark = apply_hdr(dark, &sh)[0] / dark[0];
+        let sh_bright = apply_hdr(bright, &sh)[0] / bright[0];
         assert!(hi_bright < hi_dark && hi_bright < 1.0, "{hi_bright} vs {hi_dark}");
         assert!(sh_dark > sh_bright && sh_dark > 1.0, "{sh_dark} vs {sh_bright}");
         let tinted = [0.6, 0.3, 0.15];
-        let out = hi.apply(tinted);
+        let out = apply_hdr(tinted, &hi);
         assert!((out[0] / out[1] - tinted[0] / tinted[1]).abs() < 1e-5);
     }
 

@@ -12,7 +12,7 @@ use crate::widgets::PanelStack;
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = pal(cx).clone();
-    let ids = state.read(cx).settings.workspace.quick_tools.clone();
+    let ids = state.read(cx).prefs.settings.workspace.quick_tools.clone();
     let panels: Vec<(&'static str, AnyElement)> = ids
         .iter()
         .filter_map(|id| super::QUICK_PANELS.iter().find(|q| **q == id.as_str()).copied())

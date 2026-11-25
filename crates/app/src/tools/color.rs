@@ -85,8 +85,8 @@ pub(crate) fn base_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                     .on_select(move |i, _, cx| {
                         stg.update(cx, |s, _| {
                             s.icc_group = i;
-                            s.settings.icc_group = i as u8;
-                            s.settings.save();
+                            s.prefs.settings.icc_group = i as u8;
+                            s.prefs.settings.save();
                         })
                     })
                     .into_any_element()
@@ -304,7 +304,7 @@ fn wheel_for(
 pub(crate) fn color_balance_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let cb = read_scoped(s.adj(), scope, |a| &a.color_balance, |l| &l.color_balance).cloned().unwrap_or_default();
-    let mode = s.panels.color_balance_mode;
+    let mode = s.prefs.panels.color_balance_mode;
     let (st, st2) = (state.clone(), state.clone());
     let modes = [
         ColorBalanceMode::ThreeWay,
@@ -389,7 +389,7 @@ pub(crate) fn color_balance_panel(state: &Entity<AppState>, scope: Scope, cx: &A
                     .text(t("High", "高光"))
                     .on_select(move |i, _, cx| {
                         st2.update(cx, |s, cx| {
-                            s.panels.color_balance_mode = modes[i];
+                            s.prefs.panels.color_balance_mode = modes[i];
                             cx.notify();
                         })
                     }),
@@ -449,9 +449,9 @@ pub(crate) fn hue_range_bar(range: &ColorRange, cx: &App) -> impl IntoElement + 
 pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let ce = read_scoped(s.adj(), scope, |a| &a.color_editor, |l| &l.color_editor).cloned().unwrap_or_default();
-    let mode = s.panels.color_editor_mode;
-    let sector = s.panels.selected_sector.min(7);
-    let selected_range = s.panels.selected_color_range;
+    let mode = s.prefs.panels.color_editor_mode;
+    let sector = s.prefs.panels.selected_sector.min(7);
+    let selected_range = s.prefs.panels.selected_color_range;
     let p = pal(cx).clone();
     let (st, st2) = (state.clone(), state.clone());
 
@@ -475,7 +475,7 @@ pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &Ap
                     .when(changed, |d| d.child(div().mb(px(2.0)).size(px(4.0)).rounded_full().bg(gpui_kit::white())))
                     .on_click(move |_, _, cx| {
                         st.update(cx, |s, cx| {
-                            s.panels.selected_sector = i;
+                            s.prefs.panels.selected_sector = i;
                             cx.notify();
                         })
                     })
@@ -485,7 +485,7 @@ pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &Ap
             let chips = chips.child(
                 IconBtn::new("ce-basic-pick", IconName::Pipette, t("Pick a color in the image", "在图像中取样颜色")).size(22.0).on_click(move |_, cx| {
                     st_pick.update(cx, |s, cx| {
-                        s.panels.pick_to_range = true;
+                        s.prefs.panels.pick_to_range = true;
                         s.set_cursor(CursorTool::ColorPicker, cx)
                     })
                 }),
@@ -520,7 +520,7 @@ pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &Ap
                                 if skin { ce.skin.push(r) } else { ce.advanced.push(r) }
                             })
                         }, cx);
-                        s.panels.selected_color_range = Some(id);
+                        s.prefs.panels.selected_color_range = Some(id);
                     })
                 }
             };
@@ -541,7 +541,7 @@ pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &Ap
                     .child(div().flex_1().text_xs().text_color(p.text).child(format!("{} {}  ·  {:.0}°", if skin { t("Skin", "肤色") } else { t("Range", "范围") }, i + 1, r.hue)))
                     .on_click(move |_, _, cx| {
                         st.update(cx, |s, cx| {
-                            s.panels.selected_color_range = Some(id);
+                            s.prefs.panels.selected_color_range = Some(id);
                             cx.notify();
                         })
                     })
@@ -559,7 +559,7 @@ pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &Ap
                                 let st = state.clone();
                                 move |_, _, cx| {
                                     st.update(cx, |s, cx| {
-                                        s.panels.pick_to_range = true;
+                                        s.prefs.panels.pick_to_range = true;
                                         s.set_cursor(CursorTool::ColorPicker, cx)
                                     })
                                 }
@@ -647,8 +647,8 @@ pub(crate) fn color_editor_panel(state: &Entity<AppState>, scope: Scope, cx: &Ap
                     .text(t("Skin Tone", "肤色"))
                     .on_select(move |i, _, cx| {
                         st2.update(cx, |s, cx| {
-                            s.panels.color_editor_mode = i as u8;
-                            s.panels.selected_color_range = None;
+                            s.prefs.panels.color_editor_mode = i as u8;
+                            s.prefs.panels.selected_color_range = None;
                             cx.notify();
                         })
                     }),
@@ -687,7 +687,7 @@ pub(crate) fn black_white_panel(state: &Entity<AppState>, cx: &App) -> impl Into
 pub(crate) fn readout_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let c = s.sampled_color;
+    let c = s.preview_state.sampled_color;
     let picking = s.cursor == CursorTool::ColorPicker;
     let st = state.clone();
     ToolPanel::new(state, "readout", t("Color Readout", "颜色读数"))

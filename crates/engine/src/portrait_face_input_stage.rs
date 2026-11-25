@@ -4485,11 +4485,11 @@ mod frame_digest_scope_tests {
 
     #[test]
     fn scope_never_vouches_for_another_allocation() {
-        let source = source(10);
-        let same_bytes = source.clone();
+        let first = source(10);
+        let same_bytes = first.clone();
         let other = source(99);
-        let bundle = bundle(JOB, &source);
-        let _scope = FrameDigestScope::new(&source);
+        let bundle = bundle(JOB, &first);
+        let _scope = FrameDigestScope::new(&first);
 
         reset_frame_digest_computes();
         // Same bytes in a fresh allocation: still valid, but hashed, not reused.

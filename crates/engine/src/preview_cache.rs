@@ -53,6 +53,14 @@ const RENDER_VERSION: u32 = 1;
 
 /// Everything that changes the rendered bytes. `generation` is deliberately
 /// absent: a redraw of the same content must hit.
+///
+/// This key is **document-only**. Producer/runtime inputs are not fields of
+/// `AdjustmentSet` (they live in `crate::document::RuntimeInputs`), so they are
+/// not covered here. When a render path starts threading runtime inputs into
+/// previews, it MUST add them to this key (for example a
+/// `RuntimeInputs::fingerprint` field) in the same change; otherwise a frame
+/// rendered with different masks could be served from cache. No production path
+/// attaches producer inputs today, so the current omission is not a regression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewKey {
     build: u64,
@@ -278,6 +286,11 @@ pub(crate) fn key(
 /// order characterization → geometry → develop → detail → local → portrait, so
 /// a stage cache must include every group at or before its own stage.
 ///
+/// This covers the persistent document only. Per-job producer inputs are no
+/// longer part of `AdjustmentSet`, so a caller that lets runtime inputs affect
+/// output must mix `crate::document::RuntimeInputs::fingerprint` into the cache
+/// key itself.
+///
 /// The groups are disjoint and every field of [`AdjustmentSet`] belongs to
 /// exactly one of them. `preview_cache::tests` enforces that against the
 /// serialized schema and against a fully populated set, and also pins the
@@ -321,7 +334,6 @@ impl ParamsFingerprint {
             portrait: portrait_fingerprint(adj),
         }
     }
-
     /// Every group except the layer rows and node topology agrees. A true
     /// result means `NodeGraph::dirty_between` alone decides whether the two
     /// requests render differently; it must never be used to skip that check.
@@ -586,10 +598,6 @@ fn portrait_fingerprint(adj: &AdjustmentSet) -> u64 {
     let mut hash = Fnv::new("portrait-v1");
     hash.json("retouch", &adj.retouch);
     hash.json("extra", &adj.extra);
-    match adj.portrait_producer_inputs.as_deref() {
-        Some(producer) => hash.u64("producer.fingerprint", producer.fingerprint()),
-        None => hash.tag("producer.none"),
-    }
     hash.0
 }
 
@@ -994,14 +1002,6 @@ mod tests {
             changed_groups(before, ParamsFingerprint::of(&changed)),
             vec![ParamGroup::Geometry]
         );
-
-        let mut changed = base.clone();
-        changed.portrait_producer_inputs =
-            Some(Arc::new(crate::portrait_stage::ProducerInputs::default()));
-        assert_eq!(
-            changed_groups(before, ParamsFingerprint::of(&changed)),
-            vec![ParamGroup::Portrait]
-        );
     }
 
     /// The DAG lane report listed `select_point` as non-pixel. At this HEAD a
@@ -1292,7 +1292,7 @@ mod tests {
         assert_eq!(gate.reuse(&key_of(&spotted), &repaired(&spotted), &spotted.layers), None);
 
         // A different image must never reuse.
-        let other_image = key(ImageId(2), &adj, NormRect::FULL, 1400, false, None, false);
+        let other_image = super::key(ImageId(2), &adj, NormRect::FULL, 1400, false, None, false);
         assert_eq!(gate.reuse(&other_image, &repaired(&adj), &adj.layers), None);
     }
 

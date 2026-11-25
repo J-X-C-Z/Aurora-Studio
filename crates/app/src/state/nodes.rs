@@ -218,13 +218,13 @@ impl AppState {
 
     /// The selected node: the active layer, a selected mixer, or the input.
     pub fn selected_node(&self) -> u64 {
-        self.active_layer.or(self.active_node).unwrap_or(INPUT)
+        self.editor.active_layer.or(self.editor.active_node).unwrap_or(INPUT)
     }
 
     pub fn select_node(&mut self, id: u64, cx: &mut Context<Self>) {
         let is_layer = self.adj().layers.iter().any(|l| l.id == id);
-        self.active_layer = is_layer.then_some(id);
-        self.active_node = (!is_layer && id != INPUT).then_some(id);
+        self.editor.active_layer = is_layer.then_some(id);
+        self.editor.active_node = (!is_layer && id != INPUT).then_some(id);
         cx.notify();
     }
 
@@ -232,9 +232,7 @@ impl AppState {
     pub(crate) fn fresh_node_id(&mut self) -> u64 {
         let adj = self.adj();
         let used = adj.layers.iter().map(|l| l.id).chain(adj.nodes.iter().flat_map(|g| g.nodes.iter().map(|n| n.id)).filter(|id| *id < INPUT)).max().unwrap_or(0);
-        let id = self.next_layer.max(used + 1);
-        self.next_layer = id + 1;
-        id
+        self.editor.next_layer_id(used)
     }
 
     /// Edits the graph as one undo step and keeps the layer list in step.
@@ -255,7 +253,7 @@ impl AppState {
     /// Adds a node of `kind`. Correctors start over the whole frame; heal,
     /// clone and fill nodes start empty, to be painted.
     pub fn add_node_of(&mut self, how: NewNode, kind: LayerKind, cx: &mut Context<Self>) {
-        if self.current.is_none() {
+        if self.library.current.is_none() {
             return;
         }
         let sel = self.selected_node();

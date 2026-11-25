@@ -73,7 +73,7 @@ impl AppState {
 
     /// Merges the selected images into one new image, cataloged next to them.
     pub fn merge_selection(&mut self, kind: MergeKind, hdr: HdrOptions, pano: PanoramaOptions, cx: &mut Context<Self>) {
-        let ids: Vec<ImageId> = self.images.iter().map(|i| i.id).filter(|id| self.selection.contains(id)).collect();
+        let ids: Vec<ImageId> = self.library.images.iter().map(|i| i.id).filter(|id| self.library.selection.contains(id)).collect();
         if ids.len() < 2 {
             self.notify(t("Select at least two images to merge", "请至少选择两张图像进行合并"), cx);
             return;
@@ -92,8 +92,8 @@ impl AppState {
             this.update(cx, |this, cx| match result {
                 Ok(info) => {
                     let id = info.id;
-                    this.edits.insert(id, Edit::default());
-                    this.images.push(info);
+                    this.editor.edits.insert(id, Edit::default());
+                    this.library.images.push(info);
                     this.queue_thumbs(vec![id], cx);
                     this.select(id, false, false, cx);
                     this.notify(format!("{} · {}", kind.label(), t("done", "完成")), cx);
@@ -108,9 +108,7 @@ impl AppState {
     pub fn cancel_job(&mut self, job: u64, cx: &mut Context<Self>) {
         match planned::cancel_job(self.engine.as_ref(), job) {
             Ok(()) => {
-                if let Some(j) = self.jobs.iter_mut().find(|j| j.id == job) {
-                    j.status = JobStatus::Failed { message: t("Cancelled", "已取消").into() };
-                }
+                self.tasks.finish_job(job, JobStatus::Failed { message: t("Cancelled", "已取消").into() });
                 cx.notify();
             }
             Err(err) => self.notify(err.to_string(), cx),

@@ -49,7 +49,7 @@ pub fn tool_strip(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -
     let p = pal(cx).clone();
     let current = state.read(cx).tool_tab;
     let tabs = state.read(cx).visible_tabs();
-    let right = state.read(cx).view.inspector_right;
+    let right = state.read(cx).prefs.view.inspector_right;
     let accent = p.accent;
     let index = tabs.iter().position(|t| *t == current).unwrap_or(0) as f32;
     let y = motion::value(motion::key("tool-strip", "indicator"), index * TAB_H, motion::GLIDE, window, cx);
@@ -220,8 +220,8 @@ pub fn inspector(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
                                     .tooltip(|window, cx| Tooltip::new(t("Back to the base adjustments", "返回基础调整")).build(window, cx))
                                     .on_click(move |_, _, cx| {
                                         st.update(cx, |s, cx| {
-                                            s.active_layer = None;
-                                            s.active_node = None;
+                                            s.editor.active_layer = None;
+                                            s.editor.active_node = None;
                                             cx.notify();
                                         })
                                     })

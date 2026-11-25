@@ -4,12 +4,11 @@
 //! interface only ever talks to the trait.
 
 pub mod process;
+pub(crate) mod plan;
 pub(crate) mod stage_cache;
 pub(crate) mod scenes;
-pub(crate) mod spots;
-pub(crate) mod grain;
+pub(crate) use crate::processing::{clarity, grain, spots};
 pub(crate) mod detail;
-pub(crate) mod clarity;
 #[cfg(windows)]
 pub(crate) mod gpu_runtime;
 #[cfg(not(windows))]
@@ -159,7 +158,7 @@ pub(crate) mod nr_gpu {
         false
     }
 }
-pub(crate) mod geometry;
+pub(crate) use crate::processing::frame_map as geometry;
 pub(crate) mod lens_profile;
 
 pub(crate) const PURPLE_IDENTITY: f32 = 0.5;
