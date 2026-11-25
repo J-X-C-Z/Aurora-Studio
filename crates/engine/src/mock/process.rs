@@ -2193,7 +2193,7 @@ fn render_sized(
     let region = clean_region(region);
     let portrait_active = !bypass
         && !wide
-        && adj.extra.keys().any(|key| key.starts_with("pc:"));
+        && crate::portrait_registry::has_active_portrait_effect(adj);
     let mut cached_frame_fingerprint = None;
     let (mut rgba, mut rgba16, develop8) = 'develop: {
         if portrait_active {
@@ -2274,9 +2274,9 @@ fn render_sized(
     #[cfg(windows)]
     if !wide
         && adj.clarity.clarity.abs() <= 1e-4
+        && plan.layers.is_empty()
         && super::develop_gpu::enabled()
         && super::develop_gpu::resident_crossover_admits(out_w as usize, out_h as usize)
-        && super::develop_gpu::fallback_reason(adj, false, false).is_none()
     {
         let mut dev_params = super::develop_gpu::DevelopParams::from_adjustments(
             adj,
