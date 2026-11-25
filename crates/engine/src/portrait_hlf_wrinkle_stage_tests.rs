@@ -149,6 +149,12 @@ fn assert_real_kernel(run: &PortraitEffectRun, expected: &str) {
                 run.pf, run.skip_reason
             )
         }
+        PortraitBackend::Metal => {
+            panic!(
+                "PF{} has no Metal route in this stage: {:?}",
+                run.pf, run.metal_dispatches
+            )
+        }
     }
 }
 

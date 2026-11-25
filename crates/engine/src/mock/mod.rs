@@ -9,8 +9,82 @@ pub(crate) mod spots;
 pub(crate) mod grain;
 pub(crate) mod detail;
 pub(crate) mod clarity;
+#[cfg(windows)]
 pub(crate) mod gpu_runtime;
+#[cfg(not(windows))]
+pub(crate) mod gpu_runtime {
+    /// The shared CUDA runtime is Windows-only. Its portrait observer only
+    /// reports kernels dispatched on a process CUDA context, so a platform
+    /// without that context has nothing to install.
+    pub(crate) fn install_portrait_bridge() {}
+}
+#[cfg(windows)]
 pub(crate) mod pixel_gpu;
+#[cfg(not(windows))]
+pub(crate) mod pixel_gpu {
+    use std::sync::Arc;
+
+    use crate::dust_lcc::GpuLccGrid;
+    use crate::{FilmGrain, VignetteMethod};
+
+    /// The CUDA gain planes never run on this platform; this stays at zero and
+    /// callers keep the CPU formula.
+    #[cfg(test)]
+    pub(crate) static PLANE_HITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// CPU reference for the bilinear gain-plane lookup, identical to the
+    /// Windows module's helper for the CPU render path.
+    pub(crate) fn sample_plane(plane: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
+        if w < 2 || h < 2 || plane.len() < w * h || !x.is_finite() || !y.is_finite() {
+            return 1.0;
+        }
+        let fx = x.floor();
+        let fy = y.floor();
+        let ix = (fx.max(0.0) as usize).min(w - 2);
+        let iy = (fy.max(0.0) as usize).min(h - 2);
+        let tx = x - ix as f32;
+        let ty = y - iy as f32;
+        let at = |px: usize, py: usize| plane[py * w + px];
+        let top = at(ix, iy) * (1.0 - tx) + at(ix + 1, iy) * tx;
+        let bottom = at(ix, iy + 1) * (1.0 - tx) + at(ix + 1, iy + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+
+    /// No GPU vignette plane: the caller uses the CPU `exp2` formula.
+    pub(crate) fn vignette_plane_cached(
+        _width: usize,
+        _height: usize,
+        _region: [f32; 4],
+        _method: VignetteMethod,
+        _amount: f32,
+        _aspect: f32,
+        _center: [f32; 2],
+    ) -> Option<Arc<Vec<f32>>> {
+        None
+    }
+
+    /// No GPU LCC plane: the caller uses `UniformLight::source_gain`.
+    pub(crate) fn lcc_plane_for_output(
+        _grid: &GpuLccGrid,
+        _plane_w: usize,
+        _plane_h: usize,
+        _out_pixels: usize,
+    ) -> Option<Arc<Vec<f32>>> {
+        None
+    }
+
+    /// No GPU grain plane: the caller runs the CPU grain stage.
+    pub(crate) fn grain_stage(
+        _rgba: &mut [u8],
+        _w: usize,
+        _h: usize,
+        _adj: &FilmGrain,
+        _scale: f32,
+    ) -> bool {
+        false
+    }
+}
 #[cfg(windows)]
 pub(crate) mod detail_gpu;
 #[cfg(windows)]

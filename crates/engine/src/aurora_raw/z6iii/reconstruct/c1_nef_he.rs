@@ -118,17 +118,10 @@ impl<'a> Tiff<'a> {
     }
 }
 
+/// Reuses the cross-platform TIFF identification so the Windows OpenCL and the
+/// macOS CPU routes cannot disagree about which body a file came from.
 pub fn is_z6iii_nef(nef: &[u8]) -> bool {
-    let Some(tiff) = Tiff::from_bytes(nef) else { return false };
-    let Ok(root) = tiff.root() else { return false };
-    let matches_ascii = |tag, expected: &[u8]| {
-        tiff.entry(root, tag).is_some_and(|entry| {
-            let size = tiff.long(&entry[4..]);
-            tiff.short(&entry[2..]) == 2 && size == expected.len() &&
-                tiff.range(tiff.long(&entry[8..]), size).ok() == Some(expected)
-        })
-    };
-    matches_ascii(271, b"NIKON CORPORATION\0") && matches_ascii(272, b"NIKON Z6_3\0")
+    crate::aurora_raw::c1_nef_he::is_z6iii_nef(nef)
 }
 
 fn nikon_maker_tiff(nef: &[u8]) -> Result<Option<Tiff<'_>>> {

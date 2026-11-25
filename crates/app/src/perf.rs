@@ -158,23 +158,206 @@ mod memory {
     }
 }
 
-/// Current process working set, or `None` where the platform is unsupported.
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "macos")]
+mod memory {
+    //! macOS process memory via Mach `task_info`.
+    //!
+    //! `working_set_bytes` reports the kernel's **physical footprint**
+    //! (`task_vm_info::phys_footprint`), which is the figure Activity Monitor
+    //! and `footprint(1)` show: dirty + compressed pages attributed to this
+    //! task, not file-backed clean pages. If a kernel is too old to return the
+    //! rev1 `phys_footprint` field we fall back to `resident_size` from
+    //! `MACH_TASK_BASIC_INFO`.
+    //!
+    //! `peak_working_set_bytes` returns an **OS-provided high-water mark**, never
+    //! a sampled/synthesized value: `task_vm_info::ledger_phys_footprint_peak`
+    //! (rev3) when available, otherwise `resident_size_max` from
+    //! `MACH_TASK_BASIC_INFO`. The two are different metrics (peak footprint vs
+    //! peak resident), so a mixed fallback is reported as-is rather than
+    //! pretending they are identical.
+    //!
+    //! The structs and constants are declared locally because `crates/app` does
+    //! not depend on `libc`; field order and padding must match
+    //! `<mach/task_info.h>` exactly. Compile-time `size_of` assertions guard the
+    //! two layouts this module reads.
+
+    use std::mem::size_of;
+
+    /// `kern_return_t`; `KERN_SUCCESS` is 0.
+    type KernReturn = i32;
+    const KERN_SUCCESS: KernReturn = 0;
+    /// `natural_t` / `mach_msg_type_number_t` unit used by `task_info` counts.
+    type NaturalT = u32;
+
+    /// `MACH_TASK_BASIC_INFO` flavor (always 64-bit basic info).
+    const MACH_TASK_BASIC_INFO: NaturalT = 20;
+    /// `TASK_VM_INFO` flavor.
+    const TASK_VM_INFO: NaturalT = 22;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(dead_code)] // Fields after resident_size_max exist only for ABI layout.
+    struct TimeValue {
+        seconds: i32,
+        microseconds: i32,
+    }
+
+    /// `struct mach_task_basic_info` from `<mach/task_info.h>`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(dead_code)] // Timers/policy are ABI padding for this module's purpose.
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: TimeValue,
+        system_time: TimeValue,
+        policy: i32,
+        suspend_count: i32,
+    }
+    const _: () = assert!(size_of::<MachTaskBasicInfo>() == 48);
+
+    /// Prefix of `struct task_vm_info` through `ledger_phys_footprint_peak`
+    /// (rev3). Later revisions append fields this module does not read, so the
+    /// requested count stops here and works on every macOS the project targets.
+    ///
+    /// Offsets that matter: `phys_footprint` @144 B (rev1),
+    /// `ledger_phys_footprint_peak` @168 B (rev3).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(dead_code)] // The full prefix is declared to keep the ABI offsets exact.
+    struct TaskVmInfoPrefix {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        min_address: u64,
+        max_address: u64,
+        ledger_phys_footprint_peak: i64,
+    }
+    const _: () = assert!(size_of::<TaskVmInfoPrefix>() == 176);
+
+    /// `task_info` counts in `natural_t` units (4 bytes on all Apple targets).
+    const MACH_TASK_BASIC_INFO_COUNT: u32 =
+        (size_of::<MachTaskBasicInfo>() / size_of::<NaturalT>()) as u32;
+    const TASK_VM_INFO_PREFIX_COUNT: u32 =
+        (size_of::<TaskVmInfoPrefix>() / size_of::<NaturalT>()) as u32;
+    /// Units needed before `phys_footprint` is valid.
+    const UNITS_THROUGH_PHYS_FOOTPRINT: u32 = 38;
+    /// Units needed before `ledger_phys_footprint_peak` is valid.
+    const UNITS_THROUGH_LEDGER_PEAK: u32 = 44;
+
+    // `mach_task_self()` and `task_info` live in libsystem_kernel, which every
+    // macOS binary links by default; no `#[link]` attribute is needed.
+    unsafe extern "C" {
+        fn mach_task_self() -> u32;
+        /// `task_info(task_name_t, task_flavor_t, task_info_t, *mut u32)`.
+        /// `task_info_t` is `*mut integer_t` (i32), whatever the struct behind it.
+        fn task_info(
+            target_task: u32,
+            flavor: NaturalT,
+            task_info_out: *mut i32,
+            task_info_out_cnt: *mut u32,
+        ) -> KernReturn;
+    }
+
+    fn task_basic_info() -> Option<MachTaskBasicInfo> {
+        let mut info = MachTaskBasicInfo::default();
+        let mut count = MACH_TASK_BASIC_INFO_COUNT;
+        // SAFETY: `info` is a `repr(C)` struct matching `mach_task_basic_info`,
+        // `count` is its size in `natural_t` units, and the kernel writes at
+        // most `count` units into it. Casting the struct pointer to
+        // `*mut i32` matches `task_info_t`; `mach_task_self()` takes no input.
+        let result = unsafe {
+            task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                (&mut info as *mut MachTaskBasicInfo).cast::<i32>(),
+                &mut count,
+            )
+        };
+        (result == KERN_SUCCESS).then_some(info)
+    }
+
+    /// Returns the populated prefix and the unit count the kernel actually
+    /// wrote, so callers can tell whether rev1/rev3 fields are valid.
+    fn task_vm_info() -> Option<(TaskVmInfoPrefix, u32)> {
+        let mut info = TaskVmInfoPrefix::default();
+        let mut count = TASK_VM_INFO_PREFIX_COUNT;
+        // SAFETY: same contract as `task_basic_info`; `info` is a `repr(C)`
+        // prefix of `task_vm_info` and `count` is its size in natural_t units.
+        let result = unsafe {
+            task_info(
+                mach_task_self(),
+                TASK_VM_INFO,
+                (&mut info as *mut TaskVmInfoPrefix).cast::<i32>(),
+                &mut count,
+            )
+        };
+        (result == KERN_SUCCESS).then_some((info, count))
+    }
+
+    pub(super) fn working_set_bytes() -> Option<u64> {
+        if let Some((info, units)) = task_vm_info()
+            && units >= UNITS_THROUGH_PHYS_FOOTPRINT
+            && info.phys_footprint > 0
+        {
+            return Some(info.phys_footprint);
+        }
+        task_basic_info()
+            .map(|info| info.resident_size)
+            .filter(|bytes| *bytes > 0)
+    }
+
+    pub(super) fn peak_working_set_bytes() -> Option<u64> {
+        if let Some((info, units)) = task_vm_info()
+            && units >= UNITS_THROUGH_LEDGER_PEAK
+            && info.ledger_phys_footprint_peak > 0
+        {
+            return Some(info.ledger_phys_footprint_peak as u64);
+        }
+        task_basic_info()
+            .map(|info| info.resident_size_max)
+            .filter(|bytes| *bytes > 0)
+    }
+}
+
+/// Current process working set (Windows working set / macOS physical
+/// footprint), or `None` where the platform is unsupported.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn working_set_bytes() -> Option<u64> {
     memory::working_set_bytes()
 }
 
-#[cfg(target_os = "windows")]
+/// OS-reported peak process working set, or `None` when unavailable. This is
+/// never a sampled or synthesized peak.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn peak_working_set_bytes() -> Option<u64> {
     memory::peak_working_set_bytes()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub(crate) fn working_set_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub(crate) fn peak_working_set_bytes() -> Option<u64> {
     None
 }
@@ -240,5 +423,18 @@ mod tests {
         let peak = super::peak_working_set_bytes().expect("peak working set");
         assert!(working > 0);
         assert!(peak >= working);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn mach_task_info_reports_a_footprint_and_peak() {
+        let working = super::working_set_bytes().expect("phys_footprint");
+        let peak = super::peak_working_set_bytes().expect("peak footprint");
+        // A live test process always owns at least a few pages.
+        assert!(working > 0, "phys_footprint must be positive, got {working}");
+        assert!(peak > 0, "peak footprint must be positive, got {peak}");
+        eprintln!("perf memory: working={working} B peak={peak} B");
     }
 }

@@ -9,6 +9,8 @@
 //! `__f*_rn` intrinsic, so the GPU performs the same sequence of IEEE-754
 //! binary32 roundings as the CPU. `AURORA_BLEMISH_GPU=0` keeps the CPU bytes.
 
+#[cfg(windows)]
+mod imp {
 use crate::blemish_gainmap::{validate_gainmap_input, GainMap, SpotlessGainmapInputs};
 use aurora_portrait::cuda::{CudaError, Dispatch, Nvidia, PinnedBuffer};
 use aurora_portrait::Refusal;
@@ -410,4 +412,39 @@ pub fn apply_8u_device(
         &mut params as *mut Params as *mut std::ffi::c_void,
     ];
     gpu.launch_raw(KERNEL_8U, grid(width, height), BLOCK, &mut args)
+}
+}
+
+#[cfg(windows)]
+pub use imp::*;
+
+#[cfg(not(windows))]
+use crate::blemish_gainmap::{GainMap, SpotlessGainmapInputs};
+#[cfg(not(windows))]
+use aurora_portrait::cuda::{CudaError, Dispatch};
+
+/// No CUDA driver exists on this platform, so the consumer reports a typed
+/// refusal and the caller keeps the scalar gain-map path.
+#[cfg(not(windows))]
+fn unsupported() -> CudaError {
+    CudaError::Unavailable("blemish gain map CUDA consumer is only available on Windows")
+}
+
+#[cfg(not(windows))]
+pub fn apply_16u(
+    _input: &SpotlessGainmapInputs<'_>,
+) -> Result<(Vec<u16>, Dispatch), CudaError> {
+    Err(unsupported())
+}
+
+#[cfg(not(windows))]
+pub fn apply_8u(
+    _rgb8: &[u8],
+    _width: u32,
+    _height: u32,
+    _map: &GainMap,
+    _amount: f32,
+    _protection_mask: Option<&[u8]>,
+) -> Result<(Vec<u8>, Dispatch), CudaError> {
+    Err(unsupported())
 }

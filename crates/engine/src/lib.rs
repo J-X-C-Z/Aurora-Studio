@@ -72,6 +72,17 @@ mod merge_options;
 mod panel_commands;
 mod mock;
 
+// Metal compute runtime (Mac lane, M2). Declarations only: nothing in the
+// engine pipeline calls this yet; product wiring is a follow-up owned by Mac-C.
+// The module tree is `cfg(target_os = "macos")` so Windows builds are unchanged.
+#[cfg(target_os = "macos")]
+pub mod metal_runtime;
+#[cfg(target_os = "macos")]
+pub(crate) mod metal;
+#[cfg(target_os = "macos")]
+#[path = "mock/skin_whiten_metal.rs"]
+pub mod skin_whiten_metal;
+
 pub fn prewarm_gpu() {
     #[cfg(windows)]
     mock::prewarm_gpu();
@@ -158,7 +169,7 @@ pub use portrait_stage::{
     PF90116_INPUT_NAME, PF90116_INPUT_SCALE, PF90116_INPUT_SHAPE, PF90116_MODEL_HEIGHT,
     PF90116_MODEL_ID, PF90116_MODEL_NET_SHA256, PF90116_MODEL_PAYLOAD_SHA256,
     PF90116_MODEL_WIDTH, PF90116_RESPONSE_NAME, PF90116_RESPONSE_SHAPE, MakeupInput,
-    PortraitBackend, PortraitEffectRun,
+    MetalDispatch, PortraitBackend, PortraitEffectRun,
     PortraitFrameReceipt, PortraitGeometryRun, PortraitJobInputs, PortraitJobReceipt,
     PortraitMasks, ProducerInputs, PLUMP_PFS,
     PlumpCompositeReceipt, PlumpFinalComposite, PlumpProducerInputs, SmileAxisDecode, SmileAxisSign,

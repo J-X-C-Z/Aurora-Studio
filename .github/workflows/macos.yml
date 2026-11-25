@@ -1,0 +1,155 @@
+name: macOS
+
+# Independent of ci.yml (Windows/Ubuntu). This workflow never edits or gates
+# the Windows jobs. The ARM64 workspace check now passes and
+# scripts/build-macos.sh assembles the release .app. The synthetic-test gate
+# skips tests that need local, gitignored fixtures, using the documented list
+# in scripts/testdata-skips.txt (see the note on that file).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Must match scripts/build-macos.sh and 50-app-audit.md. gpui-pre-apple's
+  # Metal library is compiled with -mmacosx-version-min=12.0.
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+concurrency:
+  group: macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS build, synthetic tests, ARM64 app
+    # Plain macos-14 hosted runners are Apple Silicon on current GitHub
+    # images. The step below records the real architecture and the workflow
+    # still works if the label resolves to x86_64 (check is cross, tests are
+    # native, the bundle is always aarch64).
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record architecture and toolchain
+        run: |
+          HOST_ARCH="$(uname -m)"
+          if [ "$HOST_ARCH" != "arm64" ]; then
+            echo "::warning::Runner architecture is $HOST_ARCH, not arm64. The release bundle is cross-built for aarch64 and its binary is not executed on this host."
+          fi
+          {
+            echo "## macOS runner"
+            echo ""
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| host arch | \`$HOST_ARCH\` |"
+            echo "| runner arch context | \`${{ runner.arch }}\` |"
+            echo "| macOS | \`$(sw_vers -productVersion) ($(sw_vers -buildVersion))\` |"
+            echo "| Xcode | \`$(xcodebuild -version 2>/dev/null | tr '\n' ' ')\` |"
+            echo "| SDK | \`$(xcrun --sdk macosx --show-sdk-version)\` |"
+            echo "| rustc | \`$(rustc -vV 2>/dev/null | tr '\n' ' ')\` |"
+            echo "| deployment target | \`$MACOSX_DEPLOYMENT_TARGET\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64
+
+      - name: Check manifests
+        run: cargo metadata --locked --no-deps --format-version 1
+
+      - name: Check all targets (aarch64-apple-darwin)
+        run: cargo check --workspace --all-targets --locked --target aarch64-apple-darwin
+
+      - name: Run synthetic tests (skip local-only fixtures)
+        # Tests run natively: an arm64 runner executes the aarch64 target,
+        # while an x86_64 runner can only execute host binaries. The release
+        # build below is always aarch64.
+        #
+        # A clean checkout has no crates/engine/testdata/ (gitignored) or the
+        # other local fixture trees, so the pass gate applies every non-comment
+        # line of scripts/testdata-skips.txt as an explicit `--skip` filter.
+        # The count is printed so a silently-empty list cannot pass as success.
+        run: |
+          SKIPS="$(sed -e 's/#.*//' scripts/testdata-skips.txt \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+            | grep -v '^$' || true)"
+          COUNT="$(printf '%s\n' "$SKIPS" | grep -c . || true)"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::scripts/testdata-skips.txt produced no --skip filters"
+            exit 1
+          fi
+          SKIP_ARGS=()
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            SKIP_ARGS+=(--skip "$name")
+          done <<< "$SKIPS"
+          echo "Applying $COUNT explicit --skip filters from scripts/testdata-skips.txt"
+          if [ "$(uname -m)" = "arm64" ]; then
+            cargo test --workspace --locked --target aarch64-apple-darwin -- --test-threads=1 "${SKIP_ARGS[@]}"
+          else
+            cargo test --workspace --locked -- --test-threads=1 "${SKIP_ARGS[@]}"
+          fi
+
+      - name: Build and assemble ARM64 .app
+        run: ./scripts/build-macos.sh
+
+      - name: Detect Metal device
+        id: metal
+        run: |
+          # All GPU tests in crates/portrait/tests are #[ignore = "requires
+          # macOS Metal device"]. They are never counted as passes by the
+          # default test run above (cargo reports them as ignored).
+          if xcrun --find swift >/dev/null 2>&1 \
+             && xcrun swift -e 'import Metal; print(MTLCreateSystemDefaultDevice() != nil ? "yes" : "no")' 2>/dev/null | grep -qx yes; then
+            echo "has_device=1" >> "$GITHUB_OUTPUT"
+            echo "Metal device present; GPU-only tests will run with --ignored."
+          else
+            echo "has_device=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Metal device on this runner. GPU tests are skipped and are NOT counted as passes."
+          fi
+
+      - name: Metal GPU tests (real device only)
+        if: steps.metal.outputs.has_device == '1'
+        # metal_asset is intentionally excluded: both of its tests read
+        # work/backend-r11/o2e/whiten_lut.f32, a local-only asset absent on a
+        # clean checkout (only o1i is present), so it would fail rather than
+        # verify anything. The four Metal targets below are the ones that pass
+        # with real hardware on this machine (18 ignored tests).
+        run: |
+          cargo test -p aurora-portrait --locked \
+            --test metal_runtime \
+            --test metal_mesh_runtime \
+            --test metal_smile \
+            --test metal_skin_assets \
+            -- --ignored --test-threads=1
+
+      - name: Metal GPU tests skipped (no device)
+        if: steps.metal.outputs.has_device != '1'
+        run: |
+          echo "Metal GPU tests were not executed: no Metal device."
+          echo "They are ignored by the default run and are not counted as passes."
+
+      - name: Verify, ad-hoc sign and zip .app
+        run: ./scripts/package-macos.sh
+
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurora-studio-macos-${{ runner.arch }}
+          path: dist/*.zip*
+          if-no-files-found: error
