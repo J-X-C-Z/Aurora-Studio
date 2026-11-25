@@ -77,12 +77,12 @@ impl Render for LiveView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let camera = match &s.camera {
+        let camera = match &s.device.camera {
             CameraStatus::Connected { model, .. } => Some(model.clone()),
             CameraStatus::Disconnected => None,
         };
         let capturing = s.capturing;
-        let settings = s.camera_settings.clone();
+        let settings = s.device.camera_settings.clone();
         let this = cx.entity();
         let (e1, e2) = (this.clone(), this.clone());
         let st = self.state.clone();

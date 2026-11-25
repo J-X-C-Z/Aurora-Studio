@@ -83,16 +83,16 @@ fn opt_binding<T: Clone + Default + 'static>(
 fn navigator_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let thumb = s.current.and_then(|id| s.thumbs.get(&id).cloned());
+    let thumb = s.library.current.and_then(|id| s.preview_state.thumbs.get(&id).cloned());
     let region = s.visible_region();
-    let zoomed = s.zoom.scale.is_some();
+    let zoomed = s.preview_state.zoom.scale.is_some();
     let (fw, fh) = s.frame_size();
     let aspect = fw / fh.max(1.0);
     let w = 270.0f32;
     let h = (w / aspect).min(200.0);
     let w = h * aspect;
     let (st, st2) = (state.clone(), state.clone());
-    let zoom_pct = (s.effective_scale() / s.scale_factor.max(0.5) * 100.0).round();
+    let zoom_pct = (s.effective_scale() / s.device.scale_factor.max(0.5) * 100.0).round();
     let st3 = state.clone();
     ToolPanel::new(state, "navigator", t("Navigator", "导航器")).badge(format!("{zoom_pct:.0}%")).child(
         v_flex()
@@ -121,15 +121,15 @@ fn navigator_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use
                     })
                     .on_down(move |ptr, _, cx| {
                         st.update(cx, |s, cx| {
-                            if s.zoom.scale.is_some() {
-                                let z = s.zoom.scale;
+                            if s.preview_state.zoom.scale.is_some() {
+                                let z = s.preview_state.zoom.scale;
                                 s.set_zoom(z, Some((ptr.pos.0.clamp(0.0, 1.0), ptr.pos.1.clamp(0.0, 1.0))), cx);
                             }
                         })
                     })
                     .on_drag(move |ptr, _, cx| {
                         st2.update(cx, |s, cx| {
-                            let c = s.zoom.center;
+                            let c = s.preview_state.zoom.center;
                             s.pan_by(ptr.pos.0.clamp(0.0, 1.0) - c.0, ptr.pos.1.clamp(0.0, 1.0) - c.1, cx)
                         })
                     }),
@@ -139,8 +139,8 @@ fn navigator_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use
                     let st = st3.clone();
                     Button::new(SharedString::from(format!("nav-{label}"))).xsmall().ghost().label(label).on_click(move |_, _, cx| {
                         st.update(cx, |s, cx| {
-                            let sf = s.scale_factor;
-                            let c = s.zoom.center;
+                            let sf = s.device.scale_factor;
+                            let c = s.preview_state.zoom.center;
                             s.set_zoom(z.map(|z| z * sf), Some(c), cx)
                         })
                     })
@@ -315,9 +315,9 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let active = s.cursor == CursorTool::Spot;
     let p = pal(cx).clone();
     let (st, st2) = (state.clone(), state.clone());
-    let size = s.panels.brush_size;
-    let clone = s.panels.spot_clone;
-    let anchored = s.spot_anchor.is_some();
+    let size = s.prefs.panels.brush_size;
+    let clone = s.prefs.panels.spot_clone;
+    let anchored = s.editor.spot_anchor.is_some();
     ToolPanel::new(state, "spots", t("Spot Removal", "污点去除"))
         .status(crate::contract::SPOTS)
         .modified(!spots.is_empty())
@@ -354,8 +354,8 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                         let st = state.clone();
                         move |_, _, cx| {
                             st.update(cx, |s, cx| {
-                                s.panels.spot_clone = false;
-                                s.spot_anchor = None;
+                                s.prefs.panels.spot_clone = false;
+                                s.editor.spot_anchor = None;
                                 s.set_cursor(CursorTool::Spot, cx);
                                 cx.notify();
                             })
@@ -370,7 +370,7 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                         let st = state.clone();
                         move |_, _, cx| {
                             st.update(cx, |s, cx| {
-                                s.panels.spot_clone = true;
+                                s.prefs.panels.spot_clone = true;
                                 s.set_cursor(CursorTool::Spot, cx);
                                 cx.notify();
                             })
@@ -383,7 +383,7 @@ fn spots_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                 let st = state.clone();
                 move |v, _, cx| {
                     st.update(cx, |s, cx| {
-                        s.panels.brush_size = v / 100.0;
+                        s.prefs.panels.brush_size = v / 100.0;
                         cx.notify();
                     })
                 }

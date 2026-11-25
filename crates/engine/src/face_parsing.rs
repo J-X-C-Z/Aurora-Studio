@@ -732,13 +732,17 @@ impl FaceParsingProducer {
         })
     }
 
-    /// Candidate application entry. The automatic native chain is
+    /// Produce the per-job producer bundle for one renderer job.
+    ///
+    /// The caller passes the returned bundle through
+    /// [`crate::document::RuntimeInputs`] for *that exact job*; it is never
+    /// stored on [`crate::AdjustmentSet`], an undo step or a saved file. The
+    /// automatic native chain is
     /// `1882168271 -> 1063025060 -> 323773030 -> source-frame ROI -> this fbe
     /// model`; the caller supplies the same-job ROI and no detected face is a
     /// typed refusal, never a full-frame fallback.
-    pub fn attach_to_adjustment(
+    pub fn produce_bundle(
         &self,
-        adjustments: &mut crate::AdjustmentSet,
         frame: &Image,
         job_id: u64,
         detected_face_roi: Option<FaceParsingRoi>,
@@ -749,15 +753,13 @@ impl FaceParsingProducer {
         let source_to_crop = roi
             .source_to_crop()
             .map_err(|refusal| anyhow::anyhow!("FaceParsingV2 ROI refused: {refusal:?}"))?;
-        let bundle = Arc::new(self.produce(
+        Ok(Arc::new(self.produce(
             frame,
             job_id,
             source_to_crop,
             bright_ui,
             deyellow_ui,
-        )?);
-        adjustments.portrait_producer_inputs = Some(Arc::clone(&bundle));
-        Ok(bundle)
+        )?))
     }
 }
 

@@ -72,7 +72,7 @@ impl ExportDialog {
         let sidecar = self.sidecar;
         let items: Vec<OriginalItem> = {
             let s = state.read(cx);
-            s.selection
+            s.library.selection
                 .iter()
                 .filter_map(|id| {
                     s.info(*id).map(|i| OriginalItem {
@@ -80,7 +80,7 @@ impl ExportDialog {
                         name: i.file_name.clone(),
                         sidecar: sidecar.then(|| {
                             serde_json::to_string_pretty(
-                                &s.edits.get(id).map(|e| e.adj.clone()).unwrap_or_default(),
+                                &s.editor.edits.get(id).map(|e| e.adj.clone()).unwrap_or_default(),
                             )
                             .unwrap_or_default()
                         }),
@@ -345,7 +345,7 @@ impl Render for ExportDialog {
         let p = pal(cx).clone();
         let this = cx.entity();
         let s = self.state.read(cx);
-        let n = s.selection.len();
+        let n = s.library.selection.len();
         let recipes: Vec<(usize, SharedString)> = s.recipes.iter().enumerate().map(|(i, r)| (i, r.name.clone().into())).collect();
         let recipe = s.recipes.get(self.recipe).cloned();
         let format = self.format.or(recipe.as_ref().map(|r| r.format)).unwrap_or_default();
@@ -400,7 +400,7 @@ impl Render for ExportDialog {
                         cx.notify();
                     })
                 }), cx))
-                .child(row(t("Format", "格式"), select("exp-format", ExportFormat::ALL.iter().map(|f| (*f, crate::contract::format_label(&s.capabilities, *f).into())).collect(), format, move |f, _, cx| {
+                .child(row(t("Format", "格式"), select("exp-format", ExportFormat::ALL.iter().map(|f| (*f, crate::contract::format_label(&s.prefs.capabilities, *f).into())).collect(), format, move |f, _, cx| {
                     this3.update(cx, |d, cx| {
                         d.format = Some(f);
                         cx.notify();

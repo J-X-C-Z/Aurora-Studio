@@ -1,12 +1,19 @@
-use super::{ExportAssets, color, reconstruct as raw};
-use anyhow::{Context, Result, anyhow, ensure};
+use super::ExportAssets;
+#[cfg(windows)]
+use super::{color, reconstruct as raw};
+use anyhow::{Result, ensure};
+#[cfg(windows)]
+use anyhow::{Context, anyhow};
+#[cfg(windows)]
 use color::output::OutputClut;
 
+#[cfg(windows)]
 const TILE: usize = 512;
 
 /// Runs the Z6III OpenCL reconstruction + optional linear CA (stage 16) +
 /// highlight recovery + anti-aliasing pipeline over 512x512 tiles, invoking
 /// `on_tile(left, top, width, height, core, iso, noise)` for each tile.
+#[cfg(windows)]
 pub(super) fn render_linear_tiles(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
@@ -74,6 +81,7 @@ pub(super) fn render_linear_tiles(
     Ok((crop.width, crop.height))
 }
 
+#[cfg(windows)]
 pub(in crate::aurora_raw) fn linear_rgba16(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
@@ -102,6 +110,7 @@ pub(in crate::aurora_raw) fn linear_rgba16(
     Ok((crop_w, crop_h, out))
 }
 
+#[cfg(windows)]
 pub(super) fn neutral(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Vec<u16>> {
     check_assets(assets)?;
     let film = color::film_nodes(assets.curve).context("invalid film curve")?;
@@ -140,6 +149,7 @@ pub(super) fn check_assets(assets: &ExportAssets<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn highlight_parameters(black: u32, mut gains: [f32; 3]) -> [f32; 16] {
     let range = (65535 - black) as f32;
     let threshold = range * (-0.05_f32).exp2();
@@ -157,6 +167,7 @@ fn highlight_parameters(black: u32, mut gains: [f32; 3]) -> [f32; 16] {
 /// `AntiColorAliasingV10` (`anti_alias_opencl`) on any generic Bayer linear
 /// RGB frame in 512x512 tiles with a 2-pixel clamped halo. Falls back silently
 /// when OpenCL is unavailable.
+#[cfg(windows)]
 pub(in crate::aurora_raw) fn recover_and_antialias_frame(
     rgb: &mut [[f32; 3]],
     width: usize,

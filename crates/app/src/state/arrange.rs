@@ -54,10 +54,10 @@ impl AppState {
 
     /// Restores the custom order and stacks saved for what is open.
     pub(crate) fn load_arrangement(&mut self) {
-        let Some(saved) = self.settings.arrangements.get(&self.arrangement_key()).cloned() else { return };
-        let by_key: BTreeMap<String, ImageId> = self.images.iter().map(|i| (image_key(i), i.id)).collect();
-        self.custom_order = saved.order.iter().filter_map(|k| by_key.get(k).copied()).collect();
-        self.stacks = saved
+        let Some(saved) = self.prefs.settings.arrangements.get(&self.arrangement_key()).cloned() else { return };
+        let by_key: BTreeMap<String, ImageId> = self.library.images.iter().map(|i| (image_key(i), i.id)).collect();
+        self.library.custom_order = saved.order.iter().filter_map(|k| by_key.get(k).copied()).collect();
+        self.library.stacks = saved
             .stacks
             .iter()
             .map(|keys| Stack { ids: keys.iter().filter_map(|k| by_key.get(k).copied()).collect() })
@@ -68,35 +68,35 @@ impl AppState {
     fn save_arrangement(&mut self) {
         let key_of = |id: &ImageId| self.info(*id).map(image_key);
         let saved = Arrangement {
-            order: self.custom_order.iter().filter_map(key_of).collect(),
-            stacks: self.stacks.iter().map(|s| s.ids.iter().filter_map(key_of).collect()).collect(),
+            order: self.library.custom_order.iter().filter_map(key_of).collect(),
+            stacks: self.library.stacks.iter().map(|s| s.ids.iter().filter_map(key_of).collect()).collect(),
         };
         let key = self.arrangement_key();
         if saved == Arrangement::default() {
-            self.settings.arrangements.remove(&key);
+            self.prefs.settings.arrangements.remove(&key);
         } else {
-            self.settings.arrangements.insert(key, saved);
+            self.prefs.settings.arrangements.insert(key, saved);
         }
-        self.settings.save();
+        self.prefs.settings.save();
     }
 
     /// Position of `id` in the custom order; images never placed sort last.
     pub(crate) fn custom_rank(&self, id: ImageId) -> usize {
-        self.custom_order.iter().position(|i| *i == id).unwrap_or(usize::MAX)
+        self.library.custom_order.iter().position(|i| *i == id).unwrap_or(usize::MAX)
     }
 
     pub fn stack_of(&self, id: ImageId) -> Option<&Stack> {
-        self.stacks.iter().find(|s| s.ids.contains(&id))
+        self.library.stacks.iter().find(|s| s.ids.contains(&id))
     }
 
     pub fn stack_open(&self, pick: ImageId) -> bool {
-        self.open_stacks.contains(&pick)
+        self.library.open_stacks.contains(&pick)
     }
 
     /// Folds stack members under their pick in an already sorted list; members
     /// of an open stack follow the pick directly.
     pub(crate) fn fold_stacks<'a>(&'a self, sorted: Vec<&'a ImageInfo>) -> Vec<&'a ImageInfo> {
-        if self.stacks.is_empty() {
+        if self.library.stacks.is_empty() {
             return sorted;
         }
         let present: HashSet<ImageId> = sorted.iter().map(|i| i.id).collect();
@@ -128,20 +128,20 @@ impl AppState {
             // Start from what the user is looking at.
             let shown: Vec<ImageId> = self.visible_images().iter().map(|i| i.id).collect();
             let mut order = shown.clone();
-            order.extend(self.images.iter().map(|i| i.id).filter(|id| !shown.contains(id)));
-            self.custom_order = order;
+            order.extend(self.library.images.iter().map(|i| i.id).filter(|id| !shown.contains(id)));
+            self.library.custom_order = order;
             self.sort = SortKey::Custom;
             self.sort_desc = false;
         }
-        for id in self.images.iter().map(|i| i.id) {
-            if !self.custom_order.contains(&id) {
-                self.custom_order.push(id);
+        for id in self.library.images.iter().map(|i| i.id) {
+            if !self.library.custom_order.contains(&id) {
+                self.library.custom_order.push(id);
             }
         }
-        self.custom_order.retain(|i| !ids.contains(i));
-        let at = before.and_then(|b| self.custom_order.iter().position(|i| *i == b)).unwrap_or(self.custom_order.len());
+        self.library.custom_order.retain(|i| !ids.contains(i));
+        let at = before.and_then(|b| self.library.custom_order.iter().position(|i| *i == b)).unwrap_or(self.library.custom_order.len());
         for (k, id) in ids.iter().enumerate() {
-            self.custom_order.insert(at + k, *id);
+            self.library.custom_order.insert(at + k, *id);
         }
         self.save_arrangement();
         cx.notify();
@@ -150,9 +150,9 @@ impl AppState {
     /// Stacks the selection under the current image (or the first selected).
     pub fn stack_selection(&mut self, cx: &mut Context<Self>) {
         let order: Vec<ImageId> = self.visible_images().iter().map(|i| i.id).collect();
-        let mut ids: Vec<ImageId> = order.iter().copied().filter(|id| self.selection.contains(id)).collect();
+        let mut ids: Vec<ImageId> = order.iter().copied().filter(|id| self.library.selection.contains(id)).collect();
         // Members of folded stacks are selected through their pick.
-        let folded: Vec<ImageId> = self.stacks.iter().filter(|s| ids.contains(&s.pick())).flat_map(|s| s.ids.clone()).collect();
+        let folded: Vec<ImageId> = self.library.stacks.iter().filter(|s| ids.contains(&s.pick())).flat_map(|s| s.ids.clone()).collect();
         for id in folded {
             if !ids.contains(&id) {
                 ids.push(id);
@@ -162,22 +162,22 @@ impl AppState {
             self.notify(t("Select at least two images to stack", "请至少选择两张图像来堆叠"), cx);
             return;
         }
-        if let Some(cur) = self.current.filter(|c| ids.contains(c)) {
+        if let Some(cur) = self.library.current.filter(|c| ids.contains(c)) {
             ids.retain(|i| *i != cur);
             ids.insert(0, cur);
         }
-        self.stacks.retain(|s| !s.ids.iter().any(|i| ids.contains(i)));
+        self.library.stacks.retain(|s| !s.ids.iter().any(|i| ids.contains(i)));
         let n = ids.len();
-        self.stacks.push(Stack { ids });
+        self.library.stacks.push(Stack { ids });
         self.save_arrangement();
         self.notify(format!("{} {n} {}", t("Stacked", "已堆叠"), t("images", "张图像")), cx);
     }
 
     pub fn unstack_selection(&mut self, cx: &mut Context<Self>) {
-        let before = self.stacks.len();
-        let sel = self.selection.clone();
-        self.stacks.retain(|s| !s.ids.iter().any(|i| sel.contains(i)));
-        if self.stacks.len() != before {
+        let before = self.library.stacks.len();
+        let sel = self.library.selection.clone();
+        self.library.stacks.retain(|s| !s.ids.iter().any(|i| sel.contains(i)));
+        if self.library.stacks.len() != before {
             self.save_arrangement();
             self.notify(t("Unstacked", "已取消堆叠"), cx);
         }
@@ -185,7 +185,7 @@ impl AppState {
 
     /// Stacks runs of images taken within `gap` seconds of each other.
     pub fn auto_stack(&mut self, gap: i64, cx: &mut Context<Self>) {
-        let mut timed: Vec<(i64, ImageId)> = self
+        let mut timed: Vec<(i64, ImageId)> = self.library
             .images
             .iter()
             .filter(|i| self.stack_of(i.id).is_none())
@@ -204,12 +204,12 @@ impl AppState {
         };
         for (s, id) in timed {
             if s - last > gap {
-                flush(&mut run, &mut self.stacks);
+                flush(&mut run, &mut self.library.stacks);
             }
             run.push(id);
             last = s;
         }
-        flush(&mut run, &mut self.stacks);
+        flush(&mut run, &mut self.library.stacks);
         self.save_arrangement();
         let msg = if made == 0 {
             t("No images were taken close enough together to stack", "没有拍摄时间足够接近的图像可以堆叠").to_string()
@@ -221,13 +221,13 @@ impl AppState {
 
     /// Opens or closes the current image's stack, or all stacks.
     pub fn toggle_stacks_open(&mut self, cx: &mut Context<Self>) {
-        match self.current.and_then(|c| self.stack_of(c)).map(|s| s.pick()) {
+        match self.library.current.and_then(|c| self.stack_of(c)).map(|s| s.pick()) {
             Some(pick) => self.toggle_stack(pick, cx),
             None => {
-                if self.open_stacks.is_empty() {
-                    self.open_stacks = self.stacks.iter().map(|s| s.pick()).collect();
+                if self.library.open_stacks.is_empty() {
+                    self.library.open_stacks = self.library.stacks.iter().map(|s| s.pick()).collect();
                 } else {
-                    self.open_stacks.clear();
+                    self.library.open_stacks.clear();
                 }
                 cx.notify();
             }
@@ -235,20 +235,20 @@ impl AppState {
     }
 
     pub fn toggle_stack(&mut self, pick: ImageId, cx: &mut Context<Self>) {
-        if !self.open_stacks.remove(&pick) {
-            self.open_stacks.insert(pick);
+        if !self.library.open_stacks.remove(&pick) {
+            self.library.open_stacks.insert(pick);
         }
         cx.notify();
     }
 
     /// Makes `id` the image that stands for its stack.
     pub fn set_stack_pick(&mut self, id: ImageId, cx: &mut Context<Self>) {
-        let Some(stack) = self.stacks.iter_mut().find(|s| s.ids.contains(&id)) else { return };
+        let Some(stack) = self.library.stacks.iter_mut().find(|s| s.ids.contains(&id)) else { return };
         let old = stack.pick();
         stack.ids.retain(|i| *i != id);
         stack.ids.insert(0, id);
-        if self.open_stacks.remove(&old) {
-            self.open_stacks.insert(id);
+        if self.library.open_stacks.remove(&old) {
+            self.library.open_stacks.insert(id);
         }
         self.save_arrangement();
         cx.notify();

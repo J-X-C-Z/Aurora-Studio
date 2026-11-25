@@ -16,14 +16,14 @@ impl AppState {
             return;
         }
         // One image at a time: a multiple selection would show side by side.
-        let first = self.current.unwrap_or(self.visible_images()[0].id);
+        let first = self.library.current.unwrap_or(self.visible_images()[0].id);
         self.select(first, false, false, cx);
         let was_fullscreen = window.is_fullscreen();
         if !was_fullscreen {
             window.toggle_fullscreen();
         }
         let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.slideshow = Some(Slideshow { playing: true, interval: self.settings.slideshow_interval.max(1.0), run, was_fullscreen });
+        self.slideshow = Some(Slideshow { playing: true, interval: self.prefs.settings.slideshow_interval.max(1.0), run, was_fullscreen });
         self.set_zoom(None, None, cx);
         self.request_render(RenderQuality::Final, cx);
         self.schedule_slide(run, cx);
@@ -51,7 +51,7 @@ impl AppState {
         if ids.is_empty() {
             return;
         }
-        let at = self.current.and_then(|c| ids.iter().position(|i| *i == c)).unwrap_or(0) as isize;
+        let at = self.library.current.and_then(|c| ids.iter().position(|i| *i == c)).unwrap_or(0) as isize;
         let next = ids[(at + delta).rem_euclid(ids.len() as isize) as usize];
         self.select(next, false, false, cx);
     }
@@ -65,8 +65,8 @@ impl AppState {
     }
 
     pub fn set_slideshow_interval(&mut self, secs: f32, cx: &mut Context<Self>) {
-        self.settings.slideshow_interval = secs;
-        self.settings.save();
+        self.prefs.settings.slideshow_interval = secs;
+        self.prefs.settings.save();
         // Restart the timer so the new pace applies from now.
         if let Some(show) = self.slideshow.as_mut() {
             show.interval = secs;

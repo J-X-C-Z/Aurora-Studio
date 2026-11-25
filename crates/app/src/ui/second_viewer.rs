@@ -46,11 +46,11 @@ impl Render for SecondViewer {
         let view = window.viewport_size();
         let area = gpui_kit::size((f32::from(view.width) - 48.0).max(1.0), (f32::from(view.height) - 80.0).max(1.0));
         let s = self.state.read(cx);
-        let current = s.current;
+        let current = s.library.current;
         // The preview once it is of this image; its thumbnail until then.
-        let (picture, frame_id) = match s.preview.frame.as_ref().filter(|f| Some(f.image_id) == current) {
+        let (picture, frame_id) = match s.preview_state.preview.frame.as_ref().filter(|f| Some(f.image_id) == current) {
             Some(f) => (Some(f.image.clone()), f.image_id.0),
-            None => (current.and_then(|id| s.thumbs.get(&id).cloned()), 0),
+            None => (current.and_then(|id| s.preview_state.thumbs.get(&id).cloned()), 0),
         };
         let info = s.current_info().cloned();
         let ids: Vec<_> = s.visible_images().iter().map(|i| i.id).collect();

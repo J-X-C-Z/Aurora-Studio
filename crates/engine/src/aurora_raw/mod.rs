@@ -9,7 +9,9 @@
 pub mod c1_raw_he;
 pub mod xtrans;
 pub(crate) mod rust_raw;
-#[cfg(all(windows, feature = "z6iii-raw-export"))]
+// The Z6III algorithm modules are platform-neutral; only the desktop exporter,
+// the System32 OpenCL loader and the CLI bins are Windows/product-specific and
+// are gated inside this subtree.
 pub mod z6iii;
 
 pub use c1_raw_he::decode_frame_cropped;

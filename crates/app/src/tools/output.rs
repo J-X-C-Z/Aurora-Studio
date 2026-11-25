@@ -133,7 +133,7 @@ fn recipe_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
     let Some(r) = s.recipes.get(s.selected_recipe).cloned() else {
         return div().into_any_element();
     };
-    let caps = s.capabilities.clone();
+    let caps = s.prefs.capabilities.clone();
     let query = s.icc_query.clone();
     let profiles = s.icc_picker(Some(r.icc_profile.as_str()), &query);
     let group = s.icc_group;
@@ -200,8 +200,8 @@ fn recipe_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
                     .on_select(move |i, _, cx| {
                         stg.update(cx, |s, _| {
                             s.icc_group = i;
-                            s.settings.icc_group = i as u8;
-                            s.settings.save();
+                            s.prefs.settings.icc_group = i as u8;
+                            s.prefs.settings.save();
                         })
                     })
             },
@@ -306,9 +306,9 @@ fn recipe_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
 fn summary_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let images = s.selection.len();
+    let images = s.library.selection.len();
     let recipes: Vec<ProcessRecipe> = s.recipes.iter().filter(|r| r.enabled).cloned().collect();
-    let pixels: f64 = s.selection.iter().filter_map(|id| s.info(*id)).map(|i| i.width as f64 * i.height as f64).sum();
+    let pixels: f64 = s.library.selection.iter().filter_map(|id| s.info(*id)).map(|i| i.width as f64 * i.height as f64).sum();
     let est_mb: f64 = recipes
         .iter()
         .map(|r| {
@@ -349,14 +349,14 @@ fn summary_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<>
 fn queue_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let jobs = s.jobs.clone();
+    let jobs = s.tasks.jobs.clone();
     let active = jobs.iter().filter(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running { .. })).count();
     let st = state.clone();
     ToolPanel::new(state, "queue", t("Queue", "队列"))
         .badge(format!("{active}/{}", jobs.len()))
         .on_reset(move |_, cx| {
             st.update(cx, |s, cx| {
-                s.jobs.retain(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running { .. }));
+                s.tasks.jobs.retain(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running { .. }));
                 cx.notify();
             })
         })

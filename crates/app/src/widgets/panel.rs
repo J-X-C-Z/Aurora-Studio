@@ -153,7 +153,7 @@ impl ToolPanel {
 impl RenderOnce for ToolPanel {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = pal(cx).clone();
-        let open = self.force_open || !self.state.read(cx).panels.collapsed.contains(self.id);
+        let open = self.force_open || !self.state.read(cx).prefs.panels.collapsed.contains(self.id);
         let progress = motion::toggle(motion::key(self.id, "open"), open, motion::PANEL, window, cx);
         let id = self.id;
         let state = self.state.clone();

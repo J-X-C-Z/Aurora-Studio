@@ -8,7 +8,7 @@ use crate::state::AppState;
 use crate::theme::pal;
 
 pub fn about(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
-    let engine = state.read(cx).engine_name.clone();
+    let engine = state.read(cx).prefs.engine_name.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let p = pal(cx).clone();
         dialog.title("Aurora Studio").w(px(420.0)).child(

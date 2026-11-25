@@ -53,13 +53,13 @@ impl Browser {
     fn header(&self, mode: BrowserMode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let total = s.images.len();
+        let total = s.library.images.len();
         let shown = s.visible_images().len();
-        let selected = s.selection.len();
+        let selected = s.library.selection.len();
         let filter = s.filter.clone();
         let sort = s.sort;
         let desc = s.sort_desc;
-        let thumb = s.view.thumb_size;
+        let thumb = s.prefs.view.thumb_size;
         let (st1, st2, st3, st4, st5) = (self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone());
         let sorts = vec![
             (SortKey::Name, t("Name", "名称").into()),
@@ -141,7 +141,7 @@ impl Browser {
                             .compact_label()
                             .on_change(move |v, _, cx| {
                                 st5.update(cx, |s, cx| {
-                                    s.view.thumb_size = v;
+                                    s.prefs.view.thumb_size = v;
                                     cx.notify();
                                 })
                             }),
@@ -164,7 +164,7 @@ fn cell(
     let p = pal(cx).clone();
     let (current, selected) = {
         let s = state.read(cx);
-        (s.current == Some(info.id), s.selection.contains(&info.id))
+        (s.library.current == Some(info.id), s.library.is_selected(info.id))
     };
     // Selection answers a click, so it eases in rather than switching.
     let key = format!("thumb-{}", info.id.0);
@@ -172,7 +172,7 @@ fn cell(
     let cur_t = crate::motion::toggle(crate::motion::key(&key, "cur"), current, crate::motion::QUICK, window, cx);
     let s = state.read(cx);
     let id = info.id;
-    let thumb = s.thumbs.get(&id).cloned();
+    let thumb = s.preview_state.thumbs.get(&id).cloned();
     let thumb_failed = thumb.is_none() && s.thumb_failed.contains(&id);
     let eyes_closed = s.eyes.get(&id).map(|r| r.closed).filter(|n| *n > 0);
     let edited = info.has_adjustments;
@@ -181,7 +181,7 @@ fn cell(
     let tag = info.color_tag;
     let name: SharedString = info.file_name.clone().into();
     let variant = info.variant;
-    let dragged: Vec<ImageId> = if selected { s.selection.iter().copied().collect() } else { vec![id] };
+    let dragged: Vec<ImageId> = if selected { s.library.selection.iter().copied().collect() } else { vec![id] };
     // Stack: the pick carries a badge with the count; open members sit on a well.
     let stack = s.stack_of(id).map(|st| (st.pick() == id, st.ids.len(), s.stack_open(st.pick()), st.pick()));
     let member = stack.is_some_and(|(pick, ..)| !pick);
@@ -213,8 +213,8 @@ fn cell(
             let double = e.click_count() >= 2;
             st.update(cx, |s, cx| {
                 s.select(id, m.control || m.platform, m.shift, cx);
-                if double && s.view.browser == BrowserMode::Grid {
-                    s.view.browser = BrowserMode::Filmstrip;
+                if double && s.prefs.view.browser == BrowserMode::Grid {
+                    s.prefs.view.browser = BrowserMode::Filmstrip;
                     cx.notify();
                 }
             })
@@ -365,9 +365,9 @@ fn list_row(state: &Entity<AppState>, info: &ImageInfo, cx: &gpui_kit::App) -> i
     let p = pal(cx).clone();
     let s = state.read(cx);
     let id: ImageId = info.id;
-    let current = s.current == Some(id);
-    let selected = s.selection.contains(&id);
-    let thumb = s.thumbs.get(&id).cloned();
+    let current = s.library.current == Some(id);
+    let selected = s.library.is_selected(id);
+    let thumb = s.preview_state.thumbs.get(&id).cloned();
     let st = state.clone();
     let e = &info.exif;
     let heif_tip = info.heif.as_ref().map(heif_tip);
@@ -442,9 +442,9 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let mode = s.view.browser;
-        let height = s.view.filmstrip_height;
-        let thumb = s.view.thumb_size;
+        let mode = s.prefs.view.browser;
+        let height = s.prefs.view.filmstrip_height;
+        let thumb = s.prefs.view.thumb_size;
         let ids: Vec<ImageId> = s.visible_images().iter().map(|i| i.id).collect();
         let count = ids.len();
         let filtered = s.filter_active();
@@ -538,7 +538,7 @@ impl Render for Browser {
                     .when(filmstrip && count > 0, |d| {
                         d.horizontal_scrollbar(&self.scroll).on_scroll(cx.listener(
                             |this, e: &ScrollEvent, _, cx| {
-                                if this.state.read(cx).view.browser != BrowserMode::Filmstrip {
+                                if this.state.read(cx).prefs.view.browser != BrowserMode::Filmstrip {
                                     return;
                                 }
                                 let delta = e.delta.pixel_delta(px(72.0));

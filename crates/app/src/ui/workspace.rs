@@ -213,7 +213,7 @@ impl Workspace {
     }
 
     fn recent_names(state: &Entity<AppState>, cx: &App) -> Vec<String> {
-        state.read(cx).settings.recent.iter().map(|p| p.display().to_string()).collect()
+        state.read(cx).prefs.settings.recent.iter().map(|p| p.display().to_string()).collect()
     }
 
     fn with_state(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut AppState, &mut Context<AppState>)) {
@@ -248,7 +248,7 @@ impl Workspace {
         self.state.update(cx, |s, cx| match spawned {
             Ok(_) => {
                 let note = if catalog { format!(" · {}", crate::contract::C1_CATALOG.note().unwrap_or_default()) } else { String::new() };
-                s.settings.remember(&path);
+                s.prefs.settings.remember(&path);
                 s.notify(format!("{} {}{note}", t("Opening", "正在打开"), path.display()), cx)
             }
             Err(e) => s.notify(format!("{}: {e}", t("Cannot open", "无法打开")), cx),
@@ -256,12 +256,16 @@ impl Workspace {
     }
 
     fn register_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
-        el.on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+        el.on_action(cx.listener(|this, _: &Quit, _, cx| {
+            // Flush the bounded save queue before quitting; `flush_and_quit`
+            // shows an incomplete report before `cx.quit()`.
+            this.state.update(cx, |state, cx| state.flush_and_quit(cx));
+        }))
             .on_action(cx.listener(|this, _: &Import, window, cx| super::import::open(&this.state, window, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_in_new_window(true, window, cx)))
             .on_action(cx.listener(|this, _: &OpenCatalog, window, cx| this.open_in_new_window(false, window, cx)))
             .on_action(cx.listener(|this, a: &OpenRecent, window, cx| {
-                let Some(path) = this.state.read(cx).settings.recent.get(a.0).cloned() else { return };
+                let Some(path) = this.state.read(cx).prefs.settings.recent.get(a.0).cloned() else { return };
                 if this.state.read(cx).source == Source::Demo {
                     super::welcome::open_path(this.state.clone(), path, window.window_handle(), cx);
                 } else {
@@ -288,11 +292,11 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &MatchLook, _, cx| this.with_state(cx, |s, cx| s.match_look_selection(cx))))
             .on_action(cx.listener(|this, _: &CloneVariant, _, cx| this.with_state(cx, |s, cx| s.new_variant(false, cx))))
             .on_action(cx.listener(|this, _: &ToggleOverlay, window, cx| {
-                if this.state.read(cx).settings.overlay_image.is_none() {
+                if this.state.read(cx).prefs.settings.overlay_image.is_none() {
                     window.dispatch_action(Box::new(ChooseOverlay), cx);
                 } else {
                     this.with_state(cx, |s, cx| {
-                        s.view.overlay = !s.view.overlay;
+                        s.prefs.view.overlay = !s.prefs.view.overlay;
                         cx.notify();
                     })
                 }
@@ -310,9 +314,9 @@ impl Workspace {
                     let Some(path) = paths.into_iter().next() else { return };
                     cx.update(|cx| {
                         state.update(cx, |s, cx| {
-                            s.settings.overlay_image = Some(path);
-                            s.settings.save();
-                            s.view.overlay = true;
+                            s.prefs.settings.overlay_image = Some(path);
+                            s.prefs.settings.save();
+                            s.prefs.view.overlay = true;
                             cx.notify();
                         })
                     });
@@ -333,7 +337,7 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &AddOutsideNode, _, cx| this.with_state(cx, |s, cx| s.add_node(NewNode::Outside, cx))))
             .on_action(cx.listener(|this, _: &ToggleNode, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    if let Some(id) = s.active_layer {
+                    if let Some(id) = s.editor.active_layer {
                         s.toggle_node(id, cx)
                     }
                 })
@@ -342,7 +346,7 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &TidyNodes, _, cx| this.with_state(cx, |s, cx| s.tidy_nodes(cx))))
             .on_action(cx.listener(|this, _: &ToggleNodeDock, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.node_dock = !s.view.node_dock;
+                    s.prefs.view.node_dock = !s.prefs.view.node_dock;
                     cx.notify();
                 })
             }))
@@ -350,8 +354,8 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &SelectCurrentOnly, _, cx| {
                 // Collapses the multiple view back to the current image.
                 this.with_state(cx, |s, cx| {
-                    if let Some(id) = s.current
-                        && s.selection.len() > 1
+                    if let Some(id) = s.library.current
+                        && s.library.selection.len() > 1
                     {
                         s.select(id, false, false, cx);
                     }
@@ -362,15 +366,15 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &ZoomFit, _, cx| this.with_state(cx, |s, cx| s.set_zoom(None, None, cx))))
             .on_action(cx.listener(|this, _: &Zoom100, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    let sf = s.scale_factor;
-                    let c = s.zoom.center;
+                    let sf = s.device.scale_factor;
+                    let c = s.preview_state.zoom.center;
                     s.set_zoom(Some(sf), Some(c), cx)
                 })
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
                 this.with_state(cx, |s, cx| {
                     let next = s.effective_scale() * 1.5;
-                    let c = s.zoom.center;
+                    let c = s.preview_state.zoom.center;
                     s.set_zoom(Some(next), Some(c), cx)
                 })
             }))
@@ -380,47 +384,47 @@ impl Workspace {
                     if next <= s.fit_scale() {
                         s.set_zoom(None, None, cx)
                     } else {
-                        let c = s.zoom.center;
+                        let c = s.preview_state.zoom.center;
                         s.set_zoom(Some(next), Some(c), cx)
                     }
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleBrowser, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.browser = if s.view.browser == BrowserMode::Hidden { BrowserMode::Filmstrip } else { BrowserMode::Hidden };
+                    s.prefs.view.browser = if s.prefs.view.browser == BrowserMode::Hidden { BrowserMode::Filmstrip } else { BrowserMode::Hidden };
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleGridView, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.browser = if s.view.browser == BrowserMode::Grid { BrowserMode::Filmstrip } else { BrowserMode::Grid };
+                    s.prefs.view.browser = if s.prefs.view.browser == BrowserMode::Grid { BrowserMode::Filmstrip } else { BrowserMode::Grid };
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.show_inspector = !s.view.show_inspector;
+                    s.prefs.view.show_inspector = !s.prefs.view.show_inspector;
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleCompare, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.compare = if s.view.compare == CompareMode::Off { CompareMode::Split } else { CompareMode::Off };
-                    s.preview.before_dirty = true;
+                    s.prefs.view.compare = if s.prefs.view.compare == CompareMode::Off { CompareMode::Split } else { CompareMode::Off };
+                    s.preview_state.preview.before_dirty = true;
                     s.request_render(RenderQuality::Final, cx);
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleExposureWarning, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.exposure_warning = !s.view.exposure_warning;
+                    s.prefs.view.exposure_warning = !s.prefs.view.exposure_warning;
                     s.request_render(RenderQuality::Final, cx);
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleSoftProof, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.soft_proof = !s.view.soft_proof;
+                    s.prefs.view.soft_proof = !s.prefs.view.soft_proof;
                     s.refresh_thumbs(cx);
                     s.request_render(aurora_engine::RenderQuality::Final, cx);
                     cx.notify();
@@ -428,20 +432,20 @@ impl Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleProof, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.proof = !s.view.proof;
+                    s.prefs.view.proof = !s.prefs.view.proof;
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleGrid, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.grid = !s.view.grid;
+                    s.prefs.view.grid = !s.prefs.view.grid;
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|_, _: &ToggleFullscreen, window, _| window.toggle_fullscreen()))
             .on_action(cx.listener(|this, _: &ToggleMaskOverlay, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.panels.mask_overlay = !s.panels.mask_overlay;
+                    s.prefs.panels.mask_overlay = !s.prefs.panels.mask_overlay;
                     s.request_render(RenderQuality::Final, cx);
                     cx.notify();
                 })
@@ -466,7 +470,7 @@ impl Workspace {
                 this.with_state(cx, |s, cx| {
                     s.set_rating(rating, cx);
                     // Say what happened and to how many, where the eyes are.
-                    let n = s.selection.len();
+                    let n = s.library.selection.len();
                     let what = match rating {
                         r if r < 0 => t("Rejected", "已拒绝").to_string(),
                         0 => t("Rating cleared", "已清除评级").to_string(),
@@ -482,7 +486,7 @@ impl Workspace {
                 let tag = ColorTag::ALL[(a.0 as usize).min(7)];
                 this.with_state(cx, |s, cx| {
                     s.set_color_tag(tag, cx);
-                    let n = s.selection.len();
+                    let n = s.library.selection.len();
                     let what = if tag == ColorTag::None {
                         t("Color tag cleared", "已清除色标").to_string()
                     } else {
@@ -534,8 +538,8 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &MoveToTrash, _, cx| this.with_state(cx, |s, cx| s.toggle_trash_selection(cx))))
             .on_action(cx.listener(|this, _: &ClearAnnotations, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    if let Some(id) = s.current {
-                        s.annotations.remove(&id);
+                    if let Some(id) = s.library.current {
+                        s.library.annotations.remove(&id);
                     }
                     cx.notify();
                 })
@@ -543,8 +547,8 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &OpenExportDialog, window, cx| super::export::open(&this.state, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleMultiView, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.multi = !s.view.multi;
-                    if s.view.multi && s.multi_images().is_empty() {
+                    s.prefs.view.multi = !s.prefs.view.multi;
+                    if s.prefs.view.multi && s.multi_images().is_empty() {
                         s.notify(t("Select several images to see them side by side", "选择多张图像即可并排查看"), cx);
                     }
                     cx.notify();
@@ -552,20 +556,20 @@ impl Workspace {
             }))
             .on_action(cx.listener(|this, _: &SetCompareVariant, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.compare_variant = s.current;
-                    s.view.multi = true;
+                    s.prefs.view.compare_variant = s.library.current;
+                    s.prefs.view.multi = true;
                     s.notify(t("Set as compare variant", "已设为对比变体"), cx);
                 })
             }))
             .on_action(cx.listener(|this, _: &ClearCompareVariant, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.compare_variant = None;
+                    s.prefs.view.compare_variant = None;
                     cx.notify();
                 })
             }))
             .on_action(cx.listener(|this, _: &ToggleInspectorSide, _, cx| {
                 this.with_state(cx, |s, cx| {
-                    s.view.inspector_right = !s.view.inspector_right;
+                    s.prefs.view.inspector_right = !s.prefs.view.inspector_right;
                     s.save_settings();
                     cx.notify();
                 })
@@ -657,7 +661,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let view = s.view.clone();
+        let view = s.prefs.view.clone();
         let grid = view.browser == BrowserMode::Grid;
         let film = matches!(view.browser, BrowserMode::Filmstrip | BrowserMode::List);
         let list = view.browser == BrowserMode::List;
@@ -718,8 +722,8 @@ impl Render for Workspace {
                 let total = f32::from(window.viewport_size().width);
                 st_w.update(cx, |s, cx| {
                     let x = f32::from(ptr.point.x);
-                    let w = if s.view.inspector_right { total - x } else { x };
-                    s.view.inspector_width = w.clamp(260.0, 640.0);
+                    let w = if s.prefs.view.inspector_right { total - x } else { x };
+                    s.prefs.view.inspector_width = w.clamp(260.0, 640.0);
                     cx.notify();
                 })
             });
@@ -735,7 +739,7 @@ impl Render for Workspace {
                 let total = f32::from(window.viewport_size().height);
                 st_h.update(cx, |s, cx| {
                     let h = total - f32::from(ptr.point.y) - metrics::STATUS_BAR;
-                    s.view.filmstrip_height = h.clamp(96.0, 420.0);
+                    s.prefs.view.filmstrip_height = h.clamp(96.0, 420.0);
                     cx.notify();
                 })
             });

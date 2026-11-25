@@ -118,7 +118,7 @@ impl AppState {
     }
 
     pub fn speed_begin(&mut self, param: SpeedParam, cx: &mut Context<Self>) {
-        if self.speed.as_ref().is_some_and(|s| s.param == param) || self.current.is_none() {
+        if self.speed.as_ref().is_some_and(|s| s.param == param) || self.library.current.is_none() {
             return;
         }
         // The key may already have switched the cursor in this same keystroke.

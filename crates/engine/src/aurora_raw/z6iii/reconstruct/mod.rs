@@ -1,4 +1,7 @@
-//! Nikon Z6III HE Bayer decoding and reconstruction. The parent gates Windows and z6iii-raw-export.
+//! Nikon Z6III HE Bayer decoding and reconstruction.
+//!
+//! The decode and CPU reconstruction are platform-neutral. The System32
+//! OpenCL loader and the GPU-only entry points below keep a Windows gate.
 
 #![allow(dead_code)]
 
@@ -6,10 +9,13 @@
 mod c1_nef_he;
 #[path = "c1_adaptive_gg.rs"]
 mod c1_adaptive_gg;
+#[cfg(windows)]
 #[path = "c1_adaptive_opencl.rs"]
 mod c1_adaptive_opencl;
+#[cfg(windows)]
 #[allow(unused_imports)]
 pub(crate) use c1_adaptive_opencl::anti_alias as anti_alias_opencl;
+#[cfg(windows)]
 pub(super) use c1_adaptive_opencl::{export_color, recover_highlights};
 #[path = "c1_nikon_he.rs"]
 mod c1_nikon_he;
@@ -36,6 +42,7 @@ mod stage1_reference;
 use std::io::{Error, ErrorKind, Result};
 
 pub(super) use c1_nef_he::find_he_strip;
+#[cfg(windows)]
 pub(super) use c1_adaptive_opencl::available as gpu_available;
 #[allow(unused_imports)]
 pub use c1_nef_he::{NikonBlackLevels, NikonCrop, nikon_as_shot_rgb, nikon_black_levels, nikon_crop, nikon_exif_sensitivity};
@@ -156,6 +163,9 @@ impl NikonHeCropFrame {
         Ok(self)
     }
 
+    /// GPU AdaptiveGG plus a mirrored halo; the reconstructed halo is the
+    /// Windows OpenCL product route.
+    #[cfg(windows)]
     pub fn with_control_bayer_halo(self, threshold: f32, black: f32) -> Result<Self> {
         const HALO: usize = 20;
         let active = self.crop;
@@ -189,6 +199,7 @@ impl NikonHeCropFrame {
         self.crop.width
     }
 
+    #[cfg(windows)]
     pub fn with_stage1_opencl(mut self, params: Stage1Params) -> Result<Self> {
         let input = self.adaptive_bayer.as_deref().ok_or_else(||
             Error::new(ErrorKind::InvalidInput, "Stage1 OpenCL requires the prepared Bayer plane"))?;
@@ -356,13 +367,19 @@ fn reconstruct_planar_roi_with(
         height: area.height + 12,
     };
     let stage2 = reconstruct_basic_roi(frame, support, params, rgb_black)?;
-    if support.width.is_multiple_of(2) && !matches!(finish, Some(c1_stage3_planar::Finish::Diagnostic { .. })) {
-        if let Some(c1_stage3_planar::Finish::GgBlurComp { noise }) = finish {
-            return c1_adaptive_opencl::stage3_gg(&stage2, support.width, support.height, scale, offset, noise);
+    // Windows product route: the OpenCL stage 3 over even support widths, then
+    // the same CPU finish. Elsewhere the CPU planar reconstruction below is the
+    // platform-neutral equivalent.
+    #[cfg(windows)]
+    {
+        if support.width.is_multiple_of(2) && !matches!(finish, Some(c1_stage3_planar::Finish::Diagnostic { .. })) {
+            if let Some(c1_stage3_planar::Finish::GgBlurComp { noise }) = finish {
+                return c1_adaptive_opencl::stage3_gg(&stage2, support.width, support.height, scale, offset, noise);
+            }
+            let reconstructed = c1_adaptive_opencl::stage3(&stage2, support.width, support.height, scale, offset)?;
+            let planes = std::array::from_fn(|channel| reconstructed.iter().map(|pixel| pixel[channel]).collect());
+            return Ok(c1_stage3_planar::finish_planar(planes, support.width, area.width, area.height, scale, offset, finish));
         }
-        let reconstructed = c1_adaptive_opencl::stage3(&stage2, support.width, support.height, scale, offset)?;
-        let planes = std::array::from_fn(|channel| reconstructed.iter().map(|pixel| pixel[channel]).collect());
-        return Ok(c1_stage3_planar::finish_planar(planes, support.width, area.width, area.height, scale, offset, finish));
     }
     let output = c1_stage3_planar::planar(&stage2, support.width, area.width, area.height, scale, offset, finish);
     output.ok_or_else(invalid_area)

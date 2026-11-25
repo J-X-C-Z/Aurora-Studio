@@ -22,13 +22,13 @@ impl AppState {
         if self.cull.is_some() || self.slideshow.is_some() || self.visible_images().is_empty() {
             return;
         }
-        let first = self.current.unwrap_or(self.visible_images()[0].id);
+        let first = self.library.current.unwrap_or(self.visible_images()[0].id);
         self.select(first, false, false, cx);
         let was_fullscreen = window.is_fullscreen();
         if !was_fullscreen {
             window.toggle_fullscreen();
         }
-        self.cull = Some(Cull { auto_advance: self.settings.cull_auto_advance, unrated_only: false, was_fullscreen });
+        self.cull = Some(Cull { auto_advance: self.prefs.settings.cull_auto_advance, unrated_only: false, was_fullscreen });
         self.set_zoom(None, None, cx);
         self.request_render(RenderQuality::Final, cx);
         cx.notify();
@@ -59,13 +59,13 @@ impl AppState {
     pub fn cull_step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(cull) = self.cull.clone() else { return };
         let ids = self.cull_images();
-        let Some(at) = self.current.and_then(|c| ids.iter().position(|(i, _)| *i == c)) else { return };
+        let Some(at) = self.library.current.and_then(|c| ids.iter().position(|(i, _)| *i == c)) else { return };
         let mut i = at as isize + delta;
         while (0..ids.len() as isize).contains(&i) {
             let (id, rating) = ids[i as usize];
             if !cull.unrated_only || rating == 0 {
                 self.select(id, false, false, cx);
-                if self.zoom.scale.is_some() {
+                if self.preview_state.zoom.scale.is_some() {
                     self.set_zoom(None, None, cx);
                 }
                 return;
@@ -83,10 +83,10 @@ impl AppState {
     /// Rates (0 ..= 5) or rejects (-1) the image on screen; a second press of the
     /// same key clears it. Moves on when auto-advance is on.
     pub fn cull_rate(&mut self, rating: i8, cx: &mut Context<Self>) {
-        let Some(id) = self.current else { return };
+        let Some(id) = self.library.current else { return };
         let old = self.info(id).map(|i| i.rating).unwrap_or(0);
         let new = if old == rating && rating != 0 { 0 } else { rating };
-        self.selection = [id].into_iter().collect();
+        self.library.selection = [id].into_iter().collect();
         self.set_rating(new, cx);
         if self.cull.as_ref().is_some_and(|c| c.auto_advance) && new != 0 {
             self.cull_step(1, cx);
@@ -96,8 +96,8 @@ impl AppState {
     pub fn toggle_cull_auto_advance(&mut self, cx: &mut Context<Self>) {
         let Some(cull) = self.cull.as_mut() else { return };
         cull.auto_advance = !cull.auto_advance;
-        self.settings.cull_auto_advance = cull.auto_advance;
-        self.settings.save();
+        self.prefs.settings.cull_auto_advance = cull.auto_advance;
+        self.prefs.settings.save();
         let msg = if cull.auto_advance { t("Auto-advance on", "自动前进：开") } else { t("Auto-advance off", "自动前进：关") };
         self.notify(msg, cx);
     }
@@ -112,10 +112,10 @@ impl AppState {
 
     /// Z: fit, or 100 % at the center to check focus.
     pub fn toggle_cull_zoom(&mut self, cx: &mut Context<Self>) {
-        if self.zoom.scale.is_some() {
+        if self.preview_state.zoom.scale.is_some() {
             self.set_zoom(None, None, cx);
         } else {
-            let sf = self.scale_factor;
+            let sf = self.device.scale_factor;
             self.set_zoom(Some(sf), Some((0.5, 0.5)), cx);
         }
     }
