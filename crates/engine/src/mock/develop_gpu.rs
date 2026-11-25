@@ -36,7 +36,7 @@
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia};
+use aurora_portrait::cuda::{CudaError, DeviceBuffer, Nvidia, PinnedBuffer, Stream};
 
 use super::gpu_runtime::{self, VramLease};
 
@@ -1844,7 +1844,7 @@ pub(crate) fn fallback_reason(
     if clarity_pre_curve {
         return Some("clarity pre-curve is a neighbourhood stage between develop stages");
     }
-    if adj.nodes.is_some() {
+    if adj.nodes.is_some() && !adj.layers.is_empty() {
         return Some("node graph may reorder the point chain");
     }
     if uniform_light_without_plane {
@@ -2288,6 +2288,881 @@ fn run_pool(
     )?;
     gpu.download_buffer(&pool.io.0, as_bytes_mut(io))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Device-resident single-stream preview pipeline
+// ---------------------------------------------------------------------------
+
+struct SendStream(Stream<'static>);
+unsafe impl Send for SendStream {}
+
+struct SendPinned(PinnedBuffer<'static>);
+unsafe impl Send for SendPinned {}
+
+fn create_stream_static(gpu: &Nvidia) -> Result<Stream<'static>, CudaError> {
+    let stream = gpu.create_stream()?;
+    Ok(unsafe { std::mem::transmute::<Stream<'_>, Stream<'static>>(stream) })
+}
+
+fn alloc_pinned_static(gpu: &Nvidia, bytes: usize) -> Result<PinnedBuffer<'static>, CudaError> {
+    let buf = gpu.alloc_pinned(bytes)?;
+    Ok(unsafe { std::mem::transmute::<PinnedBuffer<'_>, PinnedBuffer<'static>>(buf) })
+}
+
+/// Exact identity of the device-resident sampled linear source frame.
+/// Colour, tone, exposure, curves, NR and sharpening are absent so dragging
+/// any of them hits the resident source with 0 CPU sampling and 0 H2D upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentSourceKey {
+    pub source: u64,
+    pub geom_hash: u64,
+    pub region_bits: [u32; 4],
+    pub out_w: u32,
+    pub out_h: u32,
+    pub level: usize,
+    pub cubic: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UsmParams {
+    pub sigma: f32,
+    pub gain: f32,
+    pub threshold: f32,
+    pub halo: f32,
+}
+
+pub(crate) struct ResidentPreviewOut {
+    pub pixels: Vec<u8>,
+    pub histogram: Option<Histogram>,
+    pub source_hit: bool,
+}
+
+const RESIDENT_RECLAIM_PRIORITY: u8 = 25;
+const HIST_WORDS: usize = 1026;
+const USM_MAX_WEIGHTS: usize = 25;
+
+/// Resident preview crossover floor: because the linear source stays in VRAM
+/// across slider drags (zero per-frame H2D), GPU wins even at modest viewport
+/// sizes (e.g. 1080p / 2K / 4K), while 360px thumbnails (<= 86k px) stay off
+/// the resident pool so they never evict the active preview source.
+pub(crate) fn resident_crossover_admits(width: usize, height: usize) -> bool {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("AURORA_DEVELOP_RESIDENT_MIN_PIXELS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|p| *p > 0)
+            .unwrap_or(130_000)
+    });
+    (width as u64).saturating_mul(height as u64) >= floor
+}
+
+struct ResidentPool {
+    // Device buffers and stream are declared BEFORE `lease` so Drop releases
+    // VRAM before returning budget credit to the shared VramLedger.
+    src_linear: Option<SendBuffer>,
+    rgb3_work: Option<SendBuffer>,
+    usm_cam: Option<SendBuffer>,
+    usm_planes: Option<SendBuffer>,
+    out_u8: Option<SendBuffer>,
+    gain: Option<SendBuffer>,
+    params: SendBuffer,
+    luts: SendBuffer,
+    c1: SendBuffer,
+    editor: SendBuffer,
+    banding: SendBuffer,
+    usm_weights: SendBuffer,
+    hist_dev: SendBuffer,
+    pinned_in: Option<SendPinned>,
+    pinned_out: Option<SendPinned>,
+    pinned_params: SendPinned,
+    pinned_weights: SendPinned,
+    pinned_hist: SendPinned,
+    stream: SendStream,
+    gpu: Box<Nvidia>,
+    src_bytes: usize,
+    rgb3_bytes: usize,
+    usm_cam_bytes: usize,
+    usm_planes_bytes: usize,
+    out_u8_bytes: usize,
+    gain_bytes: usize,
+    editor_bytes: usize,
+    pinned_in_bytes: usize,
+    pinned_out_bytes: usize,
+    resident_key: Option<ResidentSourceKey>,
+    tables: TableCache,
+    last_usm_sigma_bits: Option<u32>,
+    lease: VramLease,
+}
+
+impl ResidentPool {
+    fn fixed_resident_bytes() -> usize {
+        fixed_bytes() + USM_MAX_WEIGHTS * 4 + HIST_WORDS * 4
+    }
+
+    fn open() -> Result<Self, CudaError> {
+        let editor_bytes = E_SKIN_BASE * 4;
+        let base_bytes = Self::fixed_resident_bytes() + editor_bytes;
+        let lease = VramLease::acquire("develop_resident", base_bytes, true).map_err(budget_error)?;
+        let gpu = Box::new(Nvidia::open_ptx(PTX)?);
+        let stream = SendStream(create_stream_static(&gpu)?);
+        Ok(Self {
+            src_linear: None,
+            rgb3_work: None,
+            usm_cam: None,
+            usm_planes: None,
+            out_u8: None,
+            gain: None,
+            params: SendBuffer(alloc_static(&gpu, P_SIZE * 4)?),
+            luts: SendBuffer(alloc_static(&gpu, (1280 + GAMMA_SIZE) * 4)?),
+            c1: SendBuffer(alloc_static(&gpu, FILM_MAX * 3 * 4 + CLUT_NODES * 3 * 2)?),
+            editor: SendBuffer(alloc_static(&gpu, editor_bytes)?),
+            banding: SendBuffer(alloc_static(&gpu, 256 * 4 + 512)?),
+            usm_weights: SendBuffer(alloc_static(&gpu, USM_MAX_WEIGHTS * 4)?),
+            hist_dev: SendBuffer(alloc_static(&gpu, HIST_WORDS * 4)?),
+            pinned_in: None,
+            pinned_out: None,
+            pinned_params: SendPinned(alloc_pinned_static(&gpu, P_SIZE * 4)?),
+            pinned_weights: SendPinned(alloc_pinned_static(&gpu, USM_MAX_WEIGHTS * 4)?),
+            pinned_hist: SendPinned(alloc_pinned_static(&gpu, HIST_WORDS * 4)?),
+            stream,
+            gpu,
+            src_bytes: 0,
+            rgb3_bytes: 0,
+            usm_cam_bytes: 0,
+            usm_planes_bytes: 0,
+            out_u8_bytes: 0,
+            gain_bytes: 0,
+            editor_bytes,
+            pinned_in_bytes: 0,
+            pinned_out_bytes: 0,
+            resident_key: None,
+            tables: TableCache::default(),
+            last_usm_sigma_bits: None,
+            lease,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure(
+        &mut self,
+        need_src: usize,
+        need_rgb3: usize,
+        need_usm_cam: usize,
+        need_usm_planes: usize,
+        need_out_u8: usize,
+        need_gain: usize,
+        need_editor: usize,
+    ) -> Result<(), CudaError> {
+        let next_src = need_src.max(self.src_bytes);
+        let next_rgb3 = need_rgb3.max(self.rgb3_bytes);
+        let next_usm_cam = need_usm_cam.max(self.usm_cam_bytes);
+        let next_usm_planes = need_usm_planes.max(self.usm_planes_bytes);
+        let next_out_u8 = need_out_u8.max(self.out_u8_bytes);
+        let next_gain = need_gain.max(self.gain_bytes);
+        let next_editor = need_editor.max(self.editor_bytes);
+
+        let total = Self::fixed_resident_bytes()
+            .saturating_add(next_src)
+            .saturating_add(next_rgb3)
+            .saturating_add(next_usm_cam)
+            .saturating_add(next_usm_planes)
+            .saturating_add(next_out_u8)
+            .saturating_add(next_gain)
+            .saturating_add(next_editor);
+
+        let old_total = self.lease.bytes();
+        if total > old_total {
+            self.lease.resize(total, true).map_err(budget_error)?;
+        }
+        let alloc_res: Result<(), CudaError> = (|| {
+            if next_src > self.src_bytes {
+                self.src_linear = Some(SendBuffer(alloc_static(&self.gpu, next_src)?));
+                self.src_bytes = next_src;
+                self.resident_key = None;
+            }
+            if next_rgb3 > self.rgb3_bytes {
+                self.rgb3_work = Some(SendBuffer(alloc_static(&self.gpu, next_rgb3)?));
+                self.rgb3_bytes = next_rgb3;
+            }
+            if next_usm_cam > self.usm_cam_bytes {
+                self.usm_cam = Some(SendBuffer(alloc_static(&self.gpu, next_usm_cam)?));
+                self.usm_cam_bytes = next_usm_cam;
+            }
+            if next_usm_planes > self.usm_planes_bytes {
+                self.usm_planes = Some(SendBuffer(alloc_static(&self.gpu, next_usm_planes)?));
+                self.usm_planes_bytes = next_usm_planes;
+            }
+            if next_out_u8 > self.out_u8_bytes {
+                self.out_u8 = Some(SendBuffer(alloc_static(&self.gpu, next_out_u8)?));
+                self.out_u8_bytes = next_out_u8;
+            }
+            if next_gain > self.gain_bytes {
+                self.gain = Some(SendBuffer(alloc_static(&self.gpu, next_gain)?));
+                self.gain_bytes = next_gain;
+            }
+            if next_editor > self.editor_bytes {
+                self.editor = SendBuffer(alloc_static(&self.gpu, next_editor)?);
+                self.editor_bytes = next_editor;
+                self.tables.editor = None;
+            }
+            if need_out_u8 > self.pinned_out_bytes {
+                self.pinned_out = Some(SendPinned(alloc_pinned_static(&self.gpu, need_out_u8)?));
+                self.pinned_out_bytes = need_out_u8;
+            }
+            Ok(())
+        })();
+        if alloc_res.is_err() && total > old_total {
+            let _ = self.lease.resize(old_total, true);
+        }
+        alloc_res
+    }
+
+    fn ensure_pinned_in(&mut self, bytes: usize) -> Result<&mut [u8], CudaError> {
+        if bytes > self.pinned_in_bytes {
+            self.pinned_in = Some(SendPinned(alloc_pinned_static(&self.gpu, bytes)?));
+            self.pinned_in_bytes = bytes;
+        }
+        Ok(&mut self.pinned_in.as_mut().unwrap().0.as_mut_slice()[..bytes])
+    }
+
+    fn upload_static_tables(&mut self, params: &DevelopParams) -> Result<(), CudaError> {
+        let luts = luts_parts(params);
+        if !source_matches(self.tables.luts.as_deref(), &luts) {
+            let table = luts_floats(params);
+            let outcome = self.gpu.upload_buffer(&self.luts.0, as_bytes(&table));
+            commit_upload(&mut self.tables.luts, &luts, outcome)?;
+        }
+        let editor = editor_parts(params);
+        if !source_matches(self.tables.editor.as_deref(), &editor) {
+            let table = params
+                .editor
+                .as_ref()
+                .map(|e| e.floats.clone())
+                .unwrap_or_else(|| vec![0.0; E_SKIN_BASE]);
+            let outcome = self.gpu.upload_buffer(&self.editor.0, as_bytes(&table));
+            commit_upload(&mut self.tables.editor, &editor, outcome)?;
+        }
+        let banding = banding_parts(params);
+        if !source_matches(self.tables.banding.as_deref(), &banding) {
+            let table = params
+                .banding
+                .as_ref()
+                .map(banding_bytes)
+                .unwrap_or_else(|| vec![0u8; 256 * 4 + 512]);
+            let outcome = self.gpu.upload_buffer(&self.banding.0, &table);
+            commit_upload(&mut self.tables.banding, &banding, outcome)?;
+        }
+        if let Some(stage) = params.c1.as_ref() {
+            let c1 = c1_parts(params);
+            if !source_matches(self.tables.c1.as_deref(), &c1) {
+                let table = c1_bytes(stage);
+                let outcome = self.gpu.upload_buffer(&self.c1.0, &table);
+                commit_upload(&mut self.tables.c1, &c1, outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn upload_usm_weights(&mut self, sigma: f32) -> Result<i32, CudaError> {
+        let half = ((3.0 * sigma).ceil() as usize).clamp(1, 24);
+        let bits = sigma.to_bits();
+        if self.last_usm_sigma_bits != Some(bits) {
+            let mut weights = [0.0f32; USM_MAX_WEIGHTS];
+            let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+            let mut sum = 1.0f32;
+            weights[0] = 1.0;
+            for k in 1..=half {
+                let wk = (-((k * k) as f32) * inv2s2).exp();
+                weights[k] = wk;
+                sum += 2.0 * wk;
+            }
+            let inv_sum = 1.0 / sum;
+            for w in &mut weights[..=half] {
+                *w *= inv_sum;
+            }
+            let bytes = as_bytes(&weights);
+            self.pinned_weights.0.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+            self.gpu.upload_async(
+                &self.usm_weights.0,
+                &self.pinned_weights.0.as_slice()[..bytes.len()],
+                &self.stream.0,
+            )?;
+            self.last_usm_sigma_bits = Some(bits);
+        }
+        Ok(half as i32)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.lease.bytes()
+    }
+}
+
+enum ResidentState {
+    NotTried,
+    Ready(ResidentPool),
+    Unavailable,
+}
+
+fn resident_state() -> &'static Mutex<ResidentState> {
+    static STATE: OnceLock<Mutex<ResidentState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(ResidentState::NotTried))
+}
+
+fn release_resident() -> usize {
+    let mut state = match resident_state().try_lock() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let freed = match &*state {
+        ResidentState::Ready(pool) => pool.retained_bytes(),
+        _ => 0,
+    };
+    if freed > 0 {
+        *state = ResidentState::NotTried;
+    }
+    freed
+}
+
+fn register_resident_reclaimer() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        gpu_runtime::vram_register_reclaimer(
+            "develop_resident",
+            RESIDENT_RECLAIM_PRIORITY,
+            release_resident,
+        )
+    });
+}
+
+fn launch_stream<const N: usize>(
+    gpu: &Nvidia,
+    stream: &Stream<'_>,
+    kernel: &'static str,
+    width: usize,
+    height: usize,
+    mut args: [*mut c_void; N],
+) -> Result<(), CudaError> {
+    let grid = (
+        (width as u32).div_ceil(BLOCK.0),
+        (height as u32).div_ceil(BLOCK.1),
+    );
+    gpu.launch_raw_stream(kernel, grid, BLOCK, &mut args, stream)?;
+    Ok(())
+}
+
+fn launch_stream_1d<const N: usize>(
+    gpu: &Nvidia,
+    stream: &Stream<'_>,
+    kernel: &'static str,
+    n: usize,
+    mut args: [*mut c_void; N],
+) -> Result<(), CudaError> {
+    let grid = ((n as u32).div_ceil(256), 1);
+    gpu.launch_raw_stream(kernel, grid, (256, 1), &mut args, stream)?;
+    Ok(())
+}
+
+fn histogram_from_words(words: &[u32], pixel_count: usize) -> Histogram {
+    let total = pixel_count.max(1) as f32;
+    Histogram {
+        red: words[0..256].to_vec(),
+        green: words[256..512].to_vec(),
+        blue: words[512..768].to_vec(),
+        luma: words[768..1024].to_vec(),
+        clipped_shadows: words[1024] as f32 / total,
+        clipped_highlights: words[1025] as f32 / total,
+    }
+}
+
+/// Executes the full preview chain (develop + optional Camera USM / C1 ICC +
+/// optional GPU NR + optional Display USM + quantize + GPU histogram) on a
+/// single CUDA stream using a VRAM-resident linear source frame.
+///
+/// When `key` matches the resident source, `fill_source` is NOT called: zero
+/// CPU sampling and zero H2D pixel transfer occur.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_resident_preview<F>(
+    key: ResidentSourceKey,
+    region: [f32; 4],
+    params: &DevelopParams,
+    gain_plane: Option<&[f32]>,
+    camera_usm: Option<UsmParams>,
+    display_usm: Option<UsmParams>,
+    nr: Option<(&NoiseReduction, f32)>,
+    bgra: bool,
+    with_histogram: bool,
+    fill_source: F,
+) -> Option<ResidentPreviewOut>
+where
+    F: FnOnce(&mut [f32]),
+{
+    if !enabled() {
+        return None;
+    }
+    let width = key.out_w as usize;
+    let height = key.out_h as usize;
+    let pixels = width.checked_mul(height)?;
+    if pixels == 0 || !resident_crossover_admits(width, height) {
+        return None;
+    }
+    if gain_plane.is_some_and(|g| g.len() != pixels) {
+        return None;
+    }
+    let has_single_pixel = nr.is_some_and(|(n, _)| n.single_pixel > 0.0);
+    let has_nr = nr.is_some_and(|(n, _)| n.luminance > 0.0 || n.color > 0.0);
+    if has_nr && !super::nr_gpu::enabled() {
+        return None;
+    }
+    let needs_rgb3 = camera_usm.is_some() || display_usm.is_some() || has_nr || has_single_pixel;
+    let need_src = pixels.checked_mul(16)?;
+    let need_rgb3 = if needs_rgb3 { pixels.checked_mul(12)? } else { 0 };
+    let need_usm_cam = if camera_usm.is_some() { pixels.checked_mul(16)? } else { 0 };
+    let need_usm_planes = if camera_usm.is_some() || display_usm.is_some() {
+        pixels.checked_mul(12)?
+    } else if has_single_pixel {
+        pixels.checked_mul(4)?
+    } else {
+        0
+    };
+    let need_out_u8 = pixels.checked_mul(4)?;
+    let need_gain = if gain_plane.is_some() { pixels.checked_mul(4)? } else { 0 };
+    let need_editor = params
+        .editor
+        .as_ref()
+        .map(|e| e.floats.len().saturating_mul(4))
+        .unwrap_or(0)
+        .max(E_SKIN_BASE * 4);
+
+    register_resident_reclaimer();
+    let mut lock = resident_state().lock().unwrap_or_else(|e| e.into_inner());
+    let pool = match &mut *lock {
+        ResidentState::Unavailable => return None,
+        ResidentState::NotTried => match ResidentPool::open() {
+            Ok(p) => {
+                *lock = ResidentState::Ready(p);
+                match &mut *lock {
+                    ResidentState::Ready(p) => p,
+                    _ => unreachable!(),
+                }
+            }
+            Err(err) => {
+                log::warn!("develop_gpu resident: {err:?}; falling back");
+                if !budget_refused(&err) {
+                    *lock = ResidentState::Unavailable;
+                }
+                return None;
+            }
+        },
+        ResidentState::Ready(p) => p,
+    };
+
+    if let Err(err) = pool.ensure(
+        need_src,
+        need_rgb3,
+        need_usm_cam,
+        need_usm_planes,
+        need_out_u8,
+        need_gain,
+        need_editor,
+    ) {
+        log::warn!("develop_gpu resident ensure: {err:?}; falling back");
+        return None;
+    }
+
+    let result: Result<ResidentPreviewOut, CudaError> = (|| {
+        pool.upload_static_tables(params)?;
+
+        // 1. Source linear frame: reuse resident VRAM on slider drags!
+        let source_hit = pool.resident_key == Some(key);
+        if !source_hit {
+            let pinned_bytes = pool.ensure_pinned_in(need_src)?;
+            let pinned_f32 = unsafe {
+                std::slice::from_raw_parts_mut(pinned_bytes.as_mut_ptr() as *mut f32, pixels * 4)
+            };
+            fill_source(pinned_f32);
+            let src_dev = &pool.src_linear.as_ref().unwrap().0;
+            let pinned_slice = &pool.pinned_in.as_ref().unwrap().0.as_slice()[..need_src];
+            pool.gpu.upload_async(src_dev, pinned_slice, &pool.stream.0)?;
+            pool.resident_key = Some(key);
+        }
+
+        // 2. Upload 488-byte parameter block asynchronously on the stream.
+        let mut floats = params_floats(params);
+        floats[P_W] = width as f32;
+        floats[P_H] = height as f32;
+        floats[P_RX] = region[0];
+        floats[P_RY] = region[1];
+        floats[P_RW] = region[2];
+        floats[P_RH] = region[3];
+        floats[P_HAS_GAIN] = if gain_plane.is_some() { 1.0 } else { 0.0 };
+        let p_bytes = as_bytes(&floats);
+        pool.pinned_params.0.as_mut_slice()[..p_bytes.len()].copy_from_slice(p_bytes);
+        pool.gpu.upload_async(
+            &pool.params.0,
+            &pool.pinned_params.0.as_slice()[..p_bytes.len()],
+            &pool.stream.0,
+        )?;
+
+        if let Some(plane) = gain_plane {
+            let gain_dev = &pool.gain.as_ref().unwrap().0;
+            pool.gpu.upload_buffer(gain_dev, as_bytes(plane))?;
+        }
+
+        let mut src_handle = pool.src_linear.as_ref().unwrap().0.handle();
+        let mut out_u8_handle = pool.out_u8.as_ref().unwrap().0.handle();
+        let mut hist_handle = if with_histogram { pool.hist_dev.0.handle() } else { 0u64 };
+        let mut p_handle = pool.params.0.handle();
+        let mut lut_handle = pool.luts.0.handle();
+        let mut gain_handle = if gain_plane.is_some() {
+            pool.gain.as_ref().unwrap().0.handle()
+        } else {
+            0u64
+        };
+        let mut c1_handle = if params.c1.is_some() { pool.c1.0.handle() } else { 0u64 };
+        let mut editor_handle = pool.editor.0.handle();
+        let mut words = pool.banding.0.handle();
+        let mut left = words + 1024;
+        let mut right = words + 1280;
+        let mut bgra_i = if bgra { 1i32 } else { 0i32 };
+        let mut w_i = width as i32;
+        let mut h_i = height as i32;
+
+        if !needs_rgb3 {
+            // Fast 1-kernel path: develop -> quantize (BGRA/RGBA) + GPU histogram.
+            if with_histogram {
+                let mut n_hist = HIST_WORDS as i32;
+                launch_stream_1d(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "zero_u32_kernel",
+                    HIST_WORDS,
+                    [ptr(&mut hist_handle), ptr(&mut n_hist)],
+                )?;
+            }
+            launch_stream(
+                &pool.gpu,
+                &pool.stream.0,
+                "develop_resident_u8_hist_kernel",
+                width,
+                height,
+                [
+                    ptr(&mut src_handle),
+                    ptr(&mut out_u8_handle),
+                    ptr(&mut hist_handle),
+                    ptr(&mut p_handle),
+                    ptr(&mut lut_handle),
+                    ptr(&mut gain_handle),
+                    ptr(&mut c1_handle),
+                    ptr(&mut editor_handle),
+                    ptr(&mut words),
+                    ptr(&mut left),
+                    ptr(&mut right),
+                    ptr(&mut bgra_i),
+                ],
+            )?;
+        } else {
+            let mut rgb3_handle = pool.rgb3_work.as_ref().unwrap().0.handle();
+            if let Some(usm) = camera_usm {
+                let mut half_i = pool.upload_usm_weights(usm.sigma)?;
+                let mut cam_handle = pool.usm_cam.as_ref().unwrap().0.handle();
+                let planes_base = pool.usm_planes.as_ref().unwrap().0.handle();
+                let plane_bytes = (pixels * 4) as u64;
+                let mut norm_handle = planes_base;
+                let mut tmp_handle = planes_base + plane_bytes;
+                let mut blur_handle = planes_base + plane_bytes * 2;
+                let mut weights_handle = pool.usm_weights.0.handle();
+
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "develop_camera_encode_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut src_handle),
+                        ptr(&mut cam_handle),
+                        ptr(&mut norm_handle),
+                        ptr(&mut p_handle),
+                        ptr(&mut gain_handle),
+                        ptr(&mut c1_handle),
+                    ],
+                )?;
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "gaussian_blur_h_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut norm_handle),
+                        ptr(&mut tmp_handle),
+                        ptr(&mut weights_handle),
+                        ptr(&mut w_i),
+                        ptr(&mut h_i),
+                        ptr(&mut half_i),
+                    ],
+                )?;
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "gaussian_blur_v_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut tmp_handle),
+                        ptr(&mut blur_handle),
+                        ptr(&mut weights_handle),
+                        ptr(&mut w_i),
+                        ptr(&mut h_i),
+                        ptr(&mut half_i),
+                    ],
+                )?;
+                let mut g_usm = usm.gain;
+                let mut t_usm = usm.threshold;
+                let mut h_usm = usm.halo;
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "camera_usm_and_display_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut cam_handle),
+                        ptr(&mut norm_handle),
+                        ptr(&mut blur_handle),
+                        ptr(&mut rgb3_handle),
+                        ptr(&mut p_handle),
+                        ptr(&mut lut_handle),
+                        ptr(&mut c1_handle),
+                        ptr(&mut editor_handle),
+                        ptr(&mut words),
+                        ptr(&mut left),
+                        ptr(&mut right),
+                        ptr(&mut g_usm),
+                        ptr(&mut t_usm),
+                        ptr(&mut h_usm),
+                    ],
+                )?;
+            } else {
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "develop_resident_rgb3_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut src_handle),
+                        ptr(&mut rgb3_handle),
+                        ptr(&mut p_handle),
+                        ptr(&mut lut_handle),
+                        ptr(&mut gain_handle),
+                        ptr(&mut c1_handle),
+                        ptr(&mut editor_handle),
+                        ptr(&mut words),
+                        ptr(&mut left),
+                        ptr(&mut right),
+                    ],
+                )?;
+            }
+
+            // Optional single-pixel noise reduction in place on `rgb3_work`, same stream.
+            if let Some((nr_adj, _)) = nr {
+                let amount = (nr_adj.single_pixel / 100.0).clamp(0.0, 1.0);
+                if amount > 0.0 {
+                    let mut luma_handle = pool.usm_planes.as_ref().unwrap().0.handle();
+                    let mut threshold = 24.0f32 - 20.0f32 * amount;
+                    launch_stream(
+                        &pool.gpu,
+                        &pool.stream.0,
+                        "single_pixel_luma_kernel",
+                        width,
+                        height,
+                        [
+                            ptr(&mut rgb3_handle),
+                            ptr(&mut luma_handle),
+                            ptr(&mut w_i),
+                            ptr(&mut h_i),
+                        ],
+                    )?;
+                    launch_stream(
+                        &pool.gpu,
+                        &pool.stream.0,
+                        "single_pixel_nr_apply_kernel",
+                        width,
+                        height,
+                        [
+                            ptr(&mut rgb3_handle),
+                            ptr(&mut luma_handle),
+                            ptr(&mut w_i),
+                            ptr(&mut h_i),
+                            ptr(&mut threshold),
+                        ],
+                    )?;
+                }
+            }
+
+            // Cross-stage zero-copy NR in place on `rgb3_work`, same stream.
+            if let Some((nr_adj, scale)) = nr {
+                if nr_adj.luminance > 0.0 || nr_adj.color > 0.0 {
+                    if !super::nr_gpu::run_resident_on_stream(
+                        rgb3_handle,
+                        width,
+                        height,
+                        nr_adj,
+                        scale,
+                        &pool.stream.0,
+                    ) {
+                        return Err(CudaError::Unavailable("nr_gpu resident failed"));
+                    }
+                }
+            }
+
+            // Optional display-space USM in place on `rgb3_work`, same stream.
+            if let Some(usm) = display_usm {
+                let mut half_i = pool.upload_usm_weights(usm.sigma)?;
+                let planes_base = pool.usm_planes.as_ref().unwrap().0.handle();
+                let plane_bytes = (pixels * 4) as u64;
+                let mut luma_handle = planes_base;
+                let mut tmp_handle = planes_base + plane_bytes;
+                let mut blur_handle = planes_base + plane_bytes * 2;
+                let mut weights_handle = pool.usm_weights.0.handle();
+
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "display_usm_luma_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut rgb3_handle),
+                        ptr(&mut luma_handle),
+                        ptr(&mut w_i),
+                        ptr(&mut h_i),
+                    ],
+                )?;
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "gaussian_blur_h_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut luma_handle),
+                        ptr(&mut tmp_handle),
+                        ptr(&mut weights_handle),
+                        ptr(&mut w_i),
+                        ptr(&mut h_i),
+                        ptr(&mut half_i),
+                    ],
+                )?;
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "gaussian_blur_v_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut tmp_handle),
+                        ptr(&mut blur_handle),
+                        ptr(&mut weights_handle),
+                        ptr(&mut w_i),
+                        ptr(&mut h_i),
+                        ptr(&mut half_i),
+                    ],
+                )?;
+                let mut g_usm = usm.gain;
+                let mut t_usm = usm.threshold;
+                let mut h_usm = usm.halo;
+                launch_stream(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "display_usm_apply_kernel",
+                    width,
+                    height,
+                    [
+                        ptr(&mut rgb3_handle),
+                        ptr(&mut luma_handle),
+                        ptr(&mut blur_handle),
+                        ptr(&mut w_i),
+                        ptr(&mut h_i),
+                        ptr(&mut g_usm),
+                        ptr(&mut t_usm),
+                        ptr(&mut h_usm),
+                    ],
+                )?;
+            }
+
+            // Final quantize (BGRA/RGBA) + GPU histogram.
+            if with_histogram {
+                let mut n_hist = HIST_WORDS as i32;
+                launch_stream_1d(
+                    &pool.gpu,
+                    &pool.stream.0,
+                    "zero_u32_kernel",
+                    HIST_WORDS,
+                    [ptr(&mut hist_handle), ptr(&mut n_hist)],
+                )?;
+            }
+            launch_stream(
+                &pool.gpu,
+                &pool.stream.0,
+                "quantize_rgb3_u8_hist_kernel",
+                width,
+                height,
+                [
+                    ptr(&mut rgb3_handle),
+                    ptr(&mut out_u8_handle),
+                    ptr(&mut hist_handle),
+                    ptr(&mut w_i),
+                    ptr(&mut h_i),
+                    ptr(&mut bgra_i),
+                ],
+            )?;
+        }
+
+        // Single async D2H of the compact 8-bit frame + 4 KB histogram, then one sync.
+        let out_dev = &pool.out_u8.as_ref().unwrap().0;
+        let pinned_out = &mut pool.pinned_out.as_mut().unwrap().0.as_mut_slice()[..need_out_u8];
+        pool.gpu.download_async(out_dev, pinned_out, &pool.stream.0)?;
+        if with_histogram {
+            let hist_slice = &mut pool.pinned_hist.0.as_mut_slice()[..HIST_WORDS * 4];
+            pool.gpu.download_async(&pool.hist_dev.0, hist_slice, &pool.stream.0)?;
+        }
+        pool.gpu.stream_sync(&pool.stream.0)?;
+
+        #[cfg(test)]
+        GPU_PLANES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut out_vec = vec![0u8; need_out_u8];
+        out_vec.copy_from_slice(&pool.pinned_out.as_ref().unwrap().0.as_slice()[..need_out_u8]);
+        let histogram = if with_histogram {
+            let hist_words = unsafe {
+                std::slice::from_raw_parts(
+                    pool.pinned_hist.0.as_slice().as_ptr() as *const u32,
+                    HIST_WORDS,
+                )
+            };
+            Some(histogram_from_words(hist_words, pixels))
+        } else {
+            None
+        };
+        Ok(ResidentPreviewOut {
+            pixels: out_vec,
+            histogram,
+            source_hit,
+        })
+    })();
+
+    gpu_runtime::vram_maybe_emit_perf("develop_resident");
+    match result {
+        Ok(out) => Some(out),
+        Err(err) => {
+            log::warn!("develop_gpu resident run: {err:?}; falling back to CPU");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

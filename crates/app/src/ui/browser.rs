@@ -24,19 +24,66 @@ use crate::state::{AppState, BrowserMode, SortKey};
 use crate::theme::{hex, hexa, pal};
 use crate::widgets::{IconBtn, select};
 
+#[derive(Clone, PartialEq)]
+struct BrowserSnapshot {
+    images_len: usize,
+    current: Option<ImageId>,
+    selection_len: usize,
+    active_collection: u64,
+    filter: crate::state::Filter,
+    sort: SortKey,
+    sort_desc: bool,
+    mode: BrowserMode,
+    thumb_size_bits: u32,
+    filmstrip_h_bits: u32,
+    thumbs_len: usize,
+    stacks_len: usize,
+    folded_len: usize,
+}
+
+impl BrowserSnapshot {
+    fn from_state(s: &AppState) -> Self {
+        Self {
+            images_len: s.images.len(),
+            current: s.current,
+            selection_len: s.selection.len(),
+            active_collection: s.active_collection,
+            filter: s.filter.clone(),
+            sort: s.sort,
+            sort_desc: s.sort_desc,
+            mode: s.view.browser,
+            thumb_size_bits: s.view.thumb_size.to_bits(),
+            filmstrip_h_bits: s.view.filmstrip_height.to_bits(),
+            thumbs_len: s.thumbs.len(),
+            stacks_len: s.stacks.len(),
+            folded_len: s.open_stacks.len(),
+        }
+    }
+}
+
 pub struct Browser {
     state: Entity<AppState>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
     width: f32,
+    last_snapshot: Option<BrowserSnapshot>,
     _subs: Vec<Subscription>,
 }
 
 impl Browser {
     pub fn new(state: &Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search name or keyword", "搜索文件名或关键词")));
+        let initial_snap = BrowserSnapshot::from_state(state.read(cx));
         let subs = vec![
-            cx.observe(state, |_, _, cx| cx.notify()),
+            cx.observe(state, |this, state, cx| {
+                // Skip full browser re-render during live slider drags when
+                // catalog / selection / filter / thumbnails did not change.
+                let next = BrowserSnapshot::from_state(state.read(cx));
+                if this.last_snapshot.as_ref() != Some(&next) {
+                    this.last_snapshot = Some(next);
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&search, window, |this, input, e: &InputEvent, _, cx| {
                 if let InputEvent::Change = e {
                     let text = input.read(cx).value().to_string();
@@ -47,14 +94,20 @@ impl Browser {
                 }
             }),
         ];
-        Self { state: state.clone(), search, scroll: VirtualListScrollHandle::new(), width: 800.0, _subs: subs }
+        Self {
+            state: state.clone(),
+            search,
+            scroll: VirtualListScrollHandle::new(),
+            width: 800.0,
+            last_snapshot: Some(initial_snap),
+            _subs: subs,
+        }
     }
 
-    fn header(&self, mode: BrowserMode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn header(&self, mode: BrowserMode, shown: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
         let total = s.images.len();
-        let shown = s.visible_images().len();
         let selected = s.selection.len();
         let filter = s.filter.clone();
         let sort = s.sort;
@@ -449,7 +502,7 @@ impl Render for Browser {
         let count = ids.len();
         let filtered = s.filter_active();
         let ids = Rc::new(ids);
-        let header = self.header(mode, cx);
+        let header = self.header(mode, count, cx);
         let this = cx.entity();
         let width_probe = {
             let this = this.clone();

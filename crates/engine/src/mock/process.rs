@@ -1896,6 +1896,8 @@ pub struct Rendered {
     pub height: u32,
     pub(crate) histogram: Histogram,
     pub portrait_report: Option<crate::portrait_stage::PortraitRunReport>,
+    /// True when `rgba` is already stored in BGRA channel order for display.
+    pub(crate) bgra: bool,
 }
 
 /// A 16-bit frame for export. Previews keep using the 8-bit [`Rendered`].
@@ -1928,6 +1930,36 @@ pub fn render(
         mask_overlay,
         false,
         true,
+        false,
+    )
+    .0
+}
+
+/// Preview render that may return pixels directly in BGRA order when the GPU
+/// resident fast path handles the whole frame and the caller needs display order.
+pub(crate) fn render_preview_bgra(
+    src: &Source,
+    adj: &AdjustmentSet,
+    region: NormRect,
+    max_size: u32,
+    bypass: bool,
+    mask_overlay: Option<u64>,
+    want_bgra: bool,
+) -> Rendered {
+    let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
+    render_sized(
+        src,
+        adj,
+        region,
+        out_w,
+        out_h,
+        scale,
+        level,
+        bypass,
+        mask_overlay,
+        false,
+        true,
+        want_bgra,
     )
     .0
 }
@@ -1956,6 +1988,7 @@ pub fn render16(
             bypass,
             None,
             true,
+            false,
             false,
         );
     Rendered16 {
@@ -2030,6 +2063,7 @@ pub(crate) fn render_at(
         height: th,
         histogram,
         portrait_report: small.portrait_report,
+        bgra: false,
     }
 }
 
@@ -2639,6 +2673,63 @@ fn portrait_stage_store(
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
 }
 
+#[cfg(windows)]
+fn has_post_8bit_stages(adj: &AdjustmentSet, bypass: bool, plan: &Plan<'_>, portrait_active: bool) -> bool {
+    if bypass {
+        return false;
+    }
+    if portrait_active || !plan.layers.is_empty() || !adj.spots.is_empty() || !adj.retouch.is_empty() {
+        return true;
+    }
+    if crate::dustdetect::enabled() {
+        return true;
+    }
+    if adj.clarity.structure.abs() >= 1e-4 || adj.moire.amount > 0.0 || adj.film_grain.impact > 0.0 {
+        return true;
+    }
+    let l = &adj.lens;
+    l.diffraction_enabled
+        || l.distortion.abs() > 1e-6
+        || l.light_falloff.abs() > 1e-6
+        || l.sharpness_falloff >= 0.5
+        || l.chromatic_aberration
+        || l.purple_fringing > 0.0
+        || !l.ca_fringing.is_empty()
+        || l.shift_x != 0.0
+        || l.shift_y != 0.0
+        || l.tilt != 0.0
+        || (l.dust_removal_enabled && !l.dust_patches.is_empty())
+}
+
+#[cfg(windows)]
+fn resident_source_key(
+    src: &Source,
+    geometry: &Geometry,
+    region: NormRect,
+    out_w: u32,
+    out_h: u32,
+    level: usize,
+    cubic: bool,
+) -> super::develop_gpu::ResidentSourceKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_geometry(geometry, &mut hasher);
+    super::develop_gpu::ResidentSourceKey {
+        source: src.snapshot_id(),
+        geom_hash: hasher.finish(),
+        region_bits: [
+            region.x.to_bits(),
+            region.y.to_bits(),
+            region.width.to_bits(),
+            region.height.to_bits(),
+        ],
+        out_w,
+        out_h,
+        level,
+        cubic,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_sized(
     src: &Source,
     adj: &AdjustmentSet,
@@ -2651,7 +2742,10 @@ fn render_sized(
     mask_overlay: Option<u64>,
     wide: bool,
     with_histogram: bool,
+    want_bgra: bool,
 ) -> (Rendered, Option<Vec<u16>>) {
+    let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
+    let t0 = stage_timing.then(std::time::Instant::now);
     let region = clean_region(region);
     let portrait_active = !bypass
         && !wide
@@ -2728,6 +2822,260 @@ fn render_sized(
     #[cfg(all(windows, not(feature = "z6iii-raw-export")))]
     let camera_usm_path = false;
     let region_backed = region == NormRect::FULL || !use_f32_detail;
+
+    // ── Device-resident single-stream preview fast path ──────────────────────
+    // Keeps the sampled linear viewport in VRAM across slider drags and runs
+    // develop + optional Camera/Display USM + C1 ICC + GPU NR + quantize + GPU
+    // histogram on one CUDA stream with zero intermediate D2H/H2D round-trips.
+    #[cfg(windows)]
+    if !wide
+        && adj.clarity.clarity.abs() <= 1e-4
+        && super::develop_gpu::enabled()
+        && super::develop_gpu::resident_crossover_admits(out_w as usize, out_h as usize)
+        && super::develop_gpu::fallback_reason(adj, false, false).is_none()
+    {
+        let mut dev_params = super::develop_gpu::DevelopParams::from_adjustments(
+            adj,
+            render_wb_gains(&adj.white_balance),
+            plan.exposure,
+            plan.fine,
+        );
+        dev_params.bypass = bypass;
+        dev_params.banding_outer = false;
+        if let Some(banding) = &plan.banding {
+            dev_params.banding =
+                super::develop_gpu::BandingParams::from_vendor(banding.params, banding.frame);
+        }
+        #[cfg(all(windows, feature = "z6iii-raw-export"))]
+        let c1_ok = match &plan.c1_color {
+            Some(stage) => match super::develop_gpu::C1ColorParams::from_stage(stage) {
+                Some(c1) => {
+                    dev_params.c1 = Some(c1);
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        };
+        #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+        let c1_ok = true;
+
+        if c1_ok {
+            let post_8bit = has_post_8bit_stages(adj, bypass, &plan, portrait_active);
+            let direct_return = !post_8bit;
+            let emit_bgra = direct_return && want_bgra;
+            let emit_hist = direct_return && with_histogram;
+            let sharp = scale >= 0.5;
+            let xs: Vec<f32> = (0..out_w)
+                .map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width)
+                .collect();
+            let gain = if bypass {
+                None
+            } else {
+                develop_gpu_gain_plane(&plan, adj, region, out_w, out_h, &xs)
+            };
+            let camera_usm = if !bypass && camera_usm_path {
+                let raw_sigma = adj.sharpening.radius.max(0.1) * scale;
+                Some(super::develop_gpu::UsmParams {
+                    sigma: raw_sigma.clamp(0.35, 12.0),
+                    gain: (adj.sharpening.amount / 100.0) * 0.50 * (raw_sigma / 0.8).clamp(0.18, 1.0),
+                    threshold: adj.sharpening.threshold.max(0.0) / 255.0,
+                    halo: (adj.sharpening.halo_suppression / 100.0).clamp(0.0, 1.0),
+                })
+            } else {
+                None
+            };
+            let display_usm = if !bypass && !camera_usm_path && f32_includes_sharpen && adj.sharpening.amount > 0.0 {
+                let raw_sigma = adj.sharpening.radius.max(0.1) * scale;
+                Some(super::develop_gpu::UsmParams {
+                    sigma: raw_sigma.clamp(0.35, 12.0),
+                    gain: (adj.sharpening.amount / 100.0) * 0.50 * (raw_sigma / 0.8).clamp(0.18, 1.0),
+                    threshold: (adj.sharpening.threshold.max(0.0) / 255.0) * 0.5,
+                    halo: (adj.sharpening.halo_suppression / 100.0).clamp(0.0, 1.0),
+                })
+            } else {
+                None
+            };
+            let nr_arg = if !bypass
+                && (adj.noise_reduction.single_pixel > 0.0
+                    || adj.noise_reduction.luminance > 0.0
+                    || adj.noise_reduction.color > 0.0)
+            {
+                Some((&adj.noise_reduction, scale))
+            } else {
+                None
+            };
+            let res_key = resident_source_key(src, &adj.geometry, region, out_w, out_h, level, sharp);
+            let res_bands = BandSampler {
+                src,
+                map: &map,
+                key: sample_key(src, &adj.geometry, region, out_w, out_h, level, sharp),
+                region,
+                xs: &xs,
+                out_w,
+                out_h,
+                level,
+                cubic: sharp,
+                cache: true,
+            };
+            if let Some(res) = super::develop_gpu::render_resident_preview(
+                res_key,
+                [region.x, region.y, region.width, region.height],
+                &dev_params,
+                gain.as_deref(),
+                camera_usm,
+                display_usm,
+                nr_arg,
+                emit_bgra,
+                emit_hist,
+                |dst_f32| {
+                    let w = out_w as usize;
+                    let mut band = Vec::new();
+                    let mut y0 = 0u32;
+                    while y0 < out_h {
+                        let rows = (out_h - y0).min(SAMPLE_TILE);
+                        res_bands.band(y0, rows, &mut band);
+                        let start = y0 as usize * w * 4;
+                        let end = start + rows as usize * w * 4;
+                        dst_f32[start..end]
+                            .par_chunks_exact_mut(4)
+                            .zip(band.par_iter())
+                            .for_each(|(dst, s)| {
+                                if s.valid {
+                                    dst[0] = s.rgb[0];
+                                    dst[1] = s.rgb[1];
+                                    dst[2] = s.rgb[2];
+                                    dst[3] = 1.0;
+                                } else {
+                                    dst[0] = 0.0;
+                                    dst[1] = 0.0;
+                                    dst[2] = 0.0;
+                                    dst[3] = 0.0;
+                                }
+                            });
+                        y0 += rows;
+                    }
+                },
+            ) {
+                if let Some(t0) = t0 {
+                    eprintln!(
+                        "AURORA_STAGE resident_gpu={}x{} direct={} bgra={} src_hit={} total_ms={:.3}",
+                        out_w,
+                        out_h,
+                        direct_return,
+                        emit_bgra,
+                        res.source_hit,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                if direct_return {
+                    return (
+                        Rendered {
+                            rgba: res.pixels,
+                            width: out_w,
+                            height: out_h,
+                            histogram: res.histogram.unwrap_or_default(),
+                            portrait_report: None,
+                            bgra: emit_bgra,
+                        },
+                        None,
+                    );
+                }
+                // Still have post 8-bit stages (structure/grain/lens/spots/layers/portrait):
+                // feed the GPU-rendered RGBA8 directly into the post-stage chain.
+                let mut rgba = res.pixels;
+                let rgba16: Option<Vec<u16>> = None;
+                let develop8: Option<Vec<u8>> = None;
+                if !bypass {
+                    let structure = adj.clarity.structure;
+                    let gpu_done = if structure.abs() >= 1e-4 && super::clarity_gpu::enabled() {
+                        super::clarity_gpu::apply_structure_u8(
+                            &mut rgba,
+                            out_w as usize,
+                            out_h as usize,
+                            structure,
+                        )
+                    } else {
+                        false
+                    };
+                    if !gpu_done && structure.abs() >= 1e-4 {
+                        super::clarity::apply_structure(
+                            &mut rgba,
+                            None,
+                            out_w as usize,
+                            out_h as usize,
+                            &adj.clarity,
+                        );
+                    }
+                    let mut detail_adj_owned = adj.clone();
+                    detail_adj_owned.noise_reduction.single_pixel = 0.0;
+                    detail_adj_owned.noise_reduction.luminance = 0.0;
+                    detail_adj_owned.noise_reduction.color = 0.0;
+                    if f32_includes_sharpen {
+                        detail_adj_owned.sharpening.amount = 0.0;
+                    }
+                    let warp = if detail_adj_owned.lens.use_profile {
+                        super::lens_profile::warp_for(
+                            &detail_adj_owned.lens,
+                            src.lens_shot.as_ref(),
+                            src.lens_auto.as_ref(),
+                        )
+                    } else {
+                        None
+                    };
+                    match warp.as_ref() {
+                        Some(warp) => super::detail::post_process_with_lens(
+                            &mut rgba,
+                            out_w,
+                            out_h,
+                            &detail_adj_owned,
+                            scale,
+                            Some(warp),
+                        ),
+                        None => super::detail::post_process(
+                            &mut rgba,
+                            out_w,
+                            out_h,
+                            &detail_adj_owned,
+                            scale,
+                        ),
+                    }
+                    let dust = if crate::dustdetect::enabled() {
+                        let key = dust_frame_key(src, &adj.geometry, region, out_w, out_h);
+                        crate::dustdetect::detect_dust_cached(
+                            key,
+                            &rgba,
+                            out_w,
+                            out_h,
+                            crate::dustdetect::min_confidence(),
+                        )
+                        .unwrap_or_else(|_| Arc::new(Vec::new()))
+                    } else {
+                        Arc::new(Vec::new())
+                    };
+                    if !dust.is_empty() {
+                        super::spots::apply_detected_spots(
+                            &mut rgba,
+                            out_w,
+                            out_h,
+                            adj,
+                            &adj.geometry,
+                            dust.as_slice(),
+                            src.size(),
+                        );
+                    } else if !adj.spots.is_empty() {
+                        super::spots::apply_spots(&mut rgba, out_w, out_h, adj, src.size());
+                    }
+                    if !adj.retouch.is_empty() {
+                        apply_retouch(&mut rgba, out_w, out_h, adj, &map, region, scale);
+                    }
+                    apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
+                }
+                break 'develop (rgba, rgba16, develop8);
+            }
+        }
+    }
+
     #[cfg(windows)]
     let gpu_develop_params = gpu_develop_preflight(
         &plan,
@@ -3614,6 +3962,19 @@ fn render_sized(
         merge_wide_delta(wide, before, &rgba, out_w as usize);
     }
     let histogram = if with_histogram { histogram(&rgba) } else { Histogram::default() };
+    if let Some(t0) = t0 {
+        eprintln!(
+            "AURORA_STAGE fallback_path={}x{} clarity={:.3} layers={} nodes={} single_px={:.1} post8={} total_ms={:.3}",
+            out_w,
+            out_h,
+            adj.clarity.clarity,
+            adj.layers.len(),
+            adj.nodes.is_some(),
+            adj.noise_reduction.single_pixel,
+            adj.lens.use_profile,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     (
         Rendered {
             rgba,
@@ -3621,6 +3982,7 @@ fn render_sized(
             height: out_h,
             histogram,
             portrait_report,
+            bgra: false,
         },
         rgba16,
     )
@@ -8595,6 +8957,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             None,
             true,
             true,
+            false,
         );
         let (export, export_wide) = render_sized(
             &src,
@@ -8607,6 +8970,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             false,
             None,
             true,
+            false,
             false,
         );
         assert_ne!(preview.histogram, Histogram::default());
@@ -9901,5 +10265,94 @@ mod develop_gpu_integration_tests {
         *portrait_stage_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    #[test]
+    fn resident_preview_parity_and_slider_latency() {
+        // Synthetic 1920x1280 (~2.46 MP) photo-like source for parity + 20ms latency check.
+        let (w, h) = (1920u32, 1280u32);
+        let mut raw = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                raw[i] = ((x * 7 + y * 3) % 256) as u8;
+                raw[i + 1] = ((x * 5 + y * 11 + 40) % 256) as u8;
+                raw[i + 2] = ((x * 13 + y * 2 + 90) % 256) as u8;
+                raw[i + 3] = 255;
+            }
+        }
+        let src = Source::from_rgba(w, h, &raw);
+
+        // Typical RAW default editing state: exposure + USM 180 + Luma NR 50 + Color NR 50.
+        let mut adj = AdjustmentSet::default();
+        adj.exposure.exposure = 0.45;
+        adj.exposure.contrast = 12.0;
+        adj.hdr.highlights = -20.0;
+        adj.hdr.shadows = 15.0;
+        adj.sharpening.amount = 180.0;
+        adj.sharpening.radius = 0.8;
+        adj.sharpening.threshold = 1.0;
+        adj.noise_reduction.luminance = 50.0;
+        adj.noise_reduction.details = 50.0;
+        adj.noise_reduction.color = 50.0;
+
+        // Warm up GPU resident pipeline.
+        let warm = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true);
+        assert_eq!((warm.width, warm.height), (1920, 1280));
+        if !warm.bgra {
+            eprintln!("resident GPU path unavailable on this host; skipping latency assertion");
+            return;
+        }
+
+        // Measure 20 consecutive exposure slider ticks at full 1920x1280 quality.
+        let mut times_ms = Vec::with_capacity(20);
+        for step in 0..20 {
+            adj.exposure.exposure = -1.0 + step as f32 * 0.1;
+            let t0 = std::time::Instant::now();
+            let out = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true);
+            times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            assert!(out.bgra);
+            assert_eq!(out.histogram.red.len(), 256);
+        }
+        times_ms.sort_by(|a, b| a.total_cmp(b));
+        let p50 = times_ms[times_ms.len() / 2];
+        let p95 = times_ms[(times_ms.len() * 95) / 100];
+        let avg = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
+        println!(
+            "RESIDENT_GPU_1920x1280 (USM+LumaNR+ColorNR+BGRA+Hist): p50={p50:.2}ms p95={p95:.2}ms avg={avg:.2}ms"
+        );
+        assert!(p50 < 20.0, "expected 1920x1280 resident slider p50 < 20ms, got {p50:.2}ms");
+
+        // Also check pure exposure (no NR/USM) 1-kernel fast path.
+        let mut fast_adj = AdjustmentSet::default();
+        let _ = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true);
+        let mut fast_ms = Vec::with_capacity(20);
+        for step in 0..20 {
+            fast_adj.exposure.exposure = -1.0 + step as f32 * 0.1;
+            let t0 = std::time::Instant::now();
+            let out = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true);
+            fast_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            assert!(out.bgra);
+        }
+        fast_ms.sort_by(|a, b| a.total_cmp(b));
+        println!(
+            "RESIDENT_GPU_1920x1280 (Pure Develop+BGRA+Hist): p50={:.2}ms p95={:.2}ms",
+            fast_ms[fast_ms.len() / 2],
+            fast_ms[(fast_ms.len() * 95) / 100]
+        );
+
+        // BGRA vs RGBA channel order and histogram parity check.
+        let (pw, ph) = (512u32, 384u32);
+        let small_src = Source::from_rgba(pw, ph, &raw[..(pw * ph * 4) as usize]);
+        let gpu_rgba = render(&small_src, &adj, NormRect::FULL, 512, false, None);
+        let gpu_bgra = render_preview_bgra(&small_src, &adj, NormRect::FULL, 512, false, None, true);
+        assert!(gpu_bgra.bgra);
+        assert_eq!(gpu_rgba.histogram, gpu_bgra.histogram);
+        for (a, b) in gpu_rgba.rgba.chunks_exact(4).zip(gpu_bgra.rgba.chunks_exact(4)) {
+            assert_eq!(a[0], b[2]);
+            assert_eq!(a[1], b[1]);
+            assert_eq!(a[2], b[0]);
+            assert_eq!(a[3], b[3]);
+        }
     }
 }

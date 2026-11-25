@@ -71,12 +71,24 @@ pub(crate) struct PreparedDisplay {
 }
 
 fn into_bgra_pixels(img: RgbaImage) -> (u32, u32, Vec<u8>, f64, f64) {
+    into_bgra_pixels_ordered(img, false)
+}
+
+fn into_bgra_pixels_ordered(img: RgbaImage, already_bgra: bool) -> (u32, u32, Vec<u8>, f64, f64) {
     let width = img.width;
     let height = img.height;
     let convert_at = std::time::Instant::now();
+    if already_bgra {
+        let pixels = match Arc::try_unwrap(img.pixels) {
+            Ok(pixels) => pixels,
+            Err(shared) => shared.as_ref().clone(),
+        };
+        let copy_ms = convert_at.elapsed().as_secs_f64() * 1000.0;
+        return (width, height, pixels, copy_ms, 0.0);
+    }
     let pixels = match Arc::try_unwrap(img.pixels) {
         Ok(mut pixels) => {
-            // Sole owner (thumbnails): swap in place, no second buffer.
+            // Sole owner (thumbnails / direct drafts): swap in place, no second buffer.
             pixels.par_chunks_exact_mut(4).for_each(|pixel| pixel.swap(0, 2));
             pixels
         }
@@ -105,11 +117,11 @@ fn into_bgra_pixels(img: RgbaImage) -> (u32, u32, Vec<u8>, f64, f64) {
 }
 
 pub(crate) fn to_render_image(img: RgbaImage) -> Arc<RenderImage> {
-    to_render_image_timed(img).0
+    to_render_image_timed(img, false).0
 }
 
-fn to_render_image_timed(img: RgbaImage) -> (Arc<RenderImage>, f64, f64, f64) {
-    let (width, height, pixels, copy_ms, convert_ms) = into_bgra_pixels(img);
+fn to_render_image_timed(img: RgbaImage, already_bgra: bool) -> (Arc<RenderImage>, f64, f64, f64) {
+    let (width, height, pixels, copy_ms, convert_ms) = into_bgra_pixels_ordered(img, already_bgra);
     let create_at = std::time::Instant::now();
     let buffer = image::RgbaImage::from_raw(width, height, pixels).expect("engine returned a buffer of the wrong size");
     let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
@@ -119,6 +131,7 @@ fn to_render_image_timed(img: RgbaImage) -> (Arc<RenderImage>, f64, f64, f64) {
 
 fn prepare_display_image(
     image: RgbaImage,
+    already_bgra: bool,
     previous: Option<(usize, &Arc<RenderImage>)>,
 ) -> PreparedDisplay {
     let source_pixels = Arc::as_ptr(&image.pixels) as usize;
@@ -134,7 +147,7 @@ fn prepare_display_image(
             };
         }
     }
-    let (image, copy_ms, convert_ms, create_ms) = to_render_image_timed(image);
+    let (image, copy_ms, convert_ms, create_ms) = to_render_image_timed(image, already_bgra);
     PreparedDisplay { image, source_pixels, reused: false, copy_ms, convert_ms, create_ms }
 }
 
@@ -990,29 +1003,14 @@ impl AppState {
                     after_engine.render_preview(&request).map(move |f| {
                         let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                         let source_status = crate::planned::source_status(after_engine.as_ref(), image_id);
-                        let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
+                        let PreviewFrame { image, histogram, elapsed_ms, degraded, bgra, .. } = f;
                         let (width, height) = (image.width, image.height);
-                        let analysis_at = std::time::Instant::now();
-                        let overlays = || {
-                            let at = std::time::Instant::now();
-                            (analysis(&image, want_warning, want_focus), at.elapsed().as_secs_f64() * 1000.0)
-                        };
-                        let scopes = || {
-                            let at = std::time::Instant::now();
-                            (super::scopes::render(&image, want_scope), at.elapsed().as_secs_f64() * 1000.0)
-                        };
-                        let ((overlays, overlay_ms), (scope, scope_ms)) = match (
-                            want_warning.is_some() || want_focus.is_some(),
-                            want_scope != super::ScopeKind::Off,
-                        ) {
-                            (true, true) => rayon::join(overlays, scopes),
-                            (true, false) => (overlays(), (None, 0.0)),
-                            (false, true) => (((None, None), 0.0), scopes()),
-                            (false, false) => (((None, None), 0.0), (None, 0.0)),
-                        };
-                        let analysis_ms = analysis_at.elapsed().as_secs_f64() * 1000.0;
+                        // Keep overlays and scopes off the main preview publish critical path:
+                        // install the primary image first, then compute analysis asynchronously
+                        // from the installed BGRA display frame bound to the same generation.
                         let display = prepare_display_image(
                             image,
+                            bgra,
                             previous.as_ref().map(|(key, image, _)| (*key, image)),
                         );
                         if crate::perf::enabled() {
@@ -1026,9 +1024,9 @@ impl AppState {
                                 queue_ms: started_at.duration_since(requested_at).as_secs_f64() * 1000.0,
                                 engine_ms: elapsed_ms as f64,
                                 engine_wall_ms,
-                                analysis_ms,
-                                overlay_ms,
-                                scope_ms,
+                                analysis_ms: 0.0,
+                                overlay_ms: 0.0,
+                                scope_ms: 0.0,
                                 display_copy_ms: display.copy_ms,
                                 display_channel_convert_ms: display.convert_ms,
                                 render_image_create_ms: display.create_ms,
@@ -1040,19 +1038,22 @@ impl AppState {
                             });
                         }
                         let PreparedDisplay { image: img, source_pixels, reused, .. } = display;
-                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, overlays, scope, region, image_id, request, source_status)
+                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, region, image_id, request, source_status)
                     })
                 })
                 .await;
-            let Ok(render_before) = this.update(cx, |this, cx| {
+            let Ok((render_before, installed_img)) = this.update(cx, |this, cx| {
+                let mut installed_img: Option<Arc<RenderImage>> = None;
                 match frame {
-                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id, request, source_status)) => {
+                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, region, image_id, request, source_status)) => {
                         if this.preview.may_install(this.current, image_id, stamp.id) {
                             this.preview.last_request = Some(request);
                             this.preview.last_overlay = placed_overlay;
                             this.preview.last_scope = placed_scope;
-                            if let Some(old) = std::mem::replace(&mut this.preview.scope, scope) {
-                                cx.drop_image(old, None);
+                            if want_scope == super::ScopeKind::Off {
+                                if let Some(old) = this.preview.scope.take() {
+                                    cx.drop_image(old, None);
+                                }
                             }
                             this.preview.error = None;
                             this.source_note = source_status.map(|n| {
@@ -1064,6 +1065,9 @@ impl AppState {
                                 };
                                 (image_id, summary.into())
                             });
+                            if want_warning.is_some() || want_focus.is_some() || want_scope != super::ScopeKind::Off {
+                                installed_img = Some(Arc::clone(&img));
+                            }
                             display_frame(&mut this.preview.frame, &mut this.preview.full_after, Frame {
                                 image: img,
                                 source_pixels,
@@ -1071,8 +1075,8 @@ impl AppState {
                                 geometry: geometry.clone(),
                                 portrait_applied,
                                 image_id,
-                                warning,
-                                focus,
+                                warning: None,
+                                focus: None,
                                 degraded: degraded.map(SharedString::from),
                                 stamp,
                             }, cx);
@@ -1082,9 +1086,6 @@ impl AppState {
                         } else {
                             if !reused {
                                 cx.drop_image(img, None);
-                            }
-                            if let Some(scope) = scope {
-                                cx.drop_image(scope, None);
                             }
                         }
                     }
@@ -1104,13 +1105,76 @@ impl AppState {
                 if render_before {
                     cx.notify();
                 }
-                render_before
+                (render_before, installed_img)
             }) else { return };
+            // Compute optional overlays / scopes asynchronously after the primary frame is shown.
+            if let Some(display_img) = installed_img {
+                let analysis_this = this.clone();
+                cx.spawn(async move |cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            let size = display_img.size(0);
+                            let (w, h) = (size.width.0.max(0) as usize, size.height.0.max(0) as usize);
+                            let Some(bytes) = display_img.as_bytes(0) else {
+                                return ((None, None), None);
+                            };
+                            match (
+                                want_warning.is_some() || want_focus.is_some(),
+                                want_scope != super::ScopeKind::Off,
+                            ) {
+                                (true, true) => rayon::join(
+                                    || analysis_pixels(bytes, w, h, true, want_warning, want_focus),
+                                    || super::scopes::render_pixels(bytes, w, h, true, want_scope),
+                                ),
+                                (true, false) => (analysis_pixels(bytes, w, h, true, want_warning, want_focus), None),
+                                (false, true) => ((None, None), super::scopes::render_pixels(bytes, w, h, true, want_scope)),
+                                (false, false) => ((None, None), None),
+                            }
+                        })
+                        .await;
+                    analysis_this
+                        .update(cx, |this, cx| {
+                            let ((warning, focus), scope) = result;
+                            let still_current = this.current == Some(requested_image)
+                                && this.preview.frame.as_ref().is_some_and(|f| f.stamp.id == stamp.id);
+                            if still_current {
+                                if let Some(frame) = this.preview.frame.as_mut() {
+                                    if let Some(old) = std::mem::replace(&mut frame.warning, warning) {
+                                        cx.drop_image(old, None);
+                                    }
+                                    if let Some(old) = std::mem::replace(&mut frame.focus, focus) {
+                                        cx.drop_image(old, None);
+                                    }
+                                }
+                                if want_scope != super::ScopeKind::Off {
+                                    if let Some(old) = std::mem::replace(&mut this.preview.scope, scope) {
+                                        cx.drop_image(old, None);
+                                    }
+                                } else if let Some(scope) = scope {
+                                    cx.drop_image(scope, None);
+                                }
+                                cx.notify();
+                            } else {
+                                if let Some(w) = warning {
+                                    cx.drop_image(w, None);
+                                }
+                                if let Some(f) = focus {
+                                    cx.drop_image(f, None);
+                                }
+                                if let Some(s) = scope {
+                                    cx.drop_image(s, None);
+                                }
+                            }
+                        })
+                        .ok();
+                })
+                .detach();
+            }
             let before = if let Some(request) = before.filter(|_| render_before) {
                 Some(cx.background_spawn(async move {
                     engine.render_preview(&request).map(|frame| {
                         let display = prepare_display_image(
-                            frame.image, previous_before.as_ref().map(|(key, image, _)| (*key, image)),
+                            frame.image, frame.bgra, previous_before.as_ref().map(|(key, image, _)| (*key, image)),
                         );
                         (display.image, display.source_pixels, display.reused, request.region, request.image, request.max_size)
                     })
@@ -1364,6 +1428,7 @@ mod ordering_tests {
                     elapsed_ms: 0.0,
                     degraded: None,
                     gamut_warning: None,
+                    bgra: false,
                 }),
                 FakeReply::Fail => anyhow::bail!("fake engine failure"),
             }

@@ -1464,6 +1464,26 @@ impl Gpu {
     }
 
     /// Launches on the shared stream when present, else on the default stream.
+    pub(crate) fn launch_on_stream(
+        &mut self,
+        stream: &Stream<'_>,
+        kernel: &'static str,
+        grid: (u32, u32),
+        block: (u32, u32),
+        args: &mut [*mut c_void],
+    ) -> Result<(), Failure> {
+        let dispatch = self
+            .gpu
+            .launch_raw_stream(kernel, grid, block, args, stream)
+            .map_err(|error| self.failed(error))?;
+        if self.device.is_none() {
+            self.device = Some(dispatch.device);
+            self.compute_cap = dispatch.compute_cap;
+        }
+        self.counters.launches += 1;
+        Ok(())
+    }
+
     pub(crate) fn launch(
         &mut self,
         kernel: &'static str,

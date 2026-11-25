@@ -930,59 +930,16 @@ static __device__ __forceinline__ float3 output_banding(
     return make_float3(out[0], out[1], out[2]);
 }
 
-// ---------------------------------------------------------------------------
-// Kernel
-// ---------------------------------------------------------------------------
-extern "C" __global__ void develop_kernel(
-    float4* io,
+static __device__ __forceinline__ float3 develop_display_fn(
+    float3 display,
     const float* P,
     const float* luts,
-    const float* gain,
-    const float* c1,
     const float* editor,
     const unsigned int* band_words,
     const unsigned char* band_left,
-    const unsigned char* band_right) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int w = (int)P[P_W];
-    int h = (int)P[P_H];
-    if (x >= w || y >= h) {
-        return;
-    }
-    int index = y * w + x;
-    float4 sample = io[index];
-    if (sample.w <= 0.5f) {
-        io[index] = make_float4(0.11f, 0.11f, 0.11f, 1.0f);
-        return;
-    }
-    float fx = P[P_RX] + ((float)x + 0.5f) / (float)w * P[P_RW];
-    float fy = P[P_RY] + ((float)y + 0.5f) / (float)h * P[P_RH];
-    float3 lin = make_float3(sample.x, sample.y, sample.z);
-
-    float3 display;
-    if (P[P_BYPASS] != 0.0f) {
-        if (P[P_C1] != 0.0f) {
-            display = c1_develop(P, c1, lin);
-            display = output_banding(display, P, band_words, band_left, band_right, fx, fy);
-        } else {
-            display = make_float3(
-                encode_srgb(P, luts, lin.x),
-                encode_srgb(P, luts, lin.y),
-                encode_srgb(P, luts, lin.z));
-        }
-    } else {
-        float3 c = linear_edits(lin, P, gain, index, fx, fy);
-        if (P[P_C1] != 0.0f) {
-            display = c1_develop(P, c1, c);
-        } else {
-            display = make_float3(
-                encode_srgb(P, luts, c.x),
-                encode_srgb(P, luts, c.y),
-                encode_srgb(P, luts, c.z));
-        }
-    }
-
+    const unsigned char* band_right,
+    float fx,
+    float fy) {
     // develop_display() ------------------------------------------------------
     if (P[P_BRIGHT_GAMMA] != 1.0f) {
         float gamma = P[P_BRIGHT_GAMMA];
@@ -1050,5 +1007,614 @@ extern "C" __global__ void develop_kernel(
     if (P[P_BANDING_OUTER] != 0.0f) {
         display = output_banding(display, P, band_words, band_left, band_right, fx, fy);
     }
+    return display;
+}
+
+static __device__ __forceinline__ float3 c1_encode_camera_rgb(
+    const float* P, const float* c1, float3 rgb) {
+    const float* film = c1;
+    float linear[3] = {fmaxf(rgb.x, 0.0f), fmaxf(rgb.y, 0.0f), fmaxf(rgb.z, 0.0f)};
+    float matrix[3];
+    for (int row = 0; row < 3; ++row) {
+        const float* m = P + P_PREMAT + row * 3;
+        float v = m[0] * linear[0] + m[1] * linear[1] + m[2] * linear[2];
+        matrix[row] = fmaxf(v, 0.0f);
+    }
+    int film_count = (int)P[P_FILM_N];
+    float curved[3];
+    for (int c = 0; c < 3; ++c) {
+        curved[c] = film_at(film, film_count, matrix[c]);
+    }
+    float3 coupled = couple_float(
+        make_float3(matrix[0], matrix[1], matrix[2]),
+        make_float3(curved[0], curved[1], curved[2]));
+    return make_float3(
+        encode_camera(coupled.x),
+        encode_camera(coupled.y),
+        encode_camera(coupled.z));
+}
+
+static __device__ __forceinline__ float srgb_to_linear_exact(float c) {
+    float v = clampf(c, 0.0f, 1.0f);
+    if (v <= 0.04045f) {
+        return v / 12.92f;
+    }
+    return powf((v + 0.055f) / 1.055f, 2.4f);
+}
+
+static __device__ __forceinline__ float linear_to_srgb_exact(float c) {
+    float v = clampf(c, 0.0f, 1.0f);
+    if (v <= 0.0031308f) {
+        return v * 12.92f;
+    }
+    return 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel
+// ---------------------------------------------------------------------------
+extern "C" __global__ void develop_kernel(
+    float4* io,
+    const float* P,
+    const float* luts,
+    const float* gain,
+    const float* c1,
+    const float* editor,
+    const unsigned int* band_words,
+    const unsigned char* band_left,
+    const unsigned char* band_right) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = (int)P[P_W];
+    int h = (int)P[P_H];
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    float4 sample = io[index];
+    if (sample.w <= 0.5f) {
+        io[index] = make_float4(0.11f, 0.11f, 0.11f, 1.0f);
+        return;
+    }
+    float fx = P[P_RX] + ((float)x + 0.5f) / (float)w * P[P_RW];
+    float fy = P[P_RY] + ((float)y + 0.5f) / (float)h * P[P_RH];
+    float3 lin = make_float3(sample.x, sample.y, sample.z);
+
+    float3 display;
+    if (P[P_BYPASS] != 0.0f) {
+        if (P[P_C1] != 0.0f) {
+            display = c1_develop(P, c1, lin);
+            display = output_banding(display, P, band_words, band_left, band_right, fx, fy);
+        } else {
+            display = make_float3(
+                encode_srgb(P, luts, lin.x),
+                encode_srgb(P, luts, lin.y),
+                encode_srgb(P, luts, lin.z));
+        }
+    } else {
+        float3 c = linear_edits(lin, P, gain, index, fx, fy);
+        if (P[P_C1] != 0.0f) {
+            display = c1_develop(P, c1, c);
+        } else {
+            display = make_float3(
+                encode_srgb(P, luts, c.x),
+                encode_srgb(P, luts, c.y),
+                encode_srgb(P, luts, c.z));
+        }
+    }
+
+    display = develop_display_fn(display, P, luts, editor, band_words, band_left, band_right, fx, fy);
     io[index] = make_float4(display.x, display.y, display.z, 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Resident preview pipeline kernels (non-destructive src_linear -> rgb3 / u8)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void zero_u32_kernel(unsigned int* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = 0u;
+    }
+}
+
+extern "C" __global__ void develop_resident_rgb3_kernel(
+    const float4* src_linear,
+    float* out_rgb3,
+    const float* P,
+    const float* luts,
+    const float* gain,
+    const float* c1,
+    const float* editor,
+    const unsigned int* band_words,
+    const unsigned char* band_left,
+    const unsigned char* band_right) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = (int)P[P_W];
+    int h = (int)P[P_H];
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    int out_idx = index * 3;
+    float4 sample = src_linear[index];
+    if (sample.w <= 0.5f) {
+        out_rgb3[out_idx + 0] = 0.11f;
+        out_rgb3[out_idx + 1] = 0.11f;
+        out_rgb3[out_idx + 2] = 0.11f;
+        return;
+    }
+    float fx = P[P_RX] + ((float)x + 0.5f) / (float)w * P[P_RW];
+    float fy = P[P_RY] + ((float)y + 0.5f) / (float)h * P[P_RH];
+    float3 lin = make_float3(sample.x, sample.y, sample.z);
+
+    float3 display;
+    if (P[P_BYPASS] != 0.0f) {
+        if (P[P_C1] != 0.0f) {
+            display = c1_develop(P, c1, lin);
+            display = output_banding(display, P, band_words, band_left, band_right, fx, fy);
+        } else {
+            display = make_float3(
+                encode_srgb(P, luts, lin.x),
+                encode_srgb(P, luts, lin.y),
+                encode_srgb(P, luts, lin.z));
+        }
+    } else {
+        float3 c = linear_edits(lin, P, gain, index, fx, fy);
+        if (P[P_C1] != 0.0f) {
+            display = c1_develop(P, c1, c);
+        } else {
+            display = make_float3(
+                encode_srgb(P, luts, c.x),
+                encode_srgb(P, luts, c.y),
+                encode_srgb(P, luts, c.z));
+        }
+    }
+
+    display = develop_display_fn(display, P, luts, editor, band_words, band_left, band_right, fx, fy);
+    out_rgb3[out_idx + 0] = clampf(display.x, 0.0f, 1.0f);
+    out_rgb3[out_idx + 1] = clampf(display.y, 0.0f, 1.0f);
+    out_rgb3[out_idx + 2] = clampf(display.z, 0.0f, 1.0f);
+}
+
+extern "C" __global__ void develop_camera_encode_kernel(
+    const float4* src_linear,
+    float4* cam_buf,
+    float* norm_buf,
+    const float* P,
+    const float* gain,
+    const float* c1) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = (int)P[P_W];
+    int h = (int)P[P_H];
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    float4 sample = src_linear[index];
+    if (sample.w <= 0.5f) {
+        cam_buf[index] = make_float4(-1.0f, -1.0f, -1.0f, -1.0f);
+        norm_buf[index] = 0.0f;
+        return;
+    }
+    float fx = P[P_RX] + ((float)x + 0.5f) / (float)w * P[P_RW];
+    float fy = P[P_RY] + ((float)y + 0.5f) / (float)h * P[P_RH];
+    float3 lin = make_float3(sample.x, sample.y, sample.z);
+    float3 c = linear_edits(lin, P, gain, index, fx, fy);
+    float3 cam = c1_encode_camera_rgb(P, c1, c);
+    float norm = sqrtf(0.2126f * cam.x * cam.x + 0.7152f * cam.y * cam.y + 0.0722f * cam.z * cam.z);
+    cam_buf[index] = make_float4(cam.x, cam.y, cam.z, norm);
+    norm_buf[index] = norm;
+}
+
+extern "C" __global__ void gaussian_blur_h_kernel(
+    const float* src,
+    float* dst,
+    const float* weights,
+    int w,
+    int h,
+    int half) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    const float* row = src + y * w;
+    float acc = row[x] * weights[0];
+    int max_x = w - 1;
+    for (int k = 1; k <= half; ++k) {
+        int l = x - k;
+        if (l < 0) l = 0;
+        int r = x + k;
+        if (r > max_x) r = max_x;
+        acc += (row[l] + row[r]) * weights[k];
+    }
+    dst[y * w + x] = acc;
+}
+
+extern "C" __global__ void gaussian_blur_v_kernel(
+    const float* src,
+    float* dst,
+    const float* weights,
+    int w,
+    int h,
+    int half) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    float acc = src[y * w + x] * weights[0];
+    int max_y = h - 1;
+    for (int k = 1; k <= half; ++k) {
+        int u = y - k;
+        if (u < 0) u = 0;
+        int d = y + k;
+        if (d > max_y) d = max_y;
+        acc += (src[u * w + x] + src[d * w + x]) * weights[k];
+    }
+    dst[y * w + x] = acc;
+}
+
+extern "C" __global__ void camera_usm_and_display_kernel(
+    const float4* cam_buf,
+    const float* norm_buf,
+    const float* blur_buf,
+    float* out_rgb3,
+    const float* P,
+    const float* luts,
+    const float* c1,
+    const float* editor,
+    const unsigned int* band_words,
+    const unsigned char* band_left,
+    const unsigned char* band_right,
+    float gain,
+    float threshold,
+    float halo) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = (int)P[P_W];
+    int h = (int)P[P_H];
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    int out_idx = index * 3;
+    float4 cam = cam_buf[index];
+    if (cam.x < 0.0f) {
+        out_rgb3[out_idx + 0] = 0.11f;
+        out_rgb3[out_idx + 1] = 0.11f;
+        out_rgb3[out_idx + 2] = 0.11f;
+        return;
+    }
+    float v = norm_buf[index];
+    float detail = v - blur_buf[index];
+    float clamped_detail = clampf(detail, -threshold, threshold);
+    float sharpened = v + (detail - clamped_detail) * gain;
+    if (halo > 0.0f) {
+        float lo = v;
+        float hi = v;
+        int y0 = y > 0 ? y - 1 : 0;
+        int y1 = y + 1 < h ? y + 1 : h - 1;
+        int x0 = x > 0 ? x - 1 : 0;
+        int x1 = x + 1 < w ? x + 1 : w - 1;
+        for (int ny = y0; ny <= y1; ++ny) {
+            for (int nx = x0; nx <= x1; ++nx) {
+                float nv = norm_buf[ny * w + nx];
+                lo = fminf(lo, nv);
+                hi = fmaxf(hi, nv);
+            }
+        }
+        sharpened += (clampf(sharpened, lo, hi) - sharpened) * halo;
+    }
+    float factor = clampf(sharpened / fmaxf(v, 1e-20f), 0.0f, 16.0f);
+    float3 sharp_cam = make_float3(cam.x * factor, cam.y * factor, cam.z * factor);
+
+    const unsigned short* nodes = (const unsigned short*)(c1 + FILM_MAX * 3);
+    float3 display = clut_sample(nodes, sharp_cam);
+    float fx = P[P_RX] + ((float)x + 0.5f) / (float)w * P[P_RW];
+    float fy = P[P_RY] + ((float)y + 0.5f) / (float)h * P[P_RH];
+    display = develop_display_fn(display, P, luts, editor, band_words, band_left, band_right, fx, fy);
+    out_rgb3[out_idx + 0] = clampf(display.x, 0.0f, 1.0f);
+    out_rgb3[out_idx + 1] = clampf(display.y, 0.0f, 1.0f);
+    out_rgb3[out_idx + 2] = clampf(display.z, 0.0f, 1.0f);
+}
+
+extern "C" __global__ void single_pixel_luma_kernel(
+    const float* rgb3,
+    float* luma_buf,
+    int w,
+    int h) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    int off = index * 3;
+    luma_buf[index] = (0.2126f * rgb3[off + 0] + 0.7152f * rgb3[off + 1] + 0.0722f * rgb3[off + 2]) * 255.0f;
+}
+
+static __device__ __forceinline__ void cmp_swap_f(float& a, float& b) {
+    float lo = fminf(a, b);
+    float hi = fmaxf(a, b);
+    a = lo;
+    b = hi;
+}
+
+extern "C" __global__ void single_pixel_nr_apply_kernel(
+    float* rgb3,
+    const float* luma_buf,
+    int w,
+    int h,
+    float threshold) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    float c = luma_buf[index];
+    int xm = x > 0 ? x - 1 : 0;
+    int xp = x + 1 < w ? x + 1 : w - 1;
+    int ym = y > 0 ? y - 1 : 0;
+    int yp = y + 1 < h ? y + 1 : h - 1;
+    float v0 = luma_buf[ym * w + xm];
+    float v1 = luma_buf[ym * w + x];
+    float v2 = luma_buf[ym * w + xp];
+    float v3 = luma_buf[y * w + xm];
+    float v4 = luma_buf[y * w + xp];
+    float v5 = luma_buf[yp * w + xm];
+    float v6 = luma_buf[yp * w + x];
+    float v7 = luma_buf[yp * w + xp];
+
+    cmp_swap_f(v0, v2); cmp_swap_f(v1, v3); cmp_swap_f(v4, v6); cmp_swap_f(v5, v7);
+    cmp_swap_f(v0, v4); cmp_swap_f(v1, v5); cmp_swap_f(v2, v6); cmp_swap_f(v3, v7);
+    cmp_swap_f(v0, v1); cmp_swap_f(v2, v3); cmp_swap_f(v4, v5); cmp_swap_f(v6, v7);
+    cmp_swap_f(v2, v4); cmp_swap_f(v3, v5);
+    cmp_swap_f(v1, v4); cmp_swap_f(v3, v6);
+    cmp_swap_f(v1, v2); cmp_swap_f(v3, v4); cmp_swap_f(v5, v6);
+
+    float median = (v3 + v4) * 0.5f;
+    if (c > median + threshold) {
+        float f = c > 1.0f ? (median / c) : 1.0f;
+        int off = index * 3;
+        rgb3[off + 0] = clampf(rgb3[off + 0] * f, 0.0f, 1.0f);
+        rgb3[off + 1] = clampf(rgb3[off + 1] * f, 0.0f, 1.0f);
+        rgb3[off + 2] = clampf(rgb3[off + 2] * f, 0.0f, 1.0f);
+    }
+}
+
+extern "C" __global__ void display_usm_luma_kernel(
+    const float* rgb3,
+    float* luma_buf,
+    int w,
+    int h) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    int off = index * 3;
+    float r = srgb_to_linear_exact(rgb3[off + 0]);
+    float g = srgb_to_linear_exact(rgb3[off + 1]);
+    float b = srgb_to_linear_exact(rgb3[off + 2]);
+    luma_buf[index] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+extern "C" __global__ void display_usm_apply_kernel(
+    float* rgb3,
+    const float* luma_buf,
+    const float* blur_buf,
+    int w,
+    int h,
+    float gain,
+    float threshold_lin,
+    float halo) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    int index = y * w + x;
+    float yc = luma_buf[index];
+    float detail = yc - blur_buf[index];
+    if (fabsf(detail) <= threshold_lin) {
+        detail = 0.0f;
+    } else {
+        detail = (detail >= 0.0f ? 1.0f : -1.0f) * (fabsf(detail) - threshold_lin);
+    }
+    float v = yc + detail * gain;
+    if (halo > 0.0f) {
+        float lo = 1e30f;
+        float hi = -1e30f;
+        int y0 = y > 0 ? y - 1 : 0;
+        int y1 = y + 1 < h ? y + 1 : h - 1;
+        int x0 = x > 0 ? x - 1 : 0;
+        int x1 = x + 1 < w ? x + 1 : w - 1;
+        for (int ny = y0; ny <= y1; ++ny) {
+            for (int nx = x0; nx <= x1; ++nx) {
+                float l = luma_buf[ny * w + nx];
+                lo = fminf(lo, l);
+                hi = fmaxf(hi, l);
+            }
+        }
+        float clamped = clampf(v, lo, hi);
+        v = v * (1.0f - halo) + clamped * halo;
+    }
+    float yn = clampf(v, 0.0f, 1.0f);
+    if (fabsf(yn - yc) < 1e-6f) {
+        return;
+    }
+    int off = index * 3;
+    float r = srgb_to_linear_exact(rgb3[off + 0]);
+    float g = srgb_to_linear_exact(rgb3[off + 1]);
+    float b = srgb_to_linear_exact(rgb3[off + 2]);
+    float sr, sg, sb;
+    if (yc > 1e-4f) {
+        float f = clampf(yn / yc, 0.2f, 4.0f);
+        sr = r * f;
+        sg = g * f;
+        sb = b * f;
+    } else {
+        float d = yn - yc;
+        sr = r + d;
+        sg = g + d;
+        sb = b + d;
+    }
+    rgb3[off + 0] = linear_to_srgb_exact(sr);
+    rgb3[off + 1] = linear_to_srgb_exact(sg);
+    rgb3[off + 2] = linear_to_srgb_exact(sb);
+}
+
+extern "C" __global__ void quantize_rgb3_u8_hist_kernel(
+    const float* rgb3,
+    uchar4* out_u8,
+    unsigned int* hist,
+    int w,
+    int h,
+    int bgra) {
+    __shared__ unsigned int sh[1026];
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int block_threads = blockDim.x * blockDim.y;
+    if (hist != 0) {
+        for (int i = tid; i < 1026; i += block_threads) {
+            sh[i] = 0u;
+        }
+        __syncthreads();
+    }
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < w && y < h) {
+        int index = y * w + x;
+        int off = index * 3;
+        unsigned char r = (unsigned char)(clampf(rgb3[off + 0], 0.0f, 1.0f) * 255.0f + 0.5f);
+        unsigned char g = (unsigned char)(clampf(rgb3[off + 1], 0.0f, 1.0f) * 255.0f + 0.5f);
+        unsigned char b = (unsigned char)(clampf(rgb3[off + 2], 0.0f, 1.0f) * 255.0f + 0.5f);
+        out_u8[index] = bgra != 0
+            ? make_uchar4(b, g, r, 255u)
+            : make_uchar4(r, g, b, 255u);
+        if (hist != 0) {
+            atomicAdd(&sh[r], 1u);
+            atomicAdd(&sh[256 + g], 1u);
+            atomicAdd(&sh[512 + b], 1u);
+            int luma = (int)(0.2126f * (float)r + 0.7152f * (float)g + 0.0722f * (float)b);
+            if (luma < 0) luma = 0;
+            if (luma > 255) luma = 255;
+            atomicAdd(&sh[768 + luma], 1u);
+            if (r <= 1u && g <= 1u && b <= 1u) {
+                atomicAdd(&sh[1024], 1u);
+            }
+            if (r >= 254u || g >= 254u || b >= 254u) {
+                atomicAdd(&sh[1025], 1u);
+            }
+        }
+    }
+
+    if (hist != 0) {
+        __syncthreads();
+        for (int i = tid; i < 1026; i += block_threads) {
+            unsigned int v = sh[i];
+            if (v != 0u) {
+                atomicAdd(&hist[i], v);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void develop_resident_u8_hist_kernel(
+    const float4* src_linear,
+    uchar4* out_u8,
+    unsigned int* hist,
+    const float* P,
+    const float* luts,
+    const float* gain,
+    const float* c1,
+    const float* editor,
+    const unsigned int* band_words,
+    const unsigned char* band_left,
+    const unsigned char* band_right,
+    int bgra) {
+    __shared__ unsigned int sh[1026];
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int block_threads = blockDim.x * blockDim.y;
+    if (hist != 0) {
+        for (int i = tid; i < 1026; i += block_threads) {
+            sh[i] = 0u;
+        }
+        __syncthreads();
+    }
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = (int)P[P_W];
+    int h = (int)P[P_H];
+    if (x < w && y < h) {
+        int index = y * w + x;
+        float4 sample = src_linear[index];
+        float3 display;
+        if (sample.w <= 0.5f) {
+            display = make_float3(0.11f, 0.11f, 0.11f);
+        } else {
+            float fx = P[P_RX] + ((float)x + 0.5f) / (float)w * P[P_RW];
+            float fy = P[P_RY] + ((float)y + 0.5f) / (float)h * P[P_RH];
+            float3 lin = make_float3(sample.x, sample.y, sample.z);
+            if (P[P_BYPASS] != 0.0f) {
+                if (P[P_C1] != 0.0f) {
+                    display = c1_develop(P, c1, lin);
+                    display = output_banding(display, P, band_words, band_left, band_right, fx, fy);
+                } else {
+                    display = make_float3(
+                        encode_srgb(P, luts, lin.x),
+                        encode_srgb(P, luts, lin.y),
+                        encode_srgb(P, luts, lin.z));
+                }
+            } else {
+                float3 c = linear_edits(lin, P, gain, index, fx, fy);
+                if (P[P_C1] != 0.0f) {
+                    display = c1_develop(P, c1, c);
+                } else {
+                    display = make_float3(
+                        encode_srgb(P, luts, c.x),
+                        encode_srgb(P, luts, c.y),
+                        encode_srgb(P, luts, c.z));
+                }
+            }
+            display = develop_display_fn(display, P, luts, editor, band_words, band_left, band_right, fx, fy);
+        }
+        unsigned char r = (unsigned char)(clampf(display.x, 0.0f, 1.0f) * 255.0f + 0.5f);
+        unsigned char g = (unsigned char)(clampf(display.y, 0.0f, 1.0f) * 255.0f + 0.5f);
+        unsigned char b = (unsigned char)(clampf(display.z, 0.0f, 1.0f) * 255.0f + 0.5f);
+        out_u8[index] = bgra != 0
+            ? make_uchar4(b, g, r, 255u)
+            : make_uchar4(r, g, b, 255u);
+        if (hist != 0) {
+            atomicAdd(&sh[r], 1u);
+            atomicAdd(&sh[256 + g], 1u);
+            atomicAdd(&sh[512 + b], 1u);
+            int luma = (int)(0.2126f * (float)r + 0.7152f * (float)g + 0.0722f * (float)b);
+            if (luma < 0) luma = 0;
+            if (luma > 255) luma = 255;
+            atomicAdd(&sh[768 + luma], 1u);
+            if (r <= 1u && g <= 1u && b <= 1u) {
+                atomicAdd(&sh[1024], 1u);
+            }
+            if (r >= 254u || g >= 254u || b >= 254u) {
+                atomicAdd(&sh[1025], 1u);
+            }
+        }
+    }
+
+    if (hist != 0) {
+        __syncthreads();
+        for (int i = tid; i < 1026; i += block_threads) {
+            unsigned int v = sh[i];
+            if (v != 0u) {
+                atomicAdd(&hist[i], v);
+            }
+        }
+    }
 }

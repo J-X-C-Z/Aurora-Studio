@@ -334,13 +334,18 @@ impl RenderOnce for ParamSlider {
         let on_commit = self.on_commit.clone();
         let default = self.default;
 
+        let current_val = self.value;
         let set_from_x = {
             let on_change = on_change.clone();
             move |x: Pixels, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
                 let w = f32::from(bounds.size.width).max(1.0);
                 let t = (f32::from(x - bounds.origin.x) / w).clamp(0.0, 1.0);
+                let next = scale.to_value(t, min, max);
+                if (next - current_val).abs() < 1e-6 {
+                    return;
+                }
                 if let Some(f) = &on_change {
-                    f(scale.to_value(t, min, max), window, cx);
+                    f(next, window, cx);
                 }
             }
         };
@@ -507,8 +512,11 @@ impl RenderOnce for ParamSlider {
                             let w = f32::from(bounds.size.width).max(1.0);
                             let t0 = scale.to_t(av, min, max);
                             let t = (t0 + (x - ax) / w / 10.0).clamp(0.0, 1.0);
-                            if let Some(f) = &on_change {
-                                f(scale.to_value(t, min, max), window, cx);
+                            let next = scale.to_value(t, min, max);
+                            if (next - current).abs() >= 1e-6 {
+                                if let Some(f) = &on_change {
+                                    f(next, window, cx);
+                                }
                             }
                         } else {
                             if st.read(cx).anchor.is_some() {

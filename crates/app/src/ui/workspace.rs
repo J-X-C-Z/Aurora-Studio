@@ -183,13 +183,28 @@ impl Workspace {
         let subs = vec![
             speed_keys,
             cx.observe(&state, |this: &mut Self, state, cx| {
-                // Menus carry the language and the workspace list; rebuild them when either changes.
-                let names = Self::workspace_names(&state, cx);
-                let recent = Self::recent_names(&state, cx);
-                let key = (i18n::locale() == i18n::Locale::ZhCn, names.clone(), recent.clone());
-                if this.menu_key.as_ref() != Some(&key) {
-                    this.menu_key = Some(key);
-                    install_menus(&this.menu_bar, &names, &recent, cx);
+                // Menus carry the language and the workspace list; only rebuild
+                // when locale, workspace count/names, or recent list actually change.
+                let zh = i18n::locale() == i18n::Locale::ZhCn;
+                let needs_menu_check = {
+                    let s = state.read(cx);
+                    match this.menu_key.as_ref() {
+                        Some((prev_zh, prev_ws, prev_rec)) => {
+                            *prev_zh != zh
+                                || prev_rec.len() != s.settings.recent.len()
+                                || prev_ws.len() != s.workspace_list().len()
+                        }
+                        None => true,
+                    }
+                };
+                if needs_menu_check {
+                    let names = Self::workspace_names(&state, cx);
+                    let recent = Self::recent_names(&state, cx);
+                    let key = (zh, names.clone(), recent.clone());
+                    if this.menu_key.as_ref() != Some(&key) {
+                        this.menu_key = Some(key);
+                        install_menus(&this.menu_bar, &names, &recent, cx);
+                    }
                 }
                 cx.notify()
             }),
