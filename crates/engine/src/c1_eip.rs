@@ -537,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn original_c1_packages() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join(
             "../../../../04_reference/legacy-root/逆向工程/Capture One/resources/eip_samples",

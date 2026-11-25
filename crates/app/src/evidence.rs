@@ -2,8 +2,8 @@
 //!
 //! 数据来源是 `03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv`
 //! 的逐字节副本 `docs/frontend-contract/portrait-capability-registry-20261124.tsv`
-//! （SHA256 `d1b92c6f0b1d15b2807f917c1298c5cbac4f72449c38e9f4e6af92a28fed85c4`，
-//! 86739 字节）。`crates/portrait/assets/portrait/` 下的副本必须与它逐字节相同；
+//! （SHA256 `d64580e1feb1dd9536e7beabe6b81a5dc077fe067bd3c7634af3d6d9bee4a386`，
+//! 81363 字节）。`crates/portrait/assets/portrait/` 下的副本必须与它逐字节相同；
 //! 测试同时比对两份内嵌副本，并在仓库内可定位时比对 canonical 文件。
 //! 登记不等于可用：七级证据相互独立，低级证据不能推出高级证据，`未验证` 永远不是通过。
 //!
@@ -21,9 +21,9 @@ pub const UNVERIFIED: &str = "未验证";
 /// 嵌入的能力表；重新同步时必须与本目录下的 TSV 完全一致。
 pub const REGISTRY: &str = include_str!("../../../docs/frontend-contract/portrait-capability-registry-20261124.tsv");
 pub const REGISTRY_SOURCE: &str = "03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv";
-pub const REGISTRY_SHA256: &str = "d1b92c6f0b1d15b2807f917c1298c5cbac4f72449c38e9f4e6af92a28fed85c4";
+pub const REGISTRY_SHA256: &str = "d64580e1feb1dd9536e7beabe6b81a5dc077fe067bd3c7634af3d6d9bee4a386";
 /// 字节数；随文件同步变化的快速哨兵，防止副本与 SHA 记录脱节。
-const REGISTRY_BYTES: usize = 86739;
+const REGISTRY_BYTES: usize = 81363;
 
 /// 七级证据，顺序与能力表一致。索引 4 是 ev5（应用主预览接入）。
 pub const LEVELS: [&str; 7] = [
@@ -261,7 +261,7 @@ mod tests {
             if candidate.is_file() {
                 return std::fs::read_to_string(candidate).ok();
             }
-            if !dir.pop() {
+            if dir.join(".git").exists() || !dir.pop() {
                 return None;
             }
         }

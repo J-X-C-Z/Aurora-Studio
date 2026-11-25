@@ -2919,35 +2919,95 @@ fn import_with_edits(
 mod import_edits_tests {
     use super::import_with_edits;
     use aurora_engine::FileEngine;
-    use std::{fs, process::Command};
+    use std::fs;
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if (crc & 1) != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    fn write_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for &(name, data) in entries {
+            let offset = out.len() as u32;
+            let name_bytes = name.as_bytes();
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
 
     #[test]
     fn eip_variants_fill_the_preview_edits_immediately() {
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x01, 0x63, 0x60, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD,
+            0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
         let dir = std::env::temp_dir().join(format!("aurora-eip-import-preview-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
-        let output = Command::new("python")
-            .args([
-                "-B",
-                "-c",
-                r#"
-import base64, pathlib, sys, zipfile
-root = pathlib.Path(sys.argv[1])
-png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AICAgP8FhAKAFCF59QAAAABJRU5ErkJggg==")
-(root / "single.png").write_bytes(png)
-with zipfile.ZipFile(root / "variants.eip", "w") as package:
-    package.writestr("manifest1680.xml", """<Manifest><File><RawPath>photo.png</RawPath>
-        <SettingsPath>different/settings.cos</SettingsPath></File></Manifest>""")
-    package.writestr("photo.png", png)
-    package.writestr("different/settings.cos", """<IMG>
-        <VAR><DL><E K="Exposure" V="1.25"/></DL></VAR>
-        <VAR><DL><E K="Exposure" V="-2.0"/></DL></VAR></IMG>""")
-"#,
-            ])
-            .arg(&dir)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        fs::write(dir.join("single.png"), PNG_1X1).unwrap();
+        let manifest = b"<Manifest><File><RawPath>photo.png</RawPath><SettingsPath>different/settings.cos</SettingsPath></File></Manifest>";
+        let settings = b"<IMG><VAR><DL><E K=\"Exposure\" V=\"1.25\"/></DL></VAR><VAR><DL><E K=\"Exposure\" V=\"-2.0\"/></DL></VAR></IMG>";
+        let eip = write_stored_zip(&[
+            ("manifest1680.xml", manifest),
+            ("photo.png", PNG_1X1),
+            ("different/settings.cos", settings),
+        ]);
+        fs::write(dir.join("variants.eip"), eip).unwrap();
         let added = import_with_edits(&engine, &[dir.join("variants.eip"), dir.join("single.png")]).unwrap();
         let [(first, first_edit), (second, second_edit), (single, single_edit)] = added.as_slice() else {
             panic!("expected two EIP variants and one standalone image");

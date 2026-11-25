@@ -318,6 +318,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs ONNX Runtime and EyeDetector.onnx"]
     fn flat_image_has_no_eyes() {
         // Finding "no eyes" still means running the detector once.
         if crate::aimask::model_path("EyeDetector.onnx").is_err() {

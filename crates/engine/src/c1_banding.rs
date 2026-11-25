@@ -614,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn z6iii_reports_an_empty_range() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
         let info = crate::read_nikon_info_block(&path).expect("fixture header");

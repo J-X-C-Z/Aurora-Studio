@@ -399,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn exposure_round_trips_through_the_catalog() {
         let path = copy_sample("roundtrip");
         let (pk, current) = snapshot_variant(&path);
@@ -420,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn an_unchanged_variant_is_not_rewritten() {
         let path = copy_sample("unchanged");
         let (pk, current) = snapshot_variant(&path);
@@ -431,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_corrupt_catalog_is_refused_before_any_write() {
         let path = copy_sample("corrupt");
         std::fs::write(&path, b"not a sqlite database").expect("corrupt");
@@ -441,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_clamped_crop_write_leaves_the_row_alone_and_warns() {
         let path = copy_sample("clamped-crop");
         let (pk, current) = snapshot_variant(&path);
@@ -461,6 +465,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn an_unclamped_crop_is_written_as_pixels() {
         let path = copy_sample("crop");
         let (pk, current) = snapshot_variant(&path);
@@ -524,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn the_engine_entry_point_writes_and_rereads() {
         let path = copy_sample("engine");
         let engine = crate::FileEngine::open_c1_catalog(&path).expect("catalog engine");
@@ -552,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn the_engine_entry_point_reports_unchanged() {
         let path = copy_sample("engine-unchanged");
         let engine = crate::FileEngine::open_c1_catalog(&path).expect("catalog engine");

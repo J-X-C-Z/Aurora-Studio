@@ -10301,26 +10301,10 @@ mod tests {
         ] {
             legacy = fnv_u64(legacy, u64::from(bits));
         }
-        legacy = fnv_usize(legacy, params.len());
-        for (key, value) in &params {
-            legacy = fnv_usize(legacy, key.len());
-            legacy = fnv1a64(legacy, key.as_bytes());
-            legacy = fnv_u64(legacy, u64::from(value.to_bits()));
-        }
+        legacy = fnv_u64(legacy, params_fingerprint(&params));
         legacy = fnv_usize(legacy, masks.width);
         legacy = fnv_usize(legacy, masks.height);
-        for (index, plane) in [&masks.skin, &masks.hair, &masks.face, &masks.body]
-            .into_iter()
-            .enumerate()
-        {
-            legacy = fnv_u64(legacy, index as u64);
-            legacy = fnv_u64(legacy, plane.as_ref().map_or(usize::MAX, Vec::len) as u64);
-            if let Some(plane) = plane {
-                for value in plane {
-                    legacy = fnv_u64(legacy, u64::from(value.to_bits()));
-                }
-            }
-        }
+        legacy = fnv_u64(legacy, masks.receipt_fingerprint());
 
         assert_eq!(receipt.frame_receipt().fingerprint(), legacy_frame);
         assert_eq!(receipt.fingerprint(), legacy);
@@ -13755,6 +13739,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn wl51_full_owned_b3_bundle_matches_cpu_cuda_and_fallback() {
         let (width, height) = (32u32, 24u32);
         let source = frame(width, height);

@@ -195,6 +195,7 @@ mod gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn cuda_fragment_matches_cpu_pass_by_pass_and_chained() {
         let Some(gpu) = gpu() else { return };
         let source = source();
@@ -263,6 +264,7 @@ mod gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn face_mesh_api_matches_cpu_and_returns_real_dispatch_receipts() {
         let Some(gpu) = gpu() else { return };
         let source = source();

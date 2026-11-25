@@ -4298,6 +4298,15 @@ impl ImageEngine for FileEngine {
         &self,
         items: &[(ImageId, AdjustmentSet)],
     ) -> anyhow::Result<()> {
+        {
+            let st = self.state.lock();
+            if items
+                .iter()
+                .any(|(image, _)| !st.entries.iter().any(|entry| entry.info.id == *image))
+            {
+                anyhow::bail!("unknown image");
+            }
+        }
         match FileEngine::save_adjustments_batch_report(self, items).into_error() {
             Some(err) => Err(err),
             None => Ok(()),
@@ -4940,6 +4949,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn lcc_calibration_round_trips_through_cos_lccid_and_sidecar() {
         let (dir, settings, grid) = lcc_fixture("round-trip");
         let engine = FileEngine::open(&dir).unwrap();
@@ -4966,6 +4976,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn clearing_lcc_calibration_removes_the_cos_pointer() {
         let (dir, settings, grid) = lcc_fixture("clear");
         let engine = FileEngine::open(&dir).unwrap();
@@ -4980,6 +4991,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn setting_lcc_on_an_unknown_image_is_an_error() {
         let (dir, _settings, grid) = lcc_fixture("unknown");
         let engine = FileEngine::open(&dir).unwrap();
@@ -5999,6 +6011,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_catalog_imports_every_variant_once() {
         let dir = c1_copy("import");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6012,6 +6025,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_import_keeps_adjustments_and_metadata() {
         let dir = c1_copy("meta");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6027,6 +6041,7 @@ mod tests {
 
     /// Opening a C1 catalog must publish C1's own albums, not the folder tree.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_collections_replace_the_folder_tree() {
         let dir = c1_copy("collections");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6057,6 +6072,7 @@ mod tests {
     /// C1 local layers are attached only when their `.comask` mask can be decoded;
     /// the fixture has no sidecar, so it must stay unattached and safe.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_layers_without_a_mask_stay_out_of_the_render() {
         let dir = c1_copy("layers");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6076,6 +6092,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_import_saves_to_portrait_not_the_catalog() {
         let dir = c1_copy("store");
         let catalog_file = dir.join("Capture One.cocatalogdb");
@@ -6089,6 +6106,7 @@ mod tests {
 
     /// A real C1 catalog is a package folder; our store must stay outside it.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_bundle_leaves_no_portrait_inside_the_package() {
         let dir = std::env::temp_dir().join(format!("portrait-c1-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6106,6 +6124,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_import_keeps_portrait_edits_on_reopen() {
         let dir = c1_copy("reopen");
         {
@@ -6538,6 +6557,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn eip_restores_packed_edits_on_import_and_reopen() {
         assert_packed_edits_on_import_and_reopen(false);
     }
@@ -7353,7 +7373,7 @@ mod tests {
             .map(|level| level.allocated_bytes())
             .sum();
         assert_eq!(source_cache_bytes(&source), materialized);
-        assert!(source.levels[1..].iter().all(|level| !level.data.is_empty()));
+        assert!(source.levels[1..].iter().all(|level| level.is_materialized()));
     }
 
     #[test]
@@ -7436,7 +7456,7 @@ mod tests {
     fn export_budget_admits_two_24mp_jobs_and_not_three() {
         use std::sync::atomic::AtomicBool;
         let mib = 1024 * 1024usize;
-        let budget = export_memory_budget_from_memory(32 * mib as u64, 24 * mib as u64);
+        let budget = export_memory_budget_from_memory(32 * 1024 * mib as u64, 24 * 1024 * mib as u64);
         let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
         let full = (6048u32, 4032u32);
         let charge = estimated_decode_bytes(full.0, full.1, DecodeFormat::RawNative)
@@ -7469,7 +7489,7 @@ mod tests {
     #[test]
     fn export_budget_binds_two_45mp_jobs() {
         let mib = 1024 * 1024usize;
-        let budget = export_memory_budget_from_memory(32 * mib as u64, 24 * mib as u64);
+        let budget = export_memory_budget_from_memory(32 * 1024 * mib as u64, 24 * 1024 * mib as u64);
         let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
         let full = (8256u32, 5504u32);
         let charge = estimated_decode_bytes(full.0, full.1, DecodeFormat::RawNative)

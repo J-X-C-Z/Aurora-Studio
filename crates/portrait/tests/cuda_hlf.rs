@@ -322,6 +322,7 @@ mod hlf_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf30022_spotless_vendor_lut_matches_cpu_and_preserves_alpha() {
         let Some(gpu) = gpu() else { return };
         let luma = vendor_adjust_lut();

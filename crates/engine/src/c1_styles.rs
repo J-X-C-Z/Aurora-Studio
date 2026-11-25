@@ -767,6 +767,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_real_style_maps_its_tools() {
         let style = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("real style parses");
         assert_eq!(style.name, "Fujicolor Pro 160C");
@@ -793,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn every_real_sample_parses() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-styles");
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -1005,6 +1007,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn written_style_round_trips_mapped_values() {
         let original = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("source style");
         let text = write_costyle_text(&original);
@@ -1024,6 +1027,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn writer_omits_metadata_and_unmapped_keys() {
         let style = load_style(&testdata("B&W Generic 4.costyle")).expect("source style");
         let text = write_costyle_text(&style);
@@ -1035,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn writer_field_diff_against_real_sample() {
         // Layer two: same parameters in, field-level diff out, order ignored.
         let path = testdata("Fujicolor Pro 160C.costyle");
@@ -1079,6 +1084,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn writer_reproduces_capture_one_number_spelling() {
         let path = testdata("Fujicolor Pro 160C.costyle");
         let style = load_style(&path).expect("source style");
@@ -1112,6 +1118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn edited_values_are_written_canonically() {
         let mut style = load_style(&testdata("Fujicolor Pro 160C.costyle")).expect("source style");
         style.adjustments.exposure.exposure = -1.5;
@@ -1259,6 +1266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn save_replaces_an_existing_style_without_leaving_temp_files() {
         let dir = std::env::temp_dir().join(format!("portrait-costyle-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -1281,6 +1289,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_failed_save_keeps_the_existing_path() {
         let dir = std::env::temp_dir().join(format!("portrait-costyle-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");

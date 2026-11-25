@@ -54,6 +54,10 @@ impl Plane {
         Self { width, height, data: Vec::new(), lazy: Some(OnceLock::new()) }
     }
 
+    pub(crate) fn is_materialized(&self) -> bool {
+        !self.data.is_empty() || self.lazy.as_ref().is_some_and(|slot| slot.get().is_some())
+    }
+
     /// Bytes this level owns or has reserved.
     ///
     /// A deferred level is charged its full payload before it is built, so the
@@ -6456,6 +6460,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn film_curve_darkens_midtones() {
         if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
             return;
@@ -7820,9 +7825,9 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = Source::from_rgba16_native(w, h, &rgba);
         assert!(src.levels.len() >= 3);
         assert!(src.sample(1, 0.5, 0.5).is_some());
-        assert!(!src.levels[1].data.is_empty(), "level 1 must be built on demand");
+        assert!(src.levels[1].is_materialized(), "level 1 must be built on demand");
         assert!(
-            src.levels[2..].iter().all(|level| level.data.is_empty()),
+            src.levels[2..].iter().all(|level| !level.is_materialized()),
             "levels below the requested depth must stay unallocated"
         );
     }

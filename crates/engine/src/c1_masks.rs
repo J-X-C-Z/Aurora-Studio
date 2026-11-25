@@ -815,6 +815,7 @@ mod brush_wire_tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn all_sixteen_columns_exist_and_parse() {
         let path = catalog();
         let mut db = crate::c1catalog::SqliteReader::open(&path).unwrap();

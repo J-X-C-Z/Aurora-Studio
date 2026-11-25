@@ -96,6 +96,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn teeth_stage_matches_the_cpu_oracle_across_ui_combinations() {
         let Some(gpu) = gpu() else { return };
         for (width, height) in [(1u32, 1u32), (17, 13), (32, 24)] {
@@ -115,6 +116,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn zero_degree_and_mask_gate_are_honoured() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(17, 13, 41);
@@ -145,6 +147,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn bright_only_and_whiten_only_paths_both_match() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(9, 9, 47);
@@ -156,6 +159,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn bad_material_is_refused_before_launch() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(4, 4, 59);
@@ -179,6 +183,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn session_revalidates_the_source_before_upload() {
         let Some(gpu) = gpu() else { return };
         let session = gpu.session(4, 4, WHITEN, BRIGHT).unwrap();
@@ -209,6 +214,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn ui_weight_rounding_has_no_1_byte_drift_on_full_mask_sweep() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(16, 16, 71);

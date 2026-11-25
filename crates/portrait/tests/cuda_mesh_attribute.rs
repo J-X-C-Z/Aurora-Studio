@@ -107,6 +107,7 @@ mod attribute_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_mesh_matches_the_cpu_on_96x64() {
         let Some(gpu) = gpu() else { return };
         let mean = decode_mean();
@@ -125,6 +126,7 @@ mod attribute_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_mesh_matches_the_cpu_on_512x512() {
         let Some(gpu) = gpu() else { return };
         let mean = decode_mean();

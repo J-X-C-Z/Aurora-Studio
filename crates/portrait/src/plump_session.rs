@@ -323,6 +323,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "needs FacePlump model pool and decoder (AURORA_PLUMP_MODEL_POOL, AURORA_PLUMP_DECODER_ROOT)"]
     fn three_real_assets_match_payload_and_net_hashes() {
         for route in [Route::HighRes4, Route::HighRes3, Route::LowRes3] {
             let session = LoadedSession::open(route).unwrap();

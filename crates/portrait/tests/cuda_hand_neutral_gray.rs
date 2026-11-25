@@ -68,6 +68,7 @@ mod hand_neutral_gray_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn bgra_fixture_matches_the_cpu_reference() {
         let Some(blend) = gpu() else { return };
         let f = fixture();

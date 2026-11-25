@@ -2321,6 +2321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn parses_real_recipe_output_sharpening_keys() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/recipes/JPEG - 2048px 网络使用.xml");
         let text = std::fs::read_to_string(path).unwrap();
@@ -2419,6 +2420,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs local Capture One recipes (AURORA_C1_RECIPES)"]
     fn watermark_parse_local_c1_recipes() {
         fn collect_xml(dir: &Path, out: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {

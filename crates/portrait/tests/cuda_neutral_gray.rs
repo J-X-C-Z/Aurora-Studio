@@ -157,6 +157,7 @@ fn pf30013_fixture_matches_cpu_and_gpu() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn pf30013_refuses_the_same_entry_contract_as_cpu() {
     let Some(gpu) = gpu() else { return };
     let case = fixture();

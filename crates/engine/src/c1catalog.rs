@@ -1716,6 +1716,7 @@ mod tests {
 
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn reads_the_collection_tree() {
         let c = sample();
         assert_eq!(c.collections.len(), 11);
@@ -1735,6 +1736,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn reads_collections_kinds_from_the_entity_table() {
         let c = sample();
         let album = c.collections.iter().find(|c| c.pk == 2).unwrap();
@@ -1758,6 +1760,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn the_real_catalog_has_no_keyword_rows() {
         // ZKEYWORD exists but is empty here; that is the correct read, not a failure.
         let c = sample();
@@ -1767,6 +1770,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_wal_is_replayed_in_memory_and_the_database_is_not_written() {
         let dir = temp_dir("wal");
         let db_path = fixture_with_wal(&dir);
@@ -1838,6 +1842,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn the_minimal_session_fixture_opens_as_a_session() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/session-min.cosessiondb");
         let c = C1Catalog::open_ro(&path).expect("a session without collection tables is valid");
@@ -1855,6 +1860,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_truncated_wal_is_reported_not_ignored() {
         let dir = temp_dir("wal-truncated");
         let db_path = fixture_with_wal(&dir);
@@ -1875,6 +1881,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_wal_header_that_is_truncated_is_reported() {
         let dir = temp_dir("wal-header");
         let db_path = fixture_with_wal(&dir);
@@ -1893,6 +1900,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_wal_with_a_broken_checksum_names_the_frames_that_cannot_be_replayed() {
         let dir = temp_dir("wal-broken");
         let db_path = fixture_with_wal(&dir);
@@ -1950,6 +1958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn keyword_names_are_qualified_with_their_parent() {
         let dir = temp_dir("wal-keywords");
         let db_path = fixture_with_wal(&dir);
@@ -1966,6 +1975,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn reads_images_with_paths_and_exif() {
         let c = sample();
         assert_eq!(c.images.len(), 3);
@@ -1985,6 +1995,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn reads_all_variants() {
         let c = sample();
         assert_eq!(c.variants.len(), 4);
@@ -1995,6 +2006,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn base_layer_becomes_adjustments() {
         let c = sample();
         let v = &c.variants[0];
@@ -2006,6 +2018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn mask_layers_are_parsed_but_not_merged_globally() {
         let c = sample();
         assert_eq!(c.variants[0].mask_layers, 5);
@@ -2015,6 +2028,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn utf8_text_survives() {
         let c = sample();
         let names: Vec<&str> = c
@@ -2027,6 +2041,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn ratings_take_the_max_of_the_layer_chain() {
         let c = sample();
         assert_eq!(c.variants.iter().map(|v| v.rating).max(), Some(5));
@@ -2039,6 +2054,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn reading_does_not_modify_the_database() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/c1-sample.cocatalogdb");
         let before = std::fs::metadata(&path).unwrap().len();
@@ -2047,6 +2063,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn chromatic_aberration_columns_reach_the_model() {
         let c = sample();
         let lens = c

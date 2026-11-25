@@ -897,7 +897,8 @@ mod tests {
         let full = populated();
         let full_value = serde_json::to_value(&full).unwrap();
         let default_value = serde_json::to_value(&AdjustmentSet::default()).unwrap();
-        let before = ParamsFingerprint::of(&full);
+        let roundtripped: AdjustmentSet = serde_json::from_value(full_value.clone()).unwrap();
+        let before = ParamsFingerprint::of(&roundtripped);
         for (field, group) in GROUPED_FIELDS {
             let mut value = full_value.clone();
             let object = value.as_object_mut().unwrap();
