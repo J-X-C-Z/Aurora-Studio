@@ -1321,6 +1321,12 @@ impl Gpu {
         self.counters.skipped_uploads += 1;
     }
 
+    /// Symmetric to [`Self::note_skipped_upload`]: the frame a previous stage
+    /// left resident was consumed without a device-to-host copy.
+    pub(crate) fn note_skipped_download(&mut self) {
+        self.counters.skipped_downloads += 1;
+    }
+
     pub(crate) fn note_skipped_plane_builds(&mut self, count: u64) {
         self.counters.skipped_plane_builds += count;
     }

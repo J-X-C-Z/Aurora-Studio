@@ -675,6 +675,23 @@ fn detail_stage_plan(adj: &crate::AdjustmentSet, gpu_enabled: bool) -> DetailSta
     }
 }
 
+impl DetailStagePlan {
+    /// True when nothing rewrites `rgba` between the detail device frame and
+    /// the grain stage, so the frame can stay resident for grain (M2
+    /// cross-stage residency). `cpu_single_pixel_first` runs *before* the GPU
+    /// call, so it does not break the adjacency. Pure, so the routing is
+    /// testable without a GPU.
+    #[allow(dead_code)] // referenced from the `cfg(windows)` handoff branch
+    fn resident_to_grain(self) -> bool {
+        self.gpu
+            && !self.cpu_color_nr
+            && !self.cpu_moire
+            && !self.cpu_diffraction
+            && !self.cpu_sharpen
+            && !self.cpu_lens
+    }
+}
+
 fn post_process_impl(
     rgba: &mut [u8],
     width: u32,
@@ -744,7 +761,41 @@ fn post_process_impl(
         } else {
             adj.moire.clone()
         };
-        detail_gpu::post_process(rgba, w, h, &gpu_nr, &gpu_moire, &gpu_sh, &gpu_lens, scale)
+        // M2 residency: when no CPU split stage runs between the detail
+        // device frame and grain, hand the frame over without the two
+        // 4 B/px round trips. Failure never leaves a half-applied frame:
+        // detail's chain only uploads, and grain's only frame-writing kernels
+        // are its terminal kernels, so a refusal restores the post-detail
+        // frame and a lost device sends us back to the full CPU path.
+        #[allow(unused_mut)]
+        let mut resident_gpu: Option<bool> = None;
+        #[cfg(windows)]
+        if plan.resident_to_grain() {
+            match detail_gpu::post_process_resident_grain(
+                rgba,
+                w,
+                h,
+                &gpu_nr,
+                &gpu_moire,
+                &gpu_sh,
+                &gpu_lens,
+                scale,
+                &adj.film_grain,
+            ) {
+                // Final frame already downloaded; grain is applied.
+                detail_gpu::ResidentGrain::Applied => return,
+                // Detail is on the host; the tail below runs grain.
+                detail_gpu::ResidentGrain::DetailRestored => resident_gpu = Some(true),
+                // Nothing reached the host: rerun everything on the CPU.
+                detail_gpu::ResidentGrain::CpuEverything => resident_gpu = Some(false),
+            }
+        }
+        match resident_gpu {
+            Some(value) => value,
+            None => {
+                detail_gpu::post_process(rgba, w, h, &gpu_nr, &gpu_moire, &gpu_sh, &gpu_lens, scale)
+            }
+        }
     } else {
         false
     };
@@ -1352,14 +1403,36 @@ fn gaussian_blur_sep(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     let mut horiz = vec![0.0f32; w * h];
     horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
         let row = &src[y * w..(y + 1) * w];
-        for x in 0..w {
+        // Edge pixels need the clamp every tap; the interior never does. Both
+        // helpers perform the exact same `acc += (l + r) * kernel[k]` sequence
+        // in `k` order, so the two zones stay bit-identical to the old loop.
+        let clamped = |x: usize| -> f32 {
             let mut acc = row[x] * kernel[0];
             for k in 1..=half {
                 let l = (x as isize - k as isize).clamp(0, max_x) as usize;
                 let r = (x as isize + k as isize).clamp(0, max_x) as usize;
                 acc += (row[l] + row[r]) * kernel[k];
             }
-            out_row[x] = acc;
+            acc
+        };
+        if w > 2 * half {
+            for x in 0..half {
+                out_row[x] = clamped(x);
+            }
+            for x in half..w - half {
+                let mut acc = row[x] * kernel[0];
+                for k in 1..=half {
+                    acc += (row[x - k] + row[x + k]) * kernel[k];
+                }
+                out_row[x] = acc;
+            }
+            for x in w - half..w {
+                out_row[x] = clamped(x);
+            }
+        } else {
+            for x in 0..w {
+                out_row[x] = clamped(x);
+            }
         }
     });
 
@@ -1367,17 +1440,17 @@ fn gaussian_blur_sep(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     let mut out = vec![0.0f32; w * h];
     out.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
         let c_row = &horiz[y * w..(y + 1) * w];
-        for x in 0..w {
-            out_row[x] = c_row[x] * kernel[0];
+        for (o, c) in out_row.iter_mut().zip(c_row) {
+            *o = *c * kernel[0];
         }
         for k in 1..=half {
             let u = (y as isize - k as isize).clamp(0, max_y) as usize;
-            let d = (y as isize + k as isize).clamp(0, max_y) as usize;
+            let dep = (y as isize + k as isize).clamp(0, max_y) as usize;
             let wk = kernel[k];
             let u_row = &horiz[u * w..(u + 1) * w];
-            let d_row = &horiz[d * w..(d + 1) * w];
-            for x in 0..w {
-                out_row[x] += (u_row[x] + d_row[x]) * wk;
+            let d_row = &horiz[dep * w..(dep + 1) * w];
+            for ((o, up), down) in out_row.iter_mut().zip(u_row).zip(d_row) {
+                *o += (*up + *down) * wk;
             }
         }
     });
@@ -2905,6 +2978,174 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// M2 residency routing: only a plan with every CPU-split flag clear may
+    /// keep the detail device frame resident for grain. Pure; no GPU needed.
+    #[test]
+    fn resident_grain_plan_routes_only_pure_gpu_frames() {
+        let grain = FilmGrain {
+            kind: GrainKind::SilverRich,
+            impact: 50.0,
+            granularity: 50.0,
+            density: 0.0,
+        };
+        let base = crate::AdjustmentSet {
+            film_grain: grain.clone(),
+            noise_reduction: NoiseReduction {
+                color: 0.0,
+                single_pixel: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = |adj: &crate::AdjustmentSet| detail_plan(adj, true).resident_to_grain();
+
+        // Luminance NR + USM, no partial-route trigger.
+        let mut adj = base.clone();
+        adj.noise_reduction.luminance = 60.0;
+        adj.sharpening.amount = 180.0;
+        assert!(plan(&adj), "luminance + USM is a pure GPU frame");
+
+        // Single-pixel runs on the CPU *before* the GPU call, so it keeps the
+        // adjacency intact when moire does not force a CPU moire pass.
+        let mut adj = base.clone();
+        adj.noise_reduction.single_pixel = 63.0;
+        adj.noise_reduction.luminance = 60.0;
+        assert!(plan(&adj), "single-pixel-before is still adjacent");
+
+        // Colour NR forces the CPU ColorNoise2012 stage between detail and grain.
+        let mut adj = base.clone();
+        adj.noise_reduction.color = 40.0;
+        assert!(!plan(&adj), "CPU colour NR breaks the adjacency");
+
+        // Moire on a partially split frame goes back to the CPU.
+        let mut adj = base.clone();
+        adj.noise_reduction.single_pixel = 63.0;
+        adj.moire.amount = 50.0;
+        assert!(!plan(&adj), "CPU moire breaks the adjacency");
+
+        // Diffraction has no GPU twin and runs between moire and USM.
+        let mut adj = base.clone();
+        adj.lens.diffraction_enabled = true;
+        assert!(!plan(&adj), "CPU diffraction breaks the adjacency");
+
+        // A profiled lens sends lens correction back to the CPU.
+        let mut adj = base.clone();
+        adj.lens.use_profile = true;
+        assert!(!plan(&adj), "CPU lens breaks the adjacency");
+
+        // GPU disabled means there is no resident device frame at all.
+        let mut adj = base.clone();
+        adj.noise_reduction.luminance = 60.0;
+        assert!(!detail_plan(&adj, false).resident_to_grain());
+    }
+
+    /// The resident detail->grain handoff must be byte-identical to today's
+    /// two-copy path (detail D2H + grain H2D); the only difference is the
+    /// removed copy pair. Skipped unless `AURORA_DETAIL_GPU=1` requests a
+    /// hardware comparison.
+    #[cfg(windows)]
+    #[test]
+    fn resident_grain_handoff_matches_the_two_copy_path() {
+        if !std::env::var_os("AURORA_DETAIL_GPU").is_some_and(|value| value != "0") {
+            eprintln!("skipping: AURORA_DETAIL_GPU is not set");
+            return;
+        }
+        let (w, h) = (63usize, 47usize);
+        let bytes = w * h * 4;
+        let base: Vec<u8> = (0..bytes).map(|i| ((i * 73 + i / 7) % 256) as u8).collect();
+        let cases = [
+            // Composite grain: goes through plane + erf blur + row stats.
+            (60.0f32, 180.0f32, GrainKind::SilverRich, 70.0f32, 20.0f32),
+            // v1 grain: a single in-place kernel.
+            (60.0, 0.0, GrainKind::FineGrain, 50.0, 50.0),
+        ];
+        let saved = std::env::var_os("AURORA_DETAIL_GPU");
+        let saved_grain = std::env::var_os("AURORA_PIXEL_GRAIN_GPU");
+        unsafe {
+            std::env::set_var("AURORA_DETAIL_GPU", "1");
+            std::env::set_var("AURORA_PIXEL_GRAIN_GPU", "1");
+        }
+        for (luminance, sharpen, kind, impact, granularity) in cases {
+            let adj = crate::AdjustmentSet {
+                noise_reduction: NoiseReduction {
+                    luminance,
+                    details: 35.0,
+                    color: 0.0,
+                    single_pixel: 0.0,
+                },
+                sharpening: Sharpening {
+                    amount: sharpen,
+                    radius: 0.8,
+                    threshold: 1.0,
+                    halo_suppression: 20.0,
+                },
+                moire: Moire::default(),
+                film_grain: FilmGrain { kind, impact, granularity, density: 0.0 },
+                ..Default::default()
+            };
+            assert!(
+                detail_plan(&adj, true).resident_to_grain(),
+                "case must route to the resident handoff"
+            );
+
+            // Path A: today's two copies.
+            let mut classic = base.clone();
+            assert!(detail_gpu::post_process(
+                &mut classic,
+                w,
+                h,
+                &adj.noise_reduction,
+                &adj.moire,
+                &adj.sharpening,
+                &adj.lens,
+                1.0,
+            ));
+            assert!(crate::mock::pixel_gpu::grain_stage(&mut classic, w, h, &adj.film_grain, 1.0));
+
+            // Path B: resident handoff. One H2D + one D2H in total.
+            let ledger_before = crate::mock::gpu_runtime::vram_stats().resident_bytes;
+            let savings_before = detail_gpu::resident_savings();
+            let mut resident = base.clone();
+            let outcome = detail_gpu::post_process_resident_grain(
+                &mut resident,
+                w,
+                h,
+                &adj.noise_reduction,
+                &adj.moire,
+                &adj.sharpening,
+                &adj.lens,
+                1.0,
+                &adj.film_grain,
+            );
+            assert_eq!(outcome, detail_gpu::ResidentGrain::Applied, "resident handoff ran");
+            assert_eq!(resident, classic, "resident handoff must be byte-identical");
+
+            // The handoff takes no new lease and releases none: the detail
+            // frame stays billed once to `detail`.
+            assert_eq!(
+                crate::mock::gpu_runtime::vram_stats().resident_bytes,
+                ledger_before,
+                "handoff must not recharge or release the frame"
+            );
+            let savings_after = detail_gpu::resident_savings();
+            assert_eq!(savings_after.0, savings_before.0 + 1, "one H2D skipped");
+            assert_eq!(savings_after.1, savings_before.1 + bytes as u64, "H2D bytes skipped");
+            assert_eq!(savings_after.2, savings_before.2 + 1, "one D2H skipped");
+            assert_eq!(savings_after.3, savings_before.3 + bytes as u64, "D2H bytes skipped");
+        }
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("AURORA_DETAIL_GPU", value),
+                None => std::env::remove_var("AURORA_DETAIL_GPU"),
+            }
+            match saved_grain {
+                Some(value) => std::env::set_var("AURORA_PIXEL_GRAIN_GPU", value),
+                None => std::env::remove_var("AURORA_PIXEL_GRAIN_GPU"),
+            }
+        }
+    }
+
+
     #[test]
     fn vertical_blur_preserves_sum_order_at_edges() {
         for (w, h) in [(1, 1), (1, 17), (19, 1), (37, 23)] {
@@ -2921,6 +3162,93 @@ mod tests {
                         }
                         assert_eq!(out[y * w + x].to_bits(), (sum * (1.0 / (2 * r + 1) as f32)).to_bits());
                     }
+                }
+            }
+        }
+    }
+
+    /// Frozen copy of the pre-vectorisation separable Gaussian, the bit-exact
+    /// oracle for `gaussian_blur_sep`.
+    fn gaussian_blur_sep_scalar(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+        let half = gaussian_support(sigma);
+        let mut kernel = vec![0.0f32; half + 1];
+        let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+        let mut sum = 1.0f32;
+        kernel[0] = 1.0;
+        for k in 1..=half {
+            let wk = (-((k * k) as f32) * inv2s2).exp();
+            kernel[k] = wk;
+            sum += 2.0 * wk;
+        }
+        let inv_sum = 1.0 / sum;
+        for v in &mut kernel {
+            *v *= inv_sum;
+        }
+
+        let max_x = (w - 1) as isize;
+        let mut horiz = vec![0.0f32; w * h];
+        for y in 0..h {
+            let row = &src[y * w..(y + 1) * w];
+            let out_row = &mut horiz[y * w..(y + 1) * w];
+            for x in 0..w {
+                let mut acc = row[x] * kernel[0];
+                for k in 1..=half {
+                    let l = (x as isize - k as isize).clamp(0, max_x) as usize;
+                    let r = (x as isize + k as isize).clamp(0, max_x) as usize;
+                    acc += (row[l] + row[r]) * kernel[k];
+                }
+                out_row[x] = acc;
+            }
+        }
+
+        let max_y = (h - 1) as isize;
+        let mut out = vec![0.0f32; w * h];
+        for y in 0..h {
+            let out_row = &mut out[y * w..(y + 1) * w];
+            for x in 0..w {
+                out_row[x] = horiz[y * w + x] * kernel[0];
+            }
+            for k in 1..=half {
+                let u = (y as isize - k as isize).clamp(0, max_y) as usize;
+                let d = (y as isize + k as isize).clamp(0, max_y) as usize;
+                let wk = kernel[k];
+                let u_row = &horiz[u * w..(u + 1) * w];
+                let d_row = &horiz[d * w..(d + 1) * w];
+                for x in 0..w {
+                    out_row[x] += (u_row[x] + d_row[x]) * wk;
+                }
+            }
+        }
+        out
+    }
+
+    /// Deterministic LCG; avoids external fixtures while still exercising
+    /// arbitrary f32 values.
+    fn gaussian_lcg_plane(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gaussian_blur_sep_matches_scalar_reference_bit_exactly() {
+        // Interior split only applies when w > 2*half; these cover both the
+        // split path and the all-clamped fallback, with non-8-aligned widths
+        // and heights.
+        for (w, h) in [(1usize, 1usize), (1, 17), (19, 1), (3, 64), (64, 3), (33, 7), (37, 23), (65, 5)] {
+            let src = gaussian_lcg_plane(w * h, 0xa076_1d64_78bd_642f ^ ((w * 977 + h) as u64));
+            // half = clamp(ceil(3*sigma), 1, 24): 2, 3, 6, 12, 24.
+            for sigma in [0.35f32, 0.8, 2.0, 4.0, 12.0] {
+                let expected = gaussian_blur_sep_scalar(&src, w, h, sigma);
+                let actual = gaussian_blur_sep(&src, w, h, sigma);
+                for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(a.to_bits(), e.to_bits(), "w={w} h={h} sigma={sigma} i={i}");
                 }
             }
         }

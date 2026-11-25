@@ -132,15 +132,20 @@ fn box_blur(y: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     });
     let mut out = vec![0.0f32; w * h];
     out.par_chunks_mut(w).enumerate().for_each(|(yy, line)| {
-        for (xx, v) in line.iter_mut().enumerate() {
-            let mut acc = 0.0f32;
-            // Rows outside the frame repeat the edge row, matching the
-            // horizontal pass.
-            for k in -(r as isize)..=(r as isize) {
-                let row = (yy as isize + k).clamp(0, h as isize - 1) as usize;
-                acc += tmp[row * w + xx];
+        // Rows outside the frame repeat the edge row, matching the horizontal
+        // pass. Accumulating whole rows in `k` order keeps, for every `x`, the
+        // same additions in the same order as the per-pixel reference while
+        // turning the inner loop into a contiguous branch-free f32 add.
+        line.fill(0.0);
+        for k in -(r as isize)..=(r as isize) {
+            let row = (yy as isize + k).clamp(0, h as isize - 1) as usize;
+            let src_row = &tmp[row * w..(row + 1) * w];
+            for (sum, value) in line.iter_mut().zip(src_row) {
+                *sum += *value;
             }
-            *v = acc * inv;
+        }
+        for value in line.iter_mut() {
+            *value *= inv;
         }
     });
     out
@@ -512,6 +517,72 @@ pub(crate) fn legacy_apply(rgba: &mut [u8], w: usize, h: usize, clarity: &Clarit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frozen copy of the pre-vectorisation `box_blur` used as the bit-exact
+    /// oracle. Do not "improve" this: it must keep the original per-pixel
+    /// accumulation order.
+    fn box_blur_scalar_reference(y: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        if r == 0 {
+            return y.to_vec();
+        }
+        let inv = 1.0 / (2 * r + 1) as f32;
+        let mut tmp = vec![0.0f32; w * h];
+        for yy in 0..h {
+            let row = &y[yy * w..(yy + 1) * w];
+            let mut acc = 0.0f32;
+            for k in -(r as isize)..=(r as isize) {
+                acc += row[(k.max(0) as usize).min(w - 1)];
+            }
+            for xx in 0..w {
+                if xx > 0 {
+                    acc += row[(xx + r).min(w - 1)];
+                    acc -= row[(xx as isize - r as isize - 1).max(0) as usize];
+                }
+                tmp[yy * w + xx] = acc * inv;
+            }
+        }
+        let mut out = vec![0.0f32; w * h];
+        for yy in 0..h {
+            for xx in 0..w {
+                let mut acc = 0.0f32;
+                for k in -(r as isize)..=(r as isize) {
+                    let row = (yy as isize + k).clamp(0, h as isize - 1) as usize;
+                    acc += tmp[row * w + xx];
+                }
+                out[yy * w + xx] = acc * inv;
+            }
+        }
+        out
+    }
+
+    /// Deterministic LCG so the cross-check is reproducible without external
+    /// fixtures.
+    fn lcg_plane(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32) / ((1u64 << 24) as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn box_blur_matches_scalar_reference_bit_exactly() {
+        // 1x1, single-row/column edges, non-8-aligned widths and heights.
+        for (w, h) in [(1usize, 1usize), (1, 17), (19, 1), (3, 64), (64, 3), (37, 23), (33, 7)] {
+            let y = lcg_plane(w * h, 0x9e37_79b9_7f4a_7c15 ^ ((w * 131 + h) as u64));
+            for r in [0usize, 1, 2, 5, 23] {
+                let expected = box_blur_scalar_reference(&y, w, h, r);
+                let actual = box_blur(&y, w, h, r);
+                for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(a.to_bits(), e.to_bits(), "w={w} h={h} r={r} i={i}");
+                }
+            }
+        }
+    }
 
     /// Full-frame CPU cost of the two halves of the stage. Run with
     /// `cargo test --release -p aurora-engine --lib --features z6iii-raw-export

@@ -83,6 +83,11 @@ pub(crate) mod metal;
 #[path = "mock/skin_whiten_metal.rs"]
 pub mod skin_whiten_metal;
 
+// Roadmap M4 (section 8.2): pure CPU/GPU cost model, EWMA/quantile calibration,
+// hysteresis and failure classification. Model-only: no scheduling, no env, no IO;
+// nothing in the pipeline calls this yet.
+pub mod compute_cost;
+
 pub fn prewarm_gpu() {
     #[cfg(windows)]
     mock::prewarm_gpu();
