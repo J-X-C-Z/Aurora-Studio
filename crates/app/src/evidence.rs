@@ -2,9 +2,10 @@
 //!
 //! 数据来源是 `03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv`
 //! 的逐字节副本 `docs/frontend-contract/portrait-capability-registry-20261124.tsv`
-//! （SHA256 `f3986958a2415cd08bdcd3a6a98d5b2da6a23df90bfd7c4d68d0f41b8ccc9bc1`，
-//! 76393 字节）。登记不等于可用：七级证据相互独立，低级证据不能推出高级证据，
-//! `未验证` 永远不是通过。
+//! （SHA256 `d1b92c6f0b1d15b2807f917c1298c5cbac4f72449c38e9f4e6af92a28fed85c4`，
+//! 86739 字节）。`crates/portrait/assets/portrait/` 下的副本必须与它逐字节相同；
+//! 测试同时比对两份内嵌副本，并在仓库内可定位时比对 canonical 文件。
+//! 登记不等于可用：七级证据相互独立，低级证据不能推出高级证据，`未验证` 永远不是通过。
 //!
 //! 前端只在 ev5（应用主预览接入）有证据时才把效果呈现为可用；ev6（原厂同图对拍）
 //! 与 ev7（真实照片验收）单独展示，不能被 ev5 代替。
@@ -20,9 +21,9 @@ pub const UNVERIFIED: &str = "未验证";
 /// 嵌入的能力表；重新同步时必须与本目录下的 TSV 完全一致。
 pub const REGISTRY: &str = include_str!("../../../docs/frontend-contract/portrait-capability-registry-20261124.tsv");
 pub const REGISTRY_SOURCE: &str = "03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv";
-pub const REGISTRY_SHA256: &str = "f3986958a2415cd08bdcd3a6a98d5b2da6a23df90bfd7c4d68d0f41b8ccc9bc1";
+pub const REGISTRY_SHA256: &str = "d1b92c6f0b1d15b2807f917c1298c5cbac4f72449c38e9f4e6af92a28fed85c4";
 /// 字节数；随文件同步变化的快速哨兵，防止副本与 SHA 记录脱节。
-const REGISTRY_BYTES: usize = 76393;
+const REGISTRY_BYTES: usize = 86739;
 
 /// 七级证据，顺序与能力表一致。索引 4 是 ev5（应用主预览接入）。
 pub const LEVELS: [&str; 7] = [
@@ -245,6 +246,27 @@ pub fn preview_count_in(pred: impl Fn(i64) -> bool) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    /// The other engine-embedded copy, compiled by `aurora-portrait` for
+    /// `ImageEngine::portrait_capability_registry_tsv()`.
+    const PORTRAIT_CRATE_REGISTRY: &str =
+        include_str!("../../portrait/assets/portrait/capability-registry-20261124.tsv");
+
+    /// Walk up from this crate to the Aurora Studio root and load the canonical
+    /// table. Returns `None` for a checkout where the sibling `03_algorithms/`
+    /// tree is absent (the engine repo can be built standalone).
+    fn canonical_registry() -> Option<String> {
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        loop {
+            let candidate = dir.join("03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv");
+            if candidate.is_file() {
+                return std::fs::read_to_string(candidate).ok();
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
     #[test]
     fn embedded_copy_matches_the_registry_record() {
         assert_eq!(REGISTRY.len(), REGISTRY_BYTES, "registry copy changed; update REGISTRY_SHA256 and this size");
@@ -252,6 +274,29 @@ mod tests {
         for line in REGISTRY.lines() {
             assert_eq!(line.split('\t').count(), 18, "malformed registry line: {line}");
         }
+    }
+
+    #[test]
+    fn both_embedded_copies_are_byte_identical() {
+        assert_eq!(
+            REGISTRY, PORTRAIT_CRATE_REGISTRY,
+            "docs/frontend-contract and crates/portrait/assets copies of the capability registry diverged"
+        );
+    }
+
+    #[test]
+    fn embedded_copy_matches_canonical_registry_when_in_repo() {
+        let Some(canonical) = canonical_registry() else {
+            eprintln!(
+                "canonical registry not reachable from {}; skip in standalone checkout",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            return;
+        };
+        assert_eq!(
+            REGISTRY, canonical,
+            "embedded registry drifted from 03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv"
+        );
     }
 
     #[test]

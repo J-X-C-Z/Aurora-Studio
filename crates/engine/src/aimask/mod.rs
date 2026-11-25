@@ -181,6 +181,34 @@ fn mask_bytes(plane: &MaskPlane) -> u64 {
         .saturating_mul(std::mem::size_of::<f32>() as u64)
 }
 
+/// How many cache keys share each plane. `compute_ai_mask` stores one subject
+/// plane under the base key plus the `Subject`, `Person` and `Clothing` alias
+/// keys, and each entry adds an `Arc` clone. A bare
+/// `Arc::strong_count(plane) > 1` therefore sees the aliases as outside users
+/// and can never reclaim any of them, so the LRU would never shrink. Counting
+/// the keys that share a plane is what makes the count mean "someone outside
+/// the cache still holds it".
+fn mask_owner_counts(masks: &ByteLru<Arc<MaskPlane>>) -> HashMap<usize, usize> {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for plane in masks.values() {
+        *counts.entry(Arc::as_ptr(plane) as usize).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// One eviction pass that protects only planes with references beyond the
+/// cache's own entries.
+fn evict_masks(masks: &mut ByteLru<Arc<MaskPlane>>) -> lru::Eviction<Arc<MaskPlane>> {
+    let owners = mask_owner_counts(masks);
+    masks.evict(|_, plane| {
+        let cache_owners = owners
+            .get(&(Arc::as_ptr(plane) as usize))
+            .copied()
+            .unwrap_or(1);
+        Arc::strong_count(plane) > cache_owners
+    })
+}
+
 /// Caches one computed mask under the key `ImageEngine::compute_ai_mask` hands
 /// back to the interface. Eviction is byte-budgeted: the key already carries
 /// the image/variant/kind identity, so an evicted plane is simply recomputed.
@@ -191,7 +219,7 @@ pub fn store(key: &str, plane: Arc<MaskPlane>) {
     let (previous, eviction) = {
         let mut masks = masks().lock().unwrap_or_else(|e| e.into_inner());
         let previous = masks.insert(key.to_string(), plane, bytes);
-        let eviction = masks.evict(|_, plane| Arc::strong_count(plane) > 1);
+        let eviction = evict_masks(&mut masks);
         (previous, eviction)
     };
     drop(previous);
@@ -202,7 +230,7 @@ pub fn lookup(key: &str) -> Option<Arc<MaskPlane>> {
     let (plane, eviction) = {
         let mut masks = masks().lock().unwrap_or_else(|e| e.into_inner());
         let plane = masks.get(key).cloned();
-        let eviction = masks.evict(|_, plane| Arc::strong_count(plane) > 1);
+        let eviction = evict_masks(&mut masks);
         (plane, eviction)
     };
     drop(eviction);
@@ -1663,5 +1691,41 @@ mod tests {
         assert_eq!(eviction.removed.len(), 1);
         assert_eq!(eviction.removed[0].0, "first");
         assert_eq!(cache.bytes(), 8);
+    }
+
+    #[test]
+    fn mask_cache_reclaims_a_plane_shared_by_alias_keys() {
+        // `compute_ai_mask` stores one subject plane under the base key and
+        // the Subject/Person/Clothing aliases. Each entry's `Arc` clone keeps
+        // the plain strong count above one, so counting only the cache's own
+        // owners is what lets this group ever shrink.
+        let mut cache: super::lru::ByteLru<Arc<MaskPlane>> = super::lru::ByteLru::new(5, 16);
+        let plane = Arc::new(MaskPlane::new(1, 1, vec![0.5]));
+        let bytes = mask_bytes(&plane);
+        assert_eq!(bytes, 4);
+        let _ = cache.insert("base".to_string(), plane.clone(), bytes);
+        let _ = cache.insert("Subject".to_string(), plane.clone(), bytes);
+        let _ = cache.insert("Person".to_string(), plane.clone(), bytes);
+        drop(plane);
+        assert_eq!(cache.bytes(), 12);
+
+        // A bare `strong_count > 1` predicate protects all three entries from
+        // each other and never reclaims anything.
+        let mut plain: super::lru::ByteLru<Arc<MaskPlane>> = super::lru::ByteLru::new(5, 16);
+        let plane = Arc::new(MaskPlane::new(1, 1, vec![0.5]));
+        let _ = plain.insert("base".to_string(), plane.clone(), bytes);
+        let _ = plain.insert("Subject".to_string(), plane.clone(), bytes);
+        let _ = plain.insert("Person".to_string(), plane.clone(), bytes);
+        drop(plane);
+        let eviction = plain.evict(|_, plane| Arc::strong_count(plane) > 1);
+        assert!(eviction.removed.is_empty(), "the old predicate pins the group");
+        assert_eq!(eviction.pending, 2, "only the two entries needed to cover 7 bytes");
+
+        // Owner-aware eviction shrinks the group to the byte budget.
+        let eviction = evict_masks(&mut cache);
+        assert_eq!(eviction.removed.len(), 2, "three 4-byte aliases into 5 bytes");
+        assert_eq!(eviction.pending, 0, "no entry has an outside holder");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 4);
     }
 }

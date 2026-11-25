@@ -62,6 +62,84 @@ fn budget_error(failure: gpu_runtime::Failure) -> CudaError {
     CudaError::Unavailable("vram budget")
 }
 
+// ── staged transfer accounting (`AURORA_PERF`) ──────────────────────────────
+//
+// develop does not go through `gpu_runtime::Gpu`, so it has no per-stage
+// `Counters`. This is bookkeeping only: every `add` runs *after* the driver
+// call reported success and never changes what is sent to or read from the
+// device. `run_io` holds the stage's `state()` lock across the whole band, so
+// one `BandTransfers` belongs to exactly one band and cannot mix two bands.
+
+/// One transfer phase: successful call count and bytes moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Transfer {
+    calls: u64,
+    bytes: u64,
+}
+
+impl Transfer {
+    fn add(&mut self, bytes: usize) {
+        self.calls += 1;
+        self.bytes += bytes as u64;
+    }
+}
+
+/// The five transfer phases of one band, in the order `run_pool` performs them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BandTransfers {
+    io_h2d: Transfer,
+    params_h2d: Transfer,
+    gain_h2d: Transfer,
+    /// Static-table uploads actually performed (fingerprint misses only).
+    tables_h2d: Transfer,
+    io_d2h: Transfer,
+    /// develop has no stream, so the final blocking D2H drains the default
+    /// stream. Exactly one host barrier per completed band.
+    host_barriers: u64,
+}
+
+impl BandTransfers {
+    fn h2d_calls(&self) -> u64 {
+        self.io_h2d.calls + self.params_h2d.calls + self.gain_h2d.calls + self.tables_h2d.calls
+    }
+
+    fn h2d_bytes(&self) -> u64 {
+        self.io_h2d.bytes + self.params_h2d.bytes + self.gain_h2d.bytes + self.tables_h2d.bytes
+    }
+
+    fn d2h_calls(&self) -> u64 {
+        self.io_d2h.calls
+    }
+
+    fn d2h_bytes(&self) -> u64 {
+        self.io_d2h.bytes
+    }
+
+    /// One JSON line on the existing `AURORA_PERF` channel. These field names
+    /// are new; no existing event or field changes meaning.
+    fn to_perf_json(&self, width: usize, rows: usize, band_ms: f64) -> String {
+        format!(
+            "{{\"event\":\"gpu_develop_transfers\",\"width\":{width},\"rows\":{rows},\
+\"h2d_calls\":{},\"h2d_bytes\":{},\"d2h_calls\":{},\"d2h_bytes\":{},\
+\"host_barriers\":{},\"io_h2d_calls\":{},\"io_h2d_bytes\":{},\
+\"params_h2d_calls\":{},\"params_h2d_bytes\":{},\
+\"gain_h2d_calls\":{},\"gain_h2d_bytes\":{},\
+\"tables_h2d_calls\":{},\"tables_h2d_bytes\":{},\"band_ms\":{band_ms:.3}}}",
+            self.h2d_calls(), self.h2d_bytes(), self.d2h_calls(), self.d2h_bytes(),
+            self.host_barriers,
+            self.io_h2d.calls, self.io_h2d.bytes,
+            self.params_h2d.calls, self.params_h2d.bytes,
+            self.gain_h2d.calls, self.gain_h2d.bytes,
+            self.tables_h2d.calls, self.tables_h2d.bytes,
+        )
+    }
+}
+
+/// Same replay gate as `gpu_runtime::vram_maybe_emit_perf`.
+fn perf_enabled() -> bool {
+    std::env::var_os("AURORA_PERF_REPLAY").is_some()
+}
+
 const FILM_MAX: usize = 16;
 const CLUT_N: usize = 49;
 const CLUT_NODES: usize = CLUT_N * CLUT_N * CLUT_N;
@@ -1425,11 +1503,18 @@ impl Pool {
     /// The per-band parameters (frame size, region, gain flag) are not part
     /// of any fingerprint: they live in the parameter table, which is
     /// uploaded for every band.
-    fn upload_static_tables(&mut self, params: &DevelopParams) -> Result<(), CudaError> {
+    fn upload_static_tables(
+        &mut self,
+        params: &DevelopParams,
+        transfers: &mut BandTransfers,
+    ) -> Result<(), CudaError> {
         let luts = luts_parts(params);
         if !source_matches(self.tables.luts.as_deref(), &luts) {
             let table = luts_floats(params);
             let outcome = self.gpu.upload_buffer(&self.luts.0, as_bytes(&table));
+            if outcome.is_ok() {
+                transfers.tables_h2d.add(table.len() * 4);
+            }
             commit_upload(&mut self.tables.luts, &luts, outcome)?;
         }
 
@@ -1441,6 +1526,9 @@ impl Pool {
                 .map(|e| e.floats.clone())
                 .unwrap_or_else(|| vec![0.0; E_SKIN_BASE]);
             let outcome = self.gpu.upload_buffer(&self.editor.0, as_bytes(&table));
+            if outcome.is_ok() {
+                transfers.tables_h2d.add(table.len() * 4);
+            }
             commit_upload(&mut self.tables.editor, &editor, outcome)?;
         }
 
@@ -1452,6 +1540,9 @@ impl Pool {
                 .map(banding_bytes)
                 .unwrap_or_else(|| vec![0u8; 256 * 4 + 512]);
             let outcome = self.gpu.upload_buffer(&self.banding.0, &table);
+            if outcome.is_ok() {
+                transfers.tables_h2d.add(table.len());
+            }
             commit_upload(&mut self.tables.banding, &banding, outcome)?;
         }
 
@@ -1464,6 +1555,9 @@ impl Pool {
             if !source_matches(self.tables.c1.as_deref(), &c1) {
                 let table = c1_bytes(stage);
                 let outcome = self.gpu.upload_buffer(&self.c1.0, &table);
+                if outcome.is_ok() {
+                    transfers.tables_h2d.add(table.len());
+                }
                 commit_upload(&mut self.tables.c1, &c1, outcome)?;
             }
         }
@@ -2184,6 +2278,9 @@ fn run_io(
     floats[P_HAS_GAIN] = if gain_plane.is_some() { 1.0 } else { 0.0 };
 
     let mut lock = state().lock().unwrap_or_else(|error| error.into_inner());
+    let perf = perf_enabled();
+    let started = perf.then(std::time::Instant::now);
+    let mut transfers = BandTransfers::default();
     let result = match &mut *lock {
         State::Unavailable => Err(CudaError::Unavailable("CUDA develop path is unavailable")),
         State::NotTried => {
@@ -2194,12 +2291,13 @@ fn run_io(
                     if !budget_refused(&err) {
                         *lock = State::Unavailable;
                     }
+                    // No band ran; nothing to attribute.
                     return Err(err);
                 }
             };
             let result = run_with_pool(
                 &mut pool, io, &floats, params, gain_plane, width, height, io_bytes, gain_bytes,
-                editor_bytes,
+                editor_bytes, &mut transfers,
             );
             match result {
                 Ok(()) => {
@@ -2216,9 +2314,16 @@ fn run_io(
         }
         State::Ready(pool) => run_with_pool(
             pool, io, &floats, params, gain_plane, width, height, io_bytes, gain_bytes,
-            editor_bytes,
+            editor_bytes, &mut transfers,
         ),
     };
+    if let Some(started) = started {
+        let band_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "AURORA_PERF {}",
+            transfers.to_perf_json(width, height, band_ms)
+        );
+    }
     // One throttled `AURORA_PERF {"event":"gpu_vram",...}` line when replaying.
     gpu_runtime::vram_maybe_emit_perf("develop");
     result
@@ -2237,10 +2342,11 @@ fn run_with_pool(
     io_bytes: usize,
     gain_bytes: usize,
     editor_bytes: usize,
+    transfers: &mut BandTransfers,
 ) -> Result<(), CudaError> {
     pool.ensure(io_bytes, gain_bytes, editor_bytes)?;
-    pool.upload_static_tables(params)?;
-    run_pool(pool, io, floats, gain_plane, width, height, params.c1.is_some())
+    pool.upload_static_tables(params, transfers)?;
+    run_pool(pool, io, floats, gain_plane, width, height, params.c1.is_some(), transfers)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2252,12 +2358,19 @@ fn run_pool(
     width: usize,
     height: usize,
     c1_present: bool,
+    transfers: &mut BandTransfers,
 ) -> Result<(), CudaError> {
     let gpu = pool.gpu.as_ref();
-    gpu.upload_buffer(&pool.io.0, as_bytes(io))?;
-    gpu.upload_buffer(&pool.params.0, as_bytes(floats))?;
+    let io_h2d = as_bytes(io);
+    gpu.upload_buffer(&pool.io.0, io_h2d)?;
+    transfers.io_h2d.add(io_h2d.len());
+    let params_h2d = as_bytes(floats);
+    gpu.upload_buffer(&pool.params.0, params_h2d)?;
+    transfers.params_h2d.add(params_h2d.len());
     if let Some(plane) = gain_plane {
-        gpu.upload_buffer(&pool.gain.0, as_bytes(plane))?;
+        let gain_h2d = as_bytes(plane);
+        gpu.upload_buffer(&pool.gain.0, gain_h2d)?;
+        transfers.gain_h2d.add(gain_h2d.len());
     }
 
     let mut io_handle = pool.io.0.handle();
@@ -2286,7 +2399,12 @@ fn run_pool(
             ptr(&mut right),
         ],
     )?;
-    gpu.download_buffer(&pool.io.0, as_bytes_mut(io))?;
+    let io_d2h = as_bytes_mut(io);
+    gpu.download_buffer(&pool.io.0, io_d2h)?;
+    transfers.io_d2h.add(io_d2h.len());
+    // Blocking D2H is the one host barrier of a synchronous band: it drains
+    // the default stream before the host reads the developed pixels.
+    transfers.host_barriers += 1;
     Ok(())
 }
 
@@ -3171,6 +3289,62 @@ mod tests {
 
     fn code8(v: f32) -> i32 {
         (v.clamp(0.0, 1.0) * 255.0 + 0.5) as i32
+    }
+
+    // ── staged transfer counters (pure arithmetic; no CUDA device) ────────
+
+    #[test]
+    fn transfer_add_counts_calls_and_bytes() {
+        let mut t = Transfer::default();
+        assert_eq!(t, Transfer::default());
+        t.add(16);
+        t.add(16);
+        assert_eq!(t.calls, 2);
+        assert_eq!(t.bytes, 32);
+    }
+
+    #[test]
+    fn band_totals_cover_all_five_phases_without_double_counting() {
+        let mut b = BandTransfers::default();
+        b.io_h2d.add(16_000);
+        b.params_h2d.add(488);
+        b.gain_h2d.add(4_000);
+        b.tables_h2d.add(2_500);
+        b.io_d2h.add(16_000);
+        b.host_barriers = 1;
+        assert_eq!(b.h2d_calls(), 4);
+        assert_eq!(b.h2d_bytes(), 16_000 + 488 + 4_000 + 2_500);
+        assert_eq!(b.d2h_calls(), 1);
+        assert_eq!(b.d2h_bytes(), 16_000);
+        assert_eq!(b.host_barriers, 1);
+        // Per-band attribution: a second band starts empty and does not see
+        // the first band's copies or barrier.
+        let first = b;
+        let mut second = BandTransfers::default();
+        second.io_h2d.add(100);
+        assert_eq!(first.io_d2h.bytes, 16_000);
+        assert_eq!(second.io_d2h.bytes, 0);
+        assert_eq!(first.host_barriers, 1);
+        assert_eq!(second.host_barriers, 0);
+        assert_eq!(second.h2d_bytes(), 100);
+    }
+
+    #[test]
+    fn perf_json_reports_phase_breakdown_and_band_shape() {
+        let mut b = BandTransfers::default();
+        b.io_h2d.add(16 * 6048 * 256);
+        b.params_h2d.add(488);
+        b.io_d2h.add(16 * 6048 * 256);
+        b.host_barriers = 1;
+        let json = b.to_perf_json(6048, 256, 1.25);
+        assert!(!json.starts_with("AURORA_PERF"), "the line is added by the caller");
+        assert!(json.contains("\"event\":\"gpu_develop_transfers\""));
+        assert!(json.contains("\"width\":6048,\"rows\":256"));
+        assert!(json.contains("\"h2d_calls\":2,\"h2d_bytes\":24773096"));
+        assert!(json.contains("\"d2h_calls\":1,\"d2h_bytes\":24772608"));
+        assert!(json.contains("\"host_barriers\":1"));
+        assert!(json.contains("\"gain_h2d_calls\":0,\"gain_h2d_bytes\":0"));
+        assert!(json.contains("\"band_ms\":1.250"));
     }
 
     fn compare(cpu: &[[f32; 3]], gpu: &[[f32; 3]]) -> (i32, f32, usize) {

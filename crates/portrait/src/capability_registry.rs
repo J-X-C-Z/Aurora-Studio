@@ -1,10 +1,12 @@
 //! Portrait capability registry (PP-1).
 //!
 //! The canonical table is
-//! `03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv`; a
+//! `03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv`. A
 //! byte-identical copy ships at
 //! `assets/portrait/capability-registry-20261124.tsv` so the crate stays
-//! self-contained and offline-buildable.
+//! self-contained and offline-buildable, and `crates/app/src/evidence.rs`
+//! embeds the same bytes from `docs/frontend-contract/`. The crate test below
+//! asserts both engine copies stay byte-identical.
 //!
 //! The seven evidence levels are independent. `未验证` is never a pass, and a
 //! lower level never implies a higher one. Registration is not completion: a
@@ -168,6 +170,18 @@ mod tests {
     use super::*;
     use crate::catalog;
     use std::collections::BTreeSet;
+
+    /// `crates/app/src/evidence.rs` embeds this same table from the docs tree.
+    const APP_EVIDENCE_COPY: &str =
+        include_str!("../../../docs/frontend-contract/portrait-capability-registry-20261124.tsv");
+
+    #[test]
+    fn engine_embedded_copies_are_byte_identical() {
+        assert_eq!(
+            REGISTRY_TSV, APP_EVIDENCE_COPY,
+            "assets/portrait and docs/frontend-contract capability registries diverged"
+        );
+    }
 
     #[test]
     fn header_has_the_contract_columns() {

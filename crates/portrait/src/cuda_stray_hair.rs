@@ -77,14 +77,17 @@ fn check<'a>(
         return Ok(None);
     }
     let degree = unit(params.native_degree, "PF90088_NATIVE_DEGREE")?;
-    unit(params.native_person_area, "PF90088_NATIVE_PERSON_AREA")?;
-    unit(
-        params.native_background_area,
-        "PF90088_NATIVE_BACKGROUND_AREA",
-    )?;
-    if degree <= 0.0 {
+    // Same recovered gate as the CPU consumer: active only when `d > 0.001`
+    // (`0x8BCBA40`, doubled into `xmm9`; `ucomiss` + `seta`).
+    if degree <= crate::kernels::hair_body::STRAY_HAIR_ACTIVE_GATE {
         return Ok(None);
     }
+    // PF90113 / PF90114 only matter once the main slider is active.
+    unit(params.native_person_area, "PF90113_NATIVE_PERSON_AREA")?;
+    unit(
+        params.native_background_area,
+        "PF90114_NATIVE_BACKGROUND_AREA",
+    )?;
 
     let repair = repair.ok_or(Refusal::MissingInput("PF90088_HAIRFLY_V1"))?;
     repair
@@ -261,5 +264,28 @@ mod tests {
     fn uniform_block_is_thirty_two_bytes() {
         assert_eq!(std::mem::size_of::<Uniforms>(), 32);
         assert_eq!(std::mem::align_of::<Uniforms>(), 4);
+    }
+
+    #[test]
+    fn native_gate_matches_the_cpu_consumer() {
+        let source = Image::solid(1, 1, [1, 2, 3, 4]);
+        let repair = Image::solid(1, 1, [5, 6, 7, 8]);
+        let mask = [255u8; 1];
+
+        let mut at_gate = params();
+        at_gate.native_degree = crate::kernels::hair_body::STRAY_HAIR_ACTIVE_GATE;
+        assert!(
+            check(&source, at_gate, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut active = params();
+        active.native_degree = 0.0011;
+        assert!(
+            check(&source, active, Some(&repair), Some(&mask), None, None)
+                .unwrap()
+                .is_some()
+        );
     }
 }

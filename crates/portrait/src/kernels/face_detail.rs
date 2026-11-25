@@ -36,7 +36,7 @@ pub const META: &[EffectMeta] = &[
     EffectMeta { pf: 90021, key: "lipMakeupEnhance", label: "Lip makeup enhance", access: Access::Cpu, inputs: &["mouth mask", "LipsLUT", "LipDodgeLUT"] },
     EffectMeta { pf: 90032, key: "eyeMakeupDegree", label: "Eye image makeup", access: Access::Cpu, inputs: &["material RGBA texture", "EyeMaskType=10 mask (RGB)", "mask/material UV", "MixColor RGBA", "Opacity percent", "degree01", "FilterType 41/42/43/44"] },
     EffectMeta { pf: 90033, key: "suitMakeupDegree", label: "Suit makeup (ordered passes)", access: Access::Cpu, inputs: &["ordered pass list", "per-pass material RGBA", "per-pass mask + UV", "MixColor/opacity/degree/shelter/region", "FilterType"] },
-    EffectMeta { pf: 90087, key: "PF90087_UI_KEY_NOT_RECOVERED", label: "Hair seam fill", access: Access::Cpu, inputs: &["part-line mask", "hair mask"] },
+    EffectMeta { pf: 90087, key: "hairPartFill", label: "Hair seam fill", access: Access::Cpu, inputs: &["PF90087_PART_DEGREE_MAP", "PF90087_PART_LINE_MASK", "PF90087_HAIR_MASK", "PF90087_REPAIR_RGB", "PF90087_REPAIR_MASK"] },
     EffectMeta { pf: 90130, key: "glassesGlareRemoval", label: "Glasses glare removal", access: Access::Cpu, inputs: &["network mask", "effect RGB", "lens mask"] },
     EffectMeta { pf: 100004, key: "redBloodRemoval", label: "Eye red blood removal", access: Access::Cpu, inputs: &["model RGB", "model alpha"] },
     EffectMeta { pf: 100005, key: "eyeWhitePurify", label: "Eye white purify", access: Access::Refused, inputs: &["eye mask", "8-channel model output", "vendor pixel law (open)"] },
@@ -3700,6 +3700,59 @@ pub struct HairSeamBlendResult {
     pub alpha_changed: u32,
 }
 
+/// PF90087 (`HairSeamV0Pipeline`, id `0x15FE7`) activation gate. The fixed PE
+/// compares every per-part degree with the binary32 constant `0.001`
+/// (`0x8BEE250`, `ucomiss xmm8,xmm7` + `seta` at `0x7B4D41F`), so exactly
+/// `0.001` is **not** active.
+pub const HAIR_SEAM_PART_GATE: f32 = 0.001;
+
+/// One entry of the recovered PF90087 per-part `std::map<int,float>`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HairSeamPartDegree {
+    /// Map key from `0x1422E1820`, one generated hair part.
+    pub part: i32,
+    /// Map value at `[node+0x20]`, used verbatim. The fixed PE has no `/100`,
+    /// clamp, or other normalization for PF90087; the value is the degree.
+    pub degree: f32,
+}
+
+impl HairSeamPartDegree {
+    /// Vendor `on_i = (d_i > 0.001f)`.
+    pub fn is_active(self) -> bool {
+        self.degree > HAIR_SEAM_PART_GATE
+    }
+}
+
+/// Applies the recovered vendor loop: keep the parts whose degree is strictly
+/// greater than `0.001` and return those degrees unchanged (no normalization,
+/// no accumulation). Caller order is preserved because the vendor writes back
+/// in pipeline order, not map order.
+///
+/// * empty map -> `MissingInput("PF90087_PART_DEGREE_MAP")` (fail closed)
+/// * duplicate part key -> `ShapeMismatch`
+/// * non-finite degree -> `ValueOutOfRange`
+pub fn hair_seam_active_parts(
+    parts: &[HairSeamPartDegree],
+) -> Result<Vec<HairSeamPartDegree>, Refusal> {
+    if parts.is_empty() {
+        return Err(Refusal::MissingInput("PF90087_PART_DEGREE_MAP"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for part in parts {
+        if !part.degree.is_finite() {
+            return Err(Refusal::ValueOutOfRange("PF90087_PART_DEGREE_MAP"));
+        }
+        if !seen.insert(part.part) {
+            return Err(Refusal::ShapeMismatch("PF90087_PART_DEGREE_MAP"));
+        }
+    }
+    Ok(parts
+        .iter()
+        .copied()
+        .filter(|part| part.is_active())
+        .collect())
+}
+
 fn hair_seam_roi(
     width: u32,
     height: u32,
@@ -3715,6 +3768,11 @@ fn hair_seam_roi(
 /// CPU producer half of the split path. Normal/Sobel estimation and the
 /// bilateral / 16-direction search stay here; the device consumer only blends
 /// the returned repair plane.
+///
+/// Legacy UI entry: `ui/100` is **not** recovered for PF90087 (task06 found no
+/// normalization instruction). It is kept only so the existing CUDA parity
+/// tests share one pixel law; new callers pass the native per-part degree to
+/// [`hair_seam_repair_degree`].
 pub fn hair_seam_repair(
     source: &Image,
     part_line_mask: Option<&[u8]>,
@@ -3723,11 +3781,35 @@ pub fn hair_seam_repair(
     normals: Option<(&[f32], &[f32])>,
     max_probe_radius: Option<u32>,
 ) -> Result<HairSeamRepair, Refusal> {
-    let pixels = checked_pixels(source, "source")?;
+    checked_pixels(source, "source")?;
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
         return Err(Refusal::ValueOutOfRange("PF90087_UI"));
     }
-    let degree = ui / 100.0;
+    hair_seam_repair_degree(
+        source,
+        part_line_mask,
+        hair_mask,
+        ui / 100.0,
+        normals,
+        max_probe_radius,
+    )
+}
+
+/// Canonical PF90087 producer: `degree` is the selected native per-part value,
+/// used verbatim. Inactive (`degree <= 0.001`) returns an empty repair plane;
+/// an active job without its hair mask fails closed.
+pub fn hair_seam_repair_degree(
+    source: &Image,
+    part_line_mask: Option<&[u8]>,
+    hair_mask: Option<&[u8]>,
+    degree: f32,
+    normals: Option<(&[f32], &[f32])>,
+    max_probe_radius: Option<u32>,
+) -> Result<HairSeamRepair, Refusal> {
+    let pixels = checked_pixels(source, "source")?;
+    if !degree.is_finite() || degree < 0.0 {
+        return Err(Refusal::ValueOutOfRange("PF90087_DEGREE"));
+    }
     let half_x = 0.5 * (source.width as f32 - 1.0) * degree;
     let half_y = 0.5 * (source.height as f32 - 1.0) * degree;
     let default_radius = half_x.max(half_y);
@@ -3748,7 +3830,7 @@ pub fn hair_seam_repair(
         full_weight_pixels: 0,
         repaired_pixels: 0,
     };
-    if degree == 0.0 {
+    if degree <= HAIR_SEAM_PART_GATE {
         return Ok(result);
     }
     let part_line_mask =
@@ -3763,6 +3845,11 @@ pub fn hair_seam_repair(
             return Err(Refusal::ValueOutOfRange("normals"));
         }
     }
+    // The vendor pipeline logs `HairSeam: hairMask is black!` and treats a
+    // missing hair mask as an error, never as "fill everything". The string's
+    // binding site was not recovered (task06 NOT-FOUND), so the mask stays a
+    // required same-job input here: absent means refuse, black means no pair
+    // is ever found and the producer repairs nothing.
     for y in 0..source.height as usize {
         for x in 0..source.width as usize {
             let pixel = y * source.width as usize + x;
@@ -3823,6 +3910,10 @@ pub fn hair_seam_repair(
 
 /// CPU consumer half of the split path. `repair_mask` is the compacted producer
 /// coverage; a zero byte preserves the source even when `part_line_mask` is set.
+///
+/// Legacy UI entry (`ui/100`); see [`hair_seam_repair`] for the normalization
+/// caveat. New callers pass the native per-part degree to
+/// [`hair_seam_blend_degree`].
 pub fn hair_seam_blend(
     source: &Image,
     part_line_mask: Option<&[u8]>,
@@ -3831,12 +3922,35 @@ pub fn hair_seam_blend(
     ui: f32,
     roi: (u32, u32, u32, u32),
 ) -> Result<HairSeamBlendResult, Refusal> {
-    let pixels = checked_pixels(source, "source")?;
+    checked_pixels(source, "source")?;
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
         return Err(Refusal::ValueOutOfRange("PF90087_UI"));
     }
+    hair_seam_blend_degree(
+        source,
+        part_line_mask,
+        repair_rgb,
+        repair_mask,
+        ui / 100.0,
+        roi,
+    )
+}
+
+/// Canonical PF90087 consumer: `degree` is the selected native per-part value,
+/// used verbatim.
+pub fn hair_seam_blend_degree(
+    source: &Image,
+    part_line_mask: Option<&[u8]>,
+    repair_rgb: Option<&[u8]>,
+    repair_mask: Option<&[u8]>,
+    degree: f32,
+    roi: (u32, u32, u32, u32),
+) -> Result<HairSeamBlendResult, Refusal> {
+    let pixels = checked_pixels(source, "source")?;
+    if !degree.is_finite() || degree < 0.0 {
+        return Err(Refusal::ValueOutOfRange("PF90087_DEGREE"));
+    }
     hair_seam_roi(source.width, source.height, roi)?;
-    let degree = ui / 100.0;
     let mut result = HairSeamBlendResult {
         output: source.clone(),
         degree,
@@ -3845,7 +3959,7 @@ pub fn hair_seam_blend(
         changed: 0,
         alpha_changed: 0,
     };
-    if degree == 0.0 || roi.2 == 0 || roi.3 == 0 {
+    if degree <= HAIR_SEAM_PART_GATE || roi.2 == 0 || roi.3 == 0 {
         return Ok(result);
     }
     let part_line_mask =
@@ -3957,6 +4071,132 @@ mod hair_seam_contract_tests {
         assert_eq!(blend.output.pixel(1, 0), source.pixel(1, 0));
         assert_eq!(blend.changed, 1);
         assert_eq!(blend.alpha_changed, 0);
+    }
+
+    #[test]
+    fn row88_active_parts_use_strict_gate_and_keep_raw_degrees() {
+        // Exactly the recovered vendor loop: `d_i > 0.001`, no normalization.
+        let active = hair_seam_active_parts(&[
+            HairSeamPartDegree { part: 3, degree: 0.25 },
+            HairSeamPartDegree { part: 7, degree: 0.001 },
+            HairSeamPartDegree { part: 9, degree: 1.0 },
+        ])
+        .unwrap();
+        assert_eq!(
+            active,
+            vec![
+                HairSeamPartDegree { part: 3, degree: 0.25 },
+                HairSeamPartDegree { part: 9, degree: 1.0 },
+            ]
+        );
+        assert!(!HairSeamPartDegree { part: 0, degree: HAIR_SEAM_PART_GATE }.is_active());
+        assert!(HairSeamPartDegree { part: 0, degree: 0.0011 }.is_active());
+        // The value is used verbatim, never rescaled to 0..1 by /100.
+        assert_eq!(active[0].degree, 0.25);
+    }
+
+    #[test]
+    fn row88_active_parts_refuse_empty_duplicate_and_non_finite() {
+        assert_eq!(
+            hair_seam_active_parts(&[]),
+            Err(Refusal::MissingInput("PF90087_PART_DEGREE_MAP"))
+        );
+        assert_eq!(
+            hair_seam_active_parts(&[
+                HairSeamPartDegree { part: 1, degree: 0.5 },
+                HairSeamPartDegree { part: 1, degree: 0.5 },
+            ]),
+            Err(Refusal::ShapeMismatch("PF90087_PART_DEGREE_MAP"))
+        );
+        assert_eq!(
+            hair_seam_active_parts(&[HairSeamPartDegree { part: 1, degree: f32::NAN }]),
+            Err(Refusal::ValueOutOfRange("PF90087_PART_DEGREE_MAP"))
+        );
+    }
+
+    #[test]
+    fn row88_degree_entries_gate_at_point_zero_zero_one() {
+        let source = Image::solid(1, 1, [10, 20, 30, 200]);
+        let part_line = [255u8];
+        let hair = [255u8];
+        // pair needs hair pixels on both sides; a single-pixel canvas repairs
+        // nothing, so assert the gate through the counters instead.
+        let at_gate =
+            hair_seam_repair_degree(&source, Some(&part_line), Some(&hair), 0.001, None, Some(2))
+                .unwrap();
+        assert_eq!(at_gate.repaired_pixels, 0);
+        assert_eq!(at_gate.degree, 0.001);
+
+        let above =
+            hair_seam_repair_degree(&source, Some(&part_line), Some(&hair), 0.5, None, Some(2))
+                .unwrap();
+        assert_eq!(above.degree, 0.5);
+
+        let blend_at_gate = hair_seam_blend_degree(
+            &source,
+            Some(&part_line),
+            Some(&[100, 100, 100]),
+            Some(&[255]),
+            0.001,
+            (0, 0, 1, 1),
+        )
+        .unwrap();
+        assert_eq!(blend_at_gate.output, source);
+        assert_eq!(blend_at_gate.candidate_pixels, 0);
+        assert_eq!(blend_at_gate.degree, 0.001);
+    }
+
+    #[test]
+    fn row88_degree_entry_matches_legacy_ui_entry_byte_for_byte() {
+        let source = image_from(5, 5, |x, y| [(20 + x * x * 10 + y * 3) as u8, 50, 60, 77]);
+        let mut part_line = vec![0u8; 25];
+        part_line[2 * 5 + 2] = 255;
+        let mut hair = vec![0u8; 25];
+        hair[2 * 5] = 255;
+        hair[2 * 5 + 4] = 255;
+        let legacy = hair_seam_repair(&source, Some(&part_line), Some(&hair), 50.0, None, Some(4))
+            .unwrap();
+        let native =
+            hair_seam_repair_degree(&source, Some(&part_line), Some(&hair), 0.5, None, Some(4))
+                .unwrap();
+        assert_eq!(legacy.repair_rgb, native.repair_rgb);
+        assert_eq!(legacy.repair_mask, native.repair_mask);
+        assert_eq!(legacy.repaired_pixels, native.repaired_pixels);
+
+        let legacy_blend = hair_seam_blend(
+            &source,
+            Some(&part_line),
+            Some(&legacy.repair_rgb),
+            Some(&legacy.repair_mask),
+            50.0,
+            (0, 0, 5, 5),
+        )
+        .unwrap();
+        let native_blend = hair_seam_blend_degree(
+            &source,
+            Some(&part_line),
+            Some(&native.repair_rgb),
+            Some(&native.repair_mask),
+            0.5,
+            (0, 0, 5, 5),
+        )
+        .unwrap();
+        assert_eq!(legacy_blend.output, native_blend.output);
+    }
+
+    #[test]
+    fn row88_negative_degree_is_refused() {
+        let source = Image::solid(1, 1, [10, 20, 30, 200]);
+        assert_eq!(
+            hair_seam_repair_degree(&source, None, None, -0.5, None, None)
+                .unwrap_err(),
+            Refusal::ValueOutOfRange("PF90087_DEGREE")
+        );
+        assert_eq!(
+            hair_seam_blend_degree(&source, None, None, None, f32::NAN, (0, 0, 1, 1))
+                .unwrap_err(),
+            Refusal::ValueOutOfRange("PF90087_DEGREE")
+        );
     }
 }
 

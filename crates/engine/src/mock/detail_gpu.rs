@@ -607,6 +607,12 @@ pub(crate) fn post_process_resident(
     if bytes == 0 || rgba.len() != bytes {
         return Err(Failure::Invalid("detail frame"));
     }
+    // Same retained-frame boundary as `post_process`: above it the grow-only
+    // pool would be oversized after this one call, so the frame goes to the
+    // CPU with the frame still unmodified (grain has not run either).
+    if !retained_frame(bytes) {
+        return Err(Failure::TooLarge { need: bytes, cap: MAX_RETAINED_FRAME_BYTES });
+    }
     let Some(need) = retained_bytes(pixels, planes) else {
         return Err(Failure::Invalid("detail frame"));
     };
@@ -663,7 +669,9 @@ pub(crate) enum ResidentGrain {
     /// The frame never reached the host (detail failed, or the device was lost
     /// before the download). `rgba` holds the pre-detail bytes, so the caller
     /// reruns the whole detail path on the CPU: exactly what today's code does
-    /// when the detail attempt or its download fails.
+    /// when the detail attempt or its download fails. A frame above the
+    /// retained boundary (`Failure::TooLarge`) also lands here and reruns the
+    /// CPU path, matching `post_process`'s refusal semantics.
     CpuEverything,
 }
 
