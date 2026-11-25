@@ -494,6 +494,23 @@ fn render_v2(
 ) -> Result<FaceGeometryRun, Refusal> {
     #[cfg(windows)]
     {
+        // Per-call CUDA buffers cost more than the face-local covered-pixel
+        // CPU pass at preview sizes.
+        let preview_sized =
+            u64::from(source.width) * u64::from(source.height) <= 4_000_000;
+        if preview_sized && v2_mesh_is_face_local(source, &mesh) {
+            let image =
+                cuda_v2warp::apply_cpu(source, offset, mesh, rules, mat2, filter_size)?;
+            let changed = image != *source;
+            return Ok(FaceGeometryRun {
+                image: changed.then_some(image),
+                backend: PortraitBackend::Cpu,
+                dispatches: Vec::new(),
+                fallback_reason: Some(
+                    "face-local V2 warp: CPU covered-pixel path".to_string(),
+                ),
+            });
+        }
         let cuda = match super::forced_cuda_failure() {
             Some(error) => Err(error),
             None => cuda_v2warp::V2Warp::open()
@@ -528,6 +545,26 @@ fn render_v2(
         let changed = image != *source;
         Ok(FaceGeometryRun::cpu(changed.then_some(image)))
     }
+}
+
+fn v2_mesh_is_face_local(source: &Image, mesh: &cuda_v2warp::Mesh<'_>) -> bool {
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for point in mesh.framebuffer_positions_w1 {
+        if !point[0].is_finite() || !point[1].is_finite() {
+            return false;
+        }
+        min_x = min_x.min(point[0]);
+        max_x = max_x.max(point[0]);
+        min_y = min_y.min(point[1]);
+        max_y = max_y.max(point[1]);
+    }
+    if !min_x.is_finite() {
+        return false;
+    }
+    let (width, height) = (source.width as f32, source.height as f32);
+    let bbox = (max_x - min_x).max(0.0).min(width) * (max_y - min_y).max(0.0).min(height);
+    bbox <= width * height * 0.5
 }
 
 fn render_mesh(
@@ -851,7 +888,30 @@ pub(super) fn apply(
     pf: u32,
     controls: [f32; 2],
 ) -> Result<FaceGeometryRun, Refusal> {
-    apply_with_mode(source, region, job_id, input, shared, pf, controls, false)
+    apply_with_mode(source, region, job_id, input, shared, pf, controls, false, None)
+}
+
+pub(super) fn apply_with_stage_sha(
+    source: &Image,
+    region: NormRect,
+    job_id: Option<u64>,
+    input: Option<&FaceGeometryInputs>,
+    shared: Option<&SlimProducerInputs>,
+    pf: u32,
+    controls: [f32; 2],
+    stage_sha256: Option<[u8; 32]>,
+) -> Result<FaceGeometryRun, Refusal> {
+    apply_with_mode(
+        source,
+        region,
+        job_id,
+        input,
+        shared,
+        pf,
+        controls,
+        false,
+        stage_sha256,
+    )
 }
 
 pub(super) fn apply_cpu(
@@ -863,7 +923,7 @@ pub(super) fn apply_cpu(
     pf: u32,
     controls: [f32; 2],
 ) -> Result<FaceGeometryRun, Refusal> {
-    apply_with_mode(source, region, job_id, input, shared, pf, controls, true)
+    apply_with_mode(source, region, job_id, input, shared, pf, controls, true, None)
 }
 
 fn apply_with_mode(
@@ -875,6 +935,7 @@ fn apply_with_mode(
     pf: u32,
     controls: [f32; 2],
     cpu_only: bool,
+    stage_sha256: Option<[u8; 32]>,
 ) -> Result<FaceGeometryRun, Refusal> {
     let min = if pf == 8033 { 0.0 } else { -1.0 };
     if controls.iter().any(|value| !(min..=1.0).contains(value)) {
@@ -883,6 +944,7 @@ fn apply_with_mode(
     if controls == [0.0; 2] {
         return Ok(FaceGeometryRun::skipped());
     }
+    let digest = stage_sha256.unwrap_or_else(|| sha256_32(&source.pixels));
     let input = input.ok_or(Refusal::MissingInput(missing_draw(pf)))?;
     if input.job_id == 0 || Some(input.job_id) != job_id {
         return Err(Refusal::ValueOutOfRange("face geometry job ticket"));
@@ -900,7 +962,7 @@ fn apply_with_mode(
     if draws.next().is_some() || draw.controls != controls {
         return Err(Refusal::ValueOutOfRange("face geometry draw controls"));
     }
-    if draw.source_sha256 != sha256_32(&source.pixels) {
+    if draw.source_sha256 != digest {
         return Err(Refusal::ValueOutOfRange("face geometry frame digest"));
     }
     let v2 = || -> Result<&SlimProducerInputs, Refusal> {

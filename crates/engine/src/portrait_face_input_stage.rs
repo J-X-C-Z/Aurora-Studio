@@ -521,6 +521,10 @@ pub struct FaceInputBundle {
     pub points414: Vec<[f32; 2]>,
     pub landmark_producer: FaceLandmarkProducerInputs,
     pub model_inputs: Option<ProducerInputs>,
+    /// Exact digest of the frame this bundle was produced from, tied to the
+    /// allocation that held it. In-process validation reuses it while that
+    /// allocation is still the one being checked.
+    pub(crate) bound_digest: Option<([u8; 32], usize, usize)>,
 }
 
 impl FaceInputBundle {
@@ -536,8 +540,21 @@ impl FaceInputBundle {
         }
     }
 
+    fn digest_for(&self, source: &Image) -> [u8; 32] {
+        if let Some((sha256, ptr, len)) = self.bound_digest {
+            if ptr == source.pixels.as_ptr() as usize && len == source.pixels.len() {
+                return sha256;
+            }
+        }
+        match shared_source_digest(source) {
+            Some(sha256) => *sha256.get_or_init(|| sha256_32(&source.pixels)),
+            None => sha256_32(&source.pixels),
+        }
+    }
+
     pub fn validate_ticket(&self, source: &Image, job_id: Option<u64>) -> Result<(), Refusal> {
-        self.validate_ticket_with_digest(source, job_id, || sha256_32(&source.pixels))
+        let digest = self.digest_for(source);
+        self.validate_ticket_with_digest(source, job_id, || digest)
     }
 
     fn validate_ticket_with_digest(
@@ -597,13 +614,28 @@ impl FaceInputBundle {
 
     pub fn slim_inputs(&self, source: &Image) -> Result<SlimProducerInputs, Refusal> {
         self.validate_ticket(source, Some(self.job_id))?;
-        self.landmark_producer.slim_inputs(self.job_id, source)
+        SlimProducerInputs::from_landmarks_with_sha(
+            self.job_id,
+            source,
+            self.landmark_producer.points194.clone(),
+            self.digest_for(source),
+        )
     }
 
     pub fn slim_inputs_for_stage(
         &self,
         transform: &FaceStageTransform,
         stage: &Image,
+    ) -> Result<SlimProducerInputs, Refusal> {
+        let digest = self.digest_for(stage);
+        self.slim_inputs_for_stage_with_sha(transform, stage, digest)
+    }
+
+    pub fn slim_inputs_for_stage_with_sha(
+        &self,
+        transform: &FaceStageTransform,
+        stage: &Image,
+        digest: [u8; 32],
     ) -> Result<SlimProducerInputs, Refusal> {
         if transform.source_size != self.source_size
             || transform.stage_size != [stage.width, stage.height]
@@ -615,7 +647,19 @@ impl FaceInputBundle {
             .iter()
             .map(|point| transform.source_point_to_stage(*point))
             .collect::<Result<Vec<_>, _>>()?;
-        SlimProducerInputs::from_landmarks(self.job_id, stage, points194)
+        let stage_size = [stage.width, stage.height];
+        if let Some(mut slim) = cached_slim(digest, stage_size, &points194) {
+            slim.job_id = self.job_id;
+            return Ok(slim);
+        }
+        let slim = SlimProducerInputs::from_landmarks_with_sha(
+            self.job_id,
+            stage,
+            points194.clone(),
+            digest,
+        )?;
+        remember_slim(digest, stage_size, &points194, &slim);
+        Ok(slim)
     }
 
     pub fn attach_slim(
@@ -643,7 +687,7 @@ impl FaceInputBundle {
         {
             return Err(Refusal::ShapeMismatch("face geometry same-frame binding"));
         }
-        let digest = super::sha256_32(&source.pixels);
+        let digest = self.digest_for(source);
         if inputs.draws.iter().any(|draw| draw.source_sha256 != digest) {
             return Err(Refusal::ValueOutOfRange("face geometry frame digest"));
         }
@@ -689,7 +733,7 @@ impl FaceInputBundle {
                 atlases.push(super::portrait_v2_mesh::VFaceAtlas::captured(row));
             }
         }
-        let digest = super::sha256_32(&source.pixels);
+        let digest = self.digest_for(source);
         let inputs = super::FaceGeometryInputs {
             job_id: self.job_id,
             width: source.width,
@@ -1394,9 +1438,19 @@ impl FaceInputBundle {
         use aurora_portrait::raster_fragment::{Clamp, Defines, Edge as FragmentEdge};
 
         self.validate_ticket(source, Some(self.job_id))?;
+        let any_eye_brow = (8001u32..=8020).any(|pf| {
+            extra
+                .get(&format!("pc:{pf}"))
+                .copied()
+                .unwrap_or(0.0)
+                != 0.0
+        });
+        if !any_eye_brow {
+            return Ok(());
+        }
         let w = source.width as f32;
         let h = source.height as f32;
-        let digest = super::sha256_32(&source.pixels);
+        let digest = self.digest_for(source);
         let rules = Rules {
             winding: Winding::PositiveAreaIsFront,
             cull: Cull::None,
@@ -2400,6 +2454,7 @@ impl FaceInputProducer {
             points414,
             landmark_producer,
             model_inputs,
+            bound_digest: None,
         };
         bundle.validate_ticket_with_digest(source, Some(job_id), || bundle.source_sha256)?;
         Ok(bundle)
@@ -2971,7 +3026,7 @@ fn cached_bundle_matches(bundle: &FaceInputBundle, identity: FaceInputSourceIden
     };
     let size = identity.size();
     let frame_pixels = size[0] as usize * size[1] as usize;
-    bundle.source_size == size
+    let matched = bundle.source_size == size
         && bundle.source_sha256 == sha256
         && bundle.points194.len() == 194
         && bundle.points414.len() == 414
@@ -2987,7 +3042,8 @@ fn cached_bundle_matches(bundle: &FaceInputBundle, identity: FaceInputSourceIden
                     && teeth.mask_height == size[1]
                     && teeth.mask_g.len() == frame_pixels
             })
-        })
+        });
+    matched
 }
 
 fn lru_key<K: Clone>(items: impl Iterator<Item = (K, u64)>) -> Option<K> {
@@ -3052,6 +3108,139 @@ fn producer_cache() -> &'static Mutex<HashMap<FaceInputSessionKey, Arc<FaceInput
 fn result_cache() -> &'static Mutex<FaceInputResultCache> {
     static CACHE: OnceLock<Mutex<FaceInputResultCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(FaceInputResultCache::default()))
+}
+
+const MAX_CACHED_FACE_REFUSALS: usize = 8;
+
+struct FaceInputRefusalEntry {
+    refusal: Refusal,
+    last_used: u64,
+}
+
+fn refusal_cache() -> &'static Mutex<HashMap<FaceInputAliasKey, FaceInputRefusalEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<FaceInputAliasKey, FaceInputRefusalEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A per-frame model refusal is deterministic for the same session and frame.
+/// Runtime and model-load failures stay retryable.
+fn cacheable_refusal(refusal: &Refusal) -> bool {
+    match refusal {
+        Refusal::ShapeMismatch(_) | Refusal::ValueOutOfRange(_) => true,
+        Refusal::MissingInput(reason) => !matches!(
+            *reason,
+            MODEL_RUNTIME_ERROR | FACE_PARSING_V2_MODEL_ERROR | "ONNX Runtime" | "face model file"
+        ),
+        Refusal::UnknownEffect(_) | Refusal::NotImplemented(_) => false,
+    }
+}
+
+fn cached_refusal(alias: &FaceInputAliasKey) -> Option<Refusal> {
+    let mut cache = refusal_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stamp = next_producer_stamp();
+    let entry = cache.get_mut(alias)?;
+    entry.last_used = stamp;
+    Some(entry.refusal.clone())
+}
+
+fn remember_refusal(alias: &FaceInputAliasKey, refusal: &Refusal) {
+    if !cacheable_refusal(refusal) {
+        return;
+    }
+    let mut cache = refusal_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stamp = next_producer_stamp();
+    cache.insert(
+        alias.clone(),
+        FaceInputRefusalEntry {
+            refusal: refusal.clone(),
+            last_used: stamp,
+        },
+    );
+    while cache.len() > MAX_CACHED_FACE_REFUSALS {
+        let victim = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone());
+        match victim {
+            Some(victim) => {
+                cache.remove(&victim);
+            }
+            None => break,
+        }
+    }
+}
+
+const MAX_CACHED_SLIMS: usize = 4;
+
+struct SlimCacheEntry {
+    digest: [u8; 32],
+    stage_size: [u32; 2],
+    points194: Vec<[f32; 2]>,
+    slim: SlimProducerInputs,
+    last_used: u64,
+}
+
+fn slim_cache() -> &'static Mutex<Vec<SlimCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Vec<SlimCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_slim(
+    digest: [u8; 32],
+    stage_size: [u32; 2],
+    points194: &[[f32; 2]],
+) -> Option<SlimProducerInputs> {
+    let mut cache = slim_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stamp = next_producer_stamp();
+    let entry = cache.iter_mut().find(|entry| {
+        entry.digest == digest
+            && entry.stage_size == stage_size
+            && entry.points194 == points194
+    })?;
+    entry.last_used = stamp;
+    Some(entry.slim.clone())
+}
+
+fn remember_slim(
+    digest: [u8; 32],
+    stage_size: [u32; 2],
+    points194: &[[f32; 2]],
+    slim: &SlimProducerInputs,
+) {
+    let mut cache = slim_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|entry| {
+        !(entry.digest == digest
+            && entry.stage_size == stage_size
+            && entry.points194 == points194)
+    });
+    while cache.len() >= MAX_CACHED_SLIMS {
+        let victim = cache
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(index, _)| index);
+        match victim {
+            Some(index) => {
+                cache.remove(index);
+            }
+            None => break,
+        }
+    }
+    cache.push(SlimCacheEntry {
+        digest,
+        stage_size,
+        points194: points194.to_vec(),
+        slim: slim.clone(),
+        last_used: next_producer_stamp(),
+    });
 }
 
 /// PF-F §11: one in-flight result build per (session, source) alias.
@@ -3176,19 +3365,34 @@ impl FaceInputSession {
     }
 
     pub fn produce(&self, job_id: u64, source: &Image) -> Result<FaceInputBundle, Refusal> {
-        if job_id == 0 {
-            return Err(Refusal::ValueOutOfRange("face input job ticket"));
-        }
-        let size = [source.width, source.height];
         let digest = match shared_source_digest(source) {
             Some(sha256) => *sha256.get_or_init(|| sha256_32(&source.pixels)),
             None => sha256_32(&source.pixels),
         };
+        self.produce_with_digest(job_id, source, digest)
+    }
+
+    /// Produces a bundle for a caller that already hashed `source`. The digest
+    /// becomes the bundle's exact content receipt, so it must cover the whole
+    /// frame.
+    pub(crate) fn produce_with_digest(
+        &self,
+        job_id: u64,
+        source: &Image,
+        digest: [u8; 32],
+    ) -> Result<FaceInputBundle, Refusal> {
+        if job_id == 0 {
+            return Err(Refusal::ValueOutOfRange("face input job ticket"));
+        }
+        let size = [source.width, source.height];
         let identity = FaceInputSourceIdentity::ContentSha256 { sha256: digest, size };
         let alias = FaceInputAliasKey {
             session_fingerprint: self.key.fingerprint(),
             source: identity,
         };
+        if let Some(refusal) = cached_refusal(&alias) {
+            return Err(refusal);
+        }
         let cached = result_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3197,6 +3401,8 @@ impl FaceInputSession {
             if cached_bundle_matches(&cached, identity) {
                 let mut bundle = (*cached).clone();
                 bundle.reticket(job_id);
+                bundle.bound_digest =
+                    Some((digest, source.pixels.as_ptr() as usize, source.pixels.len()));
                 return Ok(bundle);
             }
             let mut cache = result_cache()
@@ -3222,9 +3428,14 @@ impl FaceInputSession {
             Ok(bundle) => {
                 let mut bundle = (**bundle).clone();
                 bundle.reticket(job_id);
+                bundle.bound_digest =
+                    Some((digest, source.pixels.as_ptr() as usize, source.pixels.len()));
                 Ok(bundle)
             }
-            Err(refusal) => Err(refusal.clone()),
+            Err(refusal) => {
+                remember_refusal(&alias, refusal);
+                Err(refusal.clone())
+            }
         }
     }
 
@@ -3281,6 +3492,14 @@ impl FaceInputSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        refusal_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        slim_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
@@ -3298,7 +3517,25 @@ fn file_stamp(path: &Path) -> Result<FaceInputFileStamp, Refusal> {
 }
 
 fn canonical_model_path(path: &Path) -> Result<PathBuf, Refusal> {
-    fs::canonicalize(path).map_err(|_| Refusal::MissingInput("face model file"))
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+    {
+        return Ok(cached.clone());
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|_| Refusal::MissingInput("face model file"))?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    cache.insert(path.to_owned(), canonical.clone());
+    Ok(canonical)
 }
 
 fn quantize_roi(roi: [f32; 4]) -> Result<[i64; 4], Refusal> {
@@ -3959,6 +4196,43 @@ mod pff_tests {
         };
         assert_eq!(content.size(), [2, 1]);
         assert_ne!(snapshot, content);
+    }
+
+    #[test]
+    fn frame_refusals_are_cached_but_runtime_failures_retry() {
+        refusal_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let alias = FaceInputAliasKey {
+            session_fingerprint: 3,
+            source: FaceInputSourceIdentity::ContentSha256 {
+                sha256: [1; 32],
+                size: [2, 2],
+            },
+        };
+        let refusal = Refusal::MissingInput("C1 face mesh score");
+        assert!(cacheable_refusal(&refusal));
+        assert!(!cacheable_refusal(&Refusal::MissingInput(MODEL_RUNTIME_ERROR)));
+        remember_refusal(&alias, &refusal);
+        assert_eq!(cached_refusal(&alias), Some(refusal));
+
+        let runtime_alias = FaceInputAliasKey {
+            session_fingerprint: 3,
+            source: FaceInputSourceIdentity::ContentSha256 {
+                sha256: [2; 32],
+                size: [2, 2],
+            },
+        };
+        remember_refusal(
+            &runtime_alias,
+            &Refusal::MissingInput(MODEL_RUNTIME_ERROR),
+        );
+        assert_eq!(cached_refusal(&runtime_alias), None);
+        refusal_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// PF-F acceptance microbenchmark: 24MP, ten consecutive requests.

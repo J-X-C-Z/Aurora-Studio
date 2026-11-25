@@ -215,6 +215,27 @@ impl Default for PortraitMasks {
 }
 
 impl PortraitMasks {
+    pub(crate) fn receipt_fingerprint(&self) -> u64 {
+        let mut hash = fnv_usize(FNV1A64_OFFSET_BASIS, self.width);
+        hash = fnv_usize(hash, self.height);
+        for (index, plane) in [&self.skin, &self.hair, &self.face, &self.body]
+            .into_iter()
+            .enumerate()
+        {
+            hash = fnv_u64(hash, index as u64);
+            hash = fnv_u64(
+                hash,
+                plane.as_ref().map(Vec::len).unwrap_or(usize::MAX) as u64,
+            );
+            if let Some(plane) = plane {
+                for value in plane {
+                    hash = fnv_u64(hash, value.to_bits() as u64);
+                }
+            }
+        }
+        hash
+    }
+
     pub fn from_rgba(rgba: &[u8], width: u32, height: u32) -> Self {
         let parsed = crate::aimask::people_masks(rgba, width, height).ok();
         let face = parsed.as_ref().map(|p| p.face.clone());
@@ -3352,6 +3373,16 @@ fn fnv_u64(hash: u64, value: u64) -> u64 {
     fnv1a64(hash, &value.to_le_bytes())
 }
 
+fn params_fingerprint(params: &BTreeMap<String, f32>) -> u64 {
+    let mut hash = fnv_usize(FNV1A64_OFFSET_BASIS, params.len());
+    for (key, value) in params {
+        hash = fnv_usize(hash, key.len());
+        hash = fnv1a64(hash, key.as_bytes());
+        hash = fnv_u64(hash, value.to_bits() as u64);
+    }
+    hash
+}
+
 fn smile_split_spec_fingerprint(mut hash: u64, spec: SmileHostSplitSpec) -> u64 {
     hash = fnv_u64(hash, spec.job_id);
     for axis in [spec.dx, spec.dy] {
@@ -3417,6 +3448,8 @@ pub struct PortraitJobReceipt {
     width: u32,
     height: u32,
     frame_len: usize,
+    frame_ptr: usize,
+    params_fingerprint: u64,
     region_bits: [u32; 4],
     mask_width: usize,
     mask_height: usize,
@@ -3433,11 +3466,37 @@ impl PortraitJobReceipt {
         params: &BTreeMap<String, f32>,
         masks: &PortraitMasks,
     ) -> Self {
-        let frame_receipt = PortraitFrameReceipt::from_renderer_frame(frame, width, height)
-            .unwrap_or(PortraitFrameReceipt {
-                fingerprint: 0,
+        Self::from_renderer_receipt_with_fingerprints(
+            frame, width, height, region, params, masks, None, None,
+        )
+    }
+
+    /// `frame_fingerprint` and `mask_fingerprint` let a caller that already
+    /// holds these exact values skip the full-frame and mask scans.
+    pub fn from_renderer_receipt_with_fingerprints(
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        region: NormRect,
+        params: &BTreeMap<String, f32>,
+        masks: &PortraitMasks,
+        frame_fingerprint: Option<u64>,
+        mask_fingerprint: Option<u64>,
+    ) -> Self {
+        let frame_receipt = frame_fingerprint
+            .map(|fingerprint| PortraitFrameReceipt {
+                fingerprint,
                 width,
                 height,
+            })
+            .unwrap_or_else(|| {
+                PortraitFrameReceipt::from_renderer_frame(frame, width, height).unwrap_or(
+                    PortraitFrameReceipt {
+                        fingerprint: 0,
+                        width,
+                        height,
+                    },
+                )
             });
         let region_bits = [
             region.x.to_bits(),
@@ -3445,7 +3504,6 @@ impl PortraitJobReceipt {
             region.width.to_bits(),
             region.height.to_bits(),
         ];
-        let planes = [&masks.skin, &masks.hair, &masks.face, &masks.body];
         let plane_lengths = [
             masks.skin.as_ref().map(Vec::len),
             masks.hair.as_ref().map(Vec::len),
@@ -3455,29 +3513,20 @@ impl PortraitJobReceipt {
 
         let mut fingerprint = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
         fingerprint = fnv_usize(fingerprint, frame.len());
-        fingerprint = fnv1a64(fingerprint, frame);
+        fingerprint = fnv_u64(fingerprint, frame_receipt.fingerprint());
         fingerprint = fnv_u64(fingerprint, width as u64);
         fingerprint = fnv_u64(fingerprint, height as u64);
         for bits in region_bits {
             fingerprint = fnv_u64(fingerprint, bits as u64);
         }
-        fingerprint = fnv_usize(fingerprint, params.len());
-        for (key, value) in params {
-            fingerprint = fnv_usize(fingerprint, key.len());
-            fingerprint = fnv1a64(fingerprint, key.as_bytes());
-            fingerprint = fnv_u64(fingerprint, value.to_bits() as u64);
-        }
+        let params_fingerprint = params_fingerprint(params);
+        fingerprint = fnv_u64(fingerprint, params_fingerprint);
         fingerprint = fnv_usize(fingerprint, masks.width);
         fingerprint = fnv_usize(fingerprint, masks.height);
-        for (index, plane) in planes.into_iter().enumerate() {
-            fingerprint = fnv_u64(fingerprint, index as u64);
-            fingerprint = fnv_u64(fingerprint, plane_lengths[index].unwrap_or(usize::MAX) as u64);
-            if let Some(plane) = plane {
-                for value in plane {
-                    fingerprint = fnv_u64(fingerprint, value.to_bits() as u64);
-                }
-            }
-        }
+        fingerprint = fnv_u64(
+            fingerprint,
+            mask_fingerprint.unwrap_or_else(|| masks.receipt_fingerprint()),
+        );
 
         Self {
             fingerprint,
@@ -3485,6 +3534,8 @@ impl PortraitJobReceipt {
             width,
             height,
             frame_len: frame.len(),
+            frame_ptr: frame.as_ptr() as usize,
+            params_fingerprint,
             region_bits,
             mask_width: masks.width,
             mask_height: masks.height,
@@ -3498,6 +3549,10 @@ impl PortraitJobReceipt {
 
     pub fn job_id(&self) -> u64 {
         self.fingerprint
+    }
+
+    pub(crate) fn frame_ptr(&self) -> usize {
+        self.frame_ptr
     }
 
     pub fn frame_receipt(&self) -> PortraitFrameReceipt {
@@ -3551,6 +3606,15 @@ impl PortraitJobReceipt {
             {
                 return Some(Refusal::ShapeMismatch("PortraitJobReceipt mask plane"));
             }
+        }
+
+        // The renderer builds this receipt from the buffer it is about to hand
+        // to this same call. Reusing that allocation with the same parameters
+        // proves the same job without another full-frame scan.
+        if frame.as_ptr() as usize == self.frame_ptr
+            && params_fingerprint(params) == self.params_fingerprint
+        {
+            return None;
         }
 
         let actual = Self::from_renderer_receipt(frame, width, height, region, params, masks);
@@ -3614,6 +3678,9 @@ pub struct PortraitJobInputs<'a> {
     pub pf101: Option<&'a Pf101ProducerInputs>,
     pub pf90130: Option<&'a Pf90130ProducerInputs>,
     pub face_input_refusal: Option<&'a Refusal>,
+    /// Digest of the exact pre-effect frame, when the renderer already paid
+    /// for it while building the face producer inputs.
+    pub stage_sha256: Option<[u8; 32]>,
 }
 
 impl<'a> PortraitJobInputs<'a> {
@@ -3660,6 +3727,7 @@ impl<'a> PortraitJobInputs<'a> {
             pf101: None,
             pf90130: None,
             face_input_refusal: None,
+            stage_sha256: None,
         }
     }
 
@@ -5060,7 +5128,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     };
     let landmark_frame_digest = (inputs.slim.is_some()
         && effects.iter().any(|(pf, degree)| *degree != 0.0 && face_mesh_group(*pf).is_some()))
-        .then(|| sha256_32(&source.pixels));
+        .then(|| inputs.stage_sha256.unwrap_or_else(|| sha256_32(&source.pixels)));
 
     let neutral_grey_original = effects
         .iter()
@@ -5086,7 +5154,8 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     // Non-skin rows receive their own explicit planes from `PortraitJobInputs`.
     let skin_mask = inputs.masks.mask_u8(MaskKind::Skin, width, height, region);
     let mut slim_result: Option<Result<bool, Refusal>> = None;
-    let mut face_results: BTreeMap<u32, Result<FaceGeometryRun, Refusal>> = BTreeMap::new();
+    let mut face_results: BTreeMap<u32, (Result<FaceGeometryRun, Refusal>, bool)> =
+        BTreeMap::new();
     let mut face_mesh_results: BTreeMap<u32, FaceMeshStageResult> = BTreeMap::new();
     let mut plump_result: Option<Result<PlumpGroupRun, Refusal>> = None;
     let mut effects = effects.into_iter().peekable();
@@ -5264,13 +5333,18 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if let Some((left, right)) = portrait_face_stage::pair(pf) {
-            let result = match face_results.get(&left) {
-                Some(result) => result.clone(),
+            let (result, changed) = match face_results.get(&left) {
+                Some((result, changed)) => (result.clone(), *changed),
                 None => {
                     let control =
                         |id| extra.get(&format!("pc:{id}")).copied().unwrap_or(0.0);
                     let controls = [control(left), if left == right { 0.0 } else { control(right) }];
-                    let result = match portrait_face_stage::apply(
+                    let stage_sha = inputs.stage_sha256.filter(|_| {
+                        inputs.receipt.as_ref().is_some_and(|receipt| {
+                            receipt.frame_ptr() == current.pixels.as_ptr() as usize
+                        })
+                    });
+                    let mut result = match portrait_face_stage::apply_with_stage_sha(
                         &current,
                         region,
                         inputs.job_id(),
@@ -5278,17 +5352,24 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                         inputs.slim,
                         left,
                         controls,
+                        stage_sha,
                     ) {
-                        Ok(run) => {
-                            if let Some(next) = run.image.as_ref() {
-                                current = next.clone();
-                            }
-                            Ok(run)
-                        }
+                        Ok(run) => Ok(run),
                         Err(refusal) => Err(refusal),
                     };
-                    face_results.insert(left, result.clone());
-                    result
+                    let changed = match result.as_mut() {
+                        Ok(face_run) => face_run
+                            .image
+                            .take()
+                            .map(|next| {
+                                current = next;
+                                true
+                            })
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    face_results.insert(left, (result.clone(), changed));
+                    (result, changed)
                 }
             };
             match result {
@@ -5296,7 +5377,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     run.backend = face_run.backend;
                     run.dispatches = face_run.dispatches;
                     run.fallback_reason = face_run.fallback_reason;
-                    if face_run.image.is_some() {
+                    if changed {
                     run.skipped = false;
                     run.executed = true;
                 }
@@ -10225,6 +10306,90 @@ mod tests {
     }
 
     #[test]
+    fn renderer_receipt_trusts_the_same_allocation_and_params() {
+        let masks = PortraitMasks::solid(1.0);
+        let (width, height) = (8, 8);
+        let rgba = frame(width, height);
+        let params = BTreeMap::from([("pc:90005".to_string(), 0.9f32)]);
+        let receipt = PortraitJobReceipt::from_renderer_receipt(
+            &rgba,
+            width,
+            height,
+            NormRect::FULL,
+            &params,
+            &masks,
+        );
+        assert_eq!(
+            receipt.refusal(&rgba, width, height, NormRect::FULL, &params, &masks),
+            None
+        );
+
+        let mut changed_params = params.clone();
+        changed_params.insert("pc:90005".to_string(), 0.8);
+        assert!(
+            receipt
+                .refusal(
+                    &rgba,
+                    width,
+                    height,
+                    NormRect::FULL,
+                    &changed_params,
+                    &masks,
+                )
+                .is_some()
+        );
+
+        let mut changed_frame = rgba.clone();
+        changed_frame[0] ^= 1;
+        assert!(
+            receipt
+                .refusal(
+                    &changed_frame,
+                    width,
+                    height,
+                    NormRect::FULL,
+                    &params,
+                    &masks,
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn renderer_receipt_cached_fingerprints_match_the_strict_derivation() {
+        let masks = PortraitMasks::solid(1.0);
+        let (width, height) = (8, 8);
+        let rgba = frame(width, height);
+        let params = BTreeMap::from([("pc:90005".to_string(), 0.9f32)]);
+        let frame_fingerprint =
+            PortraitFrameReceipt::from_renderer_frame(&rgba, width, height)
+                .expect("frame receipt")
+                .fingerprint();
+        let receipt = PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
+            &rgba,
+            width,
+            height,
+            NormRect::FULL,
+            &params,
+            &masks,
+            Some(frame_fingerprint),
+            Some(masks.receipt_fingerprint()),
+        );
+        let same_content = rgba.clone();
+        assert_eq!(
+            receipt.refusal(&same_content, width, height, NormRect::FULL, &params, &masks),
+            None
+        );
+        let mut changed = same_content;
+        changed[0] ^= 1;
+        assert!(
+            receipt
+                .refusal(&changed, width, height, NormRect::FULL, &params, &masks)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn renderer_receipt_does_not_promote_masks_only() {
         let masks = PortraitMasks::solid(1.0);
         let mut rgba = frame(8, 8);
@@ -14049,6 +14214,7 @@ mod tests {
             historical_skin: None,
             plump: None,
             face_input_refusal: None,
+            stage_sha256: None,
         };
 
         #[cfg(windows)]

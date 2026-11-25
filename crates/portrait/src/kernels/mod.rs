@@ -5,8 +5,10 @@
 
 pub mod body_geometry;
 pub mod body_geometry_params;
+pub mod body_refine_warp;
 pub mod body_pose_adapter;
 pub mod body_region_geometry;
+pub mod buttock_anchors;
 pub mod blemish;
 pub mod blemish_blend;
 pub mod beard_transform;
@@ -33,6 +35,7 @@ pub mod hair_material;
 pub mod leg_refine_uv;
 pub mod leg_refine;
 pub mod lip_color;
+pub mod lip_mask;
 pub mod makeup;
 pub mod makeup_material;
 pub mod makeup_mask_uv;

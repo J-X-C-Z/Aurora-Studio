@@ -340,6 +340,7 @@ mod tests {
             job_id: job,
             source_size: [source.width, source.height],
             source_sha256: crate::sha256_32(&source.pixels),
+            bound_digest: None,
             detection: C1FaceDetection {
                 score: 0.9,
                 landmarks_source: [[2.0, 4.0]; 5],

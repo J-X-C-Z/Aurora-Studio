@@ -596,6 +596,24 @@ pub fn six_point_anchors(pf: u32) -> Option<[Anchor; 6]> {
 /// 此时 `to_69` 必须整体拒绝，而不是按模型输出顺序直填。
 /// 该表的维护者是引擎层：只有拿到 vendor `oriSkeleton` 槽序证据后，才允许逐槽填入锚点，
 /// 并递增 `KEYPOINT_SEMANTICS_VERSION`。
+///
+/// ## 本轮（2026-11-25，portrait-parse / pf404-slots）取证范围与结论
+///
+/// 对 `pix-worker.exe`（SHA-256 `509D2293…96B84`）的静态反汇编得到：
+///
+/// - `oriSkeleton` 是 `loadExtJsonParam`（RVA `0x1A95020`–`0x1A96E00`）从
+///   **外部 extJson** 读取的 69 元素数组，元素只有 `x`/`y` 两个键
+///   （`0x1A9685D`/`0x1A96885`），大小断言为 `0x228 == 69*8`
+///   （`0x1A96B10`–`0x1A96B26`）。JSON 本身不携带点名或索引语义。
+/// - 在 `.rdata`/`.text` 中检索 `left_shoulder`/`right_hip`/`gluteal` 等解剖名，
+///   以及任何 69 元素名称表，均为 `NOT_FOUND`；`"x"/"y"` 之外没有点名字符串表。
+/// - 唯一回收到的**索引消费**：`EffectButtockRefineCell`（PF404）的几何生产器
+///   `0x3CB0A80` 固定读取骨架数组的槽 8..13（详见
+///   `crate::kernels::buttock_anchors`）。这不构成解剖语义，且只覆盖 6/69 槽。
+///
+/// 因此本轮**未**回收任何可写入本表的 `Anchor`。所有槽保持 `None`，
+/// `to_69` 继续整体 fail-closed。不要用 COCO-17 / Halpe-26 / WholeBody-133
+/// 的常见顺序推测 vendor 槽序。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotTable {
     pub slots: [Option<Anchor>; SLOT_COUNT],

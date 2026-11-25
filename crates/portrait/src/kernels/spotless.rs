@@ -273,6 +273,203 @@ pub fn apply(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Fail-closed four-plane input contract (PF0 binding).
+//
+// The vendor `WithSkinMask` fragment samples exactly four planes:
+//   d  = s_texture          (rgba, unit 0)
+//   bZ = s_blur_texture     (rgb,  unit 1)
+//   bk = s_facemask_texture (r,    unit 2)
+//   bi = s_skinmask_texture (r,    unit 3)
+// Each is bound through `GLSpotlessProcessBaseFilter::BindTextures`
+// (pix-worker 0x57F53F0 / 0x57F55B0) and read with `.stp` / `.s` swizzles.
+//
+// The vendor draw path gates on a live client (`cell+0x48`), a non-empty face
+// list, a positive ROI and a per-face degree above 0.01; it performs no
+// job/ticket/hash credential check before draw (see `PF0-BINDING` FINDINGS
+// section 4). This module therefore does not invent such a check either, but it
+// does refuse any missing, mismatched or non-finite plane instead of silently
+// substituting a constant plane. That silent fallback is exactly the behaviour
+// this contract removes.
+// ---------------------------------------------------------------------------
+
+/// Channel layout a plane declares to match the vendor sampler swizzle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaneChannels {
+    /// One float per pixel; sampled as `.s` (red only).
+    R,
+    /// Three floats per pixel; sampled as `.stp` (rgb).
+    Rgb,
+    /// Four floats per pixel; rgb sampled as `.stp`, alpha copied to output.
+    Rgba,
+}
+
+impl PlaneChannels {
+    pub const fn count(self) -> usize {
+        match self {
+            PlaneChannels::R => 1,
+            PlaneChannels::Rgb => 3,
+            PlaneChannels::Rgba => 4,
+        }
+    }
+}
+
+/// One explicitly supplied same-job plane: extent, channel layout and f32 data.
+///
+/// Values are expected in the shader's normalized range but are not clamped on
+/// input; only finiteness is enforced. A zero extent or empty payload means the
+/// plane is missing and is a refusal, never a synthesized constant plane.
+#[derive(Clone, Copy, Debug)]
+pub struct Plane<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub channels: PlaneChannels,
+    pub pixels: &'a [f32],
+}
+
+/// Named refusal tags for the four recovered PF0 samplers.
+pub const PF0_SOURCE: &str = "PF0_s_texture";
+pub const PF0_BLUR: &str = "PF0_s_blur_texture";
+pub const PF0_FACE_MASK: &str = "PF0_s_facemask_texture";
+pub const PF0_SKIN_MASK: &str = "PF0_s_skinmask_texture";
+pub const PF0_SOURCE_CHANNELS: &str = "PF0_s_texture_channels";
+pub const PF0_BLUR_CHANNELS: &str = "PF0_s_blur_texture_channels";
+pub const PF0_FACE_MASK_CHANNELS: &str = "PF0_s_facemask_texture_channels";
+pub const PF0_SKIN_MASK_CHANNELS: &str = "PF0_s_skinmask_texture_channels";
+pub const PF0_OUTPUT: &str = "PF0_output";
+
+/// The complete four-plane input for the vendor `WithSkinMask` fragment.
+///
+/// Every plane is mandatory: there is no `Option` and no default. Callers that
+/// want the `Normal` fragment's inline HSV heuristic use [`apply`] with
+/// `skin_mask == None`; callers that claim the skin-mask path must supply the
+/// plane explicitly here.
+#[derive(Clone, Copy, Debug)]
+pub struct SpotlessInputs<'a> {
+    pub source: Plane<'a>,
+    pub blur: Plane<'a>,
+    pub face_mask: Plane<'a>,
+    pub skin_mask: Plane<'a>,
+    pub params: SpotlessParams,
+}
+
+fn check_plane(
+    plane: Plane<'_>,
+    name: &'static str,
+    channels_name: &'static str,
+    expected: PlaneChannels,
+) -> Result<usize, Refusal> {
+    if plane.width == 0 || plane.height == 0 || plane.pixels.is_empty() {
+        return Err(Refusal::MissingInput(name));
+    }
+    if plane.channels != expected {
+        return Err(Refusal::ShapeMismatch(channels_name));
+    }
+    let expected_len = (plane.width as usize)
+        .checked_mul(plane.height as usize)
+        .and_then(|pixels| pixels.checked_mul(expected.count()))
+        .ok_or(Refusal::ShapeMismatch(name))?;
+    if plane.pixels.len() != expected_len {
+        return Err(Refusal::ShapeMismatch(name));
+    }
+    if plane.pixels.iter().any(|value| !value.is_finite()) {
+        return Err(Refusal::ValueOutOfRange(name));
+    }
+    Ok(expected_len / expected.count())
+}
+
+impl SpotlessInputs<'_> {
+    /// Validate the four planes, their common extent and the uniforms.
+    ///
+    /// Returns the pixel count on success. Every refusal is named after the
+    /// offending sampler so a missing or malformed plane cannot be confused
+    /// with a pixel-law failure. The check runs to completion before any output
+    /// buffer is touched.
+    pub fn validate(&self) -> Result<usize, Refusal> {
+        let pixels = check_plane(
+            self.source,
+            PF0_SOURCE,
+            PF0_SOURCE_CHANNELS,
+            PlaneChannels::Rgba,
+        )?;
+        check_plane(self.blur, PF0_BLUR, PF0_BLUR_CHANNELS, PlaneChannels::Rgb)?;
+        check_plane(
+            self.face_mask,
+            PF0_FACE_MASK,
+            PF0_FACE_MASK_CHANNELS,
+            PlaneChannels::R,
+        )?;
+        check_plane(
+            self.skin_mask,
+            PF0_SKIN_MASK,
+            PF0_SKIN_MASK_CHANNELS,
+            PlaneChannels::R,
+        )?;
+
+        // All four planes share one logical extent. The vendor samples every
+        // plane with the same `g` uv, so a differing extent is a producer bug,
+        // not something to resample silently here.
+        for (plane, name) in [
+            (self.blur, PF0_BLUR),
+            (self.face_mask, PF0_FACE_MASK),
+            (self.skin_mask, PF0_SKIN_MASK),
+        ] {
+            if plane.width != self.source.width || plane.height != self.source.height {
+                return Err(Refusal::ShapeMismatch(name));
+            }
+        }
+
+        self.params.validate()?;
+        Ok(pixels)
+    }
+}
+
+/// Apply the `WithSkinMask` fragment to explicitly supplied four-plane inputs.
+///
+/// Unlike [`apply`], `skin_mask` is mandatory and accents the input contract:
+/// a missing plane, a mismatched extent/channel layout, a non-finite value or a
+/// non-finite uniform refuses before `out` is written. No plane is synthesized.
+pub fn apply_inputs(inputs: SpotlessInputs<'_>, out: &mut [f32]) -> Result<(), Refusal> {
+    let pixels = inputs.validate()?;
+    if out.len() != pixels * 4 {
+        return Err(Refusal::ShapeMismatch(PF0_OUTPUT));
+    }
+
+    for pixel in 0..pixels {
+        let s = pixel * 4;
+        let b = pixel * 3;
+        let src_rgba = [
+            inputs.source.pixels[s],
+            inputs.source.pixels[s + 1],
+            inputs.source.pixels[s + 2],
+            inputs.source.pixels[s + 3],
+        ];
+        let blur_rgb = [
+            inputs.blur.pixels[b],
+            inputs.blur.pixels[b + 1],
+            inputs.blur.pixels[b + 2],
+        ];
+        let face = inputs.face_mask.pixels[pixel];
+        let skin = inputs.skin_mask.pixels[pixel];
+        let result = shade(src_rgba, blur_rgb, face, Some(skin), &inputs.params);
+        out[s..s + 4].copy_from_slice(&result);
+    }
+    Ok(())
+}
+
+/// Vendor per-face draw gate recovered from pix-worker `0x3F25661`
+/// (`ucomiss xmm6, [0x8BAD294]`; `0x8BAD294` = 0.01f).
+///
+/// Faces whose computed degree is not strictly above this value are skipped
+/// before the filter runs. Exposed so callers can reproduce the same gate
+/// instead of drawing a zero-strength pass.
+pub const DRAW_DEGREE_GATE: f32 = 0.01;
+
+/// True when a per-face degree passes the recovered vendor gate.
+pub fn passes_draw_gate(degree: f32) -> bool {
+    degree > DRAW_DEGREE_GATE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +767,216 @@ mod tests {
         let mut p = params();
         p.degree = 1.0e9;
         assert_eq!(p.validate(), Ok(()));
+    }
+
+    // --- four-plane fail-closed contract (PF0 binding) ---------------------
+
+    fn plane<'a>(width: u32, height: u32, channels: PlaneChannels, pixels: &'a [f32]) -> Plane<'a> {
+        Plane { width, height, channels, pixels }
+    }
+
+    fn full_inputs<'a>(
+        src: &'a [f32],
+        blur: &'a [f32],
+        face: &'a [f32],
+        skin: &'a [f32],
+    ) -> SpotlessInputs<'a> {
+        SpotlessInputs {
+            source: plane(2, 1, PlaneChannels::Rgba, src),
+            blur: plane(2, 1, PlaneChannels::Rgb, blur),
+            face_mask: plane(2, 1, PlaneChannels::R, face),
+            skin_mask: plane(2, 1, PlaneChannels::R, skin),
+            params: params(),
+        }
+    }
+
+    #[test]
+    fn four_planes_complete_match_the_reference_apply() {
+        let src_pixels = [0.25f32, 0.25, 0.25, 0.5, 0.0, 0.5, 0.0, 1.0];
+        // `apply` takes an RGBA `ImageF32` for the blur plane; the shader only
+        // reads its rgb. The four-plane contract declares the true 3-channel
+        // layout, so strip the unused alpha for `apply_inputs`.
+        let blur_rgba = [0.5f32, 0.5, 0.5, 0.0, 0.25, 0.5, 0.25, 0.0];
+        let blur_rgb = [0.5f32, 0.5, 0.5, 0.25, 0.5, 0.25];
+        let face = [1.0f32, 1.0];
+        let skin = [1.0f32, 1.0];
+
+        let mut expected = [0.0f32; 8];
+        apply(
+            ImageF32 { width: 2, height: 1, pixels: &src_pixels },
+            ImageF32 { width: 2, height: 1, pixels: &blur_rgba },
+            &face,
+            Some(&skin),
+            params(),
+            &mut expected,
+        )
+        .unwrap();
+
+        let mut actual = [0.0f32; 8];
+        apply_inputs(full_inputs(&src_pixels, &blur_rgb, &face, &skin), &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, [0.5, 0.5, 0.5, 0.5, 0.25, 0.5, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn each_missing_plane_is_named_in_the_refusal() {
+        let src_pixels = [0.25f32; 8];
+        let blur_pixels = [0.25f32; 6];
+        let mask = [1.0f32; 2];
+        let hello = full_inputs(&src_pixels, &blur_pixels, &mask, &mask);
+        let mut out = [9.0f32; 8];
+
+        // source: empty payload / zero extent.
+        let mut missing = hello;
+        missing.source = plane(0, 0, PlaneChannels::Rgba, &[]);
+        assert_eq!(apply_inputs(missing, &mut out), Err(Refusal::MissingInput(PF0_SOURCE)));
+
+        let mut missing = hello;
+        missing.blur = plane(2, 1, PlaneChannels::Rgb, &[]);
+        assert_eq!(apply_inputs(missing, &mut out), Err(Refusal::MissingInput(PF0_BLUR)));
+
+        let mut missing = hello;
+        missing.face_mask = plane(2, 1, PlaneChannels::R, &[]);
+        assert_eq!(
+            apply_inputs(missing, &mut out),
+            Err(Refusal::MissingInput(PF0_FACE_MASK))
+        );
+
+        let mut missing = hello;
+        missing.skin_mask = plane(0, 1, PlaneChannels::R, &mask[..0]);
+        assert_eq!(
+            apply_inputs(missing, &mut out),
+            Err(Refusal::MissingInput(PF0_SKIN_MASK))
+        );
+        assert_eq!(out, [9.0; 8], "missing-plane refusals must not touch output");
+    }
+
+    #[test]
+    fn extent_mismatch_is_refused_by_plane_name() {
+        let src_pixels = [0.25f32; 8];
+        let blur_pixels = [0.25f32; 6];
+        let mask = [1.0f32; 2];
+        let hello = full_inputs(&src_pixels, &blur_pixels, &mask, &mask);
+        let mut out = [9.0f32; 8];
+
+        // Same pixel count but a different declared extent (1x2 vs 2x1).
+        let mut bad = hello;
+        bad.blur = plane(1, 2, PlaneChannels::Rgb, &blur_pixels);
+        assert_eq!(apply_inputs(bad, &mut out), Err(Refusal::ShapeMismatch(PF0_BLUR)));
+
+        // A plane whose extent differs and whose buffer is explicitly wrong.
+        let mut bad = hello;
+        bad.face_mask = plane(3, 1, PlaneChannels::R, &mask);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ShapeMismatch(PF0_FACE_MASK))
+        );
+
+        let mut bad = hello;
+        bad.skin_mask = plane(2, 2, PlaneChannels::R, &[1.0f32; 4]);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ShapeMismatch(PF0_SKIN_MASK))
+        );
+        assert_eq!(out, [9.0; 8]);
+    }
+
+    #[test]
+    fn channel_layout_mismatch_is_refused_by_plane_name() {
+        let src_pixels = [0.25f32; 8];
+        let blur_pixels = [0.25f32; 6];
+        let mask = [1.0f32; 2];
+        let hello = full_inputs(&src_pixels, &blur_pixels, &mask, &mask);
+        let mut out = [9.0f32; 8];
+
+        let mut bad = hello;
+        bad.source = plane(2, 1, PlaneChannels::Rgb, &src_pixels);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ShapeMismatch(PF0_SOURCE_CHANNELS))
+        );
+
+        let mut bad = hello;
+        bad.blur = plane(2, 1, PlaneChannels::Rgba, &blur_pixels);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ShapeMismatch(PF0_BLUR_CHANNELS))
+        );
+
+        let mut bad = hello;
+        bad.face_mask = plane(2, 1, PlaneChannels::Rgb, &[1.0f32; 6]);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ShapeMismatch(PF0_FACE_MASK_CHANNELS))
+        );
+
+        let mut bad = hello;
+        bad.skin_mask = plane(2, 1, PlaneChannels::Rgb, &[1.0f32; 6]);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ShapeMismatch(PF0_SKIN_MASK_CHANNELS))
+        );
+    }
+
+    #[test]
+    fn non_finite_plane_values_are_refused() {
+        let src_pixels = [0.25f32; 8];
+        let blur_pixels = [0.25f32; 6];
+        let mask = [1.0f32; 2];
+        let hello = full_inputs(&src_pixels, &blur_pixels, &mask, &mask);
+        let mut out = [9.0f32; 8];
+
+        let bad_blur = [0.25f32, f32::NAN, 0.5, 0.25, 0.5, 0.25];
+        let mut bad = hello;
+        bad.blur = plane(2, 1, PlaneChannels::Rgb, &bad_blur);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ValueOutOfRange(PF0_BLUR))
+        );
+
+        let bad_skin = [1.0f32, f32::INFINITY];
+        let mut bad = hello;
+        bad.skin_mask = plane(2, 1, PlaneChannels::R, &bad_skin);
+        assert_eq!(
+            apply_inputs(bad, &mut out),
+            Err(Refusal::ValueOutOfRange(PF0_SKIN_MASK))
+        );
+    }
+
+    #[test]
+    fn non_finite_uniforms_are_refused_after_planes_pass() {
+        let src_pixels = [0.25f32; 8];
+        let blur_pixels = [0.25f32; 6];
+        let mask = [1.0f32; 2];
+        let mut inputs = full_inputs(&src_pixels, &blur_pixels, &mask, &mask);
+        inputs.params.degree = f32::NAN;
+        let mut out = [9.0f32; 8];
+        assert_eq!(
+            apply_inputs(inputs, &mut out),
+            Err(Refusal::ValueOutOfRange("spotless_params"))
+        );
+        assert_eq!(out, [9.0; 8]);
+    }
+
+    #[test]
+    fn output_length_must_match_pixel_count() {
+        let src_pixels = [0.25f32; 8];
+        let blur_pixels = [0.25f32; 6];
+        let mask = [1.0f32; 2];
+        let hello = full_inputs(&src_pixels, &blur_pixels, &mask, &mask);
+        let mut short = [0.0f32; 4];
+        assert_eq!(
+            apply_inputs(hello, &mut short),
+            Err(Refusal::ShapeMismatch(PF0_OUTPUT))
+        );
+    }
+
+    #[test]
+    fn draw_gate_matches_the_recovered_vendor_threshold() {
+        assert!(!passes_draw_gate(0.0));
+        assert!(!passes_draw_gate(DRAW_DEGREE_GATE), "gate is strict `>`");
+        assert!(!passes_draw_gate(f32::NEG_INFINITY));
+        assert!(passes_draw_gate(DRAW_DEGREE_GATE + 1.0e-6));
+        assert!(passes_draw_gate(1.0));
     }
 }
