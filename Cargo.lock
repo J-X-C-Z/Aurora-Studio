@@ -485,11 +485,15 @@ dependencies = [
  "anyhow",
  "aurora-portrait",
  "base64 0.22.1",
+ "block2 0.6.2",
  "crc32fast",
  "flate2",
  "image",
  "log",
  "memmap2",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
  "parking_lot",
  "rayon",
  "roxmltree 0.20.0",
@@ -4466,6 +4470,7 @@ dependencies = [
  "block2 0.6.2",
  "dispatch2",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
 ]
 

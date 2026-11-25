@@ -7,6 +7,13 @@
 //!
 //! `AURORA_BLEMISH_FIXTURE` overrides the fixture directory.
 
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("blemish_gpu_bench requires Windows CUDA; skipped on this platform");
+}
+
+#[cfg(windows)]
+mod cuda_bench {
 use aurora_engine::blemish_gainmap::{
     apply_gainmap_16u, apply_gainmap_16u_cpu, apply_gainmap_16u_scalar, apply_gainmap_8u,
     apply_gainmap_8u_cpu, apply_gainmap_8u_scalar, GainMap, SpotlessGainmapInputs,
@@ -44,7 +51,7 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
-fn main() {
+pub(crate) fn main() {
     let dir = std::env::var_os("AURORA_BLEMISH_FIXTURE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -288,4 +295,10 @@ fn main() {
     println!("| CUDA kernel only (device-resident) | {kernel8_ms:.2} |");
     println!();
     println!("transfer size: {} MiB per direction (u16 RGB)", W * H * 3 * 2 / (1024 * 1024));
+}
+}
+
+#[cfg(windows)]
+fn main() {
+    cuda_bench::main();
 }

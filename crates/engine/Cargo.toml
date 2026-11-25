@@ -35,3 +35,12 @@ crc32fast = "1"
 flate2 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 aurora-portrait.workspace = true
+
+# Metal compute runtime (Mac lane, M2). Only linked on macOS; the Windows
+# build keeps using the CUDA stages and never sees these crates. Versions are
+# pinned to the ones already resolved for `gpui-pre-apple` in `Cargo.lock`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"

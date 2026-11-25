@@ -257,6 +257,9 @@ impl Workspace {
 
     fn register_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el.on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+            // Window menu (macOS): GPUI has no built-in minimize/zoom actions.
+            .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| window.zoom_window()))
             .on_action(cx.listener(|this, _: &Import, window, cx| super::import::open(&this.state, window, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_in_new_window(true, window, cx)))
             .on_action(cx.listener(|this, _: &OpenCatalog, window, cx| this.open_in_new_window(false, window, cx)))
@@ -827,6 +830,21 @@ impl Render for Workspace {
                 }
             })
             .when(!showing, |d| d.child(statusbar::status_bar(&self.state, notice, self.notice_serial, window, cx)));
+        // Finder file drops reach GPUI as an `ExternalPaths` drag
+        // (gpui-pre-macos forwards the platform file URLs); import them.
+        #[cfg(target_os = "macos")]
+        let root = root.on_drop({
+            let state = self.state.clone();
+            move |paths: &gpui_kit::ExternalPaths, _, cx| {
+                let paths = paths.paths().to_vec();
+                if !paths.is_empty() {
+                    state.update(cx, |s, cx| {
+                        s.welcome = false;
+                        s.import(paths, cx);
+                    });
+                }
+            }
+        });
         self.register_actions(root, cx)
     }
 }

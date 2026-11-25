@@ -173,7 +173,9 @@ impl Radiance {
     }
 }
 
-#[cfg(test)]
+// CUDA-only ABI/dispatch tests; the Windows driver is the only backend these
+// exercise, so they are not built on platforms without it.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::kernels::radiance::{self, MaskPlanes};
