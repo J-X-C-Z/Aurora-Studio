@@ -6721,9 +6721,22 @@ mod tests {
     fn wait_export(engine: &FileEngine, job_id: u64) -> JobStatus {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            match engine.job_status(job_id) {
+            let status = engine.job_status(job_id);
+            let is_terminal = engine
+                .export_job_ids
+                .lock()
+                .get(&job_id)
+                .copied()
+                .and_then(|jid| engine.export_jobs.job(jid))
+                .map(|record| record.state().is_terminal())
+                .unwrap_or(true);
+            match status {
                 JobStatus::Queued | JobStatus::Running { .. } => {
                     assert!(std::time::Instant::now() < deadline, "export job timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ if !is_terminal => {
+                    assert!(std::time::Instant::now() < deadline, "export job timed out waiting for terminal state");
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 status => return status,
