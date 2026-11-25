@@ -10,6 +10,13 @@
 //! per-face model weight. Nothing is detected, averaged from the image or
 //! defaulted here.
 //!
+//! PF90085 also has a recovered producer degree law (task06 FINDINGS §4.3):
+//! `deg = piecewiseRemap(v, [0,4.5,5,8,10], [0,0,0.1,1,1]) * PF90085`, gated at
+//! `0.001`. `v` is a per-face metric whose physical meaning is LIVE_ONLY, so it
+//! is a required caller input; [`pf90085_apply_law`] refuses when it is absent.
+//! The reduced pixel tail ([`pf90085_apply`]) stays available for hosts that
+//! already hold a resolved degree.
+//!
 //! Channel order is RGBA, matching `Image`; the C# sources are BGRA, so a BGRA
 //! caller swaps R and B before and after.
 //!
@@ -27,7 +34,7 @@ pub const META: &[EffectMeta] = &[
         key: "skinToneUnifyFace",
         label: "Skin tone unify (face)",
         access: Access::Cpu,
-        inputs: &["source", "per-face target", "skin/face/tooth/instance masks", "model weight", "ui", "GammaMap", "74-sample hue/saturation/lightness curves", "sRGB/ProPhoto matrices"],
+        inputs: &["source", "per-face target", "per-face metric v", "skin/face/tooth/instance masks", "model weight", "ui", "GammaMap", "74-sample hue/saturation/lightness curves", "sRGB/ProPhoto matrices"],
     },
     EffectMeta {
         pf: 30059,
@@ -56,6 +63,67 @@ pub const PF90085_MISSING_PRODUCER_INPUTS: &[&str] = &[
     "forward/inverse sRGB/ProPhoto color matrices",
     "UI/preset-to-PF90085 parameter generator",
 ];
+
+/// Recovered degree knots (task06 FINDINGS §4.3, `.rdata` `0x930C7B0`).
+///
+/// `deg = piecewiseRemap(v, PF90085_METRIC_KNOTS, PF90085_METRIC_VALUES) * PF90085`
+/// with a `0.001` gate. `v` is a per-face producer metric whose physical
+/// meaning (brightness / colour distance / skin delta) is LIVE_ONLY, so it is
+/// never inferred here: the caller must pass it, or the row refuses.
+pub const PF90085_METRIC_KNOTS: [f32; 5] = [0.0, 4.5, 5.0, 8.0, 10.0];
+/// Output axis for [`PF90085_METRIC_KNOTS`] (`.rdata` `0x930C79C`).
+pub const PF90085_METRIC_VALUES: [f32; 5] = [0.0, 0.0, 0.1, 1.0, 1.0];
+
+/// Clamped piecewise-linear remap used by the recovered PF90085 producer.
+///
+/// Unlike the pass-through `map` used for the eye rows, the native remap
+/// clamps outside the knot domain: `v <= X[0] -> Y[0]`, `v >= X[last] -> Y[last]`.
+/// A non-finite input, mismatched table, or non-positive span is refused.
+pub fn piecewise_remap_clamped(
+    value: f32,
+    knots: &[f32],
+    values: &[f32],
+) -> Result<f32, Refusal> {
+    if !value.is_finite() {
+        return Err(Refusal::ValueOutOfRange("PF90085_METRIC"));
+    }
+    if knots.len() < 2 || knots.len() != values.len() {
+        return Err(Refusal::ShapeMismatch("PF90085_METRIC_TABLE"));
+    }
+    if value <= knots[0] {
+        return Ok(values[0]);
+    }
+    let last = knots.len() - 1;
+    if value >= knots[last] {
+        return Ok(values[last]);
+    }
+    for index in 1..knots.len() {
+        if value > knots[index] {
+            continue;
+        }
+        let span = knots[index] - knots[index - 1];
+        if !(span > 0.0) {
+            return Err(Refusal::ValueOutOfRange("PF90085_METRIC_TABLE"));
+        }
+        let t = (value - knots[index - 1]) / span;
+        return Ok(values[index - 1] + (values[index] - values[index - 1]) * t);
+    }
+    Ok(values[last])
+}
+
+/// PF90085 producer degree from a **required** per-face metric `v`.
+///
+/// `v` is supplied by the producer; a missing value is a typed refusal rather
+/// than a silent default. The result is not clamped to 1.0 here — the pixel
+/// blend clamps its own alpha — but negative/non-finite `PF90085` is refused.
+pub fn pf90085_metric_degree(metric: Option<f32>, pf90085: f32) -> Result<f32, Refusal> {
+    let metric = metric.ok_or(Refusal::MissingInput("PF90085_FACE_METRIC"))?;
+    if !pf90085.is_finite() || pf90085 < 0.0 {
+        return Err(Refusal::ValueOutOfRange("PF90085"));
+    }
+    let base = piecewise_remap_clamped(metric, &PF90085_METRIC_KNOTS, &PF90085_METRIC_VALUES)?;
+    Ok(base * pf90085)
+}
 
 fn check_image(image: &Image) -> Result<usize, Refusal> {
     if image.width == 0 || image.height == 0 {
@@ -357,11 +425,32 @@ pub struct Pass90085<'a> {
 /// remains OPEN until its Palette and GammaMap inputs are bound end to end.
 /// Supply a target only to exercise this reduced CPU tail.
 pub fn pf90085_apply(source: &Image, pass: &Pass90085<'_>, ui: f32) -> Result<Image, Refusal> {
-    let count = check_image(source)?;
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
         return Err(Refusal::ValueOutOfRange("PF90085_UI"));
     }
-    let degree = ui / 100.0;
+    pf90085_blend(source, pass, ui / 100.0)
+}
+
+/// Recovered producer route: `degree = piecewiseRemap(v, knots, values) * PF90085`
+/// with the `0.001` gate. `v` is the required per-face metric; a missing value
+/// is refused rather than defaulted. The reduced pixel tail is the same blend
+/// used by [`pf90085_apply`].
+pub fn pf90085_apply_law(
+    source: &Image,
+    pass: &Pass90085<'_>,
+    metric: Option<f32>,
+    pf90085: f32,
+) -> Result<Image, Refusal> {
+    let degree = pf90085_metric_degree(metric, pf90085)?;
+    pf90085_blend(source, pass, degree)
+}
+
+fn pf90085_blend(
+    source: &Image,
+    pass: &Pass90085<'_>,
+    degree: f32,
+) -> Result<Image, Refusal> {
+    let count = check_image(source)?;
     if degree <= MASK_GATE {
         return Ok(source.clone());
     }
@@ -660,6 +749,91 @@ pub fn pf30059_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_knots_are_the_recovered_producer_tables() {
+        assert_eq!(PF90085_METRIC_KNOTS, [0.0, 4.5, 5.0, 8.0, 10.0]);
+        assert_eq!(PF90085_METRIC_VALUES, [0.0, 0.0, 0.1, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn metric_remap_hits_each_knot_and_segment() {
+        let x = &PF90085_METRIC_KNOTS;
+        let y = &PF90085_METRIC_VALUES;
+        // Exact knots.
+        for (k, v) in x.iter().zip(y.iter()) {
+            assert!((piecewise_remap_clamped(*k, x, y).unwrap() - *v).abs() < 1e-6);
+        }
+        // 4.5..5.0 ramps 0 -> 0.1.
+        assert!((piecewise_remap_clamped(4.75, x, y).unwrap() - 0.05).abs() < 1e-6);
+        // 5.0..8.0 ramps 0.1 -> 1.0; midpoint 6.5 -> 0.55.
+        assert!((piecewise_remap_clamped(6.5, x, y).unwrap() - 0.55).abs() < 1e-5);
+        // Clamped outside the domain (not pass-through).
+        assert_eq!(piecewise_remap_clamped(-3.0, x, y).unwrap(), 0.0);
+        assert_eq!(piecewise_remap_clamped(12.0, x, y).unwrap(), 1.0);
+        // Non-finite and malformed tables refuse.
+        assert_eq!(
+            piecewise_remap_clamped(f32::NAN, x, y),
+            Err(Refusal::ValueOutOfRange("PF90085_METRIC"))
+        );
+        assert_eq!(
+            piecewise_remap_clamped(1.0, &[0.0], &[0.0]),
+            Err(Refusal::ShapeMismatch("PF90085_METRIC_TABLE"))
+        );
+        assert_eq!(
+            piecewise_remap_clamped(1.0, &[0.0, 1.0], &[0.0]),
+            Err(Refusal::ShapeMismatch("PF90085_METRIC_TABLE"))
+        );
+    }
+
+    #[test]
+    fn metric_degree_multiplies_pf_and_gates() {
+        // v in the flat 0 region -> degree 0 regardless of PF90085.
+        assert_eq!(pf90085_metric_degree(Some(4.0), 1.0).unwrap(), 0.0);
+        // v >= 8 -> base 1.0, times PF90085.
+        assert!((pf90085_metric_degree(Some(9.0), 0.6).unwrap() - 0.6).abs() < 1e-6);
+        // Missing metric is a refusal, never a default.
+        assert_eq!(
+            pf90085_metric_degree(None, 1.0),
+            Err(Refusal::MissingInput("PF90085_FACE_METRIC"))
+        );
+        // Negative/non-finite PF90085 refused.
+        assert_eq!(
+            pf90085_metric_degree(Some(9.0), -0.1),
+            Err(Refusal::ValueOutOfRange("PF90085"))
+        );
+        assert_eq!(
+            pf90085_metric_degree(Some(9.0), f32::INFINITY),
+            Err(Refusal::ValueOutOfRange("PF90085"))
+        );
+    }
+
+    #[test]
+    fn law_entry_refuses_without_metric_and_blends_when_present() {
+        let source = Image::solid(1, 1, [10, 20, 30, 200]);
+        let face = [255u8];
+        let pass = Pass90085 {
+            skin_mask: None,
+            face_mask_g: &face,
+            parsing_a: None,
+            parsing_g: None,
+            parsing_b: None,
+            protect: None,
+            model_weight: None,
+            model_target: None,
+            target: Some([200, 100, 50]),
+        };
+        assert_eq!(
+            pf90085_apply_law(&source, &pass, None, 1.0),
+            Err(Refusal::MissingInput("PF90085_FACE_METRIC"))
+        );
+        // v=0 -> degree 0 -> identity even with a target.
+        assert_eq!(pf90085_apply_law(&source, &pass, Some(0.0), 1.0).unwrap(), source);
+        // v=10, PF90085=1 -> degree 1, support 0.39 -> full-support blend.
+        let out = pf90085_apply_law(&source, &pass, Some(10.0), 1.0).unwrap();
+        // 10 + (200-10)*0.39 = 84.1 -> 84
+        assert_eq!(out.pixel(0, 0), [84, 51, 38, 200]);
+    }
 
     #[test]
     fn parsing_weight_is_point_three_nine() {

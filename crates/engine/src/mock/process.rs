@@ -2098,23 +2098,27 @@ fn upsample(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
     out
 }
 
-/// Resolves the output-domain BandingSuppression for one render.
+/// Resolves the output-domain BandingSuppression amount for one render.
 ///
-/// Disabled unless the source carries both an ISO and a body model, and unless
-/// `c1_banding` can resolve an amount for that body: an unknown body or a zero
-/// amount must not invent a pattern.
-fn banding_plan(src: &Source, adj: &AdjustmentSet) -> Option<BandingPlan> {
+/// The adjustment `extra` key `BandingReductionAmount` is Capture One's
+/// settings field: a positive value is the user's amplitude and replaces the
+/// automatic value; zero or a non-finite value means "keep the automatic
+/// value" (the host gates the field on `> 0`). Without an override only a body
+/// with a measured rule answers, so an unknown body never invents a pattern.
+fn banding_params(src: &Source, adj: &AdjustmentSet) -> Option<crate::c1_banding::Params> {
     let (iso, model) = src.banding_identity.as_ref()?;
-    let range = crate::c1_banding::range_for_frame(None, Some(model))?;
-    let amount = if range.is_adjustable() {
-        range.default
-    } else {
-        crate::c1_banding::default_for_iso(model, *iso)?
-    };
-    let params = crate::c1_banding::params_for_amount(amount);
-    if params == crate::c1_banding::Params::OFF {
-        return None;
-    }
+    crate::c1_banding::params_for_frame(
+        None,
+        Some(model),
+        *iso,
+        adj.extra.get("BandingReductionAmount").copied(),
+        crate::c1_banding::AutoAmount::IsoLadder,
+    )
+}
+
+/// Resolves the output-domain BandingSuppression for one render.
+fn banding_plan(src: &Source, adj: &AdjustmentSet) -> Option<BandingPlan> {
+    let params = banding_params(src, adj)?;
     let (left, right, packed) = crate::c1_banding::vendor_buffers()?;
     let (width, height) = super::geometry::FrameMap::new(src.size(), &adj.geometry).frame_size();
     Some(BandingPlan {
@@ -9905,6 +9909,61 @@ mod banding_tests {
         assert!(
             banding_plan(&source().with_banding_identity(Some(320), Some("SONY ILCE-7M4")), &adj).is_none(),
             "a body without a measured amount must not borrow the Z6III rule"
+        );
+    }
+
+    #[test]
+    fn a_positive_override_replaces_the_automatic_amount() {
+        let src = source().with_banding_identity(Some(1000), Some("NIKON Z 6III"));
+        let mut adj = AdjustmentSet::default();
+        adj.extra.insert("BandingReductionAmount".into(), 150.0);
+        assert_eq!(
+            banding_params(&src, &adj),
+            Some(crate::c1_banding::params_for_amount(150.0))
+        );
+        let automatic = crate::c1_banding::params_for_amount(
+            crate::c1_banding::default_for_iso("NIKON Z 6III", 1000).unwrap(),
+        );
+        assert_ne!(banding_params(&src, &adj), Some(automatic));
+    }
+
+    #[test]
+    fn zero_and_non_finite_overrides_keep_the_automatic_amount() {
+        let src = source().with_banding_identity(Some(1000), Some("NIKON Z 6III"));
+        let automatic = Some(crate::c1_banding::params_for_amount(
+            crate::c1_banding::default_for_iso("NIKON Z 6III", 1000).unwrap(),
+        ));
+        for value in [0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut adj = AdjustmentSet::default();
+            adj.extra.insert("BandingReductionAmount".into(), value);
+            assert_eq!(banding_params(&src, &adj), automatic, "{value}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_override_is_refused() {
+        let src = source().with_banding_identity(Some(1000), Some("NIKON Z 6III"));
+        let mut adj = AdjustmentSet::default();
+        adj.extra.insert("BandingReductionAmount".into(), 1.0e9);
+        assert_eq!(banding_params(&src, &adj), None);
+    }
+
+    #[test]
+    fn a_positive_override_works_without_a_measured_body_rule() {
+        let src = source().with_banding_identity(Some(320), Some("SONY ILCE-7M4"));
+        let mut adj = AdjustmentSet::default();
+        adj.extra.insert("BandingReductionAmount".into(), 80.0);
+        assert_eq!(
+            banding_params(&src, &adj),
+            Some(crate::c1_banding::params_for_amount(80.0)),
+            "an explicit user amount does not need a body rule"
+        );
+        let mut untouched = AdjustmentSet::default();
+        untouched.extra.insert("BandingReductionAmount".into(), 0.0);
+        assert_eq!(
+            banding_params(&src, &untouched),
+            None,
+            "zero stays 'no override', and the body has no automatic rule"
         );
     }
 

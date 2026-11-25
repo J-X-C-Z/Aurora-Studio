@@ -1555,16 +1555,72 @@ fn default_export_concurrency() -> usize {
 }
 
 fn default_export_memory_budget() -> usize {
-    const MIN_BUDGET: usize = 512 * 1024 * 1024;
-    const MAX_BUDGET: usize = 1536 * 1024 * 1024;
-    const FALLBACK: usize = 1024 * 1024 * 1024;
     match system_memory_bytes() {
-        Some((total, avail)) => {
-            let basis = avail.max(total / 2);
-            ((basis / 4) as usize).clamp(MIN_BUDGET, MAX_BUDGET)
-        }
-        None => FALLBACK,
+        Some((total, available)) => export_memory_budget_from_memory(total, available),
+        None => EXPORT_BUDGET_FALLBACK_BYTES,
     }
+}
+
+/// Smallest budget. A job larger than this still runs, alone, through the
+/// scheduler's `active_slots == 0` door, so the floor only decides how many
+/// *small* jobs pair, never whether a large one starts.
+const EXPORT_BUDGET_MIN_BYTES: usize = 512 * 1024 * 1024;
+
+/// Only used when the platform cannot report installed memory.
+const EXPORT_BUDGET_FALLBACK_BYTES: usize = 1024 * 1024 * 1024;
+
+/// What the export budget must leave for everything that is not an export: the
+/// 3 GiB foreground viewer, the decoded-source cache this engine keeps (2.67 GiB
+/// at 32 GiB installed, from [`source_cache_budget_from_memory`]) and the
+/// engine's own steady state. The last term is measured, not guessed: the
+/// `r10-real-strict-v1` solo arm ended a 24 MP 16-bit batch at 817 MiB working
+/// set with 372 MiB of native source cached, so everything but the source and
+/// the export buffers is about 445 MiB.
+const EXPORT_BUDGET_RESERVE: u64 = 6 * 1024 * 1024 * 1024;
+
+/// Frame the ceiling is sized from: the 24 MP frame a batch is usually built
+/// from. Two of these must pair; three must not.
+const EXPORT_CEILING_REFERENCE: (u32, u32) = (6000, 4000);
+
+/// Hard ceiling for the export admission budget, derived from the charge the
+/// scheduler already applies rather than from a round number.
+///
+/// One 24 MP 16-bit native-RAW job charges
+/// `estimated_decode_bytes(6000,4000,RawNative)` (672 MB: 384 MB retained +
+/// 288 MB decode transient) + `estimated_export_bytes(6000,4000,16)` (864 MB) =
+/// 1,536 MB, so two jobs need 3,072 MB. The ceiling is 2.4 jobs
+/// (1,536 x 12 / 5 = 3,686 MB = 3,516 MiB): a 26-30 MP frame can still pair
+/// with a 24 MP one, while a third 24 MP job at the real 6,048x4,032 size
+/// (3 x 1,561 MB = 4,683 MB) can never fit, and two 45 MP jobs
+/// (2 x 2,908 MB = 5,816 MB) never fit either.
+fn export_budget_ceiling() -> usize {
+    let reference = estimated_decode_bytes(
+        EXPORT_CEILING_REFERENCE.0,
+        EXPORT_CEILING_REFERENCE.1,
+        DecodeFormat::RawNative,
+    )
+    .saturating_add(estimated_export_bytes(
+        EXPORT_CEILING_REFERENCE.0,
+        EXPORT_CEILING_REFERENCE.1,
+        16,
+    ));
+    reference.saturating_mul(12) / 5
+}
+
+/// Export budget: an eighth of installed memory, shrunk by whatever the machine
+/// does not actually have free, then clamped into [min, ceiling].
+///
+/// An eighth is the point where a 32 GiB machine reaches the ceiling (two full
+/// 24 MP jobs) and a 16 GiB machine stays at one (1,489 MiB fits, two do not).
+/// The available-memory term is what keeps the budget honest under pressure: a
+/// 32 GiB machine with 5 GiB free gets the 512 MiB floor, not 3,516 MiB.
+fn export_memory_budget_from_memory(total: u64, available: u64) -> usize {
+    let by_installation = usize::try_from(total / 8).unwrap_or(usize::MAX);
+    let by_availability =
+        usize::try_from(available.saturating_sub(EXPORT_BUDGET_RESERVE)).unwrap_or(0);
+    by_installation
+        .min(by_availability)
+        .clamp(EXPORT_BUDGET_MIN_BYTES, export_budget_ceiling())
 }
 
 /// Rough peak working-set estimate for one export job based on output dimensions
@@ -7675,6 +7731,159 @@ mod tests {
         }
     }
 
+    fn export_budget_mib(total_mib: u64, available_mib: u64) -> usize {
+        export_memory_budget_from_memory(total_mib * 1024 * 1024, available_mib * 1024 * 1024) / (1024 * 1024)
+    }
+
+    /// Admits `charge` on a worker thread and reports whether it started within
+    /// 150 ms; a refusal is cancelled so the probe cannot hang the test.
+    fn admitted_while_busy(scheduler: &Arc<ExportScheduler>, charge: usize) -> bool {
+        use std::sync::atomic::AtomicBool;
+        let admitted = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let scheduler = Arc::clone(scheduler);
+            let admitted = Arc::clone(&admitted);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                if scheduler
+                    .acquire_cancellable(charge, || cancel.load(Ordering::SeqCst))
+                    .is_some()
+                {
+                    admitted.store(true, Ordering::SeqCst);
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let started = admitted.load(Ordering::SeqCst);
+        cancel.store(true, Ordering::SeqCst);
+        scheduler.notify_all();
+        worker.join().unwrap();
+        started
+    }
+
+    #[test]
+    fn export_budget_scales_from_installed_memory_and_stays_in_bounds() {
+        let mib = 1024 * 1024usize;
+        let ceiling = export_budget_ceiling();
+        assert_eq!(ceiling, 3_686_400_000, "2.4 standard-job charges: {ceiling}");
+        assert_eq!(
+            export_memory_budget_from_memory(32 * 1024 * mib as u64, 24 * 1024 * mib as u64),
+            ceiling,
+            "32 GiB must reach the derived ceiling"
+        );
+        assert_eq!(export_budget_mib(16 * 1024, 16 * 1024), 2048, "16 GiB holds one standard job, not two");
+        assert_eq!(export_budget_mib(8 * 1024, 8 * 1024), 1024, "an 8 GiB machine keeps one job in flight");
+        assert_eq!(
+            export_memory_budget_from_memory(128 * 1024 * mib as u64, 120 * 1024 * mib as u64),
+            ceiling,
+            "larger machines keep the derived ceiling"
+        );
+        assert_eq!(export_budget_mib(32 * 1024, 5 * 1024), 512, "pressure collapses the budget to the floor");
+        assert_eq!(export_budget_mib(32 * 1024, 6 * 1024), 512, "the reserve exactly offsets a 6 GiB free reading");
+        assert_eq!(export_budget_mib(32 * 1024, 7 * 1024), 1024, "just above the reserve leaves 1 GiB");
+    }
+
+    #[test]
+    fn export_budget_admits_two_24mp_jobs_and_not_three() {
+        use std::sync::atomic::AtomicBool;
+        let mib = 1024 * 1024usize;
+        let budget = export_memory_budget_from_memory(32 * mib as u64, 24 * mib as u64);
+        let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
+        let full = (6048u32, 4032u32);
+        let charge = estimated_decode_bytes(full.0, full.1, DecodeFormat::RawNative)
+            + estimated_export_bytes(full.0, full.1, 16);
+        let first = scheduler.acquire_cancellable(charge, || false);
+        assert!(first.is_some(), "the first standard job must always be admitted");
+        let hold = Arc::new(AtomicBool::new(true));
+        let worker = {
+            let scheduler = Arc::clone(&scheduler);
+            let hold = Arc::clone(&hold);
+            std::thread::spawn(move || {
+                let second = scheduler.acquire_cancellable(charge, || false);
+                assert!(second.is_some(), "the second standard job must be admitted");
+                while hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(scheduler.stats().0, 2, "exactly two 24 MP jobs are active");
+        assert!(!admitted_while_busy(&scheduler, charge), "a third standard job must wait: {charge} * 3 > {budget}");
+        hold.store(false, Ordering::SeqCst);
+        worker.join().unwrap();
+        drop(first);
+        scheduler.notify_all();
+        let (active, used, _) = scheduler.stats();
+        assert_eq!((active, used), (0, 0), "both permits were released");
+    }
+
+    #[test]
+    fn export_budget_binds_two_45mp_jobs() {
+        let mib = 1024 * 1024usize;
+        let budget = export_memory_budget_from_memory(32 * mib as u64, 24 * mib as u64);
+        let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
+        let full = (8256u32, 5504u32);
+        let charge = estimated_decode_bytes(full.0, full.1, DecodeFormat::RawNative)
+            + estimated_export_bytes(full.0, full.1, 16);
+        let first = scheduler.acquire_cancellable(charge, || false);
+        assert!(first.is_some(), "a 45 MP job alone must still be admitted");
+        assert!(!admitted_while_busy(&scheduler, charge), "two 45 MP jobs must wait: {charge} * 2 > {budget}");
+    }
+
+    #[test]
+    fn export_budget_never_refuses_a_single_over_budget_job() {
+        let mib = 1024 * 1024usize;
+        let budget = export_memory_budget_from_memory(32 * mib as u64, 5 * mib as u64);
+        assert_eq!(budget, 512 * mib, "the pressure floor is the budget here");
+        let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
+        let permit = scheduler
+            .acquire_cancellable(4096 * mib, || false)
+            .expect("an over-budget job runs alone on an idle scheduler");
+        assert_eq!(scheduler.stats().0, 1);
+        let (second, third) = (
+            admitted_while_busy(&scheduler, mib),
+            admitted_while_busy(&scheduler, mib),
+        );
+        assert!(!second, "the floor budget must not pair anything with the big job");
+        assert!(!third);
+        drop(permit);
+        assert_eq!(scheduler.stats().0, 0);
+        let _ = scheduler.acquire_cancellable(4096 * mib, || false).expect("the door reopens after release");
+    }
+
+    #[test]
+    fn export_budget_holds_fifo_across_sizes() {
+        let mib = 1024 * 1024usize;
+        let scheduler = Arc::new(ExportScheduler::with_limits(1, 8 * mib));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let holder = scheduler.acquire_cancellable(8 * mib, || false).expect("the gate starts held");
+        let tickets: Vec<_> = (0..3).map(|_| scheduler.enqueue(8 * mib)).collect();
+        let mut threads = Vec::new();
+        for (index, ticket) in tickets.into_iter().enumerate() {
+            let order = Arc::clone(&order);
+            let scheduler = Arc::clone(&scheduler);
+            threads.push(std::thread::spawn(move || {
+                let mut guard = scheduler.ticket_guard(ticket);
+                let _permit = scheduler
+                    .wait_guarded(&mut guard, || false)
+                    .expect("each queued job is admitted in turn");
+            order.lock().push(index);
+            })
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        drop(holder);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(*order.lock(), [0, 1, 2], "admission order must be submission order");
+        let (active, used, _) = scheduler.stats();
+        assert_eq!(active, 0);
+        assert_eq!(used, 0);
+        assert_eq!(scheduler.queued(), 0);
+    }
+
+    // ---- S2: decoded-source byte budget + per-image single-flight ----
     #[test]
     fn decode_gate_admits_preview_before_thumbnail() {
         let gate = Arc::new(DecodeGate::new(1));

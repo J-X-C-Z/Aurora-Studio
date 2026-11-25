@@ -95,6 +95,14 @@ impl<V> ByteLru<V> {
         self.bytes
     }
 
+    /// Every stored value. A cache that keeps one allocation under several
+    /// keys (the AI mask cache does, for `Subject`/`Person`/`Clothing`) counts
+    /// these to tell a real outside holder apart from the other keys that
+    /// share the same value.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.slots.values().map(|slot| &slot.value)
+    }
+
     /// Records a use and returns the value. The caller clones it, and that
     /// clone keeps the entry protected from eviction while it lives.
     pub(crate) fn get(&mut self, key: &str) -> Option<&V> {

@@ -4,16 +4,118 @@
 //!
 //! Whether the stored channels are `(dx, dy)` or absolute `(x', y')`, and the
 //! field scale, are not proven, so both are explicit caller inputs.
+//!
+//! The recovered parameter producer is per-face binary32 only:
+//! `W_geometry = f32(PF30188 * PF90034)` and `W_shadow = f32(PF90034 * PF30189)`
+//! (worker `0x7AEEA97`/`0x7AEEA9C`). There is no clamp, `/100`, or `0..1`
+//! normalization in the fixed PE. A face absent from the vendor
+//! `std::map<face_index, node>` yields `0.0f` (`0x7AEE963..0x7AEE987`).
+//! PF30209 (jawline) is written to `stage+0x3A0/+0x3B8` but the stage copy at
+//! `0x7AF2FD0` does not forward those slots, so it never enters this producer.
 
 use crate::{Access, EffectMeta, Image, Refusal};
 
 pub const META: &[EffectMeta] = &[EffectMeta {
     pf: 90034,
-    key: "",
+    key: "removeDoubleChin",
     label: "祛双下巴",
     access: Access::Cpu,
-    inputs: &["dense 2-channel shift field", "mode (Flow | Absolute)", "scale"],
+    inputs: &[
+        "native PF90034 per-face value",
+        "native PF30188 per-face value",
+        "native PF30189 per-face value",
+        "face parsing channels 10/11/14/6/8/9",
+        "dense 2-channel shift field",
+        "mode (Flow | Absolute)",
+        "scale",
+    ],
 }];
+
+/// Vendor execution gate at `0x8BFC350`, loaded with `movsd` as binary64
+/// (`2D431CEBE2361A3F`). Values are widened from the f32 products before
+/// `ucomisd` at `0x7E47324` / `0x7E47331`.
+pub const WEIGHT_GATE: f64 = 1e-4;
+
+/// One face's recovered binary32 weights, written to `node+0x7B0` (geometry)
+/// and `node+0x7AC` (shadow).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Weights {
+    pub geometry: f32,
+    pub shadow: f32,
+}
+
+impl Weights {
+    /// The only SSE arithmetic in the recovered producer:
+    /// `W_geometry = PF30188 * PF90034`, `W_shadow = PF90034 * PF30189`.
+    /// The multiply is deliberately raw: no clamp, scale, or normalization.
+    pub fn from_degrees(pf90034: f32, pf30188: f32, pf30189: f32) -> Self {
+        Self {
+            geometry: pf30188 * pf90034,
+            shadow: pf90034 * pf30189,
+        }
+    }
+
+    /// `W_shadow >= 1e-4 || W_geometry >= 1e-4` continues (`0x7E47335`).
+    ///
+    /// `ucomisd` reports unordered for NaN, so a NaN product also passes the
+    /// machine gate. That is the recovered instruction semantics, not a
+    /// product contract; callers that need finite values should validate
+    /// first (as `per_face_weights` and `double_chin_weights` do).
+    pub fn is_active(self) -> bool {
+        let geometry = f64::from(self.geometry);
+        let shadow = f64::from(self.shadow);
+        geometry >= WEIGHT_GATE
+            || shadow >= WEIGHT_GATE
+            || geometry.is_nan()
+            || shadow.is_nan()
+    }
+}
+
+/// Vendor `std::map<face_index, node>` lookup for one face. A PF node that is
+/// structurally absent is the recovered `0.0f` miss, not an error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceDegrees {
+    pub face_id: u32,
+    pub pf90034: Option<f32>,
+    pub pf30188: Option<f32>,
+    pub pf30189: Option<f32>,
+}
+
+impl FaceDegrees {
+    pub fn weights(self) -> Weights {
+        Weights::from_degrees(
+            self.pf90034.unwrap_or(0.0),
+            self.pf30188.unwrap_or(0.0),
+            self.pf30189.unwrap_or(0.0),
+        )
+    }
+}
+
+/// Evaluate the recovered producer once per face. Each face keeps its own
+/// binary32 pair: no broadcasting, cross-face accumulation, or normalization.
+///
+/// An empty packet is a missing same-job input. Duplicate face ids are a
+/// malformed vendor map. Non-finite products are refused before any caller can
+/// rely on the NaN-passes-gate machine quirk.
+pub fn per_face_weights(faces: &[FaceDegrees]) -> Result<Vec<(u32, Weights)>, Refusal> {
+    if faces.is_empty() {
+        return Err(Refusal::MissingInput("PF90034 per-face packet"));
+    }
+    let mut seen = Vec::with_capacity(faces.len());
+    let mut out = Vec::with_capacity(faces.len());
+    for face in faces {
+        if seen.contains(&face.face_id) {
+            return Err(Refusal::ShapeMismatch("PF90034 duplicate face id"));
+        }
+        seen.push(face.face_id);
+        let weights = face.weights();
+        if !weights.geometry.is_finite() || !weights.shadow.is_finite() {
+            return Err(Refusal::ValueOutOfRange("PF90034 per-face weights"));
+        }
+        out.push((face.face_id, weights));
+    }
+    Ok(out)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -140,5 +242,99 @@ mod tests {
             warp(&source, &[[0.0, 0.0]; 4], Mode::Flow, f32::INFINITY),
             Err(Refusal::ValueOutOfRange("shift scale"))
         );
+    }
+
+    #[test]
+    fn weights_are_raw_binary32_products_without_scale_or_clamp() {
+        // 200 * 3 would become 6 (or 0.06) under any /100 or 0..1 clamp.
+        let large = Weights::from_degrees(200.0, 3.0, 4.0);
+        assert_eq!(large.geometry, 600.0);
+        assert_eq!(large.shadow, 800.0);
+        // Negative products are not clamped to zero either.
+        let negative = Weights::from_degrees(-1.0, 2.0, 3.0);
+        assert_eq!(negative.geometry, -2.0);
+        assert_eq!(negative.shadow, -3.0);
+        // The recovered operands are `PF30188 * PF90034` and `PF90034 * PF30189`.
+        assert_eq!(Weights::from_degrees(0.5, 0.4, 0.2), Weights {
+            geometry: 0.4 * 0.5,
+            shadow: 0.5 * 0.2,
+        });
+    }
+
+    #[test]
+    fn gate_uses_the_binary64_1e_4_threshold() {
+        // Clearly above / below the recovered constant.
+        assert!(Weights { geometry: 2e-4, shadow: 0.0 }.is_active());
+        assert!(Weights { geometry: 0.0, shadow: 2e-4 }.is_active());
+        assert!(!Weights { geometry: 5e-5, shadow: 5e-5 }.is_active());
+        assert!(!Weights { geometry: 0.0, shadow: 0.0 }.is_active());
+        // Negative degrees cannot pass the `>= 1e-4` comparison.
+        assert!(!Weights { geometry: -1.0, shadow: -2.0 }.is_active());
+    }
+
+    #[test]
+    fn per_face_weights_do_not_mix_or_accumulate_faces() {
+        let faces = [
+            FaceDegrees {
+                face_id: 1,
+                pf90034: Some(0.5),
+                pf30188: Some(0.4),
+                pf30189: Some(0.2),
+            },
+            FaceDegrees {
+                face_id: 2,
+                pf90034: Some(2.0),
+                pf30188: Some(3.0),
+                pf30189: Some(-1.0),
+            },
+        ];
+        let out = per_face_weights(&faces).unwrap();
+        assert_eq!(out[0], (1, Weights { geometry: 0.2, shadow: 0.1 }));
+        assert_eq!(out[1], (2, Weights { geometry: 6.0, shadow: -2.0 }));
+    }
+
+    #[test]
+    fn missing_face_nodes_follow_the_vendor_zero_miss() {
+        let face = FaceDegrees {
+            face_id: 7,
+            pf90034: None,
+            pf30188: Some(0.4),
+            pf30189: Some(0.2),
+        };
+        assert_eq!(face.weights(), Weights { geometry: 0.0, shadow: 0.0 });
+        assert!(!face.weights().is_active());
+    }
+
+    #[test]
+    fn empty_packets_and_malformed_maps_are_refused_by_name() {
+        assert_eq!(
+            per_face_weights(&[]),
+            Err(Refusal::MissingInput("PF90034 per-face packet"))
+        );
+        let duplicate = [
+            FaceDegrees { face_id: 3, pf90034: Some(1.0), pf30188: Some(1.0), pf30189: Some(1.0) },
+            FaceDegrees { face_id: 3, pf90034: Some(1.0), pf30188: Some(1.0), pf30189: Some(1.0) },
+        ];
+        assert_eq!(
+            per_face_weights(&duplicate),
+            Err(Refusal::ShapeMismatch("PF90034 duplicate face id"))
+        );
+        let nan = [FaceDegrees {
+            face_id: 4,
+            pf90034: Some(f32::NAN),
+            pf30188: Some(1.0),
+            pf30189: Some(1.0),
+        }];
+        assert_eq!(
+            per_face_weights(&nan),
+            Err(Refusal::ValueOutOfRange("PF90034 per-face weights"))
+        );
+    }
+
+    #[test]
+    fn nan_passes_the_recovered_machine_gate() {
+        // `ucomisd` treats unordered as passing; this documents the recovered
+        // instruction semantics even though callers refuse NaN upstream.
+        assert!(Weights::from_degrees(f32::NAN, 1.0, 1.0).is_active());
     }
 }

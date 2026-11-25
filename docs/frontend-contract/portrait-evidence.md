@@ -4,7 +4,8 @@
 - 会话：frontend-opus（rv24）
 - 数据源：`03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv`
 - 前端内嵌副本：`docs/frontend-contract/portrait-capability-registry-20261124.tsv`
-  76,393 字节，SHA256 `f3986958a2415cd08bdcd3a6a98d5b2da6a23df90bfd7c4d68d0f41b8ccc9bc1`（与源文件逐字节一致）
+  86,739 字节，SHA256 `d1b92c6f0b1d15b2807f917c1298c5cbac4f72449c38e9f4e6af92a28fed85c4`（2026-11-25 与源文件及
+  `crates/portrait/assets/portrait/` 副本逐字节一致；`cargo test -p portrait-app --lib evidence::` 会校验）
 - 解析与判定代码：`crates/app/src/evidence.rs`
 
 ## 1. 七级证据
@@ -67,8 +68,8 @@
 
 - 重新同步能力表时：覆盖 `docs/frontend-contract/portrait-capability-registry-20261124.tsv`，
   同步更新 `evidence.rs` 里的 `REGISTRY_SHA256` 与 `REGISTRY_BYTES`。
-- `cargo test -p lumen-app --lib` 会校验：每行 18 列、147 个 effect、8 个 ev5、
+- `cargo test -p portrait-app --lib evidence::` 会校验：每行 18 列、147 个 effect、8 个 ev5、
   ev6/ev7 为 0、PF30096/90021/44297 的结论、以及内嵌副本字节数。
-- 已知口径差异：`90_work/lanes/backend-opt/rv24_bo2/PORTRAIT-CONTRACT-UPDATE.md` 记录的
-  registry SHA `69ad4457…` / 72,620 字节与磁盘当前文件（`f3986958…` / 76,393 字节）不一致，
-  本篇以磁盘实测为准，需 portrait-parse 复核。
+- 历史口径差异：`90_work/lanes/backend-opt/rv24_bo2/PORTRAIT-CONTRACT-UPDATE.md` 记录的
+  registry SHA `69ad4457…` / 72,620 字节、原前端副本 `f3986958…` / 76,393 字节均已过时。
+  2026-11-25 同步后以磁盘实测 `d1b92c6f…` / 86,739 字节为准（capability-sync 2026-11-25）。

@@ -140,6 +140,24 @@ struct SendBuffer(DeviceBuffer<'static>);
 // it; `State` serialises every use.
 unsafe impl Send for SendBuffer {}
 
+/// Frame-sized slots a call needs. `Frame` is the pixel stage's own RGBA
+/// buffer; a cross-stage handoff already owns the frame in another stage's
+/// pool, so it must not open, allocate or bill a second `Frame` slot.
+const WITH_FRAME_SLOTS: [Slot; 3] = [Slot::Frame, Slot::Scratch, Slot::Aux0];
+const EXTERNAL_FRAME_SLOTS: [Slot; 2] = [Slot::Scratch, Slot::Aux0];
+
+fn frame_slots(with_frame: bool) -> &'static [Slot] {
+    if with_frame { &WITH_FRAME_SLOTS } else { &EXTERNAL_FRAME_SLOTS }
+}
+
+/// Device bytes the frame-sized slots plus the node table reserve for one call.
+/// Pure so the resident-handoff saving is testable without a GPU.
+fn pooled_slot_bytes(bytes: usize, node_bytes: usize, with_frame: bool) -> usize {
+    bytes
+        .saturating_mul(frame_slots(with_frame).len())
+        .saturating_add(node_bytes)
+}
+
 struct Pool {
     gpu: Gpu,
     taps: SendBuffer,
@@ -148,9 +166,14 @@ struct Pool {
 }
 
 impl Pool {
-    fn open(bytes: usize, node_bytes: usize, taps_bytes: usize) -> Result<Self, Failure> {
+    fn open(
+        bytes: usize,
+        node_bytes: usize,
+        taps_bytes: usize,
+        with_frame: bool,
+    ) -> Result<Self, Failure> {
         let mut gpu = Gpu::open("pixel", PTX)?;
-        for slot in [Slot::Frame, Slot::Scratch, Slot::Aux0] {
+        for &slot in frame_slots(with_frame) {
             gpu.reserve(slot, bytes, MAX_RETAINED_BYTES)?;
         }
         gpu.reserve(Slot::Aux2, node_bytes.max(12), MAX_RETAINED_BYTES)?;
@@ -160,8 +183,14 @@ impl Pool {
         Ok(Self { gpu, taps, stats, taps_bytes })
     }
 
-    fn ensure(&mut self, bytes: usize, node_bytes: usize, taps_bytes: usize) -> Result<(), Failure> {
-        for slot in [Slot::Frame, Slot::Scratch, Slot::Aux0] {
+    fn ensure(
+        &mut self,
+        bytes: usize,
+        node_bytes: usize,
+        taps_bytes: usize,
+        with_frame: bool,
+    ) -> Result<(), Failure> {
+        for &slot in frame_slots(with_frame) {
             self.gpu.reserve(slot, bytes, MAX_RETAINED_BYTES)?;
         }
         self.gpu.reserve(Slot::Aux2, node_bytes.max(12), MAX_RETAINED_BYTES)?;
@@ -219,11 +248,34 @@ fn with_pool<T>(
     taps_bytes: usize,
     body: impl FnOnce(&mut Pool) -> Result<T, Failure>,
 ) -> Option<T> {
-    if bytes.saturating_mul(3).saturating_add(node_bytes) > MAX_RETAINED_BYTES {
+    with_pool_impl(bytes, node_bytes, taps_bytes, true, body)
+}
+
+/// Like [`with_pool`], but for the resident detail->grain handoff: the RGBA
+/// frame already lives in `detail`'s pool, so this call reserves and bills only
+/// the planes and taps it actually uses. It never allocates a `Frame` slot.
+fn with_pool_external_frame<T>(
+    bytes: usize,
+    node_bytes: usize,
+    taps_bytes: usize,
+    body: impl FnOnce(&mut Pool) -> Result<T, Failure>,
+) -> Option<T> {
+    with_pool_impl(bytes, node_bytes, taps_bytes, false, body)
+}
+
+fn with_pool_impl<T>(
+    bytes: usize,
+    node_bytes: usize,
+    taps_bytes: usize,
+    with_frame: bool,
+    body: impl FnOnce(&mut Pool) -> Result<T, Failure>,
+) -> Option<T> {
+    let need = pooled_slot_bytes(bytes, node_bytes, with_frame);
+    if need > MAX_RETAINED_BYTES {
         super::gpu_runtime::note_fallback(
             "pixel",
             &Failure::TooLarge {
-                need: bytes.saturating_mul(3).saturating_add(node_bytes),
+                need,
                 cap: MAX_RETAINED_BYTES,
             },
         );
@@ -232,10 +284,10 @@ fn with_pool<T>(
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     match &mut *state {
         State::Unavailable => None,
-        State::NotTried => match Pool::open(bytes, node_bytes, taps_bytes) {
+        State::NotTried => match Pool::open(bytes, node_bytes, taps_bytes, with_frame) {
             Ok(mut pool) => {
                 let result = pool
-                    .ensure(bytes, node_bytes, taps_bytes)
+                    .ensure(bytes, node_bytes, taps_bytes, with_frame)
                     .and_then(|()| body(&mut pool));
                 match result {
                     Ok(value) => {
@@ -258,7 +310,7 @@ fn with_pool<T>(
             }
         },
         State::Ready(pool) => match pool
-            .ensure(bytes, node_bytes, taps_bytes)
+            .ensure(bytes, node_bytes, taps_bytes, with_frame)
             .and_then(|()| body(pool))
         {
             Ok(value) => Some(value),
@@ -898,7 +950,7 @@ pub(crate) fn grain_stage_resident(
     let (ox, oy) = super::grain::noise_offsets();
     let frame = resident.handle();
 
-    let ran = with_pool(bytes, node_bytes, taps.len() * 4, |pool| {
+    let ran = with_pool_external_frame(bytes, node_bytes, taps.len() * 4, |pool| {
         // This call replaces grain's own frame upload: the pixels are already
         // on the device in the detail frame slot.
         pool.gpu.note_skipped_upload();
@@ -924,6 +976,28 @@ mod tests {
     use crate::dust_lcc::{parse_light_falloff, LightFalloffLimit, UniformLight};
     use crate::GrainKind;
     use std::time::Instant;
+
+    /// The resident detail->grain handoff reuses detail's frame, so it must
+    /// neither allocate nor bill a pixel `Frame` slot of its own. Pure: no GPU.
+    #[test]
+    fn resident_grain_does_not_reserve_the_unused_frame_slot() {
+        assert_eq!(frame_slots(true).len(), 3);
+        assert_eq!(frame_slots(false).len(), 2);
+        assert!(frame_slots(false).iter().all(|slot| *slot != Slot::Frame));
+
+        // 24 MP (Z6III) frame: the handoff saves exactly one frame-sized lease.
+        let bytes = 6048 * 4032 * 4;
+        assert_eq!(
+            pooled_slot_bytes(bytes, 12, true) - pooled_slot_bytes(bytes, 12, false),
+            bytes,
+            "external-frame call must skip exactly one frame-sized reservation"
+        );
+        // The node table is charged in both cases and never by the frame.
+        assert_eq!(
+            pooled_slot_bytes(bytes, 12, false) - pooled_slot_bytes(bytes, 0, false),
+            12
+        );
+    }
 
     fn real_lcc() -> Option<Vec<u8>> {
         crate::testdata::bytes("testdata/real-lightfalloff-24x16.lcc")

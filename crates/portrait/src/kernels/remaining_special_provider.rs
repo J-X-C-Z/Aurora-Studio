@@ -7,7 +7,7 @@
 
 use crate::{Image, Refusal};
 
-use super::{body_geometry, skin_adjust};
+use super::{body_geometry, double_chin, skin_adjust};
 
 pub const PF90001_PIXEL_LAW_OPEN: &str =
     "PF90001 requires the SkinDB service response and final model-to-source blend";
@@ -103,11 +103,9 @@ pub fn contract(pf: u32) -> Option<RemainingSpecialContract> {
     CONTRACTS.iter().copied().find(|row| row.pf == pf)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DoubleChinWeights {
-    pub geometry: f32,
-    pub shadow: f32,
-}
+/// Canonical per-face weights live in the double-chin kernel; this alias keeps
+/// the provider's public name stable.
+pub use super::double_chin::Weights as DoubleChinWeights;
 
 /// Static PF30188/30189 producer. These are already-native values; no UI scale
 /// or clamp is inferred here. The caller still owns the model and ROI stages.
@@ -122,10 +120,11 @@ pub fn double_chin_weights(
     {
         return Err(Refusal::ValueOutOfRange("double chin native values"));
     }
-    Ok(DoubleChinWeights {
-        geometry: native_pf90034 * native_pf30188,
-        shadow: native_pf90034 * native_pf30189,
-    })
+    Ok(DoubleChinWeights::from_degrees(
+        native_pf90034,
+        native_pf30188,
+        native_pf30189,
+    ))
 }
 
 /// PF403 delegates to the recovered source-mask kernel.
@@ -205,16 +204,63 @@ pub fn silkworm(inputs: Pf101SameJobInputs<'_>) -> Result<Image, Refusal> {
     Err(Refusal::MissingInput(PF101_LIVE_ONLY))
 }
 
+/// PF30209 operates on the vendor 194-point face packet.
+pub const JAWLINE_POINTS: usize = 194;
+/// `center = L[54]` (`0x80A0A2C`/`0x80A0A44`).
+pub const JAWLINE_CENTER: usize = 54;
+/// Fixed window `L[109..=141]` (`0x80A0A1C`/`0x80A0A24`).
+pub const JAWLINE_WINDOW_START: usize = 109;
+pub const JAWLINE_WINDOW_END: usize = 141;
+/// `L[109..=141]` is 33 points; the vendor reads point 141 inclusively.
+pub const JAWLINE_WINDOW_LEN: usize = JAWLINE_WINDOW_END - JAWLINE_WINDOW_START + 1;
+
+/// The recovered static PF30209 consumer only tests `any(value > 0)`
+/// (`0x7D150B8` `movss`/`ucomiss`/`seta`). The magnitude is never used as a
+/// weight in the fixed PE. An empty map has no active node.
+pub fn jawline_active(per_face_pf30209: &[f32]) -> bool {
+    per_face_pf30209.iter().any(|value| *value > 0.0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JawlineWindow {
+    pub center: [f32; 2],
+    pub contour: [[f32; 2]; JAWLINE_WINDOW_LEN],
+}
+
+/// Extract `center = L[54]` and the fixed 33-point window `L[109..=141]`.
+///
+/// This is the raw landmark range, not the vendor "ordered" contour: the
+/// ordered index table is a same-job input the fixed PE does not contain.
+pub fn jawline_window(points: &[[f32; 2]]) -> Result<JawlineWindow, Refusal> {
+    if points.is_empty() {
+        return Err(Refusal::MissingInput("PF30209 face_194_packet"));
+    }
+    if points.len() != JAWLINE_POINTS {
+        return Err(Refusal::ShapeMismatch("PF30209 face_194_packet"));
+    }
+    if points.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(Refusal::ValueOutOfRange("PF30209 face_194_packet"));
+    }
+    let mut contour = [[0.0f32; 2]; JAWLINE_WINDOW_LEN];
+    contour.copy_from_slice(&points[JAWLINE_WINDOW_START..=JAWLINE_WINDOW_END]);
+    Ok(JawlineWindow {
+        center: points[JAWLINE_CENTER],
+        contour,
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Pf30209SameJobInputs<'a> {
-    pub face_194_packet: &'a [f32],
+    pub face_194_packet: &'a [[f32; 2]],
     pub jawline_indices: &'a [u16],
     pub mask: &'a [u8],
     pub model_output: &'a [f32],
+    pub per_face_pf30209: &'a [f32],
 }
 
 /// PF30209 is END_STATIC at the fixed PE boundary. Inputs are checked only so
-/// callers cannot mistake an empty placeholder for a live-only residual.
+/// callers cannot mistake an empty placeholder for a live-only residual; the
+/// boolean gate and 33-point window are still evaluated and validated.
 pub fn jawline(inputs: Pf30209SameJobInputs<'_>) -> Result<Image, Refusal> {
     if inputs.face_194_packet.is_empty() {
         return Err(Refusal::MissingInput("PF30209 face_194_packet"));
@@ -228,7 +274,12 @@ pub fn jawline(inputs: Pf30209SameJobInputs<'_>) -> Result<Image, Refusal> {
     if inputs.model_output.is_empty() {
         return Err(Refusal::MissingInput("PF30209 model_output"));
     }
-    if inputs.face_194_packet.iter().any(|value| !value.is_finite())
+    if inputs.per_face_pf30209.is_empty() {
+        return Err(Refusal::MissingInput("PF30209 per_face_pf30209"));
+    }
+    let _window = jawline_window(inputs.face_194_packet)?;
+    let _active = jawline_active(inputs.per_face_pf30209);
+    if inputs.per_face_pf30209.iter().any(|value| !value.is_finite())
         || inputs.model_output.iter().any(|value| !value.is_finite())
     {
         return Err(Refusal::ValueOutOfRange("PF30209 finite input"));
@@ -298,14 +349,88 @@ mod tests {
             }),
             Err(Refusal::MissingInput(PF101_LIVE_ONLY))
         ));
+        let packet = [[0.0f32; 2]; JAWLINE_POINTS];
         assert!(matches!(
             jawline(Pf30209SameJobInputs {
-                face_194_packet: &[0.0],
+                face_194_packet: &packet,
                 jawline_indices: &[0],
                 mask: &[1],
                 model_output: &[0.0],
+                per_face_pf30209: &[1.0],
             }),
             Err(Refusal::MissingInput(PF30209_END_STATIC))
         ));
+        assert_eq!(
+            jawline(Pf30209SameJobInputs {
+                face_194_packet: &packet,
+                jawline_indices: &[0],
+                mask: &[1],
+                model_output: &[0.0],
+                per_face_pf30209: &[],
+            }),
+            Err(Refusal::MissingInput("PF30209 per_face_pf30209"))
+        );
+    }
+
+    #[test]
+    fn pf30209_activation_is_a_boolean_any_greater_than_zero() {
+        assert!(!jawline_active(&[]));
+        assert!(!jawline_active(&[0.0, -1.0, -0.0]));
+        assert!(jawline_active(&[0.0, f32::MIN_POSITIVE]));
+        assert!(jawline_active(&[1e-9, 0.0]));
+        // Magnitude is not a multiplier: 1e-9 activates exactly like 100.0.
+        assert_eq!(jawline_active(&[1e-9]), jawline_active(&[100.0]));
+    }
+
+    #[test]
+    fn pf30209_window_is_center_54_plus_109_through_141() {
+        assert_eq!(JAWLINE_WINDOW_LEN, 33);
+        let mut points = [[0.0f32; 2]; JAWLINE_POINTS];
+        for (index, point) in points.iter_mut().enumerate() {
+            *point = [index as f32, -(index as f32)];
+        }
+        let window = jawline_window(&points).unwrap();
+        assert_eq!(window.center, [54.0, -54.0]);
+        assert_eq!(window.contour.len(), 33);
+        assert_eq!(window.contour[0], [109.0, -109.0]);
+        assert_eq!(window.contour[32], [141.0, -141.0]);
+        // Neighbours outside the fixed window are not included.
+        assert!(!window.contour.contains(&points[108]));
+        assert!(!window.contour.contains(&points[142]));
+    }
+
+    #[test]
+    fn pf30209_window_refuses_missing_or_malformed_packets() {
+        assert_eq!(
+            jawline_window(&[]),
+            Err(Refusal::MissingInput("PF30209 face_194_packet"))
+        );
+        assert_eq!(
+            jawline_window(&[[0.0; 2]; JAWLINE_POINTS - 1]),
+            Err(Refusal::ShapeMismatch("PF30209 face_194_packet"))
+        );
+        let mut points = [[0.0f32; 2]; JAWLINE_POINTS];
+        points[JAWLINE_WINDOW_END][1] = f32::NAN;
+        assert_eq!(
+            jawline_window(&points),
+            Err(Refusal::ValueOutOfRange("PF30209 face_194_packet"))
+        );
+    }
+
+    #[test]
+    fn pf30209_stays_outside_the_double_chin_producer() {
+        // stage+0x3A0/+0x3B8 are not forwarded by 0x7AF2FD0, so 30209 is
+        // END_STATIC while the 30188/30189 producers remain typed producers.
+        assert_eq!(contract(30209).unwrap().status, ProviderStatus::EndStatic);
+        assert_eq!(contract(30188).unwrap().status, ProviderStatus::TypedProducer);
+        assert_eq!(contract(30189).unwrap().status, ProviderStatus::TypedProducer);
+    }
+
+    #[test]
+    fn provider_weights_are_the_kernel_products_and_share_the_gate() {
+        let weights = double_chin_weights(0.5, 0.4, 0.2).unwrap();
+        assert_eq!(weights, double_chin::Weights { geometry: 0.2, shadow: 0.1 });
+        assert!(weights.is_active());
+        assert!(!double_chin_weights(0.0, 1.0, 1.0).unwrap().is_active());
     }
 }

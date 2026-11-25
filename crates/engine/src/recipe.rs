@@ -1811,6 +1811,43 @@ fn write_export_pixels(
     if wide.is_none() && recipe.format == ExportFormat::Jpeg {
         compact_rgba_to_rgb(&mut rgba);
     }
+    // TIFF is written straight into its temporary file: the encoder accepts any
+    // `Write + Seek` sink, and the metadata pass reads the finished file back
+    // through a mapping instead of a whole-image heap buffer.
+    if recipe.format == ExportFormat::Tiff {
+        return write_tiff_streamed(
+            dir,
+            info,
+            recipe,
+            index,
+            &rgba,
+            wide.as_deref(),
+            tw,
+            th,
+            icc_bytes.as_deref(),
+            exif_bytes.as_deref(),
+            xmp_packet.as_deref(),
+            progress,
+        );
+    }
+    // PNG has the same shape: encode into the temporary file, then insert the
+    // XMP chunk by copying the finished file instead of holding it in memory.
+    if recipe.format == ExportFormat::Png {
+        return write_png_streamed(
+            dir,
+            info,
+            recipe,
+            index,
+            &rgba,
+            wide.as_deref(),
+            tw,
+            th,
+            icc_bytes.as_deref(),
+            exif_bytes.as_deref(),
+            xmp_packet.as_deref(),
+            progress,
+        );
+    }
     let rgb8 = (wide.is_none() && recipe.format == ExportFormat::Jpeg).then(|| rgba.as_slice());
     let (mut bytes, extension) = encode(
         &rgba,
@@ -1852,6 +1889,161 @@ fn write_export_pixels(
         file.write_all(chunk)?;
         written += chunk.len() as u64;
         progress((written as f32 / estimate as f32).min(1.0));
+    }
+    progress(1.0);
+    Ok(path)
+}
+
+/// Offset of the PNG `IEND` chunk, where an added `iTXt` chunk goes.
+fn png_iend_offset(path: &Path) -> anyhow::Result<u64> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut at = 8u64;
+    let mut header = [0u8; 8];
+    while at + 12 <= len {
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut header)?;
+        let chunk = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        if &header[4..8] == b"IEND" {
+            return Ok(at);
+        }
+        at += 12 + chunk;
+    }
+    anyhow::bail!("export: the PNG encoder wrote no IEND chunk")
+}
+
+/// Writes a PNG straight to its temporary file and inserts the XMP chunk by
+/// copying that file, so a large export never holds the encoded image in RAM.
+#[allow(clippy::too_many_arguments)]
+fn write_png_streamed(
+    dir: &Path,
+    info: &ImageInfo,
+    recipe: &ProcessRecipe,
+    index: usize,
+    rgba: &[u8],
+    wide: Option<&[u16]>,
+    w: u32,
+    h: u32,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+    xmp: Option<&str>,
+    progress: &mut dyn FnMut(f32),
+) -> anyhow::Result<PathBuf> {
+    use image::{EncodableLayout as _, ImageEncoder as _};
+    use std::io::{Read as _, Write as _};
+
+    let path = collision_free(dir, &output_name(recipe, info, index), "png");
+    let temp = export_temp_path(&path);
+    let tagged = export_temp_path(&path);
+    let outcome = (|| -> anyhow::Result<()> {
+        {
+            let mut file = std::fs::File::create(&temp)?;
+            let mut encoder = image::codecs::png::PngEncoder::new(&mut file);
+            if let Some(icc) = icc {
+                encoder.set_icc_profile(icc.to_vec())?;
+            }
+            if let Some(exif) = exif {
+                encoder.set_exif_metadata(exif.to_vec())?;
+            }
+            match wide {
+                Some(wide) => {
+                    encoder.write_image(wide.as_bytes(), w, h, image::ExtendedColorType::Rgba16)?
+                }
+                None => encoder.write_image(rgba, w, h, image::ExtendedColorType::Rgba8)?,
+            }
+            file.flush()?;
+        }
+        if let Some(packet) = xmp {
+            let chunk = png_xmp_chunk(packet.as_bytes());
+            let iend = png_iend_offset(&temp)?;
+            {
+                let mut source = std::fs::File::open(&temp)?;
+                let mut target = std::fs::File::create(&tagged)?;
+                std::io::copy(&mut (&mut source).take(iend), &mut target)?;
+                target.write_all(&chunk)?;
+                std::io::copy(&mut source, &mut target)?;
+                target.flush()?;
+            }
+            std::fs::remove_file(&temp)?;
+            std::fs::rename(&tagged, &temp)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&tagged);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    progress(1.0);
+    Ok(path)
+}
+
+/// Writes a TIFF straight to its temporary file, then adds the EXIF/XMP tags by
+/// mapping the finished file, so a 24 MP export never holds the encoded image
+/// twice.
+#[allow(clippy::too_many_arguments)]
+fn write_tiff_streamed(
+    dir: &Path,
+    info: &ImageInfo,
+    recipe: &ProcessRecipe,
+    index: usize,
+    rgba: &[u8],
+    wide: Option<&[u16]>,
+    w: u32,
+    h: u32,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+    xmp: Option<&str>,
+    progress: &mut dyn FnMut(f32),
+) -> anyhow::Result<PathBuf> {
+    use image::{EncodableLayout as _, ImageEncoder as _};
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = collision_free(dir, &output_name(recipe, info, index), "tif");
+    let temp = export_temp_path(&path);
+    let outcome = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        {
+            let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut file);
+            if let Some(icc) = icc {
+                encoder.set_icc_profile(icc.to_vec())?;
+            }
+            match wide {
+                Some(wide) => {
+                    encoder.write_image(wide.as_bytes(), w, h, image::ExtendedColorType::Rgba16)?
+                }
+                None => encoder.write_image(rgba, w, h, image::ExtendedColorType::Rgba8)?,
+            }
+        }
+        file.flush()?;
+        let tagged = {
+            let reader = std::fs::File::open(&temp)?;
+            // SAFETY: read-only mapping of the file just written; it is dropped
+            // before the header patch, and the temp name is not yet published.
+            let map = unsafe { memmap2::Mmap::map(&reader)? };
+            export_tiff_tags(&map, exif, xmp)
+        };
+        if let Some((field, suffix)) = tagged {
+            file.seek(SeekFrom::Start(4))?;
+            file.write_all(&field)?;
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&suffix)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
     }
     progress(1.0);
     Ok(path)
@@ -2039,6 +2231,20 @@ const XMP_SIGNATURE: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 /// segment in JPEG, right after SOI, and an `XML:com.adobe.xmp` iTXt chunk in
 /// PNG. Every existing segment and chunk is kept as it is. Formats with no
 /// wired-up spot (TIFF, WebP) are left untouched.
+/// The `iTXt` chunk that carries an XMP packet in a PNG.
+fn png_xmp_chunk(packet: &[u8]) -> Vec<u8> {
+    let mut data = b"XML:com.adobe.xmp\0".to_vec();
+    data.extend_from_slice(&[0, 0]); // Not compressed, zlib would be method 0 too.
+    data.extend_from_slice(b"\0\0"); // Empty language tag and translated keyword.
+    data.extend_from_slice(packet);
+    let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(b"iTXt");
+    chunk.extend_from_slice(&data);
+    let crc = crc32(&chunk[4..]);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    chunk
+}
+
 fn embed_xmp(image: &mut Vec<u8>, packet: &[u8]) {
     if image.starts_with(&[0xFF, 0xD8]) {
         // The length field counts itself, so 0xFFFF is the ceiling.
@@ -2060,16 +2266,7 @@ fn embed_xmp(image: &mut Vec<u8>, packet: &[u8]) {
     if !image.starts_with(b"\x89PNG\r\n\x1a\n") {
         return;
     }
-    let mut data = b"XML:com.adobe.xmp\0".to_vec();
-    data.extend_from_slice(&[0, 0]); // Not compressed, zlib would be method 0 too.
-    data.extend_from_slice(b"\0\0"); // Empty language tag and translated keyword.
-    data.extend_from_slice(packet);
-    let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
-    chunk.extend_from_slice(b"iTXt");
-    chunk.extend_from_slice(&data);
-    let crc = crc32(&chunk[4..]);
-    chunk.extend_from_slice(&crc.to_be_bytes());
-
+    let chunk = png_xmp_chunk(packet);
     let mut at = 8usize;
     while at + 12 <= image.len() {
         let len = u32::from_be_bytes([image[at], image[at + 1], image[at + 2], image[at + 3]]) as usize;
@@ -3789,6 +3986,111 @@ mod tests {
             crate::XmpMeta { rating: 4, label: "Red".into(), keywords: Vec::new(), ..Default::default() }
         );
         assert!(find(text.as_bytes(), b"dc:subject").is_none(), "rating does not write keywords");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn streamed_png_matches_the_buffered_bytes() {
+        let dir = temp_dir("png-stream-eq");
+        let xmp = "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>";
+        for (w, h) in [(1u32, 1u32), (33, 21), (129, 97)] {
+            let rgba: Vec<u8> = (0..w as usize * h as usize * 4)
+                .map(|index| (index.wrapping_mul(37) % 251) as u8)
+                .collect();
+            let wide: Vec<u16> = (0..w as usize * h as usize * 4)
+                .map(|index| (index.wrapping_mul(7777) % 65535) as u16)
+                .collect();
+            for use_wide in [false, true] {
+                let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+                r.format = ExportFormat::Png;
+                let (mut bytes, _) = encode(
+                    &rgba,
+                    None,
+                    use_wide.then_some(wide.as_slice()),
+                    w,
+                    h,
+                    &r,
+                    None,
+                    None,
+                    Some(xmp.as_bytes()),
+                )
+                .unwrap();
+                embed_xmp(&mut bytes, xmp.as_bytes());
+                let path = write_png_streamed(
+                    &dir,
+                    &info(),
+                    &r,
+                    0,
+                    &rgba,
+                    use_wide.then_some(wide.as_slice()),
+                    w,
+                    h,
+                    None,
+                    None,
+                    Some(xmp),
+                    &mut |_| {},
+                )
+                .unwrap();
+                assert!(
+                    std::fs::read(&path).unwrap() == bytes,
+                    "{w}x{h} wide={use_wide}: streamed PNG differs"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn streamed_tiff_matches_the_buffered_bytes() {
+        let dir = temp_dir("tiff-stream-eq");
+        let xmp = "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>";
+        for (w, h) in [(1u32, 1u32), (33, 21), (129, 97)] {
+            let rgba: Vec<u8> = (0..w as usize * h as usize * 4)
+                .map(|index| (index.wrapping_mul(37) % 251) as u8)
+                .collect();
+            let wide: Vec<u16> = (0..w as usize * h as usize * 4)
+                .map(|index| (index.wrapping_mul(7777) % 65535) as u16)
+                .collect();
+            for use_wide in [false, true] {
+                let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+                r.format = ExportFormat::Tiff;
+                let (mut bytes, _) = encode(
+                    &rgba,
+                    None,
+                    use_wide.then_some(wide.as_slice()),
+                    w,
+                    h,
+                    &r,
+                    None,
+                    None,
+                    Some(xmp.as_bytes()),
+                )
+                .unwrap();
+                if let Some((field, suffix)) = export_tiff_tags(&bytes, None, Some(xmp)) {
+                    bytes[4..8].copy_from_slice(&field);
+                    bytes.extend_from_slice(&suffix);
+                }
+                let path = write_tiff_streamed(
+                    &dir,
+                    &info(),
+                    &r,
+                    0,
+                    &rgba,
+                    use_wide.then_some(wide.as_slice()),
+                    w,
+                    h,
+                    None,
+                    None,
+                    Some(xmp),
+                    &mut |_| {},
+                )
+                .unwrap();
+                assert!(
+                    std::fs::read(&path).unwrap() == bytes,
+                    "{w}x{h} wide={use_wide}: streamed TIFF differs"
+                );
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

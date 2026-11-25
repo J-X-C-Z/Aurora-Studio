@@ -86,7 +86,13 @@ pub const META: &[EffectMeta] = &[
         key: "Ue.removeStrayHair",
         label: "Stray hair removal",
         access: Access::Cpu,
-        inputs: &["PF90088_HAIRFLY_V1", "PF90088_RAW_STRAY_HAIR_MASK"],
+        inputs: &[
+            "PF90088_NATIVE_DEGREE",
+            "PF90113_NATIVE_PERSON_AREA",
+            "PF90114_NATIVE_BACKGROUND_AREA",
+            "PF90088_HAIRFLY_V1",
+            "PF90088_RAW_STRAY_HAIR_MASK",
+        ],
     },
     EffectMeta {
         pf: 90131,
@@ -227,10 +233,88 @@ pub(crate) fn feather_box(
 
 /// ---- row 91: PF90088 stray hair -------------------------------------------
 
-/// `Ue.removeStrayHair`. `ui` is 0..100; the native degree/person/background
-/// values come from the live per-face maps. Missing area masks mean the
-/// PF90113/PF90114 children are at their all-area default, as in the vendor
-/// adapter; a missing repair image or raw mask is always a refusal.
+/// Vendor activation gate for PF90088. The fixed PE loads `0.001` as binary64
+/// (`0x8BCBA40`, `movsd xmm9` at `0x7B4FB2F`) and only enters the region work
+/// when `d > 0.001` (`ucomiss` + `seta` at `0x7B4FE16`/`0x7B4FF77`).
+pub const STRAY_HAIR_ACTIVE_GATE: f32 = 0.001;
+
+/// Recovered per-face region degrees (`0x7B502DD`, `0x7B506D7`, `0x7B506F0`,
+/// `0x7B50A92`, `0x7B50A96`):
+///
+/// ```text
+/// personDeg     = d * p   // PF90088 * PF90113
+/// backgroundDeg = b * d   // PF90114 * PF90088
+/// ```
+///
+/// The products are raw binary32 multiplies: the recovered instructions have
+/// no clamp, scale, `/100`, or other normalization. `d` alone is gated at
+/// [`STRAY_HAIR_ACTIVE_GATE`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrayHairRegionDegrees {
+    pub person: f32,
+    pub background: f32,
+}
+
+impl StrayHairRegionDegrees {
+    /// The two recovered binary32 products, in vendor operand order.
+    pub fn from_native(degree: f32, person_area: f32, background_area: f32) -> Self {
+        Self {
+            person: degree * person_area,
+            background: background_area * degree,
+        }
+    }
+}
+
+/// The three per-face values a PF90088 job reads from the vendor maps:
+/// `degree` is PF90088 (`0x15FE8`), `person_area` is PF90113 (`0x16001`) and
+/// `background_area` is PF90114 (`0x16002`).
+///
+/// `None` means the same-job producer did not supply that id. When the effect
+/// is active that is a named [`Refusal::MissingInput`], never a `0.0` or
+/// all-area default. The model-side `mask_a`/`mask_b` tensors still have to
+/// come from the same job; this producer only accepts the already-combined
+/// stray-hair mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StrayHairNative {
+    pub degree: Option<f32>,
+    pub person_area: Option<f32>,
+    pub background_area: Option<f32>,
+}
+
+impl StrayHairNative {
+    /// Resolves the recovered products. `Ok(None)` means the vendor `on` test
+    /// is false (`d <= 0.001`), so the two area ids are not required.
+    pub fn resolve(self) -> Result<Option<StrayHairRegionDegrees>, Refusal> {
+        let degree = unit(
+            self.degree
+                .ok_or(Refusal::MissingInput("PF90088_NATIVE_DEGREE"))?,
+            "PF90088_NATIVE_DEGREE",
+        )?;
+        if degree <= STRAY_HAIR_ACTIVE_GATE {
+            return Ok(None);
+        }
+        let person_area = unit(
+            self.person_area
+                .ok_or(Refusal::MissingInput("PF90113_NATIVE_PERSON_AREA"))?,
+            "PF90113_NATIVE_PERSON_AREA",
+        )?;
+        let background_area = unit(
+            self.background_area
+                .ok_or(Refusal::MissingInput("PF90114_NATIVE_BACKGROUND_AREA"))?,
+            "PF90114_NATIVE_BACKGROUND_AREA",
+        )?;
+        Ok(Some(StrayHairRegionDegrees::from_native(
+            degree,
+            person_area,
+            background_area,
+        )))
+    }
+}
+
+/// `Ue.removeStrayHair`. `ui` is the host 0..100 gate; the native
+/// degree/person/background values come from the live per-face maps. Missing
+/// area masks mean the PF90113/PF90114 region masks are absent, as in the
+/// vendor adapter; a missing repair image or raw mask is always a refusal.
 pub fn stray_hair(
     source: &Image,
     ui: f32,
@@ -242,16 +326,40 @@ pub fn stray_hair(
     person_mask: Option<&[u8]>,
     background_mask: Option<&[u8]>,
 ) -> Result<Image, Refusal> {
+    stray_hair_with_native(
+        source,
+        ui,
+        StrayHairNative {
+            degree: Some(native_degree),
+            person_area: Some(native_person_area),
+            background_area: Some(native_background_area),
+        },
+        repair,
+        raw_mask,
+        person_mask,
+        background_mask,
+    )
+}
+
+/// Same pixel law as [`stray_hair`] but with explicit same-job presence for
+/// PF90088/PF90113/PF90114. This is the entry point that can fail closed on a
+/// missing 90113/90114 id instead of receiving a defaulted scalar.
+pub fn stray_hair_with_native(
+    source: &Image,
+    ui: f32,
+    native: StrayHairNative,
+    repair: Option<&Image>,
+    raw_mask: Option<&[u8]>,
+    person_mask: Option<&[u8]>,
+    background_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
     let count = pixels(source)?;
     if percent(ui, "PF90088_UI")? == 0.0 {
         return Ok(source.clone());
     }
-    let native_degree = unit(native_degree, "PF90088_NATIVE_DEGREE")?;
-    let person_area = unit(native_person_area, "PF90088_NATIVE_PERSON_AREA")?;
-    let background_area = unit(native_background_area, "PF90088_NATIVE_BACKGROUND_AREA")?;
-    if native_degree <= 0.0 {
+    let Some(degrees) = native.resolve()? else {
         return Ok(source.clone());
-    }
+    };
 
     let repair = repair.ok_or(Refusal::MissingInput("PF90088_HAIRFLY_V1"))?;
     let raw_mask = raw_mask.ok_or(Refusal::MissingInput("PF90088_RAW_STRAY_HAIR_MASK"))?;
@@ -275,8 +383,8 @@ pub fn stray_hair(
         }
         let person = person_mask.map_or(1.0, |mask| mask[index] as f32 / 255.0);
         let background = background_mask.map_or(1.0, |mask| mask[index] as f32 / 255.0);
-        let region = (person * person_area).max(background * background_area);
-        let alpha = (weight * native_degree * region).clamp(0.0, 1.0);
+        let region = (person * degrees.person).max(background * degrees.background);
+        let alpha = (weight * region).clamp(0.0, 1.0);
         if alpha <= 0.0 {
             continue;
         }
@@ -1262,6 +1370,136 @@ mod tests {
         assert_eq!(
             stray_hair(&src, 50.0, 1.0, 1.0, 1.0, Some(&src), None, None, None),
             Err(Refusal::MissingInput("PF90088_RAW_STRAY_HAIR_MASK"))
+        );
+        assert_eq!(
+            stray_hair_with_native(
+                &src,
+                50.0,
+                StrayHairNative {
+                    degree: Some(1.0),
+                    person_area: Some(1.0),
+                    background_area: Some(1.0),
+                },
+                Some(&src),
+                None,
+                None,
+                None,
+            ),
+            Err(Refusal::MissingInput("PF90088_RAW_STRAY_HAIR_MASK"))
+        );
+    }
+
+    #[test]
+    fn row91_region_degrees_are_raw_products() {
+        // Exactly the recovered `personDeg = d*p`, `backgroundDeg = b*d`.
+        let degrees = StrayHairRegionDegrees::from_native(0.5, 1.0, 0.5);
+        assert_eq!(degrees.person, 0.5);
+        assert_eq!(degrees.background, 0.25);
+        let degrees = StrayHairRegionDegrees::from_native(1.0, 0.5, 0.25);
+        assert_eq!(degrees.person, 0.5);
+        assert_eq!(degrees.background, 0.25);
+    }
+
+    #[test]
+    fn row91_native_gate_is_strictly_above_point_zero_zero_one() {
+        let inactive = |degree| {
+            StrayHairNative {
+                degree: Some(degree),
+                person_area: Some(1.0),
+                background_area: Some(1.0),
+            }
+            .resolve()
+        };
+        assert_eq!(inactive(0.0).unwrap(), None);
+        assert_eq!(inactive(0.0009).unwrap(), None);
+        assert_eq!(inactive(STRAY_HAIR_ACTIVE_GATE).unwrap(), None);
+
+        let active = inactive(0.0011).unwrap().expect("gate is strict");
+        assert_eq!(active.person, 0.0011);
+        assert_eq!(active.background, 0.0011);
+    }
+
+    #[test]
+    fn row91_missing_pf90113_pf90114_are_named_refusals() {
+        let src = pixel([10, 20, 30, 200]);
+        let repair = pixel([110, 220, 30, 7]);
+        assert_eq!(
+            stray_hair_with_native(
+                &src,
+                50.0,
+                StrayHairNative {
+                    degree: Some(0.5),
+                    person_area: None,
+                    background_area: Some(0.5),
+                },
+                Some(&repair),
+                Some(&[255]),
+                None,
+                None,
+            ),
+            Err(Refusal::MissingInput("PF90113_NATIVE_PERSON_AREA"))
+        );
+        assert_eq!(
+            stray_hair_with_native(
+                &src,
+                50.0,
+                StrayHairNative {
+                    degree: Some(0.5),
+                    person_area: Some(1.0),
+                    background_area: None,
+                },
+                Some(&repair),
+                Some(&[255]),
+                None,
+                None,
+            ),
+            Err(Refusal::MissingInput("PF90114_NATIVE_BACKGROUND_AREA"))
+        );
+    }
+
+    #[test]
+    fn row91_region_degree_selects_person_or_background_branch() {
+        let blend = |native: StrayHairNative| {
+            let src = pixel([0, 0, 0, 255]);
+            let repair = pixel([100, 100, 100, 0]);
+            stray_hair_with_native(
+                &src,
+                100.0,
+                native,
+                Some(&repair),
+                Some(&[255]),
+                None,
+                None,
+            )
+            .unwrap()
+            .pixel(0, 0)
+        };
+        // personDeg = 1.0 * 0.5 = 0.5 dominates backgroundDeg = 0.25 * 1.0.
+        assert_eq!(
+            blend(StrayHairNative {
+                degree: Some(1.0),
+                person_area: Some(0.5),
+                background_area: Some(0.25),
+            }),
+            [50, 50, 50, 255]
+        );
+        // personDeg = 0; backgroundDeg = 0.5 * 1.0 = 0.5.
+        assert_eq!(
+            blend(StrayHairNative {
+                degree: Some(1.0),
+                person_area: Some(0.0),
+                background_area: Some(0.5),
+            }),
+            [50, 50, 50, 255]
+        );
+        // Main slider multiplies both branches: d = 0.5, p = 1, b = 1.
+        assert_eq!(
+            blend(StrayHairNative {
+                degree: Some(0.5),
+                person_area: Some(1.0),
+                background_area: Some(1.0),
+            }),
+            [50, 50, 50, 255]
         );
     }
 

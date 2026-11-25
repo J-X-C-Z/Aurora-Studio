@@ -7,11 +7,17 @@
 //!
 //! The public Capture One API stores the amount as `int` in
 //! `IC_ImageProcessSettings.bandingReductionAmount`, but the render layer keeps
-//! it as float32 (`settings[layer*0x148 + 0x7c]`, copied to image `+0x11054`)
-//! and uses it directly as the amplitude; there is no tick scaling. The Z6III
-//! info block reports `IB_F_BANDINGREDUCTIONAMOUNT_START/END = 0/0`, so on this
-//! camera the amount is not user-adjustable and the automatic ISO rule below
-//! is the only source.
+//! it as float32 (`settings[layer*0x148 + 0x7c]`, copied as a 16-byte `movups`
+//! block to image `+0x11054`) and uses it directly as the amplitude; there is
+//! no tick scaling. The host only overrides the automatic value when the field
+//! is positive (`comiss`/`jbe` at `0x1681011`), and no range clamp exists in
+//! that path. The Z6III info block reports
+//! `IB_F_BANDINGREDUCTIONAMOUNT_START/END = 0/0`, so this camera has no slider
+//! unit. A positive settings field replaces the automatic value; the automatic
+//! value itself depends on how the settings record was built: an SDK default
+//! record already carries 200 in that field, while a record that leaves it at
+//! zero falls through to the factory base 200 scaled by ISO (see
+//! [`AutoAmount`]).
 
 use crate::rawinfo::RawInfoBlock;
 
@@ -52,6 +58,20 @@ impl BandingRange {
         Self::new(start, end, default)
     }
 
+    /// Clamps a finite amount into an adjustable vendor range. An empty range
+    /// (`start == end`) does not clamp: the installed build applies a positive
+    /// SDK field even when the info block reports `0..0`.
+    ///
+    /// The render path itself has no clamp (no `minss`/`maxss` around
+    /// `image+0x11054`), so clamping here is the product's explicit policy,
+    /// not a vendor-proven behaviour. `None` for non-finite input or a range
+    /// whose fields were built invalid (`start > end`), never a guessed bound.
+    pub fn clamp_amount(&self, amount: f32) -> Option<f32> {
+        if !amount.is_finite() || self.start > self.end {
+            return None;
+        }
+        Some(if self.is_adjustable() { amount.clamp(self.start, self.end) } else { amount })
+    }
 }
 
 /// The Z6III E recipe is the only body whose amplitude rule is proven: the
@@ -91,10 +111,41 @@ fn iso_scale(iso: u32) -> f32 {
     }
 }
 
-/// Factory-base amplitude before the `+0x7c` override. Only the Z6III rule is
-/// proven; other bodies return `None` instead of borrowing it.
+/// Which automatic amount a caller's settings record resolves to.
+///
+/// Capture One applies the field only when it is positive, so the automatic
+/// value depends on how the settings were built:
+///
+/// * [`AutoAmount::IsoLadder`] — the field is left at zero, so the host uses
+///   factory base 200 scaled by ISO. Anchored at ISO 1000 by an archived
+///   application/preview queue whose kernel arguments were `201142/782/83`
+///   (A = 314.2857); the other ISOs use the vendor config ladder (`+0x668`)
+///   and are not separately captured.
+/// * [`AutoAmount::SdkDefault`] — the SDK's default settings record already
+///   carries a positive 200 in the field, which replaces the ladder. Export
+///   probes are byte-identical for an absent field and an explicit 200 at
+///   ISO 100, 800 and 2000.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoAmount {
+    IsoLadder,
+    SdkDefault,
+}
+
+/// [`AutoAmount::SdkDefault`] amplitude: the vendor base, not ISO scaled.
+pub const SDK_DEFAULT_AMOUNT: f32 = 200.0;
+
+/// Automatic amplitude for one frame. Only bodies with a measured rule answer;
+/// unknown bodies never borrow the Z6III rule.
+pub fn default_amount(model: &str, iso: u32, auto: AutoAmount) -> Option<f32> {
+    is_z6iii(model).then(|| match auto {
+        AutoAmount::IsoLadder => 200.0 * iso_scale(iso),
+        AutoAmount::SdkDefault => SDK_DEFAULT_AMOUNT,
+    })
+}
+
+/// The ISO-scaled automatic rule ([`AutoAmount::IsoLadder`]).
 pub fn default_for_iso(model: &str, iso: u32) -> Option<f32> {
-    is_z6iii(model).then_some(200.0 * iso_scale(iso))
+    default_amount(model, iso, AutoAmount::IsoLadder)
 }
 
 fn amount_for_iso(iso: u32) -> f32 {
@@ -113,22 +164,89 @@ impl Params {
     pub const OFF: Self = Self { gain: 0, limit: 0, strength: 0 };
 }
 
+/// Largest amount whose reference integer product `gain * 255` still fits in
+/// `i32` (`gain = trunc(A * 640)`; `8_421_504 * 255 = 2_147_483_520`).
+///
+/// The reference host multiplies in 32-bit `int`. Above this the product wraps
+/// in release and panics in debug, so the amount is refused instead of wrapped.
+pub const MAX_AMOUNT: f32 = 13_158.6;
+
+/// `Some(amount)` only for finite, positive amounts the reference 32-bit chain
+/// can carry; everything else is refused instead of saturating into a pattern.
+fn checked_amount(amount: f32) -> Option<f32> {
+    (amount.is_finite() && amount > 0.0 && amount <= MAX_AMOUNT).then_some(amount)
+}
+
 /// Converts the resolved operation amplitude to the three kernel integers with
 /// single-precision operations in the reference order.
+///
+/// Non-finite, non-positive and oversized amounts yield [`Params::OFF`]; the
+/// `gain * 255` product is checked rather than wrapped, because the reference
+/// host multiplies in 32-bit `int` (debug panic / release wrap above
+/// [`MAX_AMOUNT`]).
 pub fn params_for_amount(amount: f32) -> Params {
-    if amount <= 0.0 {
+    let Some(amount) = checked_amount(amount) else { return Params::OFF };
+    let gain = (amount * (1.0_f32 / 128.0) * 1.25 * 65_536.0) as i32;
+    if gain <= 0 {
         return Params::OFF;
     }
-    let gain = (amount * (1.0_f32 / 128.0) * 1.25 * 65_536.0) as i32;
-    let limit = (gain * 255) >> 16;
-    let strength = if limit > 0 { (65_536.0_f32 / limit as f32) as i32 } else { 0 };
-    Params { gain, limit, strength }
+    let Some(scaled) = gain.checked_mul(255) else { return Params::OFF };
+    let limit = scaled >> 16;
+    if limit <= 0 {
+        return Params::OFF;
+    }
+    Params { gain, limit, strength: (65_536.0_f32 / limit as f32) as i32 }
 }
 
 /// Resolves the amplitude from ISO through the verified factory base (200) and
 /// the camera/ISO rules used by the Z6III E recipe.
 pub fn params_for_iso(iso: u32) -> Params {
     params_for_amount(amount_for_iso(iso))
+}
+
+/// Resolves the amplitude `A` for one frame.
+///
+/// Order, all fail-closed: a finite positive user override wins (clamped only
+/// into an adjustable vendor range, because no range clamp exists in the host
+/// path); otherwise an adjustable range's default; otherwise the caller's
+/// proven automatic amount. The host applies the field only when it is positive
+/// (`0x1681001..0x1681016`: `movss` / `comiss` / `jbe`), so zero (and any
+/// non-finite value) means "keep the automatic value", not "off". Amounts
+/// above [`MAX_AMOUNT`] are refused rather than wrapped.
+pub fn resolve_amount(
+    range: Option<&BandingRange>,
+    override_amount: Option<f32>,
+    automatic: Option<f32>,
+) -> Option<f32> {
+    let amount = match override_amount.filter(|amount| amount.is_finite() && *amount > 0.0) {
+        Some(amount) => match range {
+            Some(range) => range.clamp_amount(amount)?,
+            None => amount,
+        },
+        None => match range.filter(|range| range.is_adjustable()) {
+            Some(range) => range.default,
+            None => automatic?,
+        },
+    };
+    (amount.is_finite() && (0.0..=MAX_AMOUNT).contains(&amount)).then_some(amount)
+}
+
+/// One call for a renderer: frame range, user override and a caller-declared
+/// automatic rule resolved, then converted to kernel integers. `None` means
+/// "no banding": the caller must not fabricate a pattern from a missing or
+/// invalid amount.
+pub fn params_for_frame(
+    info: Option<&RawInfoBlock>,
+    model: Option<&str>,
+    iso: u32,
+    override_amount: Option<f32>,
+    auto: AutoAmount,
+) -> Option<Params> {
+    let range = range_for_frame(info, model);
+    let automatic = default_amount(model.unwrap_or_default(), iso, auto);
+    let amount = resolve_amount(range.as_ref(), override_amount, automatic)?;
+    let params = params_for_amount(amount);
+    (params != Params::OFF).then_some(params)
 }
 
 /// The three immutable vendor banding buffers, read from the installed
@@ -256,14 +374,21 @@ fn dispatch(
     params: Params,
     tables: [&[u8]; 3],
 ) -> Result<(), &'static str> {
-    if width == 0 || channels < 3 || pixels.len() % (channels * width) != 0 {
+    if channels < 3 {
+        return Err("invalid banding frame or tables");
+    }
+    let stride = channels
+        .checked_mul(width)
+        .filter(|stride| *stride > 0)
+        .ok_or("invalid banding frame or tables")?;
+    if pixels.len() < stride || pixels.len() % stride != 0 {
         return Err("invalid banding frame or tables");
     }
     let tables = Tables::new(tables).ok_or("invalid banding frame or tables")?;
     if params.limit <= 0 || params.strength <= 0 {
         return Ok(());
     }
-    for (row, line) in pixels.chunks_exact_mut(channels * width).enumerate() {
+    for (row, line) in pixels.chunks_exact_mut(stride).enumerate() {
         let y = row as i32 + origin.1;
         for (column, pixel) in line.chunks_exact_mut(channels).enumerate() {
             let x = column as i32 + origin.0;
@@ -519,5 +644,117 @@ mod tests {
         assert_eq!(amount(3200), 400.0, "above 1600 the rule caps at 2x the base");
         assert_eq!(default_for_iso("SONY ILCE-7M4", 1000), None);
         assert_eq!(default_for_iso("Canon EOS R5", 1600), None);
+    }
+
+    #[test]
+    fn non_finite_and_oversized_amounts_are_refused() {
+        for amount in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 13_159.0, 65_536.0, 1.0e9] {
+            assert_eq!(params_for_amount(amount), Params::OFF, "{amount:?}");
+        }
+        assert_eq!(params_for_amount(-5.0), Params::OFF);
+        assert_eq!(params_for_amount(1.0e-9), Params::OFF);
+    }
+
+    #[test]
+    fn largest_carried_amount_is_exact() {
+        // The last amount whose reference `gain * 255` fits in i32.
+        assert_eq!(params_for_amount(MAX_AMOUNT), Params { gain: 8_421_504, limit: 32_767, strength: 2 });
+        // Native DLL probe: amount 1000 -> 640000/2490/26.
+        assert_eq!(params_for_amount(1000.0), Params { gain: 640_000, limit: 2_490, strength: 26 });
+    }
+
+    #[test]
+    fn override_clamps_only_into_an_adjustable_range() {
+        let adjustable = BandingRange::new(0.0, 60.0, 20.0).unwrap();
+        assert_eq!(adjustable.clamp_amount(75.0), Some(60.0));
+        assert_eq!(adjustable.clamp_amount(-3.0), Some(0.0));
+        assert_eq!(adjustable.clamp_amount(f32::NAN), None);
+
+        // The installed build applies the SDK field even when the info block
+        // reports 0..0, so an empty range must not clamp to zero.
+        let empty = BandingRange::new(0.0, 0.0, 0.0).unwrap();
+        assert_eq!(empty.clamp_amount(120.0), Some(120.0));
+        let broken = BandingRange { start: 60.0, end: 0.0, default: 0.0 };
+        assert_eq!(broken.clamp_amount(20.0), None, "inverted range is not guessed");
+    }
+
+    #[test]
+    fn resolver_prefers_override_then_range_then_automatic() {
+        let adjustable = BandingRange::new(0.0, 60.0, 20.0).unwrap();
+        assert_eq!(resolve_amount(Some(&adjustable), Some(75.0), None), Some(60.0));
+        assert_eq!(resolve_amount(Some(&adjustable), None, Some(314.285_74)), Some(20.0));
+        // The host only overrides when the field is positive (`comiss`/`jbe`),
+        // so zero keeps the automatic value instead of switching banding off.
+        assert_eq!(resolve_amount(Some(&adjustable), Some(0.0), Some(314.285_74)), Some(20.0));
+
+        assert_eq!(resolve_amount(None, None, Some(314.285_74)), Some(314.285_74));
+        assert_eq!(resolve_amount(None, None, None), None);
+        assert_eq!(resolve_amount(None, Some(1.0e9), Some(314.285_74)), None);
+        assert_eq!(
+            resolve_amount(None, Some(f32::NAN), Some(314.285_74)),
+            Some(314.285_74),
+            "a non-finite override is treated as absent, not as zero"
+        );
+    }
+
+    #[test]
+    fn automatic_amount_depends_on_the_settings_source() {
+        assert_eq!(default_amount("NIKON Z 6III", 100, AutoAmount::IsoLadder), Some(100.0));
+        let preview = default_amount("NIKON Z 6III", 1000, AutoAmount::IsoLadder).unwrap();
+        assert!((preview - 314.285_74).abs() < 1e-3, "{preview}");
+
+        // Export probe: an absent field equals an explicit 200 at ISO 100,
+        // 800 and 2000, because the SDK default settings carry a positive 200
+        // that replaces the ladder.
+        for iso in [100, 800, 2000] {
+            assert_eq!(
+                default_amount("NIKON Z 6III", iso, AutoAmount::SdkDefault),
+                Some(SDK_DEFAULT_AMOUNT),
+                "ISO {iso}"
+            );
+        }
+        assert_eq!(default_amount("SONY ILCE-7M4", 800, AutoAmount::SdkDefault), None);
+    }
+
+    #[test]
+    fn frame_params_fail_closed_without_a_proven_identity() {
+        let mut info = RawInfoBlock::default();
+        info.values = vec![
+            ("IB_F_BANDINGREDUCTIONAMOUNT_START".into(), 0.0),
+            ("IB_F_BANDINGREDUCTIONAMOUNT_END".into(), 60.0),
+            ("IB_F_BANDINGREDUCTIONAMOUNT_DEFAULT".into(), 20.0),
+        ];
+        assert_eq!(
+            params_for_frame(Some(&info), Some("SONY ILCE-7M4"), 800, Some(75.0), AutoAmount::IsoLadder),
+            Some(params_for_amount(60.0))
+        );
+        assert_eq!(
+            params_for_frame(Some(&info), Some("SONY ILCE-7M4"), 800, Some(0.0), AutoAmount::IsoLadder),
+            Some(params_for_amount(20.0)),
+            "zero is not an override: the host gates it on > 0"
+        );
+        assert_eq!(
+            params_for_frame(None, Some("SONY ILCE-7M4"), 800, None, AutoAmount::IsoLadder),
+            None
+        );
+        assert_eq!(
+            params_for_frame(None, Some("NIKON Z 6III"), 1000, None, AutoAmount::IsoLadder),
+            Some(params_for_amount(default_for_iso("NIKON Z 6III", 1000).unwrap()))
+        );
+        assert_eq!(
+            params_for_frame(None, Some("NIKON Z 6III"), 100, None, AutoAmount::SdkDefault),
+            Some(params_for_amount(SDK_DEFAULT_AMOUNT)),
+            "the SDK default is a constant 200, not the ISO-scaled preview value"
+        );
+    }
+
+    #[test]
+    fn empty_or_partial_frames_are_rejected() {
+        let (left, right, packed) = synthetic();
+        let tables = [&left[..], &right[..], &packed[..]];
+        let mut empty: Vec<u16> = Vec::new();
+        assert!(dispatch_rgb16(&mut empty, 6, (0, 0), params_for_iso(200), tables).is_err());
+        let mut partial = [1_u16; 3];
+        assert!(dispatch_rgb16(&mut partial, 2, (0, 0), params_for_iso(200), tables).is_err());
     }
 }

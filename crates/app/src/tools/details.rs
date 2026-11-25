@@ -219,8 +219,9 @@ fn noise_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoEle
         })
         .child(param_c1(state, "nr-color", "ColorNoiseReductionAmount", b(|n| &mut n.color, |n| n.color), cx))
         .child(param_c1(state, "nr-pixel", "CleanNoiseAmount", b(|n| &mut n.single_pixel, |n| n.single_pixel), cx))
-        // Capture One's AI denoise and banding reduction: stored under their C1
-        // keys in `extra` so the engine can pick them up as soon as it renders them.
+        // Capture One's AI denoise and banding reduction, stored under their C1
+        // keys in `extra`. Banding is rendered on RAW output: a positive amount
+        // replaces the automatic ISO rule; AI denoise is still stored only.
         .when(scope == Scope::Global, |d| {
             d.child(
                 param(state, "nr-ai", t("AI Denoise", "AI 降噪"), crate::state::extra_binding("AIDenoiseAmount", 0.0), 0.0, 100.0, cx).flag(crate::contract::AI_DENOISE),

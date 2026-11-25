@@ -68,7 +68,10 @@ pub const DISPLAY_PROFILE: Status = Status::Partial(
 );
 /// Parsed Capture One parameters the engine stores but does not render yet.
 pub const AI_DENOISE: Status = Status::Pending("Saved with the variant; the engine has no AI denoise yet", "随变体保存，引擎尚无 AI 降噪");
-pub const BANDING: Status = Status::Pending("Saved with the variant; the engine has no banding reduction yet", "随变体保存，引擎尚无条纹抑制");
+pub const BANDING: Status = Status::Partial(
+    "RAW output only: the measured ISO rule is applied automatically and a positive amount here replaces it; other cameras need a manual amount",
+    "仅 RAW 输出：已实测机型自动按 ISO 规则执行，正幅度会替换它；其他机型需手动设置幅度",
+);
 /// Interface built ahead of the engine (see `planned`).
 pub const MERGE: Status = Status::Partial(
     "Basic HDR and panorama merges are available; panorama projection (Perspective/Cylindrical/Spherical/Panini) and HDR deghosting (Off/Auto/Manual) are consumed; frame alignment, auto tone, boundary warp and auto crop are not",

@@ -1669,6 +1669,210 @@ fn dot(a: Point, b: Point) -> f32 {
     a.x * b.x + a.y * b.y
 }
 
+// ---------------------------------------------------------------------------
+// Row 23/24 double-part consumer (task08 FINDINGS §4.2).
+//
+// The vendor config binds each PF to *two* FacialRefine parts, each with a
+// 4-slot `ControlIndex` (0=head-left, 1=head-right, 2=tail-left, 3=tail-right)
+// and a three-node `RenderParamRanges = [0, 0.5, 1]`. The short part carries
+// only negative degrees (head [-1,0,0], tail [-1.6,0,0]); the long part only
+// positive (head [0,0,1], tail [0,0,1.8]); the long head is scaled by
+// `DegreeFactor = 1.1`. The UI slider `u` is remapped per part by the same
+// three-node `ControlCurve::remap` used by the body rows.
+//
+// Left/right direction and the exact UI->degree evaluation point are still
+// INFERRED (task08 §4.4, §5): this kernel therefore takes `ui_left`/`ui_right`
+// and `control_index` explicitly from the producer and never assumes a side.
+// ---------------------------------------------------------------------------
+
+/// `RenderParamRanges` for both parts (task08 §2, PROVEN).
+pub const BROW_LENGTH_PARAM_RANGE: [f32; 3] = [0.0, 0.5, 1.0];
+/// Short part `RenderDegreeRanges`, indexed by `ControlIndex` 0..3 (PROVEN).
+pub const BROW_LENGTH_SHORT_DEGREES: [[f32; 3]; 4] = [
+    [-1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [-1.6, 0.0, 0.0],
+    [-1.6, 0.0, 0.0],
+];
+/// Long part `RenderDegreeRanges`, indexed by `ControlIndex` 0..3 (PROVEN).
+pub const BROW_LENGTH_LONG_DEGREES: [[f32; 3]; 4] = [
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, 1.8],
+    [0.0, 0.0, 1.8],
+];
+/// Long-part head `DegreeFactor` (PROVEN); every other slot is 1.0.
+pub const BROW_HEAD_LONG_DEGREE_FACTOR: f32 = 1.1000009775161743;
+
+/// One resolved `(part, control_index)` binding for rows 23/24.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowLengthSlot {
+    pub part: BrowPartKind,
+    /// Vendor `ControlIndex`: 0=head-left, 1=head-right, 2=tail-left, 3=tail-right.
+    pub control_index: usize,
+}
+
+impl BrowLengthSlot {
+    pub fn new(part: BrowPartKind, control_index: usize) -> Result<Self, Refusal> {
+        if control_index > 3 {
+            return Err(Refusal::OutOfRange("brow_control_index_outside_0_3"));
+        }
+        Ok(Self { part, control_index })
+    }
+
+    /// `ControlIndex` 0/1 are head, 2/3 are tail.
+    pub fn is_head(&self) -> bool {
+        self.control_index < 2
+    }
+
+    fn degree_range(&self) -> [f32; 3] {
+        match self.part {
+            BrowPartKind::Short => BROW_LENGTH_SHORT_DEGREES[self.control_index],
+            BrowPartKind::Long => BROW_LENGTH_LONG_DEGREES[self.control_index],
+        }
+    }
+
+    fn degree_factor(&self) -> f32 {
+        if self.part == BrowPartKind::Long && self.is_head() {
+            BROW_HEAD_LONG_DEGREE_FACTOR
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Three-node piecewise-linear remap matching `ControlCurve::remap` (clamped,
+/// non-finite refused). Kept local so `eye_geometry` does not depend on the
+/// body-param module.
+fn remap_three(param: f32, params: &[f32; 3], degrees: &[f32; 3]) -> Result<f32, Refusal> {
+    if !param.is_finite() {
+        return Err(Refusal::OutOfRange("brow_length_param_non_finite"));
+    }
+    let (left, right) = if param <= params[1] { (0, 1) } else { (1, 2) };
+    let (p0, p1) = (params[left], params[right]);
+    if !(p1 > p0) {
+        return Err(Refusal::OutOfRange("brow_length_param_span"));
+    }
+    let t = ((param - p0) / (p1 - p0)).clamp(0.0, 1.0);
+    Ok(degrees[left] + (degrees[right] - degrees[left]) * t)
+}
+
+/// Resolve the internal degree for one `(part, control_index)` slot.
+///
+/// `ui` is the 0..1 slider value for that control (the producer decides the
+/// left/right assignment and the UI normalisation). The neutral `0.5` yields
+/// `0.0` for both parts; the short part only ever returns negative degrees and
+/// the long part only positive, matching the config's one-sided ranges.
+pub fn brow_length_slot_degree(slot: BrowLengthSlot, ui: f32) -> Result<f32, Refusal> {
+    if !ui.is_finite() || !(0.0..=1.0).contains(&ui) {
+        return Err(Refusal::OutOfRange("brow_length_ui_outside_0_1"));
+    }
+    let degree = remap_three(ui, &BROW_LENGTH_PARAM_RANGE, &slot.degree_range())?;
+    Ok(degree * slot.degree_factor())
+}
+
+/// A 144-vertex (6 windows x 24) numeric consumer result for rows 23/24.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowLengthConsumer {
+    pub target: Vec<Point>,
+    /// 6 windows x 24 vertices, `target[window*24 + i] - source[window*24 + i]`.
+    pub deltas: Vec<Point>,
+    pub half: [f32; 2],
+    pub degrees: [f32; 2],
+    pub noop: bool,
+}
+
+const BROW_LENGTH_WINDOWS: usize = 6;
+const BROW_LENGTH_VERTEX_COUNT: usize = BROW_LENGTH_WINDOWS * BROW_GUIDE_COUNT;
+/// `half = 0.5 * segment length` degenerates below this (task08 §4.2, `0.001`).
+const BROW_LENGTH_HALF_EPSILON: f32 = 0.001;
+
+/// Apply the recovered `0x707ED50` consumer to a 6-window (144) point mesh.
+///
+/// `mesh` is `6 * 24` points laid out as the two directions (A at window 0,
+/// B at window 3) x three rings each; `coeffs` are the three 24-float arrays
+/// `C1/C2/C3`. Both directions use `w = d * 0.8 * (t / half) * S` with
+/// `half = 0.5 * |segment|` and the projection-sign side selector: `t <= 0`
+/// uses `head_degree`, `t > 0` uses `tail_degree`. `S` is the caller-supplied
+/// size normaliser (the native `0x707F260` landmark-distance scalar). A zero
+/// or non-positive `half` contributes no displacement.
+pub fn brow_length_consumer(
+    mesh: &[Point],
+    coeffs: [&[f32]; 3],
+    segment_a: [Point; 2],
+    segment_b: [Point; 2],
+    head_degree: f32,
+    tail_degree: f32,
+    scale: f32,
+) -> Result<BrowLengthConsumer, Refusal> {
+    if mesh.len() != BROW_LENGTH_VERTEX_COUNT {
+        return Err(Refusal::MissingMesh("brow_length_144_required"));
+    }
+    if !all_finite(mesh)
+        || !all_finite(&segment_a)
+        || !all_finite(&segment_b)
+        || !head_degree.is_finite()
+        || !tail_degree.is_finite()
+        || !scale.is_finite()
+    {
+        return Err(Refusal::NonFinite("brow_length_consumer_non_finite"));
+    }
+    for array in coeffs {
+        if array.len() != BROW_GUIDE_COUNT || !all_finite_f32(array) {
+            return Err(Refusal::MissingFactorList);
+        }
+    }
+
+    let direction = |seg: [Point; 2]| -> Result<(Point, f32, Point), Refusal> {
+        let span = seg[1].sub(seg[0]);
+        let length = span.length();
+        // A zero-length segment cannot define an axis, but the recovered
+        // consumer's `half > 0.001` gate makes its displacement exactly zero
+        // (task08 FINDINGS §4.2: "half == 0 退化时 u = 0 无位移"), so it
+        // contributes nothing instead of refusing.
+        let axis = if length > 0.0 && length.is_finite() {
+            span.scale(1.0 / length)
+        } else {
+            Point::new(0.0, 0.0)
+        };
+        let center = Point::new((seg[0].x + seg[1].x) * 0.5, (seg[0].y + seg[1].y) * 0.5);
+        Ok((axis, length * 0.5, center))
+    };
+    let (axis_a, half_a, center_a) = direction(segment_a)?;
+    let (axis_b, half_b, center_b) = direction(segment_b)?;
+
+    let mut target = mesh.to_vec();
+    for (base, axis, half, center) in [
+        (0usize, axis_a, half_a, center_a),
+        (BROW_LENGTH_WINDOWS / 2 * BROW_GUIDE_COUNT, axis_b, half_b, center_b),
+    ] {
+        for i in 0..BROW_GUIDE_COUNT {
+            let t = dot(mesh[base + i].sub(center), axis);
+            let ratio = if half > BROW_LENGTH_HALF_EPSILON { t / half } else { 0.0 };
+            let degree = if t <= 0.0 { head_degree } else { tail_degree };
+            let w = degree * BROW_LENGTH_AMOUNT * ratio * scale;
+            for (ring, array) in coeffs.iter().enumerate() {
+                let shift = axis.scale(w * array[i]);
+                let slot = base + ring * BROW_GUIDE_COUNT + i;
+                target[slot] = target[slot].add(shift);
+            }
+        }
+    }
+
+    let deltas = target
+        .iter()
+        .zip(mesh.iter())
+        .map(|(to, from)| to.sub(*from))
+        .collect::<Vec<_>>();
+    Ok(BrowLengthConsumer {
+        noop: deltas.iter().all(|d| d.x == 0.0 && d.y == 0.0),
+        target,
+        deltas,
+        half: [half_a, half_b],
+        degrees: [head_degree, tail_degree],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1954,5 +2158,154 @@ mod tests {
             Err(Refusal::MissingParamList));
         assert_eq!(accept_indices(8001, Some(&[0, 1, 400]), 168),
             Err(Refusal::OutOfRange("index_out_of_mesh_range")));
+    }
+
+    #[test]
+    fn brow_slot_tables_match_vendor_config() {
+        // Short part carries only negative degrees; head -1.0, tail -1.6.
+        assert_eq!(BROW_LENGTH_SHORT_DEGREES[0], [-1.0, 0.0, 0.0]);
+        assert_eq!(BROW_LENGTH_SHORT_DEGREES[2], [-1.6, 0.0, 0.0]);
+        // Long part carries only positive degrees; head 1.0, tail 1.8.
+        assert_eq!(BROW_LENGTH_LONG_DEGREES[0], [0.0, 0.0, 1.0]);
+        assert_eq!(BROW_LENGTH_LONG_DEGREES[2], [0.0, 0.0, 1.8]);
+        assert_eq!(BROW_LENGTH_PARAM_RANGE, [0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn brow_slot_degree_remaps_short_head() {
+        let slot = BrowLengthSlot::new(BrowPartKind::Short, 0).unwrap();
+        assert_eq!(slot.is_head(), true);
+        // Neutral 0.5 -> 0; endpoint 0 -> -1.0; midpoint 0.25 -> -0.5.
+        assert_eq!(brow_length_slot_degree(slot, 0.5).unwrap(), 0.0);
+        assert!((brow_length_slot_degree(slot, 0.0).unwrap() + 1.0).abs() < 1e-6);
+        assert!((brow_length_slot_degree(slot, 0.25).unwrap() + 0.5).abs() < 1e-6);
+        // Clamped above 0.5: never positive on the short part.
+        assert_eq!(brow_length_slot_degree(slot, 1.0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn brow_slot_degree_remaps_long_tail_and_head_factor() {
+        let tail = BrowLengthSlot::new(BrowPartKind::Long, 2).unwrap();
+        assert!((brow_length_slot_degree(tail, 1.0).unwrap() - 1.8).abs() < 1e-6);
+        assert!((brow_length_slot_degree(tail, 0.75).unwrap() - 0.9).abs() < 1e-6);
+        assert_eq!(brow_length_slot_degree(tail, 0.5).unwrap(), 0.0);
+        // Head long gets the 1.1 DegreeFactor.
+        let head = BrowLengthSlot::new(BrowPartKind::Long, 0).unwrap();
+        assert!((brow_length_slot_degree(head, 1.0).unwrap() - 1.1).abs() < 1e-6);
+        // Short head has no factor.
+        let short_head = BrowLengthSlot::new(BrowPartKind::Short, 1).unwrap();
+        assert!((brow_length_slot_degree(short_head, 0.0).unwrap() + 1.0).abs() < 1e-6);
+        // Short tail range is -1.6, no factor.
+        let short_tail = BrowLengthSlot::new(BrowPartKind::Short, 3).unwrap();
+        assert!((brow_length_slot_degree(short_tail, 0.0).unwrap() + 1.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn brow_slot_refuses_bad_inputs() {
+        assert_eq!(
+            BrowLengthSlot::new(BrowPartKind::Short, 4),
+            Err(Refusal::OutOfRange("brow_control_index_outside_0_3"))
+        );
+        let slot = BrowLengthSlot::new(BrowPartKind::Long, 0).unwrap();
+        assert_eq!(
+            brow_length_slot_degree(slot, -0.1),
+            Err(Refusal::OutOfRange("brow_length_ui_outside_0_1"))
+        );
+        assert_eq!(
+            brow_length_slot_degree(slot, 1.1),
+            Err(Refusal::OutOfRange("brow_length_ui_outside_0_1"))
+        );
+        assert_eq!(
+            brow_length_slot_degree(slot, f32::NAN),
+            Err(Refusal::OutOfRange("brow_length_ui_outside_0_1"))
+        );
+    }
+
+    fn consumer_mesh() -> Vec<Point> {
+        // 6 windows x 24: base ring points drift along +x per window.
+        (0..144)
+            .map(|i| Point::new((i % 24) as f32 * 2.0, (i / 24) as f32 * 10.0))
+            .collect()
+    }
+
+    #[test]
+    fn consumer_vertex_count_and_layout_constants() {
+        assert_eq!(BROW_LENGTH_VERTEX_COUNT, 144);
+        assert_eq!(BROW_LENGTH_WINDOWS, 6);
+        // 6 windows x 24 = 144 vertices; direction B starts at window 3.
+        assert_eq!(BROW_LENGTH_VERTEX_COUNT, 6 * BROW_GUIDE_COUNT);
+    }
+
+    #[test]
+    fn consumer_displaces_144_vertices_and_uses_half_segment() {
+        let mesh = consumer_mesh();
+        let ones = [1.0f32; 24];
+        // Segment A spans x 0..48 -> center 24, half = 24; B spans 0..24 ->
+        // center 12, half = 12. mesh window x values are 0,2,...,46.
+        let seg_a = [Point::new(0.0, 0.0), Point::new(48.0, 0.0)];
+        let seg_b = [Point::new(0.0, 0.0), Point::new(24.0, 0.0)];
+        let out = brow_length_consumer(&mesh, [&ones; 3], seg_a, seg_b, -1.0, 1.0, 1.0).unwrap();
+        assert_eq!(out.target.len(), 144);
+        assert_eq!(out.deltas.len(), 144);
+        assert_eq!(out.half, [24.0, 12.0]);
+        assert!(!out.noop);
+        // Vertex 0 (x=0): t = -24 <= 0 -> head -1; u = -1; w = -1*0.8*(-1) = 0.8.
+        assert!((out.deltas[0].x - 0.8).abs() < 1e-5);
+        assert_eq!(out.deltas[0].y, 0.0);
+        // Vertex 12 (x=24): t = 0 <= 0 -> head side, u = 0 -> no shift.
+        assert_eq!(out.target[12], mesh[12]);
+        // Vertex 13 (x=26): t = 2 > 0 -> tail +1; u = 2/24; w = 0.8/12.
+        assert!((out.deltas[13].x - 0.8 / 12.0).abs() < 1e-4);
+        // Direction B (window 3, base 72): vertex 84 (x=24) has t = 12 > 0
+        // -> tail; u = 12/12 = 1; w = 0.8.
+        assert!((out.deltas[84].x - 0.8).abs() < 1e-5);
+        // Vertex 78 (x=12) sits exactly on the B center: no shift.
+        assert_eq!(out.target[78], mesh[78]);
+        // The three coefficient rings of one direction shift identically.
+        assert_eq!(out.deltas[12], out.deltas[12 + 24]);
+        assert_eq!(out.deltas[12], out.deltas[12 + 48]);
+        assert_eq!(out.deltas[84], out.deltas[84 + 24]);
+        assert_eq!(out.deltas[84], out.deltas[84 + 48]);
+    }
+
+    #[test]
+    fn consumer_zero_degree_is_noop_and_half_zero_degenerates() {
+        let mesh = consumer_mesh();
+        let ones = [1.0f32; 24];
+        let seg = [Point::new(0.0, 0.0), Point::new(46.0, 0.0)];
+        let zero = brow_length_consumer(&mesh, [&ones; 3], seg, seg, 0.0, 0.0, 1.0).unwrap();
+        assert!(zero.noop);
+        assert_eq!(zero.target, mesh);
+        // Degenerate half (< 0.001 segment): ratio 0, no displacement.
+        let tiny = [Point::new(5.0, 5.0), Point::new(5.0, 5.0)];
+        let out = brow_length_consumer(&mesh, [&ones; 3], tiny, seg, -1.0, 1.0, 1.0).unwrap();
+        assert_eq!(out.half[0], 0.0);
+        for i in 0..24 {
+            assert_eq!(out.target[i], mesh[i]);
+        }
+        // Scale zero also annihilates the shift.
+        let scaled = brow_length_consumer(&mesh, [&ones; 3], seg, seg, -1.0, 1.0, 0.0).unwrap();
+        assert!(scaled.noop);
+    }
+
+    #[test]
+    fn consumer_refuses_shape_and_non_finite() {
+        let mesh = consumer_mesh();
+        let ones = [1.0f32; 24];
+        let seg = [Point::new(0.0, 0.0), Point::new(46.0, 0.0)];
+        assert_eq!(
+            brow_length_consumer(&mesh[..143], [&ones; 3], seg, seg, 1.0, 1.0, 1.0),
+            Err(Refusal::MissingMesh("brow_length_144_required"))
+        );
+        assert_eq!(
+            brow_length_consumer(&mesh, [&ones[..23], &ones, &ones], seg, seg, 1.0, 1.0, 1.0),
+            Err(Refusal::MissingFactorList)
+        );
+        let mut bad = mesh.clone();
+        bad[70] = Point::new(f32::NAN, 0.0);
+        assert_eq!(
+            brow_length_consumer(&bad, [&ones; 3], seg, seg, 1.0, 1.0, 1.0),
+            Err(Refusal::NonFinite("brow_length_consumer_non_finite"))
+        );
     }
 }

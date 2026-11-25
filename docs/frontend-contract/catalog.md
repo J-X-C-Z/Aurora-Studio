@@ -4,7 +4,7 @@
 
 2026-11-24 更新：人像效果以 `portrait-capability-registry-20261124.tsv` 的七级证据为准；
 本目录内的字节副本与 `03_algorithms/reports/PORTRAIT-CAPABILITY-REGISTRY-20261124.tsv`
-一致，SHA256 `f3986958a2415cd08bdcd3a6a98d5b2da6a23df90bfd7c4d68d0f41b8ccc9bc1`，
+一致，SHA256 `d1b92c6f0b1d15b2807f917c1298c5cbac4f72449c38e9f4e6af92a28fed85c4`（86,739 字节，2026-11-25 同步），
 共 147 个 effect、6 项 test_gap。七级依次为 ev1 内核存在、ev2 CPU 参考、ev3 GPU 内核、
 ev4 同 job 输入、ev5 应用主预览接入、ev6 原厂同图对拍、ev7 真实照片验收。
 只有 ev5 有证据才允许在界面标为可用；ev6/ev7 当前都是 0 项有证据。
