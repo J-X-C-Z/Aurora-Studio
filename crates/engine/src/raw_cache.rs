@@ -1007,7 +1007,7 @@ impl Drop for DecodeSlot {
     fn drop(&mut self) {
         let mut active = DECODE_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         *active = active.saturating_sub(1);
-        DECODE_SLOT_READY.notify_one();
+        DECODE_SLOT_READY.notify_all();
     }
 }
 

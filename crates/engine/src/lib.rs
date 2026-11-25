@@ -109,6 +109,17 @@ pub fn prewarm_gpu() {
     mock::prewarm_gpu();
 }
 
+/// Preloads portrait face detection/mesh/landmark ONNX sessions in the background
+/// so the first interactive portrait slider drag avoids model-open latency.
+pub fn prewarm_face_input() {
+    if let Err(err) = FaceInputSession::open_from_env(false) {
+        log::debug!("face input session prewarm skipped: {err:?}");
+    }
+    if let Err(err) = FaceInputSession::open_from_env(true) {
+        log::debug!("face parsing session prewarm skipped: {err:?}");
+    }
+}
+
 pub mod mask_store;
 mod noise_defaults;
 mod output;

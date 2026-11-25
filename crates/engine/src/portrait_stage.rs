@@ -103,6 +103,9 @@ pub use portrait_pf8033_cpu_forward::{
     PF8033_MODEL_WIDTH,
 };
 
+#[path = "portrait_longtail_inputs.rs"]
+pub mod portrait_longtail_inputs;
+
 #[path = "portrait_face_geometry_provider.rs"]
 mod portrait_face_geometry_provider;
 pub use portrait_face_geometry_provider::{
@@ -211,6 +214,30 @@ impl Default for PortraitMasks {
             width: 0,
             height: 0,
         }
+    }
+}
+
+/// A sampled, quantised mask and the exact stage geometry that produced it.
+#[derive(Clone)]
+pub struct CachedMask {
+    pub width: u32,
+    pub height: u32,
+    pub region: NormRect,
+    pub mask: std::sync::Arc<Vec<u8>>,
+}
+
+impl CachedMask {
+    pub fn new(width: u32, height: u32, region: NormRect, mask: std::sync::Arc<Vec<u8>>) -> Self {
+        Self {
+            width,
+            height,
+            region,
+            mask,
+        }
+    }
+
+    pub fn matches(&self, width: u32, height: u32, region: NormRect) -> bool {
+        self.width == width && self.height == height && self.region == region
     }
 }
 
@@ -752,6 +779,18 @@ pub struct ProducerInputs {
     pub pf90130: Option<Pf90130ProducerInputs>,
     pub moisture_face: Option<crate::portrait_moisture_inputs::OwnedMoistureFaceInputs>,
     pub moisture_body: Option<crate::portrait_moisture_inputs::OwnedMoistureBodyInputs>,
+    /// PF90034/30188/30189 per-face native packet. The recovered producer is
+    /// `W_geometry = f32(PF30188*PF90034)`, `W_shadow = f32(PF90034*PF30189)`
+    /// with the native `1e-4` gate; the model field itself stays an external
+    /// same-job input.
+    pub double_chin_degrees: Option<portrait_longtail_inputs::DoubleChinDegreeInputs>,
+    /// PF90085 per-face value plus the producer metric `v`. Only the degree is
+    /// recoverable here; the palette/GammaMap/matrix chain is named in
+    /// [`portrait_longtail_inputs::PF90085_PRODUCER_GAP`].
+    pub skin_unify_degrees: Option<portrait_longtail_inputs::SkinUnifyDegreeInputs>,
+    /// PF44124/48019/49221/41922 UI controls resolved through the vendor
+    /// two-part tables. The 144-vertex consumer kernel is still external.
+    pub brow_length_degrees: Option<portrait_longtail_inputs::BrowLengthDegreeInputs>,
     /// Why the same-frame face-input producer refused, when it did. Carried so
     /// the run report can name the root cause instead of a downstream mask.
     pub face_input_refusal: Option<Refusal>,
@@ -2900,6 +2939,49 @@ impl ProducerInputs {
                 }
             };
         }
+        // Long-tail per-face packets: a different per-face map or UI packet
+        // must not reuse the previous stage-cache entry.
+        hash = match self.double_chin_degrees.as_ref() {
+            None => fnv_u64(hash, 0),
+            Some(packet) => {
+                hash = fnv_u64(hash, 1);
+                hash = fnv_u64(hash, packet.ticket);
+                for map in [&packet.pf90034, &packet.pf30188, &packet.pf30189] {
+                    hash = fnv_usize(hash, map.entries().len());
+                    for (face, value) in map.entries() {
+                        hash = fnv_u64(hash, u64::from(*face));
+                        hash = fnv_u64(hash, u64::from(value.to_bits()));
+                    }
+                }
+                hash
+            }
+        };
+        hash = match self.skin_unify_degrees.as_ref() {
+            None => fnv_u64(hash, 0),
+            Some(packet) => {
+                hash = fnv_u64(hash, 1);
+                hash = fnv_u64(hash, packet.ticket);
+                for map in [&packet.pf90085, &packet.metric] {
+                    hash = fnv_usize(hash, map.entries().len());
+                    for (face, value) in map.entries() {
+                        hash = fnv_u64(hash, u64::from(*face));
+                        hash = fnv_u64(hash, u64::from(value.to_bits()));
+                    }
+                }
+                hash
+            }
+        };
+        hash = match self.brow_length_degrees.as_ref() {
+            None => fnv_u64(hash, 0),
+            Some(packet) => {
+                hash = fnv_u64(hash, 1);
+                hash = fnv_u64(hash, packet.ticket);
+                for value in packet.ui01 {
+                    hash = fnv_u64(hash, u64::from(value.to_bits()));
+                }
+                hash
+            }
+        };
         hash
     }
 }
@@ -3585,6 +3667,95 @@ impl PortraitJobReceipt {
         }
     }
 
+    /// Hashes one frame into both the standalone frame id and the job-fingerprint
+    /// state after the frame bytes. A stage-cache hit can fold the unchanged
+    /// frame state with the new portrait params without rescanning the frame.
+    pub(crate) fn frame_state_from_renderer_frame(
+        frame: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(u64, u64), Refusal> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|&bytes| bytes != 0)
+            .ok_or(Refusal::ShapeMismatch("PortraitFrameReceipt dimensions"))?;
+        if frame.len() != expected {
+            return Err(Refusal::ShapeMismatch("PortraitFrameReceipt frame"));
+        }
+        let frame_seed = fnv_u64(
+            fnv_u64(
+                fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-frame-v1"),
+                u64::from(width),
+            ),
+            u64::from(height),
+        );
+        let mut receipt_state = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
+        receipt_state = fnv_usize(receipt_state, frame.len());
+        let (frame_fingerprint, receipt_state) =
+            fnv1a64_pair(frame_seed, receipt_state, frame);
+        Ok((frame_fingerprint, receipt_state))
+    }
+
+    /// Builds the same job id as `from_renderer_receipt_with_fingerprints`,
+    /// given the frame-folded state from
+    /// [`Self::frame_state_from_renderer_frame`]. Only the cheap metadata and
+    /// params are folded again; the pixel buffer is not reread.
+    pub(crate) fn from_renderer_receipt_with_frame_state(
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        region: NormRect,
+        params: &BTreeMap<String, f32>,
+        masks: &PortraitMasks,
+        frame_fingerprint: u64,
+        mut fingerprint: u64,
+        mask_fingerprint: Option<u64>,
+    ) -> Self {
+        let region_bits = [
+            region.x.to_bits(),
+            region.y.to_bits(),
+            region.width.to_bits(),
+            region.height.to_bits(),
+        ];
+        let plane_lengths = [
+            masks.skin.as_ref().map(Vec::len),
+            masks.hair.as_ref().map(Vec::len),
+            masks.face.as_ref().map(Vec::len),
+            masks.body.as_ref().map(Vec::len),
+        ];
+        fingerprint = fnv_u64(fingerprint, u64::from(width));
+        fingerprint = fnv_u64(fingerprint, u64::from(height));
+        for bits in region_bits {
+            fingerprint = fnv_u64(fingerprint, u64::from(bits));
+        }
+        let params_fingerprint = params_fingerprint(params);
+        fingerprint = fnv_u64(fingerprint, params_fingerprint);
+        fingerprint = fnv_usize(fingerprint, masks.width);
+        fingerprint = fnv_usize(fingerprint, masks.height);
+        fingerprint = fnv_u64(
+            fingerprint,
+            mask_fingerprint.unwrap_or_else(|| masks.receipt_fingerprint()),
+        );
+        Self {
+            fingerprint,
+            frame: PortraitFrameReceipt {
+                fingerprint: frame_fingerprint,
+                width,
+                height,
+            },
+            width,
+            height,
+            frame_len: frame.len(),
+            frame_ptr: frame.as_ptr() as usize,
+            params_fingerprint,
+            region_bits,
+            mask_width: masks.width,
+            mask_height: masks.height,
+            plane_lengths,
+        }
+    }
+
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
@@ -3719,7 +3890,12 @@ pub struct PortraitJobInputs<'a> {
     pub plump: Option<&'a PlumpProducerInputs>,
     pub pf101: Option<&'a Pf101ProducerInputs>,
     pub pf90130: Option<&'a Pf90130ProducerInputs>,
+    pub double_chin_degrees: Option<&'a portrait_longtail_inputs::DoubleChinDegreeInputs>,
+    pub skin_unify_degrees: Option<&'a portrait_longtail_inputs::SkinUnifyDegreeInputs>,
+    pub brow_length_degrees: Option<&'a portrait_longtail_inputs::BrowLengthDegreeInputs>,
     pub face_input_refusal: Option<&'a Refusal>,
+    /// A same-frame skin mask supplied by the renderer-side geometry cache.
+    pub skin_mask: Option<std::sync::Arc<Vec<u8>>>,
     /// Digest of the exact pre-effect frame, when the renderer already paid
     /// for it while building the face producer inputs.
     pub stage_sha256: Option<[u8; 32]>,
@@ -3768,7 +3944,11 @@ impl<'a> PortraitJobInputs<'a> {
             plump: None,
             pf101: None,
             pf90130: None,
+            double_chin_degrees: None,
+            skin_unify_degrees: None,
+            brow_length_degrees: None,
             face_input_refusal: None,
+            skin_mask: None,
             stage_sha256: None,
         }
     }
@@ -3966,6 +4146,12 @@ impl<'a> PortraitJobInputs<'a> {
         self.makeup_bundle = producer.makeup_bundle.as_ref();
         self.pf101 = producer.pf101.as_ref();
         self.pf90130 = producer.pf90130.as_ref();
+        // Long-tail degree packets ride the same bundle; the stage rows that
+        // consume them are routed below and refuse by name while their final
+        // model consumers are open.
+        self.double_chin_degrees = producer.double_chin_degrees.as_ref();
+        self.skin_unify_degrees = producer.skin_unify_degrees.as_ref();
+        self.brow_length_degrees = producer.brow_length_degrees.as_ref();
         self.face_input_refusal = producer.face_input_refusal.as_ref();
         // Borrow the owned same-frame planes back out of `producer`, which lives
         // for `'a` like `self`. A missing owned bundle stays `None`, so the
@@ -5164,7 +5350,6 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         }
         return report;
     }
-
     let Some(source) = Image::new(width, height, std::mem::take(portrait)) else {
         return report;
     };
@@ -5186,6 +5371,13 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             .get("pc:30210")
             .copied()
             .ok_or(Refusal::MissingInput("PF30210 same-job UI"))
+            .map(|raw| {
+                if raw > 0.0 && raw < 1.0 {
+                    (raw * 4.0).round().clamp(1.0, 4.0)
+                } else {
+                    raw
+                }
+            })
             .and_then(full_face_descriptor_from_ui)
             .map(Some)
     } else {
@@ -5194,7 +5386,13 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     let mut current = source;
     // Keep the main-session optimization: skin effects share one sampled plane.
     // Non-skin rows receive their own explicit planes from `PortraitJobInputs`.
-    let skin_mask = inputs.masks.mask_u8(MaskKind::Skin, width, height, region);
+    let skin_mask_owned = inputs.skin_mask.clone().or_else(|| {
+        inputs
+            .masks
+            .mask_u8(MaskKind::Skin, width, height, region)
+            .map(std::sync::Arc::new)
+    });
+    let skin_mask = skin_mask_owned.as_deref().map(Vec::as_slice);
     let mut slim_result: Option<Result<bool, Refusal>> = None;
     let mut face_results: BTreeMap<u32, (Result<FaceGeometryRun, Refusal>, bool)> =
         BTreeMap::new();
@@ -5210,6 +5408,52 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 "portrait PF{pf} skipped; missing same-job inputs: {:?}",
                 meta.inputs
             );
+            // PF90085: an attached degree packet must be internally complete
+            // before the row reports its palette-chain gap. This validates the
+            // wire; the pixel producer stays absent. If every face resolves at
+            // or below the recovered `0.001` gate the vendor consumer is
+            // inactive, so the row is an identity frame rather than a gap.
+            if pf == 90085 {
+                if let Some(packet) = inputs.skin_unify_degrees {
+                    match packet.validate() {
+                        Ok(degrees) if degrees
+                            .iter()
+                            .all(|(_, degree)| *degree <= portrait_longtail_inputs::PF90085_DEGREE_GATE) =>
+                        {
+                            report.effects.push(PortraitEffectRun {
+                                pf,
+                                backend: PortraitBackend::Skipped,
+                                dispatches: Vec::new(),
+                                metal_dispatches: Vec::new(),
+                                fallback_reason: Some(
+                                    "PF90085 all faces below the 0.001 gate".to_string(),
+                                ),
+                                skipped: true,
+                                executed: false,
+                                refusal: None,
+                                skip_reason: None,
+                            });
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(refusal) => {
+                            log::debug!("PF90085 degree packet refused: {refusal:?}");
+                            report.effects.push(PortraitEffectRun {
+                                pf,
+                                backend: PortraitBackend::Skipped,
+                                dispatches: Vec::new(),
+                                metal_dispatches: Vec::new(),
+                                fallback_reason: Some(format!("{refusal:?}")),
+                                skipped: true,
+                                executed: false,
+                                refusal: Some(refusal.clone()),
+                                skip_reason: Some(PortraitSkipReason::InputRefused(refusal)),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
             // A row with a callable producer reports the inputs that producer
             // documents; only a row with no kernel at all stays NotImplemented.
             let refusal = match portrait_face_stage::producer_gap(pf) {
@@ -5375,6 +5619,33 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if let Some((left, right)) = portrait_face_stage::pair(pf) {
+            // PF44124/48019 and PF49221/41922: when the same-job degree packet
+            // is attached, it must resolve and bind to this job before the row
+            // reaches the Type1018 draw. The 144-vertex consumer kernel is
+            // still external, so this validates the wire without claiming a
+            // pixel implementation.
+            if matches!(left, 44124 | 49221) {
+                if let Some(packet) = inputs.brow_length_degrees {
+                    let bound = inputs.job_id().map_or(true, |job_id| job_id == packet.ticket);
+                    if !bound {
+                        let refusal = Refusal::ValueOutOfRange("BROW_LENGTH_JOB_TICKET");
+                        run.backend = PortraitBackend::Skipped;
+                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                        run.refusal = Some(refusal);
+                        report.effects.push(run);
+                        continue;
+                    }
+                    if let Err(refusal) = packet.resolved() {
+                        run.backend = PortraitBackend::Skipped;
+                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                        run.refusal = Some(refusal);
+                        report.effects.push(run);
+                        continue;
+                    }
+                }
+            }
             let (result, changed) = match face_results.get(&left) {
                 Some((result, changed)) => (result.clone(), *changed),
                 None => {
@@ -5550,6 +5821,31 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if repair_stage::PFS.contains(&pf) {
+            // PF90034: the recovered producer gates on
+            // `W_shadow >= 1e-4 || W_geometry >= 1e-4`. With the same-job
+            // per-face packet present, an all-inactive packet is an identity
+            // frame and must not demand the model shift field.
+            if pf == 90034 {
+                if let Some(packet) = inputs.double_chin_degrees {
+                    match packet.per_face_weights() {
+                        Ok(weights) if !weights.iter().any(|weights| weights.active) => {
+                            run.backend = PortraitBackend::Skipped;
+                            report.effects.push(run);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(refusal) => {
+                            run.backend = PortraitBackend::Skipped;
+                            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                            run.skip_reason =
+                                Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                            run.refusal = Some(refusal);
+                            report.effects.push(run);
+                            continue;
+                        }
+                    }
+                }
+            }
             match repair_stage::apply(&current, pf, degree, inputs.job_id(), inputs.repairs) {
                 Ok(Some(next)) => {
                     current = next;
@@ -8224,6 +8520,13 @@ fn resolve_stray_hair<'a>(
     let source = &inputs.stray_hair;
     let native_degree = required(source.native_degree, "PF90088_NATIVE_DEGREE")?;
     check_degree01(native_degree, "PF90088_NATIVE_DEGREE")?;
+    // Recovered host gate: the vendor consumer is active only when
+    // `d > 0.001` (`0x8BCBA40`), the same gate the CPU kernel
+    // (`hair_body::stray_hair_with_native`) and the CUDA host check use. Below
+    // it the row is an identity frame and PF90113/PF90114 are not required.
+    if native_degree <= aurora_portrait::kernels::hair_body::STRAY_HAIR_ACTIVE_GATE {
+        return Ok(None);
+    }
     let native_person_area =
         required(source.native_person_area, "PF90088_NATIVE_PERSON_AREA")?;
     check_degree01(native_person_area, "PF90088_NATIVE_PERSON_AREA")?;
@@ -8233,9 +8536,6 @@ fn resolve_stray_hair<'a>(
         native_background_area,
         "PF90088_NATIVE_BACKGROUND_AREA",
     )?;
-    if native_degree == 0.0 {
-        return Ok(None);
-    }
 
     let hairfly_v1 = required(source.hairfly_v1, "PF90088_HAIRFLY_V1")?;
     hairfly_v1
@@ -10352,6 +10652,45 @@ mod tests {
 
         assert_eq!(receipt.frame_receipt().fingerprint(), legacy_frame);
         assert_eq!(receipt.fingerprint(), legacy);
+    }
+
+    #[test]
+    fn cached_frame_state_keeps_the_full_receipt_id() {
+        let (width, height) = (8u32, 8u32);
+        let source = frame(width, height);
+        let masks = PortraitMasks::solid(1.0);
+        let params = BTreeMap::from([
+            ("pc:247".to_string(), 0.4f32),
+            ("pc:248".to_string(), 0.2f32),
+        ]);
+        let region = NormRect {
+            x: 0.125,
+            y: 0.25,
+            width: 0.5,
+            height: 0.75,
+        };
+        let full = PortraitJobReceipt::from_renderer_receipt(
+            &source, width, height, region, &params, &masks,
+        );
+        let (frame_fingerprint, frame_state) =
+            PortraitJobReceipt::frame_state_from_renderer_frame(&source, width, height)
+                .expect("valid frame state");
+        let cached = PortraitJobReceipt::from_renderer_receipt_with_frame_state(
+            &source,
+            width,
+            height,
+            region,
+            &params,
+            &masks,
+            frame_fingerprint,
+            frame_state,
+            None,
+        );
+        assert_eq!(
+            cached.frame_receipt().fingerprint(),
+            full.frame_receipt().fingerprint()
+        );
+        assert_eq!(cached.fingerprint(), full.fingerprint());
     }
 
     #[test]
@@ -14320,7 +14659,11 @@ mod tests {
             historical_tone: None,
             historical_skin: None,
             plump: None,
+            double_chin_degrees: None,
+            skin_unify_degrees: None,
+            brow_length_degrees: None,
             face_input_refusal: None,
+            skin_mask: None,
             stage_sha256: None,
         };
 

@@ -339,8 +339,15 @@ fn missing_draw(pf: u32) -> &'static str {
 /// route at all. The refusal names the inputs that producer documents, so a
 /// missing producer stays distinguishable from a row with no kernel.
 pub(super) fn producer_gap(pf: u32) -> Option<&'static str> {
-    let _ = pf;
-    None
+    use super::portrait_longtail_inputs as longtail;
+    Some(match pf {
+        30188 | 30189 => longtail::PF30188_PRODUCER_GAP,
+        30209 => longtail::PF30209_PRODUCER_GAP,
+        90085 => longtail::PF90085_PRODUCER_GAP,
+        90087 => longtail::PF90087_PRODUCER_GAP,
+        100005 => longtail::PF100005_PRODUCER_GAP,
+        _ => return None,
+    })
 }
 
 fn draw_gap(pf: u32) -> &'static str {

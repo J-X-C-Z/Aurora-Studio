@@ -544,7 +544,17 @@ impl FaceInputBackend {
     fn from_env() -> Result<Self, Refusal> {
         let raw = std::env::var(FACE_INPUT_BACKEND_ENV).unwrap_or_default();
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "cpu" => Ok(Self::Cpu),
+            "" => {
+                #[cfg(test)]
+                {
+                    Ok(Self::Cpu)
+                }
+                #[cfg(not(test))]
+                {
+                    Ok(Self::Auto)
+                }
+            }
+            "cpu" => Ok(Self::Cpu),
             "cuda" => Ok(Self::Cuda),
             "directml" | "dml" => Ok(Self::DirectMl),
             "auto" => Ok(Self::Auto),
@@ -1544,6 +1554,40 @@ impl FaceInputBundle {
         Ok(())
     }
 
+    /// Attaches the PF44124/48019/49221/41922 same-frame degree packet.
+    ///
+    /// Control order is the vendor `ControlIndex`: 0=head-left (PF44124),
+    /// 1=head-right (PF48019), 2=tail-left (PF49221), 3=tail-right (PF41922).
+    /// The vendor `RenderParamRanges` are `[0, 0.5, 1]`, so a value outside
+    /// `0..=1` means the C1-side normalization is still unresolved: attaching
+    /// nothing keeps the row on its existing named Type1018 gap rather than
+    /// asserting an INFERRED mapping.
+    pub fn attach_brow_length_degrees(
+        &self,
+        extra: &std::collections::BTreeMap<String, f32>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        use super::portrait_longtail_inputs::BrowLengthDegreeInputs;
+        let ui01 = [44124u32, 48019, 49221, 41922].map(|pf| {
+            extra
+                .get(&format!("pc:{pf}"))
+                .copied()
+                .unwrap_or(0.0)
+        });
+        if ui01.iter().all(|value| *value == 0.0) {
+            return Ok(());
+        }
+        if ui01
+            .iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        {
+            log::debug!("PF44124..PF41922 UI outside the recovered [0,0.5,1] range; not attaching");
+            return Ok(());
+        }
+        producer.brow_length_degrees = Some(BrowLengthDegreeInputs::new(self.job_id, ui01)?);
+        Ok(())
+    }
+
     /// Builds eye, brow, and lower-eyelid mesh draws (`PF8001..=PF8022`, `PF30073`, `PF30079`)
     /// from the 194 face landmarks and attaches them to `producer.face_geometry`.
     pub fn attach_eye_and_brow_geometry(
@@ -1557,13 +1601,21 @@ impl FaceInputBundle {
         use aurora_portrait::raster_fragment::{Clamp, Defines, Edge as FragmentEdge};
 
         self.validate_ticket(source, Some(self.job_id))?;
-        let any_eye_brow = (8001u32..=8020).any(|pf| {
-            extra
-                .get(&format!("pc:{pf}"))
-                .copied()
-                .unwrap_or(0.0)
-                != 0.0
-        });
+        let any_eye_brow = (8001u32..=8022)
+            .chain([30073, 30079])
+            .any(|pf| {
+                extra
+                    .get(&format!("pc:{pf}"))
+                    .copied()
+                    .unwrap_or(0.0)
+                    != 0.0
+            });
+        // PF44124/48019/49221/41922 brow length: attach the recovered
+        // two-part degree packet even when no eye row is active. The 144-vertex
+        // consumer kernel is not in this tree yet, so the geometric draw below
+        // stays behind `any_eye_brow` and the brow rows keep their named
+        // Type1018 refusal instead of running the unrecovered synthetic mesh.
+        self.attach_brow_length_degrees(extra, producer)?;
         if !any_eye_brow {
             return Ok(());
         }

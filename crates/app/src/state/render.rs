@@ -660,6 +660,7 @@ mod display_tests {
             let start = std::time::Instant::now();
             std::hint::black_box(prepare_display_image(
                 RgbaImage::from_shared(w, h, Arc::clone(&pixels)),
+                false,
                 Some((source_key, &prepared)),
             ));
             reuse.push(start.elapsed().as_secs_f64() * 1000.0);

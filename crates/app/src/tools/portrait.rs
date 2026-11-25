@@ -106,6 +106,7 @@ const WIRED_SKIN_EFFECTS: &[(&str, &str, &str, f32)] = &[
 /// Expression management effects wired to same-job smile warp (`assets/portrait/smile/`).
 const WIRED_EXPRESSION_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:8033", "Smile mouth corner", "微笑嘴角", 0.0),
+    ("pc:100007", "Open-mouth smile", "张嘴微笑", 0.0),
 ];
 
 /// Makeup effects wired to `B3_MAKEUP_ROWS` (`attach_makeup_bundle`) and `PF90021`.
@@ -131,11 +132,15 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
 const WIRED_EYES_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:100004", "Red blood removal", "去红血丝", 0.0),
     ("pc:101", "Silkworm", "卧蚕", 0.0),
+    ("pc:90130", "Glasses glare removal", "祛眼镜反光", 0.0),
 ];
 
 /// Hair effects wired to FaceParsingV2 / same-job producer inputs.
 const WIRED_HAIR_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:30009", "Hair color unify", "统一发色", 0.0),
+    ("pc:90088", "Stray hair removal", "祛碎发", 0.0),
+    ("pc:90139", "Hair smooth", "头发柔顺", 0.0),
+    ("pc:90160", "Hair gloss", "头发光泽", 0.0),
 ];
 
 /// Teeth effects wired to canonical FaceParsingV2 (`fbe.onnx`) on CUDA.
@@ -143,6 +148,63 @@ const WIRED_TEETH_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:108", "Teeth whitening", "美牙/牙齿美白", 0.0),
     ("pc:109", "Teeth brightness", "牙齿亮白", 0.0),
     ("pc:110", "Teeth de-yellow", "牙齿去黄", 0.0),
+    ("pc:30025", "Tooth repair", "牙齿修复", 0.0),
+    ("pc:30026", "Teeth alignment", "牙齿矫正", 0.0),
+];
+
+/// Blemish / repair effects wired to same-frame model outputs (`repair_stage`,
+/// beard and eye-bag kernels). Values are 0..=1 in `AdjustmentSet::extra`.
+const WIRED_BLEMISH_EFFECTS: &[(&str, &str, &str, f32)] = &[
+    ("pc:21026", "Stubble removal", "祛胡须", 0.0),
+    ("pc:90116", "Eye bag removal", "祛眼袋", 0.0),
+    ("pc:90034", "Double chin", "祛双下巴", 0.0),
+];
+
+/// An effect the capability table still marks unavailable or whose native
+/// producer is blocked. It renders as a disabled row that names the missing
+/// input; it is never counted as live and cannot store a value.
+struct DisabledEffect {
+    key: &'static str,
+    en: &'static str,
+    zh: &'static str,
+    /// Stored-unit default (0..=1); shown as 0..=100.
+    default: f32,
+    reason_en: &'static str,
+    reason_zh: &'static str,
+}
+
+/// PF90085 `skinToneUnifyFace` is blocked: the kernel exists but no native
+/// preset/parameter generator or GammaMap/sRGB matrices were recovered, and
+/// `portrait_historical_skin` rejects it in `open_reason`.
+const DISABLED_SKIN_EFFECTS: &[DisabledEffect] = &[DisabledEffect {
+    key: "pc:90085",
+    en: "Skin tone unify (face)",
+    zh: "肤色统一（面部）",
+    default: 0.0,
+    reason_en: "Blocked: no native preset/parameter generator, GammaMap or sRGB/ProPhoto matrices; the kernel has no drive values",
+    reason_zh: "已阻塞：缺原厂预设/参数生成器、GammaMap 与 sRGB/ProPhoto 矩阵，内核没有可驱动参数",
+}];
+
+/// PF30188/30189 are only typed producers; the double-chin model output, ROI
+/// writeback and shadow compositing are still open. PF90034 itself is routed
+/// through `repair_stage` and is the enabled control in the blemish panel.
+const DISABLED_BLEMISH_EFFECTS: &[DisabledEffect] = &[
+    DisabledEffect {
+        key: "pc:30188",
+        en: "Double chin — degree",
+        zh: "祛双下巴-程度",
+        default: 0.9,
+        reason_en: "Needs the same-job double-chin model output and ROI writeback; the control-specific model field is not recovered",
+        reason_zh: "缺同 job 双下巴模型输出与 ROI 回写；控件对应的模型字段尚未恢复",
+    },
+    DisabledEffect {
+        key: "pc:30189",
+        en: "Double chin — shadow",
+        zh: "祛双下巴-阴影",
+        default: 0.8,
+        reason_en: "Needs the same-job double-chin shadow output and final compositing; not recovered",
+        reason_zh: "缺同 job 双下巴阴影输出与最终合成；尚未恢复",
+    },
 ];
 
 /// Face geometry reshape effects wired to real 194->414 landmarks + CUDA mesh raster.
@@ -186,8 +248,8 @@ const WIRED_FACE_GEOMETRY_EFFECTS: &[(&str, &str, &str)] = &[
     ("pc:8022", "Brow position (R)", "眉位（右）"),
     ("pc:44124", "Brow head length (L)", "眉头长短（左）"),
     ("pc:48019", "Brow head length (R)", "眉头长短（右）"),
-    ("pc:41922", "Brow tail length (L)", "眉尾长短（左）"),
-    ("pc:49221", "Brow tail length (R)", "眉尾长短（右）"),
+    ("pc:49221", "Brow tail length (L)", "眉尾长短（左）"),
+    ("pc:41922", "Brow tail length (R)", "眉尾长短（右）"),
 ];
 
 const WIRED_FACE_SINGLE_EFFECTS: &[(&str, &str, &str)] = &[
@@ -217,7 +279,8 @@ const WIRED_TOTAL: usize = WIRED_SKIN_EFFECTS.len()
     + WIRED_HAIR_EFFECTS.len()
     + WIRED_FACE_GEOMETRY_EFFECTS.len()
     + WIRED_FACE_SINGLE_EFFECTS.len()
-    + WIRED_PLUMP_EFFECTS.len();
+    + WIRED_PLUMP_EFFECTS.len()
+    + WIRED_BLEMISH_EFFECTS.len();
 
 pub(crate) fn has_face_reshape(adjustments: &aurora_engine::AdjustmentSet) -> bool {
     WIRED_FACE_GEOMETRY_EFFECTS
@@ -238,6 +301,7 @@ pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSe
             .chain(WIRED_EYES_EFFECTS)
             .chain(WIRED_MAKEUP_EFFECTS)
             .chain(WIRED_HAIR_EFFECTS)
+            .chain(WIRED_BLEMISH_EFFECTS)
             .any(|(key, _, _, neutral)| {
                 adjustments.extra.get(*key).is_some_and(|amount| (amount - neutral).abs() > 1.0e-6)
             })
@@ -286,6 +350,43 @@ fn live_portrait_backing_excludes_neutral_values() {
     adjustments.extra.remove("pc:30210");
     adjustments.extra.insert("pc:90023".into(), 0.3);
     assert!(has_live_portrait_effect(&adjustments));
+    adjustments.extra.remove("pc:90023");
+    adjustments.extra.insert("pc:90088".into(), 0.4);
+    assert!(has_live_portrait_effect(&adjustments));
+}
+
+#[cfg(test)]
+#[test]
+fn amount_sliders_store_0_to_1_and_start_neutral() {
+    for (key, _, _, default) in WIRED_BLEMISH_EFFECTS
+        .iter()
+        .chain(WIRED_HAIR_EFFECTS)
+        .chain(WIRED_TEETH_EFFECTS)
+        .chain(WIRED_EYES_EFFECTS)
+        .chain(WIRED_EXPRESSION_EFFECTS)
+    {
+        let id: u32 = key.strip_prefix("pc:").and_then(|id| id.parse().ok()).unwrap_or_else(|| panic!("{key} is not a pf id"));
+        assert!(*default >= 0.0 && *default <= 1.0, "{key} default {default} outside 0..=1");
+        // PF109/PF110 are brightness/de-yellow sub-controls folded into the
+        // PF108 teeth producer, so they have no dispatcher row of their own.
+        if !matches!(id, 109 | 110) {
+            assert!(aurora_engine::is_bridged_effect(id), "PF{id} has a slider but no engine route");
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn disabled_effects_never_count_as_live() {
+    for effect in DISABLED_SKIN_EFFECTS.iter().chain(DISABLED_BLEMISH_EFFECTS) {
+        assert!(!has_live_portrait_effect(&{
+            let mut a = aurora_engine::AdjustmentSet::default();
+            a.extra.insert(effect.key.into(), 0.5);
+            a
+        }), "{} must not be wired", effect.key);
+        let id: u32 = effect.key.strip_prefix("pc:").and_then(|id| id.parse().ok()).expect("pf id");
+        assert!(!aurora_engine::is_bridged_effect(id), "PF{id} is routed; it must not be listed as disabled");
+    }
 }
 
 /// Catalogue bands must not duplicate a control that already has a dedicated
@@ -300,6 +401,8 @@ fn is_wired_key(key: &str) -> bool {
         || WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_FACE_SINGLE_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_PLUMP_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_BLEMISH_EFFECTS.iter().any(|row| row.0 == key)
+        || DISABLED_SKIN_EFFECTS.iter().chain(DISABLED_BLEMISH_EFFECTS).any(|row| row.key == key)
 }
 
 fn portrait_amount_binding(key: &'static str, default: f32) -> Binding {
@@ -393,6 +496,20 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
 
     let live = PanelStack::new(state)
         .head(header)
+        .panel("portrait-blemish", simple_live_panel(
+            state,
+            "portrait-blemish",
+            t("Blemish Removal", "祛除瑕疵"),
+            t("Reset blemish removal", "复位祛除瑕疵"),
+            Status::Partial(
+                "Blemish removal needs same-frame model output on the current photo; rows without it are disabled",
+                "祛除瑕疵需要在当前照片上取得同帧模型输出；缺少输入的项已禁用",
+            ),
+            WIRED_BLEMISH_EFFECTS,
+            DISABLED_BLEMISH_EFFECTS,
+            &query,
+            cx,
+        ))
         .panel("portrait-skin", skin_panel(state, &query, cx))
         .panel("retouch-face-geometry", wired_face_geometry_panel(state, &query, cx))
         .panel("retouch-face-plump", wired_plump_panel(state, &query, cx))
@@ -402,10 +519,11 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             t("Expression", "表情管理"),
             t("Reset expression", "复位表情管理"),
             Status::Partial(
-                "Smile mouth corner (PF8033) uses built-in smile warp assets and same-job face geometry",
-                "微笑嘴角（PF8033）使用内置微笑形变资产与同帧面部几何",
+                "Smile mouth corner (PF8033) uses built-in smile warp assets; open-mouth smile (PF100007) needs a same-job model frame",
+                "微笑嘴角（PF8033）使用内置微笑形变资产；张嘴微笑（PF100007）需要同帧模型输出",
             ),
             WIRED_EXPRESSION_EFFECTS,
+            &[],
             &query,
             cx,
         ))
@@ -415,10 +533,11 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             t("Teeth", "牙齿美化"),
             t("Reset teeth", "复位牙齿美化"),
             Status::Partial(
-                "Teeth whitening (PF108) renders through FaceParsingV2 on CUDA or CPU",
-                "美牙（PF108）通过 FaceParsingV2 在 CUDA/CPU 上实时渲染",
+                "Teeth whitening (PF108) renders through FaceParsingV2; repair/alignment (PF30025/PF30026) need same-job model output",
+                "美牙（PF108）通过 FaceParsingV2 渲染；牙齿修复/矫正（PF30025/PF30026）需要同帧模型输出",
             ),
             WIRED_TEETH_EFFECTS,
+            &[],
             &query,
             cx,
         ))
@@ -428,10 +547,11 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             t("Eyes", "眼睛增强"),
             t("Reset eyes", "复位眼睛增强"),
             Status::Partial(
-                "Eye enhancement requires detected eye masks on the current photo",
-                "眼睛增强需要在当前照片中检测到有效的眼部掩码",
+                "Eye enhancement requires detected eye masks; glasses glare removal (PF90130) needs its same-job producer",
+                "眼睛增强需要检测到有效的眼部掩码；祛眼镜反光（PF90130）需要同帧生产者输出",
             ),
             WIRED_EYES_EFFECTS,
+            &[],
             &query,
             cx,
         ))
@@ -442,10 +562,11 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             t("Hair", "头发调整"),
             t("Reset hair", "复位头发调整"),
             Status::Partial(
-                "Hair color unify requires a detected hair mask on the current photo",
-                "统一发色需要在当前照片中检测到头发掩码",
+                "Hair effects require a detected hair mask and same-job hair producer output",
+                "头发效果需要检测到头发掩码与同帧头发生产者输出",
             ),
             WIRED_HAIR_EFFECTS,
+            &[],
             &query,
             cx,
         ));
@@ -496,6 +617,7 @@ fn sectioned_live_panel(
     status: Status,
     effects: &'static [(&'static str, &'static str, &'static str, f32)],
     sections: &'static [(&'static str, &'static str, &'static [&'static str])],
+    disabled: &'static [DisabledEffect],
     query: &str,
     cx: &App,
 ) -> AnyElement {
@@ -514,6 +636,14 @@ fn sectioned_live_panel(
         }
         rows.push(caption(t(en, zh), cx));
         rows.extend(hits.into_iter().map(|(key, en, zh, default)| live_slider(state, key, en, zh, *default, cx)));
+    }
+    let disabled_hits: Vec<&DisabledEffect> = disabled
+        .iter()
+        .filter(|e| matches(query, t(e.en, e.zh), e.key, None))
+        .collect();
+    if !disabled_hits.is_empty() {
+        rows.push(caption(t("Missing input", "缺输入"), cx));
+        rows.extend(disabled_hits.into_iter().map(|effect| disabled_effect_row(effect, cx)));
     }
     if rows.is_empty() {
         return div().into_any_element();
@@ -536,6 +666,41 @@ fn sectioned_live_panel(
         .into_any_element()
 }
 
+/// One disabled row for an effect whose inputs the backend cannot produce yet:
+/// no slider, only the label, its PF id and the missing input.
+fn disabled_effect_row(effect: &DisabledEffect, cx: &App) -> AnyElement {
+    let p = pal(cx).clone();
+    let tip = format!(
+        "{}\n{} {:.0}",
+        t(effect.reason_en, effect.reason_zh),
+        t("Default", "默认"),
+        effect.default * 100.0,
+    );
+    h_flex()
+        .id(SharedString::from(format!("blocked-{}", effect.key)))
+        .px_3()
+        .py_0p5()
+        .gap_2()
+        .items_start()
+        .text_size(px(10.0))
+        .text_color(p.text_disabled)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(t(effect.en, effect.zh)),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .child(effect.key.trim_start_matches("pc:").to_string()),
+        )
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+        .into_any_element()
+}
+
 fn simple_live_panel(
     state: &Entity<AppState>,
     id: &'static str,
@@ -543,6 +708,7 @@ fn simple_live_panel(
     reset_label: &'static str,
     status: Status,
     effects: &'static [(&'static str, &'static str, &'static str, f32)],
+    disabled: &'static [DisabledEffect],
     query: &str,
     cx: &App,
 ) -> AnyElement {
@@ -553,7 +719,11 @@ fn simple_live_panel(
         .iter()
         .filter(|(key, en, zh, _)| matches(query, t(en, zh), key, None))
         .collect();
-    if hits.is_empty() {
+    let disabled_hits: Vec<&DisabledEffect> = disabled
+        .iter()
+        .filter(|e| matches(query, t(e.en, e.zh), e.key, None))
+        .collect();
+    if hits.is_empty() && disabled_hits.is_empty() {
         return div().into_any_element();
     }
     let st = state.clone();
@@ -571,6 +741,7 @@ fn simple_live_panel(
             })
         })
         .children(hits.into_iter().map(|(key, en, zh, default)| live_slider(state, key, en, zh, *default, cx)))
+        .children(disabled_hits.into_iter().map(|effect| disabled_effect_row(effect, cx)))
         .into_any_element()
 }
 
@@ -587,6 +758,7 @@ fn skin_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
         ),
         WIRED_SKIN_EFFECTS,
         &SKIN_SECTIONS,
+        DISABLED_SKIN_EFFECTS,
         query,
         cx,
     )
@@ -605,9 +777,32 @@ fn makeup_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
         ),
         WIRED_MAKEUP_EFFECTS,
         &MAKEUP_SECTIONS,
+        &[],
         query,
         cx,
     )
+}
+
+/// Face-geometry rows belong to two engine contracts:
+/// * mesh-group rows (PF30092/93, PF30080..83, PF242/243, PF8023..8030) take
+///   percent in -100..=100 and normalise it inside the stage;
+/// * pair rows (PF8001..8022, PF247/248, PF30073/79, PF44124/48019/49221/41922)
+///   are validated against -1..=1 by `portrait_face_stage::apply_with_mode`.
+/// The panel always shows -100..=100, so pair rows divide by 100 on write.
+fn is_mesh_group_pf(pf: u32) -> bool {
+    matches!(
+        pf,
+        30092 | 30093 | 30080 | 30081 | 30082 | 30083 | 242 | 243 | 8023 | 8024 | 8027 | 8028 | 8029 | 8030
+    )
+}
+
+fn face_geometry_binding(key: &'static str) -> Binding {
+    let pf = key.strip_prefix("pc:").and_then(|id| id.parse::<u32>().ok()).unwrap_or(0);
+    if is_mesh_group_pf(pf) {
+        extra_binding(key, 0.0)
+    } else {
+        portrait_amount_binding(key, 0.0)
+    }
 }
 
 /// Face reshape as left/right pairs. Linked (the default), one slider moves
@@ -637,7 +832,7 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
     for (sides, (en, zh)) in pairs {
         let (left, right) = (sides[0].0, sides[1].0);
         if linked {
-            let (l, r) = (extra_binding(left, 0.0), extra_binding(right, 0.0));
+            let (l, r) = (face_geometry_binding(left), face_geometry_binding(right));
             let (lget, rget, lset, rset) = (l.get.clone(), r.get.clone(), l.set.clone(), r.set.clone());
             let both = Binding::new(move |a| (lget(a) + rget(a)) * 0.5, move |a, v| {
                 lset(a, v);
@@ -646,12 +841,14 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
             rows.push(param(state, format!("fg-{left}-lr"), t(en, zh), both, -100.0, 100.0, cx).default_value(0.0).into_any_element());
         } else {
             rows.push(caption(t(en, zh), cx));
-            rows.push(param(state, format!("fg-{left}"), t("Left", "左"), extra_binding(left, 0.0), -100.0, 100.0, cx).default_value(0.0).into_any_element());
-            rows.push(param(state, format!("fg-{right}"), t("Right", "右"), extra_binding(right, 0.0), -100.0, 100.0, cx).default_value(0.0).into_any_element());
+            rows.push(param(state, format!("fg-{left}"), t("Left", "左"), face_geometry_binding(left), -100.0, 100.0, cx).default_value(0.0).into_any_element());
+            rows.push(param(state, format!("fg-{right}"), t("Right", "右"), face_geometry_binding(right), -100.0, 100.0, cx).default_value(0.0).into_any_element());
         }
     }
     for (key, en, zh) in singles {
-        rows.push(param(state, format!("fg-{key}"), t(en, zh), extra_binding(*key, 0.0), -100.0, 100.0, cx).default_value(0.0).into_any_element());
+        // PF8033 (smile corner) is monotonic 0..=1; the others are bipolar.
+        let (min, max) = if *key == "pc:8033" { (0.0, 100.0) } else { (-100.0, 100.0) };
+        rows.push(param(state, format!("fg-{key}"), t(en, zh), face_geometry_binding(key), min, max, cx).default_value(0.0).into_any_element());
     }
     let (st, st_link) = (state.clone(), state.clone());
     ToolPanel::new(state, "retouch-face-geometry", t("Face Reshape", "面部精修"))
@@ -715,13 +912,14 @@ fn wired_plump_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElem
             })
         })
         .children(shown.into_iter().map(|(key, en, zh)| {
+            let (min, max) = if *key == "pc:30210" { (0.0, 100.0) } else { (-100.0, 100.0) };
             param(
                 state,
                 format!("fp-{key}"),
                 t(*en, *zh),
-                extra_binding(*key, 0.0),
-                -100.0,
-                100.0,
+                portrait_amount_binding(key, 0.0),
+                min,
+                max,
                 cx,
             )
             .default_value(0.0)

@@ -780,7 +780,7 @@ mod tests {
             (8069, "skinTexture"),
             (8070, "skinClarity"),
             (21015, "skinColorHue"),
-            (30096, "未验证"), // registry key/label still placeholder; row exists
+            (30096, "sediao"), // capability registry row is now recovered (2026-11-25)
             (90005, "skinWhitening"),
         ];
         let mut seen = BTreeSet::new();

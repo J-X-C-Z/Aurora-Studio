@@ -33,6 +33,8 @@ pub struct Source {
     fingerprint: OnceLock<u64>,
     /// Packed sRGB RGBA for the full decoded source frame.
     face_rgba8: OnceLock<crate::PortraitImage>,
+    /// Skin mask sampled at the cached preview stage size.
+    portrait_skin_mask: Mutex<Option<crate::portrait_stage::CachedMask>>,
 }
 
 pub(crate) struct Plane {
@@ -700,6 +702,7 @@ impl Source {
                 portrait_masks_fingerprint: OnceLock::new(),
                 fingerprint: OnceLock::new(),
                 face_rgba8: OnceLock::new(),
+                portrait_skin_mask: Mutex::new(None),
             };
         }
         data.truncate((width as usize) * (height as usize));
@@ -726,6 +729,7 @@ impl Source {
             portrait_masks_fingerprint: OnceLock::new(),
             fingerprint: OnceLock::new(),
             face_rgba8: OnceLock::new(),
+            portrait_skin_mask: Mutex::new(None),
         }
     }
 
@@ -845,6 +849,36 @@ impl Source {
         *self
             .portrait_masks_fingerprint
             .get_or_init(|| self.portrait_masks().receipt_fingerprint())
+    }
+
+    pub(crate) fn portrait_skin_mask_cached(
+        &self,
+        out_w: u32,
+        out_h: u32,
+        region: crate::NormRect,
+    ) -> Option<Arc<Vec<u8>>> {
+        let mut cache = self
+            .portrait_skin_mask
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mask) = cache.as_ref() {
+            if mask.matches(out_w, out_h, region) {
+                return Some(Arc::clone(&mask.mask));
+            }
+        }
+        let mask = Arc::new(self.portrait_masks().mask_u8(
+            crate::portrait_stage::MaskKind::Skin,
+            out_w,
+            out_h,
+            region,
+        )?);
+        *cache = Some(crate::portrait_stage::CachedMask::new(
+            out_w,
+            out_h,
+            region,
+            Arc::clone(&mask),
+        ));
+        Some(mask)
     }
 
     fn portrait_mask_rgba(&self, edge: usize) -> Vec<u8> {
@@ -1287,6 +1321,15 @@ fn needs_stage_face_bundle_direct(extra: &std::collections::BTreeMap<String, f32
                 | 30204
                 | 30207
                 | 30210
+                // Brow head/tail length (PF44124/48019/49221/41922): the
+                // recovered two-part degree packet is attached through the
+                // face-bundle path. The synthetic Type1018 draw itself stays
+                // behind `any_eye_brow`, so the brow rows keep their named
+                // refusal until the 144-vertex consumer is routed.
+                | 41922
+                | 44124
+                | 48019
+                | 49221
         )
     })
 }
@@ -1973,7 +2016,8 @@ struct PortraitStageEntry {
     level: usize,
     mask_overlay: Option<u64>,
     frame_fingerprint: u64,
-    rgba: Vec<u8>,
+    frame_state: u64,
+    image: Arc<crate::PortraitImage>,
 }
 
 const PORTRAIT_STAGE_MAX_BYTES: usize = 64 << 20;
@@ -2019,7 +2063,7 @@ fn portrait_stage_cached(
     scale: f32,
     level: usize,
     mask_overlay: Option<u64>,
-) -> Option<(Vec<u8>, u64)> {
+) -> Option<(Arc<crate::PortraitImage>, u64, u64)> {
     let adjustments = portrait_stage_adjustments(adj);
     let cache = portrait_stage_cache()
         .lock()
@@ -2036,7 +2080,13 @@ fn portrait_stage_cached(
         && entry.scale_bits == scale.to_bits()
         && entry.level == level
         && entry.mask_overlay == mask_overlay;
-    matches.then(|| (entry.rgba.clone(), entry.frame_fingerprint))
+    matches.then(|| {
+        (
+            Arc::clone(&entry.image),
+            entry.frame_fingerprint,
+            entry.frame_state,
+        )
+    })
 }
 
 fn portrait_stage_store(
@@ -2049,14 +2099,16 @@ fn portrait_stage_store(
     level: usize,
     mask_overlay: Option<u64>,
     rgba: &[u8],
-) {
+) -> Option<(Arc<crate::PortraitImage>, u64, u64)> {
     if rgba.len() > PORTRAIT_STAGE_MAX_BYTES {
-        return;
+        return None;
     }
-    let frame_fingerprint =
-        crate::portrait_stage::PortraitFrameReceipt::from_renderer_frame(rgba, out_w, out_h)
-            .map(|receipt| receipt.fingerprint())
-            .unwrap_or(0);
+    let (frame_fingerprint, frame_state) =
+        crate::portrait_stage::PortraitJobReceipt::frame_state_from_renderer_frame(
+            rgba, out_w, out_h,
+        )
+        .unwrap_or((0, 0));
+    let image = Arc::new(crate::PortraitImage::new(out_w, out_h, rgba.to_vec())?);
     let entry = PortraitStageEntry {
         source_ptr: src.levels[0].data.as_ptr() as usize,
         source_len: src.levels[0].data.len(),
@@ -2070,11 +2122,13 @@ fn portrait_stage_store(
         level,
         mask_overlay,
         frame_fingerprint,
-        rgba: rgba.to_vec(),
+        frame_state,
+        image: Arc::clone(&image),
     };
     *portrait_stage_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
+    Some((image, frame_fingerprint, frame_state))
 }
 
 #[cfg(windows)]
@@ -2194,14 +2248,17 @@ fn render_sized(
     let portrait_active = !bypass
         && !wide
         && crate::portrait_registry::has_active_portrait_effect(adj);
-    let mut cached_frame_fingerprint = None;
+    let mut cached_frame_state: Option<(u64, u64)> = None;
+    let mut cached_stage_image: Option<Arc<crate::PortraitImage>> = None;
     let (mut rgba, mut rgba16, develop8) = 'develop: {
         if portrait_active {
-            if let Some((cached, fingerprint)) =
+            if let Some((cached, fingerprint, frame_state)) =
                 portrait_stage_cached(src, adj, region, out_w, out_h, scale, level, mask_overlay)
             {
-                cached_frame_fingerprint = Some(fingerprint);
-                break 'develop (cached, None, None);
+                cached_frame_state = Some((fingerprint, frame_state));
+                let pixels = cached.pixels.clone();
+                cached_stage_image = Some(cached);
+                break 'develop (pixels, None, None);
             }
         }
     let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
@@ -3150,22 +3207,42 @@ fn render_sized(
     }
         (rgba, rgba16, develop8)
     };
-    if portrait_active {
-        portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba);
-    }
+    let stored_stage = if portrait_active && cached_frame_state.is_none() {
+        portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba)
+    } else {
+        None
+    };
+    let stored_frame_state = stored_stage
+        .as_ref()
+        .map(|(_, frame_fingerprint, frame_state)| (*frame_fingerprint, *frame_state));
     let portrait_report = if portrait_active {
         let masks = src.portrait_masks();
-        let receipt =
-            crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
+        let mask_fingerprint = Some(src.portrait_masks_receipt_fingerprint());
+        let receipt = match cached_frame_state.or(stored_frame_state) {
+            Some((frame_fingerprint, frame_state)) => {
+                crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_frame_state(
+                    &rgba,
+                    out_w,
+                    out_h,
+                    region,
+                    &adj.extra,
+                    masks,
+                    frame_fingerprint,
+                    frame_state,
+                    mask_fingerprint,
+                )
+            }
+            None => crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
                 &rgba,
                 out_w,
                 out_h,
                 region,
                 &adj.extra,
                 masks,
-                cached_frame_fingerprint,
-                Some(src.portrait_masks_receipt_fingerprint()),
-            );
+                None,
+                mask_fingerprint,
+            ),
+        };
         // Face landmarks come from the full decoded source and are mapped
         // through the renderer's FrameMap into the current out_w/out_h stage.
         let mut producer_inputs: Option<ProducerInputs> = None;
@@ -3184,7 +3261,11 @@ fn render_sized(
             cached_stage_sha256(receipt.frame_receipt().fingerprint(), &rgba)
         });
         let stage_frame = if want_stage_slim || want_stage_attachments {
-            crate::PortraitImage::new(out_w, out_h, rgba.clone())
+            cached_stage_image.clone().or_else(|| {
+                stored_stage
+                    .as_ref()
+                    .map(|(image, _, _)| Arc::clone(image))
+            })
         } else {
             None
         };
@@ -3377,11 +3458,21 @@ fn render_sized(
                                 }
                             }
                         }
-                        if any_makeup_row_active(&adj.extra)
+                        let active_makeup_rows: Vec<u32> =
+                            crate::portrait_makeup_wiring::makeup_rows_2d_declared()
+                                .iter()
+                                .copied()
+                                .filter(|pf| {
+                                    adj.extra
+                                        .get(&format!("pc:{pf}"))
+                                        .is_some_and(|v| v.abs() > 1.0e-6)
+                                })
+                                .collect();
+                        if !active_makeup_rows.is_empty()
                             && bundle
                                 .attach_makeup_bundle(
                                     stage_frame,
-                                    &crate::portrait_makeup_bundle::B3_MAKEUP_ROWS,
+                                    &active_makeup_rows,
                                     &mut inputs,
                                 )
                                 .is_ok()
@@ -3458,6 +3549,7 @@ fn render_sized(
         let mut inputs =
             crate::portrait_stage::PortraitJobInputs::from_renderer_receipt(receipt, masks);
         inputs.stage_sha256 = stage_sha256;
+        inputs.skin_mask = src.portrait_skin_mask_cached(out_w, out_h, region);
         if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
@@ -9403,9 +9495,9 @@ mod develop_gpu_integration_tests {
         let region = NormRect::FULL;
         let stored = vec![7u8; 64];
         portrait_stage_store(&source, &adj, region, 4, 4, 1.0, 0, None, &stored);
-        let (cached, _) = portrait_stage_cached(&source, &adj, region, 4, 4, 1.0, 0, None)
+        let (cached, _, _) = portrait_stage_cached(&source, &adj, region, 4, 4, 1.0, 0, None)
             .expect("stage cache hit");
-        assert_eq!(cached, stored);
+        assert_eq!(cached.pixels, stored);
 
         let mut changed_portrait = adj.clone();
         changed_portrait.extra.insert("pc:247".to_string(), 0.8);
