@@ -649,3 +649,515 @@ mod tests {
         assert!(close(wb, wa * 0.5, 1e-6), "{wa} vs {wb}");
     }
 }
+
+
+// ===========================================================================
+// HOST MAPPING CLOSED IN c1_luma_noise_host_20261125
+// ===========================================================================
+//
+// Evidence (current DLL ca02b6ac..., ImageBase 0x180000000):
+//   SetParameters          VA 0x181775100
+//   ProcessBlock           VA 0x18177bc50
+//   0x310 buffer init      VA 0x18177d720
+//   op Run (kernel args)   VA 0x18177b330
+//   enable predicate       VA 0x181776210
+//   noise-model producer   VA 0x18154e3b0  (SettingsToSettingsExCameraConfig)
+//   per-ISO table          coreConfig.cdx (XML XOR 0x81), see camera-iso-sample.tsv
+//
+// The 0x310-byte constant buffer is the OpenCL struct transcribed from
+// p_041588192.cl (struct z5dd37f8de8): 8 x 32-byte entries, 64 int2 taps,
+// then count/bbox/min and a -1 tail.  The three 512-byte 32x16 tap masks are
+// static .rdata tables selected by (flag_a, size16) in SetParameters.
+
+/// f32 at VA 0x182a3df2c.
+pub const LN_REF_LUMA: f32 = 11796.30078125;
+/// f32 at VA 0x182a3dfec (f32(LN_REF_LUMA * LN_REF_LUMA)).
+pub const LN_REF_LUMA_SQ: f32 = 139_152_720.0;
+/// f32 at VA 0x182a35508.
+pub const LN_AMOUNT_SCALE: f32 = 0.019_999_999_552_965_164;
+/// f32 at VA 0x182a31fc4.
+pub const LN_STRAIGHT_SCALE: f32 = 4.999_999_873_689_376e-5;
+/// Tap list capacity (CL `int2 taps[64]`).
+pub const LN_TAP_CAPACITY: usize = 64;
+/// The shipped kernel unrolls `if (count > 49)` only, so taps 50..63 are unused.
+pub const LN_KERNEL_TAP_UNROLL: usize = 50;
+/// op+0xf8, set at 0x181775f6a.
+pub const LN_BLOCK_W: i32 = 32;
+/// op+0xfc, set at 0x181775f74.
+pub const LN_BLOCK_H: i32 = 16;
+/// `clCreateBuffer` size at 0x18177c5de.
+pub const LN_ANGLE_PARAM_BUF_SIZE: usize = 0x310;
+
+/// VA 0x1827bf890, SHA-256 645fcf9312fa72d6409d8f001560338a089efcf5b02c04e0e43e84890c03aa35, 32 non-zero bytes.
+pub static LN_TAP_MASK_16_ND: [u8; 512] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+];
+/// VA 0x1827bfa90, SHA-256 4591e0636d1926e78d88073c89c533f28ff0360bce1f151afa269fe064a20e8b, 64 non-zero bytes.
+pub static LN_TAP_MASK_8_ND: [u8; 512] = [
+    0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+    1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+    0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+];
+/// VA 0x1827bfc90, SHA-256 b2112555aec7706440f3cae32151b5aad0d89fe3e41b5ea3e58778d87155e539, 18 non-zero bytes.
+pub static LN_TAP_MASK_16_DIR: [u8; 512] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Mask table used by `SetParameters` (0x181775f19..0x181775f5c).
+pub fn ln_tap_mask(flag_a: bool, size16: bool) -> (&'static [u8; 512], u64) {
+    match (flag_a, size16) {
+        (false, false) => (&LN_TAP_MASK_8_ND, 0x1827BFA90),
+        (false, true) => (&LN_TAP_MASK_16_ND, 0x1827BF890),
+        (true, false) => (&LN_TAP_MASK_16_ND, 0x1827BF890),
+        (true, true) => (&LN_TAP_MASK_16_DIR, 0x1827BFC90),
+    }
+}
+
+/// One 32-byte OpenCL angle entry (`struct z60c1969d74`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct AngleEntryGuest {
+    pub offsets: [i8; 16],
+    pub scale: f32,
+    pub mode: i32,
+    pub flag: i32,
+    /// Initialised to -1 by 0x18177d740, never overwritten.
+    pub pad: i32,
+}
+
+impl AngleEntryGuest {
+    /// Defaults written by 0x18177d720: scale 0, mode 2, flag 0, pad -1.
+    pub const DEFAULT: AngleEntryGuest = AngleEntryGuest {
+        offsets: [0; 16],
+        scale: 0.0,
+        mode: 2,
+        flag: 0,
+        pad: -1,
+    };
+
+    pub fn from_angle_entry(e: &AngleEntry) -> Self {
+        AngleEntryGuest {
+            offsets: e.offsets,
+            scale: e.scale,
+            mode: e.mode,
+            flag: if e.flag { 1 } else { 0 },
+            pad: -1,
+        }
+    }
+}
+
+/// Host-side 0x310-byte `LN_AngleParamBuf` (also the CL struct z5dd37f8de8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct AngleParamBuf {
+    pub entries: [AngleEntryGuest; 8],
+    pub taps: [[i32; 2]; LN_TAP_CAPACITY],
+    pub tap_count: i32,
+    pub bbox_w: i16,
+    pub bbox_h: i16,
+    pub min_x: i16,
+    pub min_y: i16,
+    pub tail: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<AngleEntryGuest>() == 32);
+const _: () = assert!(core::mem::size_of::<AngleParamBuf>() == LN_ANGLE_PARAM_BUF_SIZE);
+const _: () = assert!(core::mem::offset_of!(AngleParamBuf, taps) == 0x100);
+const _: () = assert!(core::mem::offset_of!(AngleParamBuf, tap_count) == 0x300);
+const _: () = assert!(core::mem::offset_of!(AngleParamBuf, bbox_w) == 0x304);
+const _: () = assert!(core::mem::offset_of!(AngleParamBuf, min_x) == 0x308);
+const _: () = assert!(core::mem::offset_of!(AngleParamBuf, tail) == 0x30c);
+
+impl Default for AngleParamBuf {
+    fn default() -> Self {
+        AngleParamBuf {
+            entries: [AngleEntryGuest::DEFAULT; 8],
+            taps: [[0; 2]; LN_TAP_CAPACITY],
+            tap_count: 0,
+            bbox_w: 0,
+            bbox_h: 0,
+            min_x: 100,
+            min_y: 100,
+            tail: -1,
+        }
+    }
+}
+
+impl AngleParamBuf {
+    /// Pack the entries and tap list exactly as ProcessBlock 0x18177c11a.. does.
+    pub fn pack(entries: &[AngleEntry], taps: &[(i32, i32)]) -> Self {
+        assert!(entries.len() <= 8);
+        assert!(taps.len() <= LN_TAP_CAPACITY);
+        let mut buf = AngleParamBuf::default();
+        for (i, e) in entries.iter().enumerate() {
+            buf.entries[i] = AngleEntryGuest::from_angle_entry(e);
+        }
+        for (i, &(x, y)) in taps.iter().enumerate() {
+            buf.taps[i] = [x, y];
+        }
+        buf.tap_count = taps.len() as i32;
+        if !taps.is_empty() {
+            let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
+            let (mut min_y, mut max_y) = (i32::MAX, i32::MIN);
+            for &(x, y) in taps {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+            buf.min_x = min_x as i16;
+            buf.min_y = min_y as i16;
+            buf.bbox_w = (max_x - min_x + 1) as i16;
+            buf.bbox_h = (max_y - min_y + 1) as i16;
+        }
+        buf
+    }
+
+    /// Canonical little-endian bytes (no unsafe aliasing).
+    pub fn to_bytes(&self) -> [u8; LN_ANGLE_PARAM_BUF_SIZE] {
+        let mut out = [0u8; LN_ANGLE_PARAM_BUF_SIZE];
+        let mut o = 0usize;
+        for e in &self.entries {
+            for &b in &e.offsets {
+                out[o] = b as u8;
+                o += 1;
+            }
+            out[o..o + 4].copy_from_slice(&e.scale.to_le_bytes());
+            o += 4;
+            out[o..o + 4].copy_from_slice(&e.mode.to_le_bytes());
+            o += 4;
+            out[o..o + 4].copy_from_slice(&e.flag.to_le_bytes());
+            o += 4;
+            out[o..o + 4].copy_from_slice(&e.pad.to_le_bytes());
+            o += 4;
+        }
+        debug_assert_eq!(o, 0x100);
+        for t in &self.taps {
+            out[o..o + 4].copy_from_slice(&t[0].to_le_bytes());
+            out[o + 4..o + 8].copy_from_slice(&t[1].to_le_bytes());
+            o += 8;
+        }
+        debug_assert_eq!(o, 0x300);
+        out[o..o + 4].copy_from_slice(&self.tap_count.to_le_bytes());
+        out[o + 4..o + 6].copy_from_slice(&self.bbox_w.to_le_bytes());
+        out[o + 6..o + 8].copy_from_slice(&self.bbox_h.to_le_bytes());
+        out[o + 8..o + 10].copy_from_slice(&self.min_x.to_le_bytes());
+        out[o + 10..o + 12].copy_from_slice(&self.min_y.to_le_bytes());
+        out[o + 12..o + 16].copy_from_slice(&self.tail.to_le_bytes());
+        out
+    }
+}
+
+/// Tap collection, ProcessBlock 0x18177c278..0x18177c46e.
+///
+/// The outer loop is `y in 1-tile ..= 16-tile`, the inner `x in y ..= 32-tile`;
+/// the mask is indexed `(x+base_x) mod 32 + ((y+base_y) mod 16)*32`.
+pub fn ln_collect_taps(mask: &[u8; 512], tile: usize, base_x: i32, base_y: i32) -> Vec<(i32, i32)> {
+    let mut taps = Vec::new();
+    let mut y = 1 - tile as i32;
+    while y < LN_BLOCK_H - tile as i32 + 1 {
+        let mut x = y;
+        while x < LN_BLOCK_W - tile as i32 + 1 {
+            let idx = ((x + base_x).rem_euclid(LN_BLOCK_W)
+                + (y + base_y).rem_euclid(LN_BLOCK_H) * LN_BLOCK_W) as usize;
+            if mask[idx] != 0 {
+                taps.push((x, y));
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+    taps
+}
+
+/// Noise-model SNR in dB as computed by SetParameters 0x1817751e6..0x181775240.
+pub fn ln_model_db_settings(noise_floor: f32, noise_poisson: f32) -> f32 {
+    let denom = noise_floor * noise_floor + noise_poisson * LN_REF_LUMA;
+    10.0 * (LN_REF_LUMA_SQ / denom).log10()
+}
+
+/// Same dB test as the enable predicate 0x181776232..0x181776276 (gate 25 dB).
+/// NOTE: the field roles in that predicate are NOT proven to be floor/poisson.
+pub fn ln_model_db_predicate(x_11038: f32, x_1103c: f32) -> f32 {
+    let denom = x_11038 * LN_REF_LUMA + x_1103c * x_1103c;
+    10.0 * (LN_REF_LUMA_SQ / denom).log10()
+}
+
+/// Inputs read by `CImgOpLumaNoise2018::SetParameters` (0x181775100).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LumaNoiseHostInputs {
+    /// settings+0x11038, coreConfig `noiseFloorCoeff_*`.
+    pub noise_floor: f32,
+    /// settings+0x1103c, coreConfig `noisePoissonCoeff_*`.
+    pub noise_poisson: f32,
+    /// settings+0x11040 != 0.
+    pub model_present: bool,
+    /// settings+0x484 (integer slider; defaults 40/50).
+    pub amount: i32,
+    /// settings+0x89c/+0x8a0/+0x8a4.
+    pub weights: [f32; 3],
+    /// settings+0x8a8/+0x8ac/+0x8b0 (defaults 2.0/1.0/1.5).
+    pub mults: [f32; 3],
+    /// settings+0x130 (f64).
+    pub favour_straight: f64,
+    /// settings+0xf8 == 1 selects block size 16.
+    pub size16: bool,
+    /// First predicate, 0x1817751c1..0x1817751e6 (settings+0x480 < 51 and a
+    /// parent-virtual test).  Must be supplied by the caller.
+    pub flag_a: bool,
+}
+
+/// Outputs written to op+0xa8/+0xac/+0xb0/+0xcc/+0xd0/+0xd8/+0xdc.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LumaNoiseHostParams {
+    pub valid_model: bool,
+    pub a8: f32,
+    pub ac: f32,
+    pub m_favour_straight: f32,
+    pub b0: f32,
+    pub d0: f32,
+    pub block_size: i32,
+    pub directional: bool,
+    pub mask_va: u64,
+    pub db: f32,
+}
+
+/// Default (no debug globals) transcription of SetParameters 0x18177531c..0x181776195.
+pub fn ln_host_params(i: &LumaNoiseHostInputs) -> LumaNoiseHostParams {
+    let valid = i.model_present && i.noise_floor > 0.0 && i.noise_poisson > 0.0;
+    let (a8_0, ac_0) = if valid {
+        (i.noise_poisson, i.noise_floor)
+    } else {
+        // 0x1817753b1: virtual +0x668 default 100 -> 100/100; ac = res*5.
+        (1.0f32, 5.0f32)
+    };
+    let mut sumsq = 0.0f32;
+    for k in 0..3 {
+        let t = i.weights[k] * i.mults[k];
+        sumsq += t * t;
+    }
+    let a8 = a8_0 * sumsq;
+    let ac = ac_0 * sumsq.sqrt();
+    let c6 = i.favour_straight as f32;
+    // 0x181775507..0x18177556d (debug branches 0x...47d..0x...51c excluded).
+    let a8 = c6 * c6 * a8;
+    let ac = c6 * ac;
+    let cc = ((LN_REF_LUMA_SQ / (ac * ac + LN_REF_LUMA * a8)) * LN_STRAIGHT_SCALE)
+        .clamp(0.05, 1.0);
+    let x = i.amount as f32 * LN_AMOUNT_SCALE;
+    let base = 1.0 - x;
+    let b0 = (0.5 * base).exp2() + 2.0 + base.max(0.0) * base.max(0.0);
+    let db = ln_model_db_settings(i.noise_floor, i.noise_poisson);
+    let flag_b = i.flag_a && db >= 30.0;
+    let (_, mask_va) = ln_tap_mask(i.flag_a, i.size16);
+    LumaNoiseHostParams {
+        valid_model: valid,
+        a8,
+        ac,
+        m_favour_straight: cc,
+        b0,
+        d0: 1024.0,
+        block_size: if i.size16 { 16 } else { 8 },
+        directional: !flag_b,
+        mask_va,
+        db,
+    }
+}
+
+/// The only static ISO ramp found in the DLL: BandingSuppression SetParameters
+/// 0x18167fbd0 (`cmp iso, 200` at 0x18167fcae, `cmp iso, 1600` at
+/// 0x18167fcb7).  Included for comparison; it does NOT belong to LumaNoise2018.
+pub fn iso_strength_ramp_200_1600(iso: i32, base: f32) -> f32 {
+    if iso <= 200 {
+        base
+    } else if iso > 1600 {
+        base * 2.0
+    } else {
+        base * (1.0 + (iso - 200) as f32 / 1400.0)
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use std::convert::TryInto;
+
+    #[test]
+    fn angle_param_buf_layout_is_0x310() {
+        assert_eq!(core::mem::size_of::<AngleEntryGuest>(), 32);
+        assert_eq!(core::mem::size_of::<AngleParamBuf>(), 0x310);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, taps), 0x100);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, tap_count), 0x300);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, bbox_w), 0x304);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, bbox_h), 0x306);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, min_x), 0x308);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, min_y), 0x30a);
+        assert_eq!(core::mem::offset_of!(AngleParamBuf, tail), 0x30c);
+    }
+
+    #[test]
+    fn angle_param_buf_pack_matches_process_block() {
+        let e = angle_entries_vendor(16);
+        let taps = [(-3i32, -7i32), (1, -7), (9, 0)];
+        // One real entry: slots 1..7 must keep the 0x18177d720 defaults.
+        let buf = AngleParamBuf::pack(&e[..1], &taps);
+        assert_eq!(buf.tap_count, 3);
+        assert_eq!((buf.bbox_w, buf.bbox_h), (13, 8));
+        assert_eq!((buf.min_x, buf.min_y), (-3, -7));
+        assert_eq!(buf.tail, -1);
+        let bytes = buf.to_bytes();
+        assert_eq!(bytes.len(), 0x310);
+        // entry 0 (slope 1.0, 16): offsets -8..7, then scale 1, mode 2, flag 0, -1
+        assert_eq!(&bytes[..8], &[248, 249, 250, 251, 252, 253, 254, 255]);
+        assert_eq!(f32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap()), 1.0);
+        assert_eq!(i32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(bytes[0x18..0x1c].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(bytes[0x1c..0x20].try_into().unwrap()), -1);
+        // unused entries keep the 0x18177d720 defaults
+        assert_eq!(f32::from_le_bytes(bytes[0x30..0x34].try_into().unwrap()), 0.0);
+        assert_eq!(i32::from_le_bytes(bytes[0x34..0x38].try_into().unwrap()), 2);
+        // header
+        assert_eq!(i32::from_le_bytes(bytes[0x300..0x304].try_into().unwrap()), 3);
+        assert_eq!(i16::from_le_bytes(bytes[0x304..0x306].try_into().unwrap()), 13);
+        assert_eq!(i16::from_le_bytes(bytes[0x306..0x308].try_into().unwrap()), 8);
+        assert_eq!(i16::from_le_bytes(bytes[0x308..0x30a].try_into().unwrap()), -3);
+        assert_eq!(i16::from_le_bytes(bytes[0x30a..0x30c].try_into().unwrap()), -7);
+        assert_eq!(i32::from_le_bytes(bytes[0x30c..0x310].try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn tap_mask_counts_match_the_static_tables() {
+        // Counts at phase (0,0); triangular scan 0x18177c2c0..0x18177c444.
+        let t16 = ln_collect_taps(&LN_TAP_MASK_16_ND, 8, 0, 0);
+        assert!((23..=26).contains(&t16.len()), "{}", t16.len());
+        let t8 = ln_collect_taps(&LN_TAP_MASK_8_ND, 8, 0, 0);
+        assert!((46..=51).contains(&t8.len()), "{}", t8.len());
+        let td = ln_collect_taps(&LN_TAP_MASK_16_DIR, 8, 0, 0);
+        assert!((12..=15).contains(&td.len()), "{}", td.len());
+        // Over all 512 phases the 8-bit non-directional mask can exceed the
+        // 50-tap kernel unroll (24 of 512 phases yield 51 taps).
+        // 144/512 phases yield >=50 taps; 24/512 yield 51 taps, so in 24
+        // phases the host emits one tap the shipped kernel unroll never reads.
+        let mut ge50 = 0;
+        let mut eq51 = 0;
+        for bx in 0..32 {
+            for by in 0..16 {
+                let n = ln_collect_taps(&LN_TAP_MASK_8_ND, 8, bx, by).len();
+                if n >= LN_KERNEL_TAP_UNROLL {
+                    ge50 += 1;
+                }
+                if n > LN_KERNEL_TAP_UNROLL {
+                    eq51 += 1;
+                }
+            }
+        }
+        assert_eq!(ge50, 144);
+        assert_eq!(eq51, 24);
+    }
+
+    #[test]
+    fn mask_selection_matches_set_parameters() {
+        assert_eq!(ln_tap_mask(false, false).1, 0x1827BFA90);
+        assert_eq!(ln_tap_mask(false, true).1, 0x1827BF890);
+        assert_eq!(ln_tap_mask(true, false).1, 0x1827BF890);
+        assert_eq!(ln_tap_mask(true, true).1, 0x1827BFC90);
+    }
+
+    #[test]
+    fn host_params_synthetic() {
+        let i = LumaNoiseHostInputs {
+            noise_floor: 0.5,
+            noise_poisson: 0.03125,
+            model_present: true,
+            amount: 100,
+            weights: [1.0, 1.0, 1.0],
+            mults: [2.0, 1.0, 1.5],
+            favour_straight: 1.0,
+            size16: true,
+            flag_a: true,
+        };
+        let p = ln_host_params(&i);
+        // sumsq = 4 + 1 + 2.25 = 7.25
+        assert!((p.a8 - 0.03125 * 7.25).abs() < 1e-6, "{p:?}");
+        assert!((p.ac - 0.5 * 7.25f32.sqrt()).abs() < 1e-6, "{p:?}");
+        assert!((p.b0 - ((-0.5f32).exp2() + 2.0)).abs() < 1e-6, "{p:?}");
+        assert_eq!(p.block_size, 16);
+        assert!(!p.directional);
+        assert_eq!(p.mask_va, 0x1827BFC90);
+        // invalid model -> fallback res = 1, a8 = sumsq, ac = 5*sqrt(sumsq)
+        let j = LumaNoiseHostInputs {
+            model_present: false,
+            noise_floor: -1.0,
+            noise_poisson: 0.0,
+            size16: false,
+            flag_a: false,
+            ..i
+        };
+        let q = ln_host_params(&j);
+        assert!(!q.valid_model && q.directional);
+        assert!((q.a8 - 7.25).abs() < 1e-6, "{q:?}");
+        assert!((q.ac - 5.0 * 7.25f32.sqrt()).abs() < 1e-6, "{q:?}");
+        assert_eq!(q.block_size, 8);
+        assert_eq!(q.mask_va, 0x1827BFA90);
+    }
+
+    #[test]
+    fn model_db_uses_reference_luma() {
+        // real config sample: CanonEOS100D ISO100
+        let db = ln_model_db_settings(0.385510, 0.032761);
+        assert!(db > 30.0 && db < 70.0, "{db}");
+        // fallback model 10/1/0 is invalid (type 0) but the dB value is finite
+        assert!(ln_model_db_settings(10.0, 1.0).is_finite());
+    }
+
+    #[test]
+    fn banding_iso_ramp_is_not_luma_noise() {
+        assert_eq!(iso_strength_ramp_200_1600(100, 3.0), 3.0);
+        assert_eq!(iso_strength_ramp_200_1600(1600, 3.0), 6.0);
+        assert_eq!(iso_strength_ramp_200_1600(1601, 3.0), 6.0);
+    }
+}

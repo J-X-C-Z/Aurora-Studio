@@ -11,11 +11,18 @@
 //!   passed to the bilinear sampler (floor base + fractional weights), applied
 //!   to R and B only; G is copied unchanged.
 //!
-//! The six `IC_LensChromaFringing` curves (red/blue shift, ra, strength) are
-//! named for contract purposes, but the **host-side fold into the two kernel
-//! tables is not recovered (grade C)**. Do not interpret `ra`/`strength`
-//! weights as verified, and do not feed them into this kernel: the two tables
-//! must hold already-folded `(radius_px, displacement_px, slope)` values.
+//! Host-side fold (2026-11-25): `ImgCoreDll!0x18131c920` builds exactly two
+//! tables from a compact struct that holds one count and two <=16-point
+//! curves (red at `+0x08`, blue at `+0x88`, count at `+0x04`). Each point is
+//! scaled in f32 by `1/reference` per axis (settings vtable `+0x848`; 1.0 when
+//! absent) and becomes a `(x, y, slope, 0)` row at parameter-store `+0x1008`
+//! (red) / `+0x1220` (blue), bound as kernel arg 9 / arg 11 by
+//! `0x18173e2a0`. The builder has no reference to the six
+//! `IC_LensChromaFringing` counts/curves at `+0x17f0..+0x1804`; those feed the
+//! purple-fringing operator instead. Effective weights for this kernel are
+//! therefore shift = 1, ra = 0, strength = 1, and [`fold_table`] implements
+//! exactly that. The 2-point slope is the proven secant; n>2 uses the generic
+//! spline tangent (central difference, grade C).
 
 /// Hard clamp of the kernel's curve output (`z17a085e5c8 = 3.0f`).
 pub const CURVE_CLAMP: f32 = 3.0;
@@ -41,8 +48,10 @@ impl Knot {
 /// The six curves of `IC_LensChromaFringing` / `<chromaFringe>`.
 ///
 /// Only the names and ordering are confirmed (managed metadata + XML strings).
-/// Their weights and the fold into the two runtime tables are **grade C** and
-/// unverified; this struct is deliberately not consumed by [`apply_ca`].
+/// They are **not** folded into the two kernel tables: the table builder
+/// (`0x18131c920`) reads only the compact two-curve struct, and the six-curve
+/// counts are consumed by the purple-fringing path. This struct remains a
+/// naming contract and is deliberately not consumed by [`apply_ca`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CaSixCurves<Table> {
     pub red_shift: Table,
@@ -170,9 +179,9 @@ pub fn radial_unit(x: usize, y: usize, p: CaParams) -> (f32, f32, f32) {
 /// Full kernel step for one pixel: R/B are resampled at the radial offset,
 /// G is copied from the source. Output is RGBA with alpha 0, as in the kernel.
 ///
-/// `red_table` and `blue_table` are the host-supplied folded tables; the six
-/// C1 curve names in [`CaSixCurves`] are *not* consumed here because the fold
-/// formula is grade C (unverified).
+/// `red_table` and `blue_table` are the host-supplied folded tables produced
+/// by [`fold_table`]; the six C1 curve names in [`CaSixCurves`] are *not*
+/// consumed here because the native builder does not read them.
 pub fn apply_ca(
     src: &[f32],
     width: usize,
@@ -193,6 +202,65 @@ pub fn apply_ca(
         bilinear_channel(src, width, height, x as f32 + ux * db, y as f32 + uy * db, 2),
         0.0,
     ]
+}
+
+
+/// One point of a C1 CA profile curve: `x` is the radius in the profile unit,
+/// `y` the red/blue displacement in the same unit family.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl CaPoint {
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// Host-side fold into one kernel table, matching `ImgCoreDll!0x18131c920`.
+///
+/// The DLL scales x and y in f32 by `1/ref_x` and `1/ref_y` (1.0 when the
+/// settings object supplies no reference at vtable `+0x848`), stores the points as
+/// doubles and computes the tangent:
+/// - `n == 0` -> empty table (the kernel is only bound when `n >= 2`);
+/// - `n == 1` -> slope 0;
+/// - `n == 2` -> exact secant `(y1-y0)/(x1-x0)` (proven at `0x1814283d1`);
+/// - `n >= 3` -> central difference over `[i-1, i+1]`, one-sided at the ends
+///   (reconstruction of the generic spline builder, grade C).
+///
+/// `ra` and `strength` are intentionally absent: the native builder has no
+/// input for them. The effective weights are shift = 1, ra = 0, strength = 1.
+pub fn fold_table(points: &[CaPoint], ref_x: f32, ref_y: f32) -> Vec<Knot> {
+    let inv = |r: f32| if r.is_finite() && r != 0.0 { 1.0f32 / r } else { 1.0 };
+    let (inv_x, inv_y) = (inv(ref_x), inv(ref_y));
+    let scaled: Vec<(f64, f64)> = points
+        .iter()
+        .map(|p| ((p.x * inv_x) as f64, (p.y * inv_y) as f64))
+        .collect();
+    let n = scaled.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let slope = if n < 2 {
+            0.0
+        } else if n == 2 {
+            let dx = scaled[1].0 - scaled[0].0;
+            if dx == 0.0 { 0.0 } else { (scaled[1].1 - scaled[0].1) / dx }
+        } else {
+            let (a, b) = if i == 0 {
+                (scaled[0], scaled[1])
+            } else if i == n - 1 {
+                (scaled[n - 2], scaled[n - 1])
+            } else {
+                (scaled[i - 1], scaled[i + 1])
+            };
+            let dx = b.0 - a.0;
+            if dx == 0.0 { 0.0 } else { (b.1 - a.1) / dx }
+        };
+        out.push(Knot::new(scaled[i].0 as f32, scaled[i].1 as f32, slope as f32));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -350,5 +418,42 @@ mod tests {
             blue_strength: [0.0f32],
         };
         assert_eq!(c.red_strength, c.red_ra);
+    }
+
+    #[test]
+    fn fold_two_points_use_the_proven_secant() {
+        let t = fold_table(&[CaPoint::new(0.0, 0.0), CaPoint::new(1000.0, 2.0)], 1.0, 1.0);
+        assert_eq!(t.len(), 2);
+        assert!(close(t[0].z, 0.002, 1e-9));
+        assert!(close(sample_curve(250.0, &t), 0.5, 1e-6));
+    }
+
+    #[test]
+    fn fold_scales_both_axes_by_the_reference() {
+        // x/2000 and y/4: (1000,2) -> (0.5,0.5), so the slope becomes 1.
+        let t = fold_table(&[CaPoint::new(0.0, 0.0), CaPoint::new(1000.0, 2.0)], 2000.0, 4.0);
+        assert!(close(t[1].x, 0.5, 1e-7));
+        assert!(close(t[1].y, 0.5, 1e-7));
+        assert!(close(t[0].z, 1.0, 1e-9));
+    }
+
+    #[test]
+    fn fold_has_no_ra_or_strength_input() {
+        // The function takes exactly two arguments; there is no weight knob.
+        // A six-curve struct cannot be passed to it, which is the point: the
+        // native builder reads only the compact two-curve struct.
+        let _: fn(&[CaPoint], f32, f32) -> Vec<Knot> = fold_table;
+    }
+
+    #[test]
+    fn folded_table_clamps_and_hits_linear_values() {
+        let t = fold_table(
+            &[CaPoint::new(0.0, 0.0), CaPoint::new(50.0, 2.0), CaPoint::new(100.0, 4.0)],
+            1.0,
+            1.0,
+        );
+        assert!(close(sample_curve(50.0, &t), 2.0, 1e-5));
+        assert!(close(sample_curve(25.0, &t), 1.0, 1e-4));
+        assert!(close(curve(100.0, &t), 3.0, 1e-7));
     }
 }

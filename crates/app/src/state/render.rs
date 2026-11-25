@@ -937,6 +937,9 @@ impl AppState {
         }
         self.preview.generation += 1;
         request.generation = self.preview.generation;
+        if crate::perf::enabled() {
+            crate::perf::record(serde_json::json!({"event": "preview_start", "id": request.generation, "quality": format!("{quality:?}"), "fast": quality == RenderQuality::Draft}));
+        }
         let stamp = crate::perf::Stamp::new(request.generation, quality, requested_at);
         let requested_image = request.image;
         let before = (quality == RenderQuality::Final
