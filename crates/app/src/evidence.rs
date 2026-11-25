@@ -215,22 +215,29 @@ pub fn for_pf(pf: i64) -> Option<&'static Effect> {
 
 /// 某个 ID 段内已登记、但前端没有参数控件的效果。
 pub fn without_control(lo: i64, hi: i64) -> Vec<&'static Effect> {
+    without_control_in(|pf| pf >= lo && pf <= hi)
+}
+
+/// 满足给定谓词且已登记、但前端没有参数控件的效果。
+pub fn without_control_in(pred: impl Fn(i64) -> bool) -> Vec<&'static Effect> {
     let controls: std::collections::BTreeSet<i64> = contract::PORTRAIT.iter().map(|param| param.id).collect();
     all()
         .filter(|effect| {
             let pf = i64::from(effect.pf);
-            pf >= lo && pf <= hi && !controls.contains(&pf)
+            pred(pf) && !controls.contains(&pf)
         })
         .collect()
 }
 
 /// 某个 ID 段内达到 ev5 的效果数，以及该段登记的效果总数。
 pub fn preview_count(lo: i64, hi: i64) -> (usize, usize) {
+    preview_count_in(|pf| pf >= lo && pf <= hi)
+}
+
+/// 满足给定谓词且达到 ev5 的效果数，以及登记的效果总数。
+pub fn preview_count_in(pred: impl Fn(i64) -> bool) -> (usize, usize) {
     all()
-        .filter(|effect| {
-            let pf = i64::from(effect.pf);
-            pf >= lo && pf <= hi
-        })
+        .filter(|effect| pred(i64::from(effect.pf)))
         .fold((0, 0), |(wired, total), effect| (wired + usize::from(effect.preview_connected()), total + 1))
 }
 

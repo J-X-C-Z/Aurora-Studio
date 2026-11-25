@@ -235,40 +235,116 @@ impl PortraitParam {
     }
 }
 
-/// One ID band of `catalog.md`'s portrait table.
+/// One functional category aligned with PixCake's portrait sidebar order.
 pub struct Band {
     pub id: &'static str,
     /// Panel id for the band's registry-only effects (registered but no slider).
     pub evidence_id: &'static str,
     pub en: &'static str,
     pub zh: &'static str,
-    pub lo: i64,
-    pub hi: i64,
 }
 
-pub const BANDS: [Band; 8] = [
-    Band { id: "pc-blemish", evidence_id: "pc-blemish-evidence", en: "Blemish Removal", zh: "瑕疵去除", lo: 0, hi: 999 },
-    Band { id: "pc-face", evidence_id: "pc-face-evidence", en: "Face Reshaping", zh: "面部重塑", lo: 21000, hi: 21999 },
-    Band { id: "pc-skin", evidence_id: "pc-skin-evidence", en: "Skin, Makeup & Body", zh: "皮肤/妆容/身体", lo: 30000, hi: 39999 },
-    Band { id: "pc-makeup", evidence_id: "pc-makeup-evidence", en: "Makeup Details", zh: "妆容细节", lo: 40000, hi: 49999 },
-    Band { id: "pc-smart", evidence_id: "pc-smart-evidence", en: "Smart Recognition", zh: "智能识别", lo: 80000, hi: 89999 },
-    Band { id: "pc-material", evidence_id: "pc-material-evidence", en: "Materials, Looks & Sky", zh: "素材/样式/天空替换", lo: 90000, hi: 90999 },
-    Band { id: "pc-placement", evidence_id: "pc-placement-evidence", en: "Placement & Edges", zh: "素材定位/边缘调整", lo: 100000, hi: 899999 },
-    Band { id: "pc-local", evidence_id: "pc-local-evidence", en: "Local Blemish Removal", zh: "局部去瑕疵", lo: 900000, hi: i64::MAX },
+pub const BANDS: [Band; 14] = [
+    Band { id: "pc-blemish", evidence_id: "pc-blemish-evidence", en: "Blemish Removal", zh: "祛除瑕疵" },
+    Band { id: "pc-skin", evidence_id: "pc-skin-evidence", en: "Skin Adjustment", zh: "皮肤调整" },
+    Band { id: "pc-face", evidence_id: "pc-face-evidence", en: "Face Reshape", zh: "面部重塑" },
+    Band { id: "pc-expression", evidence_id: "pc-expression-evidence", en: "Expression", zh: "表情管理" },
+    Band { id: "pc-teeth", evidence_id: "pc-teeth-evidence", en: "Teeth", zh: "牙齿美化" },
+    Band { id: "pc-eyes", evidence_id: "pc-eyes-evidence", en: "Eyes", zh: "眼睛增强" },
+    Band { id: "pc-makeup", evidence_id: "pc-makeup-evidence", en: "Makeup", zh: "妆容调整" },
+    Band { id: "pc-hair", evidence_id: "pc-hair-evidence", en: "Hair", zh: "头发调整" },
+    Band { id: "pc-hands", evidence_id: "pc-hands-evidence", en: "Hands", zh: "手部美化" },
+    Band { id: "pc-feet", evidence_id: "pc-feet-evidence", en: "Feet", zh: "脚部美化" },
+    Band { id: "pc-body", evidence_id: "pc-body-evidence", en: "Body Reshape", zh: "全身美型" },
+    Band { id: "pc-clothes", evidence_id: "pc-clothes-evidence", en: "Clothes", zh: "服装调整" },
+    Band { id: "pc-scene", evidence_id: "pc-scene-evidence", en: "Background & Sky", zh: "背景与天空" },
+    Band { id: "pc-other", evidence_id: "pc-other-evidence", en: "Other Registered", zh: "其它已登记参数" },
 ];
+
+/// Maps every parameter id to its PixCake functional category index in [`BANDS`],
+/// derived from `PORTRAIT-UI-KEY-MAP-20261124.tsv` with conservative fallbacks.
+pub fn band_index_for_id(id: i64) -> usize {
+    match id {
+        // 0: 祛除瑕疵 (Y)
+        0 | 1 | 2 | 3 | 5 | 21020 | 21022..=21026 | 21049 | 21050 | 21069..=21071 | 21104 | 30188 | 30189
+        | 30209 | 30259 | 90008 | 90013 | 90015 | 90019 | 90023 | 90024 | 90034 | 90037 | 90080 | 90089
+        | 90116..=90118 | 100008 | 100010 | 100011 => 0,
+
+        // 1: 皮肤调整 (V)
+        8068..=8070 | 21015 | 21105 | 30013..=30017 | 30021 | 30022 | 30031..=30034 | 30059
+        | 30191..=30207 | 30210 | 44634 | 80001..=80003 | 90001..=90005 | 90007 | 90010 | 90085
+        | 90086 => 1,
+
+        // 2: 面部重塑 (Be + Ml + Ba + ra)
+        203 | 205 | 209..=216 | 222 | 224 | 230 | 233..=238 | 242..=245 | 247..=249 | 8001..=8030
+        | 8050 | 8051 | 30010..=30012 | 30028 | 30071..=30073 | 30077..=30083 | 30092 | 30093
+        | 30258 | 31561 | 31933 | 32035 | 32729 | 33070 | 33149 | 34722 | 34794 | 35470 | 36671
+        | 37595 | 39753 | 39920 | 41922 | 44124 | 48019 | 49221 | 90046..=90048 | 90115 => 2,
+
+        // 3: 表情管理 (It)
+        8033 | 21076 | 30076 | 100007 => 3,
+
+        // 4: 牙齿美化 (Je)
+        108..=110 | 240 | 241 | 30025..=30027 | 90040 => 4,
+
+        // 5: 眼睛增强 ($)
+        8034..=8049 | 8052 | 8053 | 21054 | 21093..=21100 | 30023 | 30039 | 90130 | 90142..=90149
+        | 90153..=90159 | 90170..=90173 | 900109 | 100004 | 100005 => 5,
+
+        // 6: 妆容调整 (Te)
+        8 | 9 | 100 | 101 | 103 | 105..=107 | 111 | 115..=118 | 120..=125 | 8057..=8059
+        | 8061..=8063 | 8065..=8067 | 30004..=30008 | 30040 | 40100..=40115 | 90020 | 90021
+        | 90032 | 90033 | 90090..=90095 | 90097 | 90119 | 90150 | 90151 | 900110..=900112
+        | 900114 => 6,
+
+        // 7: 头发调整 (Ue)
+        202 | 232 | 21016 | 21017 | 30009 | 90087 | 90088 | 90113 | 90114 | 90131 | 90132
+        | 90137 | 90139 | 90140 | 90160 => 7,
+
+        // 8: 手部美化 (Vl)
+        30030 | 30187 | 30190 => 8,
+
+        // 10: 全身美型 (ye)
+        400 | 401 | 403..=408 | 410..=418 | 8031 | 8032 | 30029 | 30074 | 30075 | 30094
+        | 30095 | 38556 | 90041 => 10,
+
+        // 11: 服装调整 (Qe)
+        21055 | 21056 | 21138 | 90141 | 100013..=100018 => 11,
+
+        // 12: 背景与天空 (Ht + Zt + sl)
+        21002 | 21012..=21014 | 21027..=21031 | 21040 | 21042..=21044 | 21047 | 21048 | 21052
+        | 21053 | 21075 | 30018 | 30019 | 30096 | 35040 | 36965 | 39798 | 90006 | 90035 | 90036
+        | 90038 | 90039 | 90042 | 90049..=90057 | 90060 | 90061 | 90099 | 90100 | 90111 | 90112
+        | 90133..=90136 | 90200 | 90201 => 12,
+
+        // Local blemish removal (900000+) falls back to 祛除瑕疵; everything else to 其它已登记参数.
+        id if id >= 900_000 => 0,
+        _ => 13,
+    }
+}
 
 impl Band {
     pub fn title(&self) -> &'static str {
         t(self.en, self.zh)
     }
 
+    pub fn index(&self) -> usize {
+        BANDS.iter().position(|b| b.id == self.id).unwrap_or(13)
+    }
+
+    pub fn contains_id(&self, id: i64) -> bool {
+        band_index_for_id(id) == self.index()
+    }
+
     pub fn params(&self) -> impl Iterator<Item = &'static PortraitParam> + use<'_> {
-        PORTRAIT.iter().filter(move |p| p.id >= self.lo && p.id <= self.hi)
+        let idx = self.index();
+        PORTRAIT.iter().filter(move |p| band_index_for_id(p.id) == idx)
     }
 
     /// Unresolved ids in this band.
     pub fn unresolved(&self) -> Vec<i64> {
-        UNRESOLVED.iter().copied().filter(|id| *id >= self.lo && *id <= self.hi).collect()
+        let idx = self.index();
+        UNRESOLVED.iter().copied().filter(|id| band_index_for_id(*id) == idx).collect()
     }
 }
 
@@ -291,9 +367,9 @@ pub static PORTRAIT: LazyLock<Vec<PortraitParam>> = LazyLock::new(|| {
     raw.into_iter()
         .map(|p| {
             let key = p.ui_key.clone().unwrap_or_else(|| p.string_enum.clone().map(|s| s.replace('/', "_")).unwrap_or_else(|| format!("param{}", p.id)));
-            let band = BANDS.iter().position(|b| p.id >= b.lo && p.id <= b.hi);
+            let band = band_index_for_id(p.id);
             let child = keys.iter().any(|(id, k)| {
-                *id != p.id && BANDS.iter().position(|b| *id >= b.lo && *id <= b.hi) == band && key.len() > k.len() + 1 && key.starts_with(k.as_str()) && key.as_bytes()[k.len()] == b'_'
+                *id != p.id && band_index_for_id(*id) == band && key.len() > k.len() + 1 && key.starts_with(k.as_str()) && key.as_bytes()[k.len()] == b'_'
             });
             let lower = key.to_ascii_lowercase();
             let control = match &p.default {
