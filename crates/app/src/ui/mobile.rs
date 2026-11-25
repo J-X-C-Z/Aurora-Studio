@@ -80,8 +80,8 @@ impl MobileShell {
         state.update(cx, |s, cx| {
             // A phone has no room for the info overlay or several images at once.
             s.welcome = false;
-            s.view.show_info_overlay = false;
-            s.view.multi = false;
+            s.prefs.view.show_info_overlay = false;
+            s.prefs.view.multi = false;
             if !s.visible_tabs().contains(&s.tool_tab) || matches!(s.tool_tab, ToolTab::Library) {
                 s.tool_tab = ToolTab::Grading;
             }
@@ -183,7 +183,7 @@ impl MobileShell {
         let p = pal(cx).clone();
         let ids = self.ids(cx);
         let count = ids.len();
-        let title: SharedString = i18n::builtin(self.state.read(cx).active_collection_name.as_ref()).into();
+        let title: SharedString = i18n::builtin(self.state.read(cx).library.active_collection_name.as_ref()).into();
         let note: SharedString = format!("{count} {}", t("images", "张图像")).into();
         let this = cx.entity();
         let import = IconBtn::new("m-import", IconName::ImagePlus, t("Import", "导入")).size(TAP).on_click({
@@ -230,11 +230,11 @@ impl MobileShell {
     fn thumb(&self, id: ImageId, side: f32, strip: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let image = s.thumbs.get(&id).cloned();
+        let image = s.preview_state.thumbs.get(&id).cloned();
         let failed = image.is_none() && s.thumb_failed.contains(&id);
         let info = s.info(id);
         let (rating, tag, edited) = info.map_or((0, aurora_engine::ColorTag::None, false), |i| (i.rating, i.color_tag, i.has_adjustments));
-        let current = strip && s.current == Some(id);
+        let current = strip && s.library.current == Some(id);
         let this = cx.entity();
         div()
             .id(SharedString::from(format!("m-thumb-{}-{}", if strip { "s" } else { "g" }, id.0)))
@@ -274,16 +274,16 @@ impl MobileShell {
     fn edit_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let has_image = s.current.is_some();
+        let has_image = s.library.current.is_some();
         let title: SharedString = s.current_info().map(|i| i.file_name.clone()).unwrap_or_else(|| t("No image", "没有图像").to_string()).into();
         let ids = s.visible_images();
-        let note: SharedString = match s.current.and_then(|id| ids.iter().position(|i| i.id == id)) {
+        let note: SharedString = match s.library.current.and_then(|id| ids.iter().position(|i| i.id == id)) {
             Some(i) => format!("{} / {}", i + 1, ids.len()).into(),
             None => SharedString::default(),
         };
         let (can_undo, can_redo) = (s.can_undo(), s.can_redo());
-        let comparing = s.view.compare == CompareMode::Split;
-        let (warning, has_clip, film) = (s.view.exposure_warning, s.clipboard.is_some(), self.film);
+        let comparing = s.prefs.view.compare == CompareMode::Split;
+        let (warning, has_clip, film) = (s.prefs.view.exposure_warning, s.editor.clipboard.is_some(), self.film);
         let this = cx.entity();
         let st = self.state.clone();
         let act = move |id: &'static str, icon: IconName, tip: &'static str, f: fn(&mut AppState, &mut Context<AppState>)| {
@@ -314,12 +314,12 @@ impl MobileShell {
                 .separator()
                 .item(item(t("Fit to Screen", "适合屏幕"), |s, cx| s.set_zoom(None, None, cx)))
                 .item(item("100%", |s, cx| {
-                    let (sf, c) = (s.scale_factor, s.zoom.center);
+                    let (sf, c) = (s.device.scale_factor, s.preview_state.zoom.center);
                     s.set_zoom(Some(sf), Some(c), cx)
                 }))
                 .item(
                     item(t("Exposure Warning", "曝光警告"), |s, cx| {
-                        s.view.exposure_warning = !s.view.exposure_warning;
+                        s.prefs.view.exposure_warning = !s.prefs.view.exposure_warning;
                         s.request_render(aurora_engine::RenderQuality::Final, cx);
                         cx.notify();
                     })
@@ -340,8 +340,8 @@ impl MobileShell {
             .child(act("m-redo", IconName::Redo2, t("Redo", "重做"), |s, cx| s.redo(cx)).disabled(!can_redo))
             .child(
                 act("m-compare", IconName::Columns2, t("Before / After", "调整前后"), |s, cx| {
-                    s.view.compare = if s.view.compare == CompareMode::Split { CompareMode::Off } else { CompareMode::Split };
-                    s.preview.before_dirty = true;
+                    s.prefs.view.compare = if s.prefs.view.compare == CompareMode::Split { CompareMode::Off } else { CompareMode::Split };
+                    s.preview_state.preview.before_dirty = true;
                     s.request_render(aurora_engine::RenderQuality::Final, cx);
                     cx.notify();
                 })
@@ -357,9 +357,9 @@ impl MobileShell {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
         let rating = s.current_info().map_or(0, |i| i.rating);
-        let has_image = s.current.is_some();
-        let pct = (s.effective_scale() / s.scale_factor.max(0.5) * 100.0).round();
-        let zoom: SharedString = if s.zoom.scale.is_none() { t("Fit", "适合").into() } else { format!("{pct:.0}%").into() };
+        let has_image = s.library.current.is_some();
+        let pct = (s.effective_scale() / s.device.scale_factor.max(0.5) * 100.0).round();
+        let zoom: SharedString = if s.preview_state.zoom.scale.is_none() { t("Fit", "适合").into() } else { format!("{pct:.0}%").into() };
         let st = self.state.clone();
         let step = move |id: &'static str, icon: IconName, tip: &'static str, delta: isize| {
             let st = st.clone();

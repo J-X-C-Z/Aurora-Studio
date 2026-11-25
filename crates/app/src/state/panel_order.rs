@@ -46,12 +46,12 @@ pub fn reorder(shown: &[&'static str], moved: &str, before: Option<&str>) -> Opt
 
 impl AppState {
     pub fn panel_pinned(&self, id: &str) -> bool {
-        self.settings.workspace.pinned_panels.iter().any(|p| p == id)
+        self.prefs.settings.workspace.pinned_panels.iter().any(|p| p == id)
     }
 
     /// Pins a panel to the top of its tab, or unpins it.
     pub fn toggle_pin(&mut self, id: &str, cx: &mut Context<Self>) {
-        let pins = &mut self.settings.workspace.pinned_panels;
+        let pins = &mut self.prefs.settings.workspace.pinned_panels;
         let pinned = if let Some(i) = pins.iter().position(|p| p == id) {
             pins.remove(i);
             false
@@ -61,7 +61,7 @@ impl AppState {
         };
         // A pinned panel is there to be used: open it.
         if pinned {
-            self.panels.collapsed.retain(|c| *c != id);
+            self.prefs.panels.collapsed.retain(|c| *c != id);
         }
         self.save_settings();
         cx.notify();
@@ -69,7 +69,7 @@ impl AppState {
 
     /// The order the current tab shows `natural` in.
     pub fn arranged_panels(&self, natural: &[&'static str]) -> Vec<&'static str> {
-        let w = &self.settings.workspace;
+        let w = &self.prefs.settings.workspace;
         let saved = w.panel_order.get(&tab_id(self.tool_tab)).map(Vec::as_slice).unwrap_or(&[]);
         arrange(natural, saved, &w.pinned_panels)
     }
@@ -81,7 +81,7 @@ impl AppState {
         let Some(order) = reorder(shown, moved, before) else { return };
         let pinned_before = before.is_some_and(|b| self.panel_pinned(b));
         let was_pinned = self.panel_pinned(moved);
-        let w = &mut self.settings.workspace;
+        let w = &mut self.prefs.settings.workspace;
         if pinned_before && !was_pinned {
             w.pinned_panels.push(moved.to_string());
         } else if !pinned_before && was_pinned {
@@ -110,7 +110,7 @@ impl AppState {
 
     /// Puts the current tab's panels back in their built-in order and unpins them.
     pub fn reset_panel_order(&mut self, shown: &[&'static str], cx: &mut Context<Self>) {
-        let w = &mut self.settings.workspace;
+        let w = &mut self.prefs.settings.workspace;
         let saved = w.panel_order.remove(&tab_id(self.tool_tab)).unwrap_or_default();
         w.pinned_panels.retain(|p| !shown.contains(&p.as_str()) && !saved.contains(p));
         self.save_settings();
@@ -119,7 +119,7 @@ impl AppState {
     }
 
     pub fn panel_order_custom(&self, shown: &[&'static str]) -> bool {
-        let w = &self.settings.workspace;
+        let w = &self.prefs.settings.workspace;
         w.panel_order.contains_key(&tab_id(self.tool_tab)) || w.pinned_panels.iter().any(|p| shown.contains(&p.as_str()))
     }
 }

@@ -43,6 +43,12 @@ jobs:
       - name: Check all targets
         run: cargo check --workspace --all-targets --locked
 
+      - name: Architecture rules
+        # Source-tree layering checks (crates/engine/tests/architecture_rules.rs).
+        # No external fixtures and no extra toolchain: runs on the same stable
+        # Rust installed above.
+        run: cargo test -p aurora-engine --test architecture_rules --locked -- --test-threads=1
+
       - name: Run synthetic tests
         shell: pwsh
         env:

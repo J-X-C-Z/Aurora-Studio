@@ -68,7 +68,7 @@ impl PrefsView {
 
     fn edit_render(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
         self.state.update(cx, |s, cx| {
-            f(&mut s.settings);
+            f(&mut s.prefs.settings);
             s.save_settings();
             s.request_render(RenderQuality::Final, cx);
             cx.notify();
@@ -79,7 +79,7 @@ impl PrefsView {
     /// A profile change also refetches every visible thumbnail.
     fn edit_thumbs(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
         self.state.update(cx, |s, cx| {
-            f(&mut s.settings);
+            f(&mut s.prefs.settings);
             s.save_settings();
             s.refresh_thumbs(cx);
             s.request_render(RenderQuality::Final, cx);
@@ -95,17 +95,17 @@ impl PrefsView {
                 Some(k) => {
                     let default: Vec<String> = shortcuts().into_iter().find(|x| x.id == id).map(|x| x.defaults.iter().map(|k| k.to_string()).collect()).unwrap_or_default();
                     if k == default {
-                        s.settings.shortcuts.remove(&id);
+                        s.prefs.settings.shortcuts.remove(&id);
                     } else {
-                        s.settings.shortcuts.insert(id, k);
+                        s.prefs.settings.shortcuts.insert(id, k);
                     }
                 }
                 None => {
-                    s.settings.shortcuts.remove(&id);
+                    s.prefs.settings.shortcuts.remove(&id);
                 }
             }
             s.save_settings();
-            s.settings.shortcuts.clone()
+            s.prefs.settings.shortcuts.clone()
         });
         actions::bind_keys(cx, &overrides);
         cx.notify();
@@ -217,7 +217,7 @@ fn note(text: &'static str, cx: &App) -> AnyElement {
 
 impl PrefsView {
     fn general(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let s = self.state.read(cx).settings.clone();
+        let s = self.state.read(cx).prefs.settings.clone();
         let this = cx.entity();
         let (t1, t2, t3, t4, t5) = (this.clone(), this.clone(), this.clone(), this.clone(), this.clone());
         v_flex()
@@ -233,12 +233,12 @@ impl PrefsView {
             )
             .child(caption(t("Startup", "启动"), cx))
             .child(switch_row("pref-reopen", t("Reopen the last folder or catalog", "启动时打开上次的文件夹或目录"), s.reopen_last, move |v, _, cx| {
-                t5.update(cx, |p, cx| p.edit(cx, |s| s.settings.reopen_last = v))
+                t5.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.reopen_last = v))
             }, cx))
             .child(note(t("Otherwise Aurora starts on the welcome screen.", "否则启动时显示欢迎页。"), cx))
             .child(caption(t("Editing", "编辑"), cx))
             .child(ParamSlider::new("pref-undo", t("Undo steps", "撤销步数"), s.undo_levels as f32, 20.0, 1000.0).step(10.0).default_value(200.0).on_change(move |v, _, cx| {
-                t2.update(cx, |p, cx| p.edit(cx, |s| s.settings.undo_levels = v.round() as usize))
+                t2.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.undo_levels = v.round() as usize))
             }))
             .child(note(t("Per image; older steps are dropped first.", "按图像计；超出后最早的步骤先被丢弃。"), cx))
             .child(caption(t("Backend roadmap", "后端路线图"), cx))
@@ -252,10 +252,10 @@ impl PrefsView {
             .child(note(crate::contract::METAL.note().unwrap_or_default(), cx))
             .child(caption(t("Capture & Output", "拍摄与输出"), cx))
             .child(switch_row("pref-newcap", t("Select each new capture", "自动选中新拍摄的图像"), s.select_new_capture, move |v, _, cx| {
-                t3.update(cx, |p, cx| p.edit(cx, |s| s.settings.select_new_capture = v))
+                t3.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.select_new_capture = v))
             }, cx))
             .child(switch_row("pref-notify", t("Notify when processing finishes", "处理完成时通知"), s.notify_on_process, move |v, _, cx| {
-                t4.update(cx, |p, cx| p.edit(cx, |s| s.settings.notify_on_process = v))
+                t4.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.notify_on_process = v))
             }, cx))
             .child(caption(t("Reset", "复位"), cx))
             .child(
@@ -263,11 +263,11 @@ impl PrefsView {
                     |v, _, window, cx| {
                         v.state.update(cx, |s, cx| {
                             // The recent list is history, not a preference.
-                            let recent = std::mem::take(&mut s.settings.recent);
-                            s.settings = Settings { recent, ..Settings::default() };
-                            s.view.viewer_gray = s.settings.viewer_gray;
-                            s.view.thumb_size = s.settings.thumb_size;
-                            s.view.show_info_overlay = s.settings.info_overlay;
+                            let recent = std::mem::take(&mut s.prefs.settings.recent);
+                            s.prefs.settings = Settings { recent, ..Settings::default() };
+                            s.prefs.view.viewer_gray = s.prefs.settings.viewer_gray;
+                            s.prefs.view.thumb_size = s.prefs.settings.thumb_size;
+                            s.prefs.view.show_info_overlay = s.prefs.settings.info_overlay;
                             s.apply_workspace(0, cx);
                         });
                         i18n::set_locale(Locale::ZhCn);
@@ -285,8 +285,8 @@ impl PrefsView {
     fn appearance(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
-        let gray = s.view.viewer_gray;
-        let info = s.view.show_info_overlay;
+        let gray = s.prefs.view.viewer_gray;
+        let info = s.prefs.view.show_info_overlay;
         let current_accent = cx.global::<theme::AuroraTheme>().accent;
         let speed = motion::speed();
         let speed_index = SPEEDS.iter().position(|(f, _, _)| (f - speed).abs() < 0.05).unwrap_or(2);
@@ -309,7 +309,7 @@ impl PrefsView {
                     .hover(|d| d.border_color(p.text_muted))
                     .on_click(move |_, _, cx| {
                         theme::set_accent(c, cx);
-                        t1.update(cx, |v, cx| v.edit(cx, |s| s.settings.accent = Some(c)));
+                        t1.update(cx, |v, cx| v.edit(cx, |s| s.prefs.settings.accent = Some(c)));
                     })
             })))
             .child(caption(t("Motion", "动效"), cx))
@@ -333,10 +333,10 @@ impl PrefsView {
             ))
             .child(caption(t("Viewer", "查看器"), cx))
             .child(ParamSlider::new("pref-gray", t("Background", "背景"), gray * 100.0, 0.0, 60.0).default_value(11.0).unit("%").on_change(move |v, _, cx| {
-                t3.update(cx, |p, cx| p.edit(cx, |s| s.view.viewer_gray = v / 100.0))
+                t3.update(cx, |p, cx| p.edit(cx, |s| s.prefs.view.viewer_gray = v / 100.0))
             }))
             .child(switch_row("pref-info", t("Show info overlay", "显示信息叠加"), info, move |v, _, cx| {
-                t4.update(cx, |p, cx| p.edit(cx, |s| s.view.show_info_overlay = v))
+                t4.update(cx, |p, cx| p.edit(cx, |s| s.prefs.view.show_info_overlay = v))
             }, cx))
             .child(self.display_profile(cx))
             .into_any_element()
@@ -346,7 +346,7 @@ impl PrefsView {
     /// engine still has to convert previews to it (see `contract::DISPLAY_PROFILE`).
     fn display_profile(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx).clone();
-        let chosen = self.state.read(cx).settings.display_profile.clone();
+        let chosen = self.state.read(cx).prefs.settings.display_profile.clone();
         let mut profiles = crate::state::display_profiles();
         if let Some(c) = chosen.as_ref().filter(|c| !profiles.contains(c)) {
             profiles.insert(0, c.clone());
@@ -356,7 +356,7 @@ impl PrefsView {
         options.extend(profiles.iter().enumerate().map(|(i, path)| (i + 1, path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().into())));
         let this = cx.entity();
         let refresh = cx.entity();
-        let detected = crate::state::detected_display_profile_status(self.state.read(cx).window_hwnd);
+        let detected = crate::state::detected_display_profile_status(self.state.read(cx).device.display_target());
         let name_of = |p: &std::path::PathBuf| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
         let fallback = if detected.fallback { format!(" · {}", t("primary fallback", "回退主屏")) } else { String::new() };
         let detected_name = detected.path.as_ref().map(|p| name_of(p)).unwrap_or_else(|| t("none", "无").to_string());
@@ -414,9 +414,9 @@ impl PrefsView {
 
     /// Soft-proof profile, from the engine's ICC list; used while soft proof is on.
     fn proof_profile(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let chosen = self.state.read(cx).settings.proof_profile.clone();
-        let white = self.state.read(cx).settings.proof_paper_white;
-        let black = self.state.read(cx).settings.proof_black_point;
+        let chosen = self.state.read(cx).prefs.settings.proof_profile.clone();
+        let white = self.state.read(cx).prefs.settings.proof_paper_white;
+        let black = self.state.read(cx).prefs.settings.proof_black_point;
         let mut profiles = self.state.read(cx).icc_profiles.clone();
         if let Some(c) = chosen.as_ref().filter(|c| !profiles.contains(c)) {
             profiles.insert(0, c.clone());
@@ -448,30 +448,30 @@ impl PrefsView {
 
     fn browser(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let s = self.state.read(cx);
-        let thumb = s.view.thumb_size;
-        let multi = s.view.multi;
-        let divisions = s.settings.grid_divisions;
+        let thumb = s.prefs.view.thumb_size;
+        let multi = s.prefs.view.multi;
+        let divisions = s.prefs.settings.grid_divisions;
         let this = cx.entity();
         let (t1, t2, t3) = (this.clone(), this.clone(), this.clone());
         v_flex()
             .child(caption(t("Browser", "浏览器"), cx))
             .child(ParamSlider::new("pref-thumb", t("Thumbnail size", "缩略图大小"), thumb, 80.0, 320.0).default_value(120.0).unit(" px").on_change(move |v, _, cx| {
-                t1.update(cx, |p, cx| p.edit(cx, |s| s.view.thumb_size = v))
+                t1.update(cx, |p, cx| p.edit(cx, |s| s.prefs.view.thumb_size = v))
             }))
             .child(caption(t("Viewer", "查看器"), cx))
             .child(switch_row("pref-multi", t("Show multiple selected images side by side", "选中多张时并排显示"), multi, move |v, _, cx| {
-                t2.update(cx, |p, cx| p.edit(cx, |s| s.view.multi = v))
+                t2.update(cx, |p, cx| p.edit(cx, |s| s.prefs.view.multi = v))
             }, cx))
             .child(note(t("Shortcut N toggles it; Shift+Enter pins the current image as the compare variant.", "快捷键 N 切换；Shift+Enter 将当前图像固定为对比变体。"), cx))
             .child(ParamSlider::new("pref-grid", t("Grid divisions", "网格分格"), divisions as f32, 2.0, 12.0).step(1.0).default_value(3.0).on_change(move |v, _, cx| {
-                t3.update(cx, |p, cx| p.edit(cx, |s| s.settings.grid_divisions = v.round() as u8))
+                t3.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.grid_divisions = v.round() as u8))
             }))
             .into_any_element()
     }
 
     fn exposure(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx).clone();
-        let s = self.state.read(cx).settings.clone();
+        let s = self.state.read(cx).prefs.settings.clone();
         let this = cx.entity();
         let (t1, t2, t3, t4) = (this.clone(), this.clone(), this.clone(), this.clone());
         // A ramp showing which levels the warning marks.
@@ -512,7 +512,7 @@ impl PrefsView {
     }
 
     fn crop(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let s = self.state.read(cx).settings.clone();
+        let s = self.state.read(cx).prefs.settings.clone();
         let this = cx.entity();
         let (t1, t2) = (this.clone(), this.clone());
         v_flex()
@@ -520,12 +520,12 @@ impl PrefsView {
             .child(row(
                 t("Guides", "参考线"),
                 select("pref-crop-guide", CropGuide::ALL.iter().map(|g| (*g, g.label().into())).collect(), s.crop_guide, move |g, _, cx| {
-                    t1.update(cx, |p, cx| p.edit(cx, |s| s.settings.crop_guide = g))
+                    t1.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.crop_guide = g))
                 }),
                 cx,
             ))
             .child(ParamSlider::new("pref-crop-mask", t("Mask outside crop", "裁剪外遮罩"), s.crop_mask * 100.0, 0.0, 100.0).unit("%").default_value(55.0).on_change(move |v, _, cx| {
-                t2.update(cx, |p, cx| p.edit(cx, |s| s.settings.crop_mask = v / 100.0))
+                t2.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.crop_mask = v / 100.0))
             }))
             .into_any_element()
     }
@@ -535,8 +535,8 @@ impl PrefsView {
         let s = self.state.read(cx);
         let list = s.workspace_list();
         let builtin = crate::state::builtin_workspaces().len();
-        let active = s.settings.workspace.name.clone();
-        let right = s.view.inspector_right;
+        let active = s.prefs.settings.workspace.name.clone();
+        let right = s.prefs.view.inspector_right;
         let hidden: Vec<ToolTab> = ToolTab::ALL.into_iter().filter(|t| s.tab_hidden(*t)).collect();
         let this = cx.entity();
         let t_side = this.clone();
@@ -584,7 +584,7 @@ impl PrefsView {
             .child(row(
                 t("Tools", "工具栏"),
                 Segmented::new("pref-side", if right { 1 } else { 0 }).text(t("Left", "左侧")).text(t("Right", "右侧")).on_select(move |i, _, cx| {
-                    t_side.update(cx, |p, cx| p.edit(cx, |s| s.view.inspector_right = i == 1))
+                    t_side.update(cx, |p, cx| p.edit(cx, |s| s.prefs.view.inspector_right = i == 1))
                 }),
                 cx,
             ))
@@ -619,7 +619,7 @@ impl PrefsView {
 
     fn keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx).clone();
-        let overrides = self.state.read(cx).settings.shortcuts.clone();
+        let overrides = self.state.read(cx).prefs.settings.shortcuts.clone();
         let all = shortcuts();
         // Keys used by more than one command.
         let mut uses: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -756,7 +756,7 @@ impl PrefsView {
                     .child(div().flex_1().child(search))
                     .child(Button::new("keys-reset-all").xsmall().outline().label(format!("{} ({custom})", t("Restore all", "全部恢复默认"))).on_click(cx.listener(|v, _, _, cx| {
                         v.state.update(cx, |s, _| {
-                            s.settings.shortcuts.clear();
+                            s.prefs.settings.shortcuts.clear();
                             s.save_settings();
                         });
                         actions::bind_keys(cx, &BTreeMap::new());

@@ -25,7 +25,7 @@ pub fn param_c1(state: &Entity<AppState>, id: impl Into<SharedString>, key: &'st
     let Some(meta) = s.engine.param_metadata().iter().find(|m| m.key == key) else {
         return param(state, id, key, binding, 0.0, 100.0, cx);
     };
-    let (min, max, default) = match s.current {
+    let (min, max, default) = match s.library.current {
         Some(image) => OVERRIDES.with_borrow_mut(|cache| {
             if cache.as_ref().is_none_or(|(id, _)| *id != image) {
                 *cache = Some((image, s.engine.param_overrides(image)));

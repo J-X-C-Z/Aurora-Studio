@@ -1,5 +1,10 @@
-use std::ffi::{c_char, c_int, c_void, OsStr};
+use std::ffi::{c_char, c_int, c_void};
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::slice;
 
@@ -132,8 +137,52 @@ struct Library {
     handle: *mut c_void,
 }
 
+/// Typed absence for the POSIX loader: lists every candidate path that was
+/// considered, so a failure names the searched locations instead of a generic
+/// "could not load" message. Windows keeps its historical `AURORA_JXL_DIR`
+/// error strings.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct LibraryNotFound {
+    searched: Vec<PathBuf>,
+    details: Vec<String>,
+}
+
+#[cfg(unix)]
+impl LibraryNotFound {
+    /// Candidate paths that were searched, in order, including ones rejected
+    /// because the file was absent or the dynamic loader failed.
+    pub fn searched(&self) -> &[PathBuf] {
+        &self.searched
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for LibraryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let searched = self
+            .searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "libjxl library not found; searched: {searched}")?;
+        if !self.details.is_empty() {
+            write!(f, "; load errors: {}", self.details.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for LibraryNotFound {}
+
+#[cfg(windows)]
 impl Library {
-    fn load(dir: &Path) -> Result<Self> {
+    fn load() -> Result<Self> {
+        let dir = std::env::var_os("AURORA_JXL_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("AURORA_JXL_DIR is not set"))?;
         let path = dir.join("libjxl.dll");
         if !path.is_file() {
             bail!("libjxl.dll not found: {}", path.display());
@@ -145,7 +194,43 @@ impl Library {
         }
         Ok(Self { handle })
     }
+}
 
+#[cfg(unix)]
+impl Library {
+    fn load() -> Result<Self> {
+        let mut searched = Vec::new();
+        let mut details = Vec::new();
+        for candidate in library_candidates() {
+            // Absolute/path-like candidates are checked on disk first so a
+            // missing prefix entry cannot hide a later valid one. Bare names
+            // (no separator) are resolved by the dynamic loader's own search
+            // path, so they are handed to dlopen directly.
+            let path_like = candidate.is_absolute() || candidate.components().count() > 1;
+            if path_like && !candidate.is_file() {
+                searched.push(candidate);
+                continue;
+            }
+            match unsafe { dlopen_path(&candidate) } {
+                Ok(handle) => return Ok(Self { handle }),
+                Err(detail) => {
+                    details.push(format!("{}: {detail}", candidate.display()));
+                    searched.push(candidate);
+                }
+            }
+        }
+        Err(anyhow::Error::new(LibraryNotFound { searched, details }))
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+impl Library {
+    fn load() -> Result<Self> {
+        bail!("JPEG XL decoding is not available on this platform")
+    }
+}
+
+impl Library {
     fn symbols(&self) -> Result<Symbols> {
         unsafe {
             Ok(Symbols {
@@ -166,17 +251,128 @@ impl Library {
 
     unsafe fn symbol<T>(&self, name: &str) -> Result<T> {
         let name = std::ffi::CString::new(name)?;
+        let pointer = unsafe { self.lookup(&name) }?;
+        Ok(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&pointer) })
+    }
+
+    #[cfg(windows)]
+    unsafe fn lookup(&self, name: &std::ffi::CStr) -> Result<*mut c_void> {
         let pointer = unsafe { GetProcAddress(self.handle, name.as_ptr() as *const c_char) };
         if pointer.is_null() {
             bail!("missing libjxl export {}", name.to_string_lossy());
         }
-        Ok(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&pointer) })
+        Ok(pointer)
+    }
+
+    #[cfg(unix)]
+    unsafe fn lookup(&self, name: &std::ffi::CStr) -> Result<*mut c_void> {
+        unsafe { dlerror() };
+        let pointer = unsafe { dlsym(self.handle, name.as_ptr()) };
+        if pointer.is_null() {
+            match unsafe { dl_error() } {
+                Some(detail) => bail!("missing libjxl export {}: {detail}", name.to_string_lossy()),
+                None => bail!("missing libjxl export {}", name.to_string_lossy()),
+            }
+        }
+        Ok(pointer)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    unsafe fn lookup(&self, _name: &std::ffi::CStr) -> Result<*mut c_void> {
+        bail!("JPEG XL decoding is not available on this platform")
     }
 }
 
 impl Drop for Library {
     fn drop(&mut self) {
-        unsafe { FreeLibrary(self.handle) };
+        #[cfg(windows)]
+        unsafe {
+            FreeLibrary(self.handle)
+        };
+        #[cfg(unix)]
+        unsafe {
+            dlclose(self.handle)
+        };
+    }
+}
+
+/// Built-in POSIX search order. `AURORA_JXL_LIB` is authoritative when set: it
+/// is the only candidate, so a bad override fails instead of silently falling
+/// back to an installed copy.
+#[cfg(unix)]
+fn library_candidates() -> Vec<PathBuf> {
+    if let Some(override_path) = std::env::var_os("AURORA_JXL_LIB") {
+        return vec![PathBuf::from(override_path)];
+    }
+
+    let mut paths = Vec::new();
+    if cfg!(target_os = "macos") {
+        const DIRS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib"];
+        const NAMES: &[&str] = &[
+            "libjxl.0.13.0.dylib",
+            "libjxl.0.13.dylib",
+            "libjxl.dylib",
+        ];
+        for dir in DIRS {
+            for name in NAMES {
+                paths.push(Path::new(dir).join(name));
+            }
+        }
+        for name in NAMES {
+            paths.push(PathBuf::from(name));
+        }
+    } else {
+        const DIRS: &[&str] = &[
+            "/usr/local/lib",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+        ];
+        const NAMES: &[&str] = &["libjxl.so.0.13", "libjxl.so.0", "libjxl.so"];
+        for dir in DIRS {
+            for name in NAMES {
+                paths.push(Path::new(dir).join(name));
+            }
+        }
+        for name in NAMES {
+            paths.push(PathBuf::from(name));
+        }
+    }
+    deduplicate(paths)
+}
+
+#[cfg(unix)]
+fn deduplicate(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+#[cfg(unix)]
+unsafe fn dlopen_path(path: &Path) -> std::result::Result<*mut c_void, String> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "path contains an interior NUL byte".to_string())?;
+    unsafe { dlerror() };
+    let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
+    if handle.is_null() {
+        Err(unsafe { dl_error() }.unwrap_or_else(|| "dlopen returned NULL".to_string()))
+    } else {
+        Ok(handle)
+    }
+}
+
+#[cfg(unix)]
+unsafe fn dl_error() -> Option<String> {
+    let error = unsafe { dlerror() };
+    if error.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ffi::CStr::from_ptr(error) }.to_string_lossy().into_owned())
     }
 }
 
@@ -206,10 +402,7 @@ fn feed(data: &[u8], decoder: &Decoder<'_>) {
 }
 
 pub fn decode_cop(path: impl AsRef<Path>) -> Result<RgbaImage> {
-    let dir = std::env::var_os("AURORA_JXL_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("AURORA_JXL_DIR is not set"))?;
-    let library = Library::load(&dir)?;
+    let library = Library::load()?;
     let symbols = library.symbols()?;
 
     let data = std::fs::read(path.as_ref()).with_context(|| {
@@ -253,8 +446,7 @@ fn basic_info_zero() -> BasicInfo {
 }
 
 pub fn dimensions(path: impl AsRef<Path>) -> Option<(u32, u32)> {
-    let dir = std::env::var_os("AURORA_JXL_DIR").map(PathBuf::from)?;
-    let library = Library::load(&dir).ok()?;
+    let library = Library::load().ok()?;
     let symbols = library.symbols().ok()?;
     let data = std::fs::read(path.as_ref()).ok()?;
     let decoder = Decoder::new(&symbols).ok()?;
@@ -416,33 +608,52 @@ fn check(status: Status, action: &'static str) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn LoadLibraryW(path: *const u16) -> *mut c_void;
     fn FreeLibrary(library: *mut c_void) -> c_int;
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
+    fn dlclose(handle: *mut c_void) -> c_int;
+}
+
+#[cfg(unix)]
+const RTLD_NOW: c_int = 2;
+
 #[cfg(test)]
 mod tests {
     use super::decode_cop;
+    #[cfg(unix)]
+    use super::{dimensions, LibraryNotFound};
     use anyhow::Result;
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    #[cfg(windows)]
     const SAMPLE: &str = r"C:\Users\Jxcz2\Pictures\Capture One Catalog\Cache\Previews\2026\9\13\0\_DSC5673.NEF.cop";
 
+    #[cfg(windows)]
     fn dir() -> PathBuf {
         std::env::var_os("AURORA_JXL_DIR").map(PathBuf::from).unwrap_or_default()
     }
 
+    #[cfg(windows)]
     fn source() -> &'static Path {
         Path::new(SAMPLE)
     }
 
+    #[cfg(windows)]
     #[test]
     fn decodes_real_proxy() -> Result<()> {
         if !source().is_file() || !dir().join("libjxl.dll").is_file() {
@@ -454,6 +665,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
     #[test]
     fn missing_dll_returns_err() -> Result<()> {
         let lane = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -470,6 +682,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
     #[test]
     fn invalid_cop_returns_err() -> Result<()> {
         if !dir().join("libjxl.dll").is_file() {
@@ -482,6 +695,159 @@ mod tests {
         let result = decode_cop(&path);
         fs::remove_file(&path)?;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    // POSIX loader tests. They use the real Homebrew libjxl when present and
+    // skip cleanly when only the encoder (`cjxl`) or the library is missing.
+
+    #[cfg(unix)]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes tests that mutate `AURORA_JXL_LIB`.
+    #[cfg(unix)]
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(unix)]
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("aurora-jxl-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    fn with_override<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+        struct Restore {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        let key = "AURORA_JXL_LIB";
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, path) };
+        let _restore = Restore { key, previous };
+        f()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_override_reports_searched_candidates() -> Result<()> {
+        let _guard = env_guard();
+        let dir = unique_temp_dir("missing-override");
+        let missing = dir.join("libjxl-does-not-exist.dylib");
+        let (decoded, header) = with_override(&missing, || {
+            (
+                decode_cop(Path::new("no-such.cop")),
+                dimensions(Path::new("no-such.cop")),
+            )
+        });
+
+        assert_eq!(header, None, "dimensions must not panic when absent");
+        let error = decoded.expect_err("a missing override must not fall back");
+        let typed = error
+            .downcast_ref::<LibraryNotFound>()
+            .expect("absence must be a typed LibraryNotFound");
+        assert_eq!(typed.searched(), std::slice::from_ref(&missing));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("libjxl library not found; searched:"),
+            "{message}"
+        );
+        assert!(message.contains("libjxl-does-not-exist.dylib"), "{message}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_jxl_returns_err() -> Result<()> {
+        let _guard = env_guard();
+        if super::Library::load().is_err() {
+            eprintln!("skipped: libjxl library unavailable");
+            return Ok(());
+        }
+        let dir = unique_temp_dir("invalid");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("invalid.jxl");
+        fs::write(&path, b"not jxl")?;
+        let result = decode_cop(&path);
+        fs::remove_dir_all(&dir)?;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cjxl_synthetic_roundtrip() -> Result<()> {
+        let _guard = env_guard();
+        let dir = unique_temp_dir("synthetic");
+        fs::create_dir_all(&dir)?;
+        let png = dir.join("synthetic.png");
+        let jxl = dir.join("synthetic.jxl");
+
+        let mut rgba = image::RgbaImage::new(8, 8);
+        for (x, y, pixel) in rgba.enumerate_pixels_mut() {
+            *pixel = image::Rgba([(x * 32) as u8, (y * 32) as u8, 128, 255]);
+        }
+        rgba.save(&png)?;
+
+        let cjxl = std::env::var_os("AURORA_CJXL").unwrap_or_else(|| "cjxl".into());
+        let encoded = std::process::Command::new(&cjxl)
+            .arg(&png)
+            .arg(&jxl)
+            .args(["-d", "0", "-e", "1"])
+            .output();
+        let cleanup = || {
+            let _ = fs::remove_dir_all(&dir);
+        };
+        let encoded = match encoded {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skipped: cjxl unavailable: {error}");
+                cleanup();
+                return Ok(());
+            }
+        };
+        if !encoded.status.success() || !jxl.is_file() {
+            eprintln!(
+                "skipped: cjxl could not encode: {}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            cleanup();
+            return Ok(());
+        }
+
+        let image = match decode_cop(&jxl) {
+            Ok(image) => image,
+            Err(error) if error.downcast_ref::<LibraryNotFound>().is_some() => {
+                eprintln!("skipped: libjxl library unavailable: {error:#}");
+                cleanup();
+                return Ok(());
+            }
+            Err(error) => {
+                cleanup();
+                return Err(error);
+            }
+        };
+        let header = dimensions(&jxl);
+        cleanup();
+
+        assert_eq!((image.width(), image.height()), (8, 8));
+        assert_eq!(header, Some((8, 8)));
+        assert!(image.pixels().all(|pixel| pixel.0[3] == 255));
         Ok(())
     }
 }

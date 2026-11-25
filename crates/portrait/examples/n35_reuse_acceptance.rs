@@ -1,3 +1,19 @@
+//! Windows CUDA acceptance benchmark for the N35 reuse path.
+//!
+//! The kernels it drives (`facial_smooth`, eye bag, PF30025, PF90021, mesh
+//! raster/attribute) only exist in the Windows driver build. On other platforms
+//! the crate keeps this example as an explicit no-op instead of failing
+//! `cargo check --all-targets` with unresolved CUDA items.
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!(
+        "n35_reuse_acceptance is a Windows CUDA example; nothing to run on this platform."
+    );
+}
+
+#[cfg(windows)]
+mod win_example {
 use aurora_portrait::cuda::{DriverMetrics, driver_metrics};
 use aurora_portrait::cuda_eye_bag::{self, EyeBag};
 use aurora_portrait::cuda_mesh_attribute::MeshAttribute;
@@ -808,7 +824,7 @@ fn push_case(cases: &mut Vec<Case>, case: Case) {
     cases.push(case);
 }
 
-fn main() {
+    pub(crate) fn main() {
     assert!(std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_some());
     let mut cases = Vec::new();
     push_case(&mut cases, run_facial_smooth(6000, 4000));
@@ -853,4 +869,10 @@ fn main() {
     }
     println!("  ]");
     println!("}}");
+}
+}
+
+#[cfg(windows)]
+fn main() {
+    win_example::main()
 }

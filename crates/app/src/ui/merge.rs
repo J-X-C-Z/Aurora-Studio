@@ -37,7 +37,7 @@ fn deghost_at(index: usize) -> DeghostMode {
 }
 
 pub fn open(state: &Entity<AppState>, kind: MergeKind, window: &mut Window, cx: &mut App) {
-    let count = state.read(cx).selection.len();
+    let count = state.read(cx).library.selection.len();
     if count < 2 {
         state.update(cx, |s, cx| s.notify(t("Select at least two images to merge", "请至少选择两张图像进行合并"), cx));
         return;

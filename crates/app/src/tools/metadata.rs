@@ -42,8 +42,8 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
 fn presets_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let presets = s.settings.metadata_presets.clone();
-    let n = s.selection.len().max(1);
+    let presets = s.prefs.settings.metadata_presets.clone();
+    let n = s.library.selection.len().max(1);
     let st_save = state.clone();
     let mut panel = ToolPanel::new(state, "metadata-presets", t("Metadata Presets", "元数据预设"))
         .badge(presets.len().to_string())
@@ -56,7 +56,7 @@ fn presets_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<>
                     .label(t("Save Current as Preset…", "将当前元数据存储为预设…"))
                     .on_click(move |_, window, cx| {
                         let st = st_save.clone();
-                        let count = st.read(cx).settings.metadata_presets.len();
+                        let count = st.read(cx).prefs.settings.metadata_presets.len();
                         crate::ui::naming::prompt(
                             t("Save Metadata Preset", "存储元数据预设"),
                             t("Saves this image's IPTC fields and keywords. Applying fills only the fields the preset has and adds its keywords.", "存储当前图像的 IPTC 字段与关键词。应用时只填写预设中有内容的字段，并添加关键词。"),
@@ -135,7 +135,7 @@ fn rating_panel(state: &Entity<AppState>, info: &ImageInfo, cx: &App) -> impl In
     let rating = info.rating;
     let tag = info.color_tag;
     let (st, st2) = (state.clone(), state.clone());
-    let n = state.read(cx).selection.len();
+    let n = state.read(cx).library.selection.len();
     ToolPanel::new(state, "rating", t("Rating & Tag", "评级与色标"))
         .when(n > 1, |p| p.badge(format!("{} {n}", t("Editing", "正在编辑"))))
         .child(row(

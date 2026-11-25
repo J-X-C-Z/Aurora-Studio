@@ -146,6 +146,11 @@ impl Catalog {
 }
 
 /// A folder of images plus everything Portrait remembers about them.
+///
+/// The handle is just the catalog root, so cloning is cheap and both handles
+/// address the same files. The queued save path hands a clone to its single
+/// writer thread instead of sharing a catalog lock across file I/O.
+#[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
 }
@@ -250,7 +255,15 @@ impl Store {
             }
         }
         let adjustments = value.get("adjustments").unwrap_or(&value);
-        Ok(serde_json::from_value::<AdjustmentSet>(adjustments.clone()).unwrap_or_default())
+        let mut adjustments = adjustments.clone();
+        // A wrapper-level `schema_version` on a legacy flat file is document
+        // metadata, not a vendor extension. Unknown top-level keys are otherwise
+        // preserved verbatim (see `AdjustmentSet::extensions`), so strip only
+        // this known key to avoid re-emitting it inside `adjustments`.
+        if let Some(object) = adjustments.as_object_mut() {
+            object.remove("schema_version");
+        }
+        Ok(serde_json::from_value::<AdjustmentSet>(adjustments).unwrap_or_default())
     }
 
     /// Writes the adjustments of one image atomically.
@@ -665,6 +678,54 @@ mod tests {
     }
 
     #[test]
+    fn unknown_top_level_keys_survive_a_save_and_reload() {
+        let temp = TempFolder::new();
+        let store = Store::open(temp.path()).unwrap();
+        let path = store.adjust_path("shoot/img_001.cr3").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{"schema_version":1,"adjustments":{"exposure":{"ev":0.5},"VendorWidget":{"gain":0.25}}}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load_adjustments("shoot/img_001.cr3").unwrap();
+        assert_eq!(
+            loaded.extensions.get("VendorWidget").and_then(|v| v.get("gain")),
+            Some(&serde_json::json!(0.25))
+        );
+        store.save_adjustments("shoot/img_001.cr3", &loaded).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["adjustments"]["VendorWidget"]["gain"], 0.25);
+        assert!(value["adjustments"].get("extensions").is_none());
+    }
+
+    #[test]
+    fn legacy_flat_schema_version_is_not_a_document_extension() {
+        let temp = TempFolder::new();
+        let store = Store::open(temp.path()).unwrap();
+        let path = store.adjust_path("shoot/img_001.cr3").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Older/foreign flat shape: the document fields and `schema_version` sit
+        // at the top level instead of under `adjustments`.
+        fs::write(
+            &path,
+            br#"{"schema_version":1,"exposure":{"exposure":0.5},"VendorWidget":7}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load_adjustments("shoot/img_001.cr3").unwrap();
+        assert_eq!(loaded.exposure.exposure, 0.5);
+        assert_eq!(loaded.extensions.get("VendorWidget"), Some(&serde_json::json!(7)));
+        assert!(
+            !loaded.extensions.contains_key("schema_version"),
+            "wrapper metadata must not land in document extensions"
+        );
+    }
+
+    #[test]
     fn round_trips_user_collections() {
         use crate::catalog::{CollectionKind, ImageId, SmartRule, UserCollection};
         let temp = TempFolder::new();
@@ -1008,5 +1069,25 @@ mod tests {
         assert!(store.save_metadata("Shoot.cocatalogdb/a.CR3", 5, "Red", &keywords(&["x"])).is_err());
         assert!(!temp.path().join("Shoot.cocatalogdb").join("a.xmp").exists());
         assert!(store.load_index().unwrap().images.is_empty());
+    }
+
+    #[test]
+    fn save_adjustments_reports_an_unwritable_adjust_directory() {
+        let temp = TempFolder::new();
+        let store = Store::open(temp.path()).unwrap();
+        // Replacing `adjust/` with a regular file makes every write fail
+        // deterministically (also when the test runs as root, unlike a
+        // read-only permission bit).
+        let adjust = store.root().join("adjust");
+        fs::remove_dir_all(&adjust).unwrap();
+        fs::write(&adjust, b"not a directory").unwrap();
+
+        let err = store
+            .save_adjustments("shoot/img_001.cr3", &sample_adjustments())
+            .expect_err("write into a file-as-directory must fail");
+        assert!(!format!("{err:#}").is_empty());
+
+        // Leave a clean folder for the guard's cleanup.
+        fs::remove_file(&adjust).unwrap();
     }
 }

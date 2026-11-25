@@ -46,6 +46,14 @@ const RENDER_VERSION: u32 = 1;
 
 /// Everything that changes the rendered bytes. `generation` is deliberately
 /// absent: a redraw of the same content must hit.
+///
+/// This key is **document-only**. Producer/runtime inputs are not fields of
+/// `AdjustmentSet` (they live in `crate::document::RuntimeInputs`), so they are
+/// not covered here. When a render path starts threading runtime inputs into
+/// previews, it MUST add them to this key (for example a
+/// `RuntimeInputs::fingerprint` field) in the same change; otherwise a frame
+/// rendered with different masks could be served from cache. No production path
+/// attaches producer inputs today, so the current omission is not a regression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewKey {
     build: u64,
@@ -185,6 +193,12 @@ pub(crate) fn key(
 /// FNV-1a over the serialized adjustment set: stable across runs and Rust
 /// versions, and no per-call `Debug` formatting. A near-miss on one slider
 /// changes the bytes, so it always misses.
+///
+/// This covers the persistent document only. Per-job producer inputs are no
+/// longer part of `AdjustmentSet`, so a caller that lets runtime inputs affect
+/// output must mix `crate::document::RuntimeInputs::fingerprint` into the cache
+/// key itself; [`PreviewKey`] does not do that yet because no preview path
+/// supplies runtime inputs. Do not read this hash as producer coverage.
 pub(crate) fn params_fingerprint(adj: &AdjustmentSet) -> u64 {
     struct Fnv(u64);
     impl std::io::Write for Fnv {
@@ -202,12 +216,6 @@ pub(crate) fn params_fingerprint(adj: &AdjustmentSet) -> u64 {
     }
     let mut hash = Fnv(0xcbf2_9ce4_8422_2325u64);
     serde_json::to_writer(&mut hash, adj).unwrap_or_default();
-    if let Some(producer) = adj.portrait_producer_inputs.as_deref() {
-        for byte in producer.fingerprint().to_le_bytes() {
-            hash.0 ^= byte as u64;
-            hash.0 = hash.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
     hash.0
 }
 

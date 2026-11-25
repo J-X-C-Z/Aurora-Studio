@@ -14,67 +14,18 @@
 //! aspect-ratio crop needs source pixels to size itself, so use
 //! `frame_to_source` for that case.
 
-use crate::{AspectRatio, Geometry, Keystone, NormRect};
+use crate::{Geometry, Keystone, NormRect};
 
-const EPS: f32 = 1e-6;
+// Pure crop/aspect math lives in `processing`; re-export it here so the frame
+// map and every legacy caller keep the same `crate::mock::geometry` paths.
+pub(crate) use crate::processing::geometry::{
+    canvas_size, clean_rect, crop_for_aspect, finite, is_quarter_turn, oriented_size, EPS,
+};
+
 const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-
-fn finite(v: f32) -> f32 {
-    if v.is_finite() {
-        v
-    } else {
-        0.0
-    }
-}
 
 fn finite_pair(p: [f32; 2]) -> [f32; 2] {
     [finite(p[0]), finite(p[1])]
-}
-
-fn clean_rect(g: &Geometry) -> NormRect {
-    let r = g.crop;
-    let (width, height) = (finite(r.width), finite(r.height));
-    if g.crop_outside_image {
-        // `ZCROPOUTSIDEIMAGE`: C1 allows the crop rectangle to reach past the
-        // image, so only non-finite values are repaired here.
-        return NormRect { x: finite(r.x), y: finite(r.y), width, height };
-    }
-    let (width, height) = (width.clamp(0.0, 1.0), height.clamp(0.0, 1.0));
-    NormRect {
-        x: finite(r.x).clamp(0.0, 1.0 - width),
-        y: finite(r.y).clamp(0.0, 1.0 - height),
-        width,
-        height,
-    }
-}
-
-/// Oriented image size: a quarter turn of `rotation` or an odd `orientation` swaps the axes.
-fn oriented_size(g: &Geometry, source_size: (u32, u32)) -> (f32, f32) {
-    let (w, h) = (source_size.0 as f32, source_size.1 as f32);
-    let quarter_turn = (g.orientation % 2 == 1) ^ is_quarter_turn(g.rotation);
-    if quarter_turn {
-        (h, w)
-    } else {
-        (w, h)
-    }
-}
-
-fn is_quarter_turn(rotation_deg: f32) -> bool {
-    let turns = finite(rotation_deg) / 90.0;
-    (turns - turns.round()).abs() < 1e-4 && turns.round() as i64 % 2 != 0
-}
-
-/// `ZCANVASSIZE` when the crop was stored against it, otherwise the oriented
-/// image. A full-frame crop keeps the image size, so an uncropped variant
-/// renders exactly as it did before the canvas was carried.
-fn canvas_size(g: &Geometry, source_size: (u32, u32)) -> (f32, f32) {
-    let (ow, oh) = oriented_size(g, source_size);
-    let (cw, ch) = (finite(g.canvas[0]), finite(g.canvas[1]));
-    if cw > EPS && ch > EPS && g.crop != NormRect::FULL {
-        (cw, ch)
-    } else {
-        (ow, oh)
-    }
 }
 
 /// Canvas size after a fine rotation: the AABB of the four rotated corners.
@@ -98,50 +49,6 @@ fn total_rotation(g: &Geometry) -> f32 {
     finite(g.rotation) + 90.0 * (g.orientation % 4) as f32
 }
 
-/// The crop rect implied by an aspect ratio + portrait flag, centred in the oriented frame.
-pub(crate) fn crop_for_aspect(g: &Geometry, source_size: (u32, u32)) -> NormRect {
-    let c = clean_rect(g);
-    let target = match g.aspect {
-        AspectRatio::Unconstrained | AspectRatio::Original => return c,
-        other => {
-            let (ow, oh) = oriented_size(g, source_size);
-            match other.ratio(ow / oh.max(EPS)) {
-                Some(r) if r.is_finite() && r > EPS => {
-                    if g.portrait {
-                        1.0 / r
-                    } else {
-                        r
-                    }
-                }
-                _ => return c,
-            }
-        }
-    };
-    // The rect is in `ZCROP`'s pixel frame, so the current ratio and the
-    // resized rect are measured there.
-    let (ow, oh) = canvas_size(g, source_size);
-    let (pw, ph) = (ow * c.width, oh * c.height);
-    if pw <= EPS || ph <= EPS {
-        return c;
-    }
-    let current = pw / ph;
-    if (current - target).abs() < 1e-4 {
-        return c;
-    }
-    let (w, h) = if current > target {
-        (c.width * target / current, c.height)
-    } else {
-        (c.width, c.height * current / target)
-    };
-    let (cx, cy) = (c.x + c.width * 0.5, c.y + c.height * 0.5);
-    NormRect {
-        x: (cx - w * 0.5).clamp(0.0, 1.0 - w),
-        y: (cy - h * 0.5).clamp(0.0, 1.0 - h),
-        width: w,
-        height: h,
-    }
-}
-
 /// Keystone as a weak perspective plus C1's symmetric skew shear.
 ///
 /// `vertical` insets the top edge horizontally (top narrower than bottom for a
@@ -150,8 +57,11 @@ pub(crate) fn crop_for_aspect(g: &Geometry, source_size: (u32, u32)) -> NormRect
 /// crop centre to undo the squeeze the correction introduces — Y for a positive
 /// value, X for a negative one (`UpdateGeo` flips `.dca`). `skew` shears
 /// both axes by `tan(atan(tan(skew°)·amount)/2)`. `focal_length` is C1's `c`:
-/// stored tilt is written as `100·tan(pitch)/fLen`, so scaling it back cancels
-/// the lens and leaves the physical angle.
+/// stored tilt is written as `100·tan(pitch)/fLen`, so multiplying it back
+/// cancels the tilt scale and leaves the physical angle. `c` still divides the
+/// perspective column (0x18141e00b), so the projective strength itself scales
+/// as `1/f` — the linear basis is focal-length independent, the corner map is
+/// not.
 pub(crate) struct KeystoneMap {
     /// Row-major 3x3 mapping a centred crop-space point (`p - 0.5`) to its
     /// centred source-crop point: C1's exact `CResampler::UpdateGeo` basis.
@@ -194,10 +104,15 @@ impl KeystoneMap {
 
         // `c` is `fLen > 0 ? fLen : 1` (0x18141d6c0), and
         // `keystoneFlagIgnoreFocalLength` forces it to 0 (0x18141d6f9).
-        let c = if k.flags & 1 == 0 && k.focal_length.is_finite() && k.focal_length > 0.0 {
+        // Unknown focal data (`fLen <= 0`) must take the `c = 1` normalised
+        // branch, *not* the `c = 0` unnormalised one: only the ignore flag
+        // reaches `0`.
+        let c = if k.flags & 1 != 0 {
+            0.0
+        } else if k.focal_length.is_finite() && k.focal_length > 0.0 {
             k.focal_length
         } else {
-            0.0
+            1.0
         };
         // 0x182a37a08 is `double(float(0.01))`, not the exact decimal 0.01.
         const TILT: f32 = 0.009_999_999_776_482_582;
@@ -622,6 +537,7 @@ fn apply_radial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AspectRatio;
 
     const SRC: (u32, u32) = (400, 300);
 
@@ -710,29 +626,77 @@ mod tests {
         assert_near(frame_to_source([0.5, 0.6], &aspect_only, SRC), [0.5, 0.5 + 0.1 * 1.2]);
     }
 
-    /// Camera data writes `tilt = 100·tan(pitch)/fLen`; the `c` scale in the
-    /// matrix must cancel it so the correction depends only on the pitch.
+    /// Camera data stores `tilt = 100·tan(pitch)/fLen`. `SetGeoCfg`'s
+    /// `c = fLen` multiplies that back to the physical angle, so the four
+    /// linear basis terms depend only on the pitch. But `UpdateGeo` also
+    /// divides the perspective column by `c·hypot(w, h)` (0x18141e00b): in
+    /// image-frame coordinates the projective strength really is `~tan(pitch)/f`,
+    /// the same `K·R·K⁻¹` factor a wider lens makes stronger. The old test
+    /// expected the *whole* corner map to be focal-length independent, which
+    /// was only true for the pre-a4b9d27 `0.35·tilt` approximation.
     #[test]
-    fn focal_length_cancels_the_camera_data_tilt() {
+    fn camera_tilt_recovers_the_angle_and_scales_perspective_by_focal_length() {
         let tan_pitch = 20.0f32.to_radians().tan();
-        let wanted = Geometry {
-            keystone: Keystone { vertical: 100.0 * tan_pitch, amount: 80.0, ..Default::default() },
-            ..Default::default()
-        };
+        let mut linear: Option<[f32; 4]> = None;
+        let mut scaled_perspective: Option<[f32; 2]> = None;
         for f in [0.2, 0.5, 1.0, 2.0] {
-            let g = Geometry {
-                keystone: Keystone {
-                    vertical: 100.0 * tan_pitch / f,
-                    amount: 80.0,
-                    focal_length: f,
-                    ..Default::default()
-                },
+            let k = Keystone {
+                vertical: 100.0 * tan_pitch / f,
+                amount: 80.0,
+                focal_length: f,
                 ..Default::default()
             };
-            for p in [[0.0, 0.0], [0.3, 0.8], [0.5, 0.5], [1.0, 1.0]] {
-                assert_near(frame_to_source(p, &g, SRC), frame_to_source(p, &wanted, SRC));
+            let m = KeystoneMap::new(&k, 0.0, false, false, 4.0 / 3.0).m;
+            let lin = [m[0], m[1], m[3], m[4]];
+            // `p_i·f` is the constant projective factor once `c` cancels.
+            let perspective = [m[6] * f, m[7] * f];
+            match (linear, scaled_perspective) {
+                (None, None) => {
+                    linear = Some(lin);
+                    scaled_perspective = Some(perspective);
+                }
+                (Some(l0), Some(p0)) => {
+                    for i in 0..4 {
+                        assert!(
+                            (lin[i] - l0[i]).abs() < 1e-5,
+                            "f={f} linear[{i}] {} vs {l0:?}",
+                            lin[i]
+                        );
+                    }
+                    for i in 0..2 {
+                        assert!(
+                            (perspective[i] - p0[i]).abs() < 1e-5,
+                            "f={f} perspective[{i}]·f {} vs {p0:?}",
+                            perspective[i]
+                        );
+                    }
+                }
+                _ => unreachable!(),
             }
         }
+    }
+
+    /// `SetGeoCfg` falls back to `c = 1` when the focal length is unknown; only
+    /// `keystoneFlagIgnoreFocalLength` (flags bit0) reaches the unnormalised
+    /// `c = 0` branch. This pins the branch `KeystoneMap` takes for the common
+    /// no-camera-data case.
+    #[test]
+    fn unknown_focal_length_uses_the_normalised_c_one_branch() {
+        let make = |focal_length, flags| {
+            KeystoneMap::new(
+                &Keystone { vertical: 60.0, amount: 100.0, focal_length, flags, ..Default::default() },
+                0.0,
+                false,
+                false,
+                4.0 / 3.0,
+            )
+            .m
+        };
+        let unknown = make(0.0, 0);
+        let one = make(1.0, 0);
+        let ignored = make(0.0, 1);
+        assert_eq!(unknown, one, "unknown focal must use the c = 1 fallback");
+        assert_ne!(unknown, ignored, "only flags bit0 selects the c = 0 branch");
     }
 
     /// Skew is C1's symmetric shear: `t = tan(atan(tan(20°)·1)/2) = tan(10°)`.
@@ -828,9 +792,16 @@ mod tests {
         let bottom_right = frame_to_source([1.0, 1.0], &g, SRC);
         let top_width = top_right[0] - top[0];
         let bottom_width = bottom_right[0] - bottom[0];
-        assert!((top_width - bottom_width).abs() > 1e-2, "top {top_width} vs bottom {bottom_width}");
-        // A perspective quad leaves frame corners on the image border.
-        assert!(top[1].abs() < 1e-4 && (bottom[1] - 1.0).abs() < 1e-4);
+        assert!(top_width < bottom_width - 1e-2, "top {top_width} vs bottom {bottom_width}");
+        // Exact `UpdateGeo` corners for `tilt = 0.5`, `amount = 1`, `c = 1`,
+        // `aspect = 4/3`. The perspective column also moves y, so frame corners
+        // do *not* stay on the y = 0 / y = 1 image border as the old 0.35
+        // trapezoid did (the previous check `top[1] == 0 && bottom[1] == 1`
+        // encoded that approximation).
+        assert_near(top, [0.059147, 0.105689]);
+        assert_near(top_right, [0.940853, 0.105689]);
+        assert_near(bottom, [-0.077477, 1.016511]);
+        assert_near(bottom_right, [1.077477, 1.016511]);
     }
 
     #[test]
@@ -997,18 +968,21 @@ mod tests {
         assert!((c.x + c.width * 0.5 - 0.5).abs() < 1e-4);
     }
 
+    /// The frame corners must land on the perspective quad that
+    /// `CResampler::UpdateGeo` builds. These values are the exact basis on a
+    /// 400x300 crop (`aspect = 4/3`, `amount = 1`, `tilt = {h: -0.4, v: 0.6}`,
+    /// `c = 1` fallback). The previous `0.35 * tilt` trapezoid was the
+    /// pre-a4b9d27 approximation and does not include the perspective column.
     #[test]
     fn keystone_maps_the_frame_corners_onto_its_trapezoid() {
         let g = Geometry {
             keystone: Keystone { vertical: 60.0, horizontal: -40.0, amount: 100.0, aspect: 0.0, ..Default::default() },
             ..Default::default()
         };
-        // 0.35 * control amount, the trapezoid `KeystoneMap` builds.
-        let (a, b) = (0.6 * 0.35, -0.4 * 0.35);
-        assert_near(frame_to_source([0.0, 0.0], &g, SRC), [a, b]);
-        assert_near(frame_to_source([1.0, 0.0], &g, SRC), [1.0 - a, 0.0]);
-        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.0, 1.0]);
-        assert_near(frame_to_source([0.0, 1.0], &g, SRC), [0.0, 1.0 - b]);
+        assert_near(frame_to_source([0.0, 0.0], &g, SRC), [0.004407, 0.015131]);
+        assert_near(frame_to_source([1.0, 0.0], &g, SRC), [0.843514, 0.204891]);
+        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.011937, 1.000860]);
+        assert_near(frame_to_source([0.0, 1.0], &g, SRC), [-0.105126, 1.019858]);
     }
 
     /// A positive horizontal keystone shortens the *source* left edge, which
@@ -1042,19 +1016,25 @@ mod tests {
         assert!(frame_to_source([0.0, 1.0], &g, SRC)[1] < 1.0);
     }
 
-    /// Vertical-only keystones must keep the exact corners the old quad had;
-    /// only the horizontal (`b`) terms changed.
+    /// A vertical-only keystone must follow `CResampler::UpdateGeo`, not the
+    /// old 0.35-inset trapezoid. With no focal data C1's `SetGeoCfg` falls back
+    /// to `c = 1`, so `UpdateGeo` takes its normalised branch: the basis carries
+    /// a `1/hypot` perspective column and the `1/sqrt(1+L²)` cosine term, which
+    /// move y as well as x. On a 400x300 crop (`aspect = 4/3`, `amount = 1`,
+    /// `tilt = 0.6`) that gives these four corners. The old expectation
+    /// `[0.21, 0], [0.79, 0], [1, 1], [0, 1]` was the pre-a4b9d27 approximation.
     #[test]
-    fn vertical_only_keystone_keeps_the_old_corners() {
+    fn vertical_keystone_matches_the_update_geo_corners() {
         let g = Geometry {
             keystone: Keystone { vertical: 60.0, amount: 100.0, ..Default::default() },
             ..Default::default()
         };
-        let a = 0.6 * 0.35;
-        assert_near(frame_to_source([0.0, 0.0], &g, SRC), [a, 0.0]);
-        assert_near(frame_to_source([1.0, 0.0], &g, SRC), [1.0 - a, 0.0]);
-        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.0, 1.0]);
-        assert_near(frame_to_source([0.0, 1.0], &g, SRC), [0.0, 1.0]);
+        assert_near(frame_to_source([0.0, 0.0], &g, SRC), [0.066855, 0.128582]);
+        assert_near(frame_to_source([1.0, 0.0], &g, SRC), [0.933145, 0.128582]);
+        assert_near(frame_to_source([1.0, 1.0], &g, SRC), [1.091260, 1.007002]);
+        assert_near(frame_to_source([0.0, 1.0], &g, SRC), [-0.091260, 1.007002]);
+        // The map stays symmetric about the crop centre.
+        assert_near(frame_to_source([0.0, 0.5], &g, SRC), [0.0, 0.5]);
     }
 
     #[test]

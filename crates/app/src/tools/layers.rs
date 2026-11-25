@@ -49,7 +49,7 @@ pub(crate) fn rename(state: &Entity<AppState>, id: u64, current: String, window:
 pub(crate) fn node_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let docked = s.view.node_dock;
+    let docked = s.prefs.view.node_dock;
     let count = s.adj().layers.len();
     let sel = s.selected_node();
     let graph = s.node_graph();
@@ -148,8 +148,8 @@ pub(crate) fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> i
     let p = pal(cx).clone();
     let id = layer.id;
     let cursor = s.cursor;
-    let overlay = s.panels.mask_overlay;
-    let busy = s.ai_busy;
+    let overlay = s.prefs.panels.mask_overlay;
+    let busy = s.tasks.ai_busy;
     let mask = layer.mask.clone();
 
     let tool = |tool: CursorTool| {
@@ -173,7 +173,7 @@ pub(crate) fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> i
     // AI masks: tick any number of kinds, then create them in one go.
     let (ai_failed, pick) = {
         let s = state.read(cx);
-        (s.ai_unavailable.clone(), s.panels.ai_pick.clone())
+        (s.ai_unavailable.clone(), s.prefs.panels.ai_pick.clone())
     };
     let chips = AiMaskKind::ALL.into_iter().map(|k| {
         let on = pick.contains(&k);
@@ -222,7 +222,7 @@ pub(crate) fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> i
                             .hover(|s| s.text_color(p.text))
                             .child(t("Clear", "清除"))
                             .on_click(move |_, _, cx| st_clear.update(cx, |s, cx| {
-                                s.panels.ai_pick.clear();
+                                s.prefs.panels.ai_pick.clear();
                                 cx.notify();
                             })),
                     )
@@ -240,7 +240,7 @@ pub(crate) fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> i
                     .disabled(busy || n == 0)
                     .tooltip(crate::contract::AI_MASK.note().unwrap_or_default())
                     .on_click(move |_, _, cx| st_go.update(cx, |s, cx| {
-                        let kinds = s.panels.ai_pick.clone();
+                        let kinds = s.prefs.panels.ai_pick.clone();
                         s.compute_ai_masks(kinds, cx)
                     })),
             )
@@ -301,7 +301,7 @@ pub(crate) fn mask_panel(state: &Entity<AppState>, layer: &Layer, cx: &App) -> i
                         .active(overlay)
                         .on_click(move |_, cx| {
                             st_overlay.update(cx, |s, cx| {
-                                s.panels.mask_overlay = !s.panels.mask_overlay;
+                                s.prefs.panels.mask_overlay = !s.prefs.panels.mask_overlay;
                                 s.request_render(RenderQuality::Final, cx);
                                 cx.notify();
                             })
@@ -372,12 +372,12 @@ pub(crate) fn color_range_panel(state: &Entity<AppState>, layer: &Layer, cx: &Ap
 }
 
 pub(crate) fn brush_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
-    let pr = state.read(cx).panels.clone();
+    let pr = state.read(cx).prefs.panels.clone();
     let slider = |id: &'static str, label: &'static str, value: f32, min: f32, max: f32, default: f32, unit: &'static str, f: fn(&mut crate::state::PanelPrefs, f32)| {
         let st = state.clone();
         ParamSlider::new(id, label, value, min, max).default_value(default).unit(unit).on_change(move |v, _, cx| {
             st.update(cx, |s, cx| {
-                f(&mut s.panels, v);
+                f(&mut s.prefs.panels, v);
                 cx.notify();
             })
         })
@@ -390,7 +390,7 @@ pub(crate) fn brush_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElemen
         .child(slider("brush-flow", t("Flow", "流量"), pr.brush_flow, 1.0, 100.0, 100.0, "%", |p, v| p.brush_flow = v))
         .child(switch_row("brush-auto", t("Auto Mask", "自动蒙版"), pr.brush_auto_mask, move |v, _, cx| {
             st.update(cx, |s, cx| {
-                s.panels.brush_auto_mask = v;
+                s.prefs.panels.brush_auto_mask = v;
                 cx.notify();
             })
         }, cx))

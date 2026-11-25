@@ -284,7 +284,7 @@ pub fn param(
     let commit_state = state.clone();
     let undo_label = label.clone();
     ParamSlider::new(id, label, value, min, max)
-        .disabled(state.read(cx).current.is_none())
+        .disabled(state.read(cx).library.current.is_none())
         .on_change(move |v, _, cx| {
             let set = set.clone();
             let undo_label = undo_label.clone();

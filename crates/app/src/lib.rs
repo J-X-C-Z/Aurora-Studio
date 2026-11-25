@@ -1,6 +1,7 @@
 //! Aurora Studio: a professional raw editor interface on GPUI.
 
 mod actions;
+mod capability;
 mod contract;
 mod evidence;
 mod i18n;
@@ -62,7 +63,26 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
             }
             theme::init(cx);
             actions::bind_keys(cx, &Default::default());
-            cx.on_action(|_: &actions::Quit, cx| cx.quit());
+            let quit_engine = engine.clone();
+            cx.on_action(move |_: &actions::Quit, cx| {
+                // Bounded close flush: queued saves must not be dropped just
+                // because the window closed. A failure is logged; the
+                // workspace's own Quit handler also shows it in the UI.
+                if let Some(report) =
+                    quit_engine.flush_pending_saves(std::time::Duration::from_secs(2))
+                {
+                    if !report.is_complete() {
+                        log::warn!(
+                            "save queue incomplete at quit: {} saved, {} failed, {} not written, index_error={:?}",
+                            report.saved(),
+                            report.failed(),
+                            report.not_written(),
+                            report.index_error,
+                        );
+                    }
+                }
+                cx.quit();
+            });
             cx.activate(true);
 
             let state = state::init_state(engine.clone(), source.clone(), cx);

@@ -778,7 +778,7 @@ pub(crate) fn analysis(img: &RgbaImage, warn: Option<(u8, u8, bool)>, focus: Opt
 impl AppState {
     /// Adjustments as the viewer should draw them: the crop tool shows the whole frame.
     pub fn display_adjustments(&self) -> AdjustmentSet {
-        let mut adj = super::flattened(self.hover_look.as_ref().unwrap_or(self.adj()));
+        let mut adj = super::flattened(self.preview_state.hover_look.as_ref().unwrap_or(self.adj()));
         if self.cursor == CursorTool::Crop {
             adj.geometry.crop = NormRect::FULL;
         }
@@ -802,37 +802,37 @@ impl AppState {
     pub fn fit_scale(&self) -> f32 {
         let (fw, fh) = self.frame_size();
         let (vw, vh) = self.viewport_inner();
-        (vw * self.scale_factor / fw).min(vh * self.scale_factor / fh)
+        (vw * self.device.scale_factor / fw).min(vh * self.device.scale_factor / fh)
     }
 
     /// Viewport minus the breathing margin around a fitted image, in logical pixels.
     pub fn viewport_inner(&self) -> (f32, f32) {
         let margin = 24.0;
-        ((self.viewport.0 - margin * 2.0).max(32.0), (self.viewport.1 - margin * 2.0).max(32.0))
+        ((self.preview_state.viewport.0 - margin * 2.0).max(32.0), (self.preview_state.viewport.1 - margin * 2.0).max(32.0))
     }
 
     pub fn effective_scale(&self) -> f32 {
-        self.zoom.scale.unwrap_or_else(|| self.fit_scale())
+        self.preview_state.zoom.scale.unwrap_or_else(|| self.fit_scale())
     }
 
     /// The part of the frame visible at the current zoom, normalized.
     pub fn visible_region(&self) -> NormRect {
-        let Some(scale) = self.zoom.scale else { return NormRect::FULL };
+        let Some(scale) = self.preview_state.zoom.scale else { return NormRect::FULL };
         let (fw, fh) = self.frame_size();
-        let w = (self.viewport.0 * self.scale_factor / (scale * fw)).min(1.0);
-        let h = (self.viewport.1 * self.scale_factor / (scale * fh)).min(1.0);
-        let (cx, cy) = self.zoom.center;
+        let w = (self.preview_state.viewport.0 * self.device.scale_factor / (scale * fw)).min(1.0);
+        let h = (self.preview_state.viewport.1 * self.device.scale_factor / (scale * fh)).min(1.0);
+        let (cx, cy) = self.preview_state.zoom.center;
         NormRect { x: (cx - w / 2.0).clamp(0.0, 1.0 - w), y: (cy - h / 2.0).clamp(0.0, 1.0 - h), width: w, height: h }
     }
 
     pub(crate) fn clamp_center(&mut self) {
         let r = self.visible_region();
-        self.zoom.center = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        self.preview_state.zoom.center = (r.x + r.width / 2.0, r.y + r.height / 2.0);
     }
 
     /// The request inputs without consuming a generation.
     fn preview_inputs(&self, quality: RenderQuality, bypass: bool) -> Option<PreviewRequest> {
-        let image = self.current?;
+        let image = self.library.current?;
         let adjustments = self.display_adjustments();
         let mut region = self.visible_region();
         if crate::tools::portrait::has_face_reshape(&adjustments) {
@@ -841,7 +841,7 @@ impl AppState {
         let (fw, fh) = self.frame_size();
         let scale = self.effective_scale();
         let max_size = ((fw * region.width).max(fh * region.height) * scale).clamp(64.0, 8192.0) as u32;
-        let mask_overlay = if self.panels.mask_overlay || self.cursor.is_mask_tool() { self.active_layer } else { None };
+        let mask_overlay = if self.prefs.panels.mask_overlay || self.cursor.is_mask_tool() { self.editor.active_layer } else { None };
         Some(PreviewRequest {
             image,
             adjustments,
@@ -850,11 +850,11 @@ impl AppState {
             quality,
             bypass,
             mask_overlay: mask_overlay.filter(|_| !bypass),
-            generation: self.preview.generation,
-            display_profile: self.settings.display_profile.clone().or_else(|| crate::state::detected_display_profile(self.window_hwnd)),
-            proof_profile: self.view.soft_proof.then(|| self.settings.proof_profile.clone()).flatten(),
-            proof_paper_white: if self.view.soft_proof { self.settings.proof_paper_white } else { 1.0 },
-            proof_black_point: if self.view.soft_proof { self.settings.proof_black_point } else { 0.0 },
+            generation: self.preview_state.preview.generation,
+            display_profile: self.prefs.settings.display_profile.clone().or_else(|| crate::state::detected_display_profile(self.device.display_target())),
+            proof_profile: self.prefs.view.soft_proof.then(|| self.prefs.settings.proof_profile.clone()).flatten(),
+            proof_paper_white: if self.prefs.view.soft_proof { self.prefs.settings.proof_paper_white } else { 1.0 },
+            proof_black_point: if self.prefs.view.soft_proof { self.prefs.settings.proof_black_point } else { 0.0 },
             rendering_intent: None,
             black_point_compensation: false,
         })
@@ -862,38 +862,38 @@ impl AppState {
 
     fn preview_request(&mut self, quality: RenderQuality, bypass: bool) -> Option<PreviewRequest> {
         let request = self.preview_inputs(quality, bypass)?;
-        self.preview.generation += 1;
-        Some(PreviewRequest { generation: self.preview.generation, ..request })
+        self.preview_state.preview.generation += 1;
+        Some(PreviewRequest { generation: self.preview_state.preview.generation, ..request })
     }
 
     fn warning_settings(&self) -> Option<(u8, u8, bool)> {
-        self.view
+        self.prefs.view
             .exposure_warning
-            .then_some((self.settings.warn_high, self.settings.warn_low, self.settings.warn_shadows))
+            .then_some((self.prefs.settings.warn_high, self.prefs.settings.warn_low, self.prefs.settings.warn_shadows))
     }
 
     fn focus_threshold(&self) -> Option<f32> {
-        self.view.focus_mask.then_some(self.settings.focus_threshold)
+        self.prefs.view.focus_mask.then_some(self.prefs.settings.focus_threshold)
     }
 
     /// Handles a request whose engine inputs match the shown frame: toggling
     /// the exposure warning or focus mask, or changing their thresholds, only
     /// rebuilds those overlays. Returns true when no render is needed.
     fn refresh_overlays_if_unchanged(&mut self, request: &PreviewRequest, cx: &mut Context<Self>) -> bool {
-        if self.preview.error.is_some() || self.view.compare != super::CompareMode::Off {
+        if self.preview_state.preview.error.is_some() || self.prefs.view.compare != super::CompareMode::Off {
             return false;
         }
         // Scopes are drawn with the frame; a scope toggle needs a normal render.
-        if self.panels.scope_kind != super::ScopeKind::Off || self.preview.last_scope != super::ScopeKind::Off {
+        if self.prefs.panels.scope_kind != super::ScopeKind::Off || self.preview_state.preview.last_scope != super::ScopeKind::Off {
             return false;
         }
-        let Some(shown) = self.preview.last_request.as_ref() else { return false };
+        let Some(shown) = self.preview_state.preview.last_request.as_ref() else { return false };
         if !same_render_inputs(shown, request) {
             return false;
         }
         let warning = self.warning_settings();
         let focus = self.focus_threshold();
-        if (warning, focus) != self.preview.last_overlay {
+        if (warning, focus) != self.preview_state.preview.last_overlay {
             self.rebuild_overlays(warning, focus, cx);
         }
         true
@@ -903,47 +903,47 @@ impl AppState {
     /// (BGRA) order, without asking the engine for the same pixels again.
     fn rebuild_overlays(&mut self, warning: Option<(u8, u8, bool)>, focus: Option<f32>, cx: &mut Context<Self>) {
         let rebuilt = {
-            let Some(frame) = self.preview.frame.as_ref() else { return };
+            let Some(frame) = self.preview_state.preview.frame.as_ref() else { return };
             let size = frame.image.size(0);
             let (w, h) = (size.width.0.max(0) as usize, size.height.0.max(0) as usize);
             let Some(bytes) = frame.image.as_bytes(0) else { return };
             analysis_pixels(bytes, w, h, true, warning, focus)
         };
-        let Some(frame) = self.preview.frame.as_mut() else { return };
+        let Some(frame) = self.preview_state.preview.frame.as_mut() else { return };
         if let Some(old) = std::mem::replace(&mut frame.warning, rebuilt.0) {
             cx.drop_image(old, None);
         }
         if let Some(old) = std::mem::replace(&mut frame.focus, rebuilt.1) {
             cx.drop_image(old, None);
         }
-        self.preview.last_overlay = (warning, focus);
+        self.preview_state.preview.last_overlay = (warning, focus);
         cx.notify();
     }
 
     pub fn request_render(&mut self, quality: RenderQuality, cx: &mut Context<Self>) {
-        self.preview.draft = quality == RenderQuality::Draft;
+        self.preview_state.preview.draft = quality == RenderQuality::Draft;
         self.enqueue_render(quality, std::time::Instant::now(), cx);
     }
 
     fn enqueue_render(&mut self, quality: RenderQuality, requested_at: std::time::Instant, cx: &mut Context<Self>) {
-        self.preview.draft = quality == RenderQuality::Draft;
+        self.preview_state.preview.draft = quality == RenderQuality::Draft;
         // A new drag supersedes an older release's pending final frame.
-        if self.preview.accept_request(quality, requested_at) == PreviewRequested::Coalesced {
+        if self.preview_state.preview.accept_request(quality, requested_at) == PreviewRequested::Coalesced {
             return;
         }
         let Some(mut request) = self.preview_inputs(quality, false) else { return };
         if self.refresh_overlays_if_unchanged(&request, cx) {
             return;
         }
-        self.preview.generation += 1;
-        request.generation = self.preview.generation;
+        self.preview_state.preview.generation += 1;
+        request.generation = self.preview_state.preview.generation;
         let stamp = crate::perf::Stamp::new(request.generation, quality, requested_at);
         let requested_image = request.image;
         let before = (quality == RenderQuality::Final
             && needs_before(
-                self.view.compare != super::CompareMode::Off,
-                self.preview.before_dirty,
-                self.preview.before.as_ref(),
+                self.prefs.view.compare != super::CompareMode::Off,
+                self.preview_state.preview.before_dirty,
+                self.preview_state.preview.before.as_ref(),
                 request.image,
                 &request.adjustments.geometry,
                 request.region,
@@ -951,23 +951,23 @@ impl AppState {
         .then(|| self.preview_request(RenderQuality::Final, true))
         .flatten();
         if before.is_some() {
-            self.preview.before_dirty = false;
+            self.preview_state.preview.before_dirty = false;
         }
         let geometry = request.adjustments.geometry.clone();
         let portrait_applied = !request.bypass && crate::tools::portrait::has_live_portrait_effect(&request.adjustments);
-        self.preview.start_request();
+        self.preview_state.preview.start_request();
         let engine = self.engine.clone();
-        let st = &self.settings;
-        let want_warning = self.view.exposure_warning.then_some((st.warn_high, st.warn_low, st.warn_shadows));
-        let want_focus = self.view.focus_mask.then_some(st.focus_threshold);
-        let want_scope = self.panels.scope_kind;
+        let st = &self.prefs.settings;
+        let want_warning = self.prefs.view.exposure_warning.then_some((st.warn_high, st.warn_low, st.warn_shadows));
+        let want_focus = self.prefs.view.focus_mask.then_some(st.focus_threshold);
+        let want_scope = self.prefs.panels.scope_kind;
         // Recorded with the installed frame so overlay toggles can reuse it.
         let placed_overlay = (want_warning, want_focus);
         let placed_scope = want_scope;
-        let previous = self.preview.frame.as_ref().map(|frame| {
+        let previous = self.preview_state.preview.frame.as_ref().map(|frame| {
             (frame.source_pixels, Arc::clone(&frame.image), frame.image_id)
         });
-        let previous_before = self.preview.before.as_ref().map(|frame| {
+        let previous_before = self.preview_state.preview.before.as_ref().map(|frame| {
             (frame.source_pixels, Arc::clone(&frame.image), frame.image_id)
         });
         cx.spawn(async move |this, cx| {
@@ -1033,15 +1033,15 @@ impl AppState {
             let Ok(render_before) = this.update(cx, |this, cx| {
                 match frame {
                     Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, (warning, focus), scope, region, image_id, request, source_status)) => {
-                        if this.preview.may_install(this.current, image_id, stamp.id) {
-                            this.preview.last_request = Some(request);
-                            this.preview.last_overlay = placed_overlay;
-                            this.preview.last_scope = placed_scope;
-                            if let Some(old) = std::mem::replace(&mut this.preview.scope, scope) {
+                        if this.preview_state.preview.may_install(this.library.current, image_id, stamp.id) {
+                            this.preview_state.preview.last_request = Some(request);
+                            this.preview_state.preview.last_overlay = placed_overlay;
+                            this.preview_state.preview.last_scope = placed_scope;
+                            if let Some(old) = std::mem::replace(&mut this.preview_state.preview.scope, scope) {
                                 cx.drop_image(old, None);
                             }
-                            this.preview.error = None;
-                            this.source_note = source_status.map(|n| {
+                            this.preview_state.preview.error = None;
+                            this.preview_state.source_note = source_status.map(|n| {
                                 log::warn!("source status: {n}");
                                 let summary = match SourceStatusKind::of(&n) {
                                     SourceStatusKind::DecodeFailed => t("RAW decode failed; showing the embedded preview", "RAW 解码失败，显示嵌入预览"),
@@ -1050,7 +1050,7 @@ impl AppState {
                                 };
                                 (image_id, summary.into())
                             });
-                            display_frame(&mut this.preview.frame, &mut this.preview.full_after, Frame {
+                            display_frame(&mut this.preview_state.preview.frame, &mut this.preview_state.preview.full_after, Frame {
                                 image: img,
                                 source_pixels,
                                 region,
@@ -1063,8 +1063,8 @@ impl AppState {
                                 stamp,
                             }, cx);
                             log::debug!("preview: {}×{} in {:.1} ms", width, height, elapsed_ms);
-                            this.preview.histogram = histogram;
-                            this.preview.elapsed_ms = elapsed_ms;
+                            this.preview_state.preview.histogram = histogram;
+                            this.preview_state.preview.elapsed_ms = elapsed_ms;
                         } else {
                             if !reused {
                                 cx.drop_image(img, None);
@@ -1076,14 +1076,14 @@ impl AppState {
                     }
                     Err(err) => {
                         log::error!("preview: render failed: {err}");
-                        if this.current == Some(requested_image) {
-                            this.preview.error = Some((requested_image, err.to_string().into()));
+                        if this.library.current == Some(requested_image) {
+                            this.preview_state.preview.error = Some((requested_image, err.to_string().into()));
                         }
                     }
                 }
-                let render_before = this.preview.wants_before(
-                    this.view.compare != super::CompareMode::Off,
-                    this.current,
+                let render_before = this.preview_state.preview.wants_before(
+                    this.prefs.view.compare != super::CompareMode::Off,
+                    this.library.current,
                     requested_image,
                     before.is_some(),
                 );
@@ -1106,15 +1106,15 @@ impl AppState {
             };
             this.update(cx, |this, cx| {
                 match before {
-                    Some(Ok((img, source_pixels, _, region, image_id, max_size))) if this.preview.wants_before(
-                        this.view.compare != super::CompareMode::Off,
-                        this.current,
+                    Some(Ok((img, source_pixels, _, region, image_id, max_size))) if this.preview_state.preview.wants_before(
+                        this.prefs.view.compare != super::CompareMode::Off,
+                        this.library.current,
                         image_id,
-                        !this.preview.before_dirty,
+                        !this.preview_state.preview.before_dirty,
                     ) && this.preview_inputs(RenderQuality::Final, true).is_some_and(|latest| {
                         latest.region == region && latest.max_size == max_size && latest.adjustments.geometry == geometry
                     }) => {
-                        display_frame(&mut this.preview.before, &mut this.preview.full_before, Frame {
+                        display_frame(&mut this.preview_state.preview.before, &mut this.preview_state.preview.full_before, Frame {
                             image: img,
                             source_pixels,
                             region,
@@ -1128,11 +1128,11 @@ impl AppState {
                         }, cx);
                     }
                     Some(Ok((img, _, false, _, _, _))) => cx.drop_image(img, None),
-                    Some(Err(_)) if this.current == Some(requested_image) => this.preview.before_dirty = true,
+                    Some(Err(_)) if this.library.current == Some(requested_image) => this.preview_state.preview.before_dirty = true,
                     _ => {}
                 }
                 crate::note_first_preview_ready();
-                if let Some((next, requested_at)) = this.preview.finish_request() {
+                if let Some((next, requested_at)) = this.preview_state.preview.finish_request() {
                     this.enqueue_render(next, requested_at, cx);
                 }
                 this.start_queued_thumbs(cx);
@@ -1144,33 +1144,33 @@ impl AppState {
     }
 
     pub fn queue_thumbs(&mut self, ids: Vec<ImageId>, cx: &mut Context<Self>) {
-        self.thumb_queue.push(ids, self.current);
+        self.preview_state.thumb_queue.push(ids, self.library.current);
         self.start_queued_thumbs(cx);
     }
 
     fn start_queued_thumbs(&mut self, cx: &mut Context<Self>) {
-        if !self.preview.thumbs_allowed(self.thumb_task.is_some(), self.thumb_queue.is_empty()) {
+        if !self.preview_state.preview.thumbs_allowed(self.preview_state.thumb_task.is_some(), self.preview_state.thumb_queue.is_empty()) {
             return;
         }
-        let rev = self.thumb_rev;
-        self.thumb_task = Some(cx.spawn(async move |this, cx| {
+        let rev = self.preview_state.thumb_rev;
+        self.preview_state.thumb_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let next = this
                     .update(cx, |this, _| {
-                        if this.thumb_rev != rev || this.preview.in_flight {
+                        if this.preview_state.thumb_rev != rev || this.preview_state.preview.in_flight {
                             return None;
                         }
-                        if this.thumb_queue.is_empty() {
+                        if this.preview_state.thumb_queue.is_empty() {
                             return None;
                         }
-                        if let Some(id) = this.current {
-                            this.thumb_queue.prioritize(id);
+                        if let Some(id) = this.library.current {
+                            this.preview_state.thumb_queue.prioritize(id);
                         }
-                        let id = this.thumb_queue.pop_front()?;
-                        let adj = this.edits.get(&id).map(|e| super::flattened(&e.adj)).unwrap_or_default();
-                        let display = this.settings.display_profile.clone().or_else(|| crate::state::detected_display_profile(this.window_hwnd));
-                        let proof = this.view.soft_proof.then(|| this.settings.proof_profile.clone()).flatten();
-                        let levels = if this.view.soft_proof { (this.settings.proof_paper_white, this.settings.proof_black_point) } else { (1.0, 0.0) };
+                        let id = this.preview_state.thumb_queue.pop_front()?;
+                        let adj = this.editor.edits.get(&id).map(|e| super::flattened(&e.adj)).unwrap_or_default();
+                        let display = this.prefs.settings.display_profile.clone().or_else(|| crate::state::detected_display_profile(this.device.display_target()));
+                        let proof = this.prefs.view.soft_proof.then(|| this.prefs.settings.proof_profile.clone()).flatten();
+                        let levels = if this.prefs.view.soft_proof { (this.prefs.settings.proof_paper_white, this.prefs.settings.proof_black_point) } else { (1.0, 0.0) };
                         Some((id, adj, this.engine.clone(), display, proof, levels))
                     })
                     .ok()
@@ -1180,13 +1180,13 @@ impl AppState {
                     .background_spawn(async move { engine.thumbnail_profiled(id, &adj, 360, display.as_deref(), proof.as_deref(), levels).map(to_render_image) })
                     .await;
                 this.update(cx, |this, cx| {
-                    if this.thumb_rev != rev {
+                    if this.preview_state.thumb_rev != rev {
                         return;
                     }
                     match result {
                         Ok(img) => {
                             this.thumb_failed.remove(&id);
-                            if let Some(old) = this.thumbs.insert(id, img) {
+                            if let Some(old) = this.preview_state.thumbs.insert(id, img) {
                                 cx.drop_image(old, None);
                             }
                         }
@@ -1200,8 +1200,8 @@ impl AppState {
                 .ok();
             }
             this.update(cx, |this, cx| {
-                if this.thumb_rev == rev {
-                    this.thumb_task = None;
+                if this.preview_state.thumb_rev == rev {
+                    this.preview_state.thumb_task = None;
                     this.start_queued_thumbs(cx);
                 }
             })
@@ -1211,13 +1211,13 @@ impl AppState {
 
     /// Drops cached thumbnails and rebuilds them after a display/profile change.
     pub fn refresh_thumbs(&mut self, cx: &mut Context<Self>) {
-        for (_, img) in self.thumbs.drain() {
+        for (_, img) in self.preview_state.thumbs.drain() {
             cx.drop_image(img, None);
         }
         self.thumb_failed.clear();
-        self.thumb_queue.clear();
-        self.thumb_rev += 1;
-        self.thumb_task = None;
+        self.preview_state.thumb_queue.clear();
+        self.preview_state.thumb_rev += 1;
+        self.preview_state.thumb_task = None;
         let ids = self.visible_images().iter().map(|i| i.id).collect();
         self.queue_thumbs(ids, cx);
     }

@@ -51,8 +51,8 @@ pub fn panel(id: &str, state: &Entity<AppState>, window: &mut Window, cx: &mut A
 /// frame costs nothing extra until someone looks.
 pub(crate) fn scopes_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
-    let kind = s.panels.scope_kind;
-    let image = s.preview.scope.clone().filter(|_| kind != crate::state::ScopeKind::Off);
+    let kind = s.prefs.panels.scope_kind;
+    let image = s.preview_state.preview.scope.clone().filter(|_| kind != crate::state::ScopeKind::Off);
     let p = pal(cx).clone();
     let st = state.clone();
     let index = crate::state::ScopeKind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
@@ -66,7 +66,7 @@ pub(crate) fn scopes_panel(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
                     .text(t("Vector", "矢量"))
                     .on_select(move |i, _, cx| {
                         st.update(cx, |s, cx| {
-                            s.panels.scope_kind = crate::state::ScopeKind::ALL[i];
+                            s.prefs.panels.scope_kind = crate::state::ScopeKind::ALL[i];
                             s.request_render(aurora_engine::RenderQuality::Final, cx);
                             cx.notify();
                         })
@@ -90,14 +90,14 @@ pub(crate) fn scopes_panel(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
 
 pub fn histogram_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
-    let mode = match s.panels.histogram_mode {
+    let mode = match s.prefs.panels.histogram_mode {
         1 => HistogramMode::Luma,
         2 => HistogramMode::Red,
         3 => HistogramMode::Green,
         4 => HistogramMode::Blue,
         _ => HistogramMode::Rgb,
     };
-    let h = s.preview.histogram.clone();
+    let h = s.preview_state.preview.histogram.clone();
     let info = s.current_info().cloned();
     let p = pal(cx).clone();
     let st = state.clone();
@@ -112,7 +112,7 @@ pub fn histogram_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement +
                         .gap_2()
                         .child(
                             div().w(px(150.0)).child(
-                                Segmented::new("hist-mode", s.panels.histogram_mode as usize)
+                                Segmented::new("hist-mode", s.prefs.panels.histogram_mode as usize)
                                     .text("RGB")
                                     .text(t("Luma", "亮度"))
                                     .swatch(hex(0xff4a4a), "R")
@@ -121,7 +121,7 @@ pub fn histogram_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement +
                                     .height(20.0)
                                     .on_select(move |i, _, cx| {
                                         st.update(cx, |s, cx| {
-                                            s.panels.histogram_mode = i as u8;
+                                            s.prefs.panels.histogram_mode = i as u8;
                                             cx.notify();
                                         })
                                     }),
@@ -204,10 +204,10 @@ fn channel_bins(h: &Histogram, c: ToneChannel) -> Vec<f32> {
 
 pub(crate) fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut Window, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
-    let channel = s.panels.levels_channel;
+    let channel = s.prefs.panels.levels_channel;
     let levels = read_scoped_optional(s.adj(), scope, |a| &a.levels, |l| &l.levels);
     let value = levels.channel(channel).clone();
-    let hist = channel_bins(&s.preview.histogram, channel);
+    let hist = channel_bins(&s.preview_state.preview.histogram, channel);
     let (st, st2, st3, st4) = (state.clone(), state.clone(), state.clone(), state.clone());
     let idx = ToneChannel::LEVELS.iter().position(|c| *c == channel).unwrap_or(0);
     ToolPanel::new(state, "levels", t("Levels", "色阶"))
@@ -228,7 +228,7 @@ pub(crate) fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut
                     .swatch(hex(0x5b95ff), t("Blue", "蓝"))
                     .on_select(move |i, _, cx| {
                         st2.update(cx, |s, cx| {
-                            s.panels.levels_channel = ToneChannel::LEVELS[i];
+                            s.prefs.panels.levels_channel = ToneChannel::LEVELS[i];
                             cx.notify();
                         })
                     }),
@@ -239,7 +239,7 @@ pub(crate) fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut
                 .on_change(move |v, _, cx| {
                     st3.update(cx, |s, cx| {
                         let scope = s.scope();
-                        let channel = s.panels.levels_channel;
+                        let channel = s.prefs.panels.levels_channel;
                         s.edit_live(t("Levels", "色阶"), |a| {
                             with_scoped_optional(a, scope, |a| &mut a.levels, |l| &mut l.levels, |lv| *lv.channel_mut(channel) = v)
                         }, cx)
@@ -254,10 +254,10 @@ pub(crate) fn levels_panel(state: &Entity<AppState>, scope: Scope, _window: &mut
 
 pub(crate) fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
-    let channel = s.panels.curve_channel;
+    let channel = s.prefs.panels.curve_channel;
     let curves = read_scoped_optional(s.adj(), scope, |a| &a.curves, |l| &l.curves);
     let curve = curves.channel(channel).clone();
-    let hist = channel_bins(&s.preview.histogram, channel);
+    let hist = channel_bins(&s.preview_state.preview.histogram, channel);
     let idx = ToneChannel::CURVES.iter().position(|c| *c == channel).unwrap_or(0);
     let (st, st2, st3) = (state.clone(), state.clone(), state.clone());
     let p = pal(cx).clone();
@@ -266,7 +266,7 @@ pub(crate) fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> i
         .on_reset(move |_, cx| {
             st.update(cx, |s, cx| {
                 let scope = s.scope();
-                let channel = s.panels.curve_channel;
+                let channel = s.prefs.panels.curve_channel;
                 s.edit(t("Reset curve", "复位曲线"), |a| {
                     with_scoped_optional(a, scope, |a| &mut a.curves, |l| &mut l.curves, |c| *c.channel_mut(channel) = Curve::default())
                 }, cx)
@@ -282,7 +282,7 @@ pub(crate) fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> i
                     .swatch(hex(0x5b95ff), t("Blue", "蓝"))
                     .on_select(move |i, _, cx| {
                         st2.update(cx, |s, cx| {
-                            s.panels.curve_channel = ToneChannel::CURVES[i];
+                            s.prefs.panels.curve_channel = ToneChannel::CURVES[i];
                             cx.notify();
                         })
                     }),
@@ -295,7 +295,7 @@ pub(crate) fn curve_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> i
                     .on_change(move |c, _, cx| {
                         st3.update(cx, |s, cx| {
                             let scope = s.scope();
-                            let channel = s.panels.curve_channel;
+                            let channel = s.prefs.panels.curve_channel;
                             s.edit_live(t("Curve", "曲线"), |a| {
                                 with_scoped_optional(a, scope, |a| &mut a.curves, |l| &mut l.curves, |cv| *cv.channel_mut(channel) = c)
                             }, cx)

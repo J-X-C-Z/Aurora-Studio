@@ -179,18 +179,34 @@ mod tests {
     use crate::kernels::radiance::{self, MaskPlanes};
 
     fn assets() -> FixedAssets<'static> {
-        fn floats(bytes: &'static [u8]) -> &'static [f32] {
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) }
+        use std::sync::OnceLock;
+
+        /// `include_bytes!` has alignment 1, so casting its pointer to `f32` is
+        /// undefined behaviour (and aborts under the alignment check on
+        /// aarch64). Decode into an aligned, cached buffer instead; the assets
+        /// are native-endian `f32` arrays.
+        fn floats(bytes: &'static [u8], slot: &'static OnceLock<Vec<f32>>) -> &'static [f32] {
+            slot.get_or_init(|| {
+                bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()
+            })
         }
+
+        static GAMMA: OnceLock<Vec<f32>> = OnceLock::new();
+        static MATRICES: OnceLock<Vec<f32>> = OnceLock::new();
         FixedAssets {
             lut_a: include_bytes!("../../../assets/portrait/radiance/native-lut-a.bin"),
             lut_b: include_bytes!("../../../assets/portrait/radiance/native-lut-b.bin"),
-            gamma: floats(include_bytes!(
-                "../../../assets/portrait/radiance/native-gamma-rgba32f.bin"
-            )),
-            matrices: floats(include_bytes!(
-                "../../../assets/portrait/radiance/native-color-matrices.bin"
-            )),
+            gamma: floats(
+                include_bytes!("../../../assets/portrait/radiance/native-gamma-rgba32f.bin"),
+                &GAMMA,
+            ),
+            matrices: floats(
+                include_bytes!("../../../assets/portrait/radiance/native-color-matrices.bin"),
+                &MATRICES,
+            ),
         }
     }
 

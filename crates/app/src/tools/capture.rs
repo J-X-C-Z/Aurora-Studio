@@ -28,14 +28,14 @@ fn camera_panel(state: &Entity<AppState>, cx: &App) -> AnyElement {
     let s = state.read(cx);
     let p = pal(cx).clone();
     // No platform backend: neither probing nor "check again" can help.
-    if !s.capabilities.tether {
+    if !s.prefs.capabilities.tether {
         return ToolPanel::new(state, "camera", t("Camera", "相机"))
             .status(crate::contract::TETHER)
             .child(v_flex().px_3().gap_2().child(div().text_xs().text_color(p.text_muted).child(s.tether_note())))
             .into_any_element();
     }
     let capturing = s.capturing;
-    let probing = s.tether_probing;
+    let probing = s.device.tether_probing;
     let st = state.clone();
     let recheck = {
         let st = state.clone();
@@ -44,7 +44,7 @@ fn camera_panel(state: &Entity<AppState>, cx: &App) -> AnyElement {
             Button::new(id).outline().small().loading(probing).icon(Icon::new(IconName::RefreshCw)).label(t("Check again", "重新检测")).on_click(move |_, _, cx| st.update(cx, |s, cx| s.probe_tether(cx)))
         }
     };
-    let body: AnyElement = match (s.tether.clone(), s.camera.clone()) {
+    let body: AnyElement = match (s.device.tether.clone(), s.device.camera.clone()) {
         (Some(TetherStatus::Available { lib_version }), camera) => {
             // libgphoto2 opened a camera; model, battery and card come from
             // `camera_status` only when the engine reads them.
@@ -118,7 +118,7 @@ fn camera_panel(state: &Entity<AppState>, cx: &App) -> AnyElement {
 fn settings_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let settings = s.camera_settings.clone().filter(|_| s.camera_ready());
+    let settings = s.device.camera_settings.clone().filter(|_| s.camera_ready());
     let tile = |label: &'static str, value: String| {
         v_flex()
             .flex_1()
@@ -153,17 +153,17 @@ fn sample_name(format: &str, counter: u32) -> String {
 fn naming_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let pr = s.panels.clone();
+    let pr = s.prefs.panels.clone();
     let (st, st2, st3) = (state.clone(), state.clone(), state.clone());
     let format_field = text_field("cap-format", pr.capture_format.clone(), "[Job]_[Counter]", move |v, _, cx| {
         st.update(cx, |s, cx| {
-            s.panels.capture_format = v;
+            s.prefs.panels.capture_format = v;
             cx.notify();
         })
     }, window, cx);
     let folder_field = text_field("cap-folder", pr.capture_folder.clone(), "Capture", move |v, _, cx| {
         st2.update(cx, |s, cx| {
-            s.panels.capture_folder = v;
+            s.prefs.panels.capture_folder = v;
             cx.notify();
         })
     }, window, cx);
@@ -175,7 +175,7 @@ fn naming_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
             let tok = *tok;
             Button::new(SharedString::from(format!("tok-{tok}"))).xsmall().ghost().label(tok).on_click(move |_, _, cx| {
                 st.update(cx, |s, cx| {
-                    s.panels.capture_format.push_str(tok);
+                    s.prefs.panels.capture_format.push_str(tok);
                     cx.notify();
                 })
             })
@@ -186,7 +186,7 @@ fn naming_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
                 let st = state.clone();
                 move |v, _, cx| {
                     st.update(cx, |s, cx| {
-                        s.panels.capture_counter = v.round() as u32;
+                        s.prefs.panels.capture_counter = v.round() as u32;
                         cx.notify();
                     })
                 }
@@ -198,7 +198,7 @@ fn naming_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> 
 
 fn adjust_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
-    let mode = s.panels.capture_adjust;
+    let mode = s.prefs.panels.capture_adjust;
     let st = state.clone();
     ToolPanel::new(state, "capture-adjust", t("Next Capture Adjustments", "下次拍摄调整")).child(
         div().px_3().child(
@@ -208,7 +208,7 @@ fn adjust_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
                 .text(t("Style", "风格"))
                 .on_select(move |i, _, cx| {
                     st.update(cx, |s, cx| {
-                        s.panels.capture_adjust = i as u8;
+                        s.prefs.panels.capture_adjust = i as u8;
                         cx.notify();
                     })
                 }),

@@ -1,5 +1,23 @@
+//! HEIF/HEIC decoding through a runtime-loaded `libheif`.
+//!
+//! The loader is platform-neutral. Windows resolves `libheif.dll` with
+//! `LoadLibraryW`/`GetProcAddress` and links `kernel32`; POSIX/macOS finds a
+//! Homebrew or system dylib and loads it with `dlopen`/`dlsym`. The decode,
+//! EXIF/XMP and auxiliary-image paths are identical on both.
+//!
+//! When no library can be loaded the reader returns an explicit error instead
+//! of a silent failure, so callers can distinguish a missing `libheif` from a
+//! malformed HEIC.
+//!
+//! The full auxiliary-image surface (components, thumbnails, depth) is kept
+//! compiled on every platform; some of it is only exercised by tests or by
+//! Windows-only call sites, so unused-item warnings are not useful here.
+#![allow(dead_code)]
+
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -67,6 +85,123 @@ const PLANE_INTERLEAVED: c_int = 10;
 #[repr(C)]
 struct Hmodule(*mut c_void);
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryW(filename: *const u16) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn FreeLibrary(module: *mut c_void) -> c_int;
+}
+
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
+    fn dlsym(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
+    fn dlclose(module: *mut c_void) -> c_int;
+}
+
+/// Resolve every symbol before returning, so a partially usable library is
+/// rejected at load time instead of at the first decode call.
+#[cfg(not(windows))]
+const RTLD_NOW: c_int = 2;
+
+/// Typed failure returned when no candidate `libheif` library can be opened.
+///
+/// It is a real error type rather than a bare string so callers can tell a
+/// missing library apart from a malformed HEIC file.
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct LibraryNotFound {
+    candidates: Vec<PathBuf>,
+}
+
+#[cfg(not(windows))]
+impl std::fmt::Display for LibraryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "libheif library not found; searched: ")?;
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", candidate.display())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+impl std::error::Error for LibraryNotFound {}
+
+#[cfg(windows)]
+unsafe fn open_library(path: &Path) -> Result<*mut c_void> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+    if module.is_null() {
+        bail!("failed to load {}", path.display());
+    }
+    Ok(module)
+}
+
+#[cfg(not(windows))]
+unsafe fn open_library(path: &Path) -> Result<*mut c_void> {
+    let name = CString::new(path.as_os_str().to_string_lossy().as_bytes())?;
+    let module = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
+    if module.is_null() {
+        bail!("failed to load {}: {}", path.display(), dl_error());
+    }
+    Ok(module)
+}
+
+/// Message for the most recent failed `dlopen`/`dlsym`, consumed with the call.
+#[cfg(not(windows))]
+fn dl_error() -> String {
+    let error = unsafe { dlerror() };
+    if error.is_null() {
+        "unknown dynamic-loader error".to_string()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+#[cfg(windows)]
+unsafe fn library_symbol(module: *mut c_void, name: &str) -> Result<*mut c_void> {
+    let symbol = CString::new(name)?;
+    let address = unsafe { GetProcAddress(module, symbol.as_ptr().cast()) };
+    if address.is_null() {
+        bail!("libheif.dll 缺少导出 {name}");
+    }
+    Ok(address)
+}
+
+#[cfg(not(windows))]
+unsafe fn library_symbol(module: *mut c_void, name: &str) -> Result<*mut c_void> {
+    let symbol = CString::new(name)?;
+    let address = unsafe { dlsym(module, symbol.as_ptr()) };
+    if address.is_null() {
+        bail!("missing export {name}: {}", dl_error());
+    }
+    Ok(address)
+}
+
+#[cfg(windows)]
+unsafe fn close_library(module: *mut c_void) {
+    unsafe { FreeLibrary(module) };
+}
+
+#[cfg(not(windows))]
+unsafe fn close_library(module: *mut c_void) {
+    unsafe { dlclose(module) };
+}
+
 struct Dll {
     module: Hmodule,
     context_alloc: ContextAllocFn,
@@ -102,125 +237,153 @@ unsafe impl Sync for Dll {}
 
 impl Drop for Dll {
     fn drop(&mut self) {
-        unsafe {
-            #[link(name = "kernel32")]
-            unsafe extern "system" {
-                fn FreeLibrary(module: *mut c_void) -> c_int;
-            }
-            drop(FreeLibrary(self.module.0));
-        }
+        unsafe { close_library(self.module.0) };
     }
 }
 
 impl Dll {
+    /// Windows keeps its existing `LoadLibraryW("libheif.dll")` search: the
+    /// DLL directory/PATH order is what callers already depend on.
+    #[cfg(windows)]
     fn load() -> Result<Self> {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn LoadLibraryW(filename: *const u16) -> *mut c_void;
-            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-        }
-        unsafe {
-            let name: Vec<u16> = "libheif.dll\0".encode_utf16().collect();
-            let module = LoadLibraryW(name.as_ptr());
-            if module.is_null() {
-                bail!("libheif.dll 未找到或加载失败；请将 libheif.dll 及其依赖加入 PATH");
+        let module = match unsafe { open_library(Path::new("libheif.dll")) } {
+            Ok(module) => module,
+            Err(_) => {
+                bail!("libheif.dll 未找到或加载失败；请将 libheif.dll 及其依赖加入 PATH")
             }
-            macro_rules! symbol {
-                ($name:literal, $ty:ty) => {{
-                    let address = GetProcAddress(
-                        module,
-                        concat!($name, "\0").as_ptr(),
-                    );
-                    if address.is_null() {
-                        bail!("libheif.dll 缺少导出 {}", $name);
-                    }
-                    std::mem::transmute::<*mut c_void, $ty>(address)
-                }};
+        };
+        match unsafe { Self::from_handle(module) } {
+            Ok(dll) => Ok(dll),
+            Err(error) => {
+                unsafe { close_library(module) };
+                Err(error)
             }
-            Ok(Self {
-                context_alloc: symbol!("heif_context_alloc", ContextAllocFn),
-                context_free: symbol!("heif_context_free", ContextFreeFn),
-                read_from_file: symbol!("heif_context_read_from_file", ReadFileFn),
-                primary_handle: symbol!(
-                    "heif_context_get_primary_image_handle",
-                    PrimaryHandleFn
-                ),
-                release_handle: symbol!("heif_image_handle_release", ReleaseHandleFn),
-                handle_width: symbol!(
-                    "heif_image_handle_get_width",
-                    HandleSizeFn
-                ),
-                handle_height: symbol!(
-                    "heif_image_handle_get_height",
-                    HandleSizeFn
-                ),
-                bits_per_pixel: symbol!(
-                    "heif_image_handle_get_luma_bits_per_pixel",
-                    BitsFn
-                ),
-                get_image_width: symbol!(
-                    "heif_image_get_width",
-                    GetImageSizeFn
-                ),
-                get_image_height: symbol!(
-                    "heif_image_get_height",
-                    GetImageSizeFn
-                ),
-                decode: symbol!("heif_decode_image", DecodeFn),
-                release_image: symbol!("heif_image_release", ReleaseImageFn),
-                get_plane: symbol!("heif_image_get_plane_readonly", GetPlaneFn),
-                metadata_count: symbol!(
-                    "heif_image_handle_get_number_of_metadata_blocks",
-                    MetadataCountFn
-                ),
-                metadata_ids: symbol!(
-                    "heif_image_handle_get_list_of_metadata_block_IDs",
-                    MetadataIdsFn
-                ),
-                metadata_size: symbol!(
-                    "heif_image_handle_get_metadata_size",
-                    MetadataSizeFn
-                ),
-                metadata_get: symbol!("heif_image_handle_get_metadata", MetadataFn),
-                metadata_content_type: symbol!(
-                    "heif_image_handle_get_metadata_content_type",
-                    MetadataContentTypeFn
-                ),
-                thumbnail_count: symbol!(
-                    "heif_image_handle_get_number_of_thumbnails",
-                    AuxCountFn
-                ),
-                thumbnail_ids: symbol!(
-                    "heif_image_handle_get_list_of_thumbnail_IDs",
-                    AuxIdsFn
-                ),
-                thumbnail_handle: symbol!(
-                    "heif_image_handle_get_thumbnail",
-                    ThumbnailHandleFn
-                ),
-                depth_count: symbol!(
-                    "heif_image_handle_get_number_of_depth_images",
-                    AuxCountFn
-                ),
-                depth_ids: symbol!(
-                    "heif_image_handle_get_list_of_depth_image_IDs",
-                    AuxIdsFn
-                ),
-                depth_handle: symbol!(
-                    "heif_image_handle_get_depth_image_handle",
-                    DepthHandleFn
-                ),
-                depth_info: symbol!(
-                    "heif_image_handle_get_depth_image_representation_info",
-                    DepthInfoFn
-                ),
-                depth_info_free: symbol!(
-                    "heif_depth_representation_info_free",
-                    DepthInfoFreeFn
-                ),
-                module: Hmodule(module),
-            })
         }
+    }
+
+    /// `AURORA_HEIF_LIB` is authoritative when set, matching the writer: a
+    /// stale override must fail loudly instead of silently selecting another
+    /// library. Each candidate must exist on disk before `dlopen`, and the
+    /// typed error lists everything that was searched.
+    #[cfg(not(windows))]
+    fn load() -> Result<Self> {
+        let override_path = std::env::var_os("AURORA_HEIF_LIB").map(PathBuf::from);
+        let candidates = crate::heif_write::candidate_paths(override_path.as_deref());
+        let mut refused = Vec::new();
+        for candidate in &candidates {
+            if !candidate.is_file() {
+                refused.push(format!("{}: not found", candidate.display()));
+                continue;
+            }
+            let module = match unsafe { open_library(candidate) } {
+                Ok(module) => module,
+                Err(error) => {
+                    refused.push(error.to_string());
+                    continue;
+                }
+            };
+            match unsafe { Self::from_handle(module) } {
+                Ok(dll) => return Ok(dll),
+                Err(error) => {
+                    unsafe { close_library(module) };
+                    refused.push(format!("{}: {error}", candidate.display()));
+                }
+            }
+        }
+        log::debug!("libheif candidates exhausted: {}", refused.join("; "));
+        Err(anyhow::Error::new(LibraryNotFound { candidates }))
+    }
+
+    unsafe fn from_handle(module: *mut c_void) -> Result<Self> {
+        macro_rules! symbol {
+            ($name:literal, $ty:ty) => {{
+                let address = unsafe { library_symbol(module, $name)? };
+                unsafe { std::mem::transmute::<*mut c_void, $ty>(address) }
+            }};
+        }
+        Ok(Self {
+            context_alloc: symbol!("heif_context_alloc", ContextAllocFn),
+            context_free: symbol!("heif_context_free", ContextFreeFn),
+            read_from_file: symbol!("heif_context_read_from_file", ReadFileFn),
+            primary_handle: symbol!(
+                "heif_context_get_primary_image_handle",
+                PrimaryHandleFn
+            ),
+            release_handle: symbol!("heif_image_handle_release", ReleaseHandleFn),
+            handle_width: symbol!(
+                "heif_image_handle_get_width",
+                HandleSizeFn
+            ),
+            handle_height: symbol!(
+                "heif_image_handle_get_height",
+                HandleSizeFn
+            ),
+            bits_per_pixel: symbol!(
+                "heif_image_handle_get_luma_bits_per_pixel",
+                BitsFn
+            ),
+            get_image_width: symbol!(
+                "heif_image_get_width",
+                GetImageSizeFn
+            ),
+            get_image_height: symbol!(
+                "heif_image_get_height",
+                GetImageSizeFn
+            ),
+            decode: symbol!("heif_decode_image", DecodeFn),
+            release_image: symbol!("heif_image_release", ReleaseImageFn),
+            get_plane: symbol!("heif_image_get_plane_readonly", GetPlaneFn),
+            metadata_count: symbol!(
+                "heif_image_handle_get_number_of_metadata_blocks",
+                MetadataCountFn
+            ),
+            metadata_ids: symbol!(
+                "heif_image_handle_get_list_of_metadata_block_IDs",
+                MetadataIdsFn
+            ),
+            metadata_size: symbol!(
+                "heif_image_handle_get_metadata_size",
+                MetadataSizeFn
+            ),
+            metadata_get: symbol!("heif_image_handle_get_metadata", MetadataFn),
+            metadata_content_type: symbol!(
+                "heif_image_handle_get_metadata_content_type",
+                MetadataContentTypeFn
+            ),
+            thumbnail_count: symbol!(
+                "heif_image_handle_get_number_of_thumbnails",
+                AuxCountFn
+            ),
+            thumbnail_ids: symbol!(
+                "heif_image_handle_get_list_of_thumbnail_IDs",
+                AuxIdsFn
+            ),
+            thumbnail_handle: symbol!(
+                "heif_image_handle_get_thumbnail",
+                ThumbnailHandleFn
+            ),
+            depth_count: symbol!(
+                "heif_image_handle_get_number_of_depth_images",
+                AuxCountFn
+            ),
+            depth_ids: symbol!(
+                "heif_image_handle_get_list_of_depth_image_IDs",
+                AuxIdsFn
+            ),
+            depth_handle: symbol!(
+                "heif_image_handle_get_depth_image_handle",
+                DepthHandleFn
+            ),
+            depth_info: symbol!(
+                "heif_image_handle_get_depth_image_representation_info",
+                DepthInfoFn
+            ),
+            depth_info_free: symbol!(
+                "heif_depth_representation_info_free",
+                DepthInfoFreeFn
+            ),
+            module: Hmodule(module),
+        })
     }
 }
 
@@ -657,6 +820,7 @@ impl Drop for ImageGuard<'_> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn missing_dll_returns_clear_error() {
         #[link(name = "kernel32")]
@@ -683,6 +847,31 @@ mod tests {
         }
         let error = result.unwrap_err().to_string();
         assert!(error.contains("libheif.dll") || error.contains("libheif"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn missing_override_reports_typed_error_with_candidates() {
+        let previous = std::env::var_os("AURORA_HEIF_LIB");
+        let missing = std::env::temp_dir().join(format!(
+            "aurora-missing-libheif-{}.dylib",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        unsafe { std::env::set_var("AURORA_HEIF_LIB", &missing) };
+        let result = dimensions(Path::new("missing.heic"));
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AURORA_HEIF_LIB", value) },
+            None => unsafe { std::env::remove_var("AURORA_HEIF_LIB") },
+        }
+        let error = result.expect_err("a missing override must be reported, not panic");
+        let typed = error
+            .downcast_ref::<LibraryNotFound>()
+            .expect("the missing library error must keep its type");
+        assert_eq!(typed.candidates, vec![missing.clone()]);
+        let text = error.to_string();
+        assert!(text.contains("libheif library not found"), "{text}");
+        assert!(text.contains(missing.to_str().unwrap()), "{text}");
     }
 
     #[test]

@@ -162,7 +162,7 @@ impl Viewer {
         let f = self.placement.to_frame(v);
         let (cursor, compare, split, zoomed) = {
             let s = self.state.read(cx);
-            (s.cursor, s.view.compare, s.view.split, s.zoom.scale.is_some())
+            (s.cursor, s.prefs.view.compare, s.prefs.view.split, s.preview_state.zoom.scale.is_some())
         };
         // While a Speed Edit key is held, dragging adjusts its parameter.
         if let Some(param) = self.state.read(cx).speed.as_ref().map(|s| s.param) {
@@ -183,7 +183,7 @@ impl Viewer {
         match cursor {
             CursorTool::Select | CursorTool::Pan => {
                 if zoomed || cursor == CursorTool::Pan {
-                    let center = state.read(cx).zoom.center;
+                    let center = state.read(cx).preview_state.zoom.center;
                     self.drag = Some(Drag::Pan { start: v, center });
                 }
             }
@@ -205,22 +205,22 @@ impl Viewer {
             }
             CursorTool::Spot => {
                 let at = self.to_image(f, cx);
-                let clone = state.read(cx).panels.spot_clone;
+                let clone = state.read(cx).prefs.panels.spot_clone;
                 if clone {
-                    let pending = state.read(cx).spot_anchor;
+                    let pending = state.read(cx).editor.spot_anchor;
                     state.update(cx, |s, cx| {
-                        let size = s.panels.brush_size;
-                        let Some(id) = s.current else { return };
+                        let size = s.prefs.panels.brush_size;
+                        let Some(id) = s.library.current else { return };
                         let src = pending.filter(|(a, _)| *a == id).map(|(_, p)| p);
                         let Some(src) = src else {
-                            s.spot_anchor = Some((id, at));
+                            s.editor.spot_anchor = Some((id, at));
                             cx.notify();
                             return;
                         };
                         let geo = s.adj().geometry.clone();
                         let source = s.current_info().map(|i| (i.width, i.height)).unwrap_or((0, 0));
                         let offset = crate::state::clone_offset(src, at, &geo, source);
-                        s.spot_anchor = None;
+                        s.editor.spot_anchor = None;
                         s.edit(t("Clone", "仿制"), |a| {
                             let spot = a.spots.iter().map(|s| s.id).max().unwrap_or(0) + 1;
                             a.spots.push(Spot { id: spot, kind: SpotKind::Clone { src_offset: offset }, x: at[0], y: at[1], radius: size * 0.5 });
@@ -229,7 +229,7 @@ impl Viewer {
                     return;
                 }
                 state.update(cx, |s, cx| {
-                    let size = s.panels.brush_size;
+                    let size = s.prefs.panels.brush_size;
                     s.edit(t("Spot removal", "污点去除"), |a| {
                         let id = a.spots.iter().map(|s| s.id).max().unwrap_or(0) + 1;
                         a.spots.push(Spot { id, kind: SpotKind::Spot, x: at[0], y: at[1], radius: size * 0.5 });
@@ -241,7 +241,7 @@ impl Viewer {
                 let erase = cursor == CursorTool::Eraser;
                 state.update(cx, |s, cx| {
                     let Scope::Layer(id) = s.scope() else { return };
-                    let pr = s.panels.clone();
+                    let pr = s.prefs.panels.clone();
                     s.edit_layer(t("Brush", "画笔"), id, true, |l| {
                         crate::state::add_shape(&mut l.mask, MaskShape::Brush(BrushStroke {
                             op: if erase { MaskOp::Subtract } else { MaskOp::Add },
@@ -288,19 +288,19 @@ impl Viewer {
             CursorTool::ColorPicker => {
                 let at = [f.0, f.1];
                 state.update(cx, |s, cx| {
-                    let Some(id) = s.current else { return };
+                    let Some(id) = s.library.current else { return };
                     let frame = if compare == CompareMode::Split && v.0 < split * self.placement.vw {
-                        s.preview.before.as_ref().filter(|frame| frame.image_id == id)
-                    } else { None }.or_else(|| s.preview.frame.as_ref().filter(|frame| frame.image_id == id));
+                        s.preview_state.preview.before.as_ref().filter(|frame| frame.image_id == id)
+                    } else { None }.or_else(|| s.preview_state.preview.frame.as_ref().filter(|frame| frame.image_id == id));
                     // Color Editor ranges need the engine's working color, not monitor codes.
-                    if !s.panels.pick_to_range {
+                    if !s.prefs.panels.pick_to_range {
                         if let Some(frame) = frame {
                             let size = frame.image.size(0);
                             if let Some(color) = frame.image.as_bytes(0).and_then(|bytes| {
                                 pick_rendered_color(bytes, (size.width.0 as usize, size.height.0 as usize), frame.region, at)
                             }) {
-                                s.sampled_color = Some(color);
-                                s.picker_point = Some(at);
+                                s.preview_state.sampled_color = Some(color);
+                                s.preview_state.picker_point = Some(at);
                                 cx.notify();
                             }
                         }
@@ -309,9 +309,9 @@ impl Viewer {
                     let adj = crate::state::flattened(s.adj());
                     match s.engine.sample_color(id, &adj, at) {
                         Ok(c) => {
-                            s.sampled_color = Some(c);
-                            s.picker_point = Some(at);
-                            if s.panels.pick_to_range {
+                            s.preview_state.sampled_color = Some(c);
+                            s.preview_state.picker_point = Some(at);
+                            if s.prefs.panels.pick_to_range {
                                 s.range_from_sample(c, cx);
                             }
                         }
@@ -323,7 +323,7 @@ impl Viewer {
             CursorTool::WhiteBalance => {
                 let at = self.to_image(f, cx);
                 state.update(cx, |s, cx| {
-                    let Some(id) = s.current else { return };
+                    let Some(id) = s.library.current else { return };
                     match s.engine.pick_white_balance(id, at) {
                         Ok((k, tint)) => s.edit(t("Pick white balance", "白平衡取样"), |a| {
                             a.white_balance.mode = WhiteBalanceMode::Custom;
@@ -344,8 +344,8 @@ impl Viewer {
             }
             CursorTool::Annotate => {
                 state.update(cx, |s, cx| {
-                    if let Some(id) = s.current {
-                        s.annotations.entry(id).or_default().push(vec![f]);
+                    if let Some(id) = s.library.current {
+                        s.library.annotations.entry(id).or_default().push(vec![f]);
                         cx.notify();
                     }
                 });
@@ -375,14 +375,14 @@ impl Viewer {
                 let dx = -(v.0 - start.0) / (pl.fw * pl.s);
                 let dy = -(v.1 - start.1) / (pl.fh * pl.s);
                 state.update(cx, |s, cx| {
-                    let delta = (center.0 + dx - s.zoom.center.0, center.1 + dy - s.zoom.center.1);
+                    let delta = (center.0 + dx - s.preview_state.zoom.center.0, center.1 + dy - s.preview_state.zoom.center.1);
                     s.pan_by(delta.0, delta.1, cx)
                 });
             }
             Drag::Split => {
                 let x = (v.0 / self.placement.vw).clamp(0.02, 0.98);
                 state.update(cx, |s, cx| {
-                    s.view.split = x;
+                    s.prefs.view.split = x;
                     cx.notify();
                 });
             }
@@ -444,8 +444,8 @@ impl Viewer {
             }
             Drag::Annotate => {
                 state.update(cx, |s, cx| {
-                    if let Some(id) = s.current
-                        && let Some(stroke) = s.annotations.entry(id).or_default().last_mut()
+                    if let Some(id) = s.library.current
+                        && let Some(stroke) = s.library.annotations.entry(id).or_default().last_mut()
                     {
                         stroke.push(f);
                         cx.notify();
@@ -494,10 +494,10 @@ impl Viewer {
 
     fn toggle_zoom(&mut self, f: (f32, f32), cx: &mut Context<Self>) {
         self.state.update(cx, |s, cx| {
-            if s.zoom.scale.is_some() {
+            if s.preview_state.zoom.scale.is_some() {
                 s.set_zoom(None, None, cx)
             } else {
-                let sf = s.scale_factor;
+                let sf = s.device.scale_factor;
                 s.set_zoom(Some(sf), Some(f), cx)
             }
         });
@@ -513,7 +513,7 @@ impl Viewer {
                 s.set_zoom(None, None, cx)
             } else {
                 let k = current / next;
-                let c = if s.zoom.scale.is_none() { (0.5, 0.5) } else { s.zoom.center };
+                let c = if s.preview_state.zoom.scale.is_none() { (0.5, 0.5) } else { s.preview_state.zoom.center };
                 s.set_zoom(Some(next), Some((f.0 + (c.0 - f.0) * k, f.1 + (c.1 - f.1) * k)), cx)
             }
         });
@@ -547,7 +547,7 @@ impl Viewer {
             self.zoom_about(pl.to_frame(v), (1.0 + delta.1 / 400.0).clamp(0.5, 2.0), cx);
         } else {
             self.state.update(cx, |s, cx| {
-                if s.zoom.scale.is_some() {
+                if s.preview_state.zoom.scale.is_some() {
                     s.pan_by(-delta.0 / (pl.fw * pl.s), -delta.1 / (pl.fh * pl.s), cx);
                 }
             });
@@ -570,8 +570,8 @@ fn overlay_controls(state: &Entity<AppState>, opacity: f32, p: &crate::theme::Pa
             .hover(|d| d.bg(hexa(0xffffff, 0.12)))
             .on_click(move |_, _, cx| {
                 st.update(cx, |s, cx| {
-                    s.settings.overlay_opacity = v;
-                    s.settings.save();
+                    s.prefs.settings.overlay_opacity = v;
+                    s.prefs.settings.save();
                     cx.notify();
                 })
             })
@@ -611,7 +611,7 @@ fn overlay_controls(state: &Entity<AppState>, opacity: f32, p: &crate::theme::Pa
                     .child(Icon::new(IconName::X).xsmall())
                     .on_click(move |_, _, cx| {
                         st_hide.update(cx, |s, cx| {
-                            s.view.overlay = false;
+                            s.prefs.view.overlay = false;
                             cx.notify();
                         })
                     }),
@@ -624,7 +624,7 @@ impl Render for Viewer {
         let p = pal(cx).clone();
         let s = self.state.read(cx);
         if crate::perf::enabled() {
-            if let Some(frame) = &s.preview.frame {
+            if let Some(frame) = &s.preview_state.preview.frame {
                 if frame.stamp.id != self.last_frame {
                     self.last_frame = frame.stamp.id;
                     let stamp = frame.stamp;
@@ -636,7 +636,7 @@ impl Render for Viewer {
                 }
             }
         }
-        let gray = s.view.viewer_gray;
+        let gray = s.prefs.view.viewer_gray;
         // A slideshow or culling shows the image alone on black.
         let showing = self.state.read(cx).presenting();
         let bg = if showing { gpui_kit::black() } else { gpui_kit::hsla(0.0, 0.0, gray, 1.0) };
@@ -653,25 +653,25 @@ impl Render for Viewer {
                 .into_any_element();
         }
         let s = self.state.read(cx);
-        let sf = s.scale_factor.max(0.5);
+        let sf = s.device.scale_factor.max(0.5);
         let (fw, fh) = s.frame_size();
         let target_s = s.effective_scale() / sf;
-        let target_c = if s.zoom.scale.is_none() { (0.5, 0.5) } else { s.zoom.center };
+        let target_c = if s.preview_state.zoom.scale.is_none() { (0.5, 0.5) } else { s.preview_state.zoom.center };
         let panning = matches!(self.drag, Some(Drag::Pan { .. }));
-        let image_key = s.current.map(|i| i.0).unwrap_or(0);
+        let image_key = s.library.current.map(|i| i.0).unwrap_or(0);
         // Springs keyed per image so switching images snaps instead of gliding across.
         let anim_s = motion::follow(motion::key(format!("viewer-{image_key}"), "scale"), target_s, motion::VIEW, !panning, window, cx);
         let anim_cx = motion::follow(motion::key(format!("viewer-{image_key}"), "cx"), target_c.0, motion::VIEW, !panning, window, cx);
         let anim_cy = motion::follow(motion::key(format!("viewer-{image_key}"), "cy"), target_c.1, motion::VIEW, !panning, window, cx);
         // Exposure warning and focus mask fade with their toggles.
         let (warn_on, focus_on) = {
-            let v = &self.state.read(cx).view;
+            let v = &self.state.read(cx).prefs.view;
             (v.exposure_warning, v.focus_mask)
         };
         let warn_t = motion::toggle(motion::key("viewer", "warn"), warn_on, motion::GLIDE, window, cx);
         let focus_t = motion::toggle(motion::key("viewer", "focus"), focus_on, motion::GLIDE, window, cx);
         let s = self.state.read(cx);
-        self.placement = Placement { vw: s.viewport.0, vh: s.viewport.1, s: anim_s, cx: anim_cx, cy: anim_cy, fw, fh };
+        self.placement = Placement { vw: s.preview_state.viewport.0, vh: s.preview_state.viewport.1, s: anim_s, cx: anim_cx, cy: anim_cy, fw, fh };
         let pl = self.placement;
 
         let frame_el = |frame: &crate::state::Frame| {
@@ -690,25 +690,25 @@ impl Render for Viewer {
                 .when_some(frame.focus.clone().filter(|_| focus_t > 0.01), |d, o| d.child(layer(o).opacity(focus_t)))
         };
 
-        let has_image = s.current.is_some();
-        let compare = s.view.compare;
-        let split = s.view.split;
-        let rendering = s.preview.rendering;
-        let render_error = s.preview.error.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, e)| e.clone());
-        let source_note = s.source_note.as_ref().filter(|(id, _)| Some(*id) == s.current).map(|(_, n)| n.clone());
-        let degraded = s.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.current).and_then(|f| f.degraded.clone());
+        let has_image = s.library.current.is_some();
+        let compare = s.prefs.view.compare;
+        let split = s.prefs.view.split;
+        let rendering = s.preview_state.preview.rendering;
+        let render_error = s.preview_state.preview.error.as_ref().filter(|(id, _)| Some(*id) == s.library.current).map(|(_, e)| e.clone());
+        let source_note = s.preview_state.source_note.as_ref().filter(|(id, _)| Some(*id) == s.library.current).map(|(_, n)| n.clone());
+        let degraded = s.preview_state.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.library.current).and_then(|f| f.degraded.clone());
         let source_note = match (source_note, degraded) {
             (Some(note), Some(reason)) => Some(SharedString::from(format!("{note} · {reason}"))),
             (note, None) => note,
             (None, reason) => reason,
         };
         // Soft proofing uses the profile chosen in Preferences.
-        let soft_proof = s.view.soft_proof.then(|| {
-            let profile = s.settings.proof_profile.clone().unwrap_or_else(|| t("No proof profile selected", "未选择打样配置文件").into());
+        let soft_proof = s.prefs.view.soft_proof.then(|| {
+            let profile = s.prefs.settings.proof_profile.clone().unwrap_or_else(|| t("No proof profile selected", "未选择打样配置文件").into());
             (profile, crate::planned::PROOF_READY)
         });
-        let after_frame = s.preview.frame.as_ref().filter(|frame| Some(frame.image_id) == s.current);
-        let before_frame = s.preview.before.as_ref().filter(|before| after_frame.is_some_and(|after| {
+        let after_frame = s.preview_state.preview.frame.as_ref().filter(|frame| Some(frame.image_id) == s.library.current);
+        let before_frame = s.preview_state.preview.before.as_ref().filter(|before| after_frame.is_some_and(|after| {
             before.image_id == after.image_id && before.geometry == after.geometry && before.region == after.region
         }));
         let after = after_frame.map(frame_el);
@@ -720,18 +720,18 @@ impl Render for Viewer {
                 .child(img(frame.image.clone()).absolute().size_full().object_fit(ObjectFit::Fill))
         };
         let matching_backing = |base: &&crate::state::Frame, current: Option<&crate::state::Frame>| {
-            current.is_some_and(|tile| Some(tile.image_id) == s.current
+            current.is_some_and(|tile| Some(tile.image_id) == s.library.current
                 && backing_matches_tile((base.image_id, &base.geometry, base.portrait_applied), (tile.image_id, &tile.geometry, tile.region, tile.portrait_applied)))
         };
-        let after_backing = s.preview.full_after.as_ref().filter(|base| matching_backing(base, after_frame)).map(backing);
-        let before_backing = s.preview.full_before.as_ref().filter(|base| {
+        let after_backing = s.preview_state.preview.full_after.as_ref().filter(|base| matching_backing(base, after_frame)).map(backing);
+        let before_backing = s.preview_state.preview.full_before.as_ref().filter(|base| {
             after_frame.is_some_and(|after| !after.portrait_applied) && matching_backing(base, before_frame)
         }).map(backing);
         let info = s.current_info().cloned();
         let cursor = s.cursor;
-        let show_info = s.view.show_info_overlay && !s.presenting();
+        let show_info = s.prefs.view.show_info_overlay && !s.presenting();
         let annotating = cursor == CursorTool::Annotate;
-        let notes = s.current.and_then(|id| s.annotations.get(&id)).map_or(0, |n| n.len());
+        let notes = s.library.current.and_then(|id| s.library.annotations.get(&id)).map_or(0, |n| n.len());
 
         let this = cx.entity();
         let (e1, e2, e3, e4) = (this.clone(), this.clone(), this.clone(), this.clone());
@@ -739,7 +739,7 @@ impl Render for Viewer {
 
         let cursor_style = match cursor {
             CursorTool::Pan => gpui_kit::CursorStyle::OpenHand,
-            CursorTool::Select if s.zoom.scale.is_some() => gpui_kit::CursorStyle::OpenHand,
+            CursorTool::Select if s.preview_state.zoom.scale.is_some() => gpui_kit::CursorStyle::OpenHand,
             CursorTool::Zoom => gpui_kit::CursorStyle::Arrow,
             CursorTool::Select => gpui_kit::CursorStyle::Arrow,
             _ => gpui_kit::CursorStyle::Crosshair,
@@ -749,7 +749,7 @@ impl Render for Viewer {
         // Composition overlay: a transparent image laid over the frame.
         let (overlay_on, overlay_path, overlay_opacity, showing) = {
             let s = self.state.read(cx);
-            (s.view.overlay && s.settings.overlay_image.is_some(), s.settings.overlay_image.clone(), s.settings.overlay_opacity, s.presenting())
+            (s.prefs.view.overlay && s.prefs.settings.overlay_image.is_some(), s.prefs.settings.overlay_image.clone(), s.prefs.settings.overlay_opacity, s.presenting())
         };
         let overlay_t = motion::toggle(motion::key("viewer", "overlay"), overlay_on && !showing, motion::GLIDE, window, cx);
         let overlay_img = overlay_path.filter(|_| overlay_t > 0.01).map(|path| {
@@ -978,8 +978,8 @@ impl Render for Viewer {
                         .child(format!("{} · {notes} {}", t("Draw notes on the image", "在图像上绘制标注"), t("notes", "条标注")))
                         .child(gpui_kit::component::button::Button::new("notes-clear").xsmall().ghost().label(t("Clear", "清除")).on_click(move |_, _, cx| {
                             st.update(cx, |s, cx| {
-                                if let Some(id) = s.current {
-                                    s.annotations.remove(&id);
+                                if let Some(id) = s.library.current {
+                                    s.library.annotations.remove(&id);
                                 }
                                 cx.notify();
                             })
@@ -1097,13 +1097,13 @@ impl Viewer {
 
     fn loupe(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let s = self.state.read(cx);
-        let on = s.cursor == CursorTool::Loupe && s.current.is_some() && self.hover.is_some();
+        let on = s.cursor == CursorTool::Loupe && s.library.current.is_some() && self.hover.is_some();
         let pl = self.placement;
-        let src = s.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.current).map(|f| {
+        let src = s.preview_state.preview.frame.as_ref().filter(|f| Some(f.image_id) == s.library.current).map(|f| {
             let (l, t) = pl.to_view((f.region.x, f.region.y));
             (f.image.clone(), l, t, f.region.width * pl.fw * pl.s, f.region.height * pl.fh * pl.s)
         });
-        let shown = s.effective_scale() / s.scale_factor.max(0.5);
+        let shown = s.effective_scale() / s.device.scale_factor.max(0.5);
         let open = motion::toggle(motion::key("loupe", "open"), on, motion::FLOW, window, cx);
         let size = motion::value(motion::key("loupe", "size"), if self.loupe_down { 300.0 } else { 200.0 }, motion::FLOW, window, cx);
         let mag = motion::value(motion::key("loupe", "mag"), if self.loupe_down { 4.0 } else { 2.0 }, motion::GLIDE, window, cx);
@@ -1201,7 +1201,7 @@ fn label_chip(text: &'static str, left: bool, p: &crate::theme::Palette) -> impl
 
 impl Viewer {
     fn surface_origin(&self, cx: &App) -> gpui_kit::Point<Pixels> {
-        self.state.read(cx).viewport_origin
+        self.state.read(cx).preview_state.viewport_origin
     }
 }
 
@@ -1226,16 +1226,16 @@ impl ViewportReport for Surface {
             let hwnd = 0;
             let changed = {
                 let s = state.read(cx);
-                s.viewport_origin != bounds.origin
-                    || s.window_hwnd != hwnd
-                    || (f32::from(bounds.size.width) - s.viewport.0).abs() > 0.5
-                    || (f32::from(bounds.size.height) - s.viewport.1).abs() > 0.5
-                    || s.scale_factor != sf
+                s.preview_state.viewport_origin != bounds.origin
+                    || s.device.window_hwnd != hwnd
+                    || (f32::from(bounds.size.width) - s.preview_state.viewport.0).abs() > 0.5
+                    || (f32::from(bounds.size.height) - s.preview_state.viewport.1).abs() > 0.5
+                    || s.device.scale_factor != sf
             };
             if changed {
                 state.update(cx, |s, cx| {
-                    s.viewport_origin = bounds.origin;
-                    s.window_hwnd = hwnd;
+                    s.preview_state.viewport_origin = bounds.origin;
+                    s.device.set_window_hwnd(hwnd);
                     s.set_viewport((bounds.size.width, bounds.size.height), sf, cx);
                 });
             }

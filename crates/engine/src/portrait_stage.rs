@@ -4337,7 +4337,7 @@ fn apply_face_mesh_group(
                 source_uv: &uv,
                 ebo: &mesh_out.initial_indices,
             };
-            let mut stepped = None;
+            let mut stepped: Option<()> = None;
             #[cfg(windows)]
             {
                 let cuda = match forced_cuda_failure() {
@@ -5294,7 +5294,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         }
         let needs_hlf_auto = (pf == 30021 && inputs.hlf_face.is_none())
             || (pf == 30022 && inputs.hlf_body.is_none());
-        let mut cuda_hlf_auto_fallback = None;
+        let mut cuda_hlf_auto_fallback: Option<String> = None;
         #[cfg(windows)]
         if needs_hlf_auto {
             if let Some((next, dispatches)) =

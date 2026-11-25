@@ -30,9 +30,9 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> A
 fn user_styles_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let styles = s.settings.user_styles.clone();
+    let styles = s.prefs.settings.user_styles.clone();
     let applied = s.adj().style.clone();
-    let n = s.selection.len().max(1);
+    let n = s.library.selection.len().max(1);
     let st_save = state.clone();
     let mut panel = ToolPanel::new(state, "user-styles", t("User Styles", "用户风格"))
         .badge(styles.len().to_string())
@@ -115,7 +115,7 @@ fn styles_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
     let p = pal(cx).clone();
     let styles = s.styles.clone();
     let applied = s.adj().style.clone();
-    let stack = s.panels.stack_styles;
+    let stack = s.prefs.panels.stack_styles;
     let mut groups: Vec<String> = styles.iter().map(|s| s.group.clone()).collect();
     groups.dedup();
     let st = state.clone();
@@ -148,7 +148,7 @@ fn styles_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
         )
         .child(switch_row("stack-styles", t("Stack styles", "叠加风格"), stack, move |v, _, cx| {
             st.update(cx, |s, cx| {
-                s.panels.stack_styles = v;
+                s.prefs.panels.stack_styles = v;
                 cx.notify();
             })
         }, cx));
@@ -181,7 +181,7 @@ fn styles_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
                     })
                     .on_click(move |_, _, cx| {
                         st.update(cx, |s, cx| {
-                            let stack = s.panels.stack_styles;
+                            let stack = s.prefs.panels.stack_styles;
                             s.apply_style(&style, stack, cx)
                         })
                     }),
@@ -194,11 +194,11 @@ fn styles_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
 fn clipboard_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let groups = s.clip_groups.clone();
-    let clip = s.clipboard.clone();
+    let groups = s.editor.clip_groups.clone();
+    let clip = s.editor.clipboard.clone();
     let source = clip.clone().unwrap_or_else(|| s.adj().clone());
     let (st_all, st_none, st_copy, st_apply) = (state.clone(), state.clone(), state.clone(), state.clone());
-    let n = s.selection.len();
+    let n = s.library.selection.len();
     ToolPanel::new(state, "clipboard", t("Adjustments Clipboard", "调整剪贴板"))
         .badge(if clip.is_some() { t("Copied", "已拷贝") } else { t("Empty", "空") })
         .child(
@@ -218,13 +218,13 @@ fn clipboard_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use
                 .child(div().flex_1())
                 .child(Button::new("clip-all").xsmall().ghost().label(t("All", "全选")).on_click(move |_, _, cx| {
                     st_all.update(cx, |s, cx| {
-                        s.clip_groups = ClipGroup::ALL.iter().copied().collect();
+                        s.editor.clip_groups = ClipGroup::ALL.iter().copied().collect();
                         cx.notify();
                     })
                 }))
                 .child(Button::new("clip-none").xsmall().ghost().label(t("None", "全不选")).on_click(move |_, _, cx| {
                     st_none.update(cx, |s, cx| {
-                        s.clip_groups.clear();
+                        s.editor.clip_groups.clear();
                         cx.notify();
                     })
                 })),
@@ -246,9 +246,9 @@ fn clipboard_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use
                             let v = *v;
                             st.update(cx, |s, cx| {
                                 if v {
-                                    s.clip_groups.insert(g);
+                                    s.editor.clip_groups.insert(g);
                                 } else {
-                                    s.clip_groups.remove(&g);
+                                    s.editor.clip_groups.remove(&g);
                                 }
                                 cx.notify();
                             })
