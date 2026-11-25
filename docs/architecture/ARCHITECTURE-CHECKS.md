@@ -27,7 +27,7 @@ sh scripts/architecture/check.sh
 cargo test -p aurora-engine --test architecture_rules --locked -- --test-threads=1
 ```
 
-当前实际输出（macOS，11 条全部通过）：
+当前实际输出（macOS，最终工作树，2026-11-25 重跑）：**11 passed / 0 failed**。
 
 ```text
 running 11 tests
@@ -46,6 +46,8 @@ test arch_rule9_lifecycle_and_save_queue_stay_standalone ... ok
 test result: ok. 11 passed; 0 failed
 ```
 
+历史说明：中间态 `f999acd` 曾把计划类型放进 `processing/plan.rs`，规则 8 的 standalone word `Plan` 立即命中（当时 10 passed / 1 failed）。修复是把同一组类型移到 `crates/engine/src/render_plan_types.rs`（`lib.rs:260`），**不是削弱规则 8**；重跑恢复 11/0。
+
 测试名统一带 `arch_rule` 前缀，仅便于日志过滤；不是 harness 要求。数字编号跨轮
 累加：规则 1–9 是 A-QA 第一轮，规则 10–11 是本轮新增，规则 8 本轮扩展。
 
@@ -60,7 +62,7 @@ test result: ok. 11 passed; 0 failed
 | 5 | 内嵌 CUDA PTX 的源码文件必须平台门控或有无 Windows 适配面 | 新增 GPU 文件悄悄破坏非 Windows 构建 | 精确清单 38 个文件 + 1 条例外（见下） |
 | 6 | `render_plan` / `contracts` 不引用 `super::process` | 编译计划/契约耦合到 mock 像素管线 | 通过 |
 | 7 | 三个 workspace package 之间无依赖环 | 依赖图成环，无法独立构建 | 通过 |
-| 8 | 生产代码 `processing/` 不出现 `mock::`、`super::process`、`gpu_runtime`、`render_plan`、`RenderPlan`、`FrameMap`、`Plan`、`Source` | 迁移后的纯阶段偷偷依赖旧渲染器、编译计划或 `Source` 输入 | 通过（测试代码可建 `Source` fixture，见下） |
+| 8 | 生产代码 `processing/` 不出现 `mock::`、`super::process`、`gpu_runtime`、`render_plan`、`RenderPlan`、`FrameMap`、`Plan`、`Source` | 迁移后的纯阶段偷偷依赖旧渲染器、编译计划或 `Source` 输入 | 通过（`f999acd` 中间态曾因 `processing/plan.rs` 的 `Plan` 失败；类型移到 `render_plan_types.rs` 后恢复） |
 | 9 | `job_lifecycle.rs` / `save_queue.rs` 不依赖 `mock`/`file_engine`/`portrait_stage` | 协议层反向依赖具体实现，无法单测 | 通过 |
 | 10 | `file_engine_services.rs` 只借用 `&FileEngine`，不拥有引擎 | 服务持有第二个引擎/第二把锁，或把方法重新塞回 `impl FileEngine` | 通过（无例外） |
 | 11 | `crates/app/src` 不引用 `file_engine_services` | UI 依赖引擎内部组合方式，绕过 `ImageEngine` | 通过（无例外） |
@@ -192,6 +194,12 @@ portrait-app   -> aurora-engine
 
 标识符边界避免把 `Plane`（清晰度平面）误判为 `Plan`。`#[cfg(test)]` 跳过是
 粗粒度花括号计数：只跳过被该属性门控的模块/函数/单行项。
+
+**历史回归与恢复**：commit `f999acd` 曾定义 `crates/engine/src/processing/plan.rs`
+的 `struct Plan`，规则 8 的 standalone word 命中（10 passed / 1 failed）。随后
+`Plan` 等类型被移到 `crates/engine/src/render_plan_types.rs`，规则恢复为
+11 passed / 0 failed；规则本身没有放宽。`FrameMap` 已迁入
+`processing::frame_map`，当前规则文本仍保留该词，防止它再次从 mock 侧引入。
 
 **当前例外（仅测试）**：`crates/engine/src/processing/clarity.rs` 的
 `#[cfg(test)] mod tests` 里有一个 `#[ignore]` 基准，构建 `crate::Source::from_rgba`

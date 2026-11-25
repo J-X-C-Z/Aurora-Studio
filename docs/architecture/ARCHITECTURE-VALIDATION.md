@@ -10,12 +10,13 @@
 - **Verified locally（macOS arm64）**：本节写出的命令确实在本机执行过，并记录了实际输出；行内注明命令。
 - **Unverified**：没有在本机执行，或本机不存在该平台/资产。包括但不限于：Windows 原生 Release、P50/P95 性能、DirectML/CUDA/OpenCL/Metal 真机、外部 fixture 测试、ONNX Runtime 是否存在。
 
-2026-11-25 文档同步轮只重跑了 `cargo test -p aurora-engine --test architecture_rules --locked`（11 passed）；其余既有结果保留原记录，未重跑，也不升级为“本轮验证”。
+2026-11-25 文档同步轮只重跑了 `cargo test -p aurora-engine --test architecture_rules --locked`，最终结果 **11 passed / 0 failed**。同步中间态 `f999acd` 曾因 `processing/plan.rs:359` 的 `Plan` 出现 10 passed / 1 failed；并发修复把类型移到 `render_plan_types.rs` 后恢复 11/0。其余既有结果保留原记录，未重跑，也不升级为“本轮验证”。
 
 | 项目 | 状态 | 依据 |
 |---|---|---|
-| macOS arm64 编译 / 原生链接 / 架构规则 | Verified locally | §1、§2、§3 的命令与输出 |
-| engine / app / portrait 全量套件数字 | Verified locally（既有运行，本轮未重跑） | §3；失败逐项列出，不当作通过 |
+| macOS arm64 编译 / 原生链接 | Verified locally | §1、§3 的命令与输出 |
+| 架构规则（最终工作树） | Verified locally | 2026-11-25 重跑：11 passed / 0 failed，见 §2；`f999acd` 中间态曾 10/1，随后修复 |
+| engine / app / portrait 全量套件数字 | Verified locally（既有运行，早于 `f999acd`，本轮未重跑） | §3；失败逐项列出，不当作通过 |
 | Windows 原生 Release 构建与测试 | Unverified | 本机无 Windows |
 | DirectML / ONNX Runtime GPU | Unverified | 本机未安装 ORT；`AURORA_AI_PROVIDER` 真机路径未执行 |
 | CUDA 细节阶段真机执行 | Unverified | macOS `no_driver` 返回 `Unavailable` |
@@ -50,7 +51,7 @@
 | App 保存提示 | `cargo test -p portrait-app --lib save_notice` | **6 passed, 0 failed** |
 | 未知顶层字段 round-trip | `cargo test -p aurora-engine --lib unknown_field_tests` / `unknown_top_level_keys_survive` | **2 + 1 passed** |
 | 人像 descriptor | `cargo test -p aurora-portrait --lib effect_descriptor` | **12 passed, 0 failed** |
-| 架构规则 | `cargo test -p aurora-engine --test architecture_rules` | **11 passed, 0 failed**（services 借用、app 不引用 services、CI 已接入） |
+| 架构规则 | `cargo test -p aurora-engine --test architecture_rules --locked` | **11 passed / 0 failed**（最终工作树，2026-11-25 重跑）。中间态 `f999acd` 曾因 `processing/plan.rs:359` 的 `Plan` 为 10/1；并发修复移到 `crates/engine/src/render_plan_types.rs` 后恢复 11/0，未削弱规则 8 |
 | 迁移：grain | `cargo test -p aurora-engine --lib processing::grain` / `mock::detail` / `default_render_bytes_are_the_pre_patch_bytes` | **17 / 73 / 1 passed**；`git diff -M` similarity 98%，仅 5 行文档 |
 | 架构规则脚本 | `sh scripts/architecture/check.sh` | 通过（11 条规则） |
 | 任务生命周期 | `cargo test -p aurora-engine --lib job_lifecycle` | **15 passed, 0 failed** |
@@ -137,5 +138,5 @@
 
 - 非 Windows 构建从小红变为可编译、可链接、可跑测试；这是本轮最直接的可验证收益。
 - 六个代码 lane 的实际产物（契约、文档/运行时、保存报告、图编译、效果 descriptor、架构规则）均通过各自测试，且未接入旧渲染路径，不改变当前像素输出。
-- 这套改动**不能**被表述为“架构重构完成”：正式渲染仍在 `mock/`（`Plan`/`LayerPlan`/`render_sized`/layer 合成未迁出），`LibraryState` 未落地，运行时几何字段仍在 `AdjustmentSet`，Windows/Metal/性能/外部 fixture 未验证。当前逐项状态见 [REMAINING-GAPS.md](REMAINING-GAPS.md)。
+- 这套改动**不能**被表述为“架构重构完成”：`Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 已移到 `render_plan_types.rs`，`render_sized`、`apply_layers` 与 `mock/retouch.rs` 仍在 `mock/` 范围；`LibraryState` 已落地但 `filter`/`sort`/`nodes` 仍在 `AppState`；运行时几何字段仍在 `AdjustmentSet`；Windows/Metal/性能/外部 fixture 未验证。当前逐项状态与接手顺序见 [REMAINING-GAPS.md](REMAINING-GAPS.md)。
 - “服务边界未拆”“导出放大问题仍在”“存档扩展字段仍丢失”是本记录早先版本的结论；当前源码中服务边界已拆（10 个借用式服务）、导出全分辨率已实现（ADR-012）、未知顶层字段已 round-trip。不要把旧结论当现状。

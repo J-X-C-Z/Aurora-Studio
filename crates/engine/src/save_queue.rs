@@ -64,9 +64,13 @@
 //! (O(log n)) when the list is actually needed. `flush`/`close` necessarily
 //! scan the retained detail because their reports are per path.
 //!
-//! **Production status:** `FileEngine` is not wired to this queue yet. The
-//! existing synchronous save path remains the production behavior; this module
-//! is standalone and exercised by its own tests.
+//! **Production status:** this queue is the production save path. `FileEngine`
+//! starts it in `start_save_queue` and routes edits through
+//! `save_adjustments_queued`, with `flush_saves`/`flush_pending_saves` at
+//! close and `save_queue_status` for observation. The old synchronous
+//! `save_adjustments` remains for explicit batch/EOF callers and for
+//! persistence without a queue. `SaveQueue` itself stays standalone: its tests
+//! never construct a `FileEngine`.
 //!
 //! # Locking
 //!

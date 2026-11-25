@@ -11,7 +11,7 @@ Aurora Studio 公共架构 lane
 
 ## 当前已验证状态（2026-11-25，文档同步轮）
 
-本节于 2026-11-25 在 `J-X-C-Z/架构` worktree（基线 SHA `8118a4a`，未提交）上按当前源码重新核对。**本轮只重跑了架构规则测试**；全量套件数字引用本副本已记录的实际运行基线，未在本轮重跑。
+本节于 2026-11-25 在 `J-X-C-Z/架构` worktree 上按当前源码重新核对。架构 lane 的基线是 `8118a4a`；同步过程中并发 agent 已把工作落到 commit `f999acd`（`refactor(architecture): split engine contracts/services/jobs and app state groups`），工作树另有未提交的 `processing/mod.rs`/`mock/process.rs` 改动。**本轮只重跑了架构规则测试**；全量套件数字引用本副本已记录的实际运行基线（早于 `f999acd`），未在 `f999acd` 后重跑。
 
 ### 已重跑的命令
 
@@ -30,10 +30,10 @@ test arch_rule9_lifecycle_and_save_queue_stay_standalone ... ok
 test arch_rule10_file_engine_services_borrow_the_engine ... ok
 test arch_rule11_app_does_not_reference_engine_services ... ok
 
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 ```
 
-该命令同时是 `.github/workflows/ci.yml` 的 `Architecture rules` 步骤（`windows` job，位于 `Check all targets` 与 `Run synthetic tests` 之间，`--locked -- --test-threads=1`）。
+**当前最终结果是 11 passed / 0 failed。** 同步过程中出现过一次短暂回归：`f999acd` 曾把 `Plan` 等计划类型放进 `processing/plan.rs`，规则 8 的 standalone word `Plan` 立即命中（当时实测 10 passed / 1 failed）。随后的并发修复把同一组类型移到 `crates/engine/src/render_plan_types.rs`（`lib.rs:260` `pub(crate) mod render_plan_types;`），没有再削弱规则 8；重跑即 11 passed。记录这段是为了说明门禁确实会拦住“把渲染计划词汇塞进 `processing`”，而不是把中间失败抹掉。该命令同时是 `.github/workflows/ci.yml` 的 `Architecture rules` 步骤（`windows` job，位于 `Check all targets` 与 `Run synthetic tests` 之间，`--locked -- --test-threads=1`）。
 
 ### 全量套件基线（本工作副本，既有记录，未在本轮重跑）
 
@@ -42,15 +42,15 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 | `aurora-engine --lib` + `scripts/testdata-skips.txt` | 1893 passed / 29 failed / 94 ignored / 105 filtered | 29 个失败是既有环境/资产问题：缺外部 fixture 15、macOS `/var`→`/private/var` 规范化 7、CUDA 在 macOS 不可用 3、共享 `params.json`/目录 2、`portrait_historical_tone_provider` code/test 不匹配 2 |
 | `portrait-app --lib` | 96 passed / 1 failed / 5 ignored | `state::import_edits_tests::eip_variants_fill_the_preview_edits_immediately`，缺外部 EIP fixture |
 | `aurora-portrait --lib` | 675 passed / 2 failed | 两个缺真实资产：`kernels::face_width_414`、`plump_session::tests::three_real_assets_match_payload_and_net_hashes` |
-| `architecture_rules` | 11 passed / 0 failed | 无 |
+| `architecture_rules` | **11 passed / 0 failed**（最终工作树，2026-11-25 重跑） | 无。`f999acd` 中间态曾因 `processing/plan.rs` 的 `Plan` 失败（10/1），并发修复移到 `render_plan_types.rs` 后恢复 11/0 |
 
-29 + 1 + 2 个失败均为既有失败，不写成本轮通过，也不表示本轮回归。
+29 + 1 + 2 个失败均为既有失败，不写成本轮通过，也不表示本轮回归。全量套件数字来自 `f999acd` 之前的工作树，未在提交后重跑，不能据此推断提交后的通过数；架构规则是唯一在本轮按最终树重跑的门禁。
 
 ### 当前源码确认已落地
 
-- engine 模块：`contracts/`（`compute`/`frame`/`identity`）、`document.rs`、`render_plan.rs`、`compute_bridge.rs`、`save_queue.rs`、`save_report.rs`、`job_lifecycle.rs`、`file_engine_services.rs`、`processing/`（`clarity`、`color`、`encoding`、`frame_map`、`geometry`、`grain`、`spots`、`statistics`、`tone`）均存在。
+- engine 模块：`contracts/`（`compute`/`frame`/`identity`）、`document.rs`、`render_plan.rs`、`render_plan_types.rs`、`compute_bridge.rs`、`save_queue.rs`、`save_report.rs`、`job_lifecycle.rs`、`file_engine_services.rs`、`processing/`（`clarity`、`color`、`encoding`、`frame_map`、`geometry`、`grain`、`spots`、`statistics`、`tone`）均存在。`Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 已从 `mock/process.rs` 移到 `render_plan_types.rs:24/268/354/359/392`（`lib.rs:260` 声明 `pub(crate) mod render_plan_types;`；写入时已重新核对）。
 - `file_engine_services.rs` 10 个借用式服务：`CatalogService`、`SourceService`、`RenderService`、`InferenceService`、`CaptureService`、`ExportService`、`MergeService`、`PersistenceService`、`ImportService`、`LibraryService`；每个都是 `struct ...Service<'a> { engine: &'a FileEngine }`。
-- app 子状态：`state/tasks.rs` `TaskCenter`、`state/device.rs` `DeviceState`、`state/preview.rs` `PreviewState`、`state/editor.rs` `EditorState`、`state/settings_state.rs` `SettingsState`；`AppState` 以 `tasks`/`device`/`preview_state`/`editor`/`prefs` 持有（`state/mod.rs:508-543`）。`ViewPrefs` 与 `PanelPrefs` 在 `SettingsState` 内，路径为 `state.prefs.view` / `state.prefs.panels`。
+- app 子状态：`state/tasks.rs` `TaskCenter`、`state/device.rs` `DeviceState`、`state/preview.rs` `PreviewState`、`state/editor.rs` `EditorState`、`state/settings_state.rs` `SettingsState`、`state/library.rs` `LibraryState`；`AppState` 以 `tasks`/`device`/`preview_state`/`editor`/`prefs`/`library` 持有（`state/mod.rs:508-543`，`LibraryState` 在 `:513`）。`ViewPrefs` 与 `PanelPrefs` 在 `SettingsState` 内，路径为 `state.prefs.view` / `state.prefs.panels`。`filter`/`sort`/`sort_desc`/`nodes` 仍在 `AppState`。
 - `mock/geometry.rs` → `processing/frame_map.rs`；`mock/mod.rs:85` 用 `pub(crate) use crate::processing::frame_map as geometry` 保持旧路径。
 - 平台加载：`aimask/ort.rs`、`jxl.rs`、`heif.rs`、`heif_write.rs`、`raw.rs` 均在 POSIX 用 `dlopen`/`dlsym`，Windows 用 `LoadLibraryW`/`GetProcAddress`；非 Windows CUDA 由 `crates/portrait/src/cuda.rs:3495` 的 `mod no_driver` 提供同形不可用面。
 - Z6III 中性算法：`aurora_raw/z6iii/mod.rs:7-13` 只对 `desktop`/OpenCL/CLI 加 Windows+feature 门控，`color`/`geometry16`/`reconstruct`/`render` 中性模块跨平台编译。
@@ -59,7 +59,7 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
 ### 仍未完成
 
-`processing/plan.rs` 在写入时不存在；`Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 仍在 `mock/process.rs:782/1174/1282/1287/1320`。`render_sized` 在 `mock/process.rs:2143`，layer 合成在 `:1208/:1257/:3858`；`mock/retouch.rs` 仍是未挂载孤儿。`LibraryState` 尚未落地（无 `crates/app/src/state/library.rs`）。`Geometry.distortion`/`optical_center` 与 `LensCorrection.uniform_light_grid`/`distortion` 仍在持久化 `AdjustmentSet`（`adjust.rs:1578/1590/1865/1868`），`RuntimeInputs` 只有 `producer_inputs`（`document.rs:207`）。Windows 原生 Release、DirectML/CUDA/OpenCL/Metal 真机、ONNX Runtime 存在性、P50/P95 性能与外部 fixture 均未验证。许可证 MIT vs Proprietary 需仓库所有者裁决。逐项证据与下一步见 [REMAINING-GAPS.md](REMAINING-GAPS.md)。
+`Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 已移到 `render_plan_types.rs:24/268/354/359/392`，架构规则 8 不再失败。`render_sized` 仍在 `mock/process.rs:1764`；`layer_plans`/`cached_layer_weights` 在 `mock/process.rs:937/959`，`apply_layers` 在 `:3479`；`mock/retouch.rs`（674 行）仍是未挂载孤儿。`LibraryState` 已落地（`state/library.rs:22`，`AppState.library` 在 `state/mod.rs:513`），但 `filter`/`sort`/`sort_desc`/`nodes` 仍在 `AppState`。`Geometry.distortion`/`optical_center` 与 `LensCorrection.uniform_light_grid`/`distortion` 仍在持久化 `AdjustmentSet`（`adjust.rs:1578/1590/1865/1868`），`RuntimeInputs` 只有 `producer_inputs`（`document.rs:207`）。Windows 原生 Release、DirectML/CUDA/OpenCL/Metal 真机、ONNX Runtime 存在性、P50/P95 性能与外部 fixture 均未验证。许可证 MIT vs Proprietary 需仓库所有者裁决。逐项证据、验收标准与下一步见 [REMAINING-GAPS.md](REMAINING-GAPS.md)。
 
 ## 本轮已实现
 

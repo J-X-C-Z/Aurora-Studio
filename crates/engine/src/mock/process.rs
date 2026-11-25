@@ -68,6 +68,15 @@ use crate::processing::encoding::{encode_f32_frame, merge_wide_delta, upsample};
 #[cfg(windows)]
 use crate::processing::encoding::{band_region, encode_io_rows};
 
+// Render-plan types live in the `render_plan_types` layer; imported here so
+// this renderer and its tests keep the unqualified names.
+use crate::render_plan_types::{
+    BandingPlan, LayerOutputWeightKey, LayerPlan, MaskGrid, MaskGridCacheKey, PixelGains, Plan,
+    grid_dims, layer_has_spatial, layer_plan,
+};
+#[cfg(test)]
+use crate::render_plan_types::shape_value;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SourceSample {
     rgb: [f32; 3],

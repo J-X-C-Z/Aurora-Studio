@@ -23,7 +23,7 @@
 - `crates/app/src/state/tasks.rs` — AppState 的 TaskCenter（jobs/ids/busy flags）与手势不变量测试。
 - `crates/app/src/state/device.rs` / `preview.rs` / `settings_state.rs` — DeviceState、PreviewState、SettingsState（`settings`/`panels`/`view`/`engine_name`/`capabilities`）。
 - `crates/engine/src/file_engine_services.rs` — FileEngine 的 10 个借用式服务：Catalog/Source/Render/Inference/Capture/Export/Merge/Persistence/Import/Library（trait 方法保留为委托）。
-- `crates/app/src/state/library.rs` — **尚未落地**；LibraryState 仍未拆出（见 REMAINING-GAPS.md）。
+- `crates/app/src/state/library.rs` — `LibraryState`（`images`/`selection`/`current`/recent/trash/active collection/annotations/custom order/stacks）；`AppState.library` 持有。`filter`/`sort`/`nodes` 仍在 `AppState`。
 - `crates/engine/src/document.rs` — 文档 vs 运行时输入、指纹、快照与身份 newtype（A-document）；`Geometry`/`LensCorrection` 的运行时字段已从相等性排除。
 - `crates/engine/src/render_plan.rs` — 节点图编译、脏传播、缓存 key（A-graph）。
 - `crates/engine/src/save_report.rs` — 批量保存逐文档结果（A-storage）。
@@ -33,6 +33,7 @@
 - `crates/app/src/capability.rs` — 三维能力视图（静态/证据/运行时）。
 - `crates/engine/src/job_lifecycle.rs` — 统一任务 id/状态/取消/回执协议；已接入导出任务（merge/preview 尚未迁移）。
 - `crates/engine/src/processing/` — 从 `mock` 机械迁出的纯阶段：`grain`、`clarity`、`spots`、`color`、`tone`、`statistics`、`encoding`、`frame_map` 与共享 `geometry`；`mock` 保留 re-export。
+- `crates/engine/src/render_plan_types.rs` — 从 `mock/process.rs` 拆出的 `Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains`（`lib.rs` 内 `pub(crate) mod render_plan_types;`）；放在渲染计划层而不是 `processing`，以免触犯架构规则 8。
 - `crates/portrait/src/effect_descriptor.rs` — 效果 descriptor/registry 与三维能力状态（A-registry）。
 - `crates/engine/tests/architecture_rules.rs` — 架构规则测试（A-QA）。
 

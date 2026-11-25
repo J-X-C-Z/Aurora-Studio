@@ -1,4 +1,4 @@
-//! Per-render planning types extracted from `mock::process`.
+//! Per-render planning types extracted from the mock renderer.
 //!
 //! These values hold adjustment data and precomputed tables for one frame
 //! (`MaskGrid`, `LayerPlan`, `Plan`, ...). They used to be defined inside the
@@ -6,7 +6,7 @@
 //! mock module. The pixel stages themselves stay in the sibling `processing`
 //! modules and the renderer entry points stay in `mock`.
 //!
-//! Fields are `pub(crate)` because `mock::process` builds and reads them in
+//! Fields are `pub(crate)` because the mock renderer builds and reads them in
 //! place; the layout and semantics are byte-identical to the previous
 //! definitions.
 

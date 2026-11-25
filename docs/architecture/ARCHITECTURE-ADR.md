@@ -142,7 +142,7 @@
 
 - 决策：新增规则 10（services 只借用、不拥有 FileEngine）、规则 11（app 不引用 services）；规则 8 扩展为 production 代码禁止 `Plan`/`Source`/`FrameMap`/`render_plan`；CI 在 `cargo check` 后运行 `architecture_rules`。
 - 理由：把服务边界变成可失败的契约；不引入 fmt 门禁。
-- 状态：11 条规则通过；YAML 保持原 job/权限。
+- 状态：最终工作树 11 条规则通过；YAML 保持原 job/权限。同步中间态 `f999acd` 曾把计划类型移入 `processing/plan.rs`，规则 8 因 `struct Plan`（`:359`）失败（10 passed / 1 failed）；随后类型移到 `crates/engine/src/render_plan_types.rs`，规则恢复 11/0，未削弱规则。
 
 ## ADR-021：HEIF 读取器在 POSIX/macOS 使用 libheif（dlopen）
 
@@ -171,21 +171,21 @@
 
 - 决策：`settings`/`panels`/`engine_name`/`capabilities` 收进 `state/settings_state.rs`；`tools/portrait.rs` 的 `s.panels` 改为 `s.prefs.panels`，不保留全局 Deref 兼容。
 - 后续（2026-11-25 源码确认）：`ViewPrefs` 也已进入 `SettingsState`，路径为 `state.prefs.view`；`PanelPrefs` 为 `state.prefs.panels`。`SettingsState` 字段见 `settings_state.rs:12-20`，调用点如 `state/mod.rs:697`。原“view 暂留 AppState”的描述已过期。
-- 状态：app 96 passed / 1 known fixture failure；Catalog/Library 组仍留 AppState（`LibraryState` 尚未落地）。
+- 状态：app 96 passed / 1 failed / 5 ignored（同一 EIP fixture 失败，不是本轮通过）。`LibraryState` 已落地（`state/library.rs:22`，`AppState.library` 在 `state/mod.rs:513`）；`filter`/`sort`/`sort_desc`/`nodes` 仍留 `AppState`（见 REMAINING-GAPS G13）。
 
 ## ADR-026：FrameMap/KeystoneMap 迁入 processing::frame_map
 
 - 决策：`mock::geometry` 的 FrameMap/KeystoneMap/frame_to_source 与既有 `processing::geometry` 纯 crop helper 合并到 `processing::frame_map`；`mock/mod.rs` 用 `pub(crate) use crate::processing::frame_map as geometry` 保持所有旧路径。架构规则 8 相应不再把 `FrameMap` 视为 mock 耦合。
 - 理由：FrameMap 是纯值几何，是 `Plan`/`LayerPlan` 迁移的前置；移动后 `processing` 内自洽，mock 只做兼容别名。
 - 状态：33 个几何测试（新路径）通过；全量 1893/29 失败集不变。
-- 注意：`Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 本身仍在 `mock/process.rs:782/1174/1282/1287/1320`；`processing/plan.rs` 在 2026-11-25 写入时不存在。本 ADR 只覆盖 FrameMap/纯 crop helper。
+- 后续（2026-11-25 源码确认）：`Plan`/`LayerPlan`/`MaskGrid`/`BandingPlan`/`PixelGains` 已移到 `crates/engine/src/render_plan_types.rs:24/268/354/359/392`（`lib.rs:260` `pub(crate) mod render_plan_types;`），`mock/process.rs` 通过 `use` 保持原名。中途曾短暂放进 `processing/plan.rs` 并触发规则 8；移到 `render_plan_types.rs` 后恢复 11/0。`render_sized`（`mock/process.rs:1764`）、`apply_layers`（`:3479`）、`mock/retouch.rs` 仍未迁出。
 
 ## ADR-027：AppState 五个子状态分组完成
 
 - 决策：`AppState` 以组合字段持有 `tasks: TaskCenter`、`device: DeviceState`、`preview_state: PreviewState`、`editor: EditorState`、`prefs: SettingsState`（`state/mod.rs:508-543`）。每个子状态是普通数据持有者，不引入 Entity 化、事件总线或第二套模型；gesture/undo/redo、保存、渲染决策仍留在 `AppState`，因为它们同时触达 GPUI/render/engine。
 - 理由：先拆有明确边界且更新频繁的状态，减少 `mod.rs` 的阅读与冲突面；保持 UI 仍只 observe `AppState`。
-- 结果：Tasks/Device/Preview/Editor/Settings 已拆；`ViewPrefs`/`PanelPrefs` 在 `SettingsState` 内（见 ADR-025 更新）。`LibraryState`、history helper、catalog/collection 组仍未拆。
-- 状态：app 96 passed / 1 known fixture failure（既有 EIP fixture 失败，不是本轮通过）；`state::render` 19、commit invariants 6、task center 4 通过。
+- 结果：Tasks/Device/Preview/Editor/Settings/Library 已拆。`LibraryState` 在 `state/library.rs:22`，字段为 `images`/`selection`/`current`/`recent_imports`/`recent_captures`/`trash`/`active_collection`/`active_collection_name`/`annotations`/`custom_order`/`stacks`/`open_stacks`，`AppState.library` 在 `state/mod.rs:513`。`ViewPrefs`/`PanelPrefs` 在 `SettingsState` 内（见 ADR-025 更新）。history helper、`filter`/`sort`/`sort_desc`/`nodes` 仍未拆。
+- 状态：app 96 passed / 1 failed / 5 ignored（既有 EIP fixture 失败，不是本轮通过）；`state::render` 19、commit invariants 6、task center 4 通过。
 
 ## ADR-028：平台加载、Z6III 中性算法与 Keystone 反解的现状确认
 

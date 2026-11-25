@@ -257,6 +257,7 @@ mod wb_gains;
 mod recipe;
 /// Compiled execution view of a saved node graph.
 pub mod render_plan;
+pub(crate) mod render_plan_types;
 mod save_queue;
 pub use save_queue::*;
 mod save_report;
