@@ -95,7 +95,18 @@ pub fn default_raw16_dir() -> Option<PathBuf> {
             .map(PathBuf::from)
             .map(|dir| dir.join("Aurora Studio").join("Cache").join("raw"));
     }
-    #[cfg(not(target_os = "windows"))]
+    // macOS convention: `~/Library/Caches`. The explicit overrides above still
+    // win, so portable installs and tests can redirect the cache.
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME").map(PathBuf::from).map(|dir| {
+            dir.join("Library")
+                .join("Caches")
+                .join("Aurora Studio")
+                .join("raw")
+        });
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
@@ -1778,6 +1789,26 @@ mod tests {
             assert_ne!(baseline, key(route), "a route change must land on a new key");
         }
         assert_eq!(baseline, key(base), "the same route must be stable");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_key_changes_when_the_z6iii_flag_flips() {
+        let dir = scratch("z6iii-flag-key");
+        let path = source(&dir, b"z6iii-flag");
+        let z6iii = test_route(true, true);
+        let generic = test_route(true, false);
+        let z6iii_key = cache_key16_for_route(&path, &dir, 0, z6iii).unwrap();
+        let generic_key = cache_key16_for_route(&path, &dir, 0, generic).unwrap();
+        assert_ne!(
+            z6iii_key, generic_key,
+            "a Z6III route must not reuse the generic Bayer entry"
+        );
+        assert_eq!(
+            z6iii_key,
+            cache_key16_for_route(&path, &dir, 0, z6iii).unwrap(),
+            "the same route must be stable"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

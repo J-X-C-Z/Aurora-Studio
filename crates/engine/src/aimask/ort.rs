@@ -150,6 +150,10 @@ pub(crate) enum Provider {
     TensorRt,
     Cuda,
     DirectMl,
+    /// Apple Core ML execution provider. Only offered when the loaded runtime
+    /// exports `OrtSessionOptionsAppendExecutionProvider_CoreML`; the plan
+    /// says nothing about which device (ANE/GPU/CPU) a session finally uses.
+    CoreMl,
     Cpu,
 }
 
@@ -159,6 +163,7 @@ impl Provider {
             Provider::TensorRt => "TensorRT",
             Provider::Cuda => "CUDA",
             Provider::DirectMl => "DirectML",
+            Provider::CoreMl => "CoreML",
             Provider::Cpu => "CPU",
         }
     }
@@ -187,6 +192,7 @@ fn provider_symbol(provider: Provider) -> Option<&'static str> {
         Provider::TensorRt => Some("OrtSessionOptionsAppendExecutionProvider_Tensorrt"),
         Provider::Cuda => Some("OrtSessionOptionsAppendExecutionProvider_CUDA"),
         Provider::DirectMl => Some("OrtSessionOptionsAppendExecutionProvider_DML"),
+        Provider::CoreMl => Some("OrtSessionOptionsAppendExecutionProvider_CoreML"),
         Provider::Cpu => None,
     }
 }
@@ -194,7 +200,8 @@ fn provider_symbol(provider: Provider) -> Option<&'static str> {
 /// Symbol spellings to try when appending a provider. ORT <= 1.22 exports
 /// `_TensorRT`, ORT >= 1.23 exports `_Tensorrt`; `GetProcAddress` is case
 /// sensitive, so both are probed and the PE export table is scanned
-/// case-insensitively on Windows.
+/// case-insensitively on Windows. On macOS `dlsym` is case-sensitive too, so
+/// both CoreML spellings are tried (the shipped binary exports `_CoreML`).
 fn append_symbol_candidates(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::TensorRt => &[
@@ -203,6 +210,10 @@ fn append_symbol_candidates(provider: Provider) -> &'static [&'static str] {
         ],
         Provider::Cuda => &["OrtSessionOptionsAppendExecutionProvider_CUDA"],
         Provider::DirectMl => &["OrtSessionOptionsAppendExecutionProvider_DML"],
+        Provider::CoreMl => &[
+            "OrtSessionOptionsAppendExecutionProvider_CoreML",
+            "OrtSessionOptionsAppendExecutionProvider_CoreMl",
+        ],
         Provider::Cpu => &[],
     }
 }
@@ -227,6 +238,30 @@ fn providers_from(has_cuda: bool, has_direct_ml: bool) -> Vec<Provider> {
     out
 }
 
+/// Default provider order for one OS. macOS has no CUDA/DirectML runtime, so the
+/// CPU baseline is the default. Core ML is *not* auto-selected even when the
+/// loaded library exports the symbol: the EP may choose FP16 compute, and this
+/// tree has no CPU-vs-Core ML parity evidence for continuous mask alpha yet
+/// (README: raw FP16 probabilities must not drive feathered masks). It stays
+/// reachable through `AURORA_ORT_PROVIDERS=coreml,cpu` or
+/// `AURORA_AI_PROVIDER=coreml` once that evidence exists.
+/// Every other platform keeps the existing CUDA -> DirectML -> CPU order; a
+/// Core ML symbol there is listed as exported but never auto-selected.
+/// The `os` argument is explicit so this can be tested on any host.
+fn providers_for_os(
+    os: &str,
+    has_cuda: bool,
+    has_direct_ml: bool,
+    has_core_ml: bool,
+) -> Vec<Provider> {
+    if os == "macos" {
+        let _ = has_core_ml;
+        vec![Provider::Cpu]
+    } else {
+        providers_from(has_cuda, has_direct_ml)
+    }
+}
+
 fn with_tensor_rt_first(mut providers: Vec<Provider>) -> Vec<Provider> {
     if !providers.contains(&Provider::TensorRt) {
         providers.insert(0, Provider::TensorRt);
@@ -239,6 +274,7 @@ fn provider_from_name(raw: &str) -> Option<Provider> {
         "tensorrt" | "trt" => Some(Provider::TensorRt),
         "cuda" => Some(Provider::Cuda),
         "dml" | "directml" => Some(Provider::DirectMl),
+        "coreml" | "core_ml" => Some(Provider::CoreMl),
         "cpu" => Some(Provider::Cpu),
         _ => None,
     }
@@ -279,6 +315,7 @@ fn log_provider_plan(plan: &ProviderPlan) {
         Provider::TensorRt,
         Provider::Cuda,
         Provider::DirectMl,
+        Provider::CoreMl,
         Provider::Cpu,
     ] {
         let state = match provider {
@@ -399,11 +436,21 @@ fn intra_op_threads() -> c_int {
     std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) as c_int
 }
 
+/// TensorRT cache directory as an opaque 64-bit id. The key only needs to tell
+/// two directories apart; storing the path would leak a user directory into
+/// [`SessionKey`]/logs.
+fn trt_dir_identity(raw: Option<&str>) -> String {
+    match raw.filter(|dir| !dir.is_empty()) {
+        Some(dir) => format!("{:016x}", fnv64(dir.as_bytes())),
+        None => "-".to_string(),
+    }
+}
+
 /// Everything that changes how ORT executes a model, in a stable order. Kept
 /// as one string so it can be hashed into [`SessionKey`] and printed in logs.
 fn provider_options_fingerprint() -> String {
     let tf32 = std::env::var("NVIDIA_TF32_OVERRIDE").unwrap_or_else(|_| "-".to_string());
-    let trt_dir = std::env::var("AURORA_TRT_CACHE_DIR").unwrap_or_else(|_| "-".to_string());
+    let trt_dir = trt_dir_identity(std::env::var("AURORA_TRT_CACHE_DIR").ok().as_deref());
     format!(
         "opt={};threads={};tf32={tf32};trt_dir={trt_dir};trt_present={}",
         graph_optimization_level(),
@@ -502,15 +549,27 @@ fn model_fingerprint(path: &Path) -> Result<(u64, u64)> {
 }
 
 /// Identity of one reusable ONNX session. A session may be reused only when
-/// every component matches: the model content, the ORT build, the execution
-/// provider and the options that change execution (thread count, graph
-/// optimization, TensorRT cache, TF32).
+/// every component matches: the model content, the ORT build (version, API and
+/// the actual dylib/DLL identity), the platform/arch, the model precision, the
+/// execution provider configuration and the options that change execution
+/// (thread count, graph optimization, TensorRT cache, TF32).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionKey {
     model_hash: u64,
     model_len: u64,
     ort_version: String,
     ort_api: u32,
+    /// e.g. `macos-aarch64`; CPU and Core ML optimized graphs are not
+    /// interchangeable across OS/arch, even at the same ORT version.
+    platform: String,
+    /// Runtime identity as `<file name>:<bytes>`. Deliberately not the absolute
+    /// path, so the key/logs never leak a user directory.
+    runtime: String,
+    /// Model precision implied by its file name (`fp32` / `fp16`). Name-derived,
+    /// not a content inspection.
+    precision: String,
+    /// Provider configuration string, e.g. `CoreML,CPU`. A CPU-only and a
+    /// hypothetical Core ML session therefore cannot share an entry.
     providers: String,
     options: String,
 }
@@ -526,8 +585,15 @@ impl SessionKey {
 
     fn canonical(&self) -> String {
         format!(
-            "v1|model={:016x}|len={}|ort={}|api={}|eps={}|opts={}",
-            self.model_hash, self.model_len, self.ort_version, self.ort_api, self.providers,
+            "v2|model={:016x}|len={}|ort={}|api={}|platform={}|runtime={}|precision={}|eps={}|opts={}",
+            self.model_hash,
+            self.model_len,
+            self.ort_version,
+            self.ort_api,
+            self.platform,
+            self.runtime,
+            self.precision,
+            self.providers,
             self.options
         )
     }
@@ -565,7 +631,19 @@ fn optimized_cache_dir() -> Option<PathBuf> {
                 .join("onnxruntime")
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // Apple's per-user cache convention; the path is derived from $HOME, so
+        // it never hardcodes a user name.
+        std::env::var_os("HOME").map(|dir| {
+            PathBuf::from(dir)
+                .join("Library")
+                .join("Caches")
+                .join("Aurora Studio")
+                .join("onnxruntime")
+        })
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
@@ -680,6 +758,40 @@ fn single_flight<V: Clone>(
     }
 }
 
+/// `os-arch`, e.g. `macos-aarch64`. Part of [`SessionKey`] so optimized graphs
+/// never cross a platform boundary.
+fn platform_identity() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Runtime identity for [`SessionKey`]: file name plus size, never the
+/// absolute path (the key is logged and used as a cache file name).
+fn runtime_identity(library: &Path) -> String {
+    let name = library
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("onnxruntime");
+    match std::fs::metadata(library) {
+        Ok(metadata) => format!("{name}:{}", metadata.len()),
+        Err(_) => name.to_string(),
+    }
+}
+
+/// Model precision implied by the file name. This is an identity hint, not a
+/// tensor inspection: FP32 and FP16 variants must not share an optimized graph.
+fn precision_for_path(path: &Path) -> &'static str {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if stem.contains("fp16") || stem.contains("float16") {
+        "fp16"
+    } else {
+        "fp32"
+    }
+}
+
 // ORT objects are internally synchronised; `Run` may be called from any thread.
 unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
@@ -707,7 +819,7 @@ impl Runtime {
         let handle = unsafe { load_library(&library)? };
         log::info!("ONNX Runtime from {}", library.display());
         let symbol = CString::new("OrtGetApiBase")?;
-        #[cfg(target_os = "linux")]
+        #[cfg(not(windows))]
         let get_base: unsafe extern "C" fn() -> *const OrtApiBase =
             unsafe { std::mem::transmute(dlsym(handle, symbol.as_ptr())) };
         #[cfg(windows)]
@@ -791,6 +903,9 @@ impl Runtime {
             model_len,
             ort_version: self.version.clone(),
             ort_api: self.api_version,
+            platform: platform_identity(),
+            runtime: runtime_identity(&self.library),
+            precision: precision_for_path(path).to_string(),
             providers: provider_labels(providers).join(","),
             options: provider_options_fingerprint(),
         })
@@ -800,7 +915,7 @@ impl Runtime {
         let Ok(name) = CString::new(name) else {
             return ptr::null_mut();
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(not(windows))]
         {
             unsafe { dlsym(self.handle, name.as_ptr()) }
         }
@@ -909,10 +1024,32 @@ impl Runtime {
         let has_trt = !self.provider_append_symbol(Provider::TensorRt).is_null();
         let has_cuda = !self.provider_append_symbol(Provider::Cuda).is_null();
         let has_dml = !self.provider_append_symbol(Provider::DirectMl).is_null();
-        let base = providers_from(has_cuda, has_dml);
+        // Core ML is only real when this library exports the append function.
+        // The probe, not a platform guess, decides: macOS stays CPU-only when
+        // the symbol is absent, and a non-macOS library that exports it is
+        // merely listed (never auto-selected).
+        let has_core_ml = !self.provider_append_symbol(Provider::CoreMl).is_null();
+        if std::env::consts::OS == "macos" && !has_core_ml {
+            log::info!(
+                "CoreML EP unavailable: this ONNX Runtime does not export \
+                 OrtSessionOptionsAppendExecutionProvider_CoreML; using CPU only"
+            );
+        } else if std::env::consts::OS == "macos" {
+            log::info!(
+                "CoreML EP exported but not auto-selected: no CPU/Core ML parity \
+                 evidence yet; set AURORA_ORT_PROVIDERS=coreml,cpu to opt in"
+            );
+        }
+        let base = providers_for_os(std::env::consts::OS, has_cuda, has_dml, has_core_ml);
         let mut exported = base.clone();
         if has_trt {
             exported.insert(0, Provider::TensorRt);
+        }
+        // Keep the exported list honest even when the platform default ignores
+        // a provider (e.g. an explicit override on a non-macOS host).
+        if has_core_ml && !exported.contains(&Provider::CoreMl) {
+            let cpu_index = exported.len().saturating_sub(1);
+            exported.insert(cpu_index, Provider::CoreMl);
         }
 
         let override_raw = std::env::var(PROVIDERS_ENV)
@@ -992,6 +1129,9 @@ impl Runtime {
                 ),
                 Provider::Cuda => log::info!(
                     "CUDA EP enabled on device 0 (TF32 follows NVIDIA_TF32_OVERRIDE)"
+                ),
+                Provider::CoreMl => log::info!(
+                    "CoreML EP enabled with default flags; ANE/GPU placement is per node and unverified"
                 ),
                 _ => {}
             }
@@ -1538,11 +1678,48 @@ fn derived_runtime_dirs(library: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Every path is explicit. A bare `onnxruntime.dll` is never attempted because
+/// Library discovery. Windows never attempts a bare `onnxruntime.dll` because
 /// `C:\Windows\System32\onnxruntime.dll` (1.17, API 17) would win the search and
-/// is too old for this module (`MIN_ORT_API_VERSION` is 18).
+/// is too old for this module (`MIN_ORT_API_VERSION` is 18). macOS prefers the
+/// app bundle's `Contents/Frameworks` and binary directory, then the official
+/// release names; Homebrew and other user install roots are never guessed.
 fn library_candidates() -> Vec<PathBuf> {
     library_candidates_from(|key| std::env::var_os(key), &project_roots())
+}
+
+/// Official macOS release names for ORT 1.23.2, most specific first. The
+/// versioned files are symlinks in the upstream package, but a bundled copy may
+/// ship only one of them.
+#[cfg(target_os = "macos")]
+const MACOS_ORT_LIB_NAMES: [&str; 4] = [
+    "libonnxruntime.1.23.2.dylib",
+    "libonnxruntime.1.23.dylib",
+    "libonnxruntime.1.dylib",
+    "libonnxruntime.dylib",
+];
+
+/// Adds `libonnxruntime*.dylib` found directly in `dir`, in a deterministic
+/// (name-sorted) order. Missing or unreadable directories are not an error:
+/// discovery is best-effort and `resolve_library` reports what was tried.
+#[cfg(target_os = "macos")]
+fn push_macos_dylibs_in(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("libonnxruntime") && name.ends_with(".dylib")
+                })
+        })
+        .collect();
+    found.sort();
+    out.extend(found);
 }
 
 fn library_candidates_from(
@@ -1551,7 +1728,23 @@ fn library_candidates_from(
 ) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(path) = get("AURORA_ORT_LIB") {
-        candidates.push(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        // `dlopen` does not search the current directory for a bare name, so a
+        // relative override would fail even when `is_file` saw it. macOS keeps
+        // the documented absolute-path contract; other platforms are unchanged.
+        #[cfg(target_os = "macos")]
+        {
+            if path.is_absolute() {
+                candidates.push(path);
+            } else {
+                log::warn!(
+                    "AURORA_ORT_LIB must be an absolute path on macOS; ignoring {:?}",
+                    path
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        candidates.push(path);
     }
     if cfg!(windows) {
         for root in roots {
@@ -1569,18 +1762,56 @@ fn library_candidates_from(
             );
         }
     } else {
-        candidates.extend(
-            ["libonnxruntime.so.1.23", "libonnxruntime.so.1", "libonnxruntime.so"]
-                .into_iter()
-                .map(PathBuf::from),
-        );
-        candidates.push(PathBuf::from(
-            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so.1.23",
-        ));
+        #[cfg(target_os = "macos")]
+        {
+            // A bundled app keeps the dylib at `<...>.app/Contents/Frameworks`,
+            // one level above the `Contents/MacOS` binary directory. Only these
+            // two executable-relative locations are scanned; Homebrew and other
+            // per-user install roots are deliberately not guessed.
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(bin_dir) = exe.parent() {
+                    if let Some(contents) = bin_dir.parent() {
+                        push_macos_dylibs_in(&contents.join("Frameworks"), &mut candidates);
+                    }
+                    push_macos_dylibs_in(bin_dir, &mut candidates);
+                }
+            }
+            candidates.extend(MACOS_ORT_LIB_NAMES.into_iter().map(PathBuf::from));
+            // Explicit, operator-supplied directory; never a hardcoded path.
+            if let Some(dir) = get("AURORA_ORT_DIR") {
+                let dir = PathBuf::from(dir);
+                candidates.extend(MACOS_ORT_LIB_NAMES.into_iter().map(|name| dir.join(name)));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            candidates.extend(
+                ["libonnxruntime.so.1.23", "libonnxruntime.so.1", "libonnxruntime.so"]
+                    .into_iter()
+                    .map(PathBuf::from),
+            );
+            candidates.push(PathBuf::from(
+                "/usr/lib/x86_64-linux-gnu/libonnxruntime.so.1.23",
+            ));
+        }
     }
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|path| seen.insert(path.clone()));
     candidates
+}
+
+/// Platform-neutral "not found" text, listing every candidate that was tried.
+/// Kept separate so the message is testable without touching the filesystem.
+fn library_not_found_message(candidates: &[PathBuf]) -> String {
+    let tried = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "ONNX Runtime library not found; set AURORA_ORT_LIB to an absolute library path \
+         (tried: {tried})"
+    )
 }
 
 /// Working directory and every executable ancestor, so a checkout works both
@@ -1617,15 +1848,7 @@ fn resolve_library() -> Result<PathBuf> {
             return Ok(path.clone());
         }
     }
-    bail!(
-        "ONNX Runtime not found; set AURORA_ORT_LIB to an absolute onnxruntime.dll \
-         (looked in {})",
-        candidates
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    bail!(library_not_found_message(&candidates))
 }
 
 #[cfg(windows)]
@@ -1649,7 +1872,7 @@ unsafe fn load_library(path: &Path) -> Result<*mut c_void> {
     Ok(handle)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 unsafe fn load_library(path: &Path) -> Result<*mut c_void> {
     let name = CString::new(path.as_os_str().to_string_lossy().as_bytes())?;
     let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
@@ -2186,6 +2409,94 @@ mod tests {
     }
 
     #[test]
+    fn provider_names_parse_and_round_trip() {
+        for (raw, expected) in [
+            ("tensorrt", Provider::TensorRt),
+            ("trt", Provider::TensorRt),
+            ("CUDA", Provider::Cuda),
+            ("dml", Provider::DirectMl),
+            ("directml", Provider::DirectMl),
+            ("coreml", Provider::CoreMl),
+            ("core_ml", Provider::CoreMl),
+            (" cpu ", Provider::Cpu),
+        ] {
+            assert_eq!(provider_from_name(raw), Some(expected), "{raw:?}");
+        }
+        assert_eq!(provider_from_name("core ml"), None);
+        assert_eq!(provider_from_name("metal"), None);
+        for provider in [
+            Provider::TensorRt,
+            Provider::Cuda,
+            Provider::DirectMl,
+            Provider::CoreMl,
+            Provider::Cpu,
+        ] {
+            assert_eq!(
+                provider_from_name(provider.label()),
+                Some(provider),
+                "label {:?} must parse back",
+                provider.label()
+            );
+        }
+    }
+
+    #[test]
+    fn macos_default_plan_is_cpu_until_coreml_parity_is_measured() {
+        assert_eq!(
+            providers_for_os("macos", false, false, true),
+            vec![Provider::Cpu],
+            "CoreML is available but not auto-selected without parity evidence"
+        );
+        assert_eq!(
+            providers_for_os("macos", false, false, false),
+            vec![Provider::Cpu],
+            "no CoreML symbol means CPU only"
+        );
+        assert_eq!(
+            providers_for_os("macos", true, true, false),
+            vec![Provider::Cpu],
+            "CUDA/DirectML are not available on macOS"
+        );
+    }
+
+    #[test]
+    fn windows_and_linux_default_plan_ignores_coreml() {
+        assert_eq!(
+            providers_for_os("windows", true, true, true),
+            vec![Provider::Cuda, Provider::DirectMl, Provider::Cpu]
+        );
+        assert_eq!(
+            providers_for_os("windows", false, true, true),
+            vec![Provider::DirectMl, Provider::Cpu]
+        );
+        assert_eq!(providers_for_os("linux", false, false, true), vec![Provider::Cpu]);
+    }
+
+    #[test]
+    fn overrides_can_request_coreml_and_cpu_is_always_kept() {
+        assert_eq!(
+            providers_from_override("coreml,cpu"),
+            vec![Provider::CoreMl, Provider::Cpu]
+        );
+        assert_eq!(
+            providers_from_override("coreml,coreml"),
+            vec![Provider::CoreMl, Provider::Cpu],
+            "duplicates are dropped and CPU is appended"
+        );
+        assert_eq!(providers_from_override("bogus"), vec![Provider::Cpu]);
+        // A forced provider the runtime cannot export falls back to CPU, never
+        // to a different accelerator.
+        assert_eq!(
+            apply_override(vec![Provider::Cpu], Some(Provider::CoreMl)),
+            vec![Provider::Cpu]
+        );
+        assert_eq!(
+            apply_override(vec![Provider::CoreMl, Provider::Cpu], Some(Provider::CoreMl)),
+            vec![Provider::CoreMl, Provider::Cpu]
+        );
+    }
+
+    #[test]
     fn tensorrt_is_not_in_the_default_order_but_can_be_prepended() {
         let default = providers_from(true, true);
         assert!(!default.contains(&Provider::TensorRt));
@@ -2229,6 +2540,97 @@ mod tests {
     }
 
     #[test]
+    fn coreml_symbol_candidates_match_the_real_export() {
+        assert_eq!(
+            provider_symbol(Provider::CoreMl),
+            Some("OrtSessionOptionsAppendExecutionProvider_CoreML")
+        );
+        let candidates = append_symbol_candidates(Provider::CoreMl);
+        assert!(
+            candidates.contains(&"OrtSessionOptionsAppendExecutionProvider_CoreML"),
+            "{candidates:?}"
+        );
+        // macOS `dlsym` is case-sensitive; the capital-M spelling is a fallback.
+        assert!(
+            candidates.contains(&"OrtSessionOptionsAppendExecutionProvider_CoreMl"),
+            "{candidates:?}"
+        );
+        assert!(append_symbol_candidates(Provider::Cpu).is_empty());
+    }
+
+    #[test]
+    fn not_found_message_is_platform_neutral_and_lists_every_candidate() {
+        let candidates = vec![
+            PathBuf::from("libonnxruntime.1.23.2.dylib"),
+            PathBuf::from("/tmp/no-such-dir/libonnxruntime.dylib"),
+        ];
+        let message = library_not_found_message(&candidates);
+        assert!(message.contains("AURORA_ORT_LIB"), "{message}");
+        for candidate in &candidates {
+            assert!(
+                message.contains(&candidate.display().to_string()),
+                "missing {:?} in {message}",
+                candidate
+            );
+        }
+        assert!(!message.contains(".dll"), "the message must be platform-neutral: {message}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_library_candidates_use_official_names_and_no_homebrew_paths() {
+        let names: Vec<String> = library_candidates_from(|_| None, &[])
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        for expected in MACOS_ORT_LIB_NAMES {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected:?} in {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name.contains("libonnxruntime.23.dylib")),
+            "the non-standard short version name must be gone: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("libonnxruntime.dylib.23")),
+            "the non-standard suffix name must be gone: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_ascii_lowercase().contains("homebrew")),
+            "no Homebrew path may be guessed: {names:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_library_candidates_try_the_explicit_path_first() {
+        let explicit = PathBuf::from("/tmp/aurora-ort/libonnxruntime.dylib");
+        let candidates = library_candidates_from(
+            |key| (key == "AURORA_ORT_LIB").then(|| explicit.clone().into_os_string()),
+            &[],
+        );
+        assert_eq!(candidates.first(), Some(&explicit));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ignores_a_relative_aurora_ort_lib() {
+        let relative = "vendor/libonnxruntime.dylib";
+        let candidates = library_candidates_from(
+            |key| (key == "AURORA_ORT_LIB").then(|| std::ffi::OsString::from(relative)),
+            &[],
+        );
+        assert!(
+            !candidates.contains(&PathBuf::from(relative)),
+            "a relative override must not enter the candidate list: {candidates:?}"
+        );
+    }
+
+    #[test]
     fn local_runtime_reports_its_providers() {
         let Some(runtime) = Runtime::get() else {
             println!("ONNX Runtime unavailable; no execution provider list to print");
@@ -2252,6 +2654,9 @@ mod tests {
             model_len: 1024,
             ort_version: "1.31.1".to_string(),
             ort_api: 23,
+            platform: "windows-x86_64".to_string(),
+            runtime: "onnxruntime.dll:1024".to_string(),
+            precision: "fp32".to_string(),
             providers: providers.to_string(),
             options: options.to_string(),
         }
@@ -2277,6 +2682,74 @@ mod tests {
         let cpu = base.for_provider(Provider::Cpu);
         assert_eq!(cpu.providers, "CPU");
         assert_ne!(cpu.digest(), base.digest(), "per-EP cache must not collide");
+    }
+
+    #[test]
+    fn session_key_separates_platform_runtime_precision_and_coreml() {
+        let base = key_for(7, "CPU", "opt=99;threads=8");
+        let mut mac = base.clone();
+        mac.platform = "macos-aarch64".to_string();
+        assert_ne!(base.digest(), mac.digest(), "platform/arch must be part of the key");
+
+        let mut other_runtime = base.clone();
+        other_runtime.runtime = "libonnxruntime.1.20.1.dylib:54213856".to_string();
+        assert_ne!(
+            base.digest(),
+            other_runtime.digest(),
+            "the resolved library identity must be part of the key"
+        );
+
+        let mut fp16 = base.clone();
+        fp16.precision = "fp16".to_string();
+        assert_ne!(base.digest(), fp16.digest(), "precision must be part of the key");
+
+        let coreml = base.for_provider(Provider::CoreMl);
+        assert_eq!(coreml.providers, "CoreML");
+        assert_ne!(
+            coreml.digest(),
+            base.digest(),
+            "a CPU and a CoreML session must never share a cache entry"
+        );
+    }
+
+    #[test]
+    fn precision_is_derived_from_the_model_file_name() {
+        assert_eq!(precision_for_path(Path::new("subjectMaskingFP16.onnx")), "fp16");
+        assert_eq!(precision_for_path(Path::new("FaceDetectionFP16-640.onnx")), "fp16");
+        assert_eq!(precision_for_path(Path::new("subjectMasking.onnx")), "fp32");
+        assert_eq!(precision_for_path(Path::new("skinMasking.onnx")), "fp32");
+    }
+
+    #[test]
+    fn provider_options_hide_the_tensorrt_cache_path() {
+        let id = trt_dir_identity(Some("/Users/alice/private/trt-cache"));
+        assert_eq!(id.len(), 16, "{id}");
+        assert!(!id.contains("alice") && !id.contains('/'), "{id}");
+        assert_eq!(trt_dir_identity(None), "-");
+        assert_eq!(trt_dir_identity(Some("")), "-");
+        assert_ne!(
+            trt_dir_identity(Some("/tmp/cache-a")),
+            trt_dir_identity(Some("/tmp/cache-b")),
+            "different directories must still produce different keys"
+        );
+    }
+
+    #[test]
+    fn runtime_identity_keeps_only_the_file_name_and_size() {
+        let dir = std::env::temp_dir().join(format!("bo8-runtime-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("libonnxruntime.1.23.2.dylib");
+        std::fs::write(&path, b"not a real dylib").unwrap();
+        let identity = runtime_identity(&path);
+        assert_eq!(
+            identity,
+            format!("libonnxruntime.1.23.2.dylib:{}", b"not a real dylib".len())
+        );
+        assert!(
+            !identity.contains(&dir.to_string_lossy().to_string()),
+            "the cache key/log must not contain an absolute user path: {identity}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2401,7 +2874,6 @@ mod tests {
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
     #[test]
     fn single_flight_turns_a_panicking_leader_into_an_error() {
         static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();

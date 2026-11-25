@@ -440,7 +440,28 @@ pub enum MaskKind {
 pub enum PortraitBackend {
     Cpu,
     Cuda,
+    /// A macOS Metal compute pipeline produced the row's pixels.
+    Metal,
     Skipped,
+}
+
+/// Evidence that a Metal compute pipeline actually ran for one row.
+///
+/// The host only reports this after `dispatch_pipeline` observed
+/// `MTLCommandBufferStatusCompleted` with no error, so a non-empty receipt is
+/// the product-level equivalent of `cuda::Dispatch`. CUDA-only fields
+/// (`ptx_bytes`, `compute_cap`, ...) are deliberately absent rather than
+/// filled with zeros.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetalDispatch {
+    /// MSL kernel entry point that was dispatched.
+    pub kernel: &'static str,
+    /// Threadgroups issued: `(ceil(width/16), ceil(height/16))`.
+    pub grid: (u32, u32),
+    /// Threads per threadgroup.
+    pub threads: (u32, u32),
+    /// Number of command-buffer dispatches that produced this row.
+    pub dispatch_count: u32,
 }
 
 /// Machine-readable reason for a row that produced no pixels.
@@ -456,6 +477,9 @@ pub struct PortraitEffectRun {
     pub pf: u32,
     pub backend: PortraitBackend,
     pub dispatches: Vec<Dispatch>,
+    /// Metal receipts. Empty for CPU/CUDA/Skipped rows and for any row that
+    /// did not complete a Metal dispatch.
+    pub metal_dispatches: Vec<MetalDispatch>,
     pub fallback_reason: Option<String>,
     pub skipped: bool,
     pub executed: bool,
@@ -4522,7 +4546,7 @@ fn apply_face_mesh_group(
                 source_uv: &uv,
                 ebo: &mesh_out.initial_indices,
             };
-            let mut stepped = None;
+            let mut stepped: Option<()> = None;
             #[cfg(windows)]
             {
                 let cuda = match forced_cuda_failure() {
@@ -4791,6 +4815,15 @@ fn log_report(report: &PortraitRunReport) {
                     .map(|dispatch| dispatch.kernel)
                     .collect::<Vec<_>>()
             ),
+            PortraitBackend::Metal => log::debug!(
+                "portrait PF{} executed on Metal: {:?}",
+                effect.pf,
+                effect
+                    .metal_dispatches
+                    .iter()
+                    .map(|dispatch| dispatch.kernel)
+                    .collect::<Vec<_>>()
+            ),
             PortraitBackend::Cpu => {
                 match &effect.fallback_reason {
                     Some(reason) => log::debug!("portrait PF{} CPU fallback: {reason}", effect.pf),
@@ -4882,6 +4915,85 @@ pub fn apply_portrait_effects_with_report_and_inputs(
     )
 }
 
+/// Existing dev/AB CPU force, reused verbatim from the Windows CUDA lane.
+/// This is not a new global switch (decision D5): the same `AURORA_*` names
+/// already mean "do not use the GPU" there.
+#[cfg(target_os = "macos")]
+fn metal_forced_cpu() -> Option<&'static str> {
+    let render_backend_cpu = std::env::var("AURORA_PORTRAIT_RENDER_BACKEND")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("cpu"));
+    if render_backend_cpu {
+        return Some("AURORA_PORTRAIT_RENDER_BACKEND=cpu");
+    }
+    if std::env::var_os("AURORA_PORTRAIT_FORCE_CPU").is_some() {
+        return Some("AURORA_PORTRAIT_FORCE_CPU");
+    }
+    None
+}
+
+/// macOS-only product route for the fixed-point SkinAdjust LUT family.
+///
+/// `None` means "this PF has no Metal route here"; P15 (including PF21024),
+/// mesh raster and smile are deliberately absent, so they keep their existing
+/// CPU/CUDA behaviour and are never labelled Metal by this bridge.
+/// `Some(Err(reason))` is a real refusal: the caller records `reason` in
+/// `fallback_reason` and continues on the existing CPU path.
+#[cfg(target_os = "macos")]
+fn try_metal_effect(
+    current: &Image,
+    pf: u32,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+) -> Option<Result<(Image, Vec<MetalDispatch>), String>> {
+    // The LUT assets are the same decoded 512x512x3 PNGs the CPU lane uses.
+    let lut = match pf {
+        90005 => whiten_lut(),
+        90007 => ruddy_lut(),
+        // PF21024/P15, mesh and smile are not routed to Metal by this bridge.
+        _ => return None,
+    };
+    if let Some(reason) = metal_forced_cpu() {
+        return Some(Err(reason.to_string()));
+    }
+    let Some(mask) = skin_mask else {
+        return Some(Err("Metal skin LUT needs a same-size skin mask".to_string()));
+    };
+    let Some(lut) = lut else {
+        return Some(Err(format!("Metal skin LUT asset unavailable for PF{pf}")));
+    };
+    // `mask_u8` is sampled at the frame resolution, so this must hold before
+    // the host's own shape check; report the true reason if it does not.
+    if mask.len() != current.pixel_count() {
+        return Some(Err(format!(
+            "Metal skin LUT mask/source shape mismatch: {}x{} frame, {} mask bytes",
+            current.width,
+            current.height,
+            mask.len()
+        )));
+    }
+    // Exactly the CPU path's clamp (`apply_skin_whiten`/`apply_skin_ruddy`).
+    let mix = degree.clamp(0.0, 1.0);
+    match aurora_portrait::metal::execute_skin_lut_fixed(current, mask, lut, mix) {
+        Ok(out) => {
+            // `execute_skin_lut_fixed` returns only after `dispatch_pipeline`
+            // observed `MTLCommandBufferStatusCompleted` with no command-buffer
+            // error. It issues exactly one dispatch: 16x16 threads per group
+            // over ceil(w/16) x ceil(h/16) groups (`metal.rs::skin_lut_fixed`).
+            let receipt = MetalDispatch {
+                kernel: "skin_lut_fixed",
+                grid: (
+                    current.width.div_ceil(16),
+                    current.height.div_ceil(16),
+                ),
+                threads: (16, 16),
+                dispatch_count: 1,
+            };
+            Some(Ok((out, vec![receipt])))
+        }
+        Err(error) => Some(Err(format!("{error:?}"))),
+    }
+}
+
 fn apply_portrait_effects_with_report_and_inputs_policy(
     portrait: &mut Vec<u8>,
     width: u32,
@@ -4932,6 +5044,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 pf,
                 backend: PortraitBackend::Skipped,
                 dispatches: Vec::new(),
+                metal_dispatches: Vec::new(),
                 fallback_reason: Some(format!("receipt refused: {refusal:?}")),
                 skipped: true,
                 executed: false,
@@ -4996,6 +5109,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 pf,
                 backend: PortraitBackend::Skipped,
                 dispatches: Vec::new(),
+                metal_dispatches: Vec::new(),
                 fallback_reason: Some(format!("{refusal:?}")),
                 skipped: true,
                 executed: false,
@@ -5008,6 +5122,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             pf,
             backend: PortraitBackend::Cpu,
             dispatches: Vec::new(),
+            metal_dispatches: Vec::new(),
             fallback_reason: None,
             skipped: true,
             executed: false,
@@ -5479,6 +5594,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                                     pf,
                                     backend: PortraitBackend::Cuda,
                                     dispatches: vec![dispatches[0].clone()],
+                                    metal_dispatches: Vec::new(),
                                     fallback_reason: None,
                                     skipped: false,
                                     executed: true,
@@ -5489,6 +5605,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                                     pf: next_pf,
                                     backend: PortraitBackend::Cuda,
                                     dispatches: vec![dispatches[1].clone()],
+                                    metal_dispatches: Vec::new(),
                                     fallback_reason: None,
                                     skipped: false,
                                     executed: true,
@@ -5504,7 +5621,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         }
         let needs_hlf_auto = (pf == 30021 && inputs.hlf_face.is_none())
             || (pf == 30022 && inputs.hlf_body.is_none());
-        let mut cuda_hlf_auto_fallback = None;
+        let mut cuda_hlf_auto_fallback: Option<String> = None;
         #[cfg(windows)]
         if needs_hlf_auto {
             if let Some((next, dispatches)) =
@@ -5618,6 +5735,33 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     run.fallback_reason = Some(match run.fallback_reason.take() {
                         Some(previous) => format!("{previous}; CUDA effect: {reason}"),
                         None => reason,
+                    });
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(metal_result) = try_metal_effect(&current, pf, degree, skin_mask.as_deref()) {
+            match metal_result {
+                Ok((next, metal_dispatches)) if !metal_dispatches.is_empty() => {
+                    current = next;
+                    run.backend = PortraitBackend::Metal;
+                    run.metal_dispatches = metal_dispatches;
+                    run.skipped = false;
+                    run.executed = true;
+                    report.effects.push(run);
+                    continue;
+                }
+                Ok(_) => {
+                    let reason = "Metal returned no dispatch; CPU kernel selected for parity";
+                    run.fallback_reason = Some(match run.fallback_reason.take() {
+                        Some(previous) => format!("{previous}; {reason}"),
+                        None => reason.to_string(),
+                    });
+                }
+                Err(reason) => {
+                    run.fallback_reason = Some(match run.fallback_reason.take() {
+                        Some(previous) => format!("{previous}; Metal effect: {reason}"),
+                        None => format!("Metal effect: {reason}"),
                     });
                 }
             }
@@ -5999,6 +6143,7 @@ fn pf90021_skipped(
             pf: 90021,
             backend: PortraitBackend::Skipped,
             dispatches: Vec::new(),
+            metal_dispatches: Vec::new(),
             fallback_reason: Some(detail),
             skipped: true,
             executed: false,
@@ -6131,6 +6276,7 @@ fn apply_pf90021_stage(
                     pf: 90021,
                     backend: PortraitBackend::Skipped,
                     dispatches: Vec::new(),
+                    metal_dispatches: Vec::new(),
                     fallback_reason: Some("neutral direction; no dispatch".to_string()),
                     skipped: true,
                     executed: false,
@@ -6172,6 +6318,7 @@ fn apply_pf90021_stage(
                         pf: 90021,
                         backend: PortraitBackend::Cuda,
                         dispatches,
+                        metal_dispatches: Vec::new(),
                         fallback_reason: None,
                         skipped: false,
                         executed: true,
@@ -6191,6 +6338,7 @@ fn apply_pf90021_stage(
                             pf: 90021,
                             backend: PortraitBackend::Cpu,
                             dispatches: Vec::new(),
+                            metal_dispatches: Vec::new(),
                             fallback_reason: Some(format!("{error:?}")),
                             skipped: false,
                             executed: true,
@@ -6215,6 +6363,7 @@ fn apply_pf90021_stage(
                 pf: 90021,
                 backend: PortraitBackend::Cpu,
                 dispatches: Vec::new(),
+                metal_dispatches: Vec::new(),
                 fallback_reason: None,
                 skipped: false,
                 executed: true,
@@ -6277,6 +6426,7 @@ fn pf30026_skipped(
         pf: 30026,
         backend: PortraitBackend::Skipped,
         dispatches: Vec::new(),
+        metal_dispatches: Vec::new(),
         fallback_reason: Some(detail),
         skipped: true,
         executed: false,
@@ -6296,6 +6446,7 @@ fn pf30026_cpu_fallback(
                 pf: 30026,
                 backend: PortraitBackend::Cpu,
                 dispatches: Vec::new(),
+                metal_dispatches: Vec::new(),
                 fallback_reason: Some(cuda_reason),
                 skipped: false,
                 executed: true,
@@ -6426,6 +6577,7 @@ fn apply_pf30026_stage<'a>(
                     pf: 30026,
                     backend: PortraitBackend::Cuda,
                     dispatches,
+                    metal_dispatches: Vec::new(),
                     fallback_reason: None,
                     skipped: false,
                     executed: true,
@@ -7789,6 +7941,7 @@ fn apply_suit_effect(
         pf: 90033,
         backend: PortraitBackend::Cpu,
         dispatches: Vec::new(),
+        metal_dispatches: Vec::new(),
         fallback_reason: None,
         skipped: true,
         executed: false,
@@ -12569,6 +12722,12 @@ mod tests {
                 };
                 assert_eq!(actual, expected.pixels, "PF30026 CPU fallback parity");
             }
+            PortraitBackend::Metal => {
+                panic!(
+                    "PF30026 must not claim a Metal dispatch: {:?}",
+                    run.metal_dispatches
+                )
+            }
         }
     }
 
@@ -14052,6 +14211,12 @@ mod tests {
                     PortraitBackend::Skipped => {
                         panic!("PF{pf} unexpectedly skipped: {:?}", effect.skip_reason)
                     }
+                    PortraitBackend::Metal => {
+                        assert!(
+                            !effect.metal_dispatches.is_empty(),
+                            "PF{pf} Metal row must carry a dispatch receipt"
+                        );
+                    }
                 }
             }
         }
@@ -14676,6 +14841,12 @@ mod tests {
                 assert!(effect.fallback_reason.is_some());
             }
             PortraitBackend::Skipped => panic!("PF30096 unexpectedly skipped"),
+            PortraitBackend::Metal => {
+                panic!(
+                    "PF30096 has no Metal route: {:?}",
+                    effect.metal_dispatches
+                )
+            }
         }
     }
 
@@ -14756,6 +14927,13 @@ mod tests {
                 effect.fallback_reason
             ),
             PortraitBackend::Skipped => panic!("PF90005 unexpectedly skipped"),
+            PortraitBackend::Metal => {
+                assert!(
+                    !effect.metal_dispatches.is_empty(),
+                    "PF90005 Metal row must carry a dispatch receipt"
+                );
+                assert!(effect.dispatches.is_empty());
+            }
         }
     }
 

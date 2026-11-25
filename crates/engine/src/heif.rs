@@ -1,5 +1,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -100,39 +102,140 @@ struct Dll {
 unsafe impl Send for Dll {}
 unsafe impl Sync for Dll {}
 
+/// Name used in diagnostics; matches the loader compiled into this build.
+#[cfg(windows)]
+const LIB_HEIF: &str = "libheif.dll";
+#[cfg(not(windows))]
+const LIB_HEIF: &str = "libheif";
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryW(filename: *const u16) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn FreeLibrary(module: *mut c_void) -> c_int;
+}
+
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlclose(handle: *mut c_void) -> c_int;
+}
+
+#[cfg(not(windows))]
+const RTLD_NOW: c_int = 2;
+
+/// Candidate libraries for the non-Windows loader.
+///
+/// Order: `AURORA_HEIF_LIB`, then executable-relative locations for a bundled
+/// app (`Contents/Frameworks` and the binary's own directory, i.e. the
+/// `@loader_path` equivalents), then bare names resolved by the system loader.
+/// Nothing is anchored to Homebrew, a user directory or a drive letter.
+#[cfg(not(windows))]
+fn library_candidates() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("AURORA_HEIF_LIB") {
+        return vec![PathBuf::from(path)];
+    }
+    #[cfg(target_os = "macos")]
+    let names: &[&str] = &["libheif.dylib", "libheif.1.dylib"];
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let names: &[&str] = &["libheif.so.1", "libheif.so"];
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(bin_dir) = exe.parent() {
+                let frameworks = bin_dir.join("..").join("Frameworks");
+                for name in names {
+                    candidates.push(frameworks.join(name));
+                }
+                for name in names {
+                    candidates.push(bin_dir.join(name));
+                }
+            }
+        }
+    }
+    for name in names {
+        candidates.push(PathBuf::from(name));
+    }
+    candidates
+}
+
+#[cfg(windows)]
+unsafe fn resolve(module: *mut c_void, name: &str) -> *mut c_void {
+    let mut bytes = Vec::with_capacity(name.len() + 1);
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(0);
+    unsafe { GetProcAddress(module, bytes.as_ptr()) }
+}
+
+#[cfg(not(windows))]
+unsafe fn resolve(module: *mut c_void, name: &str) -> *mut c_void {
+    let Ok(name) = CString::new(name) else {
+        return std::ptr::null_mut();
+    };
+    unsafe { dlsym(module, name.as_ptr()) }
+}
+
+#[cfg(not(windows))]
+unsafe fn open(path: &Path) -> Option<*mut c_void> {
+    let name = CString::new(path.as_os_str().to_string_lossy().as_bytes()).ok()?;
+    let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
+    (!handle.is_null()).then_some(handle)
+}
+
+#[cfg(not(windows))]
+unsafe fn open_first_available() -> Result<*mut c_void> {
+    let mut tried = String::new();
+    for candidate in library_candidates() {
+        if let Some(handle) = unsafe { open(&candidate) } {
+            return Ok(handle);
+        }
+        tried.push_str(&format!("{}; ", candidate.display()));
+    }
+    bail!(
+        "libheif 未找到或加载失败；已尝试 {}。请安装 libheif 或将 AURORA_HEIF_LIB 指向库文件",
+        tried.trim_end_matches("; ")
+    )
+}
+
 impl Drop for Dll {
     fn drop(&mut self) {
         unsafe {
-            #[link(name = "kernel32")]
-            unsafe extern "system" {
-                fn FreeLibrary(module: *mut c_void) -> c_int;
+            #[cfg(windows)]
+            {
+                FreeLibrary(self.module.0);
             }
-            drop(FreeLibrary(self.module.0));
+            #[cfg(not(windows))]
+            {
+                dlclose(self.module.0);
+            }
         }
     }
 }
 
 impl Dll {
     fn load() -> Result<Self> {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn LoadLibraryW(filename: *const u16) -> *mut c_void;
-            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-        }
-        unsafe {
+        #[cfg(windows)]
+        let module = unsafe {
             let name: Vec<u16> = "libheif.dll\0".encode_utf16().collect();
             let module = LoadLibraryW(name.as_ptr());
             if module.is_null() {
                 bail!("libheif.dll 未找到或加载失败；请将 libheif.dll 及其依赖加入 PATH");
             }
+            module
+        };
+
+        #[cfg(not(windows))]
+        let module = unsafe { open_first_available()? };
+
+        unsafe {
             macro_rules! symbol {
                 ($name:literal, $ty:ty) => {{
-                    let address = GetProcAddress(
-                        module,
-                        concat!($name, "\0").as_ptr(),
-                    );
+                    let address = resolve(module, $name);
                     if address.is_null() {
-                        bail!("libheif.dll 缺少导出 {}", $name);
+                        bail!("{} 缺少导出 {}", LIB_HEIF, $name);
                     }
                     std::mem::transmute::<*mut c_void, $ty>(address)
                 }};
@@ -657,6 +760,7 @@ impl Drop for ImageGuard<'_> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn missing_dll_returns_clear_error() {
         #[link(name = "kernel32")]

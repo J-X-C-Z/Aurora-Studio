@@ -208,8 +208,16 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
     // is an escape hatch back to the LibRaw path.
     if c1_raw_enabled() {
         if let Some(mut ctx) = RawDecodeContext::read(path) {
+            let forced = libraw_forced();
+            let forbidden = libraw_forbidden();
             let open_started = Instant::now();
-            let mut session = libraw::Session::open(path, &ctx.bytes, demosaic_quality()).ok();
+            // `AURORA_NO_LIBRAW=1` makes the native front-end the only allowed
+            // source; an installed LibRaw must not silently win instead.
+            let mut session = if forbidden && !forced {
+                None
+            } else {
+                libraw::Session::open(path, &ctx.bytes, demosaic_quality()).ok()
+            };
             ctx.timings.libraw_open_ms = open_started.elapsed().as_millis() as u64;
             let bayer = session.as_mut().and_then(|session| {
                 let unpack_started = Instant::now();
@@ -223,15 +231,20 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
                 ctx.timings.bayer_ms = bayer_started.elapsed().as_millis() as u64;
                 bayer
             });
-            if let Some(bayer) = bayer.as_ref() {
+            // LibRaw first; when it produced no Bayer plane, the native
+            // pure-Rust container decoder reuses these bytes instead of reading
+            // the file again.
+            let effective = effective_bayer(&ctx.bytes, bayer.as_ref());
+            let front_end = effective.as_deref();
+            if let Some(frame) = front_end {
                 ctx.timings
-                    .note_bytes(ctx.bytes.len() as u64 + (bayer.data.len() as u64) * 2);
+                    .note_bytes(ctx.bytes.len() as u64 + (frame.data.len() as u64) * 2);
             }
-            let mut kind = RawKind::classify(path, bayer.as_ref(), ctx.exif.camera_model.as_deref());
+            let mut kind = RawKind::classify(path, front_end, ctx.exif.camera_model.as_deref());
             if let Some((width, height, rgba, route)) = crate::aurora_raw::decode_he_rgba16_with(
                 &ctx.bytes,
                 &ctx.exif,
-                bayer.as_ref(),
+                front_end,
                 &mut ctx.timings,
             ) {
                 log::info!("Aurora Raw decoded {}", path.display());
@@ -281,6 +294,13 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
             }
             // No libraw handle at all (library missing, or the format needs a
             // file handle): keep the historic path and record its cost.
+            if forbidden && !forced {
+                // The native front-end already ran and declined. `AURORA_NO_LIBRAW=1`
+                // must not then fall through to LibRaw's own 16-bit decode.
+                ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+                record_raw_decode(kind, ctx.timings);
+                return None;
+            }
             let fallback_started = Instant::now();
             let decoded = libraw::decode16(path, demosaic_quality());
             ctx.timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
@@ -341,7 +361,10 @@ pub const DECODE_STAGE_REVISIONS: DecodeStageRevisions = DecodeStageRevisions {
     highlight_recovery: 1,
     chromatic_aberration: 1,
     noise_model: 1,
-    z6iii_reconstruction: 1,
+    // Bumped when macOS became able to route a Z6III HE NEF through the Z6III
+    // stage shape (CPU C1 instead of the generic Bayer shape). Windows pays one
+    // conservative re-decode; the persisted layout and `RAW16_MAGIC` are intact.
+    z6iii_reconstruction: 2,
     orientation_active_area: 1,
     output_packing: 1,
 };
@@ -803,7 +826,8 @@ pub struct DecodeRoute {
     pub c1_raw_enabled: bool,
     /// The file is a recognisable Z6III HE NEF and C1 RAW is enabled.
     pub z6iii_nef: bool,
-    /// This build contains the Z6III OpenCL/CPU reconstruction.
+    /// This build contains a Z6III reconstruction: OpenCL on Windows with the
+    /// feature, the CPU C1 chain on every other platform.
     pub z6iii_feature: bool,
     /// The libraw shared library resolves in this process.
     pub libraw_available: bool,
@@ -825,14 +849,21 @@ pub enum OpenClRouteState {
 /// The route inputs for `path`, suitable for hashing into a cache key.
 pub fn decode_route(path: &Path) -> DecodeRoute {
     let c1_raw_enabled = c1_raw_enabled();
-    let z6iii_feature = cfg!(all(windows, feature = "z6iii-raw-export"));
+    // The CPU C1 reconstruction is compiled on every platform; only the OpenCL
+    // backend and the desktop export helpers are Windows-only. `opencl` records
+    // that separately, so a macOS Z6III route can still take the Z6III stage
+    // shape without pretending an OpenCL stage exists.
+    let z6iii_feature = !cfg!(windows) || cfg!(feature = "z6iii-raw-export");
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     let z6iii_nef = c1_raw_enabled
         && z6iii_feature
         && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nef"))
         && crate::z6iii::is_z6iii_nef_file(path);
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-    let z6iii_nef = false;
+    let z6iii_nef = c1_raw_enabled
+        && z6iii_feature
+        && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nef"))
+        && crate::aurora_raw::c1_nef_he::is_z6iii_nef_file(path);
     let mut route = DecodeRoute {
         pipeline_fingerprint: 0,
         c1_raw_enabled,
@@ -965,6 +996,48 @@ pub fn decode_bayer16(path: &Path) -> Result<BayerFrame, BayerError> {
     decode_bayer16_with(path, libraw::unpack_bayer)
 }
 
+fn libraw_forced() -> bool {
+    std::env::var("AURORA_USE_LIBRAW").is_ok_and(|value| value == "1")
+}
+
+fn libraw_forbidden() -> bool {
+    std::env::var("AURORA_NO_LIBRAW").is_ok_and(|value| value == "1")
+}
+
+/// The sensor frame the product 16-bit route feeds to the C1 chain.
+///
+/// LibRaw's unpacked frame keeps priority. When no LibRaw frame exists (library
+/// missing, container unsupported, or unpack failed) the pure-Rust native
+/// front-end decodes the bytes the caller already read, so the product path
+/// gains DNG/ARW/CR2/CR3/ORF/RW2/RAF/classic-NEF support without a second disk
+/// read. `AURORA_USE_LIBRAW=1` still forbids the native front-end.
+fn effective_bayer<'a>(
+    bytes: &[u8],
+    libraw_bayer: Option<&'a BayerFrame>,
+) -> Option<std::borrow::Cow<'a, BayerFrame>> {
+    use std::borrow::Cow;
+    if let Some(frame) = libraw_bayer {
+        return Some(Cow::Borrowed(frame));
+    }
+    if libraw_forced() {
+        return None;
+    }
+    match crate::aurora_raw::rust_raw::decode_bytes(bytes) {
+        Ok(frame) => {
+            raw_trace!(
+                "RAWTRACE native product16 {}x{}",
+                frame.raw_width,
+                frame.raw_height
+            );
+            Some(Cow::Owned(frame))
+        }
+        Err(error) => {
+            raw_trace!("RAWTRACE native product16: {error}");
+            None
+        }
+    }
+}
+
 /// Native front-end switch.
 ///
 /// `AURORA_USE_LIBRAW=1` forces the DLL path; `AURORA_NO_LIBRAW=1` forbids the
@@ -975,8 +1048,8 @@ pub(crate) fn decode_bayer16_with(
     path: &Path,
     libraw: impl FnOnce(&Path) -> Result<BayerFrame, BayerError>,
 ) -> Result<BayerFrame, BayerError> {
-    let forced = std::env::var("AURORA_USE_LIBRAW").is_ok_and(|value| value == "1");
-    let forbidden = std::env::var("AURORA_NO_LIBRAW").is_ok_and(|value| value == "1");
+    let forced = libraw_forced();
+    let forbidden = libraw_forbidden();
     if !forced {
         match crate::aurora_raw::rust_raw::decode(path) {
             Ok(frame) => {
@@ -1264,7 +1337,9 @@ mod libraw {
 
     #[cfg(target_os = "windows")]
     const LIBRARY_NAMES: [&str; 1] = ["libraw.dll\0"];
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    const LIBRARY_NAMES: [&str; 3] = ["libraw.dylib\0", "libraw.23.dylib\0", "libraw.dylib.23\0"];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     const LIBRARY_NAMES: [&str; 2] = ["libraw.so.23\0", "libraw.so\0"];
 
     unsafe extern "C" {
@@ -1421,7 +1496,48 @@ mod libraw {
         std::ptr::null_mut()
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    fn load_library(name: &str) -> *mut c_void {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = name.trim_end_matches('\0');
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        // 1. Explicit override.
+        if let Some(dir) = std::env::var_os("AURORA_LIBRAW_DIR") {
+            dirs.push(dir.into());
+        }
+        // 2. App bundle: Contents/MacOS/<exe> -> Contents/Frameworks.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                dirs.push(parent.join("../Frameworks"));
+                dirs.push(parent.join("Frameworks"));
+                dirs.push(parent.to_path_buf());
+                dirs.push(parent.join("../Resources"));
+            }
+        }
+        dirs.push(std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/libraw/lib"
+        )));
+        for dir in dirs {
+            let candidate = dir.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+            if let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) {
+                let handle = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+                if !handle.is_null() {
+                    return handle;
+                }
+            }
+        }
+        // 3. Standard macOS name and the dynamic loader's own search path.
+        match CString::new(name) {
+            Ok(c) => unsafe { dlopen(c.as_ptr(), RTLD_NOW) },
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     fn load_library(name: &str) -> *mut c_void {
         unsafe { dlopen(name.as_ptr() as *const c_char, RTLD_NOW) }
     }
@@ -1437,7 +1553,12 @@ mod libraw {
         (!ptr.is_null()).then(|| unsafe { std::mem::transmute_copy(&ptr) })
     }
 
-    fn start(path: &Path) -> Result<(*mut c_void, &'static Api, Vec<u16>), String> {
+    #[cfg(target_os = "windows")]
+    type PathArg = Vec<u16>;
+    #[cfg(not(target_os = "windows"))]
+    type PathArg = CString;
+
+    fn start(path: &Path) -> Result<(*mut c_void, &'static Api, PathArg), String> {
         let api = api().ok_or("libraw library not found")?;
         #[cfg(target_os = "windows")]
         let path = {
@@ -2830,8 +2951,10 @@ mod tests {
             base.pipeline_fingerprint(&libraw_only),
             "a LibRaw-only route never runs our chromatic aberration stage"
         );
-        let z6iii_bump =
-            DecodeStageRevisions { z6iii_reconstruction: 2, ..base };
+        let z6iii_bump = DecodeStageRevisions {
+            z6iii_reconstruction: base.z6iii_reconstruction + 1,
+            ..base
+        };
         assert_ne!(
             z6iii_bump.pipeline_fingerprint(&z6iii),
             base.pipeline_fingerprint(&z6iii)
@@ -3211,5 +3334,166 @@ mod tests {
         assert_eq!(mismatches, 0, "native sensor pixels differ from LibRaw");
     }
 
+    /// Minimal little-endian TIFF whose IFD0 carries only Make and Model.
+    fn z6iii_body_tiff() -> Vec<u8> {
+        let make = b"NIKON CORPORATION\0";
+        let model = b"NIKON Z6_3\0";
+        let mut out = Vec::from(*b"II\x2a\x00\x08\x00\x00\x00");
+        out.extend_from_slice(&2u16.to_le_bytes());
+        let ifd0 = out.len();
+        out.resize(ifd0 + 2 * 12, 0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let make_offset = out.len();
+        out.extend_from_slice(make);
+        let model_offset = out.len();
+        out.extend_from_slice(model);
+        let entry = |out: &mut Vec<u8>, index: usize, tag: u16, count: usize, offset: usize| {
+            let at = ifd0 + index * 12;
+            out[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+            out[at + 2..at + 4].copy_from_slice(&2u16.to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&(count as u32).to_le_bytes());
+            out[at + 8..at + 12].copy_from_slice(&(offset as u32).to_le_bytes());
+        };
+        entry(&mut out, 0, 0x010f, make.len(), make_offset);
+        entry(&mut out, 1, 0x0110, model.len(), model_offset);
+        out
+    }
+
+    /// Minimal uncompressed NEF: one 64x64 16-bit RGGB strip. The native
+    /// front-end can decode it without LibRaw. These are not camera pixels.
+    fn synthetic_uncompressed_nef() -> Vec<u8> {
+        const W: usize = 64;
+        const H: usize = 64;
+        let make = b"NIKON CORPORATION\0";
+        let model = b"NIKON Z 6_2\0";
+        let filters = 0x9494_9494u32;
+        let mut samples = Vec::with_capacity(W * H * 2);
+        for y in 0..H {
+            for x in 0..W {
+                let c = ((filters >> ((((y << 1) & 14) + (x & 1)) << 1)) & 3) as u8;
+                let value = match c {
+                    0 => 16000u16,
+                    2 => 12000,
+                    _ => 14000,
+                };
+                samples.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mut out = Vec::from(*b"II\x2a\x00\x08\x00\x00\x00");
+        let count = 11u16;
+        out.extend_from_slice(&count.to_le_bytes());
+        let ifd0 = out.len();
+        out.resize(ifd0 + count as usize * 12, 0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let make_offset = out.len();
+        out.extend_from_slice(make);
+        let model_offset = out.len();
+        out.extend_from_slice(model);
+        if out.len() % 2 != 0 {
+            out.push(0);
+        }
+        let strip_offset = out.len();
+        out.extend_from_slice(&samples);
+
+        let entry = |out: &mut Vec<u8>, index: usize, tag: u16, typ: u16, count: u32, value: [u8; 4]| {
+            let at = ifd0 + index * 12;
+            out[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+            out[at + 2..at + 4].copy_from_slice(&typ.to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&count.to_le_bytes());
+            out[at + 8..at + 12].copy_from_slice(&value);
+        };
+        let offset = |value: usize| (value as u32).to_le_bytes();
+        let short = |value: u16| {
+            let mut bytes = [0u8; 4];
+            bytes[..2].copy_from_slice(&value.to_le_bytes());
+            bytes
+        };
+        entry(&mut out, 0, 0x0100, 4, 1, offset(W));
+        entry(&mut out, 1, 0x0101, 4, 1, offset(H));
+        entry(&mut out, 2, 0x0102, 3, 1, short(16));
+        entry(&mut out, 3, 0x0103, 3, 1, short(1));
+        entry(&mut out, 4, 0x0106, 3, 1, short(32803));
+        entry(&mut out, 5, 0x010f, 2, make.len() as u32, offset(make_offset));
+        entry(&mut out, 6, 0x0110, 2, model.len() as u32, offset(model_offset));
+        entry(&mut out, 7, 0x0111, 4, 1, offset(strip_offset));
+        entry(&mut out, 8, 0x0115, 3, 1, short(1));
+        entry(&mut out, 9, 0x0116, 4, 1, offset(H));
+        entry(&mut out, 10, 0x0117, 4, 1, offset(samples.len()));
+        out
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_route_recognises_a_z6iii_body_on_this_platform() {
+        if !c1_raw_enabled() {
+            return;
+        }
+        let path = temp_file("z6iii-route.nef", &z6iii_body_tiff());
+        let route = decode_route(&path);
+        let expected = cfg!(not(windows)) || cfg!(feature = "z6iii-raw-export");
+        assert_eq!(route.z6iii_feature, expected);
+        assert_eq!(route.z6iii_nef, expected, "a Z6III body must be recognised");
+        #[cfg(not(windows))]
+        {
+            assert_eq!(route.opencl, OpenClRouteState::NotCompiled);
+            let generic = DecodeRoute { z6iii_nef: false, ..route };
+            assert_ne!(
+                route.pipeline_fingerprint,
+                DECODE_STAGE_REVISIONS.pipeline_fingerprint(&generic),
+                "the Z6III route must not share the generic Bayer stage shape"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_front_end_feeds_the_product_16_bit_route_without_libraw() {
+        if !c1_raw_enabled() {
+            return;
+        }
+        let bytes = synthetic_uncompressed_nef();
+        let native = effective_bayer(&bytes, None)
+            .expect("the native front-end must decode the synthetic NEF from bytes alone");
+        assert_eq!((native.raw_width, native.raw_height), (64, 64));
+        assert_eq!(native.data.len(), 64 * 64);
+
+        let path = temp_file("native-product16.nef", &bytes);
+        // Force the no-LibRaw branch so the test proves the native path rather
+        // than whatever LibRaw happens to be installed on the test machine.
+        let guard = EnvGuard::set("AURORA_NO_LIBRAW", "1");
+        let decoded = decode16_traced(&path);
+        drop(guard);
+        let (width, height, pixels, provenance) =
+            decoded.expect("the native C1 chain should decode the synthetic NEF");
+        assert!(width >= 46 && height >= 46, "{width}x{height}");
+        assert_eq!(pixels.len(), (width as usize) * (height as usize) * 4);
+        assert_eq!(provenance.backend, DecodeBackend::AuroraCpuChain);
+        assert_eq!(provenance.pixel_space, PixelSpace::CameraLinear16);
+        assert!(!provenance.z6iii_linear);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 

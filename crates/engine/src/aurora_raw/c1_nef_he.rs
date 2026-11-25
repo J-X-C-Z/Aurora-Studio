@@ -118,6 +118,37 @@ impl<'a> Tiff<'a> {
     }
 }
 
+/// Whether this TIFF carries the Z6III body identification.
+///
+/// Pure TIFF IFD0 tags 0x010F (Make) and 0x0110 (Model). This lives here, not in
+/// the Windows-only reconstruction module, so a platform without OpenCL can
+/// still tell a Z6III NEF from every other body.
+#[allow(dead_code)]
+pub fn is_z6iii_nef(nef: &[u8]) -> bool {
+    let Some(tiff) = Tiff::from_bytes(nef) else { return false };
+    let Ok(root) = tiff.root() else { return false };
+    let matches_ascii = |tag, expected: &[u8]| {
+        tiff.entry(root, tag).is_some_and(|entry| {
+            let size = tiff.long(&entry[4..]);
+            tiff.short(&entry[2..]) == 2 && size == expected.len()
+                && tiff.range(tiff.long(&entry[8..]), size).ok() == Some(expected)
+        })
+    };
+    matches_ascii(271, b"NIKON CORPORATION\0") && matches_ascii(272, b"NIKON Z6_3\0")
+}
+
+/// [`is_z6iii_nef`] over a file the caller has not read into memory yet.
+///
+/// The mapping is read-only and lazy, so this costs the same as the Windows
+/// `z6iii::is_z6iii_nef_file` route without reading the whole NEF.
+#[allow(dead_code)]
+pub fn is_z6iii_nef_file(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    // SAFETY: the mapping is read-only and lives only for this call.
+    let Ok(bytes) = (unsafe { memmap2::Mmap::map(&file) }) else { return false };
+    is_z6iii_nef(&bytes)
+}
+
 fn nikon_maker_tiff(nef: &[u8]) -> Result<Option<Tiff<'_>>> {
     let Some(tiff) = Tiff::from_bytes(nef) else {
         return Ok(None);
@@ -363,6 +394,38 @@ mod tests {
         assert!(crop.validate(6064, 4035).is_err());
         assert!(NikonCrop { width: 0, ..crop }.validate(6064, 4040).is_err());
         assert_eq!(nikon_crop(b"other file").unwrap(), None);
+    }
+
+    /// Minimal little-endian TIFF whose IFD0 carries only Make and Model.
+    fn body_tiff(make: &[u8], model: &[u8]) -> Vec<u8> {
+        let mut nef = Vec::from(*b"II\x2a\x00\x08\x00\x00\x00");
+        nef.extend(2u16.to_le_bytes());
+        let entries = nef.len();
+        nef.extend([0u8; 2 * 12]);
+        nef.extend(0u32.to_le_bytes());
+        let data = nef.len();
+        let model_offset = data + make.len();
+        nef.extend_from_slice(make);
+        nef.extend_from_slice(model);
+        let write = |nef: &mut Vec<u8>, at: usize, tag: u16, count: usize, offset: usize| {
+            nef[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+            nef[at + 2..at + 4].copy_from_slice(&2u16.to_le_bytes());
+            nef[at + 4..at + 8].copy_from_slice(&(count as u32).to_le_bytes());
+            nef[at + 8..at + 12].copy_from_slice(&(offset as u32).to_le_bytes());
+        };
+        write(&mut nef, entries, 271, make.len(), data);
+        write(&mut nef, entries + 12, 272, model.len(), model_offset);
+        nef
+    }
+
+    #[test]
+    fn z6iii_body_identification_is_a_pure_tiff_check() {
+        assert!(is_z6iii_nef(&body_tiff(b"NIKON CORPORATION\0", b"NIKON Z6_3\0")));
+        assert!(!is_z6iii_nef(&body_tiff(b"NIKON CORPORATION\0", b"NIKON Z 6_2\0")));
+        assert!(!is_z6iii_nef(&body_tiff(b"Canon\0", b"NIKON Z6_3\0")));
+        assert!(!is_z6iii_nef(b"not a tiff"));
+        assert!(!is_z6iii_nef(b"II\x2a\x00\xff\xff\xff\xff"));
+        assert!(!is_z6iii_nef(&[]));
     }
 
     #[test]

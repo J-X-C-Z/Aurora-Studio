@@ -1,3 +1,10 @@
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("n35_reuse_acceptance requires Windows CUDA; skipped on this platform");
+}
+
+#[cfg(windows)]
+mod cuda_example {
 use aurora_portrait::cuda::{DriverMetrics, driver_metrics};
 use aurora_portrait::cuda_eye_bag::{self, EyeBag};
 use aurora_portrait::cuda_mesh_attribute::MeshAttribute;
@@ -808,7 +815,7 @@ fn push_case(cases: &mut Vec<Case>, case: Case) {
     cases.push(case);
 }
 
-fn main() {
+pub(crate) fn main() {
     assert!(std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_some());
     let mut cases = Vec::new();
     push_case(&mut cases, run_facial_smooth(6000, 4000));
@@ -853,4 +860,10 @@ fn main() {
     }
     println!("  ]");
     println!("}}");
+}
+}
+
+#[cfg(windows)]
+fn main() {
+    cuda_example::main();
 }

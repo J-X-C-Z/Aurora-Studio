@@ -3469,8 +3469,11 @@ mod driver {
 
 #[cfg(windows)]
 pub use driver::DeviceBuffer;
+#[cfg(windows)]
 pub use driver::HostRegistration;
+#[cfg(windows)]
 pub use driver::PinnedBuffer;
+#[cfg(windows)]
 pub use driver::Stream;
 #[cfg(windows)]
 pub use driver::{BufferSession, JobBufferSession, Nvidia};

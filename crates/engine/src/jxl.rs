@@ -1,5 +1,10 @@
-use std::ffi::{c_char, c_int, c_void, OsStr};
+use std::ffi::{c_char, c_int, c_void};
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::slice;
 
@@ -133,6 +138,7 @@ struct Library {
 }
 
 impl Library {
+    #[cfg(windows)]
     fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("libjxl.dll");
         if !path.is_file() {
@@ -144,6 +150,45 @@ impl Library {
             bail!("failed to load {}", path.display());
         }
         Ok(Self { handle })
+    }
+
+    #[cfg(unix)]
+    fn load(dir: &Path) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        const NAMES: [&str; 3] = ["libjxl.dylib", "libjxl.0.dylib", "libjxl.1.dylib"];
+        #[cfg(not(target_os = "macos"))]
+        const NAMES: [&str; 3] = ["libjxl.so", "libjxl.so.0", "libjxl.so.1"];
+        let mut tried: Vec<String> = Vec::new();
+        // A library shipped beside the executable (or pointed at by the
+        // AURORA_JXL_DIR the caller resolved) wins over the system search path.
+        for name in NAMES {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+                let handle = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+                if !handle.is_null() {
+                    return Ok(Self { handle });
+                }
+            }
+            tried.push(path.display().to_string());
+        }
+        // Fall back to the dynamic loader's own search path (DYLD_LIBRARY_PATH
+        // and the installed system copy on macOS, ldconfig paths on Linux).
+        for name in NAMES {
+            if let Ok(c) = std::ffi::CString::new(name) {
+                let handle = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+                if !handle.is_null() {
+                    return Ok(Self { handle });
+                }
+            }
+        }
+        bail!(
+            "libjxl not found in {} or the dynamic loader search path (tried {})",
+            dir.display(),
+            tried.join(", ")
+        )
     }
 
     fn symbols(&self) -> Result<Symbols> {
@@ -166,7 +211,10 @@ impl Library {
 
     unsafe fn symbol<T>(&self, name: &str) -> Result<T> {
         let name = std::ffi::CString::new(name)?;
+        #[cfg(windows)]
         let pointer = unsafe { GetProcAddress(self.handle, name.as_ptr() as *const c_char) };
+        #[cfg(unix)]
+        let pointer = unsafe { dlsym(self.handle, name.as_ptr()) };
         if pointer.is_null() {
             bail!("missing libjxl export {}", name.to_string_lossy());
         }
@@ -176,7 +224,14 @@ impl Library {
 
 impl Drop for Library {
     fn drop(&mut self) {
-        unsafe { FreeLibrary(self.handle) };
+        #[cfg(windows)]
+        unsafe {
+            FreeLibrary(self.handle);
+        }
+        #[cfg(unix)]
+        unsafe {
+            dlclose(self.handle);
+        }
     }
 }
 
@@ -416,14 +471,26 @@ fn check(status: Status, action: &'static str) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn LoadLibraryW(path: *const u16) -> *mut c_void;
     fn FreeLibrary(library: *mut c_void) -> c_int;
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+#[cfg(unix)]
+const RTLD_NOW: c_int = 2;
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", link(name = "dl"))]
+unsafe extern "C" {
+    fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn dlclose(handle: *mut c_void) -> c_int;
 }
 
 #[cfg(test)]

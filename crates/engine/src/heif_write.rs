@@ -127,6 +127,8 @@ fn library_candidates() -> Vec<PathBuf> {
     }
     if cfg!(windows) {
         vec!["libheif.dll".into(), "heif.dll".into()]
+    } else if cfg!(target_os = "macos") {
+        vec!["libheif.dylib".into(), "libheif.1.dylib".into()]
     } else {
         vec!["libheif.so.1".into(), "libheif.so".into()]
     }

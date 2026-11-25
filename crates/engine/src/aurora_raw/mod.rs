@@ -6,6 +6,7 @@
 //! `AURORA_C1_RAW=1` in `crate::raw` until the demosaic output has a visual
 //! acceptance of its own.
 
+pub mod c1_nef_he;
 pub mod c1_raw_he;
 pub mod xtrans;
 pub(crate) mod rust_raw;
@@ -100,8 +101,32 @@ pub(crate) fn decode_he_rgba16_with(
     let (z6iii_frame, opencl) =
         z6iii::render_linear_rgba16_traced(bytes, libraw_bayer, ca_warp.as_ref());
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-    let (z6iii_frame, opencl): (Option<(usize, usize, Vec<u16>)>, OpenClRoute) =
-        (None, OpenClRoute::NotZ6iii);
+    let (z6iii_frame, opencl): (Option<(usize, usize, Vec<u16>)>, OpenClRoute) = (
+        None,
+        // The OpenCL backend is not compiled on this platform, so no OpenCL
+        // stage can run. A recognised Z6III HE body still carries
+        // `z6iii_linear`, which records the source colour space for cache
+        // routing. It does NOT mean the pre-matrix ran here: the CPU C1 chain
+        // produces camera-linear pixels, while the Z6III pre-matrix / film /
+        // Camera CLUT colour stage is still compiled only in the Windows build
+        // (`mock::process::build_plan`). Output on this platform is therefore
+        // not colour-equivalent to Windows yet.
+        if c1_nef_he::is_z6iii_nef(bytes)
+            && matches!(c1_nef_he::find_he_strip(bytes), Ok(Some(_)))
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!(
+                    "Z6III HE source detected: camera-linear C1 decode is available on this platform, \
+                     but the Z6III pre-matrix/film/Camera-CLUT colour stage is Windows-only in this \
+                     build; colours will not match the Windows renderer"
+                );
+            });
+            OpenClRoute::Unavailable
+        } else {
+            OpenClRoute::NotZ6iii
+        },
+    );
     timings.z6iii_ms += z6iii_started.elapsed().as_millis() as u64;
 
     if let Some((width, height, rgba)) = z6iii_frame {
@@ -547,5 +572,129 @@ mod tests {
             let center = ((h / 2) * w + (w / 2)) * 4;
             assert!(out[center] > 1000 && out[center + 1] > 1000 && out[center + 2] > 1000);
         }
+    }
+
+    /// Minimal Z6III HE metadata: IFD0 carries Make/Model and a SubIFD whose
+    /// single strip matches the verified HE layout (14-bit, compression 34713,
+    /// RGGB CFA, JPEG-XS strip markers). No bitstream is decoded here, so this
+    /// proves route identification only, never pixel correctness.
+    fn z6iii_he_metadata() -> Vec<u8> {
+        const W: usize = 64;
+        const H: usize = 64;
+        let make = b"NIKON CORPORATION\0";
+        let model = b"NIKON Z6_3\0";
+        let strip: [u8; 8] = [0xff, 0x10, 0xff, 0x50, 0x00, 0x00, 0xff, 0x11];
+        let mut out = Vec::from(*b"II\x2a\x00\x08\x00\x00\x00");
+        out.extend_from_slice(&3u16.to_le_bytes());
+        let ifd0 = out.len();
+        out.resize(ifd0 + 3 * 12, 0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let make_offset = out.len();
+        out.extend_from_slice(make);
+        let model_offset = out.len();
+        out.extend_from_slice(model);
+        if out.len() % 2 != 0 {
+            out.push(0);
+        }
+        let sub_ifd = out.len();
+        out.extend_from_slice(&10u16.to_le_bytes());
+        let sub = out.len();
+        out.resize(sub + 10 * 12, 0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let strip_offset = out.len();
+        out.extend_from_slice(&strip);
+
+        let entry = |out: &mut Vec<u8>, at: usize, tag: u16, typ: u16, count: u32, value: [u8; 4]| {
+            out[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+            out[at + 2..at + 4].copy_from_slice(&typ.to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&count.to_le_bytes());
+            out[at + 8..at + 12].copy_from_slice(&value);
+        };
+        let offset = |value: usize| (value as u32).to_le_bytes();
+        let short = |value: u16| {
+            let mut bytes = [0u8; 4];
+            bytes[..2].copy_from_slice(&value.to_le_bytes());
+            bytes
+        };
+        entry(&mut out, ifd0, 0x010f, 2, make.len() as u32, offset(make_offset));
+        entry(&mut out, ifd0 + 12, 0x0110, 2, model.len() as u32, offset(model_offset));
+        entry(&mut out, ifd0 + 24, 0x014a, 4, 1, offset(sub_ifd));
+        entry(&mut out, sub, 0x0100, 4, 1, offset(W));
+        entry(&mut out, sub + 12, 0x0101, 4, 1, offset(H));
+        entry(&mut out, sub + 24, 0x0102, 3, 1, short(14));
+        entry(&mut out, sub + 36, 0x0103, 3, 1, short(34713));
+        entry(&mut out, sub + 48, 0x0106, 3, 1, short(32803));
+        entry(&mut out, sub + 60, 0x0111, 4, 1, offset(strip_offset));
+        entry(&mut out, sub + 72, 0x0115, 3, 1, short(1));
+        entry(&mut out, sub + 84, 0x0116, 4, 1, offset(H));
+        entry(&mut out, sub + 96, 0x0117, 4, 1, offset(strip.len()));
+        entry(&mut out, sub + 108, 0x828e, 1, 4, [0, 1, 1, 2]);
+        out
+    }
+
+    fn stub_rggb_bayer() -> crate::raw::BayerFrame {
+        let (raw_w, raw_h) = (64usize, 64usize);
+        let filters = 0x9494_9494u32;
+        let mut data = vec![0u16; raw_w * raw_h];
+        for y in 0..raw_h {
+            for x in 0..raw_w {
+                let c = ((filters >> ((((y << 1) & 14) + (x & 1)) << 1)) & 3) as u8;
+                data[y * raw_w + x] = match c {
+                    0 => 4000,
+                    2 => 3000,
+                    _ => 3500,
+                };
+            }
+        }
+        crate::raw::BayerFrame {
+            raw_width: raw_w,
+            raw_height: raw_h,
+            width: 64,
+            height: 64,
+            top_margin: 0,
+            left_margin: 0,
+            stride: raw_w * 2,
+            bits: 14,
+            data,
+            filters,
+            colors: 3,
+            black: 0,
+            maximum: 16383,
+            cam_mul: [2048.0, 1024.0, 1536.0, 1024.0],
+            rgb_cam: [[0.0; 4]; 3],
+        }
+    }
+
+    /// macOS has no OpenCL backend, so a recognised Z6III HE file must carry
+    /// `z6iii_linear` while reporting that no OpenCL stage ran. The pixels come
+    /// from the generic C1 chain over a stub Bayer plane; this is a routing
+    /// test, not a claim about real Z6III pixels.
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    #[test]
+    fn z6iii_he_identification_marks_cpu_route_without_claiming_opencl() {
+        let bytes = z6iii_he_metadata();
+        let bayer = stub_rggb_bayer();
+        let exif = crate::Exif {
+            camera_model: Some("NIKON Z 6_3".into()),
+            iso: Some(400),
+            ..Default::default()
+        };
+        let mut timings = crate::raw::RawStageTimings::default();
+        let (width, height, pixels, route) =
+            super::decode_he_rgba16_with(&bytes, &exif, Some(&bayer), &mut timings)
+                .expect("the generic C1 chain should still run with the stub Bayer");
+        assert_eq!(route, super::AuroraRoute::Z6iiiCpuOpenClUnavailable);
+        let provenance = crate::raw::DecodeProvenance::aurora(route);
+        assert!(provenance.z6iii_linear);
+        assert_eq!(provenance.backend, crate::raw::DecodeBackend::AuroraCpuChain);
+        assert_eq!(provenance.opencl, crate::raw::OpenClStatus::Unavailable);
+        assert_ne!(provenance.opencl, crate::raw::OpenClStatus::Succeeded);
+        assert_eq!(provenance.pixel_space, crate::raw::PixelSpace::CameraLinear16);
+        assert!(
+            provenance.unlocks_c1_z6iii_linear(),
+            "the pre-matrix guard still requires z6iii_linear && CameraLinear16"
+        );
+        assert!(width > 0 && height > 0);
+        assert_eq!(pixels.len(), (width as usize) * (height as usize) * 4);
     }
 }
