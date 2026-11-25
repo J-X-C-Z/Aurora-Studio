@@ -4,6 +4,8 @@
 //! deltas at a shared shift.  Values are doubled (`curve[pix << 1]`, identity
 //! curve) exactly as LibRaw's `sony_arw2_load_raw` does.
 
+use rayon::prelude::*;
+
 use super::tiff::{Ifd, Tiff};
 use super::{cfa_filters, make_frame, meta, NativeError, NativeResult};
 
@@ -190,7 +192,9 @@ fn sony_curve(ifd: &Ifd<'_>) -> Option<Vec<u16>> {
     for (index, &value) in values.iter().take(4).enumerate() {
         stops[index + 1] = i32::from((value >> 2) & 0x0fff);
     }
-    let mut curve: Vec<u16> = (0..=u16::MAX).map(|value| value).collect();
+    // ARW2 indexes `curve[pix << 1]` where `pix <= 0x7ff`, so 4096 entries
+    // cover every possible lookup while fitting in L1 cache.
+    let mut curve: Vec<u16> = (0..4096u16).collect();
     for step in 0..5 {
         let (start, end) = (stops[step], stops[step + 1]);
         let mut at = start + 1;
@@ -215,13 +219,13 @@ fn decode_arw2(
     raw_height: usize,
     curve: Option<&[u16]>,
 ) -> NativeResult<Vec<u16>> {
-    if strip.len() < raw_width * raw_height {
+    if strip.len() < raw_width.saturating_mul(raw_height) {
         return Err(NativeError::corrupt("ARW2 strip is shorter than one byte per pixel"));
     }
     let mut out = vec![0u16; raw_width * raw_height];
-    let mut block = [0u16; 16];
-    for row in 0..raw_height {
+    let decode_row = |row: usize, out_row: &mut [u16]| {
         let row_data = &strip[row * raw_width..(row + 1) * raw_width];
+        let mut block = [0u16; 16];
         let mut data_at = 0usize;
         let mut col = 0usize;
         while col + 30 < raw_width && data_at + 16 <= row_data.len() {
@@ -232,7 +236,7 @@ fn decode_arw2(
             let maximum_index = ((packed >> 22) & 0x0f) as usize;
             let minimum_index = ((packed >> 26) & 0x0f) as usize;
             let mut shift = 0u32;
-            let range = maximum.checked_sub(minimum).unwrap_or(0);
+            let range = maximum.saturating_sub(minimum);
             while shift < 4 && (0x80u32 << shift) <= range {
                 shift += 1;
             }
@@ -244,15 +248,15 @@ fn decode_arw2(
                     *slot = minimum as u16;
                 } else {
                     let at = (bit >> 3) as usize;
-                    let offset = (bit & 7) as u32;
+                    let offset = bit & 7;
                     // LibRaw reads past the 16-byte block into the next one;
                     // the row buffer is contiguous, so do the same.
+                    let pos = data_at + at;
                     let word = u16::from_le_bytes([
-                        *row_data.get(data_at + at).unwrap_or(&0),
-                        *row_data.get(data_at + at + 1).unwrap_or(&0),
+                        *row_data.get(pos).unwrap_or(&0),
+                        *row_data.get(pos + 1).unwrap_or(&0),
                     ]);
-                    let value = ((u32::from(word) >> offset) & 0x7f) << shift;
-                    let value = value + minimum;
+                    let value = (((u32::from(word) >> offset) & 0x7f) << shift) + minimum;
                     *slot = value.min(0x7ff) as u16;
                     bit += 7;
                 }
@@ -260,7 +264,7 @@ fn decode_arw2(
             for &value in &block {
                 let index = usize::from(value) << 1;
                 let scaled = curve.and_then(|curve| curve.get(index)).copied().unwrap_or(index as u16);
-                if let Some(slot) = out.get_mut(row * raw_width + col) {
+                if let Some(slot) = out_row.get_mut(col) {
                     *slot = scaled;
                 }
                 col += 2;
@@ -271,6 +275,15 @@ fn decode_arw2(
             } else {
                 col -= 31;
             }
+        }
+    };
+    if raw_height >= 32 {
+        out.par_chunks_exact_mut(raw_width)
+            .enumerate()
+            .for_each(|(row, out_row)| decode_row(row, out_row));
+    } else {
+        for (row, out_row) in out.chunks_exact_mut(raw_width).enumerate() {
+            decode_row(row, out_row);
         }
     }
     Ok(out)

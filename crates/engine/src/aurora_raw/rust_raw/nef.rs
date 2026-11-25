@@ -168,10 +168,8 @@ impl<'a> BitReader<'a> {
         Self { data, pos, end: end.min(data.len()), buffer: 0, buffered: 0, past_end: 0 }
     }
 
-    fn get(&mut self, count: u8) -> u32 {
-        if count == 0 {
-            return 0;
-        }
+    #[inline(always)]
+    fn fill_to(&mut self, count: u8) {
         while self.buffered < count {
             let byte = if self.pos < self.end {
                 self.data[self.pos]
@@ -185,15 +183,28 @@ impl<'a> BitReader<'a> {
             self.buffer = (self.buffer << 8) | u64::from(byte);
             self.buffered += 8;
         }
+    }
+
+    #[inline(always)]
+    fn get(&mut self, count: u8) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        self.fill_to(count);
         self.buffered -= count;
         ((self.buffer >> self.buffered) & ((1u64 << count) - 1)) as u32
     }
 }
 
+const NEF_LUT_BITS: u8 = 10;
+const NEF_LUT_SIZE: usize = 1 << NEF_LUT_BITS;
+
 struct Huff {
     counts: [u8; 16],
     first_code: [i32; 17],
     values: Vec<u8>,
+    lut: [(u8, u8); NEF_LUT_SIZE],
+    index_after_lut: usize,
 }
 
 impl Huff {
@@ -211,13 +222,41 @@ impl Huff {
         // A short initializer in LibRaw's table leaves the remaining leaves zero.
         values.resize(total, 0);
         values.truncate(total);
-        Self { counts, first_code, values }
+        let mut lut = [(0u8, 0u8); NEF_LUT_SIZE];
+        let mut sym_idx = 0usize;
+        for length in 1..=usize::from(NEF_LUT_BITS) {
+            let count = usize::from(counts[length - 1]);
+            let shift = usize::from(NEF_LUT_BITS) - length;
+            let base_code = first_code[length] as usize;
+            for offset in 0..count {
+                let sym = values[sym_idx + offset];
+                let prefix = base_code + offset;
+                let start = prefix << shift;
+                let end = (prefix + 1) << shift;
+                if end <= NEF_LUT_SIZE {
+                    for slot in &mut lut[start..end] {
+                        *slot = (sym, length as u8);
+                    }
+                }
+            }
+            sym_idx += count;
+        }
+        Self { counts, first_code, values, lut, index_after_lut: sym_idx }
     }
 
+    #[inline(always)]
     fn decode(&self, bits: &mut BitReader<'_>) -> Option<u8> {
-        let mut code = 0i32;
-        let mut index = 0usize;
-        for length in 1..=16 {
+        bits.fill_to(NEF_LUT_BITS);
+        let peeked = ((bits.buffer >> (bits.buffered - NEF_LUT_BITS)) & ((NEF_LUT_SIZE - 1) as u64)) as usize;
+        let (sym, len) = self.lut[peeked];
+        if len != 0 {
+            bits.buffered -= len;
+            return Some(sym);
+        }
+        bits.buffered -= NEF_LUT_BITS;
+        let mut code = peeked as i32;
+        let mut index = self.index_after_lut;
+        for length in (usize::from(NEF_LUT_BITS) + 1)..=16 {
             code = (code << 1) | bits.get(1) as i32;
             let count = i32::from(self.counts[length - 1]);
             let offset = code - self.first_code[length];
@@ -377,5 +416,30 @@ mod tests {
         let _ = reader.get(8);
         let _ = reader.get(8);
         assert!(reader.past_end >= 1);
+    }
+
+    #[test]
+    fn huff_lut_matches_canonical_decode_for_all_nikon_trees() {
+        for tree in &NIKON_TREES {
+            let huff = Huff::new(tree);
+            // Re-encode every leaf in the table and verify LUT + slow path
+            // recover the exact symbol and consume the exact bit length.
+            let mut idx = 0usize;
+            for length in 1..=16usize {
+                let count = usize::from(huff.counts[length - 1]);
+                for offset in 0..count {
+                    let expected_sym = huff.values[idx + offset];
+                    let code = (huff.first_code[length] + offset as i32) as u32;
+                    let padded = code << (32 - length);
+                    let bytes = padded.to_be_bytes();
+                    let mut reader = BitReader::new(&bytes, 0, bytes.len());
+                    assert_eq!(huff.decode(&mut reader), Some(expected_sym));
+                    // Verify remaining bits after decoding match the exact bit length.
+                    let consumed = reader.pos * 8 - usize::from(reader.buffered);
+                    assert_eq!(consumed, length);
+                }
+                idx += count;
+            }
+        }
     }
 }

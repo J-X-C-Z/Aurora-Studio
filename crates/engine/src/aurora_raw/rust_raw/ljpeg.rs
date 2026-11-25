@@ -17,10 +17,17 @@ pub(crate) struct LjpegImage {
     pub data: Vec<u16>,
 }
 
+const LUT_BITS: u8 = 10;
+const LUT_SIZE: usize = 1 << LUT_BITS;
+
 struct HuffTable {
     counts: [u8; 16],
     first_code: [i32; 17],
     symbols: Vec<u8>,
+    /// 10-bit fast lookup: `(symbol, code_length)`. `code_length == 0` means
+    /// code is longer than 10 bits and falls back to the canonical loop.
+    lut: Box<[(u8, u8); LUT_SIZE]>,
+    index_after_lut: usize,
 }
 
 impl HuffTable {
@@ -35,14 +42,45 @@ impl HuffTable {
             first_code[index + 1] = code;
             code = (code + i32::from(count)) << 1;
         }
-        Ok(Self { counts, first_code, symbols })
+        let mut lut: Box<[(u8, u8); LUT_SIZE]> = vec![(0u8, 0u8); LUT_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let mut sym_idx = 0usize;
+        for length in 1..=usize::from(LUT_BITS) {
+            let count = usize::from(counts[length - 1]);
+            let shift = usize::from(LUT_BITS) - length;
+            let base_code = first_code[length] as usize;
+            for offset in 0..count {
+                let sym = symbols[sym_idx + offset];
+                let prefix = base_code + offset;
+                let start = prefix << shift;
+                let end = (prefix + 1) << shift;
+                if end <= LUT_SIZE {
+                    for slot in &mut lut[start..end] {
+                        *slot = (sym, length as u8);
+                    }
+                }
+            }
+            sym_idx += count;
+        }
+        Ok(Self { counts, first_code, symbols, lut, index_after_lut: sym_idx })
     }
 
+    #[inline(always)]
     fn decode(&self, bits: &mut Bits<'_>) -> NativeResult<u8> {
-        let mut code = 0i32;
-        let mut index = 0usize;
-        for length in 1..=16usize {
-            code = (code << 1) | i32::from(bits.get(1)? as u8);
+        bits.fill();
+        let peeked = ((bits.buffer >> (bits.buffered - LUT_BITS)) & ((LUT_SIZE - 1) as u64)) as usize;
+        let (sym, len) = self.lut[peeked];
+        if len != 0 {
+            bits.buffered -= len;
+            return Ok(sym);
+        }
+        bits.buffered -= LUT_BITS;
+        let mut code = peeked as i32;
+        let mut index = self.index_after_lut;
+        for length in (usize::from(LUT_BITS) + 1)..=16usize {
+            code = (code << 1) | i32::from(bits.get_one());
             let count = i32::from(self.counts[length - 1]);
             let offset = code - self.first_code[length];
             if offset >= 0 && offset < count {
@@ -71,6 +109,7 @@ impl<'a> Bits<'a> {
         Self { data, pos, buffer: 0, buffered: 0 }
     }
 
+    #[inline(always)]
     fn next_byte(&mut self) -> Option<u8> {
         let byte = *self.data.get(self.pos)?;
         if byte != 0xff {
@@ -87,7 +126,8 @@ impl<'a> Bits<'a> {
         }
     }
 
-    fn fill(&mut self) -> NativeResult<()> {
+    #[inline(always)]
+    fn fill(&mut self) {
         while self.buffered < 32 {
             // LibRaw's getbits stops at a marker and returns zero bits after it;
             // do the same so the final padding of a legal stream is harmless.
@@ -95,16 +135,27 @@ impl<'a> Bits<'a> {
             self.buffer = (self.buffer << 8) | u64::from(byte);
             self.buffered += 8;
         }
-        Ok(())
     }
 
-    fn get(&mut self, count: u8) -> NativeResult<u32> {
-        if count == 0 {
-            return Ok(0);
+    #[inline(always)]
+    fn get_one(&mut self) -> u8 {
+        if self.buffered == 0 {
+            self.fill();
         }
-        self.fill()?;
+        self.buffered -= 1;
+        ((self.buffer >> self.buffered) & 1) as u8
+    }
+
+    #[inline(always)]
+    fn get(&mut self, count: u8) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        if self.buffered < count {
+            self.fill();
+        }
         self.buffered -= count;
-        Ok(((self.buffer >> self.buffered) & ((1u64 << count) - 1)) as u32)
+        ((self.buffer >> self.buffered) & ((1u64 << count) - 1)) as u32
     }
 
     fn reset(&mut self) {
@@ -328,6 +379,19 @@ pub(crate) fn decode(stream: &[u8], dng_16bit_bug: bool) -> NativeResult<LjpegIm
     let clrs = components;
     let row_samples = width * clrs;
 
+    let mut resolved_tables: Vec<&HuffTable> = Vec::with_capacity(clrs);
+    for component in 0..clrs {
+        let table = tables[component_tables[component]]
+            .as_ref()
+            .ok_or_else(|| NativeError::corrupt("missing lossless JPEG Huffman table"))?;
+        resolved_tables.push(table);
+    }
+    if !(1..=7).contains(&predictor) && height > 1 && width > 1 {
+        return Err(NativeError::unsupported(format!(
+            "lossless JPEG predictor {predictor}"
+        )));
+    }
+
     for row in 0..height {
         if restart != 0 && (row * width) % restart == 0 {
             vpred = [base; 4];
@@ -335,11 +399,12 @@ pub(crate) fn decode(stream: &[u8], dng_16bit_bug: bool) -> NativeResult<LjpegIm
                 bits.skip_restart()?;
             }
         }
+        let row_start = row * row_samples;
+        let prev_row_start = row.saturating_sub(1) * row_samples;
         for col in 0..width {
-            for component in 0..clrs {
-                let table = tables[component_tables[component]]
-                    .as_ref()
-                    .ok_or_else(|| NativeError::corrupt("missing lossless JPEG Huffman table"))?;
+            let col_off = col * clrs;
+            let left_off = col.saturating_sub(1) * clrs;
+            for (component, &table) in resolved_tables.iter().enumerate() {
                 let length = table.decode(&mut bits)?;
                 let diff = if length == 16 && dng_16bit_bug {
                     -32768
@@ -349,7 +414,7 @@ pub(crate) fn decode(stream: &[u8], dng_16bit_bug: bool) -> NativeResult<LjpegIm
                     if length > 16 {
                         return Err(NativeError::corrupt("lossless JPEG difference is wider than 16 bits"));
                     }
-                    let raw = bits.get(length)? as i32;
+                    let raw = bits.get(length) as i32;
                     // Sign-extend the JPEG magnitude (T.81 F.2.2.1).
                     if raw & (1 << (length - 1)) != 0 {
                         raw
@@ -357,34 +422,38 @@ pub(crate) fn decode(stream: &[u8], dng_16bit_bug: bool) -> NativeResult<LjpegIm
                         raw - ((1i32 << length) - 1)
                     }
                 };
-                let previous = out
-                    .get(row.saturating_sub(1) * row_samples + col * clrs + component)
-                    .copied()
-                    .unwrap_or(0) as i32;
-                let left = out
-                    .get(row * row_samples + col.saturating_sub(1) * clrs + component)
-                    .copied()
-                    .unwrap_or(0) as i32;
-                let above_left = out
-                    .get(row.saturating_sub(1) * row_samples + col.saturating_sub(1) * clrs + component)
-                    .copied()
-                    .unwrap_or(0) as i32;
                 let prediction = if col == 0 {
                     // LibRaw keeps a running DC per component for the first column.
                     let before = vpred[component];
                     vpred[component] = before.wrapping_add(diff);
                     before
                 } else if row == 0 {
-                    left
+                    i32::from(out[row_start + left_off + component])
                 } else {
+                    let left = i32::from(out[row_start + left_off + component]);
                     match predictor {
                         1 => left,
-                        2 => previous,
-                        3 => above_left,
-                        4 => left + previous - above_left,
-                        5 => left + ((previous - above_left) >> 1),
-                        6 => previous + ((left - above_left) >> 1),
-                        7 => (left + previous) >> 1,
+                        2 => i32::from(out[prev_row_start + col_off + component]),
+                        3 => i32::from(out[prev_row_start + left_off + component]),
+                        4 => {
+                            let previous = i32::from(out[prev_row_start + col_off + component]);
+                            let above_left = i32::from(out[prev_row_start + left_off + component]);
+                            left + previous - above_left
+                        }
+                        5 => {
+                            let previous = i32::from(out[prev_row_start + col_off + component]);
+                            let above_left = i32::from(out[prev_row_start + left_off + component]);
+                            left + ((previous - above_left) >> 1)
+                        }
+                        6 => {
+                            let previous = i32::from(out[prev_row_start + col_off + component]);
+                            let above_left = i32::from(out[prev_row_start + left_off + component]);
+                            previous + ((left - above_left) >> 1)
+                        }
+                        7 => {
+                            let previous = i32::from(out[prev_row_start + col_off + component]);
+                            (left + previous) >> 1
+                        }
                         other => {
                             return Err(NativeError::unsupported(format!(
                                 "lossless JPEG predictor {other}"
@@ -393,7 +462,7 @@ pub(crate) fn decode(stream: &[u8], dng_16bit_bug: bool) -> NativeResult<LjpegIm
                     }
                 };
                 let value = prediction.wrapping_add(diff);
-                out[row * row_samples + col * clrs + component] = value as u16;
+                out[row_start + col_off + component] = value as u16;
             }
         }
     }

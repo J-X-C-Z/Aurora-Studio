@@ -8,6 +8,8 @@
 
 pub mod c1_nef_he;
 pub mod c1_raw_he;
+pub(crate) mod demosaic_cuda;
+pub(crate) mod linear_post_cuda;
 pub mod xtrans;
 pub(crate) mod rust_raw;
 // The Z6III algorithm modules are platform-neutral; only the desktop exporter,
@@ -198,25 +200,80 @@ pub(crate) fn decode_he_rgba16_with(
     // otherwise construct the C1 Stage 1/2/3 input directly from LibRaw's generic
     // BayerFrame (covers Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.).
     let c1_started = Instant::now();
-    let (frame, wb, black) = if let Some((frame, wb, black)) =
-        nikon_c1_stage_input(bytes, libraw_frame)
-    {
-        (frame, wb, black)
-    } else if let Some(bayer) = libraw_frame {
-        generic_bayer_c1_stage_input(bayer)?
-    } else {
-        return None;
-    };
+    let (width, height, mut rgb, wb, black) =
+        if let Some((frame, wb, black)) = nikon_c1_stage_input(bytes, libraw_frame) {
+            let (width, height, rgb) = demosaic_cuda::demosaic_rggb_crop_cuda(&frame, wb, black, noise)
+                .ok()
+                .or_else(|| run_c1_stage123_tiles_f32(&frame, wb, black, noise))?;
+            (width, height, rgb, wb, black)
+        } else if let Some(bayer) = libraw_frame {
+            let g = if bayer.cam_mul[1].is_finite() && bayer.cam_mul[1] > 0.0 {
+                bayer.cam_mul[1]
+            } else {
+                1.0
+            };
+            let wb = [
+                if bayer.cam_mul[0].is_finite() && bayer.cam_mul[0] > 0.0 {
+                    bayer.cam_mul[0] / g
+                } else {
+                    1.0
+                },
+                1.0,
+                if bayer.cam_mul[2].is_finite() && bayer.cam_mul[2] > 0.0 {
+                    bayer.cam_mul[2] / g
+                } else {
+                    1.0
+                },
+            ];
+            let black_14 = if bayer.bits == 14 || bayer.bits == 0 {
+                bayer.black
+            } else if bayer.bits < 14 {
+                bayer.black << (14 - u32::from(bayer.bits))
+            } else {
+                bayer.black >> (u32::from(bayer.bits) - 14)
+            };
+            if let Ok((width, height, rgb)) = demosaic_cuda::demosaic_bayer_cuda(
+                &bayer.data,
+                bayer.raw_width,
+                bayer.raw_height,
+                bayer.left_margin,
+                bayer.top_margin,
+                bayer.width,
+                bayer.height,
+                bayer.bits,
+                bayer.filters,
+                bayer.black,
+                wb,
+                noise,
+            ) {
+                (width, height, rgb, wb, black_14 << 2)
+            } else {
+                let (frame, wb, black) = generic_bayer_c1_stage_input(bayer)?;
+                let (width, height, rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
+                (width, height, rgb, wb, black)
+            }
+        } else {
+            return None;
+        };
 
-    let (width, height, mut rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
     timings.note_bytes((rgb.len() as u64) * 12);
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     {
         if let Some(warp) = ca_warp.as_ref() {
             z6iii::apply_linear_chromatic_aberration(&mut rgb, width, height, 0, 0, width, height, warp);
         }
-        z6iii::recover_and_antialias_frame(&mut rgb, width, height, black, wb, iso);
-        finish_linear_stages(&mut rgb, width, height, iso, noise, None);
+        if let Err(err) = linear_post_cuda::linear_finish_cuda(
+            &mut rgb,
+            width,
+            height,
+            Some((black, wb)),
+            iso,
+            noise,
+        ) {
+            log::debug!("generic Bayer linear_finish_cuda fallback ({err})");
+            z6iii::recover_and_antialias_frame(&mut rgb, width, height, black, wb, iso);
+            finish_linear_stages(&mut rgb, width, height, iso, noise, None);
+        }
     }
     timings.c1_stages_ms += c1_started.elapsed().as_millis() as u64;
     let out = pack_rgba16(&rgb);
@@ -249,6 +306,19 @@ fn decode_xtrans_linear(bayer: &crate::raw::BayerFrame) -> Option<(usize, usize,
         1.0,
         if bayer.cam_mul[2].is_finite() && bayer.cam_mul[2] > 0.0 { bayer.cam_mul[2] / g } else { 1.0 },
     ];
+    if let Ok(rgb) = demosaic_cuda::demosaic_xtrans_cuda(
+        &bayer.data,
+        bayer.raw_width,
+        bayer.left_margin,
+        bayer.top_margin,
+        bayer.width,
+        bayer.height,
+        bayer.bits,
+        bayer.black as f32,
+        wb,
+    ) {
+        return Some((bayer.width, bayer.height, rgb));
+    }
     let (data, black) = if bayer.bits == 14 || bayer.bits == 0 {
         (bayer.data.clone(), bayer.black as f32)
     } else if bayer.bits < 14 {
@@ -285,15 +355,18 @@ fn finish_linear_stages(
     }
     // Luminance NR is deferred to the full-precision detail stage so it is not
     // double-applied and stays 100% responsive to the UI slider.
-    z6iii::apply_linear_color_noise_2012(rgb, width, height, iso, noise);
-    if iso >= 1600 {
-        z6iii::apply_linear_color_noise_2012(
-            rgb,
-            width,
-            height,
-            iso,
-            [noise[0] * 1.6, noise[1] * 2.0],
-        );
+    if let Err(err) = linear_post_cuda::linear_finish_cuda(rgb, width, height, None, iso, noise) {
+        log::debug!("X-Trans linear_finish_cuda fallback ({err})");
+        z6iii::apply_linear_color_noise_2012(rgb, width, height, iso, noise);
+        if iso >= 1600 {
+            z6iii::apply_linear_color_noise_2012(
+                rgb,
+                width,
+                height,
+                iso,
+                [noise[0] * 1.6, noise[1] * 2.0],
+            );
+        }
     }
 }
 

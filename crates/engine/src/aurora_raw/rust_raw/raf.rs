@@ -8,6 +8,8 @@
 //! unrecognised packing or a layout change returns `Unsupported` rather than
 //! producing a plausible-looking but wrong image.
 
+use rayon::prelude::*;
+
 use super::tiff::{Ifd, Tiff, TYPE_LONG, TYPE_SHORT};
 use super::{make_frame, meta, NativeError, NativeResult};
 use crate::raw::BayerFrame;
@@ -369,14 +371,12 @@ fn unpack16(bytes: &[u8], offset: usize, count: usize, little: bool) -> NativeRe
     let end = offset.checked_add(count.checked_mul(2).ok_or_else(|| NativeError::corrupt("RAF plane overflow"))?)
         .filter(|&end| end <= bytes.len())
         .ok_or_else(|| NativeError::corrupt("RAF 16-bit plane is truncated"))?;
-    Ok(bytes[offset..end]
-        .chunks_exact(2)
-        .map(|pair| if little {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
-        })
-        .collect())
+    let raw = &bytes[offset..end];
+    if little {
+        meta::unpack_bits_le16(raw, count)
+    } else {
+        meta::unpack_bits_msb(raw, 16, count)
+    }
 }
 
 /// Unpacks Fuji's packed 14-bit rows exactly like LibRaw's
@@ -385,33 +385,60 @@ fn unpack16(bytes: &[u8], offset: usize, count: usize, little: bool) -> NativeRe
 /// then decoded with the 7-byte/4-sample layout.
 fn unpack14(bytes: &[u8], offset: usize, width: usize, height: usize) -> NativeResult<Vec<u16>> {
     let linelen = width.checked_mul(7).ok_or_else(|| NativeError::corrupt("RAF row overflow"))? / 4;
+    let total_bytes = height
+        .checked_mul(linelen)
+        .and_then(|total| offset.checked_add(total))
+        .ok_or_else(|| NativeError::corrupt("RAF 14-bit row overflow"))?;
+    if total_bytes > bytes.len() {
+        return Err(NativeError::corrupt("RAF 14-bit plane is truncated"));
+    }
     let pitch = width;
     let mut out = vec![0u16; width * height];
-    for row in 0..height {
-        let start = row
-            .checked_mul(linelen)
-            .and_then(|row_start| offset.checked_add(row_start))
-            .ok_or_else(|| NativeError::corrupt("RAF 14-bit row overflow"))?;
-        let line = bytes
-            .get(start..start + linelen)
-            .ok_or_else(|| NativeError::corrupt("RAF 14-bit plane is truncated"))?;
-        if linelen % 28 != 0 {
-            let mut swapped = line.to_vec();
+    let src_plane = &bytes[offset..total_bytes];
+    if linelen % 28 != 0 {
+        let decode_row = |swapped: &mut Vec<u8>, row: usize, out_row: &mut [u16]| {
+            let line = &src_plane[row * linelen..(row + 1) * linelen];
+            swapped.clear();
+            swapped.extend_from_slice(line);
             for word in swapped.chunks_exact_mut(4) {
                 word.reverse();
             }
             let (mut sp, mut dp) = (0usize, 0usize);
             while dp + 3 < pitch && sp + 6 < linelen {
-                unpack7(&swapped[sp..sp + 7], &mut out[row * width + dp..]);
+                unpack7(&swapped[sp..sp + 7], &mut out_row[dp..]);
                 sp += 7;
                 dp += 4;
             }
+        };
+        if height >= 32 {
+            out.par_chunks_exact_mut(width)
+                .enumerate()
+                .for_each_init(|| Vec::with_capacity(linelen), |swapped, (row, out_row)| {
+                    decode_row(swapped, row, out_row);
+                });
         } else {
+            let mut swapped = Vec::with_capacity(linelen);
+            for (row, out_row) in out.chunks_exact_mut(width).enumerate() {
+                decode_row(&mut swapped, row, out_row);
+            }
+        }
+    } else {
+        let decode_row = |row: usize, out_row: &mut [u16]| {
+            let line = &src_plane[row * linelen..(row + 1) * linelen];
             let (mut sp, mut dp) = (0usize, 0usize);
             while dp + 15 < pitch && sp + 27 < linelen {
-                unpack28(&line[sp..sp + 28], &mut out[row * width + dp..]);
+                unpack28(&line[sp..sp + 28], &mut out_row[dp..]);
                 sp += 28;
                 dp += 16;
+            }
+        };
+        if height >= 32 {
+            out.par_chunks_exact_mut(width)
+                .enumerate()
+                .for_each(|(row, out_row)| decode_row(row, out_row));
+        } else {
+            for (row, out_row) in out.chunks_exact_mut(width).enumerate() {
+                decode_row(row, out_row);
             }
         }
     }

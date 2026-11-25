@@ -80,12 +80,14 @@ pub(crate) fn decode(bytes: &[u8]) -> NativeResult<BayerFrame> {
     if !bytes.starts_with(b"IIRO") && !bytes.starts_with(b"IIRS") {
         return Err(NativeError::corrupt("not an ORF container"));
     }
-    // LibRaw's ORF entry point reads `II`, ignores the two signature bytes and
-    // treats u32@4 as the IFD0 offset.  Patch only the two magic bytes so the
-    // shared TIFF reader can use the same zero-based offsets as the file.
-    let mut patched = bytes.to_vec();
-    patched.get_mut(2..4).ok_or_else(|| NativeError::corrupt("truncated ORF header"))?.copy_from_slice(&42u16.to_le_bytes());
-    let tiff = Tiff::parse(&patched, 0)?;
+    // LibRaw's ORF entry point reads `II`, accepts the two signature bytes
+    // (`RO`/`RS`) and treats u32@4 as the IFD0 offset. Parse zero-copy directly
+    // via `Tiff::parse_with_magic` instead of cloning the entire file buffer.
+    let tiff = Tiff::parse_with_magic(
+        bytes,
+        0,
+        &[u16::from_le_bytes(*b"RO"), u16::from_le_bytes(*b"RS")],
+    )?;
     let ifd0 = tiff.ifd(tiff.u32_at(4)?)?;
 
     let ifd = super::raw_ifd(&tiff)?;
@@ -120,18 +122,22 @@ pub(crate) fn decode(bytes: &[u8]) -> NativeResult<BayerFrame> {
     let params = oly.params;
     let bits = params.map(|p| p.valid_bits as u8).unwrap_or(ifd_bits);
 
+    let pixels = raw_width.saturating_mul(raw_height);
     let (data, load_flags) = match compression {
-        1 | 32769 | 32770 | 32773 if count.saturating_mul(7) > raw_width.saturating_mul(raw_height) => {
-            let params = params.ok_or_else(|| {
-                NativeError::unsupported("Olympus 14-bit ORF lacks its MakerNote compression parameters")
-            })?;
+        1 | 32769 | 32770 | 32773 if count >= pixels.saturating_mul(2) => {
+            (meta::unpack_bits_le16(strip, pixels)?, if bits == 14 { 4 } else { 0 })
+        }
+        1 | 32769 | 32770 | 32773 if params.is_some() => {
+            let params = params.unwrap();
             (decode_olympus14(strip, raw_width, raw_height, &params)?, 0)
         }
-        1 | 32769 | 32770 | 32773 if count >= raw_width.saturating_mul(raw_height) * 2 => {
-            (meta::unpack_bits_le16(strip, raw_width * raw_height)?, if bits == 14 { 4 } else { 0 })
-        }
-        1 | 32769 | 32770 | 32773 if count.saturating_mul(3) >= raw_width.saturating_mul(raw_height) * 2 => {
+        1 | 32769 | 32770 | 32773 if count.saturating_mul(2) >= pixels.saturating_mul(3) => {
             (decode_packed12(strip, raw_width, raw_height, 0)?, 0)
+        }
+        1 | 32769 | 32770 | 32773 => {
+            return Err(NativeError::unsupported(
+                "Olympus 14-bit ORF lacks its MakerNote compression parameters",
+            ));
         }
         6 | 7 => {
             let image = ljpeg::decode(strip, false)?;
@@ -558,7 +564,6 @@ fn decode_olympus14(
     let mut pred1 = 0i32;
     let mut glc = 0i32;
     let mut gcode = 0i32;
-    let bitcounts = bit_count_table();
 
     for row in 0..height {
         for col in 0..width {
@@ -572,7 +577,7 @@ fn decode_olympus14(
             context[3] = context[2];
             context[2] = psel;
             let mut wbits = if col > 1 {
-                let highbitcount = bitcounts[(previous_code as u16) as usize];
+                let highbitcount = (16 - (previous_code as u16).leading_zeros()) as i32;
                 let t1 = if psel >= tag646 { tag648 } else { tag650 };
                 let t2 = if psel >= tag646 { tag647 } else { tag649 };
                 let tt = (highbitcount - t1).max(-1);
@@ -647,8 +652,9 @@ fn decode_olympus14(
     Ok(out)
 }
 
-/// Mirrors LibRaw's `bitcounts[65536]` table without allocating 256 KB: entry
-/// `n` is `floor(log2(n)) + 1`, with `bitcounts[0] = 0`.
+#[cfg(test)]
+/// Mirrors LibRaw's `bitcounts[65536]` table: entry `n` is `floor(log2(n)) + 1`,
+/// with `bitcounts[0] = 0`.
 fn bit_count_table() -> Vec<i32> {
     let mut table = vec![0i32; 65536];
     let mut n = 1usize;
@@ -854,6 +860,26 @@ mod tests {
         assert_eq!(table[3], 2);
         assert_eq!(table[4], 3);
         assert_eq!(table[65535], 16);
+        for v in 0..=u16::MAX {
+            assert_eq!(table[usize::from(v)], (16 - v.leading_zeros()) as i32);
+        }
+    }
+
+    #[test]
+    fn parse_with_magic_accepts_iiro_and_iirs_zero_copy() {
+        for sig in [b"IIRO", b"IIRS"] {
+            let mut bytes = Vec::from(&sig[..]);
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            bytes.extend([0u8; 32]);
+            let tiff = Tiff::parse_with_magic(
+                &bytes,
+                0,
+                &[u16::from_le_bytes(*b"RO"), u16::from_le_bytes(*b"RS")],
+            )
+            .unwrap();
+            assert!(tiff.little);
+            assert_eq!(tiff.u32_at(4).unwrap(), 8);
+        }
     }
 
     #[test]

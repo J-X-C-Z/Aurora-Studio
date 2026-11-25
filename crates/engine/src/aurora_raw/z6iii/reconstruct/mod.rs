@@ -59,8 +59,6 @@ pub use c1_nef_he::{NikonBlackLevels, NikonCrop, nikon_as_shot_rgb, nikon_black_
 pub use c1_nef_he::is_z6iii_nef;
 pub use c1_stage1_params::Stage1Params;
 pub use c1_stage3_params::Z6iiiStage3;
-use c1_nikon_he::{bayer_frame, bayer_prefix, dequantize, reconstruct_precinct};
-use nikon_he_bitstream::{Decoder, Weights};
 
 const PIH_PROFILE: [u8; 25] = [
     0, 0, 0, 16, 4, 4, 8, 18, 0x44, 0x10, 0x51, 0x14, 0x50, 0x88, 0x70, 0x83, 0xf0, 0x15, 0x23,
@@ -601,65 +599,14 @@ fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)
     let Some(strip) = find_he_strip(nef)? else {
         return Ok(None);
     };
-    let (mut rest, weights) = verified_profile(&strip)?;
-    let mut decoder = Decoder::new(Weights::from_wgt(weights)?);
-    let precinct_count = if first_slice_only {
-        17
-    } else {
-        strip.height / 4
-    };
-    let mut raw_precincts = Vec::with_capacity(precinct_count);
-    for index in 0..precinct_count {
-        if index % 16 == 0 {
-            let slice = marker(&mut rest, 0x20)?;
-            if slice[4..] != ((index / 16) as u16).to_be_bytes() {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "unexpected HE slice index",
-                ));
-            }
-            decoder.reset_slice();
-        }
-        let precinct = decoder.decode_precinct(rest)?;
-        rest = &rest[precinct.bytes_consumed..];
-        raw_precincts.push(precinct);
-    }
-    if !first_slice_only && !rest.is_empty() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "extra HE payload after final precinct",
-        ));
-    }
-    use rayon::prelude::*;
-    let half_width = strip.width / 2;
-    let precincts: Vec<_> = raw_precincts
-        .into_par_iter()
-        .map(|precinct| {
-            let mut packets: [Vec<Vec<i32>>; 8] = std::array::from_fn(|_| Vec::new());
-            for (destination, packet) in packets.iter_mut().zip(precinct.packets) {
-                for band in packet.bands {
-                    let mut coefficient_band = Vec::with_capacity(band.groups.len() * 4);
-                    for group in band.groups {
-                        for coefficient in group.coeffs {
-                            coefficient_band.push(dequantize(
-                                coefficient.unsigned_abs(),
-                                coefficient < 0,
-                                group.nbits,
-                                band.gtli,
-                            )?);
-                        }
-                    }
-                    destination.push(coefficient_band);
-                }
-            }
-            reconstruct_precinct(half_width, &packets)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let bayer = if first_slice_only {
-        bayer_prefix(&precincts, 64)?
-    } else {
-        bayer_frame(&precincts, strip.height)?
-    };
+    let (rest, weights) = verified_profile(&strip)?;
+    let bayer = c1_nikon_he::decode_he_bayer_parallel(
+        rest,
+        weights,
+        strip.width,
+        strip.height,
+        first_slice_only,
+    )?;
     Ok(Some((strip.width, bayer)))
 }
 

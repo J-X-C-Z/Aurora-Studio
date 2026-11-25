@@ -49,6 +49,12 @@ pub(crate) struct Tiff<'a> {
 impl<'a> Tiff<'a> {
     /// Parses the TIFF header at `base` (the whole file for RAW containers).
     pub fn parse(data: &'a [u8], base: usize) -> NativeResult<Self> {
+        Self::parse_with_magic(data, base, &[42])
+    }
+
+    /// Parses a TIFF-like header whose 16-bit version/magic word matches one of
+    /// `allowed_magics` (e.g. `0x0055` for Panasonic RW2 or `RO`/`RS` for ORF).
+    pub fn parse_with_magic(data: &'a [u8], base: usize, allowed_magics: &[u16]) -> NativeResult<Self> {
         let header = data
             .get(base..base + 8)
             .ok_or_else(|| NativeError::corrupt("truncated TIFF header"))?;
@@ -57,10 +63,13 @@ impl<'a> Tiff<'a> {
             b"MM" => false,
             _ => return Err(NativeError::corrupt("not a TIFF file")),
         };
-        let magic = u16::from_le_bytes([header[2], header[3]]);
-        let magic = if little { magic } else { u16::from_be_bytes([header[2], header[3]]) };
-        if magic != 42 {
-            return Err(NativeError::corrupt("TIFF magic is not 42"));
+        let magic = if little {
+            u16::from_le_bytes([header[2], header[3]])
+        } else {
+            u16::from_be_bytes([header[2], header[3]])
+        };
+        if !allowed_magics.contains(&magic) {
+            return Err(NativeError::corrupt(format!("TIFF magic {magic:#06x} is not expected")));
         }
         Ok(Self { data, base, little })
     }
