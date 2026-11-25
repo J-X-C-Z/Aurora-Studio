@@ -3486,6 +3486,73 @@ impl FileEngine {
                 elapsed_ms,
                 degraded,
                 gamut_warning,
+                bgra: false,
+            });
+        }
+        let display_is_noop = match request.display_profile.as_deref() {
+            None => true,
+            Some(path) => {
+                static DISPLAY_SRGB_CACHE: std::sync::OnceLock<
+                    parking_lot::Mutex<Option<(std::path::PathBuf, bool)>>,
+                > = std::sync::OnceLock::new();
+                let mut guard = DISPLAY_SRGB_CACHE
+                    .get_or_init(|| parking_lot::Mutex::new(None))
+                    .lock();
+                if let Some((cached_path, is_srgb)) = guard.as_ref() {
+                    if cached_path.as_path() == path {
+                        *is_srgb
+                    } else {
+                        let is_srgb = crate::icc::load_profile(path)
+                            .map(|p| crate::icc::is_srgb(&p))
+                            .unwrap_or(false);
+                        *guard = Some((path.to_path_buf(), is_srgb));
+                        is_srgb
+                    }
+                } else {
+                    let is_srgb = crate::icc::load_profile(path)
+                        .map(|p| crate::icc::is_srgb(&p))
+                        .unwrap_or(false);
+                    *guard = Some((path.to_path_buf(), is_srgb));
+                    is_srgb
+                }
+            }
+        };
+        let direct_bgra = !fast
+            && request.quality == RenderQuality::Draft
+            && display_is_noop
+            && request.proof_profile.is_none();
+        if direct_bgra {
+            let out = process::render_preview_bgra(
+                &src,
+                &adj,
+                request.region,
+                max,
+                request.bypass,
+                request.mask_overlay,
+                true,
+            );
+            let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+            if perf {
+                eprintln!(
+                    "AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":false,\"fast\":false,\"bgra\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
+                    request.generation,
+                    request.image.0,
+                    out.bgra,
+                    out.width,
+                    out.height,
+                    elapsed_ms,
+                    source_kind,
+                    request.bypass
+                );
+            }
+            return Ok(PreviewFrame {
+                image: RgbaImage::new(out.width, out.height, out.rgba),
+                histogram: out.histogram,
+                generation: request.generation,
+                elapsed_ms,
+                degraded: intent_note,
+                gamut_warning: None,
+                bgra: out.bgra,
             });
         }
         let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
@@ -3515,6 +3582,7 @@ impl FileEngine {
             elapsed_ms,
             degraded,
             gamut_warning,
+            bgra: false,
         })
     }
 

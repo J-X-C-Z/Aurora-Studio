@@ -138,6 +138,8 @@ pub struct PreviewFrame {
     /// Pixels that change materially through an sRGB -> proof -> sRGB round trip.
     /// `None` when proofing is off or the proof profile is sRGB.
     pub gamut_warning: Option<GamutWarning>,
+    /// True when `image.pixels` is already in BGRA byte order for GPUI display.
+    pub bgra: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -367,6 +367,7 @@ impl MockEngine {
                 elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
                 degraded,
                 gamut_warning,
+                bgra: false,
             });
         }
         let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
@@ -388,6 +389,7 @@ impl MockEngine {
             elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
             degraded,
             gamut_warning,
+            bgra: false,
         })
     }
 

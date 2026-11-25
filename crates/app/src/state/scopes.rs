@@ -42,11 +42,21 @@ fn finish(w: usize, h: usize, bgra: Vec<u8>) -> Arc<RenderImage> {
 
 /// Draws `kind` for `img`, or `None` when scopes are off or the frame is empty.
 pub(crate) fn render(img: &RgbaImage, kind: ScopeKind) -> Option<Arc<RenderImage>> {
-    let (w, h) = (img.width as usize, img.height as usize);
-    if w == 0 || h == 0 || kind == ScopeKind::Off {
+    render_pixels(img.pixels.as_ref(), img.width as usize, img.height as usize, false, kind)
+}
+
+/// Draws `kind` directly from RGBA or BGRA bytes (e.g. a GPUI `RenderImage`).
+pub(crate) fn render_pixels(
+    px: &[u8],
+    w: usize,
+    h: usize,
+    bgra: bool,
+    kind: ScopeKind,
+) -> Option<Arc<RenderImage>> {
+    if w == 0 || h == 0 || kind == ScopeKind::Off || px.len() < w * h * 4 {
         return None;
     }
-    let px = img.pixels.as_ref();
+    let (r_idx, b_idx) = if bgra { (2, 0) } else { (0, 2) };
     let step = ((w * h) as f32 / SAMPLES as f32).sqrt().ceil().max(1.0) as usize;
     let samples = || (0..h).step_by(step).flat_map(move |y| (0..w).step_by(step).map(move |x| (x, &px[(y * w + x) * 4..(y * w + x) * 4 + 3])));
     // Graticule: faint lines at 0, 25, 50, 75 and 100 %.
@@ -66,8 +76,9 @@ pub(crate) fn render(img: &RgbaImage, kind: ScopeKind) -> Option<Arc<RenderImage
             let lane_w = W / lanes;
             let mut counts = vec![0u32; W * H];
             for (x, p) in samples() {
+                let rgb = [p[r_idx], p[1], p[b_idx]];
                 for lane in 0..lanes {
-                    let v = if lanes == 1 { luma(p[0], p[1], p[2]) } else { p[lane] as f32 };
+                    let v = if lanes == 1 { luma(rgb[0], rgb[1], rgb[2]) } else { rgb[lane] as f32 };
                     let col = lane * lane_w + (x * lane_w / w).min(lane_w - 1);
                     let row = H - 1 - ((v / 255.0) * (H - 1) as f32).round() as usize;
                     counts[row * W + col] += 1;
@@ -103,8 +114,8 @@ pub(crate) fn render(img: &RgbaImage, kind: ScopeKind) -> Option<Arc<RenderImage
             let n = H;
             let mut counts = vec![0u32; n * n];
             for (_, p) in samples() {
-                let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
-                let y = luma(p[0], p[1], p[2]);
+                let (r, g, b) = (p[r_idx] as f32, p[1] as f32, p[b_idx] as f32);
+                let y = luma(p[r_idx], p[1], p[b_idx]);
                 // BT.709 chroma, ±0.5 of full scale mapped to the circle.
                 let cb = (b - y) / 1.8556 / 255.0;
                 let cr = (r - y) / 1.5748 / 255.0;

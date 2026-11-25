@@ -123,6 +123,91 @@ pub(crate) fn prewarm() -> bool {
     }
 }
 
+/// Runs the luma and/or colour noise reduction kernels in place on a
+/// device-resident `[f32; 3]` frame (`p_rgb_dev`), enqueuing every kernel onto
+/// `stream` with zero host-device pixel transfers and zero mid-frame sync.
+pub(crate) fn run_resident_on_stream(
+    p_rgb_dev: u64,
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    scale: f32,
+    stream: &aurora_portrait::cuda::Stream<'_>,
+) -> bool {
+    let luma = nr.luminance > 0.0;
+    let color = nr.color > 0.0;
+    if (!luma && !color) || !enabled() {
+        return true;
+    }
+    let Some(l) = layout(w, h) else { return false };
+    let scratch_bytes = l.pad.saturating_add(l.plane.saturating_mul(4));
+    if scratch_bytes == 0 || scratch_bytes > MAX_POOL_BYTES {
+        return false;
+    }
+    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+    let result = match &mut *state {
+        State::Unavailable => return false,
+        State::NotTried => match NrPool::open(w, h) {
+            Ok(mut pool) => {
+                let res = pool
+                    .gpu
+                    .reserve(Slot::Scratch, scratch_bytes, MAX_POOL_BYTES)
+                    .and_then(|scratch_base| {
+                        ensure_lut(&mut pool, nr, luma)?;
+                        launch_stages_at(
+                            &mut pool.gpu,
+                            Some(stream),
+                            p_rgb_dev,
+                            scratch_base,
+                            w,
+                            h,
+                            nr,
+                            scale,
+                            luma,
+                            color,
+                        )
+                    });
+                if res.is_ok() {
+                    *state = State::Ready(pool);
+                }
+                res
+            }
+            Err(failure) => {
+                log::warn!("nr_gpu: {failure:?}; staying on CPU");
+                gpu_runtime::note_fallback("nr", &failure);
+                *state = State::Unavailable;
+                return false;
+            }
+        },
+        State::Ready(pool) => pool
+            .gpu
+            .reserve(Slot::Scratch, scratch_bytes, MAX_POOL_BYTES)
+            .and_then(|scratch_base| {
+                ensure_lut(pool, nr, luma)?;
+                launch_stages_at(
+                    &mut pool.gpu,
+                    Some(stream),
+                    p_rgb_dev,
+                    scratch_base,
+                    w,
+                    h,
+                    nr,
+                    scale,
+                    luma,
+                    color,
+                )
+            }),
+    };
+    match result {
+        Ok(()) => true,
+        Err(failure) => {
+            log::warn!("nr_gpu resident: {failure:?}; falling back");
+            gpu_runtime::note_fallback("nr", &failure);
+            false
+        }
+    }
+}
+
 /// Runs the luma and/or colour stage on the GPU. `false` means the caller must
 /// run the CPU stages instead.
 pub(crate) fn run_f32(
@@ -246,8 +331,25 @@ fn launch_stages(
 ) -> Result<(), Failure> {
     let l = layout(w, h).ok_or(Failure::Invalid("nr frame size"))?;
     let base = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("nr frame slot"))?;
-    let mut p_rgb = base;
-    let mut p_pad = base + l.rgb as u64;
+    launch_stages_at(gpu, None, base, base + l.rgb as u64, w, h, nr, scale, luma, color)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_stages_at(
+    gpu: &mut Gpu,
+    external_stream: Option<&aurora_portrait::cuda::Stream<'_>>,
+    p_rgb_in: u64,
+    scratch_base: u64,
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    scale: f32,
+    luma: bool,
+    color: bool,
+) -> Result<(), Failure> {
+    let l = layout(w, h).ok_or(Failure::Invalid("nr frame size"))?;
+    let mut p_rgb = p_rgb_in;
+    let mut p_pad = scratch_base;
     // `p_l` aliases the luma pad: the luma pass has already finished.
     let mut p_l = p_pad;
     let mut p_u = p_pad + l.pad as u64;
@@ -262,8 +364,9 @@ fn launch_stages(
         let mut p_lut = gpu.handle(Slot::Aux0).ok_or(Failure::Invalid("nr lut slot"))?;
         let mut strength_f = strength;
 
-        launch2(
+        launch2_on(
             gpu,
+            external_stream,
             "nr_luma_pad_kernel",
             w + 2,
             h + 2,
@@ -274,8 +377,9 @@ fn launch_stages(
                 ptr(&mut h_i),
             ],
         )?;
-        launch2(
+        launch2_on(
             gpu,
+            external_stream,
             "nr_luma_apply_kernel",
             w,
             h,
@@ -306,8 +410,9 @@ fn launch_stages(
         let half_taps = (7.0 * (0.4 + 1.2 * strength)).round().clamp(2.0, 11.0) as i32;
         let mut radius = half_taps * step;
 
-        launch1(
+        launch1_on(
             gpu,
+            external_stream,
             "nr_color_encode_kernel",
             l.n,
             [
@@ -318,8 +423,9 @@ fn launch_stages(
                 ptr(&mut n_i),
             ],
         )?;
-        launch2(
+        launch2_on(
             gpu,
+            external_stream,
             "nr_color_h_kernel",
             w,
             h,
@@ -339,8 +445,9 @@ fn launch_stages(
                 ptr(&mut pw_chroma),
             ],
         )?;
-        launch2(
+        launch2_on(
             gpu,
+            external_stream,
             "nr_color_v_kernel",
             w,
             h,
@@ -368,23 +475,33 @@ fn ptr<T>(value: &mut T) -> *mut c_void {
     value as *mut T as *mut c_void
 }
 
-fn launch2<const N: usize>(
+fn launch2_on<const N: usize>(
     gpu: &mut Gpu,
+    stream: Option<&aurora_portrait::cuda::Stream<'_>>,
     kernel: &'static str,
     w: usize,
     h: usize,
     mut args: [*mut c_void; N],
 ) -> Result<(), Failure> {
-    gpu.launch(kernel, gpu_runtime::grid2(w, h, BLOCK), BLOCK, &mut args)
+    let grid = gpu_runtime::grid2(w, h, BLOCK);
+    match stream {
+        Some(stream) => gpu.launch_on_stream(stream, kernel, grid, BLOCK, &mut args),
+        None => gpu.launch(kernel, grid, BLOCK, &mut args),
+    }
 }
 
-fn launch1<const N: usize>(
+fn launch1_on<const N: usize>(
     gpu: &mut Gpu,
+    stream: Option<&aurora_portrait::cuda::Stream<'_>>,
     kernel: &'static str,
     n: usize,
     mut args: [*mut c_void; N],
 ) -> Result<(), Failure> {
-    gpu.launch(kernel, gpu_runtime::grid1(n, 256), (256, 1), &mut args)
+    let grid = gpu_runtime::grid1(n, 256);
+    match stream {
+        Some(stream) => gpu.launch_on_stream(stream, kernel, grid, (256, 1), &mut args),
+        None => gpu.launch(kernel, grid, (256, 1), &mut args),
+    }
 }
 
 #[cfg(test)]
