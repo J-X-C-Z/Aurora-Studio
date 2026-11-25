@@ -34,14 +34,21 @@ const RETOUCH_GROUPS: [(&str, &str, &str, &str); 4] = [
     ("RetouchTeeth", "retouch-teeth", "Teeth", "牙齿"),
 ];
 
-/// How the live skin, wrinkle, eye, hair and teeth sliders are grouped in their panel.
-const SKIN_SECTIONS: [(&str, &str, &[&str]); 6] = [
-    ("Skin tone & Lip", "肤色与唇妆", &["pc:21015", "pc:30096", "pc:90005", "pc:90007", "pc:90004", "pc:21105", "pc:90086", "pc:90021"]),
+/// How the live skin adjustment sliders are grouped in their panel.
+const SKIN_SECTIONS: [(&str, &str, &[&str]); 4] = [
+    ("Skin tone", "肤色", &["pc:21015", "pc:30096", "pc:90005", "pc:90007", "pc:90004", "pc:21105", "pc:90086"]),
     ("Texture", "质感", &["pc:8068", "pc:8069", "pc:8070"]),
     ("Smoothing & Neutral Grey", "磨皮与中性灰", &["pc:30021", "pc:30022", "pc:90002", "pc:90010", "pc:30013", "pc:30014"]),
     ("Wrinkles", "祛皱", &["pc:90023", "pc:90024", "pc:21024", "pc:21025", "pc:21069", "pc:21070", "pc:21071"]),
-    ("Eyes & Hair", "眼部与头发", &["pc:100004", "pc:101", "pc:30009"]),
-    ("Teeth", "牙齿", &["pc:108", "pc:109", "pc:110"]),
+];
+
+/// How the live makeup sliders are grouped in their panel.
+const MAKEUP_SECTIONS: [(&str, &str, &[&str]); 5] = [
+    ("Stereo contour", "立体修容", &["pc:8", "pc:9"]),
+    ("Brows & Eyes", "眉眼妆", &["pc:100", "pc:117", "pc:30007", "pc:103", "pc:105", "pc:118", "pc:111"]),
+    ("Blusher & Contour", "腮红与修容", &["pc:106", "pc:116"]),
+    ("Lips", "唇妆", &["pc:107", "pc:90032", "pc:90021"]),
+    ("Sticker", "贴纸", &["pc:115"]),
 ];
 
 /// Names of the left/right pairs in `WIRED_FACE_GEOMETRY_EFFECTS`, in its order.
@@ -94,7 +101,30 @@ const WIRED_SKIN_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:21069", "Cheek wrinkles", "祛面颊纹", 0.0),
     ("pc:21070", "Nose back wrinkles", "祛鼻背纹", 0.0),
     ("pc:21071", "Perioral wrinkles", "祛口周纹", 0.0),
+];
+
+/// Expression management effects wired to same-job smile warp (`assets/portrait/smile/`).
+const WIRED_EXPRESSION_EFFECTS: &[(&str, &str, &str, f32)] = &[
+    ("pc:8033", "Smile mouth corner", "微笑嘴角", 0.0),
+];
+
+/// Makeup effects wired to `B3_MAKEUP_ROWS` (`attach_makeup_bundle`) and `PF90021`.
+const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
+    ("pc:8", "Stereo shadow", "立体阴影", 0.0),
+    ("pc:9", "Stereo highlight", "立体高光", 0.0),
+    ("pc:100", "Eyebrow (L)", "眉妆（左）", 0.0),
+    ("pc:117", "Eyebrow (R)", "眉妆（右）", 0.0),
+    ("pc:30007", "Eyeshadow", "眼影", 0.0),
+    ("pc:103", "Upper eyeliner", "上眼线", 0.0),
+    ("pc:105", "Upper eyelash", "上睫毛", 0.0),
+    ("pc:118", "Lower eyelash", "下睫毛", 0.0),
+    ("pc:111", "Contact lenses", "美瞳", 0.0),
+    ("pc:106", "Blusher", "腮红", 0.0),
+    ("pc:116", "Contour", "修容", 0.0),
+    ("pc:107", "Lipstick", "口红", 0.0),
+    ("pc:90032", "Lip gloss", "唇彩", 0.0),
     ("pc:90021", "Lip makeup enhance", "唇妆增强", 0.5),
+    ("pc:115", "Face decoration", "面部贴纸", 0.0),
 ];
 
 /// Eye effects wired to FaceParsingV2 / face-input pipeline.
@@ -180,9 +210,11 @@ const WIRED_PLUMP_EFFECTS: &[(&str, &str, &str)] = &[
 ];
 
 const WIRED_TOTAL: usize = WIRED_SKIN_EFFECTS.len()
-    + WIRED_EYES_EFFECTS.len()
-    + WIRED_HAIR_EFFECTS.len()
+    + WIRED_EXPRESSION_EFFECTS.len()
     + WIRED_TEETH_EFFECTS.len()
+    + WIRED_EYES_EFFECTS.len()
+    + WIRED_MAKEUP_EFFECTS.len()
+    + WIRED_HAIR_EFFECTS.len()
     + WIRED_FACE_GEOMETRY_EFFECTS.len()
     + WIRED_FACE_SINGLE_EFFECTS.len()
     + WIRED_PLUMP_EFFECTS.len();
@@ -201,9 +233,11 @@ pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSe
     has_face_reshape(adjustments)
         || WIRED_SKIN_EFFECTS
             .iter()
-            .chain(WIRED_EYES_EFFECTS)
-            .chain(WIRED_HAIR_EFFECTS)
+            .chain(WIRED_EXPRESSION_EFFECTS)
             .chain(WIRED_TEETH_EFFECTS)
+            .chain(WIRED_EYES_EFFECTS)
+            .chain(WIRED_MAKEUP_EFFECTS)
+            .chain(WIRED_HAIR_EFFECTS)
             .any(|(key, _, _, neutral)| {
                 adjustments.extra.get(*key).is_some_and(|amount| (amount - neutral).abs() > 1.0e-6)
             })
@@ -212,16 +246,15 @@ pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSe
 #[cfg(test)]
 #[test]
 fn every_live_skin_and_teeth_effect_has_one_section() {
-    let listed: Vec<&str> = SKIN_SECTIONS.iter().flat_map(|(_, _, keys)| keys.iter().copied()).collect();
-    let live: Vec<&str> = WIRED_SKIN_EFFECTS
-        .iter()
-        .chain(WIRED_EYES_EFFECTS)
-        .chain(WIRED_HAIR_EFFECTS)
-        .chain(WIRED_TEETH_EFFECTS)
-        .map(|e| e.0)
-        .collect();
-    assert_eq!(listed.len(), live.len());
-    assert!(live.iter().all(|k| listed.iter().filter(|l| *l == k).count() == 1));
+    let listed_skin: Vec<&str> = SKIN_SECTIONS.iter().flat_map(|(_, _, keys)| keys.iter().copied()).collect();
+    let live_skin: Vec<&str> = WIRED_SKIN_EFFECTS.iter().map(|e| e.0).collect();
+    assert_eq!(listed_skin.len(), live_skin.len());
+    assert!(live_skin.iter().all(|k| listed_skin.iter().filter(|l| *l == k).count() == 1));
+
+    let listed_makeup: Vec<&str> = MAKEUP_SECTIONS.iter().flat_map(|(_, _, keys)| keys.iter().copied()).collect();
+    let live_makeup: Vec<&str> = WIRED_MAKEUP_EFFECTS.iter().map(|e| e.0).collect();
+    assert_eq!(listed_makeup.len(), live_makeup.len());
+    assert!(live_makeup.iter().all(|k| listed_makeup.iter().filter(|l| *l == k).count() == 1));
 }
 
 #[cfg(test)]
@@ -259,9 +292,11 @@ fn live_portrait_backing_excludes_neutral_values() {
 /// wired panel: both rows would use the same `pc:<id>` key and reset together.
 fn is_wired_key(key: &str) -> bool {
     WIRED_SKIN_EFFECTS.iter().any(|row| row.0 == key)
-        || WIRED_EYES_EFFECTS.iter().any(|row| row.0 == key)
-        || WIRED_HAIR_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_EXPRESSION_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_TEETH_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_EYES_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_MAKEUP_EFFECTS.iter().any(|row| row.0 == key)
+        || WIRED_HAIR_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_FACE_SINGLE_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_PLUMP_EFFECTS.iter().any(|row| row.0 == key)
@@ -360,7 +395,60 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
         .head(header)
         .panel("portrait-skin", skin_panel(state, &query, cx))
         .panel("retouch-face-geometry", wired_face_geometry_panel(state, &query, cx))
-        .panel("retouch-face-plump", wired_plump_panel(state, &query, cx));
+        .panel("retouch-face-plump", wired_plump_panel(state, &query, cx))
+        .panel("portrait-expression", simple_live_panel(
+            state,
+            "portrait-expression",
+            t("Expression", "表情管理"),
+            t("Reset expression", "复位表情管理"),
+            Status::Partial(
+                "Smile mouth corner (PF8033) uses built-in smile warp assets and same-job face geometry",
+                "微笑嘴角（PF8033）使用内置微笑形变资产与同帧面部几何",
+            ),
+            WIRED_EXPRESSION_EFFECTS,
+            &query,
+            cx,
+        ))
+        .panel("portrait-teeth", simple_live_panel(
+            state,
+            "portrait-teeth",
+            t("Teeth", "牙齿美化"),
+            t("Reset teeth", "复位牙齿美化"),
+            Status::Partial(
+                "Teeth whitening (PF108) renders through FaceParsingV2 on CUDA or CPU",
+                "美牙（PF108）通过 FaceParsingV2 在 CUDA/CPU 上实时渲染",
+            ),
+            WIRED_TEETH_EFFECTS,
+            &query,
+            cx,
+        ))
+        .panel("portrait-eyes", simple_live_panel(
+            state,
+            "portrait-eyes",
+            t("Eyes", "眼睛增强"),
+            t("Reset eyes", "复位眼睛增强"),
+            Status::Partial(
+                "Eye enhancement requires detected eye masks on the current photo",
+                "眼睛增强需要在当前照片中检测到有效的眼部掩码",
+            ),
+            WIRED_EYES_EFFECTS,
+            &query,
+            cx,
+        ))
+        .panel("portrait-makeup", makeup_panel(state, &query, cx))
+        .panel("portrait-hair", simple_live_panel(
+            state,
+            "portrait-hair",
+            t("Hair", "头发调整"),
+            t("Reset hair", "复位头发调整"),
+            Status::Partial(
+                "Hair color unify requires a detected hair mask on the current photo",
+                "统一发色需要在当前照片中检测到头发掩码",
+            ),
+            WIRED_HAIR_EFFECTS,
+            &query,
+            cx,
+        ));
     if !show_all && query.is_empty() {
         return live.render(cx);
     }
@@ -399,19 +487,23 @@ fn live_slider(state: &Entity<AppState>, key: &'static str, en: &'static str, zh
     slider.default_value(default * 100.0).into_any_element()
 }
 
-/// The skin, wrinkle, eye, hair and teeth effects the renderer uses, grouped by what they change.
-fn skin_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
+/// Sectioned live panel shared by Skin Adjustment and Makeup.
+fn sectioned_live_panel(
+    state: &Entity<AppState>,
+    id: &'static str,
+    title: &'static str,
+    reset_label: &'static str,
+    status: Status,
+    effects: &'static [(&'static str, &'static str, &'static str, f32)],
+    sections: &'static [(&'static str, &'static str, &'static [&'static str])],
+    query: &str,
+    cx: &App,
+) -> AnyElement {
     let s = state.read(cx);
-    let effects: Vec<_> = WIRED_SKIN_EFFECTS
-        .iter()
-        .chain(WIRED_EYES_EFFECTS)
-        .chain(WIRED_HAIR_EFFECTS)
-        .chain(WIRED_TEETH_EFFECTS)
-        .collect();
     let keys: Vec<&'static str> = effects.iter().map(|e| e.0).collect();
     let modified = effects.iter().any(|(k, _, _, neutral)| s.adj().extra.get(*k).is_some_and(|v| (v - neutral).abs() > 1.0e-6));
     let mut rows: Vec<AnyElement> = Vec::new();
-    for (en, zh, section) in SKIN_SECTIONS {
+    for (en, zh, section) in sections {
         let hits: Vec<_> = section
             .iter()
             .filter_map(|k| effects.iter().find(|e| e.0 == *k))
@@ -427,16 +519,13 @@ fn skin_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
         return div().into_any_element();
     }
     let st = state.clone();
-    ToolPanel::new(state, "portrait-skin", t("Skin & Teeth", "皮肤与牙齿"))
-        .status(Status::Partial(
-            "Skin effects need a suitable input; teeth whitening (PF108) renders through FaceParsingV2 on CUDA",
-            "皮肤效果需要有效输入；美牙（PF108）通过 FaceParsingV2 在 CUDA 上实时渲染",
-        ))
+    ToolPanel::new(state, id, title)
+        .status(status)
         .modified(modified)
         .on_reset(move |_, cx| {
             let keys = keys.clone();
             st.update(cx, |s, cx| {
-                s.edit(t("Reset skin & teeth", "复位皮肤与牙齿"), |a| {
+                s.edit(reset_label, |a| {
                     for k in &keys {
                         a.extra.remove(*k);
                     }
@@ -445,6 +534,80 @@ fn skin_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
         })
         .children(rows)
         .into_any_element()
+}
+
+fn simple_live_panel(
+    state: &Entity<AppState>,
+    id: &'static str,
+    title: &'static str,
+    reset_label: &'static str,
+    status: Status,
+    effects: &'static [(&'static str, &'static str, &'static str, f32)],
+    query: &str,
+    cx: &App,
+) -> AnyElement {
+    let s = state.read(cx);
+    let keys: Vec<&'static str> = effects.iter().map(|e| e.0).collect();
+    let modified = effects.iter().any(|(k, _, _, neutral)| s.adj().extra.get(*k).is_some_and(|v| (v - neutral).abs() > 1.0e-6));
+    let hits: Vec<_> = effects
+        .iter()
+        .filter(|(key, en, zh, _)| matches(query, t(en, zh), key, None))
+        .collect();
+    if hits.is_empty() {
+        return div().into_any_element();
+    }
+    let st = state.clone();
+    ToolPanel::new(state, id, title)
+        .status(status)
+        .modified(modified)
+        .on_reset(move |_, cx| {
+            let keys = keys.clone();
+            st.update(cx, |s, cx| {
+                s.edit(reset_label, |a| {
+                    for k in &keys {
+                        a.extra.remove(*k);
+                    }
+                }, cx)
+            })
+        })
+        .children(hits.into_iter().map(|(key, en, zh, default)| live_slider(state, key, en, zh, *default, cx)))
+        .into_any_element()
+}
+
+/// Skin adjustment effects grouped by Skin tone, Texture, Smoothing & Wrinkles.
+fn skin_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
+    sectioned_live_panel(
+        state,
+        "portrait-skin",
+        t("Skin Adjustment", "皮肤调整"),
+        t("Reset skin adjustment", "复位皮肤调整"),
+        Status::Partial(
+            "Skin effects require valid face/skin inputs on the current photo",
+            "皮肤效果需要在当前照片中检测到有效人脸与皮肤输入",
+        ),
+        WIRED_SKIN_EFFECTS,
+        &SKIN_SECTIONS,
+        query,
+        cx,
+    )
+}
+
+/// Makeup adjustment effects wired to `B3_MAKEUP_ROWS` and `PF90021`.
+fn makeup_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
+    sectioned_live_panel(
+        state,
+        "portrait-makeup",
+        t("Makeup", "妆容调整"),
+        t("Reset makeup", "复位妆容调整"),
+        Status::Partial(
+            "Makeup effects use `B3_MAKEUP_ROWS` and require makeup asset root + face masks",
+            "妆容效果接入 `B3_MAKEUP_ROWS`，需要人脸掩码及妆容素材目录",
+        ),
+        WIRED_MAKEUP_EFFECTS,
+        &MAKEUP_SECTIONS,
+        query,
+        cx,
+    )
 }
 
 /// Face reshape as left/right pairs. Linked (the default), one slider moves
@@ -605,7 +768,7 @@ fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &A
     let keys: Vec<String> = params.iter().map(|p| p.store_key()).collect();
     let set = s.adj().extra.keys().filter(|k| keys.iter().any(|p| *k == p || k.starts_with(&format!("{p}:")))).count();
     let shown: Vec<_> = params.iter().copied().filter(|p| matches(query, &p.label(), &p.key, Some(p.id))).collect();
-    let unlisted: Vec<_> = evidence::without_control(band.lo, band.hi)
+    let unlisted: Vec<_> = evidence::without_control_in(|pf| band.contains_id(pf))
         .into_iter()
         .filter(|effect| matches(query, &effect.display_label(), effect.key, Some(i64::from(effect.pf))))
         .collect();
@@ -660,7 +823,7 @@ fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &A
 /// 段内证据摘要：达到 ev5 的项也只标“部分”，因为 ev6/ev7 仍无证据；
 /// 其余一律“未接入”。
 fn band_status(band: &'static Band) -> Status {
-    let (wired, _total) = evidence::preview_count(band.lo, band.hi);
+    let (wired, _total) = evidence::preview_count_in(|pf| band.contains_id(pf));
     if wired > 0 {
         Status::Partial(
             "Only ev5 (main preview) effects are presented as available; vendor parity and real-photo acceptance are unverified",
