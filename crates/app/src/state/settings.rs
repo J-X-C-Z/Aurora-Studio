@@ -132,22 +132,29 @@ pub fn display_profiles() -> Vec<PathBuf> {
     found
 }
 
-/// The ICC profile Windows reports for the monitor under `hwnd` (the app's
-/// window); falls back to the primary display. `None` off Windows or on failure.
+/// The ICC profile of the display: the monitor under `hwnd` on Windows (falling
+/// back to the primary display); the main display on macOS (ColorSync), because
+/// the app has no public handle to the display under its window. `None` on
+/// other platforms or on failure.
 pub fn detected_display_profile(hwnd: isize) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         win_icm::current(hwnd)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = hwnd;
+        mac_display::status().0
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = hwnd;
         None
     }
 }
 
-/// What the current monitor lookup resolved, and whether it fell back to the
-/// primary display.
+/// What the current display lookup resolved, and whether it fell back to the
+/// primary/main display.
 pub struct DisplayProfileStatus {
     pub path: Option<PathBuf>,
     pub fallback: bool,
@@ -159,17 +166,25 @@ pub fn detected_display_profile_status(hwnd: isize) -> DisplayProfileStatus {
         let (path, fallback) = win_icm::status(hwnd);
         DisplayProfileStatus { path, fallback }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = hwnd;
+        let (path, fallback) = mac_display::status();
+        DisplayProfileStatus { path, fallback }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = hwnd;
         DisplayProfileStatus { path: None, fallback: false }
     }
 }
 
-/// Drops cached monitor profiles, e.g. on a display change.
+/// Drops cached display profiles, e.g. on a display change.
 pub fn invalidate_display_profile_cache() {
     #[cfg(windows)]
     win_icm::invalidate();
+    #[cfg(target_os = "macos")]
+    mac_display::invalidate();
 }
 
 #[cfg(windows)]
@@ -449,6 +464,152 @@ mod win_icm {
     }
 }
 
+/// ColorSync/CoreGraphics lookup of the main display's ICC profile.
+///
+/// Limitation: this always resolves the main display, not necessarily the
+/// display the window is on, because GPUI exposes no public display id from the
+/// window. Multi-display colour management therefore needs a GPUI-side hook.
+#[cfg(target_os = "macos")]
+mod mac_display {
+    use std::ffi::{c_char, c_void};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    type CGDirectDisplayID = u32;
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFURLRef = *const c_void;
+    type ColorSyncProfileRef = *const c_void;
+    type CFIndex = isize;
+    type Boolean = u8;
+
+    const K_CF_URL_POSIX_PATH_STYLE: isize = 0;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+    }
+
+    #[link(name = "ColorSync", kind = "framework")]
+    unsafe extern "C" {
+        /// Returns a +1 profile (release with `CFRelease`) or null.
+        /// SDK signature: `ColorSyncProfileRef (uint32_t displayID)`; pass 0 for
+        /// the main display.
+        fn ColorSyncProfileCreateWithDisplayID(display: CGDirectDisplayID) -> ColorSyncProfileRef;
+        /// Non-owning URL for the profile's ICC file, or null.
+        fn ColorSyncProfileGetURL(profile: ColorSyncProfileRef, error: *mut CFTypeRef) -> CFURLRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFURLCopyFileSystemPath(url: CFURLRef, style: isize) -> CFStringRef;
+        fn CFStringGetLength(string: CFStringRef) -> CFIndex;
+        fn CFStringGetMaximumSizeForEncoding(length: CFIndex, encoding: u32) -> CFIndex;
+        fn CFStringGetCString(
+            string: CFStringRef,
+            buffer: *mut c_char,
+            size: CFIndex,
+            encoding: u32,
+        ) -> Boolean;
+        fn CFRelease(object: CFTypeRef);
+    }
+
+    /// A display profile changes rarely; a short TTL also picks up hot-plug and
+    /// calibration changes that we get no callback for. Mirrors `win_icm`.
+    const CACHE_TTL: Duration = Duration::from_secs(5);
+
+    struct Entry {
+        display: CGDirectDisplayID,
+        path: Option<PathBuf>,
+        at: Instant,
+    }
+
+    fn cache() -> &'static Mutex<Option<Entry>> {
+        static CACHE: OnceLock<Mutex<Option<Entry>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn invalidate() {
+        *cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// (profile path, always a main-display fallback on macOS).
+    pub(super) fn status() -> (Option<PathBuf>, bool) {
+        let display = unsafe { CGMainDisplayID() };
+        let now = Instant::now();
+        {
+            let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref()
+                && entry.display == display
+                && now.saturating_duration_since(entry.at) <= CACHE_TTL
+            {
+                return (entry.path.clone(), true);
+            }
+        }
+        let path = profile_path(display);
+        *cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(Entry {
+            display,
+            path: path.clone(),
+            at: now,
+        });
+        (path, true)
+    }
+
+    fn profile_path(display: CGDirectDisplayID) -> Option<PathBuf> {
+        unsafe {
+            let profile = ColorSyncProfileCreateWithDisplayID(display);
+            if profile.is_null() {
+                return None;
+            }
+            let url = ColorSyncProfileGetURL(profile, std::ptr::null_mut());
+            let path = (!url.is_null()).then(|| url_path(url)).flatten();
+            // "Create" rule: we own the profile.
+            CFRelease(profile);
+            path
+        }
+    }
+
+    unsafe fn url_path(url: CFURLRef) -> Option<PathBuf> {
+        unsafe {
+            let string = CFURLCopyFileSystemPath(url, K_CF_URL_POSIX_PATH_STYLE);
+            if string.is_null() {
+                return None;
+            }
+            let length = CFStringGetLength(string);
+            let capacity = if length > 0 {
+                CFStringGetMaximumSizeForEncoding(length, K_CF_STRING_ENCODING_UTF8)
+            } else {
+                0
+            };
+            let path = if capacity > 0 {
+                let mut buffer = vec![0u8; capacity as usize + 1];
+                let ok = CFStringGetCString(
+                    string,
+                    buffer.as_mut_ptr().cast::<c_char>(),
+                    buffer.len() as CFIndex,
+                    K_CF_STRING_ENCODING_UTF8,
+                );
+                if ok == 0 {
+                    None
+                } else {
+                    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+                    std::str::from_utf8(&buffer[..end])
+                        .ok()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                }
+            } else {
+                None
+            };
+            // "Copy" rule: we own the string.
+            CFRelease(string);
+            path
+        }
+    }
+}
+
 /// Where the tabs sit before the user moves them: Quick after Capture, as in Capture One.
 pub fn default_tab_order() -> Vec<ToolTab> {
     let mut order: Vec<ToolTab> = ToolTab::ALL.into_iter().filter(|t| *t != ToolTab::Quick).collect();
@@ -636,6 +797,10 @@ fn path() -> Option<PathBuf> {
 fn config_dir(windows: &str, unix: &str) -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(windows))
+    } else if cfg!(target_os = "macos") {
+        // `~/Library/Application Support/Aurora Studio`, never inside the .app.
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support").join(windows))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -645,8 +810,19 @@ fn config_dir(windows: &str, unix: &str) -> Option<PathBuf> {
 }
 
 /// Settings written before the rename to Aurora Studio.
+#[cfg(not(target_os = "macos"))]
 fn legacy_path() -> Option<PathBuf> {
     config_dir("Aurora Studio", "aurora-studio").map(|d| d.join("settings.json"))
+}
+
+/// macOS builds before Application Support wrote beside the Linux config; read
+/// that so an earlier build's settings are still picked up.
+#[cfg(target_os = "macos")]
+fn legacy_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|d| d.join("aurora-studio/settings.json"))
 }
 
 const RECENT: usize = 10;

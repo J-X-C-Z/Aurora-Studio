@@ -7,7 +7,9 @@
 
 use crate::cuda::{CudaError, Dispatch};
 use crate::cuda_v2warp as v2warp;
-use crate::cuda_v2warp::{Mesh, OffsetTexture, V2Warp};
+use crate::cuda_v2warp::{Mesh, OffsetTexture};
+#[cfg(windows)]
+use crate::cuda_v2warp::V2Warp;
 use crate::raster::Rules;
 use crate::{Image, Refusal};
 

@@ -66,7 +66,10 @@ Desktop.ini
 /90_work/
 /.build-cache/
 /crates/engine/local-fixtures/
-/crates/engine/examples/
+# Local scratch/benchmark probes stay out, except the synthetic Metal
+# microbenchmark, which uses no private assets.
+/crates/engine/examples/*
+!/crates/engine/examples/metal_chain_bench.rs
 /crates/engine/src/bin/
 !/crates/engine/src/bin/
 !/crates/engine/src/bin/c1_session_export.rs

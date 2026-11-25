@@ -86,6 +86,12 @@ actions!(
         Print,
         SaveWorkspace,
         ToggleInspectorSide,
+        // macOS application menu. Harmless (and unreachable) on other platforms.
+        Hide,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        ZoomWindow,
     ]
 );
 
@@ -141,72 +147,79 @@ pub fn shortcuts() -> Vec<Shortcut> {
     let view = t("View", "视图");
     let tools = t("Tools", "工具");
     let rate = t("Rating & Tags", "评级与色标");
-    add("quit", "Exit", "退出", file, &["ctrl-q"], Box::new(Quit));
-    add("import", "Import images", "导入图像", file, &["ctrl-shift-i"], Box::new(Import));
-    add("export-selected", "Process selected", "处理所选", file, &["ctrl-d"], Box::new(ExportSelected));
-    add("export", "Export…", "导出…", file, &["ctrl-shift-d"], Box::new(OpenExportDialog));
-    add("print", "Print…", "打印…", file, &["ctrl-p"], Box::new(Print));
-    add("prefs", "Preferences", "首选项", file, &["ctrl-,"], Box::new(ShowPreferences));
-    add("capture", "Capture", "拍摄", file, &["ctrl-k"], Box::new(Capture));
-    add("live-view", "Live View", "实时取景", file, &["ctrl-alt-v"], Box::new(LiveView));
-    add("undo", "Undo", "撤销", edit, &["ctrl-z"], Box::new(Undo));
-    add("redo", "Redo", "重做", edit, &["ctrl-y", "ctrl-shift-z"], Box::new(Redo));
-    add("copy-adj", "Copy adjustments", "拷贝调整", edit, &["ctrl-shift-c"], Box::new(CopyAdjustments));
-    add("apply-adj", "Apply adjustments", "应用调整", edit, &["ctrl-shift-v"], Box::new(ApplyAdjustments));
-    add("reset-adj", "Reset adjustments", "复位调整", edit, &["ctrl-r"], Box::new(ResetAdjustments));
-    add("auto-adj", "Auto adjust", "自动调整", edit, &["ctrl-l"], Box::new(AutoAdjust));
+    // `secondary` is GPUI's platform-aware primary modifier: Command on macOS,
+    // Control on Windows/Linux. Windows bindings therefore stay Ctrl+…; on macOS
+    // they become Cmd+…. Two Capture One bindings intentionally keep `ctrl`:
+    // Cmd+H hides the app and Cmd+M minimizes the window on macOS, so Merge HDR
+    // and Merge Panorama stay on Control+H / Control+M there.
+    add("quit", "Exit", "退出", file, &["secondary-q"], Box::new(Quit));
+    add("import", "Import images", "导入图像", file, &["secondary-shift-i"], Box::new(Import));
+    add("export-selected", "Process selected", "处理所选", file, &["secondary-d"], Box::new(ExportSelected));
+    add("export", "Export…", "导出…", file, &["secondary-shift-d"], Box::new(OpenExportDialog));
+    add("print", "Print…", "打印…", file, &["secondary-p"], Box::new(Print));
+    add("prefs", "Preferences", "首选项", file, &["secondary-,"], Box::new(ShowPreferences));
+    add("capture", "Capture", "拍摄", file, &["secondary-k"], Box::new(Capture));
+    add("live-view", "Live View", "实时取景", file, &["secondary-alt-v"], Box::new(LiveView));
+    add("undo", "Undo", "撤销", edit, &["secondary-z"], Box::new(Undo));
+    add("redo", "Redo", "重做", edit, &["secondary-y", "secondary-shift-z"], Box::new(Redo));
+    add("copy-adj", "Copy adjustments", "拷贝调整", edit, &["secondary-shift-c"], Box::new(CopyAdjustments));
+    add("apply-adj", "Apply adjustments", "应用调整", edit, &["secondary-shift-v"], Box::new(ApplyAdjustments));
+    add("reset-adj", "Reset adjustments", "复位调整", edit, &["secondary-r"], Box::new(ResetAdjustments));
+    add("auto-adj", "Auto adjust", "自动调整", edit, &["secondary-l"], Box::new(AutoAdjust));
     add("match-look", "Match look to reference", "匹配参考风格", edit, &[], Box::new(MatchLook));
-    add("select-all", "Select all", "全选", edit, &["ctrl-a"], Box::new(SelectAll));
+    add("select-all", "Select all", "全选", edit, &["secondary-a"], Box::new(SelectAll));
     add("select-current", "Select only the current image", "只选当前图像", edit, &["escape"], Box::new(SelectCurrentOnly));
-    add("palette", "Command palette", "命令面板", edit, &["ctrl-shift-p"], Box::new(CommandPalette));
+    add("palette", "Command palette", "命令面板", edit, &["secondary-shift-p"], Box::new(CommandPalette));
     add("new-variant", "New variant", "新建变体", image, &["f2"], Box::new(NewVariant));
     add("clone-variant", "Clone variant", "克隆变体", image, &["f3"], Box::new(CloneVariant));
     add("compare-variant", "Set compare variant", "设为对比变体", image, &["shift-enter"], Box::new(SetCompareVariant));
     add("clear-compare", "Clear compare variant", "取消对比变体", image, &["shift-escape"], Box::new(ClearCompareVariant));
     add("next", "Next image", "下一张", image, &["right"], Box::new(NextImage));
     add("prev", "Previous image", "上一张", image, &["left"], Box::new(PrevImage));
-    add("rotate-left", "Rotate left", "向左旋转", image, &["ctrl-alt-l"], Box::new(RotateLeft));
+    add("rotate-left", "Rotate left", "向左旋转", image, &["secondary-alt-l"], Box::new(RotateLeft));
     add("auto-rotate", "Auto rotate", "自动旋转", image, &[], Box::new(AutoRotate));
     add("closed-eyes", "Check closed eyes", "检查闭眼", image, &[], Box::new(CheckClosedEyes));
     add("merge-hdr", "Merge to HDR", "合并为 HDR", image, &["ctrl-h"], Box::new(MergeHdr));
     add("merge-pano", "Merge to panorama", "合并为全景", image, &["ctrl-m"], Box::new(MergePanorama));
-    add("rotate-right", "Rotate right", "向右旋转", image, &["ctrl-alt-r"], Box::new(RotateRight));
+    add("rotate-right", "Rotate right", "向右旋转", image, &["secondary-alt-r"], Box::new(RotateRight));
     add("trash", "Move to trash", "移到废纸篓", image, &["delete"], Box::new(MoveToTrash));
-    add("new-layer", "New adjustment layer", "新建调整图层", image, &["ctrl-shift-l"], Box::new(NewLayer));
+    add("new-layer", "New adjustment layer", "新建调整图层", image, &["secondary-shift-l"], Box::new(NewLayer));
     add("mask", "Display mask", "显示蒙版", image, &["m"], Box::new(ToggleMaskOverlay));
     let nodes = t("Nodes", "节点");
     add("node-serial", "Add serial node", "添加串行节点", nodes, &["alt-s"], Box::new(AddSerialNode));
     add("node-parallel", "Add parallel node", "添加并行节点", nodes, &["alt-shift-p"], Box::new(AddParallelNode));
     add("node-layer", "Add layer node", "添加图层节点", nodes, &["alt-l"], Box::new(AddLayerNode));
     add("node-outside", "Add outside node", "添加外部节点", nodes, &["alt-shift-o"], Box::new(AddOutsideNode));
-    add("node-toggle", "Enable / disable node", "启用 / 停用节点", nodes, &["ctrl-shift-e"], Box::new(ToggleNode));
-    add("node-dock", "Dock node editor", "停靠节点编辑器", nodes, &["ctrl-shift-n"], Box::new(ToggleNodeDock));
-    add("zoom-fit", "Zoom to fit", "适合窗口", view, &["ctrl-0"], Box::new(ZoomFit));
-    add("zoom-100", "Zoom 100%", "100% 缩放", view, &["ctrl-alt-0"], Box::new(Zoom100));
-    add("zoom-in", "Zoom in", "放大", view, &["ctrl-="], Box::new(ZoomIn));
-    add("zoom-out", "Zoom out", "缩小", view, &["ctrl--"], Box::new(ZoomOut));
+    add("node-toggle", "Enable / disable node", "启用 / 停用节点", nodes, &["secondary-shift-e"], Box::new(ToggleNode));
+    add("node-dock", "Dock node editor", "停靠节点编辑器", nodes, &["secondary-shift-n"], Box::new(ToggleNodeDock));
+    add("zoom-fit", "Zoom to fit", "适合窗口", view, &["secondary-0"], Box::new(ZoomFit));
+    add("zoom-100", "Zoom 100%", "100% 缩放", view, &["secondary-alt-0"], Box::new(Zoom100));
+    add("zoom-in", "Zoom in", "放大", view, &["secondary-="], Box::new(ZoomIn));
+    add("zoom-out", "Zoom out", "缩小", view, &["secondary--"], Box::new(ZoomOut));
     add("compare", "Before / after", "前后对比", view, &["y"], Box::new(ToggleCompare));
     add("multi", "Multiple view", "多图查看", view, &["n"], Box::new(ToggleMultiView));
     add("overlay", "Show / hide overlay", "显示/隐藏叠加图", view, &["alt-o"], Box::new(ToggleOverlay));
-    add("slideshow", "Slideshow", "幻灯片放映", view, &["ctrl-alt-s"], Box::new(Slideshow));
-    add("cull", "Cull", "挑片模式", view, &["ctrl-alt-c"], Box::new(CullMode));
-    add("second-viewer", "Second viewer window", "第二查看器窗口", view, &["ctrl-shift-v"], Box::new(SecondViewer));
-    add("stack", "Stack selected", "堆叠所选", image, &["ctrl-alt-k"], Box::new(StackSelected));
-    add("unstack", "Unstack", "取消堆叠", image, &["ctrl-alt-shift-k"], Box::new(UnstackSelected));
+    add("slideshow", "Slideshow", "幻灯片放映", view, &["secondary-alt-s"], Box::new(Slideshow));
+    add("cull", "Cull", "挑片模式", view, &["secondary-alt-c"], Box::new(CullMode));
+    add("second-viewer", "Second viewer window", "第二查看器窗口", view, &["secondary-shift-v"], Box::new(SecondViewer));
+    add("stack", "Stack selected", "堆叠所选", image, &["secondary-alt-k"], Box::new(StackSelected));
+    add("unstack", "Unstack", "取消堆叠", image, &["secondary-alt-shift-k"], Box::new(UnstackSelected));
     add("stacks-open", "Expand / collapse stacks", "展开/折叠堆叠", image, &["shift-s"], Box::new(ToggleStacksOpen));
-    add("save-style", "Save user style", "存储用户风格", edit, &["ctrl-alt-y"], Box::new(SaveUserStyle));
+    add("save-style", "Save user style", "存储用户风格", edit, &["secondary-alt-y"], Box::new(SaveUserStyle));
     add("warning", "Exposure warning", "曝光警告", view, &["alt-e"], Box::new(ToggleExposureWarning));
     add("proof", "Proof margin", "校样边距", view, &["alt-p"], Box::new(ToggleProof));
-    add("soft-proof", "Soft proof", "软打样", view, &["ctrl-alt-p"], Box::new(ToggleSoftProof));
+    add("soft-proof", "Soft proof", "软打样", view, &["secondary-alt-p"], Box::new(ToggleSoftProof));
     add("grid", "Grid", "网格", view, &["alt-g"], Box::new(ToggleGrid));
-    add("browser", "Show / hide browser", "显示/隐藏浏览器", view, &["ctrl-b"], Box::new(ToggleBrowser));
-    add("grid-view", "Grid view", "网格视图", view, &["ctrl-g"], Box::new(ToggleGridView));
-    add("inspector", "Show / hide tools", "显示/隐藏工具", view, &["ctrl-t"], Box::new(ToggleInspector));
-    add("inspector-side", "Tools on the other side", "工具栏换边", view, &["ctrl-shift-t"], Box::new(ToggleInspectorSide));
-    add("fullscreen", "Full screen", "全屏", view, &["f11"], Box::new(ToggleFullscreen));
-    add("shortcuts", "Keyboard shortcuts", "键盘快捷键", view, &["ctrl-/"], Box::new(ShowShortcuts));
-    add("language", "Switch language", "切换语言", view, &["ctrl-shift-u"], Box::new(ToggleLanguage));
-    for (i, k) in ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6", "ctrl-7", "ctrl-8", "ctrl-9"].iter().enumerate() {
+    add("browser", "Show / hide browser", "显示/隐藏浏览器", view, &["secondary-b"], Box::new(ToggleBrowser));
+    add("grid-view", "Grid view", "网格视图", view, &["secondary-g"], Box::new(ToggleGridView));
+    add("inspector", "Show / hide tools", "显示/隐藏工具", view, &["secondary-t"], Box::new(ToggleInspector));
+    add("inspector-side", "Tools on the other side", "工具栏换边", view, &["secondary-shift-t"], Box::new(ToggleInspectorSide));
+    // macOS's full-screen chord is Control+Command+F; Windows keeps F11.
+    let fullscreen: &[&'static str] = if cfg!(target_os = "macos") { &["ctrl-cmd-f"] } else { &["f11"] };
+    add("fullscreen", "Full screen", "全屏", view, fullscreen, Box::new(ToggleFullscreen));
+    add("shortcuts", "Keyboard shortcuts", "键盘快捷键", view, &["secondary-/"], Box::new(ShowShortcuts));
+    add("language", "Switch language", "切换语言", view, &["secondary-shift-u"], Box::new(ToggleLanguage));
+    for (i, k) in ["secondary-1", "secondary-2", "secondary-3", "secondary-4", "secondary-5", "secondary-6", "secondary-7", "secondary-8", "secondary-9"].iter().enumerate() {
         let tab = crate::state::ToolTab::ALL[i];
         out.push(Shortcut { id: format!("tab-{i}"), label: format!("{} · {}", t("Tool tab", "工具页签"), tab.label()), group: tools, defaults: vec![k], action: Box::new(SelectToolTab(i)), global: false });
     }
@@ -249,10 +262,30 @@ pub fn bind_keys(cx: &mut App, overrides: &std::collections::BTreeMap<String, Ve
         }
     }
     cx.bind_keys(keys);
+    // Standard macOS application-menu chords. They are not part of the user
+    // rebindable list; Merge HDR / Merge Panorama keep Control+H / Control+M so
+    // Cmd+H and Cmd+M stay free for AppKit.
+    #[cfg(target_os = "macos")]
+    {
+        let extras: [(&str, Box<dyn Action>); 3] = [
+            ("cmd-h", Box::new(Hide)),
+            ("cmd-alt-h", Box::new(HideOthers)),
+            ("cmd-m", Box::new(Minimize)),
+        ];
+        let mut bindings = Vec::new();
+        for (source, action) in extras {
+            match KeyBinding::load(source, action, None, false, None, cx) {
+                Ok(binding) => bindings.push(binding),
+                Err(error) => log::warn!("platform shortcut {source}: {error:?}"),
+            }
+        }
+        cx.bind_keys(bindings);
+    }
 }
 
-/// `ctrl-shift-k` → `Ctrl+Shift+K`.
+/// `secondary-shift-k` → `Ctrl+Shift+K` (`⌘+Shift+K` on macOS).
 pub fn display_keys(keys: &str) -> String {
+    let mac = cfg!(target_os = "macos");
     keys.split(' ')
         .map(|stroke| {
             stroke
@@ -262,7 +295,10 @@ pub fn display_keys(keys: &str) -> String {
                     "ctrl" => "Ctrl".to_string(),
                     "alt" => "Alt".to_string(),
                     "shift" => "Shift".to_string(),
-                    "cmd" | "super" | "win" => "Win".to_string(),
+                    // `cmd`/`super`/`win` all parse to GPUI's `platform` modifier,
+                    // which is Command on macOS — never label it "Win" there.
+                    "cmd" | "super" | "win" => if mac { "⌘".to_string() } else { "Win".to_string() },
+                    "secondary" => if mac { "⌘".to_string() } else { "Ctrl".to_string() },
                     "left" => "←".to_string(),
                     "right" => "→".to_string(),
                     "up" => "↑".to_string(),
@@ -439,8 +475,63 @@ fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
     ]
 }
 
+/// The macOS application menu AppKit expects: About, Preferences, Services,
+/// Hide / Hide Others / Show All and Quit. Key equivalents come from the
+/// keymap (`cmd-h`, `cmd-alt-h`, `secondary-q`, …).
+#[cfg(target_os = "macos")]
+fn macos_app_menu() -> Menu {
+    Menu {
+        name: "Aurora Studio".into(),
+        items: vec![
+            MenuItem::action(t("About Aurora Studio", "关于 Aurora Studio"), ShowAbout),
+            MenuItem::separator(),
+            MenuItem::action(t("Preferences…", "首选项…"), ShowPreferences),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", gpui_kit::SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action(t("Hide Aurora Studio", "隐藏 Aurora Studio"), Hide),
+            MenuItem::action(t("Hide Others", "隐藏其他"), HideOthers),
+            MenuItem::action(t("Show All", "全部显示"), ShowAll),
+            MenuItem::separator(),
+            MenuItem::action(t("Quit Aurora Studio", "退出 Aurora Studio"), Quit),
+        ],
+        disabled: false,
+    }
+}
+
+/// The macOS Window menu. GPUI only registers it with AppKit (`setWindowsMenu:`)
+/// when the title is exactly `Window`, so this title is intentionally not localized.
+#[cfg(target_os = "macos")]
+fn macos_window_menu() -> Menu {
+    Menu {
+        name: "Window".into(),
+        items: vec![
+            MenuItem::action(t("Minimize", "最小化"), Minimize),
+            MenuItem::action(t("Zoom", "缩放"), ZoomWindow),
+            MenuItem::separator(),
+            MenuItem::action(t("Full Screen", "全屏"), ToggleFullscreen),
+        ],
+        disabled: false,
+    }
+}
+
 /// Installs the menus for both the native menu bar and the in-window [`AppMenuBar`].
 pub fn install_menus(menu_bar: &Entity<AppMenuBar>, workspaces: &[String], recent: &[String], cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    {
+        // Prepend the application menu and insert the Window menu before Help,
+        // matching AppKit's usual order. The in-window bar below keeps the plain
+        // Windows/Linux menu list.
+        let mut native = Vec::with_capacity(10);
+        native.push(macos_app_menu());
+        let mut rest = menus(workspaces, recent);
+        let help = rest.pop();
+        native.extend(rest);
+        native.push(macos_window_menu());
+        native.extend(help);
+        cx.set_menus(native);
+    }
+    #[cfg(not(target_os = "macos"))]
     cx.set_menus(menus(workspaces, recent));
     let owned = menus(workspaces, recent).into_iter().map(|m| m.owned()).collect();
     GlobalState::global_mut(cx).set_app_menus(owned);

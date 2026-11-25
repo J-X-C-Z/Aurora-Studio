@@ -11,7 +11,7 @@
 use super::*;
 use crate::{LibraryAction, UserCollection};
 use crate::engine::ImageEngine;
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -52,11 +52,35 @@ fn is_private(path: &Path) -> bool {
     })
 }
 
+/// Canonicalize the deepest existing ancestor and rejoin the components that do
+/// not exist yet. macOS reports `/var/...` from `temp_dir()` while the physical
+/// path is `/private/var/...`; comparing a canonical root against a
+/// non-canonical request would falsely reject a path inside the library.
+fn physical_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(path) = fs::canonicalize(path) {
+        return Some(path);
+    }
+    let mut existing = path;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        let parent = existing.parent()?;
+        tail.push(existing.file_name()?.to_os_string());
+        if let Ok(base) = fs::canonicalize(parent) {
+            let mut out = base;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        existing = parent;
+    }
+}
+
 fn resolve_inside(root: &Path, path: &Path) -> Result<PathBuf> {
     ensure!(!path.as_os_str().is_empty(), "empty path");
     ensure!(!path.components().any(|component| matches!(component, Component::ParentDir)), "parent traversal is not allowed");
     let path = if path.is_absolute() {
-        plain_path(path)
+        plain_path(&physical_path(path).ok_or_else(|| anyhow!("path is unavailable: {}", path.display()))?)
     } else {
         ensure!(
             !path.components().any(|component| matches!(component, Component::RootDir | Component::Prefix(_))),
@@ -620,7 +644,11 @@ mod tests {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             ));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            // `temp_dir()` is `/var/...` on macOS while the physical path is
+            // `/private/var/...`. The engine stores a canonical root, so the
+            // fixture must use the same physical form or path equality is
+            // platform-dependent.
+            Self(canonical_root(&path).unwrap())
         }
 
         fn folder(&self, name: &str) -> PathBuf {

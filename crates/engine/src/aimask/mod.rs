@@ -176,6 +176,13 @@ pub fn lookup(key: &str) -> Option<Arc<MaskPlane>> {
 }
 
 /// Folders a Capture One install keeps its models and `onnxruntime.dll` in.
+///
+/// macOS is deliberately absent: Capture One ships its licensed models inside
+/// `/Applications/Capture One.app/Contents/Frameworks/ImageProcessing.framework/Resources/AIModels`
+/// (verified on this machine 2026-11-25), but those assets must not be consumed
+/// implicitly. Point `AURORA_AIMODELS` (or `AURORA_C1_DIR`) at a folder the
+/// operator is licensed to use. Auto-discovering them would also make default
+/// synthetic tests open sessions they cannot run.
 pub(crate) fn c1_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(dir) = std::env::var_os("AURORA_C1_DIR") {
