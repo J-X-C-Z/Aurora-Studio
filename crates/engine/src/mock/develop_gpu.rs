@@ -1903,6 +1903,83 @@ pub(crate) fn can_run_develop_gpu(
     gpu_runtime::vram_can_allocate("develop", fixed_bytes() + bytes)
 }
 
+/// Device bytes the develop pool retains for one band of `width × rows`.
+///
+/// The pool is band-shaped: `develop_band_sampled` opens it with the band
+/// dimensions, so the 4-float IO band and the 4-byte gain band cover
+/// `width × rows`, not the whole output frame. The parameter table, curve
+/// LUTs, colour-editor table, banding words and C1 tables are allocated once
+/// and stay resident for the life of the pool. `None` on overflow.
+fn band_device_bytes_with(width: usize, rows: usize, editor_bytes: usize) -> Option<usize> {
+    let pixels = width.checked_mul(rows)?;
+    if pixels == 0 {
+        return None;
+    }
+    pixels
+        .checked_mul(16)?
+        .checked_add(pixels.checked_mul(4)?)?
+        .checked_add(editor_bytes.max(4))?
+        .checked_add(fixed_bytes())
+}
+
+/// Host bytes one band needs: the full-frame gain plane the caller builds and
+/// the pooled 4-float band.
+///
+/// The gain plane is counted unconditionally. It is `4 × width × full_height`
+/// whenever the plan carries vignette/LCC, and counting it always keeps the
+/// admission independent of slider state. Host memory is not on the device
+/// ledger, so it is checked against the budget as its own conservative bound.
+fn band_host_bytes_with(width: usize, rows: usize, full_height: usize) -> Option<usize> {
+    let frame = width.checked_mul(full_height)?;
+    let band = width.checked_mul(rows)?;
+    if frame == 0 || band == 0 {
+        return None;
+    }
+    frame.checked_mul(4)?.checked_add(band.checked_mul(16)?)
+}
+
+/// Device-side admission for one band of `width × rows`, against the shared
+/// VRAM ledger: the same authority [`can_run_develop_gpu`] uses, but describing
+/// the band the pool actually opens instead of the whole output frame.
+pub(crate) fn band_device_admits(
+    width: usize,
+    rows: usize,
+    params: &DevelopParams,
+    budget: usize,
+) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let editor_bytes = params
+        .editor
+        .as_ref()
+        .map(|e| e.floats.len().saturating_mul(4))
+        .unwrap_or(0);
+    let Some(bytes) = band_device_bytes_with(width, rows, editor_bytes) else { return false };
+    if bytes > budget {
+        return false;
+    }
+    gpu_runtime::vram_can_allocate("develop", bytes)
+}
+
+/// Admission for the band path: the device pool this band grows plus the host
+/// plane the caller builds for it. Both must fit the budget.
+///
+/// `develop_plane` keeps [`can_run_develop_gpu`]: that API materialises a whole
+/// frame, so its whole-frame ledger still applies.
+pub(crate) fn can_run_band_develop_gpu(
+    width: usize,
+    rows: usize,
+    full_height: usize,
+    params: &DevelopParams,
+    budget: usize,
+) -> bool {
+    if !band_device_admits(width, rows, params, budget) {
+        return false;
+    }
+    band_host_bytes_with(width, rows, full_height).is_some_and(|bytes| bytes <= budget)
+}
+
 /// End-to-end CPU/GPU crossover policy of the point chain, in output pixels.
 ///
 /// S6 measured the LCC/vignette gain planes end to end, not this kernel, so
@@ -2234,6 +2311,57 @@ mod tests {
             }
         }
         (max_code, max_abs, over_one)
+    }
+
+    // Band-path retained ledger: the develop pool is band-shaped, so the
+    // whole-frame numbers must not decide whether a band may run.
+
+    #[test]
+    fn band_ledger_describes_the_band_not_the_whole_frame() {
+        let (w, h) = (8192usize, 5464usize);
+        let band = band_device_bytes_with(w, 256, 0).expect("band ledger");
+        // 45 MP at 256 rows: ~40.7 MiB, dominated by the 20 B/px band.
+        assert!(band <= 64 * 1024 * 1024, "45 MP band {band} must stay ~40 MiB");
+        let whole = band_device_bytes_with(w, h, 0).expect("frame ledger");
+        // The whole-frame shape stays an order of magnitude larger (~854 MiB):
+        // `develop_plane`'s whole-frame admission keeps refusing it.
+        assert!(whole > 800 * 1024 * 1024, "whole-frame ledger {whole} must stay large");
+    }
+
+    #[test]
+    fn band_host_ledger_counts_the_full_gain_plane() {
+        let (w, h, rows) = (8192usize, 5464usize, 256usize);
+        let host = band_host_bytes_with(w, rows, h).expect("host ledger");
+        assert!(host >= w * h * 4, "the full-frame gain plane is counted");
+        // 45 MP: gain plane 179 MiB + band IO 32 MiB ≈ 202.8 MiB.
+        assert!(host <= 256 * 1024 * 1024, "45 MP host ledger {host} must fit");
+    }
+
+    #[test]
+    fn the_odd_tail_band_is_cheaper_than_a_full_band() {
+        let (w, h) = (6048usize, 4032usize);
+        let tail = h % 256;
+        assert!(tail > 0 && tail < 256, "4032 leaves a 192-row tail");
+        let full = band_device_bytes_with(w, 256, 0).expect("full band");
+        let odd = band_device_bytes_with(w, tail, 0).expect("tail band");
+        assert!(odd < full);
+    }
+
+    #[test]
+    fn a_very_wide_band_still_fits_both_ledgers() {
+        let (w, h) = (40_000usize, 2_000usize);
+        let device = band_device_bytes_with(w, 256, 0).expect("device ledger");
+        let host = band_host_bytes_with(w, 256, h).expect("host ledger");
+        assert!(device < 256 * 1024 * 1024, "40k-wide band device ledger {device}");
+        assert!(host < 512 * 1024 * 1024, "40k-wide band host ledger {host}");
+    }
+
+    #[test]
+    fn the_band_ledger_refuses_overflow() {
+        assert!(band_device_bytes_with(usize::MAX / 8, 256, 0).is_none());
+        assert!(band_host_bytes_with(usize::MAX / 4, 1, 2).is_none());
+        assert!(band_device_bytes_with(0, 256, 0).is_none());
+        assert!(band_host_bytes_with(1024, 0, 2).is_none());
     }
 
     fn gradient(w: usize, h: usize) -> Vec<Sample> {

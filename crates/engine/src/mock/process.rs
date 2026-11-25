@@ -107,6 +107,7 @@ struct SourceSampleKey {
     out_h: u32,
     level: usize,
     cubic: bool,
+    halo: usize,
 }
 
 /// One cached square of output-space samples.
@@ -244,6 +245,7 @@ fn sample_key(
         out_h,
         level,
         cubic,
+        halo: 0,
     }
 }
 
@@ -291,11 +293,55 @@ mod sample_tile_cache_tests {
             out_h: SAMPLE_TILE,
             level: 0,
             cubic: false,
+            halo: 0,
         }
     }
 
     fn tile() -> Arc<Vec<SourceSample>> {
         Arc::new(vec![EMPTY_SAMPLE; 16])
+    }
+
+    #[test]
+    fn padded_tiles_match_direct_sampling_at_viewport_edges() {
+        let rgba: Vec<u8> = (0..(96 * 80 * 4)).map(|i| (i * 37 + i / 29) as u8).collect();
+        let src = Source::from_rgba(96, 80, &rgba);
+        let geometry = Geometry::default();
+        let map = super::super::geometry::FrameMap::new(src.size(), &geometry);
+        let region = NormRect { x: 0.0, y: 0.2, width: 0.7, height: 0.8 };
+        let (out_w, out_h, halo) = (253u32, 251u32, 7usize);
+        let (work_w, work_h) = (out_w + 2 * halo as u32, out_h + 2 * halo as u32);
+        let old_coordinate = |origin, span, count, index: usize| {
+            let step = f64::from(span) / f64::from(count);
+            let half = step * 0.5;
+            (f64::from(origin) + (index as f64 - halo as f64 + 0.5) * step)
+                .clamp(half, 1.0 - half) as f32
+        };
+        let xs: Vec<_> = (0..work_w)
+            .map(|x| halo_coordinate(region.x, region.width, out_w, x as usize, halo))
+            .collect();
+        for cubic in [false, true] {
+            let key = sample_key(&src, &geometry, region, work_w, work_h, 0, cubic);
+            for ty in 0..2 {
+                for tx in 0..2 {
+                    // Seed an unpadded tile of the same dimensions to catch accidental reuse.
+                    tile_for(&src, &map, &key, region, &xs, work_w, work_h, 0, cubic, tx, ty, true);
+                    let padded_key = SourceSampleKey { halo, ..key.clone() };
+                    let tile = tile_for(&src, &map, &padded_key, region, &xs, work_w, work_h, 0, cubic, tx, ty, true);
+                    let width = (work_w - tx * SAMPLE_TILE).min(SAMPLE_TILE) as usize;
+                    for (index, sample) in tile.iter().enumerate() {
+                        let x = (tx * SAMPLE_TILE) as usize + index % width;
+                        let y = (ty * SAMPLE_TILE) as usize + index / width;
+                        let point = [
+                            old_coordinate(region.x, region.width, out_w, x),
+                            old_coordinate(region.y, region.height, out_h, y),
+                        ];
+                        let direct = source_sample_at(&src, &map, 0, cubic, point);
+                        assert_eq!(sample.valid, direct.valid);
+                        assert_eq!(sample.rgb.map(f32::to_bits), direct.rgb.map(f32::to_bits));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -360,6 +406,14 @@ mod sample_tile_cache_tests {
     }
 }
 
+// Padded detail sampling extends the visible viewport's pixel centers.
+fn halo_coordinate(origin: f32, span: f32, count: u32, index: usize, halo: usize) -> f32 {
+    let step = f64::from(span) / f64::from(count);
+    let half = step * 0.5;
+    (f64::from(origin) + (index as f64 - halo as f64 + 0.5) * step)
+        .clamp(half, 1.0 - half) as f32
+}
+
 /// One `SAMPLE_TILE` square of the requested output frame. Sampling is the same
 /// per-pixel formula the whole-frame cache used, so results are bit-identical.
 #[allow(clippy::too_many_arguments)]
@@ -374,6 +428,7 @@ fn fill_tile(
     cubic: bool,
     tx: u32,
     ty: u32,
+    halo: usize,
 ) -> Vec<SourceSample> {
     let x0 = tx * SAMPLE_TILE;
     let y0 = ty * SAMPLE_TILE;
@@ -381,7 +436,12 @@ fn fill_tile(
     let height = (out_h - y0).min(SAMPLE_TILE) as usize;
     let mut tile = vec![EMPTY_SAMPLE; width * height];
     tile.par_chunks_mut(width).enumerate().for_each(|(row, line)| {
-        let fy = region.y + ((y0 + row as u32) as f32 + 0.5) / out_h as f32 * region.height;
+        let y = y0 + row as u32;
+        let fy = if halo == 0 {
+            region.y + (y as f32 + 0.5) / out_h as f32 * region.height
+        } else {
+            halo_coordinate(region.y, region.height, out_h - 2 * halo as u32, y as usize, halo)
+        };
         for (column, pixel) in line.iter_mut().enumerate() {
             let fx = xs[x0 as usize + column];
             *pixel = source_sample_at(src, map, level, cubic, [fx, fy]);
@@ -408,7 +468,7 @@ fn tile_for(
     if let Some(tile) = tile_lookup(key, tx, ty) {
         return tile;
     }
-    let tile = Arc::new(fill_tile(src, map, region, xs, out_w, out_h, level, cubic, tx, ty));
+    let tile = Arc::new(fill_tile(src, map, region, xs, out_w, out_h, level, cubic, tx, ty, key.halo));
     if cache {
         tile_insert(key, tx, ty, Arc::clone(&tile));
     }
@@ -431,14 +491,8 @@ struct BandSampler<'a> {
 }
 
 impl BandSampler<'_> {
-    /// Fills `band` with output rows `y0 .. y0 + rows` (row-major, `out_w` wide).
-    /// A band is one tile row tall, so it maps onto whole cached tiles.
-    fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
-        let out_w = self.out_w as usize;
-        band.resize(rows as usize * out_w, EMPTY_SAMPLE);
-        let ty = y0 / SAMPLE_TILE;
-        let columns = self.out_w.div_ceil(SAMPLE_TILE);
-        let tiles: Vec<Arc<Vec<SourceSample>>> = (0..columns)
+    fn tiles(&self, ty: u32) -> Vec<Arc<Vec<SourceSample>>> {
+        (0..self.out_w.div_ceil(SAMPLE_TILE))
             .into_par_iter()
             .map(|tx| {
                 tile_for(
@@ -446,7 +500,15 @@ impl BandSampler<'_> {
                     self.level, self.cubic, tx, ty, self.cache,
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// Fills `band` with output rows `y0 .. y0 + rows` (row-major, `out_w` wide).
+    /// A band is one tile row tall, so it maps onto whole cached tiles.
+    fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
+        let out_w = self.out_w as usize;
+        band.resize(rows as usize * out_w, EMPTY_SAMPLE);
+        let tiles = self.tiles(y0 / SAMPLE_TILE);
         band.par_chunks_mut(out_w).enumerate().for_each(|(row, line)| {
             let local = (y0 + row as u32) % SAMPLE_TILE;
             for (tx, tile) in tiles.iter().enumerate() {
@@ -2211,13 +2273,19 @@ fn gpu_develop_preflight(
     }
     // P0: the admission check runs before anything frame-sized exists — no
     // prewarm, no gain plane, no host IO, no sample band.
-    if !develop_gpu::can_run_develop_gpu(
+    //
+    // The develop GPU path is band-based: both call sites hand
+    // `develop_band_sampled` at most `SAMPLE_TILE` rows, so the retained
+    // ledger has to describe that band. `develop_plane`, the whole-frame API,
+    // keeps its own whole-frame check.
+    if !develop_gpu::can_run_band_develop_gpu(
         out_w as usize,
+        (out_h as usize).min(SAMPLE_TILE as usize),
         out_h as usize,
         &params,
         develop_gpu::develop_budget(),
     ) {
-        log_develop_gpu_fallback("frame exceeds the 768 MiB retained budget");
+        log_develop_gpu_fallback("band exceeds the shared VRAM budget");
         return None;
     }
     if !develop_gpu::crossover_admits(out_w as usize, out_h as usize) {
@@ -2911,22 +2979,46 @@ fn render_sized(
         if halo != 0 {
             // Preserve the viewport's sample centers and fetch neighbors in the
             // surrounding image. Clamp only at the developed frame boundary.
-            let coordinate = |origin: f32, span: f32, count: u32, index: usize| {
-                let step = f64::from(span) / f64::from(count);
-                let half = step * 0.5;
-                (f64::from(origin) + (index as f64 - halo as f64 + 0.5) * step)
-                    .clamp(half, 1.0 - half) as f32
-            };
             let work_x: Vec<_> = (0..work_w)
-                .map(|x| coordinate(region.x, region.width, out_w, x)).collect();
-            rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
-                let fy = coordinate(region.y, region.height, out_h, y);
-                for (x, (pixel, &fx)) in line.iter_mut().zip(&work_x).enumerate() {
-                    let point = [fx, fy];
-                    let sample = source_sample_at(src, &map, level, sharp, point);
-                    *pixel = develop_detail_input(sample, point, x, y);
+                .map(|x| halo_coordinate(region.x, region.width, out_w, x, halo))
+                .collect();
+            let sample_bytes = work_w.saturating_mul(work_h).saturating_mul(std::mem::size_of::<SourceSample>());
+            if !wide && sample_bytes <= tile_budget_bytes() {
+                let mut key = sample_key(src, &adj.geometry, region, work_w as u32, work_h as u32, level, sharp);
+                key.halo = halo;
+                let padded_bands = BandSampler {
+                    key,
+                    xs: &work_x,
+                    out_w: work_w as u32,
+                    out_h: work_h as u32,
+                    ..bands
+                };
+                let tile_width = SAMPLE_TILE as usize;
+                for (ty, band) in rgb_f32.chunks_mut(tile_width * work_w).enumerate() {
+                    let tiles = padded_bands.tiles(ty as u32);
+                    band.par_chunks_mut(work_w).enumerate().for_each(|(row, line)| {
+                        let y = ty * tile_width + row;
+                        let fy = halo_coordinate(region.y, region.height, out_h, y, halo);
+                        for (tx, (pixels, tile)) in line.chunks_mut(tile_width).zip(&tiles).enumerate() {
+                            let width = pixels.len();
+                            let samples = &tile[row * width..(row + 1) * width];
+                            for (column, (pixel, &sample)) in pixels.iter_mut().zip(samples).enumerate() {
+                                let x = tx * tile_width + column;
+                                *pixel = develop_detail_input(sample, [work_x[x], fy], x, y);
+                            }
+                        }
+                    });
                 }
-            });
+            } else {
+                rgb_f32.par_chunks_mut(work_w).enumerate().for_each(|(y, line)| {
+                    let fy = halo_coordinate(region.y, region.height, out_h, y, halo);
+                    for (x, (pixel, &fx)) in line.iter_mut().zip(&work_x).enumerate() {
+                        let point = [fx, fy];
+                        let sample = source_sample_at(src, &map, level, sharp, point);
+                        *pixel = develop_detail_input(sample, point, x, y);
+                    }
+                });
+            }
         } else {
             let mut band = Vec::new();
             let mut y0 = 0u32;

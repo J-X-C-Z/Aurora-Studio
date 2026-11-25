@@ -12,6 +12,7 @@
 //! `AURORA_ORT_LIB` overrides the ONNX Runtime library. Everything degrades to a
 //! warning when either is missing; nothing here panics.
 
+mod lru;
 pub(crate) mod ort;
 pub mod body_pose;
 
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
+use lru::ByteLru;
 use rayon::prelude::*;
 
 pub(crate) use ort::{Provider, Runtime, Session};
@@ -152,27 +154,59 @@ impl MaskPlane {
     }
 }
 
+/// Byte budget for cached masks. A plane costs `w * h * 4` bytes because
+/// `MaskPlane::data` is `Vec<f32>`; 64 MiB keeps about sixteen 1024-pixel
+/// masks (the old entry cap) while charging a large plane for what it really
+/// occupies instead of charging every plane the same.
+const MASK_BUDGET_ENV: &str = "AURORA_AI_MASK_BUDGET_MB";
+const MASK_BUDGET_DEFAULT_MIB: u64 = 64;
+/// Secondary ceiling, retained from the old cache.
 const MAX_CACHED_MASKS: usize = 16;
 
-fn masks() -> &'static Mutex<HashMap<String, Arc<MaskPlane>>> {
-    static MASKS: OnceLock<Mutex<HashMap<String, Arc<MaskPlane>>>> = OnceLock::new();
-    MASKS.get_or_init(|| Mutex::new(HashMap::new()))
+fn masks() -> &'static Mutex<ByteLru<Arc<MaskPlane>>> {
+    static MASKS: OnceLock<Mutex<ByteLru<Arc<MaskPlane>>>> = OnceLock::new();
+    MASKS.get_or_init(|| {
+        Mutex::new(ByteLru::new(
+            lru::budget_from_env(MASK_BUDGET_ENV, MASK_BUDGET_DEFAULT_MIB),
+            MAX_CACHED_MASKS,
+        ))
+    })
+}
+
+/// Bytes one mask keeps resident. `data.len()` is used rather than `w * h` so
+/// a malformed plane cannot understate its allocation.
+fn mask_bytes(plane: &MaskPlane) -> u64 {
+    u64::try_from(plane.data.len().max(plane.w.saturating_mul(plane.h)))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(std::mem::size_of::<f32>() as u64)
 }
 
 /// Caches one computed mask under the key `ImageEngine::compute_ai_mask` hands
-/// back to the interface.
+/// back to the interface. Eviction is byte-budgeted: the key already carries
+/// the image/variant/kind identity, so an evicted plane is simply recomputed.
+/// A plane a caller still holds is never dropped by the cache; it is marked
+/// pending and reclaimed once that clone goes away.
 pub fn store(key: &str, plane: Arc<MaskPlane>) {
-    let mut masks = masks().lock().unwrap_or_else(|e| e.into_inner());
-    // shortcut: whole-cache eviction, enough for a few hundred megapixels;
-    // switch to LRU if sessions ever hold many masked images at once.
-    if masks.len() >= MAX_CACHED_MASKS {
-        masks.clear();
-    }
-    masks.insert(key.to_string(), plane);
+    let bytes = mask_bytes(&plane);
+    let (previous, eviction) = {
+        let mut masks = masks().lock().unwrap_or_else(|e| e.into_inner());
+        let previous = masks.insert(key.to_string(), plane, bytes);
+        let eviction = masks.evict(|_, plane| Arc::strong_count(plane) > 1);
+        (previous, eviction)
+    };
+    drop(previous);
+    drop(eviction);
 }
 
 pub fn lookup(key: &str) -> Option<Arc<MaskPlane>> {
-    masks().lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+    let (plane, eviction) = {
+        let mut masks = masks().lock().unwrap_or_else(|e| e.into_inner());
+        let plane = masks.get(key).cloned();
+        let eviction = masks.evict(|_, plane| Arc::strong_count(plane) > 1);
+        (plane, eviction)
+    };
+    drop(eviction);
+    plane
 }
 
 /// Folders a Capture One install keeps its models and `onnxruntime.dll` in.
@@ -1594,5 +1628,40 @@ mod tests {
         assert_eq!(stored.output_dtype, "float32");
         assert_eq!(stored.postprocess_ms, 5.5);
         assert!(last_mask_timing("never-recorded").is_none());
+    }
+
+    #[test]
+    fn mask_cache_bytes_charge_w_h_times_f32() {
+        let plane = MaskPlane::new(3, 2, vec![0.0; 6]);
+        assert_eq!(mask_bytes(&plane), 6 * 4, "w*h*f32 bytes, not entry count");
+        // A malformed plane must not understate what it allocated.
+        let short = MaskPlane::new(0, 0, vec![0.0; 4]);
+        assert_eq!(mask_bytes(&short), 4 * 4);
+    }
+
+    #[test]
+    fn mask_cache_defers_eviction_while_a_caller_holds_the_plane() {
+        // A local cache so this test never disturbs the process-wide one.
+        let mut cache: super::lru::ByteLru<Arc<MaskPlane>> = super::lru::ByteLru::new(12, 16);
+        let first = Arc::new(MaskPlane::new(2, 1, vec![0.0, 1.0]));
+        let second = Arc::new(MaskPlane::new(2, 1, vec![1.0, 0.0]));
+        let first_bytes = mask_bytes(&first);
+        assert_eq!(first_bytes, 2 * 1 * 4);
+        let _ = cache.insert("first".to_string(), first.clone(), first_bytes);
+        let _ = cache.insert("second".to_string(), second.clone(), mask_bytes(&second));
+
+        // Two 8-byte planes over a 12-byte budget. Both are still referenced
+        // by this test, so eviction is deferred and the memory stays charged.
+        let eviction = cache.evict(|_, plane| Arc::strong_count(plane) > 1);
+        assert!(eviction.removed.is_empty(), "a live plane must not be dropped");
+        assert_eq!(eviction.pending, 1, "the older plane is marked pending");
+        assert_eq!(cache.bytes(), 16, "pending bytes still count against the budget");
+
+        // Releasing the caller's clone lets the next pass reclaim it.
+        drop(first);
+        let eviction = cache.evict(|_, plane| Arc::strong_count(plane) > 1);
+        assert_eq!(eviction.removed.len(), 1);
+        assert_eq!(eviction.removed[0].0, "first");
+        assert_eq!(cache.bytes(), 8);
     }
 }
