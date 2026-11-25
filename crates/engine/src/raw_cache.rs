@@ -222,6 +222,7 @@ fn get_or_decode_source16_with_failed(
                         long_side,
                         &route,
                         identity,
+                        true,
                         |path| {
                             let route = decode.take()?;
                             let mut leftover = None;
@@ -258,6 +259,7 @@ fn get_or_decode_source16_with_failed(
         long_side,
         &route,
         identity,
+        true,
         |path| {
             let route = decode.take()?;
             let mut leftover = None;
@@ -336,6 +338,7 @@ where
             long_side,
             &route,
             identity,
+            false,
             |path| decode.take()?(path),
         )
     };
@@ -588,8 +591,61 @@ fn resized16(
     ))
 }
 
+struct BgWriteJob {
+    file: PathBuf,
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    provenance: DecodeProvenance,
+    identity: SourceIdentity,
+    route: DecodeRoute,
+    native_input: Option<NativePersistInput>,
+}
+
+/// Single bounded background writer for cold-RAW 16-bit disk cache persistence.
+/// Offloads the ~200 MB RGB16 pack + CRC32 + disk write + eviction scan off
+/// the first-preview critical path while bounding queued RAM to at most 2 frames.
+fn bg_writer() -> &'static std::sync::mpsc::SyncSender<BgWriteJob> {
+    static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<BgWriteJob>> =
+        std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BgWriteJob>(2);
+        let _ = std::thread::Builder::new()
+            .name("aurora-raw16-cache-writer".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    if let Some(input) = job.native_input {
+                        persist_native_entry(
+                            &job.file,
+                            job.width,
+                            job.height,
+                            &job.pixels,
+                            job.provenance,
+                            job.identity,
+                            &job.route,
+                            input.z6iii,
+                            input,
+                        );
+                    } else {
+                        store16_binary(
+                            &job.file,
+                            job.width,
+                            job.height,
+                            &job.pixels,
+                            job.provenance,
+                            job.identity,
+                            &job.route,
+                        );
+                    }
+                }
+            });
+        tx
+    })
+}
+
 /// Downscales a full sensor frame and keeps its native samples for the first
 /// zoom request. The pending frame never triggers extra work.
+#[allow(clippy::too_many_arguments)]
 fn fit16_keep_native(
     native_file: Option<&Path>,
     native_key: Option<String>,
@@ -603,6 +659,7 @@ fn fit16_keep_native(
     route: &DecodeRoute,
     decode_millis: Option<u64>,
     explicit_native: bool,
+    async_persist: bool,
 ) -> Frame16 {
     let Some((target_width, target_height, proxy)) =
         resized16(width, height, &pixels, long_side)
@@ -623,17 +680,30 @@ fn fit16_keep_native(
             z6iii: provenance.unlocks_c1_z6iii_linear(),
             free_disk: free_disk_bytes(file.parent().unwrap_or(Path::new("."))),
         };
-        persist_native_entry(
-            file,
-            width,
-            height,
-            &pixels,
-            provenance,
-            identity,
-            route,
-            input.z6iii,
-            input,
-        );
+        if async_persist {
+            let _ = bg_writer().try_send(BgWriteJob {
+                file: file.to_path_buf(),
+                width,
+                height,
+                pixels: pixels.clone(),
+                provenance,
+                identity,
+                route: *route,
+                native_input: Some(input),
+            });
+        } else {
+            persist_native_entry(
+                file,
+                width,
+                height,
+                &pixels,
+                provenance,
+                identity,
+                route,
+                input.z6iii,
+                input,
+            );
+        }
     }
     remember_native(native_key, path, width, height, pixels, provenance, identity, route);
     (target_width, target_height, proxy, provenance)
@@ -642,6 +712,7 @@ fn fit16_keep_native(
 /// Decodes under one decode slot, fits the result, and applies the proxy/native
 /// persistence split: proxies always persist, native frames only when
 /// [`native_persist_decision`] says the write is worth it.
+#[allow(clippy::too_many_arguments)]
 fn decode_and_fit<F>(
     path: &Path,
     native_file: Option<&Path>,
@@ -649,6 +720,7 @@ fn decode_and_fit<F>(
     long_side: u32,
     route: &DecodeRoute,
     identity: SourceIdentity,
+    async_persist: bool,
     decode: F,
 ) -> Option<Frame16>
 where
@@ -677,6 +749,7 @@ where
         route,
         Some(millis),
         long_side == 0,
+        async_persist,
     );
     if long_side == 0 {
         // The requested frame is the native frame, so `fit16_keep_native`
@@ -691,17 +764,41 @@ where
                 native_file.and_then(Path::parent).unwrap_or(Path::new(".")),
             ),
         };
-        persist_native_entry(
-            probe_file,
-            image.0,
-            image.1,
-            &image.2,
-            image.3,
+        if async_persist {
+            let _ = bg_writer().try_send(BgWriteJob {
+                file: probe_file.to_path_buf(),
+                width: image.0,
+                height: image.1,
+                pixels: image.2.clone(),
+                provenance: image.3,
+                identity,
+                route: *route,
+                native_input: Some(input),
+            });
+        } else {
+            persist_native_entry(
+                probe_file,
+                image.0,
+                image.1,
+                &image.2,
+                image.3,
+                identity,
+                route,
+                z6iii,
+                input,
+            );
+        }
+    } else if async_persist {
+        let _ = bg_writer().try_send(BgWriteJob {
+            file: probe_file.to_path_buf(),
+            width: image.0,
+            height: image.1,
+            pixels: image.2.clone(),
+            provenance: image.3,
             identity,
-            route,
-            z6iii,
-            input,
-        );
+            route: *route,
+            native_input: None,
+        });
     } else {
         store16_binary(probe_file, image.0, image.1, &image.2, image.3, identity, route);
     }
@@ -1099,6 +1196,7 @@ fn cached_full_frame16(
         // Already persisted; never count a disk read as a fresh decode.
         None,
         false,
+        false,
     ))
 }
 
@@ -1133,6 +1231,7 @@ fn decode_frame16(
         identity,
         &route,
         None,
+        false,
         false,
     ))
 }

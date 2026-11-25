@@ -479,24 +479,48 @@ fn run_c1_stage123_tiles(
 /// decoder returns the stored landscape buffer, so apply the same turn here;
 /// callers then keep `geometry.orientation` at zero for normal folder imports.
 fn orient_rgba16(mut pixels: Vec<u16>, width: usize, height: usize, orientation: u16) -> (u32, u32, Vec<u16>) {
+    use rayon::prelude::*;
     match orientation {
         3 => {
-            for index in 0..width * height / 2 {
-                let other = width * height - 1 - index;
-                for channel in 0..4 {
-                    pixels.swap(index * 4 + channel, other * 4 + channel);
-                }
-            }
+            let total = width * height;
+            let half = total / 2;
+            let (left, right) = pixels.split_at_mut(half * 4);
+            let skip = (total - half * 2) * 4;
+            let right = &mut right[skip..];
+            left.par_chunks_exact_mut(4)
+                .zip(right.par_chunks_exact_mut(4).rev())
+                .for_each(|(a, b)| a.swap_with_slice(b));
             (width as u32, height as u32, pixels)
         }
         6 | 8 => {
-            let mut rotated = vec![0; pixels.len()];
-            for (index, pixel) in pixels.chunks_exact(4).enumerate() {
-                let (column, row) = (index % width, index / width);
-                let dst = if orientation == 6 { column * height + height - 1 - row }
-                    else { (width - 1 - column) * height + row };
-                rotated[dst * 4..dst * 4 + 4].copy_from_slice(pixel);
-            }
+            // Cache-tiled parallel 90° transpose: each destination row-band of
+            // 32 rows owns a disjoint slice of `rotated`, reading 32x32 tiles
+            // from `pixels` to stay in L1 cache.
+            const TILE: usize = 32;
+            let dst_w = height;
+            let dst_h = width;
+            let mut rotated = vec![0u16; pixels.len()];
+            let src = &pixels;
+            rotated
+                .par_chunks_mut(dst_w * 4 * TILE)
+                .enumerate()
+                .for_each(|(band_idx, band)| {
+                    let dy0 = band_idx * TILE;
+                    let dy1 = (dy0 + TILE).min(dst_h);
+                    for dx0 in (0..dst_w).step_by(TILE) {
+                        let dx1 = (dx0 + TILE).min(dst_w);
+                        for dy in dy0..dy1 {
+                            let dst_row = (dy - dy0) * dst_w * 4;
+                            let sx = if orientation == 6 { dy } else { width - 1 - dy };
+                            for dx in dx0..dx1 {
+                                let sy = if orientation == 6 { height - 1 - dx } else { dx };
+                                let s = (sy * width + sx) * 4;
+                                let d = dst_row + dx * 4;
+                                band[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                            }
+                        }
+                    }
+                });
             (height as u32, width as u32, rotated)
         }
         _ => (width as u32, height as u32, pixels),
