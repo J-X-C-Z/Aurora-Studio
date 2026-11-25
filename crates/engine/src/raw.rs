@@ -47,6 +47,44 @@ pub fn embedded_preview(path: &Path) -> anyhow::Result<RgbaImage> {
     found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))
 }
 
+/// Fast progressive first-frame preview for a cold RAW: streams chunks and
+/// stops as soon as an embedded JPEG with long side `>= target_long_side.clamp(640, 1600)`
+/// is found, then applies EXIF orientation so portrait frames appear upright.
+pub fn quick_embedded_preview(path: &Path, target_long_side: u32) -> anyhow::Result<RgbaImage> {
+    let min_long_side = target_long_side.clamp(640, 1600);
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(CHUNK, file);
+    let mut buf = vec![0u8; CHUNK];
+    let mut state = ScanState::default();
+    let mut best: Option<(u64, RgbaImage)> = None;
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                feed(&mut state, &buf[..n], &mut evaluate_preview, &mut best);
+                if let Some((_, ref img)) = best {
+                    if img.width().max(img.height()) >= min_long_side {
+                        break;
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let img = best
+        .map(|(_, value)| value)
+        .ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))?;
+    let oriented = match exif_orientation_tag(path).unwrap_or(1) {
+        3 => image::imageops::rotate180(&img),
+        6 => image::imageops::rotate90(&img),
+        8 => image::imageops::rotate270(&img),
+        _ => img,
+    };
+    Ok(oriented)
+}
+
 /// [`embedded_preview`] over bytes we already hold: the sensor/preview sanity
 /// check must not read the RAW a second time.
 fn embedded_preview_bytes(bytes: &[u8]) -> Option<RgbaImage> {
@@ -3953,6 +3991,30 @@ mod tests {
         assert_eq!(provenance.pixel_space, PixelSpace::CameraLinear16);
         assert!(!provenance.z6iii_linear);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_embedded_preview_returns_embedded_jpeg() {
+        let mut container = vec![0x49, 0x49, 0x2A, 0x00, 0, 0, 0, 0];
+        container.extend_from_slice(&jpeg(64, 48, 4));
+        let path = temp_file("quick-preview.nef", &container);
+        let img = quick_embedded_preview(&path, 1600).expect("embedded preview");
+        assert_eq!(img.dimensions(), (64, 48));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "profiles quick embedded JPEG preview on a real NEF; set AURORA_TEST_RAW"]
+    fn bench_quick_embedded_preview() {
+        let path = std::env::var_os("AURORA_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_TEST_RAW to a real NEF file");
+        for round in 0..3 {
+            let started = Instant::now();
+            let img = quick_embedded_preview(&path, 1600).expect("quick embedded preview");
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!("QUICK_PREVIEW round={round} {}x{} ms={ms:.1}", img.width(), img.height());
+        }
     }
 }
 

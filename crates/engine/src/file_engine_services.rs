@@ -390,6 +390,106 @@ impl<'a> RenderService<'a> {
     /// `render_preview_fast`. This records that a render started and how it
     /// ended; it is not a scheduler. Generation handling, latest-value policy
     /// and the preview cache remain in [`Self::preview_frame_inner`] untouched.
+    /// Fast progressive first-frame preview for a cold RAW image. Returns `None`
+    /// immediately if the image is already cached in RAM/disk, is not a RAW, or
+    /// is a zoomed sub-region request.
+    pub(crate) fn quick_cold_raw_preview(&self, request: &PreviewRequest) -> Option<PreviewFrame> {
+        if request.region != NormRect::FULL {
+            return None;
+        }
+        if self.engine.cached_source(request.image).is_some() {
+            return None;
+        }
+        let path = {
+            let st = self.engine.state.lock();
+            st.entries
+                .iter()
+                .find(|entry| entry.info.id == request.image)
+                .map(|entry| entry.path.clone())?
+        };
+        if !crate::raw::is_raw(&path) || is_eip(&path) || is_cop(&path) {
+            return None;
+        }
+        if crate::raw_cache::has_cached_source16(&path, SOURCE_LONG_SIDE) {
+            return None;
+        }
+        let start = std::time::Instant::now();
+        let max_size = request.max_size.max(1);
+        let preview = crate::raw::quick_embedded_preview(&path, max_size).ok()?;
+        let (pw, ph) = preview.dimensions();
+        let long = pw.max(ph);
+        let resized = if long > max_size {
+            let scale = max_size as f32 / long as f32;
+            let nw = ((pw as f32 * scale).round() as u32).max(1);
+            let nh = ((ph as f32 * scale).round() as u32).max(1);
+            downscale_rgba(&preview, nw, nh)
+        } else {
+            preview
+        };
+        let (w, h) = resized.dimensions();
+        let adj = crate::styles::resolve(&request.adjustments);
+        if !request.bypass && !adj.is_default() {
+            let src = Source::from_rgba(w, h, resized.as_raw()).with_camera_preview(true);
+            let out = process::render_preview_bgra(
+                &src,
+                &adj,
+                NormRect::FULL,
+                max_size,
+                false,
+                request.mask_overlay,
+                true,
+            );
+            return Some(PreviewFrame {
+                image: RgbaImage::new(out.width, out.height, out.rgba),
+                histogram: out.histogram,
+                generation: request.generation,
+                elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+                degraded: None,
+                gamut_warning: None,
+                bgra: out.bgra,
+            });
+        }
+        let mut pixels = resized.into_raw();
+        let mut red = vec![0u32; 256];
+        let mut green = vec![0u32; 256];
+        let mut blue = vec![0u32; 256];
+        let mut luma = vec![0u32; 256];
+        let mut shadows = 0u32;
+        let mut highlights = 0u32;
+        for px in pixels.chunks_exact_mut(4) {
+            let (r, g, b) = (px[0], px[1], px[2]);
+            red[r as usize] += 1;
+            green[g as usize] += 1;
+            blue[b as usize] += 1;
+            let l = ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8).min(255) as usize;
+            luma[l] += 1;
+            if r == 0 && g == 0 && b == 0 {
+                shadows += 1;
+            } else if r == 255 && g == 255 && b == 255 {
+                highlights += 1;
+            }
+            px[0] = b;
+            px[2] = r;
+        }
+        let total = (w * h).max(1) as f32;
+        Some(PreviewFrame {
+            image: RgbaImage::new(w, h, pixels),
+            histogram: crate::Histogram {
+                red,
+                green,
+                blue,
+                luma,
+                clipped_shadows: shadows as f32 / total,
+                clipped_highlights: highlights as f32 / total,
+            },
+            generation: request.generation,
+            elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            degraded: None,
+            gamut_warning: None,
+            bgra: true,
+        })
+    }
+
     pub(crate) fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
         let engine = self.engine;
         // Keep the record map bounded across a drag: terminal records are

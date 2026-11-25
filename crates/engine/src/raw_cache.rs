@@ -139,6 +139,29 @@ pub fn get_or_decode16_traced(
     })
 }
 
+/// Cheap check whether a 16-bit disk or pending-RAM cache entry already exists
+/// for `path`, used to skip the temporary embedded-JPEG progressive preview
+/// whenever a warm 16-bit source is available.
+pub(crate) fn has_cached_source16(path: &Path, long_side: u32) -> bool {
+    let route = crate::raw::decode_route(path);
+    let Some(identity) = tracked_identity(path) else {
+        return false;
+    };
+    if let Some(dir) = default_raw16_dir() {
+        let key = cache_name16_for_identity(path, long_side, route, identity);
+        if dir.join(&key).is_file() {
+            return true;
+        }
+        if long_side > 0 {
+            let native_key = cache_name16_for_identity(path, 0, route, identity);
+            if dir.join(&native_key).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn get_or_decode_source16(
     path: &Path,
     long_side: u32,

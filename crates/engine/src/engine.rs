@@ -755,6 +755,12 @@ pub trait ImageEngine: Send + Sync + 'static {
     fn render_preview_fast(&self, request: &PreviewRequest, _fast: bool) -> anyhow::Result<PreviewFrame> {
         self.render_preview(request)
     }
+    /// Fast embedded-JPEG preview for a cold RAW image whose 16-bit source is
+    /// not yet in RAM or the 16-bit disk cache. Returns `None` when the image
+    /// is already warm, is not a RAW, or has no embedded JPEG preview.
+    fn quick_cold_raw_preview(&self, _request: &PreviewRequest) -> Option<PreviewFrame> {
+        None
+    }
     /// Processed sRGB color under a normalized image point, 0 ..= 1 per channel.
     fn sample_color(&self, image: ImageId, adjustments: &AdjustmentSet, point: [f32; 2]) -> anyhow::Result<[f32; 3]>;
 

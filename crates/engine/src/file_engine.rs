@@ -4452,6 +4452,10 @@ impl ImageEngine for FileEngine {
         self.preview_frame(request, fast)
     }
 
+    fn quick_cold_raw_preview(&self, request: &PreviewRequest) -> Option<PreviewFrame> {
+        self.renders().quick_cold_raw_preview(request)
+    }
+
     fn sample_color(&self, image: ImageId, adjustments: &AdjustmentSet, point: [f32; 2]) -> anyhow::Result<[f32; 3]> {
         let src = self.source(image)?;
         Ok(process::sample_point(&src, &crate::styles::resolve(adjustments), point))

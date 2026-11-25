@@ -992,6 +992,78 @@ impl AppState {
         let previous_before = self.preview_state.preview.before.as_ref().map(|frame| {
             (frame.source_pixels, Arc::clone(&frame.image), frame.image_id)
         });
+        // Progressive cold-RAW first frame: when switching to a new image in
+        // fit-view, concurrently extract its embedded JPEG preview (~20-40 ms)
+        // so the canvas paints immediately while the full 16-bit RAW decode
+        // runs in the background and seamlessly upgrades the frame.
+        let showing_same_image = self
+            .preview_state
+            .preview
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.image_id == requested_image);
+        if !showing_same_image && request.region == NormRect::FULL {
+            let quick_engine = engine.clone();
+            let quick_req = request.clone();
+            let quick_geometry = geometry.clone();
+            cx.spawn(async move |this, cx| {
+                let quick = cx
+                    .background_spawn(async move {
+                        quick_engine.quick_cold_raw_preview(&quick_req).map(|f| {
+                            let PreviewFrame { image, histogram, elapsed_ms, bgra, .. } = f;
+                            let (width, height) = (image.width, image.height);
+                            let display = prepare_display_image(image, bgra, None);
+                            (histogram, elapsed_ms, display, width, height)
+                        })
+                    })
+                    .await;
+                let Some((histogram, elapsed_ms, display, width, height)) = quick else {
+                    return;
+                };
+                let _ = this.update(cx, |this, cx| {
+                    let already_showing = this
+                        .preview_state
+                        .preview
+                        .frame
+                        .as_ref()
+                        .is_some_and(|frame| frame.image_id == requested_image);
+                    if !already_showing
+                        && this.preview_state.preview.may_install(
+                            this.library.current,
+                            requested_image,
+                            stamp.id,
+                        )
+                    {
+                        let PreparedDisplay { image: img, source_pixels, .. } = display;
+                        this.preview_state.preview.error = None;
+                        display_frame(
+                            &mut this.preview_state.preview.frame,
+                            &mut this.preview_state.preview.full_after,
+                            Frame {
+                                image: img,
+                                source_pixels,
+                                region: NormRect::FULL,
+                                geometry: quick_geometry,
+                                portrait_applied: false,
+                                image_id: requested_image,
+                                warning: None,
+                                focus: None,
+                                degraded: None,
+                                stamp,
+                            },
+                            cx,
+                        );
+                        this.preview_state.preview.histogram = histogram;
+                        this.preview_state.preview.elapsed_ms = elapsed_ms;
+                        log::debug!("quick cold RAW preview: {}×{} in {:.1} ms", width, height, elapsed_ms);
+                        cx.notify();
+                    } else {
+                        cx.drop_image(display.image, None);
+                    }
+                });
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             let after_engine = engine.clone();
             let frame = cx
