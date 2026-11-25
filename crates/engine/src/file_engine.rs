@@ -4,7 +4,7 @@
 //! before an engine exists. This one reads an actual folder: it scans it,
 //! reads EXIF, keeps ratings and keywords, and writes adjustments back.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,6 +180,44 @@ impl SourceFileIdentity {
     }
 }
 
+/// The source one export was queued for: its catalog path and the lightweight
+/// file identity (length + mtime) read at queue time.
+///
+/// The worker checks both again before it decodes and once more afterwards, so
+/// a file that was deleted, moved or replaced while the job waited fails the
+/// job instead of exporting different pixels with the queued recipe. A
+/// replacement that keeps the exact length and mtime is not distinguishable by
+/// this lightweight check; catching that needs the content token, which costs
+/// a file read and is only taken when a source is stored for the cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExportSourceSnapshot {
+    path: PathBuf,
+    identity: Option<SourceFileIdentity>,
+}
+
+impl ExportSourceSnapshot {
+    fn read(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), identity: SourceFileIdentity::read(path) }
+    }
+
+    /// Fails unless the catalog still points at the queued path and the file
+    /// still has the length and mtime it had when the job was queued.
+    fn ensure_unchanged(
+        &self,
+        sources: &SourceProvider,
+        image: ImageId,
+        phase: &str,
+    ) -> anyhow::Result<()> {
+        if sources.image_path(image).as_deref() != Some(self.path.as_path()) {
+            anyhow::bail!("export source path changed {phase}");
+        }
+        if self.identity.is_none() || SourceFileIdentity::read(&self.path) != self.identity {
+            anyhow::bail!("export source changed {phase}");
+        }
+        Ok(())
+    }
+}
+
 /// How a file is decoded, for working-set estimation only. Proxy/native RAW and
 /// raster decoders allocate very different intermediates at the *source*
 /// resolution, so admission must not be based on the retained 4096 proxy alone.
@@ -252,10 +290,12 @@ fn decode_gate_units(cache_bytes: usize) -> usize {
     (cache_bytes / DECODE_UNIT_BYTES).clamp(2, 6)
 }
 
-/// Admission units one decode reserves: its estimated working set in 256 MiB
-/// units, never more than the gate can grant.
-fn decode_units(total_units: usize, bytes: usize) -> usize {
-    bytes.div_ceil(DECODE_UNIT_BYTES).clamp(1, total_units.max(1))
+/// Admission units one decode asks for: its estimated working set in 256 MiB
+/// units. This stays the caller's true ask — the gate clamps the charge to its
+/// own total when the request is registered — so a budget retune before the
+/// grant cannot shrink what the caller originally needed.
+fn decode_units(bytes: usize) -> usize {
+    bytes.div_ceil(DECODE_UNIT_BYTES).max(1)
 }
 
 /// Removes a cached source and everything charged alongside it. Returns the
@@ -1097,6 +1137,74 @@ struct FileEntry {
     adjustments: AdjustmentSet,
 }
 
+/// Batch size above which one library-wide id index is cheaper than a scan of
+/// the entry list per id. Reuses the prior batch-lookup patch's fixed 8, so a
+/// small batch does not build a whole-library map.
+const BATCH_INDEX_MIN: usize = 8;
+
+/// First slot of every id, so a duplicated id resolves to its first entry
+/// exactly like `entries.iter().position(...)`.
+fn image_indices(entries: &[FileEntry]) -> HashMap<ImageId, usize> {
+    let mut indices = HashMap::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        indices.entry(entry.info.id).or_insert(index);
+    }
+    indices
+}
+
+/// Positions for `ids`, resolved without an `entries * ids` scan on a large
+/// batch. Every id is checked before the caller mutates anything, so an
+/// unknown id still leaves the entries untouched.
+fn image_positions(entries: &[FileEntry], ids: &[ImageId]) -> anyhow::Result<Vec<usize>> {
+    let indices = (ids.len() > BATCH_INDEX_MIN).then(|| image_indices(entries));
+    ids.iter()
+        .map(|id| match &indices {
+            Some(indices) => indices.get(id).copied(),
+            None => entries.iter().position(|entry| entry.info.id == *id),
+        })
+        .map(|position| position.ok_or_else(|| anyhow::anyhow!("unknown image")))
+        .collect()
+}
+
+/// First catalog slot per wanted `rel_path`, filled by one catalog pass. A
+/// duplicated path keeps its first slot, matching `Catalog::upsert`.
+fn catalog_positions(catalog: &Catalog, wanted: &[&str]) -> HashMap<String, usize> {
+    let wanted: HashSet<&str> = wanted.iter().copied().collect();
+    let mut positions = HashMap::with_capacity(wanted.len());
+    for (slot, entry) in catalog.images.iter().enumerate() {
+        if wanted.contains(entry.rel_path.as_str()) {
+            positions.entry(entry.rel_path.clone()).or_insert(slot);
+        }
+    }
+    positions
+}
+
+/// Applies `entries` with `Catalog::upsert`'s exact replace-first / append-new
+/// result. A large batch indexes the wanted paths once instead of scanning the
+/// whole catalog per record.
+fn upsert_entries(catalog: &mut Catalog, entries: Vec<Entry>) {
+    if entries.len() <= BATCH_INDEX_MIN {
+        for entry in entries {
+            catalog.upsert(entry);
+        }
+        return;
+    }
+    let mut positions = {
+        let wanted: Vec<&str> = entries.iter().map(|entry| entry.rel_path.as_str()).collect();
+        catalog_positions(catalog, &wanted)
+    };
+    for entry in entries {
+        let slot = positions.get(entry.rel_path.as_str()).copied();
+        match slot {
+            Some(slot) => catalog.images[slot] = entry,
+            None => {
+                positions.insert(entry.rel_path.clone(), catalog.images.len());
+                catalog.images.push(entry);
+            }
+        }
+    }
+}
+
 struct AiInput {
     source_id: u64,
     geometry: u64,
@@ -1236,17 +1344,33 @@ enum DecodePriority {
 struct GateWaiter {
     ticket: u64,
     priority: DecodePriority,
+    /// Units the caller asked for. A queued request is charged
+    /// `requested_units.min(total_units)` and gets the original ask back when
+    /// the budget grows again.
+    requested_units: usize,
+    /// Units this request is charged once it is granted. Retuning only ever
+    /// touches requests that have not been granted yet.
     units: usize,
     granted: bool,
 }
 
 struct GateInner {
     total_units: usize,
-    free_units: usize,
+    /// Units held by granted requests, including grants whose caller has not
+    /// returned from `acquire` yet. `free_units` is derived from this and
+    /// `total_units` so no separate free counter can drift when the budget
+    /// shrinks below what is already in flight.
+    occupied_units: usize,
     next_ticket: u64,
     waiters: Vec<GateWaiter>,
     active: usize,
     peak_active: usize,
+}
+
+impl GateInner {
+    fn free_units(&self) -> usize {
+        self.total_units.saturating_sub(self.occupied_units)
+    }
 }
 
 /// A priority-aware counting semaphore. A decode reserves units proportional to
@@ -1261,6 +1385,7 @@ struct DecodeGate {
 
 struct GatePermit<'a> {
     gate: &'a DecodeGate,
+    /// Exactly the units charged at grant time; returned on drop.
     units: usize,
 }
 
@@ -1268,11 +1393,12 @@ struct GatePermit<'a> {
 fn dispatch_gate(inner: &mut GateInner) -> bool {
     let mut granted = false;
     loop {
+        let free = inner.free_units();
         let Some(index) = inner
             .waiters
             .iter()
             .enumerate()
-            .filter(|(_, waiter)| !waiter.granted && waiter.units <= inner.free_units)
+            .filter(|(_, waiter)| !waiter.granted && waiter.units <= free)
             .min_by_key(|(_, waiter)| (waiter.priority, waiter.ticket))
             .map(|(index, _)| index)
         else {
@@ -1280,7 +1406,7 @@ fn dispatch_gate(inner: &mut GateInner) -> bool {
         };
         let units = inner.waiters[index].units;
         inner.waiters[index].granted = true;
-        inner.free_units -= units;
+        inner.occupied_units = inner.occupied_units.saturating_add(units);
         inner.active += 1;
         inner.peak_active = inner.peak_active.max(inner.active);
         granted = true;
@@ -1294,7 +1420,7 @@ impl DecodeGate {
         Self {
             inner: Mutex::new(GateInner {
                 total_units,
-                free_units: total_units,
+                occupied_units: 0,
                 next_ticket: 0,
                 waiters: Vec::new(),
                 active: 0,
@@ -1310,43 +1436,69 @@ impl DecodeGate {
         self.inner.lock().total_units
     }
 
-    /// Retunes admission when the RAM budget changes. Queued requests are
-    /// clamped to the new total so none can wait for units that no longer exist.
+    /// Retunes admission when the RAM budget changes. Granted requests keep the
+    /// units they were charged because they are already in flight; only queued
+    /// requests are reclamped to the new total, and a request that was clamped
+    /// down gets its original ask back when the budget grows.
     fn set_total_units(&self, total_units: usize) {
         let total_units = total_units.max(1);
         let mut inner = self.inner.lock();
-        inner.free_units = inner
-            .free_units
-            .saturating_add(total_units)
-            .saturating_sub(inner.total_units)
-            .min(total_units);
         inner.total_units = total_units;
         for waiter in &mut inner.waiters {
-            waiter.units = waiter.units.min(total_units);
+            if !waiter.granted {
+                waiter.units = waiter.requested_units.clamp(1, total_units);
+            }
         }
         if dispatch_gate(&mut inner) {
             self.released.notify_all();
         }
     }
 
-    fn acquire(&self, priority: DecodePriority, units: usize) -> GatePermit<'_> {
-        let mut inner = self.inner.lock();
-        let units = units.clamp(1, inner.total_units);
+    /// Registers a request without charging it; units are charged at grant.
+    fn enqueue(inner: &mut GateInner, priority: DecodePriority, units: usize) -> u64 {
+        let requested_units = units.max(1);
         let ticket = inner.next_ticket;
         inner.next_ticket = inner.next_ticket.wrapping_add(1);
-        inner.waiters.push(GateWaiter { ticket, priority, units, granted: false });
+        inner.waiters.push(GateWaiter {
+            ticket,
+            priority,
+            requested_units,
+            units: requested_units.min(inner.total_units.max(1)),
+            granted: false,
+        });
+        ticket
+    }
+
+    fn is_granted(inner: &GateInner, ticket: u64) -> bool {
+        inner.waiters.iter().find(|waiter| waiter.ticket == ticket).is_some_and(|waiter| waiter.granted)
+    }
+
+    /// Removes a granted request and returns the units it was charged. A granted
+    /// request's charge never changes, so this is exactly what the permit holds
+    /// until drop.
+    fn claim(inner: &mut GateInner, ticket: u64) -> usize {
+        let index = inner
+            .waiters
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+            .expect("granted decode request must still be registered");
+        inner.waiters.remove(index).units
+    }
+
+    fn acquire(&self, priority: DecodePriority, units: usize) -> GatePermit<'_> {
+        let mut inner = self.inner.lock();
+        let ticket = Self::enqueue(&mut inner, priority, units);
         dispatch_gate(&mut inner);
-        let granted_now = inner.waiters.iter().find(|waiter| waiter.ticket == ticket).is_some_and(|waiter| waiter.granted);
-        if !granted_now {
+        if !Self::is_granted(&inner, ticket) {
             self.waits.fetch_add(1, Ordering::Relaxed);
             let start = Instant::now();
-            while !inner.waiters.iter().find(|waiter| waiter.ticket == ticket).is_some_and(|waiter| waiter.granted) {
+            while !Self::is_granted(&inner, ticket) {
                 self.released.wait(&mut inner);
             }
             let waited = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             self.wait_nanos.fetch_add(waited, Ordering::Relaxed);
         }
-        inner.waiters.retain(|waiter| waiter.ticket != ticket);
+        let units = Self::claim(&mut inner, ticket);
         GatePermit { gate: self, units }
     }
 
@@ -1366,7 +1518,7 @@ impl DecodeGate {
 impl Drop for GatePermit<'_> {
     fn drop(&mut self) {
         let mut inner = self.gate.inner.lock();
-        inner.free_units = (inner.free_units + self.units).min(inner.total_units);
+        inner.occupied_units = inner.occupied_units.saturating_sub(self.units);
         inner.active = inner.active.saturating_sub(1);
         if dispatch_gate(&mut inner) {
             self.gate.released.notify_all();
@@ -1421,6 +1573,94 @@ fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
     let pixels = (width as usize).saturating_mul(height as usize);
     let bytes_per_px = if bit_depth == 16 { 36usize } else { 24usize };
     pixels.saturating_mul(bytes_per_px).max(1)
+}
+
+/// Pixel size charged for a source whose real dimensions could not be read.
+/// This is a conservative floor, not an upper bound: it only keeps an
+/// unreadable size from being priced as free, while a frame that really is
+/// larger is charged through its real (catalog) dimensions instead.
+const UNKNOWN_SOURCE_SIZE: (u32, u32) = (6000, 4000);
+
+/// Bytes one export is charged: the source frame it decodes plus the frame it
+/// writes.
+///
+/// Both are derived from the catalog (the scan already read the dimensions) and
+/// the recipe's geometry, so the charge is known before a pixel is decoded. The
+/// source side uses the decode envelope of the format the job will read — the
+/// native frame for a RAW or EIP, the proxy for everything else — and an
+/// unreadable size is charged at [`UNKNOWN_SOURCE_SIZE`], a documented floor
+/// rather than an upper bound, so a missing measurement is never priced as
+/// free.
+fn estimated_export_charge(recipe: &crate::ProcessRecipe, info: &ImageInfo, geometry: &Geometry) -> usize {
+    let source = if info.width == 0 || info.height == 0 {
+        UNKNOWN_SOURCE_SIZE
+    } else {
+        (info.width, info.height)
+    };
+    let format = if crate::raw::is_raw(&info.path) || is_eip(&info.path) {
+        DecodeFormat::RawNative
+    } else {
+        DecodeFormat::Raster
+    };
+    let input_bytes = estimated_decode_bytes(source.0, source.1, format);
+    let (width, height) = crate::mock::geometry::FrameMap::new(source, geometry).frame_size();
+    let edited_size = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+    let (width, height) = crate::recipe::output_size(recipe, edited_size);
+    input_bytes.saturating_add(estimated_export_bytes(width, height, recipe.bit_depth))
+}
+
+/// Whether the queued request is one the Windows exact desktop path can serve,
+/// judged only from the catalog path, the queued adjustments and the recipe.
+///
+/// The specialization itself also proves the file is a Z6III HE NEF before it
+/// runs, which needs the bytes; admission cannot wait for that, so it mirrors
+/// the two pure gates the export opens with — the `.nef` extension and
+/// [`crate::z6iii::desktop::compatible`] — and charges the exact envelope only
+/// for requests that can actually reach that path. A non-NEF or a recipe the
+/// specialised export rejects keeps the standard estimate, so an ordinary JPEG
+/// is never charged the full RAW working set.
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+fn exact_export_candidate(
+    info: &ImageInfo,
+    adjustments: &crate::AdjustmentSet,
+    recipe: &crate::ProcessRecipe,
+) -> bool {
+    info.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nef"))
+        && crate::z6iii::desktop::compatible(adjustments, recipe)
+}
+
+/// Working set of an exact desktop (Z6III) export: it reads and writes the RAW
+/// at its own size, so the geometry-scaled standard estimate is not an upper
+/// bound for it and the two must be charged with the larger one. Only a request
+/// [`exact_export_candidate`] admits pays this; everything else is charged the
+/// standard estimate alone.
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+fn estimated_exact_export_charge(recipe: &crate::ProcessRecipe, info: &ImageInfo) -> usize {
+    let source = if info.width == 0 || info.height == 0 {
+        UNKNOWN_SOURCE_SIZE
+    } else {
+        (info.width, info.height)
+    };
+    estimated_decode_bytes(source.0, source.1, DecodeFormat::RawNative)
+        .saturating_add(estimated_export_bytes(source.0, source.1, recipe.bit_depth))
+}
+
+/// Bytes one job is admitted with: the standard source-plus-output charge, and
+/// for an [`exact_export_candidate`] the larger of that and the exact RAW
+/// envelope. Pure and catalog-only, so it runs before the scheduler admits the
+/// job and before any pixel is decoded.
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+fn estimated_job_charge(
+    recipe: &crate::ProcessRecipe,
+    info: &ImageInfo,
+    adjustments: &crate::AdjustmentSet,
+) -> usize {
+    let standard = estimated_export_charge(recipe, info, &adjustments.geometry);
+    if exact_export_candidate(info, adjustments, recipe) {
+        standard.max(estimated_exact_export_charge(recipe, info))
+    } else {
+        standard
+    }
 }
 
 struct ExportSchedulerInner {
@@ -1553,10 +1793,24 @@ impl Flight {
     }
 }
 
+/// The decoding half of the engine.
+///
+/// `FileEngine` owns one and clones the `Arc` into a background export worker,
+/// so a job reads its source only after the export scheduler has admitted it.
+/// Everything here is shared with the engine: the same state lock, flight
+/// table, decode gates and native-decode lock.
+struct SourceProvider {
+    root: PathBuf,
+    state: Arc<Mutex<State>>,
+    flights: Mutex<HashMap<SourceKey, Arc<Flight>>>,
+    decode_gates: DecodeGates,
+    native_decode: Mutex<()>,
+}
+
 /// The thread that owns a decode. If it unwinds, waiters are released with an
 /// error instead of hanging on the flight forever.
 struct FlightLeader<'a> {
-    engine: &'a FileEngine,
+    provider: &'a SourceProvider,
     key: SourceKey,
     flight: Arc<Flight>,
     finished: bool,
@@ -1565,7 +1819,7 @@ struct FlightLeader<'a> {
 impl FlightLeader<'_> {
     fn finish(mut self, result: Result<Arc<Source>, String>) -> Result<Arc<Source>, String> {
         self.flight.publish(result.clone());
-        self.engine.flights.lock().remove(&self.key);
+        self.provider.flights.lock().remove(&self.key);
         self.finished = true;
         result
     }
@@ -1575,7 +1829,7 @@ impl Drop for FlightLeader<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.flight.publish(Err("decode aborted".into()));
-            self.engine.flights.lock().remove(&self.key);
+            self.provider.flights.lock().remove(&self.key);
         }
     }
 }
@@ -1620,14 +1874,11 @@ pub struct FileEngine {
     /// Gamut counts are tiny compared with the frame; keep recent proof results
     /// so a repaint does not repeat the full round trip.
     gamut: Mutex<Vec<(preview_cache::PreviewKey, String, crate::GamutWarning)>>,
-    /// One in-flight decode per `SourceKey`; later callers wait for that result
-    /// instead of decoding the same image again.
-    flights: Mutex<HashMap<SourceKey, Arc<Flight>>>,
-    /// One full-size RAW at a time: the native slot holds a single frame, so a
-    /// second native decode would only overwrite the first.
-    native_decode: Mutex<()>,
-    /// Bounded, priority-aware admission per decode class.
-    decode_gates: DecodeGates,
+    /// The decode half of the engine: one in-flight decode per `SourceKey`, the
+    /// native-decode lock and the priority-aware admission gates. A background
+    /// export worker holds the same `Arc`, so it decodes without borrowing the
+    /// engine.
+    sources: Arc<SourceProvider>,
     /// Serializes the final cancel check against export publication (`gate -> state`).
     publish_gate: Arc<Mutex<()>>,
     store: Option<Store>,
@@ -1672,12 +1923,7 @@ impl crate::matchlook::LookWhiteBalanceContext for CameraWhiteBalance {
 
 impl FileEngine {
     fn image_path(&self, image: ImageId) -> Option<PathBuf> {
-        self.state
-            .lock()
-            .entries
-            .iter()
-            .find(|entry| entry.info.id == image)
-            .map(|entry| entry.path.clone())
+        self.sources.image_path(image)
     }
 
     fn lcc_files(&self, image: ImageId) -> Option<(PathBuf, PathBuf)> {
@@ -1796,30 +2042,36 @@ impl FileEngine {
         let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
         let cache_bytes = default_source_cache_bytes();
         log::debug!("source cache budget: {cache_bytes} bytes");
+        let state = Arc::new(Mutex::new(State {
+            entries: Vec::new(),
+            next_id: 1,
+            sources: HashMap::new(),
+            native_raw: None,
+            ai_inputs: HashMap::new(),
+            source_cache: SourceCacheBudget::new(cache_bytes),
+            jobs: HashMap::new(),
+            cancelled: Default::default(),
+            source_reasons: HashMap::new(),
+            layers: HashMap::new(),
+            retouch: HashMap::new(),
+            c1_collections: Vec::new(),
+            c1_members: HashMap::new(),
+            catalog,
+            preview: PreviewCache::default(),
+        }));
+        let sources = Arc::new(SourceProvider {
+            root: root.clone(),
+            state: Arc::clone(&state),
+            flights: Mutex::new(HashMap::new()),
+            decode_gates: DecodeGates::new(cache_bytes),
+            native_decode: Mutex::new(()),
+        });
         let engine = Self {
             root,
-            state: Arc::new(Mutex::new(State {
-                entries: Vec::new(),
-                next_id: 1,
-                sources: HashMap::new(),
-                native_raw: None,
-                ai_inputs: HashMap::new(),
-                source_cache: SourceCacheBudget::new(cache_bytes),
-                jobs: HashMap::new(),
-                cancelled: Default::default(),
-                source_reasons: HashMap::new(),
-                layers: HashMap::new(),
-                retouch: HashMap::new(),
-                c1_collections: Vec::new(),
-                c1_members: HashMap::new(),
-                catalog,
-                preview: PreviewCache::default(),
-            })),
+            state,
+            sources,
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
-            flights: Mutex::new(HashMap::new()),
-            native_decode: Mutex::new(()),
-            decode_gates: DecodeGates::new(cache_bytes),
             publish_gate: Arc::new(Mutex::new(())),
             store,
             c1_catalog: false,
@@ -1874,30 +2126,36 @@ impl FileEngine {
         let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
         let cache_bytes = default_source_cache_bytes();
         log::debug!("source cache budget: {cache_bytes} bytes");
+        let state = Arc::new(Mutex::new(State {
+            entries: Vec::new(),
+            next_id: 1,
+            sources: HashMap::new(),
+            native_raw: None,
+            ai_inputs: HashMap::new(),
+            source_cache: SourceCacheBudget::new(cache_bytes),
+            jobs: HashMap::new(),
+            cancelled: Default::default(),
+            source_reasons: HashMap::new(),
+            layers: HashMap::new(),
+            retouch: HashMap::new(),
+            c1_collections: Vec::new(),
+            c1_members: HashMap::new(),
+            catalog,
+            preview: PreviewCache::default(),
+        }));
+        let sources = Arc::new(SourceProvider {
+            root: root.clone(),
+            state: Arc::clone(&state),
+            flights: Mutex::new(HashMap::new()),
+            decode_gates: DecodeGates::new(cache_bytes),
+            native_decode: Mutex::new(()),
+        });
         let engine = Self {
             root,
-            state: Arc::new(Mutex::new(State {
-                entries: Vec::new(),
-                next_id: 1,
-                sources: HashMap::new(),
-                native_raw: None,
-                ai_inputs: HashMap::new(),
-                source_cache: SourceCacheBudget::new(cache_bytes),
-                jobs: HashMap::new(),
-                cancelled: Default::default(),
-                source_reasons: HashMap::new(),
-                layers: HashMap::new(),
-                retouch: HashMap::new(),
-                c1_collections: Vec::new(),
-                c1_members: HashMap::new(),
-                catalog,
-                preview: PreviewCache::default(),
-            })),
+            state,
+            sources,
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
-            flights: Mutex::new(HashMap::new()),
-            native_decode: Mutex::new(()),
-            decode_gates: DecodeGates::new(cache_bytes),
             publish_gate: Arc::new(Mutex::new(())),
             store,
             c1_catalog: true,
@@ -2150,6 +2408,17 @@ impl FileEngine {
         let mut reassigned = false;
         let mut removed_any = false;
         st.entries.clear();
+        // Index the catalog once. The loop below asks the same path twice
+        // (`.cos` gate, then stored metadata), and a Vec scan per image is
+        // N*M on a large library. A duplicate path keeps its first slot so
+        // this matches `Catalog::entry`'s `.iter().find()` result.
+        let catalog_paths: HashMap<String, usize> = {
+            let mut index = HashMap::with_capacity(st.catalog.images.len());
+            for (slot, entry) in st.catalog.images.iter().enumerate() {
+                index.entry(entry.rel_path.clone()).or_insert(slot);
+            }
+            index
+        };
         for scanned in scanned
             .into_iter()
             .filter(|scanned| !excluded.contains(&scanned.path))
@@ -2184,7 +2453,7 @@ impl FileEngine {
             }
             // C1 keeps per-image settings in a `.cos` sidecar; apply it when
             // neither our store nor this process has edits for the path.
-            if adjustments.is_default() && st.catalog.entry(rel_path).is_none() {
+            if adjustments.is_default() && !catalog_paths.contains_key(rel_path.as_str()) {
                 if let Some(cos) = scanned.c1_adjustments() {
                     from_cos.push((scanned.rel_path.clone(), cos.clone()));
                     adjustments = cos;
@@ -2197,7 +2466,8 @@ impl FileEngine {
             let mut trashed = false;
 
             // The catalog wins over the in-memory copy: it survives restarts.
-            if let Some(entry) = st.catalog.entry(rel_path) {
+            if let Some(&slot) = catalog_paths.get(rel_path.as_str()) {
+                let entry = &st.catalog.images[slot];
                 rating = entry.rating;
                 color_tag = ColorTag::ALL[(entry.color_tag.clamp(0, 7)) as usize];
                 keywords = entry.keywords.clone();
@@ -2395,13 +2665,25 @@ impl FileEngine {
         log::debug!("source {image:?} invalidated: {reason}");
     }
 
+}
+
+impl SourceProvider {
+    fn image_path(&self, image: ImageId) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.info.id == image)
+            .map(|entry| entry.path.clone())
+    }
+
     /// A cached source, charged to the byte budget and refreshed in the LRU.
     /// Derived buffers are accounted again on every hit because they are built
     /// lazily after the source was stored.
     fn cached_source(&self, image: ImageId) -> Option<Arc<Source>> {
         let path = self.image_path(image)?;
         let mut st = self.state.lock();
-        if !Self::refresh_source_identity(&mut st, image, &path, false) {
+        if !FileEngine::refresh_source_identity(&mut st, image, &path, false) {
             return None;
         }
         let tick = st.source_cache.next_tick();
@@ -2465,7 +2747,7 @@ impl FileEngine {
         if st.native_raw.as_ref().is_none_or(|slot| slot.image != image) {
             return None;
         }
-        if !Self::refresh_source_identity(&mut st, image, path, true) {
+        if !FileEngine::refresh_source_identity(&mut st, image, path, true) {
             return None;
         }
         let tick = st.source_cache.next_tick();
@@ -2486,7 +2768,7 @@ impl FileEngine {
         } else {
             let flight = Arc::new(Flight::default());
             flights.insert(key, Arc::clone(&flight));
-            FlightRole::Leader(FlightLeader { engine: self, key, flight, finished: false })
+            FlightRole::Leader(FlightLeader { provider: self, key, flight, finished: false })
         }
     }
 
@@ -2536,10 +2818,10 @@ impl FileEngine {
         };
         let bytes = estimated_decode_bytes(width, height, format);
         let _permit = if heavy {
-            let units = decode_units(self.decode_gates.heavy.total_units(), bytes);
+            let units = decode_units(bytes);
             self.decode_gates.heavy.acquire(priority, units)
         } else {
-            let units = decode_units(self.decode_gates.light.total_units(), bytes);
+            let units = decode_units(bytes);
             self.decode_gates.light.acquire(priority, units)
         };
         // A decode that was already in flight may have finished while this
@@ -2700,10 +2982,7 @@ impl FileEngine {
                     st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(previous.bytes);
                 }
             }
-            let units = decode_units(
-                self.decode_gates.heavy.total_units(),
-                estimated_decode_bytes(width, height, DecodeFormat::RawNative),
-            );
+            let units = decode_units(estimated_decode_bytes(width, height, DecodeFormat::RawNative));
             let _permit = self.decode_gates.heavy.acquire(DecodePriority::Interactive, units);
             self.state.lock().source_cache.misses += 1;
             let decoded = (|| {
@@ -2751,17 +3030,37 @@ impl FileEngine {
         };
         leader.finish(flight_result).ok()
     }
+}
+
+impl FileEngine {
+    fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
+        self.sources.source(image)
+    }
+
+    fn source_with_priority(&self, image: ImageId, priority: DecodePriority) -> anyhow::Result<Arc<Source>> {
+        self.sources.source_with_priority(image, priority)
+    }
+
+    fn native_raw_source(
+        &self,
+        image: ImageId,
+        viewport: Option<(&crate::Geometry, NormRect, u32)>,
+    ) -> Option<Arc<Source>> {
+        self.sources.native_raw_source(image, viewport)
+    }
 
     /// Current source-cache bytes, pins and counters. The app's performance log
     /// and the unified budget (S7) read this; it never decodes anything.
     pub fn source_cache_stats(&self) -> SourceCacheStats {
         // Gate locks are taken before the state lock: a decoder holds a gate
         // permit while it stores its result, so the reverse order could deadlock.
-        let heavy_units = self.decode_gates.heavy.total_units();
-        let light_units = self.decode_gates.light.total_units();
-        let decode_waits = self.decode_gates.heavy.waits() + self.decode_gates.light.waits();
-        let decode_wait_ms = (self.decode_gates.heavy.wait_nanos() + self.decode_gates.light.wait_nanos()) / 1_000_000;
-        let decode_peak_concurrency = self.decode_gates.heavy.peak_active().max(self.decode_gates.light.peak_active());
+        let heavy_units = self.sources.decode_gates.heavy.total_units();
+        let light_units = self.sources.decode_gates.light.total_units();
+        let decode_waits = self.sources.decode_gates.heavy.waits() + self.sources.decode_gates.light.waits();
+        let decode_wait_ms =
+            (self.sources.decode_gates.heavy.wait_nanos() + self.sources.decode_gates.light.wait_nanos()) / 1_000_000;
+        let decode_peak_concurrency =
+            self.sources.decode_gates.heavy.peak_active().max(self.sources.decode_gates.light.peak_active());
         let st = self.state.lock();
         let cache = &st.source_cache;
         let ai_input_bytes_total = st.ai_inputs.values().fold(0usize, |total, input| {
@@ -2806,8 +3105,8 @@ impl FileEngine {
         // Concurrency follows the budget: a smaller cache admits fewer large
         // decodes at once. Gate before state, matching decoders' lock order.
         let units = decode_gate_units(max_bytes);
-        self.decode_gates.heavy.set_total_units(units);
-        self.decode_gates.light.set_total_units(units);
+        self.sources.decode_gates.heavy.set_total_units(units);
+        self.sources.decode_gates.light.set_total_units(units);
         let mut st = self.state.lock();
         st.source_cache.max_bytes = max_bytes;
         evict_sources_to_budget(&mut st, None);
@@ -3237,8 +3536,9 @@ impl FileEngine {
             return;
         }
         let mut st = self.state.lock();
-        for (rel_path, info) in saved {
-            st.catalog.upsert(Entry {
+        let entries = saved
+            .into_iter()
+            .map(|(rel_path, info)| Entry {
                 rel_path: rel_path.clone(),
                 rating: info.rating,
                 color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
@@ -3246,8 +3546,9 @@ impl FileEngine {
                 variant: info.variant,
                 updated_at: now_secs(),
                 trashed: info.trashed,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
+        upsert_entries(&mut st.catalog, entries);
         let catalog = st.catalog.clone();
         drop(st);
         if let Err(err) = store.save_index(&catalog) {
@@ -3582,6 +3883,85 @@ impl FileEngine {
             .map_or_else(Default::default, |d| d.overrides(model, iso))
     }
 
+    /// Applies the import defaults Capture One starts a frame with to
+    /// `adjustments` seeded from the catalog entry: sensor-RAW camera profile,
+    /// film curve, noise reduction and sharpening, the display-referred ICC
+    /// fallback, and automatic lens detection. Shared by the single-image and
+    /// batch loads so both produce exactly the same set. Does not touch the
+    /// engine state lock; callers snapshot the entry themselves.
+    fn resolve_adjustments(&self, mut adjustments: AdjustmentSet, info: &ImageInfo) -> AdjustmentSet {
+        // RAW defaults follow Capture One: its own camera profile and film curve,
+        // plus the noise reduction and sharpening it starts a frame with for this
+        // body and ISO. JPEG/TIFF frames are already display-referred, so they get
+        // none of this.
+        // Only sensor-decoded RAW gets the camera profile and film curve; the
+        // embedded preview is already processed by the camera.
+        if crate::raw::is_raw(&info.path)
+            && crate::raw::from_sensor(&info.path) != Some(false)
+        {
+            let model = info.exif.camera_model.as_deref();
+            if adjustments.base.film_curve.is_none() {
+                adjustments.base.film_curve = model.and_then(crate::camera_curve::default_curve);
+            }
+            let icc_is_output_space = adjustments.base.icc_profile.as_deref().is_some_and(|name| {
+                let lower = name.trim().to_ascii_lowercase();
+                lower.contains("adobe rgb")
+                    || lower.contains("srgb")
+                    || lower.contains("display p3")
+                    || lower.contains("prophoto")
+            });
+            if adjustments.base.icc_profile.is_none() || icc_is_output_space {
+                adjustments.base.icc_profile = model
+                    .and_then(crate::camera_profile::for_camera)
+                    .filter(|name| crate::camera_profile::is_available(name))
+                    .map(|name| name.as_str().to_string());
+            }
+            let catalog = self.catalog_overrides(model, info.exif.iso);
+            if adjustments.noise_reduction == crate::NoiseReduction::default() {
+                if let Some(iso) = info.exif.iso {
+                    // C1's own values win; the ISO curve only fills gaps a body
+                    // leaves unstated in coreConfig.
+                    let heuristic: crate::NoiseReduction = crate::noise_defaults::for_iso(iso).into();
+                    adjustments.noise_reduction = crate::NoiseReduction {
+                        luminance: catalog.default_for("NoiseReductionAmount").unwrap_or(heuristic.luminance),
+                        details: catalog.default_for("NoiseDetailsAmount").unwrap_or(heuristic.details),
+                        color: catalog.default_for("ColorNoiseReductionAmount").unwrap_or(heuristic.color),
+                        single_pixel: heuristic.single_pixel,
+                    };
+                }
+            }
+            if adjustments.sharpening == crate::Sharpening::default() {
+                let default = crate::Sharpening::default();
+                adjustments.sharpening = crate::Sharpening {
+                    amount: catalog.default_for("USMAmount").unwrap_or(default.amount),
+                    radius: catalog.default_for("USMRadius").unwrap_or(default.radius),
+                    threshold: catalog.default_for("USMThreshold").unwrap_or(default.threshold),
+                    halo_suppression: default.halo_suppression,
+                };
+            }
+        } else if !crate::raw::is_raw(&info.path) && adjustments.base.icc_profile.is_none() {
+            // Display-referred JPEG/TIFF keeps its embedded profile. Only a file
+            // still carrying the camera's own colour space gets the camera
+            // profile added here (see `camera_icc`).
+            adjustments.base.icc_profile = camera_icc(
+                &info.path,
+                info.exif.camera_model.as_deref(),
+            )
+            .filter(|name| crate::camera_profile::is_available(name));
+        }
+        // C1's automatic lens detection is an import default like the ones
+        // above: EXIF names the lens, the database supplies the profile, and
+        // only a hit turns the calibrated warp on.
+        apply_auto_lens(&mut adjustments.lens, crate::lensdb::default_database().unwrap_or(&[]), &info.exif);
+        adjustments.lens.mount = info
+            .exif
+            .camera_model
+            .as_deref()
+            .and_then(crate::lensdb::mount_for_camera)
+            .map(str::to_string);
+        adjustments
+    }
+
     /// [`Self::catalog_overrides`] plus the values the frame itself states
     /// (EXIF exposure, Nikon white balance). Used for the sliders; the render
     /// path only needs the catalog half, so it does not re-read the RAW.
@@ -3914,83 +4294,60 @@ impl ImageEngine for FileEngine {
     }
 
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet {
-        let (mut adjustments, info) = {
+        let seeded = {
             let st = self.state.lock();
-            let Some(entry) = st.entries.iter().find(|e| e.info.id == image) else {
-                return AdjustmentSet::default();
-            };
-            (entry.adjustments.clone(), entry.info.clone())
+            st.entries
+                .iter()
+                .find(|e| e.info.id == image)
+                .map(|e| (e.adjustments.clone(), e.info.clone()))
         };
-        // RAW defaults follow Capture One: its own camera profile and film curve,
-        // plus the noise reduction and sharpening it starts a frame with for this
-        // body and ISO. JPEG/TIFF frames are already display-referred, so they get
-        // none of this.
-        // Only sensor-decoded RAW gets the camera profile and film curve; the
-        // embedded preview is already processed by the camera.
-        if crate::raw::is_raw(&info.path)
-            && crate::raw::from_sensor(&info.path) != Some(false)
-        {
-            let model = info.exif.camera_model.as_deref();
-            if adjustments.base.film_curve.is_none() {
-                adjustments.base.film_curve = model.and_then(crate::camera_curve::default_curve);
-            }
-            let icc_is_output_space = adjustments.base.icc_profile.as_deref().is_some_and(|name| {
-                let lower = name.trim().to_ascii_lowercase();
-                lower.contains("adobe rgb")
-                    || lower.contains("srgb")
-                    || lower.contains("display p3")
-                    || lower.contains("prophoto")
-            });
-            if adjustments.base.icc_profile.is_none() || icc_is_output_space {
-                adjustments.base.icc_profile = model
-                    .and_then(crate::camera_profile::for_camera)
-                    .filter(|name| crate::camera_profile::is_available(name))
-                    .map(|name| name.as_str().to_string());
-            }
-            let catalog = self.catalog_overrides(model, info.exif.iso);
-            if adjustments.noise_reduction == crate::NoiseReduction::default() {
-                if let Some(iso) = info.exif.iso {
-                    // C1's own values win; the ISO curve only fills gaps a body
-                    // leaves unstated in coreConfig.
-                    let heuristic: crate::NoiseReduction = crate::noise_defaults::for_iso(iso).into();
-                    adjustments.noise_reduction = crate::NoiseReduction {
-                        luminance: catalog.default_for("NoiseReductionAmount").unwrap_or(heuristic.luminance),
-                        details: catalog.default_for("NoiseDetailsAmount").unwrap_or(heuristic.details),
-                        color: catalog.default_for("ColorNoiseReductionAmount").unwrap_or(heuristic.color),
-                        single_pixel: heuristic.single_pixel,
-                    };
-                }
-            }
-            if adjustments.sharpening == crate::Sharpening::default() {
-                let default = crate::Sharpening::default();
-                adjustments.sharpening = crate::Sharpening {
-                    amount: catalog.default_for("USMAmount").unwrap_or(default.amount),
-                    radius: catalog.default_for("USMRadius").unwrap_or(default.radius),
-                    threshold: catalog.default_for("USMThreshold").unwrap_or(default.threshold),
-                    halo_suppression: default.halo_suppression,
-                };
-            }
-        } else if !crate::raw::is_raw(&info.path) && adjustments.base.icc_profile.is_none() {
-            // Display-referred JPEG/TIFF keeps its embedded profile. Only a file
-            // still carrying the camera's own colour space gets the camera
-            // profile added here (see `camera_icc`).
-            adjustments.base.icc_profile = camera_icc(
-                &info.path,
-                info.exif.camera_model.as_deref(),
-            )
-            .filter(|name| crate::camera_profile::is_available(name));
+        match seeded {
+            Some((adjustments, info)) => self.resolve_adjustments(adjustments, &info),
+            None => AdjustmentSet::default(),
         }
-        // C1's automatic lens detection is an import default like the ones
-        // above: EXIF names the lens, the database supplies the profile, and
-        // only a hit turns the calibrated warp on.
-        apply_auto_lens(&mut adjustments.lens, crate::lensdb::default_database().unwrap_or(&[]), &info.exif);
-        adjustments.lens.mount = info
-            .exif
-            .camera_model
-            .as_deref()
-            .and_then(crate::lensdb::mount_for_camera)
-            .map(str::to_string);
-        adjustments
+    }
+
+    fn load_adjustments_batch(&self, images: &[ImageId]) -> Vec<(ImageId, AdjustmentSet)> {
+        // One snapshot under the state lock: every requested entry is cloned
+        // exactly once, then the import defaults resolve in parallel outside
+        // it. This is what keeps a 20k-image startup from taking the lock and
+        // scanning the entry list 20k times.
+        let wanted: std::collections::HashSet<ImageId> = images.iter().copied().collect();
+        let seeded: Vec<(ImageId, Option<(AdjustmentSet, ImageInfo)>)> = {
+            let st = self.state.lock();
+            let mut by_id: HashMap<ImageId, (AdjustmentSet, ImageInfo)> = st
+                .entries
+                .iter()
+                .filter(|entry| wanted.contains(&entry.info.id))
+                .map(|entry| (entry.info.id, (entry.adjustments.clone(), entry.info.clone())))
+                .collect();
+            let mut seen = std::collections::HashSet::with_capacity(images.len());
+            images
+                .iter()
+                .map(|&image| {
+                    if !seen.insert(image) {
+                        // A repeated id gets another copy rather than falling
+                        // through to the default, matching a per-image load.
+                        let entry = st
+                            .entries
+                            .iter()
+                            .find(|entry| entry.info.id == image)
+                            .map(|entry| (entry.adjustments.clone(), entry.info.clone()));
+                        return (image, entry);
+                    }
+                    (image, by_id.remove(&image))
+                })
+                .collect()
+        };
+        seeded
+            .into_par_iter()
+            .map(|(image, seeded)| {
+                let adjustments = seeded.map_or_else(AdjustmentSet::default, |(adjustments, info)| {
+                    self.resolve_adjustments(adjustments, &info)
+                });
+                (image, adjustments)
+            })
+            .collect()
     }
 
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
@@ -4006,19 +4363,13 @@ impl ImageEngine for FileEngine {
         }
         let records = {
             let mut st = self.state.lock();
-            for (image, _) in items {
-                if !st.entries.iter().any(|entry| entry.info.id == *image) {
-                    anyhow::bail!("unknown image");
-                }
-            }
+            let ids: Vec<ImageId> = items.iter().map(|(image, _)| *image).collect();
+            let positions = image_positions(&st.entries, &ids)?;
             items
                 .iter()
-                .map(|(image, adjustments)| {
-                    let entry = st
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.info.id == *image)
-                        .expect("validated image id");
+                .zip(positions)
+                .map(|((_, adjustments), position)| {
+                    let entry = &mut st.entries[position];
                     entry.adjustments = adjustments.clone();
                     entry.info.has_adjustments = !adjustments.is_default();
                     (entry.rel_path.clone(), adjustments.clone(), entry.info.clone())
@@ -4547,13 +4898,16 @@ impl ImageEngine for FileEngine {
         let state = self.state.clone();
         let publish_gate = self.publish_gate.clone();
         let job_id = job.job_id;
+        // One lock, one file: the info, the queued path and (for the exact
+        // desktop path) the RAW adjustments must describe the same catalog
+        // entry, so a later rescan cannot pair an old recipe with a new file.
         let render = {
             let st = state.lock();
             let entry = st.entries.iter().find(|entry| entry.info.id == job.image)
                 .ok_or_else(|| anyhow::anyhow!("export: unknown image {}", job.image.0))?;
             #[cfg(all(windows, feature = "z6iii-raw-export"))]
-            let exact = (entry.path.clone(), entry.adjustments.clone());
-            (entry.info.clone(), #[cfg(all(windows, feature = "z6iii-raw-export"))] exact)
+            let raw_for_exact = entry.adjustments.clone();
+            (entry.info.clone(), entry.path.clone(), #[cfg(all(windows, feature = "z6iii-raw-export"))] raw_for_exact)
         };
         let destination = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
         // Canonicalize and prove the destination is a folder before a single
@@ -4563,38 +4917,32 @@ impl ImageEngine for FileEngine {
         // A crashed export leaves a staging folder behind; reclaim it here.
         crate::output::sweep_stale_staging(&dir);
         let info = render.0;
+        // Lightweight identity at queue time: the worker re-checks it before it
+        // decodes and again afterwards, so a file that was deleted, moved or
+        // replaced while the job waited fails instead of exporting new pixels
+        // with the queued recipe and size.
+        let queued_source = ExportSourceSnapshot::read(&render.1);
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
-        let exact = match crate::z6iii::desktop::Export::prepare(&render.1.0, &render.1.1, &job.recipe) {
-            Ok(exact) => exact,
-            Err(error) => {
-                log::warn!("Z6III export unavailable; using standard engine: {error:#}");
-                None
-            }
-        };
+        let raw_for_exact = render.2;
+        // The adjustment snapshot is immutable: the worker renders what was
+        // queued, even if the user edits the image while it waits.
+        let adjustments = crate::styles::resolve(&self.load_adjustments(job.image)).into_owned();
+        // `load_adjustments` reads the catalog a second time. Raw defaults and
+        // styles are still resolved by that one implementation; this only makes
+        // sure the second lookup described the same file as the queued entry.
+        queued_source.ensure_unchanged(&self.sources, job.image, "while it was being queued")?;
+        // The charge covers the source the job decodes as well as the frame it
+        // writes. Both come from the catalog, so no pixel is decoded before the
+        // export scheduler admits the job; an unreadable size falls back to the
+        // documented floor instead of being priced as free.
+        // Gate the exact envelope on the same adjustments the worker hands to
+        // `Export::prepare`, so admission and the specialised path agree.
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
-        let use_standard = exact.is_none();
+        let estimated_bytes = estimated_job_charge(&job.recipe, &info, &raw_for_exact);
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-        let use_standard = true;
-        let (standard, export_dims) = if use_standard {
-            let adjustments = crate::styles::resolve(&self.load_adjustments(job.image)).into_owned();
-            let (source, source_size) = if let Some(native) = self.native_raw_source(job.image, None) {
-                let size = native.size();
-                (native, size)
-            } else {
-                (self.source(job.image)?, (info.width, info.height))
-            };
-            let (width, height) =
-                crate::mock::geometry::FrameMap::new(source_size, &adjustments.geometry).frame_size();
-            let edited_size = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
-            let (width, height) = crate::recipe::output_size(&job.recipe, edited_size);
-            let mut recipe = job.recipe.clone();
-            recipe.scale = crate::ScaleMode::Fixed100;
-            (Some((source, adjustments, width.max(height), recipe)), (width, height))
-        } else {
-            (None, (info.width, info.height))
-        };
-        let estimated_bytes = estimated_export_bytes(export_dims.0, export_dims.1, job.recipe.bit_depth);
+        let estimated_bytes = estimated_export_charge(&job.recipe, &info, &adjustments.geometry);
         state.lock().jobs.insert(job_id, JobStatus::Queued);
+        let sources = Arc::clone(&self.sources);
         std::thread::spawn(move || {
             let cancelled = |state: &Mutex<State>| state.lock().cancelled.contains(&job_id);
             let Some(_export_permit) =
@@ -4610,6 +4958,51 @@ impl ImageEngine for FileEngine {
                 st.jobs.insert(job_id, JobStatus::Running { progress: 0.05 });
             }
             let result = (|| {
+                // The source is read only now, with an export permit in hand:
+                // a queued job that is cancelled never decodes a frame.
+                queued_source.ensure_unchanged(&sources, job.image, "after it was queued")?;
+                // The exact desktop path maps the RAW and loads its assets,
+                // which costs about as much as a decode; it runs under the same
+                // permit, after the identity check above.
+                #[cfg(all(windows, feature = "z6iii-raw-export"))]
+                let exact = match crate::z6iii::desktop::Export::prepare(
+                    &queued_source.path,
+                    &raw_for_exact,
+                    &job.recipe,
+                ) {
+                    Ok(exact) => exact,
+                    Err(error) => {
+                        log::warn!("Z6III export unavailable; using standard engine: {error:#}");
+                        None
+                    }
+                };
+                #[cfg(all(windows, feature = "z6iii-raw-export"))]
+                let use_standard = exact.is_none();
+                #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+                let use_standard = true;
+                // Preparing the exact path opened the file; re-check it before
+                // any frame is decoded from it.
+                queued_source.ensure_unchanged(&sources, job.image, "after the export was prepared")?;
+                let standard = if use_standard {
+                    let (source, source_size) = if let Some(native) = sources.native_raw_source(job.image, None) {
+                        let size = native.size();
+                        (native, size)
+                    } else {
+                        (sources.source(job.image)?, (info.width, info.height))
+                    };
+                    let (width, height) =
+                        crate::mock::geometry::FrameMap::new(source_size, &adjustments.geometry).frame_size();
+                    let edited_size = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+                    let (width, height) = crate::recipe::output_size(&job.recipe, edited_size);
+                    let mut recipe = job.recipe.clone();
+                    recipe.scale = crate::ScaleMode::Fixed100;
+                    Some((source, adjustments, width.max(height), recipe))
+                } else {
+                    None
+                };
+                // A file that changed while it decoded must not be published
+                // with the size computed from the stale catalog entry.
+                queued_source.ensure_unchanged(&sources, job.image, "while it was decoded")?;
                 // Every format renders into a staging folder on the target's
                 // own volume. The finished file is synced and only then renamed
                 // to its final name, so cancel or failure never truncates (or
@@ -4669,6 +5062,8 @@ impl ImageEngine for FileEngine {
                     }
                 })();
                 let written = written?;
+                // A file that changed while it rendered must not be published.
+                queued_source.ensure_unchanged(&sources, job.image, "while it was rendered")?;
                 // The gate makes the final cancel check and the publish one
                 // step: `cancel_job` takes the same gate, so a cancel that
                 // returns `true` happened before this publish and the job is
@@ -5148,6 +5543,14 @@ mod tests {
             .collect();
         let parallel_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+        let start = Instant::now();
+        let batch: Vec<_> = engine
+            .load_adjustments_batch(&ids)
+            .into_iter()
+            .map(|(_, adjustments)| adjustments)
+            .collect();
+        let batch_ms = start.elapsed().as_secs_f64() * 1000.0;
+
         let hash = |values: &[AdjustmentSet]| {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             for value in values {
@@ -5157,11 +5560,141 @@ mod tests {
         };
         let serial_hash = hash(&serial);
         let parallel_hash = hash(&parallel);
+        let batch_hash = hash(&batch);
         assert_eq!(serial_hash, parallel_hash);
+        assert_eq!(serial_hash, batch_hash);
         println!(
-            "LOAD_ADJUSTMENTS count={} serial={serial_ms:.3} ms parallel={parallel_ms:.3} ms hash={serial_hash:016x}",
+            "LOAD_ADJUSTMENTS count={} serial={serial_ms:.3} ms parallel={parallel_ms:.3} ms \
+             batch={batch_ms:.3} ms hash={serial_hash:016x}",
             ids.len()
         );
+    }
+
+    #[test]
+    fn load_adjustments_batch_matches_serial_and_keeps_variants() {
+        let dir = std::env::temp_dir()
+            .join(format!("aurora-adjust-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, rgb) in [
+            ("first.jpg", [12u8, 24, 36]),
+            ("second.jpg", [48, 60, 72]),
+            ("third.jpg", [84, 96, 108]),
+        ] {
+            image::RgbImage::from_pixel(6, 4, image::Rgb(rgb))
+                .save(dir.join(name))
+                .unwrap();
+        }
+        let engine = FileEngine::open(&dir).unwrap();
+        let ids: Vec<ImageId> = engine.images().into_iter().map(|image| image.id).collect();
+        assert_eq!(ids.len(), 3);
+
+        let mut edited = engine.load_adjustments(ids[0]);
+        edited.exposure.exposure = 1.75;
+        engine.save_adjustments(ids[0], &edited).unwrap();
+
+        let mut variant_seed = engine.load_adjustments(ids[1]);
+        variant_seed.exposure.exposure = -2.0;
+        let variant = engine.new_variant(ids[1], &variant_seed).unwrap();
+
+        let all: Vec<ImageId> = engine.images().into_iter().map(|image| image.id).collect();
+        assert!(all.contains(&variant.id), "the variant joins the startup list");
+        let serial: Vec<(ImageId, AdjustmentSet)> = all
+            .iter()
+            .map(|&image| (image, engine.load_adjustments(image)))
+            .collect();
+        let batch = engine.load_adjustments_batch(&all);
+        assert_eq!(batch, serial, "batch must resolve every variant identically");
+
+        let subset = vec![ids[0], variant.id, ids[2]];
+        let serial_subset: Vec<(ImageId, AdjustmentSet)> = subset
+            .iter()
+            .map(|&image| (image, engine.load_adjustments(image)))
+            .collect();
+        assert_eq!(engine.load_adjustments_batch(&subset), serial_subset);
+
+        let unknown = ImageId(9_999_999);
+        assert_eq!(
+            engine.load_adjustments_batch(&[unknown]),
+            vec![(unknown, AdjustmentSet::default())]
+        );
+
+        let repeated = vec![ids[0], ids[0]];
+        let repeated_serial: Vec<(ImageId, AdjustmentSet)> = repeated
+            .iter()
+            .map(|&image| (image, engine.load_adjustments(image)))
+            .collect();
+        assert_eq!(engine.load_adjustments_batch(&repeated), repeated_serial);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_adjustments_batch_resolves_synthetic_raw_entries_like_single_loads() {
+        let dir = std::env::temp_dir()
+            .join(format!("aurora-adjust-batch-raw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+
+        let raw_info = |id: u64, variant: u32| ImageInfo {
+            id: ImageId(id),
+            path: PathBuf::from(format!(r"C:\synthetic\IMG_{id}.NEF")),
+            file_name: format!("IMG_{id}.NEF"),
+            kind: FileKind::Raw,
+            width: 6048,
+            height: 4024,
+            file_size: 25_000_000,
+            exif: Exif {
+                camera_model: Some("NIKON Z 6III".to_owned()),
+                lens: Some("NIKKOR Z 24-70mm f/2.8 S".to_owned()),
+                focal_length_mm: Some(50.0),
+                iso: Some(3200),
+                ..Default::default()
+            },
+            iptc: Iptc::default(),
+            keywords: Vec::new(),
+            rating: 0,
+            color_tag: ColorTag::default(),
+            variant,
+            has_adjustments: false,
+            trashed: false,
+            heif: None,
+        };
+        let mut seeded = AdjustmentSet::default();
+        seeded.exposure.exposure = 2.5;
+        seeded.noise_reduction.luminance = 7.0;
+        {
+            let mut st = engine.state.lock();
+            st.entries.push(FileEntry {
+                info: raw_info(9001, 1),
+                path: PathBuf::from(r"C:\synthetic\IMG_9001.NEF"),
+                rel_path: "IMG_9001.NEF".to_owned(),
+                adjustments: seeded.clone(),
+            });
+            st.entries.push(FileEntry {
+                info: raw_info(9002, 2),
+                path: PathBuf::from(r"C:\synthetic\IMG_9001.NEF"),
+                rel_path: "IMG_9001.NEF".to_owned(),
+                adjustments: AdjustmentSet::default(),
+            });
+        }
+
+        let ids = [ImageId(9001), ImageId(9002)];
+        let serial: Vec<(ImageId, AdjustmentSet)> = ids
+            .iter()
+            .map(|&image| (image, engine.load_adjustments(image)))
+            .collect();
+        let batch = engine.load_adjustments_batch(&ids);
+        assert_eq!(batch, serial, "the RAW/ICC/lens defaults are shared verbatim");
+        assert_eq!(
+            batch[0].1.exposure.exposure, 2.5,
+            "a stored edit survives the import defaults"
+        );
+        assert_eq!(
+            batch[0].1.noise_reduction.luminance, 7.0,
+            "a non-default value is not replaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5657,6 +6190,188 @@ mod tests {
             assert!((reopened.load_adjustments(info.id).exposure.exposure - (i as f32 + 0.25)).abs() < 1e-6);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_adjustments_batch_keeps_last_duplicate_and_writes_nothing_on_unknown() {
+        let dir = std::env::temp_dir().join(format!("portrait-batch-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3 {
+            image::RgbaImage::from_pixel(8, 6, image::Rgba([i as u8 * 20, 40, 60, 255]))
+                .save(dir.join(format!("frame-{i}.png")))
+                .unwrap();
+        }
+        let engine = FileEngine::open(&dir).unwrap();
+        let infos = engine.images();
+
+        let id = infos[0].id;
+        let mut first = AdjustmentSet::default();
+        first.exposure.exposure = 1.0;
+        let mut last = AdjustmentSet::default();
+        last.exposure.exposure = 3.0;
+        engine.save_adjustments_batch(&[(id, first), (id, last)]).unwrap();
+        assert_eq!(
+            engine.load_adjustments(id).exposure.exposure,
+            3.0,
+            "the last duplicate in the batch wins"
+        );
+
+        let mut before = engine.load_adjustments(infos[1].id);
+        before.exposure.exposure = 2.0;
+        let poison = AdjustmentSet::default();
+        let error = engine
+            .save_adjustments_batch(&[(infos[1].id, before), (ImageId(99_999_999), poison)])
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unknown image");
+        assert_eq!(
+            engine.load_adjustments(infos[1].id).exposure.exposure,
+            0.0,
+            "an invalid id rejects the whole batch before any entry is written"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "profiles batch adjustment id/catalog lookup; run with --ignored --nocapture"]
+    fn bench_batch_edit_index_equivalence() {
+        use std::time::Instant;
+
+        fn linear_positions(entries: &[FileEntry], ids: &[ImageId]) -> Vec<usize> {
+            ids.iter()
+                .map(|id| {
+                    entries
+                        .iter()
+                        .position(|entry| entry.info.id == *id)
+                        .expect("known id")
+                })
+                .collect()
+        }
+
+        fn p50(mut run: impl FnMut()) -> f64 {
+            let mut samples: Vec<f64> = (0..5)
+                .map(|_| {
+                    let started = Instant::now();
+                    run();
+                    started.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        fn synthetic_info(id: u64) -> ImageInfo {
+            ImageInfo {
+                id: ImageId(id),
+                path: PathBuf::from(format!("IMG_{id}.jpg")),
+                file_name: format!("IMG_{id}.jpg"),
+                kind: FileKind::Jpeg,
+                width: 16,
+                height: 12,
+                file_size: 1,
+                exif: Exif::default(),
+                iptc: Iptc::default(),
+                keywords: Vec::new(),
+                rating: 0,
+                color_tag: ColorTag::default(),
+                variant: 1,
+                has_adjustments: false,
+                trashed: false,
+                heif: None,
+            }
+        }
+
+        fn catalog_entry(path: String, rating: i8) -> Entry {
+            Entry {
+                rel_path: path,
+                rating,
+                color_tag: 0,
+                keywords: Vec::new(),
+                variant: 1,
+                updated_at: 0,
+                trashed: false,
+            }
+        }
+
+        let entries: Vec<FileEntry> = (0..20_000)
+            .map(|id| FileEntry {
+                info: synthetic_info(id),
+                path: PathBuf::from(format!("IMG_{id}.jpg")),
+                rel_path: format!("IMG_{id}.jpg"),
+                adjustments: AdjustmentSet::default(),
+            })
+            .collect();
+        let mut catalog_seed: Vec<Entry> = (0..20_000)
+            .map(|slot| catalog_entry(format!("IMG_{slot}.jpg"), (slot % 7) as i8))
+            .collect();
+        // A duplicated path keeps its first slot, the case the batch index
+        // must reproduce from `Catalog::upsert`.
+        catalog_seed[1] = catalog_entry("IMG_0.jpg".to_owned(), 6);
+
+        for count in [1usize, 8, 100, 10_000] {
+            // Scattered ids: a selection lands anywhere in the library, unlike
+            // a prefix that would flatter the linear scan.
+            let ids: Vec<ImageId> = (0..count as u64)
+                .map(|i| ImageId((i * 7_919) % 20_000))
+                .collect();
+            let expected = linear_positions(&entries, &ids);
+            assert_eq!(image_positions(&entries, &ids).unwrap(), expected);
+            let lookup_old = p50(|| {
+                std::hint::black_box(linear_positions(&entries, &ids));
+            });
+            let lookup_new = p50(|| {
+                std::hint::black_box(image_positions(&entries, &ids).unwrap());
+            });
+
+            let updates: Vec<Entry> = (0..count as u64)
+                .map(|i| match i % 3 {
+                    0 => catalog_entry(format!("IMG_{i}.jpg"), -1),
+                    1 => catalog_entry(format!("IMG_{}.jpg", 20_000 + i), -1),
+                    _ => catalog_entry("IMG_2.jpg".to_owned(), -1),
+                })
+                .collect();
+            let mut old_catalog = Catalog::default();
+            old_catalog.images = catalog_seed.clone();
+            for entry in updates.iter().cloned() {
+                old_catalog.upsert(entry);
+            }
+            let mut new_catalog = Catalog::default();
+            new_catalog.images = catalog_seed.clone();
+            upsert_entries(&mut new_catalog, updates.clone());
+            assert_eq!(new_catalog, old_catalog, "batch catalog write changed the result");
+
+            let catalog_old = p50(|| {
+                let mut catalog = Catalog::default();
+                catalog.images = catalog_seed.clone();
+                for entry in updates.iter().cloned() {
+                    catalog.upsert(entry);
+                }
+                std::hint::black_box(catalog);
+            });
+            let catalog_new = p50(|| {
+                let mut catalog = Catalog::default();
+                catalog.images = catalog_seed.clone();
+                upsert_entries(&mut catalog, updates.clone());
+                std::hint::black_box(catalog);
+            });
+            println!(
+                "BATCH_EDIT_INDEX count={count} lookup_old_p50={lookup_old:.3}ms lookup_new_p50={lookup_new:.3}ms \
+                 catalog_old_p50={catalog_old:.3}ms catalog_new_p50={catalog_new:.3}ms"
+            );
+        }
+
+        assert!(image_positions(&entries, &[ImageId(99_999_999)]).is_err());
+        assert_eq!(
+            image_positions(&entries, &[ImageId(3), ImageId(3)]).unwrap(),
+            vec![3, 3]
+        );
+        let mut duplicate_entries = vec![entries[5].clone(), entries[5].clone()];
+        duplicate_entries[1].rel_path = "IMG_5_dup.jpg".to_owned();
+        assert_eq!(
+            image_positions(&duplicate_entries, &[ImageId(5)]).unwrap(),
+            vec![0],
+            "a duplicated id resolves to its first entry"
+        );
     }
 
     #[test]
@@ -6592,6 +7307,242 @@ mod tests {
         assert!(!message.contains(r"C:\"));
     }
 
+    // ---- R1: admission before source acquisition --------------------------
+
+    fn published_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| !crate::output::is_staging_path(&entry.path()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_queued_export_is_cancelled_before_it_decodes() {
+        let fixture = export_fixture("r1-queued-cancel");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        let before = fixture.engine.source_cache_stats();
+        // Hold the scheduler so the job below keeps waiting for a permit.
+        let blocker = export_scheduler()
+            .acquire_cancellable(usize::MAX, || false)
+            .expect("an idle scheduler grants the first permit");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 90, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap();
+        let queued = fixture.engine.source_cache_stats();
+        assert_eq!(queued.misses, before.misses, "start_export itself must not decode");
+        assert_eq!(queued.cached_sources, before.cached_sources);
+        assert!(fixture.engine.cancel_job(90), "a queued job can be cancelled");
+        drop(blocker);
+        let status = wait_export(&fixture.engine, 90);
+        assert!(matches!(status, JobStatus::Failed { .. }), "cancelled job: {status:?}");
+        let after = fixture.engine.source_cache_stats();
+        assert_eq!(after.misses, before.misses, "a cancelled queue entry never decodes");
+        assert_eq!(published_files(&out), 0, "a cancelled job publishes nothing");
+    }
+
+    #[test]
+    fn a_missing_source_is_refused_at_submit() {
+        let fixture = export_fixture("r1-missing-at-submit");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::remove_file(fixture.dir.join("shot.jpg")).unwrap();
+        // The queue-time identity cannot be read at all, so the job is refused
+        // before it is queued (the old synchronous error for this case).
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 91, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap_err();
+        assert_eq!(published_files(&out), 0);
+    }
+
+    #[test]
+    fn a_source_deleted_after_queueing_fails_the_job() {
+        let fixture = export_fixture("r1-deleted-after-queue");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        let blocker = export_scheduler()
+            .acquire_cancellable(usize::MAX, || false)
+            .expect("an idle scheduler grants the first permit");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 94, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap();
+        std::fs::remove_file(fixture.dir.join("shot.jpg")).unwrap();
+        drop(blocker);
+        let status = wait_export(&fixture.engine, 94);
+        assert!(matches!(status, JobStatus::Failed { .. }), "deleted source: {status:?}");
+        assert_eq!(published_files(&out), 0);
+    }
+
+    #[test]
+    fn a_source_replaced_after_queueing_fails_the_job() {
+        let fixture = export_fixture("r1-replaced-after-queue");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        let blocker = export_scheduler()
+            .acquire_cancellable(usize::MAX, || false)
+            .expect("an idle scheduler grants the first permit");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 95, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap();
+        // A different size changes the lightweight identity, so the queued job
+        // must fail rather than render the new pixels with the old recipe.
+        image::RgbImage::from_pixel(16, 12, image::Rgb([220, 20, 20]))
+            .save(fixture.dir.join("shot.jpg"))
+            .unwrap();
+        drop(blocker);
+        let status = wait_export(&fixture.engine, 95);
+        assert!(matches!(status, JobStatus::Failed { .. }), "replaced source: {status:?}");
+        assert_eq!(published_files(&out), 0, "a replaced source must not be exported");
+    }
+
+    #[test]
+    fn an_undecodable_source_fails_the_job_instead_of_the_call() {
+        let fixture = export_fixture("r1-undecodable");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        // Present before the job is queued, so the identity is readable; the
+        // decode is what fails. Documented change: this used to make
+        // `start_export` return `Err`, and now ends as `JobStatus::Failed`.
+        std::fs::write(fixture.dir.join("shot.jpg"), b"not an image").unwrap();
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 96, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .expect("the queue-time checks pass; the decode fails in the worker");
+        match wait_export(&fixture.engine, 96) {
+            JobStatus::Failed { message } => assert!(!message.is_empty(), "the failure keeps its message"),
+            other => panic!("an undecodable source must fail the job: {other:?}"),
+        }
+        assert_eq!(published_files(&out), 0);
+    }
+
+    #[test]
+    fn an_export_owns_its_paths_and_outlives_the_engine() {
+        let dir = std::env::temp_dir().join(format!("aurora-r1-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbImage::from_pixel(8, 6, image::Rgb([30, 60, 90]))
+            .save(dir.join("shot.jpg"))
+            .unwrap();
+        let out = dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let image = engine.images()[0].id;
+        engine
+            .start_export(ExportJob { job_id: 93, image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap();
+        // The worker owns the state, the source reader and the destination, so
+        // the engine may go away while the job is queued or rendering.
+        drop(engine);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while published_files(&out) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the export did not finish after the engine was dropped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_export_charge_includes_the_input_frame() {
+        let fixture = export_fixture("r1-charge");
+        let info = fixture.engine.images().into_iter().next().unwrap();
+        let adjustments = crate::styles::resolve(&fixture.engine.load_adjustments(info.id)).into_owned();
+        let recipe = jpeg_recipe(fixture.dir.join("out"));
+        let charge = estimated_export_charge(&recipe, &info, &adjustments.geometry);
+        let (width, height) =
+            crate::mock::geometry::FrameMap::new((info.width, info.height), &adjustments.geometry).frame_size();
+        let edited = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+        let (out_w, out_h) = crate::recipe::output_size(&recipe, edited);
+        assert!(
+            charge > estimated_export_bytes(out_w, out_h, recipe.bit_depth),
+            "the decoded source frame must be part of the charge"
+        );
+        // An unknown size is charged like a full frame, never like an empty one.
+        let mut unknown = info.clone();
+        unknown.width = 0;
+        unknown.height = 0;
+        assert!(
+            estimated_export_charge(&recipe, &unknown, &adjustments.geometry) > charge,
+            "an unknown size must be charged conservatively"
+        );
+    }
+
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    fn exact_tiff_recipe(destination: PathBuf) -> crate::ProcessRecipe {
+        crate::ProcessRecipe {
+            format: crate::ExportFormat::Tiff,
+            bit_depth: 16,
+            icc_profile: "Adobe RGB (1998)".into(),
+            scale: crate::ScaleMode::Fixed100,
+            watermark: None,
+            output_sharpening: crate::OutputSharpening::Disabled,
+            output_sharpening_settings: None,
+            destination: Some(destination),
+            include_metadata: crate::MetadataPolicy::StripAll,
+            ..crate::ProcessRecipe::default()
+        }
+    }
+
+    // The admission charge must not price an ordinary JPEG or a NEF the
+    // specialised export rejects as a full RAW working set. Only a request that
+    // is both a `.nef` and `desktop::compatible` pays the exact envelope.
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    #[test]
+    fn only_a_compatible_nef_is_charged_the_exact_upper_bound() {
+        let fixture = export_fixture("r3-exact-charge");
+        let mut info = fixture.engine.images().into_iter().next().unwrap();
+        info.width = 6048;
+        info.height = 4032;
+        let mut neutral = AdjustmentSet::default();
+        neutral.sharpening.amount = 0.0;
+        neutral.noise_reduction.luminance = 0.0;
+        neutral.noise_reduction.color = 0.0;
+        // Crop to half width and height so the standard output frame is clearly
+        // smaller than the full RAW envelope the exact path charges.
+        neutral.geometry.crop = crate::NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        let exact = exact_tiff_recipe(fixture.dir.join("nef-out"));
+        let jpeg = jpeg_recipe(fixture.dir.join("jpeg-out"));
+
+        // 1. An ordinary JPEG never pays the exact RAW envelope, even with a
+        //    recipe the specialised export would accept only for a NEF.
+        info.path = fixture.dir.join("shot.jpg");
+        let jpeg_standard = estimated_export_charge(&exact, &info, &neutral.geometry);
+        assert_eq!(
+            estimated_job_charge(&exact, &info, &neutral),
+            jpeg_standard,
+            "a JPEG must not be charged the RAW envelope"
+        );
+
+        // 2. A NEF with a recipe the specialised export rejects stays standard.
+        info.path = fixture.dir.join("shot.nef");
+        let nef_standard = estimated_export_charge(&jpeg, &info, &neutral.geometry);
+        assert_eq!(
+            estimated_job_charge(&jpeg, &info, &neutral),
+            nef_standard,
+            "a non-specialised NEF keeps the standard estimate"
+        );
+
+        // 3. A NEF that is a specialised candidate pays the larger exact bound.
+        let standard = estimated_export_charge(&exact, &info, &neutral.geometry);
+        let exact_charge = estimated_exact_export_charge(&exact, &info);
+        assert!(exact_charge > standard, "the crop must make the exact bound larger");
+        assert_eq!(
+            estimated_job_charge(&exact, &info, &neutral),
+            exact_charge,
+            "a specialised candidate pays the exact upper bound"
+        );
+    }
+
     // ---- S2: decoded-source byte budget + per-image single-flight ----
 
     fn s2_test_dir(name: &str) -> PathBuf {
@@ -6682,10 +7633,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_units_shrink_concurrency_for_large_frames() {
-        assert_eq!(decode_units(6, 1), 1);
-        assert_eq!(decode_units(6, DECODE_UNIT_BYTES * 3), 3);
-        assert_eq!(decode_units(2, DECODE_UNIT_BYTES * 99), 2);
+    fn decode_units_asks_are_clamped_by_the_gate() {
+        assert_eq!(decode_units(1), 1);
+        assert_eq!(decode_units(DECODE_UNIT_BYTES * 3), 3);
+        // The caller's ask is not pre-capped: a 99-unit frame on a 2-unit gate
+        // still asks for 99 and the gate charges only what it has.
+        assert_eq!(decode_units(DECODE_UNIT_BYTES * 99), 99);
+        let gate = DecodeGate::new(2);
+        let permit = gate.acquire(DecodePriority::Interactive, decode_units(DECODE_UNIT_BYTES * 99));
+        assert_eq!(permit.units, 2);
+        drop(permit);
+        assert_eq!(gate_state(&gate).occupied, 0);
         // A 45MP RAW proxy and a 45MP native view reserve different shares.
         assert!(
             estimated_decode_bytes(8256, 5504, DecodeFormat::RawNative)
@@ -6729,11 +7687,155 @@ mod tests {
         assert_eq!(gates.light.total_units(), 2);
     }
 
+    struct GateState {
+        total: usize,
+        occupied: usize,
+        free: usize,
+        active: usize,
+        /// `(charged units, granted)` per registered request, in ticket order.
+        waiters: Vec<(usize, bool)>,
+    }
+
+    fn gate_state(gate: &DecodeGate) -> GateState {
+        let inner = gate.inner.lock();
+        GateState {
+            total: inner.total_units,
+            occupied: inner.occupied_units,
+            free: inner.free_units(),
+            active: inner.active,
+            waiters: inner.waiters.iter().map(|waiter| (waiter.units, waiter.granted)).collect(),
+        }
+    }
+
+    #[test]
+    fn decode_gate_shrink_below_two_active_permits_admits_nothing() {
+        // Two 2-unit decodes are in flight on a 4-unit gate when the budget
+        // shrinks the gate to 2 — below what is already running.
+        let gate = DecodeGate::new(4);
+        let first = gate.acquire(DecodePriority::Interactive, 2);
+        let second = gate.acquire(DecodePriority::Interactive, 2);
+        let full = gate_state(&gate);
+        assert_eq!((full.occupied, full.free), (4, 0));
+
+        gate.set_total_units(2);
+        let shrunk = gate_state(&gate);
+        assert_eq!(shrunk.total, 2);
+        assert_eq!(shrunk.occupied, 4, "in-flight decodes stay charged above the new budget");
+        assert_eq!(shrunk.free, 0, "a budget below occupancy has no free units");
+
+        // A weakly-charged thumbnail queues behind the over-budget decodes.
+        let queued = {
+            let mut inner = gate.inner.lock();
+            DecodeGate::enqueue(&mut inner, DecodePriority::Thumbnail, 1)
+        };
+        drop(first);
+        let after_one = gate_state(&gate);
+        assert_eq!(after_one.waiters, vec![(1, false)], "the queued 1-unit decode must not be admitted");
+        assert_eq!(after_one.occupied, 2);
+        assert_eq!(after_one.free, 0, "one release still leaves the gate fully occupied");
+
+        drop(second);
+        let after_all = gate_state(&gate);
+        assert_eq!((after_all.occupied, after_all.free), (1, 1));
+        assert_eq!(after_all.waiters, vec![(1, true)], "the queued decode runs once the gate drains");
+
+        let permit = GatePermit { gate: &gate, units: DecodeGate::claim(&mut gate.inner.lock(), queued) };
+        assert_eq!(permit.units, 1);
+        drop(permit);
+        let drained = gate_state(&gate);
+        assert_eq!((drained.occupied, drained.free, drained.active), (0, 2, 0));
+        assert!(drained.waiters.is_empty());
+    }
+
+    #[test]
+    fn decode_gate_partial_release_then_growth_recredits_only_real_headroom() {
+        let gate = DecodeGate::new(4);
+        let first = gate.acquire(DecodePriority::Interactive, 2);
+        let second = gate.acquire(DecodePriority::Interactive, 2);
+        gate.set_total_units(2);
+        drop(second);
+        let held = gate_state(&gate);
+        assert_eq!(
+            (held.occupied, held.free),
+            (2, 0),
+            "the release below the new budget must not free units that are still held"
+        );
+
+        let (big, clamped) = {
+            let mut inner = gate.inner.lock();
+            (
+                DecodeGate::enqueue(&mut inner, DecodePriority::Interactive, 5),
+                DecodeGate::enqueue(&mut inner, DecodePriority::Thumbnail, 6),
+            )
+        };
+        assert_eq!(gate_state(&gate).waiters, vec![(2, false), (2, false)], "queued asks are clamped to the small gate");
+
+        // Growth re-opens 6 - 2 = 4 units, not the 6 the stale free counter
+        // would have invented, and queued asks return to their original size.
+        gate.set_total_units(6);
+        let grown = gate_state(&gate);
+        assert_eq!((grown.total, grown.occupied, grown.free), (6, 2, 4));
+        assert_eq!(grown.waiters, vec![(5, false), (6, false)]);
+
+        drop(first);
+        let after_release = gate_state(&gate);
+        assert_eq!((after_release.occupied, after_release.free), (5, 1));
+        assert_eq!(after_release.waiters, vec![(5, true), (6, false)], "only the 5-unit decode fits the reclaimed headroom");
+
+        let big_permit = GatePermit { gate: &gate, units: DecodeGate::claim(&mut gate.inner.lock(), big) };
+        assert_eq!(big_permit.units, 5);
+        drop(big_permit);
+        let unblocked = gate_state(&gate);
+        assert_eq!((unblocked.occupied, unblocked.free), (6, 0));
+        assert_eq!(unblocked.waiters, vec![(6, true)]);
+
+        let clamped_permit = GatePermit { gate: &gate, units: DecodeGate::claim(&mut gate.inner.lock(), clamped) };
+        assert_eq!(clamped_permit.units, 6);
+        drop(clamped_permit);
+        assert_eq!(gate_state(&gate).occupied, 0);
+    }
+
+    #[test]
+    fn decode_gate_grant_retune_before_claim_releases_charged_units() {
+        let gate = DecodeGate::new(4);
+        let held = gate.acquire(DecodePriority::Interactive, 2);
+        let queued = {
+            let mut inner = gate.inner.lock();
+            DecodeGate::enqueue(&mut inner, DecodePriority::Thumbnail, 4)
+        };
+        assert_eq!(gate_state(&gate).free, 2);
+
+        gate.set_total_units(6);
+        let granted = gate_state(&gate);
+        assert_eq!((granted.occupied, granted.free), (6, 0));
+        assert_eq!(granted.waiters, vec![(4, true)]);
+
+        // The budget shrinks while the grant is still unclaimed: the granted
+        // charge is already in flight and must not be retuned.
+        gate.set_total_units(2);
+        let retuned = gate_state(&gate);
+        assert_eq!(retuned.waiters, vec![(4, true)], "granted charge must not be clamped");
+        assert_eq!((retuned.total, retuned.occupied, retuned.free), (2, 6, 0));
+
+        let charged = DecodeGate::claim(&mut gate.inner.lock(), queued);
+        assert_eq!(charged, 4, "the permit returns the units actually charged, not the caller's ask");
+        let permit = GatePermit { gate: &gate, units: charged };
+        drop(permit);
+        let after = gate_state(&gate);
+        assert_eq!(after.occupied, 2, "exactly the charged 4 units are released");
+        assert_eq!(after.free, 0, "the surviving 2-unit decode still fills the 2-unit gate");
+        assert_eq!(after.active, 1);
+
+        drop(held);
+        let empty = gate_state(&gate);
+        assert_eq!((empty.occupied, empty.free, empty.active), (0, 2, 0));
+    }
+
     #[test]
     fn large_raster_reserves_most_of_a_full_gate() {
         // A ~64MP raster cannot be admitted several times at once.
         let bytes = estimated_decode_bytes(8000, 8000, DecodeFormat::Raster);
-        assert!(decode_units(6, bytes) >= 5, "{bytes}");
+        assert!(decode_units(bytes) >= 5, "{bytes}");
     }
 
     #[test]
