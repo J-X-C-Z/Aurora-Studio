@@ -22,8 +22,3 @@
 *.icc binary
 *.fcrv binary
 *.cocatalogdb binary
-
-# Byte-hashed fixtures: crates/portrait/tests/fixtures/metal_skin/SHA256SUMS pins
-# raw bytes of index.tsv and manifest.json. Disable EOL normalization so a fresh
-# checkout, a Windows working tree and `git archive` all produce the same bytes.
-crates/portrait/tests/fixtures/metal_skin/** -text

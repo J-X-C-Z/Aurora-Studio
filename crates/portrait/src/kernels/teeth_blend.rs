@@ -160,7 +160,7 @@ pub fn apply_alignment_final_blend(
 mod tests {
     use super::*;
 
-    const FIXTURE: &[u8] = include_bytes!("../../../../work/backend-r27/r8/blend_fixture.bin");
+    const FIXTURE: &[u8] = crate::private_assets::or_empty(crate::private_asset!("fixtures/portrait/teeth_blend/blend_fixture.bin"));
 
     fn parts() -> (Image, Image, Vec<u8>) {
         let original = Image::new(2, 2, FIXTURE[..16].to_vec()).unwrap();
@@ -174,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn fixture_matches_native_lut_math() {
         let (original, effect, mask) = parts();
         let out = apply(&original, &effect, &mask).unwrap();
@@ -184,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn core_contract_explicit_input() {
         let (original, effect, mask) = parts();
         let out = apply(&original, &effect, &mask).unwrap();
@@ -260,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn shape_and_length_are_refused() {
         let (original, effect, _) = parts();
         assert_eq!(

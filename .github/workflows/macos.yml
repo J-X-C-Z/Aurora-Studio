@@ -125,17 +125,14 @@ jobs:
 
       - name: Metal GPU tests (real device only)
         if: steps.metal.outputs.has_device == '1'
-        # metal_asset is intentionally excluded: both of its tests read
-        # work/backend-r11/o2e/whiten_lut.f32, a local-only asset absent on a
-        # clean checkout (only o1i is present), so it would fail rather than
-        # verify anything. The four Metal targets below are the ones that pass
-        # with real hardware on this machine (18 ignored tests).
+        # metal_asset, metal_smile and metal_skin_assets read data under
+        # private-assets/ (see private-assets.md), which a clean checkout does
+        # not have, so --ignored would fail rather than verify anything. Run
+        # them locally with private-assets/ present.
         run: |
           cargo test -p aurora-portrait --locked \
             --test metal_runtime \
             --test metal_mesh_runtime \
-            --test metal_smile \
-            --test metal_skin_assets \
             -- --ignored --test-threads=1
 
       - name: Metal GPU tests skipped (no device)

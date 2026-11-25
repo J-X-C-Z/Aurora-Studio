@@ -199,14 +199,14 @@ mod tests {
         static GAMMA: OnceLock<Vec<f32>> = OnceLock::new();
         static MATRICES: OnceLock<Vec<f32>> = OnceLock::new();
         FixedAssets {
-            lut_a: include_bytes!("../../../assets/portrait/radiance/native-lut-a.bin"),
-            lut_b: include_bytes!("../../../assets/portrait/radiance/native-lut-b.bin"),
+            lut_a: crate::private_asset!("portrait/radiance/native-lut-a.bin").unwrap(),
+            lut_b: crate::private_asset!("portrait/radiance/native-lut-b.bin").unwrap(),
             gamma: floats(
-                include_bytes!("../../../assets/portrait/radiance/native-gamma-rgba32f.bin"),
+                crate::private_asset!("portrait/radiance/native-gamma-rgba32f.bin").unwrap(),
                 &GAMMA,
             ),
             matrices: floats(
-                include_bytes!("../../../assets/portrait/radiance/native-color-matrices.bin"),
+                crate::private_asset!("portrait/radiance/native-color-matrices.bin").unwrap(),
                 &MATRICES,
             ),
         }
@@ -274,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn abi_and_fixed_asset_shapes_are_exact() {
         assert_eq!(std::mem::size_of::<Uniforms>(), 32);
         assert_eq!(std::mem::align_of::<Uniforms>(), 4);
@@ -293,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn missing_or_wrong_size_inputs_are_typed_refusals() {
         let source = Image::solid(2, 2, [10, 20, 30, 40]);
         let all_assets = assets();
@@ -335,6 +337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn value_mean_domain_and_zero_degree_rounding_are_checked() {
         let source = Image::solid(1, 1, [1, 2, 3, 4]);
         let all_assets = assets();
@@ -369,6 +372,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_cuda_matches_the_independent_cpu_oracle() {
         let (source, skin, parsing, face) = fixture(35, 27);
         let fixed = assets();
@@ -455,6 +459,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_cuda_matches_the_cpu_oracle_across_rgb8_domain() {
         let width = 256u32;
         let height = 4u32;

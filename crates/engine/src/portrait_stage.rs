@@ -4171,12 +4171,9 @@ fn face_mesh_group(pf: u32) -> Option<FaceMeshGroup> {
     }
 }
 
-const FACE_WIDTH_PARTS: &[u8] =
-    include_bytes!("../../portrait/assets/portrait/face-width/parts.f32le");
-const FOREHEAD_PARTS: &[u8] =
-    include_bytes!("../../portrait/assets/portrait/forehead/parts.f32le");
-const FACE_RESHAPE_PARTS: &[u8] =
-    include_bytes!("../../portrait/assets/portrait/face-reshape/parts.f32le");
+const FACE_WIDTH_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/face-width/parts.f32le");
+const FOREHEAD_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/forehead/parts.f32le");
+const FACE_RESHAPE_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/face-reshape/parts.f32le");
 
 struct FaceReshapePartData {
     part: u8,
@@ -4185,7 +4182,7 @@ struct FaceReshapePartData {
 }
 
 fn builtin_face_reshape_parts() -> Result<Vec<FaceReshapePartData>, Refusal> {
-    let bytes = FACE_RESHAPE_PARTS;
+    let bytes = FACE_RESHAPE_PARTS.ok_or(Refusal::MissingInput("private-assets/portrait/face-reshape/parts.f32le"))?;
     if bytes.len() < 4 {
         return Err(Refusal::ShapeMismatch("face reshape parts header"));
     }
@@ -4369,7 +4366,7 @@ struct ForeheadPartData {
 }
 
 fn builtin_forehead_parts() -> Result<Vec<ForeheadPartData>, Refusal> {
-    let mut bytes = FOREHEAD_PARTS;
+    let mut bytes = FOREHEAD_PARTS.ok_or(Refusal::MissingInput("private-assets/portrait/forehead/parts.f32le"))?;
     let mut parts = Vec::with_capacity(4);
     while !bytes.is_empty() {
         if bytes.len() < 544 {
@@ -4407,7 +4404,7 @@ struct FaceWidthPartData {
 }
 
 fn builtin_face_width_parts() -> Result<Vec<FaceWidthPartData>, Refusal> {
-    let mut bytes = FACE_WIDTH_PARTS;
+    let mut bytes = FACE_WIDTH_PARTS.ok_or(Refusal::MissingInput("private-assets/portrait/face-width/parts.f32le"))?;
     let mut parts = Vec::with_capacity(4);
     while !bytes.is_empty() {
         if bytes.len() < 220 {
@@ -8298,7 +8295,8 @@ fn try_cuda_same_job_effect(
         90004 => {
             let resolved =
                 resolve_radiance_inputs(current, inputs.radiance).expect("validated PF90004 inputs");
-            let assets = radiance_assets();
+            // Without the tables the CPU path refuses with the missing input.
+            let Ok(assets) = radiance_assets() else { return None };
             let fixed = aurora_portrait::kernels::radiance::FixedAssets {
                 lut_a: &assets.lut_a,
                 lut_b: &assets.lut_b,
@@ -9656,8 +9654,8 @@ fn with_skin_lut<T>(
     })
 }
 
-fn decode_lut(png: &[u8], name: &'static str) -> Option<Vec<u8>> {
-    let image = image::load_from_memory(png).ok()?.into_rgb8();
+fn decode_lut(png: Option<&[u8]>, name: &'static str) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(png?).ok()?.into_rgb8();
     if image.width() as usize != LUT_EDGE || image.height() as usize != LUT_EDGE {
         log::warn!(
             "portrait LUT {name}: expected {LUT_EDGE}x{LUT_EDGE}, got {}x{}",
@@ -9674,10 +9672,7 @@ fn tint_green() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/TintGreen.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/TintGreen.png"),
             "TintGreen.png",
         )
     })
@@ -9688,10 +9683,7 @@ fn tint_magenta() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/TintMagenta.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/TintMagenta.png"),
             "TintMagenta.png",
         )
     })
@@ -9702,10 +9694,7 @@ fn whiten_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/whiten.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/whiten.png"),
             "whiten.png",
         )
     })
@@ -9716,10 +9705,7 @@ fn ruddy_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/ruddy_new.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/ruddy_new.png"),
             "ruddy_new.png",
         )
     })
@@ -9730,10 +9716,7 @@ fn cold_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/cold.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/cold.png"),
             "cold.png",
         )
     })
@@ -9744,10 +9727,7 @@ fn warm_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/warm.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/warm.png"),
             "warm.png",
         )
     })
@@ -9899,28 +9879,20 @@ fn f32_asset(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn radiance_assets() -> &'static RadianceAssets {
-    static ASSETS: OnceLock<RadianceAssets> = OnceLock::new();
-    ASSETS.get_or_init(|| RadianceAssets {
-        lut_a: include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-lut-a.bin"
-        ))
-        .to_vec(),
-        lut_b: include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-lut-b.bin"
-        ))
-        .to_vec(),
-        gamma: f32_asset(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-gamma-rgba32f.bin"
-        ))),
-        matrices: f32_asset(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-color-matrices.bin"
-        ))),
-    })
+/// Decoded third-party tables, embedded from `private-assets/` when present.
+fn radiance_assets() -> Result<&'static RadianceAssets, aurora_portrait::Refusal> {
+    static ASSETS: OnceLock<Option<RadianceAssets>> = OnceLock::new();
+    ASSETS
+        .get_or_init(|| {
+            Some(RadianceAssets {
+                lut_a: aurora_portrait::private_asset!("portrait/radiance/native-lut-a.bin")?.to_vec(),
+                lut_b: aurora_portrait::private_asset!("portrait/radiance/native-lut-b.bin")?.to_vec(),
+                gamma: f32_asset(aurora_portrait::private_asset!("portrait/radiance/native-gamma-rgba32f.bin")?),
+                matrices: f32_asset(aurora_portrait::private_asset!("portrait/radiance/native-color-matrices.bin")?),
+            })
+        })
+        .as_ref()
+        .ok_or(aurora_portrait::Refusal::MissingInput("private-assets/portrait/radiance"))
 }
 
 fn apply_skin_radiance(
@@ -9934,7 +9906,7 @@ fn apply_skin_radiance(
         parsing_rgba: resolved.parsing_rgba,
         face_rgba: resolved.face_rgba,
     };
-    let assets = radiance_assets();
+    let assets = radiance_assets()?;
     let fixed = aurora_portrait::kernels::radiance::FixedAssets {
         lut_a: &assets.lut_a,
         lut_b: &assets.lut_b,
@@ -14508,6 +14480,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn skin_lut_effects_change_a_warm_tone() {
         for (pf, degree) in [(21015u32, 0.9f32), (30096, 0.1), (90005, 0.9), (90007, 0.9)] {
             let mut rgba = frame(8, 8);
@@ -14587,6 +14560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_requires_an_owned_same_job_bundle() {
         let masks = PortraitMasks::solid(1.0);
         let absent = PortraitJobInputs::from_renderer_job(1, &masks);
@@ -14691,6 +14665,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_producer_writer_is_atomic_and_frame_exact() {
         let bundle = || {
             Pf90004ProducerInputs::from_same_job(
@@ -14882,6 +14857,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_cuda_route_matches_cpu_oracle_and_reports_dispatch() {
         let (width, height) = (35u32, 27u32);
         let pixels = (width * height) as usize;
@@ -14952,6 +14928,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_forced_cuda_failure_uses_cpu_oracle() {
         let (width, height) = (8u32, 8u32);
         let pixels = (width * height) as usize;
@@ -15000,6 +14977,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn cuda_ported_stages_match_cpu_pixels_when_available() {
         let source = Image::new(8, 8, frame(8, 8)).expect("frame");
         let masks = PortraitMasks::solid(1.0);
@@ -15048,6 +15026,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf30096_forced_cuda_failure_falls_back_to_cpu() {
         let (width, height) = (8u32, 8u32);
         let source = Image::new(width, height, frame(width, height)).expect("frame");
@@ -15081,6 +15060,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf30096_report_marks_the_real_backend() {
         let (width, height) = (8u32, 8u32);
         let source = Image::new(width, height, frame(width, height)).expect("frame");
@@ -15153,6 +15133,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn cuda_fixed_point_tint_route_matches_cpu_when_available() {
         let source = Image::solid(16, 16, [181, 139, 103, 255]);
         let masks = PortraitMasks::solid(1.0);
@@ -15174,6 +15155,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn run_report_does_not_label_cpu_as_cuda() {
         let mut rgba = frame(8, 8);
         let map = BTreeMap::from([("pc:90005".to_string(), 0.9)]);
@@ -15321,6 +15303,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn face_width_mesh_auto_records_backend_and_matches_cpu() {
         let (cpu_frame, cpu_report) = run_face_width_mesh_stage(true);
         assert_eq!(

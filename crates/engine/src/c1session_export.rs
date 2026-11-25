@@ -24,7 +24,15 @@ use crate::c1import::C1Import;
 use crate::catalog::CollectionKind;
 use crate::sqlite_write::{replace_rows_sqlite, write_tables, Cell, SynthTable};
 
-const SESSION_TEMPLATE: &[u8] = include_bytes!("../assets/c1-session-template.cosessiondb");
+/// An empty Capture One session database. It comes from Capture One, so it is
+/// embedded from `private-assets/c1/` only when present.
+const SESSION_TEMPLATE: Option<&[u8]> = aurora_portrait::private_asset!("c1/c1-session-template.cosessiondb");
+
+fn session_template() -> Result<&'static [u8]> {
+    SESSION_TEMPLATE.ok_or_else(|| {
+        anyhow!("this build has no Capture One session template (private-assets/c1/c1-session-template.cosessiondb)")
+    })
+}
 
 /// The folders a Capture One session carries; media would land in `Capture`.
 const SESSION_FOLDERS: [&str; 6] =
@@ -106,6 +114,7 @@ pub fn export_session_with_edits_and_mapping(
     edits: &[SessionMaskEdit<'_>],
     linear_mapping: LinearGradientMapping,
 ) -> Result<SessionExport> {
+    session_template()?;
     if target.exists() {
         bail!("{} already exists; refusing to overwrite it", target.display());
     }
@@ -265,7 +274,7 @@ fn write_bundle(
     tables.push(members);
     tables.push(location);
     let database_path = dir.join(&database);
-    std::fs::write(&database_path, SESSION_TEMPLATE)?;
+    std::fs::write(&database_path, session_template()?)?;
     replace_rows_sqlite(&database_path, &tables)
         .with_context(|| format!("writing {database}"))?;
     let connection = rusqlite::Connection::open(&database_path)?;
@@ -2611,6 +2620,7 @@ mod tests {
     /// The catalog fixture has no keywords, so the synthetic session (a keyword
     /// tree Wedding > Bride, rating 6) carries that half of the round trip.
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn ratings_and_keywords_survive_the_round_trip() {
         let dir = temp_dir("metadata");
         let source_path = dir.join("Synth.cosessiondb");
@@ -3541,6 +3551,7 @@ mod gradient_writeback_tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn read_only_open_and_export_leave_the_catalog_database_byte_identical() {
         let dir = scratch_dir("read-only-source");
         let bundle = dir.join("Source.cocatalogdb");
@@ -3584,6 +3595,7 @@ mod gradient_writeback_tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn a_refused_session_export_keeps_the_existing_folder_and_leaves_no_staging() {
         let dir = scratch_dir("refuse-overwrite");
         let database = dir.join("Source.cocatalogdb");
@@ -3602,6 +3614,7 @@ mod gradient_writeback_tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn a_catalog_file_name_cannot_leave_the_bundle() {
         let dir = scratch_dir("traversal-name");
         let database = dir.join("Source.cocatalogdb");

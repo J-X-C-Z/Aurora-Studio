@@ -526,8 +526,8 @@ pub fn produce(points194: &[[f32; 2]], scale: f32) -> Result<[[f32; 2]; OUTPUT_C
 mod tests {
     use super::*;
 
-    const INPUT: &[u8] = include_bytes!("../../testdata/pf30092.194.f32le");
-    const EXPECTED: &[u8] = include_bytes!("../../testdata/pf30092.414.f32le");
+    const INPUT: &[u8] = crate::private_assets::or_empty(crate::private_asset!("fixtures/portrait/pf30092/pf30092.194.f32le"));
+    const EXPECTED: &[u8] = crate::private_assets::or_empty(crate::private_asset!("fixtures/portrait/pf30092/pf30092.414.f32le"));
 
     fn points194() -> Vec<[f32; 2]> {
         INPUT
@@ -542,6 +542,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn fixed_fixture_matches_recovered_414_bytes() {
         let output = produce(&points194(), 0.0).unwrap();
         let raw: Vec<u8> = output
@@ -566,6 +567,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn short_or_non_finite_inputs_refuse() {
         assert_eq!(produce(&points194()[..193], 0.0), Err(Error::Points194));
         let mut points = points194();

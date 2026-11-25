@@ -1026,10 +1026,8 @@ impl FaceInputBundle {
             super::portrait_pf8033_cpu_forward::PF8033_CPU_FORWARD_RECEIPT_ENV,
         )
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../assets/portrait/smile/pf8033-cpu-forward.json")
-        });
+        .or_else(|| aurora_portrait::private_assets::path("portrait/smile/pf8033-cpu-forward.json"))
+        .ok_or(Refusal::MissingInput("PF8033 CPU forward receipt"))?;
         let receipt_bytes = std::fs::read(&receipt_path)
             .map_err(|_| Refusal::MissingInput("PF8033 CPU forward receipt"))?;
         let receipt = super::portrait_pf8033_cpu_forward::Pf8033CpuForwardReceipt::parse(

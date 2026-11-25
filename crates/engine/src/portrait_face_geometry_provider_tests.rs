@@ -154,6 +154,7 @@ fn route_table_covers_requested_rows_with_named_refusals() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn builder_binds_ready_rows_to_the_source_digest() {
     for pf in [
         242, 243, 247, 248, 8001, 8022, 30073, 30079, 44124, 48019, 49221, 41922, 8033,
@@ -279,9 +280,10 @@ fn open_and_contract_split_rows_do_not_emit_face_geometry() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn pf8033_effect_contract_pins_warp_type_flag_and_ranges() {
     let effect: serde_json::Value =
-        serde_json::from_str(include_str!("../../../assets/portrait/smile/effect.json")).unwrap();
+        serde_json::from_str(aurora_portrait::private_asset_str!("portrait/smile/effect.json").unwrap()).unwrap();
     let effects = effect["Effects"].as_array().unwrap();
     assert_eq!(effects.len(), 1);
     let effect = &effects[0];

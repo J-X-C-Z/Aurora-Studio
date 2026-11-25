@@ -18,7 +18,7 @@ use aurora_portrait::kernels::skin_adjust::{
 use aurora_portrait::{Image, Refusal};
 
 const PF30013_FIXTURE: &[u8] =
-    include_bytes!("fixtures/neutral_gray/pf30013.bin");
+    aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("fixtures/portrait/neutral_gray/pf30013.bin"));
 
 fn gpu() -> Option<NeutralGrayGpu> {
     match NeutralGrayGpu::open() {
@@ -116,6 +116,7 @@ fn planes() -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn pf30013_fixture_matches_cpu_and_gpu() {
     let case = fixture();
     let expected = skin_grey_apply(

@@ -2,7 +2,7 @@
 //
 // The atlases are the shipped assets decoded exactly like
 // `processing::portrait_assets::load_lut_png` (PngDecoder -> into_rgb8), dumped
-// to work/backend-r11/o1i/{whiten,bright}.rgb by o1i/decode.
+// to private-assets/fixtures/portrait/teeth_gpu/{whiten,bright}.rgb.
 
 #[cfg(windows)]
 mod teeth_gpu {
@@ -11,8 +11,8 @@ mod teeth_gpu {
     use aurora_portrait::kernels::face_detail;
     use aurora_portrait::{Image, Refusal};
 
-    const WHITEN: &[u8] = include_bytes!("../../../work/backend-r11/o1i/whiten.rgb");
-    const BRIGHT: &[u8] = include_bytes!("../../../work/backend-r11/o1i/bright.rgb");
+    const WHITEN: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("fixtures/portrait/teeth_gpu/whiten.rgb"));
+    const BRIGHT: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("fixtures/portrait/teeth_gpu/bright.rgb"));
 
     #[derive(Clone)]
     struct Rng(u64);

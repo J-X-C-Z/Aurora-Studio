@@ -65,7 +65,7 @@ impl SlimProducerInputs {
             width: source.width,
             height: source.height,
             source_sha256,
-            grid: super::portrait_v2_mesh::captured_grid_2005(),
+            grid: super::portrait_v2_mesh::captured_grid_2005()?,
             base: super::portrait_v2_mesh::zero_base_280(),
             points194,
             framebuffer_positions_w1: mesh.framebuffer_positions_w1,

@@ -10,7 +10,6 @@
 
 #[cfg(windows)]
 mod skin_lut_gpu {
-    use std::path::Path;
 
     use aurora_portrait::cuda::{driver_metrics, CudaError};
     use aurora_portrait::cuda_lut::{GATE, KERNEL, LUT_BYTES, SkinLut, TEMPERATURE_KERNEL};
@@ -81,8 +80,8 @@ mod skin_lut_gpu {
     }
 
     fn tint_fixture(name: &str) -> Vec<u8> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/pf21015")
+        let path = aurora_portrait::private_assets::path("fixtures/portrait/pf21015")
+            .expect("needs private-assets/")
             .join(name);
         let bytes =
             std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));

@@ -7,7 +7,7 @@ mod hand_neutral_gray_gpu {
     use aurora_portrait::kernels::hair_body::NeutralTarget;
     use aurora_portrait::{Image, Refusal};
 
-    const FIXTURE: &[u8] = include_bytes!("fixtures/pf30187/hand_neutral_fixture.bin");
+    const FIXTURE: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("fixtures/portrait/pf30187/hand_neutral_fixture.bin"));
 
     struct Fixture<'a> {
         width: u32,

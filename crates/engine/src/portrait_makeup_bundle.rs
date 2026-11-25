@@ -1557,8 +1557,8 @@ struct SuitMaskSource {
     value: u32,
 }
 
-const SUIT_PRESETS_JSON: &str =
-    include_str!("../../../assets/portrait/suit/presets.json");
+/// Decoded third-party presets, embedded from `private-assets/` when present.
+const SUIT_PRESETS_JSON: Option<&str> = aurora_portrait::private_asset_str!("portrait/suit/presets.json");
 static SUIT_BUNDLE: OnceLock<Result<OwnedSuitBundle, Refusal>> = OnceLock::new();
 
 fn vendor_suit_field<T: serde::de::DeserializeOwned>(
@@ -1624,8 +1624,9 @@ fn read_vendor_suit_parameters(root: &Path, document: &mut SuitPresetDocument) -
 }
 
 fn parse_owned_suit_bundle() -> Result<OwnedSuitBundle, Refusal> {
-    let mut document: SuitPresetDocument = serde_json::from_str(SUIT_PRESETS_JSON)
-        .map_err(|_| Refusal::ShapeMismatch(SUIT_PRESETS_INVALID))?;
+    let presets = SUIT_PRESETS_JSON.ok_or(Refusal::MissingInput("private-assets/portrait/suit/presets.json"))?;
+    let mut document: SuitPresetDocument =
+        serde_json::from_str(presets).map_err(|_| Refusal::ShapeMismatch(SUIT_PRESETS_INVALID))?;
     if let Some(root) = crate::portrait_vendor_config::root_from_env() {
         read_vendor_suit_parameters(&root, &mut document).map_err(|error| {
             log::warn!("suit vendor preset root {}: {error:#}", root.display());
@@ -2273,6 +2274,7 @@ pub(crate) mod test_support {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn complete_owned_bundle_outlives_its_transient_inputs() {
         let bundle = {
             let rows = vec![single_row(100), single_row(106), single_row(116)];
@@ -2323,8 +2325,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn vendor_suit_group_applies_distinct_values_to_the_exact_passes() {
-        let mut document: SuitPresetDocument = serde_json::from_str(SUIT_PRESETS_JSON).unwrap();
+        let mut document: SuitPresetDocument = serde_json::from_str(SUIT_PRESETS_JSON.unwrap()).unwrap();
         let passes = &mut document.presets[0].passes[..2];
         let path = "Makeups/Suit/MU00000001/Bronzer/effect.json";
         let json = r#"{"Effects":[
@@ -2342,6 +2345,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn suit_presets_keep_order_and_name_every_static_gap() {
         let suit = load_owned_suit_bundle().unwrap();
         assert_eq!(suit.presets.len(), 24);
@@ -2406,6 +2410,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn suit_effect_router_admits_real_consumers_and_names_the_rest() {
         for effect in [
             "BlusherImageMakeup",
@@ -2468,6 +2473,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn live_bundle_admits_fourteen_unmasked_eye_pupil_passes() {
         let suit = load_owned_suit_bundle().unwrap();
         let passes = suit

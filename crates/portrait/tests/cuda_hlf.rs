@@ -244,7 +244,7 @@ mod hlf_gpu {
     }
 
     fn vendor_adjust_lut() -> &'static [u8] {
-        include_bytes!("fixtures/pf30022/vendor_hlfreq_adjust_lut_256x1_l8.bin")
+        aurora_portrait::private_asset!("fixtures/portrait/pf30022/vendor_hlfreq_adjust_lut_256x1_l8.bin").unwrap()
     }
 
     #[test]

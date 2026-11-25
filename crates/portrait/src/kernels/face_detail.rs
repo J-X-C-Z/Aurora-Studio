@@ -3451,8 +3451,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn row82_s505_plane_order_binds_to_the_recovered_mixer() {
-        let bytes = include_bytes!("../../tests/fixtures/pf100005_s505/model_planes.bin");
+        let bytes = crate::private_asset!("fixtures/portrait/pf100005_s505/model_planes.bin").unwrap();
         assert_eq!(bytes.len(), 8 * 4 * std::mem::size_of::<f32>());
         let values: Vec<f32> = bytes
             .chunks_exact(4)

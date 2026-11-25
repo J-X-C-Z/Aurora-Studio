@@ -1,6 +1,6 @@
 //! PF100007 Metal contract and golden-pack tests.
 //!
-//! The four fixture cases live in `tests/fixtures/metal_smile`. The CPU test
+//! The four fixture cases live in `private-assets/fixtures/portrait/metal_smile`. The CPU test
 //! recomputes every expected byte with `pf100007_apply`; the macOS-only GPU
 //! test loads the same files through the same loader and compares GPU bytes.
 
@@ -42,7 +42,7 @@ fn read_f32(path: &Path) -> Vec<f32> {
 
 /// Single loader shared by the CPU and GPU tests.
 fn load_cases() -> Vec<GoldenCase> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metal_smile");
+    let root = aurora_portrait::private_assets::path("fixtures/portrait/metal_smile").expect("needs private-assets/");
     let index = fs::read_to_string(root.join("index.tsv")).expect("index.tsv");
     let mut cases = Vec::new();
     for line in index.lines().skip(1).filter(|line| !line.trim().is_empty()) {
@@ -190,6 +190,7 @@ fn validation_matches_cpu_entry_checks() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn golden_pack_cpu_recomputes_all_four_cases() {
     let cases = load_cases();
     assert_eq!(cases.len(), 4);

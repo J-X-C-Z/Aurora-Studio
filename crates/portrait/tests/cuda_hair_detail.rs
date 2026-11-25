@@ -108,23 +108,14 @@ fn reference_gloss(source: &Image, roi: Roi, scale: f32, producer: GlossProducer
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn pf90139_tie_uses_nearest_even_not_scalar_or_trunc() {
     let Some(gpu) = gpu() else { return };
-    let source_bytes = hex(include_str!(
-        "fixtures/hair_detail/pf90139_tie_source.rgba8.hex"
-    ));
-    let blend = hex(include_str!(
-        "fixtures/hair_detail/pf90139_tie_blend.rgb8.hex"
-    ));
-    let nearest_even = hex(include_str!(
-        "fixtures/hair_detail/pf90139_tie_nearest_even.rgba8.hex"
-    ));
-    let scalar = hex(include_str!(
-        "fixtures/hair_detail/pf90139_tie_scalar_half_away.rgba8.hex"
-    ));
-    let truncated = hex(include_str!(
-        "fixtures/hair_detail/pf90139_tie_trunc.rgba8.hex"
-    ));
+    let source_bytes = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_tie_source.rgba8.hex").unwrap());
+    let blend = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_tie_blend.rgb8.hex").unwrap());
+    let nearest_even = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_tie_nearest_even.rgba8.hex").unwrap());
+    let scalar = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_tie_scalar_half_away.rgba8.hex").unwrap());
+    let truncated = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_tie_trunc.rgba8.hex").unwrap());
     let mask = [255u8; 32];
     let detail = [128u8; 32];
     let source = image(32, 1, source_bytes);
@@ -169,27 +160,22 @@ fn pf90139_tie_uses_nearest_even_not_scalar_or_trunc() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn pf90139_roi_and_independent_strides_match_the_fixture() {
     let Some(gpu) = gpu() else { return };
     let source = image(
         5,
         3,
-        hex(include_str!(
-            "fixtures/hair_detail/pf90139_roi_source.rgba8.hex"
-        )),
+        hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_roi_source.rgba8.hex").unwrap()),
     );
-    let hair = hex(include_str!("fixtures/hair_detail/pf90139_roi_hair.hex"));
-    let mix = hex(include_str!("fixtures/hair_detail/pf90139_roi_mix.hex"));
-    let detail = hex(include_str!("fixtures/hair_detail/pf90139_roi_detail.hex"));
-    let blend = hex(include_str!(
-        "fixtures/hair_detail/pf90139_roi_blend.rgb8.hex"
-    ));
+    let hair = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_roi_hair.hex").unwrap());
+    let mix = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_roi_mix.hex").unwrap());
+    let detail = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_roi_detail.hex").unwrap());
+    let blend = hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_roi_blend.rgb8.hex").unwrap());
     let fixture_expected = image(
         5,
         3,
-        hex(include_str!(
-            "fixtures/hair_detail/pf90139_roi_nearest_even.rgba8.hex"
-        )),
+        hex(aurora_portrait::private_asset_str!("fixtures/portrait/hair_detail/pf90139_roi_nearest_even.rgba8.hex").unwrap()),
     );
     let producer = SmoothProducer {
         ticket: 7,

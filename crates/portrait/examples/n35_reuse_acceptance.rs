@@ -726,8 +726,8 @@ fn decode_pair_fixture(bytes: &[u8]) -> Vec<[f32; 2]> {
 }
 
 fn run_mesh_attribute_512() -> Case {
-    const FACES: &[u8] = include_bytes!("../../../assets/portrait/smile/triangles.u32le");
-    const MEAN: &[u8] = include_bytes!("../../../assets/portrait/smile/mean.f32le");
+    const FACES: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("portrait/smile/triangles.u32le"));
+    const MEAN: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("portrait/smile/mean.f32le"));
     let (width, height) = (512u32, 512u32);
     let mean = decode_pair_fixture(MEAN);
     let faces = decode_u32_fixture(FACES);

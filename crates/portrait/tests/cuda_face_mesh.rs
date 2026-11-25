@@ -64,13 +64,13 @@ fn source() -> Image {
 }
 
 fn authority() -> Vec<(Vec<[f32; 2]>, Vec<[f32; 2]>, Vec<u16>)> {
-    let ebo = include_bytes!("../testdata/pf30092.ebo.u16le")
+    let ebo = aurora_portrait::private_asset!("fixtures/portrait/pf30092/pf30092.ebo.u16le").unwrap()
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
     [
-        include_bytes!("../testdata/pf30092.a27.f32le").as_slice(),
-        include_bytes!("../testdata/pf30092.q27.f32le").as_slice(),
+        aurora_portrait::private_asset!("fixtures/portrait/pf30092/pf30092.a27.f32le").unwrap(),
+        aurora_portrait::private_asset!("fixtures/portrait/pf30092/pf30092.q27.f32le").unwrap(),
     ]
     .into_iter()
     .map(|raw| {
@@ -127,6 +127,7 @@ fn hash64(bytes: &[u8]) -> u64 {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn type63_two_pass_cpu_contract_is_stable() {
     assert_eq!(
         PASS1,

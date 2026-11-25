@@ -16,12 +16,15 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// The pack is checked in next to the crate so a build without Capture One
-/// still knows every supported body.
-const PACK_JSON: &str = include_str!("../data/camera_params.json");
+/// Extracted from Capture One, so it is not published with the source: it is
+/// embedded from `private-assets/c1/` when present. Without it no body has
+/// Capture One defaults and callers fall back to their generic paths.
+const PACK_JSON: Option<&str> = aurora_portrait::private_asset_str!("c1/camera_params.json");
 /// All 714 non-pseudo bodies, with the fields coreConfig can supply for every
 /// model and DLL metadata where it could be extracted statically.
-const ALL_PACK_JSON: &str = include_str!("../data/camera_params_all.json");
+const ALL_PACK_JSON: Option<&str> = aurora_portrait::private_asset_str!("c1/camera_params_all.json");
+/// What the packs read as in a build without the private assets.
+const EMPTY_PACK_JSON: &str = r#"{"source":{"c1_version":"","dll_sha256":"","snapshot_date":""},"cameras":{}}"#;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CameraPack {
@@ -161,7 +164,7 @@ const ALIASES: &[(&str, &str)] = &[
 fn pack() -> &'static CameraPack {
     static PACK: OnceLock<CameraPack> = OnceLock::new();
     PACK.get_or_init(|| {
-        serde_json::from_str(PACK_JSON).expect("embedded camera_params.json is valid")
+        serde_json::from_str(PACK_JSON.unwrap_or(EMPTY_PACK_JSON)).expect("embedded camera_params.json is valid")
     })
 }
 
@@ -311,7 +314,7 @@ impl AllCameraParams {
 fn all_pack() -> &'static AllCameraPack {
     static PACK: OnceLock<AllCameraPack> = OnceLock::new();
     PACK.get_or_init(|| {
-        serde_json::from_str(ALL_PACK_JSON).expect("embedded camera_params_all.json is valid")
+        serde_json::from_str(ALL_PACK_JSON.unwrap_or(EMPTY_PACK_JSON)).expect("embedded camera_params_all.json is valid")
     })
 }
 
@@ -352,6 +355,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pack_covers_every_extracted_body() {
         assert_eq!(all().len(), 23);
         assert_eq!(
@@ -367,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn exif_names_resolve_to_capture_one_ids() {
         assert_eq!(for_camera("NIKON Z6_3").unwrap().brand, "Nikon");
         assert_eq!(for_camera("Nikon Z 7_2").unwrap().mount, "Nikon Z");
@@ -384,6 +389,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn noise_and_ccm_values_are_usable() {
         let z6 = for_camera("Nikon Z6III").unwrap();
         assert_eq!(z6.model_id_u32(), Some(0x3000_0057));
@@ -402,6 +408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn source_is_the_installed_16_8_6_build() {
         assert_eq!(source().c1_version, "16.8.6.3784");
         assert_eq!(
@@ -411,6 +418,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn all_pack_covers_every_extracted_body() {
         assert_eq!(all_cameras().len(), 714);
         assert_eq!(all_cameras().values().filter(|c| c.brand == "Nikon").count(), 89);
@@ -421,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn any_camera_lookup_reaches_the_full_pack() {
         let nikon = for_any_camera("Nikon Z6III").unwrap();
         assert_eq!(nikon.model_id_u32(), Some(0x3000_0057));

@@ -738,6 +738,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn absent_capture_names_all_337_static_passes() {
         let report = produce_suit_same_job_bundle(
             41,
@@ -851,6 +852,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn generic_bfm_blocks_every_executable_pass() {
         let report = bfm_blocked_report().unwrap();
         assert_eq!(report.static_executable_passes, 337);
@@ -892,9 +894,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_414_probe_fixture_has_eight_nonfinite_points_and_no_map() {
         let landmarks =
-            landmark_fixture(include_bytes!("../../portrait/testdata/pf30092.414.f32le"));
+            landmark_fixture(aurora_portrait::private_asset!("fixtures/portrait/pf30092/pf30092.414.f32le").unwrap());
         assert_eq!(landmarks.len(), SUIT_BFM_LANDMARK_COUNT);
         let report = audit_suit_bfm_landmark_map(
             1,
@@ -926,10 +929,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn finite_414_points_without_correspondence_are_not_a_map() {
-        let landmarks = landmark_fixture(include_bytes!(
-            "../../portrait/testdata/pf30092.dense414.f32le"
-        ));
+        let landmarks = landmark_fixture(aurora_portrait::private_asset!("fixtures/portrait/pf30092/pf30092.dense414.f32le").unwrap());
         let report = audit_suit_bfm_landmark_map(
             2,
             Some(2),
