@@ -111,24 +111,24 @@ pub fn rasterize(
     sampler: Sampler,
 ) -> Result<Image, Refusal> {
     validate(source, &mesh)?;
-    let (selected, coverage) = select(source, &mesh, rules, Tolerance::TILE);
+    let (selected, coverage, covered) = select(source, &mesh, rules, Tolerance::TILE);
     let width = source.width as usize;
     let height = source.height as usize;
     let mut pixels = source.pixels.clone();
-    for py in 0..height {
-        for px in 0..width {
-            let p = py * width + px;
-            let Some(triangle) = pick(&selected, &coverage, p, rules) else {
-                continue;
-            };
-            let Some((u, v)) = source_uv_at(&mesh, rules, Tolerance::TILE, triangle, px, py) else {
-                continue;
-            };
-            let color = sample_bilinear(source, u, v, sampler.wrap);
-            let o = p * 4;
-            for c in 0..4 {
-                pixels[o + c] = quantize(color[c]);
-            }
+    for &pixel in &covered {
+        let p = pixel as usize;
+        let py = p / width;
+        let px = p % width;
+        let Some(triangle) = pick(&selected, &coverage, p, rules) else {
+            continue;
+        };
+        let Some((u, v)) = source_uv_at(&mesh, rules, Tolerance::TILE, triangle, px, py) else {
+            continue;
+        };
+        let color = sample_bilinear(source, u, v, sampler.wrap);
+        let o = p * 4;
+        for c in 0..4 {
+            pixels[o + c] = quantize(color[c]);
         }
     }
     Image::new(source.width, source.height, pixels).ok_or(Refusal::ShapeMismatch("output"))
@@ -151,13 +151,21 @@ pub fn rasterize_with_fragment(
     if sampler.wrap == Wrap::Repeat {
         return Err(Refusal::MissingInput("fragment repeat wrap"));
     }
-    let (selected, coverage) = select(source, &mesh, rules, tolerance);
+    let (selected, coverage, covered) = select(source, &mesh, rules, tolerance);
     let width = source.width as usize;
     let height = source.height as usize;
     let mut pixels = source.pixels.clone();
-    for py in 0..height {
-        for px in 0..width {
-            let p = py * width + px;
+    for_each_row_chunk(width, height, &mut pixels, |py0, chunk| {
+        let rows = chunk.len() / (width * 4);
+        let start = py0 * width;
+        let end = start + rows * width;
+        let first = covered.partition_point(|&pixel| (pixel as usize) < start);
+        let last = covered.partition_point(|&pixel| (pixel as usize) < end);
+        for &pixel in &covered[first..last] {
+            let p = pixel as usize;
+            let py = p / width;
+            let px = p % width;
+            let local = p - start;
             let Some(triangle) = pick(&selected, &coverage, p, rules) else {
                 continue;
             };
@@ -168,14 +176,39 @@ pub fn rasterize_with_fragment(
             let color = crate::raster_fragment::evaluate(
                 source, [u, v], dst, edge, defines, clamp);
             let stored = crate::raster_fragment::to_rgba8(color);
-            pixels[p * 4..p * 4 + 4].copy_from_slice(&stored);
+            chunk[local * 4..local * 4 + 4].copy_from_slice(&stored);
         }
-    }
+    });
     Image::new(source.width, source.height, pixels).ok_or(Refusal::ShapeMismatch("output"))
 }
 
+/// Runs an independent row body across the frame. Every chunk owns disjoint
+/// RGBA rows, so the result is identical to a serial pass.
+pub(crate) fn for_each_row_chunk<F>(width: usize, height: usize, pixels: &mut [u8], body: F)
+where
+    F: Fn(usize, &mut [u8]) + Sync,
+{
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let rows = height.div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        for (index, chunk) in pixels.chunks_mut(rows * width * 4).enumerate() {
+            let body = &body;
+            let first_row = index * rows;
+            scope.spawn(move || body(first_row, chunk));
+        }
+    });
+}
+
 /// Coverage selection shared by both writers.
-fn select(source: &Image, mesh: &Mesh<'_>, rules: Rules, tolerance: Tolerance) -> (Vec<u32>, Vec<u8>) {
+fn select(
+    source: &Image,
+    mesh: &Mesh<'_>,
+    rules: Rules,
+    tolerance: Tolerance,
+) -> (Vec<u32>, Vec<u8>, Vec<u32>) {
     let width = source.width as usize;
     let height = source.height as usize;
     let mut selected = vec![u32::MAX; width * height];
@@ -208,7 +241,13 @@ fn select(source: &Image, mesh: &Mesh<'_>, rules: Rules, tolerance: Tolerance) -
             }
         }
     }
-    (selected, coverage)
+    let covered = coverage
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count > 0 && (count == 1 || rules.overlap != Overlap::Reject))
+        .map(|(pixel, _)| pixel as u32)
+        .collect();
+    (selected, coverage, covered)
 }
 
 fn pick(selected: &[u32], coverage: &[u8], p: usize, rules: Rules) -> Option<usize> {
@@ -456,5 +495,28 @@ mod tests {
                 Clamp::disabled(), Tolerance::TILE),
             Err(Refusal::MissingInput("fragment repeat wrap"))
         );
+    }
+
+    #[test]
+    fn parallel_rows_match_a_serial_pass() {
+        let (width, height) = (37usize, 23usize);
+        let mut serial = vec![0u8; width * height * 4];
+        for py in 0..height {
+            for px in 0..width {
+                let at = (py * width + px) * 4;
+                serial[at..at + 4].copy_from_slice(&[(px as u8), (py as u8), 7, 255]);
+            }
+        }
+        let mut parallel = vec![0u8; width * height * 4];
+        for_each_row_chunk(width, height, &mut parallel, |py0, chunk| {
+            for (row_index, row) in chunk.chunks_mut(width * 4).enumerate() {
+                let py = py0 + row_index;
+                for px in 0..width {
+                    row[px * 4..px * 4 + 4]
+                        .copy_from_slice(&[(px as u8), (py as u8), 7, 255]);
+                }
+            }
+        });
+        assert_eq!(serial, parallel);
     }
 }

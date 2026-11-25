@@ -39,6 +39,16 @@ impl SlimProducerInputs {
         source: &Image,
         points194: Vec<[f32; 2]>,
     ) -> Result<Self, Refusal> {
+        let source_sha256 = sha256_32(&source.pixels);
+        Self::from_landmarks_with_sha(job_id, source, points194, source_sha256)
+    }
+
+    pub fn from_landmarks_with_sha(
+        job_id: u64,
+        source: &Image,
+        points194: Vec<[f32; 2]>,
+        source_sha256: [u8; 32],
+    ) -> Result<Self, Refusal> {
         source.validate()?;
         if job_id == 0 {
             return Err(Refusal::ValueOutOfRange("face landmarks job ticket"));
@@ -54,7 +64,7 @@ impl SlimProducerInputs {
             job_id,
             width: source.width,
             height: source.height,
-            source_sha256: sha256_32(&source.pixels),
+            source_sha256,
             grid: super::portrait_v2_mesh::captured_grid_2005(),
             base: super::portrait_v2_mesh::zero_base_280(),
             points194,

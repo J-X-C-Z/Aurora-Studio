@@ -26,6 +26,28 @@
 //!
 //! Stage textures are sampled with an explicit UV convention ([`LipColorUv`]);
 //! a missing convention is a named refusal, never an implicit stretch.
+//!
+//! Host producer evidence (2026-11-25, static, `pixcake.exe` SHA-256
+//! `A84519DA…64C7`)
+//! -----
+//! * PF107 is a full-screen pass. `glsl/LipColor/LipColorNormal.vert` declares
+//!   `attribute vec2 a_position` used directly as clip space
+//!   (`gl_Position = vec4(a_position, 0.0, 1.0)`) plus `a_src_texcoord`,
+//!   `a_smooth_texcoord`, `a_mask_texcoord`; `LipMultiColors.vert` adds
+//!   `a_roi_texcoord`. Neither vertex shader declares an `u_mvp`/matrix
+//!   uniform, so PF107 has **no** 3DMM matrix; the texcoords are host-supplied
+//!   per-vertex data.
+//! * The `u_*` names used here (`u_lip_color`, `u_factorScale`,
+//!   `u_metallight_alpha`, `u_enable_hsl_adjust`, `u_lipcolor_switch`,
+//!   `u_is_adapt_env`, `u_lip_light_degree`, `u_is_remove_highlight`,
+//!   `a_mask_texcoord`, `s_combine_mask_texture`, …) are **absent** as literals
+//!   from both `pixcake.exe` and `pix-worker.exe`; the shader source lives in
+//!   the `Resources` tree, so the host uniform writers cannot be located by PE
+//!   string xref. Verdict: `NOT_FOUND` in the fixed PE. The values stay explicit
+//!   caller inputs; no producer code is added here. The only recovered mask
+//!   contract is the shader body itself: `mask_color.r` drives lip alpha,
+//!   `mask_color.g * u_metallight_alpha` drives contrast, `mask_color.b` drives
+//!   gloss, and `smooth_color.g/b` drive the smooth/H/S/L terms.
 
 use crate::kernels::makeup_material::MaskChannel;
 use crate::{Image, Refusal};
