@@ -5,7 +5,8 @@
 //! whenever the driver, PTX or `AURORA_DETAIL_GPU` is absent.
 //!
 //! Device memory comes from the shared [`super::gpu_runtime::Gpu`]: one
-//! six-plane `Frame` slot, one LUT slot, grow-only and accounted.
+//! `Frame` slot sized from the stages that actually run, one LUT slot,
+//! grow-only and accounted through the shared VRAM ledger (`VramLease`).
 
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -17,15 +18,35 @@ use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
 const PTX: &str = include_str!("../../native/cuda/detail_gpu.ptx");
 const BLOCK: (u32, u32) = (16, 16);
 const PREWARM_BYTES: usize = 1400 * 933 * 4;
+/// Planes a frame can touch: RGBA, luma, blur and one scratch plane. Colour NR
+/// rewrites the finished luma/blur planes with chroma, and lens keeps its
+/// source in the scratch plane, so four is the production maximum.
+const MAX_PLANES: usize = 4;
+/// One 32 MP RGBA frame: the retention boundary is the frame, not
+/// `bytes × planes`, so plane sizing never raises the largest frame kept
+/// resident.
+const MAX_RETAINED_FRAME_BYTES: usize = 32 * 1024 * 1024 * 4;
+/// A retained 32 MP frame at four planes: the grow-only slot's hard cap.
+const MAX_RETAINED_BYTES: usize = MAX_RETAINED_FRAME_BYTES * MAX_PLANES;
 /// Retained cap is the shared ledger budget, not a private 768 MiB constant.
 fn retained_cap() -> usize {
     gpu_runtime::vram_budget()
 }
 /// Reclaimed before clarity but after develop.
 const RECLAIM_PRIORITY: u8 = 10;
-/// Six RGBA planes plus the 1025-entry luma LUT.
-fn retained_bytes(pixels: usize) -> Option<usize> {
-    pixels.checked_mul(24)?.checked_add(1025 * 4)
+/// Device bytes a `pixels`-frame at `planes` active planes reserves: the RGBA
+/// frame times the planes, plus the 1025-entry luma LUT. `None` on overflow.
+fn retained_bytes(pixels: usize, planes: usize) -> Option<usize> {
+    pixels
+        .checked_mul(4)?
+        .checked_mul(planes)?
+        .checked_add(1025 * 4)
+}
+/// Whether a frame is small enough to keep a grow-only pool for. The boundary
+/// is the frame itself: a 45 MP frame takes the CPU fallback even when only two
+/// planes are active, so subtracting planes cannot pin a larger frame.
+fn retained_frame(bytes: usize) -> bool {
+    bytes != 0 && bytes <= MAX_RETAINED_FRAME_BYTES
 }
 
 struct DetailPool {
@@ -33,19 +54,22 @@ struct DetailPool {
 }
 
 impl DetailPool {
-    fn open(bytes: usize) -> Result<Self, Failure> {
+    fn open(bytes: usize, planes: usize) -> Result<Self, Failure> {
         let mut gpu = Gpu::open("detail", PTX)?;
-        reserve(&mut gpu, bytes, retained_cap())?;
+        reserve(&mut gpu, bytes, planes, retained_cap())?;
         Ok(Self { gpu })
     }
 
-    fn ensure(&mut self, bytes: usize) -> Result<(), Failure> {
-        reserve(&mut self.gpu, bytes, retained_cap())
+    fn ensure(&mut self, bytes: usize, planes: usize) -> Result<(), Failure> {
+        reserve(&mut self.gpu, bytes, planes, retained_cap())
     }
 }
 
-fn reserve(gpu: &mut Gpu, bytes: usize, cap: usize) -> Result<(), Failure> {
-    gpu.reserve(Slot::Frame, bytes.saturating_mul(6), cap)?;
+/// Grows the grow-only `Frame` slot to `bytes × planes` and the LUT slot. Both
+/// reservations become `VramLease`s in the shared ledger; a refused growth is a
+/// `TooLarge` the caller answers by staying on the CPU.
+fn reserve(gpu: &mut Gpu, bytes: usize, planes: usize, cap: usize) -> Result<(), Failure> {
+    gpu.reserve(Slot::Frame, bytes.saturating_mul(planes), cap)?;
     gpu.reserve(Slot::Aux0, 1025 * 4, cap)?;
     Ok(())
 }
@@ -101,7 +125,7 @@ pub(crate) fn prewarm() -> bool {
     match &mut *state {
         State::Ready(_) => true,
         State::Unavailable => false,
-        State::NotTried => match DetailPool::open(PREWARM_BYTES) {
+        State::NotTried => match DetailPool::open(PREWARM_BYTES, MAX_PLANES) {
             Ok(pool) => {
                 *state = State::Ready(pool);
                 log::info!("CUDA detail path ready");
@@ -135,9 +159,20 @@ pub(crate) fn post_process(
     if bytes == 0 || rgba.len() != bytes {
         return false;
     }
+    let planes = active_planes(nr, moire, sh, lens);
+    if planes == 0 {
+        // Every stage the GPU path implements is off; the caller already ran
+        // the CPU-only stages, so the frame is finished.
+        return true;
+    }
     // Non-allocating admission against the shared ledger before any device
-    // memory exists; a refusal is a CPU fallback, not a broken stage.
-    let Some(need) = retained_bytes(pixels) else { return false };
+    // memory exists; a refusal is a CPU fallback, not a broken stage. Above the
+    // retained frame boundary the pool would be oversized after one call, so
+    // the frame goes to the CPU the same way.
+    if !retained_frame(bytes) {
+        return false;
+    }
+    let Some(need) = retained_bytes(pixels, planes) else { return false };
     if need > retained_cap() || !gpu_runtime::vram_can_allocate("detail", need) {
         gpu_runtime::note_fallback(
             "detail",
@@ -149,10 +184,10 @@ pub(crate) fn post_process(
     let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     let result = match &mut *state {
         State::Unavailable => Err(Failure::Unavailable("detail_gpu")),
-        State::NotTried => match DetailPool::open(bytes) {
+        State::NotTried => match DetailPool::open(bytes, planes) {
             Ok(mut pool) => {
                 let result = pool
-                    .ensure(bytes)
+                    .ensure(bytes, planes)
                     .and_then(|()| post_process_pool(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale));
                 if result.is_ok() {
                     *state = State::Ready(pool);
@@ -167,7 +202,7 @@ pub(crate) fn post_process(
             }
         },
         State::Ready(pool) => pool
-            .ensure(bytes)
+            .ensure(bytes, planes)
             .and_then(|()| post_process_pool(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale)),
     };
     match result {
@@ -196,8 +231,44 @@ pub(crate) fn post_process_with(
     if pixels == 0 || rgba.len() != pixels.saturating_mul(4) {
         return Ok(());
     }
-    reserve(gpu, pixels * 4, usize::MAX)?;
+    let planes = active_planes(nr, moire, sh, lens);
+    if planes == 0 {
+        return Ok(());
+    }
+    reserve(gpu, pixels * 4, planes, usize::MAX)?;
     post_process_pool(gpu, rgba, w, h, nr, moire, sh, lens, scale)
+}
+
+/// Planes the active stages touch. Mirrors [`post_process_pool`]'s stage
+/// flags; pure so the sizing is testable without a GPU.
+fn active_planes(
+    nr: &NoiseReduction,
+    moire: &Moire,
+    sh: &Sharpening,
+    lens: &LensCorrection,
+) -> usize {
+    plane_count(
+        nr.luminance > 0.0 || nr.single_pixel > 0.0,
+        nr.color > 0.0,
+        moire.amount > 0.0,
+        sh.amount > 0.0,
+        lens.distortion != 0.0
+            || lens.light_falloff != 0.0
+            || lens.chromatic_aberration
+            || lens.purple_fringing > 0.0,
+    )
+}
+
+/// Luma-only stages (NE/moire) build luma plus one blur/scratch plane; colour
+/// NR, sharpening and lens also run box blurs against a second plane.
+fn plane_count(lum: bool, color: bool, moire: bool, sharp: bool, lens: bool) -> usize {
+    if color || sharp || lens {
+        4
+    } else if lum || moire {
+        2
+    } else {
+        0
+    }
 }
 
 /// Bench entry point: reserves the slots it needs on `gpu`.
@@ -238,19 +309,21 @@ pub(crate) fn post_process_pool(
     if !lum_active && !color_active && !moire_active && !sharp_active && !lens_active {
         return Ok(());
     }
+    let planes = plane_count(lum_active, color_active, moire_active, sharp_active, lens_active);
     let Some(pixels) = w.checked_mul(h) else { return Ok(()) };
     if pixels == 0 || rgba.len() != pixels.saturating_mul(4) {
         return Ok(());
     }
     let bytes = pixels * 4;
+    if gpu.slot_bytes(Slot::Frame) < bytes.saturating_mul(planes) {
+        return Err(Failure::Invalid("detail frame slot smaller than active planes"));
+    }
 
     let base = gpu.handle(Slot::Frame).ok_or(Failure::Invalid("detail frame slot"))?;
     let mut p_rgba = base;
     let mut p_luma = base + bytes as u64;
     let mut p_blur = base + (bytes * 2) as u64;
     let mut p_tmp = base + (bytes * 3) as u64;
-    let mut p_cb = base + (bytes * 4) as u64;
-    let mut p_cr = base + (bytes * 5) as u64;
     gpu.upload(Slot::Frame, rgba)?;
 
     let (mut w_i, mut h_i) = (w as i32, h as i32);
@@ -300,6 +373,10 @@ pub(crate) fn post_process_pool(
     }
 
     if color_active {
+        // Chroma rewrites the finished luma and blur planes; moire and
+        // sharpening rebuild those planes before reading them again.
+        let mut p_cb = p_luma;
+        let mut p_cr = p_blur;
         let strength = (nr.color / 100.0).clamp(0.0, 1.0);
         let mut radius = (1.0 + 2.0 * strength).round() as i32;
         let mut n_i = pixels as i32;
@@ -430,4 +507,97 @@ fn launch1<const N: usize>(
 #[cfg(test)]
 pub(crate) fn open_for_bench() -> Option<Gpu> {
     Gpu::open("detail", PTX).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nr(luminance: f32, color: f32) -> NoiseReduction {
+        NoiseReduction {
+            luminance,
+            details: 0.0,
+            color,
+            single_pixel: 0.0,
+        }
+    }
+
+    fn sharp(amount: f32) -> Sharpening {
+        Sharpening { amount, ..Default::default() }
+    }
+
+    #[test]
+    fn active_plane_count_covers_every_stage_without_overallocation() {
+        let off_nr = nr(0.0, 0.0);
+        let off_moire = Moire::default();
+        let off_sharp = sharp(0.0);
+        let off_lens = LensCorrection::default();
+
+        assert_eq!(plane_count(false, false, false, false, false), 0);
+        assert_eq!(plane_count(true, false, false, false, false), 2);
+        assert_eq!(plane_count(false, false, true, false, false), 2);
+        assert_eq!(plane_count(false, true, false, false, false), 4);
+        assert_eq!(plane_count(false, false, false, true, false), 4);
+        assert_eq!(plane_count(false, false, false, false, true), 4);
+        assert_eq!(plane_count(true, true, true, true, true), 4);
+
+        assert_eq!(active_planes(&off_nr, &off_moire, &off_sharp, &off_lens), 0);
+        assert_eq!(active_planes(&nr(50.0, 0.0), &off_moire, &off_sharp, &off_lens), 2);
+        let single = NoiseReduction { single_pixel: 50.0, ..nr(0.0, 0.0) };
+        assert_eq!(active_planes(&single, &off_moire, &off_sharp, &off_lens), 2);
+        assert_eq!(
+            active_planes(&off_nr, &Moire { amount: 50.0, ..Default::default() }, &off_sharp, &off_lens),
+            2
+        );
+        assert_eq!(active_planes(&nr(0.0, 50.0), &off_moire, &off_sharp, &off_lens), 4);
+        assert_eq!(active_planes(&off_nr, &off_moire, &sharp(50.0), &off_lens), 4);
+        assert_eq!(
+            active_planes(
+                &off_nr,
+                &off_moire,
+                &off_sharp,
+                &LensCorrection { distortion: 50.0, ..Default::default() },
+            ),
+            4,
+            "lens reads the scratch plane, so it needs four planes"
+        );
+    }
+
+    #[test]
+    fn plane_sizing_preserves_the_32_mp_retention_boundary() {
+        assert_eq!(MAX_RETAINED_FRAME_BYTES, 128 * 1024 * 1024);
+        assert_eq!(MAX_RETAINED_BYTES, 512 * 1024 * 1024);
+        assert_eq!(MAX_RETAINED_FRAME_BYTES.saturating_mul(MAX_PLANES), MAX_RETAINED_BYTES);
+
+        // The boundary is the frame, not bytes*planes: 24 MP and exactly
+        // 32 MP stay resident; one pixel over 32 MP takes the CPU fallback.
+        assert!(retained_frame(24_000_000 * 4));
+        assert!(retained_frame(MAX_RETAINED_FRAME_BYTES));
+        assert!(!retained_frame(MAX_RETAINED_FRAME_BYTES + 4));
+
+        // A 45 MP frame is not retained even when only two planes run; sizing
+        // by `bytes * planes` alone would have pinned 363 MB of it.
+        let frame_45mp = 8256usize * 5504 * 4;
+        assert!(!retained_frame(frame_45mp));
+        assert!(frame_45mp.saturating_mul(2) < MAX_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn retained_bytes_tracks_the_planes_actually_active() {
+        let pixels = 1400 * 933;
+        // Four planes (colour NR active) and two planes (luma only) differ.
+        let four = retained_bytes(pixels, 4).expect("no overflow");
+        let two = retained_bytes(pixels, 2).expect("no overflow");
+        assert_eq!(four, pixels * 4 * 4 + 1025 * 4);
+        assert_eq!(two, pixels * 4 * 2 + 1025 * 4);
+        assert_eq!(retained_bytes(pixels, 0), Some(1025 * 4));
+
+        // The old six-plane formula was bytes * 6; a 32 MP four-plane frame
+        // must not reserve more than the old shape did.
+        let frame_32mp = MAX_RETAINED_FRAME_BYTES / 4;
+        assert!(retained_bytes(frame_32mp, 4).unwrap() < frame_32mp * 6 + 1025 * 4);
+
+        // Checked arithmetic: a huge frame returns None instead of wrapping.
+        assert!(retained_bytes(usize::MAX / 8, 4).is_none());
+    }
 }

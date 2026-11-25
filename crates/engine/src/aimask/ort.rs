@@ -17,6 +17,8 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::lru::{self, ByteLru};
+
 type Status = *mut c_void;
 type ApiPtr = *const *const c_void;
 
@@ -661,11 +663,85 @@ fn optimized_model_cache_path_in(dir: &Path, path: &Path, key: &SessionKey) -> P
     dir.join(format!("{stem}-{}.onnx", key.short()))
 }
 
-type SessionRegistry = Mutex<HashMap<String, Session>>;
+/// Bytes one session is charged against the registry budget.
+///
+/// The ONNX Runtime C API slice used here has no call that reports a session's
+/// arena size, so this is a documented *lower bound*, not a measurement:
+/// `model file bytes + every input/output tensor at its declared dtype`. ORT
+/// keeps the weights in memory (a GPU EP usually keeps its own copy as well);
+/// the optimized graph, activation arenas and EP scratch buffers are not
+/// counted, so the real footprint is larger. The default budget is small for
+/// that reason.
+const SESSION_MODEL_BYTES_FACTOR: u64 = 1;
+/// Idle GPU sessions are expensive. Capture One's models are 30-180 MB, so
+/// 512 MiB keeps a working set of a few sessions and evicts the rest.
+const SESSION_BUDGET_ENV: &str = "AURORA_ORT_SESSION_BUDGET_MB";
+const SESSION_BUDGET_DEFAULT_MIB: u64 = 512;
+/// Secondary ceiling, retained from the old map so many tiny sessions cannot
+/// grow without bound even under the byte budget.
+const SESSION_REGISTRY_MAX_ENTRIES: usize = 64;
+
+fn session_budget_bytes() -> u64 {
+    lru::budget_from_env(SESSION_BUDGET_ENV, SESSION_BUDGET_DEFAULT_MIB)
+}
+
+fn tensor_bytes(dims: &[i64], element_type: c_int) -> u64 {
+    let element_size = match element_type {
+        FLOAT => 4,
+        FLOAT16 => 2,
+        _ => return 0,
+    };
+    let Some(elements) = dims.iter().try_fold(1u64, |total, dim| {
+        u64::try_from(*dim)
+            .ok()
+            .filter(|dim| *dim > 0)
+            .map(|dim| total.saturating_mul(dim))
+    }) else {
+        // A dynamic dimension cannot be sized from metadata; counting nothing
+        // keeps the result a lower bound.
+        return 0;
+    };
+    elements.saturating_mul(element_size)
+}
+
+fn session_bytes_estimate(model_len: u64, input: &TensorMeta, outputs: &[TensorMeta]) -> u64 {
+    let tensors = std::iter::once(input)
+        .chain(outputs)
+        .fold(0u64, |total, meta| {
+            total.saturating_add(tensor_bytes(&meta.dims, meta.element_type))
+        });
+    model_len
+        .saturating_mul(SESSION_MODEL_BYTES_FACTOR)
+        .saturating_add(tensors)
+}
+
+impl Session {
+    /// What this session keeps resident, as charged to the registry budget.
+    fn cached_bytes(&self) -> u64 {
+        session_bytes_estimate(self.inner.key.model_len, &self.input, &self.outputs)
+    }
+
+    /// `true` when someone outside the registry still holds this session.
+    /// Registry entries and callers share one `Arc<SessionInner>`, so a count
+    /// of one means the registry is the only owner.
+    fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.inner) > 1
+    }
+}
+
+/// Byte-budgeted LRU instead of an unbounded map. A cleared map never released
+/// a GPU session either: the finished [`Flight`] keeps a clone of it, so
+/// [`drop_finished_flights`] runs before every eviction pass.
+type SessionRegistry = Mutex<ByteLru<Session>>;
 
 fn session_registry() -> &'static SessionRegistry {
     static REGISTRY: OnceLock<SessionRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    REGISTRY.get_or_init(|| {
+        Mutex::new(ByteLru::new(
+            session_budget_bytes(),
+            SESSION_REGISTRY_MAX_ENTRIES,
+        ))
+    })
 }
 
 /// In-flight session creations, keyed by [`SessionKey::registry_id`].
@@ -674,24 +750,101 @@ fn session_flights() -> &'static OnceLock<Mutex<HashMap<String, Arc<Flight<Sessi
     &FLIGHTS
 }
 
-fn registry_lookup(id: &str) -> Option<Session> {
-    session_registry()
+/// Drops finished single-flight records so their cached session clone stops
+/// pinning the ORT session. Waiters keep their own `Arc` and still read the
+/// result; a later caller that misses the registry starts a fresh flight, and
+/// that flight's work rechecks the registry before creating anything. Only a
+/// flight whose `result` is already written is removed, so a creation in
+/// progress is never dropped or duplicated.
+fn drop_finished_flights() {
+    let Some(store) = session_flights().get() else {
+        return;
+    };
+    let mut flights = store.lock().unwrap_or_else(|error| error.into_inner());
+    let finished: Vec<String> = flights
+        .iter()
+        .filter(|(_, flight)| {
+            flight
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    let removed: Vec<Arc<Flight<Session>>> = finished
+        .iter()
+        .filter_map(|key| flights.remove(key))
+        .collect();
+    drop(flights);
+    // Session clones inside `removed` are released here, outside the lock.
+    drop(removed);
+}
+
+/// True while a creation for `id` is running. Finished flights are removed by
+/// [`drop_finished_flights`], so a cached key is not in flight.
+fn session_in_flight(id: &str) -> bool {
+    let Some(store) = session_flights().get() else {
+        return false;
+    };
+    store
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .get(id)
-        .cloned()
+        .contains_key(id)
+}
+
+/// Runs one eviction pass. The caller drops the returned values *after*
+/// releasing the registry lock: `SessionInner::drop` calls
+/// `OrtReleaseSession`, which must not run under the cache mutex.
+fn reclaim_sessions(registry: &mut ByteLru<Session>) -> lru::Eviction<Session> {
+    drop_finished_flights();
+    registry.evict(|key, session| session.is_shared() || session_in_flight(key))
+}
+
+fn log_evictions(eviction: lru::Eviction<Session>) {
+    for (_, session) in &eviction.removed {
+        log::debug!(
+            "ONNX session registry: released {} ({} bytes estimated)",
+            session.session_key().short(),
+            session.cached_bytes()
+        );
+    }
+    if eviction.pending > 0 {
+        log::debug!(
+            "ONNX session registry: {} entry(s) over budget still in use; eviction deferred",
+            eviction.pending
+        );
+    }
+    // Dropping here releases the ORT sessions; the registry lock is gone.
+    drop(eviction);
+}
+
+fn registry_lookup(id: &str) -> Option<Session> {
+    let (session, eviction) = {
+        let mut registry = session_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let session = registry.get(id).cloned();
+        let eviction = reclaim_sessions(&mut registry);
+        (session, eviction)
+    };
+    log_evictions(eviction);
+    session
 }
 
 fn registry_insert(id: String, session: Session) {
-    let mut registry = session_registry()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    // Unlike the mask cache, sessions are cheap to reopen and expensive to keep
-    // alive on a GPU; a large registry is a leak, not a cache.
-    if registry.len() > 64 {
-        registry.clear();
-    }
-    registry.insert(id, session);
+    let bytes = session.cached_bytes();
+    let (previous, eviction) = {
+        let mut registry = session_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = registry.insert(id, session, bytes);
+        let eviction = reclaim_sessions(&mut registry);
+        (previous, eviction)
+    };
+    // A replaced session is released outside the lock as well.
+    drop(previous);
+    log_evictions(eviction);
 }
 
 /// One in-flight creation. `done` is signalled after `result` is written.
@@ -2149,6 +2302,10 @@ unsafe impl Sync for SessionInner {}
 
 impl Drop for SessionInner {
     fn drop(&mut self) {
+        if self.ptr.is_null() {
+            // A test-only handle without an ORT session behind it.
+            return;
+        }
         let release: unsafe extern "C" fn(*mut c_void) = unsafe { function(self.api, RELEASE_SESSION) };
         unsafe { release(self.ptr) };
     }
@@ -2883,6 +3040,116 @@ mod tests {
         assert!(error.contains("session creation panicked"), "{error}");
         let next = single_flight(&FLIGHTS, "panic-key-2".to_string(), || Ok(3u32));
         assert_eq!(next.unwrap(), 3, "a panic must not poison later keys");
+    }
+
+    #[test]
+    fn tensor_bytes_use_declared_dims_and_dtype() {
+        let input = TensorMeta {
+            name: "x".to_string(),
+            dims: vec![1, 3, 320, 320],
+            element_type: DT_FLOAT,
+        };
+        assert_eq!(tensor_bytes(&input.dims, DT_FLOAT), 3 * 320 * 320 * 4);
+        assert_eq!(
+            tensor_bytes(&[1, 1, 512, 512], DT_FLOAT16),
+            512 * 512 * 2,
+            "fp16 counts two bytes per element"
+        );
+        // A dynamic dimension (ONNX symbol) cannot be sized; it counts zero so
+        // the estimate stays a lower bound.
+        assert_eq!(tensor_bytes(&[1, 3, -1, -1], DT_FLOAT), 0);
+        assert_eq!(tensor_bytes(&[1, 3, 320], 7), 0, "unknown dtype");
+    }
+
+    #[test]
+    fn session_bytes_estimate_is_model_plus_known_tensors() {
+        let input = TensorMeta {
+            name: "x".to_string(),
+            dims: vec![1, 3, 8, 8],
+            element_type: DT_FLOAT,
+        };
+        let outputs = vec![TensorMeta {
+            name: "y".to_string(),
+            dims: vec![1, 1, 8, 8],
+            element_type: DT_FLOAT,
+        }];
+        let estimate = session_bytes_estimate(10_000, &input, &outputs);
+        assert_eq!(estimate, 10_000 + (3 * 64 + 64) * 4);
+    }
+
+    #[test]
+    fn session_budget_defaults_to_512_mib() {
+        // No override in the environment (CI does not set one); documented
+        // default. An override cannot be tested here without racing other
+        // tests that read the same variable.
+        if std::env::var_os(SESSION_BUDGET_ENV).is_none() {
+            assert_eq!(session_budget_bytes(), 512 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn registry_evicts_lru_not_everything() {
+        // 150-byte budget: two 100-byte entries fit only after one is evicted.
+        let mut registry = ByteLru::new(150, 64);
+        let _ = registry.insert("a".to_string(), test_session(10), 100);
+        let _ = registry.insert("b".to_string(), test_session(20), 100);
+        assert!(registry.get("a").is_some(), "a is now the most recent entry");
+
+        // No outside clones; the LRU entry "b" is released, "a" stays.
+        let eviction = reclaim_sessions(&mut registry);
+        assert_eq!(eviction.removed.len(), 1);
+        assert_eq!(eviction.removed[0].0, "b");
+        drop(eviction);
+        assert!(registry.get("a").is_some(), "the just-used entry survives");
+        assert!(registry.get("b").is_none(), "only the LRU entry was released");
+        assert_eq!(registry.bytes(), 100);
+    }
+
+    /// A `Session` with no ORT handles, for registry accounting tests. The
+    /// pointers are never dereferenced: these values are only counted and
+    /// dropped, and `SessionInner::drop` is never reached because the test
+    /// keeps the last clone alive until the end.
+    fn test_session(model_len: u64) -> Session {
+        Session {
+            inner: Arc::new(SessionInner {
+                api: ptr::null_mut(),
+                ptr: ptr::null_mut(),
+                provider: Provider::Cpu,
+                key: key_for(model_len, "CPU", "opt=99"),
+                fallback: Mutex::new(None),
+                profile_active: AtomicBool::new(false),
+                timing: Mutex::new(SessionTiming::default()),
+            }),
+            input: TensorMeta {
+                name: "x".to_string(),
+                dims: vec![1, 3, 1, 1],
+                element_type: DT_FLOAT,
+            },
+            outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn registry_defers_eviction_while_a_caller_holds_the_session() {
+        let mut registry = ByteLru::new(150, 64);
+
+        let older = test_session(10);
+        let _ = registry.insert("a".to_string(), older.clone(), 100);
+        let _ = registry.insert("b".to_string(), test_session(20), 100);
+
+        // The caller still holds a clone of "a" (strong_count 2), so the
+        // in-use predicate must protect it even though it is the LRU entry.
+        let eviction = reclaim_sessions(&mut registry);
+        assert!(
+            registry.get("a").is_some(),
+            "an entry with a live caller clone must not be dropped"
+        );
+        assert!(registry.get("b").is_none(), "the unused entry is reclaimed");
+        assert_eq!(eviction.pending, 0, "no pending marker needed: b was free");
+        // A registered key that is currently being created is in flight and
+        // must not be evicted either.
+        assert!(!session_in_flight("a"), "no flight was ever created for a");
+        drop(older);
     }
 
     #[test]

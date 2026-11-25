@@ -372,23 +372,36 @@ impl VramLedger {
             .sum()
     }
 
-    fn reclaimable_bytes(&self, requester: &'static str) -> usize {
+    /// Bytes `requester` can actually get back: evictable leases of other
+    /// stages that registered a reclaim hook. An `evictable` flag alone is not
+    /// enough, because a stage without a hook cannot free its leases, so
+    /// crediting them would only turn a later refusal into a silent CPU
+    /// fallback.
+    fn reclaimable_bytes(&self, requester: &'static str, hooked: &[&'static str]) -> usize {
         self.entries
             .iter()
-            .filter(|entry| entry.evictable && entry.stage != requester)
+            .filter(|entry| {
+                entry.evictable && entry.stage != requester && hooked.contains(&entry.stage)
+            })
             .map(|entry| entry.bytes)
             .sum()
     }
 
     /// Would a stage that needs `bytes` resident fit, assuming rebuildable
-    /// buffers of other stages can be reclaimed first? Non-allocating.
-    pub(crate) fn can_allocate(&self, stage: &'static str, bytes: usize) -> bool {
+    /// buffers of other stages (only those with a reclaim hook) can be
+    /// reclaimed first? Non-allocating.
+    pub(crate) fn can_allocate(
+        &self,
+        stage: &'static str,
+        bytes: usize,
+        hooked: &[&'static str],
+    ) -> bool {
         let own = self.stage_bytes(stage);
         let base = self.resident.saturating_sub(own);
         if base + bytes <= self.budget {
             return true;
         }
-        let reclaimable = self.reclaimable_bytes(stage);
+        let reclaimable = self.reclaimable_bytes(stage, hooked);
         base.saturating_sub(reclaimable) + bytes <= self.budget
     }
 
@@ -479,10 +492,22 @@ fn reclaimer_snapshot() -> Vec<(&'static str, u8, ReclaimHook)> {
         .clone()
 }
 
+/// Stages with a registered reclaim hook, in registration order.
+fn reclaimer_stages() -> Vec<&'static str> {
+    reclaimers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .map(|(stage, _, _)| *stage)
+        .collect()
+}
+
 /// Non-allocating admission check: would `stage` fit `bytes` resident, counting
-/// buffers other stages could rebuild? Never evicts and never allocates.
+/// buffers other stages with a reclaim hook could rebuild? Never evicts and
+/// never allocates.
 pub(crate) fn vram_can_allocate(stage: &'static str, bytes: usize) -> bool {
-    with_ledger(|ledger| ledger.can_allocate(stage, bytes))
+    let hooked = reclaimer_stages();
+    with_ledger(|ledger| ledger.can_allocate(stage, bytes, &hooked))
 }
 
 /// Records a lease size, reclaiming other stages' rebuildable buffers when the
@@ -640,14 +665,26 @@ pub(crate) enum FrameFormat {
     F32Planes,
 }
 
+/// A device allocation paired with the ledger lease that pays for it.
+///
+/// Field order is load-bearing: Rust drops fields in declaration order, so the
+/// buffer is freed first and only then does the lease hand its bytes back to
+/// the ledger. With the lease first, another thread could pass
+/// `can_allocate`/`admit` in the window before `cuMemFree` finished and its
+/// `cuMemAlloc` would fail even though the preflight had said yes.
+struct LeasedBuffer<B> {
+    buffer: B,
+    lease: VramLease,
+}
+
 /// Device-resident frame shared across the passes of one stage. It is the
 /// P-07 step-2 building block: allocation and residency are owned by an object
 /// with a layout and a generation instead of an ad-hoc slot offset, so a later
 /// cross-stage fusion can hand the same device pointer to the next kernel.
+/// The buffer is freed before its lease is returned (see [`LeasedBuffer`]).
 pub(crate) struct FrameHandle {
     layout: FrameLayout,
-    lease: VramLease,
-    buffer: DeviceBuffer<'static>,
+    resident: LeasedBuffer<DeviceBuffer<'static>>,
 }
 
 // The buffer borrows the process driver table, kept alive by the owning `Gpu`,
@@ -660,9 +697,11 @@ impl FrameHandle {
         match gpu.gpu.alloc_buffer(layout.bytes.max(1)) {
             Ok(buffer) => Ok(Self {
                 layout,
-                lease,
-                buffer: unsafe {
-                    std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer)
+                resident: LeasedBuffer {
+                    buffer: unsafe {
+                        std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer)
+                    },
+                    lease,
                 },
             }),
             Err(error) => Err(gpu.failed(error)),
@@ -674,7 +713,7 @@ impl FrameHandle {
     }
 
     pub(crate) fn handle(&self) -> u64 {
-        self.buffer.handle()
+        self.resident.buffer.handle()
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -682,11 +721,11 @@ impl FrameHandle {
     }
 
     pub(crate) fn lease_bytes(&self) -> usize {
-        self.lease.bytes()
+        self.resident.lease.bytes()
     }
 
     fn buffer(&self) -> &DeviceBuffer<'static> {
-        &self.buffer
+        &self.resident.buffer
     }
 }
 
@@ -1301,9 +1340,10 @@ mod tests {
         assert!(ledger.admit(2, "develop", 200, true));
         // 700 resident above develop's own 200 + 900 more does not fit, but
         // clarity's 700 are rebuildable, so it admits.
-        assert!(ledger.can_allocate("develop", 900));
+        let hooked = ["clarity", "develop"];
+        assert!(ledger.can_allocate("develop", 900, &hooked));
         // Nothing can make a request larger than the whole budget fit.
-        assert!(!ledger.can_allocate("develop", 1001));
+        assert!(!ledger.can_allocate("develop", 1001, &hooked));
     }
 
     #[test]
@@ -1313,8 +1353,24 @@ mod tests {
         assert!(ledger.admit(2, "develop", 300, false));
         // Only 700 of the 1000 resident bytes can be reclaimed, so 900 more
         // for pixel leaves 200 unreachable.
-        assert!(!ledger.can_allocate("pixel", 900));
-        assert!(ledger.can_allocate("pixel", 700));
+        let hooked = ["clarity", "develop"];
+        assert!(!ledger.can_allocate("pixel", 900, &hooked));
+        assert!(ledger.can_allocate("pixel", 700, &hooked));
+    }
+
+    #[test]
+    fn can_allocate_does_not_credit_stages_without_a_reclaim_hook() {
+        let mut ledger = VramLedger::new(1000);
+        // `nr` and `pixel` mark their slots evictable but never register a
+        // reclaim hook, so nothing can actually free these bytes.
+        assert!(ledger.admit(1, "nr", 600, true));
+        assert!(ledger.admit(2, "pixel", 300, true));
+        let hooked = ["clarity", "detail", "develop"];
+        // 100 bytes of free tail fit; 200 need bytes that no hook can free.
+        assert!(ledger.can_allocate("clarity", 100, &hooked));
+        assert!(!ledger.can_allocate("clarity", 200, &hooked));
+        // The same bytes count once their stage has a hook.
+        assert!(ledger.can_allocate("clarity", 200, &["clarity", "detail", "develop", "nr"]));
     }
 
     #[test]
@@ -1398,6 +1454,39 @@ mod tests {
             assert_eq!(vram_stats().resident_bytes, before + 4096);
         }
         assert_eq!(vram_stats().resident_bytes, before);
+    }
+
+    #[test]
+    fn leased_buffer_frees_the_device_buffer_before_the_lease() {
+        // Stands in for `DeviceBuffer`, which needs a CUDA device to build.
+        struct Probe {
+            lease_id: u64,
+            charged_when_dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                // The ledger must still own the lease while the buffer is being
+                // freed; with the lease first these bytes would already be
+                // spendable by another stage.
+                let charged = with_ledger(|ledger| {
+                    ledger
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == self.lease_id && entry.bytes > 0)
+                });
+                self.charged_when_dropped.store(charged, Ordering::SeqCst);
+            }
+        }
+
+        let charged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease = VramLease::acquire("test-drop-order", 4096, true).expect("admit");
+        let lease_id = lease.id();
+        drop(LeasedBuffer {
+            buffer: Probe { lease_id, charged_when_dropped: Arc::clone(&charged) },
+            lease,
+        });
+        assert!(charged.load(Ordering::SeqCst), "lease returned before the buffer was freed");
+        assert!(!with_ledger(|ledger| ledger.entries.iter().any(|entry| entry.id == lease_id)));
     }
 
     #[test]
