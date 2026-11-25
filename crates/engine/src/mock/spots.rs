@@ -230,12 +230,14 @@ pub(crate) fn apply_cover_patches(
     if patches.is_empty() || width == 0 || height == 0 || sw == 0 || sh == 0 {
         return;
     }
-    let snapshot = rgba.to_vec();
     let (ow, oh) = if geometry.orientation % 2 == 1 {
         (sh as f32, sw as f32)
     } else {
         (sw as f32, sh as f32)
     };
+    // Every patch reads the frame as it was before any repair, so the pixels
+    // are copied first and applied afterwards.
+    let mut placed: Vec<(CoverKind, (f32, f32, f32, f32), (f32, f32))> = Vec::new();
     for patch in patches {
         let Some((dx, dy, scale)) =
             oriented_to_frame(patch.dst, geometry, source_size, width, height)
@@ -254,11 +256,148 @@ pub(crate) fn apply_cover_patches(
         }
         let rect = (dx - hw, dy - hh, dx + hw, dy + hh);
         let offset = (sx - dx, sy - dy);
-        let shift = match patch.kind {
-            CoverKind::Clone => [0.0; 3],
-            CoverKind::Heal => colour_shift(&snapshot, width, height, rect, offset),
+        placed.push((patch.kind, rect, offset));
+    }
+    // Windows are per patch so a small repair does not copy the whole frame.
+    // Far-apart patches can add up past that, so the larger total falls back to
+    // one full copy.
+    let frame_pixels = width as usize * height as usize;
+    let window_pixels: usize = placed
+        .iter()
+        .filter_map(|(_, rect, offset)| Snapshot::pixel_count(width, height, *rect, *offset))
+        .sum();
+    let shared = (window_pixels > frame_pixels).then(|| Snapshot::whole(rgba, width, height));
+    let mut tasks = Vec::with_capacity(placed.len());
+    for (kind, rect, offset) in placed {
+        let window = if shared.is_some() {
+            None
+        } else {
+            Snapshot::of(rgba, width, height, rect, offset)
         };
-        cover_rect(rgba, &snapshot, width, height, rect, offset, shift);
+        tasks.push((kind, rect, offset, window));
+    }
+    for (kind, rect, offset, window) in tasks {
+        let Some(snapshot) = window.as_ref().or(shared.as_ref()) else {
+            continue;
+        };
+        let shift = match kind {
+            CoverKind::Clone => [0.0; 3],
+            CoverKind::Heal => colour_shift(snapshot, width, height, rect, offset),
+        };
+        cover_rect(rgba, snapshot, width, height, rect, offset, shift);
+    }
+}
+
+/// The pixels one cover patch can read: its destination rim and the source
+/// region it copies from, copied before any patch writes.
+struct Snapshot {
+    x0: i64,
+    y0: i64,
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
+impl Snapshot {
+    fn bounds(
+        width: u32,
+        height: u32,
+        rect: (f32, f32, f32, f32),
+        offset: (f32, f32),
+    ) -> Option<(i64, i64, i64, i64)> {
+        let last_x = width as f32 - 1.0;
+        let last_y = height as f32 - 1.0;
+        if last_x < 0.0 || last_y < 0.0 {
+            return None;
+        }
+        // `sample` clamps every read into the frame, then bilinearly blends the
+        // pixel below it with its right/bottom neighbour.
+        let reach_x0 = (rect.0 - HEAL_FEATHER_PX).min(rect.0 - HEAL_FEATHER_PX + offset.0);
+        let reach_x1 = (rect.2 + HEAL_FEATHER_PX).max(rect.2 + HEAL_FEATHER_PX + offset.0);
+        let reach_y0 = (rect.1 - HEAL_FEATHER_PX).min(rect.1 - HEAL_FEATHER_PX + offset.1);
+        let reach_y1 = (rect.3 + HEAL_FEATHER_PX).max(rect.3 + HEAL_FEATHER_PX + offset.1);
+        let x0 = reach_x0.floor().clamp(0.0, last_x) as i64;
+        let y0 = reach_y0.floor().clamp(0.0, last_y) as i64;
+        let x1 = (reach_x1.ceil().clamp(0.0, last_x) + 1.0).min(last_x) as i64;
+        let y1 = (reach_y1.ceil().clamp(0.0, last_y) + 1.0).min(last_y) as i64;
+        Some((x0, y0, x1, y1))
+    }
+
+    fn pixel_count(
+        width: u32,
+        height: u32,
+        rect: (f32, f32, f32, f32),
+        offset: (f32, f32),
+    ) -> Option<usize> {
+        let (x0, y0, x1, y1) = Self::bounds(width, height, rect, offset)?;
+        let columns = usize::try_from(x1 - x0 + 1).ok()?;
+        let rows = usize::try_from(y1 - y0 + 1).ok()?;
+        Some(columns * rows)
+    }
+
+    /// The whole frame, for the case where the per-patch windows would add up
+    /// to more than one copy.
+    fn whole(frame: &[u8], width: u32, height: u32) -> Self {
+        let (width, height) = (width as usize, height as usize);
+        let pixels = frame.get(..width * height * 4).unwrap_or_default().to_vec();
+        Self { x0: 0, y0: 0, width, height, pixels }
+    }
+
+    fn of(
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        rect: (f32, f32, f32, f32),
+        offset: (f32, f32),
+    ) -> Option<Self> {
+        let (x0, y0, x1, y1) = Self::bounds(width, height, rect, offset)?;
+        let window_width = usize::try_from(x1 - x0 + 1).ok()?;
+        let window_height = usize::try_from(y1 - y0 + 1).ok()?;
+        let mut pixels = Vec::with_capacity(window_width * window_height * 4);
+        for y in y0..=y1 {
+            let start = (y as usize * width as usize + x0 as usize) * 4;
+            pixels.extend_from_slice(frame.get(start..start + window_width * 4)?);
+        }
+        Some(Self { x0, y0, width: window_width, height: window_height, pixels })
+    }
+
+    fn rgb_at(&self, x: i64, y: i64) -> Option<[f32; 3]> {
+        let (column, row) = (usize::try_from(x - self.x0).ok()?, usize::try_from(y - self.y0).ok()?);
+        if column >= self.width || row >= self.height {
+            return None;
+        }
+        let index = (row * self.width + column) * 4;
+        Some([
+            self.pixels[index] as f32,
+            self.pixels[index + 1] as f32,
+            self.pixels[index + 2] as f32,
+        ])
+    }
+
+    /// The bilinear, edge-clamped sample of `sample`, read from this window.
+    fn sample(&self, width: u32, height: u32, x: f32, y: f32) -> Option<[f32; 3]> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let fx = x.clamp(0.0, width as f32 - 1.0);
+        let fy = y.clamp(0.0, height as f32 - 1.0);
+        let x0 = fx.floor() as i64;
+        let y0 = fy.floor() as i64;
+        let x1 = (x0 + 1).min(width as i64 - 1);
+        let y1 = (y0 + 1).min(height as i64 - 1);
+        let tx = fx - fx.floor();
+        let ty = fy - fy.floor();
+        let p00 = self.rgb_at(x0, y0)?;
+        let p10 = self.rgb_at(x1, y0)?;
+        let p01 = self.rgb_at(x0, y1)?;
+        let p11 = self.rgb_at(x1, y1)?;
+        let mut out = [0f32; 3];
+        for k in 0..3 {
+            let top = p00[k] * (1.0 - tx) + p10[k] * tx;
+            let bottom = p01[k] * (1.0 - tx) + p11[k] * tx;
+            out[k] = top * (1.0 - ty) + bottom * ty;
+        }
+        Some(out)
     }
 }
 
@@ -273,7 +412,7 @@ fn rect_distance(x: f32, y: f32, rect: (f32, f32, f32, f32)) -> f32 {
 
 /// `mean(src) - mean(ring around dst)` per channel, over the 2 px feather band.
 fn colour_shift(
-    snapshot: &[u8],
+    snapshot: &Snapshot,
     width: u32,
     height: u32,
     rect: (f32, f32, f32, f32),
@@ -289,14 +428,14 @@ fn colour_shift(
             let (x, y) = (px as f32, py as f32);
             let d = rect_distance(x, y, rect);
             if d <= 0.0 {
-                if let Some(c) = sample(snapshot, width, height, x + offset.0, y + offset.1) {
+                if let Some(c) = snapshot.sample(width, height, x + offset.0, y + offset.1) {
                     for k in 0..3 {
                         src[k] += c[k];
                     }
                     n_src += 1.0;
                 }
             } else if d <= HEAL_FEATHER_PX {
-                if let Some(c) = sample(snapshot, width, height, x, y) {
+                if let Some(c) = snapshot.sample(width, height, x, y) {
                     for k in 0..3 {
                         ring[k] += c[k];
                     }
@@ -318,7 +457,7 @@ fn colour_shift(
 /// Copies the source rectangle over `rect`, feathering the 2 px outside it.
 fn cover_rect(
     rgba: &mut [u8],
-    snapshot: &[u8],
+    snapshot: &Snapshot,
     width: u32,
     height: u32,
     rect: (f32, f32, f32, f32),
@@ -345,13 +484,16 @@ fn cover_rect(
             if p + 3 >= rgba.len() {
                 continue;
             }
-            let Some(c) = sample(snapshot, width, height, x + offset.0, y + offset.1) else {
+            let Some(c) = snapshot.sample(width, height, x + offset.0, y + offset.1) else {
+                continue;
+            };
+            let Some(orig) = snapshot.rgb_at(px, py) else {
                 continue;
             };
             for k in 0..3 {
                 let repaired = c[k] + shift[k];
-                let orig = snapshot[p + k] as f32;
-                rgba[p + k] = (orig * (1.0 - weight) + repaired * weight).clamp(0.0, 255.0) as u8;
+                rgba[p + k] =
+                    (orig[k] * (1.0 - weight) + repaired * weight).clamp(0.0, 255.0) as u8;
             }
         }
     }

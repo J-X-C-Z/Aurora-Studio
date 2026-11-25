@@ -7,7 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -1143,22 +1143,24 @@ fn body_matches(header: &Raw16Header, body: &[u8]) -> bool {
 
 /// Reads one RAW16 entry and rejects it unless its source identity, route and
 /// provenance all match the current request.
+///
+/// The compact RGB16 body is expanded into the RGBA16 result from the back, so
+/// a full-sensor entry needs one frame buffer instead of two.
 fn read_cached16_binary(
     file: &Path,
     route: &DecodeRoute,
     identity: &SourceIdentity,
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
-    use rayon::prelude::*;
-
     let mut reader = fs::File::open(file).ok()?;
     let size = reader.metadata().ok()?.len();
     let mut header = [0u8; HEADER16];
     reader.read_exact(&mut header).ok()?;
     let header = parse_header(&header, size, route, identity)?;
-    let mut rgb = vec![0u16; header.body_bytes / 2];
+    let pixel_count = header.width as usize * header.height as usize;
+    let mut pixels = vec![0u16; pixel_count * 4];
     // SAFETY: `u8` has weaker alignment than `u16`, and the complete zeroed
     // allocation is written from disk before any `u16` is read.
-    let (before, body, after) = unsafe { rgb.align_to_mut::<u8>() };
+    let (before, body, after) = unsafe { pixels.align_to_mut::<u8>() };
     if !before.is_empty() || !after.is_empty() {
         return None;
     }
@@ -1166,15 +1168,21 @@ fn read_cached16_binary(
     if !body_matches(&header, &body[..header.body_bytes]) {
         return None;
     }
+    // Every source byte sits below its destination, so a backward pass reads
+    // each pixel before the copy can overwrite it.
+    for index in (0..pixel_count).rev() {
+        let source = index * 6;
+        let target = index * 8;
+        let mut sample = [0u8; 6];
+        sample.copy_from_slice(&body[source..source + 6]);
+        body[target..target + 6].copy_from_slice(&sample);
+        body[target + 6] = 0xFF;
+        body[target + 7] = 0xFF;
+    }
     #[cfg(target_endian = "big")]
-    for sample in &mut rgb {
+    for sample in &mut pixels {
         *sample = u16::from_le(*sample);
     }
-    let mut pixels = vec![65535u16; header.width as usize * header.height as usize * 4];
-    pixels
-        .par_chunks_exact_mut(4)
-        .zip(rgb.par_chunks_exact(3))
-        .for_each(|(dst, src)| dst[..3].copy_from_slice(src));
     Some((header.width, header.height, pixels, header.provenance))
 }
 
@@ -1260,8 +1268,6 @@ fn store16_binary(
     identity: SourceIdentity,
     route: &DecodeRoute,
 ) -> bool {
-    use rayon::prelude::*;
-
     let Some(dir) = file.parent() else { return false };
     if fs::create_dir_all(dir).is_err() {
         return false;
@@ -1271,36 +1277,30 @@ fn store16_binary(
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut body = vec![0u8; pixels.len() / 4 * 6];
-    body.par_chunks_exact_mut(6)
-        .zip(pixels.par_chunks_exact(4))
-        .for_each(|(dst, src)| {
-            dst[0..2].copy_from_slice(&src[0].to_le_bytes());
-            dst[2..4].copy_from_slice(&src[1].to_le_bytes());
-            dst[4..6].copy_from_slice(&src[2].to_le_bytes());
+    // The body goes out first and the header follows, so a full-sensor frame
+    // never needs a body-sized buffer just to be cached.
+    let body = fs::File::create(&temp)
+        .ok()
+        .and_then(|mut out| {
+            out.write_all(&[0u8; HEADER16]).ok()?;
+            let (len, crc32, hash) = write16_body(&mut out, pixels, width, height)?;
+            let mut header = [0u8; HEADER16];
+            write16_header(
+                &mut header,
+                width,
+                height,
+                len,
+                hash,
+                crc32,
+                provenance,
+                identity,
+                route,
+            );
+            out.seek(SeekFrom::Start(0)).ok()?;
+            out.write_all(&header).ok()?;
+            Some(())
         });
-    let mut data = Vec::with_capacity(HEADER16 + body.len());
-    data.extend_from_slice(RAW16_MAGIC);
-    data.extend_from_slice(&width.to_le_bytes());
-    data.extend_from_slice(&height.to_le_bytes());
-    data.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    data.extend_from_slice(&image_hash(width, height, &body).to_le_bytes());
-    data.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
-    data.extend_from_slice(&[0u8; 4]);
-    data.extend_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
-    data.extend_from_slice(&identity.len.to_le_bytes());
-    data.extend_from_slice(&identity.content.to_le_bytes());
-    data.extend_from_slice(&identity.mtime_nanos.to_le_bytes());
-    data.extend_from_slice(&route_digest(route).to_le_bytes());
-    data.push(identity.flags());
-    data.push(provenance.backend_code());
-    data.push(provenance.opencl_code());
-    data.push(provenance.pixel_space_code());
-    data.push(provenance.flags());
-    data.extend_from_slice(&[0u8; 11]);
-    debug_assert_eq!(data.len(), HEADER16);
-    data.extend_from_slice(&body);
-    if fs::write(&temp, &data).is_err() || fs::rename(&temp, file).is_err() {
+    if body.is_none() || fs::rename(&temp, file).is_err() {
         let _ = fs::remove_file(&temp);
         return false;
     }
@@ -1308,33 +1308,108 @@ fn store16_binary(
     true
 }
 
+/// Streams the compact RGB16 body and returns its byte length, CRC-32 and image
+/// hash, hashing the same 256 KiB windows `image_hash` would see on a buffered
+/// body so cached bytes and checksums stay identical.
+fn write16_body(
+    out: &mut fs::File,
+    pixels: &[u16],
+    width: u32,
+    height: u32,
+) -> Option<(usize, u32, u64)> {
+    use rayon::prelude::*;
+
+    // 131,072 pixels are 786,432 body bytes, exactly three 256 KiB hash
+    // windows, so every batch ends on a window boundary.
+    const UNIT_PIXELS: usize = 131_072;
+    const BATCH_UNITS: usize = 12;
+    const HASH_WINDOW: usize = 256 << 10;
+    let batch_pixels = UNIT_PIXELS * BATCH_UNITS;
+    let mut scratch = vec![0u8; batch_pixels * 6];
+    let mut crc = crc32fast::Hasher::new();
+    let mut parts: Vec<u64> = Vec::new();
+    let mut body_len = 0usize;
+    for chunk in pixels.chunks(batch_pixels * 4) {
+        let packed = scratch.get_mut(..chunk.len() / 4 * 6)?;
+        packed
+            .par_chunks_exact_mut(6)
+            .zip(chunk.par_chunks_exact(4))
+            .for_each(|(dst, src)| {
+                dst[0..2].copy_from_slice(&src[0].to_le_bytes());
+                dst[2..4].copy_from_slice(&src[1].to_le_bytes());
+                dst[4..6].copy_from_slice(&src[2].to_le_bytes());
+            });
+        body_len += packed.len();
+        out.write_all(packed).ok()?;
+        crc.update(packed);
+        parts.extend(packed.par_chunks(HASH_WINDOW).map(chunk_hash).collect::<Vec<u64>>());
+    }
+    Some((body_len, crc.finalize(), fold_hash(width, height, &parts)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write16_header(
+    header: &mut [u8; HEADER16],
+    width: u32,
+    height: u32,
+    body_bytes: usize,
+    image_hash: u64,
+    crc32: u32,
+    provenance: DecodeProvenance,
+    identity: SourceIdentity,
+    route: &DecodeRoute,
+) {
+    header[..8].copy_from_slice(RAW16_MAGIC);
+    header[8..12].copy_from_slice(&width.to_le_bytes());
+    header[12..16].copy_from_slice(&height.to_le_bytes());
+    header[16..24].copy_from_slice(&(body_bytes as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&image_hash.to_le_bytes());
+    header[32..36].copy_from_slice(&crc32.to_le_bytes());
+    header[36..40].copy_from_slice(&[0u8; 4]);
+    header[40..48].copy_from_slice(&provenance.pipeline_fingerprint.to_le_bytes());
+    header[48..56].copy_from_slice(&identity.len.to_le_bytes());
+    header[56..64].copy_from_slice(&identity.content.to_le_bytes());
+    header[64..72].copy_from_slice(&identity.mtime_nanos.to_le_bytes());
+    header[72..80].copy_from_slice(&route_digest(route).to_le_bytes());
+    header[80] = identity.flags();
+    header[81] = provenance.backend_code();
+    header[82] = provenance.opencl_code();
+    header[83] = provenance.pixel_space_code();
+    header[84] = provenance.flags();
+    header[85..].copy_from_slice(&[0u8; 11]);
+}
+
 fn image_hash(width: u32, height: u32, body: &[u8]) -> u64 {
     use rayon::prelude::*;
 
-    fn chunk_hash(body: &[u8]) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for chunk in body.chunks_exact(8) {
-            hash ^= u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
-            hash = hash.rotate_left(27).wrapping_mul(0x9E37_79B1_85EB_CA87);
-            hash = hash.wrapping_add(0xD1B5_4A32_D192_ED03);
-        }
-        let tail = body.len() % 8;
-        if tail != 0 {
-            let mut word = [0u8; 8];
-            word[..tail].copy_from_slice(&body[body.len() - tail..]);
-            hash ^= u64::from_le_bytes(word);
-            hash = hash.wrapping_mul(0x9E37_79B1_85EB_CA87);
-        }
-        hash
-    }
-
     const CHUNK: usize = 256 << 10;
+    let parts: Vec<u64> = body.par_chunks(CHUNK).map(chunk_hash).collect();
+    fold_hash(width, height, &parts)
+}
+
+fn chunk_hash(body: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for chunk in body.chunks_exact(8) {
+        hash ^= u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
+        hash = hash.rotate_left(27).wrapping_mul(0x9E37_79B1_85EB_CA87);
+        hash = hash.wrapping_add(0xD1B5_4A32_D192_ED03);
+    }
+    let tail = body.len() % 8;
+    if tail != 0 {
+        let mut word = [0u8; 8];
+        word[..tail].copy_from_slice(&body[body.len() - tail..]);
+        hash ^= u64::from_le_bytes(word);
+        hash = hash.wrapping_mul(0x9E37_79B1_85EB_CA87);
+    }
+    hash
+}
+
+fn fold_hash(width: u32, height: u32, parts: &[u64]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(width).rotate_left(17);
     hash ^= u64::from(height).rotate_left(41);
     hash = hash.wrapping_mul(0x9E37_79B1_85EB_CA87);
-    let parts: Vec<u64> = body.par_chunks(CHUNK).map(chunk_hash).collect();
     for part in parts {
-        hash ^= part;
+        hash ^= *part;
         hash = hash.rotate_left(27).wrapping_mul(0x9E37_79B1_85EB_CA87);
         hash = hash.wrapping_add(0xD1B5_4A32_D192_ED03);
     }

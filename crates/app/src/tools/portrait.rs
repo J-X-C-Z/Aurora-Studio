@@ -213,7 +213,13 @@ pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSe
 #[test]
 fn every_live_skin_and_teeth_effect_has_one_section() {
     let listed: Vec<&str> = SKIN_SECTIONS.iter().flat_map(|(_, _, keys)| keys.iter().copied()).collect();
-    let live: Vec<&str> = WIRED_SKIN_EFFECTS.iter().chain(WIRED_TEETH_EFFECTS).map(|e| e.0).collect();
+    let live: Vec<&str> = WIRED_SKIN_EFFECTS
+        .iter()
+        .chain(WIRED_EYES_EFFECTS)
+        .chain(WIRED_HAIR_EFFECTS)
+        .chain(WIRED_TEETH_EFFECTS)
+        .map(|e| e.0)
+        .collect();
     assert_eq!(listed.len(), live.len());
     assert!(live.iter().all(|k| listed.iter().filter(|l| *l == k).count() == 1));
 }

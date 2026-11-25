@@ -55,7 +55,7 @@ try {
 
     $rules = @{
         'aurora-engine' = [pscustomobject]@{
-            AllowDirs  = @('src/', 'native/cuda/', 'assets/', 'tests/', 'examples/', 'data/')
+            AllowDirs  = @('src/', 'native/cuda/', 'native/metal/', 'assets/', 'tests/', 'examples/', 'data/')
             AllowFiles = @()
             DenyDirs   = @('work/', 'tools/', 'docs/', 'testdata/')
         }

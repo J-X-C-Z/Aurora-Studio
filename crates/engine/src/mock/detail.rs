@@ -144,8 +144,7 @@ fn stage_single_pixel_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &NoiseR
             for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
                 nb[k] = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
             }
-            nb.sort_by(|a, b| a.total_cmp(b));
-            let median = (nb[3] + nb[4]) * 0.5;
+            let median = neighbour_median(nb);
             if c > median + threshold {
                 let f = if c > 1.0 { median / c } else { 1.0 };
                 let p = &mut row[x];
@@ -210,6 +209,137 @@ pub(super) fn stage_luminance_nr_f32(
 }
 
 pub(super) fn stage_color_nr_f32(
+    rgb: &mut [[f32; 3]],
+    w: usize,
+    h: usize,
+    adj: &NoiseReduction,
+    scale: f32,
+) {
+    let strength = (adj.color / 100.0).clamp(0.0, 1.0);
+    if strength <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    const K: [f32; 4] = [0.299, 0.587, 0.114, 35.759_254];
+    const PX: f32 = 0.178_877_62;
+    const PY: f32 = 0.377_672_3;
+    const PZ_BASE: f32 = 0.401_832_58;
+    const PW_BASE: f32 = 2.968_700_4;
+
+    let scale_p = 0.35 + 1.3 * strength;
+    let pz = PZ_BASE * scale_p;
+    let pw = PW_BASE * scale_p;
+    let pz_chroma = 2_400.0 + 18_000.0 * strength * strength;
+    let pw_chroma = 12.0 + 36.0 * strength;
+
+    let (radius, step) = color_filter_support(adj.color, scale);
+    let max_x = (w - 1) as isize;
+
+    // The luma/chroma transform is only read by its own row, so keeping it in a
+    // row scratch instead of a whole-frame buffer halves this pass's memory
+    // without changing the arithmetic or the parallelism.
+    let mut horiz = vec![[0.0f32; 3]; w * h];
+    horiz.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        let src = &rgb[y * w..(y + 1) * w];
+        let mut encoded = vec![[0.0f32; 3]; w];
+        encoded.par_iter_mut().zip(src.par_iter()).for_each(|(slot, src)| {
+            let r = srgb_to_linear_f32(src[0]) * 65535.0;
+            let g = srgb_to_linear_f32(src[1]) * 65535.0;
+            let b = srgb_to_linear_f32(src[2]) * 65535.0;
+            let l = (K[0] * r + K[1] * g + K[2] * b).max(0.0) + K[3];
+            let inv_l = 1.0 / l;
+            *slot = [l, (r - g) * inv_l, (b - g) * inv_l];
+        });
+        for x in 0..w {
+            let [lc, uc, vc] = encoded[x];
+            let t_root = (pz + pw * lc).max(1.0);
+            let t_l2 = t_root * t_root;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -radius;
+            while off <= radius {
+                let nx = (x as isize + off).clamp(0, max_x) as usize;
+                let [li, ui, vi] = encoded[nx];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += step;
+            }
+            out_row[x] = if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                [lc, sum_u * inv_w, sum_v * inv_w]
+            } else {
+                [lc, uc, vc]
+            };
+        }
+    });
+
+    let max_y = (h - 1) as isize;
+    rgb.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+        for x in 0..w {
+            let [lc, uc, vc] = horiz[y * w + x];
+            let t_root = (pz + pw * lc).max(1.0);
+            let t_l2 = t_root * t_root;
+            let t_c = (pz_chroma + pw_chroma * lc).max(1.0);
+            let u_lc = uc * lc;
+            let v_lc = vc * lc;
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            let mut sum_w = 0.0f32;
+            let mut off = -radius;
+            while off <= radius {
+                let ny = (y as isize + off).clamp(0, max_y) as usize;
+                let [li, ui, vi] = horiz[ny * w + x];
+                let dl = lc - li;
+                let du = u_lc - ui * li;
+                let dv = v_lc - vi * li;
+                let dl2 = dl * dl;
+                let dc = (PX * du * du).max(PY * dv * dv);
+                let w_l = t_l2 / (dl2 * dl2 + t_l2);
+                let w_c = t_c / (dc + t_c);
+                let wt = (w_l * w_c - 0.01).max(0.0);
+                sum_u += ui * wt;
+                sum_v += vi * wt;
+                sum_w += wt;
+                off += step;
+            }
+            let (u, v) = if sum_w > 1e-6 {
+                let inv_w = 1.0 / sum_w;
+                (sum_u * inv_w, sum_v * inv_w)
+            } else {
+                (uc, vc)
+            };
+            let ul = u * lc;
+            let vl = v * lc;
+            let g = lc - ul * K[0] - vl * K[2] - K[3];
+            let r0 = (ul + g).max(1.0);
+            let g0 = g.max(1.0);
+            let b0 = (vl + g).max(1.0);
+            let sc = ((lc - (K[3] - 1.0)) / ((K[0] * r0 + K[1] * g0 + K[2] * b0).max(0.0) + 1.0))
+                .min(1.5);
+            let lin = [r0 * sc, g0 * sc, b0 * sc];
+            out_row[x] = [
+                super::process::linear_to_srgb((lin[0] / 65535.0).clamp(0.0, 1.0)),
+                super::process::linear_to_srgb((lin[1] / 65535.0).clamp(0.0, 1.0)),
+                super::process::linear_to_srgb((lin[2] / 65535.0).clamp(0.0, 1.0)),
+            ];
+        }
+    });
+}
+
+#[cfg(test)]
+fn stage_color_nr_f32_legacy(
     rgb: &mut [[f32; 3]],
     w: usize,
     h: usize,
@@ -340,6 +470,7 @@ pub(super) fn stage_color_nr_f32(
         }
     });
 }
+
 
 fn stage_sharpening_f32(rgb: &mut [[f32; 3]], w: usize, h: usize, adj: &Sharpening, scale: f32) {
     let amount = adj.amount / 100.0;
@@ -810,6 +941,36 @@ fn mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
 const NEIGHBOURS: [(i32, i32); 8] =
     [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
 
+fn neighbour_median(values: [f32; 8]) -> f32 {
+    #[inline]
+    fn total_order_bits(bits: i32) -> i32 {
+        bits ^ (((bits >> 31) as u32 >> 1) as i32)
+    }
+
+    let mut ordered = values.map(|value| total_order_bits(value.to_bits() as i32));
+    macro_rules! compare_exchange {
+        ($(($left:literal, $right:literal)),+ $(,)?) => {
+            $(
+                let left = ordered[$left];
+                let right = ordered[$right];
+                ordered[$left] = left.min(right);
+                ordered[$right] = left.max(right);
+            )+
+        };
+    }
+    compare_exchange!(
+        (0, 2), (1, 3), (4, 6), (5, 7),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+        (0, 1), (2, 3), (4, 5), (6, 7),
+        (2, 4), (3, 5),
+        (1, 4), (3, 6),
+        (1, 2), (3, 4), (5, 6),
+    );
+    let lower = f32::from_bits(total_order_bits(ordered[3]) as u32);
+    let upper = f32::from_bits(total_order_bits(ordered[4]) as u32);
+    (lower + upper) * 0.5
+}
+
 /// Long-exposure hot-pixel suppression, C1's `ZCLEANLONGEXPOSUREAMOUNT`
 /// ("Single Pixel"). A pixel is a spike when its luma is more than
 /// `threshold(amount)` above the median of its eight neighbours; it is then
@@ -845,8 +1006,7 @@ fn stage_single_pixel_with_pad(
             for (k, (dx, dy)) in NEIGHBOURS.iter().enumerate() {
                 nb[k] = pad[(y as i32 + 1 + dy) as usize * pw + (x as i32 + 1 + dx) as usize];
             }
-            nb.sort_by(|a, b| a.total_cmp(b));
-            let median = (nb[3] + nb[4]) * 0.5;
+            let median = neighbour_median(nb);
             if c > median + threshold {
                 let i = x * 4;
                 let f = if c > 1.0 { median / c } else { 1.0 };
@@ -2228,6 +2388,33 @@ pub(super) fn hash_noise(x: u32, y: u32, seed: u32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neighbour_median_matches_total_cmp() {
+        let check = |mut values: [f32; 8]| {
+            let actual = super::neighbour_median(values);
+            values.sort_by(f32::total_cmp);
+            let expected = (values[3] + values[4]) * 0.5;
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{values:?}");
+            }
+        };
+        for pattern in 0u16..256 {
+            check(std::array::from_fn(|index| ((pattern >> index) & 1) as f32));
+        }
+        let mut state = 0x6210_2c9bu32;
+        for _ in 0..32_768 {
+            check(std::array::from_fn(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                f32::from_bits(state)
+            }));
+        }
+        check([-0.0; 8]);
+        check([-0.0, -0.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0]);
+        check([f32::NEG_INFINITY, -8.0, -0.0, 0.0, 8.0, f32::INFINITY, f32::NAN, -f32::NAN]);
+    }
+
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     #[test]
     fn camera_usm_keeps_channel_ratios_and_preserves_blank_pixels() {
@@ -4489,5 +4676,53 @@ over1={over1} diff_px={diff_px}",
         adj.lens.chromatic_aberration = true;
         stage_lens(&mut generic, 64, 64, &adj.lens, None);
         assert!(generic.iter().step_by(4).copied().max().unwrap_or(0) > 200, "generic remap blanked the frame");
+    }
+
+    #[test]
+    fn row_scratch_color_nr_matches_the_two_buffer_version() {
+        for (w, h) in [(1usize, 1usize), (3, 5), (17, 9), (64, 48), (129, 97)] {
+            for color in [0.0f32, 25.0, 50.0, 100.0] {
+                for scale in [1.0f32, 0.5, 0.25] {
+                    let base: Vec<[f32; 3]> = (0..w * h)
+                        .map(|index| {
+                            let v = ((index.wrapping_mul(37) % 255) as f32) / 255.0;
+                            [v, 1.0 - v, (v * 0.5 + 0.25).min(1.0)]
+                        })
+                        .collect();
+                    let noise = NoiseReduction { color, ..NoiseReduction::default() };
+                    let mut expected = base.clone();
+                    let mut actual = base.clone();
+                    stage_color_nr_f32_legacy(&mut expected, w, h, &noise, scale);
+                    stage_color_nr_f32(&mut actual, w, h, &noise, scale);
+                    assert!(
+                        expected == actual,
+                        "{w}x{h} color={color} scale={scale}: row scratch differs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "prints 24 MP colour-NR timings for both implementations"]
+    fn bench_color_nr_24mp() {
+        let (w, h) = (6000usize, 4000usize);
+        let base: Vec<[f32; 3]> = (0..w * h)
+            .map(|index| {
+                let v = ((index.wrapping_mul(37) % 255) as f32) / 255.0;
+                [v, 1.0 - v, (v * 0.5 + 0.25).min(1.0)]
+            })
+            .collect();
+        let noise = NoiseReduction { color: 50.0, ..NoiseReduction::default() };
+        type Fn = fn(&mut [[f32; 3]], usize, usize, &NoiseReduction, f32);
+        for (name, run) in [
+            ("whole-frame copy", stage_color_nr_f32_legacy as Fn),
+            ("row scratch", stage_color_nr_f32 as Fn),
+        ] {
+            let mut buf = base.clone();
+            let started = std::time::Instant::now();
+            run(&mut buf, w, h, &noise, 1.0);
+            println!("{name}: {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 }

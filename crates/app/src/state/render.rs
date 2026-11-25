@@ -212,14 +212,11 @@ fn needs_before(
             }))
 }
 
-/// Whether two requests would produce the same engine frame. The generation
-/// differs by definition. Draft frames use the half-size fast path, so quality
-/// is part of the pixels and a release must not reuse a draft.
+/// Both interactive priorities use the same full-quality render path.
 fn same_render_inputs(a: &PreviewRequest, b: &PreviewRequest) -> bool {
     a.image == b.image
         && a.region == b.region
         && a.max_size == b.max_size
-        && a.quality == b.quality
         && a.bypass == b.bypass
         && a.mask_overlay == b.mask_overlay
         && a.display_profile == b.display_profile
@@ -761,7 +758,7 @@ fn analysis_pixels(
     warn: Option<(u8, u8, bool)>,
     focus: Option<f32>,
 ) -> (Option<Arc<RenderImage>>, Option<Arc<RenderImage>>) {
-    if w == 0 || h == 0 || px.len() < w * h * 4 {
+    if (warn.is_none() && focus.is_none()) || w == 0 || h == 0 || px.len() < w * h * 4 {
         return (None, None);
     }
     let channels = if bgra { (2, 0) } else { (0, 2) };
@@ -896,6 +893,14 @@ impl AppState {
         if (warning, focus) != self.preview.last_overlay {
             self.rebuild_overlays(warning, focus, cx);
         }
+        if request.quality == RenderQuality::Final {
+            if let Some(shown) = self.preview.last_request.as_mut() {
+                shown.quality = RenderQuality::Final;
+            }
+            if let Some(frame) = self.preview.frame.as_mut() {
+                frame.stamp.quality = RenderQuality::Final;
+            }
+        }
         true
     }
 
@@ -975,7 +980,6 @@ impl AppState {
         });
         cx.spawn(async move |this, cx| {
             let after_engine = engine.clone();
-            let fast = quality == RenderQuality::Draft;
             let frame = cx
                 .background_spawn(async move {
                     let started_at = std::time::Instant::now();
@@ -983,22 +987,29 @@ impl AppState {
                         .then(crate::perf::working_set_bytes)
                         .flatten();
                     let (region, image_id) = (request.region, request.image);
-                    after_engine.render_preview_fast(&request, fast).map(move |f| {
+                    after_engine.render_preview(&request).map(move |f| {
                         let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                         let source_status = crate::planned::source_status(after_engine.as_ref(), image_id);
                         let PreviewFrame { image, histogram, elapsed_ms, degraded, .. } = f;
                         let (width, height) = (image.width, image.height);
                         let analysis_at = std::time::Instant::now();
-                        let ((overlays, overlay_ms), (scope, scope_ms)) = rayon::join(
-                            || {
-                                let at = std::time::Instant::now();
-                                (analysis(&image, want_warning, want_focus), at.elapsed().as_secs_f64() * 1000.0)
-                            },
-                            || {
-                                let at = std::time::Instant::now();
-                                (super::scopes::render(&image, want_scope), at.elapsed().as_secs_f64() * 1000.0)
-                            },
-                        );
+                        let overlays = || {
+                            let at = std::time::Instant::now();
+                            (analysis(&image, want_warning, want_focus), at.elapsed().as_secs_f64() * 1000.0)
+                        };
+                        let scopes = || {
+                            let at = std::time::Instant::now();
+                            (super::scopes::render(&image, want_scope), at.elapsed().as_secs_f64() * 1000.0)
+                        };
+                        let ((overlays, overlay_ms), (scope, scope_ms)) = match (
+                            want_warning.is_some() || want_focus.is_some(),
+                            want_scope != super::ScopeKind::Off,
+                        ) {
+                            (true, true) => rayon::join(overlays, scopes),
+                            (true, false) => (overlays(), (None, 0.0)),
+                            (false, true) => (((None, None), 0.0), scopes()),
+                            (false, false) => (((None, None), 0.0), (None, 0.0)),
+                        };
                         let analysis_ms = analysis_at.elapsed().as_secs_f64() * 1000.0;
                         let display = prepare_display_image(
                             image,
@@ -1723,7 +1734,7 @@ mod ordering_tests {
 
         let mut draft = a.clone();
         draft.quality = RenderQuality::Draft;
-        assert!(!same_render_inputs(&a, &draft), "a release must replace the draft");
+        assert!(same_render_inputs(&a, &draft), "release may reuse the same full-quality pixels");
 
         let mut region = a.clone();
         region.region = TILE;
