@@ -16,7 +16,7 @@
 ```powershell
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked -- --test-threads=1
-cargo build -p lumen-app --release --locked
+cargo build -p portrait-app --release --locked
 ```
 
 CI 只运行不依赖外部资产的 synthetic 测试。涉及外部资产的测试必须放在
@@ -28,6 +28,11 @@ cargo test -p aurora-engine --features external-fixtures --locked -- --test-thre
 
 `crates/engine/testdata/` 被 `.gitignore` 整体排除。不得为了让 CI 通过而上传
 其中任何原始或派生资产，也不得把外部测试改成静默跳过后在 PR 中宣称已覆盖。
+
+从第三方软件提取的资产、Capture One 提取数据和依赖它们的 fixture 放在被忽略的
+`private-assets/`，规则见 [private-assets.md](private-assets.md)。没有该目录时
+相关测试显示为 ignored；改动资产引用时有、无该目录两种情况都要跑
+`cargo check --workspace --all-targets --locked`。
 
 ## 预览与性能
 
