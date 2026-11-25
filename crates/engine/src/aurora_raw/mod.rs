@@ -118,10 +118,14 @@ pub(crate) fn decode_he_rgba16_with(
 
     let z6iii_started = Instant::now();
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    let (z6iii_frame, opencl) =
-        z6iii::render_linear_rgba16_traced(bytes, libraw_bayer, ca_warp.as_ref());
+    let (z6iii_frame, opencl, z6iii_oriented) = z6iii::render_linear_rgba16_oriented_traced(
+        bytes,
+        libraw_bayer,
+        ca_warp.as_ref(),
+        orientation,
+    );
     #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-    let (z6iii_frame, opencl): (Option<(usize, usize, Vec<u16>)>, OpenClRoute) = (
+    let (z6iii_frame, opencl, z6iii_oriented): (Option<(usize, usize, Vec<u16>)>, OpenClRoute, bool) = (
         None,
         // The OpenCL backend is not compiled on this platform, so no OpenCL
         // stage can run. A recognised Z6III HE body still carries
@@ -146,12 +150,17 @@ pub(crate) fn decode_he_rgba16_with(
         } else {
             OpenClRoute::NotZ6iii
         },
+        false,
     );
     timings.z6iii_ms += z6iii_started.elapsed().as_millis() as u64;
 
     if let Some((width, height, rgba)) = z6iii_frame {
         timings.note_bytes((rgba.len() as u64) * 2);
-        let (width, height, pixels) = orient_rgba16(rgba, width, height, orientation);
+        let (width, height, pixels) = if z6iii_oriented {
+            (width as u32, height as u32, rgba)
+        } else {
+            orient_rgba16(rgba, width, height, orientation)
+        };
         return Some((width, height, pixels, AuroraRoute::Z6iiiOpenCl));
     }
     // `Succeeded` cannot reach here: the frame moved out above. Any other

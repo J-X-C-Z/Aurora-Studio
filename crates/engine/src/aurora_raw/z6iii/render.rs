@@ -110,7 +110,113 @@ pub(in crate::aurora_raw) fn linear_rgba16(
     bayer: Option<(usize, usize, Vec<u16>)>,
     ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
 ) -> Result<(usize, usize, Vec<u16>)> {
+    let (w, h, out, _oriented) = linear_rgba16_oriented(nef, bayer, ca_warp, 1)?;
+    Ok((w, h, out))
+}
+
+/// Reconstructs Z6III linear RGBA16, preferring the single-upload GPU-resident
+/// native CUDA pipeline (which fuses EXIF orientation into the final RGBA16
+/// write) and transparently falling back to OpenCL when CUDA is disabled,
+/// unavailable, or OOM.
+///
+/// Returns `(width, height, rgba16, already_oriented)`.
+#[cfg(windows)]
+pub(in crate::aurora_raw) fn linear_rgba16_oriented(
+    nef: &[u8],
+    bayer: Option<(usize, usize, Vec<u16>)>,
+    ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
+    orientation: u16,
+) -> Result<(usize, usize, Vec<u16>, bool)> {
     use rayon::prelude::*;
+
+    // Fast path: native CUDA GPU-resident full pipeline (single H2D, 0 mid-readbacks,
+    // fused orient + RGBA16 pack, single D2H).
+    if raw::cuda_enabled() {
+        let cuda_attempt = (|| -> Result<Option<(usize, usize, Vec<u16>, bool)>> {
+            let iso = raw::nikon_exif_sensitivity(nef)
+                .map_err(|error| anyhow!("ISO: {error}"))?
+                .context("missing NEF ISO")?;
+            let noise = color::z6iii_noise::z6iii_noise_for_iso(iso)
+                .context("unsupported Z6III ISO")?;
+            let offset = raw::Z6iiiStage3::offset_for_noise(noise, (50, 0.0));
+            let wb = raw::nikon_as_shot_rgb(nef)
+                .map_err(|error| anyhow!("white balance: {error}"))?
+                .map(color::prepare_z6iii_global_white_balance)
+                .context("missing as-shot white balance")?
+                .map(|gain| ((f64::from(gain) * 1000.0).round_ties_even() / 1000.0) as f32);
+            let black = raw::nikon_black_levels(nef)
+                .map_err(|error| anyhow!("black levels: {error}"))?
+                .context("missing black levels")?
+                .capture_one_scalar();
+            ensure!(
+                black < 65_535 && wb.into_iter().all(|gain| gain.is_finite() && gain > 0.0),
+                "invalid NEF black level or white balance"
+            );
+            let stage1 = raw::Stage1Params::prepare(wb, noise, black, false);
+            let frame = match bayer.as_ref() {
+                Some((full_w, full_h, samples)) => {
+                    let crop = raw::nikon_crop(nef)
+                        .map_err(|error| anyhow!("crop: {error}"))?
+                        .context("missing Z6III crop")?;
+                    raw::NikonHeCropFrame::new(crop, *full_w, *full_h, samples.clone())
+                        .map_err(|error| anyhow!("Bayer frame: {error}"))?
+                }
+                None => raw::decode_frame_cropped(nef)
+                    .map_err(|error| anyhow!("HE decode: {error}"))?
+                    .context("unsupported Nikon HE RAW variant")?,
+            };
+            let crop = frame.crop();
+            ensure!(
+                (crop.width, crop.height) == (6048, 4032) && crop.cfa_phase() == (0, 0),
+                "unsupported Z6III active crop"
+            );
+            let recovery = highlight_parameters(black, wb);
+            let iso_u32 = iso as u32;
+            let aca_gain = if iso_u32 >= 3200 {
+                1.0
+            } else if iso_u32 >= 1600 {
+                0.75
+            } else {
+                0.5
+            };
+            let aa_params = [0.05_f32.sqrt(), aca_gain];
+            let cuda_in = raw::CudaPipelineInput {
+                full_w: frame.full_width(),
+                full_h: frame.full_height(),
+                crop,
+                samples: frame.full_samples(),
+                stage1,
+                black,
+                wb,
+                offset,
+                noise0: noise[0],
+                recovery,
+                aa_params,
+                ca_warp,
+                orientation,
+            };
+            match raw::cuda_reconstruct_rgba16(&cuda_in) {
+                Ok((w, h, out)) => Ok(Some((w, h, out, true))),
+                Err(err) => {
+                    log::warn!("Z6III CUDA pipeline unavailable/failed ({err:?}); falling back to OpenCL");
+                    Ok(None)
+                }
+            }
+        })();
+        match cuda_attempt {
+            Ok(Some(frame)) => return Ok(frame),
+            Ok(None) => {}
+            Err(err) => {
+                // If OpenCL is also unavailable, surface the metadata/HE decode error.
+                if !raw::gpu_available() {
+                    return Err(err);
+                }
+                log::warn!("Z6III CUDA prep failed ({err:#}); falling back to OpenCL");
+            }
+        }
+    }
+
+    // Fallback: OpenCL strip pipeline (returns unoriented 6048x4032).
     // Both the neutral export and the editable source start at the same
     // reconstructed pixels. Color noise is an adjustment, so the source cache
     // must be independent of it.
@@ -143,7 +249,7 @@ pub(in crate::aurora_raw) fn linear_rgba16(
             Ok(())
         },
     )?;
-    Ok((crop_w, crop_h, out))
+    Ok((crop_w, crop_h, out, false))
 }
 
 #[cfg(windows)]

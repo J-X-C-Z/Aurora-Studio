@@ -13,10 +13,18 @@ mod c1_adaptive_gg;
 #[path = "c1_adaptive_opencl.rs"]
 mod c1_adaptive_opencl;
 #[cfg(windows)]
+#[path = "c1_cuda_pipeline.rs"]
+mod c1_cuda_pipeline;
+#[cfg(windows)]
 #[allow(unused_imports)]
 pub(crate) use c1_adaptive_opencl::anti_alias as anti_alias_opencl;
 #[cfg(windows)]
 pub(super) use c1_adaptive_opencl::{export_color, highlight_and_aa, recover_highlights, stage3_gg_highlight_aa};
+#[cfg(windows)]
+pub(super) use c1_cuda_pipeline::{
+    available as cuda_available, enabled as cuda_enabled, reconstruct_rgba16 as cuda_reconstruct_rgba16,
+    CudaPipelineInput,
+};
 #[path = "c1_nikon_he.rs"]
 mod c1_nikon_he;
 #[path = "c1_stage1_direction.rs"]
