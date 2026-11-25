@@ -1137,6 +1137,13 @@ fn cached_mask_grids(
     cell_px: f32,
     guide: Option<&[f32]>,
 ) -> Arc<Vec<Option<Arc<MaskGrid>>>> {
+    // Without shapes every entry is `None`, independent of source, geometry
+    // and guide. Skip the global lock and the key's deep copies entirely; the
+    // old path still cloned `Geometry` and every `Mask` and inserted a
+    // zero-byte entry that the byte-budget trim could never evict.
+    if active.iter().all(|layer| layer.mask.shapes.is_empty()) {
+        return Arc::new(vec![None; active.len()]);
+    }
     const MAX_CACHED_BYTES: usize = 8 * 1024 * 1024;
     static CACHE: OnceLock<
         Mutex<Vec<(MaskGridCacheKey, Arc<Vec<Option<Arc<MaskGrid>>>>)>>,
@@ -1530,6 +1537,12 @@ fn layer_plans<'a>(
         .into_iter()
         .filter(|layer| layer.enabled && layer.opacity > 0.0)
         .collect();
+    // No layer means no grid. Returning before the cache skips the global
+    // mutex, the `Geometry` clone and the per-layer `Mask` clones the key
+    // would make, on every preview frame of an unlayered document.
+    if active.is_empty() {
+        return Vec::new();
+    }
     let grids = cached_mask_grids(src, adj, &active, aspect, cell_px, guide);
     active
         .iter()
@@ -3693,16 +3706,26 @@ fn merge_wide_delta(wide: &mut [u16], before: &[u8], after: &[u8], width: usize)
         .zip(before.par_chunks(row))
         .zip(after.par_chunks(row))
         .for_each(|((wide_line, base_line), after_line)| {
-            for ((px, base), after) in wide_line
+            // Stay on whole pixels, exactly like the old `chunks_exact(4)`
+            // loop, in case a caller ever passes a short trailing chunk.
+            let n = wide_line.len().min(base_line.len()).min(after_line.len()) & !3;
+            // One branch-free integer map over the whole row. i32 keeps every
+            // intermediate exact: `(after-base)*257` is in [-65535, 65535] and
+            // adding the u16 value stays in [-65535, 131070].
+            for i in 0..n {
+                let delta = (i32::from(after_line[i]) - i32::from(base_line[i])) * 257;
+                wide_line[i] = (i32::from(wide_line[i]) + delta).clamp(0, 65535) as u16;
+            }
+            // The uniform map leaves alpha untouched when the 8-bit alphas
+            // match (delta 0); only the changed pixels need the old override.
+            for ((px, base), aft) in wide_line
                 .chunks_exact_mut(4)
                 .zip(base_line.chunks_exact(4))
                 .zip(after_line.chunks_exact(4))
             {
-                for k in 0..3 {
-                    px[k] = (px[k] as i32 + (after[k] as i32 - base[k] as i32) * 257)
-                        .clamp(0, 65535) as u16;
+                if aft[3] != base[3] {
+                    px[3] = u16::from(aft[3]) * 257;
                 }
-                px[3] = if after[3] == base[3] { px[3] } else { after[3] as u16 * 257 };
             }
         });
 }
@@ -9067,6 +9090,82 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         }
         merge_wide_delta(&mut wide, &before, &after, w);
         assert_eq!(wide, expected);
+    }
+
+    /// Frozen copy of the pre-vectorisation `merge_wide_delta`, the bit-exact
+    /// oracle.
+    fn merge_wide_delta_scalar(wide: &mut [u16], before: &[u8], after: &[u8], width: usize) {
+        if width == 0 {
+            return;
+        }
+        let row = width * 4;
+        for ((wide_line, base_line), after_line) in
+            wide.chunks_mut(row).zip(before.chunks(row)).zip(after.chunks(row))
+        {
+            for ((px, base), aft) in wide_line
+                .chunks_exact_mut(4)
+                .zip(base_line.chunks_exact(4))
+                .zip(after_line.chunks_exact(4))
+            {
+                for k in 0..3 {
+                    px[k] = (px[k] as i32 + (aft[k] as i32 - base[k] as i32) * 257)
+                        .clamp(0, 65535) as u16;
+                }
+                px[3] = if aft[3] == base[3] { px[3] } else { aft[3] as u16 * 257 };
+            }
+        }
+    }
+
+    fn merge_lcg_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 56) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wide_delta_matches_scalar_reference_bit_exactly() {
+        for (w, h) in [(1usize, 1usize), (1, 9), (3, 1), (2, 2), (37, 23), (33, 7)] {
+            let len = w * h * 4;
+            let mut before = merge_lcg_bytes(len, 0x243f_6a88_85a3_08d3 ^ (w as u64));
+            // Force both clamp directions and equal/changed alpha.
+            for (i, value) in before.iter_mut().enumerate() {
+                match i % 5 {
+                    0 => *value = 0,
+                    1 => *value = 255,
+                    2 => *value = 128,
+                    _ => {}
+                }
+            }
+            let mut after = before.clone();
+            for (i, value) in after.iter_mut().enumerate() {
+                if (i / 4 + i) % 3 != 0 {
+                    *value = value.wrapping_add(1 + ((i * 17) % 200) as u8);
+                }
+            }
+            // Wide values also cover 0 / 65535 / mid so the i32 clamp is hit.
+            let mut expected: Vec<u16> = (0..len)
+                .map(|i| match i % 6 {
+                    0 => 0,
+                    1 => 65535,
+                    2 => 32768,
+                    _ => (seed_wide(i) >> 7) as u16,
+                })
+                .collect();
+            let mut actual = expected.clone();
+            merge_wide_delta_scalar(&mut expected, &before, &after, w);
+            merge_wide_delta(&mut actual, &before, &after, w);
+            assert_eq!(actual, expected, "w={w} h={h}");
+        }
+    }
+
+    fn seed_wide(i: usize) -> u64 {
+        (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
     }
 
     #[test]

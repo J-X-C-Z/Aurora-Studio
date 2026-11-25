@@ -9,11 +9,12 @@
 //! grow-only and accounted through the shared VRAM ledger (`VramLease`).
 
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use super::gpu_runtime::{self, Failure, Gpu, Slot};
 
-use crate::{LensCorrection, Moire, NoiseReduction, Sharpening};
+use crate::{FilmGrain, LensCorrection, Moire, NoiseReduction, Sharpening};
 
 const PTX: &str = include_str!("../../native/cuda/detail_gpu.ptx");
 const BLOCK: (u32, u32) = (16, 16);
@@ -287,7 +288,12 @@ pub(crate) fn post_process_bench(
     post_process_with(gpu, rgba, w, h, nr, moire, sh, lens, scale)
 }
 
-pub(crate) fn post_process_pool(
+/// Uploads `rgba` into `Slot::Frame` and runs whichever detail kernels are
+/// active. `Ok(None)` means nothing was active (or the shape is invalid): no
+/// upload happened and the slot does not hold this frame. `Ok(Some(base))` is
+/// the device handle of the post-detail RGBA8 frame; every kernel writes back
+/// to `p_rgba = base`, so the result is always at the slot base.
+fn launch_detail_chain(
     gpu: &mut Gpu,
     rgba: &mut [u8],
     w: usize,
@@ -297,7 +303,7 @@ pub(crate) fn post_process_pool(
     sh: &Sharpening,
     lens: &LensCorrection,
     scale: f32,
-) -> Result<(), Failure> {
+) -> Result<Option<u64>, Failure> {
     let lum_active = nr.luminance > 0.0 || nr.single_pixel > 0.0;
     let color_active = nr.color > 0.0;
     let moire_active = moire.amount > 0.0;
@@ -307,12 +313,12 @@ pub(crate) fn post_process_pool(
         || lens.chromatic_aberration
         || lens.purple_fringing > 0.0;
     if !lum_active && !color_active && !moire_active && !sharp_active && !lens_active {
-        return Ok(());
+        return Ok(None);
     }
     let planes = plane_count(lum_active, color_active, moire_active, sharp_active, lens_active);
-    let Some(pixels) = w.checked_mul(h) else { return Ok(()) };
+    let Some(pixels) = w.checked_mul(h) else { return Ok(None) };
     if pixels == 0 || rgba.len() != pixels.saturating_mul(4) {
-        return Ok(());
+        return Ok(None);
     }
     let bytes = pixels * 4;
     if gpu.slot_bytes(Slot::Frame) < bytes.saturating_mul(planes) {
@@ -477,8 +483,218 @@ pub(crate) fn post_process_pool(
         ])?;
     }
 
-    gpu.download(Slot::Frame, rgba)?;
+    Ok(Some(base))
+}
+
+/// Classic two-copy entry point: run the chain, then download the frame.
+pub(crate) fn post_process_pool(
+    gpu: &mut Gpu,
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    moire: &Moire,
+    sh: &Sharpening,
+    lens: &LensCorrection,
+    scale: f32,
+) -> Result<(), Failure> {
+    if launch_detail_chain(gpu, rgba, w, h, nr, moire, sh, lens, scale)?.is_some() {
+        gpu.download(Slot::Frame, rgba)?;
+    }
     Ok(())
+}
+
+/// A detail frame left resident on the device for the grain stage.
+///
+/// Holding the stage mutex is the handoff pin: `release_retained` reclaims with
+/// `try_lock`, so while this guard exists the reclaim hook cannot drop the
+/// pool. The frame's bytes therefore stay on `detail`'s existing
+/// [`gpu_runtime::VramLease`]: the handoff takes no second lease and releases
+/// nothing early, so the ledger never double-bills or prematurely frees the
+/// frame.
+pub(crate) struct DetailResident {
+    state: MutexGuard<'static, State>,
+    handle: u64,
+    pixels: usize,
+}
+
+impl DetailResident {
+    /// Device handle of the post-detail RGBA8 frame (the `Slot::Frame` base the
+    /// detail kernels wrote; grain reads and rewrites the same bytes).
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// Row-major RGBA8 bytes of the frame.
+    pub(crate) fn bytes(&self) -> usize {
+        self.pixels.saturating_mul(4)
+    }
+
+    /// Downloads the resident frame into `rgba`. The grain rollback path uses
+    /// this so the host never keeps a partially applied stage.
+    pub(crate) fn download(&mut self, rgba: &mut [u8]) -> Result<(), Failure> {
+        match &mut *self.state {
+            State::Ready(pool) => pool.gpu.download(Slot::Frame, rgba),
+            State::NotTried | State::Unavailable => Err(Failure::Unavailable("detail_gpu")),
+        }
+    }
+
+    /// Records one completed handoff: one frame-sized H2D (grain's upload) and
+    /// one frame-sized D2H (detail's download) were made unnecessary.
+    pub(crate) fn note_handoff_complete(&mut self) {
+        let bytes = self.bytes();
+        RESIDENT_SKIPPED_H2D.fetch_add(1, Ordering::Relaxed);
+        RESIDENT_SKIPPED_H2D_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        RESIDENT_SKIPPED_D2H.fetch_add(1, Ordering::Relaxed);
+        RESIDENT_SKIPPED_D2H_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        if let State::Ready(pool) = &mut *self.state {
+            pool.gpu.note_skipped_download();
+        }
+        log::debug!(
+            "detail_gpu: resident handoff kept {bytes} B on the device (skipped one H2D and one D2H)"
+        );
+    }
+}
+
+/// Process-wide transfers the resident detail->grain handoff made unnecessary.
+static RESIDENT_SKIPPED_H2D: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SKIPPED_H2D_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SKIPPED_D2H: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_SKIPPED_D2H_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(skipped H2D count, skipped H2D bytes, skipped D2H count, skipped D2H
+/// bytes)`. Only fully completed handoffs advance these counters, so a non-zero
+/// result is the acceptance proof that the reuse actually happened.
+pub(crate) fn resident_savings() -> (u64, u64, u64, u64) {
+    (
+        RESIDENT_SKIPPED_H2D.load(Ordering::Relaxed),
+        RESIDENT_SKIPPED_H2D_BYTES.load(Ordering::Relaxed),
+        RESIDENT_SKIPPED_D2H.load(Ordering::Relaxed),
+        RESIDENT_SKIPPED_D2H_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Same reservation and state contract as [`post_process`], but on success the
+/// post-detail frame stays in `Slot::Frame` and is returned instead of being
+/// downloaded. `Ok(None)` means the chain had nothing active, so no upload
+/// happened and `rgba` already is the post-detail frame.
+pub(crate) fn post_process_resident(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    moire: &Moire,
+    sh: &Sharpening,
+    lens: &LensCorrection,
+    scale: f32,
+) -> Result<Option<DetailResident>, Failure> {
+    let lum_active = nr.luminance > 0.0 || nr.single_pixel > 0.0;
+    let color_active = nr.color > 0.0;
+    let moire_active = moire.amount > 0.0;
+    let sharp_active = sh.amount > 0.0;
+    let lens_active = lens.distortion != 0.0
+        || lens.light_falloff != 0.0
+        || lens.chromatic_aberration
+        || lens.purple_fringing > 0.0;
+    if !lum_active && !color_active && !moire_active && !sharp_active && !lens_active {
+        return Ok(None);
+    }
+    let planes = plane_count(lum_active, color_active, moire_active, sharp_active, lens_active);
+    let Some(pixels) = w.checked_mul(h) else {
+        return Err(Failure::Invalid("detail frame"));
+    };
+    let bytes = pixels.saturating_mul(4);
+    if bytes == 0 || rgba.len() != bytes {
+        return Err(Failure::Invalid("detail frame"));
+    }
+    let Some(need) = retained_bytes(pixels, planes) else {
+        return Err(Failure::Invalid("detail frame"));
+    };
+    if need > retained_cap() || !gpu_runtime::vram_can_allocate("detail", need) {
+        let failure = Failure::TooLarge { need, cap: retained_cap() };
+        gpu_runtime::note_fallback("detail", &failure);
+        return Err(failure);
+    }
+    register_reclaimer();
+    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+    let launched = match &mut *state {
+        State::Unavailable => Err(Failure::Unavailable("detail_gpu")),
+        State::NotTried => match DetailPool::open(bytes, planes) {
+            Ok(mut pool) => {
+                let result = pool.ensure(bytes, planes).and_then(|()| {
+                    launch_detail_chain(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale)
+                });
+                if result.is_ok() {
+                    *state = State::Ready(pool);
+                }
+                result
+            }
+            Err(failure) => {
+                *state = State::Unavailable;
+                Err(failure)
+            }
+        },
+        State::Ready(pool) => pool.ensure(bytes, planes).and_then(|()| {
+            launch_detail_chain(&mut pool.gpu, rgba, w, h, nr, moire, sh, lens, scale)
+        }),
+    };
+    match launched {
+        Ok(handle) => Ok(handle.map(|handle| DetailResident { state, handle, pixels })),
+        Err(failure) => {
+            log::warn!("detail_gpu: {failure:?}; staying on CPU");
+            gpu_runtime::note_fallback("detail", &failure);
+            Err(failure)
+        }
+    }
+}
+
+/// How [`super::detail::post_process_impl`] continues after the resident
+/// detail->grain attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentGrain {
+    /// Detail and grain both ran on the device and the final frame was
+    /// downloaded; the caller is done.
+    Applied,
+    /// Detail is applied on the host and grain still has to run: either the
+    /// chain was inactive (nothing to upload) or grain refused/failed and the
+    /// post-detail frame was restored. The caller skips a second detail attempt
+    /// and lets the normal grain tail run.
+    DetailRestored,
+    /// The frame never reached the host (detail failed, or the device was lost
+    /// before the download). `rgba` holds the pre-detail bytes, so the caller
+    /// reruns the whole detail path on the CPU: exactly what today's code does
+    /// when the detail attempt or its download fails.
+    CpuEverything,
+}
+
+/// Detail plus grain in one handoff. Only called for a plan whose CPU-split
+/// flags are all clear (see `DetailStagePlan::resident_to_grain`), so no host
+/// rewrite can sit between the detail device frame and grain.
+pub(crate) fn post_process_resident_grain(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    nr: &NoiseReduction,
+    moire: &Moire,
+    sh: &Sharpening,
+    lens: &LensCorrection,
+    scale: f32,
+    grain: &FilmGrain,
+) -> ResidentGrain {
+    let mut resident = match post_process_resident(rgba, w, h, nr, moire, sh, lens, scale) {
+        Ok(Some(resident)) => resident,
+        // No detail operator touched the frame: `rgba` already is the
+        // post-detail frame, so the tail can run grain on it.
+        Ok(None) => return ResidentGrain::DetailRestored,
+        // Same failure contract as `post_process`: the host frame is untouched,
+        // so rerun everything on the CPU.
+        Err(_) => return ResidentGrain::CpuEverything,
+    };
+    match super::pixel_gpu::grain_stage_resident(&mut resident, rgba, w, h, grain, scale) {
+        super::pixel_gpu::GrainResident::Applied => ResidentGrain::Applied,
+        super::pixel_gpu::GrainResident::Restored => ResidentGrain::DetailRestored,
+        super::pixel_gpu::GrainResident::RestoreFailed => ResidentGrain::CpuEverything,
+    }
 }
 
 fn ptr<T>(value: &mut T) -> *mut c_void {
@@ -594,8 +810,8 @@ mod tests {
 
         // The old six-plane formula was bytes * 6; a 32 MP four-plane frame
         // must not reserve more than the old shape did.
-        let frame_32mp = MAX_RETAINED_FRAME_BYTES / 4;
-        assert!(retained_bytes(frame_32mp, 4).unwrap() < frame_32mp * 6 + 1025 * 4);
+        let pixels_32mp = MAX_RETAINED_FRAME_BYTES / 4;
+        assert!(retained_bytes(pixels_32mp, 4).unwrap() < pixels_32mp * 4 * 6 + 1025 * 4);
 
         // Checked arithmetic: a huge frame returns None instead of wrapping.
         assert!(retained_bytes(usize::MAX / 8, 4).is_none());

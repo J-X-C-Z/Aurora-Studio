@@ -271,6 +271,7 @@ fn with_pool<T>(
     }
 }
 
+use super::detail_gpu::DetailResident;
 use super::gpu_runtime::{self, Failure, Gpu, Slot};
 use super::gpu_runtime::{grid2, ptr};
 
@@ -708,113 +709,211 @@ pub(crate) fn grain_stage(
             .gpu
             .handle(Slot::Frame)
             .ok_or(Failure::Invalid("frame slot"))?;
-        let tap_handle = pool.taps();
-        let stats_handle = pool.stats();
         pool.gpu.upload(Slot::Frame, rgba)?;
+        grain_kernels(pool, rgba_handle, w, h, adj, amount, &taps, radius, ox as u32, oy as u32)?;
+        pool.gpu.download(Slot::Frame, rgba)
+    })
+    .is_some()
+}
+
+/// Runs the grain kernels against the frame already resident at `rgba_handle`
+/// (`w*h*4` RGBA8 bytes). Uploads the erf taps when the composite path needs
+/// them and never downloads: the caller decides where the frame goes next,
+/// which is what lets the resident detail->grain handoff skip grain's upload.
+#[allow(clippy::too_many_arguments)]
+fn grain_kernels(
+    pool: &mut Pool,
+    rgba_handle: u64,
+    w: usize,
+    h: usize,
+    adj: &FilmGrain,
+    amount: f32,
+    taps: &[f32],
+    radius: i32,
+    ox: u32,
+    oy: u32,
+) -> Result<(), Failure> {
+    let composite = adj.kind.uses_erf_blur();
+    let tap_handle = pool.taps();
+    let stats_handle = pool.stats();
+    if !taps.is_empty() {
+        let tap_slice = unsafe {
+            std::slice::from_raw_parts(taps.as_ptr() as *const u8, taps.len() * 4)
+        };
+        pool.gpu.upload_to(&pool.taps.0, tap_slice)?;
+    }
+    let (mut w_i, mut h_i) = (w as i32, h as i32);
+    let (mut ox, mut oy) = (ox, oy);
+    let mut rgba_ptr = rgba_handle;
+    let mut plane = pool
+        .gpu
+        .handle(Slot::Scratch)
+        .ok_or(Failure::Invalid("plane slot"))?;
+    let mut tmp = pool
+        .gpu
+        .handle(Slot::Aux0)
+        .ok_or(Failure::Invalid("tmp slot"))?;
+    if !composite {
+        let mut gain = amount * super::grain::GRAIN_GAIN_V1;
+        launch2(&mut pool.gpu, "grain_v1_kernel", w, h, [
+            ptr(&mut rgba_ptr),
+            ptr(&mut w_i),
+            ptr(&mut h_i),
+            ptr(&mut gain),
+            ptr(&mut ox),
+            ptr(&mut oy),
+        ])?;
+        Ok(())
+    } else {
+        launch2(
+            &mut pool.gpu,
+            "grain_plane_kernel",
+            w,
+            h,
+            [ptr(&mut plane), ptr(&mut w_i), ptr(&mut h_i), ptr(&mut ox), ptr(&mut oy)],
+        )?;
         if !taps.is_empty() {
-            let tap_slice = unsafe {
-                std::slice::from_raw_parts(taps.as_ptr() as *const u8, taps.len() * 4)
-            };
-            pool.gpu.upload_to(&pool.taps.0, tap_slice)?;
-        }
-        let (mut w_i, mut h_i) = (w as i32, h as i32);
-        let (mut ox, mut oy) = (ox, oy);
-        let mut rgba_ptr = rgba_handle;
-        let mut plane = pool
-            .gpu
-            .handle(Slot::Scratch)
-            .ok_or(Failure::Invalid("plane slot"))?;
-        let mut tmp = pool
-            .gpu
-            .handle(Slot::Aux0)
-            .ok_or(Failure::Invalid("tmp slot"))?;
-        if !composite {
-            let mut gain = amount * super::grain::GRAIN_GAIN_V1;
-            launch2(&mut pool.gpu, "grain_v1_kernel", w, h, [
-                ptr(&mut rgba_ptr),
+            let mut r = radius;
+            let mut tap_ptr = tap_handle;
+            launch2(&mut pool.gpu, "grain_blur_h_kernel", w, h, [
+                ptr(&mut plane),
+                ptr(&mut tmp),
                 ptr(&mut w_i),
                 ptr(&mut h_i),
-                ptr(&mut gain),
-                ptr(&mut ox),
-                ptr(&mut oy),
+                ptr(&mut r),
+                ptr(&mut tap_ptr),
             ])?;
-            pool.gpu.download(Slot::Frame, rgba)
-        } else {
-            launch2(
-                &mut pool.gpu,
-                "grain_plane_kernel",
-                w,
-                h,
-                [ptr(&mut plane), ptr(&mut w_i), ptr(&mut h_i), ptr(&mut ox), ptr(&mut oy)],
-            )?;
-            if !taps.is_empty() {
-                let mut r = radius;
-                let mut tap_ptr = tap_handle;
-                launch2(&mut pool.gpu, "grain_blur_h_kernel", w, h, [
-                    ptr(&mut plane),
-                    ptr(&mut tmp),
-                    ptr(&mut w_i),
-                    ptr(&mut h_i),
-                    ptr(&mut r),
-                    ptr(&mut tap_ptr),
-                ])?;
-                launch2(&mut pool.gpu, "grain_blur_v_kernel", w, h, [
-                    ptr(&mut tmp),
-                    ptr(&mut plane),
-                    ptr(&mut w_i),
-                    ptr(&mut h_i),
-                    ptr(&mut r),
-                    ptr(&mut tap_ptr),
-                ])?;
-            }
-            // Row totals, then one block over the rows: deterministic order.
-            let row_base = pool
-                .gpu
-                .handle(Slot::Aux2)
-                .ok_or(Failure::Invalid("row totals slot"))?;
-            let mut row_sum = row_base;
-            let mut row_sq = row_base + h as u64 * 4;
-            pool.gpu.launch(
-                "grain_row_stats_kernel",
-                (h as u32, 1),
-                (256, 1),
-                &mut [
-                    ptr(&mut plane),
-                    ptr(&mut row_sum),
-                    ptr(&mut row_sq),
-                    ptr(&mut w_i),
-                    ptr(&mut h_i),
-                ],
-            )?;
-            let mut inv_n = 1.0f32 / (w * h) as f32;
-            let mut sd_out = stats_handle;
-            pool.gpu.launch(
-                "grain_reduce_stats_kernel",
-                (1, 1),
-                (256, 1),
-                &mut [
-                    ptr(&mut row_sum),
-                    ptr(&mut row_sq),
-                    ptr(&mut h_i),
-                    ptr(&mut inv_n),
-                    ptr(&mut sd_out),
-                ],
-            )?;
-            let mut sd_bytes = [0u8; 4];
-            pool.gpu.download_from(&pool.stats.0, &mut sd_bytes)?;
-            let sd = f32::from_le_bytes(sd_bytes).max(1e-6);
-            let mut gain = amount * adj.kind.v8_amplitude(adj.granularity) / (sd * 257.0);
-            launch2(&mut pool.gpu, "grain_v8_kernel", w, h, [
-                ptr(&mut rgba_ptr),
+            launch2(&mut pool.gpu, "grain_blur_v_kernel", w, h, [
+                ptr(&mut tmp),
                 ptr(&mut plane),
                 ptr(&mut w_i),
                 ptr(&mut h_i),
-                ptr(&mut gain),
+                ptr(&mut r),
+                ptr(&mut tap_ptr),
             ])?;
-            pool.gpu.download(Slot::Frame, rgba)
         }
-    })
-    .is_some()
+        // Row totals, then one block over the rows: deterministic order.
+        let row_base = pool
+            .gpu
+            .handle(Slot::Aux2)
+            .ok_or(Failure::Invalid("row totals slot"))?;
+        let mut row_sum = row_base;
+        let mut row_sq = row_base + h as u64 * 4;
+        pool.gpu.launch(
+            "grain_row_stats_kernel",
+            (h as u32, 1),
+            (256, 1),
+            &mut [
+                ptr(&mut plane),
+                ptr(&mut row_sum),
+                ptr(&mut row_sq),
+                ptr(&mut w_i),
+                ptr(&mut h_i),
+            ],
+        )?;
+        let mut inv_n = 1.0f32 / (w * h) as f32;
+        let mut sd_out = stats_handle;
+        pool.gpu.launch(
+            "grain_reduce_stats_kernel",
+            (1, 1),
+            (256, 1),
+            &mut [
+                ptr(&mut row_sum),
+                ptr(&mut row_sq),
+                ptr(&mut h_i),
+                ptr(&mut inv_n),
+                ptr(&mut sd_out),
+            ],
+        )?;
+        let mut sd_bytes = [0u8; 4];
+        pool.gpu.download_from(&pool.stats.0, &mut sd_bytes)?;
+        let sd = f32::from_le_bytes(sd_bytes).max(1e-6);
+        let mut gain = amount * adj.kind.v8_amplitude(adj.granularity) / (sd * 257.0);
+        launch2(&mut pool.gpu, "grain_v8_kernel", w, h, [
+            ptr(&mut rgba_ptr),
+            ptr(&mut plane),
+            ptr(&mut w_i),
+            ptr(&mut h_i),
+            ptr(&mut gain),
+        ])?;
+        Ok(())
+    }
+}
+
+/// Outcome of running grain over a [`DetailResident`] frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrainResident {
+    /// Grain kernels ran on the resident frame and the final frame was
+    /// downloaded into `rgba`; the caller is done.
+    Applied,
+    /// Grain refused or failed before the frame was downloaded; `rgba` was
+    /// restored from the device and holds the post-detail frame for the CPU
+    /// grain stage.
+    Restored,
+    /// The device was lost before the frame could be downloaded; `rgba` still
+    /// holds the pre-detail bytes and the caller must rerun the whole CPU
+    /// detail path.
+    RestoreFailed,
+}
+
+fn restore_for_cpu_grain(resident: &mut DetailResident, rgba: &mut [u8]) -> GrainResident {
+    match resident.download(rgba) {
+        Ok(()) => GrainResident::Restored,
+        Err(_) => GrainResident::RestoreFailed,
+    }
+}
+
+/// Grain on the frame `detail_gpu` left resident on the device: the frame is
+/// never uploaded and exactly one download brings the final bytes back. The
+/// frame's lease stays with `detail` (see [`DetailResident`]), so its bytes are
+/// charged once and never released here.
+pub(crate) fn grain_stage_resident(
+    resident: &mut DetailResident,
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    adj: &FilmGrain,
+    scale: f32,
+) -> GrainResident {
+    let amount = (adj.impact / 100.0).clamp(0.0, 1.0);
+    if amount <= 0.0 || w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return restore_for_cpu_grain(resident, rgba);
+    }
+    if !enabled(Op::Grain) {
+        return restore_for_cpu_grain(resident, rgba);
+    }
+    let Some(bytes) = w.checked_mul(h).and_then(|n| n.checked_mul(4)) else {
+        return restore_for_cpu_grain(resident, rgba);
+    };
+    let composite = adj.kind.uses_erf_blur();
+    let zoom = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let sigma = if adj.impact.is_finite() && adj.impact > 0.0 { adj.sigma_px() * zoom } else { 0.0 };
+    let (radius, taps) = if composite && sigma > 0.0 {
+        let taps = super::grain::erf_taps(sigma);
+        ((taps.len() / 2) as i32, taps)
+    } else {
+        (0, Vec::new())
+    };
+    let node_bytes = (h * 8).max(12);
+    let (ox, oy) = super::grain::noise_offsets();
+    let frame = resident.handle();
+
+    let ran = with_pool(bytes, node_bytes, taps.len() * 4, |pool| {
+        // This call replaces grain's own frame upload: the pixels are already
+        // on the device in the detail frame slot.
+        pool.gpu.note_skipped_upload();
+        grain_kernels(pool, frame, w, h, adj, amount, &taps, radius, ox as u32, oy as u32)
+    });
+    match ran {
+        Some(()) => match resident.download(rgba) {
+            Ok(()) => {
+                resident.note_handoff_complete();
+                GrainResident::Applied
+            }
+            Err(_) => GrainResident::RestoreFailed,
+        },
+        None => restore_for_cpu_grain(resident, rgba),
+    }
 }
 
 // ─────────────────────────────── tests ────────────────────────────────────
