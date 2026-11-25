@@ -57,6 +57,12 @@ mod engine;
 pub mod job_lifecycle;
 /// Stages migrated out of `mock` (with compatibility re-exports).
 pub mod processing;
+/// Production render pipeline facade and `RenderPlan` execution bridge.
+pub mod render;
+/// Layered export pipeline (`ExportPlan`, `Encoder`, `MetadataWriter`, `AtomicPublisher`).
+pub mod export;
+/// Unified portrait effect descriptor and capability registry.
+pub mod portrait_registry;
 mod exif;
 mod file_engine;
 pub mod param_contract;
