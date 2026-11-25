@@ -11,6 +11,7 @@ pub(in crate::aurora_raw) use render::{
     apply_linear_chromatic_aberration, apply_linear_color_noise_2012,
     recover_and_antialias_frame,
 };
+pub(crate) use reconstruct::is_verified_he_nef;
 
 use anyhow::{Context, Result, ensure};
 use std::io::{Seek, Write};

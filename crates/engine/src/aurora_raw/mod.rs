@@ -79,6 +79,24 @@ pub fn decode_he_rgba16_traced(
     decode_he_rgba16_with(&bytes, &exif, libraw_frame.as_ref(), &mut timings)
 }
 
+/// Whether the Aurora chain can produce this file without a LibRaw Bayer plane,
+/// so LibRaw must not be opened before it.
+///
+/// Only the verified Z6III HE profile qualifies: its reconstruction decodes the
+/// codestream itself. Generic Bayer / X-Trans still need LibRaw's plane, so the
+/// caller keeps the LibRaw-first order for everything else.
+pub(crate) fn route_skips_libraw(route: &crate::raw::DecodeRoute, bytes: &[u8]) -> bool {
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    {
+        route.z6iii_nef && route.z6iii_feature && z6iii::is_verified_he_nef(bytes)
+    }
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    {
+        let _ = (route, bytes);
+        false
+    }
+}
+
 /// The same chain over a caller-provided decode context: the file bytes, the
 /// EXIF parsed from them and the LibRaw Bayer frame are reused instead of read
 /// again. Stage wall times are added to `timings` for the per-format report.

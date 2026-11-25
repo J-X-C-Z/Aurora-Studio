@@ -137,7 +137,7 @@ pub fn build_immediate_historical_skin_inputs(
     }
     frame.validate()?;
     let size = [frame.width, frame.height];
-    let frame_sha256 = sha256_32(&frame.pixels);
+    let frame_sha256 = super::portrait_face_input_stage::frame_digest(frame);
     let parsed_skin = project_face_parsing_skin_mask(parsing, frame.width, frame.height)?;
     let mut built = BTreeMap::new();
     for mut row in inputs.rows {

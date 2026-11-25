@@ -38,8 +38,55 @@ pub struct Source {
 pub(crate) struct Plane {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    /// Linear-light RGB.
+    /// Linear-light RGB. Empty on a deferred level until it is first sampled.
     pub(crate) data: Vec<[f32; 3]>,
+    /// Deferred 2x2 box average. Only native RAW sources use this; level 0 and
+    /// every eager source keep `None` and their pixels in `data`.
+    lazy: Option<OnceLock<Vec<[f32; 3]>>>,
+}
+
+impl Plane {
+    fn ready(width: u32, height: u32, data: Vec<[f32; 3]>) -> Self {
+        Self { width, height, data, lazy: None }
+    }
+
+    fn deferred(width: u32, height: u32) -> Self {
+        Self { width, height, data: Vec::new(), lazy: Some(OnceLock::new()) }
+    }
+
+    /// Bytes this level owns or has reserved.
+    ///
+    /// A deferred level is charged its full payload before it is built, so the
+    /// native source slot never publishes a budget that grows behind its back.
+    /// Once built, the larger of the reservation and the allocator's capacity
+    /// is charged; the next native cache hit re-reads this value.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let pixels = self.data.capacity().saturating_add(self.lazy.as_ref().map_or(0, |slot| {
+            let planned = (self.width as usize).saturating_mul(self.height as usize);
+            slot.get().map_or(planned, |data| data.capacity().max(planned))
+        }));
+        pixels.saturating_mul(std::mem::size_of::<[f32; 3]>())
+    }
+}
+
+/// The one 2x2 box average used by both eager and deferred mip tails. Keeping
+/// it in one place is what makes a lazily built level bit-identical to the
+/// level an eager source built up front.
+fn box_downscale(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
+    (0..(w * h) as usize)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = ((i as u32 % w) * 2, (i as u32 / w) * 2);
+            let mut acc = [0.0; 3];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let p = prev[((y + dy) * prev_width + x + dx) as usize];
+                for k in 0..3 {
+                    acc[k] += p[k] * 0.25;
+                }
+            }
+            acc
+        })
+        .collect()
 }
 
 fn srgb_to_linear(v: f32) -> f32 {
@@ -602,13 +649,45 @@ impl Source {
         Self::from_linear(width, height, data)
     }
 
+    /// RGBA16 source whose mip tail is built on first use.
+    ///
+    /// Only the full-sensor RAW path (`long_side == 0`) uses this: a 24/45 MP
+    /// native frame otherwise allocates its whole tail before any zoom-out
+    /// request. The logical level count and the 2x2 box average are identical
+    /// to [`Self::from_rgba16`], so every sampled pixel stays bit-identical.
+    pub(crate) fn from_rgba16_native(width: u32, height: u32, rgba: &[u16]) -> Self {
+        let data: Vec<[f32; 3]> = rgba
+            .par_chunks_exact(4)
+            .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
+            .collect();
+        Self::from_linear_with_mips(width, height, data, true)
+    }
+
+    /// Packed RGB16 counterpart of [`Self::from_rgba16_native`].
+    pub(crate) fn from_rgb16_native(width: u32, height: u32, rgb: &[u16]) -> Self {
+        let data: Vec<[f32; 3]> = rgb
+            .par_chunks_exact(3)
+            .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
+            .collect();
+        Self::from_linear_with_mips(width, height, data, true)
+    }
+
     /// Wraps level 0 and builds the mip chain shared by both bit depths.
     /// A zero-size or short frame becomes one black pixel so `sample` stays in bounds.
-    fn from_linear(width: u32, height: u32, mut data: Vec<[f32; 3]>) -> Self {
+    fn from_linear(width: u32, height: u32, data: Vec<[f32; 3]>) -> Self {
+        Self::from_linear_with_mips(width, height, data, false)
+    }
+
+    fn from_linear_with_mips(
+        width: u32,
+        height: u32,
+        mut data: Vec<[f32; 3]>,
+        lazy_mips: bool,
+    ) -> Self {
         if width == 0 || height == 0 || data.len() < (width as usize) * (height as usize) {
             return Self {
                 snapshot_id: Self::next_snapshot_id(),
-                levels: vec![Plane { width: 1, height: 1, data: vec![[0.0; 3]] }],
+                levels: vec![Plane::ready(1, 1, vec![[0.0; 3]])],
                 lens_shot: None,
                 lens_auto: None,
                 camera_preview: false,
@@ -621,25 +700,16 @@ impl Source {
             };
         }
         data.truncate((width as usize) * (height as usize));
-        let mut levels = vec![Plane { width, height, data }];
+        let mut levels = vec![Plane::ready(width, height, data)];
         while levels.last().is_some_and(|l| l.width > 256 && l.height > 256) {
             let prev = levels.last().unwrap();
             let (w, h) = (prev.width / 2, prev.height / 2);
-            let data: Vec<[f32; 3]> = (0..(w * h) as usize)
-                .into_par_iter()
-                .map(|i| {
-                    let (x, y) = ((i as u32 % w) * 2, (i as u32 / w) * 2);
-                    let mut acc = [0.0; 3];
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let p = prev.data[((y + dy) * prev.width + x + dx) as usize];
-                        for k in 0..3 {
-                            acc[k] += p[k] * 0.25;
-                        }
-                    }
-                    acc
-                })
-                .collect();
-            levels.push(Plane { width: w, height: h, data });
+            if lazy_mips {
+                levels.push(Plane::deferred(w, h));
+            } else {
+                let data = box_downscale(&prev.data, prev.width, w, h);
+                levels.push(Plane::ready(w, h, data));
+            }
         }
         Self {
             snapshot_id: Self::next_snapshot_id(),
@@ -654,6 +724,21 @@ impl Source {
             fingerprint: OnceLock::new(),
             face_rgba8: OnceLock::new(),
         }
+    }
+
+    /// Pixels of one logical mip level, building a deferred level and every
+    /// missing parent on first access. Concurrent callers share one build.
+    fn level_data(&self, level: usize) -> &[[f32; 3]] {
+        let index = level.min(self.levels.len() - 1);
+        let plane = &self.levels[index];
+        let Some(slot) = &plane.lazy else {
+            return &plane.data;
+        };
+        slot.get_or_init(|| {
+            debug_assert!(index > 0, "level 0 is never deferred");
+            let parent = self.level_data(index - 1);
+            box_downscale(parent, self.levels[index - 1].width, plane.width, plane.height)
+        })
     }
 
     pub(crate) fn size(&self) -> (u32, u32) {
@@ -810,6 +895,7 @@ impl Source {
             return None;
         }
         let plane = &self.levels[level.min(self.levels.len() - 1)];
+        let data = self.level_data(level);
         // `.max(0.0)` keeps the one-pixel planes of an empty source in range.
         let x = (sx * plane.width as f32 - 0.5).clamp(0.0, (plane.width as f32 - 1.001).max(0.0));
         let y = (sy * plane.height as f32 - 0.5).clamp(0.0, (plane.height as f32 - 1.001).max(0.0));
@@ -817,7 +903,7 @@ impl Source {
         let (tx, ty) = (x - x0 as f32, y - y0 as f32);
         let x1 = (x0 + 1).min(plane.width - 1);
         let y1 = (y0 + 1).min(plane.height - 1);
-        let at = |xx: u32, yy: u32| plane.data[(yy * plane.width + xx) as usize];
+        let at = |xx: u32, yy: u32| data[(yy * plane.width + xx) as usize];
         let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
         let mut out = [0.0; 3];
         for k in 0..3 {
@@ -835,13 +921,14 @@ impl Source {
             return None;
         }
         let plane = &self.levels[level.min(self.levels.len() - 1)];
+        let data = self.level_data(level);
         let (w, h) = (plane.width as i64, plane.height as i64);
         let x = (sx * w as f32 - 0.5).clamp(0.0, (w as f32 - 1.001).max(0.0));
         let y = (sy * h as f32 - 0.5).clamp(0.0, (h as f32 - 1.001).max(0.0));
         let (x0, y0) = (x as i64, y as i64);
         let (tx, ty) = (x - x0 as f32, y - y0 as f32);
         let at = |xx: i64, yy: i64| {
-            plane.data[(yy.clamp(0, h - 1) * w + xx.clamp(0, w - 1)) as usize]
+            data[(yy.clamp(0, h - 1) * w + xx.clamp(0, w - 1)) as usize]
         };
         let mut out = [0.0; 3];
         for k in 0..3 {
@@ -2350,65 +2437,43 @@ fn gpu_develop_preflight(
     Some(params)
 }
 
-/// Identity of what the dust model is shown: the source snapshot, its geometry,
-/// the region and the frame size. Colour, tone and every other slider stay out,
-/// so dragging exposure/WB/curves reuses the detection mask (C1 detects on the
-/// base image).
-fn dust_frame_key(
+/// Identity of what the dust model is shown.
+///
+/// The model runs on the developed frame (`render_sized` passes the buffer that
+/// the develop and detail stages just wrote), so the key has to cover every
+/// stage that runs before detection — characterization, geometry/lens, develop
+/// and detail. Those are exactly the four groups hashed by
+/// `preview_cache::dust_input_fingerprint`; the schema test there assigns every
+/// adjustment field to one group, so a newly added field cannot silently escape
+/// the key. `local` (spots/layers/nodes) and `portrait` (retouch/extras) are
+/// applied after detection and deliberately stay out.
+fn dust_input_key(
     src: &Source,
-    geometry: &Geometry,
+    adj: &AdjustmentSet,
     region: NormRect,
     out_w: u32,
     out_h: u32,
-) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    src.snapshot_id().hash(&mut hasher);
-    hash_geometry(geometry, &mut hasher);
-    for value in [region.x, region.y, region.width, region.height] {
-        value.to_bits().hash(&mut hasher);
-    }
-    out_w.hash(&mut hasher);
-    out_h.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
-    geometry.rotation.to_bits().hash(hasher);
-    geometry.orientation.hash(hasher);
-    geometry.flip_horizontal.hash(hasher);
-    geometry.flip_vertical.hash(hasher);
-    geometry.crop_outside_image.hash(hasher);
-    for value in [
-        geometry.crop.x,
-        geometry.crop.y,
-        geometry.crop.width,
-        geometry.crop.height,
-        geometry.canvas[0],
-        geometry.canvas[1],
-        geometry.optical_center[0],
-        geometry.optical_center[1],
-    ] {
-        value.to_bits().hash(hasher);
-    }
-    geometry.aspect.hash(hasher);
-    geometry.portrait.hash(hasher);
-    let keystone = &geometry.keystone;
-    for value in [
-        keystone.vertical,
-        keystone.horizontal,
-        keystone.amount,
-        keystone.aspect,
-        keystone.skew,
-        keystone.focal_length,
-    ] {
-        value.to_bits().hash(hasher);
-    }
-    keystone.flags.hash(hasher);
-    for axis in [&geometry.distortion.v, &geometry.distortion.x, &geometry.distortion.m] {
-        axis.len().hash(hasher);
-        for value in axis {
-            value.to_bits().hash(hasher);
-        }
+    scale: f32,
+    level: usize,
+    wide: bool,
+) -> crate::dustdetect::DustInputKey {
+    let params = crate::preview_cache::dust_input_fingerprint(adj);
+    crate::dustdetect::DustInputKey {
+        source: src.snapshot_id(),
+        characterization: params.characterization,
+        geometry: params.geometry,
+        develop: params.develop,
+        detail: params.detail,
+        region: [
+            region.x.to_bits(),
+            region.y.to_bits(),
+            region.width.to_bits(),
+            region.height.to_bits(),
+        ],
+        out: [out_w, out_h],
+        scale_bits: scale.to_bits(),
+        level: level as u32,
+        wide,
     }
 }
 
@@ -3289,11 +3354,55 @@ fn render_sized(
         let work_h = out_h as usize + 2 * halo;
         let mut rgb_f32 = take_f32_frame(work_w * work_h);
         let mut gpu_filled = false;
+        // L3 stage cache: the develop frame before detail. The key holds the
+        // develop revision plus every sampling dependency, so a sharpening,
+        // noise-reduction, layer or portrait change reuses this frame instead
+        // of re-running sampling and the whole tone chain.
+        // The numeric path this render will take, from the same preflight that
+        // decides `gpu_develop`. Deriving it here (rather than from the last
+        // fill's global) keeps the key from lagging one frame, which could
+        // serve a GPU-filled frame to a CPU path or the reverse.
+        #[cfg(windows)]
+        let stage_gpu = gpu_develop.is_some();
+        #[cfg(not(windows))]
+        let stage_gpu = false;
+        let stage_key = super::stage_cache::StageKey {
+            source: src.snapshot_id(),
+            geometry: {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                hash_geometry(&adj.geometry, &mut hasher);
+                Hasher::finish(&hasher)
+            },
+            region: [
+                region.x.to_bits(),
+                region.y.to_bits(),
+                region.width.to_bits(),
+                region.height.to_bits(),
+            ],
+            out_w,
+            out_h,
+            level,
+            cubic: sharp,
+            halo,
+            wide,
+            gpu: stage_gpu,
+            develop: super::stage_cache::develop_revision(adj),
+        };
+        let stage_cached = super::stage_cache::enabled()
+            && super::stage_cache::get(&stage_key)
+                .map(|cached| {
+                    if cached.len() != work_w * work_h {
+                        return false;
+                    }
+                    rgb_f32.copy_from_slice(&cached);
+                    true
+                })
+                .unwrap_or(false);
         #[cfg(windows)]
         if let Some((params, gain)) = &gpu_develop {
             // A halo frame keeps its per-pixel CPU sampling; the GPU point chain
             // is only admitted for the halo-free frame (`region_backed`).
-            if halo == 0 {
+            if !stage_cached && halo == 0 {
                 let mut band = Vec::new();
                 let mut y0 = 0u32;
                 let mut done = true;
@@ -3336,11 +3445,14 @@ fn render_sized(
                     });
                     gpu_filled = true;
                 } else {
+                    // A device that was serving frames just stopped: the cached
+                    // develop frames carry the GPU's numeric path, so drop them.
+                    super::stage_cache::clear();
                     log_develop_gpu_fallback("CUDA develop launch failed");
                 }
             }
         }
-        if !gpu_filled {
+        if !stage_cached && !gpu_filled {
         if halo != 0 {
             // Preserve the viewport's sample centers and fetch neighbors in the
             // surrounding image. Clamp only at the developed frame boundary.
@@ -3410,6 +3522,16 @@ fn render_sized(
                 y0 += rows;
             }
         }
+        }
+        if !stage_cached {
+            // Keep the frame only under the numeric path that actually filled
+            // it. A GPU preflight that failed and fell back to CPU leaves
+            // `gpu_filled != stage_gpu`; the fallback branch above already
+            // cleared the GPU-keyed entries, so a CPU fill is never served as
+            // a GPU frame.
+            if super::stage_cache::enabled() && gpu_filled == stage_gpu {
+                super::stage_cache::insert(stage_key, &rgb_f32);
+            }
         }
         #[cfg(all(windows, feature = "z6iii-raw-export"))]
         if let Some(c1) = camera_usm {
@@ -3610,7 +3732,7 @@ fn render_sized(
     }
     if !bypass {
         let dust = if crate::dustdetect::enabled() {
-            let key = dust_frame_key(src, &adj.geometry, region, out_w, out_h);
+            let key = dust_input_key(src, adj, region, out_w, out_h, scale, level, wide);
             match crate::dustdetect::detect_dust_cached(
                 key,
                 &rgba,
@@ -3690,6 +3812,19 @@ fn render_sized(
             crate::PortraitImage::new(out_w, out_h, rgba.clone())
         } else {
             None
+        };
+        // One SHA-256 for the immutable stage frame below. The face-input
+        // produce call, the slim validation and every attachment check read the
+        // same pixels; without this scope each of them re-hashed the full frame.
+        // The digest is computed lazily, so a slim-only frame that succeeds on
+        // the source path still pays nothing here.
+        let _stage_frame_digest: Option<
+            crate::portrait_face_input_stage::FrameDigestScope<'_>,
+        > = match stage_frame.as_ref() {
+            Some(frame) => Some(crate::portrait_face_input_stage::FrameDigestScope::new(
+                frame,
+            )),
+            None => None,
         };
         // PF-F §11: both blocks consume the same frame and job ticket, so the
         // stage inference is computed at most once. It stays lazy: when only
@@ -5697,6 +5832,70 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
 
 #[cfg(test)]
 mod tests {
+
+    /// The L3 stage cache must never change a pixel: a hit has to equal the
+    /// frame the uncached pipeline produces, for the same request and for a
+    /// detail-only edit that is supposed to hit.
+    #[test]
+    fn the_stage_cache_never_changes_a_pixel() {
+        use crate::mock::stage_cache;
+        let _serial = stage_cache::test_lock();
+        stage_cache::clear();
+        stage_cache::reset_stats();
+        stage_cache::set_test_enabled(true);
+
+        let src = Source::from_linear(
+            24,
+            18,
+            (0..24 * 18)
+                .map(|i| {
+                    let v = (i % 24) as f32 / 24.0;
+                    [v, (1.0 - v) * 0.8, 0.25 + v * 0.5]
+                })
+                .collect(),
+        );
+        let mut adj = AdjustmentSet::default();
+        // `use_f32_detail` requires a detail stage; sharpening and colour NR
+        // also exercise the path this cache exists for.
+        adj.sharpening.amount = 90.0;
+        adj.sharpening.radius = 1.2;
+        adj.noise_reduction.color = 40.0;
+        let render = |adj: &AdjustmentSet| render(&src, adj, NormRect::FULL, 24, false, None).rgba;
+
+        let first = render(&adj);
+        let (_hits, inserted, _len, _bytes) = stage_cache::stats();
+        assert_eq!(inserted, 1, "the first render must populate the cache");
+
+        // Same request: a hit, and byte-identical.
+        let second = render(&adj);
+        assert_eq!(second, first);
+        let (hits, _inserted, _len, _bytes) = stage_cache::stats();
+        assert_eq!(hits, 1, "the repeated request must come from the cache");
+
+        // Detail-only edit: hits, and equals the uncached render of the edit.
+        let mut sharpened = adj.clone();
+        sharpened.sharpening.amount = 40.0;
+        let cached = render(&sharpened);
+        let (hits, _inserted, _len, _bytes) = stage_cache::stats();
+        assert_eq!(hits, 2, "a sharpening change is downstream of the cache point");
+        stage_cache::set_test_enabled(false);
+        let uncached = render(&sharpened);
+        stage_cache::set_test_enabled(true);
+        assert_eq!(cached, uncached, "hit and miss must agree byte for byte");
+        assert_ne!(cached, first, "the detail edit must still change the frame");
+
+        // Develop-domain edit: misses, and equals the uncached render.
+        let mut exposed = adj.clone();
+        exposed.exposure.exposure = 0.6;
+        let cached = render(&exposed);
+        stage_cache::set_test_enabled(false);
+        let uncached = render(&exposed);
+        stage_cache::set_test_enabled(true);
+        assert_eq!(cached, uncached);
+        assert_ne!(cached, first);
+
+        stage_cache::clear();
+    }
 
     #[test]
     fn lcc_uniform_light_lens_stage_uses_source_coordinates_and_identity_gates() {
@@ -8772,6 +8971,154 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let big = Source::from_rgba(1024, 1024, &vec![128u8; 1024 * 1024 * 4]);
         assert!(big.levels.len() > 1);
         assert!(big.sample(99, 0.25, 0.75).is_some());
+    }
+
+    fn native_lazy_fixture(w: u32, h: u32) -> Vec<u16> {
+        (0..w as usize * h as usize)
+            .flat_map(|i| {
+                let x = (i % w as usize) as u16;
+                let y = (i / w as usize) as u16;
+                [
+                    x.wrapping_mul(257),
+                    y.wrapping_mul(131),
+                    (x ^ y).wrapping_mul(97).wrapping_add(11),
+                    65535,
+                ]
+            })
+            .collect()
+    }
+
+    /// The native RAW constructor defers the tail without changing the logical
+    /// level count, the reservation, or any rendered pixel.
+    #[test]
+    fn native_lazy_mips_match_eager_for_all_output_sizes() {
+        let (w, h) = (1023u32, 769u32);
+        let rgba = native_lazy_fixture(w, h);
+        let eager = Source::from_rgba16(w, h, &rgba);
+        let lazy = Source::from_rgba16_native(w, h, &rgba);
+
+        assert_eq!(lazy.levels.len(), eager.levels.len());
+        for (lazy_level, eager_level) in lazy.levels.iter().zip(&eager.levels) {
+            assert_eq!(
+                (lazy_level.width, lazy_level.height),
+                (eager_level.width, eager_level.height)
+            );
+        }
+        assert_eq!(lazy.levels[0].data.capacity(), eager.levels[0].data.capacity());
+        assert!(lazy.levels[0].lazy.is_none(), "level 0 must stay eagerly owned");
+        assert!(
+            lazy.levels[1..].iter().all(|level| level.data.is_empty() && level.lazy.is_some()),
+            "a native source must not allocate its mip tail up front"
+        );
+
+        let level0_bytes = lazy.levels[0].data.capacity() * std::mem::size_of::<[f32; 3]>();
+        let planned_tail: usize = lazy.levels[1..]
+            .iter()
+            .map(|level| {
+                level.width as usize * level.height as usize * std::mem::size_of::<[f32; 3]>()
+            })
+            .sum();
+        assert_eq!(
+            lazy.levels.iter().map(|level| level.allocated_bytes()).sum::<usize>(),
+            level0_bytes + planned_tail,
+            "the native slot must publish the reserved tail"
+        );
+
+        let adj = AdjustmentSet::default();
+        for max_size in [w, w / 2, w / 4, 257] {
+            let a = render(&eager, &adj, NormRect::FULL, max_size, false, None);
+            let b = render(&lazy, &adj, NormRect::FULL, max_size, false, None);
+            assert_eq!((a.width, a.height), (b.width, b.height), "size at {max_size}");
+            assert_eq!(a.rgba, b.rgba, "lazy mip changed pixels at output width {max_size}");
+        }
+
+        let wide_eager = render16(&eager, &adj, NormRect::FULL, w / 2, false);
+        let wide_lazy = render16(&lazy, &adj, NormRect::FULL, w / 2, false);
+        assert_eq!((wide_eager.width, wide_eager.height), (wide_lazy.width, wide_lazy.height));
+        assert_eq!(wide_eager.rgba, wide_lazy.rgba, "16-bit wide export changed");
+
+        for level in 0..lazy.levels.len() {
+            for (x, y) in [(0.0, 0.0), (0.25, 0.75), (0.5, 0.5), (0.9, 0.1)] {
+                assert_eq!(
+                    lazy.sample(level, x, y),
+                    eager.sample(level, x, y),
+                    "level {level} at {x},{y}"
+                );
+            }
+        }
+    }
+
+    /// Requesting a shallow level builds it and its parents only; deeper levels
+    /// stay deferred.
+    #[test]
+    fn sampling_one_level_leaves_deeper_levels_deferred() {
+        let (w, h) = (1024u32, 768u32);
+        let rgba = native_lazy_fixture(w, h);
+        let src = Source::from_rgba16_native(w, h, &rgba);
+        assert!(src.levels.len() >= 3);
+        assert!(src.sample(1, 0.5, 0.5).is_some());
+        assert!(!src.levels[1].data.is_empty(), "level 1 must be built on demand");
+        assert!(
+            src.levels[2..].iter().all(|level| level.data.is_empty()),
+            "levels below the requested depth must stay unallocated"
+        );
+    }
+
+    /// A 1:1 render never samples beyond level 0, so the deferred tail must
+    /// stay unallocated after the render completes.
+    #[test]
+    fn native_lazy_level_zero_render_does_not_materialise_the_tail() {
+        let (w, h) = (1024u32, 768u32);
+        let rgba = vec![32768u16; w as usize * h as usize * 4];
+        let src = Source::from_rgba16_native(w, h, &rgba);
+        let _ = render(&src, &AdjustmentSet::default(), NormRect::FULL, w, false, None);
+        assert!(
+            src.levels[1..].iter().all(|level| level.data.is_empty()),
+            "a 1:1 render allocated mip levels it never sampled"
+        );
+    }
+
+    /// Several sampling threads may hit the same deferred level at once. One
+    /// build wins; every caller still sees the eager arithmetic.
+    #[test]
+    fn concurrent_lazy_mip_builds_match_eager() {
+        let (w, h) = (1024u32, 768u32);
+        let rgba = native_lazy_fixture(w, h);
+        let eager = Source::from_rgba16(w, h, &rgba);
+        let lazy = std::sync::Arc::new(Source::from_rgba16_native(w, h, &rgba));
+        let deep = lazy.levels.len() - 1;
+
+        let grid = |src: &Source| -> Vec<[f32; 3]> {
+            (0..64 * 64)
+                .map(|i| {
+                    let x = ((i % 64) as f32 + 0.5) / 64.0;
+                    let y = ((i / 64) as f32 + 0.5) / 64.0;
+                    src.sample(deep, x, y).expect("sample inside the frame")
+                })
+                .collect()
+        };
+        let expected = grid(&eager);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let source = std::sync::Arc::clone(&lazy);
+                    scope.spawn(move || grid(&source))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("lazy mip worker"))
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            assert_eq!(result, expected, "a concurrent build diverged from the eager tail");
+        }
+        assert!(
+            lazy.levels[1..]
+                .iter()
+                .all(|level| level.lazy.as_ref().is_some_and(|slot| slot.get().is_some())),
+            "sampling the deepest level must materialise every parent exactly once"
+        );
     }
 
     /// The 8-bit path still decodes sRGB codes through its LUT, unchanged.

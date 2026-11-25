@@ -4,6 +4,7 @@
 //! interface only ever talks to the trait.
 
 pub mod process;
+pub(crate) mod stage_cache;
 pub(crate) mod scenes;
 pub(crate) mod spots;
 pub(crate) mod grain;
@@ -228,6 +229,8 @@ struct State {
     jobs: HashMap<u64, JobStatus>,
     preview: PreviewCache,
     profiled: crate::engine::ProfileCache,
+    /// Last preview's graph identity; a pruned-branch edit reuses the frame.
+    graph_gate: preview_cache::GraphGate,
 }
 
 pub struct MockEngine {
@@ -353,7 +356,41 @@ impl MockEngine {
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
         let (rendering, intent_note) = crate::engine::request_rendering(request);
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
-        let hit = self.state.lock().preview.get(key);
+        // Graph-dirty reuse, mirroring the file engine: a pruned-branch edit
+        // misses the exact key but cannot move a pixel, so `dirty_between`
+        // carries the frame already on screen forward.
+        let graph = adj.nodes.clone().unwrap_or_default().repaired(&adj.layers);
+        let mut frame_key = key;
+        let hit = {
+            let mut st = self.state.lock();
+            st.preview.get(key)
+        };
+        let hit = match hit {
+            Some(hit) => Some(hit),
+            None => {
+                let reuse_key = {
+                    let st = self.state.lock();
+                    st.graph_gate.reuse(&key, &graph, &adj.layers)
+                };
+                match reuse_key {
+                    Some(reuse_key) => {
+                        let hit = {
+                            let mut st = self.state.lock();
+                            st.preview.get(reuse_key)
+                        };
+                        if hit.is_some() {
+                            frame_key = reuse_key;
+                        }
+                        hit
+                    }
+                    None => None,
+                }
+            }
+        };
+        {
+            let mut st = self.state.lock();
+            st.graph_gate.record(key, frame_key, graph, adj.layers.clone());
+        }
         if let Some(hit) = hit {
             let histogram = hit.histogram.clone();
             let source = hit.into_image();

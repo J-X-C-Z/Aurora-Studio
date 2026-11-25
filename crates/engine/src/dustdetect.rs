@@ -9,8 +9,10 @@
 //! 0.25 above), tiled 416 with 100 px overlap, and the last tile is flush with
 //! the right/bottom edge.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64 as TickCounter, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Result, bail};
 use rayon::prelude::*;
@@ -69,37 +71,63 @@ pub(crate) struct RawSpot {
     pub side: f32,
 }
 
-#[derive(Clone, PartialEq)]
-struct CacheKey {
-    frame: u64,
-    threshold_bits: u32,
-    model: Vec<u8>,
+/// Everything, apart from the model, that decides the pixels fed to the dust
+/// model.
+///
+/// The four fingerprints are the `preview_cache` parameter groups that run
+/// before dust reads the frame (characterization, geometry, develop and
+/// detail). `local` (spots/layers/nodes) and `portrait` (retouch/extras) run
+/// after it and stay out of the key, so moving a spot or a layer still hits.
+/// Film grain lives in `develop`: the detail stage applies it before dust, and
+/// it is deterministic (a fixed hash offset, no random seed), so its parameters
+/// fully describe its contribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DustInputKey {
+    /// The immutable decoded frame (`Source::snapshot_id`).
+    pub source: u64,
+    pub characterization: u64,
+    pub geometry: u64,
+    pub develop: u64,
+    pub detail: u64,
+    /// Viewport rectangle and output size.
+    pub region: [u32; 4],
+    pub out: [u32; 2],
+    /// Detail radii and grain sigma are multiplied by this scale.
+    pub scale_bits: u32,
+    /// Mip level the source is sampled from.
+    pub level: u32,
+    /// A wide (16-bit export) render drives the 8-bit preview buffer through a
+    /// different detail sequence.
+    pub wide: bool,
 }
 
-struct CacheEntry {
-    key: CacheKey,
-    spots: Arc<Vec<Spot>>,
+/// Model identity: the resolved path plus the file's metadata and
+/// first/middle/last KiB. A model replacement changes this even when the path
+/// is reused, so stale sessions and detections cannot survive an ONNX update.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModelIdentity {
+    path: PathBuf,
+    fingerprint: Vec<u8>,
 }
 
-const DUST_CACHE_ENTRIES: usize = 8;
-
-fn cache() -> &'static Mutex<Vec<CacheEntry>> {
-    static CACHE: OnceLock<Mutex<Vec<CacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+fn model_identity() -> Result<ModelIdentity> {
+    let path = model_path()?;
+    let fingerprint = model_fingerprint(&path);
+    Ok(ModelIdentity { path, fingerprint })
 }
 
-/// Model identity: the file's metadata and first/middle/last KiB. A model
-/// replacement changes this even when the path is reused, so stale inference
-/// results cannot be served after an ONNX update.
-fn model_fingerprint() -> Vec<u8> {
+/// Content fingerprint of the model file: metadata plus head/middle/tail KiB.
+/// Read on every call, including cache hits: the read *is* the replacement
+/// check. Memoising the bytes by path/length/mtime would skip it but would also
+/// miss a rewrite that preserves length and mtime, so the stronger check stays.
+fn model_fingerprint(path: &Path) -> Vec<u8> {
     let mut out = Vec::new();
-    let Ok(path) = model_path() else { return out };
-    let Ok(meta) = std::fs::metadata(&path) else { return out };
+    let Ok(meta) = std::fs::metadata(path) else { return out };
     out.extend_from_slice(&meta.len().to_le_bytes());
     out.extend_from_slice(&meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|t| t.as_secs().to_le_bytes()).unwrap_or([0; 8]));
     use std::io::{Read, Seek, SeekFrom};
-    if let Ok(mut file) = std::fs::File::open(&path) {
+    if let Ok(mut file) = std::fs::File::open(path) {
         for at in [SeekFrom::Start(0), SeekFrom::End(-1024), SeekFrom::End(-2048)] {
             let mut bytes = [0u8; 1024];
             if file.seek(at).is_ok() && file.read(&mut bytes).unwrap_or(0) > 0 {
@@ -110,41 +138,180 @@ fn model_fingerprint() -> Vec<u8> {
     out
 }
 
-/// Cached automatic dust detection. `frame` must identify the source snapshot,
-/// geometry and output frame; colour sliders are deliberately absent. The
-/// threshold and the model bytes are part of the key so changing either
-/// re-detects, while dragging an unrelated slider hits the cache.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    input: DustInputKey,
+    threshold_bits: u32,
+    model: ModelIdentity,
+}
+
+struct CacheEntry {
+    key: CacheKey,
+    spots: Arc<Vec<Spot>>,
+    last_used: u64,
+}
+
+const DUST_CACHE_ENTRIES: usize = 8;
+
+fn cache() -> &'static Mutex<Vec<CacheEntry>> {
+    static CACHE: OnceLock<Mutex<Vec<CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn next_tick() -> u64 {
+    static TICK: TickCounter = TickCounter::new(1);
+    TICK.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Least-recently-used lookup: a hit refreshes the entry's recency.
+fn cache_find(entries: &mut [CacheEntry], key: &CacheKey, now: u64) -> Option<Arc<Vec<Spot>>> {
+    let entry = entries.iter_mut().find(|entry| &entry.key == key)?;
+    entry.last_used = now;
+    Some(Arc::clone(&entry.spots))
+}
+
+/// Inserts with the newest recency, replacing an equal key. When full it evicts
+/// the least recently used entry instead of the oldest inserted (FIFO before).
+fn cache_store(entries: &mut Vec<CacheEntry>, key: CacheKey, spots: Arc<Vec<Spot>>, now: u64) {
+    entries.retain(|entry| entry.key != key);
+    if entries.len() >= DUST_CACHE_ENTRIES {
+        if let Some(index) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(index, _)| index)
+        {
+            entries.remove(index);
+        }
+    }
+    entries.push(CacheEntry { key, spots, last_used: now });
+}
+
+fn cache_insert(key: CacheKey, spots: Arc<Vec<Spot>>) {
+    let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+    cache_store(&mut entries, key, spots, next_tick());
+}
+
+/// One in-flight detection. `done` is signalled after `result` is written.
+struct Flight<V> {
+    result: Mutex<Option<Result<V, String>>>,
+    done: Condvar,
+}
+
+/// Runs `work` once per key; concurrent callers with the same key wait for the
+/// leader and receive a clone of its result. The finished flight is removed, so
+/// a process that renders many frames does not accumulate one entry per frame:
+/// the leader stores its answer in the LRU before returning, so a caller that
+/// arrives after removal finds the cache or starts one fresh attempt.
+///
+/// Failures are shared with the waiters but never cached, and a panicking
+/// leader becomes an error instead of hanging the waiters.
+///
+/// `detect_dust` itself fans out with rayon. A waiter blocks on a condvar and
+/// leaves the pool; the leader still finishes because rayon's joins run the
+/// remaining work inline on the leader, so this cannot deadlock.
+fn single_flight<K, V>(
+    store: &OnceLock<Mutex<HashMap<K, Arc<Flight<V>>>>>,
+    key: K,
+    work: impl FnOnce() -> Result<V, String>,
+) -> Result<V, String>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone,
+{
+    let flights = store.get_or_init(|| Mutex::new(HashMap::new()));
+    let (flight, leader) = {
+        let mut flights = flights.lock().unwrap_or_else(|error| error.into_inner());
+        match flights.get(&key) {
+            Some(flight) => (Arc::clone(flight), false),
+            None => {
+                let flight = Arc::new(Flight { result: Mutex::new(None), done: Condvar::new() });
+                flights.insert(key.clone(), Arc::clone(&flight));
+                (flight, true)
+            }
+        }
+    };
+    if leader {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            .unwrap_or_else(|_| Err("dust detection panicked".to_string()));
+        *flight.result.lock().unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+        // Publish before the key disappears: a later caller then finds either
+        // this flight's answer or the LRU entry, never an empty gap.
+        flights.lock().unwrap_or_else(|error| error.into_inner()).remove(&key);
+        flight.done.notify_all();
+    }
+    let mut result = flight.result.lock().unwrap_or_else(|error| error.into_inner());
+    while result.is_none() {
+        result = flight
+            .done
+            .wait(result)
+            .unwrap_or_else(|error| error.into_inner());
+    }
+    result
+        .as_ref()
+        .expect("single_flight result is written before any waiter returns")
+        .clone()
+}
+
+fn dust_flights() -> &'static OnceLock<Mutex<HashMap<CacheKey, Arc<Flight<Arc<Vec<Spot>>>>>>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<CacheKey, Arc<Flight<Arc<Vec<Spot>>>>>>> =
+        OnceLock::new();
+    &FLIGHTS
+}
+
+/// Cached automatic dust detection.
+///
+/// The key covers the source snapshot, every parameter group that runs before
+/// dust reads the frame, the viewport and output geometry, the confidence
+/// threshold and the model identity. Colour and tone sliders are part of it:
+/// the earlier key omitted them and could serve spots computed from different
+/// pixels. Spots, retouch and layers are absent because they are applied after
+/// detection.
 pub fn detect_dust_cached(
-    frame: u64,
+    input: DustInputKey,
     rgba: &[u8],
     w: u32,
     h: u32,
     min_confidence: f32,
 ) -> Result<Arc<Vec<Spot>>> {
     let key = CacheKey {
-        frame,
+        input,
         threshold_bits: min_confidence.to_bits(),
-        model: model_fingerprint(),
+        model: model_identity()?,
     };
     {
-        let entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(found) = entries.iter().find(|entry| entry.key == key) {
-            return Ok(Arc::clone(&found.spots));
+        let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(found) = cache_find(&mut entries, &key, next_tick()) {
+            return Ok(found);
         }
     }
-    let spots = Arc::new(detect_dust(rgba, w, h, min_confidence)?);
-    let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-    entries.retain(|entry| entry.key != key);
-    if entries.len() >= DUST_CACHE_ENTRIES {
-        entries.remove(0);
-    }
-    entries.push(CacheEntry { key, spots: Arc::clone(&spots) });
+    let cache_key = key.clone();
+    let spots = single_flight(dust_flights(), key, || {
+        let spots = Arc::new(
+            detect_dust_with_model(&cache_key.model, rgba, w, h, min_confidence)
+                .map_err(|error| format!("{error:#}"))?,
+        );
+        cache_insert(cache_key.clone(), Arc::clone(&spots));
+        Ok(spots)
+    })
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(spots)
 }
 
 /// Detects dust spots in a developed RGBA frame.  Returned coordinates are
 /// normalised like every other `Spot`; `radius` is a fraction of the long side.
 pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<Vec<Spot>> {
+    let model = model_identity()?;
+    detect_dust_with_model(&model, rgba, w, h, min_confidence)
+}
+
+fn detect_dust_with_model(
+    model: &ModelIdentity,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    min_confidence: f32,
+) -> Result<Vec<Spot>> {
     if w == 0 || h == 0 {
         return Ok(Vec::new());
     }
@@ -158,7 +325,7 @@ pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<V
     let canvas_w = ((w as f32 * scale).ceil() as usize).max(INPUT_SIDE);
     let canvas_h = ((h as f32 * scale).ceil() as usize).max(INPUT_SIDE);
     let canvas = resize_canvas(rgba, w as usize, h as usize, canvas_w, canvas_h);
-    let session = &session()?.session;
+    let session = session_for(model)?;
     let runtime = Runtime::get()
         .ok_or_else(|| anyhow::anyhow!("ONNX Runtime is not available for dust detection"))?;
     let tiles_x = spot_tiles(canvas_w);
@@ -172,7 +339,7 @@ pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<V
             for &tx in &tiles_x {
                 fill_tile_tensor(&mut tile_input, &canvas, canvas_w, canvas_h, tx, ty);
                 let planes = runtime.run(
-                    session,
+                    &session,
                     &mut tile_input,
                     &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64],
                 )?;
@@ -214,28 +381,59 @@ pub fn detect_dust(rgba: &[u8], w: u32, h: u32, min_confidence: f32) -> Result<V
         .collect())
 }
 
-struct Loaded {
-    session: Session,
+struct SessionSlot {
+    identity: ModelIdentity,
+    outcome: Result<Session, String>,
 }
 
-fn session() -> Result<&'static Loaded> {
-    static SESSION: OnceLock<Result<Loaded, String>> = OnceLock::new();
-    match SESSION.get_or_init(|| {
-        let path = model_path().map_err(|e| format!("{e:#}"))?;
-        let runtime = Runtime::get().ok_or_else(|| "ONNX Runtime is not available".to_string())?;
-        let session = runtime.open_session(&path).map_err(|e| format!("{e:#}"))?;
-        let dims = &session.input.dims;
-        if dims != &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64] || session.input.element_type != 1 {
-            return Err(format!("dust.onnx: unexpected input {dims:?}"));
+fn session_slot() -> &'static Mutex<Option<SessionSlot>> {
+    static SLOT: OnceLock<Mutex<Option<SessionSlot>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn session_error(error: String) -> anyhow::Error {
+    anyhow::anyhow!("dust detection unavailable: {error}")
+}
+
+/// The session for `identity`, reopened when the model file changes.
+///
+/// The old `OnceLock` kept the first session for the life of the process, so
+/// replacing `dust.onnx` kept running the old graph even after the cache key
+/// had moved on. The outcome (including a failure) is stored per identity, so
+/// a broken model is not reopened on every render while a replaced one is.
+fn session_for(identity: &ModelIdentity) -> Result<Session> {
+    {
+        let slot = session_slot().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(slot) = slot.as_ref() {
+            if slot.identity == *identity {
+                return slot.outcome.clone().map_err(session_error);
+            }
         }
-        if session.outputs.len() != 1 || session.outputs[0].name.is_empty() {
-            return Err("dust.onnx: expected one output".into());
-        }
-        Ok(Loaded { session })
-    }) {
-        Ok(loaded) => Ok(loaded),
-        Err(err) => bail!("dust detection unavailable: {err}"),
     }
+    // Open outside the lock; `Runtime::open_session` is itself single-flight
+    // per model key, so concurrent callers share one graph.
+    let outcome = open_dust_session(&identity.path);
+    let mut slot = session_slot().lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(existing) = slot.as_ref() {
+        if existing.identity == *identity {
+            return existing.outcome.clone().map_err(session_error);
+        }
+    }
+    *slot = Some(SessionSlot { identity: identity.clone(), outcome: outcome.clone() });
+    outcome.map_err(session_error)
+}
+
+fn open_dust_session(path: &Path) -> Result<Session, String> {
+    let runtime = Runtime::get().ok_or_else(|| "ONNX Runtime is not available".to_string())?;
+    let session = runtime.open_session(path).map_err(|error| format!("{error:#}"))?;
+    let dims = &session.input.dims;
+    if dims != &[1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64] || session.input.element_type != 1 {
+        return Err(format!("dust.onnx: unexpected input {dims:?}"));
+    }
+    if session.outputs.len() != 1 || session.outputs[0].name.is_empty() {
+        return Err("dust.onnx: expected one output".into());
+    }
+    Ok(session)
 }
 
 /// `AURORA_DUST_MODEL` wins, then `AURORA_AIMODELS`, then the Capture One
@@ -376,6 +574,158 @@ pub(crate) fn iou(a: &RawSpot, b: &RawSpot) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_input(source: u64) -> DustInputKey {
+        DustInputKey {
+            source,
+            characterization: 1,
+            geometry: 2,
+            develop: 3,
+            detail: 4,
+            region: [0, 0, 1.0f32.to_bits(), 1.0f32.to_bits()],
+            out: [64, 64],
+            scale_bits: 1.0f32.to_bits(),
+            level: 0,
+            wide: false,
+        }
+    }
+
+    fn key_for(source: u64) -> CacheKey {
+        CacheKey {
+            input: key_input(source),
+            threshold_bits: DEFAULT_CONFIDENCE.to_bits(),
+            model: ModelIdentity {
+                path: PathBuf::from("dust.onnx"),
+                fingerprint: vec![7, 7, 7],
+            },
+        }
+    }
+
+    /// The key must move when a stage applied before dust changes, and stay put
+    /// for the stages applied after it.
+    #[test]
+    fn dust_input_fingerprint_tracks_pre_dust_stages_only() {
+        let base = crate::AdjustmentSet::default();
+        let baseline = crate::preview_cache::dust_input_fingerprint(&base);
+
+        // Film grain is applied by the detail stage before dust.
+        let mut grain = base.clone();
+        grain.film_grain.impact = 60.0;
+        assert_ne!(
+            crate::preview_cache::dust_input_fingerprint(&grain).develop,
+            baseline.develop,
+            "film grain changes the pixels fed to the model"
+        );
+
+        // A colour/tone slider changes the developed pixels too.
+        let mut exposure = base.clone();
+        exposure.exposure.exposure = 0.5;
+        assert_ne!(
+            crate::preview_cache::dust_input_fingerprint(&exposure).develop,
+            baseline.develop
+        );
+
+        // Spots and portrait extras are applied after detection.
+        let mut spots = base.clone();
+        spots.spots.push(Spot { id: 1, kind: SpotKind::Dust, x: 0.1, y: 0.1, radius: 0.1 });
+        assert_eq!(crate::preview_cache::dust_input_fingerprint(&spots), baseline);
+
+        let mut extra = base.clone();
+        extra.extra.insert("pc:21093".into(), 1.0);
+        assert_eq!(crate::preview_cache::dust_input_fingerprint(&extra), baseline);
+    }
+
+    #[test]
+    fn dust_cache_evicts_the_least_recently_used_entry() {
+        let mut entries = Vec::new();
+        for source in 1..=DUST_CACHE_ENTRIES as u64 {
+            cache_store(&mut entries, key_for(source), Arc::new(Vec::new()), source);
+        }
+        assert_eq!(entries.len(), DUST_CACHE_ENTRIES);
+        // Refresh key 1, so key 2 becomes the oldest.
+        assert!(cache_find(&mut entries, &key_for(1), 100).is_some());
+        cache_store(&mut entries, key_for(99), Arc::new(Vec::new()), 101);
+        assert_eq!(entries.len(), DUST_CACHE_ENTRIES);
+        assert!(
+            cache_find(&mut entries, &key_for(2), 102).is_none(),
+            "least recently used entry must be evicted"
+        );
+        assert!(
+            cache_find(&mut entries, &key_for(1), 103).is_some(),
+            "recently used entry must survive"
+        );
+    }
+
+    #[test]
+    fn dust_cache_replaces_an_equal_key_without_growing() {
+        let mut entries = Vec::new();
+        cache_store(&mut entries, key_for(1), Arc::new(Vec::new()), 1);
+        let spots = Arc::new(vec![Spot {
+            id: 1,
+            kind: SpotKind::Dust,
+            x: 0.1,
+            y: 0.2,
+            radius: 0.3,
+        }]);
+        cache_store(&mut entries, key_for(1), Arc::clone(&spots), 2);
+        assert_eq!(entries.len(), 1);
+        let found = cache_find(&mut entries, &key_for(1), 3).expect("entry");
+        assert!(Arc::ptr_eq(&found, &spots));
+    }
+
+    #[test]
+    fn single_flight_runs_one_detection_for_concurrent_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let store: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();
+        let runs = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        let results: Vec<u32> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        single_flight(&store, "same-key".to_string(), || {
+                            runs.fetch_add(1, AtomicOrdering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                            Ok(7u32)
+                        })
+                        .expect("shared result")
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+        assert_eq!(runs.load(AtomicOrdering::SeqCst), 1, "one leader must run the work");
+        assert!(results.iter().all(|value| *value == 7));
+    }
+
+    #[test]
+    fn single_flight_shares_failure_but_retries_the_next_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let store: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let first: Result<u32, String> = single_flight(&store, "err-key".to_string(), || {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Err("boom".to_string())
+        });
+        assert!(first.is_err());
+        let second = single_flight(&store, "err-key".to_string(), || {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(3u32)
+        });
+        assert_eq!(second.unwrap(), 3);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn single_flight_turns_a_panicking_leader_into_an_error() {
+        let store: OnceLock<Mutex<HashMap<String, Arc<Flight<u32>>>>> = OnceLock::new();
+        let outcome: Result<u32, String> =
+            single_flight(&store, "panic-key".to_string(), || panic!("boom"));
+        assert!(outcome.is_err());
+        let retry = single_flight(&store, "panic-key".to_string(), || Ok(5u32));
+        assert_eq!(retry.unwrap(), 5);
+    }
 
     fn rows_with(detections: &[(usize, [f32; 6])]) -> Vec<f32> {
         let mut rows = vec![0.0f32; ANCHORS * 6];

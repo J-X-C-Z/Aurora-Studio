@@ -131,28 +131,59 @@ pub fn get_or_decode16_traced(
     let route = crate::raw::decode_route(path);
     let Some(dir) = default_raw16_dir() else {
         let identity = tracked_identity(path).unwrap_or(SourceIdentity::UNKNOWN);
-        return decode_frame16(path, long_side, route, identity);
+        let mut failed = None;
+        return decode_frame16(path, long_side, route, identity, &mut failed);
     };
-    get_or_decode16_with(path, &dir, long_side, crate::raw::decode16_traced)
+    get_or_decode16_with_route(path, &dir, long_side, route, |path| {
+        crate::raw::decode16_traced_routed(path, route)
+    })
 }
 
 pub(crate) fn get_or_decode_source16(
     path: &Path,
     long_side: u32,
 ) -> Option<(Source, DecodeProvenance)> {
+    let failed = std::cell::RefCell::new(None);
+    get_or_decode_source16_with_failed(path, long_side, &failed)
+}
+
+/// [`get_or_decode_source16`] that also returns the container bytes a failed
+/// 16-bit decode already read.
+///
+/// The caller's 8-bit fallback reuses those bytes, so one cold load reads the
+/// file once instead of once per backend. A cache hit leaves them `None`.
+pub(crate) fn get_or_decode_source16_with_bytes(
+    path: &Path,
+    long_side: u32,
+) -> (Option<(Source, DecodeProvenance)>, Option<crate::raw::FailedRaw16>) {
+    let failed = std::cell::RefCell::new(None);
+    let source = get_or_decode_source16_with_failed(path, long_side, &failed);
+    (source, failed.into_inner())
+}
+
+fn get_or_decode_source16_with_failed(
+    path: &Path,
+    long_side: u32,
+    failed: &std::cell::RefCell<Option<crate::raw::FailedRaw16>>,
+) -> Option<(Source, DecodeProvenance)> {
     let route = crate::raw::decode_route(path);
     let Some(dir) = default_raw16_dir() else {
-        return decode_source16(path, long_side, route);
+        return decode_source16(path, long_side, route, &mut *failed.borrow_mut());
     };
     let Some(identity) = tracked_identity(path) else {
-        return decode_source16(path, long_side, route);
+        return decode_source16(path, long_side, route, &mut *failed.borrow_mut());
     };
     let key = cache_name16_for_identity(path, long_side, route, identity);
     let file = dir.join(&key);
+    // Only the full-sensor decode gets a deferred mip tail. Proxy decodes stay
+    // eager: they are small and immediately used by fit-view sampling. This
+    // defers `Source` pixels only; the pending native frame is moved into
+    // `source_of` and no decoder buffer is retained twice.
+    let lazy_mips = long_side == 0;
     let source_of = |(width, height, pixels, provenance): Frame16| {
-        (Source::from_rgba16(width, height, &pixels), provenance)
+        (rgba16_source(width, height, &pixels, lazy_mips), provenance)
     };
-    if let Some(source) = read_cached_source16(&file, &route, &identity) {
+    if let Some(source) = read_cached_source16_with_mips(&file, &route, &identity, lazy_mips) {
         return Some(source);
     }
     if let Some(frame) = take_pending_native(path, long_side, route, identity) {
@@ -162,14 +193,16 @@ pub(crate) fn get_or_decode_source16(
         return Some(source_of(frame));
     }
 
-    let mut decode = Some(crate::raw::decode16_traced);
+    let mut decode = Some(route);
     for _ in 0..3 {
         match acquire_flight(&key) {
             FlightTicket::Leader(flight) => {
                 let result = (|| {
                     // A previous leader for this key may have stored the entry
                     // just before we acquired the lead.
-                    if let Some(source) = read_cached_source16(&file, &route, &identity) {
+                    if let Some(source) =
+                        read_cached_source16_with_mips(&file, &route, &identity, lazy_mips)
+                    {
                         return Some(source);
                     }
                     if let Some(frame) = take_pending_native(path, long_side, route, identity) {
@@ -189,7 +222,14 @@ pub(crate) fn get_or_decode_source16(
                         long_side,
                         &route,
                         identity,
-                        |path| decode.take()?(path),
+                        |path| {
+                            let route = decode.take()?;
+                            let mut leftover = None;
+                            let frame =
+                                crate::raw::decode16_traced_into(path, route, &mut leftover);
+                            *failed.borrow_mut() = leftover;
+                            frame
+                        },
                     )?;
                     Some(source_of(image))
                 })();
@@ -199,7 +239,9 @@ pub(crate) fn get_or_decode_source16(
             FlightTicket::Follower(flight) => {
                 count_waiter();
                 flight.wait();
-                if let Some(source) = read_cached_source16(&file, &route, &identity) {
+                if let Some(source) =
+                    read_cached_source16_with_mips(&file, &route, &identity, lazy_mips)
+                {
                     return Some(source);
                 }
                 if let Some(frame) = take_pending_native(path, long_side, route, identity) {
@@ -216,19 +258,34 @@ pub(crate) fn get_or_decode_source16(
         long_side,
         &route,
         identity,
-        |path| decode.take()?(path),
+        |path| {
+            let route = decode.take()?;
+            let mut leftover = None;
+            let frame = crate::raw::decode16_traced_into(path, route, &mut leftover);
+            *failed.borrow_mut() = leftover;
+            frame
+        },
     )?;
     Some(source_of(image))
+}
+
+fn rgba16_source(width: u32, height: u32, pixels: &[u16], lazy_mips: bool) -> Source {
+    if lazy_mips {
+        Source::from_rgba16_native(width, height, pixels)
+    } else {
+        Source::from_rgba16(width, height, pixels)
+    }
 }
 
 fn decode_source16(
     path: &Path,
     long_side: u32,
     route: DecodeRoute,
+    failed: &mut Option<crate::raw::FailedRaw16>,
 ) -> Option<(Source, DecodeProvenance)> {
     let identity = tracked_identity(path).unwrap_or(SourceIdentity::UNKNOWN);
-    let image = decode_frame16(path, long_side, route, identity)?;
-    Some((Source::from_rgba16(image.0, image.1, &image.2), image.3))
+    let image = decode_frame16(path, long_side, route, identity, failed)?;
+    Some((rgba16_source(image.0, image.1, &image.2, long_side == 0), image.3))
 }
 
 fn get_or_decode16_with<F>(
@@ -1040,15 +1097,17 @@ fn decode_frame16(
     long_side: u32,
     route: DecodeRoute,
     identity: SourceIdentity,
+    failed: &mut Option<crate::raw::FailedRaw16>,
 ) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
     if let Some(pending) = take_pending_native(path, long_side, route, identity) {
+        *failed = None;
         return Some(pending);
     }
     let native_key = cache_name16_for_identity(path, 0, route, identity);
     let (width, height, pixels, provenance) = {
         let _slot = enter_decode_slot();
         count_decode();
-        crate::raw::decode16_traced(path)?
+        crate::raw::decode16_traced_into(path, route, failed)?
     };
     Some(fit16_keep_native(
         // No cache directory: nothing to persist, but the pending frame is
@@ -1187,10 +1246,11 @@ fn read_cached16_binary(
 }
 
 #[cfg(target_endian = "little")]
-fn read_cached_source16(
+fn read_cached_source16_with_mips(
     file: &Path,
     route: &DecodeRoute,
     identity: &SourceIdentity,
+    lazy_mips: bool,
 ) -> Option<(Source, DecodeProvenance)> {
     use memmap2::MmapOptions;
 
@@ -1211,19 +1271,37 @@ fn read_cached_source16(
     }
     let (valid, source) = rayon::join(
         || body_matches(&header, body),
-        || Source::from_rgb16(header.width, header.height, pixels),
+        || {
+            if lazy_mips {
+                Source::from_rgb16_native(header.width, header.height, pixels)
+            } else {
+                Source::from_rgb16(header.width, header.height, pixels)
+            }
+        },
     );
     valid.then_some((source, header.provenance))
 }
 
 #[cfg(not(target_endian = "little"))]
+fn read_cached_source16_with_mips(
+    file: &Path,
+    route: &DecodeRoute,
+    identity: &SourceIdentity,
+    lazy_mips: bool,
+) -> Option<(Source, DecodeProvenance)> {
+    let (width, height, pixels, provenance) = read_cached16_binary(file, route, identity)?;
+    Some((rgba16_source(width, height, &pixels, lazy_mips), provenance))
+}
+
+/// Eager reader kept for the existing cache tests. Production callers choose
+/// deferred mips explicitly through [`read_cached_source16_with_mips`].
+#[cfg(test)]
 fn read_cached_source16(
     file: &Path,
     route: &DecodeRoute,
     identity: &SourceIdentity,
 ) -> Option<(Source, DecodeProvenance)> {
-    let (width, height, pixels, provenance) = read_cached16_binary(file, route, identity)?;
-    Some((Source::from_rgba16(width, height, &pixels), provenance))
+    read_cached_source16_with_mips(file, route, identity, false)
 }
 
 #[cfg(test)]
@@ -2025,6 +2103,42 @@ mod tests {
             .rgba
         };
         assert_eq!(render(&mapped), render(&expected));
+    }
+
+    #[test]
+    fn mapped_native_source_defers_the_tail_without_changing_pixels() {
+        let dir = scratch("raw16-source-map-native");
+        let file = dir.join("sample.bin");
+        let (width, height) = (1024u32, 768u32);
+        let pixels: Vec<u16> = (0..width as usize * height as usize * 4)
+            .map(|i| i.wrapping_mul(40503) as u16)
+            .collect();
+        let route = test_route(true, false);
+        let identity = test_identity(5);
+        store_libraw(&file, width, height, &pixels, identity, &route);
+        let lazy = read_cached_source16_with_mips(&file, &route, &identity, true)
+            .expect("mapped source")
+            .0;
+        let eager = Source::from_rgba16(width, height, &pixels);
+        assert_eq!(lazy.levels.len(), eager.levels.len());
+        assert!(
+            lazy.levels[1..].iter().all(|level| level.data.is_empty()),
+            "the native map must not build the tail up front"
+        );
+        for max_size in [width, width / 2, width / 4] {
+            let render = |src: &Source| {
+                crate::render(
+                    src,
+                    &crate::AdjustmentSet::default(),
+                    crate::NormRect::FULL,
+                    max_size,
+                    false,
+                    None,
+                )
+                .rgba
+            };
+            assert_eq!(render(&lazy), render(&eager), "mapped lazy pixels at {max_size}");
+        }
     }
 
     #[test]
