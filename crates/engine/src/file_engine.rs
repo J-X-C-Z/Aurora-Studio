@@ -8062,8 +8062,8 @@ mod tests {
                 let _permit = scheduler
                     .wait_guarded(&mut guard, || false)
                     .expect("each queued job is admitted in turn");
-            order.lock().push(index);
-            })
+                order.lock().push(index);
+            }));
         }
         std::thread::sleep(std::time::Duration::from_millis(80));
         drop(holder);
