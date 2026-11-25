@@ -2770,6 +2770,46 @@ fn has_post_8bit_stages(adj: &AdjustmentSet, bypass: bool, plan: &Plan<'_>, port
         || (l.dust_removal_enabled && !l.dust_patches.is_empty())
 }
 
+fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
+    geometry.rotation.to_bits().hash(hasher);
+    geometry.orientation.hash(hasher);
+    geometry.flip_horizontal.hash(hasher);
+    geometry.flip_vertical.hash(hasher);
+    geometry.crop_outside_image.hash(hasher);
+    for value in [
+        geometry.crop.x,
+        geometry.crop.y,
+        geometry.crop.width,
+        geometry.crop.height,
+        geometry.canvas[0],
+        geometry.canvas[1],
+        geometry.optical_center[0],
+        geometry.optical_center[1],
+    ] {
+        value.to_bits().hash(hasher);
+    }
+    geometry.aspect.hash(hasher);
+    geometry.portrait.hash(hasher);
+    let keystone = &geometry.keystone;
+    for value in [
+        keystone.vertical,
+        keystone.horizontal,
+        keystone.amount,
+        keystone.aspect,
+        keystone.skew,
+        keystone.focal_length,
+    ] {
+        value.to_bits().hash(hasher);
+    }
+    keystone.flags.hash(hasher);
+    for axis in [&geometry.distortion.v, &geometry.distortion.x, &geometry.distortion.m] {
+        axis.len().hash(hasher);
+        for value in axis {
+            value.to_bits().hash(hasher);
+        }
+    }
+}
+
 #[cfg(windows)]
 fn resident_source_key(
     src: &Source,
@@ -3110,7 +3150,7 @@ fn render_sized(
                         ),
                     }
                     let dust = if crate::dustdetect::enabled() {
-                        let key = dust_frame_key(src, &adj.geometry, region, out_w, out_h);
+                        let key = dust_input_key(src, adj, region, out_w, out_h, scale, level, false);
                         crate::dustdetect::detect_dust_cached(
                             key,
                             &rgba,
