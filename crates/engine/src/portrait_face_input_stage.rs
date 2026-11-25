@@ -341,6 +341,28 @@ pub struct FaceInputModelPaths {
 
 impl FaceInputModelPaths {
     pub fn from_environment(include_parsing: bool) -> Result<Self, Refusal> {
+        // A portable install ships the face-input models beside the executable
+        // under `models/faceinput`; prefer that root over a Capture One install
+        // when both exist.
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        if let Some(face_input_root) = face_input_root_from_exe(exe_dir.as_deref()) {
+            let landmark_root = std::env::var_os("AURORA_FACE_LANDMARK_ROOT")
+                .map(PathBuf::from)
+                .or_else(default_face_landmark_root)
+                .ok_or(Refusal::MissingInput("AURORA_FACE_LANDMARK_ROOT"))?;
+            let parsing = if include_parsing {
+                face_parsing_v2_model_path().unwrap_or_default()
+            } else {
+                PathBuf::new()
+            };
+            let paths = Self::from_face_input_root(face_input_root, &landmark_root, parsing);
+            if include_parsing && !paths.parsing.is_file() {
+                return Err(Refusal::MissingInput(FACE_PARSING_V2_MODEL_ENV));
+            }
+            return Ok(paths);
+        }
         let c1_root = std::env::var_os("AURORA_C1_DIR")
             .map(PathBuf::from)
             .or_else(|| crate::aimask::c1_roots().into_iter().next())
@@ -372,6 +394,21 @@ impl FaceInputModelPaths {
         )
     }
 
+    /// Builds paths from a flat `faceinput` root that holds `faceDetection.onnx`
+    /// and `faceMesh.onnx` directly, reusing the landmark-derived fields of
+    /// [`Self::from_roots`].
+    fn from_face_input_root(
+        face_input_root: impl AsRef<Path>,
+        landmark_root: &Path,
+        parsing: PathBuf,
+    ) -> Self {
+        let face_input_root = face_input_root.as_ref();
+        let mut paths = Self::from_roots(face_input_root, landmark_root, parsing);
+        paths.detection = face_input_root.join("faceDetection.onnx");
+        paths.mesh = face_input_root.join("faceMesh.onnx");
+        paths
+    }
+
     fn from_roots(c1_root: &Path, landmark_root: &Path, parsing: PathBuf) -> Self {
         let extra52_local = landmark_root.join("2722162333").join("model.onnx");
         let extra52 = if extra52_local.is_file() {
@@ -401,14 +438,45 @@ impl FaceInputModelPaths {
     }
 }
 
+/// Ordered executable-relative roots that may hold a flat `faceinput`
+/// directory (`faceDetection.onnx` + `faceMesh.onnx`). The portable install
+/// layout is `<exe_dir>/models/faceinput`; the others cover bundled assets and
+/// a dev tree where the binary sits two levels under the repository root.
+fn face_input_model_roots(exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = exe_dir {
+        for root in [
+            dir.join("models").join("faceinput"),
+            dir.join("assets").join("portrait").join("faceinput"),
+            dir.join("faceinput"),
+            dir.join("..").join("..").join("models").join("faceinput"),
+        ] {
+            if !roots.iter().any(|existing| *existing == root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+fn face_input_root_from_exe(exe_dir: Option<&Path>) -> Option<PathBuf> {
+    face_input_model_roots(exe_dir).into_iter().find(|root| {
+        root.join("faceDetection.onnx").is_file() && root.join("faceMesh.onnx").is_file()
+    })
+}
+
 fn default_face_landmark_root() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("models").join("landmark"));
+            candidates.push(dir.join("assets").join("portrait").join("landmark"));
             candidates.push(dir.join("landmark"));
+            candidates.push(dir.join("..").join("..").join("models").join("landmark"));
         }
     }
+    // Development fallback: only selected when the directory actually holds the
+    // three landmark files, so a clean install never depends on this path.
     candidates.push(PathBuf::from(
         r"C:\WorkSpace\Aurora Studio\04_reference\legacy-root\逆向工程\像素蛋糕\analysis\model-recovery-landmark-independent",
     ));
@@ -507,6 +575,15 @@ fn face_parsing_v2_model_path() -> Option<PathBuf> {
             let mut candidates = Vec::new();
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
+                    let roots = [
+                        dir.join("models").join("faceparsing"),
+                        dir.join("assets").join("portrait").join("faceparsing"),
+                        dir.join("..").join("..").join("models").join("faceparsing"),
+                    ];
+                    for root in roots {
+                        candidates.push(root.join("2102828093.onnx"));
+                        candidates.push(root.join("fbe.onnx"));
+                    }
                     candidates.push(dir.join("models").join("2102828093.onnx"));
                     candidates.push(dir.join("models").join("fbe.onnx"));
                     candidates.push(dir.join("2102828093.onnx"));
@@ -544,17 +621,7 @@ impl FaceInputBackend {
     fn from_env() -> Result<Self, Refusal> {
         let raw = std::env::var(FACE_INPUT_BACKEND_ENV).unwrap_or_default();
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" => {
-                #[cfg(test)]
-                {
-                    Ok(Self::Cpu)
-                }
-                #[cfg(not(test))]
-                {
-                    Ok(Self::Auto)
-                }
-            }
-            "cpu" => Ok(Self::Cpu),
+            "" | "cpu" => Ok(Self::Cpu),
             "cuda" => Ok(Self::Cuda),
             "directml" | "dml" => Ok(Self::DirectMl),
             "auto" => Ok(Self::Auto),
@@ -758,6 +825,67 @@ impl FaceInputBundle {
     ) -> Result<SlimProducerInputs, Refusal> {
         let digest = self.digest_for(stage);
         self.slim_inputs_for_stage_with_sha(transform, stage, digest)
+    }
+
+    /// Maps a source-frame `FaceInputBundle` (cached on the immutable decoded
+    /// source) into the current stage viewport via `FaceStageTransform`.
+    /// This lets color/exposure/portrait drags reuse cached face landmarks with
+    /// zero ONNX re-inference whenever geometry has not changed.
+    pub fn for_stage_with_sha(
+        &self,
+        transform: &FaceStageTransform,
+        stage: &Image,
+        job_id: u64,
+        digest: [u8; 32],
+    ) -> Result<Self, Refusal> {
+        if transform.source_size != self.source_size
+            || transform.stage_size != [stage.width, stage.height]
+        {
+            return Err(Refusal::ShapeMismatch(FACE_STAGE_TRANSFORM_ERROR));
+        }
+        let map_pts = |pts: &[[f32; 2]]| -> Result<Vec<[f32; 2]>, Refusal> {
+            pts.iter()
+                .map(|p| transform.source_point_to_stage(*p))
+                .collect()
+        };
+        let points17 = map_pts(&self.points17)?;
+        let points142 = map_pts(&self.points142)?;
+        let points194 = map_pts(&self.points194)?;
+        let points414 = map_pts(&self.points414)?;
+        let p0 = transform.source_point_to_stage([self.roi_xywh[0], self.roi_xywh[1]])?;
+        let p1 = transform.source_point_to_stage([
+            self.roi_xywh[0] + self.roi_xywh[2],
+            self.roi_xywh[1] + self.roi_xywh[3],
+        ])?;
+        let min_x = p0[0].min(p1[0]);
+        let min_y = p0[1].min(p1[1]);
+        let max_x = p0[0].max(p1[0]);
+        let max_y = p0[1].max(p1[1]);
+        let roi_xywh = [min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)];
+        let sw = stage.width.max(1) as f32;
+        let sh = stage.height.max(1) as f32;
+        let roi_normalized_xywh = [
+            roi_xywh[0] / sw,
+            roi_xywh[1] / sh,
+            roi_xywh[2] / sw,
+            roi_xywh[3] / sh,
+        ];
+        Ok(Self {
+            job_id,
+            source_size: [stage.width, stage.height],
+            source_sha256: digest,
+            detection: self.detection.clone(),
+            mesh: self.mesh.clone(),
+            roi_xywh,
+            roi_normalized_xywh,
+            points17,
+            points142,
+            points194,
+            points414,
+            landmark_producer: self.landmark_producer.clone(),
+            model_inputs: None,
+            bound_digest: Some((digest, stage.pixels.as_ptr() as usize, stage.pixels.len())),
+        })
     }
 
     pub fn slim_inputs_for_stage_with_sha(
@@ -4221,6 +4349,35 @@ mod tests {
         let left = quantize_roi([0.125, 0.25, 0.5, 0.5]).unwrap();
         let right = quantize_roi([0.125001, 0.25, 0.5, 0.5]).unwrap();
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn face_input_model_roots_prefer_exe_models_then_assets_then_dev() {
+        let exe = Path::new(r"C:\app\bin");
+        let roots = face_input_model_roots(Some(exe));
+        assert_eq!(
+            roots,
+            vec![
+                exe.join("models").join("faceinput"),
+                exe.join("assets").join("portrait").join("faceinput"),
+                exe.join("faceinput"),
+                exe.join("..").join("..").join("models").join("faceinput"),
+            ]
+        );
+        assert!(face_input_model_roots(None).is_empty());
+    }
+
+    #[test]
+    fn face_input_model_roots_do_not_duplicate_on_windows_style_paths() {
+        // `..\..\models` only collides with `models` for a two-deep exe dir;
+        // the helper keeps first-seen order and never repeats an entry.
+        let exe = Path::new(r"C:\app");
+        let roots = face_input_model_roots(Some(exe));
+        let mut unique = roots.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), roots.len());
+        assert_eq!(roots[0], exe.join("models").join("faceinput"));
     }
 }
 

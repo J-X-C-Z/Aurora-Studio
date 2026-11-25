@@ -3357,21 +3357,60 @@ fn render_sized(
             }
         }
         // Keep R17's PF108 path on the stage frame; its parsing semantics are
-        // owned by the separate teeth lane.
+        // owned by the separate teeth lane. For non-parsing, non-lens-warped
+        // attachments (2D makeup, eye/brow/vface/plump geometry), reuse the
+        // immutable decoded source's cached landmarks via FaceStageTransform so
+        // dragging exposure/color sliders never re-runs ONNX face detection.
         if want_stage_attachments {
             let want_parsing = want_stage_parsing;
+            let geometric_lens = adj.lens.use_profile
+                || adj.lens.distortion.abs() > 1.0e-6
+                || adj.lens.shift_x.abs() > 1.0e-6
+                || adj.lens.shift_y.abs() > 1.0e-6
+                || adj.lens.tilt.abs() > 1.0e-6;
             if let Some(stage_frame) = stage_frame.as_ref() {
-                match stage_bundle_cached(
-                    &stage_bundle,
-                    stage_frame,
-                    receipt.job_id(),
-                    stage_include_parsing,
-                    stage_sha256,
-                ) {
+                let mapped_from_source = if !stage_include_parsing && !geometric_lens {
+                    (|| -> Result<crate::FaceInputBundle, aurora_portrait::Refusal> {
+                        let source_frame = src.face_input_image();
+                        let source_bundle = stage_face_bundle(
+                            receipt.job_id(),
+                            source_frame.as_ref(),
+                            false,
+                            None,
+                        )?;
+                        let transform = crate::FaceStageTransform::new(
+                            [src.size().0, src.size().1],
+                            [out_w, out_h],
+                            [region.x, region.y, region.width, region.height],
+                            &adj.geometry,
+                        )?;
+                        source_bundle.for_stage_with_sha(
+                            &transform,
+                            stage_frame,
+                            receipt.job_id(),
+                            stage_sha256.unwrap(),
+                        )
+                    })()
+                    .ok()
+                } else {
+                    None
+                };
+                let bundle_res: Result<&crate::FaceInputBundle, aurora_portrait::Refusal> =
+                    match mapped_from_source.as_ref() {
+                        Some(mapped) => Ok(mapped),
+                        None => stage_bundle_cached(
+                            &stage_bundle,
+                            stage_frame,
+                            receipt.job_id(),
+                            stage_include_parsing,
+                            stage_sha256,
+                        ),
+                    };
+                match bundle_res {
                     Ok(bundle) => {
                         let mut inputs = producer_inputs.take().unwrap_or_default();
                         let mut attached = false;
-                        if inputs.slim.is_none() {
+                        if want_stage_slim && inputs.slim.is_none() {
                             match bundle.slim_inputs(stage_frame) {
                                 Ok(slim) => {
                                     inputs.slim = Some(slim);
