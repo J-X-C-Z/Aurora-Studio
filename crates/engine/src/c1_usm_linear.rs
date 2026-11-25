@@ -733,3 +733,324 @@ mod tests {
         assert!(out.iter().all(|v| *v == 0.0));
     }
 }
+
+// ===========================================================================
+// Host-side mapping additions, c1-parse lane, 2026-11-25.
+//
+// All constants below were read from the current ImgCoreDll.dll
+// (SHA-256 ca02b6ac2786e9a100f63221df7340e5df210416eb0bd53a4bb1bfc2306a44a4)
+// at the VAs quoted in each doc comment.  Nothing here is estimated.
+//
+// NOTE: `gaussian_taps_integrated` above is the earlier approximation retained
+// for the existing callers.  `gaussian_taps_c1` below is the literal host
+// transcription (bucket integral over `n` taps, normalised so the sum of all
+// `n` taps is 1, not center + 2*sum).  Prefer the latter for parity work.
+// ===========================================================================
+
+/// Number of taps requested by `CImgOpUnsharpMaskLinear` parameter prep.
+/// `op+0x94 = 13` (0xd) normally, `33` (0x21) when `settings[+0x460] == 1`
+/// (0x18181c143 / 0x18181c152).  The Run body may use fewer taps.
+pub const C1_TAPS_STD: usize = 13;
+pub const C1_TAPS_HQ: usize = 33;
+
+/// A&S 7.1.26 coefficients, used verbatim by `erfc` at `0x1813f04a0`
+/// (`p=0x182a380d8`, `a1=0x182a38008`, `0.284496736=0x182a38048`,
+/// `a3=0x182a398c0`, `a4=0x182a39a50`, `a5=0x182a386e0`).
+pub const ERFC_P: f64 = 0.3275911;
+pub const ERFC_A1: f64 = 0.254829592;
+pub const ERFC_A2: f64 = -0.284496736;
+pub const ERFC_A3: f64 = 1.421413741;
+pub const ERFC_A4: f64 = -1.453152027;
+pub const ERFC_A5: f64 = 1.061405429;
+/// Large-argument continued fraction constants (`0x182a383e0`, `0x182a3a9c0`,
+/// `0x182a38990`).
+pub const ERFC_CF_A: f64 = 0.879249;
+pub const ERFC_SQRT_PI: f64 = 1.77245385090552;
+pub const ERFC_CF_B: f64 = 1.128379;
+/// Branch points (`0x182a3cec0` = 3.0 in erfc, `0x182a37dd8` = 0.1 in erf).
+pub const ERFC_SWITCH: f64 = 3.0;
+pub const ERF_SERIES_SWITCH: f64 = 0.1;
+/// `2/sqrt(pi)` (`0x182a38998`), the Maclaurin scale for erf.
+pub const TWO_OVER_SQRT_PI: f64 = 1.12837916709551;
+
+/// Host `erfc` (`0x1813f04a0`), transcribed bit-for-bit in f64.
+pub fn erfc_c1(x: f64) -> f64 {
+    let ax = x.abs();
+    let mut val = if ax < ERFC_SWITCH {
+        let t = 1.0 / (1.0 + ERFC_P * ax);
+        let r = (((ERFC_A5 * t + ERFC_A4) * t + ERFC_A3) * t + ERFC_A2) * t + ERFC_A1;
+        (r * t) * (-ax * ax).exp()
+    } else {
+        (-ax * ax).exp() / (ERFC_SQRT_PI * ax + 1.0 / (ERFC_CF_B * ax + 1.0 / (ERFC_CF_A * ax)))
+    };
+    if x < 0.0 {
+        val = 2.0 - val;
+    }
+    val
+}
+
+/// Host `erf` (`0x1813f0600`): `1 - erfc(|x|)` for `|x| > 0.1`, otherwise the
+/// three-term Maclaurin series scaled by `2/sqrt(pi)`.
+pub fn erf_c1(x: f64) -> f64 {
+    let ax = x.abs();
+    let r = if ax > ERF_SERIES_SWITCH {
+        1.0 - erfc_c1(ax)
+    } else {
+        let x2 = ax * ax;
+        (ax - ax * x2 / 3.0 + ax * x2 * x2 / 10.0) * TWO_OVER_SQRT_PI
+    };
+    if x < 0.0 { -r } else { r }
+}
+
+/// `0x182a383f0` = sqrt(pi)/2 as stored (truncated) in the DLL.
+pub const BAND_SCALE: f64 = 0.88622692545276;
+/// `0x182a3c2c0` = sqrt(2*pi) as stored (truncated) in the DLL.
+pub const SQRT_2PI: f64 = 2.506628274631;
+
+/// `0x1813f0690`: `int_a^b exp(-(t/s)^2) dt`, as computed by the host.
+pub fn erf_band_helper(a: f64, b: f64, s: f64) -> f64 {
+    (erf_c1(b / s) - erf_c1(a / s)) * s * BAND_SCALE
+}
+
+/// Run-body tap-count selection (0x181823c89..0x181823cd4 and the twin at
+/// 0x181825148..0x18182518a):
+/// `n = min(cap, max(3, trunc(5*sigma + 2.5) | 1))`.
+pub fn tap_count_c1(sigma: f32, cap: usize) -> usize {
+    let est = (sigma * 5.0 + 2.5) as i32; // cvttss2si: truncation toward zero
+    let odd = (est | 1).max(3) as usize;
+    odd.min(cap)
+}
+
+/// `0x1813569b0`: pixel-integrated Gaussian taps.
+///
+/// `den = sqrt(2)*sigma` (double).  For each tap `i`:
+/// `w_i = (erf((t+0.5)/den) - erf((t-0.5)/den)) * den * sqrt(pi)/2`,
+/// `t = (i - (n-1)/2)` (the subtraction is f32, then widened to f64).
+/// Stored taps are f32; the running sum is `f32(f64(sum) + w_i)` after every
+/// tap, and the final division is f32.
+pub fn gaussian_taps_c1(n: usize, sigma: f32) -> (Vec<f32>, usize) {
+    let n = n.max(1);
+    let mid = ((n - 1) as f32) * 0.5;
+    let den = std::f64::consts::SQRT_2 * sigma as f64;
+    let mut taps = Vec::with_capacity(n);
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let t = (i as f32 - mid) as f64;
+        let w = erf_band_helper(t - 0.5, t + 0.5, den);
+        taps.push(w as f32);
+        sum = (sum as f64 + w) as f32;
+    }
+    if sum != 0.0 {
+        for w in &mut taps {
+            *w /= sum;
+        }
+    }
+    (taps, n / 2)
+}
+
+/// Radius slider -> internal Gaussian sigma (`0x18181bbe2..0x18181bc4e`):
+/// `x >= 0.5 -> 0.7x + 0.3`; `0.09 < x < 0.5 -> 0.97*sqrt(x-0.09)`; else 0.
+pub fn radius_curve_c1(x: f32) -> f32 {
+    if x >= 0.5 {
+        x * 0.7 + 0.3
+    } else if x > 0.09 {
+        (x - 0.09).sqrt() * 0.97
+    } else {
+        0.0
+    }
+}
+
+/// `0x181356cd0`: adjusts a radius and a threshold/value.
+///
+/// Radius: `g > 1 -> r*g`; else `r > 0.15 -> (r-0.15)*g + 0.15`; else `r`.
+/// Threshold: `s * (1 - w(r')^2) / (1 - w(r)^2)` with
+/// `w(r) = erf(0.5/(r*sqrt(2)))`.  The host evaluates `w` through
+/// `0x1813f0690` and divides by `r*sqrt(2*pi)`; the identity above is exact.
+pub fn radius_remap_c1(r: f32, s: f32, g: f32) -> (f32, f32) {
+    let r0 = r.max(1e-6);
+    let rp = if g > 1.0 {
+        r0 * g
+    } else if r0 > 0.15 {
+        (r0 - 0.15) * g + 0.15
+    } else {
+        r0
+    };
+    let band = |x: f32| {
+        let rr = x as f64;
+        erf_band_helper(-0.5, 0.5, rr * std::f64::consts::SQRT_2) / (rr * SQRT_2PI)
+    };
+    let den = 1.0 - band(r0).powi(2);
+    let num = 1.0 - band(rp).powi(2);
+    let s_out = if den != 0.0 { ((s as f64) * num / den) as f32 } else { 0.0 };
+    (rp, s_out)
+}
+
+/// `0x18181bb6b..0x18181bbe6`: base/halo radius scalar `op+0x264`.
+/// `f3b0 * min(f3b4, 1)`; if non-positive use `f128`; doubled when
+/// `a8 == 2 && b0 in {1,2}`.
+pub fn op264_c1(f3b0: f32, f3b4: f32, f128: f64, a8: i32, b0: i32) -> f32 {
+    let mut v = if f3b4 < 1.0 { f3b0 * f3b4 } else { f3b0 };
+    if v <= 0.0 {
+        v = f128 as f32;
+    }
+    if a8 == 2 && (b0 == 1 || b0 == 2) {
+        v += v;
+    }
+    v
+}
+
+/// Variant-8 `float8` argument, built in `0x18181ee60` (`[rsp+0x78]`) and in
+/// the CPU reference `0x181820410` (fixed `r = 2` defaults).
+///
+/// `s0 = (2r+1)^2` (always); `s1 = int(f11078)` when `mode6 && f11078 > 0`,
+/// else `((2r+1)^2 + 1) / 4` (integer division);
+/// `s2 = 1.0` or `int(f1107c)*0.01`; `s3 = 1/r` or `exp2(0.1*f11080)/r`;
+/// `s4 = 1/(2r+1)^2` or `exp2(0.1*f11084)/(2r+1)^2`; `s5..s7 = 0` and the
+/// kernel never reads them.
+pub fn halo_float8_c1(
+    r_px: i32,
+    mode6: bool,
+    f1107c: f32,
+    f11078: f32,
+    f11080: f32,
+    f11084: f32,
+) -> [f32; 8] {
+    let r = r_px.max(1);
+    let win = (2 * r + 1) * (2 * r + 1);
+    let inv_r = 1.0f32 / r as f32;
+    let inv_win = 1.0f32 / win as f32;
+    let mut s1 = ((win + 1) / 4) as f32;
+    let (s2, s3, s4) = if mode6 {
+        if f11078 > 0.0 {
+            s1 = (f11078 as i32) as f32;
+        }
+        let s2 = if f1107c > 0.0 { (f1107c as i32) as f32 * 0.01 } else { 1.0 };
+        (s2, (0.1 * f11080).exp2() * inv_r, (0.1 * f11084).exp2() * inv_win)
+    } else {
+        (1.0, inv_r, inv_win)
+    };
+    [win as f32, s1, s2, s3, s4, 0.0, 0.0, 0.0]
+}
+
+#[cfg(test)]
+mod host_map_tests {
+    use super::*;
+
+    fn close(a: f64, b: f64, eps: f64) -> bool {
+        (a - b).abs() <= eps
+    }
+
+    #[test]
+    fn erf_matches_math_reference() {
+        // The host approximation is A&S 7.1.26 (max error ~1.5e-7).
+        for &x in &[-3.0f64, -2.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0, 3.0] {
+            let got = erf_c1(x);
+            let want = libm_erf(x);
+            assert!(close(got, want, 5e-6), "erf({x}) got {got} want {want}");
+        }
+    }
+
+    fn libm_erf(x: f64) -> f64 {
+        // Series/rational reference independent of the host approximation.
+        if x.abs() <= 2.0 {
+            // erf(x) = 2/sqrt(pi) * sum (-1)^n x^(2n+1)/(n!(2n+1))
+            let mut term = x;
+            let mut sum = x;
+            let mut n = 0.0f64;
+            while term.abs() > 1e-17 {
+                n += 1.0;
+                term *= -x * x / n;
+                sum += term / (2.0 * n + 1.0);
+            }
+            2.0 / std::f64::consts::PI.sqrt() * sum
+        } else {
+            let tail = erfc_c1(x.abs());
+            if x < 0.0 { -(1.0 - tail) } else { 1.0 - tail }
+        }
+    }
+
+    #[test]
+    fn taps_are_normalized_symmetric_and_pixel_integrated() {
+        let (t13, mid13) = gaussian_taps_c1(C1_TAPS_STD, 2.0);
+        assert_eq!(t13.len(), 13);
+        assert_eq!(mid13, 6);
+        assert!((t13.iter().map(|v| *v as f64).sum::<f64>() - 1.0).abs() < 1e-6);
+        for i in 0..6 {
+            assert!((t13[i] - t13[12 - i]).abs() < 1e-9);
+        }
+        assert!(t13[6] > t13[5] && t13[5] > t13[4]);
+
+        let (t33, mid33) = gaussian_taps_c1(C1_TAPS_HQ, 2.0);
+        assert_eq!(t33.len(), 33);
+        assert_eq!(mid33, 16);
+        assert!((t33.iter().map(|v| *v as f64).sum::<f64>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tap_count_matches_run_body_formula() {
+        assert_eq!(tap_count_c1(2.0, C1_TAPS_STD), 13);
+        assert_eq!(tap_count_c1(4.0, C1_TAPS_HQ), 23); // 5*4+2.5=22.5 -> 22|1=23
+        assert_eq!(tap_count_c1(1.0, C1_TAPS_STD), 7); // 7.5 -> 7
+        assert_eq!(tap_count_c1(0.2, C1_TAPS_STD), 3); // 3.5 -> 3
+        assert_eq!(tap_count_c1(0.0, C1_TAPS_STD), 3); // floor 3
+        assert_eq!(tap_count_c1(10.0, C1_TAPS_STD), 13); // cap
+        assert_eq!(tap_count_c1(0.1, C1_TAPS_HQ), 3);
+    }
+
+    #[test]
+    fn radius_curve_is_piecewise_exact() {
+        assert_eq!(radius_curve_c1(0.09), 0.0);
+        assert!(radius_curve_c1(0.1) > 0.0);
+        assert!((radius_curve_c1(0.5) - (0.5 * 0.7 + 0.3)).abs() < 1e-7);
+        assert!((radius_curve_c1(2.0) - 1.7).abs() < 1e-7);
+        assert!((radius_curve_c1(0.3) - 0.97 * (0.3f32 - 0.09).sqrt()).abs() < 1e-7);
+    }
+
+    #[test]
+    fn radius_remap_is_identity_at_gain_one() {
+        let (r, s) = radius_remap_c1(2.0, 1.0, 1.0);
+        assert_eq!(r, 2.0);
+        assert!((s - 1.0).abs() < 1e-6);
+        // Shrinking the radius raises 1-w^2, so the threshold scales down.
+        let (r2, s2) = radius_remap_c1(2.0, 1.0, 0.5);
+        assert!(r2 < 2.0 && s2 < 1.0);
+    }
+
+    #[test]
+    fn halo_float8_default_matches_cpu_reference_r2() {
+        let v = halo_float8_c1(2, false, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(v[0], 25.0);
+        assert_eq!(v[0].to_bits(), 0x41c80000);
+        assert_eq!(v[1], 6.0); // (25+1)/4
+        assert_eq!(v[1].to_bits(), 0x40c00000);
+        assert_eq!(v[2], 1.0);
+        assert_eq!(v[3], 0.5);
+        assert_eq!(v[4], 0.04f32);
+        assert_eq!(&v[5..], &[0.0, 0.0, 0.0]);
+        // These are exactly the hardcoded constants in 0x181820410.
+    }
+
+    #[test]
+    fn halo_float8_mode6_uses_camera_fields() {
+        let v = halo_float8_c1(2, true, 100.0, 0.0, 10.0, 0.0);
+        assert_eq!(v[2], 1.0); // int(100)*0.01
+        assert_eq!(v[3], 1.0); // exp2(1.0) * (1/2)
+        assert_eq!(v[4], 0.04f32); // exp2(0)*1/25
+        let v2 = halo_float8_c1(2, true, -5.0, 0.0, 0.0, 0.0);
+        assert_eq!(v2[2], 1.0); // non-positive -> default
+        // settings[+0x11078] overrides the count threshold only in mode 6
+        let v3 = halo_float8_c1(2, true, 0.0, 9.0, 0.0, 0.0);
+        assert_eq!(v3[1], 9.0);
+        let v4 = halo_float8_c1(2, false, 0.0, 9.0, 0.0, 0.0);
+        assert_eq!(v4[1], 6.0);
+    }
+
+    #[test]
+    fn op264_rules() {
+        assert_eq!(op264_c1(3.0, 0.5, 9.0, 0, 0), 1.5);
+        assert_eq!(op264_c1(3.0, 1.0, 9.0, 0, 0), 3.0);
+        assert_eq!(op264_c1(0.0, 1.0, 7.5, 0, 0), 7.5);
+        assert_eq!(op264_c1(2.0, 1.0, 0.0, 2, 1), 4.0);
+        assert_eq!(op264_c1(2.0, 1.0, 0.0, 2, 3), 2.0);
+    }
+}

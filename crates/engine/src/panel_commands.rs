@@ -152,20 +152,36 @@ fn rgb_to_rgba(rgb: image::RgbImage) -> RgbaImage {
     RgbaImage::new(width, height, pixels)
 }
 
-/// All portrait effect ids the Windows bridge can currently run from a frame,
-/// mask and bundled LUT bytes. The registry is read-only; it does not imply
-/// automatic landmark or model generation.
+/// The complete portrait catalogue with the engine's own bridge state.
+///
+/// `engine_bridge` is derived from the dispatcher: it is true exactly when
+/// `portrait_stage` reads `pc:<pf>` and hands the frame to a recovered kernel
+/// (or a typed refusal naming the missing same-job input). It is not a parity or
+/// acceptance claim, and `automatic` stays false because no row has real-photo
+/// acceptance for the desktop default packaging.
 pub(crate) fn portrait_capabilities() -> Vec<PortraitCapability> {
-    crate::portrait_stage::supported_effects()
-        .iter()
-        .map(|pf| PortraitCapability {
-            pf: *pf,
-            key: format!("pf{pf}"),
-            label: format!("PF{pf}"),
-            stage: "cpu_stage",
-            required_inputs: vec!["frame".into(), "mask".into()],
-            engine_bridge: true,
-            automatic: false,
+    aurora_portrait::catalog()
+        .into_iter()
+        .map(|meta| {
+            let stage = match meta.access {
+                aurora_portrait::Access::Cpu => "cpu_stage",
+                aurora_portrait::Access::GpuPlanned => "parameters_only",
+                aurora_portrait::Access::Refused => "unavailable",
+            };
+            PortraitCapability {
+                pf: meta.pf,
+                key: if meta.key.is_empty() {
+                    format!("pf{}", meta.pf)
+                } else {
+                    meta.key.to_string()
+                },
+                label: meta.label.to_string(),
+                stage,
+                required_inputs: meta.inputs.iter().map(|input| (*input).to_string()).collect(),
+                engine_bridge: stage == "cpu_stage"
+                    && crate::portrait_stage::is_bridged_effect(meta.pf),
+                automatic: false,
+            }
         })
         .collect()
 }
@@ -356,6 +372,33 @@ mod tests {
         assert!(!capabilities.is_empty());
         assert!(capabilities.iter().any(|capability| capability.pf == 90005));
         assert!(capabilities.iter().all(|capability| !capability.automatic));
+    }
+
+    #[test]
+    fn portrait_capabilities_report_the_derived_bridge_state() {
+        let capabilities = portrait_capabilities();
+        let catalogue = aurora_portrait::catalog();
+        assert_eq!(capabilities.len(), catalogue.len());
+        let bridged = crate::portrait_stage::bridged_effects();
+        let claimed = capabilities
+            .iter()
+            .filter(|capability| capability.engine_bridge)
+            .map(|capability| capability.pf)
+            .collect::<Vec<_>>();
+        assert_eq!(claimed, bridged);
+        assert!(capabilities.windows(2).all(|pair| pair[0].pf < pair[1].pf));
+        for capability in &capabilities {
+            assert!(!capability.automatic, "automatic needs real-photo acceptance");
+            assert_eq!(
+                capability.engine_bridge,
+                capability.stage == "cpu_stage"
+                    && crate::portrait_stage::is_bridged_effect(capability.pf),
+            );
+        }
+        // Rows that only declare parameters must never claim a bridge.
+        for capability in capabilities.iter().filter(|row| row.stage != "cpu_stage") {
+            assert!(!capability.engine_bridge, "PF{}", capability.pf);
+        }
     }
 
     #[test]

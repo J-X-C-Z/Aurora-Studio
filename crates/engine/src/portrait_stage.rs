@@ -467,6 +467,162 @@ pub struct PortraitEffectRun {
 pub struct PortraitRunReport {
     pub job_id: Option<u64>,
     pub effects: Vec<PortraitEffectRun>,
+    /// Whether the same-job bundle carried the FaceParsingV2 planes. When this
+    /// is false, a row that refuses for a mask names a consequence of the
+    /// missing model rather than a missing caller plane.
+    pub parsing_available: bool,
+    /// Whether the same-job bundle carried the 414-point slim geometry.
+    pub slim_available: bool,
+    /// The face-input producer's own refusal for this frame, when it failed.
+    /// This is the root cause behind the per-row mask/plane refusals.
+    pub face_input_refusal: Option<Refusal>,
+}
+
+/// What the renderer actually did with one row on one frame.
+///
+/// This is derived from the dispatcher's own [`PortraitEffectRun`], so it states
+/// an observed runtime outcome rather than what a capability table claims. A
+/// row only reports [`Self::Ready`] when it produced pixels on this frame; every
+/// other value names the blocking condition instead of hiding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortraitRuntimeStatus {
+    /// The row executed and wrote pixels (CPU, or CUDA with a dispatch).
+    Ready,
+    /// The row executed on CPU after a CUDA attempt failed.
+    CudaFallback,
+    /// The control was neutral or the edge gate closed; nothing was requested.
+    NotRequested,
+    /// A named ONNX model / model asset / model ticket is absent.
+    MissingModel,
+    /// No face or person target was detected in the frame.
+    NoTarget,
+    /// Some other same-job input is missing or malformed.
+    IncompleteInput,
+    /// No dispatcher route exists for this ParamFlag.
+    NotImplemented,
+}
+
+impl PortraitRuntimeStatus {
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Ready | Self::CudaFallback)
+    }
+
+    /// Stable machine token for the desktop UI and the frontend contract.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::CudaFallback => "cuda_fallback",
+            Self::NotRequested => "not_requested",
+            Self::MissingModel => "missing_model",
+            Self::NoTarget => "no_target",
+            Self::IncompleteInput => "incomplete_input",
+            Self::NotImplemented => "not_implemented",
+        }
+    }
+}
+
+/// Refusal names that mean "a model file / model identity is absent", as
+/// opposed to "the caller did not supply a same-job plane". Kept as one list so
+/// new producer refusals only have to be named here.
+fn model_input_refusal(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("model") || lower.contains("onnx") || lower.contains("constants")
+}
+
+/// Refusal names that mean "there is no face/person to work on".
+fn missing_target_refusal(name: &str) -> bool {
+    matches!(name, "C1 face detection score")
+        || name.contains("no face")
+        || name.contains("no person")
+        || name.contains("no target")
+}
+
+fn refusal_runtime_status(refusal: &Refusal) -> PortraitRuntimeStatus {
+    match refusal {
+        Refusal::NotImplemented(_) | Refusal::UnknownEffect(_) => {
+            PortraitRuntimeStatus::NotImplemented
+        }
+        Refusal::MissingInput(name) => {
+            if model_input_refusal(name) {
+                PortraitRuntimeStatus::MissingModel
+            } else if missing_target_refusal(name) {
+                PortraitRuntimeStatus::NoTarget
+            } else {
+                PortraitRuntimeStatus::IncompleteInput
+            }
+        }
+        Refusal::ShapeMismatch(_) | Refusal::ValueOutOfRange(_) => {
+            PortraitRuntimeStatus::IncompleteInput
+        }
+    }
+}
+
+impl PortraitEffectRun {
+    /// Classify this row's observed outcome. `skip_reason` wins over
+    /// `refusal`; `executed` with no failure is the only ready path.
+    pub fn runtime_status(&self) -> PortraitRuntimeStatus {
+        if let Some(reason) = &self.skip_reason {
+            return match reason {
+                PortraitSkipReason::InputRefused(refusal) => refusal_runtime_status(refusal),
+                PortraitSkipReason::EdgeGateClosed => PortraitRuntimeStatus::IncompleteInput,
+                PortraitSkipReason::Cuda(_) => PortraitRuntimeStatus::CudaFallback,
+            };
+        }
+        if let Some(refusal) = &self.refusal {
+            return refusal_runtime_status(refusal);
+        }
+        if !self.executed {
+            return PortraitRuntimeStatus::NotRequested;
+        }
+        let cuda_attempted = self
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("CUDA"));
+        if self.backend == PortraitBackend::Cpu && cuda_attempted {
+            PortraitRuntimeStatus::CudaFallback
+        } else {
+            PortraitRuntimeStatus::Ready
+        }
+    }
+}
+
+impl PortraitRunReport {
+    /// A row's status with the upstream face-input failure folded in.
+    ///
+    /// When the same-job face bundle never materialised, a row's own refusal
+    /// names a downstream mask or plane. The bundle's refusal is the actual
+    /// cause ("face model file" vs "C1 face detection score"), so it wins for
+    /// rows that otherwise only report a missing same-job input.
+    pub fn status_of(&self, effect: &PortraitEffectRun) -> PortraitRuntimeStatus {
+        let base = effect.runtime_status();
+        if base != PortraitRuntimeStatus::IncompleteInput {
+            return base;
+        }
+        if let Some(refusal) = &self.face_input_refusal {
+            return refusal_runtime_status(refusal);
+        }
+        if !self.parsing_available && !self.slim_available {
+            // No face producer ran at all; the row's missing plane is a
+            // consequence of the absent model bundle, not a caller omission.
+            return PortraitRuntimeStatus::MissingModel;
+        }
+        base
+    }
+
+    /// Observed status for one ParamFlag, if the dispatcher saw that row.
+    pub fn status(&self, pf: u32) -> Option<PortraitRuntimeStatus> {
+        self.effects
+            .iter()
+            .find(|effect| effect.pf == pf)
+            .map(|effect| self.status_of(effect))
+    }
+
+    /// Every row the dispatcher saw, with its observed status.
+    pub fn statuses(&self) -> impl Iterator<Item = (u32, PortraitRuntimeStatus)> + '_ {
+        self.effects
+            .iter()
+            .map(|effect| (effect.pf, self.status_of(effect)))
+    }
 }
 
 pub type Pf8050GeometryInputs<'a> = cuda_pf8050::Inputs<'a>;
@@ -551,6 +707,9 @@ pub struct ProducerInputs {
     pub pf90130: Option<Pf90130ProducerInputs>,
     pub moisture_face: Option<crate::portrait_moisture_inputs::OwnedMoistureFaceInputs>,
     pub moisture_body: Option<crate::portrait_moisture_inputs::OwnedMoistureBodyInputs>,
+    /// Why the same-frame face-input producer refused, when it did. Carried so
+    /// the run report can name the root cause instead of a downstream mask.
+    pub face_input_refusal: Option<Refusal>,
 }
 
 /// Owned same-job inputs for the recovered PF101 FilterType 41/42/43/44 stage.
@@ -3430,6 +3589,7 @@ pub struct PortraitJobInputs<'a> {
     pub plump: Option<&'a PlumpProducerInputs>,
     pub pf101: Option<&'a Pf101ProducerInputs>,
     pub pf90130: Option<&'a Pf90130ProducerInputs>,
+    pub face_input_refusal: Option<&'a Refusal>,
 }
 
 impl<'a> PortraitJobInputs<'a> {
@@ -3475,6 +3635,7 @@ impl<'a> PortraitJobInputs<'a> {
             plump: None,
             pf101: None,
             pf90130: None,
+            face_input_refusal: None,
         }
     }
 
@@ -3671,6 +3832,7 @@ impl<'a> PortraitJobInputs<'a> {
         self.makeup_bundle = producer.makeup_bundle.as_ref();
         self.pf101 = producer.pf101.as_ref();
         self.pf90130 = producer.pf90130.as_ref();
+        self.face_input_refusal = producer.face_input_refusal.as_ref();
         // Borrow the owned same-frame planes back out of `producer`, which lives
         // for `'a` like `self`. A missing owned bundle stays `None`, so the
         // PF90002/PF90010 rows still refuse with their own MissingInput names.
@@ -3804,6 +3966,29 @@ const SUPPORTED_EFFECTS: &[u32] = &[
 /// imply automatic landmark or model generation.
 pub fn supported_effects() -> &'static [u32] {
     SUPPORTED_EFFECTS
+}
+
+/// Whether the unified portrait dispatcher has a route for `pf`.
+///
+/// A route means: a `pc:<pf>` value is read from `AdjustmentSet::extra` and the
+/// frame is handed to a recovered kernel (or a typed refusal when its same-job
+/// inputs are absent). It is not a pixel-parity or evidence claim.
+pub fn is_bridged_effect(pf: u32) -> bool {
+    supports_effect(pf)
+}
+
+/// Every registry row the dispatcher routes, sorted. Derived from the catalogue
+/// and [`supports_effect`] so it cannot drift from the match arms the way a
+/// hand-maintained duplicate list does.
+pub fn bridged_effects() -> Vec<u32> {
+    let mut pfs: Vec<u32> = aurora_portrait::catalog()
+        .into_iter()
+        .filter(|meta| meta.access == Access::Cpu && supports_effect(meta.pf))
+        .map(|meta| meta.pf)
+        .collect();
+    pfs.sort_unstable();
+    pfs.dedup();
+    pfs
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4570,6 +4755,28 @@ fn try_cuda_body_mesh(
 
 fn log_report(report: &PortraitRunReport) {
     for effect in &report.effects {
+        // Stable machine-readable row, one per ParamFlag the dispatcher saw:
+        // `portrait-status <pf> <token> <backend> <parsing> <slim> <detail>`.
+        // The desktop status view and the product-matrix probe read this instead
+        // of re-deriving state from the human log lines below.
+        let status = report.status_of(effect);
+        let detail = match (&effect.skip_reason, &effect.refusal) {
+            (Some(PortraitSkipReason::InputRefused(refusal)), _) => format!("{refusal:?}"),
+            (Some(PortraitSkipReason::EdgeGateClosed), _) => "edge gate closed".to_string(),
+            (Some(PortraitSkipReason::Cuda(error)), _) => format!("{error:?}"),
+            (None, Some(refusal)) => format!("{refusal:?}"),
+            (None, None) => effect.fallback_reason.clone().unwrap_or_default(),
+        }
+        .replace(['\t', '\n'], " ");
+        log::debug!(
+            "portrait-status\t{}\t{}\t{:?}\t{}\t{}\t{}",
+            effect.pf,
+            status.token(),
+            effect.backend,
+            u8::from(report.parsing_available),
+            u8::from(report.slim_available),
+            detail,
+        );
         if let Some(refusal) = &effect.refusal {
             log::debug!("portrait PF{} refused: {refusal:?}", effect.pf);
             continue;
@@ -4687,6 +4894,9 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     let mut report = PortraitRunReport {
         job_id: inputs.job_id(),
         effects: Vec::new(),
+        parsing_available: inputs.parsing.is_some(),
+        slim_available: inputs.slim.is_some(),
+        face_input_refusal: inputs.face_input_refusal.cloned(),
     };
     let missing_renderer_receipt = require_renderer_receipt
         && inputs.receipt.is_none()
@@ -6929,7 +7139,10 @@ fn apply_cpu_effect(
         90160 => apply_hair_gloss_cpu(current, degree, inputs),
         90088 => apply_stray_hair_cpu(current, degree, inputs),
         100007 => apply_smile_cpu(current, degree, inputs),
-        _ => Ok(current.clone()),
+        // Fail closed: a row that reached the CPU stage without a kernel must be
+        // reported as missing a route, never as an executed effect that happened
+        // to leave the frame unchanged.
+        _ => Err(Refusal::NotImplemented(pf)),
     }
 }
 
@@ -9466,6 +9679,215 @@ fn apply_skin_radiance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn effect_run(
+        pf: u32,
+        backend: PortraitBackend,
+        executed: bool,
+        refusal: Option<Refusal>,
+        skip_reason: Option<PortraitSkipReason>,
+        fallback_reason: Option<&str>,
+    ) -> PortraitEffectRun {
+        PortraitEffectRun {
+            pf,
+            backend,
+            dispatches: Vec::new(),
+            fallback_reason: fallback_reason.map(str::to_string),
+            skipped: !executed,
+            executed,
+            refusal,
+            skip_reason,
+        }
+    }
+
+    #[test]
+    fn runtime_status_names_the_blocking_condition() {
+        assert_eq!(
+            effect_run(8068, PortraitBackend::Cpu, true, None, None, None).runtime_status(),
+            PortraitRuntimeStatus::Ready,
+        );
+        assert_eq!(
+            effect_run(
+                8068,
+                PortraitBackend::Cpu,
+                true,
+                None,
+                None,
+                Some("CUDA effect: Unavailable(\"no adapter\")"),
+            )
+            .runtime_status(),
+            PortraitRuntimeStatus::CudaFallback,
+        );
+        assert_eq!(
+            effect_run(108, PortraitBackend::Skipped, false, None, None, None).runtime_status(),
+            PortraitRuntimeStatus::NotRequested,
+        );
+        assert_eq!(
+            effect_run(
+                90004,
+                PortraitBackend::Skipped,
+                false,
+                Some(Refusal::MissingInput("FaceParsingV2 canonical model")),
+                Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
+                    "FaceParsingV2 canonical model",
+                ))),
+                None,
+            )
+            .runtime_status(),
+            PortraitRuntimeStatus::MissingModel,
+        );
+        assert_eq!(
+            effect_run(
+                108,
+                PortraitBackend::Skipped,
+                false,
+                None,
+                Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
+                    "C1 face detection score",
+                ))),
+                None,
+            )
+            .runtime_status(),
+            PortraitRuntimeStatus::NoTarget,
+        );
+        assert_eq!(
+            effect_run(
+                90021,
+                PortraitBackend::Skipped,
+                false,
+                None,
+                Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
+                    "PF90021_LIP_MASK",
+                ))),
+                None,
+            )
+            .runtime_status(),
+            PortraitRuntimeStatus::IncompleteInput,
+        );
+        assert_eq!(
+            effect_run(
+                424242,
+                PortraitBackend::Skipped,
+                false,
+                Some(Refusal::NotImplemented(424242)),
+                None,
+                None,
+            )
+            .runtime_status(),
+            PortraitRuntimeStatus::NotImplemented,
+        );
+    }
+
+    #[test]
+    fn report_status_is_looked_up_per_param_flag() {
+        let report = PortraitRunReport {
+            job_id: Some(7),
+            effects: vec![
+                effect_run(8068, PortraitBackend::Cuda, true, None, None, None),
+                effect_run(
+                    90004,
+                    PortraitBackend::Skipped,
+                    false,
+                    None,
+                    Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
+                        "FaceParsingV2 canonical model",
+                    ))),
+                    None,
+                ),
+            ],
+            parsing_available: false,
+            slim_available: false,
+            face_input_refusal: None,
+        };
+        assert_eq!(report.status(8068), Some(PortraitRuntimeStatus::Ready));
+        assert_eq!(report.status(90004), Some(PortraitRuntimeStatus::MissingModel));
+        assert_eq!(report.status(123), None);
+        assert!(report.status(8068).is_some_and(PortraitRuntimeStatus::is_ready));
+        assert_eq!(report.statuses().count(), 2);
+    }
+
+    #[test]
+    fn upstream_face_input_refusal_names_the_root_cause() {
+        let row = effect_run(
+            108,
+            PortraitBackend::Skipped,
+            false,
+            None,
+            Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
+                "teeth mask",
+            ))),
+            None,
+        );
+        let missing_model = PortraitRunReport {
+            job_id: Some(7),
+            effects: vec![row.clone()],
+            parsing_available: false,
+            slim_available: false,
+            face_input_refusal: Some(Refusal::MissingInput("face model file")),
+        };
+        assert_eq!(
+            missing_model.status(108),
+            Some(PortraitRuntimeStatus::MissingModel)
+        );
+
+        let no_target = PortraitRunReport {
+            effects: vec![row.clone()],
+            face_input_refusal: Some(Refusal::MissingInput("C1 face detection score")),
+            ..Default::default()
+        };
+        assert_eq!(no_target.status(108), Some(PortraitRuntimeStatus::NoTarget));
+
+        // A caller omission with a live face bundle stays incomplete input.
+        let caller_gap = PortraitRunReport {
+            effects: vec![row],
+            parsing_available: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            caller_gap.status(108),
+            Some(PortraitRuntimeStatus::IncompleteInput)
+        );
+    }
+
+    #[test]
+    fn unrouted_effect_fails_closed_instead_of_reporting_executed() {
+        // A row that reaches the CPU stage without a kernel must refuse; the old
+        // `Ok(current.clone())` fallback reported `executed` with zero pixels.
+        let masks = PortraitMasks::default();
+        let inputs = PortraitJobInputs::new(&masks);
+        let source = Image::solid(2, 2, [10, 20, 30, 255]);
+        let result = apply_cpu_effect(
+            &source,
+            424242,
+            0.5,
+            &BTreeMap::new(),
+            None,
+            2,
+            2,
+            &inputs,
+            None,
+        );
+        assert_eq!(result, Err(Refusal::NotImplemented(424242)));
+    }
+
+    #[test]
+    fn bridged_effects_derive_from_the_catalogue() {
+        let bridged = bridged_effects();
+        assert!(!bridged.is_empty());
+        assert!(bridged.windows(2).all(|pair| pair[0] < pair[1]), "sorted + unique");
+        for pf in &bridged {
+            let meta = aurora_portrait::lookup(*pf).expect("bridged row is in the catalogue");
+            assert_eq!(meta.access, Access::Cpu, "PF{pf} must be a CPU row");
+            assert!(is_bridged_effect(*pf));
+        }
+        for pf in SUPPORTED_EFFECTS {
+            assert!(
+                bridged.contains(pf),
+                "PF{pf} is a supported effect and must appear in bridged_effects()"
+            );
+        }
+        assert!(!is_bridged_effect(424242));
+    }
 
     #[test]
     fn type1015_reads_the_original_194_point_contour() {
@@ -13466,6 +13888,7 @@ mod tests {
             historical_tone: None,
             historical_skin: None,
             plump: None,
+            face_input_refusal: None,
         };
 
         #[cfg(windows)]

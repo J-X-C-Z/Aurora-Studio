@@ -910,3 +910,200 @@ mod tests {
         assert!((sample_grid(&grid, 2, 2, 1, 0, 2) - 0.5).abs() < 1e-6);
     }
 }
+
+// ===========================================================================
+// 2026-11-25: low-frequency construction and method routing (c1_clarity_levels)
+//
+// Evidence: ImgCoreDll.dll SHA-256 ca02b6ac..., ImageBase 0x180000000.
+// This section records what is *proven* by disassembly / embedded CL sources
+// and deliberately leaves the rest out (see the lane report's NOT PROVEN list).
+//
+// Corrections to the module docstring above:
+//  * The Clarity2012 low-frequency source is an `ImagePyramidCacheItem` built by
+//    CImgOpClarity2012 vtable slot 18 (RVA 0x16d0510), not a set of blur levels.
+//    It contains exactly TWO levels: level0 = source/2, level1 = level0/4
+//    (RVA 0x16d05bf..0x16d0690). The op reads level0 through mParam+0x298; the
+//    executor asserts level0's inner width == (OperationFullSourceWidth + 7) / 8
+//    (RVA 0x16d20e7..0x16d2113), so the slot-18 source rect is the 1/4 proxy.
+//  * The three planes the executor allocates (RVA 0x16d1f54..0x16d205a) are a
+//    private float scratch buffer, NOT the pyramid levels.
+//  * The pyramid smoothing is the generic C1 resampler
+//    (0x134f770 -> 0x180f409a0 -> 0x181029710); no Gaussian/tent radius or
+//    weight constant exists in the Clarity2012 pyramid code. The resampler
+//    coefficient table is NOT PROVEN.
+//  * The sqrt encode offset passed by the host is 4.0f (xmm8 at RVA 0x16d1581,
+//    CL kernel arg 6 = 0x40800000 at RVA 0x16d21cf), not 16.0. The +16 seen in
+//    variants 3..8 is added *inside* those kernels to luma/channel values.
+//
+// Routing (proven):
+//  * CImgOpClarity::SetParameters (vtable 0x276bc48 slot 6 = RVA 0x16c5af0)
+//    writes op+0x84 = method; op+0x88 = amount only when method == 2 (Classic),
+//    else 0; op+0x8c = structure amount.  RVA 0x16c5b69..0x16c5b9e.
+//  * CImgOpClarity2012::SetParameters (vtable 0x27706d0 slot 6 = RVA 0x16cb0c0)
+//    copies method -> op+0x88 and amount -> op+0x8c; its executor enables a pass
+//    only when selector == method, with selectors 3/0/1. Method 2 matches none.
+//  * Therefore Classic can only run on the legacy CImgOpClarity executor
+//    (slot 11 = RVA 0x16c8470), whose CLKernelClarity (RVA 0x16c8a30) builds the
+//    15x15 tent luma grid from CL program p_041290736.cl (kernel z906da05d53).
+// ===========================================================================
+
+/// Sqrt-encode offset the host passes to the Clarity2012 low-res kernels.
+///
+/// PROVEN: `movss xmm8, [rip+0x136c3f6]` at RVA 0x16d1581 reads 4.0f, and
+/// RVA 0x16d21cf stores 0x40800000 (= 4.0f) as CL kernel argument 6.
+pub const CLARITY2012_ENCODE_OFFSET: f32 = 4.0;
+
+/// `|amount| < 1e-4` makes the executor skip a pass (RVA 0x16d1e0e..0x16d1e19).
+pub const CLARITY2012_AMOUNT_EPS: f32 = 1e-4;
+
+/// Dimensions of the two levels built by `CImgOpClarity2012` slot 18.
+///
+/// PROVEN: level0 = `((w+1)>>1, (h+1)>>1)` at RVA 0x16d05bf..0x16d05fe;
+/// level1 = `((l0w+3)>>2, (l0h+3)>>2)` at RVA 0x16d0644..0x16d0690.
+/// The returned array is `[(l0w, l0h), (l1w, l1h)]`.
+pub fn clarity2012_pyramid_level_dims(src_w: usize, src_h: usize) -> [(usize, usize); 2] {
+    let w0 = (src_w + 1) / 2;
+    let h0 = (src_h + 1) / 2;
+    let w1 = (w0 + 3) / 4;
+    let h1 = (h0 + 3) / 4;
+    [(w0, h0), (w1, h1)]
+}
+
+/// The width the executor requires of `pyramidBuf0` (RVA 0x16d20e7..0x16d20fe):
+/// `(OperationFullSourceWidth + 7) / 8`.
+pub fn clarity2012_pyramid_assert_width(full_source_width: usize) -> usize {
+    (full_source_width + 7) / 8
+}
+
+/// Per-channel sqrt encode used by CL variant 1 / the CPU fallback.
+/// `sqrt(R + 4), sqrt(G + 4), sqrt(B + 4)` on 16-bit code values.
+pub fn clarity2012_encode_rgb4(rgb: [u16; 3]) -> [f32; 3] {
+    clarity2012_encode_rgb(rgb, CLARITY2012_ENCODE_OFFSET)
+}
+
+/// Luma sqrt encode used by CL variant 2 / the CPU fallback.
+/// `sqrt(0.299 R + 0.587 G + 0.114 B + 4)`.
+pub fn clarity2012_encode_luma4(rgb: [u16; 3]) -> f32 {
+    clarity2012_encode_luma(rgb, CLARITY2012_ENCODE_OFFSET)
+}
+
+/// Grid sample coordinate, CL variants 1/2 and the CPU loop:
+/// `clamp(origin + index * step, 0, inner - 1)`.
+///
+/// `step` is `max(1, mParam+0xf8)` (RVA 0x16d211e..0x16d2132).
+pub fn clarity2012_grid_coord(index: i32, step: i32, origin: i32, inner: i32) -> i32 {
+    let v = origin.saturating_add(index.saturating_mul(step));
+    v.max(0).min(inner - 1)
+}
+
+/// Private 3-rect float plane dimensions (RVA 0x16d1ec6..0x16d1f2d).
+///
+/// `aligned = (op + (offset & 7) + 7) & !7`,
+/// `plane = (aligned >> 3) + 2 + 2 * grid_side`.
+pub fn clarity2012_plane_dims(
+    op_w: usize,
+    op_h: usize,
+    off_x: usize,
+    off_y: usize,
+    grid_side: usize,
+) -> (usize, usize) {
+    let aw = (op_w + (off_x & 7) + 7) & !7;
+    let ah = (op_h + (off_y & 7) + 7) & !7;
+    ((aw >> 3) + 2 + 2 * grid_side, (ah >> 3) + 2 + 2 * grid_side)
+}
+
+/// Result of [`clarity_route`]: which executor may carry a non-zero amount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClarityRoute {
+    /// Legacy `CImgOpClarity` is armed only for method 2 (Classic).
+    pub legacy_armed: bool,
+    /// Which of the three Clarity2012 passes is enabled (selectors 3/0/1).
+    pub clarity2012_passes: [bool; 3],
+}
+
+/// Method routing table proven at RVA 0x16c5b69 and 0x16d15aa.
+///
+/// C1 method values: 0 Neutral, 1 Punch, 2 Classic, 3 Contrast/Natural.
+pub fn clarity_route(method: i32) -> ClarityRoute {
+    ClarityRoute {
+        legacy_armed: method == 2,
+        clarity2012_passes: [
+            clarity2012_pass_enabled(0, method),
+            clarity2012_pass_enabled(1, method),
+            clarity2012_pass_enabled(2, method),
+        ],
+    }
+}
+
+/// Legacy tent filter weight `8 - |k|`, k in -7..=7 (CL kernel z906da05d53).
+pub fn legacy_tent_weight(k: i32) -> i32 {
+    8 - k.abs()
+}
+
+/// Sum of the 15x15 separable tent weights: 64 * 64 = 4096.
+pub fn legacy_tent_weight_sum() -> i32 {
+    64 * 64
+}
+
+#[cfg(test)]
+mod levels_tests {
+    use super::*;
+
+    #[test]
+    fn pyramid_has_two_levels_half_then_quarter_of_half() {
+        assert_eq!(clarity2012_pyramid_level_dims(4000, 3000), [(2000, 1500), (500, 375)]);
+        assert_eq!(clarity2012_pyramid_level_dims(17, 9), [(9, 5), (3, 2)]);
+        assert_eq!(clarity2012_pyramid_level_dims(16, 8), [(8, 4), (2, 1)]);
+        // Slot 18 is fed the 1/4 proxy; its level0 is then 1/8 of the full source.
+        assert_eq!(clarity2012_pyramid_level_dims(4000 / 4, 3000 / 4)[0].0, clarity2012_pyramid_assert_width(4000));
+        assert_eq!(clarity2012_pyramid_assert_width(4001), 501);
+    }
+
+    #[test]
+    fn encode_offset_is_four_not_sixteen() {
+        assert_eq!(CLARITY2012_ENCODE_OFFSET, 4.0);
+        let e = clarity2012_encode_rgb4([0, 12, 65535]);
+        assert!((e[0] - 2.0).abs() < 1e-6);
+        assert!((e[1] - 4.0).abs() < 1e-6);
+        assert!((e[2] - (65539.0f32).sqrt()).abs() < 1e-3);
+        assert!((clarity2012_encode_luma4([0, 0, 0]) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grid_coordinate_is_clamped() {
+        assert_eq!(clarity2012_grid_coord(0, 1, -5, 10), 0);
+        assert_eq!(clarity2012_grid_coord(9, 1, 0, 10), 9);
+        assert_eq!(clarity2012_grid_coord(3, 2, 4, 10), 9);
+        assert_eq!(clarity2012_grid_coord(0, 8, 3, 100), 3);
+    }
+
+    #[test]
+    fn classic_routes_to_legacy_only_and_2012_passes_are_3_0_1() {
+        let c = clarity_route(2);
+        assert!(c.legacy_armed);
+        assert_eq!(c.clarity2012_passes, [false, false, false]);
+        assert_eq!(clarity_route(3).clarity2012_passes, [true, false, false]);
+        assert_eq!(clarity_route(0).clarity2012_passes, [false, true, false]);
+        assert_eq!(clarity_route(1).clarity2012_passes, [false, false, true]);
+        for m in [0, 1, 3] {
+            assert!(!clarity_route(m).legacy_armed);
+        }
+    }
+
+    #[test]
+    fn legacy_tent_is_15_taps_with_sum_4096() {
+        assert_eq!(legacy_tent_weight(-7), 1);
+        assert_eq!(legacy_tent_weight(0), 8);
+        assert_eq!(legacy_tent_weight(7), 1);
+        let s: i32 = (-7..=7).map(legacy_tent_weight).sum();
+        assert_eq!(s, 64);
+        assert_eq!(s * s, legacy_tent_weight_sum());
+        assert_eq!(legacy_tent_weight_sum(), 4096);
+    }
+
+    #[test]
+    fn private_plane_dims_include_two_plus_two_grid_side_halo() {
+        assert_eq!(clarity2012_plane_dims(100, 50, 0, 0, 3), (21, 15));
+        assert_eq!(clarity2012_plane_dims(4000, 3000, 0, 0, 0), (502, 377));
+    }
+}

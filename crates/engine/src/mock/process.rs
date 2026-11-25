@@ -3123,6 +3123,9 @@ fn render_sized(
                         producer_inputs = Some(inputs);
                     }
                     Err(refusal) => {
+                        let mut inputs = producer_inputs.take().unwrap_or_default();
+                        inputs.face_input_refusal.get_or_insert(refusal.clone());
+                        producer_inputs = Some(inputs);
                         log::warn!("stage face input refused: {refusal:?}");
                     }
                 }
@@ -3305,6 +3308,13 @@ fn render_sized(
                         }
                     }
                     Err(refusal) => {
+                        // Keep the producer's own refusal on the job so the
+                        // run report can name the root cause ("face model file"
+                        // vs "C1 face detection score") instead of repeating a
+                        // downstream mask refusal for every row.
+                        let mut inputs = producer_inputs.take().unwrap_or_default();
+                        inputs.face_input_refusal = Some(refusal.clone());
+                        producer_inputs = Some(inputs);
                         log::warn!("stage face inference refused: {refusal:?}");
                     }
                 }

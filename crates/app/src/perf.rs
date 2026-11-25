@@ -215,7 +215,7 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
         record(serde_json::json!({"event": "drag_end"}));
         for _ in 0..300 {
             cx.background_executor().timer(Duration::from_millis(20)).await;
-            if state.read_with(cx, |s, _| !s.preview.rendering) {
+            if state.read_with(cx, |s, _| !s.preview.rendering && s.preview.pending.is_none()) {
                 break;
             }
         }
@@ -226,6 +226,11 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
             "rendering": s.preview.rendering,
             "expected_exposure": 1.12f32 * (119.0f32 * 0.12).sin(),
             "final_quality": s.preview.frame.as_ref().map(|f| format!("{:?}", f.stamp.quality)),
+            "last_request_quality": s.preview.last_request.as_ref().map(|r| format!("{:?}", r.quality)),
+            "pending_quality": s.preview.pending.map(|(q, _)| format!("{q:?}")),
+            "draft_flag": s.preview.draft,
+            "frame_generation": s.preview.frame.as_ref().map(|f| f.stamp.id),
+            "generation": s.preview.generation,
             "latest_frame": s.preview.frame.as_ref().is_some_and(|f| f.stamp.id == s.preview.generation),
         })));
         cx.update(|cx| cx.quit());
