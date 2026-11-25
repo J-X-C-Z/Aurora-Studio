@@ -231,11 +231,13 @@ fn prewarm_in_background() {
                 "detail GPU prewarm finished in {:.0} ms",
                 gpu_start.elapsed().as_secs_f64() * 1000.0
             );
-            // Session creation competes with the first real preview. Let that
-            // frame finish before consuming the same CPU/GPU resources.
+            // Session creation competes with the first real preview and initial
+            // slider interaction. Wait briefly after the first frame before
+            // loading heavy ONNX/CUDA sessions in the background.
             while !FIRST_PREVIEW_READY.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
+            std::thread::sleep(std::time::Duration::from_secs(3));
             lower_current_thread_priority();
             let start = std::time::Instant::now();
             match aurora_engine::aimask::prewarm_models() {

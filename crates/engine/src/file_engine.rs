@@ -424,12 +424,14 @@ fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
     if st.source_cache.current_bytes <= st.source_cache.max_bytes {
         return;
     }
+    let active = st.source_cache.active_preview;
+    let is_protected = |image: ImageId| Some(image) == protect || Some(image) == active;
     // 1) Drop unpinned AI inputs. They are recomputable and never a Source.
     let ai_victims: Vec<ImageId> = st
         .ai_inputs
         .keys()
         .copied()
-        .filter(|image| Some(*image) != protect && !st.source_cache.is_pinned(*image))
+        .filter(|image| !is_protected(*image) && !st.source_cache.is_pinned(*image))
         .collect();
     for image in ai_victims {
         if st.source_cache.current_bytes <= st.source_cache.max_bytes {
@@ -447,7 +449,7 @@ fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
             let cache = &st.source_cache;
             let mut best: Option<(u64, bool, ImageId)> = None;
             for (id, entry) in st.sources.iter() {
-                if Some(*id) == protect || cache.is_pinned(*id) || Arc::strong_count(&entry.source) > 1 {
+                if is_protected(*id) || cache.is_pinned(*id) || Arc::strong_count(&entry.source) > 1 {
                     continue;
                 }
                 if best.is_none_or(|(last, _, _)| entry.last_used < last) {
@@ -456,7 +458,7 @@ fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
             }
             if let Some(slot) = &st.native_raw {
                 if slot.bytes > 0
-                    && Some(slot.image) != protect
+                    && !is_protected(slot.image)
                     && !cache.is_pinned(slot.image)
                     && slot.source.as_ref().is_none_or(|source| Arc::strong_count(source) <= 1)
                     && best.is_none_or(|(last, _, _)| slot.last_used < last)
@@ -483,15 +485,15 @@ fn evict_sources_to_budget(st: &mut State, protect: Option<ImageId>) {
             log::debug!("evicted source {image:?}: {released} bytes");
         }
     }
-    // 3) Degrade the oldest implicit recent pins; explicit pins and `protect`
-    //    stay. Each candidate is visited at most once.
+    // 3) Degrade the oldest implicit recent pins; explicit pins, `protect`, and
+    //    the active preview image stay. Each candidate is visited at most once.
     if st.source_cache.current_bytes > st.source_cache.max_bytes {
         let candidates: Vec<ImageId> = st.source_cache.recent.iter().rev().copied().collect();
         for image in candidates {
             if st.source_cache.current_bytes <= st.source_cache.max_bytes {
                 break;
             }
-            if Some(image) == protect || st.source_cache.pins.get(&image).is_some_and(|count| *count > 0) {
+            if is_protected(image) || st.source_cache.pins.get(&image).is_some_and(|count| *count > 0) {
                 continue;
             }
             let evictable_source = st
@@ -1537,6 +1539,9 @@ struct SourceCacheBudget {
     recent_pins: usize,
     /// Explicit pins, e.g. images an export is still reading.
     pins: HashMap<ImageId, u32>,
+    /// Currently previewed image: protected from background thumbnail eviction
+    /// even when implicit `recent` pins degrade under memory pressure.
+    active_preview: Option<ImageId>,
     /// Current image and its recently visited neighbours: implicit pins.
     recent: VecDeque<ImageId>,
     tick: u64,
@@ -1557,6 +1562,7 @@ impl SourceCacheBudget {
             single_flight_waits: 0,
             recent_pins: recent_source_pins(),
             pins: HashMap::new(),
+            active_preview: None,
             recent: VecDeque::new(),
             tick: 0,
         }

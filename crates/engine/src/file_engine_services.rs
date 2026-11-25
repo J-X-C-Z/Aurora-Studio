@@ -412,6 +412,12 @@ impl<'a> RenderService<'a> {
         let engine = self.engine;
         let start = Instant::now();
         let perf = std::env::var_os("AURORA_PERF_REPLAY").is_some();
+        // Protect the currently previewed image from being evicted by concurrent
+        // background thumbnail decodes so slider drags never trigger a full RAW
+        // re-decode.
+        {
+            engine.state.lock().source_cache.active_preview = Some(request.image);
+        }
         // Draft and Final must keep the same output size: a lower draft cap made
         // the preview jump when the pointer was released. Draft is cheaper
         // because `fast` renders half size and upsamples, not because it is smaller.
@@ -421,9 +427,78 @@ impl<'a> RenderService<'a> {
             Some(native) => (native, "native_raw"),
             None => (engine.source(request.image)?, "source"),
         };
+        let (rendering, intent_note) = crate::engine::request_rendering(request);
+        let display_is_noop = match request.display_profile.as_deref() {
+            None => true,
+            Some(path) => {
+                static DISPLAY_SRGB_CACHE: std::sync::OnceLock<
+                    parking_lot::Mutex<Option<(std::path::PathBuf, bool)>>,
+                > = std::sync::OnceLock::new();
+                let mut guard = DISPLAY_SRGB_CACHE
+                    .get_or_init(|| parking_lot::Mutex::new(None))
+                    .lock();
+                if let Some((cached_path, is_srgb)) = guard.as_ref() {
+                    if cached_path.as_path() == path {
+                        *is_srgb
+                    } else {
+                        let is_srgb = crate::icc::load_profile(path)
+                            .map(|p| crate::icc::is_srgb(&p))
+                            .unwrap_or(false);
+                        *guard = Some((path.to_path_buf(), is_srgb));
+                        is_srgb
+                    }
+                } else {
+                    let is_srgb = crate::icc::load_profile(path)
+                        .map(|p| crate::icc::is_srgb(&p))
+                        .unwrap_or(false);
+                    *guard = Some((path.to_path_buf(), is_srgb));
+                    is_srgb
+                }
+            }
+        };
+        // Short-circuit interactive Draft drags before computing preview_cache::key
+        // (8x serde_json), cloning/repairing adj.nodes, or touching preview/graph_gate
+        // locks. Draft frames never populate st.preview anyway.
+        let direct_bgra = !fast
+            && request.quality == RenderQuality::Draft
+            && display_is_noop
+            && request.proof_profile.is_none();
+        if direct_bgra {
+            let out = process::render_preview_bgra(
+                &src,
+                &adj,
+                request.region,
+                max,
+                request.bypass,
+                request.mask_overlay,
+                true,
+            );
+            let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+            if perf {
+                eprintln!(
+                    "AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":false,\"fast\":false,\"bgra\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
+                    request.generation,
+                    request.image.0,
+                    out.bgra,
+                    out.width,
+                    out.height,
+                    elapsed_ms,
+                    source_kind,
+                    request.bypass
+                );
+            }
+            return Ok(PreviewFrame {
+                image: RgbaImage::new(out.width, out.height, out.rgba),
+                histogram: out.histogram,
+                generation: request.generation,
+                elapsed_ms,
+                degraded: intent_note,
+                gamut_warning: None,
+                bgra: out.bgra,
+            });
+        }
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
             .with_source(src.snapshot_id());
-        let (rendering, intent_note) = crate::engine::request_rendering(request);
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let graph = adj.nodes.clone().unwrap_or_default().repaired(&adj.layers);
         let mut frame_key = key;
@@ -479,72 +554,6 @@ impl<'a> RenderService<'a> {
                 degraded,
                 gamut_warning,
                 bgra: false,
-            });
-        }
-        let display_is_noop = match request.display_profile.as_deref() {
-            None => true,
-            Some(path) => {
-                static DISPLAY_SRGB_CACHE: std::sync::OnceLock<
-                    parking_lot::Mutex<Option<(std::path::PathBuf, bool)>>,
-                > = std::sync::OnceLock::new();
-                let mut guard = DISPLAY_SRGB_CACHE
-                    .get_or_init(|| parking_lot::Mutex::new(None))
-                    .lock();
-                if let Some((cached_path, is_srgb)) = guard.as_ref() {
-                    if cached_path.as_path() == path {
-                        *is_srgb
-                    } else {
-                        let is_srgb = crate::icc::load_profile(path)
-                            .map(|p| crate::icc::is_srgb(&p))
-                            .unwrap_or(false);
-                        *guard = Some((path.to_path_buf(), is_srgb));
-                        is_srgb
-                    }
-                } else {
-                    let is_srgb = crate::icc::load_profile(path)
-                        .map(|p| crate::icc::is_srgb(&p))
-                        .unwrap_or(false);
-                    *guard = Some((path.to_path_buf(), is_srgb));
-                    is_srgb
-                }
-            }
-        };
-        let direct_bgra = !fast
-            && request.quality == RenderQuality::Draft
-            && display_is_noop
-            && request.proof_profile.is_none();
-        if direct_bgra {
-            let out = process::render_preview_bgra(
-                &src,
-                &adj,
-                request.region,
-                max,
-                request.bypass,
-                request.mask_overlay,
-                true,
-            );
-            let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
-            if perf {
-                eprintln!(
-                    "AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":false,\"fast\":false,\"bgra\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
-                    request.generation,
-                    request.image.0,
-                    out.bgra,
-                    out.width,
-                    out.height,
-                    elapsed_ms,
-                    source_kind,
-                    request.bypass
-                );
-            }
-            return Ok(PreviewFrame {
-                image: RgbaImage::new(out.width, out.height, out.rgba),
-                histogram: out.histogram,
-                generation: request.generation,
-                elapsed_ms,
-                degraded: intent_note,
-                gamut_warning: None,
-                bgra: out.bgra,
             });
         }
         let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
