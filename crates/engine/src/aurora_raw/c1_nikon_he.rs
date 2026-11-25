@@ -123,7 +123,254 @@ pub fn bayer_frame(precincts: &[Precinct], output_rows: usize) -> Result<Vec<u16
     assemble_bayer(precincts, output_rows, true)
 }
 
+fn green_pair(
+    above: &[Vec<i64>; 4],
+    current: &[Vec<i64>; 4],
+    below: &[Vec<i64>; 4],
+    bottom: bool,
+    width: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let [yl, cr, yh, cb] = current;
+    let [_, _, above_yh, above_cb] = above;
+    let [below_yl, below_cr, below_yh, _] = below;
+    let mut green0 = Vec::with_capacity(width);
+    let mut green1 = Vec::with_capacity(width);
+    let mut y0_left = 0;
+    let mut y0_below_left = 0;
+    for col in 0..width {
+        let left = col.saturating_sub(1);
+        let right = (col + 1).min(width - 1);
+        let y0 = yl[col] - ((above_yh[col] + above_yh[right] + yh[col] + yh[right]) >> 3);
+        let y0_below = if bottom {
+            y0
+        } else {
+            below_yl[col] - ((yh[col] + yh[right] + below_yh[col] + below_yh[right]) >> 3)
+        };
+        if col == 0 {
+            y0_left = y0;
+            y0_below_left = y0_below;
+        }
+        green0.push(y0 - ((cb[col] + above_cb[col] + cr[col] + cr[right]) >> 3));
+        green1.push(
+            ((y0_below + y0 + y0_below_left + y0_left) >> 2) + yh[col]
+                - ((cb[left] + cb[col] + cr[col] + below_cr[col]) >> 3),
+        );
+        y0_left = y0;
+        y0_below_left = y0_below;
+    }
+    (green0, green1)
+}
+
+/// Row/column context for one cell-row block. `row` is the original closure,
+/// unchanged; only the block start state is recomputed from the same formulas.
+struct BayerContext<'a> {
+    precincts: &'a [Precinct],
+    width: usize,
+    cell_rows: usize,
+    has_bottom: bool,
+    output_rows: usize,
+}
+
+impl BayerContext<'_> {
+    fn row(&self, cell_row: usize) -> [Vec<i64>; 4] {
+        let width = self.width;
+        let cell_row = if self.has_bottom {
+            cell_row.min(self.cell_rows - 1)
+        } else {
+            cell_row
+        };
+        let index = cell_row / 2;
+        let current = &self.precincts[index];
+        let previous = &self.precincts[index.saturating_sub(1)];
+        std::array::from_fn(|component| {
+            if component == 2 {
+                return if cell_row % 2 == 0 {
+                    &current.low[2]
+                } else {
+                    &current.high[2]
+                }
+                .clone();
+            }
+            (0..width)
+                .map(|col| {
+                    let detail = current.high[component][col];
+                    let even =
+                        (4 * current.low[component][col] - previous.high[component][col] - detail
+                            + 1)
+                            >> 2;
+                    if cell_row % 2 == 0 {
+                        even
+                    } else if index + 1 == self.precincts.len() {
+                        detail + even
+                    } else {
+                        let next = &self.precincts[index + 1];
+                        let next_even =
+                            (4 * next.low[component][col] - detail - next.high[component][col] + 1)
+                                >> 2;
+                        detail + ((even + next_even) >> 1)
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// `green` for cell row `index`. Index 0 is the top-edge call the sequential
+    /// loop uses; every later index uses the row above, matching its iteration
+    /// `index - 1`.
+    fn greens(&self, index: usize) -> (Vec<i64>, Vec<i64>) {
+        let current = self.row(index);
+        let below = self.row(index + 1);
+        if index == 0 {
+            return green_pair(&current, &current, &below, false, self.width);
+        }
+        let above = self.row(index - 1);
+        green_pair(
+            &above,
+            &current,
+            &below,
+            self.has_bottom && index + 1 >= self.cell_rows,
+            self.width,
+        )
+    }
+
+    fn emit_block(&self, first: usize, last: usize, output: &mut [u16]) -> usize {
+        let width = self.width;
+        let cell_rows = self.cell_rows;
+        let output_rows = self.output_rows;
+        let mut at = 0usize;
+        let mut current = self.row(first);
+        let mut below = self.row(first + 1);
+        let (mut green0, mut green1, mut above_green1);
+        if first == 0 {
+            let (first0, first1) = green_pair(&current, &current, &below, false, width);
+            green0 = first0;
+            green1 = first1;
+            above_green1 = green1.clone();
+        } else {
+            let (block0, block1) = self.greens(first);
+            green0 = block0;
+            green1 = block1;
+            above_green1 = self.greens(first - 1).1;
+        }
+        for index in first..last {
+            let next_context = (index + 1 < cell_rows).then(|| self.row(index + 2));
+            let (next_green0, next_green1) = green_pair(
+                &current,
+                &below,
+                next_context.as_ref().unwrap_or(&below),
+                self.has_bottom && index + 2 >= cell_rows,
+                width,
+            );
+            let blue_green0 = if self.has_bottom && index + 1 == cell_rows {
+                &green0
+            } else {
+                &next_green0
+            };
+            for col in 0..width {
+                let left = col.saturating_sub(1);
+                let red = ((green1[col] + green0[col] + green0[left] + above_green1[col]) >> 2)
+                    + current[1][col];
+                output[at] = inverse_curve(red + 32768);
+                output[at + 1] = inverse_curve(green0[col] + 32768);
+                at += 2;
+            }
+            if 2 * index + 1 < output_rows {
+                for col in 0..width {
+                    let right = (col + 1).min(width - 1);
+                    let blue = ((green1[col] + green0[col] + green1[right] + blue_green0[col])
+                        >> 2)
+                        + current[3][col];
+                    output[at] = inverse_curve(green1[col] + 32768);
+                    output[at + 1] = inverse_curve(blue + 32768);
+                    at += 2;
+                }
+            }
+            if let Some(next_context) = next_context {
+                current = below;
+                below = next_context;
+                green0 = next_green0;
+                above_green1 = std::mem::replace(&mut green1, next_green1);
+            }
+        }
+        at
+    }
+}
+
+fn bayer_workers(cell_rows: usize) -> usize {
+    let requested = std::env::var("AURORA_HE_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(8)
+        });
+    requested.clamp(1, cell_rows.max(1))
+}
+
 fn assemble_bayer(
+    precincts: &[Precinct],
+    output_rows: usize,
+    has_bottom: bool,
+) -> Result<Vec<u16>> {
+    let Some(first) = precincts.first() else {
+        return Err(invalid("missing HE precincts"));
+    };
+    let precinct_count = output_rows.div_ceil(4) + usize::from(!has_bottom);
+    if output_rows == 0 || output_rows > 65535 || precinct_count > precincts.len() {
+        return Err(invalid("Bayer prefix needs one trailing context precinct"));
+    }
+    let width = first.low[0].len();
+    let precincts = &precincts[..precinct_count];
+    if !(32..=32767).contains(&width)
+        || precincts.iter().any(|precinct| {
+            precinct
+                .low
+                .iter()
+                .chain(&precinct.high)
+                .any(|line| line.len() != width)
+        })
+    {
+        return Err(invalid("inconsistent HE precinct width"));
+    }
+    let cell_rows = output_rows.div_ceil(2);
+    let sample_count = (2 * width)
+        .checked_mul(output_rows)
+        .ok_or_else(|| invalid("HE dimensions overflow"))?;
+    let workers = bayer_workers(cell_rows);
+    if workers <= 1 || cell_rows < 32 {
+        return assemble_bayer_sequential(precincts, output_rows, has_bottom);
+    }
+    let context = BayerContext {
+        precincts,
+        width,
+        cell_rows,
+        has_bottom,
+        output_rows,
+    };
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(sample_count)
+        .map_err(Error::other)?;
+    output.resize(sample_count, 0);
+    let block = cell_rows.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (block_index, chunk) in output.chunks_mut(block * 4 * width).enumerate() {
+            let first = block_index * block;
+            let last = (first + block).min(cell_rows);
+            let context = &context;
+            scope.spawn(move || {
+                let written = context.emit_block(first, last, chunk);
+                debug_assert!(written <= chunk.len());
+            });
+        }
+    });
+    Ok(output)
+}
+
+fn assemble_bayer_sequential(
     precincts: &[Precinct],
     output_rows: usize,
     has_bottom: bool,

@@ -13,8 +13,9 @@ use std::sync::OnceLock;
 use serde::Serialize;
 
 use crate::{
-    AdjustmentSet, CoverPatch, Histogram, ImageId, LayerKind, LocalAdjustments, Mask, NodeKind,
-    NodeLink, NormRect, RgbaImage, TechnicalProcessingMethod, ToneCurvePreset, WhiteBalanceMode,
+    AdjustmentSet, CoverPatch, Histogram, ImageId, Layer, LayerKind, LocalAdjustments, Mask,
+    NodeGraph, NodeKind, NodeLink, NormRect, RgbaImage, TechnicalProcessingMethod, ToneCurvePreset,
+    WhiteBalanceMode,
 };
 
 /// Bumped by the RAW cache when the bytes behind a source path change. Every
@@ -70,6 +71,86 @@ impl PreviewKey {
     pub(crate) fn with_source(mut self, snapshot: u64) -> Self {
         self.source_snapshot = Some(snapshot);
         self
+    }
+
+    /// True when two requests differ at most in their layer rows and node
+    /// topology. The caller must still run [`NodeGraph::dirty_between`]: this
+    /// only rules out every other input, including spots and all develop /
+    /// detail / portrait parameters.
+    pub(crate) fn graph_reusable_with(&self, other: &Self) -> bool {
+        self.build == other.build
+            && self.source_snapshot == other.source_snapshot
+            && self.image == other.image
+            && self.long_side == other.long_side
+            && self.region == other.region
+            && self.bypass == other.bypass
+            && self.mask_overlay == other.mask_overlay
+            && self.fast == other.fast
+            && self.params.same_except_graph(&other.params)
+    }
+}
+
+/// The last preview of one image, for reusing its pixels after an edit that
+/// only touched pruned branches.
+///
+/// `request` is the logical request the frame answers; `frame` is the cache key
+/// that actually holds its pixels. They differ only after a graph-dirty reuse:
+/// the pixels keep the earlier key, so no alias entry (and no double-counted
+/// byte budget) is needed.
+#[derive(Clone, Default)]
+pub(crate) struct GraphGate {
+    request: Option<PreviewKey>,
+    frame: Option<PreviewKey>,
+    graph: NodeGraph,
+    rows: Vec<Layer>,
+}
+
+impl GraphGate {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cache key of a frame that is byte-identical to what `key` would
+    /// render, or `None` when the render must run.
+    ///
+    /// Both graphs must already be [`NodeGraph::repaired`] against their rows;
+    /// repair is what turns a row without a node into a real render node, so a
+    /// raw row edit cannot hide from `dirty_between`.
+    pub(crate) fn reuse(
+        &self,
+        key: &PreviewKey,
+        graph: &NodeGraph,
+        rows: &[Layer],
+    ) -> Option<PreviewKey> {
+        let request = self.request.as_ref()?;
+        let frame = self.frame.as_ref()?;
+        if !key.graph_reusable_with(request) {
+            return None;
+        }
+        // A refused graph (cycle through the output) renders background only;
+        // never carry a frame across one. The dirty API must not guess an order.
+        if graph.plan().is_err() || self.graph.plan().is_err() {
+            return None;
+        }
+        if !graph.dirty_between(&self.graph, rows, &self.rows).is_empty() {
+            return None;
+        }
+        Some(*frame)
+    }
+
+    /// Remember what produced the frame now on screen. `request` is the
+    /// logical request, `frame` the cache key holding its pixels.
+    pub(crate) fn record(
+        &mut self,
+        request: PreviewKey,
+        frame: PreviewKey,
+        graph: NodeGraph,
+        rows: Vec<Layer>,
+    ) {
+        self.request = Some(request);
+        self.frame = Some(frame);
+        self.graph = graph;
+        self.rows = rows;
     }
 }
 
@@ -213,20 +294,44 @@ pub(crate) struct ParamsFingerprint {
     detail: u64,
     /// Spots, layers, masks and node topology.
     local: u64,
+    /// The non-graph half of [`Self::local`] (spots). Two requests that agree
+    /// here and on every group above differ at most in their layer rows and
+    /// node topology, which [`NodeGraph::dirty_between`] then adjudicates.
+    local_rest: u64,
+    /// The layer-row and node-topology half of [`Self::local`]. Kept separate
+    /// so the preview can ask "did only the graph move?" without treating a
+    /// pruned edit as a frame miss.
+    local_graph: u64,
     /// Retouch faces, portrait contract parameters and producer inputs.
     portrait: u64,
 }
 
 impl ParamsFingerprint {
     fn of(adj: &AdjustmentSet) -> Self {
+        let local_rest = local_rest_fingerprint(adj);
+        let local_graph = local_graph_fingerprint(adj);
         Self {
             characterization: characterization_fingerprint(adj),
             geometry: geometry_fingerprint(adj),
             develop: develop_fingerprint(adj),
             detail: detail_fingerprint(adj),
-            local: local_fingerprint(adj),
+            local: local_fingerprint_of(local_rest, local_graph),
+            local_rest,
+            local_graph,
             portrait: portrait_fingerprint(adj),
         }
+    }
+
+    /// Every group except the layer rows and node topology agrees. A true
+    /// result means `NodeGraph::dirty_between` alone decides whether the two
+    /// requests render differently; it must never be used to skip that check.
+    pub(crate) fn same_except_graph(&self, other: &Self) -> bool {
+        self.characterization == other.characterization
+            && self.geometry == other.geometry
+            && self.develop == other.develop
+            && self.detail == other.detail
+            && self.portrait == other.portrait
+            && self.local_rest == other.local_rest
     }
 }
 
@@ -423,8 +528,19 @@ fn detail_fingerprint(adj: &AdjustmentSet) -> u64 {
     hash.0
 }
 
-fn local_fingerprint(adj: &AdjustmentSet) -> u64 {
-    let mut hash = Fnv::new("local-v1");
+/// Local inputs that are not a layer row or the node graph. The graph half is
+/// re-derived by [`NodeGraph::dirty_between`]; spots are not, so they must
+/// still match before a frame can be reused.
+fn local_rest_fingerprint(adj: &AdjustmentSet) -> u64 {
+    let mut hash = Fnv::new("local-rest-v1");
+    hash.json("spots", &adj.spots);
+    hash.0
+}
+
+/// Layer rows and node topology, exactly the part [`NodeGraph::dirty_between`]
+/// compares.
+fn local_graph_fingerprint(adj: &AdjustmentSet) -> u64 {
+    let mut hash = Fnv::new("local-graph-v1");
     let layers: Vec<LayerView<'_>> = adj
         .layers
         .iter()
@@ -440,7 +556,6 @@ fn local_fingerprint(adj: &AdjustmentSet) -> u64 {
         })
         .collect();
     hash.json("layers", &layers);
-    hash.json("spots", &adj.spots);
     match adj.nodes.as_ref() {
         Some(graph) => {
             let view = NodeGraphView {
@@ -458,6 +573,15 @@ fn local_fingerprint(adj: &AdjustmentSet) -> u64 {
     hash.0
 }
 
+/// The whole local group, from its two halves, so the frame key still moves
+/// whenever any layer, node or spot moves.
+fn local_fingerprint_of(rest: u64, graph: u64) -> u64 {
+    let mut hash = Fnv::new("local-v1");
+    hash.u64("rest", rest);
+    hash.u64("graph", graph);
+    hash.0
+}
+
 fn portrait_fingerprint(adj: &AdjustmentSet) -> u64 {
     let mut hash = Fnv::new("portrait-v1");
     hash.json("retouch", &adj.retouch);
@@ -467,6 +591,34 @@ fn portrait_fingerprint(adj: &AdjustmentSet) -> u64 {
         None => hash.tag("producer.none"),
     }
     hash.0
+}
+
+/// Fingerprints of the parameter groups that run before automatic dust
+/// detection reads the developed frame.
+///
+/// `Local` (spots/layers/nodes) and `Portrait` (retouch/extras) are applied
+/// after dust consumes the frame, so they must not invalidate its cache.
+/// Everything else — `Characterization` (base/style), `Geometry` (geometry and
+/// the whole lens group, including LCC and diffraction), `Develop` (white
+/// balance through film grain) and `Detail` (sharpening/NR/moire) — changes the
+/// pixels the model sees. The schema test above assigns every top-level
+/// `AdjustmentSet` field to exactly one group, so a new field cannot silently
+/// escape this key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DustInputFingerprint {
+    pub characterization: u64,
+    pub geometry: u64,
+    pub develop: u64,
+    pub detail: u64,
+}
+
+pub(crate) fn dust_input_fingerprint(adj: &AdjustmentSet) -> DustInputFingerprint {
+    DustInputFingerprint {
+        characterization: characterization_fingerprint(adj),
+        geometry: geometry_fingerprint(adj),
+        develop: develop_fingerprint(adj),
+        detail: detail_fingerprint(adj),
+    }
 }
 
 /// Package version plus an optional build id, so a rebuilt engine never reuses
@@ -1038,5 +1190,124 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert!(cache.get(key_for(1, 0.0)).is_none());
         assert!(cache.get(key_for(2, 0.0)).is_none());
+    }
+
+    // ── Graph-dirty reuse gate ──────────────────────────────────────────
+
+    fn gate_layer(id: u64, exposure: f32) -> Layer {
+        let mut layer = Layer { id, ..Default::default() };
+        layer.adjustments.exposure.exposure = exposure;
+        layer
+    }
+
+    fn gate_graph(links: &[(u64, u64, u32)], ids: &[u64]) -> NodeGraph {
+        let mut nodes = vec![
+            crate::GraphNode { id: NodeGraph::INPUT, kind: NodeKind::Input, pos: [0.0; 2] },
+            crate::GraphNode { id: NodeGraph::OUTPUT, kind: NodeKind::Output, pos: [0.0; 2] },
+        ];
+        nodes.extend(
+            ids.iter().map(|id| crate::GraphNode { id: *id, kind: NodeKind::Layer, pos: [0.0; 2] }),
+        );
+        NodeGraph {
+            nodes,
+            links: links.iter().map(|&(from, to, input)| NodeLink { from, to, input }).collect(),
+        }
+    }
+
+    /// The graph the render path uses, so a row without a node still renders.
+    fn repaired(adj: &AdjustmentSet) -> NodeGraph {
+        adj.nodes.clone().unwrap_or_default().repaired(&adj.layers)
+    }
+
+    fn gate_set() -> AdjustmentSet {
+        let mut adj = AdjustmentSet::default();
+        adj.layers = vec![gate_layer(1, 0.0), gate_layer(2, 0.0), gate_layer(3, 0.0)];
+        // 3 hangs off 1 but never reaches the output.
+        adj.nodes = Some(gate_graph(
+            &[
+                (NodeGraph::INPUT, 1, 0),
+                (1, 2, 0),
+                (1, 3, 0),
+                (2, NodeGraph::OUTPUT, 0),
+            ],
+            &[1, 2, 3],
+        ));
+        adj
+    }
+
+    #[test]
+    fn graph_gate_reuses_a_frame_after_a_pruned_layer_edit() {
+        let _serial = serial();
+        let adj = gate_set();
+        let key = key_of(&adj);
+        let mut gate = GraphGate::new();
+        gate.record(key, key, repaired(&adj), adj.layers.clone());
+
+        let mut edited = adj.clone();
+        edited.layers[2].adjustments.exposure.exposure = 2.0;
+        let new_key = key_of(&edited);
+        assert_ne!(key, new_key, "the frame key still sees the pruned edit");
+        assert_eq!(
+            gate.reuse(&new_key, &repaired(&edited), &edited.layers),
+            Some(key),
+            "the pruned edit cannot change a pixel, so the earlier frame is reused"
+        );
+    }
+
+    #[test]
+    fn graph_gate_rejects_a_live_layer_edit() {
+        let _serial = serial();
+        let adj = gate_set();
+        let key = key_of(&adj);
+        let mut gate = GraphGate::new();
+        gate.record(key, key, repaired(&adj), adj.layers.clone());
+
+        let mut edited = adj.clone();
+        edited.layers[1].adjustments.exposure.exposure = 1.0;
+        assert_eq!(gate.reuse(&key_of(&edited), &repaired(&edited), &edited.layers), None);
+    }
+
+    #[test]
+    fn graph_gate_rejects_edits_outside_the_graph() {
+        let _serial = serial();
+        let adj = gate_set();
+        let key = key_of(&adj);
+        let mut gate = GraphGate::new();
+        gate.record(key, key, repaired(&adj), adj.layers.clone());
+
+        // A develop change keeps the graph identical but still changes pixels.
+        let mut exposed = adj.clone();
+        exposed.exposure.exposure = 0.6;
+        assert_eq!(gate.reuse(&key_of(&exposed), &repaired(&exposed), &exposed.layers), None);
+
+        // A spot is local but not part of the graph, so it is not reusable.
+        let mut spotted = adj.clone();
+        spotted.spots.push(crate::Spot {
+            id: 1,
+            kind: crate::SpotKind::Spot,
+            x: 0.5,
+            y: 0.5,
+            radius: 0.1,
+        });
+        assert_eq!(gate.reuse(&key_of(&spotted), &repaired(&spotted), &spotted.layers), None);
+
+        // A different image must never reuse.
+        let other_image = key(ImageId(2), &adj, NormRect::FULL, 1400, false, None, false);
+        assert_eq!(gate.reuse(&other_image, &repaired(&adj), &adj.layers), None);
+    }
+
+    #[test]
+    fn graph_gate_rejects_a_deleted_live_layer() {
+        let _serial = serial();
+        let adj = gate_set();
+        let key = key_of(&adj);
+        let mut gate = GraphGate::new();
+        gate.record(key, key, repaired(&adj), adj.layers.clone());
+
+        let mut edited = adj.clone();
+        edited.layers.retain(|layer| layer.id != 2);
+        // Repair reconnects 1 straight to the output; the removed layer's
+        // contribution is gone even though no current layer replaced it.
+        assert_eq!(gate.reuse(&key_of(&edited), &repaired(&edited), &edited.layers), None);
     }
 }

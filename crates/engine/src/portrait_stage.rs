@@ -3373,6 +3373,22 @@ fn fnv_u64(hash: u64, value: u64) -> u64 {
     fnv1a64(hash, &value.to_le_bytes())
 }
 
+/// Advances two independent FNV-1a states over `bytes` in one memory sweep.
+///
+/// [`PortraitJobReceipt`] binds both the standalone frame receipt and the job
+/// fingerprint, and the job fingerprint folds the same frame bytes after its
+/// own prefix. Updating both states together keeps every value bit-identical
+/// to two separate passes while reading the frame once.
+fn fnv1a64_pair(mut left: u64, mut right: u64, bytes: &[u8]) -> (u64, u64) {
+    for byte in bytes {
+        left ^= u64::from(*byte);
+        left = left.wrapping_mul(FNV1A64_PRIME);
+        right ^= u64::from(*byte);
+        right = right.wrapping_mul(FNV1A64_PRIME);
+    }
+    (left, right)
+}
+
 fn params_fingerprint(params: &BTreeMap<String, f32>) -> u64 {
     let mut hash = fnv_usize(FNV1A64_OFFSET_BASIS, params.len());
     for (key, value) in params {
@@ -3483,21 +3499,50 @@ impl PortraitJobReceipt {
         frame_fingerprint: Option<u64>,
         mask_fingerprint: Option<u64>,
     ) -> Self {
-        let frame_receipt = frame_fingerprint
-            .map(|fingerprint| PortraitFrameReceipt {
-                fingerprint,
+        // Frame receipt and job fingerprint hash the same frame bytes under two
+        // different prefixes. Hash both states in one sweep when neither value
+        // was supplied by the caller; this keeps every id bit-identical to two
+        // separate passes. A caller-supplied fingerprint (the renderer's cached
+        // frame fingerprint) keeps that value verbatim, and the job fingerprint
+        // still folds its own frame bytes as before.
+        let expected_frame_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|&bytes| bytes != 0);
+        let mut fingerprint = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
+        fingerprint = fnv_usize(fingerprint, frame.len());
+        let frame_receipt = if let Some(known) = frame_fingerprint {
+            fingerprint = fnv1a64(fingerprint, frame);
+            PortraitFrameReceipt {
+                fingerprint: known,
                 width,
                 height,
-            })
-            .unwrap_or_else(|| {
-                PortraitFrameReceipt::from_renderer_frame(frame, width, height).unwrap_or(
-                    PortraitFrameReceipt {
-                        fingerprint: 0,
-                        width,
-                        height,
-                    },
-                )
-            });
+            }
+        } else if expected_frame_bytes == Some(frame.len()) {
+            let frame_receipt_seed = fnv_u64(
+                fnv_u64(
+                    fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-frame-v1"),
+                    width as u64,
+                ),
+                height as u64,
+            );
+            let (frame_fingerprint, next) = fnv1a64_pair(frame_receipt_seed, fingerprint, frame);
+            fingerprint = next;
+            PortraitFrameReceipt {
+                fingerprint: frame_fingerprint,
+                width,
+                height,
+            }
+        } else {
+            // `PortraitFrameReceipt::from_renderer_frame` falls back to a zero
+            // fingerprint, but the job fingerprint still folds the bytes.
+            fingerprint = fnv1a64(fingerprint, frame);
+            PortraitFrameReceipt {
+                fingerprint: 0,
+                width,
+                height,
+            }
+        };
         let region_bits = [
             region.x.to_bits(),
             region.y.to_bits(),
@@ -3511,9 +3556,6 @@ impl PortraitJobReceipt {
             masks.body.as_ref().map(Vec::len),
         ];
 
-        let mut fingerprint = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
-        fingerprint = fnv_usize(fingerprint, frame.len());
-        fingerprint = fnv_u64(fingerprint, frame_receipt.fingerprint());
         fingerprint = fnv_u64(fingerprint, width as u64);
         fingerprint = fnv_u64(fingerprint, height as u64);
         for bits in region_bits {
@@ -10245,6 +10287,71 @@ mod tests {
         let masks = PortraitMasks::solid(1.0);
         let inputs = PortraitJobInputs::from_renderer_job(1, &masks);
         let _ = apply_portrait_effects_with_job(rgba, w, h, NormRect::FULL, &map, &inputs);
+    }
+
+    #[test]
+    fn renderer_receipt_single_sweep_keeps_the_legacy_ids() {
+        let (width, height) = (8u32, 8u32);
+        let source = frame(width, height);
+        let masks = PortraitMasks::solid(1.0);
+        let params = BTreeMap::from([
+            ("pc:90005".to_string(), 0.9f32),
+            ("pc:202".to_string(), 0.25f32),
+        ]);
+        let region = NormRect {
+            x: 0.125,
+            y: 0.25,
+            width: 0.5,
+            height: 0.75,
+        };
+        let receipt = PortraitJobReceipt::from_renderer_receipt(
+            &source, width, height, region, &params, &masks,
+        );
+
+        // Legacy recipe: the frame receipt and the job fingerprint each swept
+        // the frame in a separate pass. Pin both values so the fused sweep
+        // cannot drift.
+        let mut legacy_frame = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-frame-v1");
+        legacy_frame = fnv_u64(legacy_frame, u64::from(width));
+        legacy_frame = fnv_u64(legacy_frame, u64::from(height));
+        legacy_frame = fnv1a64(legacy_frame, &source);
+
+        let mut legacy = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
+        legacy = fnv_usize(legacy, source.len());
+        legacy = fnv1a64(legacy, &source);
+        legacy = fnv_u64(legacy, u64::from(width));
+        legacy = fnv_u64(legacy, u64::from(height));
+        for bits in [
+            region.x.to_bits(),
+            region.y.to_bits(),
+            region.width.to_bits(),
+            region.height.to_bits(),
+        ] {
+            legacy = fnv_u64(legacy, u64::from(bits));
+        }
+        legacy = fnv_usize(legacy, params.len());
+        for (key, value) in &params {
+            legacy = fnv_usize(legacy, key.len());
+            legacy = fnv1a64(legacy, key.as_bytes());
+            legacy = fnv_u64(legacy, u64::from(value.to_bits()));
+        }
+        legacy = fnv_usize(legacy, masks.width);
+        legacy = fnv_usize(legacy, masks.height);
+        for (index, plane) in [&masks.skin, &masks.hair, &masks.face, &masks.body]
+            .into_iter()
+            .enumerate()
+        {
+            legacy = fnv_u64(legacy, index as u64);
+            legacy = fnv_u64(legacy, plane.as_ref().map_or(usize::MAX, Vec::len) as u64);
+            if let Some(plane) = plane {
+                for value in plane {
+                    legacy = fnv_u64(legacy, u64::from(value.to_bits()));
+                }
+            }
+        }
+
+        assert_eq!(receipt.frame_receipt().fingerprint(), legacy_frame);
+        assert_eq!(receipt.fingerprint(), legacy);
     }
 
     #[test]

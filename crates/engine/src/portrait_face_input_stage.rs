@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -176,6 +177,127 @@ fn shared_source_digest(image: &Image) -> Option<Arc<OnceLock<[u8; 32]>>> {
                 && std::ptr::eq(Arc::as_ptr(&entry.image), image)
         })
         .map(|entry| Arc::clone(&entry.sha256))
+}
+
+/// One full-frame SHA-256 shared by every same-frame check inside a render.
+///
+/// The renderer owns an immutable stage frame while the portrait attachment
+/// block runs. Every attachment validates that frame against its bundle and
+/// several of them also bind the frame digest into a geometry draw; without a
+/// scope each of those calls re-reads the whole RGBA plane. The scope keeps a
+/// lazily computed digest for the exact allocation it borrows, so the frame is
+/// hashed once and every later check in the same scope reuses that value.
+///
+/// The borrow (`&'a Image`) is load-bearing: it keeps the plane alive and
+/// immutable for as long as an entry exists. A different allocation, a fresh
+/// clone, or a frame rendered on another thread never matches and falls back
+/// to hashing exactly as before.
+pub(crate) struct FrameDigestScope<'a> {
+    _source: &'a Image,
+    ptr: usize,
+    len: usize,
+    width: u32,
+    height: u32,
+}
+
+struct FrameDigestEntry {
+    ptr: usize,
+    len: usize,
+    width: u32,
+    height: u32,
+    digest: Option<[u8; 32]>,
+}
+
+thread_local! {
+    static FRAME_DIGEST_SCOPES: RefCell<Vec<FrameDigestEntry>> = RefCell::new(Vec::new());
+}
+
+impl<'a> FrameDigestScope<'a> {
+    pub(crate) fn new(source: &'a Image) -> Self {
+        let entry = FrameDigestEntry {
+            ptr: source.pixels.as_ptr() as usize,
+            len: source.pixels.len(),
+            width: source.width,
+            height: source.height,
+            digest: None,
+        };
+        let (ptr, len, width, height) = (entry.ptr, entry.len, entry.width, entry.height);
+        FRAME_DIGEST_SCOPES.with(|scopes| scopes.borrow_mut().push(entry));
+        Self {
+            _source: source,
+            ptr,
+            len,
+            width,
+            height,
+        }
+    }
+}
+
+impl Drop for FrameDigestScope<'_> {
+    fn drop(&mut self) {
+        FRAME_DIGEST_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            if let Some(index) = scopes.iter().rposition(|entry| {
+                entry.ptr == self.ptr
+                    && entry.len == self.len
+                    && entry.width == self.width
+                    && entry.height == self.height
+            }) {
+                scopes.remove(index);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRAME_DIGEST_COMPUTES: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+fn note_frame_digest_compute() {
+    FRAME_DIGEST_COMPUTES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_frame_digest_computes() {
+    FRAME_DIGEST_COMPUTES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn frame_digest_computes() -> usize {
+    FRAME_DIGEST_COMPUTES.with(|count| count.get())
+}
+
+fn computed_frame_digest(source: &Image) -> [u8; 32] {
+    #[cfg(test)]
+    note_frame_digest_compute();
+    sha256_32(&source.pixels)
+}
+
+fn scoped_frame_digest(source: &Image) -> Option<[u8; 32]> {
+    FRAME_DIGEST_SCOPES.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        let entry = scopes.iter_mut().rev().find(|entry| {
+            entry.ptr == source.pixels.as_ptr() as usize
+                && entry.len == source.pixels.len()
+                && entry.width == source.width
+                && entry.height == source.height
+        })?;
+        Some(*entry.digest.get_or_insert_with(|| computed_frame_digest(source)))
+    })
+}
+
+/// SHA-256 of `source.pixels`, reusing an active [`FrameDigestScope`] or the
+/// per-source cache when either already covers this exact allocation.
+pub(crate) fn frame_digest(source: &Image) -> [u8; 32] {
+    if let Some(digest) = scoped_frame_digest(source) {
+        return digest;
+    }
+    match shared_source_digest(source) {
+        Some(digest) => *digest.get_or_init(|| computed_frame_digest(source)),
+        None => computed_frame_digest(source),
+    }
 }
 
 /// The session cache uses exact content SHA-256; shared source images compute
@@ -546,10 +668,7 @@ impl FaceInputBundle {
                 return sha256;
             }
         }
-        match shared_source_digest(source) {
-            Some(sha256) => *sha256.get_or_init(|| sha256_32(&source.pixels)),
-            None => sha256_32(&source.pixels),
-        }
+        frame_digest(source)
     }
 
     pub fn validate_ticket(&self, source: &Image, job_id: Option<u64>) -> Result<(), Refusal> {
@@ -927,7 +1046,7 @@ impl FaceInputBundle {
             draws: vec![super::FaceGeometryDraw {
                 pf: 8033,
                 controls: [c8033, 0.0],
-                source_sha256: sha256_32(&source.pixels),
+                source_sha256: frame_digest(source),
                 geometry: super::FaceGeometry::Smile {
                     dx: artifacts.dx,
                     dy: artifacts.dy,
@@ -965,7 +1084,7 @@ impl FaceInputBundle {
         }
 
         let pixels = source.pixel_count();
-        let digest = sha256_32(&source.pixels);
+        let digest = frame_digest(source);
         let size = [source.width, source.height];
         let mut rows = Vec::new();
 
@@ -1279,7 +1398,7 @@ impl FaceInputBundle {
             source.width as f32,
             source.height as f32,
         )?;
-        let digest = super::sha256_32(&source.pixels);
+        let digest = frame_digest(source);
         let rules = aurora_portrait::raster::Rules {
             winding: aurora_portrait::raster::Winding::PositiveAreaIsFront,
             cull: aurora_portrait::raster::Cull::None,
@@ -2443,7 +2562,7 @@ impl FaceInputProducer {
         let bundle = FaceInputBundle {
             job_id,
             source_size: [source.width, source.height],
-            source_sha256: source_sha256.unwrap_or_else(|| sha256_32(&source.pixels)),
+            source_sha256: source_sha256.unwrap_or_else(|| frame_digest(source)),
             detection,
             mesh,
             roi_xywh,
@@ -3365,11 +3484,7 @@ impl FaceInputSession {
     }
 
     pub fn produce(&self, job_id: u64, source: &Image) -> Result<FaceInputBundle, Refusal> {
-        let digest = match shared_source_digest(source) {
-            Some(sha256) => *sha256.get_or_init(|| sha256_32(&source.pixels)),
-            None => sha256_32(&source.pixels),
-        };
-        self.produce_with_digest(job_id, source, digest)
+        self.produce_with_digest(job_id, source, frame_digest(source))
     }
 
     /// Produces a bundle for a caller that already hashed `source`. The digest
@@ -4263,5 +4378,129 @@ mod pff_tests {
             first.pixels.len()
         );
         assert_eq!(shared, 9);
+    }
+}
+
+
+#[cfg(test)]
+mod frame_digest_scope_tests {
+    use super::*;
+
+    const JOB: u64 = 71;
+
+    fn source(seed: u8) -> Image {
+        Image::solid(16, 12, [seed, 20, 30, 255])
+    }
+
+    fn bundle(job: u64, source: &Image) -> FaceInputBundle {
+        let normalization = FaceNormalization {
+            channel_order: "BGR",
+            mean: [127.5; 3],
+            scale: [128.0; 3],
+        };
+        let model = FaceModelIdentity {
+            model_id: "test",
+            sha256: [0; 32],
+        };
+        FaceInputBundle {
+            job_id: job,
+            source_size: [source.width, source.height],
+            source_sha256: sha256_32(&source.pixels),
+            detection: C1FaceDetection {
+                score: 0.9,
+                landmarks_source: [[4.0, 3.0]; 5],
+                source_to_input: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                input_size: [640, 640],
+                normalization,
+                provider: "cpu",
+                model,
+            },
+            mesh: C1FaceMesh {
+                score: 0.9,
+                landmarks_source: vec![[4.0, 3.0, 0.0]],
+                source_to_crop: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                crop_side: 8.0,
+                input_size: [256, 256],
+                normalization,
+                provider: "cpu",
+                model,
+            },
+            roi_xywh: [2.0, 1.5, 12.0, 9.0],
+            roi_normalized_xywh: [0.125, 0.125, 0.75, 0.75],
+            points17: Vec::new(),
+            points142: Vec::new(),
+            points194: vec![[8.0, 6.0]; 194],
+            points414: vec![[8.0, 6.0]; 414],
+            landmark_producer: FaceLandmarkProducerInputs {
+                resource_id: 1,
+                provider: "test".to_string(),
+                model_sha256: [0; 32],
+                source_sha256: [0; 32],
+                source_size: [source.width, source.height],
+                points142: Vec::new(),
+                crop_bgr: Vec::new(),
+                crop_sha256: [0; 32],
+                raw52: Vec::new(),
+                points52: Vec::new(),
+                points194: Vec::new(),
+                fit_pre: [[0.0; 3]; 2],
+                fit_inverse: [[0.0; 3]; 2],
+            },
+            model_inputs: None,
+            bound_digest: None,
+        }
+    }
+
+    #[test]
+    fn one_scope_digest_covers_repeated_frame_checks() {
+        let source = source(10);
+        let bundle = bundle(JOB, &source);
+
+        reset_frame_digest_computes();
+        bundle.validate_ticket(&source, Some(JOB)).unwrap();
+        assert_eq!(
+            frame_digest_computes(),
+            1,
+            "outside a scope every check hashes"
+        );
+
+        let scope = FrameDigestScope::new(&source);
+        for _ in 0..6 {
+            bundle.validate_ticket(&source, Some(JOB)).unwrap();
+        }
+        assert_eq!(
+            frame_digest_computes(),
+            2,
+            "the scope computes the frame digest once and reuses it"
+        );
+
+        drop(scope);
+        bundle.validate_ticket(&source, Some(JOB)).unwrap();
+        assert_eq!(
+            frame_digest_computes(),
+            3,
+            "dropping the scope restores hashing"
+        );
+    }
+
+    #[test]
+    fn scope_never_vouches_for_another_allocation() {
+        let source = source(10);
+        let same_bytes = source.clone();
+        let other = source(99);
+        let bundle = bundle(JOB, &source);
+        let _scope = FrameDigestScope::new(&source);
+
+        reset_frame_digest_computes();
+        // Same bytes in a fresh allocation: still valid, but hashed, not reused.
+        bundle.validate_ticket(&same_bytes, Some(JOB)).unwrap();
+        assert_eq!(frame_digest_computes(), 1);
+
+        // Different bytes: the scope digest must not mask the mismatch.
+        assert_eq!(
+            bundle.validate_ticket(&other, Some(JOB)),
+            Err(Refusal::ValueOutOfRange("face input source digest"))
+        );
+        assert_eq!(frame_digest_computes(), 2);
     }
 }

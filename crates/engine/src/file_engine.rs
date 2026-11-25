@@ -123,15 +123,14 @@ const SOURCE_IDENTITY_RECHECK: std::time::Duration = std::time::Duration::from_s
 /// Hits allowed between content-token re-hashes while the metadata is unchanged.
 const SOURCE_IDENTITY_RECHECK_HITS: u32 = 8;
 
-/// Bytes a decoded source really owns: every mip level's allocated capacity
+/// Bytes a decoded source really owns or has reserved: every mip level's
+/// allocated capacity (or the full payload a deferred native level will need)
 /// plus the lazily built portrait derivatives (RGBA8 face input and masks).
 fn source_cache_bytes(source: &Source) -> usize {
     source
         .levels
         .iter()
-        .fold(0usize, |total, plane| {
-            total.saturating_add(plane.data.capacity().saturating_mul(std::mem::size_of::<[f32; 3]>()))
-        })
+        .fold(0usize, |total, plane| total.saturating_add(plane.allocated_bytes()))
         .saturating_add(source.cached_derived_bytes())
 }
 
@@ -273,6 +272,80 @@ fn estimated_decode_bytes(width: u32, height: u32, format: DecodeFormat) -> usiz
     let retained = kept_px.saturating_mul(RETAINED_BYTES_PER_PX).saturating_mul(4) / 3;
     let transient = source_px.saturating_mul(format.transient_bytes_per_px());
     retained.saturating_add(transient)
+}
+
+/// Which RAW decoder the route selects, for the *observed* working-set
+/// estimate. Deliberately separate from [`DecodeFormat`]: it does not feed
+/// admission until real peak-RSS data lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum RawDecodeShape {
+    LibRaw,
+    AuroraGeneric,
+    AuroraZ6iii,
+}
+
+#[allow(dead_code)]
+impl RawDecodeShape {
+    fn of(route: &crate::raw::DecodeRoute) -> Self {
+        if !route.c1_raw_enabled {
+            Self::LibRaw
+        } else if route.z6iii_nef && route.z6iii_feature {
+            Self::AuroraZ6iii
+        } else {
+            Self::AuroraGeneric
+        }
+    }
+
+    /// Decoder buffers per source pixel at peak, excluding the container file.
+    fn transient_bytes_per_px(self) -> usize {
+        match self {
+            // Bayer16 2 + LibRaw imgdata.image (4 x u16) 8 + RGB16 6 +
+            // demosaic intermediates 4.
+            Self::LibRaw => 20,
+            // Bayer16 2 + LibRaw image 8 + stage1 [f32; 4] 16 + stage2/3
+            // [f32; 3] 12 + RGBA16 output 8.
+            Self::AuroraGeneric => 46,
+            // Roadmap estimate: halo/adaptive Bayer + stage1 [f32; 4] +
+            // RGBA16 output + reconstruction scaffolding. Probe value, not a
+            // measured peak.
+            Self::AuroraZ6iii => 40,
+        }
+    }
+}
+
+/// Working set a decode is expected to hold, including the container bytes and
+/// the per-backend buffers the 12/16 B/px admission constants omit.
+///
+/// **Estimation only.** Admission still uses [`estimated_decode_bytes`] with
+/// its unchanged constants; switching the gate to this value needs real
+/// peak-RSS measurements per format (Z6III HE/HE★, lossless NEF, ARW, CR3,
+/// RAF, DNG).
+#[allow(dead_code)]
+fn estimated_decode_bytes_observed(
+    width: u32,
+    height: u32,
+    format: DecodeFormat,
+    file_bytes: usize,
+    route: &crate::raw::DecodeRoute,
+) -> usize {
+    let source_px = (width as usize).saturating_mul(height as usize);
+    let (kept_w, kept_h) = if format.is_native() {
+        (width, height)
+    } else {
+        fit_long_side((width, height))
+    };
+    let kept_px = (kept_w as usize).saturating_mul(kept_h as usize);
+    let retained = kept_px.saturating_mul(RETAINED_BYTES_PER_PX).saturating_mul(4) / 3;
+    let per_px = match format {
+        DecodeFormat::RawProxy | DecodeFormat::RawNative => {
+            RawDecodeShape::of(route).transient_bytes_per_px()
+        }
+        DecodeFormat::Raster => RASTER_DECODE_TRANSIENT_BYTES_PER_PX,
+    };
+    file_bytes
+        .saturating_add(retained)
+        .saturating_add(source_px.saturating_mul(per_px))
 }
 
 /// Decode-format class for a proxy decode of `path`; native RAW decodes pass
@@ -686,6 +759,22 @@ fn raw16_source(path: &Path) -> Option<(Source, crate::raw::DecodeProvenance)> {
         return None;
     }
     crate::raw_cache::get_or_decode_source16(path, SOURCE_LONG_SIDE)
+}
+
+/// [`raw16_source`] plus the bytes a failed 16-bit decode already read.
+///
+/// The 8-bit fallback consumes them instead of reading the container and
+/// reopening LibRaw, so a cold load pays the file read once per attempt.
+fn raw16_source_with_bytes(
+    path: &Path,
+) -> (
+    Option<(Source, crate::raw::DecodeProvenance)>,
+    Option<crate::raw::FailedRaw16>,
+) {
+    if is_cop(path) || !crate::raw::is_raw(path) {
+        return (None, None);
+    }
+    crate::raw_cache::get_or_decode_source16_with_bytes(path, SOURCE_LONG_SIDE)
 }
 
 /// Capture ISO and body model for the output-domain BandingSuppression.
@@ -1930,6 +2019,9 @@ pub struct FileEngine {
     /// Gamut counts are tiny compared with the frame; keep recent proof results
     /// so a repaint does not repeat the full round trip.
     gamut: Mutex<Vec<(preview_cache::PreviewKey, String, crate::GamutWarning)>>,
+    /// The last preview's graph identity, so a request that differs only by a
+    /// pruned-branch edit can reuse the frame on screen instead of rendering.
+    graph_gate: Mutex<preview_cache::GraphGate>,
     /// The decode half of the engine: one in-flight decode per `SourceKey`, the
     /// native-decode lock and the priority-aware admission gates. A background
     /// export worker holds the same `Arc`, so it decodes without borrowing the
@@ -2128,6 +2220,7 @@ impl FileEngine {
             sources,
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
+            graph_gate: Mutex::new(preview_cache::GraphGate::new()),
             publish_gate: Arc::new(Mutex::new(())),
             store,
             c1_catalog: false,
@@ -2212,6 +2305,7 @@ impl FileEngine {
             sources,
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
+            graph_gate: Mutex::new(preview_cache::GraphGate::new()),
             publish_gate: Arc::new(Mutex::new(())),
             store,
             c1_catalog: true,
@@ -2807,11 +2901,25 @@ impl SourceProvider {
             return None;
         }
         let tick = st.source_cache.next_tick();
-        let cached = {
+        let (cached, old_bytes, new_bytes) = {
             let slot = st.native_raw.as_mut()?;
             slot.last_used = tick;
-            slot.source.clone()
+            // A deferred mip may have been built since publication. Re-read the
+            // reservation/actual bytes so the native slot cannot stay stale.
+            let new_bytes = slot.source.as_ref().map_or(0, |source| source_cache_bytes(source));
+            let old_bytes = slot.bytes;
+            slot.bytes = new_bytes;
+            (slot.source.clone(), old_bytes, new_bytes)
         };
+        if new_bytes != old_bytes {
+            st.source_cache.current_bytes = st
+                .source_cache
+                .current_bytes
+                .saturating_add(new_bytes)
+                .saturating_sub(old_bytes);
+            st.source_cache.peak_bytes =
+                st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
+        }
         st.source_cache.native_hits += 1;
         st.source_cache.note_use(image);
         Some(cached)
@@ -2897,7 +3005,8 @@ impl SourceProvider {
             path.clone()
         };
         let mut decoded_reason = None;
-        let (source, provenance) = match raw16_source(&decoded_path) {
+        let (source16, failed16) = raw16_source_with_bytes(&decoded_path);
+        let (source, provenance) = match source16 {
             Some((source, provenance)) => (source, provenance),
             None => {
                 let img = if is_cop(&decoded_path) {
@@ -2910,7 +3019,7 @@ impl SourceProvider {
                         }
                     }
                 } else if crate::raw::is_raw(&decoded_path) {
-                    match crate::raw::decode(&decoded_path) {
+                    match crate::raw::decode8_fallback(&decoded_path, failed16.as_ref()) {
                         Ok(img) => img,
                         Err(err) => {
                             let reason = format!("RAW decode failed: {err:#}");
@@ -3519,7 +3628,44 @@ impl FileEngine {
             .with_source(src.snapshot_id());
         let (rendering, intent_note) = crate::engine::request_rendering(request);
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
-        let hit = self.state.lock().preview.get(key);
+        // Graph-dirty reuse. `preview_cache::key` still includes the layer rows
+        // and node topology, so an edit confined to a pruned branch misses the
+        // exact key even though it cannot move a pixel. `dirty_between` decides
+        // that case after `graph_reusable_with` has ruled out every other input
+        // (spots, develop/detail/portrait/geometry, region, size, quality).
+        // Repair first: a row with no node still renders, so it must be a node
+        // for the diff to see it.
+        let graph = adj.nodes.clone().unwrap_or_default().repaired(&adj.layers);
+        let mut frame_key = key;
+        let mut graph_reused = false;
+        let hit = {
+            let mut st = self.state.lock();
+            st.preview.get(key)
+        };
+        let hit = match hit {
+            Some(hit) => Some(hit),
+            None => {
+                let reuse_key = { self.graph_gate.lock().reuse(&key, &graph, &adj.layers) };
+                match reuse_key {
+                    Some(reuse_key) => {
+                        let hit = {
+                            let mut st = self.state.lock();
+                            st.preview.get(reuse_key)
+                        };
+                        if hit.is_some() {
+                            frame_key = reuse_key;
+                            graph_reused = true;
+                        }
+                        hit
+                    }
+                    None => None,
+                }
+            }
+        };
+        {
+            let mut gate = self.graph_gate.lock();
+            gate.record(key, frame_key, graph, adj.layers.clone());
+        }
         if let Some(hit) = hit {
             let histogram = hit.histogram.clone();
             let source = hit.into_image();
@@ -3532,8 +3678,8 @@ impl FileEngine {
             let degraded = degraded.or(intent_note);
             let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
             if perf {
-                eprintln!("AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":true,\"fast\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
-                    request.generation, request.image.0, fast, width, height, elapsed_ms, source_kind, request.bypass);
+                eprintln!("AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":true,\"graph_reuse\":{},\"fast\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
+                    request.generation, request.image.0, graph_reused, fast, width, height, elapsed_ms, source_kind, request.bypass);
             }
             return Ok(PreviewFrame {
                 histogram,
@@ -7709,6 +7855,54 @@ mod tests {
     }
 
     #[test]
+    fn native_lazy_source_publishes_the_reserved_mip_tail() {
+        let rgba = vec![32000u16; 1024 * 768 * 4];
+        let source = Source::from_rgba16_native(1024, 768, &rgba);
+        let level0 = source.levels[0].data.capacity() * std::mem::size_of::<[f32; 3]>();
+        let tail: usize = source.levels[1..]
+            .iter()
+            .map(|level| {
+                level.width as usize * level.height as usize * std::mem::size_of::<[f32; 3]>()
+            })
+            .sum();
+        assert_eq!(
+            source_cache_bytes(&source),
+            level0 + tail,
+            "a native slot must reserve the full tail at publication"
+        );
+        // Sampling level 0 only must not materialise the tail.
+        let _ = crate::render(
+            &source,
+            &AdjustmentSet::default(),
+            NormRect::FULL,
+            1024,
+            false,
+            None,
+        );
+        assert!(
+            source.levels[1..].iter().all(|level| level.data.is_empty()),
+            "a 1:1 render must not build the deferred tail"
+        );
+        assert_eq!(source_cache_bytes(&source), level0 + tail);
+        // Zoom out: the tail materialises and accounting follows its capacity.
+        let _ = crate::render(
+            &source,
+            &AdjustmentSet::default(),
+            NormRect::FULL,
+            256,
+            false,
+            None,
+        );
+        let materialized: usize = source
+            .levels
+            .iter()
+            .map(|level| level.allocated_bytes())
+            .sum();
+        assert_eq!(source_cache_bytes(&source), materialized);
+        assert!(source.levels[1..].iter().all(|level| !level.data.is_empty()));
+    }
+
+    #[test]
     fn source_cache_budget_follows_installed_memory() {
         let mib = 1024 * 1024usize;
         let small = source_cache_budget_from_memory(16 * 1024 * mib as u64, 8 * 1024 * mib as u64);
@@ -7952,6 +8146,59 @@ mod tests {
         let source_px = w as usize * h as usize;
         let raster = estimated_decode_bytes(w, h, DecodeFormat::Raster);
         assert!(raster >= source_px * 14, "{raster} vs {}", source_px * 14);
+    }
+
+    #[test]
+    fn observed_decode_estimate_counts_file_bytes_and_backend_buffers() {
+        let (w, h) = (6048u32, 4032u32);
+        let px = w as usize * h as usize;
+        let file_bytes = 50_000_000usize;
+        let route = |c1_raw_enabled: bool, z6iii_nef: bool| crate::raw::DecodeRoute {
+            pipeline_fingerprint: 0,
+            c1_raw_enabled,
+            z6iii_nef,
+            z6iii_feature: true,
+            libraw_available: true,
+            opencl: crate::raw::OpenClRouteState::NotCompiled,
+            demosaic: 3,
+        };
+        let libraw = route(false, false);
+        let generic = route(true, false);
+        let z6iii = route(true, true);
+        let kept = fit_long_side((w, h));
+        let retained = kept.0 as usize * kept.1 as usize * RETAINED_BYTES_PER_PX * 4 / 3;
+
+        let libraw_bytes =
+            estimated_decode_bytes_observed(w, h, DecodeFormat::RawProxy, file_bytes, &libraw);
+        assert_eq!(libraw_bytes, file_bytes + retained + px * 20);
+        let generic_bytes =
+            estimated_decode_bytes_observed(w, h, DecodeFormat::RawProxy, file_bytes, &generic);
+        assert_eq!(generic_bytes, file_bytes + retained + px * 46);
+        let z6iii_bytes =
+            estimated_decode_bytes_observed(w, h, DecodeFormat::RawProxy, file_bytes, &z6iii);
+        assert_eq!(z6iii_bytes, file_bytes + retained + px * 40);
+
+        // The detailed estimate exceeds the unchanged admission value: the gate
+        // still undercounts until real peak-RSS data justifies raising it.
+        assert!(libraw_bytes > estimated_decode_bytes(w, h, DecodeFormat::RawProxy));
+        assert!(generic_bytes > z6iii_bytes && z6iii_bytes > libraw_bytes);
+
+        // Native keeps the full source resolution in the retained mip.
+        let native =
+            estimated_decode_bytes_observed(w, h, DecodeFormat::RawNative, file_bytes, &z6iii);
+        assert_eq!(native, file_bytes + px * RETAINED_BYTES_PER_PX * 4 / 3 + px * 40);
+
+        // Saturation, not panic, on absurd inputs.
+        assert_eq!(
+            estimated_decode_bytes_observed(
+                u32::MAX,
+                u32::MAX,
+                DecodeFormat::RawNative,
+                usize::MAX,
+                &generic,
+            ),
+            usize::MAX
+        );
     }
 
     #[test]

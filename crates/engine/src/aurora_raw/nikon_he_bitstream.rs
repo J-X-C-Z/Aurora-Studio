@@ -107,6 +107,7 @@ impl Decoder {
         let mut current: [Prediction; 26] = std::array::from_fn(|_| Prediction::default());
         let mut packets: [Packet; 8] = std::array::from_fn(|_| Packet::default());
         for (packet_index, (packet, slots)) in packets.iter_mut().zip(PACKET_BANDS).enumerate() {
+            packet.bands.reserve(slots.len());
             let mut parse_packet = || -> Result<(), DecodeError> {
                 let mut packet_header = Bits::new(take(&mut body, 7)?);
                 if packet_header.read(1)? != 0 {
@@ -137,7 +138,7 @@ impl Decoder {
                         gcli: Vec::with_capacity(GROUPS[slot]), gtli, empty: true,
                     };
                     for start in (0..GROUPS[slot]).step_by(8) {
-                        let insignificant = sig.read(1)? != 0;
+                        let insignificant = sig.read1()? != 0;
                         prediction.empty &= insignificant;
                         for index in start..(start + 8).min(GROUPS[slot]) {
                             let unary = if insignificant { 0 } else { gcli.unary()? };
@@ -154,13 +155,13 @@ impl Decoder {
                             prediction.gcli.push(planes);
                             let mut coeffs = [0i16; 4];
                             for _ in 0..nbits {
-                                let plane = data.read(4)?;
+                                let plane = data.read4()?;
                                 for (index, coeff) in coeffs.iter_mut().enumerate() {
-                                    *coeff = (*coeff << 1) | ((plane >> (3 - index)) & 1) as i16;
+                                    *coeff = (*coeff << 1) | i16::from((plane >> (3 - index)) & 1);
                                 }
                             }
                             for coeff in &mut coeffs {
-                                if *coeff != 0 && sign.read(1)? != 0 {
+                                if *coeff != 0 && sign.read1()? != 0 {
                                     *coeff = -*coeff;
                                 }
                             }
@@ -209,26 +210,80 @@ fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], DecodeError> {
 struct Bits<'a> {
     bytes: &'a [u8],
     pos: usize,
+    next: usize,
+    buffer: u64,
+    buffered: u32,
 }
 
 impl<'a> Bits<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+        Self { bytes, pos: 0, next: 0, buffer: 0, buffered: 0 }
     }
 
-    fn read(&mut self, count: usize) -> Result<usize, DecodeError> {
-        let mut value = 0;
-        for _ in 0..count {
-            let byte = self.bytes.get(self.pos / 8).ok_or_else(truncated)?;
-            value = (value << 1) | usize::from((byte >> (7 - self.pos % 8)) & 1);
-            self.pos += 1;
+    #[inline(always)]
+    fn refill(&mut self) {
+        while self.buffered <= 56 {
+            let Some(&byte) = self.bytes.get(self.next) else {
+                break;
+            };
+            self.buffer |= u64::from(byte) << (56 - self.buffered);
+            self.next += 1;
+            self.buffered += 8;
         }
+    }
+
+    #[inline(always)]
+    fn read(&mut self, count: usize) -> Result<usize, DecodeError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        if self.buffered < count as u32 {
+            self.refill();
+            if self.buffered < count as u32 {
+                return Err(truncated());
+            }
+        }
+        let value = (self.buffer >> (64 - count)) & ((1u64 << count) - 1);
+        self.buffer <<= count;
+        self.buffered -= count as u32;
+        self.pos += count;
+        Ok(value as usize)
+    }
+
+    #[inline(always)]
+    fn read1(&mut self) -> Result<u8, DecodeError> {
+        if self.buffered == 0 {
+            self.refill();
+            if self.buffered == 0 {
+                return Err(truncated());
+            }
+        }
+        let value = (self.buffer >> 63) as u8;
+        self.buffer <<= 1;
+        self.buffered -= 1;
+        self.pos += 1;
         Ok(value)
     }
 
+    #[inline(always)]
+    fn read4(&mut self) -> Result<u8, DecodeError> {
+        if self.buffered < 4 {
+            self.refill();
+            if self.buffered < 4 {
+                return Err(truncated());
+            }
+        }
+        let value = (self.buffer >> 60) as u8;
+        self.buffer <<= 4;
+        self.buffered -= 4;
+        self.pos += 4;
+        Ok(value)
+    }
+
+    #[inline(always)]
     fn unary(&mut self) -> Result<u8, DecodeError> {
         for ones in 0..=31 {
-            if self.read(1)? == 0 {
+            if self.read1()? == 0 {
                 return Ok(ones);
             }
         }

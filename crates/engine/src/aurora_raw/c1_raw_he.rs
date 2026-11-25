@@ -25,6 +25,7 @@ mod nikon_he_bitstream;
 mod stage1_reference;
 
 use std::io::{Error, ErrorKind, Result};
+use std::sync::mpsc;
 
 use c1_nef_he::find_he_strip;
 #[allow(unused_imports)]
@@ -361,6 +362,187 @@ fn reconstruct_active_mirror_with(
     reconstruct_planar_roi_with(&tile, local, params, rgb_black, scale, offset, finish)
 }
 
+/// One HE slice: a 0x20 marker resets the coefficient predictor, then 16 (or
+/// fewer, for the tail) length-prefixed precincts. Each slice is therefore an
+/// independent decode unit; only the byte offsets are discovered sequentially.
+struct SlicePlan {
+    /// Byte offset of each precinct's length field. Decoding is handed the
+    /// payload from that offset onward, exactly as the sequential loop does, so
+    /// a stream whose length field overruns its slice fails the same way.
+    precincts: Vec<usize>,
+}
+
+fn coefficient_bands(precinct: nikon_he_bitstream::Precinct) -> Result<[Vec<Vec<i32>>; 8]> {
+    let mut packets: [Vec<Vec<i32>>; 8] = std::array::from_fn(|_| Vec::new());
+    for (destination, packet) in packets.iter_mut().zip(precinct.packets) {
+        for band in packet.bands {
+            let mut coefficient_band = Vec::with_capacity(band.groups.len() * 4);
+            for group in band.groups {
+                for coefficient in group.coeffs {
+                    coefficient_band.push(dequantize(
+                        coefficient.unsigned_abs(),
+                        coefficient < 0,
+                        group.nbits,
+                        band.gtli,
+                    )?);
+                }
+            }
+            destination.push(coefficient_band);
+        }
+    }
+    Ok(packets)
+}
+
+/// Walks the slice headers and precinct length fields without touching
+/// coefficients. `None` means the payload is structurally irregular, and the
+/// caller must use the sequential path so error selection stays identical.
+fn plan_slices(payload: &[u8], precinct_count: usize) -> Option<Vec<SlicePlan>> {
+    let mut plans: Vec<SlicePlan> = Vec::new();
+    let mut at = 0usize;
+    for index in 0..precinct_count {
+        if index % 16 == 0 {
+            let header = payload.get(at..at + 4)?;
+            if header[..2] != [0xff, 0x20] {
+                return None;
+            }
+            let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            if length < 2 || payload.len() < at + length + 2 {
+                return None;
+            }
+            let segment = &payload[at..at + length + 2];
+            if segment[4..] != ((index / 16) as u16).to_be_bytes() {
+                return None;
+            }
+            at += length + 2;
+            plans.push(SlicePlan { precincts: Vec::with_capacity(16) });
+        }
+        let header = payload.get(at..at + 12)?;
+        let bytes_consumed = 12
+            + (usize::from(header[0]) << 16)
+            + (usize::from(header[1]) << 8)
+            + usize::from(header[2]);
+        if payload.len() < at.checked_add(bytes_consumed)? {
+            return None;
+        }
+        plans.last_mut()?.precincts.push(at);
+        at += bytes_consumed;
+    }
+    (at == payload.len()).then_some(plans)
+}
+
+fn decode_slice(
+    decoder: &mut Decoder,
+    payload: &[u8],
+    plan: &SlicePlan,
+    cell_width: usize,
+) -> Result<Vec<c1_nikon_he::Precinct>> {
+    decoder.reset_slice();
+    let mut precincts = Vec::with_capacity(plan.precincts.len());
+    for &start in &plan.precincts {
+        let precinct = decoder.decode_precinct(&payload[start..])?;
+        let packets = coefficient_bands(precinct)?;
+        precincts.push(reconstruct_precinct(cell_width, &packets)?);
+    }
+    Ok(precincts)
+}
+
+/// Bounded worker count. One slice is one work item, so the pool never exceeds
+/// the slice count and never assumes a particular machine.
+fn worker_count(slices: usize) -> usize {
+    let requested = std::env::var("AURORA_HE_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(8)
+        });
+    requested.clamp(1, slices.max(1))
+}
+
+fn decode_slices_parallel(
+    payload: &[u8],
+    plans: &[SlicePlan],
+    weights: Weights,
+    cell_width: usize,
+) -> Result<Vec<c1_nikon_he::Precinct>> {
+    let workers = worker_count(plans.len());
+    if workers <= 1 {
+        let mut decoder = Decoder::new(weights);
+        let mut precincts = Vec::new();
+        for plan in plans {
+            precincts.extend(decode_slice(&mut decoder, payload, plan, cell_width)?);
+        }
+        return Ok(precincts);
+    }
+    let mut collected: Vec<Option<Result<Vec<c1_nikon_he::Precinct>>>> =
+        (0..plans.len()).map(|_| None).collect();
+    let (sender, receiver) = mpsc::channel();
+    let chunk = plans.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (worker, group) in plans.chunks(chunk).enumerate() {
+            let sender = sender.clone();
+            let first = worker * chunk;
+            scope.spawn(move || {
+                let mut decoder = Decoder::new(weights);
+                for (offset, plan) in group.iter().enumerate() {
+                    let result = decode_slice(&mut decoder, payload, plan, cell_width);
+                    if sender.send((first + offset, result)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            collected[index] = Some(result);
+        }
+    });
+    let mut precincts = Vec::with_capacity(plans.iter().map(|plan| plan.precincts.len()).sum());
+    for slot in collected {
+        match slot {
+            Some(Ok(mut slice)) => precincts.append(&mut slice),
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "HE slice worker did not report a result",
+                ));
+            }
+        }
+    }
+    Ok(precincts)
+}
+
+fn decode_precincts_sequential(
+    rest: &mut &[u8],
+    precinct_count: usize,
+    weights: Weights,
+    cell_width: usize,
+) -> Result<Vec<c1_nikon_he::Precinct>> {
+    let mut decoder = Decoder::new(weights);
+    let mut precincts = Vec::with_capacity(precinct_count);
+    for index in 0..precinct_count {
+        if index % 16 == 0 {
+            let slice = marker(rest, 0x20)?;
+            if slice[4..] != ((index / 16) as u16).to_be_bytes() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "unexpected HE slice index",
+                ));
+            }
+            decoder.reset_slice();
+        }
+        let precinct = decoder.decode_precinct(rest)?;
+        *rest = &rest[precinct.bytes_consumed..];
+        let packets = coefficient_bands(precinct)?;
+        precincts.push(reconstruct_precinct(cell_width, &packets)?);
+    }
+    Ok(precincts)
+}
+
 fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)>> {
     let Some(strip) = find_he_strip(nef)? else {
         return Ok(None);
@@ -385,45 +567,21 @@ fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)
             "untested HE codestream profile",
         ));
     }
-    let mut decoder = Decoder::new(Weights::from_wgt(weights)?);
+    let weights = Weights::from_wgt(weights)?;
     let precinct_count = if first_slice_only {
         17
     } else {
         strip.height / 4
     };
-    let mut precincts = Vec::with_capacity(precinct_count);
-    for index in 0..precinct_count {
-        if index % 16 == 0 {
-            let slice = marker(&mut rest, 0x20)?;
-            if slice[4..] != ((index / 16) as u16).to_be_bytes() {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "unexpected HE slice index",
-                ));
-            }
-            decoder.reset_slice();
+    let cell_width = strip.width / 2;
+    let precincts = match plan_slices(rest, precinct_count) {
+        Some(plans) => {
+            let precincts = decode_slices_parallel(rest, &plans, weights, cell_width)?;
+            rest = &rest[rest.len()..];
+            precincts
         }
-        let precinct = decoder.decode_precinct(rest)?;
-        rest = &rest[precinct.bytes_consumed..];
-        let mut packets: [Vec<Vec<i32>>; 8] = std::array::from_fn(|_| Vec::new());
-        for (destination, packet) in packets.iter_mut().zip(precinct.packets) {
-            for band in packet.bands {
-                let mut coefficient_band = Vec::with_capacity(band.groups.len() * 4);
-                for group in band.groups {
-                    for coefficient in group.coeffs {
-                        coefficient_band.push(dequantize(
-                            coefficient.unsigned_abs(),
-                            coefficient < 0,
-                            group.nbits,
-                            band.gtli,
-                        )?);
-                    }
-                }
-                destination.push(coefficient_band);
-            }
-        }
-        precincts.push(reconstruct_precinct(strip.width / 2, &packets)?);
-    }
+        None => decode_precincts_sequential(&mut rest, precinct_count, weights, cell_width)?,
+    };
     let bayer = if first_slice_only {
         bayer_prefix(&precincts, 64)?
     } else {

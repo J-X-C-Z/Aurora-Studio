@@ -121,6 +121,12 @@ pub fn demosaic_quality() -> i32 {
 /// encoding at that width keeps about eight times the shadow levels that
 /// truncating to 8-bit linear leaves.
 pub fn decode(path: &Path) -> anyhow::Result<RgbaImage> {
+    decode_from_path(path)
+}
+
+/// The historical 8-bit decode: open the path, demosaic with LibRaw, else scan
+/// the embedded preview.
+fn decode_from_path(path: &Path) -> anyhow::Result<RgbaImage> {
     match libraw::decode(path, demosaic_quality()) {
         Ok(decoded) if matches_preview(&decoded, path) => {
             remember_sensor(path, true);
@@ -135,6 +141,76 @@ pub fn decode(path: &Path) -> anyhow::Result<RgbaImage> {
     }
     remember_sensor(path, false);
     embedded_preview(path)
+}
+
+/// The 8-bit fallback for a RAW whose 16-bit attempt already read the file.
+///
+/// `failed` carries the container bytes that attempt read, so this function
+/// never has to read the file again. The pixels are the same [`decode`]
+/// produces:
+///
+/// * `libraw_unpack_unsupported` means LibRaw itself returned
+///   `LIBRAW_FILE_UNSUPPORTED` for these exact bytes during the 16-bit attempt.
+///   The same build would reject the same bytes again, so the embedded preview
+///   is used without a second LibRaw open. This is an observed result, not a
+///   guess about the file format.
+/// * Otherwise LibRaw runs on the in-memory buffer (`libraw_open_buffer`) when
+///   the build exports it, falling back to the path exactly as before. The
+///   similarity check scans the same bytes instead of re-reading the file.
+pub(crate) fn decode8_fallback(
+    path: &Path,
+    failed: Option<&FailedRaw16>,
+) -> anyhow::Result<RgbaImage> {
+    let Some(failed) = failed else {
+        return decode_from_path(path);
+    };
+    if failed.libraw_unpack_unsupported {
+        log::debug!(
+            "libraw {}: unpack already reported unsupported for these bytes; \
+             using the embedded preview without reopening",
+            path.display()
+        );
+        remember_sensor(path, false);
+        return embedded_preview_bytes(&failed.bytes)
+            .ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()));
+    }
+    log::debug!(
+        "libraw {}: reusing the {} bytes the 16-bit attempt read for the 8-bit fallback",
+        path.display(),
+        failed.bytes.len()
+    );
+    let decoded = libraw::decode_bytes(path, &failed.bytes, demosaic_quality());
+    match decoded {
+        Ok(decoded) if same_picture_bytes(&luma_grid(&decoded), &failed.bytes) => {
+            remember_sensor(path, true);
+            return Ok(decoded);
+        }
+        Ok(_) => log::warn!(
+            "libraw {}: the sensor decode does not resemble the camera's own preview \
+             (unsupported compression?); using the embedded preview",
+            path.display()
+        ),
+        Err(err) => log::warn!("libraw {}: {err}; using the embedded preview", path.display()),
+    }
+    remember_sensor(path, false);
+    embedded_preview_bytes(&failed.bytes)
+        .ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))
+}
+
+/// Containers individually larger than this are not retained for the 8-bit
+/// fallback; the fallback then reads the file again instead of holding a second
+/// large copy while decoding. The limit is a memory guard only; well above any
+/// current camera RAW, so normal files always take the reuse path.
+const MAX_FAILED16_BYTES: usize = 512 << 20;
+
+/// What a failed 16-bit attempt leaves behind for the 8-bit fallback.
+pub(crate) struct FailedRaw16 {
+    /// The bytes the 16-bit attempt already read.
+    pub bytes: Vec<u8>,
+    /// LibRaw returned `LIBRAW_FILE_UNSUPPORTED` while unpacking these exact
+    /// bytes. A second LibRaw attempt cannot succeed, so the fallback goes
+    /// straight to the embedded preview.
+    pub libraw_unpack_unsupported: bool,
 }
 
 /// Whether [`decode`] returned real sensor data for path, or the camera's own
@@ -202,105 +278,168 @@ impl RawDecodeContext {
 /// pixels. Cache headers persist it so a hit can still route the colour
 /// pipeline (the Z6III pre-matrix must never run on a LibRaw/preview fallback).
 pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    decode16_traced_routed(path, decode_route(path))
+}
+
+/// [`decode16_traced`] with the route the caller already computed.
+///
+/// `raw_cache` builds a [`DecodeRoute`] for its key; passing it through keeps
+/// the backend choice ahead of the decode and avoids a second Z6III file scan.
+pub(crate) fn decode16_traced_routed(
+    path: &Path,
+    route: DecodeRoute,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    decode16_attempt(path, route).0
+}
+
+/// Routes [`decode16_traced_routed`] and hands a failed attempt's bytes back.
+///
+/// The 8-bit fallback in the file engine reuses those bytes
+/// ([`decode8_fallback`]) instead of reading the container and reopening LibRaw.
+pub(crate) fn decode16_attempt(
+    path: &Path,
+    route: DecodeRoute,
+) -> (
+    Option<(u32, u32, Vec<u16>, DecodeProvenance)>,
+    Option<FailedRaw16>,
+) {
     let started = Instant::now();
     // The Aurora Raw chain decodes the same Bayer as LibRaw but demosaics with
     // Aurora Raw's own stages. It handles the verified HE variant; `AURORA_C1_RAW=0`
     // is an escape hatch back to the LibRaw path.
-    if c1_raw_enabled() {
-        if let Some(mut ctx) = RawDecodeContext::read(path) {
-            let forced = libraw_forced();
-            let forbidden = libraw_forbidden();
-            let open_started = Instant::now();
-            // `AURORA_NO_LIBRAW=1` makes the native front-end the only allowed
-            // source; an installed LibRaw must not silently win instead.
-            let mut session = if forbidden && !forced {
-                None
-            } else {
-                libraw::Session::open(path, &ctx.bytes, demosaic_quality()).ok()
-            };
-            ctx.timings.libraw_open_ms = open_started.elapsed().as_millis() as u64;
-            let bayer = session.as_mut().and_then(|session| {
-                let unpack_started = Instant::now();
-                let unpacked = session.unpack().is_ok();
-                ctx.timings.libraw_unpack_ms = unpack_started.elapsed().as_millis() as u64;
-                if !unpacked {
-                    return None;
-                }
-                let bayer_started = Instant::now();
-                let bayer = session.bayer().ok();
-                ctx.timings.bayer_ms = bayer_started.elapsed().as_millis() as u64;
-                bayer
-            });
-            // LibRaw first; when it produced no Bayer plane, the native
-            // pure-Rust container decoder reuses these bytes instead of reading
-            // the file again.
-            let effective = effective_bayer(&ctx.bytes, bayer.as_ref());
-            let front_end = effective.as_deref();
-            if let Some(frame) = front_end {
-                ctx.timings
-                    .note_bytes(ctx.bytes.len() as u64 + (frame.data.len() as u64) * 2);
+    if route.c1_raw_enabled {
+        let Some(mut ctx) = RawDecodeContext::read(path) else {
+            // The shared read failed; keep the historic path, which lets LibRaw
+            // open the file itself. No bytes exist to hand to the fallback.
+            return decode16_libraw_only(path, started);
+        };
+        let forced = libraw_forced();
+        let forbidden = libraw_forbidden();
+        // A verified Z6III HE NEF needs no LibRaw Bayer plane: the
+        // reconstruction decodes the HE codestream itself. Deciding this from
+        // the route plus the codestream header, before opening LibRaw, avoids a
+        // fruitless open/unpack for compression this build rejects.
+        let mut bayerless_aurora_done = false;
+        if crate::aurora_raw::route_skips_libraw(&route, &ctx.bytes) {
+            ctx.timings.note_bytes(ctx.bytes.len() as u64);
+            if let Some(frame) = crate::aurora_raw::decode_he_rgba16_with(
+                &ctx.bytes,
+                &ctx.exif,
+                None,
+                &mut ctx.timings,
+            ) {
+                let mut kind = RawKind::classify(path, None, ctx.exif.camera_model.as_deref());
+                return (
+                    Some(finish_aurora(path, &mut kind, frame, &mut ctx.timings, started)),
+                    None,
+                );
             }
-            let mut kind = RawKind::classify(path, front_end, ctx.exif.camera_model.as_deref());
-            if let Some((width, height, rgba, route)) = crate::aurora_raw::decode_he_rgba16_with(
+            bayerless_aurora_done = true;
+            log::debug!(
+                "Aurora Raw declined {} before LibRaw unpack; continuing with LibRaw",
+                path.display()
+            );
+        }
+        let open_started = Instant::now();
+        // `AURORA_NO_LIBRAW=1` makes the native front-end the only allowed
+        // source; an installed LibRaw must not silently win instead.
+        let mut session = if forbidden && !forced {
+            None
+        } else {
+            libraw::Session::open(path, &ctx.bytes, demosaic_quality()).ok()
+        };
+        ctx.timings.libraw_open_ms = open_started.elapsed().as_millis() as u64;
+        let mut unpack_unsupported = false;
+        let bayer = session.as_mut().and_then(|session| {
+            let unpack_started = Instant::now();
+            let unpacked = match session.unpack() {
+                Ok(()) => true,
+                Err(BayerError::Unsupported) => {
+                    // The same bytes and the same LibRaw build: a second open
+                    // cannot turn this into a successful unpack.
+                    unpack_unsupported = true;
+                    false
+                }
+                Err(_) => false,
+            };
+            ctx.timings.libraw_unpack_ms = unpack_started.elapsed().as_millis() as u64;
+            if !unpacked {
+                return None;
+            }
+            let bayer_started = Instant::now();
+            let bayer = session.bayer().ok();
+            ctx.timings.bayer_ms = bayer_started.elapsed().as_millis() as u64;
+            bayer
+        });
+        // LibRaw first; when it produced no Bayer plane, the native
+        // pure-Rust container decoder reuses these bytes instead of reading
+        // the file again.
+        let effective = effective_bayer(&ctx.bytes, bayer.as_ref());
+        let front_end = effective.as_deref();
+        if let Some(frame) = front_end {
+            ctx.timings
+                .note_bytes(ctx.bytes.len() as u64 + (frame.data.len() as u64) * 2);
+        }
+        let mut kind = RawKind::classify(path, front_end, ctx.exif.camera_model.as_deref());
+        // The bayer-less attempt above already ran this exact call when LibRaw
+        // produced no plane; repeating it would decode the same bytes a second
+        // time for the same answer. A native front-end is a *different* input,
+        // so the chain still runs for it.
+        let aurora = if front_end.is_none() && bayerless_aurora_done {
+            None
+        } else {
+            crate::aurora_raw::decode_he_rgba16_with(
                 &ctx.bytes,
                 &ctx.exif,
                 front_end,
                 &mut ctx.timings,
-            ) {
-                log::info!("Aurora Raw decoded {}", path.display());
-                remember_sensor(path, true);
-                if matches!(
-                    route,
-                    crate::aurora_raw::AuroraRoute::Z6iiiOpenCl
-                        | crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClUnavailable
-                        | crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed
-                ) {
-                    kind = RawKind::Z6iiiHe;
-                }
-                ctx.timings.total_ms = started.elapsed().as_millis() as u64;
-                record_raw_decode(kind, ctx.timings);
-                return Some((width, height, rgba, DecodeProvenance::aurora(route)));
-            }
-            if let Some(session) = session.as_mut() {
-                // The same unpacked handle serves libraw's own demosaic, so the
-                // fallback no longer reads and decodes the file a second time.
-                let fallback_started = Instant::now();
-                let decoded = session.process16();
-                ctx.timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
-                match decoded {
-                    Ok((width, height, rgba)) => {
-                        ctx.timings
-                            .note_bytes(ctx.bytes.len() as u64 + (rgba.len() as u64) * 2);
-                        if same_picture_bytes(&luma_grid16(width, height, &rgba), &ctx.bytes) {
-                            remember_sensor(path, true);
-                            ctx.timings.total_ms = started.elapsed().as_millis() as u64;
-                            record_raw_decode(kind, ctx.timings);
-                            return Some((width, height, rgba, DecodeProvenance::libraw16()));
-                        }
-                        log::warn!(
-                            "libraw {}: the 16-bit sensor decode does not resemble the camera's \
-                             own preview (unsupported compression?); falling back to the 8-bit path",
-                            path.display()
-                        );
+            )
+        };
+        if let Some(frame) = aurora {
+            return (
+                Some(finish_aurora(path, &mut kind, frame, &mut ctx.timings, started)),
+                None,
+            );
+        }
+        if let Some(session) = session.as_mut() {
+            // The same unpacked handle serves libraw's own demosaic, so the
+            // fallback no longer reads and decodes the file a second time.
+            let fallback_started = Instant::now();
+            let decoded = session.process16();
+            ctx.timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
+            match decoded {
+                Ok((width, height, rgba)) => {
+                    ctx.timings
+                        .note_bytes(ctx.bytes.len() as u64 + (rgba.len() as u64) * 2);
+                    if same_picture_bytes(&luma_grid16(width, height, &rgba), &ctx.bytes) {
+                        remember_sensor(path, true);
+                        ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+                        record_raw_decode(kind, ctx.timings);
+                        return (Some((width, height, rgba, DecodeProvenance::libraw16())), None);
                     }
-                    Err(err) => log::warn!(
-                        "libraw {}: 16-bit {err}; falling back to the 8-bit path",
+                    log::warn!(
+                        "libraw {}: the 16-bit sensor decode does not resemble the camera's \
+                         own preview (unsupported compression?); falling back to the 8-bit path",
                         path.display()
-                    ),
+                    );
                 }
-                ctx.timings.total_ms = started.elapsed().as_millis() as u64;
-                record_raw_decode(kind, ctx.timings);
-                return None;
+                Err(err) => log::warn!(
+                    "libraw {}: 16-bit {err}; falling back to the 8-bit path",
+                    path.display()
+                ),
             }
-            // No libraw handle at all (library missing, or the format needs a
-            // file handle): keep the historic path and record its cost.
+        } else {
             if forbidden && !forced {
                 // The native front-end already ran and declined. `AURORA_NO_LIBRAW=1`
                 // must not then fall through to LibRaw's own 16-bit decode.
                 ctx.timings.total_ms = started.elapsed().as_millis() as u64;
                 record_raw_decode(kind, ctx.timings);
-                return None;
+                // Under AURORA_NO_LIBRAW the 8-bit fallback must not open
+                // LibRaw either, so no bytes are handed over.
+                return (None, None);
             }
+            // No libraw handle at all (library missing, or the format needs a
+            // file handle): keep the historic path and record its cost.
             let fallback_started = Instant::now();
             let decoded = libraw::decode16(path, demosaic_quality());
             ctx.timings.fallback_ms = fallback_started.elapsed().as_millis() as u64;
@@ -309,14 +448,32 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
                     remember_sensor(path, true);
                     ctx.timings.total_ms = started.elapsed().as_millis() as u64;
                     record_raw_decode(kind, ctx.timings);
-                    return Some((width, height, rgba, DecodeProvenance::libraw16()));
+                    return (Some((width, height, rgba, DecodeProvenance::libraw16())), None);
                 }
             }
-            ctx.timings.total_ms = started.elapsed().as_millis() as u64;
-            record_raw_decode(kind, ctx.timings);
-            return None;
         }
+        drop(session);
+        ctx.timings.total_ms = started.elapsed().as_millis() as u64;
+        record_raw_decode(kind, ctx.timings);
+        let failed = (ctx.bytes.len() <= MAX_FAILED16_BYTES).then(|| FailedRaw16 {
+            bytes: ctx.bytes,
+            libraw_unpack_unsupported: unpack_unsupported,
+        });
+        return (None, failed);
     }
+    decode16_libraw_only(path, started)
+}
+
+/// The historic LibRaw-only 16-bit attempt, used when C1 RAW is off or when
+/// the shared whole-file read failed. It keeps its own `fs` access through
+/// LibRaw and never hands bytes to the fallback.
+fn decode16_libraw_only(
+    path: &Path,
+    started: Instant,
+) -> (
+    Option<(u32, u32, Vec<u16>, DecodeProvenance)>,
+    Option<FailedRaw16>,
+) {
     let mut timings = RawStageTimings::default();
     let fallback_started = Instant::now();
     let decoded = libraw::decode16(path, demosaic_quality());
@@ -326,7 +483,7 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
             remember_sensor(path, true);
             timings.total_ms = started.elapsed().as_millis() as u64;
             record_raw_decode(RawKind::classify(path, None, None), timings);
-            return Some((width, height, rgba, DecodeProvenance::libraw16()));
+            return (Some((width, height, rgba, DecodeProvenance::libraw16())), None);
         }
         Ok(_) => log::warn!(
             "libraw {}: the 16-bit sensor decode does not resemble the camera's own preview \
@@ -335,7 +492,47 @@ pub fn decode16_traced(path: &Path) -> Option<(u32, u32, Vec<u16>, DecodeProvena
         ),
         Err(err) => log::warn!("libraw {}: 16-bit {err}; falling back to the 8-bit path", path.display()),
     }
-    None
+    (None, None)
+}
+
+/// Records a successful Aurora frame exactly once: kind, sensor flag, timings.
+fn finish_aurora(
+    path: &Path,
+    kind: &mut RawKind,
+    frame: (u32, u32, Vec<u16>, crate::aurora_raw::AuroraRoute),
+    timings: &mut RawStageTimings,
+    started: Instant,
+) -> (u32, u32, Vec<u16>, DecodeProvenance) {
+    let (width, height, rgba, route) = frame;
+    log::info!("Aurora Raw decoded {}", path.display());
+    remember_sensor(path, true);
+    if matches!(
+        route,
+        crate::aurora_raw::AuroraRoute::Z6iiiOpenCl
+            | crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClUnavailable
+            | crate::aurora_raw::AuroraRoute::Z6iiiCpuOpenClFailed
+    ) {
+        *kind = RawKind::Z6iiiHe;
+    }
+    timings.total_ms = started.elapsed().as_millis() as u64;
+    record_raw_decode(*kind, *timings);
+    (width, height, rgba, DecodeProvenance::aurora(route))
+}
+
+/// [`decode16_attempt`] for callers that only need the frame, but want the
+/// fallback bytes parked in `failed` when the attempt produced nothing.
+pub(crate) fn decode16_traced_into(
+    path: &Path,
+    route: DecodeRoute,
+    failed: &mut Option<FailedRaw16>,
+) -> Option<(u32, u32, Vec<u16>, DecodeProvenance)> {
+    let (frame, leftover) = decode16_attempt(path, route);
+    if frame.is_some() {
+        *failed = None;
+    } else {
+        *failed = leftover;
+    }
+    frame
 }
 
 /// Revision of each independent stage of the RAW pipeline.
@@ -1769,12 +1966,49 @@ mod libraw {
             unsafe { (api.clear)(pixels) };
             result
         }
+
+        /// libraw's own demosaic and sRGB encode on this handle, the same
+        /// pipeline as [`processed`] + [`expand_raw8`].
+        pub(super) fn process8(&mut self) -> Result<(u32, u32, Vec<u8>), String> {
+            if !self.unpacked {
+                return Err("libraw handle is not unpacked".into());
+            }
+            let api = self.api;
+            let code = unsafe { (api.process)(self.data) };
+            if code != 0 {
+                return Err(format!("dcraw_process code {code}"));
+            }
+            let mut code = 0;
+            let pixels = unsafe { (api.make)(self.data, &mut code) };
+            if pixels.is_null() {
+                return Err(format!("dcraw_make_mem_image code {code}"));
+            }
+            let result = view_ptr(pixels).and_then(|(out, raw, (width, height))| {
+                expand_raw8(raw, out.bits, out.colors, width as usize * height as usize)
+                    .map(|rgba| (width, height, rgba))
+            });
+            unsafe { (api.clear)(pixels) };
+            result
+        }
     }
 
     pub fn decode(path: &Path, quality: i32) -> Result<RgbaImage, String> {
         let guard = processed(path, quality)?;
         let (out, raw, (width, height)) = view(&guard)?;
         let rgba = expand_raw8(raw, out.bits, out.colors, width as usize * height as usize)?;
+        RgbaImage::from_raw(width, height, rgba).ok_or_else(|| "pixel buffer mismatch".into())
+    }
+
+    /// [`decode`] over bytes the caller already read.
+    ///
+    /// The output settings, unpack and demosaic are the same calls as
+    /// [`processed`]; only the container source changes, and `Session::open`
+    /// still falls back to opening the path when the build lacks
+    /// `libraw_open_buffer` or that call rejects the buffer.
+    pub fn decode_bytes(path: &Path, bytes: &[u8], quality: i32) -> Result<RgbaImage, String> {
+        let mut session = Session::open(path, bytes, quality)?;
+        session.unpack().map_err(|err| err.to_string())?;
+        let (width, height, rgba) = session.process8()?;
         RgbaImage::from_raw(width, height, rgba).ok_or_else(|| "pixel buffer mismatch".into())
     }
 
@@ -3037,6 +3271,95 @@ mod tests {
             );
         }
         reset_raw_decode_stats();
+    }
+
+    #[test]
+    fn fallback_reuses_bytes_after_a_rejected_unpack() {
+        let mut container = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00];
+        container.extend_from_slice(&jpeg(48, 32, 11));
+        container.extend_from_slice(&[0u8; 4096]);
+        let path = temp_file("fallback-reuse.nef", &container);
+        // Any attempt to read the path from here on must fail: only the bytes
+        // handed over by the 16-bit attempt can produce a frame.
+        std::fs::remove_file(&path).unwrap();
+        let failed = FailedRaw16 { bytes: container, libraw_unpack_unsupported: true };
+        let decoded = decode8_fallback(&path, Some(&failed)).expect("preview from bytes");
+        assert_eq!(decoded.dimensions(), (48, 32));
+        assert_eq!(from_sensor(&path), Some(false));
+    }
+
+    #[test]
+    fn fallback_reuses_bytes_when_libraw_cannot_use_the_buffer() {
+        let mut container = vec![0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08];
+        container.extend_from_slice(&jpeg(40, 24, 3));
+        container.extend_from_slice(&[0x7F; 4096]);
+        let path = temp_file("fallback-buffer.cr3", &container);
+        std::fs::remove_file(&path).unwrap();
+        let failed = FailedRaw16 { bytes: container, libraw_unpack_unsupported: false };
+        // LibRaw may or may not exist here; either it rejects the fake
+        // container (file is gone, buffer parse fails) or it is absent. Both
+        // end at the embedded preview scanned from the same bytes.
+        let decoded = decode8_fallback(&path, Some(&failed)).expect("preview from bytes");
+        assert_eq!(decoded.dimensions(), (40, 24));
+    }
+
+    #[test]
+    fn failed_16bit_attempt_returns_the_bytes_it_read() {
+        let container = vec![0x5A; 512];
+        let path = temp_file("attempt-bytes.nef", &container);
+        let route = DecodeRoute {
+            pipeline_fingerprint: 0,
+            c1_raw_enabled: true,
+            z6iii_nef: false,
+            z6iii_feature: false,
+            libraw_available: false,
+            opencl: OpenClRouteState::NotCompiled,
+            demosaic: 3,
+        };
+        let (frame, failed) = decode16_attempt(&path, route);
+        assert!(frame.is_none());
+        let failed = failed.expect("the attempt must hand its bytes to the fallback");
+        assert_eq!(failed.bytes, container);
+        assert!(!failed.libraw_unpack_unsupported);
+    }
+
+    #[test]
+    #[ignore = "requires a real Z6III HE NEF in AURORA_TEST_Z6III_HE"]
+    fn z6iii_he_route_skips_libraw_before_aurora() {
+        let Some(path) = std::env::var_os("AURORA_TEST_Z6III_HE").map(PathBuf::from) else {
+            return;
+        };
+        if !path.is_file() {
+            return;
+        }
+        let route = decode_route(&path);
+        assert!(
+            route.z6iii_nef && route.z6iii_feature,
+            "fixture must be a Z6III NEF in a z6iii-raw-export build"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            crate::aurora_raw::route_skips_libraw(&route, &bytes),
+            "fixture must be the verified HE profile this gate claims"
+        );
+        reset_raw_decode_stats();
+        let (frame, failed) = decode16_attempt(&path, route);
+        let (_, _, _, provenance) = frame.expect("HE decode");
+        assert!(matches!(
+            provenance.backend,
+            DecodeBackend::AuroraZ6iiiOpenCl | DecodeBackend::AuroraCpuChain
+        ));
+        assert!(failed.is_none());
+        let stats = raw_decode_stats();
+        let (_, aggregate) = stats
+            .iter()
+            .find(|(kind, _)| *kind == RawKind::Z6iiiHe)
+            .expect("z6iii stats");
+        assert_eq!(
+            aggregate.timings.libraw_open_ms, 0,
+            "the verified HE route must not open LibRaw before Aurora"
+        );
+        assert_eq!(aggregate.timings.libraw_unpack_ms, 0);
     }
 
     #[test]

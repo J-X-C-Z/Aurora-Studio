@@ -36,6 +36,7 @@ mod stage1_reference;
 use std::io::{Error, ErrorKind, Result};
 
 pub(super) use c1_nef_he::find_he_strip;
+use c1_nef_he::NikonHeStrip;
 pub(super) use c1_adaptive_opencl::available as gpu_available;
 #[allow(unused_imports)]
 pub use c1_nef_he::{NikonBlackLevels, NikonCrop, nikon_as_shot_rgb, nikon_black_levels, nikon_crop, nikon_exif_sensitivity};
@@ -475,10 +476,12 @@ fn reconstruct_active_mirror_with(
     reconstruct_planar_roi_with(&tile, local, params, rgb_black, scale, offset, finish)
 }
 
-fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)>> {
-    let Some(strip) = find_he_strip(nef)? else {
-        return Ok(None);
-    };
+/// Validates the HE codestream header profile without decoding coefficients.
+///
+/// Returns the payload after the 0x14 marker and the weights marker. Every
+/// caller that accepts a file for HE reconstruction goes through this, so the
+/// cheap [`is_verified_he_nef`] gate and the real decode cannot disagree.
+fn verified_profile<'a>(strip: &NikonHeStrip<'a>) -> Result<(&'a [u8], &'a [u8])> {
     if (strip.width, strip.height) != (6064, 4040) {
         return Err(Error::new(ErrorKind::Unsupported, "untested HE geometry"));
     }
@@ -499,6 +502,28 @@ fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)
             "untested HE codestream profile",
         ));
     }
+    Ok((rest, weights))
+}
+
+/// Whether `nef` is the HE profile [`decode_frame`] accepts, read from TIFF and
+/// codestream headers only.
+///
+/// This is the pre-unpack backend gate: the verified profile is decoded from
+/// the codestream itself without a LibRaw Bayer plane, so opening LibRaw first
+/// would only pay for an unpack the other path does not use. A header mismatch
+/// returns `false` and the caller keeps the LibRaw-first order.
+pub(crate) fn is_verified_he_nef(nef: &[u8]) -> bool {
+    match find_he_strip(nef) {
+        Ok(Some(strip)) => verified_profile(&strip).is_ok(),
+        _ => false,
+    }
+}
+
+fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)>> {
+    let Some(strip) = find_he_strip(nef)? else {
+        return Ok(None);
+    };
+    let (mut rest, weights) = verified_profile(&strip)?;
     let mut decoder = Decoder::new(Weights::from_wgt(weights)?);
     let precinct_count = if first_slice_only {
         17

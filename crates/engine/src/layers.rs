@@ -1,5 +1,7 @@
 //! Local adjustment layers and the masks that place them.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::adjust::*;
@@ -744,6 +746,280 @@ pub fn render_layers(adj: &AdjustmentSet) -> Vec<&Layer> {
     }
 }
 
+/// What a graph edit makes stale.
+///
+/// Design BO-10 §3 B5. This is the *decision* layer: it says whether a render
+/// is needed at all and which nodes feed the changed ones. It does not cache
+/// node outputs (a 24MP frame is ~96 MiB, so per-node caching is opt-in and
+/// lives elsewhere); it only narrows what has to be recomputed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphDirty {
+    /// Nodes whose own fingerprint changed, edited and otherwise.
+    pub changed: Vec<u64>,
+    /// `changed` plus everything downstream of it reachable from the output.
+    pub dirty: Vec<u64>,
+    /// Layer rows that must re-render, in the plan's render order.
+    pub layers: Vec<u64>,
+    /// The output's recursive identity moved, so no cached frame can stand in
+    /// for a render. A pruned-only edit leaves this `false` even though
+    /// `changed` and `dirty` are non-empty: those nodes cannot reach a pixel.
+    pub output_changed: bool,
+}
+
+impl GraphDirty {
+    /// The rendered frame is unchanged: the output's recursive identity is the
+    /// same and no live layer has to re-render. A pruned-only edit is empty.
+    ///
+    /// This is the predicate a preview cache must use to serve a previous
+    /// frame. It deliberately does not test `dirty`: a change confined to a
+    /// pruned branch still names that branch, and a deleted live layer leaves
+    /// `layers` empty because it is no longer live — `output_changed` is what
+    /// distinguishes those from a no-op edit.
+    pub fn is_empty(&self) -> bool {
+        !self.output_changed && self.layers.is_empty()
+    }
+}
+
+/// FNV-1a over a serialized value. Stable across runs and Rust versions, and
+/// sensitive to every field that reaches a pixel.
+fn fnv_of_serialized<T: Serialize>(value: &T) -> u64 {
+    struct Fnv(u64);
+
+    impl std::io::Write for Fnv {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for byte in bytes {
+                self.0 ^= u64::from(*byte);
+                self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut hash = Fnv(0xcbf2_9ce4_8422_2325u64);
+    serde_json::to_writer(&mut hash, value).unwrap_or_default();
+    hash.0
+}
+
+fn mix(hash: u64, value: u64) -> u64 {
+    let mut hash = hash ^ value;
+    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    hash
+}
+
+fn node_kind_tag(kind: NodeKind) -> u64 {
+    match kind {
+        NodeKind::Input => 1,
+        NodeKind::Output => 2,
+        NodeKind::Layer => 3,
+        NodeKind::Parallel => 4,
+        NodeKind::LayerMixer => 5,
+    }
+}
+
+impl NodeGraph {
+    /// Fingerprint of every node's output: its kind, its layer row (when it has
+    /// one) and the fingerprints of the inputs that feed it, in input order.
+    ///
+    /// Two graphs that render the same pixels at a node have the same value; a
+    /// change anywhere upstream changes every value downstream of it.
+    pub fn fingerprints(&self, rows: &[Layer]) -> BTreeMap<u64, u64> {
+        let mut memo = BTreeMap::new();
+        let mut stack = Vec::new();
+        for node in &self.nodes {
+            self.node_fingerprint(node.id, rows, &mut memo, &mut stack);
+        }
+        // The output can be implicit in a stored graph; include it anyway so
+        // `fingerprint()` never depends on node order.
+        self.node_fingerprint(Self::OUTPUT, rows, &mut memo, &mut stack);
+        memo
+    }
+
+    fn node_fingerprint(
+        &self,
+        id: u64,
+        rows: &[Layer],
+        memo: &mut BTreeMap<u64, u64>,
+        stack: &mut Vec<u64>,
+    ) -> u64 {
+        if let Some(value) = memo.get(&id) {
+            return *value;
+        }
+        if stack.contains(&id) {
+            // A loop has no stable fingerprint; report a fixed value rather
+            // than recursing forever. `plan()` refuses such a graph anyway.
+            return 0;
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        match self.node(id) {
+            Some(node) => {
+                hash = mix(hash, node_kind_tag(node.kind));
+                let row = match node.kind {
+                    NodeKind::Layer => rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(fnv_of_serialized)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                hash = mix(hash, row);
+            }
+            // The output node may be absent from the stored list; it still has
+            // an identity so a link change shows up downstream.
+            None if id == Self::OUTPUT => hash = mix(hash, 2),
+            None => return 0,
+        }
+        stack.push(id);
+        let mut inputs: Vec<&NodeLink> = self.links.iter().filter(|link| link.to == id).collect();
+        inputs.sort_by_key(|link| link.input);
+        for link in inputs {
+            let from = self.node_fingerprint(link.from, rows, memo, stack);
+            hash = mix(hash, u64::from(link.input));
+            hash = mix(hash, from);
+        }
+        stack.pop();
+        memo.insert(id, hash);
+        hash
+    }
+
+    /// The identity of the whole graph's output.
+    pub fn fingerprint(&self, rows: &[Layer]) -> u64 {
+        self.fingerprints(rows).get(&Self::OUTPUT).copied().unwrap_or(0)
+    }
+
+    /// Each node's *own* inputs: its kind, its row and the `(input, from)`
+    /// pairs wired into it. Not recursive, so a diff of this map names exactly
+    /// where an edit happened instead of flagging everything downstream.
+    pub fn local_fingerprints(&self, rows: &[Layer]) -> BTreeMap<u64, u64> {
+        let mut out = BTreeMap::new();
+        for node in &self.nodes {
+            let mut hash = mix(0xcbf2_9ce4_8422_2325u64, node_kind_tag(node.kind));
+            let row = match node.kind {
+                NodeKind::Layer => {
+                    rows.iter().find(|row| row.id == node.id).map(fnv_of_serialized).unwrap_or(0)
+                }
+                _ => 0,
+            };
+            hash = mix(hash, row);
+            let mut inputs: Vec<&NodeLink> =
+                self.links.iter().filter(|link| link.to == node.id).collect();
+            inputs.sort_by_key(|link| link.input);
+            for link in inputs {
+                hash = mix(hash, u64::from(link.input));
+                hash = mix(hash, link.from);
+            }
+            out.insert(node.id, hash);
+        }
+        if !out.contains_key(&Self::OUTPUT) {
+            let mut hash = mix(0xcbf2_9ce4_8422_2325u64, 2);
+            let mut inputs: Vec<&NodeLink> =
+                self.links.iter().filter(|link| link.to == Self::OUTPUT).collect();
+            inputs.sort_by_key(|link| link.input);
+            for link in inputs {
+                hash = mix(hash, u64::from(link.input));
+                hash = mix(hash, link.from);
+            }
+            out.insert(Self::OUTPUT, hash);
+        }
+        out
+    }
+
+    /// What changed between `previous` and `self`, and what has to recompute.
+    ///
+    /// `rows`/`previous_rows` are the layer rows each graph is paired with, so
+    /// a parameter edit on a layer row is seen even when the topology is
+    /// unchanged. Nodes that the output does not depend on are reported in
+    /// `changed` but never in `dirty.layers`: a pruned edit cannot reach a
+    /// pixel.
+    pub fn dirty_between(
+        &self,
+        previous: &NodeGraph,
+        rows: &[Layer],
+        previous_rows: &[Layer],
+    ) -> GraphDirty {
+        // The recursive output identity is the ground truth for "do these two
+        // graphs render the same pixels"; local fingerprints only name the
+        // edit site. Computing both once is cheap next to a frame render.
+        let output_changed = self.fingerprint(rows) != previous.fingerprint(previous_rows);
+        // Local fingerprints name the edit site; the recursive ones would flag
+        // every downstream node as "changed" too.
+        let now = self.local_fingerprints(rows);
+        let before = previous.local_fingerprints(previous_rows);
+        let mut changed: Vec<u64> = Vec::new();
+        for (id, value) in &now {
+            if *id == Self::INPUT || *id == Self::OUTPUT {
+                continue;
+            }
+            if before.get(id).copied().unwrap_or(u64::MAX) != *value {
+                changed.push(*id);
+            }
+        }
+        // A node that only existed before also changed something.
+        for (id, value) in &before {
+            if *id == Self::INPUT || *id == Self::OUTPUT {
+                continue;
+            }
+            if now.get(id).copied().unwrap_or(u64::MAX) != *value && !changed.contains(id) {
+                changed.push(*id);
+            }
+        }
+        // Rewiring the output changes the composition without changing either
+        // branch's own inputs. Name both branch roots so the change is never
+        // mistaken for a pruned edit (the output marker itself is not a render
+        // node, so it is deliberately excluded from `changed` above).
+        if now.get(&Self::OUTPUT) != before.get(&Self::OUTPUT) {
+            for link in self.links.iter().filter(|link| link.to == Self::OUTPUT) {
+                if !changed.contains(&link.from) {
+                    changed.push(link.from);
+                }
+            }
+            for link in previous.links.iter().filter(|link| link.to == Self::OUTPUT) {
+                if !changed.contains(&link.from) {
+                    changed.push(link.from);
+                }
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+
+        // Downstream closure over this graph's links.
+        let mut dirty: Vec<u64> = changed.clone();
+        let mut pending = changed.clone();
+        while let Some(id) = pending.pop() {
+            for link in self.links.iter().filter(|link| link.from == id) {
+                // The output marker consumes the frame; it is not a render node.
+                if link.to == Self::OUTPUT || dirty.contains(&link.to) {
+                    continue;
+                }
+                dirty.push(link.to);
+                pending.push(link.to);
+            }
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+
+        // Only live layer rows matter; a pruned change renders nothing.
+        let layers = match self.plan() {
+            Ok(plan) => {
+                // A pruned edit must not invalidate a live frame.
+                let live: Vec<u64> = plan.layers;
+                if dirty.iter().any(|id| plan.pruned.contains(id))
+                    && !dirty.iter().any(|id| live.contains(id))
+                {
+                    Vec::new()
+                } else {
+                    live.into_iter().filter(|id| dirty.contains(id)).collect()
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+        GraphDirty { changed, dirty, layers, output_changed }
+    }
+}
+
 #[cfg(test)]
 mod node_tests {
     use super::*;
@@ -914,6 +1190,100 @@ mod node_tests {
         adj.nodes = Some(graph(&[(I, 1, 0), (1, 2, 0), (2, 1, 1), (2, O, 0)], &[1, 2]));
         assert!(layered(&adj).is_err());
         assert!(render_layers(&adj).is_empty());
+    }
+
+    fn layer_with_exposure(id: u64, exposure: f32) -> Layer {
+        let mut layer = row(id);
+        layer.adjustments.exposure.exposure = exposure;
+        layer
+    }
+
+    #[test]
+    fn an_unchanged_graph_is_not_dirty() {
+        let g = graph(&[(I, 1, 0), (1, 2, 0), (2, O, 0)], &[1, 2]);
+        let rows = vec![layer_with_exposure(1, 0.25), layer_with_exposure(2, -0.5)];
+        let dirty = g.dirty_between(&g, &rows, &rows);
+        assert!(dirty.changed.is_empty());
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn editing_a_layer_dirties_it_and_its_downstream_only() {
+        let g = graph(&[(I, 1, 0), (1, 2, 0), (2, 3, 0), (3, O, 0)], &[1, 2, 3]);
+        let before =
+            vec![layer_with_exposure(1, 0.0), layer_with_exposure(2, 0.5), layer_with_exposure(3, 0.0)];
+        let mut after = before.clone();
+        after[1].adjustments.exposure.exposure = 1.0;
+        let dirty = g.dirty_between(&g, &after, &before);
+        assert_eq!(dirty.changed, vec![2], "only the edited row changed");
+        assert_eq!(dirty.dirty, vec![2, 3], "downstream only: 1 is upstream");
+        assert_eq!(dirty.layers, vec![2, 3], "render order, not id order");
+        assert!(dirty.output_changed, "a live edit changes the frame");
+    }
+
+    #[test]
+    fn editing_a_pruned_layer_does_not_invalidate_a_live_frame() {
+        // 3 hangs off 1 but never reaches the output.
+        let g = graph(&[(I, 1, 0), (1, 2, 0), (1, 3, 0), (2, O, 0)], &[1, 2, 3]);
+        let before = vec![layer_with_exposure(1, 0.0), layer_with_exposure(2, 0.0), layer_with_exposure(3, 0.0)];
+        let mut after = before.clone();
+        after[2].adjustments.exposure.exposure = 2.0;
+        let dirty = g.dirty_between(&g, &after, &before);
+        assert_eq!(dirty.changed, vec![3]);
+        assert!(dirty.layers.is_empty(), "a pruned edit cannot reach a pixel");
+        assert!(!dirty.output_changed, "a pruned edit cannot change the frame");
+        assert!(dirty.is_empty(), "a cached frame still holds after a pruned edit");
+    }
+
+    #[test]
+    fn a_topology_change_dirties_the_nodes_it_now_feeds() {
+        let before = graph(&[(I, 1, 0), (1, 2, 0), (2, O, 0)], &[1, 2, 3]);
+        // 3 joins in series between 2 and the output.
+        let after = graph(&[(I, 1, 0), (1, 2, 0), (2, 3, 0), (3, O, 0)], &[1, 2, 3]);
+        let rows = vec![row(1), row(2), row(3)];
+        let dirty = after.dirty_between(&before, &rows, &rows);
+        // The output's own input moved from 2 to 3, so both branch roots are
+        // named: 3 must render, and 2 is the previous tail. Conservative by
+        // design — the frame is stale either way.
+        assert_eq!(dirty.layers, vec![2, 3], "both sides of the rewired output re-render");
+        assert!(dirty.output_changed);
+        assert!(!dirty.is_empty());
+    }
+
+    #[test]
+    fn rewiring_the_output_is_never_a_pruned_edit() {
+        // Both layers are live; only which one the output consumes changes.
+        let before = graph(&[(I, 1, 0), (I, 2, 0), (1, O, 0), (2, O, 1)], &[1, 2]);
+        let after = graph(&[(I, 1, 0), (I, 2, 0), (2, O, 0), (1, O, 1)], &[1, 2]);
+        let rows = vec![row(1), row(2)];
+        let dirty = after.dirty_between(&before, &rows, &rows);
+        assert!(dirty.output_changed, "the output composition changed");
+        assert!(!dirty.layers.is_empty(), "a swapped output must re-render a live layer");
+        assert!(!dirty.is_empty(), "the cached frame must not be reused");
+    }
+
+    #[test]
+    fn a_parallel_branch_edit_does_not_dirty_its_sibling() {
+        // 1 -> 2 and 1 -> 3 both feed mixer 10, which feeds the output.
+        let g = graph(&[(I, 1, 0), (1, 2, 0), (1, 3, 0), (2, 10, 0), (3, 10, 1), (10, O, 0)], &[1, 2, 3]);
+        let before = vec![layer_with_exposure(1, 0.0), layer_with_exposure(2, 0.0), layer_with_exposure(3, 0.0)];
+        let mut after = before.clone();
+        after[1].adjustments.exposure.exposure = 0.5;
+        let dirty = g.dirty_between(&g, &after, &before);
+        assert_eq!(dirty.layers, vec![2], "3 is a sibling, not downstream");
+    }
+
+    #[test]
+    fn the_graph_fingerprint_covers_rows_and_links() {
+        let g = graph(&[(I, 1, 0), (1, O, 0)], &[1]);
+        let rows = vec![layer_with_exposure(1, 0.0)];
+        let base = g.fingerprint(&rows);
+        let mut edited = rows.clone();
+        edited[0].adjustments.exposure.exposure = 0.5;
+        assert_ne!(base, g.fingerprint(&edited));
+
+        let relinked = graph(&[(I, 77, 0), (77, O, 0)], &[1]);
+        assert_ne!(base, relinked.fingerprint(&rows), "a different source is a different frame");
     }
 
     #[test]
