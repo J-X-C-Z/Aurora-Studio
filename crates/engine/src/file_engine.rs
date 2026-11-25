@@ -3811,9 +3811,7 @@ impl FileEngine {
     fn catalog_overrides(&self, model: Option<&str>, iso: Option<u32>) -> crate::ParamOverrides {
         self.camera_defaults
             .get_or_init(|| {
-                let path = std::env::var_os("AURORA_CORE_CONFIG")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One\coreConfig.cdx"));
+                let path = crate::bundled_resources::core_config_path();
                 match crate::CameraDefaults::load(&path) {
                     Ok(d) => Some(d),
                     Err(err) => {

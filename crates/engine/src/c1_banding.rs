@@ -267,13 +267,25 @@ pub fn vendor_buffers() -> Option<&'static ([u8; 256], [u8; 256], [u8; 1024])> {
         std::sync::OnceLock::new();
     BUFFERS
         .get_or_init(|| {
-            let root = std::env::var_os("AURORA_Z6III_C1_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files\Capture One\Capture One"));
-            let mut core = std::fs::File::open(root.join("ImgCoreDll.dll")).ok()?;
             let mut left = [0_u8; 256];
             let mut right = [0_u8; 256];
             let mut packed = [0_u8; 1024];
+            if let Some(bin_path) = crate::bundled_resources::banding_tables_path() {
+                if let Ok(bytes) = std::fs::read(&bin_path) {
+                    if bytes.len() == 256 + 256 + 1024 {
+                        left.copy_from_slice(&bytes[0..256]);
+                        right.copy_from_slice(&bytes[256..512]);
+                        packed.copy_from_slice(&bytes[512..1536]);
+                        if [fingerprint(&left), fingerprint(&right), fingerprint(&packed)]
+                            == [0x0528b3d3556eb0f5, 0x24060a098de1ec13, 0x065f8d932bb7fdef3]
+                        {
+                            return Some((left, right, packed));
+                        }
+                    }
+                }
+            }
+            let root = crate::bundled_resources::camera_root();
+            let mut core = std::fs::File::open(root.join("ImgCoreDll.dll")).ok()?;
             for (offset, table) in [
                 (40_613_632, &mut left[..]),
                 (40_614_912, &mut right[..]),

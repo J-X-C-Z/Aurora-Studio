@@ -164,14 +164,7 @@ fn catalog() -> Option<&'static Catalog> {
 /// `$AURORA_CORECONFIG`, else the Capture One install, else the crate's
 /// `testdata` copy (which is what `cargo test` runs against).
 fn core_config_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("AURORA_CORECONFIG") {
-        return PathBuf::from(path);
-    }
-    let install = PathBuf::from(r"C:\Program Files\Capture One\Capture One\coreConfig.cdx");
-    if install.is_file() {
-        return install;
-    }
-    PathBuf::from("testdata/coreConfig.cdx")
+    crate::bundled_resources::core_config_path()
 }
 
 fn parse_catalog(xml: &str) -> Catalog {

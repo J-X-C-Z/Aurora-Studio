@@ -32,15 +32,9 @@ const MODEL_NAMES: [&str; 5] = [
     "pose.onnx",
 ];
 
-const MODEL_DIRS: [&str; 10] = [
-    r"C:\Program Files\Capture One\Capture One\AIModels\Common\BodyPose",
-    r"C:\Program Files (x86)\Capture One\Capture One\AIModels\Common\BodyPose",
-    r"C:\Program Files\Capture One\Capture One\AIModels\Common",
-    r"C:\Program Files (x86)\Capture One\Capture One\AIModels\Common",
-    "/Applications/Capture One.app/Contents/Resources/AIModels/Common/BodyPose",
-    "/opt/captureone/AIModels/Common/BodyPose",
+const MODEL_DIRS: [&str; 4] = [
+    "models/AIModels/Common/BodyPose",
     "AIModels/Common/BodyPose",
-    "BodyPose",
     "models/BodyPose",
     "resources/body-pose",
 ];

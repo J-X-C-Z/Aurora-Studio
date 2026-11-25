@@ -63,13 +63,7 @@ fn report_gpu(state: u8, message: impl FnOnce() -> String) {
 
 /// Shipped model path. `AURORA_BLEMISH_MODEL` overrides it for tests/fixtures.
 pub fn model_path() -> PathBuf {
-    std::env::var_os("AURORA_BLEMISH_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                r"C:\Program Files\Capture One\Capture One\AIModels\Common\BlemishRemoval\blemishRemoval.onnx",
-            )
-        })
+    crate::bundled_resources::blemish_model_path()
 }
 
 pub fn model_available_at(path: &Path) -> bool {

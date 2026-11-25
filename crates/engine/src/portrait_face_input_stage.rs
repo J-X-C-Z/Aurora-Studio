@@ -466,25 +466,7 @@ fn face_input_root_from_exe(exe_dir: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn default_face_landmark_root() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("models").join("landmark"));
-            candidates.push(dir.join("assets").join("portrait").join("landmark"));
-            candidates.push(dir.join("landmark"));
-            candidates.push(dir.join("..").join("..").join("models").join("landmark"));
-        }
-    }
-    // Development fallback: only selected when the directory actually holds the
-    // three landmark files, so a clean install never depends on this path.
-    candidates.push(PathBuf::from(
-        r"C:\WorkSpace\Aurora Studio\04_reference\legacy-root\逆向工程\像素蛋糕\analysis\model-recovery-landmark-independent",
-    ));
-    candidates.into_iter().find(|root| {
-        root.join("assets").join("1063025060.onnx").is_file()
-            && root.join("assets").join("323773030.onnx").is_file()
-            && root.join("constants.json").is_file()
-    })
+    crate::bundled_resources::face_landmark_root()
 }
 
 type ParsingModelChecks = Mutex<HashMap<PathBuf, (FaceInputFileStamp, bool)>>;
@@ -590,12 +572,6 @@ fn face_parsing_v2_model_path() -> Option<PathBuf> {
                     candidates.push(dir.join("fbe.onnx"));
                 }
             }
-            candidates.push(PathBuf::from(
-                r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceparsing\2102828093.onnx",
-            ));
-            candidates.push(PathBuf::from(
-                r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceparsing\fbe.onnx",
-            ));
             candidates
                 .into_iter()
                 .find(|candidate| is_canonical_face_parsing_v2(candidate))
@@ -1164,12 +1140,18 @@ impl FaceInputBundle {
             super::portrait_pf8033_cpu_forward::PF8033_CPU_FORWARD_RECEIPT_ENV,
         )
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../assets/portrait/smile/pf8033-cpu-forward.json")
-        });
-        let receipt_bytes = std::fs::read(&receipt_path)
-            .map_err(|_| Refusal::MissingInput("PF8033 CPU forward receipt"))?;
+        .or_else(crate::bundled_resources::pf8033_receipt_path);
+        let (receipt_path, receipt_bytes): (PathBuf, Vec<u8>) = match receipt_path {
+            Some(path) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|_| Refusal::MissingInput("PF8033 CPU forward receipt"))?;
+                (path, bytes)
+            }
+            None => (
+                PathBuf::from("embedded://assets/portrait/smile/pf8033-cpu-forward.json"),
+                include_bytes!("../../../assets/portrait/smile/pf8033-cpu-forward.json").to_vec(),
+            ),
+        };
         let receipt = super::portrait_pf8033_cpu_forward::Pf8033CpuForwardReceipt::parse(
             receipt_path,
             &receipt_bytes,

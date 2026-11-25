@@ -26,12 +26,11 @@ pub fn probe_model() -> AiDenoiseStatus {
             return AiDenoiseStatus::Ready(p);
         }
     }
-    let roots = [
-        PathBuf::from(r"C:\Program Files\Capture One\Capture One\AIModels"),
-        PathBuf::from(r"C:\ProgramData\Capture One\AIModels"),
-    ];
-    for root in &roots {
+    for root in crate::bundled_resources::ai_model_roots() {
         for rel in [
+            "AIModels/Common/Denoise/denoise.onnx",
+            "AIModels/Common/Denoise/denoiseOracle.onnx",
+            "AIModels/DirectML/denoiseFP16.onnx",
             "Common/Denoise/denoise.onnx",
             "Common/Denoise/denoiseOracle.onnx",
             "DirectML/denoiseFP16.onnx",

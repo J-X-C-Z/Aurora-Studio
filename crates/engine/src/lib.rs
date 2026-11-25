@@ -306,6 +306,7 @@ pub mod icc;
 pub mod camera_profile;
 pub mod ai_denoise;
 pub mod aimask;
+pub(crate) mod bundled_resources;
 pub mod dustdetect;
 pub mod beautymarks;
 pub mod autorotate;
