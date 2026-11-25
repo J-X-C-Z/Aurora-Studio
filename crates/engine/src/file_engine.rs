@@ -1918,6 +1918,24 @@ fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
     pixels.saturating_mul(bytes_per_px).max(1)
 }
 
+/// Format-aware export working-set estimate: streaming TIFF writes directly to a
+/// temporary file (~14 B/px for 16-bit RGBA16 + scratch), whereas PNG still
+/// buffers ~525 MB at 24 MP (~36 B/px).
+fn estimated_export_bytes_for_recipe(
+    width: u32,
+    height: u32,
+    recipe: &crate::ProcessRecipe,
+) -> usize {
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let bytes_per_px = match (recipe.format, recipe.bit_depth) {
+        (crate::ExportFormat::Tiff, 16) => 14usize,
+        (crate::ExportFormat::Tiff, _) => 10usize,
+        (_, 16) => 36usize,
+        _ => 24usize,
+    };
+    pixels.saturating_mul(bytes_per_px).max(1)
+}
+
 /// Pixel size charged for a source whose real dimensions could not be read.
 /// This is a conservative floor, not an upper bound: it only keeps an
 /// unreadable size from being priced as free, while a frame that really is
@@ -1949,7 +1967,7 @@ fn estimated_export_charge(recipe: &crate::ProcessRecipe, info: &ImageInfo, geom
     let (width, height) = crate::mock::geometry::FrameMap::new(source, geometry).frame_size();
     let edited_size = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
     let (width, height) = crate::recipe::output_size(recipe, edited_size);
-    input_bytes.saturating_add(estimated_export_bytes(width, height, recipe.bit_depth))
+    input_bytes.saturating_add(estimated_export_bytes_for_recipe(width, height, recipe))
 }
 
 /// Whether the queued request is one the Windows exact desktop path can serve,
@@ -3907,6 +3925,16 @@ impl FileEngine {
         };
         if let Some(frame) = &frame {
             frame.apply_to(&mut overrides);
+        }
+        // Banding has no `CATALOG` row, so its only real bounds come from the
+        // frame's info block (kept by `apply_to`) or the measured body rule.
+        // Z6III reports 0..0 — an empty range the slider must disable, not a
+        // guessed 0..100.
+        if overrides.range("BandingReductionAmount").is_none() {
+            if let Some(range) = crate::c1_banding::range_for_frame(None, model) {
+                overrides.set_range("BandingReductionAmount", range.start, range.end);
+                overrides.set_default("BandingReductionAmount", range.default);
+            }
         }
         overrides
     }

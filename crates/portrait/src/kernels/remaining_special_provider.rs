@@ -17,6 +17,11 @@ pub const PF101_LIVE_ONLY: &str =
     "PF101 FilterType 41/42/43/44 material branches and common draw are statically callable; the xmm1 factor reaches vtable+0xF8 after 0x4AD6C50, but the dynamic vtable target and same-job compiled defines/GL+FBO/readback remain unbound";
 pub const PF30209_END_STATIC: &str =
     "PF30209 stage +0x3A0/+0x3B8 is not forwarded by the fixed PE";
+/// PF100005 has no local model/tensor/handler receipt. The 8-plane layout,
+/// `cv::max(maskA,maskB)` and `boundingRect` are static facts; the final
+/// group blend and UI-to-flag binding are LIVE_ONLY.
+pub const PF100005_LIVE_ONLY: &str =
+    "PF100005 8 CV_32FC1 planes and mask max/boundingRect are static; the final RGB/source blend, UI-to-group binding and handler-to-layer receipt are LIVE_ONLY";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderStatus {
@@ -33,7 +38,7 @@ pub struct RemainingSpecialContract {
     pub reason: &'static str,
 }
 
-pub const CONTRACTS: [RemainingSpecialContract; 7] = [
+pub const CONTRACTS: [RemainingSpecialContract; 8] = [
     RemainingSpecialContract {
         pf: 90001,
         status: ProviderStatus::LiveOnly,
@@ -96,6 +101,20 @@ pub const CONTRACTS: [RemainingSpecialContract; 7] = [
             "model_output",
         ],
         reason: PF30209_END_STATIC,
+    },
+    RemainingSpecialContract {
+        pf: 100005,
+        status: ProviderStatus::LiveOnly,
+        required_same_job_inputs: &[
+            "source RGBA",
+            "8 CV_32FC1 model planes",
+            "group A/B enable flags",
+            "ui",
+            "model SHA-256",
+            "frame SHA-256",
+            "handler-to-layer receipt",
+        ],
+        reason: PF100005_LIVE_ONLY,
     },
 ];
 
@@ -287,6 +306,16 @@ pub fn jawline(inputs: Pf30209SameJobInputs<'_>) -> Result<Image, Refusal> {
     Err(Refusal::MissingInput(PF30209_END_STATIC))
 }
 
+/// PF100005 boundary: the producer planes and per-group enable flags are
+/// checked, but no local model blob or handler receipt exists, so the full
+/// effect fails closed. `face_detail::eye_white_active_mask` and
+/// `eye_white_bounding_rect` cover the parts that are static.
+pub fn eye_white_purify_provider(
+    inputs: super::face_detail::EyeWhiteSameJobInputs<'_>,
+) -> Result<Image, Refusal> {
+    super::face_detail::eye_white_purify_same_job(inputs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +324,7 @@ mod tests {
     fn contracts_cover_each_row_once() {
         let mut pfs: Vec<u32> = CONTRACTS.iter().map(|row| row.pf).collect();
         pfs.sort_unstable();
-        assert_eq!(pfs, [101, 403, 30188, 30189, 30209, 90001, 90003]);
+        assert_eq!(pfs, [101, 403, 30188, 30189, 30209, 90001, 90003, 100005]);
         for row in CONTRACTS {
             assert_eq!(contract(row.pf), Some(row));
         }
@@ -432,5 +461,22 @@ mod tests {
         assert_eq!(weights, double_chin::Weights { geometry: 0.2, shadow: 0.1 });
         assert!(weights.is_active());
         assert!(!double_chin_weights(0.0, 1.0, 1.0).unwrap().is_active());
+    }
+
+    #[test]
+    fn pf100005_provider_names_the_missing_final_input() {
+        let source = crate::Image::solid(1, 1, [100, 110, 120, 130]);
+        let err = eye_white_purify_provider(crate::kernels::face_detail::EyeWhiteSameJobInputs {
+            source: &source,
+            model_planes: None,
+            group_a: None,
+            group_b: None,
+            ui: Some(50.0),
+            model_sha256: None,
+            frame_sha256: None,
+            receipt: None,
+        })
+        .unwrap_err();
+        assert_eq!(err, Refusal::MissingInput("PF100005_MODEL_SHA256"));
     }
 }

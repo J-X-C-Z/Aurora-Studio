@@ -1073,7 +1073,7 @@ impl<'a> ExportService<'a> {
         } else {
             (None, (info.width, info.height))
         };
-        let estimated_bytes = estimated_export_bytes(export_dims.0, export_dims.1, job.recipe.bit_depth);
+        let estimated_bytes = estimated_export_bytes_for_recipe(export_dims.0, export_dims.1, &job.recipe);
         // Register the job before spawning so `cancel_job` can reach it without
         // racing the worker. This is where the old gate inserted
         // `JobStatus::Queued`, so a bad recipe or destination still returns

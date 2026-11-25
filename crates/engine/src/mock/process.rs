@@ -74,20 +74,31 @@ impl Plane {
 /// The one 2x2 box average used by both eager and deferred mip tails. Keeping
 /// it in one place is what makes a lazily built level bit-identical to the
 /// level an eager source built up front.
+fn box_downscale_pixel(prev: &[[f32; 3]], prev_width: u32, w: u32, i: usize) -> [f32; 3] {
+    let (x, y) = ((i as u32 % w) * 2, (i as u32 / w) * 2);
+    let mut acc = [0.0; 3];
+    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let p = prev[((y + dy) * prev_width + x + dx) as usize];
+        for k in 0..3 {
+            acc[k] += p[k] * 0.25;
+        }
+    }
+    acc
+}
+
 fn box_downscale(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
     (0..(w * h) as usize)
         .into_par_iter()
-        .map(|i| {
-            let (x, y) = ((i as u32 % w) * 2, (i as u32 / w) * 2);
-            let mut acc = [0.0; 3];
-            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let p = prev[((y + dy) * prev_width + x + dx) as usize];
-                for k in 0..3 {
-                    acc[k] += p[k] * 0.25;
-                }
-            }
-            acc
-        })
+        .map(|i| box_downscale_pixel(prev, prev_width, w, i))
+        .collect()
+}
+
+/// Serial variant for lazy `OnceLock` mip construction: `level_data` may be
+/// entered from inside a rayon parallel render pass, so spawning nested rayon
+/// tasks inside `OnceLock::get_or_init` risks threadpool starvation.
+fn box_downscale_serial(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
+    (0..(w * h) as usize)
+        .map(|i| box_downscale_pixel(prev, prev_width, w, i))
         .collect()
 }
 
@@ -744,7 +755,7 @@ impl Source {
         slot.get_or_init(|| {
             debug_assert!(index > 0, "level 0 is never deferred");
             let parent = self.level_data(index - 1);
-            box_downscale(parent, self.levels[index - 1].width, plane.width, plane.height)
+            box_downscale_serial(parent, self.levels[index - 1].width, plane.width, plane.height)
         })
     }
 
@@ -3251,10 +3262,9 @@ fn render_sized(
         // build it once here and let both read it.
         let want_stage_slim = needs_stage_face_input(&adj.extra);
         let want_stage_parsing = needs_stage_face_parsing(&adj.extra);
-        let want_stage_attachments = (want_stage_parsing
+        let want_stage_attachments = want_stage_parsing
             || needs_stage_face_bundle_direct(&adj.extra)
-            || needs_producer_attach(&adj.extra))
-            && region == NormRect::FULL;
+            || needs_producer_attach(&adj.extra);
         // One digest for the whole tick: face producers, slim inputs, and the
         // effect stage all bind to the same bytes.
         let stage_sha256 = (want_stage_slim || want_stage_attachments).then(|| {
@@ -7901,9 +7911,14 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = Source::from_rgba16_native(w, h, &rgba);
         assert!(src.levels.len() >= 3);
         assert!(src.sample(1, 0.5, 0.5).is_some());
-        assert!(!src.levels[1].data.is_empty(), "level 1 must be built on demand");
         assert!(
-            src.levels[2..].iter().all(|level| level.data.is_empty()),
+            src.levels[1].lazy.as_ref().is_some_and(|slot| slot.get().is_some()),
+            "level 1 must be built on demand"
+        );
+        assert!(
+            src.levels[2..]
+                .iter()
+                .all(|level| level.data.is_empty() && level.lazy.as_ref().is_some_and(|slot| slot.get().is_none())),
             "levels below the requested depth must stay unallocated"
         );
     }

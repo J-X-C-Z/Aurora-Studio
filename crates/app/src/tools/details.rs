@@ -226,10 +226,36 @@ fn noise_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoEle
             d.child(
                 param(state, "nr-ai", t("AI Denoise", "AI 降噪"), crate::state::extra_binding("AIDenoiseAmount", 0.0), 0.0, 100.0, cx).flag(crate::contract::AI_DENOISE),
             )
-            .child(
-                param(state, "nr-banding", t("Banding Reduction", "条纹抑制"), crate::state::extra_binding("BandingReductionAmount", 0.0), 0.0, 100.0, cx).flag(crate::contract::BANDING),
-            )
+            .child(banding_param(state, cx))
         })
+}
+
+/// The banding slider, ranged by the frame's own vendor range.
+///
+/// `BandingReductionAmount` has no `CATALOG` row, so the engine's RAW
+/// overrides carry the only real bounds: a frame that states a range gets it
+/// verbatim (Z6III states `0..0`), and one without any gets the settled
+/// `0..100` fallback. An empty range (`start == end`) disables the slider —
+/// the camera declares no adjustable unit — rather than widening it.
+fn banding_param(state: &Entity<AppState>, cx: &App) -> crate::widgets::ParamSlider {
+    let binding = crate::state::extra_binding("BandingReductionAmount", 0.0);
+    let Some(image) = state.read(cx).library.current else {
+        return param(state, "nr-banding", t("Banding Reduction", "条纹抑制"), binding, 0.0, 100.0, cx).flag(crate::contract::BANDING);
+    };
+    let overrides = state.read(cx).engine.param_overrides(image);
+    match overrides.range("BandingReductionAmount") {
+        Some((start, end, _default)) if start == end => {
+            param(state, "nr-banding", t("Banding Reduction", "条纹抑制"), binding, 0.0, 100.0, cx)
+                .flag(crate::contract::BANDING)
+                .disabled(true)
+        }
+        Some((start, end, default)) => {
+            param(state, "nr-banding", t("Banding Reduction", "条纹抑制"), binding, start, end, cx)
+                .flag(crate::contract::BANDING)
+                .default_value(default)
+        }
+        None => param(state, "nr-banding", t("Banding Reduction", "条纹抑制"), binding, 0.0, 100.0, cx).flag(crate::contract::BANDING),
+    }
 }
 
 fn moire_panel(state: &Entity<AppState>, scope: Scope, cx: &App) -> impl IntoElement + use<> {

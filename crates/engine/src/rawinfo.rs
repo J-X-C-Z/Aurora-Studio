@@ -61,6 +61,13 @@ impl RawInfoBlock {
         if let Some(ev) = self.get("IB_F_EXP_EXPOSURECOMPENSATION") {
             overrides.set_default("Exposure", ev as f32);
         }
+        // The frame's own banding range. `BandingRange::from_info` needs all
+        // three keys, so a frame without them keeps whatever the body's
+        // catalog/reference path set (Z6III: 0..0, i.e. a disabled slider).
+        if let Some(range) = crate::c1_banding::BandingRange::from_info(self) {
+            overrides.set_range("BandingReductionAmount", range.start, range.end);
+            overrides.set_default("BandingReductionAmount", range.default);
+        }
     }
 }
 

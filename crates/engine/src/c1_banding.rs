@@ -599,6 +599,37 @@ mod tests {
         );
         info.values.pop();
         assert_eq!(BandingRange::from_info(&info), None, "missing DEFAULT is not invented");
+
+        // The frame's stated range reaches the slider overrides verbatim,
+        // including an empty one that must disable rather than widen.
+        let mut full = RawInfoBlock::default();
+        full.values = vec![
+            ("IB_F_BANDINGREDUCTIONAMOUNT_START".into(), 0.0),
+            ("IB_F_BANDINGREDUCTIONAMOUNT_END".into(), 60.0),
+            ("IB_F_BANDINGREDUCTIONAMOUNT_DEFAULT".into(), 20.0),
+        ];
+        let mut overrides = crate::ParamOverrides::default();
+        full.apply_to(&mut overrides);
+        assert_eq!(overrides.range("BandingReductionAmount"), Some((0.0, 60.0, 20.0)));
+
+        let mut empty = RawInfoBlock::default();
+        empty.values = vec![
+            ("IB_F_BANDINGREDUCTIONAMOUNT_START".into(), 0.0),
+            ("IB_F_BANDINGREDUCTIONAMOUNT_END".into(), 0.0),
+            ("IB_F_BANDINGREDUCTIONAMOUNT_DEFAULT".into(), 0.0),
+        ];
+        let mut overrides = crate::ParamOverrides::default();
+        empty.apply_to(&mut overrides);
+        assert_eq!(
+            overrides.range("BandingReductionAmount"),
+            Some((0.0, 0.0, 0.0)),
+            "the empty range must survive for the disabled slider"
+        );
+
+        // A frame without the keys leaves the overrides untouched.
+        let mut overrides = crate::ParamOverrides::default();
+        RawInfoBlock::default().apply_to(&mut overrides);
+        assert_eq!(overrides.range("BandingReductionAmount"), None);
         assert_eq!(
             range_for_frame(Some(&info), Some("NIKON Z 6III")),
             Some(BandingRange { start: 0.0, end: 0.0, default: 0.0 }),
