@@ -273,6 +273,10 @@ pub mod beautymarks;
 pub mod autorotate;
 pub mod keystone;
 
+// Unified compute capability/policy layer (roadmap M1). Pure addition: no
+// product call site consults it yet; see the module docs for the phase-2 plan.
+pub mod compute;
+
 // Vendor (像素蛋糕) preset parameters, injected into this machine's Capture One
 // install by third-party DLLs. Deliberately not re-exported at the crate root:
 // these 482 keys are NOT Capture One's own adjustment model. Capture One's real

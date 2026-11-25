@@ -129,6 +129,9 @@ impl Pool {
             format: FrameFormat::F32Rgb12,
             bytes,
             generation: 0,
+            // M1 defaults: `alloc` stamps generation/identity/residency; the
+            // remaining descriptor fields keep their pre-M1 meaning.
+            ..FrameLayout::default()
         };
         self.frame = Some(ClarityFrame { handle: self.gpu.frame(layout)? });
         Ok(())
@@ -194,6 +197,9 @@ impl Pool {
             format: FrameFormat::F32Planes,
             bytes,
             generation: 0,
+            // M1 defaults: `alloc` stamps generation/identity/residency; the
+            // remaining descriptor fields keep their pre-M1 meaning.
+            ..FrameLayout::default()
         };
         let buffer = self.gpu.frame(layout)?;
         let grid_raw = &grid.raw;

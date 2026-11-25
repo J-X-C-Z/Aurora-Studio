@@ -364,6 +364,22 @@ impl VramLedger {
         }
     }
 
+    /// Re-labels an existing lease without touching `resident`/`peak`. Used by
+    /// a cross-stage handoff so the bytes are charged once, to the new owner.
+    /// `false` when the id is no longer resident (already released/reclaimed).
+    pub(crate) fn reassign(&mut self, id: u64, stage: &'static str) -> bool {
+        self.clock += 1;
+        let clock = self.clock;
+        match self.entries.iter_mut().find(|entry| entry.id == id) {
+            Some(entry) => {
+                entry.stage = stage;
+                entry.last_used = clock;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn stage_bytes(&self, stage: &'static str) -> usize {
         self.entries
             .iter()
@@ -563,6 +579,10 @@ fn vram_touch(id: u64) {
     with_ledger(|ledger| ledger.touch(id));
 }
 
+fn vram_reassign(id: u64, stage: &'static str) -> bool {
+    with_ledger(|ledger| ledger.reassign(id, stage))
+}
+
 /// Real residency of the shared ledger: `resident_bytes`, `peak_bytes`,
 /// `eviction_count`, `refused_count` plus the configured budget.
 pub(crate) fn vram_stats() -> VramStats {
@@ -618,6 +638,22 @@ impl VramLease {
         self.bytes
     }
 
+    pub(crate) fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    /// Moves the reservation to another stage's ledger share for a cross-stage
+    /// handoff. The id and byte count stay the same, so this neither releases
+    /// the bytes (no early return) nor admits them again (no double charge):
+    /// exactly one ledger entry of the same size changes owner.
+    pub(crate) fn reassign(&mut self, stage: &'static str) -> Result<(), Failure> {
+        if self.bytes == 0 || !vram_reassign(self.id, stage) {
+            return Err(Failure::Invalid("lease not resident"));
+        }
+        self.stage = stage;
+        Ok(())
+    }
+
     /// Grows (or shrinks) the reservation. A refusal leaves the old size.
     pub(crate) fn resize(&mut self, bytes: usize, evictable: bool) -> Result<(), Failure> {
         if bytes == self.bytes {
@@ -645,24 +681,278 @@ impl Drop for VramLease {
     }
 }
 
+/// Process-wide, strictly increasing residency epoch. Starts at 1 so `0` never
+/// means "current" and a descriptor that skipped allocation is distinguishable.
+static NEXT_FRAME_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_frame_generation() -> u64 {
+    NEXT_FRAME_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Process context token. The driver wrapper owns exactly one context per
+/// process (`cuda.rs` `DOMAIN`), so this is an engine-side identity, not the
+/// driver's `CUcontext` pointer (that crate is not owned by this lane).
+static NEXT_CONTEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn mint_context_token() -> u64 {
+    NEXT_CONTEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+fn process_context_token() -> u64 {
+    static TOKEN: OnceLock<u64> = OnceLock::new();
+    *TOKEN.get_or_init(mint_context_token)
+}
+
+/// Where a frame's pixels are authoritative right now.
+#[allow(dead_code)] // M1 descriptor: consumed by later cross-stage fusion steps
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Residency {
+    /// Host memory only; no device allocation is charged for this frame.
+    Host,
+    /// One device allocation owned by the frame; the lease pays for it.
+    #[default]
+    Device,
+    /// Device allocation mirrored in pinned host memory (staging frames).
+    Shared,
+}
+
+/// Transfer function / gamut of the stored samples.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FrameColorSpace {
+    /// Scene-linear RGB; the develop tone chain's input.
+    #[default]
+    LinearRgb,
+    /// Display-referred sRGB-encoded RGB.
+    Srgb,
+    /// Non-color planes (grid, luma, statistics).
+    Data,
+}
+
+/// Bits per channel. Kept independent of [`FrameFormat`] because a 10-bit
+/// source can ride in an f32 frame and an 8-bit display frame is not an f32
+/// frame in lower precision.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FrameBitDepth {
+    U8,
+    U16,
+    #[default]
+    F32,
+}
+
+/// Pixel region of a frame plus the halo its consumer may read. An all-zero
+/// width/height means "the whole frame", so descriptors built before the ROI
+/// is known keep working.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Extra pixels on every side of the region a kernel reads.
+    pub halo: u32,
+}
+
+impl FrameRegion {
+    pub(crate) fn is_unspecified(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// The region actually addressed, halo included: an unspecified ROI becomes
+    /// the full `width` x `height` frame.
+    pub(crate) fn addressed(&self, width: u32, height: u32) -> Self {
+        if self.is_unspecified() {
+            Self { x: 0, y: 0, width, height, halo: self.halo }
+        } else {
+            *self
+        }
+    }
+
+    /// Whether `self` lies inside a `width` x `height` frame.
+    pub(crate) fn fits(&self, width: u32, height: u32) -> bool {
+        self.is_unspecified()
+            || (self.x.saturating_add(self.width) <= width
+                && self.y.saturating_add(self.height) <= height)
+    }
+}
+
+/// Device/context identity an allocation is stamped with.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameIdentity {
+    /// The wrapper always opens device ordinal 0 (`cuDeviceGet(&mut device, 0)`).
+    pub device_id: u32,
+    /// Engine-side process context token (see [`process_context_token`]).
+    pub context_id: u64,
+}
+
 /// Host-side layout of a device-resident frame. `bytes` is explicit because a
 /// plane cache is not `w * h * bpp`.
+///
+/// Everything after `generation` (inclusive) has a `Default` meaning that
+/// preserves the pre-M1 behavior: `FrameHandle::alloc` stamps the generation,
+/// device/context identity and `Residency::Device`, so a caller that only fills
+/// `width/height/format/bytes` keeps allocating exactly what it did before.
+#[allow(dead_code)] // the descriptor is populated ahead of its consumers
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameLayout {
     pub width: u32,
     pub height: u32,
     pub format: FrameFormat,
     pub bytes: usize,
-    /// Bumped when the owner invalidates the residency (resize, device loss).
+    /// Bumped when the owner invalidates the residency (resize, device loss) or
+    /// hands the frame to another stage. `0` means "not stamped yet"; every
+    /// allocation receives a strictly larger value from a process counter.
     pub generation: u64,
+    pub residency: Residency,
+    /// Device ordinal and context token; `None` until an allocation stamps them.
+    pub device_id: Option<u32>,
+    pub context_id: Option<u64>,
+    /// Row pitch in bytes; `0` means tightly packed (`width * bytes_per_px`).
+    pub stride: usize,
+    /// Sub-window this frame covers; unspecified means the whole frame.
+    pub region: FrameRegion,
+    pub colorspace: FrameColorSpace,
+    pub bit_depth: FrameBitDepth,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Default for FrameLayout {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            format: FrameFormat::F32Rgb12,
+            bytes: 0,
+            generation: 0,
+            residency: Residency::Device,
+            device_id: None,
+            context_id: None,
+            stride: 0,
+            region: FrameRegion::default(),
+            colorspace: FrameColorSpace::LinearRgb,
+            bit_depth: FrameBitDepth::F32,
+        }
+    }
+}
+
+#[allow(dead_code)] // `new` enters production with the first u8/u16 staging frame
+impl FrameLayout {
+    /// A layout whose derived fields agree with `format`; new callers that use
+    /// `U8Rgba8`/`U16Rgba16` should start here instead of listing fields.
+    pub(crate) fn new(width: u32, height: u32, format: FrameFormat, bytes: usize) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            bytes,
+            colorspace: format.default_colorspace(),
+            bit_depth: format.bit_depth(),
+            ..Self::default()
+        }
+    }
+
+    /// Bytes from one row to the next, or `None` for a composite plane cache.
+    pub(crate) fn row_bytes(&self) -> Option<usize> {
+        self.format.bytes_per_px().map(|bpp| {
+            if self.stride != 0 {
+                self.stride
+            } else {
+                self.width as usize * bpp
+            }
+        })
+    }
+
+    /// Bytes the declared region (halo included) needs, or `None` for a
+    /// composite plane cache whose `bytes` is already authoritative.
+    pub(crate) fn required_bytes(&self) -> Option<usize> {
+        let row = self.row_bytes()?;
+        let region = self.region.addressed(self.width, self.height);
+        row.checked_mul(region.height as usize + 2 * region.halo as usize)
+    }
+
+    /// Stamps what only the allocating stage knows: a fresh generation, the
+    /// device/context identity and device residency. Rejects descriptors that
+    /// cannot describe one device allocation. Pure arithmetic.
+    pub(crate) fn prepare_for_device(
+        mut self,
+        identity: FrameIdentity,
+    ) -> Result<Self, Failure> {
+        if self.residency == Residency::Host {
+            return Err(Failure::Invalid("host residency has no device frame"));
+        }
+        if self.bit_depth != self.format.bit_depth() {
+            return Err(Failure::Invalid("bit depth does not match format"));
+        }
+        if !self.region.fits(self.width, self.height) {
+            return Err(Failure::Invalid("region exceeds frame"));
+        }
+        if let (Some(required), Some(row), Some(bpp)) =
+            (self.required_bytes(), self.row_bytes(), self.format.bytes_per_px())
+        {
+            if self.stride != 0 && self.stride < self.width as usize * bpp {
+                return Err(Failure::Invalid("stride below one tight row"));
+            }
+            if self.bytes < required || row == 0 {
+                return Err(Failure::Invalid("frame bytes below stride * rows"));
+            }
+        }
+        self.generation = next_frame_generation();
+        self.device_id = Some(identity.device_id);
+        self.context_id = Some(identity.context_id);
+        Ok(self)
+    }
+
+    /// Advances `generation` for an owner that invalidated the residency in
+    /// place (resize, device loss, content rewrite).
+    pub(crate) fn bump_generation(&mut self) -> u64 {
+        self.generation = next_frame_generation();
+        self.generation
+    }
+}
+
+#[allow(dead_code)] // u8/u16 variants are the frame-side half of display/export staging
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FrameFormat {
     /// `Vec<[f32; 3]>`: 12 bytes per pixel, the pre-curve display frame.
+    #[default]
     F32Rgb12,
     /// Grid plus the two low-frequency planes built from it.
     F32Planes,
+    /// One `u8` per channel, four channels: display/export staging frames.
+    U8Rgba8,
+    /// One `u16` per channel, four channels: 16-bit export staging frames.
+    U16Rgba16,
+}
+
+impl FrameFormat {
+    /// Bytes one pixel occupies when tightly packed. `None` for the composite
+    /// plane cache, whose `FrameLayout::bytes` is not `w * h * bpp`.
+    pub(crate) fn bytes_per_px(self) -> Option<usize> {
+        match self {
+            Self::F32Rgb12 => Some(12),
+            Self::F32Planes => None,
+            Self::U8Rgba8 => Some(4),
+            Self::U16Rgba16 => Some(8),
+        }
+    }
+
+    pub(crate) fn bit_depth(self) -> FrameBitDepth {
+        match self {
+            Self::F32Rgb12 | Self::F32Planes => FrameBitDepth::F32,
+            Self::U8Rgba8 => FrameBitDepth::U8,
+            Self::U16Rgba16 => FrameBitDepth::U16,
+        }
+    }
+
+    pub(crate) fn default_colorspace(self) -> FrameColorSpace {
+        match self {
+            Self::F32Rgb12 => FrameColorSpace::LinearRgb,
+            Self::F32Planes => FrameColorSpace::Data,
+            Self::U8Rgba8 | Self::U16Rgba16 => FrameColorSpace::Srgb,
+        }
+    }
 }
 
 /// A device allocation paired with the ledger lease that pays for it.
@@ -680,29 +970,85 @@ struct LeasedBuffer<B> {
 /// Device-resident frame shared across the passes of one stage. It is the
 /// P-07 step-2 building block: allocation and residency are owned by an object
 /// with a layout and a generation instead of an ad-hoc slot offset, so a later
-/// cross-stage fusion can hand the same device pointer to the next kernel.
-/// The buffer is freed before its lease is returned (see [`LeasedBuffer`]).
+/// cross-stage fusion can hand the same device pointer to the next kernel
+/// through [`FrameHandle::hand_off`].
+///
+/// Ownership bookkeeping of one resident frame, split from the device buffer so
+/// the handoff rules are unit-testable with a ledger-only lease (no CUDA).
+#[allow(dead_code)] // handoff API lands before its first cross-stage consumer
+struct FrameResidency {
+    /// Stage the lease currently belongs to (the allocator, or the last stage
+    /// the frame was handed to).
+    owner: &'static str,
+    /// Device ordinal and context token the buffer was allocated under.
+    identity: FrameIdentity,
+    /// Stream generation the frame was last written on, `None` when the writes
+    /// used synchronous copies. A consumer on another stage must sync the
+    /// producer before reading; this records what to wait for.
+    last_write_sync: Option<u64>,
+}
+
+impl FrameResidency {
+    fn new(owner: &'static str, identity: FrameIdentity) -> Self {
+        Self { owner, identity, last_write_sync: None }
+    }
+
+    /// Moves the frame to `next_stage`. The lease keeps its id and byte count,
+    /// so the ledger total never moves (no double charge) and no release runs
+    /// before the receiving stage owns it (no early return). Only the entry's
+    /// stage label changes. The layout generation advances so a stale consumer
+    /// cannot mistake the frame for the version it read before the handoff.
+    fn hand_off(
+        &mut self,
+        lease: &mut VramLease,
+        layout: &mut FrameLayout,
+        next_stage: &'static str,
+    ) -> Result<(), Failure> {
+        if next_stage == self.owner {
+            return Ok(());
+        }
+        lease.reassign(next_stage)?;
+        self.owner = next_stage;
+        self.last_write_sync = None;
+        layout.bump_generation();
+        Ok(())
+    }
+}
+
+/// Drop order is load-bearing: `buffer` is declared before `lease` so `cuMemFree`
+/// runs before the ledger marks the bytes spendable again.
+#[allow(dead_code)] // new descriptor/handoff accessors land before their consumers
 pub(crate) struct FrameHandle {
     layout: FrameLayout,
-    resident: LeasedBuffer<DeviceBuffer<'static>>,
+    residency: FrameResidency,
+    buffer: DeviceBuffer<'static>,
+    lease: VramLease,
 }
 
 // The buffer borrows the process driver table, kept alive by the owning `Gpu`,
 // and every use happens behind the stage's `Mutex<State>`.
 unsafe impl Send for FrameHandle {}
 
+#[allow(dead_code)] // new descriptor/handoff accessors land before their consumers
 impl FrameHandle {
     pub(crate) fn alloc(gpu: &Gpu, layout: FrameLayout) -> Result<Self, Failure> {
+        let identity = FrameIdentity {
+            device_id: 0,
+            context_id: process_context_token(),
+        };
+        // Stamps generation/identity and validates the derived fields. The
+        // pre-M1 descriptors (plain struct literal, generation: 0) carry no
+        // stride/region/bit-depth constraints, so this cannot fail for them.
+        let layout = layout.prepare_for_device(identity)?;
         let lease = VramLease::acquire(gpu.stage, layout.bytes.max(1), true)?;
         match gpu.gpu.alloc_buffer(layout.bytes.max(1)) {
             Ok(buffer) => Ok(Self {
                 layout,
-                resident: LeasedBuffer {
-                    buffer: unsafe {
-                        std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer)
-                    },
-                    lease,
+                residency: FrameResidency::new(gpu.stage, identity),
+                buffer: unsafe {
+                    std::mem::transmute::<DeviceBuffer<'_>, DeviceBuffer<'static>>(buffer)
                 },
+                lease,
             }),
             Err(error) => Err(gpu.failed(error)),
         }
@@ -712,8 +1058,30 @@ impl FrameHandle {
         self.layout
     }
 
+    /// Stage the residency is currently charged to.
+    pub(crate) fn owner(&self) -> &'static str {
+        self.residency.owner
+    }
+
+    /// Device ordinal and context token the buffer was allocated under.
+    pub(crate) fn identity(&self) -> FrameIdentity {
+        self.residency.identity
+    }
+
+    /// Stream generation of the last write, when it went through a stream.
+    pub(crate) fn last_write_sync(&self) -> Option<u64> {
+        self.residency.last_write_sync
+    }
+
+    /// Records that the frame was written through `sync_generation` on the
+    /// owning stage's stream. Consumers use it as the handoff dependency.
+    pub(crate) fn note_write_sync(&mut self, sync_generation: u64) {
+        self.residency.last_write_sync = Some(sync_generation);
+        self.layout.bump_generation();
+    }
+
     pub(crate) fn handle(&self) -> u64 {
-        self.resident.buffer.handle()
+        self.buffer.handle()
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -721,11 +1089,69 @@ impl FrameHandle {
     }
 
     pub(crate) fn lease_bytes(&self) -> usize {
-        self.resident.lease.bytes()
+        self.lease.bytes()
+    }
+
+    /// Cross-stage handoff: consumes the handle and returns it renamed for
+    /// `next_stage`, so the caller physically gives the frame up and the
+    /// receiver stores it. The buffer, layout and lease are the same objects:
+    /// the lease id and byte count do not change, so the ledger totals and the
+    /// peak stay put and the bytes are charged exactly once, to the receiver.
+    ///
+    /// The device buffer borrows only the process driver table (kept alive by
+    /// the `Gpu`s), not the producing stage's `Gpu`, so the frame stays valid
+    /// after the producer drops its pool. The receiver must first make the
+    /// producer's last write visible (`sync`, or the recorded
+    /// [`Self::last_write_sync`]) before launching its own kernels.
+    pub(crate) fn hand_off(mut self, next_stage: &'static str) -> Result<Self, Failure> {
+        self.residency
+            .hand_off(&mut self.lease, &mut self.layout, next_stage)?;
+        Ok(self)
+    }
+
+    /// Read-only loan for one more stage. The lease stays charged to the
+    /// owner, so a borrow can never double-count the bytes.
+    pub(crate) fn borrow_to<'a>(&'a self, borrower: &'static str) -> FrameBorrow<'a> {
+        FrameBorrow { frame: self, borrower }
     }
 
     fn buffer(&self) -> &DeviceBuffer<'static> {
-        &self.resident.buffer
+        &self.buffer
+    }
+}
+
+/// A non-owning, read-only view of a resident frame for another stage.
+/// Dropping it changes no ledger state: the owner keeps paying for the bytes.
+#[allow(dead_code)] // consumed by later cross-stage fusion steps
+pub(crate) struct FrameBorrow<'a> {
+    frame: &'a FrameHandle,
+    borrower: &'static str,
+}
+
+#[allow(dead_code)] // consumed by later cross-stage fusion steps
+impl FrameBorrow<'_> {
+    pub(crate) fn borrower(&self) -> &'static str {
+        self.borrower
+    }
+
+    pub(crate) fn owner(&self) -> &'static str {
+        self.frame.owner()
+    }
+
+    pub(crate) fn handle(&self) -> u64 {
+        self.frame.handle()
+    }
+
+    pub(crate) fn layout(&self) -> FrameLayout {
+        self.frame.layout()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.frame.bytes()
+    }
+
+    pub(crate) fn lease_bytes(&self) -> usize {
+        self.frame.lease_bytes()
     }
 }
 
@@ -1499,5 +1925,225 @@ mod tests {
             vram_release(id);
         }
         assert_eq!(vram_stats().resident_bytes, before, "residency leaked");
+    }
+
+    // ── M1: frame residency descriptor and cross-stage handoff ───────────
+
+    #[test]
+    fn generation_stamps_are_nonzero_and_strictly_increasing() {
+        let first = next_frame_generation();
+        let second = next_frame_generation();
+        assert!(first >= 1 && second > first, "{first} {second}");
+        // A descriptor that was never allocated still has generation 0, so a
+        // consumer can tell "not stamped" from a real residency epoch.
+        assert_eq!(FrameLayout::default().generation, 0);
+        let mut layout = FrameLayout::new(4, 4, FrameFormat::F32Rgb12, 4 * 4 * 12);
+        let before = layout.generation;
+        let bumped = layout.bump_generation();
+        assert!(bumped > before);
+        assert_eq!(layout.generation, bumped);
+    }
+
+    #[test]
+    fn legacy_layout_literal_still_describes_the_same_allocation() {
+        // This is the pre-M1 clarity shape: five explicit fields, no ROI, no
+        // stride. `prepare_for_device` must accept it and derive the rest.
+        let layout = FrameLayout {
+            width: 1920,
+            height: 1080,
+            format: FrameFormat::F32Rgb12,
+            bytes: 1920 * 1080 * 12,
+            generation: 0,
+            ..FrameLayout::default()
+        };
+        let prepared = layout
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 7 })
+            .expect("legacy layout admits");
+        assert_eq!(prepared.bytes, 1920 * 1080 * 12);
+        assert!(prepared.generation >= 1, "allocation must stamp a generation");
+        assert_eq!(prepared.residency, Residency::Device);
+        assert_eq!(prepared.device_id, Some(0));
+        assert_eq!(prepared.context_id, Some(7));
+        assert_eq!(prepared.row_bytes(), Some(1920 * 12));
+        assert_eq!(prepared.region.addressed(1920, 1080).width, 1920);
+    }
+
+    #[test]
+    fn composite_plane_cache_is_exempt_from_pixel_geometry_checks() {
+        // The plane cache's `bytes` is grid + planes, not w * h * bpp, so the
+        // stride/rows check must not reject it.
+        let layout = FrameLayout {
+            width: 97,
+            height: 61,
+            format: FrameFormat::F32Planes,
+            bytes: 64 * 4 + 2 * 32,
+            ..FrameLayout::default()
+        };
+        assert_eq!(layout.format.bytes_per_px(), None);
+        assert_eq!(layout.row_bytes(), None);
+        assert!(layout
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 1 })
+            .is_ok());
+    }
+
+    #[test]
+    fn stride_and_roi_halo_are_checked_against_bytes() {
+        let frame = FrameLayout::new(100, 50, FrameFormat::U8Rgba8, 100 * 50 * 4);
+        assert_eq!(frame.bit_depth, FrameBitDepth::U8);
+        assert_eq!(frame.colorspace, FrameColorSpace::Srgb);
+        assert_eq!(frame.row_bytes(), Some(400));
+        // A padded stride must still fit the declared bytes.
+        let mut padded = frame;
+        padded.stride = 512;
+        padded.bytes = 512 * 50;
+        assert!(padded
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 1 })
+            .is_ok());
+        // A stride below one tight row is invalid.
+        let mut narrow = frame;
+        narrow.stride = 399;
+        assert!(narrow
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 1 })
+            .is_err());
+        // ROI + halo must be covered by `bytes`.
+        let mut small = frame;
+        small.region = FrameRegion { x: 10, y: 5, width: 20, height: 10, halo: 2 };
+        small.bytes = 100 * 14 * 4;
+        assert!(small
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 1 })
+            .is_ok());
+        small.bytes = 100 * 13 * 4;
+        assert!(small
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 1 })
+            .is_err());
+        // An ROI outside the frame is rejected.
+        let mut outside = frame;
+        outside.region = FrameRegion { x: 90, y: 0, width: 20, height: 10, halo: 0 };
+        assert!(outside
+            .prepare_for_device(FrameIdentity { device_id: 0, context_id: 1 })
+            .is_err());
+    }
+
+    #[test]
+    fn format_variants_report_u8_and_u16_geometry() {
+        for (format, bpp, depth, space) in [
+            (FrameFormat::U8Rgba8, 4, FrameBitDepth::U8, FrameColorSpace::Srgb),
+            (FrameFormat::U16Rgba16, 8, FrameBitDepth::U16, FrameColorSpace::Srgb),
+            (FrameFormat::F32Rgb12, 12, FrameBitDepth::F32, FrameColorSpace::LinearRgb),
+        ] {
+            assert_eq!(format.bytes_per_px(), Some(bpp));
+            assert_eq!(format.bit_depth(), depth);
+            assert_eq!(format.default_colorspace(), space);
+        }
+        assert_eq!(FrameFormat::F32Planes.bytes_per_px(), None);
+        assert_eq!(FrameFormat::F32Planes.bit_depth(), FrameBitDepth::F32);
+        assert_eq!(FrameFormat::F32Planes.default_colorspace(), FrameColorSpace::Data);
+    }
+
+    #[test]
+    fn handoff_retags_the_lease_without_double_charging_or_releasing() {
+        let before = vram_stats();
+        let identity = FrameIdentity { device_id: 0, context_id: 3 };
+        let mut layout = FrameLayout::new(64, 32, FrameFormat::U8Rgba8, 64 * 32 * 4)
+            .prepare_for_device(identity)
+            .expect("layout");
+        let generation = layout.generation;
+        let mut lease = VramLease::acquire("test-handoff-from", layout.bytes, true)
+            .expect("admit");
+        let id = lease.id();
+        let charged = vram_stats();
+        assert_eq!(charged.resident_bytes, before.resident_bytes + layout.bytes);
+
+        // A handoff only relabels the ledger entry: same id, same bytes.
+        lease.reassign("test-handoff-to").expect("reassign");
+        assert_eq!(lease.stage(), "test-handoff-to");
+        let after = vram_stats();
+        assert_eq!(after.resident_bytes, charged.resident_bytes);
+        assert_eq!(after.peak_bytes, charged.peak_bytes);
+        assert_eq!(after.eviction_count, charged.eviction_count);
+        assert_eq!(lease.id(), id);
+        assert_eq!(lease.bytes(), layout.bytes);
+        assert_eq!(with_ledger(|ledger| ledger.stage_bytes("test-handoff-from")), 0);
+        assert_eq!(with_ledger(|ledger| ledger.stage_bytes("test-handoff-to")), layout.bytes);
+
+        // The frame-side bump is separate from the ledger move.
+        assert!(layout.bump_generation() > generation);
+        assert_eq!(lease.bytes(), layout.bytes);
+
+        // Normal drop returns the bytes exactly once.
+        drop(lease);
+        assert_eq!(vram_stats().resident_bytes, before.resident_bytes);
+    }
+
+    #[test]
+    fn handoff_transfers_owner_and_generation_but_not_bytes() {
+        // Exercises the exact `FrameResidency::hand_off` path `FrameHandle`
+        // uses, with a real ledger lease but no device buffer.
+        let before = vram_stats().resident_bytes;
+        let identity = FrameIdentity { device_id: 0, context_id: 11 };
+        let mut layout = FrameLayout::new(32, 16, FrameFormat::U16Rgba16, 32 * 16 * 8)
+            .prepare_for_device(identity)
+            .expect("layout");
+        let generation = layout.generation;
+        let mut lease = VramLease::acquire("test-owner-a", layout.bytes, true).expect("admit");
+        let id = lease.id();
+        let mut residency = FrameResidency::new("test-owner-a", identity);
+        assert_eq!(residency.owner, "test-owner-a");
+
+        residency
+            .hand_off(&mut lease, &mut layout, "test-owner-b")
+            .expect("handoff");
+        assert_eq!(residency.owner, "test-owner-b");
+        assert_eq!(lease.id(), id);
+        assert_eq!(lease.bytes(), 32 * 16 * 8);
+        assert_eq!(lease.stage(), "test-owner-b");
+        assert!(layout.generation > generation);
+        assert_eq!(vram_stats().resident_bytes, before + 32 * 16 * 8);
+        assert_eq!(with_ledger(|ledger| ledger.stage_bytes("test-owner-a")), 0);
+        assert_eq!(
+            with_ledger(|ledger| ledger.stage_bytes("test-owner-b")),
+            32 * 16 * 8
+        );
+
+        // A handoff to the current owner is a no-op, not a second charge.
+        let unchanged = layout.generation;
+        residency
+            .hand_off(&mut lease, &mut layout, "test-owner-b")
+            .expect("noop");
+        assert_eq!(layout.generation, unchanged);
+        assert_eq!(vram_stats().resident_bytes, before + 32 * 16 * 8);
+
+        drop(lease);
+        assert_eq!(vram_stats().resident_bytes, before);
+    }
+
+    #[test]
+    fn handoff_of_a_released_lease_is_refused() {
+        let mut lease = VramLease::acquire("test-handoff-gone", 1024, true).expect("admit");
+        lease.forget();
+        assert!(lease.reassign("test-handoff-next").is_err());
+        assert_eq!(with_ledger(|ledger| ledger.stage_bytes("test-handoff-next")), 0);
+    }
+
+    #[test]
+    fn ledger_reassign_moves_attribution_only() {
+        let mut ledger = VramLedger::new(1 << 20);
+        assert!(ledger.admit(7001, "from", 4096, true));
+        assert!(ledger.admit(7002, "other", 1024, true));
+        assert_eq!(ledger.stats().resident_bytes, 5120);
+        assert!(ledger.reassign(7001, "to"));
+        assert_eq!(ledger.stage_bytes("from"), 0);
+        assert_eq!(ledger.stage_bytes("to"), 4096);
+        assert_eq!(ledger.stage_bytes("other"), 1024);
+        assert_eq!(ledger.stats().resident_bytes, 5120);
+        assert_eq!(ledger.stats().peak_bytes, 5120);
+        assert!(!ledger.reassign(9999, "to"));
+    }
+
+    #[test]
+    fn context_token_is_one_per_process() {
+        assert!(process_context_token() >= 1);
+        assert_eq!(process_context_token(), process_context_token());
+        assert!(mint_context_token() > process_context_token());
     }
 }
