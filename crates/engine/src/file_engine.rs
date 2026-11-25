@@ -287,7 +287,7 @@ fn proxy_decode_format(path: &Path) -> DecodeFormat {
 
 /// Admission units both decode gates are sized to for a byte budget.
 fn decode_gate_units(cache_bytes: usize) -> usize {
-    (cache_bytes / DECODE_UNIT_BYTES).clamp(2, 6)
+    (cache_bytes / DECODE_UNIT_BYTES).clamp(2, 16)
 }
 
 /// Admission units one decode asks for: its estimated working set in 256 MiB
@@ -7681,7 +7681,7 @@ mod tests {
     fn decode_gate_units_follow_byte_budget() {
         let mib = 1024 * 1024usize;
         assert_eq!(decode_gate_units(512 * mib), 2);
-        assert_eq!(decode_gate_units(4 * 1024 * mib), 6);
+        assert_eq!(decode_gate_units(4 * 1024 * mib), 16);
         let gates = DecodeGates::new(512 * mib);
         assert_eq!(gates.heavy.total_units(), 2);
         assert_eq!(gates.light.total_units(), 2);
