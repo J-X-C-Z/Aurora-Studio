@@ -33,6 +33,28 @@ const HEIF_CHROMA_INTERLEAVED_RGBA: c_int = 11;
 const HEIF_CHANNEL_INTERLEAVED: c_int = 10;
 const RTLD_NOW: c_int = 2;
 
+/// macOS ships the ABI in a versioned dylib (`libheif.1.23.7.dylib` for the
+/// current Homebrew build); newest first, then the `*.1.dylib` and unversioned
+/// symlinks Homebrew also creates.
+#[cfg(all(not(windows), target_os = "macos"))]
+const POSIX_LIBRARY_NAMES: [&str; 4] = [
+    "libheif.1.23.7.dylib",
+    "libheif.1.23.dylib",
+    "libheif.1.dylib",
+    "libheif.dylib",
+];
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const POSIX_LIBRARY_NAMES: [&str; 2] = ["libheif.so.1", "libheif.so"];
+
+/// Directories `dlopen` does not search on its own. Homebrew on Apple silicon
+/// installs into `/opt/homebrew/lib`; Intel and source builds use
+/// `/usr/local/lib`. Linux gets the common multi-arch directories.
+#[cfg(target_os = "macos")]
+const LIBRARY_PREFIXES: [&str; 2] = ["/opt/homebrew/lib", "/usr/local/lib"];
+#[cfg(all(not(windows), not(target_os = "macos")))]
+const LIBRARY_PREFIXES: [&str; 3] =
+    ["/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib"];
+
 const REQUIRED_EXPORTS: &[&str] = &[
     "heif_context_alloc",
     "heif_context_free",
@@ -122,16 +144,47 @@ fn free(handle: Handle) {
 }
 
 fn library_candidates() -> Vec<PathBuf> {
-    if let Some(path) = std::env::var_os("AURORA_HEIF_LIB") {
-        return vec![PathBuf::from(path)];
+    let override_path = std::env::var_os("AURORA_HEIF_LIB").map(PathBuf::from);
+    candidate_paths(override_path.as_deref())
+}
+
+/// `AURORA_HEIF_LIB` is authoritative when set: a stale override must fail
+/// loudly instead of silently picking a different libheif than the caller
+/// asked for.
+///
+/// Shared with the reader (`crate::heif`) so both halves resolve the same
+/// platform candidate list.
+pub(crate) fn candidate_paths(override_path: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(path) = override_path {
+        return vec![path.to_path_buf()];
     }
-    if cfg!(windows) {
-        vec!["libheif.dll".into(), "heif.dll".into()]
-    } else if cfg!(target_os = "macos") {
-        vec!["libheif.dylib".into(), "libheif.1.dylib".into()]
-    } else {
-        vec!["libheif.so.1".into(), "libheif.so".into()]
+    default_library_candidates()
+}
+
+#[cfg(windows)]
+fn default_library_candidates() -> Vec<PathBuf> {
+    vec!["libheif.dll".into(), "heif.dll".into()]
+}
+
+/// Deterministic and de-duplicated: each known directory crossed with the
+/// versioned names first, then the bare sonames for the platform loader's own
+/// search path.
+#[cfg(not(windows))]
+fn default_library_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for prefix in LIBRARY_PREFIXES {
+        for name in POSIX_LIBRARY_NAMES {
+            candidates.push(Path::new(prefix).join(name));
+        }
     }
+    for name in POSIX_LIBRARY_NAMES {
+        candidates.push(PathBuf::from(name));
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 fn missing_library_error(reason: &str) -> anyhow::Error {
@@ -614,6 +667,79 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_override_is_the_only_candidate() {
+        let override_path = PathBuf::from("/custom/libheif.dylib");
+        assert_eq!(
+            candidate_paths(Some(override_path.as_path())),
+            vec![override_path]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_are_unchanged() {
+        assert_eq!(
+            default_library_candidates(),
+            vec![PathBuf::from("libheif.dll"), PathBuf::from("heif.dll")]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_candidates_are_ordered_and_deduplicated() {
+        let candidates = default_library_candidates();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                candidates.first().map(PathBuf::as_path),
+                Some(Path::new("/opt/homebrew/lib/libheif.1.23.7.dylib"))
+            );
+            for expected in [
+                "/opt/homebrew/lib/libheif.1.23.7.dylib",
+                "/usr/local/lib/libheif.1.23.dylib",
+                "/opt/homebrew/lib/libheif.dylib",
+                "libheif.1.dylib",
+                "libheif.dylib",
+            ] {
+                assert!(
+                    candidates.iter().any(|path| path.as_path() == Path::new(expected)),
+                    "missing {expected} in {candidates:?}"
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                candidates.first().map(PathBuf::as_path),
+                Some(Path::new("/usr/local/lib/libheif.so.1"))
+            );
+            for expected in [
+                "/usr/local/lib/libheif.so.1",
+                "/usr/lib/libheif.so",
+                "libheif.so.1",
+                "libheif.so",
+            ] {
+                assert!(
+                    candidates.iter().any(|path| path.as_path() == Path::new(expected)),
+                    "missing {expected} in {candidates:?}"
+                );
+            }
+        }
+        assert_eq!(
+            candidates.last().map(PathBuf::as_path),
+            Some(Path::new(if cfg!(target_os = "macos") {
+                "libheif.dylib"
+            } else {
+                "libheif.so"
+            }))
+        );
+        let mut unique = candidates.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), candidates.len(), "duplicate candidate in {candidates:?}");
+    }
+
+    #[test]
     fn missing_library_reports_structured_error() {
         let previous = std::env::var_os("AURORA_HEIF_LIB");
         unsafe { std::env::set_var("AURORA_HEIF_LIB", "Z:/definitely/not/libheif.dll") };
@@ -739,7 +865,11 @@ mod tests {
 
     #[test]
     fn encodes_10_and_12_bit_heif_with_metadata() {
-        if !available() {
+        // The assert below reads the file back. The non-Windows HEIF reader is
+        // an explicit refusal, so the round trip can only be checked where that
+        // reader exists; the writer itself is still exercised by the other
+        // tests once libheif resolves.
+        if !available() || !cfg!(windows) {
             return;
         }
         let meta = crate::XmpMeta {

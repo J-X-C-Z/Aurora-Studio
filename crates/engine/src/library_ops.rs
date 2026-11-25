@@ -1,18 +1,17 @@
-//! Library filesystem commands over the Windows `FileEngine`.
+//! Library filesystem helpers over the Windows `FileEngine`.
 //!
-//! The names and return types follow Levin's `FileEngine` implementation:
-//! `library_root() -> Option<PathBuf>`, `collection_path(id) -> Option<PathBuf>`,
-//! and `manage_files(LibraryAction) -> Result<Vec<ImageInfo>>`.
+//! The operation bodies moved to [`super::services::LibraryService`]; what
+//! remains here are the path-normalization, sidecar and no-clobber helpers they
+//! share, a one-line `FileEngine::manage_library` delegation with the original
+//! signature, and the library test suite.
 //!
 //! All mutations preflight the whole batch before touching a file. A collision,
 //! a missing source or an I/O failure therefore leaves the original batch in
 //! place (or restores the files already moved).
 
 use super::*;
-use crate::{LibraryAction, UserCollection};
-use crate::engine::ImageEngine;
+use crate::LibraryAction;
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -36,12 +35,12 @@ fn plain_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn path_key(path: &Path) -> String {
+pub(super) fn path_key(path: &Path) -> String {
     let key = path.to_string_lossy().replace('\\', "/");
     if cfg!(windows) { key.to_lowercase() } else { key }
 }
 
-fn is_private(path: &Path) -> bool {
+pub(super) fn is_private(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
         name == ".portrait"
@@ -76,7 +75,7 @@ fn physical_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn resolve_inside(root: &Path, path: &Path) -> Result<PathBuf> {
+pub(super) fn resolve_inside(root: &Path, path: &Path) -> Result<PathBuf> {
     ensure!(!path.as_os_str().is_empty(), "empty path");
     ensure!(!path.components().any(|component| matches!(component, Component::ParentDir)), "parent traversal is not allowed");
     let path = if path.is_absolute() {
@@ -93,7 +92,7 @@ fn resolve_inside(root: &Path, path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn existing_directory(root: &Path, path: &Path) -> Result<PathBuf> {
+pub(super) fn existing_directory(root: &Path, path: &Path) -> Result<PathBuf> {
     let path = resolve_inside(root, path)?;
     ensure!(path.is_dir(), "directory unavailable: {}", path.display());
     let path = canonical_root(&path)?;
@@ -101,7 +100,7 @@ fn existing_directory(root: &Path, path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn validate_name(name: &str) -> Result<()> {
+pub(super) fn validate_name(name: &str) -> Result<()> {
     ensure!(!name.is_empty() && name != "." && name != ".." && name.encode_utf16().count() <= 255, "invalid Windows filename");
     ensure!(!name.ends_with(['.', ' ']) && !name.chars().any(|c| c < ' ' || "<>:\"/\\|?*".contains(c)), "invalid Windows filename");
     let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
@@ -114,7 +113,7 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_absent(path: &Path) -> Result<()> {
+pub(super) fn ensure_absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -122,12 +121,12 @@ fn ensure_absent(path: &Path) -> Result<()> {
     }
 }
 
-fn rel_key(root: &Path, path: &Path) -> Result<String> {
+pub(super) fn rel_key(root: &Path, path: &Path) -> Result<String> {
     let relative = path.strip_prefix(root).with_context(|| format!("{} is outside {}", path.display(), root.display()))?;
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
     let Some(parent) = path.parent() else { return Ok(Vec::new()) };
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return Ok(Vec::new()) };
     let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
@@ -150,7 +149,7 @@ fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-fn selected_paths(entries: &[FileEntry], ids: &[ImageId]) -> Result<Vec<PathBuf>> {
+pub(super) fn selected_paths(entries: &[FileEntry], ids: &[ImageId]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for id in ids {
         let entry = entries.iter().find(|entry| entry.info.id == *id).with_context(|| format!("unknown image identity {}", id.0))?;
@@ -163,7 +162,7 @@ fn selected_paths(entries: &[FileEntry], ids: &[ImageId]) -> Result<Vec<PathBuf>
 
 /// A folder is offline when its path is gone or every recorded image under it
 /// is missing. An existing folder whose images are still present is online.
-fn folder_is_offline(entries: &[FileEntry], folder: &Path) -> bool {
+pub(super) fn folder_is_offline(entries: &[FileEntry], folder: &Path) -> bool {
     if !folder.exists() {
         return true;
     }
@@ -181,7 +180,7 @@ fn transfer_target(from: &Path, to: &Path, sidecar: &Path) -> PathBuf {
     }
 }
 
-fn expand_sidecars(pairs: Vec<(PathBuf, PathBuf)>) -> Result<Vec<(PathBuf, PathBuf)>> {
+pub(super) fn expand_sidecars(pairs: Vec<(PathBuf, PathBuf)>) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut all = pairs;
     let originals = all.clone();
     for (from, to) in originals {
@@ -195,7 +194,7 @@ fn expand_sidecars(pairs: Vec<(PathBuf, PathBuf)>) -> Result<Vec<(PathBuf, PathB
     Ok(all)
 }
 
-fn entry_record(info: &ImageInfo, rel_path: String) -> Entry {
+pub(super) fn entry_record(info: &ImageInfo, rel_path: String) -> Entry {
     Entry {
         rel_path,
         rating: info.rating,
@@ -208,7 +207,7 @@ fn entry_record(info: &ImageInfo, rel_path: String) -> Entry {
 }
 
 #[cfg(windows)]
-fn move_no_replace(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn move_no_replace(from: &Path, to: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -224,13 +223,13 @@ fn move_no_replace(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn move_no_replace(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn move_no_replace(from: &Path, to: &Path) -> Result<()> {
     copy_no_replace(from, to)?;
     fs::remove_file(from)?;
     Ok(())
 }
 
-fn copy_no_replace(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn copy_no_replace(from: &Path, to: &Path) -> Result<()> {
     let mut source = fs::File::open(from).with_context(|| format!("reading {}", from.display()))?;
     let mut target = fs::OpenOptions::new().write(true).create_new(true).open(to).with_context(|| format!("creating {}", to.display()))?;
     let copied = (|| -> Result<()> {
@@ -245,7 +244,7 @@ fn copy_no_replace(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rollback(moves: &[(PathBuf, PathBuf)], copy: bool, error: anyhow::Error) -> anyhow::Error {
+pub(super) fn rollback(moves: &[(PathBuf, PathBuf)], copy: bool, error: anyhow::Error) -> anyhow::Error {
     let mut failures = Vec::new();
     for (from, to) in moves.iter().rev() {
         let result = if copy { fs::remove_file(to).map_err(Into::into) } else { move_no_replace(to, from) };
@@ -257,329 +256,15 @@ fn rollback(moves: &[(PathBuf, PathBuf)], copy: bool, error: anyhow::Error) -> a
 }
 
 impl FileEngine {
+    /// Library operation entry point; the bodies live in
+    /// [`super::services::LibraryService`] and the signature is unchanged.
     pub(super) fn manage_library(&self, action: LibraryAction) -> Result<Vec<ImageInfo>> {
-        ensure!(!self.c1_catalog, "library filesystem operations are read-only for a Capture One catalog");
-        if let LibraryAction::Synchronize { folder, recursive } = &action {
-            let folder = existing_directory(&self.root, folder)?;
-            self.rescan()?;
-            let _ = recursive;
-            return Ok(self.images().into_iter().filter(|image| image.path.starts_with(&folder)).collect());
-        }
-        match action {
-            LibraryAction::Move { images, destination } => self.move_images(&images, &destination),
-            LibraryAction::MoveFolder { from, to } => self.move_folder(&from, &to),
-            LibraryAction::Rename { image, name } => {
-                validate_name(&name)?;
-                let source = selected_paths(&self.state.lock().entries, &[image])?.remove(0);
-                let target = source.with_file_name(name);
-                self.move_paths(vec![(source, target)])
-            }
-            LibraryAction::RenameMany { names } => self.rename_many(&names),
-            LibraryAction::Locate { from, to } => self.relink_folder(&from, &to),
-            LibraryAction::LocateImage { image, to } => self.relink_image(image, &to),
-            LibraryAction::Forget { images } => self.forget(&images),
-            LibraryAction::CreateFolder { path } => self.create_folder(&path),
-            LibraryAction::Copy { images, destination } => self.copy_images(&images, &destination),
-            LibraryAction::Delete { images, permanent } => self.delete_images(&images, permanent),
-            LibraryAction::Synchronize { .. } => unreachable!(),
-        }
-    }
-
-    fn move_images(&self, images: &[ImageId], destination: &Path) -> Result<Vec<ImageInfo>> {
-        let destination = existing_directory(&self.root, destination)?;
-        let entries = self.state.lock().entries.clone();
-        let mut pairs = Vec::new();
-        for source in selected_paths(&entries, images)? {
-            let target = destination.join(source.file_name().context("source has no filename")?);
-            if source != target {
-                pairs.push((source, target));
-            }
-        }
-        self.move_paths(pairs)
-    }
-
-    fn rename_many(&self, names: &[(ImageId, String)]) -> Result<Vec<ImageInfo>> {
-        let entries = self.state.lock().entries.clone();
-        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
-        for (image, name) in names {
-            validate_name(name)?;
-            let source = selected_paths(&entries, &[*image])?.remove(0);
-            let target = source.with_file_name(name);
-            if let Some((_, previous)) = pairs.iter().find(|(from, _)| path_key(from) == path_key(&source)) {
-                ensure!(path_key(previous) == path_key(&target), "variants of one file have conflicting rename targets");
-            } else if source != target {
-                pairs.push((source, target));
-            }
-        }
-        self.move_paths(pairs)
-    }
-
-    fn move_paths(&self, pairs: Vec<(PathBuf, PathBuf)>) -> Result<Vec<ImageInfo>> {
-        if pairs.is_empty() {
-            return Ok(self.images());
-        }
-        let pairs = expand_sidecars(pairs)?;
-        self.apply_pairs(&pairs, false)?;
-        let map: HashMap<PathBuf, PathBuf> = pairs
-            .iter()
-            .filter(|(from, _)| !from.extension().is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("xmp")))
-            .cloned()
-            .collect();
-        self.relink_entries(&map)
-    }
-
-    fn move_folder(&self, from: &Path, to: &Path) -> Result<Vec<ImageInfo>> {
-        let from = existing_directory(&self.root, from)?;
-        ensure!(from != self.root && !self.root.starts_with(&from), "cannot move the library root or its ancestor");
-        let to = resolve_inside(&self.root, to)?;
-        validate_name(to.file_name().and_then(|name| name.to_str()).context("invalid folder name")?)?;
-        let parent = existing_directory(&self.root, to.parent().context("missing destination parent")?)?;
-        let to = parent.join(to.file_name().context("missing destination name")?);
-        ensure!(!to.starts_with(&from), "cannot move a folder into itself");
-        ensure_absent(&to)?;
-        let entries = self.state.lock().entries.clone();
-        let map: HashMap<PathBuf, PathBuf> = entries
-            .iter()
-            .filter(|entry| entry.path.starts_with(&from))
-            .map(|entry| (entry.path.clone(), to.join(entry.path.strip_prefix(&from).unwrap_or(Path::new("")))))
-            .collect();
-        fs::rename(&from, &to).with_context(|| format!("moving folder {} to {}", from.display(), to.display()))?;
-        match self.relink_entries(&map) {
-            Ok(images) => Ok(images),
-            Err(error) => {
-                let _ = fs::rename(&to, &from);
-                Err(error)
-            }
-        }
-    }
-
-    fn relink_folder(&self, from: &Path, to: &Path) -> Result<Vec<ImageInfo>> {
-        let from = resolve_inside(&self.root, from)?;
-        ensure!(from != self.root && !is_private(&from), "cannot relink the library root or private data");
-        let to = existing_directory(&self.root, to)?;
-        let entries = self.state.lock().entries.clone();
-        ensure!(folder_is_offline(&entries, &from), "Locate requires an offline folder");
-        let map: HashMap<PathBuf, PathBuf> = entries
-            .iter()
-            .filter(|entry| entry.path.starts_with(&from))
-            .map(|entry| (entry.path.clone(), to.join(entry.path.strip_prefix(&from).unwrap_or(Path::new("")))))
-            .collect();
-        for target in map.values() {
-            ensure!(target.is_file(), "relink target unavailable: {}", target.display());
-        }
-        self.relink_entries(&map)
-    }
-
-    fn relink_image(&self, image: ImageId, to: &Path) -> Result<Vec<ImageInfo>> {
-        let entries = self.state.lock().entries.clone();
-        let from = selected_paths(&entries, &[image])?.remove(0);
-        ensure!(!from.exists(), "LocateImage requires an offline source");
-        let to = canonical_root(&resolve_inside(&self.root, to)?)?;
-        ensure!(to.is_file() && !is_private(&to), "relink target must be an existing image");
-        ensure!(
-            !entries.iter().any(|entry| entry.path != from && path_key(&entry.path) == path_key(&to)),
-            "relink target already belongs to another source"
-        );
-        self.relink_entries(&HashMap::from([(from, to)]))
-    }
-
-    fn create_folder(&self, path: &Path) -> Result<Vec<ImageInfo>> {
-        let path = resolve_inside(&self.root, path)?;
-        validate_name(path.file_name().and_then(|name| name.to_str()).context("invalid folder name")?)?;
-        let parent = existing_directory(&self.root, path.parent().context("folder has no parent")?)?;
-        let path = parent.join(path.file_name().context("missing folder name")?);
-        ensure!(!is_private(&path), "folder name is reserved for private data");
-        ensure_absent(&path)?;
-        fs::create_dir(&path)?;
-        Ok(self.images())
-    }
-
-    fn copy_images(&self, images: &[ImageId], destination: &Path) -> Result<Vec<ImageInfo>> {
-        let destination = existing_directory(&self.root, destination)?;
-        let entries = self.state.lock().entries.clone();
-        let sources = selected_paths(&entries, images)?;
-        let mut pairs = Vec::new();
-        for source in &sources {
-            let target = destination.join(source.file_name().context("source has no filename")?);
-            ensure!(path_key(&target) != path_key(source), "cannot copy a file onto itself");
-            pairs.push((source.clone(), target));
-        }
-        let pairs = expand_sidecars(pairs)?;
-        self.apply_pairs(&pairs, true)?;
-        let mut copied = Vec::new();
-        for source in sources {
-            let source_entry = entries.iter().find(|entry| entry.path == source).cloned().context("source disappeared")?;
-            let target = destination.join(source.file_name().context("source has no filename")?);
-            let info = self.add_file(&target)?;
-            if let Some(entry) = self.state.lock().entries.iter_mut().find(|entry| entry.info.id == info.id) {
-                entry.adjustments = source_entry.adjustments.clone();
-            }
-            if let Some(store) = &self.store {
-                store.save_adjustments(&rel_key(&self.root, &target)?, &source_entry.adjustments)?;
-            }
-            let record = {
-                let state = self.state.lock();
-                let entry = state.entries.iter().find(|entry| entry.info.id == info.id).unwrap();
-                entry_record(&entry.info, entry.rel_path.clone())
-            };
-            let catalog = {
-                let mut state = self.state.lock();
-                state.catalog.upsert(record);
-                state.catalog.clone()
-            };
-            if let Some(store) = &self.store {
-                store.save_index(&catalog)?;
-            }
-            copied.push(self.images().into_iter().find(|image| image.id == info.id).unwrap());
-        }
-        Ok(copied)
-    }
-
-    fn delete_images(&self, images: &[ImageId], permanent: bool) -> Result<Vec<ImageInfo>> {
-        let entries = self.state.lock().entries.clone();
-        let paths = selected_paths(&entries, images)?;
-        let mut delete = Vec::new();
-        for path in &paths {
-            ensure!(path.is_file() && !is_private(path), "source unavailable or protected: {}", path.display());
-            delete.push(path.clone());
-            for sidecar in sidecars(path)? {
-                delete.push(sidecar);
-            }
-        }
-        if permanent {
-            for path in &delete {
-                fs::remove_file(path)?;
-            }
-        } else {
-            recycle_paths(&delete)?;
-        }
-        let mut state = self.state.lock();
-        state.entries.retain(|entry| !images.contains(&entry.info.id));
-        for path in &paths {
-            if !state.entries.iter().any(|entry| entry.path == *path) {
-                if let Some(store) = &self.store {
-                    let mut excluded = store.load_excluded();
-                    excluded.push(path.clone());
-                    store.save_excluded(&excluded)?;
-                }
-            }
-        }
-        for image in images {
-            if let Some(entry) = entries.iter().find(|entry| entry.info.id == *image) {
-                state.catalog.remove(&entry.rel_path);
-                if let Some(store) = &self.store {
-                    store.remove_adjustments(&entry.rel_path)?;
-                }
-            }
-        }
-        if let Some(store) = &self.store {
-            store.save_index(&state.catalog)?;
-        }
-        Ok(state.entries.iter().map(|entry| entry.info.clone()).collect())
-    }
-
-    fn forget(&self, images: &[ImageId]) -> Result<Vec<ImageInfo>> {
-        let mut state = self.state.lock();
-        let removed: Vec<FileEntry> = state.entries.iter().filter(|entry| images.contains(&entry.info.id)).cloned().collect();
-        ensure!(!removed.is_empty(), "no matching images");
-        state.entries.retain(|entry| !images.contains(&entry.info.id));
-        for entry in &removed {
-            state.catalog.remove(&entry.rel_path);
-            if let Some(store) = &self.store {
-                store.remove_adjustments(&entry.rel_path)?;
-            }
-        }
-        if let Some(store) = &self.store {
-            let mut excluded = store.load_excluded();
-            for entry in &removed {
-                if !state.entries.iter().any(|remaining| remaining.path == entry.path) {
-                    excluded.push(entry.path.clone());
-                }
-            }
-            store.save_excluded(&excluded)?;
-            let mut albums: Vec<UserCollection> = store.load_user_collections();
-            for album in &mut albums {
-                album.images.retain(|id| !images.contains(id));
-            }
-            store.save_user_collections(&albums)?;
-            store.save_index(&state.catalog)?;
-        }
-        Ok(state.entries.iter().map(|entry| entry.info.clone()).collect())
-    }
-
-    fn apply_pairs(&self, pairs: &[(PathBuf, PathBuf)], copy: bool) -> Result<()> {
-        let mut sources = HashSet::new();
-        let mut targets = HashSet::new();
-        for (from, to) in pairs {
-            ensure!(from.is_file() && !is_private(from), "source unavailable or protected: {}", from.display());
-            ensure!(!is_private(to), "destination is private data");
-            ensure!(to.parent().is_some_and(Path::is_dir), "destination folder unavailable: {}", to.display());
-            validate_name(to.file_name().and_then(|name| name.to_str()).context("invalid destination filename")?)?;
-            ensure!(sources.insert(path_key(from)), "one source cannot move to multiple destinations");
-            ensure!(targets.insert(path_key(to)), "duplicate destination: {}", to.display());
-            ensure_absent(to)?;
-            ensure!(
-                !self.state.lock().entries.iter().any(|entry| {
-                    path_key(&entry.path) == path_key(to)
-                        && !pairs.iter().any(|(source, _)| path_key(source) == path_key(&entry.path))
-                }),
-                "destination already cataloged: {}",
-                to.display()
-            );
-        }
-        let mut completed = Vec::new();
-        for (from, to) in pairs {
-            let result = if copy { copy_no_replace(from, to) } else { move_no_replace(from, to) };
-            if let Err(error) = result {
-                return Err(rollback(&completed, copy, error));
-            }
-            completed.push((from.clone(), to.clone()));
-        }
-        Ok(())
-    }
-
-    fn relink_entries(&self, map: &HashMap<PathBuf, PathBuf>) -> Result<Vec<ImageInfo>> {
-        if map.is_empty() {
-            return Ok(self.images());
-        }
-        let mut state = self.state.lock();
-        let mut entries = std::mem::take(&mut state.entries);
-        for entry in &mut entries {
-            let Some(target) = map.get(&entry.path) else { continue };
-            let old_path = entry.path.clone();
-            let old_rel = entry.rel_path.clone();
-            let old_base = rel_key(&self.root, &old_path)?;
-            let suffix = old_rel.strip_prefix(&old_base).unwrap_or("");
-            let new_rel = format!("{}{suffix}", rel_key(&self.root, target)?);
-            entry.path = target.clone();
-            entry.info.path = target.clone();
-            entry.info.file_name = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            entry.rel_path = new_rel.clone();
-            state.catalog.remove(&old_rel);
-            state.catalog.upsert(entry_record(&entry.info, new_rel.clone()));
-            if let Some(store) = &self.store {
-                store.save_adjustments(&new_rel, &entry.adjustments)?;
-                store.remove_adjustments(&old_rel)?;
-            }
-        }
-        state.entries = entries;
-        state.sources.clear();
-        state.ai_inputs.clear();
-        state.native_raw = None;
-        // Ids were reassigned, so every pin would point at the wrong image.
-        state.source_cache.pins.clear();
-        state.source_cache.recent.clear();
-        state.source_cache.current_bytes = 0;
-        state.preview = PreviewCache::default();
-        if let Some(store) = &self.store {
-            store.save_index(&state.catalog)?;
-        }
-        Ok(state.entries.iter().map(|entry| entry.info.clone()).collect())
+        self.library().manage_library(action)
     }
 }
 
 #[cfg(windows)]
-fn recycle_paths(paths: &[PathBuf]) -> Result<()> {
+pub(super) fn recycle_paths(paths: &[PathBuf]) -> Result<()> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 
@@ -626,13 +311,14 @@ fn recycle_paths(paths: &[PathBuf]) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn recycle_paths(_paths: &[PathBuf]) -> Result<()> {
+pub(super) fn recycle_paths(_paths: &[PathBuf]) -> Result<()> {
     bail!("Recycle Bin is Windows-only; pass permanent = true to delete explicitly")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ImageEngine;
 
     struct Fixture(PathBuf);
 
@@ -695,6 +381,25 @@ mod tests {
         let engine = crate::MockEngine::new();
         assert!(engine.library_root().is_none());
         assert!(engine.manage_files(LibraryAction::CreateFolder { path: "new".into() }).is_err());
+    }
+
+    #[test]
+    fn library_service_delegates_manage_files() {
+        let fixture = Fixture::new("service");
+        fixture.image("a.png");
+        fixture.folder("dest");
+        let engine = FileEngine::open(&fixture.0).unwrap();
+        // Use the engine's canonical root so the macOS `/var` -> `/private/var`
+        // symlink does not trip the inside-root check.
+        let root = engine.library_root().unwrap();
+        let id = engine.images()[0].id;
+        let moved = engine
+            .library()
+            .manage_library(LibraryAction::Move { images: vec![id], destination: root.join("dest") })
+            .unwrap();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(engine.images()[0].path, root.join("dest/a.png"));
+        assert!(root.join("dest/a.png").is_file());
     }
 
     #[test]

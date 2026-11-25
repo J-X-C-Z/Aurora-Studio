@@ -402,7 +402,7 @@ pub fn editor(state: &Entity<AppState>, id: &'static str, height: f32, window: &
     let g = s.node_graph();
     let selected = s.selected_node();
     let order = g.render_order();
-    let image = s.current.map(|c| c.0).unwrap_or(0);
+    let image = s.library.current.map(|c| c.0).unwrap_or(0);
 
     // Refit when the image or the graph's shape changes.
     let shape_key = (image, g.nodes.len(), g.links.len(), size[0] as u32);
@@ -646,7 +646,7 @@ pub fn editor(state: &Entity<AppState>, id: &'static str, height: f32, window: &
 /// The row of node commands above the editor.
 pub fn toolbar(state: &Entity<AppState>, docked: bool, cx: &App) -> impl IntoElement + use<> {
     let p = pal(cx).clone();
-    let has_image = state.read(cx).current.is_some();
+    let has_image = state.read(cx).library.current.is_some();
     let add = |how: NewNode| {
         let st = state.clone();
         Button::new(SharedString::from(format!("node-add-{how:?}")))

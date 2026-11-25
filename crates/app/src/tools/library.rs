@@ -46,11 +46,11 @@ fn kind_icon(k: CollectionKind) -> IconName {
 fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = pal(cx).clone();
     let s = state.read(cx);
-    let active = s.active_collection == c.id;
+    let active = s.library.active_collection == c.id;
     let count = s.collection_count(c.id);
     let children: Vec<CollNode> = s.child_nodes(Some(c.id)).into_iter().cloned().collect();
     let has_children = !children.is_empty();
-    let selection: Vec<ImageId> = s.selection.iter().copied().collect();
+    let selection: Vec<ImageId> = s.library.selection.iter().copied().collect();
     let open_state = window.use_keyed_state(SharedString::from(format!("coll-open-{}", c.id)), cx, |_, _| true);
     let open = *open_state.read(cx);
     let progress = motion::toggle(motion::key(format!("coll-{}", c.id), "open"), open, motion::PANEL, window, cx);
@@ -221,8 +221,8 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
     let s = state.read(cx);
     let p = pal(cx).clone();
     let f = s.filter.clone();
-    let counts: Vec<usize> = (-1..=5).map(|r| s.images.iter().filter(|i| i.rating == r).count()).collect();
-    let tag_counts: Vec<usize> = ColorTag::ALL.iter().map(|t| s.images.iter().filter(|i| i.color_tag == *t).count()).collect();
+    let counts: Vec<usize> = (-1..=5).map(|r| s.library.images.iter().filter(|i| i.rating == r).count()).collect();
+    let tag_counts: Vec<usize> = ColorTag::ALL.iter().map(|t| s.library.images.iter().filter(|i| i.color_tag == *t).count()).collect();
     let (st, st2, st3) = (state.clone(), state.clone(), state.clone());
     let search = text_field(
         "lib-search",
@@ -312,13 +312,13 @@ fn filters_panel(state: &Entity<AppState>, window: &mut Window, cx: &mut App) ->
 fn catalog_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let p = pal(cx).clone();
-    let total = s.images.len();
-    let edited = s.images.iter().filter(|i| i.has_adjustments).count();
-    let bytes: u64 = s.images.iter().map(|i| i.file_size).sum();
-    let picked = s.images.iter().filter(|i| i.rating >= 4).count();
+    let total = s.library.images.len();
+    let edited = s.library.images.iter().filter(|i| i.has_adjustments).count();
+    let bytes: u64 = s.library.images.iter().map(|i| i.file_size).sum();
+    let picked = s.library.images.iter().filter(|i| i.rating >= 4).count();
     let line = |k: &'static str, v: String| h_flex().px_3().h(px(20.0)).text_xs().child(div().flex_1().text_color(p.text_subtle).child(k)).child(div().text_color(p.text_muted).child(v));
     ToolPanel::new(state, "catalog", t("Catalog", "目录"))
-        .child(line(t("Collection", "当前集合"), s.active_collection_name.to_string()))
+        .child(line(t("Collection", "当前集合"), s.library.active_collection_name.to_string()))
         .child(line(t("Images", "图像"), format!("{total}")))
         .child(line(t("Edited", "已编辑"), format!("{edited}")))
         .child(line(t("Rated 4★+", "4 星及以上"), format!("{picked}")))

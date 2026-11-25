@@ -82,7 +82,7 @@ impl AppState {
     }
 
     fn edited(&self, id: ImageId) -> bool {
-        self.edits.get(&id).is_some_and(|e| !e.adj.is_default())
+        self.editor.edits.get(&id).is_some_and(|e| !e.adj.is_default())
     }
 
     /// Images in a collection; `None` means every image outside the trash.
@@ -91,17 +91,17 @@ impl AppState {
         if let Some(m) = &node.members {
             return Some(m.clone());
         }
-        let all = || self.images.iter().map(|i| i.id);
+        let all = || self.library.images.iter().map(|i| i.id);
         match node.kind {
             CollectionKind::AllImages => None,
-            CollectionKind::RecentImports => (!self.recent_imports.is_empty()).then(|| self.recent_imports.clone()),
-            CollectionKind::RecentCaptures => Some(self.recent_captures.clone()),
-            CollectionKind::Trash => Some(self.trash.clone()),
+            CollectionKind::RecentImports => (!self.library.recent_imports.is_empty()).then(|| self.library.recent_imports.clone()),
+            CollectionKind::RecentCaptures => Some(self.library.recent_captures.clone()),
+            CollectionKind::Trash => Some(self.library.trash.clone()),
             CollectionKind::Album => Some(BTreeSet::new()),
             CollectionKind::Folder => {
                 let path = node.path.clone().unwrap_or_default().replace('\\', "/");
                 Some(
-                    self.images
+                    self.library.images
                         .iter()
                         .filter(|i| i.path.to_string_lossy().replace('\\', "/").starts_with(&path))
                         .map(|i| i.id)
@@ -113,7 +113,7 @@ impl AppState {
                     return Some(BTreeSet::new());
                 }
                 Some(
-                    self.images
+                    self.library.images
                         .iter()
                         .filter(|i| {
                             let edited = self.edited(i.id);
@@ -144,9 +144,9 @@ impl AppState {
         match self.members(id) {
             Some(m) => {
                 let trash = self.node(id).is_some_and(|n| n.kind == CollectionKind::Trash);
-                m.iter().filter(|i| trash || !self.trash.contains(i)).count()
+                m.iter().filter(|i| trash || !self.library.trash.contains(i)).count()
             }
-            None => self.images.iter().filter(|i| !self.trash.contains(&i.id)).count(),
+            None => self.library.images.iter().filter(|i| !self.library.trash.contains(&i.id)).count(),
         }
     }
 
@@ -195,18 +195,18 @@ impl AppState {
             rules: if kind == CollectionKind::SmartAlbum { vec![SmartRule::RatingAtLeast(4)] } else { Vec::new() },
             match_all: true,
         });
-        self.active_collection = id;
+        self.library.active_collection = id;
         self.persist_collections(cx);
         id
     }
 
     /// Shows a collection in the browser and keeps the viewer on one of its images.
     pub fn set_active_collection(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.active_collection = id;
-        self.active_collection_name = self.node(id).map(|n| if n.user { n.name.clone() } else { crate::i18n::builtin(&n.name) }).unwrap_or_default().into();
+        self.library.active_collection = id;
+        self.library.active_collection_name = self.node(id).map(|n| if n.user { n.name.clone() } else { crate::i18n::builtin(&n.name) }).unwrap_or_default().into();
         let visible: Vec<ImageId> = self.visible_images().iter().map(|i| i.id).collect();
         if let Some(first) = visible.first()
-            && !self.current.is_some_and(|c| visible.contains(&c))
+            && !self.library.current.is_some_and(|c| visible.contains(&c))
         {
             self.select(*first, false, false, cx);
         }
@@ -229,8 +229,8 @@ impl AppState {
             i += 1;
         }
         self.nodes.retain(|n| !(n.user && doomed.contains(&n.id)));
-        if doomed.contains(&self.active_collection) {
-            self.active_collection = 1;
+        if doomed.contains(&self.library.active_collection) {
+            self.library.active_collection = 1;
         }
         self.persist_collections(cx);
     }
@@ -265,26 +265,26 @@ impl AppState {
 
     /// Moves the selection to the trash, or restores it when viewing the trash.
     pub fn toggle_trash_selection(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<ImageId> = self.selection.iter().copied().collect();
+        let ids: Vec<ImageId> = self.library.selection.iter().copied().collect();
         if ids.is_empty() {
             return;
         }
-        let restoring = ids.iter().all(|i| self.trash.contains(i));
+        let restoring = ids.iter().all(|i| self.library.trash.contains(i));
         if let Err(err) = self.engine.set_trashed(&ids, !restoring) {
             self.notify(err.to_string(), cx);
             return;
         }
         for id in &ids {
             if restoring {
-                self.trash.remove(id);
+                self.library.trash.remove(id);
             } else {
-                self.trash.insert(*id);
+                self.library.trash.insert(*id);
             }
         }
         let msg = if restoring { t("restored from trash", "已从废纸篓恢复") } else { t("moved to trash", "已移到废纸篓") };
         self.notify(format!("{} {msg}", ids.len()), cx);
         if !restoring {
-            self.selection.clear();
+            self.library.selection.clear();
             if let Some(next) = self.visible_images().first().map(|i| i.id) {
                 self.select(next, false, false, cx);
             }
@@ -293,17 +293,17 @@ impl AppState {
     }
 
     pub fn empty_trash(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<ImageId> = self.trash.iter().copied().collect();
-        self.images.retain(|i| !self.trash.contains(&i.id));
+        let ids: Vec<ImageId> = self.library.trash.iter().copied().collect();
+        self.library.images.retain(|i| !self.library.trash.contains(&i.id));
         for id in &ids {
-            self.edits.remove(id);
-            if let Some(img) = self.thumbs.remove(id) {
+            self.editor.edits.remove(id);
+            if let Some(img) = self.preview_state.thumbs.remove(id) {
                 cx.drop_image(img, None);
             }
         }
-        self.trash.clear();
-        if self.current.is_some_and(|c| ids.contains(&c)) {
-            self.current = None;
+        self.library.trash.clear();
+        if self.library.current.is_some_and(|c| ids.contains(&c)) {
+            self.library.current = None;
             if let Some(next) = self.visible_images().first().map(|i| i.id) {
                 self.select(next, false, false, cx);
             }

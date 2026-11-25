@@ -517,6 +517,54 @@ pub trait ImageEngine: Send + Sync + 'static {
         }
         Ok(())
     }
+    /// Persists a multi-image adjustment edit and reports every document.
+    ///
+    /// Unlike [`Self::save_adjustments_batch`], a partially failed batch keeps
+    /// its per-document results instead of collapsing to one error: the caller
+    /// can distinguish "written", "refused by the disk" and "superseded by a
+    /// newer save". The default implementation is the single-document path;
+    /// engines that commit a batch (a real catalog) override it.
+    fn save_adjustments_batch_report(
+        &self,
+        items: &[(ImageId, AdjustmentSet)],
+    ) -> crate::SaveReport {
+        let documents = items
+            .iter()
+            .map(|(image, adjustments)| match self.save_adjustments(*image, adjustments) {
+                Ok(()) => crate::DocumentSaveResult::saved(*image, String::new()),
+                Err(error) => {
+                    crate::DocumentSaveResult::failed(*image, String::new(), format!("{error:#}"))
+                }
+            })
+            .collect();
+        crate::SaveReport::new(documents, None)
+    }
+    /// Queues a multi-image edit for the engine's bounded single-writer save
+    /// queue, returning per-image submit results.
+    ///
+    /// The in-memory edit is applied before the queue is consulted, so the
+    /// user's latest content is visible even when the queue is full or closed.
+    /// Engines without a queue return `None`; the caller then uses
+    /// [`Self::save_adjustments_batch_report`].
+    fn save_adjustments_queued(
+        &self,
+        _items: &[(ImageId, AdjustmentSet)],
+    ) -> Option<crate::QueuedSaveSummary> {
+        None
+    }
+    /// Waits up to `timeout` for queued saves and reports what reached disk.
+    ///
+    /// `None` means this engine has no queue (the synchronous path owns saving).
+    fn flush_pending_saves(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> Option<crate::FlushReport> {
+        None
+    }
+    /// Cheap snapshot of the save queue, or `None` without a queue.
+    fn pending_save_status(&self) -> Option<crate::QueueStatus> {
+        None
+    }
     /// Creates a new variant of `image` with the given adjustments; returns its info.
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo>;
 

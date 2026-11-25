@@ -32,7 +32,7 @@ fn overlay_look(dst: &mut AdjustmentSet, look: &AdjustmentSet) {
 impl AppState {
     /// One image's change with its own undo step, for results that differ per image.
     pub(crate) fn edit_image(&mut self, id: ImageId, label: impl Into<gpui_kit::SharedString>, f: impl FnOnce(&mut AdjustmentSet), cx: &mut Context<Self>) {
-        let edit = self.edits.entry(id).or_default();
+        let edit = self.editor.edits.entry(id).or_default();
         let before = edit.adj.clone();
         f(&mut edit.adj);
         if before != edit.adj {
@@ -43,22 +43,22 @@ impl AppState {
     }
 
     fn selected_ids(&self) -> Vec<ImageId> {
-        let mut ids: Vec<ImageId> = self.images.iter().map(|i| i.id).filter(|id| self.selection.contains(id)).collect();
+        let mut ids: Vec<ImageId> = self.library.images.iter().map(|i| i.id).filter(|id| self.library.selection.contains(id)).collect();
         if ids.is_empty() {
-            ids.extend(self.current);
+            ids.extend(self.library.current);
         }
         ids
     }
 
     fn start_analysis(&mut self, what: &str, count: usize, cx: &mut Context<Self>) -> bool {
-        if self.analysing {
+        if self.tasks.analysing {
             self.notify(t("Another analysis is still running", "另一项分析仍在进行"), cx);
             return false;
         }
         if count == 0 {
             return false;
         }
-        self.analysing = true;
+        self.tasks.analysing = true;
         self.notify(format!("{what} · {count} {}", t("images…", "张…")), cx);
         true
     }
@@ -82,7 +82,7 @@ impl AppState {
                 cx.background_spawn(async move { ids.into_iter().map(|id| (id, engine.eye_report(id))).collect() }).await;
             this.update(cx, |this, cx| {
                 if verbose {
-                    this.analysing = false;
+                    this.tasks.analysing = false;
                 }
                 let (mut closed, mut faces, mut first_err) = (0, 0, None);
                 for (id, r) in results {
@@ -126,7 +126,7 @@ impl AppState {
             let results: Vec<(ImageId, anyhow::Result<u16>)> =
                 cx.background_spawn(async move { ids.into_iter().map(|id| (id, engine.auto_rotate(id))).collect() }).await;
             this.update(cx, |this, cx| {
-                this.analysing = false;
+                this.tasks.analysing = false;
                 let (mut turned, mut upright, mut first_err) = (0, 0, None);
                 for (id, r) in results {
                     match r.map(quarter_turns) {
@@ -147,7 +147,7 @@ impl AppState {
                 if let Some(err) = first_err {
                     msg = if turned + upright == 0 { format!("{}: {err}", t("Auto rotation unavailable", "自动旋转不可用")) } else { format!("{msg} · {err}") };
                 }
-                this.preview.before_dirty = true;
+                this.preview_state.preview.before_dirty = true;
                 this.request_render(super::RenderQuality::Final, cx);
                 this.notify(msg, cx);
             })
@@ -159,7 +159,7 @@ impl AppState {
     /// Match Look: the pinned compare variant (or else the current image) is the
     /// reference; every other selected image moves toward it.
     pub fn match_look_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(reference) = self.view.compare_variant.filter(|id| self.info(*id).is_some()).or(self.current) else { return };
+        let Some(reference) = self.prefs.view.compare_variant.filter(|id| self.info(*id).is_some()).or(self.library.current) else { return };
         let targets: Vec<ImageId> = self.selected_ids().into_iter().filter(|id| *id != reference).collect();
         if targets.is_empty() {
             self.notify(t("Select the images to match, with the reference as the current image or pinned compare variant", "请选择要匹配的图像，并把参考图设为当前图像或对比变体"), cx);
@@ -173,7 +173,7 @@ impl AppState {
             let results: Vec<(ImageId, anyhow::Result<aurora_engine::MatchLook>)> =
                 cx.background_spawn(async move { targets.into_iter().map(|id| (id, engine.match_look(reference, id))).collect() }).await;
             this.update(cx, |this, cx| {
-                this.analysing = false;
+                this.tasks.analysing = false;
                 let (mut matched, mut residual, mut first_err) = (0, 0.0f32, None);
                 for (id, r) in results {
                     match r {
@@ -194,7 +194,7 @@ impl AppState {
                 if let Some(err) = first_err {
                     msg = format!("{msg}: {err}");
                 }
-                this.preview.before_dirty = true;
+                this.preview_state.preview.before_dirty = true;
                 this.request_render(super::RenderQuality::Final, cx);
                 this.notify(msg, cx);
             })

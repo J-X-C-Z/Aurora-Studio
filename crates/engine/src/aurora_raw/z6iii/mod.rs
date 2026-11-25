@@ -1,6 +1,13 @@
 //! Neutral Z6III HE export, with a Windows desktop route for compatible recipes.
+//!
+//! Colour, CPU reconstruction, the 16-bit geometry stage and the linear CPU
+//! finish helpers are platform-neutral and compile everywhere. The desktop
+//! exporter and the System32 OpenCL pipeline keep their Windows/product gate.
+
+#![cfg_attr(not(all(windows, feature = "z6iii-raw-export")), allow(dead_code, unused_imports))]
 
 mod color;
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
 pub(crate) mod desktop;
 pub(crate) mod geometry16;
 mod reconstruct;
@@ -9,11 +16,14 @@ mod render;
 pub use color::{StageTrace, Z6iiiColorStage};
 pub(in crate::aurora_raw) use render::{
     apply_linear_chromatic_aberration, apply_linear_color_noise_2012,
-    recover_and_antialias_frame,
 };
 pub(crate) use reconstruct::is_verified_he_nef;
+#[cfg(windows)]
+pub(in crate::aurora_raw) use render::recover_and_antialias_frame;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::{Context, ensure};
 use std::io::{Seek, Write};
 
 pub struct ExportAssets<'a> {
@@ -50,6 +60,7 @@ impl Frame {
     }
 }
 
+#[cfg(windows)]
 pub fn render(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Frame> {
     ensure!(reconstruct::is_z6iii_nef(nef), "expected a Nikon Z6III NEF");
     let orientation = crate::raw::exif_orientation_bytes(nef).unwrap_or(1);
@@ -60,6 +71,7 @@ pub fn render(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Frame> {
 }
 
 /// Whether this machine exposes an OpenCL device the Z6III pipeline can use.
+#[cfg(windows)]
 pub(crate) fn opencl_available() -> bool {
     reconstruct::gpu_available()
 }
@@ -71,6 +83,7 @@ pub(crate) fn opencl_available() -> bool {
 /// The returned route distinguishes "not this file", "no OpenCL device" and
 /// "device present but the reconstruction failed", so callers can record why a
 /// frame did or did not come from OpenCL.
+#[cfg(windows)]
 pub(in crate::aurora_raw) fn render_linear_rgba16_traced(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
@@ -91,6 +104,7 @@ pub(in crate::aurora_raw) fn render_linear_rgba16_traced(
     }
 }
 
+#[cfg(windows)]
 pub(in crate::aurora_raw) fn render_linear_rgba16(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,

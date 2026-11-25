@@ -8,7 +8,16 @@ use serde::{Deserialize, Serialize};
 
 /// All adjustments applied to one image variant: the background layer's
 /// global settings plus the local adjustment layers stacked above it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `PartialEq` is implemented by hand, not derived: it is the *document*
+/// identity used by undo/redo and by "is this image edited?" checks, so it
+/// compares every persistent field. Per-job runtime inputs (such as the
+/// portrait producer bundle) are not fields of this struct at all; they live in
+/// `crate::document::RuntimeInputs`, so they cannot influence equality or make a
+/// render job look like an undo step. Use
+/// `crate::document::document_fingerprint` when a hash of the same identity is
+/// needed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdjustmentSet {
     pub base: BaseCharacteristics,
@@ -50,14 +59,61 @@ pub struct AdjustmentSet {
     /// Engines ignore keys they do not render.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extra: std::collections::BTreeMap<String, f32>,
-    /// Ephemeral producer bytes for this exact render job. Never persisted.
-    #[serde(skip)]
-    pub portrait_producer_inputs:
-        Option<std::sync::Arc<crate::portrait_stage::ProducerInputs>>,
+    /// Unknown top-level keys read from a saved document, preserved verbatim so
+    /// a vendor extension written by another tool survives load/save. Known
+    /// typed fields never land here. Do not insert a key that collides with a
+    /// typed field: serialization would emit it twice. This is document data, so
+    /// it participates in equality and in `document_fingerprint`.
+    ///
+    /// A legacy or foreign key named `portrait_producer_inputs` can only arrive
+    /// this way (the old field was `#[serde(skip)]`, so this build never wrote
+    /// it); it is preserved verbatim and cannot break loading.
+    #[serde(flatten, default)]
+    pub extensions: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl PartialEq for AdjustmentSet {
+    fn eq(&self, other: &Self) -> bool {
+        // Every persistent field participates. Per-job runtime inputs are not
+        // fields of this struct: they live in `crate::document::RuntimeInputs`.
+        // `uniform_light_grid`, `Geometry::distortion` and
+        // `Geometry::optical_center` are `#[serde(skip)]`, but they are still
+        // compared here to keep this change minimal; migrating them out of the
+        // document struct is the next extraction step.
+        self.base == other.base
+            && self.white_balance == other.white_balance
+            && self.exposure == other.exposure
+            && self.hdr == other.hdr
+            && self.levels == other.levels
+            && self.curves == other.curves
+            && self.clarity == other.clarity
+            && self.dehaze == other.dehaze
+            && self.vignetting == other.vignetting
+            && self.color_balance == other.color_balance
+            && self.color_balance_gains == other.color_balance_gains
+            && self.color_editor == other.color_editor
+            && self.black_white == other.black_white
+            && self.sharpening == other.sharpening
+            && self.noise_reduction == other.noise_reduction
+            && self.film_grain == other.film_grain
+            && self.moire == other.moire
+            && self.lens == other.lens
+            && self.geometry == other.geometry
+            && self.spots == other.spots
+            && self.retouch == other.retouch
+            && self.layers == other.layers
+            && self.nodes == other.nodes
+            && self.style == other.style
+            && self.extra == other.extra
+            && self.extensions == other.extensions
+    }
 }
 
 impl AdjustmentSet {
     /// True when nothing differs from a freshly imported image.
+    ///
+    /// Per-job runtime inputs are not part of the document (see
+    /// `crate::document::RuntimeInputs`), so they cannot affect this.
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -1509,7 +1565,7 @@ impl CaFringing {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LensCorrection {
     /// Lens profile name; `None` is the engine's generic profile.
@@ -1567,6 +1623,40 @@ pub struct LensCorrection {
     /// Camera mount, so the manufacturer curves have a half diagonal to
     /// normalize against.
     pub mount: Option<String>,
+}
+
+impl PartialEq for LensCorrection {
+    /// Document identity: every persisted field participates; the
+    /// sidecar-rehydrated `uniform_light_grid` is runtime calibration data and
+    /// is excluded so two documents with the same stored edits compare equal.
+    fn eq(&self, other: &Self) -> bool {
+        self.profile == other.profile
+            && self.use_profile == other.use_profile
+            && self.distortion == other.distortion
+            && self.sharpness_falloff == other.sharpness_falloff
+            && self.radial_blur == other.radial_blur
+            && self.light_falloff == other.light_falloff
+            && self.uniform_light == other.uniform_light
+            && self.uniform_light_enabled == other.uniform_light_enabled
+            && self.dust_removal_enabled == other.dust_removal_enabled
+            && self.dust_patches == other.dust_patches
+            && self.dust_gain == other.dust_gain
+            && self.chromatic_aberration == other.chromatic_aberration
+            && self.ca_red_points == other.ca_red_points
+            && self.ca_blue_points == other.ca_blue_points
+            && self.ca_origin == other.ca_origin
+            && self.ca_fringing == other.ca_fringing
+            && self.purple_fringing == other.purple_fringing
+            && self.diffraction_enabled == other.diffraction_enabled
+            && self.aperture == other.aperture
+            && self.hide_distorted_areas == other.hide_distorted_areas
+            && self.optic_center == other.optic_center
+            && self.shift_x == other.shift_x
+            && self.shift_y == other.shift_y
+            && self.tilt == other.tilt
+            && self.manufacturer == other.manufacturer
+            && self.mount == other.mount
+    }
 }
 
 /// Capture One's sharpness-falloff curves, `ZLENSRADIALBLUR` fields 1 and 2.
@@ -1747,7 +1837,7 @@ impl Keystone {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Geometry {
     /// Fine rotation, -45 ..= 45 degrees.
@@ -1776,6 +1866,24 @@ pub struct Geometry {
     /// `ZLENSOPTICCENTER` in source pixels; only read when `distortion` is set.
     #[serde(skip)]
     pub optical_center: [f32; 2],
+}
+
+impl PartialEq for Geometry {
+    /// Document identity: the persisted crop/rotation/keystone fields compare;
+    /// `distortion` and `optical_center` are rehydrated lens calibration and
+    /// belong to the runtime context, not to the saved document.
+    fn eq(&self, other: &Self) -> bool {
+        self.rotation == other.rotation
+            && self.orientation == other.orientation
+            && self.flip_horizontal == other.flip_horizontal
+            && self.flip_vertical == other.flip_vertical
+            && self.crop_outside_image == other.crop_outside_image
+            && self.crop == other.crop
+            && self.canvas == other.canvas
+            && self.aspect == other.aspect
+            && self.portrait == other.portrait
+            && self.keystone == other.keystone
+    }
 }
 
 impl Default for Geometry {
@@ -2317,5 +2425,96 @@ mod tests {
         assert_eq!(g.diameter_px(), 0.0);
         let text = serde_json::to_string(&AdjustmentSet::default()).expect("serializes");
         assert!(!text.contains("\"density\""), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod unknown_field_tests {
+    use super::AdjustmentSet;
+
+    #[test]
+    fn unknown_top_level_keys_round_trip_verbatim() {
+        let json = r#"{
+            "exposure": {"ev": 1.0},
+            "VendorWidget": {"gain": 0.5, "note": "keep me"},
+            "pc:99999": 3.0
+        }"#;
+        let set: AdjustmentSet = serde_json::from_str(json).expect("legacy document");
+        assert!(set.extensions.contains_key("VendorWidget"));
+        assert!(set.extensions.contains_key("pc:99999"));
+        assert!(!set.extensions.contains_key("exposure"));
+
+        let out = serde_json::to_value(&set).expect("serialize");
+        assert_eq!(out["VendorWidget"]["gain"], 0.5);
+        assert_eq!(out["VendorWidget"]["note"], "keep me");
+        assert_eq!(out["pc:99999"], 3.0);
+        assert!(out.get("extensions").is_none(), "must flatten, not nest");
+    }
+
+    /// The old in-memory `portrait_producer_inputs` field was `#[serde(skip)]`,
+    /// so no file this build wrote ever carried the key. A legacy/foreign file
+    /// that does is still loadable: the unknown key lands in `extensions` and
+    /// cannot fail the parse.
+    #[test]
+    fn foreign_producer_key_loads_as_an_extension() {
+        let json = r#"{
+            "exposure": {"exposure": 0.25},
+            "portrait_producer_inputs": {"job": 7}
+        }"#;
+        let set: AdjustmentSet = serde_json::from_str(json).expect("foreign key must not break load");
+        assert_eq!(set.exposure.exposure, 0.25);
+        assert_eq!(set.extensions.get("portrait_producer_inputs").and_then(|v| v.get("job")), Some(&serde_json::json!(7)));
+        let out = serde_json::to_value(&set).expect("serialize");
+        assert_eq!(out["portrait_producer_inputs"]["job"], 7);
+    }
+
+    #[test]
+    fn known_fields_never_duplicate_into_extensions() {
+        let set: AdjustmentSet =
+            serde_json::from_str(r#"{"style": "Warm", "extra": {"pc:108": 2.0}}"#).unwrap();
+        assert_eq!(set.style.as_deref(), Some("Warm"));
+        assert_eq!(set.extra.get("pc:108"), Some(&2.0));
+        assert!(set.extensions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::{Geometry, LensCorrection};
+
+    #[test]
+    fn geometry_equality_ignores_rehydrated_lens_calibration() {
+        let mut a = Geometry::default();
+        let mut b = Geometry::default();
+        b.distortion = crate::c1_model::crop_limit::RadialCurve {
+            v: vec![1.0],
+            x: vec![0.0],
+            m: vec![],
+        };
+        b.optical_center = [12.0, 34.0];
+        assert_eq!(a, b, "lens calibration is runtime, not document identity");
+
+        a.rotation = 1.5;
+        assert_ne!(a, b, "persisted geometry must still compare");
+    }
+
+    #[test]
+    fn lens_equality_ignores_the_sidecar_grid() {
+        let mut a = LensCorrection::default();
+        let mut b = LensCorrection::default();
+        b.uniform_light_grid = Some(std::sync::Arc::new(crate::dust_lcc::LightFalloff {
+            header: vec![1, 2],
+            columns: 1,
+            rows: 1,
+            nodes: vec![crate::dust_lcc::LightFalloffNode {
+                luminance: 1000,
+                dx: 0,
+                dy: 0,
+            }],
+        }));
+        assert_eq!(a, b, "the LCC grid is runtime calibration");
+
+        a.uniform_light = 50.0;
+        assert_ne!(a, b, "the persisted amount must still compare");
     }
 }

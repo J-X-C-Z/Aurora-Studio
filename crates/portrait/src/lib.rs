@@ -8,6 +8,7 @@
 //! CPU kernels have no windowing dependency and stay testable headless.
 
 pub mod capability_registry;
+pub mod effect_descriptor;
 pub mod kernels;
 pub mod model_sha256;
 pub mod plump_session;

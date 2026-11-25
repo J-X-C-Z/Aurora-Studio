@@ -310,9 +310,9 @@ fn portrait_amount_binding(key: &'static str, default: f32) -> Binding {
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let s = state.read(cx);
-    let raw_query = s.panels.portrait_query.clone();
+    let raw_query = s.prefs.panels.portrait_query.clone();
     let query = raw_query.trim().to_lowercase();
-    let show_all = s.panels.portrait_open;
+    let show_all = s.prefs.panels.portrait_open;
     let p = pal(cx).clone();
 
     let retouch: Vec<&'static str> =
@@ -323,7 +323,7 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
     let st = state.clone();
     let search = text_field("portrait-search", raw_query, t("Search all parameters…", "搜索全部参数…"), move |q, _, cx| {
         st.update(cx, |s, cx| {
-            s.panels.portrait_query = q;
+            s.prefs.panels.portrait_query = q;
             cx.notify();
         })
     }, window, cx);
@@ -374,7 +374,7 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                 .text(format!("{} · {}", t("All", "全部"), WIRED_TOTAL + stored_total))
                 .on_select(move |i, _, cx| {
                     st.update(cx, |s, cx| {
-                        s.panels.portrait_open = i == 1;
+                        s.prefs.panels.portrait_open = i == 1;
                         cx.notify();
                     })
                 }),
@@ -614,7 +614,7 @@ fn makeup_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
 /// both sides; unlinked, each side has its own slider under the pair's name.
 fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
     let s = state.read(cx);
-    let linked = s.panels.portrait_link_lr;
+    let linked = s.prefs.panels.portrait_link_lr;
     let pairs: Vec<_> = WIRED_FACE_GEOMETRY_EFFECTS
         .chunks(2)
         .zip(FACE_PAIRS)
@@ -666,7 +666,7 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
                 if linked { IconName::Link } else { IconName::Unlink },
                 if linked { t("Left and right move together — click to adjust each side", "左右联动 · 单击分别调整左右") } else { t("Sides adjust separately — click to link them", "左右分别调整 · 单击联动") },
                 move |_, cx| st_link.update(cx, |s, cx| {
-                    s.panels.portrait_link_lr = !s.panels.portrait_link_lr;
+                    s.prefs.panels.portrait_link_lr = !s.prefs.panels.portrait_link_lr;
                     cx.notify();
                 }),
             )
@@ -776,7 +776,7 @@ fn band_panel(state: &Entity<AppState>, band: &'static Band, query: &str, cx: &A
         return div().into_any_element();
     }
     // While searching, show hits even in a closed band; otherwise build rows only when open.
-    let open = !query.is_empty() || !s.panels.collapsed.contains(band.id);
+    let open = !query.is_empty() || !s.prefs.panels.collapsed.contains(band.id);
     let st = state.clone();
     let mut panel = ToolPanel::new(state, band.id, band.title())
         .status(band_status(band))

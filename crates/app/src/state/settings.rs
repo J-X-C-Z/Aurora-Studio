@@ -11,6 +11,42 @@ use serde::{Deserialize, Serialize};
 use super::{BrowserMode, ToolTab};
 use crate::i18n::t;
 
+/// Where the display-profile lookup should look.
+///
+/// Windows resolves the monitor under the window's handle with the same ICM
+/// calls as before; other platforms treat every target as a no-op. `None`
+/// carries no handle (before the first prepaint, or off Windows), so the
+/// Windows path keeps its primary-display fallback exactly as a `0` handle did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DisplayTarget {
+    /// The monitor under this native window handle.
+    Window(isize),
+    /// No window handle yet.
+    #[default]
+    None,
+}
+
+impl DisplayTarget {
+    /// A target for `hwnd`; a null handle means no window yet.
+    pub fn from_handle(hwnd: isize) -> Self {
+        if hwnd == 0 { DisplayTarget::None } else { DisplayTarget::Window(hwnd) }
+    }
+
+    /// The native handle, when there is one.
+    pub fn handle(self) -> Option<isize> {
+        match self {
+            DisplayTarget::Window(hwnd) => Some(hwnd),
+            DisplayTarget::None => None,
+        }
+    }
+
+    /// The handle to pass to the Windows ICM calls; `0` (primary display) when
+    /// there is no window, matching the former plain `isize` field.
+    pub fn hwnd(self) -> isize {
+        self.handle().unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CropGuide {
     #[default]
@@ -132,11 +168,12 @@ pub fn display_profiles() -> Vec<PathBuf> {
     found
 }
 
-/// The ICC profile of the display: the monitor under `hwnd` on Windows (falling
-/// back to the primary display); the main display on macOS (ColorSync), because
-/// the app has no public handle to the display under its window. `None` on
-/// other platforms or on failure.
-pub fn detected_display_profile(hwnd: isize) -> Option<PathBuf> {
+/// The ICC profile of the display: the monitor under `target` on Windows
+/// (falling back to the primary display); the main display on macOS
+/// (ColorSync), because the app has no public handle to the display under its
+/// window. `None` on other platforms or on failure.
+pub fn detected_display_profile(target: DisplayTarget) -> Option<PathBuf> {
+    let hwnd = target.hwnd();
     #[cfg(windows)]
     {
         win_icm::current(hwnd)
@@ -160,7 +197,8 @@ pub struct DisplayProfileStatus {
     pub fallback: bool,
 }
 
-pub fn detected_display_profile_status(hwnd: isize) -> DisplayProfileStatus {
+pub fn detected_display_profile_status(target: DisplayTarget) -> DisplayProfileStatus {
+    let hwnd = target.hwnd();
     #[cfg(windows)]
     {
         let (path, fallback) = win_icm::status(hwnd);
@@ -874,6 +912,19 @@ impl Settings {
 #[cfg(test)]
 mod tab_tests {
     use super::*;
+
+    #[test]
+    fn display_target_round_trips_none_and_window() {
+        assert_eq!(DisplayTarget::None.handle(), None);
+        assert_eq!(DisplayTarget::None.hwnd(), 0);
+        assert_eq!(DisplayTarget::Window(42).handle(), Some(42));
+        assert_eq!(DisplayTarget::Window(42).hwnd(), 42);
+
+        assert_eq!(DisplayTarget::from_handle(0), DisplayTarget::None);
+        assert_eq!(DisplayTarget::from_handle(42), DisplayTarget::Window(42));
+        assert_eq!(DisplayTarget::from_handle(42).handle(), Some(42));
+        assert_eq!(DisplayTarget::default(), DisplayTarget::None);
+    }
 
     #[test]
     fn default_order_has_every_tab_once_with_quick_third() {

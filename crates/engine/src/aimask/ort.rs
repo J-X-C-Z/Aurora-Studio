@@ -972,7 +972,7 @@ impl Runtime {
         let handle = unsafe { load_library(&library)? };
         log::info!("ONNX Runtime from {}", library.display());
         let symbol = CString::new("OrtGetApiBase")?;
-        #[cfg(not(windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let get_base: unsafe extern "C" fn() -> *const OrtApiBase =
             unsafe { std::mem::transmute(dlsym(handle, symbol.as_ptr())) };
         #[cfg(windows)]
@@ -1068,7 +1068,7 @@ impl Runtime {
         let Ok(name) = CString::new(name) else {
             return ptr::null_mut();
         };
-        #[cfg(not(windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             unsafe { dlsym(self.handle, name.as_ptr()) }
         }
@@ -1914,6 +1914,22 @@ fn library_candidates_from(
                     .join("onnxruntime.dll"),
             );
         }
+    } else if cfg!(target_os = "macos") {
+        // Homebrew's `onnxruntime` and a bundle-local dylib. The versioned
+        // names match how the library is installed on Apple Silicon.
+        candidates.extend(
+            [
+                "libonnxruntime.1.23.0.dylib",
+                "libonnxruntime.1.23.dylib",
+                "libonnxruntime.1.dylib",
+                "libonnxruntime.dylib",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+        for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
+            candidates.push(PathBuf::from(prefix).join("libonnxruntime.dylib"));
+        }
     } else {
         #[cfg(target_os = "macos")]
         {
@@ -2025,7 +2041,7 @@ unsafe fn load_library(path: &Path) -> Result<*mut c_void> {
     Ok(handle)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 unsafe fn load_library(path: &Path) -> Result<*mut c_void> {
     let name = CString::new(path.as_os_str().to_string_lossy().as_bytes())?;
     let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };

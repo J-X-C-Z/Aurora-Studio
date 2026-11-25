@@ -46,11 +46,11 @@ pub const CURSOR_TOOLS: [CursorTool; 15] = [
 pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl IntoElement + use<> {
     let p = pal(cx).clone();
     let s = state.read(cx);
-    let has_image = s.current.is_some();
+    let has_image = s.library.current.is_some();
     let cursor = s.cursor;
-    let view = s.view.clone();
-    let zoom_pct = (s.effective_scale() / s.scale_factor.max(0.5) * 100.0).round();
-    let fit = s.zoom.scale.is_none();
+    let view = s.prefs.view.clone();
+    let zoom_pct = (s.effective_scale() / s.device.scale_factor.max(0.5) * 100.0).round();
+    let fit = s.preview_state.zoom.scale.is_none();
     let can_undo = s.can_undo();
     let camera_ready = s.camera_ready();
     let tether_note = s.tether_note();
@@ -65,7 +65,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
         Some(step) => format!("{} · {step}", t("Redo", "重做")),
         None => t("Redo", "重做").to_string(),
     };
-    let has_clip = s.clipboard.is_some();
+    let has_clip = s.editor.clipboard.is_some();
 
     let st = state.clone();
     let tool = move |tool: CursorTool| {
@@ -97,8 +97,8 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
                 menu = menu.item(PopupMenuItem::new(format!("{pct:.0}%")).checked(!fit && (zoom_pct - pct).abs() < 0.5).on_click(
                     move |_, _, cx| {
                         st.update(cx, |s, cx| {
-                            let sf = s.scale_factor;
-                            let c = s.zoom.center;
+                            let sf = s.device.scale_factor;
+                            let c = s.preview_state.zoom.center;
                             s.set_zoom(Some(pct / 100.0 * sf), Some(c), cx)
                         })
                     },
@@ -115,7 +115,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
             .active(view.browser == mode)
             .on_click(move |_, cx| {
                 st.update(cx, |s, cx| {
-                    s.view.browser = if s.view.browser == mode { BrowserMode::Hidden } else { mode };
+                    s.prefs.view.browser = if s.prefs.view.browser == mode { BrowserMode::Hidden } else { mode };
                     cx.notify();
                 })
             })
@@ -126,7 +126,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
         IconBtn::new(id, icon, tip).shortcut(key).active(on).on_click(move |_, cx| {
             st.update(cx, |s, cx| {
                 f(s);
-                s.preview.before_dirty = true;
+                s.preview_state.preview.before_dirty = true;
                 s.request_render(aurora_engine::RenderQuality::Final, cx);
                 cx.notify();
             })
@@ -193,14 +193,14 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
         .child(
             group(cx)
                 .child(view_toggle("tb-compare", IconName::Columns2, t("Before / after", "前后对比"), "Y", view.compare != CompareMode::Off, |s| {
-                    s.view.compare = if s.view.compare == CompareMode::Off { CompareMode::Split } else { CompareMode::Off }
+                    s.prefs.view.compare = if s.prefs.view.compare == CompareMode::Off { CompareMode::Split } else { CompareMode::Off }
                 }))
                 .child(view_toggle("tb-exposure", IconName::TriangleAlert, t("Exposure warning", "曝光警告"), "Alt+E", view.exposure_warning, |s| {
-                    s.view.exposure_warning = !s.view.exposure_warning
+                    s.prefs.view.exposure_warning = !s.prefs.view.exposure_warning
                 }))
-                .child(view_toggle("tb-focus", IconName::Focus, t("Focus mask", "焦点蒙版"), "", view.focus_mask, |s| s.view.focus_mask = !s.view.focus_mask))
-                .child(view_toggle("tb-grid", IconName::Grid3x3, t("Grid overlay", "网格叠加"), "Alt+G", view.grid, |s| s.view.grid = !s.view.grid))
-                .child(view_toggle("tb-proof", IconName::Frame, t("Proof margin", "校样边距"), "Alt+P", view.proof, |s| s.view.proof = !s.view.proof)),
+                .child(view_toggle("tb-focus", IconName::Focus, t("Focus mask", "焦点蒙版"), "", view.focus_mask, |s| s.prefs.view.focus_mask = !s.prefs.view.focus_mask))
+                .child(view_toggle("tb-grid", IconName::Grid3x3, t("Grid overlay", "网格叠加"), "Alt+G", view.grid, |s| s.prefs.view.grid = !s.prefs.view.grid))
+                .child(view_toggle("tb-proof", IconName::Frame, t("Proof margin", "校样边距"), "Alt+P", view.proof, |s| s.prefs.view.proof = !s.prefs.view.proof)),
         )
         .child(sep(cx))
         .child(
@@ -209,7 +209,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
                 .child(browser_btn(BrowserMode::Grid, IconName::LayoutGrid, t("Grid browser", "网格浏览")))
                 .child(browser_btn(BrowserMode::List, IconName::List, t("List browser", "列表浏览")))
                 .child(view_toggle("tb-inspector", IconName::PanelLeft, t("Show tools", "显示工具"), "Ctrl+T", view.show_inspector, |s| {
-                    s.view.show_inspector = !s.view.show_inspector
+                    s.prefs.view.show_inspector = !s.prefs.view.show_inspector
                 })),
         )
         .child(sep(cx))

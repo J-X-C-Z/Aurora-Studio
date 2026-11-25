@@ -130,7 +130,7 @@ pub fn save_style(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
         let adj = s.adj();
         let set: BTreeSet<ClipGroup> =
             ClipGroup::ALL.into_iter().filter(|g| !g.is_composition() && *g != ClipGroup::Style && *g != ClipGroup::Layers && g.is_set(adj)).collect();
-        (set, s.settings.user_styles.len())
+        (set, s.prefs.settings.user_styles.len())
     };
     let groups = Rc::new(RefCell::new(preset));
     let name = Rc::new(RefCell::new(format!("{} {}", t("My Style", "我的风格"), count + 1)));

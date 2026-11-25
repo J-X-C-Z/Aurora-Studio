@@ -46,7 +46,17 @@ mod ca_fix;
 mod batch;
 mod catalog;
 mod closedeyes;
+/// Stable pixel/compute contracts shared by CPU, CUDA and Metal adapters.
+pub mod contracts;
+/// Translation from the in-crate GPU runtime vocabulary to `contracts`.
+mod compute_bridge;
+/// Persistent edit document versus per-job runtime inputs.
+pub mod document;
 mod engine;
+/// Unified job lifecycle: scoped id, state, cancellation and receipts.
+pub mod job_lifecycle;
+/// Stages migrated out of `mock` (with compatibility re-exports).
+pub mod processing;
 mod exif;
 mod file_engine;
 pub mod param_contract;
@@ -262,6 +272,12 @@ mod rawmatch;
 mod rawinfo;
 mod wb_gains;
 mod recipe;
+/// Compiled execution view of a saved node graph.
+pub mod render_plan;
+mod save_queue;
+pub use save_queue::*;
+mod save_report;
+pub use save_report::*;
 mod scopes;
 mod store;
 mod styles;
@@ -310,7 +326,10 @@ pub use catalog::*;
 pub use exif::read_exif;
 pub use closedeyes::{any_eye_closed, detect_eyes, EyeBox, EyeReport};
 pub use engine::*;
-pub use file_engine::{FileEngine, ImportErrorKind, SourceStatusKind};
+pub use file_engine::{
+    FileEngine, ImportErrorKind, QueuedDocumentResult, QueuedSaveOutcome, QueuedSaveSummary,
+    SourceStatusKind,
+};
 pub use fcrv_index::*;
 pub use filmcurve::{curve_dir, parse_film_curves, FilmCurve};
 pub use layers::*;

@@ -3483,6 +3483,242 @@ pub use driver::{BufferSession, JobBufferSession, Nvidia};
 #[allow(unused_imports)] // used by `cuda_teeth`, which lib.rs mounts separately
 pub(crate) use driver::DeviceSet;
 
+/// Non-Windows face of the CUDA adapter.
+///
+/// The platform driver is Windows-only, but the stages above it (the shared
+/// `gpu_runtime` in the engine, `pixel_gpu`, `blemish_gainmap_cuda`) are
+/// compiled everywhere and are expected to fall back to their CPU reference
+/// when no device is present. This module supplies the same type and method
+/// surface as `driver`, with every operation reporting
+/// [`CudaError::Unavailable`] instead of linking a driver. It is an adapter,
+/// not a second implementation: no kernel, buffer or stream is ever created.
+#[cfg(not(windows))]
+mod no_driver {
+    use std::ffi::c_void;
+    use std::marker::PhantomData;
+
+    use super::{CudaError, Dispatch};
+
+    fn unavailable() -> CudaError {
+        CudaError::Unavailable("CUDA driver (non-Windows build)")
+    }
+
+    pub struct Nvidia {
+        _private: (),
+    }
+
+    impl Nvidia {
+        pub fn open() -> Result<Self, CudaError> {
+            Err(unavailable())
+        }
+
+        pub(crate) fn open_image(_image: &'static str) -> Result<Self, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn open_ptx(_image: &'static str) -> Result<Self, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn alloc_buffer(&self, _bytes: usize) -> Result<DeviceBuffer<'_>, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn upload_buffer(
+            &self,
+            _buffer: &DeviceBuffer<'_>,
+            _data: &[u8],
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn download_buffer(
+            &self,
+            _buffer: &DeviceBuffer<'_>,
+            _data: &mut [u8],
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn upload_async(
+            &self,
+            _buffer: &DeviceBuffer<'_>,
+            _data: &[u8],
+            _stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn download_async(
+            &self,
+            _buffer: &DeviceBuffer<'_>,
+            _data: &mut [u8],
+            _stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn alloc_pinned(&self, _bytes: usize) -> Result<PinnedBuffer<'_>, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn register_host<'a>(
+            &self,
+            _data: &'a mut [u8],
+        ) -> Result<HostRegistration<'a>, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn create_stream(&self) -> Result<Stream<'_>, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn stream_sync(&self, _stream: &Stream<'_>) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn launch_raw(
+            &self,
+            _kernel: &'static str,
+            _geometry: (u32, u32),
+            _block: (u32, u32),
+            _params: &mut [*mut c_void],
+        ) -> Result<Dispatch, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn launch_raw_stream(
+            &self,
+            _kernel: &'static str,
+            _geometry: (u32, u32),
+            _block: (u32, u32),
+            _params: &mut [*mut c_void],
+            _stream: &Stream<'_>,
+        ) -> Result<Dispatch, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn with_reusable_buffers<T>(
+            &self,
+            _pool: &'static str,
+            _sizes: &[usize],
+            _call: impl FnOnce(&mut BufferSession<'_>) -> Result<T, CudaError>,
+        ) -> Result<T, CudaError> {
+            Err(unavailable())
+        }
+    }
+
+    pub struct DeviceBuffer<'a> {
+        _owner: PhantomData<&'a ()>,
+    }
+
+    impl DeviceBuffer<'_> {
+        pub fn handle(&self) -> u64 {
+            0
+        }
+    }
+
+    pub struct PinnedBuffer<'a> {
+        _owner: PhantomData<&'a mut ()>,
+    }
+
+    impl PinnedBuffer<'_> {
+        pub fn bytes(&self) -> usize {
+            0
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            &[]
+        }
+
+        pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            &mut []
+        }
+
+        pub fn copy_from(&mut self, _data: &[u8]) {}
+
+        pub fn copy_to(&self, _out: &mut [u8]) {}
+    }
+
+    pub struct HostRegistration<'a> {
+        _owner: PhantomData<&'a mut ()>,
+    }
+
+    impl HostRegistration<'_> {
+        pub fn as_slice(&self) -> &[u8] {
+            &[]
+        }
+
+        pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            &mut []
+        }
+    }
+
+    pub struct Stream<'a> {
+        _owner: PhantomData<&'a ()>,
+    }
+
+    pub struct BufferSession<'a> {
+        _owner: PhantomData<&'a mut ()>,
+    }
+
+    impl BufferSession<'_> {
+        pub fn handle(&self, _index: usize) -> u64 {
+            0
+        }
+
+        pub fn upload(&mut self, _index: usize, _data: &[u8]) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn launch(
+            &mut self,
+            _kernel: &'static str,
+            _geometry: (u32, u32),
+            _block: (u32, u32),
+            _params: &mut [*mut c_void],
+        ) -> Result<Dispatch, CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn download(&mut self, _index: usize, _data: &mut [u8]) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn upload_pinned(
+            &mut self,
+            _index: usize,
+            _data: &PinnedBuffer,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn download_pinned(
+            &mut self,
+            _index: usize,
+            _data: &mut PinnedBuffer,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn copy_from_device(
+            &mut self,
+            _dst: usize,
+            _src: usize,
+            _bytes: usize,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
+        pub fn mark_consumed(&mut self) {}
+    }
+}
+
+#[cfg(not(windows))]
+pub use no_driver::{
+    BufferSession, DeviceBuffer, HostRegistration, Nvidia, PinnedBuffer, Stream,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -79,7 +79,7 @@ impl PrintDialog {
         let spec = self.spec();
         let Some((image, name, adjustments, engine, max_size)) = ({
             let s = self.state.read(cx);
-            let image = s.current.filter(|id| self.images.contains(id)).or_else(|| self.images.first().copied());
+            let image = s.library.current.filter(|id| self.images.contains(id)).or_else(|| self.images.first().copied());
             image.and_then(|image| {
                 let (w, h) = spec.content_px().ok()?;
                 Some((image, s.info(image)?.file_name.clone(), crate::state::flattened(s.adj()), s.engine.clone(), w.max(h)))
@@ -165,7 +165,7 @@ impl Render for PrintDialog {
             let key = format!("print-cell-{i}");
             let (thumb, name) = {
                 let s = self.state.read(cx);
-                (s.thumbs.get(id).cloned(), s.info(*id).map(|i| i.file_name.clone()).unwrap_or_default())
+                (s.preview_state.thumbs.get(id).cloned(), s.info(*id).map(|i| i.file_name.clone()).unwrap_or_default())
             };
             let x = motion::value(motion::key(&key, "x"), m + c as f32 * (cell_w + g), motion::FLOW, window, cx);
             let y = motion::value(motion::key(&key, "y"), m + r as f32 * (cell_h + g), motion::FLOW, window, cx);
@@ -272,7 +272,7 @@ impl Render for PrintDialog {
 pub fn open(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     let images: Vec<ImageId> = {
         let s = state.read(cx);
-        if s.selection.is_empty() { s.current.into_iter().collect() } else { s.selection.iter().copied().collect() }
+        if s.library.selection.is_empty() { s.library.current.into_iter().collect() } else { s.library.selection.iter().copied().collect() }
     };
     let view = cx.new(|_| PrintDialog {
         state: state.clone(),

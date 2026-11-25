@@ -8,26 +8,51 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use rayon::prelude::*;
 
 use crate::adjust::{AdjustmentSet, Curves, Geometry, Levels, NoiseReduction, Sharpening, WhiteBalance, WhiteBalanceMode};
 use crate::catalog::{ColorTag, Exif, FileKind, ImageId, ImageInfo, Iptc};
+use crate::document::DocumentRevision;
 use crate::engine::{AutoResult, AutoTarget, CameraSettings, CameraStatus, ImageEngine, PreviewFrame, PreviewRequest, RenderQuality, StyleInfo};
+use crate::job_lifecycle::{CancelToken, JobId, JobRegistry, JobScope, JobState};
 use crate::layers::{Layer, LinearGradient, LocalAdjustments, Mask, MaskOp, MaskShape};
 use crate::mock::process::{self, Source};
 use crate::preview_cache::{self, CachedFrame, PreviewCache};
+use crate::save_queue::{FlushReport, QueueStatus, SaveQueue, SaveWriter};
+use crate::save_report::SaveReport;
 use crate::store::{Catalog, Entry, Store, StoreError};
 use crate::tether::{self, TetherStatus};
 use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, HdrOptions, JobStatus, NormRect, PanoramaOptions, RgbaImage};
 
 #[path = "library_ops.rs"]
 mod library_ops;
+#[path = "file_engine_services.rs"]
+mod services;
 
 /// Longest side kept for a decoded source; larger files are downscaled.
 const SOURCE_LONG_SIDE: u32 = 4096;
+/// Test-only count of the one-shot full-resolution export decodes. Exporting
+/// at or below [`SOURCE_LONG_SIDE`] must never take this path.
+#[cfg(test)]
+static FULL_RES_EXPORT_DECODES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn full_res_export_decode_count() -> u64 {
+    FULL_RES_EXPORT_DECODES.load(Ordering::Relaxed)
+}
+
+/// The decode counter is process-global, so tests that assert on it must not
+/// run concurrently with another full-resolution export test (the default
+/// harness runs tests in parallel; the repository's CI passes
+/// `--test-threads=1`, but `cargo test <filter>` may not).
+#[cfg(test)]
+fn full_res_export_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 /// Bounds for the decoded-source working set. A source is charged for every
 /// mip level it really owns, so one 4096-long-side RAW is ~170 MiB while a
 /// thumbnail-sized JPEG is ~1 MiB. The default budget is derived from this
@@ -203,11 +228,11 @@ impl ExportSourceSnapshot {
     /// still has the length and mtime it had when the job was queued.
     fn ensure_unchanged(
         &self,
-        sources: &SourceProvider,
+        engine: &FileEngine,
         image: ImageId,
         phase: &str,
     ) -> anyhow::Result<()> {
-        if sources.image_path(image).as_deref() != Some(self.path.as_path()) {
+        if engine.image_path(image).as_deref() != Some(self.path.as_path()) {
             anyhow::bail!("export source path changed {phase}");
         }
         if self.identity.is_none() || SourceFileIdentity::read(&self.path) != self.identity {
@@ -765,7 +790,7 @@ fn raw16_source(path: &Path) -> Option<(Source, crate::raw::DecodeProvenance)> {
 ///
 /// The 8-bit fallback consumes them instead of reading the container and
 /// reopening LibRaw, so a cold load pays the file read once per attempt.
-fn raw16_source_with_bytes(
+pub(crate) fn raw16_source_with_bytes(
     path: &Path,
 ) -> (
     Option<(Source, crate::raw::DecodeProvenance)>,
@@ -775,6 +800,173 @@ fn raw16_source_with_bytes(
         return (None, None);
     }
     crate::raw_cache::get_or_decode_source16_with_bytes(path, SOURCE_LONG_SIDE)
+}
+
+/// Decode the original file at its full resolution for an export whose
+/// requested output is larger than the cached preview proxy.
+///
+/// Unlike the preview `source()` path this never applies [`fit_long_side`], so
+/// a 100% export of a raster above [`SOURCE_LONG_SIDE`] is not an upscaled
+/// proxy. The decode is one-shot: the result is not stored in the source cache
+/// and is dropped together with the export job.
+///
+/// Admission note: [`FullResExportRequest::decode`] calls this from the export
+/// worker after the `ExportScheduler` permit is taken and before the render.
+/// The permit is sized from the output dimensions only, so this full-resolution
+/// working set is *not* yet part of export admission accounting and adds to the
+/// scheduler's estimate rather than being budgeted by it. The caller applies a
+/// conservative memory cap before decoding; that cap is a safety refusal, not
+/// scheduler accounting.
+///
+/// A RAW with no native decode has no full-resolution raster fallback: libraw's
+/// 8-bit path may return only the camera's embedded preview, so refusing is safer
+/// than silently upsampling. HEIF follows the same libheif → `image` fallback as
+/// the preview source; when neither can read it, the export fails.
+fn decode_full_res_export_source(
+    root: &Path,
+    path: &Path,
+    lens: Option<crate::mock::lens_profile::LensShot>,
+) -> anyhow::Result<Source> {
+    #[cfg(test)]
+    FULL_RES_EXPORT_DECODES.fetch_add(1, Ordering::Relaxed);
+    let name = crate::output::log_name(path);
+    let format = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase())
+        .unwrap_or_else(|| "unknown".into());
+    let decoded_path = if is_eip(path) {
+        materialize_eip(root, path).map_err(|err| {
+            anyhow::anyhow!(
+                "export: {name} ({format}) cannot be decoded at full resolution: EIP package: {err:#}"
+            )
+        })?.raw
+    } else {
+        path.to_path_buf()
+    };
+    if crate::raw::is_raw(&decoded_path) {
+        anyhow::bail!(
+            "export: {name} ({format}) cannot be decoded at full resolution: native RAW decode \
+             failed and no full-resolution raster fallback exists"
+        );
+    }
+    let decoded = if is_cop(&decoded_path) {
+        crate::jxl::decode_cop(&decoded_path).map_err(|err| {
+            anyhow::anyhow!("export: {name} ({format}) cannot be decoded at full resolution: {err:#}")
+        })?
+    } else if file_kind(&decoded_path) == FileKind::Heif {
+        match crate::heif::decode(&decoded_path) {
+            Ok(image) => image,
+            Err(err) => match image::open(&decoded_path) {
+                Ok(image) => image.to_rgba8(),
+                Err(fallback) => anyhow::bail!(
+                    "export: {name} ({format}) cannot be decoded at full resolution: \
+                     libheif: {err:#}; image crate: {fallback:#}"
+                ),
+            },
+        }
+    } else {
+        image::open(&decoded_path).map_err(|err| {
+            anyhow::anyhow!("export: {name} ({format}) cannot be decoded at full resolution: {err:#}")
+        })?.to_rgba8()
+    };
+    let (width, height) = decoded.dimensions();
+    if width == 0 || height == 0 {
+        anyhow::bail!(
+            "export: {name} ({format}) cannot be decoded at full resolution: \
+             decoder returned an empty {width}x{height} frame"
+        );
+    }
+    Ok(Source::from_rgba(width, height, decoded.as_raw()).with_lens_shot(lens))
+}
+
+/// What the standard export will render from.
+///
+/// `start_export` only decides this on the calling thread. A full-resolution
+/// fallback is deferred to the export worker so a multi-megapixel original is
+/// never decoded on the UI/caller thread.
+enum StandardExportSource {
+    /// Native RAW, or the cached preview source at or below the proxy cap.
+    Ready(Arc<Source>),
+    /// Decode the original at full resolution inside the export worker.
+    FullRes(FullResExportRequest),
+}
+
+/// Estimated peak working set of one full-resolution export decode, per source
+/// pixel: `Source::from_rgba` holds a linear f32 RGB plane (12 B/px) plus its
+/// mip chain (×4/3 ≈ 16 B/px) while `image::open`'s RGBA8 raster (4 B/px) is
+/// still alive. The extra 4 B/px over 20 is allocator/portrait headroom.
+const FULL_RES_EXPORT_BYTES_PER_PX: u64 = 24;
+
+fn full_res_export_estimate_bytes(width: u32, height: u32) -> u64 {
+    (width as u64).saturating_mul(height as u64).saturating_mul(FULL_RES_EXPORT_BYTES_PER_PX)
+}
+
+/// Safety cap for one full-resolution export decode: a quarter of installed
+/// RAM and at most half of what is free; 2 GiB when the platform cannot report
+/// memory. This is a refusal threshold, *not* `ExportScheduler` accounting.
+fn full_res_export_decode_cap() -> u64 {
+    system_memory_bytes().map_or(2 * 1024 * 1024 * 1024, |(total, available)| {
+        (total / 4).min(available / 2)
+    })
+}
+
+/// Pure threshold test: `Err(estimate)` when the decode's estimated working set
+/// exceeds `cap` bytes. Kept separate so the refusal is unit-testable without a
+/// real 100 MP image.
+fn full_res_export_decode_fits(width: u32, height: u32, cap: u64) -> Result<(), u64> {
+    let estimate = full_res_export_estimate_bytes(width, height);
+    if estimate > cap { Err(estimate) } else { Ok(()) }
+}
+
+/// Cheap, owned state for the deferred full-resolution decode. Paths stay
+/// private to the worker; the decode itself is not cached.
+struct FullResExportRequest {
+    root: PathBuf,
+    path: PathBuf,
+    lens: Option<crate::mock::lens_profile::LensShot>,
+    original_width: u32,
+    original_height: u32,
+    original_long: u32,
+    requested_long: u32,
+}
+
+impl FullResExportRequest {
+    /// Runs on the export worker after `ExportScheduler` admission and before
+    /// the render. First refuses a decode whose estimated working set exceeds
+    /// [`full_res_export_decode_cap`], so a huge raster cannot OOM the process
+    /// (and is never silently downgraded to the proxy). Then a decoder that
+    /// returned less than the file reported is rejected too: using it would
+    /// upsample again.
+    fn decode(&self) -> anyhow::Result<Source> {
+        let cap = full_res_export_decode_cap();
+        if let Err(estimate) =
+            full_res_export_decode_fits(self.original_width, self.original_height, cap)
+        {
+            anyhow::bail!(
+                "export: {} cannot be decoded at full resolution: the {}x{} frame needs about \
+                 {} MiB (cap {} MiB); refusing rather than risking an out-of-memory failure",
+                crate::output::log_name(&self.path),
+                self.original_width,
+                self.original_height,
+                estimate.div_ceil(1024 * 1024),
+                cap.div_ceil(1024 * 1024)
+            );
+        }
+        let source = decode_full_res_export_source(&self.root, &self.path, self.lens.clone())?;
+        let floor = self.requested_long.min(self.original_long).max(1);
+        if source.size().0.max(source.size().1) < floor {
+            anyhow::bail!(
+                "export: {} decoded to {}x{} at full resolution, below the {} px long side the \
+                 original reported",
+                crate::output::log_name(&self.path),
+                source.size().0,
+                source.size().1,
+                floor
+            );
+        }
+        Ok(source)
+    }
 }
 
 /// Capture ISO and body model for the output-domain BandingSuppression.
@@ -1940,22 +2132,10 @@ impl Flight {
 
 /// The decoding half of the engine.
 ///
-/// `FileEngine` owns one and clones the `Arc` into a background export worker,
-/// so a job reads its source only after the export scheduler has admitted it.
-/// Everything here is shared with the engine: the same state lock, flight
-/// table, decode gates and native-decode lock.
-struct SourceProvider {
-    root: PathBuf,
-    state: Arc<Mutex<State>>,
-    flights: Mutex<HashMap<SourceKey, Arc<Flight>>>,
-    decode_gates: DecodeGates,
-    native_decode: Mutex<()>,
-}
-
 /// The thread that owns a decode. If it unwinds, waiters are released with an
 /// error instead of hanging on the flight forever.
 struct FlightLeader<'a> {
-    provider: &'a SourceProvider,
+    provider: &'a FileEngine,
     key: SourceKey,
     flight: Arc<Flight>,
     finished: bool,
@@ -1993,9 +2173,6 @@ struct State {
     ai_inputs: HashMap<ImageId, Arc<AiInput>>,
     /// Byte budget, LRU bookkeeping, pins and counters for `sources` + `native_raw`.
     source_cache: SourceCacheBudget,
-    jobs: HashMap<u64, JobStatus>,
-    /// Jobs whose worker must not overwrite the cancelled status.
-    cancelled: std::collections::HashSet<u64>,
     /// Why a source is not full sensor data; consumed by `source_status`.
     source_reasons: HashMap<ImageId, String>,
     /// Local layers read from a C1 catalog: listed in the panel, never rendered.
@@ -2009,10 +2186,107 @@ struct State {
     preview: PreviewCache,
 }
 
+/// One image's result from [`FileEngine::save_adjustments_queued`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedDocumentResult {
+    /// The image variant the edit belongs to.
+    pub image: ImageId,
+    /// Path relative to the library root, or empty for an unknown image.
+    pub path: String,
+    pub outcome: QueuedSaveOutcome,
+}
+
+/// What happened to one document submitted to the bounded save queue.
+///
+/// The in-memory edit is applied before the outcome is known, so every variant
+/// here except [`Self::Failed`] for an unknown image means the user's latest
+/// content is already visible in this engine. Only [`Self::Accepted`] promises
+/// the writer will try to persist it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueuedSaveOutcome {
+    /// Queued with a strictly increasing revision. `flush_saves` reports what
+    /// the writer did with it.
+    Accepted { revision: DocumentRevision },
+    /// The bounded queue is full for a new path. The edit is kept in memory but
+    /// will not be written by this submission; flush and resubmit to retry.
+    Full { capacity: usize },
+    /// The queue is closed (for example the writer thread could not start).
+    /// The edit stays in memory.
+    Closed,
+    /// An at-least-as-new revision already owns the path, so this submission was
+    /// discarded. Only reachable in practice at revision saturation; the newer
+    /// revision owns the bytes.
+    Superseded { newest: DocumentRevision },
+    /// The submission could not be made at all: an unknown image id or a
+    /// library with no writable store.
+    Failed { error: String },
+}
+
+/// Per-image results of one [`FileEngine::save_adjustments_queued`] call.
+///
+/// This is not a per-path queue snapshot; use [`FileEngine::flush_saves`] for
+/// what actually reached disk and [`FileEngine::save_queue_status`] for the
+/// bounded queue's current state.
+#[derive(Clone, Debug, Default)]
+pub struct QueuedSaveSummary {
+    /// One result per input item, in input order.
+    pub documents: Vec<QueuedDocumentResult>,
+}
+
+impl QueuedSaveSummary {
+    /// Number of documents accepted by the queue.
+    pub fn accepted(&self) -> usize {
+        self.documents
+            .iter()
+            .filter(|document| matches!(document.outcome, QueuedSaveOutcome::Accepted { .. }))
+            .count()
+    }
+
+    /// Number of new paths refused because the queue was at capacity.
+    pub fn full(&self) -> usize {
+        self.documents.iter().filter(|document| matches!(document.outcome, QueuedSaveOutcome::Full { .. })).count()
+    }
+
+    /// Number of submissions refused because the queue was closed.
+    pub fn closed(&self) -> usize {
+        self.documents.iter().filter(|document| matches!(document.outcome, QueuedSaveOutcome::Closed)).count()
+    }
+
+    /// Number of submissions discarded because a newer revision owned the path.
+    pub fn superseded(&self) -> usize {
+        self.documents
+            .iter()
+            .filter(|document| matches!(document.outcome, QueuedSaveOutcome::Superseded { .. }))
+            .count()
+    }
+
+    /// Number of submissions that could not be made (unknown image / no store).
+    pub fn failed(&self) -> usize {
+        self.documents
+            .iter()
+            .filter(|document| matches!(document.outcome, QueuedSaveOutcome::Failed { .. }))
+            .count()
+    }
+
+    /// The outcome recorded for `image`, if it was part of this call.
+    pub fn outcome_of(&self, image: ImageId) -> Option<&QueuedSaveOutcome> {
+        self.documents.iter().find(|document| document.image == image).map(|document| &document.outcome)
+    }
+
+    /// The first failure, for a concise diagnostic.
+    pub fn first_failure(&self) -> Option<&QueuedDocumentResult> {
+        self.documents
+            .iter()
+            .find(|document| matches!(document.outcome, QueuedSaveOutcome::Failed { .. }))
+    }
+}
+
 /// An engine over a real folder of images.
 pub struct FileEngine {
     root: PathBuf,
     state: Arc<Mutex<State>>,
+    /// Per-document save ordering; see [`services::SaveOrder`].
+    save_order: Mutex<services::SaveOrder>,
     /// ICC conversion has its own lock: a cold profile miss must not block the
     /// catalog, thumbnails, or source-cache readers.
     profiled: Mutex<crate::engine::ProfileCache>,
@@ -2022,14 +2296,57 @@ pub struct FileEngine {
     /// The last preview's graph identity, so a request that differs only by a
     /// pruned-branch edit can reuse the frame on screen instead of rendering.
     graph_gate: Mutex<preview_cache::GraphGate>,
-    /// The decode half of the engine: one in-flight decode per `SourceKey`, the
-    /// native-decode lock and the priority-aware admission gates. A background
-    /// export worker holds the same `Arc`, so it decodes without borrowing the
-    /// engine.
-    sources: Arc<SourceProvider>,
-    /// Serializes the final cancel check against export publication (`gate -> state`).
+    /// One in-flight decode per `SourceKey`; later callers wait for that result
+    /// instead of decoding the same image again.
+    flights: Mutex<HashMap<SourceKey, Arc<Flight>>>,
+    /// One full-size RAW at a time: the native slot holds a single frame, so a
+    /// second native decode would only overwrite the first.
+    native_decode: Mutex<()>,
+    /// Bounded, priority-aware admission per decode class.
+    decode_gates: DecodeGates,
+    /// Serializes the final cancel check against export publication
+    /// (`gate -> registry/maps`; see [`FileEngine::start_export`]).
     publish_gate: Arc<Mutex<()>>,
+    /// Export job lifecycle. The registry owns the state and cancellation
+    /// token, so a cancel never takes the document `state` lock.
+    export_jobs: JobRegistry,
+    /// UI job id (`ExportJob::job_id`) -> registry id. Shared with workers so a
+    /// superseded worker can prove it still owns its id before publishing.
+    export_job_ids: Arc<Mutex<HashMap<u64, JobId>>>,
+    /// Published output path per UI job id, so `Succeeded` can map back to the
+    /// `Done { output }` contract. Shared with workers; written under
+    /// `publish_gate` just before the `Succeeded` transition.
+    export_outputs: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    /// Lifecycle records for flight-leader decodes. Scheduling, single-flight
+    /// and cache admission stay in `flights`/`decode_gates`; this only records
+    /// that a decode started and how it ended.
+    decode_jobs: JobRegistry,
+    /// Lifecycle records for preview renders. One per call; terminal records
+    /// are pruned so a drag cannot grow the map without bound.
+    preview_jobs: JobRegistry,
+    /// Lifecycle records for thumbnail renders. One per call, pruned the same
+    /// way as preview records.
+    thumbnail_jobs: JobRegistry,
+    /// Lifecycle records for AI mask / closed-eye inference. One per call,
+    /// pruned the same way as preview records.
+    inference_jobs: JobRegistry,
+    /// Lifecycle records for library import and folder rescan. One per public
+    /// `import`/`rescan` call. The constructor's initial scan uses the
+    /// unrecorded body so opening a library does not populate the snapshot.
+    import_jobs: JobRegistry,
     store: Option<Store>,
+    /// The [`ImageInfo`] captured when a document was last queued, shared with
+    /// the single writer. The writer upserts the catalog from this under a
+    /// short state lock after a successful file write, without the writer ever
+    /// seeing the rest of the engine. Bounded: queued/in-flight paths plus the
+    /// newest terminal entries are retained.
+    save_infos: Arc<services::SaveInfos>,
+    /// The newest queued revision per relative path. Only the engine generates
+    /// revisions for the queued path, and it never reuses or lowers one.
+    save_revisions: Mutex<HashMap<String, DocumentRevision>>,
+    /// Bounded single-writer persistence. `None` when this library has no
+    /// writable store; the synchronous save path stays available regardless.
+    save_queue: Option<Arc<SaveQueue>>,
     /// A C1 catalog is read-only: opening it must not save the imported index.
     c1_catalog: bool,
     /// The database `open_c1_catalog` read, for the write-back entry point.
@@ -2070,10 +2387,6 @@ impl crate::matchlook::LookWhiteBalanceContext for CameraWhiteBalance {
 }
 
 impl FileEngine {
-    fn image_path(&self, image: ImageId) -> Option<PathBuf> {
-        self.sources.image_path(image)
-    }
-
     fn lcc_files(&self, image: ImageId) -> Option<(PathBuf, PathBuf)> {
         Some((self.image_path(image)?, self.c1_settings_path(image)?))
     }
@@ -2197,8 +2510,6 @@ impl FileEngine {
             native_raw: None,
             ai_inputs: HashMap::new(),
             source_cache: SourceCacheBudget::new(cache_bytes),
-            jobs: HashMap::new(),
-            cancelled: Default::default(),
             source_reasons: HashMap::new(),
             layers: HashMap::new(),
             retouch: HashMap::new(),
@@ -2207,22 +2518,31 @@ impl FileEngine {
             catalog,
             preview: PreviewCache::default(),
         }));
-        let sources = Arc::new(SourceProvider {
-            root: root.clone(),
-            state: Arc::clone(&state),
-            flights: Mutex::new(HashMap::new()),
-            decode_gates: DecodeGates::new(cache_bytes),
-            native_decode: Mutex::new(()),
-        });
+        let save_infos: Arc<services::SaveInfos> = Arc::new(services::SaveInfos::new());
+        let save_queue = services::start_save_queue(store.as_ref(), &state, &save_infos);
         let engine = Self {
             root,
             state,
-            sources,
+            save_order: Mutex::new(services::SaveOrder::default()),
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
             graph_gate: Mutex::new(preview_cache::GraphGate::new()),
+            flights: Mutex::new(HashMap::new()),
+            native_decode: Mutex::new(()),
+            decode_gates: DecodeGates::new(cache_bytes),
             publish_gate: Arc::new(Mutex::new(())),
+            export_jobs: JobRegistry::new(),
+            export_job_ids: Arc::new(Mutex::new(HashMap::new())),
+            export_outputs: Arc::new(Mutex::new(HashMap::new())),
+            decode_jobs: JobRegistry::new(),
+            preview_jobs: JobRegistry::new(),
+            thumbnail_jobs: JobRegistry::new(),
+            inference_jobs: JobRegistry::new(),
+            import_jobs: JobRegistry::new(),
             store,
+            save_infos,
+            save_revisions: Mutex::new(HashMap::new()),
+            save_queue,
             c1_catalog: false,
             c1_catalog_path: None,
             camera_defaults: std::sync::OnceLock::new(),
@@ -2231,14 +2551,67 @@ impl FileEngine {
             merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
             soft_proof: RwLock::new(soft_proof),
         };
-        engine.rescan()?;
-        engine.preload_ai_masks();
+        // The opening scan is not a user rescan: keep it out of the import job
+        // snapshot so the records describe explicit `import`/`rescan` calls.
+        engine.imports().rescan_inner()?;
+        engine.inference().preload_ai_masks();
         Ok(engine)
     }
 
     /// The folder this engine reads.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Read-only counts of the export jobs this engine's registry still tracks.
+    ///
+    /// The UI uses this for progress and close hooks; it is deliberately not
+    /// part of [`ImageEngine`] and takes no lock the export worker needs.
+    pub fn export_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
+        self.exports().export_job_snapshot()
+    }
+
+    /// Read-only counts of the decode jobs this engine's registry tracks.
+    ///
+    /// One record per flight-leader decode, so waiters that re-use the leader's
+    /// result do not add records. Deliberately not part of [`ImageEngine`].
+    pub fn decode_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
+        self.decode_jobs.snapshot()
+    }
+
+    /// Read-only counts of the preview render records this engine tracks.
+    ///
+    /// One record per `render_preview`/`render_preview_fast` call; terminal
+    /// records are pruned periodically. Deliberately not part of
+    /// [`ImageEngine`].
+    pub fn preview_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
+        self.preview_jobs.snapshot()
+    }
+
+    /// Read-only counts of the thumbnail render records this engine tracks.
+    ///
+    /// One record per `thumbnail` call; terminal records are pruned
+    /// periodically. Deliberately not part of [`ImageEngine`].
+    pub fn thumbnail_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
+        self.renders().thumbnail_job_snapshot()
+    }
+
+    /// Read-only counts of the AI inference records this engine tracks.
+    ///
+    /// One record per `compute_ai_mask`/`eye_report` call, including cache
+    /// hits; terminal records are pruned periodically. Deliberately not part of
+    /// [`ImageEngine`].
+    pub fn inference_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
+        self.inference().inference_job_snapshot()
+    }
+
+    /// Read-only counts of the import/rescan records this engine tracks.
+    ///
+    /// One record per public `import` or `rescan` call; terminal records are
+    /// pruned periodically. The `open`/`open_c1_catalog` initial scan is not
+    /// recorded. Deliberately not part of [`ImageEngine`].
+    pub fn import_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
+        self.imports().import_job_snapshot()
     }
 
     /// The packed RAW, settings and CoMask members of a C1 `.eip` entry,
@@ -2282,8 +2655,6 @@ impl FileEngine {
             native_raw: None,
             ai_inputs: HashMap::new(),
             source_cache: SourceCacheBudget::new(cache_bytes),
-            jobs: HashMap::new(),
-            cancelled: Default::default(),
             source_reasons: HashMap::new(),
             layers: HashMap::new(),
             retouch: HashMap::new(),
@@ -2292,22 +2663,31 @@ impl FileEngine {
             catalog,
             preview: PreviewCache::default(),
         }));
-        let sources = Arc::new(SourceProvider {
-            root: root.clone(),
-            state: Arc::clone(&state),
-            flights: Mutex::new(HashMap::new()),
-            decode_gates: DecodeGates::new(cache_bytes),
-            native_decode: Mutex::new(()),
-        });
+        let save_infos: Arc<services::SaveInfos> = Arc::new(services::SaveInfos::new());
+        let save_queue = services::start_save_queue(store.as_ref(), &state, &save_infos);
         let engine = Self {
             root,
             state,
-            sources,
+            save_order: Mutex::new(services::SaveOrder::default()),
             profiled: Mutex::new(Default::default()),
             gamut: Mutex::new(Vec::new()),
             graph_gate: Mutex::new(preview_cache::GraphGate::new()),
+            flights: Mutex::new(HashMap::new()),
+            native_decode: Mutex::new(()),
+            decode_gates: DecodeGates::new(cache_bytes),
             publish_gate: Arc::new(Mutex::new(())),
+            export_jobs: JobRegistry::new(),
+            export_job_ids: Arc::new(Mutex::new(HashMap::new())),
+            export_outputs: Arc::new(Mutex::new(HashMap::new())),
+            decode_jobs: JobRegistry::new(),
+            preview_jobs: JobRegistry::new(),
+            thumbnail_jobs: JobRegistry::new(),
+            inference_jobs: JobRegistry::new(),
+            import_jobs: JobRegistry::new(),
             store,
+            save_infos,
+            save_revisions: Mutex::new(HashMap::new()),
+            save_queue,
             c1_catalog: true,
             c1_catalog_path: Some(import.catalog_path.clone()),
             camera_defaults: std::sync::OnceLock::new(),
@@ -2317,32 +2697,8 @@ impl FileEngine {
             soft_proof: RwLock::new(soft_proof),
         };
         engine.import_c1(&import);
-        engine.preload_ai_masks();
+        engine.inference().preload_ai_masks();
         Ok(engine)
-    }
-
-    /// Puts masks referenced by saved layers back into the in-memory cache, so
-    /// a reopened folder renders the segmentation instead of the ellipse.
-    fn preload_ai_masks(&self) {
-        let keys: Vec<String> = {
-            let st = self.state.lock();
-            st.entries
-                .iter()
-                .flat_map(|e| e.adjustments.layers.iter())
-                .flat_map(|layer| layer.mask.shapes.iter())
-                .filter_map(|shape| match shape {
-                    crate::MaskShape::Ai(ai) => ai.cache_key.clone(),
-                    _ => None,
-                })
-                .collect()
-        };
-        for key in keys {
-            if crate::aimask::lookup(&key).is_none() {
-                if let Some(plane) = crate::mask_store::load(&self.root, &key) {
-                    crate::aimask::store(&key, plane);
-                }
-            }
-        }
     }
 
     fn import_c1(&self, import: &crate::c1import::C1Import) {
@@ -2519,181 +2875,7 @@ impl FileEngine {
 
     /// Re-reads the folder, keeping edits already made.
     pub fn rescan(&self) -> anyhow::Result<()> {
-        let mut found = Vec::new();
-        collect(&self.root, &self.root, 0, &mut found)?;
-        found.sort_by(|a, b| a.0.cmp(&b.0));
-        let excluded: std::collections::HashSet<PathBuf> =
-            self.store.as_ref().map(|store| store.load_excluded().into_iter().collect()).unwrap_or_default();
-
-        let mut st = self.state.lock();
-        let previous: HashMap<String, (AdjustmentSet, i8, ColorTag, Vec<String>, u32)> = st
-            .entries
-            .iter()
-            .map(|e| {
-                (
-                    e.rel_path.clone(),
-                    (e.adjustments.clone(), e.info.rating, e.info.color_tag, e.info.keywords.clone(), e.info.variant),
-                )
-            })
-            .collect();
-        // Keep an unchanged file's ImageId so its cached source, AI input,
-        // pins and preview frames stay valid across a rescan.
-        let previous_ids: HashMap<String, (ImageId, u64, u32, u32, FileKind)> = st
-            .entries
-            .iter()
-            .map(|e| {
-                (
-                    e.rel_path.clone(),
-                    (e.info.id, e.info.file_size, e.info.width, e.info.height, e.info.kind),
-                )
-            })
-            .collect();
-
-        let scanned: Vec<ScannedFile> = found
-            .into_par_iter()
-            .map(|(rel, path)| scan_file(&self.root, rel, path))
-            .collect();
-
-        let mut from_cos = Vec::new();
-        let mut reassigned = false;
-        let mut removed_any = false;
-        st.entries.clear();
-        // Index the catalog once. The loop below asks the same path twice
-        // (`.cos` gate, then stored metadata), and a Vec scan per image is
-        // N*M on a large library. A duplicate path keeps its first slot so
-        // this matches `Catalog::entry`'s `.iter().find()` result.
-        let catalog_paths: HashMap<String, usize> = {
-            let mut index = HashMap::with_capacity(st.catalog.images.len());
-            for (slot, entry) in st.catalog.images.iter().enumerate() {
-                index.entry(entry.rel_path.clone()).or_insert(slot);
-            }
-            index
-        };
-        for scanned in scanned
-            .into_iter()
-            .filter(|scanned| !excluded.contains(&scanned.path))
-            .flat_map(ScannedFile::library_variants)
-        {
-            let rel_path = &scanned.rel_path;
-            let id = previous_ids
-                .get(rel_path)
-                .filter(|(_, file_size, width, height, kind)| {
-                    *file_size == scanned.file_size
-                        && *width == scanned.width
-                        && *height == scanned.height
-                        && *kind == scanned.kind
-                })
-                .map(|(id, ..)| *id)
-                .unwrap_or_else(|| {
-                    reassigned = true;
-                    let id = ImageId(st.next_id);
-                    st.next_id += 1;
-                    id
-                });
-            let stored = previous.get(rel_path);
-            let mut adjustments = stored.map(|s| s.0.clone()).unwrap_or_default();
-            // Restore edits saved in a previous process; keep unsaved in-memory
-            // edits made before this rescan.
-            if adjustments.is_default() {
-                if let Some(store) = &self.store {
-                    if let Ok(saved) = store.load_adjustments(rel_path) {
-                        adjustments = saved;
-                    }
-                }
-            }
-            // C1 keeps per-image settings in a `.cos` sidecar; apply it when
-            // neither our store nor this process has edits for the path.
-            if adjustments.is_default() && !catalog_paths.contains_key(rel_path.as_str()) {
-                if let Some(cos) = scanned.c1_adjustments() {
-                    from_cos.push((scanned.rel_path.clone(), cos.clone()));
-                    adjustments = cos;
-                }
-            }
-            let mut rating = stored.map(|s| s.1).unwrap_or(0);
-            let mut color_tag = stored.map(|s| s.2).unwrap_or(ColorTag::None);
-            let mut keywords = stored.map(|s| s.3.clone()).unwrap_or_default();
-            let mut variant = stored.map(|s| s.4).unwrap_or(scanned.packed_variant);
-            let mut trashed = false;
-
-            // The catalog wins over the in-memory copy: it survives restarts.
-            if let Some(&slot) = catalog_paths.get(rel_path.as_str()) {
-                let entry = &st.catalog.images[slot];
-                rating = entry.rating;
-                color_tag = ColorTag::ALL[(entry.color_tag.clamp(0, 7)) as usize];
-                keywords = entry.keywords.clone();
-                variant = variant.max(entry.variant);
-                trashed = entry.trashed;
-            }
-
-            if keywords.is_empty() {
-                keywords = scanned.iptc.keywords.clone();
-            }
-            st.entries.push(FileEntry {
-                info: ImageInfo {
-                    id,
-                    path: scanned.path.clone(),
-                    file_name: scanned.file_name,
-                    kind: scanned.kind,
-                    heif: None,
-                    width: scanned.width,
-                    height: scanned.height,
-                    file_size: scanned.file_size,
-                    exif: scanned.exif,
-                    iptc: scanned.iptc,
-                    keywords,
-                    rating,
-                    color_tag,
-                    variant,
-                    has_adjustments: !adjustments.is_default(),
-                    trashed,
-                },
-                path: scanned.path,
-                rel_path: scanned.rel_path,
-                adjustments,
-            });
-        }
-        // Drop every cached resource whose id is no longer in the library.
-        // IDs are stable for unchanged files, so hot sources and pins survive
-        // a rescan; removed or rewritten files release their bytes at once.
-        let living: std::collections::HashSet<ImageId> = st.entries.iter().map(|entry| entry.info.id).collect();
-        let mut removed_bytes = 0usize;
-        let stale_sources: Vec<ImageId> = st.sources.keys().copied().filter(|id| !living.contains(id)).collect();
-        for id in stale_sources {
-            removed_bytes = removed_bytes.saturating_add(evict_cached_source(&mut st, id));
-        }
-        let stale_ai: Vec<ImageId> = st.ai_inputs.keys().copied().filter(|id| !living.contains(id)).collect();
-        for id in stale_ai {
-            if let Some(input) = st.ai_inputs.remove(&id) {
-                removed_bytes = removed_bytes.saturating_add(ai_input_bytes(&input));
-            }
-        }
-        if st.native_raw.as_ref().is_some_and(|slot| !living.contains(&slot.image)) {
-            if let Some(slot) = st.native_raw.take() {
-                removed_bytes = removed_bytes.saturating_add(slot.bytes);
-            }
-        }
-        removed_any |= removed_bytes > 0;
-        st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(removed_bytes);
-        let pins_before = st.source_cache.pins.len();
-        st.source_cache.pins.retain(|id, _| living.contains(id));
-        st.source_cache.recent.retain(|id| living.contains(id));
-        st.source_reasons.retain(|id, _| living.contains(id));
-        removed_any |= reassigned || pins_before != st.source_cache.pins.len();
-        if removed_any {
-            // Rendered frames of a rewritten or removed file must never be hit.
-            st.preview.clear();
-        }
-        // Save the C1 snapshot once, so a later metadata edit and restart does
-        // not fall back to defaults when the catalog entry blocks a re-read.
-        drop(st);
-        if let Some(store) = &self.store {
-            for (rel_path, adjustments) in from_cos {
-                if let Err(err) = store.save_adjustments(&rel_path, &adjustments) {
-                    log::warn!("save `.cos` adjustments {rel_path}: {err}");
-                }
-            }
-        }
-        Ok(())
+        self.imports().rescan()
     }
 
     fn add_file(&self, path: &Path) -> anyhow::Result<ImageInfo> {
@@ -2815,9 +2997,6 @@ impl FileEngine {
         log::debug!("source {image:?} invalidated: {reason}");
     }
 
-}
-
-impl SourceProvider {
     fn image_path(&self, image: ImageId) -> Option<PathBuf> {
         self.state
             .lock()
@@ -2941,164 +3120,13 @@ impl SourceProvider {
     }
 
     fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
-        self.source_with_priority(image, DecodePriority::Interactive)
+        self.sources().source(image)
     }
 
-    /// One decode per image: callers that arrive mid-decode wait on the same
-    /// flight. Different images run in parallel, bounded by their gate (heavy
-    /// for RAW/EIP/COP/HEIF, light for other rasters) and the RAM-derived units
-    /// the source-resolution estimate needs; thumbnails queue behind previews.
+    /// One decode per image via the source service; see that module for the
+    /// single-flight and admission contract.
     fn source_with_priority(&self, image: ImageId, priority: DecodePriority) -> anyhow::Result<Arc<Source>> {
-        if let Some(src) = self.cached_source(image) {
-            return Ok(src);
-        }
-        let (path, lens, width, height, heavy, format) = {
-            let st = self.state.lock();
-            let entry = st
-                .entries
-                .iter()
-                .find(|e| e.info.id == image)
-                .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
-            let heavy = crate::raw::is_raw(&entry.path)
-                || is_eip(&entry.path)
-                || is_cop(&entry.path)
-                || file_kind(&entry.path) == FileKind::Heif;
-            (
-                entry.path.clone(),
-                crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif),
-                entry.info.width,
-                entry.info.height,
-                heavy,
-                proxy_decode_format(&entry.path),
-            )
-        };
-        let key = SourceKey::Proxy(image);
-        let leader = match self.join_flight(key) {
-            FlightRole::Waiter(flight) => {
-                self.note_flight_wait();
-                return flight.wait().map_err(|message| anyhow::anyhow!(message));
-            }
-            FlightRole::Leader(leader) => leader,
-        };
-        let bytes = estimated_decode_bytes(width, height, format);
-        let _permit = if heavy {
-            let units = decode_units(bytes);
-            self.decode_gates.heavy.acquire(priority, units)
-        } else {
-            let units = decode_units(bytes);
-            self.decode_gates.light.acquire(priority, units)
-        };
-        // A decode that was already in flight may have finished while this
-        // request waited for admission; take its result instead of decoding.
-        if let Some(src) = self.cached_source(image) {
-            return leader.finish(Ok(src)).map_err(|message| anyhow::anyhow!(message));
-        }
-        self.state.lock().source_cache.misses += 1;
-        let decoded = (|| -> Result<Arc<Source>, String> {
-        // Decoding happens outside the state lock.
-        // A RAW keeps libraw's 16-bit linear samples; every other file and any
-        // RAW libraw cannot demosaic arrives as 8-bit sRGB.
-        // An EIP hides its RAW inside a ZIP; hand every decoder the member.
-        let decoded_path = if is_eip(&path) {
-            materialize_eip(&self.root, &path).map_err(|err| format!("{err:#}"))?.raw
-        } else {
-            path.clone()
-        };
-        let mut decoded_reason = None;
-        let (source16, failed16) = raw16_source_with_bytes(&decoded_path);
-        let (source, provenance) = match source16 {
-            Some((source, provenance)) => (source, provenance),
-            None => {
-                let img = if is_cop(&decoded_path) {
-                    match crate::jxl::decode_cop(&path) {
-                        Ok(img) => img,
-                        Err(err) => {
-                            let reason = format!(".cop decode failed: {err:#}");
-                            self.state.lock().source_reasons.insert(image, reason.clone());
-                            return Err(reason);
-                        }
-                    }
-                } else if crate::raw::is_raw(&decoded_path) {
-                    match crate::raw::decode8_fallback(&decoded_path, failed16.as_ref()) {
-                        Ok(img) => img,
-                        Err(err) => {
-                            let reason = format!("RAW decode failed: {err:#}");
-                            self.state.lock().source_reasons.insert(image, reason.clone());
-                            return Err(reason);
-                        }
-                    }
-                } else if file_kind(&decoded_path) == FileKind::Heif {
-                    match crate::heif::decode(&decoded_path) {
-                        Ok(img) => img,
-                        Err(err) => match image::open(&decoded_path) {
-                            Ok(img) => {
-                                decoded_reason = Some(format!(
-                                    "HEIF via libheif failed ({err:#}); used the image crate fallback"
-                                ));
-                                img.to_rgba8()
-                            }
-                            Err(fallback) => {
-                                let reason =
-                                    format!("HEIF decode failed: libheif: {err:#}; image crate: {fallback}");
-                                self.state.lock().source_reasons.insert(image, reason.clone());
-                                return Err(reason);
-                            }
-                        },
-                    }
-                } else {
-                    image::open(&decoded_path).map_err(|err| format!("{err:#}"))?.to_rgba8()
-                };
-                let (w, h) = fit_long_side(img.dimensions());
-                let img = if img.dimensions() != (w, h) {
-                    downscale_rgba(&img, w, h)
-                } else {
-                    img
-                };
-                (
-                    Source::from_rgba(w, h, img.as_raw()),
-                    crate::raw::decode_fallback_provenance(&decoded_path),
-                )
-            }
-        };
-        // The decoded provenance is the only authority for the preview flag and
-        // for the C1 Z6III pre-matrix: a LibRaw or embedded-preview fallback
-        // must never take the camera-linear path.
-        let camera_preview = provenance.pixel_space == crate::raw::PixelSpace::EmbeddedPreview;
-        if camera_preview {
-            decoded_reason = Some("unsupported RAW compression; showing the camera's embedded preview".into());
-        }
-        // BandingSuppression is keyed on ISO and body; the stage stays off when
-        // either is missing rather than falling back to a guessed amount.
-        let banding_identity = crate::raw::is_raw(&decoded_path)
-            .then(|| crate::exif::read_exif(&decoded_path))
-            .map(|exif| raw_banding_identity(&exif));
-        let source = Arc::new(
-            source
-                .with_lens_shot(lens)
-                .with_camera_preview(camera_preview)
-                .with_c1_z6iii_linear(provenance.unlocks_c1_z6iii_linear())
-                .with_banding_identity(
-                    banding_identity.as_ref().and_then(|(iso, _)| *iso),
-                    banding_identity.as_ref().and_then(|(_, model)| model.as_deref()),
-                ),
-        );
-
-        {
-            let mut st = self.state.lock();
-            match decoded_reason {
-                Some(reason) => {
-                    st.source_reasons.insert(image, reason);
-                }
-                None => {
-                    st.source_reasons.remove(&image);
-                }
-            }
-        }
-        self.store_cached_source(image, &path, Arc::clone(&source));
-        Ok(source)
-        })();
-        let result = leader.finish(decoded);
-        result.map_err(|message| anyhow::anyhow!(message))
+        self.sources().source_with_priority(image, priority)
     }
 
     /// Full-size RAW for 1:1 zoom and export. The native slot holds one frame,
@@ -3195,23 +3223,48 @@ impl SourceProvider {
         };
         leader.finish(flight_result).ok()
     }
-}
-
-impl FileEngine {
-    fn source(&self, image: ImageId) -> anyhow::Result<Arc<Source>> {
-        self.sources.source(image)
-    }
-
-    fn source_with_priority(&self, image: ImageId, priority: DecodePriority) -> anyhow::Result<Arc<Source>> {
-        self.sources.source_with_priority(image, priority)
-    }
-
-    fn native_raw_source(
-        &self,
-        image: ImageId,
-        viewport: Option<(&crate::Geometry, NormRect, u32)>,
-    ) -> Option<Arc<Source>> {
-        self.sources.native_raw_source(image, viewport)
+    /// Decide the standard export source when no native RAW frame is available,
+    /// without doing the expensive decode on the calling thread.
+    ///
+    /// At or below the cached proxy's long side this is exactly the preview
+    /// [`Self::source`] path (unchanged). Above it, using the proxy would make
+    /// the renderer upscale it (explicitly forbidden), so the plan hands the
+    /// worker the cheap state it needs to decode the original at full
+    /// resolution. That decode bypasses the source cache; see
+    /// [`decode_full_res_export_source`] for the admission note.
+    fn export_source_plan(&self, image: ImageId, requested_long: u32) -> anyhow::Result<StandardExportSource> {
+        let (path, lens, original_width, original_height) = {
+            let st = self.state.lock();
+            let entry = st
+                .entries
+                .iter()
+                .find(|entry| entry.info.id == image)
+                .ok_or_else(|| anyhow::anyhow!("export: unknown image {}", image.0))?;
+            (
+                entry.path.clone(),
+                crate::mock::lens_profile::LensShot::from_exif(&entry.info.exif),
+                entry.info.width,
+                entry.info.height,
+            )
+        };
+        let original_long = original_width.max(original_height);
+        // The preview source never keeps more than SOURCE_LONG_SIDE, so this is
+        // the long side `self.source()` would return for this file. A source at
+        // or below the cap keeps the existing `source()` path even for an
+        // explicit enlargement: the proxy there is the full-resolution file.
+        let proxy_long = original_long.min(SOURCE_LONG_SIDE);
+        if original_long <= SOURCE_LONG_SIDE || requested_long <= proxy_long {
+            return Ok(StandardExportSource::Ready(self.source(image)?));
+        }
+        Ok(StandardExportSource::FullRes(FullResExportRequest {
+            root: self.root.clone(),
+            path,
+            lens,
+            original_width,
+            original_height,
+            original_long,
+            requested_long,
+        }))
     }
 
     /// Current source-cache bytes, pins and counters. The app's performance log
@@ -3219,13 +3272,13 @@ impl FileEngine {
     pub fn source_cache_stats(&self) -> SourceCacheStats {
         // Gate locks are taken before the state lock: a decoder holds a gate
         // permit while it stores its result, so the reverse order could deadlock.
-        let heavy_units = self.sources.decode_gates.heavy.total_units();
-        let light_units = self.sources.decode_gates.light.total_units();
-        let decode_waits = self.sources.decode_gates.heavy.waits() + self.sources.decode_gates.light.waits();
+        let heavy_units = self.decode_gates.heavy.total_units();
+        let light_units = self.decode_gates.light.total_units();
+        let decode_waits = self.decode_gates.heavy.waits() + self.decode_gates.light.waits();
         let decode_wait_ms =
-            (self.sources.decode_gates.heavy.wait_nanos() + self.sources.decode_gates.light.wait_nanos()) / 1_000_000;
+            (self.decode_gates.heavy.wait_nanos() + self.decode_gates.light.wait_nanos()) / 1_000_000;
         let decode_peak_concurrency =
-            self.sources.decode_gates.heavy.peak_active().max(self.sources.decode_gates.light.peak_active());
+            self.decode_gates.heavy.peak_active().max(self.decode_gates.light.peak_active());
         let st = self.state.lock();
         let cache = &st.source_cache;
         let ai_input_bytes_total = st.ai_inputs.values().fold(0usize, |total, input| {
@@ -3270,8 +3323,8 @@ impl FileEngine {
         // Concurrency follows the budget: a smaller cache admits fewer large
         // decodes at once. Gate before state, matching decoders' lock order.
         let units = decode_gate_units(max_bytes);
-        self.sources.decode_gates.heavy.set_total_units(units);
-        self.sources.decode_gates.light.set_total_units(units);
+        self.decode_gates.heavy.set_total_units(units);
+        self.decode_gates.light.set_total_units(units);
         let mut st = self.state.lock();
         st.source_cache.max_bytes = max_bytes;
         evict_sources_to_budget(&mut st, None);
@@ -3322,508 +3375,119 @@ impl FileEngine {
         st.source_cache.current_bytes = 0;
     }
 
+    /// The cached model-sized input, for the engine's own tests. The inference
+    /// service owns the production body.
+    #[cfg(test)]
     fn ai_input(&self, image: ImageId) -> anyhow::Result<Arc<AiInput>> {
-        let source = self.source(image)?;
-        let geometry = self.load_adjustments(image).geometry;
-        let fingerprint = geometry_fingerprint(&geometry);
-        if let Some(input) = self
-            .state
-            .lock()
-            .ai_inputs
-            .get(&image)
-            .filter(|input| input.source_id == source.snapshot_id() && input.geometry == fingerprint)
-            .cloned()
-        {
-            return Ok(input);
-        }
-        let (rgba, width, height) = process::ai_input_rgba(&source, &geometry, 1024);
-        let input = Arc::new(AiInput {
-            source_id: source.snapshot_id(),
-            geometry: fingerprint,
-            rgba,
-            width,
-            height,
-        });
-        let mut st = self.state.lock();
-        let bytes = ai_input_bytes(&input);
-        if let Some(old) = st.ai_inputs.insert(image, input.clone()) {
-            st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(ai_input_bytes(&old));
-        }
-        st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_add(bytes);
-        st.source_cache.peak_bytes = st.source_cache.peak_bytes.max(st.source_cache.current_bytes);
-        evict_sources_to_budget(&mut st, Some(image));
-        Ok(input)
+        self.inference().ai_input(image)
     }
 
-    /// Cached preview frame; `fast` renders at half size and upsamples.
-    /// Merges bracketed frames into one 16-bit TIFF beside the first frame and
-    /// catalogs it. The first frame's exposure is the reference the result is
-    /// rendered at; frames must share one size.
-    pub fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
-        self.merge_hdr_impl(ids, None)
-    }
-
-    /// [`Self::merge_hdr_frames`] with the interface's options. `align: false`
-    /// is honoured by keeping the existing no-alignment path; `deghost` is
-    /// consumed by `hdr::fuse_with_options`; `auto_tone` is only logged.
-    pub fn merge_hdr_with_options(
-        &self,
-        ids: &[ImageId],
-        options: &HdrOptions,
-    ) -> anyhow::Result<ImageInfo> {
-        self.merge_hdr_impl(ids, Some(options))
-    }
-
-    fn start_merge(
-        &self,
-        kind: crate::merge_async::MergeKind,
-        images: &[ImageId],
-        options: &crate::MergeRequest,
-    ) -> anyhow::Result<crate::MergeJobId> {
-        anyhow::ensure!(!images.is_empty(), "merge needs at least one image");
-        let mut sources = Vec::with_capacity(images.len());
-        let mut stops = Vec::with_capacity(images.len());
-        let first_path;
-        {
-            let st = self.state.lock();
-            let mut exif = Vec::with_capacity(images.len());
-            let mut paths = Vec::with_capacity(images.len());
-            for id in images {
-                let entry = st
-                    .entries
-                    .iter()
-                    .find(|entry| entry.info.id == *id)
-                    .ok_or_else(|| anyhow::anyhow!("merge: unknown image {id:?}"))?;
-                paths.push(entry.path.clone());
-                exif.push(entry.info.exif.clone());
-            }
-            first_path = paths.first().cloned().ok_or_else(|| anyhow::anyhow!("merge: no first frame"))?;
-            if let Some(first) = exif.first() {
-                stops = exif.iter().map(|frame| crate::hdr::relative_stops(first, frame)).collect();
-            }
-        }
-        for id in images {
-            sources.push(self.source(*id)?);
-        }
-        let mut request = options.clone();
-        request.images = images.to_vec();
-        Ok(self.merge_registry.start(kind, sources, stops, first_path, request))
-    }
-
-    fn merge_hdr_impl(&self, ids: &[ImageId], options: Option<&HdrOptions>) -> anyhow::Result<ImageInfo> {
-        if let Some(options) = options {
-            Self::warn_hdr_options(options);
-        }
-        let mut paths = Vec::with_capacity(ids.len());
-        let mut exposures = Vec::with_capacity(ids.len());
-        {
-            let st = self.state.lock();
-            for id in ids {
-                let entry = st
-                    .entries
-                    .iter()
-                    .find(|e| e.info.id == *id)
-                    .ok_or_else(|| anyhow::anyhow!("HDR merge: unknown image {id:?}"))?;
-                paths.push(entry.path.clone());
-                exposures.push(entry.info.exif.clone());
-            }
-        }
-        let Some(first_path) = paths.first() else {
-            anyhow::bail!("HDR merge needs at least one frame");
-        };
-        let stops: Vec<f32> = exposures
-            .iter()
-            .map(|exif| crate::hdr::relative_stops(&exposures[0], exif))
-            .collect();
-        let sources: Vec<Arc<Source>> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
-        let frames: Vec<&Source> = sources.iter().map(|s| s.as_ref()).collect();
-        let defaults = HdrOptions::default();
-        let fused = crate::hdr::fuse_with_options(&frames, &stops, options.unwrap_or(&defaults))?;
-        let wide = crate::hdr::to_srgb16(&fused);
-
-        let dir = first_path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = first_path.file_stem().and_then(|s| s.to_str()).unwrap_or("merge");
-        let mut path = dir.join(format!("{stem}_HDR.tif"));
-        let mut counter = 2;
-        while path.exists() {
-            if counter > 999 {
-                anyhow::bail!("HDR merge: no free output name beside {}", first_path.display());
-            }
-            path = dir.join(format!("{stem}_HDR-{counter}.tif"));
-            counter += 1;
-        }
-        {
-            use image::ImageEncoder as _;
-            let bytes: Vec<u8> = wide.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let mut out = std::io::Cursor::new(Vec::new());
-            let encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
-            encoder.write_image(&bytes, fused.width, fused.height, image::ExtendedColorType::Rgb16)?;
-            std::fs::write(&path, out.into_inner())?;
-        }
-
-        let info = self.add_file(&path)?;
-        let rel = {
-            let st = self.state.lock();
-            st.entries
-                .iter()
-                .find(|e| e.info.id == info.id)
-                .map(|e| e.rel_path.clone())
-                .ok_or_else(|| anyhow::anyhow!("HDR merge: output missing from the catalog"))?
-        };
-        self.persist(&rel, &AdjustmentSet::default(), &info);
-        Ok(info)
-    }
-
-    /// Stitches frames left to right into one 8-bit TIFF beside the first frame
-    /// and catalogs it. Frames must share one height; each neighbouring pair is
-    /// aligned by a horizontal SAD search and the overlap is feathered.
-    /// Distortion, perspective and exposure matching are not applied yet.
-    pub fn merge_panorama_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
-        self.merge_panorama_impl(ids, None)
-    }
-
-    /// [`Self::merge_panorama_frames`] with the interface's options.
-    /// `projection` is consumed by `pano::stitch_with_options`; `auto_crop:
-    /// false` keeps the stitched canvas edges; boundary warp and auto crop are
-    /// still not implemented.
-    pub fn merge_panorama_with_options(
-        &self,
-        ids: &[ImageId],
-        options: &PanoramaOptions,
-    ) -> anyhow::Result<ImageInfo> {
-        self.merge_panorama_impl(ids, Some(options))
-    }
-
-    fn merge_panorama_impl(
-        &self,
-        ids: &[ImageId],
-        options: Option<&PanoramaOptions>,
-    ) -> anyhow::Result<ImageInfo> {
-        if let Some(options) = options {
-            Self::warn_panorama_options(options);
-        }
-        let first_path = {
-            let st = self.state.lock();
-            let id = ids.first().ok_or_else(|| anyhow::anyhow!("Panorama merge needs at least one frame"))?;
-            st.entries
-                .iter()
-                .find(|e| e.info.id == *id)
-                .map(|e| e.path.clone())
-                .ok_or_else(|| anyhow::anyhow!("Panorama merge: unknown image {id:?}"))?
-        };
-        let sources: Vec<Arc<Source>> = ids.iter().map(|id| self.source(*id)).collect::<anyhow::Result<_>>()?;
-        let frames: Vec<&Source> = sources.iter().map(|s| s.as_ref()).collect();
-        let defaults = PanoramaOptions::default();
-        let fused = crate::pano::stitch_with_options(&frames, options.unwrap_or(&defaults))?;
-        let bytes = crate::pano::to_srgb8(&fused);
-        self.write_merge(&first_path, "Pano", fused.width, fused.height, &bytes, image::ExtendedColorType::Rgb8)
-    }
-
-    fn warn_hdr_options(options: &HdrOptions) {
-        if options.align {
-            log::warn!("HDR merge: align=true is not applied; frames are never aligned");
-        }
-        if options.auto_tone {
-            log::warn!("HDR merge: auto_tone=true is not applied");
-        }
-    }
-
-    fn warn_panorama_options(options: &PanoramaOptions) {
-        if options.boundary_warp != 0.0 {
-            log::warn!(
-                "Panorama merge: boundary_warp={} is not applied",
-                options.boundary_warp
-            );
-        }
-        if options.auto_crop {
-            log::warn!(
-                "Panorama merge: auto_crop=true is not applied; the stitched canvas keeps its edges"
-            );
-        } else {
-            log::debug!("Panorama merge: auto_crop=false, keeping the stitched canvas edges");
-        }
-    }
-
-    /// Writes a merged TIFF beside the first frame, names it `{stem}_{tag}.tif`
-    /// without clobbering an existing file, then catalogs and persists it.
-    fn write_merge(
-        &self,
-        first_path: &Path,
-        tag: &str,
-        width: u32,
-        height: u32,
-        bytes: &[u8],
-        color: image::ExtendedColorType,
-    ) -> anyhow::Result<ImageInfo> {
-        let dir = first_path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = first_path.file_stem().and_then(|s| s.to_str()).unwrap_or("merge");
-        let mut path = dir.join(format!("{stem}_{tag}.tif"));
-        let mut counter = 2;
-        while path.exists() {
-            if counter > 999 {
-                anyhow::bail!("{tag} merge: no free output name beside {}", first_path.display());
-            }
-            path = dir.join(format!("{stem}_{tag}-{counter}.tif"));
-            counter += 1;
-        }
-        {
-            use image::ImageEncoder as _;
-            let mut out = std::io::Cursor::new(Vec::new());
-            let encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
-            encoder.write_image(bytes, width, height, color)?;
-            std::fs::write(&path, out.into_inner())?;
-        }
-
-        let info = self.add_file(&path)?;
-        let rel = {
-            let st = self.state.lock();
-            st.entries
-                .iter()
-                .find(|e| e.info.id == info.id)
-                .map(|e| e.rel_path.clone())
-                .ok_or_else(|| anyhow::anyhow!("{tag} merge: output missing from the catalog"))?
-        };
-        self.persist(&rel, &AdjustmentSet::default(), &info);
-        Ok(info)
-    }
-
-    fn cached_gamut_warning(
-        &self,
-        key: preview_cache::PreviewKey,
-        proof: &str,
-        image: &RgbaImage,
-    ) -> Option<crate::GamutWarning> {
-        let mut entries = self.gamut.lock();
-        if let Some(index) = entries
-            .iter()
-            .position(|(cached_key, cached_proof, _)| *cached_key == key && cached_proof == proof)
-        {
-            let entry = entries.remove(index);
-            let warning = entry.2;
-            entries.push(entry);
-            return Some(warning);
-        }
-        let warning = crate::engine::gamut_warning(image, Some(proof))?;
-        entries.push((key, proof.to_owned(), warning));
-        while entries.len() > 8 {
-            entries.remove(0);
-        }
-        Some(warning)
-    }
-
-    /// Cached preview frame; `fast` renders at half size and upsamples.
+    /// Cached preview frame; the render service owns the one-record-per-call
+    /// lifecycle wrapper and the cache/latest-value logic.
     fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
-        let start = Instant::now();
-        let perf = std::env::var_os("AURORA_PERF_REPLAY").is_some();
-        // Draft and Final must keep the same output size: a lower draft cap made
-        // the preview jump when the pointer was released. Draft is cheaper
-        // because `fast` renders half size and upsamples, not because it is smaller.
-        let max = request.max_size;
-        let adj = crate::styles::resolve(&request.adjustments);
-        let (src, source_kind) = match self.native_raw_source(request.image, Some((&adj.geometry, request.region, max))) {
-            Some(native) => (native, "native_raw"),
-            None => (self.source(request.image)?, "source"),
-        };
-        let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
-            .with_source(src.snapshot_id());
-        let (rendering, intent_note) = crate::engine::request_rendering(request);
-        let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
-        // Graph-dirty reuse. `preview_cache::key` still includes the layer rows
-        // and node topology, so an edit confined to a pruned branch misses the
-        // exact key even though it cannot move a pixel. `dirty_between` decides
-        // that case after `graph_reusable_with` has ruled out every other input
-        // (spots, develop/detail/portrait/geometry, region, size, quality).
-        // Repair first: a row with no node still renders, so it must be a node
-        // for the diff to see it.
-        let graph = adj.nodes.clone().unwrap_or_default().repaired(&adj.layers);
-        let mut frame_key = key;
-        let mut graph_reused = false;
-        let hit = {
-            let mut st = self.state.lock();
-            st.preview.get(key)
-        };
-        let hit = match hit {
-            Some(hit) => Some(hit),
-            None => {
-                let reuse_key = { self.graph_gate.lock().reuse(&key, &graph, &adj.layers) };
-                match reuse_key {
-                    Some(reuse_key) => {
-                        let hit = {
-                            let mut st = self.state.lock();
-                            st.preview.get(reuse_key)
-                        };
-                        if hit.is_some() {
-                            frame_key = reuse_key;
-                            graph_reused = true;
-                        }
-                        hit
-                    }
-                    None => None,
-                }
-            }
-        };
-        {
-            let mut gate = self.graph_gate.lock();
-            gate.record(key, frame_key, graph, adj.layers.clone());
-        }
-        if let Some(hit) = hit {
-            let histogram = hit.histogram.clone();
-            let source = hit.into_image();
-            let (width, height) = (source.width, source.height);
-            let gamut_warning = request
-                .proof_profile
-                .as_deref()
-                .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
-            let (image, degraded) = self.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
-            let degraded = degraded.or(intent_note);
-            let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
-            if perf {
-                eprintln!("AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":true,\"graph_reuse\":{},\"fast\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
-                    request.generation, request.image.0, graph_reused, fast, width, height, elapsed_ms, source_kind, request.bypass);
-            }
-            return Ok(PreviewFrame {
-                histogram,
-                image,
-                generation: request.generation,
-                elapsed_ms,
-                degraded,
-                gamut_warning,
-                bgra: false,
-            });
-        }
-        let display_is_noop = match request.display_profile.as_deref() {
-            None => true,
-            Some(path) => {
-                static DISPLAY_SRGB_CACHE: std::sync::OnceLock<
-                    parking_lot::Mutex<Option<(std::path::PathBuf, bool)>>,
-                > = std::sync::OnceLock::new();
-                let mut guard = DISPLAY_SRGB_CACHE
-                    .get_or_init(|| parking_lot::Mutex::new(None))
-                    .lock();
-                if let Some((cached_path, is_srgb)) = guard.as_ref() {
-                    if cached_path.as_path() == path {
-                        *is_srgb
-                    } else {
-                        let is_srgb = crate::icc::load_profile(path)
-                            .map(|p| crate::icc::is_srgb(&p))
-                            .unwrap_or(false);
-                        *guard = Some((path.to_path_buf(), is_srgb));
-                        is_srgb
-                    }
-                } else {
-                    let is_srgb = crate::icc::load_profile(path)
-                        .map(|p| crate::icc::is_srgb(&p))
-                        .unwrap_or(false);
-                    *guard = Some((path.to_path_buf(), is_srgb));
-                    is_srgb
-                }
-            }
-        };
-        let direct_bgra = !fast
-            && request.quality == RenderQuality::Draft
-            && display_is_noop
-            && request.proof_profile.is_none();
-        if direct_bgra {
-            let out = process::render_preview_bgra(
-                &src,
-                &adj,
-                request.region,
-                max,
-                request.bypass,
-                request.mask_overlay,
-                true,
-            );
-            let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
-            if perf {
-                eprintln!(
-                    "AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":false,\"fast\":false,\"bgra\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
-                    request.generation,
-                    request.image.0,
-                    out.bgra,
-                    out.width,
-                    out.height,
-                    elapsed_ms,
-                    source_kind,
-                    request.bypass
-                );
-            }
-            return Ok(PreviewFrame {
-                image: RgbaImage::new(out.width, out.height, out.rgba),
-                histogram: out.histogram,
-                generation: request.generation,
-                elapsed_ms,
-                degraded: intent_note,
-                gamut_warning: None,
-                bgra: out.bgra,
-            });
-        }
-        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
-        let frame = CachedFrame {
-            width: out.width,
-            height: out.height,
-            pixels: Arc::new(out.rgba),
-            histogram: out.histogram.clone(),
-        };
-        self.state.lock().preview.insert(key, frame.clone());
-        let source = frame.into_image();
-        let gamut_warning = request
-            .proof_profile
-            .as_deref()
-            .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
-        let (image, degraded) = self.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
-        let degraded = degraded.or(intent_note);
-        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
-        if perf {
-            eprintln!("AURORA_PERF {{\"event\":\"engine_preview\",\"id\":{},\"image_id\":{},\"hit\":false,\"fast\":{},\"width\":{},\"height\":{},\"engine_ms\":{:.3},\"source\":\"{}\",\"bypass\":{}}}",
-                request.generation, request.image.0, fast, out.width, out.height, elapsed_ms, source_kind, request.bypass);
-        }
-        Ok(PreviewFrame {
-            image,
-            histogram: out.histogram,
-            generation: request.generation,
-            elapsed_ms,
-            degraded,
-            gamut_warning,
-            bgra: false,
-        })
+        self.renders().preview_frame(request, fast)
     }
 
-    fn persist(&self, rel_path: &str, adjustments: &AdjustmentSet, info: &ImageInfo) {
-        self.persist_batch(&[(rel_path.to_string(), adjustments.clone(), info.clone())]);
+    fn persist(&self, rel_path: &str, adjustments: &AdjustmentSet, info: &ImageInfo) -> SaveReport {
+        self.persistence().persist(rel_path, adjustments, info)
     }
 
-    fn persist_batch(&self, items: &[(String, AdjustmentSet, ImageInfo)]) {
-        let Some(store) = &self.store else { return };
-        let mut saved = Vec::new();
-        for (rel_path, adjustments, info) in items {
-            if let Err(err) = store.save_adjustments(rel_path, adjustments) {
-                log::warn!("save adjustments {rel_path}: {err}");
-            } else {
-                saved.push((rel_path, info));
-            }
-        }
-        if saved.is_empty() {
-            return;
-        }
-        let mut st = self.state.lock();
-        let entries = saved
-            .into_iter()
-            .map(|(rel_path, info)| Entry {
-                rel_path: rel_path.clone(),
-                rating: info.rating,
-                color_tag: ColorTag::ALL.iter().position(|c| *c == info.color_tag).unwrap_or(0) as i8,
-                keywords: info.keywords.clone(),
-                variant: info.variant,
-                updated_at: now_secs(),
-                trashed: info.trashed,
-            })
-            .collect::<Vec<_>>();
-        upsert_entries(&mut st.catalog, entries);
-        let catalog = st.catalog.clone();
-        drop(st);
-        if let Err(err) = store.save_index(&catalog) {
-            log::warn!("save catalog: {err}");
-        }
+    /// Writes one batch of adjustment files and then the catalog index.
+    ///
+    /// Each document is written atomically on its own; this is not a multi-file
+    /// transaction, so one failure does not roll back the others. Disk I/O runs
+    /// without the state mutex. A document whose sequence was overtaken by a
+    /// newer save for the same path is reported
+    /// [`crate::save_report::SaveOutcome::Superseded`] and
+    /// left untouched, so newer bytes are never replaced by older ones.
+    // The persistence service owns the production call graph; this replay hook
+    // is exercised directly by the save-ordering tests.
+    #[allow(dead_code)]
+    fn persist_batch(&self, items: &[(String, AdjustmentSet, ImageInfo)]) -> SaveReport {
+        self.persistence().persist_batch(items)
+    }
+
+    /// [`Self::persist_batch`] with an explicit sequence, so tests can replay a
+    /// stale write after a newer one.
+    #[allow(dead_code)]
+    fn persist_batch_at(&self, seq: u64, items: &[(String, AdjustmentSet, ImageInfo)]) -> SaveReport {
+        self.persistence().persist_batch_at(seq, items)
+    }
+
+    /// Applies a multi-image edit in memory and returns what reached disk.
+    ///
+    /// The in-memory edits are always kept, even when their files failed: the
+    /// user's latest content is never dropped just because the disk refused it.
+    /// `save_adjustments_batch` is the `Result`-shaped wrapper for callers that
+    /// only need pass/fail.
+    pub fn save_adjustments_batch_report(&self, items: &[(ImageId, AdjustmentSet)]) -> SaveReport {
+        self.persistence().save_adjustments_batch_report(items)
+    }
+
+    /// [`Self::save_adjustments_batch_report`] with an explicit sequence, so a
+    /// test can replay an older call after a newer one and prove it neither
+    /// restores stale in-memory edits nor overwrites newer bytes.
+    #[allow(dead_code)]
+    fn save_adjustments_batch_report_at(
+        &self,
+        seq: u64,
+        items: &[(ImageId, AdjustmentSet)],
+    ) -> SaveReport {
+        self.persistence().save_adjustments_batch_report_at(seq, items)
+    }
+
+    /// Applies a multi-image edit in memory and hands each document to the
+    /// bounded single-writer queue.
+    ///
+    /// The in-memory edit is applied **before** the queue is consulted, so the
+    /// user's latest content is immediately visible; a refused submission
+    /// ([`QueuedSaveOutcome::Full`], [`QueuedSaveOutcome::Closed`]) keeps that
+    /// edit and only reports that it was not accepted for writing. A later
+    /// flush and resubmit is the retry path. The synchronous
+    /// [`Self::save_adjustments_batch_report`] path is independent and unchanged;
+    /// callers should use one path at a time for a given document so their
+    /// orderings cannot interleave.
+    ///
+    /// Revisions are allocated per relative path and strictly increase for the
+    /// life of this engine, so the queue rejects any older revision. The
+    /// captured [`ImageInfo`] is what the writer uses to upsert the catalog
+    /// after a successful file write.
+    pub fn save_adjustments_queued(&self, items: &[(ImageId, AdjustmentSet)]) -> QueuedSaveSummary {
+        self.persistence().save_adjustments_queued(items)
+    }
+
+    /// Allocates the next queued revision for `rel_path`.
+    ///
+    /// The counter is per path and only moves forward. [`DocumentRevision::next`]
+    /// saturates at `u64::MAX`; at that unreachable point further queued submits
+    /// for the path report [`QueuedSaveOutcome::Superseded`] rather than reusing
+    /// a revision.
+    #[allow(dead_code)]
+    fn next_save_revision(&self, rel_path: &str) -> DocumentRevision {
+        self.persistence().next_save_revision(rel_path)
+    }
+
+    /// Waits for the save queue to drain (or `timeout`) and reports what
+    /// actually reached disk. `None` when this library has no queue.
+    ///
+    /// This is a bounded wait, not a barrier command: a writer stuck in I/O
+    /// still lets this return with `timed_out == true` and the affected paths
+    /// reported [`crate::PathState::NotWritten`]. Queued work is never dropped.
+    pub fn flush_saves(&self, timeout: Duration) -> Option<FlushReport> {
+        self.persistence().flush_saves(timeout)
+    }
+
+    /// Cheap O(1) snapshot of the bounded queue. `None` when there is no queue.
+    pub fn save_queue_status(&self) -> Option<QueueStatus> {
+        self.persistence().save_queue_status()
+    }
+
+    /// Replaces the production queue with a caller-supplied writer and capacity.
+    /// Test-only: the production capacity is fixed and its writer is the real
+    /// `StoreSaveWriter`.
+    #[cfg(test)]
+    fn install_test_save_queue(&mut self, writer: Arc<dyn SaveWriter>, capacity: usize) {
+        services::PersistenceService::install_test_save_queue(self, writer, capacity);
     }
 
     fn collection_tree(&self) -> Vec<Collection> {
@@ -3854,22 +3518,7 @@ impl FileEngine {
     }
 
     fn collection_images(&self, collection: u64) -> Option<Vec<ImageId>> {
-        if let Some(ids) = self.state.lock().c1_members.get(&collection).cloned() {
-            return Some(ids);
-        }
-        let index = collection.checked_sub(FOLDER_BASE)? as usize;
-        let dir = self.folder_dirs().get(index)?.0.clone();
-        let st = self.state.lock();
-        Some(
-            st.entries
-                .iter()
-                .filter(|e| match e.rel_path.rfind('/') {
-                    Some(idx) => e.rel_path[..idx] == dir,
-                    None => dir.is_empty(),
-                })
-                .map(|e| e.info.id)
-                .collect(),
-        )
+        self.catalog().collection_images(collection)
     }
 
     /// Every immediate directory of the catalog with its image count, sorted.
@@ -4304,6 +3953,105 @@ impl FileEngine {
     }
 }
 
+impl FileEngine {
+    /// Compositional catalog/metadata service (see `file_engine_services`).
+    fn catalog(&self) -> services::CatalogService<'_> {
+        services::CatalogService::new(self)
+    }
+
+    /// Compositional source-acquisition service (see `file_engine_services`).
+    fn sources(&self) -> services::SourceService<'_> {
+        services::SourceService::new(self)
+    }
+
+    /// Compositional preview/thumbnail render service.
+    fn renders(&self) -> services::RenderService<'_> {
+        services::RenderService::new(self)
+    }
+
+    /// Compositional export service (see `file_engine_services`).
+    fn exports(&self) -> services::ExportService<'_> {
+        services::ExportService::new(self)
+    }
+
+    /// Compositional merge service (see `file_engine_services`).
+    fn merges(&self) -> services::MergeService<'_> {
+        services::MergeService::new(self)
+    }
+
+    /// Compositional persistence service (see `file_engine_services`).
+    fn persistence(&self) -> services::PersistenceService<'_> {
+        services::PersistenceService::new(self)
+    }
+
+    /// Compositional AI inference service (see `file_engine_services`).
+    fn inference(&self) -> services::InferenceService<'_> {
+        services::InferenceService::new(self)
+    }
+
+    /// Compositional library import/rescan service (see `file_engine_services`).
+    fn imports(&self) -> services::ImportService<'_> {
+        services::ImportService::new(self)
+    }
+
+    /// Compositional library filesystem service (see `file_engine_services`).
+    fn library(&self) -> services::LibraryService<'_> {
+        services::LibraryService::new(self)
+    }
+
+    /// Compositional tethered-capture service (see `file_engine_services`).
+    fn captures(&self) -> services::CaptureService<'_> {
+        services::CaptureService::new(self)
+    }
+}
+
+impl FileEngine {
+    pub fn merge_hdr_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        self.merges().merge_hdr_frames(ids)
+    }
+
+    /// [`Self::merge_hdr_frames`] with the interface's options. `align: false`
+    /// is honoured by keeping the existing no-alignment path; `deghost` is
+    /// consumed by `hdr::fuse_with_options`; `auto_tone` is only logged.
+    pub fn merge_hdr_with_options(
+        &self,
+        ids: &[ImageId],
+        options: &HdrOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        self.merges().merge_hdr_with_options(ids, options)
+    }
+
+    fn start_merge(
+        &self,
+        kind: crate::merge_async::MergeKind,
+        images: &[ImageId],
+        options: &crate::MergeRequest,
+    ) -> anyhow::Result<crate::MergeJobId> {
+        self.merges().start_merge(kind, images, options)
+    }
+
+    /// Stitches frames left to right into one 8-bit TIFF beside the first frame
+    /// and catalogs it. Frames must share one height; each neighbouring pair is
+    /// aligned by a horizontal SAD search and the overlap is feathered.
+    /// Distortion, perspective and exposure matching are not applied yet.
+    pub fn merge_panorama_frames(&self, ids: &[ImageId]) -> anyhow::Result<ImageInfo> {
+        self.merges().merge_panorama_frames(ids)
+    }
+
+    /// [`Self::merge_panorama_frames`] with the interface's options.
+    /// `projection` is consumed by `pano::stitch_with_options`; `auto_crop:
+    /// false` keeps the stitched canvas edges; boundary warp and auto crop are
+    /// still not implemented.
+    pub fn merge_panorama_with_options(
+        &self,
+        ids: &[ImageId],
+        options: &PanoramaOptions,
+    ) -> anyhow::Result<ImageInfo> {
+        self.merges().merge_panorama_with_options(ids, options)
+    }
+
+}
+
 impl ImageEngine for FileEngine {
     fn name(&self) -> String {
         format!("Portrait File Engine ({})", self.root.display())
@@ -4326,111 +4074,27 @@ impl ImageEngine for FileEngine {
     }
 
     fn images(&self) -> Vec<ImageInfo> {
-        self.state.lock().entries.iter().map(|e| e.info.clone()).collect()
+        self.catalog().images()
     }
 
     fn import(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>> {
-        let mut files = Vec::new();
-        for path in paths {
-            if path.is_dir() && !path.starts_with(&self.root) {
-                let mut found = Vec::new();
-                collect(path, path, 0, &mut found)?;
-                files.extend(found.into_iter().map(|(_, path)| path));
-            } else if path.is_file() && is_supported(path) {
-                files.push(path.clone());
-            }
-        }
-        let scanned: Vec<ScannedFile> = files
-            .into_par_iter()
-            .map(|path| {
-                let rel = path
-                    .strip_prefix(&self.root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                scan_file(&self.root, rel, path)
-            })
-            .collect();
-        let mut st = self.state.lock();
-        let mut added = Vec::with_capacity(scanned.len());
-        for scanned in scanned.into_iter().flat_map(ScannedFile::library_variants) {
-            if scanned.packed.is_some() && st.entries.iter().any(|entry| entry.rel_path == scanned.rel_path) {
-                continue;
-            }
-            let adjustments = if scanned.packed.is_some() {
-                let saved = self.store.as_ref().map(|store| store.load_adjustments(&scanned.rel_path));
-                match saved {
-                    Some(Ok(saved))
-                        if !saved.is_default() || st.catalog.entry(&scanned.rel_path).is_some() => saved,
-                    Some(Ok(_)) => {
-                        let adjustments = scanned.c1_adjustments().unwrap_or_default();
-                        if !adjustments.is_default() {
-                            if let Some(store) = &self.store {
-                                if let Err(err) = store.save_adjustments(&scanned.rel_path, &adjustments) {
-                                    log::warn!("save EIP adjustments {}: {err}", scanned.rel_path);
-                                }
-                            }
-                        }
-                        adjustments
-                    }
-                    _ => scanned.c1_adjustments().unwrap_or_default(),
-                }
-            } else {
-                AdjustmentSet::default()
-            };
-            let id = ImageId(st.next_id);
-            st.next_id += 1;
-            let keywords = scanned.iptc.keywords.clone();
-            let info = ImageInfo {
-                id,
-                path: scanned.path.clone(),
-                file_name: scanned.file_name,
-                kind: scanned.kind,
-                heif: None,
-                width: scanned.width,
-                height: scanned.height,
-                file_size: scanned.file_size,
-                exif: scanned.exif,
-                iptc: scanned.iptc,
-                keywords,
-                rating: 0,
-                color_tag: ColorTag::None,
-                variant: scanned.packed_variant,
-                has_adjustments: !adjustments.is_default(),
-                trashed: false,
-            };
-            added.push(info.clone());
-            st.entries.push(FileEntry {
-                info,
-                path: scanned.path,
-                rel_path: scanned.rel_path,
-                adjustments,
-            });
-        }
-        Ok(added)
+        self.imports().import(paths)
     }
 
     fn collections(&self) -> Vec<Collection> {
-        let c1 = self.state.lock().c1_collections.clone();
-        if c1.is_empty() {
-            self.collection_tree()
-        } else {
-            c1
-        }
+        self.catalog().collections()
     }
 
     fn library_root(&self) -> Option<PathBuf> {
-        Some(self.root.clone())
+        self.catalog().library_root()
     }
 
     fn collection_path(&self, id: u64) -> Option<PathBuf> {
-        let index = id.checked_sub(FOLDER_BASE)? as usize;
-        let (dir, _) = self.folder_dirs().get(index)?.clone();
-        Some(if dir.is_empty() { self.root.clone() } else { self.root.join(dir) })
+        self.catalog().collection_path(id)
     }
 
     fn user_collections(&self) -> Vec<crate::UserCollection> {
-        self.store.as_ref().map(|store| store.load_user_collections()).unwrap_or_default()
+        self.catalog().user_collections()
     }
 
     fn manage_files(&self, action: crate::LibraryAction) -> anyhow::Result<Vec<ImageInfo>> {
@@ -4628,26 +4292,32 @@ impl ImageEngine for FileEngine {
         &self,
         items: &[(ImageId, AdjustmentSet)],
     ) -> anyhow::Result<()> {
-        if items.is_empty() {
-            return Ok(());
+        match FileEngine::save_adjustments_batch_report(self, items).into_error() {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
-        let records = {
-            let mut st = self.state.lock();
-            let ids: Vec<ImageId> = items.iter().map(|(image, _)| *image).collect();
-            let positions = image_positions(&st.entries, &ids)?;
-            items
-                .iter()
-                .zip(positions)
-                .map(|((_, adjustments), position)| {
-                    let entry = &mut st.entries[position];
-                    entry.adjustments = adjustments.clone();
-                    entry.info.has_adjustments = !adjustments.is_default();
-                    (entry.rel_path.clone(), adjustments.clone(), entry.info.clone())
-                })
-                .collect::<Vec<_>>()
-        };
-        self.persist_batch(&records);
-        Ok(())
+    }
+
+    fn save_adjustments_batch_report(
+        &self,
+        items: &[(ImageId, AdjustmentSet)],
+    ) -> crate::SaveReport {
+        FileEngine::save_adjustments_batch_report(self, items)
+    }
+
+    fn save_adjustments_queued(
+        &self,
+        items: &[(ImageId, AdjustmentSet)],
+    ) -> Option<QueuedSaveSummary> {
+        Some(FileEngine::save_adjustments_queued(self, items))
+    }
+
+    fn flush_pending_saves(&self, timeout: std::time::Duration) -> Option<FlushReport> {
+        FileEngine::flush_saves(self, timeout)
+    }
+
+    fn pending_save_status(&self) -> Option<QueueStatus> {
+        FileEngine::save_queue_status(self)
     }
 
     fn new_variant(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
@@ -4756,10 +4426,7 @@ impl ImageEngine for FileEngine {
     }
 
     fn thumbnail(&self, image: ImageId, adjustments: &AdjustmentSet, max_size: u32) -> anyhow::Result<RgbaImage> {
-        // Thumbnails queue behind the visible preview on the decode gate.
-        let src = self.source_with_priority(image, DecodePriority::Thumbnail)?;
-        let out = process::render(&src, &crate::styles::resolve(adjustments), NormRect::FULL, max_size, false, None);
-        Ok(RgbaImage::new(out.width, out.height, out.rgba))
+        self.renders().thumbnail(image, adjustments, max_size)
     }
 
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
@@ -4887,185 +4554,11 @@ impl ImageEngine for FileEngine {
     }
 
     fn compute_ai_mask(&self, image: ImageId, kind: AiMaskKind) -> anyhow::Result<String> {
-        let (rel_path, variant) = {
-            let st = self.state.lock();
-            let entry = st
-                .entries
-                .iter()
-                .find(|e| e.info.id == image)
-                .ok_or_else(|| anyhow::anyhow!("unknown image {image:?}"))?;
-            (entry.rel_path.clone(), entry.info.variant)
-        };
-        let cache_key = |mask_kind: AiMaskKind| crate::mask_store::key(&rel_path, variant, mask_kind);
-        let key = cache_key(kind);
-        if crate::aimask::lookup(&key).is_some() {
-            return Ok(key);
-        }
-        if let Some(plane) = crate::mask_store::load(&self.root, &key) {
-            crate::aimask::store(&key, plane);
-            return Ok(key);
-        }
-        let start = Instant::now();
-        let base_key = |group: &str| {
-            format!(
-                "mask-base-v1:{}#v{variant}:{group}",
-                rel_path.replace('\\', "/")
-            )
-        };
-        let plane = match kind {
-            AiMaskKind::Subject
-            | AiMaskKind::Person
-            | AiMaskKind::Clothing
-            | AiMaskKind::Background
-            | AiMaskKind::Sky => {
-                let subject_cache = base_key("subject");
-                let subject = match crate::aimask::lookup(&subject_cache) {
-                    Some(subject) => subject,
-                    None => {
-                        let input = self.ai_input(image)?;
-                        match crate::aimask::subject_mask(&input.rgba, input.width, input.height) {
-                            Ok(subject) => {
-                                let subject = std::sync::Arc::new(crate::aimask::MaskPlane::new(
-                                    input.width as usize,
-                                    input.height as usize,
-                                    subject,
-                                ));
-                                crate::aimask::store(&subject_cache, subject.clone());
-                                subject
-                            }
-                            Err(err) => {
-                                log::warn!("AI mask {kind:?} unavailable: {err:#}");
-                                return Err(err);
-                            }
-                        }
-                    }
-                };
-                for alias in [
-                    AiMaskKind::Subject,
-                    AiMaskKind::Person,
-                    AiMaskKind::Clothing,
-                ] {
-                    crate::aimask::store(&cache_key(alias), subject.clone());
-                }
-                match kind {
-                    AiMaskKind::Subject | AiMaskKind::Person | AiMaskKind::Clothing => subject,
-                    AiMaskKind::Background => {
-                        let mut background = subject.data.clone();
-                        for value in &mut background {
-                            *value = 1.0 - *value;
-                        }
-                        std::sync::Arc::new(crate::aimask::MaskPlane::new(
-                            subject.w,
-                            subject.h,
-                            background,
-                        ))
-                    }
-                    AiMaskKind::Sky => {
-                        let input = self.ai_input(image)?;
-                        let sky = crate::aimask::sky_mask_from_subject(
-                            &input.rgba,
-                            input.width as usize,
-                            input.height as usize,
-                            &subject.data,
-                        );
-                        std::sync::Arc::new(crate::aimask::MaskPlane::new(
-                            input.width as usize,
-                            input.height as usize,
-                            sky,
-                        ))
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            AiMaskKind::Skin | AiMaskKind::Hair => {
-                let skin_cache = base_key("people-face");
-                let hair_cache = base_key("people-hair");
-                let skin = crate::aimask::lookup(&skin_cache);
-                let hair = crate::aimask::lookup(&hair_cache);
-                let (skin, hair) = match (skin, hair) {
-                    (Some(skin), Some(hair)) => (skin, hair),
-                    (skin, hair) => {
-                        let input = self.ai_input(image)?;
-                        match crate::aimask::people_masks(&input.rgba, input.width, input.height) {
-                        Ok(masks) => {
-                            let skin = skin.unwrap_or_else(|| {
-                                let skin = std::sync::Arc::new(crate::aimask::MaskPlane::new(
-                                    input.width as usize,
-                                    input.height as usize,
-                                    masks.face,
-                                ));
-                                crate::aimask::store(&skin_cache, skin.clone());
-                                skin
-                            });
-                            let hair = hair.unwrap_or_else(|| {
-                                let hair = std::sync::Arc::new(crate::aimask::MaskPlane::new(
-                                    input.width as usize,
-                                    input.height as usize,
-                                    masks.hair,
-                                ));
-                                crate::aimask::store(&hair_cache, hair.clone());
-                                hair
-                            });
-                            (skin, hair)
-                        }
-                        Err(err) => {
-                            log::warn!("AI mask {kind:?} unavailable: {err:#}");
-                            return Err(err);
-                        }
-                        }
-                    }
-                };
-                crate::aimask::store(&cache_key(AiMaskKind::Skin), skin.clone());
-                crate::aimask::store(&cache_key(AiMaskKind::Hair), hair.clone());
-                if kind == AiMaskKind::Skin {
-                    skin
-                } else {
-                    hair
-                }
-            }
-            other => anyhow::bail!(
-                "Capture One's six-class people parser has no {other:?} class (background, hair, \
-                 body skin, face skin, clothing, held object); no model segments it"
-            ),
-        };
-        crate::aimask::store(&key, plane.clone());
-        log::info!(
-            "AI mask {kind:?} for image {}: {}x{}, {:.0} ms, foreground {:.1}%",
-            image.0,
-            plane.w,
-            plane.h,
-            start.elapsed().as_secs_f32() * 1000.0,
-            plane.foreground_fraction() * 100.0
-        );
-        if let Err(err) = crate::mask_store::save(&self.root, &key, &plane) {
-            log::warn!("AI mask {kind:?} for image {} not saved: {err:#}", image.0);
-        }
-        Ok(key)
+        self.inference().compute_ai_mask(image, kind)
     }
 
     fn eye_report(&self, image: ImageId) -> anyhow::Result<crate::EyeReport> {
-        if let Some(report) = self.eyes.lock().get(&image) {
-            return Ok(*report);
-        }
-        let input = self.ai_input(image)?;
-        let start = Instant::now();
-        let report = match crate::any_eye_closed(&input.rgba, input.width, input.height) {
-            Ok(report) => report,
-            Err(err) => {
-                log::warn!("closed-eye check for image {} unavailable: {err:#}", image.0);
-                return Err(err);
-            }
-        };
-        log::info!(
-            "closed-eye check for image {}: {} eyes, {} closed, worst p={:.2}, {:.0} ms",
-            image.0,
-            report.evaluated,
-            report.closed,
-            report.worst_confidence,
-            start.elapsed().as_secs_f32() * 1000.0
-        );
-        self.eyes.lock().insert(image, report);
-        Ok(report)
+        self.inference().eye_report(image)
     }
     fn auto_rotate(&self, image: ImageId) -> anyhow::Result<u16> {
         let src = self.source(image)?;
@@ -5163,256 +4656,35 @@ impl ImageEngine for FileEngine {
     }
 
     fn start_export(&self, job: ExportJob) -> anyhow::Result<()> {
-        job.recipe.format.ensure_supported()?;
-        job.recipe.format.supports_bit_depth(job.recipe.bit_depth)?;
-        let state = self.state.clone();
-        let publish_gate = self.publish_gate.clone();
-        let job_id = job.job_id;
-        // One lock, one file: the info, the queued path and (for the exact
-        // desktop path) the RAW adjustments must describe the same catalog
-        // entry, so a later rescan cannot pair an old recipe with a new file.
-        let render = {
-            let st = state.lock();
-            let entry = st.entries.iter().find(|entry| entry.info.id == job.image)
-                .ok_or_else(|| anyhow::anyhow!("export: unknown image {}", job.image.0))?;
-            #[cfg(all(windows, feature = "z6iii-raw-export"))]
-            let raw_for_exact = entry.adjustments.clone();
-            (entry.info.clone(), entry.path.clone(), #[cfg(all(windows, feature = "z6iii-raw-export"))] raw_for_exact)
-        };
-        let destination = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
-        // Canonicalize and prove the destination is a folder before a single
-        // pixel is rendered, so a bad recipe fails at `start_export` rather
-        // than after minutes of work.
-        let dir = crate::output::resolve_output_dir(&destination)?;
-        // A crashed export leaves a staging folder behind; reclaim it here.
-        crate::output::sweep_stale_staging(&dir);
-        let info = render.0;
-        // Lightweight identity at queue time: the worker re-checks it before it
-        // decodes and again afterwards, so a file that was deleted, moved or
-        // replaced while the job waited fails instead of exporting new pixels
-        // with the queued recipe and size.
-        let queued_source = ExportSourceSnapshot::read(&render.1);
-        #[cfg(all(windows, feature = "z6iii-raw-export"))]
-        let raw_for_exact = render.2;
-        // The adjustment snapshot is immutable: the worker renders what was
-        // queued, even if the user edits the image while it waits.
-        let adjustments = crate::styles::resolve(&self.load_adjustments(job.image)).into_owned();
-        // `load_adjustments` reads the catalog a second time. Raw defaults and
-        // styles are still resolved by that one implementation; this only makes
-        // sure the second lookup described the same file as the queued entry.
-        queued_source.ensure_unchanged(&self.sources, job.image, "while it was being queued")?;
-        // The charge covers the source the job decodes as well as the frame it
-        // writes. Both come from the catalog, so no pixel is decoded before the
-        // export scheduler admits the job; an unreadable size falls back to the
-        // documented floor instead of being priced as free.
-        // Gate the exact envelope on the same adjustments the worker hands to
-        // `Export::prepare`, so admission and the specialised path agree.
-        #[cfg(all(windows, feature = "z6iii-raw-export"))]
-        let estimated_bytes = estimated_job_charge(&job.recipe, &info, &raw_for_exact);
-        #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-        let estimated_bytes = estimated_export_charge(&job.recipe, &info, &adjustments.geometry);
-        state.lock().jobs.insert(job_id, JobStatus::Queued);
-        let sources = Arc::clone(&self.sources);
-        std::thread::spawn(move || {
-            let cancelled = |state: &Mutex<State>| state.lock().cancelled.contains(&job_id);
-            let Some(_export_permit) =
-                export_scheduler().acquire_cancellable(estimated_bytes, || cancelled(&state))
-            else {
-                return;
-            };
-            {
-                let mut st = state.lock();
-                if st.cancelled.contains(&job_id) {
-                    return;
-                }
-                st.jobs.insert(job_id, JobStatus::Running { progress: 0.05 });
-            }
-            let result = (|| {
-                // The source is read only now, with an export permit in hand:
-                // a queued job that is cancelled never decodes a frame.
-                queued_source.ensure_unchanged(&sources, job.image, "after it was queued")?;
-                // The exact desktop path maps the RAW and loads its assets,
-                // which costs about as much as a decode; it runs under the same
-                // permit, after the identity check above.
-                #[cfg(all(windows, feature = "z6iii-raw-export"))]
-                let exact = match crate::z6iii::desktop::Export::prepare(
-                    &queued_source.path,
-                    &raw_for_exact,
-                    &job.recipe,
-                ) {
-                    Ok(exact) => exact,
-                    Err(error) => {
-                        log::warn!("Z6III export unavailable; using standard engine: {error:#}");
-                        None
-                    }
-                };
-                #[cfg(all(windows, feature = "z6iii-raw-export"))]
-                let use_standard = exact.is_none();
-                #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
-                let use_standard = true;
-                // Preparing the exact path opened the file; re-check it before
-                // any frame is decoded from it.
-                queued_source.ensure_unchanged(&sources, job.image, "after the export was prepared")?;
-                let standard = if use_standard {
-                    let (source, source_size) = if let Some(native) = sources.native_raw_source(job.image, None) {
-                        let size = native.size();
-                        (native, size)
-                    } else {
-                        (sources.source(job.image)?, (info.width, info.height))
-                    };
-                    let (width, height) =
-                        crate::mock::geometry::FrameMap::new(source_size, &adjustments.geometry).frame_size();
-                    let edited_size = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
-                    let (width, height) = crate::recipe::output_size(&job.recipe, edited_size);
-                    let mut recipe = job.recipe.clone();
-                    recipe.scale = crate::ScaleMode::Fixed100;
-                    Some((source, adjustments, width.max(height), recipe))
-                } else {
-                    None
-                };
-                // A file that changed while it decoded must not be published
-                // with the size computed from the stale catalog entry.
-                queued_source.ensure_unchanged(&sources, job.image, "while it was decoded")?;
-                // Every format renders into a staging folder on the target's
-                // own volume. The finished file is synced and only then renamed
-                // to its final name, so cancel or failure never truncates (or
-                // touches) an existing output.
-                let staged = crate::output::StagedExport::new(&dir, job_id)?;
-                let written = (|| {
-                    #[cfg(all(windows, feature = "z6iii-raw-export"))]
-                    if let Some(exact) = exact {
-                        return exact.write(staged.dir(), &info, &job.recipe, || cancelled(&state));
-                    }
-                    let (src, adjustments, max_size, recipe) = standard.expect("standard export source");
-                    if recipe.bit_depth == 16 {
-                        let out = process::render16(
-                            &src,
-                            &adjustments,
-                            NormRect::FULL,
-                            max_size,
-                            false,
-                        );
-                        crate::recipe::write_export16(
-                            staged.dir(),
-                            &info,
-                            &recipe,
-                            info.variant as usize,
-                            out.rgba,
-                            out.width,
-                            out.height,
-                            |p| {
-                                if !cancelled(&state) {
-                                    state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
-                                }
-                            },
-                        )
-                    } else {
-                        let out = process::render(
-                            &src,
-                            &adjustments,
-                            NormRect::FULL,
-                            max_size,
-                            false,
-                            None,
-                        );
-                        crate::recipe::write_export(
-                            staged.dir(),
-                            &info,
-                            &recipe,
-                            info.variant as usize,
-                            out.rgba,
-                            out.width,
-                            out.height,
-                            |p| {
-                                if !cancelled(&state) {
-                                    state.lock().jobs.insert(job_id, JobStatus::Running { progress: 0.1 + 0.9 * p });
-                                }
-                            },
-                        )
-                    }
-                })();
-                let written = written?;
-                // A file that changed while it rendered must not be published.
-                queued_source.ensure_unchanged(&sources, job.image, "while it was rendered")?;
-                // The gate makes the final cancel check and the publish one
-                // step: `cancel_job` takes the same gate, so a cancel that
-                // returns `true` happened before this publish and the job is
-                // dropped below; a publish that got here first records `Done`
-                // under the gate and `cancel_job` then reports `false`.
-                let _gate = publish_gate.lock();
-                if cancelled(&state) {
-                    anyhow::bail!("cancelled");
-                }
-                let output = staged.publish(&written)?;
-                state.lock().jobs.insert(job_id, JobStatus::Done { output: output.clone() });
-                Ok(output)
-            })();
-            let mut state = state.lock();
-            if !state.cancelled.contains(&job_id) {
-                state.jobs.insert(
-                    job_id,
-                    match result {
-                        Ok(output) => {
-                            // File name only: an export log must not reveal the
-                            // folder a photograph lives in.
-                            log::info!("export job {job_id} wrote {}", crate::output::log_name(&output));
-                            JobStatus::Done { output }
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "export job {job_id} for {} failed: {}",
-                                info.file_name,
-                                crate::output::sanitize_log_text(&err.to_string())
-                            );
-                            JobStatus::Failed { message: err.to_string() }
-                        }
-                    },
-                );
-            }
-        });
-        Ok(())
+        self.exports().start_export(job)
     }
 
     fn job_status(&self, job_id: u64) -> JobStatus {
-        self.state.lock().jobs.get(&job_id).cloned().unwrap_or(JobStatus::Failed { message: "unknown job".into() })
+        self.exports().job_status(job_id)
     }
 
     fn cancel_job(&self, job_id: u64) -> bool {
-        // Same gate as the export's publish point: either the cancel lands
-        // before the publish (and the job is dropped) or the publish lands
-        // first and the job is already `Done` here. Lock order: gate, state.
-        let _gate = self.publish_gate.lock();
-        let mut st = self.state.lock();
-        match st.jobs.get(&job_id) {
-            Some(JobStatus::Queued) | Some(JobStatus::Running { .. }) => {
-                st.cancelled.insert(job_id);
-                st.jobs.insert(job_id, JobStatus::Failed { message: "cancelled".into() });
-                drop(st);
-                export_scheduler().notify_all();
-                true
-            }
-            _ => false,
-        }
+        self.exports().cancel_job(job_id)
     }
 
     fn source_status(&self, image: ImageId) -> Option<String> {
-        self.state.lock().source_reasons.get(&image).cloned()
+        self.catalog().source_status(image)
     }
 
     fn tether_status(&self) -> TetherStatus {
-        tether::probe()
+        self.captures().tether_status()
     }
     fn capture_devices(&self) -> Vec<crate::CaptureDevice> {
-        tether::devices()
+        self.captures().capture_devices()
     }
     fn portrait_capabilities(&self) -> Vec<crate::PortraitCapability> {
         crate::panel_commands::portrait_capabilities()
     }
     fn layer_summaries(&self, image: ImageId) -> Vec<crate::engine::LayerSummary> {
-        self.state.lock().layers.get(&image).cloned().unwrap_or_default()
+        self.catalog().layer_summaries(image)
     }
     fn retouch_masks(&self, image: ImageId) -> Vec<crate::c1_retouch::RetouchMaskSummary> {
-        self.state.lock().retouch.get(&image).cloned().unwrap_or_default()
+        self.catalog().retouch_masks(image)
     }
     fn capabilities(&self) -> crate::engine::EngineCapabilities {
         crate::engine::EngineCapabilities {
@@ -5438,35 +4710,22 @@ impl ImageEngine for FileEngine {
         }
     }
     fn camera_status(&self) -> CameraStatus {
-        tether::camera_status()
+        self.captures().camera_status()
     }
     fn camera_settings(&self) -> Option<CameraSettings> {
-        tether::camera_settings()
+        self.captures().camera_settings()
     }
     fn capture(&self) -> anyhow::Result<ImageInfo> {
-        let frame = tether::capture_frame()?;
-        let dir = self.root.join("Capture");
-        std::fs::create_dir_all(&dir)?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let path = dir.join(format!("CAP_{stamp}.jpg"));
-        std::fs::write(&path, &frame.jpeg)?;
-        self.add_file(&path)
+        self.captures().capture()
     }
     fn live_view_frame(&self, width: u32) -> Option<RgbaImage> {
-        match tether::preview_frame(width) {
-            Ok(frame) => Some(frame),
-            Err(err) => {
-                log::debug!("live view: {err:#}");
-                None
-            }
-        }
+        self.captures().live_view_frame(width)
     }
-    /// libgphoto2 exposes focus only through the camera's config tree, which this
-    /// binding does not read yet, so a focus step is a no-op.
-    fn live_view_focus(&self, _steps: i32) {}
+    /// See [`services::CaptureService::live_view_focus`]: focus is a no-op
+    /// because this binding does not read the camera's config tree.
+    fn live_view_focus(&self, steps: i32) {
+        self.captures().live_view_focus(steps)
+    }
 }
 
 /// Sorted by `(group, name)`; of a duplicate pair the first one wins.
@@ -6138,6 +5397,62 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_import_returns_infos_one_succeeded_job_and_is_idempotent() {
+        let root = s2_test_dir("import-service-root");
+        let source = s2_test_dir("import-service-source");
+        // Opening an empty library uses the unrecorded opening scan, so the
+        // snapshot starts empty and the record below belongs to `import`.
+        let engine = FileEngine::open(&root).unwrap();
+        assert!(engine.import_job_snapshot().scope(JobScope::Import).is_none());
+
+        let first = write_test_png(&source, "first.png", 32, 24, 11);
+        let second = write_test_png(&source, "second.png", 40, 30, 22);
+        let added = engine.import(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(engine.images().len(), 2);
+        let mut names: Vec<String> = added.iter().map(|info| info.file_name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["first.png".to_string(), "second.png".to_string()]);
+        assert!(added.iter().all(|info| info.width > 0 && info.height > 0 && info.file_size > 0));
+
+        let snapshot = engine.import_job_snapshot();
+        let import = snapshot.scope(JobScope::Import).expect("one import scope");
+        assert_eq!(import.succeeded, 1, "one import call is one Succeeded record");
+        assert_eq!(import.live(), 0);
+
+        // Re-importing the same paths adds no entries; it still records the
+        // call as Succeeded.
+        let again = engine.import(&[first, second]).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(engine.images().len(), 2);
+        let snapshot = engine.import_job_snapshot();
+        let import = snapshot.scope(JobScope::Import).expect("import scope");
+        assert_eq!(import.succeeded, 2);
+        assert_eq!(import.live(), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&source).ok();
+    }
+
+    #[test]
+    fn synthetic_rescan_records_one_succeeded_job_per_call() {
+        let dir = s2_test_dir("rescan-service");
+        write_test_png(&dir, "one.png", 32, 24, 3);
+        let engine = FileEngine::open(&dir).unwrap();
+        assert!(engine.import_job_snapshot().scope(JobScope::Import).is_none());
+
+        engine.rescan().unwrap();
+        engine.rescan().unwrap();
+        let snapshot = engine.import_job_snapshot();
+        let import = snapshot.scope(JobScope::Import).expect("rescan scope");
+        assert_eq!(import.succeeded, 2, "one Succeeded record per rescan");
+        assert_eq!(import.live(), 0);
+        assert_eq!(engine.images().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn source_status_reasons_map_to_stable_kinds() {
         assert_eq!(
             SourceStatusKind::of("RAW decode failed: bad data"),
@@ -6155,7 +5470,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("portrait-cancel-job-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
-        engine.state.lock().jobs.insert(77, JobStatus::Queued);
+        let jid = engine.export_jobs.submit(JobScope::Export, CancelToken::new());
+        engine.export_job_ids.lock().insert(77, jid);
         assert!(engine.cancel_job(77));
         assert_eq!(engine.job_status(77), JobStatus::Failed { message: "cancelled".into() });
         assert!(!engine.cancel_job(77));
@@ -7545,6 +6861,158 @@ mod tests {
     }
 
     #[test]
+    fn export_job_snapshot_counts_the_export_scope() {
+        let fixture = export_fixture("snapshot");
+        let out = fixture.dir.join("Output");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 51, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap();
+        let JobStatus::Done { .. } = wait_export(&fixture.engine, 51) else {
+            panic!("export did not finish: {:?}", fixture.engine.job_status(51));
+        };
+        let snapshot = fixture.engine.export_job_snapshot();
+        let export = snapshot.scope(JobScope::Export).expect("export scope counts");
+        assert_eq!(export.total, 1);
+        assert_eq!(export.succeeded, 1);
+        assert_eq!(export.live(), 0);
+        assert_eq!(snapshot.terminal(), 1);
+        assert_eq!(snapshot.live(), 0);
+    }
+
+    #[test]
+    fn unknown_export_job_is_failed_not_queued() {
+        let fixture = export_fixture("unknown");
+        assert_eq!(
+            fixture.engine.job_status(987_654),
+            JobStatus::Failed { message: "unknown job".into() }
+        );
+        assert!(!fixture.engine.cancel_job(987_654));
+        assert_eq!(fixture.engine.export_job_snapshot().total, 0);
+    }
+
+    #[test]
+    fn cancelling_before_the_worker_starts_publishes_nothing() {
+        let fixture = export_fixture("cancel-early");
+        let out = fixture.dir.join("Output");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Hold the whole export budget so the worker cannot leave the
+        // scheduler wait before `cancel_job` runs. The guard is dropped before
+        // we wait on the job, so this cannot stall another export test.
+        let hold = export_scheduler()
+            .acquire_cancellable(usize::MAX, || false)
+            .expect("the test acquires the idle export budget");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 52, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
+            .unwrap();
+        assert!(fixture.engine.cancel_job(52));
+        // `cancel_job` moves the registry to `Cancelling` synchronously, so the
+        // old immediate-cancel contract holds before the worker runs.
+        assert_eq!(
+            fixture.engine.job_status(52),
+            JobStatus::Failed { message: "cancelled".into() }
+        );
+        drop(hold);
+
+        assert!(matches!(wait_export(&fixture.engine, 52), JobStatus::Failed { .. }));
+        assert!(staging_leftovers(&out).is_empty(), "no staging folder survives");
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().flatten().count(),
+            0,
+            "a cancelled export publishes nothing"
+        );
+        // Exactly one terminal state; a second cancel is a no-op.
+        assert!(!fixture.engine.cancel_job(52));
+        let snapshot = fixture.engine.export_job_snapshot();
+        assert_eq!(snapshot.terminal(), 1);
+        assert_eq!(snapshot.scope(JobScope::Export).unwrap().cancelled, 1);
+    }
+
+    #[test]
+    fn a_late_success_cannot_overwrite_a_cancelled_export() {
+        let fixture = export_fixture("stale-success");
+        let jid = fixture.engine.export_jobs.submit(JobScope::Export, CancelToken::new());
+        fixture.engine.export_job_ids.lock().insert(53, jid);
+
+        assert!(fixture.engine.cancel_job(53));
+        // The worker observes the token at the publish point and settles the
+        // job as `Cancelled`; a late `Succeeded` is then rejected by the
+        // terminal registry state and the output map never grows.
+        fixture.engine.export_jobs.transition(jid, JobState::Cancelled).unwrap();
+        assert!(fixture.engine.export_jobs.transition(jid, JobState::Succeeded).is_err());
+        assert_eq!(
+            fixture.engine.job_status(53),
+            JobStatus::Failed { message: "cancelled".into() },
+            "a cancelled job is never reported as Done"
+        );
+        assert!(!fixture.engine.export_outputs.lock().contains_key(&53));
+        let snapshot = fixture.engine.export_job_snapshot();
+        assert_eq!(snapshot.terminal(), 1, "exactly one terminal state");
+        assert_eq!(snapshot.scope(JobScope::Export).unwrap().cancelled, 1);
+    }
+
+    #[test]
+    fn export_history_is_bounded_and_keeps_live_and_newest_outputs() {
+        let fixture = export_fixture("bounded-history");
+        let engine = &fixture.engine;
+        let cap = 16usize;
+
+        // A live job that pruning must never touch.
+        let live_jid = engine.export_jobs.submit(JobScope::Export, CancelToken::new());
+        engine.export_jobs.transition(live_jid, JobState::running(0.5)).unwrap();
+        engine.export_job_ids.lock().insert(9_000, live_jid);
+
+        // `cap` terminal jobs, oldest first, each with an output entry.
+        let mut terminal_jids = Vec::new();
+        for job_id in 0..cap as u64 {
+            let jid = engine.export_jobs.submit(JobScope::Export, CancelToken::new());
+            engine.export_jobs.transition(jid, JobState::running(1.0)).unwrap();
+            engine.export_jobs.transition(jid, JobState::Succeeded).unwrap();
+            engine.export_job_ids.lock().insert(job_id, jid);
+            engine.export_outputs.lock().insert(job_id, PathBuf::from(format!("/out/{job_id}.jpg")));
+            terminal_jids.push(jid);
+        }
+        // One newer terminal job: with the `cap` above, this overflows by one.
+        let newest_jid = engine.export_jobs.submit(JobScope::Export, CancelToken::new());
+        engine.export_jobs.transition(newest_jid, JobState::running(1.0)).unwrap();
+        engine.export_jobs.transition(newest_jid, JobState::Succeeded).unwrap();
+        engine.export_job_ids.lock().insert(9_999, newest_jid);
+        engine.export_outputs.lock().insert(9_999, PathBuf::from("/out/newest.jpg"));
+
+        assert_eq!(engine.exports().prune_export_history_for_test(cap), 1);
+
+        // The live job and its status survive.
+        assert_eq!(engine.job_status(9_000), JobStatus::Running { progress: 0.5 });
+        assert!(engine.export_job_ids.lock().contains_key(&9_000));
+
+        // The newest terminal output survives; the oldest one is dropped.
+        assert_eq!(
+            engine.job_status(9_999),
+            JobStatus::Done { output: PathBuf::from("/out/newest.jpg") }
+        );
+        assert!(engine.export_outputs.lock().contains_key(&9_999));
+        assert!(!engine.export_outputs.lock().contains_key(&0));
+        assert_eq!(
+            engine.job_status(0),
+            JobStatus::Failed { message: "unknown job".into() },
+            "a pruned id reports the same unknown-job answer as a never-submitted one"
+        );
+        assert!(!engine.export_job_ids.lock().contains_key(&0));
+
+        // The rest of the retained window still reports Done.
+        assert!(matches!(engine.job_status(1), JobStatus::Done { .. }));
+        assert!(matches!(engine.job_status(cap as u64 - 1), JobStatus::Done { .. }));
+
+        // Registry terminal records are bounded too, and the live one is kept.
+        let snapshot = engine.export_job_snapshot();
+        assert_eq!(snapshot.terminal(), cap, "terminal records bounded to the cap");
+        assert_eq!(snapshot.live(), 1, "the live export is preserved");
+        assert!(!engine.export_jobs.contains(terminal_jids[0]));
+    }
+
+    #[test]
     fn a_destination_that_is_a_file_is_refused_before_rendering() {
         let fixture = export_fixture("bad-destination");
         let not_a_folder = fixture.dir.join("not-a-folder.jpg");
@@ -7577,240 +7045,210 @@ mod tests {
         assert!(!message.contains(r"C:\"));
     }
 
-    // ---- R1: admission before source acquisition --------------------------
+    // ---- export source acquisition above SOURCE_LONG_SIDE ----
+    //
+    // A 4096-capped proxy upscaled to a larger output violates the repository
+    // rule against upsampling. These tests pin the replacement: at or below the
+    // cap the cached `source()` path is unchanged; above it the original file is
+    // decoded once at full resolution (or the job fails) and the cache is left
+    // alone.
 
-    fn published_files(dir: &Path) -> usize {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| !crate::output::is_staging_path(&entry.path()))
-                    .count()
-            })
-            .unwrap_or(0)
-    }
+    /// [`FULL_RES_EXPORT_DECODES`] is process-global; serialize the tests that
+    /// read it so an exact before/after delta also holds when the suite runs
+    /// with more than one test thread.
+    static FULL_RES_EXPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn a_queued_export_is_cancelled_before_it_decodes() {
-        let fixture = export_fixture("r1-queued-cancel");
-        let out = fixture.dir.join("Output");
-        std::fs::create_dir_all(&out).unwrap();
-        let before = fixture.engine.source_cache_stats();
-        // Hold the scheduler so the job below keeps waiting for a permit.
-        let blocker = export_scheduler()
-            .acquire_cancellable(usize::MAX, || false)
-            .expect("an idle scheduler grants the first permit");
-        fixture
-            .engine
-            .start_export(ExportJob { job_id: 90, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
-            .unwrap();
-        let queued = fixture.engine.source_cache_stats();
-        assert_eq!(queued.misses, before.misses, "start_export itself must not decode");
-        assert_eq!(queued.cached_sources, before.cached_sources);
-        assert!(fixture.engine.cancel_job(90), "a queued job can be cancelled");
-        drop(blocker);
-        let status = wait_export(&fixture.engine, 90);
-        assert!(matches!(status, JobStatus::Failed { .. }), "cancelled job: {status:?}");
-        let after = fixture.engine.source_cache_stats();
-        assert_eq!(after.misses, before.misses, "a cancelled queue entry never decodes");
-        assert_eq!(published_files(&out), 0, "a cancelled job publishes nothing");
-    }
-
-    #[test]
-    fn a_missing_source_is_refused_at_submit() {
-        let fixture = export_fixture("r1-missing-at-submit");
-        let out = fixture.dir.join("Output");
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::remove_file(fixture.dir.join("shot.jpg")).unwrap();
-        // The queue-time identity cannot be read at all, so the job is refused
-        // before it is queued (the old synchronous error for this case).
-        fixture
-            .engine
-            .start_export(ExportJob { job_id: 91, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
-            .unwrap_err();
-        assert_eq!(published_files(&out), 0);
-    }
-
-    #[test]
-    fn a_source_deleted_after_queueing_fails_the_job() {
-        let fixture = export_fixture("r1-deleted-after-queue");
-        let out = fixture.dir.join("Output");
-        std::fs::create_dir_all(&out).unwrap();
-        let blocker = export_scheduler()
-            .acquire_cancellable(usize::MAX, || false)
-            .expect("an idle scheduler grants the first permit");
-        fixture
-            .engine
-            .start_export(ExportJob { job_id: 94, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
-            .unwrap();
-        std::fs::remove_file(fixture.dir.join("shot.jpg")).unwrap();
-        drop(blocker);
-        let status = wait_export(&fixture.engine, 94);
-        assert!(matches!(status, JobStatus::Failed { .. }), "deleted source: {status:?}");
-        assert_eq!(published_files(&out), 0);
-    }
-
-    #[test]
-    fn a_source_replaced_after_queueing_fails_the_job() {
-        let fixture = export_fixture("r1-replaced-after-queue");
-        let out = fixture.dir.join("Output");
-        std::fs::create_dir_all(&out).unwrap();
-        let blocker = export_scheduler()
-            .acquire_cancellable(usize::MAX, || false)
-            .expect("an idle scheduler grants the first permit");
-        fixture
-            .engine
-            .start_export(ExportJob { job_id: 95, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
-            .unwrap();
-        // A different size changes the lightweight identity, so the queued job
-        // must fail rather than render the new pixels with the old recipe.
-        image::RgbImage::from_pixel(16, 12, image::Rgb([220, 20, 20]))
-            .save(fixture.dir.join("shot.jpg"))
-            .unwrap();
-        drop(blocker);
-        let status = wait_export(&fixture.engine, 95);
-        assert!(matches!(status, JobStatus::Failed { .. }), "replaced source: {status:?}");
-        assert_eq!(published_files(&out), 0, "a replaced source must not be exported");
-    }
-
-    #[test]
-    fn an_undecodable_source_fails_the_job_instead_of_the_call() {
-        let fixture = export_fixture("r1-undecodable");
-        let out = fixture.dir.join("Output");
-        std::fs::create_dir_all(&out).unwrap();
-        // Present before the job is queued, so the identity is readable; the
-        // decode is what fails. Documented change: this used to make
-        // `start_export` return `Err`, and now ends as `JobStatus::Failed`.
-        std::fs::write(fixture.dir.join("shot.jpg"), b"not an image").unwrap();
-        fixture
-            .engine
-            .start_export(ExportJob { job_id: 96, image: fixture.image, recipe: jpeg_recipe(out.clone()) })
-            .expect("the queue-time checks pass; the decode fails in the worker");
-        match wait_export(&fixture.engine, 96) {
-            JobStatus::Failed { message } => assert!(!message.is_empty(), "the failure keeps its message"),
-            other => panic!("an undecodable source must fail the job: {other:?}"),
-        }
-        assert_eq!(published_files(&out), 0);
-    }
-
-    #[test]
-    fn an_export_owns_its_paths_and_outlives_the_engine() {
-        let dir = std::env::temp_dir().join(format!("aurora-r1-owned-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        image::RgbImage::from_pixel(8, 6, image::Rgb([30, 60, 90]))
-            .save(dir.join("shot.jpg"))
-            .unwrap();
-        let out = dir.join("Output");
-        std::fs::create_dir_all(&out).unwrap();
-        let engine = FileEngine::open(&dir).unwrap();
-        let image = engine.images()[0].id;
-        engine
-            .start_export(ExportJob { job_id: 93, image, recipe: jpeg_recipe(out.clone()) })
-            .unwrap();
-        // The worker owns the state, the source reader and the destination, so
-        // the engine may go away while the job is queued or rendering.
-        drop(engine);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while published_files(&out) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the export did not finish after the engine was dropped"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn the_export_charge_includes_the_input_frame() {
-        let fixture = export_fixture("r1-charge");
-        let info = fixture.engine.images().into_iter().next().unwrap();
-        let adjustments = crate::styles::resolve(&fixture.engine.load_adjustments(info.id)).into_owned();
-        let recipe = jpeg_recipe(fixture.dir.join("out"));
-        let charge = estimated_export_charge(&recipe, &info, &adjustments.geometry);
-        let (width, height) =
-            crate::mock::geometry::FrameMap::new((info.width, info.height), &adjustments.geometry).frame_size();
-        let edited = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
-        let (out_w, out_h) = crate::recipe::output_size(&recipe, edited);
-        assert!(
-            charge > estimated_export_bytes(out_w, out_h, recipe.bit_depth),
-            "the decoded source frame must be part of the charge"
-        );
-        // An unknown size is charged like a full frame, never like an empty one.
-        let mut unknown = info.clone();
-        unknown.width = 0;
-        unknown.height = 0;
-        assert!(
-            estimated_export_charge(&recipe, &unknown, &adjustments.geometry) > charge,
-            "an unknown size must be charged conservatively"
-        );
-    }
-
-    #[cfg(all(windows, feature = "z6iii-raw-export"))]
-    fn exact_tiff_recipe(destination: PathBuf) -> crate::ProcessRecipe {
+    fn png_recipe(destination: PathBuf) -> crate::ProcessRecipe {
         crate::ProcessRecipe {
-            format: crate::ExportFormat::Tiff,
-            bit_depth: 16,
-            icc_profile: "Adobe RGB (1998)".into(),
-            scale: crate::ScaleMode::Fixed100,
-            watermark: None,
-            output_sharpening: crate::OutputSharpening::Disabled,
-            output_sharpening_settings: None,
+            format: crate::ExportFormat::Png,
             destination: Some(destination),
             include_metadata: crate::MetadataPolicy::StripAll,
             ..crate::ProcessRecipe::default()
         }
     }
 
-    // The admission charge must not price an ordinary JPEG or a NEF the
-    // specialised export rejects as a full RAW working set. Only a request that
-    // is both a `.nef` and `desktop::compatible` pays the exact envelope.
-    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    /// Flat RGBA background with a 1-pixel black/white checker patch. The flat
+    /// field keeps a 13.5 MP PNG encode fast and small; the patch is the
+    /// high-frequency feature an upscaled proxy cannot preserve.
+    fn write_checker_png(path: &Path, width: u32, height: u32, patch: (u32, u32, u32)) {
+        use image::ImageEncoder as _;
+        let mut pixels =
+            image::RgbaImage::from_pixel(width, height, image::Rgba([128, 128, 128, 255]));
+        let (px, py, size) = patch;
+        for y in py..(py + size).min(height) {
+            for x in px..(px + size).min(width) {
+                let value = if (x - px + y - py) % 2 == 0 { 0 } else { 255 };
+                pixels.put_pixel(x, y, image::Rgba([value, value, value, 255]));
+            }
+        }
+        let file = std::fs::File::create(path).unwrap();
+        image::codecs::png::PngEncoder::new_with_quality(
+            std::io::BufWriter::new(file),
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        )
+        .write_image(pixels.as_raw(), width, height, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    }
+
+    fn export_png_fixture(tag: &str, width: u32, height: u32, patch: (u32, u32, u32)) -> ExportFixture {
+        let dir = std::env::temp_dir()
+            .join(format!("aurora-export-raster-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_checker_png(&dir.join("shot.png"), width, height, patch);
+        let engine = FileEngine::open(&dir).unwrap();
+        let image = engine
+            .images()
+            .into_iter()
+            .find(|info| info.file_name == "shot.png")
+            .expect("the PNG was scanned")
+            .id;
+        ExportFixture { dir, engine, image }
+    }
+
+    /// A real 1x1 PNG whose IHDR is rewritten to `width`x`height` (CRC fixed):
+    /// scanning reads the advertised size, but the pixel data can only decode
+    /// as 1x1, so the full-resolution decode fails.
+    fn png_with_patched_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let mut bytes = encoded.into_inner();
+        // PNG layout: 8-byte signature, then IHDR length(4) type(4) data(13)
+        // CRC(4). Width/height are the first 8 bytes of the IHDR data.
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32fast::hash(&bytes[12..29]);
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
     #[test]
-    fn only_a_compatible_nef_is_charged_the_exact_upper_bound() {
-        let fixture = export_fixture("r3-exact-charge");
-        let mut info = fixture.engine.images().into_iter().next().unwrap();
-        info.width = 6048;
-        info.height = 4032;
-        let mut neutral = AdjustmentSet::default();
-        neutral.sharpening.amount = 0.0;
-        neutral.noise_reduction.luminance = 0.0;
-        neutral.noise_reduction.color = 0.0;
-        // Crop to half width and height so the standard output frame is clearly
-        // smaller than the full RAW envelope the exact path charges.
-        neutral.geometry.crop = crate::NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
-        let exact = exact_tiff_recipe(fixture.dir.join("nef-out"));
-        let jpeg = jpeg_recipe(fixture.dir.join("jpeg-out"));
-
-        // 1. An ordinary JPEG never pays the exact RAW envelope, even with a
-        //    recipe the specialised export would accept only for a NEF.
-        info.path = fixture.dir.join("shot.jpg");
-        let jpeg_standard = estimated_export_charge(&exact, &info, &neutral.geometry);
+    fn export_above_the_proxy_decodes_the_original_at_full_resolution() {
+    let _serial = full_res_export_test_lock();
+        let _guard = FULL_RES_EXPORT_TEST_LOCK.lock();
+        let fixture = export_png_fixture("full", 4500, 3000, (100, 100, 64));
+        let before_misses = fixture.engine.source_cache_stats().misses;
+        let before_decodes = full_res_export_decode_count();
+        let out = fixture.dir.join("Output");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 71, image: fixture.image, recipe: png_recipe(out.clone()) })
+            .unwrap();
+        let JobStatus::Done { output } = wait_export(&fixture.engine, 71) else {
+            panic!("export did not finish: {:?}", fixture.engine.job_status(71));
+        };
+        // The 4096 proxy would render 4500x2999 (4500 * 2730 / 4096); the full
+        // original renders exactly 4500x3000.
+        assert_eq!(image::image_dimensions(&output).unwrap(), (4500, 3000));
         assert_eq!(
-            estimated_job_charge(&exact, &info, &neutral),
-            jpeg_standard,
-            "a JPEG must not be charged the RAW envelope"
+            full_res_export_decode_count() - before_decodes,
+            1,
+            "exactly one full-resolution export decode"
+        );
+        assert_eq!(
+            fixture.engine.source_cache_stats().misses,
+            before_misses,
+            "the full-resolution export decode must not touch the preview source cache"
         );
 
-        // 2. A NEF with a recipe the specialised export rejects stays standard.
-        info.path = fixture.dir.join("shot.nef");
-        let nef_standard = estimated_export_charge(&jpeg, &info, &neutral.geometry);
-        assert_eq!(
-            estimated_job_charge(&jpeg, &info, &neutral),
-            nef_standard,
-            "a non-specialised NEF keeps the standard estimate"
+        let exported = image::open(&output).unwrap().to_rgba8();
+        assert_eq!(exported.dimensions(), (4500, 3000));
+        let row: Vec<u8> = (0..64).map(|i| exported.get_pixel(100 + i, 110).0[0]).collect();
+        let dark = row.iter().filter(|value| **value < 60).count();
+        let bright = row.iter().filter(|value| **value > 195).count();
+        assert!(dark >= 20 && bright >= 20, "checker polarity lost: {row:?}");
+        let max_step =
+            row.windows(2).map(|pair| pair[0].abs_diff(pair[1])).max().unwrap_or(0);
+        assert!(
+            max_step > 120,
+            "an upscaled proxy would blur the 1-pixel checker (max adjacent step {max_step})"
         );
+    }
 
-        // 3. A NEF that is a specialised candidate pays the larger exact bound.
-        let standard = estimated_export_charge(&exact, &info, &neutral.geometry);
-        let exact_charge = estimated_exact_export_charge(&exact, &info);
-        assert!(exact_charge > standard, "the crop must make the exact bound larger");
+    #[test]
+    fn export_at_or_below_the_proxy_keeps_the_cached_source_path() {
+    let _serial = full_res_export_test_lock();
+        let _guard = FULL_RES_EXPORT_TEST_LOCK.lock();
+        let fixture = export_png_fixture("small", 800, 600, (50, 50, 32));
+        let before_misses = fixture.engine.source_cache_stats().misses;
+        let before_decodes = full_res_export_decode_count();
+        let out = fixture.dir.join("Output");
+        fixture
+            .engine
+            .start_export(ExportJob { job_id: 72, image: fixture.image, recipe: png_recipe(out.clone()) })
+            .unwrap();
+        let JobStatus::Done { output } = wait_export(&fixture.engine, 72) else {
+            panic!("export did not finish: {:?}", fixture.engine.job_status(72));
+        };
+        assert_eq!(image::image_dimensions(&output).unwrap(), (800, 600));
         assert_eq!(
-            estimated_job_charge(&exact, &info, &neutral),
-            exact_charge,
-            "a specialised candidate pays the exact upper bound"
+            full_res_export_decode_count(),
+            before_decodes,
+            "a source at or below SOURCE_LONG_SIDE must keep the existing preview decode"
         );
+        assert_eq!(
+            fixture.engine.source_cache_stats().misses,
+            before_misses + 1,
+            "the existing source() path decoded the preview exactly once"
+        );
+    }
+
+    #[test]
+    fn full_resolution_decode_failure_fails_the_job_and_publishes_nothing() {
+    let _serial = full_res_export_test_lock();
+        // This also increments the process-global full-res counter (the decode
+        // is attempted), so share the lock with the delta assertions above.
+        let _guard = FULL_RES_EXPORT_TEST_LOCK.lock();
+        let dir = std::env::temp_dir()
+            .join(format!("aurora-export-raster-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), png_with_patched_dimensions(4500, 3000)).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine
+            .images()
+            .into_iter()
+            .find(|info| info.file_name == "shot.png")
+            .expect("the header-only PNG was scanned");
+        assert_eq!((info.width, info.height), (4500, 3000));
+
+        let out = dir.join("Output");
+        // The full-resolution decode is deferred to the export worker, so
+        // `start_export` only queues the job; the typed failure arrives through
+        // `job_status`.
+        engine
+            .start_export(ExportJob { job_id: 73, image: info.id, recipe: png_recipe(out.clone()) })
+            .expect("the job is queued");
+        let JobStatus::Failed { message } = wait_export(&engine, 73) else {
+            panic!("a failed full decode must fail the job: {:?}", engine.job_status(73));
+        };
+        assert!(message.contains("shot.png"), "the error names the file: {message}");
+        assert!(message.contains("full resolution"), "the error says what failed: {message}");
+        let published: Vec<PathBuf> = std::fs::read_dir(&out)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        assert!(published.is_empty(), "a failed full decode publishes nothing: {published:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn full_res_export_memory_guard_refuses_only_above_the_cap() {
+        let cap = 2 * 1024 * 1024 * 1024u64;
+        // 4500x3000 (~13.5 MP) is a normal export and stays well below 2 GiB.
+        assert!(full_res_export_decode_fits(4500, 3000, cap).is_ok());
+        // 45 MP too.
+        assert!(full_res_export_decode_fits(8000, 6000, cap).is_ok());
+        // 100 MP exceeds the unknown-memory fallback cap and is refused with the
+        // estimate so the caller can report it.
+        let refused = full_res_export_decode_fits(10000, 10000, cap).unwrap_err();
+        assert_eq!(refused, full_res_export_estimate_bytes(10000, 10000));
+        assert!(refused > cap);
+        // The derived cap never undercuts the estimate formula for a small cap.
+        assert_eq!(full_res_export_estimate_bytes(100, 50), 100 * 50 * FULL_RES_EXPORT_BYTES_PER_PX);
+        assert!(full_res_export_decode_fits(0, 0, 0).is_ok(), "an empty frame is not refused");
     }
 
     // ---- S2: decoded-source byte budget + per-image single-flight ----
@@ -8044,37 +7482,6 @@ mod tests {
         drop(permit);
         assert_eq!(scheduler.stats().0, 0);
         let _ = scheduler.acquire_cancellable(4096 * mib, || false).expect("the door reopens after release");
-    }
-
-    #[test]
-    fn export_budget_holds_fifo_across_sizes() {
-        let mib = 1024 * 1024usize;
-        let scheduler = Arc::new(ExportScheduler::with_limits(1, 8 * mib));
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let holder = scheduler.acquire_cancellable(8 * mib, || false).expect("the gate starts held");
-        let tickets: Vec<_> = (0..3).map(|_| scheduler.enqueue(8 * mib)).collect();
-        let mut threads = Vec::new();
-        for (index, ticket) in tickets.into_iter().enumerate() {
-            let order = Arc::clone(&order);
-            let scheduler = Arc::clone(&scheduler);
-            threads.push(std::thread::spawn(move || {
-                let mut guard = scheduler.ticket_guard(ticket);
-                let _permit = scheduler
-                    .wait_guarded(&mut guard, || false)
-                    .expect("each queued job is admitted in turn");
-                order.lock().push(index);
-            }));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        drop(holder);
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        assert_eq!(*order.lock(), [0, 1, 2], "admission order must be submission order");
-        let (active, used, _) = scheduler.stats();
-        assert_eq!(active, 0);
-        assert_eq!(used, 0);
-        assert_eq!(scheduler.queued(), 0);
     }
 
     // ---- S2: decoded-source byte budget + per-image single-flight ----
@@ -8646,6 +8053,238 @@ mod tests {
     }
 
     #[test]
+    fn decode_jobs_record_success_and_failure() {
+        let dir = s2_test_dir("decode-lifecycle");
+        write_test_png(&dir, "good.png", 16, 12, 1);
+        std::fs::write(dir.join("broken.png"), b"\x89PNG\r\n\x1a\nnot a real png").unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        assert_eq!(engine.decode_job_snapshot().total, 0, "opening the library must not decode");
+
+        let (good, broken) = {
+            let images = engine.images();
+            let good = images.iter().find(|image| image.file_name == "good.png").unwrap().id;
+            let broken = images.iter().find(|image| image.file_name == "broken.png").unwrap().id;
+            (good, broken)
+        };
+
+        engine.source(good).unwrap();
+        let snapshot = engine.decode_job_snapshot();
+        assert_eq!(snapshot.total, 1);
+        let decode = snapshot.scope(JobScope::Decode).expect("decode scope counts");
+        assert_eq!(decode.succeeded, 1);
+        assert_eq!(decode.failed, 0);
+        assert_eq!(decode.live(), 0);
+
+        assert!(engine.source(broken).is_err(), "corrupt PNG must fail to decode");
+        let snapshot = engine.decode_job_snapshot();
+        assert_eq!(snapshot.total, 2);
+        let decode = snapshot.scope(JobScope::Decode).expect("decode scope counts");
+        assert_eq!(decode.succeeded, 1);
+        assert_eq!(decode.failed, 1);
+        assert_eq!(decode.live(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decode_jobs_stay_bounded_across_many_flights() {
+        let dir = s2_test_dir("decode-lifecycle-bound");
+        // More distinct images than the decode record cap, so pruning runs.
+        let count = 80u32;
+        for index in 0..count {
+            write_test_png(&dir, &format!("shot-{index:03}.png"), 8, 8, (index % 251) as u8);
+        }
+        let engine = FileEngine::open(&dir).unwrap();
+        let images: Vec<_> = engine.images().into_iter().map(|info| info.id).collect();
+        assert_eq!(images.len(), count as usize);
+
+        // Each distinct image is a new leader flight and therefore a new record.
+        for image in images {
+            engine.source(image).unwrap();
+        }
+        let snapshot = engine.decode_job_snapshot();
+        assert!(snapshot.total <= 64, "decode records grew to {}", snapshot.total);
+        let decode = snapshot.scope(JobScope::Decode).expect("decode scope counts");
+        assert_eq!(decode.live(), 0, "all flights settled, no live record leaked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_jobs_record_terminal_calls_and_stay_bounded() {
+        let dir = s2_test_dir("preview-lifecycle");
+        write_test_png(&dir, "shot.png", 32, 24, 2);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let request = |generation: u64| PreviewRequest {
+            image: id,
+            adjustments: AdjustmentSet::default(),
+            region: NormRect::FULL,
+            max_size: 32,
+            quality: crate::RenderQuality::Final,
+            bypass: false,
+            mask_overlay: None,
+            generation,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
+        };
+
+        engine.render_preview(&request(1)).unwrap();
+        engine.render_preview_fast(&request(2), true).unwrap();
+        let snapshot = engine.preview_job_snapshot();
+        assert_eq!(snapshot.total, 2);
+        let preview = snapshot.scope(JobScope::Preview).expect("preview scope counts");
+        assert_eq!(preview.succeeded, 2);
+        assert_eq!(preview.live(), 0);
+
+        // Repeated drags must not grow the record map without bound. The cache
+        // makes these cheap, but each call still leaves a terminal record.
+        for generation in 0..200 {
+            engine.render_preview_fast(&request(generation), true).unwrap();
+        }
+        let snapshot = engine.preview_job_snapshot();
+        assert!(snapshot.total <= 64, "preview records grew to {}", snapshot.total);
+        assert_eq!(
+            snapshot.scope(JobScope::Preview).expect("preview scope counts").live(),
+            0
+        );
+
+        // A failed render still settles its record as Failed.
+        let missing = PreviewRequest { image: ImageId(999_999), ..request(0) };
+        assert!(engine.render_preview(&missing).is_err());
+        let snapshot = engine.preview_job_snapshot();
+        assert_eq!(
+            snapshot.scope(JobScope::Preview).expect("preview scope counts").failed,
+            1
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn thumbnail_jobs_record_success_and_failure_and_stay_bounded() {
+        let dir = s2_test_dir("thumbnail-lifecycle");
+        write_test_png(&dir, "thumb.png", 32, 24, 4);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let adjustments = AdjustmentSet::default();
+
+        engine.thumbnail(id, &adjustments, 16).unwrap();
+        let snapshot = engine.thumbnail_job_snapshot();
+        assert_eq!(snapshot.total, 1);
+        let thumbnail = snapshot.scope(JobScope::Thumbnail).expect("thumbnail scope counts");
+        assert_eq!(thumbnail.succeeded, 1);
+        assert_eq!(thumbnail.failed, 0);
+        assert_eq!(thumbnail.live(), 0);
+
+        // An unknown image fails its record and returns the usual error.
+        assert!(engine.thumbnail(ImageId(999_999), &adjustments, 16).is_err());
+        let snapshot = engine.thumbnail_job_snapshot();
+        let thumbnail = snapshot.scope(JobScope::Thumbnail).expect("thumbnail scope counts");
+        assert_eq!(thumbnail.failed, 1);
+        assert_eq!(thumbnail.live(), 0);
+
+        // Repeated calls prune terminal records instead of growing without bound.
+        for _ in 0..200 {
+            engine.thumbnail(id, &adjustments, 16).unwrap();
+        }
+        let snapshot = engine.thumbnail_job_snapshot();
+        assert!(snapshot.total <= 64, "thumbnail records grew to {}", snapshot.total);
+        assert_eq!(
+            snapshot.scope(JobScope::Thumbnail).expect("thumbnail scope counts").live(),
+            0
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compute_ai_mask_failure_is_a_failed_inference_record() {
+        let dir = s2_test_dir("inference-mask");
+        write_test_png(&dir, "inference-mask.png", 32, 24, 5);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+
+        // A category the people parser cannot produce fails without any model.
+        let err = engine.compute_ai_mask(id, AiMaskKind::Eyes).unwrap_err();
+        assert!(err.to_string().contains("no Eyes class"), "{err}");
+        let snapshot = engine.inference_job_snapshot();
+        let inference = snapshot.scope(JobScope::Inference).expect("inference scope counts");
+        assert_eq!(inference.total, 1);
+        assert_eq!(inference.failed, 1);
+        assert_eq!(inference.succeeded, 0);
+        assert_eq!(inference.live(), 0);
+
+        // With no subject model installed, the typed "no model/runtime" error is
+        // recorded as well. A machine that ships the model keeps this branch out.
+        if !crate::aimask::model_available("subjectMasking.onnx") {
+            let err = engine.compute_ai_mask(id, AiMaskKind::Subject).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("AI model subjectMasking.onnx not found")
+                    || text.contains("ONNX Runtime is not available"),
+                "{text}"
+            );
+            let snapshot = engine.inference_job_snapshot();
+            let inference = snapshot.scope(JobScope::Inference).expect("inference scope counts");
+            assert_eq!(inference.total, 2);
+            assert_eq!(inference.failed, 2);
+            assert_eq!(inference.live(), 0);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eye_report_records_both_outcomes_without_external_fixtures() {
+        let dir = s2_test_dir("inference-eyes");
+        write_test_png(&dir, "inference-eyes.png", 32, 24, 6);
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+
+        // The eye models are optional local assets. Each call must still leave
+        // one terminal record whether the check runs or reports its typed error.
+        let first = engine.eye_report(id);
+        let second = engine.eye_report(id);
+        let snapshot = engine.inference_job_snapshot();
+        let inference = snapshot.scope(JobScope::Inference).expect("inference scope counts");
+        assert_eq!(inference.total, 2);
+        assert_eq!(inference.live(), 0);
+        match (&first, &second) {
+            (Ok(_), Ok(_)) => assert_eq!(inference.succeeded, 2),
+            (Err(_), Err(_)) => assert_eq!(inference.failed, 2),
+            other => panic!("eye report outcome changed between calls: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capture_methods_without_a_camera_keep_their_contract() {
+        let dir = s2_test_dir("capture-lifecycle");
+        write_test_png(&dir, "capture.png", 8, 6, 7);
+        let engine = FileEngine::open(&dir).unwrap();
+        if matches!(engine.tether_status(), TetherStatus::Available { .. }) {
+            // A real camera makes the no-camera assertions inapplicable.
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        if cfg!(not(windows)) {
+            assert_eq!(engine.camera_status(), CameraStatus::Disconnected);
+            assert_eq!(engine.camera_settings(), None);
+        }
+        assert!(engine.live_view_frame(640).is_none());
+        engine.live_view_focus(2);
+
+        let err = engine.capture().expect_err("capture must fail without a camera");
+        assert!(err.to_string().contains("NoCamera"), "{err}");
+        assert!(
+            !dir.join("Capture").exists(),
+            "a failed capture must not create the output folder"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn export_scheduler_bounds_concurrent_slots_and_releases_on_drop() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8759,5 +8398,625 @@ mod tests {
         assert_eq!(left_active, 0);
         assert_eq!(left_bytes, 0);
         assert!(scheduler.acquire_cancellable(4096, || false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod save_report_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aurora-save-report-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_png(dir: &Path, name: &str, seed: u8) {
+        let image = image::RgbaImage::from_fn(8, 8, |x, y| {
+            image::Rgba([(x as u8).wrapping_add(seed), (y as u8).wrapping_mul(3), seed, 255])
+        });
+        image.save(dir.join(name)).unwrap();
+    }
+
+    #[test]
+    fn batch_report_separates_saved_and_failed_documents() {
+        let dir = temp_dir("partial");
+        write_png(&dir, "one.png", 1);
+        write_png(&dir, "two.png", 2);
+        let engine = FileEngine::open(&dir).unwrap();
+        assert_eq!(engine.images().len(), 2);
+        let (id_a, rel_a, id_b, rel_b) = {
+            let st = engine.state.lock();
+            let a = &st.entries[0];
+            let b = &st.entries[1];
+            (a.info.id, a.rel_path.clone(), b.info.id, b.rel_path.clone())
+        };
+
+        // Write `b` once, then make its target a directory so the next atomic
+        // rename over it fails while `a` keeps writing normally.
+        let store = engine.store.as_ref().unwrap();
+        store.save_adjustments(&rel_b, &AdjustmentSet::default()).unwrap();
+        let target = std::fs::read_dir(store.root().join("adjust"))
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+            .expect("b's adjustment file");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        let mut adj = AdjustmentSet::default();
+        adj.exposure.exposure = 0.5;
+        let report = engine.save_adjustments_batch_report(&[(id_a, adj.clone()), (id_b, adj.clone())]);
+        assert_eq!(report.documents.len(), 2);
+        assert_eq!(report.saved(), 1);
+        assert_eq!(report.failed(), 1);
+        assert_eq!(report.superseded(), 0);
+        assert!(report.index_error.is_none());
+        assert_eq!(report.documents.iter().find(|d| d.is_saved()).unwrap().path, rel_a);
+        let failed = report.first_failure().expect("one failed document");
+        assert_eq!(failed.image, id_b);
+        assert_eq!(failed.path, rel_b);
+        assert!(!report.is_complete());
+        assert!(engine.save_adjustments_batch(&[(id_a, adj.clone()), (id_b, adj)]).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stale_report_does_not_restore_older_in_memory_edits() {
+        let dir = temp_dir("memory-order");
+        write_png(&dir, "shot.png", 4);
+        let engine = FileEngine::open(&dir).unwrap();
+        let (id, rel_path) = {
+            let st = engine.state.lock();
+            (st.entries[0].info.id, st.entries[0].rel_path.clone())
+        };
+
+        let mut newer = AdjustmentSet::default();
+        newer.exposure.exposure = 2.0;
+        assert_eq!(
+            engine.save_adjustments_batch_report_at(5, &[(id, newer)]).saved(),
+            1
+        );
+
+        // An older call that reaches the engine late must not restore its
+        // stale edits in memory, even though its disk write is skipped.
+        let mut older = AdjustmentSet::default();
+        older.exposure.exposure = -1.0;
+        let stale = engine.save_adjustments_batch_report_at(4, &[(id, older)]);
+        assert_eq!(stale.superseded(), 1);
+        assert_eq!(ImageEngine::load_adjustments(&engine, id).exposure.exposure, 2.0);
+        let store = engine.store.as_ref().unwrap();
+        assert_eq!(store.load_adjustments(&rel_path).unwrap().exposure.exposure, 2.0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stale_sequence_does_not_overwrite_newer_bytes() {
+        let dir = temp_dir("order");
+        write_png(&dir, "shot.png", 3);
+        let engine = FileEngine::open(&dir).unwrap();
+        let (id, rel_path, info) = {
+            let st = engine.state.lock();
+            let entry = &st.entries[0];
+            (entry.info.id, entry.rel_path.clone(), entry.info.clone())
+        };
+
+        let mut newer = AdjustmentSet::default();
+        newer.exposure.exposure = 2.0;
+        let first = engine.persist_batch(&[(rel_path.clone(), newer.clone(), info.clone())]);
+        assert_eq!(first.saved(), 1);
+
+        // Sequence 0 is older than every allocated batch sequence.
+        let mut older = AdjustmentSet::default();
+        older.exposure.exposure = -2.0;
+        let stale = engine.persist_batch_at(0, &[(rel_path.clone(), older, info)]);
+        assert_eq!(stale.superseded(), 1);
+        assert_eq!(stale.saved(), 0);
+        assert!(stale.into_error().is_none(), "superseded is not a failure");
+
+        let loaded = engine.store.as_ref().unwrap().load_adjustments(&rel_path).unwrap();
+        assert_eq!(loaded.exposure.exposure, 2.0, "older write replaced newer bytes");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod queued_save_tests {
+    use super::*;
+    use crate::save_queue::PathState;
+
+    fn queued_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aurora-queued-save-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn queued_write_png(dir: &Path, name: &str, seed: u8) {
+        let image = image::RgbaImage::from_fn(8, 8, |x, y| {
+            image::Rgba([(x as u8).wrapping_add(seed), (y as u8).wrapping_mul(3), seed, 255])
+        });
+        image.save(dir.join(name)).unwrap();
+    }
+
+    fn id_by_path(engine: &FileEngine, rel_path: &str) -> ImageId {
+        engine
+            .state
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.rel_path == rel_path)
+            .map(|entry| entry.info.id)
+            .unwrap_or_else(|| panic!("{rel_path} is not in the engine"))
+    }
+
+    fn rel_of(engine: &FileEngine, image: ImageId) -> String {
+        engine
+            .state
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.info.id == image)
+            .map(|entry| entry.rel_path.clone())
+            .unwrap()
+    }
+
+    fn exposure(value: f32) -> AdjustmentSet {
+        let mut adjustments = AdjustmentSet::default();
+        adjustments.exposure.exposure = value;
+        adjustments
+    }
+
+    /// Blocks the first `write` until the test releases it; later writes pass
+    /// straight through (the release sender is dropped after the first send, so
+    /// `recv` returns immediately once disconnected).
+    struct WriteGate {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl WriteGate {
+        fn enter_and_wait(&self) {
+            let _ = self.entered.send(());
+            let receiver = self.release.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = receiver.recv();
+        }
+    }
+
+    /// A `SaveWriter` fake that records what the queue would have written.
+    struct RecordingWriter {
+        writes: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        gate: Option<Arc<WriteGate>>,
+    }
+
+    impl RecordingWriter {
+        fn plain() -> Arc<Self> {
+            Arc::new(RecordingWriter { writes: std::sync::Mutex::new(Vec::new()), gate: None })
+        }
+
+        fn gated(gate: Arc<WriteGate>) -> Arc<Self> {
+            Arc::new(RecordingWriter { writes: std::sync::Mutex::new(Vec::new()), gate: Some(gate) })
+        }
+
+        fn writes_for(&self, rel_path: &str) -> Vec<Option<String>> {
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path == rel_path)
+                .map(|(_, marker)| marker.clone())
+                .collect()
+        }
+    }
+
+    impl SaveWriter for RecordingWriter {
+        fn write(&self, rel_path: &str, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
+            if let Some(gate) = &self.gate {
+                gate.enter_and_wait();
+            }
+            self.writes
+                .lock()
+                .unwrap()
+                .push((rel_path.to_string(), adjustments.style.clone()));
+            Ok(())
+        }
+
+        fn commit_index(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn queued_save_writes_documents_and_index_then_reloads() {
+        let dir = queued_temp_dir("round-trip");
+        queued_write_png(&dir, "one.png", 1);
+        queued_write_png(&dir, "two.png", 2);
+        let engine = FileEngine::open(&dir).unwrap();
+
+        let rel_a = "one.png".to_string();
+        let rel_b = "two.png".to_string();
+        let id_a = id_by_path(&engine, &rel_a);
+        let id_b = id_by_path(&engine, &rel_b);
+        let adj_a = exposure(0.75);
+        let adj_b = exposure(-0.5);
+
+        let summary =
+            engine.save_adjustments_queued(&[(id_a, adj_a.clone()), (id_b, adj_b.clone())]);
+        assert_eq!(summary.accepted(), 2, "{summary:?}");
+        assert_eq!(summary.failed(), 0, "{summary:?}");
+        assert!(matches!(
+            summary.outcome_of(id_a),
+            Some(QueuedSaveOutcome::Accepted { revision }) if revision.get() >= 1
+        ));
+
+        // The edit is visible immediately, before the writer has necessarily run.
+        assert_eq!(ImageEngine::load_adjustments(&engine, id_a), adj_a);
+
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert!(!report.timed_out, "{report:?}");
+        assert_eq!(report.saved(), 2, "{report:?}");
+        assert_eq!(report.failed(), 0, "{report:?}");
+        assert!(report.index_error.is_none(), "{report:?}");
+        assert_eq!(report.state_of(&rel_a), Some(&PathState::Saved), "{report:?}");
+        assert_eq!(report.state_of(&rel_b), Some(&PathState::Saved), "{report:?}");
+
+        let store = engine.store.as_ref().unwrap();
+        assert_eq!(store.load_adjustments(&rel_a).unwrap(), adj_a);
+        assert_eq!(store.load_adjustments(&rel_b).unwrap(), adj_b);
+        let index = store.load_index().unwrap();
+        assert_eq!(index.entry(&rel_a).map(|entry| entry.rel_path.as_str()), Some(rel_a.as_str()));
+        assert_eq!(index.entry(&rel_b).map(|entry| entry.rel_path.as_str()), Some(rel_b.as_str()));
+
+        drop(engine);
+        let reopened = FileEngine::open(&dir).unwrap();
+        let reopened_a = id_by_path(&reopened, &rel_a);
+        let reopened_b = id_by_path(&reopened, &rel_b);
+        assert_eq!(ImageEngine::load_adjustments(&reopened, reopened_a), adj_a);
+        assert_eq!(ImageEngine::load_adjustments(&reopened, reopened_b), adj_b);
+
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_save_failure_is_per_document_and_the_writer_survives() {
+        let dir = queued_temp_dir("partial");
+        queued_write_png(&dir, "one.png", 1);
+        queued_write_png(&dir, "two.png", 2);
+        let engine = FileEngine::open(&dir).unwrap();
+
+        let rel_a = "one.png".to_string();
+        let rel_b = "two.png".to_string();
+        let id_a = id_by_path(&engine, &rel_a);
+        let id_b = id_by_path(&engine, &rel_b);
+
+        // Turn `b`'s adjustment target into a directory so the atomic rename
+        // fails while `a` keeps working. Writing b first names the only file.
+        let store = engine.store.as_ref().unwrap();
+        store.save_adjustments(&rel_b, &AdjustmentSet::default()).unwrap();
+        let target = std::fs::read_dir(store.root().join("adjust"))
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+            .expect("b's adjustment file");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        let adj_a = exposure(0.5);
+        let adj_b = exposure(0.25);
+        let summary =
+            engine.save_adjustments_queued(&[(id_a, adj_a.clone()), (id_b, adj_b.clone())]);
+        assert_eq!(summary.accepted(), 2, "{summary:?}");
+
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert!(!report.timed_out, "{report:?}");
+        assert_eq!(report.saved(), 1, "{report:?}");
+        assert_eq!(report.failed(), 1, "{report:?}");
+        assert_eq!(report.state_of(&rel_a), Some(&PathState::Saved), "{report:?}");
+        assert!(
+            matches!(report.state_of(&rel_b), Some(PathState::Failed { .. })),
+            "{report:?}"
+        );
+        // The failed edit was never dropped from memory.
+        assert_eq!(ImageEngine::load_adjustments(&engine, id_b), adj_b);
+
+        // Repair the path; the writer is still alive and takes new work.
+        std::fs::remove_dir_all(&target).unwrap();
+        let retry = engine.save_adjustments_queued(&[(id_b, adj_b.clone())]);
+        assert_eq!(retry.accepted(), 1, "{retry:?}");
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert!(!report.timed_out, "{report:?}");
+        assert_eq!(report.state_of(&rel_b), Some(&PathState::Saved), "{report:?}");
+        let store = engine.store.as_ref().unwrap();
+        assert_eq!(store.load_adjustments(&rel_b).unwrap(), adj_b);
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queue_full_keeps_the_in_memory_edit_and_reports_capacity() {
+        let dir = queued_temp_dir("full");
+        queued_write_png(&dir, "one.png", 1);
+        queued_write_png(&dir, "two.png", 2);
+        let mut engine = FileEngine::open(&dir).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(WriteGate {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let writer = RecordingWriter::gated(gate);
+        engine.install_test_save_queue(writer.clone(), 1);
+
+        let rel_a = "one.png".to_string();
+        let rel_b = "two.png".to_string();
+        let id_a = id_by_path(&engine, &rel_a);
+        let id_b = id_by_path(&engine, &rel_b);
+
+        let first = exposure(0.5);
+        let second = exposure(0.25);
+        assert_eq!(
+            engine.save_adjustments_queued(&[(id_a, first)]).accepted(),
+            1,
+            "the first path uses the single outstanding slot"
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the writer never entered write()");
+
+        let summary = engine.save_adjustments_queued(&[(id_b, second.clone())]);
+        assert_eq!(summary.full(), 1, "{summary:?}");
+        assert!(matches!(
+            summary.outcome_of(id_b),
+            Some(QueuedSaveOutcome::Full { capacity }) if *capacity == 1
+        ));
+        // A refused submission still applies the edit the user just made.
+        assert_eq!(ImageEngine::load_adjustments(&engine, id_b), second);
+
+        let _ = release_tx.send(());
+        drop(release_tx);
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert_eq!(report.state_of(&rel_a), Some(&PathState::Saved), "{report:?}");
+        assert!(writer.writes_for(&rel_b).is_empty(), "a Full submission must not be written");
+
+        // Resubmitting after the queue drains is the documented retry.
+        let retry = engine.save_adjustments_queued(&[(id_b, second)]);
+        assert_eq!(retry.accepted(), 1, "{retry:?}");
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert_eq!(report.state_of(&rel_b), Some(&PathState::Saved), "{report:?}");
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_revisions_keep_the_newest_write_for_a_path() {
+        let dir = queued_temp_dir("revisions");
+        queued_write_png(&dir, "one.png", 1);
+        let mut engine = FileEngine::open(&dir).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(WriteGate {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let writer = RecordingWriter::gated(gate);
+        engine.install_test_save_queue(writer.clone(), 8);
+
+        let rel = "one.png".to_string();
+        let image = id_by_path(&engine, &rel);
+
+        let mut r1 = AdjustmentSet::default();
+        r1.style = Some("r1".to_string());
+        let first = engine.save_adjustments_queued(&[(image, r1)]);
+        let revision1 = match first.outcome_of(image) {
+            Some(QueuedSaveOutcome::Accepted { revision }) => *revision,
+            other => panic!("expected the first revision to be accepted, got {other:?}"),
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the writer never entered write()");
+        assert_eq!(first.accepted(), 1);
+
+        let mut r2 = AdjustmentSet::default();
+        r2.style = Some("r2".to_string());
+        let second = engine.save_adjustments_queued(&[(image, r2)]);
+        let revision2 = match second.outcome_of(image) {
+            Some(QueuedSaveOutcome::Accepted { revision }) => *revision,
+            other => panic!("expected the newer revision to be accepted, got {other:?}"),
+        };
+        assert!(revision2 > revision1, "revisions must strictly increase: {revision1:?} {revision2:?}");
+
+        let _ = release_tx.send(());
+        drop(release_tx);
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert!(!report.timed_out, "{report:?}");
+        assert_eq!(report.state_of(&rel), Some(&PathState::Saved), "{report:?}");
+        let status = report
+            .documents
+            .iter()
+            .find(|document| document.rel_path == rel)
+            .expect("the path in the report");
+        assert_eq!(
+            status.revision, revision2,
+            "the report must name the revision that owns the path"
+        );
+        assert_eq!(
+            writer.writes_for(&rel),
+            [Some("r1".to_string()), Some("r2".to_string())],
+            "the in-flight r1 may finish, but r2 must land last"
+        );
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_infos_stay_bounded_keep_in_flight_and_reinsert_on_retry() {
+        let dir = queued_temp_dir("save-info-bound");
+        queued_write_png(&dir, "one.png", 1);
+        let mut engine = FileEngine::open(&dir).unwrap();
+        let image = id_by_path(&engine, "one.png");
+        let rel = "one.png".to_string();
+
+        // Gate the writer so the path is genuinely in flight during pruning.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(WriteGate {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        engine.install_test_save_queue(RecordingWriter::gated(gate), 8);
+
+        assert_eq!(engine.save_adjustments_queued(&[(image, exposure(0.5))]).accepted(), 1);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the writer never entered write()");
+        assert!(engine.save_infos.get(&rel).is_some(), "info recorded before the write");
+
+        // Fill past a small cap with synthetic terminal entries, then prune.
+        let cap = 4usize;
+        let info = engine.images()[0].clone();
+        for index in 0..(cap as u64 + 4) {
+            engine.save_infos.insert(format!("synthetic/{index}.png"), info.clone());
+        }
+        let removed = engine.save_infos.prune(cap, engine.save_queue.as_deref());
+        assert_eq!(removed, 4, "only the oldest terminal entries are dropped");
+        assert_eq!(
+            engine.save_infos.len(),
+            cap + 1,
+            "the in-flight path plus the newest cap terminal entries survive"
+        );
+        assert!(engine.save_infos.get(&rel).is_some(), "an in-flight path is never pruned");
+        assert!(engine.save_infos.get("synthetic/0.png").is_none(), "oldest dropped");
+        assert!(
+            engine.save_infos.get(&format!("synthetic/{}.png", cap + 3)).is_some(),
+            "newest retained"
+        );
+
+        let _ = release_tx.send(());
+        drop(release_tx);
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert_eq!(report.state_of(&rel), Some(&PathState::Saved), "{report:?}");
+        // Within the cap the terminal entry is retained; a zero cap removes it.
+        assert!(engine.save_infos.get(&rel).is_some());
+        assert_eq!(engine.save_infos.prune(0, engine.save_queue.as_deref()), cap + 1);
+        assert_eq!(engine.save_infos.len(), 0);
+
+        // A retry re-inserts the metadata before its new revision is written,
+        // so the writer still finds it after a prune.
+        let retry = engine.save_adjustments_queued(&[(image, exposure(0.25))]);
+        assert_eq!(retry.accepted(), 1, "{retry:?}");
+        assert!(engine.save_infos.get(&rel).is_some(), "the retry re-recorded the info");
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert_eq!(report.state_of(&rel), Some(&PathState::Saved), "{report:?}");
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_unknown_image_is_reported_and_does_not_panic() {
+        let dir = queued_temp_dir("unknown");
+        queued_write_png(&dir, "one.png", 1);
+        let engine = FileEngine::open(&dir).unwrap();
+
+        let summary = engine.save_adjustments_queued(&[(ImageId(9_999), exposure(1.0))]);
+        assert_eq!(summary.failed(), 1, "{summary:?}");
+        assert_eq!(summary.accepted(), 0, "{summary:?}");
+        assert!(summary.first_failure().is_some_and(|failure| failure.path.is_empty()));
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn synchronous_batch_report_stays_off_the_queue() {
+        let dir = queued_temp_dir("sync");
+        queued_write_png(&dir, "one.png", 1);
+        let engine = FileEngine::open(&dir).unwrap();
+
+        let rel = "one.png".to_string();
+        let image = id_by_path(&engine, &rel);
+        let adj = exposure(1.0);
+        let report = engine.save_adjustments_batch_report(&[(image, adj.clone())]);
+        assert_eq!(report.saved(), 1, "{report:?}");
+
+        // The synchronous path wrote through immediately and never touched the
+        // bounded queue.
+        let store = engine.store.as_ref().unwrap();
+        assert_eq!(store.load_adjustments(&rel).unwrap(), adj);
+        let status = engine.save_queue_status().expect("queue");
+        assert_eq!(status.pending, 0, "{status:?}");
+        assert_eq!(status.in_flight, 0, "{status:?}");
+        assert!(status.is_idle(), "{status:?}");
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queue_status_and_flush_stay_responsive_while_the_writer_blocks() {
+        let dir = queued_temp_dir("responsive");
+        queued_write_png(&dir, "one.png", 1);
+        let mut engine = FileEngine::open(&dir).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(WriteGate {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let writer = RecordingWriter::gated(gate);
+        engine.install_test_save_queue(writer, 8);
+
+        let rel = "one.png".to_string();
+        let image = id_by_path(&engine, &rel);
+        assert_eq!(engine.save_adjustments_queued(&[(image, exposure(0.5))]).accepted(), 1);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the writer never entered write()");
+
+        // If the engine held the queue lock across I/O, these calls would never
+        // return; the watchdog makes that a clear failure rather than a hang.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let rel_probe = rel.clone();
+        let observed = std::thread::scope(|scope| {
+            let engine_ref = &engine;
+            scope.spawn(move || {
+                let status = engine_ref.save_queue_status().expect("queue");
+                let report = engine_ref.flush_saves(Duration::from_millis(20)).expect("queue");
+                let _ = probe_tx
+                    .send((status.in_flight, report.timed_out, report.state_of(&rel_probe).cloned()));
+            });
+            probe_rx.recv_timeout(Duration::from_secs(5))
+        });
+
+        // Always release before asserting so a failure cannot leave the writer
+        // blocked.
+        let _ = release_tx.send(());
+        drop(release_tx);
+        let (in_flight, timed_out, state) = observed.expect(
+            "save_queue_status()/flush_saves() blocked while the writer was inside write()",
+        );
+        assert_eq!(in_flight, 1);
+        assert!(timed_out, "flush must return at its deadline, not wait for I/O");
+        assert_eq!(state, Some(PathState::NotWritten));
+
+        let report = engine.flush_saves(Duration::from_secs(10)).expect("queue");
+        assert_eq!(report.state_of(&rel), Some(&PathState::Saved), "{report:?}");
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

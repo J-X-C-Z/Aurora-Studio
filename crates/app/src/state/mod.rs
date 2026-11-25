@@ -7,8 +7,10 @@
 mod binding;
 mod clipboard;
 mod collections;
+mod editor;
 pub(crate) mod render;
 mod settings;
+mod settings_state;
 mod source;
 mod arrange;
 mod panel_order;
@@ -18,24 +20,34 @@ mod nodes;
 mod analysis;
 mod cull;
 mod ahead;
+mod tasks;
+mod device;
+mod preview;
+mod library;
 pub(crate) mod scopes;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gpui_kit::{App, AppContext, Context, Entity, EventEmitter, Pixels, RenderImage, SharedString, Task};
+use gpui_kit::{App, AppContext, Context, Entity, EventEmitter, Pixels, RenderImage, SharedString};
 use aurora_engine::*;
 use rayon::prelude::*;
 
 pub use binding::*;
 pub use clipboard::ClipGroup;
 pub use collections::CollNode;
+pub use editor::{Edit, EditorState};
 pub use settings::*;
+pub use settings_state::SettingsState;
 pub use source::Source;
 pub use arrange::{Arrangement, Stack};
 pub use speed::{SpeedEdit, SpeedParam};
 pub use cull::Cull;
 pub use ahead::MergeKind;
+pub use tasks::TaskCenter;
+pub use device::DeviceState;
+pub use preview::PreviewState;
+pub use library::LibraryState;
 pub use scopes::ScopeKind;
 pub use nodes::{GraphExt, NewNode, add_shape, flattened, flattened_checked, is_full};
 pub mod open {
@@ -243,16 +255,6 @@ impl Default for Filter {
     fn default() -> Self {
         Self { min_rating: -1, color_tag: None, search: String::new(), edited_only: false }
     }
-}
-
-/// One image's adjustments and history.
-#[derive(Clone, Default)]
-pub struct Edit {
-    pub adj: AdjustmentSet,
-    pub undo: Vec<(SharedString, AdjustmentSet)>,
-    pub redo: Vec<(SharedString, AdjustmentSet)>,
-    /// Set while a drag is in progress: the state before it began, and its label.
-    gesture: Option<(SharedString, AdjustmentSet)>,
 }
 
 /// Zoom and pan of the viewer, in developed-frame space.
@@ -507,50 +509,23 @@ pub enum StateEvent {
 
 pub struct AppState {
     pub engine: Arc<dyn ImageEngine>,
-    pub images: Vec<ImageInfo>,
+    /// The catalog's images, selection, current image and browser arrangement.
+    pub library: LibraryState,
     pub nodes: Vec<CollNode>,
-    pub recent_imports: BTreeSet<ImageId>,
-    pub recent_captures: BTreeSet<ImageId>,
-    pub trash: BTreeSet<ImageId>,
-    pub active_collection: u64,
     pub filter: Filter,
     pub sort: SortKey,
     pub sort_desc: bool,
-    pub selection: BTreeSet<ImageId>,
-    pub current: Option<ImageId>,
-    pub edits: HashMap<ImageId, Edit>,
-    /// `None` edits the background layer.
-    pub active_layer: Option<u64>,
-    /// A selected mixer or the output in the node editor; layers use `active_layer`.
-    pub active_node: Option<u64>,
+    /// Per-image edits with undo history, and the editor's own selection.
+    pub editor: EditorState,
     pub tool_tab: ToolTab,
     pub cursor: CursorTool,
-    /// Clone tool's first click: the image and crop-normalised source point
-    /// waiting for its target.
-    pub spot_anchor: Option<(ImageId, [f32; 2])>,
-    pub view: ViewPrefs,
-    pub panels: PanelPrefs,
-    pub zoom: ViewZoom,
-    /// Viewer size in device pixels, written by the viewer each layout.
-    pub viewport: (f32, f32),
-    /// Window position of the viewer's top-left corner.
-    pub viewport_origin: gpui_kit::Point<Pixels>,
-    /// Native handle of the main window, for display-profile lookup.
-    pub window_hwnd: isize,
-    pub scale_factor: f32,
-    pub preview: Preview,
-    pub thumbs: HashMap<ImageId, Arc<RenderImage>>,
-    thumb_queue: render::ThumbQueue,
-    /// Bumped when cached thumbnails are invalidated; older results are dropped.
-    thumb_rev: u64,
-    thumb_task: Option<Task<()>>,
-    pub clipboard: Option<AdjustmentSet>,
-    /// Tools the adjustments clipboard copies and applies.
-    pub clip_groups: BTreeSet<ClipGroup>,
-    pub active_collection_name: SharedString,
+    /// Preferences, per-panel choices and the engine identity read at start.
+    pub prefs: SettingsState,
+    /// Camera/tether status and the window's display identity.
+    pub device: DeviceState,
+    /// Viewer frames, thumbnails, zoom/pan and the color-picker sample.
+    pub preview_state: PreviewState,
     pub capturing: bool,
-    /// Freehand notes drawn with the annotate tool, in frame space, per image.
-    pub annotations: HashMap<ImageId, Vec<Vec<(f32, f32)>>>,
     pub styles: Vec<StyleInfo>,
     pub icc_profiles: Vec<String>,
     pub icc_group: usize,
@@ -558,21 +533,12 @@ pub struct AppState {
     pub lens_profiles: Vec<String>,
     pub recipes: Vec<ProcessRecipe>,
     pub selected_recipe: usize,
-    pub jobs: Vec<JobView>,
-    next_job: u64,
-    next_layer: u64,
-    pub sampled_color: Option<[f32; 3]>,
-    pub picker_point: Option<[f32; 2]>,
-    pub camera: CameraStatus,
-    pub camera_settings: Option<CameraSettings>,
-    /// What the engine's tethering backend answered; `None` until the first probe returns.
-    pub tether: Option<TetherStatus>,
-    pub tether_probing: bool,
+    /// Export jobs and the background-task busy flags.
+    pub tasks: TaskCenter,
     pub notice: Option<SharedString>,
-    pub ai_busy: bool,
-    /// The current image with a hovered style applied, shown instead of its own
-    /// adjustments until the pointer leaves the style.
-    pub hover_look: Option<AdjustmentSet>,
+    /// Last background save error already shown, so a sticky queue error is
+    /// not re-notified on every commit.
+    last_save_error: Option<String>,
     /// Result of the last "save to Capture One" action.
     pub c1_save_status: Option<C1SaveStatus>,
     /// Keys or layers the last save refused to write.
@@ -583,17 +549,8 @@ pub struct AppState {
     pub ai_unavailable: HashSet<AiMaskKind>,
     /// Closed-eye results for this session, shown on the thumbnails.
     pub eyes: HashMap<ImageId, EyeReport>,
-    /// A selection analysis (eyes, rotation, Match Look) is running.
-    pub analysing: bool,
     /// Images whose thumbnail the engine could not make.
     pub thumb_failed: HashSet<ImageId>,
-    /// Why the engine shows the current image from something other than its full
-    /// data (`planned::source_status`), refreshed with each preview.
-    pub source_note: Option<(ImageId, SharedString)>,
-    pub settings: Settings,
-    pub engine_name: String,
-    /// What the engine reported it can do on this machine, read once at start.
-    pub capabilities: EngineCapabilities,
     /// What this window has open.
     pub source: Source,
     /// The welcome screen covers the demo images until one is opened or the
@@ -607,10 +564,6 @@ pub struct AppState {
     pub speed: Option<SpeedEdit>,
     /// Bumped when metadata changes outside the fields, so they reload.
     pub metadata_rev: u64,
-    pub custom_order: Vec<ImageId>,
-    pub stacks: Vec<Stack>,
-    /// Picks of the stacks shown expanded.
-    pub open_stacks: HashSet<ImageId>,
     pub slideshow: Option<Slideshow>,
     pub cull: Option<Cull>,
     /// The cursor before the last change, and when it changed (Speed Edit
@@ -621,8 +574,24 @@ pub struct AppState {
 
 impl EventEmitter<StateEvent> for AppState {}
 
+// Transitional seam: `tools/portrait.rs` is owned by another lane and still
+// reaches `AppState.panels` directly. These impls let that field read resolve
+// through the extracted `SettingsState` until that file migrates to `prefs.*`;
+// no other module should rely on them.
 impl AppState {
     pub fn new(engine: Arc<dyn ImageEngine>, source: Source, settings: Settings, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::assemble(engine, source, settings);
+        let all: Vec<_> = this.library.images.iter().map(|i| i.id).collect();
+        this.queue_thumbs(all, cx);
+        this.request_render(RenderQuality::Final, cx);
+        this.probe_tether(cx);
+        this
+    }
+
+    /// Builds the model without touching GPUI: no thumbnails, preview or
+    /// tether probe are started. [`Self::new`] does those; tests use this to
+    /// exercise pure state transitions.
+    fn assemble(engine: Arc<dyn ImageEngine>, source: Source, settings: Settings) -> Self {
         let images = engine.images();
         // Startup loads every variant's stored adjustments. Ask the engine for
         // them as one batch so a catalog-backed engine takes a single snapshot
@@ -657,6 +626,9 @@ impl AppState {
                 ..Default::default()
             },
         ];
+        let camera_settings = engine.camera_settings();
+        let engine_name = engine.name();
+        let capabilities = crate::planned::capabilities(engine.as_ref());
         let mut this = Self {
             styles: engine.styles(),
             icc_profiles: engine.icc_profiles(),
@@ -664,64 +636,37 @@ impl AppState {
             icc_query: String::new(),
             lens_profiles: engine.lens_profiles(),
             nodes: collections::flatten(engine.as_ref(), &engine.collections()),
-            recent_imports: BTreeSet::new(),
-            recent_captures: BTreeSet::new(),
-            trash: BTreeSet::new(),
-            // Trust `tether_status` first: mock/imaging-only devices may report
-            // `camera_status` without a camera the tether backend can open.
-            camera: CameraStatus::Disconnected,
-            camera_settings: engine.camera_settings(),
-            tether: None,
             ai_unavailable: HashSet::new(),
             eyes: HashMap::new(),
-            analysing: false,
             thumb_failed: HashSet::new(),
-            source_note: None,
-            tether_probing: false,
-            engine_name: engine.name(),
-            capabilities: crate::planned::capabilities(engine.as_ref()),
             engine,
-            selection: current.into_iter().collect(),
-            current,
-            images,
-            active_collection: 1,
+            library: LibraryState {
+                images,
+                selection: current.into_iter().collect(),
+                current,
+                ..LibraryState::default()
+            },
             filter: Filter::default(),
             sort: SortKey::Name,
             sort_desc: false,
-            edits,
-            active_layer: None,
-            active_node: None,
+            editor: EditorState::with_edits(edits),
             tool_tab: tab_from(&settings.workspace.tab).unwrap_or(ToolTab::Grading),
             cursor: CursorTool::Select,
-            spot_anchor: None,
-            view: ViewPrefs::default(),
-            settings,
-            panels: PanelPrefs::default(),
-            zoom: ViewZoom::default(),
-            viewport: (1200.0, 800.0),
-            viewport_origin: Default::default(),
-            window_hwnd: 0,
-            scale_factor: 1.0,
-            preview: Preview::default(),
-            thumbs: HashMap::new(),
-            thumb_queue: render::ThumbQueue::default(),
-            thumb_rev: 0,
-            thumb_task: None,
-            clipboard: None,
-            clip_groups: ClipGroup::ALL.iter().copied().filter(|g| !g.is_composition()).collect(),
-            active_collection_name: t("All Images", "所有图像").into(),
+            prefs: SettingsState::from_parts(engine_name, capabilities, settings),
+            // Trust `tether_status` first: mock/imaging-only devices may report
+            // `camera_status` without a camera the tether backend can open.
+            device: DeviceState {
+                camera: CameraStatus::Disconnected,
+                camera_settings,
+                ..DeviceState::default()
+            },
+            preview_state: PreviewState::default(),
             capturing: false,
-            annotations: HashMap::new(),
             recipes,
             selected_recipe: 0,
-            jobs: Vec::new(),
-            next_job: 1,
-            next_layer: 1,
-            sampled_color: None,
-            picker_point: None,
+            tasks: TaskCenter::default(),
             notice: None,
-            ai_busy: false,
-            hover_look: None,
+            last_save_error: None,
             c1_save_status: None,
             c1_save_warnings: Vec::new(),
             c1_save_busy: false,
@@ -731,51 +676,44 @@ impl AppState {
             open_error: None,
             speed: None,
             metadata_rev: 0,
-            custom_order: Vec::new(),
-            stacks: Vec::new(),
-            open_stacks: HashSet::new(),
             slideshow: None,
             cull: None,
             prev_cursor: CursorTool::Select,
             cursor_changed: std::time::Instant::now(),
         };
-        let layout = this.settings.workspace.clone();
+        let layout = this.prefs.settings.workspace.clone();
         this.load_layout(&layout);
         this.load_arrangement();
-        this.view.viewer_gray = this.settings.viewer_gray;
-        this.view.thumb_size = this.settings.thumb_size;
-        this.view.show_info_overlay = this.settings.info_overlay;
-        let all: Vec<_> = this.images.iter().map(|i| i.id).collect();
-        this.queue_thumbs(all, cx);
-        this.request_render(RenderQuality::Final, cx);
-        this.probe_tether(cx);
+        this.prefs.view.viewer_gray = this.prefs.settings.viewer_gray;
+        this.prefs.view.thumb_size = this.prefs.settings.thumb_size;
+        this.prefs.view.show_info_overlay = this.prefs.settings.info_overlay;
         this
     }
 
     // ───────────── Catalog ─────────────
 
     pub fn info(&self, id: ImageId) -> Option<&ImageInfo> {
-        self.images.iter().find(|i| i.id == id)
+        self.library.info(id)
     }
 
     pub fn current_info(&self) -> Option<&ImageInfo> {
-        self.current.and_then(|id| self.info(id))
+        self.library.current_info()
     }
 
     /// Images passing the filter, in sort order.
     pub fn visible_images(&self) -> Vec<&ImageInfo> {
         let f = &self.filter;
         let search = f.search.to_lowercase();
-        let in_trash = self.node(self.active_collection).is_some_and(|n| n.kind == CollectionKind::Trash);
-        let members = self.members(self.active_collection);
-        let mut out: Vec<&ImageInfo> = self
+        let in_trash = self.node(self.library.active_collection).is_some_and(|n| n.kind == CollectionKind::Trash);
+        let members = self.members(self.library.active_collection);
+        let mut out: Vec<&ImageInfo> = self.library
             .images
             .iter()
             .filter(|i| members.as_ref().is_none_or(|m| m.contains(&i.id)))
-            .filter(|i| in_trash || !self.trash.contains(&i.id))
+            .filter(|i| in_trash || !self.library.trash.contains(&i.id))
             .filter(|i| i.rating >= f.min_rating)
             .filter(|i| f.color_tag.is_none_or(|t| i.color_tag == t))
-            .filter(|i| !f.edited_only || self.edits.get(&i.id).is_some_and(|e| !e.adj.is_default()))
+            .filter(|i| !f.edited_only || self.editor.edits.get(&i.id).is_some_and(|e| !e.adj.is_default()))
             .filter(|i| {
                 search.is_empty()
                     || i.file_name.to_lowercase().contains(&search)
@@ -797,24 +735,24 @@ impl AppState {
     }
 
     pub fn select(&mut self, id: ImageId, extend: bool, range: bool, cx: &mut Context<Self>) {
-        self.hover_look = None;
+        self.preview_state.hover_look = None;
         if range {
-            if let Some(anchor) = self.current {
+            if let Some(anchor) = self.library.current {
                 let visible: Vec<ImageId> = self.visible_images().iter().map(|i| i.id).collect();
                 let a = visible.iter().position(|i| *i == anchor);
                 let b = visible.iter().position(|i| *i == id);
                 if let (Some(a), Some(b)) = (a, b) {
                     let (lo, hi) = (a.min(b), a.max(b));
-                    self.selection = visible[lo..=hi].iter().copied().collect();
+                    self.library.selection = visible[lo..=hi].iter().copied().collect();
                 }
             }
         } else if extend {
-            if !self.selection.remove(&id) {
-                self.selection.insert(id);
+            if !self.library.selection.remove(&id) {
+                self.library.selection.insert(id);
             }
         } else {
-            self.selection.clear();
-            self.selection.insert(id);
+            self.library.selection.clear();
+            self.library.selection.insert(id);
         }
         self.set_current(id, cx);
         cx.notify();
@@ -822,19 +760,19 @@ impl AppState {
 
     /// Makes `id` the image the tools edit, leaving the selection alone.
     pub fn set_current(&mut self, id: ImageId, cx: &mut Context<Self>) {
-        if self.current != Some(id) {
+        if self.library.current != Some(id) {
             self.end_gesture(cx);
-            self.current = Some(id);
-            self.thumb_queue.prioritize(id);
-            self.active_layer = None;
-            self.active_node = None;
-            self.zoom = ViewZoom::default();
-            self.preview.before_dirty = true;
-            for frame in [self.preview.full_after.take(), self.preview.full_before.take()].into_iter().flatten() {
+            self.library.current = Some(id);
+            self.preview_state.thumb_queue.prioritize(id);
+            self.editor.active_layer = None;
+            self.editor.active_node = None;
+            self.preview_state.zoom = ViewZoom::default();
+            self.preview_state.preview.before_dirty = true;
+            for frame in [self.preview_state.preview.full_after.take(), self.preview_state.preview.full_before.take()].into_iter().flatten() {
                 frame.release(cx);
             }
-            self.sampled_color = None;
-            self.picker_point = None;
+            self.preview_state.sampled_color = None;
+            self.preview_state.picker_point = None;
             cx.emit(StateEvent::CurrentChanged);
             self.request_render(RenderQuality::Final, cx);
         }
@@ -844,12 +782,12 @@ impl AppState {
     /// The images multiple view shows, the pinned compare variant first; empty
     /// when a single image fills the viewer.
     pub fn multi_images(&self) -> Vec<ImageId> {
-        if !self.view.multi {
+        if !self.prefs.view.multi {
             return Vec::new();
         }
-        let pinned = self.view.compare_variant.filter(|id| self.info(*id).is_some());
+        let pinned = self.prefs.view.compare_variant.filter(|id| self.info(*id).is_some());
         let mut ids: Vec<ImageId> = pinned.into_iter().collect();
-        ids.extend(self.selection.iter().copied().filter(|id| Some(*id) != pinned).take(16));
+        ids.extend(self.library.selection.iter().copied().filter(|id| Some(*id) != pinned).take(16));
         if ids.len() < 2 { Vec::new() } else { ids }
     }
 
@@ -859,21 +797,21 @@ impl AppState {
         if visible.is_empty() {
             return;
         }
-        let pos = self.current.and_then(|c| visible.iter().position(|i| *i == c)).unwrap_or(0) as isize;
+        let pos = self.library.current.and_then(|c| visible.iter().position(|i| *i == c)).unwrap_or(0) as isize;
         let next = (pos + delta).clamp(0, visible.len() as isize - 1) as usize;
         self.select(visible[next], false, false, cx);
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.selection = self.visible_images().iter().map(|i| i.id).collect();
+        self.library.selection = self.visible_images().iter().map(|i| i.id).collect();
         cx.notify();
     }
 
     pub fn set_rating(&mut self, rating: i8, cx: &mut Context<Self>) {
-        let targets: Vec<ImageId> = self.selection.iter().copied().collect();
+        let targets: Vec<ImageId> = self.library.selection.iter().copied().collect();
         let mut updated = Vec::with_capacity(targets.len());
         for id in targets {
-            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
+            if let Some(info) = self.library.images.iter_mut().find(|i| i.id == id) {
                 info.rating = rating;
                 updated.push(info.clone());
             }
@@ -885,10 +823,10 @@ impl AppState {
     }
 
     pub fn set_color_tag(&mut self, tag: ColorTag, cx: &mut Context<Self>) {
-        let targets: Vec<ImageId> = self.selection.iter().copied().collect();
+        let targets: Vec<ImageId> = self.library.selection.iter().copied().collect();
         let mut updated = Vec::with_capacity(targets.len());
         for id in targets {
-            if let Some(info) = self.images.iter_mut().find(|i| i.id == id) {
+            if let Some(info) = self.library.images.iter_mut().find(|i| i.id == id) {
                 info.color_tag = tag;
                 updated.push(info.clone());
             }
@@ -903,25 +841,25 @@ impl AppState {
     pub fn save_metadata_preset(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(info) = self.current_info() else { return };
         let preset = MetadataPreset { name: name.clone(), iptc: info.iptc.clone(), keywords: info.keywords.clone() };
-        match self.settings.metadata_presets.iter_mut().find(|p| p.name == name) {
+        match self.prefs.settings.metadata_presets.iter_mut().find(|p| p.name == name) {
             Some(existing) => *existing = preset,
-            None => self.settings.metadata_presets.push(preset),
+            None => self.prefs.settings.metadata_presets.push(preset),
         }
-        self.settings.save();
+        self.prefs.settings.save();
         self.notify(format!("{} {name}", t("Saved metadata preset", "已存储元数据预设")), cx);
     }
 
     /// Applies metadata preset `index` to every selected image.
     pub fn apply_metadata_preset(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(preset) = self.settings.metadata_presets.get(index).cloned() else { return };
+        let Some(preset) = self.prefs.settings.metadata_presets.get(index).cloned() else { return };
         let fill = |dst: &mut String, src: &String| {
             if !src.trim().is_empty() {
                 *dst = src.clone();
             }
         };
-        let ids: Vec<ImageId> = if self.selection.is_empty() { self.current.into_iter().collect() } else { self.selection.iter().copied().collect() };
+        let ids: Vec<ImageId> = if self.library.selection.is_empty() { self.library.current.into_iter().collect() } else { self.library.selection.iter().copied().collect() };
         let mut updated = Vec::with_capacity(ids.len());
-        for info in self.images.iter_mut().filter(|i| ids.contains(&i.id)) {
+        for info in self.library.images.iter_mut().filter(|i| ids.contains(&i.id)) {
             let (d, s) = (&mut info.iptc, &preset.iptc);
             fill(&mut d.title, &s.title);
             fill(&mut d.description, &s.description);
@@ -950,24 +888,24 @@ impl AppState {
     }
 
     pub fn rename_metadata_preset(&mut self, index: usize, name: String, cx: &mut Context<Self>) {
-        if let Some(p) = self.settings.metadata_presets.get_mut(index) {
+        if let Some(p) = self.prefs.settings.metadata_presets.get_mut(index) {
             p.name = name;
-            self.settings.save();
+            self.prefs.settings.save();
             cx.notify();
         }
     }
 
     pub fn delete_metadata_preset(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.settings.metadata_presets.len() {
-            let p = self.settings.metadata_presets.remove(index);
-            self.settings.save();
+        if index < self.prefs.settings.metadata_presets.len() {
+            let p = self.prefs.settings.metadata_presets.remove(index);
+            self.prefs.settings.save();
             self.notify(format!("{} {}", t("Deleted preset", "已删除预设"), p.name), cx);
         }
     }
 
     pub fn update_current_info(&mut self, f: impl FnOnce(&mut ImageInfo), cx: &mut Context<Self>) {
-        if let Some(id) = self.current
-            && let Some(info) = self.images.iter_mut().find(|i| i.id == id)
+        if let Some(id) = self.library.current
+            && let Some(info) = self.library.images.iter_mut().find(|i| i.id == id)
         {
             f(info);
             let _ = self.engine.update_info(info);
@@ -991,16 +929,16 @@ impl AppState {
                     let added: Vec<_> = added
                         .into_iter()
                         .map(|(info, edit)| {
-                            this.edits.insert(info.id, edit);
+                            this.editor.edits.insert(info.id, edit);
                             info
                         })
                         .collect();
                     let ids: Vec<_> = added.iter().map(|i| i.id).collect();
                     let n = added.len();
-                    this.recent_imports.extend(ids.iter().copied());
-                    this.images.extend(added);
+                    this.library.recent_imports.extend(ids.iter().copied());
+                    this.library.images.extend(added);
                     for id in &ids {
-                        if let Some(info) = this.images.iter_mut().find(|i| i.id == *id) {
+                        if let Some(info) = this.library.images.iter_mut().find(|i| i.id == *id) {
                             if !after.copyright.is_empty() {
                                 info.iptc.copyright = after.copyright.clone();
                             }
@@ -1019,7 +957,7 @@ impl AppState {
                         this.add_to_album(album, &ids, cx);
                     }
                     if let Some(style) = &after.style {
-                        this.selection = ids.iter().copied().collect();
+                        this.library.selection = ids.iter().copied().collect();
                         this.apply_style(style, false, cx);
                     }
                     this.queue_thumbs(ids.clone(), cx);
@@ -1047,14 +985,14 @@ impl AppState {
     }
 
     pub fn new_variant(&mut self, clean: bool, cx: &mut Context<Self>) {
-        let Some(id) = self.current else { return };
+        let Some(id) = self.library.current else { return };
         let adj = if clean { AdjustmentSet::default() } else { self.adj().clone() };
         match self.engine.new_variant(id, &adj) {
             Ok(info) => {
                 let new_id = info.id;
-                let pos = self.images.iter().position(|i| i.id == id).map_or(self.images.len(), |p| p + 1);
-                self.images.insert(pos, info);
-                self.edits.insert(new_id, Edit { adj, ..Default::default() });
+                let pos = self.library.images.iter().position(|i| i.id == id).map_or(self.library.images.len(), |p| p + 1);
+                self.library.images.insert(pos, info);
+                self.editor.edits.insert(new_id, Edit { adj, ..Default::default() });
                 self.queue_thumbs(vec![new_id], cx);
                 self.select(new_id, false, false, cx);
             }
@@ -1073,14 +1011,14 @@ impl AppState {
 
     pub fn adj(&self) -> &AdjustmentSet {
         static EMPTY: std::sync::OnceLock<AdjustmentSet> = std::sync::OnceLock::new();
-        self.current
-            .and_then(|id| self.edits.get(&id))
+        self.library.current
+            .and_then(|id| self.editor.edit_for(id))
             .map(|e| &e.adj)
             .unwrap_or_else(|| EMPTY.get_or_init(AdjustmentSet::default))
     }
 
     pub fn scope(&self) -> Scope {
-        match self.active_layer {
+        match self.editor.active_layer {
             Some(id) if self.adj().layers.iter().any(|l| l.id == id) => Scope::Layer(id),
             _ => Scope::Global,
         }
@@ -1105,21 +1043,21 @@ impl AppState {
     }
 
     pub fn active_layer_ref(&self) -> Option<&Layer> {
-        let id = self.active_layer?;
+        let id = self.editor.active_layer?;
         self.adj().layers.iter().find(|l| l.id == id)
     }
 
     pub fn can_undo(&self) -> bool {
-        self.current.and_then(|id| self.edits.get(&id)).is_some_and(|e| !e.undo.is_empty())
+        self.library.current.and_then(|id| self.editor.edit_for(id)).is_some_and(|e| !e.undo.is_empty())
     }
 
     pub fn can_redo(&self) -> bool {
-        self.current.and_then(|id| self.edits.get(&id)).is_some_and(|e| !e.redo.is_empty())
+        self.library.current.and_then(|id| self.editor.edit_for(id)).is_some_and(|e| !e.redo.is_empty())
     }
 
     pub fn history(&self) -> (Vec<SharedString>, Vec<SharedString>) {
-        self.current
-            .and_then(|id| self.edits.get(&id))
+        self.library.current
+            .and_then(|id| self.editor.edit_for(id))
             .map(|e| (e.undo.iter().map(|u| u.0.clone()).collect(), e.redo.iter().map(|u| u.0.clone()).collect()))
             .unwrap_or_default()
     }
@@ -1127,14 +1065,27 @@ impl AppState {
     /// Applies a change while a control is being dragged. The first call of a gesture
     /// records the state to undo to; [`Self::end_gesture`] commits it as one step.
     pub fn edit_live(&mut self, label: impl Into<SharedString>, f: impl FnOnce(&mut AdjustmentSet), cx: &mut Context<Self>) {
+        self.edit_live_inner(label, f, Some(cx));
+    }
+
+    /// The state half of [`Self::edit_live`]. `None` skips the GPUI render and
+    /// notification so tests can drive the same transition without a window.
+    fn edit_live_inner(
+        &mut self,
+        label: impl Into<SharedString>,
+        f: impl FnOnce(&mut AdjustmentSet),
+        cx: Option<&mut Context<Self>>,
+    ) {
         self.apply_gesture_edit(label, f);
-        self.request_render(RenderQuality::Draft, cx);
-        cx.notify();
+        if let Some(cx) = cx {
+            self.request_render(RenderQuality::Draft, cx);
+            cx.notify();
+        }
     }
 
     fn apply_gesture_edit(&mut self, label: impl Into<SharedString>, f: impl FnOnce(&mut AdjustmentSet)) {
-        let Some(id) = self.current else { return };
-        let edit = self.edits.entry(id).or_default();
+        let Some(id) = self.library.current else { return };
+        let edit = self.editor.edits.entry(id).or_default();
         if edit.gesture.is_none() {
             edit.gesture = Some((label.into(), edit.adj.clone()));
         }
@@ -1144,12 +1095,20 @@ impl AppState {
     /// Ends the current gesture, if any, as a single undo step.
     #[track_caller]
     pub fn end_gesture(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.current else { return };
-        let Some(edit) = self.edits.get_mut(&id) else { return };
+        self.end_gesture_inner(Some(cx));
+    }
+
+    /// The state half of [`Self::end_gesture`]; see [`Self::edit_live_inner`].
+    #[track_caller]
+    fn end_gesture_inner(&mut self, mut cx: Option<&mut Context<Self>>) {
+        let Some(id) = self.library.current else { return };
+        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
         let Some((label, before)) = edit.gesture.take() else {
             // Panning has no undo step but still leaves a draft on screen.
-            if self.preview.draft {
-                self.request_render(RenderQuality::Final, cx);
+            if self.preview_state.preview.draft {
+                if let Some(cx) = cx {
+                    self.request_render(RenderQuality::Final, cx);
+                }
             }
             return;
         };
@@ -1159,30 +1118,52 @@ impl AppState {
         if before != edit.adj {
             edit.undo.push((label, before));
             edit.redo.clear();
-            if edit.undo.len() > self.settings.undo_levels.max(10) {
+            if edit.undo.len() > self.prefs.settings.undo_levels.max(10) {
                 edit.undo.remove(0);
             }
-            self.after_commit(id, cx);
+            self.after_commit_inner(id, cx.as_deref_mut());
         }
-        self.request_render(RenderQuality::Final, cx);
-        cx.notify();
+        if let Some(cx) = cx {
+            self.request_render(RenderQuality::Final, cx);
+            cx.notify();
+        }
     }
 
     /// A discrete change: one undo step, final-quality render.
     pub fn edit(&mut self, label: impl Into<SharedString>, f: impl FnOnce(&mut AdjustmentSet), cx: &mut Context<Self>) {
-        self.end_gesture(cx);
+        self.edit_inner(label, f, Some(cx));
+    }
+
+    /// The state half of [`Self::edit`]; see [`Self::edit_live_inner`].
+    fn edit_inner(
+        &mut self,
+        label: impl Into<SharedString>,
+        f: impl FnOnce(&mut AdjustmentSet),
+        mut cx: Option<&mut Context<Self>>,
+    ) {
+        self.end_gesture_inner(cx.as_deref_mut());
         self.apply_gesture_edit(label, f);
-        self.end_gesture(cx);
+        self.end_gesture_inner(cx);
     }
 
     /// Applies one change to every selected image (Capture One's "Edit selected variants").
     pub fn edit_selected(&mut self, label: impl Into<SharedString>, f: impl Fn(&mut AdjustmentSet), cx: &mut Context<Self>) {
+        self.edit_selected_inner(label, f, Some(cx));
+    }
+
+    /// The state half of [`Self::edit_selected`]; see [`Self::edit_live_inner`].
+    fn edit_selected_inner(
+        &mut self,
+        label: impl Into<SharedString>,
+        f: impl Fn(&mut AdjustmentSet),
+        mut cx: Option<&mut Context<Self>>,
+    ) {
         let label = label.into();
-        self.end_gesture(cx);
-        let ids: Vec<ImageId> = self.selection.iter().copied().collect();
+        self.end_gesture_inner(cx.as_deref_mut());
+        let ids: Vec<ImageId> = self.library.selection.iter().copied().collect();
         let mut changed = Vec::new();
         for id in ids {
-            let edit = self.edits.entry(id).or_default();
+            let edit = self.editor.edits.entry(id).or_default();
             let before = edit.adj.clone();
             f(&mut edit.adj);
             if before != edit.adj {
@@ -1191,72 +1172,147 @@ impl AppState {
                 changed.push(id);
             }
         }
-        self.after_commit_many(changed, cx);
-        self.preview.before_dirty = true;
-        self.request_render(RenderQuality::Final, cx);
-        cx.notify();
+        self.after_commit_many_inner(changed, cx.as_deref_mut());
+        self.preview_state.preview.before_dirty = true;
+        if let Some(cx) = cx {
+            self.request_render(RenderQuality::Final, cx);
+            cx.notify();
+        }
     }
 
     pub(crate) fn after_commit(&mut self, id: ImageId, cx: &mut Context<Self>) {
-        self.after_commit_many(vec![id], cx);
+        self.after_commit_inner(id, Some(cx));
+    }
+
+    fn after_commit_inner(&mut self, id: ImageId, cx: Option<&mut Context<Self>>) {
+        self.after_commit_many_inner(vec![id], cx);
     }
 
     fn after_commit_many(&mut self, ids: Vec<ImageId>, cx: &mut Context<Self>) {
+        self.after_commit_many_inner(ids, Some(cx));
+    }
+
+    /// Commits `ids` to the engine. The save path is identical with or
+    /// without a GPUI context; `None` only skips notices, thumbnail refreshes
+    /// and the render request.
+    fn after_commit_many_inner(&mut self, ids: Vec<ImageId>, mut cx: Option<&mut Context<Self>>) {
         if ids.is_empty() {
             return;
         }
         let items: Vec<(ImageId, AdjustmentSet)> = ids
             .iter()
-            .filter_map(|id| self.edits.get(id).map(|edit| (*id, edit.adj.clone())))
+            .filter_map(|id| self.editor.edits.get(id).map(|edit| (*id, edit.adj.clone())))
             .collect();
-        if let Err(err) = self.engine.save_adjustments_batch(&items) {
-            self.notify(format!("{} {err}", t("Could not save adjustments", "无法存储调整：")), cx);
+        // Engines with a bounded writer use it so the UI thread does not wait
+        // for N files + the catalog index. The synchronous report remains the
+        // fallback (MockEngine and any engine without a queue).
+        if let Some(summary) = self.engine.save_adjustments_queued(&items) {
+            if let Some(message) = queued_save_notice(&summary) {
+                if let Some(cx) = cx.as_deref_mut() {
+                    self.notify(message, cx);
+                }
+            }
+            // A sticky background error (disk/index) is surfaced once; a later
+            // successful status clears it.
+            if let Some(status) = self.engine.pending_save_status() {
+                let error = status.index_error.clone().or(status.last_error.clone());
+                if error != self.last_save_error {
+                    if let Some(error) = &error {
+                        if let Some(cx) = cx.as_deref_mut() {
+                            self.notify(
+                                format!("{} {error}", t("Could not save adjustments", "无法存储调整：")),
+                                cx,
+                            );
+                        }
+                    }
+                    self.last_save_error = error;
+                }
+            }
+        } else {
+            let report = self.engine.save_adjustments_batch_report(&items);
+            if let Some(message) = save_report_notice(&report) {
+                if let Some(cx) = cx.as_deref_mut() {
+                    self.notify(message, cx);
+                }
+            }
+            self.last_save_error = None;
         }
         for id in &ids {
-            if let Some(edit) = self.edits.get(id) {
+            if let Some(edit) = self.editor.edits.get(id) {
                 let changed = !edit.adj.is_default();
-                if let Some(info) = self.images.iter_mut().find(|info| info.id == *id) {
+                if let Some(info) = self.library.images.iter_mut().find(|info| info.id == *id) {
                     info.has_adjustments = changed;
                 }
             }
         }
-        self.queue_thumbs(ids, cx);
+        if let Some(cx) = cx {
+            self.queue_thumbs(ids, cx);
+        }
+    }
+
+    /// Flushes queued saves (bounded) and quits. The UI may block for up to the
+    /// timeout at close; a failure is logged and shown so unsaved work is not
+    /// silently dropped.
+    pub fn flush_and_quit(&mut self, cx: &mut Context<Self>) {
+        if let Some(report) =
+            self.engine.flush_pending_saves(std::time::Duration::from_secs(2))
+        {
+            if let Some(message) = flush_report_notice(&report) {
+                log::warn!("{message}");
+                self.notify(message, cx);
+            }
+        }
+        cx.quit();
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
-        self.end_gesture(cx);
-        let Some(id) = self.current else { return };
-        let Some(edit) = self.edits.get_mut(&id) else { return };
+        self.undo_inner(Some(cx));
+    }
+
+    /// The state half of [`Self::undo`]; see [`Self::edit_live_inner`].
+    fn undo_inner(&mut self, mut cx: Option<&mut Context<Self>>) {
+        self.end_gesture_inner(cx.as_deref_mut());
+        let Some(id) = self.library.current else { return };
+        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
         if let Some((label, prev)) = edit.undo.pop() {
             let now = std::mem::replace(&mut edit.adj, prev);
             edit.redo.push((label.clone(), now));
-            self.after_commit(id, cx);
-            self.request_render(RenderQuality::Final, cx);
-            self.notify(format!("{} {label}", t("Undo", "撤销")), cx);
+            self.after_commit_inner(id, cx.as_deref_mut());
+            if let Some(cx) = cx {
+                self.request_render(RenderQuality::Final, cx);
+                self.notify(format!("{} {label}", t("Undo", "撤销")), cx);
+            }
         }
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) {
-        self.end_gesture(cx);
-        let Some(id) = self.current else { return };
-        let Some(edit) = self.edits.get_mut(&id) else { return };
+        self.redo_inner(Some(cx));
+    }
+
+    /// The state half of [`Self::redo`]; see [`Self::edit_live_inner`].
+    fn redo_inner(&mut self, mut cx: Option<&mut Context<Self>>) {
+        self.end_gesture_inner(cx.as_deref_mut());
+        let Some(id) = self.library.current else { return };
+        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
         if let Some((label, next)) = edit.redo.pop() {
             let now = std::mem::replace(&mut edit.adj, next);
             edit.undo.push((label.clone(), now));
-            self.after_commit(id, cx);
-            self.request_render(RenderQuality::Final, cx);
-            self.notify(format!("{} {label}", t("Redo", "重做")), cx);
+            self.after_commit_inner(id, cx.as_deref_mut());
+            if let Some(cx) = cx {
+                self.request_render(RenderQuality::Final, cx);
+                self.notify(format!("{} {label}", t("Redo", "重做")), cx);
+            }
         }
     }
 
     pub fn copy_adjustments(&mut self, cx: &mut Context<Self>) {
-        self.clipboard = Some(self.adj().clone());
+        self.editor.clipboard = Some(self.adj().clone());
         self.notify(t("Adjustments copied", "已拷贝调整"), cx);
     }
 
     pub fn apply_adjustments(&mut self, cx: &mut Context<Self>) {
-        let Some(clip) = self.clipboard.clone() else { return };
-        let groups: Vec<ClipGroup> = self.clip_groups.iter().copied().collect();
+        let Some(clip) = self.editor.clipboard.clone() else { return };
+        let groups: Vec<ClipGroup> = self.editor.clip_groups.iter().copied().collect();
         if groups.is_empty() {
             self.notify(t("Choose at least one tool to apply", "请至少选择一个要应用的工具"), cx);
             return;
@@ -1272,8 +1328,8 @@ impl AppState {
     /// Undoes or redoes until `undo_len` steps remain on the undo stack.
     pub fn jump_history(&mut self, undo_len: usize, cx: &mut Context<Self>) {
         self.end_gesture(cx);
-        let Some(id) = self.current else { return };
-        let Some(edit) = self.edits.get_mut(&id) else { return };
+        let Some(id) = self.library.current else { return };
+        let Some(edit) = self.editor.edits.get_mut(&id) else { return };
         while edit.undo.len() > undo_len {
             let Some((label, prev)) = edit.undo.pop() else { break };
             let now = std::mem::replace(&mut edit.adj, prev);
@@ -1298,52 +1354,52 @@ impl AppState {
             g.copy(&mut adjustments, &src);
         }
         let style = UserStyle { name: name.clone(), groups: groups.iter().map(|g| g.id()).collect(), adjustments };
-        match self.settings.user_styles.iter_mut().find(|s| s.name == name) {
+        match self.prefs.settings.user_styles.iter_mut().find(|s| s.name == name) {
             Some(existing) => *existing = style,
-            None => self.settings.user_styles.push(style),
+            None => self.prefs.settings.user_styles.push(style),
         }
-        self.settings.save();
+        self.prefs.settings.save();
         self.notify(format!("{} {name}", t("Saved style", "已存储风格")), cx);
     }
 
     /// Applies user style `index` to the selection: only its saved tools change.
     pub fn apply_user_style(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(style) = self.settings.user_styles.get(index).cloned() else { return };
+        let Some(style) = self.prefs.settings.user_styles.get(index).cloned() else { return };
         let name = style.name.clone();
-        self.hover_look = None;
+        self.preview_state.hover_look = None;
         self.edit_selected(format!("{} {name}", t("Style", "风格")), move |a| user_style_onto(a, &style), cx);
     }
 
     pub fn rename_user_style(&mut self, index: usize, name: String, cx: &mut Context<Self>) {
-        if let Some(style) = self.settings.user_styles.get_mut(index) {
+        if let Some(style) = self.prefs.settings.user_styles.get_mut(index) {
             style.name = name;
-            self.settings.save();
+            self.prefs.settings.save();
             cx.notify();
         }
     }
 
     pub fn delete_user_style(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.settings.user_styles.len() {
-            let style = self.settings.user_styles.remove(index);
-            self.settings.save();
+        if index < self.prefs.settings.user_styles.len() {
+            let style = self.prefs.settings.user_styles.remove(index);
+            self.prefs.settings.save();
             self.notify(format!("{} {}", t("Deleted style", "已删除风格"), style.name), cx);
         }
     }
 
     pub fn apply_style(&mut self, style: &StyleInfo, stack: bool, cx: &mut Context<Self>) {
         let style = style.clone();
-        self.hover_look = None;
+        self.preview_state.hover_look = None;
         let label = format!("{} {}", t("Style", "风格"), style.name);
         if !style.has_look || style.source.is_none() {
             self.edit_selected(label, move |a| style_onto(a, &style, stack), cx);
             return;
         }
-        let targets: Vec<(ImageId, AdjustmentSet)> = self
+        let targets: Vec<(ImageId, AdjustmentSet)> = self.library
             .selection
             .iter()
             .copied()
             .map(|id| {
-                let target = self.edits.get(&id).map(|edit| edit.adj.clone()).unwrap_or_default();
+                let target = self.editor.edits.get(&id).map(|edit| edit.adj.clone()).unwrap_or_default();
                 (id, target)
             })
             .collect();
@@ -1380,7 +1436,7 @@ impl AppState {
     ) {
         let mut changed = Vec::new();
         for (id, target, effective) in loaded {
-            let edit = self.edits.entry(id).or_default();
+            let edit = self.editor.edits.entry(id).or_default();
             let before = edit.adj.clone();
             if edit.adj == target {
                 style_onto(&mut edit.adj, &effective, stack);
@@ -1396,7 +1452,7 @@ impl AppState {
             }
         }
         self.after_commit_many(changed, cx);
-        self.preview.before_dirty = true;
+        self.preview_state.preview.before_dirty = true;
         self.request_render(RenderQuality::Final, cx);
         cx.notify();
     }
@@ -1409,24 +1465,24 @@ impl AppState {
             let mut a = self.adj().clone();
             match look {
                 HoverLook::Style(style, stack) => {
-                    let effective = match self.current {
+                    let effective = match self.library.current {
                         Some(image) => style_for_target(self.engine.as_ref(), &style, image, &a),
                         None => style,
                     };
                     style_onto(&mut a, &effective, stack);
                 }
                 HoverLook::User(index) => {
-                    if let Some(style) = self.settings.user_styles.get(index) {
+                    if let Some(style) = self.prefs.settings.user_styles.get(index) {
                         user_style_onto(&mut a, style);
                     }
                 }
             }
             a
         });
-        if self.hover_look == adj {
+        if self.preview_state.hover_look == adj {
             return;
         }
-        self.hover_look = adj;
+        self.preview_state.hover_look = adj;
         self.request_render(RenderQuality::Final, cx);
         cx.notify();
     }
@@ -1434,7 +1490,7 @@ impl AppState {
     /// Whether tethered capture can be offered: the engine's tethering backend has
     /// a camera open (`tether_status`, not `camera_status`, per the engine contract).
     pub fn camera_ready(&self) -> bool {
-        matches!(self.tether, Some(TetherStatus::Available { .. }))
+        self.device.camera_ready()
     }
 
     /// Saves the current image's adjustments into its Capture One `.cos`.
@@ -1449,10 +1505,10 @@ impl AppState {
 
     fn save_c1(&mut self, catalog: bool, cx: &mut Context<Self>) {
         let is_catalog = matches!(self.source, Source::Catalog(_));
-        if !c1_save_enabled(self.c1_save_busy, self.current.is_some(), catalog, is_catalog) {
+        if !c1_save_enabled(self.c1_save_busy, self.library.current.is_some(), catalog, is_catalog) {
             let reason = if self.c1_save_busy {
                 t("A Capture One save is already running", "已有 Capture One 保存在进行")
-            } else if self.current.is_none() {
+            } else if self.library.current.is_none() {
                 t("Open an image first", "请先打开图像")
             } else {
                 t("This window has no Capture One catalog open", "当前窗口没有打开 C1 catalog")
@@ -1460,7 +1516,7 @@ impl AppState {
             self.notify(reason, cx);
             return;
         }
-        let Some(image) = self.current else { return };
+        let Some(image) = self.library.current else { return };
         let adjustments = self.adj().clone();
         let engine = self.engine.clone();
         self.c1_save_busy = true;
@@ -1489,7 +1545,7 @@ impl AppState {
 
     /// Why capture is not offered right now, for disabled controls and notices.
     pub fn tether_note(&self) -> &'static str {
-        match self.tether {
+        match self.device.tether {
             None => t("Looking for a camera…", "正在检测相机…"),
             Some(TetherStatus::NoLibrary) => t("Tethering needs libgphoto2, which was not found (Linux only for now)", "联机拍摄需要 libgphoto2，本机未找到（目前仅支持 Linux）"),
             Some(TetherStatus::NoCamera) => t("No camera answered; connect one by USB and check again", "未检测到相机；请通过 USB 连接后重新检测"),
@@ -1500,10 +1556,10 @@ impl AppState {
     /// Asks the engine whether a camera can be opened. Opening one can take a few
     /// seconds, so it runs in the background.
     pub fn probe_tether(&mut self, cx: &mut Context<Self>) {
-        if self.tether_probing {
+        if self.device.tether_probing {
             return;
         }
-        self.tether_probing = true;
+        self.device.set_tether_probing(true);
         cx.notify();
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
@@ -1517,10 +1573,9 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.tether_probing = false;
-                this.tether = Some(tether);
-                this.camera = camera;
-                this.camera_settings = settings;
+                this.device.set_tether_probing(false);
+                this.device.set_tether(Some(tether));
+                this.device.set_camera(camera, settings);
                 cx.notify();
             })
             .ok();
@@ -1542,9 +1597,9 @@ impl AppState {
                 match result {
                     Ok(info) => {
                         let id = info.id;
-                        this.edits.insert(id, Edit::default());
-                        this.recent_captures.insert(id);
-                        this.images.push(info);
+                        this.editor.edits.insert(id, Edit::default());
+                        this.library.recent_captures.insert(id);
+                        this.library.images.push(info);
                         this.queue_thumbs(vec![id], cx);
                         this.select(id, false, false, cx);
                         this.notify(t("Captured", "已拍摄"), cx);
@@ -1572,19 +1627,19 @@ impl AppState {
 
     pub fn reset_all(&mut self, cx: &mut Context<Self>) {
         self.edit(t("Reset", "复位"), |a| *a = AdjustmentSet::default(), cx);
-        self.active_layer = None;
-        self.active_node = None;
+        self.editor.active_layer = None;
+        self.editor.active_node = None;
     }
 
     pub fn auto_adjust(&mut self, target: AutoTarget, cx: &mut Context<Self>) {
-        let Some(id) = self.current else { return };
+        let Some(id) = self.library.current else { return };
         let engine = self.engine.clone();
         let current = self.adj().clone();
         cx.spawn(async move |this, cx| {
             let result = cx.background_spawn(async move { engine.auto_adjust(id, &current, target) }).await;
             this.update(cx, |this, cx| match result {
                 Ok(r) => {
-                    if this.current == Some(id) {
+                    if this.library.current == Some(id) {
                         this.edit(t("Auto adjust", "自动调整"), |a| *a = r.adjustments, cx);
                     }
                 }
@@ -1609,8 +1664,8 @@ impl AppState {
         self.edit(t("Add layer", "新建图层"), |a| {
             a.layers.push(Layer { id, name, kind, mask: mask.unwrap_or_default(), ..Default::default() });
         }, cx);
-        self.active_layer = Some(id);
-        self.active_node = None;
+        self.editor.active_layer = Some(id);
+        self.editor.active_node = None;
         cx.notify();
         id
     }
@@ -1618,7 +1673,7 @@ impl AppState {
     /// Turns a sampled color into a color editor selection: the nearest basic
     /// sector, or a new advanced / skin range centered on its hue.
     pub fn range_from_sample(&mut self, rgb: [f32; 3], cx: &mut Context<Self>) {
-        self.panels.pick_to_range = false;
+        self.prefs.panels.pick_to_range = false;
         let [r, g, b] = rgb.map(|v| v.clamp(0.0, 1.0));
         let (max, min) = (r.max(g).max(b), r.min(g).min(b));
         let d = max - min;
@@ -1632,9 +1687,9 @@ impl AppState {
             60.0 * ((r - g) / d + 4.0)
         };
         let sat = if max > 0.0 { d / max } else { 0.0 };
-        let mode = self.panels.color_editor_mode;
+        let mode = self.prefs.panels.color_editor_mode;
         if mode == 0 {
-            self.panels.selected_sector = HueSector::nearest(hue) as usize;
+            self.prefs.panels.selected_sector = HueSector::nearest(hue) as usize;
             self.notify(format!("{} · {hue:.0}°", t("Picked the nearest color", "已选中最接近的颜色")), cx);
         } else {
             let skin = mode == 2;
@@ -1653,7 +1708,7 @@ impl AppState {
                     if skin { ce.skin.push(r) } else { ce.advanced.push(r) }
                 })
             }, cx);
-            self.panels.selected_color_range = Some(id);
+            self.prefs.panels.selected_color_range = Some(id);
             self.notify(format!("{} · {hue:.0}°", t("Color range created from the sample", "已从取样创建色彩范围")), cx);
         }
         self.set_cursor(CursorTool::Select, cx);
@@ -1672,7 +1727,7 @@ impl AppState {
 
     /// Ticks or unticks an AI mask kind for the next "Create" in the mask panel.
     pub fn toggle_ai_pick(&mut self, kind: AiMaskKind, cx: &mut Context<Self>) {
-        let pick = &mut self.panels.ai_pick;
+        let pick = &mut self.prefs.panels.ai_pick;
         if let Some(i) = pick.iter().position(|k| *k == kind) {
             pick.remove(i);
         } else {
@@ -1687,21 +1742,21 @@ impl AppState {
     /// step (from the base, they go on one new layer). A result for an image
     /// no longer shown, or a layer since deleted, is dropped.
     pub fn compute_ai_masks(&mut self, kinds: Vec<AiMaskKind>, cx: &mut Context<Self>) {
-        let Some(image) = self.current else { return };
-        if kinds.is_empty() || self.ai_busy {
+        let Some(image) = self.library.current else { return };
+        if kinds.is_empty() || self.tasks.ai_busy {
             return;
         }
         let engine = self.engine.clone();
         let scope = self.scope();
-        self.ai_busy = true;
+        self.tasks.ai_busy = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let results = cx
                 .background_spawn(async move { kinds.into_iter().map(|k| (k, engine.compute_ai_mask(image, k))).collect::<Vec<_>>() })
                 .await;
             this.update(cx, |this, cx| {
-                this.ai_busy = false;
-                if this.current != Some(image) {
+                this.tasks.ai_busy = false;
+                if this.library.current != Some(image) {
                     cx.notify();
                     return;
                 }
@@ -1719,7 +1774,7 @@ impl AppState {
                         }
                     }
                 }
-                this.panels.ai_pick.clear();
+                this.prefs.panels.ai_pick.clear();
                 if !shapes.is_empty() {
                     let label = t("AI mask", "AI 蒙版");
                     match scope {
@@ -1760,11 +1815,11 @@ impl AppState {
         self.cursor_changed = std::time::Instant::now();
         self.cursor = tool;
         if tool != CursorTool::Spot {
-            self.spot_anchor = None;
+            self.editor.spot_anchor = None;
         }
         if tool == CursorTool::Crop || was_crop {
             // The crop tool shows the uncropped frame with an overlay.
-            self.zoom = ViewZoom::default();
+            self.preview_state.zoom = ViewZoom::default();
             self.request_render(RenderQuality::Final, cx);
         }
         if tool.is_mask_tool() && self.scope() == Scope::Global {
@@ -1774,12 +1829,12 @@ impl AppState {
     }
 
     pub fn set_zoom(&mut self, scale: Option<f32>, center: Option<(f32, f32)>, cx: &mut Context<Self>) {
-        self.zoom.scale = scale.map(|s| s.clamp(0.05, 8.0));
+        self.preview_state.zoom.scale = scale.map(|s| s.clamp(0.05, 8.0));
         if let Some(c) = center {
-            self.zoom.center = c;
+            self.preview_state.zoom.center = c;
         }
         if scale.is_none() {
-            self.zoom.center = (0.5, 0.5);
+            self.preview_state.zoom.center = (0.5, 0.5);
         }
         self.clamp_center();
         self.request_render(RenderQuality::Final, cx);
@@ -1787,11 +1842,11 @@ impl AppState {
     }
 
     pub fn pan_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
-        if self.zoom.scale.is_none() {
+        if self.preview_state.zoom.scale.is_none() {
             return;
         }
-        self.zoom.center.0 += dx;
-        self.zoom.center.1 += dy;
+        self.preview_state.zoom.center.0 += dx;
+        self.preview_state.zoom.center.1 += dy;
         self.clamp_center();
         self.request_render(RenderQuality::Draft, cx);
         cx.notify();
@@ -1799,18 +1854,18 @@ impl AppState {
 
     pub fn set_viewport(&mut self, size: (Pixels, Pixels), scale_factor: f32, cx: &mut Context<Self>) {
         let size = (f32::from(size.0), f32::from(size.1));
-        if (size.0 - self.viewport.0).abs() > 1.0 || (size.1 - self.viewport.1).abs() > 1.0 || scale_factor != self.scale_factor {
-            self.viewport = size;
-            self.scale_factor = scale_factor;
-            self.preview.before_dirty = true;
+        if (size.0 - self.preview_state.viewport.0).abs() > 1.0 || (size.1 - self.preview_state.viewport.1).abs() > 1.0 || scale_factor != self.device.scale_factor {
+            self.preview_state.viewport = size;
+            self.device.set_scale_factor(scale_factor);
+            self.preview_state.preview.before_dirty = true;
             crate::state::invalidate_display_profile_cache();
             self.request_render(RenderQuality::Final, cx);
         }
     }
 
     pub fn toggle_panel(&mut self, id: &'static str, cx: &mut Context<Self>) {
-        if !self.panels.collapsed.remove(id) {
-            self.panels.collapsed.insert(id);
+        if !self.prefs.panels.collapsed.remove(id) {
+            self.prefs.panels.collapsed.insert(id);
         }
         cx.notify();
     }
@@ -1819,12 +1874,12 @@ impl AppState {
     /// open one, opens them all again (Alt-click on a panel header).
     pub fn solo_panel(&mut self, id: &'static str, cx: &mut Context<Self>) {
         let others = || crate::tools::QUICK_PANELS.iter().copied().filter(|p| *p != id);
-        let alone = !self.panels.collapsed.contains(id) && others().all(|p| self.panels.collapsed.contains(p));
+        let alone = !self.prefs.panels.collapsed.contains(id) && others().all(|p| self.prefs.panels.collapsed.contains(p));
         if alone {
             self.set_all_panels(true, cx);
         } else {
-            self.panels.collapsed.extend(others());
-            self.panels.collapsed.remove(id);
+            self.prefs.panels.collapsed.extend(others());
+            self.prefs.panels.collapsed.remove(id);
             cx.notify();
         }
     }
@@ -1833,9 +1888,9 @@ impl AppState {
     pub fn set_all_panels(&mut self, open: bool, cx: &mut Context<Self>) {
         for id in crate::tools::QUICK_PANELS {
             if open {
-                self.panels.collapsed.remove(id);
+                self.prefs.panels.collapsed.remove(id);
             } else {
-                self.panels.collapsed.insert(id);
+                self.prefs.panels.collapsed.insert(id);
             }
         }
         cx.notify();
@@ -1859,7 +1914,7 @@ impl AppState {
 
     /// Queues every selected image through each of `recipes`.
     pub fn process(&mut self, recipes: Vec<ProcessRecipe>, cx: &mut Context<Self>) {
-        let images: Vec<ImageId> = self.selection.iter().copied().collect();
+        let images: Vec<ImageId> = self.library.selection.iter().copied().collect();
         if recipes.is_empty() {
             self.notify(t("Enable at least one process recipe", "请至少启用一个处理配方"), cx);
             return;
@@ -1867,14 +1922,13 @@ impl AppState {
         for image in images {
             let name = self.info(image).map(|i| i.file_name.clone()).unwrap_or_default();
             for recipe in &recipes {
-                let id = self.next_job;
-                self.next_job += 1;
+                let id = self.tasks.reserve_job_id();
                 let job = ExportJob { job_id: id, image, recipe: recipe.clone() };
                 if let Err(err) = self.engine.start_export(job) {
                     self.notify(err.to_string(), cx);
                     continue;
                 }
-                self.jobs.push(JobView { id, name: name.clone(), recipe: recipe.name.clone(), status: JobStatus::Queued });
+                self.tasks.push_job(JobView { id, name: name.clone(), recipe: recipe.name.clone(), status: JobStatus::Queued });
             }
         }
         self.tool_tab = ToolTab::Batch;
@@ -1889,7 +1943,7 @@ impl AppState {
                 let busy = this
                     .update(cx, |this, cx| {
                         let mut busy = false;
-                        for job in &mut this.jobs {
+                        for job in &mut this.tasks.jobs {
                             if matches!(job.status, JobStatus::Queued | JobStatus::Running { .. }) {
                                 job.status = this.engine.job_status(job.id);
                                 if let JobStatus::Failed { message } = &job.status {
@@ -1930,12 +1984,12 @@ pub fn init_state(engine: Arc<dyn ImageEngine>, source: Source, cx: &mut App) ->
 impl AppState {
     /// Writes the current view into the settings and saves them.
     pub fn save_settings(&mut self) {
-        let layout = self.current_layout(self.settings.workspace.name.clone());
-        let st = &mut self.settings;
+        let layout = self.current_layout(self.prefs.settings.workspace.name.clone());
+        let st = &mut self.prefs.settings;
         st.workspace = layout;
-        st.viewer_gray = self.view.viewer_gray;
-        st.thumb_size = self.view.thumb_size;
-        st.info_overlay = self.view.show_info_overlay;
+        st.viewer_gray = self.prefs.view.viewer_gray;
+        st.thumb_size = self.prefs.view.thumb_size;
+        st.info_overlay = self.prefs.view.show_info_overlay;
         st.chinese = crate::i18n::locale() == crate::i18n::Locale::ZhCn;
         st.motion_speed = crate::motion::speed();
         st.save();
@@ -1944,29 +1998,29 @@ impl AppState {
     pub fn current_layout(&self, name: String) -> WorkspaceLayout {
         WorkspaceLayout {
             name,
-            inspector_right: self.view.inspector_right,
-            show_inspector: self.view.show_inspector,
-            browser: browser_name(self.view.browser).into(),
-            hidden_tabs: self.settings.workspace.hidden_tabs.clone(),
-            tab_order: self.settings.workspace.tab_order.clone(),
-            quick_tools: self.settings.workspace.quick_tools.clone(),
-            panel_order: self.settings.workspace.panel_order.clone(),
-            pinned_panels: self.settings.workspace.pinned_panels.clone(),
+            inspector_right: self.prefs.view.inspector_right,
+            show_inspector: self.prefs.view.show_inspector,
+            browser: browser_name(self.prefs.view.browser).into(),
+            hidden_tabs: self.prefs.settings.workspace.hidden_tabs.clone(),
+            tab_order: self.prefs.settings.workspace.tab_order.clone(),
+            quick_tools: self.prefs.settings.workspace.quick_tools.clone(),
+            panel_order: self.prefs.settings.workspace.panel_order.clone(),
+            pinned_panels: self.prefs.settings.workspace.pinned_panels.clone(),
             tab: tab_id(self.tool_tab),
-            inspector_width: self.view.inspector_width,
-            filmstrip_height: self.view.filmstrip_height,
-            multi: self.view.multi,
+            inspector_width: self.prefs.view.inspector_width,
+            filmstrip_height: self.prefs.view.filmstrip_height,
+            multi: self.prefs.view.multi,
         }
     }
 
     fn load_layout(&mut self, l: &WorkspaceLayout) {
-        self.view.inspector_right = l.inspector_right;
-        self.view.show_inspector = l.show_inspector;
-        self.view.browser = browser_from(&l.browser);
-        self.view.inspector_width = l.inspector_width.clamp(260.0, 640.0);
-        self.view.filmstrip_height = l.filmstrip_height.clamp(96.0, 420.0);
-        self.view.multi = l.multi;
-        self.settings.workspace = l.clone();
+        self.prefs.view.inspector_right = l.inspector_right;
+        self.prefs.view.show_inspector = l.show_inspector;
+        self.prefs.view.browser = browser_from(&l.browser);
+        self.prefs.view.inspector_width = l.inspector_width.clamp(260.0, 640.0);
+        self.prefs.view.filmstrip_height = l.filmstrip_height.clamp(96.0, 420.0);
+        self.prefs.view.multi = l.multi;
+        self.prefs.settings.workspace = l.clone();
         if let Some(tab) = tab_from(&l.tab) {
             self.tool_tab = tab;
         }
@@ -1978,7 +2032,7 @@ impl AppState {
     /// Built-in workspaces followed by the user's saved ones.
     pub fn workspace_list(&self) -> Vec<WorkspaceLayout> {
         let mut all = builtin_workspaces();
-        all.extend(self.settings.workspaces.iter().cloned());
+        all.extend(self.prefs.settings.workspaces.iter().cloned());
         all
     }
 
@@ -1993,21 +2047,21 @@ impl AppState {
 
     pub fn save_workspace_as(&mut self, name: String, cx: &mut Context<Self>) {
         let layout = self.current_layout(name.clone());
-        self.settings.workspaces.retain(|w| w.name != name);
-        self.settings.workspaces.push(layout.clone());
-        self.settings.workspace = layout;
+        self.prefs.settings.workspaces.retain(|w| w.name != name);
+        self.prefs.settings.workspaces.push(layout.clone());
+        self.prefs.settings.workspace = layout;
         self.save_settings();
         self.notify(format!("{} · {name}", t("Workspace saved", "工作区已保存")), cx);
     }
 
     pub fn delete_workspace(&mut self, name: &str, cx: &mut Context<Self>) {
-        self.settings.workspaces.retain(|w| w.name != name);
+        self.prefs.settings.workspaces.retain(|w| w.name != name);
         self.save_settings();
         cx.notify();
     }
 
     pub fn tab_hidden(&self, tab: ToolTab) -> bool {
-        self.settings.workspace.hidden_tabs.iter().any(|h| *h == tab_id(tab))
+        self.prefs.settings.workspace.hidden_tabs.iter().any(|h| *h == tab_id(tab))
     }
 
     /// The shown tabs in the workspace's order; tabs the order does not name
@@ -2018,7 +2072,7 @@ impl AppState {
 
     pub fn tab_order(&self) -> Vec<ToolTab> {
         let mut order: Vec<ToolTab> = Vec::new();
-        for tab in self.settings.workspace.tab_order.iter().filter_map(|id| tab_from(id)) {
+        for tab in self.prefs.settings.workspace.tab_order.iter().filter_map(|id| tab_from(id)) {
             if !order.contains(&tab) {
                 order.push(tab);
             }
@@ -2040,18 +2094,18 @@ impl AppState {
         order.retain(|t| *t != tab);
         let at = before.and_then(|b| order.iter().position(|t| *t == b)).unwrap_or(order.len());
         order.insert(at, tab);
-        self.settings.workspace.tab_order = order.into_iter().map(tab_id).collect();
+        self.prefs.settings.workspace.tab_order = order.into_iter().map(tab_id).collect();
         self.save_settings();
         cx.notify();
     }
 
     pub fn in_quick(&self, panel: &str) -> bool {
-        self.settings.workspace.quick_tools.iter().any(|p| p == panel)
+        self.prefs.settings.workspace.quick_tools.iter().any(|p| p == panel)
     }
 
     /// Adds a tool panel to the Quick tab, or takes it off.
     pub fn toggle_quick(&mut self, panel: &str, cx: &mut Context<Self>) {
-        let tools = &mut self.settings.workspace.quick_tools;
+        let tools = &mut self.prefs.settings.workspace.quick_tools;
         if let Some(i) = tools.iter().position(|p| p == panel) {
             tools.remove(i);
         } else {
@@ -2066,9 +2120,9 @@ impl AppState {
 
     pub fn set_tab_hidden(&mut self, tab: ToolTab, hidden: bool, cx: &mut Context<Self>) {
         let id = tab_id(tab);
-        self.settings.workspace.hidden_tabs.retain(|h| *h != id);
+        self.prefs.settings.workspace.hidden_tabs.retain(|h| *h != id);
         if hidden && self.visible_tabs().len() > 1 {
-            self.settings.workspace.hidden_tabs.push(id);
+            self.prefs.settings.workspace.hidden_tabs.push(id);
             if self.tool_tab == tab {
                 self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Grading);
             }
@@ -2207,6 +2261,209 @@ pub fn clone_offset(src: [f32; 2], dst: [f32; 2], g: &Geometry, source_size: (u3
     (x.round() as i32, y.round() as i32)
 }
 
+/// Localized notice for a batch save: per-document counts, the catalog-index
+/// error and the first document failure. `None` when everything reached disk.
+fn save_report_notice(report: &SaveReport) -> Option<String> {
+    if report.is_complete() {
+        return None;
+    }
+    let mut message = format!(
+        "{} {} / {} {} / {} {}",
+        t("Saved", "已保存"),
+        report.saved(),
+        t("failed", "失败"),
+        report.failed(),
+        t("skipped", "已跳过"),
+        report.superseded(),
+    );
+    if let Some(index) = &report.index_error {
+        message.push_str(&format!("; {} {index}", t("catalog index not saved", "目录索引未存储：")));
+    }
+    if let Some(first) = report.first_failure() {
+        let error = first.outcome.error().unwrap_or_default();
+        if first.path.is_empty() {
+            message.push_str(&format!("; {error}"));
+        } else {
+            message.push_str(&format!("; {}: {error}", first.path));
+        }
+    }
+    Some(message)
+}
+
+/// Localized notice for a queued submission: capacity/closed/failed only.
+/// Accepted-only submissions are silent; the writer reports later failures
+/// through `pending_save_status` or the quit flush.
+fn queued_save_notice(summary: &QueuedSaveSummary) -> Option<String> {
+    if summary.full() == 0 && summary.closed() == 0 && summary.failed() == 0 {
+        return None;
+    }
+    let mut message = format!(
+        "{} {} / {} {} / {} {}",
+        t("Queued", "已排队"),
+        summary.accepted(),
+        t("queue full", "队列已满"),
+        summary.full(),
+        t("queue closed", "队列已关闭"),
+        summary.closed(),
+    );
+    if let Some(first) = summary.first_failure() {
+        let error = match &first.outcome {
+            QueuedSaveOutcome::Failed { error } => error.clone(),
+            _ => String::new(),
+        };
+        if first.path.is_empty() {
+            message.push_str(&format!("; {error}"));
+        } else {
+            message.push_str(&format!("; {}: {error}", first.path));
+        }
+    }
+    Some(message)
+}
+
+/// Localized notice for a quit/flush report. `None` when everything confirmed.
+fn flush_report_notice(report: &FlushReport) -> Option<String> {
+    if report.is_complete() {
+        return None;
+    }
+    let mut message = format!(
+        "{} {} / {} {} / {} {}",
+        t("Saved", "已保存"),
+        report.saved(),
+        t("failed", "失败"),
+        report.failed(),
+        t("not written", "未写入"),
+        report.not_written(),
+    );
+    if let Some(index) = &report.index_error {
+        message.push_str(&format!("; {} {index}", t("catalog index not saved", "目录索引未存储：")));
+    }
+    if let Some(first) = report
+        .documents
+        .iter()
+        .find(|document| matches!(document.state, PathState::Failed { .. }))
+    {
+        if let PathState::Failed { error } = &first.state {
+            message.push_str(&format!("; {}: {error}", first.rel_path));
+        }
+    }
+    Some(message)
+}
+
+#[cfg(test)]
+mod save_notice_tests {
+    use super::{flush_report_notice, queued_save_notice, save_report_notice};
+    use aurora_engine::{
+        DocumentSaveResult, ImageId, PathState, PathStatus, QueuedDocumentResult,
+        QueuedSaveOutcome, QueuedSaveSummary, SaveReport,
+    };
+    use aurora_engine::document::DocumentRevision;
+    use aurora_engine::FlushReport;
+
+    #[test]
+    fn complete_reports_are_silent() {
+        let report = SaveReport::new(
+            vec![DocumentSaveResult::saved(ImageId(1), "a.cr3")],
+            None,
+        );
+        assert!(save_report_notice(&report).is_none());
+    }
+
+    #[test]
+    fn partial_reports_name_counts_index_and_first_failure() {
+        let report = SaveReport::new(
+            vec![
+                DocumentSaveResult::saved(ImageId(1), "a.cr3"),
+                DocumentSaveResult::saved(ImageId(2), "b.cr3"),
+                DocumentSaveResult::saved(ImageId(3), "c.cr3"),
+                DocumentSaveResult::saved(ImageId(4), "d.cr3"),
+                DocumentSaveResult::failed(ImageId(5), "e.cr3", "read-only"),
+                DocumentSaveResult::failed(ImageId(6), "f.cr3", "gone"),
+                DocumentSaveResult::superseded(ImageId(7), "g.cr3"),
+            ],
+            Some("index locked".into()),
+        );
+        let message = save_report_notice(&report).expect("a partial batch is reported");
+        // Counts are language-independent; labels come from t().
+        assert!(message.contains('4'), "{message}");
+        assert!(message.contains('2'), "{message}");
+        assert!(message.contains('1'), "{message}");
+        assert!(message.contains("index locked"), "{message}");
+        assert!(message.contains("e.cr3: read-only"), "{message}");
+    }
+
+    #[test]
+    fn index_failure_is_reported_without_a_document_failure() {
+        let report = SaveReport::new(
+            vec![DocumentSaveResult::saved(ImageId(1), "a.cr3")],
+            Some("locked".into()),
+        );
+        let message = save_report_notice(&report).expect("an index failure is reported");
+        assert!(message.contains("locked"), "{message}");
+        assert!(!message.contains("a.cr3"), "{message}");
+    }
+
+    fn queued(path: &str, outcome: QueuedSaveOutcome) -> QueuedDocumentResult {
+        QueuedDocumentResult { image: ImageId(1), path: path.into(), outcome }
+    }
+
+    #[test]
+    fn accepted_queued_submissions_are_silent() {
+        let summary = QueuedSaveSummary {
+            documents: vec![queued(
+                "a.cr3",
+                QueuedSaveOutcome::Accepted { revision: DocumentRevision::new(1) },
+            )],
+        };
+        assert!(queued_save_notice(&summary).is_none());
+    }
+
+    #[test]
+    fn full_and_failed_queued_submissions_name_the_reason() {
+        let summary = QueuedSaveSummary {
+            documents: vec![
+                queued("a.cr3", QueuedSaveOutcome::Accepted { revision: DocumentRevision::new(2) }),
+                queued("b.cr3", QueuedSaveOutcome::Full { capacity: 64 }),
+                queued("c.cr3", QueuedSaveOutcome::Failed { error: "unknown image".into() }),
+            ],
+        };
+        let message = queued_save_notice(&summary).expect("not silent");
+        // Counts are language-independent; accepted == full == 1 here.
+        assert!(message.contains('1'), "{message}");
+        assert!(message.contains("c.cr3"), "{message}");
+        assert!(message.contains("unknown image"), "{message}");
+    }
+
+    #[test]
+    fn quit_flush_reports_failed_and_not_written() {
+        let report = FlushReport {
+            documents: vec![
+                PathStatus {
+                    rel_path: "a.cr3".into(),
+                    revision: DocumentRevision::new(1),
+                    state: PathState::Saved,
+                },
+                PathStatus {
+                    rel_path: "b.cr3".into(),
+                    revision: DocumentRevision::new(2),
+                    state: PathState::Failed { error: "disk full".into() },
+                },
+                PathStatus {
+                    rel_path: "c.cr3".into(),
+                    revision: DocumentRevision::new(3),
+                    state: PathState::NotWritten,
+                },
+            ],
+            index_error: Some("index locked".into()),
+            timed_out: true,
+            pending: 1,
+        };
+        let message = flush_report_notice(&report).expect("incomplete flush");
+        assert!(message.contains("disk full"), "{message}");
+        assert!(message.contains("index locked"), "{message}");
+        assert!(message.contains("b.cr3"), "{message}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2245,6 +2502,399 @@ mod tests {
     #[test]
     fn clone_offset_survives_a_missing_image() {
         assert_eq!(clone_offset([0.6, 0.5], [0.4, 0.5], &Geometry::default(), (0, 0)), (0, 0));
+    }
+}
+
+/// `TaskCenter` owns the job list and the busy flags; these pin the id and
+/// ordering contract the output queue and AI panels rely on.
+#[cfg(test)]
+mod task_center_tests {
+    use super::TaskCenter;
+    use aurora_engine::JobStatus;
+
+    #[test]
+    fn ids_are_monotonic_and_jobs_keep_submission_order() {
+        let mut tasks = TaskCenter::default();
+        assert_eq!(tasks.start_job("first.cr3".into(), "JPEG".into()), 1);
+        assert_eq!(tasks.start_job("second.cr3".into(), "TIFF".into()), 2);
+        assert_eq!(tasks.start_job("third.cr3".into(), "JPEG".into()), 3);
+        let ids: Vec<u64> = tasks.jobs.iter().map(|job| job.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        let names: Vec<&str> = tasks.jobs.iter().map(|job| job.name.as_str()).collect();
+        assert_eq!(names, vec!["first.cr3", "second.cr3", "third.cr3"]);
+    }
+
+    #[test]
+    fn a_reserved_id_is_consumed_even_when_the_export_is_rejected() {
+        let mut tasks = TaskCenter::default();
+        let rejected = tasks.reserve_job_id();
+        assert_eq!(rejected, 1);
+        assert!(tasks.jobs.is_empty());
+        assert_eq!(tasks.start_job("next.cr3".into(), "JPEG".into()), 2);
+    }
+
+    #[test]
+    fn finish_job_updates_only_a_listed_job() {
+        let mut tasks = TaskCenter::default();
+        let id = tasks.start_job("a.cr3".into(), "JPEG".into());
+        assert!(tasks.finish_job(id, JobStatus::Failed { message: "cancelled".into() }));
+        assert!(matches!(tasks.jobs[0].status, JobStatus::Failed { .. }));
+        assert!(!tasks.finish_job(id + 1, JobStatus::Queued));
+    }
+
+    #[test]
+    fn busy_flags_round_trip() {
+        let mut tasks = TaskCenter::default();
+        assert!(!tasks.ai_busy && !tasks.analysing);
+        tasks.ai_busy = true;
+        tasks.analysing = true;
+        assert!(tasks.ai_busy && tasks.analysing);
+        tasks.ai_busy = false;
+        assert!(!tasks.ai_busy && tasks.analysing);
+    }
+}
+
+/// Gesture/command invariants. These drive the real `AppState` transition
+/// methods with the GPUI side effects suppressed (`*_inner(..., None)`) and a
+/// recording engine, so undo depth and save calls are asserted on the same code
+/// the UI runs.
+#[cfg(test)]
+mod commit_invariant_tests {
+    use super::*;
+    use aurora_engine::document::DocumentRevision;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Calls {
+        /// Single-document `save_adjustments` writes.
+        singles: Vec<(ImageId, AdjustmentSet)>,
+        /// Synchronous `save_adjustments_batch_report` calls.
+        sync_batches: Vec<Vec<(ImageId, AdjustmentSet)>>,
+        /// `save_adjustments_queued` calls that actually queued.
+        queued_batches: Vec<Vec<(ImageId, AdjustmentSet)>>,
+        /// Every `save_adjustments_queued` call, including engines with no queue.
+        queued_offers: usize,
+    }
+
+    /// A minimal `ImageEngine` that records save calls and keeps the last
+    /// written adjustments so `load_adjustments` round-trips.
+    struct RecordingEngine {
+        images: Vec<ImageInfo>,
+        adjustments: Mutex<HashMap<ImageId, AdjustmentSet>>,
+        calls: Mutex<Calls>,
+        /// Scenario switch: `true` makes `save_adjustments_queued` return a
+        /// summary, `false` returns `None` so the synchronous report is used.
+        has_queue: bool,
+    }
+
+    impl RecordingEngine {
+        fn new(has_queue: bool, images: Vec<ImageInfo>) -> Self {
+            Self { images, adjustments: Mutex::new(HashMap::new()), calls: Mutex::new(Calls::default()), has_queue }
+        }
+
+        fn save_counts(&self) -> (usize, usize, usize) {
+            let calls = self.calls.lock().unwrap();
+            (calls.singles.len(), calls.sync_batches.len(), calls.queued_batches.len())
+        }
+
+        fn queued_offers(&self) -> usize {
+            self.calls.lock().unwrap().queued_offers
+        }
+
+        fn last_sync_batch(&self) -> Vec<(ImageId, AdjustmentSet)> {
+            self.calls.lock().unwrap().sync_batches.last().cloned().unwrap_or_default()
+        }
+
+        fn last_queued_batch(&self) -> Vec<(ImageId, AdjustmentSet)> {
+            self.calls.lock().unwrap().queued_batches.last().cloned().unwrap_or_default()
+        }
+    }
+
+    impl ImageEngine for RecordingEngine {
+        fn name(&self) -> String {
+            "recording".into()
+        }
+
+        fn images(&self) -> Vec<ImageInfo> {
+            self.images.clone()
+        }
+
+        fn import(&self, _paths: &[PathBuf]) -> anyhow::Result<Vec<ImageInfo>> {
+            Ok(Vec::new())
+        }
+
+        fn collections(&self) -> Vec<Collection> {
+            Vec::new()
+        }
+
+        fn update_info(&self, _info: &ImageInfo) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn load_adjustments(&self, image: ImageId) -> AdjustmentSet {
+            self.adjustments.lock().unwrap().get(&image).cloned().unwrap_or_default()
+        }
+
+        fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().singles.push((image, adjustments.clone()));
+            self.adjustments.lock().unwrap().insert(image, adjustments.clone());
+            Ok(())
+        }
+
+        fn save_adjustments_batch_report(&self, items: &[(ImageId, AdjustmentSet)]) -> SaveReport {
+            self.calls.lock().unwrap().sync_batches.push(items.to_vec());
+            let documents = items
+                .iter()
+                .map(|(image, adjustments)| {
+                    self.adjustments.lock().unwrap().insert(*image, adjustments.clone());
+                    DocumentSaveResult::saved(*image, String::new())
+                })
+                .collect();
+            SaveReport::new(documents, None)
+        }
+
+        fn save_adjustments_queued(&self, items: &[(ImageId, AdjustmentSet)]) -> Option<QueuedSaveSummary> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.queued_offers += 1;
+            if !self.has_queue {
+                return None;
+            }
+            calls.queued_batches.push(items.to_vec());
+            drop(calls);
+            for (image, adjustments) in items {
+                self.adjustments.lock().unwrap().insert(*image, adjustments.clone());
+            }
+            Some(QueuedSaveSummary {
+                documents: items
+                    .iter()
+                    .map(|(image, _)| QueuedDocumentResult {
+                        image: *image,
+                        path: format!("image-{}.jpg", image.0),
+                        outcome: QueuedSaveOutcome::Accepted { revision: DocumentRevision::new(1) },
+                    })
+                    .collect(),
+            })
+        }
+
+        fn new_variant(&self, _image: ImageId, _adjustments: &AdjustmentSet) -> anyhow::Result<ImageInfo> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn thumbnail(&self, _image: ImageId, _adjustments: &AdjustmentSet, _max_size: u32) -> anyhow::Result<RgbaImage> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn render_preview(&self, _request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn sample_color(&self, _image: ImageId, _adjustments: &AdjustmentSet, _point: [f32; 2]) -> anyhow::Result<[f32; 3]> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn auto_adjust(&self, _image: ImageId, _current: &AdjustmentSet, _target: AutoTarget) -> anyhow::Result<AutoResult> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn pick_white_balance(&self, _image: ImageId, _point: [f32; 2]) -> anyhow::Result<(f32, f32)> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn compute_ai_mask(&self, _image: ImageId, _kind: AiMaskKind) -> anyhow::Result<String> {
+            anyhow::bail!("not used by these tests")
+        }
+
+        fn icc_profiles(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn lens_profiles(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn styles(&self) -> Vec<StyleInfo> {
+            Vec::new()
+        }
+
+        fn start_export(&self, _job: ExportJob) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn job_status(&self, _job_id: u64) -> JobStatus {
+            JobStatus::Queued
+        }
+    }
+
+    fn image(id: u64) -> ImageInfo {
+        ImageInfo {
+            id: ImageId(id),
+            path: PathBuf::from(format!("image-{id}.jpg")),
+            file_name: format!("image-{id}.jpg"),
+            kind: FileKind::Jpeg,
+            width: 4,
+            height: 4,
+            file_size: 0,
+            exif: Exif::default(),
+            iptc: Iptc::default(),
+            keywords: Vec::new(),
+            rating: 0,
+            color_tag: ColorTag::None,
+            variant: 1,
+            has_adjustments: false,
+            trashed: false,
+            heif: None,
+        }
+    }
+
+    fn assemble_state(engine: &Arc<RecordingEngine>) -> AppState {
+        let engine: Arc<dyn ImageEngine> = engine.clone();
+        AppState::assemble(engine, Source::Demo, Settings::default())
+    }
+
+    /// `edit_live` × N followed by one `end_gesture` is one undo step and one
+    /// save, and the last live value is what gets written.
+    #[test]
+    fn live_gesture_commits_one_step_and_one_save() {
+        let fake = Arc::new(RecordingEngine::new(false, vec![image(1)]));
+        let mut state = assemble_state(&fake);
+        let id = state.library.current.expect("assemble selects the first image");
+
+        state.edit_live_inner("Exposure", |a| a.exposure.exposure = 0.25, None);
+        state.edit_live_inner("Exposure", |a| a.exposure.exposure = 0.75, None);
+        state.edit_live_inner("Exposure", |a| a.exposure.exposure = 1.5, None);
+        // Live changes stay pending until the gesture ends.
+        assert!(state.editor.edits[&id].undo.is_empty());
+        assert_eq!(fake.save_counts(), (0, 0, 0));
+
+        state.end_gesture_inner(None);
+
+        let edit = &state.editor.edits[&id];
+        assert_eq!(edit.undo.len(), 1, "one undo step per gesture");
+        assert_eq!(edit.undo[0].1.exposure.exposure, 0.0, "undo restores the value before the drag");
+        assert_eq!(edit.adj.exposure.exposure, 1.5, "the last live value wins");
+        assert_eq!(fake.save_counts(), (0, 1, 0), "exactly one save for the gesture");
+        let batch = fake.last_sync_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, id);
+        assert_eq!(batch[0].1.exposure.exposure, 1.5);
+
+        // A repeated end_gesture must not add another undo step or save.
+        state.end_gesture_inner(None);
+        assert_eq!(state.editor.edits[&id].undo.len(), 1);
+        assert_eq!(fake.save_counts(), (0, 1, 0));
+    }
+
+    /// A discrete `edit` is one undo step and one save; `undo` and `redo` both
+    /// restore the value and commit once each.
+    #[test]
+    fn edit_undo_and_redo_each_commit_once() {
+        let fake = Arc::new(RecordingEngine::new(false, vec![image(7)]));
+        let mut state = assemble_state(&fake);
+        let id = state.library.current.expect("assemble selects the first image");
+
+        state.edit_inner("Exposure", |a| a.exposure.exposure = 2.0, None);
+        assert_eq!(state.editor.edits[&id].undo.len(), 1);
+        assert_eq!(state.editor.edits[&id].adj.exposure.exposure, 2.0);
+        assert_eq!(fake.save_counts(), (0, 1, 0));
+
+        state.undo_inner(None);
+        assert_eq!(state.editor.edits[&id].adj.exposure.exposure, 0.0, "undo restores the default");
+        assert!(state.editor.edits[&id].undo.is_empty());
+        assert_eq!(fake.save_counts(), (0, 2, 0), "undo commits once");
+
+        state.redo_inner(None);
+        assert_eq!(state.editor.edits[&id].adj.exposure.exposure, 2.0, "redo restores the edit");
+        assert_eq!(state.editor.edits[&id].undo.len(), 1);
+        assert_eq!(fake.save_counts(), (0, 3, 0), "redo commits once");
+    }
+
+    /// `edit_selected` gives every affected image one undo step and writes a
+    /// single batch containing the whole selection.
+    #[test]
+    fn edit_selected_writes_one_batch_for_the_selection() {
+        let fake = Arc::new(RecordingEngine::new(false, (1..=4).map(image).collect()));
+        let mut state = assemble_state(&fake);
+        state.library.selection = [ImageId(1), ImageId(2), ImageId(3)].into_iter().collect();
+
+        state.edit_selected_inner("Exposure", |a| a.exposure.exposure = 1.25, None);
+
+        for id in [ImageId(1), ImageId(2), ImageId(3)] {
+            assert_eq!(state.editor.edits[&id].undo.len(), 1, "{id:?} gets one undo step");
+            assert_eq!(state.editor.edits[&id].adj.exposure.exposure, 1.25, "{id:?} has the new value");
+        }
+        assert_eq!(state.editor.edits[&ImageId(4)].undo.len(), 0, "unselected image is untouched");
+
+        assert_eq!(fake.save_counts(), (0, 1, 0), "one batch save for the selection");
+        let batch = fake.last_sync_batch();
+        let ids: Vec<ImageId> = batch.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![ImageId(1), ImageId(2), ImageId(3)]);
+        assert!(batch.iter().all(|(_, adj)| adj.exposure.exposure == 1.25));
+    }
+
+    /// The same multi-image edit uses one queued summary with every item
+    /// accepted when the engine exposes a queue.
+    #[test]
+    fn edit_selected_uses_the_queue_when_the_engine_has_one() {
+        let fake = Arc::new(RecordingEngine::new(true, (1..=3).map(image).collect()));
+        let mut state = assemble_state(&fake);
+        state.library.selection = [ImageId(1), ImageId(2), ImageId(3)].into_iter().collect();
+
+        state.edit_selected_inner("Exposure", |a| a.exposure.exposure = -0.5, None);
+
+        for id in [ImageId(1), ImageId(2), ImageId(3)] {
+            assert_eq!(state.editor.edits[&id].undo.len(), 1);
+        }
+        assert_eq!(fake.save_counts(), (0, 0, 1), "queued instead of synchronous");
+        let batch = fake.last_queued_batch();
+        assert_eq!(batch.len(), 3, "one item per selected image");
+        let summary = QueuedSaveSummary {
+            documents: batch
+                .iter()
+                .map(|(image, _)| QueuedDocumentResult {
+                    image: *image,
+                    path: String::new(),
+                    outcome: QueuedSaveOutcome::Accepted { revision: DocumentRevision::new(1) },
+                })
+                .collect(),
+        };
+        assert_eq!(summary.accepted(), 3);
+    }
+
+    #[test]
+    fn after_commit_many_uses_the_queued_path_when_available() {
+        let fake = Arc::new(RecordingEngine::new(true, vec![image(1)]));
+        let mut state = assemble_state(&fake);
+        let id = state.library.current.expect("assemble selects the first image");
+        state.editor.edits.get_mut(&id).unwrap().adj.exposure.exposure = 0.8;
+
+        state.after_commit_many_inner(vec![id], None);
+
+        assert_eq!(fake.queued_offers(), 1);
+        assert_eq!(fake.save_counts(), (0, 0, 1), "queue consulted and used");
+        assert_eq!(fake.last_queued_batch().len(), 1);
+        assert!(fake.last_sync_batch().is_empty(), "no synchronous report");
+    }
+
+    #[test]
+    fn after_commit_many_falls_back_to_the_sync_report() {
+        let fake = Arc::new(RecordingEngine::new(false, vec![image(1)]));
+        let mut state = assemble_state(&fake);
+        let id = state.library.current.expect("assemble selects the first image");
+        state.editor.edits.get_mut(&id).unwrap().adj.exposure.exposure = 0.8;
+
+        state.after_commit_many_inner(vec![id], None);
+
+        assert_eq!(fake.queued_offers(), 1, "the queue is offered first");
+        assert_eq!(fake.save_counts(), (0, 1, 0), "no queue means the synchronous report");
+        let batch = fake.last_sync_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].1.exposure.exposure, 0.8);
+
+        // An empty list commits nothing.
+        state.after_commit_many_inner(Vec::new(), None);
+        assert_eq!(fake.save_counts(), (0, 1, 0));
     }
 }
 

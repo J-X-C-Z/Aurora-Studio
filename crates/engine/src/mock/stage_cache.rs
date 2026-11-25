@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 

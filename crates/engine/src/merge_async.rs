@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,12 +14,19 @@ use anyhow::{ensure, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::job_lifecycle::{CancelToken, JobId, JobRegistry, JobScope, JobState};
+#[cfg(test)]
+use crate::job_lifecycle::RegistrySnapshot;
 use crate::mock::process::Source;
 use crate::{
     DeghostMode, HdrOptions, ImageId, PanoramaOptions, Projection,
 };
 
 pub type MergeJobId = u64;
+
+/// Cap on retained async merge records. A new merge prunes terminal history
+/// once the record map reaches this size; live merges are never removed.
+const MERGE_JOB_CAP: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeKind {
@@ -132,15 +139,26 @@ pub struct SoftProofSettings {
 #[derive(Clone)]
 pub(crate) struct MergeJob {
     id: MergeJobId,
+    /// Lifecycle identity in the shared registry.
+    jid: JobId,
+    lifecycle: JobRegistry,
     progress: Arc<Mutex<MergeProgress>>,
     result: Arc<Mutex<Option<std::result::Result<MergeOutcome, MergeError>>>>,
-    cancel: Arc<AtomicBool>,
+    cancel: CancelToken,
 }
 
 impl MergeJob {
-    fn new(id: u64, total: usize) -> Self {
+    fn new(
+        id: MergeJobId,
+        total: usize,
+        jid: JobId,
+        cancel: CancelToken,
+        lifecycle: JobRegistry,
+    ) -> Self {
         Self {
             id,
+            jid,
+            lifecycle,
             progress: Arc::new(Mutex::new(MergeProgress {
                 job_id: id,
                 stage: MergeStage::Load,
@@ -148,24 +166,42 @@ impl MergeJob {
                 total: total as u32,
             })),
             result: Arc::new(Mutex::new(None)),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel,
         }
     }
 
+    /// Record a live stage update. A terminal job ignores late updates, so a
+    /// rejected registry transition can never be hidden by rewritten progress.
     fn progress(&self, stage: MergeStage, done: usize, total: usize) {
+        let live = self
+            .lifecycle
+            .job(self.jid)
+            .is_some_and(|record| !record.state().is_terminal());
+        if !live {
+            return;
+        }
         *self.progress.lock() = MergeProgress { job_id: self.id, stage, done: done as u32, total: total as u32 };
     }
 
     fn finish(&self, result: std::result::Result<MergeOutcome, MergeError>) {
-        let stage = match &result {
-            Ok(_) => MergeStage::Done,
-            Err(error) if error.code == MergeErrorCode::Cancelled => MergeStage::Cancelled,
-            Err(_) => MergeStage::Failed,
+        let (stage, state) = match &result {
+            Ok(_) => (MergeStage::Done, JobState::Succeeded),
+            Err(error) if error.code == MergeErrorCode::Cancelled => {
+                (MergeStage::Cancelled, JobState::Cancelled)
+            }
+            Err(error) => (
+                MergeStage::Failed,
+                JobState::failed(error.message.clone()),
+            ),
         };
-        let mut progress = self.progress.lock();
-        progress.stage = stage;
-        progress.done = progress.total;
-        drop(progress);
+        {
+            let mut progress = self.progress.lock();
+            progress.stage = stage;
+            progress.done = progress.total;
+        }
+        // Settle the registry before publishing the result, so a cancel that
+        // observes the result also sees a terminal job.
+        let _ = self.lifecycle.transition(self.jid, state);
         *self.result.lock() = Some(result);
     }
 }
@@ -173,7 +209,9 @@ impl MergeJob {
 #[derive(Default)]
 pub(crate) struct MergeRegistry {
     next: AtomicU64,
-    jobs: Mutex<HashMap<MergeJobId, MergeJob>>,
+    records: Mutex<HashMap<MergeJobId, MergeJob>>,
+    /// Shared lifecycle state and cancellation token per job.
+    lifecycle: JobRegistry,
 }
 
 impl MergeRegistry {
@@ -185,28 +223,94 @@ impl MergeRegistry {
         first_path: PathBuf,
         request: MergeRequest,
     ) -> MergeJobId {
+        // Terminal history is disposable; a live merge is never pruned. Run
+        // before inserting the new job so the map is bounded when it grows.
+        if self.record_count() >= MERGE_JOB_CAP {
+            self.prune_terminal(MERGE_JOB_CAP / 2);
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let job = MergeJob::new(id, sources.len());
-        self.jobs.lock().insert(id, job.clone());
+        let token = CancelToken::new();
+        let jid = self.lifecycle.submit(JobScope::Merge, token.clone());
+        let _ = self.lifecycle.transition(jid, JobState::running(0.0));
+        let job = MergeJob::new(id, sources.len(), jid, token, self.lifecycle.clone());
+        self.records.lock().insert(id, job.clone());
         std::thread::spawn(move || run(kind, job, sources, stops, first_path, request));
         id
     }
 
+    /// Number of retained merge records, live plus terminal.
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.lock().len()
+    }
+
+    /// Retain at most `keep` terminal merge records, dropping the oldest by
+    /// lifecycle serial. Live merges and the newest `keep` terminal records
+    /// survive; the matching lifecycle records are pruned too.
+    ///
+    /// A pruned id behaves like an id that was never started:
+    /// [`Self::progress`] and [`Self::result`] return `None`, and
+    /// [`Self::cancel`] returns `false`. A worker may still be finishing when a
+    /// record is pruned; its result is dropped with the record.
+    pub(crate) fn prune_terminal(&self, keep: usize) -> usize {
+        let lifecycle = &self.lifecycle;
+        let mut records = self.records.lock();
+        let mut terminal: Vec<(u64, MergeJobId)> = records
+            .iter()
+            .filter(|(_, job)| {
+                // A lifecycle record that is already gone can only be stale;
+                // treat it as terminal so its map entry does not leak.
+                lifecycle
+                    .job(job.jid)
+                    .map(|record| record.state().is_terminal())
+                    .unwrap_or(true)
+            })
+            .map(|(&id, job)| (job.jid.serial, id))
+            .collect();
+        let removed = if terminal.len() > keep {
+            terminal.sort_unstable_by_key(|(serial, _)| *serial);
+            let remove = terminal.len() - keep;
+            for (_, id) in terminal.into_iter().take(remove) {
+                records.remove(&id);
+            }
+            remove
+        } else {
+            0
+        };
+        drop(records);
+        lifecycle.prune_terminal(keep);
+        removed
+    }
+
     pub(crate) fn progress(&self, id: MergeJobId) -> Option<MergeProgress> {
-        self.jobs.lock().get(&id).map(|job| job.progress.lock().clone())
+        let job = self.records.lock().get(&id).cloned()?;
+        let state = self.lifecycle.job(job.jid)?.state().clone();
+        let live = job.progress.lock().clone();
+        let stage = match state {
+            JobState::Queued | JobState::Running { .. } | JobState::Cancelling => {
+                return Some(live);
+            }
+            JobState::Succeeded => MergeStage::Done,
+            JobState::Cancelled => MergeStage::Cancelled,
+            JobState::Failed { .. } => MergeStage::Failed,
+        };
+        Some(MergeProgress { job_id: id, stage, done: live.total, total: live.total })
     }
 
     pub(crate) fn cancel(&self, id: MergeJobId) -> bool {
-        let Some(job) = self.jobs.lock().get(&id).cloned() else { return false };
-        if job.result.lock().is_some() {
-            return false;
-        }
-        job.cancel.store(true, Ordering::SeqCst);
-        true
+        let Some(job) = self.records.lock().get(&id).cloned() else { return false };
+        // `true` only when this call newly requested cancellation; terminal and
+        // already-cancelling jobs report `false`.
+        self.lifecycle.cancel(job.jid).unwrap_or(false)
     }
 
     pub(crate) fn result(&self, id: MergeJobId) -> Option<std::result::Result<MergeOutcome, MergeError>> {
-        self.jobs.lock().get(&id).and_then(|job| job.result.lock().clone())
+        self.records.lock().get(&id).and_then(|job| job.result.lock().clone())
+    }
+
+    /// Read-only counts for tests and UI. Not part of the engine's public API.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> RegistrySnapshot {
+        self.lifecycle.snapshot()
     }
 }
 
@@ -226,18 +330,18 @@ fn run(
     }
     job.progress(MergeStage::Load, 0, total);
     for (index, _source) in sources.iter().enumerate() {
-        if job.cancel.load(Ordering::SeqCst) {
+        if job.cancel.is_cancelled() {
             job.finish(Err(MergeError::cancelled()));
             return;
         }
         job.progress(MergeStage::Load, index + 1, total);
     }
-    if job.cancel.load(Ordering::SeqCst) {
+    if job.cancel.is_cancelled() {
         job.finish(Err(MergeError::cancelled()));
         return;
     }
     job.progress(MergeStage::Align, total, total);
-    if job.cancel.load(Ordering::SeqCst) {
+    if job.cancel.is_cancelled() {
         job.finish(Err(MergeError::cancelled()));
         return;
     }
@@ -271,7 +375,7 @@ fn run(
         }
     };
     job.progress(MergeStage::Blend, total, total);
-    if job.cancel.load(Ordering::SeqCst) {
+    if job.cancel.is_cancelled() {
         job.finish(Err(MergeError::cancelled()));
         return;
     }
@@ -303,7 +407,7 @@ fn run(
         job.finish(Err(MergeError::new(MergeErrorCode::Encode, error.to_string())));
         return;
     }
-    if job.cancel.load(Ordering::SeqCst) {
+    if job.cancel.is_cancelled() {
         let _ = std::fs::remove_file(&temp);
         job.finish(Err(MergeError::cancelled()));
         return;
@@ -483,6 +587,137 @@ mod tests {
         assert!(!engine.cancel_merge(999));
         assert!(engine.merge_result(999).is_none());
         assert!(engine.merge_progress(999).is_none());
+    }
+
+    #[test]
+    fn merge_registry_snapshot_progress_and_terminal_cancel() {
+        let fixture = Fixture::new("registry");
+        let registry = MergeRegistry::default();
+        assert_eq!(registry.snapshot().total, 0);
+        assert!(!registry.cancel(1));
+        assert!(registry.progress(1).is_none());
+        assert!(registry.result(1).is_none());
+
+        let rgba = vec![40u8; 4 * 4 * 4];
+        let sources = vec![
+            Arc::new(Source::from_rgba(4, 4, &rgba)),
+            Arc::new(Source::from_rgba(4, 4, &rgba)),
+        ];
+        let output = fixture.0.join("registry.tif");
+        let request = MergeRequest { output_path: Some(output.clone()), ..Default::default() };
+        let id = registry.start(MergeKind::Hdr, sources, vec![0.0, 1.0], fixture.0.join("a.png"), request);
+        let outcome = (0..400)
+            .find_map(|_| {
+                match registry.result(id) {
+                    Some(result) => Some(result),
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        None
+                    }
+                }
+            })
+            .expect("merge job did not finish");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(output.is_file());
+
+        let snapshot = registry.snapshot();
+        let merge = snapshot.scope(JobScope::Merge).expect("merge scope counts");
+        assert_eq!(merge.total, 1);
+        assert_eq!(merge.succeeded, 1);
+        assert_eq!(merge.terminal(), 1);
+        let progress = registry.progress(id).expect("merge progress");
+        assert_eq!(progress.stage, MergeStage::Done);
+        assert_eq!((progress.done, progress.total), (2, 2));
+        // A terminal job cannot be cancelled again.
+        assert!(!registry.cancel(id));
+    }
+
+    /// Build a terminal record without spawning a worker.
+    fn terminal_record(registry: &MergeRegistry, id: MergeJobId) {
+        let jid = registry.lifecycle.submit(JobScope::Merge, CancelToken::new());
+        registry.lifecycle.transition(jid, JobState::running(0.0)).unwrap();
+        registry.lifecycle.transition(jid, JobState::Succeeded).unwrap();
+        registry
+            .records
+            .lock()
+            .insert(id, MergeJob::new(id, 1, jid, CancelToken::new(), registry.lifecycle.clone()));
+    }
+
+    #[test]
+    fn merge_registry_prune_terminal_bounds_records_and_keeps_live() {
+        let registry = MergeRegistry::default();
+        let terminal_count = MERGE_JOB_CAP + 8;
+        let mut terminal_ids = Vec::new();
+        for index in 0..terminal_count as u64 {
+            let id = index + 1;
+            terminal_record(&registry, id);
+            terminal_ids.push(id);
+        }
+        // A live merge that pruning must never remove.
+        let live_id = 100_000u64;
+        let live_jid = registry.lifecycle.submit(JobScope::Merge, CancelToken::new());
+        registry.lifecycle.transition(live_jid, JobState::running(0.5)).unwrap();
+        registry.records.lock().insert(
+            live_id,
+            MergeJob::new(live_id, 1, live_jid, CancelToken::new(), registry.lifecycle.clone()),
+        );
+
+        assert_eq!(registry.record_count(), terminal_count + 1);
+        let removed = registry.prune_terminal(MERGE_JOB_CAP);
+        assert_eq!(removed, terminal_count - MERGE_JOB_CAP);
+        assert_eq!(registry.record_count(), MERGE_JOB_CAP + 1, "bounded plus the live merge");
+        {
+            let records = registry.records.lock();
+            assert!(records.contains_key(&live_id), "live merge preserved");
+            assert!(records.contains_key(terminal_ids.last().unwrap()), "newest terminal kept");
+            assert!(!records.contains_key(&terminal_ids[0]), "oldest terminal dropped");
+        }
+        // Pruned ids are unknown: progress/result are gone, cancel is a no-op.
+        assert!(registry.progress(terminal_ids[0]).is_none());
+        assert!(registry.result(terminal_ids[0]).is_none());
+        assert!(!registry.cancel(terminal_ids[0]));
+        // The live merge is still observable through the lifecycle registry.
+        assert!(registry.progress(live_id).is_some());
+    }
+
+    #[test]
+    fn merge_start_prunes_terminal_history_when_the_map_is_full() {
+        let fixture = Fixture::new("prune-start");
+        let registry = MergeRegistry::default();
+        for index in 0..MERGE_JOB_CAP as u64 {
+            terminal_record(&registry, index + 1);
+        }
+        assert_eq!(registry.record_count(), MERGE_JOB_CAP);
+        // Keep the real merge's id clear of the synthetic ones.
+        registry.next.store(1_000, Ordering::Relaxed);
+
+        let rgba = vec![40u8; 4 * 4 * 4];
+        let sources = vec![
+            Arc::new(Source::from_rgba(4, 4, &rgba)),
+            Arc::new(Source::from_rgba(4, 4, &rgba)),
+        ];
+        let output = fixture.0.join("prune-start.tif");
+        let request = MergeRequest { output_path: Some(output), ..Default::default() };
+        let id = registry.start(MergeKind::Hdr, sources, vec![0.0, 1.0], fixture.0.join("a.png"), request);
+
+        // `start` pruned terminal history to half the cap before adding one
+        // live record.
+        assert!(
+            registry.record_count() <= MERGE_JOB_CAP / 2 + 1,
+            "records grew to {}",
+            registry.record_count()
+        );
+        // Wait for the started merge so the fixture directory can be removed.
+        let result = (0..400)
+            .find_map(|_| match registry.result(id) {
+                Some(result) => Some(result),
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                }
+            })
+            .expect("merge job did not finish");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

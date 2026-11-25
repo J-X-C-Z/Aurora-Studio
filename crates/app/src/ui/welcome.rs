@@ -100,8 +100,8 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
     let s = state.read(cx);
     let opening = s.opening.clone();
     let error = s.open_error.clone();
-    let recent = s.settings.recent.clone();
-    let reopen = s.settings.reopen_last;
+    let recent = s.prefs.settings.recent.clone();
+    let reopen = s.prefs.settings.reopen_last;
     let busy = opening.is_some();
     let handle = window.window_handle();
 
@@ -194,8 +194,8 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         st_forget.update(cx, |s, cx| {
-                            s.settings.forget(&forget_path);
-                            s.settings.save();
+                            s.prefs.settings.forget(&forget_path);
+                            s.prefs.settings.save();
                             cx.notify();
                         })
                     }),
@@ -231,8 +231,8 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             reopen,
             move |v, _, cx| {
                 st_reopen.update(cx, |s, cx| {
-                    s.settings.reopen_last = v;
-                    s.settings.save();
+                    s.prefs.settings.reopen_last = v;
+                    s.prefs.settings.save();
                     cx.notify();
                 })
             },

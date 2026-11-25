@@ -12,10 +12,10 @@ use crate::theme::{metrics, pal};
 pub fn status_bar(state: &Entity<AppState>, notice: Option<SharedString>, serial: u64, _window: &mut Window, cx: &App) -> impl IntoElement + use<> {
     let p = pal(cx).clone();
     let s = state.read(cx);
-    let total = s.images.len();
-    let selected = s.selection.len();
-    let zoom = (s.effective_scale() / s.scale_factor.max(0.5) * 100.0).round();
-    let ms = s.preview.elapsed_ms;
+    let total = s.library.images.len();
+    let selected = s.library.selection.len();
+    let zoom = (s.effective_scale() / s.device.scale_factor.max(0.5) * 100.0).round();
+    let ms = s.preview_state.preview.elapsed_ms;
     let scope = s.active_layer_ref().map(|l| l.name.clone());
     let cursor = s.cursor.label();
     let dims = s.current_info().map(|i| format!("{} × {}", i.width, i.height));
@@ -55,7 +55,7 @@ pub fn status_bar(state: &Entity<AppState>, notice: Option<SharedString>, serial
                 .into_any_element(),
             _ => div()
                 .text_color(p.text_disabled)
-                .child(s.engine_name.clone())
+                .child(s.prefs.engine_name.clone())
                 .into_any_element(),
         }))
 }

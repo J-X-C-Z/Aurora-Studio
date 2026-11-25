@@ -37,7 +37,7 @@ fn columns(n: usize, vw: f32, vh: f32, aspect: f32) -> usize {
 pub fn render(state: &Entity<AppState>, ids: &[ImageId], window: &mut Window, cx: &mut App) -> AnyElement {
     let p = pal(cx).clone();
     let s = state.read(cx);
-    let (vw, vh) = s.viewport;
+    let (vw, vh) = s.preview_state.viewport;
     let n = ids.len();
     let aspect = ids.iter().filter_map(|id| s.info(*id)).map(|i| i.aspect()).sum::<f32>() / n.max(1) as f32;
     let cols = columns(n, vw, vh, aspect.max(0.2));
@@ -45,8 +45,8 @@ pub fn render(state: &Entity<AppState>, ids: &[ImageId], window: &mut Window, cx
     let cw = (vw - 2.0 * PAD - GAP * (cols as f32 - 1.0)) / cols as f32;
     let ch = (vh - 2.0 * PAD - GAP * (rows as f32 - 1.0)) / rows as f32;
     // Center the last, possibly short, row.
-    let pinned = s.view.compare_variant;
-    let current = s.current;
+    let pinned = s.prefs.view.compare_variant;
+    let current = s.library.current;
 
     let tiles: Vec<_> = ids
         .iter()
@@ -74,9 +74,9 @@ pub fn render(state: &Entity<AppState>, ids: &[ImageId], window: &mut Window, cx
 
         let s = state.read(cx);
         let picture = if is_current {
-            s.preview.frame.as_ref().filter(|f| f.image_id == id).map(|f| f.image.clone()).or_else(|| s.thumbs.get(&id).cloned())
+            s.preview_state.preview.frame.as_ref().filter(|f| f.image_id == id).map(|f| f.image.clone()).or_else(|| s.preview_state.thumbs.get(&id).cloned())
         } else {
-            s.thumbs.get(&id).cloned()
+            s.preview_state.thumbs.get(&id).cloned()
         };
         let info = s.info(id).cloned();
         let name = info.as_ref().map(|i| i.file_name.clone()).unwrap_or_default();
@@ -101,7 +101,7 @@ pub fn render(state: &Entity<AppState>, ids: &[ImageId], window: &mut Window, cx
                 st_click.update(cx, |s, cx| {
                     if e.click_count() >= 2 {
                         // Double-click opens the image alone.
-                        s.view.multi = false;
+                        s.prefs.view.multi = false;
                         s.select(id, false, false, cx);
                     } else {
                         s.set_current(id, cx);
@@ -146,7 +146,7 @@ pub fn render(state: &Entity<AppState>, ids: &[ImageId], window: &mut Window, cx
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         st_pin.update(cx, |s, cx| {
-                            s.view.compare_variant = if is_pinned { None } else { Some(id) };
+                            s.prefs.view.compare_variant = if is_pinned { None } else { Some(id) };
                             cx.notify();
                         })
                     })

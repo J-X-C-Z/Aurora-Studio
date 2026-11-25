@@ -373,7 +373,7 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
         });
         for _ in 0..300 {
             cx.background_executor().timer(Duration::from_millis(20)).await;
-            let ready = state.read_with(cx, |s, _| s.preview.frame.is_some() && !s.preview.rendering && s.thumbs.len() == s.images.len());
+            let ready = state.read_with(cx, |s, _| s.preview_state.preview.frame.is_some() && !s.preview_state.preview.rendering && s.preview_state.thumbs.len() == s.library.images.len());
             if ready {
                 break;
             }
@@ -398,23 +398,23 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
         record(serde_json::json!({"event": "drag_end"}));
         for _ in 0..300 {
             cx.background_executor().timer(Duration::from_millis(20)).await;
-            if state.read_with(cx, |s, _| !s.preview.rendering && s.preview.pending.is_none()) {
+            if state.read_with(cx, |s, _| !s.preview_state.preview.rendering && s.preview_state.preview.pending.is_none()) {
                 break;
             }
         }
         cx.background_executor().timer(Duration::from_millis(150)).await;
         state.read_with(cx, |s, _| record(serde_json::json!({
             "event": "replay_done", "exposure": s.adj().exposure.exposure,
-            "undo_steps": s.current.and_then(|id| s.edits.get(&id)).map_or(0, |e| e.undo.len()),
-            "rendering": s.preview.rendering,
+            "undo_steps": s.library.current.and_then(|id| s.editor.edits.get(&id)).map_or(0, |e| e.undo.len()),
+            "rendering": s.preview_state.preview.rendering,
             "expected_exposure": 1.12f32 * (119.0f32 * 0.12).sin(),
-            "final_quality": s.preview.frame.as_ref().map(|f| format!("{:?}", f.stamp.quality)),
-            "last_request_quality": s.preview.last_request.as_ref().map(|r| format!("{:?}", r.quality)),
-            "pending_quality": s.preview.pending.map(|(q, _)| format!("{q:?}")),
-            "draft_flag": s.preview.draft,
-            "frame_generation": s.preview.frame.as_ref().map(|f| f.stamp.id),
-            "generation": s.preview.generation,
-            "latest_frame": s.preview.frame.as_ref().is_some_and(|f| f.stamp.id == s.preview.generation),
+            "final_quality": s.preview_state.preview.frame.as_ref().map(|f| format!("{:?}", f.stamp.quality)),
+            "last_request_quality": s.preview_state.preview.last_request.as_ref().map(|r| format!("{:?}", r.quality)),
+            "pending_quality": s.preview_state.preview.pending.map(|(q, _)| format!("{q:?}")),
+            "draft_flag": s.preview_state.preview.draft,
+            "frame_generation": s.preview_state.preview.frame.as_ref().map(|f| f.stamp.id),
+            "generation": s.preview_state.preview.generation,
+            "latest_frame": s.preview_state.preview.frame.as_ref().is_some_and(|f| f.stamp.id == s.preview_state.preview.generation),
         })));
         cx.update(|cx| cx.quit());
     }).detach();
