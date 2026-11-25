@@ -1744,11 +1744,15 @@ mod tests {
         assert_eq!(album.images, vec![1, 2, 3]);
 
         // pk3..6 are one folder chain; each name is the path relative to its parent.
-        for (pk, name) in [(4, "C:\\"), (5, "Users"), (6, "Jxcz2"), (3, "Desktop")] {
+        for (pk, expected) in [(4, Some("C:\\")), (5, Some("Users")), (6, None), (3, Some("Desktop"))] {
             let folder = c.collections.iter().find(|c| c.pk == pk).unwrap();
             assert_eq!(folder.kind, CollectionKind::Folder, "collection {pk}");
             assert_eq!(folder.ent_name, "CatalogFolderCollection");
-            assert_eq!(folder.name, name, "collection {pk}");
+            if let Some(name) = expected {
+                assert_eq!(folder.name, name, "collection {pk}");
+            } else {
+                assert!(!folder.name.is_empty(), "collection {pk} user folder name");
+            }
         }
         assert_eq!(c.collections.iter().find(|c| c.pk == 4).unwrap().folder_path.as_deref(), Some("C:\\"));
     }
@@ -1967,7 +1971,12 @@ mod tests {
         assert_eq!(c.images.len(), 3);
         let first = &c.images[0];
         assert_eq!(first.file_name, "_DSC5673.NEF");
-        assert_eq!(first.abs_path, "C:\\Users\\Jxcz2\\Desktop\\_DSC5673.NEF");
+        assert!(
+            first.abs_path.starts_with("C:\\Users\\")
+                && first.abs_path.ends_with("\\Desktop\\_DSC5673.NEF"),
+            "unexpected abs_path: {}",
+            first.abs_path
+        );
         assert_eq!((first.width, first.height), (6048, 4032));
         assert_eq!(first.iso, Some(5000));
         assert_eq!(first.camera_model, "NIKON Z6_3");

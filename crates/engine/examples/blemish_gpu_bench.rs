@@ -52,12 +52,13 @@ fn median(mut samples: Vec<f64>) -> f64 {
 }
 
 pub(crate) fn main() {
-    let dir = std::env::var_os("AURORA_BLEMISH_FIXTURE")
+    let dir = std::env::args_os()
+        .nth(1)
+        .or_else(|| std::env::var_os("AURORA_BLEMISH_FIXTURE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(
-                r"C:\Users\Jxcz2\Documents\Codex\2026-11-10\capture-one-rust-gpui-thread-01a1bf2a\90_work\lanes\c1-parse\c1_blemish_model_r280\harness\fixtures\nef_9868",
-            )
+            eprintln!("usage: blemish_gpu_bench <fixture_dir> (or set AURORA_BLEMISH_FIXTURE)");
+            std::process::exit(2);
         });
     println!("fixture: {}", dir.display());
 

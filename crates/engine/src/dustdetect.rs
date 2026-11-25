@@ -831,13 +831,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "needs local 16-bit TIFF frame; set AURORA_DUST_SAMPLE"]
     fn detect_real_9868_frame() {
-        let path = r"C:\WorkSpace\Aurora Studio\90_work\build-cache\z6iii-desktop-smoke-a88d98b0\output\DSC_9868.tif";
-        if !std::path::Path::new(path).is_file() {
-            return;
-        }
-        let image = image::open(path).unwrap().to_rgba8();
+        let path = std::env::var_os("AURORA_DUST_SAMPLE")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_DUST_SAMPLE to a real frame image");
+        let image = image::open(&path).unwrap().to_rgba8();
         let (w, h) = image.dimensions();
         let spots = detect_dust(image.as_raw(), w, h, 0.15).expect("detection");
         println!("real 9868: {} spots in {w}x{h}", spots.len());

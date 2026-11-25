@@ -1083,13 +1083,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs local blemish golden fixture; set AURORA_BLEMISH_FIXTURE"]
     fn golden_9868_matches_scalar() {
-        let dir = std::path::Path::new(
-            r"C:\Users\Jxcz2\Documents\Codex\2026-11-10\capture-one-rust-gpui-thread-01a1bf2a\90_work\lanes\c1-parse\c1_blemish_model_r280\harness\fixtures\nef_9868",
-        );
-        if !dir.join("engine_9868_blemish.u16").is_file() {
-            return;
-        }
+        let dir = std::env::var_os("AURORA_BLEMISH_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_BLEMISH_FIXTURE to the blemish golden fixture directory");
         let read_u16 = |name: &str| -> Vec<u16> {
             std::fs::read(dir.join(name))
                 .unwrap()
@@ -1118,13 +1116,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs local blemish golden fixture (AURORA_BLEMISH_FIXTURE) and CUDA GPU"]
     fn golden_9868_gpu_matches_cpu() {
-        let dir = std::path::Path::new(
-            r"C:\Users\Jxcz2\Documents\Codex\2026-11-10\capture-one-rust-gpui-thread-01a1bf2a\90_work\lanes\c1-parse\c1_blemish_model_r280\harness\fixtures\nef_9868",
-        );
-        if !dir.join("engine_9868_blemish.u16").is_file() {
-            return;
-        }
+        let dir = std::env::var_os("AURORA_BLEMISH_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_BLEMISH_FIXTURE to the blemish golden fixture directory");
         let read_u16 = |name: &str| -> Vec<u16> {
             std::fs::read(dir.join(name))
                 .unwrap()

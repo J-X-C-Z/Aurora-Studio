@@ -37,8 +37,7 @@ const OPT_ENABLE_ALL: c_int = 99;
 const ORT_RUNTIME_DIRS_ENV: &str = "AURORA_ORT_RUNTIME_DIRS";
 /// Project-relative GPU runtime. A bare `onnxruntime.dll` is never attempted:
 /// Windows ships an incompatible 1.17 build in System32 and it wins the search.
-const PROJECT_ORT_RELATIVE: &str =
-    "90_work/gpu-runtime/python/onnxruntime/capi/onnxruntime.dll";
+const PROJECT_ORT_RELATIVE: &str = "runtime/onnxruntime/onnxruntime.dll";
 /// Comma-separated provider order, e.g. `tensorrt,cuda,cpu`.
 const PROVIDERS_ENV: &str = "AURORA_ORT_PROVIDERS";
 /// Extra DLL directories (semicolon-separated) for cuDNN / TensorRT / CUDA.
@@ -1984,7 +1983,7 @@ fn library_not_found_message(candidates: &[PathBuf]) -> String {
 }
 
 /// Working directory and every executable ancestor, so a checkout works both
-/// from a console in the repo root and from `90_work/build-cache/.../release`.
+/// from a console in the repo root and from `target/.../release`.
 fn project_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {

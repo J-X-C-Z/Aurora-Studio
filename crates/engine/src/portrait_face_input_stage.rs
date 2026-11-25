@@ -409,9 +409,6 @@ fn default_face_landmark_root() -> Option<PathBuf> {
             candidates.push(dir.join("landmark"));
         }
     }
-    candidates.push(PathBuf::from(
-        r"C:\WorkSpace\Aurora Studio\04_reference\legacy-root\逆向工程\像素蛋糕\analysis\model-recovery-landmark-independent",
-    ));
     candidates.into_iter().find(|root| {
         root.join("assets").join("1063025060.onnx").is_file()
             && root.join("assets").join("323773030.onnx").is_file()
@@ -513,12 +510,6 @@ fn face_parsing_v2_model_path() -> Option<PathBuf> {
                     candidates.push(dir.join("fbe.onnx"));
                 }
             }
-            candidates.push(PathBuf::from(
-                r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceparsing\2102828093.onnx",
-            ));
-            candidates.push(PathBuf::from(
-                r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceparsing\fbe.onnx",
-            ));
             candidates
                 .into_iter()
                 .find(|candidate| is_canonical_face_parsing_v2(candidate))

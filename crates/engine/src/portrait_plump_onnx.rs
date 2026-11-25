@@ -120,12 +120,6 @@ pub fn discover_plump_onnx_models() -> Result<[PlumpOnnxAsset; 3], Refusal> {
         roots.push(cwd.join("models").join("faceplump"));
         roots.push(cwd.join("assets").join("portrait").join("faceplump"));
     }
-    roots.push(PathBuf::from(
-        r"C:\WorkSpace\Aurora Studio\05_deliverables\faceplump-models",
-    ));
-    roots.push(PathBuf::from(
-        r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceplump",
-    ));
     let routes = [Route::HighRes4, Route::HighRes3, Route::LowRes3];
     let mut found = Vec::with_capacity(3);
     for route in routes {

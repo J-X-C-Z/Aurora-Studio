@@ -5250,16 +5250,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "profiles real NEF decode through Source construction"]
+    #[ignore = "profiles real NEF decode through Source construction; set AURORA_TEST_RAW"]
     fn bench_real_nef_source_pipeline() {
         use std::time::Instant;
 
         let path = std::env::var_os("AURORA_TEST_RAW")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF"));
-        if !path.is_file() {
-            return;
-        }
+            .expect("set AURORA_TEST_RAW to a real NEF file");
         for round in 0..3 {
             let started = Instant::now();
             let (w, h, px) = crate::raw::decode16(&path).expect("decode16");

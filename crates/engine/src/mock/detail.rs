@@ -3342,7 +3342,7 @@ mod tests {
         use std::time::Instant;
 
         let path = std::env::var("AURORA_DETAIL_BENCH_NEF")
-            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+            .expect("set AURORA_DETAIL_BENCH_NEF to a real NEF file");
         let image = crate::raw::decode(Path::new(&path)).expect("decode NEF");
         assert_eq!(
             crate::raw::from_sensor(Path::new(&path)),

@@ -3,10 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::model_sha256::{hex, sha256};
 
-pub const MODEL_POOL: &str =
-    r"C:\WorkSpace\自研图像编辑软件\逆向工程\像素蛋糕\素材池_全量";
-pub const DECODER_ROOT: &str =
-    r"C:\WorkSpace\Aurora Studio\04_reference\legacy-root\逆向工程\像素蛋糕\analysis\model-recovery-header";
+pub const MODEL_POOL_ENV: &str = "AURORA_PLUMP_MODEL_POOL";
+pub const DECODER_ROOT_ENV: &str = "AURORA_PLUMP_DECODER_ROOT";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -124,11 +122,13 @@ pub struct LoadedSession {
 
 impl LoadedSession {
     pub fn open(route: Route) -> Result<Self, String> {
-        Self::open_at(
-            Path::new(MODEL_POOL),
-            Path::new(DECODER_ROOT),
-            route,
-        )
+        let pool = std::env::var_os(MODEL_POOL_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("set {MODEL_POOL_ENV} to the FacePlump model pool directory"))?;
+        let decoder = std::env::var_os(DECODER_ROOT_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("set {DECODER_ROOT_ENV} to the FacePlump decoder root directory"))?;
+        Self::open_at(&pool, &decoder, route)
     }
 
     pub fn open_at(pool: &Path, decoder: &Path, route: Route) -> Result<Self, String> {

@@ -25,8 +25,7 @@ use super::FaceInputBundle;
 
 pub const PF90116_MODEL_ID: u64 = 814_444_604;
 pub const PF90116_MODEL_PATH_ENV: &str = "AURORA_PF90116_MODEL";
-pub const PF90116_DEFAULT_MODEL_PATH: &str =
-    r"C:\WorkSpace\Aurora Studio\90_work\build-cache\pf90116\814444604.onnx";
+pub const PF90116_DEFAULT_MODEL_PATH: &str = "models/pf90116/814444604.onnx";
 pub const PF90116_GRAPH_INPUT_NAME: &str = "t39";
 pub const PF90116_INPUT_NAME: &str = "781141184";
 pub const PF90116_RESPONSE_NAME: &str = "3204548346";

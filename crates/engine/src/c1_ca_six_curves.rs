@@ -1,6 +1,5 @@
 //! Capture One lateral-CA pixel kernel, transcribed from `p_041444160.cl`
-//! (kernel `z88d05a530c`, 4920 bytes, recovered from the C1 install; see
-//! `90_work/lanes/c1-parse/c1_cl_repo_r250/KERNEL-INDEX.tsv`).
+//! (kernel `z88d05a530c`, 4920 bytes).
 //!
 //! This module implements the **verified** part only:
 //! - piecewise cubic Hermite sampling of a `(radius, value, slope)` knot table,

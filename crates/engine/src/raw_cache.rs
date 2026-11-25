@@ -2353,14 +2353,7 @@ mod tests {
 
         let path = std::env::var_os("AURORA_TEST_RAW")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(
-                    r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF",
-                )
-            });
-        if !path.is_file() {
-            return;
-        }
+            .expect("set AURORA_TEST_RAW to a real NEF file");
         let dir = scratch("raw16-real-nef");
 
         let started = Instant::now();

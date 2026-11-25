@@ -29,8 +29,7 @@ pub const PF8033_FINAL_TENSOR_FILE: &str = "pf8033-780929437.f32le";
 pub const PF8033_DX_FILE: &str = "pf8033-dx.f32le";
 pub const PF8033_DY_FILE: &str = "pf8033-dy.f32le";
 pub const PF8033_MASK_FILE: &str = "pf8033-mask.u8";
-pub const PF8033_ARTIFACT_CACHE: &str =
-    r"C:\WorkSpace\Aurora Studio\90_work\build-cache\pf8033";
+pub const PF8033_ARTIFACT_CACHE: &str = "assets/portrait/smile";
 pub const PF8033_MODEL_WIDTH: u32 = 512;
 pub const PF8033_MODEL_HEIGHT: u32 = 512;
 pub const PF8033_FRAME_WIDTH: u32 = 1024;

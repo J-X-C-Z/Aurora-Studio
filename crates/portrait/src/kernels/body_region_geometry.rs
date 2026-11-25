@@ -18,8 +18,7 @@
 //! `WAIST_BAND` / `BREAST_BAND` / `BUTTOCK_BAND` 取自
 //! `03_algorithms/reports/BODY-POSE-REGION-MAP.tsv` 的 `height_band_t` 列，
 //! `NECK_BAND` 是工程默认值。所有阈值与羽化宽度均标 `[D]`，
-//! 来自 `90_work/lanes/portrait-parse/body-onnx-contract/07-seg-class-to-region-mask.md`
-//! §3–§4，**需要实拍标定**，不得当作原厂参数。
+//! 来自 `07-seg-class-to-region-mask.md` §3–§4，**需要实拍标定**，不得当作原厂参数。
 //!
 //! # 边界
 //!

@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(drive.kind, CollectionKind::Folder);
         assert_eq!(drive.children.len(), 1);
         assert_eq!(drive.children[0].name, "Users");
-        assert_eq!(drive.children[0].children[0].name, "Jxcz2");
+        assert!(!drive.children[0].children[0].name.is_empty());
         assert_eq!(drive.children[0].children[0].children[0].name, "Desktop");
     }
 

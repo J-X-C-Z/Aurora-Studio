@@ -212,12 +212,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "decodes a 16 MP NEF from this machine"]
+    #[ignore = "decodes a real NEF; set AURORA_TEST_RAW"]
     fn report_real_nef() {
-        use std::path::Path;
-
-        let path = Path::new(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF");
-        let image = crate::raw::decode(path).unwrap();
+        let path = std::env::var_os("AURORA_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_TEST_RAW to a real NEF file");
+        let image = crate::raw::decode(&path).unwrap();
         let src = crate::Source::from_rgba(image.width(), image.height(), image.as_raw());
 
         let before = crate::render(&src, &crate::AdjustmentSet::default(), crate::NormRect::FULL, 256, false, None);

@@ -8273,7 +8273,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         use std::path::Path;
 
         let path = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
-            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+            .expect("set AURORA_PORTRAIT_BENCH_NEF to a real NEF file");
         let (w, h, rgba16) = crate::raw::decode16(Path::new(&path)).expect("decode NEF");
         assert_eq!(crate::raw::from_sensor(Path::new(&path)), Some(true));
         let src = Source::from_rgba16(w, h, &rgba16);
@@ -8814,7 +8814,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         use std::path::Path;
 
         let path = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
-            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+            .expect("set AURORA_PORTRAIT_BENCH_NEF to a real NEF file");
         let (w, h, rgba16) = crate::raw::decode16(Path::new(&path)).expect("decode NEF");
         assert_eq!(crate::raw::from_sensor(Path::new(&path)), Some(true));
         let src = Source::from_rgba16(w, h, &rgba16);

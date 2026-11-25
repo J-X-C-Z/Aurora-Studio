@@ -2151,7 +2151,7 @@ mod libraw {
         raw_image: 193_776,
     };
 
-    /// `90_work/build-cache/libraw-0.23-include` (0.23.0 snapshot).
+    /// LibRaw 0.23.0 struct layout snapshot.
     const LAYOUT_23_0: Layout = Layout {
         black: 153_096,
         maximum: 153_104,
@@ -2988,15 +2988,16 @@ mod tests {
         use super::*;
         use std::path::PathBuf;
 
-        const SAMPLE: &str = r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF";
-        const HE_SAMPLE: &str = r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF";
-
         fn sample() -> PathBuf {
-            PathBuf::from(SAMPLE)
+            std::env::var_os("AURORA_TEST_RAW")
+                .map(PathBuf::from)
+                .expect("set AURORA_TEST_RAW to a real NEF file")
         }
 
-        fn sample_is_available() -> bool {
-            sample().is_file()
+        fn he_sample() -> Option<PathBuf> {
+            std::env::var_os("AURORA_TEST_HE_RAW")
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
         }
 
         #[test]
@@ -3013,13 +3014,12 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "needs a real NEF file; set AURORA_TEST_RAW"]
         fn real_nef_decodes_successfully() {
-            if !sample_is_available() {
-                panic!("real NEF sample not found: {SAMPLE}");
-            }
-            let img = decode(&sample()).unwrap();
+            let path = sample();
+            let img = decode(&path).unwrap();
             assert!(img.width().max(img.height()) > 3000, "{:?}", img.dimensions());
-            assert!(sensor_dimensions(&sample()).unwrap().0.max(sensor_dimensions(&sample()).unwrap().1) > 3000);
+            assert!(sensor_dimensions(&path).unwrap().0.max(sensor_dimensions(&path).unwrap().1) > 3000);
         }
 
         #[test]
@@ -3030,11 +3030,10 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "needs a real NEF file; set AURORA_TEST_RAW"]
         fn sixteen_bit_path_returns_or_falls_back() {
-            if !sample_is_available() {
-                panic!("real NEF sample not found: {SAMPLE}");
-            }
-            match decode16(&sample()) {
+            let path = sample();
+            match decode16(&path) {
                 Some((w, h, rgba)) => {
                     assert_eq!(rgba.len(), (w * h * 4) as usize);
                     assert!(w.max(h) > 3000);
@@ -3042,7 +3041,8 @@ mod tests {
                 None => {
                     // HE* compression is not demosaiced by this libraw build:
                     // the 8-bit path must still deliver the embedded preview.
-                    let eight = decode(&PathBuf::from(HE_SAMPLE).exists().then(|| PathBuf::from(HE_SAMPLE)).unwrap_or_else(|| sample())).unwrap();
+                    let fallback = he_sample().unwrap_or(path);
+                    let eight = decode(&fallback).unwrap();
                     assert!(eight.width() > 0);
                 }
             }
@@ -3379,12 +3379,7 @@ mod tests {
         use std::time::Instant;
         let path = std::env::var_os("AURORA_TEST_RAW")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF")
-            });
-        if !path.is_file() {
-            return;
-        }
+            .expect("set AURORA_TEST_RAW to a real NEF file");
         let mut best = f64::MAX;
         for round in 0..3 {
             let started = Instant::now();

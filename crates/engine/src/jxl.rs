@@ -641,43 +641,40 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[cfg(windows)]
-    const SAMPLE: &str = r"C:\Users\Jxcz2\Pictures\Capture One Catalog\Cache\Previews\2026\9\13\0\_DSC5673.NEF.cop";
-
-    #[cfg(windows)]
     fn dir() -> PathBuf {
         std::env::var_os("AURORA_JXL_DIR").map(PathBuf::from).unwrap_or_default()
     }
 
     #[cfg(windows)]
-    fn source() -> &'static Path {
-        Path::new(SAMPLE)
+    fn sample_path() -> PathBuf {
+        std::env::var_os("AURORA_JXL_SAMPLE")
+            .map(PathBuf::from)
+            .expect("set AURORA_JXL_SAMPLE to a Capture One .cop proxy file")
     }
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "needs local .cop proxy (AURORA_JXL_SAMPLE) and libjxl.dll (AURORA_JXL_DIR)"]
     fn decodes_real_proxy() -> Result<()> {
-        if !source().is_file() || !dir().join("libjxl.dll").is_file() {
-            eprintln!("skipped: real sample or libjxl.dll unavailable");
-            return Ok(());
-        }
-        let image = decode_cop(source())?;
-        assert_eq!((image.width(), image.height()), (3840, 2560));
+        let sample = sample_path();
+        let image = decode_cop(&sample)?;
+        assert!(image.width() > 0 && image.height() > 0);
         Ok(())
     }
 
     #[cfg(windows)]
     #[test]
     fn missing_dll_returns_err() -> Result<()> {
-        let lane = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let empty_dir = lane.join("empty-jxl");
+        let empty_dir = std::env::temp_dir().join(format!("aurora-empty-jxl-{}", std::process::id()));
         fs::create_dir_all(&empty_dir)?;
         let previous = std::env::var_os("AURORA_JXL_DIR");
         unsafe { std::env::set_var("AURORA_JXL_DIR", &empty_dir) };
-        let result = decode_cop(source());
+        let result = decode_cop(&empty_dir.join("missing.cop"));
         match previous {
             Some(value) => unsafe { std::env::set_var("AURORA_JXL_DIR", value) },
             None => unsafe { std::env::remove_var("AURORA_JXL_DIR") },
         }
+        let _ = fs::remove_dir_all(&empty_dir);
         assert!(result.is_err());
         Ok(())
     }

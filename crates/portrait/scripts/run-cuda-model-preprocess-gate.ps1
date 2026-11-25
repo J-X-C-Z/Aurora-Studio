@@ -18,9 +18,13 @@ while ($workspaceRoot -and (Split-Path -Leaf $workspaceRoot) -ne 'Aurora Studio'
 }
 
 if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) {
-    $CargoTargetDir = Join-Path $workspaceRoot '90_work\build-cache\wl46-model-preprocess-compile\target'
+    $CargoTargetDir = Join-Path $repoRoot 'target\wl46-model-preprocess'
 }
-$evidenceDir = Join-Path $workspaceRoot '90_work\lanes\portrait-parse\wl46-model-preprocess-compile\EVIDENCE'
+$evidenceDir = if ($env:AURORA_EVIDENCE_DIR) {
+    $env:AURORA_EVIDENCE_DIR
+} else {
+    Join-Path $repoRoot 'target\evidence\wl46-model-preprocess'
+}
 New-Item -ItemType Directory -Force -Path $CargoTargetDir, $evidenceDir | Out-Null
 $logPath = Join-Path $evidenceDir 'gpu-rtx4070ti.log'
 
