@@ -624,9 +624,15 @@ impl EventEmitter<StateEvent> for AppState {}
 impl AppState {
     pub fn new(engine: Arc<dyn ImageEngine>, source: Source, settings: Settings, cx: &mut Context<Self>) -> Self {
         let images = engine.images();
-        let edits = images
-            .par_iter()
-            .map(|i| (i.id, Edit { adj: engine.load_adjustments(i.id), ..Default::default() }))
+        // Startup loads every variant's stored adjustments. Ask the engine for
+        // them as one batch so a catalog-backed engine takes a single snapshot
+        // instead of locking and scanning its entry list per image; selection,
+        // edit filtering and thumbnail queueing still run over `images` below.
+        let ids: Vec<ImageId> = images.iter().map(|image| image.id).collect();
+        let edits: HashMap<ImageId, Edit> = engine
+            .load_adjustments_batch(&ids)
+            .into_iter()
+            .map(|(id, adj)| (id, Edit { adj, ..Default::default() }))
             .collect();
         let current = images.first().map(|i| i.id);
         let recipes = vec![

@@ -492,6 +492,20 @@ pub trait ImageEngine: Send + Sync + 'static {
     }
     /// Adjustments stored for an image, so reopening a session restores them.
     fn load_adjustments(&self, image: ImageId) -> AdjustmentSet;
+    /// Adjustments for many images in one call, returned in `images` order.
+    ///
+    /// The startup path uses this so an engine backed by a catalog can take one
+    /// snapshot of its entry list instead of locking and scanning it once per
+    /// image. The default preserves the single-image behaviour and the
+    /// parallel fan-out the startup path had before; engines whose load also
+    /// applies import defaults can resolve the whole batch together.
+    fn load_adjustments_batch(&self, images: &[ImageId]) -> Vec<(ImageId, AdjustmentSet)> {
+        use rayon::prelude::*;
+        images
+            .par_iter()
+            .map(|image| (*image, self.load_adjustments(*image)))
+            .collect()
+    }
     fn save_adjustments(&self, image: ImageId, adjustments: &AdjustmentSet) -> anyhow::Result<()>;
     /// Persists a multi-image adjustment edit with one catalog commit when the
     /// engine supports it.
