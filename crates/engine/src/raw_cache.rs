@@ -1007,7 +1007,7 @@ impl Drop for DecodeSlot {
     fn drop(&mut self) {
         let mut active = DECODE_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         *active = active.saturating_sub(1);
-        DECODE_SLOT_READY.notify_one();
+        DECODE_SLOT_READY.notify_all();
     }
 }
 
@@ -1032,6 +1032,17 @@ fn count_waiter() {
     PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).stats.decode_waiters += 1;
 }
 
+struct FlightGuard<'a> {
+    key: &'a str,
+    flight: std::sync::Arc<Flight>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        release_flight(self.key, &self.flight);
+    }
+}
+
 /// Runs `work` as the single leader for `key`, or waits for the current leader
 /// and retries `recheck`. Both closures may run at most a few times; `work` is
 /// only entered by the leader, holding one decode slot.
@@ -1043,9 +1054,8 @@ fn with_single_flight(
     for _ in 0..3 {
         match acquire_flight(key) {
             FlightTicket::Leader(flight) => {
-                let result = recheck().or_else(|| work());
-                release_flight(key, &flight);
-                return result;
+                let _guard = FlightGuard { key, flight };
+                return recheck().or_else(|| work());
             }
             FlightTicket::Follower(flight) => {
                 count_waiter();

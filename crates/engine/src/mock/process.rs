@@ -72,20 +72,31 @@ impl Plane {
 /// The one 2x2 box average used by both eager and deferred mip tails. Keeping
 /// it in one place is what makes a lazily built level bit-identical to the
 /// level an eager source built up front.
+fn box_downscale_pixel(prev: &[[f32; 3]], prev_width: u32, w: u32, i: usize) -> [f32; 3] {
+    let (x, y) = ((i as u32 % w) * 2, (i as u32 / w) * 2);
+    let mut acc = [0.0; 3];
+    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let p = prev[((y + dy) * prev_width + x + dx) as usize];
+        for k in 0..3 {
+            acc[k] += p[k] * 0.25;
+        }
+    }
+    acc
+}
+
 fn box_downscale(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
     (0..(w * h) as usize)
         .into_par_iter()
-        .map(|i| {
-            let (x, y) = ((i as u32 % w) * 2, (i as u32 / w) * 2);
-            let mut acc = [0.0; 3];
-            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let p = prev[((y + dy) * prev_width + x + dx) as usize];
-                for k in 0..3 {
-                    acc[k] += p[k] * 0.25;
-                }
-            }
-            acc
-        })
+        .map(|i| box_downscale_pixel(prev, prev_width, w, i))
+        .collect()
+}
+
+/// Serial variant for `OnceLock::get_or_init` inside rayon render workers:
+/// calling `into_par_iter()` while holding a `OnceLock` deadlocks when other
+/// rayon workers block on the same `OnceLock`.
+fn box_downscale_serial(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
+    (0..(w * h) as usize)
+        .map(|i| box_downscale_pixel(prev, prev_width, w, i))
         .collect()
 }
 
@@ -740,7 +751,7 @@ impl Source {
         slot.get_or_init(|| {
             debug_assert!(index > 0, "level 0 is never deferred");
             let parent = self.level_data(index - 1);
-            box_downscale(parent, self.levels[index - 1].width, plane.width, plane.height)
+            box_downscale_serial(parent, self.levels[index - 1].width, plane.width, plane.height)
         })
     }
 
