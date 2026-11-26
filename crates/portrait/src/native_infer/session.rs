@@ -55,6 +55,9 @@ mod imp {
         Conv2dParams, ConvGemmKernels, ConvTranspose2dParams, FusedActivation,
     };
     use crate::native_infer::ops_elem_norm::{BinaryOp, CompareOp, ElemNormKernels, UnaryOp};
+    use crate::native_infer::ops_quant::{
+        ConvIntegerParams, MatMulIntegerParams, QuantInt8Kernels, ZeroPointArg,
+    };
     use crate::native_infer::ops_spatial_tensor::{
         pool2d_out_dim, ResizeKernelMode, SpatialTensorKernels,
     };
@@ -97,6 +100,7 @@ mod imp {
         conv: ConvGemmKernels,
         elem: ElemNormKernels,
         spatial: SpatialTensorKernels,
+        quant: QuantInt8Kernels,
         /// Persistent GPU buffers for static weights (`TensorId -> (ptr, shape, dtype)`).
         weight_ptrs: HashMap<TensorId, (u64, Vec<usize>, DataType)>,
         /// Backing device allocations kept alive for the session lifetime.
@@ -135,6 +139,7 @@ mod imp {
             let conv = ConvGemmKernels::open()?;
             let elem = ElemNormKernels::open()?;
             let spatial = SpatialTensorKernels::open()?;
+            let quant = QuantInt8Kernels::open()?;
 
             // SAFETY: `owned_buffers`, `arena_buf`, and `im2col_buf` are explicitly dropped
             // in `NativeCudaSession::drop` before `self.conv` is dropped, and the underlying
@@ -153,30 +158,37 @@ mod imp {
                         static_cpu_tensors.insert(tid, ct);
                     }
                 }
-                // Upload weights to VRAM. For Float16 weights we keep raw FP16 bytes OR
-                // upload as-is (Cast nodes handle FP16->FP32, or Conv/MatMul unpack if needed).
-                let bytes: Vec<u8> = match proto.data_type {
+                // Upload weights to VRAM. Float16 weights are unpacked to FP32 so all
+                // FP32 compute kernels operate on valid 4-byte floats without alignment hazards;
+                // explicit `Cast(to=Float16)` nodes still round through IEEE FP16 on GPU.
+                let (bytes, stored_dt): (Vec<u8>, DataType) = match proto.data_type {
                     DataType::Float => {
                         if proto.raw_data.len() == proto.elem_count() * 4 {
-                            proto.raw_data.clone()
+                            (proto.raw_data.clone(), DataType::Float)
                         } else {
                             let v = proto.to_f32_vec().map_err(|e| {
                                 SessionError::Runtime(format!("weight decode error: {e}"))
                             })?;
-                            f32_as_bytes(&v).to_vec()
+                            (f32_as_bytes(&v).to_vec(), DataType::Float)
                         }
                     }
-                    _ => proto.raw_data.clone(),
+                    DataType::Float16 => {
+                        let v = proto.to_f32_vec().map_err(|e| {
+                            SessionError::Runtime(format!("fp16 weight decode error: {e}"))
+                        })?;
+                        (f32_as_bytes(&v).to_vec(), DataType::Float)
+                    }
+                    other => (proto.raw_data.clone(), other),
                 };
                 if bytes.is_empty() {
-                    weight_ptrs.insert(tid, (0u64, shape, proto.data_type));
+                    weight_ptrs.insert(tid, (0u64, shape, stored_dt));
                     continue;
                 }
                 let buf = gpu_static.alloc_buffer(bytes.len())?;
                 gpu_static.upload_buffer(&buf, &bytes)?;
                 let ptr = buf.handle();
                 owned_buffers.push(buf);
-                weight_ptrs.insert(tid, (ptr, shape, proto.data_type));
+                weight_ptrs.insert(tid, (ptr, shape, stored_dt));
             }
 
             // Compute maximum im2col workspace needed across all Conv nodes.
@@ -222,6 +234,7 @@ mod imp {
                 conv,
                 elem,
                 spatial,
+                quant,
                 weight_ptrs,
                 owned_buffers,
                 arena_buf,
@@ -279,6 +292,11 @@ mod imp {
                 let ptr = buf.handle();
                 run_bufs.push(buf);
                 gpu_tensors.insert(in_id, (ptr, shape.clone(), DataType::Float));
+                if data.len() <= DEFAULT_MAX_CPU_TENSOR_ELEMS {
+                    if let Ok(ct) = CpuTensor::from_f32(shape.clone(), data.to_vec()) {
+                        cpu_tensors.insert(in_id, ct);
+                    }
+                }
             }
 
             // Pre-allocate graph outputs that are not in the scratch arena.
@@ -294,6 +312,52 @@ mod imp {
                 }
             }
 
+            // 2. Execute nodes in topological order.
+            let use_arena = std::env::var("AURORA_NATIVE_NO_ARENA").ok().as_deref() != Some("1");
+            self.exec_graph(
+                graph,
+                use_arena,
+                &output_ids,
+                &mut gpu_tensors,
+                &mut cpu_tensors,
+                &mut run_bufs,
+            )?;
+
+            // 3. Download all graph outputs.
+            let mut results = HashMap::with_capacity(graph.outputs.len());
+            for &out_id in &graph.outputs {
+                let info = &graph.tensors[out_id.0];
+                let (ptr, shape, _dt) = gpu_tensors.get(&out_id).ok_or_else(|| {
+                    SessionError::Runtime(format!("graph output '{}' was not produced", info.name))
+                })?;
+                let count = numel(shape);
+                let mut host = vec![0.0f32; count];
+                if count > 0 {
+                    // Find matching DeviceBuffer or copy into a staging DeviceBuffer for safe D2H.
+                    if let Some(buf) = run_bufs.iter().find(|b| b.handle() == *ptr) {
+                        gpu.download_buffer(buf, f32_as_bytes_mut(&mut host))?;
+                    } else {
+                        let tmp = gpu.alloc_buffer(count * 4)?;
+                        self.spatial.copy_f32(*ptr, tmp.handle(), count)?;
+                        gpu.download_buffer(&tmp, f32_as_bytes_mut(&mut host))?;
+                    }
+                }
+                results.insert(info.name.clone(), (host, shape.clone()));
+            }
+            Ok(results)
+        }
+
+        fn exec_graph<'a>(
+            &'a self,
+            graph: &IrGraph,
+            use_arena: bool,
+            output_ids: &HashMap<TensorId, (u64, Vec<usize>)>,
+            gpu_tensors: &mut HashMap<TensorId, (u64, Vec<usize>, DataType)>,
+            cpu_tensors: &mut HashMap<TensorId, CpuTensor>,
+            run_bufs: &mut Vec<DeviceBuffer<'a>>,
+        ) -> Result<(), SessionError> {
+            let gpu = self.conv.nvidia();
+
             // Helper: resolve output device pointer for `tid` (arena if planned, else output/dynamic buf).
             let alloc_out = |tid: TensorId,
                              shape: &[usize],
@@ -304,9 +368,11 @@ mod imp {
                     return Ok(ptr);
                 }
                 let bytes = numel(shape).max(1) * dtype.byte_size().unwrap_or(4);
-                if let Some(alloc) = self.plan.arena.allocations.get(&tid) {
-                    if bytes <= alloc.aligned_bytes && self.arena_base_ptr != 0 {
-                        return Ok(self.arena_base_ptr + alloc.offset as u64);
+                if use_arena {
+                    if let Some(alloc) = self.plan.arena.allocations.get(&tid) {
+                        if bytes <= alloc.aligned_bytes && self.arena_base_ptr != 0 {
+                            return Ok(self.arena_base_ptr + alloc.offset as u64);
+                        }
                     }
                 }
                 let buf = gpu.alloc_buffer(bytes)?;
@@ -315,18 +381,12 @@ mod imp {
                 Ok(ptr)
             };
 
-            // 2. Execute nodes in topological order.
             for node in &graph.nodes {
                 // Fast-path: pure CPU shape/constant evaluation when applicable.
                 let is_pure_shape_op = matches!(
                     node.op,
                     Op::Constant { .. } | Op::Shape { .. } | Op::Size | Op::ConstantOfShape { .. }
                 );
-                let all_inputs_on_cpu = !node.inputs.is_empty()
-                    && node
-                        .inputs
-                        .iter()
-                        .all(|opt| opt.map_or(true, |id| cpu_tensors.contains_key(&id)));
                 let is_cpu_evaluable_op = matches!(
                     node.op,
                     Op::Gather { .. }
@@ -349,7 +409,82 @@ mod imp {
                         | Op::Where
                         | Op::Cast { .. }
                         | Op::Identity
+                        | Op::Clip
                 );
+
+                // If any input of an integer/shape op is a GPU-resident Int64/Bool tensor
+                // (e.g. produced by `Cast(Float->Int64)` in landmark indexing subgraphs),
+                // pull those small tensors to CPU so exact integer arithmetic runs on CPU
+                // instead of falling into f32 CUDA kernels.
+                let has_gpu_i64_or_bool_input = is_cpu_evaluable_op
+                    && !matches!(node.op, Op::Gather { .. } | Op::Slice | Op::Reshape { .. } | Op::Squeeze { .. } | Op::Unsqueeze { .. } | Op::Expand | Op::Tile)
+                    && node.inputs.iter().any(|opt| {
+                        opt.and_then(|id| gpu_tensors.get(&id))
+                            .map_or(false, |(_, sh, dt)| {
+                                matches!(dt, DataType::Int64 | DataType::Bool)
+                                    && numel(sh) <= 65_536
+                            })
+                    });
+                if has_gpu_i64_or_bool_input {
+                    let all_small = node.inputs.iter().all(|opt| {
+                        opt.map_or(true, |id| {
+                            cpu_tensors.contains_key(&id)
+                                || gpu_tensors
+                                    .get(&id)
+                                    .map_or(false, |(_, sh, _)| numel(sh) <= 65_536)
+                        })
+                    });
+                    if all_small {
+                        for opt in &node.inputs {
+                            if let Some(id) = *opt {
+                                if !cpu_tensors.contains_key(&id) {
+                                    if let Some(&(ptr, ref sh, dt)) = gpu_tensors.get(&id) {
+                                        let count = numel(sh);
+                                        if count > 0 {
+                                            let eb = dt.byte_size().unwrap_or(4);
+                                            let blen = count * eb;
+                                            let tmp = gpu.alloc_buffer(blen.max(4))?;
+                                            self.spatial.copy_bytes_u8(ptr, tmp.handle(), blen)?;
+                                            let mut raw = vec![0u8; blen];
+                                            gpu.download_buffer(&tmp, &mut raw)?;
+                                            let ct_opt = match dt {
+                                                DataType::Int64 => CpuTensor::from_i64(
+                                                    sh.clone(),
+                                                    raw.chunks_exact(8)
+                                                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                                                        .collect(),
+                                                )
+                                                .ok(),
+                                                DataType::Bool => CpuTensor::from_bool(
+                                                    sh.clone(),
+                                                    raw.iter().map(|&b| b != 0).collect(),
+                                                )
+                                                .ok(),
+                                                DataType::Float => CpuTensor::from_f32(
+                                                    sh.clone(),
+                                                    raw.chunks_exact(4)
+                                                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                                                        .collect(),
+                                                )
+                                                .ok(),
+                                                _ => None,
+                                            };
+                                            if let Some(ct) = ct_opt {
+                                                cpu_tensors.insert(id, ct);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let all_inputs_on_cpu = !node.inputs.is_empty()
+                    && node
+                        .inputs
+                        .iter()
+                        .all(|opt| opt.map_or(true, |id| cpu_tensors.contains_key(&id)));
 
                 if is_pure_shape_op
                     || (all_inputs_on_cpu
@@ -375,9 +510,51 @@ mod imp {
                             })
                         })
                         .collect();
-                    if let Ok(ct) = eval_cpu_node(&node.op, &inp_vals, &inp_shapes) {
+                    let cpu_res = if matches!(node.op, Op::Clip) {
+                        match inp_vals.first().and_then(|o| *o) {
+                            Some(x_ct) => match &x_ct.data {
+                                CpuData::I64(v) => {
+                                    let lo = inp_vals
+                                        .get(1)
+                                        .and_then(|o| *o)
+                                        .and_then(|c| c.to_i64_vec().into_iter().next())
+                                        .unwrap_or(i64::MIN);
+                                    let hi = inp_vals
+                                        .get(2)
+                                        .and_then(|o| *o)
+                                        .and_then(|c| c.to_i64_vec().into_iter().next())
+                                        .unwrap_or(i64::MAX);
+                                    CpuTensor::from_i64(
+                                        x_ct.shape.clone(),
+                                        v.iter().map(|&x| x.clamp(lo, hi)).collect(),
+                                    )
+                                }
+                                CpuData::F32(v) => {
+                                    let lo = inp_vals
+                                        .get(1)
+                                        .and_then(|o| *o)
+                                        .and_then(|c| c.to_f32_vec().into_iter().next())
+                                        .unwrap_or(f32::NEG_INFINITY);
+                                    let hi = inp_vals
+                                        .get(2)
+                                        .and_then(|o| *o)
+                                        .and_then(|c| c.to_f32_vec().into_iter().next())
+                                        .unwrap_or(f32::INFINITY);
+                                    CpuTensor::from_f32(
+                                        x_ct.shape.clone(),
+                                        v.iter().map(|&x| x.clamp(lo, hi)).collect(),
+                                    )
+                                }
+                                _ => eval_cpu_node(&node.op, &inp_vals, &inp_shapes),
+                            },
+                            None => eval_cpu_node(&node.op, &inp_vals, &inp_shapes),
+                        }
+                    } else {
+                        eval_cpu_node(&node.op, &inp_vals, &inp_shapes)
+                    };
+                    if let Ok(ct) = cpu_res {
                         if let Some(Some(out_id)) = node.outputs.first() {
-                            // Also mirror small F32/I64 constants to GPU if needed by downstream GPU ops.
+                            // Also mirror small F32/I64/Bool constants to GPU if needed by downstream GPU ops.
                             if let CpuData::F32(ref v) = ct.data {
                                 if !v.is_empty() {
                                     let buf = gpu.alloc_buffer(v.len() * 4)?;
@@ -399,6 +576,15 @@ mod imp {
                                     let ptr = buf.handle();
                                     run_bufs.push(buf);
                                     gpu_tensors.insert(*out_id, (ptr, ct.shape.clone(), DataType::Int64));
+                                }
+                            } else if let CpuData::Bool(ref v) = ct.data {
+                                if !v.is_empty() {
+                                    let bytes: Vec<u8> = v.iter().map(|&b| u8::from(b)).collect();
+                                    let buf = gpu.alloc_buffer(bytes.len())?;
+                                    gpu.upload_buffer(&buf, &bytes)?;
+                                    let ptr = buf.handle();
+                                    run_bufs.push(buf);
+                                    gpu_tensors.insert(*out_id, (ptr, ct.shape.clone(), DataType::Bool));
                                 }
                             }
                             cpu_tensors.insert(*out_id, ct);
@@ -444,15 +630,60 @@ mod imp {
                         ))
                     })
                 };
+                let read_i64_vec = |tid: TensorId| -> Result<Vec<i64>, SessionError> {
+                    if let Some(ct) = cpu_tensors.get(&tid) {
+                        return Ok(ct.to_i64_vec());
+                    }
+                    if let Some(&(ptr, ref sh, dt)) = gpu_tensors.get(&tid) {
+                        let count = numel(sh);
+                        if count == 0 {
+                            return Ok(Vec::new());
+                        }
+                        let eb = dt.byte_size().unwrap_or(4);
+                        let bytes_len = count * eb;
+                        let tmp = gpu.alloc_buffer(bytes_len.max(4))?;
+                        self.spatial.copy_bytes_u8(ptr, tmp.handle(), bytes_len)?;
+                        let mut raw = vec![0u8; bytes_len];
+                        gpu.download_buffer(&tmp, &mut raw)?;
+                        return match dt {
+                            DataType::Int64 => Ok(raw
+                                .chunks_exact(8)
+                                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                                .collect()),
+                            DataType::Int32 => Ok(raw
+                                .chunks_exact(4)
+                                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
+                                .collect()),
+                            DataType::Float => Ok(raw
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i64)
+                                .collect()),
+                            _ => Err(SessionError::Runtime(format!(
+                                "cannot read {:?} GPU tensor as i64",
+                                dt
+                            ))),
+                        };
+                    }
+                    Err(SessionError::Runtime(format!(
+                        "tensor '{}' not found on CPU or GPU",
+                        graph.tensors[tid.0].name
+                    )))
+                };
 
                 match &node.op {
                     // --- View ops (copy into arena slot to respect arena liveness) ---
                     Op::Identity => {
                         let (p, sh, dt) = req_gpu(0)?;
                         let out_id = req_out_id(0)?;
-                        let optr = alloc_out(out_id, &sh, dt, &mut run_bufs)?;
-                        if optr != p && numel(&sh) > 0 && dt == DataType::Float {
-                            self.spatial.copy_f32(p, optr, numel(&sh))?;
+                        let optr = alloc_out(out_id, &sh, dt, run_bufs)?;
+                        let total = numel(&sh);
+                        if optr != p && total > 0 {
+                            if dt == DataType::Float {
+                                self.spatial.copy_f32(p, optr, total)?;
+                            } else {
+                                let eb = dt.byte_size().unwrap_or(4);
+                                self.spatial.copy_bytes_u8(p, optr, total * eb)?;
+                            }
                             gpu_tensors.insert(out_id, (optr, sh, dt));
                         } else {
                             gpu_tensors.insert(out_id, (p, sh, dt));
@@ -465,8 +696,7 @@ mod imp {
                             .inputs
                             .get(1)
                             .and_then(|o| *o)
-                            .and_then(|id| cpu_tensors.get(&id))
-                            .map(|c| c.to_i64_vec())
+                            .and_then(|id| read_i64_vec(id).ok())
                             .or_else(|| {
                                 graph.tensors[out_id.0]
                                     .static_shape()
@@ -499,9 +729,15 @@ mod imp {
                         if let Some(ni) = neg_idx {
                             out_sh[ni] = if known_prod > 0 { total / known_prod } else { 0 };
                         }
-                        let optr = alloc_out(out_id, &out_sh, dt, &mut run_bufs)?;
-                        if optr != p && numel(&out_sh) > 0 && dt == DataType::Float {
-                            self.spatial.copy_f32(p, optr, numel(&out_sh))?;
+                        let optr = alloc_out(out_id, &out_sh, dt, run_bufs)?;
+                        let out_elems = numel(&out_sh);
+                        if optr != p && out_elems > 0 {
+                            if dt == DataType::Float {
+                                self.spatial.copy_f32(p, optr, out_elems)?;
+                            } else {
+                                let eb = dt.byte_size().unwrap_or(4);
+                                self.spatial.copy_bytes_u8(p, optr, out_elems * eb)?;
+                            }
                             gpu_tensors.insert(out_id, (optr, out_sh, dt));
                         } else {
                             gpu_tensors.insert(out_id, (p, out_sh, dt));
@@ -535,9 +771,15 @@ mod imp {
                             })
                             .map(|(_, &d)| d)
                             .collect();
-                        let optr = alloc_out(out_id, &out_sh, dt, &mut run_bufs)?;
-                        if optr != p && numel(&out_sh) > 0 && dt == DataType::Float {
-                            self.spatial.copy_f32(p, optr, numel(&out_sh))?;
+                        let optr = alloc_out(out_id, &out_sh, dt, run_bufs)?;
+                        let out_elems = numel(&out_sh);
+                        if optr != p && out_elems > 0 {
+                            if dt == DataType::Float {
+                                self.spatial.copy_f32(p, optr, out_elems)?;
+                            } else {
+                                let eb = dt.byte_size().unwrap_or(4);
+                                self.spatial.copy_bytes_u8(p, optr, out_elems * eb)?;
+                            }
                             gpu_tensors.insert(out_id, (optr, out_sh, dt));
                         } else {
                             gpu_tensors.insert(out_id, (p, out_sh, dt));
@@ -572,9 +814,15 @@ mod imp {
                                 src_i += 1;
                             }
                         }
-                        let optr = alloc_out(out_id, &out_sh, dt, &mut run_bufs)?;
-                        if optr != p && numel(&out_sh) > 0 && dt == DataType::Float {
-                            self.spatial.copy_f32(p, optr, numel(&out_sh))?;
+                        let optr = alloc_out(out_id, &out_sh, dt, run_bufs)?;
+                        let out_elems = numel(&out_sh);
+                        if optr != p && out_elems > 0 {
+                            if dt == DataType::Float {
+                                self.spatial.copy_f32(p, optr, out_elems)?;
+                            } else {
+                                let eb = dt.byte_size().unwrap_or(4);
+                                self.spatial.copy_bytes_u8(p, optr, out_elems * eb)?;
+                            }
                             gpu_tensors.insert(out_id, (optr, out_sh, dt));
                         } else {
                             gpu_tensors.insert(out_id, (p, out_sh, dt));
@@ -594,7 +842,7 @@ mod imp {
                         )?;
                         let out_sh = vec![params.batch, params.c_out, params.out_h, params.out_w];
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         let ws_ptr = if !params.is_depthwise()
                             && !params.is_direct_1x1()
                             && params.im2col_workspace_bytes() > self.im2col_bytes
@@ -622,7 +870,7 @@ mod imp {
                         )?;
                         let out_sh = vec![params.batch, params.c_out, params.out_h, params.out_w];
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.conv.conv_transpose2d_nchw(
                             x_ptr, w_ptr, bias_ptr, y_ptr, &params, None,
                         )?;
@@ -653,7 +901,7 @@ mod imp {
                         }
                         out_sh.push(m);
                         out_sh.push(n);
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.conv
                             .batched_matmul(a_ptr, b_ptr, y_ptr, &a_sh, &b_sh, None)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
@@ -668,7 +916,7 @@ mod imp {
                         let n = if attrs.trans_b { b_sh[0] } else { b_sh[1] };
                         let out_sh = vec![m, n];
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.conv
                             .gemm(a_ptr, b_ptr, c_ptr, c_sh, y_ptr, &a_sh, &b_sh, attrs, None)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
@@ -691,7 +939,7 @@ mod imp {
                             }
                         };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
                         self.elem
                             .batch_norm_fused_nchw_f32(x_ptr, s_ptr, b_ptr, y_ptr, n, c, h, w)?;
                         gpu_tensors.insert(out_id, (y_ptr, x_sh, DataType::Float));
@@ -703,7 +951,7 @@ mod imp {
                         let norm_dim = *x_sh.last().unwrap_or(&1);
                         let rows = numel(&x_sh) / norm_dim.max(1);
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
                         self.elem.layer_norm_last_f32(
                             x_ptr,
                             s_ptr,
@@ -719,12 +967,20 @@ mod imp {
                         let (x_ptr, x_sh, _) = req_gpu(0)?;
                         let s_ptr = opt_gpu(1).map(|(p, _, _)| p);
                         let b_ptr = opt_gpu(2).map(|(p, _, _)| p);
+                        let (n, c, h, w) = match x_sh.as_slice() {
+                            &[n, c, l] => (n, c, l, 1),
+                            &[n, c, h, w] => (n, c, h, w),
+                            _ => {
+                                return Err(SessionError::Runtime(format!(
+                                    "InstanceNormalization '{}' unsupported shape {:?}",
+                                    node.name, x_sh
+                                )));
+                            }
+                        };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, &mut run_bufs)?;
-                        self.elem.instance_norm_nchw_f32(
-                            x_ptr, s_ptr, b_ptr, y_ptr, x_sh[0], x_sh[1], x_sh[2], x_sh[3],
-                            *epsilon,
-                        )?;
+                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
+                        self.elem
+                            .instance_norm_nchw_f32(x_ptr, s_ptr, b_ptr, y_ptr, n, c, h, w, *epsilon)?;
                         gpu_tensors.insert(out_id, (y_ptr, x_sh, DataType::Float));
                     }
                     Op::Softmax { axis } => {
@@ -734,7 +990,7 @@ mod imp {
                         let axis_dim = x_sh[ax];
                         let inner: usize = x_sh[ax + 1..].iter().product();
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
                         self.elem
                             .softmax_axis_f32(x_ptr, y_ptr, outer, axis_dim, inner)?;
                         gpu_tensors.insert(out_id, (y_ptr, x_sh, DataType::Float));
@@ -768,7 +1024,7 @@ mod imp {
                             _ => unreachable!(),
                         };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.elem
                             .binary_broadcast_f32(bop, a_ptr, &a_sh, b_ptr, &b_sh, y_ptr)
                             .map_err(|e| {
@@ -806,7 +1062,7 @@ mod imp {
                             _ => unreachable!(),
                         };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Bool, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Bool, run_bufs)?;
                         self.elem
                             .compare_broadcast_f32(cop, a_ptr, &a_sh, b_ptr, &b_sh, y_ptr)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Bool));
@@ -830,7 +1086,7 @@ mod imp {
                             out_sh.push(da.max(db));
                         }
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Bool, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Bool, run_bufs)?;
                         self.elem
                             .and_broadcast_u8(a_ptr, &a_sh, b_ptr, &b_sh, y_ptr)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Bool));
@@ -848,7 +1104,7 @@ mod imp {
                             out_sh.push(dc.max(dx).max(dy));
                         }
                         let out_id = req_out_id(0)?;
-                        let out_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let out_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.elem.where_broadcast_f32(
                             c_ptr, &c_sh, x_ptr, &x_sh, y_ptr_in, &y_sh, out_ptr,
                         )?;
@@ -862,7 +1118,7 @@ mod imp {
                             s_sh = vec![1, s_sh[0], 1, 1];
                         }
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
                         self.elem
                             .prelu_broadcast_f32(x_ptr, &x_sh, s_ptr, &s_sh, y_ptr)
                             .map_err(|e| {
@@ -918,7 +1174,7 @@ mod imp {
                             _ => unreachable!(),
                         };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
                         self.elem
                             .unary_f32(uop, x_ptr, y_ptr, numel(&x_sh), p0, p1)?;
                         gpu_tensors.insert(out_id, (y_ptr, x_sh, DataType::Float));
@@ -926,20 +1182,46 @@ mod imp {
                     Op::Cast { to } => {
                         let (x_ptr, x_sh, src_dt) = req_gpu(0)?;
                         let out_id = req_out_id(0)?;
+                        let total = numel(&x_sh);
                         if src_dt == *to {
-                            gpu_tensors.insert(out_id, (x_ptr, x_sh, *to));
+                            let y_ptr = alloc_out(out_id, &x_sh, *to, run_bufs)?;
+                            if y_ptr != x_ptr && total > 0 {
+                                if *to == DataType::Float {
+                                    self.spatial.copy_f32(x_ptr, y_ptr, total)?;
+                                } else {
+                                    let eb = to.byte_size().unwrap_or(4);
+                                    self.spatial.copy_bytes_u8(x_ptr, y_ptr, total * eb)?;
+                                }
+                                gpu_tensors.insert(out_id, (y_ptr, x_sh, *to));
+                            } else {
+                                gpu_tensors.insert(out_id, (x_ptr, x_sh, *to));
+                            }
+                        } else if src_dt == DataType::Float && *to == DataType::Float16 {
+                            // Keep activations in FP32 storage for downstream FP32 kernels,
+                            // while rounding through IEEE FP16 on GPU to preserve exact FP16 semantics.
+                            let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
+                            if total > 0 {
+                                let tmp_f16 = gpu.alloc_buffer(total.max(1) * 2)?;
+                                let tmp_ptr = tmp_f16.handle();
+                                run_bufs.push(tmp_f16);
+                                self.elem.cast_f32_to_f16(x_ptr, tmp_ptr, total)?;
+                                self.elem.cast_f16_to_f32(tmp_ptr, y_ptr, total)?;
+                            }
+                            gpu_tensors.insert(out_id, (y_ptr, x_sh, DataType::Float));
                         } else {
-                            let y_ptr = alloc_out(out_id, &x_sh, *to, &mut run_bufs)?;
-                            let total = numel(&x_sh);
+                            let y_ptr = alloc_out(out_id, &x_sh, *to, run_bufs)?;
                             match (src_dt, *to) {
                                 (DataType::Float16, DataType::Float) => {
                                     self.elem.cast_f16_to_f32(x_ptr, y_ptr, total)?;
                                 }
-                                (DataType::Float, DataType::Float16) => {
-                                    self.elem.cast_f32_to_f16(x_ptr, y_ptr, total)?;
-                                }
                                 (DataType::Int64, DataType::Float) => {
                                     self.elem.cast_i64_to_f32(x_ptr, y_ptr, total)?;
+                                }
+                                (DataType::Int32, DataType::Float) => {
+                                    self.elem.cast_i32_to_f32(x_ptr, y_ptr, total)?;
+                                }
+                                (DataType::Uint8, DataType::Float) => {
+                                    self.elem.cast_u8_to_f32(x_ptr, y_ptr, total)?;
                                 }
                                 (DataType::Float, DataType::Int64) => {
                                     self.elem.cast_f32_to_i64(x_ptr, y_ptr, total)?;
@@ -949,12 +1231,16 @@ mod imp {
                                     let d_zero = gpu.alloc_buffer(4)?;
                                     gpu.upload_buffer(&d_one, f32_as_bytes(&[1.0f32]))?;
                                     gpu.upload_buffer(&d_zero, f32_as_bytes(&[0.0f32]))?;
+                                    let one_ptr = d_one.handle();
+                                    let zero_ptr = d_zero.handle();
+                                    run_bufs.push(d_one);
+                                    run_bufs.push(d_zero);
                                     self.elem.where_broadcast_f32(
                                         x_ptr,
                                         &x_sh,
-                                        d_one.handle(),
+                                        one_ptr,
                                         &[1],
-                                        d_zero.handle(),
+                                        zero_ptr,
                                         &[1],
                                         y_ptr,
                                     )?;
@@ -988,7 +1274,7 @@ mod imp {
                         let out_w = pool2d_out_dim(w, kw, sw, pad_l, pad_r, dw, attrs.ceil_mode)?;
                         let out_sh = vec![n, c, out_h, out_w];
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.maxpool2d_nchw_f32(
                             x_ptr, y_ptr, n, c, h, w, out_h, out_w, kh, kw, sh, sw, pad_t, pad_l,
                             dh, dw,
@@ -1010,7 +1296,7 @@ mod imp {
                         let out_w = pool2d_out_dim(w, kw, sw, pad_l, pad_r, 1, attrs.ceil_mode)?;
                         let out_sh = vec![n, c, out_h, out_w];
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.avgpool2d_nchw_f32(
                             x_ptr,
                             y_ptr,
@@ -1043,7 +1329,7 @@ mod imp {
                             )));
                         };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.global_avgpool_nchw_f32(x_ptr, y_ptr, n, c, h, w)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
@@ -1074,7 +1360,7 @@ mod imp {
                             }
                         }
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.reduce_mean_f32(x_ptr, y_ptr, &x_sh, &axes)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
@@ -1086,8 +1372,7 @@ mod imp {
                             .inputs
                             .get(3)
                             .and_then(|o| *o)
-                            .and_then(|sid| cpu_tensors.get(&sid))
-                            .map(|ct| ct.to_i64_vec())
+                            .and_then(|sid| read_i64_vec(sid).ok())
                             .filter(|v| v.len() >= 4)
                         {
                             (v[2] as usize, v[3] as usize)
@@ -1117,7 +1402,7 @@ mod imp {
                             attrs.nearest_mode,
                         )?;
                         let out_sh = vec![n, c, out_h, out_w];
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.resize_nchw_f32(
                             x_ptr, y_ptr, n, c, in_h, in_w, out_h, out_w, mode,
                         )?;
@@ -1141,18 +1426,29 @@ mod imp {
                             .and_then(|id| cpu_tensors.get(&id))
                             .and_then(|c| c.to_f32_vec().into_iter().next())
                             .unwrap_or(0.0);
-                        let (n, c, in_h, in_w) = (x_sh[0], x_sh[1], x_sh[2], x_sh[3]);
-                        let (pt, pl, pb, pr) = (
+                        let in_shape = [x_sh[0], x_sh[1], x_sh[2], x_sh[3]];
+                        let pad_begin = [
+                            pads[0] as usize,
+                            pads[1] as usize,
                             pads[2] as usize,
                             pads[3] as usize,
+                        ];
+                        let pad_end = [
+                            pads[4] as usize,
+                            pads[5] as usize,
                             pads[6] as usize,
                             pads[7] as usize,
-                        );
-                        let out_sh = vec![n, c, in_h + pt + pb, in_w + pl + pr];
+                        ];
+                        let out_sh = vec![
+                            in_shape[0] + pad_begin[0] + pad_end[0],
+                            in_shape[1] + pad_begin[1] + pad_end[1],
+                            in_shape[2] + pad_begin[2] + pad_end[2],
+                            in_shape[3] + pad_begin[3] + pad_end[3],
+                        ];
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
-                        self.spatial.pad_constant_nchw_f32(
-                            x_ptr, y_ptr, n, c, in_h, in_w, pt, pb, pl, pr, const_val,
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
+                        self.spatial.pad_constant_4d_f32(
+                            x_ptr, y_ptr, in_shape, pad_begin, pad_end, const_val,
                         )?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
@@ -1162,7 +1458,7 @@ mod imp {
                         let (x_ptr, x_sh, _) = req_gpu(0)?;
                         let out_sh: Vec<usize> = perm.iter().map(|&p| x_sh[p]).collect();
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.transpose_nd_f32(x_ptr, y_ptr, &x_sh, perm)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
@@ -1185,7 +1481,7 @@ mod imp {
                         let inner: usize = out_sh[ax + 1..].iter().product();
                         out_sh[ax] = total_axis;
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.concat_axis_f32(&segs, y_ptr, outer, inner)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
@@ -1212,7 +1508,7 @@ mod imp {
                                 starts[ax] = offset;
                                 let steps = vec![1i64; x_sh.len()];
                                 let y_ptr =
-                                    alloc_out(*out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                                    alloc_out(*out_id, &out_sh, DataType::Float, run_bufs)?;
                                 self.spatial.slice_nd_f32(
                                     x_ptr, y_ptr, &x_sh, &out_sh, &starts, &steps,
                                 )?;
@@ -1287,7 +1583,7 @@ mod imp {
                             full_steps[ax] = step;
                         }
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.slice_nd_f32(
                             x_ptr, y_ptr, &x_sh, &out_sh, &full_starts, &full_steps,
                         )?;
@@ -1306,7 +1602,7 @@ mod imp {
                         out_sh.extend_from_slice(&idx_sh);
                         out_sh.extend_from_slice(&data_sh[ax + 1..]);
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.gather_axis_f32(
                             data_ptr, idx_ptr, y_ptr, outer, axis_dim, num_indices, inner,
                         )?;
@@ -1323,7 +1619,7 @@ mod imp {
                             1
                         };
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &data_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &data_sh, DataType::Float, run_bufs)?;
                         self.spatial.scatter_nd_f32(
                             data_ptr,
                             idx_ptr,
@@ -1337,15 +1633,13 @@ mod imp {
                     }
                     Op::Expand => {
                         let (x_ptr, x_sh, _) = req_gpu(0)?;
-                        let target: Vec<usize> = cpu_tensors
-                            .get(&node.inputs[1].unwrap())
-                            .map(|c| c.to_i64_vec().into_iter().map(|v| v as usize).collect())
-                            .ok_or_else(|| {
-                                SessionError::Runtime(format!(
-                                    "Expand '{}' missing CPU target shape",
-                                    node.name
-                                ))
-                            })?;
+                        let tgt_tid = node.inputs.get(1).and_then(|o| *o).ok_or_else(|| {
+                            SessionError::Runtime(format!("Expand '{}' missing target input", node.name))
+                        })?;
+                        let target: Vec<usize> = read_i64_vec(tgt_tid)?
+                            .into_iter()
+                            .map(|v| v as usize)
+                            .collect();
                         let rank = x_sh.len().max(target.len());
                         let mut out_sh = Vec::with_capacity(rank);
                         for i in 0..rank {
@@ -1362,24 +1656,285 @@ mod imp {
                             out_sh.push(dx.max(dt));
                         }
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.expand_nd_f32(x_ptr, y_ptr, &x_sh, &out_sh)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
                     Op::Tile => {
                         let (x_ptr, x_sh, _) = req_gpu(0)?;
-                        let repeats: Vec<usize> = cpu_tensors
-                            .get(&node.inputs[1].unwrap())
-                            .map(|c| c.to_i64_vec().into_iter().map(|v| v as usize).collect())
-                            .ok_or_else(|| {
-                                SessionError::Runtime(format!("Tile '{}' missing repeats", node.name))
-                            })?;
+                        let rep_tid = node.inputs.get(1).and_then(|o| *o).ok_or_else(|| {
+                            SessionError::Runtime(format!("Tile '{}' missing repeats input", node.name))
+                        })?;
+                        let repeats: Vec<usize> = read_i64_vec(rep_tid)?
+                            .into_iter()
+                            .map(|v| v as usize)
+                            .collect();
                         let out_sh: Vec<usize> =
                             x_sh.iter().zip(&repeats).map(|(&d, &r)| d * r).collect();
                         let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.tile_nd_f32(x_ptr, y_ptr, &x_sh, &repeats)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
+                    }
+
+                    // --- Quantized UInt8 ops (eSamEncoderPreUInt8) ---
+                    Op::DynamicQuantizeLinear => {
+                        let (x_ptr, x_sh, _) = req_gpu(0)?;
+                        let y_id = req_out_id(0)?;
+                        let sc_id = req_out_id(1)?;
+                        let zp_id = req_out_id(2)?;
+                        let y_ptr = alloc_out(y_id, &x_sh, DataType::Uint8, run_bufs)?;
+                        let sc_ptr = alloc_out(sc_id, &[], DataType::Float, run_bufs)?;
+                        let zp_ptr = alloc_out(zp_id, &[], DataType::Uint8, run_bufs)?;
+                        self.quant.dynamic_quantize_linear(
+                            x_ptr,
+                            numel(&x_sh),
+                            y_ptr,
+                            sc_ptr,
+                            zp_ptr,
+                        )?;
+                        gpu_tensors.insert(y_id, (y_ptr, x_sh, DataType::Uint8));
+                        gpu_tensors.insert(sc_id, (sc_ptr, Vec::new(), DataType::Float));
+                        gpu_tensors.insert(zp_id, (zp_ptr, Vec::new(), DataType::Uint8));
+                    }
+                    Op::MatMulInteger => {
+                        let (a_ptr, a_sh, _) = req_gpu(0)?;
+                        let (b_ptr, b_sh, _) = req_gpu(1)?;
+                        let a_zp = match opt_gpu(2) {
+                            None => ZeroPointArg::None,
+                            Some((p, sh, _)) => {
+                                if numel(&sh) <= 1 {
+                                    ZeroPointArg::Scalar(p)
+                                } else if sh.len() == 1 {
+                                    ZeroPointArg::PerAxis(p)
+                                } else {
+                                    ZeroPointArg::BatchedPerAxis(p)
+                                }
+                            }
+                        };
+                        let b_zp = match opt_gpu(3) {
+                            None => ZeroPointArg::None,
+                            Some((p, sh, _)) => {
+                                if numel(&sh) <= 1 {
+                                    ZeroPointArg::Scalar(p)
+                                } else if sh.len() == 1 {
+                                    ZeroPointArg::PerAxis(p)
+                                } else {
+                                    ZeroPointArg::BatchedPerAxis(p)
+                                }
+                            }
+                        };
+                        let m = a_sh[a_sh.len() - 2];
+                        let k = a_sh[a_sh.len() - 1];
+                        let n = b_sh[b_sh.len() - 1];
+                        let a_batch = &a_sh[..a_sh.len() - 2];
+                        let b_batch = &b_sh[..b_sh.len() - 2];
+                        let br = a_batch.len().max(b_batch.len());
+                        let mut out_sh = Vec::with_capacity(br + 2);
+                        for i in 0..br {
+                            let da = if i + a_batch.len() >= br {
+                                a_batch[i + a_batch.len() - br]
+                            } else {
+                                1
+                            };
+                            let db = if i + b_batch.len() >= br {
+                                b_batch[i + b_batch.len() - br]
+                            } else {
+                                1
+                            };
+                            out_sh.push(da.max(db));
+                        }
+                        out_sh.push(m);
+                        out_sh.push(n);
+                        let out_id = req_out_id(0)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Int32, run_bufs)?;
+                        let params = MatMulIntegerParams::new_batched(
+                            a_ptr, b_ptr, y_ptr, a_batch, b_batch, m, n, k, a_zp, b_zp,
+                        )?;
+                        self.quant.matmul_integer(&params)?;
+                        gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Int32));
+                    }
+                    Op::ConvInteger(attrs) => {
+                        let (x_ptr, x_sh, _) = req_gpu(0)?;
+                        let (w_ptr, w_sh, _) = req_gpu(1)?;
+                        let x_zp = match opt_gpu(2) {
+                            None => ZeroPointArg::None,
+                            Some((p, sh, _)) => {
+                                if numel(&sh) <= 1 {
+                                    ZeroPointArg::Scalar(p)
+                                } else {
+                                    ZeroPointArg::PerAxis(p)
+                                }
+                            }
+                        };
+                        let w_zp = match opt_gpu(3) {
+                            None => ZeroPointArg::None,
+                            Some((p, sh, _)) => {
+                                if numel(&sh) <= 1 {
+                                    ZeroPointArg::Scalar(p)
+                                } else {
+                                    ZeroPointArg::PerAxis(p)
+                                }
+                            }
+                        };
+                        let p = Conv2dParams::from_attrs(
+                            &x_sh,
+                            &w_sh,
+                            attrs,
+                            FusedActivation::None,
+                        )?;
+                        let out_sh = vec![p.batch, p.c_out, p.out_h, p.out_w];
+                        let out_id = req_out_id(0)?;
+                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Int32, run_bufs)?;
+                        let cparams = ConvIntegerParams {
+                            x_ptr,
+                            w_ptr,
+                            y_ptr,
+                            x_zero_point: x_zp,
+                            w_zero_point: w_zp,
+                            n: p.batch,
+                            c_in: p.c_in,
+                            h_in: p.h_in,
+                            w_in: p.w_in,
+                            c_out: p.c_out,
+                            k_h: p.kh,
+                            k_w: p.kw,
+                            h_out: p.out_h,
+                            w_out: p.out_w,
+                            stride_h: p.sh,
+                            stride_w: p.sw,
+                            pad_top: p.pad_t,
+                            pad_left: p.pad_l,
+                            dilation_h: p.dh,
+                            dilation_w: p.dw,
+                            group: p.group,
+                        };
+                        self.quant.conv_integer(&cparams)?;
+                        gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Int32));
+                    }
+
+                    // --- Control Flow (`If` subgraphs in eSamDecoder) ---
+                    Op::If(if_attrs) => {
+                        let cond_tid = node.inputs.first().and_then(|o| *o).ok_or_else(|| {
+                            SessionError::Runtime(format!("If '{}' missing condition input", node.name))
+                        })?;
+                        let cond_val: bool = if let Some(ct) = cpu_tensors.get(&cond_tid) {
+                            match &ct.data {
+                                CpuData::Bool(v) => v.first().copied().unwrap_or(false),
+                                CpuData::I64(v) => v.first().copied().unwrap_or(0) != 0,
+                                CpuData::F32(v) => v.first().copied().unwrap_or(0.0) != 0.0,
+                            }
+                        } else if let Some(&(ptr, _, _)) = gpu_tensors.get(&cond_tid) {
+                            let tmp = gpu.alloc_buffer(4)?;
+                            self.spatial.copy_bytes_u8(ptr, tmp.handle(), 1)?;
+                            let mut byte = [0u8; 4];
+                            gpu.download_buffer(&tmp, &mut byte)?;
+                            byte[0] != 0
+                        } else {
+                            return Err(SessionError::Runtime(format!(
+                                "If '{}' condition tensor not found",
+                                node.name
+                            )));
+                        };
+
+                        let branch = if cond_val {
+                            &if_attrs.then_branch
+                        } else {
+                            &if_attrs.else_branch
+                        };
+
+                        let mut sub_gpu: HashMap<TensorId, (u64, Vec<usize>, DataType)> =
+                            HashMap::new();
+                        let mut sub_cpu: HashMap<TensorId, CpuTensor> = HashMap::new();
+
+                        // Bind subgraph weights.
+                        for (&wtid, proto) in &branch.weights {
+                            let shape: Vec<usize> =
+                                proto.dims.iter().map(|&d| d.max(0) as usize).collect();
+                            if proto.elem_count() <= DEFAULT_MAX_CPU_TENSOR_ELEMS {
+                                if let Ok(ct) = CpuTensor::from_tensor_proto(proto) {
+                                    sub_cpu.insert(wtid, ct);
+                                }
+                            }
+                            let (bytes, stored_dt): (Vec<u8>, DataType) = match proto.data_type {
+                                DataType::Float => {
+                                    if proto.raw_data.len() == proto.elem_count() * 4 {
+                                        (proto.raw_data.clone(), DataType::Float)
+                                    } else {
+                                        let v = proto.to_f32_vec().map_err(|e| {
+                                            SessionError::Runtime(format!(
+                                                "If subgraph weight decode error: {e}"
+                                            ))
+                                        })?;
+                                        (f32_as_bytes(&v).to_vec(), DataType::Float)
+                                    }
+                                }
+                                DataType::Float16 => {
+                                    let v = proto.to_f32_vec().map_err(|e| {
+                                        SessionError::Runtime(format!(
+                                            "If subgraph fp16 weight decode error: {e}"
+                                        ))
+                                    })?;
+                                    (f32_as_bytes(&v).to_vec(), DataType::Float)
+                                }
+                                other => (proto.raw_data.clone(), other),
+                            };
+                            if !bytes.is_empty() {
+                                let buf = gpu.alloc_buffer(bytes.len())?;
+                                gpu.upload_buffer(&buf, &bytes)?;
+                                let ptr = buf.handle();
+                                run_bufs.push(buf);
+                                sub_gpu.insert(wtid, (ptr, shape, stored_dt));
+                            } else {
+                                sub_gpu.insert(wtid, (0u64, shape, stored_dt));
+                            }
+                        }
+
+                        // Bind outer-scope captured tensors by name.
+                        for info in &branch.tensors {
+                            if let Some(&outer_tid) = graph.name_to_id.get(&info.name) {
+                                if let Some(g) = gpu_tensors.get(&outer_tid) {
+                                    sub_gpu.insert(info.id, g.clone());
+                                }
+                                if let Some(c) = cpu_tensors.get(&outer_tid) {
+                                    sub_cpu.insert(info.id, c.clone());
+                                }
+                            }
+                        }
+
+                        let empty_out_ids = HashMap::new();
+                        self.exec_graph(
+                            branch,
+                            false,
+                            &empty_out_ids,
+                            &mut sub_gpu,
+                            &mut sub_cpu,
+                            run_bufs,
+                        )?;
+
+                        // Propagate branch outputs back to outer node outputs.
+                        for (idx, &branch_out_tid) in branch.outputs.iter().enumerate() {
+                            if let Some(Some(outer_out_tid)) = node.outputs.get(idx) {
+                                if let Some(g) = sub_gpu.get(&branch_out_tid) {
+                                    let optr = alloc_out(*outer_out_tid, &g.1, g.2, run_bufs)?;
+                                    let total = numel(&g.1);
+                                    if optr != g.0 && total > 0 {
+                                        if g.2 == DataType::Float {
+                                            self.spatial.copy_f32(g.0, optr, total)?;
+                                        } else {
+                                            let eb = g.2.byte_size().unwrap_or(4);
+                                            self.spatial.copy_bytes_u8(g.0, optr, total * eb)?;
+                                        }
+                                        gpu_tensors.insert(*outer_out_tid, (optr, g.1.clone(), g.2));
+                                    } else {
+                                        gpu_tensors.insert(*outer_out_tid, g.clone());
+                                    }
+                                }
+                                if let Some(c) = sub_cpu.get(&branch_out_tid) {
+                                    cpu_tensors.insert(*outer_out_tid, c.clone());
+                                }
+                            }
+                        }
                     }
 
                     other => {
@@ -1391,29 +1946,7 @@ mod imp {
                     }
                 }
             }
-
-            // 3. Download all graph outputs.
-            let mut results = HashMap::with_capacity(graph.outputs.len());
-            for &out_id in &graph.outputs {
-                let info = &graph.tensors[out_id.0];
-                let (ptr, shape, _dt) = gpu_tensors.get(&out_id).ok_or_else(|| {
-                    SessionError::Runtime(format!("graph output '{}' was not produced", info.name))
-                })?;
-                let count = numel(shape);
-                let mut host = vec![0.0f32; count];
-                if count > 0 {
-                    // Find matching DeviceBuffer or copy into a staging DeviceBuffer for safe D2H.
-                    if let Some(buf) = run_bufs.iter().find(|b| b.handle() == *ptr) {
-                        gpu.download_buffer(buf, f32_as_bytes_mut(&mut host))?;
-                    } else {
-                        let tmp = gpu.alloc_buffer(count * 4)?;
-                        self.spatial.copy_f32(*ptr, tmp.handle(), count)?;
-                        gpu.download_buffer(&tmp, f32_as_bytes_mut(&mut host))?;
-                    }
-                }
-                results.insert(info.name.clone(), (host, shape.clone()));
-            }
-            Ok(results)
+            Ok(())
         }
     }
 
@@ -1454,6 +1987,8 @@ mod imp {
                 (r"AIModels\Common\PeopleMasking\skinMasking.onnx", "input_29", &[1, 512, 512, 3]),
                 (r"AIModels\Common\SubjectMasking\subjectMasking.onnx", "x", &[1, 3, 320, 320]),
                 (r"AIModels\Common\MatchLook\MatchLookBrightness.onnx", "input.1", &[1, 3, 384, 384]),
+                (r"AIModels\Common\FaceDetection\faceDetection.onnx", "input", &[1, 3, 320, 320]),
+                (r"AIModels\Common\SamEncoder\eSamEncoderPreUInt8.onnx", "input_image", &[1024, 1024, 3]),
             ];
 
             let mut passed = 0usize;
@@ -1514,6 +2049,58 @@ mod imp {
                     Err(e) => {
                         eprintln!("[ERR ] {:<32} {e}", rel);
                     }
+                }
+            }
+            // Also test multi-input eSamDecoder.onnx (contains Op::If subgraphs).
+            let dec_path = root.join(r"AIModels\Common\SamDecoder\eSamDecoder.onnx");
+            if dec_path.is_file() {
+                let bytes = std::fs::read(&dec_path).expect("read eSamDecoder");
+                let mut overrides = HashMap::new();
+                overrides.insert("image_embeddings".to_string(), vec![1, 256, 64, 64]);
+                overrides.insert("point_coords".to_string(), vec![1, 1, 80, 2]);
+                overrides.insert("point_labels".to_string(), vec![1, 1, 80]);
+                overrides.insert("orig_im_size".to_string(), vec![2]);
+                let t_load = Instant::now();
+                match NativeCudaSession::from_bytes(&bytes, &overrides) {
+                    Ok(session) => {
+                        let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+                        let emb = vec![0.1f32; 256 * 64 * 64];
+                        let mut pts = vec![0.0f32; 80 * 2];
+                        pts[0] = 512.0;
+                        pts[1] = 512.0;
+                        let mut lbl = vec![-1.0f32; 80];
+                        lbl[0] = 1.0;
+                        let orig = vec![1024.0f32, 1024.0f32];
+                        let mut inputs = HashMap::new();
+                        inputs.insert("image_embeddings".to_string(), (emb.as_slice(), vec![1, 256, 64, 64]));
+                        inputs.insert("point_coords".to_string(), (pts.as_slice(), vec![1, 1, 80, 2]));
+                        inputs.insert("point_labels".to_string(), (lbl.as_slice(), vec![1, 1, 80]));
+                        inputs.insert("orig_im_size".to_string(), (orig.as_slice(), vec![2]));
+                        match session.run_f32(&inputs) {
+                            Ok(first) => {
+                                let t = Instant::now();
+                                let _ = session.run_f32(&inputs).expect("eSamDecoder timed run");
+                                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                                let mut summary = String::new();
+                                for (k, (v, sh)) in &first {
+                                    assert!(v.iter().all(|x| x.is_finite()), "eSamDecoder '{k}' non-finite");
+                                    let mean = v.iter().sum::<f32>() / (v.len().max(1) as f32);
+                                    summary.push_str(&format!("{k}{sh:?}(mean={mean:.4}) "));
+                                }
+                                eprintln!(
+                                    "[PASS] {:<32} load={:6.1}ms arena={:6.2}MiB infer={:6.2}ms | {}",
+                                    r"AIModels\Common\SAM\eSamDecoder.onnx",
+                                    load_ms,
+                                    session.arena_peak_bytes() as f64 / (1024.0 * 1024.0),
+                                    ms,
+                                    summary
+                                );
+                                passed += 1;
+                            }
+                            Err(e) => eprintln!("[ERR ] eSamDecoder.onnx: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("[LOAD-ERR] eSamDecoder.onnx: {e}"),
                 }
             }
             assert!(passed >= 5, "expected at least 5 real models to run end-to-end, got {passed}");

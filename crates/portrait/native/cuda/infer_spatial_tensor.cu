@@ -321,6 +321,50 @@ extern "C" __global__ void pad_constant_nchw_f32(
     }
 }
 
+extern "C" __global__ void pad_constant_4d_f32(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int in_n,
+    int in_c,
+    int in_h,
+    int in_w,
+    int out_n,
+    int out_c,
+    int out_h,
+    int out_w,
+    int pad_n0,
+    int pad_c0,
+    int pad_h0,
+    int pad_w0,
+    float const_val
+) {
+    int total = out_n * out_c * out_h * out_w;
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total) return;
+
+    int ow = idx % out_w;
+    int tmp = idx / out_w;
+    int oh = tmp % out_h;
+    tmp /= out_h;
+    int oc = tmp % out_c;
+    int on = tmp / out_c;
+
+    int in_ni = on - pad_n0;
+    int in_ci = oc - pad_c0;
+    int in_hi = oh - pad_h0;
+    int in_wi = ow - pad_w0;
+
+    if (in_ni >= 0 && in_ni < in_n &&
+        in_ci >= 0 && in_ci < in_c &&
+        in_hi >= 0 && in_hi < in_h &&
+        in_wi >= 0 && in_wi < in_w) {
+        size_t src_idx = (((size_t)in_ni * (size_t)in_c + (size_t)in_ci) * (size_t)in_h + (size_t)in_hi) * (size_t)in_w + (size_t)in_wi;
+        output[idx] = input[src_idx];
+    } else {
+        output[idx] = const_val;
+    }
+}
+
 // ============================================================================
 // 3. Tensor Layout Rearrangement & Indexing
 // ============================================================================
@@ -453,6 +497,16 @@ extern "C" __global__ void copy_f32(
 ) {
     int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= total) return;
+    dst[idx] = src[idx];
+}
+
+extern "C" __global__ void copy_bytes_u8(
+    const unsigned char* __restrict__ src,
+    unsigned char* __restrict__ dst,
+    int total_bytes
+) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total_bytes) return;
     dst[idx] = src[idx];
 }
 

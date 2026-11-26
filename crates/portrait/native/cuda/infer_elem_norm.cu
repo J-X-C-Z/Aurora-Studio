@@ -366,6 +366,26 @@ extern "C" __global__ void cast_f32_to_i64(
     dst[idx] = static_cast<int64_t>(src[idx]);
 }
 
+extern "C" __global__ void cast_i32_to_f32(
+    const int32_t* __restrict__ src,
+    float* __restrict__ dst,
+    uint32_t total
+) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    dst[idx] = static_cast<float>(src[idx]);
+}
+
+extern "C" __global__ void cast_u8_to_f32(
+    const uint8_t* __restrict__ src,
+    float* __restrict__ dst,
+    uint32_t total
+) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    dst[idx] = static_cast<float>(src[idx]);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Softmax & Normalization Kernels (Warp/Block Reduction, High Precision)
 // ---------------------------------------------------------------------------

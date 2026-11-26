@@ -29,6 +29,8 @@ pub const KERNEL_CAST_F16_TO_F32: &str = "cast_f16_to_f32";
 pub const KERNEL_CAST_F32_TO_F16: &str = "cast_f32_to_f16";
 pub const KERNEL_CAST_I64_TO_F32: &str = "cast_i64_to_f32";
 pub const KERNEL_CAST_F32_TO_I64: &str = "cast_f32_to_i64";
+pub const KERNEL_CAST_I32_TO_F32: &str = "cast_i32_to_f32";
+pub const KERNEL_CAST_U8_TO_F32: &str = "cast_u8_to_f32";
 pub const KERNEL_SOFTMAX_AXIS_F32: &str = "softmax_axis_f32";
 pub const KERNEL_LAYER_NORM_LAST_F32: &str = "layer_norm_last_f32";
 pub const KERNEL_INSTANCE_NORM_NCHW_F32: &str = "instance_norm_nchw_f32";
@@ -523,6 +525,26 @@ impl ElemNormKernels {
         total: usize,
     ) -> Result<Dispatch, CudaError> {
         self.launch_cast(KERNEL_CAST_F32_TO_I64, src_ptr, dst_ptr, total)
+    }
+
+    /// Cast `total` `i32` elements to FP32 (`f32`).
+    pub fn cast_i32_to_f32(
+        &self,
+        src_ptr: u64,
+        dst_ptr: u64,
+        total: usize,
+    ) -> Result<Dispatch, CudaError> {
+        self.launch_cast(KERNEL_CAST_I32_TO_F32, src_ptr, dst_ptr, total)
+    }
+
+    /// Cast `total` `u8` elements to FP32 (`f32`).
+    pub fn cast_u8_to_f32(
+        &self,
+        src_ptr: u64,
+        dst_ptr: u64,
+        total: usize,
+    ) -> Result<Dispatch, CudaError> {
+        self.launch_cast(KERNEL_CAST_U8_TO_F32, src_ptr, dst_ptr, total)
     }
 
     fn launch_cast(

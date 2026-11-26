@@ -24,11 +24,13 @@ pub const KERNEL_GLOBAL_AVGPOOL: &str = "global_avgpool_nchw_f32";
 pub const KERNEL_REDUCE_MEAN: &str = "reduce_mean_f32";
 pub const KERNEL_RESIZE: &str = "resize_nchw_f32";
 pub const KERNEL_PAD_CONSTANT: &str = "pad_constant_nchw_f32";
+pub const KERNEL_PAD_CONSTANT_4D: &str = "pad_constant_4d_f32";
 pub const KERNEL_TRANSPOSE_ND: &str = "transpose_nd_f32";
 pub const KERNEL_CONCAT_AXIS: &str = "concat_axis_f32";
 pub const KERNEL_SLICE_ND: &str = "slice_nd_f32";
 pub const KERNEL_GATHER_AXIS: &str = "gather_axis_f32";
 pub const KERNEL_COPY: &str = "copy_f32";
+pub const KERNEL_COPY_BYTES: &str = "copy_bytes_u8";
 pub const KERNEL_SCATTER_ND: &str = "scatter_nd_f32";
 pub const KERNEL_EXPAND_ND: &str = "expand_nd_f32";
 pub const KERNEL_TILE_ND: &str = "tile_nd_f32";
@@ -488,6 +490,63 @@ impl SpatialTensorKernels {
         Ok(())
     }
 
+    /// General 4D NCHW constant padding supporting padding along all 4 dimensions (N, C, H, W).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pad_constant_4d_f32(
+        &self,
+        input: u64,
+        output: u64,
+        in_shape: [usize; 4],
+        pad_begin: [usize; 4],
+        pad_end: [usize; 4],
+        const_val: f32,
+    ) -> Result<(), CudaError> {
+        let out_n = in_shape[0] + pad_begin[0] + pad_end[0];
+        let out_c = in_shape[1] + pad_begin[1] + pad_end[1];
+        let out_h = in_shape[2] + pad_begin[2] + pad_end[2];
+        let out_w = in_shape[3] + pad_begin[3] + pad_end[3];
+        let total = shape_numel(&[out_n, out_c, out_h, out_w])?;
+        if total == 0 {
+            return Ok(());
+        }
+        let mut p_in = input;
+        let mut p_out = output;
+        let mut p_in_n = to_i32(in_shape[0], "in_n")?;
+        let mut p_in_c = to_i32(in_shape[1], "in_c")?;
+        let mut p_in_h = to_i32(in_shape[2], "in_h")?;
+        let mut p_in_w = to_i32(in_shape[3], "in_w")?;
+        let mut p_out_n = to_i32(out_n, "out_n")?;
+        let mut p_out_c = to_i32(out_c, "out_c")?;
+        let mut p_out_h = to_i32(out_h, "out_h")?;
+        let mut p_out_w = to_i32(out_w, "out_w")?;
+        let mut p_pn0 = to_i32(pad_begin[0], "pad_n0")?;
+        let mut p_pc0 = to_i32(pad_begin[1], "pad_c0")?;
+        let mut p_ph0 = to_i32(pad_begin[2], "pad_h0")?;
+        let mut p_pw0 = to_i32(pad_begin[3], "pad_w0")?;
+        let mut p_val = const_val;
+
+        let mut params: [*mut c_void; 15] = [
+            (&mut p_in as *mut u64).cast(),
+            (&mut p_out as *mut u64).cast(),
+            (&mut p_in_n as *mut i32).cast(),
+            (&mut p_in_c as *mut i32).cast(),
+            (&mut p_in_h as *mut i32).cast(),
+            (&mut p_in_w as *mut i32).cast(),
+            (&mut p_out_n as *mut i32).cast(),
+            (&mut p_out_c as *mut i32).cast(),
+            (&mut p_out_h as *mut i32).cast(),
+            (&mut p_out_w as *mut i32).cast(),
+            (&mut p_pn0 as *mut i32).cast(),
+            (&mut p_pc0 as *mut i32).cast(),
+            (&mut p_ph0 as *mut i32).cast(),
+            (&mut p_pw0 as *mut i32).cast(),
+            (&mut p_val as *mut f32).cast(),
+        ];
+        self.nvidia
+            .launch_raw(KERNEL_PAD_CONSTANT_4D, grid_1d(total), (BLOCK_1D, 1), &mut params)?;
+        Ok(())
+    }
+
     /// General 1D–5D transpose with arbitrary permutation `perm`.
     pub fn transpose_nd_f32(
         &self,
@@ -730,6 +789,24 @@ impl SpatialTensorKernels {
         ];
         self.nvidia
             .launch_raw(KERNEL_COPY, grid_1d(count), (BLOCK_1D, 1), &mut params)?;
+        Ok(())
+    }
+
+    /// Device-to-device exact byte copy kernel (safe for all dtypes including U8/F16/I64).
+    pub fn copy_bytes_u8(&self, src: u64, dst: u64, total_bytes: usize) -> Result<(), CudaError> {
+        if total_bytes == 0 || src == dst {
+            return Ok(());
+        }
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_total = to_i32(total_bytes, "copy_bytes")?;
+        let mut params: [*mut c_void; 3] = [
+            (&mut p_src as *mut u64).cast(),
+            (&mut p_dst as *mut u64).cast(),
+            (&mut p_total as *mut i32).cast(),
+        ];
+        self.nvidia
+            .launch_raw(KERNEL_COPY_BYTES, grid_1d(total_bytes), (BLOCK_1D, 1), &mut params)?;
         Ok(())
     }
 
