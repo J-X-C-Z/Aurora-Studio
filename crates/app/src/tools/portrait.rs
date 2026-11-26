@@ -610,6 +610,35 @@ fn makeup_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
     )
 }
 
+fn face_geometry_binding(key: &'static str) -> Binding {
+    // Face-mesh group rows (`30092/30093`, `242/243`, `8023/8024`, `8027/8028`,
+    // `8029/8030`, `30080..=30083`) read `-100..=100` directly; all other
+    // `portrait_face_stage` rows (V-face, eyes, brows, hairline, skull top,
+    // smile) expect normalized `-1..=1` (or `0..=1` for `pc:8033`).
+    let percent_stored = matches!(
+        key,
+        "pc:30092"
+            | "pc:30093"
+            | "pc:242"
+            | "pc:243"
+            | "pc:8023"
+            | "pc:8024"
+            | "pc:8027"
+            | "pc:8028"
+            | "pc:8029"
+            | "pc:8030"
+            | "pc:30080"
+            | "pc:30081"
+            | "pc:30082"
+            | "pc:30083"
+    );
+    if percent_stored {
+        extra_binding(key, 0.0)
+    } else {
+        portrait_amount_binding(key, 0.0)
+    }
+}
+
 /// Face reshape as left/right pairs. Linked (the default), one slider moves
 /// both sides; unlinked, each side has its own slider under the pair's name.
 fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
@@ -637,7 +666,7 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
     for (sides, (en, zh)) in pairs {
         let (left, right) = (sides[0].0, sides[1].0);
         if linked {
-            let (l, r) = (extra_binding(left, 0.0), extra_binding(right, 0.0));
+            let (l, r) = (face_geometry_binding(left), face_geometry_binding(right));
             let (lget, rget, lset, rset) = (l.get.clone(), r.get.clone(), l.set.clone(), r.set.clone());
             let both = Binding::new(move |a| (lget(a) + rget(a)) * 0.5, move |a, v| {
                 lset(a, v);
@@ -646,12 +675,13 @@ fn wired_face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) ->
             rows.push(param(state, format!("fg-{left}-lr"), t(en, zh), both, -100.0, 100.0, cx).default_value(0.0).into_any_element());
         } else {
             rows.push(caption(t(en, zh), cx));
-            rows.push(param(state, format!("fg-{left}"), t("Left", "左"), extra_binding(left, 0.0), -100.0, 100.0, cx).default_value(0.0).into_any_element());
-            rows.push(param(state, format!("fg-{right}"), t("Right", "右"), extra_binding(right, 0.0), -100.0, 100.0, cx).default_value(0.0).into_any_element());
+            rows.push(param(state, format!("fg-{left}"), t("Left", "左"), face_geometry_binding(left), -100.0, 100.0, cx).default_value(0.0).into_any_element());
+            rows.push(param(state, format!("fg-{right}"), t("Right", "右"), face_geometry_binding(right), -100.0, 100.0, cx).default_value(0.0).into_any_element());
         }
     }
     for (key, en, zh) in singles {
-        rows.push(param(state, format!("fg-{key}"), t(en, zh), extra_binding(*key, 0.0), -100.0, 100.0, cx).default_value(0.0).into_any_element());
+        let min = if *key == "pc:8033" { 0.0 } else { -100.0 };
+        rows.push(param(state, format!("fg-{key}"), t(en, zh), face_geometry_binding(key), min, 100.0, cx).default_value(0.0).into_any_element());
     }
     let (st, st_link) = (state.clone(), state.clone());
     ToolPanel::new(state, "retouch-face-geometry", t("Face Reshape", "面部精修"))

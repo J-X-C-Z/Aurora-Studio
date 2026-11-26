@@ -250,6 +250,14 @@ pub(crate) fn c1_roots() -> Vec<PathBuf> {
     if let Some(dir) = std::env::var_os("AURORA_C1_DIR") {
         roots.push(PathBuf::from(dir));
     }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("models");
+            if bundled.join("AIModels").is_dir() {
+                roots.push(bundled);
+            }
+        }
+    }
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
         roots.push(PathBuf::from(program_files).join("Capture One").join("Capture One"));
     }

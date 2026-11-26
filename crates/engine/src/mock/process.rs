@@ -8315,6 +8315,65 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         assert!(export.rgba.chunks_exact(4).all(|pixel| pixel[3] == 65535));
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires CUDA GPU, deliverable models dir, and AURORA_PORTRAIT_BENCH_NEF"]
+    fn zero_ort_portrait_end_to_end_smoke() {
+        use std::path::Path;
+
+        let rt_info = crate::aimask::runtime_info().expect("zero-ORT Native CUDA runtime must initialize");
+        println!("runtime: {rt_info:?}");
+        assert_eq!(rt_info.0, "<aurora-native-cuda>");
+
+        let session = crate::FaceInputSession::open_from_env(true)
+            .expect("FaceInputSession::open_from_env(true) must succeed in zero-ORT mode");
+        println!("FaceInputSession(include_parsing=true) opened OK");
+        drop(session);
+
+        let nef = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
+            .expect("set AURORA_PORTRAIT_BENCH_NEF");
+        let (w, h, rgba16) = crate::raw::decode16(Path::new(&nef)).expect("decode NEF");
+        let src = Source::from_rgba16(w, h, &rgba16);
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 640, false, None);
+
+        let sliders: &[(&str, &str, f32)] = &[
+            ("Whitening", "pc:90005", 0.8),
+            ("Skin hue", "pc:21015", 0.9),
+            ("Face smooth HLF", "pc:30021", 0.8),
+            ("Face width L", "pc:30092", 60.0),
+            ("Sharp chin L", "pc:242", 60.0),
+            ("Eye width L", "pc:8019", 0.6),
+            ("Brow position L", "pc:8021", 0.6),
+            ("Rosy", "pc:90007", 0.8),
+        ];
+        for &(label, key, val) in sliders {
+            let mut adj = AdjustmentSet::default();
+            adj.extra.insert(key.to_string(), val);
+            let out = render(&src, &adj, NormRect::FULL, 640, false, None);
+            let diff_px = out
+                .rgba
+                .chunks_exact(4)
+                .zip(plain.rgba.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            let report = out.portrait_report.as_ref().expect("portrait_report present");
+            let eff_summary: Vec<String> = report
+                .effects
+                .iter()
+                .map(|e| format!("pf={} exec={} backend={:?} fallback={:?}", e.pf, e.executed, e.backend, e.fallback_reason))
+                .collect();
+            println!(
+                "[{:<18}] key={:<8} diff_px={:<7} effects={:?}",
+                label, key, diff_px, eff_summary
+            );
+            assert!(
+                report.effects.iter().any(|e| e.executed),
+                "{label} ({key}) did not execute: {eff_summary:?}"
+            );
+            assert!(diff_px > 0, "{label} ({key}) changed 0 pixels");
+        }
+    }
+
     fn serial_mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; w * h];
         for y in 0..h {

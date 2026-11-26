@@ -1546,13 +1546,15 @@ impl FaceInputBundle {
         use aurora_portrait::raster_fragment::{Clamp, Defines, Edge as FragmentEdge};
 
         self.validate_ticket(source, Some(self.job_id))?;
-        let any_eye_brow = (8001u32..=8020).any(|pf| {
-            extra
-                .get(&format!("pc:{pf}"))
-                .copied()
-                .unwrap_or(0.0)
-                != 0.0
-        });
+        let any_eye_brow = (8001u32..=8022)
+            .chain([30073u32, 30079, 44124, 48019, 41922, 49221])
+            .any(|pf| {
+                extra
+                    .get(&format!("pc:{pf}"))
+                    .copied()
+                    .unwrap_or(0.0)
+                    != 0.0
+            });
         if !any_eye_brow {
             return Ok(());
         }

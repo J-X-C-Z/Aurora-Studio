@@ -1662,7 +1662,7 @@ impl Runtime {
         shape: &[i64],
     ) -> Result<Vec<OutputPlane>> {
         #[cfg(windows)]
-        if let Some(planes) = try_run_native_cuda(session, input, shape) {
+        if let Some(planes) = try_run_native_cuda(session, input, shape, self.is_native_only()) {
             return Ok(planes);
         }
         if self.is_native_only() {
@@ -2483,12 +2483,16 @@ fn try_run_native_cuda(
     session: &Session,
     input: &[f32],
     shape: &[i64],
+    native_only: bool,
 ) -> Option<Vec<OutputPlane>> {
     use aurora_portrait::native_infer::session::NativeCudaSession;
 
-    if !native_infer_enabled()
-        || session.input.element_type != FLOAT
-        || !is_native_verified_model(&session.inner.model_path)
+    if !native_infer_enabled() {
+        return None;
+    }
+    if !native_only
+        && (session.input.element_type != FLOAT
+            || !is_native_verified_model(&session.inner.model_path))
     {
         return None;
     }
