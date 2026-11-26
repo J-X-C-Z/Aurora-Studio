@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+samples/
+ev6-selftest/
+report/
+.scratch/
+.ev6-scratch/

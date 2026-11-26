@@ -1,0 +1,4 @@
+# Build output and run reports stay local.
+/target/
+/logs/
+*.log

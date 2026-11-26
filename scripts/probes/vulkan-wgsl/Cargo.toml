@@ -1,0 +1,24 @@
+[package]
+name = "aurora-vulkan-wgsl-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Vulkan compute probe: WGSL compiled to SPIR-V through naga, submitted directly through ash — integer RGBA8 stage fusion and a small FP32 matmul, both checked against CPU references"
+
+# Own workspace root on purpose: this crate lives under scripts/probes/, outside
+# the repository workspace members, so it must stay loadable with
+#   cargo <cmd> --manifest-path scripts/probes/vulkan-wgsl/Cargo.toml
+# from the repository root without being pulled into (or excluded from) that
+# workspace. Remove this table and cargo fails with
+# "current package believes it's in a workspace when it's not".
+[workspace]
+
+[dependencies]
+# Exact versions the CPU-reference contract was validated against; Cargo.lock
+# carries the full transitive set.
+ash = "=0.38.0"
+naga = { version = "=30.0.1", features = ["wgsl-in", "spv-out"] }
+
+[profile.release]
+opt-level = 2
+debug = false
