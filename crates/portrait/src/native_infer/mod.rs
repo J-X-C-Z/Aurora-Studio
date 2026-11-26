@@ -9,8 +9,13 @@
 
 pub mod arena;
 pub mod bn_fold;
+pub mod cpu_shape_eval;
 pub mod graph;
 pub mod onnx_proto;
+pub mod ops_conv_gemm;
+pub mod ops_elem_norm;
+pub mod ops_quant;
+pub mod ops_spatial_tensor;
 
 use std::collections::HashMap;
 use std::fmt;
