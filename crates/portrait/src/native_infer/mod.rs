@@ -16,6 +16,7 @@ pub mod ops_conv_gemm;
 pub mod ops_elem_norm;
 pub mod ops_quant;
 pub mod ops_spatial_tensor;
+pub mod session;
 
 use std::collections::HashMap;
 use std::fmt;
