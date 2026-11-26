@@ -33,7 +33,7 @@ mod library_ops;
 mod services;
 
 /// Longest side kept for a decoded source; larger files are downscaled.
-const SOURCE_LONG_SIDE: u32 = 4096;
+const SOURCE_LONG_SIDE: u32 = crate::raw_cache::PREVIEW_LONG_SIDE;
 /// Test-only count of the one-shot full-resolution export decodes. Exporting
 /// at or below [`SOURCE_LONG_SIDE`] must never take this path.
 #[cfg(test)]
@@ -1912,7 +1912,11 @@ fn export_memory_budget_from_memory(total: u64, available: u64) -> usize {
 
 /// Rough peak working-set estimate for one export job based on output dimensions
 /// and bit depth, used to serialize large-frame (e.g. 24MP/45MP) exports.
-fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
+///
+/// Also the per-pixel envelope the export pipeline charges its bounded queues
+/// with ([`crate::export::stages`]), so the admission budget and the in-flight
+/// queue depth cannot disagree about what a frame costs.
+pub(crate) fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
     let pixels = (width as usize).saturating_mul(height as usize);
     let bytes_per_px = if bit_depth == 16 { 36usize } else { 24usize };
     pixels.saturating_mul(bytes_per_px).max(1)
@@ -2364,6 +2368,11 @@ pub struct FileEngine {
     imported_styles: RwLock<Vec<StyleInfo>>,
     merge_registry: Arc<crate::merge_async::MergeRegistry>,
     soft_proof: RwLock<crate::SoftProofSettings>,
+    /// The image whose neighbours were last queued for prefetch. A preview
+    /// re-render of the same image (every slider drag) must not rebuild the
+    /// folder path list or re-queue a plan, so this is the selection latch.
+    // Once a viewer supplies its sorted order, stale render workers never overwrite it.
+    last_prefetched: Mutex<(bool,Option<(ImageId,u32)>)>,
 }
 
 /// Target white balance for Match Look: stored C1 gains when present, the
@@ -2493,6 +2502,12 @@ impl FileEngine {
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = library_ops::canonical_root(root.as_ref())?;
+        // Real registration point for the startup device warmup: opening a
+        // library is the first moment this process knows it will decode RAW, and
+        // the JIT then overlaps the folder scan below instead of the first
+        // click. Single-flight and idempotent; `AURORA_RAW_PREWARM=0` (and a
+        // non-CUDA `AURORA_GPU_BACKEND`) are honoured inside the warmup.
+        crate::aurora_raw::prewarm::spawn_background();
         let store = match Store::open(&root) {
             Ok(store) => Some(store),
             Err(err) => {
@@ -2556,6 +2571,7 @@ impl FileEngine {
             imported_styles: RwLock::new(Vec::new()),
             merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
             soft_proof: RwLock::new(soft_proof),
+            last_prefetched: Mutex::new((false,None)),
         };
         // The opening scan is not a user rescan: keep it out of the import job
         // snapshot so the records describe explicit `import`/`rescan` calls.
@@ -2649,6 +2665,9 @@ impl FileEngine {
             root = root.parent().unwrap_or(Path::new(".")).to_path_buf();
         }
         let root = library_ops::canonical_root(&root)?;
+        // A catalog is a folder of RAW too: same warmup registration point as
+        // [`Self::open`], and the same single-flight latch.
+        crate::aurora_raw::prewarm::spawn_background();
         let store = Store::open(&root).ok();
         let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
         let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
@@ -2701,6 +2720,7 @@ impl FileEngine {
             imported_styles: RwLock::new(Vec::new()),
             merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
             soft_proof: RwLock::new(soft_proof),
+            last_prefetched: Mutex::new((false,None)),
         };
         engine.import_c1(&import);
         engine.inference().preload_ai_masks();
@@ -3381,6 +3401,38 @@ impl FileEngine {
         st.source_cache.current_bytes = 0;
     }
 
+    /// Warms the neighbours of `image` on the prefetch worker.
+    ///
+    /// This is the real registration point for the neighbour graph: the engine
+    /// knows its own entry order and the exact long side the next preview reads,
+    /// so the worker fills the entry the interactive path asks for instead of a
+    /// second cache. The path list is rebuilt only when the selected image
+    /// changes, so a re-render of the same frame costs one atomic load.
+    ///
+    /// Order caveat: entries are in folder-scan order. A browser sorted by
+    /// capture time may step through a different neighbour; warming the scan
+    /// neighbour is still a hit whenever the two agree, and the plan is bounded
+    /// by [`crate::aurora_raw::prefetch::MAX_TARGETS`] either way.
+    pub fn prefetch_neighbors(&self, image: ImageId) {
+        self.prefetch_neighbors_at(image, SOURCE_LONG_SIDE);
+    }
+
+    /// [`Self::prefetch_neighbors`] with an explicit long side, for a caller
+    /// that will read a different cache entry next (1:1 zoom).
+    pub fn prefetch_neighbors_at(&self, image: ImageId, long_side: u32) {
+        use crate::aurora_raw::prefetch as pf;
+        let mut owner=self.last_prefetched.lock();
+        if owner.0 || owner.1==Some((image,long_side)) {return;}
+        if !pf::prefetch_enabled() {pf::cancel_pending();owner.1=None;return;}
+        let targets={
+            let state=self.state.lock();
+            let Some(current)=state.entries.iter().position(|e|e.info.id==image) else{return};
+            pf::neighbor_paths_by(current,&state.entries,&pf::DEFAULT_OFFSETS,|e|e.path.as_path())
+        };
+        owner.1=Some((image,long_side));
+        pf::request_visible_targets(targets,long_side);
+    }
+
     /// The cached model-sized input, for the engine's own tests. The inference
     /// service owns the production body.
     #[cfg(test)]
@@ -3573,11 +3625,12 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "portrait-output" {
+            if name.starts_with('.') || name == "portrait-output"
+                || (name == "Output" && path.join(".aurora-export-dir").is_file()) {
                 continue;
             }
             collect(root, &path, depth + 1, out)?;
-        } else if path.is_file() && is_supported(&path) {
+        } else if path.is_file() && supports_photo_path(&path) {
             let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
             out.push((rel, path));
         }
@@ -3624,7 +3677,8 @@ fn scan_file(root: &Path, rel: String, path: PathBuf) -> ScannedFile {
     }
 }
 
-fn is_supported(path: &Path) -> bool {
+/// Photo, RAW or supported catalog package the real folder scanner can index (no I/O).
+pub fn supports_photo_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif")
@@ -4059,6 +4113,12 @@ impl FileEngine {
 }
 
 impl ImageEngine for FileEngine {
+    fn prefetch_visible_neighbors(&self, targets:Vec<PathBuf>) {
+        let mut owner=self.last_prefetched.lock();
+        owner.0=true;
+        crate::aurora_raw::prefetch::request_visible_targets(targets,SOURCE_LONG_SIDE);
+    }
+
     fn name(&self) -> String {
         format!("Portrait File Engine ({})", self.root.display())
     }
@@ -4445,11 +4505,16 @@ impl ImageEngine for FileEngine {
     }
 
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
+        self.prefetch_neighbors(request.image);
         self.preview_frame(request, false)
     }
 
-    fn render_preview_fast(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
-        self.preview_frame(request, fast)
+    fn render_preview_scoped(
+        &self,
+        request: &PreviewRequest,
+        scopes: crate::scopes::ScopeWants,
+    ) -> anyhow::Result<PreviewFrame> {
+        self.renders().preview_frame_scoped(request, false, scopes)
     }
 
     fn quick_cold_raw_preview(&self, request: &PreviewRequest) -> Option<PreviewFrame> {
@@ -5611,12 +5676,12 @@ mod tests {
     #[test]
     fn raw_files_are_supported() {
         for ext in ["nef", "cr3", "arw", "dng"] {
-            assert!(is_supported(Path::new(&format!("shot.{ext}"))), "{ext}");
+            assert!(supports_photo_path(Path::new(&format!("shot.{ext}"))), "{ext}");
         }
         for ext in ["jpg", "png", "tif", "webp", "heic", "heif"] {
-            assert!(is_supported(Path::new(&format!("shot.{ext}"))), "{ext}");
+            assert!(supports_photo_path(Path::new(&format!("shot.{ext}"))), "{ext}");
         }
-        assert!(!is_supported(Path::new("notes.txt")));
+        assert!(!supports_photo_path(Path::new("notes.txt")));
     }
 
     #[test]
@@ -7167,9 +7232,9 @@ mod tests {
 
     #[test]
     fn export_above_the_proxy_decodes_the_original_at_full_resolution() {
-    let _serial = full_res_export_test_lock();
+        let _serial = full_res_export_test_lock();
         let _guard = FULL_RES_EXPORT_TEST_LOCK.lock();
-        let fixture = export_png_fixture("full", 4500, 3000, (100, 100, 64));
+        let fixture = export_png_fixture("full", 4500, 750, (100, 100, 64));
         let before_misses = fixture.engine.source_cache_stats().misses;
         let before_decodes = full_res_export_decode_count();
         let out = fixture.dir.join("Output");
@@ -7180,9 +7245,10 @@ mod tests {
         let JobStatus::Done { output } = wait_export(&fixture.engine, 71) else {
             panic!("export did not finish: {:?}", fixture.engine.job_status(71));
         };
-        // The 4096 proxy would render 4500x2999 (4500 * 2730 / 4096); the full
-        // original renders exactly 4500x3000.
-        assert_eq!(image::image_dimensions(&output).unwrap(), (4500, 3000));
+        // Keep the width above the 4096 proxy but avoid depending on 309 MiB of
+        // available decode budget in parallel CI. The proxy is 4096x682; the
+        // original must retain every pixel of the 4500x750 checker.
+        assert_eq!(image::image_dimensions(&output).unwrap(), (4500, 750));
         assert_eq!(
             full_res_export_decode_count() - before_decodes,
             1,
@@ -7195,7 +7261,7 @@ mod tests {
         );
 
         let exported = image::open(&output).unwrap().to_rgba8();
-        assert_eq!(exported.dimensions(), (4500, 3000));
+        assert_eq!(exported.dimensions(), (4500, 750));
         let row: Vec<u8> = (0..64).map(|i| exported.get_pixel(100 + i, 110).0[0]).collect();
         let dark = row.iter().filter(|value| **value < 60).count();
         let bright = row.iter().filter(|value| **value > 195).count();
@@ -7607,6 +7673,7 @@ mod tests {
             z6iii_feature: true,
             libraw_available: true,
             opencl: crate::raw::OpenClRouteState::NotCompiled,
+            device_policy: crate::raw::RawDevicePolicy::default(),
             demosaic: 3,
         };
         let libraw = route(false, false);
@@ -9058,5 +9125,125 @@ mod queued_save_tests {
 
         drop(engine);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod warmup_wiring_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aurora-warmup-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_png(dir: &Path, name: &str) {
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([40, 80, 120, 255]))
+            .save(dir.join(name))
+            .unwrap();
+    }
+
+    fn preview_request(image: ImageId) -> PreviewRequest {
+        PreviewRequest {
+            image,
+            adjustments: AdjustmentSet::default(),
+            region: crate::NormRect::FULL,
+            max_size: 512,
+            quality: crate::RenderQuality::Final,
+            bypass: true,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
+        }
+    }
+
+    /// `FileEngine::open` is the real registration point: opening a library has
+    /// to ask for the startup device warmup, or the first RAW click pays the JIT.
+    #[test]
+    fn opening_a_library_registers_the_device_warmup() {
+        let dir = temp_dir("open");
+        write_png(&dir, "a.png");
+        let before = crate::aurora_raw::prewarm::spawn_requests();
+        let engine = FileEngine::open(&dir).unwrap();
+        let after = crate::aurora_raw::prewarm::spawn_requests();
+        assert!(after > before, "opening a library must request the device warmup");
+        assert_eq!(engine.images().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A preview queues the RAW neighbours of the selected image exactly once:
+    /// the long side is the one the next preview reads, and re-rendering the same
+    /// selection (a slider drag) must not rebuild the plan.
+    #[test]
+    fn a_preview_queues_raw_neighbours_once_per_selection() {
+        let dir = temp_dir("prefetch");
+        write_png(&dir, "a.png");
+        std::fs::write(dir.join("b.nef"), b"not a real raw").unwrap();
+        std::fs::write(dir.join("c.nef"), b"not a real raw").unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine
+            .images()
+            .into_iter()
+            .find(|info| info.file_name.ends_with(".png"))
+            .expect("the png is the previewable image");
+
+        let before = crate::aurora_raw::prefetch::stats().requested;
+        engine.render_preview(&preview_request(info.id)).unwrap();
+        let after = crate::aurora_raw::prefetch::stats().requested;
+        assert_eq!(
+            after,
+            before + 1,
+            "one preview must queue exactly one neighbour plan: {:?}",
+            crate::aurora_raw::prefetch::stats()
+        );
+
+        // Same selection, second render: the latch keeps the plan untouched.
+        engine.render_preview(&preview_request(info.id)).unwrap();
+        assert_eq!(
+            crate::aurora_raw::prefetch::stats().requested,
+            after,
+            "a re-render of the same image must not queue again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_late_preview_must_not_replace_the_viewers_sorted_neighbours() {
+        let dir=temp_dir("visible-order");write_png(&dir,"a.png");std::fs::write(dir.join("b.nef"),b"synthetic invalid RAW").unwrap();
+        let engine=FileEngine::open(&dir).unwrap();
+        let image=engine.images().into_iter().find(|x|x.file_name.ends_with(".png")).unwrap().id;
+        engine.prefetch_visible_neighbors(Vec::new());
+        let before=crate::aurora_raw::prefetch::stats().requested;
+        engine.prefetch_neighbors(image);
+        assert_eq!(before,crate::aurora_raw::prefetch::stats().requested);
+        drop(engine);std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The plan the engine hands to the worker is the RAW neighbours at the
+    /// preview long side, capped and de-duplicated.
+    #[test]
+    fn the_engine_plan_is_the_raw_neighbours_at_the_preview_long_side() {
+        let paths: Vec<PathBuf> = ["a.png", "b.nef", "c.nef", "d.jpg", "e.arw"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let plan = crate::aurora_raw::prefetch::neighbor_paths(
+            0,
+            &paths,
+            &crate::aurora_raw::prefetch::DEFAULT_OFFSETS,
+        );
+        assert_eq!(
+            plan,
+            vec![PathBuf::from("b.nef"), PathBuf::from("c.nef")],
+            "the +1/-1/+2 walk keeps b and c; the jpg at +3 and the arw beyond the window do not consume the cap"
+        );
+        assert_eq!(SOURCE_LONG_SIDE, crate::raw_cache::PREVIEW_LONG_SIDE);
     }
 }

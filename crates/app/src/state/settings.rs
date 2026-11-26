@@ -824,9 +824,9 @@ fn one() -> f32 {
     1.0
 }
 
-/// `AURORA_SETTINGS` (or the older `AURORA_SETTINGS`), else the config folder.
+/// `AURORA_SETTINGS` optionally isolates a portable install or a diagnostic run.
 fn path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("AURORA_SETTINGS").or_else(|| std::env::var_os("AURORA_SETTINGS")) {
+    if let Some(p) = std::env::var_os("AURORA_SETTINGS").filter(|p| !p.is_empty()) {
         return Some(p.into());
     }
     config_dir("Aurora Studio", "aurora-studio").map(|d| d.join("settings.json"))
@@ -882,7 +882,12 @@ impl Settings {
     pub fn load() -> Self {
         path()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .or_else(|| legacy_path().and_then(|p| std::fs::read_to_string(p).ok()))
+            .or_else(|| {
+                if std::env::var_os("AURORA_SETTINGS").is_some_and(|p| !p.is_empty()) {
+                    return None; // an isolated profile never inherits the user's recent photos
+                }
+                legacy_path().and_then(|p| std::fs::read_to_string(p).ok())
+            })
             .and_then(|text| match serde_json::from_str(&text) {
                 Ok(s) => Some(s),
                 Err(e) => {
@@ -895,12 +900,9 @@ impl Settings {
 
     pub fn save(&self) {
         let Some(path) = path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match serde_json::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
+        match serde_json::to_vec_pretty(self) {
+            Ok(bytes) => {
+                if let Err(e) = aurora_engine::write_atomic(&path, &bytes) {
                     log::warn!("settings: cannot write {}: {e}", path.display());
                 }
             }

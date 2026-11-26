@@ -51,6 +51,7 @@ mod imp {
     use crate::native_infer::cpu_shape_eval::{
         eval_op as eval_cpu_node, CpuData, CpuTensor, DEFAULT_MAX_CPU_TENSOR_ELEMS,
     };
+    use crate::native_infer::cuda_graph;
     use crate::native_infer::ops_conv_gemm::{
         Conv2dParams, ConvGemmKernels, ConvTranspose2dParams, FusedActivation,
     };
@@ -77,6 +78,16 @@ mod imp {
     #[inline]
     fn numel(shape: &[usize]) -> usize {
         shape.iter().copied().product::<usize>()
+    }
+
+    #[inline]
+    fn align_up_usize(value: usize, alignment: usize) -> usize {
+        let rem = value % alignment;
+        if rem == 0 {
+            value
+        } else {
+            value + (alignment - rem)
+        }
     }
 
     #[inline]
@@ -117,11 +128,108 @@ mod imp {
         im2col_bytes: usize,
         /// Small static weights mirrored on CPU for shape/control-flow evaluation.
         static_cpu_tensors: HashMap<TensorId, CpuTensor>,
+        /// Process-wide driver handle, kept `'static` so persistent buffers and a
+        /// captured graph can outlive a single call. The underlying context is
+        /// process-global, exactly as `from_bytes` documents for `device buffers`.
+        gpu: &'static crate::cuda::Nvidia,
+        /// Static-graph slot: one installed CUDA Graph plus its fallback state.
+        graph: cuda_graph::GraphSlot,
+        // All paths reuse the same arena and im2col buffer (not just graph replay).
+        run_gate: std::sync::Mutex<()>,
+        /// Reusable `1.0` / `0.0` operands for the `Bool -> Float` cast.
+        const_one: Option<DeviceBuffer<'static>>,
+        const_zero: Option<DeviceBuffer<'static>>,
+        /// Reusable FP16 staging for `Float -> Float16` casts, sized at load.
+        ///
+        /// A per-run allocation here would make the model uncapturable: the
+        /// recorded node would point at a buffer that dies with the call.
+        f16_scratch: Option<DeviceBuffer<'static>>,
+        f16_scratch_elems: usize,
+        /// Device staging for CPU-evaluated shape/parameter tensors.
+        ///
+        /// A ViT builds its `Reshape`/`Expand` targets from `Shape -> Gather ->
+        /// Concat -> Where`, and the executor evaluates those chains on the host
+        /// and mirrors the small results to the device so downstream GPU kernels
+        /// can read them. Doing that with `alloc_buffer` + `upload_buffer` per
+        /// node meant one `cuMemAlloc` per call *and* a pointer that dies with
+        /// the call, so no model with a shape subgraph could ever be captured.
+        /// The staged blocks live in one buffer whose layout is the same on every
+        /// pass over the same graph.
+        cpu_stage: std::sync::Mutex<CpuStage>,
+    }
+
+    /// Deterministic bump-allocated device staging for CPU-evaluated tensors.
+    ///
+    /// `slots` describes the block layout the last non-recording pass produced;
+    /// a record pass must reproduce it byte for byte, which is what proves the
+    /// staged values are a function of the shape and the weights rather than of
+    /// the pixels.
+    struct CpuStage {
+        buffer: Option<DeviceBuffer<'static>>,
+        base: u64,
+        capacity: usize,
+        cursor: usize,
+        /// Buffers replaced by a growth; kept alive because a kernel enqueued
+        /// earlier in the same pass may still reference them.
+        retired: Vec<DeviceBuffer<'static>>,
+        /// Blocks staged by the pass that is running now.
+        current: Vec<StageSlot>,
+        /// Blocks staged by the last completed non-recording pass.
+        committed: Vec<StageSlot>,
+    }
+
+    /// One staged block: `(offset, len, fnv1a-64 of the bytes)`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct StageSlot {
+        offset: usize,
+        len: usize,
+        hash: u64,
+        address: u64, // allocation that actually received this block
+    }
+
+    impl CpuStage {
+        fn new() -> Self {
+            Self {
+                buffer: None,
+                base: 0,
+                capacity: 0,
+                cursor: 0,
+                retired: Vec::new(),
+                current: Vec::new(),
+                committed: Vec::new(),
+            }
+        }
+    }
+
+    /// 256-byte alignment for every staged block, matching the arena.
+    const CPU_STAGE_ALIGNMENT: usize = 256;
+    /// Initial staging capacity; a shape subgraph of a 640x640 FPN needs ~64 KiB.
+    const CPU_STAGE_INITIAL_BYTES: usize = 256 * 1024;
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
 
     impl Drop for NativeCudaSession {
         fn drop(&mut self) {
+            // The graph executable replays against the arena, the im2col
+            // workspace and `owned_buffers`, so it has to go first: its `Drop`
+            // drains the context and destroys the executable before any buffer
+            // it names is freed.
+            self.graph.clear();
             // Explicitly drop all device buffers while `self.conv` (holding `Nvidia`) is still alive.
+            self.f16_scratch.take();
+            self.const_one.take();
+            self.const_zero.take();
+            if let Ok(mut stage) = self.cpu_stage.lock() {
+                stage.buffer.take();
+                stage.retired.clear();
+            }
             self.im2col_buf.take();
             self.arena_buf.take();
             self.owned_buffers.clear();
@@ -141,11 +249,15 @@ mod imp {
             let spatial = SpatialTensorKernels::open()?;
             let quant = QuantInt8Kernels::open()?;
 
-            // SAFETY: `owned_buffers`, `arena_buf`, and `im2col_buf` are explicitly dropped
-            // in `NativeCudaSession::drop` before `self.conv` is dropped, and the underlying
-            // CUDA driver primary context is process-global.
-            let gpu_static: &'static crate::cuda::Nvidia =
-                unsafe { std::mem::transmute(conv.nvidia()) };
+            // A process-wide CUDA context does not give a reference to a local
+            // Rust handle a static lifetime. Store the handle itself at a stable
+            // address: sessions move, but their allocations and graph replays do not.
+            static DRIVER: std::sync::OnceLock<crate::cuda::Nvidia> = std::sync::OnceLock::new();
+            if DRIVER.get().is_none() {
+                let handle = crate::cuda::Nvidia::open_ptx(crate::native_infer::ops_conv_gemm::PTX)?;
+                let _ = DRIVER.set(handle);
+            }
+            let gpu_static = DRIVER.get().expect("CUDA handle initialized above");
 
             let mut weight_ptrs = HashMap::with_capacity(plan.graph.weights.len());
             let mut owned_buffers = Vec::with_capacity(plan.graph.weights.len());
@@ -229,6 +341,44 @@ mod imp {
             };
             let im2col_ptr = im2col_buf.as_ref().map_or(0, DeviceBuffer::handle);
 
+            // Persistent cast operands. The `Bool -> Float` cast needs scalar
+            // 1.0/0.0 buffers and the `Float -> Float16` round trip needs a
+            // staging buffer whose size is fixed by the static input shape;
+            // allocating either per run would put a pointer that dies with the
+            // call inside a captured graph.
+            let mut f16_scratch_elems = 0usize;
+            let mut needs_bool_cast = false;
+            for node in &plan.graph.nodes {
+                if let Op::Cast { to } = &node.op
+                    && let Some(Some(x_id)) = node.inputs.first()
+                {
+                    if *to == DataType::Float16
+                        && let Some(shape) = plan.graph.tensors[x_id.0].static_shape()
+                    {
+                        f16_scratch_elems = f16_scratch_elems.max(numel(&shape));
+                    }
+                    if *to == DataType::Float
+                        && plan.graph.tensors[x_id.0].dtype == DataType::Bool
+                    {
+                        needs_bool_cast = true;
+                    }
+                }
+            }
+            let f16_scratch = if f16_scratch_elems > 0 {
+                Some(gpu_static.alloc_buffer(f16_scratch_elems.max(1) * 2)?)
+            } else {
+                None
+            };
+            let (const_one, const_zero) = if needs_bool_cast {
+                let one = gpu_static.alloc_buffer(4)?;
+                gpu_static.upload_buffer(&one, f32_as_bytes(&[1.0f32]))?;
+                let zero = gpu_static.alloc_buffer(4)?;
+                gpu_static.upload_buffer(&zero, f32_as_bytes(&[0.0f32]))?;
+                (Some(one), Some(zero))
+            } else {
+                (None, None)
+            };
+
             Ok(Self {
                 plan,
                 conv,
@@ -243,6 +393,14 @@ mod imp {
                 im2col_ptr,
                 im2col_bytes: max_im2col_bytes,
                 static_cpu_tensors,
+                gpu: gpu_static,
+                graph: cuda_graph::GraphSlot::new(),
+                run_gate: std::sync::Mutex::new(()),
+                const_one,
+                const_zero,
+                f16_scratch,
+                f16_scratch_elems,
+                cpu_stage: std::sync::Mutex::new(CpuStage::new()),
             })
         }
 
@@ -250,17 +408,118 @@ mod imp {
             &self.plan.graph
         }
 
+        pub(crate) fn actual_device_label(&self)->String {self.gpu.device_label()}
+
         pub fn arena_peak_bytes(&self) -> usize {
             self.plan.arena.peak_bytes
         }
 
+        /// Clears the per-pass staging cursor before a pass over the graph.
+        fn reset_cpu_stage(&self) {
+            let mut stage = self.cpu_stage.lock().unwrap_or_else(|p| p.into_inner());
+            stage.cursor = 0;
+            stage.current.clear();
+        }
+
+        /// Copies one CPU-evaluated tensor into the staging buffer and returns its
+        /// device pointer.
+        ///
+        /// During a record pass the bytes are only *compared* with the block the
+        /// last plain pass staged at the same offset: a `cuMemcpyHtoD` inside the
+        /// captured region has no replay equivalent, and re-uploading a value the
+        /// graph would otherwise freeze is exactly what must not happen.
+        fn stage_cpu_tensor(
+            &self,
+            bytes: &[u8],
+            recording: bool,
+        ) -> Result<u64, SessionError> {
+            if bytes.is_empty() {
+                return Err(SessionError::Runtime("empty staged tensor".into()));
+            }
+            let mut stage = self.cpu_stage.lock().unwrap_or_else(|p| p.into_inner());
+            let offset = align_up_usize(stage.cursor, CPU_STAGE_ALIGNMENT);
+            let end=offset.checked_add(bytes.len()).ok_or_else(||SessionError::Runtime("CPU stage overflow".into()))?;
+            if end > stage.capacity {
+                if recording {
+                    return Err(SessionError::Runtime(
+                        "CPU staging capacity exceeded during a record pass".into(),
+                    ));
+                }
+                let capacity = end.checked_mul(2).ok_or_else(||SessionError::Runtime("CPU staging size overflow".into()))?.max(CPU_STAGE_INITIAL_BYTES);
+                let buffer = self.gpu.alloc_buffer(capacity)?;
+                if let Some(previous) = stage.buffer.replace(buffer) {
+                    // An earlier kernel in this pass may still read the old block.
+                    stage.retired.push(previous);
+                }
+                stage.base = stage
+                    .buffer
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::handle);
+                stage.capacity = capacity;
+            }
+            stage.cursor = end;
+            let slot = StageSlot {
+                offset,
+                len: bytes.len(),
+                hash: fnv1a64(bytes),
+                address: stage.base + offset as u64,
+            };
+            if recording {
+                // The plain pass that ran immediately before this one staged the
+                // same tensor from the same shape and weights. A different hash
+                // means the value depends on the pixels, and a captured graph
+                // would freeze the first image's value into every later call.
+                let expected = stage.committed.get(stage.current.len()).copied();
+                stage.current.push(slot);
+                if !expected.is_some_and(|old| (old.offset,old.len,old.hash)==(slot.offset,slot.len,slot.hash)) {
+                    return Err(SessionError::Runtime(
+                        "cpu-evaluated tensor is not shape-stable across passes".into(),
+                    ));
+                }
+                // An earlier block can still live in the previous page after growth.
+                return Ok(expected.expect("verified staged block").address);
+            }
+            stage.current.push(slot);
+            let buffer = stage
+                .buffer
+                .as_ref()
+                .ok_or_else(|| SessionError::Runtime("CPU staging buffer missing".into()))?;
+            self.gpu.upload_buffer_at(buffer, offset, bytes)?;
+            Ok(stage.base + offset as u64)
+        }
+
+        /// Publishes the block layout of a completed non-recording pass so the
+        /// next record pass can prove it reproduces the same bytes.
+        fn commit_cpu_stage(&self) {
+            let mut stage = self.cpu_stage.lock().unwrap_or_else(|p| p.into_inner());
+            stage.committed = stage.current.clone();
+        }
+
         /// Execute the compiled graph with named `f32` inputs and return all
         /// graph outputs as `(name -> Vec<f32>)`.
-        pub fn run_f32<'a>(
-            &'a self,
+        ///
+        /// Once a static graph has been captured and verified, this call costs
+        /// `H2D(input) -> cuGraphLaunch -> stream sync -> D2H(output)` instead of
+        /// one kernel launch per node. Every path that cannot be captured keeps
+        /// the ordinary execution below, and the reason is recorded in
+        /// [`Self::graph_status`] rather than returned as an error.
+        pub fn run_f32(
+            &self,
             inputs: &HashMap<String, (&[f32], Vec<usize>)>,
         ) -> Result<HashMap<String, (Vec<f32>, Vec<usize>)>, SessionError> {
-            let gpu = self.conv.nvidia();
+            let _guard = self.run_gate.lock().unwrap_or_else(|p| p.into_inner());
+            for &tid in &self.plan.graph.inputs {
+                let info = &self.plan.graph.tensors[tid.0];
+                let (values, shape) = inputs.get(&info.name).ok_or_else(|| SessionError::Runtime(format!("missing input {}", info.name)))?;
+                if shape.iter().try_fold(1usize, |a, &b| a.checked_mul(b)) != Some(values.len())
+                    || info.static_shape().is_some_and(|expected| expected != *shape) {
+                    return Err(SessionError::Runtime(format!("input {} does not match the compiled shape or element count", info.name)));
+                }
+            }
+            if let Some(replayed) = self.try_replay(inputs) {
+                return Ok(replayed);
+            }
+            let gpu = self.gpu;
             let graph = &self.plan.graph;
 
             // Runtime tensor bindings: TensorId -> (device_ptr, shape, dtype).
@@ -268,7 +527,7 @@ mod imp {
                 self.weight_ptrs.clone();
             let mut cpu_tensors: HashMap<TensorId, CpuTensor> = self.static_cpu_tensors.clone();
             // Per-run allocations for graph inputs, graph outputs, and dynamic/non-arena tensors.
-            let mut run_bufs: Vec<DeviceBuffer<'a>> = Vec::new();
+            let mut run_bufs: Vec<DeviceBuffer<'static>> = Vec::new();
 
             // 1. Upload graph inputs.
             for &in_id in &graph.inputs {
@@ -304,6 +563,7 @@ mod imp {
             for &out_id in &graph.outputs {
                 if let Some(sh) = graph.tensors[out_id.0].static_shape() {
                     let elem_bytes = graph.tensors[out_id.0].dtype.byte_size().unwrap_or(4);
+                    let elem_bytes = elem_bytes.max(4); // promoted floats may have a 16-bit ONNX declaration
                     let bytes = numel(&sh).max(1) * elem_bytes;
                     let buf = gpu.alloc_buffer(bytes)?;
                     let ptr = buf.handle();
@@ -314,22 +574,29 @@ mod imp {
 
             // 2. Execute nodes in topological order.
             let use_arena = std::env::var("AURORA_NATIVE_NO_ARENA").ok().as_deref() != Some("1");
+            self.reset_cpu_stage();
             self.exec_graph(
                 graph,
                 use_arena,
+                false,
                 &output_ids,
                 &mut gpu_tensors,
                 &mut cpu_tensors,
                 &mut run_bufs,
             )?;
+            // Publish the staged-CPU layout: a later record pass must reproduce it.
+            self.commit_cpu_stage();
 
             // 3. Download all graph outputs.
             let mut results = HashMap::with_capacity(graph.outputs.len());
             for &out_id in &graph.outputs {
                 let info = &graph.tensors[out_id.0];
-                let (ptr, shape, _dt) = gpu_tensors.get(&out_id).ok_or_else(|| {
+                let (ptr, shape, actual_type) = gpu_tensors.get(&out_id).ok_or_else(|| {
                     SessionError::Runtime(format!("graph output '{}' was not produced", info.name))
                 })?;
+                if *actual_type != DataType::Float {
+                    return Err(SessionError::Runtime(format!("run_f32 cannot return {:?} output {}", actual_type, info.name)));
+                }
                 let count = numel(shape);
                 let mut host = vec![0.0f32; count];
                 if count > 0 {
@@ -344,25 +611,243 @@ mod imp {
                 }
                 results.insert(info.name.clone(), (host, shape.clone()));
             }
+            // The plain run just produced the authoritative result, so a capture
+            // attempt can only add speed: it is verified against `results` and
+            // dropped on any doubt.
+            self.maybe_capture(inputs, &results);
             Ok(results)
         }
 
-        fn exec_graph<'a>(
-            &'a self,
+        /// State of the static-graph path for logs, benchmarks and tests.
+        pub fn graph_status(&self) -> cuda_graph::GraphStatus {
+            self.graph.status()
+        }
+
+        /// Answers the call from the installed graph when it matches this shape.
+        fn try_replay(
+            &self,
+            inputs: &HashMap<String, (&[f32], Vec<usize>)>,
+        ) -> Option<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+            if !self.graph.is_enabled() {
+                return None;
+            }
+            let signature =
+                cuda_graph::signature(&self.plan.graph, |name| {
+                    inputs.get(name).map(|(_, shape)| shape.clone())
+                })?;
+            match self.graph.run(self.gpu, inputs, &signature) {
+                cuda_graph::SlotRun::Replay(results) => Some(results),
+                cuda_graph::SlotRun::Plain => None,
+            }
+        }
+
+        /// Captures a static graph for this call shape, once per shape.
+        ///
+        /// All failures are swallowed into [`cuda_graph::GraphStatus`]: the
+        /// caller already has a correct result and must not pay for a capture
+        /// that turns out not to be provable.
+        fn maybe_capture(
+            &self,
+            inputs: &HashMap<String, (&[f32], Vec<usize>)>,
+            plain: &HashMap<String, (Vec<f32>, Vec<usize>)>,
+        ) {
+            if !self.graph.is_enabled() {
+                return;
+            }
+            let graph = &self.plan.graph;
+            if let Err(fallback) = cuda_graph::precheck(graph) {
+                self.graph.disable(fallback);
+                return;
+            }
+            // Without the static arena every intermediate tensor is a per-run
+            // allocation, so there are no pointers to replay against.
+            if std::env::var("AURORA_NATIVE_NO_ARENA").ok().as_deref() == Some("1") {
+                self.graph.disable(cuda_graph::Fallback::NoArena);
+                return;
+            }
+            let Some(signature) = cuda_graph::signature(graph, |name| {
+                inputs.get(name).map(|(_, shape)| shape.clone())
+            }) else {
+                self.graph.disable(cuda_graph::Fallback::Unsupported(
+                    "an input of this call is missing from the signature".into(),
+                ));
+                return;
+            };
+            if !self.graph.begin_capture(&signature) {
+                return;
+            }
+            match self.capture_static_graph(&signature, inputs, plain) {
+                Ok((static_graph, verify_max_abs)) => {
+                    self.graph.install(static_graph, verify_max_abs)
+                }
+                Err(fallback) => self.graph.disable(fallback),
+            }
+        }
+
+        /// One record pass over the compiled graph, then a replay checked against
+        /// the result the plain path just produced.
+        fn capture_static_graph(
+            &self,
+            signature: &cuda_graph::InputSignature,
+            inputs: &HashMap<String, (&[f32], Vec<usize>)>,
+            plain: &HashMap<String, (Vec<f32>, Vec<usize>)>,
+        ) -> Result<(cuda_graph::StaticGraph, f32), cuda_graph::Fallback> {
+            let graph = &self.plan.graph;
+            let gpu = self.gpu;
+
+            // The plain path mirrors small inputs on the host. A recorded kernel
+            // could bake a scalar derived from those values into its arguments.
+            if graph.inputs.iter().any(|id| inputs.get(&graph.tensors[id.0].name)
+                .is_some_and(|(v, _)| v.len() <= DEFAULT_MAX_CPU_TENSOR_ELEMS)) {
+                return Err(cuda_graph::Fallback::Unsupported("runtime input may be folded on the host".into()));
+            }
+            if graph.outputs.iter().any(|id| graph.tensors[id.0].dtype != DataType::Float) {
+                return Err(cuda_graph::Fallback::Unsupported("replay downloads float32 outputs only".into()));
+            }
+
+            // 1. Every pointer the graph will name is allocated here and owned by
+            //    the `StaticGraph` until it is replaced or the session drops.
+            let mut graph_inputs = Vec::with_capacity(graph.inputs.len());
+            for &in_id in &graph.inputs {
+                let info = &graph.tensors[in_id.0];
+                let (values, shape) = inputs.get(&info.name).ok_or_else(|| {
+                    cuda_graph::Fallback::Unsupported(format!(
+                        "input '{}' is not supplied by the call",
+                        info.name
+                    ))
+                })?;
+                let buffer = gpu
+                    .alloc_buffer((values.len() * 4).max(4))
+                    .map_err(cuda_graph::Fallback::from)?;
+                graph_inputs.push(cuda_graph::GraphInput {
+                    name: info.name.clone(),
+                    shape: shape.clone(),
+                    bytes: values.len() * 4,
+                    upload: gpu.alloc_pinned((values.len() * 4).max(4)).map_err(cuda_graph::Fallback::from)?,
+                    buffer,
+                });
+            }
+            let mut graph_outputs = Vec::with_capacity(graph.outputs.len());
+            for &out_id in &graph.outputs {
+                let info = &graph.tensors[out_id.0];
+                let shape = info.static_shape().ok_or_else(|| {
+                    cuda_graph::Fallback::DynamicShape(info.name.clone())
+                })?;
+                let element_bytes = info.dtype.byte_size().unwrap_or(4);
+                let buffer = gpu
+                    .alloc_buffer((numel(&shape) * element_bytes).max(4))
+                    .map_err(cuda_graph::Fallback::from)?;
+                let values = numel(&shape);
+                graph_outputs.push(cuda_graph::GraphOutput {
+                    name: info.name.clone(),
+                    shape,
+                    values,
+                    buffer,
+                });
+            }
+
+            // 2. Bind the graph exactly as this call sees it: weights, the fixed
+            //    input/output buffers and the static arena.
+            let mut gpu_tensors: HashMap<TensorId, (u64, Vec<usize>, DataType)> =
+                self.weight_ptrs.clone();
+            let mut cpu_tensors: HashMap<TensorId, CpuTensor> = self.static_cpu_tensors.clone();
+            for (&in_id, input) in graph.inputs.iter().zip(&graph_inputs) {
+                gpu_tensors.insert(
+                    in_id,
+                    (input.buffer.handle(), input.shape.clone(), DataType::Float),
+                );
+            }
+            // Mirror the plain path's small-input CPU mirrors, so both passes take
+            // the same branch for every node: a node that the plain run evaluates
+            // on the CPU must not become a GPU node only inside the recording.
+            for (&in_id, input) in graph.inputs.iter().zip(&graph_inputs) {
+                let Some((values, _)) = inputs.get(&input.name) else {
+                    continue;
+                };
+                if values.len() <= DEFAULT_MAX_CPU_TENSOR_ELEMS
+                    && let Ok(tensor) = CpuTensor::from_f32(input.shape.clone(), values.to_vec())
+                {
+                    cpu_tensors.insert(in_id, tensor);
+                }
+            }
+            let mut output_ids: HashMap<TensorId, (u64, Vec<usize>)> =
+                HashMap::with_capacity(graph_outputs.len());
+            for (&out_id, output) in graph.outputs.iter().zip(&graph_outputs) {
+                output_ids.insert(out_id, (output.buffer.handle(), output.shape.clone()));
+            }
+
+            // 3. Record. Nothing executes; a readback, an upload or an allocation
+            //    between two nodes flags the pass and drops the recording.
+            let recording = cuda_graph::Recording::begin()?;
+            let mut run_bufs = Vec::new();
+            self.reset_cpu_stage();
+            let executed = self.exec_graph(
+                graph,
+                true,
+                true,
+                &output_ids,
+                &mut gpu_tensors,
+                &mut cpu_tensors,
+                &mut run_bufs,
+            );
+            if let Some(what) = recording.violation() {
+                return Err(cuda_graph::Fallback::for_violation(what));
+            }
+            executed.map_err(|error| cuda_graph::Fallback::RecordFailed(error.to_string()))?;
+            if !run_bufs.is_empty() {
+                return Err(cuda_graph::Fallback::Allocation(
+                    "per-run buffer allocated during the record pass",
+                ));
+            }
+            // A view/identity may bind an output name to its source instead of
+            // writing the fixed IO buffer. Never replay an uninitialised output.
+            for (&id, out) in graph.outputs.iter().zip(&graph_outputs) {
+                if gpu_tensors.get(&id).map(|tensor| tensor.0) != Some(out.buffer.handle()) {
+                    return Err(cuda_graph::Fallback::Unsupported("graph output aliases another tensor".into()));
+                }
+            }
+            let exec = recording.finish()?;
+
+            // 4. Replay once on the dedicated stream and prove it against the
+            //    plain result before the graph is allowed to serve a call.
+            let stream = gpu
+                .create_stream()
+                .map_err(cuda_graph::Fallback::from)?;
+            let mut static_graph = cuda_graph::StaticGraph::new(
+                exec,
+                stream,
+                signature.clone(),
+                graph_inputs,
+                graph_outputs,
+            );
+            let replayed = static_graph
+                .launch(gpu, inputs)
+                .map_err(|error| cuda_graph::Fallback::LaunchFailed(format!("{error:?}")))?;
+            let verify_max_abs =
+                cuda_graph::compare_outputs(plain, &replayed, cuda_graph::VERIFY_TOLERANCE)?;
+            Ok((static_graph, verify_max_abs))
+        }
+
+        fn exec_graph(
+            &self,
             graph: &IrGraph,
             use_arena: bool,
+            recording: bool,
             output_ids: &HashMap<TensorId, (u64, Vec<usize>)>,
             gpu_tensors: &mut HashMap<TensorId, (u64, Vec<usize>, DataType)>,
             cpu_tensors: &mut HashMap<TensorId, CpuTensor>,
-            run_bufs: &mut Vec<DeviceBuffer<'a>>,
+            run_bufs: &mut Vec<DeviceBuffer<'static>>,
         ) -> Result<(), SessionError> {
-            let gpu = self.conv.nvidia();
+            let gpu = self.gpu;
+            // Staged CPU-evaluated tensors are bump-allocated from a fixed base in
+            // graph order, so every pass over the same graph reproduces the layout.
+            // The top-level call owns the bump cursor. If branches retain parent slots.
 
             // Helper: resolve output device pointer for `tid` (arena if planned, else output/dynamic buf).
             let alloc_out = |tid: TensorId,
                              shape: &[usize],
                              dtype: DataType,
-                             run_bufs: &mut Vec<DeviceBuffer<'a>>|
+                             run_bufs: &mut Vec<DeviceBuffer<'static>>|
              -> Result<u64, SessionError> {
                 if let Some(&(ptr, _)) = output_ids.get(&tid) {
                     return Ok(ptr);
@@ -554,13 +1039,24 @@ mod imp {
                     };
                     if let Ok(ct) = cpu_res {
                         if let Some(Some(out_id)) = node.outputs.first() {
+                            // A `Constant` payload was already uploaded with the
+                            // weights. Re-uploading it would allocate a fresh
+                            // device buffer on every call, which costs a
+                            // `cuMemAlloc` + H2D per run and gives a captured
+                            // graph a pointer that dies with the call.
+                            if matches!(node.op, Op::Constant { .. })
+                                && gpu_tensors.get(out_id).is_some_and(|(_, shape, dtype)| {
+                                    shape.as_slice() == ct.shape.as_slice()
+                                        && *dtype == ct.data.dtype()
+                                })
+                            {
+                                cpu_tensors.insert(*out_id, ct);
+                                continue;
+                            }
                             // Also mirror small F32/I64/Bool constants to GPU if needed by downstream GPU ops.
                             if let CpuData::F32(ref v) = ct.data {
                                 if !v.is_empty() {
-                                    let buf = gpu.alloc_buffer(v.len() * 4)?;
-                                    gpu.upload_buffer(&buf, f32_as_bytes(v))?;
-                                    let ptr = buf.handle();
-                                    run_bufs.push(buf);
+                                    let ptr = self.stage_cpu_tensor(f32_as_bytes(v), recording)?;
                                     gpu_tensors.insert(*out_id, (ptr, ct.shape.clone(), DataType::Float));
                                 }
                             } else if let CpuData::I64(ref v) = ct.data {
@@ -571,19 +1067,13 @@ mod imp {
                                             std::mem::size_of_val(v.as_slice()),
                                         )
                                     };
-                                    let buf = gpu.alloc_buffer(bytes.len())?;
-                                    gpu.upload_buffer(&buf, bytes)?;
-                                    let ptr = buf.handle();
-                                    run_bufs.push(buf);
+                                    let ptr = self.stage_cpu_tensor(bytes, recording)?;
                                     gpu_tensors.insert(*out_id, (ptr, ct.shape.clone(), DataType::Int64));
                                 }
                             } else if let CpuData::Bool(ref v) = ct.data {
                                 if !v.is_empty() {
                                     let bytes: Vec<u8> = v.iter().map(|&b| u8::from(b)).collect();
-                                    let buf = gpu.alloc_buffer(bytes.len())?;
-                                    gpu.upload_buffer(&buf, &bytes)?;
-                                    let ptr = buf.handle();
-                                    run_bufs.push(buf);
+                                    let ptr = self.stage_cpu_tensor(&bytes, recording)?;
                                     gpu_tensors.insert(*out_id, (ptr, ct.shape.clone(), DataType::Bool));
                                 }
                             }
@@ -838,7 +1328,7 @@ mod imp {
                             &x_sh,
                             &w_sh,
                             attrs,
-                            FusedActivation::None,
+                            self.plan.conv_activations.get(&node.id).copied().unwrap_or(FusedActivation::None),
                         )?;
                         let out_sh = vec![params.batch, params.c_out, params.out_h, params.out_w];
                         let out_id = req_out_id(0)?;
@@ -1130,6 +1620,8 @@ mod imp {
                         gpu_tensors.insert(out_id, (y_ptr, x_sh, DataType::Float));
                     }
                     Op::Relu
+                    | Op::Gelu
+                    | Op::SiLU
                     | Op::Sigmoid
                     | Op::Erf
                     | Op::Sqrt
@@ -1144,6 +1636,8 @@ mod imp {
                         let (x_ptr, x_sh, _) = req_gpu(0)?;
                         let (uop, p0, p1) = match node.op {
                             Op::Relu => (UnaryOp::Relu, 0.0, 0.0),
+                            Op::Gelu => (UnaryOp::Gelu, 0.0, 0.0),
+                            Op::SiLU => (UnaryOp::SiLU, 0.0, 0.0),
                             Op::Sigmoid => (UnaryOp::Sigmoid, 0.0, 0.0),
                             Op::Erf => (UnaryOp::Erf, 0.0, 0.0),
                             Op::Sqrt => (UnaryOp::Sqrt, 0.0, 0.0),
@@ -1201,9 +1695,20 @@ mod imp {
                             // while rounding through IEEE FP16 on GPU to preserve exact FP16 semantics.
                             let y_ptr = alloc_out(out_id, &x_sh, DataType::Float, run_bufs)?;
                             if total > 0 {
-                                let tmp_f16 = gpu.alloc_buffer(total.max(1) * 2)?;
-                                let tmp_ptr = tmp_f16.handle();
-                                run_bufs.push(tmp_f16);
+                                // The load-time staging buffer keeps the pointer
+                                // stable so the two casts can live in a graph; a
+                                // dynamic shape that outgrew it still gets its own.
+                                let tmp_ptr = match self.f16_scratch.as_ref() {
+                                    Some(buffer) if self.f16_scratch_elems >= total => {
+                                        buffer.handle()
+                                    }
+                                    _ => {
+                                        let scratch = gpu.alloc_buffer(total.max(1) * 2)?;
+                                        let ptr = scratch.handle();
+                                        run_bufs.push(scratch);
+                                        ptr
+                                    }
+                                };
                                 self.elem.cast_f32_to_f16(x_ptr, tmp_ptr, total)?;
                                 self.elem.cast_f16_to_f32(tmp_ptr, y_ptr, total)?;
                             }
@@ -1227,14 +1732,25 @@ mod imp {
                                     self.elem.cast_f32_to_i64(x_ptr, y_ptr, total)?;
                                 }
                                 (DataType::Bool, DataType::Float) => {
-                                    let d_one = gpu.alloc_buffer(4)?;
-                                    let d_zero = gpu.alloc_buffer(4)?;
-                                    gpu.upload_buffer(&d_one, f32_as_bytes(&[1.0f32]))?;
-                                    gpu.upload_buffer(&d_zero, f32_as_bytes(&[0.0f32]))?;
-                                    let one_ptr = d_one.handle();
-                                    let zero_ptr = d_zero.handle();
-                                    run_bufs.push(d_one);
-                                    run_bufs.push(d_zero);
+                                    // The scalar operands are load-time constants;
+                                    // a per-run allocation would break capture.
+                                    let (one_ptr, zero_ptr) =
+                                        match (self.const_one.as_ref(), self.const_zero.as_ref())
+                                        {
+                                            (Some(one), Some(zero)) => {
+                                                (one.handle(), zero.handle())
+                                            }
+                                            _ => {
+                                                let one = gpu.alloc_buffer(4)?;
+                                                let zero = gpu.alloc_buffer(4)?;
+                                                gpu.upload_buffer(&one, f32_as_bytes(&[1.0f32]))?;
+                                                gpu.upload_buffer(&zero, f32_as_bytes(&[0.0f32]))?;
+                                                let ptrs = (one.handle(), zero.handle());
+                                                run_bufs.push(one);
+                                                run_bufs.push(zero);
+                                                ptrs
+                                            }
+                                        };
                                     self.elem.where_broadcast_f32(
                                         x_ptr,
                                         &x_sh,
@@ -1906,6 +2422,7 @@ mod imp {
                         self.exec_graph(
                             branch,
                             false,
+                            recording,
                             &empty_out_ids,
                             &mut sub_gpu,
                             &mut sub_cpu,
@@ -1962,17 +2479,8 @@ mod imp {
         #[test]
         #[ignore = "requires shipped ONNX models on disk and NVIDIA CUDA GPU"]
         fn run_real_shipped_models_end_to_end_native_cuda() {
-            let root = match std::env::var_os("AURORA_MODELS_DIR") {
-                Some(v) => PathBuf::from(v),
-                None => {
-                    eprintln!("set AURORA_MODELS_DIR to the models directory");
-                    return;
-                }
-            };
-            if !root.is_dir() {
-                eprintln!("models dir missing: {}", root.display());
-                return;
-            }
+            let root = PathBuf::from(std::env::var_os("AURORA_MODELS_DIR").expect("set AURORA_MODELS_DIR for the full 19-model smoke suite"));
+            assert!(root.is_dir(), "model directory missing: {}", root.display());
             let cases: &[(&str, &str, &[usize])] = &[
                 (r"landmark\assets\1063025060.onnx", "3070435246", &[1, 3, 64, 64]),
                 (r"landmark\assets\323773030.onnx", "t1511", &[1, 3, 160, 160]),
@@ -1987,6 +2495,9 @@ mod imp {
                 (r"AIModels\Common\PeopleMasking\skinMasking.onnx", "input_29", &[1, 512, 512, 3]),
                 (r"AIModels\Common\SubjectMasking\subjectMasking.onnx", "x", &[1, 3, 320, 320]),
                 (r"AIModels\Common\MatchLook\MatchLookBrightness.onnx", "input.1", &[1, 3, 384, 384]),
+                (r"AIModels\Common\MatchLook\MatchLookBw.onnx", "input.1", &[1, 3, 224, 224]),
+                (r"AIModels\Common\MatchLook\MatchLookColor.onnx", "input.1", &[1, 3, 384, 384]),
+                (r"AIModels\Common\MatchLook\MatchLookExp.onnx", "input.1", &[1, 3, 384, 384]),
                 (r"AIModels\Common\FaceDetection\faceDetection.onnx", "input", &[1, 3, 320, 320]),
                 (r"AIModels\Common\SamEncoder\eSamEncoderPreUInt8.onnx", "input_image", &[1024, 1024, 3]),
             ];
@@ -1995,6 +2506,7 @@ mod imp {
             for &(rel, input_name, shape) in cases {
                 let path = root.join(rel);
                 if !path.is_file() {
+                    eprintln!("[MISSING] {rel}");
                     continue;
                 }
                 let bytes = std::fs::read(&path).expect("read onnx");
@@ -2089,7 +2601,7 @@ mod imp {
                                 }
                                 eprintln!(
                                     "[PASS] {:<32} load={:6.1}ms arena={:6.2}MiB infer={:6.2}ms | {}",
-                                    r"AIModels\Common\SAM\eSamDecoder.onnx",
+                                    r"AIModels\Common\SamDecoder\eSamDecoder.onnx",
                                     load_ms,
                                     session.arena_peak_bytes() as f64 / (1024.0 * 1024.0),
                                     ms,
@@ -2103,7 +2615,127 @@ mod imp {
                     Err(e) => eprintln!("[LOAD-ERR] eSamDecoder.onnx: {e}"),
                 }
             }
-            assert!(passed >= 5, "expected at least 5 real models to run end-to-end, got {passed}");
+            if !dec_path.is_file() { eprintln!("[MISSING] eSamDecoder.onnx"); }
+            let expected = cases.len() + 1;
+            eprintln!("=== SMOKE SUMMARY: {passed}/{expected} ===");
+            assert_eq!(expected, 19, "shipped manifest drift");
+            assert_eq!(passed, expected, "incomplete native end-to-end smoke suite");
+        }
+
+        /// A/B proof that graph replay reproduces the plain path, with the
+        /// per-model capture verdict.
+        ///
+        /// The comparison is two-sided on purpose: the first call runs the plain
+        /// path and captures, the second call is answered by the replay, and both
+        /// are checked against a session that ran with the feature switched off.
+        ///
+        /// Mutates `AURORA_NATIVE_CUDA_GRAPH` for the whole process, so run it
+        /// alone:
+        /// `cargo test -p aurora-portrait --lib native_infer::session::imp::tests::graph_replay_matches_the_plain_path_on_shipped_models -- --ignored --test-threads=1 --nocapture`
+        #[test]
+        #[ignore = "requires shipped ONNX models on disk and NVIDIA CUDA GPU"]
+        fn graph_replay_matches_the_plain_path_on_shipped_models() {
+            let root = match std::env::var_os("AURORA_MODELS_DIR") {
+                Some(v) => PathBuf::from(v),
+                None => {
+                    eprintln!("set AURORA_MODELS_DIR to the models directory");
+                    return;
+                }
+            };
+            let cases: &[(&str, &str, &[usize])] = &[
+                (r"AIModels\Common\FaceMesh\faceMesh.onnx", "input_12", &[1, 3, 256, 256]),
+                (r"AIModels\Common\Rotation\autoRotation.onnx", "conv2d_input", &[1, 384, 384, 1]),
+                (r"landmark\assets\323773030.onnx", "t1511", &[1, 3, 160, 160]),
+                (r"AIModels\Common\BlemishRemoval\blemishRemoval.onnx", "input.1", &[1, 3, 278, 278]),
+                (r"AIModels\Common\PeopleMasking\skinMasking.onnx", "input_29", &[1, 512, 512, 3]),
+                (r"AIModels\Common\SubjectMasking\subjectMasking.onnx", "x", &[1, 3, 320, 320]),
+                (r"AIModels\Common\MatchLook\MatchLookColor.onnx", "input.1", &[1, 3, 384, 384]),
+                (r"AIModels\Common\FaceDetection\faceDetection.onnx", "input", &[1, 3, 320, 320]),
+                (r"AIModels\Common\SamEncoder\eSamEncoderPreUInt8.onnx", "input_image", &[1024, 1024, 3]),
+            ];
+
+            let mut present = 0usize;
+            let mut captured = 0usize;
+            let mut replayed = 0usize;
+            for &(rel, input_name, shape) in cases {
+                let path = root.join(rel);
+                if !path.is_file() {
+                    eprintln!("[MISSING] {rel}");
+                    continue;
+                }
+                present += 1;
+                let bytes = std::fs::read(&path).expect("read onnx");
+                let mut overrides = HashMap::new();
+                overrides.insert(input_name.to_string(), shape.to_vec());
+                let count = numel(shape);
+                let values: Vec<f32> = (0..count)
+                    .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+                    .collect();
+                let mut inputs = HashMap::new();
+                inputs.insert(input_name.to_string(), (values.as_slice(), shape.to_vec()));
+
+                // Reference: the same model with the feature switched off.
+                // SAFETY: the repository runs its suite with `--test-threads=1`,
+                // which this test documents in its own invocation line.
+                unsafe { std::env::set_var(cuda_graph::SWITCH_ENV, "0") };
+                let plain = NativeCudaSession::from_bytes(&bytes, &overrides).expect("plain session");
+                assert_eq!(
+                    plain.graph_status(),
+                    cuda_graph::GraphStatus::default(),
+                    "{rel}: the switch did not turn capture off"
+                );
+                let expected = plain.run_f32(&inputs).expect("plain run");
+                let changed = values.iter().map(|&v| 0.23 - v * 0.67).collect::<Vec<_>>();
+                let changed_inputs = HashMap::from([(input_name.to_string(), (changed.as_slice(), shape.to_vec()))]);
+                let expected_changed = plain.run_f32(&changed_inputs).expect("second plain input");
+                drop(plain);
+
+                unsafe { std::env::set_var(cuda_graph::SWITCH_ENV, "1") };
+                let session =
+                    NativeCudaSession::from_bytes(&bytes, &overrides).expect("graph session");
+                let capture_started = Instant::now();
+                let first = session.run_f32(&inputs).expect("first run");
+                let first_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
+                cuda_graph::compare_outputs(&expected, &first, cuda_graph::VERIFY_TOLERANCE)
+                    .expect("the plain path changed");
+                let after_capture = session.graph_status();
+
+                let replay_started = Instant::now();
+                let replay = session.run_f32(&inputs).expect("replay run");
+                let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
+                let max_abs = cuda_graph::compare_outputs(
+                    &expected,
+                    &replay,
+                    cuda_graph::VERIFY_TOLERANCE,
+                )
+                .unwrap_or_else(|fallback| {
+                    panic!("{rel}: replay diverged from the plain path: {fallback}")
+                });
+                let after_replay = session.graph_status();
+                let changed_replay = session.run_f32(&changed_inputs).expect("replay with different pixels");
+                cuda_graph::compare_outputs(&expected_changed, &changed_replay, cuda_graph::VERIFY_TOLERANCE)
+                    .unwrap_or_else(|error| panic!("{rel}: stale pixels on second input: {error}"));
+                if after_capture.active {
+                    captured += 1;
+                }
+                if after_replay.replays > 0 {
+                    replayed += 1;
+                }
+                assert!(
+                    !after_capture.active || after_replay.replays == 1,
+                    "{rel}: an active graph did not serve the second call"
+                );
+                eprintln!(
+                    "[GRAPH] {:<42} nodes={:4} first={:7.2}ms replay={:7.2}ms max_abs={max_abs:.3e} | {}",
+                    rel, after_capture.nodes, first_ms, replay_ms, after_replay.summary()
+                );
+            }
+            unsafe { std::env::remove_var(cuda_graph::SWITCH_ENV) };
+            assert!(present > 0 && replayed > 0, "no real model was replayed");
+            eprintln!(
+                "=== GRAPH A/B: {captured} captured, {replayed} replayed of {} models ===",
+                cases.len()
+            );
         }
     }
 }

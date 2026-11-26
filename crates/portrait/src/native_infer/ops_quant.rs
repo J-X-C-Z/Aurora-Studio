@@ -15,12 +15,32 @@ use crate::cuda::Nvidia;
 use std::ffi::c_void;
 
 /// Embedded PTX compiled from `native/cuda/infer_quant_int8.cu` (`-arch=compute_75`).
+///
+/// `matmul_integer_u8_to_i32` and `conv_integer_u8_to_i32` run on `dp4a.u32.u32`
+/// (4 int8 MACs per instruction) with the zero-point linear term folded out of
+/// the inner loop; results are bit-identical to the previous scalar kernels.
 pub const QUANT_INT8_PTX: &str = include_str!("../../native/cuda/infer_quant_int8.ptx");
 
 pub const KERNEL_DQL_MINMAX: &str = "dynamic_quantize_linear_minmax_f32";
 pub const KERNEL_DQL_APPLY: &str = "dynamic_quantize_linear_apply_f32_to_u8";
 pub const KERNEL_MATMUL_INT_U8: &str = "matmul_integer_u8_to_i32";
 pub const KERNEL_CONV_INT_U8: &str = "conv_integer_u8_to_i32";
+
+/// Output tile edge of `matmul_integer_u8_to_i32` (see `MM_TILE` in the `.cu`).
+pub const MATMUL_TILE: usize = 64;
+
+/// Output channels per block of `conv_integer_u8_to_i32` (see the `oc4` schedule
+/// inside `native/cuda/infer_quant_int8.cu`).
+///
+/// The kernel derives this from `gridDim.y`, so it accepts either this value or
+/// the legacy one-channel-per-block grid; publishing 4 keeps each input byte
+/// fetched once per four output channels instead of once per channel.
+///
+/// The window is blocked *per group*: with `group > 1` a 4-channel window that
+/// straddled a group boundary would feed one output channel the wrong input
+/// channels, so the grid is `N * group * ceil(C_out/group/4)`, not
+/// `N * ceil(C_out/4)`.
+pub const CONV_OC_PER_BLOCK: usize = 4;
 
 /// Optional zero-point device pointer mode for quantized integer kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,8 +354,11 @@ impl QuantInt8Kernels {
         if p.m == 0 || p.n == 0 || batch == 0 {
             return Err(CudaError::Unavailable("MatMulInteger empty output"));
         }
-        let tiles_m = ((p.m + 15) / 16) as u32;
-        let tiles_n = ((p.n + 15) / 16) as u32;
+        // Must stay in sync with `MM_TILE` in `native/cuda/infer_quant_int8.cu`.
+        // The kernel walks 64x64 super-tiles with a grid-stride loop, so a stale
+        // (16-wide) grid here is still correct - it only leaves blocks idle.
+        let tiles_m = ((p.m + (MATMUL_TILE - 1)) / MATMUL_TILE) as u32;
+        let tiles_n = ((p.n + (MATMUL_TILE - 1)) / MATMUL_TILE) as u32;
         let grid = (tiles_m.saturating_mul(tiles_n).max(1), batch);
         let block = (16, 16);
 
@@ -407,8 +430,18 @@ impl QuantInt8Kernels {
         if hw_out == 0 || noc == 0 || p.group == 0 {
             return Err(CudaError::Unavailable("ConvInteger empty output or group=0"));
         }
+        if p.c_in % p.group != 0 || p.c_out % p.group != 0 {
+            return Err(CudaError::Unavailable(
+                "ConvInteger channels not divisible by group",
+            ));
+        }
         let grid_x = ((hw_out + 255) / 256) as u32;
-        let grid_y = noc as u32;
+        // Must stay in sync with `CONV_OC_PER_BLOCK` / the `.cu` schedule: the
+        // kernel detects this geometry from gridDim.y and otherwise falls back to
+        // the legacy one-channel-per-block mapping. Blocking is per group so that
+        // one block's 4-channel window never crosses a group boundary.
+        let oc_blocks = p.c_out.div_ceil(p.group).div_ceil(CONV_OC_PER_BLOCK);
+        let grid_y = (p.n * p.group * oc_blocks) as u32;
         let grid = (grid_x.max(1), grid_y);
         let block = (256, 1);
 
@@ -766,6 +799,9 @@ mod tests {
             ("all_positive", lcg_f32(1024, 202, 1.0, 10.0)),
             ("all_negative", lcg_f32(777, 303, -8.0, -0.5)),
             ("all_zero", vec![0.0; 512]),
+            // With scale = 3 / 255, IEEE division rounds the middle value to 6;
+            // multiplying by a pre-rounded reciprocal incorrectly gives 7.
+            ("reciprocal_tie", vec![0.0, f32::from_bits(0x3d9c_9c9d), 3.0]),
             ("non_multiple_of_256", lcg_f32(1337, 404, -1.25, 1.25)),
         ];
 

@@ -594,15 +594,27 @@ fn fnv1a_hex(value: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Writes bytes to a `.tmp` sibling and renames it over the target, so a
-/// reader never sees a partial file.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+/// Publishes one complete file by renaming a same-directory temporary. Independent
+/// writers (including separate desktop instances) must never share a temporary.
+/// This guarantees atomic visibility, not power-loss durability or conflict merging.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::{ErrorKind, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let tmp = dir.join(format!("{file_name}.tmp"));
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, path) {
+    let (tmp, mut file) = loop {
+        let name = format!(".aurora-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let tmp = dir.join(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating a temporary beside {}", path.display())),
+        }
+    };
+    let written = file.write_all(bytes);
+    drop(file);
+    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
         let _ = fs::remove_file(&tmp);
         return Err(StoreError::Io(e).into());
     }
@@ -806,6 +818,30 @@ mod tests {
         let err = store.save_index(&Catalog::default()).unwrap_err();
         assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::Newer { .. })));
         assert_eq!(fs::read_to_string(&path).unwrap(), newer, "newer catalog is left untouched");
+    }
+
+    #[test]
+    fn atomic_writers_publish_whole_files_without_touching_foreign_temps() {
+        let temp = TempFolder::new();
+        let path = temp.path().join("settings.json");
+        let other = temp.path().join("settings.json.tmp");
+        fs::write(&other, b"not ours").unwrap();
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|s| {
+            for n in 1..=4u8 {
+                let (start, path) = (&start, &path);
+                s.spawn(move || {
+                    let payload = vec![n; 65_536];
+                    start.wait();
+                    for _ in 0..8 { write_atomic(path, &payload).unwrap(); }
+                });
+            }
+        });
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 65_536);
+        assert!(bytes.iter().all(|b| *b == bytes[0]));
+        assert_eq!(fs::read(other).unwrap(), b"not ours");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
     }
 
     #[test]

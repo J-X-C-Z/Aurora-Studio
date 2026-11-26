@@ -17,6 +17,10 @@ pub mod device;
 pub mod eye_bag_alignment;
 pub mod cuda;
 pub mod cuda_job_upload;
+/// AMD/Intel Direct3D 12 compute device layer (Windows only, zero bundled DLLs).
+/// Managed by `native_infer::dx12_session`.
+#[cfg(windows)]
+pub mod dx12;
 pub mod cuda_lut;
 pub mod cuda_pf90021;
 pub mod cuda_pf8050;

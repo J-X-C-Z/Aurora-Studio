@@ -5,6 +5,8 @@
 //! (oriented RGBA16). Embedded PTX is JIT-loaded via system `nvcuda.dll`
 //! through `aurora_portrait::cuda::Nvidia` (zero external DLLs).
 
+#![cfg(windows)] // Also gated at the #[path] module declaration.
+
 use super::{NikonCrop, Stage1Params};
 use aurora_portrait::cuda::{CudaError, Nvidia};
 use aurora_portrait::Refusal;
@@ -12,6 +14,14 @@ use std::ffi::c_void;
 use std::slice;
 
 const PTX: &str = include_str!("../../../../native/cuda/z6iii_raw.ptx");
+
+/// The embedded PTX image, for the startup warmup in
+/// [`crate::aurora_raw::prewarm`]. The first Z6III open used to pay this
+/// module's JIT synchronously; the warmup loads the identical text so the
+/// shared domain already holds it.
+pub(in crate::aurora_raw) fn ptx_image() -> &'static str {
+    PTX
+}
 
 const BLOCK_2D: (u32, u32) = (16, 16);
 const BLOCK_1D: (u32, u32) = (256, 1);
@@ -516,12 +526,11 @@ mod tests {
     fn cuda_vs_opencl_bit_exact_and_bench_real_nef() {
         use std::time::Instant;
 
-        let default_path = std::env::var("USERPROFILE")
-            .map(|p| std::path::PathBuf::from(p).join("Desktop").join("_DSC5673.NEF"))
-            .unwrap();
-        let path = std::env::var("AURORA_TEST_RAW")
-            .map(std::path::PathBuf::from)
-            .unwrap_or(default_path);
+        // A designated golden is identified by the caller, never by a similar body or filename.
+        let golden = std::env::var_os("AURORA_Z6III_GOLDEN_NEF");
+        let path = golden.as_ref().map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("AURORA_TEST_RAW").map(std::path::PathBuf::from))
+            .expect("set AURORA_Z6III_GOLDEN_NEF to the exact reference photo or AURORA_TEST_RAW to another Z6III HE fixture");
         let bytes = std::fs::read(&path).expect("read NEF");
         let exif = crate::exif::parse_exif(&bytes);
         let orientation = crate::raw::exif_orientation_bytes(&bytes).unwrap_or(1);
@@ -602,6 +611,12 @@ mod tests {
             "CUDA pipeline:   {cw}x{ch} route={cuda_route:?} cold={cuda_cold_ms:.1} ms warm={cuda_warm_ms:.1} ms gpu_only(H2D+Compute+D2H)={gpu_only_ms:.1} ms hash={cuda_hash:016x}"
         );
 
+        assert_eq!((_ww, _wh), (cw, ch));
+        assert!(cuda_px == _warm_px, "warm CUDA pixels differ from cold");
+        if golden.is_some() {
+            assert_eq!(ocl_hash, 0xef4057f5335a4ba7, "designated OpenCL golden mismatch");
+            assert_eq!(cuda_hash, 0xef4057f5335a4ba7, "designated CUDA golden mismatch");
+        }
         assert_eq!((cw, ch), (ow, oh));
         assert_eq!(cuda_px.len(), ocl_px.len());
 

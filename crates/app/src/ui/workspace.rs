@@ -86,6 +86,10 @@ impl Focusable for Workspace {
 
 impl Workspace {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let closing = state.downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            closing.update(cx, |s, cx| s.prepare_to_close(cx)).unwrap_or(true)
+        });
         let viewer = cx.new(|cx| Viewer::new(&state, cx));
         let browser = cx.new(|cx| Browser::new(&state, window, cx));
         let menu_bar = AppMenuBar::new(cx);
@@ -274,6 +278,7 @@ impl Workspace {
         el.on_action(cx.listener(|this, _: &Quit, _, cx| {
             // Flush the bounded save queue before quitting; `flush_and_quit`
             // shows an incomplete report before `cx.quit()`.
+            cx.stop_propagation();
             this.state.update(cx, |state, cx| state.flush_and_quit(cx));
         }))
             // Window menu (macOS): GPUI has no built-in minimize/zoom actions.

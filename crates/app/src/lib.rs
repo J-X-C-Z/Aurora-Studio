@@ -3,6 +3,8 @@
 mod actions;
 mod capability;
 mod contract;
+mod diagnostics;
+pub use diagnostics::init as init_diagnostics;
 mod evidence;
 mod i18n;
 mod motion;
@@ -96,20 +98,36 @@ fn import_opened(
 /// Runs the interface on `app`. Desktop builds pass `gpui_kit::application()`;
 /// a mobile host passes `Application::with_platform` over its own platform.
 pub fn run(app: gpui_kit::Application, launch: Launch) {
-    env_logger_init();
+    init_diagnostics();
     let touch = launch.touch || gpui_kit::is_mobile();
     theme::set_touch(touch);
     let args = launch.paths;
     prewarm_in_background();
 
-    // A folder or a Capture One catalog/session given on the command line opens
-    // directly; otherwise the welcome screen offers recent ones (or reopens the
-    // last, if the preferences say so), with the demo images behind it.
-    let target = args.iter().find(|p| p.is_dir() || state::open::is_catalog(p)).cloned().or_else(|| {
-        let settings = state::Settings::load();
-        settings.reopen_last.then(|| settings.recent.first().cloned()).flatten().filter(|p| p.exists())
-    });
     let mut error = None;
+    let mut requests = state::open::requests(&args).unwrap_or_else(|err| {
+        error = Some(format!("{err:#}"));
+        Vec::new()
+    }).into_iter();
+    let first = requests.next();
+    let (target, files) = match first {
+        Some(request) => (Some(request.root), request.photos),
+        None if args.is_empty() => {
+            let settings = state::Settings::load();
+            (settings.reopen_last.then(|| settings.recent.first().cloned()).flatten().filter(|p| p.exists()), vec![])
+        }
+        None => (None, vec![]),
+    };
+    // As in File → Open Folder, distinct libraries have distinct processes and
+    // edit stores. Never import an absolute external path into another catalog.
+    for request in requests {
+        let result = std::env::current_exe().and_then(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            if touch { cmd.arg("--touch"); }
+            cmd.arg(&request.root).args(request.photos).spawn()
+        });
+        if let Err(err) = result { error = Some(format!("{}: {err}", request.root.display())); }
+    }
     let (engine, source) = match &target {
         Some(path) => state::open::open(path).unwrap_or_else(|err| {
             log::error!("cannot open {}: {err}", path.display());
@@ -118,7 +136,6 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
         }),
         None => state::open::demo(),
     };
-    let files: Vec<_> = args.into_iter().filter(|p| p.is_file() && !state::open::is_catalog(p)).collect();
 
     // macOS delivers Finder / Open With / `open -a` paths through
     // `application:openURLs:`, not argv. Register before `run`; URLs that arrive
@@ -154,26 +171,6 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
             }
             theme::init(cx);
             actions::bind_keys(cx, &Default::default());
-            let quit_engine = engine.clone();
-            cx.on_action(move |_: &actions::Quit, cx| {
-                // Bounded close flush: queued saves must not be dropped just
-                // because the window closed. A failure is logged; the
-                // workspace's own Quit handler also shows it in the UI.
-                if let Some(report) =
-                    quit_engine.flush_pending_saves(std::time::Duration::from_secs(2))
-                {
-                    if !report.is_complete() {
-                        log::warn!(
-                            "save queue incomplete at quit: {} saved, {} failed, {} not written, index_error={:?}",
-                            report.saved(),
-                            report.failed(),
-                            report.not_written(),
-                            report.index_error,
-                        );
-                    }
-                }
-                cx.quit();
-            });
             // macOS application-menu actions. They are no-ops elsewhere.
             cx.on_action(|_: &actions::Hide, cx| cx.hide());
             cx.on_action(|_: &actions::HideOthers, cx| cx.hide_other_apps());
@@ -181,6 +178,13 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
             cx.activate(true);
 
             let state = state::init_state(engine.clone(), source.clone(), cx);
+            // The workspace can change its backing engine after launch. Global
+            // Quit (including the application menu) must save the live state.
+            cx.on_action(|_: &actions::Quit, cx| {
+                if let Some(state) = cx.try_global::<state::ActiveLibrary>().map(|g| g.0.clone()) {
+                    let _ = state.update(cx, |s, cx| s.flush_and_quit(cx));
+                }
+            });
             #[cfg(target_os = "macos")]
             {
                 let queued = {
@@ -195,10 +199,27 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
             }
             state.update(cx, |s, cx| {
                 s.open_error = error.clone();
-                // Loose files on the command line are imported into what opened.
-                if !files.is_empty() {
-                    s.welcome = false;
-                    s.import(files.clone(), cx);
+                // The real folder scanner has already indexed the originals. Select
+                // them instead of importing a second copy (or editing a demo image).
+                if !files.is_empty() && s.source != state::Source::Demo {
+                    let mut ids = Vec::new();
+                    let mut absent = Vec::new();
+                    for path in &files {
+                        let direct = s.library.images.iter().find(|i| i.path == *path && !i.trashed);
+                        let found = direct.or_else(|| {
+                            let key = std::fs::canonicalize(path).ok()?;
+                            s.library.images.iter().filter(|i| !i.trashed && i.path.file_name().zip(path.file_name()).is_some_and(|(a,b)| a.eq_ignore_ascii_case(b)))
+                                .find(|i| std::fs::canonicalize(&i.path).ok().as_ref() == Some(&key))
+                        });
+                        if let Some(info) = found { ids.push(info.id); } else { absent.push(path.display().to_string()); }
+                    }
+                    if let Some(&first) = ids.first() {
+                        s.select(first, false, false, cx);
+                        s.library.selection.extend(ids);
+                    }
+                    if !absent.is_empty() {
+                        s.notify(format!("{}: {}", crate::i18n::t("Not in this library", "图库中未找到"), absent.join(", ")), cx);
+                    }
                 }
             });
             if touch {
@@ -210,11 +231,11 @@ pub fn run(app: gpui_kit::Application, launch: Launch) {
 }
 
 fn prewarm_in_background() {
-    if gpui_kit::is_mobile()
-        || std::env::var("AURORA_AI_PREWARM").is_ok_and(|value| value == "0")
-    {
-        return;
-    }
+    if gpui_kit::is_mobile() { return; }
+    // RAW and AI warmup have distinct switches. Loading a driver module in
+    // advance can remove first-click work, but an early click may still race it.
+    aurora_engine::aurora_raw::prewarm::spawn_background();
+    if std::env::var("AURORA_AI_PREWARM").is_ok_and(|value| value == "0") { return; }
     let _ = std::thread::Builder::new()
         .name("aurora-prewarm".into())
         .spawn(|| {
@@ -269,77 +290,3 @@ fn lower_current_thread_priority() {
 
 #[cfg(not(windows))]
 fn lower_current_thread_priority() {}
-
-/// Logs to stderr everywhere. On macOS it also appends to
-/// `~/Library/Logs/Aurora Studio/aurora-studio.log`, because a bundle launched
-/// from Finder has no visible stderr.
-struct Logger {
-    #[cfg(target_os = "macos")]
-    file: std::sync::Mutex<Option<std::fs::File>>,
-}
-
-impl log::Log for Logger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= log::max_level()
-    }
-    fn log(&self, r: &log::Record) {
-        if !self.enabled(r.metadata()) {
-            return;
-        }
-        eprintln!("[{}] {}: {}", r.level(), r.target(), r.args());
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write as _;
-            if let Ok(mut file) = self.file.lock()
-                && let Some(file) = file.as_mut()
-            {
-                let _ = writeln!(file, "[{}] {}: {}", r.level(), r.target(), r.args());
-                let _ = file.flush();
-            }
-        }
-    }
-    fn flush(&self) {
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write as _;
-            if let Ok(mut file) = self.file.lock()
-                && let Some(file) = file.as_mut()
-            {
-                let _ = file.flush();
-            }
-        }
-    }
-}
-
-static LOGGER: Logger = Logger {
-    #[cfg(target_os = "macos")]
-    file: std::sync::Mutex::new(None),
-};
-
-#[cfg(target_os = "macos")]
-fn open_log_file() -> Option<std::fs::File> {
-    let home = std::env::var_os("HOME")?;
-    let dir = std::path::PathBuf::from(home).join("Library/Logs/Aurora Studio");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("aurora-studio.log"))
-        .ok()
-}
-
-fn env_logger_init() {
-    #[cfg(target_os = "macos")]
-    if let Some(file) = open_log_file() {
-        *LOGGER.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
-    }
-    let level = match std::env::var("RUST_LOG").as_deref() {
-        Ok("debug") => log::LevelFilter::Debug,
-        Ok("info") => log::LevelFilter::Info,
-        Ok("error") => log::LevelFilter::Error,
-        _ => log::LevelFilter::Warn,
-    };
-    if log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(level);
-    }
-}

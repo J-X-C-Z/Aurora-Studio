@@ -1,4 +1,4 @@
-//! Reads the shared frontend slider contract (`01_frontend/contracts/params.json`).
+//! Reads the shared frontend slider contract (`docs/frontend-contract/params.json`).
 //!
 //! The contract is the frontend's view of the 72 C1 sliders. It is input data,
 //! not a second catalog: [`compare`] reports where it disagrees with
@@ -131,12 +131,29 @@ mod tests {
     use super::*;
     use crate::param_meta::{MetaSource, by_key, catalog};
 
-    fn contract_path() -> PathBuf {
+    fn public_contract_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .map(|dir| dir.join("01_frontend/contracts/params.json"))
-            .find(|path| path.is_file())
-            .expect("shared params.json above the crate")
+            .join("../../docs/frontend-contract/params.json")
+    }
+
+    fn external_contract_path() -> PathBuf {
+        std::env::var_os("AURORA_LEGACY_PARAM_CONTRACT").map(PathBuf::from)
+            .expect("supply the external 82-item frontend snapshot via AURORA_LEGACY_PARAM_CONTRACT")
+    }
+
+    #[test]
+    fn all_shipped_slider_fields_match_the_engine_catalog() {
+        let contracts = load(&public_contract_path()).expect("shipped 72-slider contract");
+        assert_eq!(contracts.len(), 72);
+        assert_eq!(contracts.len(), catalog().len());
+        assert!(compare(catalog(), &contracts).is_empty(), "key/range/default drift");
+        for c in &contracts {
+            let m = by_key(&c.id).expect("contract key known to engine");
+            assert_eq!(c.name, m.label);
+            assert_eq!(c.step as f32, m.step);
+            assert_eq!(c.decimals, m.decimals);
+            assert_eq!(c.unit, m.unit);
+        }
     }
 
     fn contract(id: &str, min: f64, max: f64, default: f64) -> ParamContract {
@@ -153,8 +170,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "external 82-item snapshot: set AURORA_LEGACY_PARAM_CONTRACT")]
     fn loads_all_82_contracts() {
-        let contracts = load(&contract_path()).unwrap();
+        let contracts = load(&external_contract_path()).unwrap();
         assert_eq!(contracts.len(), 82);
         let exposure = contracts.iter().find(|c| c.id == "Exposure").unwrap();
         assert_eq!(exposure.name, "Exposure");
@@ -167,8 +185,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "external 82-item snapshot: set AURORA_LEGACY_PARAM_CONTRACT")]
     fn compare_against_catalog_is_stable() {
-        let contracts = load(&contract_path()).unwrap();
+        let contracts = load(&external_contract_path()).unwrap();
         let diffs = compare(catalog(), &contracts);
         assert_eq!(diffs.len(), 20);
         assert_eq!(

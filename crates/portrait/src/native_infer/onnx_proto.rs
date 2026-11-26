@@ -383,43 +383,64 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 }
 
 /// IEEE-754 binary32 (FP32) to binary16 (FP16) round-to-nearest-even conversion.
-pub fn f32_to_f16(val: f32) -> u16 {
-    let bits = val.to_bits();
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let frac = bits & 0x007f_ffff;
-
-    if exp == 0xff {
-        // Inf or NaN
-        if frac == 0 {
-            return sign | 0x7c00;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+    if exponent == 0xFF {
+        let payload = if mantissa != 0 {
+            0x200 | ((mantissa >> 13) as u16 & 0x3FF)
+        } else {
+            0
+        };
+        return sign | 0x7C00 | payload;
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
         }
-        return sign | 0x7c00 | ((frac >> 13) as u16).max(1);
+        let mantissa = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut half = (mantissa >> shift) as u16;
+        let round_bit = 1u32 << (shift - 1);
+        if mantissa & round_bit != 0
+            && ((mantissa & (round_bit - 1)) != 0 || half & 1 != 0)
+        {
+            half += 1;
+        }
+        return sign | half;
     }
+    let mut half = (((half_exponent as u32) << 10) as u16) | ((mantissa >> 13) as u16);
+    let round = mantissa & 0x1FFF;
+    if round > 0x1000 || (round == 0x1000 && half & 1 != 0) {
+        half += 1;
+    }
+    sign | half
+}
 
-    let unbiased = exp - 127;
-    if unbiased > 15 {
-        return sign | 0x7c00; // overflow -> Inf
+#[cfg(test)]
+#[test]
+fn fp16_midpoints_round_to_even_on_both_sides_of_every_finite_interval(){
+    for low in 0u16..0x7bff {
+        let hi=low+1;
+        // Every binary16 value and its exact midpoint fit strictly within f32 precision.
+        let left=f16_to_f32(low);let right=f16_to_f32(hi);let m=(left+right)*0.5;
+        for (sign,mask) in [(1.0f32,0u16),(-1.0,0x8000)] {
+            for (x,want) in [(left,low),(f32::from_bits(m.to_bits()-1),low),
+                (m,if low&1==0 {low}else{hi}),(f32::from_bits(m.to_bits()+1),hi),(right,hi)] {
+                assert_eq!(f32_to_f16(sign*x),want|mask,"interval {low:04x}, x={x}, sign={sign}");
+            }
+        }
     }
-    if unbiased < -24 {
-        return sign; // underflow -> 0
-    }
-    if unbiased < -14 {
-        // Subnormal
-        let m = frac | 0x0080_0000;
-        let shift = (-14 - unbiased) as u32 + 13;
-        let half = 1u32 << (shift - 1);
-        let rounded = (m + half) >> shift;
-        return sign | (rounded as u16);
-    }
-
-    let h_exp = ((unbiased + 15) as u16) << 10;
-    let h_frac = (frac + 0x1000) >> 13;
-    if h_frac >= 0x0400 {
-        sign | (h_exp + 0x0400)
-    } else {
-        sign | h_exp | (h_frac as u16)
-    }
+    assert_eq!(f32_to_f16(65520.0),0x7c00);assert_eq!(f32_to_f16(-65520.0),0xfc00);
+    assert_eq!(f32_to_f16(f32::from_bits(0x477f_efff)),0x7bff);
+    assert_eq!(f32_to_f16(-0.),0x8000);
+    assert_ne!(f32_to_f16(f32::NAN)&0x03ff,0);
 }
 
 // ---------------------------------------------------------------------------
