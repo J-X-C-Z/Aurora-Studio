@@ -1,6 +1,8 @@
 # 公共架构 lane 文档索引
 
-本轮目标：把 Aurora Studio 渐进展成模块化单体，先修正确性与可验证性，再建立公共契约与图/注册语义，最后才迁移活跃的渲染实现。所有结论以本副本源码和实际命令为准。
+首次接手先读[代码架构导览](CODEBASE-TOUR.zh-CN.md)，新一轮人像工作的验证边界见[人像 147 交接](PORTRAIT147-HANDOFF.zh-CN.md)。
+
+下表是此前模块化单体的架构决策与迁移记录。它解释设计意图；哪些路径实际接入，仍要以目标分支源码和运行证据为准。
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
@@ -14,16 +16,16 @@
 | [A-BOUNDARY-AUDIT.md](A-BOUNDARY-AUDIT.md) | RAW/平台 cfg、native FFI、mock 渲染迁移清单 | A-boundary |
 | [A-FRONTEND-AUDIT.md](A-FRONTEND-AUDIT.md) | AppState、命令/手势、导出与任务边界 | A-frontend |
 | [ROUND-REPORT-2026-11-25.md](ROUND-REPORT-2026-11-25.md) | 本轮报告 + 2026-11-25 当前已验证状态与套件基线 | 随源码更新 |
-| [REMAINING-GAPS.md](REMAINING-GAPS.md) | 未完成重构、未验证平台/性能、许可证冲突的逐项证据与下一步 | 2026-11-25 |
+| [人像 147 交接](PORTRAIT147-HANDOFF.zh-CN.md) | 当前可交付成果、指定基线、草稿和接手顺序 | 本次交接 |
 
-代码落点（本轮新增，均未接入旧渲染路径）：
+代码落点（有的已接入应用，有的仅提供契约；调用链见导览）：
 
 - `crates/engine/src/contracts/` — Frame/坐标/后端/回执/身份契约（A-core）。
 - `crates/app/src/state/editor.rs` — EditorState/Edit/history 字段（gesture 逻辑仍在 AppState）。
 - `crates/app/src/state/tasks.rs` — AppState 的 TaskCenter（jobs/ids/busy flags）与手势不变量测试。
 - `crates/app/src/state/device.rs` / `preview.rs` / `settings_state.rs` — DeviceState、PreviewState、SettingsState（`settings`/`panels`/`view`/`engine_name`/`capabilities`）。
 - `crates/engine/src/file_engine_services.rs` — FileEngine 的 10 个借用式服务：Catalog/Source/Render/Inference/Capture/Export/Merge/Persistence/Import/Library（trait 方法保留为委托）。
-- `crates/app/src/state/library.rs` — **尚未落地**；LibraryState 仍未拆出（见 REMAINING-GAPS.md）。
+- `crates/app/src/state/library.rs` — `LibraryState` 的库状态与相关数据；交互入口仍由 `AppState` 编排。
 - `crates/engine/src/document.rs` — 文档 vs 运行时输入、指纹、快照与身份 newtype（A-document）；`Geometry`/`LensCorrection` 的运行时字段已从相等性排除。
 - `crates/engine/src/render_plan.rs` — 节点图编译、脏传播、缓存 key（A-graph）。
 - `crates/engine/src/save_report.rs` — 批量保存逐文档结果（A-storage）。

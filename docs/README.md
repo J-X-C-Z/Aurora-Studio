@@ -1,7 +1,6 @@
 # 文档索引
 
-结论以当前源码和实际命令为准。下面的报告多为某一轮工作的快照，行号、计数和
-“已验证”状态都可能已经过时，引用前请对照源码重新确认。
+结论以当前源码和实际命令为准。下面的报告多为某一轮工作的快照，行号、计数和“已验证”状态都可能已经过时，引用前请对照源码重新确认。首次接手先看[代码架构导览](architecture/CODEBASE-TOUR.zh-CN.md)：界面从哪里发请求，预览、RAW、人像、导出和保存分别走哪条路径。
 
 ## 先读这些
 
@@ -14,6 +13,7 @@
 | [architecture/README.md](architecture/README.md) | 模块边界、ADR、迁移映射、架构规则测试 |
 | [architecture/REMAINING-GAPS.md](architecture/REMAINING-GAPS.md) | 未完成重构的接手清单 |
 | [Windows 桌面性能候选 C4](architecture/DESKTOP-C4-REVIEW.zh-CN.md) | 历史性能分支的代码入口、复现命令与未通过的门槛 |
+| [人像 147 交接](architecture/PORTRAIT147-HANDOFF.zh-CN.md) | 哪些可以复用，哪些是草稿，需要哪个上游提交才能继续 |
 
 ## 按主题
 
@@ -25,6 +25,12 @@
 | [../private-assets.md](../private-assets.md) | 不进 Git 的私有资产：目录布局、构建开关、新增流程 |
 | [private-assets.sha256](private-assets.sha256) | 私有资产文件清单与校验和 |
 | [performance-audit-implementation-2026-11-24.md](performance-audit-implementation-2026-11-24.md) | 整体性能审计与落地记录 |
+
+## 独立开发工具
+
+- [EV6 同图对拍](../scripts/ev6/README.md)：像素/ROI/通道误差、热图及合成自测。
+- [Vulkan/WGSL 探针](../scripts/probes/vulkan-wgsl/README.md)：分段、融合和 CPU 参考的合成夹具，独立 Cargo workspace。
+- [原创唇妆 LUT](../examples/portrait-lip-luts/README.md)：两张可再生成的 PNG 与独立校验，不改变安装后的默认素材。
 
 ## 写新文档时
 

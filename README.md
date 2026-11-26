@@ -63,11 +63,14 @@ cargo build -p portrait-app --release --locked
 
 本机 HEIF 导出测试因缺少带 HEVC encoder 的 `libheif.dll` 失败；该用例不计入本版通过项。
 
-版本记录见 [CHANGELOG.md](CHANGELOG.md)。开发边界与验收规范见 [CONTRIBUTING.md](CONTRIBUTING.md)、[AGENTS.md](AGENTS.md)、[前端契约](docs/frontend-contract/engine-requests.md)。
+版本记录见 [CHANGELOG.md](CHANGELOG.md)。开发边界与验收规范见 [CONTRIBUTING.md](CONTRIBUTING.md)、[AGENTS.md](AGENTS.md)、[前端契约](docs/frontend-contract/engine-requests.md)。上文的历史实测不是当前分支或所有设备的验收结论。
 
-## 架构文档
+## 架构与接手
 
 公共架构 lane 的基线、ADR、模块迁移映射、文件所有权与验证记录见
 [`docs/architecture/`](docs/architecture/README.md)，未完成项与接手清单见
-[REMAINING-GAPS.md](docs/architecture/REMAINING-GAPS.md)。Windows 原生 Release、macOS Metal、
-真实模型与性能结论仍未验证。
+[REMAINING-GAPS.md](docs/architecture/REMAINING-GAPS.md)。Windows 原生 Release、macOS Metal、真实模型与性能结论仍以实际运行验证为准。
+
+- [文档索引](docs/README.md)：运行、开发契约、架构决策和工具入口。
+- [代码架构导览](docs/architecture/CODEBASE-TOUR.zh-CN.md)：从打开原片到预览、保存与导出的真实调用路径。
+- [人像 147 交接](docs/architecture/PORTRAIT147-HANDOFF.zh-CN.md)：已验证的独立成果、尚未接入的功能与基线阻塞。
