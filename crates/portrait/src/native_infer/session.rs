@@ -446,11 +446,12 @@ mod imp {
                 };
 
                 match &node.op {
-                    // --- Zero-copy view ops ---
+                    // --- View ops (copy into arena slot to respect arena liveness) ---
                     Op::Identity => {
                         let (p, sh, dt) = req_gpu(0)?;
                         let out_id = req_out_id(0)?;
-                        if let Some(&(optr, _)) = output_ids.get(&out_id) {
+                        let optr = alloc_out(out_id, &sh, dt, &mut run_bufs)?;
+                        if optr != p && numel(&sh) > 0 && dt == DataType::Float {
                             self.spatial.copy_f32(p, optr, numel(&sh))?;
                             gpu_tensors.insert(out_id, (optr, sh, dt));
                         } else {
@@ -498,7 +499,8 @@ mod imp {
                         if let Some(ni) = neg_idx {
                             out_sh[ni] = if known_prod > 0 { total / known_prod } else { 0 };
                         }
-                        if let Some(&(optr, _)) = output_ids.get(&out_id) {
+                        let optr = alloc_out(out_id, &out_sh, dt, &mut run_bufs)?;
+                        if optr != p && numel(&out_sh) > 0 && dt == DataType::Float {
                             self.spatial.copy_f32(p, optr, numel(&out_sh))?;
                             gpu_tensors.insert(out_id, (optr, out_sh, dt));
                         } else {
@@ -533,7 +535,8 @@ mod imp {
                             })
                             .map(|(_, &d)| d)
                             .collect();
-                        if let Some(&(optr, _)) = output_ids.get(&out_id) {
+                        let optr = alloc_out(out_id, &out_sh, dt, &mut run_bufs)?;
+                        if optr != p && numel(&out_sh) > 0 && dt == DataType::Float {
                             self.spatial.copy_f32(p, optr, numel(&out_sh))?;
                             gpu_tensors.insert(out_id, (optr, out_sh, dt));
                         } else {
@@ -569,7 +572,8 @@ mod imp {
                                 src_i += 1;
                             }
                         }
-                        if let Some(&(optr, _)) = output_ids.get(&out_id) {
+                        let optr = alloc_out(out_id, &out_sh, dt, &mut run_bufs)?;
+                        if optr != p && numel(&out_sh) > 0 && dt == DataType::Float {
                             self.spatial.copy_f32(p, optr, numel(&out_sh))?;
                             gpu_tensors.insert(out_id, (optr, out_sh, dt));
                         } else {
@@ -766,7 +770,14 @@ mod imp {
                         let out_id = req_out_id(0)?;
                         let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, &mut run_bufs)?;
                         self.elem
-                            .binary_broadcast_f32(bop, a_ptr, &a_sh, b_ptr, &b_sh, y_ptr)?;
+                            .binary_broadcast_f32(bop, a_ptr, &a_sh, b_ptr, &b_sh, y_ptr)
+                            .map_err(|e| {
+                                SessionError::Runtime(format!(
+                                    "{} '{}' a={a_sh:?} b={b_sh:?}: {e:?}",
+                                    node.op.name(),
+                                    node.name
+                                ))
+                            })?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
                     Op::Equal | Op::Greater | Op::GreaterOrEqual | Op::Less => {

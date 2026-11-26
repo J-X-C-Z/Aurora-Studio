@@ -3186,4 +3186,134 @@ mod tests {
             println!("{model} session provider: {}", session.provider().label());
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires shipped ONNX models, onnxruntime.dll, and NVIDIA CUDA GPU"]
+    fn native_infer_vs_ort_parity_all_shipped_models() {
+        use aurora_portrait::native_infer::session::NativeCudaSession;
+        use std::time::Instant;
+
+        let root = match std::env::var_os("AURORA_MODELS_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => panic!("set AURORA_MODELS_DIR to the models directory"),
+        };
+        let runtime = Runtime::get().expect("ONNX Runtime must be available (set AURORA_ORT_RUNTIME_DIRS)");
+
+        let cases: &[(&str, &str, &[usize], f32)] = &[
+            (r"landmark\assets\1063025060.onnx", "3070435246", &[1, 3, 64, 64], 1e-4),
+            (r"landmark\assets\323773030.onnx", "t1511", &[1, 3, 160, 160], 1e-4),
+            (r"AIModels\Common\BlemishRemoval\blemishRemoval.onnx", "input.1", &[1, 3, 278, 278], 1e-4),
+            (r"AIModels\Common\ClosedEyesDetection\EyeDetector.onnx", "input", &[1, 3, 64, 64], 1e-4),
+            (r"AIModels\Common\ClosedEyesDetection\DenseNet121_FP32.onnx", "input", &[1, 3, 64, 64], 1e-4),
+            (r"AIModels\Common\BeautyMarks\beautyMarks.onnx", "images", &[1, 3, 416, 416], 1e-4),
+            (r"AIModels\Common\DustRemoval\dust.onnx", "images", &[1, 3, 416, 416], 1e-4),
+            (r"AIModels\Common\Rotation\autoRotation.onnx", "conv2d_input", &[1, 384, 384, 1], 1e-4),
+            (r"AIModels\Common\Similarity\similarity.onnx", "input_1", &[1, 224, 224, 3], 1e-4),
+            (r"AIModels\Common\PeopleMasking\skinMasking.onnx", "input_29", &[1, 512, 512, 3], 1e-4),
+            (r"AIModels\Common\SubjectMasking\subjectMasking.onnx", "x", &[1, 3, 320, 320], 1e-4),
+            (r"AIModels\Common\MatchLook\MatchLookBrightness.onnx", "input.1", &[1, 3, 384, 384], 5e-4),
+            (r"AIModels\Common\MatchLook\MatchLookBw.onnx", "input.1", &[1, 3, 224, 224], 5e-4),
+            (r"AIModels\Common\MatchLook\MatchLookColor.onnx", "input.1", &[1, 3, 384, 384], 5e-4),
+            (r"AIModels\Common\MatchLook\MatchLookExp.onnx", "input.1", &[1, 3, 384, 384], 5e-4),
+        ];
+
+        let mut passed = 0usize;
+        let mut failed_models = Vec::new();
+
+        for &(rel, input_name, shape, tol) in cases {
+            let path = root.join(rel);
+            if !path.is_file() {
+                continue;
+            }
+            let numel: usize = shape.iter().product();
+            let input_data: Vec<f32> = (0..numel)
+                .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+                .collect();
+            let shape_i64: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+
+            // 1. Run ORT golden oracle (warmup + best of 3).
+            let ort_sess = runtime
+                .open_session(&path)
+                .unwrap_or_else(|e| panic!("ORT open {rel}: {e:#}"));
+            let mut ort_in = input_data.clone();
+            let ort_outs = runtime
+                .run(&ort_sess, &mut ort_in, &shape_i64)
+                .unwrap_or_else(|e| panic!("ORT run {rel}: {e:#}"));
+            let mut ort_best_ms = f64::INFINITY;
+            for _ in 0..3 {
+                let mut inp = input_data.clone();
+                let t = Instant::now();
+                let _ = runtime.run(&ort_sess, &mut inp, &shape_i64).unwrap();
+                ort_best_ms = ort_best_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            // 2. Run NativeCudaSession (zero ORT, warmup + best of 3).
+            let bytes = std::fs::read(&path).expect("read onnx");
+            let mut overrides = HashMap::new();
+            overrides.insert(input_name.to_string(), shape.to_vec());
+            let native_sess = NativeCudaSession::from_bytes(&bytes, &overrides)
+                .unwrap_or_else(|e| panic!("Native open {rel}: {e}"));
+            let mut native_in = HashMap::new();
+            native_in.insert(input_name.to_string(), (input_data.as_slice(), shape.to_vec()));
+            let native_outs = native_sess
+                .run_f32(&native_in)
+                .unwrap_or_else(|e| panic!("Native run {rel}: {e}"));
+            let mut native_best_ms = f64::INFINITY;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let _ = native_sess.run_f32(&native_in).unwrap();
+                native_best_ms = native_best_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            // 3. Compare every output tensor in ORT's declared output order.
+            let mut worst_max = 0.0f32;
+            let mut worst_mean = 0.0f64;
+            for (idx, out_spec) in ort_sess.outputs.iter().enumerate() {
+                let ort_vec = &ort_outs[idx];
+                let (nat_vec, _sh) = native_outs
+                    .get(&out_spec.name)
+                    .unwrap_or_else(|| panic!("{rel}: missing native output '{}'", out_spec.name));
+                assert_eq!(
+                    ort_vec.len(),
+                    nat_vec.len(),
+                    "{rel} output '{}' length mismatch",
+                    out_spec.name
+                );
+                let mut max_d = 0.0f32;
+                let mut sum_d = 0.0f64;
+                for (&a, &b) in ort_vec.iter().zip(nat_vec.iter()) {
+                    let d = (a - b).abs();
+                    if d > max_d {
+                        max_d = d;
+                    }
+                    sum_d += d as f64;
+                }
+                worst_max = worst_max.max(max_d);
+                worst_mean = worst_mean.max(sum_d / (ort_vec.len().max(1) as f64));
+            }
+
+            let status = if worst_max <= tol { "PASS" } else { "DIFF" };
+            println!(
+                "[{status}] {:<48} ORT({:<4})={:6.2}ms  NativeCUDA={:6.2}ms  max_diff={:.2e}  mean_diff={:.2e}  tol={:.0e}",
+                rel,
+                ort_sess.provider().label(),
+                ort_best_ms,
+                native_best_ms,
+                worst_max,
+                worst_mean,
+                tol,
+            );
+            if worst_max <= tol {
+                passed += 1;
+            } else {
+                failed_models.push((rel, worst_max, tol));
+            }
+        }
+        println!("=== PARITY SUMMARY: {passed}/{} within tolerance ===", cases.len());
+        assert!(
+            failed_models.is_empty(),
+            "models exceeding parity tolerance: {failed_models:?}"
+        );
+    }
 }
