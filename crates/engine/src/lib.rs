@@ -125,6 +125,7 @@ pub mod portrait_makeup_provider;
 mod portrait_eye_bag_inputs;
 mod portrait_makeup_mesh2d;
 mod portrait_makeup_wiring;
+pub use portrait_makeup_wiring::{MakeupPresetInfo, makeup_palette_for_pf, makeup_presets_for_pf};
 mod portrait_moisture_inputs;
 pub mod portrait_pf115_pf107;
 mod portrait_pf90021_input;

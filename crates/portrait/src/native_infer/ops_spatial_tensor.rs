@@ -1,6 +1,6 @@
 //! Native CUDA spatial & tensor operator kernels for Aurora Native Inference Engine.
 //!
-//! Covers ONNX pooling, reduction, resize (3 coordinate modes), constant pad,
+//! Covers ONNX pooling, reduction, resize (4 coordinate modes), constant pad,
 //! 2D–5D transpose, concat, slice, gather, scatter_nd, expand, and tile.
 //!
 //! All dispatch entry points take raw CUDA device addresses (`u64`), making them
@@ -21,7 +21,7 @@ pub const PTX: &str = include_str!("../../native/cuda/infer_spatial_tensor.ptx")
 pub const KERNEL_MAXPOOL2D: &str = "maxpool2d_nchw_f32";
 pub const KERNEL_AVGPOOL2D: &str = "avgpool2d_nchw_f32";
 pub const KERNEL_GLOBAL_AVGPOOL: &str = "global_avgpool_nchw_f32";
-pub const KERNEL_REDUCE_MEAN: &str = "reduce_mean_f32";
+const KERNEL_REDUCE_AXIS: &str = "reduce_axis_f32";
 pub const KERNEL_RESIZE: &str = "resize_nchw_f32";
 pub const KERNEL_PAD_CONSTANT: &str = "pad_constant_nchw_f32";
 pub const KERNEL_PAD_CONSTANT_4D: &str = "pad_constant_4d_f32";
@@ -48,6 +48,8 @@ pub enum ResizeKernelMode {
     NearestAsymmetricFloor = 1,
     /// `mode=nearest`, `coordinate_transformation_mode=tf_half_pixel_for_nn`, `nearest_mode=floor`
     NearestTfHalfPixelForNnFloor = 2,
+    /// `mode=linear`, `coordinate_transformation_mode=align_corners`
+    LinearAlignCorners = 3,
 }
 
 impl ResizeKernelMode {
@@ -58,6 +60,7 @@ impl ResizeKernelMode {
     ) -> Result<Self, CudaError> {
         match (mode, coord_mode, nearest_mode) {
             (ResizeMode::Linear, CoordTransformMode::HalfPixel, _) => Ok(Self::LinearHalfPixel),
+            (ResizeMode::Linear, CoordTransformMode::AlignCorners, _) => Ok(Self::LinearAlignCorners),
             (ResizeMode::Nearest, CoordTransformMode::Asymmetric, NearestMode::Floor) => {
                 Ok(Self::NearestAsymmetricFloor)
             }
@@ -334,8 +337,39 @@ impl SpatialTensorKernels {
         in_shape: &[usize],
         axes: &[i64],
     ) -> Result<(), CudaError> {
+        self.reduce_axis_f32(input, output, in_shape, axes, 0)
+    }
+
+    pub fn reduce_max_f32(
+        &self,
+        input: u64,
+        output: u64,
+        in_shape: &[usize],
+        axes: &[i64],
+    ) -> Result<(), CudaError> {
+        self.reduce_axis_f32(input, output, in_shape, axes, 2)
+    }
+
+    pub fn reduce_sum_f32(
+        &self,
+        input: u64,
+        output: u64,
+        in_shape: &[usize],
+        axes: &[i64],
+    ) -> Result<(), CudaError> {
+        self.reduce_axis_f32(input, output, in_shape, axes, 1)
+    }
+
+    fn reduce_axis_f32(
+        &self,
+        input: u64,
+        output: u64,
+        in_shape: &[usize],
+        axes: &[i64],
+        mut reduction: i32,
+    ) -> Result<(), CudaError> {
         if in_shape.len() > 5 {
-            return Err(CudaError::Refused(Refusal::ShapeMismatch("reduce_mean_rank")));
+            return Err(CudaError::Refused(Refusal::ShapeMismatch("reduce_rank")));
         }
         let rank = in_shape.len();
         let offset = 5 - rank;
@@ -348,19 +382,19 @@ impl SpatialTensorKernels {
             for &ax in axes {
                 let norm = if ax < 0 { ax + rank as i64 } else { ax };
                 if norm < 0 || norm >= rank as i64 {
-                    return Err(CudaError::Refused(Refusal::ValueOutOfRange("reduce_mean_axis")));
+                    return Err(CudaError::Refused(Refusal::ValueOutOfRange("reduce_axis")));
                 }
                 mask |= 1 << (offset + norm as usize);
             }
         }
 
-        let dims = pad5_dims(in_shape, "reduce_mean_shape")?;
+        let dims = pad5_dims(in_shape, "reduce_shape")?;
         let mut out_total: usize = 1;
         for i in 0..5 {
             if (mask & (1 << i)) == 0 {
                 out_total = out_total
                     .checked_mul(dims[i] as usize)
-                    .ok_or(CudaError::Refused(Refusal::ValueOutOfRange("reduce_mean_out")))?;
+                    .ok_or(CudaError::Refused(Refusal::ValueOutOfRange("reduce_out")))?;
             }
         }
         if out_total == 0 {
@@ -377,7 +411,7 @@ impl SpatialTensorKernels {
         let mut p_mask = mask;
         let mut p_total = to_i32(out_total, "out_total")?;
 
-        let mut params: [*mut c_void; 9] = [
+        let mut params: [*mut c_void; 10] = [
             (&mut p_in as *mut u64).cast(),
             (&mut p_out as *mut u64).cast(),
             (&mut d0 as *mut i32).cast(),
@@ -387,9 +421,10 @@ impl SpatialTensorKernels {
             (&mut d4 as *mut i32).cast(),
             (&mut p_mask as *mut i32).cast(),
             (&mut p_total as *mut i32).cast(),
+            (&mut reduction as *mut i32).cast(),
         ];
         self.nvidia
-            .launch_raw(KERNEL_REDUCE_MEAN, grid_1d(out_total), (BLOCK_1D, 1), &mut params)?;
+            .launch_raw(KERNEL_REDUCE_AXIS, grid_1d(out_total), (BLOCK_1D, 1), &mut params)?;
         Ok(())
     }
 
@@ -1089,6 +1124,26 @@ impl SpatialTensorKernels {
         Err(Self::unavailable())
     }
 
+    pub fn reduce_max_f32(
+        &self,
+        _input: u64,
+        _output: u64,
+        _in_shape: &[usize],
+        _axes: &[i64],
+    ) -> Result<(), CudaError> {
+        Err(Self::unavailable())
+    }
+
+    pub fn reduce_sum_f32(
+        &self,
+        _input: u64,
+        _output: u64,
+        _in_shape: &[usize],
+        _axes: &[i64],
+    ) -> Result<(), CudaError> {
+        Err(Self::unavailable())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn resize_nchw_f32(
         &self,
@@ -1485,7 +1540,29 @@ mod tests {
     }
 
     #[test]
-    fn test_resize_all_three_onnx_modes() {
+    fn test_reduce_sum_and_max_edges() {
+        let Some(k) = open_or_skip() else { return };
+        let nv = k.nvidia();
+        let input = [16_777_216.0, 1.0, -16_777_216.0, -3.0, -5.0, -2.0];
+        let in_buf = nv.alloc_buffer(input.len() * 4).unwrap();
+        let out_buf = nv.alloc_buffer(2 * 4).unwrap();
+        let mut raw = [0; 8];
+        nv.upload_buffer(&in_buf, &f32_to_bytes(&input)).unwrap();
+        k.reduce_sum_f32(in_buf.handle(), out_buf.handle(), &[2, 3], &[-1]).unwrap();
+        nv.download_buffer(&out_buf, &mut raw).unwrap();
+        assert_eq!(bytes_to_f32(&raw), [1.0, -10.0]);
+
+        let input = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, -3.0, f32::NAN, -2.0];
+        nv.upload_buffer(&in_buf, &f32_to_bytes(&input)).unwrap();
+        k.reduce_max_f32(in_buf.handle(), out_buf.handle(), &[2, 3], &[-1]).unwrap();
+        nv.download_buffer(&out_buf, &mut raw).unwrap();
+        let max = bytes_to_f32(&raw);
+        assert_eq!(max[0], f32::NEG_INFINITY);
+        assert!(max[1].is_nan());
+    }
+
+    #[test]
+    fn test_resize_onnx_modes() {
         let Some(k) = open_or_skip() else { return };
         let (n, c, in_h, in_w) = (1, 3, 5, 6);
         let (out_h, out_w) = (11, 9);
@@ -1500,6 +1577,7 @@ mod tests {
 
         for mode in [
             ResizeKernelMode::LinearHalfPixel,
+            ResizeKernelMode::LinearAlignCorners,
             ResizeKernelMode::NearestAsymmetricFloor,
             ResizeKernelMode::NearestTfHalfPixelForNnFloor,
         ] {
@@ -1509,11 +1587,18 @@ mod tests {
                 for oh in 0..out_h {
                     for ow in 0..out_w {
                         let val = match mode {
-                            ResizeKernelMode::LinearHalfPixel => {
-                                let fy = (((oh as f64 + 0.5) / scale_h) - 0.5)
-                                    .clamp(0.0, (in_h - 1) as f64);
-                                let fx = (((ow as f64 + 0.5) / scale_w) - 0.5)
-                                    .clamp(0.0, (in_w - 1) as f64);
+                            ResizeKernelMode::LinearHalfPixel | ResizeKernelMode::LinearAlignCorners => {
+                                let (fy, fx) = if mode == ResizeKernelMode::LinearAlignCorners {
+                                    (
+                                        oh as f64 / (out_h - 1) as f64 * (in_h - 1) as f64,
+                                        ow as f64 / (out_w - 1) as f64 * (in_w - 1) as f64,
+                                    )
+                                } else {
+                                    (
+                                        (((oh as f64 + 0.5) / scale_h) - 0.5).clamp(0.0, (in_h - 1) as f64),
+                                        (((ow as f64 + 0.5) / scale_w) - 0.5).clamp(0.0, (in_w - 1) as f64),
+                                    )
+                                };
                                 let y0 = fy.floor() as usize;
                                 let x0 = fx.floor() as usize;
                                 let y1 = (y0 + 1).min(in_h - 1);

@@ -989,7 +989,7 @@ impl Runtime {
     }
 
     #[inline]
-    fn is_native_only(&self) -> bool {
+    pub(crate) fn is_native_only(&self) -> bool {
         self.api.is_null()
     }
 
@@ -1662,8 +1662,18 @@ impl Runtime {
         shape: &[i64],
     ) -> Result<Vec<OutputPlane>> {
         #[cfg(windows)]
-        if let Some(planes) = try_run_native_cuda(session, input, shape, self.is_native_only()) {
-            return Ok(planes);
+        match try_run_native_cuda(session, input, shape, self.is_native_only()) {
+            Ok(Some(planes)) => return Ok(planes),
+            Ok(None) => {}
+            Err(err) => {
+                if self.is_native_only() {
+                    return Err(err);
+                }
+                log::warn!(
+                    "NativeCudaSession fallback to ORT for {}: {err:#}",
+                    session.inner.model_path.display()
+                );
+            }
         }
         if self.is_native_only() {
             bail!(
@@ -2484,22 +2494,23 @@ fn try_run_native_cuda(
     input: &[f32],
     shape: &[i64],
     native_only: bool,
-) -> Option<Vec<OutputPlane>> {
+) -> Result<Option<Vec<OutputPlane>>> {
     use aurora_portrait::native_infer::session::NativeCudaSession;
 
     if !native_infer_enabled() {
-        return None;
+        return Ok(None);
     }
     if !native_only
         && (session.input.element_type != FLOAT
             || !is_native_verified_model(&session.inner.model_path))
     {
-        return None;
+        return Ok(None);
     }
     let shape_usize: Vec<usize> = shape
         .iter()
         .map(|&d| usize::try_from(d).ok())
-        .collect::<Option<Vec<_>>>()?;
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow!("negative input shape {shape:?}"))?;
 
     static CACHE: OnceLock<Mutex<HashMap<(PathBuf, Vec<usize>), Arc<NativeCudaSession>>>> =
         OnceLock::new();
@@ -2513,7 +2524,9 @@ fn try_run_native_cuda(
     let native = match native {
         Some(s) => s,
         None => {
-            let bytes = std::fs::read(&session.inner.model_path).ok()?;
+            let bytes = std::fs::read(&session.inner.model_path).with_context(|| {
+                format!("reading ONNX model {}", session.inner.model_path.display())
+            })?;
             let mut overrides = HashMap::new();
             overrides.insert(session.input.name.clone(), shape_usize.clone());
             match NativeCudaSession::from_bytes(&bytes, &overrides) {
@@ -2529,11 +2542,10 @@ fn try_run_native_cuda(
                     arc
                 }
                 Err(err) => {
-                    log::debug!(
-                        "NativeCudaSession unavailable for {}, falling back to ORT: {err}",
+                    bail!(
+                        "NativeCudaSession::from_bytes failed for {}: {err}",
                         session.inner.model_path.display()
                     );
-                    return None;
                 }
             }
         }
@@ -2542,20 +2554,22 @@ fn try_run_native_cuda(
     let mut inputs = HashMap::new();
     inputs.insert(session.input.name.clone(), (input, shape_usize));
     let started = std::time::Instant::now();
-    let outputs = match native.run_f32(&inputs) {
-        Ok(o) => o,
-        Err(err) => {
-            log::warn!(
-                "NativeCudaSession run failed for {}, falling back to ORT: {err}",
-                session.inner.model_path.display()
-            );
-            return None;
-        }
-    };
+    let outputs = native.run_f32(&inputs).map_err(|err| {
+        anyhow!(
+            "NativeCudaSession::run_f32 failed for {}: {err}",
+            session.inner.model_path.display()
+        )
+    })?;
     let infer_us = started.elapsed().as_micros() as u64;
     let mut planes = Vec::with_capacity(session.outputs.len());
     for out_meta in &session.outputs {
-        let (values, dims_u) = outputs.get(&out_meta.name)?;
+        let (values, dims_u) = outputs.get(&out_meta.name).ok_or_else(|| {
+            anyhow!(
+                "NativeCudaSession missing output '{}' for {}",
+                out_meta.name,
+                session.inner.model_path.display()
+            )
+        })?;
         planes.push(OutputPlane {
             values: values.clone(),
             dtype: FLOAT,
@@ -2563,7 +2577,7 @@ fn try_run_native_cuda(
         });
     }
     session.record_run(0, infer_us, 0);
-    Some(planes)
+    Ok(Some(planes))
 }
 
 unsafe impl Send for SessionInner {}

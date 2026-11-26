@@ -54,7 +54,7 @@ pub(crate) fn build_face2d_draw_bytes(
     profile: &MakeupRowProfile,
 ) -> Result<OwnedFace2dDrawBytes, Refusal> {
     validate_contract(points194, frame_size)?;
-    let (vertices, indices) = region_geometry(points194, profile)?;
+    let (vertices, indices) = region_geometry(points194, frame_size, profile)?;
     if indices.is_empty() {
         return Err(Refusal::ShapeMismatch(REGION_UNMAPPED));
     }
@@ -85,7 +85,7 @@ pub(crate) fn build_region_uv(
     profile: &MakeupRowProfile,
 ) -> Result<OwnedFace2dUvBytes, Refusal> {
     validate_contract(points194, frame_size)?;
-    let (vertices, _) = region_geometry(points194, profile)?;
+    let (vertices, _) = region_geometry(points194, frame_size, profile)?;
     if vertices.is_empty() {
         return Err(Refusal::ShapeMismatch(REGION_UNMAPPED));
     }
@@ -132,10 +132,16 @@ fn validate_contract(points194: &[[f32; 2]], frame_size: [u32; 2]) -> Result<(),
     Ok(())
 }
 
+const EYE_LEFT_OUTLINE: [usize; 8] = [18, 19, 20, 21, 22, 23, 24, 25];
+const EYE_RIGHT_OUTLINE: [usize; 8] = [36, 37, 38, 39, 40, 41, 42, 43];
+const IRIS_LEFT: [usize; 8] = [27, 28, 29, 30, 31, 32, 33, 34];
+const IRIS_RIGHT: [usize; 8] = [45, 46, 47, 48, 49, 50, 51, 52];
+
 /// Resolve the row family from the profile's recovered mask semantic and emit
 /// its vertex stream plus local triangle indices.
 fn region_geometry(
     points194: &[[f32; 2]],
+    frame_size: [u32; 2],
     profile: &MakeupRowProfile,
 ) -> Result<(Vec<[f32; 2]>, Vec<u16>), Refusal> {
     if !B3_MAKEUP_ROWS.contains(&profile.pf) {
@@ -151,29 +157,57 @@ fn region_geometry(
         let all: Vec<usize> = (0..POINTS194).collect();
         push_hull(points194, &all, &mut vertices, &mut indices)?;
     } else if semantic.contains("EyeBrow") {
-        push_ring(points194, &BROW_LEFT, &mut vertices, &mut indices)?;
-        push_ring(points194, &BROW_RIGHT, &mut vertices, &mut indices)?;
-    } else if semantic.contains("EyeLash")
-        || semantic.contains("EyeMask")
-        || semantic.contains("EyePupil")
-    {
-        // Eye colour, eyeliner/eyeshadow and eyelash all draw the eye rings.
-        push_ring(points194, &EYE_LEFT, &mut vertices, &mut indices)?;
-        push_ring(points194, &EYE_RIGHT, &mut vertices, &mut indices)?;
+        // PF100 is left brow (`mmz.png`), PF117 is right brow (`mmy.png`).
+        // Use an expanded axis-aligned quad so the curved brow texture fits
+        // cleanly without chord-clipping or painting both brows for one slider.
+        let brow = if profile.pf == 117 {
+            &BROW_RIGHT
+        } else {
+            &BROW_LEFT
+        };
+        push_expanded_quad(
+            points194,
+            brow,
+            frame_size,
+            0.15,
+            0.45,
+            &mut vertices,
+            &mut indices,
+        )?;
+    } else if semantic.contains("EyePupil") {
+        // Contact lenses cover only the iris rings, not the sclera.
+        push_ring(points194, &IRIS_LEFT, &mut vertices, &mut indices)?;
+        push_ring(points194, &IRIS_RIGHT, &mut vertices, &mut indices)?;
+    } else if semantic.contains("EyeLash") || semantic.contains("EyeMask") {
+        // Eyeliner, eyeshadow and eyelash textures live around the eyelids
+        // outside the eyeball; emit one expanded quad per eye.
+        push_expanded_quad(
+            points194,
+            &EYE_LEFT_OUTLINE,
+            frame_size,
+            0.35,
+            0.85,
+            &mut vertices,
+            &mut indices,
+        )?;
+        push_expanded_quad(
+            points194,
+            &EYE_RIGHT_OUTLINE,
+            frame_size,
+            0.35,
+            0.85,
+            &mut vertices,
+            &mut indices,
+        )?;
     } else if semantic.contains("Lip") {
         push_ring(points194, &LIP_OUTER, &mut vertices, &mut indices)?;
         push_ring(points194, &LIP_INNER, &mut vertices, &mut indices)?;
     } else if semantic.contains("Blusher") || semantic.contains("blusher") {
-        // A cheek patch is supported by the lower eye ring and the upper half
-        // of the jaw oval on the same side; take the convex perimeter so the
-        // two clusters become one closed ring.
-        let mut left = EYE_LEFT.to_vec();
-        left.extend(109..=121);
-        push_hull(points194, &left, &mut vertices, &mut indices)?;
-
-        let mut right = EYE_RIGHT.to_vec();
-        right.extend(129..=141);
-        push_hull(points194, &right, &mut vertices, &mut indices)?;
+        // Blusher (`model_Blusher_4001.png`) and Contour (`01.png`) are full-face
+        // 901x1081 templates (`ROIRect=[95,40,901,1081]`), so align them to the
+        // full 194-point face hull rather than two small cheek triangles.
+        let all: Vec<usize> = (0..POINTS194).collect();
+        push_hull(points194, &all, &mut vertices, &mut indices)?;
     } else if semantic.contains("face-parsing") || semantic.contains("MASK_RGBA") {
         // Whole-face owner masks: the full 194-point silhouette hull. The
         // secondary 52 points cover the upper face and add the forehead edge
@@ -188,6 +222,53 @@ fn region_geometry(
         return Err(Refusal::ShapeMismatch(REGION_UNMAPPED));
     }
     Ok((vertices, indices))
+}
+
+/// Append one padded axis-aligned quad (4 vertices, 2 triangles) enclosing the
+/// selected landmarks, clamped to `[0, frame_size]`, so local brow/eye makeup
+/// textures map cleanly without exceeding draw bounds.
+fn push_expanded_quad(
+    points194: &[[f32; 2]],
+    landmarks: &[usize],
+    frame_size: [u32; 2],
+    pad_x_frac: f32,
+    pad_y_frac: f32,
+    vertices: &mut Vec<[f32; 2]>,
+    indices: &mut Vec<u16>,
+) -> Result<(), Refusal> {
+    if landmarks.is_empty() {
+        return Err(Refusal::ShapeMismatch(REGION_UNMAPPED));
+    }
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &landmark in landmarks {
+        let p = *points194
+            .get(landmark)
+            .ok_or(Refusal::ValueOutOfRange(LANDMARKS_INVALID))?;
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    }
+    let fw = frame_size[0] as f32;
+    let fh = frame_size[1] as f32;
+    let w = (max_x - min_x).max(2.0);
+    let h = (max_y - min_y).max(2.0);
+    let pad_x = w * pad_x_frac;
+    let pad_y = h * pad_y_frac;
+    let x0 = (min_x - pad_x).clamp(0.0, fw);
+    let y0 = (min_y - pad_y).clamp(0.0, fh);
+    let x1 = (max_x + pad_x).clamp(0.0, fw);
+    let y1 = (max_y + pad_y).clamp(0.0, fh);
+    if vertices.len() + 4 > u16::MAX as usize {
+        return Err(Refusal::ValueOutOfRange(REGION_UNMAPPED));
+    }
+    let base = vertices.len() as u16;
+    vertices.extend_from_slice(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    Ok(())
 }
 
 /// Append one closed ring and fan it from the ring's first vertex.
@@ -404,13 +485,13 @@ mod tests {
 
         let brow = build_face2d_draw_bytes(&points, [512, 512], &row_profile(100).unwrap())
             .unwrap();
-        assert_eq!(brow.vertices.len() / 8, 18);
-        assert_eq!(brow.draw_index_count, 14 * 3);
+        assert_eq!(brow.vertices.len() / 8, 4);
+        assert_eq!(brow.draw_index_count, 2 * 3);
 
         let eye = build_face2d_draw_bytes(&points, [512, 512], &row_profile(103).unwrap())
             .unwrap();
-        assert_eq!(eye.vertices.len() / 8, 36);
-        assert_eq!(eye.draw_index_count, 32 * 3);
+        assert_eq!(eye.vertices.len() / 8, 8);
+        assert_eq!(eye.draw_index_count, 4 * 3);
 
         let lips = build_face2d_draw_bytes(&points, [512, 512], &row_profile(107).unwrap())
             .unwrap();

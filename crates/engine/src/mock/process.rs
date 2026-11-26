@@ -1302,6 +1302,10 @@ fn needs_stage_face_bundle_direct(extra: &std::collections::BTreeMap<String, f32
                 | 30204
                 | 30207
                 | 30210
+                | 41922
+                | 44124
+                | 48019
+                | 49221
         )
     })
 }
@@ -1350,7 +1354,7 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90086 | 100004)
+        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90021 | 90086 | 100004)
             || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
@@ -2206,12 +2210,15 @@ fn render_sized(
     let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
     let t0 = stage_timing.then(std::time::Instant::now);
     let region = clean_region(region);
-    let portrait_active = !bypass
-        && !wide
-        && crate::portrait_registry::has_active_portrait_effect(adj);
+    // The wide (export) render runs the portrait stage too: the kernels eat
+    // the 8-bit stage frame, and their delta merges into the 16-bit buffer
+    // with the other local stages at the final `merge_wide_delta`. Only the
+    // cross-entry portrait cache stays preview-only (see the lookup below).
+    let portrait_active =
+        !bypass && crate::portrait_registry::has_active_portrait_effect(adj);
     let mut cached_frame_fingerprint = None;
     let (mut rgba, mut rgba16, develop8) = 'develop: {
-        if portrait_active {
+        if portrait_active && !wide {
             if let Some((cached, fingerprint)) =
                 portrait_stage_cached(src, adj, region, out_w, out_h, scale, level, mask_overlay)
             {
@@ -3165,7 +3172,10 @@ fn render_sized(
     }
         (rgba, rgba16, develop8)
     };
-    if portrait_active {
+    // A wide render is a one-shot export: it must neither take the cache hit
+    // above (which returns rgba16 = None) nor evict the preview's entry, so
+    // the portrait stage cache stays preview-only on both sides.
+    if portrait_active && !wide {
         portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba);
     }
     let portrait_report = if portrait_active {
@@ -3189,10 +3199,9 @@ fn render_sized(
         // build it once here and let both read it.
         let want_stage_slim = needs_stage_face_input(&adj.extra);
         let want_stage_parsing = needs_stage_face_parsing(&adj.extra);
-        let want_stage_attachments = (want_stage_parsing
+        let want_stage_attachments = want_stage_parsing
             || needs_stage_face_bundle_direct(&adj.extra)
-            || needs_producer_attach(&adj.extra))
-            && region == NormRect::FULL;
+            || needs_producer_attach(&adj.extra);
         // One digest for the whole tick: face producers, slim inputs, and the
         // effect stage all bind to the same bytes.
         let stage_sha256 = (want_stage_slim || want_stage_attachments).then(|| {
@@ -3331,11 +3340,10 @@ fn render_sized(
                                 attached = true;
                             }
                         }
-                        if bundle
-                            .attach_plump_from_extra(stage_frame, &adj.extra, &mut inputs)
-                            .is_ok()
-                        {
-                            attached = true;
+                        match bundle.attach_plump_from_extra(stage_frame, &adj.extra, &mut inputs) {
+                            Ok(()) if inputs.plump.is_some() => attached = true,
+                            Ok(()) => {}
+                            Err(refusal) => log::warn!("same-frame FacePlump input refused: {refusal:?}"),
                         }
                         if bundle
                             .attach_eye_and_brow_geometry(stage_frame, &adj.extra, &mut inputs)
@@ -3392,24 +3400,56 @@ fn render_sized(
                                 }
                             }
                         }
-                        if any_makeup_row_active(&adj.extra)
-                            && bundle
-                                .attach_makeup_bundle(
-                                    stage_frame,
-                                    &crate::portrait_makeup_bundle::B3_MAKEUP_ROWS,
-                                    &mut inputs,
-                                )
-                                .is_ok()
-                        {
-                            attached = true;
+                        let active_makeup_rows: Vec<u32> =
+                            crate::portrait_makeup_wiring::makeup_rows_2d_declared()
+                                .iter()
+                                .copied()
+                                .filter(|pf| {
+                                    adj.extra
+                                        .get(&format!("pc:{pf}"))
+                                        .is_some_and(|value| value.abs() > 1.0e-6)
+                                })
+                                .collect();
+                        if any_makeup_row_active(&adj.extra) {
+                            let makeup_face_mask = masks.mask_u8(
+                                crate::portrait_stage::MaskKind::Face,
+                                stage_frame.width,
+                                stage_frame.height,
+                                region,
+                            );
+                            match bundle.attach_makeup_bundle_with_options(
+                                stage_frame,
+                                &active_makeup_rows,
+                                makeup_face_mask.as_deref(),
+                                Some(&adj.extra),
+                                &mut inputs,
+                            ) {
+                                Ok(()) => attached = true,
+                                Err(refusal) => {
+                                    log::warn!("same-frame makeup bundle refused: {refusal:?}");
+                                }
+                            }
                         }
                         let c101 = adj.extra.get("pc:101").copied().unwrap_or(0.0);
                         if c101 != 0.0 {
-                            if bundle
-                                .attach_pf101_inputs(stage_frame, c101, &mut inputs)
-                                .is_ok()
-                            {
-                                attached = true;
+                            let s101 = adj
+                                .extra
+                                .get("pc:101:style")
+                                .copied()
+                                .unwrap_or(0.0)
+                                .round()
+                                .max(0.0) as usize;
+                            match bundle.attach_pf101_inputs_with_style(
+                                stage_frame,
+                                c101,
+                                s101,
+                                &mut inputs,
+                            ) {
+                                Ok(()) => attached = true,
+                                Err(refusal) => {
+                                    log::warn!("PF101 same-frame input refused: {refusal:?}");
+                                    inputs.face_input_refusal.get_or_insert(refusal);
+                                }
                             }
                         }
                         // The apply path needs moisture planes only for
@@ -3425,22 +3465,25 @@ fn render_sized(
                         {
                             attached = true;
                         }
-                        if bundle
-                            .attach_pf8033_from_extra(stage_frame, &adj.extra, &mut inputs)
-                            .is_ok()
-                        {
-                            attached = true;
+                        match bundle.attach_pf8033_from_extra(stage_frame, &adj.extra, &mut inputs) {
+                            Ok(()) => attached = true,
+                            Err(refusal) => {
+                                log::warn!("PF8033 same-frame input refused: {refusal:?}");
+                                inputs.face_input_refusal.get_or_insert(refusal);
+                            }
                         }
-                        if bundle
-                            .attach_historical_tone_from_extra(
-                                stage_frame,
-                                Some(masks),
-                                &adj.extra,
-                                &mut inputs,
-                            )
-                            .is_ok()
-                        {
-                            attached = true;
+                        match bundle.attach_historical_tone_from_extra(
+                            stage_frame,
+                            Some(masks),
+                            &adj.extra,
+                            &mut inputs,
+                        ) {
+                            Ok(()) => attached = true,
+                            Err(refusal) => {
+                                log::warn!(
+                                    "historical tone same-frame input refused: {refusal:?}"
+                                );
+                            }
                         }
                         if bundle
                             .attach_historical_skin_from_extra(
@@ -8321,6 +8364,22 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
     fn zero_ort_portrait_end_to_end_smoke() {
         use std::path::Path;
 
+        struct Warnings;
+        impl log::Log for Warnings {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    eprintln!("{}: {}", record.target(), record.args());
+                }
+            }
+            fn flush(&self) {}
+        }
+        if log::set_logger(&Warnings).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+
         let rt_info = crate::aimask::runtime_info().expect("zero-ORT Native CUDA runtime must initialize");
         println!("runtime: {rt_info:?}");
         assert_eq!(rt_info.0, "<aurora-native-cuda>");
@@ -8345,7 +8404,23 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             ("Eye width L", "pc:8019", 0.6),
             ("Brow position L", "pc:8021", 0.6),
             ("Rosy", "pc:90007", 0.8),
+            ("Eye wrinkles", "pc:90023", 0.8),
+            ("Neutral grey flat", "pc:30013", 0.8),
+            ("AI body unify", "pc:21105", 0.8),
+            ("Blusher", "pc:106", 0.8),
+            ("Lipstick", "pc:107", 0.8),
+            ("Cheek plump", "pc:30197", 60.0),
+            ("Full face plump", "pc:30210", 2.0),
+            ("Brow head length L", "pc:44124", 0.6),
+            ("Body skin unify", "pc:90086", 0.8),
+            ("Silkworm eye bag", "pc:101", 0.8),
+            ("Spotless acne", "pc:0", 0.8),
+            ("Face skin unify", "pc:90085", 0.8),
+            ("Stereo shadow", "pc:8", 0.8),
+            ("Stereo highlight", "pc:9", 0.8),
+            ("Lip enhance", "pc:90021", 0.9),
         ];
+        let mut failures = Vec::new();
         for &(label, key, val) in sliders {
             let mut adj = AdjustmentSet::default();
             adj.extra.insert(key.to_string(), val);
@@ -8366,12 +8441,12 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
                 "[{:<18}] key={:<8} diff_px={:<7} effects={:?}",
                 label, key, diff_px, eff_summary
             );
-            assert!(
-                report.effects.iter().any(|e| e.executed),
-                "{label} ({key}) did not execute: {eff_summary:?}"
-            );
-            assert!(diff_px > 0, "{label} ({key}) changed 0 pixels");
+            let pf = key.strip_prefix("pc:").unwrap().parse::<u32>().unwrap();
+            if !report.effects.iter().any(|effect| effect.pf == pf && effect.executed) || diff_px == 0 {
+                failures.push(format!("{label} ({key}): diff_px={diff_px}, effects={eff_summary:?}"));
+            }
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn serial_mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {

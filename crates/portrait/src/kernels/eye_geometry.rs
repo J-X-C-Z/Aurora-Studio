@@ -607,6 +607,13 @@ pub const TYPE1018_EBO_REFERENCED_SLOTS: usize = 96;
 pub const TYPE1018_EBO_RING_COUNT: usize = 4;
 pub const TYPE1018_TARGET_WINDOW_COUNT: usize = 3;
 pub const TYPE1018_TARGET_WINDOW_SIZE: usize = 24;
+/// Proven dual-side Type1018 layout (`0x707DE40`: `object+0x58 = 24`, `object+0x5c = 96`).
+pub const TYPE1018_RING_SIZE: usize = super::brow_length_exact_vendor::RING_VERTICES;
+pub const TYPE1018_SIDE_VERTEX_COUNT: usize = super::brow_length_exact_vendor::SIDE_VERTEX_COUNT;
+pub const TYPE1018_VERTEX_COUNT: usize = super::brow_length_exact_vendor::NUMERIC_BUFFER_POINTS;
+pub const TYPE1018_SIDE_EBO_INDEX_COUNT: usize =
+    super::brow_length_exact_vendor::SIDE_EBO_INDEX_COUNT;
+pub const TYPE1018_DUAL_EBO_INDEX_COUNT: usize = super::brow_length_exact_vendor::EBO_INDEX_COUNT;
 pub const TYPE1018_EBO_U16LE_SHA256: &str =
     "7BDEC0ECB1FCAA51D4DC42904CFA616536346EF0EC024EA11C6A51AF2836569A";
 pub const TYPE1018_EBO_MAPPING_REFUSAL: &str =
@@ -664,13 +671,24 @@ pub fn stage_ebo_gate(
     if matches!(pf, 30073 | 30079) {
         return accept_indices(pf, Some(indices), vertices);
     }
-    if matches!(pf, 44124 | 48019 | 49221 | 41922) && indices.len() == 498 {
-        return Err(Refusal::MissingEbo(TYPE1018_EBO_MAPPING_REFUSAL));
+    if matches!(pf, 44124 | 48019 | 49221 | 41922) {
+        if indices.len() == TYPE1018_DUAL_EBO_INDEX_COUNT && vertices == TYPE1018_VERTEX_COUNT {
+            return accept_indices(pf, Some(indices), vertices);
+        }
+        if indices.len() == 498 {
+            return Err(Refusal::MissingEbo(TYPE1018_EBO_MAPPING_REFUSAL));
+        }
     }
     if let Some(source) = ebo_rva(pf) {
         return Err(Refusal::MissingEbo(source));
     }
     accept_indices(pf, Some(indices), vertices)
+}
+
+/// Proven dual-side `Type1018` ordered EBO (`0x707DE40`: 996 `u16` indices over
+/// 192 disjoint vertices — left brow `0..=95`, right brow `96..=191`).
+pub fn type1018_dual_ordered_ebo() -> Vec<u16> {
+    super::brow_length_exact_vendor::type1018_ordered_ebo()
 }
 
 /// Reproduces the ordered `u16` triangle list built by the Type1018 constructor.
@@ -1873,6 +1891,156 @@ pub fn brow_length_consumer(
     })
 }
 
+/// Proven dual-side 192-vertex numeric consumer result for `Type1018`
+/// (`FacialRefinePart[15]` Short / `[16]` Long), delegating to
+/// [`super::brow_length_exact_vendor`].
+///
+/// Layout: left brow `0..96` (active rings `0..72`, zero-displacement Ring 3
+/// anchor `72..96`), right brow `96..192` (active rings `96..168`,
+/// zero-displacement Ring 3 anchor `168..192`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowLengthDualConsumer {
+    pub part: super::brow_length_exact_vendor::BrowPart,
+    pub source: Vec<Point>,
+    pub target: Vec<Point>,
+    pub deltas: Vec<Point>,
+    pub half: [f32; 2],
+    /// `[head_left, head_right, tail_left_gated, tail_right_gated]`.
+    pub degrees: [f32; 4],
+    pub scale: f32,
+    pub noop: bool,
+}
+
+/// Sample indices in each 24-vertex ring used by `0x707F260` to compute the
+/// Ring 2 ↔ Ring 3 minimum-distance scale factor `S`.
+const TYPE1018_SCALE_RING_SAMPLES: [usize; 6] = [0, 1, 11, 12, 22, 23];
+
+/// Compute the `0x707F260` scale factor `S`: minimum Euclidean distance over
+/// 12 Ring 2 ↔ Ring 3 vertex pairs (6 sample indices per brow side).
+pub fn brow_length_scale_0x707f260(mesh: &[Point]) -> Result<f32, Refusal> {
+    if mesh.len() != TYPE1018_VERTEX_COUNT {
+        return Err(Refusal::MissingMesh("type1018_192_vertices_required"));
+    }
+    if !all_finite(mesh) {
+        return Err(Refusal::NonFinite("type1018_scale_mesh_non_finite"));
+    }
+    let mut min_dist = f32::INFINITY;
+    for side_base in [0usize, TYPE1018_SIDE_VERTEX_COUNT] {
+        let ring2 = side_base + 2 * TYPE1018_RING_SIZE;
+        let ring3 = side_base + 3 * TYPE1018_RING_SIZE;
+        for &idx in &TYPE1018_SCALE_RING_SAMPLES {
+            let d = distance(mesh[ring2 + idx], mesh[ring3 + idx]);
+            if d < min_dist {
+                min_dist = d;
+            }
+        }
+    }
+    if !min_dist.is_finite() {
+        return Err(Refusal::NonFinite("type1018_scale_non_finite"));
+    }
+    Ok(min_dist)
+}
+
+/// `0x707E820` brow-tail contour-distance attenuation:
+/// `clamp((min_dist / brow_len - 0.15) / 0.35, 0.0, 1.0)`.
+pub fn brow_tail_contour_atten(tail: Point, brow_len: f32, contour: &[Point]) -> f32 {
+    if !tail.finite() || !brow_len.is_finite() {
+        return 0.0;
+    }
+    if !(brow_len > super::brow_length_exact_vendor::HALF_EPSILON) {
+        return 0.0;
+    }
+    if contour.is_empty() {
+        return 1.0;
+    }
+    let mut min_dist = f32::INFINITY;
+    for &p in contour {
+        if p.finite() {
+            min_dist = min_dist.min(distance(tail, p));
+        }
+    }
+    if !min_dist.is_finite() {
+        return 1.0;
+    }
+    ((min_dist / brow_len - 0.15) / 0.35).clamp(0.0, 1.0)
+}
+
+/// Evaluate one `Type1018` part (`BrowPart::Short` or `BrowPart::Long`) over a
+/// 192-vertex dual-side brow mesh using the vendor-exact `SHORT_TABLES` /
+/// `LONG_TABLES` and zero-displacement Ring 3 border anchoring.
+pub fn brow_length_consumer_dual(
+    part: super::brow_length_exact_vendor::BrowPart,
+    mesh: &[Point],
+    guide_left: super::brow_length_exact_vendor::BrowGuide,
+    guide_right: super::brow_length_exact_vendor::BrowGuide,
+    degrees: [f32; 4],
+    scale: Option<f32>,
+) -> Result<BrowLengthDualConsumer, Refusal> {
+    use super::brow_length_exact_vendor::{
+        BrowDirectionDegrees, BrowError, BrowLengthInputs as VendorInputs, Point as VendorPoint,
+        build as vendor_build,
+    };
+
+    if mesh.len() != TYPE1018_VERTEX_COUNT {
+        return Err(Refusal::MissingMesh("type1018_192_vertices_required"));
+    }
+    if !all_finite(mesh) || !all_finite_f32(&degrees) {
+        return Err(Refusal::NonFinite("brow_length_dual_non_finite"));
+    }
+    let resolved_scale = match scale {
+        Some(value) => value,
+        None => brow_length_scale_0x707f260(mesh)?,
+    };
+    let vendor_source: Vec<VendorPoint> = mesh
+        .iter()
+        .map(|p| VendorPoint::new(p.x, p.y))
+        .collect();
+    let built = vendor_build(VendorInputs {
+        part,
+        source: &vendor_source,
+        guide_a: guide_left,
+        guide_b: guide_right,
+        degrees_a: BrowDirectionDegrees {
+            head: degrees[0],
+            tail: degrees[2],
+        },
+        degrees_b: BrowDirectionDegrees {
+            head: degrees[1],
+            tail: degrees[3],
+        },
+        scale: resolved_scale,
+    })
+    .map_err(|err| match err {
+        BrowError::NonFinite(what) => Refusal::NonFinite(what),
+        BrowError::OutOfRange(what) => Refusal::OutOfRange(what),
+        BrowError::BufferLength { .. } => Refusal::MissingMesh("type1018_192_vertices_required"),
+        BrowError::GuideLength { .. } => Refusal::MissingGuide,
+        BrowError::DegenerateAxis(what) => Refusal::NonFinite(what),
+    })?;
+
+    let target: Vec<Point> = built
+        .target
+        .iter()
+        .map(|p| Point::new(p.x, p.y))
+        .collect();
+    let deltas: Vec<Point> = target
+        .iter()
+        .zip(mesh.iter())
+        .map(|(to, from)| to.sub(*from))
+        .collect();
+
+    Ok(BrowLengthDualConsumer {
+        part,
+        source: mesh.to_vec(),
+        target,
+        deltas,
+        half: built.half,
+        degrees,
+        scale: resolved_scale,
+        noop: built.noop,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2306,6 +2474,140 @@ mod tests {
         assert_eq!(
             brow_length_consumer(&bad, [&ones; 3], seg, seg, 1.0, 1.0, 1.0),
             Err(Refusal::NonFinite("brow_length_consumer_non_finite"))
+        );
+    }
+
+    fn dual_brow_mesh_192() -> Vec<Point> {
+        let mut mesh = Vec::with_capacity(TYPE1018_VERTEX_COUNT);
+        for side in 0..2 {
+            let cx = if side == 0 { 100.0f32 } else { 260.0f32 };
+            let cy = 120.0f32;
+            for ring in 0..4 {
+                let rx = 20.0 * (1.0 + ring as f32 * 0.5);
+                let ry = 6.0 * (1.0 + ring as f32 * 0.5);
+                for i in 0..24 {
+                    let theta = i as f32 / 24.0 * std::f32::consts::TAU;
+                    mesh.push(Point::new(cx + theta.cos() * rx, cy + theta.sin() * ry));
+                }
+            }
+        }
+        mesh
+    }
+
+    #[test]
+    fn type1018_dual_996_ebo_passes_stage_gate_while_legacy_498_still_refuses() {
+        let dual_ebo = type1018_dual_ordered_ebo();
+        assert_eq!(dual_ebo.len(), TYPE1018_DUAL_EBO_INDEX_COUNT);
+        assert_eq!(dual_ebo.len(), 996);
+        assert_eq!(dual_ebo.iter().copied().min(), Some(0));
+        assert_eq!(dual_ebo.iter().copied().max(), Some(191));
+        for pf in [44124u32, 48019, 49221, 41922] {
+            assert_eq!(
+                stage_ebo_gate(pf, &dual_ebo, TYPE1018_VERTEX_COUNT),
+                Ok(332)
+            );
+            // Wrong vertex count must not pass.
+            assert_eq!(
+                stage_ebo_gate(pf, &dual_ebo, TYPE1018_EBO_VERTEX_COUNT),
+                Err(Refusal::MissingEbo(EBO_23))
+            );
+        }
+        // Legacy 498-index EBO stays refused for backward compatibility.
+        let legacy = type1018_ordered_ebo();
+        assert_eq!(
+            stage_ebo_gate(44124, &legacy, TYPE1018_EBO_VERTEX_COUNT),
+            Err(Refusal::MissingEbo(TYPE1018_EBO_MAPPING_REFUSAL))
+        );
+    }
+
+    #[test]
+    fn dual_consumer_192_anchors_ring3_and_applies_short_and_long_tables() {
+        use super::super::brow_length_exact_vendor::{
+            BrowGuide, BrowPart, LONG_TABLES, Point as VPoint, SHORT_TABLES,
+        };
+
+        let mesh = dual_brow_mesh_192();
+        let guide_left = BrowGuide {
+            start: VPoint::new(120.0, 120.0),
+            end: VPoint::new(80.0, 120.0),
+            center: VPoint::new(100.0, 120.0),
+        };
+        let guide_right = BrowGuide {
+            start: VPoint::new(240.0, 120.0),
+            end: VPoint::new(280.0, 120.0),
+            center: VPoint::new(260.0, 120.0),
+        };
+
+        // Auto-computed 0x707F260 scale must be strictly positive.
+        let auto_scale = brow_length_scale_0x707f260(&mesh).unwrap();
+        assert!(auto_scale > 0.0);
+
+        // Short part with 4 independent degrees.
+        let short = brow_length_consumer_dual(
+            BrowPart::Short,
+            &mesh,
+            guide_left,
+            guide_right,
+            [-0.8, -0.4, -1.2, -0.6],
+            None,
+        )
+        .unwrap();
+        assert_eq!(short.target.len(), 192);
+        assert_eq!(short.deltas.len(), 192);
+        assert!(!short.noop);
+        assert_eq!(short.scale, auto_scale);
+
+        // Long part with 4 independent degrees.
+        let long = brow_length_consumer_dual(
+            BrowPart::Long,
+            &mesh,
+            guide_left,
+            guide_right,
+            [0.8, 0.4, 1.2, 0.6],
+            Some(auto_scale),
+        )
+        .unwrap();
+        assert_eq!(long.target.len(), 192);
+        assert!(!long.noop);
+
+        // SHORT_TABLES and LONG_TABLES differ (e.g. Ring 0 index 0 is ~1.45 vs 1.0).
+        assert_ne!(SHORT_TABLES.param_list[0], LONG_TABLES.param_list[0]);
+        assert!((short.deltas[0].x.abs() - long.deltas[0].x.abs()).abs() > 1e-4);
+
+        // Ring 3 (left 72..96, right 168..192) is strictly zero-displacement anchored.
+        for result in [&short, &long] {
+            for slot in (72..96).chain(168..192) {
+                assert_eq!(result.target[slot].x.to_bits(), mesh[slot].x.to_bits());
+                assert_eq!(result.target[slot].y.to_bits(), mesh[slot].y.to_bits());
+                assert_eq!(result.deltas[slot], Point::new(0.0, 0.0));
+            }
+        }
+
+        // Neutral degrees produce a bit-exact no-op.
+        let zero = brow_length_consumer_dual(
+            BrowPart::Short,
+            &mesh,
+            guide_left,
+            guide_right,
+            [0.0; 4],
+            None,
+        )
+        .unwrap();
+        assert!(zero.noop);
+        assert_eq!(zero.target, mesh);
+
+        // Contour distance attenuation gate.
+        let contour = [Point::new(70.0, 120.0)];
+        // dist = 10, brow_len = 40 -> ratio = 0.25 -> (0.25 - 0.15) / 0.35
+        let atten = brow_tail_contour_atten(Point::new(80.0, 120.0), 40.0, &contour);
+        assert!((atten - (0.10 / 0.35)).abs() < 1e-5);
+        assert_eq!(
+            brow_tail_contour_atten(Point::new(80.0, 120.0), 40.0, &[Point::new(80.0, 120.0)]),
+            0.0
+        );
+        assert_eq!(
+            brow_tail_contour_atten(Point::new(80.0, 120.0), 40.0, &[Point::new(0.0, 120.0)]),
+            1.0
         );
     }
 }

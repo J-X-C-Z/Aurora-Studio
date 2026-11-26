@@ -178,6 +178,8 @@ pub enum Op {
     AveragePool(PoolAttrs),
     GlobalAveragePool,
     ReduceMean(ReduceAttrs),
+    ReduceSum(ReduceAttrs),
+    ReduceMax(ReduceAttrs),
 
     // Spatial / Resize / Pad
     Resize(ResizeAttrs),
@@ -188,6 +190,7 @@ pub enum Op {
     Sub,
     Mul,
     Div,
+    Mod { fmod: bool },
     Pow,
     Sqrt,
     Reciprocal,
@@ -255,12 +258,15 @@ impl Op {
             Self::AveragePool(_) => "AveragePool",
             Self::GlobalAveragePool => "GlobalAveragePool",
             Self::ReduceMean(_) => "ReduceMean",
+            Self::ReduceSum(_) => "ReduceSum",
+            Self::ReduceMax(_) => "ReduceMax",
             Self::Resize(_) => "Resize",
             Self::Pad { .. } => "Pad",
             Self::Add => "Add",
             Self::Sub => "Sub",
             Self::Mul => "Mul",
             Self::Div => "Div",
+            Self::Mod { .. } => "Mod",
             Self::Pow => "Pow",
             Self::Sqrt => "Sqrt",
             Self::Reciprocal => "Reciprocal",
@@ -716,7 +722,7 @@ impl IrGraph {
                 }
 
                 // Binary broadcast ops
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Pow => {
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod { .. } | Op::Pow => {
                     if let (Some(oid), Some(a), Some(b)) = (
                         out0_id,
                         in_shapes.first().and_then(|x| x.as_ref()),
@@ -863,20 +869,28 @@ impl IrGraph {
                     }
                 }
 
-                Op::ReduceMean(attrs) => {
+                Op::ReduceMean(attrs) | Op::ReduceSum(attrs) | Op::ReduceMax(attrs) => {
                     if let (Some(oid), Some(x)) = (out0_id, in_shapes.first().and_then(|s| s.as_ref())) {
                         let axes_opt = attrs.axes.clone().or_else(|| {
-                            node.inputs.get(1).and_then(|o| *o).and_then(|id| const_i64.get(&id).cloned())
+                            match node.inputs.get(1).and_then(|input| *input) {
+                                Some(id) => const_i64.get(&id).cloned(),
+                                None => Some(Vec::new()),
+                            }
                         });
                         if let Some(axes) = axes_opt {
                             let rank = x.len() as i64;
+                            let reduce_all = axes.is_empty() && !attrs.noop_with_empty_axes;
                             let axis_set: HashSet<usize> = axes
                                 .iter()
-                                .map(|&a| if a < 0 { (a + rank) as usize } else { a as usize })
+                                .map(|&axis| if axis < 0 { axis + rank } else { axis })
+                                .map(|axis| axis as usize)
                                 .collect();
+                            if axis_set.iter().any(|&axis| axis >= x.len()) {
+                                continue;
+                            }
                             let mut out = Vec::new();
                             for (i, &d) in x.iter().enumerate() {
-                                if axis_set.contains(&i) {
+                                if reduce_all || axis_set.contains(&i) {
                                     if attrs.keepdims {
                                         out.push(1);
                                     }
@@ -1520,6 +1534,16 @@ fn parse_op(np: &NodeProto, parent: &IrGraph) -> Result<Op, GraphError> {
             keepdims: np.attr_int("keepdims").unwrap_or(1) != 0,
             noop_with_empty_axes: np.attr_int("noop_with_empty_axes").unwrap_or(0) != 0,
         })),
+        "ReduceSum" => Ok(Op::ReduceSum(ReduceAttrs {
+            axes: np.attr_ints("axes").map(|s| s.to_vec()),
+            keepdims: np.attr_int("keepdims").unwrap_or(1) != 0,
+            noop_with_empty_axes: np.attr_int("noop_with_empty_axes").unwrap_or(0) != 0,
+        })),
+        "ReduceMax" => Ok(Op::ReduceMax(ReduceAttrs {
+            axes: np.attr_ints("axes").map(|s| s.to_vec()),
+            keepdims: np.attr_int("keepdims").unwrap_or(1) != 0,
+            noop_with_empty_axes: np.attr_int("noop_with_empty_axes").unwrap_or(0) != 0,
+        })),
         "Resize" => {
             let mode = match np.attr_string("mode").unwrap_or("nearest") {
                 "linear" => ResizeMode::Linear,
@@ -1559,6 +1583,9 @@ fn parse_op(np: &NodeProto, parent: &IrGraph) -> Result<Op, GraphError> {
         "Sub" => Ok(Op::Sub),
         "Mul" => Ok(Op::Mul),
         "Div" => Ok(Op::Div),
+        "Mod" => Ok(Op::Mod {
+            fmod: np.attr_int("fmod").unwrap_or(0) != 0,
+        }),
         "Pow" => Ok(Op::Pow),
         "Sqrt" => Ok(Op::Sqrt),
         "Reciprocal" => Ok(Op::Reciprocal),

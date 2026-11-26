@@ -791,7 +791,9 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     skin_desc!(90007, "pc:90007", "Skin tone", "Rosy", "红润", 0.0, DEPS_SKIN),
     skin_desc!(90004, "pc:90004", "Skin tone", "Skin radiance", "皮肤透亮", 0.0, DEPS_SKIN),
     skin_desc!(21105, "pc:21105", "Skin tone", "AI body skin tone unify", "AI 身体肤色统一", 0.0, DEPS_SKIN),
+    skin_desc!(90085, "pc:90085", "Skin tone", "Face skin tone unify", "肤色统一（脸部）", 0.0, DEPS_SKIN),
     skin_desc!(90086, "pc:90086", "Skin tone", "Body skin tone unify", "肤色统一（身体）", 0.0, DEPS_SKIN),
+    skin_desc!(0, "pc:0", "Blemish", "Spotless acne removal", "祛斑祛痘", 0.0, DEPS_SKIN),
     // ── Skin: Texture (3) ──────────────────────────────────────────────────
     skin_desc!(8068, "pc:8068", "Texture", "Skin gloss", "皮肤光泽", 0.5, DEPS_SKIN),
     EffectDescriptor {
@@ -950,8 +952,8 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     face_geom_desc!(8022, "pc:8022", "Face pairs", "Brow position (R)", "眉位（右）"),
     face_geom_desc!(44124, "pc:44124", "Face pairs", "Brow head length (L)", "眉头长短（左）"),
     face_geom_desc!(48019, "pc:48019", "Face pairs", "Brow head length (R)", "眉头长短（右）"),
-    face_geom_desc!(41922, "pc:41922", "Face pairs", "Brow tail length (L)", "眉尾长短（左）"),
-    face_geom_desc!(49221, "pc:49221", "Face pairs", "Brow tail length (R)", "眉尾长短（右）"),
+    face_geom_desc!(49221, "pc:49221", "Face pairs", "Brow tail length (L)", "眉尾长短（左）"),
+    face_geom_desc!(41922, "pc:41922", "Face pairs", "Brow tail length (R)", "眉尾长短（右）"),
     // ── Face Geometry: Single controls (2; pc:8033 lives in Expression) ────
     face_geom_desc!(202, "pc:202", "Face single", "Hairline", "发际线"),
     face_geom_desc!(232, "pc:232", "Face single", "Skull top enhance", "高颅顶"),
@@ -1057,7 +1059,7 @@ mod tests {
     fn all_registered_effects_have_unique_keys_valid_ranges_and_consistent_pf_ids() {
         let mut keys = BTreeSet::new();
         let mut pfs = BTreeSet::new();
-        assert_eq!(descriptors().len(), 95);
+        assert_eq!(descriptors().len(), 97);
 
         for desc in descriptors() {
             assert!(

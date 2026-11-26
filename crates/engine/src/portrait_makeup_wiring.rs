@@ -30,6 +30,7 @@
 //! `3DMMFaceSticker` is refused upstream by `row_profile_for_effect`; this
 //! module only selects the 2D `BlusherImageMakeup` branch.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -71,7 +72,9 @@ pub struct Makeup2dRowContract {
     pub owner_mask_missing: &'static str,
 }
 
-pub static MAKEUP_2D_ROWS: [Makeup2dRowContract; 12] = [
+pub static MAKEUP_2D_ROWS: [Makeup2dRowContract; 14] = [
+    row(8, "BlusherImageMakeup", [95, 40, 901, 1081], [0, 0, 0, 255], 100.0, "FaceStereo/model_FaceStereoShadow_yy.png"),
+    row(9, "BlusherImageMakeup", [95, 40, 901, 1081], [0, 0, 0, 255], 100.0, "FaceStereo/model_FaceStereoShadow_gg.png"),
     row(100, "NormalEyeBrowColorMakeup", [210, 410, 260, 110], [100, 82, 70, 255], 100.0, "Makeups/Eyebrow/MUEB00000010/mmz.png"),
     row(103, "SymEyeColorMakeup", [200, 400, 300, 300], [39, 15, 6, 255], 100.0, "Makeups/EyeLiner/MUELR00000001/yxz.png"),
     row(105, "SymEyeLashColorMakeup", [200, 400, 300, 300], [100, 45, 43, 255], 80.0, "Makeups/Eyelash/MUEL00000001/lt.png"),
@@ -96,6 +99,8 @@ const fn row(
 ) -> Makeup2dRowContract {
     // Static tags per PF: `Refusal` only carries `&'static str`.
     let (material_missing, owner_mask_missing) = match pf {
+        8 => ("MAKEUP_MATERIAL_PNG_MISSING:8", "MAKEUP_SAME_JOB_OWNER_MASK:8"),
+        9 => ("MAKEUP_MATERIAL_PNG_MISSING:9", "MAKEUP_SAME_JOB_OWNER_MASK:9"),
         100 => ("MAKEUP_MATERIAL_PNG_MISSING:100", "MAKEUP_SAME_JOB_OWNER_MASK:100"),
         103 => ("MAKEUP_MATERIAL_PNG_MISSING:103", "MAKEUP_SAME_JOB_OWNER_MASK:103"),
         105 => ("MAKEUP_MATERIAL_PNG_MISSING:105", "MAKEUP_SAME_JOB_OWNER_MASK:105"),
@@ -137,17 +142,250 @@ pub fn makeup_rows_2d_available() -> &'static [u32] {
 /// owner mask cannot be assembled from 2D landmarks (named refusal).
 #[allow(dead_code)]
 pub fn makeup_rows_2d_declared() -> &'static [u32] {
-    &[100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032]
+    &[8, 9, 100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032]
 }
 
 fn row_contract(pf: u32) -> Option<&'static Makeup2dRowContract> {
     MAKEUP_2D_ROWS.iter().find(|row| row.pf == pf)
 }
 
+fn normalize_makeup_root(path: &Path) -> Option<PathBuf> {
+    if path.join("Makeups").is_dir() {
+        return Some(path.to_path_buf());
+    }
+    if path.file_name().is_some_and(|name| name == "Makeups") {
+        return path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+    }
+    None
+}
+
+pub fn makeup_asset_root() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os(MAKEUP_ASSET_ROOT_ENV) {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for rel in ["assets/portrait/makeup", "assets/makeup", "makeup"] {
+                candidates.push(dir.join(rel));
+            }
+            candidates.push(dir.join("../../assets/portrait/makeup"));
+        }
+    }
+    if let Ok(dir) = std::env::current_dir() {
+        for rel in ["assets/portrait/makeup", "assets/makeup", "makeup"] {
+            candidates.push(dir.join(rel));
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|candidate| normalize_makeup_root(&candidate))
+}
+
+/// One discovered makeup style preset under `AURORA_MAKEUP_ASSET_ROOT/Makeups/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MakeupPresetInfo {
+    pub id: String,
+    pub path: PathBuf,
+    pub mirror_x: bool,
+}
+
+fn trailing_number(name: &str) -> u32 {
+    let digits: String = name
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse::<u32>().unwrap_or(u32::MAX)
+}
+
+fn find_png_recursive(dir: &Path, prefer: &[&str], exclude_sub: &[&str]) -> Option<PathBuf> {
+    let mut all = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+            {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if exclude_sub.iter().any(|ex| name.contains(ex)) {
+                    continue;
+                }
+                all.push((name, path));
+            }
+        }
+    }
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    for pat in prefer {
+        let pat_low = pat.to_ascii_lowercase();
+        if let Some((_, p)) = all.iter().find(|(n, _)| n == &pat_low || n.starts_with(&pat_low)) {
+            return Some(p.clone());
+        }
+    }
+    all.into_iter().next().map(|(_, p)| p)
+}
+
+/// Scans `makeup_asset_root()/Makeups/<category>/` and returns all available
+/// style presets for `pf` in natural numeric order.
+pub fn makeup_presets_for_pf(pf: u32) -> Vec<MakeupPresetInfo> {
+    let Some(root) = makeup_asset_root() else {
+        return Vec::new();
+    };
+    let (category, prefer, exclude): (&str, &[&str], &[&str]) = match pf {
+        100 => ("Eyebrow", &["mmz.png", "mmy.png"], &["sideface"]),
+        117 => ("Eyebrow", &["mmy.png", "mmz.png"], &["sideface"]),
+        103 | 30007 => ("EyeLiner", &["yxz.png", "yxzs.png", "yxy.png"], &["sideface"]),
+        105 => ("Eyelash", &["lt.png", "rt.png"], &["sideface"]),
+        118 => ("Eyelash", &["lb.png", "rb.png"], &["sideface"]),
+        106 => ("Blusher", &["model_blusher", "sh.png", "sh"], &["sideface"]),
+        107 => ("Lipstick", &["staintexture.png"], &["sideface"]),
+        111 => ("Eyepupil", &["mt.png"], &["eye_mask", "sideface"]),
+        115 => ("FacialDecoration", &["z01.png"], &["sideface"]),
+        116 => ("Contour", &[], &["sideface"]),
+        90032 => ("Eyemakeup", &["yyz.png", "yyy.png"], &["sideface"]),
+        101 => ("Silkworm", &["wcz", "wcy"], &["sideface"]),
+        _ => return Vec::new(),
+    };
+    let cat_dir = root.join("Makeups").join(category);
+    let Ok(entries) = std::fs::read_dir(&cat_dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(u32, String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let id = path.file_name()?.to_str()?.to_string();
+            Some((trailing_number(&id), id, path))
+        })
+        .collect();
+    dirs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut presets = Vec::with_capacity(dirs.len());
+    for (_, id, dir) in dirs {
+        if let Some(png) = find_png_recursive(&dir, prefer, exclude) {
+            let mirror_x = pf == 117
+                && png
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case("mmz.png"));
+            presets.push(MakeupPresetInfo {
+                id,
+                path: png,
+                mirror_x,
+            });
+        }
+    }
+    presets
+}
+
+/// Recommended color swatches `(label_zh, rgba8)` for color-driven makeup rows.
+pub fn makeup_palette_for_pf(pf: u32) -> &'static [(&'static str, [u8; 4])] {
+    const BROW_PALETTE: &[(&str, [u8; 4])] = &[
+        ("经典棕", [100, 82, 70, 255]),
+        ("炭黑", [36, 34, 34, 255]),
+        ("浅咖", [138, 108, 84, 255]),
+        ("暖棕", [124, 78, 52, 255]),
+        ("红棕", [128, 58, 48, 255]),
+    ];
+    const BLUSHER_PALETTE: &[(&str, [u8; 4])] = &[
+        ("蜜桃粉", [234, 112, 129, 255]),
+        ("珊瑚橘", [238, 132, 102, 255]),
+        ("玫瑰红", [206, 74, 98, 255]),
+        ("杏仁裸", [214, 148, 128, 255]),
+        ("梅子粉", [188, 88, 126, 255]),
+    ];
+    const EYELINER_PALETTE: &[(&str, [u8; 4])] = &[
+        ("深棕", [39, 15, 6, 255]),
+        ("炭黑", [22, 20, 22, 255]),
+        ("酒红", [112, 38, 48, 255]),
+        ("大地咖", [96, 64, 48, 255]),
+    ];
+    const EYELASH_PALETTE: &[(&str, [u8; 4])] = &[
+        ("自然棕", [100, 45, 43, 255]),
+        ("浓黑", [24, 22, 24, 255]),
+        ("焦糖", [132, 76, 56, 255]),
+    ];
+    match pf {
+        100 | 117 => BROW_PALETTE,
+        106 => BLUSHER_PALETTE,
+        103 | 30007 => EYELINER_PALETTE,
+        105 | 118 => EYELASH_PALETTE,
+        _ => &[],
+    }
+}
+
+fn resolve_style_selection(
+    pf: u32,
+    extra: Option<&BTreeMap<String, f32>>,
+) -> Option<MakeupPresetInfo> {
+    let extra = extra?;
+    let key = format!("pc:{pf}:style");
+    let raw = extra.get(&key).copied().or_else(|| {
+        // Right brow follows left brow style when not explicitly overridden.
+        (pf == 117).then(|| extra.get("pc:100:style").copied()).flatten()
+    })?;
+    let idx = raw.round() as isize;
+    if idx <= 0 {
+        return None;
+    }
+    let presets = makeup_presets_for_pf(pf);
+    if presets.is_empty() {
+        return None;
+    }
+    let clamped = (idx as usize - 1).min(presets.len() - 1);
+    presets.into_iter().nth(clamped)
+}
+
+fn resolve_mix_color(pf: u32, default_color: [u8; 4], extra: Option<&BTreeMap<String, f32>>) -> [u8; 4] {
+    let Some(extra) = extra else {
+        return default_color;
+    };
+    let rgb_key = format!("pc:{pf}:rgb");
+    if let Some(packed) = extra.get(&rgb_key).copied().or_else(|| {
+        (pf == 117).then(|| extra.get("pc:100:rgb").copied()).flatten()
+    }) {
+        if packed.is_finite() && packed >= 1.0 {
+            let v = packed.round() as u32;
+            return [((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8, 255];
+        }
+    }
+    let color_key = format!("pc:{pf}:color");
+    let raw = extra.get(&color_key).copied().or_else(|| {
+        (pf == 117).then(|| extra.get("pc:100:color").copied()).flatten()
+    });
+    if let Some(val) = raw {
+        let idx = val.round() as isize;
+        let palette = makeup_palette_for_pf(pf);
+        if idx >= 1 && !palette.is_empty() {
+            return palette[(idx as usize - 1).min(palette.len() - 1)].1;
+        }
+    }
+    default_color
+}
+
 fn asset_root() -> Option<PathBuf> {
-    std::env::var_os(MAKEUP_ASSET_ROOT_ENV)
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
+    makeup_asset_root()
 }
 
 /// Canonical B3 order, de-duplicated, unknown PFs refused. FaceStereo rows are
@@ -158,9 +396,6 @@ fn selected_rows(requested: &[u32]) -> Result<Vec<u32>, Refusal> {
     for pf in requested {
         if !B3_MAKEUP_ROWS.contains(pf) {
             return Err(Refusal::UnknownEffect(*pf));
-        }
-        if *pf == 8 || *pf == 9 {
-            return Err(Refusal::MissingInput(FACESTEREO_OWNER_MASK_UNSUPPORTED));
         }
         if !selected.contains(pf) {
             selected.push(*pf);
@@ -190,6 +425,27 @@ impl FaceInputBundle {
         rows: &[u32],
         producer: &mut ProducerInputs,
     ) -> Result<(), Refusal> {
+        self.attach_makeup_bundle_with_face_mask(source, rows, None, producer)
+    }
+
+    pub fn attach_makeup_bundle_with_face_mask(
+        &self,
+        source: &Image,
+        rows: &[u32],
+        face_mask: Option<&[u8]>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        self.attach_makeup_bundle_with_options(source, rows, face_mask, None, producer)
+    }
+
+    pub fn attach_makeup_bundle_with_options(
+        &self,
+        source: &Image,
+        rows: &[u32],
+        face_mask: Option<&[u8]>,
+        extra: Option<&BTreeMap<String, f32>>,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
         self.validate_ticket(source, Some(self.job_id))?;
         if rows.is_empty() {
             return Err(Refusal::MissingInput("makeup bundle rows"));
@@ -215,17 +471,25 @@ impl FaceInputBundle {
         let root = asset_root();
         let job_id = self.job_id;
         let root_ref = root.as_deref();
-        let (input_rows, skipped_material) = assemble_constructible_rows(
+        let (input_rows, skipped_material) = assemble_constructible_rows_with_options(
             job_id,
             [source.width, source.height],
             &self.points194,
             &planned,
+            face_mask,
+            extra,
             |pf| {
+                if let Some(preset) = resolve_style_selection(pf, extra) {
+                    if let Some(img) = load_row_material(&preset.path, job_id, pf)? {
+                        return Ok(Some((img, preset.mirror_x)));
+                    }
+                }
                 let Some(root) = root_ref else {
                     return Ok(None);
                 };
                 let contract = row_contract(pf).ok_or(Refusal::UnknownEffect(pf))?;
-                load_row_material(root.join(contract.material), job_id, pf)
+                Ok(load_row_material(root.join(contract.material), job_id, pf)?
+                    .map(|img| (img, false)))
             },
         )?;
         if !skipped_material.is_empty() {
@@ -278,6 +542,7 @@ type OwnedOwnerMask = Arc<Image>;
 /// Assembles every requested row that can be completed right now. Material rows
 /// whose PNG is unavailable are skipped and returned separately; owner-mask rows
 /// are always constructed from the same-job landmarks.
+#[cfg_attr(not(test), allow(dead_code))]
 fn assemble_constructible_rows<M>(
     job_id: u64,
     frame_size: [u32; 2],
@@ -288,21 +553,48 @@ fn assemble_constructible_rows<M>(
 where
     M: FnMut(u32) -> Result<Option<OwnedMaterial>, Refusal>,
 {
+    assemble_constructible_rows_with_options(
+        job_id,
+        frame_size,
+        points194,
+        selected,
+        None,
+        None,
+        |pf| Ok(load_material(pf)?.map(|img| (img, false))),
+    )
+}
+
+fn assemble_constructible_rows_with_options<M>(
+    _job_id: u64,
+    frame_size: [u32; 2],
+    points194: &[[f32; 2]],
+    selected: &[u32],
+    face_mask: Option<&[u8]>,
+    extra: Option<&BTreeMap<String, f32>>,
+    mut load_material: M,
+) -> Result<(Vec<OwnedMakeupBundleInputRow>, Vec<u32>), Refusal>
+where
+    M: FnMut(u32) -> Result<Option<(OwnedMaterial, bool)>, Refusal>,
+{
     let mut rows = Vec::with_capacity(selected.len());
     let mut skipped_material = Vec::new();
     for &pf in selected {
         let contract = row_contract(pf).ok_or(Refusal::UnknownEffect(pf))?;
         let profile = row_profile_for_effect(pf, contract.source_effect)?;
-        let material = if profile.requires_material {
+        let (material, mask_texture, mirror_x) = if profile.requires_material {
             match load_material(pf)? {
-                Some(material) => Some(material),
+                Some((material, mirror)) => (Some(material), None, mirror),
                 None => {
                     skipped_material.push(pf);
                     continue;
                 }
             }
         } else {
-            None
+            let loaded = load_material(pf).ok().flatten();
+            match loaded {
+                Some((img, mirror)) => (None, Some(img), mirror),
+                None => (None, None, false),
+            }
         };
         let draw = crate::portrait_makeup_mesh2d::build_face2d_draw_bytes(
             points194,
@@ -311,13 +603,19 @@ where
         )?;
         let positions = decode_owned_positions(&draw)?;
         let indices = decode_owned_indices(&draw)?;
-        // The recovered `contract.roi` is evidence for the vendor's own draw
-        // bounds, but this 2D mesh already spans both sides for symmetric rows.
-        // Normalizing UV to the row's actual draw bounds keeps every vertex in
-        // [0,1] instead of clipping one side against a single-side ROI.
         let (origin, size) = draw_origin_size(&positions, frame_size)?;
         let owner_mask: Option<OwnedOwnerMask> = if profile.requires_owner_mask() {
-            Some(derive_owner_mask(&positions, &indices, origin, size)?)
+            Some(derive_owner_mask_textured(
+                pf,
+                &positions,
+                &indices,
+                origin,
+                size,
+                frame_size,
+                mask_texture.as_deref(),
+                mirror_x,
+                face_mask,
+            )?)
         } else {
             None
         };
@@ -332,6 +630,7 @@ where
         };
         let filter_type = recovered_filter_type(pf, contract.source_effect)
             .ok_or(Refusal::MissingInput("makeup provider FilterType"))?;
+        let mix_color = resolve_mix_color(pf, contract.mix_color, extra);
         rows.push(OwnedMakeupBundleInputRow {
             pf,
             source_effect: Some(contract.source_effect.to_owned()),
@@ -343,7 +642,7 @@ where
             extra_owner_mask: None,
             material,
             material_uv,
-            mix_color: contract.mix_color,
+            mix_color,
             opacity_percent: contract.opacity_percent,
             filter_type,
         });
@@ -397,14 +696,51 @@ fn draw_origin_size(
     Ok(([min_x, min_y], [max_x - min_x, max_y - min_y]))
 }
 
-/// Rasterizes the row's own mesh into its draw bounds as a same-job owner mask.
-/// Every covered pixel is opaque white; the declared channel selects the
-/// component at shade time, so flat 255 coverage is valid for R/G/B/A masks.
+#[cfg_attr(not(test), allow(dead_code))]
 fn derive_owner_mask(
     positions: &[[f32; 2]],
     indices: &[u16],
     origin: [i32; 2],
     size: [i32; 2],
+) -> Result<OwnedOwnerMask, Refusal> {
+    derive_owner_mask_textured(0, positions, indices, origin, size, [0, 0], None, false, None)
+}
+
+fn sample_mask_bilinear(tex: &Image, u: f32, v: f32) -> u8 {
+    let w = tex.width as usize;
+    let h = tex.height as usize;
+    if w == 0 || h == 0 || tex.pixels.len() < w * h * 4 {
+        return 0;
+    }
+    let fx = (u.clamp(0.0, 1.0) * (w.saturating_sub(1)) as f32).clamp(0.0, (w - 1) as f32);
+    let fy = (v.clamp(0.0, 1.0) * (h.saturating_sub(1)) as f32).clamp(0.0, (h - 1) as f32);
+    let x0 = fx.floor() as usize;
+    let y0 = fy.floor() as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let at = |x: usize, y: usize| -> f32 {
+        let base = (y * w + x) * 4;
+        // Material mask PNGs (mmz/mmy/yxz/lt/model_Blusher_4001) store soft
+        // intensity in RGB (grayscale), with alpha=255.
+        tex.pixels[base] as f32
+    };
+    let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+    let bot = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+    (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8
+}
+
+fn derive_owner_mask_textured(
+    pf: u32,
+    positions: &[[f32; 2]],
+    indices: &[u16],
+    origin: [i32; 2],
+    size: [i32; 2],
+    frame_size: [u32; 2],
+    material_mask: Option<&Image>,
+    mirror_x: bool,
+    face_mask: Option<&[u8]>,
 ) -> Result<OwnedOwnerMask, Refusal> {
     if size[0] <= 0 || size[1] <= 0 {
         return Err(Refusal::ShapeMismatch("makeup owner mask bounds"));
@@ -433,6 +769,102 @@ fn derive_owner_mask(
     if !covered {
         return Err(Refusal::ShapeMismatch("makeup owner mask coverage"));
     }
+
+    // When a real decrypted soft-gradient mask PNG is available for ColorMask /
+    // HistoricalColor rows, modulate the rasterized polygon by the texture so
+    // makeup follows the actual feathered brow/eyeliner/lash/blusher shape.
+    if let Some(tex) = material_mask {
+        let dual_eye_quads = matches!(pf, 103 | 105 | 118 | 30007) && positions.len() == 8;
+        if dual_eye_quads {
+            let left_box = (
+                positions[0][0].min(positions[2][0]),
+                positions[0][1].min(positions[2][1]),
+                (positions[2][0] - positions[0][0]).abs().max(1.0),
+                (positions[2][1] - positions[0][1]).abs().max(1.0),
+            );
+            let right_box = (
+                positions[4][0].min(positions[6][0]),
+                positions[4][1].min(positions[6][1]),
+                (positions[6][0] - positions[4][0]).abs().max(1.0),
+                (positions[6][1] - positions[4][1]).abs().max(1.0),
+            );
+            for y in 0..h {
+                let fy = origin_f[1] + y as f32 + 0.5;
+                for x in 0..w {
+                    let at = (y * w + x) * 4;
+                    if rgba[at] == 0 {
+                        continue;
+                    }
+                    let fx = origin_f[0] + x as f32 + 0.5;
+                    let mut val = 0u8;
+                    if fx >= left_box.0
+                        && fx <= left_box.0 + left_box.2
+                        && fy >= left_box.1
+                        && fy <= left_box.1 + left_box.3
+                    {
+                        let u = (fx - left_box.0) / left_box.2;
+                        let v = (fy - left_box.1) / left_box.3;
+                        val = val.max(sample_mask_bilinear(tex, u, v));
+                    }
+                    if fx >= right_box.0
+                        && fx <= right_box.0 + right_box.2
+                        && fy >= right_box.1
+                        && fy <= right_box.1 + right_box.3
+                    {
+                        let u = 1.0 - (fx - right_box.0) / right_box.2;
+                        let v = (fy - right_box.1) / right_box.3;
+                        val = val.max(sample_mask_bilinear(tex, u, v));
+                    }
+                    rgba[at..at + 4].copy_from_slice(&[val, val, val, val]);
+                }
+            }
+        } else {
+            let wf = w as f32;
+            let hf = h as f32;
+            for y in 0..h {
+                let v = (y as f32 + 0.5) / hf;
+                for x in 0..w {
+                    let at = (y * w + x) * 4;
+                    if rgba[at] == 0 {
+                        continue;
+                    }
+                    let raw_u = (x as f32 + 0.5) / wf;
+                    let u = if mirror_x { 1.0 - raw_u } else { raw_u };
+                    let val = sample_mask_bilinear(tex, u, v);
+                    rgba[at..at + 4].copy_from_slice(&[val, val, val, val]);
+                }
+            }
+        }
+    }
+
+    // Clip every owner mask against the same-job FaceMask so side-profile
+    // polygons never spill onto background pixels outside the face.
+    if let Some(fmask) = face_mask {
+        let fw = frame_size[0] as usize;
+        let fh = frame_size[1] as usize;
+        if fw > 0 && fh > 0 && fmask.len() == fw * fh {
+            for y in 0..h {
+                let sy = origin[1] + y as i32;
+                for x in 0..w {
+                    let sx = origin[0] + x as i32;
+                    let at = (y * w + x) * 4;
+                    if rgba[at] == 0 && rgba[at + 1] == 0 && rgba[at + 2] == 0 && rgba[at + 3] == 0
+                    {
+                        continue;
+                    }
+                    let fm = if sx >= 0 && sy >= 0 && (sx as usize) < fw && (sy as usize) < fh {
+                        fmask[sy as usize * fw + sx as usize] as u32
+                    } else {
+                        0
+                    };
+                    for c in 0..4 {
+                        rgba[at + c] = ((rgba[at + c] as u32 * fm + 127) / 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+
     Image::new(size[0] as u32, size[1] as u32, rgba)
         .map(Arc::new)
         .ok_or(Refusal::ShapeMismatch("makeup owner mask image"))
@@ -577,14 +1009,12 @@ mod tests {
         );
         assert_eq!(
             makeup_rows_2d_declared(),
-            &[100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032]
+            &[8, 9, 100, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032]
         );
         assert_eq!(
             makeup_rows_2d_declared(),
             MAKEUP_2D_ROWS.map(|row| row.pf).as_slice()
         );
-        assert!(!makeup_rows_2d_declared().contains(&8));
-        assert!(!makeup_rows_2d_declared().contains(&9));
         for pf in makeup_rows_2d_declared() {
             assert!(B3_MAKEUP_ROWS.contains(pf), "PF{pf} is not a B3 row");
             assert!(row_contract(*pf).is_some(), "PF{pf} has no contract");
@@ -686,11 +1116,7 @@ mod tests {
             Refusal::UnknownEffect(999)
         );
         for pf in [8, 9] {
-            assert_eq!(
-                selected_rows(&[pf]).unwrap_err(),
-                Refusal::MissingInput(FACESTEREO_OWNER_MASK_UNSUPPORTED),
-                "PF{pf} has no 2D owner-mask producer"
-            );
+            assert_eq!(selected_rows(&[pf]).unwrap(), vec![pf]);
         }
     }
 
@@ -698,8 +1124,9 @@ mod tests {
     fn every_row_names_its_material_png() {
         for contract in MAKEUP_2D_ROWS {
             assert!(
-                contract.material.starts_with("Makeups/"),
-                "PF{} material path is not under Makeups/",
+                contract.material.starts_with("Makeups/")
+                    || contract.material.starts_with("FaceStereo/"),
+                "PF{} material path is neither Makeups/ nor FaceStereo/",
                 contract.pf
             );
             assert!(contract.material.ends_with(".png"));
@@ -762,16 +1189,14 @@ mod facestereo_wiring_tests {
     use super::*;
 
     #[test]
-    fn facestereo_rows_have_no_2d_owner_mask_producer() {
-        // The first-class preset/material contract lives in
-        // `portrait_makeup_bundle::FACESTEREO_PRESET_ROWS`; this 2D wiring
-        // cannot synthesize its whole-face mask.
+    fn facestereo_rows_are_declared_with_2d_hull_masks() {
         for pf in [8, 9] {
-            assert_eq!(
-                selected_rows(&[pf]).unwrap_err(),
-                Refusal::MissingInput(FACESTEREO_OWNER_MASK_UNSUPPORTED)
-            );
-            assert!(!makeup_rows_2d_declared().contains(&pf));
+            assert_eq!(selected_rows(&[pf]).unwrap(), vec![pf]);
+            assert!(makeup_rows_2d_declared().contains(&pf));
+            let contract = row_contract(pf).unwrap();
+            assert!(contract.material.starts_with("FaceStereo/"));
+            let profile = row_profile_for_effect(pf, contract.source_effect).unwrap();
+            assert!(profile.requires_owner_mask());
         }
     }
 

@@ -4093,6 +4093,8 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     117,    // Eyebrow color makeup, right
     118,    // Lower eyelash color makeup
     30007,  // Lower eyeliner color makeup
+    0,      // PF0 Spotless (skin+face mask, local blur; vendor blur FBO LIVE_ONLY)
+    90085,  // PF90085 face skin-tone unify (reduced mask blend)
 ];
 
 /// Effect ids the Windows bridge can currently run from a frame, a mask and
@@ -5894,6 +5896,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             skin_mask.as_deref(),
             width,
             height,
+            region,
             inputs,
             hlf_auto.as_ref(),
         );
@@ -7361,6 +7364,18 @@ fn validate_effect_inputs(
                 return Err(Refusal::ValueOutOfRange("pf100007 displacement"));
             }
         }
+        0 => {
+            check_degree01(extra.get("pc:0").copied().unwrap_or_default(), "PF0 degree")?;
+            required(skin_mask, "PF0 skin mask")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            required(face_mask.as_deref(), "PF0 face mask")?;
+        }
+        90085 => {
+            check_degree01(extra.get("pc:90085").copied().unwrap_or_default(), "PF90085 degree")?;
+            required(skin_mask, "PF90085 skin mask")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            required(face_mask.as_deref(), "PF90085 face mask")?;
+        }
         _ => {}
     }
     Ok(())
@@ -7374,10 +7389,19 @@ fn apply_cpu_effect(
     skin_mask: Option<&[u8]>,
     width: u32,
     height: u32,
+    region: NormRect,
     inputs: &PortraitJobInputs<'_>,
     hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<Image, Refusal> {
     match pf {
+        0 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_pf0_spotless(current, degree, skin_mask, face_mask.as_deref())
+        }
+        90085 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_pf90085_face(current, degree, skin_mask, face_mask.as_deref())
+        }
         pf if B3_MAKEUP_ROWS.contains(&pf) => {
             apply_makeup_cpu(current, pf, degree, inputs)
         }
@@ -7416,6 +7440,129 @@ fn apply_cpu_effect(
         // to leave the frame unchanged.
         _ => Err(Refusal::NotImplemented(pf)),
     }
+}
+
+/// PF0 Spotless: vendor-proven blur-difference fragment with the frame's own
+/// SkinMask/FaceMask. The vendor blur FBO producer is still LIVE_ONLY, so this
+/// wiring uses a local separable box blur as a stand-in and makes NO parity claim.
+fn apply_pf0_spotless(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    use aurora_portrait::kernels::spotless::{self, ImageF32, SpotlessParams};
+    let skin = required(skin_mask, "PF0 skin mask")?;
+    let face = required(face_mask, "PF0 face mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF0 skin mask")?;
+    check_plane(face.len(), pixels, "PF0 face mask")?;
+    if degree <= 0.0 {
+        return Ok(current.clone());
+    }
+    let params = SpotlessParams {
+        dist_factor: 28.87,
+        dist_threshold: 0.5,
+        dark_diff_min_threshold: 0.0,
+        dark_diff_max_threshold: 0.3,
+        white_diff_factor: 0.7,
+        degree: degree.clamp(0.0, 1.0),
+    };
+    let src: Vec<f32> = current.pixels.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let blur_rgb = box_blur_rgba(current, 8);
+    let face_f: Vec<f32> = face.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let skin_f: Vec<f32> = skin.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let mut out = vec![0.0f32; src.len()];
+    spotless::apply(
+        ImageF32 { width: current.width, height: current.height, pixels: &src },
+        ImageF32 { width: current.width, height: current.height, pixels: &blur_rgb },
+        &face_f,
+        Some(&skin_f),
+        params,
+        &mut out,
+    )?;
+    let mut image = current.clone();
+    for (dst, pixel) in image.pixels.chunks_exact_mut(4).zip(out.chunks_exact(4)) {
+        for channel in 0..4 {
+            dst[channel] = (pixel[channel].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    Ok(image)
+}
+
+fn box_blur_rgba(image: &Image, radius: u32) -> Vec<f32> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let r = radius as i64;
+    let mut horizontal = vec![0.0f32; width * height * 3];
+    let mut out = vec![0.0f32; width * height * 4];
+    let x_last = width as i64 - 1;
+    let y_last = height as i64 - 1;
+    let count = (2 * r + 1) as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0f32; 3];
+            for dx in -r..=r {
+                let sx = (x as i64 + dx).clamp(0, x_last) as usize;
+                let offset = (y * width + sx) * 4;
+                for channel in 0..3 {
+                    sum[channel] += f32::from(image.pixels[offset + channel]);
+                }
+            }
+            let offset = (y * width + x) * 3;
+            for channel in 0..3 {
+                horizontal[offset + channel] = sum[channel] / count;
+            }
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0f32; 3];
+            for dy in -r..=r {
+                let sy = (y as i64 + dy).clamp(0, y_last) as usize;
+                let offset = (sy * width + x) * 3;
+                for channel in 0..3 {
+                    sum[channel] += horizontal[offset + channel];
+                }
+            }
+            let offset = (y * width + x) * 4;
+            for channel in 0..3 {
+                out[offset + channel] = sum[channel] / count / 255.0;
+            }
+            out[offset + 3] = 1.0;
+        }
+    }
+    out
+}
+
+/// PF90085 reduced CPU tail (`support = max(skin, face*0.39)`).
+fn apply_pf90085_face(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    use aurora_portrait::kernels::tone_unify::{self, Pass90085};
+    let skin = required(skin_mask, "PF90085 skin mask")?;
+    let face = required(face_mask, "PF90085 face mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF90085 skin mask")?;
+    check_plane(face.len(), pixels, "PF90085 face mask")?;
+    let pass = Pass90085 {
+        skin_mask: Some(skin),
+        face_mask_g: face,
+        parsing_a: None,
+        parsing_g: None,
+        parsing_b: None,
+        protect: None,
+        model_weight: None,
+        model_target: None,
+        target: None,
+    };
+    tone_unify::pf90085_apply(current, &pass, degree.clamp(0.0, 1.0) * 100.0)
 }
 
 fn apply_stray_hair_cpu(
@@ -7569,7 +7716,7 @@ fn hlf_rgb_f32_to_image(current: &Image, rgb: &[f32]) -> Result<Image, Refusal> 
     for (index, rgb) in rgb.chunks_exact(3).enumerate() {
         let offset = index * 4;
         for channel in 0..3 {
-            pixels[offset + channel] = StoreMode::TruncU8.quantize(rgb[channel]);
+            pixels[offset + channel] = StoreMode::Round.quantize(rgb[channel]);
         }
     }
     Ok(Image {
@@ -10113,6 +10260,7 @@ mod tests {
             None,
             2,
             2,
+            NormRect::FULL,
             &inputs,
             None,
         );

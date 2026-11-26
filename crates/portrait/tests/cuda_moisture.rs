@@ -3,7 +3,7 @@
 #[cfg(windows)]
 mod moisture_gpu {
     use aurora_portrait::cuda::CudaError;
-    use aurora_portrait::cuda_moisture::{Moisture, BODY_KERNEL, FACE_PTX_BLOCKER};
+    use aurora_portrait::cuda_moisture::{Moisture, BODY_KERNEL, FACE_KERNEL};
     use aurora_portrait::kernels::moisture::{self, FaceParams, Lut1D, MaskChannel, SkinMap};
     use aurora_portrait::{Image, Refusal};
 
@@ -62,7 +62,7 @@ mod moisture_gpu {
     }
 
     #[test]
-    fn face_stage_fails_closed_until_source_alpha_ptx_is_rebuilt() {
+    fn face_stage_matches_the_cpu_oracle() {
         let Some(gpu) = gpu() else { return };
         let hardlight = ramp(64);
         let beauty = ramp(32);
@@ -74,7 +74,18 @@ mod moisture_gpu {
             let source = canvas(width, height, width as u64 * 31 + height as u64);
             let mask = plane(pixels * 4, width as u64 * 7 + height as u64);
             let blur = plane(pixels, width as u64 * 11 + height as u64);
-            let error = gpu
+            let expected = moisture::face_apply(
+                &source,
+                &mask,
+                &blur,
+                &params,
+                MaskChannel::R,
+                &skin_map,
+                &Lut1D { samples: &hardlight },
+                &Lut1D { samples: &beauty },
+            )
+            .unwrap();
+            let (actual, dispatches) = gpu
                 .face_apply(
                     &source,
                     &mask,
@@ -85,11 +96,16 @@ mod moisture_gpu {
                     &Lut1D { samples: &hardlight },
                     &Lut1D { samples: &beauty },
                 )
-                .unwrap_err();
-            assert_eq!(
-                error,
-                CudaError::Refused(Refusal::MissingInput(FACE_PTX_BLOCKER))
-            );
+                .expect("real GPU dispatch");
+            let differing = expected
+                .pixels
+                .iter()
+                .zip(&actual.pixels)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(differing, 0, "{width}x{height}: {differing} bytes differ");
+            assert_eq!(dispatches.len(), 1);
+            assert_eq!(dispatches[0].kernel, FACE_KERNEL);
         }
     }
 

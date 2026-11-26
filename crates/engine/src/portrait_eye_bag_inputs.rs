@@ -52,11 +52,15 @@ pub const PF101_MATERIAL_ENV: &str = "AURORA_PF101_MATERIAL";
 pub const PF101_MATERIAL_ROOT_ENV: &str = "AURORA_MAKEUP_MATERIAL_ROOT";
 /// Recovered left-eye material under the decrypted config root.
 pub const PF101_MATERIAL_RELATIVE: &str = "Makeups/Silkworm/SILK00000001/wcz1.png";
+/// Private-asset layout for the same decrypted PNG, matching the other
+/// portrait materials (`private-assets/portrait/...`).
+pub const PF101_PRIVATE_RELATIVE: &str =
+    "portrait/makeup/Makeups/Silkworm/SILK00000001/wcz1.png";
 
-/// Left eye corner indices, matching the `PF30073` lower-lid path.
-pub const PF101_LEFT_EYE_CORNERS: (usize, usize) = (57, 63);
-/// Right eye corner indices, matching the `PF30073` lower-lid path.
-pub const PF101_RIGHT_EYE_CORNERS: (usize, usize) = (77, 83);
+/// Left eye outer/inner corner indices in the 142-point primary template.
+pub const PF101_LEFT_EYE_CORNERS: (usize, usize) = (18, 22);
+/// Right eye inner/outer corner indices in the 142-point primary template.
+pub const PF101_RIGHT_EYE_CORNERS: (usize, usize) = (40, 36);
 
 impl crate::portrait_face_input_stage::FaceInputBundle {
     /// Builds and attaches PF101 inputs for this exact frame/job.
@@ -70,12 +74,31 @@ impl crate::portrait_face_input_stage::FaceInputBundle {
         control: f32,
         producer: &mut ProducerInputs,
     ) -> Result<(), Refusal> {
+        self.attach_pf101_inputs_with_style(source, control, 0, producer)
+    }
+
+    pub fn attach_pf101_inputs_with_style(
+        &self,
+        source: &Image,
+        control: f32,
+        style_index: usize,
+        producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
         self.validate_ticket(source, Some(self.job_id))?;
         source
             .validate()
             .map_err(|_| Refusal::ShapeMismatch(PF101_SOURCE))?;
         let params = pf101_params(control)?;
-        let material = load_pf101_material()?;
+        let material = if style_index >= 1 {
+            let presets = crate::portrait_makeup_wiring::makeup_presets_for_pf(101);
+            if let Some(preset) = presets.get((style_index - 1).min(presets.len().saturating_sub(1))) {
+                load_pf101_material_from(&[preset.path.clone()]).or_else(|_| load_pf101_material())?
+            } else {
+                load_pf101_material()?
+            }
+        } else {
+            load_pf101_material()?
+        };
         let face_mask = build_face_mask(source, &self.points194, self.roi_xywh)?;
         let (mask_uv, material_uv) = build_band_uvs(source, &self.points194)?;
         producer.pf101 = Some(Pf101ProducerInputs::from_same_job(
@@ -116,6 +139,12 @@ fn material_candidates() -> Vec<PathBuf> {
     }
     if let Some(root) = std::env::var_os(PF101_MATERIAL_ROOT_ENV).map(PathBuf::from) {
         candidates.push(root.join(PF101_MATERIAL_RELATIVE));
+    }
+    if let Some(root) = crate::portrait_makeup_wiring::makeup_asset_root() {
+        candidates.push(root.join(PF101_MATERIAL_RELATIVE));
+    }
+    if let Some(path) = aurora_portrait::private_assets::path(PF101_PRIVATE_RELATIVE) {
+        candidates.push(path);
     }
     candidates
 }

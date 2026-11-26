@@ -214,6 +214,25 @@ fn all_eight_plump_rows_execute_one_same_job_group() {
 }
 
 #[test]
+fn empty_split_mask_with_unchanged_composite_is_not_ready() {
+    let source = frame();
+    let requested = [30_197];
+    let mut inputs = producer(&source, &requested);
+    let output = inputs.model_output.as_mut().unwrap();
+    output.tensor.data[12..].fill(1.0);
+    inputs.final_composite.as_mut().unwrap().frame = source.clone();
+
+    let outcome = portrait_plump_stage::apply(
+        &source,
+        &requested.into_iter().collect(),
+        None,
+        Some(TICKET),
+        Some(&inputs),
+    );
+    assert_eq!(outcome, Err(Refusal::MissingInput("FacePlump split-mask coverage")));
+}
+
+#[test]
 fn absent_model_output_or_final_composite_is_typed_refusal() {
     let source = frame();
     let requested = vec![30_191];

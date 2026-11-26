@@ -139,7 +139,8 @@ extern "C" __global__ void global_avgpool_nchw_f32(
     }
 }
 
-extern "C" __global__ void reduce_mean_f32(
+// reduction: 0 = mean, 1 = sum, 2 = max
+extern "C" __global__ void reduce_axis_f32(
     const float* __restrict__ input,
     float* __restrict__ output,
     int in_d0,
@@ -148,7 +149,8 @@ extern "C" __global__ void reduce_mean_f32(
     int in_d3,
     int in_d4,
     int reduce_mask,
-    int out_total
+    int out_total,
+    int reduction
 ) {
     int out_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (out_idx >= out_total) return;
@@ -179,6 +181,7 @@ extern "C" __global__ void reduce_mean_f32(
     int s0 = s1 * in_d1;
 
     double sum = 0.0;
+    float maximum = __int_as_float(0xff800000u);
     for (int i0 = 0; i0 < red_d0; ++i0) {
         int o0 = (b0 + i0) * s0;
         for (int i1 = 0; i1 < red_d1; ++i1) {
@@ -188,7 +191,16 @@ extern "C" __global__ void reduce_mean_f32(
                 for (int i3 = 0; i3 < red_d3; ++i3) {
                     int o3 = o2 + (b3 + i3) * s3;
                     for (int i4 = 0; i4 < red_d4; ++i4) {
-                        sum += (double)input[o3 + (b4 + i4) * s4];
+                        float value = input[o3 + (b4 + i4) * s4];
+                        if (reduction == 2) {
+                            if (isnan(value)) {
+                                output[out_idx] = value;
+                                return;
+                            }
+                            maximum = fmaxf(maximum, value);
+                        } else {
+                            sum += (double)value;
+                        }
                     }
                 }
             }
@@ -196,7 +208,13 @@ extern "C" __global__ void reduce_mean_f32(
     }
 
     int red_total = red_d0 * red_d1 * red_d2 * red_d3 * red_d4;
-    output[out_idx] = (red_total > 0) ? (float)(sum / (double)red_total) : 0.0f;
+    if (reduction == 2) {
+        output[out_idx] = maximum;
+    } else if (reduction == 1) {
+        output[out_idx] = (float)sum;
+    } else {
+        output[out_idx] = red_total > 0 ? (float)(sum / (double)red_total) : 0.0f;
+    }
 }
 
 // ============================================================================
@@ -230,11 +248,17 @@ extern "C" __global__ void resize_nchw_f32(
     double scale_h = (double)out_h / (double)in_h;
     double scale_w = (double)out_w / (double)in_w;
 
-    if (mode == 0) {
-        // ONNX linear + half_pixel:
-        // x_orig = (x_resized + 0.5) / scale - 0.5
-        double fy = ((double)oh + 0.5) / scale_h - 0.5;
-        double fx = ((double)ow + 0.5) / scale_w - 0.5;
+    if (mode == 0 || mode == 3) {
+        double fy;
+        double fx;
+        if (mode == 3) {
+            // ONNX align_corners maps the first and last output centers to the input endpoints.
+            fy = out_h > 1 ? (double)oh * (in_h - 1) / (out_h - 1) : 0.0;
+            fx = out_w > 1 ? (double)ow * (in_w - 1) / (out_w - 1) : 0.0;
+        } else {
+            fy = ((double)oh + 0.5) / scale_h - 0.5;
+            fx = ((double)ow + 0.5) / scale_w - 0.5;
+        }
 
         if (fy < 0.0) fy = 0.0;
         if (fy > (double)(in_h - 1)) fy = (double)(in_h - 1);

@@ -105,7 +105,7 @@ fn hlf_face_image(current: &Image, rgb: &[f32]) -> Image {
     let mut pixels = current.pixels.clone();
     for (index, rgb) in rgb.chunks_exact(3).enumerate() {
         for channel in 0..3 {
-            pixels[index * 4 + channel] = StoreMode::TruncU8.quantize(rgb[channel]);
+            pixels[index * 4 + channel] = StoreMode::Round.quantize(rgb[channel]);
         }
     }
     Image::new(current.width, current.height, pixels).unwrap()

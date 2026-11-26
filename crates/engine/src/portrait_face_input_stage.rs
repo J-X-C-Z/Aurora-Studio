@@ -994,7 +994,8 @@ impl FaceInputBundle {
                 color: [0, 1, 2],
                 split_mask: 3,
             },
-            color_encoding: aurora_portrait::kernels::plump_pipeline::ColorEncoding::Unit,
+            color_encoding:
+                aurora_portrait::kernels::plump_pipeline::ColorEncoding::VendorResidualSignedUnit,
         })?;
         producer.write_plump(plump);
         Ok(())
@@ -1330,8 +1331,15 @@ impl FaceInputBundle {
         }
 
         if c90086 != 0.0 {
-            let m = body_mask_f32;
-            let o = vec![0.0f32; pixels];
+            // PF90086 binds M/O as three linear f32 channels per pixel
+            // (see kernels::makeup::body_tone_unify). The parsing body mask is
+            // scalar-per-pixel; expand it to RGB and keep O zero. This is a
+            // derived M/O plane, not a recovered vendor model output.
+            let mut m = Vec::with_capacity(pixels * 3);
+            for &weight in &body_mask_f32 {
+                m.extend_from_slice(&[weight, weight, weight]);
+            }
+            let o = vec![0.0f32; pixels * 3];
             rows.push(HistoricalSkinImmediateRow {
                 pf: 90086,
                 ticket: self.job_id,
@@ -2028,58 +2036,177 @@ impl FaceInputBundle {
             });
         }
 
-        // PF44124 / PF48019 (eyebrowHeadLength) and PF49221 / PF41922 (eyebrowTailLength) via Type1018 EBO
-        let type1018_ebo = eye_geometry::type1018_ordered_ebo();
-        for (left_pf, right_pf, is_head) in [(44124u32, 48019u32, true), (49221, 41922, false)] {
-            let c_left = control(left_pf);
-            let c_right = control(right_pf);
-            if c_left == 0.0 && c_right == 0.0 {
-                continue;
-            }
-            let (left_anchor, right_anchor, dir_l, dir_r) = if is_head {
-                (points194[24], points194[44], [1.0f32, 0.0], [-1.0f32, 0.0])
-            } else {
-                (points194[31], points194[51], [-1.0f32, 0.0], [1.0f32, 0.0])
+        // PF44124 / PF48019 (eyebrowHeadLength) and PF49221 / PF41922 (eyebrowTailLength)
+        // via proven Type1018 dual-side 192-vertex mesh + 996-index EBO + SHORT_TABLES / LONG_TABLES.
+        let c_head_l = control(44124);
+        let c_head_r = control(48019);
+        let c_tail_l = control(49221);
+        let c_tail_r = control(41922);
+        if c_head_l != 0.0 || c_head_r != 0.0 || c_tail_l != 0.0 || c_tail_r != 0.0 {
+            use aurora_portrait::kernels::brow_length_exact_vendor::{
+                self as brow_vendor, BrowGuide, BrowPart, Point as VendorPoint,
             };
-            let radius = (brow_span * 0.14).max(8.0);
-            let mut src_102 = Vec::with_capacity(102);
-            let mut dst_102 = Vec::with_capacity(102);
-            for _ in 0..6 {
-                src_102.push([left_anchor.x, left_anchor.y]);
-                dst_102.push([left_anchor.x, left_anchor.y]);
-            }
-            // Four 24-slot rings split between left (0..12) and right (12..24) brow tips
-            for ring in 0..4 {
-                let ring_scale = 0.25 * (ring + 1) as f32;
-                let weight = 1.0 - ring as f32 * 0.25;
-                for slot in 0..24 {
-                    let (anchor, dir, deg) = if slot < 12 {
-                        (left_anchor, dir_l, c_left)
-                    } else {
-                        (right_anchor, dir_r, c_right)
+
+            // INFERRED: `points194` brow anchor indices (left head/mid/tail = 24/27/31,
+            // right head/mid/tail = 44/47/51) and jaw/face contour slice `0..24` approximate
+            // PixelCake's internal 293-point `face_info+0x924` and 56-point contour; exact
+            // index correspondence still requires live same-photo verification.
+            let build_side_guide = |head: Point, mid: Point, tail: Point, fallback_dir_x: f32| {
+                let dx = tail.x - head.x;
+                let dy = tail.y - head.y;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len > 1e-3 && len.is_finite() {
+                    let guide = BrowGuide {
+                        start: VendorPoint::new(head.x, head.y),
+                        center: VendorPoint::new(mid.x, mid.y),
+                        end: VendorPoint::new(tail.x, tail.y),
                     };
-                    let theta = (slot % 12) as f32 / 12.0 * std::f32::consts::TAU;
-                    let sx = anchor.x + theta.cos() * radius * ring_scale;
-                    let sy = anchor.y + theta.sin() * radius * 0.7 * ring_scale;
-                    let shift = deg * radius * 0.35 * weight;
-                    src_102.push([(sx / w).clamp(0.0, 1.0), (sy / h).clamp(0.0, 1.0)]);
-                    dst_102.push([sx + dir[0] * shift, sy + dir[1] * shift]);
+                    (guide, [dx / len, dy / len], len * 0.5)
+                } else {
+                    let half = (brow_span * 0.28).max(8.0);
+                    let start = VendorPoint::new(mid.x - fallback_dir_x * half, mid.y);
+                    let end = VendorPoint::new(mid.x + fallback_dir_x * half, mid.y);
+                    let guide = BrowGuide {
+                        start,
+                        center: VendorPoint::new(mid.x, mid.y),
+                        end,
+                    };
+                    (guide, [fallback_dir_x, 0.0], half)
+                }
+            };
+
+            let (guide_left, axis_l, half_l) =
+                build_side_guide(points194[24], points194[27], points194[31], -1.0);
+            let (guide_right, axis_r, half_r) =
+                build_side_guide(points194[44], points194[47], points194[51], 1.0);
+
+            // Build 192-vertex dual-side source mesh: left brow `0..96` (4 rings x 24)
+            // and right brow `96..192` (4 rings x 24), where Ring 3 is the outer border
+            // anchor ring (zero displacement under `0x707ED50`).
+            // INFERRED: ring expansion ratios `[1.0, 1.6, 2.1, 2.5]` follow `0x707F550`
+            // outer-ring ratios over a closed 24-point brow contour; exact Catmull-Rom
+            // control-point mapping from `points194` to `face_info+0x924` awaits live parity.
+            const RING_SCALES: [f32; 4] = [1.0, 1.6, 2.1, 2.5];
+            let mut src_192 = Vec::with_capacity(eye_geometry::TYPE1018_VERTEX_COUNT);
+            for (guide, axis, half_len) in [
+                (guide_left, axis_l, half_l),
+                (guide_right, axis_r, half_r),
+            ] {
+                let mut normal = [-axis[1], axis[0]];
+                if normal[1] > 0.0 {
+                    normal = [-normal[0], -normal[1]];
+                }
+                let base_ry = (half_len * 0.28).max(4.0);
+                for &ring_scale in &RING_SCALES {
+                    let rx = half_len * ring_scale;
+                    let ry = base_ry * ring_scale;
+                    // Upper arc: indices 0..=12 (head u=-1 -> tail u=+1)
+                    for i in 0..=12usize {
+                        let u = (i as f32 / 12.0) * 2.0 - 1.0;
+                        let arch = (1.0 - u * u).max(0.0).sqrt();
+                        let px = guide.center.x + axis[0] * (u * rx) + normal[0] * (arch * ry);
+                        let py = guide.center.y + axis[1] * (u * rx) + normal[1] * (arch * ry);
+                        src_192.push(Point::new(px, py));
+                    }
+                    // Lower arc: indices 13..24 (tail -> head, matching `0x707DE40` EBO closure)
+                    for k in 0..11usize {
+                        let u = 1.0 - ((k + 1) as f32 / 12.0) * 2.0;
+                        let arch = (1.0 - u * u).max(0.0).sqrt();
+                        let px = guide.center.x + axis[0] * (u * rx) - normal[0] * (arch * ry);
+                        let py = guide.center.y + axis[1] * (u * rx) - normal[1] * (arch * ry);
+                        src_192.push(Point::new(px, py));
+                    }
                 }
             }
-            draws.push(super::FaceGeometryDraw {
-                pf: left_pf,
-                controls: [c_left, c_right],
-                source_sha256: digest,
-                geometry: super::FaceGeometry::Eye {
-                    dest: dst_102,
-                    uv: src_102,
-                    ebo: type1018_ebo.clone(),
-                    rules,
-                    edge: FragmentEdge::ReshapeNormal,
-                    defines: Defines::plain(),
-                    clamp: Clamp::disabled(),
-                },
-            });
+            debug_assert_eq!(src_192.len(), eye_geometry::TYPE1018_VERTEX_COUNT);
+
+            // Native `0x4C976F0` UV normalization: `src_pts *= (1/W, 1/H)`.
+            let uv_192: Vec<[f32; 2]> = src_192.iter().map(|p| [p.x / w, p.y / h]).collect();
+            let type1018_ebo = eye_geometry::type1018_dual_ordered_ebo();
+
+            // INFERRED: `points194[0..24]` approximates the face contour for `0x707E820`
+            // tail-distance attenuation, and per-side frame visibility (`[face+0x618]` /
+            // `[face+0x63c]`) is not yet produced by `points194`, defaulting to `1.0`.
+            let contour_slice = &points194[..24];
+            let tail_atten_l = eye_geometry::brow_tail_contour_atten(
+                Point::new(guide_left.end.x, guide_left.end.y),
+                half_l * 2.0,
+                contour_slice,
+            );
+            let tail_atten_r = eye_geometry::brow_tail_contour_atten(
+                Point::new(guide_right.end.x, guide_right.end.y),
+                half_r * 2.0,
+                contour_slice,
+            );
+            let vis_left = 1.0f32;
+            let vis_right = 1.0f32;
+
+            let ui_from_signed = |signed: f32| ((signed + 1.0) * 0.5).clamp(0.0, 1.0);
+
+            for (left_pf, right_pf, c_left, c_right, is_head) in [
+                (44124u32, 48019u32, c_head_l, c_head_r, true),
+                (49221u32, 41922u32, c_tail_l, c_tail_r, false),
+            ] {
+                if c_left == 0.0 && c_right == 0.0 {
+                    continue;
+                }
+                eye_geometry::stage_ebo_gate(left_pf, &type1018_ebo, src_192.len())
+                    .map_err(|_| Refusal::ShapeMismatch("type1018 dual EBO gate"))?;
+                let _ = right_pf;
+
+                let ui_l = ui_from_signed(c_left);
+                let ui_r = ui_from_signed(c_right);
+                let mut dst_192: Vec<[f32; 2]> = src_192.iter().map(|p| [p.x, p.y]).collect();
+
+                for part in [BrowPart::Short, BrowPart::Long] {
+                    let degrees = if is_head {
+                        let hl = brow_vendor::part_degree(part, 0, ui_l)
+                            .map_err(|_| Refusal::ValueOutOfRange("brow head left degree"))?;
+                        let hr = brow_vendor::part_degree(part, 1, ui_r)
+                            .map_err(|_| Refusal::ValueOutOfRange("brow head right degree"))?;
+                        [hl, hr, 0.0, 0.0]
+                    } else {
+                        let raw_tl = brow_vendor::part_degree(part, 2, ui_l)
+                            .map_err(|_| Refusal::ValueOutOfRange("brow tail left degree"))?;
+                        let raw_tr = brow_vendor::part_degree(part, 3, ui_r)
+                            .map_err(|_| Refusal::ValueOutOfRange("brow tail right degree"))?;
+                        let tl = brow_vendor::gate_tail_degree(raw_tl, vis_left) * tail_atten_l;
+                        let tr = brow_vendor::gate_tail_degree(raw_tr, vis_right) * tail_atten_r;
+                        [0.0, 0.0, tl, tr]
+                    };
+                    if degrees == [0.0; 4] {
+                        continue;
+                    }
+                    let evaluated = eye_geometry::brow_length_consumer_dual(
+                        part,
+                        &src_192,
+                        guide_left,
+                        guide_right,
+                        degrees,
+                        None,
+                    )
+                    .map_err(|_| Refusal::ShapeMismatch("type1018 brow length dual consumer"))?;
+                    for (dst_pt, delta) in dst_192.iter_mut().zip(evaluated.deltas.iter()) {
+                        dst_pt[0] += delta.x;
+                        dst_pt[1] += delta.y;
+                    }
+                }
+
+                draws.push(super::FaceGeometryDraw {
+                    pf: left_pf,
+                    controls: [c_left, c_right],
+                    source_sha256: digest,
+                    geometry: super::FaceGeometry::Eye {
+                        dest: dst_192,
+                        uv: uv_192.clone(),
+                        ebo: type1018_ebo.clone(),
+                        rules,
+                        edge: FragmentEdge::ReshapeNormal,
+                        defines: Defines::plain(),
+                        clamp: Clamp::disabled(),
+                    },
+                });
+            }
         }
 
         if !draws.is_empty() {
@@ -4493,5 +4620,80 @@ mod frame_digest_scope_tests {
             Err(Refusal::ValueOutOfRange("face input source digest"))
         );
         assert_eq!(frame_digest_computes(), 2);
+    }
+
+    #[test]
+    fn attach_eye_and_brow_emits_192_vertex_996_ebo_with_ring3_anchored() {
+        let source = Image::solid(256, 256, [120, 110, 100, 255]);
+        let mut b = bundle(JOB, &source);
+        // Place synthetic contour (0..24) far enough from brows and distinct left/right brow landmarks.
+        for i in 0..24 {
+            let theta = i as f32 / 24.0 * std::f32::consts::TAU;
+            b.points194[i] = [128.0 + theta.cos() * 110.0, 136.0 + theta.sin() * 110.0];
+        }
+        // Left brow (head=24, mid=27, tail=31)
+        b.points194[24] = [110.0, 96.0];
+        b.points194[27] = [90.0, 92.0];
+        b.points194[31] = [70.0, 96.0];
+        // Right brow (head=44, mid=47, tail=51)
+        b.points194[44] = [146.0, 96.0];
+        b.points194[47] = [166.0, 92.0];
+        b.points194[51] = [186.0, 96.0];
+
+        let mut extra = std::collections::BTreeMap::new();
+        // Left head short (-0.6), right head long (+0.8), left tail long (+0.7), right tail short (-0.5)
+        extra.insert("pc:44124".to_string(), -0.6);
+        extra.insert("pc:48019".to_string(), 0.8);
+        extra.insert("pc:49221".to_string(), 0.7);
+        extra.insert("pc:41922".to_string(), -0.5);
+
+        let mut producer = ProducerInputs::default();
+        b.attach_eye_and_brow_geometry(&source, &extra, &mut producer)
+            .expect("attach brow length 192/996");
+        let fg = producer
+            .face_geometry
+            .as_ref()
+            .expect("face_geometry attached");
+        assert_eq!(fg.draws.len(), 2);
+
+        for (draw, expected_pf, expected_controls) in [
+            (&fg.draws[0], 44124u32, [-0.6f32, 0.8f32]),
+            (&fg.draws[1], 49221u32, [0.7f32, -0.5f32]),
+        ] {
+            assert_eq!(draw.pf, expected_pf);
+            assert_eq!(draw.controls, expected_controls);
+            let super::super::FaceGeometry::Eye { dest, uv, ebo, .. } = &draw.geometry else {
+                panic!("expected FaceGeometry::Eye for PF{expected_pf}");
+            };
+            assert_eq!(dest.len(), 192);
+            assert_eq!(uv.len(), 192);
+            assert_eq!(ebo.len(), 996);
+            assert_eq!(ebo.iter().copied().min(), Some(0));
+            assert_eq!(ebo.iter().copied().max(), Some(191));
+            assert_eq!(
+                aurora_portrait::kernels::eye_geometry::stage_ebo_gate(
+                    expected_pf,
+                    ebo,
+                    dest.len()
+                ),
+                Ok(332)
+            );
+            // Ring 3 (left 72..96, right 168..192) must remain anchored at source position (uv * size).
+            for slot in (72..96).chain(168..192) {
+                let sx = uv[slot][0] * source.width as f32;
+                let sy = uv[slot][1] * source.height as f32;
+                assert!((dest[slot][0] - sx).abs() < 1e-4, "PF{expected_pf} slot {slot} x drifted");
+                assert!((dest[slot][1] - sy).abs() < 1e-4, "PF{expected_pf} slot {slot} y drifted");
+            }
+            // Active rings must have non-zero displacement.
+            let active_moved = (0..72)
+                .chain(96..168)
+                .any(|slot| {
+                    let sx = uv[slot][0] * source.width as f32;
+                    let sy = uv[slot][1] * source.height as f32;
+                    (dest[slot][0] - sx).abs() > 1e-3 || (dest[slot][1] - sy).abs() > 1e-3
+                });
+            assert!(active_moved, "PF{expected_pf} active rings did not displace");
+        }
     }
 }

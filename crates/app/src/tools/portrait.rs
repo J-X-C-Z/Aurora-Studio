@@ -16,7 +16,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, prelude::FluentBuilder as _, px,
+    div, prelude::FluentBuilder as _, px, rgb,
 };
 
 use crate::contract::{self, BANDS, Band, PortraitParam, Status};
@@ -186,8 +186,8 @@ const WIRED_FACE_GEOMETRY_EFFECTS: &[(&str, &str, &str)] = &[
     ("pc:8022", "Brow position (R)", "眉位（右）"),
     ("pc:44124", "Brow head length (L)", "眉头长短（左）"),
     ("pc:48019", "Brow head length (R)", "眉头长短（右）"),
-    ("pc:41922", "Brow tail length (L)", "眉尾长短（左）"),
-    ("pc:49221", "Brow tail length (R)", "眉尾长短（右）"),
+    ("pc:49221", "Brow tail length (L)", "眉尾长短（左）"),
+    ("pc:41922", "Brow tail length (R)", "眉尾长短（右）"),
 ];
 
 const WIRED_FACE_SINGLE_EFFECTS: &[(&str, &str, &str)] = &[
@@ -487,6 +487,149 @@ fn live_slider(state: &Entity<AppState>, key: &'static str, en: &'static str, zh
     slider.default_value(default * 100.0).into_any_element()
 }
 
+fn makeup_style_bar_for_key(
+    state: &Entity<AppState>,
+    key: &'static str,
+    cx: &App,
+) -> Option<AnyElement> {
+    let pf: u32 = key.strip_prefix("pc:")?.parse().ok()?;
+    // Right brow (117) shares style & color controls with left brow (100).
+    if pf == 117 {
+        return None;
+    }
+    let presets = aurora_engine::makeup_presets_for_pf(pf);
+    let palette = aurora_engine::makeup_palette_for_pf(pf);
+    if presets.len() <= 1 && palette.is_empty() {
+        return None;
+    }
+    let s = state.read(cx);
+    let p = pal(cx);
+    let style_key = format!("pc:{pf}:style");
+    let color_key = format!("pc:{pf}:color");
+    let total = presets.len().max(1);
+    let cur_style = s
+        .adj()
+        .extra
+        .get(&style_key)
+        .copied()
+        .unwrap_or(1.0)
+        .round()
+        .clamp(1.0, total as f32) as usize;
+    let cur_color = s
+        .adj()
+        .extra
+        .get(&color_key)
+        .copied()
+        .unwrap_or(1.0)
+        .round()
+        .max(1.0) as usize;
+
+    let mut row = h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(px(6.0))
+        .pl(px(4.0))
+        .pb(px(4.0));
+
+    if presets.len() > 1 {
+        let prev_idx = if cur_style <= 1 { total } else { cur_style - 1 };
+        let next_idx = if cur_style >= total { 1 } else { cur_style + 1 };
+        let sk_prev = style_key.clone();
+        let sk_next = style_key.clone();
+        let st_prev = state.clone();
+        let st_next = state.clone();
+        let label = format!("{} {:02}/{:02}", t("Style", "款式"), cur_style, total);
+        let switcher = h_flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .id(SharedString::from(format!("mk-prev-{pf}")))
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.edge)
+                    .text_size(px(10.0))
+                    .text_color(p.text_muted)
+                    .cursor_pointer()
+                    .child("◀")
+                    .on_click(move |_, _, cx| {
+                        let sk = sk_prev.clone();
+                        st_prev.update(cx, |s, cx| {
+                            s.edit("Switch makeup style", |a| {
+                                a.extra.insert(sk, prev_idx as f32);
+                            }, cx)
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("mk-next-{pf}")))
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.edge)
+                    .text_size(px(10.0))
+                    .text_color(p.text_muted)
+                    .cursor_pointer()
+                    .child("▶")
+                    .on_click(move |_, _, cx| {
+                        let sk = sk_next.clone();
+                        st_next.update(cx, |s, cx| {
+                            s.edit("Switch makeup style", |a| {
+                                a.extra.insert(sk, next_idx as f32);
+                            }, cx)
+                        });
+                    }),
+            );
+        row = row.child(switcher);
+    }
+
+    if !palette.is_empty() {
+        let mut swatches = h_flex().items_center().gap(px(4.0));
+        for (idx, (_name, rgba)) in palette.iter().enumerate() {
+            let color_idx = idx + 1;
+            let selected = cur_color == color_idx;
+            let packed = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | (rgba[2] as u32);
+            let ck = color_key.clone();
+            let st_c = state.clone();
+            swatches = swatches.child(
+                div()
+                    .id(SharedString::from(format!("mk-col-{pf}-{color_idx}")))
+                    .w(px(13.0))
+                    .h(px(13.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(packed))
+                    .border_1()
+                    .border_color(if selected { p.text } else { p.edge })
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let ck = ck.clone();
+                        st_c.update(cx, |s, cx| {
+                            s.edit("Switch makeup color", |a| {
+                                a.extra.insert(ck, color_idx as f32);
+                            }, cx)
+                        });
+                    }),
+            );
+        }
+        row = row.child(swatches);
+    }
+
+    Some(row.into_any_element())
+}
+
 /// Sectioned live panel shared by Skin Adjustment and Makeup.
 fn sectioned_live_panel(
     state: &Entity<AppState>,
@@ -513,7 +656,12 @@ fn sectioned_live_panel(
             continue;
         }
         rows.push(caption(t(en, zh), cx));
-        rows.extend(hits.into_iter().map(|(key, en, zh, default)| live_slider(state, key, en, zh, *default, cx)));
+        for (key, en, zh, default) in hits {
+            rows.push(live_slider(state, key, en, zh, *default, cx));
+            if let Some(bar) = makeup_style_bar_for_key(state, key, cx) {
+                rows.push(bar);
+            }
+        }
     }
     if rows.is_empty() {
         return div().into_any_element();
@@ -528,6 +676,9 @@ fn sectioned_live_panel(
                 s.edit(reset_label, |a| {
                     for k in &keys {
                         a.extra.remove(*k);
+                        a.extra.remove(&format!("{k}:style"));
+                        a.extra.remove(&format!("{k}:color"));
+                        a.extra.remove(&format!("{k}:rgb"));
                     }
                 }, cx)
             })
@@ -556,6 +707,13 @@ fn simple_live_panel(
     if hits.is_empty() {
         return div().into_any_element();
     }
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for (key, en, zh, default) in hits {
+        rows.push(live_slider(state, key, en, zh, *default, cx));
+        if let Some(bar) = makeup_style_bar_for_key(state, key, cx) {
+            rows.push(bar);
+        }
+    }
     let st = state.clone();
     ToolPanel::new(state, id, title)
         .status(status)
@@ -566,11 +724,14 @@ fn simple_live_panel(
                 s.edit(reset_label, |a| {
                     for k in &keys {
                         a.extra.remove(*k);
+                        a.extra.remove(&format!("{k}:style"));
+                        a.extra.remove(&format!("{k}:color"));
+                        a.extra.remove(&format!("{k}:rgb"));
                     }
                 }, cx)
             })
         })
-        .children(hits.into_iter().map(|(key, en, zh, default)| live_slider(state, key, en, zh, *default, cx)))
+        .children(rows)
         .into_any_element()
 }
 
@@ -745,16 +906,23 @@ fn wired_plump_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElem
             })
         })
         .children(shown.into_iter().map(|(key, en, zh)| {
-            param(
-                state,
-                format!("fp-{key}"),
-                t(*en, *zh),
-                extra_binding(*key, 0.0),
-                -100.0,
-                100.0,
-                cx,
-            )
-            .default_value(0.0)
+            if *key == "pc:30210" {
+                let inner = extra_binding(*key, 0.0);
+                let (get, set) = (inner.get.clone(), inner.set.clone());
+                let stepped = Binding::new(move |a| get(a), move |a, v| set(a, v.round().clamp(0.0, 4.0)));
+                param(state, format!("fp-{key}"), t(*en, *zh), stepped, 0.0, 4.0, cx).default_value(0.0)
+            } else {
+                param(
+                    state,
+                    format!("fp-{key}"),
+                    t(*en, *zh),
+                    extra_binding(*key, 0.0),
+                    -100.0,
+                    100.0,
+                    cx,
+                )
+                .default_value(0.0)
+            }
         }))
         .into_any_element()
 }

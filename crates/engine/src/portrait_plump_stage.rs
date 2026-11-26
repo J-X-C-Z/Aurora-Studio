@@ -338,6 +338,11 @@ pub fn apply(
         composite,
         input.backend,
     )?;
+    if layer.alpha_binary.bytes.iter().all(|&alpha| alpha == 0)
+        && composite.frame.pixels == current.pixels
+    {
+        return Err(Refusal::MissingInput("FacePlump split-mask coverage"));
+    }
 
     Ok(Some(PlumpGroupRun {
         requested_pfs,

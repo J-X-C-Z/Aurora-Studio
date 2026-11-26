@@ -1153,7 +1153,13 @@ pub fn produce_owned_makeup_bundle(
         source_sha256: inputs.source_sha256,
         rows: &borrowed_rows,
     }))?;
-    let suit = load_owned_suit_bundle()?;
+    // PF90033 suit data is not a B3 makeup input. A missing private preset
+    // tree must not refuse the 2D makeup bundle; `suit_live` still reports its
+    // own gap when a suit effect actually runs.
+    let suit = load_owned_suit_bundle().unwrap_or_else(|error| {
+        log::warn!("suit presets unavailable; B3 makeup keeps only 2D rows: {error:?}");
+        OwnedSuitBundle::empty()
+    });
 
     let mut rows = Vec::with_capacity(produced.rows.len());
     for row in produced.rows {
@@ -1513,6 +1519,19 @@ pub struct OwnedSuitBundle {
     pub separate_passes: Vec<OwnedSuitPass>,
     pub total_passes: usize,
     pub executable_passes: usize,
+}
+
+impl OwnedSuitBundle {
+    /// Placeholder when the private PF90033 preset tree is absent. B3 2D rows
+    /// never consume suit data.
+    pub fn empty() -> Self {
+        Self {
+            presets: Vec::new(),
+            separate_passes: Vec::new(),
+            total_passes: 0,
+            executable_passes: 0,
+        }
+    }
 }
 
 #[derive(Deserialize)]

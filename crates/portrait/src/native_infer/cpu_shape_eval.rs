@@ -911,6 +911,7 @@ enum BinArith {
     Sub,
     Mul,
     Div,
+    Mod { fmod: bool },
 }
 
 fn eval_bin_arith(
@@ -940,6 +941,17 @@ fn eval_bin_arith(
                         }
                         x / y
                     }
+                    BinArith::Mod { fmod } => {
+                        if y == 0 {
+                            return Err(ShapeEvalError::DivisionByZero);
+                        }
+                        let remainder = x.wrapping_rem(y);
+                        if !fmod && remainder != 0 && (remainder < 0) != (y < 0) {
+                            remainder + y
+                        } else {
+                            remainder
+                        }
+                    }
                 };
                 out.push(v);
             }
@@ -958,6 +970,14 @@ fn eval_bin_arith(
                     BinArith::Sub => x - y,
                     BinArith::Mul => x * y,
                     BinArith::Div => x / y,
+                    BinArith::Mod { fmod } => {
+                        if fmod {
+                            x % y
+                        } else {
+                            let r = x % y;
+                            if r != 0.0 && (r < 0.0) != (y < 0.0) { r + y } else { r }
+                        }
+                    }
                 };
                 out.push(v);
             }
@@ -1240,6 +1260,7 @@ pub fn eval_op(
         Op::Sub => eval_bin_arith("Sub", BinArith::Sub, req_tensor(0)?, req_tensor(1)?),
         Op::Mul => eval_bin_arith("Mul", BinArith::Mul, req_tensor(0)?, req_tensor(1)?),
         Op::Div => eval_bin_arith("Div", BinArith::Div, req_tensor(0)?, req_tensor(1)?),
+        Op::Mod { fmod } => eval_bin_arith("Mod", BinArith::Mod { fmod: *fmod }, req_tensor(0)?, req_tensor(1)?),
         Op::Equal => eval_bin_cmp("Equal", BinCmp::Equal, req_tensor(0)?, req_tensor(1)?),
         Op::Less => eval_bin_cmp("Less", BinCmp::Less, req_tensor(0)?, req_tensor(1)?),
         Op::Greater => eval_bin_cmp("Greater", BinCmp::Greater, req_tensor(0)?, req_tensor(1)?),
@@ -1274,6 +1295,7 @@ pub fn is_cpu_shape_op(op: &Op) -> bool {
             | Op::Sub
             | Op::Mul
             | Op::Div
+            | Op::Mod { .. }
             | Op::Equal
             | Op::Less
             | Op::Greater

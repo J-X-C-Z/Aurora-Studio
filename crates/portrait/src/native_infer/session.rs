@@ -401,6 +401,7 @@ mod imp {
                         | Op::Sub
                         | Op::Mul
                         | Op::Div
+                        | Op::Mod { .. }
                         | Op::Equal
                         | Op::Less
                         | Op::Greater
@@ -1333,36 +1334,51 @@ mod imp {
                         self.spatial.global_avgpool_nchw_f32(x_ptr, y_ptr, n, c, h, w)?;
                         gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
                     }
-                    Op::ReduceMean(attrs) => {
-                        let (x_ptr, x_sh, _) = req_gpu(0)?;
-                        let axes: Vec<i64> = if let Some(a) = &attrs.axes {
-                            a.clone()
-                        } else if let Some(Some(aid)) = node.inputs.get(1) {
-                            cpu_tensors
-                                .get(aid)
-                                .map(|c| c.to_i64_vec())
-                                .unwrap_or_default()
+                    Op::ReduceMean(attrs) | Op::ReduceSum(attrs) | Op::ReduceMax(attrs) => {
+                        let (x_ptr, x_sh, dtype) = req_gpu(0)?;
+                        let axes = if let Some(axes) = &attrs.axes {
+                            axes.clone()
+                        } else if let Some(Some(axes_id)) = node.inputs.get(1) {
+                            read_i64_vec(*axes_id)?
                         } else {
-                            (0..x_sh.len() as i64).collect()
+                            Vec::new()
                         };
-                        let norm_axes: Vec<usize> = axes
-                            .iter()
-                            .map(|&a| norm_axis(a, x_sh.len()))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let mut out_sh = Vec::new();
-                        for (i, &d) in x_sh.iter().enumerate() {
-                            if norm_axes.contains(&i) {
+                        let out_id = req_out_id(0)?;
+                        if axes.is_empty() && attrs.noop_with_empty_axes {
+                            let y_ptr = alloc_out(out_id, &x_sh, dtype, run_bufs)?;
+                            let bytes = numel(&x_sh) * dtype.byte_size().unwrap_or(4);
+                            if bytes > 0 && x_ptr != y_ptr {
+                                self.spatial.copy_bytes_u8(x_ptr, y_ptr, bytes)?;
+                            }
+                            gpu_tensors.insert(out_id, (y_ptr, x_sh, dtype));
+                            continue;
+                        }
+                        if dtype != DataType::Float {
+                            return Err(SessionError::Runtime(format!(
+                                "{} '{}' cannot reduce {dtype:?}", node.op.name(), node.name
+                            )));
+                        }
+                        let norm_axes: Vec<usize> = axes.iter()
+                            .map(|&axis| norm_axis(axis, x_sh.len()))
+                            .collect::<Result<_, _>>()?;
+                        let mut out_sh = Vec::with_capacity(x_sh.len());
+                        for (axis, &dim) in x_sh.iter().enumerate() {
+                            if axes.is_empty() || norm_axes.contains(&axis) {
                                 if attrs.keepdims {
                                     out_sh.push(1);
                                 }
                             } else {
-                                out_sh.push(d);
+                                out_sh.push(dim);
                             }
                         }
-                        let out_id = req_out_id(0)?;
-                        let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
-                        self.spatial.reduce_mean_f32(x_ptr, y_ptr, &x_sh, &axes)?;
-                        gpu_tensors.insert(out_id, (y_ptr, out_sh, DataType::Float));
+                        let y_ptr = alloc_out(out_id, &out_sh, dtype, run_bufs)?;
+                        match node.op {
+                            Op::ReduceMean(_) => self.spatial.reduce_mean_f32(x_ptr, y_ptr, &x_sh, &axes)?,
+                            Op::ReduceSum(_) => self.spatial.reduce_sum_f32(x_ptr, y_ptr, &x_sh, &axes)?,
+                            Op::ReduceMax(_) => self.spatial.reduce_max_f32(x_ptr, y_ptr, &x_sh, &axes)?,
+                            _ => unreachable!(),
+                        }
+                        gpu_tensors.insert(out_id, (y_ptr, out_sh, dtype));
                     }
                     Op::Resize(attrs) => {
                         let (x_ptr, x_sh, _) = req_gpu(0)?;
@@ -1400,7 +1416,9 @@ mod imp {
                             attrs.mode,
                             attrs.coord_mode,
                             attrs.nearest_mode,
-                        )?;
+                        ).map_err(|err| SessionError::Runtime(format!(
+                            "Resize '{}': unsupported attributes {attrs:?}: {err:?}", node.name
+                        )))?;
                         let out_sh = vec![n, c, out_h, out_w];
                         let y_ptr = alloc_out(out_id, &out_sh, DataType::Float, run_bufs)?;
                         self.spatial.resize_nchw_f32(
@@ -2104,6 +2122,94 @@ mod imp {
                 }
             }
             assert!(passed >= 5, "expected at least 5 real models to run end-to-end, got {passed}");
+        }
+
+        #[test]
+        #[ignore = "requires CUDA GPU and 2102828093.onnx"]
+        fn test_2102828093_native_cuda() {
+            let path = std::env::var("AURORA_FACE_PARSING_MODEL")
+                .expect("set AURORA_FACE_PARSING_MODEL");
+            let bytes = std::fs::read(&path).expect("read 2102828093.onnx");
+            let model = crate::native_infer::onnx_proto::decode_model(&bytes).expect("decode");
+            let mut ops: Vec<String> = model.graph.nodes.iter().map(|n| n.op_type.clone()).collect();
+            ops.sort();
+            ops.dedup();
+            eprintln!("2102828093.onnx ops ({}): {:?}", ops.len(), ops);
+            let mut overrides = HashMap::new();
+            let in_name = model.graph.inputs[0].name.clone();
+            overrides.insert(in_name.clone(), vec![1, 3, 384, 384]);
+            let session = NativeCudaSession::from_bytes(&bytes, &overrides)
+                .expect("NativeCudaSession::from_bytes(2102828093.onnx)");
+            let input = vec![0.25f32; 3 * 384 * 384];
+            let mut inputs = HashMap::new();
+            inputs.insert(in_name, (input.as_slice(), vec![1, 3, 384, 384]));
+            let t0 = std::time::Instant::now();
+            let out = session.run_f32(&inputs).expect("run_f32(2102828093.onnx)");
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            for (k, (v, sh)) in &out {
+                assert!(v.iter().all(|x| x.is_finite()), "non-finite in {k}");
+                let mean = v.iter().sum::<f32>() / (v.len().max(1) as f32);
+                eprintln!("[PASS] 2102828093.onnx {k}{sh:?} mean={mean:.4} infer={ms:.2}ms");
+            }
+        }
+
+        #[test]
+        #[ignore = "requires CUDA GPU and faceplump ONNX models"]
+        fn test_faceplump_3_models_native_cuda() {
+            let dir = std::env::var("AURORA_FACEPLUMP_DIR")
+                .expect("set AURORA_FACEPLUMP_DIR");
+            use crate::native_infer::onnx_proto::{DataType, DimSpec, decode_model};
+
+            for (name, input_shape, output_shape) in [
+                ("597383622.onnx", [1, 4, 768, 768], [1, 4, 768, 768]),
+                ("3861222348.onnx", [1, 3, 768, 768], [1, 8, 512, 512]),
+                ("1139333499.onnx", [1, 3, 256, 512], [1, 4, 256, 512]),
+            ] {
+                let path = std::path::Path::new(&dir).join(name);
+                let bytes = std::fs::read(&path).expect("read FacePlump ONNX");
+                let model = decode_model(&bytes).expect("decode FacePlump ONNX");
+                let [input_info] = model.graph.inputs.as_slice() else {
+                    panic!("{name}: expected one input");
+                };
+                let [output_info] = model.graph.outputs.as_slice() else {
+                    panic!("{name}: expected one output");
+                };
+                assert_eq!(input_info.data_type, DataType::Float, "{name}");
+                assert_eq!(output_info.data_type, DataType::Float, "{name}");
+                assert_eq!(input_info.dims, input_shape.map(|dim| DimSpec::Value(dim as i64)), "{name}");
+                let session = NativeCudaSession::from_bytes(&bytes, &HashMap::new())
+                    .unwrap_or_else(|err| panic!("{name}: open CUDA session: {err}"));
+                let input: Vec<f32> = (0..input_shape.iter().product())
+                    .map(|index: usize| (index % 251) as f32 / 250.0)
+                    .collect();
+                let inputs = HashMap::from([(input_info.name.clone(), (input.as_slice(), input_shape.to_vec()))]);
+                let start = std::time::Instant::now();
+                let output = session.run_f32(&inputs)
+                    .unwrap_or_else(|err| panic!("{name}: CUDA inference: {err}"));
+                assert_eq!(output.len(), 1, "{name}");
+                let (values, shape) = output.get(&output_info.name).expect("declared output tensor");
+                assert_eq!(shape.as_slice(), output_shape, "{name}");
+                assert_eq!(values.len(), output_shape.iter().product::<usize>(), "{name}");
+                assert!(values.iter().all(|value| value.is_finite()), "{name}");
+                eprintln!("{name}: {shape:?} finite FP32 output in {:.2?}", start.elapsed());
+                if let Some(root) = std::env::var_os("AURORA_FACEPLUMP_REFERENCE_DIR") {
+                    let reference = std::fs::read(std::path::Path::new(&root).join(path.file_stem().unwrap()).with_extension("f32"))
+                        .expect("read CPU reference in little-endian FP32");
+                    assert_eq!(reference.len(), values.len() * 4, "{name}");
+                    let mut exact = 0usize;
+                    let mut max_abs = 0.0f32;
+                    let mut sum_abs = 0.0f64;
+                    for (&value, bytes) in values.iter().zip(reference.chunks_exact(4)) {
+                        let expected = f32::from_le_bytes(bytes.try_into().unwrap());
+                        assert!(expected.is_finite(), "{name}: nonfinite CPU reference");
+                        exact += usize::from(value == expected);
+                        let diff = (value - expected).abs();
+                        max_abs = max_abs.max(diff);
+                        sum_abs += f64::from(diff);
+                    }
+                    eprintln!("{name}: CPU reference exact={exact}/{} max_abs={max_abs:.8e} mae={:.8e}", values.len(), sum_abs / values.len() as f64);
+                }
+            }
         }
     }
 }

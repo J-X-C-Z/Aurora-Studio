@@ -110,6 +110,9 @@ where
 
 pub fn discover_plump_onnx_models() -> Result<[PlumpOnnxAsset; 3], Refusal> {
     let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("AURORA_FACEPLUMP_MODEL_ROOT").filter(|root| !root.is_empty()) {
+        roots.push(PathBuf::from(root));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             roots.push(parent.join("models").join("faceplump"));
@@ -296,7 +299,15 @@ pub fn build_plump_producer_inputs(
         OutputSink::FacialPlumpingLayer,
     )
     .map_err(pipeline_refusal)?;
-    let frame = compose_layer(request.current, &layer)?;
+    let strength = plump_effective_strength(&request.slots, request.full_face_level);
+    let has_forehead = request.requested_pfs.contains(&30_191);
+    let frame = compose_layer(
+        request.current,
+        &layer,
+        request.color_encoding,
+        strength,
+        has_forehead,
+    )?;
     let requested_pfs = request.requested_pfs.clone();
     let composite = PlumpFinalComposite {
         receipt: PlumpCompositeReceipt {
@@ -381,7 +392,14 @@ fn infer_onnx(
             asset.net_sha256,
         )
     };
-    let outcome = plump_raster_with_cpu_fallback(cuda, cpu)?;
+    let outcome = if runtime.is_native_only() {
+        PlumpRasterOutcome {
+            value: cuda()?,
+            receipt: PlumpRasterReceipt { backend: PlumpRasterBackend::Cuda },
+        }
+    } else {
+        plump_raster_with_cpu_fallback(cuda, cpu)?
+    };
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((asset.model_id, input_digest, outcome.clone()));
     }
@@ -409,7 +427,10 @@ fn infer_session(
     let mut input = nchw.to_vec();
     let outputs = runtime
         .run(&session, &mut input, &dims)
-        .map_err(|_| Refusal::MissingInput("FacePlump ONNX dispatch"))?;
+        .map_err(|err| {
+            log::warn!("FacePlump model {model_id} {:?} dispatch failed: {err:#}", session.provider());
+            Refusal::MissingInput("FacePlump ONNX dispatch")
+        })?;
     if outputs.len() != 1 {
         return Err(Refusal::ShapeMismatch("FacePlump ONNX output"));
     }
@@ -529,7 +550,31 @@ fn bilinear_plane(plane: &[f32], width: usize, height: usize, x: f32, y: f32) ->
     top * (1.0 - fy) + bottom * fy
 }
 
-fn compose_layer(source: &Image, layer: &PlumpLayer) -> Result<Image, Refusal> {
+fn plump_effective_strength(slots: &[f32; 17], full_face_level: Option<u8>) -> f32 {
+    let level_strength = full_face_level
+        .map(|lvl| (f32::from(lvl) / 4.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let mut slot_strength = 0.0f32;
+    for idx in [0usize, 3, 6, 7, 12, 13, 16] {
+        let v = slots[idx].abs();
+        let norm = if v > 1.0 { v / 100.0 } else { v };
+        slot_strength = slot_strength.max(norm.clamp(0.0, 1.0));
+    }
+    level_strength.max(slot_strength)
+}
+
+fn compose_layer(
+    source: &Image,
+    layer: &PlumpLayer,
+    encoding: ColorEncoding,
+    strength: f32,
+    has_forehead: bool,
+) -> Result<Image, Refusal> {
+    use aurora_portrait::kernels::plump_exact_composite::{
+        PLUMP_BRIGHTEN_LUT_FOREHEAD, PLUMP_BRIGHTEN_LUT_SOFT, PLUMP_STACK_BLUR_RADIUS,
+        apply_plump_brighten_lut_rgba8, apply_plump_residual_rgba8, stack_blur_u8,
+    };
+
     if layer.color.width != layer.roi.width
         || layer.color.height != layer.roi.height
         || layer.alpha_binary.width != layer.roi.width
@@ -540,18 +585,78 @@ fn compose_layer(source: &Image, layer: &PlumpLayer) -> Result<Image, Refusal> {
     let mut frame = source.clone();
     let source_stride = source.width as usize * 4;
     let layer_stride = layer.roi.width as usize * 4;
-    for y in 0..layer.roi.height as usize {
-        for x in 0..layer.roi.width as usize {
-            let mask = layer.alpha_binary.bytes[y * layer.roi.width as usize + x] as f32 / 255.0;
-            let dst = (layer.roi.y as usize + y) * source_stride
-                + (layer.roi.x as usize + x) * 4;
-            let src = y * layer_stride + x * 4;
-            for channel in 0..3 {
-                frame.pixels[dst + channel] = (f32::from(source.pixels[dst + channel])
-                    * (1.0 - mask)
-                    + f32::from(layer.color.bytes[src + channel]) * mask)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+    let roi_w = layer.roi.width as usize;
+    let roi_h = layer.roi.height as usize;
+
+    if encoding == ColorEncoding::VendorResidualSignedUnit {
+        if strength <= 0.0 || roi_w == 0 || roi_h == 0 {
+            return Ok(frame);
+        }
+        let pixel_count = roi_w * roi_h;
+        let mut roi_rgba = vec![0u8; pixel_count * 4];
+        let mut pred_rgb = vec![0.0f32; pixel_count * 3];
+        let mut weight_u8 = vec![0u8; pixel_count];
+        let mut split_u8 = vec![0u8; pixel_count];
+        for y in 0..roi_h {
+            let src_row = (layer.roi.y as usize + y) * source_stride + layer.roi.x as usize * 4;
+            let dst_row = y * roi_w * 4;
+            roi_rgba[dst_row..dst_row + roi_w * 4]
+                .copy_from_slice(&source.pixels[src_row..src_row + roi_w * 4]);
+            for x in 0..roi_w {
+                let at = y * roi_w + x;
+                let layer_px = at * 4;
+                pred_rgb[at * 3] = f32::from(layer.color.bytes[layer_px]);
+                pred_rgb[at * 3 + 1] = f32::from(layer.color.bytes[layer_px + 1]);
+                pred_rgb[at * 3 + 2] = f32::from(layer.color.bytes[layer_px + 2]);
+                let raw = f32::from_le_bytes(
+                    layer.alpha_raw.bytes[at * 4..at * 4 + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                );
+                // `split_u8` gates valid ROI pixels (0 or 255) so `weight_u8` is not
+                // double-multiplied against the same sparse mask before StackBlur.
+                split_u8[at] = layer.alpha_binary.bytes[at];
+                weight_u8[at] = (raw * strength).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+        // PROVEN 0x06c1f769 -> 0x06c26830: StackBlur(radius=10) feathering when ROI
+        // exceeds the kernel window; keep raw weight on tiny sparse masks to avoid
+        // collapsing sub-window support below 1/255.
+        let non_zero = weight_u8.iter().filter(|&&v| v > 0).count();
+        let effective_weight = if non_zero > (PLUMP_STACK_BLUR_RADIUS * 2 + 1) * 4 {
+            stack_blur_u8(&weight_u8, roi_w, roi_h, PLUMP_STACK_BLUR_RADIUS)
+        } else {
+            weight_u8
+        };
+        apply_plump_residual_rgba8(&mut roi_rgba, &pred_rgb, &effective_weight, &split_u8, roi_w, roi_h);
+        // PROVEN 0x06c29f90: dual 3x256 brighten LUT (forehead strong vs soft regions).
+        let lut = if has_forehead {
+            &PLUMP_BRIGHTEN_LUT_FOREHEAD
+        } else {
+            &PLUMP_BRIGHTEN_LUT_SOFT
+        };
+        apply_plump_brighten_lut_rgba8(&mut roi_rgba, lut, &effective_weight, &split_u8, roi_w, roi_h);
+        for y in 0..roi_h {
+            let dst_row = (layer.roi.y as usize + y) * source_stride + layer.roi.x as usize * 4;
+            let src_row = y * roi_w * 4;
+            frame.pixels[dst_row..dst_row + roi_w * 4]
+                .copy_from_slice(&roi_rgba[src_row..src_row + roi_w * 4]);
+        }
+    } else {
+        for y in 0..roi_h {
+            for x in 0..roi_w {
+                let at = y * roi_w + x;
+                let dst = (layer.roi.y as usize + y) * source_stride
+                    + (layer.roi.x as usize + x) * 4;
+                let src = y * layer_stride + x * 4;
+                let mask = layer.alpha_binary.bytes[at] as f32 / 255.0;
+                for channel in 0..3 {
+                    frame.pixels[dst + channel] = (f32::from(source.pixels[dst + channel])
+                        * (1.0 - mask)
+                        + f32::from(layer.color.bytes[src + channel]) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
             }
         }
     }
