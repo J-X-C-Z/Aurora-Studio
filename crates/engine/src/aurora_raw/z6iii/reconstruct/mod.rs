@@ -25,6 +25,10 @@ pub(super) use c1_cuda_pipeline::{
     available as cuda_available, enabled as cuda_enabled, reconstruct_rgba16 as cuda_reconstruct_rgba16,
     CudaPipelineInput,
 };
+/// Re-exported at the `aurora_raw` visibility the startup warmup needs; the
+/// module itself stays private to this subtree.
+#[cfg(windows)]
+pub(in crate::aurora_raw) use c1_cuda_pipeline::ptx_image as cuda_ptx_image;
 #[path = "c1_nikon_he.rs"]
 mod c1_nikon_he;
 #[path = "c1_stage1_direction.rs"]

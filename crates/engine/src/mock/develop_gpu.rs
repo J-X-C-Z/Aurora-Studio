@@ -2454,11 +2454,18 @@ pub(crate) struct ResidentPreviewOut {
     pub pixels: Vec<u8>,
     pub histogram: Option<Histogram>,
     pub source_hit: bool,
+    /// Viewer scope counts for the selected kind, counted from `pixels` on the
+    /// device before they were copied back. `None` whenever the pass did not
+    /// run, so a caller can always fall back to counting on the CPU.
+    pub scopes: Option<ScopeMaps>,
 }
 
 const RESIDENT_RECLAIM_PRIORITY: u8 = 25;
 const HIST_WORDS: usize = 1026;
 const USM_MAX_WEIGHTS: usize = 25;
+/// Density-map words one scope pass writes: wave | parade | vector, `u32` each.
+/// Fixed by the kernel, so the buffers are allocated once with the pool.
+const SCOPE_WORDS: usize = crate::scopes::VIEWER_WORDS;
 
 /// Resident preview crossover floor: because the linear source stays in VRAM
 /// across slider drags (zero per-frame H2D), GPU wins even at modest viewport
@@ -2492,11 +2499,17 @@ struct ResidentPool {
     banding: SendBuffer,
     usm_weights: SendBuffer,
     hist_dev: SendBuffer,
+    /// Viewer scope density maps, counted from `out_u8` on the same stream.
+    scope_maps: SendBuffer,
+    scope_module: Option<super::scopes_gpu::ScopeGpu>,
+    scope_unavailable: bool,
     pinned_in: Option<SendPinned>,
+    pinned_gain: Option<SendPinned>,
     pinned_out: Option<SendPinned>,
     pinned_params: SendPinned,
     pinned_weights: SendPinned,
     pinned_hist: SendPinned,
+    pinned_scopes: SendPinned,
     stream: SendStream,
     gpu: Box<Nvidia>,
     src_bytes: usize,
@@ -2516,7 +2529,11 @@ struct ResidentPool {
 
 impl ResidentPool {
     fn fixed_resident_bytes() -> usize {
-        fixed_bytes() + USM_MAX_WEIGHTS * 4 + HIST_WORDS * 4
+        fixed_bytes()
+            + USM_MAX_WEIGHTS * 4
+            + HIST_WORDS * 4
+            + SCOPE_WORDS * 4
+            + SCOPE_WORDS * 4
     }
 
     fn open() -> Result<Self, CudaError> {
@@ -2539,11 +2556,16 @@ impl ResidentPool {
             banding: SendBuffer(alloc_static(&gpu, 256 * 4 + 512)?),
             usm_weights: SendBuffer(alloc_static(&gpu, USM_MAX_WEIGHTS * 4)?),
             hist_dev: SendBuffer(alloc_static(&gpu, HIST_WORDS * 4)?),
+            scope_maps: SendBuffer(alloc_static(&gpu, SCOPE_WORDS * 4)?),
+            scope_module: None,
+            scope_unavailable: false,
             pinned_in: None,
+            pinned_gain: None,
             pinned_out: None,
             pinned_params: SendPinned(alloc_pinned_static(&gpu, P_SIZE * 4)?),
             pinned_weights: SendPinned(alloc_pinned_static(&gpu, USM_MAX_WEIGHTS * 4)?),
             pinned_hist: SendPinned(alloc_pinned_static(&gpu, HIST_WORDS * 4)?),
+            pinned_scopes: SendPinned(alloc_pinned_static(&gpu, SCOPE_WORDS * 4)?),
             stream,
             gpu,
             src_bytes: 0,
@@ -2587,7 +2609,7 @@ impl ResidentPool {
             .saturating_add(next_usm_cam)
             .saturating_add(next_usm_planes)
             .saturating_add(next_out_u8)
-            .saturating_add(next_gain)
+            .saturating_add(next_gain.saturating_mul(2)) // device plus page-locked gain staging
             .saturating_add(next_editor);
 
         let old_total = self.lease.bytes();
@@ -2617,7 +2639,9 @@ impl ResidentPool {
                 self.out_u8_bytes = next_out_u8;
             }
             if next_gain > self.gain_bytes {
-                self.gain = Some(SendBuffer(alloc_static(&self.gpu, next_gain)?));
+                let device = SendBuffer(alloc_static(&self.gpu, next_gain)?);
+                let host = SendPinned(alloc_pinned_static(&self.gpu, next_gain)?);
+                self.gain = Some(device); self.pinned_gain = Some(host);
                 self.gain_bytes = next_gain;
             }
             if next_editor > self.editor_bytes {
@@ -2811,6 +2835,8 @@ pub(crate) fn render_resident_preview<F>(
     nr: Option<(&NoiseReduction, f32)>,
     bgra: bool,
     with_histogram: bool,
+    // Viewer scope kinds to count from the finished frame; empty asks for none.
+    scopes: ScopeWants,
     fill_source: F,
 ) -> Option<ResidentPreviewOut>
 where
@@ -2856,7 +2882,9 @@ where
     register_resident_reclaimer();
     let mut lock = resident_state().lock().unwrap_or_else(|e| e.into_inner());
     let pool = match &mut *lock {
-        ResidentState::Unavailable => return None,
+        ResidentState::Unavailable => {
+            return None;
+        }
         ResidentState::NotTried => match ResidentPool::open() {
             Ok(p) => {
                 *lock = ResidentState::Ready(p);
@@ -2925,7 +2953,10 @@ where
 
         if let Some(plane) = gain_plane {
             let gain_dev = &pool.gain.as_ref().unwrap().0;
-            pool.gpu.upload_buffer(gain_dev, as_bytes(plane))?;
+            let bytes=as_bytes(plane);
+            let stage=&mut pool.pinned_gain.as_mut().expect("gain staging allocated together with device buffer").0.as_mut_slice()[..bytes.len()];
+            stage.copy_from_slice(bytes);
+            pool.gpu.upload_async(gain_dev, stage, &pool.stream.0)?;
         }
 
         let mut src_handle = pool.src_linear.as_ref().unwrap().0.handle();
@@ -3240,6 +3271,53 @@ where
             )?;
         }
 
+        // Viewer scopes read the frame the preview is about to show, on the same
+        // stream and straight out of VRAM: `out_u8` is what the D2H below copies
+        // to the app, so the bins and the displayed pixels cannot disagree.
+        let scope_zone = if scopes.any() && super::scopes_gpu::enabled() {
+            if pool.scope_module.is_none() && !pool.scope_unavailable {
+                match super::scopes_gpu::ScopeGpu::open() {
+                    Ok(module) => pool.scope_module = Some(module),
+                    Err(err) => {
+                        log::warn!("scopes_gpu: {err:?}; scopes stay on the CPU");
+                        pool.scope_unavailable = true;
+                    }
+                }
+            }
+            let (base, words) = scopes.zone();
+            let mut counted = None;
+            let mut failure = None;
+            if let Some(counter) = pool.scope_module.as_ref() {
+                // `DeviceScopeCounter` is the cross-platform seam: CUDA counts
+                // here, and the DX12/Metal counters take the same frame
+                // descriptor with their own command list/queue in `stream`.
+                let frame = crate::scopes::DeviceScopeFrame {
+                    pixels: out_u8_handle,
+                    width,
+                    height,
+                    bgra,
+                    stream: &pool.stream.0,
+                    device: None,
+                };
+                match crate::scopes::DeviceScopeCounter::count(
+                    counter,
+                    frame,
+                    pool.scope_maps.0.handle(),
+                    scopes,
+                ) {
+                    Ok(()) => counted = Some((base, words)),
+                    Err(err) => failure = Some(err.to_string()),
+                }
+            }
+            if let Some(err) = failure {
+                log::warn!("scopes_gpu count: {err}; scopes stay on the CPU");
+                pool.scope_unavailable = true;
+            }
+            counted
+        } else {
+            None
+        };
+
         // Single async D2H of the compact 8-bit frame + 4 KB histogram, then one sync.
         let out_dev = &pool.out_u8.as_ref().unwrap().0;
         let pinned_out = &mut pool.pinned_out.as_mut().unwrap().0.as_mut_slice()[..need_out_u8];
@@ -3247,6 +3325,10 @@ where
         if with_histogram {
             let hist_slice = &mut pool.pinned_hist.0.as_mut_slice()[..HIST_WORDS * 4];
             pool.gpu.download_async(&pool.hist_dev.0, hist_slice, &pool.stream.0)?;
+        }
+        if let Some((base, words)) = scope_zone {
+            let scope_slice = &mut pool.pinned_scopes.0.as_mut_slice()[..words * 4];
+            pool.gpu.download_async_at(&pool.scope_maps.0, base * 4, scope_slice, &pool.stream.0)?;
         }
         pool.gpu.stream_sync(&pool.stream.0)?;
 
@@ -3266,10 +3348,24 @@ where
         } else {
             None
         };
+        // Only the selected zone comes back; `from_zone` drops the other maps
+        // instead of carrying two maps of zeros into the app.
+        let scope_maps = scope_zone.map(|(base, words)| {
+            let counts = unsafe {
+                std::slice::from_raw_parts(
+                    pool.pinned_scopes.0.as_slice().as_ptr() as *const u32,
+                    words,
+                )
+            };
+            let step = crate::scopes::viewer_step(width, height);
+            let sampled = (width.div_ceil(step) * height.div_ceil(step)) as u32;
+            ScopeMaps::from_zone(base, counts, sampled, scopes)
+        });
         Ok(ResidentPreviewOut {
             pixels: out_vec,
             histogram,
             source_hit,
+            scopes: scope_maps,
         })
     })();
 
@@ -3277,6 +3373,8 @@ where
     match result {
         Ok(out) => Some(out),
         Err(err) => {
+            // Do not recycle a page-locked input belonging to an earlier DMA.
+            let _=pool.gpu.stream_sync(&pool.stream.0);pool.resident_key=None;
             log::warn!("develop_gpu resident run: {err:?}; falling back to CPU");
             None
         }
@@ -3797,5 +3895,407 @@ mod tests {
         // The per-band parameter table itself does change, so the dynamic
         // values are still uploaded with every band.
         assert_ne!(params_floats(&params), params_floats(&changed));
+    }
+
+    /// The acceptance test for the wired-up scopes: the resident preview counts
+    /// the bins on the device and hands back the pixels it counted. Re-counting
+    /// those same pixels with the CPU reference has to land in every bin.
+    #[test]
+    fn resident_scope_bins_describe_the_pixels_the_preview_shows() {
+        if !prewarm() {
+            eprintln!(
+                "skipping resident_scope_bins_describe_the_pixels_the_preview_shows: CUDA develop device/PTX unavailable"
+            );
+            return;
+        }
+        let (w, h) = (1600usize, 1067usize);
+        let key = ResidentSourceKey {
+            source: 0x5C0_9E17,
+            geom_hash: 0xA11CE,
+            region_bits: [0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()],
+            out_w: w as u32,
+            out_h: h as u32,
+            level: 0,
+            cubic: false,
+        };
+        let adj = tone_color_adjustments();
+        let params = DevelopParams::from_adjustments(&adj, [1.85, 1.0, 0.72], 2f32.powf(0.35), false);
+        let before = super::super::scopes_gpu::GPU_SCOPES.load(std::sync::atomic::Ordering::Relaxed);
+        let filled = std::sync::atomic::AtomicBool::new(false);
+        let out = render_resident_preview(
+            key,
+            [0.0, 0.0, 1.0, 1.0],
+            &params,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            ScopeWants::ALL,
+            |dst| {
+                // Linear RGBA with `valid` in alpha, like the caller's sampler.
+                for y in 0..h {
+                    for x in 0..w {
+                        let o = (y * w + x) * 4;
+                        let fx = x as f32 / w as f32;
+                        let fy = y as f32 / h as f32;
+                        dst[o] = 0.05 + 1.4 * fx;
+                        dst[o + 1] = 0.06 + 1.1 * fy;
+                        dst[o + 2] = 0.07 + 0.9 * (fx * fy).sqrt();
+                        dst[o + 3] = if (x + y) % 97 == 0 { 0.0 } else { 1.0 };
+                    }
+                }
+                filled.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+        )
+        .expect("resident preview refused the frame, so no device scope pass could run");
+        assert!(filled.load(std::sync::atomic::Ordering::Relaxed), "the source was never filled");
+        assert_eq!(out.pixels.len(), w * h * 4, "frame size");
+
+        let maps = out
+            .scopes
+            .expect("the device scope pass did not run and silently returned no maps");
+        assert_eq!(maps.wants(), ScopeWants::ALL);
+        assert!(
+            super::super::scopes_gpu::GPU_SCOPES.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "scopes came back without a device pass"
+        );
+        // The pixels handed to the app, counted by the CPU reference.
+        let cpu = crate::scopes::viewer_maps(&out.pixels, w, h, true, ScopeWants::ALL);
+        assert_eq!(maps.sampled(), cpu.sampled(), "sampled pixel count");
+        assert!(
+            maps.words() == cpu.words(),
+            "GPU scope bins differ from the displayed pixels: {}",
+            crate::scopes::bins_differ(maps.words(), cpu.words())
+                .unwrap_or_else(|| "no differing bins".to_string())
+        );
+    }
+
+    /// The same frame, but only the waveform is selected: its bins still match
+    /// the CPU reference and the other two maps stay empty, so the panel never
+    /// draws counts nobody asked for.
+    #[test]
+    fn resident_scopes_return_only_the_selected_map() {
+        if !prewarm() {
+            eprintln!("skipping resident_scopes_return_only_the_selected_map: CUDA unavailable");
+            return;
+        }
+        let (w, h) = (1280usize, 853usize);
+        let key = ResidentSourceKey {
+            source: 0x5C0_9E18,
+            geom_hash: 0xB0B,
+            region_bits: [0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()],
+            out_w: w as u32,
+            out_h: h as u32,
+            level: 0,
+            cubic: false,
+        };
+        let adj = tone_color_adjustments();
+        let params = DevelopParams::from_adjustments(&adj, [1.0; 3], 1.0, false);
+        for wants in [ScopeWants::WAVEFORM, ScopeWants::PARADE, ScopeWants::VECTOR] {
+            let out = render_resident_preview(
+                key,
+                [0.0, 0.0, 1.0, 1.0],
+                &params,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                wants,
+                |dst| {
+                    for y in 0..h {
+                        for x in 0..w {
+                            let o = (y * w + x) * 4;
+                            dst[o] = x as f32 / w as f32;
+                            dst[o + 1] = y as f32 / h as f32;
+                            dst[o + 2] = 0.5;
+                            dst[o + 3] = 1.0;
+                        }
+                    }
+                },
+            )
+            .expect("resident preview refused the frame");
+            let maps = out.scopes.expect("no device scope maps");
+            assert_eq!(maps.wants(), wants);
+            let (base, words) = wants.zone();
+            let cpu = crate::scopes::viewer_maps(&out.pixels, w, h, true, wants);
+            assert!(
+                maps.words()[base..base + words] == cpu.words()[base..base + words],
+                "{wants:?}: selected zone differs: {}",
+                crate::scopes::bins_differ(
+                    &maps.words()[base..base + words],
+                    &cpu.words()[base..base + words]
+                )
+                .unwrap_or_else(|| "no differing bins".to_string())
+            );
+        }
+    }
+
+    // ── cost: what the device scope pass adds to a real preview frame ─────
+
+    fn percentile(values: &mut [f64], q: f64) -> f64 {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if values.is_empty() {
+            return f64::NAN;
+        }
+        let idx = ((values.len() - 1) as f64 * q).round() as usize;
+        values[idx]
+    }
+
+    /// 119 exposure steps through the production preview entry point, the way an
+    /// interactive drag drives it, for each scope selection.
+    ///
+    /// This is a benchmark, not an assertion: it prints the per-kind P50/P95 of
+    /// `process::render_preview_bgra` plus what the CPU fallback would have
+    /// spent counting the same frame, so the marginal cost of the device scope
+    /// path is a measured number instead of a claim. `#[ignore]`, because it
+    /// needs a real card and takes seconds.
+    #[test]
+    #[ignore = "GPU bench: 119-frame preview percentiles with and without device scopes"]
+    fn preview_frame_percentiles_with_device_scopes() {
+        if !prewarm() {
+            eprintln!("skipping preview_frame_percentiles_with_device_scopes: CUDA unavailable");
+            return;
+        }
+        use crate::scopes::ScopeWants;
+
+        let (w, h) = (1600usize, 1067usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                px[o] = (12.0 + 220.0 * (0.45 * fx + 0.55 * fy)).min(255.0) as u8;
+                px[o + 1] = (20.0 + 200.0 * (0.3 * fx + 0.7 * (1.0 - fy))).min(255.0) as u8;
+                px[o + 2] = (40.0 + 190.0 * ((fx * fy).sqrt())).min(255.0) as u8;
+                px[o + 3] = 255;
+            }
+        }
+        let src = crate::mock::process::Source::from_rgba(w as u32, h as u32, &px);
+        // Exposure only, exactly the edit the interactive replay drives: this is
+        // the frame the resident path handles end to end, so the comparison is
+        // device scopes vs CPU scopes on the same frames, not two pipelines.
+        let base = AdjustmentSet::default();
+        let frames = 119usize;
+
+        // What the panel does today without a device pass: count the frame on
+        // the CPU. Measured on the same pixels the preview returns.
+        let mut cpu_ms = Vec::with_capacity(8);
+        {
+            let out = crate::mock::process::render_preview_bgra(
+                &src,
+                &base,
+                crate::NormRect::FULL,
+                w as u32,
+                false,
+                None,
+                true,
+                ScopeWants::default(),
+            );
+            for _ in 0..8 {
+                let t0 = std::time::Instant::now();
+                let maps = crate::scopes::viewer_maps(&out.rgba, w, h, true, ScopeWants::ALL);
+                std::hint::black_box(maps.words().iter().sum::<u32>());
+                cpu_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+
+        let mut report = String::new();
+        for (name, wants) in [
+            ("none", ScopeWants::default()),
+            ("waveform", ScopeWants::WAVEFORM),
+            ("parade", ScopeWants::PARADE),
+            ("vector", ScopeWants::VECTOR),
+        ] {
+            // Two warm frames so the first JIT/module-load frame is not the P95.
+            for step in 0..2 {
+                let mut adj = base.clone();
+                adj.exposure.exposure = -1.0 + step as f32 * 0.1;
+                let _ = crate::mock::process::render_preview_bgra(
+                    &src,
+                    &adj,
+                    crate::NormRect::FULL,
+                    w as u32,
+                    false,
+                    None,
+                    true,
+                    wants,
+                );
+            }
+            let before = super::super::scopes_gpu::GPU_SCOPES.load(std::sync::atomic::Ordering::Relaxed);
+            let mut ms = Vec::with_capacity(frames);
+            let mut returned = 0usize;
+            let mut resident_frames = 0usize;
+            for step in 0..frames {
+                let mut adj = base.clone();
+                adj.exposure.exposure = -1.0 + step as f32 * (2.0 / frames as f32);
+                let t0 = std::time::Instant::now();
+                let out = crate::mock::process::render_preview_bgra(
+                    &src,
+                    &adj,
+                    crate::NormRect::FULL,
+                    w as u32,
+                    false,
+                    None,
+                    true,
+                    wants,
+                );
+                ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if out.bgra {
+                    resident_frames += 1;
+                }
+                if out.scopes.is_some() {
+                    returned += 1;
+                }
+            }
+            let device_frames = super::super::scopes_gpu::GPU_SCOPES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_sub(before) as usize;
+            let p50 = percentile(&mut ms.clone(), 0.50);
+            let p95 = percentile(&mut ms.clone(), 0.95);
+            let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+            report.push_str(&format!(
+                "{{\"kind\":\"{name}\",\"frames\":{},\"p50_ms\":{p50:.3},\"p95_ms\":{p95:.3},\"mean_ms\":{mean:.3},\"resident_frames\":{resident_frames},\"device_passes\":{device_frames},\"frames_with_scopes\":{returned}}}\n",
+                ms.len()
+            ));
+        }
+        let step = crate::scopes::viewer_step(w, h);
+        let sampled = w.div_ceil(step) * h.div_ceil(step);
+        let mut cpu_sorted = cpu_ms.clone();
+        report.push_str(&format!(
+            "{{\"cpu_count_ms\":{{\"p50\":{:.3},\"min\":{:.3}}},\"step\":{step},\"samples_per_frame\":{sampled},\"readback_kib\":{{\"waveform\":{},\"parade\":{},\"vector\":{}}}}}\n",
+            percentile(&mut cpu_sorted, 0.50),
+            cpu_ms.iter().copied().fold(f64::INFINITY, f64::min),
+            160 * 256 * 4 / 1024,
+            160 * 256 * 4 / 1024,
+            160 * 160 * 4 / 1024,
+        ));
+        eprintln!("AURORA_SCOPE_BENCH\n{report}");
+    }
+
+    /// The resident preview stage itself — the GPU work the production entry
+    /// calls — 119 frames per scope selection, with the CPU cost of counting the
+    /// same pixels printed alongside.
+    #[test]
+    #[ignore = "GPU bench: resident preview stage percentiles with device scopes"]
+    fn resident_scope_stage_percentiles() {
+        if !prewarm() {
+            eprintln!("skipping resident_scope_stage_percentiles: CUDA unavailable");
+            return;
+        }
+        let (w, h) = (1600usize, 1067usize);
+        let key = ResidentSourceKey {
+            source: 0x5C0_9E19,
+            geom_hash: 0x1CE,
+            region_bits: [0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()],
+            out_w: w as u32,
+            out_h: h as u32,
+            level: 0,
+            cubic: false,
+        };
+        // A real colour edit (curves, colour balance, levels), so the measured
+        // frame is the one the panel would be looking at mid-drag.
+        let adj = tone_color_adjustments();
+        let params = DevelopParams::from_adjustments(&adj, [1.85, 1.0, 0.72], 2f32.powf(0.35), false);
+        let frames = 119usize;
+        let mut report = String::new();
+        let mut pixels_for_cpu: Option<Vec<u8>> = None;
+        for (name, wants) in [
+            ("none", ScopeWants::default()),
+            ("waveform", ScopeWants::WAVEFORM),
+            ("parade", ScopeWants::PARADE),
+            ("vector", ScopeWants::VECTOR),
+        ] {
+            // One warm frame: module load and the first PSO-free launch.
+            let _ = render_resident_preview(
+                key,
+                [0.0, 0.0, 1.0, 1.0],
+                &params,
+                None,
+                None,
+                None,
+                None,
+                true,
+                true,
+                wants,
+                |dst| fill_test_frame(dst, w, h),
+            );
+            let before = super::super::scopes_gpu::GPU_SCOPES.load(std::sync::atomic::Ordering::Relaxed);
+            let mut ms = Vec::with_capacity(frames);
+            let mut returned = 0usize;
+            for _ in 0..frames {
+                let t0 = std::time::Instant::now();
+                let out = render_resident_preview(
+                    key,
+                    [0.0, 0.0, 1.0, 1.0],
+                    &params,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    true,
+                    wants,
+                    |dst| fill_test_frame(dst, w, h),
+                )
+                .expect("resident preview refused the frame");
+                ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if out.scopes.is_some() {
+                    returned += 1;
+                }
+                if pixels_for_cpu.is_none() {
+                    pixels_for_cpu = Some(out.pixels.clone());
+                }
+            }
+            let device_frames = super::super::scopes_gpu::GPU_SCOPES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_sub(before) as usize;
+            let p50 = percentile(&mut ms.clone(), 0.50);
+            let p95 = percentile(&mut ms.clone(), 0.95);
+            let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+            report.push_str(&format!(
+                "{{\"stage\":\"resident\",\"kind\":\"{name}\",\"frames\":{},\"p50_ms\":{p50:.3},\"p95_ms\":{p95:.3},\"mean_ms\":{mean:.3},\"device_passes\":{device_frames},\"frames_with_scopes\":{returned}}}\n",
+                ms.len()
+            ));
+        }
+        let pixels = pixels_for_cpu.expect("at least one frame");
+        let mut cpu_ms = Vec::new();
+        for _ in 0..9 {
+            let t0 = std::time::Instant::now();
+            let maps = crate::scopes::viewer_maps(&pixels, w, h, true, ScopeWants::ALL);
+            std::hint::black_box(maps.words().iter().sum::<u32>());
+            cpu_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let step = crate::scopes::viewer_step(w, h);
+        let mut cpu_sorted = cpu_ms.clone();
+        report.push_str(&format!(
+            "{{\"stage\":\"cpu_count\",\"p50_ms\":{:.3},\"frames\":9,\"step\":{step},\"samples\":{},\"zone_kib\":{{\"waveform\":{},\"parade\":{},\"vector\":{}}}}}\n",
+            percentile(&mut cpu_sorted, 0.50),
+            w.div_ceil(step) * h.div_ceil(step),
+            160 * 256 * 4 / 1024,
+            160 * 256 * 4 / 1024,
+            160 * 160 * 4 / 1024,
+        ));
+        eprintln!("AURORA_SCOPE_BENCH_STAGE\n{report}");
+    }
+
+    /// Linear RGBA with `valid` in alpha, the shape the sampler hands the
+    /// resident stage.
+    fn fill_test_frame(dst: &mut [f32], w: usize, h: usize) {
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                dst[o] = 0.05 + 1.4 * fx;
+                dst[o + 1] = 0.06 + 1.1 * fy;
+                dst[o + 2] = 0.07 + 0.9 * (fx * fy).sqrt();
+                dst[o + 3] = if (x + y) % 97 == 0 { 0.0 } else { 1.0 };
+            }
+        }
     }
 }

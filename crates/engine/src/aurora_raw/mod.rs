@@ -9,7 +9,10 @@
 pub mod c1_nef_he;
 pub mod c1_raw_he;
 pub(crate) mod demosaic_cuda;
+pub mod gpu_probe;
 pub(crate) mod linear_post_cuda;
+pub mod prefetch;
+pub mod prewarm;
 pub mod xtrans;
 pub(crate) mod rust_raw;
 // The Z6III algorithm modules are platform-neutral; only the desktop exporter,
@@ -111,8 +114,6 @@ pub(crate) fn decode_he_rgba16_with(
     timings: &mut crate::raw::RawStageTimings,
 ) -> Option<(u32, u32, Vec<u16>, AuroraRoute)> {
     let orientation = crate::raw::exif_orientation_bytes(bytes).unwrap_or(1);
-    let libraw_bayer = libraw_frame
-        .map(|lib| (lib.raw_width, lib.raw_height, lib.data.clone()));
 
     let ca_warp = crate::mock::lens_profile::LensShot::from_exif(exif)
         .and_then(|shot| crate::mock::lens_profile::auto_warp(&shot))
@@ -122,7 +123,14 @@ pub(crate) fn decode_he_rgba16_with(
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     let (z6iii_frame, opencl, z6iii_oriented) = z6iii::render_linear_rgba16_oriented_traced(
         bytes,
-        libraw_bayer,
+        // The reconstruction reads the LibRaw plane only for a Z6III HE NEF and
+        // returns `NotZ6iii` before looking at it otherwise. Copying the whole
+        // sensor plane (48.4 MB at 24 MP) for every ARW/CR3/DNG/RAF decode and
+        // dropping it was pure waste; the predicate is the same one the render
+        // entry uses, so a Z6III file still gets its plane.
+        libraw_frame
+            .filter(|_| z6iii::uses_libraw_plane(bytes))
+            .map(|lib| (lib.raw_width, lib.raw_height, lib.data.clone())),
         ca_warp.as_ref(),
         orientation,
     );
@@ -176,6 +184,22 @@ pub(crate) fn decode_he_rgba16_with(
     if let Some(bayer) = libraw_frame {
         if bayer.filters == 9 && bayer.colors == 3 {
             let demosaic_started = Instant::now();
+            // Warp-free frames run demosaic and linear finish as one
+            // device-resident chain (one H2D of the raw window, one D2H of the
+            // finished frame; no full-frame host round trip between the two
+            // stages). A CPU lens CA warp reads every pixel in between, so a
+            // warped frame keeps the two segments and the round trip.
+            #[cfg(all(windows, feature = "z6iii-raw-export"))]
+            if ca_warp.is_none() && demosaic_cuda::fused_cuda_enabled() {
+                if let Some((width, height, rgb)) = decode_xtrans_linear_fused(bayer, iso, noise) {
+                    timings.cuda_fused_frames += 1;
+                    timings.demosaic_ms += demosaic_started.elapsed().as_millis() as u64;
+                    timings.note_bytes((rgb.len() as u64) * 12);
+                    let out = pack_rgba16(&rgb);
+                    let (width, height, pixels) = orient_rgba16(out, width, height, orientation);
+                    return Some((width, height, pixels, cpu_route));
+                }
+            }
             let (width, height, mut rgb) = decode_xtrans_linear(bayer)?;
             timings.demosaic_ms += demosaic_started.elapsed().as_millis() as u64;
             timings.note_bytes((rgb.len() as u64) * 12);
@@ -200,12 +224,37 @@ pub(crate) fn decode_he_rgba16_with(
     // otherwise construct the C1 Stage 1/2/3 input directly from LibRaw's generic
     // BayerFrame (covers Sony ARW, Canon CR3, classic Nikon NEF, DNG, etc.).
     let c1_started = Instant::now();
+    // Fused demosaic -> linear finish: only for a warp-free frame, because the
+    // CPU CA warp reads every pixel between the two stages and therefore needs
+    // the download the fusion is meant to remove.
+    #[cfg(all(windows, feature = "z6iii-raw-export"))]
+    let fused_allowed = ca_warp.is_none() && demosaic_cuda::fused_cuda_enabled();
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    let fused_allowed = false;
+
+    let mut finished = false;
     let (width, height, mut rgb, wb, black) =
         if let Some((frame, wb, black)) = nikon_c1_stage_input(bytes, libraw_frame) {
-            let (width, height, rgb) = demosaic_cuda::demosaic_rggb_crop_cuda(&frame, wb, black, noise)
-                .ok()
-                .or_else(|| run_c1_stage123_tiles_f32(&frame, wb, black, noise))?;
-            (width, height, rgb, wb, black)
+            let fused = if fused_allowed {
+                demosaic_cuda::demosaic_and_finish_rggb_crop_cuda(&frame, wb, black, noise, iso)
+                    .ok()
+            } else {
+                None
+            };
+            match fused {
+                Some((width, height, rgb)) => {
+                    finished = true;
+                    timings.cuda_fused_frames += 1;
+                    (width, height, rgb, wb, black)
+                }
+                None => {
+                    let (width, height, rgb) =
+                        demosaic_cuda::demosaic_rggb_crop_cuda(&frame, wb, black, noise)
+                            .ok()
+                            .or_else(|| run_c1_stage123_tiles_f32(&frame, wb, black, noise))?;
+                    (width, height, rgb, wb, black)
+                }
+            }
         } else if let Some(bayer) = libraw_frame {
             let g = if bayer.cam_mul[1].is_finite() && bayer.cam_mul[1] > 0.0 {
                 bayer.cam_mul[1]
@@ -232,25 +281,56 @@ pub(crate) fn decode_he_rgba16_with(
             } else {
                 bayer.black >> (u32::from(bayer.bits) - 14)
             };
-            if let Ok((width, height, rgb)) = demosaic_cuda::demosaic_bayer_cuda(
-                &bayer.data,
-                bayer.raw_width,
-                bayer.raw_height,
-                bayer.left_margin,
-                bayer.top_margin,
-                bayer.width,
-                bayer.height,
-                bayer.bits,
-                bayer.filters,
-                bayer.black,
-                wb,
-                noise,
-            ) {
-                (width, height, rgb, wb, black_14 << 2)
+            // The demosaic writes the `0..65535` domain, so the recovery black
+            // it is compared against is the 14-bit point scaled by four.
+            let fused = if fused_allowed {
+                demosaic_cuda::demosaic_and_finish_bayer_cuda(
+                    &bayer.data,
+                    bayer.raw_width,
+                    bayer.raw_height,
+                    bayer.left_margin,
+                    bayer.top_margin,
+                    bayer.width,
+                    bayer.height,
+                    bayer.bits,
+                    bayer.filters,
+                    bayer.black,
+                    wb,
+                    noise,
+                    iso,
+                )
+                .ok()
             } else {
-                let (frame, wb, black) = generic_bayer_c1_stage_input(bayer)?;
-                let (width, height, rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
-                (width, height, rgb, wb, black)
+                None
+            };
+            match fused {
+                Some((width, height, rgb)) => {
+                    finished = true;
+                    timings.cuda_fused_frames += 1;
+                    (width, height, rgb, wb, black_14 << 2)
+                }
+                None => {
+                    if let Ok((width, height, rgb)) = demosaic_cuda::demosaic_bayer_cuda(
+                        &bayer.data,
+                        bayer.raw_width,
+                        bayer.raw_height,
+                        bayer.left_margin,
+                        bayer.top_margin,
+                        bayer.width,
+                        bayer.height,
+                        bayer.bits,
+                        bayer.filters,
+                        bayer.black,
+                        wb,
+                        noise,
+                    ) {
+                        (width, height, rgb, wb, black_14 << 2)
+                    } else {
+                        let (frame, wb, black) = generic_bayer_c1_stage_input(bayer)?;
+                        let (width, height, rgb) = run_c1_stage123_tiles_f32(&frame, wb, black, noise)?;
+                        (width, height, rgb, wb, black)
+                    }
+                }
             }
         } else {
             return None;
@@ -259,22 +339,30 @@ pub(crate) fn decode_he_rgba16_with(
     timings.note_bytes((rgb.len() as u64) * 12);
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     {
-        if let Some(warp) = ca_warp.as_ref() {
-            z6iii::apply_linear_chromatic_aberration(&mut rgb, width, height, 0, 0, width, height, warp);
-        }
-        if let Err(err) = linear_post_cuda::linear_finish_cuda(
-            &mut rgb,
-            width,
-            height,
-            Some((black, wb)),
-            iso,
-            noise,
-        ) {
-            log::debug!("generic Bayer linear_finish_cuda fallback ({err})");
-            z6iii::recover_and_antialias_frame(&mut rgb, width, height, black, wb, iso);
-            finish_linear_stages(&mut rgb, width, height, iso, noise, None);
+        if !finished {
+            if let Some(warp) = ca_warp.as_ref() {
+                z6iii::apply_linear_chromatic_aberration(&mut rgb, width, height, 0, 0, width, height, warp);
+            }
+            if let Err(err) = linear_post_cuda::linear_finish_cuda(
+                &mut rgb,
+                width,
+                height,
+                Some((black, wb)),
+                iso,
+                noise,
+            ) {
+                log::debug!("generic Bayer linear_finish_cuda fallback ({err})");
+                match z6iii::recover_and_antialias_frame(&mut rgb, width, height, black, wb, iso) {
+                    z6iii::GenericPostRoute::Cpu => timings.cpu_highlight_aa_frames += 1,
+                    z6iii::GenericPostRoute::OpenCl => timings.opencl_highlight_aa_frames += 1,
+                    z6iii::GenericPostRoute::InvalidInput => return None,
+                }
+                finish_linear_stages(&mut rgb, width, height, iso, noise, None);
+            }
         }
     }
+    #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
+    let _ = finished;
     timings.c1_stages_ms += c1_started.elapsed().as_millis() as u64;
     let out = pack_rgba16(&rgb);
     let (width, height, pixels) = orient_rgba16(out, width, height, orientation);
@@ -338,6 +426,41 @@ fn decode_xtrans_linear(bayer: &crate::raw::BayerFrame) -> Option<(usize, usize,
         black,
         wb,
     )?;
+    Some((bayer.width, bayer.height, rgb))
+}
+
+#[cfg(all(windows, feature = "z6iii-raw-export"))]
+fn decode_xtrans_linear_fused(
+    bayer: &crate::raw::BayerFrame,
+    iso: u32,
+    noise: [f32; 2],
+) -> Option<(usize, usize, Vec<[f32; 3]>)> {
+    let g = if bayer.cam_mul[1].is_finite() && bayer.cam_mul[1] > 0.0 {
+        bayer.cam_mul[1]
+    } else {
+        1.0
+    };
+    let wb = [
+        if bayer.cam_mul[0].is_finite() && bayer.cam_mul[0] > 0.0 { bayer.cam_mul[0] / g } else { 1.0 },
+        1.0,
+        if bayer.cam_mul[2].is_finite() && bayer.cam_mul[2] > 0.0 { bayer.cam_mul[2] / g } else { 1.0 },
+    ];
+    // Demosaic + linear finish in one VRAM session: the frame never leaves the
+    // device between the two stages.
+    let rgb = demosaic_cuda::demosaic_and_finish_xtrans_cuda(
+        &bayer.data,
+        bayer.raw_width,
+        bayer.left_margin,
+        bayer.top_margin,
+        bayer.width,
+        bayer.height,
+        bayer.bits,
+        bayer.black as f32,
+        wb,
+        noise,
+        iso,
+    )
+    .ok()?;
     Some((bayer.width, bayer.height, rgb))
 }
 
@@ -611,6 +734,19 @@ fn orient_rgba16(mut pixels: Vec<u16>, width: usize, height: usize, orientation:
 
 #[cfg(test)]
 mod tests {
+    /// The LibRaw plane copy before the Z6III attempt is skipped for every body
+    /// that is not a Z6III NEF, so the gate must reject ordinary containers.
+    /// This is a pure predicate test: no RAW file, no GPU.
+    #[cfg(windows)]
+    #[test]
+    fn libraw_plane_gate_rejects_non_z6iii_bodies() {
+        assert!(!super::z6iii::uses_libraw_plane(b""));
+        assert!(!super::z6iii::uses_libraw_plane(b"\xFF\xD8\xFF\xE0 not a nef"));
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.resize(4096, 0);
+        assert!(!super::z6iii::uses_libraw_plane(&tiff), "a bare TIFF header is not a Z6III HE NEF");
+    }
+
     /// `AURORA_TEST_RAW=<nef> cargo test -p aurora-engine aurora_raw -- --ignored`
     #[test]
     #[ignore]

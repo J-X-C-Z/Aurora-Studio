@@ -27,6 +27,24 @@ fn parse_enabled_env(value: Option<&str>) -> bool {
     }
 }
 
+/// Whether the fused demosaic -> linear-finish chain may run.
+///
+/// Set `AURORA_RAW_FUSED_CUDA=0` (`false`/`off`) to force the historical
+/// two-segment path (`demosaic_*_cuda` + `linear_post_cuda::linear_finish_cuda`)
+/// so a frame can be compared between the two, or to isolate a regression to
+/// one of the segments.
+pub(crate) fn fused_cuda_enabled() -> bool {
+    parse_enabled_env(std::env::var("AURORA_RAW_FUSED_CUDA").ok().as_deref())
+}
+
+/// Test-only accounting for the fused demosaic -> linear-finish entries: one
+/// increment per host<->device copy they perform. One fused call must leave it
+/// at exactly 2 (the raw window up, the finished frame down); the two-segment
+/// path it replaces performs 4 for the same frame.
+#[cfg(test)]
+pub(crate) static FUSED_HOST_COPIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Evaluates LibRaw's 2x2 Bayer filter bitmask at `(x, y)` (0=R, 1/3=G, 2=B).
 #[inline]
 fn bayer_color_at(filters: u32, x: usize, y: usize) -> u8 {
@@ -70,11 +88,20 @@ fn bit_shifts_to_14(bits: u8) -> (u32, u32) {
 mod imp {
     use super::{bit_shifts_to_14, demosaic_cuda_enabled, find_rggb_offset};
     use crate::aurora_raw::c1_raw_he::{NikonHeCropFrame, Stage1Params};
-    use aurora_portrait::cuda::Nvidia;
+    use crate::aurora_raw::linear_post_cuda::{launch_finish_chain, linear_post_ptx_image};
+    use aurora_portrait::cuda::{BufferSession, CudaError, Nvidia};
     use std::ffi::c_void;
     use std::slice;
 
     const PTX: &str = include_str!("../../native/cuda/raw_demosaic.ptx");
+
+    /// The embedded PTX image, for the startup warmup in
+    /// [`crate::aurora_raw::prewarm`]. Handing out the same text (not a second
+    /// `include_str!`) is what makes the warmup hit the shared domain's module
+    /// cache instead of JIT-compiling a duplicate.
+    pub(crate) fn ptx_image() -> &'static str {
+        PTX
+    }
 
     const KERNEL_BAYER_STAGE1: &str = "bayer_stage1_kernel";
     const KERNEL_BAYER_STAGE2_SCALE: &str = "bayer_stage2_scale_kernel";
@@ -151,9 +178,187 @@ mod imp {
         }
     }
 
+    /// The four C1 Stage 1/2/3 kernels over an already-uploaded raw window.
+    ///
+    /// `image` is the PTX image that declares them, so the same chain can run in
+    /// a session opened on another image (the fused demosaic -> linear-finish
+    /// chain) without re-uploading anything.
     #[allow(clippy::too_many_arguments)]
-    fn run_bayer_rggb_cuda_inner(
-        raw: &[u16],
+    fn launch_bayer_chain(
+        session: &mut BufferSession<'_>,
+        image: &'static str,
+        params: &BayerDemosaicParams,
+        buf_raw: u64,
+        buf_s1: u64,
+        buf_s2: u64,
+        buf_out: u64,
+        width: usize,
+        height: usize,
+    ) -> Result<(), CudaError> {
+        // Stage 1: directional green + black offset
+        {
+            let mut src = buf_raw;
+            let mut dst = buf_s1;
+            let mut p = *params;
+            let mut args: [*mut c_void; 3] = [
+                &mut src as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut p as *mut BayerDemosaicParams as *mut c_void,
+            ];
+            session.launch_from_image(
+                image,
+                KERNEL_BAYER_STAGE1,
+                grid_2d((width + 16) as u32, (height + 16) as u32),
+                BLOCK_2D,
+                &mut args,
+            )?;
+        }
+
+        // Stage 2: basic green refinement + WB channel scale
+        {
+            let mut src = buf_s1;
+            let mut dst = buf_s2;
+            let mut p = *params;
+            let mut args: [*mut c_void; 3] = [
+                &mut src as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut p as *mut BayerDemosaicParams as *mut c_void,
+            ];
+            session.launch_from_image(
+                image,
+                KERNEL_BAYER_STAGE2_SCALE,
+                grid_2d((width + 12) as u32, (height + 12) as u32),
+                BLOCK_2D,
+                &mut args,
+            )?;
+        }
+
+        // Stage 3a: diagonal R/B reconstruction (in-place on buf_s2)
+        {
+            let mut buf = buf_s2;
+            let mut p = *params;
+            let mut args: [*mut c_void; 2] = [
+                &mut buf as *mut u64 as *mut c_void,
+                &mut p as *mut BayerDemosaicParams as *mut c_void,
+            ];
+            session.launch_from_image(
+                image,
+                KERNEL_BAYER_STAGE3_DIAG,
+                grid_2d((width + 8) as u32, (height + 8) as u32),
+                BLOCK_2D,
+                &mut args,
+            )?;
+        }
+
+        // Stage 3b: cross R/B on G sites + pack tightly to [f32; 3]
+        {
+            let mut src = buf_s2;
+            let mut dst = buf_out;
+            let mut p = *params;
+            let mut args: [*mut c_void; 3] = [
+                &mut src as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut p as *mut BayerDemosaicParams as *mut c_void,
+            ];
+            session.launch_from_image(
+                image,
+                KERNEL_BAYER_STAGE3_GREEN,
+                grid_2d(width as u32, height as u32),
+                BLOCK_2D,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The four X-Trans kernels over an already-uploaded active window.
+    fn launch_xtrans_chain(
+        session: &mut BufferSession<'_>,
+        image: &'static str,
+        params: &XTransDemosaicParams,
+        buf_raw: u64,
+        buf_plane: u64,
+        buf_green: u64,
+        buf_green_fixed: u64,
+        buf_out: u64,
+        width: usize,
+        height: usize,
+    ) -> Result<(), CudaError> {
+        let p = *params;
+        let w = params.width;
+        let h = params.height;
+        let g2 = grid_2d(width as u32, height as u32);
+
+        // Stage 0: normalize
+        {
+            let mut src = buf_raw;
+            let mut dst = buf_plane;
+            let mut params = p;
+            let mut args: [*mut c_void; 3] = [
+                &mut src as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut params as *mut XTransDemosaicParams as *mut c_void,
+            ];
+            session.launch_from_image(image, KERNEL_XTRANS_NORM, g2, BLOCK_2D, &mut args)?;
+        }
+
+        // Stage 1: directional green interpolation
+        {
+            let mut src = buf_plane;
+            let mut dst = buf_green;
+            let mut w = w;
+            let mut h = h;
+            let mut args: [*mut c_void; 4] = [
+                &mut src as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut w as *mut i32 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+            ];
+            session.launch_from_image(image, KERNEL_XTRANS_GREEN, g2, BLOCK_2D, &mut args)?;
+        }
+
+        // Stage 2: fixGreen cross clamp
+        {
+            let mut src = buf_green;
+            let mut dst = buf_green_fixed;
+            let mut w = w;
+            let mut h = h;
+            let mut args: [*mut c_void; 4] = [
+                &mut src as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut w as *mut i32 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+            ];
+            session.launch_from_image(image, KERNEL_XTRANS_FIX_GREEN, g2, BLOCK_2D, &mut args)?;
+        }
+
+        // Stage 3: 5x5 R-G / B-G chroma rebuild -> [f32; 3]
+        {
+            let mut src_plane = buf_plane;
+            let mut src_gf = buf_green_fixed;
+            let mut dst = buf_out;
+            let mut w = w;
+            let mut h = h;
+            let mut args: [*mut c_void; 5] = [
+                &mut src_plane as *mut u64 as *mut c_void,
+                &mut src_gf as *mut u64 as *mut c_void,
+                &mut dst as *mut u64 as *mut c_void,
+                &mut w as *mut i32 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+            ];
+            session.launch_from_image(image, KERNEL_XTRANS_CHROMA, g2, BLOCK_2D, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Validates an RGGB-aligned Bayer request and returns the kernel params
+    /// plus the contiguous raw row window that is uploaded.
+    ///
+    /// Shared by the standalone demosaic path and the fused
+    /// demosaic -> linear-finish path so both validate identically.
+    #[allow(clippy::too_many_arguments)]
+    fn bayer_stage_params<'a>(
+        raw: &'a [u16],
         raw_stride: usize,
         src_left: usize,
         src_top: usize,
@@ -164,10 +369,7 @@ mod imp {
         black_14: u32,
         wb: [f32; 3],
         noise: [f32; 2],
-    ) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
-        if !demosaic_cuda_enabled() {
-            return Err("disabled via AURORA_DEMOSAIC_CUDA=0".to_string());
-        }
+    ) -> Result<(BayerDemosaicParams, &'a [u16]), String> {
         if width < 16 || height < 16 {
             return Err(format!("Bayer active dimensions too small: {width}x{height}"));
         }
@@ -216,7 +418,7 @@ mod imp {
         let black_i32 =
             i32::try_from(black_14).map_err(|_| "black exceeds i32::MAX".to_string())?;
 
-        let mut params = BayerDemosaicParams {
+        let params = BayerDemosaicParams {
             raw_stride: stride_i32,
             src_left: left_i32,
             src_top: top_i32,
@@ -239,7 +441,30 @@ mod imp {
         // copying unused top/bottom optical black rows over PCIe.
         let slice_start = src_top * raw_stride;
         let slice_end = (src_top + height) * raw_stride;
-        let raw_window = &raw[slice_start..slice_end];
+        Ok((params, &raw[slice_start..slice_end]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_bayer_rggb_cuda_inner(
+        raw: &[u16],
+        raw_stride: usize,
+        src_left: usize,
+        src_top: usize,
+        width: usize,
+        height: usize,
+        shift_left: u32,
+        shift_right: u32,
+        black_14: u32,
+        wb: [f32; 3],
+        noise: [f32; 2],
+    ) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
+        if !demosaic_cuda_enabled() {
+            return Err("disabled via AURORA_DEMOSAIC_CUDA=0".to_string());
+        }
+        let (mut params, raw_window) = bayer_stage_params(
+            raw, raw_stride, src_left, src_top, width, height, shift_left, shift_right, black_14,
+            wb, noise,
+        )?;
         params.src_top = 0;
 
         let stage1_pixels = (width + 16) * (height + 16);
@@ -262,75 +487,9 @@ mod imp {
             let buf_s2 = session.handle(2);
             let buf_out = session.handle(3);
 
-            // Stage 1: directional green + black offset
-            {
-                let mut src = buf_raw;
-                let mut dst = buf_s1;
-                let mut p = params;
-                let mut args: [*mut c_void; 3] = [
-                    &mut src as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut p as *mut BayerDemosaicParams as *mut c_void,
-                ];
-                session.launch(
-                    KERNEL_BAYER_STAGE1,
-                    grid_2d((width + 16) as u32, (height + 16) as u32),
-                    BLOCK_2D,
-                    &mut args,
-                )?;
-            }
-
-            // Stage 2: basic green refinement + WB channel scale
-            {
-                let mut src = buf_s1;
-                let mut dst = buf_s2;
-                let mut p = params;
-                let mut args: [*mut c_void; 3] = [
-                    &mut src as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut p as *mut BayerDemosaicParams as *mut c_void,
-                ];
-                session.launch(
-                    KERNEL_BAYER_STAGE2_SCALE,
-                    grid_2d((width + 12) as u32, (height + 12) as u32),
-                    BLOCK_2D,
-                    &mut args,
-                )?;
-            }
-
-            // Stage 3a: diagonal R/B reconstruction (in-place on buf_s2)
-            {
-                let mut buf = buf_s2;
-                let mut p = params;
-                let mut args: [*mut c_void; 2] = [
-                    &mut buf as *mut u64 as *mut c_void,
-                    &mut p as *mut BayerDemosaicParams as *mut c_void,
-                ];
-                session.launch(
-                    KERNEL_BAYER_STAGE3_DIAG,
-                    grid_2d((width + 8) as u32, (height + 8) as u32),
-                    BLOCK_2D,
-                    &mut args,
-                )?;
-            }
-
-            // Stage 3b: cross R/B on G sites + pack tightly to [f32; 3]
-            {
-                let mut src = buf_s2;
-                let mut dst = buf_out;
-                let mut p = params;
-                let mut args: [*mut c_void; 3] = [
-                    &mut src as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut p as *mut BayerDemosaicParams as *mut c_void,
-                ];
-                session.launch(
-                    KERNEL_BAYER_STAGE3_GREEN,
-                    grid_2d(width as u32, height as u32),
-                    BLOCK_2D,
-                    &mut args,
-                )?;
-            }
+            launch_bayer_chain(
+                session, PTX, &params, buf_raw, buf_s1, buf_s2, buf_out, width, height,
+            )?;
 
             session.download(3, unsafe { bytes_of_mut(&mut out) })?;
             session.mark_consumed();
@@ -430,15 +589,11 @@ mod imp {
         )
     }
 
-    /// Demosaics a Fujifilm X-Trans 6x6 CFA active plane into linear 16-bit camera
-    /// RGB (`0.0..=65535.0`) on CUDA, 1:1 aligned with `xtrans::demosaic_xtrans`.
-    ///
-    /// Pass `bits = 14` (or `0`) when `raw` and `black` are already in 14-bit units;
-    /// for other bit depths (`bits < 14` or `bits > 14`), both sample values and
-    /// `black` are shifted into 14-bit identically to `aurora_raw::decode_xtrans_linear`.
+    /// Validates an X-Trans active window and returns the kernel params plus the
+    /// uploaded row window. Shared by the standalone and the fused paths.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn demosaic_xtrans_cuda(
-        raw: &[u16],
+    fn xtrans_stage_params<'a>(
+        raw: &'a [u16],
         raw_width: usize,
         left: usize,
         top: usize,
@@ -447,10 +602,7 @@ mod imp {
         bits: u8,
         black: f32,
         wb: [f32; 3],
-    ) -> Result<Vec<[f32; 3]>, String> {
-        if !demosaic_cuda_enabled() {
-            return Err("disabled via AURORA_DEMOSAIC_CUDA=0".to_string());
-        }
+    ) -> Result<(XTransDemosaicParams, &'a [u16]), String> {
         if width < 8 || height < 8 {
             return Err(format!("X-Trans dimensions too small: {width}x{height}"));
         }
@@ -490,11 +642,6 @@ mod imp {
             i32::try_from(raw_width).map_err(|_| "raw_width exceeds i32::MAX".to_string())?;
         let left_i32 = i32::try_from(left).map_err(|_| "left exceeds i32::MAX".to_string())?;
 
-        // Upload only the active rows [top .. top + height).
-        let slice_start = top * raw_width;
-        let slice_end = (top + height) * raw_width;
-        let raw_window = &raw[slice_start..slice_end];
-
         let params = XTransDemosaicParams {
             raw_stride: stride_i32,
             left: left_i32,
@@ -509,15 +656,45 @@ mod imp {
             wb_b: wb[2],
         };
 
+        // Upload only the active rows [top .. top + height).
+        let slice_start = top * raw_width;
+        let slice_end = (top + height) * raw_width;
+        Ok((params, &raw[slice_start..slice_end]))
+    }
+
+    /// Demosaics a Fujifilm X-Trans 6x6 CFA active plane into linear 16-bit camera
+    /// RGB (`0.0..=65535.0`) on CUDA, 1:1 aligned with `xtrans::demosaic_xtrans`.
+    ///
+    /// Pass `bits = 14` (or `0`) when `raw` and `black` are already in 14-bit units;
+    /// for other bit depths (`bits < 14` or `bits > 14`), both sample values and
+    /// `black` are shifted into 14-bit identically to `aurora_raw::decode_xtrans_linear`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn demosaic_xtrans_cuda(
+        raw: &[u16],
+        raw_width: usize,
+        left: usize,
+        top: usize,
+        width: usize,
+        height: usize,
+        bits: u8,
+        black: f32,
+        wb: [f32; 3],
+    ) -> Result<Vec<[f32; 3]>, String> {
+        if !demosaic_cuda_enabled() {
+            return Err("disabled via AURORA_DEMOSAIC_CUDA=0".to_string());
+        }
+        let (params, raw_window) =
+            xtrans_stage_params(raw, raw_width, left, top, width, height, bits, black, wb)?;
+
         let pixels = width * height;
         let raw_bytes = raw_window.len() * std::mem::size_of::<u16>();
         let plane_bytes = pixels * std::mem::size_of::<f32>();
         let out_bytes = pixels * 12; // [f32; 3]
 
+
         let gpu = Nvidia::open_ptx(PTX).map_err(|e| format!("CUDA open_ptx: {e:?}"))?;
         let sizes = [raw_bytes, plane_bytes, plane_bytes, plane_bytes, out_bytes];
         let mut out = vec![[0.0f32; 3]; pixels];
-        let g2 = grid_2d(width as u32, height as u32);
 
         gpu.with_reusable_buffers("raw-demosaic-xtrans", &sizes, |session| {
             session.upload(0, unsafe { bytes_of(raw_window) })?;
@@ -527,65 +704,18 @@ mod imp {
             let buf_green_fixed = session.handle(3);
             let buf_out = session.handle(4);
 
-            // Stage 0: normalize
-            {
-                let mut src = buf_raw;
-                let mut dst = buf_plane;
-                let mut p = params;
-                let mut args: [*mut c_void; 3] = [
-                    &mut src as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut p as *mut XTransDemosaicParams as *mut c_void,
-                ];
-                session.launch(KERNEL_XTRANS_NORM, g2, BLOCK_2D, &mut args)?;
-            }
-
-            // Stage 1: directional green interpolation
-            {
-                let mut src = buf_plane;
-                let mut dst = buf_green;
-                let mut w = w_i32;
-                let mut h = h_i32;
-                let mut args: [*mut c_void; 4] = [
-                    &mut src as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut w as *mut i32 as *mut c_void,
-                    &mut h as *mut i32 as *mut c_void,
-                ];
-                session.launch(KERNEL_XTRANS_GREEN, g2, BLOCK_2D, &mut args)?;
-            }
-
-            // Stage 2: fixGreen cross clamp
-            {
-                let mut src = buf_green;
-                let mut dst = buf_green_fixed;
-                let mut w = w_i32;
-                let mut h = h_i32;
-                let mut args: [*mut c_void; 4] = [
-                    &mut src as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut w as *mut i32 as *mut c_void,
-                    &mut h as *mut i32 as *mut c_void,
-                ];
-                session.launch(KERNEL_XTRANS_FIX_GREEN, g2, BLOCK_2D, &mut args)?;
-            }
-
-            // Stage 3: 5x5 R-G / B-G chroma rebuild -> [f32; 3]
-            {
-                let mut src_plane = buf_plane;
-                let mut src_gf = buf_green_fixed;
-                let mut dst = buf_out;
-                let mut w = w_i32;
-                let mut h = h_i32;
-                let mut args: [*mut c_void; 5] = [
-                    &mut src_plane as *mut u64 as *mut c_void,
-                    &mut src_gf as *mut u64 as *mut c_void,
-                    &mut dst as *mut u64 as *mut c_void,
-                    &mut w as *mut i32 as *mut c_void,
-                    &mut h as *mut i32 as *mut c_void,
-                ];
-                session.launch(KERNEL_XTRANS_CHROMA, g2, BLOCK_2D, &mut args)?;
-            }
+            launch_xtrans_chain(
+                session,
+                PTX,
+                &params,
+                buf_raw,
+                buf_plane,
+                buf_green,
+                buf_green_fixed,
+                buf_out,
+                width,
+                height,
+            )?;
 
             session.download(4, unsafe { bytes_of_mut(&mut out) })?;
             session.mark_consumed();
@@ -595,10 +725,338 @@ mod imp {
 
         Ok(out)
     }
+
+    // ---------------------------------------------------------------------
+    // Fused demosaic -> linear finish (task 3.2)
+    //
+    // The historical shape is two CUDA calls with a host round trip in the
+    // middle: `demosaic_*_cuda` downloads the whole frame as `[f32; 3]`, then
+    // `linear_post_cuda::linear_finish_cuda` uploads the same bytes again.
+    // Both stages already run in the process-wide CUDA domain, so the tail can
+    // read the demosaic's `[f32; 3]` buffer directly. These entries keep one
+    // session open across both kernel sets, which removes exactly two host
+    // copies per frame of `pixels * 12` bytes each (one D2H + one H2D),
+    // leaving one H2D of the raw window and one D2H of the finished frame.
+    //
+    // The device-side pack (RGB3 -> float4) still runs: the ColorNoise2012 and
+    // anti-alias kernels are float4-based, and it now reads the demosaic
+    // output in place instead of a freshly uploaded copy.
+    // ---------------------------------------------------------------------
+
+    /// The black point handed to highlight recovery, in the same `0..65535`
+    /// domain `linear_post_cuda::linear_finish_cuda` expects, or `None` when the
+    /// frame/black point leaves nothing to recover. Mirrors that function's own
+    /// guard, so a fused frame recovers highlights exactly when the two-segment
+    /// path would.
+    pub(super) fn recovery_black(
+        black_16: u32,
+        width: usize,
+        height: usize,
+        wb: [f32; 3],
+    ) -> Option<u32> {
+        let usable = width >= 4
+            && height >= 4
+            && black_16 < 65_535
+            && wb.into_iter().all(|gain| gain.is_finite() && gain > 0.0);
+        usable.then_some(black_16)
+    }
+
+    /// The linear-finish tail over a `[f32; 3]` buffer that is already in VRAM.
+    /// Delegates to the same chain the two-stage path runs, so fused and
+    /// two-stage decodes share one implementation and cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_linear_finish_tail(
+        session: &mut BufferSession<'_>,
+        buf_rgb3: u64,
+        buf_a: u64,
+        buf_b: u64,
+        width: usize,
+        height: usize,
+        recovery: Option<u32>,
+        wb: [f32; 3],
+        iso: u32,
+        noise: [f32; 2],
+    ) -> Result<(), CudaError> {
+        launch_finish_chain(
+            session,
+            buf_rgb3,
+            buf_a,
+            buf_b,
+            width as i32,
+            height as i32,
+            (width * height) as i32,
+            recovery.map(|black| (black, wb)),
+            iso,
+            noise,
+        )
+    }
+
+    /// Bayer Stage 1/2/3 + linear finish over one VRAM allocation set.
+    #[allow(clippy::too_many_arguments)]
+    fn run_bayer_rggb_fused_inner(
+        raw: &[u16],
+        raw_stride: usize,
+        src_left: usize,
+        src_top: usize,
+        width: usize,
+        height: usize,
+        shift_left: u32,
+        shift_right: u32,
+        black_14: u32,
+        finish_black: u32,
+        wb: [f32; 3],
+        noise: [f32; 2],
+        iso: u32,
+    ) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
+        if !super::fused_cuda_enabled() {
+            return Err("disabled via AURORA_RAW_FUSED_CUDA=0".to_string());
+        }
+        if !demosaic_cuda_enabled() {
+            return Err("disabled via AURORA_DEMOSAIC_CUDA=0".to_string());
+        }
+        if !crate::aurora_raw::linear_post_cuda::linear_post_cuda_enabled() {
+            return Err("disabled via AURORA_LINEAR_POST_CUDA=0".to_string());
+        }
+        let (mut params, raw_window) = bayer_stage_params(
+            raw, raw_stride, src_left, src_top, width, height, shift_left, shift_right, black_14,
+            wb, noise,
+        )?;
+        params.src_top = 0;
+
+        let stage1_pixels = (width + 16) * (height + 16);
+        let stage2_pixels = (width + 12) * (height + 12);
+        let out_pixels = width * height;
+
+        let raw_bytes = raw_window.len() * std::mem::size_of::<u16>();
+        let stage1_bytes = stage1_pixels * 16; // float4
+        let stage2_bytes = stage2_pixels * 16; // float4
+        let out_bytes = out_pixels * 12; // [f32; 3]
+        let f4_bytes = out_pixels * 16; // float4 scratch for the linear tail
+
+        // The session is opened on the linear-post image because the tail has
+        // more kernels than the head; the four demosaic kernels are reached
+        // through `launch_from_image`, which resolves the same cached module.
+        let gpu = Nvidia::open_ptx(linear_post_ptx_image())
+            .map_err(|e| format!("CUDA open_ptx: {e:?}"))?;
+        let sizes = [
+            raw_bytes, stage1_bytes, stage2_bytes, out_bytes, f4_bytes, f4_bytes,
+        ];
+        let mut out = vec![[0.0f32; 3]; out_pixels];
+        let recovery = recovery_black(finish_black, width, height, wb);
+
+        gpu.with_reusable_buffers("raw-demosaic-finish-bayer", &sizes, |session| {
+            session.upload(0, unsafe { bytes_of(raw_window) })?;
+            #[cfg(test)]
+            super::FUSED_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let buf_raw = session.handle(0);
+            let buf_s1 = session.handle(1);
+            let buf_s2 = session.handle(2);
+            let buf_rgb3 = session.handle(3);
+            let buf_a = session.handle(4);
+            let buf_b = session.handle(5);
+
+            launch_bayer_chain(
+                session, PTX, &params, buf_raw, buf_s1, buf_s2, buf_rgb3, width, height,
+            )?;
+            launch_linear_finish_tail(
+                session, buf_rgb3, buf_a, buf_b, width, height, recovery, wb, iso, noise,
+            )?;
+
+            session.download(3, unsafe { bytes_of_mut(&mut out) })?;
+            #[cfg(test)]
+            super::FUSED_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            session.mark_consumed();
+            Ok(())
+        })
+        .map_err(|e| format!("CUDA demosaic_finish_bayer: {e:?}"))?;
+
+        Ok((width, height, out))
+    }
+
+    /// Demosaics a generic 2x2 Bayer frame and runs `linear_finish` without a
+    /// host round trip. Same arguments and result as calling
+    /// [`demosaic_bayer_cuda`] and then
+    /// `linear_post_cuda::linear_finish_cuda(..., Some((black_14 << 2, wb)), iso, noise)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn demosaic_and_finish_bayer_cuda(
+        raw: &[u16],
+        raw_width: usize,
+        raw_height: usize,
+        left_margin: usize,
+        top_margin: usize,
+        width: usize,
+        height: usize,
+        bits: u8,
+        filters: u32,
+        black: u32,
+        wb: [f32; 3],
+        noise: [f32; 2],
+        iso: u32,
+    ) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
+        if filters == 0 || filters == 9 {
+            return Err(format!("unsupported Bayer filters mask: {filters:#x}"));
+        }
+        let (dx, dy) = find_rggb_offset(filters, left_margin, top_margin)
+            .ok_or_else(|| format!("cannot find RGGB origin for filters={filters:#x}"))?;
+        let src_left = left_margin + dx;
+        let src_top = top_margin + dy;
+        let out_w = width.saturating_sub(dx) & !1;
+        let out_h = height.saturating_sub(dy) & !1;
+        if out_w < 16 || out_h < 16 || src_left + out_w > raw_width || src_top + out_h > raw_height {
+            return Err(format!(
+                "invalid RGGB-aligned Bayer crop: ({src_left},{src_top}) {out_w}x{out_h} in {raw_width}x{raw_height}"
+            ));
+        }
+
+        let (shift_left, shift_right) = bit_shifts_to_14(bits);
+        let black_14 = if shift_left > 0 {
+            black << shift_left
+        } else if shift_right > 0 {
+            black >> shift_right
+        } else {
+            black
+        };
+
+        run_bayer_rggb_fused_inner(
+            raw,
+            raw_width,
+            src_left,
+            src_top,
+            out_w,
+            out_h,
+            shift_left,
+            shift_right,
+            black_14,
+            black_14 << 2, // generic Bayer: match segmented 16-bit recovery input
+            wb,
+            noise,
+            iso,
+        )
+    }
+
+    /// Fused variant over an already RGGB-aligned 14-bit `NikonHeCropFrame`.
+    /// The recovery black is the input `black` itself (already 16-bit domain),
+    /// matching what the two-segment caller passes to `linear_finish_cuda`.
+    pub(crate) fn demosaic_and_finish_rggb_crop_cuda(
+        frame: &NikonHeCropFrame,
+        wb: [f32; 3],
+        black: u32,
+        noise: [f32; 2],
+        iso: u32,
+    ) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
+        let crop = frame.crop();
+        if (crop.left | crop.top) & 1 != 0 {
+            return Err(format!(
+                "NikonHeCropFrame crop origin ({}, {}) is not even RGGB-aligned",
+                crop.left, crop.top
+            ));
+        }
+        run_bayer_rggb_fused_inner(
+            frame.full_samples(),
+            frame.full_width(),
+            crop.left,
+            crop.top,
+            crop.width,
+            crop.height,
+            0,
+            0,
+            black,
+            black, // Nikon crop: MakerNote black is passed unchanged to recovery
+            wb,
+            noise,
+            iso,
+        )
+    }
+
+    /// Demosaics an X-Trans active plane and runs the linear finish in the same
+    /// session. Equivalent to [`demosaic_xtrans_cuda`] followed by
+    /// `linear_finish_cuda(rgb, w, h, None, iso, noise)`; there is no Bayer
+    /// highlight-recovery stage on this sensor, so `recovery` is `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn demosaic_and_finish_xtrans_cuda(
+        raw: &[u16],
+        raw_width: usize,
+        left: usize,
+        top: usize,
+        width: usize,
+        height: usize,
+        bits: u8,
+        black: f32,
+        wb: [f32; 3],
+        noise: [f32; 2],
+        iso: u32,
+    ) -> Result<Vec<[f32; 3]>, String> {
+        if !super::fused_cuda_enabled() {
+            return Err("disabled via AURORA_RAW_FUSED_CUDA=0".to_string());
+        }
+        if !demosaic_cuda_enabled() {
+            return Err("disabled via AURORA_DEMOSAIC_CUDA=0".to_string());
+        }
+        if !crate::aurora_raw::linear_post_cuda::linear_post_cuda_enabled() {
+            return Err("disabled via AURORA_LINEAR_POST_CUDA=0".to_string());
+        }
+        let (params, raw_window) =
+            xtrans_stage_params(raw, raw_width, left, top, width, height, bits, black, wb)?;
+
+        let pixels = width * height;
+        let raw_bytes = raw_window.len() * std::mem::size_of::<u16>();
+        let plane_bytes = pixels * std::mem::size_of::<f32>();
+        let out_bytes = pixels * 12; // [f32; 3]
+        let f4_bytes = pixels * 16; // float4 scratch for the linear tail
+
+        let gpu = Nvidia::open_ptx(linear_post_ptx_image())
+            .map_err(|e| format!("CUDA open_ptx: {e:?}"))?;
+        let sizes = [
+            raw_bytes, plane_bytes, plane_bytes, plane_bytes, out_bytes, f4_bytes, f4_bytes,
+        ];
+        let mut out = vec![[0.0f32; 3]; pixels];
+
+        gpu.with_reusable_buffers("raw-demosaic-finish-xtrans", &sizes, |session| {
+            session.upload(0, unsafe { bytes_of(raw_window) })?;
+            #[cfg(test)]
+            super::FUSED_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let buf_raw = session.handle(0);
+            let buf_plane = session.handle(1);
+            let buf_green = session.handle(2);
+            let buf_green_fixed = session.handle(3);
+            let buf_rgb3 = session.handle(4);
+            let buf_a = session.handle(5);
+            let buf_b = session.handle(6);
+
+            launch_xtrans_chain(
+                session,
+                PTX,
+                &params,
+                buf_raw,
+                buf_plane,
+                buf_green,
+                buf_green_fixed,
+                buf_rgb3,
+                width,
+                height,
+            )?;
+            launch_linear_finish_tail(
+                session, buf_rgb3, buf_a, buf_b, width, height, None, wb, iso, noise,
+            )?;
+
+            session.download(4, unsafe { bytes_of_mut(&mut out) })?;
+            #[cfg(test)]
+            super::FUSED_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            session.mark_consumed();
+            Ok(())
+        })
+        .map_err(|e| format!("CUDA demosaic_finish_xtrans: {e:?}"))?;
+
+        Ok(out)
+    }
 }
 
 #[cfg(windows)]
-pub(crate) use imp::{demosaic_bayer_cuda, demosaic_rggb_crop_cuda, demosaic_xtrans_cuda};
+pub(crate) use imp::{
+    demosaic_and_finish_bayer_cuda, demosaic_and_finish_rggb_crop_cuda,
+    demosaic_and_finish_xtrans_cuda, demosaic_bayer_cuda, demosaic_rggb_crop_cuda,
+    demosaic_xtrans_cuda, ptx_image as demosaic_ptx_image,
+};
 
 #[cfg(not(windows))]
 #[allow(clippy::too_many_arguments)]
@@ -641,6 +1099,55 @@ pub(crate) fn demosaic_xtrans_cuda(
     _bits: u8,
     _black: f32,
     _wb: [f32; 3],
+) -> Result<Vec<[f32; 3]>, String> {
+    Err("demosaic_cuda is only available on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn demosaic_and_finish_bayer_cuda(
+    _raw: &[u16],
+    _raw_width: usize,
+    _raw_height: usize,
+    _left_margin: usize,
+    _top_margin: usize,
+    _width: usize,
+    _height: usize,
+    _bits: u8,
+    _filters: u32,
+    _black: u32,
+    _wb: [f32; 3],
+    _noise: [f32; 2],
+    _iso: u32,
+) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
+    Err("demosaic_cuda is only available on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn demosaic_and_finish_rggb_crop_cuda(
+    _frame: &super::c1_raw_he::NikonHeCropFrame,
+    _wb: [f32; 3],
+    _black: u32,
+    _noise: [f32; 2],
+    _iso: u32,
+) -> Result<(usize, usize, Vec<[f32; 3]>), String> {
+    Err("demosaic_cuda is only available on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn demosaic_and_finish_xtrans_cuda(
+    _raw: &[u16],
+    _raw_width: usize,
+    _left: usize,
+    _top: usize,
+    _width: usize,
+    _height: usize,
+    _bits: u8,
+    _black: f32,
+    _wb: [f32; 3],
+    _noise: [f32; 2],
+    _iso: u32,
 ) -> Result<Vec<[f32; 3]>, String> {
     Err("demosaic_cuda is only available on Windows".to_string())
 }
@@ -813,5 +1320,252 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Fused demosaic -> linear finish (task 3.2)
+    // ---------------------------------------------------------------
+
+    // Nikon MakerNote and generic Bayer use different recovery black domains.
+    // Comparing only generic CFA phases did not expose this on a real Nikon Z8.
+    #[cfg(windows)]
+    #[test]
+    fn fused_nikon_crop_uses_segmented_recovery_black() {
+        use crate::aurora_raw::c1_raw_he::{NikonCrop, NikonHeCropFrame};
+        use crate::aurora_raw::linear_post_cuda::linear_finish_cuda;
+        let (w, h) = (48, 40);
+        let samples = (0..w*h).map(|i| ((i * 157 + i / w * 197) % 16_384) as u16).collect();
+        let frame = NikonHeCropFrame::new(NikonCrop { left: 0, top: 0, width: w, height: h }, w, h, samples).unwrap();
+        let (wb, black, noise) = ([1.87, 1., 1.51], 1024, [10.5, 22.]);
+        let Ok((width, height, mut reference)) = demosaic_rggb_crop_cuda(&frame, wb, black, noise) else { eprintln!("skip Nikon GPU check: device unavailable"); return };
+        linear_finish_cuda(&mut reference, width, height, Some((black, wb)), 800, noise).unwrap();
+        let (_, _, fused) = demosaic_and_finish_rggb_crop_cuda(&frame, wb, black, noise, 800).unwrap();
+        assert_eq!(max_abs_diff(&reference, &fused), 0.0, "Nikon recovery black diverged");
+        eprintln!("Nikon crop GPU: every RGB float matches the segmented reference");
+    }
+
+    /// Small-image parity for the fused chain: the frame produced by
+    /// `demosaic_and_finish_bayer_cuda` must equal the one the historical
+    /// two-segment path produces for the same input, at every ISO branch the
+    /// linear tail has (stage 1 only, ISO>=400 wide stage, ISO>=1600 repeat,
+    /// ISO>=3200 anti-alias gain).
+    #[cfg(windows)]
+    #[test]
+    fn fused_bayer_cuda_matches_two_segment() {
+        use crate::aurora_raw::linear_post_cuda::linear_finish_cuda;
+
+        let patterns = [
+            ("RGGB", 0x9494_9494u32),
+            ("GRBG", 0x6161_6161u32),
+            ("GBRG", 0x4949_4949u32),
+            ("BGGR", 0x1616_1616u32),
+        ];
+        let wb = [1.87f32, 1.0, 1.51];
+        let black = 1024u32;
+        let noise = [10.5f32, 22.0];
+        let (raw_w, raw_h) = (64usize, 56usize);
+        let (left_margin, top_margin, w, h) = (5usize, 7usize, 48usize, 40usize);
+
+        for (name, filters) in patterns {
+            let mut raw = vec![0u16; raw_w * raw_h];
+            for y in 0..raw_h {
+                for x in 0..raw_w {
+                    let c = bayer_color_at(filters, x, y);
+                    let diag = if (x as i32 - y as i32) > 4 { 7300i32 } else { 2100i32 };
+                    let ripple = (((x * 5 + y * 3) % 17) as i32) * 120;
+                    let high = if x < 12 && y < 12 { 5400 } else { 0 };
+                    let ch = match c {
+                        0 => 820,
+                        2 => 500,
+                        _ => 1180,
+                    };
+                    raw[y * raw_w + x] = (diag + ripple + high + ch).clamp(300, 16383) as u16;
+                }
+            }
+
+            for iso in [100u32, 800, 1600, 3200] {
+                let (tw, th, mut two) = match demosaic_bayer_cuda(
+                    &raw, raw_w, raw_h, left_margin, top_margin, w, h, 14, filters, black, wb,
+                    noise,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("skipping fused Bayer parity check (no CUDA device): {err}");
+                        return;
+                    }
+                };
+                linear_finish_cuda(&mut two, tw, th, Some((black << 2, wb)), iso, noise)
+                    .expect("two-segment linear_finish_cuda");
+
+                let (fw, fh, fused) = demosaic_and_finish_bayer_cuda(
+                    &raw, raw_w, raw_h, left_margin, top_margin, w, h, 14, filters, black, wb,
+                    noise, iso,
+                )
+                .expect("fused Bayer chain");
+                assert_eq!((fw, fh), (tw, th), "{name} ISO {iso}: dimension mismatch");
+                let diff = max_abs_diff(&two, &fused);
+                println!(
+                    "fused vs two-segment Bayer {name} ISO {iso} ({fw}x{fh}): max_abs_diff={diff:.6e}"
+                );
+                assert!(
+                    diff < 1e-4,
+                    "{name} ISO {iso}: fused vs two-segment max_abs_diff={diff}"
+                );
+            }
+        }
+    }
+
+    /// The same parity check on the X-Trans path (no highlight recovery there,
+    /// so `recovery = None`), at the low and the ISO>=1600 double-pass settings.
+    #[cfg(windows)]
+    #[test]
+    fn fused_xtrans_cuda_matches_two_segment() {
+        use crate::aurora_raw::linear_post_cuda::linear_finish_cuda;
+
+        const XTRANS_STD: [[u8; 6]; 6] = [
+            [1, 2, 1, 1, 0, 1],
+            [0, 1, 0, 2, 1, 2],
+            [1, 2, 1, 1, 0, 1],
+            [1, 0, 1, 1, 2, 1],
+            [2, 1, 2, 0, 1, 0],
+            [1, 0, 1, 1, 2, 1],
+        ];
+        let (raw_w, raw_h) = (48usize, 42usize);
+        let (left, top, w, h) = (5usize, 3usize, 40usize, 34usize);
+        let black = 1024.0f32;
+        let wb = [1.85f32, 1.0, 1.62];
+        let noise = [14.0f32, 120.0];
+
+        let mut raw = vec![0u16; raw_w * raw_h];
+        for y in 0..h {
+            for x in 0..w {
+                let c = XTRANS_STD[y % 6][x % 6];
+                let edge = if x * 3 + y * 2 > 90 { 6100i32 } else { 1900i32 };
+                let stripe = if ((x + y) % 5) == 0 { 900i32 } else { -320i32 };
+                let grad = (x as i32 * 41 + y as i32 * 29) % 2300;
+                let ch_bias = match c {
+                    0 => 780,
+                    1 => 1350,
+                    _ => 430,
+                };
+                raw[(top + y) * raw_w + left + x] =
+                    (edge + stripe + grad + ch_bias).clamp(200, 16383) as u16;
+            }
+        }
+
+        for iso in [100u32, 1600] {
+            let mut two = match demosaic_xtrans_cuda(&raw, raw_w, left, top, w, h, 14, black, wb)
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("skipping fused X-Trans parity check (no CUDA device): {err}");
+                    return;
+                }
+            };
+            linear_finish_cuda(&mut two, w, h, None, iso, noise).expect("two-segment finish");
+
+            let fused = demosaic_and_finish_xtrans_cuda(
+                &raw, raw_w, left, top, w, h, 14, black, wb, noise, iso,
+            )
+            .expect("fused X-Trans chain");
+            assert_eq!(fused.len(), two.len());
+            let diff = max_abs_diff(&two, &fused);
+            println!("fused vs two-segment X-Trans ISO {iso}: max_abs_diff={diff:.6e}");
+            assert!(diff < 1e-4, "X-Trans ISO {iso}: max_abs_diff={diff}");
+        }
+    }
+
+    /// The fused frame must leave the device exactly twice: the raw window up
+    /// and the finished frame down. The two-segment path it replaces does four
+    /// copies of the same frame (down for the demosaic result, up again for the
+    /// linear stage), which is the whole point of the fusion.
+    #[cfg(windows)]
+    #[test]
+    fn fused_chain_performs_exactly_two_host_copies() {
+        use std::sync::atomic::Ordering;
+
+        let (raw_w, raw_h) = (64usize, 56usize);
+        let raw = vec![1800u16; raw_w * raw_h];
+        let before = FUSED_HOST_COPIES.load(Ordering::Relaxed);
+        let result = demosaic_and_finish_bayer_cuda(
+            &raw, raw_w, raw_h, 4, 4, 48, 40, 14, 0x9494_9494, 1024, [1.9, 1.0, 1.5],
+            [10.0, 20.0], 800,
+        );
+        if let Err(err) = &result {
+            eprintln!("skipping host-copy accounting (no CUDA device): {err}");
+            return;
+        }
+        let copies = FUSED_HOST_COPIES.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            copies, 2,
+            "one fused call must upload once and download once, counted {copies}"
+        );
+    }
+
+    /// Boundaries: the fused entries refuse exactly the frames the standalone
+    /// entries refuse, so a caller can fall back on the same error shape.
+    #[cfg(windows)]
+    #[test]
+    fn fused_entries_share_the_standalone_dimension_guards() {
+        let raw = vec![1500u16; 64 * 64];
+        let wb = [1.9f32, 1.0, 1.5];
+        let noise = [10.0f32, 20.0];
+
+        for filters in [0x9494_9494u32, 0x6161_6161u32, 0x4949_4949u32, 0x1616_1616u32] {
+            // 15x15 aligns to a 14x14 active area, below the 16x16 kernel floor.
+            let two = demosaic_bayer_cuda(&raw, 64, 64, 0, 0, 15, 15, 14, filters, 1024, wb, noise);
+            let fused = demosaic_and_finish_bayer_cuda(
+                &raw, 64, 64, 0, 0, 15, 15, 14, filters, 1024, wb, noise, 800,
+            );
+            assert!(two.is_err(), "{filters:#x}: standalone must refuse 15x15");
+            assert!(fused.is_err(), "{filters:#x}: fused must refuse 15x15");
+        }
+
+        // X-Trans floor is 8x8.
+        assert!(demosaic_xtrans_cuda(&raw, 64, 0, 0, 7, 7, 14, 1024.0, wb).is_err());
+        assert!(
+            demosaic_and_finish_xtrans_cuda(&raw, 64, 0, 0, 7, 7, 14, 1024.0, wb, noise, 800)
+                .is_err()
+        );
+
+        // A CFA mask that is not 2x2 Bayer and not X-Trans is refused up front.
+        assert!(demosaic_and_finish_bayer_cuda(
+            &raw, 64, 64, 0, 0, 32, 32, 14, 0, 1024, wb, noise, 800
+        )
+        .is_err());
+    }
+
+    /// The recovery stage runs on the fused frame under exactly the conditions
+    /// `linear_finish_cuda` applies to its `recovery` argument.
+    #[cfg(windows)]
+    #[test]
+    fn fused_recovery_black_matches_linear_finish_guard() {
+        let wb = [1.9f32, 1.0, 1.5];
+        assert_eq!(super::imp::recovery_black(4096, 32, 32, wb), Some(4096));
+        // Too small for the 5x5 anti-alias pass.
+        assert_eq!(super::imp::recovery_black(4096, 3, 32, wb), None);
+        assert_eq!(super::imp::recovery_black(4096, 32, 3, wb), None);
+        // No headroom left above the black point.
+        assert_eq!(super::imp::recovery_black(65_535, 32, 32, wb), None);
+        // White balance the highlight kernel cannot scale by.
+        assert_eq!(super::imp::recovery_black(4096, 32, 32, [0.0, 1.0, 1.5]), None);
+        assert_eq!(super::imp::recovery_black(4096, 32, 32, [1.9, f32::NAN, 1.5]), None);
+    }
+
+    /// On a host without the Windows CUDA chain the fused entries report the
+    /// same unavailability the standalone ones do.
+    #[cfg(not(windows))]
+    #[test]
+    fn fused_entries_report_platform_unavailability() {
+        assert!(fused_cuda_enabled());
+        let raw = [1000u16; 64];
+        assert!(demosaic_and_finish_bayer_cuda(
+            &raw, 8, 8, 0, 0, 8, 8, 14, 0x9494_9494, 0, [1.0; 3], [0.0; 2], 100
+        )
+        .is_err());
+        assert!(demosaic_and_finish_xtrans_cuda(
+            &raw, 8, 0, 0, 8, 8, 14, 0.0, [1.0; 3], [0.0; 2], 100
+        )
+        .is_err());
     }
 }

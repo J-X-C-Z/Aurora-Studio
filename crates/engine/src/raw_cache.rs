@@ -58,6 +58,12 @@ const IDENTITY_FULL_BELOW: u64 = 2 << 20;
 /// 24 MP RGBA16 frame; `AURORA_RAW_PENDING_BYTES` overrides it.
 const MAX_PENDING_NATIVE_BYTES: usize = 256 << 20;
 
+/// Long side the preview source decode requests.
+///
+/// Shared by the folder engine and neighbour prefetch: a different long side
+/// would populate a different cache key and force the foreground to decode again.
+pub const PREVIEW_LONG_SIDE: u32 = 4096;
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A decoded frame: width, height, RGBA16 pixels, provenance.
@@ -143,6 +149,19 @@ pub fn get_or_decode16_traced(
 /// for `path`, used to skip the temporary embedded-JPEG progressive preview
 /// whenever a warm 16-bit source is available.
 pub(crate) fn has_cached_source16(path: &Path, long_side: u32) -> bool {
+    is_source16_warm(path, long_side)
+}
+
+/// Whether a 16-bit decode of `path` at `long_side` can be served without
+/// decoding: a stored entry under the proxy key or the full-sensor key, or — for
+/// a full-sensor request — a retained pending frame.
+///
+/// Side-effect free: it does not decode, does not insert, and does not consume
+/// the pending frame. `raw::decode_route` and the source identity read file
+/// metadata and a few small windows, so callers on a latency-critical path
+/// (the preview request) must run it off the UI thread; the neighbour prefetch
+/// in [`crate::aurora_raw::prefetch`] is the intended user.
+pub fn is_source16_warm(path: &Path, long_side: u32) -> bool {
     let route = crate::raw::decode_route(path);
     let Some(identity) = tracked_identity(path) else {
         return false;
@@ -159,7 +178,11 @@ pub(crate) fn has_cached_source16(path: &Path, long_side: u32) -> bool {
             }
         }
     }
-    false
+    long_side == 0
+        && PENDING_NATIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .covers(path, route, identity)
 }
 
 pub(crate) fn get_or_decode_source16(
@@ -963,6 +986,19 @@ impl PendingNative {
         self.stats.peak_bytes = self.stats.peak_bytes.max(self.bytes);
         self.stats.bytes = self.bytes;
         self.stats.entries = self.entries.len();
+    }
+
+    /// Whether a retained full-sensor frame for `path` is present, without
+    /// consuming it. Only full-sensor (`long_side == 0`) requests can be served
+    /// from this table, which is why [`is_source16_warm`] asks for `0` only.
+    fn covers(&self, path: &Path, route: DecodeRoute, identity: SourceIdentity) -> bool {
+        let key = cache_name16_for_identity(path, 0, route, identity);
+        self.entries.iter().any(|entry| {
+            entry.key == key
+                && entry.path == path
+                && entry.identity == identity
+                && entry.provenance.consistent_with(&route)
+        })
     }
 
     fn take(
@@ -2007,6 +2043,7 @@ mod tests {
             z6iii_feature: true,
             libraw_available: true,
             opencl: crate::raw::OpenClRouteState::Available,
+            device_policy: crate::raw::RawDevicePolicy::default(),
             demosaic: crate::raw::DEMOSAIC_DEFAULT,
         };
         route.pipeline_fingerprint =
@@ -2094,6 +2131,20 @@ mod tests {
             cache_key16_for_route(&path, &dir, 0, z6iii).unwrap(),
             "the same route must be stable"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cpu_and_cuda_routes_never_reuse_each_others_sensor_pixels() {
+        use aurora_portrait::native_infer::backend::{BackendKind,BackendRequest};
+        let dir=scratch("device-policy");let input=source(&dir,b"synthetic sensor payload");let id=test_identity(7);
+        let mut gpu=test_route(true,false);gpu.device_policy.selector=Some(BackendRequest::Only(BackendKind::Cuda));
+        let mut cpu=gpu;cpu.device_policy.selector=Some(BackendRequest::Only(BackendKind::Cpu));
+        let key=|r|cache_key16_for_route(&input,&dir,0,r).unwrap();assert_ne!(key(gpu),key(cpu));
+        let file=key(gpu);store_libraw(&file,1,1,&[1,2,3,65535],id,&gpu);
+        assert!(read_cached16_binary(&file,&gpu,&id).is_some());
+        assert!(read_cached16_binary(&file,&cpu,&id).is_none(),"even a copied entry must not leak between devices");
+        let mut mixed=gpu;mixed.device_policy.cuda_linear=!mixed.device_policy.cuda_linear;assert_ne!(key(gpu),key(mixed));
         fs::remove_dir_all(dir).unwrap();
     }
 

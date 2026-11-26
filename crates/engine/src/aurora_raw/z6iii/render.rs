@@ -305,10 +305,16 @@ fn highlight_parameters(black: u32, mut gains: [f32; 3]) -> [f32; 16] {
     settings
 }
 
-/// Runs Capture One's OpenCL highlight recovery (`recover_highlights`) and
-/// `AntiColorAliasingV10` (`anti_alias_opencl`) on any generic Bayer linear
-/// RGB frame in 512x512 tiles with a 2-pixel clamped halo. Falls back silently
-/// when OpenCL is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::aurora_raw) enum GenericPostRoute { Cpu, OpenCl, InvalidInput }
+
+/// Applies highlight recovery and chroma anti-aliasing to a generic Bayer frame.
+///
+/// The OpenCL path runs in 512x512 tiles with a 2-pixel clamped halo. When no
+/// OpenCL device is permitted (`AURORA_GPU_BACKEND=cpu`, a missing NVIDIA
+/// driver, or a failed kernel) the same two stages run through the CPU ports
+/// below instead of being skipped: a CPU-only decode must be the whole chain,
+/// not a frame with highlight recovery and anti-aliasing silently missing.
 #[cfg(windows)]
 pub(in crate::aurora_raw) fn recover_and_antialias_frame(
     rgb: &mut [[f32; 3]],
@@ -317,15 +323,34 @@ pub(in crate::aurora_raw) fn recover_and_antialias_frame(
     black: u32,
     wb: [f32; 3],
     iso: u32,
-) {
-    if width < 4 || height < 4 || rgb.len() != width * height || !raw::gpu_available() {
-        return;
+) -> GenericPostRoute {
+    if width < 4 || height < 4 || width.checked_mul(height)!=Some(rgb.len()) {
+        return GenericPostRoute::InvalidInput;
     }
     if black >= 65_535 || !wb.into_iter().all(|g| g.is_finite() && g > 0.0) {
-        return;
+        return GenericPostRoute::InvalidInput;
     }
     let recovery = highlight_parameters(black, wb);
     let aca_gain = if iso >= 3200 { 1.0 } else if iso >= 1600 { 0.75 } else { 0.5 };
+    if raw::gpu_available() && recover_and_antialias_opencl(rgb, width, height, recovery, aca_gain) {
+        return GenericPostRoute::OpenCl;
+    }
+    recover_highlights_cpu(rgb, recovery);
+    anti_alias_cpu(rgb, width, height, [0.05_f32.sqrt(), aca_gain]);
+    GenericPostRoute::Cpu
+}
+
+/// The historical OpenCL implementation, unchanged. Returns `false` when the
+/// device disappears between the probe and the first kernel, so the caller can
+/// complete the frame on the CPU instead of leaving part of it unprocessed.
+#[cfg(windows)]
+fn recover_and_antialias_opencl(
+    rgb: &mut [[f32; 3]],
+    width: usize,
+    height: usize,
+    recovery: [f32; 16],
+    aca_gain: f32,
+) -> bool {
     let max_x = (width - 1) as isize;
     let max_y = (height - 1) as isize;
     let mut out = vec![[0.0f32; 3]; width * height];
@@ -347,15 +372,15 @@ pub(in crate::aurora_raw) fn recover_and_antialias_frame(
                 }
             }
             if let Err(err) = raw::recover_highlights(&mut halo, recovery) {
-                log::warn!("generic Bayer OpenCL highlight recovery skipped: {err:#}");
-                return;
+                log::warn!("generic Bayer OpenCL highlight recovery failed; recomputing both stages on CPU: {err:#}");
+                return false;
             }
             let core = match raw::anti_alias_opencl(&halo, hw, hh, [0.05_f32.sqrt(), aca_gain]) {
                 Ok(core) if core.len() == tw * th => core,
-                Ok(_) => return,
+                Ok(_) => return false,
                 Err(err) => {
-                    log::warn!("generic Bayer OpenCL anti-alias skipped: {err:#}");
-                    return;
+                    log::warn!("generic Bayer OpenCL anti-alias failed; recomputing both stages on CPU: {err:#}");
+                    return false;
                 }
             };
             for row in 0..th {
@@ -366,6 +391,178 @@ pub(in crate::aurora_raw) fn recover_and_antialias_frame(
         }
     }
     rgb.copy_from_slice(&out);
+    true
+}
+
+/// CPU port of `highlight.cl` (`recover_highlights`).
+///
+/// Same per-pixel math as `native/cuda/raw_linear_post.cu`'s
+/// `highlight_recovery_kernel`, which is the 1:1 CUDA twin of the OpenCL
+/// kernel, so a CPU-only decode and the CUDA path agree on this stage.
+#[cfg(windows)]
+fn recover_highlights_cpu(pixels: &mut [[f32; 3]], settings: [f32; 16]) {
+    use rayon::prelude::*;
+
+    let threshold = [settings[0], settings[1], settings[2]];
+    if !pixels
+        .par_iter()
+        .any(|pixel| (0..3).any(|channel| pixel[channel] > threshold[channel]))
+    {
+        return;
+    }
+    let strength = settings[3];
+    let span = [settings[4], settings[5], settings[6]];
+    let inverse_gain = [settings[7], settings[8], settings[9]];
+    let floor_scale = settings[10];
+
+    pixels.par_iter_mut().for_each(|pixel| {
+        let [red, green, blue] = *pixel;
+        let mut recovered = [
+            recover_channel_cpu(red, green, blue, threshold[0], strength),
+            recover_channel_cpu(green, red, blue, threshold[1], strength),
+            recover_channel_cpu(blue, green, red, threshold[2], strength),
+        ];
+        if recovered[0] > threshold[0]
+            || recovered[1] > threshold[1]
+            || recovered[2] > threshold[2]
+        {
+            let red_excess = normalized_excess_cpu(recovered[0], threshold[0], span[0]);
+            let green_excess = normalized_excess_cpu(recovered[1], threshold[1], span[1]);
+            let blue_excess = normalized_excess_cpu(recovered[2], threshold[2], span[2]);
+            let neutral = [
+                recovered[0] * inverse_gain[0],
+                recovered[1] * inverse_gain[1],
+                recovered[2] * inverse_gain[2],
+            ];
+            let floor_level = neutral[0].min(neutral[1]).min(neutral[2]) * floor_scale;
+            let fade = ((red_excess + green_excess) + blue_excess) * floor_level;
+            let weight = (fade * fade).min(1.0);
+            let luma = (recovered[0] * 0.299 + recovered[1] * 0.587) + recovered[2] * 0.114;
+            let one_minus_weight = 1.0 - weight;
+            recovered = [
+                recovered[0] * one_minus_weight + luma * weight,
+                recovered[1] * one_minus_weight + luma * weight,
+                recovered[2] * one_minus_weight + luma * weight,
+            ];
+        }
+        *pixel = recovered;
+    });
+}
+
+#[cfg(windows)]
+#[inline]
+fn recover_channel_cpu(value: f32, n0: f32, n1: f32, threshold: f32, strength: f32) -> f32 {
+    if !(value > threshold) {
+        return value;
+    }
+    let excess = (value - threshold) * (strength / threshold);
+    let balance = n0.min(n1) / value;
+    let weight = (excess * balance).min(1.0);
+    let mean = (n0 + n1) * 0.5;
+    mean * weight + value * (1.0 - weight)
+}
+
+#[cfg(windows)]
+#[inline]
+fn normalized_excess_cpu(value: f32, threshold: f32, span: f32) -> f32 {
+    if value > threshold {
+        (value - threshold) * (1.0 / span)
+    } else {
+        0.0
+    }
+}
+
+/// CPU port of `reconstruct.cl` program 4 (`anti_alias`): 5x5 median chroma
+/// of the recovered frame, blended back into R and B; green is untouched.
+///
+/// Row bands snapshot their two leading recovered rows before the band is
+/// overwritten, so the pass needs `band + 4` rows of scratch instead of a
+/// second full-resolution frame. Border reads replicate the edge exactly like
+/// the kernel's clamped indices.
+#[cfg(windows)]
+fn anti_alias_cpu(rgb: &mut [[f32; 3]], width: usize, height: usize, params: [f32; 2]) {
+    use rayon::prelude::*;
+
+    const BAND_ROWS: usize = 128;
+    let mut saved: Vec<[f32; 3]> = Vec::new();
+    let mut top = 0usize;
+    while top < height {
+        let bottom = (top + BAND_ROWS).min(height);
+        let carry_from = bottom.saturating_sub(2).max(top);
+        let carry: Vec<[f32; 3]> = rgb[carry_from * width..bottom * width].to_vec();
+
+        let window_top = top.saturating_sub(2);
+        let window_bottom = (bottom + 2).min(height);
+        let window_rows = window_bottom - window_top;
+        let mut window = Vec::with_capacity(window_rows * width);
+        for y in window_top..window_bottom {
+            if y < top {
+                let start = (y - window_top) * width;
+                window.extend_from_slice(&saved[start..start + width]);
+            } else {
+                window.extend_from_slice(&rgb[y * width..(y + 1) * width]);
+            }
+        }
+
+        rgb[top * width..bottom * width].par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let window_y = (top - window_top) + row;
+                for (column, out) in out_row.iter_mut().enumerate() {
+                    let pixel = window[window_y * width + column];
+                    let factor = params[0] / (pixel[1] + 1.0).max(1.0);
+                    let red_chroma =
+                        median_chroma_cpu(&window, width, window_rows, column, window_y, false);
+                    let blue_chroma =
+                        median_chroma_cpu(&window, width, window_rows, column, window_y, true);
+                    *out = [
+                        blend_chroma_cpu(pixel[0], pixel[1], red_chroma, factor, params[1]),
+                        pixel[1],
+                        blend_chroma_cpu(pixel[2], pixel[1], blue_chroma, factor, params[1]),
+                    ];
+                }
+            });
+        saved = carry;
+        top = bottom;
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+fn median_chroma_cpu(
+    input: &[[f32; 3]],
+    width: usize,
+    height: usize,
+    column: usize,
+    row: usize,
+    blue: bool,
+) -> f32 {
+    let max_x = width - 1;
+    let max_y = height - 1;
+    let mut values = [0.0f32; 25];
+    let mut count = 0usize;
+    for dy in -2isize..=2 {
+        let sy = (row as isize + dy).clamp(0, max_y as isize) as usize;
+        for dx in -2isize..=2 {
+            let sx = (column as isize + dx).clamp(0, max_x as isize) as usize;
+            let pixel = input[sy * width + sx];
+            values[count] = if blue { pixel[2] - pixel[1] } else { pixel[0] - pixel[1] };
+            count += 1;
+        }
+    }
+    // The kernels insertion-sort 25 values and take `values[12]`; the 13th
+    // smallest is that same value, reached in O(25) here.
+    let (_, median, _) = values.select_nth_unstable_by(12, f32::total_cmp);
+    *median
+}
+
+#[cfg(windows)]
+#[inline]
+fn blend_chroma_cpu(original: f32, green: f32, chroma: f32, factor: f32, gain: f32) -> f32 {
+    let z = chroma * factor;
+    let gate = (-z).mul_add(z, 1.0).max(0.0);
+    let weight = (gate * gate) * gain;
+    weight.mul_add(chroma + green, (1.0 - weight) * original)
 }
 
 fn apply_banding(rgb: &mut [u16], width: usize, iso: u32, tables: [&[u8]; 3]) {
@@ -848,5 +1045,96 @@ mod tests {
         assert!(after_c < before_c * 0.25, "linear ColorNoise2012 must strongly suppress 8px chroma blotches: before={before_c} after={after_c}");
         let mean_l: f32 = rgb.iter().map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).sum::<f32>() / rgb.len() as f32;
         assert!((mean_l - 8000.0).abs() < 150.0, "mean luma should stay stable: {mean_l}");
+    }
+
+    #[cfg(windows)]
+    fn synthetic_highlight_frame(w: usize, h: usize) -> Vec<[f32; 3]> {
+        let mut rgb = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let edge = if x >= w / 2 { 9000.0f32 } else { 3000.0 };
+                let highlight = if x < 20 && y < 20 { 62000.0f32 } else { 0.0 };
+                let blotch: f32 = if ((x / 8) + (y / 8)) % 2 == 0 { 1.0 } else { -1.0 };
+                let grain: f32 = if (x + y) % 2 == 0 { 240.0 } else { -240.0 };
+                let base = edge + highlight + grain;
+                rgb[y * w + x] = [
+                    (base + blotch * 1200.0).max(0.0),
+                    (base - blotch * 450.0).max(0.0),
+                    (base + blotch * 800.0).max(0.0),
+                ];
+            }
+        }
+        rgb
+    }
+
+    #[cfg(windows)]
+    fn max_channel_delta(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .flat_map(|(pa, pb)| {
+                [
+                    (pa[0] - pb[0]).abs(),
+                    (pa[1] - pb[1]).abs(),
+                    (pa[2] - pb[2]).abs(),
+                ]
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The CPU fallback must reproduce the CUDA kernel pair (`highlight.cl`
+    /// and `reconstruct.cl` program 4's 1:1 twins), not merely "do something":
+    /// a CPU-only decode is expected to match the GPU frame.
+    #[cfg(windows)]
+    #[test]
+    #[ignore="requires a real NVIDIA GPU for the second half of the comparison"]
+    fn cpu_recover_and_antialias_matches_cuda_kernels() {
+        let (w, h) = (97, 259);
+        let (black, wb, iso) = (1008u32, [1.85f32, 1.0, 1.55], 1600u32);
+        let source = synthetic_highlight_frame(w, h);
+
+        let mut cpu = source.clone();
+        let settings = highlight_parameters(black, wb);
+        recover_highlights_cpu(&mut cpu, settings);
+        let aca_gain = if iso >= 3200 { 1.0 } else if iso >= 1600 { 0.75 } else { 0.5 };
+        anti_alias_cpu(&mut cpu, w, h, [0.05_f32.sqrt(), aca_gain]);
+        assert_ne!(cpu, source, "the synthetic frame must exercise both stages");
+
+        let mut gpu = source.clone();
+        match crate::aurora_raw::linear_post_cuda::recover_and_antialias_cuda(
+            &mut gpu, w, h, black, wb, iso,
+        ) {
+            Ok(()) => {
+                let diff = max_channel_delta(&cpu, &gpu);
+                assert!(diff < 0.5, "CPU highlight/AA port vs CUDA max_abs_diff={diff}");
+            }
+            Err(err) => panic!("explicit CPU-vs-CUDA test requires executing both paths: {err}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_anti_alias_band_halos_match_the_full_frame() {
+        let (w,h)=(19usize,259usize);
+        let src=synthetic_highlight_frame(w,h);let mut banded=src.clone();let params=[0.05_f32.sqrt(),0.75];
+        anti_alias_cpu(&mut banded,w,h,params);
+        // The reference always reads an immutable source, never a finished band.
+        for (index,pixel) in src.iter().enumerate(){
+            let (x,y)=(index%w,index/w);let gain=params[0]/(pixel[1]+1.).max(1.);
+            let r=median_chroma_cpu(&src,w,h,x,y,false);let b=median_chroma_cpu(&src,w,h,x,y,true);
+            assert_eq!(banded[index],[blend_chroma_cpu(pixel[0],pixel[1],r,gain,params[1]),pixel[1],blend_chroma_cpu(pixel[2],pixel[1],b,gain,params[1])],"({x},{y})");
+        }
+    }
+
+    /// Constant chroma is a fixed point of the anti-alias blend; a port that
+    /// mixed up channels or edge clamping would move a flat frame.
+    #[cfg(windows)]
+    #[test]
+    fn cpu_anti_alias_leaves_flat_frames_unchanged() {
+        let (w, h) = (13, 11);
+        let flat = vec![[1234.0f32; 3]; w * h];
+        let mut rgb = flat.clone();
+        anti_alias_cpu(&mut rgb, w, h, [0.05_f32.sqrt(), 0.5]);
+        assert!(max_channel_delta(&rgb, &flat) < 1e-3);
     }
 }

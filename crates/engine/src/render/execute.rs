@@ -97,7 +97,7 @@ pub enum RenderTarget {
         /// Request BGRA display channel order when the GPU resident fast path
         /// handles the whole frame.
         want_bgra: bool,
-        /// Half-resolution upsampled fast preview (`render_at(..., fast = true)`).
+        /// Legacy interactive priority; it never changes the output pixel grid.
         fast: bool,
     },
     /// 16-bit export render (`render16`).
@@ -449,6 +449,7 @@ fn invoke_backend_render(
                     opts.bypass,
                     opts.mask_overlay,
                     true,
+                    crate::scopes::ScopeWants::default(),
                 )
             } else if want_bgra {
                 render_preview_bgra(
@@ -459,6 +460,7 @@ fn invoke_backend_render(
                     opts.bypass,
                     opts.mask_overlay,
                     true,
+                    crate::scopes::ScopeWants::default(),
                 )
             } else {
                 render(

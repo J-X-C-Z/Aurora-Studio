@@ -73,6 +73,10 @@ opencl_api! {
 
 pub(super) fn bindings() -> io::Result<&'static Api> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
-    API.get_or_init(|| Api::load().map_err(|error| error.to_string()))
+    use aurora_portrait::native_infer::backend::{BackendKind,BackendRequest};
+    if !BackendRequest::from_env().map_err(io::Error::other)?.permits(BackendKind::OpenCl) {
+        return Err(io::Error::other("AURORA_GPU_BACKEND excludes OpenCL"));
+    }
+    API.get_or_init(|| Api::load().map_err(|e|e.to_string()))
         .as_ref().map_err(|message| io::Error::other(message.clone()))
 }

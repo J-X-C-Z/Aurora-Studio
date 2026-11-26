@@ -553,13 +553,18 @@ impl FaceInputBackend {
     }
 
     fn open(self, runtime: &Runtime, path: &Path) -> Result<Session, Refusal> {
-        let providers = match self {
-            Self::Cpu => vec![Provider::Cpu],
-            Self::Cuda => vec![Provider::Cuda],
-            Self::DirectMl => vec![Provider::DirectMl],
-            Self::Auto => vec![Provider::Cuda, Provider::DirectMl, Provider::Cpu],
+        let opened = if runtime.is_native_only() {
+            runtime.open_session(path)
+        } else {
+            let providers = match self {
+                Self::Cpu => vec![Provider::Cpu],
+                Self::Cuda => vec![Provider::Cuda],
+                Self::DirectMl => vec![Provider::DirectMl],
+                Self::Auto => vec![Provider::Cuda, Provider::DirectMl, Provider::Cpu],
+            };
+            runtime.open_session_on(path, &providers)
         };
-        runtime.open_session_on(path, &providers).map_err(|error| {
+        opened.map_err(|error| {
             log::warn!(
                 "C1 face model {} on {} refused: {error:#}",
                 path.display(),
@@ -2576,17 +2581,23 @@ impl FaceInputProducer {
             detection.provider().label(),
             mesh.provider().label()
         );
-        let coarse = runtime
-            .open_cpu_session(&paths.coarse)
-            .map_err(|_| Refusal::MissingInput(MODEL_RUNTIME_ERROR))?;
+        let coarse = if runtime.is_native_only() {
+            runtime.open_session(&paths.coarse)
+        } else {
+            runtime.open_cpu_session(&paths.coarse)
+        }
+        .map_err(|_| Refusal::MissingInput(MODEL_RUNTIME_ERROR))?;
         validate_fixed_session(
             &coarse,
             [1, 3, COARSE_SIDE as i64, COARSE_SIDE as i64],
             &[("2297057593", &[1, 34, 1, 1])],
         )?;
-        let dense = runtime
-            .open_cpu_session(&paths.dense)
-            .map_err(|_| Refusal::MissingInput(MODEL_RUNTIME_ERROR))?;
+        let dense = if runtime.is_native_only() {
+            runtime.open_session(&paths.dense)
+        } else {
+            runtime.open_cpu_session(&paths.dense)
+        }
+        .map_err(|_| Refusal::MissingInput(MODEL_RUNTIME_ERROR))?;
         validate_fixed_session(
             &dense,
             [1, 3, DENSE_SIDE as i64, DENSE_SIDE as i64],

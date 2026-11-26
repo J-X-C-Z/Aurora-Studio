@@ -61,6 +61,9 @@ pub mod processing;
 pub mod render;
 /// Layered export pipeline (`ExportPlan`, `Encoder`, `MetadataWriter`, `AtomicPublisher`).
 pub mod export;
+/// CPU SIMD kernels (AVX2/NEON) for the export pixel plumbing, with the scalar
+/// reference each kernel is checked against.
+pub mod simd_fallback;
 /// Unified portrait effect descriptor and capability registry.
 pub mod portrait_registry;
 mod exif;
@@ -106,7 +109,7 @@ pub mod compute_cost;
 
 pub fn prewarm_gpu() {
     #[cfg(windows)]
-    mock::prewarm_gpu();
+    if aurora_portrait::native_infer::backend::BackendRequest::from_env().is_ok_and(|r|r.permits(aurora_portrait::native_infer::backend::BackendKind::Cuda)){mock::prewarm_gpu();}
 }
 
 pub mod mask_store;
@@ -334,7 +337,7 @@ pub use exif::read_exif;
 pub use closedeyes::{any_eye_closed, detect_eyes, EyeBox, EyeReport};
 pub use engine::*;
 pub use file_engine::{
-    FileEngine, ImportErrorKind, QueuedDocumentResult, QueuedSaveOutcome, QueuedSaveSummary,
+    supports_photo_path, FileEngine, ImportErrorKind, QueuedDocumentResult, QueuedSaveOutcome, QueuedSaveSummary,
     SourceStatusKind,
 };
 pub use fcrv_index::*;
@@ -364,7 +367,7 @@ pub use raw::*;
 pub use rawinfo::{parse_info_block, read_nikon_info_block, CameraDefaults, RawInfoBlock};
 pub use recipe::*;
 pub use scopes::*;
-pub use store::{Catalog, Entry, Store, StoreError};
+pub use store::{Catalog, Entry, Store, StoreError, write_atomic};
 pub use styles::*;
 pub use tether::*;
 pub use xmp::XmpMeta;

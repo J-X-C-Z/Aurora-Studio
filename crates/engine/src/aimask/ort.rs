@@ -18,6 +18,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::lru::{self, ByteLru};
+use aurora_portrait::native_infer::{backend::{BackendKind, BackendRequest, NativeInferBackend}, dispatch};
 
 type Status = *mut c_void;
 type ApiPtr = *const *const c_void;
@@ -156,6 +157,8 @@ pub(crate) enum Provider {
     /// says nothing about which device (ANE/GPU/CPU) a session finally uses.
     CoreMl,
     Cpu,
+    NativePending,
+    Native(BackendKind),
 }
 
 impl Provider {
@@ -165,6 +168,8 @@ impl Provider {
             Provider::Cuda => "CUDA",
             Provider::DirectMl => "DirectML",
             Provider::CoreMl => "CoreML",
+            Provider::NativePending => "native-pending",
+            Provider::Native(k) => k.label(),
             Provider::Cpu => "CPU",
         }
     }
@@ -194,7 +199,7 @@ fn provider_symbol(provider: Provider) -> Option<&'static str> {
         Provider::Cuda => Some("OrtSessionOptionsAppendExecutionProvider_CUDA"),
         Provider::DirectMl => Some("OrtSessionOptionsAppendExecutionProvider_DML"),
         Provider::CoreMl => Some("OrtSessionOptionsAppendExecutionProvider_CoreML"),
-        Provider::Cpu => None,
+        Provider::Cpu | Provider::NativePending | Provider::Native(_) => None,
     }
 }
 
@@ -215,7 +220,7 @@ fn append_symbol_candidates(provider: Provider) -> &'static [&'static str] {
             "OrtSessionOptionsAppendExecutionProvider_CoreML",
             "OrtSessionOptionsAppendExecutionProvider_CoreMl",
         ],
-        Provider::Cpu => &[],
+        Provider::Cpu | Provider::NativePending | Provider::Native(_) => &[],
     }
 }
 
@@ -479,6 +484,16 @@ fn fnv64_with(bytes: &[u8], seed: u64) -> u64 {
     hash
 }
 
+fn fold_model_fingerprint(crc: u32, len: u64, head: u32, tail: u32) -> u64 {
+    [u64::from(crc), len, u64::from(head), u64::from(tail)].into_iter()
+        .fold(FNV_OFFSET, |h, v| fnv64_with(&v.to_le_bytes(), h))
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> u64 {
+    let edge = bytes.len().min(64 << 10);
+    fold_model_fingerprint(crc32fast::hash(bytes),bytes.len() as u64,crc32fast::hash(&bytes[..edge]),crc32fast::hash(&bytes[bytes.len()-edge..]))
+}
+
 /// Content fingerprint of a model, plus its length. `crc32` over the whole file
 /// (fast) folded with the length, the head and the tail. Models are tens of
 /// megabytes, so a full cryptographic digest would cost more cold-start time
@@ -533,15 +548,7 @@ fn model_fingerprint(path: &Path) -> Result<(u64, u64)> {
         offset += read as u64;
     }
     tail.update(&ring);
-    let mut hash = FNV_OFFSET;
-    for value in [
-        u64::from(crc.finalize()),
-        len,
-        u64::from(head.finalize()),
-        u64::from(tail.finalize()),
-    ] {
-        hash = fnv64_with(&value.to_le_bytes(), hash);
-    }
+    let hash = fold_model_fingerprint(crc.finalize(), len, head.finalize(), tail.finalize());
     cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -955,14 +962,8 @@ impl Runtime {
             .get_or_init(|| match unsafe { Self::load() } {
                 Ok(runtime) => Some(runtime),
                 Err(err) => {
-                    #[cfg(windows)]
-                    if native_infer_enabled()
-                        && aurora_portrait::native_infer::ops_conv_gemm::ConvGemmKernels::open()
-                            .is_ok()
-                    {
-                        log::info!(
-                            "ONNX Runtime DLL unavailable ({err:#}); using zero-DLL Aurora Native CUDA runtime"
-                        );
+                    if native_infer_enabled() {
+                        log::info!("optional ONNX Runtime not loaded ({err:#}); native execution is selected per model");
                         return Some(Self::native_only());
                     }
                     log::warn!("ONNX Runtime unavailable: {err:#}");
@@ -972,7 +973,6 @@ impl Runtime {
             .as_ref()
     }
 
-    #[cfg(windows)]
     fn native_only() -> Self {
         Self {
             api: ptr::null(),
@@ -980,10 +980,12 @@ impl Runtime {
             allocator: ptr::null_mut(),
             memory_info: ptr::null_mut(),
             handle: ptr::null_mut(),
-            library: PathBuf::from("<aurora-native-cuda>"),
-            version: "aurora-native-cuda-1.0".to_string(),
+            library: PathBuf::from("<aurora-native>"),
+            version: "aurora-native-2".to_string(),
             api_version: ORT_API_VERSION,
+            #[cfg(windows)]
             _runtime_modules: Vec::new(),
+            #[cfg(windows)]
             cuda_runtime_error: None,
         }
     }
@@ -995,7 +997,8 @@ impl Runtime {
 
     unsafe fn load() -> Result<Self> {
         let library = resolve_library()?;
-        let dll_dirs = configure_gpu_dll_directories(&library);
+        let legacy_gpu = legacy_gpu_runtime_needed();
+        let dll_dirs = if legacy_gpu { configure_gpu_dll_directories(&library) } else { Vec::new() };
         if !dll_dirs.is_empty() {
             log::info!("GPU DLL dirs: {dll_dirs:?}");
         }
@@ -1054,7 +1057,7 @@ impl Runtime {
         let mut memory_info = ptr::null_mut();
         unsafe { check(allocator_info(allocator, &mut memory_info), api)? };
         #[cfg(windows)]
-        let (runtime_modules, cuda_runtime_error) = unsafe { preload_cuda_runtime(&library) };
+        let (runtime_modules, cuda_runtime_error) = if legacy_gpu { unsafe { preload_cuda_runtime(&library) } } else { (Vec::new(), None) };
         Ok(Self {
             api,
             env,
@@ -1209,9 +1212,9 @@ impl Runtime {
     fn compute_provider_plan(&self) -> ProviderPlan {
         if self.is_native_only() {
             return ProviderPlan {
-                exported: vec![Provider::Cuda, Provider::Cpu],
-                selected: vec![Provider::Cuda, Provider::Cpu],
-                trt_reason: "native-cuda-zero-ort",
+                exported: vec![], // No ORT provider is exported without ORT.
+                selected: aurora_portrait::native_infer::backend::Host::current().auto_order().iter().copied().map(Provider::Native).collect(),
+                trt_reason: "native backend determined on model execution",
             };
         }
         let has_trt = !self.provider_append_symbol(Provider::TensorRt).is_null();
@@ -1343,7 +1346,32 @@ impl Runtime {
 
     /// Opens a session on the first provider that works, falling back to CPU.
     pub(crate) fn open_session(&self, path: &Path) -> Result<Session> {
-        self.open_session_on(path, &self.available_providers())
+        self.open_session_for_backend(path, BackendRequest::from_env().map_err(anyhow::Error::msg)?)
+    }
+
+    fn open_session_for_backend(&self, path: &Path, request: BackendRequest) -> Result<Session> {
+        let mut key = self.session_key(path, &[])?;
+        if requires_cpu_reference(key.model_hash, key.model_len) {
+            if matches!(request, BackendRequest::Only(k) if k != BackendKind::Cpu) { bail!("this model revision exceeds the original native tolerance; the requested GPU cannot serve it"); }
+            return self.open_cpu_session(path);
+        }
+        if request == BackendRequest::Only(BackendKind::Cpu) && !self.is_native_only() {
+            return self.open_cpu_session(path);
+        }
+        if !native_infer_enabled() || (request == BackendRequest::Auto && !self.is_native_only()
+            && std::env::var_os("AURORA_GPU_BACKEND").is_none()
+            && (std::env::var_os(PROVIDERS_ENV).is_some() || std::env::var_os("AURORA_AI_PROVIDER").is_some())) {
+            if matches!(request, BackendRequest::Only(k) if k != BackendKind::Cpu) { bail!("AURORA_NATIVE_INFER disabled the requested native backend"); }
+            return self.open_session_on(path, &self.available_providers());
+        }
+        key.providers = format!("native:{}", request.label());
+        let result = self.session_slot(key.registry_id(), || open_native_only_session(path, &key, request));
+        match result {
+            Err(err) if request==BackendRequest::Auto && !self.is_native_only() => {
+                let session=self.open_cpu_session(path)?; session.set_fallback(Some(format!("native metadata: {err:#}"))); Ok(session)
+            }
+            other => other,
+        }
     }
 
     /// Opens a session using only the requested providers, in order. This is
@@ -1390,10 +1418,11 @@ impl Runtime {
         base_key: &SessionKey,
         providers: &[Provider],
     ) -> Result<Session> {
-        #[cfg(windows)]
-        if self.is_native_only() {
-            return open_native_only_session(path, &base_key.for_provider(Provider::Cuda));
-        }
+        if self.is_native_only() { bail!("optional ORT is not loaded; no requested ORT provider is available"); }
+        let providers = if requires_cpu_reference(base_key.model_hash, base_key.model_len) {
+            if !providers.contains(&Provider::Cpu) { bail!("this model revision requires the ORT CPU reference; GPU-only request was not executed"); }
+            &[Provider::Cpu][..]
+        } else { providers };
         let mut failures: Vec<String> = Vec::new();
         for &provider in providers {
             if provider != Provider::Cpu {
@@ -1477,10 +1506,7 @@ impl Runtime {
             .with_context(|| format!("identifying model {}", path.display()))?;
         let id = key.registry_id();
         self.session_slot(id, || {
-            #[cfg(windows)]
-            if self.is_native_only() {
-                return open_native_only_session(path, &key.for_provider(Provider::Cuda));
-            }
+            if self.is_native_only() { bail!("the ORT CPU reference is not loaded"); }
             self.open_session_with(path, Provider::Cpu, &key, false)
                 .with_context(|| format!("opening CPU model {}", path.display()))
         })
@@ -1607,6 +1633,9 @@ impl Runtime {
                 provider,
                 key: key.clone(),
                 model_path: path.to_path_buf(),
+                native_request: None,
+                native: Mutex::new(None),
+                effective: Mutex::new(None),
                 fallback: Mutex::new(None),
                 profile_active: AtomicBool::new(profile_prefix.is_some()),
                 timing: Mutex::new(SessionTiming {
@@ -1661,23 +1690,26 @@ impl Runtime {
         input: &mut [f32],
         shape: &[i64],
     ) -> Result<Vec<OutputPlane>> {
-        #[cfg(windows)]
-        match try_run_native_cuda(session, input, shape, self.is_native_only()) {
-            Ok(Some(planes)) => return Ok(planes),
-            Ok(None) => {}
-            Err(err) => {
-                if self.is_native_only() {
-                    return Err(err);
+        if let Some(request) = session.inner.native_request {
+            match run_native(session, request, input, shape) {
+                Ok(planes) => return Ok(planes),
+                Err(err) if request == BackendRequest::Auto && !self.is_native_only() => {
+                    let reference = self.open_cpu_session(&session.inner.model_path)?;
+                    let planes = self.run_typed_ort(&reference, input, shape)?;
+                    *session
+                        .inner
+                        .effective
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(Provider::Cpu);
+                    session.set_fallback(Some(format!("native: {err:#}; served by ORT CPU")));
+                    return Ok(planes);
                 }
-                log::warn!(
-                    "NativeCudaSession fallback to ORT for {}: {err:#}",
-                    session.inner.model_path.display()
-                );
+                Err(err) => return Err(err),
             }
         }
         if self.is_native_only() {
             bail!(
-                "zero-DLL Aurora Native CUDA runtime could not execute {} (onnxruntime.dll not loaded)",
+                "no actual backend for {} (optional runtime not loaded)",
                 session.inner.model_path.display()
             );
         }
@@ -1691,6 +1723,7 @@ impl Runtime {
         shape: &[i64],
     ) -> Result<Vec<OutputPlane>> {
         let api = self.api;
+        if api.is_null() || session.inner.ptr.is_null() { bail!("an ORT execution requires real library and session handles"); }
         let create_tensor: unsafe extern "C" fn(
             *const c_void,
             *mut c_void,
@@ -1992,22 +2025,6 @@ fn library_candidates_from(
                     .join("onnxruntime.dll"),
             );
         }
-    } else if cfg!(target_os = "macos") {
-        // Homebrew's `onnxruntime` and a bundle-local dylib. The versioned
-        // names match how the library is installed on Apple Silicon.
-        candidates.extend(
-            [
-                "libonnxruntime.1.23.0.dylib",
-                "libonnxruntime.1.23.dylib",
-                "libonnxruntime.1.dylib",
-                "libonnxruntime.dylib",
-            ]
-            .into_iter()
-            .map(PathBuf::from),
-        );
-        for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
-            candidates.push(PathBuf::from(prefix).join("libonnxruntime.dylib"));
-        }
     } else {
         #[cfg(target_os = "macos")]
         {
@@ -2295,45 +2312,7 @@ pub(crate) fn half_to_f32(bits: u16) -> f32 {
 
 /// f32 → IEEE-754 binary16 with round-to-nearest-even. Values beyond half's
 /// range become infinities and NaN payloads are kept as quiet NaN.
-pub(crate) fn float_to_half(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xFF) as i32;
-    let mantissa = bits & 0x7F_FFFF;
-    if exponent == 0xFF {
-        let payload = if mantissa != 0 {
-            0x200 | ((mantissa >> 13) as u16 & 0x3FF)
-        } else {
-            0
-        };
-        return sign | 0x7C00 | payload;
-    }
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 0x1F {
-        return sign | 0x7C00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        let mantissa = mantissa | 0x80_0000;
-        let shift = (14 - half_exponent) as u32;
-        let mut half = (mantissa >> shift) as u16;
-        let round_bit = 1u32 << (shift - 1);
-        if mantissa & round_bit != 0
-            && ((mantissa & (round_bit - 1)) != 0 || half & 1 != 0)
-        {
-            half += 1;
-        }
-        return sign | half;
-    }
-    let mut half = (((half_exponent as u32) << 10) as u16) | ((mantissa >> 13) as u16);
-    let round = mantissa & 0x1FFF;
-    if round > 0x1000 || (round == 0x1000 && half & 1 != 0) {
-        half += 1;
-    }
-    sign | half
-}
+pub(crate) use aurora_portrait::native_infer::onnx_proto::f32_to_f16 as float_to_half;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TensorMeta {
@@ -2386,13 +2365,25 @@ struct SessionInner {
     provider: Provider,
     key: SessionKey,
     model_path: PathBuf,
+    // The owning session is keyed on model contents and subject to the existing
+    // byte-budgeted registry eviction. Retain only the most recent shape;
+    // concurrent callers share an Arc and safely finish even on replacement.
+    native_request: Option<BackendRequest>,
+    native: Mutex<Option<(Vec<usize>, Arc<dyn NativeInferBackend>)>>,
+    effective: Mutex<Option<Provider>>,
     /// Human-readable reasons earlier provider choices failed, if any.
     fallback: Mutex<Option<String>>,
     profile_active: AtomicBool,
     timing: Mutex<SessionTiming>,
 }
 
-#[cfg(windows)]
+// Native CUDA uses the system driver and embedded PTX; it needs none of ORT's CUDA providers.
+fn legacy_gpu_runtime_needed() -> bool {
+    if std::env::var_os("AURORA_GPU_BACKEND").is_some() || forced_provider()==Some(Provider::Cpu) { return false; }
+    if let Ok(s)=std::env::var(PROVIDERS_ENV) { return s.split(',').filter_map(provider_from_name).any(|p| matches!(p,Provider::Cuda|Provider::TensorRt)); }
+    matches!(forced_provider(),Some(Provider::Cuda|Provider::TensorRt)) || !native_infer_enabled()
+}
+
 fn native_infer_enabled() -> bool {
     match std::env::var("AURORA_NATIVE_INFER") {
         Ok(v) => {
@@ -2405,42 +2396,22 @@ fn native_infer_enabled() -> bool {
     }
 }
 
-#[cfg(windows)]
-fn is_native_verified_model(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    // All 18 single-input shipped models verified against ORT CPU golden outputs
-    // (18/18 PASS, relative error <= 7e-7 on FP32/FP16 models and mean 7e-4 on UInt8 SAM).
-    matches!(
-        name,
-        "autoRotation.onnx"
-            | "blemishRemoval.onnx"
-            | "skinMasking.onnx"
-            | "subjectMasking.onnx"
-            | "similarity.onnx"
-            | "beautyMarks.onnx"
-            | "dust.onnx"
-            | "EyeDetector.onnx"
-            | "DenseNet121_FP32.onnx"
-            | "1063025060.onnx"
-            | "323773030.onnx"
-            | "faceMesh.onnx"
-            | "faceDetection.onnx"
-            | "MatchLookBrightness.onnx"
-            | "MatchLookBw.onnx"
-            | "MatchLookColor.onnx"
-            | "MatchLookExp.onnx"
-            | "eSamEncoderPreUInt8.onnx"
-    )
+/// This measured FP16 B/W model exceeds its original 5e-4 tolerance.
+/// Do not relax the oracle or return approximate pixels. Only this model
+/// fingerprint uses an installed reference CPU backend; nothing is bundled.
+fn requires_cpu_reference(hash: u64, len: u64) -> bool {
+    (hash, len) == (0xb6ba_adfe_3188_c8a4, 45_557_540)
 }
 
-#[cfg(windows)]
-fn open_native_only_session(path: &Path, key: &SessionKey) -> Result<Session> {
+fn open_native_only_session(path: &Path, key: &SessionKey, request: BackendRequest) -> Result<Session> {
     use aurora_portrait::native_infer::onnx_proto::{decode_model, DataType, DimSpec};
+    if requires_cpu_reference(key.model_hash, key.model_len) {
+        bail!("this Match Look B/W revision exceeds the native accuracy tolerance and needs the optional ORT CPU backend");
+    }
+
 
     let bytes = std::fs::read(path)
-        .with_context(|| format!("reading ONNX model {} for native CUDA", path.display()))?;
+        .with_context(|| format!("reading ONNX model {} for native execution", path.display()))?;
     let model = decode_model(&bytes)
         .map_err(|e| anyhow!("decoding ONNX model {}: {e}", path.display()))?;
     let init_names: std::collections::HashSet<&str> = model
@@ -2449,7 +2420,7 @@ fn open_native_only_session(path: &Path, key: &SessionKey) -> Result<Session> {
         .iter()
         .map(|t| t.name.as_str())
         .collect();
-    let to_meta = |vi: &aurora_portrait::native_infer::onnx_proto::ValueInfoProto| TensorMeta {
+    let to_meta = |vi: &aurora_portrait::native_infer::onnx_proto::ValueInfoProto| -> Result<TensorMeta> { Ok(TensorMeta {
         name: vi.name.clone(),
         dims: vi
             .dims
@@ -2461,24 +2432,25 @@ fn open_native_only_session(path: &Path, key: &SessionKey) -> Result<Session> {
             .collect(),
         element_type: match vi.data_type {
             DataType::Float16 => FLOAT16,
-            _ => FLOAT,
+            DataType::Float => FLOAT,
+            dtype => bail!("native FP adapter does not support {dtype:?} I/O"),
         },
-    };
-    let input = model
-        .graph
-        .inputs
-        .iter()
-        .find(|vi| !init_names.contains(vi.name.as_str()))
-        .map(to_meta)
-        .ok_or_else(|| anyhow!("ONNX model {} has no graph input", path.display()))?;
-    let outputs: Vec<TensorMeta> = model.graph.outputs.iter().map(to_meta).collect();
+    }) };
+    let mut external = model.graph.inputs.iter().filter(|vi| !init_names.contains(vi.name.as_str()));
+    let input=to_meta(external.next().ok_or_else(||anyhow!("missing graph input"))?)?;
+    if external.next().is_some() { bail!("the image adapter expects a single model input; use named inference for multi-input models"); }
+    if model.graph.outputs.is_empty() { bail!("model has no outputs"); }
+    let outputs=model.graph.outputs.iter().map(to_meta).collect::<Result<Vec<_>>>()?;
     Ok(Session {
         inner: Arc::new(SessionInner {
             api: ptr::null(),
             ptr: ptr::null_mut(),
-            provider: Provider::Cuda,
+            provider: Provider::NativePending,
             key: key.clone(),
             model_path: path.to_path_buf(),
+            native_request: Some(request),
+            native: Mutex::new(None),
+            effective: Mutex::new(None),
             fallback: Mutex::new(None),
             profile_active: AtomicBool::new(false),
             timing: Mutex::new(SessionTiming::default()),
@@ -2488,96 +2460,123 @@ fn open_native_only_session(path: &Path, key: &SessionKey) -> Result<Session> {
     })
 }
 
-#[cfg(windows)]
-fn try_run_native_cuda(
+fn output_planes(
     session: &Session,
+    mut outputs: aurora_portrait::native_infer::backend::NamedOutputs,
+) -> Result<Vec<OutputPlane>> {
+    if outputs.len() != session.outputs.len() {
+        bail!("native output count mismatch");
+    }
+    session
+        .outputs
+        .iter()
+        .map(|spec| {
+            let (values, size) = outputs
+                .remove(&spec.name)
+                .ok_or_else(|| anyhow!("missing native output {}", spec.name))?;
+            let dims: Vec<i64> = size
+                .iter()
+                .map(|&d| i64::try_from(d))
+                .collect::<Result<_, _>>()?;
+            if size.iter().try_fold(1usize, |a, &b| a.checked_mul(b)) != Some(values.len())
+                || dims.len() != spec.dims.len()
+                || dims.iter().zip(&spec.dims).any(|(a, b)| *b >= 0 && a != b)
+            {
+                bail!("unexpected output shape for {}", spec.name);
+            }
+            Ok(OutputPlane {
+                values,
+                dims,
+                dtype: spec.element_type,
+            })
+        })
+        .collect()
+}
+
+fn run_native(
+    session: &Session,
+    request: BackendRequest,
     input: &[f32],
     shape: &[i64],
-    native_only: bool,
-) -> Result<Option<Vec<OutputPlane>>> {
-    use aurora_portrait::native_infer::session::NativeCudaSession;
-
-    if !native_infer_enabled() {
-        return Ok(None);
+) -> Result<Vec<OutputPlane>> {
+    if session.input.element_type != FLOAT {
+        bail!("native image adapter needs Float input");
     }
-    if !native_only
-        && (session.input.element_type != FLOAT
-            || !is_native_verified_model(&session.inner.model_path))
-    {
-        return Ok(None);
-    }
-    let shape_usize: Vec<usize> = shape
+    let dims: Vec<_> = shape
         .iter()
-        .map(|&d| usize::try_from(d).ok())
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| anyhow!("negative input shape {shape:?}"))?;
-
-    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, Vec<usize>), Arc<NativeCudaSession>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (session.inner.model_path.clone(), shape_usize.clone());
-
-    let native = {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(&key).cloned()
-    };
-    let native = match native {
-        Some(s) => s,
-        None => {
-            let bytes = std::fs::read(&session.inner.model_path).with_context(|| {
-                format!("reading ONNX model {}", session.inner.model_path.display())
-            })?;
-            let mut overrides = HashMap::new();
-            overrides.insert(session.input.name.clone(), shape_usize.clone());
-            match NativeCudaSession::from_bytes(&bytes, &overrides) {
-                Ok(built) => {
-                    let arc = Arc::new(built);
-                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.insert(key, arc.clone());
-                    log::info!(
-                        "NativeCudaSession opened for {} (zero-ORT, arena={:.2} MiB)",
-                        session.inner.model_path.display(),
-                        arc.arena_peak_bytes() as f64 / (1024.0 * 1024.0),
-                    );
-                    arc
-                }
-                Err(err) => {
-                    bail!(
-                        "NativeCudaSession::from_bytes failed for {}: {err}",
-                        session.inner.model_path.display()
-                    );
-                }
-            }
-        }
-    };
-
-    let mut inputs = HashMap::new();
-    inputs.insert(session.input.name.clone(), (input, shape_usize));
-    let started = std::time::Instant::now();
-    let outputs = native.run_f32(&inputs).map_err(|err| {
-        anyhow!(
-            "NativeCudaSession::run_f32 failed for {}: {err}",
-            session.inner.model_path.display()
-        )
-    })?;
-    let infer_us = started.elapsed().as_micros() as u64;
-    let mut planes = Vec::with_capacity(session.outputs.len());
-    for out_meta in &session.outputs {
-        let (values, dims_u) = outputs.get(&out_meta.name).ok_or_else(|| {
-            anyhow!(
-                "NativeCudaSession missing output '{}' for {}",
-                out_meta.name,
-                session.inner.model_path.display()
-            )
-        })?;
-        planes.push(OutputPlane {
-            values: values.clone(),
-            dtype: FLOAT,
-            dims: dims_u.iter().map(|&d| d as i64).collect(),
-        });
+        .map(|&d| usize::try_from(d))
+        .collect::<Result<_, _>>()?;
+    if dims.iter().try_fold(1usize, |a, &b| a.checked_mul(b)) != Some(input.len())
+        || shape.len() != session.input.dims.len()
+        || shape
+            .iter()
+            .zip(&session.input.dims)
+            .any(|(a, b)| *b >= 0 && a != b)
+    {
+        bail!("model input shape/length mismatch");
     }
-    session.record_run(0, infer_us, 0);
-    Ok(Some(planes))
+    let inputs = HashMap::from([(session.input.name.clone(), (input, dims.clone()))]);
+    let stamp = std::time::Instant::now();
+    let record = |kind: BackendKind| {
+        *session
+            .inner
+            .effective
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Provider::Native(kind));
+        session.record_run(0, stamp.elapsed().as_micros() as u64, 0);
+    };
+    let cached = session
+        .inner
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .filter(|(s, _)| s == &dims)
+        .map(|(_, v)| Arc::clone(v));
+    if let Some(native) = cached {
+        match native
+            .run_f32(&inputs)
+            .map_err(anyhow::Error::msg)
+            .and_then(|r| output_planes(session, r))
+        {
+            Ok(out) => {
+                record(native.kind());
+                return Ok(out);
+            }
+            Err(e) if request != BackendRequest::Auto => return Err(e),
+            Err(e) => log::warn!(
+                "cached native {} failed; reselecting: {e:#}",
+                native.kind().label()
+            ),
+        }
+    }
+    let bytes = std::fs::read(&session.inner.model_path)?;
+    if bytes.len() as u64 != session.inner.key.model_len
+        || fingerprint_bytes(&bytes) != session.inner.key.model_hash
+    {
+        bail!("model content changed after selection; reopen");
+    }
+    let overrides = HashMap::from([(session.input.name.clone(), dims.clone())]);
+    let (route, out) = dispatch::open_and_run(request, &bytes, &overrides, &inputs, |r| {
+        output_planes(session, r).map_err(|e| e.to_string())
+    })?;
+    let reason = route
+        .previous_attempts
+        .iter()
+        .map(|(k, e)| format!("{}: {e}", k.label()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    session.set_fallback((!reason.is_empty()).then_some(reason));
+    let kind = route.session.kind();
+    let old = session
+        .inner
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .replace((dims, route.session));
+    drop(old);
+    record(kind);
+    Ok(out)
 }
 
 unsafe impl Send for SessionInner {}
@@ -2609,8 +2608,10 @@ impl Session {
     /// the sense that it was actually appended and accepted by ORT; nodes the
     /// provider does not support can still run on CPU inside the same session.
     pub(crate) fn provider(&self) -> Provider {
-        self.inner.provider
+        self.inner.effective.lock().unwrap_or_else(|p|p.into_inner()).unwrap_or(self.inner.provider)
     }
+
+    pub(crate) fn allows_cpu_fallback(&self)->bool { !matches!(self.inner.native_request,Some(BackendRequest::Only(k)) if k!=BackendKind::Cpu) }
 
     /// Provider selection order actually attempted and the reason for a
     /// fallback, if the first choice was skipped or failed.
@@ -3075,10 +3076,19 @@ mod tests {
 
     #[test]
     fn local_runtime_reports_its_providers() {
+        // A host verification may require an exact mode. A missing runtime or
+        // native-only fallback must not turn a positive ORT test green by skipping.
+        let expected = std::env::var("AURORA_TEST_EXPECT_ORT").ok();
         let Some(runtime) = Runtime::get() else {
-            println!("ONNX Runtime unavailable; no execution provider list to print");
-            return;
+            assert!(expected.is_none(), "expected runtime mode {:?}, no Runtime returned",expected);
+            println!("no runtime installed");return;
         };
+        match expected.as_deref() {
+            Some("native-only") => assert!(runtime.is_native_only(), "unexpected ORT library loaded"),
+            Some("library") => assert!(!runtime.is_native_only(), "expected actual ORT, got native-only"),
+            Some(other) => panic!("unknown expected runtime mode {other}"), None=>{}
+        }
+        println!("[runtime] native_only={}",runtime.is_native_only());
         let (library, version, api) = runtime.describe();
         let providers = runtime.available_providers();
         let labels: Vec<&str> = providers.iter().map(|p| p.label()).collect();
@@ -3088,7 +3098,13 @@ mod tests {
             version,
             api
         );
-        assert_eq!(providers.last(), Some(&Provider::Cpu), "CPU is the mandatory fallback");
+        if runtime.is_native_only() {
+            assert!(runtime.provider_plan().exported.is_empty(), "without the library there are no exported ORT providers");
+            assert_eq!(providers.last(), Some(&Provider::Native(BackendKind::Cpu)), "native CPU, not an invented ORT CPU, terminates the candidate list");
+            assert!(providers.iter().all(|p| matches!(p, Provider::Native(_))));
+        } else {
+            assert_eq!(providers.last(), Some(&Provider::Cpu), "real ORT CPU remains the fallback for an ORT plan");
+        }
     }
 
     fn key_for(model_hash: u64, providers: &str, options: &str) -> SessionKey {
@@ -3195,6 +3211,30 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An in-memory protobuf assembled from graph IR v8, opset 13, X[4] -> Relu -> Y[4].
+    /// This is a generated fixture and never reads anyone's installed models.
+    #[test]
+    fn image_adapter_reports_executed_backend_and_rejects_substitution() {
+        let bytes: &[u8] = &[8,8,58,67,10,18,10,1,120,18,1,121,26,4,114,101,108,117,34,4,82,101,108,117,18,11,112,117,98,108,105,99,95,116,101,115,116,90,15,10,1,120,18,10,10,8,8,1,18,4,10,2,8,4,98,15,10,1,121,18,10,10,8,8,1,18,4,10,2,8,4,66,2,16,13];
+        let dir=std::env::temp_dir().join(format!("aurora-native-route-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap(); let path=dir.join("public_relu.onnx"); std::fs::write(&path,bytes).unwrap();
+        let runtime=Runtime::native_only();
+        // An ORT-only reference may never be manufactured by the native runtime.
+        assert!(runtime.open_session_on(&path,&[Provider::Cpu]).is_err());
+        let cpu=runtime.open_session_for_backend(&path,BackendRequest::Only(BackendKind::Cpu)).unwrap();
+        assert_eq!(cpu.provider(),Provider::NativePending);
+        for (mut x,y) in [([-3.,1.,0.,2.],[0.,1.,0.,2.]),([4.,-5.,6.,-7.],[4.,0.,6.,0.])] {
+            let p=runtime.run_typed(&cpu,&mut x,&[4]).unwrap();assert_eq!(p.len(),1);assert_eq!(p[0].values,y);assert_eq!(p[0].dims,[4]);
+            assert_eq!(cpu.provider(),Provider::Native(BackendKind::Cpu));
+        }
+        assert!(runtime.run_typed(&cpu,&mut [0.;4],&[2,2]).is_err());
+        let absent=if cfg!(target_os="macos"){BackendKind::Dx12}else{BackendKind::Metal};
+        let gpu=runtime.open_session_for_backend(&path,BackendRequest::Only(absent)).unwrap();
+        assert!(runtime.run_typed(&gpu,&mut [1.;4],&[4]).is_err());assert!(!gpu.allows_cpu_fallback());assert_eq!(gpu.provider(),Provider::NativePending);
+        assert_ne!(gpu.session_key().registry_id(),cpu.session_key().registry_id());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn optimized_cache_path_is_namespaced_by_the_session_key() {
         let dir = Path::new("C:/cache");
@@ -3221,10 +3261,13 @@ mod tests {
         let (first, first_len) = model_fingerprint(&path).unwrap();
         let (again, again_len) = model_fingerprint(&path).unwrap();
         assert_eq!((first, first_len), (again, again_len), "fingerprint is cached and stable");
+        assert_eq!(fingerprint_bytes(b"first model body"),first);
         std::fs::write(&path, b"second model body with a different length").unwrap();
         let (second, second_len) = model_fingerprint(&path).unwrap();
         assert_ne!(first_len, second_len);
         assert_ne!(first, second, "content change must change the fingerprint");
+        let large:Vec<u8>=(0..140_111).map(|i|(i%239) as u8).collect();
+        std::fs::write(&path,&large).unwrap(); assert_eq!(model_fingerprint(&path).unwrap(),(fingerprint_bytes(&large),large.len() as u64));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3403,6 +3446,9 @@ mod tests {
                 provider: Provider::Cpu,
                 key: key_for(model_len, "CPU", "opt=99"),
                 model_path: PathBuf::new(),
+                native_request: None,
+                native: Mutex::new(None),
+                effective: Mutex::new(None),
                 fallback: Mutex::new(None),
                 profile_active: AtomicBool::new(false),
                 timing: Mutex::new(SessionTiming::default()),
@@ -3459,20 +3505,46 @@ mod tests {
         }
     }
 
+    /// The runtime serves this one measured revision through the ORT CPU
+    /// reference; every other revision of the same path must meet the native
+    /// parity tolerance declared in [`parity_cases`].
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires shipped ONNX models, onnxruntime.dll, and NVIDIA CUDA GPU"]
-    fn native_infer_vs_ort_parity_all_shipped_models() {
-        use aurora_portrait::native_infer::session::NativeCudaSession;
-        use std::time::Instant;
+    fn measured_bw_drift_only_selects_cpu_for_matching_content() {
+        assert!(requires_cpu_reference(0xb6ba_adfe_3188_c8a4, 45_557_540));
+        assert!(!requires_cpu_reference(0xb6ba_adfe_3188_c8a5, 45_557_540));
+        assert!(!requires_cpu_reference(0xb6ba_adfe_3188_c8a4, 45_557_541));
+    }
 
-        let root = match std::env::var_os("AURORA_MODELS_DIR") {
-            Some(v) => PathBuf::from(v),
-            None => panic!("set AURORA_MODELS_DIR to the models directory"),
-        };
-        let runtime = Runtime::get().expect("ONNX Runtime must be available (set AURORA_ORT_RUNTIME_DIRS)");
+    /// A reference-served revision must stay in the suite — otherwise the
+    /// relaxation becomes invisible — and its declared tolerance must not have
+    /// been quietly widened to make it fit either.
+    #[cfg(windows)]
+    #[test]
+    fn reference_served_revision_stays_in_the_suite_and_keeps_the_declared_tolerance() {
+        let case = parity_cases()
+            .iter()
+            .find(|case| case.0.eq_ignore_ascii_case(r"AIModels\Common\MatchLook\MatchLookBw.onnx"))
+            .expect("the reference-served revision must stay in the parity suite");
+        assert_eq!(
+            case.3, 5e-4,
+            "native parity tolerance for this revision is not relaxed; the runtime serves the \
+             pinned content on the ORT CPU reference instead"
+        );
+        assert!(requires_cpu_reference(0xb6ba_adfe_3188_c8a4, 45_557_540));
+        assert!(
+            !requires_cpu_reference(0xb6ba_adfe_3188_c8a4, 1),
+            "a truncated or padded copy is not the served revision"
+        );
+    }
 
-        let cases: &[(&str, &str, &[usize], f32)] = &[
+    /// The shipped-model golden suite: `(path, input name, input shape, tolerance)`.
+    ///
+    /// Hoisted out of the test so the reference-served set can be validated
+    /// against it without loading a model: a case that vanished from the table
+    /// would otherwise hide a relaxation forever.
+    fn parity_cases() -> &'static [(&'static str, &'static str, &'static [usize], f32)] {
+        &[
             (r"landmark\assets\1063025060.onnx", "3070435246", &[1, 3, 64, 64], 1e-4),
             (r"landmark\assets\323773030.onnx", "t1511", &[1, 3, 160, 160], 1e-4),
             (r"AIModels\Common\BlemishRemoval\blemishRemoval.onnx", "input.1", &[1, 3, 278, 278], 1e-4),
@@ -3491,33 +3563,136 @@ mod tests {
             (r"AIModels\Common\MatchLook\MatchLookColor.onnx", "input.1", &[1, 3, 384, 384], 5e-4),
             (r"AIModels\Common\MatchLook\MatchLookExp.onnx", "input.1", &[1, 3, 384, 384], 5e-4),
             (r"AIModels\Common\SamEncoder\eSamEncoderPreUInt8.onnx", "input_image", &[1024, 1024, 3], 2e-2),
-        ];
+        ]
+    }
+
+    /// A detector packs geometry and ordinary FP32 scores into one output. A geometry
+    /// tolerance never extends to confidence or class. The historically published
+    /// maximum is still tested over *all* elements and printed independently.
+    fn requires_fp32_subgate(model:&str, output:&str, shape:&[usize], index:usize)->bool {
+        if model.ends_with("faceMesh.onnx") {return output!="Identity";}
+        (model.ends_with("beautyMarks.onnx") || model.ends_with("dust.onnx"))
+            && shape.last()==Some(&6) && index%6>=4
+    }
+    #[test] fn geometry_tolerance_never_extends_to_confidences(){
+        for i in 0..18 {assert_eq!(requires_fp32_subgate("dust.onnx","output",&[1,3,6],i),i%6>=4);}
+        assert!(requires_fp32_subgate("faceMesh.onnx","Identity_1",&[1,1],0));
+        assert!(!requires_fp32_subgate("faceMesh.onnx","Identity",&[1,1434],9));
+        assert!(!requires_fp32_subgate("MatchLookBw.onnx","1106",&[1,7],4));
+    }
+    fn within_golden(rel:&str,max:f32,mean:f64,tol:f32)->bool {
+        max.is_finite() && mean.is_finite() && max < tol && (!rel.ends_with("eSamEncoderPreUInt8.onnx") || mean < 1e-3)
+    }
+    #[test] fn sam_requires_both_original_max_and_new_strict_mean() {
+        let n="eSamEncoderPreUInt8.onnx";
+        assert!(within_golden(n,0.0191,0.000727,0.02));assert!(!within_golden(n,0.0191,0.001,0.02));
+        assert!(!within_golden(n,0.02,0.0,0.02));assert!(!within_golden("float",1e-4,0.0,1e-4));
+        assert!(!within_golden(n,f32::NAN,0.0,0.02));
+    }
+
+    #[test]
+    #[ignore = "requires original models, a real ORT CPU oracle, and the selected native device"]
+    fn native_infer_vs_ort_parity_all_shipped_models() {
+        // Default reproduces the specified platform's native test. Never allow Auto or CPU
+        // to make a GPU conformance table look green.
+        let backend=match BackendRequest::from_env().expect("valid backend preference") {
+            BackendRequest::Auto if cfg!(target_os="macos")=>BackendKind::Metal,
+            BackendRequest::Auto=>BackendKind::Cuda,
+            BackendRequest::Only(k @ (BackendKind::Cuda|BackendKind::Metal|BackendKind::Dx12|BackendKind::OpenCl))=>k,
+            BackendRequest::Only(BackendKind::Cpu)=>panic!("a GPU conformance suite may not use the CPU as both sides"),
+        };
+        println!("[BACKEND] strict requested={}, ORT CPU reference only", backend.label());
+        use std::time::Instant;
+
+        let root = match std::env::var_os("AURORA_MODELS_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => panic!("set AURORA_MODELS_DIR to the models directory"),
+        };
+        // The reference must be ONNX Runtime's CPU execution provider. The two
+        // ways it can be absent are reported per model instead of panicking, so
+        // the suite never turns green without a usable oracle: `Runtime::get()`
+        // falls back to the zero-DLL native CUDA runtime when onnxruntime.dll
+        // fails to load, and that runtime is the thing under test, not a
+        // reference.
+        let golden: Result<&'static Runtime, String> = match Runtime::get() {
+            Some(runtime) if runtime.is_native_only() => Err(
+                "onnxruntime.dll failed to load, so Runtime::get() returned the zero-DLL native \
+                 CUDA runtime; no ORT CPU reference to compare against"
+                    .to_string(),
+            ),
+            Some(runtime) => Ok(runtime),
+            None => Err(
+                "onnxruntime.dll not found (set AURORA_ORT_LIB or AURORA_ORT_RUNTIME_DIRS)"
+                    .to_string(),
+            ),
+        };
+
+        let cases = parity_cases();
 
         let mut passed = 0usize;
+        let mut unsupported = Vec::new();
         let mut failed_models = Vec::new();
-
+        let mut missing_models = Vec::new();
+        let mut golden_blocked: Vec<&'static str> = Vec::new();
+        let mut served_by_reference: Vec<&'static str> = Vec::new();
         for &(rel, input_name, shape, tol) in cases {
-            let path = root.join(rel);
+            let path = rel.split('\\').fold(root.clone(), |p, c| p.join(c));
             if !path.is_file() {
+                eprintln!(
+                    "[MISSING] {rel}: not present under AURORA_MODELS_DIR, so this case produced no \
+                     evidence (incomplete staging root or incomplete install, not a pass)"
+                );
+                missing_models.push(rel);
                 continue;
             }
+            // Content identity of *these* bytes, the same fingerprint the session
+            // cache uses. It decides whether native parity applies at all: the
+            // runtime serves exactly one measured revision through the ORT CPU
+            // reference (see `requires_cpu_reference`), and every other revision —
+            // a Capture One update, a re-export, a truncated copy — is not covered
+            // by that and must meet the declared native-parity tolerance.
+            let (model_hash, model_len) = model_fingerprint(&path)
+                .unwrap_or_else(|err| panic!("fingerprinting {rel}: {err:#}"));
+            let reference_served = requires_cpu_reference(model_hash, model_len);
+            // 1. Run the ORT golden oracle on the CPU execution provider, forced
+            // so a GPU EP configured in the environment cannot change what the
+            // reference is.
+            let runtime = match &golden {
+                Ok(runtime) => *runtime,
+                Err(reason) => {
+                    eprintln!("[GOLDEN-UNAVAILABLE] {rel}: {reason}");
+                    golden_blocked.push(rel);
+                    continue;
+                }
+            };
+            let ort_sess = match runtime.open_session_on(&path, &[Provider::Cpu]) {
+                Ok(session) if session.provider() == Provider::Cpu => session,
+                Ok(session) => {
+                    eprintln!(
+                        "[GOLDEN-NOT-CPU] {rel}: session opened on {} while the reference must be \
+                         the ORT CPU execution provider",
+                        session.provider().label()
+                    );
+                    golden_blocked.push(rel);
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("[GOLDEN-UNAVAILABLE] {rel}: ORT CPU session failed: {err:#}");
+                    golden_blocked.push(rel);
+                    continue;
+                }
+            };
             let numel: usize = shape.iter().product();
             let input_data: Vec<f32> = (0..numel)
                 .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
                 .collect();
             let shape_i64: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
 
-            // 1. Run ORT golden oracle directly (bypassing NativeCudaSession fast path).
-            let ort_sess = runtime
-                .open_session(&path)
-                .unwrap_or_else(|e| panic!("ORT open {rel}: {e:#}"));
+            assert_eq!(ort_sess.provider(), Provider::Cpu, "golden must be CPU ORT");
             let mut ort_in = input_data.clone();
-            let ort_outs: Vec<Vec<f32>> = runtime
+            let ort_outs = runtime
                 .run_typed_ort(&ort_sess, &mut ort_in, &shape_i64)
-                .unwrap_or_else(|e| panic!("ORT run {rel}: {e:#}"))
-                .into_iter()
-                .map(|p| p.values)
-                .collect();
+                .unwrap_or_else(|e| panic!("ORT run {rel}: {e:#}"));
             let mut ort_best_ms = f64::INFINITY;
             for _ in 0..3 {
                 let mut inp = input_data.clone();
@@ -3530,28 +3705,30 @@ mod tests {
             let bytes = std::fs::read(&path).expect("read onnx");
             let mut overrides = HashMap::new();
             overrides.insert(input_name.to_string(), shape.to_vec());
-            let native_sess = NativeCudaSession::from_bytes(&bytes, &overrides)
-                .unwrap_or_else(|e| panic!("Native open {rel}: {e}"));
-            let mut native_in = HashMap::new();
-            native_in.insert(input_name.to_string(), (input_data.as_slice(), shape.to_vec()));
-            let native_outs = native_sess
-                .run_f32(&native_in)
-                .unwrap_or_else(|e| panic!("Native run {rel}: {e}"));
-            let mut native_best_ms = f64::INFINITY;
-            for _ in 0..3 {
-                let t = Instant::now();
-                let _ = native_sess.run_f32(&native_in).unwrap();
-                native_best_ms = native_best_ms.min(t.elapsed().as_secs_f64() * 1000.0);
-            }
-
+            let native_sess = match dispatch::open(BackendRequest::Only(backend), &bytes, &overrides) {
+                Ok(r) if r.session.kind()==backend && r.previous_attempts.is_empty()=>r.session,
+                Ok(_)=>panic!("a forced backend was silently substituted"),
+                Err(e)=>{ eprintln!("[UNSUPPORTED] {rel} {}: {e}",backend.label());unsupported.push(rel);continue; }
+            };
+            let native_in=HashMap::from([(input_name.to_string(),(input_data.as_slice(),shape.to_vec()))]);
+            let measured = (|| -> Result<_, String> {
+                let mut actual=native_sess.run_f32(&native_in)?; let mut best=f64::INFINITY;
+                for _ in 0..3 {let t=Instant::now(); actual=native_sess.run_f32(&native_in)?; best=best.min(t.elapsed().as_secs_f64()*1000.0);}
+                Ok((actual,best))
+            })();
+            let (native_outs,native_best_ms)=match measured { Ok(v)=>v, Err(e)=>{eprintln!("[EXECUTION-FAILED] {rel} {}: {e}",backend.label());unsupported.push(rel);continue;}};
+            assert_eq!(native_outs.len(),ort_outs.len(),"{rel}: unexpected total number of outputs");
             // 3. Compare every output tensor in ORT's declared output order.
             let mut worst_max = 0.0f32;
             let mut worst_mean = 0.0f64;
+            let mut strict_fp32=0.0f32;
+            let mut strict_values=0usize;
             for (idx, out_spec) in ort_sess.outputs.iter().enumerate() {
-                let ort_vec = &ort_outs[idx];
-                let (nat_vec, _sh) = native_outs
+                let ort_vec = &ort_outs[idx].values;
+                let (nat_vec, shape) = native_outs
                     .get(&out_spec.name)
                     .unwrap_or_else(|| panic!("{rel}: missing native output '{}'", out_spec.name));
+                assert!(ort_outs[idx].dims.iter().copied().eq(shape.iter().map(|&d| d as i64)), "{rel}: output axis order differs for {}", out_spec.name);
                 assert_eq!(
                     ort_vec.len(),
                     nat_vec.len(),
@@ -3560,13 +3737,14 @@ mod tests {
                 );
                 let mut max_d = 0.0f32;
                 let mut sum_d = 0.0f64;
-                for (&a, &b) in ort_vec.iter().zip(nat_vec.iter()) {
+                for (element,(&a,&b)) in ort_vec.iter().zip(nat_vec.iter()).enumerate() {
                     if !a.is_finite() || !b.is_finite() {
                         max_d = f32::INFINITY;
                         sum_d = f64::INFINITY;
                         break;
                     }
                     let d = (a - b).abs();
+                    if requires_fp32_subgate(rel,&out_spec.name,shape,element) {strict_fp32=strict_fp32.max(d);strict_values+=1;}
                     if d > max_d {
                         max_d = d;
                     }
@@ -3585,27 +3763,52 @@ mod tests {
                 }
             }
 
-            let status = if worst_max <= tol { "PASS" } else { "DIFF" };
+            // Native conformance and production fallback are two separate assertions:
+            // passing ORT-vs-ORT never repairs a failed native-vs-ORT comparison.
+            let within = within_golden(rel,worst_max,worst_mean,tol) && strict_fp32 < 1e-4;
+            if strict_values!=0 {println!("[FP32-SCORES] {rel}: {strict_values} ordinary values, max={strict_fp32:.8e}, required <1.0e-4");}
+            let status = if within { "PASS" } else { "DIFF" };
             println!(
-                "[{status}] {:<48} ORT({:<4})={:6.2}ms  NativeCUDA={:6.2}ms  max_diff={:.2e}  mean_diff={:.2e}  tol={:.0e}",
+                "[{status}] {:<48} ORT({:<4})={:6.2}ms  Native({})={:6.2}ms  max_diff={:.2e}  mean_diff={:.2e}  tol={:.0e}",
                 rel,
                 ort_sess.provider().label(),
                 ort_best_ms,
+                backend.label(),
                 native_best_ms,
                 worst_max,
                 worst_mean,
                 tol,
             );
-            if worst_max <= tol {
+            if reference_served {
+                let session = runtime.open_session_for_backend(&path, BackendRequest::Auto).expect("open production fallback separately from the forced device");
+                assert_eq!(session.provider(), Provider::Cpu);
+                let output = runtime.run_typed(&session, &mut ort_in, &shape_i64).expect("serve via CPU reference");
+                assert!(output.len() == ort_outs.len() && output.iter().zip(&ort_outs).all(|(a,b)| a.dims == b.dims && a.values == b.values), "product fallback differs from CPU reference");
+                println!("[CPU-FALLBACK] fp={model_hash:016x}/len={model_len} returned reference values exactly; not a native parity pass");
+                served_by_reference.push(rel);
+            }
+            if within {
                 passed += 1;
             } else {
                 failed_models.push((rel, worst_max, tol));
             }
         }
-        println!("=== PARITY SUMMARY: {passed}/{} within tolerance ===", cases.len());
+        println!(
+            "=== PARITY SUMMARY: {passed}/{} within original native tolerances; missing={}, outside tolerance={}, no CPU oracle={}, ref-served={}, unsupported={} ===",
+            cases.len(),
+            missing_models.len(),
+            failed_models.len(),
+            golden_blocked.len(),
+            served_by_reference.len(), unsupported.len()
+        );
+        // 18/18 or nothing: every declared case must be present, must have run
+        // against a real ORT CPU oracle, and must land inside its tolerance. A
+        // short run prints its real denominator and fails here; it is never
+        // reported as green.
         assert!(
-            failed_models.is_empty(),
-            "models exceeding parity tolerance: {failed_models:?}"
+            passed == cases.len() && missing_models.is_empty() && failed_models.is_empty() && golden_blocked.is_empty() && unsupported.is_empty(),
+            "incomplete golden suite: missing={missing_models:?}; outside tolerance={failed_models:?}; \
+             no ORT CPU oracle={golden_blocked:?}; ref-served={served_by_reference:?}; unsupported={unsupported:?}"
         );
     }
 }

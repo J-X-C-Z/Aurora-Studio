@@ -363,9 +363,12 @@ fn infer_onnx(
     let runtime = Runtime::get()
         .ok_or(Refusal::MissingInput("FacePlump ONNX Runtime"))?;
     let cuda = || {
-        let session = runtime
-            .open_session_on(&asset.path, &[Provider::Cuda])
-            .map_err(|_| Refusal::MissingInput("FacePlump ONNX CUDA session"))?;
+        let session = if runtime.is_native_only() {
+            runtime.open_session(&asset.path)
+        } else {
+            runtime.open_session_on(&asset.path, &[Provider::Cuda])
+        }
+        .map_err(|_| Refusal::MissingInput("FacePlump ONNX CUDA session"))?;
         infer_session(
             runtime,
             &session,

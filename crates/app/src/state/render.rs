@@ -1073,10 +1073,10 @@ impl AppState {
                         .then(crate::perf::working_set_bytes)
                         .flatten();
                     let (region, image_id) = (request.region, request.image);
-                    after_engine.render_preview(&request).map(move |f| {
+                    after_engine.render_preview_scoped(&request, want_scope.wants()).map(move |f| {
                         let engine_wall_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                         let source_status = crate::planned::source_status(after_engine.as_ref(), image_id);
-                        let PreviewFrame { image, histogram, elapsed_ms, degraded, bgra, .. } = f;
+                        let PreviewFrame { image, histogram, elapsed_ms, degraded, bgra, scopes, .. } = f;
                         let (width, height) = (image.width, image.height);
                         // Keep overlays and scopes off the main preview publish critical path:
                         // install the primary image first, then compute analysis asynchronously
@@ -1111,14 +1111,14 @@ impl AppState {
                             });
                         }
                         let PreparedDisplay { image: img, source_pixels, reused, .. } = display;
-                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, region, image_id, request, source_status)
+                        (histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, region, image_id, request, source_status, scopes)
                     })
                 })
                 .await;
-            let Ok((render_before, installed_img)) = this.update(cx, |this, cx| {
-                let mut installed_img: Option<Arc<RenderImage>> = None;
+            let Ok((render_before, installed)) = this.update(cx, |this, cx| {
+                let mut installed: Option<(Arc<RenderImage>, Option<aurora_engine::ScopeMaps>)> = None;
                 match frame {
-                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, region, image_id, request, source_status)) => {
+                    Ok((histogram, elapsed_ms, degraded, img, source_pixels, reused, width, height, region, image_id, request, source_status, scopes)) => {
                         if this.preview_state.preview.may_install(this.library.current, image_id, stamp.id) {
                             this.preview_state.preview.last_request = Some(request);
                             this.preview_state.preview.last_overlay = placed_overlay;
@@ -1139,7 +1139,7 @@ impl AppState {
                                 (image_id, summary.into())
                             });
                             if want_warning.is_some() || want_focus.is_some() || want_scope != super::ScopeKind::Off {
-                                installed_img = Some(Arc::clone(&img));
+                                installed = Some((Arc::clone(&img), scopes));
                             }
                             display_frame(&mut this.preview_state.preview.frame, &mut this.preview_state.preview.full_after, Frame {
                                 image: img,
@@ -1178,33 +1178,62 @@ impl AppState {
                 if render_before {
                     cx.notify();
                 }
-                (render_before, installed_img)
+                (render_before, installed)
             }) else { return };
             // Compute optional overlays / scopes asynchronously after the primary frame is shown.
-            if let Some(display_img) = installed_img {
+            if let Some((display_img, engine_scopes)) = installed {
                 let analysis_this = this.clone();
                 cx.spawn(async move |cx| {
-                    let result = cx
+                    let (result, scope_ns, from_device) = cx
                         .background_spawn(async move {
                             let size = display_img.size(0);
                             let (w, h) = (size.width.0.max(0) as usize, size.height.0.max(0) as usize);
                             let Some(bytes) = display_img.as_bytes(0) else {
-                                return ((None, None), None);
+                                return (((None, None), None), 0u64, false);
                             };
-                            match (
+                            // The scope pass is the only stage here that scales with
+                            // the sampled pixel count, so it is timed on its own
+                            // instead of being folded into the overlay stage.
+                            let scope_ns = std::sync::atomic::AtomicU64::new(0);
+                            let used_engine_map=std::sync::atomic::AtomicBool::new(false);
+                            let run_scope = || {
+                                let started = std::time::Instant::now();
+                                // The renderer counted these bins from the very
+                                // pixels installed above; only count here when it
+                                // could not (cache hit, ICC conversion, CPU path).
+                                let out=match engine_scopes.as_ref().and_then(|maps|super::scopes::render_maps(maps,want_scope)) {
+                                    Some(image)=> { used_engine_map.store(true,std::sync::atomic::Ordering::Relaxed);Some(image) }
+                                    None=>super::scopes::render_pixels(bytes,w,h,true,want_scope),
+                                };
+                                scope_ns.store(
+                                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                out
+                            };
+                            let result = match (
                                 want_warning.is_some() || want_focus.is_some(),
                                 want_scope != super::ScopeKind::Off,
                             ) {
                                 (true, true) => rayon::join(
                                     || analysis_pixels(bytes, w, h, true, want_warning, want_focus),
-                                    || super::scopes::render_pixels(bytes, w, h, true, want_scope),
+                                    || run_scope(),
                                 ),
                                 (true, false) => (analysis_pixels(bytes, w, h, true, want_warning, want_focus), None),
-                                (false, true) => ((None, None), super::scopes::render_pixels(bytes, w, h, true, want_scope)),
+                                (false, true) => ((None, None), run_scope()),
                                 (false, false) => ((None, None), None),
-                            }
+                            };
+                            (result, scope_ns.load(std::sync::atomic::Ordering::Relaxed), used_engine_map.load(std::sync::atomic::Ordering::Relaxed))
                         })
                         .await;
+                    if scope_ns > 0 {
+                        crate::perf::record(serde_json::json!({
+                            "event": "scope",
+                            "id": stamp.id,
+                            "kind": format!("{:?}", want_scope),
+                            "scope_ms": scope_ns as f64 / 1e6,
+                        }));
+                    }
                     analysis_this
                         .update(cx, |this, cx| {
                             let ((warning, focus), scope) = result;
@@ -1219,7 +1248,11 @@ impl AppState {
                                         cx.drop_image(old, None);
                                     }
                                 }
-                                if want_scope != super::ScopeKind::Off {
+                                if want_scope != super::ScopeKind::Off && this.prefs.panels.scope_kind == want_scope {
+                                    if crate::perf::enabled() && scope.is_some() {
+                                        crate::perf::record(serde_json::json!({"event":"scope_installed","frame":stamp.id,
+                                            "kind":format!("{want_scope:?}"),"source":if from_device {"renderer_bins"} else {"cpu_display_pixels"}}));
+                                    }
                                     if let Some(old) = std::mem::replace(&mut this.preview_state.preview.scope, scope) {
                                         cx.drop_image(old, None);
                                     }
@@ -1502,6 +1535,7 @@ mod ordering_tests {
                     degraded: None,
                     gamut_warning: None,
                     bgra: false,
+                    scopes: None,
                 }),
                 FakeReply::Fail => anyhow::bail!("fake engine failure"),
             }

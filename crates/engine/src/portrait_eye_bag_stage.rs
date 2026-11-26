@@ -346,7 +346,7 @@ impl EyeBagFrameProducer {
         let primary = runtime
             .open_session(path)
             .map_err(|_| Refusal::MissingInput("PF90116_MODEL_SESSION"))?;
-        let cpu = if primary.provider() == Provider::Cpu {
+        let cpu = if primary.provider() == Provider::Cpu || runtime.is_native_only() {
             None
         } else {
             Some(

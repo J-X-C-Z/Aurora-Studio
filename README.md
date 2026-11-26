@@ -11,7 +11,7 @@ Rust / GPUI 桌面照片编辑器。此版整合 Levin 最新前端、Windows �
 .\aurora-studio.exe 'D:\Photos'
 ```
 
-Windows 使用 DirectX 显示。RAW 16-bit 解码需要 LibRaw 0.23；AI 蒙版、闭眼检测、自动旋转需要用户本机合法安装的模型与 ONNX Runtime。发布物不含照片、EXIF 样本、Capture One 模型、ICC、风格或校准表。
+**本地构建、校验安装、非破坏性编辑和批量导出：**见 [Windows 桌面使用与架构](docs/WINDOWS-QUICKSTART.zh-CN.md)。Windows 使用 DirectX 显示；通用 RAW 可使用开源 LibRaw 0.22.3（ABI 25）。AI 工具需对应模型，受支持的原生 NVIDIA 路径使用内嵌 PTX，个别模型版本需要另行配置 CPU 参考运行库。标准导出和编辑不依赖商业模型。发布物不含用户照片、Capture One 模型或第三方闭源推理 DLL。
 
 ## 构建与测试
 

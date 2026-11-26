@@ -128,7 +128,7 @@ use crate::processing::tone::{apply_dehaze, apply_hdr, tone_user, tone_user_core
 
 // Encoding/banding quantisers live in `processing::encoding`; imported here so
 // this renderer and its tests keep the unqualified names.
-use crate::processing::encoding::{encode_f32_frame, merge_wide_delta, upsample};
+use crate::processing::encoding::{encode_f32_frame, merge_wide_delta};
 #[cfg(windows)]
 use crate::processing::encoding::{band_region, encode_io_rows};
 use super::plan::{
@@ -1421,6 +1421,11 @@ pub struct Rendered {
     pub portrait_report: Option<crate::portrait_stage::PortraitRunReport>,
     /// True when `rgba` is already stored in BGRA channel order for display.
     pub(crate) bgra: bool,
+    /// Viewer scope counts taken on the device from exactly `rgba`, when the
+    /// frame came straight off the resident GPU path. `None` on every path that
+    /// still changes the pixels afterwards, so a caller always has the option of
+    /// counting on the CPU.
+    pub(crate) scopes: Option<ScopeMaps>,
 }
 
 /// A 16-bit frame for export. Previews keep using the 8-bit [`Rendered`].
@@ -1454,6 +1459,7 @@ pub fn render(
         false,
         true,
         false,
+        ScopeWants::default(),
     )
     .0
 }
@@ -1468,6 +1474,7 @@ pub(crate) fn render_preview_bgra(
     bypass: bool,
     mask_overlay: Option<u64>,
     want_bgra: bool,
+    scopes: ScopeWants,
 ) -> Rendered {
     let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
     render_sized(
@@ -1483,6 +1490,7 @@ pub(crate) fn render_preview_bgra(
         false,
         true,
         want_bgra,
+        scopes,
     )
     .0
 }
@@ -1513,6 +1521,7 @@ pub fn render16(
             true,
             false,
             false,
+            ScopeWants::default(),
         );
     Rendered16 {
         rgba: wide.expect("a wide render always returns its 16-bit buffer"),
@@ -1559,8 +1568,7 @@ pub(crate) fn preview_size(src: &Source, adj: &AdjustmentSet, region: NormRect, 
     (w, h)
 }
 
-/// `fast` renders at half the output size and upsamples to the size a full
-/// render would have, so callers get the same dimensions with less per-pixel work.
+/// Both drag and settled frames sample this exact output grid.
 pub(crate) fn render_at(
     src: &Source,
     adj: &AdjustmentSet,
@@ -1568,26 +1576,10 @@ pub(crate) fn render_at(
     max_size: u32,
     bypass: bool,
     mask_overlay: Option<u64>,
-    fast: bool,
+    _fast: bool,
+    scopes: ScopeWants,
 ) -> Rendered {
-    if !fast {
-        return render(src, adj, region, max_size, bypass, mask_overlay);
-    }
-    let (tw, th) = preview_size(src, adj, region, max_size);
-    let small = render(src, adj, region, max_size.div_ceil(2).max(1), bypass, mask_overlay);
-    if (small.width, small.height) == (tw, th) {
-        return small;
-    }
-    let rgba = upsample(&small.rgba, small.width, small.height, tw, th);
-    let histogram = histogram(&rgba);
-    Rendered {
-        rgba,
-        width: tw,
-        height: th,
-        histogram,
-        portrait_report: small.portrait_report,
-        bgra: false,
-    }
+    render_preview_bgra(src, adj, region, max_size, bypass, mask_overlay, false, scopes)
 }
 
 /// Resolves the output-domain BandingSuppression for one render.
@@ -2206,6 +2198,7 @@ fn render_sized(
     wide: bool,
     with_histogram: bool,
     want_bgra: bool,
+    scopes: ScopeWants,
 ) -> (Rendered, Option<Vec<u16>>) {
     let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
     let t0 = stage_timing.then(std::time::Instant::now);
@@ -2293,6 +2286,10 @@ fn render_sized(
     // Keeps the sampled linear viewport in VRAM across slider drags and runs
     // develop + optional Camera/Display USM + C1 ICC + GPU NR + quantize + GPU
     // histogram on one CUDA stream with zero intermediate D2H/H2D round-trips.
+    // The CUDA scope pass only exists on this platform, so elsewhere the
+    // request is never fulfilled and the caller keeps counting on the CPU.
+    #[cfg(not(windows))]
+    let _ = scopes;
     #[cfg(windows)]
     if !wide
         && adj.clarity.clarity.abs() <= 1e-4
@@ -2331,6 +2328,10 @@ fn render_sized(
             let direct_return = !post_8bit;
             let emit_bgra = direct_return && want_bgra;
             let emit_hist = direct_return && with_histogram;
+            // The device counts scopes only when the frame it counted is the
+            // frame the app shows: post-8-bit stages would change the pixels
+            // after the count, so those renders ask for nothing.
+            let emit_scopes = if direct_return { scopes } else { ScopeWants::default() };
             let sharp = scale >= 0.5;
             let xs: Vec<f32> = (0..out_w)
                 .map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width)
@@ -2384,7 +2385,7 @@ fn render_sized(
                 cubic: sharp,
                 cache: true,
             };
-            if let Some(res) = super::develop_gpu::render_resident_preview(
+            let resident = super::develop_gpu::render_resident_preview(
                 res_key,
                 [region.x, region.y, region.width, region.height],
                 &dev_params,
@@ -2394,6 +2395,7 @@ fn render_sized(
                 nr_arg,
                 emit_bgra,
                 emit_hist,
+                emit_scopes,
                 |dst_f32| {
                     let w = out_w as usize;
                     let mut band = Vec::new();
@@ -2422,7 +2424,8 @@ fn render_sized(
                         y0 += rows;
                     }
                 },
-            ) {
+            );
+            if let Some(res) = resident {
                 if let Some(t0) = t0 {
                     eprintln!(
                         "AURORA_STAGE resident_gpu={}x{} direct={} bgra={} src_hit={} total_ms={:.3}",
@@ -2443,6 +2446,7 @@ fn render_sized(
                             histogram: res.histogram.unwrap_or_default(),
                             portrait_report: None,
                             bgra: emit_bgra,
+                            scopes: res.scopes,
                         },
                         None,
                     );
@@ -3555,6 +3559,9 @@ fn render_sized(
             histogram,
             portrait_report,
             bgra: false,
+            // Nothing on this path can promise the pixels are what the panel
+            // shows, so scopes here are always counted by the caller.
+            scopes: None,
         },
         rgba16,
     )
@@ -8120,6 +8127,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             true,
             true,
             false,
+            ScopeWants::default(),
         );
         let (export, export_wide) = render_sized(
             &src,
@@ -8134,6 +8142,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             true,
             false,
             false,
+            ScopeWants::default(),
         );
         assert_ne!(preview.histogram, Histogram::default());
         assert_eq!(export.histogram, Histogram::default());
@@ -8382,7 +8391,11 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
         let rt_info = crate::aimask::runtime_info().expect("zero-ORT Native CUDA runtime must initialize");
         println!("runtime: {rt_info:?}");
-        assert_eq!(rt_info.0, "<aurora-native-cuda>");
+        assert!(
+            rt_info.0 == "<aurora-native>" || rt_info.0 == "<aurora-native-cuda>",
+            "unexpected native runtime: {}",
+            rt_info.0
+        );
 
         let session = crate::FaceInputSession::open_from_env(true)
             .expect("FaceInputSession::open_from_env(true) must succeed in zero-ORT mode");
@@ -9605,7 +9618,7 @@ mod develop_gpu_integration_tests {
         adj.noise_reduction.color = 50.0;
 
         // Warm up GPU resident pipeline.
-        let warm = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true);
+        let warm = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
         assert_eq!((warm.width, warm.height), (1920, 1280));
         if !warm.bgra {
             eprintln!("resident GPU path unavailable on this host; skipping latency assertion");
@@ -9617,7 +9630,7 @@ mod develop_gpu_integration_tests {
         for step in 0..20 {
             adj.exposure.exposure = -1.0 + step as f32 * 0.1;
             let t0 = std::time::Instant::now();
-            let out = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true);
+            let out = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
             times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             assert!(out.bgra);
             assert_eq!(out.histogram.red.len(), 256);
@@ -9633,12 +9646,12 @@ mod develop_gpu_integration_tests {
 
         // Also check pure exposure (no NR/USM) 1-kernel fast path.
         let mut fast_adj = AdjustmentSet::default();
-        let _ = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true);
+        let _ = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
         let mut fast_ms = Vec::with_capacity(20);
         for step in 0..20 {
             fast_adj.exposure.exposure = -1.0 + step as f32 * 0.1;
             let t0 = std::time::Instant::now();
-            let out = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true);
+            let out = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
             fast_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             assert!(out.bgra);
         }
@@ -9653,7 +9666,7 @@ mod develop_gpu_integration_tests {
         let (pw, ph) = (512u32, 384u32);
         let small_src = Source::from_rgba(pw, ph, &raw[..(pw * ph * 4) as usize]);
         let gpu_rgba = render(&small_src, &adj, NormRect::FULL, 512, false, None);
-        let gpu_bgra = render_preview_bgra(&small_src, &adj, NormRect::FULL, 512, false, None, true);
+        let gpu_bgra = render_preview_bgra(&small_src, &adj, NormRect::FULL, 512, false, None, true, ScopeWants::default());
         assert!(gpu_bgra.bgra);
         assert_eq!(gpu_rgba.histogram, gpu_bgra.histogram);
         for (a, b) in gpu_rgba.rgba.chunks_exact(4).zip(gpu_bgra.rgba.chunks_exact(4)) {
