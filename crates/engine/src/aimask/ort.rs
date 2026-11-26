@@ -1557,6 +1557,7 @@ impl Runtime {
                 ptr: session,
                 provider,
                 key: key.clone(),
+                model_path: path.to_path_buf(),
                 fallback: Mutex::new(None),
                 profile_active: AtomicBool::new(profile_prefix.is_some()),
                 timing: Mutex::new(SessionTiming {
@@ -1606,6 +1607,19 @@ impl Runtime {
     /// is converted here, so callers do not need a second tensor type. Outputs
     /// are converted back to f32 but keep their dtype for the caller's checks.
     pub(crate) fn run_typed(
+        &self,
+        session: &Session,
+        input: &mut [f32],
+        shape: &[i64],
+    ) -> Result<Vec<OutputPlane>> {
+        #[cfg(windows)]
+        if let Some(planes) = try_run_native_cuda(session, input, shape) {
+            return Ok(planes);
+        }
+        self.run_typed_ort(session, input, shape)
+    }
+
+    fn run_typed_ort(
         &self,
         session: &Session,
         input: &mut [f32],
@@ -2306,10 +2320,130 @@ struct SessionInner {
     ptr: *mut c_void,
     provider: Provider,
     key: SessionKey,
+    model_path: PathBuf,
     /// Human-readable reasons earlier provider choices failed, if any.
     fallback: Mutex<Option<String>>,
     profile_active: AtomicBool,
     timing: Mutex<SessionTiming>,
+}
+
+#[cfg(windows)]
+fn native_infer_enabled() -> bool {
+    match std::env::var("AURORA_NATIVE_INFER") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            !(trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
+#[cfg(windows)]
+fn is_native_verified_model(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    // Strictly limited to models verified deterministic & parity-equivalent
+    // against ORT CPU golden outputs (max_abs_diff <= 2e-4, rel <= 5e-7).
+    matches!(
+        name,
+        "autoRotation.onnx"
+            | "blemishRemoval.onnx"
+            | "skinMasking.onnx"
+            | "subjectMasking.onnx"
+            | "similarity.onnx"
+            | "beautyMarks.onnx"
+            | "dust.onnx"
+            | "EyeDetector.onnx"
+            | "DenseNet121_FP32.onnx"
+            | "1063025060.onnx"
+    )
+}
+
+#[cfg(windows)]
+fn try_run_native_cuda(
+    session: &Session,
+    input: &[f32],
+    shape: &[i64],
+) -> Option<Vec<OutputPlane>> {
+    use aurora_portrait::native_infer::session::NativeCudaSession;
+
+    if !native_infer_enabled()
+        || session.input.element_type != FLOAT
+        || !is_native_verified_model(&session.inner.model_path)
+    {
+        return None;
+    }
+    let shape_usize: Vec<usize> = shape
+        .iter()
+        .map(|&d| usize::try_from(d).ok())
+        .collect::<Option<Vec<_>>>()?;
+
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, Vec<usize>), Arc<NativeCudaSession>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (session.inner.model_path.clone(), shape_usize.clone());
+
+    let native = {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&key).cloned()
+    };
+    let native = match native {
+        Some(s) => s,
+        None => {
+            let bytes = std::fs::read(&session.inner.model_path).ok()?;
+            let mut overrides = HashMap::new();
+            overrides.insert(session.input.name.clone(), shape_usize.clone());
+            match NativeCudaSession::from_bytes(&bytes, &overrides) {
+                Ok(built) => {
+                    let arc = Arc::new(built);
+                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.insert(key, arc.clone());
+                    log::info!(
+                        "NativeCudaSession opened for {} (zero-ORT, arena={:.2} MiB)",
+                        session.inner.model_path.display(),
+                        arc.arena_peak_bytes() as f64 / (1024.0 * 1024.0),
+                    );
+                    arc
+                }
+                Err(err) => {
+                    log::debug!(
+                        "NativeCudaSession unavailable for {}, falling back to ORT: {err}",
+                        session.inner.model_path.display()
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    let mut inputs = HashMap::new();
+    inputs.insert(session.input.name.clone(), (input, shape_usize));
+    let started = std::time::Instant::now();
+    let outputs = match native.run_f32(&inputs) {
+        Ok(o) => o,
+        Err(err) => {
+            log::warn!(
+                "NativeCudaSession run failed for {}, falling back to ORT: {err}",
+                session.inner.model_path.display()
+            );
+            return None;
+        }
+    };
+    let infer_us = started.elapsed().as_micros() as u64;
+    let mut planes = Vec::with_capacity(session.outputs.len());
+    for out_meta in &session.outputs {
+        let (values, dims_u) = outputs.get(&out_meta.name)?;
+        planes.push(OutputPlane {
+            values: values.clone(),
+            dtype: FLOAT,
+            dims: dims_u.iter().map(|&d| d as i64).collect(),
+        });
+    }
+    session.record_run(0, infer_us, 0);
+    Some(planes)
 }
 
 unsafe impl Send for SessionInner {}
@@ -3131,6 +3265,7 @@ mod tests {
                 ptr: ptr::null_mut(),
                 provider: Provider::Cpu,
                 key: key_for(model_len, "CPU", "opt=99"),
+                model_path: PathBuf::new(),
                 fallback: Mutex::new(None),
                 profile_active: AtomicBool::new(false),
                 timing: Mutex::new(SessionTiming::default()),
@@ -3232,19 +3367,22 @@ mod tests {
                 .collect();
             let shape_i64: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
 
-            // 1. Run ORT golden oracle (warmup + best of 3).
+            // 1. Run ORT golden oracle directly (bypassing NativeCudaSession fast path).
             let ort_sess = runtime
                 .open_session(&path)
                 .unwrap_or_else(|e| panic!("ORT open {rel}: {e:#}"));
             let mut ort_in = input_data.clone();
-            let ort_outs = runtime
-                .run(&ort_sess, &mut ort_in, &shape_i64)
-                .unwrap_or_else(|e| panic!("ORT run {rel}: {e:#}"));
+            let ort_outs: Vec<Vec<f32>> = runtime
+                .run_typed_ort(&ort_sess, &mut ort_in, &shape_i64)
+                .unwrap_or_else(|e| panic!("ORT run {rel}: {e:#}"))
+                .into_iter()
+                .map(|p| p.values)
+                .collect();
             let mut ort_best_ms = f64::INFINITY;
             for _ in 0..3 {
                 let mut inp = input_data.clone();
                 let t = Instant::now();
-                let _ = runtime.run(&ort_sess, &mut inp, &shape_i64).unwrap();
+                let _ = runtime.run_typed_ort(&ort_sess, &mut inp, &shape_i64).unwrap();
                 ort_best_ms = ort_best_ms.min(t.elapsed().as_secs_f64() * 1000.0);
             }
 
