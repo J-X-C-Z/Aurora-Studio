@@ -19,7 +19,22 @@ pub(in crate::aurora_raw) use render::{
 };
 pub(crate) use reconstruct::is_verified_he_nef;
 #[cfg(windows)]
-pub(in crate::aurora_raw) use render::recover_and_antialias_frame;
+pub(in crate::aurora_raw) use render::{recover_and_antialias_frame,GenericPostRoute};
+/// The Z6III CUDA PTX text, re-exported so `aurora_raw::prewarm` can JIT it on
+/// the startup thread instead of on the first RAW open.
+#[cfg(windows)]
+pub(in crate::aurora_raw) use reconstruct::cuda_ptx_image as raw_ptx_image;
+
+/// Whether the Z6III reconstruction will consume the caller's LibRaw plane.
+///
+/// [`render_linear_rgba16_oriented_traced`] returns `NotZ6iii` before it reads
+/// the plane for any other body, so this is exactly the predicate that decides
+/// whether copying the sensor plane is useful — and it is the same predicate,
+/// not a second guess at it.
+#[cfg(windows)]
+pub(in crate::aurora_raw) fn uses_libraw_plane(nef: &[u8]) -> bool {
+    reconstruct::is_z6iii_nef(nef)
+}
 
 use anyhow::Result;
 #[cfg(windows)]

@@ -114,6 +114,17 @@ impl Rgba8 {
         }
     }
 
+    fn of_preview(frame: &aurora_engine::PreviewFrame) -> Self {
+        let mut img = Self::of_engine(&frame.image);
+        // BGRA is a storage convention; compare the displayed channels in the same order.
+        if frame.bgra {
+            for pixel in img.pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        img
+    }
+
     fn of_rendered(rendered: &Rendered) -> Self {
         Self {
             width: rendered.width,
@@ -965,19 +976,7 @@ fn wide_export_path_renders_deterministically() {
 // Case 6 (red line): FileEngine Draft must equal Final at the same size
 // ---------------------------------------------------------------------------
 
-/// Roadmap §1 item 2, the engine-level shape of the defect. At this HEAD the
-/// app already routes both qualities through `render_preview`
-/// (`crates/app/src/state/render.rs:990,1111`), but
-/// `FileEngine::render_preview_fast(req, true)` still forwards `fast` to
-/// `process::render_at` (`crates/engine/src/file_engine.rs:3491`), which
-/// renders at `max_size.div_ceil(2)` and bilinearly upsamples
-/// (`crates/engine/src/mock/process.rs:2021,2038`). So a direct engine call
-/// still produces different pixels for the same size and parameters. This
-/// case pins the engine red line; it is enabled by the engine half of
-/// DRAFT-FULL-RES and must not be deleted.
-///
-/// Enable with: `cargo test -p aurora-engine --test quality_parity -- --ignored`
-#[ignore = "待 DRAFT-FULL-RES 引擎侧合入后启用: FileEngine::render_preview_fast(true) 仍是半尺寸渲染后上采样（app 已不走该路径，但 API 仍可复现），Draft != Final 是已知缺陷，不是本骨架的误报"]
+/// A fast/interactive request must not substitute half-resolution pixels at the engine boundary.
 #[test]
 fn file_engine_draft_preview_matches_final_byte_for_byte() {
     let temp = Temp::new("draft-vs-final");
@@ -993,11 +992,6 @@ fn file_engine_draft_preview_matches_final_byte_for_byte() {
     let draft_request = preview_request(image, &adjustments, 256, RenderQuality::Draft, false);
 
     let final_frame = engine.render_preview(&final_request).unwrap();
-    // This is the shape a fast preview takes at the engine boundary
-    // (`crates/engine/src/file_engine.rs:3491` forwards `fast` into
-    // `process::render_at`). The app no longer calls it at this HEAD
-    // (`crates/app/src/state/render.rs:990,1111`), but the engine red line
-    // in `AGENTS.md` covers the API, not just the current call graph.
     let draft_frame = engine.render_preview_fast(&draft_request, true).unwrap();
 
     assert_eq!(
@@ -1007,10 +1001,58 @@ fn file_engine_draft_preview_matches_final_byte_for_byte() {
     );
     assert_parity_u8(
         "FileEngine Draft (fast) vs Final at the same size and parameters",
-        &Rgba8::of_engine(&final_frame.image),
-        &Rgba8::of_engine(&draft_frame.image),
+        &Rgba8::of_preview(&final_frame),
+        &Rgba8::of_preview(&draft_frame),
         0,
     );
+}
+
+/// Exercise the same scoped FileEngine entry points as the viewer on a real RAW.
+/// Only the copy enters the writable catalog. GPU-specific assertions are opt-in.
+#[test]
+#[ignore = "requires AURORA_TEST_RAW pointing to a real full-resolution RAW and its decoder"]
+fn real_raw_scoped_draft_matches_final_display_pixels() {
+    use aurora_engine::{viewer_maps, ScopeWants};
+
+    let raw = PathBuf::from(std::env::var_os("AURORA_TEST_RAW").expect("set AURORA_TEST_RAW"));
+    let temp = Temp::new("scoped-raw");
+    let mut copy = temp.path().join("control");
+    copy.set_extension(raw.extension().expect("RAW extension"));
+    std::fs::copy(&raw, copy).expect("copy fixture to an isolated catalog");
+    let require_bins = std::env::var("AURORA_TEST_REQUIRE_SCOPE_GPU").as_deref() == Ok("1");
+    let engine = FileEngine::open(temp.path()).unwrap();
+    let images = engine.images();
+    assert_eq!(images.len(), 1);
+    let mut previous = None;
+    for (step, ev) in [0.30_f32, 1.1085948].into_iter().enumerate() {
+        let mut adj = AdjustmentSet::default();
+        adj.exposure.exposure = ev;
+        let mut req = preview_request(images[0].id, &adj, 2137, RenderQuality::Draft, false);
+        req.generation = 2 * step as u64 + 1;
+        let d = engine.render_preview_scoped(&req, ScopeWants::WAVEFORM).unwrap();
+        assert_eq!(d.generation, req.generation);
+        req.quality = RenderQuality::Final;
+        req.generation += 1;
+        let f = engine.render_preview_scoped(&req, ScopeWants::WAVEFORM).unwrap();
+        assert_eq!(f.generation, req.generation);
+        let (draft, final_frame) = (Rgba8::of_preview(&d), Rgba8::of_preview(&f));
+        assert_eq!(draft.width.max(draft.height), 2137);
+        assert_eq!(d.histogram, f.histogram, "histograms must describe the same pixels");
+        assert_parity_u8("real RAW full-quality drag vs final", &final_frame, &draft, 0);
+        if let Some(prev) = previous {
+            assert!(final_frame.pixels != prev, "distinct exposures must not reuse stale pixels");
+        }
+        if require_bins {
+            let device = d.scopes.as_ref().expect("a device waveform was explicitly requested");
+            let cpu = viewer_maps(&draft.pixels, draft.width as usize, draft.height as usize, false, ScopeWants::WAVEFORM);
+            assert!(device.sampled() > 0);
+            assert_eq!(device.sampled(), cpu.sampled());
+            assert!(device.wave_bins() == cpu.wave_bins(), "device waveform differs from CPU on displayed pixels");
+            eprintln!("[real-raw-waveform] bins={} sampled={} all equal", device.wave_bins().len(), device.sampled());
+        }
+        eprintln!("[real-raw-preview] ev={ev} size={}x{} compared={} bytes; max_diff=0", draft.width, draft.height, draft.pixels.len());
+        previous = Some(final_frame.pixels);
+    }
 }
 
 // ---------------------------------------------------------------------------

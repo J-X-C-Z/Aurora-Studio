@@ -36,6 +36,13 @@ mod imp {
 
     const PTX: &str = include_str!("../../native/cuda/raw_linear_post.ptx");
 
+    /// The embedded PTX image, for the startup warmup in
+    /// [`crate::aurora_raw::prewarm`]. Same text as the decode path loads, so a
+    /// warmup and a decode share one module in the process CUDA domain.
+    pub(crate) fn ptx_image() -> &'static str {
+        PTX
+    }
+
     const KERNEL_PACK: &str = "pack_rgb3_to_f4_kernel";
     const KERNEL_UNPACK: &str = "unpack_f4_to_rgb3_kernel";
     const KERNEL_HIGHLIGHT: &str = "highlight_recovery_kernel";
@@ -119,7 +126,10 @@ mod imp {
         HighlightParams { p: settings }
     }
 
-    fn launch_pack(
+    /// Device-local `[f32; 3]` -> float4 pack. Crate-visible so the fused
+    /// demosaic -> linear-finish path can pack straight from the demosaic
+    /// kernel's output buffer (see `demosaic_cuda::demosaic_and_finish_*`).
+    pub(crate) fn launch_pack(
         session: &mut BufferSession<'_>,
         src_rgb3: u64,
         dst_f4: u64,
@@ -133,11 +143,11 @@ mod imp {
             &mut dst as *mut u64 as *mut c_void,
             &mut n as *mut i32 as *mut c_void,
         ];
-        session.launch(KERNEL_PACK, grid_1d(total_pixels as u32), BLOCK_1D, &mut args)?;
+        session.launch_from_image(PTX, KERNEL_PACK, grid_1d(total_pixels as u32), BLOCK_1D, &mut args)?;
         Ok(())
     }
 
-    fn launch_unpack(
+    pub(crate) fn launch_unpack(
         session: &mut BufferSession<'_>,
         src_f4: u64,
         dst_rgb3: u64,
@@ -151,13 +161,13 @@ mod imp {
             &mut dst as *mut u64 as *mut c_void,
             &mut n as *mut i32 as *mut c_void,
         ];
-        session.launch(KERNEL_UNPACK, grid_1d(total_pixels as u32), BLOCK_1D, &mut args)?;
+        session.launch_from_image(PTX, KERNEL_UNPACK, grid_1d(total_pixels as u32), BLOCK_1D, &mut args)?;
         Ok(())
     }
 
     /// Runs highlight recovery (`buf_a -> buf_b`) followed by clamped 5x5
     /// anti-aliasing (`buf_b -> buf_a`) entirely in VRAM.
-    fn launch_recover_and_aa_in_place(
+    pub(crate) fn launch_recover_and_aa_in_place(
         session: &mut BufferSession<'_>,
         buf_a: u64,
         buf_b: u64,
@@ -179,7 +189,8 @@ mod imp {
                 &mut n as *mut i32 as *mut c_void,
                 &mut hl_params as *mut HighlightParams as *mut c_void,
             ];
-            session.launch(
+            session.launch_from_image(
+                PTX,
                 KERNEL_HIGHLIGHT,
                 grid_1d(total_pixels as u32),
                 BLOCK_1D,
@@ -209,7 +220,8 @@ mod imp {
                 &mut param_x as *mut f32 as *mut c_void,
                 &mut param_y as *mut f32 as *mut c_void,
             ];
-            session.launch(
+            session.launch_from_image(
+                PTX,
                 KERNEL_AA,
                 grid_2d(width as u32, height as u32),
                 BLOCK_2D,
@@ -221,7 +233,7 @@ mod imp {
 
     /// Runs one full `ColorNoise2012` pass on `buf_a` (reading `buf_a`, ping-ponging
     /// through `buf_b`, writing decoded linear RGB back to `buf_a`) with zero readbacks.
-    fn launch_color_noise_2012_in_place(
+    pub(crate) fn launch_color_noise_2012_in_place(
         session: &mut BufferSession<'_>,
         buf_a: u64,
         buf_b: u64,
@@ -250,7 +262,7 @@ mod imp {
                 &mut dst as *mut u64 as *mut c_void,
                 &mut n as *mut i32 as *mut c_void,
             ];
-            session.launch(KERNEL_CN_ENCODE, g1, BLOCK_1D, &mut args)?;
+            session.launch_from_image(PTX, KERNEL_CN_ENCODE, g1, BLOCK_1D, &mut args)?;
         }
 
         // 2. Stage 1 H (buf_b -> buf_a) & V (buf_a -> buf_b)
@@ -274,7 +286,7 @@ mod imp {
                 &mut dst as *mut u64 as *mut c_void,
                 &mut p1 as *mut ColorNoisePassParams as *mut c_void,
             ];
-            session.launch(KERNEL_CN_PASS_H, g2, BLOCK_2D, &mut args)?;
+            session.launch_from_image(PTX, KERNEL_CN_PASS_H, g2, BLOCK_2D, &mut args)?;
         }
         {
             let mut src = buf_a;
@@ -284,7 +296,7 @@ mod imp {
                 &mut dst as *mut u64 as *mut c_void,
                 &mut p1 as *mut ColorNoisePassParams as *mut c_void,
             ];
-            session.launch(KERNEL_CN_PASS_V, g2, BLOCK_2D, &mut args)?;
+            session.launch_from_image(PTX, KERNEL_CN_PASS_V, g2, BLOCK_2D, &mut args)?;
         }
 
         // 3. Wide-scale stage 2 for ISO >= 400: H (buf_b -> buf_a) & V (buf_a -> buf_b)
@@ -311,7 +323,7 @@ mod imp {
                     &mut dst as *mut u64 as *mut c_void,
                     &mut p2 as *mut ColorNoisePassParams as *mut c_void,
                 ];
-                session.launch(KERNEL_CN_PASS_H, g2, BLOCK_2D, &mut args)?;
+                session.launch_from_image(PTX, KERNEL_CN_PASS_H, g2, BLOCK_2D, &mut args)?;
             }
             {
                 let mut src = buf_a;
@@ -321,7 +333,7 @@ mod imp {
                     &mut dst as *mut u64 as *mut c_void,
                     &mut p2 as *mut ColorNoisePassParams as *mut c_void,
                 ];
-                session.launch(KERNEL_CN_PASS_V, g2, BLOCK_2D, &mut args)?;
+                session.launch_from_image(PTX, KERNEL_CN_PASS_V, g2, BLOCK_2D, &mut args)?;
             }
         }
 
@@ -335,7 +347,7 @@ mod imp {
                 &mut dst as *mut u64 as *mut c_void,
                 &mut n as *mut i32 as *mut c_void,
             ];
-            session.launch(KERNEL_CN_DECODE, g1, BLOCK_1D, &mut args)?;
+            session.launch_from_image(PTX, KERNEL_CN_DECODE, g1, BLOCK_1D, &mut args)?;
         }
         Ok(())
     }
@@ -440,6 +452,44 @@ mod imp {
         .map_err(|e| format!("CUDA color_noise_2012: {e:?}"))
     }
 
+    /// Runs the whole finish chain over buffers already resident in `session`:
+    /// `rgb3 -> pack -> [recovery] -> ColorNoise2012 [x2] -> unpack -> rgb3`.
+    ///
+    /// `rgb3` is both the packed source and the final tightly packed `[f32; 3]`
+    /// output, so a caller that already holds linear RGB in VRAM (the demosaic
+    /// stage) pays no upload and no intermediate download.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_finish_chain(
+        session: &mut BufferSession<'_>,
+        rgb3: u64,
+        buf_a: u64,
+        buf_b: u64,
+        width: i32,
+        height: i32,
+        total_pixels: i32,
+        recovery: Option<(u32, [f32; 3])>,
+        iso: u32,
+        noise: [f32; 2],
+    ) -> Result<(), CudaError> {
+        launch_pack(session, rgb3, buf_a, total_pixels)?;
+        if let Some((black, wb)) = recovery {
+            launch_recover_and_aa_in_place(session, buf_a, buf_b, width, height, black, wb, iso)?;
+        }
+        launch_color_noise_2012_in_place(session, buf_a, buf_b, width, height, iso, noise)?;
+        if iso >= 1600 {
+            launch_color_noise_2012_in_place(
+                session,
+                buf_a,
+                buf_b,
+                width,
+                height,
+                iso,
+                [noise[0] * 1.6, noise[1] * 2.0],
+            )?;
+        }
+        launch_unpack(session, buf_a, rgb3, total_pixels)
+    }
+
     /// One-stop device-resident linear post-processing for generic Bayer and
     /// X-Trans frames in a single H2D + single D2H:
     /// 1. Optional highlight recovery + clamped 5x5 anti-aliasing when
@@ -481,23 +531,7 @@ mod imp {
             let buf_a = session.handle(1);
             let buf_b = session.handle(2);
 
-            launch_pack(session, buf_rgb3, buf_a, n)?;
-            if let Some((black, wb)) = run_recovery {
-                launch_recover_and_aa_in_place(session, buf_a, buf_b, w, h, black, wb, iso)?;
-            }
-            launch_color_noise_2012_in_place(session, buf_a, buf_b, w, h, iso, noise)?;
-            if iso >= 1600 {
-                launch_color_noise_2012_in_place(
-                    session,
-                    buf_a,
-                    buf_b,
-                    w,
-                    h,
-                    iso,
-                    [noise[0] * 1.6, noise[1] * 2.0],
-                )?;
-            }
-            launch_unpack(session, buf_a, buf_rgb3, n)?;
+            launch_finish_chain(session, buf_rgb3, buf_a, buf_b, w, h, n, run_recovery, iso, noise)?;
 
             session.download(0, unsafe { bytes_of_mut(rgb) })?;
             session.mark_consumed();
@@ -508,7 +542,11 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub(crate) use imp::{color_noise_2012_cuda, linear_finish_cuda, recover_and_antialias_cuda};
+pub(crate) use imp::{
+    color_noise_2012_cuda, launch_color_noise_2012_in_place, launch_finish_chain, launch_pack,
+    launch_recover_and_aa_in_place, launch_unpack, linear_finish_cuda,
+    ptx_image as linear_post_ptx_image, recover_and_antialias_cuda,
+};
 
 #[cfg(not(windows))]
 pub(crate) fn recover_and_antialias_cuda(

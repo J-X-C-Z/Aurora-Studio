@@ -91,6 +91,8 @@ pub(crate) mod detail_gpu;
 pub(crate) mod clarity_gpu;
 #[cfg(windows)]
 pub(crate) mod develop_gpu;
+#[cfg(windows)]
+pub(crate) mod scopes_gpu;
 #[cfg(not(windows))]
 pub(crate) mod clarity_gpu {
     use super::clarity;
@@ -404,9 +406,10 @@ impl MockEngine {
                 degraded,
                 gamut_warning,
                 bgra: false,
+                scopes: None,
             });
         }
-        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast, crate::scopes::ScopeWants::default());
         let frame = CachedFrame {
             width: out.width,
             height: out.height,
@@ -426,6 +429,7 @@ impl MockEngine {
             degraded,
             gamut_warning,
             bgra: false,
+            scopes: None,
         })
     }
 

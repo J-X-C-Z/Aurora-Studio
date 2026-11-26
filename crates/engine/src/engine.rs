@@ -140,6 +140,12 @@ pub struct PreviewFrame {
     pub gamut_warning: Option<GamutWarning>,
     /// True when `image.pixels` is already in BGRA byte order for GPUI display.
     pub bgra: bool,
+    /// Viewer scope counts taken from exactly these pixels on the device, when
+    /// the request asked for them and the render could promise that the pixels
+    /// are the displayed ones. `None` otherwise — CPU-only path, ICC/soft-proof
+    /// conversion, a cached frame, a post-8-bit stage or an unsupported kind —
+    /// and the caller then counts the scopes itself, as before.
+    pub scopes: Option<crate::scopes::ScopeMaps>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -383,7 +389,33 @@ pub struct EngineCapabilities {
     pub export_formats: Vec<ExportFormat>,
 }
 
+/// Two actual executions of a generated three-operator graph, not an installed-model score.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceProbe {
+    pub requested: String,
+    pub executed: String,
+    pub adapter: Option<String>,
+    pub first_us: u64,
+    pub warm_us: u64,
+    pub earlier_failures: Vec<String>,
+}
+
+impl InferenceProbe {
+    pub fn run(backend: &str) -> Result<Self, String> {
+        let req: aurora_portrait::native_infer::backend::BackendRequest = backend.parse()?;
+        let r = aurora_portrait::native_infer::selfcheck::run(req)?;
+        Ok(Self { requested: req.label().into(), executed: r.actual.label().into(), adapter:r.adapter, first_us: r.first_us,
+            warm_us: r.warm_us, earlier_failures: r.prior.into_iter().map(|(k,e)| format!("{}: {e}", k.label())).collect() })
+    }
+}
+
 pub trait ImageEngine: Send + Sync + 'static {
+    /// Opt-in diagnostic. Call off the UI thread; no user photos, private assets, or ORT are required.
+    fn check_inference_device(&self, backend: &str) -> Result<InferenceProbe, String> { InferenceProbe::run(backend) }
+
+    /// A folder-backed host can supply its sorted/filtered next RAW paths. Demo engines have nothing to prefetch.
+    fn prefetch_visible_neighbors(&self, _targets:Vec<PathBuf>) {}
+
     /// Human-readable engine name and version, shown in About.
     fn name(&self) -> String;
 
@@ -748,10 +780,24 @@ pub trait ImageEngine: Send + Sync + 'static {
         Ok(with_display_profile(img, proof_profile, display_profile, levels, crate::icc::Rendering::default()).0)
     }
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame>;
-    /// [`Self::render_preview`] with an explicit quality switch. `fast` renders at
-    /// half resolution and upsamples, for the frames issued while a slider is
-    /// dragged; `false` is exactly `render_preview`. Engines that cannot go
-    /// faster ignore the flag.
+    /// [`Self::render_preview`] that also asks for viewer scope counts of the
+    /// returned pixels.
+    ///
+    /// The counts are only filled when the engine can prove they were taken
+    /// from the very pixels in `frame.image`; otherwise `frame.scopes` stays
+    /// `None` and the caller counts on the CPU. This default keeps every engine
+    /// without a device path on that fallback.
+    fn render_preview_scoped(
+        &self,
+        request: &PreviewRequest,
+        _scopes: crate::scopes::ScopeWants,
+    ) -> anyhow::Result<PreviewFrame> {
+        let mut frame = self.render_preview(request)?;
+        frame.scopes = None;
+        Ok(frame)
+    }
+    /// Legacy interactive hint. Both settings preserve the exact sampling grid,
+    /// processing stages and visible pixels of `render_preview`.
     fn render_preview_fast(&self, request: &PreviewRequest, _fast: bool) -> anyhow::Result<PreviewFrame> {
         self.render_preview(request)
     }

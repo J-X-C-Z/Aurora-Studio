@@ -203,6 +203,13 @@ pub enum Op {
     HardSwish,
     HardSigmoid { alpha: f32, beta: f32 },
     Erf,
+    /// Exact-erf `0.5 * x * (1 + erf(x / sqrt 2))`, produced by
+    /// [`crate::native_infer::fuse`] from the expanded ONNX decomposition.
+    /// Executed as `UnaryOp::Gelu` (kernel id 3) in `infer_elem_norm.cu`.
+    Gelu,
+    /// `x * sigmoid(x)`, produced by [`crate::native_infer::fuse`] from
+    /// `Sigmoid` + `Mul`. Executed as `UnaryOp::SiLU` (kernel id 2).
+    SiLU,
     Clip,
     Softmax { axis: i64 },
 
@@ -273,6 +280,8 @@ impl Op {
             Self::Sigmoid => "Sigmoid",
             Self::HardSwish => "HardSwish",
             Self::HardSigmoid { .. } => "HardSigmoid",
+            Self::Gelu => "Gelu",
+            Self::SiLU => "SiLU",
             Self::Erf => "Erf",
             Self::Clip => "Clip",
             Self::Softmax { .. } => "Softmax",
@@ -620,6 +629,24 @@ impl IrGraph {
         &mut self,
         input_overrides: &HashMap<String, Vec<usize>>,
     ) -> Result<usize, GraphError> {
+        self.infer_shapes_with_constants(input_overrides, &HashMap::new())
+    }
+
+    /// [`Self::infer_shapes`] with a caller-supplied integer constant seed.
+    ///
+    /// The per-op rules only fold a size operand that they can see as a literal:
+    /// `Shape -> Slice -> Concat -> Where -> Reshape` chains therefore leave the
+    /// consumer dynamic even when every value in the chain is known. A caller
+    /// that has already evaluated those chains on the CPU ([`CpuShapeEvaluator`])
+    /// passes the results here, and the ordinary rules then resolve the consumer
+    /// exactly as they would for a literal.
+    ///
+    /// [`CpuShapeEvaluator`]: super::cpu_shape_eval::CpuShapeEvaluator
+    pub fn infer_shapes_with_constants(
+        &mut self,
+        input_overrides: &HashMap<String, Vec<usize>>,
+        constant_seed: &HashMap<TensorId, Vec<i64>>,
+    ) -> Result<usize, GraphError> {
         // Apply user-specified input overrides.
         for (name, dims) in input_overrides {
             if let Some(&id) = self.name_to_id.get(name) {
@@ -636,6 +663,9 @@ impl IrGraph {
                     const_i64.insert(id, vals);
                 }
             }
+        }
+        for (id, values) in constant_seed {
+            const_i64.entry(*id).or_insert_with(|| values.clone());
         }
 
         for node_idx in 0..self.nodes.len() {
@@ -679,6 +709,8 @@ impl IrGraph {
                 | Op::Sigmoid
                 | Op::HardSwish
                 | Op::HardSigmoid { .. }
+                | Op::Gelu
+                | Op::SiLU
                 | Op::Erf
                 | Op::Clip
                 | Op::Sqrt

@@ -51,7 +51,7 @@ pub use library::LibraryState;
 pub use scopes::ScopeKind;
 pub use nodes::{GraphExt, NewNode, add_shape, flattened, flattened_checked, is_full};
 pub mod open {
-    pub use super::source::{demo, display_name, is_catalog, open};
+    pub use super::source::{demo, display_name, is_catalog, open, requests};
 }
 
 use crate::i18n::t;
@@ -626,7 +626,9 @@ impl AppState {
                 ..Default::default()
             },
         ];
-        let camera_settings = engine.camera_settings();
+        // The existing asynchronous probe populates settings. Opening a photo
+        // library must never synchronously create a WIA device on the UI thread.
+        let camera_settings = None;
         let engine_name = engine.name();
         let capabilities = crate::planned::capabilities(engine.as_ref());
         let mut this = Self {
@@ -763,6 +765,7 @@ impl AppState {
         if self.library.current != Some(id) {
             self.end_gesture(cx);
             self.library.current = Some(id);
+            self.prefetch_raw_neighbors(id);
             self.preview_state.thumb_queue.prioritize(id);
             self.editor.active_layer = None;
             self.editor.active_node = None;
@@ -777,6 +780,25 @@ impl AppState {
             self.request_render(RenderQuality::Final, cx);
         }
         cx.notify();
+    }
+
+    /// Warms the RAW decodes of the images around `id` in visible order.
+    ///
+    /// This is the switch-time half of the RAW first-load work: the current
+    /// image is decoded by the normal preview request, and the neighbours the
+    /// arrow keys reach next are decoded on the engine's single prefetch worker
+    /// (`aurora_engine::aurora_raw::prefetch`). It writes the same cache entry
+    /// the preview then reads (`raw_cache::PREVIEW_LONG_SIDE`), stays inside the
+    /// existing cache budgets, changes no pixels, and a faster switch cancels
+    /// whatever has not started.
+    fn prefetch_raw_neighbors(&self, id: ImageId) {
+        use aurora_engine::aurora_raw::prefetch as pf;
+        if !pf::prefetch_enabled(){self.engine.prefetch_visible_neighbors(Vec::new());return;}
+        let visible=self.visible_images();
+        let targets=visible.iter().position(|i|i.id==id).map(|idx|
+            pf::neighbor_paths_by(idx,&visible,&pf::DEFAULT_OFFSETS,|i|i.path.as_path())
+        ).unwrap_or_default();
+        self.engine.prefetch_visible_neighbors(targets);
     }
 
     /// The images multiple view shows, the pinned compare variant first; empty
@@ -1250,19 +1272,29 @@ impl AppState {
         }
     }
 
-    /// Flushes queued saves (bounded) and quits. The UI may block for up to the
-    /// timeout at close; a failure is logged and shown so unsaved work is not
-    /// silently dropped.
-    pub fn flush_and_quit(&mut self, cx: &mut Context<Self>) {
-        if let Some(report) =
-            self.engine.flush_pending_saves(std::time::Duration::from_secs(2))
+    /// The title-bar close and the keyboard/menu quit must drain the *current*
+    /// library's edits, including an in-flight slider gesture. Keep the window
+    /// alive on failure so the user can read the notice and retry.
+    pub fn prepare_to_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.end_gesture(cx);
+        if let Some(report) = self.engine.flush_pending_saves(std::time::Duration::from_secs(2))
+            && let Some(message) = flush_report_notice(&report)
         {
-            if let Some(message) = flush_report_notice(&report) {
-                log::warn!("{message}");
-                self.notify(message, cx);
-            }
+            log::warn!("{message}");
+            self.notify(message, cx);
+            return false;
         }
-        cx.quit();
+        if self.tasks.jobs.iter().any(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running { .. })
+            && matches!(self.engine.job_status(j.id), JobStatus::Queued | JobStatus::Running { .. })) {
+            self.notify(t("Exports are still running. Finish or cancel them in Batch before closing.", "仍有照片正在导出，请在「批处理」中等待完成或取消，再关闭。"), cx);
+            return false;
+        }
+        aurora_engine::aurora_raw::prefetch::cancel_pending();
+        true
+    }
+
+    pub fn flush_and_quit(&mut self, cx: &mut Context<Self>) {
+        if self.prepare_to_close(cx) { cx.quit(); }
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
@@ -1965,6 +1997,10 @@ impl AppState {
     }
 }
 
+/// The active folder in this process. Replaced when Welcome opens the real workspace.
+pub(crate) struct ActiveLibrary(pub gpui_kit::WeakEntity<AppState>);
+impl gpui_kit::Global for ActiveLibrary {}
+
 pub fn init_state(engine: Arc<dyn ImageEngine>, source: Source, cx: &mut App) -> Entity<AppState> {
     let mut settings = Settings::load();
     if let Some(path) = source.path() {
@@ -1978,7 +2014,9 @@ pub fn init_state(engine: Arc<dyn ImageEngine>, source: Source, cx: &mut App) ->
         crate::theme::set_accent(accent, cx);
     }
     crate::actions::bind_keys(cx, &settings.shortcuts);
-    cx.new(|cx| AppState::new(engine, source, settings, cx))
+    let state = cx.new(|cx| AppState::new(engine, source, settings, cx));
+    cx.set_global(ActiveLibrary(state.downgrade()));
+    state
 }
 
 impl AppState {

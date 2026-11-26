@@ -112,3 +112,98 @@ File: `crates/engine/src/batch.rs`
 - New batch-registry unit test added: yes.
 - GPU preflight refactor: static call-order review completed.
 - `cargo fmt`, `cargo check`, `cargo test`, Windows Release build and RTX benchmark: not run in this environment. No measured speedup is claimed.
+
+## Follow-up implementation: bounded three-stage batch export pipeline
+
+### Where a batch export really runs
+
+- GPUI batch entry: `crates/app/src/state/mod.rs` `AppState::process` calls
+  `ImageEngine::start_export` once per selected image x enabled recipe (on the UI
+  thread) and `poll_jobs` polls `job_status` every 120 ms. `crates/engine/src/batch.rs`
+  is a separate sequential driver and is not on the app path.
+- Admission and memory budget: `ExportScheduler` in `crates/engine/src/file_engine.rs`
+  (slot limit, byte budget derived from installed/available RAM, FIFO ticket queue,
+  `acquire_cancellable`).
+- Codec and publishing: `ExportService::start_export` in
+  `crates/engine/src/file_engine_services.rs`, writing through
+  `crate::output::StagedExport` and publishing under `publish_gate`.
+
+### What changed
+
+Files: `crates/engine/src/export/pipeline.rs` (new),
+`crates/engine/src/export/stages.rs` (new), `crates/engine/src/export/mod.rs`,
+`crates/engine/src/file_engine_services.rs` (export worker body only),
+`crates/engine/src/file_engine.rs` (`estimated_export_bytes` visibility).
+
+- The standard export chain is split into three stages with a single
+  implementation: `stages::acquire_source` (the deferred full-resolution decode),
+  `stages::render_frame` (`process::render` / `render16`, same arguments),
+  `stages::encode_and_publish` (`recipe::write_export(16)` into
+  `output::StagedExport` plus `stages::publish_staged`, which keeps the
+  `gate -> maps -> registry` order, the cancel check, the supersede check and the
+  output map).
+- `pipeline::Pipeline` runs those stages on one render lane (GPU) and two encode
+  lanes connected by `BoundedQueue`s capped by item count **and** bytes (4 items /
+  1 GiB per stage by default). A full queue blocks its producer (backpressure); an
+  empty queue always admits, so a frame larger than the whole cap still progresses
+  instead of deadlocking. The byte cap bounds what is *queued*; a frame already
+  held by a stage is charged by the export scheduler's admission budget, which is
+  the same accounting a serial batch had.
+- Per-item cancel tokens are polled at every stage boundary and wake a blocked
+  producer within 5 ms. A cancelled or failed item never reaches the encode lane,
+  so no staging folder and no partial file is created for it.
+- The Z6III exact export stays fused and inline (RAW scope untouched) and publishes
+  through the same `publish_staged`.
+- Switches: `AURORA_EXPORT_PIPELINE=serial|0` runs the same stage functions inline
+  (A/B and the byte-identity regression), `AURORA_EXPORT_RENDER_LANES`,
+  `AURORA_EXPORT_ENCODE_LANES` set the lane counts.
+
+Byte identity is structural: serial and pipelined modes call the same three
+functions, so `export::stages::tests::pipelined_and_serial_exports_publish_identical_bytes`
+compares published file names and file bytes rather than pixels. The regression
+generates its own 48x32 gradient PNGs with the `image` crate; no external fixture.
+
+### Known limits of this change
+
+- Native RAW full-size decode and the Z6III exact path still run where they ran
+  before (submitting thread / inline). Stage 1 carries the deferred
+  full-resolution raster decode, not the RAW decoder; changing the RAW path was out
+  of scope.
+- The pipeline does not replace `ExportScheduler`; a job still holds one admission
+  permit for its whole chain, so peak memory stays what the budget already allowed.
+  What changes is that a job no longer serialises its own decode/render/encode.
+- Renders are serialised on one lane. `mock::process::render` is already
+  rayon-parallel per frame and two concurrent GPU develops contend for one device,
+  so this is the intended shape; `AURORA_EXPORT_RENDER_LANES=2` restores the old
+  two-renders-at-once behaviour for an A/B comparison.
+- No Windows Release benchmark numbers are claimed here; the numbers must come from
+  the owner machine (see `CONTRIBUTING.md`). `export::stages::pipeline_stats()`
+  exposes per-stage item counts, queue peak bytes and blocked-push counts for that
+  measurement.
+
+### Validation status of the export pipeline
+
+Run by this lane in a detached worktree of the same baseline commit, with an
+isolated `CARGO_TARGET_DIR` so the shared build directory stayed untouched:
+
+```powershell
+cargo check -p aurora-engine --lib --tests --locked
+cargo check -p aurora-engine --lib --features z6iii-raw-export --locked
+cargo test  -p aurora-engine --lib --locked export:: -- --test-threads=1
+cargo test  -p aurora-engine --locked --test export_faults_bo4 -- --test-threads=1
+```
+
+- `export::` unit tests: 26 passed, 0 failed (10 of them new: 6 pipeline
+  executor, 4 stage/engine regressions).
+- `export_faults_bo4`: 4 passed, 0 failed (cancel keeps existing bytes, duplicate
+  names, read-only store, failed writes).
+- Both feature configurations type-check; no new warnings in the touched files.
+
+Indicative A/B on 8 synthetic 1600x1200 PNGs, dev profile, one machine, CPU develop
+path: inline 3942 ms -> pipelined 2247 ms (1.75x). Peak queued bytes 46 MB / 11 MB,
+no blocked pushes at that frame size. This is a shape check, not the Windows
+Release 24 MP RAW number the owner machine still has to produce.
+
+Not verified here: `cargo test --workspace`, the Windows Release build, `cargo build
+-p portrait-app --release`, and any real-camera RAW batch. The app crate was not
+compiled by this lane because other lanes had in-progress edits in the same tree.

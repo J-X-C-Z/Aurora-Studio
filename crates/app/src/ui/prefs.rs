@@ -46,6 +46,9 @@ pub struct PrefsView {
     page: usize,
     /// Shortcut id waiting for a key press.
     recording: Option<String>,
+    probe_target: &'static str,
+    probing: bool,
+    probe_result: Option<Result<aurora_engine::InferenceProbe,String>>,
     query: String,
     focus: FocusHandle,
 }
@@ -216,6 +219,40 @@ fn note(text: &'static str, cx: &App) -> AnyElement {
 }
 
 impl PrefsView {
+    fn start_probe(&mut self, cx: &mut Context<Self>) {
+        if self.probing { return; }
+        self.probing=true; self.probe_result=None; cx.notify();
+        let backend=self.probe_target;
+        let engine=self.state.read(cx).engine.clone();
+        cx.spawn(async move |this,cx| {
+            let result=cx.background_spawn(async move { engine.check_inference_device(backend) }).await;
+            let _=this.update(cx, |v,cx| { v.probing=false; if v.probe_target==backend {v.probe_result=Some(result);} cx.notify(); });
+        }).detach();
+    }
+
+    fn inference_check(&self, cx: &mut Context<Self>) -> AnyElement {
+        let this=cx.entity(); let p=pal(cx).clone();
+        let actual=match &self.probe_result {
+            Some(Ok(r))=>{
+                let mut text=format!("{} {}  ·  {} {:.2} ms  ·  {} {:.2} ms",t("Verified on", "实际执行"),r.executed.to_uppercase(),t("First run", "首次"),r.first_us as f64/1000.,t("Warm", "热运行"),r.warm_us as f64/1000.);
+                if let Some(a)=&r.adapter {text.push_str(&format!("  ·  {a}"));}
+                if !r.earlier_failures.is_empty() { text.push_str(&format!("  ·  {}: {}",t("Earlier attempts", "先前尝试"),r.earlier_failures.join("; "))); }
+                text
+            }
+            Some(Err(e))=>format!("{}：{}", t("Not verified", "未通过"),e),
+            None if self.probing=>t("Checking two sets of known outputs…", "正在核对两组已知输出…").into(),
+            None=>t("No check run yet.", "尚未检测。").into(),
+        };
+        let production=std::env::var("AURORA_GPU_BACKEND").unwrap_or_else(|_|"auto".into());
+        v_flex().gap_1().child(caption(t("Inference device check", "推理设备检测"),cx))
+            .child(div().px_3().text_xs().text_color(p.text_muted).child(format!("{}: {}",t("Application request", "应用请求"),production)))
+            .child(h_flex().px_3().gap_2().child(select("pref-inference-device",vec![("auto", t("Automatic","自动").into()),("cuda","NVIDIA CUDA".into()),("dx12","AMD / Intel DX12".into()),("metal","Apple Metal".into()),("opencl","OpenCL".into()),("cpu","CPU".into())],self.probe_target,move |k,_,cx| {
+                this.update(cx,|v,cx|{ if !v.probing {v.probe_target=k;v.probe_result=None;cx.notify();} });
+            })).child(Button::new("pref-run-device-check").small().outline().label(t("Run check","运行检测")).on_click(cx.listener(|v,_,_,cx|v.start_probe(cx)))))
+            .child(div().px_3().text_xs().text_color(p.text).child(actual))
+            .child(note(t("Tests this device on a tiny known graph. No photos or downloaded models are used; full model compatibility is separate.","仅测试所选设备，不更改应用配置；不用照片或外部模型。通过小图检测不代表通过完整模型验收。"),cx)).into_any_element()
+    }
+
     fn general(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let s = self.state.read(cx).prefs.settings.clone();
         let this = cx.entity();
@@ -241,15 +278,7 @@ impl PrefsView {
                 t2.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.undo_levels = v.round() as usize))
             }))
             .child(note(t("Per image; older steps are dropped first.", "按图像计；超出后最早的步骤先被丢弃。"), cx))
-            .child(caption(t("Backend roadmap", "后端路线图"), cx))
-            .child(note(
-                t(
-                    "Metal: roadmap only — no Metal backend and no on-device verification. GPU inference currently uses the Windows CUDA/DirectML path; everything else runs on CPU.",
-                    "Metal：仅为路线图——没有 Metal 后端，也没有真机验证。当前 GPU 推理走 Windows 的 CUDA/DirectML 路径，其余仍由 CPU 处理。",
-                ),
-                cx,
-            ))
-            .child(note(crate::contract::METAL.note().unwrap_or_default(), cx))
+            .child(self.inference_check(cx))
             .child(caption(t("Capture & Output", "拍摄与输出"), cx))
             .child(switch_row("pref-newcap", t("Select each new capture", "自动选中新拍摄的图像"), s.select_new_capture, move |v, _, cx| {
                 t3.update(cx, |p, cx| p.edit(cx, |s| s.prefs.settings.select_new_capture = v))
@@ -769,12 +798,12 @@ impl PrefsView {
 }
 
 pub fn open(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
-    let view = cx.new(|cx| PrefsView { state: state.clone(), page: 0, recording: None, query: String::new(), focus: cx.focus_handle() });
+    let view = cx.new(|cx| PrefsView { state: state.clone(), page: 0, recording: None, probe_target: "auto", probing: false, probe_result: None, query: String::new(), focus: cx.focus_handle() });
     window.open_dialog(cx, move |dialog, _, _| dialog.title(t("Preferences", "首选项")).w(px(820.0)).child(view.clone()));
 }
 
 /// Opens Preferences on the keyboard page.
 pub fn open_shortcuts(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
-    let view = cx.new(|cx| PrefsView { state: state.clone(), page: PAGES.len() - 1, recording: None, query: String::new(), focus: cx.focus_handle() });
+    let view = cx.new(|cx| PrefsView { state: state.clone(), page: PAGES.len() - 1, recording: None, probe_target: "auto", probing: false, probe_result: None, query: String::new(), focus: cx.focus_handle() });
     window.open_dialog(cx, move |dialog, _, _| dialog.title(t("Preferences", "首选项")).w(px(820.0)).child(view.clone()));
 }

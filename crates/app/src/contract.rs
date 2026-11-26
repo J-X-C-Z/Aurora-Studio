@@ -125,11 +125,10 @@ mod format_tests {
 pub const SOFT_PROOF: Status = Status::Partial("Proofs through the chosen ICC profile; a missing profile falls back with no gamut warning", "按所选 ICC 配置文件校样；缺配置文件时回退且不提示色域");
 /// Lens blur: stored with the variant; the engine has no depth map or blur yet.
 pub const LENS_BLUR: Status = Status::Pending("Saved with the variant; the engine has no depth estimation or lens blur yet", "随变体保存，引擎尚无景深估计与镜头模糊");
-/// Apple-Silicon GPU path: roadmap only. No backend, no on-device run, no
-/// measurement exists, so nothing may be presented as verified.
-pub const METAL: Status = Status::Missing(
-    "Roadmap only: no Metal backend and no on-device verification; inference is CPU or the Windows CUDA/DirectML path",
-    "仅为路线图：尚无 Metal 后端，也没有真机验证；推理走 CPU 或 Windows 的 CUDA/DirectML",
+/// A real Apple-device verdict is per model; neither a compiled adapter nor a roadmap proves it.
+pub const METAL: Status = Status::Pending(
+    "Apple GPU model verification is pending. Use Preferences > General for a local device check.",
+    "Apple GPU 的完整模型验收尚未完成。可在偏好设置的常规页检测本机设备。",
 );
 
 /// The unit suffix a slider shows for a `ParamMeta::unit`.

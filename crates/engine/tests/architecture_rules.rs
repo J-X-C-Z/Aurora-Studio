@@ -569,6 +569,16 @@ fn arch_rule4_contracts_are_backend_neutral() {
 /// Exact set of `crates/*/src` files that embed CUDA PTX. Adding a new backend
 /// file requires updating this list on purpose.
 const CUDA_PTX_FILES: &[&str] = &[
+    // Resident renderer import is gated alongside its Windows driver module.
+    "crates/engine/src/mock/scopes_gpu.rs",
+    // RAW and native operator backends: Windows driver or per-module stub.
+    "crates/engine/src/aurora_raw/demosaic_cuda.rs",
+    "crates/engine/src/aurora_raw/linear_post_cuda.rs",
+    "crates/engine/src/aurora_raw/z6iii/reconstruct/c1_cuda_pipeline.rs",
+    "crates/portrait/src/native_infer/ops_conv_gemm.rs",
+    "crates/portrait/src/native_infer/ops_elem_norm.rs",
+    "crates/portrait/src/native_infer/ops_quant.rs",
+    "crates/portrait/src/native_infer/ops_spatial_tensor.rs",
     "crates/engine/src/blemish_gainmap_cuda.rs",
     "crates/engine/src/mock/clarity_gpu.rs",
     "crates/engine/src/mock/detail_gpu.rs",
@@ -671,7 +681,7 @@ fn arch_rule5_cuda_ptx_includes_are_platform_gated() {
             root.join("crates/portrait/src")
         };
         let src = fs::read_to_string(path).unwrap_or_default();
-        let in_file_gate = src.contains("#[cfg(windows)]")
+        let in_file_gate = src.contains("#[cfg(windows)]") || src.contains("#![cfg(windows)]")
             || src.contains("cfg(target_os = \"windows\")");
         let module_gate = is_module_gated(&crate_src, path);
         let documented = NON_WINDOWS_ADAPTER_EXCEPTIONS

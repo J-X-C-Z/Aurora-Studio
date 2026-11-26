@@ -7,6 +7,21 @@ exclude = ["work/**", "testdata/**", "examples/**", "scripts/**"]
 
 [dependencies]
 
+# The DX12 compute backend (src/dx12.rs) binds D3D12/DXGI/D3DCompiler directly;
+# the pinned version is the one already in Cargo.lock for other workspace crates,
+# and no redistributable binary is added: d3d12.dll/dxgi.dll/d3dcompiler_47.dll
+# ship with Windows 10/11.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 serde_json.workspace = true
 

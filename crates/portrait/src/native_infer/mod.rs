@@ -1,15 +1,24 @@
 //! Aurora Native Inference Engine — Phase 1 Pure-Rust Foundation.
 //!
 //! Zero-external-dependency ONNX graph loader, strongly-typed IR, static shape
-//! inference, `Conv + BatchNormalization` weight folding, and liveness-based
-//! VRAM Memory Arena Planner.
+//! inference, `Conv + BatchNormalization` weight folding, static graph fusion
+//! (`fuse.rs`: GELU / SiLU / `Conv + activation`, alias and dead-node removal),
+//! and liveness-based VRAM Memory Arena Planner.
 //!
 //! Designed to replace `onnxruntime*.dll` (~213 MB) together with Phase 2
 //! custom CUDA operator kernels.
 
 pub mod arena;
+pub mod backend;
+pub mod cpu_session;
+pub mod dispatch;
+#[cfg(windows)]
+pub mod dx12_session;
+pub mod metal_session;
 pub mod bn_fold;
 pub mod cpu_shape_eval;
+pub mod cuda_graph;
+pub mod fuse;
 pub mod graph;
 pub mod onnx_proto;
 pub mod ops_conv_gemm;
@@ -17,14 +26,18 @@ pub mod ops_elem_norm;
 pub mod ops_quant;
 pub mod ops_spatial_tensor;
 pub mod session;
+pub mod selfcheck;
 
 use std::collections::HashMap;
 use std::fmt;
 
 use arena::{plan_memory_arena, ArenaPlan, CUDA_DEFAULT_ALIGNMENT};
 use bn_fold::{fold_batch_norms, BnFoldStats};
-use graph::{GraphError, IrGraph};
+use cpu_shape_eval::CpuShapeEvaluator;
+use fuse::{finalize_graph, fuse_activations, FuseConfig, FuseStats};
+use graph::{GraphError, IrGraph, NodeId, TensorId};
 use onnx_proto::{decode_model, ProtoError};
+use ops_conv_gemm::FusedActivation;
 
 #[derive(Debug)]
 pub enum NativeInferError {
@@ -60,28 +73,150 @@ impl From<GraphError> for NativeInferError {
 pub struct CompiledPlan {
     pub graph: IrGraph,
     pub bn_stats: BnFoldStats,
+    /// Graph-rewrite statistics (`fuse.rs`); all-zero when fusion is off.
+    pub fuse_stats: FuseStats,
     pub resolved_shapes: usize,
     pub arena: ArenaPlan,
+    /// `Conv` node id (already re-indexed into `graph`) -> epilogue activation the
+    /// convolution kernel must apply to its output. Populated only when
+    /// [`FuseLevel::Full`](fuse::FuseLevel::Full) folded `Conv + Relu/SiLU`;
+    /// empty otherwise, so the executor keeps using `FusedActivation::None`.
+    pub conv_activations: HashMap<NodeId, FusedActivation>,
+}
+
+/// Round trips allowed between the per-op shape rules and the CPU shape
+/// subgraph evaluator.
+///
+/// Each round can unlock the next `Reshape` / `Expand` / `Resize` whose size
+/// operand only becomes a constant once an earlier chain resolved, so one round
+/// is not enough for a ViT that builds its `[batch, tokens, dim]` shape from
+/// `Shape -> Gather -> Concat -> Where`.
+const SHAPE_RESOLVE_ROUNDS: usize = 4;
+
+/// Folds the shapes the CPU shape-subgraph evaluator can prove back into the IR.
+///
+/// `infer_shapes` derives each tensor from the op it is produced by, which stops
+/// at the first node that needs a *value* rather than a shape (a `Where` between
+/// two size constants, a `Slice` of a `Shape`, a `Concat` of the two). Those
+/// chains are exactly how the shipped ViT/FPN models build their reshape
+/// targets, so half of `subjectMasking` and `MatchLookColor` stayed dynamic:
+/// every intermediate then missed the arena and was allocated per run, which
+/// also kept CUDA Graph capture off.
+///
+/// [`CpuShapeEvaluator`] already evaluates those chains symbolically (it is what
+/// the executor uses for the same nodes at run time). Running it once per round,
+/// writing the resolved shapes back and re-propagating is enough to make those
+/// tensors static. Only unknown dimensions are filled in — a declared dim is
+/// never overwritten — so this cannot move a shape that the model stated itself.
+fn resolve_shapes_from_subgraphs(graph: &mut IrGraph, input_overrides: &HashMap<String, Vec<usize>>) -> usize {
+    let mut resolved = 0usize;
+    for _ in 0..SHAPE_RESOLVE_ROUNDS {
+        let mut evaluator = CpuShapeEvaluator::from_graph(graph, &HashMap::new());
+        evaluator.eval_graph(graph);
+        // Hand the folded size values to the per-op rules: `Reshape`, `Expand`,
+        // `Resize` and `Split` propagate their shape (and dtype) from an integer
+        // operand as long as it is a known constant, and the evaluator has just
+        // turned those operands into ones.
+        let mut seed: HashMap<TensorId, Vec<i64>> = HashMap::new();
+        for info in &graph.tensors {
+            let Some(tensor) = evaluator.get_tensor(info.id) else {
+                continue;
+            };
+            if !matches!(
+                tensor.data.dtype(),
+                onnx_proto::DataType::Int64 | onnx_proto::DataType::Int32
+            ) {
+                continue;
+            }
+            let values = tensor.to_i64_vec();
+            if values.len() <= 64 {
+                seed.insert(info.id, values);
+            }
+        }
+        let mut changed = 0usize;
+        for info in graph.tensors.iter_mut() {
+            if info.is_weight || info.is_graph_input || info.is_graph_output {
+                continue;
+            }
+            if info.shape.as_ref().is_some_and(|dims| dims.iter().all(|d| d.is_some())) {
+                continue;
+            }
+            let Some(shape) = evaluator.get_shape(info.id) else {
+                continue;
+            };
+            if info.static_shape().as_deref() == Some(shape) {
+                continue;
+            }
+            info.shape = Some(shape.iter().map(|&dim| Some(dim)).collect());
+            if info.dtype == onnx_proto::DataType::Undefined
+                && let Some(tensor) = evaluator.get_tensor(info.id)
+            {
+                info.dtype = tensor.data.dtype();
+            }
+            changed += 1;
+        }
+        if changed == 0 && seed.is_empty() {
+            break;
+        }
+        resolved += changed;
+        let _ = graph.infer_shapes_with_constants(input_overrides, &seed);
+    }
+    resolved
 }
 
 /// Decode an `.onnx` buffer, build the strongly-typed IR, fold BatchNorms,
+/// apply the graph-optimization passes selected by [`fuse::ENV_FUSE`],
 /// validate topology, infer static shapes, and plan the VRAM arena.
 pub fn load_and_plan(
     onnx_bytes: &[u8],
     input_overrides: &HashMap<String, Vec<usize>>,
+) -> Result<CompiledPlan, NativeInferError> {
+    load_and_plan_with_fuse(onnx_bytes, input_overrides, FuseConfig::from_env())
+}
+
+/// Keep CUDA-only epilogues out of backends that execute the source IR. The portable
+/// graph still folds BatchNorm; an optional CUDA flag cannot delete a Relu on another device.
+pub(super) fn load_and_plan_portable(onnx_bytes: &[u8], overrides: &HashMap<String, Vec<usize>>) -> Result<CompiledPlan, NativeInferError> {
+    load_and_plan_with_fuse(onnx_bytes, overrides, FuseConfig::OFF)
+}
+
+/// [`load_and_plan`] with an explicit fusion configuration (A/B testing, tests).
+pub fn load_and_plan_with_fuse(
+    onnx_bytes: &[u8],
+    input_overrides: &HashMap<String, Vec<usize>>,
+    fuse_config: FuseConfig,
 ) -> Result<CompiledPlan, NativeInferError> {
     let model = decode_model(onnx_bytes)?;
     let mut graph = IrGraph::from_model_proto(&model)?;
     graph.validate_topology()?;
     let bn_stats = fold_batch_norms(&mut graph, true);
     graph.validate_topology()?;
-    let resolved_shapes = graph.infer_shapes(input_overrides)?;
+    // Phase 1: activation fusion. Structural only, so it runs on the un-typed IR and
+    // the fused graph is what gets shape-inferred and arena-planned below.
+    let mut fuse_stats = fuse_activations(&mut graph, fuse_config);
+    if !fuse_stats.is_noop() {
+        graph.validate_topology()?;
+    }
+    let mut resolved_shapes = graph.infer_shapes(input_overrides)?;
+    // The per-op rules cannot fold size *values*, so resolve the shape subgraphs
+    // (`Shape -> Slice -> Concat -> Where -> Reshape/Expand/Resize`) and let the
+    // rules propagate the result. Without this the intermediates of every ViT
+    // stay dynamic and the arena planner has to skip them.
+    resolved_shapes += resolve_shapes_from_subgraphs(&mut graph, input_overrides);
+    // Phase 2: aliasing / dead nodes / `Conv` epilogue, which need inferred dtypes.
+    let (tail_stats, conv_activations) = finalize_graph(&mut graph, fuse_config);
+    if !tail_stats.is_noop() {
+        graph.validate_topology()?;
+    }
+    fuse_stats += tail_stats;
     let arena = plan_memory_arena(&graph, CUDA_DEFAULT_ALIGNMENT);
     Ok(CompiledPlan {
         graph,
         bn_stats,
+        fuse_stats,
         resolved_shapes,
         arena,
+        conv_activations,
     })
 }
 
@@ -236,6 +371,20 @@ mod tests {
         n
     }
 
+    fn check_routed_model(k: backend::BackendKind) {
+        let route=dispatch::open(backend::BackendRequest::Only(k),&selfcheck::model(),&HashMap::new()).expect("open actual backend");
+        assert_eq!(route.session.kind(),k);assert!(route.previous_attempts.is_empty());
+        for (x,wanted) in [([1.,2.,3.,4.,5.,6.], [0.,7.,0.,16.]), ([-2.,0.,-3.,4.,1.,-1.], [1.5,0.,5.5,0.])] {
+            let inputs=HashMap::from([("x".to_owned(), (&x[..],vec![2,3]))]);
+            let out=route.session.run_f32(&inputs).expect("matrix, broadcast bias, relu");
+            assert_eq!(out.len(),1);assert_eq!(out["out"],(wanted.to_vec(),vec![2,2]));
+        }
+        let bad=[1.;6];let wrong=HashMap::from([("x".to_owned(),(&bad[..],vec![3,2]))]);
+        assert!(route.session.run_f32(&wrong).is_err(),"same element count is not the same shape");
+    }
+    #[test] fn routed_cpu_named_onnx_matches_literal_results() {check_routed_model(backend::BackendKind::Cpu);}
+    #[test] #[cfg(windows)] #[ignore="needs a real CUDA device"]
+    fn routed_cuda_named_onnx_matches_literal_results() {check_routed_model(backend::BackendKind::Cuda);}
     #[test]
     fn f16_roundtrip_accuracy() {
         for &v in &[0.0f32, -0.0, 1.0, -1.0, 0.5, 3.140625, 1e-4, -65504.0] {
@@ -310,8 +459,142 @@ mod tests {
             Some(vec![1, 4, 16, 16])
         );
         compiled.arena.verify_no_overlap().expect("arena valid");
-        // Intermediate tensors: b1 [1,8,16,16]=8192B and r1 [1,8,16,16]=8192B (live together at Relu1).
-        assert_eq!(compiled.arena.peak_bytes, 2 * 8192);
+        // Intermediate tensors: b1 [1,8,16,16]=8192B (folded Conv1 output) and
+        // r1 [1,8,16,16]=8192B (Relu output). They are live together at Relu1, and
+        // Relu is an in-place `unary_f32` op, so r1 reuses b1's bytes instead of
+        // getting a second buffer: one arena slot instead of two.
+        assert_eq!(compiled.arena.peak_bytes, 8192);
+        assert_eq!(compiled.arena.inplace_reuses, 1);
+    }
+
+    #[test]
+    fn synthetic_gelu_chain_fuses_and_removes_its_arena_buffers() {
+        // x[1,8,16,16] -> Div(x, sqrt2) -> Erf -> Add(1) -> Mul(x, .) -> Mul(., 0.5) -> y
+        // With fusion off: 5 nodes, 4 live intermediates (peak 2 x 8 KiB after reuse).
+        // With fusion on:  1 `Gelu` node, no intermediates at all (peak 0).
+        let mut g = Vec::new();
+        enc_str(&mut g, 2, "synthetic_gelu");
+        for node in [
+            enc_node("Div", "div_sqrt2", &["x", "c_sqrt2"], &["t1"], &[]),
+            enc_node("Erf", "erf", &["t1"], &["t2"], &[]),
+            enc_node("Add", "add_one", &["t2", "c_one"], &["t3"], &[]),
+            enc_node("Mul", "mul_x", &["x", "t3"], &["t4"], &[]),
+            enc_node("Mul", "mul_half", &["t4", "c_half"], &["y"], &[]),
+        ] {
+            enc_bytes(&mut g, 1, &node);
+        }
+        enc_bytes(
+            &mut g,
+            5,
+            &enc_tensor_f32_raw("c_sqrt2", &[], &[std::f32::consts::SQRT_2]),
+        );
+        enc_bytes(&mut g, 5, &enc_tensor_f32_raw("c_one", &[], &[1.0]));
+        enc_bytes(&mut g, 5, &enc_tensor_f32_raw("c_half", &[], &[0.5]));
+        enc_bytes(&mut g, 11, &enc_value_info("x", DataType::Float, &[1, 8, 16, 16]));
+        enc_bytes(&mut g, 12, &enc_value_info("y", DataType::Float, &[1, 8, 16, 16]));
+
+        let mut model = Vec::new();
+        enc_tag(&mut model, 1, 0);
+        enc_varint(&mut model, 8);
+        enc_bytes(&mut model, 7, &g);
+
+        let unfused = load_and_plan_with_fuse(&model, &HashMap::new(), FuseConfig::OFF)
+            .expect("unfused plan");
+        assert_eq!(unfused.graph.nodes.len(), 5);
+        assert!(unfused.fuse_stats.is_noop());
+        assert!(unfused.conv_activations.is_empty());
+        // 4 intermediates of 8 KiB, ping-ponged into 2 buffers.
+        assert_eq!(unfused.arena.peak_bytes, 2 * 8192);
+        unfused.arena.verify_no_overlap().expect("unfused arena valid");
+
+        let fused = load_and_plan_with_fuse(&model, &HashMap::new(), FuseConfig::FULL)
+            .expect("fused plan");
+        assert_eq!(fused.fuse_stats.gelu_fused, 1);
+        assert_eq!(fused.graph.nodes.len(), 1);
+        assert!(matches!(fused.graph.nodes[0].op, graph::Op::Gelu));
+        assert_eq!(fused.arena.peak_bytes, 0);
+        assert_eq!(fused.arena.dynamic_skipped, 0);
+        assert_eq!(
+            fused.graph.tensors[fused.graph.name_to_id["y"].0].static_shape(),
+            Some(vec![1, 8, 16, 16])
+        );
+    }
+
+
+    #[test]
+    #[ignore = "needs the shipped ONNX models: set AURORA_MODELS_DIR"]
+    fn every_statically_shaped_activation_of_shipped_models_is_arena_planned() {
+        // Regression guard for the two gaps that kept CUDA Graph capture off the
+        // ViT / FPN models: shape subgraphs the per-op rules cannot fold
+        // (`Shape -> Gather -> Concat -> Where -> Reshape/Expand/Resize`) and FP16
+        // activations that the executor stores in FP32. Both used to leave
+        // intermediates out of the arena, which forced one `cuMemAlloc` per
+        // tensor per call (thousands per inference on `MatchLookColor`) and made
+        // the model uncapturable.
+        //
+        // `subjectMasking.onnx` keeps a known, measured gap: its stage1/stage2
+        // pyramid derives the `Resize` sizes of `/stage1/Resize_4` from a
+        // `/stage1/Concat_9` whose operands the CPU shape evaluator still cannot
+        // fold, so 426 activations stay dynamic. The expectation below is a
+        // ceiling on that gap, not an absence of it.
+        let Ok(root) = std::env::var("AURORA_MODELS_DIR") else {
+            eprintln!("set AURORA_MODELS_DIR to the models directory");
+            return;
+        };
+        let root = std::path::Path::new(&root).to_path_buf();
+        // (relative path, input name, input shape, allowed unplanned activations)
+        let cases: &[(&str, &str, &[usize], usize)] = &[
+            (r"AIModels\Common\SubjectMasking\subjectMasking.onnx", "x", &[1, 3, 320, 320], 426),
+            (r"AIModels\Common\MatchLook\MatchLookColor.onnx", "input.1", &[1, 3, 384, 384], 0),
+            (r"AIModels\Common\MatchLook\MatchLookBrightness.onnx", "input.1", &[1, 3, 384, 384], 0),
+            (r"AIModels\Common\PeopleMasking\skinMasking.onnx", "input_29", &[1, 512, 512, 3], 0),
+            (r"AIModels\Common\FaceDetection\faceDetection.onnx", "input", &[1, 3, 320, 320], 0),
+            (r"AIModels\Common\SamEncoder\eSamEncoderPreUInt8.onnx", "input_image", &[1024, 1024, 3], 0),
+        ];
+        let mut checked = 0usize;
+        for &(rel, input_name, shape, ceiling) in cases {
+            let path = root.join(rel);
+            if !path.is_file() {
+                eprintln!("[MISSING] {rel}");
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read onnx");
+            let overrides = HashMap::from([(input_name.to_string(), shape.to_vec())]);
+            let plan = load_and_plan(&bytes, &overrides).expect("load_and_plan");
+            let mut unplanned = Vec::new();
+            for node in &plan.graph.nodes {
+                for out in node.outputs.iter().flatten() {
+                    let info = &plan.graph.tensors[out.0];
+                    if info.is_weight || info.is_graph_input || info.is_graph_output {
+                        continue;
+                    }
+                    // A tensor the shape evaluator still cannot size is a real
+                    // per-run allocation, so this is the honest denominator.
+                    if info.static_shape().is_none() {
+                        unplanned.push(format!("{} (dynamic)", info.name));
+                    } else if !plan.arena.allocations.contains_key(out) {
+                        unplanned.push(info.name.clone());
+                    }
+                }
+            }
+            eprintln!(
+                "[PLAN] {rel} nodes={} peak={:.2}MiB dyn_skipped={} unplanned={}/{}",
+                plan.graph.nodes.len(),
+                plan.arena.peak_bytes as f64 / 1048576.0,
+                plan.arena.dynamic_skipped,
+                unplanned.len(),
+                ceiling,
+            );
+            assert!(
+                unplanned.len() <= ceiling,
+                "{rel}: {} activation(s) are not arena-planned, above the recorded ceiling {ceiling}; first: {:?}",
+                unplanned.len(),
+                &unplanned[..unplanned.len().min(6)],
+            );
+            plan.arena.verify_no_overlap().expect("arena overlap");
+            checked += 1;
+        }
+        assert!(checked > 0, "no shipped model was checked");
     }
 
     #[test]

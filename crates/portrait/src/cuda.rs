@@ -232,6 +232,122 @@ pub(crate) fn test_driver_counts() -> [usize; 3] {
     ]
 }
 
+/// Why an explicit CUDA Graph recording was refused.
+///
+/// Deliberately separate from [`CudaError`]: a refused capture is not a failed
+/// inference. The caller already has a correct result from the plain path and
+/// only loses the replay optimisation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GraphRecordError {
+    /// The driver build does not export the entry point (`cuGraphAddKernelNode`
+    /// needs CUDA 10 or newer, `cuGraphInstantiateWithFlags` CUDA 11).
+    Unavailable(&'static str),
+    /// A driver call returned a non-zero `CUresult`.
+    Driver(&'static str, i32),
+    /// The pass touched host state that a replay cannot reproduce: a device
+    /// allocation, a host readback/upload, or a device-to-device copy.
+    NotStatic(&'static str),
+    /// Nothing was recorded, so there is no graph to instantiate.
+    Empty,
+}
+
+impl From<CudaError> for GraphRecordError {
+    fn from(error: CudaError) -> Self {
+        match error {
+            CudaError::Unavailable(what) => Self::Unavailable(what),
+            CudaError::Driver(call, code) => Self::Driver(call, code),
+            CudaError::Refused(_) => Self::Unavailable("graph recording"),
+        }
+    }
+}
+
+/// Process-wide CUDA Graph counters, for the A/B report and the tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GraphMetrics {
+    /// Kernel nodes appended by every recording so far.
+    pub nodes: usize,
+    /// Successful `cuGraphInstantiate*` calls.
+    pub instantiations: usize,
+    /// Successful `cuGraphLaunch` calls.
+    pub launches: usize,
+}
+
+/// Starts recording kernel launches on the calling thread onto a fresh graph.
+#[cfg(windows)]
+pub(crate) fn graph_record_begin() -> Result<(), GraphRecordError> {
+    driver::graph_record_begin()
+}
+
+/// Stops recording and instantiates the recorded graph.
+#[cfg(windows)]
+pub(crate) fn graph_record_end() -> Result<GraphExec, GraphRecordError> {
+    driver::graph_record_end()
+}
+
+/// Throws the recording away (also called by the guard's `Drop`).
+#[cfg(windows)]
+pub(crate) fn graph_record_abort() {
+    driver::graph_record_abort()
+}
+
+/// Records one host-side effect that a replay could not reproduce.
+#[cfg(windows)]
+pub(crate) fn graph_record_violation(what: &'static str) {
+    driver::graph_record_violation(what)
+}
+
+/// Number of kernel nodes appended so far by the armed recording.
+#[cfg(windows)]
+pub(crate) fn graph_record_nodes() -> usize {
+    driver::graph_record_nodes()
+}
+
+/// First static-execution violation seen by the armed recording.
+#[cfg(windows)]
+pub(crate) fn graph_record_first_violation() -> Option<&'static str> {
+    driver::graph_record_first_violation()
+}
+
+#[cfg(windows)]
+pub(crate) fn graph_metrics() -> GraphMetrics {
+    driver::graph_metrics()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_record_begin() -> Result<(), GraphRecordError> {
+    Err(GraphRecordError::Unavailable(
+        "CUDA driver (non-Windows build)",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_record_end() -> Result<GraphExec, GraphRecordError> {
+    Err(GraphRecordError::Unavailable(
+        "CUDA driver (non-Windows build)",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_record_abort() {}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_record_violation(_what: &'static str) {}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_record_nodes() -> usize {
+    0
+}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_record_first_violation() -> Option<&'static str> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn graph_metrics() -> GraphMetrics {
+    GraphMetrics::default()
+}
+
 /// Why the NVIDIA path produced nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CudaError {
@@ -409,8 +525,9 @@ pub mod runtime_bridge {
 #[cfg(windows)]
 mod driver {
     use super::{
-        ChainStage, CudaError, DeviceMemoryInfo, Dispatch, DriverMetrics, Image, PTX, Pass,
-        Refusal, Uniforms, cpu, driver_ptx_isa, ptx_isa, restamp_ptx,
+        ChainStage, CudaError, DeviceMemoryInfo, Dispatch, DriverMetrics, GraphMetrics,
+        GraphRecordError, Image, PTX, Pass, Refusal, Uniforms, cpu, driver_ptx_isa, ptx_isa,
+        restamp_ptx,
     };
     use crate::cuda_job_upload::{
         JobBufferPlan, JobBufferRole, JobContentKey, JobShapeKey, JobUploadReceipt,
@@ -472,6 +589,31 @@ mod driver {
     type CuFunction = *mut c_void;
     type CuPtr = u64;
     type CuStream = *mut c_void;
+    type CuGraph = *mut c_void;
+    type CuGraphExec = *mut c_void;
+    type CuGraphNode = *mut c_void;
+
+    /// `CUDA_KERNEL_NODE_PARAMS`.
+    ///
+    /// The CUDA 11 layout stops at `extra`; CUDA 12 appends `CUkernel` and
+    /// CUDA 12.4 appends `CUcontext`. This block is the CUDA 11 prefix followed
+    /// by the zeroed tail, so an older driver reads exactly the fields it knows
+    /// and a newer one sees "no CUkernel / no override context" and uses `func`.
+    #[repr(C)]
+    struct KernelNodeParams {
+        func: CuFunction,
+        grid_dim_x: u32,
+        grid_dim_y: u32,
+        grid_dim_z: u32,
+        block_dim_x: u32,
+        block_dim_y: u32,
+        block_dim_z: u32,
+        shared_mem_bytes: u32,
+        kernel_params: *mut *mut c_void,
+        extra: *mut *mut c_void,
+        kernel: *mut c_void,
+        ctx: *mut c_void,
+    }
 
     const ATTR_CC_MAJOR: i32 = 75;
     const ATTR_CC_MINOR: i32 = 76;
@@ -523,6 +665,32 @@ mod driver {
         stream_create: Option<unsafe extern "system" fn(*mut CuStream, u32) -> CuResult>,
         stream_destroy: Option<unsafe extern "system" fn(CuStream) -> CuResult>,
         stream_sync: Option<unsafe extern "system" fn(CuStream) -> CuResult>,
+        /// Optional CUDA Graph entry points (CUDA 10+). A driver without them
+        /// only loses graph replay; every other path is unchanged.
+        graph_create: Option<unsafe extern "system" fn(*mut CuGraph, u32) -> CuResult>,
+        graph_destroy: Option<unsafe extern "system" fn(CuGraph) -> CuResult>,
+        graph_add_kernel_node: Option<
+            unsafe extern "system" fn(
+                *mut CuGraphNode,
+                CuGraph,
+                *const CuGraphNode,
+                usize,
+                *const KernelNodeParams,
+            ) -> CuResult,
+        >,
+        graph_instantiate_with_flags:
+            Option<unsafe extern "system" fn(*mut CuGraphExec, CuGraph, u64, *mut CuGraphNode) -> CuResult>,
+        graph_instantiate: Option<
+            unsafe extern "system" fn(
+                *mut CuGraphExec,
+                CuGraph,
+                *mut CuGraphNode,
+                *mut c_char,
+                usize,
+            ) -> CuResult,
+        >,
+        graph_launch: Option<unsafe extern "system" fn(CuGraphExec, CuStream) -> CuResult>,
+        graph_exec_destroy: Option<unsafe extern "system" fn(CuGraphExec) -> CuResult>,
         launch: unsafe extern "system" fn(
             CuFunction,
             u32,
@@ -612,6 +780,21 @@ mod driver {
                 stream_create: sym_opt!("cuStreamCreate", "cuStreamCreate"),
                 stream_destroy: sym_opt!("cuStreamDestroy_v2", "cuStreamDestroy"),
                 stream_sync: sym_opt!("cuStreamSynchronize", "cuStreamSynchronize"),
+                graph_create: sym_opt!("cuGraphCreate", "cuGraphCreate"),
+                graph_destroy: sym_opt!("cuGraphDestroy", "cuGraphDestroy"),
+                // Loaded by its only exported spelling: a `_v2` form with a
+                // different parameter block would silently misread the struct.
+                graph_add_kernel_node: sym_opt!(
+                    "cuGraphAddKernelNode",
+                    "cuGraphAddKernelNode"
+                ),
+                graph_instantiate_with_flags: sym_opt!(
+                    "cuGraphInstantiateWithFlags",
+                    "cuGraphInstantiateWithFlags"
+                ),
+                graph_instantiate: sym_opt!("cuGraphInstantiate_v2", "cuGraphInstantiate"),
+                graph_launch: sym_opt!("cuGraphLaunch", "cuGraphLaunch"),
+                graph_exec_destroy: sym_opt!("cuGraphExecDestroy", "cuGraphExecDestroy"),
                 launch: sym!("cuLaunchKernel"),
             })
         }
@@ -793,6 +976,9 @@ mod driver {
     }
 
     fn domain() -> Result<&'static Mutex<Domain>, CudaError> {
+        // Do not poison the process-wide driver cache when CPU/another GPU is selected.
+        use crate::native_infer::backend::{BackendKind,BackendRequest};
+        if !BackendRequest::from_env().is_ok_and(|r|r.permits(BackendKind::Cuda)) {return Err(CudaError::Unavailable("AURORA_GPU_BACKEND excludes CUDA"));}
         match DOMAIN.get_or_init(|| Domain::open().map(Mutex::new)) {
             Ok(domain) => Ok(domain),
             Err(error) => Err(error.clone()),
@@ -1322,6 +1508,7 @@ mod driver {
     #[allow(dead_code)] // consumed by `cuda_mesh`
     pub struct DeviceBuffer<'a> {
         ptr: CuPtr,
+        bytes: usize,
         owner: std::marker::PhantomData<&'a Nvidia>,
     }
 
@@ -1467,12 +1654,360 @@ mod driver {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // CUDA Graph: explicit-node recording and replay
+    // -----------------------------------------------------------------------
+    //
+    // The native inference session walks the whole ONNX graph on the host and
+    // issues one `cuLaunchKernel` per node; for `323773030.onnx` that walk is
+    // 1,511 host-to-driver calls. A CUDA Graph turns the walk into one
+    // `cuGraphLaunch`.
+    //
+    // Recording happens inside the launch path itself: while a recording is
+    // armed on the calling thread, `launch_on_stream` appends a kernel node
+    // whose argument *values* the driver copies at node creation, exactly like
+    // `cuLaunchKernel` copies them at launch. Nothing executes during the
+    // recording, so a pass that needs a host readback between two nodes cannot
+    // be recorded by accident: those entry points flag the violation and the
+    // recording is thrown away.
+    //
+    // Deliberately not stream capture (`cuStreamBeginCapture`): every operator
+    // suite shares one process context and several dispatch on the legacy
+    // default stream, which CUDA refuses to capture. Explicit nodes record the
+    // same kernels whichever stream each dispatch names, and the replay stream
+    // is chosen at launch time.
+
+    /// One armed recording on the calling thread.
+    struct Recording {
+        api: Api,
+        graph: CuGraph,
+        /// Tail dependency: every node depends on the previous one, so the
+        /// instantiated graph replays the dispatch order exactly.
+        last: CuGraphNode,
+        nodes: usize,
+        violation: Option<&'static str>,
+    }
+
+    thread_local! {
+        static RECORDING: std::cell::RefCell<Option<Recording>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    static GRAPH_NODES_RECORDED: AtomicUsize = AtomicUsize::new(0);
+    static GRAPH_INSTANTIATIONS: AtomicUsize = AtomicUsize::new(0);
+    static GRAPH_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
+    /// One instantiated CUDA Graph. A replay is a single `cuGraphLaunch`.
+    pub(crate) struct GraphExec {
+        api: Api,
+        ptr: usize,
+        nodes: usize,
+    }
+
+    // SAFETY: the executable holds only driver-owned state. Every access in
+    // this module happens while the process-wide domain mutex is held and the
+    // primary context has been made current on the calling thread, so moving
+    // the handle between threads cannot race a replay or a destroy.
+    unsafe impl Send for GraphExec {}
+
+    impl GraphExec {
+        pub(crate) fn node_count(&self) -> usize {
+            self.nodes
+        }
+    }
+
+    impl Drop for GraphExec {
+        fn drop(&mut self) {
+            let Some(destroy) = self.api.graph_exec_destroy else {
+                return;
+            };
+            if let Ok(domain) = domain() {
+                let mut domain = domain
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if domain.bind().is_ok() {
+                    // A replay may still be in flight on a session stream.
+                    unsafe {
+                        let _ = (domain.api.ctx_sync)();
+                        let _ = destroy(self.ptr as CuGraphExec);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn graph_record_active() -> bool {
+        RECORDING.with(|cell| cell.borrow().is_some())
+    }
+
+    /// Flags the armed recording as non-static. A no-op when not recording.
+    pub(crate) fn graph_record_violation(what: &'static str) {
+        if !graph_record_active() {
+            return;
+        }
+        RECORDING.with(|cell| {
+            if let Some(recording) = cell.borrow_mut().as_mut()
+                && recording.violation.is_none()
+            {
+                recording.violation = Some(what);
+            }
+        });
+    }
+
+    pub(crate) fn graph_record_nodes() -> usize {
+        RECORDING.with(|cell| cell.borrow().as_ref().map_or(0, |recording| recording.nodes))
+    }
+
+    pub(crate) fn graph_record_first_violation() -> Option<&'static str> {
+        RECORDING.with(|cell| cell.borrow().as_ref().and_then(|recording| recording.violation))
+    }
+
+    fn graph_record_bind() -> Result<(), GraphRecordError> {
+        let domain = domain()?;
+        let mut domain = domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        domain.bind()?;
+        Ok(())
+    }
+
+    pub(crate) fn graph_record_begin() -> Result<(), GraphRecordError> {
+        if graph_record_active() {
+            return Err(GraphRecordError::NotStatic("nested graph recording"));
+        }
+        graph_record_bind()?;
+        let domain = domain()?;
+        let api = domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .api;
+        for (available, what) in [
+            (api.graph_create.is_some(), "cuGraphCreate"),
+            (
+                api.graph_add_kernel_node.is_some(),
+                "cuGraphAddKernelNode",
+            ),
+            (api.graph_destroy.is_some(), "cuGraphDestroy"),
+            (api.graph_launch.is_some(), "cuGraphLaunch"),
+            (
+                api.graph_exec_destroy.is_some(),
+                "cuGraphExecDestroy",
+            ),
+            (
+                api.graph_instantiate_with_flags.is_some() || api.graph_instantiate.is_some(),
+                "cuGraphInstantiate",
+            ),
+        ] {
+            if !available {
+                return Err(GraphRecordError::Unavailable(what));
+            }
+        }
+        let create = api
+            .graph_create
+            .ok_or(GraphRecordError::Unavailable("cuGraphCreate"))?;
+        let mut graph: CuGraph = ptr::null_mut();
+        unsafe {
+            check(create(&mut graph, 0), "cuGraphCreate")?;
+        }
+        RECORDING.with(|cell| {
+            *cell.borrow_mut() = Some(Recording {
+                api,
+                graph,
+                last: ptr::null_mut(),
+                nodes: 0,
+                violation: None,
+            });
+        });
+        Ok(())
+    }
+
+    pub(crate) fn graph_record_abort() {
+        let recording = RECORDING.with(|cell| cell.borrow_mut().take());
+        if let Some(recording) = recording
+            && let Some(destroy) = recording.api.graph_destroy
+        {
+            let _ = graph_record_bind();
+            unsafe {
+                let _ = destroy(recording.graph);
+            }
+        }
+    }
+
+    pub(crate) fn graph_record_end() -> Result<GraphExec, GraphRecordError> {
+        let recording = RECORDING
+            .with(|cell| cell.borrow_mut().take())
+            .ok_or(GraphRecordError::Unavailable("cuGraph recording"))?;
+        let release = |api: &Api, graph: CuGraph| {
+            if let Some(destroy) = api.graph_destroy {
+                let _ = graph_record_bind();
+                unsafe {
+                    let _ = destroy(graph);
+                }
+            }
+        };
+        if let Some(what) = recording.violation {
+            release(&recording.api, recording.graph);
+            return Err(GraphRecordError::NotStatic(what));
+        }
+        if recording.nodes == 0 {
+            release(&recording.api, recording.graph);
+            return Err(GraphRecordError::Empty);
+        }
+        graph_record_bind()?;
+        let mut exec: CuGraphExec = ptr::null_mut();
+        let instantiated = if let Some(instantiate) = recording.api.graph_instantiate_with_flags {
+            // flags = 0: keep the executable independent of the container graph.
+            unsafe {
+                check(
+                    instantiate(&mut exec, recording.graph, 0, ptr::null_mut()),
+                    "cuGraphInstantiateWithFlags",
+                )
+            }
+        } else if let Some(instantiate) = recording.api.graph_instantiate {
+            let mut error_node: CuGraphNode = ptr::null_mut();
+            let mut log = vec![0 as c_char; 2048];
+            unsafe {
+                check(
+                    instantiate(
+                        &mut exec,
+                        recording.graph,
+                        &mut error_node,
+                        log.as_mut_ptr(),
+                        log.len(),
+                    ),
+                    "cuGraphInstantiate",
+                )
+            }
+        } else {
+            Err(CudaError::Unavailable("cuGraphInstantiate"))
+        };
+        // The container graph is only needed to build the executable; CUDA
+        // keeps the instantiated copy.
+        release(&recording.api, recording.graph);
+        instantiated?;
+        if exec.is_null() {
+            return Err(GraphRecordError::NotStatic(
+                "cuGraphInstantiate returned no executable",
+            ));
+        }
+        GRAPH_INSTANTIATIONS.fetch_add(1, Ordering::Relaxed);
+        GRAPH_NODES_RECORDED.fetch_add(recording.nodes, Ordering::Relaxed);
+        Ok(GraphExec {
+            api: recording.api,
+            ptr: exec as usize,
+            nodes: recording.nodes,
+        })
+    }
+
+    pub(crate) fn graph_metrics() -> GraphMetrics {
+        GraphMetrics {
+            nodes: GRAPH_NODES_RECORDED.load(Ordering::Relaxed),
+            instantiations: GRAPH_INSTANTIATIONS.load(Ordering::Relaxed),
+            launches: GRAPH_LAUNCHES.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Appends one kernel node instead of launching it.
+    ///
+    /// Returns `Ok(false)` when no recording is armed, so the caller falls
+    /// through to the real `cuLaunchKernel`.
+    fn record_kernel_node(
+        function: &CuFunction,
+        geometry: (u32, u32),
+        block: (u32, u32),
+        params: &mut [*mut c_void],
+    ) -> Result<bool, CudaError> {
+        if !graph_record_active() {
+            return Ok(false);
+        }
+        RECORDING.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let Some(recording) = guard.as_mut() else {
+                return Ok(false);
+            };
+            let add = recording
+                .api
+                .graph_add_kernel_node
+                .ok_or(CudaError::Unavailable("cuGraphAddKernelNode"))?;
+            let node_params = KernelNodeParams {
+                func: *function,
+                grid_dim_x: geometry.0,
+                grid_dim_y: geometry.1,
+                grid_dim_z: 1,
+                block_dim_x: block.0,
+                block_dim_y: block.1,
+                block_dim_z: 1,
+                shared_mem_bytes: 0,
+                kernel_params: params.as_mut_ptr(),
+                extra: ptr::null_mut(),
+                kernel: ptr::null_mut(),
+                ctx: ptr::null_mut(),
+            };
+            let dependency = recording.last;
+            let (dependencies, dependency_count) = if dependency.is_null() {
+                (ptr::null::<CuGraphNode>(), 0usize)
+            } else {
+                (&dependency as *const CuGraphNode, 1usize)
+            };
+            let mut node: CuGraphNode = ptr::null_mut();
+            unsafe {
+                check(
+                    add(
+                        &mut node,
+                        recording.graph,
+                        dependencies,
+                        dependency_count,
+                        &node_params,
+                    ),
+                    "cuGraphAddKernelNode",
+                )?;
+            }
+            recording.last = node;
+            recording.nodes += 1;
+            Ok(true)
+        })
+    }
+
+    impl Nvidia {
+        /// Replays one instantiated graph on `stream`.
+        ///
+        /// The graph was recorded for one exact set of device pointers, so the
+        /// caller must replay it against the same buffers it recorded with.
+        pub(crate) fn graph_launch(
+            &self,
+            exec: &GraphExec,
+            stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            let launch = domain
+                .api
+                .graph_launch
+                .ok_or(CudaError::Unavailable("cuGraphLaunch"))?;
+            unsafe {
+                check(
+                    launch(exec.ptr as CuGraphExec, stream.ptr),
+                    "cuGraphLaunch",
+                )
+            }
+            .map_err(|error| {
+                super::runtime_bridge::note_failure(self.image, &error);
+                error
+            })?;
+            GRAPH_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            domain.pending = true;
+            Ok(())
+        }
+    }
+
     /// A fixed group of device buffers, allocated once and reused across
     /// launches. Crate-private: a session that repeats the same job shape should
     /// not pay `cuMemAlloc` per launch.
     #[allow(dead_code)] // consumed by the O1h session benchmark
-    pub(crate) struct DeviceSet<'a> {
-        buffers: Vec<(CuPtr, usize)>,
+    pub(crate) struct DeviceSet<'a> {        buffers: Vec<(CuPtr, usize)>,
         owner: std::marker::PhantomData<&'a Nvidia>,
     }
 
@@ -1536,6 +2071,24 @@ mod driver {
             let dispatch =
                 self.gpu
                     .launch_on(&api, self.module, kernel, geometry, block, params)?;
+            self.domain.pending = true;
+            Ok(dispatch)
+        }
+
+        /// Runs a kernel from another PTX image already loadable in this
+        /// session's context. Every module shares the device context, so a
+        /// chained stage reads and writes the same buffers without a roundtrip.
+        pub fn launch_from_image(
+            &mut self,
+            image: &'static str,
+            kernel: &'static str,
+            geometry: (u32, u32),
+            block: (u32, u32),
+            params: &mut [*mut c_void],
+        ) -> Result<Dispatch, CudaError> {
+            let module = self.domain.module(image)?.module as CuModule;
+            let api = self.domain.api;
+            let dispatch = self.gpu.launch_on(&api, module, kernel, geometry, block, params)?;
             self.domain.pending = true;
             Ok(dispatch)
         }
@@ -1743,6 +2296,9 @@ mod driver {
     }
 
     impl Nvidia {
+        pub(crate) fn device_label(&self) -> String {
+            format!("{} · SM {}.{}",self.name,self.compute_cap.0,self.compute_cap.1)
+        }
         /// Returns a handle to the process domain's cached P15 module.
         pub fn open() -> Result<Self, CudaError> {
             Self::open_image(PTX)
@@ -2346,6 +2902,14 @@ mod driver {
                     super::runtime_bridge::note_failure(self.image, &error);
                     error
                 })?;
+            }
+            // An armed recording takes the dispatch instead of the device: the
+            // node keeps the argument values and the grid, and the graph replays
+            // them in the recorded order.
+            if record_kernel_node(&function, geometry, block, params)? {
+                return Ok(self.dispatch(kernel, geometry, block));
+            }
+            unsafe {
                 check(
                     (api.launch)(
                         function,
@@ -2395,6 +2959,7 @@ mod driver {
         }
 
         fn upload(&self, ptr: CuPtr, data: &[u8]) -> Result<(), CudaError> {
+            graph_record_violation("host upload");
             unsafe {
                 check(
                     (self.api.copy_in)(ptr, data.as_ptr() as *const c_void, data.len()),
@@ -2414,6 +2979,7 @@ mod driver {
         }
 
         fn download(&self, ptr: CuPtr, data: &mut [u8]) -> Result<(), CudaError> {
+            graph_record_violation("host readback");
             unsafe {
                 check(
                     (self.api.copy_out)(data.as_mut_ptr() as *mut c_void, ptr, data.len()),
@@ -2433,6 +2999,7 @@ mod driver {
         }
 
         fn copy_from_device(&self, dst: CuPtr, src: CuPtr, bytes: usize) -> Result<(), CudaError> {
+            graph_record_violation("device-to-device copy");
             unsafe { check((self.api.copy_device)(dst, src, bytes), "cuMemcpyDtoD") }
         }
 
@@ -2615,6 +3182,7 @@ mod driver {
         /// Crate-private: allocate a buffer that lives across several launches.
         #[allow(dead_code)] // consumed by `cuda_mesh`
         pub fn alloc_buffer(&self, bytes: usize) -> Result<DeviceBuffer<'_>, CudaError> {
+            graph_record_violation("device allocation");
             self.with_domain(|domain, _| {
                 let mut ptr: CuPtr = 0;
                 unsafe {
@@ -2623,6 +3191,7 @@ mod driver {
                 count_device_allocation();
                 Ok(DeviceBuffer {
                     ptr,
+                    bytes,
                     owner: std::marker::PhantomData,
                 })
             })
@@ -2634,6 +3203,7 @@ mod driver {
             buffer: &DeviceBuffer<'_>,
             data: &[u8],
         ) -> Result<(), CudaError> {
+            graph_record_violation("host upload");
             let domain = domain()?;
             let mut domain = domain
                 .lock()
@@ -2647,12 +3217,45 @@ mod driver {
             }
         }
 
+        /// H2D copy into `buffer` starting at `offset` bytes.
+        ///
+        /// Used to refresh one block of a device staging buffer that a captured
+        /// graph addresses by a fixed pointer, so the whole buffer cannot be
+        /// reallocated.
+        pub fn upload_buffer_at(
+            &self,
+            buffer: &DeviceBuffer<'_>,
+            offset: usize,
+            data: &[u8],
+        ) -> Result<(), CudaError> {
+            graph_record_violation("host upload");
+            if offset + data.len() > buffer.bytes {
+                return Err(CudaError::Driver("cuMemcpyHtoD", -1));
+            }
+            let domain = domain()?;
+            let mut domain = domain
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            domain.bind()?;
+            unsafe {
+                check(
+                    (domain.api.copy_in)(
+                        buffer.ptr.wrapping_add(offset as u64),
+                        data.as_ptr() as *const c_void,
+                        data.len(),
+                    ),
+                    "cuMemcpyHtoD",
+                )
+            }
+        }
+
         #[allow(dead_code)] // consumed by `cuda_mesh`
         pub fn download_buffer(
             &self,
             buffer: &DeviceBuffer<'_>,
             data: &mut [u8],
         ) -> Result<(), CudaError> {
+            graph_record_violation("host readback");
             let domain = domain()?;
             let mut domain = domain
                 .lock()
@@ -2777,6 +3380,20 @@ mod driver {
             data: &mut [u8],
             stream: &Stream<'_>,
         ) -> Result<(), CudaError> {
+            self.download_async_at(buffer, 0, data, stream)
+        }
+
+        /// Copy only `data.len()` bytes starting at a checked device offset. The
+        /// caller owns pinned host storage until it synchronizes this stream.
+        pub fn download_async_at(
+            &self, buffer: &DeviceBuffer<'_>, offset: usize, data: &mut [u8], stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            if offset > buffer.bytes || data.len() > buffer.bytes - offset {
+                return Err(CudaError::Refused(Refusal::ShapeMismatch("device readback range")));
+            }
+            if data.is_empty() { return Ok(()); }
+            let src = buffer.ptr.checked_add(offset as u64)
+                .ok_or(CudaError::Refused(Refusal::ShapeMismatch("device address")))?;
             let domain = domain()?;
             let mut domain = domain
                 .lock()
@@ -2788,7 +3405,7 @@ mod driver {
                 .ok_or(CudaError::Unavailable("cuMemcpyDtoHAsync"))?;
             unsafe {
                 check(
-                    copy(data.as_mut_ptr() as *mut c_void, buffer.ptr, data.len(), stream.ptr),
+                    copy(data.as_mut_ptr() as *mut c_void, src, data.len(), stream.ptr),
                     "cuMemcpyDtoHAsync",
                 )
             }
@@ -3470,6 +4087,8 @@ mod driver {
 #[cfg(windows)]
 pub use driver::DeviceBuffer;
 #[cfg(windows)]
+pub(crate) use driver::GraphExec;
+#[cfg(windows)]
 pub use driver::HostRegistration;
 #[cfg(windows)]
 pub use driver::PinnedBuffer;
@@ -3558,6 +4177,12 @@ mod no_driver {
             Err(unavailable())
         }
 
+        pub fn download_async_at(
+            &self, _buffer: &DeviceBuffer<'_>, _offset: usize, _data: &mut [u8], _stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
+        }
+
         pub fn alloc_pinned(&self, _bytes: usize) -> Result<PinnedBuffer<'_>, CudaError> {
             Err(unavailable())
         }
@@ -3615,6 +4240,28 @@ mod no_driver {
     impl DeviceBuffer<'_> {
         pub fn handle(&self) -> u64 {
             0
+        }
+    }
+
+    /// Non-Windows stand-in: a graph executable can never be created here, so
+    /// the type carries no pointer and no destructor.
+    pub(crate) struct GraphExec {
+        _private: (),
+    }
+
+    impl GraphExec {
+        pub(crate) fn node_count(&self) -> usize {
+            0
+        }
+    }
+
+    impl Nvidia {
+        pub(crate) fn graph_launch(
+            &self,
+            _exec: &GraphExec,
+            _stream: &Stream<'_>,
+        ) -> Result<(), CudaError> {
+            Err(unavailable())
         }
     }
 
@@ -3681,6 +4328,17 @@ mod no_driver {
             Err(unavailable())
         }
 
+        pub fn launch_from_image(
+            &mut self,
+            _image: &'static str,
+            _kernel: &'static str,
+            _geometry: (u32, u32),
+            _block: (u32, u32),
+            _params: &mut [*mut c_void],
+        ) -> Result<Dispatch, CudaError> {
+            Err(unavailable())
+        }
+
         pub fn download(&mut self, _index: usize, _data: &mut [u8]) -> Result<(), CudaError> {
             Err(unavailable())
         }
@@ -3718,6 +4376,9 @@ mod no_driver {
 pub use no_driver::{
     BufferSession, DeviceBuffer, HostRegistration, Nvidia, PinnedBuffer, Stream,
 };
+
+#[cfg(not(windows))]
+pub(crate) use no_driver::GraphExec;
 
 #[cfg(test)]
 mod tests {
@@ -4532,5 +5193,123 @@ mod tests {
                 pass
             );
         }
+    }
+}
+
+
+/// CUDA Graph recorder tests: real driver, real kernels, no ONNX model on disk.
+///
+/// These prove the two properties the session relies on — a recorded graph
+/// replays the recorded sequence exactly, and a pass with a host round trip is
+/// refused instead of silently pointing at dead memory. Without a CUDA device
+/// they report and return, so the suite still passes on CI.
+#[cfg(all(windows, test))]
+mod graph_tests {
+    use super::*;
+    use crate::native_infer::ops_elem_norm::{ElemNormKernels, UnaryOp};
+
+    fn f32_bytes(values: &[f32]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(values),
+            )
+        }
+    }
+
+    fn open_kernels() -> Option<ElemNormKernels> {
+        match ElemNormKernels::open() {
+            Ok(kernels) => Some(kernels),
+            Err(error) => {
+                eprintln!("no CUDA device on this host: {error:?}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn graph_record_replays_a_kernel_sequence_identically() {
+        let Some(kernels) = open_kernels() else {
+            return;
+        };
+        let gpu = kernels.nvidia();
+        const COUNT: usize = 4096;
+        let source: Vec<f32> = (0..COUNT).map(|i| (i as f32 - 2048.0) / 61.0).collect();
+
+        let x = gpu.alloc_buffer(COUNT * 4).expect("x");
+        let mid = gpu.alloc_buffer(COUNT * 4).expect("mid");
+        let y = gpu.alloc_buffer(COUNT * 4).expect("y");
+        gpu.upload_buffer(&x, f32_bytes(&source))
+            .expect("upload source");
+
+        // Reference: the same two kernels, launched directly.
+        kernels
+            .unary_f32(UnaryOp::Sigmoid, x.handle(), mid.handle(), COUNT, 0.0, 0.0)
+            .expect("sigmoid");
+        kernels
+            .unary_f32(UnaryOp::Relu, mid.handle(), y.handle(), COUNT, 0.0, 0.0)
+            .expect("relu");
+        let mut direct = vec![0.0f32; COUNT];
+        gpu.download_buffer(&y, f32_bytes_mut(&mut direct))
+            .expect("download reference");
+
+        // Recording: the two launches become nodes and nothing runs.
+        let before = graph_metrics();
+        graph_record_begin().expect("begin recording");
+        kernels
+            .unary_f32(UnaryOp::Sigmoid, x.handle(), mid.handle(), COUNT, 0.0, 0.0)
+            .expect("recorded sigmoid");
+        kernels
+            .unary_f32(UnaryOp::Relu, mid.handle(), y.handle(), COUNT, 0.0, 0.0)
+            .expect("recorded relu");
+        assert_eq!(graph_record_nodes(), 2);
+        assert_eq!(graph_record_first_violation(), None);
+        let exec = graph_record_end().expect("instantiate");
+        assert_eq!(exec.node_count(), 2);
+        assert_eq!(graph_metrics().instantiations, before.instantiations + 1);
+
+        // A replay has to rewrite the output even if it was cleared meanwhile.
+        let cleared = vec![0u8; COUNT * 4];
+        gpu.upload_buffer(&y, &cleared).expect("clear output");
+        let stream = gpu.create_stream().expect("stream");
+        gpu.graph_launch(&exec, &stream).expect("graph launch");
+        gpu.stream_sync(&stream).expect("stream sync");
+        assert_eq!(graph_metrics().launches, before.launches + 1);
+        let mut replayed = vec![0.0f32; COUNT];
+        gpu.download_buffer(&y, f32_bytes_mut(&mut replayed))
+            .expect("download replayed");
+        assert_eq!(
+            direct, replayed,
+            "graph replay diverged from the recorded launches"
+        );
+        eprintln!("CUDA_GRAPH_REPLAY nodes=2 identical=1");
+    }
+
+    #[test]
+    fn graph_record_refuses_a_pass_with_a_host_round_trip() {
+        let Some(kernels) = open_kernels() else {
+            return;
+        };
+        let gpu = kernels.nvidia();
+        let buffer = gpu.alloc_buffer(16).expect("buffer");
+        graph_record_begin().expect("begin recording");
+        gpu.upload_buffer(&buffer, &[0u8; 16]).expect("upload");
+        assert_eq!(graph_record_first_violation(), Some("host upload"));
+        let mut host = [0u8; 16];
+        gpu.download_buffer(&buffer, &mut host).expect("download");
+        // The first violation wins: it names the cause, not the consequence.
+        assert_eq!(graph_record_first_violation(), Some("host upload"));
+        assert!(matches!(
+            graph_record_end(),
+            Err(GraphRecordError::NotStatic("host upload"))
+        ));
+        // The recording is gone, so a later pass cannot inherit it.
+        assert_eq!(graph_record_nodes(), 0);
     }
 }
