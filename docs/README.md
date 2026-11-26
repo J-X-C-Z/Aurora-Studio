@@ -13,6 +13,7 @@
 | [../ASSET-LICENSES.md](../ASSET-LICENSES.md) | 运行时资产来源与许可状态（草案） |
 | [architecture/README.md](architecture/README.md) | 模块边界、ADR、迁移映射、架构规则测试 |
 | [architecture/REMAINING-GAPS.md](architecture/REMAINING-GAPS.md) | 未完成重构的接手清单 |
+| [Windows 桌面性能候选 C4](architecture/DESKTOP-C4-REVIEW.zh-CN.md) | 历史性能分支的代码入口、复现命令与未通过的门槛 |
 
 ## 按主题
 
