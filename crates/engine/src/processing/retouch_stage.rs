@@ -6,7 +6,6 @@
 //! the renderer keeps its local copies until the integration lane switches to
 //! these paths.
 
-#![allow(dead_code)] // wired by the follow-up integration lane; see REMAINING-GAPS G2.
 
 use rayon::prelude::*;
 

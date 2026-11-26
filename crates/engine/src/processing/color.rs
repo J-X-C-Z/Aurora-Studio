@@ -14,8 +14,8 @@
 use std::sync::OnceLock;
 
 use crate::adjust::{
-    AdjustmentSet, ColorBand, ColorEditor, ColorRange, ColorWheel, Curve, HslShift, VignetteCenter,
-    VignetteMethod,
+    AdjustmentSet, BlackWhite, ColorBalance, ColorBand, ColorEditor, ColorRange, ColorWheel, Curve,
+    HslShift, VignetteCenter, VignetteMethod,
 };
 
 pub(crate) fn srgb_to_linear(v: f32) -> f32 {
@@ -413,4 +413,147 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     let s2 = (s * (1.0 + ds / 100.0 * k)).clamp(0.0, 1.0);
     let v2 = (v * (1.0 + dl / 100.0 * 0.5 * s * k)).max(0.0);
     hsv_to_rgb(h + dh * k, s2, v2)
+}
+
+// ── Black & white / colour-balance stages (moved from the renderer) ──
+
+pub(crate) fn color_balance(g: [f32; 3], cb: &ColorBalance, k: f32) -> [f32; 3] {
+    let l = luma(g).clamp(0.0, 1.0);
+    let ws = (1.0 - l).powi(2);
+    let wh = l.powi(2);
+    let wm = (1.0 - ws - wh).max(0.0);
+    let mut out = g;
+    for (wheel, w) in [(&cb.master, 1.0), (&cb.shadow, ws), (&cb.midtone, wm), (&cb.highlight, wh)] {
+        if wheel.saturation == 0.0 && wheel.lightness == 0.0 {
+            continue;
+        }
+        let o = wheel_offset(wheel, 0.35);
+        for i in 0..3 {
+            out[i] += o[i] * w * k;
+        }
+    }
+    out
+}
+
+pub(crate) fn black_white(g: [f32; 3], bw: &BlackWhite) -> [f32; 3] {
+    // Zero sliders keep the exact display luma and therefore the old buckets.
+    let y = if bw.sensitivity.iter().all(|&v| v == 0.0) {
+        luma(g)
+    } else {
+        bw_sector_y(g, &bw.sensitivity)
+    }
+    .max(0.0);
+    if bw.highlight_tone.saturation <= 0.0 && bw.shadow_tone.saturation <= 0.0 {
+        return [y, y, y];
+    }
+    bw_split_tone(y, bw)
+}
+
+/// The tonemap kernel's own luma basis, Q10 `0.3328 / 0.6121 / 0.0551`.
+const BW_C1_LUMA: [f32; 3] = [0.3328, 0.6121, 0.0551];
+const BW_C1_LUMA_Q10: [i32; 3] = [340, 626, 56];
+
+/// `CImgOpBlackWhiteV8_splittone`, host prep at `0x1816B0B40`: the tint is
+/// `0.1 * pow(mix(1, hue_ramp, saturation), 2.2)` per channel. Hue is degrees,
+/// saturation `0 ..= 100`; channel offsets are `1, 2/3, 1/3` (R, G, B).
+fn bw_tint(hue: f32, saturation: f32) -> [f32; 3] {
+    let s = (saturation / 100.0).clamp(0.0, 1.0);
+    [1.0f32, 2.0 / 3.0, 1.0 / 3.0].map(|off| {
+        let x = (hue / 360.0 + off).fract();
+        let ramp = ((x * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0);
+        0.1 * ((1.0 - s) + s * ramp).powf(2.2)
+    })
+}
+
+/// The main kernel (`p_041248720.cl`): `dark_hi` is the light tint's luma,
+/// `light_lo` the dark tint's max channel; the middle band blends the two
+/// linear ramps. The 65536-entry LUT is identity in this build.
+pub(crate) fn bw_split_tone(y: f32, bw: &BlackWhite) -> [f32; 3] {
+    let light = bw_tint(bw.highlight_tone.hue, bw.highlight_tone.saturation);
+    let dark = bw_tint(bw.shadow_tone.hue, bw.shadow_tone.saturation);
+    let dark_hi = light[0] * BW_C1_LUMA[0] + light[1] * BW_C1_LUMA[1] + light[2] * BW_C1_LUMA[2];
+    let light_lo = dark[0].max(dark[1]).max(dark[2]);
+    if light_lo <= dark_hi {
+        return [y, y, y];
+    }
+    let dark_ramp = dark.map(|c| c * y / light_lo);
+    let light_ramp = light.map(|c| c * y / (light_lo - dark_hi));
+    let out = if y < dark_hi {
+        dark_ramp
+    } else if y > light_lo {
+        light_ramp
+    } else {
+        let t = (y - dark_hi) / (light_lo - dark_hi);
+        [0, 1, 2].map(|i| dark_ramp[i] + (light_ramp[i] - dark_ramp[i]) * t)
+    };
+    out.map(|v| v.clamp(0.0, 1.0))
+}
+
+/// Q10 filter weights from the host builder at `0x1816B1FC0`. Slider order is
+/// `[red, yellow, green, cyan, blue, magenta]`; each unit is `0.01` of full
+/// scale, i.e. `10.24` Q10 counts. The two tables are complementary at zero:
+/// `sum = 1024`, based on the tonemap's own luma basis (not Rec.601).
+///
+/// The min-side slot is the channel that is *darkest* in that colour, so the
+/// secondaries pair with their missing channel: cyan owns min R, magenta min
+/// G, yellow min B. Assigning yellow to min G (or magenta to min B) instead
+/// makes the matching slider inert on its own colour.
+pub(crate) fn bw_weights(sensitivity: &[f32; 6]) -> ([i32; 3], [i32; 3]) {
+    const BASE: [f64; 3] = [340.7872, 626.7904, 56.4224];
+    let luma = [
+        BASE[0] + 10.24 * sensitivity[0] as f64,
+        BASE[1] + 10.24 * sensitivity[2] as f64,
+        BASE[2] + 10.24 * sensitivity[4] as f64,
+    ];
+    let comp = [
+        (1024.0 - BASE[0]) + 10.24 * sensitivity[3] as f64,
+        (1024.0 - BASE[1]) + 10.24 * sensitivity[5] as f64,
+        (1024.0 - BASE[2]) + 10.24 * sensitivity[1] as f64,
+    ];
+    let q = |w: [f64; 3]| w.map(|v| v as i32);
+    (q(comp), q(luma))
+}
+
+/// `CImgOpBlackWhiteV8_tonemap` (`p_041248720.cl`), 16-bit path: sort RGB, pick
+/// the sector by `(argmax, argmin)`, then
+/// `t = min + ((mid-min)*wMin + (max-mid)*wMax)/1024` (C truncating division,
+/// not a shift). A neutral floor follows when `t*8 < luma`.
+pub(crate) fn bw_sector_y(g: [f32; 3], sensitivity: &[f32; 6]) -> f32 {
+    let (w_min, w_max) = bw_weights(sensitivity);
+    let q = g.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as i32);
+    // The host's argmax favours R unless B >= R, and argmin favours R unless
+    // G < R. On a tie the tied channel is the mid one for every pure primary
+    // and secondary, so its `max - mid` / `mid - min` term is zero and the
+    // choice cannot move the result; keep the order for the other sectors.
+    let (i_max, max) = if q[0] > q[2] { (0, q[0]) } else { (2, q[2]) };
+    let (i_max, max) = if q[1] > max { (1, q[1]) } else { (i_max, max) };
+    let (i_min, min) = if q[1] < q[0] { (1, q[1]) } else { (0, q[0]) };
+    let (i_min, min) = if q[2] < min { (2, q[2]) } else { (i_min, min) };
+    let mid = q[3 - i_max - i_min];
+    let mut t = min + ((mid - min) * w_min[i_min] + (max - mid) * w_max[i_max]) / 1024;
+    let y = (q[0] * BW_C1_LUMA_Q10[0] + q[1] * BW_C1_LUMA_Q10[1] + q[2] * BW_C1_LUMA_Q10[2]) / 1024;
+    if t * 8 < y {
+        t = if t <= 0 {
+            0
+        } else {
+            let yu = y as u32;
+            let a = ((yu * yu) >> 5) * 25;
+            let b = 1 + (yu.wrapping_mul(288).wrapping_sub((t as u32).wrapping_mul(1024)) >> 5);
+            ((a / b) as i32 - (yu / 32) as i32).max(0)
+        };
+    }
+    let shift = bw_shift(&w_min, &w_max);
+    (((t >> shift) << shift).clamp(0, 65535) as f32) / 65535.0
+}
+
+/// The op pairs a right shift with the splittone stage's left shift; it keeps
+/// the Q10 weights inside `0 ..= 1024` when a slider pushes past full scale.
+fn bw_shift(w_min: &[i32; 3], w_max: &[i32; 3]) -> u32 {
+    let mut m = w_min.iter().chain(w_max).copied().max().unwrap_or(0).max(0);
+    let mut shift = 0;
+    while m > 1024 {
+        m >>= 1;
+        shift += 1;
+    }
+    shift
 }

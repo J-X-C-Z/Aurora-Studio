@@ -73,6 +73,8 @@ pub mod print;
 pub mod jxl;
 mod iptc;
 mod layers;
+/// Layer-mask composition used by the CPU renderer (moved out of `mock`).
+mod layer_stage;
 mod lens_correct;
 mod layer_graph;
 mod lensdb;
@@ -106,30 +108,20 @@ mod portrait_makeup_wiring;
 mod portrait_moisture_inputs;
 pub mod portrait_pf115_pf107;
 mod portrait_pf90021_input;
-pub use portrait_stage::portrait_face_input_stage;
+pub(crate) use portrait_stage::portrait_face_input_stage;
 pub mod blemish_gainmap;
 pub mod blemish_gainmap_cuda;
-pub use blemish_gainmap::*;
-pub use aurora_portrait::cuda_pf90021::{
-    Direction as Pf90021Direction, RuntimeScalars as Pf90021RuntimeScalars, VolumeLut64,
-};
 pub use aurora_portrait::{Image as PortraitImage, Refusal as PortraitRefusal};
-pub use portrait_historical_tone_provider::{
-    build_complete_historical_tone_inputs, build_historical_tone_inputs,
-    HistoricalToneBreastRepairPayload, HistoricalToneCollarbonePayload,
-    HistoricalToneEyeRedVeinsPayload, HistoricalToneFlatGrayPayload,
-    HistoricalToneGray3dPayload, HistoricalToneHairColorPayload,
-    HistoricalToneHandGrayPayload, HistoricalToneHandShapePayload,
-    HistoricalToneHandVeinsPayload, HistoricalToneMultiTonePayload,
-    HistoricalToneProviderPayload, HistoricalToneProviderRow, HistoricalToneRowData,
-    HistoricalToneRowJob, HISTORICAL_TONE_PROVIDER_PFS,
-};
-pub use body_shader_abi::{
+// GPU body-shader ABI: crate-internal producer vocabulary, not a public contract.
+#[allow(dead_code, unused_imports)]
+pub(crate) use body_shader_abi::{
     decode_body_geometry, encode_body_geometry, BodyKeypointSet, BodySixPointShaderInput,
     EncodedBodyGeometry, BODY_EBO_INDEX_BYTES, BODY_LANDMARK_COUNT, BODY_SIX_POINT_SLOTS,
     BODY_VBO_DESTINATION_XY_OFFSET, BODY_VBO_SOURCE_UV_OFFSET, BODY_VBO_STRIDE_BYTES,
 };
-pub use portrait_stage::{
+// Historical-tone GPU backend selection: crate-internal producer vocabulary.
+#[allow(dead_code, unused_imports)]
+pub(crate) use portrait_stage::{
     apply_historical_tone_row, gpu_kernel, gpu_lut_reason, plan_historical_skin_backend,
     plan_historical_tone_backend, HistoricalSkinGpuPlan, HistoricalSkinPath,
     HistoricalToneFixture, HistoricalToneGpu, HistoricalToneGpuPlan, HistoricalTonePath,
@@ -137,112 +129,93 @@ pub use portrait_stage::{
     GPU_PROVEN_HISTORICAL_SKIN_PFS, GPU_PROVEN_HISTORICAL_TONE_PFS,
 };
 pub(crate) use portrait_stage::sha256_32;
-pub use portrait_stage::{
+// Portrait producer inputs, receipts and model-id constants: crate-internal
+// GPU/vendor vocabulary. Only the domain entry points and the `Pf30025*` /
+// `Portrait*` inputs the engine's own tests drive stay at the crate root.
+#[allow(dead_code, unused_imports)]
+pub(crate) use portrait_stage::{
     BodyGeometryInput, BodyGeometryJob, BodyGeometryProducerInputs, BodyLandmarkDomain,
-    BodyVendorParams,
-    BodyLandmarkEffect, BodyLandmarkFrame, BodyLandmarkRef, BodyShiftInput, FaceGeometry,
-    FaceGeometryDraw,
-    FaceGeometryInputs, FaceGeometryProviderInputs, FaceGeometryProviderMesh,
-    FaceGeometryProviderMeshReceipt, FaceGeometryProviderReceipt, FaceGeometryProviderRoute,
-    FaceGeometryProviderRow, HistoricalSkinData, HistoricalSkinExternalInputs,
-    HistoricalSkinExternalRow, HistoricalSkinImmediateInputs, HistoricalSkinImmediateRow,
-    HistoricalSkinInput, HistoricalSkinInputs, HistoricalSkinPass, HistoricalSkinWrinkle,
-    HistoricalToneData, HistoricalToneFace,
-    HistoricalToneInput, HistoricalToneInputs,
-    HlfBodyAdjustLutProducerInputs, Pf8050AttachReceipt, Pf8050FboReceipt, Pf8050GeometryInputs,
-    Pf8050StageInputs, Pf8050VendorRuntime, Pf30025Inputs, Pf30025LiveModelOutputs,
-    Pf30025ProducerInputs, Pf30025SameJobReceipt, Pf30025SourceSurface, Pf30026EdgeOutput,
-    Pf30026GateBinding, Pf8069PositiveInputs, Pf90004ProducerInputs, Pf90021DirectionReceipt, Pf90021Inputs,
-    Pf90021MaskSource, Pf90021ProducerInputs, Pf90021RuntimeReceipt, Pf90021SameJobBinding,
-    FaceLandmarkProducerInputs, FACE_LANDMARK_52_MODEL_SHA256, FACE_LANDMARK_52_RESOURCE,
-    FaceInputBundle, FaceInputModelPaths, FaceInputProducer, C1FaceDetection,
-    C1FaceMesh, C1FaceParsing, C1_FACE_DETECTION_MODEL_SHA256, C1_FACE_DETECTION_MODEL_ID,
-    C1_FACE_MESH_MODEL_SHA256, C1_FACE_MESH_MODEL_ID, C1_FACE_PARSING_MODEL_SHA256,
-    C1_FACE_PARSING_MODEL_ID, FACE_LANDMARK_1063025060_MODEL_SHA256,
-    FACE_LANDMARK_323773030_MODEL_SHA256, FACE_LANDMARK_CONSTANTS_SHA256,
-    FaceInputFileStamp, FaceInputResultKey, FaceInputSession, FaceInputSessionKey,
-    FaceModelIdentity, FaceNormalization, FaceStageTransform, FACE_STAGE_TRANSFORM_REFUSAL,
-    EyeBagFrameProducer, Pf90116ColorDomain, Pf90116FrameGeometry,
+    BodyVendorParams, BodyLandmarkEffect, BodyLandmarkFrame, BodyLandmarkRef,
+    BodyShiftInput, FaceGeometry, FaceGeometryDraw, FaceGeometryInputs,
+    FaceGeometryProviderInputs, FaceGeometryProviderMesh, FaceGeometryProviderMeshReceipt, FaceGeometryProviderReceipt,
+    FaceGeometryProviderRoute, FaceGeometryProviderRow, HistoricalSkinData, HistoricalSkinExternalInputs,
+    HistoricalSkinExternalRow, HistoricalSkinImmediateInputs, HistoricalSkinImmediateRow, HistoricalSkinInput,
+    HistoricalSkinInputs, HistoricalSkinPass, HistoricalSkinWrinkle, HistoricalToneData,
+    HistoricalToneFace, HistoricalToneInput, HistoricalToneInputs, HlfBodyAdjustLutProducerInputs,
+    Pf8050AttachReceipt, Pf8050FboReceipt, Pf8050GeometryInputs, Pf8050StageInputs,
+    Pf8050VendorRuntime, Pf30026EdgeOutput, Pf30026GateBinding, Pf8069PositiveInputs,
+    Pf90004ProducerInputs, Pf90021DirectionReceipt, Pf90021Inputs, Pf90021MaskSource,
+    Pf90021ProducerInputs, Pf90021RuntimeReceipt, Pf90021SameJobBinding, FaceLandmarkProducerInputs,
+    FACE_LANDMARK_52_MODEL_SHA256, FACE_LANDMARK_52_RESOURCE, FaceInputBundle, FaceInputModelPaths,
+    FaceInputProducer, C1FaceDetection, C1FaceMesh, C1FaceParsing,
+    C1_FACE_DETECTION_MODEL_SHA256, C1_FACE_DETECTION_MODEL_ID, C1_FACE_MESH_MODEL_SHA256, C1_FACE_MESH_MODEL_ID,
+    C1_FACE_PARSING_MODEL_SHA256, C1_FACE_PARSING_MODEL_ID, FACE_LANDMARK_1063025060_MODEL_SHA256, FACE_LANDMARK_323773030_MODEL_SHA256,
+    FACE_LANDMARK_CONSTANTS_SHA256, FaceInputFileStamp, FaceInputResultKey, FaceInputSession,
+    FaceInputSessionKey, FaceModelIdentity, FaceNormalization, FaceStageTransform,
+    FACE_STAGE_TRANSFORM_REFUSAL, EyeBagFrameProducer, Pf90116ColorDomain, Pf90116FrameGeometry,
     Pf90116FrameBinding, Pf90116FrameReceipt, Pf90116InputOrder, Pf90116TensorReceipts,
     PF90116_ACTIVE_GATE, PF90116_COLOR_NAME, PF90116_COLOR_SHAPE, PF90116_INPUT_MEAN,
     PF90116_INPUT_NAME, PF90116_INPUT_SCALE, PF90116_INPUT_SHAPE, PF90116_MODEL_HEIGHT,
-    PF90116_MODEL_ID, PF90116_MODEL_NET_SHA256, PF90116_MODEL_PAYLOAD_SHA256,
-    PF90116_MODEL_WIDTH, PF90116_RESPONSE_NAME, PF90116_RESPONSE_SHAPE, MakeupInput,
-    PortraitBackend, PortraitEffectRun,
-    PortraitFrameReceipt, PortraitGeometryRun, PortraitJobInputs, PortraitJobReceipt,
-    PortraitMasks, ProducerInputs, PLUMP_PFS,
-    PlumpCompositeReceipt, PlumpFinalComposite, PlumpProducerInputs, SmileAxisDecode, SmileAxisSign,
-    SmileChannelSplit, SmileFieldChannel, SmileHostSplitSpec,
-    SmileProducerInputs, SmileRgbReconstructionField, SmileSigmoidEdgeResponse,
-    BeardInputs, HairGlossInputs, HairSmoothInputs, MoistureBodyInputs, MoistureFaceInputs,
-    RepairModelPlanes, RepairOutput, RepairOutputReceipt, RepairPlaneSha256,
-    RepairProducerInputs, SixPointWarp, SlimProducerInputs,
-    StrayHairInputs, StrayHairProducerInputs, SuitPassInput, SuitPassKindInput,
-    TeethAlignmentProducerInputs, TeethProducerInputs,
-    apply_pf8050_pf8051_geometry,
-    apply_pf8050_pf8051_stage,
-    apply_pf8033_cpu_forward,
-    build_historical_skin_inputs,
-    apply_portrait_effects_with_job,
-    apply_portrait_effects_with_report_and_inputs,
-    build_face_geometry_inputs,
-    build_pf8033_cpu_forward_row,
-    full_face_descriptor_from_ui,
-    landmark_receipt_hashes,
-    load_pf8033_cpu_forward_artifacts,
-    mesh_receipt,
-    pf8033_cpu_forward_cpu_oracle,
-    provider_route,
-    PROVIDER_ROUTED_PFS,
-    Pf8033CpuForwardArtifacts,
-    Pf8033CpuForwardReceipt,
-    Pf8033CpuForwardRun,
-    Pf8033HostSplitReceiptData,
-    Pf8033ModelReceipt,
-    Pf8033NetworkReceipt,
-    Pf8033TensorReceipt,
-    Pf8033WarpReceipt,
-    PF8033_CPU_FORWARD_ARTIFACTS_ENV,
-    PF8033_CPU_FORWARD_RECEIPT_ENV,
-    PF8033_DX_FILE,
-    PF8033_DY_FILE,
-    PF8033_FINAL_MODEL_ID,
-    PF8033_FINAL_TENSOR_FILE,
-    PF8033_FINAL_TENSOR_ID,
-    PF8033_FRAME_HEIGHT,
-    PF8033_FRAME_WIDTH,
-    PF8033_MASK_FILE,
-    PF8033_MODEL_HEIGHT,
-    PF8033_MODEL_IDS,
-    PF8033_MODEL_ROOT_ENV,
-    PF8033_MODEL_WIDTH,
+    PF90116_MODEL_ID, PF90116_MODEL_NET_SHA256, PF90116_MODEL_PAYLOAD_SHA256, PF90116_MODEL_WIDTH,
+    PF90116_RESPONSE_NAME, PF90116_RESPONSE_SHAPE, MakeupInput, PortraitEffectRun,
+    PortraitFrameReceipt, PortraitGeometryRun, PLUMP_PFS, PlumpCompositeReceipt,
+    PlumpFinalComposite, PlumpProducerInputs, SmileAxisDecode, SmileAxisSign,
+    SmileChannelSplit, SmileFieldChannel, SmileHostSplitSpec, SmileProducerInputs,
+    SmileRgbReconstructionField, SmileSigmoidEdgeResponse, BeardInputs, HairGlossInputs,
+    HairSmoothInputs, MoistureBodyInputs, MoistureFaceInputs, RepairModelPlanes,
+    RepairOutput, RepairOutputReceipt, RepairPlaneSha256, RepairProducerInputs,
+    SixPointWarp, SlimProducerInputs, StrayHairInputs, StrayHairProducerInputs,
+    SuitPassInput, SuitPassKindInput, TeethAlignmentProducerInputs, TeethProducerInputs,
+    apply_pf8050_pf8051_geometry, apply_pf8050_pf8051_stage, apply_pf8033_cpu_forward, build_historical_skin_inputs,
+    apply_portrait_effects_with_report_and_inputs, build_face_geometry_inputs, build_pf8033_cpu_forward_row, full_face_descriptor_from_ui,
+    landmark_receipt_hashes, load_pf8033_cpu_forward_artifacts, mesh_receipt, pf8033_cpu_forward_cpu_oracle,
+    provider_route, PROVIDER_ROUTED_PFS, Pf8033CpuForwardArtifacts, Pf8033CpuForwardReceipt,
+    Pf8033CpuForwardRun, Pf8033HostSplitReceiptData, Pf8033ModelReceipt, Pf8033NetworkReceipt,
+    Pf8033TensorReceipt, Pf8033WarpReceipt, PF8033_CPU_FORWARD_ARTIFACTS_ENV, PF8033_CPU_FORWARD_RECEIPT_ENV,
+    PF8033_DX_FILE, PF8033_DY_FILE, PF8033_FINAL_MODEL_ID, PF8033_FINAL_TENSOR_FILE,
+    PF8033_FINAL_TENSOR_ID, PF8033_FRAME_HEIGHT, PF8033_FRAME_WIDTH, PF8033_MASK_FILE,
+    PF8033_MODEL_HEIGHT, PF8033_MODEL_IDS, PF8033_MODEL_ROOT_ENV, PF8033_MODEL_WIDTH,
 };
-pub use wrinkle_legacy::{
-    WRINKLE_FACEPARSING_MASK_MAPPING_REFUSAL, WRINKLE_FACE_ROI_WRITER_RVA,
-    WRINKLE_LANDMARK_194_COUNT, WRINKLE_LANDMARK_56_COUNT,
-    WRINKLE_LEGACY_SKIN_MASK_FILTER_SLOT, WRINKLE_LEGACY_SKIN_MASK_SERVICE_OFFSET,
-    WRINKLE_LEGACY_SKIN_MASK_TEXTURE_INDEX, WRINKLE_MASK_ROI_SIDE,
-    WRINKLE_SHADER_UPLOAD_REFUSAL, WRINKLE_V1_PARAM_SLOTS, WRINKLE_V1_SHADER_SLOTS,
-    WrinkleFaceRoiContract, WrinkleLegacySkinMaskProducer, WrinkleLegacySkinMaskTexture,
-    WrinkleMaskMiniImage, WrinkleMaskMiniImageProducer, WrinkleProducerInputs, WrinkleSameJobReceipt,
+pub use portrait_stage::{
+    Pf30025Inputs, Pf30025LiveModelOutputs, Pf30025ProducerInputs, Pf30025SameJobReceipt,
+    Pf30025SourceSurface, PortraitBackend, PortraitJobInputs, PortraitJobReceipt,
+    PortraitMasks, ProducerInputs, apply_portrait_effects_with_job,
+};
+
+// Legacy wrinkle producer vocabulary: crate-internal, not a public contract.
+#[allow(dead_code, unused_imports)]
+pub(crate) use wrinkle_legacy::{
+    WRINKLE_FACEPARSING_MASK_MAPPING_REFUSAL, WRINKLE_FACE_ROI_WRITER_RVA, WRINKLE_LANDMARK_194_COUNT,
+    WRINKLE_LANDMARK_56_COUNT, WRINKLE_LEGACY_SKIN_MASK_FILTER_SLOT, WRINKLE_LEGACY_SKIN_MASK_SERVICE_OFFSET,
+    WRINKLE_LEGACY_SKIN_MASK_TEXTURE_INDEX, WRINKLE_MASK_ROI_SIDE, WRINKLE_SHADER_UPLOAD_REFUSAL,
+    WRINKLE_V1_PARAM_SLOTS, WRINKLE_V1_SHADER_SLOTS, WrinkleFaceRoiContract,
+    WrinkleLegacySkinMaskProducer, WrinkleLegacySkinMaskTexture, WrinkleMaskMiniImage,
+    WrinkleMaskMiniImageProducer, WrinkleProducerInputs, WrinkleSameJobReceipt,
     WrinkleShaderSlot, WrinkleV1ParamSlot, WrinkleV1ParamsResultReceipt,
     faceparsing_v2_wrinkle_masks_refusal, validate_wrinkle_uniforms,
 };
-pub use portrait_stage::{
-    GlareChainFinalWritebackInputs, GlareFinalWritebackInputs, GlareFinalWritebackOutput,
-    GlareInputs, GlarePlanarBundle, GlarePlanarInputs, GlarePlanarReceipts, GlareWritebackInputs,
-    GlareWritebackOutput, PF90130_A_PLANAR_BYTES, PF90130_B_PLANAR_BYTES, PF90130_EFFECT_TENSOR_ID,
-    PF90130_INPUT_TENSOR_ID, PF90130_MASK_TENSOR_ID, PF90130_MODEL_ID, PF90130_NORMALIZE_SCALE,
-    PF90130_NORMALIZE_SUB, PF90130_PIXELS, PF90130_PLANE_HEIGHT, PF90130_PLANE_WIDTH,
-    Pf101ProducerInputs, Pf90130AlignedGeometry, Pf90130GlareProducer, Pf90130ProducerInputs,
-    Pf90130SameJobReceipt, Pf90130StageRun,
-    SkinRepairData, SkinRepairOutput, SkinRepairProducerInputs, SpotlessGainmapJob, SpotlessInputs,
-    apply_glare_chain_final_writeback, apply_glare_final_writeback, apply_glare_stage_writeback,
-    apply_pf90130_producer_stage, bridge_glare_planes, run_skin_repair,
+
+// Glare / skin-repair producer internals: crate-internal. The writeback
+// entry points and PF90130 binding constants the engine tests drive stay public.
+#[allow(dead_code, unused_imports)]
+pub(crate) use portrait_stage::{
+    GlareFinalWritebackOutput, GlareInputs, GlarePlanarBundle, GlareWritebackOutput,
+    PF90130_NORMALIZE_SCALE, PF90130_NORMALIZE_SUB, Pf101ProducerInputs, Pf90130ProducerInputs,
+    Pf90130SameJobReceipt, Pf90130StageRun, SkinRepairData, SkinRepairOutput,
+    SkinRepairProducerInputs, SpotlessGainmapJob, SpotlessInputs, run_skin_repair,
     resolve_spotless_gainmap_amount, run_spotless_gainmap_16u,
 };
-pub use portrait_makeup_bundle::*;
-pub use portrait_makeup_provider::*;
+pub use portrait_stage::{
+    GlareChainFinalWritebackInputs, GlareFinalWritebackInputs, GlarePlanarInputs, GlarePlanarReceipts,
+    GlareWritebackInputs, PF90130_A_PLANAR_BYTES, PF90130_B_PLANAR_BYTES, PF90130_EFFECT_TENSOR_ID,
+    PF90130_INPUT_TENSOR_ID, PF90130_MASK_TENSOR_ID, PF90130_MODEL_ID, PF90130_PIXELS,
+    PF90130_PLANE_HEIGHT, PF90130_PLANE_WIDTH, Pf90130AlignedGeometry, Pf90130GlareProducer,
+    apply_glare_chain_final_writeback, apply_glare_final_writeback, apply_glare_stage_writeback, apply_pf90130_producer_stage,
+    bridge_glare_planes,
+};
+
+// `portrait_makeup_bundle` / `portrait_makeup_provider` stay reachable through
+// their public module paths; the crate root does not glob-re-export them.
 mod param_meta;
 mod preview_cache;
 mod presets;
@@ -255,8 +228,10 @@ mod rawmatch;
 mod rawinfo;
 mod wb_gains;
 mod recipe;
-/// Compiled execution view of a saved node graph.
-pub mod render_plan;
+/// Compiled execution view of a saved node graph. Crate-internal until the
+/// renderer consumes it; its own tests exercise it today.
+#[allow(dead_code)]
+pub(crate) mod render_plan;
 pub(crate) mod render_plan_types;
 mod save_queue;
 pub use save_queue::*;
@@ -329,8 +304,10 @@ pub use output::*;
 pub use panel_commands::{
     CaptureDevice, PortraitCapability, PrintLayout, PrintPreview, PrintRequest,
 };
-#[doc(hidden)]
-pub use mock::process::{render, render16, Rendered, Rendered16, Source};
+// The CPU renderer's frame/input types are internal plumbing; the app never
+// names them and the engine reaches them through these crate-visible aliases.
+#[allow(dead_code, unused_imports)]
+pub(crate) use mock::process::{render, render16, Rendered, Rendered16, Source};
 pub use param_meta::*;
 pub use presets::*;
 pub use raw::*;

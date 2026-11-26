@@ -65,13 +65,26 @@ standalone word `Plan` 命中（实测 10 passed / 1 failed）。随后同一组
 
 ### G2 — 把 `render_sized`、layer 合成与 retouch 决策迁出 `mock`
 
-- 进展（2026-11-26）：
-  - **已迁出且已接线**：`clean_region` → `crates/engine/src/processing/sizing.rs`（`mock/process.rs` 现委托）；`luma_range_weight` → `crates/engine/src/processing/layer_weight.rs`（渲染器现委托）。两模块带自身单测，`cargo test -p aurora-engine --lib mock::process::tests` 116 passed。
-  - **已迁出、待接线**：`crates/engine/src/processing/retouch_stage.rs`（`retouch_plane`/`union_plane`/`apply_retouch`，含测试）；渲染器仍走本地实现，接线前必须先做字节对拍。
-  - **仍在 `mock/process.rs`**：`render_sized`、`layer_plans`、`cached_layer_weights`、`apply_layers`；`mock/retouch.rs` 仍未在 `mock/mod.rs` 声明。
+- 进展（2026-11-26，最终）：
+  - **已迁出且已接线**：`clean_region` → `processing/sizing.rs`；`luma_range_weight` →
+    `processing/layer_weight.rs`；`apply_layers`/`apply_layer_color_row`/
+    `static_mask_can_apply`/`layer_weight`/`layer_pixel`/`local`、
+    `cached_layer_weights`、`layer_mask_weight` → `crates/engine/src/layer_stage.rs`
+    （`layer_stage` 已不依赖 `mock::process`）；`retouch_plane`/`union_plane`/
+    `apply_retouch` → `processing/retouch_stage.rs` 并由渲染器调用。
+  - `color_balance`、`black_white`、`bw_sector_y`、`bw_split_tone`、`bw_weights` →
+    `processing/color.rs`；`mock/process.rs` 通过 `pub(crate) use` 保持测试与调用点不变。
+  - 行为未改：`mock::process::tests` 116 passed；全量 engine 1911/29/94/105（失败集不变）；
+    规则 11/0。GPU 路由与混合顺序未动。
+  - **仍在 `mock/process.rs`**：`render_sized`、`layer_plans`、`mask_grid`/
+    `cached_mask_grids`（都直接持有 `Source`/GPU 句柄，需先定义渲染层边界）。
+  - **待 owner 裁决**：`crates/engine/src/mock/retouch.rs`（674 行，仍未被
+    `mock/mod.rs` 声明）是删除还是接线。
 - 目标：纯 sizing/layer 权重/retouch 逻辑不再定义在 `mock/process.rs` 或孤儿文件里。
-- 触碰点（2026-11-26 快照，行号会漂移，先 grep）：`render_sized` `mock/process.rs`；
-  `layer_plans`；`cached_layer_weights`；`apply_layers`；
+- 触碰点（2026-11-26 快照，行号会漂移，先 grep）：`render_sized`、`layer_plans`、
+  `mask_grid`/`cached_mask_grids` 仍在 `mock/process.rs`；layer 合成在
+  `crates/engine/src/layer_stage.rs`；retouch 在
+  `crates/engine/src/processing/retouch_stage.rs`；孤儿文件
   `crates/engine/src/mock/retouch.rs`（674 行，未被 `mock/mod.rs` 声明）。
 - 验收：`render_sized`/layer 权重逻辑位于非 `mock` 模块并通过默认帧字节对拍；
   `retouch.rs` 要么被明确接线并有测试，要么作为 dead code 删除（先由 owner 裁决）。
@@ -118,15 +131,38 @@ standalone word `Plan` 命中（实测 10 passed / 1 failed）。随后同一组
 - 约束：不改 `crates/engine/testdata/` 外部资产、不把资产提交 Git；不把失败写成通过。
 - 建议 lane：infra / owner（资产授权）。
 
-### G12 — 公共面仍暴露内部类型
+### G12 — 公共面仍暴露内部类型（评审完成，零风险部分已落地）
 
 - 目标：公共 API 与内部实现分离，trait 领域方法可评审。
-- 触碰点：`crates/engine/src/lib.rs` 约 56 处 `pub use`；`crates/engine/src/engine.rs`
-  约 97 个 `fn` 行；`portrait_stage`/vendor/CUDA 相关类型仍被 root re-export。
-- 验收：内部类型改 `pub(crate)`；稳定边界才 re-export；`ImageEngine` 方法清单有评审记录。
-- 验证：`cargo check --workspace --all-targets --locked`；
-  `cargo test -p aurora-engine --test architecture_rules --locked`；app 编译/测试。
-- 约束：先确认没有 app 调用点依赖被收窄的 re-export；不新增 crate。
+- 评审记录：**`docs/architecture/PUBLIC-SURFACE-REVIEW.md`**（2026-11-26）。
+  审计范围：60 条 root `pub use`/350 个显式名、30 个 root glob（约 796 item）、
+  54 个 `pub mod`、`ImageEngine` 的 81 个方法；逐名 grep `crates/app/src`、
+  `crates/engine/{tests,examples}`、`crates/portrait/{src,tests,examples}`，
+  并以 `cargo check --workspace --all-targets` 定案常见词误报。
+- 已应用（256 个显式名 + 1 个模块 re-export + 1 个 `pub mod` + 3 个 root glob）：
+  - `portrait_stage` producer/历史色调/glare 内部（164+15+18 名）→ `pub(crate) use`；
+    仅保留 engine 测试驱动的 32 个名字为 root `pub use`（pf30025/glare 测试）。
+  - `body_shader_abi`(11)、`wrinkle_legacy`(23)、`mock::process` 帧类型(5)
+    → `pub(crate) use`；`portrait_face_input_stage` 模块 re-export → `pub(crate)`。
+  - `aurora_portrait::cuda_pf90021`(3)、`portrait_historical_tone_provider`(17)
+    → 删除 root re-export（模块/上游路径仍在）。
+  - `pub mod render_plan` → `#[allow(dead_code)] pub(crate) mod`（仅自测）。
+  - `blemish_gainmap`/`portrait_makeup_bundle`/`portrait_makeup_provider`
+    的 root glob 删除；三个模块仍 `pub`，调用点均走模块路径
+    （`crates/engine/examples/blemish_gpu_bench.rs:10`、`blemish_env_off.rs:3`、
+    `crates/engine/tests/makeup_owner_bytes.rs:3`）。
+- 延后（见评审 §6）：`pub mod processing`、`c1_model`/`c1_masks`/`c1_styles`/
+  `lensdb`/`layer_graph`/`matchlook`/`recipe` 的零调用名、`raw`/`aurora_raw`/
+  `camera_params` 等 `pub mod`、`z6iii`、C1 catalog/sidecar 领域类型。原因：
+  属稳定领域或主树外 c1-parse/portrait lane 的未验证接口，需 owner 裁决；
+  本轮未验证主树外依赖。
+- 验证（本 worktree）：`cargo check --workspace --all-targets --locked` exit 0；
+  architecture_rules **11 passed**；engine lib **1911 passed / 29 failed / 94 ignored /
+  105 filtered**（失败集不变）；app lib **99 passed / 1 failed / 5 ignored**
+  （既有 EIP fixture）。`pub(crate)` 使 producer item 变为 dead code，engine lib
+  warning 由 223 增至 282（可达性事实，非功能回归）。
+- 约束：不新增 crate；不改 `LICENSE`；不恢复已收窄的 root re-export，除非 owner
+  确认主树外生产者在用。
 - 建议 lane：`crates/engine` + owner 评审。
 
 ### G9 — 许可证 MIT vs Proprietary（需裁决）

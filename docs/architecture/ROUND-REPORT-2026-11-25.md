@@ -175,3 +175,21 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 最新全量（macOS arm64）：engine **1911 passed / 29 failed / 94 ignored / 105 filtered**（失败集不变）；
 app **99 / 1 / 5**；architecture rules **11 passed / 0 failed**；`cargo check --workspace
 --all-targets --locked` exit 0。Windows/GPU/Metal/性能与外部 fixture 仍为未验证。
+
+
+## 2026-11-26 追加二：layer/retouch 迁移与 G12 收窄
+
+- layer 合成整体迁入 `crates/engine/src/layer_stage.rs`：`apply_layers`、
+  `apply_layer_color_row`、`static_mask_can_apply`、`layer_weight`、`layer_pixel`、
+  `local`、`cached_layer_weights`、`layer_mask_weight`；该模块不再依赖 `mock::process`。
+- `retouch_stage.rs` 的三函数已由渲染器调用；`mock/process.rs` 的重复实现删除。
+- `color_balance`/`black_white`/B&W 权重与分段算法迁入 `processing/color.rs`。
+- 仍在 `mock`：`render_sized`、`layer_plans`、`mask_grid`/`cached_mask_grids`（持有
+  `Source`/GPU 句柄）；`mock/retouch.rs` 孤儿文件待 owner 裁决。
+- G12：审计 350 个显式名字、约 796 个 glob item、81 个 `ImageEngine` 方法；256 个
+  零外部调用者名字收窄为 `pub(crate)`，3 个 root glob 删除（模块仍 `pub`），
+  `render_plan` 改为 `pub(crate)`。剩余稳定领域/主树外 lane 接口见
+  `PUBLIC-SURFACE-REVIEW.md` §6，需 owner 确认。
+- 最终验证：workspace check exit 0；engine 1911/29/94/105（失败集不变）；
+  app 99/1/5；规则 11/0。`pub(crate)` 收窄使未使用的 producer 类型显性化，
+  lib 警告数上升，属于可达性事实，不是功能回归。

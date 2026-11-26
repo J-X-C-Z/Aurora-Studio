@@ -67,6 +67,8 @@
 | 运行时字段迁移（G3） | `cargo test -p aurora-engine --lib document:: adjust:: processing::frame_map preview_cache`；`mock::process::tests` | 字段已从 `AdjustmentSet` 删除，由 `document::LensRuntime` 持有并经 `render_with_runtime`/`sample_point` 显式传入；`PreviewKey::with_runtime`/`dust_frame_key` 混入指纹；document 11、frame_map 33、preview_cache 9、process 116 passed；adjust 仅既有 NEF fixture 1 failed |
 | App 状态分组（G5/G13） | `cargo test -p portrait-app --lib` | **99 passed / 1 failed / 5 ignored**（既有 EIP fixture）；history/undo 纯状态转移 + `LibraryState` 浏览器字段 |
 | 原子写临时名（G10） | `cargo test -p aurora-engine --lib store::tests` | **34 passed / 1 ignored**；唯一临时名、8 线程同目标并发、失败清理、durable 路径 |
+| 迁移：layer/retouch | `cargo test -p aurora-engine --lib mock::process::tests`、`retouch_stage`、`layer_stage` | `apply_layers`/权重缓存/`local`/`layer_mask_weight` → `layer_stage`（不再依赖 `mock`）；retouch 三函数 → `processing::retouch_stage` 并接线；B&W/ColorBalance → `processing::color`；process 116 passed、retouch 5 passed、规则 11/0 |
+| 公共面收窄（G12） | `cargo check --workspace --all-targets --locked` + 全量基线 | 审计 350 显式名/796 glob/81 方法；256 名零外部调用者收窄为 `pub(crate)`；剩余稳定领域与主树外 lane 接口需 owner 确认；基线不变 |
 | FileEngine 服务 | 全量 suite + source/preview/export/merge/save/inference/capture/import/library 定向测试 | Catalog/Source/Render/Export/Merge/Persistence/Inference/Capture/Import/Library 全部拆出；**1911 passed / 29 failed**（2026-11-26 全量），失败集不变 |
 | 迁移：frame_map | `cargo test -p aurora-engine --lib frame_map` | **33 passed**；`mock::geometry` 兼容别名；规则 8 通过 |
 | Z6III 平台分层 | `cargo test -p aurora-engine --lib aurora_raw` | **83 passed / 13 ignored**（中性算法在 macOS 编译/测试；Windows/OpenCL 仍 gate） |
