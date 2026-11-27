@@ -785,8 +785,7 @@ impl AppState {
             self.preview_state.sampled_color = None;
             self.preview_state.picker_point = None;
             cx.emit(StateEvent::CurrentChanged);
-            // 换图即换能力结论：后台取本图的快照，绘制照样只读缓存。
-            self.request_portrait_capability(portrait_capability::CapabilityDetail::Auto, cx);
+            // 等待首帧解码完成后由人像面板自动按帧探测，避免未解码前抢跑缓存 0/147。
             self.request_render(RenderQuality::Final, cx);
         }
         cx.notify();

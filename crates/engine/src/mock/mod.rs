@@ -480,6 +480,30 @@ impl ImageEngine for MockEngine {
         "Portrait Mock Engine 0.1 (CPU preview)".into()
     }
 
+    fn capabilities(&self) -> crate::engine::EngineCapabilities {
+        crate::engine::EngineCapabilities {
+            ai_mask_kinds: vec![
+                crate::AiMaskKind::Subject,
+                crate::AiMaskKind::Person,
+                crate::AiMaskKind::Clothing,
+                crate::AiMaskKind::Skin,
+                crate::AiMaskKind::Hair,
+                crate::AiMaskKind::Sky,
+                crate::AiMaskKind::Background,
+            ],
+            eye_report: true,
+            auto_rotate: false,
+            match_look: false,
+            tether: false,
+            blemish_gainmap: false,
+            blemish_gainmap_model: false,
+            export_formats: crate::output::ExportFormat::ALL
+                .into_iter()
+                .filter(|format| format.is_supported())
+                .collect(),
+        }
+    }
+
     fn images(&self) -> Vec<ImageInfo> {
         self.state.lock().entries.iter().map(|e| e.info.clone()).collect()
     }

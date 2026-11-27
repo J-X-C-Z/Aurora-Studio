@@ -58,6 +58,7 @@ pub mod raster_fragment;
 pub mod metal;
 pub mod metal_mesh;
 pub mod metal_smile;
+pub mod wgpu_backend;
 pub mod effect_router;
 pub mod native_infer;
 

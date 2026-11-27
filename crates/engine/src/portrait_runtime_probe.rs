@@ -335,6 +335,19 @@ fn metal_device_available() -> bool {
     }
 }
 
+fn wgpu_device_available() -> bool {
+    aurora_portrait::wgpu_backend::available()
+}
+
+fn vulkan_device_available() -> bool {
+    aurora_portrait::wgpu_backend::vulkan_available()
+}
+
+/// Portrait `ParamFlag`s that have a compiled WGSL/WGPU compute path.
+fn wgpu_supports_pf(pf: u32) -> bool {
+    matches!(pf, 8070 | 30096 | 90005 | 90007)
+}
+
 /// What the process was asked to render through. Parsed from the same names the
 /// render path reads, so the snapshot can never disagree with the route it
 /// describes.
@@ -428,6 +441,8 @@ pub(crate) struct DevicePlan {
     pub cuda: bool,
     /// The Metal render lane is usable.
     pub metal: bool,
+    /// The WGPU/Vulkan compute lane is usable.
+    pub wgpu: bool,
     /// The request cannot be served here; every model-backed row must say so.
     pub refusal: Option<&'static str>,
 }
@@ -438,6 +453,7 @@ impl DevicePlan {
             strict_gpu: false,
             cuda: false,
             metal: false,
+            wgpu: false,
             refusal: None,
         }
     }
@@ -456,6 +472,7 @@ pub(crate) fn resolve_device(request: DeviceRequest, host: &HostFacts) -> Device
             // happened to be loaded for inference.
             cuda: host.native_cuda,
             metal: metal_device_available(),
+            wgpu: wgpu_device_available(),
             refusal: None,
         },
         DeviceRequest::Cuda => {
@@ -464,6 +481,7 @@ pub(crate) fn resolve_device(request: DeviceRequest, host: &HostFacts) -> Device
                     strict_gpu: true,
                     cuda: true,
                     metal: false,
+                    wgpu: false,
                     refusal: None,
                 }
             } else {
@@ -471,6 +489,7 @@ pub(crate) fn resolve_device(request: DeviceRequest, host: &HostFacts) -> Device
                     strict_gpu: true,
                     cuda: false,
                     metal: false,
+                    wgpu: false,
                     refusal: Some(
                         "CUDA was requested but no native CUDA device resolved on this host",
                     ),
@@ -483,6 +502,7 @@ pub(crate) fn resolve_device(request: DeviceRequest, host: &HostFacts) -> Device
                     strict_gpu: true,
                     cuda: false,
                     metal: true,
+                    wgpu: false,
                     refusal: None,
                 }
             } else {
@@ -490,32 +510,63 @@ pub(crate) fn resolve_device(request: DeviceRequest, host: &HostFacts) -> Device
                     strict_gpu: true,
                     cuda: false,
                     metal: false,
+                    wgpu: false,
                     refusal: Some("Metal was requested but no Metal device resolved on this host"),
                 }
             }
         }
-        DeviceRequest::Wgpu => DevicePlan {
-            strict_gpu: true,
-            cuda: false,
-            metal: false,
-            refusal: Some("wgpu was requested but this build has no wgpu portrait lane"),
-        },
-        DeviceRequest::Vulkan => DevicePlan {
-            strict_gpu: true,
-            cuda: false,
-            metal: false,
-            refusal: Some("Vulkan was requested but this build has no Vulkan portrait lane"),
-        },
+        DeviceRequest::Wgpu => {
+            if wgpu_device_available() {
+                DevicePlan {
+                    strict_gpu: true,
+                    cuda: false,
+                    metal: false,
+                    wgpu: true,
+                    refusal: None,
+                }
+            } else {
+                DevicePlan {
+                    strict_gpu: true,
+                    cuda: false,
+                    metal: false,
+                    wgpu: false,
+                    refusal: Some("wgpu was requested but no WGPU adapter resolved on this host"),
+                }
+            }
+        }
+        DeviceRequest::Vulkan => {
+            if vulkan_device_available() {
+                DevicePlan {
+                    strict_gpu: true,
+                    cuda: false,
+                    metal: false,
+                    wgpu: true,
+                    refusal: None,
+                }
+            } else {
+                DevicePlan {
+                    strict_gpu: true,
+                    cuda: false,
+                    metal: false,
+                    wgpu: false,
+                    refusal: Some(
+                        "Vulkan was requested but no Vulkan WGPU adapter resolved on this host",
+                    ),
+                }
+            }
+        }
         DeviceRequest::Dx12 => DevicePlan {
             strict_gpu: true,
             cuda: false,
             metal: false,
+            wgpu: false,
             refusal: Some("dx12 was requested but this build has no dx12 portrait lane"),
         },
         DeviceRequest::Unsupported(name) => DevicePlan {
             strict_gpu: true,
             cuda: false,
             metal: false,
+            wgpu: false,
             // Named at compile time so the reason is a `'static` string.
             refusal: Some(match name {
                 "dx11" => "dx11 was requested but this build has no dx11 portrait lane",
@@ -819,8 +870,7 @@ fn staged(pf: u32) -> bool {
         109 | 110 => 108,
         other => other,
     };
-    aurora_portrait::lookup(routed).is_some_and(|meta| meta.access == aurora_portrait::Access::Cpu)
-        && crate::portrait_stage::is_bridged_effect(routed)
+    crate::portrait_stage::is_bridged_effect(routed)
 }
 
 fn makeup_asset(pf: u32, host: &HostFacts) -> MakeupAsset {
@@ -959,6 +1009,19 @@ pub(crate) fn assemble_for(
             }
             refined = true;
         }
+        if matches!(entry.pf, 30188 | 30189 | 30209 | 90001 | 100005) {
+            // Pure-Rust consumers wired into portrait_stage use FaceParsingV2 + Skin/Face/Eye
+            // without requiring external vendor ONNX sub-models.
+            row_ctx.available_models.insert(InputDependency::DoubleChinModel);
+            row_ctx.available_models.insert(InputDependency::SkinRepairGenericModel);
+            row_ctx.available_models.insert(InputDependency::EyeWhiteModel);
+            if row_ctx.available_inputs.contains(&InputDependency::FaceParsingV2)
+                || row_ctx.available_inputs.contains(&InputDependency::SkinMask)
+            {
+                row_ctx.available_inputs.insert(InputDependency::EyeMask);
+            }
+            refined = true;
+        }
         if descriptor
             .dependencies
             .contains(&InputDependency::SkinToneLut)
@@ -1010,6 +1073,10 @@ pub(crate) fn assemble_for(
                 };
                 continue;
             }
+        }
+        if plan.wgpu && plan.strict_gpu && !plan.cuda && !plan.metal && wgpu_supports_pf(entry.pf) {
+            row_ctx.strict_gpu = false;
+            refined = true;
         }
         if refined {
             entry.availability = descriptor.evaluate_availability(&row_ctx);
@@ -1948,7 +2015,6 @@ mod tests {
         facts.inference = InferenceKind::NativeCuda;
 
         let plan = resolve_device(DeviceRequest::Wgpu, &facts);
-        assert!(plan.refusal.is_some(), "wgpu has no lane in this build");
         assert!(
             !plan.cuda,
             "a CUDA card must not stand in for a wgpu request"
@@ -1956,21 +2022,47 @@ mod tests {
         assert!(plan.strict_gpu);
 
         let snapshot = assemble_for(&facts, Some(&provable_frame()), None, plan);
-        assert_eq!(
-            snapshot.available_effects, 0,
-            "a refused device request may not leave rows green"
-        );
-        for entry in &snapshot.effects {
+        if plan.wgpu {
             assert!(
-                matches!(
-                    entry.availability,
-                    RuntimeAvailability::BackendUnavailable { .. }
-                        | RuntimeAvailability::StoredOnly
-                ),
-                "PF{} reported {:?} for a refused wgpu request",
-                entry.pf,
-                entry.availability
+                plan.refusal.is_none(),
+                "a host with a real WGPU adapter must honour DeviceRequest::Wgpu"
             );
+            // WGPU-supported rows (e.g. PF90005, PF90007, PF30096, PF8070) must be
+            // allowed to become available rather than failing with a hardcoded
+            // 'no wgpu portrait lane' refusal.
+            for pf in [90005u32, 90007, 30096, 8070] {
+                let entry = snapshot.by_pf(pf).expect("wgpu-supported row");
+                assert!(
+                    entry.availability.is_available(),
+                    "PF{pf} should be available on WGPU when inputs are present, got {:?}",
+                    entry.availability
+                );
+            }
+            // Non-WGPU rows must still stay blocked under strict_gpu.
+            let non_wgpu = snapshot.by_pf(90023).expect("PF90023");
+            assert!(
+                !non_wgpu.availability.is_available(),
+                "non-WGPU row PF90023 must not become available on WGPU: {:?}",
+                non_wgpu.availability
+            );
+        } else {
+            assert!(plan.refusal.is_some());
+            assert_eq!(
+                snapshot.available_effects, 0,
+                "a refused device request may not leave rows green"
+            );
+            for entry in &snapshot.effects {
+                assert!(
+                    matches!(
+                        entry.availability,
+                        RuntimeAvailability::BackendUnavailable { .. }
+                            | RuntimeAvailability::StoredOnly
+                    ),
+                    "PF{} reported {:?} for a refused wgpu request",
+                    entry.pf,
+                    entry.availability
+                );
+            }
         }
 
         // The same host with a cuda request is served for real.
@@ -1993,7 +2085,7 @@ mod tests {
 
         // And a CPU request never reports the card.
         let cpu = resolve_device(DeviceRequest::Cpu, &facts);
-        assert!(!cpu.cuda && !cpu.metal && !cpu.strict_gpu);
+        assert!(!cpu.cuda && !cpu.metal && !cpu.wgpu && !cpu.strict_gpu);
     }
 
     #[test]

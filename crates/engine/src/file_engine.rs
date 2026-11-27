@@ -3072,21 +3072,39 @@ impl FileEngine {
             return (None, None);
         };
         let mut st = self.state.lock();
-        if !FileEngine::refresh_source_identity(&mut st, image, &path, false) {
-            return (None, None);
+        if FileEngine::refresh_source_identity(&mut st, image, &path, false) {
+            if let Some(entry) = st.sources.get(&image) {
+                let identity = portrait_runtime_probe::FrameIdentity {
+                    path,
+                    len: entry.identity.len,
+                    mtime_nanos: entry.identity.mtime_nanos,
+                    token: entry.identity.token,
+                };
+                let source = Arc::clone(&entry.source);
+                drop(st);
+                return (Some(identity), Some(source));
+            }
         }
-        let Some(entry) = st.sources.get(&image) else {
-            return (None, None);
-        };
-        let identity = portrait_runtime_probe::FrameIdentity {
-            path,
-            len: entry.identity.len,
-            mtime_nanos: entry.identity.mtime_nanos,
-            token: entry.identity.token,
-        };
-        let source = Arc::clone(&entry.source);
-        drop(st);
-        (Some(identity), Some(source))
+        if st.native_raw.as_ref().is_some_and(|slot| slot.image == image)
+            && FileEngine::refresh_source_identity(&mut st, image, &path, true)
+        {
+            if let Some(slot) = st.native_raw.as_ref() {
+                if slot.image == image {
+                    if let Some(source) = slot.source.as_ref() {
+                        let identity = portrait_runtime_probe::FrameIdentity {
+                            path,
+                            len: slot.identity.len,
+                            mtime_nanos: slot.identity.mtime_nanos,
+                            token: slot.identity.token,
+                        };
+                        let source = Arc::clone(source);
+                        drop(st);
+                        return (Some(identity), Some(source));
+                    }
+                }
+            }
+        }
+        (None, None)
     }
 
     /// A cached source, charged to the byte budget and refreshed in the LRU.

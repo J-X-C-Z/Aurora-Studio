@@ -401,12 +401,152 @@ fn feed(data: &[u8], decoder: &Decoder<'_>) {
         }
 }
 
+const ORIGINAL_EXTENSIONS: &[&str] = &[
+    "nef", "cr2", "cr3", "arw", "dng", "orf", "rw2", "raf", "pef", "srw", "iiq", "3fr", "fff",
+    "raw", "rwl", "jpg", "jpeg", "png", "tif", "tiff", "webp", "heic", "heif",
+];
+
+fn is_cop_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cop"))
+}
+
+fn is_heif_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("heic") || e.eq_ignore_ascii_case("heif"))
+}
+
+fn is_usable_original(path: &Path) -> bool {
+    path.is_file() && !is_cop_path(path)
+}
+
+fn probe_stem_extensions(dir: &Path, stem: &std::ffi::OsStr) -> Option<PathBuf> {
+    let stem_str = stem.to_str()?;
+    for ext in ORIGINAL_EXTENSIONS {
+        for candidate_ext in [ext.to_ascii_lowercase(), ext.to_ascii_uppercase()] {
+            let candidate = dir.join(format!("{stem_str}.{candidate_ext}"));
+            if is_usable_original(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Resolves the original RAW or raster image corresponding to a Capture One
+/// `.cop` cache file when `libjxl` is unavailable.
+pub fn resolve_original(path: &Path) -> Option<PathBuf> {
+    if !is_cop_path(path) {
+        return None;
+    }
+
+    // 1. Double extension in the same directory: e.g. `_DSC5673.NEF.cop` -> `_DSC5673.NEF`.
+    let stripped = path.with_extension("");
+    if is_usable_original(&stripped) {
+        return Some(stripped);
+    }
+
+    let stripped_name = stripped.file_name();
+
+    // 2. Capture One Session/Catalog cache layout: `.../CaptureOne/Cache/.../<name>.cop`.
+    let mut search_dirs = Vec::new();
+    if let Some(parent) = path.parent() {
+        search_dirs.push(parent.to_path_buf());
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("CaptureOne"))
+            && let Some(session_root) = ancestor.parent()
+        {
+            if let Some(name) = stripped_name {
+                let direct = session_root.join(name);
+                if is_usable_original(&direct) {
+                    return Some(direct);
+                }
+                let originals = session_root.join("Originals").join(name);
+                if is_usable_original(&originals) {
+                    return Some(originals);
+                }
+            }
+            search_dirs.push(session_root.to_path_buf());
+            search_dirs.push(session_root.join("Originals"));
+            break;
+        }
+    }
+
+    // 3. Same stem with a known RAW/raster extension (e.g. `photo.cop` -> `photo.NEF`).
+    if let Some(stem) = stripped.file_stem() {
+        for dir in &search_dirs {
+            if let Some(found) = probe_stem_extensions(dir, stem) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+fn decode_original(orig: &Path) -> Result<RgbaImage> {
+    if crate::raw::is_raw(orig) {
+        return crate::raw::decode(orig);
+    }
+    if is_heif_path(orig) {
+        return match crate::heif::decode(orig) {
+            Ok(img) => Ok(img),
+            Err(err) => image::open(orig)
+                .map(|img| img.to_rgba8())
+                .map_err(|fallback| anyhow!("libheif: {err:#}; image crate: {fallback}")),
+        };
+    }
+    Ok(image::open(orig)
+        .with_context(|| format!("failed to decode original image: {}", orig.display()))?
+        .to_rgba8())
+}
+
+fn original_dimensions(orig: &Path) -> Option<(u32, u32)> {
+    if crate::raw::is_raw(orig) {
+        return crate::raw::sensor_dimensions(orig);
+    }
+    if is_heif_path(orig) {
+        return crate::heif::dimensions(orig).ok();
+    }
+    image::image_dimensions(orig).ok()
+}
+
 pub fn decode_cop(path: impl AsRef<Path>) -> Result<RgbaImage> {
-    let library = Library::load()?;
+    let path = path.as_ref();
+    let library = match Library::load() {
+        Ok(library) => library,
+        Err(load_err) => {
+            if let Some(orig) = resolve_original(path) {
+                log::warn!(
+                    "libjxl unavailable ({load_err:#}); falling back to original file {} for .cop {}",
+                    orig.display(),
+                    path.display()
+                );
+                return decode_original(&orig).with_context(|| {
+                    format!(
+                        "fallback decode from {} for .cop {}",
+                        orig.display(),
+                        path.display()
+                    )
+                });
+            }
+            log::warn!(
+                "libjxl unavailable ({load_err:#}); no original file found for .cop {}",
+                path.display()
+            );
+            return Err(load_err);
+        }
+    };
     let symbols = library.symbols()?;
 
-    let data = std::fs::read(path.as_ref()).with_context(|| {
-        format!("failed to read .cop file: {}", path.as_ref().display())
+    let data = std::fs::read(path).with_context(|| {
+        format!("failed to read .cop file: {}", path.display())
     })?;
     let decoder = Decoder::new(&symbols)?;
     feed(&data, &decoder);
@@ -446,9 +586,21 @@ fn basic_info_zero() -> BasicInfo {
 }
 
 pub fn dimensions(path: impl AsRef<Path>) -> Option<(u32, u32)> {
-    let library = Library::load().ok()?;
+    let path = path.as_ref();
+    let library = match Library::load() {
+        Ok(library) => library,
+        Err(_) => {
+            let orig = resolve_original(path)?;
+            log::debug!(
+                "libjxl unavailable; reading dimensions from original file {} for .cop {}",
+                orig.display(),
+                path.display()
+            );
+            return original_dimensions(&orig);
+        }
+    };
     let symbols = library.symbols().ok()?;
-    let data = std::fs::read(path.as_ref()).ok()?;
+    let data = std::fs::read(path).ok()?;
     let decoder = Decoder::new(&symbols).ok()?;
     feed(&data, &decoder);
     unsafe {
@@ -633,12 +785,55 @@ unsafe extern "C" {
 const RTLD_NOW: c_int = 2;
 #[cfg(test)]
 mod tests {
-    use super::decode_cop;
+    use super::{decode_cop, dimensions, resolve_original};
     #[cfg(unix)]
-    use super::{dimensions, LibraryNotFound};
+    use super::LibraryNotFound;
     use anyhow::Result;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("aurora-jxl-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    fn with_missing_jxl<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        struct Restore {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        let (key, value) = ("AURORA_JXL_DIR", dir.join("missing-jxl-dir"));
+        #[cfg(unix)]
+        let (key, value) = ("AURORA_JXL_LIB", dir.join("missing-libjxl.so"));
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, &value) };
+        let _restore = Restore { key, previous };
+        f()
+    }
+
+    #[cfg(windows)]
+    const SAMPLE: &str = r"C:\Users\Jxcz2\Pictures\Capture One Catalog\Cache\Previews\2026\9\13\0\_DSC5673.NEF.cop";
 
     #[cfg(windows)]
     fn dir() -> PathBuf {
@@ -646,36 +841,85 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn sample_path() -> PathBuf {
-        std::env::var_os("AURORA_JXL_SAMPLE")
-            .map(PathBuf::from)
-            .expect("set AURORA_JXL_SAMPLE to a Capture One .cop proxy file")
+    fn source() -> &'static Path {
+        Path::new(SAMPLE)
     }
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "needs local .cop proxy (AURORA_JXL_SAMPLE) and libjxl.dll (AURORA_JXL_DIR)"]
     fn decodes_real_proxy() -> Result<()> {
-        let sample = sample_path();
-        let image = decode_cop(&sample)?;
-        assert!(image.width() > 0 && image.height() > 0);
+        let _guard = env_guard();
+        if !source().is_file() || !dir().join("libjxl.dll").is_file() {
+            eprintln!("skipped: real sample or libjxl.dll unavailable");
+            return Ok(());
+        }
+        let image = decode_cop(source())?;
+        assert_eq!((image.width(), image.height()), (3840, 2560));
         Ok(())
     }
 
     #[cfg(windows)]
     #[test]
     fn missing_dll_returns_err() -> Result<()> {
-        let empty_dir = std::env::temp_dir().join(format!("aurora-empty-jxl-{}", std::process::id()));
+        let _guard = env_guard();
+        let lane = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let empty_dir = lane.join("empty-jxl");
         fs::create_dir_all(&empty_dir)?;
-        let previous = std::env::var_os("AURORA_JXL_DIR");
-        unsafe { std::env::set_var("AURORA_JXL_DIR", &empty_dir) };
-        let result = decode_cop(&empty_dir.join("missing.cop"));
-        match previous {
-            Some(value) => unsafe { std::env::set_var("AURORA_JXL_DIR", value) },
-            None => unsafe { std::env::remove_var("AURORA_JXL_DIR") },
-        }
+        let result = with_missing_jxl(&empty_dir, || decode_cop(source()));
         let _ = fs::remove_dir_all(&empty_dir);
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_dll_falls_back_to_original_image() -> Result<()> {
+        let _guard = env_guard();
+        let dir = temp_dir("fallback-same-dir");
+        fs::create_dir_all(&dir)?;
+
+        let mut rgba = image::RgbaImage::new(12, 8);
+        for pixel in rgba.pixels_mut() {
+            *pixel = image::Rgba([11, 22, 33, 255]);
+        }
+        let orig = dir.join("frame.png");
+        rgba.save(&orig)?;
+        let cop = dir.join("frame.png.cop");
+        fs::write(&cop, b"not-jxl")?;
+
+        let (decoded, dims) = with_missing_jxl(&dir, || (decode_cop(&cop), dimensions(&cop)));
+        let _ = fs::remove_dir_all(&dir);
+
+        let image = decoded?;
+        assert_eq!(dims, Some((12, 8)));
+        assert_eq!(image.dimensions(), (12, 8));
+        assert_eq!(image.get_pixel(0, 0).0, [11, 22, 33, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_dll_falls_back_from_capture_one_cache_layout() -> Result<()> {
+        let _guard = env_guard();
+        let dir = temp_dir("fallback-c1-layout");
+        let proxies = dir.join("CaptureOne").join("Cache").join("Proxies");
+        fs::create_dir_all(&proxies)?;
+
+        let mut rgba = image::RgbaImage::new(10, 10);
+        for pixel in rgba.pixels_mut() {
+            *pixel = image::Rgba([200, 100, 50, 255]);
+        }
+        let orig = dir.join("shot.png");
+        rgba.save(&orig)?;
+        let cop = proxies.join("shot.cop");
+        fs::write(&cop, b"not-jxl")?;
+
+        assert_eq!(resolve_original(&cop).as_deref(), Some(orig.as_path()));
+        let (decoded, dims) = with_missing_jxl(&dir, || (decode_cop(&cop), dimensions(&cop)));
+        let _ = fs::remove_dir_all(&dir);
+
+        let image = decoded?;
+        assert_eq!(dims, Some((10, 10)));
+        assert_eq!(image.dimensions(), (10, 10));
+        assert_eq!(image.get_pixel(0, 0).0, [200, 100, 50, 255]);
         Ok(())
     }
 
@@ -697,15 +941,6 @@ mod tests {
 
     // POSIX loader tests. They use the real Homebrew libjxl when present and
     // skip cleanly when only the encoder (`cjxl`) or the library is missing.
-
-    #[cfg(unix)]
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Serializes tests that mutate `AURORA_JXL_LIB`.
-    #[cfg(unix)]
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[cfg(unix)]
     fn unique_temp_dir(tag: &str) -> PathBuf {

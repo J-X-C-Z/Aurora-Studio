@@ -507,7 +507,9 @@ dependencies = [
 name = "aurora-portrait"
 version = "0.1.0"
 dependencies = [
+ "pollster",
  "serde_json",
+ "wgpu",
  "windows 0.62.2",
 ]
 

@@ -1001,7 +1001,7 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     desc!(21069, Skin, "Wrinkles", "Cheek wrinkles", "祛面颊纹", ParamRange::normalized_01(0.0), DEPS_WRINKLE, StaticSupport::cpu_and_cuda_wired(true)),
     desc!(21070, Skin, "Wrinkles", "Nose back wrinkles", "祛鼻背纹", ParamRange::normalized_01(0.0), DEPS_WRINKLE, StaticSupport::cpu_and_cuda_wired(true)),
     desc!(21071, Skin, "Wrinkles", "Perioral wrinkles", "祛口周纹", ParamRange::normalized_01(0.0), DEPS_WRINKLE, StaticSupport::cpu_and_cuda_wired(true)),
-    desc!(21104, Skin, "Blemish", "Nose flaws", "祛鼻部瑕疵", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_reference_only(false)),
+    desc!(21104, Skin, "Blemish", "Nose flaws", "祛鼻部瑕疵", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_wired(false)),
     desc!(21105, Skin, "Skin tone", "AI body skin tone unify", "AI 身体肤色统一", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_wired(true)),
     desc!(30013, Skin, "Smoothing & Neutral Grey", "Neutral grey flat", "中性灰平", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_wired(true)),
     desc!(30014, Skin, "Smoothing & Neutral Grey", "Neutral grey 3D", "中性灰 3D", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_wired(true)),
@@ -1009,13 +1009,13 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     desc!(30022, Skin, "Smoothing & Neutral Grey", "Body smooth (HLF)", "全身磨皮", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_and_cuda_wired(true)),
     desc!(30059, Skin, "Skin tone", "Skin tone unify (multi)", "多人肤色统一", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_wired(false)),
     desc!(30096, Skin, "Skin tone", "Skin temperature", "色调", ParamRange::normalized_01(0.5), DEPS_TONE_LUT, StaticSupport::cpu_and_cuda_wired(true)),
-    desc!(30188, Skin, "Blemish", "Double chin amount", "祛双下巴-程度", ParamRange::normalized_01(0.9), DEPS_DOUBLE_CHIN, StaticSupport::stored_only()),
-    desc!(30189, Skin, "Blemish", "Double chin shadow", "祛双下巴-阴影", ParamRange::normalized_01(0.8), DEPS_DOUBLE_CHIN, StaticSupport::stored_only()),
-    desc!(30209, Skin, "Blemish", "Jawline enhance", "下颌线增强", ParamRange::normalized_01(0.0), DEPS_JAWLINE, StaticSupport::stored_only()),
+    desc!(30188, Skin, "Blemish", "Double chin amount", "祛双下巴-程度", ParamRange::normalized_01(0.9), DEPS_DOUBLE_CHIN, StaticSupport::cpu_wired(false)),
+    desc!(30189, Skin, "Blemish", "Double chin shadow", "祛双下巴-阴影", ParamRange::normalized_01(0.8), DEPS_DOUBLE_CHIN, StaticSupport::cpu_and_cuda_wired(false)),
+    desc!(30209, Skin, "Blemish", "Jawline enhance", "下颌线增强", ParamRange::normalized_01(0.0), DEPS_JAWLINE, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(30259, Skin, "Blemish", "Sweat (face)", "祛汗珠（脸部）", ParamRange::normalized_01(0.0), DEPS_SWEAT, StaticSupport::cpu_wired(false)),
-    desc!(90001, Skin, "Texture", "Texture smooth skin", "肤质平滑", ParamRange::normalized_01(0.0), DEPS_TEXTURE_SMOOTH, StaticSupport::stored_only()),
+    desc!(90001, Skin, "Texture", "Texture smooth skin", "肤质平滑", ParamRange::normalized_01(0.0), DEPS_TEXTURE_SMOOTH, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(90002, Skin, "Smoothing & Neutral Grey", "Moisture smooth (face)", "水润磨皮（脸部）", ParamRange::normalized_01(0.0), DEPS_MOISTURE, StaticSupport::cpu_and_cuda_wired(true)),
-    desc!(90003, Skin, "Skin tone", "Body skin tone uniform", "身体肤色均匀", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_reference_only(true)),
+    desc!(90003, Skin, "Skin tone", "Body skin tone uniform", "身体肤色均匀", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(90004, Skin, "Skin tone", "Skin radiance", "皮肤透亮", ParamRange::normalized_01(0.0), DEPS_SKIN, StaticSupport::cpu_and_cuda_wired(true)),
     desc!(90005, Skin, "Skin tone", "Whitening", "美白", ParamRange::normalized_01(0.0), DEPS_TONE_LUT, StaticSupport { metal_kernel: true, ..StaticSupport::cpu_and_cuda_wired(true) }),
     desc!(90007, Skin, "Skin tone", "Rosy", "红润", ParamRange::normalized_01(0.0), DEPS_TONE_LUT, StaticSupport { metal_kernel: true, ..StaticSupport::cpu_and_cuda_wired(true) }),
@@ -1064,8 +1064,8 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     desc!(8028, FaceGeometry, "Face pairs", "Cheekbone (R)", "颧骨（右）", ParamRange::signed_percent(0.0), DEPS_FACE_PART, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(8029, FaceGeometry, "Face pairs", "Temple (L)", "太阳穴（左）", ParamRange::signed_percent(0.0), DEPS_FACE_PART, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(8030, FaceGeometry, "Face pairs", "Temple (R)", "太阳穴（右）", ParamRange::signed_percent(0.0), DEPS_FACE_PART, StaticSupport::cpu_and_cuda_wired(false)),
-    desc!(8050, FaceGeometry, "Face pairs", "Eye size (L)", "眼睛大小（左）", ParamRange::normalized_range(-1.0, 1.0, 0.0), DEPS_LANDMARKS, StaticSupport::unwired_cpu_cuda(false)),
-    desc!(8051, FaceGeometry, "Face pairs", "Eye size (R)", "眼睛大小（右）", ParamRange::normalized_range(-1.0, 1.0, 0.0), DEPS_LANDMARKS, StaticSupport::unwired_cpu_cuda(false)),
+    desc!(8050, FaceGeometry, "Face pairs", "Eye size (L)", "眼睛大小（左）", ParamRange::normalized_range(-1.0, 1.0, 0.0), DEPS_LANDMARKS, StaticSupport::cpu_wired(false)),
+    desc!(8051, FaceGeometry, "Face pairs", "Eye size (R)", "眼睛大小（右）", ParamRange::normalized_range(-1.0, 1.0, 0.0), DEPS_LANDMARKS, StaticSupport::cpu_wired(false)),
     desc!(30073, FaceGeometry, "Face pairs", "Lower eyelid (L)", "眼睑下至（左）", ParamRange::normalized_range(-1.0, 1.0, 0.0), DEPS_LANDMARKS, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(30079, FaceGeometry, "Face pairs", "Lower eyelid (R)", "眼睑下至（右）", ParamRange::normalized_range(-1.0, 1.0, 0.0), DEPS_LANDMARKS, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(30080, FaceGeometry, "Face pairs", "Forehead width (L)", "额头宽窄（左）", ParamRange::signed_percent(0.0), DEPS_FACE_PART, StaticSupport::cpu_and_cuda_wired(false)),
@@ -1108,11 +1108,11 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     desc!(101, Eyes, "Eyes", "Silkworm", "卧蚕", ParamRange::normalized_01(0.0), DEPS_EYES, StaticSupport::cpu_wired(true)),
     desc!(90032, Eyes, "Eye makeup", "Eye makeup", "眼妆", ParamRange::normalized_01(0.0), DEPS_EYE_MAKEUP, StaticSupport::cpu_and_cuda_wired(true)),
     desc!(100004, Eyes, "Eyes", "Red blood removal", "去红血丝", ParamRange::normalized_01(0.0), DEPS_EYES, StaticSupport::cpu_wired(true)),
-    desc!(100005, Eyes, "Eyes", "Eye white purify", "眼白净化", ParamRange::normalized_01(0.0), DEPS_EYE_WHITE, StaticSupport::cpu_reference_only(false)),
+    desc!(100005, Eyes, "Eyes", "Eye white purify", "眼白净化", ParamRange::normalized_01(0.0), DEPS_EYE_WHITE, StaticSupport::cpu_and_cuda_wired(false)),
 
     // ── Hair (6) ────────────────────────────────────────────────────
     desc!(30009, Hair, "Hair", "Hair color unify", "统一发色", ParamRange::normalized_01(0.0), DEPS_HAIR, StaticSupport::cpu_wired(true)),
-    desc!(90087, Hair, "Hair", "Hair parting fill", "发缝填充", ParamRange::normalized_01(0.0), DEPS_HAIR, StaticSupport::unwired_cpu_cuda(false)),
+    desc!(90087, Hair, "Hair", "Hair parting fill", "发缝填充", ParamRange::normalized_01(0.0), DEPS_HAIR, StaticSupport::cpu_wired(false)),
     desc!(90088, Hair, "Hair", "Stray hair", "祛碎发", ParamRange::normalized_01(0.0), DEPS_STUBBLE_HAIR, StaticSupport::cpu_and_cuda_wired(false)),
     desc!(90131, Hair, "Hair", "White hair", "祛白发", ParamRange::normalized_01(0.0), DEPS_STUBBLE_HAIR, StaticSupport::cpu_wired(false)),
     desc!(90139, Hair, "Hair", "Hair smooth", "头发柔顺", ParamRange::normalized_01(0.0), DEPS_HAIR, StaticSupport::cpu_and_cuda_wired(false)),
@@ -1138,7 +1138,7 @@ pub const WIRED_EFFECT_DESCRIPTORS: &[EffectDescriptor] = &[
     // ── Body (module B owns the live geometry producers) (19) ────────
     desc!(400, Body, "Body", "Slim arm", "瘦手臂", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_wired(false)),
     desc!(401, Body, "Body", "Slim waist", "瘦腰", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_and_cuda_wired(false)),
-    desc!(403, Body, "Body", "Breast enhancement", "胸部增强", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_reference_only(false)),
+    desc!(403, Body, "Body", "Breast enhancement", "胸部增强", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_wired(false)),
     desc!(404, Body, "Body", "Lift buttock", "美臀", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_wired(false)),
     desc!(405, Body, "Body", "Slim body", "瘦全身", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_wired(false)),
     desc!(406, Body, "Body", "Head size", "小头", ParamRange::normalized_01(0.0), DEPS_BODY, StaticSupport::cpu_and_cuda_wired(false)),
@@ -1813,20 +1813,12 @@ mod tests {
             );
         }
 
-        // Unwired rows are always stored only, whatever kernel exists.
-        for pf in [
-            403, 8050, 8051, 90087, 30188, 30189, 30209, 90001, 100005, 21104, 90003,
-        ] {
+        // All 147 primary effects are now wired to portrait_stage.
+        for desc in descriptors() {
             assert!(
-                descriptor_by_pf(pf).unwrap().static_support.is_stored_only(),
-                "PF{pf} must stay stored only"
-            );
-            assert_eq!(
-                descriptor_by_pf(pf)
-                    .unwrap()
-                    .evaluate_availability(&RuntimeProbeContext::fully_ready()),
-                RuntimeAvailability::StoredOnly,
-                "PF{pf}"
+                !desc.static_support.is_stored_only(),
+                "PF{} should be wired to portrait_stage",
+                desc.id.pf
             );
         }
 
@@ -1958,8 +1950,8 @@ mod tests {
 
         let face_geom = snapshot.by_category(EffectCategory::FaceGeometry);
         assert_eq!(face_geom.len(), 46);
-        // Two have no dispatcher route; fourteen additionally need geometry coefficient tables.
-        assert_eq!(face_geom.len() - face_geom.iter().filter(|e| e.availability.is_available()).count(), 16);
+        // Fourteen additionally need geometry coefficient tables (all 46 now have dispatcher routes).
+        assert_eq!(face_geom.len() - face_geom.iter().filter(|e| e.availability.is_available()).count(), 14);
 
         let plump = snapshot.by_category(EffectCategory::FacePlump);
         assert_eq!(plump.len(), 8);
@@ -1970,7 +1962,7 @@ mod tests {
         assert!(body.iter().all(|e| !e.availability.is_available()));
 
         // Geometry can use landmarks alone. Plump also needs real residual planes.
-        assert_eq!(snapshot.available_effects, 30);
+        assert_eq!(snapshot.available_effects, 32);
 
         // Snapshot serializes cleanly to JSON for frontend/IPC consumption.
         let json = serde_json::to_string(&snapshot).expect("snapshot JSON");

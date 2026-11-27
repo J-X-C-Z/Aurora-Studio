@@ -2641,7 +2641,13 @@ impl FaceInputProducer {
             .validate()
             .map_err(|_| Refusal::ShapeMismatch("face input source image"))?;
         let detection = self.detect(source)?;
-        let (mesh, roi_xywh) = self.mesh_roi(source, &detection)?;
+        let (mesh, roi_xywh) = match self.mesh_roi(source, &detection) {
+            Ok(pair) => pair,
+            Err(Refusal::MissingInput(FACE_MESH_SCORE_ERROR)) => {
+                self.fallback_mesh_roi_from_detection(source, &detection)?
+            }
+            Err(err) => return Err(err),
+        };
         let points17 = self.points17(source, roi_xywh)?;
         let points142 = self.points142(source, &points17)?;
         let landmark_producer =
@@ -2821,7 +2827,8 @@ impl FaceInputProducer {
             eye[1] * 0.35 + mouth[1] * 0.65,
         ];
         let eye_distance = distance(detection.landmarks_source[0], detection.landmarks_source[1]);
-        let side = (eye_distance * 3.4).max(16.0);
+        let eye_to_mouth = distance(eye, mouth);
+        let side = (eye_distance.max(eye_to_mouth * 1.15) * 3.4).max(16.0);
         let origin_x = center[0] - side * 0.5;
         let origin_y = center[1] - side * 0.5;
         let scale = MESH_SIDE as f32 / side;
@@ -2918,6 +2925,54 @@ impl FaceInputProducer {
                 },
             },
             roi,
+        ))
+    }
+
+    fn fallback_mesh_roi_from_detection(
+        &self,
+        source: &Image,
+        detection: &C1FaceDetection,
+    ) -> Result<(C1FaceMesh, [f32; 4]), Refusal> {
+        let eye = midpoint(detection.landmarks_source[0], detection.landmarks_source[1]);
+        let mouth = midpoint(detection.landmarks_source[3], detection.landmarks_source[4]);
+        let center = [
+            eye[0] * 0.4 + mouth[0] * 0.6,
+            eye[1] * 0.4 + mouth[1] * 0.6,
+        ];
+        let eye_distance = distance(detection.landmarks_source[0], detection.landmarks_source[1]);
+        let eye_to_mouth = distance(eye, mouth);
+        let side = (eye_distance.max(eye_to_mouth * 1.15) * 3.2).max(24.0);
+        let x0 = (center[0] - side * 0.5).max(0.0);
+        let y0 = (center[1] - side * 0.55).max(0.0);
+        let x1 = (center[0] + side * 0.5).min(source.width as f32);
+        let y1 = (center[1] + side * 0.45).min(source.height as f32);
+        if x1 - x0 < 8.0 || y1 - y0 < 8.0 {
+            return Err(Refusal::MissingInput("C1 face ROI"));
+        }
+        let scale = MESH_SIDE as f32 / side;
+        let source_to_crop = [
+            [scale, 0.0, -(center[0] - side * 0.5) * scale],
+            [0.0, scale, -(center[1] - side * 0.5) * scale],
+        ];
+        Ok((
+            C1FaceMesh {
+                score: detection.score,
+                landmarks_source: Vec::new(),
+                source_to_crop,
+                crop_side: side,
+                input_size: [MESH_SIDE as u32, MESH_SIDE as u32],
+                normalization: FaceNormalization {
+                    channel_order: "BGR",
+                    mean: [127.5; 3],
+                    scale: [127.5; 3],
+                },
+                provider: self.mesh.provider().label(),
+                model: FaceModelIdentity {
+                    model_id: C1_FACE_MESH_MODEL_ID,
+                    sha256: C1_FACE_MESH_MODEL_SHA256,
+                },
+            },
+            [x0, y0, x1 - x0, y1 - y0],
         ))
     }
 

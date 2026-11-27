@@ -195,12 +195,10 @@ fn op_supported(op: &Op) -> bool {
 }
 
 /// `ReduceMean` is planned for the whole tensor or for the last axis only; any
-/// other axis set needs a transposing reduction kernel this backend does not have.
+/// other axis set (or a runtime-computed `axes` input) is refused in `plan_node`.
 fn reduce_mean_supported(attrs: &ReduceAttrs) -> bool {
-    match &attrs.axes {
-        None => true,
-        Some(axes) => axes.len() == 1 && axes[0] == -1,
-    }
+    let _ = attrs;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,14 +1058,12 @@ fn plan_node(
         }
         Op::ReduceMean(attrs) => {
             let src = ctx.input(node, 0)?;
+            let in_shape = ctx.shape(src)?.to_vec();
             let out_buffer = ctx.place_output(device, buffers, activation_bytes, out_id, out_shape.clone(), out_numel)?;
             let inner = ctx.placement(src)?.numel;
-            match &attrs.axes {
-                Some(axes) if axes.len() == 1 => {
+            match plan_reduce_mean(ctx.graph, node, attrs, &in_shape, &label)? {
+                ReduceMeanPlan::LastAxis { rows, len } => {
                     // Last-axis mean: one group per row, written as a per-row scalar.
-                    let rank = ctx.shape(src)?.len();
-                    let len = ctx.shape(src)?[rank - 1];
-                    let rows = inner / len.max(1);
                     let p = params_from(&[rows as u32, len as u32]);
                     steps.push(Step {
                         entry: "cs_reduce_rows",
@@ -1078,7 +1074,7 @@ fn plan_node(
                         label: label.clone(),
                     });
                 }
-                _ => {
+                ReduceMeanPlan::WholeTensor => {
                     // Whole-tensor mean in two passes through a partial-sum buffer.
                     let partials = ceil_div(inner, (GROUP as usize) * 4) as usize;
                     let key = format!("reduce_partials:{}", partials);
@@ -1678,14 +1674,14 @@ fn static_values(ctx: &NodeCtx<'_>, tid: TensorId) -> Result<Vec<f32>, String> {
 /// Deliberately *not* [`static_values`]: those bytes would be narrowed to the
 /// 32-bit float tensor slots, which cannot represent every `Int64`. A tensor
 /// that is computed at run time is an error, not a zero.
-fn static_i64_values(ctx: &NodeCtx<'_>, tid: TensorId) -> Result<Vec<i64>, String> {
-    let name = || ctx.graph.tensors[tid.0].name.as_str();
-    if let Some(proto) = ctx.graph.weights.get(&tid) {
+fn graph_static_i64_values(graph: &IrGraph, tid: TensorId) -> Result<Vec<i64>, String> {
+    let name = || graph.tensors[tid.0].name.as_str();
+    if let Some(proto) = graph.weights.get(&tid) {
         return proto
             .to_i64_vec()
             .map_err(|e| format!("`{}` is not a static integer tensor: {e}", name()));
     }
-    for node in &ctx.graph.nodes {
+    for node in &graph.nodes {
         if let Op::Constant { value } = &node.op {
             if node.outputs.first().copied().flatten() == Some(tid) {
                 return value
@@ -1695,9 +1691,69 @@ fn static_i64_values(ctx: &NodeCtx<'_>, tid: TensorId) -> Result<Vec<i64>, Strin
         }
     }
     Err(format!(
-        "`{}` is computed at run time, so it cannot parameterise a static Pad/Slice",
+        "`{}` is computed at run time, so it cannot parameterise a static Pad/Slice/ReduceMean",
         name()
     ))
+}
+
+fn static_i64_values(ctx: &NodeCtx<'_>, tid: TensorId) -> Result<Vec<i64>, String> {
+    graph_static_i64_values(ctx.graph, tid)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReduceMeanPlan {
+    LastAxis { rows: usize, len: usize },
+    WholeTensor,
+}
+
+/// Resolves `ReduceMean` axes from either legacy `attrs.axes` or opset-18+
+/// constant `inputs[1]`, refusing unresolved or unsupported axis sets instead
+/// of silently falling back to whole-tensor mean.
+fn plan_reduce_mean(
+    graph: &IrGraph,
+    node: &super::graph::IrNode,
+    attrs: &ReduceAttrs,
+    in_shape: &[usize],
+    label: &str,
+) -> Result<ReduceMeanPlan, String> {
+    let axes = match &attrs.axes {
+        Some(axes) => axes.clone(),
+        None => match node.inputs.get(1).copied().flatten() {
+            Some(axes_tid) => graph_static_i64_values(graph, axes_tid)
+                .map_err(|e| format!("{label}: ReduceMean requires static axes ({e})"))?,
+            None => Vec::new(),
+        },
+    };
+    if axes.is_empty() {
+        if attrs.noop_with_empty_axes {
+            return Err(format!(
+                "{label}: ReduceMean with noop_with_empty_axes=1 and empty axes is not supported"
+            ));
+        }
+        return Ok(ReduceMeanPlan::WholeTensor);
+    }
+
+    let rank = in_shape.len();
+    let mut norm_axes = Vec::with_capacity(axes.len());
+    for axis in axes {
+        let norm = normalize_axis(axis, rank)?;
+        if !norm_axes.contains(&norm) {
+            norm_axes.push(norm);
+        }
+    }
+
+    if rank > 0 && norm_axes.len() == 1 && norm_axes[0] == rank - 1 {
+        let len = in_shape[rank - 1];
+        let inner = in_shape.iter().product::<usize>().max(1);
+        let rows = inner / len.max(1);
+        Ok(ReduceMeanPlan::LastAxis { rows, len })
+    } else if norm_axes.len() == rank {
+        Ok(ReduceMeanPlan::WholeTensor)
+    } else {
+        Err(format!(
+            "{label}: ReduceMean over axes {norm_axes:?} for shape {in_shape:?} is not supported (only whole-tensor or last-axis reduction is supported)"
+        ))
+    }
 }
 
 /// ONNX Slice index normalisation, identical to the static-shape inference in
@@ -2745,6 +2801,44 @@ mod tests {
         eprintln!("[reduce_mean] gpu={} cpu={mean} diff={diff:.3e}", outs["y"].0[0]);
         assert!(diff < 1e-6, "ReduceMean diff {diff:.3e}");
 
+        // --- ReduceMean over last axis via legacy `axes` attr and opset-18 `axes` input
+        let row_ref: Vec<f32> = values
+            .chunks_exact(4)
+            .map(|row| row.iter().sum::<f32>() / 4.0)
+            .collect();
+        let legacy_model = Model::new()
+            .input("x", &[2, 3, 4])
+            .node(
+                "ReduceMean",
+                "mean_attr",
+                &["x"],
+                &["y"],
+                &[attr_ints("axes", &[-1]), attr_int("keepdims", 1)],
+            )
+            .output("y", &[2, 3, 1])
+            .encode();
+        let sess = NativeDx12Session::open(&legacy_model, &ShapeOverrides::default(), &request).expect("open legacy last-axis ReduceMean");
+        let outs = sess.run_f32(&inputs).expect("run legacy last-axis ReduceMean");
+        let diff = max_abs_diff(&outs["y"].0, &row_ref);
+        assert!(diff < 1e-6, "ReduceMean legacy attr last-axis diff {diff:.3e}");
+
+        let opset18_model = Model::new()
+            .input("x", &[2, 3, 4])
+            .constant("c_axes", "axes", &tensor_i64("axes", &[1], &[-1]))
+            .node(
+                "ReduceMean",
+                "mean_const",
+                &["x", "axes"],
+                &["y"],
+                &[attr_int("keepdims", 1)],
+            )
+            .output("y", &[2, 3, 1])
+            .encode();
+        let sess = NativeDx12Session::open(&opset18_model, &ShapeOverrides::default(), &request).expect("open opset18 last-axis ReduceMean");
+        let outs = sess.run_f32(&inputs).expect("run opset18 last-axis ReduceMean");
+        let diff = max_abs_diff(&outs["y"].0, &row_ref);
+        assert!(diff < 1e-6, "ReduceMean opset18 const axes last-axis diff {diff:.3e}");
+
         // --- LayerNormalization over the last axis, with scale and bias
         let (rows, len) = (4usize, 6usize);
         let x = seeded(rows * len, 0x55, 2.0);
@@ -2909,6 +3003,122 @@ mod tests {
                 "{missing} has no DX12 kernel and must not be listed as supported"
             );
         }
+    }
+
+    #[test]
+    fn reduce_mean_plans_legacy_attr_and_constant_input_axes() {
+        let plan_for = |model_bytes: &[u8]| -> Result<ReduceMeanPlan, String> {
+            let planned = load_and_plan(model_bytes, &ShapeOverrides::default()).map_err(|e| e.to_string())?;
+            let node = planned
+                .graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::ReduceMean(_)))
+                .expect("ReduceMean node");
+            let Op::ReduceMean(attrs) = &node.op else { unreachable!() };
+            let src = node.inputs[0].expect("x");
+            let in_shape = planned.graph.tensors[src.0].static_shape().expect("x shape");
+            plan_reduce_mean(&planned.graph, node, attrs, &in_shape, "test:ReduceMean")
+        };
+
+        // Legacy attribute: axes = [-1] and positive last axis [2] on [2, 3, 4].
+        for axes in [&[-1i64][..], &[2i64][..]] {
+            let m = Model::new()
+                .input("x", &[2, 3, 4])
+                .node(
+                    "ReduceMean",
+                    "mean",
+                    &["x"],
+                    &["y"],
+                    &[attr_ints("axes", axes), attr_int("keepdims", 1)],
+                )
+                .output("y", &[2, 3, 1])
+                .encode();
+            assert_eq!(plan_for(&m), Ok(ReduceMeanPlan::LastAxis { rows: 6, len: 4 }));
+        }
+
+        // Opset 18+ constant `axes` input tensor (via Constant node and via initializer).
+        let m_const = Model::new()
+            .input("x", &[2, 3, 4])
+            .constant("c_axes", "axes", &tensor_i64("axes", &[1], &[-1]))
+            .node("ReduceMean", "mean", &["x", "axes"], &["y"], &[attr_int("keepdims", 1)])
+            .output("y", &[2, 3, 1])
+            .encode();
+        assert_eq!(plan_for(&m_const), Ok(ReduceMeanPlan::LastAxis { rows: 6, len: 4 }));
+
+        let m_init = Model::new()
+            .input("x", &[2, 3, 4])
+            .init_i64("axes", &[1], &[2])
+            .node("ReduceMean", "mean", &["x", "axes"], &["y"], &[attr_int("keepdims", 1)])
+            .output("y", &[2, 3, 1])
+            .encode();
+        assert_eq!(plan_for(&m_init), Ok(ReduceMeanPlan::LastAxis { rows: 6, len: 4 }));
+
+        // Opset 18+ constant `axes = [0, 1, 2]` -> whole-tensor reduction.
+        let m_all = Model::new()
+            .input("x", &[2, 3, 4])
+            .constant("c_axes", "axes", &tensor_i64("axes", &[3], &[0, 1, 2]))
+            .node("ReduceMean", "mean", &["x", "axes"], &["y"], &[attr_int("keepdims", 1)])
+            .output("y", &[1, 1, 1])
+            .encode();
+        assert_eq!(plan_for(&m_all), Ok(ReduceMeanPlan::WholeTensor));
+
+        // No axes attr and no axes input -> whole-tensor reduction.
+        let m_empty = Model::new()
+            .input("x", &[2, 3, 4])
+            .node("ReduceMean", "mean", &["x"], &["y"], &[attr_int("keepdims", 1)])
+            .output("y", &[1, 1, 1])
+            .encode();
+        assert_eq!(plan_for(&m_empty), Ok(ReduceMeanPlan::WholeTensor));
+    }
+
+    #[test]
+    fn reduce_mean_rejects_unresolved_or_unsupported_axes() {
+        let plan_for = |model_bytes: &[u8]| -> Result<ReduceMeanPlan, String> {
+            let planned = load_and_plan(model_bytes, &ShapeOverrides::default()).map_err(|e| e.to_string())?;
+            let node = planned
+                .graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::ReduceMean(_)))
+                .expect("ReduceMean node");
+            let Op::ReduceMean(attrs) = &node.op else { unreachable!() };
+            let src = node.inputs[0].expect("x");
+            let in_shape = planned.graph.tensors[src.0].static_shape().expect("x shape");
+            plan_reduce_mean(&planned.graph, node, attrs, &in_shape, "test:ReduceMean")
+        };
+
+        // Runtime-computed `axes` input must be rejected, never fall back to whole-tensor mean.
+        let m_runtime = Model::new()
+            .input("x", &[2, 3, 4])
+            .input("axes", &[1])
+            .node("ReduceMean", "mean", &["x", "axes"], &["y"], &[attr_int("keepdims", 1)])
+            .output("y", &[2, 1, 4])
+            .encode();
+        let err = plan_for(&m_runtime).expect_err("runtime axes must be refused");
+        assert!(err.contains("static axes"), "unexpected error: {err}");
+
+        // Non-last axis via legacy attr and via constant input must both be rejected.
+        let m_attr_mid = Model::new()
+            .input("x", &[2, 3, 4])
+            .node(
+                "ReduceMean",
+                "mean",
+                &["x"],
+                &["y"],
+                &[attr_ints("axes", &[1]), attr_int("keepdims", 1)],
+            )
+            .output("y", &[2, 1, 4])
+            .encode();
+        assert!(plan_for(&m_attr_mid).is_err());
+
+        let m_const_mid = Model::new()
+            .input("x", &[2, 3, 4])
+            .constant("c_axes", "axes", &tensor_i64("axes", &[1], &[1]))
+            .node("ReduceMean", "mean", &["x", "axes"], &["y"], &[attr_int("keepdims", 1)])
+            .output("y", &[2, 1, 4])
+            .encode();
+        assert!(plan_for(&m_const_mid).is_err());
     }
 
     /// Latency and throughput of the submitted GPU work, measured after warm-up.

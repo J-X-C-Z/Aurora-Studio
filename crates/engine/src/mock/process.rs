@@ -2122,6 +2122,7 @@ fn has_post_8bit_stages(adj: &AdjustmentSet, bypass: bool, plan: &Plan<'_>, port
         || l.shift_y != 0.0
         || l.tilt != 0.0
         || (l.dust_removal_enabled && !l.dust_patches.is_empty())
+        || adj.extra.get("lens:green_fringing").copied().unwrap_or(0.0) > 0.0
 }
 
 fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
@@ -3139,6 +3140,23 @@ fn render_sized(
             }
             Some(warp) => super::detail::post_process_with_lens(&mut rgba, out_w, out_h, detail_adj, scale, Some(warp)),
             None => super::detail::post_process(&mut rgba, out_w, out_h, detail_adj, scale),
+        }
+        let green_fringe = detail_adj.extra.get("lens:green_fringing").copied().unwrap_or(0.0);
+        if green_fringe > 0.0 {
+            let before_green = rgba16.as_ref().map(|_| rgba.clone());
+            crate::ca_fix::defringe_dual(
+                &mut rgba,
+                out_w,
+                out_h,
+                &crate::ca_fix::DualDefringeParams {
+                    purple_amount: 0.0,
+                    green_amount: (green_fringe / 100.0).clamp(0.0, 1.0),
+                    ..Default::default()
+                },
+            );
+            if let (Some(wide), Some(before)) = (rgba16.as_mut(), before_green.as_deref()) {
+                merge_wide_delta(wide, before, &rgba, out_w as usize);
+            }
         }
     }
     if !bypass {

@@ -712,6 +712,14 @@ impl AppState {
     /// 同帧输入的产出由输入指纹与显式刷新负责失效；按代清空会让「某行 StoredOnly
     /// 导致非全绿」的图每帧重探，149 行永远换不来稳定结论。
     pub(crate) fn note_portrait_frame(&mut self, image: ImageId, frame: u64) {
+        if self
+            .portrait_caps
+            .entries
+            .get(&image)
+            .is_some_and(|cached| cached.snapshot.available_effects == 0 && cached.frame != frame)
+        {
+            self.portrait_caps.invalidate(image);
+        }
         self.portrait_caps.note_frame(image, frame);
     }
 
