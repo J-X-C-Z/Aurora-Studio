@@ -407,7 +407,9 @@ impl Default for PanelPrefs {
     fn default() -> Self {
         Self {
             // The portrait bands hold ~250 controls; they start closed.
-            collapsed: crate::contract::BANDS.iter().map(|b| b.id).collect(),
+            // Face reshape opens on its face-shape region; the other regions
+            // start folded and still list the rows that were changed.
+            collapsed: crate::contract::BANDS.iter().map(|b| b.id).chain(crate::tools::portrait::FACE_REGIONS_FOLDED).collect(),
             curve_channel: ToneChannel::Rgb,
             levels_channel: ToneChannel::Rgb,
             color_balance_mode: ColorBalanceMode::ThreeWay,

@@ -56,10 +56,14 @@ const SUIT_CONTROL_PFS: [u32; 13] = [
     100, 101, 103, 105, 106, 107, 111, 115, 116, 117, 118, 30007, 90032,
 ];
 
-const STYLE_CHIP_W: f32 = 78.0;
-const SUIT_CHIP_W: f32 = 134.0;
-const THUMB_H: f32 = 46.0;
-const SWATCH: f32 = 14.0;
+/// Style tiles per row, and how many rows show before "show all".
+const STYLE_COLS: u16 = 4;
+const STYLE_ROWS_FOLDED: usize = 2;
+const SUIT_COLS: u16 = 3;
+const SWATCH: f32 = 16.0;
+/// Materials are mostly dark strokes on transparency (brows, liner, lashes); a
+/// light skin tone behind them shows their shape the way they will sit on a face.
+const MATERIAL_BG: u32 = 0xEADBD3;
 
 /// An empty scan is retried quickly so assets mounted while the app is running
 /// show up; a full scan is trusted for longer so hovering never rescans.
@@ -452,51 +456,34 @@ impl RenderOnce for MakeupStyleBar {
             BarUi::default()
         });
         let open = ui.read(cx).open;
+        let folded_slots = STYLE_ROWS_FOLDED * STYLE_COLS as usize;
+        let foldable = total + 1 > folded_slots;
 
-        let mut title: Vec<String> = Vec::new();
-        if right_brow && own.is_none() {
-            title.push(t("Follows the left brow", "跟随左眉").to_string());
-        }
-        match style {
-            Some(index) => title.push(format!(
-                "{} {:02}/{:02}",
-                t("Style", "款式"),
-                index,
-                total.max(1)
-            )),
-            None => title.push(t("Default style", "默认款式").to_string()),
-        }
-        if let Some(name) = style
-            .and_then(|index| self.presets.get(index - 1))
-            .map(|preset| preset.id.as_str())
-        {
-            if !name.is_empty() {
-                title.push(name.to_string());
-            }
-        }
-        let title = title.join(" · ");
+        let title = match style.and_then(|index| self.presets.get(index - 1).map(|preset| (index, preset))) {
+            Some((index, preset)) => format!("{index:02} {}", preset.id),
+            None if right_brow && own.is_none() => t("Follows the left brow", "跟随左眉").to_string(),
+            None => t("None", "无").to_string(),
+        };
 
         let mut card = v_flex()
             .w_full()
-            .mx_3()
-            .mb_1p5()
-            .rounded(px(4.0))
-            .bg(p.well)
-            .border_1()
-            .border_color(if follows {
-                p.accent.opacity(0.45)
-            } else {
-                p.edge
-            })
+            .px_3()
+            .pt(px(2.0))
+            .pb_2()
+            .gap(px(6.0))
             .when(!available, |d| d.opacity(0.55));
 
         let mut head = h_flex()
             .w_full()
             .items_center()
             .gap_1()
-            .px(px(6.0))
-            .pt(px(4.0))
-            .pb(px(2.0))
+            .text_size(px(10.0))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(p.text_subtle)
+                    .child(SharedString::from(if total > 0 { t("Style", "款式") } else { t("Colour", "颜色") })),
+            )
             .child(
                 div()
                     .flex_1()
@@ -504,13 +491,8 @@ impl RenderOnce for MakeupStyleBar {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_size(px(10.0))
-                    .text_color(if available {
-                        p.text_muted
-                    } else {
-                        p.text_disabled
-                    })
-                    .child(SharedString::from(title)),
+                    .text_color(if style.is_some() { p.text } else { p.text_muted })
+                    .when(total > 0, |d| d.child(SharedString::from(title))),
             );
 
         if right_brow {
@@ -553,79 +535,27 @@ impl RenderOnce for MakeupStyleBar {
             );
         }
 
-        if total > 1 {
-            let (st_prev, st_next) = (self.state.clone(), self.state.clone());
-            let (prev, next) = match style {
-                Some(index) => (
-                    if index <= 1 { total } else { index - 1 },
-                    if index >= total { 1 } else { index + 1 },
-                ),
-                None => (total, 1),
-            };
-            head = head
-                .child(
-                    icon_button(
-                        SharedString::from(format!("mk-prev-{pf}")),
-                        IconName::ChevronLeft,
-                        false,
-                        available,
-                        t("Previous style", "上一款式"),
-                        act(move |_, cx| {
-                            commit(
-                                &st_prev,
-                                pf,
-                                drawn,
-                                t("Switch makeup style", "切换妆容款式"),
-                                move |a| set_style(a, pf, Some(prev)),
-                                cx,
-                            )
-                        }),
-                        &p,
-                    )
-                    .into_any_element(),
-                )
-                .child(
-                    icon_button(
-                        SharedString::from(format!("mk-next-{pf}")),
-                        IconName::ChevronRight,
-                        false,
-                        available,
-                        t("Next style", "下一款式"),
-                        act(move |_, cx| {
-                            commit(
-                                &st_next,
-                                pf,
-                                drawn,
-                                t("Switch makeup style", "切换妆容款式"),
-                                move |a| set_style(a, pf, Some(next)),
-                                cx,
-                            )
-                        }),
-                        &p,
-                    )
-                    .into_any_element(),
-                );
-        }
-
-        {
+        if foldable {
             let st_toggle = self.state.clone();
-            let tip = if open {
-                t("Hide all styles", "收起全部款式")
-            } else {
-                t("Show all styles", "展开全部款式")
-            };
+            let ui = ui.clone();
             head = head.child(
-                icon_button(
-                    SharedString::from(format!("mk-more-{pf}")),
-                    if open {
-                        IconName::ChevronUp
+                h_flex()
+                    .id(SharedString::from(format!("mk-more-{pf}")))
+                    .flex_shrink_0()
+                    .gap(px(2.0))
+                    .px_1()
+                    .rounded(px(3.0))
+                    .items_center()
+                    .cursor_pointer()
+                    .text_color(p.text_subtle)
+                    .hover(|s| s.bg(p.pressed).text_color(p.text))
+                    .child(SharedString::from(if open {
+                        t("Less", "收起").to_string()
                     } else {
-                        IconName::ChevronDown
-                    },
-                    open,
-                    total > 0,
-                    tip,
-                    act(move |_, cx| {
+                        format!("{} {total}", t("All", "全部"))
+                    }))
+                    .child(Icon::new(if open { IconName::ChevronUp } else { IconName::ChevronDown }).xsmall())
+                    .on_click(move |_, _, cx| {
                         // Opening is the explicit refresh: drop the cached scan once so
                         // a folder mounted since the last paint shows up immediately.
                         let opened = ui.update(cx, |bar, _| {
@@ -637,15 +567,12 @@ impl RenderOnce for MakeupStyleBar {
                         }
                         st_toggle.update(cx, |_, cx| cx.notify());
                     }),
-                    &p,
-                )
-                .into_any_element(),
             );
         }
 
         card = card.child(head);
 
-        let mut body = v_flex().w_full().gap(px(5.0)).px(px(6.0)).pb(px(5.0));
+        let mut body = v_flex().w_full().gap(px(6.0));
 
         // 材质行（PF101 卧蚕、PF111 等）在一条预设都没装时也要给出明确状态：
         // 说明「没有可选款式」而不是整块静默消失或留一片空白。
@@ -795,25 +722,32 @@ impl RenderOnce for MakeupStyleBar {
             );
         }
 
-        if open && total > 0 {
-            let mut cells: Vec<AnyElement> = Vec::with_capacity(total + 1);
+        if total > 0 {
+            // Folded, the grid shows its first rows; the chosen style always stays
+            // in view, taking the last slot if it sits further down the list.
+            let mut shown: Vec<usize> = (1..=total).collect();
+            if foldable && !open {
+                shown.truncate(folded_slots - 1);
+                if let Some(chosen) = own.filter(|chosen| !shown.contains(chosen)) {
+                    if let Some(last) = shown.last_mut() {
+                        *last = chosen;
+                    }
+                }
+            }
+            let mut cells: Vec<AnyElement> = Vec::with_capacity(shown.len() + 1);
             {
                 let st = self.state.clone();
-                cells.push(chip(
-                    ChipSpec {
+                cells.push(tile(
+                    TileSpec {
                         id: SharedString::from(format!("mk-chip-{pf}-default")),
                         caption: SharedString::from(if right_brow {
-                            t("Follow the left brow", "跟随左眉")
+                            t("Follow left", "跟随左眉")
                         } else {
-                            t("Default", "默认")
+                            t("None", "无")
                         }),
                         sub: None,
                         thumb: None,
-                        placeholder: Some(if right_brow {
-                            t("Uses the left brow", "沿用左眉")
-                        } else {
-                            t("Engine default", "引擎默认")
-                        }),
+                        icon: if right_brow { IconName::Link } else { IconName::Ban },
                         selected: own.is_none(),
                         enabled: available,
                         tip: SharedString::from(if right_brow {
@@ -823,11 +757,10 @@ impl RenderOnce for MakeupStyleBar {
                             )
                         } else {
                             t(
-                                "The engine's default material for this row",
-                                "该行使用引擎默认材质",
+                                "No style of its own: the engine's default material for this row",
+                                "不选款式：该行使用引擎默认材质",
                             )
                         }),
-                        width: STYLE_CHIP_W,
                     },
                     act(move |_, cx| {
                         commit(
@@ -842,27 +775,28 @@ impl RenderOnce for MakeupStyleBar {
                     &p,
                 ));
             }
-            for (index, preset) in self.presets.iter().enumerate() {
-                let ordinal = index + 1;
+            for ordinal in shown {
+                let Some(preset) = self.presets.get(ordinal - 1) else {
+                    continue;
+                };
                 let st = self.state.clone();
-                let mut tip = preset.path.display().to_string();
+                let mut tip = format!("{ordinal:02} {}", preset.id);
                 if preset.mirror_x {
                     tip = format!(
                         "{tip}\n{}",
                         t("Mirrored horizontally for the right brow", "按右眉水平镜像")
                     );
                 }
-                cells.push(chip(
-                    ChipSpec {
+                cells.push(tile(
+                    TileSpec {
                         id: SharedString::from(format!("mk-chip-{pf}-{ordinal}")),
                         caption: SharedString::from(format!("{ordinal:02} {}", preset.id)),
                         sub: None,
                         thumb: Some(preset.path.clone()),
-                        placeholder: None,
+                        icon: IconName::Image,
                         selected: own == Some(ordinal),
                         enabled: available,
                         tip: SharedString::from(tip),
-                        width: STYLE_CHIP_W,
                     },
                     act(move |_, cx| {
                         commit(
@@ -877,13 +811,14 @@ impl RenderOnce for MakeupStyleBar {
                     &p,
                 ));
             }
-            body = body.child(
+            card = card.child(
                 div()
                     .id(SharedString::from(format!("mk-grid-{pf}")))
                     .w_full()
-                    .max_h(px(178.0))
-                    .overflow_y_scroll()
-                    .child(h_flex().w_full().flex_wrap().gap_1().children(cells)),
+                    .grid()
+                    .grid_cols(STYLE_COLS)
+                    .gap(px(6.0))
+                    .children(cells),
             );
         }
 
@@ -893,57 +828,74 @@ impl RenderOnce for MakeupStyleBar {
 
 // ───────────── Shared chip glue ─────────────
 
-/// Everything one material / look cell needs. Both the style grid and the look
-/// board render through [`chip`], so border, selection, hover, tooltip and the
-/// "inert but visible" rule exist once.
-struct ChipSpec {
+/// Everything one material / look tile needs. The style grid and the look board
+/// both render through [`tile`], so selection, hover, tooltip and the "inert but
+/// visible" rule exist once.
+struct TileSpec {
     id: SharedString,
     caption: SharedString,
     sub: Option<SharedString>,
     thumb: Option<PathBuf>,
-    /// Shown instead of a thumbnail when the cell has no material of its own.
-    placeholder: Option<&'static str>,
+    /// Drawn instead of a thumbnail when the tile has no material of its own.
+    icon: IconName,
     selected: bool,
     enabled: bool,
     tip: SharedString,
-    width: f32,
 }
 
-fn chip(spec: ChipSpec, act: Act, p: &Palette) -> AnyElement {
+/// A square picture with its name underneath; the chosen one gets an accent
+/// outline. The real material is decoded asynchronously by GPUI's image cache,
+/// so painting a grid decodes nothing on this thread.
+fn tile(spec: TileSpec, act: Act, p: &Palette) -> AnyElement {
     let click = act.clone();
+    let group = SharedString::from(format!("{}-g", spec.id));
     let caption_color = if spec.selected {
-        p.text
+        p.accent
     } else if spec.enabled {
         p.text_muted
     } else {
         p.text_disabled
     };
+    let has_thumb = spec.thumb.is_some();
+    let frame = div()
+        .w_full()
+        .aspect_square()
+        .p(px(3.0))
+        .rounded(px(5.0))
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .justify_center()
+        .border_2()
+        .border_color(if spec.selected { p.accent } else { p.edge.opacity(0.0) })
+        .bg(if has_thumb { rgb(MATERIAL_BG).into() } else { p.raised })
+        .when(spec.enabled && !spec.selected, |d| {
+            d.group_hover(group.clone(), |s| s.border_color(p.text_subtle))
+        })
+        .child(match spec.thumb {
+            Some(path) => img(path).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+            None => Icon::new(spec.icon).large().text_color(p.text_subtle).into_any_element(),
+        });
     v_flex()
         .id(spec.id)
-        .w(px(spec.width))
-        .p(px(3.0))
-        .gap(px(2.0))
-        .rounded(px(4.0))
-        .border_1()
-        .border_color(if spec.selected { p.accent } else { p.edge })
-        .bg(if spec.selected {
-            p.accent_soft
-        } else {
-            p.raised
-        })
+        .group(group)
+        .w_full()
+        .min_w_0()
+        .gap(px(3.0))
+        .when(!spec.enabled, |d| d.opacity(0.5))
         .when(spec.enabled, |d| {
             d.cursor_pointer()
-                .hover(|s| s.bg(p.hover))
                 .on_click(move |_, window, cx| (click)(window, cx))
         })
-        .child(thumb(spec.thumb, spec.placeholder, p))
+        .child(frame)
         .child(
             div()
                 .w_full()
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .text_size(px(9.5))
+                .text_center()
+                .text_size(px(10.0))
                 .text_color(caption_color)
                 .child(spec.caption),
         )
@@ -954,6 +906,7 @@ fn chip(spec: ChipSpec, act: Act, p: &Palette) -> AnyElement {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
+                    .text_center()
                     .text_size(px(9.0))
                     .text_color(p.text_subtle)
                     .child(sub),
@@ -961,40 +914,6 @@ fn chip(spec: ChipSpec, act: Act, p: &Palette) -> AnyElement {
         })
         .tooltip(move |window, cx| Tooltip::new(spec.tip.clone()).build(window, cx))
         .into_any_element()
-}
-
-/// The real material: GPUI decodes the PNG asynchronously and keeps it in its own
-/// image cache, so painting a grid decodes nothing on this thread.
-fn thumb(path: Option<PathBuf>, placeholder: Option<&'static str>, p: &Palette) -> AnyElement {
-    let frame = v_flex()
-        .w_full()
-        .h(px(THUMB_H))
-        .rounded(px(3.0))
-        .bg(p.well)
-        .border_1()
-        .border_color(p.divider)
-        .overflow_hidden()
-        .items_center()
-        .justify_center();
-    match path {
-        Some(path) => frame
-            .child(
-                img(path)
-                    .w_full()
-                    .h(px(THUMB_H))
-                    .object_fit(ObjectFit::Contain),
-            )
-            .into_any_element(),
-        None => frame
-            .child(
-                div()
-                    .px(px(2.0))
-                    .text_size(px(9.0))
-                    .text_color(p.text_subtle)
-                    .child(SharedString::from(placeholder.unwrap_or_default())),
-            )
-            .into_any_element(),
-    }
 }
 
 fn icon_button(
@@ -1119,17 +1038,16 @@ impl RenderOnce for SuitBoard {
                 Some(reason) => SharedString::from(reason.clone()),
                 None => SharedString::from(format!("{count} {}", t("controls", "项"))),
             };
-            cells.push(chip(
-                ChipSpec {
+            cells.push(tile(
+                TileSpec {
                     id: SharedString::from(format!("suit-{index}")),
                     caption: SharedString::from(suit.label.clone()),
                     sub: Some(sub),
                     thumb: look_thumb(suit),
-                    placeholder: Some(t("Whole look", "整妆")),
+                    icon: IconName::Palette,
                     selected: active.get(index).copied().unwrap_or(false),
                     enabled,
                     tip,
-                    width: SUIT_CHIP_W,
                 },
                 act(move |_, cx| {
                     let look = look.clone();
@@ -1198,7 +1116,7 @@ impl RenderOnce for SuitBoard {
                     )
                     .tooltip(move |window, cx| Tooltip::new(help.clone()).build(window, cx)),
             )
-            .child(h_flex().w_full().flex_wrap().gap_1().children(cells))
+            .child(div().w_full().grid().grid_cols(SUIT_COLS).gap(px(6.0)).children(cells))
     }
 }
 

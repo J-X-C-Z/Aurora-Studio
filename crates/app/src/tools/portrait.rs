@@ -510,9 +510,25 @@ fn is_makeup_row(pf: u32) -> bool {
     pf == 90032 || pf == 101 || portrait_capability::category_of(pf) == Some(EffectCategory::Makeup)
 }
 
+/// 调过的行左侧一道强调色竖条，长列表里一眼能找到动过的项。
+fn changed_mark(row: AnyElement, changed: bool, cx: &App) -> AnyElement {
+    let p = pal(cx);
+    div()
+        .w_full()
+        .border_l_2()
+        .border_color(if changed { p.accent } else { p.accent.opacity(0.0) })
+        .child(row)
+        .into_any_element()
+}
+
 /// 一行已登记效果：`Available` 才可交互；其它状态禁用并写原因，绝不发 edit。
 fn effect_row(state: &Entity<AppState>, pf: u32, cx: &App) -> AnyElement {
-    let (available, reason, tip, spec) = {
+    effect_row_with(state, pf, true, cx)
+}
+
+/// `own_reason = false`：原因已经在分节标题下统一写过一次，这一行不再重复。
+fn effect_row_with(state: &Entity<AppState>, pf: u32, own_reason: bool, cx: &App) -> AnyElement {
+    let (available, reason, tip, spec, changed) = {
         let s = state.read(cx);
         let status = s.capability_status(pf);
         (
@@ -520,6 +536,7 @@ fn effect_row(state: &Entity<AppState>, pf: u32, cx: &App) -> AnyElement {
             status.line(),
             row_tooltip(pf, status),
             portrait_capability::slider_spec(pf),
+            effect_is_modified(&*s, pf),
         )
     };
     let p = pal(cx).clone();
@@ -534,7 +551,7 @@ fn effect_row(state: &Entity<AppState>, pf: u32, cx: &App) -> AnyElement {
             if let Some(step) = spec.step {
                 slider = slider.step(step);
             }
-            rows.push(slider.into_any_element());
+            rows.push(changed_mark(slider.into_any_element(), changed, cx));
         }
         None => {
             // 没有尺寸/单位可靠的控件：只列标签与状态，不猜一个滑杆出来。
@@ -551,7 +568,7 @@ fn effect_row(state: &Entity<AppState>, pf: u32, cx: &App) -> AnyElement {
             );
         }
     }
-    if !available {
+    if !available && own_reason {
         rows.push(reason_line(reason, cx));
     }
     // 子妆容行：款式与色板。旧的小色条已经搬进这个组件，这里不再重复画。
@@ -799,40 +816,64 @@ fn category_panel(
 ) -> AnyElement {
     let pfs = main_effects(category);
     // 先取数据（读锁短），再建元素。
-    let (items, modified) = {
+    let (items, modified, adjusted) = {
         let s = state.read(cx);
-        let mut items: Vec<(Option<&'static str>, u32, &'static [u32])> = Vec::new();
+        let mut items: Vec<(Option<&'static str>, u32, &'static [u32], Option<String>)> = Vec::new();
         let mut modified = false;
-        let mut section: Option<&'static str> = None;
+        let adjusted = pfs.iter().filter(|pf| effect_is_modified(&*s, **pf) || sub_controls_of(**pf).iter().any(|sub| effect_is_modified(&*s, *sub))).count();
         for pf in pfs.iter().copied() {
             if !matches_effect(query, &effect_label(pf), pf) && !sub_controls_of(pf).iter().any(|&sub| matches_effect(query, &effect_label(sub), sub)) {
                 continue;
             }
-            let current = portrait_capability::section_of(pf);
-            let starts_section = current != section;
-            section = current;
             let subs = sub_controls_of(pf);
             modified |= effect_is_modified(&*s, pf);
             modified |= subs.iter().any(|sub| effect_is_modified(&*s, *sub));
-            items.push((if starts_section { current } else { None }, pf, subs));
+            let status = s.capability_status(pf);
+            let reason = (!status.is_available()).then(|| status.line());
+            items.push((portrait_capability::section_of(pf), pf, subs, reason));
         }
-        (items, modified)
+        // 描述符表里同一节的项不一定挨着；按每节第一次出现的位置稳定排序，
+        // 这样每个分节只出现一次。
+        let first: Vec<Option<&'static str>> = items.iter().fold(Vec::new(), |mut seen, item| {
+            if !seen.contains(&item.0) {
+                seen.push(item.0);
+            }
+            seen
+        });
+        items.sort_by_key(|item| first.iter().position(|section| *section == item.0));
+        (items, modified, adjusted)
     };
     if items.is_empty() {
         return div().into_any_element();
     }
     let link_brows = category == EffectCategory::Makeup && state.read(cx).prefs.panels.portrait_link_lr
-        && [100, 117].iter().all(|pf| items.iter().any(|(_, item, _)| item == pf));
+        && [100, 117].iter().all(|pf| items.iter().any(|(_, item, _, _)| item == pf));
     let mut rows: Vec<AnyElement> = Vec::new();
-    for (section, pf, subs) in items {
+    let mut start = 0;
+    while start < items.len() {
+        let section = items[start].0;
+        let end = items[start..].iter().position(|item| item.0 != section).map_or(items.len(), |n| start + n);
+        let group = &items[start..end];
+        start = end;
         if let Some(section) = section {
             rows.push(caption(t(section, section_zh(section)), cx));
         }
-        if link_brows && pf == 117 { continue; }
-        if link_brows && pf == 100 { rows.push(brow_pair(state, cx)); }
-        else { rows.push(effect_row(state, pf, cx)); }
-        for sub in subs {
-            rows.push(sub_control_row(state, *sub, cx));
+        // 一节里每行都因为同一个原因不可用时，原因只在节标题下写一次。
+        let shared = match group.first().and_then(|item| item.3.clone()) {
+            Some(reason) if group.len() > 1 && group.iter().all(|item| item.3.as_deref() == Some(reason.as_str())) => Some(reason),
+            _ => None,
+        };
+        if let Some(reason) = shared.clone() {
+            rows.push(reason_line(reason, cx));
+        }
+        for (_, pf, subs, _) in group {
+            let pf = *pf;
+            if link_brows && pf == 117 { continue; }
+            if link_brows && pf == 100 { rows.push(brow_pair(state, cx)); }
+            else { rows.push(effect_row_with(state, pf, shared.is_none(), cx)); }
+            for sub in subs.iter() {
+                rows.push(sub_control_row(state, *sub, cx));
+            }
         }
     }
     let keys: Vec<String> = pfs.iter().flat_map(|&pf| std::iter::once(pf).chain(sub_controls_of(pf).iter().copied())).map(effect_store_key).collect();
@@ -843,7 +884,7 @@ fn category_panel(
             "Rows stay disabled until the engine reports this photo's models, assets and same-frame inputs as available",
             "引擎为该照片报告模型、资产与同帧输入就绪前，各行保持禁用",
         ))
-        .badge(pfs.len().to_string())
+        .badge(count_badge(adjusted, pfs.len()))
         .modified(modified)
         .on_reset(move |_, cx| {
             let keys = keys.clone();
@@ -924,7 +965,11 @@ fn linked_binding(left: u32, right: u32, spec: SliderSpec) -> Binding {
 
 /// 联动的一对：一条滑杆写两侧；两侧都 `Available` 才可交互。
 fn linked_row(state: &Entity<AppState>, label: SharedString, left: u32, right: u32, cx: &App) -> AnyElement {
-    let (available, reason, spec) = {
+    linked_row_with(state, label, left, right, true, cx)
+}
+
+fn linked_row_with(state: &Entity<AppState>, label: SharedString, left: u32, right: u32, own_reason: bool, cx: &App) -> AnyElement {
+    let (available, reason, spec, changed) = {
         let s = state.read(cx);
         let left_status = s.capability_status(left);
         let right_status = s.capability_status(right);
@@ -935,7 +980,8 @@ fn linked_row(state: &Entity<AppState>, label: SharedString, left: u32, right: u
         } else {
             left_status.line()
         };
-        (available, reason, portrait_capability::slider_spec(left))
+        let changed = effect_is_modified(&*s, left) || effect_is_modified(&*s, right);
+        (available, reason, portrait_capability::slider_spec(left), changed)
     };
     let Some(spec) = spec else {
         return effect_row(state, left, cx);
@@ -956,66 +1002,215 @@ fn linked_row(state: &Entity<AppState>, label: SharedString, left: u32, right: u
     v_flex()
         .id(SharedString::from(format!("fg-pair-{left}")))
         .w_full()
-        .child(slider)
-        .when(!available, |this| this.child(reason_line(reason, cx)))
+        .child(changed_mark(slider.into_any_element(), changed, cx))
+        .when(!available && own_reason, |this| this.child(reason_line(reason, cx)))
         .into_any_element()
 }
 
-/// 面部精修：左右配对 + 单项。联动（默认）时一条滑杆写两侧，分开时各一条。
+/// 面部精修按五官分区，从上到下按修图时的常用顺序排；区内按重要程度排。
+/// 名称对的是描述符的英文基名（去掉 `(L)`/`(R)`），单项对完整英文名。
+/// 描述符表里多出来、这里没列到的项一律进「其他」，不会丢。
+struct FaceRegion {
+    id: &'static str,
+    en: &'static str,
+    zh: &'static str,
+    names: &'static [&'static str],
+}
+
+const FACE_REGIONS: [FaceRegion; 4] = [
+    FaceRegion { id: "fg-shape", en: "Face shape", zh: "脸型", names: &["Slim face", "Face width", "V-face", "Sharp chin", "Jawline", "Cheekbone", "Temple"] },
+    FaceRegion { id: "fg-eyes", en: "Eyes", zh: "眼睛", names: &["Eye size", "Eye width", "Eye height", "Eye distance", "Eye tilt", "Pupil size", "Lower eyelid"] },
+    FaceRegion { id: "fg-brows", en: "Brows", zh: "眉毛", names: &["Brow thickness", "Brow shape", "Brow position", "Brow distance", "Brow head length", "Brow tail length"] },
+    FaceRegion { id: "fg-head", en: "Forehead & head", zh: "额头与头顶", names: &["Forehead width", "Forehead height", "Hairline", "Skull top enhance"] },
+];
+const FACE_OTHER_REGION: &str = "fg-other";
+
+/// 开始时只展开「脸型」；其余分区折叠，但折叠的分区仍列出已调过的项。
+pub(crate) const FACE_REGIONS_FOLDED: [&str; 4] = ["fg-eyes", "fg-brows", "fg-head", FACE_OTHER_REGION];
+
+/// 面部精修的一项：左右一对，或单项。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FaceItem {
+    Pair { en: &'static str, zh: &'static str, left: u32, right: u32 },
+    Single(u32),
+}
+
+impl FaceItem {
+    fn name_en(self) -> &'static str {
+        match self {
+            FaceItem::Pair { en, .. } => en,
+            FaceItem::Single(pf) => descriptor_by_pf(pf).map(|d| d.label_en).unwrap_or(""),
+        }
+    }
+
+    fn pfs(self) -> Vec<u32> {
+        match self {
+            FaceItem::Pair { left, right, .. } => vec![left, right],
+            FaceItem::Single(pf) => vec![pf],
+        }
+    }
+
+    fn matches(self, query: &str) -> bool {
+        match self {
+            FaceItem::Pair { en, zh, left, right } => {
+                [left, right].iter().any(|pf| matches_effect(query, t(en, zh), *pf) || matches_effect(query, &effect_label(*pf), *pf))
+            }
+            FaceItem::Single(pf) => matches_effect(query, &effect_label(pf), pf),
+        }
+    }
+}
+
+/// 把描述符配成左右对：按基名配，不依赖表里的先后（注册表里眉尾是先右后左）。
+fn face_items(pfs: &[u32]) -> Vec<FaceItem> {
+    let descriptors: Vec<_> = pfs.iter().filter_map(|pf| descriptor_by_pf(*pf)).collect();
+    let mut used = vec![false; descriptors.len()];
+    let mut items = Vec::new();
+    for (index, current) in descriptors.iter().enumerate() {
+        if used[index] {
+            continue;
+        }
+        used[index] = true;
+        let Some((base_en, is_right)) = pair_base_en(current.label_en) else {
+            items.push(FaceItem::Single(current.id.pf));
+            continue;
+        };
+        let partner = descriptors.iter().enumerate().position(|(other, d)| {
+            !used[other] && matches!(pair_base_en(d.label_en), Some((base, right)) if base == base_en && right != is_right)
+        });
+        match partner {
+            Some(other) => {
+                used[other] = true;
+                let (left, right) = if is_right { (descriptors[other], *current) } else { (*current, descriptors[other]) };
+                let base_zh = pair_base_zh(left.label_zh).map(|(base, _)| base).unwrap_or(left.label_zh);
+                items.push(FaceItem::Pair { en: base_en, zh: base_zh, left: left.id.pf, right: right.id.pf });
+            }
+            None => items.push(FaceItem::Single(current.id.pf)),
+        }
+    }
+    items
+}
+
+/// 按 [`FACE_REGIONS`] 分区并按区内顺序排；没列到的进「其他」。
+fn face_regions(items: &[FaceItem]) -> Vec<(&'static str, &'static str, &'static str, Vec<FaceItem>)> {
+    let mut out: Vec<(&'static str, &'static str, &'static str, Vec<FaceItem>)> = Vec::new();
+    let mut placed = vec![false; items.len()];
+    for region in &FACE_REGIONS {
+        let mut rows = Vec::new();
+        for name in region.names {
+            if let Some(index) = items.iter().position(|item| item.name_en() == *name) {
+                if !placed[index] {
+                    placed[index] = true;
+                    rows.push(items[index]);
+                }
+            }
+        }
+        if !rows.is_empty() {
+            out.push((region.id, region.en, region.zh, rows));
+        }
+    }
+    let rest: Vec<FaceItem> = items.iter().zip(&placed).filter(|(_, placed)| !**placed).map(|(item, _)| *item).collect();
+    if !rest.is_empty() {
+        out.push((FACE_OTHER_REGION, "Other", "其他", rest));
+    }
+    out
+}
+
+/// 面板标题上的数：有调整时显示「已调 N」，否则显示总数。
+fn count_badge(adjusted: usize, total: usize) -> String {
+    if adjusted > 0 {
+        format!("{} {adjusted}", t("Adjusted", "已调"))
+    } else {
+        total.to_string()
+    }
+}
+
+/// 分区标题：点一下折叠/展开；右侧写已调几项。
+fn region_header(state: &Entity<AppState>, id: &'static str, title: &'static str, adjusted: usize, total: usize, open: bool, cx: &App) -> AnyElement {
+    let p = pal(cx).clone();
+    let st = state.clone();
+    h_flex()
+        .id(SharedString::from(format!("{id}-head")))
+        .w_full()
+        .px_3()
+        .pt_2()
+        .pb_1()
+        .gap_1p5()
+        .items_center()
+        .cursor_pointer()
+        .text_xs()
+        .text_color(p.text_muted)
+        .hover(|s| s.text_color(p.text))
+        .on_click(move |_, _, cx| st.update(cx, |s, cx| s.toggle_panel(id, cx)))
+        .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).xsmall().text_color(p.text_subtle))
+        .child(div().flex_shrink_0().font_weight(gpui_kit::FontWeight::SEMIBOLD).child(title))
+        .when(adjusted > 0, |this| {
+            this.child(
+                div()
+                    .flex_shrink_0()
+                    .px_1()
+                    .rounded(px(3.0))
+                    .bg(p.accent_soft)
+                    .text_size(px(10.0))
+                    .text_color(p.accent)
+                    .child(format!("{} {adjusted}", t("Adjusted", "已调"))),
+            )
+        })
+        .child(div().flex_1().h(px(1.0)).bg(p.edge))
+        .child(div().flex_shrink_0().text_size(px(10.0)).text_color(p.text_subtle).child(total.to_string()))
+        .into_any_element()
+}
+
+/// 面部精修：按五官分区，左右成对。联动（默认）时一条滑杆写两侧，分开时各一条。
+/// 折叠的分区只列已调过的项，所以一眼就能看到这张图动过哪里。
 fn face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyElement {
     let linked = state.read(cx).prefs.panels.portrait_link_lr;
     let pfs = main_effects(EffectCategory::FaceGeometry);
-    let descriptors: Vec<_> = pfs.iter().filter_map(|pf| descriptor_by_pf(*pf)).collect();
-    let mut pairs: Vec<(&'static str, &'static str, u32, u32)> = Vec::new();
-    let mut singles: Vec<u32> = Vec::new();
-    let mut index = 0;
-    while index < descriptors.len() {
-        let current = descriptors[index];
-        if let (Some((base_en, false)), Some(next)) = (pair_base_en(current.label_en), descriptors.get(index + 1)) {
-            if matches!(pair_base_en(next.label_en), Some((next_base, true)) if next_base == base_en) {
-                let base_zh = pair_base_zh(current.label_zh).map(|(base, _)| base).unwrap_or(current.label_zh);
-                pairs.push((base_en, base_zh, current.id.pf, next.id.pf));
-                index += 2;
-                continue;
-            }
-        }
-        singles.push(current.id.pf);
-        index += 1;
-    }
-    let shown_pairs: Vec<_> = pairs
-        .iter()
-        .copied()
-        .filter(|(en, zh, left, right)| {
-            matches_effect(query, t(*en, *zh), *left)
-                || matches_effect(query, t(*en, *zh), *right)
-                || matches_effect(query, &effect_label(*left), *left)
-                || matches_effect(query, &effect_label(*right), *right)
-        })
-        .collect();
-    let shown_singles: Vec<u32> = singles
-        .iter()
-        .copied()
-        .filter(|pf| matches_effect(query, &effect_label(*pf), *pf))
-        .collect();
-    if shown_pairs.is_empty() && shown_singles.is_empty() {
+    let items: Vec<FaceItem> = face_items(&pfs).into_iter().filter(|item| item.matches(query)).collect();
+    if items.is_empty() {
         return div().into_any_element();
     }
-    let modified = {
+    let regions = face_regions(&items);
+    let (modified, adjusted_total) = {
         let s = state.read(cx);
-        pfs.iter().any(|pf| effect_is_modified(&*s, *pf))
+        let adjusted = pfs.iter().filter(|pf| effect_is_modified(&*s, **pf)).count();
+        (adjusted > 0, adjusted)
     };
     let mut rows: Vec<AnyElement> = Vec::new();
-    for (en, zh, left, right) in shown_pairs {
-        if linked {
-            rows.push(linked_row(state, t(en, zh).into(), left, right, cx));
-        } else {
-            rows.push(caption(t(en, zh), cx));
-            rows.push(effect_row(state, left, cx));
-            rows.push(effect_row(state, right, cx));
+    for (id, en, zh, region_items) in regions {
+        let (open, flags, shared) = {
+            let s = state.read(cx);
+            let open = !query.is_empty() || !s.prefs.panels.collapsed.contains(id);
+            let flags: Vec<bool> = region_items.iter().map(|item| item.pfs().iter().any(|pf| effect_is_modified(&*s, *pf))).collect();
+            // 每项第一个不可用分量的原因；全区相同时只在区标题下写一次。
+            let reasons: Vec<Option<String>> = region_items
+                .iter()
+                .map(|item| item.pfs().into_iter().map(|pf| s.capability_status(pf)).find(|status| !status.is_available()).map(|status| status.line()))
+                .collect();
+            let shared = match reasons.first().cloned().flatten() {
+                Some(reason) if reasons.len() > 1 && reasons.iter().all(|r| r.as_deref() == Some(reason.as_str())) => Some(reason),
+                _ => None,
+            };
+            (open, flags, shared)
+        };
+        let adjusted = flags.iter().filter(|flag| **flag).count();
+        rows.push(region_header(state, id, t(en, zh), adjusted, region_items.len(), open, cx));
+        let own_reason = shared.is_none();
+        if let Some(reason) = shared.filter(|_| open || adjusted > 0) {
+            rows.push(reason_line(reason, cx));
         }
-    }
-    for pf in shown_singles {
-        rows.push(effect_row(state, pf, cx));
+        for (item, changed) in region_items.into_iter().zip(flags) {
+            if !open && !changed {
+                continue;
+            }
+            match item {
+                FaceItem::Pair { en, zh, left, right } if linked => rows.push(linked_row_with(state, t(en, zh).into(), left, right, own_reason, cx)),
+                FaceItem::Pair { left, right, .. } => {
+                    rows.push(effect_row_with(state, left, own_reason, cx));
+                    rows.push(effect_row_with(state, right, own_reason, cx));
+                }
+                FaceItem::Single(pf) => rows.push(effect_row_with(state, pf, own_reason, cx)),
+            }
+        }
     }
     let keys: Vec<String> = pfs.iter().map(|pf| effect_store_key(*pf)).collect();
     let (st, st_link) = (state.clone(), state.clone());
@@ -1024,7 +1219,7 @@ fn face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyEl
             "Face reshape needs this photo's landmarks; linked pairs move both sides, and both must be available",
             "面部精修需要当前照片的面部关键点；联动时同时写两侧，两侧都可用才可操作",
         ))
-        .badge(pfs.len().to_string())
+        .badge(count_badge(adjusted_total, pfs.len()))
         .modified(modified)
         .action(
             HeaderAction::new(
@@ -1050,6 +1245,27 @@ fn face_geometry_panel(state: &Entity<AppState>, query: &str, cx: &App) -> AnyEl
         })
         .children(rows)
         .into_any_element()
+}
+
+#[cfg(test)]
+#[test]
+fn face_regions_pair_every_side_and_lose_nothing() {
+    let pfs = main_effects(EffectCategory::FaceGeometry);
+    let items = face_items(&pfs);
+    // 每个描述符恰好出现一次。
+    let mut seen: Vec<u32> = items.iter().flat_map(|item| item.pfs()).collect();
+    seen.sort_unstable();
+    let mut all = pfs.clone();
+    all.sort_unstable();
+    assert_eq!(seen, all);
+    // 注册表里眉尾是先右后左，照样配成一对，且左在前。
+    let tail = items.iter().find(|item| item.name_en() == "Brow tail length").copied();
+    assert!(matches!(tail, Some(FaceItem::Pair { left: 49221, right: 41922, .. })), "{tail:?}");
+    // 分区后同样一项不丢、不重。
+    let regions = face_regions(&items);
+    let placed: usize = regions.iter().map(|region| region.3.len()).sum();
+    assert_eq!(placed, items.len());
+    assert_eq!(regions.first().map(|region| region.0), Some("fg-shape"));
 }
 
 /// 妆容：子妆容行（款式/色板由 `makeup_picker::style_bar` 画）。
