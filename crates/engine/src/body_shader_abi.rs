@@ -3,6 +3,12 @@
 //! The native model contract is exactly 69 ordered keypoints. Slot order is
 //! the model output order normalized by `BodyPoseOutputLayout`; this module
 //! does not assign semantic names to unknown slots or synthesize missing ones.
+//!
+//! A model whose `K` is not 69 has **no** route into this set: its keypoints go
+//! through `BodyPoseInference::semantic_anchors`, which returns anchored
+//! semantics. Writing that semantic order into these 69 slots would invent a
+//! vendor slot table, so `BodyKeypointSet::from_inference` keeps refusing any
+//! contract other than [`BODY_LANDMARK_COUNT`].
 
 use aurora_portrait::kernels::body_geometry::{Mesh, Vec2};
 use aurora_portrait::Refusal;
@@ -207,7 +213,7 @@ fn finite(point: Vec2) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aimask::body_pose::{BodyPoseOutputLayout, BodyPoseTensorContract};
+    use crate::aimask::body_pose::{BodyPoseOutputLayout, BodyPoseTensorContract, PoseChannels};
 
     fn inference(count: usize) -> BodyPoseInference {
         BodyPoseInference {
@@ -233,6 +239,8 @@ mod tests {
                     score: 1.0,
                 })
                 .collect(),
+            // 69-slot ABI 不读语义通道；这里只是构造一个合法的推断记录。
+            channels: PoseChannels::default(),
         }
     }
 

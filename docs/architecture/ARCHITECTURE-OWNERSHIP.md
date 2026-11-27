@@ -38,6 +38,18 @@
 | A-QA（架构检查） | `crates/engine/tests/architecture_rules.rs`、`scripts/architecture/check.sh`、`docs/architecture/ARCHITECTURE-CHECKS.md` | 生产源码、Cargo.toml |
 | 统筹（本 Agent） | `lib.rs` 模块声明、`docs/architecture/*`、跨 lane 集成 patch | — |
 
+## 模块 B：同帧美体生成与消费
+
+独立于目录模块，从 `portrait/zero-ort-baseline-20261126` 的 `536fdcf` 开发；不覆盖 C4 的推理后端或 RAW/细节路径。
+
+| 写入者 | 写入面 |
+|---|---|
+| 姿态 ABI | `crates/engine/src/{aimask/body_pose.rs,body_shader_abi.rs}`、必要的 `crates/portrait/src/kernels/body_69slot_bridge.rs` 适配 |
+| 解析与实例 | `crates/engine/src/{portrait_body_inputs.rs,aimask/mod.rs}` |
+| 网格 / 稠密场 | `crates/engine/src/portrait_body_mesh.rs` / `crates/engine/src/portrait_body_fields.rs`，各自单写 |
+| 验收 | `crates/engine/src/portrait_body_live_tests.rs` |
+| 统筹 | `crates/engine/src/{portrait_body_producer.rs,portrait_body_stage.rs,portrait_body_warp.rs,portrait_stage.rs,mock/process.rs}`，以及 `crates/portrait/src/kernels/{body_geometry.rs,body_geometry_params.rs,hair_body.rs}` 的采样坐标和曲线复用；预览/宽位共同消费 |
+
 ## 3. 三个 Agent 的边界（按任务书 §1.1，待仓库所有者确认）
 
 | 责任域 | 公共架构 Agent（本 lane） | 性能 Agent | Mac Agent |

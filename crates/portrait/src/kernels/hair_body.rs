@@ -1010,6 +1010,30 @@ fn sample_plane_uv(plane: &[u8], channel: usize, width: u32, height: u32, u: f32
     top + (bottom - top) * ty
 }
 
+impl PackedShiftMap<'_> {
+    /// Same packed shift unpacking as the RGBA8 consumer. Validate once before
+    /// iterating, then reuse the displacement for both RGB storage formats.
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.width == 0 || self.height == 0 || self.shift_width == 0 || self.shift_height == 0
+            || (self.width as usize).checked_mul(self.height as usize)
+                .and_then(|n| n.checked_mul(4)) != Some(self.rgba8.len())
+        {
+            return Err(Refusal::ShapeMismatch("PF90041_SHIFT_MAP"));
+        }
+        if !self.ratio.is_finite() || self.ratio <= 0.0 {
+            return Err(Refusal::ValueOutOfRange("PF90041_SHIFT_RATIO"));
+        }
+        Ok(())
+    }
+
+    pub fn displacement(&self, u: f32, v: f32) -> (f32, f32) {
+        let sample = |channel| sample_plane_uv(self.rgba8, channel, self.width, self.height, u, v);
+        let x = ((sample(0) * 256.0 + sample(1)) - 32768.0) / self.ratio / self.shift_width as f32;
+        let y = ((sample(2) * 256.0 + sample(3)) - 32768.0) / self.ratio / self.shift_height as f32;
+        (x, y)
+    }
+}
+
 fn sample_bgra_uv(image: &Image, u: f32, v: f32) -> [u8; 4] {
     let px = u * image.width as f32 - 0.5;
     let py = v * image.height as f32 - 0.5;
@@ -1050,23 +1074,7 @@ pub fn body_shift(
         return Err(Refusal::ValueOutOfRange("PF90041_UI"));
     }
     plane(body_mask, count, "PF90041_BODY_MASK")?;
-    if shift_map.width == 0
-        || shift_map.height == 0
-        || shift_map.shift_width == 0
-        || shift_map.shift_height == 0
-    {
-        return Err(Refusal::ShapeMismatch("PF90041_SHIFT_MAP"));
-    }
-    if (shift_map.width as usize)
-        .checked_mul(shift_map.height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        != Some(shift_map.rgba8.len())
-    {
-        return Err(Refusal::ShapeMismatch("PF90041_SHIFT_MAP"));
-    }
-    if !shift_map.ratio.is_finite() || shift_map.ratio <= 0.0 {
-        return Err(Refusal::ValueOutOfRange("PF90041_SHIFT_RATIO"));
-    }
+    shift_map.validate()?;
     if ui == 0 {
         return Ok(source.clone());
     }
@@ -1077,16 +1085,7 @@ pub fn body_shift(
             let index = (y * source.width + x) as usize;
             let u = (x as f32 + 0.5) / source.width as f32;
             let v = (y as f32 + 0.5) / source.height as f32;
-            let r = sample_plane_uv(shift_map.rgba8, 0, shift_map.width, shift_map.height, u, v);
-            let g = sample_plane_uv(shift_map.rgba8, 1, shift_map.width, shift_map.height, u, v);
-            let b = sample_plane_uv(shift_map.rgba8, 2, shift_map.width, shift_map.height, u, v);
-            let a = sample_plane_uv(shift_map.rgba8, 3, shift_map.width, shift_map.height, u, v);
-            let shift_x = ((r * 256.0 + g) - 32768.0)
-                / shift_map.ratio
-                / shift_map.shift_width as f32;
-            let shift_y = ((b * 256.0 + a) - 32768.0)
-                / shift_map.ratio
-                / shift_map.shift_height as f32;
+            let (shift_x, shift_y) = shift_map.displacement(u, v);
 
             let warped = sample_bgra_uv(source, u + shift_x, v + shift_y);
             let mask = body_mask[index] as i32;
