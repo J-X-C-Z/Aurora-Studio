@@ -779,6 +779,44 @@ pub trait ImageEngine: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Per-photo portrait capability snapshot: what this engine can really run
+    /// for `image` right now.
+    ///
+    /// The interface asks for this off the UI thread and greys out exactly the
+    /// rows it reports as unavailable, so an engine must answer from evidence
+    /// about *this* photo, not from the static catalogue bridge in
+    /// [`crate::panel_commands::portrait_capabilities`].
+    ///
+    /// The default is conservative on every axis at once: no backend, no
+    /// models and no same-frame inputs are claimed, which is deliberately not
+    /// [`crate::portrait_registry::RuntimeProbeContext::fully_ready`]. Engines
+    /// that can observe their own host and frame override this; an engine that
+    /// cannot is expected to report the gap instead of optimism.
+    fn portrait_capability_snapshot(
+        &self,
+        _image: ImageId,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        crate::portrait_registry::capability_snapshot(
+            &crate::portrait_registry::RuntimeProbeContext::default(),
+        )
+    }
+
+    /// Per-photo capability for one document state.
+    ///
+    /// `detail` asks the engine to spend a real production pass on the rows it
+    /// reports; `false` must stay cheap and is what the automatic path uses. An
+    /// engine with per-row evidence overrides this; the default delegates to
+    /// [`Self::portrait_capability_snapshot`], so an engine without one keeps its
+    /// conservative answer and never invents a positive.
+    fn portrait_capability_for(
+        &self,
+        image: ImageId,
+        _adjustments: &AdjustmentSet,
+        _detail: bool,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        self.portrait_capability_snapshot(image)
+    }
+
     // ── Rendering ──
 
     /// A thumbnail whose longest side is at most `max_size`, with adjustments applied.

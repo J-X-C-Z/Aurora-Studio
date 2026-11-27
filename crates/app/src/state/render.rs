@@ -1154,6 +1154,10 @@ impl AppState {
                                 stamp,
                             }, cx);
                             log::debug!("preview: {}×{} in {:.1} ms", width, height, elapsed_ms);
+                            // Track final display identity; normal slider frames do not expire input evidence.
+                             if stamp.quality == RenderQuality::Final {
+                                this.note_portrait_frame(image_id, stamp.id);
+                            }
                             this.preview_state.preview.histogram = histogram;
                             this.preview_state.preview.elapsed_ms = elapsed_ms;
                         } else {

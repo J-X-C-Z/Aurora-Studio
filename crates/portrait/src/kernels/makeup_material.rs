@@ -414,7 +414,9 @@ fn byte_even(value: f32) -> u8 {
     rounded.clamp(0.0, 255.0) as u8
 }
 
-fn sample_rgba(image: &Image, u: f32, v: f32) -> [f32; 4] {
+/// Bilinear half-texel sample, the shader-rule sampler shared with the
+/// dual-texture evidence path.
+pub fn sample_rgba(image: &Image, u: f32, v: f32) -> [f32; 4] {
     let u = clamp01(u);
     let v = clamp01(v);
     let x = u * image.width as f32 - 0.5;
@@ -439,7 +441,8 @@ fn sample_rgba(image: &Image, u: f32, v: f32) -> [f32; 4] {
     out
 }
 
-fn mask_weight(mask: [f32; 4], channel: MaskChannel) -> f32 {
+/// Recovered `mask_weight` for one declared [`MaskChannel`].
+pub fn mask_weight(mask: [f32; 4], channel: MaskChannel) -> f32 {
     let value = match channel {
         MaskChannel::R => mask[0],
         MaskChannel::G => mask[1],

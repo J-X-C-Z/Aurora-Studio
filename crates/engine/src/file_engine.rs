@@ -31,6 +31,11 @@ use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, HdrOptions, JobSt
 mod library_ops;
 #[path = "file_engine_services.rs"]
 mod services;
+/// Per-photo portrait capability evidence; see the module docs. Declared here
+/// (not in `lib.rs`) because only this engine can supply the decoded frame and
+/// its identity, and it stays private to the engine.
+#[path = "portrait_runtime_probe.rs"]
+mod portrait_runtime_probe;
 
 /// Longest side kept for a decoded source; larger files are downscaled.
 const SOURCE_LONG_SIDE: u32 = crate::raw_cache::PREVIEW_LONG_SIDE;
@@ -3047,6 +3052,43 @@ impl FileEngine {
             .map(|entry| entry.path.clone())
     }
 
+    /// The photo's own decoded frame, when the engine still holds it, plus the
+    /// identity its portrait evidence is keyed by.
+    ///
+    /// Deliberately read-only: no decode, no LRU bookkeeping, no cache pin. A
+    /// capability query must not turn into an image load, and a photo that is
+    /// not decoded simply has no same-frame evidence yet. `None`/`None` also
+    /// covers an unknown image and a file whose identity no longer matches what
+    /// the cache holds (that entry is invalidated, so nothing is claimed from
+    /// stale pixels).
+    fn portrait_frame_evidence(
+        &self,
+        image: ImageId,
+    ) -> (
+        Option<portrait_runtime_probe::FrameIdentity>,
+        Option<Arc<Source>>,
+    ) {
+        let Some(path) = self.image_path(image) else {
+            return (None, None);
+        };
+        let mut st = self.state.lock();
+        if !FileEngine::refresh_source_identity(&mut st, image, &path, false) {
+            return (None, None);
+        }
+        let Some(entry) = st.sources.get(&image) else {
+            return (None, None);
+        };
+        let identity = portrait_runtime_probe::FrameIdentity {
+            path,
+            len: entry.identity.len,
+            mtime_nanos: entry.identity.mtime_nanos,
+            token: entry.identity.token,
+        };
+        let source = Arc::clone(&entry.source);
+        drop(st);
+        (Some(identity), Some(source))
+    }
+
     /// A cached source, charged to the byte budget and refreshed in the LRU.
     /// Derived buffers are accounted again on every hit because they are built
     /// lazily after the source was stored.
@@ -4833,6 +4875,34 @@ impl ImageEngine for FileEngine {
     }
     fn portrait_capabilities(&self) -> Vec<crate::PortraitCapability> {
         crate::panel_commands::portrait_capabilities()
+    }
+    /// Per-photo availability: the catalogue bridge above stays static, this
+    /// one answers for `image`'s own decoded frame, host models and assets.
+    ///
+    /// This form is the automatic, cheap one: no document, no production pass.
+    fn portrait_capability_snapshot(
+        &self,
+        image: ImageId,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        self.portrait_capability_for(image, &AdjustmentSet::default(), false)
+    }
+    /// Per-photo availability for the document the panel currently shows.
+    ///
+    /// `detail` is the user's explicit refresh; the automatic path passes `false`.
+    fn portrait_capability_for(
+        &self,
+        image: ImageId,
+        adjustments: &AdjustmentSet,
+        detail: bool,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        let (identity, source) = self.portrait_frame_evidence(image);
+        portrait_runtime_probe::capability_for(
+            image,
+            identity.as_ref(),
+            source.as_deref(),
+            adjustments,
+            detail,
+        )
     }
     fn layer_summaries(&self, image: ImageId) -> Vec<crate::engine::LayerSummary> {
         self.catalog().layer_summaries(image)
