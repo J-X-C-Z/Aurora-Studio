@@ -2209,9 +2209,11 @@ fn render_sized(
     // cross-entry portrait cache stays preview-only (see the lookup below).
     let portrait_active =
         !bypass && crate::portrait_registry::has_active_portrait_effect(adj);
+    let body_active = !bypass && crate::portrait_stage::has_live_body_request(&adj.extra);
+    let post_portrait = portrait_active || body_active;
     let mut cached_frame_fingerprint = None;
     let (mut rgba, mut rgba16, develop8) = 'develop: {
-        if portrait_active && !wide {
+        if post_portrait && !wide {
             if let Some((cached, fingerprint)) =
                 portrait_stage_cached(src, adj, region, out_w, out_h, scale, level, mask_overlay)
             {
@@ -2324,7 +2326,7 @@ fn render_sized(
         let c1_ok = true;
 
         if c1_ok {
-            let post_8bit = has_post_8bit_stages(adj, bypass, &plan, portrait_active);
+            let post_8bit = has_post_8bit_stages(adj, bypass, &plan, post_portrait);
             let direct_return = !post_8bit;
             let emit_bgra = direct_return && want_bgra;
             let emit_hist = direct_return && with_histogram;
@@ -3179,10 +3181,10 @@ fn render_sized(
     // A wide render is a one-shot export: it must neither take the cache hit
     // above (which returns rgba16 = None) nor evict the preview's entry, so
     // the portrait stage cache stays preview-only on both sides.
-    if portrait_active && !wide {
+    if post_portrait && !wide {
         portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba);
     }
-    let portrait_report = if portrait_active {
+    let mut portrait_report = if portrait_active {
         let masks = src.portrait_masks();
         let receipt =
             crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
@@ -3523,7 +3525,7 @@ fn render_sized(
         if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
-        Some(crate::portrait_stage::apply_portrait_effects_with_job(
+        Some(crate::portrait_stage::apply_portrait_colors_before_body(
             &mut rgba,
             out_w,
             out_h,
@@ -3536,6 +3538,26 @@ fn render_sized(
     };
     if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
         merge_wide_delta(wide, before, &rgba, out_w as usize);
+    }
+    // Body geometry resamples both depths from their own post-color samples.
+    // Running before merge_wide_delta would move high bits but leave the
+    // original pixel's low bits behind.
+    if body_active {
+        let job_id = portrait_report.as_ref().and_then(|r| r.job_id).unwrap_or_else(|| {
+            crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
+                &rgba, out_w, out_h, region, &adj.extra, src.portrait_masks(), cached_frame_fingerprint,
+                Some(src.portrait_masks_receipt_fingerprint()),
+            ).job_id()
+        });
+        let body = crate::portrait_stage::apply_live_body(
+            &mut rgba, rgba16.as_deref_mut(), (out_w, out_h), job_id, &adj.extra,
+        );
+        if !body.is_empty() {
+            let report = portrait_report.get_or_insert_with(|| crate::PortraitRunReport {
+                job_id: Some(job_id), ..Default::default()
+            });
+            report.effects.extend(body);
+        }
     }
     let histogram = if with_histogram { histogram(&rgba) } else { Histogram::default() };
     if let Some(t0) = t0 {

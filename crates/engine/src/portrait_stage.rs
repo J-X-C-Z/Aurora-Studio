@@ -123,6 +123,18 @@ pub use portrait_body_producer::{
     BodyGeometryProducerInputs, BodyLandmarkDomain, BodyLandmarkEffect, BodyLandmarkFrame,
     BodyLandmarkRef,
 };
+#[path = "portrait_body_inputs.rs"]
+mod portrait_body_inputs;
+#[path = "portrait_body_mesh.rs"]
+mod portrait_body_mesh;
+#[path = "portrait_body_fields.rs"]
+mod portrait_body_fields;
+#[path = "portrait_body_warp.rs"]
+mod portrait_body_warp;
+pub(crate) use portrait_body_producer::{apply_live_body, has_live_body_request};
+#[cfg(test)]
+#[path = "portrait_body_live_tests.rs"]
+mod portrait_body_live_tests;
 
 #[path = "portrait_plump_stage.rs"]
 mod portrait_plump_stage;
@@ -4785,20 +4797,10 @@ fn supports_effect(pf: u32) -> bool {
 fn try_cuda_body_mesh(
     source: &Image,
     pf: u32,
-    job_id: Option<u64>,
-    job: Option<&BodyGeometryJob>,
+    job: &BodyGeometryJob,
 ) -> Option<Result<(Image, Vec<aurora_portrait::cuda::Dispatch>), String>> {
-    let job = job?;
     if !matches!(pf, 401 | 406 | 410 | 415) {
         return None;
-    }
-    if job.job_id == 0 || job_id != Some(job.job_id) {
-        return Some(Err("CUDA body mesh: body geometry job id".to_string()));
-    }
-    if job.frame_size != (source.width, source.height)
-        || job.source_sha256 != sha256_32(&source.pixels)
-    {
-        return Some(Err("CUDA body mesh: body geometry frame".to_string()));
     }
     let Some(BodyGeometryInput::Mesh { mesh, passes }) = job.effects.get(&pf) else {
         return Some(Err("CUDA body mesh: body geometry effect".to_string()));
@@ -5024,6 +5026,19 @@ pub fn apply_portrait_effects_with_report_and_inputs(
     )
 }
 
+/// FileEngine composes generated body geometry last, after the wide color
+/// buffer's deltas are resolved. The same frame receipt still covers the full
+/// recipe; only this renderer defers its body rows.
+pub(crate) fn apply_portrait_colors_before_body(
+    portrait: &mut Vec<u8>, width: u32, height: u32, region: NormRect,
+    extra: &BTreeMap<String, f32>, inputs: &PortraitJobInputs<'_>,
+) -> PortraitRunReport {
+    crate::mock::gpu_runtime::install_portrait_bridge();
+    let report = apply_portrait_effects_impl(portrait, width, height, region, extra, inputs, cfg!(not(test)), true);
+    log_report(&report);
+    report
+}
+
 /// Existing dev/AB CPU force, reused verbatim from the Windows CUDA lane.
 /// This is not a new global switch (decision D5): the same `AURORA_*` names
 /// already mean "do not use the GPU" there.
@@ -5112,6 +5127,14 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     inputs: &PortraitJobInputs<'_>,
     require_renderer_receipt: bool,
 ) -> PortraitRunReport {
+    apply_portrait_effects_impl(portrait, width, height, region, extra, inputs, require_renderer_receipt, false)
+}
+
+fn apply_portrait_effects_impl(
+    portrait: &mut Vec<u8>, width: u32, height: u32, region: NormRect,
+    extra: &BTreeMap<String, f32>, inputs: &PortraitJobInputs<'_>,
+    require_renderer_receipt: bool, defer_live_body: bool,
+) -> PortraitRunReport {
     let mut report = PortraitRunReport {
         job_id: inputs.job_id(),
         effects: Vec::new(),
@@ -5136,7 +5159,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
         .iter()
         .filter_map(|(key, value)| {
             let id: u32 = key.strip_prefix("pc:")?.parse().ok()?;
-            Some((id, *value))
+            (!defer_live_body || !portrait_body_stage::supports(id)).then_some((id, *value))
         })
         .collect();
     effects.sort_by_key(|&(pf, _)| pf);
@@ -5190,6 +5213,10 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     } else {
         Ok(None)
     };
+    let body_job = inputs.body_geometry.map(|job| {
+        job.validate_frame((width, height), &source.pixels, inputs.job_id())?;
+        Ok::<_, Refusal>(job)
+    });
     let mut current = source;
     // Keep the main-session optimization: skin effects share one sampled plane.
     // Non-skin rows receive their own explicit planes from `PortraitJobInputs`.
@@ -5434,10 +5461,31 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if portrait_body_stage::supports(pf) {
+            if degree == 0.0 {
+                run.backend = PortraitBackend::Skipped;
+                report.effects.push(run);
+                continue;
+            }
+            let job = if !degree.is_finite() {
+                Err(Refusal::ValueOutOfRange("body geometry control"))
+            } else {
+                body_job.as_ref().cloned().unwrap_or(Err(Refusal::MissingInput("body geometry job")))
+            };
+            let job = match job {
+                Ok(job) => job,
+                Err(refusal) => {
+                    run.backend = PortraitBackend::Skipped;
+                    run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                    run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                    run.refusal = Some(refusal);
+                    report.effects.push(run);
+                    continue;
+                }
+            };
             #[cfg(windows)]
             {
                 if let Some(result) =
-                    try_cuda_body_mesh(&current, pf, inputs.job_id(), inputs.body_geometry)
+                    try_cuda_body_mesh(&current, pf, job)
                 {
                     match result {
                         Ok((next, dispatches)) if !dispatches.is_empty() => {
@@ -5457,13 +5505,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     }
                 }
             }
-            match portrait_body_stage::apply(
-                &current,
-                pf,
-                degree,
-                inputs.job_id(),
-                inputs.body_geometry,
-            ) {
+            match portrait_body_stage::apply_bound(&current, pf, degree, job) {
                 Ok(Some(next)) => {
                     current = next;
                     run.backend = PortraitBackend::Cpu;

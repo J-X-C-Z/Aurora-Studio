@@ -257,7 +257,7 @@ const fn three(params: [f32; 3], degrees: [f32; 3], default_param: f32) -> Contr
 
 const fn two(degrees: [f32; 2], default_param: f32) -> ControlCurve {
     ControlCurve {
-        params: [0.0, 0.5, 1.0],
+        params: [0.0, 1.0, 1.0],
         degrees: [degrees[0], degrees[1], 0.0],
         nodes: 2,
         default_param,

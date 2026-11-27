@@ -165,6 +165,22 @@ pub struct BodyGeometryBuildFrame<'a> {
 }
 
 impl BodyGeometryJob {
+    pub(super) fn validate_frame(&self, size: (u32, u32), bytes: &[u8], job_id: Option<u64>) -> Result<(), Refusal> {
+        if self.job_id == 0 || job_id != Some(self.job_id) {
+            return Err(Refusal::ValueOutOfRange("body geometry job id"));
+        }
+        if self.frame_size != size {
+            return Err(Refusal::ShapeMismatch("body geometry frame"));
+        }
+        if self.source_sha256.iter().all(|&byte| byte == 0) {
+            return Err(Refusal::MissingInput("body geometry frame SHA-256"));
+        }
+        if self.source_sha256 != sha256_32(bytes) {
+            return Err(Refusal::ValueOutOfRange("body geometry frame digest"));
+        }
+        self.body_params.check(&self.effects)
+    }
+
     /// Build the producer payload from explicit same-ticket, same-frame rows.
     ///
     /// This function never creates a mask, landmark, mesh, VBO, EBO or pass.
@@ -387,7 +403,7 @@ fn build_row(
             }
             Ok(SixPoint(warp.clone()))
         }
-        (401 | 406 | 410 | 415, Mesh { mesh, passes }) => {
+        (pf, Mesh { mesh, passes }) if mesh_row(pf) => {
             let evidence_mesh = evidence
                 .mesh
                 .ok_or(Refusal::MissingInput("body geometry mesh"))?;
@@ -444,7 +460,7 @@ fn build_row(
             })
         }
         (
-            407,
+            407 | 30094 | 30095,
             Leg {
                 columns,
                 catmull_size,
@@ -600,29 +616,26 @@ fn defines_hash(hash: &mut DefaultHasher, defines: PassDefines) {
         .hash(hash);
 }
 
-pub(super) fn supports(pf: u32) -> bool {
-    matches!(pf, 400 | 401 | 404..=408 | 410 | 415 | 416 | 38556 | 90041)
+fn mesh_row(pf: u32) -> bool {
+    matches!(pf, 401 | 403 | 406 | 410..=415 | 417 | 418 | 30074 | 30075)
 }
 
-/// Payload kind a routed row accepts. Mirrors the dispatch in [`apply`] so a job
-/// whose payload kind disagrees with its row is refused when it is written.
-/// Kind-level only: every kernel still validates its own streams at dispatch,
-/// and nothing here synthesizes a missing mask, mesh, UV or control point.
+pub(super) fn supports(pf: u32) -> bool {
+    mesh_row(pf) || matches!(pf, 400 | 404 | 405 | 407 | 408 | 416 | 38556 | 90041 | 30094 | 30095)
+}
+
+/// The generated and explicit producers share one kind gate. Height is never
+/// a Mesh; a color raster alone is not the height displacement contract.
 pub(super) fn accepts(pf: u32, input: &BodyGeometryInput) -> bool {
     use BodyGeometryInput::*;
-    matches!(
-        (pf, input),
-        (400 | 404, SixPoint(_))
-            | (401 | 406 | 408 | 410 | 415, Mesh { .. })
-            | (405, BodySlim { .. })
-            | (407, Leg { .. })
-            | (408, Height { .. })
-            | (416, Waist { .. })
-            | (38556, BreastLift { .. })
-            | (90041, Shift(_))
-    )
+    (mesh_row(pf) && matches!(input, Mesh { .. }))
+        || matches!((pf, input),
+            (400 | 404, SixPoint(_)) | (405, BodySlim { .. })
+                | (407 | 30094 | 30095, Leg { .. }) | (408, Height { .. })
+                | (416, Waist { .. }) | (38556, BreastLift { .. }) | (90041, Shift(_)))
 }
 
+#[cfg(test)]
 pub(super) fn apply(
     source: &Image,
     pf: u32,
@@ -637,19 +650,15 @@ pub(super) fn apply(
         return Ok(None);
     }
     let job = job.ok_or(Refusal::MissingInput("body geometry job"))?;
-    if job.job_id == 0 || job_id != Some(job.job_id) {
-        return Err(Refusal::ValueOutOfRange("body geometry job id"));
-    }
-    if job.frame_size != (source.width, source.height) {
-        return Err(Refusal::ShapeMismatch("body geometry frame"));
-    }
-    if job.source_sha256.iter().all(|byte| *byte == 0) {
-        return Err(Refusal::MissingInput("body geometry frame SHA-256"));
-    }
-    if job.source_sha256 != sha256_32(&source.pixels) {
-        return Err(Refusal::ValueOutOfRange("body geometry frame digest"));
-    }
-    job.body_params.check(&job.effects)?;
+    job.validate_frame((source.width, source.height), &source.pixels, job_id)?;
+    apply_bound(source, pf, ui, job)
+}
+
+/// The dispatcher validated this job once against the immutable source. The
+/// composed pixels may already include other effects from that same ticket.
+pub(super) fn apply_bound(
+    source: &Image, pf: u32, ui: f32, job: &BodyGeometryJob,
+) -> Result<Option<Image>, Refusal> {
     let input = job
         .effects
         .get(&pf)
@@ -672,7 +681,7 @@ pub(super) fn apply(
                 warp.valid_point_count,
             )
         }
-        (401 | 406 | 410 | 415, Mesh { mesh, passes }) => {
+        (pf, Mesh { mesh, passes }) if mesh_row(pf) => {
             if passes.iter().any(|pass| pass.defines.uv_map) {
                 return Err(Refusal::ValueOutOfRange(
                     "body geometry requires color passes",
@@ -689,7 +698,7 @@ pub(super) fn apply(
             },
         ) => hair_body::body_slim_warp_field(source, mask_r, source_uv, target_uv),
         (
-            407,
+            407 | 30094 | 30095,
             Leg {
                 columns,
                 catmull_size,

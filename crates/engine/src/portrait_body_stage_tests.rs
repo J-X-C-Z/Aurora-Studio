@@ -27,7 +27,7 @@ fn fixture(pf: u32) -> BodyGeometryInput {
             inverse_aspect: 1.0,
             valid_point_count: 1,
         }),
-        401 | 406 | 410 | 415 => {
+        401 | 403 | 406 | 410 | 415 => {
             let destination = vec![
                 Vec2::new(0.0, 0.0),
                 Vec2::new(1.0, 0.0),
@@ -111,8 +111,8 @@ fn producer(pf: u32, job_id: u64) -> BodyGeometryJob {
     }
 }
 
-const ROUTED: [u32; 12] = [
-    400, 401, 404, 405, 406, 407, 408, 410, 415, 416, 38556, 90041,
+const ROUTED: [u32; 13] = [
+    400, 401, 403, 404, 405, 406, 407, 408, 410, 415, 416, 38556, 90041,
 ];
 
 #[test]
@@ -229,7 +229,7 @@ fn body_normal_stage_receipt_and_writeback() {
     let source = frame();
     let masks = PortraitMasks::default();
     let region = NormRect::FULL;
-    for pf in ROUTED.into_iter().chain([403]) {
+    for pf in ROUTED {
         let extra = BTreeMap::from([(format!("pc:{pf}"), 50.0)]);
         let receipt = PortraitJobReceipt::from_renderer_receipt(
             &source.pixels,
@@ -240,11 +240,9 @@ fn body_normal_stage_receipt_and_writeback() {
             &masks,
         );
         let mut owner = ProducerInputs::default();
-        if pf != 403 {
-            owner
-                .write_body_geometry(producer(pf, receipt.job_id()), &receipt)
-                .unwrap();
-        }
+        owner
+            .write_body_geometry(producer(pf, receipt.job_id()), &receipt)
+            .unwrap();
         let mut job = PortraitJobInputs::from_renderer_receipt(receipt, &masks);
         job.fill_from_producer_inputs(&owner);
         let mut pixels = source.pixels.clone();
@@ -252,24 +250,19 @@ fn body_normal_stage_receipt_and_writeback() {
             apply_portrait_effects_with_job(&mut pixels, SIZE.0, SIZE.1, region, &extra, &job);
         assert_eq!(report.effects.len(), 1, "PF{pf}");
         let run = &report.effects[0];
-        if pf == 403 {
-            assert_eq!(run.refusal, Some(Refusal::NotImplemented(403)));
-            assert_eq!(pixels, source.pixels);
+        assert!(
+            run.executed && !run.skipped && run.refusal.is_none(),
+            "PF{pf}"
+        );
+        if matches!(pf, 401 | 406 | 410 | 415) {
+            assert!(matches!(
+                run.backend,
+                PortraitBackend::Cuda | PortraitBackend::Cpu
+            ));
         } else {
-            assert!(
-                run.executed && !run.skipped && run.refusal.is_none(),
-                "PF{pf}"
-            );
-            if matches!(pf, 401 | 406 | 410 | 415) {
-                assert!(matches!(
-                    run.backend,
-                    PortraitBackend::Cuda | PortraitBackend::Cpu
-                ));
-            } else {
-                assert_eq!(run.backend, PortraitBackend::Cpu);
-            }
-            assert_ne!(pixels, source.pixels, "PF{pf}");
+            assert_eq!(run.backend, PortraitBackend::Cpu);
         }
+        assert_ne!(pixels, source.pixels, "PF{pf}");
     }
 }
 
@@ -388,6 +381,12 @@ fn body_producer_entry_accepts_synthetic_jobs_for_each_routed_pf() {
         owner.body_geometry().map(|job| job.effects.len()),
         Some(ROUTED.len())
     );
+    let mut inputs = PortraitJobInputs::from_renderer_receipt(receipt, &masks);
+    inputs.fill_from_producer_inputs(&owner);
+    let mut pixels = source.pixels.clone();
+    let report = apply_portrait_effects_with_job(&mut pixels, SIZE.0, SIZE.1, region, &extra, &inputs);
+    assert_eq!(report.effects.len(), ROUTED.len());
+    assert!(report.effects.iter().all(|run| run.executed), "{report:?}");
 }
 
 #[test]
@@ -441,15 +440,15 @@ fn body_producer_entry_refuses_payloads_it_cannot_honor() {
         }),
         Err(Refusal::ShapeMismatch("body geometry effect kind"))
     );
-    // PF403 stays unrouted: refuse rather than invent a mask contract.
+    // Height has displacements, not a generic color mesh payload.
     assert_eq!(
         write(BodyGeometryJob {
             job_id: receipt.job_id(),
             frame_size: SIZE,
             source_sha256: sha256_32(&source.pixels),
             body_params: BodyVendorParams::default(),
-            effects: BTreeMap::from([(403, fixture(400))]),
+            effects: BTreeMap::from([(408, fixture(401))]),
         }),
-        Err(Refusal::UnknownEffect(403))
+        Err(Refusal::ShapeMismatch("body geometry effect kind"))
     );
 }
