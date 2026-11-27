@@ -28,6 +28,18 @@ pub fn full_face_descriptor_from_ui(value: f32) -> Result<f32, Refusal> {
     }
 }
 
+/// Read a saved full-face level, including normalized values written by older
+/// sidecars. A literal 1 is level one, never the normalized maximum. New edits
+/// go through the strict integer-only UI contract above.
+pub fn full_face_descriptor_from_store(value: f32) -> Result<f32, Refusal> {
+    let level = if value > 0.0 && value < 1.0 {
+        (value * 4.0).round().clamp(1.0, 4.0)
+    } else {
+        value
+    };
+    full_face_descriptor_from_ui(level)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlumpSameFrameEvidence {
     pub source_sha256: [u8; 32],

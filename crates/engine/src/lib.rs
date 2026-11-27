@@ -129,8 +129,11 @@ mod portrait_eye_bag_inputs;
 mod portrait_makeup_mesh2d;
 mod portrait_makeup_wiring;
 mod portrait_makeup_recipes;
+mod portrait_look_layer;
+mod portrait_look_catchlight;
+mod portrait_probe_inputs;
 pub use portrait_makeup_recipes::{MakeupSuit, apply_makeup_suit, makeup_suits};
-pub use portrait_makeup_wiring::{MakeupPresetInfo, makeup_palette_for_pf, makeup_presets_for_pf};
+pub use portrait_makeup_wiring::{MakeupPresetInfo, makeup_custom_color_supported, makeup_palette_for_pf, makeup_presets_for_pf};
 mod portrait_moisture_inputs;
 pub mod portrait_pf115_pf107;
 mod portrait_pf90021_input;
@@ -216,7 +219,7 @@ pub use portrait_stage::{
     apply_portrait_effects_with_report_and_inputs,
     build_face_geometry_inputs,
     build_pf8033_cpu_forward_row,
-    full_face_descriptor_from_ui,
+    full_face_descriptor_from_store, full_face_descriptor_from_ui,
     landmark_receipt_hashes,
     load_pf8033_cpu_forward_artifacts,
     mesh_receipt,

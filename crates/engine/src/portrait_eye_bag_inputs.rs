@@ -84,21 +84,35 @@ impl crate::portrait_face_input_stage::FaceInputBundle {
         style_index: usize,
         producer: &mut ProducerInputs,
     ) -> Result<(), Refusal> {
+        self.attach_pf101_selection(source, control, style_index, None, producer)
+    }
+
+    pub(crate) fn attach_pf101_from_adjustments(
+        &self, source: &Image, control: f32, extra: &std::collections::BTreeMap<String, f32>, producer: &mut ProducerInputs,
+    ) -> Result<(), Refusal> {
+        let style = extra.get("pc:101:style").copied().unwrap_or(0.0);
+        if !(0.0..=16_777_215.0).contains(&style) || style.fract() != 0.0 {
+            return Err(Refusal::ValueOutOfRange("PF101 style ordinal"));
+        }
+        let tint = crate::portrait_makeup_wiring::material_tint(101, Some(extra))?;
+        self.attach_pf101_selection(source, control, style as usize, tint, producer)
+    }
+
+    fn attach_pf101_selection(&self, source: &Image, control: f32, style_index: usize,
+        tint: Option<[u8; 3]>, producer: &mut ProducerInputs) -> Result<(), Refusal> {
         self.validate_ticket(source, Some(self.job_id))?;
         source
             .validate()
             .map_err(|_| Refusal::ShapeMismatch(PF101_SOURCE))?;
         let params = pf101_params(control)?;
-        let material = if style_index >= 1 {
+        let mut material = if style_index >= 1 {
             let presets = crate::portrait_makeup_wiring::makeup_presets_for_pf(101);
-            if let Some(preset) = presets.get((style_index - 1).min(presets.len().saturating_sub(1))) {
-                load_pf101_material_from(&[preset.path.clone()]).or_else(|_| load_pf101_material())?
-            } else {
-                load_pf101_material()?
-            }
+            let preset = presets.get(style_index - 1).ok_or(Refusal::MissingInput("PF101 selected material"))?;
+            load_pf101_material_from(std::slice::from_ref(&preset.path))?
         } else {
             load_pf101_material()?
         };
+        if let Some(tint) = tint { crate::portrait_makeup_wiring::tint_material_pixels(&mut material, tint); }
         let face_mask = build_face_mask(source, &self.points194, self.roi_xywh)?;
         let (mask_uv, material_uv) = build_band_uvs(source, &self.points194)?;
         producer.pf101 = Some(Pf101ProducerInputs::from_same_job(
@@ -149,8 +163,22 @@ fn material_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+/// Default PF101 material resolution, shared by the producer and the cheap
+/// probe: direct env file, the decoded config/default candidates, then the
+/// first real Silkworm preset. A broken candidate is skipped here; an explicit
+/// style is resolved alone and never falls through to another material.
+pub(crate) fn pf101_default_material_candidates() -> Vec<PathBuf> {
+    let mut candidates = material_candidates();
+    candidates.extend(
+        crate::portrait_makeup_wiring::makeup_presets_for_pf(101)
+            .into_iter()
+            .map(|preset| preset.path),
+    );
+    candidates
+}
+
 fn load_pf101_material() -> Result<Image, Refusal> {
-    load_pf101_material_from(&material_candidates())
+    load_pf101_material_from(&pf101_default_material_candidates())
 }
 
 fn load_pf101_material_from(candidates: &[PathBuf]) -> Result<Image, Refusal> {

@@ -1359,8 +1359,16 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
     })
 }
 
-fn teeth_ui_percent(extra: &std::collections::BTreeMap<String, f32>, key: &str) -> f32 {
-    extra.get(key).copied().unwrap_or(0.7) * 100.0
+/// PF108's `(bright, de-yellow)` percentages for one document.
+///
+/// The one resolver both the renderer and the stage dispatcher read. The old
+/// `unwrap_or(0.7)` here applied the legacy sibling default to every document,
+/// so a document that only drove `pc:109` (bright) also ran the de-yellow LUT
+/// at 70 %, and the parent's absent `pc:108` left the mask product at zero.
+fn teeth_ui_percents(
+    extra: &std::collections::BTreeMap<String, f32>,
+) -> Result<(f32, f32), aurora_portrait::Refusal> {
+    crate::portrait_stage::pf108_ui_percents(extra)
 }
 
 fn stage_face_bundle(
@@ -3356,17 +3364,29 @@ fn render_sized(
                             attached = true;
                         }
                         if want_parsing {
-                            let bright_ui = teeth_ui_percent(&adj.extra, "pc:109");
-                            let deyellow_ui = teeth_ui_percent(&adj.extra, "pc:110");
-                            match bundle.attach_pf108_inputs(
-                                stage_frame,
-                                bright_ui,
-                                deyellow_ui,
-                                &mut inputs,
-                            ) {
-                                Ok(()) => attached = true,
+                            // One resolver for the whole PF108 family: the
+                            // producer percentages and the stage's `common_ui`
+                            // come from the same control set, so a child-only
+                            // document neither inherits the legacy 70 % sibling
+                            // nor runs at a zero common weight.
+                            match teeth_ui_percents(&adj.extra) {
+                                Ok((bright_ui, deyellow_ui)) => {
+                                    match bundle.attach_pf108_inputs(
+                                        stage_frame,
+                                        bright_ui,
+                                        deyellow_ui,
+                                        &mut inputs,
+                                    ) {
+                                        Ok(()) => attached = true,
+                                        Err(refusal) => {
+                                            log::warn!(
+                                                "canonical FaceParsingV2 input refused: {refusal:?}"
+                                            );
+                                        }
+                                    }
+                                }
                                 Err(refusal) => {
-                                    log::warn!("canonical FaceParsingV2 input refused: {refusal:?}");
+                                    log::warn!("PF108 family controls refused: {refusal:?}");
                                 }
                             }
                             if bundle
@@ -3436,19 +3456,7 @@ fn render_sized(
                         }
                         let c101 = adj.extra.get("pc:101").copied().unwrap_or(0.0);
                         if c101 != 0.0 {
-                            let s101 = adj
-                                .extra
-                                .get("pc:101:style")
-                                .copied()
-                                .unwrap_or(0.0)
-                                .round()
-                                .max(0.0) as usize;
-                            match bundle.attach_pf101_inputs_with_style(
-                                stage_frame,
-                                c101,
-                                s101,
-                                &mut inputs,
-                            ) {
+                            match bundle.attach_pf101_from_adjustments(stage_frame, c101, &adj.extra, &mut inputs) {
                                 Ok(()) => attached = true,
                                 Err(refusal) => {
                                     log::warn!("PF101 same-frame input refused: {refusal:?}");
@@ -4714,6 +4722,76 @@ mod tests {
         assert_ne!(cached, first);
 
         stage_cache::clear();
+    }
+
+    /// PF108's sibling percentages must come from the same resolver the stage
+    /// dispatches with: the old `unwrap_or(0.7)` gave a bright-only document a
+    /// free 70 % de-yellow, while a legacy parent-only document must keep it.
+    #[test]
+    fn pf108_child_controls_do_not_inherit_the_legacy_sibling_default() {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:109".to_string(), 0.6f32);
+        let (bright_ui, deyellow_ui) = teeth_ui_percents(&extra).unwrap();
+        assert!((bright_ui - 60.0).abs() < 1.0e-3, "bright_ui={bright_ui}");
+        assert_eq!(deyellow_ui, 0.0, "a bright-only document has no de-yellow");
+
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:110".to_string(), 0.7f32);
+        let (bright_ui, deyellow_ui) = teeth_ui_percents(&extra).unwrap();
+        assert_eq!(bright_ui, 0.0, "a de-yellow-only document has no bright");
+        assert!((deyellow_ui - 70.0).abs() < 1.0e-3, "deyellow_ui={deyellow_ui}");
+
+        // Legacy document: only `pc:108` was ever stored, so both siblings
+        // still run at 70 % and the frame stays byte-identical to before.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:108".to_string(), 0.5f32);
+        let (bright_ui, deyellow_ui) = teeth_ui_percents(&extra).unwrap();
+        assert!((bright_ui - 70.0).abs() < 1.0e-3, "bright_ui={bright_ui}");
+        assert!(
+            (deyellow_ui - 70.0).abs() < 1.0e-3,
+            "deyellow_ui={deyellow_ui}"
+        );
+
+        // A malformed control is a refusal, not a silent default.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:109".to_string(), f32::NAN);
+        assert_eq!(
+            teeth_ui_percents(&extra),
+            Err(aurora_portrait::Refusal::ValueOutOfRange("PF108 bright UI"))
+        );
+    }
+
+    /// The child-only document must still reach the same-job face parse, or the
+    /// PF108 row can only refuse for a missing teeth mask.
+    #[test]
+    fn pf108_child_only_document_requests_the_stage_face_parse() {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:109".to_string(), 0.6f32);
+        assert!(
+            needs_stage_face_parsing(&extra),
+            "PF108 bright child must request FaceParsingV2"
+        );
+        // `want_stage_attachments` is `parsing || bundle_direct || producer_attach`;
+        // neither of the other two terms is allowed to be the reason here.
+        assert!(!needs_stage_face_bundle_direct(&extra));
+        assert!(!needs_producer_attach(&extra));
+
+        // A parent + children document requests it exactly once as well: the
+        // gate is a boolean, so nothing can dispatch PF108 twice.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:108".to_string(), 0.8f32);
+        extra.insert("pc:109".to_string(), 0.6f32);
+        extra.insert("pc:110".to_string(), 0.7f32);
+        assert!(needs_stage_face_parsing(&extra));
+        assert!(!needs_stage_face_bundle_direct(&extra));
+        assert!(!needs_producer_attach(&extra));
+
+        // All-neutral controls must not start a face parse at all.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:108".to_string(), 0.0f32);
+        extra.insert("pc:109".to_string(), 0.0f32);
+        extra.insert("pc:110".to_string(), 0.0f32);
+        assert!(!needs_stage_face_parsing(&extra));
     }
 
     #[test]

@@ -962,12 +962,7 @@ impl FaceInputBundle {
         }
         let full_face_level = if requested_pfs.contains(&30_210) {
             let raw = extra.get("pc:30210").copied().unwrap_or(0.0);
-            let normalized = if raw > 0.0 && raw < 1.0 {
-                (raw * 4.0).round().clamp(1.0, 4.0)
-            } else {
-                raw
-            };
-            let desc = super::full_face_descriptor_from_ui(normalized)?;
+            let desc = super::portrait_plump_stage::full_face_descriptor_from_store(raw)?;
             Some(desc as u8)
         } else {
             None

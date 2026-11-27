@@ -1025,6 +1025,8 @@ pub struct OwnedMakeupBundle {
     pub rows: Vec<OwnedMakeupBundleRow>,
     pub suit: OwnedSuitBundle,
     pub suit_live: Option<OwnedSuitLiveBundle>,
+    /// Optional original human iris reflection, bound to this frame and ticket.
+    pub(crate) human_catchlight: Option<crate::portrait_look_layer::HumanCatchlight>,
 }
 
 impl OwnedMakeupBundle {
@@ -1069,6 +1071,9 @@ impl OwnedMakeupBundle {
         hash = mix(hash, &self.frame_size[0].to_le_bytes());
         hash = mix(hash, &self.frame_size[1].to_le_bytes());
         hash = mix(hash, &self.source_sha256);
+        if let Some(light) = &self.human_catchlight {
+            hash = mix(hash, &light.fingerprint().to_le_bytes());
+        }
         for row in &self.rows {
             hash = mix(hash, &row.profile.pf.to_le_bytes());
             hash = mix(hash, row.source_effect.as_bytes());
@@ -1194,6 +1199,7 @@ pub fn produce_owned_makeup_bundle(
         rows,
         suit,
         suit_live: None,
+        human_catchlight: None,
     })
 }
 

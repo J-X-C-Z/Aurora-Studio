@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::AdjustmentSet;
-use crate::portrait_makeup_wiring::{makeup_asset_root, makeup_palette_for_pf, makeup_presets_at};
+use crate::portrait_makeup_wiring::{human_catchlights_at, makeup_asset_root, makeup_palette_for_pf, makeup_presets_at, MakeupPresetInfo};
 
 const SCHEMA: &str = "aurora.suit.recipe/1";
 
@@ -21,6 +21,7 @@ pub struct MakeupSuit {
     root: PathBuf,
     /// The file each 1-based ordinal selected when the recipe was displayed.
     materials: BTreeMap<u32, PathBuf>,
+    reflection: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -30,11 +31,17 @@ struct Label {
     en: String,
 }
 #[derive(Deserialize)]
+struct StyleOrdinal { index: usize, count: usize, basis: String }
+#[derive(Deserialize)]
+struct LightColor { rgb: u32 }
+#[derive(Deserialize)]
 struct Unbound {
     status: String,
     subclass: String,
     #[serde(default)]
     strength: f64,
+    style: Option<StyleOrdinal>,
+    color: Option<LightColor>,
 }
 #[derive(Deserialize)]
 struct Recipe {
@@ -57,7 +64,8 @@ fn suit_key(key: &str) -> Option<(u32, &str)> {
         pf,
         100 | 101 | 103 | 105 | 106 | 107 | 111 | 115 | 116 | 117 | 118 | 30007 | 90032
     ) || id != pf.to_string()
-        || !matches!(kind, "" | "style" | "color" | "rgb")
+        || !(matches!(kind, "" | "style" | "color" | "rgb")
+            || (pf == 111 && matches!(kind, "catchlight_style" | "catchlight_amount" | "catchlight_rgb")))
         || key.ends_with(':')
     {
         return None;
@@ -67,18 +75,19 @@ fn suit_key(key: &str) -> Option<(u32, &str)> {
 
 fn valid_value(kind: &str, value: f64) -> bool {
     match kind {
-        "" => (0.0..=1.0).contains(&value),
-        "style" | "color" => (1.0..=16_777_215.0).contains(&value) && value.fract() == 0.0,
-        "rgb" => (0.0..=16_777_215.0).contains(&value) && value.fract() == 0.0,
+        "" | "catchlight_amount" => (0.0..=1.0).contains(&value),
+        "style" | "color" | "catchlight_style" => (1.0..=16_777_215.0).contains(&value) && value.fract() == 0.0,
+        "rgb" | "catchlight_rgb" => (0.0..=16_777_215.0).contains(&value) && value.fract() == 0.0,
         _ => false,
     }
 }
 
 fn decode(
-    recipe: Recipe,
+    mut recipe: Recipe,
     id: &str,
     root: &Path,
     catalogue: &mut BTreeMap<u32, Vec<PathBuf>>,
+    human: &[MakeupPresetInfo],
 ) -> Option<MakeupSuit> {
     if recipe.schema != SCHEMA || recipe.category != "Suit" || recipe.id != id || id.is_empty() {
         return None;
@@ -92,7 +101,22 @@ fn decode(
         return None;
     }
     let mut materials = BTreeMap::new();
+    let mut reflection = None;
     let mut missing = Vec::new();
+    // v1 authors specified the human light's complete material and intensity,
+    // without claiming a standalone PF. Bind that component to the original
+    // iris overlay. Unknown active components still block the *entire* look.
+    for entry in recipe.unbound {
+        if entry.strength == 0.0 || matches!(entry.status.as_str(), "not-selected" | "excluded") { continue; }
+        if entry.subclass == "Catchlights" && entry.status == "pf-unresolved" && recipe.apply.get("pc:111").is_some_and(|&v| v > 0.0)
+            && let (Some(style),Some(color)) = (&entry.style,&entry.color)
+            && style.basis == "1-based" && (1..=style.count).contains(&style.index) && style.count == human.len()
+            && valid_value("catchlight_amount",entry.strength) && color.rgb <= 0xff_ffff {
+            for (key,value) in [("pc:111:catchlight_style",style.index as f64), ("pc:111:catchlight_amount",entry.strength), ("pc:111:catchlight_rgb",f64::from(color.rgb))] {
+                if recipe.apply.insert(key.to_owned(),value).is_some() { return None; }
+            }
+        } else { missing.push(entry.subclass); }
+    }
     for (k, &v) in &recipe.apply {
         let (pf, kind) = suit_key(k)?;
         if !valid_value(kind, v) || !recipe.apply.contains_key(&format!("pc:{pf}")) {
@@ -113,6 +137,10 @@ fn decode(
                     None => missing.push(k.clone()), // no silent clamping to a different style
                 }
             }
+            "catchlight_style" => match human.get(v as usize - 1) {
+                Some(p) => reflection = Some(p.path.clone()),
+                None => missing.push(k.clone()),
+            },
             // An explicit RGB overrides the indexed swatch, by design.
             "color"
                 if !recipe.apply.contains_key(&format!("pc:{pf}:rgb"))
@@ -123,10 +151,9 @@ fn decode(
             _ => (),
         }
     }
-    for entry in recipe.unbound {
-        if entry.strength != 0.0 && !matches!(entry.status.as_str(), "not-selected" | "excluded") {
-            missing.push(entry.subclass);
-        }
+    if recipe.apply.keys().any(|k| k.starts_with("pc:111:catchlight_")) {
+        if !recipe.apply.get("pc:111").is_some_and(|&v| v > 0.0) || !recipe.apply.contains_key("pc:111:catchlight_style") || !recipe.apply.contains_key("pc:111:catchlight_amount") { return None; }
+        if !crate::portrait_look_layer::cpu_allowed() { missing.push("Catchlights: native CPU".to_owned()); }
     }
     let unavailable_reason = (!missing.is_empty()).then(|| missing.join(", "));
     Some(MakeupSuit {
@@ -140,6 +167,7 @@ fn decode(
         unavailable_reason,
         root: root.to_owned(),
         materials,
+        reflection,
     })
 }
 
@@ -154,6 +182,7 @@ fn discover(root: &Path) -> Vec<MakeupSuit> {
         return Vec::new();
     };
     let mut catalogue = BTreeMap::new();
+    let human = human_catchlights_at(root);
     let mut suits: Vec<_> = entries
         .flatten()
         .filter_map(|e| {
@@ -166,7 +195,7 @@ fn discover(root: &Path) -> Vec<MakeupSuit> {
                 return None;
             }
             let recipe: Recipe = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-            decode(recipe, &id, &root, &mut catalogue)
+            decode(recipe, &id, root, &mut catalogue, &human)
         })
         .collect();
     suits.sort_by(|a, b| a.id.cmp(&b.id));
@@ -187,6 +216,11 @@ fn apply_at(root: Option<&Path>, suit: &MakeupSuit, adj: &mut AdjustmentSet) -> 
     let root = root
         .filter(|r| *r == suit.root.as_path())
         .ok_or("makeup asset root changed")?;
+    if let Some(path) = &suit.reflection {
+        if !crate::portrait_look_layer::cpu_allowed() { return Err("Catchlights: native CPU".into()); }
+        let idx = suit.effects.get("pc:111:catchlight_style").copied().filter(|&n| valid_value("catchlight_style",n as f64)).ok_or("invalid catchlight selection")? as usize;
+        if !human_catchlights_at(root).get(idx - 1).is_some_and(|p| &p.path == path) { return Err("Catchlights: material catalogue changed".into()); }
+    }
     for (key, &value) in &suit.effects {
         if let Some((pf, "style")) = suit_key(key) {
             let current = makeup_presets_at(root, pf);
@@ -287,6 +321,33 @@ mod tests {
         assert_eq!(adj.extra, before);
     }
 
+    /// Optional acceptance against the installed original authoring pack. No
+    /// material, image path or generated binary belongs to the public test tree.
+    #[test]
+    #[ignore = "requires the full original 24-look pack in AURORA_MAKEUP_ASSET_ROOT, CPU or auto"]
+    fn installed_original_pack_resolves_and_applies_all_24_transactions() {
+        let root = makeup_asset_root().expect("original makeup library");
+        let lights = human_catchlights_at(&root);
+        assert_eq!(lights.len(), 12);
+        let suits = discover(&root);
+        assert_eq!(suits.len(), 24);
+        let mut chosen = std::collections::BTreeSet::new();
+        let mut adj = AdjustmentSet::default();
+        adj.extra.insert("pc:108".into(), 0.33);
+        for suit in &suits {
+            assert_eq!(suit.unavailable_reason, None, "{}", suit.id);
+            apply_at(Some(&root), suit, &mut adj).unwrap_or_else(|error| panic!("{}: {error}", suit.id));
+            let ordinal = adj.extra["pc:111:catchlight_style"] as usize;
+            assert!(adj.extra["pc:111:catchlight_amount"] > 0.0);
+            assert_eq!(suit.reflection.as_ref(), Some(&lights[ordinal - 1].path));
+            assert!(suit.effects.iter().all(|(key, value)| adj.extra.get(key) == Some(value)));
+            assert!(adj.extra.keys().all(|key| suit_key(key).is_none() || suit.effects.contains_key(key)));
+            assert_eq!(adj.extra["pc:108"], 0.33);
+            chosen.insert(ordinal);
+        }
+        eprintln!("{} distinct looks, {} human reflection selections, unrelated adjustment preserved", suits.len(), chosen.len());
+    }
+
     #[test]
     fn incomplete_recipes_are_not_clamped_or_partially_applied() {
         use serde_json::json;
@@ -295,7 +356,7 @@ mod tests {
             json!({"pc:100":0.2,"pc:100:style":2}),
             json!([{"status":"pf-unresolved","subclass":"Catchlights","strength":0.5}]),
         );
-        let suit = decode(spec, "look-1", Path::new("."), &mut cache).unwrap();
+        let suit = decode(spec, "look-1", Path::new("."), &mut cache, &[]).unwrap();
         let reason = suit.unavailable_reason.as_deref().unwrap();
         assert!(reason.contains("pc:100:style") && reason.contains("Catchlights"));
         let mut adj = AdjustmentSet::default();
@@ -311,7 +372,8 @@ mod tests {
                     recipe(invalid, json!([])),
                     "look-1",
                     Path::new("."),
-                    &mut cache
+                    &mut cache,
+                    &[]
                 )
                 .is_none()
             );

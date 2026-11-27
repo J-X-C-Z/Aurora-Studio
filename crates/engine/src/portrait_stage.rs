@@ -128,7 +128,7 @@ pub use portrait_body_producer::{
 mod portrait_plump_stage;
 pub use portrait_plump_stage::{
     PLUMP_PFS, PlumpCompositeReceipt, PlumpFinalComposite, PlumpGroupRun, PlumpProducerInputs,
-    full_face_descriptor_from_ui, PlumpSameFrameEvidence, PLUMP_LANDMARK_COUNT,
+    full_face_descriptor_from_store, full_face_descriptor_from_ui, PlumpSameFrameEvidence, PLUMP_LANDMARK_COUNT,
 };
 
 #[path = "portrait_plump_onnx.rs"]
@@ -184,6 +184,11 @@ mod plump_stage_tests;
 #[cfg(test)]
 #[path = "portrait_body_stage_tests.rs"]
 mod body_geometry_stage_tests;
+
+/// PF108 family gate: `pc:108` + `pc:109` + `pc:110` are one job.
+#[cfg(test)]
+#[path = "portrait_pf108_family_tests.rs"]
+mod pf108_family_tests;
 
 
 #[cfg(test)]
@@ -806,6 +811,11 @@ impl Pf101ProducerInputs {
             material_uv,
             params,
         })
+    }
+
+    /// The exact paired textures and per-pixel UVs consumed by this draw.
+    pub(crate) fn coverage_inputs(&self) -> (&Image, &[[f32; 2]], &Image, &[[f32; 2]]) {
+        (&self.face_mask, &self.mask_uv, &self.material, &self.material_uv)
     }
 
     pub fn apply(
@@ -2904,8 +2914,9 @@ impl ProducerInputs {
     }
 }
 
-/// PF108 same-job inputs. `pc:108` supplies the common UI fraction; the other
-/// two controls remain explicit fields because no UI-to-native fallback exists.
+/// PF108 same-job inputs. `pc:108` supplies the common UI fraction; `pc:109`
+/// and `pc:110` reach this struct through [`pf108_ui_percents`], which is the
+/// one derivation both the renderer and the dispatcher read.
 #[derive(Clone, Copy, Debug)]
 pub struct TeethInputs<'a> {
     pub job_id: u64,
@@ -2919,6 +2930,105 @@ pub struct TeethInputs<'a> {
     pub mask_g: &'a [u8],
     pub bright_ui: f32,
     pub deyellow_ui: f32,
+}
+
+/// Registry key of PF108's `common_ui` control: it scales the id2.G support
+/// plane, so it is the mask weight every other PF108 control multiplies.
+pub const PF108_COMMON_PC: u32 = 108;
+pub const PF108_COMMON_KEY: &str = "pc:108";
+/// PF108's Bright-LUT control. A child of `pc:108`, never an effect row.
+pub const PF108_BRIGHT_KEY: &str = "pc:109";
+/// PF108's de-yellow-LUT control. A child of `pc:108`, never an effect row.
+pub const PF108_DEYELLOW_KEY: &str = "pc:110";
+/// The legacy document stored only `pc:108`, and both sibling LUTs ran at 70 %
+/// then; that document shape is the only one where a fabricated sibling value
+/// still reproduces the old frame.
+pub const PF108_LEGACY_SIBLING_DEFAULT01: f32 = 0.7;
+
+/// One document's PF108 controls, in the registry's normalized `0..=1` domain.
+///
+/// `teeth_whitening` builds its support mask as `common * child`
+/// (`kernels/face_detail.rs`: `dz = common * deyellow`, `ea = common * bright`),
+/// so an absent parent leaves the mask product at zero and the kernel returns
+/// `NoEffect`. A document that drives a child alone therefore resolves to
+/// `common01 = 1.0`, and the sibling stays at `0.0` so one child can never drag
+/// the other LUT up to the legacy 70 %.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pf108Family {
+    pub common01: f32,
+    pub bright01: f32,
+    pub deyellow01: f32,
+}
+
+impl Pf108Family {
+    /// `false` means PF108 is not scheduled at all: either nothing is set, or
+    /// the resolved mask product is zero for both children.
+    pub fn is_active(&self) -> bool {
+        self.common01 > 0.0 && (self.bright01 > 0.0 || self.deyellow01 > 0.0)
+    }
+
+    /// The Bright-LUT percentage the same-job producer must attach.
+    pub fn bright_ui(&self) -> f32 {
+        self.bright01 * 100.0
+    }
+
+    /// The de-yellow-LUT percentage the same-job producer must attach.
+    pub fn deyellow_ui(&self) -> f32 {
+        self.deyellow01 * 100.0
+    }
+}
+
+/// Resolves the three PF108 controls from `AdjustmentSet::extra`.
+///
+/// Every control that is present must be finite and inside the registry range
+/// (`0..=1`); a malformed value is a refusal, never a silent clamp, and never a
+/// neutral fallback that would let a fake input look executed.
+pub fn pf108_family(extra: &BTreeMap<String, f32>) -> Result<Pf108Family, Refusal> {
+    let read = |key: &'static str, name: &'static str| -> Result<Option<f32>, Refusal> {
+        let Some(&value) = extra.get(key) else {
+            return Ok(None);
+        };
+        check_degree01(value, name)?;
+        Ok(Some(value))
+    };
+    let common = read(PF108_COMMON_KEY, "PF108 common UI")?;
+    let bright = read(PF108_BRIGHT_KEY, "PF108 bright UI")?;
+    let deyellow = read(PF108_DEYELLOW_KEY, "PF108 de-yellow UI")?;
+    let parent_drives = common.is_some_and(|value| value > 0.0);
+    // The legacy 70 % only describes the old document shape: `pc:108` stored
+    // and neither sibling stored. One stored sibling means the document already
+    // speaks the three-control language, so its missing sibling stays at 0.
+    let (bright01, deyellow01) = if parent_drives && bright.is_none() && deyellow.is_none() {
+        (
+            PF108_LEGACY_SIBLING_DEFAULT01,
+            PF108_LEGACY_SIBLING_DEFAULT01,
+        )
+    } else {
+        (bright.unwrap_or(0.0), deyellow.unwrap_or(0.0))
+    };
+    let child_drives = bright01 > 0.0 || deyellow01 > 0.0;
+    let common01 = if parent_drives {
+        common.unwrap_or(0.0)
+    } else if child_drives {
+        // `mask = common * child`: a child-only document needs the full common
+        // weight, or the kernel sees `dz == ea == 0` and stays `NoEffect`.
+        1.0
+    } else {
+        0.0
+    };
+    Ok(Pf108Family {
+        common01,
+        bright01,
+        deyellow01,
+    })
+}
+
+/// The `(bright, de-yellow)` percentages the PF108 producer must attach for one
+/// document. Preview and export both read this, so the producer planes and the
+/// dispatcher's `common_ui` come from the same control set.
+pub fn pf108_ui_percents(extra: &BTreeMap<String, f32>) -> Result<(f32, f32), Refusal> {
+    let family = pf108_family(extra)?;
+    Ok((family.bright_ui(), family.deyellow_ui()))
 }
 
 /// PF30026 final-blend inputs from one worker job.
@@ -4177,6 +4287,20 @@ const FACE_WIDTH_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrai
 const FOREHEAD_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/forehead/parts.f32le");
 const FACE_RESHAPE_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/face-reshape/parts.f32le");
 
+/// Use the same decoded part tables as the corresponding renderer. Resolve
+/// each immutable embedded asset once; unrelated controls do not need it.
+pub(crate) fn face_part_table_ready(pf: u32) -> Option<bool> {
+    static SHAPE: OnceLock<bool> = OnceLock::new();
+    static FOREHEAD: OnceLock<bool> = OnceLock::new();
+    static WIDTH: OnceLock<bool> = OnceLock::new();
+    Some(match face_mesh_group(pf)?.left {
+        242 | 8023 | 8027 | 8029 => *SHAPE.get_or_init(|| builtin_face_reshape_parts().is_ok()),
+        30080 | 30082 => *FOREHEAD.get_or_init(|| builtin_forehead_parts().is_ok()),
+        30092 => *WIDTH.get_or_init(|| builtin_face_width_parts().is_ok()),
+        _ => false,
+    })
+}
+
 struct FaceReshapePartData {
     part: u8,
     parameters: Vec<f32>,
@@ -5132,13 +5256,41 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             receipt.refusal(portrait, width, height, region, extra, inputs.masks)
         })
     };
+    // PF108 is one kernel fed by three document controls. Resolve the family
+    // once, here, so the row that runs and the producer's sibling percentages
+    // cannot disagree and so at most one PF108 row is dispatched per frame.
+    let pf108 = pf108_family(extra);
     let mut effects: Vec<(u32, f32)> = extra
         .iter()
         .filter_map(|(key, value)| {
+            // `pc:109`/`pc:110` are inputs to PF108's kernel, never effects of
+            // their own: one job, one report row, no extra primary item.
+            if key == PF108_BRIGHT_KEY || key == PF108_DEYELLOW_KEY {
+                return None;
+            }
             let id: u32 = key.strip_prefix("pc:")?.parse().ok()?;
             Some((id, *value))
         })
         .collect();
+    match pf108.as_ref() {
+        Ok(family) if family.is_active() => {
+            // A child-only document has no `pc:108` key at all; the row takes
+            // the resolved common weight instead of the absent raw value.
+            match effects.iter().position(|(pf, _)| *pf == PF108_COMMON_PC) {
+                Some(index) => effects[index].1 = family.common01,
+                None => effects.push((PF108_COMMON_PC, family.common01)),
+            }
+        }
+        // Every control neutral (or both children zeroed): nothing to run.
+        Ok(_) => effects.retain(|(pf, _)| *pf != PF108_COMMON_PC),
+        // Keep the row so a malformed control is reported as a refusal by the
+        // input validation instead of vanishing from the report.
+        Err(_) => {
+            if !effects.iter().any(|(pf, _)| *pf == PF108_COMMON_PC) {
+                effects.push((PF108_COMMON_PC, 0.0));
+            }
+        }
+    }
     effects.sort_by_key(|&(pf, _)| pf);
 
     if let Some(refusal) = receipt_refusal {
@@ -5185,7 +5337,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             .get("pc:30210")
             .copied()
             .ok_or(Refusal::MissingInput("PF30210 same-job UI"))
-            .and_then(full_face_descriptor_from_ui)
+            .and_then(portrait_plump_stage::full_face_descriptor_from_store)
             .map(Some)
     } else {
         Ok(None)
@@ -5807,6 +5959,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 &current,
                 region,
                 extra,
+                &pf108,
                 skin_mask.as_deref(),
                 inputs,
                 hlf_auto.as_ref(),
@@ -5820,6 +5973,39 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             });
             run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
             run.refusal = Some(refusal);
+            report.effects.push(run);
+            continue;
+        }
+        if pf == 111 && crate::portrait_look_layer::requested(extra) {
+            // This opt-in original sublayer has a CPU implementation only. Keep
+            // the whole PF111 atomic, and never label a hybrid frame as CUDA.
+            let result = (|| {
+                if !crate::portrait_look_layer::cpu_allowed() {
+                    return Err(Refusal::MissingInput("human catchlight: requested backend has no native pass"));
+                }
+                let owner = inputs.makeup_bundle.ok_or(Refusal::MissingInput("same-job human catchlight"))?;
+                let light = owner.human_catchlight.as_ref().ok_or(Refusal::MissingInput("same-job human catchlight"))?;
+                if light.ticket.source_sha256 != owner.source_sha256 || light.ticket.source_size != owner.frame_size
+                    || light.ticket.job_id != owner.ticket || !light.matches_request(extra) {
+                    return Err(Refusal::ValueOutOfRange("catchlight request or source changed"));
+                }
+                let mut next = apply_makeup_cpu(&current, pf, degree, inputs)?;
+                light.apply(&mut next, inputs.job_id().ok_or(Refusal::MissingInput("human catchlight job"))?)?;
+                Ok(next)
+            })();
+            match result {
+                Ok(next) => {
+                    current = next;
+                    run.backend = PortraitBackend::Cpu;
+                    run.executed = true;
+                    run.skipped = false;
+                }
+                Err(refusal) => {
+                    run.backend = PortraitBackend::Skipped;
+                    run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                    run.refusal = Some(refusal);
+                }
+            }
             report.effects.push(run);
             continue;
         }
@@ -7010,11 +7196,15 @@ fn resolve_radiance_inputs<'a>(
     })
 }
 
+// `pf108` is the already-resolved PF108 family for this document: an `Err`
+// there is the control refusal the caller must report, never a neutral
+// fallback and never a silent clamp.
 fn validate_effect_inputs(
     pf: u32,
     current: &Image,
     region: NormRect,
     extra: &BTreeMap<String, f32>,
+    pf108: &Result<Pf108Family, Refusal>,
     skin_mask: Option<&[u8]>,
     inputs: &PortraitJobInputs<'_>,
     hlf_auto: Option<&HlfAutoInputs>,
@@ -7070,21 +7260,7 @@ fn validate_effect_inputs(
         8068 | 8069 | 8070 | 21015 | 30096 | 90005 | 90007
     ) {
         required(skin_mask, "skin mask")?;
-        match pf {
-            21015 if tint_green().is_none() || tint_magenta().is_none() => {
-                return Err(Refusal::MissingInput("skin tint LUT"));
-            }
-            30096 if cold_lut().is_none() || warm_lut().is_none() => {
-                return Err(Refusal::MissingInput("skin temperature LUT"));
-            }
-            90005 if whiten_lut().is_none() => {
-                return Err(Refusal::MissingInput("whiten LUT"));
-            }
-            90007 if ruddy_lut().is_none() => {
-                return Err(Refusal::MissingInput("ruddy LUT"));
-            }
-            _ => {}
-        }
+        if let Some(name) = missing_tone_table(pf) { return Err(Refusal::MissingInput(name)); }
         return Ok(());
     }
 
@@ -7093,7 +7269,11 @@ fn validate_effect_inputs(
             validate_makeup_inputs(pf, pixels, inputs)?
         }
         108 => {
-            check_degree01(extra.get("pc:108").copied().unwrap_or_default(), "degree")?;
+            // The support plane is `common * child` (`face_detail.rs`), so the
+            // value that has to be in range is the resolved common weight, not
+            // the raw `pc:108` entry (absent in a child-only document).
+            let family = pf108.as_ref().map_err(Clone::clone)?;
+            check_degree01(family.common01, "degree")?;
             let teeth = required(inputs.teeth, "teeth mask")?;
             if teeth.job_id == 0 {
                 return Err(Refusal::ValueOutOfRange("PF108 producer job id"));
@@ -9815,6 +9995,18 @@ fn decode_lut(png: Option<&[u8]>, name: &'static str) -> Option<Vec<u8>> {
     (bytes.len() == LUT_BYTES).then_some(bytes)
 }
 
+/// Shared by input validation and the capability panel; invalid tables do not
+/// count as installed just because some PNG bytes were embedded.
+pub(crate) fn missing_tone_table(pf: u32) -> Option<&'static str> {
+    match pf {
+        21015 if tint_green().is_none() || tint_magenta().is_none() => Some("skin tint LUT"),
+        30096 if cold_lut().is_none() || warm_lut().is_none() => Some("skin temperature LUT"),
+        90005 if whiten_lut().is_none() => Some("whiten LUT"),
+        90007 if ruddy_lut().is_none() => Some("ruddy LUT"),
+        _ => None,
+    }
+}
+
 fn tint_green() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
@@ -10791,6 +10983,7 @@ mod tests {
                 &current,
                 NormRect::FULL,
                 &params,
+                &pf108_family(&params),
                 None,
                 &inputs,
                 None,

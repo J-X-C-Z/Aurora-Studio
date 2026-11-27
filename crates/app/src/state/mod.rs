@@ -24,6 +24,7 @@ mod tasks;
 mod device;
 mod preview;
 mod library;
+pub(crate) mod portrait_capability;
 pub(crate) mod scopes;
 
 use std::collections::{HashMap, HashSet};
@@ -525,6 +526,10 @@ pub struct AppState {
     pub device: DeviceState,
     /// Viewer frames, thumbnails, zoom/pan and the color-picker sample.
     pub preview_state: PreviewState,
+    /// Per-image portrait capability snapshots: what the engine can actually run
+    /// on this photo right now. Read-only for the UI; only `Available` is
+    /// interactive and it is fetched in the background, never during drawing.
+    pub portrait_caps: portrait_capability::PortraitCapabilityCache,
     pub capturing: bool,
     pub styles: Vec<StyleInfo>,
     pub icc_profiles: Vec<String>,
@@ -631,6 +636,8 @@ impl AppState {
         let camera_settings = None;
         let engine_name = engine.name();
         let capabilities = crate::planned::capabilities(engine.as_ref());
+        // 能力表 TSV 是资料版本，引擎名是主机配置；两者合成快照缓存的指纹。
+        let portrait_caps = portrait_capability::PortraitCapabilityCache::new(engine.portrait_capability_registry_tsv(), &engine_name);
         let mut this = Self {
             styles: engine.styles(),
             icc_profiles: engine.icc_profiles(),
@@ -663,6 +670,7 @@ impl AppState {
                 ..DeviceState::default()
             },
             preview_state: PreviewState::default(),
+            portrait_caps,
             capturing: false,
             recipes,
             selected_recipe: 0,
@@ -777,6 +785,8 @@ impl AppState {
             self.preview_state.sampled_color = None;
             self.preview_state.picker_point = None;
             cx.emit(StateEvent::CurrentChanged);
+            // 换图即换能力结论：后台取本图的快照，绘制照样只读缓存。
+            self.request_portrait_capability(portrait_capability::CapabilityDetail::Auto, cx);
             self.request_render(RenderQuality::Final, cx);
         }
         cx.notify();

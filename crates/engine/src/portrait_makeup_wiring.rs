@@ -276,6 +276,20 @@ pub(super) fn makeup_presets_at(root: &Path, pf: u32) -> Vec<MakeupPresetInfo> {
         101 => ("Silkworm", &["wcz", "wcy"], &["sideface"]),
         _ => return Vec::new(),
     };
+    scan_style_directory(root, category, prefer, exclude, pf == 117)
+}
+
+/// The original human reflection material is a child of a look, not an extra
+/// entry in the official effect registry. The pet directory is never searched.
+pub(crate) fn human_catchlights_at(root: &Path) -> Vec<MakeupPresetInfo> {
+    scan_style_directory(root, "Catchlights", &["ysg"], &["sideface"], false)
+        .into_iter()
+        .filter(|p| p.id.strip_prefix("AUCG").is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            && p.path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.to_ascii_lowercase().starts_with("ysg")))
+        .collect()
+}
+
+fn scan_style_directory(root: &Path, category: &str, prefer: &[&str], exclude: &[&str], right_brow: bool) -> Vec<MakeupPresetInfo> {
     let cat_dir = root.join("Makeups").join(category);
     let Ok(entries) = std::fs::read_dir(&cat_dir) else {
         return Vec::new();
@@ -296,8 +310,7 @@ pub(super) fn makeup_presets_at(root: &Path, pf: u32) -> Vec<MakeupPresetInfo> {
     let mut presets = Vec::with_capacity(dirs.len());
     for (_, id, dir) in dirs {
         if let Some(png) = find_png_recursive(&dir, prefer, exclude) {
-            let mirror_x = pf == 117
-                && png
+            let mirror_x = right_brow && png
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.eq_ignore_ascii_case("mmz.png"));
@@ -347,47 +360,86 @@ pub fn makeup_palette_for_pf(pf: u32) -> &'static [(&'static str, [u8; 4])] {
     }
 }
 
-fn resolve_style_selection(
-    pf: u32,
-    extra: Option<&BTreeMap<String, f32>>,
-) -> Option<MakeupPresetInfo> {
-    let extra = extra?;
-    let key = format!("pc:{pf}:style");
-    let raw = extra.get(&key).copied().or_else(|| {
-        // Right brow follows left brow style when not explicitly overridden.
-        (pf == 117).then(|| extra.get("pc:100:style").copied()).flatten()
-    })?;
-    let idx = raw.round() as isize;
-    if idx <= 0 {
-        return None;
-    }
-    let presets = makeup_presets_for_pf(pf);
-    if presets.is_empty() {
-        return None;
-    }
-    let clamped = (idx as usize - 1).min(presets.len() - 1);
-    presets.into_iter().nth(clamped)
+/// Shared by the renderer and the per-photo probe. A stored ordinal is an
+/// explicit choice: missing material never means "use the last item".
+pub(crate) struct RowMaterial {
+    pub path: PathBuf,
+    pub mirror_x: bool,
+    pub explicit: bool,
 }
 
-fn resolve_mix_color(pf: u32, default_color: [u8; 4], extra: Option<&BTreeMap<String, f32>>) -> [u8; 4] {
-    let Some(extra) = extra else {
-        return default_color;
-    };
-    let selected = |id| -> Option<[u8; 4]> {
-        if let Some(&packed) = extra.get(&format!("pc:{id}:rgb")) {
-            // Every RGB24 integer is exactly representable in f32. Absence, not
-            // zero, means no custom color; zero is opaque black.
-            if (0.0..=16_777_215.0).contains(&packed) && packed.fract() == 0.0 {
-                let [_, r, g, b] = (packed as u32).to_be_bytes();
-                return Some([r, g, b, 255]);
-            }
+pub(crate) fn row_material_selection(
+    root: Option<&Path>, pf: u32, extra: Option<&BTreeMap<String, f32>>,
+) -> Result<Option<RowMaterial>, Refusal> {
+    let contract = row_contract(pf).ok_or(Refusal::UnknownEffect(pf))?;
+    let raw = extra.and_then(|e| e.get(&format!("pc:{pf}:style"))
+        .or_else(|| (pf == 117).then(|| e.get("pc:100:style")).flatten())).copied().unwrap_or(0.0);
+    if raw != 0.0 {
+        if !raw.is_finite() || raw.fract() != 0.0 || !(1.0..=16_777_215.0).contains(&raw) {
+            return Err(Refusal::ValueOutOfRange("makeup style ordinal"));
         }
-        let idx = extra.get(&format!("pc:{id}:color"))?.round() as isize;
+        let root = root.ok_or(Refusal::MissingInput(MAKEUP_ASSET_ROOT_MISSING))?;
+        let selected = makeup_presets_at(root, pf).into_iter().nth(raw as usize - 1)
+            .ok_or(Refusal::MissingInput(contract.material_missing))?;
+        return Ok(Some(RowMaterial { path: selected.path, mirror_x: selected.mirror_x, explicit: true }));
+    }
+    let Some(root) = root else { return Ok(None) };
+    let path = root.join(contract.material);
+    if path.is_file() { return Ok(Some(RowMaterial { path, mirror_x: false, explicit: false })); }
+    // With neither explicit style nor default texture, mask-only rows keep
+    // their existing geometry and response. Only an image row needs a default.
+    if !row_profile_for_effect(pf, contract.source_effect)?.requires_material { return Ok(None); }
+    Ok(makeup_presets_at(root, pf).into_iter().next().map(|s| RowMaterial {
+        path: s.path, mirror_x: s.mirror_x, explicit: false,
+    }))
+}
+
+fn resolve_mix_color(pf: u32, default_color: [u8; 4], extra: Option<&BTreeMap<String, f32>>) -> Result<[u8; 4], Refusal> {
+    let Some(extra) = extra else { return Ok(default_color) };
+    let selected = |id| -> Result<Option<[u8; 4]>, Refusal> {
+        if let Some(&rgb) = extra.get(&format!("pc:{id}:rgb")) {
+            if !(0.0..=16_777_215.0).contains(&rgb) || rgb.fract() != 0.0 {
+                return Err(Refusal::ValueOutOfRange("makeup RGB24"));
+            }
+            let [_, r, g, b] = (rgb as u32).to_be_bytes();
+            return Ok(Some([r, g, b, 255]));
+        }
+        let Some(&n) = extra.get(&format!("pc:{id}:color")) else { return Ok(None) };
+        if n == 0.0 { return Ok(None); }
         let palette = makeup_palette_for_pf(id);
-        (idx > 0 && !palette.is_empty()).then(|| palette[(idx as usize - 1).min(palette.len() - 1)].1)
+        if !n.is_finite() || n < 1.0 || n.fract() != 0.0 || n > palette.len() as f32 {
+            return Err(Refusal::ValueOutOfRange("makeup palette ordinal"));
+        }
+        Ok(Some(palette[n as usize - 1].1))
     };
-    // An explicit right swatch wins even if the left uses a custom RGB.
-    selected(pf).or_else(|| (pf == 117).then(|| selected(100)).flatten()).unwrap_or(default_color)
+    if let Some(color) = selected(pf)? { return Ok(color); }
+    Ok(if pf == 117 { selected(100)?.unwrap_or(default_color) } else { default_color })
+}
+
+/// Does the current product have a real consumer for an explicit packed RGB?
+pub fn makeup_custom_color_supported(pf: u32) -> bool {
+    !makeup_palette_for_pf(pf).is_empty() || matches!(pf, 101 | 107 | 111 | 115 | 116 | 90032)
+}
+
+/// Optional original material tint. The recovered image shader reads texture
+/// RGB and mix *alpha*, not mix RGB. Prepare the selected texture once for
+/// either renderer, leaving every stored alpha and untinted material intact.
+pub(crate) fn material_tint(pf: u32, extra: Option<&BTreeMap<String, f32>>) -> Result<Option<[u8; 3]>, Refusal> {
+    if !matches!(pf, 101 | 107 | 111 | 115 | 116 | 90032) { return Ok(None); }
+    let Some(&raw) = extra.and_then(|e| e.get(&format!("pc:{pf}:rgb"))) else { return Ok(None); };
+    if !(0.0..=16_777_215.0).contains(&raw) || raw.fract() != 0.0 {
+        return Err(Refusal::ValueOutOfRange("makeup material RGB24"));
+    }
+    let [_, r, g, b] = (raw as u32).to_be_bytes();
+    Ok(([r, g, b] != [255; 3]).then_some([r, g, b]))
+}
+
+pub(crate) fn tint_material_pixels(material: &mut Image, tint: [u8; 3]) {
+    for texel in material.pixels.chunks_exact_mut(4) {
+        for (value, multiplier) in texel[..3].iter_mut().zip(tint) {
+            *value = ((u16::from(*value) * u16::from(multiplier) + 127) / 255) as u8;
+        }
+    }
 }
 
 fn asset_root() -> Option<PathBuf> {
@@ -485,17 +537,12 @@ impl FaceInputBundle {
             face_mask,
             extra,
             |pf| {
-                if let Some(preset) = resolve_style_selection(pf, extra) {
-                    if let Some(img) = load_row_material(&preset.path, job_id, pf)? {
-                        return Ok(Some((img, preset.mirror_x)));
-                    }
+                let Some(selected) = row_material_selection(root_ref, pf, extra)? else { return Ok(None) };
+                let image = load_row_material(&selected.path, job_id, pf)?;
+                if image.is_none() && selected.explicit {
+                    return Err(Refusal::MissingInput(row_contract(pf).ok_or(Refusal::UnknownEffect(pf))?.material_missing));
                 }
-                let Some(root) = root_ref else {
-                    return Ok(None);
-                };
-                let contract = row_contract(pf).ok_or(Refusal::UnknownEffect(pf))?;
-                Ok(load_row_material(root.join(contract.material), job_id, pf)?
-                    .map(|img| (img, false)))
+                Ok(image.map(|img| (img, selected.mirror_x)))
             },
         )?;
         if !skipped_material.is_empty() {
@@ -509,13 +556,16 @@ impl FaceInputBundle {
             }));
         }
 
-        let produced = produce_owned_makeup_bundle(Some(OwnedMakeupBundleInputs {
+        let mut produced = produce_owned_makeup_bundle(Some(OwnedMakeupBundleInputs {
             job_id,
             ticket: Some(job_id),
             frame_size: [source.width, source.height],
             source_sha256: self.source_sha256,
             rows: &input_rows,
         }))?;
+        if planned.contains(&111) {
+            produced.human_catchlight = crate::portrait_look_layer::prepare(root_ref, self, extra)?;
+        }
         producer.makeup_bundle = Some(produced);
         Ok(())
     }
@@ -589,14 +639,19 @@ where
         let profile = row_profile_for_effect(pf, contract.source_effect)?;
         let (material, mask_texture, mirror_x) = if profile.requires_material {
             match load_material(pf)? {
-                Some((material, mirror)) => (Some(material), None, mirror),
+                Some((mut material, mirror)) => {
+                    if let Some(tint) = material_tint(pf, extra)? {
+                        tint_material_pixels(Arc::make_mut(&mut material), tint);
+                    }
+                    (Some(material), None, mirror)
+                },
                 None => {
                     skipped_material.push(pf);
                     continue;
                 }
             }
         } else {
-            let loaded = load_material(pf).ok().flatten();
+            let loaded = load_material(pf)?;
             match loaded {
                 Some((img, mirror)) => (None, Some(img), mirror),
                 None => (None, None, false),
@@ -636,7 +691,7 @@ where
         };
         let filter_type = recovered_filter_type(pf, contract.source_effect)
             .ok_or(Refusal::MissingInput("makeup provider FilterType"))?;
-        let mix_color = resolve_mix_color(pf, contract.mix_color, extra);
+        let mix_color = resolve_mix_color(pf, contract.mix_color, extra)?;
         rows.push(OwnedMakeupBundleInputRow {
             pf,
             source_effect: Some(contract.source_effect.to_owned()),
@@ -1008,6 +1063,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_black_tints_iris_pixels_but_not_coverage_or_the_shared_style() {
+        let points = synthetic_points194();
+        let original = Arc::new(Image::solid(3, 3, [121, 103, 211, 153]));
+        let extra = BTreeMap::from([("pc:111:rgb".into(), 0.0)]);
+        let build = |extra| assemble_constructible_rows_with_options(
+            7, [901, 1081], &points, &[111], None, extra, |_| Ok(Some((Arc::clone(&original), false))),
+        ).unwrap().0.pop().unwrap().material.unwrap();
+        assert!(Arc::ptr_eq(&build(None), &original));
+        let tinted = build(Some(&extra));
+        assert_eq!(&tinted.pixels[..4], &[0, 0, 0, 153]);
+        assert_eq!(&original.pixels[..4], &[121, 103, 211, 153]);
+        assert_eq!(tinted.pixels.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>(), vec![153; 9]);
+    }
+
+    #[test]
     fn mask_only_rows_are_constructible_without_assets() {
         assert_eq!(
             makeup_rows_2d_available(),
@@ -1148,14 +1218,19 @@ mod tests {
     fn rgb24_black_is_present_and_right_brow_overrides_left() {
         let default = [91, 94, 99, 255];
         let mut extra = BTreeMap::from([("pc:100:rgb".to_owned(), 0.0)]);
-        assert_eq!(resolve_mix_color(100, default, Some(&extra)), [0, 0, 0, 255]);
-        assert_eq!(resolve_mix_color(117, default, Some(&extra)), [0, 0, 0, 255]);
+        assert_eq!(resolve_mix_color(100, default, Some(&extra)).unwrap(), [0, 0, 0, 255]);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)).unwrap(), [0, 0, 0, 255]);
         extra.insert("pc:117:color".to_owned(), 2.0);
-        assert_eq!(resolve_mix_color(117, default, Some(&extra)), makeup_palette_for_pf(117)[1].1);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)).unwrap(), makeup_palette_for_pf(117)[1].1);
         extra.insert("pc:117:rgb".to_owned(), 0xff0080 as f32);
-        assert_eq!(resolve_mix_color(117, default, Some(&extra)), [255, 0, 128, 255]);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)).unwrap(), [255, 0, 128, 255]);
         extra.insert("pc:117:rgb".to_owned(), 16_777_216.0);
-        assert_eq!(resolve_mix_color(117, default, Some(&extra)), makeup_palette_for_pf(117)[1].1);
+        assert!(resolve_mix_color(117, default, Some(&extra)).is_err());
+        extra.remove("pc:117:rgb");
+        for bad in [1.4, -1.0, 99.0, f32::NAN] {
+            extra.insert("pc:117:color".to_owned(), bad);
+            assert!(resolve_mix_color(117, default, Some(&extra)).is_err());
+        }
     }
 
     #[test]
