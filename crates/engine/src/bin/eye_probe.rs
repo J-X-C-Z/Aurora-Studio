@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! LUMEN_AIMODELS=~/agents/evidence \
-//!   cargo run -p lumen-engine --bin eye_probe -- photo.jpg
+//!   cargo run -p aurora-engine --bin eye_probe -- photo.jpg
 //! ```
 
 use anyhow::Result;

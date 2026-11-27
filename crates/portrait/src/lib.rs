@@ -8,6 +8,7 @@
 //! CPU kernels have no windowing dependency and stay testable headless.
 
 pub mod capability_registry;
+pub mod compute_backend;
 pub mod effect_descriptor;
 pub mod kernels;
 pub mod model_sha256;
@@ -54,6 +55,7 @@ pub mod metal;
 pub mod metal_mesh;
 pub mod metal_smile;
 pub mod effect_router;
+pub mod shader_catalog;
 
 /// Packed RGBA8 image, row-major, four bytes per pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]

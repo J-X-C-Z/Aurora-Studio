@@ -279,6 +279,8 @@ pub use portrait_makeup_bundle::*;
 pub use portrait_makeup_provider::*;
 mod param_meta;
 mod preview_cache;
+pub mod disk_preview_cache;
+pub mod tile_scheduler;
 mod presets;
 pub mod raw;
 pub mod aurora_raw;
@@ -379,4 +381,7 @@ pub use store::{Catalog, Entry, Store, StoreError};
 pub use styles::*;
 pub use tether::*;
 pub use xmp::XmpMeta;
+pub mod lcp_lens;
+pub mod xmp_preset;
+pub mod lrcat_import;
 

@@ -527,6 +527,35 @@ fn boolean(text: &str, field: &str) -> Result<bool> {
     }
 }
 
+/// Renders all pages of a template grid into a single multi-page PDF.
+pub fn render_template_pdf(template: &PrintTemplate, images: &[DynamicImage]) -> Result<Vec<u8>> {
+    let rows = template.layout.rows as usize;
+    let cols = template.layout.columns as usize;
+    let per_page = rows.saturating_mul(cols);
+    if per_page == 0 {
+        bail!("template has no cells");
+    }
+    if images.is_empty() {
+        bail!("no images to place");
+    }
+    let page_count = images.len().div_ceil(per_page);
+    let mut encoded = Vec::with_capacity(page_count);
+    for page in 0..page_count {
+        let (canvas, spec) = compose_template_page(template, images, page)?;
+        let jpeg = encode_jpeg(&canvas)?;
+        encoded.push((jpeg, (canvas.width(), canvas.height()), spec.points()));
+    }
+    let refs: Vec<PdfPageInput<'_>> = encoded
+        .iter()
+        .map(|(jpeg, page_px, page_pt)| PdfPageInput {
+            jpeg,
+            page_px: *page_px,
+            page_pt: *page_pt,
+        })
+        .collect();
+    build_multipage_pdf(&refs)
+}
+
 /// Renders one page of a template grid to PDF bytes. The page size is
 /// reconstructed from the template's margins and cells; the file has no paper
 /// size or DPI, so 300 dpi is assumed. Annotation, watermark and cell borders
@@ -607,15 +636,47 @@ pub fn write_file_pdf(input: &Path, output: &Path, spec: &PageSpec) -> Result<Re
 }
 
 pub fn write_image_pdf(image: &DynamicImage, output: &Path, spec: &PageSpec) -> Result<RenderedPage> {
-    let (canvas, layout) = compose_page(image, spec)?;
-    let jpeg = encode_jpeg(&canvas)?;
+    let pages = write_images_pdf(std::slice::from_ref(image), output, spec)?;
+    Ok(pages.into_iter().next().expect("single page PDF must produce one RenderedPage"))
+}
+
+/// Writes one or more images into a multi-page PDF document, one image per page.
+pub fn write_images_pdf(images: &[DynamicImage], output: &Path, spec: &PageSpec) -> Result<Vec<RenderedPage>> {
+    if images.is_empty() {
+        bail!("cannot write PDF with zero pages");
+    }
     let page_pt = spec.points();
-    let pdf = build_pdf(&jpeg, layout.page_px, page_pt);
+    let mut encoded = Vec::with_capacity(images.len());
+    let mut rendered = Vec::with_capacity(images.len());
+    for image in images {
+        let (canvas, layout) = compose_page(image, spec)?;
+        let jpeg = encode_jpeg(&canvas)?;
+        encoded.push((jpeg, layout.page_px, page_pt));
+        rendered.push(RenderedPage {
+            output: output.to_path_buf(),
+            layout,
+            page_pt,
+        });
+    }
+    let inputs: Vec<PdfPageInput<'_>> = encoded
+        .iter()
+        .map(|(jpeg, page_px, page_pt)| PdfPageInput {
+            jpeg,
+            page_px: *page_px,
+            page_pt: *page_pt,
+        })
+        .collect();
+    let pdf = build_multipage_pdf(&inputs)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     fs::write(output, pdf).with_context(|| format!("write {}", output.display()))?;
-    Ok(RenderedPage { output: output.to_path_buf(), layout, page_pt })
+    Ok(rendered)
+}
+
+/// Convenience entry point for printing one or more images to a multi-page PDF file.
+pub fn print_to_pdf(images: &[DynamicImage], output: &Path, spec: &PageSpec) -> Result<Vec<RenderedPage>> {
+    write_images_pdf(images, output, spec)
 }
 
 pub fn compose_page(image: &DynamicImage, spec: &PageSpec) -> Result<(RgbImage, PageLayout)> {
@@ -669,48 +730,80 @@ fn encode_jpeg(canvas: &RgbImage) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn build_pdf(jpeg: &[u8], page_px: (u32, u32), page_pt: (f32, f32)) -> Vec<u8> {
+/// Encoded page payload for [`build_multipage_pdf`].
+#[derive(Clone, Copy, Debug)]
+pub struct PdfPageInput<'a> {
+    pub jpeg: &'a [u8],
+    pub page_px: (u32, u32),
+    pub page_pt: (f32, f32),
+}
+
+/// Builds a valid multi-page PDF 1.4 byte stream with `/Pages /Count N /Kids [...]`,
+/// per-page `/Page`, image XObject, content stream objects, and an exact `xref` table.
+pub fn build_multipage_pdf(pages: &[PdfPageInput<'_>]) -> Result<Vec<u8>> {
+    if pages.is_empty() {
+        bail!("cannot build PDF with zero pages");
+    }
     let mut out = Vec::new();
     out.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
-    let mut offsets = Vec::new();
+    let mut offsets = Vec::with_capacity(2 + pages.len() * 3);
 
-    let start_object = |out: &mut Vec<u8>, offsets: &mut Vec<usize>| {
-        offsets.push(out.len());
-    };
-
-    start_object(&mut out, &mut offsets);
+    // Object 1: Catalog
+    offsets.push(out.len());
     out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
-    start_object(&mut out, &mut offsets);
-    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    start_object(&mut out, &mut offsets);
+    // Object 2: Pages root
+    let kids: Vec<String> = (0..pages.len()).map(|i| format!("{} 0 R", 3 + i * 3)).collect();
+    offsets.push(out.len());
     out.extend_from_slice(
         format!(
-            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.4} {:.4}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
-            page_pt.0, page_pt.1
+            "2 0 obj\n<< /Type /Pages /Kids [{}] /Count {} >>\nendobj\n",
+            kids.join(" "),
+            pages.len()
         )
         .as_bytes(),
     );
 
-    start_object(&mut out, &mut offsets);
-    out.extend_from_slice(
-        format!(
-            "4 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
-            page_px.0, page_px.1, jpeg.len()
-        )
-        .as_bytes(),
-    );
-    out.extend_from_slice(jpeg);
-    out.extend_from_slice(b"\nendstream\nendobj\n");
+    // Per-page objects:
+    //   page_obj    = 3 + i * 3
+    //   image_obj   = 4 + i * 3
+    //   content_obj = 5 + i * 3
+    for (i, page) in pages.iter().enumerate() {
+        let page_obj = 3 + i * 3;
+        let image_obj = 4 + i * 3;
+        let content_obj = 5 + i * 3;
 
-    let content = format!("q\n{:.4} 0 0 {:.4} 0 0 cm\n/Im0 Do\nQ\n", page_pt.0, page_pt.1);
-    start_object(&mut out, &mut offsets);
-    out.extend_from_slice(
-        format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
-    );
-    out.extend_from_slice(content.as_bytes());
-    out.extend_from_slice(b"endstream\nendobj\n");
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!(
+                "{page_obj} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.4} {:.4}] /Resources << /XObject << /Im{i} {image_obj} 0 R >> >> /Contents {content_obj} 0 R >>\nendobj\n",
+                page.page_pt.0, page.page_pt.1
+            )
+            .as_bytes(),
+        );
+
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!(
+                "{image_obj} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+                page.page_px.0, page.page_px.1, page.jpeg.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(page.jpeg);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let content = format!(
+            "q\n{:.4} 0 0 {:.4} 0 0 cm\n/Im{i} Do\nQ\n",
+            page.page_pt.0, page.page_pt.1
+        );
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!("{content_obj} 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        out.extend_from_slice(content.as_bytes());
+        out.extend_from_slice(b"endstream\nendobj\n");
+    }
 
     let xref = out.len();
     out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
@@ -725,7 +818,12 @@ fn build_pdf(jpeg: &[u8], page_px: (u32, u32), page_pt: (f32, f32)) -> Vec<u8> {
         )
         .as_bytes(),
     );
-    out
+    Ok(out)
+}
+
+fn build_pdf(jpeg: &[u8], page_px: (u32, u32), page_pt: (f32, f32)) -> Vec<u8> {
+    build_multipage_pdf(&[PdfPageInput { jpeg, page_px, page_pt }])
+        .expect("single-page PDF construction is infallible")
 }
 
 #[cfg(test)]
@@ -888,5 +986,105 @@ mod tests {
         for name in printer_names() {
             assert!(!name.trim().is_empty(), "EnumPrinters returned an empty name");
         }
+    }
+
+    fn assert_valid_pdf_structure(bytes: &[u8], expected_pages: usize) {
+        assert!(bytes.starts_with(b"%PDF-1.4\n"), "missing PDF 1.4 header");
+        assert!(bytes.ends_with(b"%%EOF\n"), "missing %%EOF trailer");
+
+        let text = String::from_utf8_lossy(bytes);
+        let count_marker = format!("/Count {expected_pages}");
+        assert!(text.contains(&count_marker), "missing {count_marker}");
+
+        let expected_kids: String = (0..expected_pages)
+            .map(|i| format!("{} 0 R", 3 + i * 3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let kids_marker = format!("/Kids [{expected_kids}]");
+        assert!(text.contains(&kids_marker), "missing {kids_marker}");
+
+        let page_marker = b"/Type /Page ";
+        let page_occurrences = bytes
+            .windows(page_marker.len())
+            .filter(|w| w.starts_with(page_marker))
+            .count();
+        assert_eq!(page_occurrences, expected_pages, "unexpected /Type /Page count");
+
+        // Parse startxref and verify every xref offset points to the exact object header.
+        let startxref_pos = text.rfind("startxref\n").expect("missing startxref");
+        let after = &text[startxref_pos + "startxref\n".len()..];
+        let xref_offset: usize = after
+            .lines()
+            .next()
+            .expect("missing xref offset line")
+            .trim()
+            .parse()
+            .expect("xref offset must be an integer");
+        assert!(xref_offset < bytes.len(), "xref offset out of bounds");
+        let xref_section = std::str::from_utf8(&bytes[xref_offset..]).expect("xref table must be ASCII");
+        let mut lines = xref_section.lines();
+        assert_eq!(lines.next(), Some("xref"));
+        let expected_objects = 2 + expected_pages * 3;
+        assert_eq!(lines.next(), Some(format!("0 {}", expected_objects + 1).as_str()));
+        assert_eq!(lines.next(), Some("0000000000 65535 f "));
+        for obj_id in 1..=expected_objects {
+            let entry = lines.next().expect("missing xref entry");
+            assert_eq!(entry.len(), 19, "xref entry must be 19 chars before LF: {entry:?}");
+            let offset: usize = entry[..10].parse().expect("offset must be 10 digits");
+            assert!(entry.ends_with(" 00000 n "));
+            let header = format!("{obj_id} 0 obj\n");
+            assert!(
+                bytes[offset..].starts_with(header.as_bytes()),
+                "xref offset {offset} for object {obj_id} did not point to {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipage_pdf_one_and_three_pages_have_valid_structure_and_exact_xref() {
+        let jpeg = encode_jpeg(&RgbImage::from_pixel(16, 12, image::Rgb([80, 120, 160]))).unwrap();
+        let page_pt = PageSpec::a4().points();
+
+        let one = build_multipage_pdf(&[PdfPageInput { jpeg: &jpeg, page_px: (16, 12), page_pt }]).unwrap();
+        assert_valid_pdf_structure(&one, 1);
+
+        let three = build_multipage_pdf(&[
+            PdfPageInput { jpeg: &jpeg, page_px: (16, 12), page_pt },
+            PdfPageInput { jpeg: &jpeg, page_px: (16, 12), page_pt: (400.0, 600.0) },
+            PdfPageInput { jpeg: &jpeg, page_px: (16, 12), page_pt },
+        ])
+        .unwrap();
+        assert_valid_pdf_structure(&three, 3);
+        assert!(build_multipage_pdf(&[]).is_err());
+    }
+
+    #[test]
+    fn print_to_pdf_writes_three_pages_and_rejects_empty() {
+        let dir = std::env::temp_dir().join(format!("aurora-print-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("multi.pdf");
+        let spec = PageSpec { width_mm: 100.0, height_mm: 150.0, margin_mm: 5.0, dpi: 72 };
+        let images = [solid([200, 40, 40]), solid([40, 200, 40]), solid([40, 40, 200])];
+
+        let rendered = print_to_pdf(&images, &out, &spec).unwrap();
+        assert_eq!(rendered.len(), 3);
+        let bytes = std::fs::read(&out).unwrap();
+        assert_valid_pdf_structure(&bytes, 3);
+
+        assert!(print_to_pdf(&[], &out, &spec).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn render_template_pdf_generates_multipage_contact_sheet() {
+        let template = PrintTemplate {
+            version: Some(1),
+            name: Some("2x2-small".into()),
+            layout: TemplateLayout { rows: 2, columns: 2, cell_width_mm: 10.0, cell_height_mm: 10.0, ..Default::default() },
+            ..Default::default()
+        };
+        let images: Vec<DynamicImage> = (0..9).map(|i| solid([i * 25, 100, 200 - i * 15])).collect();
+        let pdf = render_template_pdf(&template, &images).unwrap();
+        assert_valid_pdf_structure(&pdf, 3);
     }
 }

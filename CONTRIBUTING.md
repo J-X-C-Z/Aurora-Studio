@@ -16,7 +16,7 @@
 ```powershell
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked -- --test-threads=1
-cargo build -p lumen-app --release --locked
+cargo build -p portrait-app --release --locked
 ```
 
 CI 只运行不依赖外部资产的 synthetic 测试。涉及外部资产的测试必须放在

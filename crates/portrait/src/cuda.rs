@@ -232,6 +232,11 @@ pub(crate) fn test_driver_counts() -> [usize; 3] {
     ]
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn test_exclusive_cache_guard() -> driver::TestCacheGuard {
+    driver::test_exclusive_cache_guard()
+}
+
 /// Why the NVIDIA path produced nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CudaError {
@@ -425,9 +430,46 @@ mod driver {
     #[cfg(test)]
     static LIVE_CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     #[cfg(test)]
+    static TEST_CACHE_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    #[cfg(test)]
     thread_local! {
         static DEVICE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
         static CONTEXT_SYNCS: Cell<usize> = const { Cell::new(0) };
+        static EXCLUSIVE_CACHE_DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) struct TestCacheGuard {
+        _guard: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+    }
+
+    #[cfg(test)]
+    impl Drop for TestCacheGuard {
+        fn drop(&mut self) {
+            EXCLUSIVE_CACHE_DEPTH.with(|depth| {
+                let current = depth.get();
+                debug_assert!(current > 0);
+                depth.set(current.saturating_sub(1));
+            });
+        }
+    }
+
+    /// Serialises cache-sensitive tests against concurrent GPU tests so
+    /// shared LRU slots and `clear_*` helpers cannot race under parallel
+    /// `cargo test`, while allowing non-exclusive tests to run concurrently.
+    #[cfg(test)]
+    pub(crate) fn test_exclusive_cache_guard() -> TestCacheGuard {
+        let _guard = if EXCLUSIVE_CACHE_DEPTH.with(|depth| depth.get() == 0) {
+            Some(
+                TEST_CACHE_GATE
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        } else {
+            None
+        };
+        EXCLUSIVE_CACHE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        TestCacheGuard { _guard }
     }
 
     #[cfg(test)]
@@ -452,7 +494,14 @@ mod driver {
     }
 
     pub(crate) fn device_allocations() -> usize {
-        DEVICE_ALLOCATIONS_TOTAL.load(Ordering::Relaxed)
+        #[cfg(test)]
+        {
+            DEVICE_ALLOCATIONS.with(|count| count.get())
+        }
+        #[cfg(not(test))]
+        {
+            DEVICE_ALLOCATIONS_TOTAL.load(Ordering::Relaxed)
+        }
     }
 
     fn count_context_sync() {
@@ -462,7 +511,14 @@ mod driver {
     }
 
     pub(crate) fn context_syncs() -> usize {
-        CONTEXT_SYNCS_TOTAL.load(Ordering::Relaxed)
+        #[cfg(test)]
+        {
+            CONTEXT_SYNCS.with(|count| count.get())
+        }
+        #[cfg(not(test))]
+        {
+            CONTEXT_SYNCS_TOTAL.load(Ordering::Relaxed)
+        }
     }
 
     type CuResult = i32;
@@ -748,7 +804,64 @@ mod driver {
         driver_version: i32,
     }
 
-    static DOMAIN: OnceLock<Result<Mutex<Domain>, CudaError>> = OnceLock::new();
+    #[cfg(test)]
+    struct DomainLock(Mutex<Domain>);
+
+    #[cfg(test)]
+    struct DomainGuard<'a> {
+        guard: std::sync::MutexGuard<'a, Domain>,
+        _shared_gate: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    }
+
+    #[cfg(test)]
+    impl std::ops::Deref for DomainGuard<'_> {
+        type Target = Domain;
+
+        fn deref(&self) -> &Self::Target {
+            &self.guard
+        }
+    }
+
+    #[cfg(test)]
+    impl std::ops::DerefMut for DomainGuard<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.guard
+        }
+    }
+
+    #[cfg(test)]
+    impl DomainLock {
+        fn new(domain: Domain) -> Self {
+            Self(Mutex::new(domain))
+        }
+
+        fn lock(&self) -> Result<DomainGuard<'_>, std::sync::PoisonError<DomainGuard<'_>>> {
+            let _shared_gate = if EXCLUSIVE_CACHE_DEPTH.with(|depth| depth.get() == 0) {
+                Some(
+                    TEST_CACHE_GATE
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                )
+            } else {
+                None
+            };
+            match self.0.lock() {
+                Ok(guard) => Ok(DomainGuard {
+                    guard,
+                    _shared_gate,
+                }),
+                Err(poisoned) => Err(std::sync::PoisonError::new(DomainGuard {
+                    guard: poisoned.into_inner(),
+                    _shared_gate,
+                })),
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    type DomainLock = Mutex<Domain>;
+
+    static DOMAIN: OnceLock<Result<DomainLock, CudaError>> = OnceLock::new();
     static PTX_MODULE_LOADS: AtomicUsize = AtomicUsize::new(0);
     static SKIN_LUT_UPLOADS: AtomicUsize = AtomicUsize::new(0);
     static TEETH_LUT_UPLOADS: AtomicUsize = AtomicUsize::new(0);
@@ -792,8 +905,8 @@ mod driver {
         ptr: CuPtr,
     }
 
-    fn domain() -> Result<&'static Mutex<Domain>, CudaError> {
-        match DOMAIN.get_or_init(|| Domain::open().map(Mutex::new)) {
+    fn domain() -> Result<&'static DomainLock, CudaError> {
+        match DOMAIN.get_or_init(|| Domain::open().map(DomainLock::new)) {
             Ok(domain) => Ok(domain),
             Err(error) => Err(error.clone()),
         }
@@ -3310,6 +3423,7 @@ mod driver {
 
         #[test]
         fn cache_keys_exact_shape_and_input_count() {
+            let _cache_guard = test_exclusive_cache_guard();
             let domain = match domain() {
                 Ok(domain) => domain,
                 Err(error) if std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none() => {
@@ -3391,6 +3505,7 @@ mod driver {
 
         #[test]
         fn named_pool_reuses_exact_key_and_shape() {
+            let _cache_guard = test_exclusive_cache_guard();
             let nvidia = match Nvidia::open() {
                 Ok(nvidia) => nvidia,
                 Err(error) if std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none() => {
@@ -3877,6 +3992,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn composite_u8_matches_composite_f32_bit_for_bit() {
+        let _cache_guard = super::test_exclusive_cache_guard();
         let Some(nvidia) = gpu() else { return };
         nvidia
             .clear_composite_buffers()
@@ -4231,6 +4347,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn reused_shape_buffers_are_byte_identical_for_constant_and_random_fields() {
+        let _cache_guard = super::test_exclusive_cache_guard();
         let Some(nvidia) = gpu() else { return };
         nvidia
             .clear_composite_buffers()

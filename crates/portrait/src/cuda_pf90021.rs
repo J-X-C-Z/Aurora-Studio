@@ -658,6 +658,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn real_gpu_matches_cpu_on_trilinear_gradient() {
+        let _cache_guard = crate::cuda::test_exclusive_cache_guard();
         let Some(gpu) = gpu() else { return };
         let mut nodes = vec![0.0f32; LUT_FLOATS];
         for z in 0..LUT_EDGE {

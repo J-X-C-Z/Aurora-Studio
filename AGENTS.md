@@ -31,7 +31,7 @@
 cargo metadata --locked --no-deps --format-version 1
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked -- --test-threads=1
-cargo build -p lumen-app --release --locked
+cargo build -p portrait-app --release --locked
 ```
 
 默认测试必须 synthetic 且可在 GitHub CI 运行。外部资产测试仅限本机：

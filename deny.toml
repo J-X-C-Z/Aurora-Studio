@@ -1,7 +1,9 @@
-# cargo-deny configuration for Aurora Studio (IN-2).
+# cargo-deny configuration for Aurora Studio (IN-2 / CI quality hardening).
 #
-# D-1 (license policy) is still open. This file only enforces a permissive
-# baseline and denies unlicensed crates; it is NOT a final license decision.
+# D-1 (final product license policy) is still open. This file enforces a
+# permissive open-source dependency allowlist, denies unlicensed crates and
+# strong copyleft (GPL/AGPL) dependencies, and restricts crate registries/git
+# sources; it is NOT a final product license decision.
 # See 06_reports/SESSION-integration-rv24-ci.md.
 #
 # MPL-2.0 is included because dwrote/option-ext/cbindgen are in the Windows
@@ -10,7 +12,10 @@
 # cannot be satisfied without them.
 
 [graph]
-targets = ["x86_64-pc-windows-msvc"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
@@ -19,6 +24,9 @@ ignore = []
 
 [licenses]
 confidence-threshold = 0.9
+# Target-specific crates (Windows vs macOS) may leave some allowed licenses
+# unused on a single host; allow unused entries rather than failing cross-OS.
+unused-allowed-license = "allow"
 allow = [
     "0BSD",
     "Apache-2.0",
