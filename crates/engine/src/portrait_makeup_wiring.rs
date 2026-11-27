@@ -214,9 +214,10 @@ fn find_png_recursive(dir: &Path, prefer: &[&str], exclude_sub: &[&str]) -> Opti
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
                 stack.push(path);
-            } else if path
+            } else if (kind.is_file() || (kind.is_symlink() && path.is_file())) && path
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("png"))
@@ -233,10 +234,20 @@ fn find_png_recursive(dir: &Path, prefer: &[&str], exclude_sub: &[&str]) -> Opti
             }
         }
     }
-    all.sort_by(|a, b| a.0.cmp(&b.0));
+    all.sort(); // filename first, then path for reproducible ties between material variants
     for pat in prefer {
-        let pat_low = pat.to_ascii_lowercase();
-        if let Some((_, p)) = all.iter().find(|(n, _)| n == &pat_low || n.starts_with(&pat_low)) {
+        let pat = pat.to_ascii_lowercase();
+        if let Some((_, p)) = all.iter().find(|(n, _)| n == &pat) {
+            return Some(p.clone());
+        }
+        let matches = |name: &str| match pat.strip_suffix(".png") {
+            // yyz1.png is the same side as yyz.png; it must not fall back
+            // to the alphabetically earlier opposite-side yyy1.png.
+            Some(stem) => name.strip_suffix(".png").and_then(|n| n.strip_prefix(stem))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+            None => name.starts_with(&pat),
+        };
+        if let Some((_, p)) = all.iter().find(|(n, _)| matches(n)) {
             return Some(p.clone());
         }
     }
@@ -246,9 +257,10 @@ fn find_png_recursive(dir: &Path, prefer: &[&str], exclude_sub: &[&str]) -> Opti
 /// Scans `makeup_asset_root()/Makeups/<category>/` and returns all available
 /// style presets for `pf` in natural numeric order.
 pub fn makeup_presets_for_pf(pf: u32) -> Vec<MakeupPresetInfo> {
-    let Some(root) = makeup_asset_root() else {
-        return Vec::new();
-    };
+    makeup_asset_root().map_or_else(Vec::new, |root| makeup_presets_at(&root, pf))
+}
+
+pub(super) fn makeup_presets_at(root: &Path, pf: u32) -> Vec<MakeupPresetInfo> {
     let (category, prefer, exclude): (&str, &[&str], &[&str]) = match pf {
         100 => ("Eyebrow", &["mmz.png", "mmy.png"], &["sideface"]),
         117 => ("Eyebrow", &["mmy.png", "mmz.png"], &["sideface"]),
@@ -361,27 +373,21 @@ fn resolve_mix_color(pf: u32, default_color: [u8; 4], extra: Option<&BTreeMap<St
     let Some(extra) = extra else {
         return default_color;
     };
-    let rgb_key = format!("pc:{pf}:rgb");
-    if let Some(packed) = extra.get(&rgb_key).copied().or_else(|| {
-        (pf == 117).then(|| extra.get("pc:100:rgb").copied()).flatten()
-    }) {
-        if packed.is_finite() && packed >= 1.0 {
-            let v = packed.round() as u32;
-            return [((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8, 255];
+    let selected = |id| -> Option<[u8; 4]> {
+        if let Some(&packed) = extra.get(&format!("pc:{id}:rgb")) {
+            // Every RGB24 integer is exactly representable in f32. Absence, not
+            // zero, means no custom color; zero is opaque black.
+            if (0.0..=16_777_215.0).contains(&packed) && packed.fract() == 0.0 {
+                let [_, r, g, b] = (packed as u32).to_be_bytes();
+                return Some([r, g, b, 255]);
+            }
         }
-    }
-    let color_key = format!("pc:{pf}:color");
-    let raw = extra.get(&color_key).copied().or_else(|| {
-        (pf == 117).then(|| extra.get("pc:100:color").copied()).flatten()
-    });
-    if let Some(val) = raw {
-        let idx = val.round() as isize;
-        let palette = makeup_palette_for_pf(pf);
-        if idx >= 1 && !palette.is_empty() {
-            return palette[(idx as usize - 1).min(palette.len() - 1)].1;
-        }
-    }
-    default_color
+        let idx = extra.get(&format!("pc:{id}:color"))?.round() as isize;
+        let palette = makeup_palette_for_pf(id);
+        (idx > 0 && !palette.is_empty()).then(|| palette[(idx as usize - 1).min(palette.len() - 1)].1)
+    };
+    // An explicit right swatch wins even if the left uses a custom RGB.
+    selected(pf).or_else(|| (pf == 117).then(|| selected(100)).flatten()).unwrap_or(default_color)
 }
 
 fn asset_root() -> Option<PathBuf> {
@@ -1136,6 +1142,20 @@ mod tests {
                     .starts_with("MAKEUP_MATERIAL_PNG_MISSING:")
             );
         }
+    }
+
+    #[test]
+    fn rgb24_black_is_present_and_right_brow_overrides_left() {
+        let default = [91, 94, 99, 255];
+        let mut extra = BTreeMap::from([("pc:100:rgb".to_owned(), 0.0)]);
+        assert_eq!(resolve_mix_color(100, default, Some(&extra)), [0, 0, 0, 255]);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)), [0, 0, 0, 255]);
+        extra.insert("pc:117:color".to_owned(), 2.0);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)), makeup_palette_for_pf(117)[1].1);
+        extra.insert("pc:117:rgb".to_owned(), 0xff0080 as f32);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)), [255, 0, 128, 255]);
+        extra.insert("pc:117:rgb".to_owned(), 16_777_216.0);
+        assert_eq!(resolve_mix_color(117, default, Some(&extra)), makeup_palette_for_pf(117)[1].1);
     }
 
     #[test]
