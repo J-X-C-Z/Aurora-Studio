@@ -11,6 +11,7 @@ pub mod capability_registry;
 pub mod compute_backend;
 pub mod effect_descriptor;
 pub mod kernels;
+pub mod native_infer_graph;
 pub mod model_sha256;
 pub mod plump_session;
 pub mod device;
