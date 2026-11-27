@@ -3,7 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::base::MotionReveal;
 use gpui_kit::component::{
-    Icon, Sizable as _,
+    Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     h_flex, v_flex,
@@ -316,13 +316,53 @@ fn catalog_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<>
     let edited = s.library.images.iter().filter(|i| i.has_adjustments).count();
     let bytes: u64 = s.library.images.iter().map(|i| i.file_size).sum();
     let picked = s.library.images.iter().filter(|i| i.rating >= 4).count();
+    let profile = s.engine.library_profile();
+    let mode_label = match profile.as_ref().map(|pr| pr.kind) {
+        Some(LibraryKind::Session) => t("Session (SQLite WAL)", "Session 会话 (SQLite WAL)"),
+        Some(LibraryKind::Catalog) => t("Catalog (SQLite WAL)", "Catalog 目录 (SQLite WAL)"),
+        Some(LibraryKind::Folder) => t("Folder (SQLite WAL)", "文件夹直读 (SQLite WAL)"),
+        None => t("In-Memory", "内存模式"),
+    };
+    let is_session = profile.as_ref().is_some_and(|pr| pr.kind == LibraryKind::Session);
+    let has_selection = !s.library.selection.is_empty();
+    let (st_selects, st_trash) = (state.clone(), state.clone());
     let line = |k: &'static str, v: String| h_flex().px_3().h(px(20.0)).text_xs().child(div().flex_1().text_color(p.text_subtle).child(k)).child(div().text_color(p.text_muted).child(v));
     ToolPanel::new(state, "catalog", t("Catalog", "目录"))
+        .child(line(t("Mode", "库模式"), mode_label.to_string()))
         .child(line(t("Collection", "当前集合"), s.library.active_collection_name.to_string()))
         .child(line(t("Images", "图像"), format!("{total}")))
         .child(line(t("Edited", "已编辑"), format!("{edited}")))
         .child(line(t("Rated 4★+", "4 星及以上"), format!("{picked}")))
         .child(line(t("Size on disk", "磁盘占用"), format!("{:.1} GB", bytes as f64 / 1e9)))
+        .when(is_session, |panel| {
+            panel
+                .child(caption(t("Session Workflow", "Session 流转"), cx))
+                .child(
+                    h_flex()
+                        .px_3()
+                        .gap_1p5()
+                        .child(
+                            Button::new("session-to-selects")
+                                .xsmall()
+                                .outline()
+                                .disabled(!has_selection)
+                                .label(t("Move to Selects", "移入精选 (Selects)"))
+                                .on_click(move |_, _, cx| {
+                                    st_selects.update(cx, |s, cx| s.move_selection_to_session_role(SessionFolderRole::Selects, cx));
+                                }),
+                        )
+                        .child(
+                            Button::new("session-to-trash")
+                                .xsmall()
+                                .outline()
+                                .disabled(!has_selection)
+                                .label(t("Move to Trash", "移入废纸篓 (Trash)"))
+                                .on_click(move |_, _, cx| {
+                                    st_trash.update(cx, |s, cx| s.move_selection_to_session_role(SessionFolderRole::Trash, cx));
+                                }),
+                        ),
+                )
+        })
         .child(div().px_3().pt_1().child(Button::new("lib-import").xsmall().outline().icon(Icon::new(IconName::ImageDown)).label(t("Import images…", "导入图像…")).on_click(|_, window, cx| {
             window.dispatch_action(Box::new(crate::actions::Import), cx)
         })))

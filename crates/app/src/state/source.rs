@@ -113,6 +113,16 @@ mod tests {
     }
 }
 
+pub fn create_session(path: &Path, name: Option<&str>) -> anyhow::Result<(Arc<dyn ImageEngine>, Source)> {
+    let engine = FileEngine::create_session(path, name)?;
+    Ok((Arc::new(engine), Source::Folder(path.to_path_buf())))
+}
+
+pub fn create_catalog(path: &Path, name: Option<&str>) -> anyhow::Result<(Arc<dyn ImageEngine>, Source)> {
+    let engine = FileEngine::create_catalog(path, name)?;
+    Ok((Arc::new(engine), Source::Folder(path.to_path_buf())))
+}
+
 pub fn demo() -> (Arc<dyn ImageEngine>, Source) {
     (Arc::new(MockEngine::new()), Source::Demo)
 }

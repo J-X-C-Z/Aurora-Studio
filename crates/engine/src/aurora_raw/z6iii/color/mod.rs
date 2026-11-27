@@ -71,6 +71,19 @@ impl Z6iiiColorStage {
         film_curve: Option<&str>,
         use_z6iii_pre_matrix: bool,
     ) -> Option<Self> {
+        let pre_matrix = if use_z6iii_pre_matrix {
+            Z6III_PRE_MATRIX
+        } else {
+            IDENTITY_PRE_MATRIX
+        };
+        Self::from_names_with_pre_matrix(icc_profile, film_curve, pre_matrix)
+    }
+
+    pub fn from_names_with_pre_matrix(
+        icc_profile: Option<&str>,
+        film_curve: Option<&str>,
+        pre_matrix: [[f32; 3]; 3],
+    ) -> Option<Self> {
         let profile = crate::icc::profile(icc_profile?)?;
         let camera_path = profile.path.clone()?;
         let srgb_path = crate::icc::profile("sRGB Color Space Profile")
@@ -79,11 +92,6 @@ impl Z6iiiColorStage {
         let clut = cached_srgb_clut(camera_path, srgb_path)?;
         let film = cached_film_nodes(film_curve)
             .unwrap_or_else(|| std::sync::Arc::new(linear_film_nodes()));
-        let pre_matrix = if use_z6iii_pre_matrix {
-            Z6III_PRE_MATRIX
-        } else {
-            IDENTITY_PRE_MATRIX
-        };
         Some(Self { pre_matrix, clut, film })
     }
 

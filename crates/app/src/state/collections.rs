@@ -310,4 +310,30 @@ impl AppState {
         }
         self.notify(format!("{} {}", ids.len(), t("images removed from the catalog", "张图像已从目录中移除")), cx);
     }
+
+    /// Moves the current selection into a Session role directory (`Capture`,
+    /// `Selects`, `Output`, `Trash`) and refreshes the library tree.
+    pub fn move_selection_to_session_role(&mut self, role: SessionFolderRole, cx: &mut Context<Self>) {
+        let ids: Vec<ImageId> = self.library.selection.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        match self.engine.move_to_session_role(&ids, role) {
+            Ok(updated) => {
+                self.library.images = updated;
+                let user_nodes: Vec<CollNode> = self.nodes.iter().filter(|n| n.user).cloned().collect();
+                let mut nodes = flatten(self.engine.as_ref(), &self.engine.collections());
+                nodes.extend(user_nodes);
+                self.nodes = nodes;
+                self.notify(
+                    format!("{} {} {}", ids.len(), t("images moved to", "张图像已移入"), role.dir_name()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(err) => {
+                self.notify(format!("{}: {err}", t("Move failed", "移动失败")), cx);
+            }
+        }
+    }
 }

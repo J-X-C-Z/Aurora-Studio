@@ -485,6 +485,24 @@ pub trait ImageEngine: Send + Sync + 'static {
     fn library_root(&self) -> Option<PathBuf> {
         None
     }
+    /// Session / Catalog profile (kind, Capture/Selects/Output/Trash dirs, favorites).
+    fn library_profile(&self) -> Option<crate::LibraryProfile> {
+        None
+    }
+    /// Moves images into one of the Session's role directories (`Capture`, `Selects`, `Output`, `Trash`).
+    fn move_to_session_role(
+        &self,
+        _images: &[ImageId],
+        _role: crate::SessionFolderRole,
+    ) -> anyhow::Result<Vec<ImageInfo>> {
+        anyhow::bail!("session role folders are unsupported by this engine")
+    }
+    fn add_favorite_folder(&self, _rel_path: &str, _label: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn remove_favorite_folder(&self, _rel_path: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Absolute folder path behind a folder collection id. `None` for a
     /// C1-only album/project, which has no filesystem path.
     fn collection_path(&self, _id: u64) -> Option<PathBuf> {

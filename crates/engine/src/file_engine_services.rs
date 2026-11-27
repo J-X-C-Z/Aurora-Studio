@@ -343,6 +343,23 @@ impl<'a> RenderService<'a> {
         adjustments: &AdjustmentSet,
         max_size: u32,
     ) -> anyhow::Result<RgbaImage> {
+        let thumb_key = if let Some(store) = &self.engine.store {
+            let st = self.engine.state.lock();
+            st.entries.iter().find(|e| e.info.id == image).map(|e| {
+                let mtime_ns = crate::aurora_store::file_mtime_ns(&e.path);
+                let adj_hash = crate::aurora_store::hash_adjustments(adjustments);
+                (store.clone(), e.rel_path.clone(), mtime_ns, adj_hash)
+            })
+        } else {
+            None
+        };
+
+        if let Some((ref store, ref rel_path, mtime_ns, adj_hash)) = thumb_key {
+            if let Some(cached) = store.thumb_cache().get(rel_path, max_size, mtime_ns, adj_hash) {
+                return Ok(cached);
+            }
+        }
+
         // Thumbnails queue behind the visible preview on the decode gate.
         let src = self.engine.source_with_priority(image, DecodePriority::Thumbnail)?;
         let out = process::render(
@@ -353,7 +370,11 @@ impl<'a> RenderService<'a> {
             false,
             None,
         );
-        Ok(RgbaImage::new(out.width, out.height, out.rgba))
+        let rgba = RgbaImage::new(out.width, out.height, out.rgba);
+        if let Some((store, rel_path, mtime_ns, adj_hash)) = thumb_key {
+            let _ = store.thumb_cache().put(&rel_path, max_size, mtime_ns, adj_hash, &rgba);
+        }
+        Ok(rgba)
     }
 
     pub(crate) fn thumbnail_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
@@ -1792,7 +1813,7 @@ impl SaveWriter for StoreSaveWriter {
 
     fn commit_index(&self) -> anyhow::Result<()> {
         let catalog = self.state.lock().catalog.clone();
-        self.store.save_index(&catalog)
+        self.store.save_index_db_only(&catalog)
     }
 }
 

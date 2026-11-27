@@ -44,6 +44,7 @@ pub(super) fn is_private(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
         name == ".portrait"
+            || name == ".aurora"
             || name == ".lumen"
             || ["cocatalogdb", "cosessiondb", "cos"]
                 .iter()

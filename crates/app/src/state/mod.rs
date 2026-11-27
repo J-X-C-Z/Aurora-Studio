@@ -51,7 +51,7 @@ pub use library::LibraryState;
 pub use scopes::ScopeKind;
 pub use nodes::{GraphExt, NewNode, add_shape, flattened, flattened_checked, is_full};
 pub mod open {
-    pub use super::source::{demo, display_name, is_catalog, open, requests};
+    pub use super::source::{create_catalog, create_session, demo, display_name, is_catalog, open, requests};
 }
 
 use crate::i18n::t;

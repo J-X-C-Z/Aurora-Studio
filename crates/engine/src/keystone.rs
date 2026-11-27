@@ -307,6 +307,129 @@ pub fn auto_keystone(aspect: f32, rgba: &[u8], w: u32, h: u32) -> crate::Keyston
     }
 }
 
+/// Lightroom Upright-style geometry correction modes, combined with C1's
+/// `amount (0..100)` strength slider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UprightMode {
+    Auto,
+    Level,
+    Vertical,
+    Full,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UprightSolution {
+    pub rotation_deg: f32,
+    pub keystone: crate::Keystone,
+}
+
+/// Computes an Upright correction from image edges according to `mode`.
+pub fn upright_keystone(
+    mode: UprightMode,
+    aspect: f32,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+) -> UprightSolution {
+    let half = detect(rgba, w, h);
+    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    match mode {
+        UprightMode::Level => UprightSolution {
+            rotation_deg: (-half.horizontal).clamp(-15.0, 15.0),
+            keystone: crate::Keystone {
+                amount: 100.0,
+                aspect,
+                ..Default::default()
+            },
+        },
+        UprightMode::Vertical => UprightSolution {
+            rotation_deg: 0.0,
+            keystone: crate::Keystone {
+                vertical: solve_axis(Axis::Vertical, half.vertical, aspect, wf, hf),
+                horizontal: 0.0,
+                amount: 100.0,
+                aspect,
+                ..Default::default()
+            },
+        },
+        UprightMode::Auto | UprightMode::Full => UprightSolution {
+            rotation_deg: 0.0,
+            keystone: crate::Keystone {
+                vertical: solve_axis(Axis::Vertical, half.vertical, aspect, wf, hf),
+                horizontal: solve_axis(Axis::Horizontal, half.horizontal, aspect, wf, hf),
+                amount: 100.0,
+                aspect,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+/// Solves a [`crate::Keystone`] from 2–4 user-drawn normalized guide segments
+/// `([x0, y0], [x1, y1])` in `0.0..=1.0` (Guided Upright).
+pub fn solve_guided_upright(
+    guides: &[([f32; 2], [f32; 2])],
+    aspect: f32,
+    w: u32,
+    h: u32,
+) -> crate::Keystone {
+    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let mut v_left = Vec::new();
+    let mut v_right = Vec::new();
+    let mut h_top = Vec::new();
+    let mut h_bot = Vec::new();
+
+    for &(p0, p1) in guides {
+        let dx = (p1[0] - p0[0]) * wf;
+        let dy = (p1[1] - p0[1]) * hf;
+        if dx.hypot(dy) < 4.0 {
+            continue;
+        }
+        let mx = 0.5 * (p0[0] + p1[0]);
+        let my = 0.5 * (p0[1] + p1[1]);
+        if dy.abs() >= dx.abs() {
+            // Vertical-ish guide: signed tilt angle in degrees (positive = tilts right as y grows).
+            let signed_dy = if dy >= 0.0 { dy } else { -dy };
+            let signed_dx = if dy >= 0.0 { dx } else { -dx };
+            let angle = (signed_dx / signed_dy).atan().to_degrees();
+            if mx < 0.5 {
+                v_left.push(angle);
+            } else {
+                v_right.push(angle);
+            }
+        } else {
+            let signed_dx = if dx >= 0.0 { dx } else { -dx };
+            let signed_dy = if dx >= 0.0 { dy } else { -dy };
+            let angle = (signed_dy / signed_dx).atan().to_degrees();
+            if my < 0.5 {
+                h_top.push(angle);
+            } else {
+                h_bot.push(angle);
+            }
+        }
+    }
+
+    let avg = |xs: &[f32]| -> Option<f32> {
+        (!xs.is_empty()).then(|| xs.iter().sum::<f32>() / xs.len() as f32)
+    };
+    let half_v = match (avg(&v_left), avg(&v_right)) {
+        (Some(l), Some(r)) => ((r - l) * 0.5).clamp(-MAX_OUT, MAX_OUT),
+        _ => 0.0,
+    };
+    let half_h = match (avg(&h_top), avg(&h_bot)) {
+        (Some(t), Some(b)) => ((b - t) * 0.5).clamp(-MAX_OUT, MAX_OUT),
+        _ => 0.0,
+    };
+
+    crate::Keystone {
+        vertical: solve_axis(Axis::Vertical, half_v, aspect, wf, hf),
+        horizontal: solve_axis(Axis::Horizontal, half_h, aspect, wf, hf),
+        amount: 100.0,
+        aspect,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +767,24 @@ mod tests {
         assert_eq!(detect(&[0; 16], 100, 100), Suggestion::default());
         assert_eq!(detect(&[0; 64], 4, 4), Suggestion::default());
         assert_eq!(detect(&[0; 64], u32::MAX, u32::MAX), Suggestion::default());
+    }
+
+    #[test]
+    fn guided_upright_solves_convergent_guides() {
+        let ks = solve_guided_upright(
+            &[
+                ([0.2, 0.1], [0.25, 0.9]),
+                ([0.8, 0.1], [0.75, 0.9]),
+            ],
+            0.0,
+            1000,
+            1000,
+        );
+        assert!(ks.vertical.abs() > 1.0 && ks.amount == 100.0, "{ks:?}");
+
+        let flat = vec![128u8; 256 * 256 * 4];
+        let level = upright_keystone(UprightMode::Level, 0.0, &flat, 256, 256);
+        assert_eq!(level.rotation_deg, 0.0);
+        assert_eq!(level.keystone.vertical, 0.0);
     }
 }

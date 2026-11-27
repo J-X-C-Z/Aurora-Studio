@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adjust::AdjustmentSet;
+use crate::aurora_store::{AuroraDb, DiskThumbCache, LibraryProfile};
 use crate::catalog::ColorTag;
 
 /// Version of the on-disk format this build writes.
@@ -153,6 +154,8 @@ impl Catalog {
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+    db: AuroraDb,
+    thumb_cache: DiskThumbCache,
 }
 
 /// Shape of `catalog.json` on disk.
@@ -175,7 +178,34 @@ impl Store {
         let root = folder.join(AURORA_DIR);
         fs::create_dir_all(root.join("adjust"))
             .with_context(|| format!("creating store directory {}", root.join("adjust").display()))?;
-        Ok(Store { root })
+        let db = AuroraDb::open(folder)?;
+        let meta_dir = db.meta_dir().to_path_buf();
+        let thumb_cache = DiskThumbCache::new(&meta_dir);
+        let store = Store { root, db, thumb_cache };
+        store.migrate_legacy_json_if_needed();
+        Ok(store)
+    }
+
+    pub fn db(&self) -> &AuroraDb {
+        &self.db
+    }
+
+    pub fn thumb_cache(&self) -> &DiskThumbCache {
+        &self.thumb_cache
+    }
+
+    pub fn library_profile(&self) -> Result<LibraryProfile> {
+        self.db.profile()
+    }
+
+    fn migrate_legacy_json_if_needed(&self) {
+        if self.db.image_count().unwrap_or(0) == 0 && self.index_path().is_file() {
+            if let Ok(legacy) = self.load_legacy_index() {
+                if !legacy.images.is_empty() {
+                    let _ = self.db.save_catalog(&legacy);
+                }
+            }
+        }
     }
 
     /// The `.portrait` directory of this store.
@@ -200,9 +230,19 @@ impl Store {
         Ok(self.root.join("adjust").join(format!("{}.json", fnv1a_hex(rel_path))))
     }
 
-    /// Reads the index. A missing file is an empty catalog; unreadable or
-    /// half-written records are skipped one by one.
+    /// Reads the index. Prefers SQLite WAL (`aurora.db`) after checking the
+    /// legacy `catalog.json` schema version guard.
     pub fn load_index(&self) -> Result<Catalog> {
+        self.guard_newer_index()?;
+        if let Ok(cat) = self.db.load_catalog() {
+            if !cat.images.is_empty() {
+                return Ok(cat);
+            }
+        }
+        self.load_legacy_index()
+    }
+
+    fn load_legacy_index(&self) -> Result<Catalog> {
         let path = self.index_path();
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
@@ -228,12 +268,25 @@ impl Store {
         Ok(Catalog { schema_version: SCHEMA_VERSION, images })
     }
 
-    /// Writes the index atomically. Refuses to write over a newer catalog.
+    /// Writes the index to SQLite WAL and legacy `catalog.json` atomically.
     pub fn save_index(&self, catalog: &Catalog) -> Result<()> {
         self.guard_newer_index()?;
+        self.db.save_catalog(catalog)?;
         let file = IndexFile { schema_version: SCHEMA_VERSION, images: &catalog.images };
         let bytes = serde_json::to_vec_pretty(&file)?;
         write_atomic(&self.index_path(), &bytes)
+    }
+
+    /// Fast incremental SQLite-only commit used by background save queues to
+    /// avoid full-catalog JSON serialization on every edit.
+    pub fn save_index_db_only(&self, catalog: &Catalog) -> Result<()> {
+        self.guard_newer_index()?;
+        self.db.save_catalog(catalog)
+    }
+
+    /// Incremental single-image upsert in SQLite WAL.
+    pub fn upsert_entry_db(&self, entry: &Entry) -> Result<()> {
+        self.db.upsert_entry(entry)
     }
 
     /// Reads the adjustments of one image. A missing or damaged file yields
@@ -482,6 +535,8 @@ impl Store {
     /// adjustment file.
     pub fn forget(&self, rel_path: &str) -> Result<()> {
         let path = self.adjust_path(rel_path)?;
+        let _ = self.db.remove_entry(rel_path);
+        self.thumb_cache.invalidate(rel_path);
         let mut catalog = self.load_index()?;
         let removed = catalog.remove(rel_path);
         if removed {
@@ -884,11 +939,18 @@ mod tests {
         store.save_index(&catalog).unwrap();
         store.save_adjustments("shoot/img_001.cr3", &sample_adjustments()).unwrap();
 
-        let names: Vec<String> = fs::read_dir(temp.path())
+        let mut names: Vec<String> = fs::read_dir(temp.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec![AURORA_DIR.to_string()]);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                crate::aurora_store::AURORA_META_DIR.to_string(),
+                AURORA_DIR.to_string(),
+            ]
+        );
     }
 
     #[test]

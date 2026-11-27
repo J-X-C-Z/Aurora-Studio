@@ -3899,19 +3899,48 @@ fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     g
 }
 
+fn wheel_to_c1_gains(w: &ColorWheel, k: f32) -> [f32; 3] {
+    let s = (w.saturation * k).clamp(0.0, 1.0);
+    if s <= 1e-6 {
+        return [1.0; 3];
+    }
+    let c = crate::processing::color::hue_rgb(w.hue);
+    let mean = (c[0] + c[1] + c[2]) / 3.0;
+    [
+        (1.0 + (c[0] - mean) * s * 0.9).max(0.1),
+        (1.0 + (c[1] - mean) * s * 0.9).max(0.1),
+        (1.0 + (c[2] - mean) * s * 0.9).max(0.1),
+    ]
+}
+
 fn color_balance(g: [f32; 3], cb: &ColorBalance, k: f32) -> [f32; 3] {
-    let l = luma(g).clamp(0.0, 1.0);
+    if k.abs() <= 1e-6 {
+        return g;
+    }
+    let gains = ColorBalanceGains {
+        master: wheel_to_c1_gains(&cb.master, k),
+        shadow: wheel_to_c1_gains(&cb.shadow, k),
+        midtone: wheel_to_c1_gains(&cb.midtone, k),
+        highlight: wheel_to_c1_gains(&cb.highlight, k),
+    };
+    let mut out = if gains.is_neutral() {
+        g
+    } else {
+        color_balance_gains(g, &gains)
+    };
+    let l = luma(out).clamp(0.0, 1.0);
     let ws = (1.0 - l).powi(2);
     let wh = l.powi(2);
     let wm = (1.0 - ws - wh).max(0.0);
-    let mut out = g;
-    for (wheel, w) in [(&cb.master, 1.0), (&cb.shadow, ws), (&cb.midtone, wm), (&cb.highlight, wh)] {
-        if wheel.saturation == 0.0 && wheel.lightness == 0.0 {
-            continue;
-        }
-        let o = wheel_offset(wheel, 0.35);
-        for i in 0..3 {
-            out[i] += o[i] * w * k;
+    let l_delta = (cb.master.lightness
+        + cb.shadow.lightness * ws
+        + cb.midtone.lightness * wm
+        + cb.highlight.lightness * wh)
+        * 0.25
+        * k;
+    if l_delta.abs() > 1e-6 {
+        for c in &mut out {
+            *c = (*c + l_delta).max(0.0);
         }
     }
     out
@@ -5717,6 +5746,20 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let pixel = [0.2, 0.4, 0.6];
         let out = color_balance_gains(pixel, &gains);
         assert!((luma(out) - luma(pixel)).abs() < 1e-4, "{out:?}");
+    }
+
+    #[test]
+    fn color_balance_wheels_use_c1_kernel_luma_preservation() {
+        let cb = ColorBalance {
+            master: ColorWheel::default(),
+            shadow: ColorWheel { hue: 210.0, saturation: 0.5, lightness: 0.0 },
+            midtone: ColorWheel { hue: 30.0, saturation: 0.4, lightness: 0.0 },
+            highlight: ColorWheel::default(),
+        };
+        let pixel = [0.25, 0.45, 0.55];
+        let out = color_balance(pixel, &cb, 1.0);
+        assert!((luma(out) - luma(pixel)).abs() < 1e-4, "{out:?}");
+        assert_ne!(out, pixel);
     }
 
     #[test]

@@ -816,8 +816,8 @@ fn linear_edits(p: &DevelopParams, lin: [f32; 3], gain: Option<&[f32]>, index: u
         let g = plane[index];
         c = [c[0] * g, c[1] * g, c[2] * g];
     }
-    c = apply_dehaze(c, &p.dehaze);
-    c = apply_hdr(c, &p.hdr);
+    c = crate::processing::tone::apply_dehaze(c, &p.dehaze);
+    c = crate::processing::tone::apply_hdr(c, &p.hdr);
     [c[0] * p.exposure, c[1] * p.exposure, c[2] * p.exposure]
 }
 

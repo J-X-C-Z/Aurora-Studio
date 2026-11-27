@@ -68,6 +68,55 @@ pub fn prompt_and_open(state: Entity<AppState>, folder: bool, replace: AnyWindow
     .detach();
 }
 
+/// Prompts for a folder and initializes it as an Aurora Session or Catalog, then opens it.
+pub fn prompt_and_create(state: Entity<AppState>, is_session: bool, replace: AnyWindowHandle, cx: &mut App) {
+    let rx = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some(if is_session {
+            t("Choose Session Folder", "选择 Session 会话文件夹")
+        } else {
+            t("Choose Catalog Folder", "选择 Catalog 目录文件夹")
+        }.into()),
+    });
+    cx.spawn(async move |cx| {
+        if let Ok(Ok(Some(paths))) = rx.await
+            && let Some(path) = paths.into_iter().next()
+        {
+            cx.update(|cx| {
+                state.update(cx, |s, cx| {
+                    s.opening = Some(path.clone());
+                    s.open_error = None;
+                    cx.notify();
+                });
+            });
+            let target = path.clone();
+            let result = cx.background_spawn(async move {
+                if is_session {
+                    source::create_session(&target, None)
+                } else {
+                    source::create_catalog(&target, None)
+                }
+            }).await;
+            cx.update(|cx| match result {
+                Ok((engine, src)) => {
+                    let next = crate::state::init_state(engine, src, cx);
+                    super::workspace::open(next, cx);
+                    let _ = replace.update(cx, |_, window, _| window.remove_window());
+                }
+                Err(err) => state.update(cx, |s, cx| {
+                    s.opening = None;
+                    s.welcome = true;
+                    s.open_error = Some(format!("{}: {err}", path.display()));
+                    cx.notify();
+                }),
+            });
+        }
+    })
+    .detach();
+}
+
 fn card(id: &'static str, icon: IconName, title: &'static str, detail: &'static str, chip: Option<&'static str>, disabled: bool, cx: &App) -> gpui_kit::Stateful<gpui_kit::Div> {
     let p = pal(cx).clone();
     div()
@@ -115,7 +164,8 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
         .justify_center()
         .child(Icon::new(IconName::Aperture).size(px(30.0)).text_color(gpui_kit::white()));
 
-    let (st_folder, st_catalog, st_demo) = (state.clone(), state.clone(), state.clone());
+    let (st_folder, st_catalog, st_demo, st_new_session, st_new_catalog) =
+        (state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
     let cards = h_flex()
         .gap_3()
         .child(motion::stagger(
@@ -300,6 +350,28 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                 ))
                 .child(status)
                 .child(cards)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("welcome-new-session")
+                                .small()
+                                .outline()
+                                .icon(Icon::new(IconName::FolderPlus))
+                                .disabled(busy)
+                                .label(t("New Aurora Session…", "新建 Aurora Session 会话…"))
+                                .on_click(move |_, _, cx| prompt_and_create(st_new_session.clone(), true, handle, cx)),
+                        )
+                        .child(
+                            Button::new("welcome-new-catalog")
+                                .small()
+                                .outline()
+                                .icon(Icon::new(IconName::Database))
+                                .disabled(busy)
+                                .label(t("New Aurora Catalog…", "新建 Aurora Catalog 目录…"))
+                                .on_click(move |_, _, cx| prompt_and_create(st_new_catalog.clone(), false, handle, cx)),
+                        ),
+                )
                 .child(motion::enter("welcome-recent", div().p_2().rounded(px(8.0)).bg(p.panel).border_1().border_color(p.edge).child(recent_block), 8.0)),
         )
         .into_any_element()

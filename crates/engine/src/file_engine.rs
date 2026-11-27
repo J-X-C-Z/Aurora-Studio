@@ -2499,6 +2499,21 @@ impl FileEngine {
         crate::c1_cos::save_adjustments(&path, adjustments, &layers)
     }
 
+    /// Creates a new Capture One-aligned Session at `root` (`Capture/`, `Selects/`,
+    /// `Output/`, `Trash/` + `.aurora/aurora.db`) and opens it.
+    pub fn create_session(root: impl AsRef<Path>, name: Option<&str>) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+        crate::aurora_store::AuroraDb::create_session(root, name)?;
+        Self::open(root)
+    }
+
+    /// Creates a new Aurora Catalog at `root` (`.aurora/aurora.db`) and opens it.
+    pub fn create_catalog(root: impl AsRef<Path>, name: Option<&str>) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+        crate::aurora_store::AuroraDb::create_catalog(root, name)?;
+        Self::open(root)
+    }
+
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = library_ops::canonical_root(root.as_ref())?;
@@ -4155,11 +4170,59 @@ impl ImageEngine for FileEngine {
         self.catalog().library_root()
     }
 
+    fn library_profile(&self) -> Option<crate::LibraryProfile> {
+        self.store.as_ref().and_then(|s| s.library_profile().ok())
+    }
+
+    fn move_to_session_role(
+        &self,
+        images: &[ImageId],
+        role: crate::SessionFolderRole,
+    ) -> anyhow::Result<Vec<ImageInfo>> {
+        let profile = self
+            .library_profile()
+            .ok_or_else(|| anyhow::anyhow!("library store is unavailable"))?;
+        let dest = profile
+            .role_path(role)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("not a Session library (no {} folder)", role.dir_name()))?;
+        std::fs::create_dir_all(&dest)?;
+        self.manage_library(crate::LibraryAction::Move {
+            images: images.to_vec(),
+            destination: dest,
+        })
+    }
+
+    fn add_favorite_folder(&self, rel_path: &str, label: &str) -> anyhow::Result<()> {
+        if let Some(store) = &self.store {
+            store.db().add_favorite(rel_path, label)?;
+        }
+        Ok(())
+    }
+
+    fn remove_favorite_folder(&self, rel_path: &str) -> anyhow::Result<()> {
+        if let Some(store) = &self.store {
+            store.db().remove_favorite(rel_path)?;
+        }
+        Ok(())
+    }
+
     fn collection_path(&self, id: u64) -> Option<PathBuf> {
         self.catalog().collection_path(id)
     }
 
     fn user_collections(&self) -> Vec<crate::UserCollection> {
+        if let Some(store) = &self.store {
+            let rel_to_id: HashMap<String, ImageId> = {
+                let st = self.state.lock();
+                st.entries.iter().map(|e| (e.rel_path.clone(), e.info.id)).collect()
+            };
+            if let Ok(cols) = store.db().load_user_collections(&rel_to_id) {
+                if !cols.is_empty() {
+                    return cols;
+                }
+            }
+        }
         self.catalog().user_collections()
     }
 
@@ -4216,7 +4279,14 @@ impl ImageEngine for FileEngine {
 
     fn save_user_collections(&self, collections: &[crate::UserCollection]) -> anyhow::Result<()> {
         match &self.store {
-            Some(store) => store.save_user_collections(collections).map_err(Into::into),
+            Some(store) => {
+                let id_to_rel: HashMap<ImageId, String> = {
+                    let st = self.state.lock();
+                    st.entries.iter().map(|e| (e.info.id, e.rel_path.clone())).collect()
+                };
+                store.db().save_user_collections(collections, &id_to_rel)?;
+                store.save_user_collections(collections).map_err(Into::into)
+            }
             None => Ok(()),
         }
     }
@@ -4243,7 +4313,7 @@ impl ImageEngine for FileEngine {
             st.catalog.clone()
         };
         if let Some(store) = &self.store {
-            store.save_index(&catalog)?;
+            store.save_index_db_only(&catalog)?;
         }
         Ok(())
     }
@@ -4286,7 +4356,7 @@ impl ImageEngine for FileEngine {
             st.catalog.clone()
         };
         if let Some(store) = &self.store {
-            if let Err(err) = store.save_index(&catalog) {
+            if let Err(err) = store.save_index_db_only(&catalog) {
                 log::warn!("save catalog: {err}");
             }
         }

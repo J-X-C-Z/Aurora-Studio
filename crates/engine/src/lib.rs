@@ -13,6 +13,7 @@
 //! rotation), so they stay attached to content when the crop changes. Preview
 //! regions are normalized in the *developed frame* (after crop and rotation).
 
+pub mod aurora_store;
 mod adjust;
 mod c1catalog;
 mod c1import;
@@ -81,6 +82,7 @@ pub mod pano;
 pub mod print;
 pub mod jxl;
 mod iptc;
+pub mod lcp;
 mod layers;
 mod lens_correct;
 mod layer_graph;
@@ -319,6 +321,11 @@ pub mod portrait {
     pub use crate::portrait_map::*;
 }
 
+pub use aurora_store::{
+    is_aurora_catalog_path, is_aurora_session_path, AuroraDb, DiskThumbCache, FavoriteFolder,
+    LibraryKind, LibraryProfile, SessionFolderRole, AURORA_CATALOG_EXT, AURORA_META_DIR,
+    AURORA_SESSION_EXT,
+};
 pub use adjust::*;
 pub use c1catalog::{
     C1Catalog, C1Collection, C1DocumentType, C1Image, C1Keyword, C1Variant, WalReplay,
@@ -342,6 +349,7 @@ pub use file_engine::{
 };
 pub use fcrv_index::*;
 pub use filmcurve::{curve_dir, parse_film_curves, FilmCurve};
+pub use lcp::*;
 pub use layers::*;
 pub use lens_correct::*;
 pub use dust_patch::{DustDetector, DustError, DustPatch};
