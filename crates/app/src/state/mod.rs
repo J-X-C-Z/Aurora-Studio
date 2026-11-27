@@ -562,6 +562,8 @@ pub struct AppState {
     /// The welcome screen covers the demo images until one is opened or the
     /// user chooses to look at the demo.
     pub welcome: bool,
+    /// The Import workspace replaces the inspector and viewer until it is closed.
+    pub importing: bool,
     /// Where a dragged tool panel would land, for the drop indicator.
     pub panel_drag: panel_order::PanelDrag,
     /// A folder or catalog being opened from the welcome screen.
@@ -687,6 +689,7 @@ impl AppState {
             c1_save_warnings: Vec::new(),
             c1_save_busy: false,
             welcome: source == Source::Demo,
+            importing: false,
             panel_drag: Default::default(),
             source,
             opening: None,

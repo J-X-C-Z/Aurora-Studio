@@ -69,6 +69,8 @@ pub struct Workspace {
     pub state: Entity<AppState>,
     viewer: Entity<Viewer>,
     browser: Entity<Browser>,
+    /// Created on first use, so import settings survive closing and reopening it.
+    import: Option<Entity<super::import::ImportView>>,
     menu_bar: Entity<AppMenuBar>,
     focus: FocusHandle,
     notice_serial: u64,
@@ -181,6 +183,17 @@ impl Workspace {
             }
             // Letters typed into a field or a dialog are text, not Speed Edit.
             let typing = window.context_stack().iter().any(|c| c.contains("Input")) || window.has_active_dialog(cx);
+            // Import takes the whole window; Esc leaves it and no edit keys apply.
+            if speed_state.read(cx).importing {
+                if e.keystroke.key == "escape" && !typing {
+                    speed_state.update(cx, |s, cx| {
+                        s.importing = false;
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                }
+                return;
+            }
             if let Some(param) = crate::state::SpeedParam::from_key(&e.keystroke.key).filter(|_| !typing) {
                 speed_state.update(cx, |s, cx| s.speed_begin(param, cx));
             }
@@ -227,7 +240,7 @@ impl Workspace {
                 StateEvent::CurrentChanged => {}
             }),
         ];
-        Self { state, viewer, browser, menu_bar, focus, notice_serial: 0, notice_carded: false, menu_key: None, _subs: subs }
+        Self { state, viewer, browser, import: None, menu_bar, focus, notice_serial: 0, notice_carded: false, menu_key: None, _subs: subs }
     }
 
     fn workspace_names(state: &Entity<AppState>, cx: &App) -> Vec<String> {
@@ -278,7 +291,7 @@ impl Workspace {
     }
 
     fn register_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
-        el.on_action(cx.listener(|this, _: &Quit, _, cx| {
+        let el = el.on_action(cx.listener(|this, _: &Quit, _, cx| {
             // Flush the bounded save queue before quitting; `flush_and_quit`
             // shows an incomplete report before `cx.quit()`.
             cx.stop_propagation();
@@ -287,7 +300,7 @@ impl Workspace {
             // Window menu (macOS): GPUI has no built-in minimize/zoom actions.
             .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
             .on_action(cx.listener(|_, _: &ZoomWindow, window, _| window.zoom_window()))
-            .on_action(cx.listener(|this, _: &Import, window, cx| super::import::open(&this.state, window, cx)))
+            .on_action(cx.listener(|this, _: &Import, _, cx| this.toggle_import(cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_in_new_window(true, window, cx)))
             .on_action(cx.listener(|this, _: &OpenCatalog, window, cx| this.open_in_new_window(false, window, cx)))
             .on_action(cx.listener(|this, a: &OpenRecent, window, cx| {
@@ -298,7 +311,22 @@ impl Workspace {
                     this.spawn_window(path, false, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &NewSession, _, cx| {
+            .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| super::prefs::open_shortcuts(&this.state, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAbout, window, cx| dialogs::about(&this.state, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowPreferences, window, cx| dialogs::preferences(&this.state, window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLanguage, window, cx| {
+                i18n::set_locale(if i18n::locale() == i18n::Locale::ZhCn { i18n::Locale::En } else { i18n::Locale::ZhCn });
+                let names = Self::workspace_names(&this.state, cx);
+                let welcome = this.state.read(cx).welcome;
+                install_menus(&this.menu_bar, &names, &Self::recent_names(&this.state, cx), welcome, cx);
+                window.refresh();
+            }));
+        // The Import workspace covers the library: shortcuts and menu items that
+        // act on images, edits or the viewer would change what the user cannot see.
+        if self.state.read(cx).importing {
+            return el;
+        }
+        el.on_action(cx.listener(|this, _: &NewSession, _, cx| {
                 this.with_state(cx, |s, cx| s.notify(crate::contract::SESSIONS.note().unwrap_or_default(), cx))
             }))
             .on_action(cx.listener(|this, _: &SyncXmp, _, cx| {
@@ -614,17 +642,29 @@ impl Workspace {
             }))
             .on_action(cx.listener(|this, _: &SaveWorkspace, window, cx| super::workspaces::save_dialog(&this.state, window, cx)))
             .on_action(cx.listener(|this, _: &Print, window, cx| super::print::open(&this.state, window, cx)))
-            .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| super::prefs::open_shortcuts(&this.state, window, cx)))
-            .on_action(cx.listener(|this, _: &ShowAbout, window, cx| dialogs::about(&this.state, window, cx)))
-            .on_action(cx.listener(|this, _: &ShowPreferences, window, cx| dialogs::preferences(&this.state, window, cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| dialogs::command_palette(&this.state, window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleLanguage, window, cx| {
-                i18n::set_locale(if i18n::locale() == i18n::Locale::ZhCn { i18n::Locale::En } else { i18n::Locale::ZhCn });
-                let names = Self::workspace_names(&this.state, cx);
-                let welcome = this.state.read(cx).welcome;
-                install_menus(&this.menu_bar, &names, &Self::recent_names(&this.state, cx), welcome, cx);
-                window.refresh();
-            }))
+    }
+
+    /// Opens the Import workspace, or closes it when it is already open.
+    fn toggle_import(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).importing {
+            self.state.update(cx, |s, cx| {
+                s.importing = false;
+                cx.notify();
+            });
+            return;
+        }
+        match &self.import {
+            Some(view) => view.update(cx, |v, cx| v.refresh(cx)),
+            None => {
+                let state = self.state.clone();
+                self.import = Some(cx.new(|cx| super::import::ImportView::new(state, cx)));
+            }
+        }
+        self.state.update(cx, |s, cx| {
+            s.importing = true;
+            cx.notify();
+        });
     }
 
     fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -704,6 +744,7 @@ impl Render for Workspace {
         let film_target = if film { if list { view.filmstrip_height.max(220.0) } else { view.filmstrip_height } } else { 0.0 };
         let notice = s.notice.clone();
         let welcome = s.welcome;
+        let importing = s.importing;
         let culling = s.cull.is_some();
         let showing = s.slideshow.is_some() || culling;
 
@@ -849,6 +890,8 @@ impl Render for Workspace {
             .map(|d| {
                 if showing {
                     d
+                } else if let Some(import) = self.import.clone().filter(|_| importing) {
+                    d.child(toolbar::toolbar(&self.state, window, cx)).child(motion::enter("workspace-import", div().flex_1().min_h_0().child(import), 6.0))
                 } else if welcome {
                     d.child(div().flex_1().min_h_0().child(super::welcome::render(&self.state, window, cx)))
                 } else {

@@ -143,7 +143,7 @@ pub fn toolbar(state: &Entity<AppState>, _window: &mut Window, cx: &App) -> impl
         // Catalog.
         .child(
             group(cx)
-                .child(dispatch("tb-import", IconName::ImageDown, t("Import", "导入"), "Ctrl+Shift+I", Box::new(actions::Import)))
+                .child(dispatch("tb-import", IconName::ImageDown, t("Import", "导入"), "Ctrl+Shift+I", Box::new(actions::Import)).active(state.read(cx).importing))
                 .child(if camera_ready {
                     dispatch("tb-capture", IconName::Camera, t("Capture", "拍摄"), "Ctrl+K", Box::new(actions::Capture))
                 } else {
