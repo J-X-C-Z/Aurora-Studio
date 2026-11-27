@@ -1336,11 +1336,13 @@ mod facestereo_provider_tests {
             assert_eq!(row.size, [preset.roi[2], preset.roi[3]]);
             assert_eq!(row.mix_color, preset.mix_color);
             assert_eq!(row.opacity_percent, preset.opacity_percent as f32);
-        }
-        // The first-class static rows are separate from the 12-row 2D wiring:
-        // FaceStereo mask capture cannot be synthesized from landmarks.
-        for pf in [8, 9] {
-            assert!(!MAKEUP_2D_ROWS.iter().any(|row| row.pf == pf));
+
+            // The 2D entry declares the front preset; the provider still needs
+            // mask pixels and material from the job that is being rendered.
+            let wired = MAKEUP_2D_ROWS.iter().find(|r| r.pf == pf).expect("FaceStereo 2D row");
+            assert_eq!(wired.source_effect, preset.source_effect, "PF{pf} source");
+            assert_eq!(wired.roi, preset.roi, "PF{pf} ROI");
+            assert_eq!(wired.material, facestereo_material(pf, 2).unwrap().path, "PF{pf} front material");
         }
         let bundle = ExternalMakeupProvider::build(Some(facestereo(&rows))).unwrap();
         for pf in [8, 9] {
@@ -1352,6 +1354,18 @@ mod facestereo_provider_tests {
             assert_eq!(resolved.filter_type, 42);
             assert!(resolved.owner_mask.is_some());
             assert!(resolved.material.is_some());
+        }
+    }
+
+    #[test]
+    fn facestereo_rejects_an_owner_mask_from_another_job() {
+        for pf in [8, 9] {
+            let mut rows = complete_rows();
+            let row = rows.iter_mut().find(|r| r.pf == pf).unwrap();
+            row.owner_mask.as_mut().expect("fixture has an owner mask").ticket += 1;
+            let err = ExternalMakeupProvider::build(Some(facestereo(&rows))).unwrap_err();
+            assert_eq!(err.code, PROVIDER_TICKET, "PF{pf} stale owner mask");
+            assert_eq!(err.pf, Some(pf));
         }
     }
 
