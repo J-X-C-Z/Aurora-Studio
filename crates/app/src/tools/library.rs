@@ -21,6 +21,16 @@ use crate::ui::collections::{DraggedImages, rename, smart_rules};
 use crate::theme::{hex, pal};
 use crate::widgets::*;
 
+/// One panel of this tab by id, for the Quick and user tabs.
+pub fn panel(id: &str, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    match id {
+        "collections" => Some(collections_panel(state, window, cx).into_any_element()),
+        "filters" => Some(filters_panel(state, window, cx).into_any_element()),
+        "catalog" => Some(catalog_panel(state, cx).into_any_element()),
+        _ => None,
+    }
+}
+
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     PanelStack::new(state)
         .panel("collections", collections_panel(state, window, cx))
@@ -62,6 +72,14 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
     let toggle = open_state.clone();
     let st_menu = state.clone();
     let menu_name = c.name.clone();
+    // A folder is shown in the file manager by one of its images, since the
+    // collection tree only knows folder names.
+    let reveal_target: Option<std::path::PathBuf> = (kind == CollectionKind::Folder)
+        .then(|| {
+            let members = c.members.as_ref()?;
+            state.read(cx).library.images.iter().find(|i| members.contains(&i.id)).map(|i| i.path.clone())
+        })
+        .flatten();
     let row = h_flex()
         .id(SharedString::from(format!("coll-{}", c.id)))
         .h(px(26.0))
@@ -156,7 +174,16 @@ fn node(state: &Entity<AppState>, c: &CollNode, depth: usize, window: &mut Windo
                     .item(PopupMenuItem::new(t("Delete", "删除")).on_click(move |_, _, cx| b.update(cx, |s, cx| s.delete_collection(id, cx))));
             }
             if kind == CollectionKind::Folder {
-                menu = menu.item(PopupMenuItem::new(t("Show in Explorer", "在资源管理器中显示")).disabled(true));
+                let target = reveal_target.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(reveal_label())
+                        .disabled(target.is_none())
+                        .on_click(move |_, _, _| {
+                            if let Some(path) = &target {
+                                reveal(path);
+                            }
+                        }),
+                );
             }
             menu
         });
@@ -318,22 +345,22 @@ fn catalog_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<>
     let picked = s.library.images.iter().filter(|i| i.rating >= 4).count();
     let profile = s.engine.library_profile();
     let mode_label = match profile.as_ref().map(|pr| pr.kind) {
-        Some(LibraryKind::Session) => t("Session (SQLite WAL)", "Session 会话 (SQLite WAL)"),
-        Some(LibraryKind::Catalog) => t("Catalog (SQLite WAL)", "Catalog 目录 (SQLite WAL)"),
-        Some(LibraryKind::Folder) => t("Folder (SQLite WAL)", "文件夹直读 (SQLite WAL)"),
-        None => t("In-Memory", "内存模式"),
+        Some(LibraryKind::Session) => t("Session", "会话"),
+        Some(LibraryKind::Catalog) => t("Catalog", "图库目录"),
+        Some(LibraryKind::Folder) => t("Folder", "文件夹"),
+        None => t("Not saved", "未保存"),
     };
     let is_session = profile.as_ref().is_some_and(|pr| pr.kind == LibraryKind::Session);
     let has_selection = !s.library.selection.is_empty();
     let (st_selects, st_trash) = (state.clone(), state.clone());
     let line = |k: &'static str, v: String| h_flex().px_3().h(px(20.0)).text_xs().child(div().flex_1().text_color(p.text_subtle).child(k)).child(div().text_color(p.text_muted).child(v));
     ToolPanel::new(state, "catalog", t("Catalog", "目录"))
-        .child(line(t("Mode", "库模式"), mode_label.to_string()))
+        .child(line(t("Type", "类型"), mode_label.to_string()))
         .child(line(t("Collection", "当前集合"), s.library.active_collection_name.to_string()))
         .child(line(t("Images", "图像"), format!("{total}")))
         .child(line(t("Edited", "已编辑"), format!("{edited}")))
         .child(line(t("Rated 4★+", "4 星及以上"), format!("{picked}")))
-        .child(line(t("Size on disk", "磁盘占用"), format!("{:.1} GB", bytes as f64 / 1e9)))
+        .child(line(t("Size on disk", "磁盘占用"), file_size(bytes)))
         .when(is_session, |panel| {
             panel
                 .child(caption(t("Session Workflow", "Session 流转"), cx))
@@ -366,4 +393,58 @@ fn catalog_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<>
         .child(div().px_3().pt_1().child(Button::new("lib-import").xsmall().outline().icon(Icon::new(IconName::ImageDown)).label(t("Import images…", "导入图像…")).on_click(|_, window, cx| {
             window.dispatch_action(Box::new(crate::actions::Import), cx)
         })))
+}
+
+/// A byte count in the largest unit that keeps it at or above one.
+fn file_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1000.0 && unit + 1 < UNITS.len() {
+        v /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[unit]) }
+}
+
+fn reveal_label() -> &'static str {
+    if cfg!(windows) {
+        t("Show in Explorer", "在资源管理器中显示")
+    } else if cfg!(target_os = "macos") {
+        t("Show in Finder", "在访达中显示")
+    } else {
+        t("Show in File Manager", "在文件管理器中显示")
+    }
+}
+
+/// Opens the system file manager at `file`, selected where the platform can.
+fn reveal(file: &std::path::Path) {
+    use std::process::Command;
+    #[cfg(windows)]
+    let spawned = {
+        use std::os::windows::process::CommandExt as _;
+        // explorer.exe parses its own command line, so `/select,` and the path go as one raw argument.
+        Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", file.display())).spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let spawned = Command::new("open").arg("-R").arg(file).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let spawned = Command::new("xdg-open").arg(file.parent().unwrap_or(file)).spawn();
+    if let Err(e) = spawned {
+        log::warn!("could not open the file manager: {e}");
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::file_size;
+
+    #[test]
+    fn sizes_pick_a_readable_unit() {
+        assert_eq!(file_size(0), "0 B");
+        assert_eq!(file_size(950), "950 B");
+        assert_eq!(file_size(48_200), "48.2 KB");
+        assert_eq!(file_size(25_300_000), "25.3 MB");
+        assert_eq!(file_size(3_400_000_000), "3.4 GB");
+    }
 }

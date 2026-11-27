@@ -25,10 +25,10 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> A
         .panel("navigator", navigator_panel(state, cx))
         .panel("sharpening", sharpening_panel(state, scope, cx))
         .panel("noise", noise_panel(state, scope, cx))
-        .panel("moire", moire_panel(state, scope, cx))
         .panel_when(global, "grain", || grain_panel(state, cx).into_any_element())
-        .panel_when(global, "lens-blur", || lens_blur_panel(state, cx).into_any_element())
         .panel_when(global, "spots", || spots_panel(state, cx).into_any_element())
+        .panel("moire", moire_panel(state, scope, cx))
+        .panel_when(global, "lens-blur", || lens_blur_panel(state, cx).into_any_element())
         .render(cx)
 }
 

@@ -117,31 +117,41 @@ pub fn prompt_and_create(state: Entity<AppState>, is_session: bool, replace: Any
     .detach();
 }
 
-fn card(id: &'static str, icon: IconName, title: &'static str, detail: &'static str, chip: Option<&'static str>, disabled: bool, cx: &App) -> gpui_kit::Stateful<gpui_kit::Div> {
+/// One action in the left column: an icon tile, a title and one line on what it does.
+fn action(id: &'static str, icon: IconName, title: &'static str, detail: &'static str, chip: Option<&'static str>, disabled: bool, cx: &App) -> gpui_kit::Stateful<gpui_kit::Div> {
     let p = pal(cx).clone();
-    div()
+    h_flex()
         .id(id)
-        .flex_1()
-        .min_w_0()
-        .p_4()
-        .gap_2()
-        .flex()
-        .flex_col()
+        .w_full()
+        .px_2()
+        .py_2()
+        .gap_3()
         .rounded(px(8.0))
-        .bg(p.panel)
-        .border_1()
-        .border_color(p.edge)
-        .when(!disabled, |d| d.cursor_pointer().hover(|d| d.border_color(p.accent.opacity(0.7)).bg(p.hover)))
+        .when(!disabled, |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
         .when(disabled, |d| d.opacity(0.5))
         .child(
-            h_flex()
-                .gap_2()
-                .child(div().size(px(32.0)).rounded(px(7.0)).bg(p.accent.opacity(0.14)).flex().items_center().justify_center().child(Icon::new(icon).text_color(p.accent)))
-                .child(div().flex_1())
-                .when_some(chip, |d, chip| d.child(div().px_1p5().rounded(px(3.0)).bg(p.well).text_size(px(10.0)).text_color(p.warning).child(chip))),
+            div()
+                .size(px(32.0))
+                .flex_shrink_0()
+                .rounded(px(8.0))
+                .bg(p.well)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(icon).text_color(p.text_muted)),
         )
-        .child(div().text_sm().text_color(p.text).child(title))
-        .child(div().text_xs().text_color(p.text_subtle).child(detail))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(div().text_sm().text_color(p.text).child(title))
+                        .when_some(chip, |d, chip| d.child(div().px_1().rounded(px(3.0)).bg(p.well).text_size(px(10.0)).text_color(p.warning).child(chip))),
+                )
+                .child(div().text_xs().text_color(p.text_subtle).overflow_hidden().whitespace_nowrap().text_ellipsis().child(detail)),
+        )
 }
 
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -166,44 +176,64 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
 
     let (st_folder, st_catalog, st_demo, st_new_session, st_new_catalog) =
         (state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
-    let cards = h_flex()
-        .gap_3()
+    // One primary action, the rest as a quiet list under it.
+    let open_folder = Button::new("welcome-open-folder")
+        .primary()
+        .large()
+        .w_full()
+        .icon(Icon::new(IconName::FolderOpen))
+        .label(t("Open Folder…", "打开文件夹…"))
+        .disabled(busy)
+        .on_click(move |_, _, cx| prompt_and_open(st_folder.clone(), true, handle, cx));
+    let actions = v_flex()
+        .gap_0p5()
         .child(motion::stagger(
-            "welcome-card-0",
+            "welcome-act-0",
             0,
-            card("welcome-folder", IconName::FolderOpen, t("Open Folder…", "打开文件夹…"), t("Browse and edit the photos in a folder.", "浏览并编辑一个文件夹中的照片。"), None, busy, cx)
-                .when(!busy, |d| d.on_click(move |_, _, cx| prompt_and_open(st_folder.clone(), true, handle, cx))),
-            10.0,
+            action("welcome-new-session", IconName::FolderPlus, t("New Session…", "新建会话…"), t("A folder that keeps its photos, edits and output together.", "照片、调整与输出都放在一个文件夹里。"), None, busy, cx)
+                .when(!busy, |d| d.on_click(move |_, _, cx| prompt_and_create(st_new_session.clone(), true, handle, cx))),
+            6.0,
         ))
         .child(motion::stagger(
-            "welcome-card-1",
+            "welcome-act-1",
             1,
-            card(
+            action("welcome-new-catalog", IconName::Database, t("New Catalog…", "新建图库…"), t("One library for photos from many folders.", "把多个文件夹的照片管理在一个图库里。"), None, busy, cx)
+                .when(!busy, |d| d.on_click(move |_, _, cx| prompt_and_create(st_new_catalog.clone(), false, handle, cx))),
+            6.0,
+        ))
+        .child(motion::stagger(
+            "welcome-act-2",
+            2,
+            action(
                 "welcome-catalog",
                 IconName::Library,
                 t("Open Capture One Catalog…", "打开 Capture One 目录…"),
-                t("Import a .cocatalog, session or Lightroom .lrcat read-only.", "只读导入 .cocatalog 目录、会话或 Lightroom .lrcat。"),
+                t("Read a .cocatalog, session or Lightroom .lrcat without changing it.", "只读打开 .cocatalog 目录、会话或 Lightroom .lrcat。"),
                 contract::C1_CATALOG.chip(),
                 busy,
                 cx,
             )
             .when(!busy, |d| d.on_click(move |_, _, cx| prompt_and_open(st_catalog.clone(), false, handle, cx))),
-            10.0,
-        ))
-        .child(motion::stagger(
-            "welcome-card-2",
-            2,
-            card("welcome-demo", IconName::Sparkles, t("Explore the Demo", "浏览演示图像"), t("Generated sample images, not real photos.", "程序生成的示例图像，并非真实照片。"), None, busy, cx)
-                .when(!busy, |d| {
-                    d.on_click(move |_, _, cx| {
-                        st_demo.update(cx, |s, cx| {
-                            s.welcome = false;
-                            cx.notify();
-                        })
-                    })
-                }),
-            10.0,
+            6.0,
         ));
+    let demo = h_flex()
+        .id("welcome-demo")
+        .gap_1p5()
+        .px_2()
+        .py_1()
+        .rounded(px(5.0))
+        .text_xs()
+        .text_color(p.text_subtle)
+        .when(!busy, |d| {
+            d.cursor_pointer().hover(|d| d.bg(p.hover).text_color(p.text)).on_click(move |_, _, cx| {
+                st_demo.update(cx, |s, cx| {
+                    s.welcome = false;
+                    cx.notify();
+                })
+            })
+        })
+        .child(Icon::new(IconName::Sparkles).xsmall())
+        .child(t("Explore the demo (generated images)", "浏览演示（程序生成的示例图像）"));
 
     let mut list = v_flex().gap_0p5();
     for (i, path) in recent.iter().enumerate() {
@@ -218,13 +248,23 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
         let row = h_flex()
             .id(SharedString::from(format!("recent-{i}")))
             .group("recent-row")
-            .h(px(40.0))
-            .px_2()
-            .gap_2()
-            .rounded(px(6.0))
+            .h(px(52.0))
+            .px_3()
+            .gap_3()
+            .rounded(px(8.0))
             .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
             .when(enabled, |d| d.on_click(move |_, _, cx| open_path(st_open.clone(), open_path_buf.clone(), handle, cx)))
-            .child(Icon::new(if is_catalog { IconName::Library } else { IconName::Folder }).small().text_color(if exists { p.accent } else { p.text_disabled }))
+            .child(
+                div()
+                    .size(px(32.0))
+                    .flex_shrink_0()
+                    .rounded(px(8.0))
+                    .bg(if exists { p.accent.opacity(0.14) } else { p.well })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(if is_catalog { IconName::Library } else { IconName::Folder }).small().text_color(if exists { p.accent } else { p.text_disabled })),
+            )
             .child(
                 v_flex()
                     .flex_1()
@@ -254,40 +294,55 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
     }
 
     let st_reopen = state.clone();
+    let reopen_row = switch_row(
+        "welcome-reopen",
+        t("Reopen the last one at startup", "启动时打开上次的目录"),
+        reopen,
+        move |v, _, cx| {
+            st_reopen.update(cx, |s, cx| {
+                s.prefs.settings.reopen_last = v;
+                s.prefs.settings.save();
+                cx.notify();
+            })
+        },
+        cx,
+    );
     let recent_block = v_flex()
+        .size_full()
+        .p_2()
         .gap_1()
         .child(
             h_flex()
-                .px_2()
-                .text_xs()
-                .text_color(p.text_subtle)
-                .child(div().flex_1().child(t("Recent", "最近打开")))
-                .when(!recent.is_empty(), |d| d.child(format!("{}", recent.len()))),
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .child(div().flex_1().text_sm().text_color(p.text).child(t("Recent", "最近打开")))
+                .when(!recent.is_empty(), |d| d.child(div().text_xs().text_color(p.text_subtle).child(format!("{}", recent.len())))),
         )
         .child(if recent.is_empty() {
-            div()
-                .px_2()
-                .py_4()
-                .text_xs()
-                .text_color(p.text_disabled)
-                .child(t("Folders and catalogs you open appear here.", "打开过的文件夹和目录会出现在这里。"))
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_color(p.text_subtle)
+                .child(
+                    div()
+                        .size(px(56.0))
+                        .rounded_full()
+                        .bg(p.well)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::FolderClock).size(px(26.0)).text_color(p.text_subtle)),
+                )
+                .child(div().text_sm().text_color(p.text_muted).child(t("Nothing opened yet", "还没有打开过文件夹或目录")))
+                .child(div().text_xs().child(t("Open a folder to start; it will be listed here next time.", "先打开一个文件夹，下次就会出现在这里。")))
                 .into_any_element()
         } else {
-            list.into_any_element()
-        })
-        .child(div().pt_2().child(switch_row(
-            "welcome-reopen",
-            t("Reopen the last one at startup", "启动时打开上次的目录"),
-            reopen,
-            move |v, _, cx| {
-                st_reopen.update(cx, |s, cx| {
-                    s.prefs.settings.reopen_last = v;
-                    s.prefs.settings.save();
-                    cx.notify();
-                })
-            },
-            cx,
-        )));
+            // A long history scrolls instead of stretching the page.
+            div().id("welcome-recent-list").flex_1().min_h_0().max_h(px(420.0)).overflow_y_scroll().child(list).into_any_element()
+        });
 
     let status = match &opening {
         Some(path) => h_flex()
@@ -319,9 +374,32 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
         },
     };
 
-    // Sit a little above the middle of the window, where the eye lands first;
-    // on a short window fall back to a fixed margin and scroll.
-    let top = ((f32::from(window.viewport_size().height) - 520.0) * 0.38).max(40.0);
+    let brand = h_flex()
+        .gap_3()
+        .child(logo)
+        .child(
+            v_flex()
+                .child(div().text_xl().font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(p.text).child("Aurora Studio"))
+                .child(div().text_xs().text_color(p.text_subtle).child(t("Raw processing, cataloguing and retouching", "RAW 处理、图库管理与人像精修"))),
+        );
+    let left = v_flex()
+        .w(px(300.0))
+        .flex_shrink_0()
+        .gap_5()
+        .child(motion::enter("welcome-head", brand, 10.0))
+        .child(open_folder)
+        .child(actions)
+        .child(div().flex_1())
+        .child(v_flex().gap_2().child(div().h(px(1.0)).bg(p.divider)).child(demo).child(div().pl_0p5().child(reopen_row)));
+    let right = motion::enter(
+        "welcome-recent",
+        div().flex_1().min_w_0().min_h(px(320.0)).rounded(px(12.0)).bg(p.panel).border_1().border_color(p.edge).child(recent_block),
+        8.0,
+    );
+
+    // A two-column start page sized by its content and centred in the window:
+    // what to do on the left, where the user was on the right. The columns
+    // stretch to the taller one, so neither leaves a hole under its content.
     div()
         .id("welcome")
         .size_full()
@@ -329,50 +407,16 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
         // A faint wash of the accent from the top keeps the page from being a flat slab.
         .bg(gpui_kit::linear_gradient(180.0, gpui_kit::linear_color_stop(p.chrome.blend(p.accent.opacity(0.07)), 0.0), gpui_kit::linear_color_stop(p.chrome, 0.55)))
         .flex()
+        .flex_col()
+        .items_center()
         .justify_center()
+        .py_8()
         .child(
             v_flex()
-                .w(px(720.0))
-                .pt(px(top))
-                .pb_8()
-                .gap_6()
-                .child(motion::enter(
-                    "welcome-head",
-                    h_flex()
-                        .gap_4()
-                        .child(logo)
-                        .child(
-                            v_flex()
-                                .child(div().text_2xl().text_color(p.text).child("Aurora Studio"))
-                                .child(div().text_sm().text_color(p.text_subtle).child(t("Raw processing, cataloguing and retouching", "RAW 处理、图库管理与人像精修"))),
-                        ),
-                    12.0,
-                ))
+                .w(px(960.0))
+                .gap_4()
                 .child(status)
-                .child(cards)
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("welcome-new-session")
-                                .small()
-                                .outline()
-                                .icon(Icon::new(IconName::FolderPlus))
-                                .disabled(busy)
-                                .label(t("New Aurora Session…", "新建 Aurora Session 会话…"))
-                                .on_click(move |_, _, cx| prompt_and_create(st_new_session.clone(), true, handle, cx)),
-                        )
-                        .child(
-                            Button::new("welcome-new-catalog")
-                                .small()
-                                .outline()
-                                .icon(Icon::new(IconName::Database))
-                                .disabled(busy)
-                                .label(t("New Aurora Catalog…", "新建 Aurora Catalog 目录…"))
-                                .on_click(move |_, _, cx| prompt_and_create(st_new_catalog.clone(), false, handle, cx)),
-                        ),
-                )
-                .child(motion::enter("welcome-recent", div().p_2().rounded(px(8.0)).bg(p.panel).border_1().border_color(p.edge).child(recent_block), 8.0)),
+                .child(h_flex().gap_8().items_stretch().child(left).child(right)),
         )
         .into_any_element()
 }

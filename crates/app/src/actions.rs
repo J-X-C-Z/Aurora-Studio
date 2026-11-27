@@ -107,6 +107,11 @@ pub struct SetColorTag(pub u8);
 #[action(namespace = portrait, no_json)]
 pub struct SelectToolTab(pub usize);
 
+/// Ctrl+1…9: the n-th tab as the tab bar shows it (order and hidden tabs applied).
+#[derive(Action, Clone, PartialEq, Deserialize)]
+#[action(namespace = portrait, no_json)]
+pub struct SelectNthTab(pub usize);
+
 #[derive(Action, Clone, PartialEq, Deserialize)]
 #[action(namespace = portrait, no_json)]
 pub struct SelectCursor(pub u8);
@@ -220,8 +225,7 @@ pub fn shortcuts() -> Vec<Shortcut> {
     add("shortcuts", "Keyboard shortcuts", "键盘快捷键", view, &["secondary-/"], Box::new(ShowShortcuts));
     add("language", "Switch language", "切换语言", view, &["secondary-shift-u"], Box::new(ToggleLanguage));
     for (i, k) in ["secondary-1", "secondary-2", "secondary-3", "secondary-4", "secondary-5", "secondary-6", "secondary-7", "secondary-8", "secondary-9"].iter().enumerate() {
-        let tab = crate::state::ToolTab::ALL[i];
-        out.push(Shortcut { id: format!("tab-{i}"), label: format!("{} · {}", t("Tool tab", "工具页签"), tab.label()), group: tools, defaults: vec![k], action: Box::new(SelectToolTab(i)), global: false });
+        out.push(Shortcut { id: format!("tab-{i}"), label: format!("{} {}", t("Tool tab", "工具页签"), i + 1), group: tools, defaults: vec![k], action: Box::new(SelectNthTab(i)), global: false });
     }
     let cursor_keys = ["v", "h", "z", "c", "r", "k", "q", "b", "e", "l", "t", "i", "w", "a", "o"];
     for (i, k) in cursor_keys.iter().enumerate() {
@@ -320,7 +324,17 @@ pub fn display_keys(keys: &str) -> String {
         .join(" ")
 }
 
-fn menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
+fn menus(workspaces: &[String], recent: &[String], welcome: bool) -> Vec<Menu> {
+    let mut all = all_menus(workspaces, recent);
+    if welcome {
+        // Nothing is open on the welcome page, so the image menus would only hold dead items.
+        let image_menus = [t("Camera", "相机"), t("Image", "图像"), t("Adjustments", "调整"), t("Nodes", "节点")];
+        all.retain(|m| !image_menus.iter().any(|n| m.name.as_ref() == *n));
+    }
+    all
+}
+
+fn all_menus(workspaces: &[String], recent: &[String]) -> Vec<Menu> {
     let mut recent_items: Vec<MenuItem> = recent.iter().enumerate().map(|(i, name)| MenuItem::action(name.clone(), OpenRecent(i))).collect();
     if recent_items.is_empty() {
         recent_items.push(MenuItem::action(t("No Recent Items", "无最近项目"), OpenRecent(usize::MAX)).disabled(true));
@@ -516,7 +530,7 @@ fn macos_window_menu() -> Menu {
 }
 
 /// Installs the menus for both the native menu bar and the in-window [`AppMenuBar`].
-pub fn install_menus(menu_bar: &Entity<AppMenuBar>, workspaces: &[String], recent: &[String], cx: &mut App) {
+pub fn install_menus(menu_bar: &Entity<AppMenuBar>, workspaces: &[String], recent: &[String], welcome: bool, cx: &mut App) {
     #[cfg(target_os = "macos")]
     {
         // Prepend the application menu and insert the Window menu before Help,
@@ -524,7 +538,7 @@ pub fn install_menus(menu_bar: &Entity<AppMenuBar>, workspaces: &[String], recen
         // Windows/Linux menu list.
         let mut native = Vec::with_capacity(10);
         native.push(macos_app_menu());
-        let mut rest = menus(workspaces, recent);
+        let mut rest = menus(workspaces, recent, welcome);
         let help = rest.pop();
         native.extend(rest);
         native.push(macos_window_menu());
@@ -532,8 +546,8 @@ pub fn install_menus(menu_bar: &Entity<AppMenuBar>, workspaces: &[String], recen
         cx.set_menus(native);
     }
     #[cfg(not(target_os = "macos"))]
-    cx.set_menus(menus(workspaces, recent));
-    let owned = menus(workspaces, recent).into_iter().map(|m| m.owned()).collect();
+    cx.set_menus(menus(workspaces, recent, welcome));
+    let owned = menus(workspaces, recent, welcome).into_iter().map(|m| m.owned()).collect();
     GlobalState::global_mut(cx).set_app_menus(owned);
     menu_bar.update(cx, |bar, cx| bar.reload(cx));
 }

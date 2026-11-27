@@ -16,11 +16,12 @@ use crate::theme::pal;
 use crate::widgets::*;
 
 pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {
+    // Capture One's Lens order: framing first, then geometry, then optics.
     PanelStack::new(state)
-        .panel("lens", lens_panel(state, cx))
-        .panel("rotation", rotation_panel(state, cx))
         .panel("crop", crop_panel(state, cx))
+        .panel("rotation", rotation_panel(state, cx))
         .panel("keystone", keystone_panel(state, cx))
+        .panel("lens", lens_panel(state, cx))
         .render(cx)
 }
 

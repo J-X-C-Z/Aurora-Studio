@@ -19,6 +19,7 @@ use gpui_kit::{
 
 use crate::motion;
 use crate::state::AppState;
+use crate::state::panel_order::{DropAt, before_for};
 use crate::theme::{metrics, pal};
 
 type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -174,9 +175,13 @@ impl RenderOnce for ToolPanel {
             .cursor_pointer()
             .hover(|s| s.bg(p.hover))
             // Drag the header to move the panel within its tab.
-            .on_drag(DraggedPanel { id, title }, |d, _, _, cx| {
-                let d = d.clone();
-                cx.new(|_| d)
+            .on_drag(DraggedPanel { id, title }, {
+                let state = self.state.clone();
+                move |d, _, _, cx| {
+                    state.update(cx, |s, cx| s.start_drag(Some(d.id), cx));
+                    let d = d.clone();
+                    cx.new(|_| d)
+                }
             })
             .on_click(move |e: &gpui_kit::ClickEvent, _, cx| {
                 // Alt-click keeps only this panel open, as in Capture One.
@@ -273,13 +278,14 @@ impl RenderOnce for ToolPanel {
         // Right-click: pin, fold the others, or put this panel on the Quick tab.
         let header = {
             let st = self.state.clone();
-            let quickable = crate::tools::QUICK_PANELS.contains(&id);
+            let quickable = crate::tools::tab_panel(id).is_some();
             header
-                .context_menu(move |menu, _, cx| {
+                .context_menu(move |menu, window, cx| {
                     let s = st.read(cx);
                     let pinned = s.panel_pinned(id);
-                    let quick = s.in_quick(id);
-                    let (a, d, e, f, g) = (st.clone(), st.clone(), st.clone(), st.clone(), st.clone());
+                    let current = s.tool_tab;
+                    let in_current = s.tab_panels(current).iter().any(|p| p == id);
+                    let (d, e, f, g, h) = (st.clone(), st.clone(), st.clone(), st.clone(), st.clone());
                     let menu = menu.item(
                         PopupMenuItem::new(if pinned { crate::i18n::t("Unpin", "取消置顶") } else { crate::i18n::t("Pin to Top", "置顶") })
                             .on_click(move |_, _, cx| g.update(cx, |s, cx| s.toggle_pin(id, cx))),
@@ -287,15 +293,36 @@ impl RenderOnce for ToolPanel {
                     if !quickable {
                         return menu;
                     }
+                    let tabs = st.clone();
                     menu.separator()
                         .item(PopupMenuItem::new(crate::i18n::t("Show Only This Panel  (Alt-click)", "仅展开此面板（Alt+单击）")).on_click(move |_, _, cx| d.update(cx, |s, cx| s.solo_panel(id, cx))))
                         .item(PopupMenuItem::new(crate::i18n::t("Expand All Panels", "展开全部面板")).on_click(move |_, _, cx| e.update(cx, |s, cx| s.set_all_panels(true, cx))))
                         .item(PopupMenuItem::new(crate::i18n::t("Collapse All Panels", "折叠全部面板")).on_click(move |_, _, cx| f.update(cx, |s, cx| s.set_all_panels(false, cx))))
                         .separator()
-                        .item(
-                            PopupMenuItem::new(if quick { crate::i18n::t("Remove from Quick Tab", "从快速页签移除") } else { crate::i18n::t("Add to Quick Tab", "添加到快速页签") })
-                                .on_click(move |_, _, cx| a.update(cx, |s, cx| s.toggle_quick(id, cx))),
-                        )
+                        // Capture One lets any tool go on any tab; here that is
+                        // the Quick tab and the tabs the user made.
+                        .submenu(crate::i18n::t("Add to Tab", "添加到页签"), window, cx, move |mut sub, _, cx| {
+                            let s = tabs.read(cx);
+                            for tab in s.panel_tabs() {
+                                let on = s.tab_panels(tab).iter().any(|p| p == id);
+                                let st = tabs.clone();
+                                sub = sub.item(
+                                    PopupMenuItem::new(s.tab_name(tab))
+                                        .checked(on)
+                                        .on_click(move |_, _, cx| st.update(cx, |s, cx| s.toggle_tab_panel(tab, id, cx))),
+                                );
+                            }
+                            let st = tabs.clone();
+                            sub.separator().item(PopupMenuItem::new(crate::i18n::t("New Tab with This Panel…", "用此面板新建页签…")).on_click(
+                                move |_, window, cx| crate::ui::workspaces::new_tab_dialog(&st, vec![id.to_string()], window, cx),
+                            ))
+                        })
+                        .when(in_current, |m| {
+                            m.item(
+                                PopupMenuItem::new(crate::i18n::t("Remove from This Tab", "从此页签移除"))
+                                    .on_click(move |_, _, cx| h.update(cx, |s, cx| s.toggle_tab_panel(current, id, cx))),
+                            )
+                        })
                 })
                 .into_any_element()
         };
@@ -403,35 +430,93 @@ impl PanelStack {
         let pins = order.iter().take_while(|id| self.state.read(cx).panel_pinned(id)).count();
         let shown: Rc<Vec<&'static str>> = Rc::new(order.clone());
         let mut items = self.items;
+        let drag = self.state.read(cx).panel_drag.clone();
+        let dragging = cx.has_active_drag() && drag.dragged.is_some();
+        // The drop line floats over the gap between panels, so nothing moves
+        // under the pointer while the user looks for the place.
+        let line = move |top: bool| {
+            div()
+                .absolute()
+                .left(px(4.0))
+                .right(px(4.0))
+                .h(px(2.0))
+                .rounded(px(1.0))
+                .bg(p.accent)
+                .when(top, |d| d.top(px(-1.0)))
+                .when(!top, |d| d.bottom(px(-1.0)))
+        };
         let mut col = v_flex().w_full().children(self.head);
         for (i, id) in order.into_iter().enumerate() {
             let Some(at) = items.iter().position(|(n, _)| *n == id) else { continue };
             let (_, el) = items.swap_remove(at);
-            let (st, shown) = (self.state.clone(), shown.clone());
-            col = col.child(
-                div()
-                    .id(SharedString::from(format!("stack-{id}")))
-                    .w_full()
-                    .drag_over::<DraggedPanel>(move |d, _, _, _| d.border_t_2().border_color(p.accent))
-                    .on_drop(move |d: &DraggedPanel, _, cx| st.update(cx, |s, cx| s.move_panel(&shown, d.id, Some(id), cx)))
-                    .child(el),
-            );
+            let (st, st_drop, shown) = (self.state.clone(), self.state.clone(), shown.clone());
+            let source = dragging && drag.dragged == Some(id);
+            let marked = match drag.at {
+                DropAt::Panel(at, after) if dragging && at == id => Some(after),
+                _ => None,
+            };
+            let wrapper = div()
+                .id(SharedString::from(format!("stack-{id}")))
+                .relative()
+                .w_full()
+                .when(source, |d| d.opacity(0.4))
+                .on_drag_move::<DraggedPanel>(move |e, _, cx| {
+                    if e.bounds.contains(&e.event.position) {
+                        let after = e.event.position.y > e.bounds.center().y;
+                        let dragged = e.drag(cx).id;
+                        st.update(cx, |s, cx| s.hover_panel_drop(dragged, DropAt::Panel(id, after), cx));
+                    } else {
+                        st.update(cx, |s, cx| s.leave_panel_drop(|at| matches!(at, DropAt::Panel(p, _) if p == id), cx));
+                    }
+                })
+                .on_drop(move |d: &DraggedPanel, _, cx| {
+                    st_drop.update(cx, |s, cx| {
+                        let after = s.panel_drag.at == DropAt::Panel(id, true);
+                        let before = if after { before_for(&shown, d.id, id, true) } else { Some(id) };
+                        s.drop_panel(&shown, d.id, before, cx)
+                    })
+                })
+                .child(el)
+                .when_some(marked, |d, after| d.child(line(!after)));
+            col = match drag.just_moved {
+                Some((moved, generation)) if moved == id && !dragging => {
+                    use gpui_kit::{Animation, AnimationExt as _, ease_out_quint};
+                    let ms = (360.0 * motion::speed()).max(1.0) as u64;
+                    col.child(wrapper.with_animation(
+                        SharedString::from(format!("stack-moved-{id}-{generation}")),
+                        Animation::new(std::time::Duration::from_millis(ms)).with_easing(ease_out_quint()),
+                        |d, t| d.opacity(0.4 + 0.6 * t),
+                    ))
+                }
+                _ => col.child(wrapper),
+            };
             // A thin accent rule under the last pinned panel marks the pinned group.
             if pins > 0 && i + 1 == pins {
                 col = col.child(div().w_full().h(px(2.0)).bg(p.accent.opacity(0.35)));
             }
         }
-        let (st, st_reset, shown_reset) = (self.state.clone(), self.state.clone(), Rc::new(all));
-        let end = SharedString::from(format!("stack-end-{}", shown.first().copied().unwrap_or("")));
+        let (st, st_hover, st_reset, shown_reset) = (self.state.clone(), self.state.clone(), self.state.clone(), Rc::new(all));
+        let end_key = shown.first().copied().unwrap_or("");
+        let end_marked = dragging && drag.at == DropAt::End(end_key);
+        let end = SharedString::from(format!("stack-end-{end_key}"));
         col.child(
             v_flex()
                 .id(end)
+                .relative()
                 .w_full()
                 .min_h(px(if self.inner { 12.0 } else { 40.0 }))
                 .when(!self.inner, |d| d.pt_2())
                 .items_center()
-                .drag_over::<DraggedPanel>(move |d, _, _, _| d.border_t_2().border_color(p.accent))
-                .on_drop(move |d: &DraggedPanel, _, cx| st.update(cx, |s, cx| s.move_panel(&shown, d.id, None, cx)))
+                .on_drag_move::<DraggedPanel>(move |e, _, cx| {
+                    if e.bounds.contains(&e.event.position) {
+                        let dragged = e.drag(cx).id;
+                        st_hover.update(cx, |s, cx| s.hover_panel_drop(dragged, DropAt::End(end_key), cx));
+                    } else {
+                        st_hover.update(cx, |s, cx| s.leave_panel_drop(|at| at == DropAt::End(end_key), cx));
+                    }
+                })
+                .on_drop(move |d: &DraggedPanel, _, cx| st.update(cx, |s, cx| s.drop_panel(&shown, d.id, None, cx)))
+                .when(end_marked, |d| d.child(line(true)))
                 .when(custom, |d| {
                     d.child(
                         h_flex()

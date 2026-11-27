@@ -71,6 +71,17 @@ impl CropGuide {
     }
 }
 
+/// A tool tab the user made and filled with panels from the other tabs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserTab {
+    /// Stable within the workspace; the tab's id is `User<key>`.
+    pub key: u8,
+    pub name: String,
+    /// Panel ids, top to bottom.
+    pub panels: Vec<String>,
+}
+
 /// One arrangement of the window: where the tools are, which tabs show, which
 /// browser, and how large things are.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,6 +102,10 @@ pub struct WorkspaceLayout {
     pub panel_order: BTreeMap<String, Vec<String>>,
     /// Panels pinned to the top of every tab that shows them, in pin order.
     pub pinned_panels: Vec<String>,
+    /// The user's own tool tabs, in the order they were made.
+    pub user_tabs: Vec<UserTab>,
+    /// The tab strip shows each tab's name under its icon.
+    pub tab_labels: bool,
     pub tab: String,
     pub inspector_width: f32,
     pub filmstrip_height: f32,
@@ -110,6 +125,8 @@ impl Default for WorkspaceLayout {
             quick_tools: ["wb", "exposure", "hdr", "clarity"].map(String::from).to_vec(),
             panel_order: Default::default(),
             pinned_panels: Vec::new(),
+            user_tabs: Vec::new(),
+            tab_labels: false,
             tab: "Exposure".into(),
             inspector_width: 320.0,
             filmstrip_height: 132.0,
@@ -137,7 +154,10 @@ pub fn browser_from(name: &str) -> BrowserMode {
 }
 
 pub fn tab_id(tab: ToolTab) -> String {
-    format!("{tab:?}")
+    match tab {
+        ToolTab::User(key) => format!("User{key}"),
+        _ => format!("{tab:?}"),
+    }
 }
 
 /// ICC profiles installed for displays on this system, by file name.
@@ -648,16 +668,18 @@ mod mac_display {
     }
 }
 
-/// Where the tabs sit before the user moves them: Quick after Capture, as in Capture One.
+/// Where the tabs sit before the user moves them, in the order a shot is
+/// worked on and as Capture One lays them out: find it, frame it, adjust it,
+/// retouch it, look at the detail, then describe and deliver it.
 pub fn default_tab_order() -> Vec<ToolTab> {
-    let mut order: Vec<ToolTab> = ToolTab::ALL.into_iter().filter(|t| *t != ToolTab::Quick).collect();
-    order.insert(2, ToolTab::Quick);
-    order
+    use ToolTab::*;
+    vec![Library, Capture, Quick, Lens, Grading, Adjustments, Portrait, Details, Metadata, Output, Batch]
 }
 
 pub fn tab_from(id: &str) -> Option<ToolTab> {
     match id {
         "Color" | "Exposure" | "Layers" => Some(ToolTab::Grading),
+        _ if id.starts_with("User") => id[4..].parse().ok().map(ToolTab::User),
         _ => ToolTab::ALL.into_iter().find(|t| tab_id(*t) == id),
     }
 }
@@ -934,7 +956,17 @@ mod tab_tests {
         assert_eq!(order.len(), ToolTab::ALL.len());
         assert_eq!(order[2], ToolTab::Quick);
         assert!(ToolTab::ALL.iter().all(|t| order.contains(t)));
-        assert_eq!(*ToolTab::ALL.last().unwrap(), ToolTab::Quick, "Ctrl+1…9 keep their tabs");
+    }
+
+    #[test]
+    fn user_tab_ids_round_trip() {
+        assert_eq!(tab_id(ToolTab::User(3)), "User3");
+        assert_eq!(tab_from("User3"), Some(ToolTab::User(3)));
+        assert_eq!(tab_from("Userx"), None);
+        assert_eq!(tab_from("Grading"), Some(ToolTab::Grading));
+        // Layouts saved before user tabs existed still load.
+        let old: WorkspaceLayout = serde_json::from_str(r#"{"name":"Old","hidden_tabs":["Portrait"]}"#).unwrap();
+        assert!(old.user_tabs.is_empty() && !old.tab_labels);
     }
 
     #[test]

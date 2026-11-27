@@ -25,21 +25,21 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
             .panel("mask-color", layers::color_range_panel(state, l, cx))
             .panel("brush", layers::brush_panel(state, cx));
     }
+    // Capture One's Adjust order: color balance of the shot first (base
+    // characteristics, white balance), then tone, then color, then local contrast.
     stack
-        // Exposure & Tone
+        .panel_when(global, "base", || color::base_panel(state, cx).into_any_element())
+        .panel("wb", color::white_balance_panel(state, scope, cx))
         .panel("exposure", exposure::exposure_panel(state, scope, cx))
         .panel("hdr", exposure::hdr_panel(state, scope, cx))
         .panel("levels", exposure::levels_panel(state, scope, window, cx))
         .panel("curve", exposure::curve_panel(state, scope, cx))
+        .panel("color-editor", color::color_editor_panel(state, scope, cx))
+        .panel("color-balance", color::color_balance_panel(state, scope, cx))
+        .panel_when(global, "bw", || color::black_white_panel(state, cx).into_any_element())
         .panel("clarity", exposure::clarity_panel(state, scope, cx))
         .panel("dehaze", exposure::dehaze_panel(state, scope, cx))
         .panel_when(global, "vignetting", || exposure::vignetting_panel(state, cx).into_any_element())
-        // Color
-        .panel_when(global, "base", || color::base_panel(state, cx).into_any_element())
-        .panel("wb", color::white_balance_panel(state, scope, cx))
-        .panel("color-balance", color::color_balance_panel(state, scope, cx))
-        .panel("color-editor", color::color_editor_panel(state, scope, cx))
-        .panel_when(global, "bw", || color::black_white_panel(state, cx).into_any_element())
         .panel("readout", color::readout_panel(state, cx))
         .render(cx)
 }

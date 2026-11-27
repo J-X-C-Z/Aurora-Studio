@@ -566,9 +566,10 @@ impl PrefsView {
         let builtin = crate::state::builtin_workspaces().len();
         let active = s.prefs.settings.workspace.name.clone();
         let right = s.prefs.view.inspector_right;
-        let hidden: Vec<ToolTab> = ToolTab::ALL.into_iter().filter(|t| s.tab_hidden(*t)).collect();
+        let tabs: Vec<(ToolTab, SharedString, bool)> = s.tab_order().into_iter().map(|t| (t, s.tab_name(t), !s.tab_hidden(t))).collect();
+        let labels = s.prefs.settings.workspace.tab_labels;
         let this = cx.entity();
-        let t_side = this.clone();
+        let (t_side, t_labels) = (this.clone(), this.clone());
         v_flex()
             .child(caption(t("Workspaces", "工作区"), cx))
             .children(list.into_iter().enumerate().map(|(i, w)| {
@@ -586,7 +587,7 @@ impl PrefsView {
                     .hover(|d| d.bg(p.hover))
                     .child(Icon::new(if i < builtin { IconName::LayoutPanelLeft } else { IconName::Bookmark }).small().text_color(if is_active { p.accent } else { p.text_subtle }))
                     .child(div().flex_1().text_sm().child(w.name.clone()))
-                    .child(div().text_xs().text_color(p.text_subtle).child(format!("{} {}", ToolTab::ALL.len() - w.hidden_tabs.len(), t("tabs", "个页签"))))
+                    .child(div().text_xs().text_color(p.text_subtle).child(format!("{} {}", (ToolTab::ALL.len() + w.user_tabs.len()).saturating_sub(w.hidden_tabs.len()), t("tabs", "个页签"))))
                     .child(Button::new(SharedString::from(format!("pref-ws-apply-{i}"))).xsmall().ghost().label(t("Use", "使用")).on_click(move |_, _, cx| {
                         ta.update(cx, |v, cx| {
                             v.state.update(cx, |s, cx| s.apply_workspace(i, cx));
@@ -617,9 +618,18 @@ impl PrefsView {
                 }),
                 cx,
             ))
+            .child(row(
+                t("Tab strip", "页签栏"),
+                Segmented::new("pref-tab-labels", if labels { 1 } else { 0 }).text(t("Icons", "仅图标")).text(t("Icons and names", "图标与名称")).on_select(move |i, _, cx| {
+                    t_labels.update(cx, |v, cx| {
+                        v.state.update(cx, |s, cx| s.set_tab_labels(i == 1, cx));
+                        cx.notify();
+                    })
+                }),
+                cx,
+            ))
             .child(caption(t("Tool tabs in this workspace", "此工作区显示的页签"), cx))
-            .child(h_flex().px_3().flex_wrap().gap_1p5().children(ToolTab::ALL.into_iter().map(|tab| {
-                let shown = !hidden.contains(&tab);
+            .child(h_flex().px_3().flex_wrap().gap_1p5().children(tabs.into_iter().map(|(tab, name, shown)| {
                 let th = this.clone();
                 h_flex()
                     .id(SharedString::from(format!("pref-tab-{tab:?}")))
@@ -640,9 +650,12 @@ impl PrefsView {
                         })
                     })
                     .child(Icon::new(tab.icon()).xsmall())
-                    .child(tab.label())
+                    .child(name)
             })))
-            .child(note(t("Right-click the tab strip to change this from the workspace.", "也可以在页签栏上右键修改。"), cx))
+            .child(note(t(
+                "Right-click the tab strip to show or hide tabs, make a tab of your own, or rename it. Drag a tool panel by its title onto the Quick tab or your own tab to add it there.",
+                "在页签栏上右键可显示/隐藏页签、新建或重命名自己的页签；把工具面板的标题拖到“快速”或自建页签的图标上即可加入该页签。",
+            ), cx))
             .into_any_element()
     }
 

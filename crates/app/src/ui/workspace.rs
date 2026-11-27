@@ -74,7 +74,7 @@ pub struct Workspace {
     notice_serial: u64,
     /// The latest notice went to a notification card, so the viewer HUD skips it.
     notice_carded: bool,
-    menu_key: Option<(bool, Vec<String>, Vec<String>)>,
+    menu_key: Option<(bool, bool, Vec<String>, Vec<String>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -94,7 +94,8 @@ impl Workspace {
         let browser = cx.new(|cx| Browser::new(&state, window, cx));
         let menu_bar = AppMenuBar::new(cx);
         let names = Self::workspace_names(&state, cx);
-        install_menus(&menu_bar, &names, &Self::recent_names(&state, cx), cx);
+        let welcome = state.read(cx).welcome;
+        install_menus(&menu_bar, &names, &Self::recent_names(&state, cx), welcome, cx);
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         cx.set_global(WorkspaceFocus(focus.clone()));
@@ -193,8 +194,9 @@ impl Workspace {
                 let needs_menu_check = {
                     let s = state.read(cx);
                     match this.menu_key.as_ref() {
-                        Some((prev_zh, prev_ws, prev_rec)) => {
+                        Some((prev_zh, prev_welcome, prev_ws, prev_rec)) => {
                             *prev_zh != zh
+                                || *prev_welcome != s.welcome
                                 || prev_rec.len() != s.prefs.settings.recent.len()
                                 || prev_ws.len() != s.workspace_list().len()
                         }
@@ -204,10 +206,11 @@ impl Workspace {
                 if needs_menu_check {
                     let names = Self::workspace_names(&state, cx);
                     let recent = Self::recent_names(&state, cx);
-                    let key = (zh, names.clone(), recent.clone());
+                    let welcome = state.read(cx).welcome;
+                    let key = (zh, welcome, names.clone(), recent.clone());
                     if this.menu_key.as_ref() != Some(&key) {
                         this.menu_key = Some(key);
-                        install_menus(&this.menu_bar, &names, &recent, cx);
+                        install_menus(&this.menu_bar, &names, &recent, welcome, cx);
                     }
                 }
                 cx.notify()
@@ -521,6 +524,14 @@ impl Workspace {
                     }
                 })
             }))
+            .on_action(cx.listener(|this, a: &SelectNthTab, _, cx| {
+                this.with_state(cx, |s, cx| {
+                    if let Some(tab) = s.visible_tabs().get(a.0) {
+                        s.tool_tab = *tab;
+                        cx.notify();
+                    }
+                })
+            }))
             .on_action(cx.listener(|this, a: &SelectToolTab, _, cx| {
                 this.with_state(cx, |s, cx| {
                     if let Some(tab) = ToolTab::ALL.get(a.0) {
@@ -610,7 +621,8 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &ToggleLanguage, window, cx| {
                 i18n::set_locale(if i18n::locale() == i18n::Locale::ZhCn { i18n::Locale::En } else { i18n::Locale::ZhCn });
                 let names = Self::workspace_names(&this.state, cx);
-                install_menus(&this.menu_bar, &names, &Self::recent_names(&this.state, cx), cx);
+                let welcome = this.state.read(cx).welcome;
+                install_menus(&this.menu_bar, &names, &Self::recent_names(&this.state, cx), welcome, cx);
                 window.refresh();
             }))
     }
@@ -853,7 +865,8 @@ impl Render for Workspace {
                     )
                 }
             })
-            .when(!showing, |d| d.child(statusbar::status_bar(&self.state, notice, self.notice_serial, window, cx)));
+            // The welcome page has nothing for the status bar to report.
+            .when(!showing && !welcome, |d| d.child(statusbar::status_bar(&self.state, notice, self.notice_serial, window, cx)));
         // Finder file drops reach GPUI as an `ExternalPaths` drag
         // (gpui-pre-macos forwards the platform file URLs); import them.
         #[cfg(target_os = "macos")]

@@ -17,6 +17,17 @@ use crate::state::{AppState, ClipGroup, HoverLook};
 use crate::theme::pal;
 use crate::widgets::*;
 
+/// One panel of this tab by id, for the Quick and user tabs.
+pub fn panel(id: &str, state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    match id {
+        "user-styles" => Some(user_styles_panel(state, cx).into_any_element()),
+        "styles" => Some(styles_panel(state, cx).into_any_element()),
+        "clipboard" => Some(clipboard_panel(state, cx).into_any_element()),
+        "history" => Some(history_panel(state, cx).into_any_element()),
+        _ => None,
+    }
+}
+
 pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyElement {
     PanelStack::new(state)
         .panel("user-styles", user_styles_panel(state, cx))

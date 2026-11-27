@@ -241,8 +241,11 @@ fn cell(
     let (st_drop, st_badge, st_menu) = (state.clone(), state.clone(), state.clone());
     let accent = p.accent;
 
+    // Small cells cut long names short; the full name shows on hover.
+    let tip_name = name.clone();
     v_flex()
         .id(SharedString::from(format!("thumb-{}", id.0)))
+        .tooltip(move |window, cx| Tooltip::new(tip_name.clone()).build(window, cx))
         // Dropping images here puts them in front of this one (custom order).
         .drag_over::<crate::ui::collections::DraggedImages>(move |d, _, _, _| d.border_l_2().border_color(accent))
         .on_drop(move |d: &crate::ui::collections::DraggedImages, _, cx| {
@@ -257,9 +260,13 @@ fn cell(
         .cursor_pointer()
         .bg(p.accent_soft.opacity(p.accent_soft.a * sel_t).blend(p.pressed.opacity(p.pressed.a * cur_t)))
         .hover(|d| d.bg(p.hover))
-        .on_drag(crate::ui::collections::DraggedImages(dragged), |d, _, _, cx| {
-            let count = d.0.len();
-            cx.new(|_| crate::ui::collections::DragCard { count })
+        .on_drag(crate::ui::collections::DraggedImages(dragged), {
+            let st = state.clone();
+            move |d, _, _, cx| {
+                st.update(cx, |s, cx| s.start_drag(None, cx));
+                let count = d.0.len();
+                cx.new(|_| crate::ui::collections::DragCard { count })
+            }
         })
         .on_click(move |e: &ClickEvent, _, cx| {
             let m = e.modifiers();
@@ -382,21 +389,41 @@ fn cell(
                     )
                 }),
         )
-        .child(
-            h_flex()
-                .h(px(12.0))
-                .justify_center()
+        // Only a rating that was given shows: five empty stars under every
+        // unrated frame read as noise. Rejected frames show a red cross.
+        .child({
+            let marks = h_flex()
+                .flex_shrink_0()
                 .gap(px(1.0))
-                .text_xs()
                 .when(rating < 0, |d| d.text_color(p.danger).child(Icon::new(IconName::X).xsmall()))
-                .when(rating >= 0, |d| {
-                    d.children((1..=5).map(|i| {
-                        div().text_color(if i <= rating { p.warning } else { p.text_disabled.opacity(0.6) }).child(Icon::new(IconName::Star).size(px(9.0)))
-                    }))
-                }),
-        )
-        .when(with_name, |d| {
-            d.child(div().w_full().text_xs().text_color(if current { p.text } else { p.text_muted }).text_center().overflow_hidden().whitespace_nowrap().text_ellipsis().child(name))
+                .when(rating > 0, |d| {
+                    // One star and the count, so the file name keeps the room.
+                    d.items_center()
+                        .text_color(p.warning)
+                        .text_size(px(10.0))
+                        .child(Icon::new(IconName::Star).size(px(9.0)))
+                        .child(format!("{rating}"))
+                });
+            let label = div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(10.0))
+                .text_color(if current { p.text } else { p.text_muted })
+                .child(name);
+            if with_name {
+                // Grid: the rating line keeps its height so rows stay even, the name under it.
+                v_flex()
+                    .w_full()
+                    .gap_0p5()
+                    .child(h_flex().h(px(12.0)).justify_center().child(marks))
+                    .child(label.w_full().text_center())
+                    .into_any_element()
+            } else {
+                // Filmstrip: the name and the rating share one line, as in Capture One.
+                h_flex().h(px(12.0)).w_full().gap_1().px_0p5().child(label.flex_1()).child(marks).into_any_element()
+            }
         })
         .context_menu(move |menu, _, cx| {
             let s = st_menu.read(cx);

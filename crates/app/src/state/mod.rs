@@ -13,7 +13,7 @@ mod settings;
 mod settings_state;
 mod source;
 mod arrange;
-mod panel_order;
+pub(crate) mod panel_order;
 mod speed;
 mod show;
 mod nodes;
@@ -71,6 +71,8 @@ pub enum ToolTab {
     Batch,
     /// The user's own selection of tool panels (Capture One's Quick tab).
     Quick,
+    /// A tab the user made, by its key in the workspace's `user_tabs`.
+    User(u8),
 }
 
 impl ToolTab {
@@ -94,14 +96,15 @@ impl ToolTab {
             ToolTab::Library => t("Library", "图库"),
             ToolTab::Capture => t("Capture", "拍摄"),
             ToolTab::Lens => t("Lens", "镜头"),
-            ToolTab::Grading => t("Grading", "调色"),
+            ToolTab::Grading => t("Adjust", "调整"),
             ToolTab::Details => t("Details", "细节"),
             ToolTab::Portrait => t("Portrait", "人像"),
-            ToolTab::Adjustments => t("Adjustments", "调整"),
+            ToolTab::Adjustments => t("Styles", "风格"),
             ToolTab::Metadata => t("Metadata", "元数据"),
             ToolTab::Output => t("Output", "输出"),
             ToolTab::Batch => t("Batch", "批处理"),
             ToolTab::Quick => t("Quick", "快速"),
+            ToolTab::User(_) => t("Custom", "自定义"),
         }
     }
 
@@ -111,20 +114,16 @@ impl ToolTab {
             ToolTab::Library => I::LibraryBig,
             ToolTab::Capture => I::Camera,
             ToolTab::Lens => I::Aperture,
-            ToolTab::Grading => I::Palette,
-            ToolTab::Details => I::ScanSearch,
+            ToolTab::Grading => I::SlidersHorizontal,
+            ToolTab::Details => I::Focus,
             ToolTab::Portrait => I::ScanFace,
-            ToolTab::Adjustments => I::SlidersHorizontal,
+            ToolTab::Adjustments => I::SwatchBook,
             ToolTab::Metadata => I::Info,
             ToolTab::Output => I::Upload,
             ToolTab::Batch => I::ListChecks,
             ToolTab::Quick => I::Bookmark,
+            ToolTab::User(_) => I::PanelsTopLeft,
         }
-    }
-
-    pub fn shortcut(self) -> Option<&'static str> {
-        let i = ToolTab::ALL.iter().position(|t| *t == self)?;
-        ["ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6", "ctrl-7", "ctrl-8", "ctrl-9"].get(i).copied()
     }
 }
 
@@ -563,6 +562,8 @@ pub struct AppState {
     /// The welcome screen covers the demo images until one is opened or the
     /// user chooses to look at the demo.
     pub welcome: bool,
+    /// Where a dragged tool panel would land, for the drop indicator.
+    pub panel_drag: panel_order::PanelDrag,
     /// A folder or catalog being opened from the welcome screen.
     pub opening: Option<std::path::PathBuf>,
     /// Why the last open failed, shown on the welcome screen.
@@ -661,7 +662,10 @@ impl AppState {
             sort: SortKey::Name,
             sort_desc: false,
             editor: EditorState::with_edits(edits),
-            tool_tab: tab_from(&settings.workspace.tab).unwrap_or(ToolTab::Grading),
+            // A saved tab of the user's own that no longer exists falls back too.
+            tool_tab: tab_from(&settings.workspace.tab)
+                .filter(|t| !matches!(t, ToolTab::User(k) if !settings.workspace.user_tabs.iter().any(|u| u.key == *k)))
+                .unwrap_or(ToolTab::Grading),
             cursor: CursorTool::Select,
             prefs: SettingsState::from_parts(engine_name, capabilities, settings),
             // Trust `tether_status` first: mock/imaging-only devices may report
@@ -683,6 +687,7 @@ impl AppState {
             c1_save_warnings: Vec::new(),
             c1_save_busy: false,
             welcome: source == Source::Demo,
+            panel_drag: Default::default(),
             source,
             opening: None,
             open_error: None,
@@ -2055,6 +2060,8 @@ impl AppState {
             quick_tools: self.prefs.settings.workspace.quick_tools.clone(),
             panel_order: self.prefs.settings.workspace.panel_order.clone(),
             pinned_panels: self.prefs.settings.workspace.pinned_panels.clone(),
+            user_tabs: self.prefs.settings.workspace.user_tabs.clone(),
+            tab_labels: self.prefs.settings.workspace.tab_labels,
             tab: tab_id(self.tool_tab),
             inspector_width: self.prefs.view.inspector_width,
             filmstrip_height: self.prefs.view.filmstrip_height,
@@ -2073,7 +2080,8 @@ impl AppState {
         if let Some(tab) = tab_from(&l.tab) {
             self.tool_tab = tab;
         }
-        if self.tab_hidden(self.tool_tab) {
+        // The tab may be one of the user's own that this layout does not have.
+        if self.tab_hidden(self.tool_tab) || !self.tab_exists(self.tool_tab) {
             self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Grading);
         }
     }
@@ -2122,7 +2130,7 @@ impl AppState {
     pub fn tab_order(&self) -> Vec<ToolTab> {
         let mut order: Vec<ToolTab> = Vec::new();
         for tab in self.prefs.settings.workspace.tab_order.iter().filter_map(|id| tab_from(id)) {
-            if !order.contains(&tab) {
+            if !order.contains(&tab) && self.tab_exists(tab) {
                 order.push(tab);
             }
         }
@@ -2131,7 +2139,127 @@ impl AppState {
                 order.insert(i.min(order.len()), tab);
             }
         }
+        // The user's tabs the saved order does not name yet go last.
+        for u in &self.prefs.settings.workspace.user_tabs {
+            if !order.contains(&ToolTab::User(u.key)) {
+                order.push(ToolTab::User(u.key));
+            }
+        }
         order
+    }
+
+    fn tab_exists(&self, tab: ToolTab) -> bool {
+        match tab {
+            ToolTab::User(key) => self.user_tab(key).is_some(),
+            _ => true,
+        }
+    }
+
+    pub fn user_tab(&self, key: u8) -> Option<&UserTab> {
+        self.prefs.settings.workspace.user_tabs.iter().find(|u| u.key == key)
+    }
+
+    /// The name the strip and the inspector header show; the user's own for their tabs.
+    pub fn tab_name(&self, tab: ToolTab) -> SharedString {
+        match tab {
+            ToolTab::User(key) => self.user_tab(key).map_or_else(|| tab.label().into(), |u| u.name.clone().into()),
+            _ => tab.label().into(),
+        }
+    }
+
+    /// Tabs that hold a list of panels the user chose: Quick and their own.
+    pub fn panel_tabs(&self) -> Vec<ToolTab> {
+        std::iter::once(ToolTab::Quick).chain(self.prefs.settings.workspace.user_tabs.iter().map(|u| ToolTab::User(u.key))).collect()
+    }
+
+    /// The panel ids a Quick or user tab holds, top to bottom.
+    pub fn tab_panels(&self, tab: ToolTab) -> Vec<String> {
+        match tab {
+            ToolTab::Quick => self.prefs.settings.workspace.quick_tools.clone(),
+            ToolTab::User(key) => self.user_tab(key).map(|u| u.panels.clone()).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn tab_panels_mut(&mut self, tab: ToolTab) -> Option<&mut Vec<String>> {
+        let w = &mut self.prefs.settings.workspace;
+        match tab {
+            ToolTab::Quick => Some(&mut w.quick_tools),
+            ToolTab::User(key) => w.user_tabs.iter_mut().find(|u| u.key == key).map(|u| &mut u.panels),
+            _ => None,
+        }
+    }
+
+    /// Puts a tool panel on a Quick or user tab, or takes it off.
+    pub fn toggle_tab_panel(&mut self, tab: ToolTab, panel: &str, cx: &mut Context<Self>) {
+        let Some(list) = self.tab_panels_mut(tab) else { return };
+        let added = match list.iter().position(|p| p == panel) {
+            Some(i) => {
+                list.remove(i);
+                false
+            }
+            None => {
+                list.push(panel.to_string());
+                true
+            }
+        };
+        if added && self.tab_hidden(tab) {
+            self.set_tab_hidden(tab, false, cx);
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Adds a panel dropped on a tab in the strip; a no-op for built-in tabs.
+    pub fn add_tab_panel(&mut self, tab: ToolTab, panel: &str, cx: &mut Context<Self>) {
+        if crate::tools::tab_panel(panel).is_none() {
+            return;
+        }
+        if self.tab_panels_mut(tab).is_some_and(|l| !l.iter().any(|p| p == panel)) {
+            self.toggle_tab_panel(tab, panel, cx);
+            self.notify(format!("{} · {}", t("Added to tab", "已添加到页签"), self.tab_name(tab)), cx);
+        }
+    }
+
+    /// Makes an empty tab of the user's own, selects it and returns it.
+    pub fn new_user_tab(&mut self, name: String, panels: Vec<String>, cx: &mut Context<Self>) -> Option<ToolTab> {
+        let w = &mut self.prefs.settings.workspace;
+        let key = (0..=u8::MAX).find(|k| !w.user_tabs.iter().any(|u| u.key == *k))?;
+        w.user_tabs.push(UserTab { key, name, panels });
+        let tab = ToolTab::User(key);
+        self.tool_tab = tab;
+        self.save_settings();
+        cx.notify();
+        Some(tab)
+    }
+
+    pub fn rename_user_tab(&mut self, key: u8, name: String, cx: &mut Context<Self>) {
+        if let Some(u) = self.prefs.settings.workspace.user_tabs.iter_mut().find(|u| u.key == key) {
+            u.name = name;
+            self.save_settings();
+            cx.notify();
+        }
+    }
+
+    /// Removes a tab of the user's own along with its place, visibility and panel order.
+    pub fn delete_user_tab(&mut self, key: u8, cx: &mut Context<Self>) {
+        let id = tab_id(ToolTab::User(key));
+        let w = &mut self.prefs.settings.workspace;
+        w.user_tabs.retain(|u| u.key != key);
+        w.tab_order.retain(|t| *t != id);
+        w.hidden_tabs.retain(|t| *t != id);
+        w.panel_order.remove(&id);
+        if self.tool_tab == ToolTab::User(key) {
+            self.tool_tab = self.visible_tabs().first().copied().unwrap_or(ToolTab::Grading);
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub fn set_tab_labels(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.prefs.settings.workspace.tab_labels = on;
+        self.save_settings();
+        cx.notify();
     }
 
     /// Moves `tab` in front of `before` (to the end with `None`).
@@ -2144,25 +2272,6 @@ impl AppState {
         let at = before.and_then(|b| order.iter().position(|t| *t == b)).unwrap_or(order.len());
         order.insert(at, tab);
         self.prefs.settings.workspace.tab_order = order.into_iter().map(tab_id).collect();
-        self.save_settings();
-        cx.notify();
-    }
-
-    pub fn in_quick(&self, panel: &str) -> bool {
-        self.prefs.settings.workspace.quick_tools.iter().any(|p| p == panel)
-    }
-
-    /// Adds a tool panel to the Quick tab, or takes it off.
-    pub fn toggle_quick(&mut self, panel: &str, cx: &mut Context<Self>) {
-        let tools = &mut self.prefs.settings.workspace.quick_tools;
-        if let Some(i) = tools.iter().position(|p| p == panel) {
-            tools.remove(i);
-        } else {
-            tools.push(panel.to_string());
-            if self.tab_hidden(ToolTab::Quick) {
-                self.set_tab_hidden(ToolTab::Quick, false, cx);
-            }
-        }
         self.save_settings();
         cx.notify();
     }

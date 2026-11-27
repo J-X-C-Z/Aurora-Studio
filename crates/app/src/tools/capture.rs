@@ -15,6 +15,17 @@ use crate::state::AppState;
 use crate::theme::pal;
 use crate::widgets::*;
 
+/// One panel of this tab by id, for the Quick and user tabs.
+pub fn panel(id: &str, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    match id {
+        "camera" => Some(camera_panel(state, cx)),
+        "camera-settings" => Some(settings_panel(state, cx).into_any_element()),
+        "capture-naming" => Some(naming_panel(state, window, cx).into_any_element()),
+        "capture-adjust" => Some(adjust_panel(state, cx).into_any_element()),
+        _ => None,
+    }
+}
+
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     PanelStack::new(state)
         .panel("camera", camera_panel(state, cx))

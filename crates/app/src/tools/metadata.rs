@@ -20,6 +20,25 @@ use crate::state::AppState;
 use crate::theme::{hex, pal};
 use crate::widgets::*;
 
+/// One panel of this tab by id, for the Quick and user tabs.
+pub fn panel(id: &str, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    if id == "metadata-presets" {
+        return Some(presets_panel(state, cx).into_any_element());
+    }
+    if !matches!(id, "rating" | "file" | "exif" | "iptc" | "keywords") {
+        return None;
+    }
+    // The other metadata panels describe the current image; without one they have nothing to show.
+    let info = state.read(cx).current_info().cloned()?;
+    Some(match id {
+        "rating" => rating_panel(state, &info, cx).into_any_element(),
+        "file" => file_panel(state, &info, cx).into_any_element(),
+        "exif" => exif_panel(state, &info, cx).into_any_element(),
+        "iptc" => iptc_panel(state, &info, window, cx).into_any_element(),
+        _ => keywords_panel(state, &info, window, cx).into_any_element(),
+    })
+}
+
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let Some(info) = state.read(cx).current_info().cloned() else {
         return div()

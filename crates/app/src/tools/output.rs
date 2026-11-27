@@ -18,6 +18,16 @@ use crate::state::AppState;
 use crate::theme::pal;
 use crate::widgets::*;
 
+/// One panel of this tab by id, for the Quick and user tabs.
+pub fn panel(id: &str, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    match id {
+        "recipes" => Some(recipes_panel(state, cx).into_any_element()),
+        "recipe" => Some(recipe_panel(state, window, cx).into_any_element()),
+        "summary" => Some(summary_panel(state, cx).into_any_element()),
+        _ => None,
+    }
+}
+
 pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     PanelStack::new(state)
         .panel("recipes", recipes_panel(state, cx))

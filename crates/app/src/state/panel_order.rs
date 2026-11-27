@@ -7,6 +7,40 @@ use gpui_kit::Context;
 use super::{AppState, ToolTab, tab_id};
 use crate::i18n::t;
 
+/// Where a dragged tool panel would land if it were let go now.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DropAt {
+    /// Over nothing that takes it: no line shows.
+    #[default]
+    Nowhere,
+    /// Against a panel; `true` puts it under that panel rather than over it.
+    Panel(&'static str, bool),
+    /// The space under a stack, keyed by the stack's first panel.
+    End(&'static str),
+    /// A tab in the strip that takes panels (Quick or the user's own).
+    Tab(ToolTab),
+}
+
+/// The panel being dragged and where it would land, shown as a line that
+/// does not move the panels around it. `just_moved` lets the dropped panel
+/// fade into its new place once.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PanelDrag {
+    pub dragged: Option<&'static str>,
+    pub at: DropAt,
+    pub just_moved: Option<(&'static str, u64)>,
+}
+
+/// The panel a drop `after` `target` goes in front of: the next one shown that
+/// is not the dragged panel itself, or `None` for the end.
+pub fn before_for(shown: &[&'static str], moved: &str, target: &'static str, after: bool) -> Option<&'static str> {
+    if !after {
+        return Some(target);
+    }
+    let at = shown.iter().position(|s| *s == target)?;
+    shown[at + 1..].iter().copied().find(|s| *s != moved)
+}
+
 /// `natural` (the tab's built-in order) rearranged by `saved`: panels the saved
 /// list names come in its order, panels it does not name keep their built-in
 /// index, and pinned panels then move to the front in pin order.
@@ -74,6 +108,50 @@ impl AppState {
         arrange(natural, saved, &w.pinned_panels)
     }
 
+    /// Records where the dragged panel would land; repaints only when that changes.
+    pub fn hover_panel_drop(&mut self, dragged: &'static str, at: DropAt, cx: &mut Context<Self>) {
+        let d = &mut self.panel_drag;
+        if d.dragged != Some(dragged) || d.at != at {
+            d.dragged = Some(dragged);
+            d.at = at;
+            cx.notify();
+        }
+    }
+
+    /// A drag began: a tool panel (`Some`) or anything else (`None`). A drag
+    /// that ended away from every drop place leaves its panel and place
+    /// behind; this keeps them from dimming a panel or lighting a tab during
+    /// the next drag.
+    pub fn start_drag(&mut self, panel: Option<&'static str>, cx: &mut Context<Self>) {
+        let d = &mut self.panel_drag;
+        if d.dragged != panel || d.at != DropAt::Nowhere {
+            d.dragged = panel;
+            d.at = DropAt::Nowhere;
+            cx.notify();
+        }
+    }
+
+    /// The pointer left a drop place: clears it if it is still the recorded one,
+    /// so a line never lingers where the panel would not go.
+    pub fn leave_panel_drop(&mut self, left: impl Fn(DropAt) -> bool, cx: &mut Context<Self>) {
+        if left(self.panel_drag.at) {
+            self.panel_drag.at = DropAt::Nowhere;
+            cx.notify();
+        }
+    }
+
+    /// Drops the dragged panel in front of `before` (`None`: the end) and
+    /// lets it fade into its new place.
+    pub fn drop_panel(&mut self, shown: &[&'static str], moved: &'static str, before: Option<&'static str>, cx: &mut Context<Self>) {
+        let generation = self.panel_drag.just_moved.map_or(1, |(_, g)| g + 1);
+        self.panel_drag = PanelDrag { just_moved: Some((moved, generation)), ..Default::default() };
+        if before == Some(moved) {
+            cx.notify();
+            return;
+        }
+        self.move_panel(shown, moved, before, cx);
+    }
+
     /// Drops `moved` in front of `before` in the current tab, `shown` being
     /// what the tab showed when the drag ended. A panel dragged among pinned
     /// ones is pinned; one dragged below them is unpinned.
@@ -93,11 +171,13 @@ impl AppState {
         let others: Vec<String> = w.pinned_panels.iter().filter(|p| !order.contains(&p.as_str())).cloned().collect();
         w.pinned_panels = others.into_iter().chain(pins).collect();
         let ids: Vec<String> = order.iter().map(|o| o.to_string()).collect();
-        if self.tool_tab == ToolTab::Quick {
-            // The Quick tab's list is its order; keep panels it shows elsewhere.
-            let rest: Vec<String> = w.quick_tools.iter().filter(|q| !ids.contains(q)).cloned().collect();
-            w.quick_tools = ids.into_iter().chain(rest).collect();
+        let tab = self.tool_tab;
+        if let Some(list) = self.tab_panels_mut(tab) {
+            // A Quick or user tab's list is its order; keep panels it shows elsewhere.
+            let rest: Vec<String> = list.iter().filter(|q| !ids.contains(q)).cloned().collect();
+            *list = ids.into_iter().chain(rest).collect();
         } else {
+            let w = &mut self.prefs.settings.workspace;
             // Panels this stack does not show (another section, another scope)
             // keep their saved places behind it.
             let key = tab_id(self.tool_tab);
@@ -153,6 +233,15 @@ mod tests {
     #[test]
     fn pinned_panels_lead_in_pin_order() {
         assert_eq!(arrange(&N, &s(&["d", "c", "b", "a"]), &s(&["b", "x", "c"])), ["b", "c", "d", "a"]);
+    }
+
+    #[test]
+    fn drop_after_a_panel_goes_in_front_of_the_next_one() {
+        assert_eq!(before_for(&N, "a", "b", false), Some("b"));
+        assert_eq!(before_for(&N, "a", "b", true), Some("c"));
+        assert_eq!(before_for(&N, "c", "b", true), Some("d"), "skips the dragged panel");
+        assert_eq!(before_for(&N, "a", "d", true), None, "after the last: the end");
+        assert_eq!(before_for(&N, "d", "c", true), None);
     }
 
     #[test]
