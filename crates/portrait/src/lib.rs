@@ -7,8 +7,20 @@
 //!
 //! CPU kernels have no windowing dependency and stay testable headless.
 
+pub mod android_qnn_vulkan;
+pub mod autotune;
 pub mod capability_registry;
 pub mod compute_backend;
+pub mod cuda_backend;
+pub mod harmony_ohos;
+pub mod hip_backend;
+pub mod metal_backend;
+pub mod mobile_ffi;
+pub mod native_infer_cuda;
+pub mod platform_runtime;
+pub mod simd_ops;
+pub mod sycl_openvino_backend;
+pub mod wgpu_compute_backend;
 pub mod private_assets;
 pub mod effect_descriptor;
 pub mod kernels;

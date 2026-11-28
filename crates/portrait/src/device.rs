@@ -12,9 +12,18 @@ pub enum Backend {
     Cuda,
     Metal,
     /// Cross-platform Vulkan / WGPU Compute (AMD/Intel discrete & integrated
-    /// GPUs, Qualcomm Snapdragon Adreno, Linux/Windows/Android).
+    /// GPUs, Qualcomm Snapdragon Adreno, Linux/Windows/Android/HarmonyOS).
     Vulkan,
-    /// Reserved NPU accelerator extension point (Qualcomm Hexagon, Apple ANE).
+    /// Windows Direct3D 12 Compute (NVIDIA/AMD/Intel/Qualcomm Windows on ARM).
+    Dx12,
+    /// AMD HIP / ROCm Compute (RDNA dGPU & APU).
+    Hip,
+    /// Intel oneAPI SYCL / Level Zero Compute (UHD/Iris Xe/Arc/Core Ultra).
+    Sycl,
+    /// OpenCL Compute (legacy / RAW Z6III path).
+    OpenCl,
+    /// Reserved NPU accelerator extension point (Qualcomm Hexagon, Apple ANE,
+    /// Intel NPU, Ryzen AI, HarmonyOS NNRt/CANN).
     Npu,
 }
 
@@ -26,14 +35,21 @@ impl Backend {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Vulkan => "vulkan",
+            Self::Dx12 => "dx12",
+            Self::Hip => "hip",
+            Self::Sycl => "sycl",
+            Self::OpenCl => "opencl",
             Self::Npu => "npu",
         }
     }
 
     /// Whether this backend is a GPU compute backend eligible for automatic
-    /// GPU selection (`Cuda -> Metal -> Vulkan`).
+    /// GPU selection.
     pub const fn is_gpu(self) -> bool {
-        matches!(self, Self::Cuda | Self::Metal | Self::Vulkan)
+        matches!(
+            self,
+            Self::Cuda | Self::Metal | Self::Vulkan | Self::Dx12 | Self::Hip | Self::Sycl | Self::OpenCl
+        )
     }
 
     /// Whether this backend offloads work off the CPU (GPU or NPU).
@@ -51,7 +67,18 @@ impl fmt::Display for Backend {
 /// Default automatic GPU preference order before falling back to [`Backend::Cpu`].
 pub const AUTO_GPU_PRIORITY: [Backend; 3] = [Backend::Cuda, Backend::Metal, Backend::Vulkan];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Extended GPU selection order across all supported native and portable APIs.
+pub const EXTENDED_GPU_PRIORITY: [Backend; 7] = [
+    Backend::Cuda,
+    Backend::Metal,
+    Backend::Vulkan,
+    Backend::Dx12,
+    Backend::Hip,
+    Backend::Sycl,
+    Backend::OpenCl,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Precision {
     Fp32,
     Fp16,
@@ -224,6 +251,10 @@ fn refusal(request: &DeviceRequest<'_>, backend: Backend) -> DeviceRefusal {
             Backend::Cuda => "no caller-probe reports NVIDIA CUDA",
             Backend::Metal => "no caller-probe reports Apple Metal",
             Backend::Vulkan => "no caller-probe reports Vulkan/WGPU compute",
+            Backend::Dx12 => "no caller-probe reports Direct3D 12 compute",
+            Backend::Hip => "no caller-probe reports AMD HIP/ROCm compute",
+            Backend::Sycl => "no caller-probe reports Intel SYCL/Level Zero compute",
+            Backend::OpenCl => "no caller-probe reports OpenCL compute",
             Backend::Npu => "no caller-probe reports NPU accelerator (Hexagon/ANE)",
             Backend::Cpu => unreachable!(),
         });

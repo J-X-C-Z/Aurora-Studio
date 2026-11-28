@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 exclude = ["work/**", "testdata/**", "examples/**", "scripts/**"]
 
+[features]
+default = ["wgpu-backend"]
+wgpu-backend = []
+vulkan-backend = ["dep:ash"]
+
 [dependencies]
-# Cross-platform WGPU/Vulkan compute backend (src/wgpu_backend.rs).
+# Cross-platform WGPU/Vulkan compute backend (src/wgpu_backend.rs & src/wgpu_compute_backend.rs).
 # Versions match Cargo.lock so offline workspace builds resolve without network.
 wgpu = "30.0.1"
 pollster = "0.4.0"
+ash = { version = "0.38.0+1.3.281", optional = true }
 
 # The DX12 compute backend (src/dx12.rs) binds D3D12/DXGI/D3DCompiler directly;
 # the pinned version is the one already in Cargo.lock for other workspace crates,

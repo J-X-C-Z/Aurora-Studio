@@ -195,20 +195,26 @@ pub(crate) const fn from_portrait_backend(backend: PortraitBackend) -> BackendKi
         PortraitBackend::Cuda => BackendKind::Cuda,
         PortraitBackend::Metal => BackendKind::Metal,
         PortraitBackend::Vulkan => BackendKind::Vulkan,
+        PortraitBackend::Dx12 => BackendKind::Dx12,
+        PortraitBackend::Hip => BackendKind::Hip,
+        PortraitBackend::Sycl => BackendKind::Sycl,
+        PortraitBackend::OpenCl => BackendKind::OpenCl,
         PortraitBackend::Npu => BackendKind::Npu,
     }
 }
 
 /// Translate a contract [`BackendKind`] into `aurora_portrait::device::Backend`.
-/// Returns `None` for backend families that `aurora-portrait` does not model (e.g. `OpenCl`).
 pub(crate) const fn to_portrait_backend(kind: BackendKind) -> Option<PortraitBackend> {
     match kind {
         BackendKind::Cpu => Some(PortraitBackend::Cpu),
         BackendKind::Cuda => Some(PortraitBackend::Cuda),
         BackendKind::Metal => Some(PortraitBackend::Metal),
         BackendKind::Vulkan => Some(PortraitBackend::Vulkan),
+        BackendKind::Dx12 => Some(PortraitBackend::Dx12),
+        BackendKind::Hip => Some(PortraitBackend::Hip),
+        BackendKind::Sycl => Some(PortraitBackend::Sycl),
+        BackendKind::OpenCl => Some(PortraitBackend::OpenCl),
         BackendKind::Npu => Some(PortraitBackend::Npu),
-        BackendKind::OpenCl => None,
     }
 }
 

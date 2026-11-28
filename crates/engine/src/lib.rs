@@ -20,6 +20,8 @@ mod c1import;
 mod c1_masks;
 pub mod c1_banding;
 pub mod dng_write;
+pub mod gpu_crossplatform;
+pub mod platform_dispatch;
 pub mod psd_write;
 pub mod c1_cos;
 pub mod c1_eip;

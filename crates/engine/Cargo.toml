@@ -6,6 +6,8 @@ version.workspace = true
 license.workspace = true
 
 [features]
+default = ["wgpu-backend"]
+wgpu-backend = ["dep:wgpu"]
 z6iii-raw-export = []
 external-fixtures = []
 
@@ -35,6 +37,7 @@ crc32fast = "1"
 flate2 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 aurora-portrait.workspace = true
+wgpu = { version = "30.0.1", optional = true }
 
 # Metal compute runtime (Mac lane, M2). Only linked on macOS; the Windows
 # build keeps using the CUDA stages and never sees these crates. Versions are

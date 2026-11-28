@@ -156,6 +156,12 @@ pub(crate) enum Provider {
     /// exports `OrtSessionOptionsAppendExecutionProvider_CoreML`; the plan
     /// says nothing about which device (ANE/GPU/CPU) a session finally uses.
     CoreMl,
+    /// Intel OpenVINO execution provider (CPU/GPU/NPU explicit verification).
+    OpenVino,
+    /// Qualcomm AI Engine Direct (QNN/HTP) execution provider.
+    Qnn,
+    /// HarmonyOS Neural Network Runtime execution provider.
+    NnRt,
     Cpu,
     NativePending,
     Native(BackendKind),
@@ -168,6 +174,9 @@ impl Provider {
             Provider::Cuda => "CUDA",
             Provider::DirectMl => "DirectML",
             Provider::CoreMl => "CoreML",
+            Provider::OpenVino => "OpenVINO",
+            Provider::Qnn => "QNN",
+            Provider::NnRt => "NNRt",
             Provider::NativePending => "native-pending",
             Provider::Native(k) => k.label(),
             Provider::Cpu => "CPU",
@@ -199,6 +208,9 @@ fn provider_symbol(provider: Provider) -> Option<&'static str> {
         Provider::Cuda => Some("OrtSessionOptionsAppendExecutionProvider_CUDA"),
         Provider::DirectMl => Some("OrtSessionOptionsAppendExecutionProvider_DML"),
         Provider::CoreMl => Some("OrtSessionOptionsAppendExecutionProvider_CoreML"),
+        Provider::OpenVino => Some("OrtSessionOptionsAppendExecutionProvider_OpenVINO"),
+        Provider::Qnn => Some("OrtSessionOptionsAppendExecutionProvider_QNN"),
+        Provider::NnRt => Some("OrtSessionOptionsAppendExecutionProvider_NNRt"),
         Provider::Cpu | Provider::NativePending | Provider::Native(_) => None,
     }
 }
@@ -220,6 +232,12 @@ fn append_symbol_candidates(provider: Provider) -> &'static [&'static str] {
             "OrtSessionOptionsAppendExecutionProvider_CoreML",
             "OrtSessionOptionsAppendExecutionProvider_CoreMl",
         ],
+        Provider::OpenVino => &[
+            "OrtSessionOptionsAppendExecutionProvider_OpenVINO",
+            "OrtSessionOptionsAppendExecutionProvider_OpenVino",
+        ],
+        Provider::Qnn => &["OrtSessionOptionsAppendExecutionProvider_QNN"],
+        Provider::NnRt => &["OrtSessionOptionsAppendExecutionProvider_NNRt"],
         Provider::Cpu | Provider::NativePending | Provider::Native(_) => &[],
     }
 }
@@ -281,6 +299,9 @@ fn provider_from_name(raw: &str) -> Option<Provider> {
         "cuda" => Some(Provider::Cuda),
         "dml" | "directml" => Some(Provider::DirectMl),
         "coreml" | "core_ml" => Some(Provider::CoreMl),
+        "openvino" | "open_vino" => Some(Provider::OpenVino),
+        "qnn" | "htp" => Some(Provider::Qnn),
+        "nnrt" => Some(Provider::NnRt),
         "cpu" => Some(Provider::Cpu),
         _ => None,
     }

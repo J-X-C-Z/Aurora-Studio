@@ -20,20 +20,29 @@ pub enum BackendKind {
     Cpu,
     /// NVIDIA CUDA (Windows/Linux NVIDIA GPUs).
     Cuda,
-    /// Apple Metal (macOS / Apple Silicon).
+    /// Apple Metal (macOS / iOS / iPadOS Apple Silicon).
     Metal,
-    /// Cross-platform Vulkan / WGPU Compute (AMD, Intel, Qualcomm Adreno).
+    /// Cross-platform Vulkan / WGPU Compute (AMD, Intel, Qualcomm Adreno, HarmonyOS).
     Vulkan,
+    /// Windows Direct3D 12 Compute (NVIDIA, AMD, Intel, Windows on ARM).
+    Dx12,
+    /// AMD HIP / ROCm Compute (RDNA dGPU & APU).
+    Hip,
+    /// Intel oneAPI SYCL / Level Zero Compute.
+    Sycl,
     /// OpenCL, kept for adapters that expose it.
     OpenCl,
-    /// Reserved NPU accelerator family (Qualcomm Hexagon, Apple ANE).
+    /// Reserved NPU accelerator family (Qualcomm Hexagon, Apple ANE, Intel NPU, HarmonyOS NNRt/CANN).
     Npu,
 }
 
 impl BackendKind {
     /// Whether this backend is a GPU compute backend.
     pub const fn is_gpu(self) -> bool {
-        matches!(self, Self::Cuda | Self::Metal | Self::Vulkan | Self::OpenCl)
+        matches!(
+            self,
+            Self::Cuda | Self::Metal | Self::Vulkan | Self::Dx12 | Self::Hip | Self::Sycl | Self::OpenCl
+        )
     }
 
     /// Whether this backend offloads work off the CPU (GPU or NPU).
@@ -48,6 +57,9 @@ impl BackendKind {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Vulkan => "vulkan",
+            Self::Dx12 => "dx12",
+            Self::Hip => "hip",
+            Self::Sycl => "sycl",
             Self::OpenCl => "opencl",
             Self::Npu => "npu",
         }
