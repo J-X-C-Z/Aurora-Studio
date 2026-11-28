@@ -66,7 +66,7 @@ const SKIN_SECTIONS: [(&str, &str, &[&str]); 4] = [
     ("Skin tone", "肤色", &["pc:21015", "pc:30096", "pc:90005", "pc:90007", "pc:90004", "pc:21105", "pc:90086"]),
     ("Texture", "质感", &["pc:8068", "pc:8069", "pc:8070"]),
     ("Smoothing & Neutral Grey", "磨皮与中性灰", &["pc:30021", "pc:30022", "pc:90002", "pc:90010", "pc:30013", "pc:30014"]),
-    ("Wrinkles", "祛皱", &["pc:90023", "pc:90024", "pc:21024", "pc:21025", "pc:21069", "pc:21070", "pc:21071"]),
+    ("Wrinkles", "祛皱", &["pc:90023", "pc:90024", "pc:21024", "pc:21025", "pc:21069", "pc:21070", "pc:21071", "pc:90015"]),
 ];
 
 /// How the live makeup sliders are grouped in their panel.
@@ -74,7 +74,7 @@ const MAKEUP_SECTIONS: [(&str, &str, &[&str]); 5] = [
     ("Stereo contour", "立体修容", &["pc:8", "pc:9"]),
     ("Brows & Eyes", "眉眼妆", &["pc:100", "pc:117", "pc:30007", "pc:103", "pc:105", "pc:118", "pc:111"]),
     ("Blusher & Contour", "腮红与修容", &["pc:106", "pc:116"]),
-    ("Lips", "唇妆", &["pc:107", "pc:90032", "pc:90021"]),
+    ("Lips", "唇妆", &["pc:107", "pc:90021"]),
     ("Sticker", "贴纸", &["pc:115"]),
 ];
 
@@ -128,6 +128,7 @@ const WIRED_SKIN_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:21069", "Cheek wrinkles", "祛面颊纹", 0.0),
     ("pc:21070", "Nose back wrinkles", "祛鼻背纹", 0.0),
     ("pc:21071", "Perioral wrinkles", "祛口周纹", 0.0),
+    ("pc:90015", "Neck lines", "祛颈纹", 0.0),
 ];
 
 /// Expression management effects wired to same-job smile warp (`assets/portrait/smile/`).
@@ -141,7 +142,7 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:9", "Stereo highlight", "立体高光", 0.0),
     ("pc:100", "Eyebrow (L)", "眉妆（左）", 0.0),
     ("pc:117", "Eyebrow (R)", "眉妆（右）", 0.0),
-    ("pc:30007", "Eyeshadow", "眼影", 0.0),
+    ("pc:30007", "Lower eyeliner", "下眼线", 0.0),
     ("pc:103", "Upper eyeliner", "上眼线", 0.0),
     ("pc:105", "Upper eyelash", "上睫毛", 0.0),
     ("pc:118", "Lower eyelash", "下睫毛", 0.0),
@@ -149,7 +150,6 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:106", "Blusher", "腮红", 0.0),
     ("pc:116", "Contour", "修容", 0.0),
     ("pc:107", "Lipstick", "口红", 0.0),
-    ("pc:90032", "Lip gloss", "唇彩", 0.0),
     ("pc:90021", "Lip makeup enhance", "唇妆增强", 0.5),
     ("pc:115", "Face decoration", "面部贴纸", 0.0),
 ];
@@ -158,6 +158,7 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
 const WIRED_EYES_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:100004", "Red blood removal", "去红血丝", 0.0),
     ("pc:101", "Silkworm", "卧蚕", 0.0),
+    ("pc:90032", "Eye makeup", "眼妆", 0.0),
 ];
 
 /// Hair effects wired to FaceParsingV2 / same-job producer inputs.
@@ -1306,4 +1307,7 @@ fn pf90032_lives_in_eyes_eye_makeup_not_in_lips() {
     assert_eq!(group_of(30007), "pc-makeup");
     assert_eq!(group_of(30096), "pc-skin");
     assert!(is_long_tail("pc-hands") && !is_long_tail("pc-body"));
+    assert!(WIRED_MAKEUP_EFFECTS.contains(&("pc:30007", "Lower eyeliner", "下眼线", 0.0)));
+    assert!(!WIRED_MAKEUP_EFFECTS.iter().any(|e| e.0 == "pc:90032"));
+    assert!(WIRED_EYES_EFFECTS.contains(&("pc:90032", "Eye makeup", "眼妆", 0.0)));
 }

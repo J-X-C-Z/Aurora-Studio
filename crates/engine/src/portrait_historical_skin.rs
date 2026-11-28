@@ -450,6 +450,17 @@ pub(super) fn apply(
     control: f32,
     inputs: Option<&HistoricalSkinInputs>,
 ) -> Result<Option<Image>, Refusal> {
+    apply_with_stage_sha(source, ticket, pf, control, inputs, None)
+}
+
+pub(super) fn apply_with_stage_sha(
+    source: &Image,
+    ticket: Option<u64>,
+    pf: u32,
+    control: f32,
+    inputs: Option<&HistoricalSkinInputs>,
+    stage_sha256: Option<[u8; 32]>,
+) -> Result<Option<Image>, Refusal> {
     if !(0.0..=1.0).contains(&control) {
         return Err(Refusal::ValueOutOfRange("historical skin control"));
     }
@@ -475,7 +486,9 @@ pub(super) fn apply(
     if input.control != control {
         return Err(Refusal::ValueOutOfRange("historical skin payload control"));
     }
-    if input.source_sha256 != [0; 32] && input.source_sha256 != sha256_32(&source.pixels) {
+    if input.source_sha256 != [0; 32]
+        && input.source_sha256 != stage_sha256.unwrap_or_else(|| sha256_32(&source.pixels))
+    {
         return Err(Refusal::ValueOutOfRange("historical skin frame digest"));
     }
 

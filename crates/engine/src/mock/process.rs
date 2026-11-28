@@ -1274,6 +1274,7 @@ fn needs_stage_face_input(extra: &std::collections::BTreeMap<String, f32>) -> bo
                 | 44124
                 | 48019
                 | 49221
+                | 100005
         )
     })
 }
@@ -1323,8 +1324,10 @@ fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> 
         };
         matches!(
             pf,
-            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 21105 | 30013 | 30014 | 90004
-                | 90023 | 90024 | 90086 | 100004
+            5 | 108 | 109 | 110 | 21024 | 21025 | 21026 | 21069 | 21070 | 21071 | 21076 | 21105
+                | 30013 | 30014 | 30025 | 30026 | 30030 | 30059 | 30187 | 30190 | 30259 | 44297
+                | 90004 | 90008 | 90015 | 90023 | 90024 | 90033 | 90034 | 90080 | 90086 | 90088
+                | 90089 | 90116 | 90118 | 90130 | 90131 | 100004 | 100007 | 100008
         )
     })
 }
@@ -1354,7 +1357,13 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90021 | 90086 | 100004)
+        matches!(
+            pf,
+            5 | 101 | 8033 | 21026 | 21076 | 21105 | 30009 | 30014 | 30025 | 30026 | 30030
+                | 30059 | 30187 | 30190 | 30259 | 44297 | 90002 | 90004 | 90008 | 90010 | 90021
+                | 90033 | 90034 | 90080 | 90086 | 90088 | 90089 | 90116 | 90118 | 90130 | 90131
+                | 90139 | 90160 | 100004 | 100007 | 100008
+        )
             || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
@@ -1419,6 +1428,308 @@ fn stage_bundle_cached<'a>(
         Ok(bundle) => Ok(bundle),
         Err(refusal) => Err(refusal.clone()),
     }
+}
+
+/// Composes two 2x3 affine matrices `a * b`: first applies `b`, then `a`.
+fn compose_affine_2x3(a: [[f32; 3]; 2], b: [[f32; 3]; 2]) -> [[f32; 3]; 2] {
+    [
+        [
+            a[0][0] * b[0][0] + a[0][1] * b[1][0],
+            a[0][0] * b[0][1] + a[0][1] * b[1][1],
+            a[0][0] * b[0][2] + a[0][1] * b[1][2] + a[0][2],
+        ],
+        [
+            a[1][0] * b[0][0] + a[1][1] * b[1][0],
+            a[1][0] * b[0][1] + a[1][1] * b[1][1],
+            a[1][0] * b[0][2] + a[1][1] * b[1][2] + a[1][2],
+        ],
+    ]
+}
+
+/// Maps continuous stage pixel coordinates `[0..stage_w, 0..stage_h]` to
+/// continuous source pixel coordinates `[0..src_w, 0..src_h]`.
+fn stage_continuous_to_source(
+    map: &super::geometry::FrameMap,
+    source_size: [u32; 2],
+    stage_size: [u32; 2],
+    region: NormRect,
+    tx: f32,
+    ty: f32,
+) -> [f32; 2] {
+    let frame = [
+        region.x + (tx / stage_size[0] as f32) * region.width,
+        region.y + (ty / stage_size[1] as f32) * region.height,
+    ];
+    let (_, src_norm) = map.map(frame);
+    [
+        src_norm[0] * source_size[0] as f32,
+        src_norm[1] * source_size[1] as f32,
+    ]
+}
+
+/// Computes the 2x3 affine matrix mapping stage continuous pixel coordinates
+/// into source continuous pixel coordinates (`stage_point -> source_point`).
+fn stage_to_source_affine(
+    map: &super::geometry::FrameMap,
+    source_size: [u32; 2],
+    stage_size: [u32; 2],
+    region: NormRect,
+) -> Result<[[f32; 3]; 2], aurora_portrait::Refusal> {
+    let sw = stage_size[0] as f32;
+    let sh = stage_size[1] as f32;
+    if !(sw > 0.0 && sh > 0.0) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let p0 = stage_continuous_to_source(map, source_size, stage_size, region, 0.0, 0.0);
+    let px = stage_continuous_to_source(map, source_size, stage_size, region, sw, 0.0);
+    let py = stage_continuous_to_source(map, source_size, stage_size, region, 0.0, sh);
+    let mat = [
+        [(px[0] - p0[0]) / sw, (py[0] - p0[0]) / sh, p0[0]],
+        [(px[1] - p0[1]) / sw, (py[1] - p0[1]) / sh, p0[1]],
+    ];
+    let det = mat[0][0] * mat[1][1] - mat[0][1] * mat[1][0];
+    if mat.iter().flatten().any(|v| !v.is_finite()) || !det.is_finite() || det.abs() <= 1.0e-12 {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    Ok(mat)
+}
+
+/// Projects a source pixel point to stage pixel coordinates without rejecting
+/// points that fall outside the zoomed viewport bounds.
+fn project_source_point_unclamped(
+    map: &super::geometry::FrameMap,
+    source_size: [u32; 2],
+    stage_size: [u32; 2],
+    region: NormRect,
+    point: [f32; 2],
+) -> Result<[f32; 2], aurora_portrait::Refusal> {
+    if point.iter().any(|v| !v.is_finite()) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let normalized = [
+        point[0] / source_size[0] as f32,
+        point[1] / source_size[1] as f32,
+    ];
+    let frame = map.frame_from_source(normalized).ok_or(
+        aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ),
+    )?;
+    let stage = [
+        (frame[0] - region.x) / region.width * stage_size[0] as f32 - 0.5,
+        (frame[1] - region.y) / region.height * stage_size[1] as f32 - 0.5,
+    ];
+    if stage.iter().any(|v| !v.is_finite()) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    Ok(stage)
+}
+
+fn resample_mask_u8_to_stage(
+    src_mask: &[u8],
+    src_w: u32,
+    src_h: u32,
+    stage_w: u32,
+    stage_h: u32,
+    stage_to_source: [[f32; 3]; 2],
+) -> Vec<u8> {
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let tw = stage_w as usize;
+    let th = stage_h as usize;
+    let mut out = vec![0u8; tw.saturating_mul(th)];
+    if sw == 0 || sh == 0 || src_mask.len() != sw.saturating_mul(sh) {
+        return out;
+    }
+    for y in 0..th {
+        let ty = y as f32 + 0.5;
+        for x in 0..tw {
+            let tx = x as f32 + 0.5;
+            let sx = stage_to_source[0][0] * tx + stage_to_source[0][1] * ty + stage_to_source[0][2] - 0.5;
+            let sy = stage_to_source[1][0] * tx + stage_to_source[1][1] * ty + stage_to_source[1][2] - 0.5;
+            if sx < -0.5 || sy < -0.5 || sx > sw as f32 - 0.5 || sy > sh as f32 - 0.5 {
+                continue;
+            }
+            let x0 = (sx.floor() as isize).clamp(0, (sw - 1) as isize) as usize;
+            let y0 = (sy.floor() as isize).clamp(0, (sh - 1) as isize) as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let y1 = (y0 + 1).min(sh - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+            let v00 = f32::from(src_mask[y0 * sw + x0]);
+            let v10 = f32::from(src_mask[y0 * sw + x1]);
+            let v01 = f32::from(src_mask[y1 * sw + x0]);
+            let v11 = f32::from(src_mask[y1 * sw + x1]);
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            out[y * tw + x] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Projects a full-frame `FaceInputBundle` into a cropped/zoomed `stage_frame`
+/// coordinate system so local 100% viewports keep face landmarks and parsing
+/// masks even when only part of the face is visible inside the viewport.
+fn project_face_bundle_to_stage(
+    source_bundle: &crate::FaceInputBundle,
+    source_size: [u32; 2],
+    stage_frame: &crate::PortraitImage,
+    stage_sha256: [u8; 32],
+    region: NormRect,
+    geometry: &crate::Geometry,
+) -> Result<crate::FaceInputBundle, aurora_portrait::Refusal> {
+    let stage_size = [stage_frame.width, stage_frame.height];
+    if source_bundle.source_size != source_size {
+        return Err(aurora_portrait::Refusal::ShapeMismatch(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    // Validate transform dimensions and region parameters via FaceStageTransform.
+    let _transform = crate::FaceStageTransform::new(
+        source_size,
+        stage_size,
+        [region.x, region.y, region.width, region.height],
+        geometry,
+    )?;
+    let map = super::geometry::FrameMap::new((source_size[0], source_size[1]), geometry);
+    let stage_to_source = stage_to_source_affine(&map, source_size, stage_size, region)?;
+    let det_inv = (stage_to_source[0][0] * stage_to_source[1][1]
+        - stage_to_source[0][1] * stage_to_source[1][0])
+        .abs();
+    let linear_scale = if det_inv > 1.0e-12 {
+        1.0 / det_inv.sqrt()
+    } else {
+        1.0
+    };
+
+    let map_pt = |pt: [f32; 2]| project_source_point_unclamped(&map, source_size, stage_size, region, pt);
+    let map_pts = |pts: &[[f32; 2]]| -> Result<Vec<[f32; 2]>, aurora_portrait::Refusal> {
+        pts.iter().map(|&pt| map_pt(pt)).collect()
+    };
+
+    let points17 = map_pts(&source_bundle.points17)?;
+    let points142 = map_pts(&source_bundle.points142)?;
+    let points194 = map_pts(&source_bundle.points194)?;
+    let points414 = map_pts(&source_bundle.points414)?;
+    let points52 = map_pts(&source_bundle.landmark_producer.points52)?;
+
+    let mut det_landmarks = [[0.0f32; 2]; 5];
+    for (dst, &src_pt) in det_landmarks
+        .iter_mut()
+        .zip(&source_bundle.detection.landmarks_source)
+    {
+        *dst = map_pt(src_pt)?;
+    }
+
+    let mut mesh_landmarks = Vec::with_capacity(source_bundle.mesh.landmarks_source.len());
+    for &[x, y, z] in &source_bundle.mesh.landmarks_source {
+        let mapped = map_pt([x, y])?;
+        mesh_landmarks.push([mapped[0], mapped[1], z * linear_scale]);
+    }
+
+    // Project ROI corners to stage AABB.
+    let roi = source_bundle.roi_xywh;
+    if roi.iter().any(|v| !v.is_finite()) || roi[2] <= 0.0 || roi[3] <= 0.0 {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let corners = [
+        [roi[0], roi[1]],
+        [roi[0] + roi[2], roi[1]],
+        [roi[0], roi[1] + roi[3]],
+        [roi[0] + roi[2], roi[1] + roi[3]],
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for corner in corners {
+        let mapped = map_pt(corner)?;
+        min_x = min_x.min(mapped[0]);
+        min_y = min_y.min(mapped[1]);
+        max_x = max_x.max(mapped[0]);
+        max_y = max_y.max(mapped[1]);
+    }
+    let roi_w = max_x - min_x;
+    let roi_h = max_y - min_y;
+    if !(roi_w.is_finite() && roi_h.is_finite() && roi_w > 0.0 && roi_h > 0.0) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let roi_xywh = [min_x, min_y, roi_w, roi_h];
+    let roi_normalized_xywh = [
+        roi_xywh[0] / stage_size[0] as f32,
+        roi_xywh[1] / stage_size[1] as f32,
+        roi_xywh[2] / stage_size[0] as f32,
+        roi_xywh[3] / stage_size[1] as f32,
+    ];
+
+    let mut projected = source_bundle.clone();
+    projected.source_size = stage_size;
+    projected.source_sha256 = stage_sha256;
+    projected.bound_digest = Some((
+        stage_sha256,
+        stage_frame.pixels.as_ptr() as usize,
+        stage_frame.pixels.len(),
+    ));
+    projected.detection.landmarks_source = det_landmarks;
+    projected.detection.source_to_input =
+        compose_affine_2x3(source_bundle.detection.source_to_input, stage_to_source);
+    projected.mesh.landmarks_source = mesh_landmarks;
+    projected.mesh.source_to_crop =
+        compose_affine_2x3(source_bundle.mesh.source_to_crop, stage_to_source);
+    projected.mesh.crop_side = source_bundle.mesh.crop_side * linear_scale;
+    projected.roi_xywh = roi_xywh;
+    projected.roi_normalized_xywh = roi_normalized_xywh;
+    projected.points17 = points17;
+    projected.points142 = points142.clone();
+    projected.points194 = points194.clone();
+    projected.points414 = points414;
+    projected.landmark_producer.source_size = stage_size;
+    projected.landmark_producer.source_sha256 = stage_sha256;
+    projected.landmark_producer.points142 = points142;
+    projected.landmark_producer.points52 = points52;
+    projected.landmark_producer.points194 = points194;
+
+    if let Some(model_inputs) = projected.model_inputs.as_mut() {
+        if let Some(parsing) = model_inputs.parsing.as_mut() {
+            parsing.job_id = projected.job_id;
+            parsing.source_to_crop = compose_affine_2x3(parsing.source_to_crop, stage_to_source);
+        }
+        if let Some(teeth) = model_inputs.teeth.as_mut() {
+            let resampled = resample_mask_u8_to_stage(
+                &teeth.mask_g,
+                teeth.mask_width,
+                teeth.mask_height,
+                stage_size[0],
+                stage_size[1],
+                stage_to_source,
+            );
+            teeth.job_id = projected.job_id;
+            teeth.mask_width = stage_size[0];
+            teeth.mask_height = stage_size[1];
+            teeth.mask_sha256 = aurora_portrait::model_sha256::sha256(&resampled);
+            teeth.mask_g = resampled;
+        }
+        if source_size != stage_size {
+            // Source-sized PF90004 buffers would fail stage shape checks.
+            model_inputs.pf90004 = None;
+        }
+    }
+
+    projected.validate_ticket(stage_frame, Some(projected.job_id))?;
+    Ok(projected)
 }
 
 pub struct Rendered {
@@ -3264,13 +3575,14 @@ fn render_sized(
         // one inference to every frame. Parsing is requested only when the
         // attachment block will run, because it costs a further model pass.
         let stage_bundle = OnceLock::new();
+        let projected_source_bundle = OnceLock::new();
         let stage_include_parsing = want_stage_parsing && want_stage_attachments;
+        let geometric_lens = adj.lens.use_profile
+            || adj.lens.distortion.abs() > 1.0e-6
+            || adj.lens.shift_x.abs() > 1.0e-6
+            || adj.lens.shift_y.abs() > 1.0e-6
+            || adj.lens.tilt.abs() > 1.0e-6;
         if want_stage_slim {
-            let geometric_lens = adj.lens.use_profile
-                || adj.lens.distortion.abs() > 1.0e-6
-                || adj.lens.shift_x.abs() > 1.0e-6
-                || adj.lens.shift_y.abs() > 1.0e-6
-                || adj.lens.tilt.abs() > 1.0e-6;
             if let Some(stage_frame) = stage_frame.as_ref() {
                 let on_stage = || {
                     stage_bundle_cached(
@@ -3285,21 +3597,39 @@ fn render_sized(
                 let slim = if geometric_lens {
                     on_stage()
                 } else {
-                    let from_source = || {
+                    let from_source = || -> Result<_, aurora_portrait::Refusal> {
                         let source_frame = src.face_input_image();
-                        let bundle =
-                            stage_face_bundle(receipt.job_id(), source_frame.as_ref(), false, None)?;
+                        let bundle = stage_face_bundle(
+                            receipt.job_id(),
+                            source_frame.as_ref(),
+                            stage_include_parsing,
+                            None,
+                        )?;
                         let transform = crate::FaceStageTransform::new(
                             [src.size().0, src.size().1],
                             [out_w, out_h],
                             [region.x, region.y, region.width, region.height],
                             &adj.geometry,
                         )?;
-                        bundle.slim_inputs_for_stage_with_sha(
-                            &transform,
-                            stage_frame,
-                            stage_sha256.unwrap(),
-                        )
+                        bundle
+                            .slim_inputs_for_stage_with_sha(
+                                &transform,
+                                stage_frame,
+                                stage_sha256.unwrap(),
+                            )
+                            .or_else(|_| {
+                                let projected = project_face_bundle_to_stage(
+                                    &bundle,
+                                    [src.size().0, src.size().1],
+                                    stage_frame,
+                                    stage_sha256.unwrap(),
+                                    region,
+                                    &adj.geometry,
+                                )?;
+                                let slim = projected.slim_inputs(stage_frame)?;
+                                let _ = projected_source_bundle.set(projected);
+                                Ok(slim)
+                            })
                     };
                     from_source().or_else(|refusal| {
                         log::debug!("source face input refused; trying rendered frame: {refusal:?}");
@@ -3326,13 +3656,58 @@ fn render_sized(
         if want_stage_attachments {
             let want_parsing = want_stage_parsing;
             if let Some(stage_frame) = stage_frame.as_ref() {
-                match stage_bundle_cached(
-                    &stage_bundle,
-                    stage_frame,
-                    receipt.job_id(),
-                    stage_include_parsing,
-                    stage_sha256,
-                ) {
+                let attachment_bundle = if region != NormRect::FULL && !geometric_lens {
+                    if let Some(projected) = projected_source_bundle.get() {
+                        Ok(projected)
+                    } else {
+                        let source_projected = (|| {
+                            let source_frame = src.face_input_image();
+                            let source_bundle = stage_face_bundle(
+                                receipt.job_id(),
+                                source_frame.as_ref(),
+                                stage_include_parsing,
+                                None,
+                            )?;
+                            project_face_bundle_to_stage(
+                                &source_bundle,
+                                [src.size().0, src.size().1],
+                                stage_frame,
+                                stage_sha256.unwrap(),
+                                region,
+                                &adj.geometry,
+                            )
+                        })();
+                        match source_projected {
+                            Ok(projected) => {
+                                let _ = projected_source_bundle.set(projected);
+                                Ok(projected_source_bundle
+                                    .get()
+                                    .expect("projected source bundle just initialized"))
+                            }
+                            Err(refusal) => {
+                                log::debug!(
+                                    "cropped viewport full-frame face projection refused; falling back to stage frame: {refusal:?}"
+                                );
+                                stage_bundle_cached(
+                                    &stage_bundle,
+                                    stage_frame,
+                                    receipt.job_id(),
+                                    stage_include_parsing,
+                                    stage_sha256,
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    stage_bundle_cached(
+                        &stage_bundle,
+                        stage_frame,
+                        receipt.job_id(),
+                        stage_include_parsing,
+                        stage_sha256,
+                    )
+                };
+                match attachment_bundle {
                     Ok(bundle) => {
                         let mut inputs = producer_inputs.take().unwrap_or_default();
                         let mut attached = false;
@@ -3519,6 +3894,51 @@ fn render_sized(
                         }
                         if bundle
                             .attach_historical_skin_from_extra(
+                                stage_frame,
+                                Some(masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_hair_detail_from_extra(
+                                stage_frame,
+                                Some(masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if want_parsing
+                            && bundle
+                                .attach_pf90004_from_extra(
+                                    stage_frame,
+                                    Some(masks),
+                                    &adj.extra,
+                                    &mut inputs,
+                                )
+                                .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_pixcake_repair_and_eyebag_from_extra(
+                                stage_frame,
+                                Some(masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_pixcake_remaining_19_from_extra(
                                 stage_frame,
                                 Some(masks),
                                 &adj.extra,

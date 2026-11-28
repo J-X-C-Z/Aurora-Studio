@@ -3,6 +3,29 @@
 //! A model is accepted only when both the ONNX file and its expected SHA-256
 //! are local and explicit. Missing models or digests are typed errors; this
 //! module never substitutes landmarks, a mesh, or a zeroed pose.
+//!
+//! Model discovery order: `AURORA_BODY_POSE_MODEL` (explicit file), the folder
+//! holding the running executable (`models/BodyPose/`, `AIModels/Common/BodyPose/`,
+//! `models/`), then the CWD-relative and Capture One install roots below. The
+//! `exe_dir` roots keep discovery working when a packaged `.bat` is launched
+//! from a different working directory.
+//!
+//! Keypoint tensor contract (all exports must be float32):
+//! * `[1,K,2]` / `[1,2,K]`: `(x, y)` only; the third channel is absent and
+//!   presence comes from geometry.
+//! * `[1,K,3]` / `[1,3,K]` (COCO-17, Halpe-26, OpenPose-25, WholeBody-133,
+//!   and MediaPipe poses without visibility): `(x, y, score)` with `score` a
+//!   real confidence in `[0,1]` (zero means absence), **not** MediaPipe's `z`.
+//!   `x`/`y` are either normalized `[0,1]` or input-pixel `[0,input_w/h]`;
+//!   the choice is per tensor, never per point.
+//! * `[1,33,5]` / `[1,5,33]` (MediaPose Pose 33 only):
+//!   `(x, y, z, visibility, presence)`. `z` is depth and is never a score;
+//!   visibility and presence must both be probabilities in `[0,1]` — logits
+//!   are not accepted. The postprocessing sigmoid used by common MediaPipe
+//!   Python exports is therefore required.
+//!
+//! Channel order is `(x, y, …)` for the `[1,K,C]` layout and `(C, K)` for the
+//! transposed `[1,C,K]` layout — never `(y, x, score)`.
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +52,16 @@ pub const BODY_POSE_NATIVE_SEMANTICS_REFUSAL: &str =
 /// point is visible, so this module does not hand out anchors for it.
 pub const BODY_POSE_VISIBILITY_REFUSAL: &str =
     "body pose mediapipe visibility (3-channel tensor carries no visibility/presence)";
+pub const BODY_POSE_MODEL_ENV: &str = "AURORA_BODY_POSE_MODEL";
 pub const BODY_POSE_KEYPOINT_COUNT: usize = 69;
+/// Folders relative to the executable, tried before the CWD-relative/Capture One
+/// roots so a packaged `.bat` finds its bundled model regardless of where it was
+/// launched from.
+const EXE_MODEL_DIRS: [&str; 3] = [
+    "models/BodyPose",
+    "AIModels/Common/BodyPose",
+    "models",
+];
 /// Smallest keypoint count this loader accepts from a non-native model.
 /// The 69-slot ABI stays fail-closed: `BodyPoseInference::landmarks()` still
 /// refuses anything other than exactly `BODY_POSE_KEYPOINT_COUNT`; an adapter
@@ -141,19 +173,7 @@ impl BodyPoseInference {
     /// channel count. `K` values with no recovered layout are refused as a whole
     /// rather than mapped through a neighbouring table.
     pub fn semantic_layout(&self) -> Result<ModelLayout, Refusal> {
-        match self.tensor_contract.keypoints {
-            17 => Ok(ModelLayout::Coco17),
-            25 => Ok(ModelLayout::OpenPose25),
-            26 => Ok(ModelLayout::Halpe26),
-            33 => Ok(ModelLayout::MediaPipe33),
-            133 => Ok(ModelLayout::WholeBody133Body),
-            // Native 69: the vendor slot order is still unrecovered, so this
-            // model's raw output order must not be read as semantics.
-            BODY_POSE_KEYPOINT_COUNT => Err(Refusal::MissingInput(
-                BODY_POSE_NATIVE_SEMANTICS_REFUSAL,
-            )),
-            _ => Err(Refusal::MissingInput(BODY_POSE_SEMANTIC_LAYOUT_REFUSAL)),
-        }
+        semantic_layout_for(self.tensor_contract.keypoints)
     }
 
     /// What the parsed model tensor actually supplied.
@@ -276,6 +296,25 @@ impl BodyPoseInference {
             })
             .collect();
         adopt(layout, &observed, min_score)
+    }
+}
+
+/// Layout table used by [`BodyPoseInference::semantic_layout`]. Kept as a free
+/// function so the loader can classify a 3-channel tensor's third channel while
+/// parsing it, using the same authority as the semantic layer.
+fn semantic_layout_for(keypoints: usize) -> Result<ModelLayout, Refusal> {
+    match keypoints {
+        17 => Ok(ModelLayout::Coco17),
+        25 => Ok(ModelLayout::OpenPose25),
+        26 => Ok(ModelLayout::Halpe26),
+        33 => Ok(ModelLayout::MediaPipe33),
+        133 => Ok(ModelLayout::WholeBody133Body),
+        // Native 69: the vendor slot order is still unrecovered, so this
+        // model's raw output order must not be read as semantics.
+        BODY_POSE_KEYPOINT_COUNT => Err(Refusal::MissingInput(
+            BODY_POSE_NATIVE_SEMANTICS_REFUSAL,
+        )),
+        _ => Err(Refusal::MissingInput(BODY_POSE_SEMANTIC_LAYOUT_REFUSAL)),
     }
 }
 
@@ -420,6 +459,7 @@ impl BodyPoseModel {
                     &plane,
                     layout,
                     self.contract.keypoints,
+                    semantic_layout_for(self.contract.keypoints).ok(),
                     transform,
                     source.width,
                     source.height,
@@ -451,10 +491,31 @@ pub fn discover() -> std::result::Result<BodyPoseModelSource, Refusal> {
     Ok(BodyPoseModelSource { path, sha256 })
 }
 
+/// Candidate paths in discovery priority order.
+///
+/// The explicit env override is probed as a *file*, not joined with a model
+/// name: it names the ONNX itself. A missing/invalid override is skipped rather
+/// than fatal, so discovery still works when the variable is stale.
 fn model_candidates() -> Vec<PathBuf> {
+    body_pose_candidates(
+        std::env::var_os(BODY_POSE_MODEL_ENV).map(PathBuf::from).as_deref(),
+        std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)).as_deref(),
+    )
+}
+
+/// Pure form of [`model_candidates`] so discovery order can be tested without
+/// touching the real environment or the real executable path.
+fn body_pose_candidates(env_model: Option<&Path>, exe_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    for root in MODEL_DIRS {
-        let root = PathBuf::from(root);
+    if let Some(path) = env_model {
+        candidates.push(path.to_path_buf());
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir {
+        roots.extend(EXE_MODEL_DIRS.iter().map(|relative| dir.join(relative)));
+    }
+    roots.extend(MODEL_DIRS.iter().map(PathBuf::from));
+    for root in roots {
         for name in MODEL_NAMES {
             candidates.push(root.join(name));
         }
@@ -639,6 +700,7 @@ fn parse_keypoints(
     plane: &[f32],
     layout: BodyPoseOutputLayout,
     count: usize,
+    model_layout: Option<ModelLayout>,
     transform: Letterbox,
     source_width: u32,
     source_height: u32,
@@ -659,10 +721,19 @@ fn parse_keypoints(
     let presence: Option<Vec<f32>> =
         (channels == 5).then(|| (0..count).map(|index| at(4, index)).collect());
     let third = match channels {
-        // 5 通道的第三位是 z（深度）。
+        // MediaPipe 的 5 通道第三位是 z（深度），永远不作置信度。
         5 => PoseThirdChannel::Depth,
-        // 2/3 通道的第三位含义随布局，见 `BodyPoseInference::third_channel` 的兜底。
-        _ => PoseThirdChannel::Absent,
+        // 2 通道没有第三位。
+        2 => PoseThirdChannel::Absent,
+        // 3 通道的第三位含义由模型布局决定，不能从张量形状猜：
+        // COCO/Halpe/OpenPose/WholeBody 是 (x,y,score)，MediaPipe 是 (x,y,z)。
+        3 => match model_layout {
+            Some(ModelLayout::MediaPipe33) => PoseThirdChannel::Depth,
+            Some(_) => PoseThirdChannel::Score,
+            // 无已知语义布局：不把未知第三位当置信度。
+            None => PoseThirdChannel::Absent,
+        },
+        _ => unreachable!("validated 2|3|5 channels"),
     };
     let raw = (0..count)
         .map(|index| {
@@ -679,14 +750,22 @@ fn parse_keypoints(
             }
         })
         .collect::<Vec<_>>();
+    // Only coordinates must be finite globally. An invalid confidence/visibility
+    // channel is handled per point by `semantic_anchors` (that point becomes
+    // absent) instead of throwing away an otherwise valid pose tensor.
     ensure!(
-        raw.iter()
-            .all(|point| point.x.is_finite() && point.y.is_finite() && point.score.is_finite()),
+        raw.iter().all(|point| point.x.is_finite() && point.y.is_finite()),
         "body pose produced non-finite keypoints"
     );
-    let normalized = raw
-        .iter()
-        .all(|point| point.x.abs() <= 2.0 && point.y.abs() <= 2.0);
+    // Coordinate contract: x/y are either [0,1] (already normalized) or
+    // [0,input_w]x[0,input_h] (pixel coordinates in the letterboxed input).
+    // Decide per tensor, never per point — a single outlier must not flip the
+    // interpretation of every other point. The 2.0 tolerance covers exporters
+    // that emit slightly out-of-frame normalized keypoints (e.g. 1.02); any
+    // coordinate beyond it means the whole plane is in input pixels.
+    let normalized = raw.iter().all(|point| {
+        point.x.abs() <= 2.0 && point.y.abs() <= 2.0
+    });
     let points = raw
         .into_iter()
         .map(|point| {
@@ -814,6 +893,179 @@ mod tests {
                 Err(Refusal::MissingInput(BODY_POSE_ACQUISITION_REFUSAL))
             );
         }
+    }
+
+    // ── model discovery: env override, exe_dir, relative fallbacks ──
+
+    #[test]
+    fn env_model_is_the_first_candidate() {
+        let env = Path::new("D:/bundle/override/pose-133.onnx");
+        let exe = Path::new("D:/bundle/bin/aurora-studio.exe");
+        let candidates = body_pose_candidates(Some(env), Some(exe));
+        assert_eq!(candidates.first().map(PathBuf::as_path), Some(env));
+        // No other candidate may be allowed to shadow an explicit override.
+        assert_eq!(candidates.iter().filter(|p| p.as_path() == env).count(), 1);
+    }
+
+    #[test]
+    fn exe_dir_model_paths_are_searched_before_relative_and_c1_roots() {
+        let exe = Path::new("D:/bundle/bin/aurora-studio.exe");
+        let candidates = body_pose_candidates(None, exe.parent());
+        let exe_dir = exe.parent().unwrap();
+        let expected: Vec<PathBuf> = EXE_MODEL_DIRS
+            .iter()
+            .flat_map(|dir| {
+                MODEL_NAMES
+                    .iter()
+                    .map(move |name| exe_dir.join(dir).join(name))
+            })
+            .collect();
+        assert_eq!(&candidates[..expected.len()], &expected[..]);
+        // All CWD-relative / Capture One roots stay as later candidates.
+        for root in MODEL_DIRS {
+            let name = MODEL_NAMES[0];
+            assert!(candidates.contains(&PathBuf::from(root).join(name)));
+        }
+        assert!(
+            candidates.iter().any(|p| p.ends_with("models/BodyPose/bodyPose.onnx")),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn no_exe_dir_keeps_the_original_relative_and_c1_roots() {
+        let candidates = body_pose_candidates(None, None);
+        assert!(!candidates.iter().any(|p| p.as_os_str().is_empty()));
+        assert!(candidates.contains(&PathBuf::from("models/BodyPose/bodyPose.onnx")));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Program Files\Capture One\Capture One\AIModels\Common\BodyPose\bodyPose.onnx"
+        )));
+    }
+
+    #[test]
+    fn env_model_without_exe_dir_is_still_a_candidate() {
+        let env = Path::new("D:/bundle/override/pose-133.onnx");
+        let candidates = body_pose_candidates(Some(env), None);
+        assert_eq!(candidates.first().map(PathBuf::as_path), Some(env));
+        assert!(candidates.contains(&PathBuf::from("models/BodyPose/bodyPose.onnx")));
+    }
+
+    // ── parse_keypoints: coordinate round-trips for COCO/MoveNet and MediaPipe ──
+
+    /// Identity letterbox (input == source, no padding) for parse tests.
+    fn identity_transform(w: u32, h: u32) -> Letterbox {
+        Letterbox { scale: 1.0, pad_x: 0.0, pad_y: 0.0, input_w: w as f32, input_h: h as f32 }
+    }
+
+    fn parse_coco17(
+        plane: &[f32],
+        layout: BodyPoseOutputLayout,
+        w: u32,
+        h: u32,
+    ) -> (Vec<BodyKeypoint>, PoseChannels) {
+        parse_keypoints(plane, layout, 17, semantic_layout_for(17).ok(), identity_transform(w, h), w, h)
+            .expect("coco17 parse")
+    }
+
+    /// COCO-17 / MoveNet `[1,17,3]`: `(x, y, score)` in `[0,1]` maps back to
+    /// source pixels; the third channel is a real score, never a depth.
+    #[test]
+    fn parse_keypoints_coco17_normalized_coordinates_and_score() {
+        let mut plane = vec![0.0f32; 17 * 3];
+        plane[0] = 0.25;
+        plane[1] = 0.75;
+        plane[2] = 0.9;
+        let (points, channels) = parse_coco17(&plane, BodyPoseOutputLayout::KeypointXyz, 640, 480);
+        assert_eq!(channels.third, PoseThirdChannel::Score);
+        assert_eq!(points[0].x, 0.25);
+        assert_eq!(points[0].y, 0.75);
+        assert_eq!(points[0].score, 0.9);
+        // (x,y) order, never (y,x,score): verified by distinct x/y values.
+        assert!((points[0].x - 0.75).abs() > 0.1);
+    }
+
+    /// COCO-17 input-pixel coordinates `[0,input_w/h]` with letterbox padding
+    /// and a scale factor back to a differently sized source frame.
+    #[test]
+    fn parse_keypoints_coco17_pixel_coordinates_with_letterbox() {
+        // source 800x400, input 320x320 -> scale = 0.4, resized 320x160,
+        // pad_x = 0, pad_y = (320-160)/2 = 80.
+        let transform = Letterbox { scale: 0.4, pad_x: 0.0, pad_y: 80.0, input_w: 320.0, input_h: 320.0 };
+        let mut plane = vec![0.0f32; 17 * 3];
+        // All points at input (160,160) map to source (0.5,0.5).
+        for point in plane.chunks_exact_mut(3) {
+            point[0] = 160.0;
+            point[1] = 160.0;
+            point[2] = 1.0;
+        }
+        plane[0] = 320.0; // input x -> 320/0.4 = 800 -> 800/800 = 1.0
+        plane[1] = 240.0; // input y -> (240-80)/0.4 = 400 -> 400/400 = 1.0
+        plane[2] = 0.8;
+        let (points, _) = parse_keypoints(&plane, BodyPoseOutputLayout::KeypointXyz, 17, semantic_layout_for(17).ok(), transform, 800, 400).unwrap();
+        assert!((points[0].x - 1.0).abs() < 1e-5, "{:?}", points[0]);
+        assert!((points[0].y - 1.0).abs() < 1e-5, "{:?}", points[0]);
+    }
+
+    /// MediaPipe `[1,33,5]`: x/y in normalized [0,1] round-trip; z is depth;
+    /// visibility/presence are separate probability planes in [0,1].
+    #[test]
+    fn parse_keypoints_mediapipe_33_five_channels() {
+        let mut plane = vec![0.0f32; 33 * 5];
+        // Every point at a valid in-frame position with high vis/pres.
+        for (index, point) in plane.chunks_exact_mut(5).enumerate() {
+            point[0] = 0.2 + 0.5 * (index % 7) as f32 / 7.0;
+            point[1] = 0.2 + 0.5 * (index / 7) as f32 / 7.0;
+            point[2] = 0.1; // z, never a score
+            point[3] = 0.95;
+            point[4] = 0.85;
+        }
+        let (points, channels) = parse_keypoints(&plane, BodyPoseOutputLayout::KeypointXyz, 33, semantic_layout_for(33).ok(), identity_transform(1200, 800), 1200, 800).unwrap();
+        assert_eq!(channels.third, PoseThirdChannel::Depth);
+        assert!((points[0].x - 0.2).abs() < 1e-6);
+        assert_eq!(channels.visibility.as_ref().unwrap()[0], 0.95);
+        assert_eq!(channels.presence.as_ref().unwrap()[0], 0.85);
+        // A 5-channel plane must not accidentally use score gating:
+        // all 19 mapped MediaPipe anchors are present.
+        let pose = BodyPoseInference { keypoints: points, channels, ..inference_with(33, vec![]) };
+        assert_eq!(pose.semantic_anchors(0.5).unwrap().present_count(), 19);
+    }
+
+    /// MediaPipe x/y in input pixels with letterbox, transposed `[1,5,33]`
+    /// channel order; z and vis/pres are read from the right slots.
+    #[test]
+    fn parse_keypoints_mediapipe_33_pixel_coordinates_transposed() {
+        // [1,5,33] channel-major: channel c starts at c*33.
+        let mut plane = vec![0.0f32; 5 * 33];
+        plane[0] = 120.0; // x(0)
+        plane[33] = 60.0;  // y(0)
+        plane[2 * 33] = -1.5; // z(0), never a score
+        plane[3 * 33] = 0.7; // visibility(0)
+        plane[4 * 33] = 0.7; // presence(0)
+        let transform = Letterbox { scale: 1.0, pad_x: 0.0, pad_y: 0.0, input_w: 256.0, input_h: 256.0 };
+        let (points, channels) = parse_keypoints(&plane, BodyPoseOutputLayout::XyzKeypoint, 33, semantic_layout_for(33).ok(), transform, 2560, 2560).unwrap();
+        assert!((points[0].x - 120.0 / 2560.0).abs() < 1e-6);
+        assert!((points[0].y - 60.0 / 2560.0).abs() < 1e-6);
+        assert_eq!(channels.visibility.as_ref().unwrap()[0], 0.7);
+        assert_eq!(channels.presence.as_ref().unwrap()[0], 0.7);
+    }
+
+    /// A point at x=1.5 in a normalized tensor stays normalized (within the
+    /// 2.0 tolerance) instead of flipping the other 16 points into pixel mode.
+    /// The out-of-frame point itself is rejected by the frame-range check.
+    #[test]
+    fn parse_keypoints_normalized_detection_tolerates_one_outlier() {
+        let mut plane = vec![0.0f32; 17 * 3];
+        plane[0] = 0.5; plane[1] = 0.5; plane[2] = 1.0;
+        plane[3] = 1.5; plane[4] = 0.5; plane[5] = 1.0; // one point slightly outside [0,1]
+        // The whole plane remains in [0,2] -> treated as normalized; x=1.5
+        // resolves outside the frame, so the parse fails as a whole.
+        assert!(parse_keypoints(&plane, BodyPoseOutputLayout::KeypointXyz, 17, semantic_layout_for(17).ok(), identity_transform(640, 480), 640, 480).is_err());
+        // Change the outlier to a valid normalized coordinate: the other point
+        // must still be interpreted as normalized (0.5), not as 0.5 input px.
+        plane[3] = 0.9;
+        let (points, _) = parse_coco17(&plane, BodyPoseOutputLayout::KeypointXyz, 640, 480);
+        assert!((points[0].x - 0.5).abs() < 1e-6, "{:?}", points[0]);
+        assert!((points[1].x - 0.9).abs() < 1e-6, "{:?}", points[1]);
     }
 
     // ── semantic anchors: channels, occlusion, Halpe-26 ──

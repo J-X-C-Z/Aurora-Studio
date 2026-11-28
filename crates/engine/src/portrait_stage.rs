@@ -85,6 +85,23 @@ pub use portrait_eye_bag_stage::{
     PF90116_RESPONSE_SHAPE,
 };
 
+#[path = "portrait_pixcake_smile.rs"]
+mod portrait_pixcake_smile;
+pub(crate) use portrait_pixcake_smile::smile_mesh_assets_present;
+#[path = "portrait_pixcake_eyebag.rs"]
+mod portrait_pixcake_eyebag;
+#[path = "portrait_pixcake_repair.rs"]
+mod portrait_pixcake_repair;
+#[path = "portrait_pixcake_hair_glare.rs"]
+mod portrait_pixcake_hair_glare;
+#[path = "portrait_pixcake_teeth_expr.rs"]
+mod portrait_pixcake_teeth_expr;
+#[path = "portrait_pixcake_blemish.rs"]
+mod portrait_pixcake_blemish;
+#[path = "portrait_pixcake_hands_feet.rs"]
+mod portrait_pixcake_hands_feet;
+#[path = "portrait_pixcake_unify_suit.rs"]
+mod portrait_pixcake_unify_suit;
 #[path = "portrait_face_stage.rs"]
 mod portrait_face_stage;
 pub use portrait_face_stage::{FaceGeometry, FaceGeometryDraw, FaceGeometryInputs};
@@ -759,6 +776,7 @@ pub struct ProducerInputs {
     pub hair_smooth: Option<HairSmoothProducerInputs>,
     pub hair_gloss: Option<HairGlossProducerInputs>,
     pub eye_bag: Option<aurora_portrait::eye_bag_alignment::AlignedEyeBagPlanes>,
+    pub eye_bag_landmark: Option<aurora_portrait::eye_bag_alignment::AlignedEyeBagPlanes>,
     pub smile: Option<SmileProducerInputs>,
     pub stray_hair: Option<StrayHairProducerInputs>,
     pub pf90021: Option<Pf90021ProducerInputs>,
@@ -769,6 +787,9 @@ pub struct ProducerInputs {
     pub plump: Option<PlumpProducerInputs>,
     pub pf101: Option<Pf101ProducerInputs>,
     pub pf90130: Option<Pf90130ProducerInputs>,
+    pub(crate) beard: Option<portrait_pixcake_hair_glare::BeardProducerInputs>,
+    pub(crate) pf90130_glare: Option<portrait_pixcake_hair_glare::Pf90130GlareRow>,
+    pub(crate) owned_suit_passes: Option<Vec<portrait_pixcake_unify_suit::OwnedSuitPassEntry>>,
     pub moisture_face: Option<crate::portrait_moisture_inputs::OwnedMoistureFaceInputs>,
     pub moisture_body: Option<crate::portrait_moisture_inputs::OwnedMoistureBodyInputs>,
     /// Why the same-frame face-input producer refused, when it did. Carried so
@@ -3717,6 +3738,7 @@ impl PortraitJobReceipt {
         self.fingerprint
     }
 
+    #[allow(dead_code)]
     pub(crate) fn frame_ptr(&self) -> usize {
         self.frame_ptr
     }
@@ -3821,11 +3843,14 @@ pub struct PortraitJobInputs<'a> {
     pub moisture_face: Option<MoistureFaceInputs<'a>>,
     pub moisture_body: Option<MoistureBodyInputs<'a>>,
     pub eye_bag: Option<EyeBagInputs<'a>>,
+    pub eye_bag_landmark: Option<EyeBagInputs<'a>>,
     pub hair_smooth: Option<HairSmoothInputs<'a>>,
     pub hair_gloss: Option<HairGlossInputs<'a>>,
     pub stray_hair: StrayHairInputs<'a>,
     pub smile: SmileInputs<'a>,
     pub suit_passes: Option<&'a [SuitPassInput<'a>]>,
+    pub(crate) owned_suit_passes: Option<&'a [portrait_pixcake_unify_suit::OwnedSuitPassEntry]>,
+    pub(crate) pf90130_glare: Option<&'a portrait_pixcake_hair_glare::Pf90130GlareRow>,
     pub makeup: Option<&'a [MakeupInput<'a>]>,
     pub makeup_bundle: Option<&'a OwnedMakeupBundle>,
     pub hlf_face: Option<HlfFaceInputs<'a>>,
@@ -3870,11 +3895,14 @@ impl<'a> PortraitJobInputs<'a> {
             moisture_face: None,
             moisture_body: None,
             eye_bag: None,
+            eye_bag_landmark: None,
             hair_smooth: None,
             hair_gloss: None,
             stray_hair: StrayHairInputs::default(),
             smile: SmileInputs::default(),
             suit_passes: None,
+            owned_suit_passes: None,
+            pf90130_glare: None,
             makeup: None,
             makeup_bundle: None,
             hlf_face: None,
@@ -4053,6 +4081,28 @@ impl<'a> PortraitJobInputs<'a> {
                 aligned_response_mask: &eye_bag.aligned_response_mask,
             });
         }
+        if let Some(eye_bag) = producer.eye_bag_landmark.as_ref() {
+            self.eye_bag_landmark = Some(EyeBagInputs {
+                ticket: eye_bag.ticket,
+                model_id: eye_bag.model_id,
+                color_units: eye_bag.color_units,
+                geometry_class: eye_bag.geometry_class,
+                geometry_receipt: eye_bag.geometry_receipt,
+                width: eye_bag.frame_width,
+                height: eye_bag.frame_height,
+                aligned_color_field_rgb_f32: &eye_bag.aligned_color_field_rgb_f32,
+                aligned_response_mask: &eye_bag.aligned_response_mask,
+            });
+        }
+        if let Some(beard) = producer.beard.as_ref() {
+            self.beard = Some(beard.as_borrowed());
+        }
+        if let Some(glare) = producer.pf90130_glare.as_ref() {
+            self.pf90130_glare = Some(glare);
+        }
+        if let Some(suit) = producer.owned_suit_passes.as_deref() {
+            self.owned_suit_passes = Some(suit);
+        }
         if let Some(pf90021) = producer.pf90021.as_ref() {
             self.pf90021 = Some(Pf90021Inputs {
                 direction: pf90021.direction,
@@ -4188,6 +4238,7 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     21069,  // Cheek wrinkle
     21070,  // Nose-back wrinkle
     21071,  // Perioral wrinkle
+    90015,  // Neck lines wrinkle
     8068,   // Skin gloss
     8069,   // Skin texture
     8070,   // Skin clarity
@@ -5808,11 +5859,7 @@ fn apply_portrait_effects_impl(
                     let control =
                         |id| extra.get(&format!("pc:{id}")).copied().unwrap_or(0.0);
                     let controls = [control(left), if left == right { 0.0 } else { control(right) }];
-                    let stage_sha = inputs.stage_sha256.filter(|_| {
-                        inputs.receipt.as_ref().is_some_and(|receipt| {
-                            receipt.frame_ptr() == current.pixels.as_ptr() as usize
-                        })
-                    });
+                    let stage_sha = inputs.stage_sha256.filter(|_| inputs.receipt.is_some());
                     let mut result = match portrait_face_stage::apply_with_stage_sha(
                         &current,
                         region,
@@ -5980,11 +6027,41 @@ fn apply_portrait_effects_impl(
                         }
                     }
                     None => {
-                        let refusal = Refusal::MissingInput("PF90130_TYPED_PRODUCER");
-                        run.backend = PortraitBackend::Skipped;
-                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
-                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
-                        run.refusal = Some(refusal);
+                        if let Some(glare) = inputs.pf90130_glare {
+                            if let SkinRepairData::Glare(glare_inputs) = &glare.data {
+                                let ui_percent = (degree * 100.0).round() as i32;
+                                match aurora_portrait::kernels::face_detail::glasses_glare_removal(
+                                    &current,
+                                    &glare_inputs.effect_rgb,
+                                    glare_inputs.mask.as_deref(),
+                                    glare_inputs.lens_mask.as_deref(),
+                                    glare_inputs.encoding,
+                                    ui_percent,
+                                ) {
+                                    Ok(next) => {
+                                        current = next;
+                                        run.backend = PortraitBackend::Cpu;
+                                        run.skipped = false;
+                                        run.executed = true;
+                                    }
+                                    Err(refusal) => {
+                                        run.backend = PortraitBackend::Skipped;
+                                        run.fallback_reason =
+                                            Some(format!("input refused: {refusal:?}"));
+                                        run.skip_reason =
+                                            Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                                        run.refusal = Some(refusal);
+                                    }
+                                }
+                            }
+                        } else {
+                            let refusal = Refusal::MissingInput("PF90130_TYPED_PRODUCER");
+                            run.backend = PortraitBackend::Skipped;
+                            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                            run.skip_reason =
+                                Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                            run.refusal = Some(refusal);
+                        }
                     }
                 }
             }
@@ -6049,12 +6126,13 @@ fn apply_portrait_effects_impl(
                     run.fallback_reason = plan.fallback_reason;
                 }
             }
-            match portrait_historical_skin::apply(
+            match portrait_historical_skin::apply_with_stage_sha(
                 &current,
                 inputs.job_id(),
                 pf,
                 degree,
                 inputs.historical_skin,
+                inputs.stage_sha256.filter(|_| inputs.receipt.is_some()),
             ) {
                 Ok(Some(next)) => {
                     current = next;
@@ -6134,7 +6212,13 @@ fn apply_portrait_effects_impl(
             continue;
         }
         if pf == 90033 {
-            let (next, suit_run) = apply_suit_effect(&current, inputs.suit_passes);
+            let borrowed_suit: Option<Vec<SuitPassInput<'_>>> = inputs.owned_suit_passes.map(|s| {
+                s.iter().map(|entry| entry.as_borrowed()).collect()
+            });
+            let (next, suit_run) = apply_suit_effect(
+                &current,
+                inputs.suit_passes.or(borrowed_suit.as_deref()),
+            );
             if let Some(next) = next {
                 current = next;
             }
@@ -7775,7 +7859,11 @@ fn validate_effect_inputs(
         }
         90116 => {
             check_degree01(extra.get("pc:90116").copied().unwrap_or_default(), "degree")?;
-            let eye_bag = required(inputs.eye_bag, "aligned_color_field_rgb_f32")?;
+            let (eye_bag, is_landmark_fallback) = match (inputs.eye_bag, inputs.eye_bag_landmark) {
+                (Some(eb), _) => (eb, false),
+                (None, Some(eb)) => (eb, true),
+                (None, None) => return Err(Refusal::MissingInput("aligned_color_field_rgb_f32")),
+            };
             if eye_bag.ticket == 0 || inputs.job_id() != Some(eye_bag.ticket) {
                 return Err(Refusal::MissingInput("PF90116_SAME_JOB_TICKET"));
             }
@@ -7800,27 +7888,29 @@ fn validate_effect_inputs(
             {
                 return Err(Refusal::MissingInput("PF90116_COLOR_TARGET_UNITS"));
             }
-            match (
-                inputs.receipt.is_some(),
-                eye_bag.geometry_class,
-                eye_bag.geometry_receipt,
-            ) {
-                (true, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, _) => {
-                    return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
-                }
-                (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, Some(_)) => {
-                    return Err(Refusal::ValueOutOfRange("PF90116_GEOMETRY_RECEIPT"));
-                }
-                (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, None) => {}
-                (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob, None) => {
-                    return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
-                }
-                (
-                    _,
-                    aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob,
-                    Some(receipt),
-                ) => {
-                    receipt.validate_for_stage(eye_bag.ticket)?;
+            if !is_landmark_fallback {
+                match (
+                    inputs.receipt.is_some(),
+                    eye_bag.geometry_class,
+                    eye_bag.geometry_receipt,
+                ) {
+                    (true, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, _) => {
+                        return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
+                    }
+                    (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, Some(_)) => {
+                        return Err(Refusal::ValueOutOfRange("PF90116_GEOMETRY_RECEIPT"));
+                    }
+                    (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, None) => {}
+                    (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob, None) => {
+                        return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
+                    }
+                    (
+                        _,
+                        aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob,
+                        Some(receipt),
+                    ) => {
+                        receipt.validate_for_stage(eye_bag.ticket)?;
+                    }
                 }
             }
         }
@@ -7845,7 +7935,7 @@ fn validate_effect_inputs(
                 inputs,
             )?;
         }
-        21025 | 21069 | 21070 | 21071 | 90023 | 90024 => {
+        21025 | 21069 | 21070 | 21071 | 90015 | 90023 | 90024 => {
             check_degree01(
                 extra.get(&format!("pc:{pf}")).copied().unwrap_or_default(),
                 "wrinkle ui",
@@ -8020,14 +8110,14 @@ fn apply_cpu_effect(
         }
         100005 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_eye_white_purify(current, degree, face_mask.as_deref())
+            apply_eye_white_purify_with_slim(current, degree, face_mask.as_deref(), inputs.slim)
         }
         pf if B3_MAKEUP_ROWS.contains(&pf) => {
             apply_makeup_cpu(current, pf, degree, inputs)
         }
         108 => apply_teeth_cpu(current, degree, inputs),
         30025 => apply_pf30025_cpu(current, degree, inputs),
-        21025 | 21069 | 21070 | 21071 | 90023 | 90024 => {
+        21025 | 21069 | 21070 | 21071 | 90015 | 90023 | 90024 => {
             apply_wrinkle_cpu(current, pf, degree, inputs)
         }
         30021 => apply_hlf_face_cpu(current, degree, inputs, hlf_auto),
@@ -8378,30 +8468,145 @@ fn apply_nose_flaws(
     Ok(out)
 }
 
+fn has_valid_eye_landmarks(slim: Option<&SlimProducerInputs>) -> bool {
+    let Some(slim) = slim else {
+        return false;
+    };
+    if slim.points194.len() != 194 {
+        return false;
+    }
+    [18, 22, 26, 36, 40, 44].iter().all(|&idx| {
+        let p = slim.points194[idx];
+        p[0].is_finite() && p[1].is_finite()
+    })
+}
+
+/// Restricts a face mask to soft elliptical eye ROIs derived from `points194`
+/// when available. When `slim` is absent or incomplete, returns `base_mask`
+/// unchanged so legacy callers and unit tests keep their exact behavior.
+fn restrict_mask_to_eye_rois(
+    base_mask: &[u8],
+    width: u32,
+    height: u32,
+    slim: Option<&SlimProducerInputs>,
+) -> Vec<u8> {
+    if !has_valid_eye_landmarks(slim) {
+        return base_mask.to_vec();
+    }
+    let points = &slim.expect("checked valid eye landmarks").points194;
+    let w = width as usize;
+    let h = height as usize;
+    let pixels = w.saturating_mul(h);
+    if pixels == 0 || base_mask.len() != pixels {
+        return base_mask.to_vec();
+    }
+    if !base_mask.iter().any(|&v| v > 0) {
+        return vec![0u8; pixels];
+    }
+
+    let make_eye = |center: [f32; 2], corner_a: [f32; 2], corner_b: [f32; 2]| {
+        let dx = corner_b[0] - corner_a[0];
+        let dy = corner_b[1] - corner_a[1];
+        let raw_dist = dx.hypot(dy);
+        let (ux, uy, dist) = if raw_dist > 1.0e-3 {
+            (dx / raw_dist, dy / raw_dist, raw_dist)
+        } else {
+            (1.0, 0.0, 4.0)
+        };
+        let rx = (dist * 0.62).max(2.0);
+        let ry = (dist * 0.38).max(1.5);
+        (center[0], center[1], ux, uy, rx, ry)
+    };
+
+    let eyes = [
+        make_eye(points[26], points[18], points[22]),
+        make_eye(points[44], points[36], points[40]),
+    ];
+
+    let mut out = vec![0u8; pixels];
+    for (cx, cy, ux, uy, rx, ry) in eyes {
+        let vx = -uy;
+        let vy = ux;
+        let bound = rx.max(ry) + 1.0;
+        let x0 = (cx - bound).floor().max(0.0) as usize;
+        let y0 = (cy - bound).floor().max(0.0) as usize;
+        let x1 = ((cx + bound).ceil() as isize).clamp(0, w.saturating_sub(1) as isize) as usize;
+        let y1 = ((cy + bound).ceil() as isize).clamp(0, h.saturating_sub(1) as isize) as usize;
+        if x0 > x1 || y0 > y1 {
+            continue;
+        }
+        for y in y0..=y1 {
+            let py = y as f32 - cy;
+            let row = y * w;
+            for x in x0..=x1 {
+                let px = x as f32 - cx;
+                let lx = px * ux + py * uy;
+                let ly = px * vx + py * vy;
+                let r2 = (lx / rx) * (lx / rx) + (ly / ry) * (ly / ry);
+                if r2 >= 1.0 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let eye_w = if r <= 0.65 {
+                    1.0
+                } else {
+                    let t = ((1.0 - r) / 0.35).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                let idx = row + x;
+                // Some face-segmentation models attenuate or carve out the eye
+                // sockets inside MaskKind::Face; preserve reasonable weight
+                // inside the landmark eye ellipse while staying strictly 0 outside.
+                let base_f = f32::from(base_mask[idx]) / 255.0;
+                let combined = (eye_w * base_f.max(0.85) * 255.0).round().clamp(0.0, 255.0) as u8;
+                if combined > out[idx] {
+                    out[idx] = combined;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// PF100005: eye-white brightening and de-yellowing/de-reddening in upper facial region.
 fn apply_eye_white_purify(
     current: &Image,
     degree: f32,
     face_mask: Option<&[u8]>,
 ) -> Result<Image, Refusal> {
-    let face = required(face_mask, "PF100005 face mask")?;
+    apply_eye_white_purify_with_slim(current, degree, face_mask, None)
+}
+
+fn apply_eye_white_purify_with_slim(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    slim: Option<&SlimProducerInputs>,
+) -> Result<Image, Refusal> {
+    let base_face = required(face_mask, "PF100005 face mask")?;
     let pixels = current.pixel_count();
-    check_plane(face.len(), pixels, "PF100005 face mask")?;
+    check_plane(base_face.len(), pixels, "PF100005 face mask")?;
     let strength = degree.clamp(0.0, 1.0);
     if strength <= 0.0 {
         return Ok(current.clone());
     }
+    let restricted = restrict_mask_to_eye_rois(base_face, current.width, current.height, slim);
+    let use_upper_band_only = !has_valid_eye_landmarks(slim);
     let w = current.width as usize;
     let h = current.height as usize;
-    let Some((x0, y0, x1, y1)) = mask_bbox(face, w, h) else {
+    let Some((x0, y0, x1, y1)) = mask_bbox(&restricted, w, h) else {
         return Ok(current.clone());
     };
-    let eye_y_max = y0 + ((y1 - y0) as f32 * 0.62) as usize;
+    let eye_y_max = if use_upper_band_only {
+        y0 + ((y1 - y0) as f32 * 0.62) as usize
+    } else {
+        y1
+    };
     let mut out = current.clone();
     for y in y0..=eye_y_max.min(y1) {
         for x in x0..=x1 {
             let i = y * w + x;
-            let fm = f32::from(face[i]) / 255.0;
+            let fm = f32::from(restricted[i]) / 255.0;
             if fm <= 0.0 {
                 continue;
             }
@@ -9047,7 +9252,10 @@ fn apply_eye_bag_cpu(
     degree: f32,
     inputs: &PortraitJobInputs<'_>,
 ) -> Result<Image, Refusal> {
-    let input = required(inputs.eye_bag, "aligned_color_field_rgb_f32")?;
+    let input = required(
+        inputs.eye_bag.or(inputs.eye_bag_landmark),
+        "aligned_color_field_rgb_f32",
+    )?;
     aurora_portrait::kernels::eye_bag::compose_field_image_pf90116(
         current,
         input.aligned_color_field_rgb_f32,
@@ -9793,7 +10001,10 @@ fn try_cuda_same_job_effect(
             ))
         }
         90116 => {
-            let input = inputs.eye_bag.expect("validated PF90116 eye-bag input");
+            let input = inputs
+                .eye_bag
+                .or(inputs.eye_bag_landmark)
+                .expect("validated PF90116 eye-bag input");
             let gpu = match aurora_portrait::cuda_eye_bag::EyeBag::open() {
                 Ok(gpu) => gpu,
                 Err(error) => return Some(Err(error)),
@@ -10283,7 +10494,10 @@ mod cuda_router {
                 Some(run::<router::MoistureBody>(&routed))
             }
             90116 => {
-                let input = inputs.eye_bag.expect("validated PF90116 eye-bag input");
+                let input = inputs
+                    .eye_bag
+                    .or(inputs.eye_bag_landmark)
+                    .expect("validated PF90116 eye-bag input");
                 let routed = router::EyeBagInput {
                     source: current,
                     color3: input.aligned_color_field_rgb_f32,
@@ -10908,22 +11122,29 @@ fn try_cuda_stage_mask_effect(
         }
         100005 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            let face = match required(face_mask.as_deref(), "PF100005 face mask")
+            let base_face = match required(face_mask.as_deref(), "PF100005 face mask")
                 .and_then(|f| check_plane(f.len(), pixels, "PF100005 face mask").map(|_| f))
             {
                 Ok(f) => f,
                 Err(r) => return Some(Err(CudaError::Refused(r))),
             };
-            let Some((x0, y0, x1, y1)) = mask_bbox(face, width as usize, height as usize) else {
+            let restricted = restrict_mask_to_eye_rois(base_face, width, height, inputs.slim);
+            let use_upper_band_only = !has_valid_eye_landmarks(inputs.slim);
+            let Some((x0, y0, x1, y1)) = mask_bbox(&restricted, width as usize, height as usize)
+            else {
                 return Some(Ok((current.clone(), Vec::new())));
             };
-            let eye_y_end = (y0 + ((y1 - y0) as f32 * 0.62) as usize).min(y1);
+            let eye_y_end = if use_upper_band_only {
+                (y0 + ((y1 - y0) as f32 * 0.62) as usize).min(y1)
+            } else {
+                y1
+            };
             Some(launch_stage_ptx(
                 "pf100005_eye_white_purify_kernel",
                 width,
                 height,
                 |gpu, grid, block, d_src, d_dst| {
-                    let d_face = upload_stage_bytes(gpu, face)?;
+                    let d_face = upload_stage_bytes(gpu, &restricted)?;
                     let mut p_src = d_src.handle();
                     let mut p_face = d_face.handle();
                     let mut p_dst = d_dst.handle();
@@ -15915,6 +16136,7 @@ mod tests {
                 aligned_color_field_rgb_f32: &eye_color,
                 aligned_response_mask: &eye_response,
             }),
+            eye_bag_landmark: None,
             smile: SmileInputs {
                 material: Some("Grinning"),
                 lip_mask: Some(&lip),
@@ -15924,6 +16146,8 @@ mod tests {
                 roi: Some(smile_roi),
             },
             suit_passes: Some(&suit_passes),
+            owned_suit_passes: None,
+            pf90130_glare: None,
             hair_smooth: None,
             hair_gloss: None,
             stray_hair: StrayHairInputs::default(),

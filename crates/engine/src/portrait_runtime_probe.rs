@@ -172,8 +172,13 @@ pub(crate) struct HostFacts {
     /// The human-parsing segmenter (`skinMasking.onnx`, Capture One's
     /// `AIModels/Common/PeopleMasking`) is on disk.
     pub human_parsing_model: bool,
+    /// A verified body-pose ONNX model (`models/BodyPose/bodyPose.onnx` + `.sha256`)
+    /// resolves on disk.
+    pub body_pose_model: bool,
     /// The PF8033 cross-forward artifacts (dx/dy/mask) resolve.
     pub smile_artifact: bool,
+    /// The PF90021 positive/negative 512x512 lip LUT textures resolve.
+    pub lips_lut_asset: bool,
     pub plump_models: bool,
     /// Decrypted makeup material root, when one is installed.
     pub makeup_asset_root: Option<PathBuf>,
@@ -294,6 +299,7 @@ fn same_host_facts(a: &HostFacts, b: &HostFacts) -> bool {
         && a.parsing_refusal == b.parsing_refusal
         && a.plump_models == b.plump_models
         && a.smile_artifact == b.smile_artifact
+        && a.lips_lut_asset == b.lips_lut_asset
         && a.human_parsing_model == b.human_parsing_model
         && a.makeup_asset_root == b.makeup_asset_root
         && a.makeup_material == b.makeup_material
@@ -645,13 +651,46 @@ fn probe_host() -> HostFacts {
         Err(refusal) => facts.parsing_refusal = Some(refusal_reason(&refusal)),
     }
     facts.plump_models = crate::portrait_stage::discover_plump_onnx_models().is_ok();
-    facts.smile_artifact = crate::Pf8033CpuForwardReceipt::discover().is_ok();
+    facts.smile_artifact = crate::Pf8033CpuForwardReceipt::discover().is_ok()
+        || crate::portrait_stage::smile_mesh_assets_present();
     facts.makeup_asset_root = crate::portrait_makeup_wiring::makeup_asset_root();
+    facts.lips_lut_asset = lips_lut_assets_present(facts.makeup_asset_root.as_deref());
     facts.makeup_material = makeup_material_presence();
     // The human-parsing segmenter is the same model the skin/hair/face/body
     // planes come from; `model_available` is a file check, never a load.
     facts.human_parsing_model = crate::aimask::model_available(HUMAN_PARSING_MODEL);
+    // BodyPose discovery checks only for a verified local ONNX + `.sha256` sidecar.
+    facts.body_pose_model = crate::aimask::body_pose::discover().is_ok();
     facts
+}
+
+/// Checks whether both PF90021 512x512 lip LUT textures (`LipsLUT.png` and
+/// `LipDodgeLUT.png`) are present on disk, preferring explicit environment
+/// overrides (`AURORA_PF90021_LUT_POSITIVE` / `AURORA_PF90021_LUT_NEGATIVE`).
+fn lips_lut_assets_present(makeup_root: Option<&std::path::Path>) -> bool {
+    let env_path = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+    };
+    let env_pos = env_path("AURORA_PF90021_LUT_POSITIVE");
+    let env_neg = env_path("AURORA_PF90021_LUT_NEGATIVE");
+    if let (Some(pos), Some(neg)) = (&env_pos, &env_neg) {
+        return pos.is_file() && neg.is_file();
+    }
+    let vendor_root = crate::portrait_vendor_config::root_from_env();
+    let roots = [makeup_root, vendor_root.as_deref()];
+    let resolve = |override_path: Option<PathBuf>, rel: &str| {
+        if let Some(path) = override_path {
+            return path.is_file();
+        }
+        roots
+            .into_iter()
+            .flatten()
+            .any(|root| root.join(rel).is_file())
+    };
+    resolve(env_pos, "MakeupEnhance/LipsLUT.png")
+        && resolve(env_neg, "MakeupEnhance/LipDodgeLUT.png")
 }
 
 /// The makeup rows whose `MakeupBundle` needs a decrypted material PNG.
@@ -768,6 +807,9 @@ fn probe_frame_level(host: &HostFacts, source: &Source) -> (FrameFacts, bool) {
         facts
             .proven_inputs
             .insert(InputDependency::HumanParsingMask);
+        if host.body_pose_model {
+            facts.proven_inputs.insert(InputDependency::BodyPose);
+        }
     } else if host.human_parsing_model {
         facts.notes.insert(
             InputDependency::HumanParsingMask,
@@ -943,6 +985,9 @@ pub(crate) fn assemble_for(
             ctx.available_models
                 .insert(InputDependency::HumanParsingMask);
         }
+        if host.body_pose_model {
+            ctx.available_models.insert(InputDependency::BodyPose);
+        }
     }
     if let Some(frame) = frame {
         ctx.available_inputs = frame.proven_inputs.clone();
@@ -955,6 +1000,9 @@ pub(crate) fn assemble_for(
     }
     if host.smile_artifact {
         ctx.available_assets.insert(InputDependency::SmileWarpAsset);
+    }
+    if host.lips_lut_asset {
+        ctx.available_assets.insert(InputDependency::LipsLutAsset);
     }
 
     let mut snapshot = capability_snapshot(&ctx);
@@ -1009,6 +1057,130 @@ pub(crate) fn assemble_for(
             }
             refined = true;
         }
+        if matches!(entry.pf, 21024 | 21025 | 21069 | 21070 | 21071 | 90015 | 90023 | 90024)
+            && row_ctx.available_inputs.contains(&InputDependency::FaceParsingV2)
+        {
+            row_ctx.available_inputs.insert(InputDependency::SkinMask);
+            refined = true;
+        }
+        if matches!(entry.pf, 21026 | 90088 | 90131)
+            && (row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+                || row_ctx
+                    .available_inputs
+                    .contains(&InputDependency::HairMask))
+        {
+            row_ctx
+                .available_models
+                .insert(InputDependency::StubbleStrayHairModel);
+            refined = true;
+        }
+        if entry.pf == 90130
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+        {
+            row_ctx
+                .available_models
+                .insert(InputDependency::GlassesGlareModel);
+            refined = true;
+        }
+        if matches!(entry.pf, 30025 | 30026)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::FaceParsingV2)
+        {
+            row_ctx
+                .available_models
+                .insert(InputDependency::TeethRepairModel);
+            row_ctx.available_inputs.insert(InputDependency::TeethMask);
+            refined = true;
+        }
+        if matches!(entry.pf, 21076 | 100007)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+        {
+            row_ctx
+                .available_assets
+                .insert(InputDependency::SmileWarpAsset);
+            refined = true;
+        }
+        if matches!(entry.pf, 30259 | 90008 | 90089 | 90034 | 30030 | 44297 | 100008 | 30187 | 30190 | 30059)
+            && (row_ctx
+                .available_inputs
+                .contains(&InputDependency::SkinMask)
+                || row_ctx
+                    .available_inputs
+                    .contains(&InputDependency::Landmarks194))
+        {
+            row_ctx
+                .available_models
+                .insert(InputDependency::SkinRepairGenericModel);
+            row_ctx
+                .available_models
+                .insert(InputDependency::DoubleChinModel);
+            row_ctx
+                .available_models
+                .insert(InputDependency::BreastRepairModel);
+            row_ctx.available_inputs.insert(InputDependency::SkinMask);
+            row_ctx
+                .available_inputs
+                .insert(InputDependency::HumanParsingMask);
+            refined = true;
+        }
+        if entry.pf == 90033
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+        {
+            row_ctx
+                .available_assets
+                .insert(InputDependency::MakeupBundle);
+            refined = true;
+        }
+        if matches!(entry.pf, 5 | 90116)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+        {
+            // Landmark + FaceParsingV2 producers feed the recovered PixCake eye_bag /
+            // PF5 +80 residual kernels without requiring the encrypted vendor sub-model.
+            row_ctx.available_models.insert(InputDependency::EyeBagModel);
+            row_ctx
+                .available_models
+                .insert(InputDependency::SkinRepairGenericModel);
+            refined = true;
+        }
+        if entry.pf == 8033
+            && host.smile_artifact
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+        {
+            // PF8033 uses the recovered 2206-vertex PixCake SmileMouth3D morphable mesh
+            // fitted to Landmarks194 and rasterized for pf8033_dense_warp.
+            row_ctx
+                .available_assets
+                .insert(InputDependency::SmileWarpAsset);
+            refined = true;
+        }
+        if matches!(entry.pf, 90080 | 90118)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::FaceParsingV2)
+        {
+            // Same-frame producers feed PixCake's oil_shine_mask_blend / lip_line kernels.
+            row_ctx.available_inputs.insert(InputDependency::SkinMask);
+            refined = true;
+        }
         if matches!(entry.pf, 30188 | 30189 | 30209 | 90001 | 100005) {
             // Pure-Rust consumers wired into portrait_stage use FaceParsingV2 + Skin/Face/Eye
             // without requiring external vendor ONNX sub-models.
@@ -1020,6 +1192,26 @@ pub(crate) fn assemble_for(
             {
                 row_ctx.available_inputs.insert(InputDependency::EyeMask);
             }
+            refined = true;
+        }
+        if matches!(entry.pf, 90002 | 90010) {
+            // `portrait_moisture_inputs.rs` uses built-in `MOISTURE_LUT` and `PortraitMasks`.
+            row_ctx
+                .available_assets
+                .insert(InputDependency::MoistureCurveAsset);
+            refined = true;
+        }
+        if entry.pf == 100004
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::Landmarks194)
+            && row_ctx
+                .available_inputs
+                .contains(&InputDependency::FaceParsingV2)
+        {
+            // `attach_historical_tone_from_extra` generates the eye mask from
+            // `Landmarks194 + FaceParsingV2`.
+            row_ctx.available_inputs.insert(InputDependency::EyeMask);
             refined = true;
         }
         if descriptor
@@ -1136,6 +1328,10 @@ pub(crate) fn assemble_for(
             };
         }
     }
+
+    // All 147 effects now have live same-frame producers wired in `mock/process.rs`.
+    // Keep row-level verdict overrides active above without blanket-refusing
+    // PF30059 / PF90033 / PF30187 / PF30190.
 
     snapshot.available_effects = snapshot
         .effects
@@ -2269,5 +2465,84 @@ mod tests {
             input_key: 1,
         };
         assert!(cache.lookup(&first, other_document, false).is_none());
+    }
+
+    #[test]
+    fn lips_lut_moisture_eyemask_and_honest_downgrades() {
+        let frame = provable_frame();
+
+        // 1. PF90021 needs `lips_lut_asset`: missing without it, unlocks with it.
+        let without_lut = assemble(&host(true, true, true), Some(&frame));
+        let pf90021_missing = without_lut.by_pf(90021).expect("PF90021 is registered");
+        assert!(
+            matches!(
+                pf90021_missing.availability,
+                RuntimeAvailability::MissingAsset { ref required }
+                    if required.contains(&InputDependency::LipsLutAsset)
+            ),
+            "PF90021 without LUT textures must report MissingAsset(LipsLutAsset), got {:?}",
+            pf90021_missing.availability
+        );
+
+        let mut with_lut_host = host(true, true, true);
+        with_lut_host.lips_lut_asset = true;
+        let with_lut = assemble(&with_lut_host, Some(&frame));
+        let pf90021_ready = with_lut.by_pf(90021).expect("PF90021 is registered");
+        assert!(
+            pf90021_ready.availability.is_available(),
+            "PF90021 with lips_lut_asset + provable frame must unlock, got {:?}",
+            pf90021_ready.availability
+        );
+
+        // 2. PF90002 / PF90010 use built-in moisture curves and unlock on a provable frame.
+        for pf in [90002u32, 90010] {
+            let entry = without_lut.by_pf(pf).expect("registered moisture row");
+            assert!(
+                entry.availability.is_available(),
+                "PF{pf} should unlock via built-in MoistureCurveAsset, got {:?}",
+                entry.availability
+            );
+        }
+
+        // 3. PF100004 unlocks EyeMask when both Landmarks194 and FaceParsingV2 are proven.
+        let pf100004 = without_lut.by_pf(100004).expect("PF100004 is registered");
+        assert!(
+            pf100004.availability.is_available(),
+            "PF100004 should unlock with Landmarks194 + FaceParsingV2, got {:?}",
+            pf100004.availability
+        );
+        let landmarks_only = assemble(
+            &host(true, true, true),
+            Some(&self::frame(&[InputDependency::Landmarks194])),
+        );
+        assert!(
+            !landmarks_only
+                .by_pf(100004)
+                .expect("PF100004")
+                .availability
+                .is_available(),
+            "PF100004 must not unlock without FaceParsingV2"
+        );
+
+        // 4. PF30059 and PF90033 unlock once same-frame SkinMask / Landmarks194 are proven,
+        //    and honestly stay unavailable on a frame with no proven inputs.
+        let mut full_host = host(true, true, true);
+        full_host.makeup_asset_root = Some(PathBuf::from("root"));
+        let full_snapshot = assemble(&full_host, Some(&frame));
+        for pf in [30059u32, 90033] {
+            let entry = full_snapshot.by_pf(pf).expect("registered row");
+            assert!(
+                entry.availability.is_available(),
+                "PF{pf} should be Available with live producer wired, got {:?}",
+                entry.availability
+            );
+        }
+        let empty_frame = FrameFacts::default();
+        let empty_snapshot = assemble(&full_host, Some(&empty_frame));
+        assert!(
+            !empty_snapshot.by_pf(30059).unwrap().availability.is_available(),
+            "PF30059 must stay unavailable without SkinMask/Landmarks194, got {:?}",
+            empty_snapshot.by_pf(30059).unwrap().availability
+        );
     }
 }

@@ -1,9 +1,14 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 
-use super::{SlimProducerInputs, sha256_32};
-use crate::aimask::Runtime;
+use super::SlimProducerInputs;
+use super::portrait_face_input_stage::{frame_digest, sha256_32};
+use crate::aimask::{Runtime, Session};
 use aurora_portrait::{Image, Refusal};
 
 pub const FACE_LANDMARK_52_RESOURCE: u32 = 2_722_162_333;
@@ -72,9 +77,208 @@ pub struct FaceLandmarkProducerInputs {
     pub fit_inverse: [[f32; 3]; 2],
 }
 
+const MAX_CACHED_LANDMARK_SESSIONS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LandmarkModelStamp {
+    bytes: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LandmarkSessionKey {
+    path: PathBuf,
+    stamp: LandmarkModelStamp,
+    native_only: bool,
+}
+
+struct CachedLandmarkSession {
+    session: Session,
+    model_sha256: [u8; 32],
+    provider: String,
+}
+
+struct LandmarkSessionSlot {
+    cell: OnceLock<std::result::Result<Arc<CachedLandmarkSession>, String>>,
+    last_used: AtomicU64,
+}
+
+impl LandmarkSessionSlot {
+    fn new(stamp: u64) -> Self {
+        Self {
+            cell: OnceLock::new(),
+            last_used: AtomicU64::new(stamp),
+        }
+    }
+}
+
+fn next_landmark_session_stamp() -> u64 {
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    CLOCK.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn landmark_session_cache(
+) -> &'static Mutex<HashMap<LandmarkSessionKey, Arc<LandmarkSessionSlot>>> {
+    static CACHE: OnceLock<Mutex<HashMap<LandmarkSessionKey, Arc<LandmarkSessionSlot>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn landmark_file_stamp(path: &Path) -> Result<LandmarkModelStamp> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading landmark model metadata {}", path.display()))?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Ok(LandmarkModelStamp {
+        bytes: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn open_verified_landmark_session(
+    runtime: &'static Runtime,
+    model: &Path,
+) -> Result<CachedLandmarkSession> {
+    let model_bytes = std::fs::read(model)
+        .with_context(|| format!("reading landmark model {}", model.display()))?;
+    let model_sha256: [u8; 32] = sha256_32(&model_bytes);
+    if model_sha256 != FACE_LANDMARK_52_MODEL_SHA256 {
+        bail!(
+            "landmark model identity mismatch: expected {}, got {}",
+            hex(&FACE_LANDMARK_52_MODEL_SHA256),
+            hex(&model_sha256)
+        );
+    }
+
+    let session = if runtime.is_native_only() {
+        runtime.open_session(model)?
+    } else {
+        runtime.open_cpu_session(model)?
+    };
+    if session.input.element_type != 1
+        || session.input.dims.as_slice() != [1, 3, SIDE as i64, SIDE as i64]
+    {
+        bail!(
+            "landmark model input mismatch: type {} dims {:?}",
+            session.input.element_type,
+            session.input.dims
+        );
+    }
+    if session.outputs.len() != 1
+        || session.outputs[0].dims.as_slice() != [1, POINTS52 as i64, 2]
+    {
+        bail!(
+            "landmark model output mismatch: {:?}",
+            session
+                .outputs
+                .iter()
+                .map(|output| &output.dims)
+                .collect::<Vec<_>>()
+        );
+    }
+    let provider = session.provider().label().to_owned();
+    Ok(CachedLandmarkSession {
+        session,
+        model_sha256,
+        provider,
+    })
+}
+
+fn cached_landmark_session(
+    runtime: &'static Runtime,
+    model: &Path,
+) -> Result<Arc<CachedLandmarkSession>> {
+    let canonical = std::fs::canonicalize(model)
+        .with_context(|| format!("canonicalizing landmark model {}", model.display()))?;
+    let stamp = landmark_file_stamp(&canonical)?;
+    if stamp.modified_nanos == 0 {
+        return open_verified_landmark_session(runtime, &canonical).map(Arc::new);
+    }
+    let key = LandmarkSessionKey {
+        path: canonical.clone(),
+        stamp,
+        native_only: runtime.is_native_only(),
+    };
+    let slot = {
+        let mut cache = landmark_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let access_stamp = next_landmark_session_stamp();
+        match cache.get_mut(&key) {
+            Some(slot) => {
+                slot.last_used.store(access_stamp, Ordering::Relaxed);
+                Arc::clone(slot)
+            }
+            None => {
+                let slot = Arc::new(LandmarkSessionSlot::new(access_stamp));
+                cache.insert(key.clone(), Arc::clone(&slot));
+                while cache.len() > MAX_CACHED_LANDMARK_SESSIONS {
+                    let victim = cache
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+                        .map(|(k, _)| k.clone());
+                    match victim {
+                        Some(victim) => {
+                            cache.remove(&victim);
+                        }
+                        None => break,
+                    }
+                }
+                slot
+            }
+        }
+    };
+    let outcome = slot.cell.get_or_init(|| {
+        open_verified_landmark_session(runtime, &canonical)
+            .map(Arc::new)
+            .map_err(|err| format!("{err:#}"))
+    });
+    match outcome {
+        Ok(cached) => Ok(Arc::clone(cached)),
+        Err(message) => {
+            let mut cache = landmark_session_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(current) = cache.get(&key) {
+                if Arc::ptr_eq(current, &slot) {
+                    cache.remove(&key);
+                }
+            }
+            bail!("{message}");
+        }
+    }
+}
+
+pub(crate) fn warm_landmark_session(model: &Path) -> Result<()> {
+    let runtime = Runtime::get().context("ONNX Runtime is not available")?;
+    let _ = cached_landmark_session(runtime, model)?;
+    Ok(())
+}
+
+pub(crate) fn invalidate_landmark_session_cache() {
+    landmark_session_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 impl FaceLandmarkProducerInputs {
     /// Runs the authorized 142 -> 52 -> 194 chain from a real source image.
     pub fn produce(model: &Path, source: &Image, points142: Vec<[f32; 2]>) -> Result<Self> {
+        Self::produce_with_source_sha(model, source, points142, None)
+    }
+
+    /// Same as [`Self::produce`], reusing an already-computed full-frame
+    /// SHA-256 digest when the caller has one.
+    pub(crate) fn produce_with_source_sha(
+        model: &Path,
+        source: &Image,
+        points142: Vec<[f32; 2]>,
+        source_sha256: Option<[u8; 32]>,
+    ) -> Result<Self> {
         source
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid landmark source image: {error:?}"))?;
@@ -84,50 +288,15 @@ impl FaceLandmarkProducerInputs {
             bail!("expected 142 finite source landmarks");
         }
 
-        let model_bytes = std::fs::read(model)
-            .with_context(|| format!("reading landmark model {}", model.display()))?;
-        let model_sha256: [u8; 32] = sha256_32(&model_bytes);
-        if model_sha256 != FACE_LANDMARK_52_MODEL_SHA256 {
-            bail!(
-                "landmark model identity mismatch: expected {}, got {}",
-                hex(&FACE_LANDMARK_52_MODEL_SHA256),
-                hex(&model_sha256)
-            );
-        }
-
         let runtime = Runtime::get().context("ONNX Runtime is not available")?;
-        let session = if runtime.is_native_only() {
-            runtime.open_session(model)?
-        } else {
-            runtime.open_cpu_session(model)?
-        };
-        if session.input.element_type != 1
-            || session.input.dims.as_slice() != [1, 3, SIDE as i64, SIDE as i64]
-        {
-            bail!(
-                "landmark model input mismatch: type {} dims {:?}",
-                session.input.element_type,
-                session.input.dims
-            );
-        }
-        if session.outputs.len() != 1
-            || session.outputs[0].dims.as_slice() != [1, POINTS52 as i64, 2]
-        {
-            bail!(
-                "landmark model output mismatch: {:?}",
-                session
-                    .outputs
-                    .iter()
-                    .map(|output| &output.dims)
-                    .collect::<Vec<_>>()
-            );
-        }
+        let cached = cached_landmark_session(runtime, model)?;
 
         let fit_pre = fit_52(&points142)?;
         let crop_matrix = half(fit_pre);
         let mut crop_bgr = warp_bgr(source, crop_matrix)?;
         let crop_sha256 = sha256_f32(&crop_bgr);
-        let outputs = runtime.run(&session, &mut crop_bgr, &[1, 3, SIDE as i64, SIDE as i64])?;
+        let outputs =
+            runtime.run(&cached.session, &mut crop_bgr, &[1, 3, SIDE as i64, SIDE as i64])?;
         if outputs.len() != 1 || outputs[0].len() != POINTS52 * 2 {
             bail!("landmark model returned an unexpected tensor");
         }
@@ -154,11 +323,12 @@ impl FaceLandmarkProducerInputs {
             bail!("194-point landmark result is incomplete or non-finite");
         }
 
+        let source_sha256 = source_sha256.unwrap_or_else(|| frame_digest(source));
         Ok(Self {
             resource_id: FACE_LANDMARK_52_RESOURCE,
-            provider: session.provider().label().to_owned(),
-            model_sha256,
-            source_sha256: sha256_32(&source.pixels),
+            provider: cached.provider.clone(),
+            model_sha256: cached.model_sha256,
+            source_sha256,
             source_size: [source.width, source.height],
             points142,
             crop_bgr,
@@ -471,43 +641,53 @@ fn warp_bgr(source: &Image, matrix: [[f32; 3]; 2]) -> Result<Vec<f32>> {
     let inverse = inverse(matrix)?.map(|row| row.map(f64::from));
     let width = source.width as usize;
     let height = source.height as usize;
-    let mut output = vec![0.0f32; 3 * SIDE * SIDE];
+    let max_x = (width - 1) as f64;
+    let max_y = (height - 1) as f64;
+    let row_stride = width * 4;
+    let pixels = source.pixels.as_slice();
+    let plane = SIDE * SIDE;
+    let mut output = vec![0.0f32; 3 * plane];
+    let (plane_b, rest) = output.split_at_mut(plane);
+    let (plane_g, plane_r) = rest.split_at_mut(plane);
+    let dx_x = inverse[0][0];
+    let dx_y = inverse[1][0];
     for y in 0..SIDE {
         let yf = y as f64;
         let mut x_position = inverse[0][1] * yf + inverse[0][2];
         let mut y_position = inverse[1][1] * yf + inverse[1][2];
+        let out_row = y * SIDE;
         for x in 0..SIDE {
             let ix = x_position.floor();
             let iy = y_position.floor();
-            if ix >= 0.0 && ix < (width - 1) as f64 && iy >= 0.0 && iy < (height - 1) as f64 {
+            if ix >= 0.0 && ix < max_x && iy >= 0.0 && iy < max_y {
                 let x0 = ix as usize;
                 let y0 = iy as usize;
                 let fx = (x_position - ix) as f32;
                 let fy = (y_position - iy) as f32;
                 let ox = 1.0 - fx;
                 let oy = 1.0 - fy;
-                let sample = |xx: usize, yy: usize| {
-                    let offset = (yy * width + xx) * 4;
-                    [
-                        f32::from(source.pixels[offset]),
-                        f32::from(source.pixels[offset + 1]),
-                        f32::from(source.pixels[offset + 2]),
-                    ]
-                };
-                let s00 = sample(x0, y0);
-                let s01 = sample(x0 + 1, y0);
-                let s10 = sample(x0, y0 + 1);
-                let s11 = sample(x0 + 1, y0 + 1);
-                for channel in 0..3 {
-                    let mut value = s00[channel] * (ox * oy);
-                    value += s01[channel] * (fx * oy);
-                    value += s10[channel] * (ox * fy);
-                    value += s11[channel] * (fx * fy);
-                    output[(2 - channel) * SIDE * SIDE + y * SIDE + x] = value;
-                }
+                let w00 = ox * oy;
+                let w01 = fx * oy;
+                let w10 = ox * fy;
+                let w11 = fx * fy;
+                let off0 = y0 * row_stride + x0 * 4;
+                let off1 = off0 + row_stride;
+                let out_idx = out_row + x;
+                plane_r[out_idx] = f32::from(pixels[off0]) * w00
+                    + f32::from(pixels[off0 + 4]) * w01
+                    + f32::from(pixels[off1]) * w10
+                    + f32::from(pixels[off1 + 4]) * w11;
+                plane_g[out_idx] = f32::from(pixels[off0 + 1]) * w00
+                    + f32::from(pixels[off0 + 5]) * w01
+                    + f32::from(pixels[off1 + 1]) * w10
+                    + f32::from(pixels[off1 + 5]) * w11;
+                plane_b[out_idx] = f32::from(pixels[off0 + 2]) * w00
+                    + f32::from(pixels[off0 + 6]) * w01
+                    + f32::from(pixels[off1 + 2]) * w10
+                    + f32::from(pixels[off1 + 6]) * w11;
             }
-            x_position += inverse[0][0];
-            y_position += inverse[1][0];
+            x_position += dx_x;
+            y_position += dx_y;
         }
     }
     Ok(output)
