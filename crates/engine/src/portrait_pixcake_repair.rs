@@ -225,10 +225,14 @@ pub(crate) fn build_pf90080_oil_shine_output(
         region[p] = skin_mask[p] as f32 / 255.0 * focus[p];
     }
 
-    // Two-scale diffuse skin baseline: combine local wide skin-weighted blur
-    // with the global diffuse skin mean so wide forehead specular patches never
-    // dominate their own baseline and leave a chalky white center island.
-    let base_radius = (width.min(height) / 5).clamp(10, 64);
+    // Scale every blur radius to `eye_dist` (face scale) instead of frame size
+    // so fit-to-screen, 65%, 100%, 125%, and 24MP renders produce identical
+    // matte diffuse appearance on the face regardless of zoom level.
+    let eye_dist = match (point(face_points194, 26), point(face_points194, 44)) {
+        (Some(l), Some(r)) => distance(l, r).max(16.0),
+        _ => (width.min(height) as f32 * 0.25).max(16.0),
+    };
+    let base_radius = ((eye_dist * 0.42).round() as usize).clamp(6, 96);
     let base_r = weighted_blur(&source_r, &region, width, height, base_radius);
     let base_g = weighted_blur(&source_g, &region, width, height, base_radius);
     let base_b = weighted_blur(&source_b, &region, width, height, base_radius);
@@ -286,7 +290,7 @@ pub(crate) fn build_pf90080_oil_shine_output(
     }
 
     let ones = vec![1.0f32; pixels];
-    let feather_r = (base_radius / 5).clamp(2, 10);
+    let feather_r = ((eye_dist * 0.09).round() as usize).clamp(1, 18);
     let feathered = weighted_blur(
         &weighted_blur(&oil, &ones, width, height, feather_r),
         &ones,
@@ -311,7 +315,7 @@ pub(crate) fn build_pf90080_oil_shine_output(
     let matte_r = weighted_blur(&source_r, &diffuse_weight, width, height, base_radius);
     let matte_g = weighted_blur(&source_g, &diffuse_weight, width, height, base_radius);
     let matte_b = weighted_blur(&source_b, &diffuse_weight, width, height, base_radius);
-    let pore_r = (width.min(height) / 300).clamp(1, 3);
+    let pore_r = ((eye_dist * 0.015).round() as usize).clamp(1, 4);
     let smooth_src_luma = weighted_blur(&luma, &region, width, height, pore_r);
 
     let mut effect_rgb = vec![0u8; pixels * 3];

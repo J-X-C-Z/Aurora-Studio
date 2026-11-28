@@ -3859,6 +3859,12 @@ fn render_sized(
                                 }
                             }
                         }
+                        // Crop PortraitMasks once into the current viewport `region` so
+                        // attachers that read `NormRect::FULL` align pixel-for-pixel at
+                        // every zoom/pan level (fit-to-screen, 65%, 100%, 125%, 24MP).
+                        let cropped_masks = (region != NormRect::FULL)
+                            .then(|| masks.cropped_to_region(region));
+                        let stage_masks = cropped_masks.as_ref().unwrap_or(masks);
                         // The apply path needs moisture planes only for
                         // PF90002 (face) or PF90010 (body); both live in the
                         // same producer call.
@@ -3867,7 +3873,7 @@ fn render_sized(
                             || adj.extra.get("pc:90010").copied().unwrap_or(0.0) != 0.0;
                         if moisture_active
                             && bundle
-                                .attach_moisture_inputs(stage_frame, masks, &mut inputs)
+                                .attach_moisture_inputs(stage_frame, stage_masks, &mut inputs)
                                 .is_ok()
                         {
                             attached = true;
@@ -3881,7 +3887,7 @@ fn render_sized(
                         }
                         match bundle.attach_historical_tone_from_extra(
                             stage_frame,
-                            Some(masks),
+                            Some(stage_masks),
                             &adj.extra,
                             &mut inputs,
                         ) {
@@ -3895,7 +3901,7 @@ fn render_sized(
                         if bundle
                             .attach_historical_skin_from_extra(
                                 stage_frame,
-                                Some(masks),
+                                Some(stage_masks),
                                 &adj.extra,
                                 &mut inputs,
                             )
@@ -3906,7 +3912,7 @@ fn render_sized(
                         if bundle
                             .attach_hair_detail_from_extra(
                                 stage_frame,
-                                Some(masks),
+                                Some(stage_masks),
                                 &adj.extra,
                                 &mut inputs,
                             )
@@ -3918,7 +3924,7 @@ fn render_sized(
                             && bundle
                                 .attach_pf90004_from_extra(
                                     stage_frame,
-                                    Some(masks),
+                                    Some(stage_masks),
                                     &adj.extra,
                                     &mut inputs,
                                 )
@@ -3929,7 +3935,7 @@ fn render_sized(
                         if bundle
                             .attach_pixcake_repair_and_eyebag_from_extra(
                                 stage_frame,
-                                Some(masks),
+                                Some(stage_masks),
                                 &adj.extra,
                                 &mut inputs,
                             )
@@ -3940,7 +3946,7 @@ fn render_sized(
                         if bundle
                             .attach_pixcake_remaining_19_from_extra(
                                 stage_frame,
-                                Some(masks),
+                                Some(stage_masks),
                                 &adj.extra,
                                 &mut inputs,
                             )

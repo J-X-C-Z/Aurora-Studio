@@ -355,6 +355,33 @@ impl PortraitMasks {
         Some(out)
     }
 
+    /// Resamples every available plane into `region`, keeping the mask's own
+    /// grid dimensions. Calling an attacher that internally reads
+    /// `NormRect::FULL` on the cropped masks then aligns pixel-for-pixel with
+    /// a zoomed viewport tile (`region != NormRect::FULL`).
+    pub fn cropped_to_region(&self, region: NormRect) -> Self {
+        if region == NormRect::FULL || self.width == 0 || self.height == 0 {
+            return Self {
+                skin: self.skin.clone(),
+                hair: self.hair.clone(),
+                face: self.face.clone(),
+                body: self.body.clone(),
+                width: self.width,
+                height: self.height,
+            };
+        }
+        let w = self.width as u32;
+        let h = self.height as u32;
+        Self {
+            skin: self.mask_f32(MaskKind::Skin, w, h, region),
+            hair: self.mask_f32(MaskKind::Hair, w, h, region),
+            face: self.mask_f32(MaskKind::Face, w, h, region),
+            body: self.mask_f32(MaskKind::Body, w, h, region),
+            width: self.width,
+            height: self.height,
+        }
+    }
+
     /// Build the PF90004 fields that the local people parser can prove.
     /// Vendor parsing/face packings remain absent rather than being guessed.
     pub fn pf90004_parser_inputs(
@@ -8257,41 +8284,117 @@ fn apply_pf0_spotless(
         out
     };
 
-    let spot_r = (w.min(h) / 140).clamp(4, 14);
-    let pore_r = (spot_r / 3).clamp(1, 3);
-    // Two-pass skin-masked blur approximates Gaussian without bleeding hair/brows.
-    let br = weighted_box(&weighted_box(&sr, &weight, spot_r), &weight, spot_r);
-    let bg = weighted_box(&weighted_box(&sg, &weight, spot_r), &weight, spot_r);
-    let bb = weighted_box(&weighted_box(&sb, &weight, spot_r), &weight, spot_r);
+    let face_w = mask_bbox(face, w, h)
+        .or_else(|| mask_bbox(skin, w, h))
+        .map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32)
+        .unwrap_or_else(|| w.min(h) as f32 * 0.35);
+    // Scale spot radius strictly to face width so fit-to-screen, 65%, 100%,
+    // 125%, and 24MP renders all heal the exact same physical blemish size
+    // without ever blurring eyes/nose/mouth into mush at low zoom.
+    let spot_r = ((face_w * 0.014).round() as usize).clamp(1, 9);
+    let pore_r = (spot_r / 3).clamp(1, 2);
     let fine_luma = weighted_box(&luma, &weight, pore_r);
 
-    // Continuous localized blemish mask: dark spots, red acne bumps, and small
-    // localized bright whiteheads — never triggering on broad smooth shading.
+    // Edge-safe isotropic surrounded-spot detector:
+    // A real pimple/freckle/acne spot is darker (or redder/brighter) than BOTH
+    // opposite sides of its surrounding ring on at least 3 of 4 axes (H, V, D1,
+    // D2) with low opposite-side contrast. Anatomical edges (eyelids, brows,
+    // nostril wings, lip borders, philtrum, jaw contour) sit on strong step
+    // edges and fail this test, so they stay 100% crisp and untouched.
     let mut blemish = vec![0.0f32; pixels];
-    for p in 0..pixels {
-        let wt = weight[p];
-        if wt <= 1e-4 {
-            continue;
+    let mut target_r_buf = sr.clone();
+    let mut target_g_buf = sg.clone();
+    let mut target_b_buf = sb.clone();
+    let d = spot_r as isize;
+    let diag = ((spot_r as f32 * 0.7071).round() as isize).max(1);
+    let axes: [((isize, isize), (isize, isize)); 4] = [
+        ((-d, 0), (d, 0)),
+        ((0, -d), (0, d)),
+        ((-diag, -diag), (diag, diag)),
+        ((-diag, diag), (diag, -diag)),
+    ];
+    let w_i = w as isize;
+    let h_i = h as isize;
+    for y in 0..h {
+        let yi = y as isize;
+        for x in 0..w {
+            let p = y * w + x;
+            let wt = weight[p];
+            if wt <= 0.08 {
+                continue;
+            }
+            let xi = x as isize;
+            let cl = luma[p];
+            let crg = sr[p] - sg[p];
+
+            let mut dark_pairs = [0.0f32; 4];
+            let mut red_pairs = [0.0f32; 4];
+            let mut bright_pairs = [0.0f32; 4];
+            let mut max_edge = 0.0f32;
+            let mut ring_r = 0.0f32;
+            let mut ring_g = 0.0f32;
+            let mut ring_b = 0.0f32;
+            let mut ring_w = 0.0f32;
+            let mut valid_axes = 0usize;
+
+            for (k, &((dx0, dy0), (dx1, dy1))) in axes.iter().enumerate() {
+                let x0 = (xi + dx0).clamp(0, w_i - 1) as usize;
+                let y0 = (yi + dy0).clamp(0, h_i - 1) as usize;
+                let x1 = (xi + dx1).clamp(0, w_i - 1) as usize;
+                let y1 = (yi + dy1).clamp(0, h_i - 1) as usize;
+                let i0 = y0 * w + x0;
+                let i1 = y1 * w + x1;
+                let w0 = weight[i0];
+                let w1 = weight[i1];
+                if w0 < 0.1 || w1 < 0.1 {
+                    continue;
+                }
+                valid_axes += 1;
+                let l0 = luma[i0];
+                let l1 = luma[i1];
+                max_edge = max_edge.max((l0 - l1).abs());
+                // Strictly surrounded: BOTH opposite neighbors must exceed center.
+                dark_pairs[k] = (l0.min(l1) - cl).max(0.0);
+                let rg0 = sr[i0] - sg[i0];
+                let rg1 = sr[i1] - sg[i1];
+                red_pairs[k] = (crg - rg0.max(rg1)).max(0.0);
+                bright_pairs[k] = (cl - l0.max(l1)).max(0.0);
+
+                ring_r += sr[i0] * w0 + sr[i1] * w1;
+                ring_g += sg[i0] * w0 + sg[i1] * w1;
+                ring_b += sb[i0] * w0 + sb[i1] * w1;
+                ring_w += w0 + w1;
+            }
+            if valid_axes < 3 || ring_w <= 1e-4 {
+                continue;
+            }
+            // Take the 2nd smallest across the 4 axes (= surrounded on at least 3 axes),
+            // rejecting lines/creases/nostril wings while keeping round/oval spots.
+            dark_pairs.sort_by(|a, b| a.total_cmp(b));
+            red_pairs.sort_by(|a, b| a.total_cmp(b));
+            bright_pairs.sort_by(|a, b| a.total_cmp(b));
+
+            let edge_protect = 1.0 - smoothstep(14.0, 32.0, max_edge);
+            let dark_score = smoothstep(4.5, 18.0, dark_pairs[1]);
+            let acne_score = smoothstep(3.5, 14.0, red_pairs[1]);
+            let bright_score = smoothstep(7.0, 24.0, bright_pairs[1]) * 0.70;
+            let score = dark_score.max(acne_score).max(bright_score) * edge_protect * wt;
+            if score > 1e-4 {
+                blemish[p] = score;
+                target_r_buf[p] = ring_r / ring_w;
+                target_g_buf[p] = ring_g / ring_w;
+                target_b_buf[p] = ring_b / ring_w;
+            }
         }
-        let bluma = 0.299 * br[p] + 0.587 * bg[p] + 0.114 * bb[p];
-        let dark_excess = (bluma - luma[p]).max(0.0);
-        let red_excess = ((sr[p] - sg[p]) - (br[p] - bg[p])).max(0.0);
-        let light_excess = (luma[p] - bluma).max(0.0);
-
-        let dark_score = smoothstep(5.0, 22.0, dark_excess);
-        let acne_score = smoothstep(4.0, 16.0, red_excess);
-        // Only suppress compact bright blemishes (high local contrast vs fine_luma),
-        // leaving broad forehead/cheek highlights smooth and natural.
-        let local_peak = (luma[p] - fine_luma[p]).max(0.0);
-        let bright_score = smoothstep(7.0, 26.0, light_excess) * smoothstep(2.0, 10.0, local_peak);
-
-        blemish[p] = dark_score.max(acne_score).max(bright_score * 0.75) * wt;
     }
 
-    // Soften the blemish mask so healed spots feather invisibly into surrounding skin.
+    // Gentle face-scaled feather so healed spots blend seamlessly without haloing edges.
     let ones = vec![1.0f32; pixels];
-    let feather_r = (spot_r / 3).clamp(1, 4);
+    let feather_r = (spot_r / 3).clamp(1, 3);
     let blemish = weighted_box(&blemish, &ones, feather_r);
+    let tr_smooth = weighted_box(&target_r_buf, &weight, feather_r);
+    let tg_smooth = weighted_box(&target_g_buf, &weight, feather_r);
+    let tb_smooth = weighted_box(&target_b_buf, &weight, feather_r);
 
     let mut image = current.clone();
     for p in 0..pixels {
@@ -8299,11 +8402,11 @@ fn apply_pf0_spotless(
         if alpha <= 1e-4 {
             continue;
         }
-        // Keep 60% of natural fine micro-pore texture while healing low-frequency blemish color.
-        let pore_detail = ((luma[p] - fine_luma[p]) * 0.60).clamp(-12.0, 12.0);
-        let target_r = (br[p] + pore_detail).clamp(0.0, 255.0);
-        let target_g = (bg[p] + pore_detail).clamp(0.0, 255.0);
-        let target_b = (bb[p] + pore_detail).clamp(0.0, 255.0);
+        // Preserve 65% of fine natural micro-pore texture over the clean ring color.
+        let pore_detail = ((luma[p] - fine_luma[p]) * 0.65).clamp(-10.0, 10.0);
+        let target_r = (tr_smooth[p] + pore_detail).clamp(0.0, 255.0);
+        let target_g = (tg_smooth[p] + pore_detail).clamp(0.0, 255.0);
+        let target_b = (tb_smooth[p] + pore_detail).clamp(0.0, 255.0);
         let off = p * 4;
         image.pixels[off] = (sr[p] + alpha * (target_r - sr[p])).round().clamp(0.0, 255.0) as u8;
         image.pixels[off + 1] = (sg[p] + alpha * (target_g - sg[p])).round().clamp(0.0, 255.0) as u8;
@@ -8420,7 +8523,13 @@ fn apply_texture_smooth(
     if strength <= 0.0 {
         return Ok(current.clone());
     }
-    let blur = box_blur_rgba(current, 4);
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let skin_w = mask_bbox(skin, w, h)
+        .map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32)
+        .unwrap_or_else(|| w.min(h) as f32 * 0.35);
+    let blur_r = ((skin_w * 0.010).round() as u32).clamp(1, 6);
+    let blur = box_blur_rgba(current, blur_r);
     let mut out = current.clone();
     for i in 0..pixels {
         let m = f32::from(skin[i]) / 255.0;
@@ -8539,17 +8648,33 @@ fn apply_nose_flaws(
     let Some((x0, y0, x1, y1)) = bbox else {
         return Ok(current.clone());
     };
+    let face_w = (x1 - x0 + 1) as f32;
     let cx = (x0 + x1) as f32 * 0.5;
     let cy = y0 as f32 + (y1 - y0) as f32 * 0.52;
-    let rx = ((x1 - x0) as f32 * 0.25).max(4.0);
+    let rx = (face_w * 0.25).max(4.0);
     let ry = ((y1 - y0) as f32 * 0.28).max(4.0);
-    let blur = box_blur_rgba(current, 5);
+    // Scale spot radius to face width so nose repair stays identical at all zoom
+    // levels and never blurs nostril wings or nose-bridge shadows into mush.
+    let spot_r = ((face_w * 0.012).round() as isize).clamp(1, 8);
+    let w_i = w as isize;
+    let h_i = h as isize;
+    let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let luma_px = |idx: usize| -> f32 {
+        let o = idx * 4;
+        0.299 * f32::from(current.pixels[o])
+            + 0.587 * f32::from(current.pixels[o + 1])
+            + 0.114 * f32::from(current.pixels[o + 2])
+    };
     let mut out = current.clone();
     for y in y0..=y1 {
+        let yi = y as isize;
         for x in x0..=x1 {
             let i = y * w + x;
             let s = f32::from(skin[i]) / 255.0;
-            if s <= 0.0 {
+            if s <= 0.05 {
                 continue;
             }
             let nx = (x as f32 - cx) / rx;
@@ -8559,21 +8684,41 @@ fn apply_nose_flaws(
                 continue;
             }
             let nose_w = (1.0 - r2).clamp(0.0, 1.0);
+            let xi = x as isize;
+            let i_l = (y * w + (xi - spot_r).clamp(0, w_i - 1) as usize);
+            let i_r = (y * w + (xi + spot_r).clamp(0, w_i - 1) as usize);
+            let i_t = ((yi - spot_r).clamp(0, h_i - 1) as usize * w + x);
+            let i_b = ((yi + spot_r).clamp(0, h_i - 1) as usize * w + x);
+            let ll = luma_px(i_l);
+            let lr = luma_px(i_r);
+            let lt = luma_px(i_t);
+            let lb = luma_px(i_b);
+            let lc = luma_px(i);
+            let edge_c = (ll - lr).abs().max((lt - lb).abs());
+            let edge_protect = 1.0 - smoothstep(14.0, 32.0, edge_c);
+            let surr_dark = (ll.min(lr) - lc).max(0.0).min((lt.min(lb) - lc).max(0.0));
             let off = i * 4;
-            let sr = f32::from(current.pixels[off]) / 255.0;
-            let sg = f32::from(current.pixels[off + 1]) / 255.0;
-            let sb = f32::from(current.pixels[off + 2]) / 255.0;
-            let sl = 0.299 * sr + 0.587 * sg + 0.114 * sb;
-            let bl = 0.299 * blur[off] + 0.587 * blur[off + 1] + 0.114 * blur[off + 2];
-            // Soften dark blemishes / pores / redness spikes relative to local surround.
-            let blemish = ((bl - sl).max(0.0) * 6.0 + (sr - sg - (blur[off] - blur[off + 1])).max(0.0) * 4.0)
-                .clamp(0.0, 1.0);
-            let alpha = strength * s * nose_w * (0.25 + 0.75 * blemish);
+            let sr = f32::from(current.pixels[off]);
+            let sg = f32::from(current.pixels[off + 1]);
+            let ring_rg = |idx: usize| f32::from(current.pixels[idx * 4]) - f32::from(current.pixels[idx * 4 + 1]);
+            let surr_red = (sr - sg - ring_rg(i_l).max(ring_rg(i_r)))
+                .max(0.0)
+                .min((sr - sg - ring_rg(i_t).max(ring_rg(i_b))).max(0.0));
+            let blemish = smoothstep(4.5, 18.0, surr_dark)
+                .max(smoothstep(3.5, 14.0, surr_red))
+                * edge_protect;
+            let alpha = (strength * s * nose_w * blemish).clamp(0.0, 1.0);
+            if alpha <= 1e-4 {
+                continue;
+            }
             for c in 0..3 {
-                let sc = f32::from(current.pixels[off + c]) / 255.0;
-                out.pixels[off + c] = ((sc + (blur[off + c] - sc) * alpha) * 255.0)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                let sc = f32::from(current.pixels[off + c]);
+                let ring_c = 0.25
+                    * (f32::from(current.pixels[i_l * 4 + c])
+                        + f32::from(current.pixels[i_r * 4 + c])
+                        + f32::from(current.pixels[i_t * 4 + c])
+                        + f32::from(current.pixels[i_b * 4 + c]));
+                out.pixels[off + c] = (sc + (ring_c - sc) * alpha).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -8916,7 +9061,9 @@ fn apply_jawline_enhance(
     let Some((x0, y0, x1, y1)) = mask_bbox(mask, w, h) else {
         return Ok(current.clone());
     };
-    let blur = box_blur_rgba(current, 3);
+    let face_w = (x1 - x0 + 1) as f32;
+    let jaw_r = ((face_w * 0.008).round() as u32).clamp(1, 5);
+    let blur = box_blur_rgba(current, jaw_r);
     let jaw_y_min = y0 + ((y1 - y0) as f32 * 0.55) as usize;
     let mut out = current.clone();
     for y in jaw_y_min..=y1 {
@@ -13968,9 +14115,68 @@ mod tests {
         let r90003 = apply_body_skin_uniform(&img, 0.8, Some(&full_mask), Some(&half_face_mask)).unwrap();
         assert_ne!(r90003.pixels, base, "PF90003 should uniform body skin");
 
-        // PF21104
-        let r21104 = apply_nose_flaws(&img, 0.8, Some(&full_mask), Some(&full_mask)).unwrap();
-        assert_ne!(r21104.pixels, base, "PF21104 should repair nose region");
+        // PF21104: isolated blemish on nose gets healed; step edges stay crisp.
+        let mut spot_pixels = vec![190u8; 32 * 32 * 4];
+        for px in spot_pixels.chunks_exact_mut(4) {
+            px[0] = 200;
+            px[1] = 165;
+            px[2] = 140;
+            px[3] = 255;
+        }
+        // Plant an isolated dark blemish right at nose center (16, 16)
+        let center_off = (16 * 32 + 16) * 4;
+        spot_pixels[center_off] = 120;
+        spot_pixels[center_off + 1] = 95;
+        spot_pixels[center_off + 2] = 80;
+        let spot_img = Image::new(32, 32, spot_pixels.clone()).unwrap();
+        let full_mask_32 = vec![255u8; 32 * 32];
+        let r21104 = apply_nose_flaws(&spot_img, 0.8, Some(&full_mask_32), Some(&full_mask_32)).unwrap();
+        assert!(
+            r21104.pixels[center_off] > spot_pixels[center_off] + 20,
+            "PF21104 should heal isolated nose blemish"
+        );
+        // PF0: isolated dark blemish is healed while sharp anatomical step edge stays untouched.
+        let mut edge_and_spot = spot_pixels.clone();
+        for y in 0..32 {
+            for x in 0..8 {
+                let off = (y * 32 + x) * 4;
+                edge_and_spot[off] = 60;
+                edge_and_spot[off + 1] = 50;
+                edge_and_spot[off + 2] = 45;
+            }
+        }
+        let edge_img = Image::new(32, 32, edge_and_spot.clone()).unwrap();
+        let r0 = apply_pf0_spotless(&edge_img, 1.0, Some(&full_mask_32), Some(&full_mask_32)).unwrap();
+        assert!(
+            r0.pixels[center_off] > edge_and_spot[center_off] + 20,
+            "PF0 must heal isolated dark blemish"
+        );
+        let edge_off = (16 * 32 + 7) * 4;
+        assert_eq!(
+            r0.pixels[edge_off], edge_and_spot[edge_off],
+            "PF0 must not smear sharp anatomical step edges (nostril/lip/eyelid)"
+        );
+        // Zoom region crop keeps PortraitMasks aligned on sub-viewport renders.
+        let mut q_mask = vec![0.0f32; 16 * 16];
+        for y in 8..16 {
+            for x in 8..16 {
+                q_mask[y * 16 + x] = 1.0;
+            }
+        }
+        let pm = PortraitMasks {
+            skin: Some(q_mask.clone()),
+            hair: None,
+            face: Some(q_mask),
+            body: None,
+            width: 16,
+            height: 16,
+        };
+        let cropped = pm.cropped_to_region(NormRect { x: 0.5, y: 0.5, width: 0.5, height: 0.5 });
+        let sampled = cropped.mask_u8(MaskKind::Skin, 8, 8, NormRect::FULL).unwrap();
+        assert!(
+            sampled.iter().all(|&v| v >= 240),
+            "cropped_to_region must align bottom-right quadrant to full zoomed tile"
+        );
 
         // PF100005
         let mut eye_img = img.clone();

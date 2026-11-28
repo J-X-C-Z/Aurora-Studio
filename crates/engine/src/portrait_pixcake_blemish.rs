@@ -311,7 +311,13 @@ pub(crate) fn build_pf30259_sweat_output(
 
     let source = channel_planes(frame);
     let source_luma = luma_plane(&source);
-    let radius = (width.min(height) / 5).clamp(6, 24);
+    let eye_dist = match (point(face_points194, 26), point(face_points194, 44)) {
+        (Some(l), Some(r)) => distance(l, r).max(12.0),
+        _ => (width.min(height) as f32 * 0.25).max(12.0),
+    };
+    let radius = ((eye_dist * 0.24).round() as usize).clamp(5, 36);
+    let local_r = ((eye_dist * 0.015).round() as usize).clamp(1, 3);
+    let rim_step = ((eye_dist * 0.025).round() as i32).clamp(1, 5);
     let base = [
         weighted_blur(&source[0], &region, width, height, radius),
         weighted_blur(&source[1], &region, width, height, radius),
@@ -321,11 +327,12 @@ pub(crate) fn build_pf30259_sweat_output(
         .map(|p| 0.299 * base[0][p] + 0.587 * base[1][p] + 0.114 * base[2][p])
         .collect();
     let ones = vec![1.0f32; pixels];
-    let local_luma = weighted_blur(&source_luma, &ones, width, height, 1);
+    let local_luma = weighted_blur(&source_luma, &ones, width, height, local_r);
 
+    let pad = (rim_step as usize).max(2);
     let mut core = vec![0.0f32; pixels];
-    for y in 2..height.saturating_sub(2) {
-        for x in 2..width.saturating_sub(2) {
+    for y in pad..height.saturating_sub(pad) {
+        for x in pad..width.saturating_sub(pad) {
             let p = y * width + x;
             if region[p] <= 0.0 {
                 continue;
@@ -342,24 +349,22 @@ pub(crate) fn build_pf30259_sweat_output(
             if strength <= 0.0 {
                 continue;
             }
-            // A water bead has a darker rim than its core; this term only
-            // modulates the response, it never zeros the core.
+            // A water bead has a darker rim than its core; check at face-scaled
+            // ring distance so zoom level never changes droplet detection.
             let mut rim = 0.0f32;
-            for dy in -2i32..=2 {
-                for dx in -2i32..=2 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let nx = (x as i32 + dx) as usize;
-                    let ny = (y as i32 + dy) as usize;
-                    rim = rim.max(local_luma[p] - local_luma[ny * width + nx]);
-                }
+            for &(dx, dy) in &[
+                (-rim_step, 0), (rim_step, 0), (0, -rim_step), (0, rim_step),
+                (-rim_step, -rim_step), (rim_step, -rim_step), (-rim_step, rim_step), (rim_step, rim_step),
+            ] {
+                let nx = (x as i32 + dx) as usize;
+                let ny = (y as i32 + dy) as usize;
+                rim = rim.max(local_luma[p] - local_luma[ny * width + nx]);
             }
             let rim_gain = 0.6 + 0.4 * smoothstep(0.0, 16.0, rim);
             core[p] = smoothstep(8.0, 24.0, strength) * rim_gain * region[p];
         }
     }
-    let feather_r = (radius / 4).clamp(1, 5);
+    let feather_r = ((eye_dist * 0.03).round() as usize).clamp(1, 6);
     let feathered = weighted_blur(&core, &ones, width, height, feather_r);
 
     let mut pixels_out = frame.pixels.clone();

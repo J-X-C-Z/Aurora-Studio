@@ -3381,7 +3381,7 @@ impl FaceInputBundle {
         // Two-pass separable box blur inside stage_roi to create a wrinkle-free smooth residual image,
         // paired with `base_img = source.clone()` (so high-freq = 0, wrinkle lines are genuinely smoothed).
         let eye_dist = distance(self.points194[26], self.points194[44]).max(16.0);
-        let radius = ((eye_dist * 0.032).round() as usize).clamp(3, 18);
+        let radius = ((eye_dist * 0.032).round() as usize).clamp(1, 18);
         let rx0 = stage_roi.x as usize;
         let ry0 = stage_roi.y as usize;
         let rx1 = (stage_roi.x + stage_roi.width) as usize;
