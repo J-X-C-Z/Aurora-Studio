@@ -18,18 +18,45 @@ use super::frame::ContractError;
 pub enum BackendKind {
     /// The CPU reference implementation. Always available.
     Cpu,
-    /// NVIDIA CUDA (the Windows adapters today).
+    /// NVIDIA CUDA (Windows/Linux NVIDIA GPUs).
     Cuda,
-    /// Apple Metal (the planned macOS adapter).
+    /// Apple Metal (macOS / Apple Silicon).
     Metal,
+    /// Cross-platform Vulkan / WGPU Compute (AMD, Intel, Qualcomm Adreno).
+    Vulkan,
     /// OpenCL, kept for adapters that expose it.
     OpenCl,
+    /// Reserved NPU accelerator family (Qualcomm Hexagon, Apple ANE).
+    Npu,
 }
 
 impl BackendKind {
-    /// Whether this backend offloads work to a device.
+    /// Whether this backend is a GPU compute backend.
     pub const fn is_gpu(self) -> bool {
+        matches!(self, Self::Cuda | Self::Metal | Self::Vulkan | Self::OpenCl)
+    }
+
+    /// Whether this backend offloads work off the CPU (GPU or NPU).
+    pub const fn is_accelerator(self) -> bool {
         !matches!(self, Self::Cpu)
+    }
+
+    /// Stable lowercase identifier for diagnostics, logs and distribution reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+            Self::OpenCl => "opencl",
+            Self::Npu => "npu",
+        }
+    }
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -151,6 +178,70 @@ pub fn select_backend(
                 }),
             }
         }
+    }
+}
+
+/// Structured capability diagnostic suitable for platform test builds and UI
+/// telemetry so every distribution truthfully reports its active compute
+/// backend and any fallback reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BackendDiagnostic {
+    /// Policy that was evaluated.
+    pub policy: BackendPolicy,
+    /// Backend selected to run, or `None` when `StrictGpu` refused.
+    pub selected: Option<BackendKind>,
+    /// Fallback reason when an accelerated backend could not be used.
+    pub fallback: Option<FallbackReason>,
+    /// All backends reported as available on this host.
+    pub available_backends: Vec<BackendKind>,
+    /// All backends explicitly reported as unavailable on this host.
+    pub unavailable_backends: Vec<BackendKind>,
+    /// Human-readable one-line summary for logs and build verification reports.
+    pub summary: String,
+}
+
+/// Evaluate `policy` against `capabilities` and emit a structured diagnostic.
+pub fn diagnose_backend_selection(
+    policy: BackendPolicy,
+    capabilities: &[BackendCapability],
+) -> BackendDiagnostic {
+    let available_backends: Vec<BackendKind> = capabilities
+        .iter()
+        .filter(|cap| cap.available)
+        .map(|cap| cap.kind)
+        .collect();
+    let unavailable_backends: Vec<BackendKind> = capabilities
+        .iter()
+        .filter(|cap| !cap.available)
+        .map(|cap| cap.kind)
+        .collect();
+
+    match select_backend(policy, capabilities) {
+        Ok(selection) => {
+            let summary = match selection.fallback {
+                Some(reason) => format!(
+                    "policy={policy:?} selected={} fallback=\"{reason}\"",
+                    selection.backend
+                ),
+                None => format!("policy={policy:?} selected={}", selection.backend),
+            };
+            BackendDiagnostic {
+                policy,
+                selected: Some(selection.backend),
+                fallback: selection.fallback,
+                available_backends,
+                unavailable_backends,
+                summary,
+            }
+        }
+        Err(err) => BackendDiagnostic {
+            policy,
+            selected: None,
+            fallback: Some(FallbackReason::Unsupported),
+            available_backends,
+            unavailable_backends,
+            summary: format!("policy={policy:?} refused=\"{err}\""),
+        },
     }
 }
 
@@ -463,5 +554,25 @@ mod tests {
             .to_string(),
             "resource budget exceeded: 64 bytes needed, 32 bytes allowed"
         );
+    }
+
+    #[test]
+    fn vulkan_and_npu_backend_kinds_and_diagnostics() {
+        assert!(BackendKind::Vulkan.is_gpu());
+        assert!(BackendKind::Vulkan.is_accelerator());
+        assert_eq!(BackendKind::Vulkan.as_str(), "vulkan");
+
+        assert!(!BackendKind::Npu.is_gpu());
+        assert!(BackendKind::Npu.is_accelerator());
+        assert_eq!(BackendKind::Npu.as_str(), "npu");
+
+        let caps = [
+            capability(BackendKind::Vulkan, true),
+            capability(BackendKind::Cpu, true),
+        ];
+        let diag = diagnose_backend_selection(BackendPolicy::Auto, &caps);
+        assert_eq!(diag.selected, Some(BackendKind::Vulkan));
+        assert_eq!(diag.fallback, None);
+        assert!(diag.summary.contains("selected=vulkan"));
     }
 }

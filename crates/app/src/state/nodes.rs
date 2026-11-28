@@ -192,13 +192,326 @@ pub fn flattened(adj: &AdjustmentSet) -> AdjustmentSet {
     }
 }
 
+/// Result of backward reachability pruning from `OUTPUT` with cycle detection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrunedGraph {
+    /// Compact graph containing only nodes and links on live paths to `OUTPUT`.
+    pub graph: NodeGraph,
+    /// Live node ids in topological evaluation order.
+    pub active_nodes: Vec<u64>,
+    /// Live `NodeKind::Layer` ids in render order.
+    pub active_layers: Vec<u64>,
+    /// Non-I/O node ids removed because they cannot reach `OUTPUT` (or `INPUT`).
+    pub pruned_nodes: Vec<u64>,
+    /// Layer node ids removed during pruning.
+    pub pruned_layers: Vec<u64>,
+}
+
+/// Semantics of a multi-input mixer node in the node graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixerSemantics {
+    /// Parallel mixer: branches grade the same upstream image independently and
+    /// are blended equally without earlier branches contaminating later ones.
+    ParallelBlend,
+    /// Layer mixer: branches are stacked in input-port order (higher input port
+    /// composites over lower input port, top wins).
+    LayerStackTopWins,
+}
+
+impl MixerSemantics {
+    pub fn from_kind(kind: NodeKind) -> Option<Self> {
+        match kind {
+            NodeKind::Parallel => Some(Self::ParallelBlend),
+            NodeKind::LayerMixer => Some(Self::LayerStackTopWins),
+            _ => None,
+        }
+    }
+
+    /// Blending weights for `branch_count` connected inputs.
+    pub fn branch_weights(self, branch_count: usize) -> Vec<f32> {
+        if branch_count == 0 {
+            return Vec::new();
+        }
+        match self {
+            Self::ParallelBlend => vec![1.0 / branch_count as f32; branch_count],
+            Self::LayerStackTopWins => vec![1.0; branch_count],
+        }
+    }
+
+    /// Whether higher-numbered input ports override lower-numbered ports.
+    pub fn overrides_previous(self) -> bool {
+        matches!(self, Self::LayerStackTopWins)
+    }
+}
+
+/// One input branch feeding a mixer node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MixerBranch {
+    pub input: u32,
+    pub steps: Vec<EvalStep>,
+}
+
+/// Structured evaluation step preserving Parallel vs. Layer mixer semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvalStep {
+    Layer(u64),
+    Mixer {
+        id: u64,
+        semantics: MixerSemantics,
+        branches: Vec<MixerBranch>,
+    },
+}
+
+/// Structured evaluation plan produced from a pruned, acyclic node graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuredPlan {
+    pub steps: Vec<EvalStep>,
+    /// Linearized layer render order compatible with flat-layer renderers.
+    pub flat_layers: Vec<u64>,
+    /// Detached/unreachable layer ids pruned before evaluation.
+    pub pruned_layers: Vec<u64>,
+}
+
+/// Walks backwards from [`OUTPUT`] to prune disconnected/orphan nodes and
+/// detect cycles on the output path.
+pub fn prune_reachable_dag(graph: &NodeGraph) -> Result<PrunedGraph, GraphError> {
+    use std::collections::HashSet;
+
+    let valid_ids: HashSet<u64> = graph.nodes.iter().map(|n| n.id).collect();
+    let clean_links: Vec<NodeLink> = graph
+        .links
+        .iter()
+        .copied()
+        .filter(|l| valid_ids.contains(&l.from) && valid_ids.contains(&l.to))
+        .collect();
+
+    // Backward DFS from OUTPUT with explicit visiting stack for cycle detection.
+    fn visit_backward(
+        id: u64,
+        links: &[NodeLink],
+        visiting: &mut Vec<u64>,
+        visited: &mut HashSet<u64>,
+        post_order: &mut Vec<u64>,
+    ) -> Result<(), GraphError> {
+        if visited.contains(&id) {
+            return Ok(());
+        }
+        if let Some(pos) = visiting.iter().position(|&n| n == id) {
+            return Err(GraphError::Cycle { nodes: visiting[pos..].to_vec() });
+        }
+        visiting.push(id);
+        let mut incoming: Vec<NodeLink> = links.iter().copied().filter(|l| l.to == id).collect();
+        incoming.sort_by_key(|l| l.input);
+        for link in incoming {
+            visit_backward(link.from, links, visiting, visited, post_order)?;
+        }
+        visiting.pop();
+        visited.insert(id);
+        post_order.push(id);
+        Ok(())
+    }
+
+    let mut post_order = Vec::new();
+    let mut visited = HashSet::new();
+    let mut visiting = Vec::new();
+    if valid_ids.contains(&OUTPUT) {
+        visit_backward(OUTPUT, &clean_links, &mut visiting, &mut visited, &mut post_order)?;
+    }
+
+    // Intersect with forward reachability from INPUT when INPUT exists.
+    let active_nodes: Vec<u64> = if valid_ids.contains(&INPUT) {
+        let mut forward = HashSet::new();
+        let mut stack = vec![INPUT];
+        while let Some(id) = stack.pop() {
+            if !forward.insert(id) {
+                continue;
+            }
+            for link in clean_links.iter().filter(|l| l.from == id) {
+                stack.push(link.to);
+            }
+        }
+        post_order.into_iter().filter(|id| forward.contains(id)).collect()
+    } else {
+        post_order
+    };
+
+    let active_set: HashSet<u64> = active_nodes.iter().copied().collect();
+    let mut keep_set = active_set.clone();
+    if valid_ids.contains(&INPUT) {
+        keep_set.insert(INPUT);
+    }
+    if valid_ids.contains(&OUTPUT) {
+        keep_set.insert(OUTPUT);
+    }
+
+    let active_layers: Vec<u64> = active_nodes
+        .iter()
+        .copied()
+        .filter(|id| graph.node(*id).is_some_and(|n| n.kind == NodeKind::Layer))
+        .collect();
+
+    let mut pruned_nodes: Vec<u64> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.id != INPUT && n.id != OUTPUT && !active_set.contains(&n.id))
+        .map(|n| n.id)
+        .collect();
+    pruned_nodes.sort_unstable();
+    pruned_nodes.dedup();
+
+    let mut pruned_layers: Vec<u64> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Layer && !active_set.contains(&n.id))
+        .map(|n| n.id)
+        .collect();
+    pruned_layers.sort_unstable();
+    pruned_layers.dedup();
+
+    let pruned_graph = NodeGraph {
+        nodes: graph.nodes.iter().filter(|n| keep_set.contains(&n.id)).cloned().collect(),
+        links: clean_links
+            .into_iter()
+            .filter(|l| active_set.contains(&l.from) && active_set.contains(&l.to))
+            .collect(),
+    };
+
+    Ok(PrunedGraph {
+        graph: pruned_graph,
+        active_nodes,
+        active_layers,
+        pruned_nodes,
+        pruned_layers,
+    })
+}
+
+/// Builds a structured evaluation plan that preserves Parallel / Layer mixer
+/// branch topology while pruning unreachable nodes and rejecting cycles.
+pub fn build_structured_plan(adj: &AdjustmentSet) -> Result<StructuredPlan, GraphError> {
+    use std::collections::HashSet;
+
+    let Some(_) = adj.nodes.as_ref() else {
+        let flat_layers: Vec<u64> = adj.layers.iter().map(|l| l.id).collect();
+        let steps = flat_layers.iter().copied().map(EvalStep::Layer).collect();
+        return Ok(StructuredPlan {
+            steps,
+            flat_layers,
+            pruned_layers: Vec::new(),
+        });
+    };
+
+    let repaired = normalized(adj);
+    let pruned = prune_reachable_dag(&repaired)?;
+    let g = &pruned.graph;
+
+    fn ancestors_of(g: &NodeGraph, start: u64) -> HashSet<u64> {
+        let mut set = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(id) = stack.pop() {
+            if !set.insert(id) {
+                continue;
+            }
+            for link in g.links.iter().filter(|l| l.to == id) {
+                stack.push(link.from);
+            }
+        }
+        set
+    }
+
+    fn collect_steps(g: &NodeGraph, id: u64, stop_at: &HashSet<u64>, out: &mut Vec<EvalStep>) {
+        if id == INPUT || stop_at.contains(&id) {
+            return;
+        }
+        let Some(node) = g.node(id) else { return };
+        match node.kind {
+            NodeKind::Output => {
+                if let Some(src) = g.source(id, 0) {
+                    collect_steps(g, src, stop_at, out);
+                }
+            }
+            NodeKind::Layer => {
+                if let Some(src) = g.source(id, 0) {
+                    collect_steps(g, src, stop_at, out);
+                }
+                out.push(EvalStep::Layer(id));
+            }
+            NodeKind::Parallel | NodeKind::LayerMixer => {
+                let semantics = MixerSemantics::from_kind(node.kind).expect("mixer kind");
+                let mut incoming: Vec<NodeLink> = g.links.iter().copied().filter(|l| l.to == id).collect();
+                incoming.sort_by_key(|l| l.input);
+
+                // Shared ancestors common to all connected branches run once before the mixer.
+                let mut common: Option<HashSet<u64>> = None;
+                for link in &incoming {
+                    let anc = ancestors_of(g, link.from);
+                    common = Some(match common {
+                        None => anc,
+                        Some(prev) => prev.intersection(&anc).copied().collect(),
+                    });
+                }
+                let common = common.unwrap_or_default();
+
+                // Emit the deepest shared trunk node(s) before the mixer.
+                let mut shared_roots: Vec<u64> = common
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        c != INPUT
+                            && !stop_at.contains(&c)
+                            && !g
+                                .links
+                                .iter()
+                                .any(|l| l.from == c && common.contains(&l.to) && l.to != c)
+                    })
+                    .collect();
+                shared_roots.sort_unstable();
+                for root in &shared_roots {
+                    collect_steps(g, *root, stop_at, out);
+                }
+
+                let mut branch_stop = stop_at.clone();
+                branch_stop.extend(common);
+                let mut branches = Vec::with_capacity(incoming.len());
+                for link in incoming {
+                    let mut branch_steps = Vec::new();
+                    collect_steps(g, link.from, &branch_stop, &mut branch_steps);
+                    branches.push(MixerBranch {
+                        input: link.input,
+                        steps: branch_steps,
+                    });
+                }
+                out.push(EvalStep::Mixer {
+                    id,
+                    semantics,
+                    branches,
+                });
+            }
+            NodeKind::Input => {}
+        }
+    }
+
+    let mut steps = Vec::new();
+    collect_steps(g, OUTPUT, &HashSet::new(), &mut steps);
+
+    Ok(StructuredPlan {
+        steps,
+        flat_layers: pruned.active_layers,
+        pruned_layers: pruned.pruned_layers,
+    })
+}
+
 /// [`flattened`], with the graph's refusal instead of a fallback frame.
 pub fn flattened_checked(adj: &AdjustmentSet) -> Result<AdjustmentSet, GraphError> {
     let mut out = adj.clone();
     if adj.nodes.is_some() {
-        out.nodes = Some(normalized(adj));
-        let order: Vec<u64> = aurora_engine::layered(&out)?.iter().map(|layer| layer.id).collect();
-        out.layers = order.iter().filter_map(|id| out.layers.iter().find(|l| l.id == *id).cloned()).collect();
+        let repaired = normalized(adj);
+        let pruned = prune_reachable_dag(&repaired)?;
+        out.nodes = Some(pruned.graph);
+        out.layers = pruned
+            .active_layers
+            .iter()
+            .filter_map(|id| out.layers.iter().find(|l| l.id == *id).cloned())
+            .collect();
     }
     Ok(out)
 }
@@ -480,5 +793,108 @@ mod tests {
         add_shape(&mut m, MaskShape::Radial(RadialGradient { op: MaskOp::Add, center: [0.3, 0.3], radius: [0.1, 0.1], rotation: 0.0, feather: 0.0, inverted: false }));
         assert_eq!(m.shapes.len(), 1);
         assert!(!is_full(&m));
+    }
+
+    #[test]
+    fn prune_reachable_dag_removes_orphan_nodes_and_dead_branches() {
+        // Live path: INPUT -> 1 -> 2 -> OUTPUT
+        // Dead branch from INPUT: INPUT -> 3 (never reaches OUTPUT)
+        // Orphan node: 4 (not linked at all)
+        // Detached mixer: 20 fed by 3 (never reaches OUTPUT)
+        let mut g = graph_with(&[(INPUT, 1, 0), (1, 2, 0), (2, OUTPUT, 0), (INPUT, 3, 0)], &[1, 2, 3, 4]);
+        g.nodes.push(GraphNode { id: 20, kind: NodeKind::Parallel, pos: [200.0, 128.0] });
+        g.link(3, 20, 0);
+
+        let pruned = prune_reachable_dag(&g).unwrap();
+        assert_eq!(pruned.active_layers, vec![1, 2]);
+        assert_eq!(pruned.pruned_layers, vec![3, 4]);
+        assert_eq!(pruned.pruned_nodes, vec![3, 4, 20]);
+        assert!(pruned.graph.node(3).is_none());
+        assert!(pruned.graph.node(4).is_none());
+        assert!(pruned.graph.node(20).is_none());
+        assert_eq!(pruned.graph.links.len(), 3);
+
+        // flattened_checked also prunes both layers and the stored graph.
+        let mut adj = layers(&[1, 2, 3, 4]);
+        adj.nodes = Some(g);
+        let flat = flattened_checked(&adj).unwrap();
+        assert_eq!(flat.layers.iter().map(|l| l.id).collect::<Vec<_>>(), vec![1, 2]);
+        let flat_graph = flat.nodes.unwrap();
+        assert!(flat_graph.node(3).is_none() && flat_graph.node(4).is_none() && flat_graph.node(20).is_none());
+    }
+
+    #[test]
+    fn prune_reachable_dag_detects_cycles_without_infinite_loop() {
+        let g = graph_with(
+            &[(INPUT, 1, 0), (1, 2, 0), (2, 3, 0), (3, 1, 1), (2, OUTPUT, 0)],
+            &[1, 2, 3],
+        );
+        let err = prune_reachable_dag(&g).unwrap_err();
+        match err {
+            GraphError::Cycle { nodes } => {
+                assert!(!nodes.is_empty(), "cycle error must report involved nodes");
+            }
+        }
+    }
+
+    #[test]
+    fn structured_plan_distinguishes_parallel_and_layer_mixers() {
+        // Shared trunk: INPUT -> 1; branches: 1 -> 2 and 1 -> 3; joined by mixer 10 -> 4 -> OUTPUT; plus orphan 99.
+        let build = |mixer_kind: NodeKind| {
+            let mut adj = layers(&[1, 2, 3, 4, 99]);
+            let mut g = graph_with(&[], &[1, 2, 3, 4, 99]);
+            g.nodes.push(GraphNode { id: 10, kind: mixer_kind, pos: [300.0, 32.0] });
+            g.link(INPUT, 1, 0);
+            g.link(1, 2, 0);
+            g.link(1, 3, 0);
+            g.link(2, 10, 0);
+            g.link(3, 10, 1);
+            g.link(10, 4, 0);
+            g.link(4, OUTPUT, 0);
+            adj.nodes = Some(g);
+            adj
+        };
+
+        let parallel_plan = build_structured_plan(&build(NodeKind::Parallel)).unwrap();
+        assert_eq!(parallel_plan.flat_layers, vec![1, 2, 3, 4]);
+        assert_eq!(parallel_plan.pruned_layers, vec![99]);
+        assert_eq!(
+            parallel_plan.steps,
+            vec![
+                EvalStep::Layer(1),
+                EvalStep::Mixer {
+                    id: 10,
+                    semantics: MixerSemantics::ParallelBlend,
+                    branches: vec![
+                        MixerBranch { input: 0, steps: vec![EvalStep::Layer(2)] },
+                        MixerBranch { input: 1, steps: vec![EvalStep::Layer(3)] },
+                    ],
+                },
+                EvalStep::Layer(4),
+            ]
+        );
+        assert_eq!(MixerSemantics::ParallelBlend.branch_weights(2), vec![0.5, 0.5]);
+        assert!(!MixerSemantics::ParallelBlend.overrides_previous());
+
+        let layer_plan = build_structured_plan(&build(NodeKind::LayerMixer)).unwrap();
+        assert_eq!(layer_plan.flat_layers, vec![1, 2, 3, 4]);
+        assert_eq!(layer_plan.pruned_layers, vec![99]);
+        assert_eq!(
+            layer_plan.steps,
+            vec![
+                EvalStep::Layer(1),
+                EvalStep::Mixer {
+                    id: 10,
+                    semantics: MixerSemantics::LayerStackTopWins,
+                    branches: vec![
+                        MixerBranch { input: 0, steps: vec![EvalStep::Layer(2)] },
+                        MixerBranch { input: 1, steps: vec![EvalStep::Layer(3)] },
+                    ],
+                },
+                EvalStep::Layer(4),
+            ]
+        );
+        assert_eq!(MixerSemantics::LayerStackTopWins.branch_weights(2), vec![1.0, 1.0]);
+        assert!(MixerSemantics::LayerStackTopWins.overrides_previous());
     }
 }

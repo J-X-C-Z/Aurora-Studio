@@ -17,8 +17,14 @@
 
 #![allow(dead_code)] // Used by the bridge tests; adapters will adopt it later.
 
+use aurora_portrait::device::{
+    Backend as PortraitBackend, DeviceProbe as PortraitDeviceProbe,
+    DeviceRefusal as PortraitDeviceRefusal,
+};
+
 use crate::contracts::compute::{
-    BackendKind, DispatchReceipt, FallbackReason, OperationId, ResourceRequest,
+    diagnose_backend_selection, BackendCapability, BackendDiagnostic, BackendKind, BackendPolicy,
+    DispatchReceipt, FallbackReason, OperationId, Precision as ContractPrecision, ResourceRequest,
 };
 use crate::contracts::frame::{
     AlphaMode, ColorSpace, ContractError, CoordinateSpace, FrameDescriptor, PixelFormat,
@@ -163,9 +169,16 @@ pub(crate) fn fallback_reason(failure: &Failure) -> FallbackReason {
 /// has no `DispatchReceipt` field; emit one receipt per launch *record*, not
 /// per collapsed count, or expand to `count` receipts at the call site.
 pub(crate) fn dispatch_receipt(launch: &Launch) -> DispatchReceipt {
+    dispatch_receipt_for(launch, backend_kind())
+}
+
+/// Build a [`DispatchReceipt`] for an explicitly selected [`BackendKind`],
+/// allowing CUDA, Metal, Vulkan/WGPU, and CPU dispatches to emit truthful
+/// backend attribution across all platforms.
+pub(crate) fn dispatch_receipt_for(launch: &Launch, backend: BackendKind) -> DispatchReceipt {
     DispatchReceipt {
         operation: DEFAULT_DISPATCH_OPERATION,
-        backend: backend_kind(),
+        backend,
         kernel: Some(launch.kernel),
         grid: Some(launch.grid),
         block: Some(launch.block),
@@ -173,6 +186,93 @@ pub(crate) fn dispatch_receipt(launch: &Launch) -> DispatchReceipt {
         device_to_host_bytes: 0,
         completed: true,
     }
+}
+
+/// Translate `aurora_portrait::device::Backend` into the public contract [`BackendKind`].
+pub(crate) const fn from_portrait_backend(backend: PortraitBackend) -> BackendKind {
+    match backend {
+        PortraitBackend::Cpu => BackendKind::Cpu,
+        PortraitBackend::Cuda => BackendKind::Cuda,
+        PortraitBackend::Metal => BackendKind::Metal,
+        PortraitBackend::Vulkan => BackendKind::Vulkan,
+        PortraitBackend::Npu => BackendKind::Npu,
+    }
+}
+
+/// Translate a contract [`BackendKind`] into `aurora_portrait::device::Backend`.
+/// Returns `None` for backend families that `aurora-portrait` does not model (e.g. `OpenCl`).
+pub(crate) const fn to_portrait_backend(kind: BackendKind) -> Option<PortraitBackend> {
+    match kind {
+        BackendKind::Cpu => Some(PortraitBackend::Cpu),
+        BackendKind::Cuda => Some(PortraitBackend::Cuda),
+        BackendKind::Metal => Some(PortraitBackend::Metal),
+        BackendKind::Vulkan => Some(PortraitBackend::Vulkan),
+        BackendKind::Npu => Some(PortraitBackend::Npu),
+        BackendKind::OpenCl => None,
+    }
+}
+
+/// Map a portrait device selection refusal onto the contract [`FallbackReason`].
+pub(crate) fn fallback_from_portrait_refusal(refusal: &PortraitDeviceRefusal) -> FallbackReason {
+    match refusal {
+        PortraitDeviceRefusal::BackendUnavailable(_) => FallbackReason::Unsupported,
+        PortraitDeviceRefusal::KernelMissing => FallbackReason::MissingKernel("portrait_stage"),
+        PortraitDeviceRefusal::PrecisionUnsupported(_) => FallbackReason::PrecisionUnsupported,
+        PortraitDeviceRefusal::ShapeUnsupported => FallbackReason::MissingInput("shape_unsupported"),
+        PortraitDeviceRefusal::SourceUnavailable => FallbackReason::MissingInput("source_pixels"),
+        PortraitDeviceRefusal::EffectUnsupported => FallbackReason::Unsupported,
+    }
+}
+
+/// Convert caller-supplied `aurora_portrait::device::DeviceProbe` slices into
+/// contract [`BackendCapability`] entries ordered by cross-platform priority
+/// (`Cuda -> Metal -> Vulkan -> Npu -> Cpu`), always appending an available
+/// `Cpu` reference capability if none was explicitly provided.
+pub(crate) fn capabilities_from_portrait_probes(
+    probes: &[PortraitDeviceProbe],
+) -> Vec<BackendCapability> {
+    let priority = [
+        PortraitBackend::Cuda,
+        PortraitBackend::Metal,
+        PortraitBackend::Vulkan,
+        PortraitBackend::Npu,
+    ];
+    let mut caps = Vec::with_capacity(probes.len() + 1);
+    for target in priority {
+        for probe in probes.iter().filter(|p| p.backend == target) {
+            let precision = match (probe.fp32, probe.fp16) {
+                (true, true) => ContractPrecision::Mixed,
+                (false, true) => ContractPrecision::F16,
+                _ => ContractPrecision::F32,
+            };
+            caps.push(BackendCapability {
+                kind: from_portrait_backend(probe.backend),
+                available: probe.is_ready(),
+                device: None,
+                compute_capability: None,
+                precision,
+            });
+        }
+    }
+    caps.push(BackendCapability {
+        kind: BackendKind::Cpu,
+        available: true,
+        device: Some("cpu-reference".to_owned()),
+        compute_capability: None,
+        precision: ContractPrecision::F32,
+    });
+    caps
+}
+
+/// Produce a structured cross-platform [`BackendDiagnostic`] directly from
+/// `aurora-portrait` device probes so every platform build truthfully reports
+/// its selected backend and any fallback reason.
+pub(crate) fn diagnose_portrait_probes(
+    policy: BackendPolicy,
+    probes: &[PortraitDeviceProbe],
+) -> BackendDiagnostic {
+    let capabilities = capabilities_from_portrait_probes(probes);
+    diagnose_backend_selection(policy, &capabilities)
 }
 
 /// The backend family the compiled runtime targets.
@@ -366,6 +466,98 @@ mod tests {
         assert_eq!(
             fallback_reason(&Failure::DeviceLost(709)).to_string(),
             "the device was lost during execution"
+        );
+    }
+
+    #[test]
+    fn portrait_backend_roundtrip_covers_cross_platform_targets() {
+        for (portrait, contract) in [
+            (PortraitBackend::Cpu, BackendKind::Cpu),
+            (PortraitBackend::Cuda, BackendKind::Cuda),
+            (PortraitBackend::Metal, BackendKind::Metal),
+            (PortraitBackend::Vulkan, BackendKind::Vulkan),
+            (PortraitBackend::Npu, BackendKind::Npu),
+        ] {
+            assert_eq!(from_portrait_backend(portrait), contract);
+            assert_eq!(to_portrait_backend(contract), Some(portrait));
+        }
+        assert_eq!(to_portrait_backend(BackendKind::OpenCl), None);
+    }
+
+    #[test]
+    fn diagnose_portrait_probes_reports_vulkan_metal_cuda_and_cpu_fallback() {
+        let vulkan_ready = PortraitDeviceProbe {
+            backend: PortraitBackend::Vulkan,
+            driver_ready: true,
+            kernel_compiled: true,
+            fp32: true,
+            fp16: true,
+            max_width: 8192,
+            max_height: 8192,
+        };
+        let metal_ready = PortraitDeviceProbe {
+            backend: PortraitBackend::Metal,
+            driver_ready: true,
+            kernel_compiled: true,
+            fp32: true,
+            fp16: true,
+            max_width: 8192,
+            max_height: 8192,
+        };
+        let broken_vulkan = PortraitDeviceProbe {
+            driver_ready: false,
+            ..vulkan_ready
+        };
+
+        // AMD / Intel / Snapdragon Adreno host with Vulkan only.
+        let vk_diag = diagnose_portrait_probes(BackendPolicy::Auto, &[vulkan_ready]);
+        assert_eq!(vk_diag.selected, Some(BackendKind::Vulkan));
+        assert_eq!(vk_diag.fallback, None);
+        assert!(vk_diag.summary.contains("selected=vulkan"));
+
+        // Priority ordering: Metal wins over Vulkan when both are ready.
+        let metal_diag =
+            diagnose_portrait_probes(BackendPolicy::Auto, &[vulkan_ready, metal_ready]);
+        assert_eq!(metal_diag.selected, Some(BackendKind::Metal));
+        assert_eq!(metal_diag.fallback, None);
+
+        // Broken Vulkan driver degrades cleanly to CPU with explicit fallback reason.
+        let fallback_diag = diagnose_portrait_probes(BackendPolicy::PreferGpu, &[broken_vulkan]);
+        assert_eq!(fallback_diag.selected, Some(BackendKind::Cpu));
+        assert_eq!(fallback_diag.fallback, Some(FallbackReason::Unsupported));
+        assert!(fallback_diag.unavailable_backends.contains(&BackendKind::Vulkan));
+        assert!(fallback_diag.summary.contains("selected=cpu"));
+        assert!(fallback_diag.summary.contains("fallback="));
+
+        // StrictGpu refuses when no GPU is ready.
+        let refused_diag = diagnose_portrait_probes(BackendPolicy::StrictGpu, &[broken_vulkan]);
+        assert_eq!(refused_diag.selected, None);
+        assert_eq!(refused_diag.fallback, Some(FallbackReason::Unsupported));
+        assert!(refused_diag.summary.contains("refused="));
+    }
+
+    #[test]
+    fn dispatch_receipt_for_preserves_explicit_backend() {
+        let launch = Launch {
+            kernel: "skin_whiten_fused",
+            grid: (32, 16),
+            block: (16, 16),
+            count: 1,
+        };
+        let vk_receipt = dispatch_receipt_for(&launch, BackendKind::Vulkan);
+        assert_eq!(vk_receipt.backend, BackendKind::Vulkan);
+        assert_eq!(vk_receipt.kernel, Some("skin_whiten_fused"));
+        assert!(vk_receipt.completed);
+
+        assert_eq!(
+            fallback_from_portrait_refusal(&PortraitDeviceRefusal::KernelMissing),
+            FallbackReason::MissingKernel("portrait_stage")
+        );
+        assert_eq!(
+            fallback_from_portrait_refusal(&PortraitDeviceRefusal::PrecisionUnsupported(
+                aurora_portrait::device::Precision::Fp16
+            )),
+            FallbackReason::PrecisionUnsupported
         );
     }
 }

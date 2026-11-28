@@ -866,6 +866,608 @@ pub(crate) fn sanitize_log_text(text: &str) -> String {
     out
 }
 
+/// Effective USM parameters for output sharpening.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputSharpeningParams {
+    /// Sharpening strength multiplier (e.g. 0.45 for screen, 0.75 for print).
+    pub amount: f32,
+    /// Gaussian blur radius in pixels.
+    pub radius: f32,
+    /// Detail threshold in 8-bit luminance levels (0..=255).
+    pub threshold: f32,
+}
+
+impl OutputSharpening {
+    /// Resolves effective USM parameters from the recipe's output sharpening mode,
+    /// target dimensions, resolution (PPI), and optional explicit settings.
+    ///
+    /// Returns `None` when sharpening is disabled or resolves to zero strength.
+    pub fn resolve_params(
+        self,
+        width: u32,
+        height: u32,
+        resolution_ppi: u32,
+        explicit: Option<&OutputSharpeningSettings>,
+    ) -> Option<OutputSharpeningParams> {
+        if let Some(settings) = explicit {
+            // Capture One control codes: 0 = Screen, 1 = Print, 2..=4 disable output USM.
+            if settings.control > 1 {
+                return None;
+            }
+            if settings.amount.is_finite() && settings.amount > 0.0 {
+                let default_radius = match settings.control {
+                    1 => (resolution_ppi.max(72) as f32 / 200.0).clamp(0.8, 3.0),
+                    _ => {
+                        let long_edge = width.max(height).max(1) as f32;
+                        (0.6 + (long_edge / 2000.0) * 0.6).clamp(0.6, 1.8)
+                    }
+                };
+                let radius = if settings.radius.is_finite() && settings.radius > 0.0 {
+                    settings.radius.clamp(0.3, 12.0)
+                } else {
+                    default_radius
+                };
+                let threshold = if settings.threshold.is_finite() && settings.threshold > 0.0 {
+                    settings.threshold.clamp(0.0, 255.0)
+                } else {
+                    0.0
+                };
+                return Some(OutputSharpeningParams {
+                    amount: settings.amount,
+                    radius,
+                    threshold,
+                });
+            }
+        }
+
+        match self {
+            Self::Disabled => None,
+            Self::Screen => {
+                let long_edge = width.max(height).max(1) as f32;
+                let radius = (0.6 + (long_edge / 2000.0) * 0.6).clamp(0.6, 1.8);
+                Some(OutputSharpeningParams {
+                    amount: 0.45,
+                    radius,
+                    threshold: 2.0,
+                })
+            }
+            Self::Print => {
+                let ppi = resolution_ppi.max(72) as f32;
+                let radius = (ppi / 200.0).clamp(0.8, 3.0);
+                Some(OutputSharpeningParams {
+                    amount: 0.75,
+                    radius,
+                    threshold: 1.5,
+                })
+            }
+        }
+    }
+}
+
+fn gaussian_kernel_1d(radius: f32) -> Vec<f32> {
+    let sigma = radius.clamp(0.3, 12.0);
+    let half = (sigma * 2.5).ceil().clamp(1.0, 16.0) as usize;
+    let mut kernel = Vec::with_capacity(half * 2 + 1);
+    let inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+    let mut sum = 0.0f32;
+    for i in 0..=(half * 2) {
+        let d = i as f32 - half as f32;
+        let w = (-d * d * inv_two_sigma_sq).exp();
+        kernel.push(w);
+        sum += w;
+    }
+    if sum > 0.0 {
+        for w in &mut kernel {
+            *w /= sum;
+        }
+    }
+    kernel
+}
+
+/// Applies separable Gaussian unsharp-mask (USM) sharpening to an 8-bit RGBA buffer in place.
+///
+/// Alpha is preserved untouched. Returns `true` if sharpening ran.
+pub fn apply_output_sharpening_rgba8(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    params: OutputSharpeningParams,
+) -> bool {
+    let (w, h) = (width as usize, height as usize);
+    let Some(pixel_count) = w.checked_mul(h) else { return false };
+    let Some(byte_len) = pixel_count.checked_mul(4) else { return false };
+    if w == 0 || h == 0 || rgba.len() < byte_len {
+        return false;
+    }
+    if !params.amount.is_finite() || params.amount <= 0.0 {
+        return false;
+    }
+
+    let kernel = gaussian_kernel_1d(params.radius);
+    let half = kernel.len() / 2;
+    let mut horiz = vec![0.0f32; pixel_count * 3];
+
+    for y in 0..h {
+        let row_base = y * w;
+        for x in 0..w {
+            let mut acc = [0.0f32; 3];
+            for (ki, &weight) in kernel.iter().enumerate() {
+                let sx = (x as isize + ki as isize - half as isize).clamp(0, w as isize - 1) as usize;
+                let idx = (row_base + sx) * 4;
+                acc[0] += rgba[idx] as f32 * weight;
+                acc[1] += rgba[idx + 1] as f32 * weight;
+                acc[2] += rgba[idx + 2] as f32 * weight;
+            }
+            let out = (row_base + x) * 3;
+            horiz[out..out + 3].copy_from_slice(&acc);
+        }
+    }
+
+    let threshold = if params.threshold.is_finite() && params.threshold > 0.0 {
+        params.threshold
+    } else {
+        0.0
+    };
+
+    for y in 0..h {
+        let row_base = y * w;
+        for x in 0..w {
+            let mut blurred = [0.0f32; 3];
+            for (ki, &weight) in kernel.iter().enumerate() {
+                let sy = (y as isize + ki as isize - half as isize).clamp(0, h as isize - 1) as usize;
+                let hidx = (sy * w + x) * 3;
+                blurred[0] += horiz[hidx] * weight;
+                blurred[1] += horiz[hidx + 1] * weight;
+                blurred[2] += horiz[hidx + 2] * weight;
+            }
+            let idx = (row_base + x) * 4;
+            for c in 0..3 {
+                let orig = rgba[idx + c] as f32;
+                let detail = orig - blurred[c];
+                if detail.abs() > threshold {
+                    rgba[idx + c] = (orig + params.amount * detail).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Applies separable Gaussian unsharp-mask (USM) sharpening to a 16-bit RGBA buffer in place.
+///
+/// `params.threshold` is interpreted in 8-bit levels and scaled to 16-bit (`* 257.0`).
+/// Alpha is preserved untouched. Returns `true` if sharpening ran.
+pub fn apply_output_sharpening_rgba16(
+    rgba: &mut [u16],
+    width: u32,
+    height: u32,
+    params: OutputSharpeningParams,
+) -> bool {
+    let (w, h) = (width as usize, height as usize);
+    let Some(pixel_count) = w.checked_mul(h) else { return false };
+    let Some(sample_len) = pixel_count.checked_mul(4) else { return false };
+    if w == 0 || h == 0 || rgba.len() < sample_len {
+        return false;
+    }
+    if !params.amount.is_finite() || params.amount <= 0.0 {
+        return false;
+    }
+
+    let kernel = gaussian_kernel_1d(params.radius);
+    let half = kernel.len() / 2;
+    let mut horiz = vec![0.0f32; pixel_count * 3];
+
+    for y in 0..h {
+        let row_base = y * w;
+        for x in 0..w {
+            let mut acc = [0.0f32; 3];
+            for (ki, &weight) in kernel.iter().enumerate() {
+                let sx = (x as isize + ki as isize - half as isize).clamp(0, w as isize - 1) as usize;
+                let idx = (row_base + sx) * 4;
+                acc[0] += rgba[idx] as f32 * weight;
+                acc[1] += rgba[idx + 1] as f32 * weight;
+                acc[2] += rgba[idx + 2] as f32 * weight;
+            }
+            let out = (row_base + x) * 3;
+            horiz[out..out + 3].copy_from_slice(&acc);
+        }
+    }
+
+    let threshold_16 = if params.threshold.is_finite() && params.threshold > 0.0 {
+        params.threshold * 257.0
+    } else {
+        0.0
+    };
+
+    for y in 0..h {
+        let row_base = y * w;
+        for x in 0..w {
+            let mut blurred = [0.0f32; 3];
+            for (ki, &weight) in kernel.iter().enumerate() {
+                let sy = (y as isize + ki as isize - half as isize).clamp(0, h as isize - 1) as usize;
+                let hidx = (sy * w + x) * 3;
+                blurred[0] += horiz[hidx] * weight;
+                blurred[1] += horiz[hidx + 1] * weight;
+                blurred[2] += horiz[hidx + 2] * weight;
+            }
+            let idx = (row_base + x) * 4;
+            for c in 0..3 {
+                let orig = rgba[idx + c] as f32;
+                let detail = orig - blurred[c];
+                if detail.abs() > threshold_16 {
+                    rgba[idx + c] = (orig + params.amount * detail).round().clamp(0.0, 65535.0) as u16;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Applies the recipe's configured output sharpening to an 8-bit RGBA frame.
+pub fn apply_recipe_output_sharpening_rgba8(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    recipe: &ProcessRecipe,
+) -> bool {
+    let Some(params) = recipe.output_sharpening.resolve_params(
+        width,
+        height,
+        recipe.resolution_ppi,
+        recipe.output_sharpening_settings.as_ref(),
+    ) else {
+        return false;
+    };
+    apply_output_sharpening_rgba8(rgba, width, height, params)
+}
+
+/// Applies the recipe's configured output sharpening to a 16-bit RGBA frame.
+pub fn apply_recipe_output_sharpening_rgba16(
+    rgba: &mut [u16],
+    width: u32,
+    height: u32,
+    recipe: &ProcessRecipe,
+) -> bool {
+    let Some(params) = recipe.output_sharpening.resolve_params(
+        width,
+        height,
+        recipe.resolution_ppi,
+        recipe.output_sharpening_settings.as_ref(),
+    ) else {
+        return false;
+    };
+    apply_output_sharpening_rgba16(rgba, width, height, params)
+}
+
+/// Anchor position for image watermark placement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WatermarkAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    #[default]
+    BottomRight,
+    /// Places the watermark center at normalized `[x, y]` in `0.0..=1.0`.
+    Normalized,
+}
+
+/// Parameters for compositing an RGBA image watermark onto an exported frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ImageWatermark {
+    pub anchor: WatermarkAnchor,
+    /// Normalized `[x, y]` (`0.0..=1.0`) used when `anchor == WatermarkAnchor::Normalized`.
+    pub position: [f32; 2],
+    /// Uniform scale factor applied to the watermark dimensions (`1.0` = 100%).
+    pub scale: f32,
+    /// Opacity percentage in `0.0..=100.0`. Values `<= 0.0` are a strict no-op.
+    pub opacity: f32,
+    /// Margin in pixels from anchored edges (may be negative to intentionally clip).
+    pub margin_px: i32,
+}
+
+impl Default for ImageWatermark {
+    fn default() -> Self {
+        Self {
+            anchor: WatermarkAnchor::BottomRight,
+            position: [0.5, 0.5],
+            scale: 1.0,
+            opacity: 100.0,
+            margin_px: 16,
+        }
+    }
+}
+
+impl ImageWatermark {
+    /// Builds an [`ImageWatermark`] from parsed Capture One [`WatermarkSettings`].
+    pub fn from_settings(settings: &WatermarkSettings) -> Self {
+        let opacity = settings.image_opacity.unwrap_or(100.0).clamp(0.0, 100.0);
+        let scale = settings.image_scale.unwrap_or(1.0).max(0.0);
+        let pos_x = settings.h_image_placement.unwrap_or(0.5);
+        let pos_y = settings.v_image_placement.unwrap_or(0.5);
+        let anchor = if settings.h_image_placement.is_some() || settings.v_image_placement.is_some() {
+            WatermarkAnchor::Normalized
+        } else {
+            WatermarkAnchor::BottomRight
+        };
+        Self {
+            anchor,
+            position: [pos_x, pos_y],
+            scale,
+            opacity,
+            margin_px: 16,
+        }
+    }
+}
+
+fn watermark_origin(
+    canvas_w: u32,
+    canvas_h: u32,
+    scaled_w: u32,
+    scaled_h: u32,
+    spec: &ImageWatermark,
+) -> (i64, i64) {
+    let cw = canvas_w as i64;
+    let ch = canvas_h as i64;
+    let ww = scaled_w as i64;
+    let wh = scaled_h as i64;
+    let m = spec.margin_px as i64;
+    match spec.anchor {
+        WatermarkAnchor::TopLeft => (m, m),
+        WatermarkAnchor::TopCenter => ((cw - ww) / 2, m),
+        WatermarkAnchor::TopRight => (cw - ww - m, m),
+        WatermarkAnchor::CenterLeft => (m, (ch - wh) / 2),
+        WatermarkAnchor::Center => ((cw - ww) / 2, (ch - wh) / 2),
+        WatermarkAnchor::CenterRight => (cw - ww - m, (ch - wh) / 2),
+        WatermarkAnchor::BottomLeft => (m, ch - wh - m),
+        WatermarkAnchor::BottomCenter => ((cw - ww) / 2, ch - wh - m),
+        WatermarkAnchor::BottomRight => (cw - ww - m, ch - wh - m),
+        WatermarkAnchor::Normalized => {
+            let cx = (spec.position[0] as f64 * cw as f64).round() as i64;
+            let cy = (spec.position[1] as f64 * ch as f64).round() as i64;
+            (cx - ww / 2, cy - wh / 2)
+        }
+    }
+}
+
+fn sample_rgba8_bilinear(src: &[u8], src_w: u32, src_h: u32, fx: f32, fy: f32) -> [f32; 4] {
+    let max_x = (src_w - 1) as f32;
+    let max_y = (src_h - 1) as f32;
+    let x = fx.clamp(0.0, max_x);
+    let y = fy.clamp(0.0, max_y);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(src_w - 1);
+    let y1 = (y0 + 1).min(src_h - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+
+    let fetch = |px: u32, py: u32| -> [f32; 4] {
+        let i = ((py as usize) * (src_w as usize) + (px as usize)) * 4;
+        [src[i] as f32, src[i + 1] as f32, src[i + 2] as f32, src[i + 3] as f32]
+    };
+    let c00 = fetch(x0, y0);
+    let c10 = fetch(x1, y0);
+    let c01 = fetch(x0, y1);
+    let c11 = fetch(x1, y1);
+
+    let mut out = [0.0f32; 4];
+    for ch in 0..4 {
+        let top = c00[ch] + (c10[ch] - c00[ch]) * tx;
+        let bot = c01[ch] + (c11[ch] - c01[ch]) * tx;
+        out[ch] = top + (bot - top) * ty;
+    }
+    out
+}
+
+/// Composites an 8-bit RGBA watermark onto an 8-bit RGBA canvas using Porter-Duff source-over
+/// blending with anchor positioning, bilinear scaling, opacity control, and safe bounds clipping.
+///
+/// Returns `false` (leaving `canvas` byte-for-byte unchanged) when opacity is `<= 0`, scale is
+/// `<= 0`, either buffer is empty/undersized, or the watermark falls completely outside the canvas.
+pub fn composite_image_watermark_rgba8(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    watermark: &[u8],
+    wm_w: u32,
+    wm_h: u32,
+    spec: &ImageWatermark,
+) -> bool {
+    let Some(canvas_bytes) = (canvas_w as usize).checked_mul(canvas_h as usize).and_then(|n| n.checked_mul(4)) else {
+        return false;
+    };
+    let Some(wm_bytes) = (wm_w as usize).checked_mul(wm_h as usize).and_then(|n| n.checked_mul(4)) else {
+        return false;
+    };
+    if canvas_w == 0 || canvas_h == 0 || wm_w == 0 || wm_h == 0 {
+        return false;
+    }
+    if canvas.len() < canvas_bytes || watermark.len() < wm_bytes {
+        return false;
+    }
+    if !spec.opacity.is_finite() || spec.opacity <= 0.0 || !spec.scale.is_finite() || spec.scale <= 0.0 {
+        return false;
+    }
+
+    let opacity = (spec.opacity / 100.0).clamp(0.0, 1.0);
+    let scaled_w = ((wm_w as f32 * spec.scale).round() as u32).max(1);
+    let scaled_h = ((wm_h as f32 * spec.scale).round() as u32).max(1);
+    let (ox, oy) = watermark_origin(canvas_w, canvas_h, scaled_w, scaled_h, spec);
+
+    let x_start = ox.max(0);
+    let y_start = oy.max(0);
+    let x_end = (ox + scaled_w as i64).min(canvas_w as i64);
+    let y_end = (oy + scaled_h as i64).min(canvas_h as i64);
+    if x_start >= x_end || y_start >= y_end {
+        return false;
+    }
+
+    let exact_scale = scaled_w == wm_w && scaled_h == wm_h;
+    let sx_ratio = wm_w as f32 / scaled_w as f32;
+    let sy_ratio = wm_h as f32 / scaled_h as f32;
+
+    for dy in y_start..y_end {
+        let local_y = (dy - oy) as u32;
+        for dx in x_start..x_end {
+            let local_x = (dx - ox) as u32;
+            let src = if exact_scale {
+                let i = ((local_y as usize) * (wm_w as usize) + (local_x as usize)) * 4;
+                [watermark[i] as f32, watermark[i + 1] as f32, watermark[i + 2] as f32, watermark[i + 3] as f32]
+            } else {
+                let fx = (local_x as f32 + 0.5) * sx_ratio - 0.5;
+                let fy = (local_y as f32 + 0.5) * sy_ratio - 0.5;
+                sample_rgba8_bilinear(watermark, wm_w, wm_h, fx, fy)
+            };
+
+            let src_a = (src[3] / 255.0) * opacity;
+            if src_a <= 0.0 {
+                continue;
+            }
+            let dst_idx = ((dy as usize) * (canvas_w as usize) + (dx as usize)) * 4;
+            let dst_a = canvas[dst_idx + 3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a <= 0.0 {
+                continue;
+            }
+            for c in 0..3 {
+                let dst_c = canvas[dst_idx + c] as f32;
+                let blended = (src[c] * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
+                canvas[dst_idx + c] = blended.round().clamp(0.0, 255.0) as u8;
+            }
+            canvas[dst_idx + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    true
+}
+
+/// Validation failure for a recipe's `open_with` external application command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenWithError {
+    /// The application string is empty or whitespace-only.
+    EmptyApplication,
+    /// The application string contains control characters (e.g. NUL, CR, LF).
+    ControlCharacters,
+    /// The application string contains shell metacharacters or unsafe syntax.
+    UnsafeCharacters,
+    /// The application path contains parent-directory traversal (`..`) or starts with `-`.
+    UnsafePath,
+    /// The exported file path is empty or has no file name.
+    InvalidExportedFile,
+}
+
+impl std::fmt::Display for OpenWithError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyApplication => write!(f, "open_with: application path is empty"),
+            Self::ControlCharacters => write!(f, "open_with: application contains control characters"),
+            Self::UnsafeCharacters => write!(f, "open_with: application contains unsafe shell characters"),
+            Self::UnsafePath => write!(f, "open_with: application path is unsafe"),
+            Self::InvalidExportedFile => write!(f, "open_with: exported file path is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for OpenWithError {}
+
+/// A validated, shell-free external launch command for an exported image.
+///
+/// Construction validates the executable path and exported target without
+/// spawning any external process. Callers must explicitly invoke
+/// [`Self::spawn_explicit`] when the user opts into launching the app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenWithCommand {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub exported_file: PathBuf,
+}
+
+impl OpenWithCommand {
+    /// Builds a `std::process::Command` directly (without invoking a shell).
+    pub fn to_std_command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.program);
+        cmd.args(&self.args);
+        cmd
+    }
+
+    /// Explicitly spawns the external application for an existing exported file.
+    ///
+    /// Export pipelines do not call this automatically; it is an opt-in entry
+    /// point that verifies the exported file exists on disk before launching.
+    pub fn spawn_explicit(&self) -> io::Result<std::process::Child> {
+        if !self.exported_file.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "open_with: exported file does not exist",
+            ));
+        }
+        self.to_std_command().spawn()
+    }
+}
+
+/// Validates a recipe's `open_with` executable string and builds a safe
+/// [`OpenWithCommand`] targeting `exported_file` without spawning a process.
+pub fn validate_open_with(app: &str, exported_file: &Path) -> Result<OpenWithCommand, OpenWithError> {
+    let trimmed = app.trim();
+    if trimmed.is_empty() {
+        return Err(OpenWithError::EmptyApplication);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(OpenWithError::ControlCharacters);
+    }
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '|' | '&' | ';' | '`' | '$' | '<' | '>' | '*' | '?'))
+    {
+        return Err(OpenWithError::UnsafeCharacters);
+    }
+
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .trim();
+    if unquoted.is_empty() {
+        return Err(OpenWithError::EmptyApplication);
+    }
+    if unquoted.contains('"') || unquoted.contains('\'') {
+        return Err(OpenWithError::UnsafeCharacters);
+    }
+    if unquoted.starts_with('-') {
+        return Err(OpenWithError::UnsafePath);
+    }
+
+    let program = PathBuf::from(unquoted);
+    if program.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(OpenWithError::UnsafePath);
+    }
+
+    if exported_file.as_os_str().is_empty() || exported_file.file_name().is_none() {
+        return Err(OpenWithError::InvalidExportedFile);
+    }
+
+    Ok(OpenWithCommand {
+        program,
+        args: vec![exported_file.to_string_lossy().into_owned()],
+        exported_file: exported_file.to_path_buf(),
+    })
+}
+
+/// Prepares the optional `open_with` command for a [`ProcessRecipe`] without executing it.
+pub fn prepare_open_with(
+    recipe: &ProcessRecipe,
+    exported_file: &Path,
+) -> Result<Option<OpenWithCommand>, OpenWithError> {
+    let Some(app) = recipe.open_with.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    validate_open_with(app, exported_file).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,5 +1806,203 @@ mod tests {
         }
         assert_eq!(log_name(Path::new("C:/Users/alice/Shoot/DSC_0001.NEF")), "DSC_0001.NEF");
         assert_eq!(log_name(Path::new("/tmp/out.jpg")), "out.jpg");
+    }
+
+    // ---- output sharpening, image watermark, open_with ----------------------
+
+    #[test]
+    fn output_sharpening_8bit_enhances_edge_and_preserves_alpha() {
+        let (w, h) = (9u32, 9u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let v = if x < 4 { 60 } else { 200 };
+                rgba[i] = v;
+                rgba[i + 1] = v;
+                rgba[i + 2] = v;
+                rgba[i + 3] = 180;
+            }
+        }
+        let before = rgba.clone();
+        let mut recipe = ProcessRecipe::default();
+        recipe.output_sharpening = OutputSharpening::Screen;
+        assert!(apply_recipe_output_sharpening_rgba8(&mut rgba, w, h, &recipe));
+        assert_ne!(rgba, before, "edge pixels must change after USM sharpening");
+        // Pixel immediately to the left of the step edge should darken; right should brighten.
+        let left_edge = ((4 * w + 3) * 4) as usize;
+        let right_edge = ((4 * w + 4) * 4) as usize;
+        assert!(rgba[left_edge] < before[left_edge], "dark side of edge should deepen");
+        assert!(rgba[right_edge] > before[right_edge], "bright side of edge should lift");
+        // Alpha channel must remain completely untouched.
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px[3], 180);
+        }
+    }
+
+    #[test]
+    fn output_sharpening_16bit_enhances_edge_and_preserves_alpha() {
+        let (w, h) = (9u32, 9u32);
+        let mut rgba = vec![0u16; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let v = if x < 4 { 15_000 } else { 50_000 };
+                rgba[i] = v;
+                rgba[i + 1] = v;
+                rgba[i + 2] = v;
+                rgba[i + 3] = 40_000;
+            }
+        }
+        let before = rgba.clone();
+        let mut recipe = ProcessRecipe::default();
+        recipe.output_sharpening = OutputSharpening::Print;
+        recipe.resolution_ppi = 300;
+        assert!(apply_recipe_output_sharpening_rgba16(&mut rgba, w, h, &recipe));
+        assert_ne!(rgba, before);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px[3], 40_000);
+        }
+    }
+
+    #[test]
+    fn output_sharpening_disabled_or_zero_amount_is_idempotent() {
+        let mut rgba = vec![10, 20, 30, 255, 200, 210, 220, 255];
+        let before = rgba.clone();
+        let recipe = ProcessRecipe::default(); // Disabled
+        assert!(!apply_recipe_output_sharpening_rgba8(&mut rgba, 2, 1, &recipe));
+        assert_eq!(rgba, before);
+        assert!(!apply_output_sharpening_rgba8(
+            &mut rgba,
+            2,
+            1,
+            OutputSharpeningParams { amount: 0.0, radius: 1.0, threshold: 0.0 },
+        ));
+        assert_eq!(rgba, before);
+    }
+
+    #[test]
+    fn output_sharpening_resolve_params_adapts_screen_and_print_dpi() {
+        let screen = OutputSharpening::Screen.resolve_params(2000, 1333, 72, None).unwrap();
+        let print_lo = OutputSharpening::Print.resolve_params(2000, 1333, 180, None).unwrap();
+        let print_hi = OutputSharpening::Print.resolve_params(2000, 1333, 600, None).unwrap();
+        assert!(print_hi.amount > screen.amount);
+        assert!(print_hi.radius > print_lo.radius);
+        // C1 control > 1 disables output sharpening even if amount > 0.
+        let disabled_c1 = OutputSharpeningSettings { amount: 1.0, radius: 1.0, control: 4, ..Default::default() };
+        assert!(OutputSharpening::Screen.resolve_params(2000, 1333, 300, Some(&disabled_c1)).is_none());
+    }
+
+    #[test]
+    fn image_watermark_zero_opacity_is_byte_idempotent() {
+        let mut canvas = vec![42u8; 8 * 8 * 4];
+        let before = canvas.clone();
+        let wm = vec![255u8; 4 * 4 * 4];
+        let spec = ImageWatermark {
+            anchor: WatermarkAnchor::Center,
+            opacity: 0.0,
+            scale: 1.0,
+            margin_px: 0,
+            ..Default::default()
+        };
+        assert!(!composite_image_watermark_rgba8(&mut canvas, 8, 8, &wm, 4, 4, &spec));
+        assert_eq!(canvas, before);
+    }
+
+    #[test]
+    fn image_watermark_alpha_blends_at_anchor_and_scaled() {
+        let (cw, ch) = (10u32, 10u32);
+        let mut canvas = vec![0u8; (cw * ch * 4) as usize];
+        for px in canvas.chunks_exact_mut(4) {
+            px.copy_from_slice(&[100, 100, 100, 255]);
+        }
+        // Solid red 2x2 watermark scaled 2x -> 4x4, placed at TopLeft with margin 1, opacity 50%.
+        let mut wm = vec![0u8; 2 * 2 * 4];
+        for px in wm.chunks_exact_mut(4) {
+            px.copy_from_slice(&[200, 0, 0, 255]);
+        }
+        let spec = ImageWatermark {
+            anchor: WatermarkAnchor::TopLeft,
+            scale: 2.0,
+            opacity: 50.0,
+            margin_px: 1,
+            ..Default::default()
+        };
+        assert!(composite_image_watermark_rgba8(&mut canvas, cw, ch, &wm, 2, 2, &spec));
+        // Inside watermark rect [1..5, 1..5]: R = 200*0.5 + 100*0.5 = 150, G = 50, B = 50.
+        let inside = ((2 * cw + 2) * 4) as usize;
+        assert_eq!(&canvas[inside..inside + 4], &[150, 50, 50, 255]);
+        // Outside watermark rect at (0, 0): untouched.
+        assert_eq!(&canvas[0..4], &[100, 100, 100, 255]);
+    }
+
+    #[test]
+    fn image_watermark_out_of_bounds_clips_safely() {
+        let (cw, ch) = (6u32, 6u32);
+        let mut canvas = vec![20u8; (cw * ch * 4) as usize];
+        for px in canvas.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let wm = vec![255u8; 4 * 4 * 4];
+
+        // Partial clip on top-left corner via negative margin: only [0..2, 0..2] overlaps.
+        let partial = ImageWatermark {
+            anchor: WatermarkAnchor::TopLeft,
+            scale: 1.0,
+            opacity: 100.0,
+            margin_px: -2,
+            ..Default::default()
+        };
+        assert!(composite_image_watermark_rgba8(&mut canvas, cw, ch, &wm, 4, 4, &partial));
+        assert_eq!(&canvas[0..4], &[255, 255, 255, 255]);
+        let outside = ((3 * cw + 3) * 4) as usize;
+        assert_eq!(&canvas[outside..outside + 4], &[20, 20, 20, 255]);
+
+        // Completely outside canvas: returns false and does not modify canvas.
+        let before = canvas.clone();
+        let offscreen = ImageWatermark {
+            anchor: WatermarkAnchor::Normalized,
+            position: [5.0, 5.0],
+            scale: 1.0,
+            opacity: 100.0,
+            margin_px: 0,
+        };
+        assert!(!composite_image_watermark_rgba8(&mut canvas, cw, ch, &wm, 4, 4, &offscreen));
+        assert_eq!(canvas, before);
+    }
+
+    #[test]
+    fn open_with_validates_and_builds_shell_free_command() {
+        let exported = Path::new("C:/Exports/photo.jpg");
+        let cmd = validate_open_with(r#""C:\Program Files\Viewer\viewer.exe""#, exported).unwrap();
+        assert_eq!(cmd.program, PathBuf::from(r"C:\Program Files\Viewer\viewer.exe"));
+        assert_eq!(cmd.args, vec!["C:/Exports/photo.jpg"]);
+        let std_cmd = cmd.to_std_command();
+        assert_eq!(std_cmd.get_program(), Path::new(r"C:\Program Files\Viewer\viewer.exe"));
+
+        let mut recipe = ProcessRecipe::default();
+        assert_eq!(prepare_open_with(&recipe, exported).unwrap(), None);
+        recipe.open_with = Some("photoshop.exe".into());
+        assert!(prepare_open_with(&recipe, exported).unwrap().is_some());
+    }
+
+    #[test]
+    fn open_with_rejects_unsafe_or_empty_inputs() {
+        let exported = Path::new("C:/Exports/photo.jpg");
+        assert_eq!(validate_open_with("   ", exported), Err(OpenWithError::EmptyApplication));
+        assert_eq!(validate_open_with("app.exe\nwhoami", exported), Err(OpenWithError::ControlCharacters));
+        assert_eq!(validate_open_with("app.exe & calc.exe", exported), Err(OpenWithError::UnsafeCharacters));
+        assert_eq!(validate_open_with("app.exe | tee", exported), Err(OpenWithError::UnsafeCharacters));
+        assert_eq!(validate_open_with("../evil.exe", exported), Err(OpenWithError::UnsafePath));
+        assert_eq!(validate_open_with("--flag", exported), Err(OpenWithError::UnsafePath));
+        assert_eq!(validate_open_with("viewer.exe", Path::new("")), Err(OpenWithError::InvalidExportedFile));
+    }
+
+    #[test]
+    fn open_with_spawn_explicit_refuses_missing_file() {
+        let missing = std::env::temp_dir().join("aurora-does-not-exist-open-with.jpg");
+        let cmd = validate_open_with("viewer.exe", &missing).unwrap();
+        let err = cmd.spawn_explicit().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
