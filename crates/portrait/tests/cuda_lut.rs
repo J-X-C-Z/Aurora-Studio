@@ -10,7 +10,6 @@
 
 #[cfg(windows)]
 mod skin_lut_gpu {
-    use std::path::Path;
 
     use aurora_portrait::cuda::{driver_metrics, CudaError};
     use aurora_portrait::cuda_lut::{GATE, KERNEL, LUT_BYTES, SkinLut, TEMPERATURE_KERNEL};
@@ -81,8 +80,8 @@ mod skin_lut_gpu {
     }
 
     fn tint_fixture(name: &str) -> Vec<u8> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/pf21015")
+        let path = aurora_portrait::private_assets::path("fixtures/portrait/pf21015")
+            .expect("needs private-assets/")
             .join(name);
         let bytes =
             std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
@@ -289,6 +288,7 @@ mod skin_lut_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn tint_green_magenta_and_full_limits_match_the_fixed_oracle() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -307,6 +307,7 @@ mod skin_lut_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn tint_zero_and_signed_limits_cover_geometry_and_alpha() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -345,6 +346,7 @@ mod skin_lut_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn tint_refuses_bad_ui_and_bad_atlases() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -373,6 +375,7 @@ mod skin_lut_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn tint_clamps_ui_outside_the_ui_range() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");
@@ -396,6 +399,7 @@ mod skin_lut_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn tint_fixed_oracle_is_not_skin_tint() {
         let Some(gpu) = gpu() else { return };
         let green = tint_fixture("TintGreen.rgb8");

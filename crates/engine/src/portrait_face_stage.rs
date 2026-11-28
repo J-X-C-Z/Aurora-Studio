@@ -357,6 +357,7 @@ fn draw_gap(pf: u32) -> &'static str {
         44124 | 48019 | 49221 | 41922 => {
             "PF44124/PF48019/PF49221/PF41922 Type1018 EBO 0x7080940 and frame draw"
         }
+        8033 => "PF8033 smile CPU-forward receipt + dx/dy/mask artifacts",
         // Every brow/topology row names the exact index buffer the kernel
         // refuses without, so a refusal states the missing contract instead
         // of a generic same-job label.

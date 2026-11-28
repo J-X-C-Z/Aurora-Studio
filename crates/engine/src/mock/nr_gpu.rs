@@ -721,7 +721,7 @@ h2d_bytes={} d2h_bytes={} launches={} kernels={kernels:?}",
             return;
         }
         let path = std::env::var("AURORA_NR_NEF")
-            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+            .expect("set AURORA_NR_NEF to a real NEF file");
         let image = crate::raw::decode(Path::new(&path)).expect("decode NEF");
         let (w, h) = image.dimensions();
         let raw = image.into_raw();

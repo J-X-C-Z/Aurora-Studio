@@ -31,9 +31,14 @@ use crate::{AiMaskKind, Collection, CollectionKind, ExportJob, HdrOptions, JobSt
 mod library_ops;
 #[path = "file_engine_services.rs"]
 mod services;
+/// Per-photo portrait capability evidence; see the module docs. Declared here
+/// (not in `lib.rs`) because only this engine can supply the decoded frame and
+/// its identity, and it stays private to the engine.
+#[path = "portrait_runtime_probe.rs"]
+mod portrait_runtime_probe;
 
 /// Longest side kept for a decoded source; larger files are downscaled.
-const SOURCE_LONG_SIDE: u32 = 4096;
+const SOURCE_LONG_SIDE: u32 = crate::raw_cache::PREVIEW_LONG_SIDE;
 /// Test-only count of the one-shot full-resolution export decodes. Exporting
 /// at or below [`SOURCE_LONG_SIDE`] must never take this path.
 #[cfg(test)]
@@ -299,18 +304,14 @@ fn estimated_decode_bytes(width: u32, height: u32, format: DecodeFormat) -> usiz
     retained.saturating_add(transient)
 }
 
-/// Which RAW decoder the route selects, for the *observed* working-set
-/// estimate. Deliberately separate from [`DecodeFormat`]: it does not feed
-/// admission until real peak-RSS data lands.
+/// Which RAW decoder the route selects, for the working-set estimate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum RawDecodeShape {
     LibRaw,
     AuroraGeneric,
     AuroraZ6iii,
 }
 
-#[allow(dead_code)]
 impl RawDecodeShape {
     fn of(route: &crate::raw::DecodeRoute) -> Self {
         if !route.c1_raw_enabled {
@@ -340,13 +341,11 @@ impl RawDecodeShape {
 }
 
 /// Working set a decode is expected to hold, including the container bytes and
-/// the per-backend buffers the 12/16 B/px admission constants omit.
+/// the per-backend buffers the 12/16 B/px constants omit.
 ///
-/// **Estimation only.** Admission still uses [`estimated_decode_bytes`] with
-/// its unchanged constants; switching the gate to this value needs real
-/// peak-RSS measurements per format (Z6III HE/HE★, lossless NEF, ARW, CR3,
-/// RAF, DNG).
-#[allow(dead_code)]
+/// The B/px values are estimates from the buffer lists in
+/// [`RawDecodeShape::transient_bytes_per_px`], not measured peak RSS (Z6III
+/// HE/HE*, lossless NEF, ARW, CR3, RAF, DNG still need measuring on Windows).
 fn estimated_decode_bytes_observed(
     width: u32,
     height: u32,
@@ -371,6 +370,51 @@ fn estimated_decode_bytes_observed(
     file_bytes
         .saturating_add(retained)
         .saturating_add(source_px.saturating_mul(per_px))
+}
+
+/// The pixel grid the decoder actually walks: the catalog's (oriented, possibly
+/// cropped) size or the RAW sensor grid, whichever is larger. Sensor sizes
+/// include margin pixels that `ImageInfo` never reports.
+fn decode_admission_dims(info: (u32, u32), sensor: Option<(u32, u32)>) -> (u32, u32) {
+    let px = |d: (u32, u32)| u64::from(d.0) * u64::from(d.1);
+    match sensor {
+        Some(s) if px(s) > px(info) => s,
+        _ => info,
+    }
+}
+
+/// Bytes the decode gate charges for one decode. Never below
+/// [`estimated_decode_bytes`] (so existing admission and the export-budget
+/// calibration are a floor); for RAW it additionally counts the sensor grid,
+/// the container bytes held while decoding and the per-backend decoder buffers.
+fn decode_admission_bytes(
+    info: (u32, u32),
+    sensor: Option<(u32, u32)>,
+    format: DecodeFormat,
+    file_bytes: usize,
+    route: Option<&crate::raw::DecodeRoute>,
+) -> usize {
+    let base = estimated_decode_bytes(info.0, info.1, format);
+    let (w, h) = decode_admission_dims(info, sensor);
+    match (format, route) {
+        (DecodeFormat::RawProxy | DecodeFormat::RawNative, Some(route)) => {
+            estimated_decode_bytes_observed(w, h, format, file_bytes, route).max(base)
+        }
+        _ => estimated_decode_bytes(w, h, format).max(base),
+    }
+}
+
+/// Sensor grid, container size and decode route for a RAW path. Empty for EIP
+/// (the RAW sits inside a ZIP) and non-RAW files.
+fn raw_admission_inputs(path: &Path) -> (Option<(u32, u32)>, usize, Option<crate::raw::DecodeRoute>) {
+    if !crate::raw::is_raw(path) || is_eip(path) {
+        return (None, 0, None);
+    }
+    let sensor = crate::raw::sensor_dimensions(path);
+    let file_bytes = std::fs::metadata(path)
+        .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    (sensor, file_bytes, Some(crate::raw::decode_route(path)))
 }
 
 /// Decode-format class for a proxy decode of `path`; native RAW decodes pass
@@ -1912,7 +1956,11 @@ fn export_memory_budget_from_memory(total: u64, available: u64) -> usize {
 
 /// Rough peak working-set estimate for one export job based on output dimensions
 /// and bit depth, used to serialize large-frame (e.g. 24MP/45MP) exports.
-fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
+///
+/// Also the per-pixel envelope the export pipeline charges its bounded queues
+/// with ([`crate::export::stages`]), so the admission budget and the in-flight
+/// queue depth cannot disagree about what a frame costs.
+pub(crate) fn estimated_export_bytes(width: u32, height: u32, bit_depth: u8) -> usize {
     let pixels = (width as usize).saturating_mul(height as usize);
     let bytes_per_px = if bit_depth == 16 { 36usize } else { 24usize };
     pixels.saturating_mul(bytes_per_px).max(1)
@@ -2382,6 +2430,11 @@ pub struct FileEngine {
     imported_styles: RwLock<Vec<StyleInfo>>,
     merge_registry: Arc<crate::merge_async::MergeRegistry>,
     soft_proof: RwLock<crate::SoftProofSettings>,
+    /// The image whose neighbours were last queued for prefetch. A preview
+    /// re-render of the same image (every slider drag) must not rebuild the
+    /// folder path list or re-queue a plan, so this is the selection latch.
+    // Once a viewer supplies its sorted order, stale render workers never overwrite it.
+    last_prefetched: Mutex<(bool,Option<(ImageId,u32)>)>,
 }
 
 /// Target white balance for Match Look: stored C1 gains when present, the
@@ -2508,9 +2561,30 @@ impl FileEngine {
         crate::c1_cos::save_adjustments(&path, adjustments, &layers)
     }
 
+    /// Creates a new Capture One-aligned Session at `root` (`Capture/`, `Selects/`,
+    /// `Output/`, `Trash/` + `.aurora/aurora.db`) and opens it.
+    pub fn create_session(root: impl AsRef<Path>, name: Option<&str>) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+        crate::aurora_store::AuroraDb::create_session(root, name)?;
+        Self::open(root)
+    }
+
+    /// Creates a new Aurora Catalog at `root` (`.aurora/aurora.db`) and opens it.
+    pub fn create_catalog(root: impl AsRef<Path>, name: Option<&str>) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+        crate::aurora_store::AuroraDb::create_catalog(root, name)?;
+        Self::open(root)
+    }
+
     /// Opens `root` and imports every supported image below it.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = library_ops::canonical_root(root.as_ref())?;
+        // Real registration point for the startup device warmup: opening a
+        // library is the first moment this process knows it will decode RAW, and
+        // the JIT then overlaps the folder scan below instead of the first
+        // click. Single-flight and idempotent; `AURORA_RAW_PREWARM=0` (and a
+        // non-CUDA `AURORA_GPU_BACKEND`) are honoured inside the warmup.
+        crate::aurora_raw::prewarm::spawn_background();
         let store = match Store::open(&root) {
             Ok(store) => Some(store),
             Err(err) => {
@@ -2574,6 +2648,7 @@ impl FileEngine {
             imported_styles: RwLock::new(Vec::new()),
             merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
             soft_proof: RwLock::new(soft_proof),
+            last_prefetched: Mutex::new((false,None)),
         };
         // The opening scan is not a user rescan: keep it out of the import job
         // snapshot so the records describe explicit `import`/`rescan` calls.
@@ -2649,6 +2724,18 @@ impl FileEngine {
         materialize_eip(&self.root, &path).ok()
     }
 
+    /// Opens any supported catalog read-only: a Lightroom Classic `.lrcat`
+    /// through [`FileEngine::open_lrcat`], everything else (Capture One
+    /// catalogs and sessions) through [`FileEngine::open_c1_catalog`].
+    pub fn open_catalog(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lrcat")) {
+            Self::open_lrcat(path)
+        } else {
+            Self::open_c1_catalog(path)
+        }
+    }
+
     /// Opens a Capture One catalog or session read-only and imports its images
     /// as Portrait entries. Edits are saved to `.portrait` beside the database; the C1
     /// database itself is never written to.
@@ -2667,6 +2754,9 @@ impl FileEngine {
             root = root.parent().unwrap_or(Path::new(".")).to_path_buf();
         }
         let root = library_ops::canonical_root(&root)?;
+        // A catalog is a folder of RAW too: same warmup registration point as
+        // [`Self::open`], and the same single-flight latch.
+        crate::aurora_raw::prewarm::spawn_background();
         let store = Store::open(&root).ok();
         let catalog = store.as_ref().and_then(|s| s.load_index().ok()).unwrap_or_default();
         let soft_proof = store.as_ref().and_then(|s| s.load_soft_proof().ok()).unwrap_or_default();
@@ -2719,9 +2809,69 @@ impl FileEngine {
             imported_styles: RwLock::new(Vec::new()),
             merge_registry: Arc::new(crate::merge_async::MergeRegistry::default()),
             soft_proof: RwLock::new(soft_proof),
+            last_prefetched: Mutex::new((false,None)),
         };
         engine.import_c1(&import);
         engine.inference().preload_ai_masks();
+        Ok(engine)
+    }
+
+    /// Opens a Lightroom Classic `.lrcat` read-only. The catalog is only read
+    /// (`SQLITE_OPEN_READ_ONLY`); the photos it references are opened as a
+    /// folder library rooted at their deepest common folder, and Lightroom's
+    /// rating, colour label and develop settings seed every image that has no
+    /// edits of its own yet. Edits are saved to `.portrait` beside the photos.
+    pub fn open_lrcat(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let catalog = crate::lrcat_import::LrcatCatalog::open_read_only(path.as_ref())?;
+        let records: Vec<_> = catalog.read_images()?.into_iter().filter(|r| r.file_path.is_file()).collect();
+        anyhow::ensure!(!records.is_empty(), "the Lightroom catalog references no photo that exists on this machine");
+        let mut root = records[0].file_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for record in &records[1..] {
+            while !record.file_path.starts_with(&root) {
+                if !root.pop() {
+                    break;
+                }
+            }
+        }
+        anyhow::ensure!(
+            root.components().count() >= 2 && root.is_dir(),
+            "the Lightroom catalog's photos share no common folder"
+        );
+        let engine = Self::open(&root)?;
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let by_path: HashMap<PathBuf, &crate::lrcat_import::LrcatImageRecord> =
+            records.iter().map(|r| (canonical(&r.file_path), r)).collect();
+        let mut infos = Vec::new();
+        let mut edits = Vec::new();
+        for mut info in engine.images() {
+            let Some(record) = by_path.get(&canonical(&info.path)) else { continue };
+            if info.rating == 0 && info.color_tag == ColorTag::None && !info.has_adjustments {
+                info.rating = record.rating.clamp(0, 5);
+                info.color_tag = match record.color_label.to_ascii_lowercase().as_str() {
+                    "red" => ColorTag::Red,
+                    "yellow" => ColorTag::Yellow,
+                    "green" => ColorTag::Green,
+                    "blue" => ColorTag::Blue,
+                    "purple" => ColorTag::Purple,
+                    _ => ColorTag::None,
+                };
+                infos.push(info.clone());
+            }
+            if !info.has_adjustments {
+                if let Some(settings) = &record.develop_settings {
+                    let adjustments = settings.to_adjustment_set();
+                    if !adjustments.is_default() {
+                        edits.push((info.id, adjustments));
+                    }
+                }
+            }
+        }
+        if !infos.is_empty() {
+            engine.update_info_batch(&infos)?;
+        }
+        if !edits.is_empty() {
+            engine.save_adjustments_batch(&edits)?;
+        }
         Ok(engine)
     }
 
@@ -3030,6 +3180,61 @@ impl FileEngine {
             .map(|entry| entry.path.clone())
     }
 
+    /// The photo's own decoded frame, when the engine still holds it, plus the
+    /// identity its portrait evidence is keyed by.
+    ///
+    /// Deliberately read-only: no decode, no LRU bookkeeping, no cache pin. A
+    /// capability query must not turn into an image load, and a photo that is
+    /// not decoded simply has no same-frame evidence yet. `None`/`None` also
+    /// covers an unknown image and a file whose identity no longer matches what
+    /// the cache holds (that entry is invalidated, so nothing is claimed from
+    /// stale pixels).
+    fn portrait_frame_evidence(
+        &self,
+        image: ImageId,
+    ) -> (
+        Option<portrait_runtime_probe::FrameIdentity>,
+        Option<Arc<Source>>,
+    ) {
+        let Some(path) = self.image_path(image) else {
+            return (None, None);
+        };
+        let mut st = self.state.lock();
+        if FileEngine::refresh_source_identity(&mut st, image, &path, false) {
+            if let Some(entry) = st.sources.get(&image) {
+                let identity = portrait_runtime_probe::FrameIdentity {
+                    path,
+                    len: entry.identity.len,
+                    mtime_nanos: entry.identity.mtime_nanos,
+                    token: entry.identity.token,
+                };
+                let source = Arc::clone(&entry.source);
+                drop(st);
+                return (Some(identity), Some(source));
+            }
+        }
+        if st.native_raw.as_ref().is_some_and(|slot| slot.image == image)
+            && FileEngine::refresh_source_identity(&mut st, image, &path, true)
+        {
+            if let Some(slot) = st.native_raw.as_ref() {
+                if slot.image == image {
+                    if let Some(source) = slot.source.as_ref() {
+                        let identity = portrait_runtime_probe::FrameIdentity {
+                            path,
+                            len: slot.identity.len,
+                            mtime_nanos: slot.identity.mtime_nanos,
+                            token: slot.identity.token,
+                        };
+                        let source = Arc::clone(source);
+                        drop(st);
+                        return (Some(identity), Some(source));
+                    }
+                }
+            }
+        }
+        (None, None)
+    }
+
     /// A cached source, charged to the byte budget and refreshed in the LRU.
     /// Derived buffers are accounted again on every hit because they are built
     /// lazily after the source was stored.
@@ -3199,7 +3404,14 @@ impl FileEngine {
                     st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(previous.bytes);
                 }
             }
-            let units = decode_units(estimated_decode_bytes(width, height, DecodeFormat::RawNative));
+            let (sensor, file_bytes, route) = raw_admission_inputs(&path);
+            let units = decode_units(decode_admission_bytes(
+                (width, height),
+                sensor,
+                DecodeFormat::RawNative,
+                file_bytes,
+                route.as_ref(),
+            ));
             let _permit = self.decode_gates.heavy.acquire(DecodePriority::Interactive, units);
             self.state.lock().source_cache.misses += 1;
             let decoded = (|| {
@@ -3399,6 +3611,38 @@ impl FileEngine {
         st.source_cache.current_bytes = 0;
     }
 
+    /// Warms the neighbours of `image` on the prefetch worker.
+    ///
+    /// This is the real registration point for the neighbour graph: the engine
+    /// knows its own entry order and the exact long side the next preview reads,
+    /// so the worker fills the entry the interactive path asks for instead of a
+    /// second cache. The path list is rebuilt only when the selected image
+    /// changes, so a re-render of the same frame costs one atomic load.
+    ///
+    /// Order caveat: entries are in folder-scan order. A browser sorted by
+    /// capture time may step through a different neighbour; warming the scan
+    /// neighbour is still a hit whenever the two agree, and the plan is bounded
+    /// by [`crate::aurora_raw::prefetch::MAX_TARGETS`] either way.
+    pub fn prefetch_neighbors(&self, image: ImageId) {
+        self.prefetch_neighbors_at(image, SOURCE_LONG_SIDE);
+    }
+
+    /// [`Self::prefetch_neighbors`] with an explicit long side, for a caller
+    /// that will read a different cache entry next (1:1 zoom).
+    pub fn prefetch_neighbors_at(&self, image: ImageId, long_side: u32) {
+        use crate::aurora_raw::prefetch as pf;
+        let mut owner=self.last_prefetched.lock();
+        if owner.0 || owner.1==Some((image,long_side)) {return;}
+        if !pf::prefetch_enabled() {pf::cancel_pending();owner.1=None;return;}
+        let targets={
+            let state=self.state.lock();
+            let Some(current)=state.entries.iter().position(|e|e.info.id==image) else{return};
+            pf::neighbor_paths_by(current,&state.entries,&pf::DEFAULT_OFFSETS,|e|e.path.as_path())
+        };
+        owner.1=Some((image,long_side));
+        pf::request_visible_targets(targets,long_side);
+    }
+
     /// The cached model-sized input, for the engine's own tests. The inference
     /// service owns the production body.
     #[cfg(test)]
@@ -3591,11 +3835,12 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "portrait-output" {
+            if name.starts_with('.') || name == "portrait-output"
+                || (name == "Output" && path.join(".aurora-export-dir").is_file()) {
                 continue;
             }
             collect(root, &path, depth + 1, out)?;
-        } else if path.is_file() && is_supported(&path) {
+        } else if path.is_file() && supports_photo_path(&path) {
             let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
             out.push((rel, path));
         }
@@ -3642,7 +3887,8 @@ fn scan_file(root: &Path, rel: String, path: PathBuf) -> ScannedFile {
     }
 }
 
-fn is_supported(path: &Path) -> bool {
+/// Photo, RAW or supported catalog package the real folder scanner can index (no I/O).
+pub fn supports_photo_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif")
@@ -4085,6 +4331,12 @@ impl FileEngine {
 }
 
 impl ImageEngine for FileEngine {
+    fn prefetch_visible_neighbors(&self, targets:Vec<PathBuf>) {
+        let mut owner=self.last_prefetched.lock();
+        owner.0=true;
+        crate::aurora_raw::prefetch::request_visible_targets(targets,SOURCE_LONG_SIDE);
+    }
+
     fn name(&self) -> String {
         format!("Portrait File Engine ({})", self.root.display())
     }
@@ -4121,11 +4373,59 @@ impl ImageEngine for FileEngine {
         self.catalog().library_root()
     }
 
+    fn library_profile(&self) -> Option<crate::LibraryProfile> {
+        self.store.as_ref().and_then(|s| s.library_profile().ok())
+    }
+
+    fn move_to_session_role(
+        &self,
+        images: &[ImageId],
+        role: crate::SessionFolderRole,
+    ) -> anyhow::Result<Vec<ImageInfo>> {
+        let profile = self
+            .library_profile()
+            .ok_or_else(|| anyhow::anyhow!("library store is unavailable"))?;
+        let dest = profile
+            .role_path(role)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("not a Session library (no {} folder)", role.dir_name()))?;
+        std::fs::create_dir_all(&dest)?;
+        self.manage_library(crate::LibraryAction::Move {
+            images: images.to_vec(),
+            destination: dest,
+        })
+    }
+
+    fn add_favorite_folder(&self, rel_path: &str, label: &str) -> anyhow::Result<()> {
+        if let Some(store) = &self.store {
+            store.db().add_favorite(rel_path, label)?;
+        }
+        Ok(())
+    }
+
+    fn remove_favorite_folder(&self, rel_path: &str) -> anyhow::Result<()> {
+        if let Some(store) = &self.store {
+            store.db().remove_favorite(rel_path)?;
+        }
+        Ok(())
+    }
+
     fn collection_path(&self, id: u64) -> Option<PathBuf> {
         self.catalog().collection_path(id)
     }
 
     fn user_collections(&self) -> Vec<crate::UserCollection> {
+        if let Some(store) = &self.store {
+            let rel_to_id: HashMap<String, ImageId> = {
+                let st = self.state.lock();
+                st.entries.iter().map(|e| (e.rel_path.clone(), e.info.id)).collect()
+            };
+            if let Ok(cols) = store.db().load_user_collections(&rel_to_id) {
+                if !cols.is_empty() {
+                    return cols;
+                }
+            }
+        }
         self.catalog().user_collections()
     }
 
@@ -4182,7 +4482,14 @@ impl ImageEngine for FileEngine {
 
     fn save_user_collections(&self, collections: &[crate::UserCollection]) -> anyhow::Result<()> {
         match &self.store {
-            Some(store) => store.save_user_collections(collections).map_err(Into::into),
+            Some(store) => {
+                let id_to_rel: HashMap<ImageId, String> = {
+                    let st = self.state.lock();
+                    st.entries.iter().map(|e| (e.info.id, e.rel_path.clone())).collect()
+                };
+                store.db().save_user_collections(collections, &id_to_rel)?;
+                store.save_user_collections(collections).map_err(Into::into)
+            }
             None => Ok(()),
         }
     }
@@ -4209,7 +4516,7 @@ impl ImageEngine for FileEngine {
             st.catalog.clone()
         };
         if let Some(store) = &self.store {
-            store.save_index(&catalog)?;
+            store.save_index_db_only(&catalog)?;
         }
         Ok(())
     }
@@ -4252,7 +4559,7 @@ impl ImageEngine for FileEngine {
             st.catalog.clone()
         };
         if let Some(store) = &self.store {
-            if let Err(err) = store.save_index(&catalog) {
+            if let Err(err) = store.save_index_db_only(&catalog) {
                 log::warn!("save catalog: {err}");
             }
         }
@@ -4324,6 +4631,15 @@ impl ImageEngine for FileEngine {
         &self,
         items: &[(ImageId, AdjustmentSet)],
     ) -> anyhow::Result<()> {
+        {
+            let st = self.state.lock();
+            if items
+                .iter()
+                .any(|(image, _)| !st.entries.iter().any(|entry| entry.info.id == *image))
+            {
+                anyhow::bail!("unknown image");
+            }
+        }
         match FileEngine::save_adjustments_batch_report(self, items).into_error() {
             Some(err) => Err(err),
             None => Ok(()),
@@ -4462,11 +4778,20 @@ impl ImageEngine for FileEngine {
     }
 
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame> {
+        self.prefetch_neighbors(request.image);
         self.preview_frame(request, false)
     }
 
-    fn render_preview_fast(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
-        self.preview_frame(request, fast)
+    fn render_preview_scoped(
+        &self,
+        request: &PreviewRequest,
+        scopes: crate::scopes::ScopeWants,
+    ) -> anyhow::Result<PreviewFrame> {
+        self.renders().preview_frame_scoped(request, false, scopes)
+    }
+
+    fn quick_cold_raw_preview(&self, request: &PreviewRequest) -> Option<PreviewFrame> {
+        self.renders().quick_cold_raw_preview(request)
     }
 
     fn sample_color(&self, image: ImageId, adjustments: &AdjustmentSet, point: [f32; 2]) -> anyhow::Result<[f32; 3]> {
@@ -4631,13 +4956,33 @@ impl ImageEngine for FileEngine {
     }
 
     fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo> {
-        let style = crate::c1_styles::load_style(path)?;
-        let info = StyleInfo {
-            name: style.name,
-            group: "Imported".into(),
-            adjustments: style.adjustments,
-            source: Some(path.to_path_buf()),
-            has_look: style.look.is_some(),
+        let is_xmp = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xmp"));
+        let info = if is_xmp {
+            // Lightroom / Camera Raw develop preset: read-only, mapped onto
+            // Aurora's own adjustments.
+            let preset = crate::xmp_preset::XmpPreset::load(path)?;
+            let name = preset
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "Lightroom preset".into());
+            StyleInfo {
+                name,
+                group: "Imported".into(),
+                adjustments: preset.to_adjustment_set(),
+                source: Some(path.to_path_buf()),
+                has_look: false,
+            }
+        } else {
+            let style = crate::c1_styles::load_style(path)?;
+            StyleInfo {
+                name: style.name,
+                group: "Imported".into(),
+                adjustments: style.adjustments,
+                source: Some(path.to_path_buf()),
+                has_look: style.look.is_some(),
+            }
         };
         let mut imported = self.imported_styles.write();
         imported.retain(|s| !(s.group == info.group && s.name == info.name));
@@ -4711,6 +5056,34 @@ impl ImageEngine for FileEngine {
     }
     fn portrait_capabilities(&self) -> Vec<crate::PortraitCapability> {
         crate::panel_commands::portrait_capabilities()
+    }
+    /// Per-photo availability: the catalogue bridge above stays static, this
+    /// one answers for `image`'s own decoded frame, host models and assets.
+    ///
+    /// This form is the automatic, cheap one: no document, no production pass.
+    fn portrait_capability_snapshot(
+        &self,
+        image: ImageId,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        self.portrait_capability_for(image, &AdjustmentSet::default(), false)
+    }
+    /// Per-photo availability for the document the panel currently shows.
+    ///
+    /// `detail` is the user's explicit refresh; the automatic path passes `false`.
+    fn portrait_capability_for(
+        &self,
+        image: ImageId,
+        adjustments: &AdjustmentSet,
+        detail: bool,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        let (identity, source) = self.portrait_frame_evidence(image);
+        portrait_runtime_probe::capability_for(
+            image,
+            identity.as_ref(),
+            source.as_deref(),
+            adjustments,
+            detail,
+        )
     }
     fn layer_summaries(&self, image: ImageId) -> Vec<crate::engine::LayerSummary> {
         self.catalog().layer_summaries(image)
@@ -4966,6 +5339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn lcc_calibration_round_trips_through_cos_lccid_and_sidecar() {
         let (dir, settings, grid) = lcc_fixture("round-trip");
         let engine = FileEngine::open(&dir).unwrap();
@@ -4992,6 +5366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn clearing_lcc_calibration_removes_the_cos_pointer() {
         let (dir, settings, grid) = lcc_fixture("clear");
         let engine = FileEngine::open(&dir).unwrap();
@@ -5006,6 +5381,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn setting_lcc_on_an_unknown_image_is_an_error() {
         let (dir, _settings, grid) = lcc_fixture("unknown");
         let engine = FileEngine::open(&dir).unwrap();
@@ -5276,16 +5652,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "profiles real NEF decode through Source construction"]
+    #[ignore = "profiles real NEF decode through Source construction; set AURORA_TEST_RAW"]
     fn bench_real_nef_source_pipeline() {
         use std::time::Instant;
 
         let path = std::env::var_os("AURORA_TEST_RAW")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF"));
-        if !path.is_file() {
-            return;
-        }
+            .expect("set AURORA_TEST_RAW to a real NEF file");
         for round in 0..3 {
             let started = Instant::now();
             let (w, h, px) = crate::raw::decode16(&path).expect("decode16");
@@ -5512,6 +5885,64 @@ mod tests {
     }
 
     #[test]
+    fn a_lightroom_catalog_opens_read_only_and_seeds_rating_and_edits() {
+        let dir = std::env::temp_dir().join(format!("portrait-open-lrcat-{}", std::process::id()));
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        image::RgbImage::from_pixel(8, 8, image::Rgb([90, 120, 150])).save(photos.join("a.png")).unwrap();
+        let catalog_path = dir.join("Synthetic.lrcat");
+        {
+            let conn = rusqlite::Connection::open(&catalog_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE AgLibraryRootFolder (id_local INTEGER PRIMARY KEY, absolutePath TEXT, relativePathFromCatalog TEXT, name TEXT);
+                 CREATE TABLE AgLibraryFolder (id_local INTEGER PRIMARY KEY, rootFolder INTEGER, pathFromRoot TEXT);
+                 CREATE TABLE AgLibraryFile (id_local INTEGER PRIMARY KEY, folder INTEGER, baseName TEXT, extension TEXT, idx_filename TEXT);
+                 CREATE TABLE Adobe_images (id_local INTEGER PRIMARY KEY, rootFile INTEGER, rating REAL, colorLabels TEXT, pick REAL, captureTime TEXT, fileFormat TEXT);
+                 CREATE TABLE Adobe_imageDevelopSettings (id_local INTEGER PRIMARY KEY, image INTEGER, text TEXT);
+                 INSERT INTO AgLibraryFolder (id_local, rootFolder, pathFromRoot) VALUES (10, 1, '');
+                 INSERT INTO AgLibraryFile VALUES (100, 10, 'a', 'png', 'a.png');
+                 INSERT INTO Adobe_images VALUES (1000, 100, 4.0, 'Red', 0.0, NULL, 'PNG');",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO AgLibraryRootFolder VALUES (1, ?1, NULL, 'photos')", [photos.to_string_lossy().to_string()]).unwrap();
+            conn.execute(
+                "INSERT INTO Adobe_imageDevelopSettings VALUES (1, 1000, ?1)",
+                ["s = {\n Exposure2012 = 0.5,\n}"],
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&catalog_path).unwrap();
+        let engine = FileEngine::open_lrcat(&catalog_path).unwrap();
+        let images = engine.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].rating, 4);
+        assert_eq!(images[0].color_tag, ColorTag::Red);
+        assert!(!engine.load_adjustments(images[0].id).is_default());
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), before, "the .lrcat is never modified");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_xmp_preset_imports_as_a_style() {
+        let dir = std::env::temp_dir().join(format!("portrait-import-xmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let preset = dir.join("Warm.xmp");
+        std::fs::write(
+            &preset,
+            br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Exposure2012="+0.50"/></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&preset).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let style = engine.import_style(&preset).unwrap();
+        assert_eq!(style.name, "Warm");
+        assert!(!style.adjustments.is_default());
+        assert!(engine.styles().iter().any(|s| s.name == "Warm"));
+        assert_eq!(std::fs::read(&preset).unwrap(), before, "source preset untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn an_imported_style_appears_once_in_styles() {
         let dir = std::env::temp_dir().join(format!("portrait-import-style-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5624,12 +6055,12 @@ mod tests {
     #[test]
     fn raw_files_are_supported() {
         for ext in ["nef", "cr3", "arw", "dng"] {
-            assert!(is_supported(Path::new(&format!("shot.{ext}"))), "{ext}");
+            assert!(supports_photo_path(Path::new(&format!("shot.{ext}"))), "{ext}");
         }
         for ext in ["jpg", "png", "tif", "webp", "heic", "heif"] {
-            assert!(is_supported(Path::new(&format!("shot.{ext}"))), "{ext}");
+            assert!(supports_photo_path(Path::new(&format!("shot.{ext}"))), "{ext}");
         }
-        assert!(!is_supported(Path::new("notes.txt")));
+        assert!(!supports_photo_path(Path::new("notes.txt")));
     }
 
     #[test]
@@ -6028,6 +6459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_catalog_imports_every_variant_once() {
         let dir = c1_copy("import");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6041,6 +6473,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_import_keeps_adjustments_and_metadata() {
         let dir = c1_copy("meta");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6056,6 +6489,7 @@ mod tests {
 
     /// Opening a C1 catalog must publish C1's own albums, not the folder tree.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_collections_replace_the_folder_tree() {
         let dir = c1_copy("collections");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6086,6 +6520,7 @@ mod tests {
     /// C1 local layers are attached only when their `.comask` mask can be decoded;
     /// the fixture has no sidecar, so it must stay unattached and safe.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_layers_without_a_mask_stay_out_of_the_render() {
         let dir = c1_copy("layers");
         let engine = FileEngine::open_c1_catalog(&dir).unwrap();
@@ -6105,6 +6540,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_import_saves_to_portrait_not_the_catalog() {
         let dir = c1_copy("store");
         let catalog_file = dir.join("Capture One.cocatalogdb");
@@ -6118,6 +6554,7 @@ mod tests {
 
     /// A real C1 catalog is a package folder; our store must stay outside it.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_bundle_leaves_no_portrait_inside_the_package() {
         let dir = std::env::temp_dir().join(format!("portrait-c1-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6135,6 +6572,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn c1_import_keeps_portrait_edits_on_reopen() {
         let dir = c1_copy("reopen");
         {
@@ -6310,6 +6748,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_tiff_still_in_the_camera_colour_space_gets_the_camera_profile() {
         let dir = icc_temp_dir("tiff-camera");
         let path = dir.join("cam.tif");
@@ -6372,6 +6811,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn raw_files_still_get_their_camera_defaults() {
         let dir = icc_temp_dir("raw");
         let tiff_path = dir.join("shot.tif");
@@ -6567,6 +7007,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn eip_restores_packed_edits_on_import_and_reopen() {
         assert_packed_edits_on_import_and_reopen(false);
     }
@@ -6747,9 +7188,22 @@ mod tests {
     fn wait_export(engine: &FileEngine, job_id: u64) -> JobStatus {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            match engine.job_status(job_id) {
+            let status = engine.job_status(job_id);
+            let is_terminal = engine
+                .export_job_ids
+                .lock()
+                .get(&job_id)
+                .copied()
+                .and_then(|jid| engine.export_jobs.job(jid))
+                .map(|record| record.state().is_terminal())
+                .unwrap_or(true);
+            match status {
                 JobStatus::Queued | JobStatus::Running { .. } => {
                     assert!(std::time::Instant::now() < deadline, "export job timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ if !is_terminal => {
+                    assert!(std::time::Instant::now() < deadline, "export job timed out waiting for terminal state");
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 status => return status,
@@ -7159,9 +7613,9 @@ mod tests {
 
     #[test]
     fn export_above_the_proxy_decodes_the_original_at_full_resolution() {
-    let _serial = full_res_export_test_lock();
+        let _serial = full_res_export_test_lock();
         let _guard = FULL_RES_EXPORT_TEST_LOCK.lock();
-        let fixture = export_png_fixture("full", 4500, 3000, (100, 100, 64));
+        let fixture = export_png_fixture("full", 4500, 750, (100, 100, 64));
         let before_misses = fixture.engine.source_cache_stats().misses;
         let before_decodes = full_res_export_decode_count();
         let out = fixture.dir.join("Output");
@@ -7172,9 +7626,10 @@ mod tests {
         let JobStatus::Done { output } = wait_export(&fixture.engine, 71) else {
             panic!("export did not finish: {:?}", fixture.engine.job_status(71));
         };
-        // The 4096 proxy would render 4500x2999 (4500 * 2730 / 4096); the full
-        // original renders exactly 4500x3000.
-        assert_eq!(image::image_dimensions(&output).unwrap(), (4500, 3000));
+        // Keep the width above the 4096 proxy but avoid depending on 309 MiB of
+        // available decode budget in parallel CI. The proxy is 4096x682; the
+        // original must retain every pixel of the 4500x750 checker.
+        assert_eq!(image::image_dimensions(&output).unwrap(), (4500, 750));
         assert_eq!(
             full_res_export_decode_count() - before_decodes,
             1,
@@ -7187,7 +7642,7 @@ mod tests {
         );
 
         let exported = image::open(&output).unwrap().to_rgba8();
-        assert_eq!(exported.dimensions(), (4500, 3000));
+        assert_eq!(exported.dimensions(), (4500, 750));
         let row: Vec<u8> = (0..64).map(|i| exported.get_pixel(100 + i, 110).0[0]).collect();
         let dark = row.iter().filter(|value| **value < 60).count();
         let bright = row.iter().filter(|value| **value > 195).count();
@@ -7369,7 +7824,7 @@ mod tests {
             .map(|level| level.allocated_bytes())
             .sum();
         assert_eq!(source_cache_bytes(&source), materialized);
-        assert!(source.levels[1..].iter().all(|level| !level.data.is_empty()));
+        assert!(source.levels[1..].iter().all(|level| level.is_materialized()));
     }
 
     #[test]
@@ -7452,7 +7907,7 @@ mod tests {
     fn export_budget_admits_two_24mp_jobs_and_not_three() {
         use std::sync::atomic::AtomicBool;
         let mib = 1024 * 1024usize;
-        let budget = export_memory_budget_from_memory(32 * mib as u64, 24 * mib as u64);
+        let budget = export_memory_budget_from_memory(32 * 1024 * mib as u64, 24 * 1024 * mib as u64);
         let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
         let full = (6048u32, 4032u32);
         let charge = estimated_decode_bytes(full.0, full.1, DecodeFormat::RawNative)
@@ -7485,7 +7940,7 @@ mod tests {
     #[test]
     fn export_budget_binds_two_45mp_jobs() {
         let mib = 1024 * 1024usize;
-        let budget = export_memory_budget_from_memory(32 * mib as u64, 24 * mib as u64);
+        let budget = export_memory_budget_from_memory(32 * 1024 * mib as u64, 24 * 1024 * mib as u64);
         let scheduler = Arc::new(ExportScheduler::with_limits(4, budget));
         let full = (8256u32, 5504u32);
         let charge = estimated_decode_bytes(full.0, full.1, DecodeFormat::RawNative)
@@ -7599,6 +8054,7 @@ mod tests {
             z6iii_feature: true,
             libraw_available: true,
             opencl: crate::raw::OpenClRouteState::NotCompiled,
+            device_policy: crate::raw::RawDevicePolicy::default(),
             demosaic: 3,
         };
         let libraw = route(false, false);
@@ -7638,6 +8094,54 @@ mod tests {
             ),
             usize::MAX
         );
+    }
+
+    #[test]
+    fn decode_admission_counts_sensor_grid_file_bytes_and_decoder_buffers() {
+        let route = crate::raw::DecodeRoute {
+            pipeline_fingerprint: 0,
+            c1_raw_enabled: false,
+            z6iii_nef: false,
+            z6iii_feature: false,
+            libraw_available: true,
+            opencl: crate::raw::OpenClRouteState::NotCompiled,
+            device_policy: crate::raw::RawDevicePolicy::default(),
+            demosaic: 3,
+        };
+        // Catalog reports a cropped 6000x4000 frame; the sensor grid is larger.
+        let info = (6000u32, 4000u32);
+        let sensor = (6064u32, 4040u32);
+        assert_eq!(decode_admission_dims(info, Some(sensor)), sensor);
+        // A smaller or missing sensor answer never shrinks the charge.
+        assert_eq!(decode_admission_dims(info, Some((100, 100))), info);
+        assert_eq!(decode_admission_dims(info, None), info);
+
+        let file_bytes = 40_000_000usize;
+        let floor = estimated_decode_bytes(info.0, info.1, DecodeFormat::RawProxy);
+        let admitted = decode_admission_bytes(info, Some(sensor), DecodeFormat::RawProxy, file_bytes, Some(&route));
+        let sensor_px = sensor.0 as usize * sensor.1 as usize;
+        let kept = fit_long_side(sensor);
+        let retained = kept.0 as usize * kept.1 as usize * RETAINED_BYTES_PER_PX * 4 / 3;
+        assert_eq!(admitted, file_bytes + retained + sensor_px * 20);
+        assert!(admitted > floor, "{admitted} should exceed the legacy estimate {floor}");
+
+        // Without a route (EIP, raster) the legacy estimate is the charge, but
+        // the sensor grid is still honoured when one is supplied.
+        assert_eq!(decode_admission_bytes(info, None, DecodeFormat::Raster, 0, None), estimated_decode_bytes(info.0, info.1, DecodeFormat::Raster));
+        assert!(decode_admission_bytes(info, Some(sensor), DecodeFormat::RawNative, 0, None) >= estimated_decode_bytes(sensor.0, sensor.1, DecodeFormat::RawNative));
+        // Never below the legacy estimate, even with a degenerate sensor answer.
+        assert!(decode_admission_bytes(info, Some((1, 1)), DecodeFormat::RawNative, 0, Some(&route)) >= estimated_decode_bytes(info.0, info.1, DecodeFormat::RawNative));
+        // Saturates instead of overflowing.
+        assert_eq!(
+            decode_admission_bytes((u32::MAX, u32::MAX), None, DecodeFormat::RawNative, usize::MAX, Some(&route)),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn raw_admission_inputs_skip_non_raw_files() {
+        let (sensor, file_bytes, route) = raw_admission_inputs(Path::new("photo.jpg"));
+        assert!(sensor.is_none() && file_bytes == 0 && route.is_none());
     }
 
     #[test]
@@ -7886,6 +8390,12 @@ mod tests {
         let before = pixel_hash(&engine.thumbnail(id, &adjustments, 128).unwrap().pixels);
         engine.clear_source_cache();
         assert_eq!(engine.source_cache_stats().current_bytes, 0);
+        // The on-disk thumbnail cache is JPEG (lossy) and would answer the second
+        // call without touching the source cache; drop it so the render is redone.
+        if let Some(store) = &engine.store {
+            let rel = engine.state.lock().entries[0].rel_path.clone();
+            store.thumb_cache().invalidate(&rel);
+        }
         let after = pixel_hash(&engine.thumbnail(id, &adjustments, 128).unwrap().pixels);
         assert_eq!(before, after, "cache eviction changed the rendered pixels");
         std::fs::remove_dir_all(&dir).ok();
@@ -9050,5 +9560,245 @@ mod queued_save_tests {
 
         drop(engine);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cop_without_libjxl_falls_back_to_original_and_updates_cache() {
+        let dir = queued_temp_dir("cop-fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut rgba = image::RgbaImage::new(16, 16);
+        for pixel in rgba.pixels_mut() {
+            *pixel = image::Rgba([42, 128, 210, 255]);
+        }
+        let orig_path = dir.join("sample.png");
+        rgba.save(&orig_path).unwrap();
+        let cop_path = dir.join("sample.png.cop");
+        std::fs::write(&cop_path, b"not-a-real-jxl-payload").unwrap();
+
+        #[cfg(windows)]
+        let (env_key, prev_env) = {
+            let key = "AURORA_JXL_DIR";
+            let prev = std::env::var_os(key);
+            let missing = dir.join("missing-jxl-dir");
+            unsafe { std::env::set_var(key, &missing) };
+            (key, prev)
+        };
+        #[cfg(unix)]
+        let (env_key, prev_env) = {
+            let key = "AURORA_JXL_LIB";
+            let prev = std::env::var_os(key);
+            let missing = dir.join("missing-libjxl.so");
+            unsafe { std::env::set_var(key, &missing) };
+            (key, prev)
+        };
+
+        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.1 {
+                        Some(v) => std::env::set_var(self.0, v),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+        let _restore = EnvRestore(env_key, prev_env);
+
+        let engine = FileEngine::open(&dir).unwrap();
+        let cop_entry = engine
+            .images()
+            .into_iter()
+            .find(|info| info.path == cop_path)
+            .expect(".cop entry should be indexed");
+        assert_eq!((cop_entry.width, cop_entry.height), (16, 16));
+
+        let thumb = engine
+            .thumbnail(cop_entry.id, &AdjustmentSet::default(), 16)
+            .expect(".cop thumbnail should fall back to original image without libjxl");
+        assert_eq!((thumb.width, thumb.height), (16, 16));
+        assert_eq!(&thumb.pixels[..4], &[42, 128, 210, 255]);
+
+        let reason = engine.source_status(cop_entry.id);
+        assert!(
+            reason.is_none(),
+            "fallback decode should not leave an error reason: {reason:?}"
+        );
+        assert!(
+            engine.cached_source(cop_entry.id).is_some(),
+            "fallback decode should update source cache"
+        );
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod warmup_wiring_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aurora-warmup-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_png(dir: &Path, name: &str) {
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([40, 80, 120, 255]))
+            .save(dir.join(name))
+            .unwrap();
+    }
+
+    fn preview_request(image: ImageId) -> PreviewRequest {
+        PreviewRequest {
+            image,
+            adjustments: AdjustmentSet::default(),
+            region: crate::NormRect::FULL,
+            max_size: 512,
+            quality: crate::RenderQuality::Final,
+            bypass: true,
+            mask_overlay: None,
+            generation: 1,
+            display_profile: None,
+            proof_profile: None,
+            proof_paper_white: 1.0,
+            proof_black_point: 0.0,
+            rendering_intent: None,
+            black_point_compensation: false,
+        }
+    }
+
+    /// A stored settled frame comes back byte-identical as a progressive first
+    /// frame carrying the *requesting* generation, and only for the identical
+    /// source, adjustments and output size.
+    #[test]
+    fn disk_placeholder_returns_the_settled_frame_only_for_identical_requests() {
+        let dir = temp_dir("disk-placeholder");
+        write_png(&dir, "a.png");
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let path = engine.image_path(id).unwrap();
+        let mut request = preview_request(id);
+        request.bypass = false;
+        request.generation = 3;
+        let rendered = engine.render_preview(&request).unwrap();
+
+        let disk = crate::preview_disk::PreviewDisk::open(dir.join("disk-cache"), 8 << 20).unwrap();
+        let adj = crate::styles::resolve(&request.adjustments);
+        let key = crate::preview_disk::DiskKey::new(
+            &path, &adj, request.region, request.max_size, request.bypass, request.mask_overlay, false,
+        )
+        .unwrap();
+        assert!(engine.renders().disk_placeholder_with(&disk, &request, &path).is_none(), "cold");
+        assert!(disk.store(&key, rendered.image.width, rendered.image.height, &rendered.image.pixels));
+
+        let mut newer = request.clone();
+        newer.generation = 9;
+        let hit = engine.renders().disk_placeholder_with(&disk, &newer, &path).expect("hit");
+        assert_eq!(hit.generation, 9, "the placeholder answers the requesting generation");
+        assert_eq!((hit.image.width, hit.image.height), (rendered.image.width, rendered.image.height));
+        assert_eq!(*hit.image.pixels, *rendered.image.pixels, "hit is the settled frame, byte for byte");
+        assert!(!hit.bgra && hit.scopes.is_none() && hit.degraded.is_none());
+        assert_eq!(hit.histogram, rendered.histogram);
+
+        // Another output size, another edit, a region or proofing: no placeholder.
+        let mut other = request.clone();
+        other.max_size = 256;
+        assert!(engine.renders().disk_placeholder_with(&disk, &other, &path).is_none());
+        let mut edited = request.clone();
+        edited.adjustments.exposure.exposure = 0.5;
+        assert!(engine.renders().disk_placeholder_with(&disk, &edited, &path).is_none());
+        let mut zoom = request.clone();
+        zoom.region = crate::NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        assert!(engine.renders().disk_placeholder_with(&disk, &zoom, &path).is_none());
+        let mut proof = request.clone();
+        proof.proof_profile = Some("p.icc".to_string());
+        assert!(engine.renders().disk_placeholder_with(&disk, &proof, &path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `FileEngine::open` is the real registration point: opening a library has
+    /// to ask for the startup device warmup, or the first RAW click pays the JIT.
+    #[test]
+    fn opening_a_library_registers_the_device_warmup() {
+        let dir = temp_dir("open");
+        write_png(&dir, "a.png");
+        let before = crate::aurora_raw::prewarm::spawn_requests();
+        let engine = FileEngine::open(&dir).unwrap();
+        let after = crate::aurora_raw::prewarm::spawn_requests();
+        assert!(after > before, "opening a library must request the device warmup");
+        assert_eq!(engine.images().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A preview queues the RAW neighbours of the selected image exactly once:
+    /// the long side is the one the next preview reads, and re-rendering the same
+    /// selection (a slider drag) must not rebuild the plan.
+    #[test]
+    fn a_preview_queues_raw_neighbours_once_per_selection() {
+        let dir = temp_dir("prefetch");
+        write_png(&dir, "a.png");
+        std::fs::write(dir.join("b.nef"), b"not a real raw").unwrap();
+        std::fs::write(dir.join("c.nef"), b"not a real raw").unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let info = engine
+            .images()
+            .into_iter()
+            .find(|info| info.file_name.ends_with(".png"))
+            .expect("the png is the previewable image");
+
+        let before = crate::aurora_raw::prefetch::stats().requested;
+        engine.render_preview(&preview_request(info.id)).unwrap();
+        let after = crate::aurora_raw::prefetch::stats().requested;
+        assert_eq!(
+            after,
+            before + 1,
+            "one preview must queue exactly one neighbour plan: {:?}",
+            crate::aurora_raw::prefetch::stats()
+        );
+
+        // Same selection, second render: the latch keeps the plan untouched.
+        engine.render_preview(&preview_request(info.id)).unwrap();
+        assert_eq!(
+            crate::aurora_raw::prefetch::stats().requested,
+            after,
+            "a re-render of the same image must not queue again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_late_preview_must_not_replace_the_viewers_sorted_neighbours() {
+        let dir=temp_dir("visible-order");write_png(&dir,"a.png");std::fs::write(dir.join("b.nef"),b"synthetic invalid RAW").unwrap();
+        let engine=FileEngine::open(&dir).unwrap();
+        let image=engine.images().into_iter().find(|x|x.file_name.ends_with(".png")).unwrap().id;
+        engine.prefetch_visible_neighbors(Vec::new());
+        let before=crate::aurora_raw::prefetch::stats().requested;
+        engine.prefetch_neighbors(image);
+        assert_eq!(before,crate::aurora_raw::prefetch::stats().requested);
+        drop(engine);std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The plan the engine hands to the worker is the RAW neighbours at the
+    /// preview long side, capped and de-duplicated.
+    #[test]
+    fn the_engine_plan_is_the_raw_neighbours_at_the_preview_long_side() {
+        let paths: Vec<PathBuf> = ["a.png", "b.nef", "c.nef", "d.jpg", "e.arw"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let plan = crate::aurora_raw::prefetch::neighbor_paths(
+            0,
+            &paths,
+            &crate::aurora_raw::prefetch::DEFAULT_OFFSETS,
+        );
+        assert_eq!(
+            plan,
+            vec![PathBuf::from("b.nef"), PathBuf::from("c.nef")],
+            "the +1/-1/+2 walk keeps b and c; the jpg at +3 and the arw beyond the window do not consume the cap"
+        );
+        assert_eq!(SOURCE_LONG_SIDE, crate::raw_cache::PREVIEW_LONG_SIDE);
     }
 }

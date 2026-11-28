@@ -4,6 +4,8 @@
 *.conflict
 
 # Capture One / third-party reference assets are local-only.
+# See private-assets.md.
+/private-assets/
 /crates/engine/testdata/
 
 # User media and benchmark inputs.
@@ -35,6 +37,7 @@
 *.zip
 *.crate
 *.sha256
+!/docs/private-assets.sha256
 *.log
 *.tmp
 crash-*.dmp
@@ -48,8 +51,6 @@ crash-*.dmp
 
 # Merge/intermediate artifacts.
 *.MERGE
-*.conflict
-*.rs.rs
 
 # Editors and operating systems.
 .idea/
@@ -61,6 +62,9 @@ Thumbs.db
 Desktop.ini
 
 # Local runtime, private fixtures, research probes and build caches.
+# crates/engine/examples/ and src/bin/ are local-only by default; the files
+# already tracked there stay tracked. Add a new one with `git add -f` only if
+# it needs no private assets.
 /vendor/
 /engine/
 /90_work/
@@ -70,6 +74,8 @@ Desktop.ini
 # microbenchmark, which uses no private assets.
 /crates/engine/examples/*
 !/crates/engine/examples/metal_chain_bench.rs
+# Portable sensor-vs-preview probe; the caller supplies a RAW, no fixture is shipped.
+!/crates/engine/examples/raw_sensor_check.rs
 /crates/engine/src/bin/
 !/crates/engine/src/bin/
 !/crates/engine/src/bin/c1_session_export.rs

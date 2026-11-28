@@ -8,6 +8,7 @@
 //! CPU kernels have no windowing dependency and stay testable headless.
 
 pub mod capability_registry;
+pub mod private_assets;
 pub mod effect_descriptor;
 pub mod kernels;
 pub mod model_sha256;
@@ -16,6 +17,10 @@ pub mod device;
 pub mod eye_bag_alignment;
 pub mod cuda;
 pub mod cuda_job_upload;
+/// AMD/Intel Direct3D 12 compute device layer (Windows only, zero bundled DLLs).
+/// Managed by `native_infer::dx12_session`.
+#[cfg(windows)]
+pub mod dx12;
 pub mod cuda_lut;
 pub mod cuda_pf90021;
 pub mod cuda_pf8050;
@@ -53,7 +58,25 @@ pub mod raster_fragment;
 pub mod metal;
 pub mod metal_mesh;
 pub mod metal_smile;
+pub mod wgpu_backend;
 pub mod effect_router;
+pub mod native_infer;
+
+// Cross-platform compute layers (platform-agnostic CPU oracle + vendor adapters).
+pub mod autotune;
+pub mod compute_backend;
+pub mod native_infer_graph;
+pub mod platform_runtime;
+pub mod shader_catalog;
+pub mod simd_ops;
+pub mod cuda_backend;
+pub mod hip_backend;
+pub mod metal_backend;
+pub mod native_infer_cuda;
+pub mod sycl_openvino_backend;
+/// Portable wgpu implementation of `compute_backend::ComputeBackend`
+/// (distinct from the legacy free-function API in `wgpu_backend`).
+pub mod wgpu_compute;
 
 /// Packed RGBA8 image, row-major, four bytes per pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]

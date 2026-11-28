@@ -483,6 +483,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn exif_is_found_in_the_file_head_without_reading_the_rest() {
         let exif = jpeg_with_exif();
         let expected = parse_exif(&exif);
@@ -495,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn exif_past_the_head_still_falls_back_to_a_full_read() {
         let exif = jpeg_with_exif();
         let expected = parse_exif(&exif);
@@ -506,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn real_sample_carries_exif_and_iptc() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/iptc-sample.jpg");
         let (exif, iptc) = read_metadata(&path);

@@ -5,9 +5,15 @@
 //! `Render`, `Encode`, `Metadata`, `Publish`), pre-flight validation with
 //! memory-budget accounting, and cancellation-safe atomic publishing while
 //! reusing the proven primitives in [`crate::recipe`] and [`crate::output`].
+//!
+//! [`pipeline`] is the bounded three-stage executor the standard export path
+//! runs on (source acquire -> render -> encode/publish), and [`stages`] is the
+//! single implementation of those three stage bodies.
 
+pub mod pipeline;
 pub mod plan;
 pub mod publisher;
+pub mod stages;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -19,7 +25,14 @@ use crate::job_lifecycle::{CancelToken, JobId};
 use crate::output::ProcessRecipe;
 
 pub use plan::{ExportMemoryBudget, ExportPlan, ExportPlanError, ExportStage};
+pub use pipeline::{
+    mode as export_pipeline_mode, pin_mode as pin_export_pipeline_mode, PipelineLimits as ExportPipelineLimits,
+    PipelineMode as ExportPipelineMode, PipelineStats as ExportPipelineStats,
+};
 pub use publisher::{AtomicPublisher, PublishError, PublishOutcome};
+pub use stages::{
+    pipeline_stats as export_pipeline_stats, run_export as run_standard_export, PublishTarget,
+};
 
 /// Outcome of a single stage in an [`ExportExecutionReport`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,10 +318,10 @@ mod tests {
     #[test]
     fn plan_rejects_unsupported_format_and_bad_scale() {
         let mut psd = ProcessRecipe::default();
-        psd.format = ExportFormat::Psd;
+        psd.format = ExportFormat::JpegXl;
         assert!(matches!(
             ExportPlan::from_recipe(&psd, (800, 600), &Geometry::default()),
-            Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::Psd, .. })
+            Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::JpegXl, .. })
         ));
 
         let mut bad_scale = ProcessRecipe::default();

@@ -56,6 +56,10 @@ impl Plane {
         Self { width, height, data: Vec::new(), lazy: Some(OnceLock::new()) }
     }
 
+    pub(crate) fn is_materialized(&self) -> bool {
+        !self.data.is_empty() || self.lazy.as_ref().is_some_and(|slot| slot.get().is_some())
+    }
+
     /// Bytes this level owns or has reserved.
     ///
     /// A deferred level is charged its full payload before it is built, so the
@@ -93,9 +97,9 @@ fn box_downscale(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32
         .collect()
 }
 
-/// Serial variant for lazy `OnceLock` mip construction: `level_data` may be
-/// entered from inside a rayon parallel render pass, so spawning nested rayon
-/// tasks inside `OnceLock::get_or_init` risks threadpool starvation.
+/// Serial variant for `OnceLock::get_or_init` inside rayon render workers:
+/// calling `into_par_iter()` while holding a `OnceLock` deadlocks when other
+/// rayon workers block on the same `OnceLock`.
 fn box_downscale_serial(prev: &[[f32; 3]], prev_width: u32, w: u32, h: u32) -> Vec<[f32; 3]> {
     (0..(w * h) as usize)
         .map(|i| box_downscale_pixel(prev, prev_width, w, i))
@@ -126,7 +130,7 @@ use crate::processing::tone::{apply_dehaze, apply_hdr, tone_user, tone_user_core
 
 // Encoding/banding quantisers live in `processing::encoding`; imported here so
 // this renderer and its tests keep the unqualified names.
-use crate::processing::encoding::{encode_f32_frame, merge_wide_delta, upsample};
+use crate::processing::encoding::{encode_f32_frame, merge_wide_delta};
 #[cfg(windows)]
 use crate::processing::encoding::{band_region, encode_io_rows};
 use super::plan::{
@@ -569,6 +573,7 @@ impl BandSampler<'_> {
     /// Fills `band` with output rows `y0 .. y0 + rows` (row-major, `out_w` wide).
     /// A band is one tile row tall, so it maps onto whole cached tiles.
     fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
+        let _sampling = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Sampling);
         let out_w = self.out_w as usize;
         band.resize(rows as usize * out_w, EMPTY_SAMPLE);
         let tiles = self.tiles(y0 / SAMPLE_TILE);
@@ -990,6 +995,80 @@ impl Source {
     }
 }
 
+/// Layers outside `active` whose masks a copy mask in `active` reads,
+/// transitively, in first-reference order.
+fn copy_mask_sources<'a>(adj: &'a AdjustmentSet, active: &[&'a Layer]) -> Vec<&'a Layer> {
+    let mut seen: Vec<u64> = active.iter().map(|layer| layer.id).collect();
+    let mut out: Vec<&Layer> = Vec::new();
+    let mut queue: Vec<&Layer> = active.to_vec();
+    while let Some(layer) = queue.pop() {
+        for shape in &layer.mask.shapes {
+            let MaskShape::Copy { from_layer, .. } = shape else { continue };
+            if seen.contains(from_layer) {
+                continue;
+            }
+            seen.push(*from_layer);
+            if let Some(source) = adj.layers.iter().find(|l| l.id == *from_layer) {
+                out.push(source);
+                queue.push(source);
+            }
+        }
+    }
+    out
+}
+
+/// Builds layer mask rasters on demand so a copy mask can read any layer's
+/// mask, whatever its draw position. Cycles resolve to an empty source.
+struct MaskResolver<'a> {
+    adj: &'a AdjustmentSet,
+    aspect: f32,
+    cell_px: f32,
+    guide: Option<&'a [f32]>,
+    memo: Vec<(u64, Option<Arc<MaskGrid>>)>,
+    stack: Vec<u64>,
+    /// Set when a cycle was cut below the current layer; such a raster
+    /// depends on where the walk started, so it is not memoized.
+    cut: bool,
+}
+
+impl MaskResolver<'_> {
+    fn grid_for(&mut self, layer: &Layer) -> Option<Arc<MaskGrid>> {
+        if let Some((_, grid)) = self.memo.iter().find(|(id, _)| *id == layer.id) {
+            return grid.clone();
+        }
+        if layer.mask.shapes.is_empty() {
+            return None;
+        }
+        if self.stack.contains(&layer.id) {
+            self.cut = true;
+            return None;
+        }
+        let outer_cut = std::mem::take(&mut self.cut);
+        self.stack.push(layer.id);
+        let mut deps: Vec<(u64, Arc<MaskGrid>)> = Vec::new();
+        for shape in &layer.mask.shapes {
+            let MaskShape::Copy { from_layer, .. } = shape else { continue };
+            if deps.iter().any(|(id, _)| id == from_layer) {
+                continue;
+            }
+            let adj = self.adj;
+            if let Some(source) = adj.layers.iter().find(|l| l.id == *from_layer) {
+                if let Some(grid) = self.grid_for(source) {
+                    deps.push((*from_layer, grid));
+                }
+            }
+        }
+        self.stack.pop();
+        let tainted = self.cut;
+        self.cut = outer_cut || tainted;
+        let grid = Arc::new(MaskGrid::build(&layer.mask, self.aspect, self.cell_px, self.guide, &deps));
+        if !tainted {
+            self.memo.push((layer.id, Some(Arc::clone(&grid))));
+        }
+        Some(grid)
+    }
+}
+
 fn cached_mask_grids(
     src: &Source,
     adj: &AdjustmentSet,
@@ -1010,10 +1089,19 @@ fn cached_mask_grids(
         Mutex<Vec<(MaskGridCacheKey, Arc<Vec<Option<Arc<MaskGrid>>>>)>>,
     > =
         OnceLock::new();
+    // A copy mask reads another layer's *mask*, which is data: the source may
+    // sit after the copying layer, be disabled, or be pruned from the render
+    // list, and the copy must still see its shapes. Those sources are part of
+    // the raster's identity, so they join the cache key.
+    let copy_sources = copy_mask_sources(adj, active);
     let key = MaskGridCacheKey {
         source: src.snapshot_id(),
         geometry: adj.geometry.clone(),
-        layers: active.iter().map(|layer| (layer.id, layer.mask.clone())).collect(),
+        layers: active
+            .iter()
+            .chain(copy_sources.iter())
+            .map(|layer| (layer.id, layer.mask.clone()))
+            .collect(),
         has_guide: guide.is_some(),
     };
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -1025,15 +1113,18 @@ fn cached_mask_grids(
         return grids;
     }
 
-    let mut built: Vec<(u64, Arc<MaskGrid>)> = Vec::new();
+    let mut resolver = MaskResolver {
+        adj,
+        aspect,
+        cell_px,
+        guide,
+        memo: Vec::new(),
+        stack: Vec::new(),
+        cut: false,
+    };
     let mut grids = Vec::with_capacity(active.len());
     for layer in active {
-        let grid = (!layer.mask.shapes.is_empty())
-            .then(|| Arc::new(MaskGrid::build(&layer.mask, aspect, cell_px, guide, &built)));
-        if let Some(grid) = &grid {
-            built.push((layer.id, Arc::clone(grid)));
-        }
-        grids.push(grid);
+        grids.push(resolver.grid_for(layer));
     }
     let bytes = grids
         .iter()
@@ -1174,7 +1265,7 @@ fn layer_plans<'a>(
 }
 
 fn cached_layer_coverage(
-    plan: &Plan<'_>,
+    plan: &LayerView<'_, '_>,
     map: &super::geometry::FrameMap,
     region: NormRect,
     width: usize,
@@ -1332,11 +1423,6 @@ fn needs_stage_face_bundle_direct(extra: &std::collections::BTreeMap<String, f32
                 | 30204
                 | 30207
                 | 30210
-                // Brow head/tail length (PF44124/48019/49221/41922): the
-                // recovered two-part degree packet is attached through the
-                // face-bundle path. The synthetic Type1018 draw itself stays
-                // behind `any_eye_brow`, so the brow rows keep their named
-                // refusal until the 144-vertex consumer is routed.
                 | 41922
                 | 44124
                 | 48019
@@ -1389,13 +1475,28 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90086 | 100004)
+        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90021 | 90086 | 100004)
+            || is_body_pf(pf)
             || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
 
-fn teeth_ui_percent(extra: &std::collections::BTreeMap<String, f32>, key: &str) -> f32 {
-    extra.get(key).copied().unwrap_or(0.7) * 100.0
+/// Body rows that consume a same-job geometry payload. Listed here so a
+/// body-only adjustment still builds the stage frame the attachment reads.
+fn is_body_pf(pf: u32) -> bool {
+    matches!(
+        pf,
+        400 | 401 | 404..=408 | 410 | 415 | 416 | 38556 | 90041
+    )
+}
+
+/// PF108's `(bright, de-yellow)` percentages for one document.
+///
+/// The one resolver both the renderer and the stage dispatcher read.
+fn teeth_ui_percents(
+    extra: &std::collections::BTreeMap<String, f32>,
+) -> Result<(f32, f32), aurora_portrait::Refusal> {
+    crate::portrait_stage::pf108_ui_percents(extra)
 }
 
 fn stage_face_bundle(
@@ -1456,6 +1557,11 @@ pub struct Rendered {
     pub portrait_report: Option<crate::portrait_stage::PortraitRunReport>,
     /// True when `rgba` is already stored in BGRA channel order for display.
     pub(crate) bgra: bool,
+    /// Viewer scope counts taken on the device from exactly `rgba`, when the
+    /// frame came straight off the resident GPU path. `None` on every path that
+    /// still changes the pixels afterwards, so a caller always has the option of
+    /// counting on the CPU.
+    pub(crate) scopes: Option<ScopeMaps>,
 }
 
 /// A 16-bit frame for export. Previews keep using the 8-bit [`Rendered`].
@@ -1489,6 +1595,7 @@ pub fn render(
         false,
         true,
         false,
+        ScopeWants::default(),
     )
     .0
 }
@@ -1503,6 +1610,7 @@ pub(crate) fn render_preview_bgra(
     bypass: bool,
     mask_overlay: Option<u64>,
     want_bgra: bool,
+    scopes: ScopeWants,
 ) -> Rendered {
     let (out_w, out_h, scale, level) = geometry_for(src, adj, region, max_size);
     render_sized(
@@ -1518,6 +1626,7 @@ pub(crate) fn render_preview_bgra(
         false,
         true,
         want_bgra,
+        scopes,
     )
     .0
 }
@@ -1548,6 +1657,7 @@ pub fn render16(
             true,
             false,
             false,
+            ScopeWants::default(),
         );
     Rendered16 {
         rgba: wide.expect("a wide render always returns its 16-bit buffer"),
@@ -1594,8 +1704,7 @@ pub(crate) fn preview_size(src: &Source, adj: &AdjustmentSet, region: NormRect, 
     (w, h)
 }
 
-/// `fast` renders at half the output size and upsamples to the size a full
-/// render would have, so callers get the same dimensions with less per-pixel work.
+/// Both drag and settled frames sample this exact output grid.
 pub(crate) fn render_at(
     src: &Source,
     adj: &AdjustmentSet,
@@ -1603,26 +1712,10 @@ pub(crate) fn render_at(
     max_size: u32,
     bypass: bool,
     mask_overlay: Option<u64>,
-    fast: bool,
+    _fast: bool,
+    scopes: ScopeWants,
 ) -> Rendered {
-    if !fast {
-        return render(src, adj, region, max_size, bypass, mask_overlay);
-    }
-    let (tw, th) = preview_size(src, adj, region, max_size);
-    let small = render(src, adj, region, max_size.div_ceil(2).max(1), bypass, mask_overlay);
-    if (small.width, small.height) == (tw, th) {
-        return small;
-    }
-    let rgba = upsample(&small.rgba, small.width, small.height, tw, th);
-    let histogram = histogram(&rgba);
-    Rendered {
-        rgba,
-        width: tw,
-        height: th,
-        histogram,
-        portrait_report: small.portrait_report,
-        bgra: false,
-    }
+    render_preview_bgra(src, adj, region, max_size, bypass, mask_overlay, false, scopes)
 }
 
 /// Resolves the output-domain BandingSuppression for one render.
@@ -1709,6 +1802,7 @@ fn build_plan<'a>(
         color_editor: adj.color_editor != ColorEditor::default(),
         color_balance: adj.color_balance != ColorBalance::default(),
         layers: layer_plans(src, adj, aspect, cell_px, guide, mask_overlay),
+        mix: crate::mix_plan(adj),
     }
 }
 
@@ -1929,6 +2023,7 @@ fn encode_gpu_develop_bands(
     mut rgba16: Option<&mut [u16]>,
 ) -> bool {
     use super::develop_gpu;
+    let _develop = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
     let out_w = bands.out_w;
     let out_h = bands.out_h;
     let row = (out_w * 4) as usize;
@@ -1977,6 +2072,7 @@ fn develop_bands(
     rgba: &mut [u8],
     mut rgba16: Option<&mut [u16]>,
 ) {
+    let _develop = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
     let out_w = bands.out_w;
     let out_h = bands.out_h;
     let row = (out_w * 4) as usize;
@@ -2168,6 +2264,7 @@ fn has_post_8bit_stages(adj: &AdjustmentSet, bypass: bool, plan: &Plan<'_>, port
         || l.shift_y != 0.0
         || l.tilt != 0.0
         || (l.dust_removal_enabled && !l.dust_patches.is_empty())
+        || adj.extra.get("lens:green_fringing").copied().unwrap_or(0.0) > 0.0
 }
 
 fn hash_geometry(geometry: &Geometry, hasher: &mut impl Hasher) {
@@ -2252,17 +2349,24 @@ fn render_sized(
     wide: bool,
     with_histogram: bool,
     want_bgra: bool,
+    scopes: ScopeWants,
 ) -> (Rendered, Option<Vec<u16>>) {
+    let _render_total = crate::compute::telemetry::span(crate::compute::telemetry::Stage::RenderTotal);
     let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
     let t0 = stage_timing.then(std::time::Instant::now);
     let region = clean_region(region);
-    let portrait_active = !bypass
-        && !wide
-        && crate::portrait_registry::has_active_portrait_effect(adj);
+    // The wide (export) render runs the portrait stage too: the kernels eat
+    // the 8-bit stage frame, and their delta merges into the 16-bit buffer
+    // with the other local stages at the final `merge_wide_delta`. Only the
+    // cross-entry portrait cache stays preview-only (see the lookup below).
+    let portrait_active =
+        !bypass && crate::portrait_registry::has_active_portrait_effect(adj);
+    let body_active = !bypass && crate::portrait_stage::has_live_body_request(&adj.extra);
+    let post_portrait = portrait_active || body_active;
     let mut cached_frame_state: Option<(u64, u64)> = None;
     let mut cached_stage_image: Option<Arc<crate::PortraitImage>> = None;
     let (mut rgba, mut rgba16, develop8) = 'develop: {
-        if portrait_active {
+        if post_portrait && !wide {
             if let Some((cached, fingerprint, frame_state)) =
                 portrait_stage_cached(src, adj, region, out_w, out_h, scale, level, mask_overlay)
             {
@@ -2339,6 +2443,10 @@ fn render_sized(
     // Keeps the sampled linear viewport in VRAM across slider drags and runs
     // develop + optional Camera/Display USM + C1 ICC + GPU NR + quantize + GPU
     // histogram on one CUDA stream with zero intermediate D2H/H2D round-trips.
+    // The CUDA scope pass only exists on this platform, so elsewhere the
+    // request is never fulfilled and the caller keeps counting on the CPU.
+    #[cfg(not(windows))]
+    let _ = scopes;
     #[cfg(windows)]
     if !wide
         && adj.clarity.clarity.abs() <= 1e-4
@@ -2372,11 +2480,34 @@ fn render_sized(
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
         let c1_ok = true;
 
-        if c1_ok {
-            let post_8bit = has_post_8bit_stages(adj, bypass, &plan, portrait_active);
+        // Preflight against the shared VRAM ledger before the sample array and
+        // the full-frame gain plane exist: a refusal must not first
+        // materialise them. Conservative on the optional buffers (same sizes
+        // the device pool computes in `ResidentNeeds`).
+        let resident_admitted = c1_ok && {
+            let nr_any = !bypass
+                && (adj.noise_reduction.single_pixel > 0.0
+                    || adj.noise_reduction.luminance > 0.0
+                    || adj.noise_reduction.color > 0.0);
+            super::develop_gpu::resident_preview_admits(
+                out_w as usize,
+                out_h as usize,
+                &dev_params,
+                !bypass && (plan.uniform_light.is_some() || adj.vignetting.amount.abs() > 1e-3),
+                !bypass && camera_usm_path,
+                !bypass && !camera_usm_path && f32_includes_sharpen && adj.sharpening.amount > 0.0,
+                nr_any.then_some(&adj.noise_reduction),
+            )
+        };
+        if resident_admitted {
+            let post_8bit = has_post_8bit_stages(adj, bypass, &plan, post_portrait);
             let direct_return = !post_8bit;
             let emit_bgra = direct_return && want_bgra;
             let emit_hist = direct_return && with_histogram;
+            // The device counts scopes only when the frame it counted is the
+            // frame the app shows: post-8-bit stages would change the pixels
+            // after the count, so those renders ask for nothing.
+            let emit_scopes = if direct_return { scopes } else { ScopeWants::default() };
             let sharp = scale >= 0.5;
             let xs: Vec<f32> = (0..out_w)
                 .map(|x| region.x + (x as f32 + 0.5) / out_w as f32 * region.width)
@@ -2430,7 +2561,7 @@ fn render_sized(
                 cubic: sharp,
                 cache: true,
             };
-            if let Some(res) = super::develop_gpu::render_resident_preview(
+            let resident = super::develop_gpu::render_resident_preview(
                 res_key,
                 [region.x, region.y, region.width, region.height],
                 &dev_params,
@@ -2440,6 +2571,7 @@ fn render_sized(
                 nr_arg,
                 emit_bgra,
                 emit_hist,
+                emit_scopes,
                 |dst_f32| {
                     let w = out_w as usize;
                     let mut band = Vec::new();
@@ -2468,7 +2600,9 @@ fn render_sized(
                         y0 += rows;
                     }
                 },
-            ) {
+            );
+            crate::compute::telemetry::record_decision(resident.is_some(), false);
+            if let Some(res) = resident {
                 if let Some(t0) = t0 {
                     eprintln!(
                         "AURORA_STAGE resident_gpu={}x{} direct={} bgra={} src_hit={} total_ms={:.3}",
@@ -2489,6 +2623,7 @@ fn render_sized(
                             histogram: res.histogram.unwrap_or_default(),
                             portrait_report: None,
                             bgra: emit_bgra,
+                            scopes: res.scopes,
                         },
                         None,
                     );
@@ -2581,7 +2716,9 @@ fn render_sized(
                     if !adj.retouch.is_empty() {
                         apply_retouch(&mut rgba, out_w, out_h, adj, &map, region, scale);
                     }
+                    let layers_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::LayersMasks);
                     apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
+                    drop(layers_span);
                 }
                 break 'develop (rgba, rgba16, develop8);
             }
@@ -2795,6 +2932,7 @@ fn render_sized(
         };
         let work_w = out_w as usize + 2 * halo;
         let work_h = out_h as usize + 2 * halo;
+        let develop_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
         let mut rgb_f32 = take_f32_frame(work_w * work_h);
         let mut gpu_filled = false;
         // L3 stage cache: the develop frame before detail. The key holds the
@@ -2895,6 +3033,9 @@ fn render_sized(
                 }
             }
         }
+        if !stage_cached {
+            crate::compute::telemetry::record_decision(gpu_filled, false);
+        }
         if !stage_cached && !gpu_filled {
         if halo != 0 {
             // Preserve the viewport's sample centers and fetch neighbors in the
@@ -2984,6 +3125,7 @@ fn render_sized(
                 else { develop_display(&plan, c1.apply_camera_icc(*rgb)).map(|v| v.clamp(0.0, 1.0)) };
             });
         }
+        drop(develop_span);
         super::detail::post_process_core_f32(
             &mut rgb_f32, work_w as u32, work_h as u32, adj, scale, sharpen_in_display,
         );
@@ -3037,6 +3179,7 @@ fn render_sized(
         };
         #[cfg(not(windows))]
         let gpu_done = false;
+        crate::compute::telemetry::record_decision(gpu_done, false);
         if !gpu_done {
             develop_bands(&plan, &bands, bypass, pre.as_ref(), &mut rgba, rgba16.as_deref_mut());
         }
@@ -3172,6 +3315,23 @@ fn render_sized(
             Some(warp) => super::detail::post_process_with_lens(&mut rgba, out_w, out_h, detail_adj, scale, Some(warp)),
             None => super::detail::post_process(&mut rgba, out_w, out_h, detail_adj, scale),
         }
+        let green_fringe = detail_adj.extra.get("lens:green_fringing").copied().unwrap_or(0.0);
+        if green_fringe > 0.0 {
+            let before_green = rgba16.as_ref().map(|_| rgba.clone());
+            crate::ca_fix::defringe_dual(
+                &mut rgba,
+                out_w,
+                out_h,
+                &crate::ca_fix::DualDefringeParams {
+                    purple_amount: 0.0,
+                    green_amount: (green_fringe / 100.0).clamp(0.0, 1.0),
+                    ..Default::default()
+                },
+            );
+            if let (Some(wide), Some(before)) = (rgba16.as_mut(), before_green.as_deref()) {
+                merge_wide_delta(wide, before, &rgba, out_w as usize);
+            }
+        }
     }
     if !bypass {
         let dust = if crate::dustdetect::enabled() {
@@ -3214,11 +3374,16 @@ fn render_sized(
     // Layers come last: the spot removal sees the developed frame, and the
     // layer mix sees the healed one.
     if !bypass {
+        let layers_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::LayersMasks);
         apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
+        drop(layers_span);
     }
         (rgba, rgba16, develop8)
     };
-    let stored_stage = if portrait_active && cached_frame_state.is_none() {
+    // A wide render is a one-shot export: it must neither take the cache hit
+    // above (which returns rgba16 = None) nor evict the preview's entry, so
+    // the portrait stage cache stays preview-only on both sides.
+    let stored_stage = if post_portrait && !wide && cached_frame_state.is_none() {
         portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba)
     } else {
         None
@@ -3226,7 +3391,7 @@ fn render_sized(
     let stored_frame_state = stored_stage
         .as_ref()
         .map(|(_, frame_fingerprint, frame_state)| (*frame_fingerprint, *frame_state));
-    let portrait_report = if portrait_active {
+    let mut portrait_report = if portrait_active {
         let masks = src.portrait_masks();
         let mask_fingerprint = Some(src.portrait_masks_receipt_fingerprint());
         let receipt = match cached_frame_state.or(stored_frame_state) {
@@ -3279,6 +3444,26 @@ fn render_sized(
         } else {
             None
         };
+        // Body six-point geometry: source points come from a locally configured
+        // body-pose model; destinations come from the caller's JSON payload.
+        // Neither the slider nor this block synthesizes geometry. Body jobs do
+        // not need a face bundle, so this runs outside the attachments block.
+        if let Some(frame) = stage_frame.as_ref() {
+            let mut inputs = producer_inputs.take().unwrap_or_default();
+            match crate::portrait_stage::attach_pose_six_point(
+                frame.as_ref(),
+                &adj.extra,
+                &receipt,
+                &mut inputs,
+            ) {
+                Ok(true) => producer_inputs = Some(inputs),
+                Ok(false) => producer_inputs = Some(inputs),
+                Err(refusal) => {
+                    log::debug!("body pose six-point attach refused: {refusal:?}");
+                    producer_inputs = Some(inputs);
+                }
+            }
+        }
         // One SHA-256 for the immutable stage frame below. The face-input
         // produce call, the slim validation and every attachment check read the
         // same pixels; without this scope each of them re-hashed the full frame.
@@ -3446,11 +3631,10 @@ fn render_sized(
                                 attached = true;
                             }
                         }
-                        if bundle
-                            .attach_plump_from_extra(stage_frame, &adj.extra, &mut inputs)
-                            .is_ok()
-                        {
-                            attached = true;
+                        match bundle.attach_plump_from_extra(stage_frame, &adj.extra, &mut inputs) {
+                            Ok(()) if inputs.plump.is_some() => attached = true,
+                            Ok(()) => {}
+                            Err(refusal) => log::warn!("same-frame FacePlump input refused: {refusal:?}"),
                         }
                         if bundle
                             .attach_eye_and_brow_geometry(stage_frame, &adj.extra, &mut inputs)
@@ -3459,17 +3643,29 @@ fn render_sized(
                             attached = true;
                         }
                         if want_parsing {
-                            let bright_ui = teeth_ui_percent(&adj.extra, "pc:109");
-                            let deyellow_ui = teeth_ui_percent(&adj.extra, "pc:110");
-                            match bundle.attach_pf108_inputs(
-                                stage_frame,
-                                bright_ui,
-                                deyellow_ui,
-                                &mut inputs,
-                            ) {
-                                Ok(()) => attached = true,
+                            // One resolver for the whole PF108 family: the
+                            // producer percentages and the stage's `common_ui`
+                            // come from the same control set, so a child-only
+                            // document neither inherits the legacy 70 % sibling
+                            // nor runs at a zero common weight.
+                            match teeth_ui_percents(&adj.extra) {
+                                Ok((bright_ui, deyellow_ui)) => {
+                                    match bundle.attach_pf108_inputs(
+                                        stage_frame,
+                                        bright_ui,
+                                        deyellow_ui,
+                                        &mut inputs,
+                                    ) {
+                                        Ok(()) => attached = true,
+                                        Err(refusal) => {
+                                            log::warn!(
+                                                "canonical FaceParsingV2 input refused: {refusal:?}"
+                                            );
+                                        }
+                                    }
+                                }
                                 Err(refusal) => {
-                                    log::warn!("canonical FaceParsingV2 input refused: {refusal:?}");
+                                    log::warn!("PF108 family controls refused: {refusal:?}");
                                 }
                             }
                             if bundle
@@ -3514,27 +3710,37 @@ fn render_sized(
                                 .filter(|pf| {
                                     adj.extra
                                         .get(&format!("pc:{pf}"))
-                                        .is_some_and(|v| v.abs() > 1.0e-6)
+                                        .is_some_and(|value| value.abs() > 1.0e-6)
                                 })
                                 .collect();
-                        if !active_makeup_rows.is_empty()
-                            && bundle
-                                .attach_makeup_bundle(
-                                    stage_frame,
-                                    &active_makeup_rows,
-                                    &mut inputs,
-                                )
-                                .is_ok()
-                        {
-                            attached = true;
+                        if any_makeup_row_active(&adj.extra) {
+                            let makeup_face_mask = masks.mask_u8(
+                                crate::portrait_stage::MaskKind::Face,
+                                stage_frame.width,
+                                stage_frame.height,
+                                region,
+                            );
+                            match bundle.attach_makeup_bundle_with_options(
+                                stage_frame,
+                                &active_makeup_rows,
+                                makeup_face_mask.as_deref(),
+                                Some(&adj.extra),
+                                &mut inputs,
+                            ) {
+                                Ok(()) => attached = true,
+                                Err(refusal) => {
+                                    log::warn!("same-frame makeup bundle refused: {refusal:?}");
+                                }
+                            }
                         }
                         let c101 = adj.extra.get("pc:101").copied().unwrap_or(0.0);
                         if c101 != 0.0 {
-                            if bundle
-                                .attach_pf101_inputs(stage_frame, c101, &mut inputs)
-                                .is_ok()
-                            {
-                                attached = true;
+                            match bundle.attach_pf101_from_adjustments(stage_frame, c101, &adj.extra, &mut inputs) {
+                                Ok(()) => attached = true,
+                                Err(refusal) => {
+                                    log::warn!("PF101 same-frame input refused: {refusal:?}");
+                                    inputs.face_input_refusal.get_or_insert(refusal);
+                                }
                             }
                         }
                         // The apply path needs moisture planes only for
@@ -3550,22 +3756,25 @@ fn render_sized(
                         {
                             attached = true;
                         }
-                        if bundle
-                            .attach_pf8033_from_extra(stage_frame, &adj.extra, &mut inputs)
-                            .is_ok()
-                        {
-                            attached = true;
+                        match bundle.attach_pf8033_from_extra(stage_frame, &adj.extra, &mut inputs) {
+                            Ok(()) => attached = true,
+                            Err(refusal) => {
+                                log::warn!("PF8033 same-frame input refused: {refusal:?}");
+                                inputs.face_input_refusal.get_or_insert(refusal);
+                            }
                         }
-                        if bundle
-                            .attach_historical_tone_from_extra(
-                                stage_frame,
-                                Some(masks),
-                                &adj.extra,
-                                &mut inputs,
-                            )
-                            .is_ok()
-                        {
-                            attached = true;
+                        match bundle.attach_historical_tone_from_extra(
+                            stage_frame,
+                            Some(masks),
+                            &adj.extra,
+                            &mut inputs,
+                        ) {
+                            Ok(()) => attached = true,
+                            Err(refusal) => {
+                                log::warn!(
+                                    "historical tone same-frame input refused: {refusal:?}"
+                                );
+                            }
                         }
                         if bundle
                             .attach_historical_skin_from_extra(
@@ -3602,7 +3811,8 @@ fn render_sized(
         if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
-        Some(crate::portrait_stage::apply_portrait_effects_with_job(
+        let _portrait = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Portrait);
+        Some(crate::portrait_stage::apply_portrait_colors_before_body(
             &mut rgba,
             out_w,
             out_h,
@@ -3615,6 +3825,28 @@ fn render_sized(
     };
     if let (Some(wide), Some(before)) = (rgba16.as_mut(), develop8.as_deref()) {
         merge_wide_delta(wide, before, &rgba, out_w as usize);
+    }
+    // Body geometry resamples both depths from their own post-color samples.
+    // Running before merge_wide_delta would move high bits but leave the
+    // original pixel's low bits behind.
+    if body_active {
+        let job_id = portrait_report.as_ref().and_then(|r| r.job_id).unwrap_or_else(|| {
+            crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
+                &rgba, out_w, out_h, region, &adj.extra, src.portrait_masks(), cached_frame_state.map(|(fp, _)| fp),
+                Some(src.portrait_masks_receipt_fingerprint()),
+            ).job_id()
+        });
+        let portrait_body_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Portrait);
+        let body = crate::portrait_stage::apply_live_body(
+            &mut rgba, rgba16.as_deref_mut(), (out_w, out_h), job_id, &adj.extra,
+        );
+        drop(portrait_body_span);
+        if !body.is_empty() {
+            let report = portrait_report.get_or_insert_with(|| crate::PortraitRunReport {
+                job_id: Some(job_id), ..Default::default()
+            });
+            report.effects.extend(body);
+        }
     }
     let histogram = if with_histogram { histogram(&rgba) } else { Histogram::default() };
     if let Some(t0) = t0 {
@@ -3638,6 +3870,9 @@ fn render_sized(
             histogram,
             portrait_report,
             bgra: false,
+            // Nothing on this path can promise the pixels are what the panel
+            // shows, so scopes here are always counted by the caller.
+            scopes: None,
         },
         rgba16,
     )
@@ -3975,19 +4210,48 @@ fn develop_display(plan: &Plan, display: [f32; 3]) -> [f32; 3] {
     g
 }
 
+fn wheel_to_c1_gains(w: &ColorWheel, k: f32) -> [f32; 3] {
+    let s = (w.saturation * k).clamp(0.0, 1.0);
+    if s <= 1e-6 {
+        return [1.0; 3];
+    }
+    let c = crate::processing::color::hue_rgb(w.hue);
+    let mean = (c[0] + c[1] + c[2]) / 3.0;
+    [
+        (1.0 + (c[0] - mean) * s * 0.9).max(0.1),
+        (1.0 + (c[1] - mean) * s * 0.9).max(0.1),
+        (1.0 + (c[2] - mean) * s * 0.9).max(0.1),
+    ]
+}
+
 fn color_balance(g: [f32; 3], cb: &ColorBalance, k: f32) -> [f32; 3] {
-    let l = luma(g).clamp(0.0, 1.0);
+    if k.abs() <= 1e-6 {
+        return g;
+    }
+    let gains = ColorBalanceGains {
+        master: wheel_to_c1_gains(&cb.master, k),
+        shadow: wheel_to_c1_gains(&cb.shadow, k),
+        midtone: wheel_to_c1_gains(&cb.midtone, k),
+        highlight: wheel_to_c1_gains(&cb.highlight, k),
+    };
+    let mut out = if gains.is_neutral() {
+        g
+    } else {
+        color_balance_gains(g, &gains)
+    };
+    let l = luma(out).clamp(0.0, 1.0);
     let ws = (1.0 - l).powi(2);
     let wh = l.powi(2);
     let wm = (1.0 - ws - wh).max(0.0);
-    let mut out = g;
-    for (wheel, w) in [(&cb.master, 1.0), (&cb.shadow, ws), (&cb.midtone, wm), (&cb.highlight, wh)] {
-        if wheel.saturation == 0.0 && wheel.lightness == 0.0 {
-            continue;
-        }
-        let o = wheel_offset(wheel, 0.35);
-        for i in 0..3 {
-            out[i] += o[i] * w * k;
+    let l_delta = (cb.master.lightness
+        + cb.shadow.lightness * ws
+        + cb.midtone.lightness * wm
+        + cb.highlight.lightness * wh)
+        * 0.25
+        * k;
+    if l_delta.abs() > 1e-6 {
+        for c in &mut out {
+            *c = (*c + l_delta).max(0.0);
         }
     }
     out
@@ -4451,6 +4715,38 @@ fn apply_layers(
     if plan.layers.is_empty() {
         return;
     }
+    if let Some(mix) = &plan.mix {
+        apply_mixed(rgba, width, height, plan, mix, map, region, scale, source_size);
+        return;
+    }
+    let view = LayerView {
+        adj: plan.adj,
+        source: plan.source,
+        layers: plan.layers.iter().collect(),
+    };
+    apply_layer_set(rgba, width, height, &view, map, region, scale, source_size);
+}
+
+/// The layers one pass applies in series, and what their caches key on.
+struct LayerView<'p, 'a> {
+    adj: &'a AdjustmentSet,
+    source: u64,
+    layers: Vec<&'p LayerPlan<'a>>,
+}
+
+fn apply_layer_set(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    plan: &LayerView<'_, '_>,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    scale: f32,
+    source_size: (u32, u32),
+) {
+    if plan.layers.is_empty() {
+        return;
+    }
     // Heal/clone layers repair the pixels before their own colour edits stack.
     for lp in &plan.layers {
         if !lp.layer.cover.is_empty() {
@@ -4637,6 +4933,171 @@ fn apply_layers(
     }
 }
 
+/// Renders a graph with mixers on the CPU frame: every `MixStep` produces an
+/// image, and a `Chain` is the ordinary serial pass over just its layers, so a
+/// chain behaves exactly like the same layers in a serial graph. Preview,
+/// export and thumbnails all reach this through `apply_layers`.
+fn apply_mixed(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    plan: &Plan,
+    mix: &crate::MixPlan,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    scale: f32,
+    source_size: (u32, u32),
+) {
+    use crate::MixStep;
+    use std::collections::HashMap;
+    let w = width as usize;
+    let h = height as usize;
+    let xs: Vec<f32> =
+        (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
+    let base: Vec<u8> = rgba.to_vec();
+    let mut values: HashMap<u64, Vec<u8>> = HashMap::new();
+    // A node nothing produced (the input, or a bypassed feeder) is the base.
+    fn value<'v>(values: &'v HashMap<u64, Vec<u8>>, base: &'v [u8], id: u64) -> &'v [u8] {
+        values.get(&id).map_or(base, |v| v.as_slice())
+    }
+    let find = |id: u64| plan.layers.iter().find(|lp| lp.layer.id == id);
+    for step in &mix.steps {
+        match step {
+            MixStep::Chain { layers, from, to } => {
+                let mut frame = value(&values, &base, *from).to_vec();
+                let view = LayerView {
+                    adj: plan.adj,
+                    source: plan.source,
+                    layers: layers.iter().filter_map(|id| find(*id)).collect(),
+                };
+                apply_layer_set(&mut frame, width, height, &view, map, region, scale, source_size);
+                values.insert(*to, frame);
+            }
+            MixStep::Parallel { node, reference, inputs } => {
+                let reference = value(&values, &base, *reference);
+                let branches: Vec<&[u8]> =
+                    inputs.iter().map(|id| value(&values, &base, *id)).collect();
+                let mut out = reference.to_vec();
+                out.par_chunks_mut(4).enumerate().for_each(|(i, px)| {
+                    for k in 0..3 {
+                        let r = reference[i * 4 + k] as i32;
+                        let sum: i32 = branches.iter().map(|b| b[i * 4 + k] as i32 - r).sum();
+                        px[k] = (r + sum).clamp(0, 255) as u8;
+                    }
+                });
+                values.insert(*node, out);
+            }
+            MixStep::Stack { node, inputs } => {
+                let Some(first) = inputs.first() else {
+                    values.insert(*node, base.clone());
+                    continue;
+                };
+                let mut out = value(&values, &base, first.source).to_vec();
+                for input in &inputs[1..] {
+                    let top = value(&values, &base, input.source);
+                    let origin = value(&values, &base, input.origin);
+                    let covering: Vec<&LayerPlan> =
+                        input.layers.iter().filter_map(|id| find(*id)).collect();
+                    let opaque = input.layers.is_empty();
+                    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| {
+                        let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
+                        for x in 0..w {
+                            let i = (y * w + x) * 4;
+                            let c = if opaque {
+                                1.0
+                            } else {
+                                let g = [
+                                    origin[i] as f32 / 255.0,
+                                    origin[i + 1] as f32 / 255.0,
+                                    origin[i + 2] as f32 / 255.0,
+                                ];
+                                let p = map.map([xs[x], fy]).0;
+                                1.0 - covering
+                                    .iter()
+                                    .map(|lp| 1.0 - layer_weight(lp, p, g).clamp(0.0, 1.0))
+                                    .product::<f32>()
+                            };
+                            for k in 0..3 {
+                                let below = line[x * 4 + k] as f32;
+                                let v = top[i + k] as f32
+                                    + (1.0 - c) * (below - origin[i + k] as f32);
+                                line[x * 4 + k] = v.clamp(0.0, 255.0).round() as u8;
+                            }
+                        }
+                    });
+                }
+                values.insert(*node, out);
+            }
+        }
+    }
+    let result = value(&values, &base, mix.output);
+    rgba.par_chunks_mut(4).zip(result.par_chunks(4)).for_each(|(dst, src)| {
+        dst[..3].copy_from_slice(&src[..3]);
+    });
+}
+
+/// The picker's version of [`apply_mixed`]: one colour through the same
+/// steps, so a sampled point agrees with the frame (colour operators only; the
+/// spatial ones need neighbours).
+fn mix_pixel(plan: &Plan, mix: &crate::MixPlan, p: [f32; 2], base: [f32; 3]) -> [f32; 3] {
+    use crate::MixStep;
+    use std::collections::HashMap;
+    let mut values: HashMap<u64, [f32; 3]> = HashMap::new();
+    let find = |id: u64| plan.layers.iter().find(|lp| lp.layer.id == id);
+    let get = |values: &HashMap<u64, [f32; 3]>, id: u64| values.get(&id).copied().unwrap_or(base);
+    for step in &mix.steps {
+        match step {
+            MixStep::Chain { layers, from, to } => {
+                let mut g = get(&values, *from);
+                for lp in layers.iter().filter_map(|id| find(*id)) {
+                    let m = layer_weight(lp, p, g);
+                    if m > 1e-4 {
+                        g = layer_pixel(lp, g, m);
+                    }
+                }
+                values.insert(*to, g);
+            }
+            MixStep::Parallel { node, reference, inputs } => {
+                let r = get(&values, *reference);
+                let mut out = r;
+                for id in inputs {
+                    let b = get(&values, *id);
+                    for k in 0..3 {
+                        out[k] += b[k] - r[k];
+                    }
+                }
+                values.insert(*node, out);
+            }
+            MixStep::Stack { node, inputs } => {
+                let Some(first) = inputs.first() else {
+                    values.insert(*node, base);
+                    continue;
+                };
+                let mut out = get(&values, first.source);
+                for input in &inputs[1..] {
+                    let top = get(&values, input.source);
+                    let origin = get(&values, input.origin);
+                    let c = if input.layers.is_empty() {
+                        1.0
+                    } else {
+                        1.0 - input
+                            .layers
+                            .iter()
+                            .filter_map(|id| find(*id))
+                            .map(|lp| 1.0 - layer_weight(lp, p, origin).clamp(0.0, 1.0))
+                            .product::<f32>()
+                    };
+                    for k in 0..3 {
+                        out[k] = top[k] + (1.0 - c) * (out[k] - origin[k]);
+                    }
+                }
+                values.insert(*node, out);
+            }
+        }
+    }
+    get(&values, mix.output)
+}
+
 fn static_mask_can_apply(lp: &LayerPlan<'_>) -> bool {
     if lp.opacity <= 1e-4 {
         return false;
@@ -4656,7 +5117,7 @@ fn apply_layer_color_row(
     static_weights: Option<&[f32]>,
     recorded_weights: Option<&mut [f32]>,
     n: usize,
-    plan: &Plan,
+    plan: &LayerView<'_, '_>,
     map: &super::geometry::FrameMap,
     region: NormRect,
     xs: &[f32],
@@ -4715,6 +5176,9 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
     };
     // The colour stack of the layers applies to the picked point too; the
     // spatial operators need neighbours, so they only run on a full frame.
+    if let Some(mix) = &plan.mix {
+        return mix_pixel(&plan, mix, p, g);
+    }
     for lp in &plan.layers {
         let m = layer_weight(lp, p, g);
         if m <= 1e-4 {
@@ -4790,6 +5254,76 @@ mod tests {
         assert_ne!(cached, first);
 
         stage_cache::clear();
+    }
+
+    /// PF108's sibling percentages must come from the same resolver the stage
+    /// dispatches with: the old `unwrap_or(0.7)` gave a bright-only document a
+    /// free 70 % de-yellow, while a legacy parent-only document must keep it.
+    #[test]
+    fn pf108_child_controls_do_not_inherit_the_legacy_sibling_default() {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:109".to_string(), 0.6f32);
+        let (bright_ui, deyellow_ui) = teeth_ui_percents(&extra).unwrap();
+        assert!((bright_ui - 60.0).abs() < 1.0e-3, "bright_ui={bright_ui}");
+        assert_eq!(deyellow_ui, 0.0, "a bright-only document has no de-yellow");
+
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:110".to_string(), 0.7f32);
+        let (bright_ui, deyellow_ui) = teeth_ui_percents(&extra).unwrap();
+        assert_eq!(bright_ui, 0.0, "a de-yellow-only document has no bright");
+        assert!((deyellow_ui - 70.0).abs() < 1.0e-3, "deyellow_ui={deyellow_ui}");
+
+        // Legacy document: only `pc:108` was ever stored, so both siblings
+        // still run at 70 % and the frame stays byte-identical to before.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:108".to_string(), 0.5f32);
+        let (bright_ui, deyellow_ui) = teeth_ui_percents(&extra).unwrap();
+        assert!((bright_ui - 70.0).abs() < 1.0e-3, "bright_ui={bright_ui}");
+        assert!(
+            (deyellow_ui - 70.0).abs() < 1.0e-3,
+            "deyellow_ui={deyellow_ui}"
+        );
+
+        // A malformed control is a refusal, not a silent default.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:109".to_string(), f32::NAN);
+        assert_eq!(
+            teeth_ui_percents(&extra),
+            Err(aurora_portrait::Refusal::ValueOutOfRange("PF108 bright UI"))
+        );
+    }
+
+    /// The child-only document must still reach the same-job face parse, or the
+    /// PF108 row can only refuse for a missing teeth mask.
+    #[test]
+    fn pf108_child_only_document_requests_the_stage_face_parse() {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:109".to_string(), 0.6f32);
+        assert!(
+            needs_stage_face_parsing(&extra),
+            "PF108 bright child must request FaceParsingV2"
+        );
+        // `want_stage_attachments` is `parsing || bundle_direct || producer_attach`;
+        // neither of the other two terms is allowed to be the reason here.
+        assert!(!needs_stage_face_bundle_direct(&extra));
+        assert!(!needs_producer_attach(&extra));
+
+        // A parent + children document requests it exactly once as well: the
+        // gate is a boolean, so nothing can dispatch PF108 twice.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:108".to_string(), 0.8f32);
+        extra.insert("pc:109".to_string(), 0.6f32);
+        extra.insert("pc:110".to_string(), 0.7f32);
+        assert!(needs_stage_face_parsing(&extra));
+        assert!(!needs_stage_face_bundle_direct(&extra));
+        assert!(!needs_producer_attach(&extra));
+
+        // All-neutral controls must not start a face parse at all.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("pc:108".to_string(), 0.0f32);
+        extra.insert("pc:109".to_string(), 0.0f32);
+        extra.insert("pc:110".to_string(), 0.0f32);
+        assert!(!needs_stage_face_parsing(&extra));
     }
 
     #[test]
@@ -5796,6 +6330,20 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
     }
 
     #[test]
+    fn color_balance_wheels_use_c1_kernel_luma_preservation() {
+        let cb = ColorBalance {
+            master: ColorWheel::default(),
+            shadow: ColorWheel { hue: 210.0, saturation: 0.5, lightness: 0.0 },
+            midtone: ColorWheel { hue: 30.0, saturation: 0.4, lightness: 0.0 },
+            highlight: ColorWheel::default(),
+        };
+        let pixel = [0.25, 0.45, 0.55];
+        let out = color_balance(pixel, &cb, 1.0);
+        assert!((luma(out) - luma(pixel)).abs() < 1e-4, "{out:?}");
+        assert_ne!(out, pixel);
+    }
+
+    #[test]
     fn source_sample_tile_cache_is_exact_absorption_and_geometry_keyed() {
         let (w, h) = (31u32, 23u32);
         let rgba: Vec<u8> = (0..w * h)
@@ -6586,6 +7134,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn film_curve_darkens_midtones() {
         if crate::icc::profile("NikonZ6III-ProStandard").is_none() {
             return;
@@ -7187,6 +7736,56 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         assert!(blank.data.iter().all(|v| *v == 0.0), "an unknown source adds nothing");
     }
 
+    /// The render path builds rasters for the enabled layers only, in draw
+    /// order. A copy mask must still read a source that is disabled or sits
+    /// after it, and a copy cycle must not recurse forever.
+    #[test]
+    fn copy_mask_reads_disabled_and_later_sources() {
+        let src = Source::from_rgba(64, 48, &synthetic(64, 48));
+        let aspect = 4.0 / 3.0;
+        let disc = Mask { shapes: vec![stroke(MaskOp::Add, [0.5, 0.5], 0.3)], ..Default::default() };
+        let copy = |from: u64| Mask {
+            shapes: vec![MaskShape::Copy { from_layer: from, op: MaskOp::Add }],
+            ..Default::default()
+        };
+        let layer = |id: u64, enabled: bool, mask: Mask| Layer {
+            id,
+            enabled,
+            opacity: 100.0,
+            mask,
+            ..Default::default()
+        };
+        let reference = MaskGrid::build(&disc, aspect, 4.0, None, &[]);
+
+        // 1 copies the disabled 2; 3 copies 4, which is drawn after it.
+        let mut adj = AdjustmentSet::default();
+        adj.layers.push(layer(1, true, copy(2)));
+        adj.layers.push(layer(2, false, disc.clone()));
+        adj.layers.push(layer(3, true, copy(4)));
+        adj.layers.push(layer(4, true, disc.clone()));
+        let active: Vec<&Layer> = adj.layers.iter().filter(|l| l.enabled).collect();
+        let grids = cached_mask_grids(&src, &adj, &active, aspect, 4.0, None);
+        assert_eq!(grids[0].as_ref().expect("copy of disabled layer").data, reference.data);
+        assert_eq!(grids[1].as_ref().expect("copy of later layer").data, reference.data);
+
+        // Editing the disabled source changes the copy: it is part of the key.
+        adj.layers[1].mask = Mask::default();
+        let active: Vec<&Layer> = adj.layers.iter().filter(|l| l.enabled).collect();
+        let edited = cached_mask_grids(&src, &adj, &active, aspect, 4.0, None);
+        assert!(edited[0].as_ref().unwrap().data.iter().all(|v| *v == 0.0));
+
+        // 5 and 6 copy each other: both resolve, the inner reference is empty.
+        let mut cyc = AdjustmentSet::default();
+        let mut a = copy(6);
+        a.shapes.push(stroke(MaskOp::Add, [0.5, 0.5], 0.3));
+        cyc.layers.push(layer(5, true, a));
+        cyc.layers.push(layer(6, true, copy(5)));
+        let active: Vec<&Layer> = cyc.layers.iter().collect();
+        let grids = cached_mask_grids(&src, &cyc, &active, aspect, 4.0, None);
+        assert_eq!(grids[0].as_ref().unwrap().data, reference.data);
+        assert_eq!(grids[1].as_ref().unwrap().data, reference.data);
+    }
+
     // ───────────────────────────── layers ─────────────────────────────
 
     fn tone_layer(id: u64, exposure: f32, brightness: f32) -> Layer {
@@ -7289,6 +7888,115 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let mut reversed = forward.clone();
         reversed.layers = vec![tone_layer(2, 0.0, 30.0), tone_layer(1, 0.8, 0.0)];
         assert_ne!(graphed, render(&src, &reversed, NormRect::FULL, w, false, None).rgba);
+    }
+
+    /// INPUT feeds both layers; `mixer` takes layer 1 on input 0 and layer 2 on
+    /// input 1, and feeds the output.
+    fn mixer_graph(kind: crate::NodeKind) -> crate::NodeGraph {
+        let mut graph = graph_of(&[1, 2], &[]);
+        graph.links.clear();
+        graph.nodes.push(crate::GraphNode { id: 10, kind, pos: [0.0; 2] });
+        let link = |from, to, input| crate::NodeLink { from, to, input };
+        graph.links = vec![
+            link(crate::NodeGraph::INPUT, 1, 0),
+            link(crate::NodeGraph::INPUT, 2, 0),
+            link(1, 10, 0),
+            link(2, 10, 1),
+            link(10, crate::NodeGraph::OUTPUT, 0),
+        ];
+        graph
+    }
+
+    fn first_pixel(rgba: &[u8], x: usize) -> [i32; 3] {
+        [rgba[x * 4] as i32, rgba[x * 4 + 1] as i32, rgba[x * 4 + 2] as i32]
+    }
+
+    /// Two parallel branches grade the same input: the result is the input
+    /// plus both branches' deltas, which a serial chain does not produce.
+    #[test]
+    fn parallel_mixer_sums_branch_deltas_from_the_shared_input() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let render_with = |layers: Vec<Layer>, nodes: Option<crate::NodeGraph>| {
+            let mut adj = AdjustmentSet::default();
+            adj.layers = layers;
+            adj.nodes = nodes;
+            render(&src, &adj, NormRect::FULL, w, false, None).rgba
+        };
+        let a_layer = tone_layer(1, 0.8, 0.0);
+        let b_layer = tone_layer(2, -0.5, 0.0);
+        let base = first_pixel(&render_with(vec![], None), 0);
+        let a = first_pixel(&render_with(vec![a_layer.clone()], None), 0);
+        let b = first_pixel(&render_with(vec![b_layer.clone()], None), 0);
+        let parallel = render_with(
+            vec![a_layer.clone(), b_layer.clone()],
+            Some(mixer_graph(crate::NodeKind::Parallel)),
+        );
+        let got = first_pixel(&parallel, 0);
+        for k in 0..3 {
+            let want = (base[k] + (a[k] - base[k]) + (b[k] - base[k])).clamp(0, 255);
+            assert!((got[k] - want).abs() <= 1, "channel {k}: got {got:?}, want {want}");
+        }
+        assert_ne!(a, b, "the branches must differ for this test to mean anything");
+
+        let serial = render_with(vec![a_layer, b_layer], Some(graph_of(&[1, 2], &[1, 2])));
+        assert_ne!(parallel, serial, "parallel branches are not a serial chain");
+    }
+
+    /// A parallel mixer with one branch is that branch, byte for byte, and the
+    /// picker agrees with the frame.
+    #[test]
+    fn a_single_parallel_branch_equals_the_branch() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let mut one = AdjustmentSet::default();
+        one.layers = vec![tone_layer(1, 0.8, 0.0)];
+        let mut graph = mixer_graph(crate::NodeKind::Parallel);
+        graph.links.retain(|l| l.from != 2 && l.to != 2);
+        graph.nodes.retain(|n| n.id != 2);
+        let mut mixed = one.clone();
+        mixed.nodes = Some(graph);
+        assert!(crate::mix_plan(&mixed).is_some());
+        assert_eq!(
+            render(&src, &one, NormRect::FULL, w, false, None).rgba,
+            render(&src, &mixed, NormRect::FULL, w, false, None).rgba
+        );
+    }
+
+    /// The top input of a layer mixer replaces what is below it only where its
+    /// mask covers; elsewhere the lower input shows.
+    #[test]
+    fn layer_mixer_stacks_the_higher_input_over_the_lower_by_its_mask() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let bottom = tone_layer(1, 0.8, 0.0);
+        let mut top = tone_layer(2, -1.0, 0.0);
+        top.mask = left_half_raster(0.0);
+        let render_with = |layers: Vec<Layer>, nodes: Option<crate::NodeGraph>| {
+            let mut adj = AdjustmentSet::default();
+            adj.layers = layers;
+            adj.nodes = nodes;
+            render(&src, &adj, NormRect::FULL, w, false, None).rgba
+        };
+        let stacked = render_with(
+            vec![bottom.clone(), top.clone()],
+            Some(mixer_graph(crate::NodeKind::LayerMixer)),
+        );
+        let only_bottom = render_with(vec![bottom], None);
+        let only_top = render_with(vec![top], None);
+        // Inside the top mask only the top input shows; outside, the bottom.
+        assert_eq!(first_pixel(&stacked, 2), first_pixel(&only_top, 2));
+        assert_eq!(first_pixel(&stacked, 13), first_pixel(&only_bottom, 13));
+        assert_ne!(first_pixel(&only_top, 2), first_pixel(&only_bottom, 2));
+    }
+
+    /// A graph without mixers keeps the flat serial path.
+    #[test]
+    fn serial_graphs_have_no_mix_plan() {
+        let mut adj = AdjustmentSet::default();
+        adj.layers = vec![tone_layer(1, 0.8, 0.0), tone_layer(2, 0.0, 30.0)];
+        adj.nodes = Some(graph_of(&[1, 2], &[1, 2]));
+        assert!(crate::mix_plan(&adj).is_none());
     }
 
     /// A layer with a curve and a hard-edged mask on the left half.
@@ -7950,14 +8658,9 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let src = Source::from_rgba16_native(w, h, &rgba);
         assert!(src.levels.len() >= 3);
         assert!(src.sample(1, 0.5, 0.5).is_some());
+        assert!(src.levels[1].is_materialized(), "level 1 must be built on demand");
         assert!(
-            src.levels[1].lazy.as_ref().is_some_and(|slot| slot.get().is_some()),
-            "level 1 must be built on demand"
-        );
-        assert!(
-            src.levels[2..]
-                .iter()
-                .all(|level| level.data.is_empty() && level.lazy.as_ref().is_some_and(|slot| slot.get().is_none())),
+            src.levels[2..].iter().all(|level| !level.is_materialized()),
             "levels below the requested depth must stay unallocated"
         );
     }
@@ -8207,6 +8910,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             true,
             true,
             false,
+            ScopeWants::default(),
         );
         let (export, export_wide) = render_sized(
             &src,
@@ -8221,6 +8925,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             true,
             false,
             false,
+            ScopeWants::default(),
         );
         assert_ne!(preview.histogram, Histogram::default());
         assert_eq!(export.histogram, Histogram::default());
@@ -8408,7 +9113,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         use std::path::Path;
 
         let path = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
-            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+            .expect("set AURORA_PORTRAIT_BENCH_NEF to a real NEF file");
         let (w, h, rgba16) = crate::raw::decode16(Path::new(&path)).expect("decode NEF");
         assert_eq!(crate::raw::from_sensor(Path::new(&path)), Some(true));
         let src = Source::from_rgba16(w, h, &rgba16);
@@ -8443,6 +9148,101 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         }
         assert_ne!(preview.rgba, plain.rgba, "PF21015 must change preview pixels");
         assert!(export.rgba.chunks_exact(4).all(|pixel| pixel[3] == 65535));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires CUDA GPU, deliverable models dir, and AURORA_PORTRAIT_BENCH_NEF"]
+    fn zero_ort_portrait_end_to_end_smoke() {
+        use std::path::Path;
+
+        struct Warnings;
+        impl log::Log for Warnings {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    eprintln!("{}: {}", record.target(), record.args());
+                }
+            }
+            fn flush(&self) {}
+        }
+        if log::set_logger(&Warnings).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+
+        let rt_info = crate::aimask::runtime_info().expect("zero-ORT Native CUDA runtime must initialize");
+        println!("runtime: {rt_info:?}");
+        assert!(
+            rt_info.0 == "<aurora-native>" || rt_info.0 == "<aurora-native-cuda>",
+            "unexpected native runtime: {}",
+            rt_info.0
+        );
+
+        let session = crate::FaceInputSession::open_from_env(true)
+            .expect("FaceInputSession::open_from_env(true) must succeed in zero-ORT mode");
+        println!("FaceInputSession(include_parsing=true) opened OK");
+        drop(session);
+
+        let nef = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
+            .expect("set AURORA_PORTRAIT_BENCH_NEF");
+        let (w, h, rgba16) = crate::raw::decode16(Path::new(&nef)).expect("decode NEF");
+        let src = Source::from_rgba16(w, h, &rgba16);
+        let plain = render(&src, &AdjustmentSet::default(), NormRect::FULL, 640, false, None);
+
+        let sliders: &[(&str, &str, f32)] = &[
+            ("Whitening", "pc:90005", 0.8),
+            ("Skin hue", "pc:21015", 0.9),
+            ("Face smooth HLF", "pc:30021", 0.8),
+            ("Face width L", "pc:30092", 60.0),
+            ("Sharp chin L", "pc:242", 60.0),
+            ("Eye width L", "pc:8019", 0.6),
+            ("Brow position L", "pc:8021", 0.6),
+            ("Rosy", "pc:90007", 0.8),
+            ("Eye wrinkles", "pc:90023", 0.8),
+            ("Neutral grey flat", "pc:30013", 0.8),
+            ("AI body unify", "pc:21105", 0.8),
+            ("Blusher", "pc:106", 0.8),
+            ("Lipstick", "pc:107", 0.8),
+            ("Cheek plump", "pc:30197", 60.0),
+            ("Full face plump", "pc:30210", 2.0),
+            ("Brow head length L", "pc:44124", 0.6),
+            ("Body skin unify", "pc:90086", 0.8),
+            ("Silkworm eye bag", "pc:101", 0.8),
+            ("Spotless acne", "pc:0", 0.8),
+            ("Face skin unify", "pc:90085", 0.8),
+            ("Stereo shadow", "pc:8", 0.8),
+            ("Stereo highlight", "pc:9", 0.8),
+            ("Lip enhance", "pc:90021", 0.9),
+        ];
+        let mut failures = Vec::new();
+        for &(label, key, val) in sliders {
+            let mut adj = AdjustmentSet::default();
+            adj.extra.insert(key.to_string(), val);
+            let out = render(&src, &adj, NormRect::FULL, 640, false, None);
+            let diff_px = out
+                .rgba
+                .chunks_exact(4)
+                .zip(plain.rgba.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            let report = out.portrait_report.as_ref().expect("portrait_report present");
+            let eff_summary: Vec<String> = report
+                .effects
+                .iter()
+                .map(|e| format!("pf={} exec={} backend={:?} fallback={:?}", e.pf, e.executed, e.backend, e.fallback_reason))
+                .collect();
+            println!(
+                "[{:<18}] key={:<8} diff_px={:<7} effects={:?}",
+                label, key, diff_px, eff_summary
+            );
+            let pf = key.strip_prefix("pc:").unwrap().parse::<u32>().unwrap();
+            if !report.effects.iter().any(|effect| effect.pf == pf && effect.executed) || diff_px == 0 {
+                failures.push(format!("{label} ({key}): diff_px={diff_px}, effects={eff_summary:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn serial_mean3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
@@ -8949,7 +9749,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         use std::path::Path;
 
         let path = std::env::var("AURORA_PORTRAIT_BENCH_NEF")
-            .unwrap_or_else(|_| r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF".to_owned());
+            .expect("set AURORA_PORTRAIT_BENCH_NEF to a real NEF file");
         let (w, h, rgba16) = crate::raw::decode16(Path::new(&path)).expect("decode NEF");
         assert_eq!(crate::raw::from_sensor(Path::new(&path)), Some(true));
         let src = Source::from_rgba16(w, h, &rgba16);
@@ -9601,7 +10401,7 @@ mod develop_gpu_integration_tests {
         adj.noise_reduction.color = 50.0;
 
         // Warm up GPU resident pipeline.
-        let warm = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true);
+        let warm = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
         assert_eq!((warm.width, warm.height), (1920, 1280));
         if !warm.bgra {
             eprintln!("resident GPU path unavailable on this host; skipping latency assertion");
@@ -9613,7 +10413,7 @@ mod develop_gpu_integration_tests {
         for step in 0..20 {
             adj.exposure.exposure = -1.0 + step as f32 * 0.1;
             let t0 = std::time::Instant::now();
-            let out = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true);
+            let out = render_preview_bgra(&src, &adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
             times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             assert!(out.bgra);
             assert_eq!(out.histogram.red.len(), 256);
@@ -9629,12 +10429,12 @@ mod develop_gpu_integration_tests {
 
         // Also check pure exposure (no NR/USM) 1-kernel fast path.
         let mut fast_adj = AdjustmentSet::default();
-        let _ = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true);
+        let _ = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
         let mut fast_ms = Vec::with_capacity(20);
         for step in 0..20 {
             fast_adj.exposure.exposure = -1.0 + step as f32 * 0.1;
             let t0 = std::time::Instant::now();
-            let out = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true);
+            let out = render_preview_bgra(&src, &fast_adj, NormRect::FULL, 1920, false, None, true, ScopeWants::default());
             fast_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             assert!(out.bgra);
         }
@@ -9649,7 +10449,7 @@ mod develop_gpu_integration_tests {
         let (pw, ph) = (512u32, 384u32);
         let small_src = Source::from_rgba(pw, ph, &raw[..(pw * ph * 4) as usize]);
         let gpu_rgba = render(&small_src, &adj, NormRect::FULL, 512, false, None);
-        let gpu_bgra = render_preview_bgra(&small_src, &adj, NormRect::FULL, 512, false, None, true);
+        let gpu_bgra = render_preview_bgra(&small_src, &adj, NormRect::FULL, 512, false, None, true, ScopeWants::default());
         assert!(gpu_bgra.bgra);
         assert_eq!(gpu_rgba.histogram, gpu_bgra.histogram);
         for (a, b) in gpu_rgba.rgba.chunks_exact(4).zip(gpu_bgra.rgba.chunks_exact(4)) {

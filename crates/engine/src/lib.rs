@@ -13,11 +13,13 @@
 //! rotation), so they stay attached to content when the crop changes. Preview
 //! regions are normalized in the *developed frame* (after crop and rotation).
 
+pub mod aurora_store;
 mod adjust;
 mod c1catalog;
 mod c1import;
 mod c1_masks;
 pub mod c1_banding;
+pub mod banding_camera_rules;
 pub mod c1_cos;
 pub mod c1_eip;
 pub mod c1_writeback;
@@ -49,18 +51,27 @@ mod closedeyes;
 /// Stable pixel/compute contracts shared by CPU, CUDA and Metal adapters.
 pub mod contracts;
 /// Translation from the in-crate GPU runtime vocabulary to `contracts`.
+/// `mock::gpu_runtime`'s full vocabulary only exists on Windows.
+#[cfg(windows)]
 mod compute_bridge;
 /// Persistent edit document versus per-job runtime inputs.
 pub mod document;
 mod engine;
 /// Unified job lifecycle: scoped id, state, cancellation and receipts.
 pub mod job_lifecycle;
+/// Cross-platform GPU compute: CPU oracle plus portable wgpu path.
+pub mod gpu_crossplatform;
+/// Backend availability probe and strict/auto dispatch across platforms.
+pub mod platform_dispatch;
 /// Stages migrated out of `mock` (with compatibility re-exports).
 pub mod processing;
 /// Production render pipeline facade and `RenderPlan` execution bridge.
 pub mod render;
 /// Layered export pipeline (`ExportPlan`, `Encoder`, `MetadataWriter`, `AtomicPublisher`).
 pub mod export;
+/// CPU SIMD kernels (AVX2/NEON) for the export pixel plumbing, with the scalar
+/// reference each kernel is checked against.
+pub mod simd_fallback;
 /// Unified portrait effect descriptor and capability registry.
 pub mod portrait_registry;
 mod exif;
@@ -72,12 +83,17 @@ mod filmcurve;
 pub mod face_parsing;
 mod heif;
 mod heif_write;
+mod dng_write;
+mod psd_write;
+mod xmp_preset;
+mod lrcat_import;
 mod highlight;
 pub mod hdr;
 pub mod pano;
 pub mod print;
 pub mod jxl;
 mod iptc;
+pub mod lcp;
 mod layers;
 mod lens_correct;
 mod layer_graph;
@@ -106,7 +122,7 @@ pub mod compute_cost;
 
 pub fn prewarm_gpu() {
     #[cfg(windows)]
-    mock::prewarm_gpu();
+    if aurora_portrait::native_infer::backend::BackendRequest::from_env().is_ok_and(|r|r.permits(aurora_portrait::native_infer::backend::BackendKind::Cuda)){mock::prewarm_gpu();}
 }
 
 /// Preloads portrait face detection/mesh/landmark ONNX sessions in the background
@@ -136,6 +152,12 @@ pub mod portrait_makeup_provider;
 mod portrait_eye_bag_inputs;
 mod portrait_makeup_mesh2d;
 mod portrait_makeup_wiring;
+mod portrait_makeup_recipes;
+mod portrait_look_layer;
+mod portrait_look_catchlight;
+mod portrait_probe_inputs;
+pub use portrait_makeup_recipes::{MakeupSuit, apply_makeup_suit, makeup_suits};
+pub use portrait_makeup_wiring::{MakeupPresetInfo, makeup_custom_color_supported, makeup_palette_for_pf, makeup_presets_for_pf};
 mod portrait_moisture_inputs;
 pub mod portrait_pf115_pf107;
 mod portrait_pf90021_input;
@@ -221,7 +243,7 @@ pub use portrait_stage::{
     apply_portrait_effects_with_report_and_inputs,
     build_face_geometry_inputs,
     build_pf8033_cpu_forward_row,
-    full_face_descriptor_from_ui,
+    full_face_descriptor_from_store, full_face_descriptor_from_ui,
     landmark_receipt_hashes,
     load_pf8033_cpu_forward_artifacts,
     mesh_receipt,
@@ -279,6 +301,11 @@ pub use portrait_makeup_bundle::*;
 pub use portrait_makeup_provider::*;
 mod param_meta;
 mod preview_cache;
+#[allow(dead_code)] // stats/invalidate/cleanup are API for later wiring; put/get are used via preview_disk
+mod disk_preview_cache;
+mod preview_disk;
+#[allow(dead_code)] // no tile-based render call site exists yet; see module docs
+mod tile_scheduler;
 mod presets;
 pub mod raw;
 pub mod aurora_raw;
@@ -327,6 +354,11 @@ pub mod portrait {
     pub use crate::portrait_map::*;
 }
 
+pub use aurora_store::{
+    is_aurora_catalog_path, is_aurora_session_path, AuroraDb, DiskThumbCache, FavoriteFolder,
+    LibraryKind, LibraryProfile, SessionFolderRole, AURORA_CATALOG_EXT, AURORA_META_DIR,
+    AURORA_SESSION_EXT,
+};
 pub use adjust::*;
 pub use c1catalog::{
     C1Catalog, C1Collection, C1DocumentType, C1Image, C1Keyword, C1Variant, WalReplay,
@@ -345,11 +377,12 @@ pub use exif::read_exif;
 pub use closedeyes::{any_eye_closed, detect_eyes, EyeBox, EyeReport};
 pub use engine::*;
 pub use file_engine::{
-    FileEngine, ImportErrorKind, QueuedDocumentResult, QueuedSaveOutcome, QueuedSaveSummary,
+    supports_photo_path, FileEngine, ImportErrorKind, QueuedDocumentResult, QueuedSaveOutcome, QueuedSaveSummary,
     SourceStatusKind,
 };
 pub use fcrv_index::*;
 pub use filmcurve::{curve_dir, parse_film_curves, FilmCurve};
+pub use lcp::*;
 pub use layers::*;
 pub use lens_correct::*;
 pub use dust_patch::{DustDetector, DustError, DustPatch};
@@ -375,7 +408,7 @@ pub use raw::*;
 pub use rawinfo::{parse_info_block, read_nikon_info_block, CameraDefaults, RawInfoBlock};
 pub use recipe::*;
 pub use scopes::*;
-pub use store::{Catalog, Entry, Store, StoreError};
+pub use store::{Catalog, Entry, Store, StoreError, write_atomic};
 pub use styles::*;
 pub use tether::*;
 pub use xmp::XmpMeta;

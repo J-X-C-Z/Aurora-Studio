@@ -38,6 +38,7 @@ pub fn panel(id: &str, state: &Entity<AppState>, _window: &mut Window, cx: &mut 
 fn lens_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let lens = s.adj().lens.clone();
+    let green_fringe = s.adj().extra.get("lens:green_fringing").copied().unwrap_or(0.0);
     let profiles = s.lens_profiles.clone();
     let current = lens.profile.as_ref().and_then(|n| profiles.iter().position(|p| p == n));
     let mut options: Vec<(Option<usize>, SharedString)> = vec![(None, t("Generic", "通用").into())];
@@ -47,8 +48,11 @@ fn lens_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let p = pal(cx).clone();
     ToolPanel::new(state, "lens", t("Lens Correction", "镜头校正"))
         .status(crate::contract::LENS_CORRECTION)
-        .modified(lens != LensCorrection::default())
-        .on_reset(move |_, cx| st.update(cx, |s, cx| s.edit(t("Reset lens correction", "复位镜头校正"), |a| a.lens = Default::default(), cx)))
+        .modified(lens != LensCorrection::default() || green_fringe > 0.0)
+        .on_reset(move |_, cx| st.update(cx, |s, cx| s.edit(t("Reset lens correction", "复位镜头校正"), |a| {
+            a.lens = Default::default();
+            a.extra.remove("lens:green_fringing");
+        }, cx)))
         .child(row(
             t("Profile", "配置文件"),
             select("lens-profile", options, current, move |i, _, cx| {
@@ -69,6 +73,7 @@ fn lens_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
         .child(param_c1(state, "lens-sharp", "LensRadialBlurAmount", global!(lens.sharpness_falloff), cx))
         .child(param_c1(state, "lens-light", "LensLccLightFalloffAmount", global!(lens.light_falloff), cx))
         .child(param_c1(state, "lens-fringe", "PurpleFringingAmount", global!(lens.purple_fringing), cx).label(t("Purple Fringing", "紫边")))
+        .child(param(state, "lens-green-fringe", t("Green Fringing", "绿边"), crate::state::extra_binding("lens:green_fringing", 0.0), 0.0, 100.0, cx))
         .child(switch_row("lens-ca", t("Chromatic Aberration", "色差"), lens.chromatic_aberration, move |v, _, cx| {
             st3.update(cx, |s, cx| s.edit(t("Chromatic aberration", "色差"), |a| a.lens.chromatic_aberration = v, cx))
         }, cx))

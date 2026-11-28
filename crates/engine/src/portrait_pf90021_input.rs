@@ -175,7 +175,8 @@ fn pf90021_vendor_volume(positive: bool) -> Option<&'static VolumeLut64> {
     };
     cell.get_or_init(|| {
         let explicit = std::env::var_os(env).map(PathBuf::from);
-        let root = crate::portrait_vendor_config::root_from_env();
+        let root = crate::portrait_vendor_config::root_from_env()
+            .or_else(crate::portrait_makeup_wiring::makeup_asset_root);
         let path = pf90021_lut_path(explicit, root.as_deref(), positive)?;
         pf90021_read_lut(&path)
     }).as_ref()

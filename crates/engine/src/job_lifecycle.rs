@@ -480,7 +480,12 @@ pub const fn backend_label(backend: BackendKind) -> &'static str {
         BackendKind::Cpu => "cpu",
         BackendKind::Cuda => "cuda",
         BackendKind::Metal => "metal",
+        BackendKind::Vulkan => "vulkan",
+        BackendKind::Dx12 => "dx12",
+        BackendKind::Hip => "hip",
+        BackendKind::Sycl => "sycl",
         BackendKind::OpenCl => "opencl",
+        BackendKind::Npu => "npu",
     }
 }
 

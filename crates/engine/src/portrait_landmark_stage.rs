@@ -96,7 +96,11 @@ impl FaceLandmarkProducerInputs {
         }
 
         let runtime = Runtime::get().context("ONNX Runtime is not available")?;
-        let session = runtime.open_cpu_session(model)?;
+        let session = if runtime.is_native_only() {
+            runtime.open_session(model)?
+        } else {
+            runtime.open_cpu_session(model)?
+        };
         if session.input.element_type != 1
             || session.input.dims.as_slice() != [1, 3, SIDE as i64, SIDE as i64]
         {

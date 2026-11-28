@@ -77,21 +77,25 @@ jobs:
       - name: Reject private fixture files
         shell: powershell
         run: |
+          # Private data lives in the gitignored private-assets/ (private-assets.md).
           $tracked = @(git ls-files | Where-Object {
             $_ -like 'crates/engine/testdata/*' -or
+            $_ -like 'private-assets/*' -or
+            $_ -like 'assets/portrait/*' -or
+            $_ -like 'crates/engine/data/camera_params*' -or
+            $_ -like '*.cosessiondb' -or
             $_ -match '(?i)\.(nef|dng|cr[23]|arw|raf|orf|rw2|pef)$'
           })
           if ($tracked.Count -gt 0) {
             $tracked | ForEach-Object { Write-Error "private fixture tracked: $_" }
-            throw "Private media or Capture One testdata must not enter the repository."
+            throw "Private media, Capture One data or third-party assets must not enter the repository (see private-assets.md)."
           }
 
       - name: Check package allowlist
         shell: pwsh
-        # Strict by default. aurora-portrait currently packages work/ and
-        # testdata/, so this step is expected to fail until portrait-parse
-        # moves them out (see 06_reports/SESSION-integration-rv24-ci.md).
-        # Use -Mode warn for an advisory-only run.
+        # Strict: every crate's `cargo package --list` must stay inside the
+        # allowlist in the script (no work/, testdata/, RAW media).
+        # Use -Mode warn locally for an advisory-only run.
         run: ./scripts/check-package-allowlist.ps1 -Mode strict
 
   supply-chain:

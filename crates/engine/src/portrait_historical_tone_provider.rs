@@ -268,10 +268,10 @@ pub fn build_historical_tone_inputs(
         if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
             return Err(Refusal::MissingInput(names.frame));
         }
+        let frame_pixels = checked_pixels(size, names.frame_size)?;
         if [frame.width, frame.height] != size {
             return Err(Refusal::ShapeMismatch(names.frame_size));
         }
-        let frame_pixels = checked_pixels(size, names.frame_size)?;
         let frame_bytes = frame_pixels
             .checked_mul(4)
             .ok_or(Refusal::ShapeMismatch(names.frame))?;
@@ -1132,12 +1132,14 @@ mod tests {
             height: 1.0,
             roll_radians: 0.0,
         };
-        let mut masks = vec![0; crate::face_parsing::FACE_PARSING_V2_CLASSES * 2];
-        masks[crate::face_parsing::FACE_PARSING_V2_SKIN_CLASS * 2..][..2].fill(200);
+        let side = crate::face_parsing::FACE_PARSING_V2_SIDE;
+        let plane = (side as usize) * (side as usize);
+        let mut masks = vec![0; crate::face_parsing::FACE_PARSING_V2_CLASSES * plane];
+        masks[crate::face_parsing::FACE_PARSING_V2_SKIN_CLASS * plane..][..plane].fill(200);
         let parsing = FaceParsingProducerInputs {
             job_id: 17,
-            width: 2,
-            height: 1,
+            width: side,
+            height: side,
             channels: crate::face_parsing::FACE_PARSING_V2_CLASSES as u8,
             model_sha256: crate::face_parsing::FACE_PARSING_V2_MODEL_SHA256,
             source_to_crop: face_roi.source_to_crop().unwrap(),

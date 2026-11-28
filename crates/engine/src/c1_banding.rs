@@ -657,6 +657,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn z6iii_reports_an_empty_range() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
         let info = crate::read_nikon_info_block(&path).expect("fixture header");
@@ -667,13 +668,12 @@ mod tests {
         assert_eq!(range.step(), 1.0);
 
         // The two real frames used for the vendor probe, when present.
-        let dir = std::env::var_os("AURORA_BANDING_SAMPLE_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Users\Jxcz2\Desktop"));
-        for name in ["_DSC5058.NEF", "_DSC5673.NEF"] {
-            let Ok(info) = crate::read_nikon_info_block(&dir.join(name)) else { continue };
-            let range = range_for_frame(Some(&info), info.model.as_deref()).expect("Z6III range");
-            assert_eq!(range, BandingRange { start: 0.0, end: 0.0, default: 0.0 }, "{name}");
+        if let Some(dir) = std::env::var_os("AURORA_BANDING_SAMPLE_DIR").map(std::path::PathBuf::from) {
+            for name in ["_DSC5058.NEF", "_DSC5673.NEF"] {
+                let Ok(info) = crate::read_nikon_info_block(&dir.join(name)) else { continue };
+                let range = range_for_frame(Some(&info), info.model.as_deref()).expect("Z6III range");
+                assert_eq!(range, BandingRange { start: 0.0, end: 0.0, default: 0.0 }, "{name}");
+            }
         }
     }
 

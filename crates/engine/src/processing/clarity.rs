@@ -1,6 +1,5 @@
 //! Capture One's `CImgOpClarity2012` / `CImgOpStructure2012`, reconstructed
-//! from the installed `ImgCoreDll.dll` and verified against 16-bit exports
-//! (`90_work/lanes/c1-parse/c1_clarity_native_20261123/REPORT.md`).
+//! from `ImgCoreDll.dll` and verified against 16-bit exports.
 //!
 //! Clarity is a low-frequency subtraction on luma — not a global S-curve:
 //!

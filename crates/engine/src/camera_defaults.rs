@@ -167,6 +167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn real_nef_fields_are_read_and_mapped() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
         let data = std::fs::read(&path).expect("testdata sample");

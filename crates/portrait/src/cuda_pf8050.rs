@@ -1211,8 +1211,10 @@ mod tests {
         assert_eq!(dispatch.kernel, KERNEL);
         assert_eq!(dispatch.grid, (1, 1));
         assert_eq!(dispatch.block, (1, 1));
-        assert!(dispatch.device.contains("RTX 4070 Ti"), "{}", dispatch.device);
-        assert_eq!(dispatch.compute_cap, (8, 9));
+        // This module's PTX targets sm_89. Newer supported devices must pass
+        // the same 6,912-byte comparison below, not impersonate the original lab card.
+        assert!(!dispatch.device.is_empty());
+        assert!(dispatch.compute_cap >= (8, 9), "sm_89 PTX ran on {:?}", dispatch.compute_cap);
         eprintln!(
             "GPU {} cc={:?} driver={} ptx={:?} bytes={} grid={:?} block={:?}",
             dispatch.device,

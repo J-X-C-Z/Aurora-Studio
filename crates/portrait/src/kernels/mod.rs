@@ -3,11 +3,14 @@
 //! Families export `META` and typed entry points. Shared producer-only stages
 //! have no effect entry. This is the single registry integration point.
 
+pub mod body_exact_vendor;
+pub mod body_69slot_bridge;
 pub mod body_geometry;
 pub mod body_geometry_params;
 pub mod body_refine_warp;
 pub mod body_pose_adapter;
 pub mod body_region_geometry;
+pub mod brow_length_exact_vendor;
 pub mod buttock_anchors;
 pub mod blemish;
 pub mod blemish_blend;
@@ -36,6 +39,7 @@ pub mod leg_refine_uv;
 pub mod leg_refine;
 pub mod lip_color;
 pub mod lip_mask;
+pub mod longtail_exact_vendor;
 pub mod makeup;
 pub mod makeup_material;
 pub mod makeup_mask_uv;
@@ -60,6 +64,7 @@ pub mod teeth_alignment;
 pub mod suit_makeup;
 pub mod tone_unify;
 pub mod plump;
+pub mod plump_exact_composite;
 pub mod plump_pipeline;
 pub mod radiance;
 pub mod remaining_special_provider;

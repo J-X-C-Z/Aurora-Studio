@@ -244,7 +244,7 @@ mod hlf_gpu {
     }
 
     fn vendor_adjust_lut() -> &'static [u8] {
-        include_bytes!("fixtures/pf30022/vendor_hlfreq_adjust_lut_256x1_l8.bin")
+        aurora_portrait::private_asset!("fixtures/portrait/pf30022/vendor_hlfreq_adjust_lut_256x1_l8.bin").unwrap()
     }
 
     #[test]
@@ -322,6 +322,7 @@ mod hlf_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf30022_spotless_vendor_lut_matches_cpu_and_preserves_alpha() {
         let Some(gpu) = gpu() else { return };
         let luma = vendor_adjust_lut();

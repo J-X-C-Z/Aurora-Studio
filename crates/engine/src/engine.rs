@@ -140,6 +140,12 @@ pub struct PreviewFrame {
     pub gamut_warning: Option<GamutWarning>,
     /// True when `image.pixels` is already in BGRA byte order for GPUI display.
     pub bgra: bool,
+    /// Viewer scope counts taken from exactly these pixels on the device, when
+    /// the request asked for them and the render could promise that the pixels
+    /// are the displayed ones. `None` otherwise — CPU-only path, ICC/soft-proof
+    /// conversion, a cached frame, a post-8-bit stage or an unsupported kind —
+    /// and the caller then counts the scopes itself, as before.
+    pub scopes: Option<crate::scopes::ScopeMaps>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -383,7 +389,33 @@ pub struct EngineCapabilities {
     pub export_formats: Vec<ExportFormat>,
 }
 
+/// Two actual executions of a generated three-operator graph, not an installed-model score.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceProbe {
+    pub requested: String,
+    pub executed: String,
+    pub adapter: Option<String>,
+    pub first_us: u64,
+    pub warm_us: u64,
+    pub earlier_failures: Vec<String>,
+}
+
+impl InferenceProbe {
+    pub fn run(backend: &str) -> Result<Self, String> {
+        let req: aurora_portrait::native_infer::backend::BackendRequest = backend.parse()?;
+        let r = aurora_portrait::native_infer::selfcheck::run(req)?;
+        Ok(Self { requested: req.label().into(), executed: r.actual.label().into(), adapter:r.adapter, first_us: r.first_us,
+            warm_us: r.warm_us, earlier_failures: r.prior.into_iter().map(|(k,e)| format!("{}: {e}", k.label())).collect() })
+    }
+}
+
 pub trait ImageEngine: Send + Sync + 'static {
+    /// Opt-in diagnostic. Call off the UI thread; no user photos, private assets, or ORT are required.
+    fn check_inference_device(&self, backend: &str) -> Result<InferenceProbe, String> { InferenceProbe::run(backend) }
+
+    /// A folder-backed host can supply its sorted/filtered next RAW paths. Demo engines have nothing to prefetch.
+    fn prefetch_visible_neighbors(&self, _targets:Vec<PathBuf>) {}
+
     /// Human-readable engine name and version, shown in About.
     fn name(&self) -> String;
 
@@ -452,6 +484,24 @@ pub trait ImageEngine: Send + Sync + 'static {
     /// changing it means reopening the library, not mutating a live engine.
     fn library_root(&self) -> Option<PathBuf> {
         None
+    }
+    /// Session / Catalog profile (kind, Capture/Selects/Output/Trash dirs, favorites).
+    fn library_profile(&self) -> Option<crate::LibraryProfile> {
+        None
+    }
+    /// Moves images into one of the Session's role directories (`Capture`, `Selects`, `Output`, `Trash`).
+    fn move_to_session_role(
+        &self,
+        _images: &[ImageId],
+        _role: crate::SessionFolderRole,
+    ) -> anyhow::Result<Vec<ImageInfo>> {
+        anyhow::bail!("session role folders are unsupported by this engine")
+    }
+    fn add_favorite_folder(&self, _rel_path: &str, _label: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn remove_favorite_folder(&self, _rel_path: &str) -> anyhow::Result<()> {
+        Ok(())
     }
     /// Absolute folder path behind a folder collection id. `None` for a
     /// C1-only album/project, which has no filesystem path.
@@ -729,6 +779,44 @@ pub trait ImageEngine: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Per-photo portrait capability snapshot: what this engine can really run
+    /// for `image` right now.
+    ///
+    /// The interface asks for this off the UI thread and greys out exactly the
+    /// rows it reports as unavailable, so an engine must answer from evidence
+    /// about *this* photo, not from the static catalogue bridge in
+    /// [`crate::panel_commands::portrait_capabilities`].
+    ///
+    /// The default is conservative on every axis at once: no backend, no
+    /// models and no same-frame inputs are claimed, which is deliberately not
+    /// [`crate::portrait_registry::RuntimeProbeContext::fully_ready`]. Engines
+    /// that can observe their own host and frame override this; an engine that
+    /// cannot is expected to report the gap instead of optimism.
+    fn portrait_capability_snapshot(
+        &self,
+        _image: ImageId,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        crate::portrait_registry::capability_snapshot(
+            &crate::portrait_registry::RuntimeProbeContext::default(),
+        )
+    }
+
+    /// Per-photo capability for one document state.
+    ///
+    /// `detail` asks the engine to spend a real production pass on the rows it
+    /// reports; `false` must stay cheap and is what the automatic path uses. An
+    /// engine with per-row evidence overrides this; the default delegates to
+    /// [`Self::portrait_capability_snapshot`], so an engine without one keeps its
+    /// conservative answer and never invents a positive.
+    fn portrait_capability_for(
+        &self,
+        image: ImageId,
+        _adjustments: &AdjustmentSet,
+        _detail: bool,
+    ) -> crate::portrait_registry::PortraitCapabilitySnapshot {
+        self.portrait_capability_snapshot(image)
+    }
+
     // ── Rendering ──
 
     /// A thumbnail whose longest side is at most `max_size`, with adjustments applied.
@@ -748,12 +836,32 @@ pub trait ImageEngine: Send + Sync + 'static {
         Ok(with_display_profile(img, proof_profile, display_profile, levels, crate::icc::Rendering::default()).0)
     }
     fn render_preview(&self, request: &PreviewRequest) -> anyhow::Result<PreviewFrame>;
-    /// [`Self::render_preview`] with an explicit quality switch. `fast` renders at
-    /// half resolution and upsamples, for the frames issued while a slider is
-    /// dragged; `false` is exactly `render_preview`. Engines that cannot go
-    /// faster ignore the flag.
+    /// [`Self::render_preview`] that also asks for viewer scope counts of the
+    /// returned pixels.
+    ///
+    /// The counts are only filled when the engine can prove they were taken
+    /// from the very pixels in `frame.image`; otherwise `frame.scopes` stays
+    /// `None` and the caller counts on the CPU. This default keeps every engine
+    /// without a device path on that fallback.
+    fn render_preview_scoped(
+        &self,
+        request: &PreviewRequest,
+        _scopes: crate::scopes::ScopeWants,
+    ) -> anyhow::Result<PreviewFrame> {
+        let mut frame = self.render_preview(request)?;
+        frame.scopes = None;
+        Ok(frame)
+    }
+    /// Legacy interactive hint. Both settings preserve the exact sampling grid,
+    /// processing stages and visible pixels of `render_preview`.
     fn render_preview_fast(&self, request: &PreviewRequest, _fast: bool) -> anyhow::Result<PreviewFrame> {
         self.render_preview(request)
+    }
+    /// Fast embedded-JPEG preview for a cold RAW image whose 16-bit source is
+    /// not yet in RAM or the 16-bit disk cache. Returns `None` when the image
+    /// is already warm, is not a RAW, or has no embedded JPEG preview.
+    fn quick_cold_raw_preview(&self, _request: &PreviewRequest) -> Option<PreviewFrame> {
+        None
     }
     /// Processed sRGB color under a normalized image point, 0 ..= 1 per channel.
     fn sample_color(&self, image: ImageId, adjustments: &AdjustmentSet, point: [f32; 2]) -> anyhow::Result<[f32; 3]>;

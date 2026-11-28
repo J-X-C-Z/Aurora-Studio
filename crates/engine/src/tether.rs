@@ -508,10 +508,10 @@ mod wia {
     const IID_IUNKNOWN: Guid = guid(0, 0, 0, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
     const WIA_CMD_TAKE_PICTURE: Guid = guid(0xAF933CAC, 0xACAD, 0x11D2, [0xA0, 0x93, 0x00, 0xC0, 0x4F, 0x72, 0xDC, 0x3C]);
 
-    /// `StiDeviceTypeDigitalCamera`; `WIA_DEVICE_TYPE_ALL` catches drivers that
-    /// register as streaming video instead.
-    const WIA_DEVICE_TYPE_IMAGE: i32 = 2;
-    const WIA_DEVICE_TYPE_ALL: i32 = 0;
+    // EnumDeviceInfo takes an enumeration *flag*, not a StiDeviceType.
+    const WIA_DEVINFO_ENUM_LOCAL: i32 = 0x10;
+    const WIA_DIP_DEV_TYPE: u32 = 5;
+    const STI_DIGITAL_CAMERA: u32 = 2;
     // WiaDef.h: device description and the two camera-status properties.
     const WIA_DIP_DEV_ID: u32 = 2;
     const WIA_DIP_DEV_DESC: u32 = 4;
@@ -618,7 +618,10 @@ mod wia {
         let mut out: *mut c_void = ptr::null_mut();
         let hr = unsafe { CoCreateInstance(clsid, ptr::null_mut(), CLSCTX_ALL, iid, &mut out) };
         if hr < 0 || out.is_null() {
-            bail!("WIA device manager is unavailable (CoCreateInstance HRESULT {})", hr_text(hr));
+            bail!(
+                "NoCamera: WIA device manager is unavailable (CoCreateInstance HRESULT {})",
+                hr_text(hr)
+            );
         }
         Ok(ComPtr::new(out))
     }
@@ -650,7 +653,9 @@ mod wia {
     #[repr(C)]
     struct PropSpec {
         kind: u32,
-        propid: u32,
+        // PROPSPEC's discriminated union also holds a pointer; on x64 the
+        // property id starts at offset 8, not immediately after `kind`.
+        propid: usize,
     }
 
     /// `PROPVARIANT` prefix plus the union slots we read; 16 bytes of union on
@@ -669,7 +674,7 @@ mod wia {
     /// the same vtable slot as `IPropertyStorage`'s.
     fn read_property(item: *mut c_void, propid: u32) -> Option<PropVariant> {
         let storage = query_interface(item, &IID_IWIA_PROPERTY_STORAGE)?;
-        let spec = PropSpec { kind: PRSPEC_PROPID, propid };
+        let spec = PropSpec { kind: PRSPEC_PROPID, propid: propid as usize };
         let mut value = PropVariant { vt: 0, reserved1: 0, reserved2: 0, reserved3: 0, data: [0; 2] };
         let read: unsafe extern "system" fn(*mut c_void, u32, *const PropSpec, *mut PropVariant) -> i32 =
             unsafe { std::mem::transmute(vtable_slot(storage.ptr(), 3)) };
@@ -794,11 +799,11 @@ mod wia {
         id: String,
     }
 
-    fn enumerate_devices(devmgr: *mut c_void, kind: i32) -> Result<Vec<Device>> {
+    fn enumerate_devices(devmgr: *mut c_void) -> Result<Vec<Device>> {
         let mut enumerator: *mut c_void = ptr::null_mut();
         let enumerate: unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> i32 =
             unsafe { std::mem::transmute(vtable_slot(devmgr, 3)) };
-        let hr = unsafe { enumerate(devmgr, kind, &mut enumerator) };
+        let hr = unsafe { enumerate(devmgr, WIA_DEVINFO_ENUM_LOCAL, &mut enumerator) };
         if hr < 0 || enumerator.is_null() {
             return Ok(Vec::new());
         }
@@ -814,29 +819,36 @@ mod wia {
                 break;
             }
             let storage = ComPtr::new(storage);
-            devices.push(Device {
-                name: device_property(storage.ptr(), WIA_DIP_DEV_NAME),
-                id: device_property(storage.ptr(), WIA_DIP_DEV_ID),
-            });
+            // GET_STIDEVICE_TYPE(dwDevType) = HIWORD(dwDevType) (Sti.h).
+            let kind = device_number(storage.ptr(), WIA_DIP_DEV_TYPE);
+            if !kind.is_some_and(|v| v >> 16 == STI_DIGITAL_CAMERA) { continue; }
+            let id = device_property(storage.ptr(), WIA_DIP_DEV_ID);
+            if !id.is_empty() {
+                devices.push(Device { name: device_property(storage.ptr(), WIA_DIP_DEV_NAME), id });
+            }
         }
         Ok(devices)
     }
 
     fn list_devices() -> Result<Vec<Device>> {
         let devmgr = co_create(&CLSID_WIA_DEV_MGR2, &IID_IWIA_DEV_MGR2)?;
-        let mut devices = enumerate_devices(devmgr.ptr(), WIA_DEVICE_TYPE_IMAGE)?;
-        if devices.is_empty() {
-            devices = enumerate_devices(devmgr.ptr(), WIA_DEVICE_TYPE_ALL)?;
-        }
-        Ok(devices)
+        enumerate_devices(devmgr.ptr())
     }
 
     pub(super) fn capture_devices() -> Vec<crate::CaptureDevice> {
+        let Ok(_com) = ComInit::new() else { return Vec::new() };
         list_devices()
             .unwrap_or_default()
             .into_iter()
             .map(|device| crate::CaptureDevice { id: device.id, name: device.name })
             .collect()
+    }
+
+    #[test]
+    fn properties_match_the_windows_sdk_layout() {
+        assert_eq!(std::mem::offset_of!(PropSpec, propid), std::mem::size_of::<usize>());
+        assert_eq!(std::mem::size_of::<PropSpec>(), 2 * std::mem::size_of::<usize>());
+        assert_eq!(std::mem::offset_of!(PropVariant, data), 8);
     }
 
     #[cfg(test)]
@@ -923,10 +935,12 @@ mod wia {
         if id.is_null() {
             bail!("NoCamera: WIA device id could not be allocated");
         }
-        let create: unsafe extern "system" fn(*mut c_void, *mut u16, *mut *mut c_void) -> i32 =
+        // IWiaDevMgr2::CreateDevice(LONG flags, BSTR id, IWiaItem2 **out).
+        // IWiaDevMgr (v1) lacks the flags word; the two ABIs are not interchangeable.
+        let create: unsafe extern "system" fn(*mut c_void, i32, *mut u16, *mut *mut c_void) -> i32 =
             unsafe { std::mem::transmute(vtable_slot(devmgr.ptr(), 4)) };
         let mut root: *mut c_void = ptr::null_mut();
-        let hr = unsafe { create(devmgr.ptr(), id, &mut root) };
+        let hr = unsafe { create(devmgr.ptr(), 0, id, &mut root) };
         unsafe { SysFreeString(id) };
         if hr < 0 || root.is_null() {
             bail!("NoCamera: WIA CreateDevice failed (HRESULT {})", hr_text(hr));

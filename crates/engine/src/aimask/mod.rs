@@ -614,12 +614,14 @@ impl Segmenter {
     }
 
     fn load_with_cpu_fallback(name: &str, cpu_only: bool) -> Result<Arc<Segmenter>> {
-        let load_lock = model_lock(name);
+        let backend=aurora_portrait::native_infer::backend::BackendRequest::from_env().map_err(anyhow::Error::msg)?;
+        let cache_key=format!("{name}:{}:{}",backend.label(),cpu_only);
+        let load_lock = model_lock(&cache_key);
         let _loading = load_lock.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(model) = model_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(name)
+            .get(&cache_key)
             .filter(|model| !cpu_only || model.session.provider() == Provider::Cpu)
         {
             return Ok(model.clone());
@@ -702,7 +704,7 @@ impl Segmenter {
         model_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(name.to_string(), model.clone());
+            .insert(cache_key, model.clone());
         Ok(model)
     }
 
@@ -731,7 +733,7 @@ impl Segmenter {
         };
         let (model, output, dtype, preprocess_ms, infer_ms) = match attempt(&model) {
             Ok(result) => (model, result.0, result.1, result.2, result.3),
-            Err(error) if model.session.provider() != Provider::Cpu => {
+            Err(error) if model.session.allows_cpu_fallback() && model.session.provider() != Provider::Cpu => {
                 log::warn!(
                     "{name} failed on {}: {error:#}; retrying on CPU",
                     model.session.provider().label()

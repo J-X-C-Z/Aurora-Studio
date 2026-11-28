@@ -21,14 +21,8 @@ use aurora_engine::{
 };
 use aurora_portrait::Image;
 
-const WHITEN_PNG: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/portrait/skin-adjust/whiten.png"
-));
-const RUDDY_PNG: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/portrait/skin-adjust/ruddy_new.png"
-));
+const WHITEN_PNG: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("portrait/skin-adjust/whiten.png"));
+const RUDDY_PNG: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("portrait/skin-adjust/ruddy_new.png"));
 
 /// Serializes tests that read/write the process-global `AURORA_*` dev switches.
 /// Integration tests share one process, so this is required for correctness

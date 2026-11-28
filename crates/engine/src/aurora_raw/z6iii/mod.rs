@@ -19,7 +19,22 @@ pub(in crate::aurora_raw) use render::{
 };
 pub(crate) use reconstruct::is_verified_he_nef;
 #[cfg(windows)]
-pub(in crate::aurora_raw) use render::recover_and_antialias_frame;
+pub(in crate::aurora_raw) use render::{recover_and_antialias_frame,GenericPostRoute};
+/// The Z6III CUDA PTX text, re-exported so `aurora_raw::prewarm` can JIT it on
+/// the startup thread instead of on the first RAW open.
+#[cfg(windows)]
+pub(in crate::aurora_raw) use reconstruct::cuda_ptx_image as raw_ptx_image;
+
+/// Whether the Z6III reconstruction will consume the caller's LibRaw plane.
+///
+/// [`render_linear_rgba16_oriented_traced`] returns `NotZ6iii` before it reads
+/// the plane for any other body, so this is exactly the predicate that decides
+/// whether copying the sensor plane is useful — and it is the same predicate,
+/// not a second guess at it.
+#[cfg(windows)]
+pub(in crate::aurora_raw) fn uses_libraw_plane(nef: &[u8]) -> bool {
+    reconstruct::is_z6iii_nef(nef)
+}
 
 use anyhow::Result;
 #[cfg(windows)]
@@ -70,36 +85,51 @@ pub fn render(nef: &[u8], assets: &ExportAssets<'_>) -> Result<Frame> {
     Ok(Frame { width: width as u32, height: height as u32, pixels, icc: assets.adobe_rgb_icc.to_vec() })
 }
 
-/// Whether this machine exposes an OpenCL device the Z6III pipeline can use.
+/// Whether this machine exposes an OpenCL or CUDA device the Z6III pipeline can use.
 #[cfg(windows)]
 pub(crate) fn opencl_available() -> bool {
-    reconstruct::gpu_available()
+    reconstruct::cuda_available() || reconstruct::gpu_available()
 }
 
-/// Reconstructs linear camera-space RGBA16 via the Z6III OpenCL pipeline
-/// (demosaic, linear CA, highlight recovery and anti-aliasing)
-/// when an OpenCL GPU is available.
+/// Reconstructs linear camera-space RGBA16 via the Z6III GPU pipeline
+/// (native CUDA GPU-resident path with OpenCL fallback: demosaic, linear CA,
+/// highlight recovery and anti-aliasing) when a GPU is available.
 ///
-/// The returned route distinguishes "not this file", "no OpenCL device" and
+/// The returned route distinguishes "not this file", "no GPU device" and
 /// "device present but the reconstruction failed", so callers can record why a
-/// frame did or did not come from OpenCL.
+/// frame did or did not come from the GPU pipeline.
 #[cfg(windows)]
 pub(in crate::aurora_raw) fn render_linear_rgba16_traced(
     nef: &[u8],
     bayer: Option<(usize, usize, Vec<u16>)>,
     ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
 ) -> (Option<(usize, usize, Vec<u16>)>, super::OpenClRoute) {
+    let (frame, route, _oriented) =
+        render_linear_rgba16_oriented_traced(nef, bayer, ca_warp, 1);
+    (frame, route)
+}
+
+/// Same as [`render_linear_rgba16_traced`], additionally allowing the GPU
+/// pipeline to fuse EXIF `orientation` directly into the final RGBA16 write.
+/// Returns `(frame, route, already_oriented)`.
+#[cfg(windows)]
+pub(in crate::aurora_raw) fn render_linear_rgba16_oriented_traced(
+    nef: &[u8],
+    bayer: Option<(usize, usize, Vec<u16>)>,
+    ca_warp: Option<&crate::mock::lens_profile::LensWarp>,
+    orientation: u16,
+) -> (Option<(usize, usize, Vec<u16>)>, super::OpenClRoute, bool) {
     if !reconstruct::is_z6iii_nef(nef) {
-        return (None, super::OpenClRoute::NotZ6iii);
+        return (None, super::OpenClRoute::NotZ6iii, false);
     }
-    if !reconstruct::gpu_available() {
-        return (None, super::OpenClRoute::Unavailable);
+    if !reconstruct::cuda_available() && !reconstruct::gpu_available() {
+        return (None, super::OpenClRoute::Unavailable, false);
     }
-    match render::linear_rgba16(nef, bayer, ca_warp) {
-        Ok(frame) => (Some(frame), super::OpenClRoute::Succeeded),
+    match render::linear_rgba16_oriented(nef, bayer, ca_warp, orientation) {
+        Ok((w, h, pixels, oriented)) => (Some((w, h, pixels)), super::OpenClRoute::Succeeded, oriented),
         Err(error) => {
-            log::warn!("Z6III OpenCL linear decode fell back to CPU C1 chain: {error:#}");
-            (None, super::OpenClRoute::Failed)
+            log::warn!("Z6III GPU linear decode fell back to CPU C1 chain: {error:#}");
+            (None, super::OpenClRoute::Failed, false)
         }
     }
 }

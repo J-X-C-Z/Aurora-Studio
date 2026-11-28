@@ -91,6 +91,8 @@ pub(crate) mod detail_gpu;
 pub(crate) mod clarity_gpu;
 #[cfg(windows)]
 pub(crate) mod develop_gpu;
+#[cfg(windows)]
+pub(crate) mod scopes_gpu;
 #[cfg(not(windows))]
 pub(crate) mod clarity_gpu {
     use super::clarity;
@@ -404,9 +406,10 @@ impl MockEngine {
                 degraded,
                 gamut_warning,
                 bgra: false,
+                scopes: None,
             });
         }
-        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast, crate::scopes::ScopeWants::default());
         let frame = CachedFrame {
             width: out.width,
             height: out.height,
@@ -426,6 +429,7 @@ impl MockEngine {
             degraded,
             gamut_warning,
             bgra: false,
+            scopes: None,
         })
     }
 
@@ -474,6 +478,30 @@ fn is_image(path: &Path) -> bool {
 impl ImageEngine for MockEngine {
     fn name(&self) -> String {
         "Portrait Mock Engine 0.1 (CPU preview)".into()
+    }
+
+    fn capabilities(&self) -> crate::engine::EngineCapabilities {
+        crate::engine::EngineCapabilities {
+            ai_mask_kinds: vec![
+                crate::AiMaskKind::Subject,
+                crate::AiMaskKind::Person,
+                crate::AiMaskKind::Clothing,
+                crate::AiMaskKind::Skin,
+                crate::AiMaskKind::Hair,
+                crate::AiMaskKind::Sky,
+                crate::AiMaskKind::Background,
+            ],
+            eye_report: true,
+            auto_rotate: false,
+            match_look: false,
+            tether: false,
+            blemish_gainmap: false,
+            blemish_gainmap_model: false,
+            export_formats: crate::output::ExportFormat::ALL
+                .into_iter()
+                .filter(|format| format.is_supported())
+                .collect(),
+        }
     }
 
     fn images(&self) -> Vec<ImageInfo> {

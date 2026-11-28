@@ -2002,6 +2002,7 @@ mod tests {
     /// The reference Z6_3 frame: C1 stores gains `1.625;1.000;1.412`, which
     /// resolve to its 4779.6 K / -4.5 tint.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn as_shot_reads_the_real_nef_gains() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
         let block = crate::read_nikon_info_block(&path).expect("sample header parses");

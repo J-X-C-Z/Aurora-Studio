@@ -2,7 +2,7 @@
 #
 # D-1 (license policy) is still open. This file only enforces a permissive
 # baseline and denies unlicensed crates; it is NOT a final license decision.
-# See 06_reports/SESSION-integration-rv24-ci.md.
+# Open questions are tracked in ASSET-LICENSES.md.
 #
 # MPL-2.0 is included because dwrote/option-ext/cbindgen are in the Windows
 # dependency graph. It is weak copyleft, so D-1 must confirm it explicitly.

@@ -2,6 +2,19 @@
 
 基线 SHA：`8118a4a`。本文件描述**当前这一轮**的实际写入边界，不替代仓库所有者未提供的 `00_admin/OWNERSHIP-2026-11-14.md`。
 
+## 人像模块 A（2026-11-27，独立于下述 A0 历史分工）
+
+| 范围 | 唯一写入方 |
+|---|---|
+| 注册表、PF 分组/证据与参数单位 | 人像注册表维护者 |
+| `portrait_stage` 及渲染入口的牙齿调度 | 人像 stage 维护者；其它 stage 修改由统筹在其交接后落地 |
+| `ImageEngine` 与 `FileEngine` 的逐图探测 | 引擎探测维护者 |
+| 面板、应用状态和异步失效 | 人像面板维护者 |
+| 款式缩略图、色板及整妆选择组件 | 妆容选择器维护者 |
+| 整妆配方读取、原子替换、打包颜色、丰盈旧配方兼容、模块声明与最终集成 | 人像模块统筹 |
+
+不改动 RAW、显示后端、CPU/GPU 细节阶段和现有 Metal 适配；不在本模块替换日用安装。
+
 ## 1. 可用信息与缺口
 
 - `AGENTS.md` 声明分工文件在 `../../00_admin/OWNERSHIP-2026-11-14.md`；该路径在本机不存在，无法读取。
@@ -24,6 +37,18 @@
 | A-registry（人像注册） | `crates/portrait/src/effect_descriptor.rs`、`docs/architecture/A-REGISTRY-AUDIT.md` | 未交接的 PF 实现、`capability_registry.rs`、`effect_router.rs` |
 | A-QA（架构检查） | `crates/engine/tests/architecture_rules.rs`、`scripts/architecture/check.sh`、`docs/architecture/ARCHITECTURE-CHECKS.md` | 生产源码、Cargo.toml |
 | 统筹（本 Agent） | `lib.rs` 模块声明、`docs/architecture/*`、跨 lane 集成 patch | — |
+
+## 模块 B：同帧美体生成与消费
+
+独立于目录模块，从 `portrait/zero-ort-baseline-20261126` 的 `536fdcf` 开发；不覆盖 C4 的推理后端或 RAW/细节路径。
+
+| 写入者 | 写入面 |
+|---|---|
+| 姿态 ABI | `crates/engine/src/{aimask/body_pose.rs,body_shader_abi.rs}`、必要的 `crates/portrait/src/kernels/body_69slot_bridge.rs` 适配 |
+| 解析与实例 | `crates/engine/src/{portrait_body_inputs.rs,aimask/mod.rs}` |
+| 网格 / 稠密场 | `crates/engine/src/portrait_body_mesh.rs` / `crates/engine/src/portrait_body_fields.rs`，各自单写 |
+| 验收 | `crates/engine/src/portrait_body_live_tests.rs` |
+| 统筹 | `crates/engine/src/{portrait_body_producer.rs,portrait_body_stage.rs,portrait_body_warp.rs,portrait_stage.rs,mock/process.rs}`，以及 `crates/portrait/src/kernels/{body_geometry.rs,body_geometry_params.rs,hair_body.rs}` 的采样坐标和曲线复用；预览/宽位共同消费 |
 
 ## 3. 三个 Agent 的边界（按任务书 §1.1，待仓库所有者确认）
 

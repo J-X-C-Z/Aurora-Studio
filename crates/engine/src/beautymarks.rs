@@ -291,13 +291,14 @@ mod tests {
     /// control, then six stamped moles. Dumps marks and the Skin Evening result
     /// with/without protection for the Python oracle.
     #[test]
-    #[ignore]
+    #[ignore = "needs real portrait fixture; set AURORA_BEAUTYMARKS_SAMPLE"]
     fn real_face_marks_and_protection() {
-        let path = r"C:\WorkSpace\Aurora Studio\90_work\lanes\portrait-parse\o834_final_index\parse\s815_moisture_producer\PF90002-stage-before.png";
-        if !std::path::Path::new(path).is_file() {
-            return;
-        }
-        let full = image::open(path).unwrap().to_rgba8();
+        let path = std::env::var_os("AURORA_BEAUTYMARKS_SAMPLE")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_BEAUTYMARKS_SAMPLE to a real portrait image");
+        let out_dir = std::env::temp_dir().join("aurora-beautymarks-test");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let full = image::open(&path).unwrap().to_rgba8();
         let crop = image::imageops::crop_imm(&full, 300, 120, 900, 900).to_image();
         let clean = detect_marks(crop.as_raw(), 900, 900, DEFAULT_CONFIDENCE).expect("clean");
         println!("clean 900x900 face: {} mark(s)", clean.len());
@@ -317,7 +318,7 @@ mod tests {
                 }
             }
         }
-        stamped.save(r"C:\WorkSpace\Aurora Studio\90_work\build-cache\beautymarks_stamped.png").unwrap();
+        stamped.save(out_dir.join("beautymarks_stamped.png")).unwrap();
         let image = stamped;
         let (w, h) = image.dimensions();
         let started = std::time::Instant::now();
@@ -335,7 +336,7 @@ mod tests {
             .map(|m| format!("[{:.4},{:.4},{:.4},{:.4},{:.6}]", m.x0, m.y0, m.x1, m.y1, m.score))
             .collect();
         let dump = format!("{{\"width\":{w},\"height\":{h},\"marks\":[{}]}}", json.join(","));
-        std::fs::write(r"C:\WorkSpace\Aurora Studio\90_work\build-cache\beautymarks_rust.json", dump).unwrap();
+        std::fs::write(out_dir.join("beautymarks_rust.json"), dump).unwrap();
 
         let mut mask = vec![255u8; (w * h) as usize];
         let plain = mask.clone();
@@ -362,20 +363,19 @@ mod tests {
             "a stamped mole was missed: {marks:?}"
         );
         let outp = image::RgbaImage::from_raw(w, h, with).unwrap();
-        outp.save(r"C:\WorkSpace\Aurora Studio\90_work\build-cache\beautymarks_protected.png").unwrap();
+        outp.save(out_dir.join("beautymarks_protected.png")).unwrap();
         let outu = image::RgbaImage::from_raw(w, h, without).unwrap();
-        outu.save(r"C:\WorkSpace\Aurora Studio\90_work\build-cache\beautymarks_plain.png").unwrap();
+        outu.save(out_dir.join("beautymarks_plain.png")).unwrap();
     }
 
     /// Obama acceptance: 0.3/0.6 × protection on/off on the real portrait.
     #[test]
-    #[ignore]
+    #[ignore = "needs real portrait fixture; set AURORA_OBAMA_SAMPLE"]
     fn obama_skin_evening_acceptance() {
-        let path = r"C:\WorkSpace\Aurora Studio\04_reference\codex-c1-task\outputs\maskcats\obama.jpg";
-        if !std::path::Path::new(path).is_file() {
-            return;
-        }
-        let image = image::open(path).unwrap().to_rgba8();
+        let path = std::env::var_os("AURORA_OBAMA_SAMPLE")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_OBAMA_SAMPLE to a real portrait image");
+        let image = image::open(&path).unwrap().to_rgba8();
         let (w, h) = image.dimensions();
         let face = [0.275, 0.030, 0.345, 0.310];
         let started = std::time::Instant::now();

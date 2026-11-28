@@ -1,17 +1,84 @@
 //! Explicit backend selection from caller-supplied device probe results.
 //!
 //! This module never probes hardware and never infers availability from OS or
-//! device names. A GPU is usable only when the caller says so and the selected
-//! effect's precision, kernel, and input shape are supported.
+//! device names. A GPU or accelerator is usable only when the caller says so
+//! and the selected effect's precision, kernel, and input shape are supported.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
     Cpu,
     Cuda,
     Metal,
+    /// Cross-platform Vulkan / WGPU Compute (AMD/Intel discrete & integrated
+    /// GPUs, Qualcomm Snapdragon Adreno, Linux/Windows/Android/HarmonyOS).
+    Vulkan,
+    /// Windows Direct3D 12 Compute (NVIDIA/AMD/Intel/Qualcomm Windows on ARM).
+    Dx12,
+    /// AMD HIP / ROCm Compute (RDNA dGPU & APU).
+    Hip,
+    /// Intel oneAPI SYCL / Level Zero Compute (UHD/Iris Xe/Arc/Core Ultra).
+    Sycl,
+    /// OpenCL Compute (legacy / RAW Z6III path).
+    OpenCl,
+    /// Reserved NPU accelerator extension point (Qualcomm Hexagon, Apple ANE,
+    /// Intel NPU, Ryzen AI, HarmonyOS NNRt/CANN).
+    Npu,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Backend {
+    /// Stable lowercase identifier for diagnostics and telemetry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+            Self::Dx12 => "dx12",
+            Self::Hip => "hip",
+            Self::Sycl => "sycl",
+            Self::OpenCl => "opencl",
+            Self::Npu => "npu",
+        }
+    }
+
+    /// Whether this backend is a GPU compute backend eligible for automatic
+    /// GPU selection.
+    pub const fn is_gpu(self) -> bool {
+        matches!(
+            self,
+            Self::Cuda | Self::Metal | Self::Vulkan | Self::Dx12 | Self::Hip | Self::Sycl | Self::OpenCl
+        )
+    }
+
+    /// Whether this backend offloads work off the CPU (GPU or NPU).
+    pub const fn is_accelerator(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
+}
+
+impl fmt::Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Default automatic GPU preference order before falling back to [`Backend::Cpu`].
+pub const AUTO_GPU_PRIORITY: [Backend; 3] = [Backend::Cuda, Backend::Metal, Backend::Vulkan];
+
+/// Extended GPU selection order across all supported native and portable APIs.
+pub const EXTENDED_GPU_PRIORITY: [Backend; 7] = [
+    Backend::Cuda,
+    Backend::Metal,
+    Backend::Vulkan,
+    Backend::Dx12,
+    Backend::Hip,
+    Backend::Sycl,
+    Backend::OpenCl,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Precision {
     Fp32,
     Fp16,
@@ -30,6 +97,26 @@ pub struct DeviceProbe {
     pub max_height: u32,
 }
 
+impl DeviceProbe {
+    /// Returns whether this probe reports a ready driver and compiled kernel.
+    pub const fn is_ready(&self) -> bool {
+        self.driver_ready && self.kernel_compiled
+    }
+
+    /// Returns whether this probe supports the requested precision.
+    pub const fn supports_precision(&self, precision: Precision) -> bool {
+        match precision {
+            Precision::Fp32 => self.fp32,
+            Precision::Fp16 => self.fp16,
+        }
+    }
+
+    /// Returns whether this probe can accept a non-empty `(width, height)` frame.
+    pub const fn supports_shape(&self, shape: (u32, u32)) -> bool {
+        shape.0 > 0 && shape.1 > 0 && shape.0 <= self.max_width && shape.1 <= self.max_height
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceRefusal {
     BackendUnavailable(&'static str),
@@ -39,6 +126,27 @@ pub enum DeviceRefusal {
     SourceUnavailable,
     EffectUnsupported,
 }
+
+impl fmt::Display for DeviceRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BackendUnavailable(reason) => write!(f, "backend unavailable: {reason}"),
+            Self::KernelMissing => f.write_str("backend kernel is not compiled or missing"),
+            Self::PrecisionUnsupported(precision) => {
+                write!(f, "precision {precision:?} is not supported by selected backend")
+            }
+            Self::ShapeUnsupported => {
+                f.write_str("frame shape is empty or exceeds backend dimensions")
+            }
+            Self::SourceUnavailable => f.write_str("source pixels are unavailable"),
+            Self::EffectUnsupported => {
+                f.write_str("effect is not supported on the requested backend")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeviceRefusal {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
@@ -62,7 +170,9 @@ pub fn select(request: DeviceRequest<'_>) -> Selection {
         if !request.source_ok || request.shape.0 == 0 || request.shape.1 == 0 {
             return Selection::Refused(refusal(&request, Backend::Cpu));
         }
-        for backend in [Backend::Cuda, Backend::Metal] {
+        // Automatic selection priority: Cuda -> Metal -> Vulkan -> Cpu.
+        // Npu is a reserved extension point and requires explicit selection.
+        for backend in AUTO_GPU_PRIORITY {
             if usable(&request, backend).is_some() {
                 return Selection::Selected(backend);
             }
@@ -71,11 +181,16 @@ pub fn select(request: DeviceRequest<'_>) -> Selection {
             return Selection::Selected(Backend::Cpu);
         }
         // Report the backend that owns the effect: a CPU-accessible effect
-        // fails on CPU rules, everything else on the first GPU in the order.
+        // fails on CPU rules; otherwise report the first probed GPU in priority
+        // order so callers see the concrete blocker (e.g. Vulkan driver/kernel),
+        // falling back to CUDA when no GPU probe was supplied.
         let home = if request.effect_access == Access::Cpu {
             Backend::Cpu
         } else {
-            Backend::Cuda
+            AUTO_GPU_PRIORITY
+                .into_iter()
+                .find(|candidate| request.probes.iter().any(|probe| probe.backend == *candidate))
+                .unwrap_or(Backend::Cuda)
         };
         return Selection::Refused(refusal(&request, home));
     };
@@ -101,17 +216,10 @@ fn usable(request: &DeviceRequest<'_>, backend: Backend) -> Option<()> {
         return None;
     }
     let probe = request.probes.iter().find(|probe| probe.backend == backend)?;
-    if !probe.driver_ready || !probe.kernel_compiled {
+    if !probe.is_ready() || !probe.supports_precision(request.precision) {
         return None;
     }
-    let precision_ok = match request.precision {
-        Precision::Fp32 => probe.fp32,
-        Precision::Fp16 => probe.fp16,
-    };
-    if !precision_ok {
-        return None;
-    }
-    (request.shape.0 <= probe.max_width && request.shape.1 <= probe.max_height).then_some(())
+    probe.supports_shape(request.shape).then_some(())
 }
 
 fn refusal(request: &DeviceRequest<'_>, backend: Backend) -> DeviceRefusal {
@@ -136,12 +244,18 @@ fn refusal(request: &DeviceRequest<'_>, backend: Backend) -> DeviceRefusal {
     if !request.effect_gpu_ready {
         return DeviceRefusal::EffectUnsupported;
     }
-    // `usable` lets an Access::Cpu effect take a GPU stage when the caller says
+    // `usable` lets an Access::Cpu effect take a GPU/NPU stage when the caller says
     // that stage is ready, so the refusal must not reject it before the probe.
     let Some(probe) = request.probes.iter().find(|probe| probe.backend == backend) else {
         return DeviceRefusal::BackendUnavailable(match backend {
             Backend::Cuda => "no caller-probe reports NVIDIA CUDA",
             Backend::Metal => "no caller-probe reports Apple Metal",
+            Backend::Vulkan => "no caller-probe reports Vulkan/WGPU compute",
+            Backend::Dx12 => "no caller-probe reports Direct3D 12 compute",
+            Backend::Hip => "no caller-probe reports AMD HIP/ROCm compute",
+            Backend::Sycl => "no caller-probe reports Intel SYCL/Level Zero compute",
+            Backend::OpenCl => "no caller-probe reports OpenCL compute",
+            Backend::Npu => "no caller-probe reports NPU accelerator (Hexagon/ANE)",
             Backend::Cpu => unreachable!(),
         });
     };
@@ -154,7 +268,7 @@ fn refusal(request: &DeviceRequest<'_>, backend: Backend) -> DeviceRefusal {
     match request.precision {
         Precision::Fp32 if !probe.fp32 => DeviceRefusal::PrecisionUnsupported(Precision::Fp32),
         Precision::Fp16 if !probe.fp16 => DeviceRefusal::PrecisionUnsupported(Precision::Fp16),
-        _ if request.shape.0 > probe.max_width || request.shape.1 > probe.max_height => DeviceRefusal::ShapeUnsupported,
+        _ if !probe.supports_shape(request.shape) => DeviceRefusal::ShapeUnsupported,
         _ => DeviceRefusal::EffectUnsupported,
     }
 }
@@ -356,5 +470,121 @@ mod tests {
             select(req),
             Selection::Refused(DeviceRefusal::PrecisionUnsupported(Precision::Fp16))
         );
+    }
+
+    const VULKAN: DeviceProbe = DeviceProbe {
+        backend: Backend::Vulkan,
+        driver_ready: true,
+        kernel_compiled: true,
+        fp32: true,
+        fp16: true,
+        max_width: 8192,
+        max_height: 8192,
+    };
+
+    const NPU: DeviceProbe = DeviceProbe {
+        backend: Backend::Npu,
+        driver_ready: true,
+        kernel_compiled: true,
+        fp32: true,
+        fp16: true,
+        max_width: 4096,
+        max_height: 4096,
+    };
+
+    #[test]
+    fn auto_priority_orders_cuda_metal_vulkan_cpu() {
+        // All three GPU backends available -> CUDA wins.
+        assert_eq!(
+            select(request(None, &[VULKAN, METAL, GOOD])),
+            Selection::Selected(Backend::Cuda)
+        );
+        // CUDA absent, Metal & Vulkan available -> Metal wins.
+        assert_eq!(
+            select(request(None, &[VULKAN, METAL])),
+            Selection::Selected(Backend::Metal)
+        );
+        // Only Vulkan available (AMD/Intel/Snapdragon Adreno) -> Vulkan wins.
+        assert_eq!(
+            select(request(None, &[VULKAN])),
+            Selection::Selected(Backend::Vulkan)
+        );
+        // No GPU available for CPU-capable FP32 effect -> falls back to CPU.
+        let mut cpu_fallback = request(None, &[]);
+        cpu_fallback.effect_access = Access::Cpu;
+        cpu_fallback.precision = Precision::Fp32;
+        assert_eq!(select(cpu_fallback), Selection::Selected(Backend::Cpu));
+    }
+
+    #[test]
+    fn vulkan_and_npu_explicit_selection_and_refusals() {
+        assert_eq!(
+            select(request(Some(Backend::Vulkan), &[VULKAN])),
+            Selection::Selected(Backend::Vulkan)
+        );
+        assert_eq!(
+            select(request(Some(Backend::Npu), &[NPU])),
+            Selection::Selected(Backend::Npu)
+        );
+        assert_eq!(
+            select(cpu_stage(Backend::Vulkan, &[])),
+            Selection::Refused(DeviceRefusal::BackendUnavailable(
+                "no caller-probe reports Vulkan/WGPU compute"
+            ))
+        );
+        assert_eq!(
+            select(cpu_stage(Backend::Npu, &[])),
+            Selection::Refused(DeviceRefusal::BackendUnavailable(
+                "no caller-probe reports NPU accelerator (Hexagon/ANE)"
+            ))
+        );
+
+        let mut broken_vk = VULKAN;
+        broken_vk.kernel_compiled = false;
+        assert_eq!(
+            select(request(Some(Backend::Vulkan), &[broken_vk])),
+            Selection::Refused(DeviceRefusal::KernelMissing)
+        );
+
+        let mut no_fp16_npu = NPU;
+        no_fp16_npu.fp16 = false;
+        assert_eq!(
+            select(request(Some(Backend::Npu), &[no_fp16_npu])),
+            Selection::Refused(DeviceRefusal::PrecisionUnsupported(Precision::Fp16))
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_from_unusable_vulkan_to_cpu_or_reports_vulkan_blocker() {
+        let mut broken_vk = VULKAN;
+        broken_vk.driver_ready = false;
+        let probes = [broken_vk];
+
+        // CPU-capable FP32 effect degrades cleanly from unusable Vulkan to CPU.
+        let mut cpu_req = request(None, &probes);
+        cpu_req.effect_access = Access::Cpu;
+        cpu_req.precision = Precision::Fp32;
+        assert_eq!(select(cpu_req), Selection::Selected(Backend::Cpu));
+
+        // GPU-only effect reports the actual Vulkan driver blocker rather than
+        // claiming CUDA is missing.
+        let gpu_only = request(None, &probes);
+        assert_eq!(
+            select(gpu_only),
+            Selection::Refused(DeviceRefusal::BackendUnavailable("driver not ready"))
+        );
+    }
+
+    #[test]
+    fn npu_is_reserved_and_not_auto_selected_without_explicit_request() {
+        let mut cpu_req = request(None, &[NPU]);
+        cpu_req.effect_access = Access::Cpu;
+        cpu_req.precision = Precision::Fp32;
+        assert_eq!(select(cpu_req), Selection::Selected(Backend::Cpu));
+        assert!(Backend::Vulkan.is_gpu());
+        assert!(!Backend::Npu.is_gpu());
+        assert!(Backend::Npu.is_accelerator());
+        assert_eq!(Backend::Vulkan.as_str(), "vulkan");
+        assert_eq!(Backend::Npu.as_str(), "npu");
     }
 }

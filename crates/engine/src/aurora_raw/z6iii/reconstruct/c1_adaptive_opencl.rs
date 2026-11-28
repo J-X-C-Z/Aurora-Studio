@@ -1,5 +1,5 @@
 use super::NikonCrop;
-use std::{cell::RefCell, collections::HashMap, ffi::{c_char, c_void}, io, ptr::{null, null_mut}};
+use std::{collections::HashMap, ffi::{c_char, c_void}, io, ptr::{null, null_mut}, sync::Mutex};
 use super::Stage1Params;
 
 type Handle = *mut c_void;
@@ -21,9 +21,11 @@ struct Runtime {
     device: Handle,
 }
 
-thread_local! {
-    static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
-}
+// SAFETY: OpenCL contexts, command queues, and built programs are thread-safe
+// when all queue/program access is serialized by `RUNTIME`'s `Mutex`.
+unsafe impl Send for Runtime {}
+
+static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
 impl Runtime {
     fn new(cl: &Api) -> io::Result<Self> {
@@ -185,7 +187,120 @@ pub(super) fn stage3_gg(input: &[[f32; 3]], width: usize, height: usize,
         enqueue(cl, runtime, &kernel, work)?;
         readback(cl, runtime, &result, &mut output)
     })?;
-    Ok(output.into_iter().map(|[red, green, blue, _]| [red, green, blue]).collect())
+    use rayon::prelude::*;
+    Ok(output.into_par_iter().map(|[red, green, blue, _]| [red, green, blue]).collect())
+}
+
+/// Fused GPU-resident Stage 3 + GG compensate + highlight recovery + anti-alias.
+/// Eliminates all intermediate CPU readbacks, re-uploads, and `[f32;3]<->[f32;4]`
+/// conversions when no linear CA pass sits between GG and highlight recovery.
+pub(in super::super) fn stage3_gg_highlight_aa(
+    input: &[[f32; 4]],
+    width: usize,
+    height: usize,
+    scale: [f32; 3],
+    threshold: f32,
+    noise: f32,
+    recovery: [f32; 16],
+    aa_params: [f32; 2],
+) -> io::Result<Vec<[f32; 3]>> {
+    assert_eq!(input.len(), width * height);
+    assert!(width > 16 && height > 16 && width.is_multiple_of(2));
+    let gg_w = width - 12;
+    let gg_h = height - 12;
+    let out_w = gg_w - 4;
+    let out_h = gg_h - 4;
+    let mut output = vec![[0.0f32; 4]; out_w * out_h];
+    let [red, green, blue] = scale.map(f32::recip);
+    with_runtime(|cl, runtime| {
+        let stage3 = runtime.program(cl, program_source(2))?;
+        let gg = runtime.program(cl, program_source(3))?;
+        let hl_prog = runtime.program(cl, include_str!("highlight.cl"))?;
+        let aa_prog = runtime.program(cl, program_source(4))?;
+
+        let bytes = size_of_val(input);
+        let gg_bytes = gg_w * gg_h * size_of::<[f32; 4]>();
+        let out_bytes = size_of_val(output.as_slice());
+
+        let source = buffer(cl, runtime, 36, bytes, input.as_ptr().cast_mut().cast())?;
+        let diagonal = buffer(cl, runtime, 1, bytes, null_mut())?;
+        let green_plane = buffer(cl, runtime, 1, bytes, null_mut())?;
+        let gg_out = buffer(cl, runtime, 1, gg_bytes, null_mut())?;
+        let hl_out = buffer(cl, runtime, 1, gg_bytes, null_mut())?;
+        let aa_out = buffer(cl, runtime, 1, out_bytes, null_mut())?;
+
+        for (entry, from, to, work) in [
+            (c"reconstruct_diagonal", &source, &diagonal, [(width - 4) / 2, height - 4]),
+            (c"reconstruct_green", &diagonal, &green_plane, [(width - 8) / 2, height - 8]),
+        ] {
+            let k = kernel(cl, stage3, entry, from, to)?;
+            stage3_args(k.0, width, height, threshold)?;
+            enqueue(cl, runtime, &k, work)?;
+        }
+        {
+            let k = kernel(cl, gg, c"gg_compensate", &green_plane, &gg_out)?;
+            argument(k.0, 2, &(width as i32))?;
+            argument(k.0, 3, &6_i32)?;
+            argument(k.0, 4, &(gg_w as i32))?;
+            argument(k.0, 5, &0_i32)?;
+            argument(k.0, 6, &[red, green, blue, 1.0])?;
+            argument(k.0, 7, &[noise, threshold])?;
+            enqueue(cl, runtime, &k, [gg_w, gg_h])?;
+        }
+        {
+            let k = kernel(cl, hl_prog, c"highlight", &gg_out, &hl_out)?;
+            argument(k.0, 2, &recovery)?;
+            enqueue(cl, runtime, &k, [gg_w * gg_h, 1])?;
+        }
+        {
+            let k = kernel(cl, aa_prog, c"anti_alias", &hl_out, &aa_out)?;
+            argument(k.0, 2, &(gg_w as i32))?;
+            argument(k.0, 3, &aa_params)?;
+            enqueue(cl, runtime, &k, [out_w, out_h])?;
+        }
+        readback(cl, runtime, &aa_out, &mut output)
+    })?;
+    use rayon::prelude::*;
+    Ok(output.into_par_iter().map(|[r, g, b, _]| [r, g, b]).collect())
+}
+
+/// Fused GPU-resident highlight recovery + anti-alias for strips that ran CPU CA.
+pub(in super::super) fn highlight_and_aa(
+    input: &[[f32; 3]],
+    width: usize,
+    height: usize,
+    recovery: [f32; 16],
+    aa_params: [f32; 2],
+) -> io::Result<Vec<[f32; 3]>> {
+    use rayon::prelude::*;
+    assert_eq!(input.len(), width * height);
+    assert!(width > 4 && height > 4);
+    let input4: Vec<[f32; 4]> = input.par_iter().map(|&[r, g, b]| [r, g, b, 0.0]).collect();
+    let out_w = width - 4;
+    let out_h = height - 4;
+    let mut output = vec![[0.0f32; 4]; out_w * out_h];
+    with_runtime(|cl, runtime| {
+        let hl_prog = runtime.program(cl, include_str!("highlight.cl"))?;
+        let aa_prog = runtime.program(cl, program_source(4))?;
+        let in_bytes = size_of_val(input4.as_slice());
+        let out_bytes = size_of_val(output.as_slice());
+        let src = buffer(cl, runtime, 36, in_bytes, input4.as_ptr().cast_mut().cast())?;
+        let hl_out = buffer(cl, runtime, 1, in_bytes, null_mut())?;
+        let aa_out = buffer(cl, runtime, 1, out_bytes, null_mut())?;
+        {
+            let k = kernel(cl, hl_prog, c"highlight", &src, &hl_out)?;
+            argument(k.0, 2, &recovery)?;
+            enqueue(cl, runtime, &k, [input4.len(), 1])?;
+        }
+        {
+            let k = kernel(cl, aa_prog, c"anti_alias", &hl_out, &aa_out)?;
+            argument(k.0, 2, &(width as i32))?;
+            argument(k.0, 3, &aa_params)?;
+            enqueue(cl, runtime, &k, [out_w, out_h])?;
+        }
+        readback(cl, runtime, &aa_out, &mut output)
+    })?;
+    Ok(output.into_par_iter().map(|[r, g, b, _]| [r, g, b]).collect())
 }
 
 pub(crate) fn anti_alias(input: &[[f32; 3]], width: usize, height: usize, params: [f32; 2]) -> io::Result<Vec<[f32; 3]>> {
@@ -258,18 +373,16 @@ fn process_with_resources<S, T, R>(input: &[S], output: &mut [T], text: &'static
 
 fn with_runtime<T>(run: impl FnOnce(&Api, &mut Runtime) -> io::Result<T>) -> io::Result<T> {
     let cl = bindings()?;
-    RUNTIME.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(Runtime::new(cl)?);
-        }
-        let runtime = slot.as_mut().expect("OpenCL runtime initialized");
-        let result = run(cl, runtime);
-        if result.is_err() {
-            *slot = None;
-        }
-        result
-    })
+    let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(Runtime::new(cl)?);
+    }
+    let runtime = slot.as_mut().expect("OpenCL runtime initialized");
+    let result = run(cl, runtime);
+    if result.is_err() {
+        *slot = None;
+    }
+    result
 }
 
 fn buffer(cl: &Api, runtime: &Runtime, flags: u64, bytes: usize, host: Handle) -> io::Result<Resource> {

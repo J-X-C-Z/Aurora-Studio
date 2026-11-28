@@ -4,7 +4,7 @@
 //! on non-macOS instead of passing.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aurora_portrait::kernels::makeup;
 use aurora_portrait::metal::{MetalContext, SkinLutParams};
@@ -17,7 +17,7 @@ fn require_macos() {
 }
 
 fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metal_skin")
+    aurora_portrait::private_assets::path("fixtures/portrait/metal_skin").expect("needs private-assets/")
 }
 
 fn atlas(name: &str) -> Vec<u8> {
@@ -215,6 +215,7 @@ fn params_are_32_bytes() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn fixture_hashes_and_cpu_expected_match() {
     let root = fixture_root();
     for line in fs::read_to_string(root.join("SHA256SUMS")).unwrap().lines() {
@@ -239,6 +240,7 @@ fn fixture_hashes_and_cpu_expected_match() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn real_whiten_index5_is_fixed_153_not_float_154() {
     let whiten = atlas("whiten");
     let source = vec![

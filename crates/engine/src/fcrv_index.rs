@@ -176,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn bad_file_is_reported_not_fatal() {
         let dir = temp_dir("bad");
         std::fs::copy(
@@ -210,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn rows_are_sorted_by_name() {
         let dir = temp_dir("sort");
         let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/NikonZ6III-Auto.fcrv");
@@ -223,6 +225,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn bare_stem_sorts_before_its_variants() {
         let dir = temp_dir("variant");
         let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/NikonZ6III-Auto.fcrv");

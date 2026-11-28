@@ -73,8 +73,8 @@ pub const PF90004_PARSING_RGBA_CLASSES: [&[usize]; 4] = [
     &[9, 10],
 ];
 const PF90004_FACE_CLASSES: &[usize] = &[1];
-const WHITEN_PNG: &[u8] = include_bytes!("../../portrait/assets/portrait/teeth/Whiten.png");
-const BRIGHT_PNG: &[u8] = include_bytes!("../../portrait/assets/portrait/teeth/Bright.png");
+const WHITEN_PNG: Option<&[u8]> = aurora_portrait::private_asset!("portrait/teeth/Whiten.png");
+const BRIGHT_PNG: Option<&[u8]> = aurora_portrait::private_asset!("portrait/teeth/Bright.png");
 
 struct LutIdentity {
     source_file: &'static str,
@@ -861,7 +861,8 @@ fn required_face_roi(roi: Option<FaceParsingRoi>) -> Result<FaceParsingRoi> {
     roi.ok_or_else(|| anyhow::anyhow!("FaceParsingV2_NO_FACE_ROI"))
 }
 
-fn decode_lut(bytes: &[u8], identity: &LutIdentity) -> Result<Vec<u8>> {
+fn decode_lut(bytes: Option<&[u8]>, identity: &LutIdentity) -> Result<Vec<u8>> {
+    let bytes = bytes.with_context(|| format!("PF108 {} is not in this build (private-assets/)", identity.source_file))?;
     ensure!(
         bytes.len() == identity.png_bytes && sha256_32(bytes) == identity.png_sha256,
         "PF108 {} PNG identity mismatch",

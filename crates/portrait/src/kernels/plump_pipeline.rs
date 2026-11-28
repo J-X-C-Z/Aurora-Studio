@@ -328,6 +328,10 @@ pub struct ChannelMap {
 pub enum ColorEncoding {
     Unit,
     Byte,
+    /// Vendor `task2_6C344A0` / `0x06c27030`: RGB channels in `[-1, 1]` mapped via
+    /// `(x + 1.0) * 127.5` to `[0, 255]` (128.0 zero-point residual), and Sigmoid
+    /// channel 4 in `[0, 1]` scaled by `255.0` before the `> 1.0` threshold.
+    VendorResidualSignedUnit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,13 +472,20 @@ impl PlumpProducer {
                     let encoded = match encoding {
                         ColorEncoding::Unit => value.clamp(0.0, 1.0) * 255.0,
                         ColorEncoding::Byte => value.clamp(0.0, 255.0),
+                        ColorEncoding::VendorResidualSignedUnit => {
+                            ((value + 1.0) * 127.5).clamp(0.0, 255.0)
+                        }
                     };
                     color.bytes[rgba_at + channel] = encoded.round() as u8;
                 }
                 color.bytes[rgba_at + 3] = 255;
 
                 let split = bilinear_plane(split, output_w, output_h, sx, sy);
-                let raw = if split > 1.0 { split } else { 0.0 };
+                let split_domain = match encoding {
+                    ColorEncoding::VendorResidualSignedUnit => (split * 255.0).clamp(0.0, 255.0),
+                    ColorEncoding::Unit | ColorEncoding::Byte => split,
+                };
+                let raw = if split_domain > 1.0 { split_domain } else { 0.0 };
                 alpha_raw.bytes[at * 4..at * 4 + 4].copy_from_slice(&raw.to_le_bytes());
                 alpha_binary.bytes[at] = if raw > 0.0 { 255 } else { 0 };
             }

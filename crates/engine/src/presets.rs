@@ -885,6 +885,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn maps_a_bundled_exposure_preset() {
         let p = preset("Exposure compensation -1 fstop.copreset");
         assert_eq!(p.kind, PresetKind::Preset);
@@ -894,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn maps_a_bw_preset_onto_the_six_sensitivities() {
         let p = preset("Color - Panchromatic 1.copreset");
         assert!(p.adjustments.black_white.enabled);
@@ -959,6 +961,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn maps_a_bundled_style_curve_and_film_curve() {
         let p = preset("Fujicolor Pro 160C.costyle");
         assert_eq!(p.kind, PresetKind::Style);
@@ -987,6 +990,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn scans_the_bundled_folder_once() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/presets");
         let first = scan(&dir);
@@ -997,6 +1001,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_preset_can_be_applied_as_a_style() {
         let p = preset("Fujicolor Pro 160C.costyle");
         let base = AdjustmentSet::default();
@@ -1169,6 +1174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn saves_a_preset_that_reads_back_the_same() {
         let p = preset("Fujicolor Pro 160C.costyle");
         let dir = TempDir::new("preset");
@@ -1182,6 +1188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn every_real_preset_survives_a_round_trip() {
         let dir = TempDir::new("real");
         let mut checked = 0;
@@ -1249,6 +1256,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_saved_file_is_a_plain_sl_document() {
         let p = preset("Exposure compensation -1 fstop.copreset");
         let text = sl_text(&p);
@@ -1258,6 +1266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_saved_file_keeps_the_metadata_and_the_order() {
         let p = preset("Fujicolor Pro 160C.costyle");
         let text = sl_text(&p);
@@ -1276,6 +1285,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn an_edited_adjustment_is_written_out() {
         let mut p = preset("Exposure compensation -1 fstop.copreset");
         p.adjustments.exposure.contrast = 12.0;
@@ -1290,6 +1300,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_saved_preset_carries_every_mapped_key_of_a_bw_preset() {
         let p = preset("Color - Panchromatic 1.copreset");
         let dir = TempDir::new("bw");

@@ -13,10 +13,22 @@ mod c1_adaptive_gg;
 #[path = "c1_adaptive_opencl.rs"]
 mod c1_adaptive_opencl;
 #[cfg(windows)]
+#[path = "c1_cuda_pipeline.rs"]
+mod c1_cuda_pipeline;
+#[cfg(windows)]
 #[allow(unused_imports)]
 pub(crate) use c1_adaptive_opencl::anti_alias as anti_alias_opencl;
 #[cfg(windows)]
-pub(super) use c1_adaptive_opencl::{export_color, recover_highlights};
+pub(super) use c1_adaptive_opencl::{export_color, highlight_and_aa, recover_highlights, stage3_gg_highlight_aa};
+#[cfg(windows)]
+pub(super) use c1_cuda_pipeline::{
+    available as cuda_available, enabled as cuda_enabled, reconstruct_rgba16 as cuda_reconstruct_rgba16,
+    CudaPipelineInput,
+};
+/// Re-exported at the `aurora_raw` visibility the startup warmup needs; the
+/// module itself stays private to this subtree.
+#[cfg(windows)]
+pub(in crate::aurora_raw) use c1_cuda_pipeline::ptx_image as cuda_ptx_image;
 #[path = "c1_nikon_he.rs"]
 mod c1_nikon_he;
 #[path = "c1_stage1_direction.rs"]
@@ -51,8 +63,6 @@ pub use c1_nef_he::{NikonBlackLevels, NikonCrop, nikon_as_shot_rgb, nikon_black_
 pub use c1_nef_he::is_z6iii_nef;
 pub use c1_stage1_params::Stage1Params;
 pub use c1_stage3_params::Z6iiiStage3;
-use c1_nikon_he::{bayer_frame, bayer_prefix, dequantize, reconstruct_precinct};
-use nikon_he_bitstream::{Decoder, Weights};
 
 const PIH_PROFILE: [u8; 25] = [
     0, 0, 0, 16, 4, 4, 8, 18, 0x44, 0x10, 0x51, 0x14, 0x50, 0x88, 0x70, 0x83, 0xf0, 0x15, 0x23,
@@ -289,20 +299,50 @@ pub fn reconstruct_basic_roi(
         return Err(Error::new(ErrorKind::InvalidInput, "non-finite or invalid stage 1 parameters"));
     }
     let stride = area.width + 4;
-    let mut stage1 = Vec::with_capacity(stride * (area.height + 4));
     let cached = frame.stage1_plane.as_ref().filter(|(cached_params, _)| *cached_params == params
         && area.left >= 10 && area.top >= 10 && right + 10 <= frame.full_width && bottom + 10 <= frame.full_height);
+    if let Some((_, cached_plane)) = cached {
+        use rayon::prelude::*;
+        let black_offset = rgb_black.map_or(0.0f32, |b| -(b as f32));
+        let stage1_h = area.height + 4;
+        let mut stage1 = vec![[0.0f32; 3]; stride * stage1_h];
+        let full_w = frame.full_width;
+        let left0 = area.left - 2;
+        let top0 = area.top - 2;
+        stage1
+            .par_chunks_exact_mut(stride)
+            .enumerate()
+            .for_each(|(row_idx, dst_row)| {
+                let src_row = &cached_plane[(top0 + row_idx) * full_w + left0..][..stride];
+                for (dst, &[r, g, b, _]) in dst_row.iter_mut().zip(src_row) {
+                    *dst = [r + black_offset, g + black_offset, b + black_offset];
+                }
+            });
+        let mut stage2 = vec![[0.0f32; 3]; area.width * area.height];
+        stage2
+            .par_chunks_exact_mut(area.width)
+            .enumerate()
+            .for_each(|(row, dst_row)| {
+                let y = row + 2;
+                let odd_row = (area.top + row) % 2 != 0;
+                for (col, dst) in dst_row.iter_mut().enumerate() {
+                    let x = col + 2;
+                    let mut pixel = stage1[y * stride + x];
+                    if odd_row == ((area.left + col) % 2 != 0) {
+                        pixel[1] = c1_stage2_basic::refine_green_basic(&stage1, stride, x, y, odd_row);
+                    }
+                    *dst = pixel;
+                }
+            });
+        return Ok(stage2);
+    }
+    let mut stage1 = Vec::with_capacity(stride * (area.height + 4));
     let (plane, shift) = match &frame.adaptive_bayer {
         Some(filtered) => (filtered.as_slice(), 0),
         None => (frame.samples.as_slice(), 2),
     };
     for y in area.top - 2..bottom + 2 {
         for x in area.left - 2..right + 2 {
-            if let Some((_, cached)) = cached {
-                let [red, green, blue, _] = cached[y * frame.full_width + x];
-                stage1.push([red, green, blue]);
-                continue;
-            }
             let patch = std::array::from_fn(|row| {
                 let start = (y + row - 5) * frame.full_width + x - 5;
                 std::array::from_fn(|col| plane[start + col] << shift)
@@ -327,6 +367,29 @@ pub fn reconstruct_basic_roi(
         }
     }
     Ok(stage2)
+}
+
+/// Parallel Stage 2 scaled directly into `[f32; 4]` for the fused GPU Stage3+GG+HL+AA strip path.
+#[cfg(windows)]
+pub(super) fn reconstruct_stage2_scaled_f4(
+    frame: &NikonHeCropFrame,
+    area: NikonCrop,
+    params: Stage1Params,
+    rgb_black: i32,
+    scale: [f32; 3],
+) -> Result<Vec<[f32; 4]>> {
+    use rayon::prelude::*;
+    let support = NikonCrop {
+        left: area.left - 6,
+        top: area.top - 6,
+        width: area.width + 12,
+        height: area.height + 12,
+    };
+    let stage2 = reconstruct_basic_roi(frame, support, params, Some(rgb_black))?;
+    Ok(stage2
+        .into_par_iter()
+        .map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2], 0.0])
+        .collect())
 }
 
 /// Interior non-CA basic demosaic with the planar `_3` branch before optional finishing.
@@ -540,57 +603,14 @@ fn decode(nef: &[u8], first_slice_only: bool) -> Result<Option<(usize, Vec<u16>)
     let Some(strip) = find_he_strip(nef)? else {
         return Ok(None);
     };
-    let (mut rest, weights) = verified_profile(&strip)?;
-    let mut decoder = Decoder::new(Weights::from_wgt(weights)?);
-    let precinct_count = if first_slice_only {
-        17
-    } else {
-        strip.height / 4
-    };
-    let mut precincts = Vec::with_capacity(precinct_count);
-    for index in 0..precinct_count {
-        if index % 16 == 0 {
-            let slice = marker(&mut rest, 0x20)?;
-            if slice[4..] != ((index / 16) as u16).to_be_bytes() {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "unexpected HE slice index",
-                ));
-            }
-            decoder.reset_slice();
-        }
-        let precinct = decoder.decode_precinct(rest)?;
-        rest = &rest[precinct.bytes_consumed..];
-        let mut packets: [Vec<Vec<i32>>; 8] = std::array::from_fn(|_| Vec::new());
-        for (destination, packet) in packets.iter_mut().zip(precinct.packets) {
-            for band in packet.bands {
-                let mut coefficient_band = Vec::with_capacity(band.groups.len() * 4);
-                for group in band.groups {
-                    for coefficient in group.coeffs {
-                        coefficient_band.push(dequantize(
-                            coefficient.unsigned_abs(),
-                            coefficient < 0,
-                            group.nbits,
-                            band.gtli,
-                        )?);
-                    }
-                }
-                destination.push(coefficient_band);
-            }
-        }
-        precincts.push(reconstruct_precinct(strip.width / 2, &packets)?);
-    }
-    let bayer = if first_slice_only {
-        bayer_prefix(&precincts, 64)?
-    } else {
-        if !rest.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "extra HE payload after final precinct",
-            ));
-        }
-        bayer_frame(&precincts, strip.height)?
-    };
+    let (rest, weights) = verified_profile(&strip)?;
+    let bayer = c1_nikon_he::decode_he_bayer_parallel(
+        rest,
+        weights,
+        strip.width,
+        strip.height,
+        first_slice_only,
+    )?;
     Ok(Some((strip.width, bayer)))
 }
 

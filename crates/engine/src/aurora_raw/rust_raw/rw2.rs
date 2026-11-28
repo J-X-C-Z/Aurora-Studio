@@ -6,6 +6,8 @@
 //! to RawFormat `0x002d`.  `make_frame` produces the same tight Bayer plane
 //! shape as the other native RAW decoders.
 
+use rayon::prelude::*;
+
 use super::tiff::{Ifd, Tiff};
 use super::{make_frame, meta, NativeError, NativeResult};
 
@@ -117,7 +119,7 @@ pub(crate) fn decode(bytes: &[u8]) -> NativeResult<BayerFrame> {
     if bytes.get(..4) != Some(b"IIU\0") {
         return Err(NativeError::corrupt("not an RW2 container"));
     }
-    let tiff = Tiff::parse(bytes, 0)?;
+    let tiff = Tiff::parse_with_magic(bytes, 0, &[0x0055])?;
     let first = tiff.u32_at(4)?;
     let pana = find_pana_ifd(&tiff, first)?
         .ok_or_else(|| NativeError::corrupt("RW2 has no PanasonicRaw IFD"))?;
@@ -339,7 +341,9 @@ fn find_pana_ifd<'a>(tiff: &Tiff<'a>, first: u32) -> NativeResult<Option<Ifd<'a>
         }
         let ifd = tiff.ifd(offset)?;
         if let Some(entry) = ifd.entry(0x0001) {
-            if entry.typ == super::tiff::TYPE_LONG && entry.count == 1 {
+            if (entry.typ == super::tiff::TYPE_LONG && entry.count == 1)
+                || (entry.typ == super::tiff::TYPE_UNDEFINED && entry.count == 4)
+            {
                 *found = Some(ifd.clone());
                 return Ok(());
             }
@@ -453,15 +457,24 @@ fn decode_block_packed(
     bits: u8,
 ) -> NativeResult<Vec<u16>> {
     let count = width.checked_mul(height).ok_or_else(|| NativeError::corrupt("RW2 plane overflow"))?;
+    let samples_per_block = if bits == 12 { 10usize } else { 9usize };
+    let blocks_per_row = width.div_ceil(samples_per_block);
+    let row_bytes = blocks_per_row
+        .checked_mul(16)
+        .ok_or_else(|| NativeError::corrupt("RW2 row overflow"))?;
+    let total_bytes = height
+        .checked_mul(row_bytes)
+        .and_then(|total| offset.checked_add(total))
+        .ok_or_else(|| NativeError::corrupt("RW2 block stream overflow"))?;
+    if total_bytes > bytes.len() {
+        return Err(NativeError::corrupt("RW2 block is truncated"));
+    }
+    let src_plane = &bytes[offset..total_bytes];
     let mut plane = vec![0u16; count];
-    let mut at = offset;
-    for row in 0..height {
+    let decode_row = |row: usize, dst_row: &mut [u16]| {
+        let src_row = &src_plane[row * row_bytes..(row + 1) * row_bytes];
         let mut col = 0usize;
-        while col < width {
-            let block = bytes
-                .get(at..at + 16)
-                .ok_or_else(|| NativeError::corrupt("RW2 block is truncated"))?;
-            at += 16;
+        for block in src_row.chunks_exact(16) {
             let mut buf = [0u16; 10];
             let sample_count = if bits == 12 {
                 buf = decode_12bit_block(block);
@@ -470,12 +483,19 @@ fn decode_block_packed(
                 buf[..9].copy_from_slice(&decode_14bit_block(block));
                 9
             };
-            for &value in &buf[..sample_count] {
-                if col < width {
-                    plane[row * width + col] = value;
-                    col += 1;
-                }
-            }
+            let take = sample_count.min(width - col);
+            dst_row[col..col + take].copy_from_slice(&buf[..take]);
+            col += take;
+        }
+    };
+    if height >= 32 {
+        plane
+            .par_chunks_exact_mut(width)
+            .enumerate()
+            .for_each(|(row, dst_row)| decode_row(row, dst_row));
+    } else {
+        for (row, dst_row) in plane.chunks_exact_mut(width).enumerate() {
+            decode_row(row, dst_row);
         }
     }
     Ok(plane)
@@ -668,5 +688,31 @@ mod tests {
         let mut reader = ReverseBits::new(&bytes, 0);
         assert_eq!(reader.get(4).unwrap(), 0b0110);
         assert_eq!(reader.get(3).unwrap(), 0b101);
+    }
+
+    #[test]
+    fn parses_rw2_magic_header_and_parallel_blocks() {
+        let mut hdr = Vec::from(&b"IIU\0"[..]);
+        hdr.extend_from_slice(&8u32.to_le_bytes());
+        let tiff = Tiff::parse_with_magic(&hdr, 0, &[0x0055]).unwrap();
+        assert!(tiff.little);
+        assert_eq!(tiff.u32_at(4).unwrap(), 8);
+
+        // 40 rows x 18 cols (2 blocks per row) exercises the rayon parallel path.
+        let width = 18usize;
+        let height = 40usize;
+        let mut raw = vec![0u8; height * 2 * 16];
+        for row in 0..height {
+            for blk in 0..2 {
+                let base = (row * 2 + blk) * 16;
+                raw[base] = (row as u8).wrapping_add(blk as u8);
+            }
+        }
+        let plane = decode_block_packed(&raw, 0, width, height, 14).unwrap();
+        assert_eq!(plane.len(), width * height);
+        for row in 0..height {
+            assert_eq!(plane[row * width], row as u16);
+            assert_eq!(plane[row * width + 9], (row as u8).wrapping_add(1) as u16);
+        }
     }
 }

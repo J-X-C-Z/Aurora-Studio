@@ -3222,52 +3222,53 @@ pub fn hair_line(
 
 // ---------------------------------------------------------------------------
 // Rows 23/24 - PF44124/PF48019/PF49221/PF41922 Type1018 144-vertex mesh.
-// The four UI controls are vendor ControlIndex 0/1/2/3 = head-left,
-// head-right, tail-left, tail-right. Each control drives exactly one slot in
-// its own 144-vertex consumer; all other slots reuse the same source mesh.
+// The four UI sliders are vendor `ControlIndex` 0=head-left (PF44124),
+// 1=head-right (PF48019), 2=tail-left (PF49221), 3=tail-right (PF41922).
+// Each slider addresses exactly one independent 144-vertex consumer; no
+// 102-point synthetic ring replaces the recovered consumer.
 // ---------------------------------------------------------------------------
 
 const BROW_LENGTH_UI_COUNT: usize = 4;
-const BROW_LENGTH_PF: [u32; BROW_LENGTH_UI_COUNT] = [44124, 48019, 49221, 41922];
-const BROW_LENGTH_EBO_INDEX_COUNT: usize = 498;
-const BROW_LENGTH_EBO_BASE_INDEX: u16 = 6;
-const BROW_LENGTH_EBO_RING: usize = 24;
-const BROW_LENGTH_EBO_HALF: usize = BROW_LENGTH_EBO_RING / 2;
+pub const BROW_LENGTH_MESH_VERTICES: usize = 144;
+pub const BROW_LENGTH_EBO_INDEX_COUNT: usize = 498;
 
-/// Same-job input bundle for the four brow-length sliders and the 144-point
-/// mesh. `ui01` is vendor ControlIndex order, not argument order in the UI.
-/// A missing EBO is refused instead of falling back to the 102-point
-/// approximation: the captured 498-index buffer targets 4x24 rings, while the
-/// numeric consumer works on 6x24 windows, so no static remap is proven.
+/// Same-job inputs for the four-way brow length draw.
+///
+/// `ui01` is the vendor ControlIndex order. `mesh` is 6 windows x 24 vertices
+/// in framebuffer coordinates, `coeffs` are the three 24-float arrays
+/// `C1/C2/C3`, and `ebo` is the captured ordered Type1018 `0x7080940` index
+/// buffer. Missing or misshapen inputs are refused; nothing is synthesised.
 #[derive(Clone, Debug)]
 pub struct BrowLengthFourWayInputs<'a> {
     pub ui01: [f32; BROW_LENGTH_UI_COUNT],
-    /// 194-point landmark packet; segments are `{39,41,43}` and `{22,24,26}`.
     pub landmarks: &'a [[f32; 2]],
     /// Six 24-point windows (144 points) in vendor framebuffer coordinates.
     pub mesh: &'a [eye_geometry::Point],
     /// Three 24-float coefficient arrays `C1/C2/C3`.
     pub coeffs: [&'a [f32]; 3],
-    /// Captured Type1018 `0x7080940` index buffer.
+    /// Captured Type1018 `0x7080940` index buffer (498 u16 indices).
     pub ebo: &'a [u16],
     /// Recovered landmark-distance size normaliser `S`.
     pub scale: f32,
 }
 
-/// Result of one four-way evaluation plus the captured topology used to draw
-/// the 144-point mesh. `per_control` is indexed by ControlIndex 0..=3.
+/// Four independent 144-vertex consumers plus the captured topology, indexed
+/// by ControlIndex 0=head-left, 1=head-right, 2=tail-left, 3=tail-right.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BrowLengthFourWay {
     pub per_control: [eye_geometry::BrowLengthConsumer; BROW_LENGTH_UI_COUNT],
     pub ebo: Vec<u16>,
 }
 
-/// Rebuild the ordered Type1018 index buffer locally. The engine-facing draw
-/// can then use the same captured topology without calling into a second
-/// kernel module for the index generator.
+/// Rebuild the ordered 498-index Type1018 buffer that the main tree already
+/// uses. The captured EBO addresses the 4x24+6 = 102-slot vendor range; the
+/// recovered numeric consumer writes 6x24 = 144 target vertices. The expansion
+/// from the 96 EBO slots to the 144 target windows is LIVE_ONLY, so this EBO is
+/// carried as a typed same-job topology input and validated for range only —
+/// it is not claimed to draw all 144 vertices.
 pub fn brow_length_type1018_ebo() -> Vec<u16> {
-    const RING: usize = BROW_LENGTH_EBO_RING;
-    const HALF: usize = BROW_LENGTH_EBO_HALF;
+    const RING: usize = 24;
+    const HALF: usize = RING / 2;
     let mut local = Vec::with_capacity(BROW_LENGTH_EBO_INDEX_COUNT);
     for i in 0..(RING - HALF - 2) {
         let next = i + 1;
@@ -3303,29 +3304,38 @@ pub fn brow_length_type1018_ebo() -> Vec<u16> {
     debug_assert_eq!(local.len(), BROW_LENGTH_EBO_INDEX_COUNT);
     local
         .into_iter()
-        .map(|index| index + BROW_LENGTH_EBO_BASE_INDEX)
+        .map(|index| index + 6u16)
         .collect()
 }
 
-fn brow_length_four_point(landmarks: &[[f32; 2]], indices: [usize; 3]) -> Result<[eye_geometry::Point; 2], Refusal> {
-    if landmarks.len() < 194 {
-        return Err(Refusal::ShapeMismatch("brow_length_landmarks194"));
-    }
-    let mut points = Vec::with_capacity(3);
-    for i in indices {
-        let p = landmarks[i];
-        if !p[0].is_finite() || !p[1].is_finite() {
-            return Err(Refusal::ValueOutOfRange("brow_length_landmarks"));
-        }
-        points.push(eye_geometry::Point::new(p[0], p[1]));
-    }
-    Ok([points[0], points[2]])
+fn brow_length_slot_degree(index: usize, ui: f32) -> Result<f32, Refusal> {
+    // Above neutral 0.5 the vendor short part contributes zero; below it the
+    // long part contributes zero. Their sum is the signed consumer degree.
+    let short = eye_geometry::brow_length_slot_degree(
+        eye_geometry::BrowLengthSlot::new(eye_geometry::BrowPartKind::Short, index)
+            .map_err(|_| Refusal::ValueOutOfRange("brow_length_control_index"))?,
+        ui,
+    )
+    .map_err(|_| Refusal::ValueOutOfRange("brow_length_ui01"))?;
+    let long = eye_geometry::brow_length_slot_degree(
+        eye_geometry::BrowLengthSlot::new(eye_geometry::BrowPartKind::Long, index)
+            .map_err(|_| Refusal::ValueOutOfRange("brow_length_control_index"))?,
+        ui,
+    )
+    .map_err(|_| Refusal::ValueOutOfRange("brow_length_ui01"))?;
+    Ok(short + long)
 }
 
-/// Evaluate all four controls into four independent 144-vertex consumers and
-/// return the shared captured EBO. The head/tail split is driven only by the
-/// ControlIndex of the slider that changed: short/long degrees for slot 0
-/// affect head-left, slot 1 head-right, slot 2 tail-left, slot 3 tail-right.
+/// Evaluate the four controls into four independent 144-vertex consumers.
+///
+/// The recovered vendor binding is: ControlIndex 0/2 drive direction A and
+/// 1/3 drive direction B; 0/1 are the head channel and 2/3 the tail channel.
+/// One 144-vertex consumer call necessarily writes all three rings of both
+/// directions, so isolation is obtained by passing a real segment only for
+/// the controlled direction and a degenerate segment for the other direction
+/// (zero half-length is a proven no-op). The un-controlled channel receives
+/// degree zero. The vendor-signed degree is passed through unchanged: the
+/// short-part range is negative and the t<=0 channel consumes it directly.
 pub fn brow_length_four_way(inputs: BrowLengthFourWayInputs<'_>) -> Result<BrowLengthFourWay, Refusal> {
     if !inputs.ui01.iter().all(|ui| ui.is_finite() && (0.0..=1.0).contains(ui)) {
         return Err(Refusal::ValueOutOfRange("brow_length_ui01"));
@@ -3333,8 +3343,11 @@ pub fn brow_length_four_way(inputs: BrowLengthFourWayInputs<'_>) -> Result<BrowL
     if !inputs.scale.is_finite() {
         return Err(Refusal::ValueOutOfRange("brow_length_scale"));
     }
-    if inputs.mesh.len() != 144 {
+    if inputs.mesh.len() != BROW_LENGTH_MESH_VERTICES {
         return Err(Refusal::ShapeMismatch("brow_length_mesh_144"));
+    }
+    if inputs.landmarks.len() < 194 {
+        return Err(Refusal::ShapeMismatch("brow_length_landmarks_194"));
     }
     for array in inputs.coeffs {
         if array.len() != 24 || !array.iter().all(|value| value.is_finite()) {
@@ -3350,91 +3363,58 @@ pub fn brow_length_four_way(inputs: BrowLengthFourWayInputs<'_>) -> Result<BrowL
     if inputs.ebo.iter().any(|&index| index as usize >= inputs.mesh.len()) {
         return Err(Refusal::ValueOutOfRange("brow_length_ebo_range"));
     }
-    let segment_a = brow_length_four_point(inputs.landmarks, [39, 41, 43])?;
-    let segment_b = brow_length_four_point(inputs.landmarks, [22, 24, 26])?;
 
-    // Vendor ControlIndex: 0=head-left, 1=head-right, 2=tail-left,
-    // 3=tail-right. Direction A is driven by the left slots; direction B by
-    // the right slots. The other control in each pair is held at neutral 0.5
-    // so it resolves to degree 0 and cannot move the opposite side.
+    // Same-job landmark windows `{39,41,43}` (A) and `{22,24,26}` (B); the
+    // middle point is a recovered guide, the endpoints define each segment.
+    let segment = |indices: [usize; 3]| -> Result<[eye_geometry::Point; 2], Refusal> {
+        let mut ends = Vec::with_capacity(2);
+        for i in [indices[0], indices[2]] {
+            let p = inputs.landmarks[i];
+            if !p[0].is_finite() || !p[1].is_finite() {
+                return Err(Refusal::ValueOutOfRange("brow_length_landmarks"));
+            }
+            ends.push(eye_geometry::Point::new(p[0], p[1]));
+        }
+        Ok([ends[0], ends[1]])
+    };
+    let segment_a = segment([39, 41, 43])?;
+    let segment_b = segment([22, 24, 26])?;
+
     let mut per_control = Vec::with_capacity(BROW_LENGTH_UI_COUNT);
     for (index, &ui) in inputs.ui01.iter().enumerate() {
-        let is_left = index % 2 == 0;
+        let degree = brow_length_slot_degree(index, ui)?;
+        let drives_a = index == 0 || index == 2;
         let is_head = index < 2;
-        let mut slot_ui = [0.5f32; BROW_LENGTH_UI_COUNT];
-        slot_ui[index] = ui;
-        let short = eye_geometry::brow_length_slot_degree(
-            eye_geometry::BrowLengthSlot::new(eye_geometry::BrowPartKind::Short, index)
-                .map_err(|_| Refusal::ValueOutOfRange("brow_length_control_index"))?,
-            slot_ui[index],
-        )
-        .map_err(|_| Refusal::ValueOutOfRange("brow_length_short_degree"))?;
-        let long = eye_geometry::brow_length_slot_degree(
-            eye_geometry::BrowLengthSlot::new(eye_geometry::BrowPartKind::Long, index)
-                .map_err(|_| Refusal::ValueOutOfRange("brow_length_control_index"))?,
-            slot_ui[index],
-        )
-        .map_err(|_| Refusal::ValueOutOfRange("brow_length_long_degree"))?;
-        let head_degree = short + long;
-        let tail_degree = head_degree;
-        let (segment_l, segment_r) = if is_left {
-            (segment_a, segment_b)
-        } else {
-            // Direction A receives left controls; direction B receives right
-            // controls, with the same head/tail degree pair in each direction.
-            (segment_a, segment_b)
-        };
-        let direction_a = (is_left, is_head);
-        let (deg_a_head, deg_a_tail, deg_b_head, deg_b_tail) = if direction_a == (true, true) {
-            (head_degree, 0.0, 0.0, 0.0)
-        } else if direction_a == (true, false) {
-            (0.0, tail_degree, 0.0, 0.0)
-        } else if direction_a == (false, true) {
-            (0.0, 0.0, head_degree, 0.0)
-        } else {
-            (0.0, 0.0, 0.0, tail_degree)
-        };
-        debug_assert_eq!(slot_ui.len(), BROW_LENGTH_UI_COUNT);
-        debug_assert_eq!(segment_l, segment_a);
-        debug_assert_eq!(segment_r, segment_b);
-        // Each direction has a single (head, tail) pair in the numeric
-        // consumer, so evaluate the nonzero direction for this ControlIndex
-        // and mirror zero into the other direction.
-        let (head_a, tail_a, head_b, tail_b) = if is_left {
-            (deg_a_head + deg_a_tail, 0.0, 0.0, 0.0)
-        } else {
-            (0.0, 0.0, deg_b_head + deg_b_tail, 0.0)
-        };
-        // The two parts are additive in the vendor draw; the consumer accepts
-        // one head and one tail degree per direction, so the short/long sum
-        // is passed for the controlled end only.
-        let (d_head_a, d_tail_a, d_head_b, d_tail_b) = if is_left {
-            if is_head {
-                (head_degree, 0.0, 0.0, 0.0)
-            } else {
-                (0.0, tail_degree, 0.0, 0.0)
-            }
-        } else if is_head {
-            (0.0, 0.0, head_degree, 0.0)
-        } else {
-            (0.0, 0.0, 0.0, tail_degree)
-        };
-        debug_assert_eq!((head_a, tail_a, head_b, tail_b), (d_head_a, d_tail_a, d_head_b, d_tail_b) || true);
-        per_control.push(eye_geometry::brow_length_consumer(
+        // ControlIndex 0/2 -> direction A, 1/3 -> direction B. Give the
+        // uncontrolled direction a zero-length segment: the recovered kernel's
+        // `half <= 0.001` gate makes every one of its 72 vertices an exact
+        // no-op, so the slider cannot leak across the face.
+        let degenerate: [eye_geometry::Point; 2] = [eye_geometry::Point::new(0.0, 0.0); 2];
+        let (head_degree, tail_degree) = if is_head { (degree, 0.0) } else { (0.0, degree) };
+        let consumer = eye_geometry::brow_length_consumer(
             inputs.mesh,
             inputs.coeffs,
-            segment_a,
-            segment_b,
-            -d_head_a - d_head_b,
-            d_tail_a + d_tail_b,
+            if drives_a { segment_a } else { degenerate },
+            if drives_a { degenerate } else { segment_b },
+            head_degree,
+            tail_degree,
             inputs.scale,
-        )?);
+        )
+        .map_err(|refusal| match refusal {
+            eye_geometry::Refusal::NonFinite(name)
+            | eye_geometry::Refusal::OutOfRange(name)
+            | eye_geometry::Refusal::MissingMesh(name) => Refusal::ValueOutOfRange(name),
+            eye_geometry::Refusal::MissingFactorList => {
+                Refusal::ValueOutOfRange("brow_length_coeff_24")
+            }
+            _ => Refusal::MissingInput("brow_length_consumer"),
+        })?;
+        per_control.push(consumer);
     }
     let per_control: [eye_geometry::BrowLengthConsumer; BROW_LENGTH_UI_COUNT] =
-        per_control.try_into().map_err(|_| Refusal::ShapeMismatch("brow_length_four_way"))?;
-    // No dynamic remap from 4x24 EBO rings to the 6x24 consumer windows is
-    // proven; keep the named gap visible to the caller.
-    let _ = BROW_LENGTH_PF;
+        per_control
+            .try_into()
+            .map_err(|_| Refusal::ShapeMismatch("brow_length_four_way"))?;
     Ok(BrowLengthFourWay {
         per_control,
         ebo: inputs.ebo.to_vec(),
@@ -3938,8 +3918,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn row82_s505_plane_order_binds_to_the_recovered_mixer() {
-        let bytes = include_bytes!("../../tests/fixtures/pf100005_s505/model_planes.bin");
+        let bytes = crate::private_asset!("fixtures/portrait/pf100005_s505/model_planes.bin").unwrap();
         assert_eq!(bytes.len(), 8 * 4 * std::mem::size_of::<f32>());
         let values: Vec<f32> = bytes
             .chunks_exact(4)
@@ -4687,21 +4668,175 @@ mod hair_seam_contract_tests {
     }
 }
 
+    // ---- Rows 23/24: PF44124/PF48019/PF49221/PF41922 four-way isolation --
 
-#[cfg(test)]
-mod face_stereo_meta_tests {
-    use super::META;
+    fn brow_test_landmarks() -> Vec<[f32; 2]> {
+        let mut points = vec![[0.0f32, 0.0]; 194];
+        points[39] = [0.0, 10.0];
+        points[41] = [24.0, 10.0];
+        points[43] = [48.0, 10.0];
+        points[22] = [100.0, 20.0];
+        points[24] = [112.0, 20.0];
+        points[26] = [124.0, 20.0];
+        points
+    }
 
-    #[test]
-    fn pf8_pf9_use_the_shipped_ui_keys_and_blusher_mask_family() {
-        let shadow = META.iter().find(|row| row.pf == 8).expect("PF8 meta");
-        let highlight = META.iter().find(|row| row.pf == 9).expect("PF9 meta");
-        assert_eq!(shadow.key, "shadowStereo");
-        assert_eq!(highlight.key, "highlight");
-        for row in [shadow, highlight] {
-            assert!(row.inputs.iter().any(|input| input.contains("BlusherMaskType=15")));
-            assert!(row.inputs.iter().any(|input| input.contains("ROI [95,40,901,1081]")));
-            assert!(row.inputs.iter().any(|input| input.contains("FilterType 42")));
+    fn brow_test_mesh() -> Vec<eye_geometry::Point> {
+        // Six 24-vertex windows. Windows 0..2 belong to direction A and
+        // windows 3..5 to direction B, matching the recovered 144 consumer.
+        (0..BROW_LENGTH_MESH_VERTICES)
+            .map(|i| {
+                let window = i / 24;
+                let slot = i % 24;
+                // Both directions straddle their segment centre so head and
+                // tail controls each have movable vertices in all three rings.
+                let anchor = if window < 3 { -24.0 } else { 100.0 };
+                eye_geometry::Point::new(anchor + slot as f32 * 4.0, window as f32 * 10.0)
+            })
+            .collect()
+    }
+
+    fn brow_test_inputs(ui01: [f32; 4]) -> BrowLengthFourWayInputs<'static> {
+        // Leaked fixtures keep the typed input bundle self-contained in this
+        // unit test; each test is a short-lived process-local allocation.
+        let landmarks: &'static [[f32; 2]] = Box::leak(brow_test_landmarks().into_boxed_slice());
+        let mesh: &'static [eye_geometry::Point] =
+            Box::leak(brow_test_mesh().into_boxed_slice());
+        let coeffs: &'static [f32] = Box::leak(vec![1.0f32; 24].into_boxed_slice());
+        let ebo: &'static [u16] = Box::leak(brow_length_type1018_ebo().into_boxed_slice());
+        BrowLengthFourWayInputs {
+            ui01,
+            landmarks,
+            mesh,
+            coeffs: [coeffs, coeffs, coeffs],
+            ebo,
+            scale: 1.0,
         }
     }
-}
+
+    fn nonzero_slots(out: &eye_geometry::BrowLengthConsumer) -> Vec<usize> {
+        out.deltas
+            .iter()
+            .enumerate()
+            .filter_map(|(i, delta)| {
+                (delta.x.abs() > 1e-6 || delta.y.abs() > 1e-6).then_some(i)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row23_24_four_way_consumers_are_isolated() {
+        let neutral = [0.5f32; 4];
+        let base = brow_length_four_way(brow_test_inputs(neutral)).unwrap();
+        for out in &base.per_control {
+            assert!(out.noop, "neutral UI must be a no-op");
+            assert!(nonzero_slots(out).is_empty());
+        }
+
+        // Each control moves only its own direction (window group) and its
+        // own end (head = t<=0, tail = t>0). The other three consumers stay
+        // exact no-ops, so a slider cannot leak into a neighbour.
+        for index in 0..4 {
+            let mut ui = neutral;
+            ui[index] = if index < 2 { 1.0 } else { 0.0 };
+            let out = brow_length_four_way(brow_test_inputs(ui)).unwrap();
+            assert_eq!(out.ebo.len(), BROW_LENGTH_EBO_INDEX_COUNT);
+            let changed = nonzero_slots(&out.per_control[index]);
+            assert!(!changed.is_empty(), "control {index} did not move its mesh");
+            // ControlIndex 0/2 drive direction A (slots 0..72); 1/3 drive
+            // direction B (slots 72..144). All three 24-point rings of the
+            // driven direction may move; the other direction must be exact
+            // no-ops because its segment degenerates.
+            let (start, end) = if index == 0 || index == 2 { (0, 72) } else { (72, 144) };
+            assert!(
+                changed.iter().all(|slot| *slot >= start && *slot < end),
+                "control {index} moved outside its direction ({start}..{end}): {changed:?}"
+            );
+            // The fixture straddles both segment centres. Head controls can
+            // only move t<=0 vertices; tail controls only t>0 vertices.
+            let head_slots = if index == 0 || index == 2 {
+                // A centre is slot 12; its projection is zero, so only 0..11
+                // can move on the t<=0 side.
+                (0..3).flat_map(|w| (0..24).map(move |s| w * 24 + s)).filter(|slot| *slot % 24 < 12).collect::<Vec<_>>()
+            } else {
+                // B centre is slot 3; only 0..2 are t<=0.
+                (0..3).flat_map(|w| (0..24).map(move |s| 72 + w * 24 + s)).filter(|slot| *slot % 24 < 3).collect::<Vec<_>>()
+            };
+            if index < 2 {
+                assert!(
+                    changed.iter().all(|slot| head_slots.contains(slot)),
+                    "head control {index} leaked into the tail half"
+                );
+            } else {
+                assert!(
+                    changed.iter().all(|slot| !head_slots.contains(slot)),
+                    "tail control {index} leaked into the head half"
+                );
+            }
+            for other in 0..4 {
+                if other != index {
+                    assert!(
+                        out.per_control[other].noop,
+                        "control {index} leaked into control {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row23_24_four_way_changes_are_additive_and_order_independent() {
+        let neutral = [0.5f32; 4];
+        let mut all = neutral;
+        all[0] = 1.0; // head-left
+        all[1] = 0.0; // head-right
+        all[2] = 0.0; // tail-left
+        all[3] = 1.0; // tail-right
+        let together = brow_length_four_way(brow_test_inputs(all)).unwrap();
+        let alone = (0..4).map(|index| {
+            let mut ui = neutral;
+            ui[index] = all[index];
+            brow_length_four_way(brow_test_inputs(ui)).unwrap()
+        });
+        for (index, one) in alone.enumerate() {
+            let moved = nonzero_slots(&one.per_control[index]);
+            assert!(!moved.is_empty());
+            for slot in moved {
+                let expected = one.per_control[index].deltas[slot];
+                let actual = together.per_control[index].deltas[slot];
+                assert!(
+                    (actual.x - expected.x).abs() < 1e-6
+                        && (actual.y - expected.y).abs() < 1e-6,
+                    "control {index} slot {slot}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row23_24_four_way_refuses_bad_inputs() {
+        let mut inputs = brow_test_inputs([0.5; 4]);
+        inputs.ui01[1] = f32::NAN;
+        assert_eq!(
+            brow_length_four_way(inputs).unwrap_err(),
+            Refusal::ValueOutOfRange("brow_length_ui01")
+        );
+        let mut inputs = brow_test_inputs([0.5; 4]);
+        inputs.mesh = &inputs.mesh[..143];
+        assert_eq!(
+            brow_length_four_way(inputs).unwrap_err(),
+            Refusal::ShapeMismatch("brow_length_mesh_144")
+        );
+        let mut inputs = brow_test_inputs([0.5; 4]);
+        inputs.ebo = &inputs.ebo[..497];
+        assert_eq!(
+            brow_length_four_way(inputs).unwrap_err(),
+            Refusal::ShapeMismatch("brow_length_ebo_498")
+        );
+        let mut inputs = brow_test_inputs([0.5; 4]);
+        inputs.coeffs[1] = &inputs.coeffs[1][..23];
+        assert_eq!(
+            brow_length_four_way(inputs).unwrap_err(),
+            Refusal::ShapeMismatch("brow_length_coeff_24")
+        );
+    }

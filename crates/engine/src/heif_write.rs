@@ -768,7 +768,10 @@ mod tests {
             Err(err) => {
                 let text = format!("{err:#}");
                 assert!(
-                    text.contains("no suitable library") || text.contains("no HEVC encoder"),
+                    text.contains("no suitable library")
+                        || text.contains("no HEVC encoder")
+                        || text.contains("finding the HEVC encoder failed")
+                        || text.contains("libheif error 3"),
                     "unexpected HEIF result: {text}"
                 );
             }

@@ -214,6 +214,25 @@ fn all_eight_plump_rows_execute_one_same_job_group() {
 }
 
 #[test]
+fn empty_split_mask_with_unchanged_composite_is_not_ready() {
+    let source = frame();
+    let requested = [30_197];
+    let mut inputs = producer(&source, &requested);
+    let output = inputs.model_output.as_mut().unwrap();
+    output.tensor.data[12..].fill(1.0);
+    inputs.final_composite.as_mut().unwrap().frame = source.clone();
+
+    let outcome = portrait_plump_stage::apply(
+        &source,
+        &requested.into_iter().collect(),
+        None,
+        Some(TICKET),
+        Some(&inputs),
+    );
+    assert_eq!(outcome, Err(Refusal::MissingInput("FacePlump split-mask coverage")));
+}
+
+#[test]
 fn absent_model_output_or_final_composite_is_typed_refusal() {
     let source = frame();
     let requested = vec![30_191];
@@ -416,6 +435,30 @@ fn foreign_model_output_is_refused_by_session_identity() {
         Some(Refusal::ValueOutOfRange("model output session"))
     );
     assert_eq!(pixels, source.pixels);
+}
+
+#[test]
+fn legacy_normalized_plump_level_and_new_integer_choose_the_same_stage_output() {
+    let source = frame();
+    let requested = [30_210];
+    let masks = PortraitMasks::default();
+    let render = |stored: f32| {
+        let extra = BTreeMap::from([("pc:30210".to_owned(), stored)]);
+        let receipt = PortraitJobReceipt::from_renderer_receipt(&source.pixels, SIZE.0, SIZE.1, NormRect::FULL, &extra, &masks);
+        let owner = ProducerInputs { plump: Some(bind_ticket(producer(&source, &requested), receipt.job_id())), ..Default::default() };
+        let mut job = PortraitJobInputs::from_renderer_receipt(receipt, &masks);
+        job.fill_from_producer_inputs(&owner);
+        let mut pixels = source.pixels.clone();
+        let report = apply_portrait_effects_with_job(&mut pixels, SIZE.0, SIZE.1, NormRect::FULL, &extra, &job);
+        assert_eq!(report.effects.len(), 1);
+        assert!(report.effects[0].executed, "{:?}", report.effects[0]);
+        pixels
+    };
+    let current = render(4.0);
+    assert_ne!(current, source.pixels);
+    assert_eq!(render(0.9), current);
+    assert_eq!(portrait_plump_stage::full_face_descriptor_from_store(1.0), Ok(1.0));
+    assert!(full_face_descriptor_from_ui(0.9).is_err(), "only old documents use the normalized encoding");
 }
 
 #[test]

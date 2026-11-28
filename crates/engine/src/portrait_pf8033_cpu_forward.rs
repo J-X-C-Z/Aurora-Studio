@@ -29,8 +29,7 @@ pub const PF8033_FINAL_TENSOR_FILE: &str = "pf8033-780929437.f32le";
 pub const PF8033_DX_FILE: &str = "pf8033-dx.f32le";
 pub const PF8033_DY_FILE: &str = "pf8033-dy.f32le";
 pub const PF8033_MASK_FILE: &str = "pf8033-mask.u8";
-pub const PF8033_ARTIFACT_CACHE: &str =
-    r"C:\WorkSpace\Aurora Studio\90_work\build-cache\pf8033";
+pub const PF8033_ARTIFACT_CACHE: &str = "assets/portrait/smile";
 pub const PF8033_MODEL_WIDTH: u32 = 512;
 pub const PF8033_MODEL_HEIGHT: u32 = 512;
 pub const PF8033_FRAME_WIDTH: u32 = 1024;
@@ -214,12 +213,11 @@ impl Pf8033CpuForwardReceipt {
 
         let warp = object(&root, "warp", "PF8033 warp receipt")?;
         let preview = PathBuf::from(text(warp, "preview", "PF8033 warp preview path")?);
-        let preview_path = path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .map(|root| root.join(&preview))
+        // The receipt names the preview by its old repo path; it now lives
+        // next to the receipt in private-assets/.
+        let preview_path = preview
+            .file_name()
+            .map(|name| path.with_file_name(name))
             .unwrap_or_else(|| path.with_file_name(&preview));
         let preview_sha256 = fs::read(&preview_path)
             .map(|bytes| sha256(&bytes))
@@ -536,8 +534,7 @@ fn discover_receipt_path() -> Result<PathBuf, Refusal> {
     }
     let candidates = [
         PathBuf::from(PF8033_ARTIFACT_CACHE).join("pf8033-cpu-forward.json"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/portrait/smile/pf8033-cpu-forward.json"),
+        aurora_portrait::private_assets::path("portrait/smile/pf8033-cpu-forward.json").unwrap_or_default(),
         env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
@@ -749,10 +746,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn a1f_forward_receipt_pins_models_tensors_split_and_warp() {
-        let bytes = include_bytes!("../../../assets/portrait/smile/pf8033-cpu-forward.json");
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/portrait/smile/pf8033-cpu-forward.json");
+        let bytes = aurora_portrait::private_asset!("portrait/smile/pf8033-cpu-forward.json").unwrap();
+        let path = aurora_portrait::private_assets::path("portrait/smile/pf8033-cpu-forward.json").unwrap();
         let receipt = Pf8033CpuForwardReceipt::parse(path, bytes).unwrap();
         assert_eq!(receipt.job_id, 3_621_424_029_303_566_009);
         assert_eq!(

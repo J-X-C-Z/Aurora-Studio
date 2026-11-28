@@ -2,7 +2,7 @@
 //
 // The atlases are the shipped assets decoded exactly like
 // `processing::portrait_assets::load_lut_png` (PngDecoder -> into_rgb8), dumped
-// to work/backend-r11/o1i/{whiten,bright}.rgb by o1i/decode.
+// to private-assets/fixtures/portrait/teeth_gpu/{whiten,bright}.rgb.
 
 #[cfg(windows)]
 mod teeth_gpu {
@@ -11,8 +11,8 @@ mod teeth_gpu {
     use aurora_portrait::kernels::face_detail;
     use aurora_portrait::{Image, Refusal};
 
-    const WHITEN: &[u8] = include_bytes!("../../../work/backend-r11/o1i/whiten.rgb");
-    const BRIGHT: &[u8] = include_bytes!("../../../work/backend-r11/o1i/bright.rgb");
+    const WHITEN: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("fixtures/portrait/teeth_gpu/whiten.rgb"));
+    const BRIGHT: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("fixtures/portrait/teeth_gpu/bright.rgb"));
 
     #[derive(Clone)]
     struct Rng(u64);
@@ -96,6 +96,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn teeth_stage_matches_the_cpu_oracle_across_ui_combinations() {
         let Some(gpu) = gpu() else { return };
         for (width, height) in [(1u32, 1u32), (17, 13), (32, 24)] {
@@ -115,6 +116,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn zero_degree_and_mask_gate_are_honoured() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(17, 13, 41);
@@ -145,6 +147,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn bright_only_and_whiten_only_paths_both_match() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(9, 9, 47);
@@ -156,6 +159,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn bad_material_is_refused_before_launch() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(4, 4, 59);
@@ -179,6 +183,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn session_revalidates_the_source_before_upload() {
         let Some(gpu) = gpu() else { return };
         let session = gpu.session(4, 4, WHITEN, BRIGHT).unwrap();
@@ -209,6 +214,7 @@ mod teeth_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn ui_weight_rounding_has_no_1_byte_drift_on_full_mask_sweep() {
         let Some(gpu) = gpu() else { return };
         let source = canvas(16, 16, 71);

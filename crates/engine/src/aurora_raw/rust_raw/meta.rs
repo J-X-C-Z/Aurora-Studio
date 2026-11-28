@@ -5,6 +5,8 @@
 //! operation order, double precision, `f32` only at the end) so the resulting
 //! matrix is bit-identical when the camera matrix is known.
 
+use rayon::prelude::*;
+
 use super::{NativeError, NativeResult};
 
 /// Builds LibRaw's `filters` word from a CFA pattern.
@@ -78,20 +80,89 @@ pub(crate) fn unpack_bits_msb(raw: &[u8], bits: u8, count: usize) -> NativeResul
     if bits == 0 || bits > 16 {
         return Err(NativeError::unsupported(format!("sample depth {bits}")));
     }
-    let mut out = Vec::with_capacity(count);
     if bits == 16 {
-        if raw.len() < count * 2 {
+        if raw.len() < count.saturating_mul(2) {
             return Err(NativeError::corrupt("raw strip is shorter than its samples"));
         }
-        for chunk in raw.chunks_exact(2).take(count) {
-            out.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        let mut out = vec![0u16; count];
+        const PAR_THRESHOLD: usize = 65_536;
+        if count >= PAR_THRESHOLD {
+            out.par_chunks_mut(16_384).enumerate().for_each(|(chunk_idx, dst)| {
+                let src = &raw[chunk_idx * 32_768..];
+                for (slot, pair) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                    *slot = u16::from_be_bytes([pair[0], pair[1]]);
+                }
+            });
+        } else {
+            for (slot, pair) in out.iter_mut().zip(raw.chunks_exact(2)) {
+                *slot = u16::from_be_bytes([pair[0], pair[1]]);
+            }
         }
         return Ok(out);
     }
-    let total_bits = raw.len() * 8;
+    let total_bits = raw.len().saturating_mul(8);
     if count.saturating_mul(usize::from(bits)) > total_bits {
         return Err(NativeError::corrupt("raw strip is shorter than its samples"));
     }
+    if bits == 12 {
+        let mut out = vec![0u16; count];
+        let pairs = count / 2;
+        const PAR_PAIRS: usize = 32_768;
+        if pairs >= PAR_PAIRS {
+            out[..pairs * 2].par_chunks_mut(16_384).enumerate().for_each(|(chunk_idx, dst)| {
+                let src = &raw[chunk_idx * 24_576..];
+                for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(3)) {
+                    d[0] = (u16::from(s[0]) << 4) | (u16::from(s[1]) >> 4);
+                    d[1] = ((u16::from(s[1]) & 0x0f) << 8) | u16::from(s[2]);
+                }
+            });
+        } else {
+            for (d, s) in out[..pairs * 2].chunks_exact_mut(2).zip(raw.chunks_exact(3)) {
+                d[0] = (u16::from(s[0]) << 4) | (u16::from(s[1]) >> 4);
+                d[1] = ((u16::from(s[1]) & 0x0f) << 8) | u16::from(s[2]);
+            }
+        }
+        if count & 1 != 0 {
+            let b = pairs * 3;
+            out[count - 1] = (u16::from(raw[b]) << 4) | (u16::from(raw[b + 1]) >> 4);
+        }
+        return Ok(out);
+    }
+    if bits == 14 {
+        let mut out = vec![0u16; count];
+        let quads = count / 4;
+        const PAR_QUADS: usize = 16_384;
+        if quads >= PAR_QUADS {
+            out[..quads * 4].par_chunks_mut(16_384).enumerate().for_each(|(chunk_idx, dst)| {
+                let src = &raw[chunk_idx * 28_672..];
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(7)) {
+                    d[0] = (u16::from(s[0]) << 6) | (u16::from(s[1]) >> 2);
+                    d[1] = ((u16::from(s[1]) & 0x03) << 12) | (u16::from(s[2]) << 4) | (u16::from(s[3]) >> 4);
+                    d[2] = ((u16::from(s[3]) & 0x0f) << 10) | (u16::from(s[4]) << 2) | (u16::from(s[5]) >> 6);
+                    d[3] = ((u16::from(s[5]) & 0x3f) << 8) | u16::from(s[6]);
+                }
+            });
+        } else {
+            for (d, s) in out[..quads * 4].chunks_exact_mut(4).zip(raw.chunks_exact(7)) {
+                d[0] = (u16::from(s[0]) << 6) | (u16::from(s[1]) >> 2);
+                d[1] = ((u16::from(s[1]) & 0x03) << 12) | (u16::from(s[2]) << 4) | (u16::from(s[3]) >> 4);
+                d[2] = ((u16::from(s[3]) & 0x0f) << 10) | (u16::from(s[4]) << 2) | (u16::from(s[5]) >> 6);
+                d[3] = ((u16::from(s[5]) & 0x3f) << 8) | u16::from(s[6]);
+            }
+        }
+        let mut bit = quads * 4 * 14;
+        for slot in &mut out[quads * 4..] {
+            let byte = bit / 8;
+            let shift = bit % 8;
+            let window = (u32::from(raw.get(byte).copied().unwrap_or(0)) << 16)
+                | (u32::from(raw.get(byte + 1).copied().unwrap_or(0)) << 8)
+                | u32::from(raw.get(byte + 2).copied().unwrap_or(0));
+            *slot = ((window >> (24 - shift - 14)) & 0x3fff) as u16;
+            bit += 14;
+        }
+        return Ok(out);
+    }
+    let mut out = Vec::with_capacity(count);
     let mut bit = 0usize;
     let mask = (1u32 << bits) - 1;
     let width = usize::from(bits);
@@ -111,10 +182,24 @@ pub(crate) fn unpack_bits_msb(raw: &[u8], bits: u8, count: usize) -> NativeResul
 }
 
 pub(crate) fn unpack_bits_le16(raw: &[u8], count: usize) -> NativeResult<Vec<u16>> {
-    if raw.len() < count * 2 {
+    if raw.len() < count.saturating_mul(2) {
         return Err(NativeError::corrupt("raw strip is shorter than its samples"));
     }
-    Ok(raw.chunks_exact(2).take(count).map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])).collect())
+    let mut out = vec![0u16; count];
+    const PAR_THRESHOLD: usize = 65_536;
+    if count >= PAR_THRESHOLD {
+        out.par_chunks_mut(16_384).enumerate().for_each(|(chunk_idx, dst)| {
+            let src = &raw[chunk_idx * 32_768..];
+            for (slot, chunk) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                *slot = u16::from_le_bytes([chunk[0], chunk[1]]);
+            }
+        });
+    } else {
+        for (slot, chunk) in out.iter_mut().zip(raw.chunks_exact(2)) {
+            *slot = u16::from_le_bytes([chunk[0], chunk[1]]);
+        }
+    }
+    Ok(out)
 }
 
 // LibRaw_constants::xyz_rgb.
@@ -309,6 +394,39 @@ mod tests {
         let raw = [0x12, 0x34, 0x56, 0x78, 0x90];
         let unpacked = unpack_bits_msb(&raw, 12, 3).unwrap();
         assert_eq!(unpacked, [0x123, 0x456, 0x789]);
+    }
+
+    #[test]
+    fn unpacks_fourteen_bit_and_parallel_paths_bit_exact() {
+        // 14-bit: pack 70_003 samples (triggers parallel path + odd tail).
+        let count = 70_003usize;
+        let expected: Vec<u16> = (0..count).map(|i| ((i * 37 + 13) & 0x3fff) as u16).collect();
+        let mut raw = vec![0u8; (count * 14).div_ceil(8)];
+        let mut bit = 0usize;
+        for &v in &expected {
+            for b in (0..14).rev() {
+                if (v >> b) & 1 != 0 {
+                    raw[bit / 8] |= 1 << (7 - (bit % 8));
+                }
+                bit += 1;
+            }
+        }
+        assert_eq!(unpack_bits_msb(&raw, 14, count).unwrap(), expected);
+
+        // 12-bit: 70_001 samples (triggers parallel path + odd tail).
+        let count12 = 70_001usize;
+        let exp12: Vec<u16> = (0..count12).map(|i| ((i * 29 + 7) & 0x0fff) as u16).collect();
+        let mut raw12 = vec![0u8; (count12 * 12).div_ceil(8)];
+        for (i, pair) in exp12.chunks(2).enumerate() {
+            let b0 = pair[0];
+            let b1 = pair.get(1).copied().unwrap_or(0);
+            raw12[i * 3] = (b0 >> 4) as u8;
+            raw12[i * 3 + 1] = (((b0 & 0x0f) << 4) | (b1 >> 8)) as u8;
+            if i * 3 + 2 < raw12.len() {
+                raw12[i * 3 + 2] = (b1 & 0xff) as u8;
+            }
+        }
+        assert_eq!(unpack_bits_msb(&raw12, 12, count12).unwrap(), exp12);
     }
 
     #[test]

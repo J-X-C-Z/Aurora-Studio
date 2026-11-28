@@ -166,7 +166,8 @@ impl<'a> SourceService<'a> {
             }
             FlightRole::Leader(leader) => leader,
         };
-        let bytes = estimated_decode_bytes(width, height, format);
+        let (sensor, file_bytes, route) = raw_admission_inputs(&path);
+        let bytes = decode_admission_bytes((width, height), sensor, format, file_bytes, route.as_ref());
         let _permit = if heavy {
             let units = decode_units(bytes);
             engine.decode_gates.heavy.acquire(priority, units)
@@ -195,6 +196,7 @@ impl<'a> SourceService<'a> {
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
         // An EIP hides its RAW inside a ZIP; hand every decoder the member.
+        let decode_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Decode);
         let decoded_path = if is_eip(&path) {
             materialize_eip(&engine.root, &path).map_err(|err| format!("{err:#}"))?.raw
         } else {
@@ -265,6 +267,8 @@ impl<'a> SourceService<'a> {
         }
         // BandingSuppression is keyed on ISO and body; the stage stays off when
         // either is missing rather than falling back to a guessed amount.
+        drop(decode_span);
+        let source_build_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::SourceBuild);
         let banding_identity = crate::raw::is_raw(&decoded_path)
             .then(|| crate::exif::read_exif(&decoded_path))
             .map(|exif| raw_banding_identity(&exif));
@@ -291,6 +295,7 @@ impl<'a> SourceService<'a> {
             }
         }
         engine.store_cached_source(image, &path, Arc::clone(&source));
+        drop(source_build_span);
         Ok(source)
         })();
         let _ = match &decoded {
@@ -343,6 +348,23 @@ impl<'a> RenderService<'a> {
         adjustments: &AdjustmentSet,
         max_size: u32,
     ) -> anyhow::Result<RgbaImage> {
+        let thumb_key = if let Some(store) = &self.engine.store {
+            let st = self.engine.state.lock();
+            st.entries.iter().find(|e| e.info.id == image).map(|e| {
+                let mtime_ns = crate::aurora_store::file_mtime_ns(&e.path);
+                let adj_hash = crate::aurora_store::hash_adjustments(adjustments);
+                (store.clone(), e.rel_path.clone(), mtime_ns, adj_hash)
+            })
+        } else {
+            None
+        };
+
+        if let Some((ref store, ref rel_path, mtime_ns, adj_hash)) = thumb_key {
+            if let Some(cached) = store.thumb_cache().get(rel_path, max_size, mtime_ns, adj_hash) {
+                return Ok(cached);
+            }
+        }
+
         // Thumbnails queue behind the visible preview on the decode gate.
         let src = self.engine.source_with_priority(image, DecodePriority::Thumbnail)?;
         let out = process::render(
@@ -353,7 +375,11 @@ impl<'a> RenderService<'a> {
             false,
             None,
         );
-        Ok(RgbaImage::new(out.width, out.height, out.rgba))
+        let rgba = RgbaImage::new(out.width, out.height, out.rgba);
+        if let Some((store, rel_path, mtime_ns, adj_hash)) = thumb_key {
+            let _ = store.thumb_cache().put(&rel_path, max_size, mtime_ns, adj_hash, &rgba);
+        }
+        Ok(rgba)
     }
 
     pub(crate) fn thumbnail_job_snapshot(&self) -> crate::job_lifecycle::RegistrySnapshot {
@@ -385,12 +411,203 @@ impl<'a> RenderService<'a> {
         Some(warning)
     }
 
-    /// Cached preview frame; `fast` renders at half size and upsamples.
-    /// One lifecycle record per preview call, shared by `render_preview` and
-    /// `render_preview_fast`. This records that a render started and how it
-    /// ended; it is not a scheduler. Generation handling, latest-value policy
-    /// and the preview cache remain in [`Self::preview_frame_inner`] untouched.
+    /// Fast progressive first-frame preview for a cold RAW image. Returns `None`
+    /// immediately if the image is already cached in RAM/disk, is not a RAW, or
+    /// is a zoomed sub-region request.
+    pub(crate) fn quick_cold_raw_preview(&self, request: &PreviewRequest) -> Option<PreviewFrame> {
+        if request.region != NormRect::FULL {
+            return None;
+        }
+        if self.engine.cached_source(request.image).is_some() {
+            return None;
+        }
+        let path = {
+            let st = self.engine.state.lock();
+            st.entries
+                .iter()
+                .find(|entry| entry.info.id == request.image)
+                .map(|entry| entry.path.clone())?
+        };
+        // Last settled frame of this exact source/adjustment/size from a previous
+        // session or earlier visit. Placeholder only: the caller installs it
+        // behind the usual generation guard and the real render replaces it.
+        if let Some(disk) = crate::preview_disk::global() {
+            if let Some(frame) = self.disk_placeholder_with(disk, request, &path) {
+                return Some(frame);
+            }
+        }
+        if !crate::raw::is_raw(&path) || is_eip(&path) || is_cop(&path) {
+            return None;
+        }
+        if crate::raw_cache::has_cached_source16(&path, SOURCE_LONG_SIDE) {
+            return None;
+        }
+        let start = std::time::Instant::now();
+        let max_size = request.max_size.max(1);
+        let preview = crate::raw::quick_embedded_preview(&path, max_size).ok()?;
+        let (pw, ph) = preview.dimensions();
+        let long = pw.max(ph);
+        let resized = if long > max_size {
+            let scale = max_size as f32 / long as f32;
+            let nw = ((pw as f32 * scale).round() as u32).max(1);
+            let nh = ((ph as f32 * scale).round() as u32).max(1);
+            downscale_rgba(&preview, nw, nh)
+        } else {
+            preview
+        };
+        let (w, h) = resized.dimensions();
+        let adj = crate::styles::resolve(&request.adjustments);
+        if !request.bypass && !adj.is_default() {
+            let src = Source::from_rgba(w, h, resized.as_raw()).with_camera_preview(true);
+            let out = process::render_preview_bgra(
+                &src,
+                &adj,
+                NormRect::FULL,
+                max_size,
+                false,
+                request.mask_overlay,
+                true,
+                crate::scopes::ScopeWants::default(),
+            );
+            return Some(PreviewFrame {
+                image: RgbaImage::new(out.width, out.height, out.rgba),
+                histogram: out.histogram,
+                generation: request.generation,
+                elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+                degraded: None,
+                gamut_warning: None,
+                bgra: out.bgra,
+                scopes: None,
+            });
+        }
+        let mut pixels = resized.into_raw();
+        let mut red = vec![0u32; 256];
+        let mut green = vec![0u32; 256];
+        let mut blue = vec![0u32; 256];
+        let mut luma = vec![0u32; 256];
+        let mut shadows = 0u32;
+        let mut highlights = 0u32;
+        for px in pixels.chunks_exact_mut(4) {
+            let (r, g, b) = (px[0], px[1], px[2]);
+            red[r as usize] += 1;
+            green[g as usize] += 1;
+            blue[b as usize] += 1;
+            let l = ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8).min(255) as usize;
+            luma[l] += 1;
+            if r == 0 && g == 0 && b == 0 {
+                shadows += 1;
+            } else if r == 255 && g == 255 && b == 255 {
+                highlights += 1;
+            }
+            px[0] = b;
+            px[2] = r;
+        }
+        let total = (w * h).max(1) as f32;
+        Some(PreviewFrame {
+            image: RgbaImage::new(w, h, pixels),
+            histogram: crate::Histogram {
+                red,
+                green,
+                blue,
+                luma,
+                clipped_shadows: shadows as f32 / total,
+                clipped_highlights: highlights as f32 / total,
+            },
+            generation: request.generation,
+            elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            degraded: None,
+            gamut_warning: None,
+            bgra: true,
+            scopes: None,
+        })
+    }
+
+    /// Stored settled frame for `request`, shaped like a progressive first
+    /// frame. `None` unless nothing but the file, adjustments and size were
+    /// asked for: proofing and display conversion are not replayed here.
+    pub(crate) fn disk_placeholder_with(
+        &self,
+        disk: &crate::preview_disk::PreviewDisk,
+        request: &PreviewRequest,
+        path: &std::path::Path,
+    ) -> Option<PreviewFrame> {
+        if request.region != NormRect::FULL
+            || request.proof_profile.is_some()
+            || request.display_profile.is_some()
+        {
+            return None;
+        }
+        let start = Instant::now();
+        let adj = crate::styles::resolve(&request.adjustments);
+        let key = crate::preview_disk::DiskKey::new(
+            path,
+            &adj,
+            request.region,
+            request.max_size,
+            request.bypass,
+            request.mask_overlay,
+            false,
+        )?;
+        let hit = disk.lookup(&key)?;
+        let histogram = crate::processing::statistics::histogram(&hit.rgba);
+        Some(PreviewFrame {
+            image: RgbaImage::new(hit.width, hit.height, hit.rgba),
+            histogram,
+            generation: request.generation,
+            elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
+            degraded: None,
+            gamut_warning: None,
+            bgra: false,
+            scopes: None,
+        })
+    }
+
+    /// Persists a settled frame for later sessions. Only the exact full-frame,
+    /// final-quality render qualifies; the write runs on a background thread.
+    fn disk_store_final(&self, request: &PreviewRequest, adj: &AdjustmentSet, fast: bool, frame: &CachedFrame) {
+        if fast
+            || request.quality != RenderQuality::Final
+            || request.region != NormRect::FULL
+            || request.mask_overlay.is_some()
+        {
+            return;
+        }
+        let Some(disk) = crate::preview_disk::global() else { return };
+        let path = {
+            let st = self.engine.state.lock();
+            match st.entries.iter().find(|entry| entry.info.id == request.image) {
+                Some(entry) => entry.path.clone(),
+                None => return,
+            }
+        };
+        let Some(key) = crate::preview_disk::DiskKey::new(
+            &path,
+            adj,
+            request.region,
+            request.max_size,
+            request.bypass,
+            request.mask_overlay,
+            false,
+        ) else {
+            return;
+        };
+        crate::preview_disk::store_async(disk, key, frame.width, frame.height, Arc::clone(&frame.pixels));
+    }
+
     pub(crate) fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
+        self.preview_frame_scoped(request, fast, crate::scopes::ScopeWants::default())
+    }
+
+    /// [`Self::preview_frame`] that also asks the device for the selected viewer
+    /// scopes, taken from the pixels the returned frame carries. Frames that
+    /// cannot promise that (ICC conversion, cached pixels, post-8-bit stages)
+    /// come back with `scopes: None` so the caller counts on the CPU.
+    pub(crate) fn preview_frame_scoped(
+        &self,
+        request: &PreviewRequest,
+        fast: bool,
+        scopes: crate::scopes::ScopeWants,
+    ) -> anyhow::Result<PreviewFrame> {
         let engine = self.engine;
         // Keep the record map bounded across a drag: terminal records are
         // disposable, live ones are never pruned.
@@ -400,7 +617,10 @@ impl<'a> RenderService<'a> {
         }
         let jid = engine.preview_jobs.submit(JobScope::Preview, CancelToken::new());
         let _ = engine.preview_jobs.transition(jid, JobState::running(0.0));
-        let result = self.preview_frame_inner(request, fast);
+        let result = self.preview_frame_inner(request, fast, scopes);
+        if std::env::var_os("AURORA_PERF_REPLAY").is_some() {
+            eprintln!("AURORA_PERF {}", crate::compute::telemetry::perf_json());
+        }
         let _ = match &result {
             Ok(_) => engine.preview_jobs.transition(jid, JobState::Succeeded),
             Err(error) => engine.preview_jobs.transition(jid, JobState::failed(format!("{error:#}"))),
@@ -408,7 +628,12 @@ impl<'a> RenderService<'a> {
         result
     }
 
-    fn preview_frame_inner(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
+    fn preview_frame_inner(
+        &self,
+        request: &PreviewRequest,
+        fast: bool,
+        scopes: crate::scopes::ScopeWants,
+    ) -> anyhow::Result<PreviewFrame> {
         let engine = self.engine;
         let start = Instant::now();
         let perf = std::env::var_os("AURORA_PERF_REPLAY").is_some();
@@ -418,9 +643,8 @@ impl<'a> RenderService<'a> {
         {
             engine.state.lock().source_cache.active_preview = Some(request.image);
         }
-        // Draft and Final must keep the same output size: a lower draft cap made
-        // the preview jump when the pointer was released. Draft is cheaper
-        // because `fast` renders half size and upsamples, not because it is smaller.
+        // UI priority never changes the sampling grid. Only channel order and
+        // cache strategy may differ between an interactive and a settled frame.
         let max = request.max_size;
         let adj = crate::styles::resolve(&request.adjustments);
         let (src, source_kind) = match engine.native_raw_source(request.image, Some((&adj.geometry, request.region, max))) {
@@ -463,6 +687,14 @@ impl<'a> RenderService<'a> {
             && request.quality == RenderQuality::Draft
             && display_is_noop
             && request.proof_profile.is_none();
+        // Scopes are only trusted when nothing downstream rewrites the pixels:
+        // a display or proof conversion would make the device counts describe a
+        // frame the panel never shows.
+        let scopes = if display_is_noop && request.proof_profile.is_none() {
+            scopes
+        } else {
+            crate::scopes::ScopeWants::default()
+        };
         if direct_bgra {
             let out = process::render_preview_bgra(
                 &src,
@@ -472,6 +704,7 @@ impl<'a> RenderService<'a> {
                 request.bypass,
                 request.mask_overlay,
                 true,
+                scopes,
             );
             let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
             if perf {
@@ -495,6 +728,7 @@ impl<'a> RenderService<'a> {
                 degraded: intent_note,
                 gamut_warning: None,
                 bgra: out.bgra,
+                scopes: out.scopes,
             });
         }
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
@@ -539,7 +773,7 @@ impl<'a> RenderService<'a> {
                 .proof_profile
                 .as_deref()
                 .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
-            let (image, degraded) = engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+            let (image, degraded) = { let _display = crate::compute::telemetry::span(crate::compute::telemetry::Stage::DisplayConversion); engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering) };
             let degraded = degraded.or(intent_note);
             let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
             if perf {
@@ -554,9 +788,12 @@ impl<'a> RenderService<'a> {
                 degraded,
                 gamut_warning,
                 bgra: false,
+                // A cached frame carries pixels only; counting its scopes here
+                // would describe a different generation of the device state.
+                scopes: None,
             });
         }
-        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast);
+        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast, scopes);
         let frame = CachedFrame {
             width: out.width,
             height: out.height,
@@ -564,12 +801,13 @@ impl<'a> RenderService<'a> {
             histogram: out.histogram.clone(),
         };
         engine.state.lock().preview.insert(key, frame.clone());
+        self.disk_store_final(request, &adj, fast, &frame);
         let source = frame.into_image();
         let gamut_warning = request
             .proof_profile
             .as_deref()
             .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
-        let (image, degraded) = engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
+        let (image, degraded) = { let _display = crate::compute::telemetry::span(crate::compute::telemetry::Stage::DisplayConversion); engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering) };
         let degraded = degraded.or(intent_note);
         let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
         if perf {
@@ -584,6 +822,7 @@ impl<'a> RenderService<'a> {
             degraded,
             gamut_warning,
             bgra: false,
+            scopes: out.scopes,
         })
     }
 
@@ -1029,7 +1268,16 @@ impl<'a> ExportService<'a> {
             let exact = (entry.path.clone(), entry.adjustments.clone());
             (entry.info.clone(), #[cfg(all(windows, feature = "z6iii-raw-export"))] exact)
         };
-        let destination = job.recipe.destination.clone().unwrap_or_else(|| std::env::temp_dir().join("portrait-output"));
+        let destination = job.recipe.destination.clone().unwrap_or_else(|| {
+            render.0.path.parent().unwrap_or(&engine.root).join("Output")
+        });
+        // Only mark directories that *we create*. A pre-existing, user-owned
+        // folder called Output is still an ordinary library folder.
+        if job.recipe.destination.is_none() && std::fs::create_dir(&destination).is_ok() {
+            if let Err(err) = std::fs::write(destination.join(".aurora-export-dir"), b"aurora-export-v1\n") {
+                log::warn!("could not mark the default export directory: {err}");
+            }
+        }
         // Canonicalize and prove the destination is a folder before a single
         // pixel is rendered, so a bad recipe fails at `start_export` rather
         // than after minutes of work.
@@ -1105,103 +1353,53 @@ impl<'a> ExportService<'a> {
             // terminal first; the render still polls the token at its own safe
             // boundaries.
             let _ = registry.transition(jid, JobState::running(0.05));
+            // Owned publish handles, shared by the stages: the same gate, maps
+            // and registry the serial worker used, so the cancel/publish
+            // contract (gate -> maps -> registry) is unchanged.
+            let target = crate::export::PublishTarget {
+                job_id,
+                destination: dir.clone(),
+                registry: registry.clone(),
+                jid,
+                gate: Arc::clone(&publish_gate),
+                job_ids: Arc::clone(&job_ids),
+                outputs: Arc::clone(&outputs),
+                variant: info.variant as usize,
+                cancel: token.clone(),
+            };
             let result = (|| {
                 // Every format renders into a staging folder on the target's
                 // own volume. The finished file is synced and only then renamed
                 // to its final name, so cancel or failure never truncates (or
                 // touches) an existing output.
-                let staged = crate::output::StagedExport::new(&dir, job_id)?;
-                let written = (|| {
-                    #[cfg(all(windows, feature = "z6iii-raw-export"))]
-                    if let Some(exact) = exact {
-                        return exact.write(staged.dir(), &info, &job.recipe, || is_cancelled());
-                    }
-                    let (source, adjustments, max_size, recipe) = standard.expect("standard export source");
-                    // The full-resolution fallback is decoded here rather than in
-                    // `start_export`, after the scheduler permit and before any
-                    // render buffer is allocated. A decode failure reaches the
-                    // normal job-failure path below, so nothing is published.
-                    let src = match source {
-                        StandardExportSource::Ready(source) => source,
-                        StandardExportSource::FullRes(request) => Arc::new(request.decode()?),
-                    };
-                    // A rejected progress transition (the job went terminal
-                    // first) is intentionally ignored; progress is cosmetic and
-                    // must never overwrite a terminal state.
-                    if recipe.bit_depth == 16 {
-                        let out = process::render16(
-                            &src,
-                            &adjustments,
-                            NormRect::FULL,
-                            max_size,
-                            false,
-                        );
-                        crate::recipe::write_export16(
-                            staged.dir(),
-                            &info,
-                            &recipe,
-                            info.variant as usize,
-                            out.rgba,
-                            out.width,
-                            out.height,
-                            |p| {
-                                if !is_cancelled() {
-                                    let _ = registry.transition(jid, JobState::running(0.1 + 0.9 * p));
-                                }
-                            },
-                        )
-                    } else {
-                        let out = process::render(
-                            &src,
-                            &adjustments,
-                            NormRect::FULL,
-                            max_size,
-                            false,
-                            None,
-                        );
-                        crate::recipe::write_export(
-                            staged.dir(),
-                            &info,
-                            &recipe,
-                            info.variant as usize,
-                            out.rgba,
-                            out.width,
-                            out.height,
-                            |p| {
-                                if !is_cancelled() {
-                                    let _ = registry.transition(jid, JobState::running(0.1 + 0.9 * p));
-                                }
-                            },
-                        )
-                    }
-                })();
-                let written = written?;
-                // The gate makes the final cancel check and the publish one
-                // step: `cancel_job` takes the same gate, so a cancel that
-                // returns `true` happened before this publish and the job is
-                // dropped below; a publish that got here first records
-                // `Succeeded` under the gate and `cancel_job` then reports
-                // `false`. Lock order: gate -> maps -> registry. The registry
-                // holds no lock of its own across the publish's file I/O
-                // because each call below takes and releases it.
-                let _gate = publish_gate.lock();
-                if is_cancelled() {
-                    anyhow::bail!("cancelled");
+                #[cfg(all(windows, feature = "z6iii-raw-export"))]
+                if let Some(exact) = exact {
+                    // The RAW-exact specialization is one fused step (decode,
+                    // develop and write inside the Z6III pipeline). It keeps its
+                    // own staging folder and publishes through the shared gate.
+                    let staged = crate::output::StagedExport::new(&dir, job_id)?;
+                    let written = exact.write(staged.dir(), &info, &job.recipe, || is_cancelled())?;
+                    return crate::export::stages::publish_staged(&target, staged, &written, &token);
                 }
-                // A reused UI job id may already name a newer export; a stale
-                // worker must not publish into, or record output for, it.
-                if job_ids.lock().get(&job_id).copied() != Some(jid) {
-                    anyhow::bail!("export superseded by a newer job");
-                }
-                let output = staged.publish(&written)?;
-                outputs.lock().insert(job_id, output.clone());
-                if registry.transition(jid, JobState::Succeeded).is_err() {
-                    // The registry went terminal first; remove the path so a
-                    // late success is never exposed as `Done`.
-                    outputs.lock().remove(&job_id);
-                    anyhow::bail!("export finished after the job was cancelled");
-                }
-                Ok(output)
+                let (source, adjustments, max_size, recipe) = standard.expect("standard export source");
+                // Stage boundaries: the deferred full-resolution decode is
+                // stage 1, the develop is stage 2, encode + atomic publish is
+                // stage 3. The pipeline runs them on its lanes behind bounded
+                // queues; the serial mode runs the very same functions inline.
+                let prepared = crate::export::stages::PreparedExport {
+                    info: info.clone(),
+                    recipe,
+                    adjustments,
+                    max_size,
+                    source: match source {
+                        StandardExportSource::Ready(source) => crate::export::stages::SourceAcquire::Ready(source),
+                        StandardExportSource::FullRes(request) => {
+                            crate::export::stages::SourceAcquire::Deferred(Box::new(move || request.decode()))
+                        }
+                    },
+                    target,
+                };
+                crate::export::run_standard_export(prepared, job_id, &token)
             })();
             match result {
                 Ok(output) => {
@@ -1704,7 +1902,7 @@ impl SaveWriter for StoreSaveWriter {
 
     fn commit_index(&self) -> anyhow::Result<()> {
         let catalog = self.state.lock().catalog.clone();
-        self.store.save_index(&catalog)
+        self.store.save_index_db_only(&catalog)
     }
 }
 
@@ -2149,7 +2347,7 @@ impl<'a> ImportService<'a> {
                 let mut found = Vec::new();
                 collect(path, path, 0, &mut found)?;
                 files.extend(found.into_iter().map(|(_, path)| path));
-            } else if path.is_file() && is_supported(path) {
+            } else if path.is_file() && supports_photo_path(path) {
                 files.push(path.clone());
             }
         }

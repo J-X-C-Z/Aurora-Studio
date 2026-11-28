@@ -1,12 +1,12 @@
-# Aurora effect backend
+# Aurora portrait effect backend (`aurora-portrait`)
 
-`aurora-portrait` contains recovered effect math with explicit inputs. It has no
-GPUI dependency. The product exposes it through
-`aurora_core::processing::portrait`; `gpui-shell::portrait` preserves the existing
-RGBA8 bridge without duplicating the kernels.
+`aurora-portrait` contains recovered portrait effect math with explicit inputs.
+It has no GPUI dependency. The workspace crates `aurora-engine`
+(`crates/engine`) and `portrait-app` (`crates/app`) consume it directly without
+duplicating the kernels.
 
 ```rust
-use aurora_core::processing::portrait::{
+use aurora_portrait::{
     Image,
     kernels::mask_compose::{apply, MaskComposeMode},
 };
@@ -18,13 +18,10 @@ assert_eq!(output.pixel(0, 0), [50, 75, 100, 77]);
 
 Call a recovered family through its typed module API. `catalog()` lists the
 registered parameter flags and required inputs; a registry entry is not an
-automatic model, landmark detector, material loader, or UI binding. The existing
-document `UnconnectedProcessor` is still unconnected: it is not used to claim
-that an arbitrary document can now be rendered.
+automatic model, landmark detector, material loader, or UI binding.
 
 `catalog_json()` (or `cargo run -p aurora-portrait --example catalog_json`)
-exports the same registry as JSON for a host that configures effects from data;
-the current 146-row snapshot is `work/backend-r33/main/catalog.json`.
+exports the same registry as JSON for a host that configures effects from data.
 
 ## Initial recovered stages
 
@@ -45,8 +42,8 @@ are fixtures, not recovered product defaults.
 ## Validation
 
 ```text
-cargo test -p aurora-portrait -p aurora-processing -p aurora-core --lib --offline
-cargo check -p gpui-shell --offline
+cargo test -p aurora-portrait --locked -- --test-threads=1
+cargo check --workspace --all-targets --locked
 ```
 
 On a Windows machine with NVIDIA hardware, require actual CUDA execution when
@@ -54,8 +51,8 @@ running the embedded GPU checks rather than accepting an unavailable-driver
 skip:
 
 ```powershell
-$env:PIXCAKE_CUDA_REQUIRED = "1"
-cargo test -p aurora-portrait cuda:: --offline
+$env:PORTRAIT_CUDA_REQUIRED = "1"
+cargo test -p aurora-portrait --locked cuda:: -- --test-threads=1
 ```
 
 CPU tests establish Rust behavior against the supplied recovered fixtures.
@@ -100,8 +97,6 @@ dark-circle composition remains unresolved and its `Vendor` mode still refuses.
   dense smile warps. `cuda_smile::Smile::apply_pf8033` accepts explicit dense
   pixel displacements and a mask. Its shared kernel preserves the CPU
   truncating byte store and source alpha.
-  Evidence: `work/backend-r11/{o1,o1d,o1f,o1i,o1e,o1g,o1k,o1l,o1n}/VERIFY.json`.
-  Smile runtime evidence: `work/backend-r26/main/cuda-smile-tests.log`.
 - `metal::MetalContext`: macOS runtime Metal compilation and synchronous
   dispatch for the supplied P15, whitening and PF100007 smile sources. Smile
   compilation is cached on its first use through `MetalContext::smile`.
@@ -132,59 +127,46 @@ when reporting readiness; counting `ParamFlag` entries is not counting effects.
 
 ## Local assets
 
-`assets/portrait/skin-adjust/` carries the two 512x512 PNG LUT atlases named by
-the decrypted `SkinAdjust_PixCook` config (`WhitenPath`, `RuddyPath`) and the
-verbatim `SkinChooses` curve subset. `aurora_processing::portrait_assets`
-decodes them as encoded RGB8 (alpha dropped without premultiplication) and the
-manifest records the source digests. They are material inputs, not a skin mask,
-face ROI or UI-to-native mapping.
+Private third-party LUTs, meshes, and test fixtures are not stored in Git; see
+[`../../private-assets.md`](../../private-assets.md) for layout and checksum
+verification. When `private-assets/` is absent, tests that require those files
+are marked `ignored` (`needs private-assets/`).
+
+`private-assets/portrait/skin-adjust/` carries the two 512x512 PNG LUT atlases
+named by the `SkinAdjust_PixCook` config (`WhitenPath`, `RuddyPath`) and the
+`SkinChooses` curve subset. They are material inputs, not a skin mask, face ROI
+or UI-to-native mapping.
 
 The gloss values in that config are captured native percent (neutral 50), not
 the signed UI (neutral 0). No conversion between the two is fabricated.
 
-`crates/processing/tests/cuda_lut_asset.rs` runs those two real atlases through
-the NVIDIA stage and compares with the CPU oracle byte for byte on 1x1, 17x13
-and 64x37 frames at gate/0.5/1.0. Its mask is synthetic, so it proves the
-material path, not a portrait result. `crates/portrait/tests/metal_asset.rs`
-carries the same atlas as RGBA float32 for the macOS run and asserts the o3b
-LUT channel order offline.
+[`tests/cuda_lut.rs`](tests/cuda_lut.rs) runs the skin LUT atlases through the
+NVIDIA stage and compares with the CPU oracle byte for byte. Its mask is
+synthetic, so it proves the material path, not a portrait result.
+[`tests/metal_asset.rs`](tests/metal_asset.rs) carries the same atlas as RGBA
+float32 for the macOS run and asserts the LUT channel order offline.
 
-`assets/portrait/teeth/` carries the `TeethWhitenV3` pair (`Whiten.png`,
+`private-assets/portrait/teeth/` carries the `TeethWhitenV3` pair (`Whiten.png`,
 `Bright.png`) and the static 111x43 `toothMask.png`.
-`aurora_processing::portrait_assets::TeethLuts` applies whiten then bright through
-the PF108-110 kernel and keeps the source alpha. `TeethLuts::apply_parallel`
-splits four row bands: measured 3.27x at 512x512 and 3.39x at 1024x1024 with
-byte-identical output plus one band-copy of the frame; enable from
-`height >= 512`, keep small frames serial. `skin-adjust/curves.tsv` holds
-the 27 generated 74-sample HSLTuner curves derived from the nine real
-`SkinChooses` control sets. Verified: `HairColorUnify/effect.json` has no
-parameter table and no asset references, so PF30009 keeps its own explicit
-curves and must not default to these SkinAdjust presets. Only the shader shape
-(`HSLTuner.frag` with three 74-sample `GL_R32F` curves) is shared.
-Evidence for that split: `work/backend-r11/r11c/REPORT.md` and the generated
-curve inventory in `work/backend-r10/r7/`.
+`skin-adjust/curves.tsv` holds the 27 generated 74-sample HSLTuner curves
+derived from the nine `SkinChooses` control sets. Verified:
+`HairColorUnify/effect.json` has no parameter table and no asset references, so
+PF30009 keeps its own explicit curves and must not default to these SkinAdjust
+presets. Only the shader shape (`HSLTuner.frag` with three 74-sample `GL_R32F`
+curves) is shared.
 
-`assets/portrait/radiance/` carries the PF90004 tables (300/150 LUT rows, 16384
-gamma floats, 18 matrix floats) with a SHA256 manifest;
-`aurora_processing::portrait_assets::RadianceLuts` loads them and applies the
-recovered brightness + HSL passes in one call.
+`private-assets/portrait/radiance/` carries the PF90004 tables (300/150 LUT
+rows, 16384 gamma floats, 18 matrix floats) with a SHA256 manifest.
 
-`assets/portrait/smile/` carries the four real PF8033 meshes as little-endian
-float32 triples, their common 4269-triangle topology and the original decrypted
-config. `aurora_processing::smile_assets::SmileAssets` validates and loads the
-2206 vertices per mesh, then delegates morph and projected vertex displacements
-to this crate. The caller supplies the same-job projection matrix and selects
-the reshape explicitly. `face_pose::compose` converts the same-job face3d pose
-`p7`, the crop-to-image affine and the image size into that projection; its
-native SSE fixture matches within `1e-6`. `mesh_attribute::rasterize` then
-interpolates the per-vertex displacement over the real triangles into a
-per-pixel field, with an explicit screen domain and last-writer coverage.
-The field-to-warp degree composition and handedness stay caller decisions
-because the vendor convention is not proven.
-`SmileAssets::config` carries the recovered `Opacity` (`0.9`, applied as
-`effective_degree = degree * opacity`), `ErodeInterval` and
-`EnableFaceParsing`; `angle_allowed` implements the native `|yaw| < 45 deg`
-skip.
+`private-assets/portrait/smile/` carries the four PF8033 meshes as little-endian
+float32 triples, their common 4269-triangle topology and the config. The caller
+supplies the same-job projection matrix and selects the reshape explicitly.
+`face_pose::compose` converts the same-job face3d pose `p7`, the crop-to-image
+affine and the image size into that projection; its native SSE fixture matches
+within `1e-6`. `mesh_attribute::rasterize` then interpolates the per-vertex
+displacement over the real triangles into a per-pixel field, with an explicit
+screen domain and last-writer coverage. The field-to-warp degree composition and
+handedness stay caller decisions because the vendor convention is not proven.
 
 `kernels::texture_mask_blend` is the recovered `BlendMode_Texture_Normal`
 stage. Original and mask share the geometry UV; the effect texture keeps its
@@ -224,8 +206,3 @@ candidate share the same host-side gate and scale.
 2x3 affine (`Fit::FirstThree` or `Fit::LeastSquares`, no default) and the
 A/B edge gate (`A+B > 100`, `ratio > 0.14`). The mask the worker reads at
 `record+0xA8` has no static producer, so callers supply it.
-
-`aurora_processing::portrait_crypt` decodes stored effect resources (4-byte XOR,
-`x100`/`xall` tags, jump-table tail bytes); `portrait_assets` builds on it with
-`load_material`, `load_json`, `load_suit_presets` and `load_suit_material`,
-which refuses absolute paths and `..`.

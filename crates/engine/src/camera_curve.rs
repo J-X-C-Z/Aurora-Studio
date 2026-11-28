@@ -130,6 +130,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn both_exif_spellings_reach_the_same_curve() {
         let _serial = crate::filmcurve::test_lock();
         crate::filmcurve::use_dir(test_dir());
@@ -139,6 +140,7 @@ mod tests {
         assert!(packed.is_some(), "Z6III must resolve when the curve ships");
     }
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn parses_real_z6_3_curve() {
         let bytes = std::fs::read(test_dir().join("NikonZ6III-Auto.fcrv")).unwrap();
         let curves = parse_film_curves(&bytes).unwrap();
@@ -150,6 +152,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn real_z6_3_lut_is_monotonic() {
         let _serial = crate::filmcurve::test_lock();
         crate::filmcurve::use_dir(test_dir());
@@ -162,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn maps_z_series_models() {
         let _serial = crate::filmcurve::test_lock();
         crate::filmcurve::use_dir(test_dir());

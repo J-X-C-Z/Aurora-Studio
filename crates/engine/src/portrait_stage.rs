@@ -123,15 +123,28 @@ pub use portrait_body_stage::{
 #[path = "portrait_body_producer.rs"]
 mod portrait_body_producer;
 pub use portrait_body_producer::{
+    anchor_set_from_pose, attach_pose_six_point, six_point_job_from_pose, six_point_warp_from_pose,
     BodyGeometryProducerInputs, BodyLandmarkDomain, BodyLandmarkEffect, BodyLandmarkFrame,
-    BodyLandmarkRef,
+    BodyLandmarkRef, SixPointTargets,
 };
+#[path = "portrait_body_inputs.rs"]
+mod portrait_body_inputs;
+#[path = "portrait_body_mesh.rs"]
+mod portrait_body_mesh;
+#[path = "portrait_body_fields.rs"]
+mod portrait_body_fields;
+#[path = "portrait_body_warp.rs"]
+mod portrait_body_warp;
+pub(crate) use portrait_body_producer::{apply_live_body, has_live_body_request};
+#[cfg(test)]
+#[path = "portrait_body_live_tests.rs"]
+mod portrait_body_live_tests;
 
 #[path = "portrait_plump_stage.rs"]
 mod portrait_plump_stage;
 pub use portrait_plump_stage::{
     PLUMP_PFS, PlumpCompositeReceipt, PlumpFinalComposite, PlumpGroupRun, PlumpProducerInputs,
-    full_face_descriptor_from_ui, PlumpSameFrameEvidence, PLUMP_LANDMARK_COUNT,
+    full_face_descriptor_from_store, full_face_descriptor_from_ui, PlumpSameFrameEvidence, PLUMP_LANDMARK_COUNT,
 };
 
 #[path = "portrait_plump_onnx.rs"]
@@ -187,6 +200,11 @@ mod plump_stage_tests;
 #[cfg(test)]
 #[path = "portrait_body_stage_tests.rs"]
 mod body_geometry_stage_tests;
+
+/// PF108 family gate: `pc:108` + `pc:109` + `pc:110` are one job.
+#[cfg(test)]
+#[path = "portrait_pf108_family_tests.rs"]
+mod pf108_family_tests;
 
 
 #[cfg(test)]
@@ -490,6 +508,8 @@ pub enum PortraitBackend {
     Cuda,
     /// A macOS Metal compute pipeline produced the row's pixels.
     Metal,
+    /// A WGPU/Vulkan compute pipeline produced the row's pixels.
+    Wgpu,
     Skipped,
 }
 
@@ -670,6 +690,16 @@ impl PortraitRunReport {
         if base != PortraitRuntimeStatus::IncompleteInput {
             return base;
         }
+        // A body row needs a same-job geometry payload, not a face model. When
+        // no face producer ran its own refusal still names the caller gap, so
+        // the face-input fold below must not relabel it as a missing model.
+        if let Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(name))) =
+            &effect.skip_reason
+        {
+            if name.starts_with("body geometry") {
+                return PortraitRuntimeStatus::IncompleteInput;
+            }
+        }
         if let Some(refusal) = &self.face_input_refusal {
             return refusal_runtime_status(refusal);
         }
@@ -845,6 +875,11 @@ impl Pf101ProducerInputs {
             material_uv,
             params,
         })
+    }
+
+    /// The exact paired textures and per-pixel UVs consumed by this draw.
+    pub(crate) fn coverage_inputs(&self) -> (&Image, &[[f32; 2]], &Image, &[[f32; 2]]) {
+        (&self.face_mask, &self.mask_uv, &self.material, &self.material_uv)
     }
 
     pub fn apply(
@@ -2986,8 +3021,9 @@ impl ProducerInputs {
     }
 }
 
-/// PF108 same-job inputs. `pc:108` supplies the common UI fraction; the other
-/// two controls remain explicit fields because no UI-to-native fallback exists.
+/// PF108 same-job inputs. `pc:108` supplies the common UI fraction; `pc:109`
+/// and `pc:110` reach this struct through [`pf108_ui_percents`], which is the
+/// one derivation both the renderer and the dispatcher read.
 #[derive(Clone, Copy, Debug)]
 pub struct TeethInputs<'a> {
     pub job_id: u64,
@@ -3001,6 +3037,105 @@ pub struct TeethInputs<'a> {
     pub mask_g: &'a [u8],
     pub bright_ui: f32,
     pub deyellow_ui: f32,
+}
+
+/// Registry key of PF108's `common_ui` control: it scales the id2.G support
+/// plane, so it is the mask weight every other PF108 control multiplies.
+pub const PF108_COMMON_PC: u32 = 108;
+pub const PF108_COMMON_KEY: &str = "pc:108";
+/// PF108's Bright-LUT control. A child of `pc:108`, never an effect row.
+pub const PF108_BRIGHT_KEY: &str = "pc:109";
+/// PF108's de-yellow-LUT control. A child of `pc:108`, never an effect row.
+pub const PF108_DEYELLOW_KEY: &str = "pc:110";
+/// The legacy document stored only `pc:108`, and both sibling LUTs ran at 70 %
+/// then; that document shape is the only one where a fabricated sibling value
+/// still reproduces the old frame.
+pub const PF108_LEGACY_SIBLING_DEFAULT01: f32 = 0.7;
+
+/// One document's PF108 controls, in the registry's normalized `0..=1` domain.
+///
+/// `teeth_whitening` builds its support mask as `common * child`
+/// (`kernels/face_detail.rs`: `dz = common * deyellow`, `ea = common * bright`),
+/// so an absent parent leaves the mask product at zero and the kernel returns
+/// `NoEffect`. A document that drives a child alone therefore resolves to
+/// `common01 = 1.0`, and the sibling stays at `0.0` so one child can never drag
+/// the other LUT up to the legacy 70 %.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pf108Family {
+    pub common01: f32,
+    pub bright01: f32,
+    pub deyellow01: f32,
+}
+
+impl Pf108Family {
+    /// `false` means PF108 is not scheduled at all: either nothing is set, or
+    /// the resolved mask product is zero for both children.
+    pub fn is_active(&self) -> bool {
+        self.common01 > 0.0 && (self.bright01 > 0.0 || self.deyellow01 > 0.0)
+    }
+
+    /// The Bright-LUT percentage the same-job producer must attach.
+    pub fn bright_ui(&self) -> f32 {
+        self.bright01 * 100.0
+    }
+
+    /// The de-yellow-LUT percentage the same-job producer must attach.
+    pub fn deyellow_ui(&self) -> f32 {
+        self.deyellow01 * 100.0
+    }
+}
+
+/// Resolves the three PF108 controls from `AdjustmentSet::extra`.
+///
+/// Every control that is present must be finite and inside the registry range
+/// (`0..=1`); a malformed value is a refusal, never a silent clamp, and never a
+/// neutral fallback that would let a fake input look executed.
+pub fn pf108_family(extra: &BTreeMap<String, f32>) -> Result<Pf108Family, Refusal> {
+    let read = |key: &'static str, name: &'static str| -> Result<Option<f32>, Refusal> {
+        let Some(&value) = extra.get(key) else {
+            return Ok(None);
+        };
+        check_degree01(value, name)?;
+        Ok(Some(value))
+    };
+    let common = read(PF108_COMMON_KEY, "PF108 common UI")?;
+    let bright = read(PF108_BRIGHT_KEY, "PF108 bright UI")?;
+    let deyellow = read(PF108_DEYELLOW_KEY, "PF108 de-yellow UI")?;
+    let parent_drives = common.is_some_and(|value| value > 0.0);
+    // The legacy 70 % only describes the old document shape: `pc:108` stored
+    // and neither sibling stored. One stored sibling means the document already
+    // speaks the three-control language, so its missing sibling stays at 0.
+    let (bright01, deyellow01) = if parent_drives && bright.is_none() && deyellow.is_none() {
+        (
+            PF108_LEGACY_SIBLING_DEFAULT01,
+            PF108_LEGACY_SIBLING_DEFAULT01,
+        )
+    } else {
+        (bright.unwrap_or(0.0), deyellow.unwrap_or(0.0))
+    };
+    let child_drives = bright01 > 0.0 || deyellow01 > 0.0;
+    let common01 = if parent_drives {
+        common.unwrap_or(0.0)
+    } else if child_drives {
+        // `mask = common * child`: a child-only document needs the full common
+        // weight, or the kernel sees `dz == ea == 0` and stays `NoEffect`.
+        1.0
+    } else {
+        0.0
+    };
+    Ok(Pf108Family {
+        common01,
+        bright01,
+        deyellow01,
+    })
+}
+
+/// The `(bright, de-yellow)` percentages the PF108 producer must attach for one
+/// document. Preview and export both read this, so the producer planes and the
+/// dispatcher's `common_ui` come from the same control set.
+pub fn pf108_ui_percents(extra: &BTreeMap<String, f32>) -> Result<(f32, f32), Refusal> {
+    let family = pf108_family(extra)?;
+    Ok((family.bright_ui(), family.deyellow_ui()))
 }
 
 /// PF30026 final-blend inputs from one worker job.
@@ -4279,6 +4414,16 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     117,    // Eyebrow color makeup, right
     118,    // Lower eyelash color makeup
     30007,  // Lower eyeliner color makeup
+    0,      // PF0 Spotless (skin+face mask, local blur; vendor blur FBO LIVE_ONLY)
+    90085,  // PF90085 face skin-tone unify (reduced mask blend)
+    21104,  // PF21104 nose flaws repair
+    30188,  // PF30188 double-chin degree
+    30189,  // PF30189 double-chin shadow
+    30209,  // PF30209 jawline enhance
+    90001,  // PF90001 texture smooth skin
+    90003,  // PF90003 body skin tone uniform
+    90087,  // PF90087 hair parting fill
+    100005, // PF100005 eye white purify
 ];
 
 /// Effect ids the Windows bridge can currently run from a frame, a mask and
@@ -4353,16 +4498,32 @@ fn face_mesh_group(pf: u32) -> Option<FaceMeshGroup> {
             left: 8029,
             right: 8030,
         }),
+        8050 | 8051 => Some(FaceMeshGroup {
+            left: 8050,
+            right: 8051,
+        }),
         _ => None,
     }
 }
 
-const FACE_WIDTH_PARTS: &[u8] =
-    include_bytes!("../../portrait/assets/portrait/face-width/parts.f32le");
-const FOREHEAD_PARTS: &[u8] =
-    include_bytes!("../../portrait/assets/portrait/forehead/parts.f32le");
-const FACE_RESHAPE_PARTS: &[u8] =
-    include_bytes!("../../portrait/assets/portrait/face-reshape/parts.f32le");
+const FACE_WIDTH_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/face-width/parts.f32le");
+const FOREHEAD_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/forehead/parts.f32le");
+const FACE_RESHAPE_PARTS: Option<&[u8]> = aurora_portrait::private_asset!("portrait/face-reshape/parts.f32le");
+
+/// Use the same decoded part tables as the corresponding renderer. Resolve
+/// each immutable embedded asset once; unrelated controls do not need it.
+pub(crate) fn face_part_table_ready(pf: u32) -> Option<bool> {
+    static SHAPE: OnceLock<bool> = OnceLock::new();
+    static FOREHEAD: OnceLock<bool> = OnceLock::new();
+    static WIDTH: OnceLock<bool> = OnceLock::new();
+    Some(match face_mesh_group(pf)?.left {
+        242 | 8023 | 8027 | 8029 => *SHAPE.get_or_init(|| builtin_face_reshape_parts().is_ok()),
+        30080 | 30082 => *FOREHEAD.get_or_init(|| builtin_forehead_parts().is_ok()),
+        30092 => *WIDTH.get_or_init(|| builtin_face_width_parts().is_ok()),
+        8050 => true,
+        _ => false,
+    })
+}
 
 struct FaceReshapePartData {
     part: u8,
@@ -4371,7 +4532,7 @@ struct FaceReshapePartData {
 }
 
 fn builtin_face_reshape_parts() -> Result<Vec<FaceReshapePartData>, Refusal> {
-    let bytes = FACE_RESHAPE_PARTS;
+    let bytes = FACE_RESHAPE_PARTS.ok_or(Refusal::MissingInput("private-assets/portrait/face-reshape/parts.f32le"))?;
     if bytes.len() < 4 {
         return Err(Refusal::ShapeMismatch("face reshape parts header"));
     }
@@ -4555,7 +4716,7 @@ struct ForeheadPartData {
 }
 
 fn builtin_forehead_parts() -> Result<Vec<ForeheadPartData>, Refusal> {
-    let mut bytes = FOREHEAD_PARTS;
+    let mut bytes = FOREHEAD_PARTS.ok_or(Refusal::MissingInput("private-assets/portrait/forehead/parts.f32le"))?;
     let mut parts = Vec::with_capacity(4);
     while !bytes.is_empty() {
         if bytes.len() < 544 {
@@ -4593,7 +4754,7 @@ struct FaceWidthPartData {
 }
 
 fn builtin_face_width_parts() -> Result<Vec<FaceWidthPartData>, Refusal> {
-    let mut bytes = FACE_WIDTH_PARTS;
+    let mut bytes = FACE_WIDTH_PARTS.ok_or(Refusal::MissingInput("private-assets/portrait/face-width/parts.f32le"))?;
     let mut parts = Vec::with_capacity(4);
     while !bytes.is_empty() {
         if bytes.len() < 220 {
@@ -4661,6 +4822,106 @@ fn type1015_landmarks(
     Ok((contour, to_point(points194[54])))
 }
 
+fn sample_bilinear_rgba_u8(image: &Image, x: f32, y: f32) -> [u8; 4] {
+    let w = image.width as i32;
+    let h = image.height as i32;
+    if w <= 0 || h <= 0 {
+        return [0, 0, 0, 255];
+    }
+    let cx = x.clamp(0.0, (w - 1) as f32);
+    let cy = y.clamp(0.0, (h - 1) as f32);
+    let x0 = cx.floor() as i32;
+    let y0 = cy.floor() as i32;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = cx - x0 as f32;
+    let fy = cy - y0 as f32;
+    let at = |px: i32, py: i32| -> usize { (py as usize * image.width as usize + px as usize) * 4 };
+    let i00 = at(x0, y0);
+    let i10 = at(x1, y0);
+    let i01 = at(x0, y1);
+    let i11 = at(x1, y1);
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        let p00 = f32::from(image.pixels[i00 + c]);
+        let p10 = f32::from(image.pixels[i10 + c]);
+        let p01 = f32::from(image.pixels[i01 + c]);
+        let p11 = f32::from(image.pixels[i11 + c]);
+        let top = p00 + (p10 - p00) * fx;
+        let bot = p01 + (p11 - p01) * fx;
+        out[c] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// PF8050/PF8051 overall eye size: smooth radial scale around the 194-point left/right eye centers.
+fn apply_eye_overall_size(
+    source: &Image,
+    points194: &[[f32; 2]],
+    controls: [f32; 2],
+) -> FaceMeshStageResult {
+    if points194.len() != 194 || points194.iter().flatten().any(|v| !v.is_finite()) {
+        return face_mesh_refused(Refusal::MissingInput("PF8050 194 landmarks"), None);
+    }
+    let norm = |v: f32| -> f32 {
+        let s = if v.abs() > 1.0 { v / 100.0 } else { v };
+        s.clamp(-1.0, 1.0)
+    };
+    let s_left = norm(controls[0]) * 0.25;
+    let s_right = norm(controls[1]) * 0.25;
+    if s_left.abs() < 1e-6 && s_right.abs() < 1e-6 {
+        return FaceMeshStageResult {
+            image: None,
+            backend: PortraitBackend::Skipped,
+            dispatches: Vec::new(),
+            fallback_reason: None,
+            refusal: None,
+        };
+    }
+    let dist = |a: [f32; 2], b: [f32; 2]| -> f32 { ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt() };
+    let eyes = [
+        (points194[26], (dist(points194[18], points194[22]) * 1.15).max(8.0), s_left),
+        (points194[44], (dist(points194[36], points194[40]) * 1.15).max(8.0), s_right),
+    ];
+    let w = source.width as usize;
+    let h = source.height as usize;
+    let mut out = source.clone();
+    for y in 0..h {
+        let fy = y as f32;
+        for x in 0..w {
+            let fx = x as f32;
+            let mut sx = fx;
+            let mut sy = fy;
+            for &(center, radius, scale) in &eyes {
+                if scale.abs() < 1e-6 {
+                    continue;
+                }
+                let dx = sx - center[0];
+                let dy = sy - center[1];
+                let r2 = dx * dx + dy * dy;
+                let max_r2 = radius * radius;
+                if r2 < max_r2 {
+                    let t = 1.0 - r2 / max_r2;
+                    let factor = 1.0 - scale * t * t;
+                    sx = center[0] + dx * factor;
+                    sy = center[1] + dy * factor;
+                }
+            }
+            if (sx - fx).abs() > 1e-4 || (sy - fy).abs() > 1e-4 {
+                let offset = (y * w + x) * 4;
+                out.pixels[offset..offset + 4].copy_from_slice(&sample_bilinear_rgba_u8(source, sx, sy));
+            }
+        }
+    }
+    FaceMeshStageResult {
+        image: (out.pixels != source.pixels).then_some(out),
+        backend: PortraitBackend::Cpu,
+        dispatches: Vec::new(),
+        fallback_reason: None,
+        refusal: None,
+    }
+}
+
 fn apply_face_mesh_group(
     source: &Image,
     landmark_frame_digest: Option<[u8; 32]>,
@@ -4694,6 +4955,9 @@ fn apply_face_mesh_group(
     }
     if Some(slim.source_sha256) != landmark_frame_digest {
         return face_mesh_refused(Refusal::ValueOutOfRange("face mesh frame digest"), None);
+    }
+    if group.left == 8050 {
+        return apply_eye_overall_size(source, &slim.points194, controls);
     }
     let points414 = match face_width_414::produce(&slim.points194, 0.0) {
         Ok(points) => points,
@@ -4972,20 +5236,10 @@ fn supports_effect(pf: u32) -> bool {
 fn try_cuda_body_mesh(
     source: &Image,
     pf: u32,
-    job_id: Option<u64>,
-    job: Option<&BodyGeometryJob>,
+    job: &BodyGeometryJob,
 ) -> Option<Result<(Image, Vec<aurora_portrait::cuda::Dispatch>), String>> {
-    let job = job?;
     if !matches!(pf, 401 | 406 | 410 | 415) {
         return None;
-    }
-    if job.job_id == 0 || job_id != Some(job.job_id) {
-        return Some(Err("CUDA body mesh: body geometry job id".to_string()));
-    }
-    if job.frame_size != (source.width, source.height)
-        || job.source_sha256 != sha256_32(&source.pixels)
-    {
-        return Some(Err("CUDA body mesh: body geometry frame".to_string()));
     }
     let Some(BodyGeometryInput::Mesh { mesh, passes }) = job.effects.get(&pf) else {
         return Some(Err("CUDA body mesh: body geometry effect".to_string()));
@@ -5120,6 +5374,10 @@ fn log_report(report: &PortraitRunReport) {
                     .map(|dispatch| dispatch.kernel)
                     .collect::<Vec<_>>()
             ),
+            PortraitBackend::Wgpu => log::debug!(
+                "portrait PF{} executed on WGPU/Vulkan",
+                effect.pf,
+            ),
             PortraitBackend::Cpu => {
                 match &effect.fallback_reason {
                     Some(reason) => log::debug!("portrait PF{} CPU fallback: {reason}", effect.pf),
@@ -5211,6 +5469,19 @@ pub fn apply_portrait_effects_with_report_and_inputs(
     )
 }
 
+/// FileEngine composes generated body geometry last, after the wide color
+/// buffer's deltas are resolved. The same frame receipt still covers the full
+/// recipe; only this renderer defers its body rows.
+pub(crate) fn apply_portrait_colors_before_body(
+    portrait: &mut Vec<u8>, width: u32, height: u32, region: NormRect,
+    extra: &BTreeMap<String, f32>, inputs: &PortraitJobInputs<'_>,
+) -> PortraitRunReport {
+    crate::mock::gpu_runtime::install_portrait_bridge();
+    let report = apply_portrait_effects_impl(portrait, width, height, region, extra, inputs, cfg!(not(test)), true);
+    log_report(&report);
+    report
+}
+
 /// Existing dev/AB CPU force, reused verbatim from the Windows CUDA lane.
 /// This is not a new global switch (decision D5): the same `AURORA_*` names
 /// already mean "do not use the GPU" there.
@@ -5290,6 +5561,133 @@ fn try_metal_effect(
     }
 }
 
+fn wgpu_backend_selected() -> (bool, bool) {
+    let cuda_required = std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_some_and(|value| {
+        let value = value.to_string_lossy().trim().to_ascii_lowercase();
+        !value.is_empty() && value != "0" && value != "false"
+    });
+    if cuda_required {
+        return (false, false);
+    }
+    let portrait = std::env::var("AURORA_PORTRAIT_RENDER_BACKEND")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
+    let selected = match portrait.as_deref() {
+        Some("") | Some("auto") | Some("default") | None => std::env::var("AURORA_GPU_BACKEND")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase()),
+        Some(other) => Some(other.to_string()),
+    };
+    match selected.as_deref() {
+        Some("wgpu") => (true, false),
+        Some("vulkan") | Some("vk") => (true, true),
+        _ => (false, false),
+    }
+}
+
+fn wgpu_forced_cpu() -> bool {
+    if std::env::var("AURORA_PORTRAIT_RENDER_BACKEND")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("cpu"))
+        || std::env::var_os("AURORA_PORTRAIT_FORCE_CPU").is_some()
+    {
+        return true;
+    }
+    #[cfg(all(windows, test))]
+    if FORCE_CUDA_FAILURE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
+/// Cross-platform WGPU/Vulkan compute route for supported skin effects
+/// (`PF8070`, `PF30096`, `PF90005`, `PF90007`).
+fn try_wgpu_effect(
+    current: &Image,
+    pf: u32,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    require_vulkan: bool,
+) -> Option<Result<(Image, aurora_portrait::wgpu_backend::WgpuDispatchReceipt), String>> {
+    if !matches!(pf, 8070 | 30096 | 90005 | 90007) {
+        return None;
+    }
+    if wgpu_forced_cpu() {
+        return None;
+    }
+    let mask = match skin_mask {
+        Some(mask) => mask,
+        None => return Some(Err("WGPU effect needs a same-size skin mask".to_string())),
+    };
+    if mask.len() != current.pixel_count() {
+        return Some(Err(format!(
+            "WGPU mask/source shape mismatch: {}x{} frame, {} mask bytes",
+            current.width,
+            current.height,
+            mask.len()
+        )));
+    }
+    match pf {
+        90005 | 90007 => {
+            let (lut, missing) = if pf == 90005 {
+                (whiten_lut(), "whiten LUT")
+            } else {
+                (ruddy_lut(), "ruddy LUT")
+            };
+            let Some(lut) = lut else {
+                return Some(Err(format!("WGPU skin LUT asset unavailable for PF{pf} ({missing})")));
+            };
+            let mix = degree.clamp(0.0, 1.0);
+            Some(
+                aurora_portrait::wgpu_backend::execute_skin_lut_fixed(
+                    current,
+                    mask,
+                    lut,
+                    mix,
+                    require_vulkan,
+                )
+                .map_err(|err| format!("{err:?}")),
+            )
+        }
+        30096 => {
+            let (Some(cold), Some(warm)) = (cold_lut(), warm_lut()) else {
+                return Some(Err("WGPU skin temperature LUT asset unavailable".to_string()));
+            };
+            let ui = ((degree - 0.5) * 200.0).clamp(-100.0, 100.0);
+            let lut = if ui < 0.0 { cold } else { warm };
+            let mix = (ui.abs() / 100.0).clamp(0.0, 1.0);
+            Some(
+                aurora_portrait::wgpu_backend::execute_skin_lut_fixed(
+                    current,
+                    mask,
+                    lut,
+                    mix,
+                    require_vulkan,
+                )
+                .map_err(|err| format!("{err:?}")),
+            )
+        }
+        8070 => {
+            let base = current.clone();
+            let blur = blur_rgba(current, 2.0);
+            Some(
+                aurora_portrait::wgpu_backend::execute_clarity(
+                    current,
+                    &base,
+                    &blur,
+                    mask,
+                    (0, 0, current.width, current.height),
+                    degree.clamp(0.0, 1.0),
+                    0.0,
+                    4.68,
+                    require_vulkan,
+                )
+                .map_err(|err| format!("{err:?}")),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn apply_portrait_effects_with_report_and_inputs_policy(
     portrait: &mut Vec<u8>,
     width: u32,
@@ -5298,6 +5696,14 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
     extra: &BTreeMap<String, f32>,
     inputs: &PortraitJobInputs<'_>,
     require_renderer_receipt: bool,
+) -> PortraitRunReport {
+    apply_portrait_effects_impl(portrait, width, height, region, extra, inputs, require_renderer_receipt, false)
+}
+
+fn apply_portrait_effects_impl(
+    portrait: &mut Vec<u8>, width: u32, height: u32, region: NormRect,
+    extra: &BTreeMap<String, f32>, inputs: &PortraitJobInputs<'_>,
+    require_renderer_receipt: bool, defer_live_body: bool,
 ) -> PortraitRunReport {
     let mut report = PortraitRunReport {
         job_id: inputs.job_id(),
@@ -5319,13 +5725,41 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             receipt.refusal(portrait, width, height, region, extra, inputs.masks)
         })
     };
+    // PF108 is one kernel fed by three document controls. Resolve the family
+    // once, here, so the row that runs and the producer's sibling percentages
+    // cannot disagree and so at most one PF108 row is dispatched per frame.
+    let pf108 = pf108_family(extra);
     let mut effects: Vec<(u32, f32)> = extra
         .iter()
         .filter_map(|(key, value)| {
+            // `pc:109`/`pc:110` are inputs to PF108's kernel, never effects of
+            // their own: one job, one report row, no extra primary item.
+            if key == PF108_BRIGHT_KEY || key == PF108_DEYELLOW_KEY {
+                return None;
+            }
             let id: u32 = key.strip_prefix("pc:")?.parse().ok()?;
-            Some((id, *value))
+            (!defer_live_body || !portrait_body_stage::supports(id)).then_some((id, *value))
         })
         .collect();
+    match pf108.as_ref() {
+        Ok(family) if family.is_active() => {
+            // A child-only document has no `pc:108` key at all; the row takes
+            // the resolved common weight instead of the absent raw value.
+            match effects.iter().position(|(pf, _)| *pf == PF108_COMMON_PC) {
+                Some(index) => effects[index].1 = family.common01,
+                None => effects.push((PF108_COMMON_PC, family.common01)),
+            }
+        }
+        // Every control neutral (or both children zeroed): nothing to run.
+        Ok(_) => effects.retain(|(pf, _)| *pf != PF108_COMMON_PC),
+        // Keep the row so a malformed control is reported as a refusal by the
+        // input validation instead of vanishing from the report.
+        Err(_) => {
+            if !effects.iter().any(|(pf, _)| *pf == PF108_COMMON_PC) {
+                effects.push((PF108_COMMON_PC, 0.0));
+            }
+        }
+    }
     effects.sort_by_key(|&(pf, _)| pf);
 
     if let Some(refusal) = receipt_refusal {
@@ -5378,11 +5812,15 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     raw
                 }
             })
-            .and_then(full_face_descriptor_from_ui)
+            .and_then(portrait_plump_stage::full_face_descriptor_from_store)
             .map(Some)
     } else {
         Ok(None)
     };
+    let body_job = inputs.body_geometry.map(|job| {
+        job.validate_frame((width, height), &source.pixels, inputs.job_id())?;
+        Ok::<_, Refusal>(job)
+    });
     let mut current = source;
     // Keep the main-session optimization: skin effects share one sampled plane.
     // Non-skin rows receive their own explicit planes from `PortraitJobInputs`.
@@ -5706,10 +6144,31 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             continue;
         }
         if portrait_body_stage::supports(pf) {
+            if degree == 0.0 {
+                run.backend = PortraitBackend::Skipped;
+                report.effects.push(run);
+                continue;
+            }
+            let job = if !degree.is_finite() {
+                Err(Refusal::ValueOutOfRange("body geometry control"))
+            } else {
+                body_job.as_ref().cloned().unwrap_or(Err(Refusal::MissingInput("body geometry job")))
+            };
+            let job = match job {
+                Ok(job) => job,
+                Err(refusal) => {
+                    run.backend = PortraitBackend::Skipped;
+                    run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                    run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                    run.refusal = Some(refusal);
+                    report.effects.push(run);
+                    continue;
+                }
+            };
             #[cfg(windows)]
             {
                 if let Some(result) =
-                    try_cuda_body_mesh(&current, pf, inputs.job_id(), inputs.body_geometry)
+                    try_cuda_body_mesh(&current, pf, job)
                 {
                     match result {
                         Ok((next, dispatches)) if !dispatches.is_empty() => {
@@ -5729,13 +6188,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                     }
                 }
             }
-            match portrait_body_stage::apply(
-                &current,
-                pf,
-                degree,
-                inputs.job_id(),
-                inputs.body_geometry,
-            ) {
+            match portrait_body_stage::apply_bound(&current, pf, degree, job) {
                 Ok(Some(next)) => {
                     current = next;
                     run.backend = PortraitBackend::Cpu;
@@ -6104,6 +6557,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 &current,
                 region,
                 extra,
+                &pf108,
                 skin_mask.as_deref(),
                 inputs,
                 hlf_auto.as_ref(),
@@ -6120,11 +6574,92 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             report.effects.push(run);
             continue;
         }
+        if pf == 111 && crate::portrait_look_layer::requested(extra) {
+            // This opt-in original sublayer has a CPU implementation only. Keep
+            // the whole PF111 atomic, and never label a hybrid frame as CUDA.
+            let result = (|| {
+                if !crate::portrait_look_layer::cpu_allowed() {
+                    return Err(Refusal::MissingInput("human catchlight: requested backend has no native pass"));
+                }
+                let owner = inputs.makeup_bundle.ok_or(Refusal::MissingInput("same-job human catchlight"))?;
+                let light = owner.human_catchlight.as_ref().ok_or(Refusal::MissingInput("same-job human catchlight"))?;
+                if light.ticket.source_sha256 != owner.source_sha256 || light.ticket.source_size != owner.frame_size
+                    || light.ticket.job_id != owner.ticket || !light.matches_request(extra) {
+                    return Err(Refusal::ValueOutOfRange("catchlight request or source changed"));
+                }
+                let mut next = apply_makeup_cpu(&current, pf, degree, inputs)?;
+                light.apply(&mut next, inputs.job_id().ok_or(Refusal::MissingInput("human catchlight job"))?)?;
+                Ok(next)
+            })();
+            match result {
+                Ok(next) => {
+                    current = next;
+                    run.backend = PortraitBackend::Cpu;
+                    run.executed = true;
+                    run.skipped = false;
+                }
+                Err(refusal) => {
+                    run.backend = PortraitBackend::Skipped;
+                    run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                    run.refusal = Some(refusal);
+                }
+            }
+            report.effects.push(run);
+            continue;
+        }
+        let (wgpu_explicit, wgpu_require_vulkan) = wgpu_backend_selected();
+        if wgpu_explicit {
+            if let Some(wgpu_result) = try_wgpu_effect(
+                &current,
+                pf,
+                degree,
+                skin_mask.as_deref(),
+                wgpu_require_vulkan,
+            ) {
+                match wgpu_result {
+                    Ok((next, receipt)) => {
+                        log::debug!(
+                            "portrait PF{pf} executed on WGPU ({}/{}): kernel={} grid={:?}",
+                            receipt.backend,
+                            receipt.adapter,
+                            receipt.kernel,
+                            receipt.grid
+                        );
+                        current = next;
+                        run.backend = PortraitBackend::Wgpu;
+                        run.skipped = false;
+                        run.executed = true;
+                        report.effects.push(run);
+                        continue;
+                    }
+                    Err(reason) => {
+                        run.fallback_reason = Some(match run.fallback_reason.take() {
+                            Some(previous) => format!("{previous}; WGPU effect: {reason}"),
+                            None => format!("WGPU effect: {reason}"),
+                        });
+                    }
+                }
+            }
+        }
         #[cfg(windows)]
-        let cuda_result =
-            try_cuda_effect(&current, pf, degree, skin_mask.as_deref()).or_else(|| {
-                try_cuda_same_job_effect(&current, pf, degree, inputs, hlf_auto.as_ref())
-            });
+        let cuda_result = if wgpu_explicit {
+            None
+        } else {
+            try_cuda_effect(&current, pf, degree, skin_mask.as_deref())
+                .or_else(|| {
+                    try_cuda_stage_mask_effect(
+                        &current,
+                        pf,
+                        degree,
+                        skin_mask.as_deref(),
+                        region,
+                        inputs,
+                    )
+                })
+                .or_else(|| {
+                    try_cuda_same_job_effect(&current, pf, degree, inputs, hlf_auto.as_ref())
+                })
+        };
         #[cfg(windows)]
         if let Some(result) = cuda_result {
             match result {
@@ -6185,6 +6720,35 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
                 }
             }
         }
+        if !wgpu_explicit {
+            if let Some(wgpu_result) =
+                try_wgpu_effect(&current, pf, degree, skin_mask.as_deref(), false)
+            {
+                match wgpu_result {
+                    Ok((next, receipt)) => {
+                        log::debug!(
+                            "portrait PF{pf} executed on WGPU fallback ({}/{}): kernel={} grid={:?}",
+                            receipt.backend,
+                            receipt.adapter,
+                            receipt.kernel,
+                            receipt.grid
+                        );
+                        current = next;
+                        run.backend = PortraitBackend::Wgpu;
+                        run.skipped = false;
+                        run.executed = true;
+                        report.effects.push(run);
+                        continue;
+                    }
+                    Err(reason) => {
+                        run.fallback_reason = Some(match run.fallback_reason.take() {
+                            Some(previous) => format!("{previous}; WGPU fallback: {reason}"),
+                            None => format!("WGPU fallback: {reason}"),
+                        });
+                    }
+                }
+            }
+        }
         let result = apply_cpu_effect(
             &current,
             pf,
@@ -6193,6 +6757,7 @@ fn apply_portrait_effects_with_report_and_inputs_policy(
             skin_mask.as_deref(),
             width,
             height,
+            region,
             inputs,
             hlf_auto.as_ref(),
         );
@@ -7306,11 +7871,15 @@ fn resolve_radiance_inputs<'a>(
     })
 }
 
+// `pf108` is the already-resolved PF108 family for this document: an `Err`
+// there is the control refusal the caller must report, never a neutral
+// fallback and never a silent clamp.
 fn validate_effect_inputs(
     pf: u32,
     current: &Image,
     region: NormRect,
     extra: &BTreeMap<String, f32>,
+    pf108: &Result<Pf108Family, Refusal>,
     skin_mask: Option<&[u8]>,
     inputs: &PortraitJobInputs<'_>,
     hlf_auto: Option<&HlfAutoInputs>,
@@ -7366,21 +7935,7 @@ fn validate_effect_inputs(
         8068 | 8069 | 8070 | 21015 | 30096 | 90005 | 90007
     ) {
         required(skin_mask, "skin mask")?;
-        match pf {
-            21015 if tint_green().is_none() || tint_magenta().is_none() => {
-                return Err(Refusal::MissingInput("skin tint LUT"));
-            }
-            30096 if cold_lut().is_none() || warm_lut().is_none() => {
-                return Err(Refusal::MissingInput("skin temperature LUT"));
-            }
-            90005 if whiten_lut().is_none() => {
-                return Err(Refusal::MissingInput("whiten LUT"));
-            }
-            90007 if ruddy_lut().is_none() => {
-                return Err(Refusal::MissingInput("ruddy LUT"));
-            }
-            _ => {}
-        }
+        if let Some(name) = missing_tone_table(pf) { return Err(Refusal::MissingInput(name)); }
         return Ok(());
     }
 
@@ -7389,7 +7944,11 @@ fn validate_effect_inputs(
             validate_makeup_inputs(pf, pixels, inputs)?
         }
         108 => {
-            check_degree01(extra.get("pc:108").copied().unwrap_or_default(), "degree")?;
+            // The support plane is `common * child` (`face_detail.rs`), so the
+            // value that has to be in range is the resolved common weight, not
+            // the raw `pc:108` entry (absent in a child-only document).
+            let family = pf108.as_ref().map_err(Clone::clone)?;
+            check_degree01(family.common01, "degree")?;
             let teeth = required(inputs.teeth, "teeth mask")?;
             if teeth.job_id == 0 {
                 return Err(Refusal::ValueOutOfRange("PF108 producer job id"));
@@ -7660,6 +8219,61 @@ fn validate_effect_inputs(
                 return Err(Refusal::ValueOutOfRange("pf100007 displacement"));
             }
         }
+        0 => {
+            check_degree01(extra.get("pc:0").copied().unwrap_or_default(), "PF0 degree")?;
+            required(skin_mask, "PF0 skin mask")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            required(face_mask.as_deref(), "PF0 face mask")?;
+        }
+        90085 => {
+            check_degree01(extra.get("pc:90085").copied().unwrap_or_default(), "PF90085 degree")?;
+            required(skin_mask, "PF90085 skin mask")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            required(face_mask.as_deref(), "PF90085 face mask")?;
+        }
+        21104 => {
+            check_degree01(extra.get("pc:21104").copied().unwrap_or_default(), "PF21104 degree")?;
+            required(skin_mask, "PF21104 skin mask")?;
+        }
+        90001 => {
+            check_degree01(extra.get("pc:90001").copied().unwrap_or_default(), "PF90001 degree")?;
+            required(skin_mask, "PF90001 skin mask")?;
+        }
+        90003 => {
+            check_degree01(extra.get("pc:90003").copied().unwrap_or_default(), "PF90003 degree")?;
+            required(skin_mask, "PF90003 skin mask")?;
+        }
+        30188 => {
+            check_degree01(extra.get("pc:30188").copied().unwrap_or_default(), "PF30188 degree")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            if face_mask.is_none() && skin_mask.is_none() {
+                return Err(Refusal::MissingInput("PF30188 face or skin mask"));
+            }
+        }
+        30189 => {
+            check_degree01(extra.get("pc:30189").copied().unwrap_or_default(), "PF30189 degree")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            if face_mask.is_none() && skin_mask.is_none() {
+                return Err(Refusal::MissingInput("PF30189 face or skin mask"));
+            }
+        }
+        30209 => {
+            check_degree01(extra.get("pc:30209").copied().unwrap_or_default(), "PF30209 degree")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            if face_mask.is_none() && skin_mask.is_none() {
+                return Err(Refusal::MissingInput("PF30209 face or skin mask"));
+            }
+        }
+        90087 => {
+            check_degree01(extra.get("pc:90087").copied().unwrap_or_default(), "PF90087 degree")?;
+            let hair_mask = inputs.masks.mask_u8(MaskKind::Hair, current.width, current.height, region);
+            required(hair_mask.as_deref(), "PF90087 hair mask")?;
+        }
+        100005 => {
+            check_degree01(extra.get("pc:100005").copied().unwrap_or_default(), "PF100005 degree")?;
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, current.width, current.height, region);
+            required(face_mask.as_deref(), "PF100005 face mask")?;
+        }
         _ => {}
     }
     Ok(())
@@ -7673,10 +8287,48 @@ fn apply_cpu_effect(
     skin_mask: Option<&[u8]>,
     width: u32,
     height: u32,
+    region: NormRect,
     inputs: &PortraitJobInputs<'_>,
     hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<Image, Refusal> {
     match pf {
+        0 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_pf0_spotless(current, degree, skin_mask, face_mask.as_deref())
+        }
+        90085 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_pf90085_face(current, degree, skin_mask, face_mask.as_deref())
+        }
+        21104 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_nose_flaws(current, degree, skin_mask, face_mask.as_deref())
+        }
+        30188 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_double_chin_degree(current, degree, face_mask.as_deref(), skin_mask)
+        }
+        30189 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_double_chin_shadow(current, degree, face_mask.as_deref(), skin_mask)
+        }
+        30209 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_jawline_enhance(current, degree, face_mask.as_deref(), skin_mask)
+        }
+        90001 => apply_texture_smooth(current, degree, skin_mask),
+        90003 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_body_skin_uniform(current, degree, skin_mask, face_mask.as_deref())
+        }
+        90087 => {
+            let hair_mask = inputs.masks.mask_u8(MaskKind::Hair, width, height, region);
+            apply_hair_part_fill(current, degree, hair_mask.as_deref())
+        }
+        100005 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            apply_eye_white_purify(current, degree, face_mask.as_deref())
+        }
         pf if B3_MAKEUP_ROWS.contains(&pf) => {
             apply_makeup_cpu(current, pf, degree, inputs)
         }
@@ -7715,6 +8367,567 @@ fn apply_cpu_effect(
         // to leave the frame unchanged.
         _ => Err(Refusal::NotImplemented(pf)),
     }
+}
+
+/// PF0 Spotless: vendor-proven blur-difference fragment with the frame's own
+/// SkinMask/FaceMask. The vendor blur FBO producer is still LIVE_ONLY, so this
+/// wiring uses a local separable box blur as a stand-in and makes NO parity claim.
+fn apply_pf0_spotless(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    use aurora_portrait::kernels::spotless::{self, ImageF32, SpotlessParams};
+    let skin = required(skin_mask, "PF0 skin mask")?;
+    let face = required(face_mask, "PF0 face mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF0 skin mask")?;
+    check_plane(face.len(), pixels, "PF0 face mask")?;
+    if degree <= 0.0 {
+        return Ok(current.clone());
+    }
+    let params = SpotlessParams {
+        dist_factor: 28.87,
+        dist_threshold: 0.5,
+        dark_diff_min_threshold: 0.0,
+        dark_diff_max_threshold: 0.3,
+        white_diff_factor: 0.7,
+        degree: degree.clamp(0.0, 1.0),
+    };
+    let src: Vec<f32> = current.pixels.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let blur_rgb = box_blur_rgba(current, 8);
+    let face_f: Vec<f32> = face.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let skin_f: Vec<f32> = skin.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let mut out = vec![0.0f32; src.len()];
+    spotless::apply(
+        ImageF32 { width: current.width, height: current.height, pixels: &src },
+        ImageF32 { width: current.width, height: current.height, pixels: &blur_rgb },
+        &face_f,
+        Some(&skin_f),
+        params,
+        &mut out,
+    )?;
+    let mut image = current.clone();
+    for (dst, pixel) in image.pixels.chunks_exact_mut(4).zip(out.chunks_exact(4)) {
+        for channel in 0..4 {
+            dst[channel] = (pixel[channel].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    Ok(image)
+}
+
+fn box_blur_rgba(image: &Image, radius: u32) -> Vec<f32> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let r = radius as i64;
+    let mut horizontal = vec![0.0f32; width * height * 3];
+    let mut out = vec![0.0f32; width * height * 4];
+    let x_last = width as i64 - 1;
+    let y_last = height as i64 - 1;
+    let count = (2 * r + 1) as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0f32; 3];
+            for dx in -r..=r {
+                let sx = (x as i64 + dx).clamp(0, x_last) as usize;
+                let offset = (y * width + sx) * 4;
+                for channel in 0..3 {
+                    sum[channel] += f32::from(image.pixels[offset + channel]);
+                }
+            }
+            let offset = (y * width + x) * 3;
+            for channel in 0..3 {
+                horizontal[offset + channel] = sum[channel] / count;
+            }
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0f32; 3];
+            for dy in -r..=r {
+                let sy = (y as i64 + dy).clamp(0, y_last) as usize;
+                let offset = (sy * width + x) * 3;
+                for channel in 0..3 {
+                    sum[channel] += horizontal[offset + channel];
+                }
+            }
+            let offset = (y * width + x) * 4;
+            for channel in 0..3 {
+                out[offset + channel] = sum[channel] / count / 255.0;
+            }
+            out[offset + 3] = 1.0;
+        }
+    }
+    out
+}
+
+/// PF90085 reduced CPU tail (`support = max(skin, face*0.39)`).
+fn apply_pf90085_face(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    use aurora_portrait::kernels::tone_unify::{self, Pass90085};
+    let skin = required(skin_mask, "PF90085 skin mask")?;
+    let face = required(face_mask, "PF90085 face mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF90085 skin mask")?;
+    check_plane(face.len(), pixels, "PF90085 face mask")?;
+    let pass = Pass90085 {
+        skin_mask: Some(skin),
+        face_mask_g: face,
+        parsing_a: None,
+        parsing_g: None,
+        parsing_b: None,
+        protect: None,
+        model_weight: None,
+        model_target: None,
+        target: None,
+    };
+    tone_unify::pf90085_apply(current, &pass, degree.clamp(0.0, 1.0) * 100.0)
+}
+
+fn mask_bbox(mask: &[u8], width: usize, height: usize) -> Option<(usize, usize, usize, usize)> {
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut any = false;
+    for y in 0..height {
+        for x in 0..width {
+            if mask[y * width + x] > 0 {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    any.then_some((min_x, min_y, max_x, max_y))
+}
+
+/// PF90001: edge-preserving local texture smoothing within skin mask.
+fn apply_texture_smooth(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let skin = required(skin_mask, "PF90001 skin mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF90001 skin mask")?;
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let blur = box_blur_rgba(current, 4);
+    let mut out = current.clone();
+    for i in 0..pixels {
+        let m = f32::from(skin[i]) / 255.0;
+        if m <= 0.0 {
+            continue;
+        }
+        let off = i * 4;
+        let sr = f32::from(current.pixels[off]) / 255.0;
+        let sg = f32::from(current.pixels[off + 1]) / 255.0;
+        let sb = f32::from(current.pixels[off + 2]) / 255.0;
+        let dr = blur[off] - sr;
+        let dg = blur[off + 1] - sg;
+        let db = blur[off + 2] - sb;
+        let diff2 = dr * dr + dg * dg + db * db;
+        // Preserve sharp facial features while smoothing pores/texture.
+        let edge_keep = (-diff2 / (2.0 * 0.085 * 0.085)).exp();
+        let w = strength * m * edge_keep;
+        out.pixels[off] = ((sr + dr * w) * 255.0).round().clamp(0.0, 255.0) as u8;
+        out.pixels[off + 1] = ((sg + dg * w) * 255.0).round().clamp(0.0, 255.0) as u8;
+        out.pixels[off + 2] = ((sb + db * w) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    Ok(out)
+}
+
+/// PF90003: body skin tone uniformization (skin mask excluding face when available).
+fn apply_body_skin_uniform(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let skin = required(skin_mask, "PF90003 skin mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF90003 skin mask")?;
+    if let Some(face) = face_mask {
+        check_plane(face.len(), pixels, "PF90003 face mask")?;
+    }
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let mut sum = [0.0f64; 3];
+    let mut w_sum = 0.0f64;
+    let body_weight = |i: usize| -> f32 {
+        let s = f32::from(skin[i]) / 255.0;
+        let f = face_mask.map_or(0.0, |fm| f32::from(fm[i]) / 255.0);
+        let body = s * (1.0 - f * 0.85);
+        if body > 0.01 { body } else { 0.0 }
+    };
+    for i in 0..pixels {
+        let bw = body_weight(i);
+        if bw > 0.0 {
+            let off = i * 4;
+            for c in 0..3 {
+                sum[c] += f64::from(current.pixels[off + c]) * f64::from(bw);
+            }
+            w_sum += f64::from(bw);
+        }
+    }
+    if w_sum <= 1e-6 {
+        return Ok(current.clone());
+    }
+    let target = [
+        (sum[0] / w_sum) as f32,
+        (sum[1] / w_sum) as f32,
+        (sum[2] / w_sum) as f32,
+    ];
+    let target_luma = (0.299 * target[0] + 0.587 * target[1] + 0.114 * target[2]).max(1.0);
+    let mut out = current.clone();
+    for i in 0..pixels {
+        let bw = body_weight(i);
+        if bw <= 0.0 {
+            continue;
+        }
+        let off = i * 4;
+        let r = f32::from(current.pixels[off]);
+        let g = f32::from(current.pixels[off + 1]);
+        let b = f32::from(current.pixels[off + 2]);
+        let luma = (0.299 * r + 0.587 * g + 0.114 * b).max(1.0);
+        let ratio = (luma / target_luma).clamp(0.6, 1.5);
+        // Preserve local shading luma while shifting chrominance toward uniform body skin tone.
+        let uniform_rgb = [target[0] * ratio, target[1] * ratio, target[2] * ratio];
+        let blend = strength * bw * 0.55;
+        let orig = [r, g, b];
+        for c in 0..3 {
+            out.pixels[off + c] = (orig[c] + (uniform_rgb[c] - orig[c]) * blend)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok(out)
+}
+
+/// PF21104: nose flaws repair within central facial/skin region.
+fn apply_nose_flaws(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let skin = required(skin_mask, "PF21104 skin mask")?;
+    let pixels = current.pixel_count();
+    check_plane(skin.len(), pixels, "PF21104 skin mask")?;
+    if let Some(face) = face_mask {
+        check_plane(face.len(), pixels, "PF21104 face mask")?;
+    }
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let bbox = face_mask
+        .and_then(|fm| mask_bbox(fm, w, h))
+        .or_else(|| mask_bbox(skin, w, h));
+    let Some((x0, y0, x1, y1)) = bbox else {
+        return Ok(current.clone());
+    };
+    let cx = (x0 + x1) as f32 * 0.5;
+    let cy = y0 as f32 + (y1 - y0) as f32 * 0.52;
+    let rx = ((x1 - x0) as f32 * 0.25).max(4.0);
+    let ry = ((y1 - y0) as f32 * 0.28).max(4.0);
+    let blur = box_blur_rgba(current, 5);
+    let mut out = current.clone();
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            let s = f32::from(skin[i]) / 255.0;
+            if s <= 0.0 {
+                continue;
+            }
+            let nx = (x as f32 - cx) / rx;
+            let ny = (y as f32 - cy) / ry;
+            let r2 = nx * nx + ny * ny;
+            if r2 > 1.0 {
+                continue;
+            }
+            let nose_w = (1.0 - r2).clamp(0.0, 1.0);
+            let off = i * 4;
+            let sr = f32::from(current.pixels[off]) / 255.0;
+            let sg = f32::from(current.pixels[off + 1]) / 255.0;
+            let sb = f32::from(current.pixels[off + 2]) / 255.0;
+            let sl = 0.299 * sr + 0.587 * sg + 0.114 * sb;
+            let bl = 0.299 * blur[off] + 0.587 * blur[off + 1] + 0.114 * blur[off + 2];
+            // Soften dark blemishes / pores / redness spikes relative to local surround.
+            let blemish = ((bl - sl).max(0.0) * 6.0 + (sr - sg - (blur[off] - blur[off + 1])).max(0.0) * 4.0)
+                .clamp(0.0, 1.0);
+            let alpha = strength * s * nose_w * (0.25 + 0.75 * blemish);
+            for c in 0..3 {
+                let sc = f32::from(current.pixels[off + c]) / 255.0;
+                out.pixels[off + c] = ((sc + (blur[off + c] - sc) * alpha) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// PF100005: eye-white brightening and de-yellowing/de-reddening in upper facial region.
+fn apply_eye_white_purify(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let face = required(face_mask, "PF100005 face mask")?;
+    let pixels = current.pixel_count();
+    check_plane(face.len(), pixels, "PF100005 face mask")?;
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let Some((x0, y0, x1, y1)) = mask_bbox(face, w, h) else {
+        return Ok(current.clone());
+    };
+    let eye_y_max = y0 + ((y1 - y0) as f32 * 0.62) as usize;
+    let mut out = current.clone();
+    for y in y0..=eye_y_max.min(y1) {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            let fm = f32::from(face[i]) / 255.0;
+            if fm <= 0.0 {
+                continue;
+            }
+            let off = i * 4;
+            let r = f32::from(current.pixels[off]) / 255.0;
+            let g = f32::from(current.pixels[off + 1]) / 255.0;
+            let b = f32::from(current.pixels[off + 2]) / 255.0;
+            let max_c = r.max(g).max(b);
+            let min_c = r.min(g).min(b);
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            let sat = if max_c > 1e-4 { (max_c - min_c) / max_c } else { 0.0 };
+            // Target bright low-saturation sclera pixels while sparing dark pupils/iris.
+            if luma > 0.35 && sat < 0.35 {
+                let luma_w = ((luma - 0.35) / 0.35).clamp(0.0, 1.0);
+                let sat_w = ((0.35 - sat) / 0.35).clamp(0.0, 1.0);
+                let w_pix = strength * fm * luma_w * sat_w * 0.65;
+                let neutral = (luma + 0.08 * w_pix).clamp(0.0, 1.0);
+                out.pixels[off] = ((r + (neutral - r) * w_pix) * 255.0).round().clamp(0.0, 255.0) as u8;
+                out.pixels[off + 1] = ((g + (neutral - g) * w_pix) * 255.0).round().clamp(0.0, 255.0) as u8;
+                out.pixels[off + 2] = ((b + (neutral - b) * w_pix) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// PF90087: hair parting fill using local dark hair average within hair mask.
+fn apply_hair_part_fill(
+    current: &Image,
+    degree: f32,
+    hair_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let hair = required(hair_mask, "PF90087 hair mask")?;
+    let pixels = current.pixel_count();
+    check_plane(hair.len(), pixels, "PF90087 hair mask")?;
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let mut sum = [0.0f64; 3];
+    let mut count = 0.0f64;
+    for i in 0..pixels {
+        let hm = f32::from(hair[i]) / 255.0;
+        if hm > 0.25 {
+            let off = i * 4;
+            let luma = 0.299 * f32::from(current.pixels[off])
+                + 0.587 * f32::from(current.pixels[off + 1])
+                + 0.114 * f32::from(current.pixels[off + 2]);
+            if luma < 170.0 {
+                for c in 0..3 {
+                    sum[c] += f64::from(current.pixels[off + c]) * f64::from(hm);
+                }
+                count += f64::from(hm);
+            }
+        }
+    }
+    if count <= 1e-6 {
+        return Ok(current.clone());
+    }
+    let hair_rgb = [
+        (sum[0] / count) as f32,
+        (sum[1] / count) as f32,
+        (sum[2] / count) as f32,
+    ];
+    let hair_luma = 0.299 * hair_rgb[0] + 0.587 * hair_rgb[1] + 0.114 * hair_rgb[2];
+    let mut out = current.clone();
+    for i in 0..pixels {
+        let hm = f32::from(hair[i]) / 255.0;
+        if hm <= 0.0 {
+            continue;
+        }
+        let off = i * 4;
+        let r = f32::from(current.pixels[off]);
+        let g = f32::from(current.pixels[off + 1]);
+        let b = f32::from(current.pixels[off + 2]);
+        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        if luma > hair_luma + 12.0 {
+            let gap_w = ((luma - hair_luma - 12.0) / 80.0).clamp(0.0, 1.0);
+            let blend = strength * hm * gap_w * 0.85;
+            out.pixels[off] = (r + (hair_rgb[0] - r) * blend).round().clamp(0.0, 255.0) as u8;
+            out.pixels[off + 1] = (g + (hair_rgb[1] - g) * blend).round().clamp(0.0, 255.0) as u8;
+            out.pixels[off + 2] = (b + (hair_rgb[2] - b) * blend).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok(out)
+}
+
+/// PF30188: double-chin upward lift geometry warp along lower chin region.
+fn apply_double_chin_degree(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let mask = face_mask.or(skin_mask).ok_or(Refusal::MissingInput("PF30188 face or skin mask"))?;
+    let pixels = current.pixel_count();
+    check_plane(mask.len(), pixels, "PF30188 mask")?;
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let Some((x0, y0, x1, y1)) = mask_bbox(mask, w, h) else {
+        return Ok(current.clone());
+    };
+    let cx = (x0 + x1) as f32 * 0.5;
+    let cy = y1 as f32;
+    let rx = ((x1 - x0) as f32 * 0.38).max(4.0);
+    let ry = ((y1 - y0) as f32 * 0.28).max(4.0);
+    let shift = (ry * 0.28 * strength).max(0.5);
+    let mut out = current.clone();
+    for y in 0..h {
+        let fy = y as f32;
+        let dy = (fy - cy) / ry;
+        if dy.abs() >= 1.0 {
+            continue;
+        }
+        for x in 0..w {
+            let fx = x as f32;
+            let dx = (fx - cx) / rx;
+            let r2 = dx * dx + dy * dy;
+            if r2 < 1.0 {
+                let bell = (1.0 - r2).powi(2);
+                let sy = fy + shift * bell;
+                let off = (y * w + x) * 4;
+                out.pixels[off..off + 4].copy_from_slice(&sample_bilinear_rgba_u8(current, fx, sy));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// PF30189: double-chin shadow softening below lower chin contour.
+fn apply_double_chin_shadow(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let mask = face_mask.or(skin_mask).ok_or(Refusal::MissingInput("PF30189 face or skin mask"))?;
+    let pixels = current.pixel_count();
+    check_plane(mask.len(), pixels, "PF30189 mask")?;
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let Some((x0, y0, x1, y1)) = mask_bbox(mask, w, h) else {
+        return Ok(current.clone());
+    };
+    let cx = (x0 + x1) as f32 * 0.5;
+    let cy = y1 as f32;
+    let rx = ((x1 - x0) as f32 * 0.36).max(4.0);
+    let ry = ((y1 - y0) as f32 * 0.24).max(4.0);
+    let mut out = current.clone();
+    for y in 0..h {
+        let dy = (y as f32 - cy) / ry;
+        if dy.abs() >= 1.0 {
+            continue;
+        }
+        for x in 0..w {
+            let dx = (x as f32 - cx) / rx;
+            let r2 = dx * dx + dy * dy;
+            if r2 < 1.0 {
+                let bell = (1.0 - r2) * strength * 0.32;
+                let off = (y * w + x) * 4;
+                for c in 0..3 {
+                    let v = f32::from(current.pixels[off + c]);
+                    out.pixels[off + c] = (v + (255.0 - v) * bell).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// PF30209: jawline definition enhancement along lower facial contour.
+fn apply_jawline_enhance(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    let mask = face_mask.or(skin_mask).ok_or(Refusal::MissingInput("PF30209 face or skin mask"))?;
+    let pixels = current.pixel_count();
+    check_plane(mask.len(), pixels, "PF30209 mask")?;
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Ok(current.clone());
+    }
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let Some((x0, y0, x1, y1)) = mask_bbox(mask, w, h) else {
+        return Ok(current.clone());
+    };
+    let blur = box_blur_rgba(current, 3);
+    let jaw_y_min = y0 + ((y1 - y0) as f32 * 0.55) as usize;
+    let mut out = current.clone();
+    for y in jaw_y_min..=y1 {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            let m = f32::from(mask[i]) / 255.0;
+            if m <= 0.0 {
+                continue;
+            }
+            // Emphasize lower jaw transition zone.
+            let y_w = ((y - jaw_y_min) as f32 / ((y1 - jaw_y_min).max(1) as f32)).clamp(0.0, 1.0);
+            let amount = strength * m * y_w * 0.65;
+            let off = i * 4;
+            for c in 0..3 {
+                let s = f32::from(current.pixels[off + c]) / 255.0;
+                let enhanced = s + (s - blur[off + c]) * amount;
+                out.pixels[off + c] = (enhanced * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn apply_stray_hair_cpu(
@@ -7868,7 +9081,7 @@ fn hlf_rgb_f32_to_image(current: &Image, rgb: &[f32]) -> Result<Image, Refusal> 
     for (index, rgb) in rgb.chunks_exact(3).enumerate() {
         let offset = index * 4;
         for channel in 0..3 {
-            pixels[offset + channel] = StoreMode::TruncU8.quantize(rgb[channel]);
+            pixels[offset + channel] = StoreMode::Round.quantize(rgb[channel]);
         }
     }
     Ok(Image {
@@ -8598,7 +9811,8 @@ fn try_cuda_same_job_effect(
         90004 => {
             let resolved =
                 resolve_radiance_inputs(current, inputs.radiance).expect("validated PF90004 inputs");
-            let assets = radiance_assets();
+            // Without the tables the CPU path refuses with the missing input.
+            let Ok(assets) = radiance_assets() else { return None };
             let fixed = aurora_portrait::kernels::radiance::FixedAssets {
                 lut_a: &assets.lut_a,
                 lut_b: &assets.lut_b,
@@ -9822,6 +11036,333 @@ mod cuda_router {
 }
 
 #[cfg(windows)]
+const PORTRAIT_STAGE_EFFECTS_PTX: &str =
+    include_str!("../../portrait/native/cuda/portrait_stage_effects.ptx");
+
+#[cfg(windows)]
+fn upload_stage_bytes<'a>(
+    gpu: &'a aurora_portrait::cuda::Nvidia,
+    data: &[u8],
+) -> Result<aurora_portrait::cuda::DeviceBuffer<'a>, CudaError> {
+    let buf = gpu.alloc_buffer(data.len())?;
+    gpu.upload_buffer(&buf, data)?;
+    Ok(buf)
+}
+
+#[cfg(windows)]
+fn launch_stage_ptx(
+    kernel: &'static str,
+    width: u32,
+    height: u32,
+    build_and_launch: impl FnOnce(
+        &aurora_portrait::cuda::Nvidia,
+        (u32, u32),
+        (u32, u32),
+        &aurora_portrait::cuda::DeviceBuffer<'_>,
+        &aurora_portrait::cuda::DeviceBuffer<'_>,
+    ) -> Result<Dispatch, CudaError>,
+    source: &Image,
+) -> Result<(Image, Vec<Dispatch>), CudaError> {
+    let gpu = aurora_portrait::cuda::Nvidia::open_ptx(PORTRAIT_STAGE_EFFECTS_PTX)?;
+    let d_src = upload_stage_bytes(&gpu, &source.pixels)?;
+    let d_dst = gpu.alloc_buffer(source.pixels.len())?;
+    let block = (16u32, 16u32);
+    let grid = (width.div_ceil(block.0).max(1), height.div_ceil(block.1).max(1));
+    let dispatch = build_and_launch(&gpu, grid, block, &d_src, &d_dst)?;
+    let mut out = vec![0u8; source.pixels.len()];
+    gpu.download_buffer(&d_dst, &mut out)?;
+    let image = Image::new(width, height, out)
+        .ok_or(CudaError::Refused(Refusal::ShapeMismatch("output")))?;
+    let _ = kernel;
+    Ok((image, vec![dispatch]))
+}
+
+#[cfg(windows)]
+fn try_cuda_stage_mask_effect(
+    current: &Image,
+    pf: u32,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    region: NormRect,
+    inputs: &PortraitJobInputs<'_>,
+) -> Option<Result<(Image, Vec<Dispatch>), CudaError>> {
+    if !matches!(pf, 90001 | 90003 | 100005 | 30189 | 30209) {
+        return None;
+    }
+    if let Some(error) = forced_cuda_failure() {
+        return Some(Err(error));
+    }
+    if forced_cuda_empty_dispatch() {
+        return Some(Ok((current.clone(), Vec::new())));
+    }
+    let strength = degree.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return Some(Ok((current.clone(), Vec::new())));
+    }
+    let width = current.width;
+    let height = current.height;
+    let pixels = current.pixel_count();
+    if width == 0 || height == 0 {
+        return Some(Ok((current.clone(), Vec::new())));
+    }
+
+    match pf {
+        90001 => {
+            let skin = match required(skin_mask, "PF90001 skin mask")
+                .and_then(|s| check_plane(s.len(), pixels, "PF90001 skin mask").map(|_| s))
+            {
+                Ok(s) => s,
+                Err(r) => return Some(Err(CudaError::Refused(r))),
+            };
+            Some(launch_stage_ptx(
+                "pf90001_texture_smooth_kernel",
+                width,
+                height,
+                |gpu, grid, block, d_src, d_dst| {
+                    let d_skin = upload_stage_bytes(gpu, skin)?;
+                    let mut p_src = d_src.handle();
+                    let mut p_skin = d_skin.handle();
+                    let mut p_dst = d_dst.handle();
+                    let mut w = width;
+                    let mut h = height;
+                    let mut st = strength;
+                    let mut params = [
+                        (&mut p_src as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_skin as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_dst as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut w as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut h as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut st as *mut f32).cast::<std::ffi::c_void>(),
+                    ];
+                    gpu.launch_raw("pf90001_texture_smooth_kernel", grid, block, &mut params)
+                },
+                current,
+            ))
+        }
+        90003 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            let skin = match required(skin_mask, "PF90003 skin mask")
+                .and_then(|s| check_plane(s.len(), pixels, "PF90003 skin mask").map(|_| s))
+            {
+                Ok(s) => s,
+                Err(r) => return Some(Err(CudaError::Refused(r))),
+            };
+            if let Some(face) = face_mask.as_deref() {
+                if let Err(r) = check_plane(face.len(), pixels, "PF90003 face mask") {
+                    return Some(Err(CudaError::Refused(r)));
+                }
+            }
+            let mut sum = [0.0f64; 3];
+            let mut w_sum = 0.0f64;
+            for i in 0..pixels {
+                let s = f32::from(skin[i]) / 255.0;
+                let f = face_mask
+                    .as_deref()
+                    .map_or(0.0, |fm| f32::from(fm[i]) / 255.0);
+                let body = s * (1.0 - f * 0.85);
+                if body > 0.01 {
+                    let off = i * 4;
+                    for c in 0..3 {
+                        sum[c] += f64::from(current.pixels[off + c]) * f64::from(body);
+                    }
+                    w_sum += f64::from(body);
+                }
+            }
+            if w_sum <= 1e-6 {
+                return Some(Ok((current.clone(), Vec::new())));
+            }
+            let target_r = (sum[0] / w_sum) as f32;
+            let target_g = (sum[1] / w_sum) as f32;
+            let target_b = (sum[2] / w_sum) as f32;
+            let target_luma = (0.299 * target_r + 0.587 * target_g + 0.114 * target_b).max(1.0);
+            Some(launch_stage_ptx(
+                "pf90003_body_skin_uniform_kernel",
+                width,
+                height,
+                |gpu, grid, block, d_src, d_dst| {
+                    let d_skin = upload_stage_bytes(gpu, skin)?;
+                    let dummy = [0u8; 4];
+                    let (d_face, has_face) = match face_mask.as_deref() {
+                        Some(fm) => (upload_stage_bytes(gpu, fm)?, 1u32),
+                        None => (upload_stage_bytes(gpu, &dummy)?, 0u32),
+                    };
+                    let mut p_src = d_src.handle();
+                    let mut p_skin = d_skin.handle();
+                    let mut p_face = d_face.handle();
+                    let mut p_dst = d_dst.handle();
+                    let mut w = width;
+                    let mut h = height;
+                    let mut hf = has_face;
+                    let mut st = strength;
+                    let mut tr = target_r;
+                    let mut tg = target_g;
+                    let mut tb = target_b;
+                    let mut tl = target_luma;
+                    let mut params = [
+                        (&mut p_src as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_skin as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_face as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_dst as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut w as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut h as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut hf as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut st as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut tr as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut tg as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut tb as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut tl as *mut f32).cast::<std::ffi::c_void>(),
+                    ];
+                    gpu.launch_raw("pf90003_body_skin_uniform_kernel", grid, block, &mut params)
+                },
+                current,
+            ))
+        }
+        100005 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            let face = match required(face_mask.as_deref(), "PF100005 face mask")
+                .and_then(|f| check_plane(f.len(), pixels, "PF100005 face mask").map(|_| f))
+            {
+                Ok(f) => f,
+                Err(r) => return Some(Err(CudaError::Refused(r))),
+            };
+            let Some((x0, y0, x1, y1)) = mask_bbox(face, width as usize, height as usize) else {
+                return Some(Ok((current.clone(), Vec::new())));
+            };
+            let eye_y_end = (y0 + ((y1 - y0) as f32 * 0.62) as usize).min(y1);
+            Some(launch_stage_ptx(
+                "pf100005_eye_white_purify_kernel",
+                width,
+                height,
+                |gpu, grid, block, d_src, d_dst| {
+                    let d_face = upload_stage_bytes(gpu, face)?;
+                    let mut p_src = d_src.handle();
+                    let mut p_face = d_face.handle();
+                    let mut p_dst = d_dst.handle();
+                    let mut w = width;
+                    let mut h = height;
+                    let mut ux0 = x0 as u32;
+                    let mut uy0 = y0 as u32;
+                    let mut ux1 = x1 as u32;
+                    let mut uy_end = eye_y_end as u32;
+                    let mut st = strength;
+                    let mut params = [
+                        (&mut p_src as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_face as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_dst as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut w as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut h as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut ux0 as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut uy0 as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut ux1 as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut uy_end as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut st as *mut f32).cast::<std::ffi::c_void>(),
+                    ];
+                    gpu.launch_raw("pf100005_eye_white_purify_kernel", grid, block, &mut params)
+                },
+                current,
+            ))
+        }
+        30189 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            let mask = match face_mask
+                .as_deref()
+                .or(skin_mask)
+                .ok_or(Refusal::MissingInput("PF30189 face or skin mask"))
+                .and_then(|m| check_plane(m.len(), pixels, "PF30189 mask").map(|_| m))
+            {
+                Ok(m) => m,
+                Err(r) => return Some(Err(CudaError::Refused(r))),
+            };
+            let Some((x0, y0, x1, y1)) = mask_bbox(mask, width as usize, height as usize) else {
+                return Some(Ok((current.clone(), Vec::new())));
+            };
+            let cx = (x0 + x1) as f32 * 0.5;
+            let cy = y1 as f32;
+            let rx = ((x1 - x0) as f32 * 0.36).max(4.0);
+            let ry = ((y1 - y0) as f32 * 0.24).max(4.0);
+            Some(launch_stage_ptx(
+                "pf30189_double_chin_shadow_kernel",
+                width,
+                height,
+                |gpu, grid, block, d_src, d_dst| {
+                    let mut p_src = d_src.handle();
+                    let mut p_dst = d_dst.handle();
+                    let mut w = width;
+                    let mut h = height;
+                    let mut fcx = cx;
+                    let mut fcy = cy;
+                    let mut frx = rx;
+                    let mut fry = ry;
+                    let mut st = strength;
+                    let mut params = [
+                        (&mut p_src as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_dst as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut w as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut h as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut fcx as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut fcy as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut frx as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut fry as *mut f32).cast::<std::ffi::c_void>(),
+                        (&mut st as *mut f32).cast::<std::ffi::c_void>(),
+                    ];
+                    gpu.launch_raw("pf30189_double_chin_shadow_kernel", grid, block, &mut params)
+                },
+                current,
+            ))
+        }
+        30209 => {
+            let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
+            let mask = match face_mask
+                .as_deref()
+                .or(skin_mask)
+                .ok_or(Refusal::MissingInput("PF30209 face or skin mask"))
+                .and_then(|m| check_plane(m.len(), pixels, "PF30209 mask").map(|_| m))
+            {
+                Ok(m) => m,
+                Err(r) => return Some(Err(CudaError::Refused(r))),
+            };
+            let Some((x0, y0, x1, y1)) = mask_bbox(mask, width as usize, height as usize) else {
+                return Some(Ok((current.clone(), Vec::new())));
+            };
+            let jaw_y_min = y0 + ((y1 - y0) as f32 * 0.55) as usize;
+            Some(launch_stage_ptx(
+                "pf30209_jawline_enhance_kernel",
+                width,
+                height,
+                |gpu, grid, block, d_src, d_dst| {
+                    let d_mask = upload_stage_bytes(gpu, mask)?;
+                    let mut p_src = d_src.handle();
+                    let mut p_mask = d_mask.handle();
+                    let mut p_dst = d_dst.handle();
+                    let mut w = width;
+                    let mut h = height;
+                    let mut ux0 = x0 as u32;
+                    let mut ujy = jaw_y_min as u32;
+                    let mut ux1 = x1 as u32;
+                    let mut uy1 = y1 as u32;
+                    let mut st = strength;
+                    let mut params = [
+                        (&mut p_src as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_mask as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut p_dst as *mut u64).cast::<std::ffi::c_void>(),
+                        (&mut w as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut h as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut ux0 as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut ujy as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut ux1 as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut uy1 as *mut u32).cast::<std::ffi::c_void>(),
+                        (&mut st as *mut f32).cast::<std::ffi::c_void>(),
+                    ];
+                    gpu.launch_raw("pf30209_jawline_enhance_kernel", grid, block, &mut params)
+                },
+                current,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
 fn try_cuda_effect(
     current: &Image,
     pf: u32,
@@ -9833,6 +11374,42 @@ fn try_cuda_effect(
     }
     if let Some(error) = forced_cuda_failure() {
         return Some(Err(error));
+    }
+    if pf == 90001 {
+        let strength = degree.clamp(0.0, 1.0);
+        if strength <= 0.0 {
+            return Some(Ok((current.clone(), Vec::new())));
+        }
+        let skin = match required(skin_mask, "PF90001 skin mask")
+            .and_then(|s| check_plane(s.len(), current.pixel_count(), "PF90001 skin mask").map(|_| s))
+        {
+            Ok(s) => s,
+            Err(r) => return Some(Err(CudaError::Refused(r))),
+        };
+        return Some(launch_stage_ptx(
+            "pf90001_texture_smooth_kernel",
+            current.width,
+            current.height,
+            |gpu, grid, block, d_src, d_dst| {
+                let d_skin = upload_stage_bytes(gpu, skin)?;
+                let mut p_src = d_src.handle();
+                let mut p_skin = d_skin.handle();
+                let mut p_dst = d_dst.handle();
+                let mut w = current.width;
+                let mut h = current.height;
+                let mut st = strength;
+                let mut params = [
+                    (&mut p_src as *mut u64).cast::<std::ffi::c_void>(),
+                    (&mut p_skin as *mut u64).cast::<std::ffi::c_void>(),
+                    (&mut p_dst as *mut u64).cast::<std::ffi::c_void>(),
+                    (&mut w as *mut u32).cast::<std::ffi::c_void>(),
+                    (&mut h as *mut u32).cast::<std::ffi::c_void>(),
+                    (&mut st as *mut f32).cast::<std::ffi::c_void>(),
+                ];
+                gpu.launch_raw("pf90001_texture_smooth_kernel", grid, block, &mut params)
+            },
+            current,
+        ));
     }
     if !matches!(pf, 8068 | 8069 | 8070 | 21015 | 30096 | 90005 | 90007) {
         return None;
@@ -9956,8 +11533,8 @@ fn with_skin_lut<T>(
     })
 }
 
-fn decode_lut(png: &[u8], name: &'static str) -> Option<Vec<u8>> {
-    let image = image::load_from_memory(png).ok()?.into_rgb8();
+fn decode_lut(png: Option<&[u8]>, name: &'static str) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(png?).ok()?.into_rgb8();
     if image.width() as usize != LUT_EDGE || image.height() as usize != LUT_EDGE {
         log::warn!(
             "portrait LUT {name}: expected {LUT_EDGE}x{LUT_EDGE}, got {}x{}",
@@ -9970,14 +11547,23 @@ fn decode_lut(png: &[u8], name: &'static str) -> Option<Vec<u8>> {
     (bytes.len() == LUT_BYTES).then_some(bytes)
 }
 
+/// Shared by input validation and the capability panel; invalid tables do not
+/// count as installed just because some PNG bytes were embedded.
+pub(crate) fn missing_tone_table(pf: u32) -> Option<&'static str> {
+    match pf {
+        21015 if tint_green().is_none() || tint_magenta().is_none() => Some("skin tint LUT"),
+        30096 if cold_lut().is_none() || warm_lut().is_none() => Some("skin temperature LUT"),
+        90005 if whiten_lut().is_none() => Some("whiten LUT"),
+        90007 if ruddy_lut().is_none() => Some("ruddy LUT"),
+        _ => None,
+    }
+}
+
 fn tint_green() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/TintGreen.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/TintGreen.png"),
             "TintGreen.png",
         )
     })
@@ -9988,10 +11574,7 @@ fn tint_magenta() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/TintMagenta.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/TintMagenta.png"),
             "TintMagenta.png",
         )
     })
@@ -10002,10 +11585,7 @@ fn whiten_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/whiten.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/whiten.png"),
             "whiten.png",
         )
     })
@@ -10016,10 +11596,7 @@ fn ruddy_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/ruddy_new.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/ruddy_new.png"),
             "ruddy_new.png",
         )
     })
@@ -10030,10 +11607,7 @@ fn cold_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/cold.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/cold.png"),
             "cold.png",
         )
     })
@@ -10044,10 +11618,7 @@ fn warm_lut() -> Option<&'static [u8]> {
     static LUT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     LUT.get_or_init(|| {
         decode_lut(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/portrait/skin-adjust/warm.png"
-            )),
+            aurora_portrait::private_asset!("portrait/skin-adjust/warm.png"),
             "warm.png",
         )
     })
@@ -10199,28 +11770,20 @@ fn f32_asset(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn radiance_assets() -> &'static RadianceAssets {
-    static ASSETS: OnceLock<RadianceAssets> = OnceLock::new();
-    ASSETS.get_or_init(|| RadianceAssets {
-        lut_a: include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-lut-a.bin"
-        ))
-        .to_vec(),
-        lut_b: include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-lut-b.bin"
-        ))
-        .to_vec(),
-        gamma: f32_asset(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-gamma-rgba32f.bin"
-        ))),
-        matrices: f32_asset(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/portrait/radiance/native-color-matrices.bin"
-        ))),
-    })
+/// Decoded third-party tables, embedded from `private-assets/` when present.
+fn radiance_assets() -> Result<&'static RadianceAssets, aurora_portrait::Refusal> {
+    static ASSETS: OnceLock<Option<RadianceAssets>> = OnceLock::new();
+    ASSETS
+        .get_or_init(|| {
+            Some(RadianceAssets {
+                lut_a: aurora_portrait::private_asset!("portrait/radiance/native-lut-a.bin")?.to_vec(),
+                lut_b: aurora_portrait::private_asset!("portrait/radiance/native-lut-b.bin")?.to_vec(),
+                gamma: f32_asset(aurora_portrait::private_asset!("portrait/radiance/native-gamma-rgba32f.bin")?),
+                matrices: f32_asset(aurora_portrait::private_asset!("portrait/radiance/native-color-matrices.bin")?),
+            })
+        })
+        .as_ref()
+        .ok_or(aurora_portrait::Refusal::MissingInput("private-assets/portrait/radiance"))
 }
 
 fn apply_skin_radiance(
@@ -10234,7 +11797,7 @@ fn apply_skin_radiance(
         parsing_rgba: resolved.parsing_rgba,
         face_rgba: resolved.face_rgba,
     };
-    let assets = radiance_assets();
+    let assets = radiance_assets()?;
     let fixed = aurora_portrait::kernels::radiance::FixedAssets {
         lut_a: &assets.lut_a,
         lut_b: &assets.lut_b,
@@ -10407,6 +11970,27 @@ mod tests {
             Some(PortraitRuntimeStatus::MissingModel)
         );
 
+        // A body row's own same-job gap stays incomplete input even though no
+        // face producer ran for a body-only job.
+        let body = effect_run(
+            405,
+            PortraitBackend::Skipped,
+            false,
+            None,
+            Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
+                "body geometry job",
+            ))),
+            None,
+        );
+        let body_only = PortraitRunReport {
+            effects: vec![body],
+            ..Default::default()
+        };
+        assert_eq!(
+            body_only.status(405),
+            Some(PortraitRuntimeStatus::IncompleteInput)
+        );
+
         let no_target = PortraitRunReport {
             effects: vec![row.clone()],
             face_input_refusal: Some(Refusal::MissingInput("C1 face detection score")),
@@ -10441,6 +12025,7 @@ mod tests {
             None,
             2,
             2,
+            NormRect::FULL,
             &inputs,
             None,
         );
@@ -10629,26 +12214,10 @@ mod tests {
         ] {
             legacy = fnv_u64(legacy, u64::from(bits));
         }
-        legacy = fnv_usize(legacy, params.len());
-        for (key, value) in &params {
-            legacy = fnv_usize(legacy, key.len());
-            legacy = fnv1a64(legacy, key.as_bytes());
-            legacy = fnv_u64(legacy, u64::from(value.to_bits()));
-        }
+        legacy = fnv_u64(legacy, params_fingerprint(&params));
         legacy = fnv_usize(legacy, masks.width);
         legacy = fnv_usize(legacy, masks.height);
-        for (index, plane) in [&masks.skin, &masks.hair, &masks.face, &masks.body]
-            .into_iter()
-            .enumerate()
-        {
-            legacy = fnv_u64(legacy, index as u64);
-            legacy = fnv_u64(legacy, plane.as_ref().map_or(usize::MAX, Vec::len) as u64);
-            if let Some(plane) = plane {
-                for value in plane {
-                    legacy = fnv_u64(legacy, u64::from(value.to_bits()));
-                }
-            }
-        }
+        legacy = fnv_u64(legacy, masks.receipt_fingerprint());
 
         assert_eq!(receipt.frame_receipt().fingerprint(), legacy_frame);
         assert_eq!(receipt.fingerprint(), legacy);
@@ -11026,6 +12595,7 @@ mod tests {
                 &current,
                 NormRect::FULL,
                 &params,
+                &pf108_family(&params),
                 None,
                 &inputs,
                 None,
@@ -12404,8 +13974,88 @@ mod tests {
     fn portrait_effects_skip_refused_rows() {
         let mut rgba = frame(16, 16);
         let original = rgba.clone();
-        apply(&mut rgba, 16, 16, &[("pc:90001", 50.0)]);
+        apply(&mut rgba, 16, 16, &[("pc:999999", 50.0)]);
         assert_eq!(rgba, original, "refused rows must not change pixels");
+    }
+
+    #[test]
+    fn newly_wired_portrait_effects_produce_pixels() {
+        let width = 32u32;
+        let height = 32u32;
+        let mut base = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                base[idx] = ((x * 7 + y * 3) % 200 + 30) as u8;
+                base[idx + 1] = ((x * 5 + y * 9) % 180 + 40) as u8;
+                base[idx + 2] = ((x * 3 + y * 11) % 160 + 50) as u8;
+                base[idx + 3] = 255;
+            }
+        }
+        let img = Image::new(width, height, base.clone()).unwrap();
+        let full_mask = vec![255u8; (width * height) as usize];
+        let half_face_mask: Vec<u8> = (0..(width * height) as usize)
+            .map(|i| if (i / width as usize) < 16 { 255 } else { 0 })
+            .collect();
+
+        // PF90001
+        let r90001 = apply_texture_smooth(&img, 0.8, Some(&full_mask)).unwrap();
+        assert_ne!(r90001.pixels, base, "PF90001 should smooth pixels");
+
+        // PF90003
+        let r90003 = apply_body_skin_uniform(&img, 0.8, Some(&full_mask), Some(&half_face_mask)).unwrap();
+        assert_ne!(r90003.pixels, base, "PF90003 should uniform body skin");
+
+        // PF21104
+        let r21104 = apply_nose_flaws(&img, 0.8, Some(&full_mask), Some(&full_mask)).unwrap();
+        assert_ne!(r21104.pixels, base, "PF21104 should repair nose region");
+
+        // PF100005
+        let mut eye_img = img.clone();
+        for p in eye_img.pixels.chunks_exact_mut(4) {
+            p[0] = 190;
+            p[1] = 175;
+            p[2] = 140;
+            p[3] = 255;
+        }
+        let r100005 = apply_eye_white_purify(&eye_img, 0.9, Some(&full_mask)).unwrap();
+        assert_ne!(r100005.pixels, eye_img.pixels, "PF100005 should purify eye white");
+
+        // PF90087
+        let mut hair_img = img.clone();
+        for (i, p) in hair_img.pixels.chunks_exact_mut(4).enumerate() {
+            if i % 10 == 0 {
+                p[0] = 220;
+                p[1] = 210;
+                p[2] = 200;
+            } else {
+                p[0] = 35;
+                p[1] = 30;
+                p[2] = 28;
+            }
+            p[3] = 255;
+        }
+        let r90087 = apply_hair_part_fill(&hair_img, 0.9, Some(&full_mask)).unwrap();
+        assert_ne!(r90087.pixels, hair_img.pixels, "PF90087 should fill hair parting");
+
+        // PF30188 / PF30189 / PF30209
+        let r30188 = apply_double_chin_degree(&img, 0.8, Some(&full_mask), None).unwrap();
+        assert_ne!(r30188.pixels, base, "PF30188 should warp lower chin");
+        let r30189 = apply_double_chin_shadow(&img, 0.8, Some(&full_mask), None).unwrap();
+        assert_ne!(r30189.pixels, base, "PF30189 should soften chin shadow");
+        let r30209 = apply_jawline_enhance(&img, 0.8, Some(&full_mask), None).unwrap();
+        assert_ne!(r30209.pixels, base, "PF30209 should enhance jawline");
+
+        // PF8050 / PF8051
+        let mut pts194 = [[16.0f32, 16.0f32]; 194];
+        pts194[18] = [6.0, 12.0];
+        pts194[22] = [12.0, 12.0];
+        pts194[26] = [9.0, 12.0];
+        pts194[36] = [20.0, 12.0];
+        pts194[40] = [26.0, 12.0];
+        pts194[44] = [23.0, 12.0];
+        let eye_res = apply_eye_overall_size(&img, &pts194, [0.8, -0.8]);
+        assert!(eye_res.image.is_some(), "PF8050/8051 should warp eye regions");
     }
 
     #[test]
@@ -13340,6 +14990,9 @@ mod tests {
                     run.metal_dispatches
                 )
             }
+            PortraitBackend::Wgpu => {
+                panic!("PF30026 has no WGPU route")
+            }
         }
     }
 
@@ -14122,6 +15775,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn wl51_full_owned_b3_bundle_matches_cpu_cuda_and_fallback() {
         let (width, height) = (32u32, 24u32);
         let source = frame(width, height);
@@ -14834,6 +16488,9 @@ mod tests {
                             "PF{pf} Metal row must carry a dispatch receipt"
                         );
                     }
+                    PortraitBackend::Wgpu => {
+                        assert!(effect.executed, "PF{pf}");
+                    }
                 }
             }
         }
@@ -14851,6 +16508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn skin_lut_effects_change_a_warm_tone() {
         for (pf, degree) in [(21015u32, 0.9f32), (30096, 0.1), (90005, 0.9), (90007, 0.9)] {
             let mut rgba = frame(8, 8);
@@ -14930,6 +16588,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_requires_an_owned_same_job_bundle() {
         let masks = PortraitMasks::solid(1.0);
         let absent = PortraitJobInputs::from_renderer_job(1, &masks);
@@ -15034,6 +16693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_producer_writer_is_atomic_and_frame_exact() {
         let bundle = || {
             Pf90004ProducerInputs::from_same_job(
@@ -15225,6 +16885,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_cuda_route_matches_cpu_oracle_and_reports_dispatch() {
         let (width, height) = (35u32, 27u32);
         let pixels = (width * height) as usize;
@@ -15295,6 +16956,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf90004_forced_cuda_failure_uses_cpu_oracle() {
         let (width, height) = (8u32, 8u32);
         let pixels = (width * height) as usize;
@@ -15343,6 +17005,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn cuda_ported_stages_match_cpu_pixels_when_available() {
         let source = Image::new(8, 8, frame(8, 8)).expect("frame");
         let masks = PortraitMasks::solid(1.0);
@@ -15391,6 +17054,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf30096_forced_cuda_failure_falls_back_to_cpu() {
         let (width, height) = (8u32, 8u32);
         let source = Image::new(width, height, frame(width, height)).expect("frame");
@@ -15424,6 +17088,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn pf30096_report_marks_the_real_backend() {
         let (width, height) = (8u32, 8u32);
         let source = Image::new(width, height, frame(width, height)).expect("frame");
@@ -15464,6 +17129,10 @@ mod tests {
                     effect.metal_dispatches
                 )
             }
+            PortraitBackend::Wgpu => {
+                assert!(effect.executed);
+                assert!(effect.dispatches.is_empty());
+            }
         }
     }
 
@@ -15496,6 +17165,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn cuda_fixed_point_tint_route_matches_cpu_when_available() {
         let source = Image::solid(16, 16, [181, 139, 103, 255]);
         let masks = PortraitMasks::solid(1.0);
@@ -15517,6 +17187,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn run_report_does_not_label_cpu_as_cuda() {
         let mut rgba = frame(8, 8);
         let map = BTreeMap::from([("pc:90005".to_string(), 0.9)]);
@@ -15549,6 +17220,10 @@ mod tests {
                     !effect.metal_dispatches.is_empty(),
                     "PF90005 Metal row must carry a dispatch receipt"
                 );
+                assert!(effect.dispatches.is_empty());
+            }
+            PortraitBackend::Wgpu => {
+                assert!(effect.executed);
                 assert!(effect.dispatches.is_empty());
             }
         }
@@ -15664,6 +17339,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn face_width_mesh_auto_records_backend_and_matches_cpu() {
         let (cpu_frame, cpu_report) = run_face_width_mesh_stage(true);
         assert_eq!(
@@ -15763,5 +17439,118 @@ mod tests {
         assert_eq!(borrowed.hardlight.len(), owned.hardlight.len());
         assert_eq!(borrowed.beauty.len(), owned.beauty.len());
         assert_eq!((borrowed.pivot, borrowed.gain), (owned.pivot, owned.gain));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cuda_stage_mask_effects_match_cpu_reference() {
+        let width = 32u32;
+        let height = 32u32;
+        let pixels = (width * height) as usize;
+        let mut rgba = Vec::with_capacity(pixels * 4);
+        let mut skin: Vec<u8> = Vec::with_capacity(pixels);
+        let mut face: Vec<u8> = Vec::with_capacity(pixels);
+        for y in 0..height {
+            for x in 0..width {
+                let r = ((x * 7 + y * 5 + 40) % 220 + 20) as u8;
+                let g = ((x * 5 + y * 9 + 35) % 210 + 25) as u8;
+                let b = ((x * 3 + y * 11 + 30) % 200 + 30) as u8;
+                rgba.extend_from_slice(&[r, g, b, 255]);
+                let in_skin = (4..28).contains(&x) && (4..28).contains(&y);
+                let in_face = (8..24).contains(&x) && (6..22).contains(&y);
+                skin.push(if in_skin { 210 } else { 0 });
+                face.push(if in_face { 230 } else { 0 });
+            }
+        }
+        // Add bright low-saturation sclera-like pixels in upper face bbox for PF100005.
+        for y in 9..13 {
+            for x in 11..15 {
+                let off = ((y * width + x) * 4) as usize;
+                rgba[off] = 215;
+                rgba[off + 1] = 205;
+                rgba[off + 2] = 195;
+            }
+        }
+        let source = Image::new(width, height, rgba).expect("source image");
+        let region = NormRect::FULL;
+        let mask_bundle = PortraitMasks {
+            skin: Some(skin.iter().map(|&v| f32::from(v) / 255.0).collect()),
+            face: Some(face.iter().map(|&v| f32::from(v) / 255.0).collect()),
+            width: width as usize,
+            height: height as usize,
+            ..Default::default()
+        };
+        let skin_u8 = mask_bundle
+            .mask_u8(MaskKind::Skin, width, height, region)
+            .expect("skin u8");
+        let face_u8 = mask_bundle
+            .mask_u8(MaskKind::Face, width, height, region)
+            .expect("face u8");
+        let inputs = PortraitJobInputs::new(&mask_bundle);
+
+        let cases: [(u32, f32, Image); 5] = [
+            (
+                90001,
+                0.75,
+                apply_texture_smooth(&source, 0.75, Some(&skin_u8)).expect("cpu 90001"),
+            ),
+            (
+                90003,
+                0.65,
+                apply_body_skin_uniform(&source, 0.65, Some(&skin_u8), Some(&face_u8))
+                    .expect("cpu 90003"),
+            ),
+            (
+                100005,
+                0.80,
+                apply_eye_white_purify(&source, 0.80, Some(&face_u8)).expect("cpu 100005"),
+            ),
+            (
+                30189,
+                0.70,
+                apply_double_chin_shadow(&source, 0.70, Some(&face_u8), Some(&skin_u8))
+                    .expect("cpu 30189"),
+            ),
+            (
+                30209,
+                0.85,
+                apply_jawline_enhance(&source, 0.85, Some(&face_u8), Some(&skin_u8))
+                    .expect("cpu 30209"),
+            ),
+        ];
+
+        for (pf, degree, cpu_ref) in cases {
+            let gpu_res = try_cuda_stage_mask_effect(
+                &source,
+                pf,
+                degree,
+                Some(&skin_u8),
+                region,
+                &inputs,
+            )
+            .expect("handled by try_cuda_stage_mask_effect");
+            let (gpu_img, dispatches) = match gpu_res {
+                Ok(pair) => pair,
+                Err(err) => {
+                    assert!(
+                        std::env::var_os("PORTRAIT_CUDA_REQUIRED").is_none(),
+                        "CUDA required for PF{pf} but failed: {err:?}"
+                    );
+                    return;
+                }
+            };
+            assert_eq!(dispatches.len(), 1, "PF{pf} should emit 1 CUDA dispatch");
+            let max_diff = gpu_img
+                .pixels
+                .iter()
+                .zip(cpu_ref.pixels.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_diff <= 1,
+                "PF{pf} CUDA vs CPU max byte diff {max_diff} > 1"
+            );
+        }
     }
 }

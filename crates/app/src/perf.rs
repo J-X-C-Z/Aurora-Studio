@@ -368,6 +368,10 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
     }
     cx.spawn(async move |cx| {
         state.update(cx, |s, cx| {
+            // Only the explicit diagnostic replay touches this transient UI selection.
+            if let Some(scope)=std::env::var("AURORA_PERF_SCOPE").ok().and_then(|v|match v.as_str(){
+                "waveform"=>Some(crate::state::ScopeKind::Waveform),"parade"=>Some(crate::state::ScopeKind::Parade),
+                "vector"=>Some(crate::state::ScopeKind::Vectorscope),_=>None}) {s.prefs.panels.scope_kind=scope;}
             s.tool_tab = ToolTab::Grading;
             cx.notify();
         });
@@ -383,6 +387,30 @@ pub(crate) fn replay(state: Entity<AppState>, window: AnyWindowHandle, cx: &mut 
             record(serde_json::json!({"event": "window", "active": window.is_window_active(),
                 "gpu": format!("{:?}", window.gpu_specs()), "power_mode": format!("{:?}", cx.power_mode())}));
         }).expect("replay window closed");
+        // Read-only reopen probe: report the document the actual workspace loaded.
+        // The separate `verify-export` mode exercises the menu action on the caller's selection;
+        // neither mode performs a slider gesture. Diagnostics are off in normal use.
+        let mode = std::env::var("AURORA_PERF_REPLAY").unwrap_or_default();
+        state.read_with(cx, |s, _| record(serde_json::json!({
+            "event": "opened_document", "file": s.current_info().map(|i| &i.file_name),
+            "exposure": s.adj().exposure.exposure, "selected": s.library.selection.len(),
+            "has_frame": s.preview_state.preview.frame.is_some()
+        })));
+        if mode == "inspect" || mode == "verify-export" {
+            if mode == "verify-export" {
+                let _ = window.update(cx, |_, window, cx| window.dispatch_action(Box::new(crate::actions::ExportSelected), cx));
+                for _ in 0..600 {
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    if state.read_with(cx, |s, _| !s.tasks.jobs.is_empty() && s.tasks.jobs.iter().all(|j| matches!(&j.status, aurora_engine::JobStatus::Done { .. } | aurora_engine::JobStatus::Failed { .. }))) { break; }
+                }
+                state.read_with(cx, |s, _| record(serde_json::json!({
+                    "event": "export_action", "jobs": s.tasks.jobs.len(),
+                    "completed": s.tasks.jobs.iter().filter(|j| matches!(&j.status, aurora_engine::JobStatus::Done{..})).count()
+                })));
+            }
+            state.update(cx, |s, cx| s.flush_and_quit(cx));
+            return;
+        }
         record(serde_json::json!({"event": "drag_start"}));
         for step in 0..120 {
             cx.background_executor().timer(Duration::from_millis(8)).await;

@@ -170,9 +170,71 @@ static __device__ __forceinline__ float dehaze_soft(float x, float a) {
     return fmaxf(x, 0.0f) + t * t * t / (6.0f * a * a);
 }
 
+static __device__ __forceinline__ void dehaze_core_dev(
+    float omega, const float a[3], const float ah[3], const float in[3], float out[3]
+) {
+    const float eps = 1.1920929e-7f;
+    float i1[3] = {in[0], in[1], in[2]};
+    float a1[3] = {a[0], a[1], a[2]};
+    float recovered[3] = {0.0f, 0.0f, 0.0f};
+    if (omega > 0.0f) {
+        for (int k = 0; k < 3; ++k) {
+            i1[k] = dehaze_soft(i1[k] - ah[k], ah[k]);
+            a1[k] = dehaze_soft(a1[k] - ah[k], ah[k]);
+        }
+        float li = luma709(i1[0], i1[1], i1[2]);
+        float la = luma709(a1[0], a1[1], a1[2]);
+        float keep = la / fmaxf(li + la, eps);
+        for (int k = 0; k < 3; ++k) {
+            recovered[k] = (1.0f - keep) * i1[k];
+            i1[k] *= keep;
+        }
+    }
+    float m_raw = fminf(fminf(i1[0] / fmaxf(a1[0], eps), i1[1] / fmaxf(a1[1], eps)),
+                        i1[2] / fmaxf(a1[2], eps));
+    float m = clampf(m_raw, 0.0f, 1.0f);
+    if (omega > 0.0f) {
+        float mag = sqrtf(i1[0] * i1[0] + i1[1] * i1[1] + i1[2] * i1[2]);
+        float dvec[3] = {m_raw * a1[0], m_raw * a1[1], m_raw * a1[2]};
+        float dx = i1[0] - dvec[0];
+        float dy = i1[1] - dvec[1];
+        float dz = i1[2] - dvec[2];
+        float mag_d = sqrtf(dx * dx + dy * dy + dz * dz);
+        float ratio = fmaxf(mag + eps, eps);
+        float val = (ratio * 3.0f - (mag_d + eps) * 8.0f) / ratio;
+        float t = 1.0f / (1.0f + expf((0.5f - val) * 4.0f));
+        m *= t;
+        for (int k = 0; k < 3; ++k) {
+            recovered[k] += (1.0f - t) * i1[k];
+            i1[k] *= t;
+        }
+    }
+    float omega_eff = (omega < 0.0f) ? (omega * 2.0f) : omega;
+    float t0 = fmaxf(1.0f - omega_eff * m, 0.05f);
+    for (int k = 0; k < 3; ++k) {
+        out[k] = (i1[k] - a1[k]) / t0 + a1[k] + recovered[k];
+    }
+    float max_i = fmaxf(fmaxf(i1[0], i1[1]), i1[2]);
+    if (max_i > eps) {
+        float sat_i = (max_i - fminf(fminf(i1[0], i1[1]), i1[2])) / max_i;
+        float limit = sat_i * sqrtf(1.0f + (0.5f + 2.0f * m_raw) * (0.5f + 2.0f * m_raw));
+        float max_o = fmaxf(fmaxf(out[0], out[1]), out[2]);
+        if (max_o > eps) {
+            float sat_o = (max_o - fminf(fminf(out[0], out[1]), out[2])) / max_o;
+            if (sat_o > limit) {
+                float k = limit / sat_o;
+                float l = luma709(out[0], out[1], out[2]);
+                out[0] = k * out[0] + (1.0f - k) * l;
+                out[1] = k * out[1] + (1.0f - k) * l;
+                out[2] = k * out[2] + (1.0f - k) * l;
+            }
+        }
+    }
+}
+
 static __device__ __forceinline__ float3 apply_dehaze(float3 g, const float* P) {
-    const float omega = P[P_DEHAZE_OMEGA];
-    if (omega <= 0.0f || !isfinite(omega)) {
+    const float omega = clampf(P[P_DEHAZE_OMEGA], -1.0f, 1.0f);
+    if (omega == 0.0f || !isfinite(omega)) {
         return g;
     }
     float c[3] = {
@@ -197,58 +259,18 @@ static __device__ __forceinline__ float3 apply_dehaze(float3 g, const float* P) 
         float v = k == 0 ? g.x : (k == 1 ? g.y : g.z);
         in[k] = use_level[k] ? (v - lo[k]) / span[k] * 65535.0f : v * 65535.0f;
     }
-    const float eps = 1e-6f;
     const float delta = fminf(2.0f * omega, 1.0f);
-    float ah[3] = {c[0] * delta, c[1] * delta, c[2] * delta};
-    float i1[3];
-    float a1[3];
-    for (int k = 0; k < 3; ++k) {
-        i1[k] = dehaze_soft(in[k] - ah[k], ah[k]);
-        a1[k] = dehaze_soft(a[k] - ah[k], ah[k]);
-    }
-    float recovered[3];
-    float li = luma709(i1[0], i1[1], i1[2]);
-    float la = luma709(a1[0], a1[1], a1[2]);
-    float keep = la / fmaxf(li + la, eps);
-    for (int k = 0; k < 3; ++k) {
-        recovered[k] = (1.0f - keep) * i1[k];
-        i1[k] *= keep;
-    }
-    float m_raw = fminf(fminf(i1[0] / fmaxf(a1[0], eps), i1[1] / fmaxf(a1[1], eps)),
-                        i1[2] / fmaxf(a1[2], eps));
-    float m0 = clampf(m_raw, 0.0f, 1.0f);
-    float mag = sqrtf(i1[0] * i1[0] + i1[1] * i1[1] + i1[2] * i1[2]);
-    float dvec[3] = {m0 * a1[0], m0 * a1[1], m0 * a1[2]};
-    float dx = i1[0] - dvec[0];
-    float dy = i1[1] - dvec[1];
-    float dz = i1[2] - dvec[2];
-    float mag_d = sqrtf(dx * dx + dy * dy + dz * dz);
-    float ratio = fmaxf(mag + eps, eps);
-    float val = (ratio * 0.375f - (mag_d + eps) * (4.0f / 7.0f)) / ratio;
-    float t = 1.0f / (1.0f + expf((0.5f - val) * 4.0f));
-    float m = m0 * t;
-    for (int k = 0; k < 3; ++k) {
-        recovered[k] += (1.0f - t) * i1[k];
-        i1[k] *= t;
-    }
-    float t0 = fmaxf(1.0f - omega * m, 0.05f);
+    const float a_min = fminf(fminf(a[0], a[1]), a[2]);
+    float ah[3] = {a_min * delta, a_min * delta, a_min * delta};
     float out[3];
-    for (int k = 0; k < 3; ++k) {
-        out[k] = (i1[k] - a1[k]) / t0 + a1[k] + recovered[k];
-    }
-    float max_i = fmaxf(fmaxf(i1[0], i1[1]), i1[2]);
-    if (max_i > eps) {
-        float sat_i = (max_i - fminf(fminf(i1[0], i1[1]), i1[2])) / max_i;
-        float limit = sat_i * sqrtf(1.0f + (0.5f + 2.0f * m_raw) * (0.5f + 2.0f * m_raw));
-        float max_o = fmaxf(fmaxf(out[0], out[1]), out[2]);
-        if (max_o > eps) {
-            float sat_o = (max_o - fminf(fminf(out[0], out[1]), out[2])) / max_o;
-            if (sat_o > limit) {
-                float k = limit / sat_o;
-                float l = luma709(out[0], out[1], out[2]);
-                out[0] = k * out[0] + (1.0f - k) * l;
-                out[1] = k * out[1] + (1.0f - k) * l;
-                out[2] = k * out[2] + (1.0f - k) * l;
+    dehaze_core_dev(omega, a, ah, in, out);
+    if (omega > 0.0f) {
+        const float white_ref[3] = {65535.0f, 65535.0f, 65535.0f};
+        float ref_out[3];
+        dehaze_core_dev(omega, a, ah, white_ref, ref_out);
+        for (int k = 0; k < 3; ++k) {
+            if (ref_out[k] > 1e-3f) {
+                out[k] *= white_ref[k] / ref_out[k];
             }
         }
     }
@@ -261,11 +283,15 @@ static __device__ __forceinline__ float3 apply_dehaze(float3 g, const float* P) 
     return make_float3(result[0], result[1], result[2]);
 }
 
-static __device__ __forceinline__ float hdr_toe(float x, float k) {
+static __device__ __forceinline__ float hdr_ramp(float x) {
     float u = x * (2.0f * 0.9f);
     float v = fabsf(u) + 1.0f;
-    float r = (u * v) / (v + u * u) * 0.5f + 0.5f;
-    r = fmaxf(r, u - r + 1.0f) * (1.0f / (2.0f * k));
+    float r0 = (u * v) / (v + u * u) * 0.5f + 0.5f;
+    return fmaxf(r0, u - r0 + 1.0f) * 0.5f;
+}
+
+static __device__ __forceinline__ float hdr_toe(float x, float k) {
+    float r = hdr_ramp(x) / k;
     float s = r * r;
     float num = (1.0f + r + s) * (r + s * s);
     return num / (1.0f + num) * k;
@@ -275,44 +301,47 @@ static __device__ __forceinline__ float hdr_inv_toe(float x, float k) {
     return hdr_toe(-x, k);
 }
 
-#define HDR_K 1.0f
-
 static __device__ __forceinline__ float3 apply_hdr(float3 g, const float* P) {
     const float highlights = P[P_HDR + 0];
     const float shadows = P[P_HDR + 1];
     const float whites = P[P_HDR + 2];
     const float blacks = P[P_HDR + 3];
-    float x = luma709(g.x, g.y, g.z);
-    float shift = 0.0f;
-    if (whites != 0.0f) {
-        shift += whites / 100.0f * 0.2f * sstep(0.65f, 1.0f, x);
-    }
-    if (blacks != 0.0f) {
-        shift += blacks / 100.0f * 0.12f * (1.0f - sstep(0.0f, 0.25f, x));
-    }
-    if (fabsf(shift) > 1e-5f) {
-        float k = fmaxf(x + shift, 0.0f) / fmaxf(x, 1e-4f);
-        g.x *= k;
-        g.y *= k;
-        g.z *= k;
-    }
-    if (highlights == 0.0f && shadows == 0.0f) {
+    if (highlights == 0.0f && shadows == 0.0f && whites == 0.0f && blacks == 0.0f) {
         return g;
     }
-    x = luma709(g.x, g.y, g.z);
-    float m = clampf(highlights / 100.0f, -1.0f, 1.0f);
-    float b = 1.0f;
-    if (m != 0.0f) {
-        float t = hdr_toe(x, HDR_K);
-        b = exp2f(m < 0.0f ? -t : t) * fabsf(m) + (1.0f - fabsf(m));
+    float x_ev = log2f(fmaxf(luma709(g.x, g.y, g.z), 1e-6f) / 0.18f);
+
+    float g_sh = 1.0f;
+    if (shadows != 0.0f) {
+        float m = clampf(shadows / 100.0f, -1.0f, 1.0f);
+        float t = hdr_inv_toe(x_ev, 2.1f);
+        g_sh = exp2f(m < 0.0f ? -t : t) * fabsf(m) + (1.0f - fabsf(m));
     }
-    m = clampf(shadows / 100.0f, -1.0f, 1.0f);
-    float a = 1.0f;
-    if (m != 0.0f) {
-        float t = hdr_inv_toe(x, HDR_K);
-        a = exp2f(m < 0.0f ? -t : t) * fabsf(m) + (1.0f - fabsf(m));
+
+    float g_hi = 1.0f;
+    if (highlights != 0.0f) {
+        float m = clampf(highlights * 0.6f / 100.0f, -1.0f, 1.0f);
+        float t = hdr_toe(x_ev, 3.0f);
+        g_hi = exp2f(m < 0.0f ? -t : t) * fabsf(m) + (1.0f - fabsf(m));
     }
-    float gain = a / b;
+
+    float g_bl = 1.0f;
+    if (blacks != 0.0f) {
+        float m = clampf(blacks / 100.0f, -1.0f, 1.0f);
+        float t1 = hdr_inv_toe(x_ev, 4.2f) - hdr_inv_toe(x_ev, 2.1f);
+        float x_sh = x_ev + log2f(g_sh) + t1;
+        float t2 = t1 + hdr_inv_toe(x_sh + 5.0f / 3.0f, 4.2f - 2.1f);
+        g_bl = exp2f(m < 0.0f ? (-4.0f * t2) : t2) * fabsf(m) + (1.0f - fabsf(m));
+    }
+
+    float g_wh = 1.0f;
+    if (whites != 0.0f) {
+        float m = clampf(-whites / 100.0f, -1.0f, 1.0f);
+        float t = hdr_ramp(x_ev - log2f(g_hi) - 10.0f / 9.0f);
+        g_wh = exp2f(m < 0.0f ? (-4.0f * t) : t) * fabsf(m) + (1.0f - fabsf(m));
+    }
+
+    float gain = (g_sh * g_bl) / (g_hi * g_wh);
     g.x *= gain;
     g.y *= gain;
     g.z *= gain;

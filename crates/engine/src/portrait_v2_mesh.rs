@@ -18,23 +18,28 @@ pub const OFFSET_UV_SHA256: &str =
 pub const GRID_2005_SHA256: &str =
     "8051D0EBB85B8007AC4190BE28E9DCBDB671A480F589FF36D92A8A0AA1CF8548";
 
-const TOPOLOGY: &[u8] = include_bytes!("../assets/portrait/vface/topology2982.u16le");
-const FACE_COEFF: &[u8] = include_bytes!("../assets/portrait/vface/face_coeff526.f32le");
-const TRIANGLE_WEIGHTS: &[u8] =
-    include_bytes!("../assets/portrait/vface/triangle_weights994.f32le");
-const OFFSET_UV: &[u8] = include_bytes!("../assets/portrait/vface/uv526.f32le");
-const GRID_2005: &[u8] = include_bytes!("../assets/portrait/vface/atlas/Grid_2005.rgba8");
-const GRID_2010_POSITIVE: &[u8] =
-    include_bytes!("../assets/portrait/vface/atlas/Grid_2010_Positive.rgba8");
-const GRID_2011_POSITIVE: &[u8] =
-    include_bytes!("../assets/portrait/vface/atlas/Grid_2011_Positive.rgba8");
-const GRID_2010_NEGATIVE: &[u8] =
-    include_bytes!("../assets/portrait/vface/atlas/Grid_2010_Negative.rgba8");
-const GRID_2011_NEGATIVE: &[u8] =
-    include_bytes!("../assets/portrait/vface/atlas/Grid_2011_Negative.rgba8");
+// Decoded third-party mesh data and atlases, embedded from `private-assets/`
+// when present. Without them the V2 mesh and VFace rows refuse.
+const TOPOLOGY_ASSET: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/topology2982.u16le");
+const FACE_COEFF_ASSET: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/face_coeff526.f32le");
+const TRIANGLE_WEIGHTS_ASSET: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/triangle_weights994.f32le");
+const OFFSET_UV_ASSET: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/uv526.f32le");
+const GRID_2005_ASSET: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/atlas/Grid_2005.rgba8");
+const GRID_2010_POSITIVE: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/atlas/Grid_2010_Positive.rgba8");
+const GRID_2011_POSITIVE: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/atlas/Grid_2011_Positive.rgba8");
+const GRID_2010_NEGATIVE: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/atlas/Grid_2010_Negative.rgba8");
+const GRID_2011_NEGATIVE: Option<&[u8]> = aurora_portrait::private_asset!("portrait/vface/atlas/Grid_2011_Negative.rgba8");
 
-pub fn captured_grid_2005() -> Vec<u8> {
-    GRID_2005.to_vec()
+// Empty when absent; `from_landmarks` refuses before reading them.
+const TOPOLOGY: &[u8] = match TOPOLOGY_ASSET { Some(bytes) => bytes, None => &[] };
+const FACE_COEFF: &[u8] = match FACE_COEFF_ASSET { Some(bytes) => bytes, None => &[] };
+const TRIANGLE_WEIGHTS: &[u8] = match TRIANGLE_WEIGHTS_ASSET { Some(bytes) => bytes, None => &[] };
+const OFFSET_UV: &[u8] = match OFFSET_UV_ASSET { Some(bytes) => bytes, None => &[] };
+
+pub fn captured_grid_2005() -> Result<Vec<u8>, Refusal> {
+    GRID_2005_ASSET
+        .map(<[u8]>::to_vec)
+        .ok_or(Refusal::MissingInput("private-assets/portrait/vface/atlas/Grid_2005.rgba8"))
 }
 
 pub fn zero_base_280() -> Vec<[f32; 4]> {
@@ -99,7 +104,7 @@ fn captured_atlas(row: Row) -> std::sync::Arc<Vec<u8>> {
         Row::LeftNegative => GRID_2010_NEGATIVE,
         Row::RightNegative => GRID_2011_NEGATIVE,
     };
-    cache.get_or_init(|| std::sync::Arc::new(pixels.to_vec())).clone()
+    cache.get_or_init(|| std::sync::Arc::new(pixels.unwrap_or_default().to_vec())).clone()
 }
 
 pub fn from_landmarks(
@@ -113,6 +118,9 @@ pub fn from_landmarks(
         || points194.iter().flatten().any(|value| !value.is_finite())
     {
         return Err(Refusal::ShapeMismatch("PF8025/PF8026 points194/frame"));
+    }
+    if [TOPOLOGY_ASSET, FACE_COEFF_ASSET, TRIANGLE_WEIGHTS_ASSET, OFFSET_UV_ASSET].iter().any(Option::is_none) {
+        return Err(Refusal::MissingInput("private-assets/portrait/vface"));
     }
     if hex(&super::sha256_32(TOPOLOGY)) != TOPOLOGY_SHA256
         || hex(&super::sha256_32(FACE_COEFF)) != FACE_COEFF_SHA256

@@ -465,6 +465,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn parses_a_real_sidecar_with_global_and_local_layers() {
         let document = CosDocument::parse(&sample("_sample_layers.cos")).expect("parses");
         assert_eq!(document.version, Some(1530));
@@ -503,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn writes_the_real_sidecar_byte_for_byte() {
         let bytes = sample("_sample_layers.cos");
         let document = CosDocument::parse(&bytes).expect("parses");
@@ -511,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn an_edit_changes_only_the_requested_value() {
         let bytes = sample("_sample_layers.cos");
         let document = CosDocument::parse(&bytes).expect("parses");
@@ -536,6 +539,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn appends_keys_that_the_file_did_not_have() {
         let bytes = sample("_sample_layers.cos");
         let document = CosDocument::parse(&bytes).expect("parses");
@@ -585,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn unchanged_adjustments_leave_the_file_alone() {
         let dir = scratch("unchanged");
         let (comask, uuid) = comask_fixture();
@@ -611,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn one_layer_exposure_is_written() {
         let dir = scratch("layer");
         let (comask, uuid) = comask_fixture();
@@ -721,6 +727,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_real_sidecar_round_trips_through_save() {
         let bytes = sample("_sample_layers.cos");
         let dir = scratch("sample");

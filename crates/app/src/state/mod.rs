@@ -24,6 +24,7 @@ mod tasks;
 mod device;
 mod preview;
 mod library;
+pub(crate) mod portrait_capability;
 pub(crate) mod scopes;
 
 use std::collections::{HashMap, HashSet};
@@ -51,7 +52,7 @@ pub use library::LibraryState;
 pub use scopes::ScopeKind;
 pub use nodes::{GraphExt, NewNode, add_shape, flattened, flattened_checked, is_full};
 pub mod open {
-    pub use super::source::{demo, display_name, is_catalog, open};
+    pub use super::source::{create_catalog, create_session, demo, display_name, is_catalog, open, requests};
 }
 
 use crate::i18n::t;
@@ -525,6 +526,10 @@ pub struct AppState {
     pub device: DeviceState,
     /// Viewer frames, thumbnails, zoom/pan and the color-picker sample.
     pub preview_state: PreviewState,
+    /// Per-image portrait capability snapshots: what the engine can actually run
+    /// on this photo right now. Read-only for the UI; only `Available` is
+    /// interactive and it is fetched in the background, never during drawing.
+    pub portrait_caps: portrait_capability::PortraitCapabilityCache,
     pub capturing: bool,
     pub styles: Vec<StyleInfo>,
     pub icc_profiles: Vec<String>,
@@ -626,9 +631,13 @@ impl AppState {
                 ..Default::default()
             },
         ];
-        let camera_settings = engine.camera_settings();
+        // The existing asynchronous probe populates settings. Opening a photo
+        // library must never synchronously create a WIA device on the UI thread.
+        let camera_settings = None;
         let engine_name = engine.name();
         let capabilities = crate::planned::capabilities(engine.as_ref());
+        // 能力表 TSV 是资料版本，引擎名是主机配置；两者合成快照缓存的指纹。
+        let portrait_caps = portrait_capability::PortraitCapabilityCache::new(engine.portrait_capability_registry_tsv(), &engine_name);
         let mut this = Self {
             styles: engine.styles(),
             icc_profiles: engine.icc_profiles(),
@@ -661,6 +670,7 @@ impl AppState {
                 ..DeviceState::default()
             },
             preview_state: PreviewState::default(),
+            portrait_caps,
             capturing: false,
             recipes,
             selected_recipe: 0,
@@ -763,6 +773,7 @@ impl AppState {
         if self.library.current != Some(id) {
             self.end_gesture(cx);
             self.library.current = Some(id);
+            self.prefetch_raw_neighbors(id);
             self.preview_state.thumb_queue.prioritize(id);
             self.editor.active_layer = None;
             self.editor.active_node = None;
@@ -774,9 +785,29 @@ impl AppState {
             self.preview_state.sampled_color = None;
             self.preview_state.picker_point = None;
             cx.emit(StateEvent::CurrentChanged);
+            // 等待首帧解码完成后由人像面板自动按帧探测，避免未解码前抢跑缓存 0/147。
             self.request_render(RenderQuality::Final, cx);
         }
         cx.notify();
+    }
+
+    /// Warms the RAW decodes of the images around `id` in visible order.
+    ///
+    /// This is the switch-time half of the RAW first-load work: the current
+    /// image is decoded by the normal preview request, and the neighbours the
+    /// arrow keys reach next are decoded on the engine's single prefetch worker
+    /// (`aurora_engine::aurora_raw::prefetch`). It writes the same cache entry
+    /// the preview then reads (`raw_cache::PREVIEW_LONG_SIDE`), stays inside the
+    /// existing cache budgets, changes no pixels, and a faster switch cancels
+    /// whatever has not started.
+    fn prefetch_raw_neighbors(&self, id: ImageId) {
+        use aurora_engine::aurora_raw::prefetch as pf;
+        if !pf::prefetch_enabled(){self.engine.prefetch_visible_neighbors(Vec::new());return;}
+        let visible=self.visible_images();
+        let targets=visible.iter().position(|i|i.id==id).map(|idx|
+            pf::neighbor_paths_by(idx,&visible,&pf::DEFAULT_OFFSETS,|i|i.path.as_path())
+        ).unwrap_or_default();
+        self.engine.prefetch_visible_neighbors(targets);
     }
 
     /// The images multiple view shows, the pinned compare variant first; empty
@@ -1250,19 +1281,29 @@ impl AppState {
         }
     }
 
-    /// Flushes queued saves (bounded) and quits. The UI may block for up to the
-    /// timeout at close; a failure is logged and shown so unsaved work is not
-    /// silently dropped.
-    pub fn flush_and_quit(&mut self, cx: &mut Context<Self>) {
-        if let Some(report) =
-            self.engine.flush_pending_saves(std::time::Duration::from_secs(2))
+    /// The title-bar close and the keyboard/menu quit must drain the *current*
+    /// library's edits, including an in-flight slider gesture. Keep the window
+    /// alive on failure so the user can read the notice and retry.
+    pub fn prepare_to_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.end_gesture(cx);
+        if let Some(report) = self.engine.flush_pending_saves(std::time::Duration::from_secs(2))
+            && let Some(message) = flush_report_notice(&report)
         {
-            if let Some(message) = flush_report_notice(&report) {
-                log::warn!("{message}");
-                self.notify(message, cx);
-            }
+            log::warn!("{message}");
+            self.notify(message, cx);
+            return false;
         }
-        cx.quit();
+        if self.tasks.jobs.iter().any(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running { .. })
+            && matches!(self.engine.job_status(j.id), JobStatus::Queued | JobStatus::Running { .. })) {
+            self.notify(t("Exports are still running. Finish or cancel them in Batch before closing.", "仍有照片正在导出，请在「批处理」中等待完成或取消，再关闭。"), cx);
+            return false;
+        }
+        aurora_engine::aurora_raw::prefetch::cancel_pending();
+        true
+    }
+
+    pub fn flush_and_quit(&mut self, cx: &mut Context<Self>) {
+        if self.prepare_to_close(cx) { cx.quit(); }
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
@@ -1965,6 +2006,10 @@ impl AppState {
     }
 }
 
+/// The active folder in this process. Replaced when Welcome opens the real workspace.
+pub(crate) struct ActiveLibrary(pub gpui_kit::WeakEntity<AppState>);
+impl gpui_kit::Global for ActiveLibrary {}
+
 pub fn init_state(engine: Arc<dyn ImageEngine>, source: Source, cx: &mut App) -> Entity<AppState> {
     let mut settings = Settings::load();
     if let Some(path) = source.path() {
@@ -1978,7 +2023,9 @@ pub fn init_state(engine: Arc<dyn ImageEngine>, source: Source, cx: &mut App) ->
         crate::theme::set_accent(accent, cx);
     }
     crate::actions::bind_keys(cx, &settings.shortcuts);
-    cx.new(|cx| AppState::new(engine, source, settings, cx))
+    let state = cx.new(|cx| AppState::new(engine, source, settings, cx));
+    cx.set_global(ActiveLibrary(state.downgrade()));
+    state
 }
 
 impl AppState {
@@ -2919,35 +2966,95 @@ fn import_with_edits(
 mod import_edits_tests {
     use super::import_with_edits;
     use aurora_engine::FileEngine;
-    use std::{fs, process::Command};
+    use std::fs;
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if (crc & 1) != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    fn write_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for &(name, data) in entries {
+            let offset = out.len() as u32;
+            let name_bytes = name.as_bytes();
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
 
     #[test]
     fn eip_variants_fill_the_preview_edits_immediately() {
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x01, 0x63, 0x60, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD,
+            0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
         let dir = std::env::temp_dir().join(format!("aurora-eip-import-preview-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let engine = FileEngine::open(&dir).unwrap();
-        let output = Command::new("python")
-            .args([
-                "-B",
-                "-c",
-                r#"
-import base64, pathlib, sys, zipfile
-root = pathlib.Path(sys.argv[1])
-png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AICAgP8FhAKAFCF59QAAAABJRU5ErkJggg==")
-(root / "single.png").write_bytes(png)
-with zipfile.ZipFile(root / "variants.eip", "w") as package:
-    package.writestr("manifest1680.xml", """<Manifest><File><RawPath>photo.png</RawPath>
-        <SettingsPath>different/settings.cos</SettingsPath></File></Manifest>""")
-    package.writestr("photo.png", png)
-    package.writestr("different/settings.cos", """<IMG>
-        <VAR><DL><E K="Exposure" V="1.25"/></DL></VAR>
-        <VAR><DL><E K="Exposure" V="-2.0"/></DL></VAR></IMG>""")
-"#,
-            ])
-            .arg(&dir)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        fs::write(dir.join("single.png"), PNG_1X1).unwrap();
+        let manifest = b"<Manifest><File><RawPath>photo.png</RawPath><SettingsPath>different/settings.cos</SettingsPath></File></Manifest>";
+        let settings = b"<IMG><VAR><DL><E K=\"Exposure\" V=\"1.25\"/></DL></VAR><VAR><DL><E K=\"Exposure\" V=\"-2.0\"/></DL></VAR></IMG>";
+        let eip = write_stored_zip(&[
+            ("manifest1680.xml", manifest),
+            ("photo.png", PNG_1X1),
+            ("different/settings.cos", settings),
+        ]);
+        fs::write(dir.join("variants.eip"), eip).unwrap();
         let added = import_with_edits(&engine, &[dir.join("variants.eip"), dir.join("single.png")]).unwrap();
         let [(first, first_edit), (second, second_edit), (single, single_edit)] = added.as_slice() else {
             panic!("expected two EIP variants and one standalone image");

@@ -537,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn original_c1_packages() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join(
             "../../../../04_reference/legacy-root/逆向工程/Capture One/resources/eip_samples",
@@ -561,14 +562,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs local comask and C1 SDK fixture; set AURORA_TEST_COMASK and AURORA_C1_SDK_DIR"]
     fn real_mask_padding_is_removed_exactly() {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mask = manifest.join(
-            "../../../90_work/lanes/c1-parse/win_retouchmask_r27/crates/engine/testdata/comask/_DSC5673.NEF.comask",
-        );
-        if !mask.is_file() {
-            return;
-        }
+        let mask = std::env::var_os("AURORA_TEST_COMASK")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_TEST_COMASK to a .comask fixture");
+        let sdk_dir = std::env::var_os("AURORA_C1_SDK_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_C1_SDK_DIR to the C1 SDK helper directory");
         let archive = std::env::temp_dir().join(format!("c1-eip-{}", std::process::id()));
         fs::create_dir_all(&archive).unwrap();
         let package_path = archive.join("fixture.EIP");
@@ -576,7 +577,7 @@ mod tests {
         fs::write(&raw_path, b"fixture only").unwrap();
         let output = std::process::Command::new("python")
             .args(["-B", "-c", "import sys; sys.path.insert(0, sys.argv[1]); from formats.eip import create; create(sys.argv[2], sys.argv[3], comask_path=sys.argv[4])"])
-            .arg(manifest.join("../../../../04_reference/legacy-root/逆向工程/Capture One/sdk"))
+            .arg(&sdk_dir)
             .arg(&package_path)
             .arg(&raw_path)
             .arg(&mask)

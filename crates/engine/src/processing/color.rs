@@ -271,10 +271,9 @@ pub(crate) fn signed_hue_delta(h: f32, center: f32) -> f32 {
     }
 }
 
-/// Coverage of one color-editor band for a pixel at hue `h`, saturation `s`,
-/// value `v`. `extra_feather` widens every band edge (the global group's
-/// smoothness).
-pub(crate) fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32, v: f32) -> f32 {
+/// Coverage of one color-editor band for a pixel at hue `h`, saturation `s`.
+/// C1 `HueBandWeight` * `ChromaBandWeight` (no Lightness/Value selection band).
+pub(crate) fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32, _v: f32) -> f32 {
     let d = signed_hue_delta(h, b.center_hue);
     let feather = b.smoothness.max(0.1) + extra_feather;
     let hue_w = if d < b.hue_low {
@@ -293,16 +292,33 @@ pub(crate) fn band_weight(b: &ColorBand, extra_feather: f32, h: f32, s: f32, v: 
     } else {
         1.0
     };
-    // Fixed 0.05 V feather: C1 has no value band, so there is no stored unit to borrow.
-    let v = v.clamp(0.0, 1.0);
-    let value_w = if v < b.value_low {
-        sstep(b.value_low - 0.05, b.value_low, v)
-    } else if v > b.value_high {
-        1.0 - sstep(b.value_high, b.value_high + 0.05, v)
+    (hue_w * sat_w).clamp(0.0, 1.0)
+}
+
+/// C1 nonlinear saturation boost `SatBoost(C*, amount)` (`ImgCoreDll!0x132bb70`).
+#[inline]
+pub(crate) fn c1_sat_boost(c_star: f32, amount: f32) -> f32 {
+    let t = 0.01 * amount;
+    let c2 = c_star * c_star;
+    let c3 = c2 * c_star;
+    let p = 0.0092299 * c_star - 3.1379e-5 * c2 + 5.3746e-8 * c3;
+    let r = ((-3.8215 * t).exp() - 1.0) / ((-3.8215f32).exp() - 1.0);
+    100.0 * (t * (1.0 - p) + p * r)
+}
+
+/// C1 asymmetric quadratic damping for skin-tone lightness uniformity (`ImgCoreDll!0x132b295`).
+#[inline]
+fn skin_luma_uniform_step(l_cur: f32, l_target: f32, uniformity: f32) -> f32 {
+    let lt = l_target.clamp(0.001, 99.999);
+    let q = if l_cur < lt {
+        l_cur / lt
     } else {
-        1.0
+        let k = 4.0 * (0.5 * (4.0625f32.sqrt() + 0.25) - 1.0);
+        1.0 - k * (l_cur - lt) / (100.0 - lt)
     };
-    (hue_w * sat_w * value_w).clamp(0.0, 1.0)
+    let factor = (1.0 - 0.25 * q).powi(2);
+    let l_uniform = lt + factor * (l_cur - lt);
+    (0.01 * uniformity) * (l_uniform - l_cur)
 }
 
 pub(crate) fn apply_homogeneity(b: &ColorBand, w: f32, h: &mut f32, s: &mut f32, v: &mut f32) {
@@ -314,9 +330,9 @@ pub(crate) fn apply_homogeneity(b: &ColorBand, w: f32, h: &mut f32, s: &mut f32,
     if sat != 0.0 {
         *s += (b.center_saturation - *s) * sat;
     }
-    let light = b.homogeneity[2] / 100.0 * w;
-    if light != 0.0 {
-        *v += (b.center_value - *v) * light;
+    if b.homogeneity[2] != 0.0 {
+        let dl = skin_luma_uniform_step(*v * 100.0, b.center_value * 100.0, b.homogeneity[2]) * 0.01 * w;
+        *v = (*v + dl).clamp(0.0, 1.0);
     }
 }
 
@@ -326,46 +342,56 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         return g;
     }
     let extra = ce.global.smoothness.max(0.0) * 0.5;
-    let mut h = h0;
-    let mut s = s0;
-    let mut v = v0;
-    let mut dh = 0.0;
-    let mut ds = 0.0;
-    let mut dl = 0.0;
+    let mut dh = 0.0f32;
+    let mut ds = 0.0f32;
+    let mut dl = 0.0f32;
+    let mut w_sum = 0.0f32;
 
-    if ce.global.enabled {
+    // Only terms that move the pixel count towards `w_sum`: an enabled band
+    // with a zero shift (the default global group) must not dilute the others.
+    if ce.global.enabled && ce.global_shift != HslShift::default() {
         let mut w = band_weight(&ce.global, 0.0, h0, s0, v0);
         if ce.global.inverted {
             w = 1.0 - w;
         }
+        w_sum += w;
         dh += ce.global_shift.hue * w;
         ds += ce.global_shift.saturation * w;
         dl += ce.global_shift.lightness * w;
     }
 
-    // Homogeneity is a skin term only. C1's `pie_skin` branch pulls toward the
-    // selected Lab chroma/L*; the basic, advanced and max-smooth branches never
-    // read their homogeneity fields.
     for r in &ce.skin {
         if let Some((_, band)) = ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
             if !band.enabled {
+                continue;
+            }
+            if band.homogeneity == [0.0; 3] {
                 continue;
             }
             let mut w = band_weight(band, 0.0, h0, s0, v0);
             if band.inverted {
                 w = 1.0 - w;
             }
-            apply_homogeneity(band, w, &mut h, &mut s, &mut v);
-        } else if let Some(u) = &r.uniformity {
+            w_sum += w;
+            if band.homogeneity[0] != 0.0 {
+                dh += signed_hue_delta(band.center_hue, h0) * (band.homogeneity[0] / 100.0 * w);
+            }
+            if band.homogeneity[1] != 0.0 {
+                ds += (band.center_saturation - s0) * band.homogeneity[1] * w;
+            }
+            if band.homogeneity[2] != 0.0 {
+                dl += skin_luma_uniform_step(v0 * 100.0, band.center_value * 100.0, band.homogeneity[2]) * w;
+            }
+        } else if let Some(u) = r.uniformity.as_ref().filter(|u| u.hue != 0.0 || u.saturation > 0.0 || u.lightness > 0.0) {
             let w = color_range_weight(r, g);
-            h += signed_hue_delta(r.hue, h) * (u.hue / 100.0 * w);
+            w_sum += w;
+            dh += signed_hue_delta(r.hue, h0) * (u.hue / 100.0 * w);
             if u.saturation > 0.0 {
                 let target_s = (r.min_saturation + 0.35).clamp(0.15, 0.55);
-                s += (target_s - s) * (u.saturation / 100.0 * w);
+                ds += (target_s - s0) * u.saturation * w;
             }
             if u.lightness > 0.0 {
-                let target_v = 0.65;
-                v += (target_v - v) * (u.lightness / 100.0 * w * 0.5);
+                dl += skin_luma_uniform_step(v0 * 100.0, 65.0, u.lightness) * w;
             }
         }
     }
@@ -378,22 +404,23 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         if !band.enabled {
             continue;
         }
-        let mut w = band_weight(band, extra, h, s, v);
+        let mut w = band_weight(band, extra, h0, s0, v0);
         if band.inverted {
             w = 1.0 - w;
         }
+        w_sum += w;
         dh += shift.hue * w;
         ds += shift.saturation * w;
         dl += shift.lightness * w;
     }
 
-    // MaxSmooth (`kind=3`) runs C1's basic `pie_smooth` window, hence `extra`.
     for (r, extra_feather) in ce
         .advanced
         .iter()
         .map(|r| (r, 0.0))
         .chain(ce.skin.iter().map(|r| (r, 0.0)))
         .chain(ce.max_smooth.iter().map(|r| (r, extra)))
+        .filter(|(r, _)| r.shift != HslShift::default())
     {
         let w = match ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
             Some((_, band)) if band.enabled => {
@@ -403,14 +430,22 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
             Some(_) => 0.0,
             None => color_range_weight(r, g),
         };
+        w_sum += w;
         dh += r.shift.hue * w;
         ds += r.shift.saturation * w;
         dl += r.shift.lightness * w;
     }
+
+    if w_sum > 1.0 {
+        let inv = 1.0 / w_sum;
+        dh *= inv;
+        ds *= inv;
+        dl *= inv;
+    }
     let dh = dh.clamp(-180.0, 180.0);
     let ds = ds.clamp(-100.0, 100.0);
     let dl = dl.clamp(-100.0, 100.0);
-    let s2 = (s * (1.0 + ds / 100.0 * k)).clamp(0.0, 1.0);
-    let v2 = (v * (1.0 + dl / 100.0 * 0.5 * s * k)).max(0.0);
-    hsv_to_rgb(h + dh * k, s2, v2)
+    let s2 = (s0 * (1.0 + ds / 100.0 * k)).clamp(0.0, 1.0);
+    let v2 = (v0 * (1.0 + dl / 100.0 * 0.5 * s0 * k)).max(0.0);
+    hsv_to_rgb(h0 + dh * k, s2, v2)
 }

@@ -24,7 +24,12 @@ pub enum Backend {
     Cpu,
     Cuda(u32),
     Metal(u32),
+    Vulkan(u32),
+    Dx12(u32),
+    Hip(u32),
+    Sycl(u32),
     OpenCl(u32),
+    Npu(u32),
 }
 
 impl Backend {
@@ -34,7 +39,12 @@ impl Backend {
             Self::Cpu => BackendKind::Cpu,
             Self::Cuda(_) => BackendKind::Cuda,
             Self::Metal(_) => BackendKind::Metal,
+            Self::Vulkan(_) => BackendKind::Vulkan,
+            Self::Dx12(_) => BackendKind::Dx12,
+            Self::Hip(_) => BackendKind::Hip,
+            Self::Sycl(_) => BackendKind::Sycl,
             Self::OpenCl(_) => BackendKind::OpenCl,
+            Self::Npu(_) => BackendKind::Npu,
         }
     }
 
@@ -45,7 +55,14 @@ impl Backend {
     pub fn device_index(self) -> Option<u32> {
         match self {
             Self::Cpu => None,
-            Self::Cuda(index) | Self::Metal(index) | Self::OpenCl(index) => Some(index),
+            Self::Cuda(index)
+            | Self::Metal(index)
+            | Self::Vulkan(index)
+            | Self::Dx12(index)
+            | Self::Hip(index)
+            | Self::Sycl(index)
+            | Self::OpenCl(index)
+            | Self::Npu(index) => Some(index),
         }
     }
 
@@ -55,7 +72,12 @@ impl Backend {
             Self::Cpu => "cpu".to_owned(),
             Self::Cuda(index) => format!("cuda:{index}"),
             Self::Metal(index) => format!("metal:{index}"),
+            Self::Vulkan(index) => format!("vulkan:{index}"),
+            Self::Dx12(index) => format!("dx12:{index}"),
+            Self::Hip(index) => format!("hip:{index}"),
+            Self::Sycl(index) => format!("sycl:{index}"),
             Self::OpenCl(index) => format!("opencl:{index}"),
+            Self::Npu(index) => format!("npu:{index}"),
         }
     }
 }
@@ -72,7 +94,12 @@ pub enum BackendKind {
     Cpu,
     Cuda,
     Metal,
+    Vulkan,
+    Dx12,
+    Hip,
+    Sycl,
     OpenCl,
+    Npu,
 }
 
 impl BackendKind {
@@ -81,7 +108,12 @@ impl BackendKind {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
             Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+            Self::Dx12 => "dx12",
+            Self::Hip => "hip",
+            Self::Sycl => "sycl",
             Self::OpenCl => "opencl",
+            Self::Npu => "npu",
         }
     }
 }
@@ -189,7 +221,12 @@ impl GpuInfo {
 pub struct Capabilities {
     pub cuda: Option<GpuInfo>,
     pub metal: Option<GpuInfo>,
+    pub vulkan: Option<GpuInfo>,
+    pub dx12: Option<GpuInfo>,
+    pub hip: Option<GpuInfo>,
+    pub sycl: Option<GpuInfo>,
     pub opencl: Option<GpuInfo>,
+    pub npu: Option<GpuInfo>,
 }
 
 impl Capabilities {
@@ -198,7 +235,12 @@ impl Capabilities {
         Self {
             cuda: None,
             metal: None,
+            vulkan: None,
+            dx12: None,
+            hip: None,
+            sycl: None,
             opencl: None,
+            npu: None,
         }
     }
 
@@ -208,7 +250,12 @@ impl Capabilities {
         match info.backend.kind() {
             BackendKind::Cuda => self.cuda = Some(info),
             BackendKind::Metal => self.metal = Some(info),
+            BackendKind::Vulkan => self.vulkan = Some(info),
+            BackendKind::Dx12 => self.dx12 = Some(info),
+            BackendKind::Hip => self.hip = Some(info),
+            BackendKind::Sycl => self.sycl = Some(info),
             BackendKind::OpenCl => self.opencl = Some(info),
+            BackendKind::Npu => self.npu = Some(info),
             BackendKind::Cpu => {}
         }
         self
@@ -221,15 +268,28 @@ impl Capabilities {
             BackendKind::Cpu => return None,
             BackendKind::Cuda => self.cuda,
             BackendKind::Metal => self.metal,
+            BackendKind::Vulkan => self.vulkan,
+            BackendKind::Dx12 => self.dx12,
+            BackendKind::Hip => self.hip,
+            BackendKind::Sycl => self.sycl,
             BackendKind::OpenCl => self.opencl,
+            BackendKind::Npu => self.npu,
         };
         candidate.filter(|info| info.backend.kind() == kind)
     }
 
     pub fn any_gpu(&self) -> bool {
-        [BackendKind::Cuda, BackendKind::Metal, BackendKind::OpenCl]
-            .into_iter()
-            .any(|kind| self.gpu(kind).is_some_and(GpuInfo::usable))
+        [
+            BackendKind::Cuda,
+            BackendKind::Metal,
+            BackendKind::Vulkan,
+            BackendKind::Dx12,
+            BackendKind::Hip,
+            BackendKind::Sycl,
+            BackendKind::OpenCl,
+        ]
+        .into_iter()
+        .any(|kind| self.gpu(kind).is_some_and(GpuInfo::usable))
     }
 }
 

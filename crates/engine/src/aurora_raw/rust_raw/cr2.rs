@@ -45,37 +45,44 @@ pub(crate) fn decode(tiff: &Tiff<'_>, ifd0: &Ifd<'_>, _bytes: &[u8]) -> NativeRe
     let slice: Option<[usize; 3]> = ifd.u16s(0xc640).and_then(|values| values.ok()).and_then(|values| {
         (values.len() >= 3).then(|| [values[0] as usize, values[1] as usize, values[2] as usize])
     });
-    let mut plane = vec![0u16; raw_width * raw_height];
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for jrow in 0..image.height {
-        for jcol in 0..jwide {
-            let value = image.data[jrow * jwide + jcol];
-            if let Some(slice) = slice.filter(|slice| slice[0] != 0 && slice[1] != 0) {
-                let mut index = jrow * jwide + jcol;
-                let mut half = index / (slice[1] * raw_height);
-                let second = half >= slice[0];
-                if second {
-                    half = slice[0];
-                }
-                let width = slice[1 + usize::from(second)];
-                if width == 0 {
-                    return Err(NativeError::corrupt("CR2 slice table has a zero width"));
-                }
-                index -= half * (slice[1] * raw_height);
-                row = index / width;
-                col = index % width + half * slice[1];
+    let total_samples = image.height.saturating_mul(jwide).min(image.data.len());
+    let plane = if let Some(slice) = slice.filter(|slice| slice[0] != 0 && slice[1] != 0) {
+        let mut plane = vec![0u16; raw_width * raw_height];
+        let slice_samples = slice[1].saturating_mul(raw_height);
+        for half in 0..=slice[0] {
+            let src_base = half.saturating_mul(slice_samples);
+            if src_base >= total_samples {
+                break;
             }
-            if row < raw_height && col < raw_width {
-                plane[row * raw_width + col] = value;
+            let width = if half < slice[0] { slice[1] } else { slice[2] };
+            if width == 0 {
+                return Err(NativeError::corrupt("CR2 slice table has a zero width"));
             }
-            col += 1;
-            if col >= raw_width {
-                col = 0;
-                row += 1;
+            let x_base = half * slice[1];
+            if x_base >= raw_width {
+                continue;
+            }
+            let max_copy = width.min(raw_width - x_base);
+            for r in 0..raw_height {
+                let src_row = src_base + r * width;
+                if src_row >= total_samples {
+                    break;
+                }
+                let copy_len = max_copy.min(total_samples - src_row);
+                let dst_row = r * raw_width + x_base;
+                plane[dst_row..dst_row + copy_len]
+                    .copy_from_slice(&image.data[src_row..src_row + copy_len]);
             }
         }
-    }
+        plane
+    } else if total_samples == raw_width * raw_height && image.data.len() == total_samples {
+        image.data
+    } else {
+        let mut plane = vec![0u16; raw_width * raw_height];
+        let copy_len = total_samples.min(plane.len());
+        plane[..copy_len].copy_from_slice(&image.data[..copy_len]);
+        plane
+    };
 
     let (left, top, width, height) = super::active_area(&ifd, raw_width, raw_height);
     let black = ifd

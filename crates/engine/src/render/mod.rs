@@ -63,6 +63,7 @@ pub(crate) fn render_preview_bgra(
     bypass: bool,
     mask_overlay: Option<u64>,
     want_bgra: bool,
+    scopes: crate::scopes::ScopeWants,
 ) -> Rendered {
     crate::mock::process::render_preview_bgra(
         src,
@@ -72,10 +73,11 @@ pub(crate) fn render_preview_bgra(
         bypass,
         mask_overlay,
         want_bgra,
+        scopes,
     )
 }
 
-/// Production preview render with optional half-resolution upsampled fast path.
+/// Production preview; the legacy priority hint does not reduce sampling quality.
 #[inline]
 pub(crate) fn render_at(
     src: &Source,
@@ -85,8 +87,9 @@ pub(crate) fn render_at(
     bypass: bool,
     mask_overlay: Option<u64>,
     fast: bool,
+    scopes: crate::scopes::ScopeWants,
 ) -> Rendered {
-    crate::mock::process::render_at(src, adj, region, max_size, bypass, mask_overlay, fast)
+    crate::mock::process::render_at(src, adj, region, max_size, bypass, mask_overlay, fast, scopes)
 }
 
 /// Clamp a normalized region to `[0, 1] x [0, 1]`.

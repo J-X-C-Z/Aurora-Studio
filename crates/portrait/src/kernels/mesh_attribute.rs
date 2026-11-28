@@ -125,10 +125,8 @@ pub fn rasterize(
 mod tests {
     use super::*;
 
-    const TRIANGLES: &[u8; 51228] =
-        include_bytes!("../../../../assets/portrait/smile/triangles.u32le");
-    const MEAN: &[u8; 26472] =
-        include_bytes!("../../../../assets/portrait/smile/mean.f32le");
+    const TRIANGLES: &[u8] = crate::private_assets::or_empty(crate::private_asset!("portrait/smile/triangles.u32le"));
+    const MEAN: &[u8] = crate::private_assets::or_empty(crate::private_asset!("portrait/smile/mean.f32le"));
 
     fn decode_faces() -> Vec<u32> {
         TRIANGLES
@@ -193,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_mesh_rasterizes_with_zero_displacement() {
         let mean = decode_mean();
         let faces = decode_faces();

@@ -58,6 +58,12 @@ const IDENTITY_FULL_BELOW: u64 = 2 << 20;
 /// 24 MP RGBA16 frame; `AURORA_RAW_PENDING_BYTES` overrides it.
 const MAX_PENDING_NATIVE_BYTES: usize = 256 << 20;
 
+/// Long side the preview source decode requests.
+///
+/// Shared by the folder engine and neighbour prefetch: a different long side
+/// would populate a different cache key and force the foreground to decode again.
+pub const PREVIEW_LONG_SIDE: u32 = 4096;
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A decoded frame: width, height, RGBA16 pixels, provenance.
@@ -137,6 +143,46 @@ pub fn get_or_decode16_traced(
     get_or_decode16_with_route(path, &dir, long_side, route, |path| {
         crate::raw::decode16_traced_routed(path, route)
     })
+}
+
+/// Cheap check whether a 16-bit disk or pending-RAM cache entry already exists
+/// for `path`, used to skip the temporary embedded-JPEG progressive preview
+/// whenever a warm 16-bit source is available.
+pub(crate) fn has_cached_source16(path: &Path, long_side: u32) -> bool {
+    is_source16_warm(path, long_side)
+}
+
+/// Whether a 16-bit decode of `path` at `long_side` can be served without
+/// decoding: a stored entry under the proxy key or the full-sensor key, or — for
+/// a full-sensor request — a retained pending frame.
+///
+/// Side-effect free: it does not decode, does not insert, and does not consume
+/// the pending frame. `raw::decode_route` and the source identity read file
+/// metadata and a few small windows, so callers on a latency-critical path
+/// (the preview request) must run it off the UI thread; the neighbour prefetch
+/// in [`crate::aurora_raw::prefetch`] is the intended user.
+pub fn is_source16_warm(path: &Path, long_side: u32) -> bool {
+    let route = crate::raw::decode_route(path);
+    let Some(identity) = tracked_identity(path) else {
+        return false;
+    };
+    if let Some(dir) = default_raw16_dir() {
+        let key = cache_name16_for_identity(path, long_side, route, identity);
+        if dir.join(&key).is_file() {
+            return true;
+        }
+        if long_side > 0 {
+            let native_key = cache_name16_for_identity(path, 0, route, identity);
+            if dir.join(&native_key).is_file() {
+                return true;
+            }
+        }
+    }
+    long_side == 0
+        && PENDING_NATIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .covers(path, route, identity)
 }
 
 pub(crate) fn get_or_decode_source16(
@@ -222,6 +268,7 @@ fn get_or_decode_source16_with_failed(
                         long_side,
                         &route,
                         identity,
+                        true,
                         |path| {
                             let route = decode.take()?;
                             let mut leftover = None;
@@ -258,6 +305,7 @@ fn get_or_decode_source16_with_failed(
         long_side,
         &route,
         identity,
+        true,
         |path| {
             let route = decode.take()?;
             let mut leftover = None;
@@ -336,6 +384,7 @@ where
             long_side,
             &route,
             identity,
+            false,
             |path| decode.take()?(path),
         )
     };
@@ -588,8 +637,61 @@ fn resized16(
     ))
 }
 
+struct BgWriteJob {
+    file: PathBuf,
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    provenance: DecodeProvenance,
+    identity: SourceIdentity,
+    route: DecodeRoute,
+    native_input: Option<NativePersistInput>,
+}
+
+/// Single bounded background writer for cold-RAW 16-bit disk cache persistence.
+/// Offloads the ~200 MB RGB16 pack + CRC32 + disk write + eviction scan off
+/// the first-preview critical path while bounding queued RAM to at most 2 frames.
+fn bg_writer() -> &'static std::sync::mpsc::SyncSender<BgWriteJob> {
+    static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<BgWriteJob>> =
+        std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BgWriteJob>(2);
+        let _ = std::thread::Builder::new()
+            .name("aurora-raw16-cache-writer".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    if let Some(input) = job.native_input {
+                        persist_native_entry(
+                            &job.file,
+                            job.width,
+                            job.height,
+                            &job.pixels,
+                            job.provenance,
+                            job.identity,
+                            &job.route,
+                            input.z6iii,
+                            input,
+                        );
+                    } else {
+                        store16_binary(
+                            &job.file,
+                            job.width,
+                            job.height,
+                            &job.pixels,
+                            job.provenance,
+                            job.identity,
+                            &job.route,
+                        );
+                    }
+                }
+            });
+        tx
+    })
+}
+
 /// Downscales a full sensor frame and keeps its native samples for the first
 /// zoom request. The pending frame never triggers extra work.
+#[allow(clippy::too_many_arguments)]
 fn fit16_keep_native(
     native_file: Option<&Path>,
     native_key: Option<String>,
@@ -603,6 +705,7 @@ fn fit16_keep_native(
     route: &DecodeRoute,
     decode_millis: Option<u64>,
     explicit_native: bool,
+    async_persist: bool,
 ) -> Frame16 {
     let Some((target_width, target_height, proxy)) =
         resized16(width, height, &pixels, long_side)
@@ -623,17 +726,30 @@ fn fit16_keep_native(
             z6iii: provenance.unlocks_c1_z6iii_linear(),
             free_disk: free_disk_bytes(file.parent().unwrap_or(Path::new("."))),
         };
-        persist_native_entry(
-            file,
-            width,
-            height,
-            &pixels,
-            provenance,
-            identity,
-            route,
-            input.z6iii,
-            input,
-        );
+        if async_persist {
+            let _ = bg_writer().try_send(BgWriteJob {
+                file: file.to_path_buf(),
+                width,
+                height,
+                pixels: pixels.clone(),
+                provenance,
+                identity,
+                route: *route,
+                native_input: Some(input),
+            });
+        } else {
+            persist_native_entry(
+                file,
+                width,
+                height,
+                &pixels,
+                provenance,
+                identity,
+                route,
+                input.z6iii,
+                input,
+            );
+        }
     }
     remember_native(native_key, path, width, height, pixels, provenance, identity, route);
     (target_width, target_height, proxy, provenance)
@@ -642,6 +758,7 @@ fn fit16_keep_native(
 /// Decodes under one decode slot, fits the result, and applies the proxy/native
 /// persistence split: proxies always persist, native frames only when
 /// [`native_persist_decision`] says the write is worth it.
+#[allow(clippy::too_many_arguments)]
 fn decode_and_fit<F>(
     path: &Path,
     native_file: Option<&Path>,
@@ -649,6 +766,7 @@ fn decode_and_fit<F>(
     long_side: u32,
     route: &DecodeRoute,
     identity: SourceIdentity,
+    async_persist: bool,
     decode: F,
 ) -> Option<Frame16>
 where
@@ -677,6 +795,7 @@ where
         route,
         Some(millis),
         long_side == 0,
+        async_persist,
     );
     if long_side == 0 {
         // The requested frame is the native frame, so `fit16_keep_native`
@@ -691,17 +810,41 @@ where
                 native_file.and_then(Path::parent).unwrap_or(Path::new(".")),
             ),
         };
-        persist_native_entry(
-            probe_file,
-            image.0,
-            image.1,
-            &image.2,
-            image.3,
+        if async_persist {
+            let _ = bg_writer().try_send(BgWriteJob {
+                file: probe_file.to_path_buf(),
+                width: image.0,
+                height: image.1,
+                pixels: image.2.clone(),
+                provenance: image.3,
+                identity,
+                route: *route,
+                native_input: Some(input),
+            });
+        } else {
+            persist_native_entry(
+                probe_file,
+                image.0,
+                image.1,
+                &image.2,
+                image.3,
+                identity,
+                route,
+                z6iii,
+                input,
+            );
+        }
+    } else if async_persist {
+        let _ = bg_writer().try_send(BgWriteJob {
+            file: probe_file.to_path_buf(),
+            width: image.0,
+            height: image.1,
+            pixels: image.2.clone(),
+            provenance: image.3,
             identity,
-            route,
-            z6iii,
-            input,
-        );
+            route: *route,
+            native_input: None,
+        });
     } else {
         store16_binary(probe_file, image.0, image.1, &image.2, image.3, identity, route);
     }
@@ -843,6 +986,19 @@ impl PendingNative {
         self.stats.peak_bytes = self.stats.peak_bytes.max(self.bytes);
         self.stats.bytes = self.bytes;
         self.stats.entries = self.entries.len();
+    }
+
+    /// Whether a retained full-sensor frame for `path` is present, without
+    /// consuming it. Only full-sensor (`long_side == 0`) requests can be served
+    /// from this table, which is why [`is_source16_warm`] asks for `0` only.
+    fn covers(&self, path: &Path, route: DecodeRoute, identity: SourceIdentity) -> bool {
+        let key = cache_name16_for_identity(path, 0, route, identity);
+        self.entries.iter().any(|entry| {
+            entry.key == key
+                && entry.path == path
+                && entry.identity == identity
+                && entry.provenance.consistent_with(&route)
+        })
     }
 
     fn take(
@@ -1032,6 +1188,17 @@ fn count_waiter() {
     PENDING_NATIVE.lock().unwrap_or_else(|e| e.into_inner()).stats.decode_waiters += 1;
 }
 
+struct FlightGuard<'a> {
+    key: &'a str,
+    flight: std::sync::Arc<Flight>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        release_flight(self.key, &self.flight);
+    }
+}
+
 /// Runs `work` as the single leader for `key`, or waits for the current leader
 /// and retries `recheck`. Both closures may run at most a few times; `work` is
 /// only entered by the leader, holding one decode slot.
@@ -1043,9 +1210,8 @@ fn with_single_flight(
     for _ in 0..3 {
         match acquire_flight(key) {
             FlightTicket::Leader(flight) => {
-                let result = recheck().or_else(|| work());
-                release_flight(key, &flight);
-                return result;
+                let _guard = FlightGuard { key, flight };
+                return recheck().or_else(|| work());
             }
             FlightTicket::Follower(flight) => {
                 count_waiter();
@@ -1089,6 +1255,7 @@ fn cached_full_frame16(
         // Already persisted; never count a disk read as a fresh decode.
         None,
         false,
+        false,
     ))
 }
 
@@ -1123,6 +1290,7 @@ fn decode_frame16(
         identity,
         &route,
         None,
+        false,
         false,
     ))
 }
@@ -1875,6 +2043,7 @@ mod tests {
             z6iii_feature: true,
             libraw_available: true,
             opencl: crate::raw::OpenClRouteState::Available,
+            device_policy: crate::raw::RawDevicePolicy::default(),
             demosaic: crate::raw::DEMOSAIC_DEFAULT,
         };
         route.pipeline_fingerprint =
@@ -1962,6 +2131,20 @@ mod tests {
             cache_key16_for_route(&path, &dir, 0, z6iii).unwrap(),
             "the same route must be stable"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cpu_and_cuda_routes_never_reuse_each_others_sensor_pixels() {
+        use aurora_portrait::native_infer::backend::{BackendKind,BackendRequest};
+        let dir=scratch("device-policy");let input=source(&dir,b"synthetic sensor payload");let id=test_identity(7);
+        let mut gpu=test_route(true,false);gpu.device_policy.selector=Some(BackendRequest::Only(BackendKind::Cuda));
+        let mut cpu=gpu;cpu.device_policy.selector=Some(BackendRequest::Only(BackendKind::Cpu));
+        let key=|r|cache_key16_for_route(&input,&dir,0,r).unwrap();assert_ne!(key(gpu),key(cpu));
+        let file=key(gpu);store_libraw(&file,1,1,&[1,2,3,65535],id,&gpu);
+        assert!(read_cached16_binary(&file,&gpu,&id).is_some());
+        assert!(read_cached16_binary(&file,&cpu,&id).is_none(),"even a copied entry must not leak between devices");
+        let mut mixed=gpu;mixed.device_policy.cuda_linear=!mixed.device_policy.cuda_linear;assert_ne!(key(gpu),key(mixed));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2343,14 +2526,7 @@ mod tests {
 
         let path = std::env::var_os("AURORA_TEST_RAW")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(
-                    r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF",
-                )
-            });
-        if !path.is_file() {
-            return;
-        }
+            .expect("set AURORA_TEST_RAW to a real NEF file");
         let dir = scratch("raw16-real-nef");
 
         let started = Instant::now();

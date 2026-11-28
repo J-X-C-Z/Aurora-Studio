@@ -10,8 +10,8 @@ mod attribute_gpu {
     use aurora_portrait::cuda_mesh_attribute::{MeshAttribute, RESOLVE_KERNEL, SELECT_KERNEL};
     use aurora_portrait::kernels::mesh_attribute;
 
-    const TRIANGLES: &[u8] = include_bytes!("../../../assets/portrait/smile/triangles.u32le");
-    const MEAN: &[u8] = include_bytes!("../../../assets/portrait/smile/mean.f32le");
+    const TRIANGLES: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("portrait/smile/triangles.u32le"));
+    const MEAN: &[u8] = aurora_portrait::private_assets::or_empty(aurora_portrait::private_asset!("portrait/smile/mean.f32le"));
 
     fn decode_faces() -> Vec<u32> {
         TRIANGLES
@@ -107,6 +107,7 @@ mod attribute_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_mesh_matches_the_cpu_on_96x64() {
         let Some(gpu) = gpu() else { return };
         let mean = decode_mean();
@@ -125,6 +126,7 @@ mod attribute_gpu {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn real_mesh_matches_the_cpu_on_512x512() {
         let Some(gpu) = gpu() else { return };
         let mean = decode_mean();

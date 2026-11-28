@@ -56,7 +56,7 @@ try {
     $rules = @{
         'aurora-engine' = [pscustomobject]@{
             AllowDirs  = @('src/', 'native/cuda/', 'native/metal/', 'assets/', 'tests/', 'examples/', 'data/')
-            AllowFiles = @()
+            AllowFiles = @('build.rs')
             DenyDirs   = @('work/', 'tools/', 'docs/', 'testdata/')
         }
         'portrait-app' = [pscustomobject]@{
@@ -66,7 +66,7 @@ try {
         }
         'aurora-portrait' = [pscustomobject]@{
             AllowDirs  = @('src/', 'assets/', 'native/', 'tests/')
-            AllowFiles = @()
+            AllowFiles = @('build.rs')
             DenyDirs   = @('work/', 'testdata/')
         }
     }

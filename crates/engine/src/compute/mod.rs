@@ -67,5 +67,6 @@ pub use telemetry::{BuildProfile, DecisionCounters, EnvSnapshot, Platform};
 /// `OnceLock`-based switches (`vram_budget`, `crossover_floor`).
 pub fn init() {
     let _ = telemetry::snapshot();
+    crate::platform_dispatch::install_host_capabilities();
     let _ = PolicyInputs::capture();
 }

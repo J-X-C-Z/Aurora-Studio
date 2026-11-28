@@ -51,11 +51,14 @@ pub const COLOR_EDITOR: Status = Status::Partial("Centres, hue/saturation bands,
 pub const MOIRE: Status = Status::Partial("3×3 low-pass, no frequency-domain filter", "3×3 低通，无频域处理");
 pub const LENS_CORRECTION: Status = Status::Partial("Distortion, aberration and purple fringing direction are assumed", "畸变/色差/紫边方向为假设");
 pub const KEYSTONE: Status = Status::Partial("Direction assumed, not verified against Capture One", "方向为假设，未与 C1 对拍");
-pub const LOCAL_ADJUSTMENTS: Status = Status::Partial("Copied shapes carry zero weight", "复制形状权重为 0");
-/// The node graph is stored with the variant; engines still render the layer list in series.
+/// Copy masks read their source layer's mask whatever its draw position or enabled state.
+pub const LOCAL_ADJUSTMENTS: Status = Status::Ready;
+/// The node graph is stored with the variant. The engine blends parallel and layer mixers
+/// (CPU path shared by preview, export and the picker); a mixer input that is itself a mixer
+/// counts as opaque, and luma/colour-range masks are measured on the branch input.
 pub const NODE_GRAPH: Status = Status::Partial(
-    "Parallel and layer mixers render their branches in series; disconnected nodes are pruned from render and export alike",
-    "并行与图层混合器暂按串联渲染分支；未连接的节点在渲染与导出中都会被剪掉",
+    "Parallel mixers sum their branches' changes to the shared input and layer mixers stack inputs by mask; disconnected nodes are pruned from render and export alike; a mixer feeding a layer mixer counts as opaque",
+    "并行混合器把各分支相对共同输入的改动相加，图层混合器按蒙版叠放输入；未连接的节点在渲染与导出中都会被剪掉；接入图层混合器的混合器按不透明处理",
 );
 pub const SPOTS: Status = Status::Partial("Healing is approximate", "修复为近似实现");
 pub const C1_CATALOG: Status = Status::Partial("Collections and WAL only", "仅集合与 WAL");
@@ -77,8 +80,8 @@ pub const MERGE: Status = Status::Partial(
     "Basic HDR and panorama merges are available; panorama projection (Perspective/Cylindrical/Spherical/Panini) and HDR deghosting (Off/Auto/Manual) are consumed; frame alignment, auto tone, boundary warp and auto crop are not",
     "基础 HDR/全景合并可用；全景投影（透视/圆柱/球面/Panini）与 HDR 去鬼影（关/自动/手动）已消费；对齐、自动色调、边界变形与自动裁剪尚未消费",
 );
-pub const STYLE_IMPORT: Status = Status::Partial("Imported styles are available for this session", "导入风格在当前会话可用");
-pub const SESSIONS: Status = Status::Partial("Session import is read-only; XMP write-back and .P1X are not connected yet", "Session 支持只读导入；XMP 写回与 .P1X 尚未接入");
+pub const STYLE_IMPORT: Status = Status::Partial("Capture One .costyle/.copreset and Lightroom .xmp presets import read-only and are available for this session", "Capture One .costyle/.copreset 与 Lightroom .xmp 预设只读导入，在当前会话可用");
+pub const SESSIONS: Status = Status::Partial("Capture One session and Lightroom .lrcat import are read-only; XMP write-back and .P1X are not connected yet", "Capture One Session 与 Lightroom .lrcat 支持只读导入；XMP 写回与 .P1X 尚未接入");
 pub const PRINT: Status = Status::Partial("Single-page PDF output is available; system printers, multi-image layouts and ICC proofing are not connected", "单页 PDF 输出可用；系统打印机、多图版式与 ICC 打样尚未接入");
 pub const RETOUCH: Status = Status::Pending("Saved with the variant; the engine does not render it yet", "随变体保存，渲染管线尚未实现");
 pub const SURFACE_NOISE: Status = Status::Pending("Surface smoothness has no engine field yet", "表面平滑尚无引擎字段");
@@ -125,11 +128,10 @@ mod format_tests {
 pub const SOFT_PROOF: Status = Status::Partial("Proofs through the chosen ICC profile; a missing profile falls back with no gamut warning", "按所选 ICC 配置文件校样；缺配置文件时回退且不提示色域");
 /// Lens blur: stored with the variant; the engine has no depth map or blur yet.
 pub const LENS_BLUR: Status = Status::Pending("Saved with the variant; the engine has no depth estimation or lens blur yet", "随变体保存，引擎尚无景深估计与镜头模糊");
-/// Apple-Silicon GPU path: roadmap only. No backend, no on-device run, no
-/// measurement exists, so nothing may be presented as verified.
-pub const METAL: Status = Status::Missing(
-    "Roadmap only: no Metal backend and no on-device verification; inference is CPU or the Windows CUDA/DirectML path",
-    "仅为路线图：尚无 Metal 后端，也没有真机验证；推理走 CPU 或 Windows 的 CUDA/DirectML",
+/// A real Apple-device verdict is per model; neither a compiled adapter nor a roadmap proves it.
+pub const METAL: Status = Status::Pending(
+    "Apple GPU model verification is pending. Use Preferences > General for a local device check.",
+    "Apple GPU 的完整模型验收尚未完成。可在偏好设置的常规页检测本机设备。",
 );
 
 /// The unit suffix a slider shows for a `ParamMeta::unit`.
@@ -269,12 +271,12 @@ pub const BANDS: [Band; 14] = [
 pub fn band_index_for_id(id: i64) -> usize {
     match id {
         // 0: 祛除瑕疵 (Y)
-        0 | 1 | 2 | 3 | 5 | 21020 | 21022..=21026 | 21049 | 21050 | 21069..=21071 | 21104 | 30188 | 30189
+        0 | 1 | 2 | 3 | 21020 | 21022..=21026 | 21049 | 21050 | 21069..=21071 | 21104 | 30188 | 30189
         | 30209 | 30259 | 90008 | 90013 | 90015 | 90019 | 90023 | 90024 | 90034 | 90037 | 90080 | 90089
-        | 90116..=90118 | 100008 | 100010 | 100011 => 0,
+        | 90117..=90118 | 100008 | 100010 | 100011 => 0,
 
         // 1: 皮肤调整 (V)
-        8068..=8070 | 21015 | 21105 | 30013..=30017 | 30021 | 30022 | 30031..=30034 | 30059
+        8068..=8070 | 21015 | 30096 | 21105 | 30013..=30017 | 30021 | 30022 | 30031..=30034 | 30059
         | 30191..=30207 | 30210 | 44634 | 80001..=80003 | 90001..=90005 | 90007 | 90010 | 90085
         | 90086 => 1,
 
@@ -291,13 +293,13 @@ pub fn band_index_for_id(id: i64) -> usize {
         108..=110 | 240 | 241 | 30025..=30027 | 90040 => 4,
 
         // 5: 眼睛增强 ($)
-        8034..=8049 | 8052 | 8053 | 21054 | 21093..=21100 | 30023 | 30039 | 90130 | 90142..=90149
+        5 | 101 | 90032 | 90116 | 8034..=8049 | 8052 | 8053 | 21054 | 21093..=21100 | 30023 | 30039 | 90130 | 90142..=90149
         | 90153..=90159 | 90170..=90173 | 900109 | 100004 | 100005 => 5,
 
         // 6: 妆容调整 (Te)
-        8 | 9 | 100 | 101 | 103 | 105..=107 | 111 | 115..=118 | 120..=125 | 8057..=8059
+        8 | 9 | 100 | 103 | 105..=107 | 111 | 115..=118 | 120..=125 | 8057..=8059
         | 8061..=8063 | 8065..=8067 | 30004..=30008 | 30040 | 40100..=40115 | 90020 | 90021
-        | 90032 | 90033 | 90090..=90095 | 90097 | 90119 | 90150 | 90151 | 900110..=900112
+        | 90033 | 90090..=90095 | 90097 | 90119 | 90150 | 90151 | 900110..=900112
         | 900114 => 6,
 
         // 7: 头发调整 (Ue)
@@ -306,6 +308,9 @@ pub fn band_index_for_id(id: i64) -> usize {
 
         // 8: 手部美化 (Vl)
         30030 | 30187 | 30190 => 8,
+
+        // 9: 脚部美化
+        44297 => 9,
 
         // 10: 全身美型 (ye)
         400 | 401 | 403..=408 | 410..=418 | 8031 | 8032 | 30029 | 30074 | 30075 | 30094
@@ -316,7 +321,7 @@ pub fn band_index_for_id(id: i64) -> usize {
 
         // 12: 背景与天空 (Ht + Zt + sl)
         21002 | 21012..=21014 | 21027..=21031 | 21040 | 21042..=21044 | 21047 | 21048 | 21052
-        | 21053 | 21075 | 30018 | 30019 | 30096 | 35040 | 36965 | 39798 | 90006 | 90035 | 90036
+        | 21053 | 21075 | 30018 | 30019 | 35040 | 36965 | 39798 | 90006 | 90035 | 90036
         | 90038 | 90039 | 90042 | 90049..=90057 | 90060 | 90061 | 90099 | 90100 | 90111 | 90112
         | 90133..=90136 | 90200 | 90201 => 12,
 

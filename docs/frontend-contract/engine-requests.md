@@ -137,7 +137,7 @@ pub degraded: Option<String>, // 例如 "嵌入预览（libraw 无法解码 Niko
 ## 8. 节点图混合器（原 node-graph.md 第 2、3 条，仍然有效）
 
 并行混合器：`out = I + Σ m_i·(B_i − I)`；图层混合器：`out = B_0；然后对每个 i，out = lerp(out, B_i, m_i)`。
-做完之后告诉前端，把 `NODE_GRAPH` 的状态改为 Ready。
+已实现（2026-11-27，语义与近似见 `node-graph.md` 文末）；`NODE_GRAPH` 状态仍为 Partial，原因写在 `contract.rs`。
 
 ## 9. 显示器色彩管理（前端已就绪，等引擎）
 

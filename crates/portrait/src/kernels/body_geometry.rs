@@ -604,9 +604,37 @@ pub fn leg_length(_source: &Image) -> Result<Image, Refusal> {
 }
 
 fn rasterize(source: &Image, mesh: &Mesh, pass: &Pass) -> Image {
-    let width = source.width as usize;
-    let height = source.height as usize;
     let mut output = source.pixels.clone();
+    visit_mesh_samples((source.width, source.height), mesh, pass, |index, src, dst| {
+        write_pixel(&mut output, index, fragment(source, src, dst, pass));
+    });
+    Image { width: source.width, height: source.height, pixels: output }
+}
+
+/// Visit the existing mesh rasterizer's color sample coordinates without
+/// materializing an 8-bit texture. The caller owns sampling and store format.
+/// `Mesh::new` validates the streams; callers supplying a mesh via fields must
+/// check them before entering this renderer.
+pub fn mesh_color_samples(
+    size: (u32, u32), mesh: &Mesh, pass: &Pass, mut write: impl FnMut(usize, Vec2),
+) -> Result<(), Refusal> {
+    Mesh::validate_streams(&mesh.source_uv, &mesh.destination, &mesh.indices)?;
+    if size.0 == 0 || size.1 == 0 || pass.defines.uv_map || pass.defines.catmull_rom
+        || !pass.matrix.iter().all(|v| v.is_finite()) || !pass.clamp.factor.is_finite()
+        || (pass.edge == EdgeMode::AdjClampEdge && (pass.clamp.protect_x > 2 || pass.clamp.protect_y > 2))
+    {
+        return Err(Refusal::ValueOutOfRange("body color mesh pass"));
+    }
+    visit_mesh_samples(size, mesh, pass, |index, src, dst| {
+        write(index, color_sample_uv(src, dst, pass));
+    });
+    Ok(())
+}
+
+fn visit_mesh_samples(
+    size: (u32, u32), mesh: &Mesh, pass: &Pass, mut write: impl FnMut(usize, Vec2, Vec2),
+) {
+    let (width, height) = (size.0 as usize, size.1 as usize);
     let mut screen = vec![(f32::NAN, f32::NAN, 0.0f32, 0.0f32); mesh.source_uv.len()];
 
     for (index, position) in mesh.destination.iter().enumerate() {
@@ -694,19 +722,14 @@ fn rasterize(source: &Image, mesh: &Mesh, pass: &Pass) -> Image {
                     (px as f32 + 0.5) / width as f32,
                     (py as f32 + 0.5) / height as f32,
                 );
-                let color = fragment(source, src_uv, dst_uv, pass);
-                write_pixel(&mut output, py * width + px, color);
+                write(py * width + px, src_uv, dst_uv);
             }
         }
     }
-    Image {
-        width: source.width,
-        height: source.height,
-        pixels: output,
-    }
 }
 
-fn fragment(source: &Image, src_uv: Vec2, dst_uv: Vec2, pass: &Pass) -> [f32; 4] {
+/// Apply a color pass's edge law, independent of the color buffer's bit depth.
+pub fn color_sample_uv(src_uv: Vec2, dst_uv: Vec2, pass: &Pass) -> Vec2 {
     let mut sample_uv = src_uv;
     if pass.defines.clamp_edge {
         let factor = match pass.edge {
@@ -718,7 +741,11 @@ fn fragment(source: &Image, src_uv: Vec2, dst_uv: Vec2, pass: &Pass) -> [f32; 4]
             dst_uv.y + (src_uv.y - dst_uv.y) * factor,
         );
     }
+    sample_uv
+}
 
+fn fragment(source: &Image, src_uv: Vec2, dst_uv: Vec2, pass: &Pass) -> [f32; 4] {
+    let sample_uv = color_sample_uv(src_uv, dst_uv, pass);
     if pass.defines.uv_map {
         let sampled = sample_bilinear_float(source, sample_uv.x, sample_uv.y);
         let current = sample_bilinear_float(source, dst_uv.x, dst_uv.y);
@@ -885,8 +912,9 @@ fn smooth_coord(uv: Vec2) -> f32 {
     smooth_coord_reshape(uv)
 }
 
+/// Source UV for a validated six-control arm warp.
 #[allow(clippy::too_many_arguments)]
-fn body_warp_uv(
+pub fn body_warp_uv(
     uv: Vec2,
     source_points: &[Vec2],
     destination_points: &[Vec2],
@@ -918,8 +946,9 @@ fn body_warp_uv(
     Vec2::new(uv.x - total_x * smooth, uv.y - total_y * smooth)
 }
 
+/// Source UV for a validated six-control hip warp.
 #[allow(clippy::too_many_arguments)]
-fn body_liquid_uv(
+pub fn body_liquid_uv(
     uv: Vec2,
     source_points: &[Vec2],
     destination_points: &[Vec2],
@@ -1163,8 +1192,9 @@ fn warp_brush(
     }
 }
 
+/// Source UV of one brush with validated density and freeze planes.
 #[allow(clippy::too_many_arguments)]
-fn brush_sample_uv(
+pub fn brush_sample_uv(
     u: f32,
     v: f32,
     mesh_width: f32,

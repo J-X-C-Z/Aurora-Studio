@@ -4,10 +4,8 @@
 # skip_testdata=true (or set AURORA_CI_SKIP_TESTDATA=1 and run the same command
 # locally). One test-name substring per line; '#' starts a comment.
 #
-# Source: 90_work/build-cache/integration/failures.txt (108 failures from a
-# clean `git archive` export of 9966a47; all need crates/engine/testdata/ which
-# is gitignored). Authoritative grouping/recommendations live in
-# 06_reports/CI-TESTDATA-SKIPS-20261124.tsv (owned by another lane).
+# Source: the 108 failures of a clean `git archive` export of 9966a47; all
+# need crates/engine/testdata/, which is gitignored.
 #
 # Deliberately NOT skipped (real code/test mismatches, must be fixed):
 #   portrait_historical_tone_provider::tests::each_row_frame_binding_is_validated_by_name

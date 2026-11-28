@@ -3,6 +3,8 @@
 
 use std::io::Read;
 
+use rayon::prelude::*;
+
 use super::tiff::{Ifd, Tiff};
 use super::{cfa_filters, active_area, make_frame, meta, packbits, NativeError, NativeResult};
 
@@ -107,6 +109,7 @@ fn decode_plane(
         if tile_offsets.len() < across * down {
             return Err(NativeError::corrupt("DNG has fewer tiles than its geometry needs"));
         }
+        let mut tile_jobs = Vec::with_capacity(across * down);
         let mut tile = 0usize;
         for tile_y in 0..down {
             for tile_x in 0..across {
@@ -117,8 +120,42 @@ fn decode_plane(
                     .data()
                     .get(offset..offset.saturating_add(count))
                     .ok_or_else(|| NativeError::corrupt("DNG tile offset is outside the file"))?;
-                // LibRaw decodes the full tile (the JPEG stream encodes the
-                // padded 256-pixel rows) and clips only when copying.
+                tile_jobs.push((tile_x * tile_width, tile_y * tile_length, raw));
+            }
+        }
+        if tile_jobs.len() >= 2 {
+            let decoded_tiles: Vec<(usize, usize, Vec<u16>)> = tile_jobs
+                .into_par_iter()
+                .map(|(x0, y0, raw)| {
+                    // LibRaw decodes the full tile (the JPEG stream encodes the
+                    // padded 256-pixel rows) and clips only when copying.
+                    let decoded = decode_segment(
+                        raw,
+                        bits,
+                        compression,
+                        predictor,
+                        tile_width,
+                        tile_length,
+                        tiff.little,
+                        dng_version,
+                    )?;
+                    Ok((x0, y0, decoded))
+                })
+                .collect::<NativeResult<Vec<_>>>()?;
+            for (x0, y0, decoded) in decoded_tiles {
+                place_tile(
+                    &mut out,
+                    raw_width,
+                    raw_height,
+                    x0,
+                    y0,
+                    tile_width,
+                    tile_length,
+                    &decoded,
+                );
+            }
+        } else {
+            for (x0, y0, raw) in tile_jobs {
                 let decoded = decode_segment(
                     raw,
                     bits,
@@ -133,8 +170,8 @@ fn decode_plane(
                     &mut out,
                     raw_width,
                     raw_height,
-                    tile_x * tile_width,
-                    tile_y * tile_length,
+                    x0,
+                    y0,
                     tile_width,
                     tile_length,
                     &decoded,
@@ -156,6 +193,7 @@ fn decode_plane(
         return Err(NativeError::corrupt("DNG strip directory is incomplete"));
     }
     let rows_per_strip = ifd.u32(0x0116).unwrap_or(raw_height as u32).max(1) as usize;
+    let mut strip_jobs = Vec::with_capacity(offsets.len());
     let mut y = 0usize;
     for (strip, &offset) in offsets.iter().enumerate() {
         if y >= raw_height {
@@ -166,9 +204,44 @@ fn decode_plane(
             .data()
             .get(offset as usize..(offset as usize).saturating_add(counts[strip] as usize))
             .ok_or_else(|| NativeError::corrupt("DNG strip offset is outside the file"))?;
-        let decoded = decode_segment(raw, bits, compression, predictor, raw_width, height, tiff.little, dng_version)?;
-        place_segment(&mut out, raw_width, 0, y, raw_width, &decoded);
+        strip_jobs.push((y, height, raw));
         y += height;
+    }
+    if strip_jobs.len() >= 2 {
+        let decoded_strips: Vec<(usize, Vec<u16>)> = strip_jobs
+            .into_par_iter()
+            .map(|(y0, height, raw)| {
+                let decoded = decode_segment(
+                    raw,
+                    bits,
+                    compression,
+                    predictor,
+                    raw_width,
+                    height,
+                    tiff.little,
+                    dng_version,
+                )?;
+                Ok((y0, decoded))
+            })
+            .collect::<NativeResult<Vec<_>>>()?;
+        for (y0, decoded) in decoded_strips {
+            place_segment(&mut out, raw_width, 0, y0, raw_width, &decoded);
+        }
+    } else if let Some((y0, height, raw)) = strip_jobs.into_iter().next() {
+        let decoded = decode_segment(
+            raw,
+            bits,
+            compression,
+            predictor,
+            raw_width,
+            height,
+            tiff.little,
+            dng_version,
+        )?;
+        if y0 == 0 && decoded.len() == out.len() {
+            return Ok(decoded);
+        }
+        place_segment(&mut out, raw_width, 0, y0, raw_width, &decoded);
     }
     Ok(out)
 }
@@ -233,14 +306,15 @@ fn decode_segment(
         7 => {
             // The DNG quirk: 16-bit difference symbols in DNG 1.1+ mean -32768.
             let dng_bug = dng_version == 0 || dng_version >= 0x0101_0000;
-            let image = super::ljpeg::decode(raw, dng_bug)?;
+            let mut image = super::ljpeg::decode(raw, dng_bug)?;
             if image.data.len() < expected {
                 return Err(NativeError::corrupt(format!(
                     "lossless DNG tile decoded {} samples, expected {expected}",
                     image.data.len()
                 )));
             }
-            image.data[..expected].to_vec()
+            image.data.truncate(expected);
+            image.data
         }
         other => {
             return Err(NativeError::unsupported(format!("DNG compression {other}")));
@@ -255,20 +329,11 @@ fn decode_segment(
 
 fn unpack(raw: &[u8], bits: u8, expected: usize, little: bool) -> NativeResult<Vec<u16>> {
     if bits == 16 {
-        if raw.len() < expected * 2 {
-            return Err(NativeError::corrupt("DNG strip is shorter than its samples"));
-        }
-        return Ok(raw
-            .chunks_exact(2)
-            .take(expected)
-            .map(|chunk| {
-                if little {
-                    u16::from_le_bytes([chunk[0], chunk[1]])
-                } else {
-                    u16::from_be_bytes([chunk[0], chunk[1]])
-                }
-            })
-            .collect());
+        return if little {
+            meta::unpack_bits_le16(raw, expected)
+        } else {
+            meta::unpack_bits_msb(raw, 16, expected)
+        };
     }
     meta::unpack_bits_msb(raw, bits, expected)
 }
@@ -284,24 +349,32 @@ fn place_tile(
     tile_length: usize,
     samples: &[u16],
 ) {
-    for y in 0..tile_length {
-        let dest_y = y0 + y;
-        if dest_y >= raw_height {
+    let copy_w = tile_width.min(raw_width.saturating_sub(x0));
+    let copy_h = tile_length.min(raw_height.saturating_sub(y0));
+    if copy_w == 0 || copy_h == 0 {
+        return;
+    }
+    for y in 0..copy_h {
+        let src_start = y * tile_width;
+        let src_end = (src_start + copy_w).min(samples.len());
+        if src_start >= src_end {
             break;
         }
-        for x in 0..tile_width {
-            let dest_x = x0 + x;
-            if dest_x >= raw_width {
-                break;
-            }
-            if let Some(value) = samples.get(y * tile_width + x) {
-                out[dest_y * raw_width + dest_x] = *value;
-            }
-        }
+        let len = src_end - src_start;
+        let dst_start = (y0 + y) * raw_width + x0;
+        out[dst_start..dst_start + len].copy_from_slice(&samples[src_start..src_end]);
     }
 }
 
 fn place_segment(out: &mut [u16], raw_width: usize, x0: usize, y0: usize, width: usize, samples: &[u16]) {
+    if x0 == 0 && width == raw_width {
+        let dst_start = y0.saturating_mul(raw_width);
+        if dst_start < out.len() {
+            let copy_len = samples.len().min(out.len() - dst_start);
+            out[dst_start..dst_start + copy_len].copy_from_slice(&samples[..copy_len]);
+        }
+        return;
+    }
     for (index, &value) in samples.iter().enumerate() {
         let x = x0 + index % width;
         let y = y0 + index / width;

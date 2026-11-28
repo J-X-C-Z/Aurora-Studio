@@ -1,11 +1,10 @@
 //! Static `PoseRefine` / `SubPoseRefine` vendor control tables.
 //!
-//! Every number below is copied from the decoded vendor `effect.json` files in
-//! `90_work/lanes/portrait-parse/cfg-decode/decoded/effect/config/`. This module
-//! is deliberately data-only and pure: it neither reads files at runtime nor
-//! invents a warp formula. The authoritative row-per-field table, including the
-//! full PF406 radial factor sets and shoulder-scale duplicates, is
-//! `90_work/lanes/portrait-parse/body-geometry/BODY-GEOMETRY-PARAMS.tsv`.
+//! Every number below is copied from decoded vendor `effect.json` tables. This
+//! module is deliberately data-only and pure: it neither reads files at runtime
+//! nor invents a warp formula. The authoritative row-per-field table, including
+//! the full PF406 radial factor sets and shoulder-scale duplicates, is
+//! `BODY-GEOMETRY-PARAMS.tsv`.
 //!
 //! `ControlContent` can carry either three nodes (`params: [0, 0.5, 1]`) or two
 //! nodes (`params: [0, 1]`). `ControlCurve::remap` is a piecewise-linear map in
@@ -258,7 +257,7 @@ const fn three(params: [f32; 3], degrees: [f32; 3], default_param: f32) -> Contr
 
 const fn two(degrees: [f32; 2], default_param: f32) -> ControlCurve {
     ControlCurve {
-        params: [0.0, 0.5, 1.0],
+        params: [0.0, 1.0, 1.0],
         degrees: [degrees[0], degrees[1], 0.0],
         nodes: 2,
         default_param,

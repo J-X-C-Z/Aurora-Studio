@@ -967,11 +967,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "需要本机 C:\\Users\\Jxcz2\\Pictures\\codex-heif-test.heic"]
+    #[ignore = "needs local HEIC sample; set AURORA_TEST_HEIC"]
     fn real_sample_decodes_at_expected_size() {
-        let path = Path::new(r"C:\Users\Jxcz2\Pictures\codex-heif-test.heic");
-        let image = decode(path).unwrap();
-        assert_eq!((image.width(), image.height()), (33, 17));
+        let path = std::env::var_os("AURORA_TEST_HEIC")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_TEST_HEIC to a local HEIC file");
+        let image = decode(&path).unwrap();
+        assert!(image.width() > 0 && image.height() > 0);
     }
 
     fn tiff_with_make(make: &str) -> Vec<u8> {
@@ -1086,16 +1088,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs local HEIC sample and libheif.dll; set AURORA_TEST_HEIC"]
     fn real_sample_auxiliary_counts_are_readable() {
-        let path = Path::new(r"C:\Users\Jxcz2\Pictures\codex-heif-test.heic");
-        if !path.exists() {
-            return;
-        }
-        let components = components(path).expect("handle probe");
+        let path = std::env::var_os("AURORA_TEST_HEIC")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_TEST_HEIC to a local HEIC file");
+        let components = components(&path).expect("handle probe");
         assert_eq!(components.depth_images, 0);
-        let _ = thumbnail(path).expect("thumbnail probe");
-        assert!(depth(path).expect("depth probe").is_none());
-        assert!(depth_info(path).is_none());
+        let _ = thumbnail(&path).expect("thumbnail probe");
+        assert!(depth(&path).expect("depth probe").is_none());
+        assert!(depth_info(&path).is_none());
     }
 
     #[test]

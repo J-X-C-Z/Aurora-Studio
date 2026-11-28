@@ -98,17 +98,14 @@ fn spotless_body_uniforms() -> BodyHlfUniforms {
 }
 
 fn vendor_adjust_lut() -> &'static [u8] {
-    include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../portrait/tests/fixtures/pf30022/vendor_hlfreq_adjust_lut_256x1_l8.bin"
-    ))
+    aurora_portrait::private_asset!("fixtures/portrait/pf30022/vendor_hlfreq_adjust_lut_256x1_l8.bin").unwrap()
 }
 
 fn hlf_face_image(current: &Image, rgb: &[f32]) -> Image {
     let mut pixels = current.pixels.clone();
     for (index, rgb) in rgb.chunks_exact(3).enumerate() {
         for channel in 0..3 {
-            pixels[index * 4 + channel] = StoreMode::TruncU8.quantize(rgb[channel]);
+            pixels[index * 4 + channel] = StoreMode::Round.quantize(rgb[channel]);
         }
     }
     Image::new(current.width, current.height, pixels).unwrap()
@@ -153,6 +150,12 @@ fn assert_real_kernel(run: &PortraitEffectRun, expected: &str) {
             panic!(
                 "PF{} has no Metal route in this stage: {:?}",
                 run.pf, run.metal_dispatches
+            )
+        }
+        PortraitBackend::Wgpu => {
+            panic!(
+                "PF{} has no WGPU route in this stage",
+                run.pf
             )
         }
     }
@@ -542,6 +545,7 @@ fn hlf_body_stage_preserves_roi_alpha_and_matches_cpu_oracle() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn hlf_body_lut_remains_separate_from_auto_planes() {
     let masks = masks(19, 17, 7);
     let producer = ProducerInputs {
@@ -572,6 +576,7 @@ fn hlf_body_lut_remains_separate_from_auto_planes() {
 }
 
 #[test]
+#[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
 fn hlf_body_stage_uses_vendor_lut_at_spotless_degree() {
     let (width, height) = (19u32, 17u32);
     let mut rng = Rng::new(0x3002201);

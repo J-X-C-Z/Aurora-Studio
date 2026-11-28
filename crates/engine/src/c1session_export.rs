@@ -24,7 +24,15 @@ use crate::c1import::C1Import;
 use crate::catalog::CollectionKind;
 use crate::sqlite_write::{replace_rows_sqlite, write_tables, Cell, SynthTable};
 
-const SESSION_TEMPLATE: &[u8] = include_bytes!("../assets/c1-session-template.cosessiondb");
+/// An empty Capture One session database. It comes from Capture One, so it is
+/// embedded from `private-assets/c1/` only when present.
+const SESSION_TEMPLATE: Option<&[u8]> = aurora_portrait::private_asset!("c1/c1-session-template.cosessiondb");
+
+fn session_template() -> Result<&'static [u8]> {
+    SESSION_TEMPLATE.ok_or_else(|| {
+        anyhow!("this build has no Capture One session template (private-assets/c1/c1-session-template.cosessiondb)")
+    })
+}
 
 /// The folders a Capture One session carries; media would land in `Capture`.
 const SESSION_FOLDERS: [&str; 6] =
@@ -106,6 +114,7 @@ pub fn export_session_with_edits_and_mapping(
     edits: &[SessionMaskEdit<'_>],
     linear_mapping: LinearGradientMapping,
 ) -> Result<SessionExport> {
+    session_template()?;
     if target.exists() {
         bail!("{} already exists; refusing to overwrite it", target.display());
     }
@@ -265,7 +274,7 @@ fn write_bundle(
     tables.push(members);
     tables.push(location);
     let database_path = dir.join(&database);
-    std::fs::write(&database_path, SESSION_TEMPLATE)?;
+    std::fs::write(&database_path, session_template()?)?;
     replace_rows_sqlite(&database_path, &tables)
         .with_context(|| format!("writing {database}"))?;
     let connection = rusqlite::Connection::open(&database_path)?;
@@ -2253,6 +2262,7 @@ mod tests {
     use crate::c1_model::C1VariantSettings;
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn renamed_capture_media_keeps_its_mask_sidecar() {
         let dir = temp_dir("renamed-mask");
         let source_db = dir.join("rename.cocatalogdb");
@@ -2294,6 +2304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn session_export_writes_requested_gradient_and_preserves_other_record() {
         let dir = temp_dir("gradient-writeback");
         let source_db = dir.join("gradient.cocatalogdb");
@@ -2361,6 +2372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn session_mapping_modes_reimport_linear_and_radial_across_canvas_orientations() {
         use crate::layers::{LinearGradient, MaskOp, MaskShape, RadialGradient};
 
@@ -2547,6 +2559,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn an_exported_session_reads_back_with_the_same_images_and_edits() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("roundtrip");
@@ -2611,6 +2624,7 @@ mod tests {
     /// The catalog fixture has no keywords, so the synthetic session (a keyword
     /// tree Wedding > Bride, rating 6) carries that half of the round trip.
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn ratings_and_keywords_survive_the_round_trip() {
         let dir = temp_dir("metadata");
         let source_path = dir.join("Synth.cosessiondb");
@@ -2642,6 +2656,7 @@ mod tests {
 
     /// A session has its own three collections, not the catalog's folder tree.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn the_collection_tree_survives_the_round_trip() {
         let source = C1Import::open(&fixture()).unwrap();
         assert_eq!(source.catalog.collections.len(), 11, "fixture must carry 11 collections");
@@ -2671,6 +2686,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn path_locations_are_winroot_plus_relative() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("path-shape");
@@ -2713,6 +2729,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn rated_images_are_linked_into_selects_only() {
         let source = C1Import::open(&fixture()).unwrap();
         let rated = source
@@ -2746,6 +2763,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn template_export_has_no_dangling_source_collection_ids() {
         let dir = temp_dir("template-source-collection-ids");
         let source = dir.join("source.cocatalogdb");
@@ -2782,6 +2800,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn collection_queries_find_preserved_variant_links() {
         let import = C1Import::open(&fixture()).unwrap();
         let mut source = SourceRows::load(&import).unwrap();
@@ -2811,6 +2830,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn entities_and_display_tables_match_the_source() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("entities-display");
@@ -2860,6 +2880,7 @@ mod tests {
     /// Selects/Trash. Keystone/29-column gaps are reported by the matrix, not
     /// asserted as passing here.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn full_session_matrix_round_trip() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("matrix");
@@ -2914,6 +2935,7 @@ mod tests {
     /// Local mask layers are rebuilt from the `Z_ENT` 23 rows; only their
     /// references travel, never the `.comask` pixels.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn local_mask_layers_survive_as_references() {
         let source = C1Import::open(&fixture()).unwrap();
         let source_layers: Vec<_> = source
@@ -2993,6 +3015,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn exported_document_points_to_its_root_collection() {
         let import = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("root-collection");
@@ -3009,6 +3032,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn exported_variant_references_resolve_to_its_rebuilt_layers() {
         let (dir, _, export) = export_fixture("layer-references");
         let source_variants = rows(&fixture(), "ZVARIANT");
@@ -3078,6 +3102,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_columns_first_eight_round_trip() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("a-first-eight");
@@ -3132,6 +3157,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_columns_all_23_round_trip_and_retouch_rows() {
         let source = C1Import::open(&fixture()).unwrap();
         let dir = temp_dir("a-all");
@@ -3541,6 +3567,7 @@ mod gradient_writeback_tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn read_only_open_and_export_leave_the_catalog_database_byte_identical() {
         let dir = scratch_dir("read-only-source");
         let bundle = dir.join("Source.cocatalogdb");
@@ -3584,6 +3611,7 @@ mod gradient_writeback_tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn a_refused_session_export_keeps_the_existing_folder_and_leaves_no_staging() {
         let dir = scratch_dir("refuse-overwrite");
         let database = dir.join("Source.cocatalogdb");
@@ -3602,6 +3630,7 @@ mod gradient_writeback_tests {
     }
 
     #[test]
+    #[cfg_attr(not(aurora_private_assets), ignore = "needs private-assets/")]
     fn a_catalog_file_name_cannot_leave_the_bundle() {
         let dir = scratch_dir("traversal-name");
         let database = dir.join("Source.cocatalogdb");

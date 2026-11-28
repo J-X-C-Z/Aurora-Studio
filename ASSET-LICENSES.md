@@ -7,6 +7,12 @@
 >
 > 起草：integration 会话，2026-11-24。依据：审查条目 F-04、C1-1、IN-1/IN-2 派单。
 
+> **2026-11-25 更新**：下文 §4–§6 列出的第三方解码资产、Capture One 提取数据、
+> 依赖它们的测试 fixture、研究记录与采集工具已全部移出 Git，改放在被忽略的
+> `private-assets/`（布局与构建方式见 [private-assets.md](private-assets.md)，
+> 清单见 [docs/private-assets.sha256](docs/private-assets.sha256)）。表中路径是迁移前的位置，
+> 保留用于追溯来源；Git 历史中仍有这些文件，是否清理历史由仓库所有者决定。
+
 ## 1. 当前仓库声明（事实，未改动）
 
 | 位置 | 现行内容 |
@@ -110,7 +116,7 @@
 | 位置 | 文件数 | 分类 | 说明 |
 |---|---:|---|---|
 | `crates/portrait/work/**` | 15 | research（**当前被 git 跟踪**） | backend-r11/o1i 基准、PTX 构建脚本、`bright.rgb`/`whiten.rgb` 中间帧 |
-| `work/**`（仓库根） | 10 | research（**当前被 git 跟踪**） | 与 `crates/portrait/work/backend-r11/o1i` 重复 |
+| `work/**`（仓库根） | 0 | 已移除 | 原为 `crates/portrait/work/backend-r11/o1i` 的逐字节重复；测试用的 3 个文件移到 `crates/portrait/tests/fixtures/teeth_{gpu,blend}/` |
 | `tools/body_pose_capture/**` | 12 | tool | PowerShell 抓取/分类脚本与 manifest（含厂商路径信息） |
 | `docs/portrait-assets/**` | 9 | research | 资产获取记录、blocker、r26 catalog |
 | `engine/**`（仓库根，未跟踪） | 23 | 历史副本 | 旧 `lumen-engine` crate 副本，工作区未跟踪，不参与 workspace |
@@ -123,7 +129,7 @@
 3. **C1 资产**：见 §4.5。编译内嵌的 `camera_params*.json` 与
    `c1-session-template.cosessiondb` 权利待确认；C1 安装目录 7 类运行期依赖不得再分发。
 4. **`vendor/libraw`**：本地 RAW 解码运行库，未纳入 git；发布包需单独说明来源与 LGPL/CDDL 义务。
-5. **两份 `assets/portrait` 与两份 `work`**：去重、去跟踪属 IN-2 迁移建议，本轮不搬文件。
+5. ~~两份 `assets/portrait` 与两份 `work`~~：已合并移入 `private-assets/`（2026-11-25）。
 
 ## 8. 哈希附注（vface 与 C1 模板）
 

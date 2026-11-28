@@ -50,6 +50,7 @@ fn roots() -> Vec<PathBuf> {
 fn package_paths(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     collect(root, &mut out);
+    out.sort();
     out
 }
 

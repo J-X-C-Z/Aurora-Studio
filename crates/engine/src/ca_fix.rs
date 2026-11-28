@@ -149,6 +149,113 @@ pub fn defringe_purple(rgba: &mut [u8], w: u32, h: u32, amount: f32) {
     });
 }
 
+/// Lightroom-aligned 6-parameter dual-colour fringe suppression (Purple & Green).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DualDefringeParams {
+    /// Purple defringe amount `0.0..=1.0` (LR UI `0..=20` / 20.0).
+    pub purple_amount: f32,
+    /// Purple hue window `[lo, hi]` in `0..=100` (LR default `30..70`).
+    pub purple_hue_lo: f32,
+    pub purple_hue_hi: f32,
+    /// Green defringe amount `0.0..=1.0` (LR UI `0..=20` / 20.0).
+    pub green_amount: f32,
+    /// Green hue window `[lo, hi]` in `0..=100` (LR default `40..60`).
+    pub green_hue_lo: f32,
+    pub green_hue_hi: f32,
+}
+
+impl Default for DualDefringeParams {
+    fn default() -> Self {
+        Self {
+            purple_amount: 0.0,
+            purple_hue_lo: 30.0,
+            purple_hue_hi: 70.0,
+            green_amount: 0.0,
+            green_hue_lo: 40.0,
+            green_hue_hi: 60.0,
+        }
+    }
+}
+
+#[inline]
+fn hue_band_0_100(pos: f32, lo: f32, hi: f32) -> f32 {
+    let lo = lo.min(hi);
+    let hi = hi.max(lo + 1e-3);
+    if pos >= lo && pos <= hi {
+        return 1.0;
+    }
+    let feather = 12.0;
+    let d = if pos < lo { lo - pos } else { pos - hi };
+    (1.0 - d / feather).clamp(0.0, 1.0)
+}
+
+/// Dual-band (Purple + Green) edge-gated fringe suppression with luminance preservation.
+pub fn defringe_dual(rgba: &mut [u8], w: u32, h: u32, params: &DualDefringeParams) {
+    let pa = params.purple_amount.clamp(0.0, 1.0);
+    let ga = params.green_amount.clamp(0.0, 1.0);
+    if pa == 0.0 && ga == 0.0 {
+        return;
+    }
+    let Some((w, h)) = dims(rgba, w, h) else {
+        return;
+    };
+    if w < 3 || h < 3 {
+        return;
+    }
+    let mut ymap = vec![0f32; w * h];
+    ymap.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let base = y * w * 4;
+        for (x, out) in row.iter_mut().enumerate() {
+            let p = base + x * 4;
+            *out = luma(
+                rgba[p] as f32 / 255.0,
+                rgba[p + 1] as f32 / 255.0,
+                rgba[p + 2] as f32 / 255.0,
+            );
+        }
+    });
+
+    rgba.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let gx = lum_at(&ymap, w, h, x + 1, y) - lum_at(&ymap, w, h, x.saturating_sub(1), y);
+            let gy = lum_at(&ymap, w, h, x, y + 1) - lum_at(&ymap, w, h, x, y.saturating_sub(1));
+            let edge = (((gx * gx + gy * gy).sqrt() - 0.025) / 0.085).clamp(0.0, 1.0);
+            if edge <= 0.0 {
+                continue;
+            }
+            let p = x * 4;
+            let r = row[p] as f32 / 255.0;
+            let g = row[p + 1] as f32 / 255.0;
+            let b = row[p + 2] as f32 / 255.0;
+            let yv = luma(r, g, b);
+            let (cr, cb) = (r - yv, b - yv);
+            if cr * cb <= 0.0 {
+                continue;
+            }
+            let sat = cr.abs().max(cb.abs());
+            let mask = ((sat - NEUTRAL) / 0.09).clamp(0.0, 1.0);
+            if mask <= 0.0 {
+                continue;
+            }
+            // Map opponent angle inside (+,+) purple or (-,-) green quadrant to 0..100.
+            let ratio = (cb.abs() / (cr.abs() + cb.abs() + 1e-6)) * 100.0;
+            let strength = if cr > 0.0 && cb > 0.0 && pa > 0.0 {
+                pa * hue_band_0_100(ratio, params.purple_hue_lo, params.purple_hue_hi)
+            } else if cr < 0.0 && cb < 0.0 && ga > 0.0 {
+                ga * hue_band_0_100(ratio, params.green_hue_lo, params.green_hue_hi)
+            } else {
+                0.0
+            };
+            let k = (strength * edge * mask).clamp(0.0, 1.0);
+            if k <= 0.0 {
+                continue;
+            }
+            let rgb = with_chroma(yv, cr * (1.0 - k), cb * (1.0 - k));
+            row[p..p + 3].copy_from_slice(&rgb);
+        }
+    });
+}
+
 /// Anti colour aliasing: a single pixel whose chroma disagrees with the median
 /// of its four neighbours while the luma shows a one-pixel detail is false
 /// colour from demosaicing.  Its chroma is blended toward the neighbour median.
@@ -435,5 +542,23 @@ mod tests {
         anti_alias(&mut dot, 1920, 1080, 1.0);
         println!("1920x1080 anti_alias {:?}", t0.elapsed());
         assert!(after_ratio < before_ratio * 0.5);
+    }
+
+    #[test]
+    fn defringe_dual_suppresses_purple_only_when_green_is_zero() {
+        let (w, h) = (64u32, 64u32);
+        let mut v = purple_frame(w, h);
+        let before = count(&v, is_purple);
+        defringe_dual(
+            &mut v,
+            w,
+            h,
+            &DualDefringeParams {
+                purple_amount: 1.0,
+                ..Default::default()
+            },
+        );
+        let after = count(&v, is_purple);
+        assert!(after < before / 2, "{before} -> {after}");
     }
 }

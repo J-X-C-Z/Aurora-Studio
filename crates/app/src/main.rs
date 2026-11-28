@@ -5,6 +5,7 @@
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn main() {
+    portrait_app::init_diagnostics();
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     let mut touch = std::env::var_os("AURORA_TOUCH").is_some();
     let mut selfcheck = std::env::var_os("AURORA_GPU_SELFCHECK").is_some();

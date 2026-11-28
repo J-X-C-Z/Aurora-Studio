@@ -7,6 +7,8 @@
 //! old (`0xFF03`) subband headers.  Rounded/partial re-quantisation (encType 1/3)
 //! is deliberately rejected instead of guessed.
 
+use rayon::prelude::*;
+
 use super::{NativeError, NativeResult};
 
 pub(crate) const E_HAS_TILES_ON_THE_RIGHT: u8 = 1;
@@ -621,8 +623,9 @@ fn decode_with_iq(sub: &mut Subband<'_>) -> NativeResult<()> {
         "CRX band {}x{} line {line_no} q{}: {error}",
         sub.width, sub.height, sub.q_param
     )))?;
-    let line = param.line_data().to_vec();
-    sub.buf[..line.len()].copy_from_slice(&line);
+    let line = param.line_data();
+    let len = line.len().min(sub.buf.len());
+    sub.buf[..len].copy_from_slice(&line[..len]);
     let q = sub.q_param;
     let index = (q % 6) as usize;
     let scale = if q / 6 >= 6 {
@@ -702,11 +705,21 @@ fn horizontal53(la: &mut [i32], lb: &mut [i32], wv: &Wavelet, flag: u8) {
     }
 }
 
-fn idwt_get_line(wv: &mut Wavelet) -> Vec<i32> {
+#[inline]
+fn idwt_get_line_slice(wv: &mut Wavelet) -> &[i32] {
     // crxIdwt53FilterGetLine indexes with curH *before* decrementing it.
     let idx = ((wv.flt as i32 - wv.cur_h + 5) % 5 + 3) as usize;
     wv.cur_h -= 1;
-    wv.line[idx].clone()
+    &wv.line[idx]
+}
+
+#[inline]
+fn copy_parent_line_to_s0(wv: &mut [Wavelet], level: usize) {
+    let (left, right) = wv.split_at_mut(level);
+    let src = idwt_get_line_slice(&mut left[level - 1]);
+    let dst = &mut right[0].s0;
+    dst.clear();
+    dst.extend_from_slice(src);
 }
 
 fn idwt_decode(
@@ -760,8 +773,7 @@ fn idwt_transform(wv: &mut [Wavelet], level: usize, flag: u8) -> NativeResult<()
                     if wv[level - 1].cur_h == 0 {
                         idwt_transform(wv, level - 1, flag)?;
                     }
-                    let line = idwt_get_line(&mut wv[level - 1]);
-                    wv[level].s0 = line;
+                    copy_parent_line_to_s0(wv, level);
                 }
                 let (h0, h1, h2) = (wv[level].flt + 3, (wv[level].flt + 1) % 5 + 3, (wv[level].flt + 2) % 5 + 3);
                 let mut l0 = std::mem::take(&mut wv[level].line[0]);
@@ -838,8 +850,7 @@ fn idwt_transform(wv: &mut [Wavelet], level: usize, flag: u8) -> NativeResult<()
             if wv[level - 1].cur_h == 0 {
                 idwt_transform(wv, level - 1, flag)?;
             }
-            let line = idwt_get_line(&mut wv[level - 1]);
-            wv[level].s0 = line;
+            copy_parent_line_to_s0(wv, level);
         }
         let (h0, h1, h2) = (wv[level].flt + 3, (wv[level].flt + 1) % 5 + 3, (wv[level].flt + 2) % 5 + 3);
         let mut l0 = std::mem::take(&mut wv[level].line[0]);
@@ -901,16 +912,19 @@ fn idwt_transform(wv: &mut [Wavelet], level: usize, flag: u8) -> NativeResult<()
         // C++ swaps lineBuf[1] and lineBuf[2] by pointer.  The buffer that
         // becomes line[2] is the same buffer the L-band reconstruction writes
         // (lineBufL1), so the assignment has to happen *after* that
-        // reconstruction; a clone taken before it would freeze zeros.
-        wv[level].line[1] = l2.clone();
-        wv[level].line[2] = l1.clone();
-        for i in 0..width {
-            // Re-reading lineBuf[1] after the swap yields the old line[2]
-            // (our `l2`) for the H-band prediction.
-            let delta = l0[i] - ((l2[i] + l1[i] + 2) >> 2);
-            h1v[i] = l2[i] + ((delta + wv[level].line[h0][i]) >> 1);
-            h2v[i] = delta;
+        // reconstruction.
+        {
+            let h0_slice = &wv[level].line[h0];
+            for i in 0..width {
+                // Re-reading lineBuf[1] after the swap yields the old line[2]
+                // (our `l2`) for the H-band prediction.
+                let delta = l0[i] - ((l2[i] + l1[i] + 2) >> 2);
+                h1v[i] = l2[i] + ((delta + h0_slice[i]) >> 1);
+                h2v[i] = delta;
+            }
         }
+        wv[level].line[1] = l2;
+        wv[level].line[2] = l1;
         wv[level].line[0] = l0;
         wv[level].line[h1] = h1v;
         wv[level].line[h2] = h2v;
@@ -932,8 +946,7 @@ fn idwt_initialize(wv: &mut [Wavelet], subs: &mut [Subband<'_>], levels: usize, 
     for level in 0..levels {
         let base = 3 * level;
         if level > 0 {
-            let line = idwt_get_line(&mut wv[level - 1]);
-            wv[level].s0 = line;
+            copy_parent_line_to_s0(wv, level);
         } else {
             decode_with_iq(&mut subs[base])?;
             copy_subband_to(&mut wv[level], 0, &subs[base]);
@@ -1238,6 +1251,9 @@ pub(crate) fn decode_sample(sample: &[u8], header: &CrxHeader) -> NativeResult<(
     let max_value = (1i32 << header.bits) - 1;
     let mdat_start = header.mdat_header_size;
 
+    let tile_cols = plane_width.div_ceil(tile_width);
+    let tile_rows = plane_height.div_ceil(tile_height);
+    let mut jobs = Vec::with_capacity(4 * tile_rows * tile_cols);
     for plane in 0..4u8 {
         // Plane -> (row offset, column offset) inside the 2x2 CFA cell.
         let (px, py) = match (header.cfa_layout, plane) {
@@ -1260,110 +1276,104 @@ pub(crate) fn decode_sample(sample: &[u8], header: &CrxHeader) -> NativeResult<(
             _ => return Err(NativeError::corrupt("CRX CFA layout is invalid")),
         };
         let mut image_row = 0usize;
-        for tile_row in 0..(plane_height.div_ceil(tile_height)) {
+        for tile_row in 0..tile_rows {
             let mut image_col = 0usize;
-            for tile_col in 0..(plane_width.div_ceil(tile_width)) {
-                let tile = &tiles[tile_row * plane_width.div_ceil(tile_width) + tile_col];
-                let comp = &tile.comps[plane as usize];
-                let geometry = setup_subband_geometry(tile, header.levels);
-                let mut subs = Vec::with_capacity(geometry.len());
-                for (index, (width, height)) in geometry.iter().enumerate() {
-                    let band = &comp.bands[index];
-                    let absolute = mdat_start as u64 + tile.data_offset + comp.data_offset + band.data_offset;
-                    let param = if band.data_size > 0 {
-                        Some(BandParam::new(
-                            sample,
-                            absolute as usize,
-                            band.data_size,
-                            *width,
-                            *height,
-                            comp.supports_partial && index == 0,
-                        ))
-                    } else {
-                        None
-                    };
-                    subs.push(Subband {
-                        width: *width,
-                        height: *height,
-                        q_param: band.q_param,
-                        data_size: band.data_size,
-                        buf: vec![0i32; *width],
-                        param,
-                    });
-                }
-                if header.levels == 0 {
-                    let width = tile.width;
-                    for row in 0..tile.height {
-                        decode_with_iq(&mut subs[0])?;
-                        let line = subs[0].buf.clone();
-                        convert_line(
-                            &mut out,
-                            raw_width,
-                            2 * image_row + 2 * row + py,
-                            2 * image_col + px,
-                            &line,
-                            width,
-                            median,
-                            max_value,
-                            2,
-                        );
-                    }
-                } else {
-                    let levels = header.levels as usize;
-                    let mut wv = Vec::with_capacity(levels);
-                    for level in 0..levels {
-                        let (width, height) = if level >= levels - 1 {
-                            (tile.width, tile.height)
-                        } else {
-                            let geometry = &geometry;
-                            let w = geometry[3 * level + 5].0;
-                            let h = geometry[3 * level + 4].1;
-                            (w, h)
-                        };
-                        wv.push(Wavelet::new(width, height));
-                    }
-                    idwt_initialize(&mut wv, &mut subs, levels, tile.flags)?;
-                    for row in 0..tile.height {
-                        idwt_decode(&mut wv, &mut subs, levels - 1, tile.flags)?;
-                        idwt_transform(&mut wv, levels - 1, tile.flags)?;
-                        let line = idwt_get_line(&mut wv[levels - 1]);
-                        convert_line(
-                            &mut out,
-                            raw_width,
-                            2 * image_row + 2 * row + py,
-                            2 * image_col + px,
-                            &line,
-                            tile.width,
-                            median,
-                            max_value,
-                            2,
-                        );
-                    }
-                }
+            for tile_col in 0..tile_cols {
+                let tile_idx = tile_row * tile_cols + tile_col;
+                let tile = &tiles[tile_idx];
+                jobs.push((plane as usize, px, py, tile_idx, image_row, image_col));
                 image_col += tile.width;
             }
-            image_row += tiles[tile_row * plane_width.div_ceil(tile_width)].height;
+            image_row += tiles[tile_row * tile_cols].height;
+        }
+    }
+
+    let decoded_tiles: Vec<(usize, usize, usize, usize, usize, usize, Vec<u16>)> = jobs
+        .into_par_iter()
+        .map(|(plane_idx, px, py, tile_idx, image_row, image_col)| {
+            let tile = &tiles[tile_idx];
+            let comp = &tile.comps[plane_idx];
+            let geometry = setup_subband_geometry(tile, header.levels);
+            let mut subs = Vec::with_capacity(geometry.len());
+            for (index, (width, height)) in geometry.iter().enumerate() {
+                let band = &comp.bands[index];
+                let absolute = mdat_start as u64 + tile.data_offset + comp.data_offset + band.data_offset;
+                let param = if band.data_size > 0 {
+                    Some(BandParam::new(
+                        sample,
+                        absolute as usize,
+                        band.data_size,
+                        *width,
+                        *height,
+                        comp.supports_partial && index == 0,
+                    ))
+                } else {
+                    None
+                };
+                subs.push(Subband {
+                    width: *width,
+                    height: *height,
+                    q_param: band.q_param,
+                    data_size: band.data_size,
+                    buf: vec![0i32; *width],
+                    param,
+                });
+            }
+            let mut tile_buf = vec![0u16; tile.width * tile.height];
+            if header.levels == 0 {
+                let width = tile.width;
+                for row in 0..tile.height {
+                    decode_with_iq(&mut subs[0])?;
+                    let dst = &mut tile_buf[row * width..(row + 1) * width];
+                    for (slot, &value) in dst.iter_mut().zip(subs[0].buf.iter()) {
+                        *slot = (median + value).clamp(0, max_value) as u16;
+                    }
+                }
+            } else {
+                let levels = header.levels as usize;
+                let mut wv = Vec::with_capacity(levels);
+                for level in 0..levels {
+                    let (width, height) = if level >= levels - 1 {
+                        (tile.width, tile.height)
+                    } else {
+                        let w = geometry[3 * level + 5].0;
+                        let h = geometry[3 * level + 4].1;
+                        (w, h)
+                    };
+                    wv.push(Wavelet::new(width, height));
+                }
+                idwt_initialize(&mut wv, &mut subs, levels, tile.flags)?;
+                let width = tile.width;
+                for row in 0..tile.height {
+                    idwt_decode(&mut wv, &mut subs, levels - 1, tile.flags)?;
+                    idwt_transform(&mut wv, levels - 1, tile.flags)?;
+                    let line = idwt_get_line_slice(&mut wv[levels - 1]);
+                    let dst = &mut tile_buf[row * width..(row + 1) * width];
+                    for (slot, &value) in dst.iter_mut().zip(line.iter()) {
+                        *slot = (median + value).clamp(0, max_value) as u16;
+                    }
+                }
+            }
+            Ok((px, py, image_row, image_col, tile.width, tile.height, tile_buf))
+        })
+        .collect::<NativeResult<Vec<_>>>()?;
+
+    for (px, py, image_row, image_col, tw, th, tile_buf) in decoded_tiles {
+        for row in 0..th {
+            let dst_row_idx = 2 * image_row + 2 * row + py;
+            if dst_row_idx >= raw_height {
+                continue;
+            }
+            let dst_row = &mut out[dst_row_idx * raw_width..(dst_row_idx + 1) * raw_width];
+            let src_row = &tile_buf[row * tw..(row + 1) * tw];
+            let col_base = 2 * image_col + px;
+            for (index, &sample) in src_row.iter().enumerate() {
+                let col = col_base + index * 2;
+                if col < raw_width {
+                    dst_row[col] = sample;
+                }
+            }
         }
     }
     Ok((out, raw_width, raw_height))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn convert_line(
-    out: &mut [u16],
-    raw_width: usize,
-    row: usize,
-    col: usize,
-    line: &[i32],
-    width: usize,
-    median: i32,
-    max_value: i32,
-    step: usize,
-) {
-    for (index, &value) in line.iter().take(width).enumerate() {
-        let sample = (median + value).clamp(0, max_value) as u16;
-        if let Some(slot) = out.get_mut(row * raw_width + col + index * step) {
-            *slot = sample;
-        }
-    }
 }

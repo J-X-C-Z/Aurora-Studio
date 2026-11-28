@@ -527,10 +527,10 @@ fn a5_export_plan_explicitly_rejects_invalid_bit_depth_zero_size_and_bad_directo
 
     // 4) Unsupported format & invalid scale parameter.
     let mut unsupported = ProcessRecipe::default();
-    unsupported.format = ExportFormat::Dng;
+    unsupported.format = ExportFormat::JpegXl;
     assert!(matches!(
         ExportPlan::from_recipe(&unsupported, (1000, 800), &geom),
-        Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::Dng, .. })
+        Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::JpegXl, .. })
     ));
 
     let mut bad_scale = ProcessRecipe::default();

@@ -132,7 +132,7 @@ fn styles_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> 
                     .xsmall()
                     .outline()
                     .icon(Icon::new(IconName::ImageDown))
-                    .label(t("Import Capture One Styles…", "导入 Capture One 风格…"))
+                    .label(t("Import Styles (.costyle, .copreset, .xmp)…", "导入风格（.costyle / .copreset / .xmp）…"))
                     .on_click(move |_, _, cx| {
                         let st = st_import.clone();
                         let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });

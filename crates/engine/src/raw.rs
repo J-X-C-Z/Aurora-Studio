@@ -47,6 +47,44 @@ pub fn embedded_preview(path: &Path) -> anyhow::Result<RgbaImage> {
     found.ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))
 }
 
+/// Fast progressive first-frame preview for a cold RAW: streams chunks and
+/// stops as soon as an embedded JPEG with long side `>= target_long_side.clamp(640, 1600)`
+/// is found, then applies EXIF orientation so portrait frames appear upright.
+pub fn quick_embedded_preview(path: &Path, target_long_side: u32) -> anyhow::Result<RgbaImage> {
+    let min_long_side = target_long_side.clamp(640, 1600);
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(CHUNK, file);
+    let mut buf = vec![0u8; CHUNK];
+    let mut state = ScanState::default();
+    let mut best: Option<(u64, RgbaImage)> = None;
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                feed(&mut state, &buf[..n], &mut evaluate_preview, &mut best);
+                if let Some((_, ref img)) = best {
+                    if img.width().max(img.height()) >= min_long_side {
+                        break;
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let img = best
+        .map(|(_, value)| value)
+        .ok_or_else(|| anyhow::anyhow!("no embedded JPEG preview in {}", path.display()))?;
+    let oriented = match exif_orientation_tag(path).unwrap_or(1) {
+        3 => image::imageops::rotate180(&img),
+        6 => image::imageops::rotate90(&img),
+        8 => image::imageops::rotate270(&img),
+        _ => img,
+    };
+    Ok(oriented)
+}
+
 /// [`embedded_preview`] over bytes we already hold: the sensor/preview sanity
 /// check must not read the RAW a second time.
 fn embedded_preview_bytes(bytes: &[u8]) -> Option<RgbaImage> {
@@ -555,7 +593,8 @@ pub struct DecodeStageRevisions {
 /// from the former single `DECODE_ALGORITHM_REVISION` constant.
 pub const DECODE_STAGE_REVISIONS: DecodeStageRevisions = DecodeStageRevisions {
     demosaic: 1,
-    highlight_recovery: 1,
+    // CPU-only Bayer frames used to skip highlight recovery and chroma anti-aliasing.
+    highlight_recovery: 2,
     chromatic_aberration: 1,
     noise_model: 1,
     // Bumped when macOS became able to route a Z6III HE NEF through the Z6III
@@ -609,6 +648,9 @@ impl DecodeStageRevisions {
         hash = stage(hash, 1, self.demosaic);
         hash = stage(hash, 2, self.orientation_active_area);
         hash = stage(hash, 3, self.output_packing);
+        // The LibRaw gamma ABI changed from int to float, and both linear
+        // parameters are now supplied. Do not reuse older non-linear proxies.
+        if matches!(shape, StageShape::LibRaw) { hash = stage(hash, 8, 1); }
         if matches!(shape, StageShape::AuroraGeneric | StageShape::AuroraZ6iii) {
             hash = stage(hash, 4, self.highlight_recovery);
             hash = stage(hash, 5, self.chromatic_aberration);
@@ -662,6 +704,11 @@ pub struct RawStageTimings {
     pub z6iii_ms: u64,
     pub demosaic_ms: u64,
     pub c1_stages_ms: u64,
+    /// Successful CUDA demosaic + linear-finish calls, counted only after a device result.
+    pub cuda_fused_frames: u64,
+    /// Completed generic Bayer post stages, independent of the Z6III reconstruction route.
+    pub cpu_highlight_aa_frames: u64,
+    pub opencl_highlight_aa_frames: u64,
     pub fallback_ms: u64,
     pub total_ms: u64,
     pub peak_tracked_bytes: u64,
@@ -678,6 +725,9 @@ impl RawStageTimings {
         self.z6iii_ms += other.z6iii_ms;
         self.demosaic_ms += other.demosaic_ms;
         self.c1_stages_ms += other.c1_stages_ms;
+        self.cuda_fused_frames += other.cuda_fused_frames;
+        self.cpu_highlight_aa_frames += other.cpu_highlight_aa_frames;
+        self.opencl_highlight_aa_frames += other.opencl_highlight_aa_frames;
         self.fallback_ms += other.fallback_ms;
         self.total_ms += other.total_ms;
         self.peak_tracked_bytes = self.peak_tracked_bytes.max(other.peak_tracked_bytes);
@@ -1013,6 +1063,25 @@ impl DecodeProvenance {
     }
 }
 
+/// RAW cache identity for choices that can change the pixel values. Keep selectors
+/// separate even if a given file happens to be byte-identical on two routes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RawDevicePolicy {
+    pub selector: Option<aurora_portrait::native_infer::backend::BackendRequest>,
+    pub cuda_demosaic: bool,
+    pub cuda_linear: bool,
+    pub cuda_fusion: bool,
+}
+impl RawDevicePolicy {
+    fn current()->Self {
+        use aurora_portrait::native_infer::backend::BackendRequest;
+        Self { selector:BackendRequest::from_env().ok(),
+            cuda_demosaic:crate::aurora_raw::demosaic_cuda::demosaic_cuda_enabled(),
+            cuda_linear:crate::aurora_raw::linear_post_cuda::linear_post_cuda_enabled(),
+            cuda_fusion:crate::aurora_raw::demosaic_cuda::fused_cuda_enabled(), }
+    }
+}
+
 /// Inputs that decide which backend [`decode16_traced`] selects *before* a
 /// decode runs. Any change here must produce a different cache entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1029,6 +1098,7 @@ pub struct DecodeRoute {
     /// The libraw shared library resolves in this process.
     pub libraw_available: bool,
     pub opencl: OpenClRouteState,
+    pub device_policy: RawDevicePolicy,
     pub demosaic: i32,
 }
 
@@ -1068,6 +1138,7 @@ pub fn decode_route(path: &Path) -> DecodeRoute {
         z6iii_feature,
         libraw_available: libraw::available(),
         opencl: opencl_route_state(),
+        device_policy: RawDevicePolicy::current(),
         demosaic: demosaic_quality(),
     };
     route.pipeline_fingerprint = DECODE_STAGE_REVISIONS.pipeline_fingerprint(&route);
@@ -1077,8 +1148,16 @@ pub fn decode_route(path: &Path) -> DecodeRoute {
 fn opencl_route_state() -> OpenClRouteState {
     #[cfg(all(windows, feature = "z6iii-raw-export"))]
     {
-        static STATE: std::sync::OnceLock<OpenClRouteState> = std::sync::OnceLock::new();
-        *STATE.get_or_init(|| {
+        use aurora_portrait::native_infer::backend::{BackendKind,BackendRequest};
+        let Ok(request)=BackendRequest::from_env() else {return OpenClRouteState::Unavailable};
+        // The legacy name covers both Z6III GPU implementations. Cache each choice
+        // independently: a CPU-only lookup must not poison an OpenCL/CUDA session.
+        static AUTO: std::sync::OnceLock<OpenClRouteState> = std::sync::OnceLock::new();
+        static CUDA: std::sync::OnceLock<OpenClRouteState> = std::sync::OnceLock::new();
+        static OPENCL: std::sync::OnceLock<OpenClRouteState> = std::sync::OnceLock::new();
+        let slot=match request {BackendRequest::Auto=>&AUTO,BackendRequest::Only(BackendKind::Cuda)=>&CUDA,
+            BackendRequest::Only(BackendKind::OpenCl)=>&OPENCL,_=>return OpenClRouteState::Unavailable};
+        *slot.get_or_init(|| {
             if crate::z6iii::opencl_available() {
                 OpenClRouteState::Available
             } else {
@@ -1534,7 +1613,7 @@ mod libraw {
     const RTLD_NOW: c_int = 2;
 
     #[cfg(target_os = "windows")]
-    const LIBRARY_NAMES: [&str; 1] = ["libraw.dll\0"];
+    const LIBRARY_NAMES: [&str; 2] = ["libraw-25.dll\0", "libraw.dll\0"];
     /// macOS ships the ABI in a versioned dylib (`libraw.25.dylib` for 0.22.x);
     /// newest first, then the unversioned symlink Homebrew also creates.
     #[cfg(target_os = "macos")]
@@ -1556,12 +1635,12 @@ mod libraw {
         fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
         #[cfg(not(target_os = "windows"))]
         fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-        #[cfg(target_os = "windows")]
-        fn LoadLibraryW(name: *const u16) -> *mut c_void;
-        #[cfg(target_os = "windows")]
+    }
+    #[cfg(target_os = "windows")]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryExW(name: *const u16, reserved: *mut c_void, flags: u32) -> *mut c_void;
         fn GetProcAddress(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-        #[cfg(target_os = "windows")]
-        fn SetDllDirectoryW(path: *const u16) -> i32;
     }
 
     /// `libraw_processed_image_t`; `data` is a byte cursor, not a real array.
@@ -1589,11 +1668,11 @@ mod libraw {
         process: unsafe extern "C" fn(*mut c_void) -> c_int,
         make: unsafe extern "C" fn(*mut c_void, *mut c_int) -> *mut Processed,
         clear: unsafe extern "C" fn(*mut Processed),
-        close: unsafe extern "C" fn(*mut c_void) -> c_int,
-        output_bps: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
-        no_auto_bright: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
-        output_color: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
-        gamma: unsafe extern "C" fn(*mut c_void, c_int, c_int),
+        close: unsafe extern "C" fn(*mut c_void),
+        output_bps: unsafe extern "C" fn(*mut c_void, c_int),
+        no_auto_bright: unsafe extern "C" fn(*mut c_void, c_int),
+        output_color: unsafe extern "C" fn(*mut c_void, c_int),
+        gamma: unsafe extern "C" fn(*mut c_void, c_int, f32),
         /// Returns `void` on libraw 0.23 (verified against the exported symbol:
         /// no return value, no validation) even though older headers declare int.
         demosaic: unsafe extern "C" fn(*mut c_void, c_int),
@@ -1767,38 +1846,26 @@ mod libraw {
 
     #[cfg(target_os = "windows")]
     fn load_library(name: &str) -> *mut c_void {
-        // LoadLibraryW searches the application directory and PATH but not a
-        // project's vendor folder, so that folder goes on the search path first.
-        // The name itself must be UTF-16: passing str bytes as u16 never loads.
         use std::os::windows::ffi::OsStrExt;
-        let wide_name: Vec<u16> =
-            name.trim_end_matches('\0').encode_utf16().chain(std::iter::once(0)).collect();
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(dir) = std::env::var_os("AURORA_LIBRAW_DIR") {
-            dirs.push(dir.into());
+        let name = name.trim_end_matches('\0');
+        let mut paths = Vec::new();
+        if let Some(dir) = std::env::var_os("AURORA_LIBRAW_DIR") { paths.push(PathBuf::from(dir).join(name)); }
+        if let Ok(exe) = std::env::current_exe() && let Some(parent) = exe.parent() {
+            paths.push(parent.join("libraw").join(name));
+            paths.push(parent.join("vendor/libraw/bin").join(name));
+            paths.push(parent.join(name));
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                dirs.push(parent.join("libraw"));
-                dirs.push(parent.join("vendor/libraw/bin"));
-                dirs.push(parent.join("../vendor/libraw/bin"));
-                dirs.push(parent.join("../../vendor/libraw/bin"));
-            }
+        // Development only: a shipped executable must not depend on the checkout.
+        #[cfg(debug_assertions)]
+        paths.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/libraw/bin").join(name));
+        for path in paths {
+            let Ok(path) = path.canonicalize() else { continue; };
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            // Load dependencies from the chosen DLL's own directory + system32;
+            // never change the process-wide DLL path or use the photo folder.
+            let handle = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0x100 | 0x800) };
+            if !handle.is_null() { return handle; }
         }
-        // A dev build keeps the DLLs in the repository's vendor folder.
-        dirs.push(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/libraw/bin")));
-        dirs.push(std::path::PathBuf::from("vendor/libraw/bin"));
-        dirs.push(std::path::PathBuf::from("../vendor/libraw/bin"));
-        for dir in dirs {
-            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-            unsafe { SetDllDirectoryW(wide.as_ptr()) };
-            let handle = unsafe { LoadLibraryW(wide_name.as_ptr()) };
-            if !handle.is_null() {
-                unsafe { SetDllDirectoryW(std::ptr::null()) };
-                return handle;
-            }
-        }
-        unsafe { SetDllDirectoryW(std::ptr::null()) };
         std::ptr::null_mut()
     }
 
@@ -1858,7 +1925,10 @@ mod libraw {
             (api.output_color)(data, 0);
             // Gamma 1 is linear. Anything else would bake in a second transfer
             // curve on top of the one the develop pipeline applies.
-            (api.gamma)(data, 1, 1);
+            // libraw_set_gamma(ctx, index, float), not two integer values.
+            // Indices 0 and 1 are the power and slope. Set BOTH for linear output.
+            (api.gamma)(data, 0, 1.0);
+            (api.gamma)(data, 1, 1.0);
             // Must land before dcraw_process; the call is legal right after open.
             (api.demosaic)(data, quality);
         }
@@ -1880,10 +1950,8 @@ mod libraw {
         let code = unsafe { (api.unpack)(data) };
         if code != 0 {
             let name_ptr = unsafe { (api.unpack_name)(data) };
-            let name = if name_ptr.is_null() { "" } else {
-                let owned =
-                    unsafe { std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned() };
-                Box::leak(owned.into_boxed_str())
+            let name = if name_ptr.is_null() { std::borrow::Cow::Borrowed("") } else {
+                unsafe { std::ffi::CStr::from_ptr(name_ptr).to_string_lossy() }
             };
             raw_trace!("RAWTRACE unpack function {name:?}");
             raw_trace!("RAWTRACE unpack code {code}");
@@ -2151,7 +2219,7 @@ mod libraw {
         raw_image: 193_776,
     };
 
-    /// `90_work/build-cache/libraw-0.23-include` (0.23.0 snapshot).
+    /// LibRaw 0.23.0 struct layout snapshot.
     const LAYOUT_23_0: Layout = Layout {
         black: 153_096,
         maximum: 153_104,
@@ -2988,15 +3056,16 @@ mod tests {
         use super::*;
         use std::path::PathBuf;
 
-        const SAMPLE: &str = r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF";
-        const HE_SAMPLE: &str = r"C:\Users\Jxcz2\Desktop\_DSC5673.NEF";
-
         fn sample() -> PathBuf {
-            PathBuf::from(SAMPLE)
+            std::env::var_os("AURORA_TEST_RAW")
+                .map(PathBuf::from)
+                .expect("set AURORA_TEST_RAW to a real NEF file")
         }
 
-        fn sample_is_available() -> bool {
-            sample().is_file()
+        fn he_sample() -> Option<PathBuf> {
+            std::env::var_os("AURORA_TEST_HE_RAW")
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
         }
 
         #[test]
@@ -3013,13 +3082,12 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "needs a real NEF file; set AURORA_TEST_RAW"]
         fn real_nef_decodes_successfully() {
-            if !sample_is_available() {
-                panic!("real NEF sample not found: {SAMPLE}");
-            }
-            let img = decode(&sample()).unwrap();
+            let path = sample();
+            let img = decode(&path).unwrap();
             assert!(img.width().max(img.height()) > 3000, "{:?}", img.dimensions());
-            assert!(sensor_dimensions(&sample()).unwrap().0.max(sensor_dimensions(&sample()).unwrap().1) > 3000);
+            assert!(sensor_dimensions(&path).unwrap().0.max(sensor_dimensions(&path).unwrap().1) > 3000);
         }
 
         #[test]
@@ -3030,11 +3098,10 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "needs a real NEF file; set AURORA_TEST_RAW"]
         fn sixteen_bit_path_returns_or_falls_back() {
-            if !sample_is_available() {
-                panic!("real NEF sample not found: {SAMPLE}");
-            }
-            match decode16(&sample()) {
+            let path = sample();
+            match decode16(&path) {
                 Some((w, h, rgba)) => {
                     assert_eq!(rgba.len(), (w * h * 4) as usize);
                     assert!(w.max(h) > 3000);
@@ -3042,7 +3109,8 @@ mod tests {
                 None => {
                     // HE* compression is not demosaiced by this libraw build:
                     // the 8-bit path must still deliver the embedded preview.
-                    let eight = decode(&PathBuf::from(HE_SAMPLE).exists().then(|| PathBuf::from(HE_SAMPLE)).unwrap_or_else(|| sample())).unwrap();
+                    let fallback = he_sample().unwrap_or(path);
+                    let eight = decode(&fallback).unwrap();
                     assert!(eight.width() > 0);
                 }
             }
@@ -3272,6 +3340,7 @@ mod tests {
             z6iii_feature: true,
             libraw_available: true,
             opencl: OpenClRouteState::Available,
+            device_policy: RawDevicePolicy::default(),
             demosaic: 3,
         };
         let mut disabled = base;
@@ -3300,6 +3369,7 @@ mod tests {
             z6iii_feature: true,
             libraw_available: true,
             opencl: OpenClRouteState::Available,
+            device_policy: RawDevicePolicy::default(),
             demosaic: 3,
         };
         let libraw_only = DecodeRoute { c1_raw_enabled: false, ..z6iii };
@@ -3315,6 +3385,9 @@ mod tests {
         // Aurora route.
         let chroma = DecodeStageRevisions { chromatic_aberration: 2, ..base };
         let generic = DecodeRoute { z6iii_nef: false, ..z6iii };
+        let old_post = DecodeStageRevisions {highlight_recovery:1,..base};
+        assert_ne!(old_post.pipeline_fingerprint(&generic),base.pipeline_fingerprint(&generic),"a cached frame missing two stages must be decoded again");
+        assert_eq!(old_post.pipeline_fingerprint(&libraw_only),base.pipeline_fingerprint(&libraw_only));
         assert_ne!(chroma.pipeline_fingerprint(&z6iii), base.pipeline_fingerprint(&z6iii));
         assert_ne!(
             chroma.pipeline_fingerprint(&generic),
@@ -3379,12 +3452,7 @@ mod tests {
         use std::time::Instant;
         let path = std::env::var_os("AURORA_TEST_RAW")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(r"C:\Users\Jxcz2\Desktop\样张\portrait-test\_DSC4133.NEF")
-            });
-        if !path.is_file() {
-            return;
-        }
+            .expect("set AURORA_TEST_RAW to a real NEF file");
         let mut best = f64::MAX;
         for round in 0..3 {
             let started = Instant::now();
@@ -3455,6 +3523,7 @@ mod tests {
             z6iii_feature: false,
             libraw_available: false,
             opencl: OpenClRouteState::NotCompiled,
+            device_policy: RawDevicePolicy::default(),
             demosaic: 3,
         };
         let (frame, failed) = decode16_attempt(&path, route);
@@ -3958,6 +4027,30 @@ mod tests {
         assert_eq!(provenance.pixel_space, PixelSpace::CameraLinear16);
         assert!(!provenance.z6iii_linear);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_embedded_preview_returns_embedded_jpeg() {
+        let mut container = vec![0x49, 0x49, 0x2A, 0x00, 0, 0, 0, 0];
+        container.extend_from_slice(&jpeg(64, 48, 4));
+        let path = temp_file("quick-preview.nef", &container);
+        let img = quick_embedded_preview(&path, 1600).expect("embedded preview");
+        assert_eq!(img.dimensions(), (64, 48));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "profiles quick embedded JPEG preview on a real NEF; set AURORA_TEST_RAW"]
+    fn bench_quick_embedded_preview() {
+        let path = std::env::var_os("AURORA_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .expect("set AURORA_TEST_RAW to a real NEF file");
+        for round in 0..3 {
+            let started = Instant::now();
+            let img = quick_embedded_preview(&path, 1600).expect("quick embedded preview");
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!("QUICK_PREVIEW round={round} {}x{} ms={ms:.1}", img.width(), img.height());
+        }
     }
 }
 

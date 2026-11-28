@@ -854,6 +854,7 @@ mod tests {
     /// The first 212 kB of a real Nikon Z6_3 NEF: file header, IFD0, the EXIF
     /// IFD and the whole 176 kB MakerNote, with the sensor data cut off.
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn real_nef_matches_capture_ones_stored_white_balance() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nef-exif-head.bin");
         let data = std::fs::read(&path).expect("testdata sample");
@@ -920,6 +921,7 @@ mod tests {
 
     /// exiftool: `[ExifIFD] LensModel = NIKKOR Z 24-120mm f/4 S` (tag 0xA434).
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn lens_model_comes_from_the_exif_ifd() {
         let block = parse_info_block(&testdata()).unwrap();
         assert_eq!(block.lens_model.as_deref(), Some("NIKKOR Z 24-120mm f/4 S"));
@@ -929,6 +931,7 @@ mod tests {
     /// `[Nikon] ColorTemperatureAuto 4790` (0x004F),
     /// `[Nikon] ShutterCount 265058` (0x00A7).
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs crates/engine/testdata/ (enable --features external-fixtures)")]
     fn nikon_makernote_wb_and_shutter_count() {
         let block = parse_info_block(&testdata()).unwrap();
         assert_eq!(block.wb_mode.as_deref(), Some("Auto1"));

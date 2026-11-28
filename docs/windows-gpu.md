@@ -11,8 +11,8 @@
 - 记录口径：没有 Windows 原生 Release 实测、没有 provider profile 节点归属、没有与 CPU 的
   像素差异时，一律写“未验证”，不得由 DLL 存在、`GetAvailableProviders` 结果或安装成功推断通过。
 普通曝光、颜色和细节处理仍使用 CPU；DirectX 11 的 GPU 显示不能作为推理加速证据。
-本轮另外完成了 CPU 滤镜、重复解码和缩略图队列优化，见
-[整体性能记录](performance-2026-11-12.md)。
+本轮另外完成了 CPU 滤镜、重复解码和缩略图队列优化；当时的性能记录未进入仓库，
+后续的整体审计见 [performance-audit-implementation-2026-11-24.md](performance-audit-implementation-2026-11-24.md)。
 
 ## 本机已配置
 
