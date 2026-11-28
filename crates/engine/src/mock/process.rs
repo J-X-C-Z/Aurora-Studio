@@ -33,8 +33,6 @@ pub struct Source {
     fingerprint: OnceLock<u64>,
     /// Packed sRGB RGBA for the full decoded source frame.
     face_rgba8: OnceLock<crate::PortraitImage>,
-    /// Skin mask sampled at the cached preview stage size.
-    portrait_skin_mask: Mutex<Option<crate::portrait_stage::CachedMask>>,
 }
 
 pub(crate) struct Plane {
@@ -573,7 +571,6 @@ impl BandSampler<'_> {
     /// Fills `band` with output rows `y0 .. y0 + rows` (row-major, `out_w` wide).
     /// A band is one tile row tall, so it maps onto whole cached tiles.
     fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
-        let _sampling = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Sampling);
         let out_w = self.out_w as usize;
         band.resize(rows as usize * out_w, EMPTY_SAMPLE);
         let tiles = self.tiles(y0 / SAMPLE_TILE);
@@ -718,7 +715,6 @@ impl Source {
                 portrait_masks_fingerprint: OnceLock::new(),
                 fingerprint: OnceLock::new(),
                 face_rgba8: OnceLock::new(),
-                portrait_skin_mask: Mutex::new(None),
             };
         }
         data.truncate((width as usize) * (height as usize));
@@ -745,7 +741,6 @@ impl Source {
             portrait_masks_fingerprint: OnceLock::new(),
             fingerprint: OnceLock::new(),
             face_rgba8: OnceLock::new(),
-            portrait_skin_mask: Mutex::new(None),
         }
     }
 
@@ -867,36 +862,6 @@ impl Source {
             .get_or_init(|| self.portrait_masks().receipt_fingerprint())
     }
 
-    pub(crate) fn portrait_skin_mask_cached(
-        &self,
-        out_w: u32,
-        out_h: u32,
-        region: crate::NormRect,
-    ) -> Option<Arc<Vec<u8>>> {
-        let mut cache = self
-            .portrait_skin_mask
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(mask) = cache.as_ref() {
-            if mask.matches(out_w, out_h, region) {
-                return Some(Arc::clone(&mask.mask));
-            }
-        }
-        let mask = Arc::new(self.portrait_masks().mask_u8(
-            crate::portrait_stage::MaskKind::Skin,
-            out_w,
-            out_h,
-            region,
-        )?);
-        *cache = Some(crate::portrait_stage::CachedMask::new(
-            out_w,
-            out_h,
-            region,
-            Arc::clone(&mask),
-        ));
-        Some(mask)
-    }
-
     fn portrait_mask_rgba(&self, edge: usize) -> Vec<u8> {
         let mut rgba = vec![0u8; edge * edge * 4];
         rgba.par_chunks_mut(edge * 4).enumerate().for_each(|(y, row)| {
@@ -995,80 +960,6 @@ impl Source {
     }
 }
 
-/// Layers outside `active` whose masks a copy mask in `active` reads,
-/// transitively, in first-reference order.
-fn copy_mask_sources<'a>(adj: &'a AdjustmentSet, active: &[&'a Layer]) -> Vec<&'a Layer> {
-    let mut seen: Vec<u64> = active.iter().map(|layer| layer.id).collect();
-    let mut out: Vec<&Layer> = Vec::new();
-    let mut queue: Vec<&Layer> = active.to_vec();
-    while let Some(layer) = queue.pop() {
-        for shape in &layer.mask.shapes {
-            let MaskShape::Copy { from_layer, .. } = shape else { continue };
-            if seen.contains(from_layer) {
-                continue;
-            }
-            seen.push(*from_layer);
-            if let Some(source) = adj.layers.iter().find(|l| l.id == *from_layer) {
-                out.push(source);
-                queue.push(source);
-            }
-        }
-    }
-    out
-}
-
-/// Builds layer mask rasters on demand so a copy mask can read any layer's
-/// mask, whatever its draw position. Cycles resolve to an empty source.
-struct MaskResolver<'a> {
-    adj: &'a AdjustmentSet,
-    aspect: f32,
-    cell_px: f32,
-    guide: Option<&'a [f32]>,
-    memo: Vec<(u64, Option<Arc<MaskGrid>>)>,
-    stack: Vec<u64>,
-    /// Set when a cycle was cut below the current layer; such a raster
-    /// depends on where the walk started, so it is not memoized.
-    cut: bool,
-}
-
-impl MaskResolver<'_> {
-    fn grid_for(&mut self, layer: &Layer) -> Option<Arc<MaskGrid>> {
-        if let Some((_, grid)) = self.memo.iter().find(|(id, _)| *id == layer.id) {
-            return grid.clone();
-        }
-        if layer.mask.shapes.is_empty() {
-            return None;
-        }
-        if self.stack.contains(&layer.id) {
-            self.cut = true;
-            return None;
-        }
-        let outer_cut = std::mem::take(&mut self.cut);
-        self.stack.push(layer.id);
-        let mut deps: Vec<(u64, Arc<MaskGrid>)> = Vec::new();
-        for shape in &layer.mask.shapes {
-            let MaskShape::Copy { from_layer, .. } = shape else { continue };
-            if deps.iter().any(|(id, _)| id == from_layer) {
-                continue;
-            }
-            let adj = self.adj;
-            if let Some(source) = adj.layers.iter().find(|l| l.id == *from_layer) {
-                if let Some(grid) = self.grid_for(source) {
-                    deps.push((*from_layer, grid));
-                }
-            }
-        }
-        self.stack.pop();
-        let tainted = self.cut;
-        self.cut = outer_cut || tainted;
-        let grid = Arc::new(MaskGrid::build(&layer.mask, self.aspect, self.cell_px, self.guide, &deps));
-        if !tainted {
-            self.memo.push((layer.id, Some(Arc::clone(&grid))));
-        }
-        Some(grid)
-    }
-}
-
 fn cached_mask_grids(
     src: &Source,
     adj: &AdjustmentSet,
@@ -1089,19 +980,10 @@ fn cached_mask_grids(
         Mutex<Vec<(MaskGridCacheKey, Arc<Vec<Option<Arc<MaskGrid>>>>)>>,
     > =
         OnceLock::new();
-    // A copy mask reads another layer's *mask*, which is data: the source may
-    // sit after the copying layer, be disabled, or be pruned from the render
-    // list, and the copy must still see its shapes. Those sources are part of
-    // the raster's identity, so they join the cache key.
-    let copy_sources = copy_mask_sources(adj, active);
     let key = MaskGridCacheKey {
         source: src.snapshot_id(),
         geometry: adj.geometry.clone(),
-        layers: active
-            .iter()
-            .chain(copy_sources.iter())
-            .map(|layer| (layer.id, layer.mask.clone()))
-            .collect(),
+        layers: active.iter().map(|layer| (layer.id, layer.mask.clone())).collect(),
         has_guide: guide.is_some(),
     };
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -1113,18 +995,15 @@ fn cached_mask_grids(
         return grids;
     }
 
-    let mut resolver = MaskResolver {
-        adj,
-        aspect,
-        cell_px,
-        guide,
-        memo: Vec::new(),
-        stack: Vec::new(),
-        cut: false,
-    };
+    let mut built: Vec<(u64, Arc<MaskGrid>)> = Vec::new();
     let mut grids = Vec::with_capacity(active.len());
     for layer in active {
-        grids.push(resolver.grid_for(layer));
+        let grid = (!layer.mask.shapes.is_empty())
+            .then(|| Arc::new(MaskGrid::build(&layer.mask, aspect, cell_px, guide, &built)));
+        if let Some(grid) = &grid {
+            built.push((layer.id, Arc::clone(grid)));
+        }
+        grids.push(grid);
     }
     let bytes = grids
         .iter()
@@ -1265,7 +1144,7 @@ fn layer_plans<'a>(
 }
 
 fn cached_layer_coverage(
-    plan: &LayerView<'_, '_>,
+    plan: &Plan<'_>,
     map: &super::geometry::FrameMap,
     region: NormRect,
     width: usize,
@@ -1395,6 +1274,7 @@ fn needs_stage_face_input(extra: &std::collections::BTreeMap<String, f32>) -> bo
                 | 44124
                 | 48019
                 | 49221
+                | 100005
         )
     })
 }
@@ -1444,8 +1324,10 @@ fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> 
         };
         matches!(
             pf,
-            108 | 109 | 110 | 21024 | 21025 | 21069 | 21070 | 21071 | 21105 | 30013 | 30014 | 90004
-                | 90023 | 90024 | 90086 | 100004
+            5 | 108 | 109 | 110 | 21024 | 21025 | 21026 | 21069 | 21070 | 21071 | 21076 | 21105
+                | 30013 | 30014 | 30025 | 30026 | 30030 | 30059 | 30187 | 30190 | 30259 | 44297
+                | 90004 | 90008 | 90015 | 90023 | 90024 | 90033 | 90034 | 90080 | 90086 | 90088
+                | 90089 | 90116 | 90118 | 90130 | 90131 | 100004 | 100007 | 100008
         )
     })
 }
@@ -1475,24 +1357,23 @@ fn needs_producer_attach(extra: &std::collections::BTreeMap<String, f32>) -> boo
         let Some(pf) = key.strip_prefix("pc:").and_then(|s| s.parse::<u32>().ok()) else {
             return false;
         };
-        matches!(pf, 101 | 8033 | 21105 | 30009 | 30014 | 90002 | 90010 | 90021 | 90086 | 100004)
-            || is_body_pf(pf)
+        matches!(
+            pf,
+            5 | 101 | 8033 | 21026 | 21076 | 21105 | 30009 | 30014 | 30025 | 30026 | 30030
+                | 30059 | 30187 | 30190 | 30259 | 44297 | 90002 | 90004 | 90008 | 90010 | 90021
+                | 90033 | 90034 | 90080 | 90086 | 90088 | 90089 | 90116 | 90118 | 90130 | 90131
+                | 90139 | 90160 | 100004 | 100007 | 100008
+        )
             || crate::portrait_makeup_bundle::B3_MAKEUP_ROWS.contains(&pf)
     })
 }
 
-/// Body rows that consume a same-job geometry payload. Listed here so a
-/// body-only adjustment still builds the stage frame the attachment reads.
-fn is_body_pf(pf: u32) -> bool {
-    matches!(
-        pf,
-        400 | 401 | 404..=408 | 410 | 415 | 416 | 38556 | 90041
-    )
-}
-
 /// PF108's `(bright, de-yellow)` percentages for one document.
 ///
-/// The one resolver both the renderer and the stage dispatcher read.
+/// The one resolver both the renderer and the stage dispatcher read. The old
+/// `unwrap_or(0.7)` here applied the legacy sibling default to every document,
+/// so a document that only drove `pc:109` (bright) also ran the de-yellow LUT
+/// at 70 %, and the parent's absent `pc:108` left the mask product at zero.
 fn teeth_ui_percents(
     extra: &std::collections::BTreeMap<String, f32>,
 ) -> Result<(f32, f32), aurora_portrait::Refusal> {
@@ -1547,6 +1428,308 @@ fn stage_bundle_cached<'a>(
         Ok(bundle) => Ok(bundle),
         Err(refusal) => Err(refusal.clone()),
     }
+}
+
+/// Composes two 2x3 affine matrices `a * b`: first applies `b`, then `a`.
+fn compose_affine_2x3(a: [[f32; 3]; 2], b: [[f32; 3]; 2]) -> [[f32; 3]; 2] {
+    [
+        [
+            a[0][0] * b[0][0] + a[0][1] * b[1][0],
+            a[0][0] * b[0][1] + a[0][1] * b[1][1],
+            a[0][0] * b[0][2] + a[0][1] * b[1][2] + a[0][2],
+        ],
+        [
+            a[1][0] * b[0][0] + a[1][1] * b[1][0],
+            a[1][0] * b[0][1] + a[1][1] * b[1][1],
+            a[1][0] * b[0][2] + a[1][1] * b[1][2] + a[1][2],
+        ],
+    ]
+}
+
+/// Maps continuous stage pixel coordinates `[0..stage_w, 0..stage_h]` to
+/// continuous source pixel coordinates `[0..src_w, 0..src_h]`.
+fn stage_continuous_to_source(
+    map: &super::geometry::FrameMap,
+    source_size: [u32; 2],
+    stage_size: [u32; 2],
+    region: NormRect,
+    tx: f32,
+    ty: f32,
+) -> [f32; 2] {
+    let frame = [
+        region.x + (tx / stage_size[0] as f32) * region.width,
+        region.y + (ty / stage_size[1] as f32) * region.height,
+    ];
+    let (_, src_norm) = map.map(frame);
+    [
+        src_norm[0] * source_size[0] as f32,
+        src_norm[1] * source_size[1] as f32,
+    ]
+}
+
+/// Computes the 2x3 affine matrix mapping stage continuous pixel coordinates
+/// into source continuous pixel coordinates (`stage_point -> source_point`).
+fn stage_to_source_affine(
+    map: &super::geometry::FrameMap,
+    source_size: [u32; 2],
+    stage_size: [u32; 2],
+    region: NormRect,
+) -> Result<[[f32; 3]; 2], aurora_portrait::Refusal> {
+    let sw = stage_size[0] as f32;
+    let sh = stage_size[1] as f32;
+    if !(sw > 0.0 && sh > 0.0) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let p0 = stage_continuous_to_source(map, source_size, stage_size, region, 0.0, 0.0);
+    let px = stage_continuous_to_source(map, source_size, stage_size, region, sw, 0.0);
+    let py = stage_continuous_to_source(map, source_size, stage_size, region, 0.0, sh);
+    let mat = [
+        [(px[0] - p0[0]) / sw, (py[0] - p0[0]) / sh, p0[0]],
+        [(px[1] - p0[1]) / sw, (py[1] - p0[1]) / sh, p0[1]],
+    ];
+    let det = mat[0][0] * mat[1][1] - mat[0][1] * mat[1][0];
+    if mat.iter().flatten().any(|v| !v.is_finite()) || !det.is_finite() || det.abs() <= 1.0e-12 {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    Ok(mat)
+}
+
+/// Projects a source pixel point to stage pixel coordinates without rejecting
+/// points that fall outside the zoomed viewport bounds.
+fn project_source_point_unclamped(
+    map: &super::geometry::FrameMap,
+    source_size: [u32; 2],
+    stage_size: [u32; 2],
+    region: NormRect,
+    point: [f32; 2],
+) -> Result<[f32; 2], aurora_portrait::Refusal> {
+    if point.iter().any(|v| !v.is_finite()) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let normalized = [
+        point[0] / source_size[0] as f32,
+        point[1] / source_size[1] as f32,
+    ];
+    let frame = map.frame_from_source(normalized).ok_or(
+        aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ),
+    )?;
+    let stage = [
+        (frame[0] - region.x) / region.width * stage_size[0] as f32 - 0.5,
+        (frame[1] - region.y) / region.height * stage_size[1] as f32 - 0.5,
+    ];
+    if stage.iter().any(|v| !v.is_finite()) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    Ok(stage)
+}
+
+fn resample_mask_u8_to_stage(
+    src_mask: &[u8],
+    src_w: u32,
+    src_h: u32,
+    stage_w: u32,
+    stage_h: u32,
+    stage_to_source: [[f32; 3]; 2],
+) -> Vec<u8> {
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let tw = stage_w as usize;
+    let th = stage_h as usize;
+    let mut out = vec![0u8; tw.saturating_mul(th)];
+    if sw == 0 || sh == 0 || src_mask.len() != sw.saturating_mul(sh) {
+        return out;
+    }
+    for y in 0..th {
+        let ty = y as f32 + 0.5;
+        for x in 0..tw {
+            let tx = x as f32 + 0.5;
+            let sx = stage_to_source[0][0] * tx + stage_to_source[0][1] * ty + stage_to_source[0][2] - 0.5;
+            let sy = stage_to_source[1][0] * tx + stage_to_source[1][1] * ty + stage_to_source[1][2] - 0.5;
+            if sx < -0.5 || sy < -0.5 || sx > sw as f32 - 0.5 || sy > sh as f32 - 0.5 {
+                continue;
+            }
+            let x0 = (sx.floor() as isize).clamp(0, (sw - 1) as isize) as usize;
+            let y0 = (sy.floor() as isize).clamp(0, (sh - 1) as isize) as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let y1 = (y0 + 1).min(sh - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+            let v00 = f32::from(src_mask[y0 * sw + x0]);
+            let v10 = f32::from(src_mask[y0 * sw + x1]);
+            let v01 = f32::from(src_mask[y1 * sw + x0]);
+            let v11 = f32::from(src_mask[y1 * sw + x1]);
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            out[y * tw + x] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Projects a full-frame `FaceInputBundle` into a cropped/zoomed `stage_frame`
+/// coordinate system so local 100% viewports keep face landmarks and parsing
+/// masks even when only part of the face is visible inside the viewport.
+fn project_face_bundle_to_stage(
+    source_bundle: &crate::FaceInputBundle,
+    source_size: [u32; 2],
+    stage_frame: &crate::PortraitImage,
+    stage_sha256: [u8; 32],
+    region: NormRect,
+    geometry: &crate::Geometry,
+) -> Result<crate::FaceInputBundle, aurora_portrait::Refusal> {
+    let stage_size = [stage_frame.width, stage_frame.height];
+    if source_bundle.source_size != source_size {
+        return Err(aurora_portrait::Refusal::ShapeMismatch(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    // Validate transform dimensions and region parameters via FaceStageTransform.
+    let _transform = crate::FaceStageTransform::new(
+        source_size,
+        stage_size,
+        [region.x, region.y, region.width, region.height],
+        geometry,
+    )?;
+    let map = super::geometry::FrameMap::new((source_size[0], source_size[1]), geometry);
+    let stage_to_source = stage_to_source_affine(&map, source_size, stage_size, region)?;
+    let det_inv = (stage_to_source[0][0] * stage_to_source[1][1]
+        - stage_to_source[0][1] * stage_to_source[1][0])
+        .abs();
+    let linear_scale = if det_inv > 1.0e-12 {
+        1.0 / det_inv.sqrt()
+    } else {
+        1.0
+    };
+
+    let map_pt = |pt: [f32; 2]| project_source_point_unclamped(&map, source_size, stage_size, region, pt);
+    let map_pts = |pts: &[[f32; 2]]| -> Result<Vec<[f32; 2]>, aurora_portrait::Refusal> {
+        pts.iter().map(|&pt| map_pt(pt)).collect()
+    };
+
+    let points17 = map_pts(&source_bundle.points17)?;
+    let points142 = map_pts(&source_bundle.points142)?;
+    let points194 = map_pts(&source_bundle.points194)?;
+    let points414 = map_pts(&source_bundle.points414)?;
+    let points52 = map_pts(&source_bundle.landmark_producer.points52)?;
+
+    let mut det_landmarks = [[0.0f32; 2]; 5];
+    for (dst, &src_pt) in det_landmarks
+        .iter_mut()
+        .zip(&source_bundle.detection.landmarks_source)
+    {
+        *dst = map_pt(src_pt)?;
+    }
+
+    let mut mesh_landmarks = Vec::with_capacity(source_bundle.mesh.landmarks_source.len());
+    for &[x, y, z] in &source_bundle.mesh.landmarks_source {
+        let mapped = map_pt([x, y])?;
+        mesh_landmarks.push([mapped[0], mapped[1], z * linear_scale]);
+    }
+
+    // Project ROI corners to stage AABB.
+    let roi = source_bundle.roi_xywh;
+    if roi.iter().any(|v| !v.is_finite()) || roi[2] <= 0.0 || roi[3] <= 0.0 {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let corners = [
+        [roi[0], roi[1]],
+        [roi[0] + roi[2], roi[1]],
+        [roi[0], roi[1] + roi[3]],
+        [roi[0] + roi[2], roi[1] + roi[3]],
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for corner in corners {
+        let mapped = map_pt(corner)?;
+        min_x = min_x.min(mapped[0]);
+        min_y = min_y.min(mapped[1]);
+        max_x = max_x.max(mapped[0]);
+        max_y = max_y.max(mapped[1]);
+    }
+    let roi_w = max_x - min_x;
+    let roi_h = max_y - min_y;
+    if !(roi_w.is_finite() && roi_h.is_finite() && roi_w > 0.0 && roi_h > 0.0) {
+        return Err(aurora_portrait::Refusal::ValueOutOfRange(
+            crate::portrait_face_input_stage::FACE_STAGE_TRANSFORM_REFUSAL,
+        ));
+    }
+    let roi_xywh = [min_x, min_y, roi_w, roi_h];
+    let roi_normalized_xywh = [
+        roi_xywh[0] / stage_size[0] as f32,
+        roi_xywh[1] / stage_size[1] as f32,
+        roi_xywh[2] / stage_size[0] as f32,
+        roi_xywh[3] / stage_size[1] as f32,
+    ];
+
+    let mut projected = source_bundle.clone();
+    projected.source_size = stage_size;
+    projected.source_sha256 = stage_sha256;
+    projected.bound_digest = Some((
+        stage_sha256,
+        stage_frame.pixels.as_ptr() as usize,
+        stage_frame.pixels.len(),
+    ));
+    projected.detection.landmarks_source = det_landmarks;
+    projected.detection.source_to_input =
+        compose_affine_2x3(source_bundle.detection.source_to_input, stage_to_source);
+    projected.mesh.landmarks_source = mesh_landmarks;
+    projected.mesh.source_to_crop =
+        compose_affine_2x3(source_bundle.mesh.source_to_crop, stage_to_source);
+    projected.mesh.crop_side = source_bundle.mesh.crop_side * linear_scale;
+    projected.roi_xywh = roi_xywh;
+    projected.roi_normalized_xywh = roi_normalized_xywh;
+    projected.points17 = points17;
+    projected.points142 = points142.clone();
+    projected.points194 = points194.clone();
+    projected.points414 = points414;
+    projected.landmark_producer.source_size = stage_size;
+    projected.landmark_producer.source_sha256 = stage_sha256;
+    projected.landmark_producer.points142 = points142;
+    projected.landmark_producer.points52 = points52;
+    projected.landmark_producer.points194 = points194;
+
+    if let Some(model_inputs) = projected.model_inputs.as_mut() {
+        if let Some(parsing) = model_inputs.parsing.as_mut() {
+            parsing.job_id = projected.job_id;
+            parsing.source_to_crop = compose_affine_2x3(parsing.source_to_crop, stage_to_source);
+        }
+        if let Some(teeth) = model_inputs.teeth.as_mut() {
+            let resampled = resample_mask_u8_to_stage(
+                &teeth.mask_g,
+                teeth.mask_width,
+                teeth.mask_height,
+                stage_size[0],
+                stage_size[1],
+                stage_to_source,
+            );
+            teeth.job_id = projected.job_id;
+            teeth.mask_width = stage_size[0];
+            teeth.mask_height = stage_size[1];
+            teeth.mask_sha256 = aurora_portrait::model_sha256::sha256(&resampled);
+            teeth.mask_g = resampled;
+        }
+        if source_size != stage_size {
+            // Source-sized PF90004 buffers would fail stage shape checks.
+            model_inputs.pf90004 = None;
+        }
+    }
+
+    projected.validate_ticket(stage_frame, Some(projected.job_id))?;
+    Ok(projected)
 }
 
 pub struct Rendered {
@@ -1802,7 +1985,6 @@ fn build_plan<'a>(
         color_editor: adj.color_editor != ColorEditor::default(),
         color_balance: adj.color_balance != ColorBalance::default(),
         layers: layer_plans(src, adj, aspect, cell_px, guide, mask_overlay),
-        mix: crate::mix_plan(adj),
     }
 }
 
@@ -2023,7 +2205,6 @@ fn encode_gpu_develop_bands(
     mut rgba16: Option<&mut [u16]>,
 ) -> bool {
     use super::develop_gpu;
-    let _develop = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
     let out_w = bands.out_w;
     let out_h = bands.out_h;
     let row = (out_w * 4) as usize;
@@ -2072,7 +2253,6 @@ fn develop_bands(
     rgba: &mut [u8],
     mut rgba16: Option<&mut [u16]>,
 ) {
-    let _develop = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
     let out_w = bands.out_w;
     let out_h = bands.out_h;
     let row = (out_w * 4) as usize;
@@ -2123,8 +2303,7 @@ struct PortraitStageEntry {
     level: usize,
     mask_overlay: Option<u64>,
     frame_fingerprint: u64,
-    frame_state: u64,
-    image: Arc<crate::PortraitImage>,
+    rgba: Vec<u8>,
 }
 
 const PORTRAIT_STAGE_MAX_BYTES: usize = 64 << 20;
@@ -2170,7 +2349,7 @@ fn portrait_stage_cached(
     scale: f32,
     level: usize,
     mask_overlay: Option<u64>,
-) -> Option<(Arc<crate::PortraitImage>, u64, u64)> {
+) -> Option<(Vec<u8>, u64)> {
     let adjustments = portrait_stage_adjustments(adj);
     let cache = portrait_stage_cache()
         .lock()
@@ -2187,13 +2366,7 @@ fn portrait_stage_cached(
         && entry.scale_bits == scale.to_bits()
         && entry.level == level
         && entry.mask_overlay == mask_overlay;
-    matches.then(|| {
-        (
-            Arc::clone(&entry.image),
-            entry.frame_fingerprint,
-            entry.frame_state,
-        )
-    })
+    matches.then(|| (entry.rgba.clone(), entry.frame_fingerprint))
 }
 
 fn portrait_stage_store(
@@ -2206,16 +2379,14 @@ fn portrait_stage_store(
     level: usize,
     mask_overlay: Option<u64>,
     rgba: &[u8],
-) -> Option<(Arc<crate::PortraitImage>, u64, u64)> {
+) {
     if rgba.len() > PORTRAIT_STAGE_MAX_BYTES {
-        return None;
+        return;
     }
-    let (frame_fingerprint, frame_state) =
-        crate::portrait_stage::PortraitJobReceipt::frame_state_from_renderer_frame(
-            rgba, out_w, out_h,
-        )
-        .unwrap_or((0, 0));
-    let image = Arc::new(crate::PortraitImage::new(out_w, out_h, rgba.to_vec())?);
+    let frame_fingerprint =
+        crate::portrait_stage::PortraitFrameReceipt::from_renderer_frame(rgba, out_w, out_h)
+            .map(|receipt| receipt.fingerprint())
+            .unwrap_or(0);
     let entry = PortraitStageEntry {
         source_ptr: src.levels[0].data.as_ptr() as usize,
         source_len: src.levels[0].data.len(),
@@ -2229,13 +2400,11 @@ fn portrait_stage_store(
         level,
         mask_overlay,
         frame_fingerprint,
-        frame_state,
-        image: Arc::clone(&image),
+        rgba: rgba.to_vec(),
     };
     *portrait_stage_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
-    Some((image, frame_fingerprint, frame_state))
 }
 
 #[cfg(windows)]
@@ -2351,7 +2520,6 @@ fn render_sized(
     want_bgra: bool,
     scopes: ScopeWants,
 ) -> (Rendered, Option<Vec<u16>>) {
-    let _render_total = crate::compute::telemetry::span(crate::compute::telemetry::Stage::RenderTotal);
     let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
     let t0 = stage_timing.then(std::time::Instant::now);
     let region = clean_region(region);
@@ -2363,17 +2531,14 @@ fn render_sized(
         !bypass && crate::portrait_registry::has_active_portrait_effect(adj);
     let body_active = !bypass && crate::portrait_stage::has_live_body_request(&adj.extra);
     let post_portrait = portrait_active || body_active;
-    let mut cached_frame_state: Option<(u64, u64)> = None;
-    let mut cached_stage_image: Option<Arc<crate::PortraitImage>> = None;
+    let mut cached_frame_fingerprint = None;
     let (mut rgba, mut rgba16, develop8) = 'develop: {
         if post_portrait && !wide {
-            if let Some((cached, fingerprint, frame_state)) =
+            if let Some((cached, fingerprint)) =
                 portrait_stage_cached(src, adj, region, out_w, out_h, scale, level, mask_overlay)
             {
-                cached_frame_state = Some((fingerprint, frame_state));
-                let pixels = cached.pixels.clone();
-                cached_stage_image = Some(cached);
-                break 'develop (pixels, None, None);
+                cached_frame_fingerprint = Some(fingerprint);
+                break 'develop (cached, None, None);
             }
         }
     let map = super::geometry::FrameMap::new(src.size(), &adj.geometry);
@@ -2480,26 +2645,7 @@ fn render_sized(
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
         let c1_ok = true;
 
-        // Preflight against the shared VRAM ledger before the sample array and
-        // the full-frame gain plane exist: a refusal must not first
-        // materialise them. Conservative on the optional buffers (same sizes
-        // the device pool computes in `ResidentNeeds`).
-        let resident_admitted = c1_ok && {
-            let nr_any = !bypass
-                && (adj.noise_reduction.single_pixel > 0.0
-                    || adj.noise_reduction.luminance > 0.0
-                    || adj.noise_reduction.color > 0.0);
-            super::develop_gpu::resident_preview_admits(
-                out_w as usize,
-                out_h as usize,
-                &dev_params,
-                !bypass && (plan.uniform_light.is_some() || adj.vignetting.amount.abs() > 1e-3),
-                !bypass && camera_usm_path,
-                !bypass && !camera_usm_path && f32_includes_sharpen && adj.sharpening.amount > 0.0,
-                nr_any.then_some(&adj.noise_reduction),
-            )
-        };
-        if resident_admitted {
+        if c1_ok {
             let post_8bit = has_post_8bit_stages(adj, bypass, &plan, post_portrait);
             let direct_return = !post_8bit;
             let emit_bgra = direct_return && want_bgra;
@@ -2601,7 +2747,6 @@ fn render_sized(
                     }
                 },
             );
-            crate::compute::telemetry::record_decision(resident.is_some(), false);
             if let Some(res) = resident {
                 if let Some(t0) = t0 {
                     eprintln!(
@@ -2716,9 +2861,7 @@ fn render_sized(
                     if !adj.retouch.is_empty() {
                         apply_retouch(&mut rgba, out_w, out_h, adj, &map, region, scale);
                     }
-                    let layers_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::LayersMasks);
                     apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
-                    drop(layers_span);
                 }
                 break 'develop (rgba, rgba16, develop8);
             }
@@ -2932,7 +3075,6 @@ fn render_sized(
         };
         let work_w = out_w as usize + 2 * halo;
         let work_h = out_h as usize + 2 * halo;
-        let develop_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
         let mut rgb_f32 = take_f32_frame(work_w * work_h);
         let mut gpu_filled = false;
         // L3 stage cache: the develop frame before detail. The key holds the
@@ -3033,9 +3175,6 @@ fn render_sized(
                 }
             }
         }
-        if !stage_cached {
-            crate::compute::telemetry::record_decision(gpu_filled, false);
-        }
         if !stage_cached && !gpu_filled {
         if halo != 0 {
             // Preserve the viewport's sample centers and fetch neighbors in the
@@ -3125,7 +3264,6 @@ fn render_sized(
                 else { develop_display(&plan, c1.apply_camera_icc(*rgb)).map(|v| v.clamp(0.0, 1.0)) };
             });
         }
-        drop(develop_span);
         super::detail::post_process_core_f32(
             &mut rgb_f32, work_w as u32, work_h as u32, adj, scale, sharpen_in_display,
         );
@@ -3179,7 +3317,6 @@ fn render_sized(
         };
         #[cfg(not(windows))]
         let gpu_done = false;
-        crate::compute::telemetry::record_decision(gpu_done, false);
         if !gpu_done {
             develop_bands(&plan, &bands, bypass, pre.as_ref(), &mut rgba, rgba16.as_deref_mut());
         }
@@ -3374,51 +3511,29 @@ fn render_sized(
     // Layers come last: the spot removal sees the developed frame, and the
     // layer mix sees the healed one.
     if !bypass {
-        let layers_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::LayersMasks);
         apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
-        drop(layers_span);
     }
         (rgba, rgba16, develop8)
     };
     // A wide render is a one-shot export: it must neither take the cache hit
     // above (which returns rgba16 = None) nor evict the preview's entry, so
     // the portrait stage cache stays preview-only on both sides.
-    let stored_stage = if post_portrait && !wide && cached_frame_state.is_none() {
-        portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba)
-    } else {
-        None
-    };
-    let stored_frame_state = stored_stage
-        .as_ref()
-        .map(|(_, frame_fingerprint, frame_state)| (*frame_fingerprint, *frame_state));
+    if post_portrait && !wide {
+        portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba);
+    }
     let mut portrait_report = if portrait_active {
         let masks = src.portrait_masks();
-        let mask_fingerprint = Some(src.portrait_masks_receipt_fingerprint());
-        let receipt = match cached_frame_state.or(stored_frame_state) {
-            Some((frame_fingerprint, frame_state)) => {
-                crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_frame_state(
-                    &rgba,
-                    out_w,
-                    out_h,
-                    region,
-                    &adj.extra,
-                    masks,
-                    frame_fingerprint,
-                    frame_state,
-                    mask_fingerprint,
-                )
-            }
-            None => crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
+        let receipt =
+            crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
                 &rgba,
                 out_w,
                 out_h,
                 region,
                 &adj.extra,
                 masks,
-                None,
-                mask_fingerprint,
-            ),
-        };
+                cached_frame_fingerprint,
+                Some(src.portrait_masks_receipt_fingerprint()),
+            );
         // Face landmarks come from the full decoded source and are mapped
         // through the renderer's FrameMap into the current out_w/out_h stage.
         let mut producer_inputs: Option<ProducerInputs> = None;
@@ -3436,34 +3551,10 @@ fn render_sized(
             cached_stage_sha256(receipt.frame_receipt().fingerprint(), &rgba)
         });
         let stage_frame = if want_stage_slim || want_stage_attachments {
-            cached_stage_image.clone().or_else(|| {
-                stored_stage
-                    .as_ref()
-                    .map(|(image, _, _)| Arc::clone(image))
-            })
+            crate::PortraitImage::new(out_w, out_h, rgba.clone())
         } else {
             None
         };
-        // Body six-point geometry: source points come from a locally configured
-        // body-pose model; destinations come from the caller's JSON payload.
-        // Neither the slider nor this block synthesizes geometry. Body jobs do
-        // not need a face bundle, so this runs outside the attachments block.
-        if let Some(frame) = stage_frame.as_ref() {
-            let mut inputs = producer_inputs.take().unwrap_or_default();
-            match crate::portrait_stage::attach_pose_six_point(
-                frame.as_ref(),
-                &adj.extra,
-                &receipt,
-                &mut inputs,
-            ) {
-                Ok(true) => producer_inputs = Some(inputs),
-                Ok(false) => producer_inputs = Some(inputs),
-                Err(refusal) => {
-                    log::debug!("body pose six-point attach refused: {refusal:?}");
-                    producer_inputs = Some(inputs);
-                }
-            }
-        }
         // One SHA-256 for the immutable stage frame below. The face-input
         // produce call, the slim validation and every attachment check read the
         // same pixels; without this scope each of them re-hashed the full frame.
@@ -3484,13 +3575,14 @@ fn render_sized(
         // one inference to every frame. Parsing is requested only when the
         // attachment block will run, because it costs a further model pass.
         let stage_bundle = OnceLock::new();
+        let projected_source_bundle = OnceLock::new();
         let stage_include_parsing = want_stage_parsing && want_stage_attachments;
+        let geometric_lens = adj.lens.use_profile
+            || adj.lens.distortion.abs() > 1.0e-6
+            || adj.lens.shift_x.abs() > 1.0e-6
+            || adj.lens.shift_y.abs() > 1.0e-6
+            || adj.lens.tilt.abs() > 1.0e-6;
         if want_stage_slim {
-            let geometric_lens = adj.lens.use_profile
-                || adj.lens.distortion.abs() > 1.0e-6
-                || adj.lens.shift_x.abs() > 1.0e-6
-                || adj.lens.shift_y.abs() > 1.0e-6
-                || adj.lens.tilt.abs() > 1.0e-6;
             if let Some(stage_frame) = stage_frame.as_ref() {
                 let on_stage = || {
                     stage_bundle_cached(
@@ -3505,21 +3597,39 @@ fn render_sized(
                 let slim = if geometric_lens {
                     on_stage()
                 } else {
-                    let from_source = || {
+                    let from_source = || -> Result<_, aurora_portrait::Refusal> {
                         let source_frame = src.face_input_image();
-                        let bundle =
-                            stage_face_bundle(receipt.job_id(), source_frame.as_ref(), false, None)?;
+                        let bundle = stage_face_bundle(
+                            receipt.job_id(),
+                            source_frame.as_ref(),
+                            stage_include_parsing,
+                            None,
+                        )?;
                         let transform = crate::FaceStageTransform::new(
                             [src.size().0, src.size().1],
                             [out_w, out_h],
                             [region.x, region.y, region.width, region.height],
                             &adj.geometry,
                         )?;
-                        bundle.slim_inputs_for_stage_with_sha(
-                            &transform,
-                            stage_frame,
-                            stage_sha256.unwrap(),
-                        )
+                        bundle
+                            .slim_inputs_for_stage_with_sha(
+                                &transform,
+                                stage_frame,
+                                stage_sha256.unwrap(),
+                            )
+                            .or_else(|_| {
+                                let projected = project_face_bundle_to_stage(
+                                    &bundle,
+                                    [src.size().0, src.size().1],
+                                    stage_frame,
+                                    stage_sha256.unwrap(),
+                                    region,
+                                    &adj.geometry,
+                                )?;
+                                let slim = projected.slim_inputs(stage_frame)?;
+                                let _ = projected_source_bundle.set(projected);
+                                Ok(slim)
+                            })
                     };
                     from_source().or_else(|refusal| {
                         log::debug!("source face input refused; trying rendered frame: {refusal:?}");
@@ -3542,60 +3652,70 @@ fn render_sized(
             }
         }
         // Keep R17's PF108 path on the stage frame; its parsing semantics are
-        // owned by the separate teeth lane. For non-parsing, non-lens-warped
-        // attachments (2D makeup, eye/brow/vface/plump geometry), reuse the
-        // immutable decoded source's cached landmarks via FaceStageTransform so
-        // dragging exposure/color sliders never re-runs ONNX face detection.
+        // owned by the separate teeth lane.
         if want_stage_attachments {
             let want_parsing = want_stage_parsing;
-            let geometric_lens = adj.lens.use_profile
-                || adj.lens.distortion.abs() > 1.0e-6
-                || adj.lens.shift_x.abs() > 1.0e-6
-                || adj.lens.shift_y.abs() > 1.0e-6
-                || adj.lens.tilt.abs() > 1.0e-6;
             if let Some(stage_frame) = stage_frame.as_ref() {
-                let mapped_from_source = if !stage_include_parsing && !geometric_lens {
-                    (|| -> Result<crate::FaceInputBundle, aurora_portrait::Refusal> {
-                        let source_frame = src.face_input_image();
-                        let source_bundle = stage_face_bundle(
-                            receipt.job_id(),
-                            source_frame.as_ref(),
-                            false,
-                            None,
-                        )?;
-                        let transform = crate::FaceStageTransform::new(
-                            [src.size().0, src.size().1],
-                            [out_w, out_h],
-                            [region.x, region.y, region.width, region.height],
-                            &adj.geometry,
-                        )?;
-                        source_bundle.for_stage_with_sha(
-                            &transform,
-                            stage_frame,
-                            receipt.job_id(),
-                            stage_sha256.unwrap(),
-                        )
-                    })()
-                    .ok()
+                // Always generate FaceDetection + 194 Landmarks + FaceParsingV2 ONCE
+                // on the full-resolution source image (`src.face_input_image()`), then
+                // project to any zoom/pan/export viewport (both `NormRect::FULL` and
+                // zoomed crops) so masks and landmarks never jitter or regenerate on zoom.
+                let attachment_bundle = if !geometric_lens {
+                    if let Some(projected) = projected_source_bundle.get() {
+                        Ok(projected)
+                    } else {
+                        let source_projected = (|| {
+                            let source_frame = src.face_input_image();
+                            let source_bundle = stage_face_bundle(
+                                receipt.job_id(),
+                                source_frame.as_ref(),
+                                stage_include_parsing,
+                                None,
+                            )?;
+                            project_face_bundle_to_stage(
+                                &source_bundle,
+                                [src.size().0, src.size().1],
+                                stage_frame,
+                                stage_sha256.unwrap(),
+                                region,
+                                &adj.geometry,
+                            )
+                        })();
+                        match source_projected {
+                            Ok(projected) => {
+                                let _ = projected_source_bundle.set(projected);
+                                Ok(projected_source_bundle
+                                    .get()
+                                    .expect("projected source bundle just initialized"))
+                            }
+                            Err(refusal) => {
+                                log::debug!(
+                                    "full-res source face projection refused; falling back to stage frame: {refusal:?}"
+                                );
+                                stage_bundle_cached(
+                                    &stage_bundle,
+                                    stage_frame,
+                                    receipt.job_id(),
+                                    stage_include_parsing,
+                                    stage_sha256,
+                                )
+                            }
+                        }
+                    }
                 } else {
-                    None
+                    stage_bundle_cached(
+                        &stage_bundle,
+                        stage_frame,
+                        receipt.job_id(),
+                        stage_include_parsing,
+                        stage_sha256,
+                    )
                 };
-                let bundle_res: Result<&crate::FaceInputBundle, aurora_portrait::Refusal> =
-                    match mapped_from_source.as_ref() {
-                        Some(mapped) => Ok(mapped),
-                        None => stage_bundle_cached(
-                            &stage_bundle,
-                            stage_frame,
-                            receipt.job_id(),
-                            stage_include_parsing,
-                            stage_sha256,
-                        ),
-                    };
-                match bundle_res {
+                match attachment_bundle {
                     Ok(bundle) => {
                         let mut inputs = producer_inputs.take().unwrap_or_default();
                         let mut attached = false;
-                        if want_stage_slim && inputs.slim.is_none() {
+                        if inputs.slim.is_none() {
                             match bundle.slim_inputs(stage_frame) {
                                 Ok(slim) => {
                                     inputs.slim = Some(slim);
@@ -3743,6 +3863,12 @@ fn render_sized(
                                 }
                             }
                         }
+                        // Crop PortraitMasks once into the current viewport `region` so
+                        // attachers that read `NormRect::FULL` align pixel-for-pixel at
+                        // every zoom/pan level (fit-to-screen, 65%, 100%, 125%, 24MP).
+                        let cropped_masks = (region != NormRect::FULL)
+                            .then(|| masks.cropped_to_region(region));
+                        let stage_masks = cropped_masks.as_ref().unwrap_or(masks);
                         // The apply path needs moisture planes only for
                         // PF90002 (face) or PF90010 (body); both live in the
                         // same producer call.
@@ -3751,7 +3877,7 @@ fn render_sized(
                             || adj.extra.get("pc:90010").copied().unwrap_or(0.0) != 0.0;
                         if moisture_active
                             && bundle
-                                .attach_moisture_inputs(stage_frame, masks, &mut inputs)
+                                .attach_moisture_inputs(stage_frame, stage_masks, &mut inputs)
                                 .is_ok()
                         {
                             attached = true;
@@ -3765,7 +3891,7 @@ fn render_sized(
                         }
                         match bundle.attach_historical_tone_from_extra(
                             stage_frame,
-                            Some(masks),
+                            Some(stage_masks),
                             &adj.extra,
                             &mut inputs,
                         ) {
@@ -3779,7 +3905,52 @@ fn render_sized(
                         if bundle
                             .attach_historical_skin_from_extra(
                                 stage_frame,
-                                Some(masks),
+                                Some(stage_masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_hair_detail_from_extra(
+                                stage_frame,
+                                Some(stage_masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if want_parsing
+                            && bundle
+                                .attach_pf90004_from_extra(
+                                    stage_frame,
+                                    Some(stage_masks),
+                                    &adj.extra,
+                                    &mut inputs,
+                                )
+                                .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_pixcake_repair_and_eyebag_from_extra(
+                                stage_frame,
+                                Some(stage_masks),
+                                &adj.extra,
+                                &mut inputs,
+                            )
+                            .is_ok()
+                        {
+                            attached = true;
+                        }
+                        if bundle
+                            .attach_pixcake_remaining_19_from_extra(
+                                stage_frame,
+                                Some(stage_masks),
                                 &adj.extra,
                                 &mut inputs,
                             )
@@ -3807,11 +3978,9 @@ fn render_sized(
         let mut inputs =
             crate::portrait_stage::PortraitJobInputs::from_renderer_receipt(receipt, masks);
         inputs.stage_sha256 = stage_sha256;
-        inputs.skin_mask = src.portrait_skin_mask_cached(out_w, out_h, region);
         if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
-        let _portrait = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Portrait);
         Some(crate::portrait_stage::apply_portrait_colors_before_body(
             &mut rgba,
             out_w,
@@ -3832,15 +4001,13 @@ fn render_sized(
     if body_active {
         let job_id = portrait_report.as_ref().and_then(|r| r.job_id).unwrap_or_else(|| {
             crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
-                &rgba, out_w, out_h, region, &adj.extra, src.portrait_masks(), cached_frame_state.map(|(fp, _)| fp),
+                &rgba, out_w, out_h, region, &adj.extra, src.portrait_masks(), cached_frame_fingerprint,
                 Some(src.portrait_masks_receipt_fingerprint()),
             ).job_id()
         });
-        let portrait_body_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Portrait);
         let body = crate::portrait_stage::apply_live_body(
             &mut rgba, rgba16.as_deref_mut(), (out_w, out_h), job_id, &adj.extra,
         );
-        drop(portrait_body_span);
         if !body.is_empty() {
             let report = portrait_report.get_or_insert_with(|| crate::PortraitRunReport {
                 job_id: Some(job_id), ..Default::default()
@@ -4715,38 +4882,6 @@ fn apply_layers(
     if plan.layers.is_empty() {
         return;
     }
-    if let Some(mix) = &plan.mix {
-        apply_mixed(rgba, width, height, plan, mix, map, region, scale, source_size);
-        return;
-    }
-    let view = LayerView {
-        adj: plan.adj,
-        source: plan.source,
-        layers: plan.layers.iter().collect(),
-    };
-    apply_layer_set(rgba, width, height, &view, map, region, scale, source_size);
-}
-
-/// The layers one pass applies in series, and what their caches key on.
-struct LayerView<'p, 'a> {
-    adj: &'a AdjustmentSet,
-    source: u64,
-    layers: Vec<&'p LayerPlan<'a>>,
-}
-
-fn apply_layer_set(
-    rgba: &mut [u8],
-    width: u32,
-    height: u32,
-    plan: &LayerView<'_, '_>,
-    map: &super::geometry::FrameMap,
-    region: NormRect,
-    scale: f32,
-    source_size: (u32, u32),
-) {
-    if plan.layers.is_empty() {
-        return;
-    }
     // Heal/clone layers repair the pixels before their own colour edits stack.
     for lp in &plan.layers {
         if !lp.layer.cover.is_empty() {
@@ -4933,171 +5068,6 @@ fn apply_layer_set(
     }
 }
 
-/// Renders a graph with mixers on the CPU frame: every `MixStep` produces an
-/// image, and a `Chain` is the ordinary serial pass over just its layers, so a
-/// chain behaves exactly like the same layers in a serial graph. Preview,
-/// export and thumbnails all reach this through `apply_layers`.
-fn apply_mixed(
-    rgba: &mut [u8],
-    width: u32,
-    height: u32,
-    plan: &Plan,
-    mix: &crate::MixPlan,
-    map: &super::geometry::FrameMap,
-    region: NormRect,
-    scale: f32,
-    source_size: (u32, u32),
-) {
-    use crate::MixStep;
-    use std::collections::HashMap;
-    let w = width as usize;
-    let h = height as usize;
-    let xs: Vec<f32> =
-        (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
-    let base: Vec<u8> = rgba.to_vec();
-    let mut values: HashMap<u64, Vec<u8>> = HashMap::new();
-    // A node nothing produced (the input, or a bypassed feeder) is the base.
-    fn value<'v>(values: &'v HashMap<u64, Vec<u8>>, base: &'v [u8], id: u64) -> &'v [u8] {
-        values.get(&id).map_or(base, |v| v.as_slice())
-    }
-    let find = |id: u64| plan.layers.iter().find(|lp| lp.layer.id == id);
-    for step in &mix.steps {
-        match step {
-            MixStep::Chain { layers, from, to } => {
-                let mut frame = value(&values, &base, *from).to_vec();
-                let view = LayerView {
-                    adj: plan.adj,
-                    source: plan.source,
-                    layers: layers.iter().filter_map(|id| find(*id)).collect(),
-                };
-                apply_layer_set(&mut frame, width, height, &view, map, region, scale, source_size);
-                values.insert(*to, frame);
-            }
-            MixStep::Parallel { node, reference, inputs } => {
-                let reference = value(&values, &base, *reference);
-                let branches: Vec<&[u8]> =
-                    inputs.iter().map(|id| value(&values, &base, *id)).collect();
-                let mut out = reference.to_vec();
-                out.par_chunks_mut(4).enumerate().for_each(|(i, px)| {
-                    for k in 0..3 {
-                        let r = reference[i * 4 + k] as i32;
-                        let sum: i32 = branches.iter().map(|b| b[i * 4 + k] as i32 - r).sum();
-                        px[k] = (r + sum).clamp(0, 255) as u8;
-                    }
-                });
-                values.insert(*node, out);
-            }
-            MixStep::Stack { node, inputs } => {
-                let Some(first) = inputs.first() else {
-                    values.insert(*node, base.clone());
-                    continue;
-                };
-                let mut out = value(&values, &base, first.source).to_vec();
-                for input in &inputs[1..] {
-                    let top = value(&values, &base, input.source);
-                    let origin = value(&values, &base, input.origin);
-                    let covering: Vec<&LayerPlan> =
-                        input.layers.iter().filter_map(|id| find(*id)).collect();
-                    let opaque = input.layers.is_empty();
-                    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| {
-                        let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
-                        for x in 0..w {
-                            let i = (y * w + x) * 4;
-                            let c = if opaque {
-                                1.0
-                            } else {
-                                let g = [
-                                    origin[i] as f32 / 255.0,
-                                    origin[i + 1] as f32 / 255.0,
-                                    origin[i + 2] as f32 / 255.0,
-                                ];
-                                let p = map.map([xs[x], fy]).0;
-                                1.0 - covering
-                                    .iter()
-                                    .map(|lp| 1.0 - layer_weight(lp, p, g).clamp(0.0, 1.0))
-                                    .product::<f32>()
-                            };
-                            for k in 0..3 {
-                                let below = line[x * 4 + k] as f32;
-                                let v = top[i + k] as f32
-                                    + (1.0 - c) * (below - origin[i + k] as f32);
-                                line[x * 4 + k] = v.clamp(0.0, 255.0).round() as u8;
-                            }
-                        }
-                    });
-                }
-                values.insert(*node, out);
-            }
-        }
-    }
-    let result = value(&values, &base, mix.output);
-    rgba.par_chunks_mut(4).zip(result.par_chunks(4)).for_each(|(dst, src)| {
-        dst[..3].copy_from_slice(&src[..3]);
-    });
-}
-
-/// The picker's version of [`apply_mixed`]: one colour through the same
-/// steps, so a sampled point agrees with the frame (colour operators only; the
-/// spatial ones need neighbours).
-fn mix_pixel(plan: &Plan, mix: &crate::MixPlan, p: [f32; 2], base: [f32; 3]) -> [f32; 3] {
-    use crate::MixStep;
-    use std::collections::HashMap;
-    let mut values: HashMap<u64, [f32; 3]> = HashMap::new();
-    let find = |id: u64| plan.layers.iter().find(|lp| lp.layer.id == id);
-    let get = |values: &HashMap<u64, [f32; 3]>, id: u64| values.get(&id).copied().unwrap_or(base);
-    for step in &mix.steps {
-        match step {
-            MixStep::Chain { layers, from, to } => {
-                let mut g = get(&values, *from);
-                for lp in layers.iter().filter_map(|id| find(*id)) {
-                    let m = layer_weight(lp, p, g);
-                    if m > 1e-4 {
-                        g = layer_pixel(lp, g, m);
-                    }
-                }
-                values.insert(*to, g);
-            }
-            MixStep::Parallel { node, reference, inputs } => {
-                let r = get(&values, *reference);
-                let mut out = r;
-                for id in inputs {
-                    let b = get(&values, *id);
-                    for k in 0..3 {
-                        out[k] += b[k] - r[k];
-                    }
-                }
-                values.insert(*node, out);
-            }
-            MixStep::Stack { node, inputs } => {
-                let Some(first) = inputs.first() else {
-                    values.insert(*node, base);
-                    continue;
-                };
-                let mut out = get(&values, first.source);
-                for input in &inputs[1..] {
-                    let top = get(&values, input.source);
-                    let origin = get(&values, input.origin);
-                    let c = if input.layers.is_empty() {
-                        1.0
-                    } else {
-                        1.0 - input
-                            .layers
-                            .iter()
-                            .filter_map(|id| find(*id))
-                            .map(|lp| 1.0 - layer_weight(lp, p, origin).clamp(0.0, 1.0))
-                            .product::<f32>()
-                    };
-                    for k in 0..3 {
-                        out[k] = top[k] + (1.0 - c) * (out[k] - origin[k]);
-                    }
-                }
-                values.insert(*node, out);
-            }
-        }
-    }
-    get(&values, mix.output)
-}
-
 fn static_mask_can_apply(lp: &LayerPlan<'_>) -> bool {
     if lp.opacity <= 1e-4 {
         return false;
@@ -5117,7 +5087,7 @@ fn apply_layer_color_row(
     static_weights: Option<&[f32]>,
     recorded_weights: Option<&mut [f32]>,
     n: usize,
-    plan: &LayerView<'_, '_>,
+    plan: &Plan,
     map: &super::geometry::FrameMap,
     region: NormRect,
     xs: &[f32],
@@ -5176,9 +5146,6 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
     };
     // The colour stack of the layers applies to the picked point too; the
     // spatial operators need neighbours, so they only run on a full frame.
-    if let Some(mix) = &plan.mix {
-        return mix_pixel(&plan, mix, p, g);
-    }
     for lp in &plan.layers {
         let m = layer_weight(lp, p, g);
         if m <= 1e-4 {
@@ -7736,56 +7703,6 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         assert!(blank.data.iter().all(|v| *v == 0.0), "an unknown source adds nothing");
     }
 
-    /// The render path builds rasters for the enabled layers only, in draw
-    /// order. A copy mask must still read a source that is disabled or sits
-    /// after it, and a copy cycle must not recurse forever.
-    #[test]
-    fn copy_mask_reads_disabled_and_later_sources() {
-        let src = Source::from_rgba(64, 48, &synthetic(64, 48));
-        let aspect = 4.0 / 3.0;
-        let disc = Mask { shapes: vec![stroke(MaskOp::Add, [0.5, 0.5], 0.3)], ..Default::default() };
-        let copy = |from: u64| Mask {
-            shapes: vec![MaskShape::Copy { from_layer: from, op: MaskOp::Add }],
-            ..Default::default()
-        };
-        let layer = |id: u64, enabled: bool, mask: Mask| Layer {
-            id,
-            enabled,
-            opacity: 100.0,
-            mask,
-            ..Default::default()
-        };
-        let reference = MaskGrid::build(&disc, aspect, 4.0, None, &[]);
-
-        // 1 copies the disabled 2; 3 copies 4, which is drawn after it.
-        let mut adj = AdjustmentSet::default();
-        adj.layers.push(layer(1, true, copy(2)));
-        adj.layers.push(layer(2, false, disc.clone()));
-        adj.layers.push(layer(3, true, copy(4)));
-        adj.layers.push(layer(4, true, disc.clone()));
-        let active: Vec<&Layer> = adj.layers.iter().filter(|l| l.enabled).collect();
-        let grids = cached_mask_grids(&src, &adj, &active, aspect, 4.0, None);
-        assert_eq!(grids[0].as_ref().expect("copy of disabled layer").data, reference.data);
-        assert_eq!(grids[1].as_ref().expect("copy of later layer").data, reference.data);
-
-        // Editing the disabled source changes the copy: it is part of the key.
-        adj.layers[1].mask = Mask::default();
-        let active: Vec<&Layer> = adj.layers.iter().filter(|l| l.enabled).collect();
-        let edited = cached_mask_grids(&src, &adj, &active, aspect, 4.0, None);
-        assert!(edited[0].as_ref().unwrap().data.iter().all(|v| *v == 0.0));
-
-        // 5 and 6 copy each other: both resolve, the inner reference is empty.
-        let mut cyc = AdjustmentSet::default();
-        let mut a = copy(6);
-        a.shapes.push(stroke(MaskOp::Add, [0.5, 0.5], 0.3));
-        cyc.layers.push(layer(5, true, a));
-        cyc.layers.push(layer(6, true, copy(5)));
-        let active: Vec<&Layer> = cyc.layers.iter().collect();
-        let grids = cached_mask_grids(&src, &cyc, &active, aspect, 4.0, None);
-        assert_eq!(grids[0].as_ref().unwrap().data, reference.data);
-        assert_eq!(grids[1].as_ref().unwrap().data, reference.data);
-    }
-
     // ───────────────────────────── layers ─────────────────────────────
 
     fn tone_layer(id: u64, exposure: f32, brightness: f32) -> Layer {
@@ -7888,115 +7805,6 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let mut reversed = forward.clone();
         reversed.layers = vec![tone_layer(2, 0.0, 30.0), tone_layer(1, 0.8, 0.0)];
         assert_ne!(graphed, render(&src, &reversed, NormRect::FULL, w, false, None).rgba);
-    }
-
-    /// INPUT feeds both layers; `mixer` takes layer 1 on input 0 and layer 2 on
-    /// input 1, and feeds the output.
-    fn mixer_graph(kind: crate::NodeKind) -> crate::NodeGraph {
-        let mut graph = graph_of(&[1, 2], &[]);
-        graph.links.clear();
-        graph.nodes.push(crate::GraphNode { id: 10, kind, pos: [0.0; 2] });
-        let link = |from, to, input| crate::NodeLink { from, to, input };
-        graph.links = vec![
-            link(crate::NodeGraph::INPUT, 1, 0),
-            link(crate::NodeGraph::INPUT, 2, 0),
-            link(1, 10, 0),
-            link(2, 10, 1),
-            link(10, crate::NodeGraph::OUTPUT, 0),
-        ];
-        graph
-    }
-
-    fn first_pixel(rgba: &[u8], x: usize) -> [i32; 3] {
-        [rgba[x * 4] as i32, rgba[x * 4 + 1] as i32, rgba[x * 4 + 2] as i32]
-    }
-
-    /// Two parallel branches grade the same input: the result is the input
-    /// plus both branches' deltas, which a serial chain does not produce.
-    #[test]
-    fn parallel_mixer_sums_branch_deltas_from_the_shared_input() {
-        let (w, h) = (16u32, 16u32);
-        let src = Source::from_rgba(w, h, &flat(w, h, 110));
-        let render_with = |layers: Vec<Layer>, nodes: Option<crate::NodeGraph>| {
-            let mut adj = AdjustmentSet::default();
-            adj.layers = layers;
-            adj.nodes = nodes;
-            render(&src, &adj, NormRect::FULL, w, false, None).rgba
-        };
-        let a_layer = tone_layer(1, 0.8, 0.0);
-        let b_layer = tone_layer(2, -0.5, 0.0);
-        let base = first_pixel(&render_with(vec![], None), 0);
-        let a = first_pixel(&render_with(vec![a_layer.clone()], None), 0);
-        let b = first_pixel(&render_with(vec![b_layer.clone()], None), 0);
-        let parallel = render_with(
-            vec![a_layer.clone(), b_layer.clone()],
-            Some(mixer_graph(crate::NodeKind::Parallel)),
-        );
-        let got = first_pixel(&parallel, 0);
-        for k in 0..3 {
-            let want = (base[k] + (a[k] - base[k]) + (b[k] - base[k])).clamp(0, 255);
-            assert!((got[k] - want).abs() <= 1, "channel {k}: got {got:?}, want {want}");
-        }
-        assert_ne!(a, b, "the branches must differ for this test to mean anything");
-
-        let serial = render_with(vec![a_layer, b_layer], Some(graph_of(&[1, 2], &[1, 2])));
-        assert_ne!(parallel, serial, "parallel branches are not a serial chain");
-    }
-
-    /// A parallel mixer with one branch is that branch, byte for byte, and the
-    /// picker agrees with the frame.
-    #[test]
-    fn a_single_parallel_branch_equals_the_branch() {
-        let (w, h) = (16u32, 16u32);
-        let src = Source::from_rgba(w, h, &flat(w, h, 110));
-        let mut one = AdjustmentSet::default();
-        one.layers = vec![tone_layer(1, 0.8, 0.0)];
-        let mut graph = mixer_graph(crate::NodeKind::Parallel);
-        graph.links.retain(|l| l.from != 2 && l.to != 2);
-        graph.nodes.retain(|n| n.id != 2);
-        let mut mixed = one.clone();
-        mixed.nodes = Some(graph);
-        assert!(crate::mix_plan(&mixed).is_some());
-        assert_eq!(
-            render(&src, &one, NormRect::FULL, w, false, None).rgba,
-            render(&src, &mixed, NormRect::FULL, w, false, None).rgba
-        );
-    }
-
-    /// The top input of a layer mixer replaces what is below it only where its
-    /// mask covers; elsewhere the lower input shows.
-    #[test]
-    fn layer_mixer_stacks_the_higher_input_over_the_lower_by_its_mask() {
-        let (w, h) = (16u32, 16u32);
-        let src = Source::from_rgba(w, h, &flat(w, h, 110));
-        let bottom = tone_layer(1, 0.8, 0.0);
-        let mut top = tone_layer(2, -1.0, 0.0);
-        top.mask = left_half_raster(0.0);
-        let render_with = |layers: Vec<Layer>, nodes: Option<crate::NodeGraph>| {
-            let mut adj = AdjustmentSet::default();
-            adj.layers = layers;
-            adj.nodes = nodes;
-            render(&src, &adj, NormRect::FULL, w, false, None).rgba
-        };
-        let stacked = render_with(
-            vec![bottom.clone(), top.clone()],
-            Some(mixer_graph(crate::NodeKind::LayerMixer)),
-        );
-        let only_bottom = render_with(vec![bottom], None);
-        let only_top = render_with(vec![top], None);
-        // Inside the top mask only the top input shows; outside, the bottom.
-        assert_eq!(first_pixel(&stacked, 2), first_pixel(&only_top, 2));
-        assert_eq!(first_pixel(&stacked, 13), first_pixel(&only_bottom, 13));
-        assert_ne!(first_pixel(&only_top, 2), first_pixel(&only_bottom, 2));
-    }
-
-    /// A graph without mixers keeps the flat serial path.
-    #[test]
-    fn serial_graphs_have_no_mix_plan() {
-        let mut adj = AdjustmentSet::default();
-        adj.layers = vec![tone_layer(1, 0.8, 0.0), tone_layer(2, 0.0, 30.0)];
-        adj.nodes = Some(graph_of(&[1, 2], &[1, 2]));
-        assert!(crate::mix_plan(&adj).is_none());
     }
 
     /// A layer with a curve and a hard-edged mask on the left half.
@@ -10349,9 +10157,9 @@ mod develop_gpu_integration_tests {
         let region = NormRect::FULL;
         let stored = vec![7u8; 64];
         portrait_stage_store(&source, &adj, region, 4, 4, 1.0, 0, None, &stored);
-        let (cached, _, _) = portrait_stage_cached(&source, &adj, region, 4, 4, 1.0, 0, None)
+        let (cached, _) = portrait_stage_cached(&source, &adj, region, 4, 4, 1.0, 0, None)
             .expect("stage cache hit");
-        assert_eq!(cached.pixels, stored);
+        assert_eq!(cached, stored);
 
         let mut changed_portrait = adj.clone();
         changed_portrait.extra.insert("pc:247".to_string(), 0.8);

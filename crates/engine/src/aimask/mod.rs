@@ -246,7 +246,22 @@ pub fn lookup(key: &str) -> Option<Arc<MaskPlane>> {
 /// operator is licensed to use. Auto-discovering them would also make default
 /// synthetic tests open sessions they cannot run.
 pub(crate) fn c1_roots() -> Vec<PathBuf> {
-    crate::bundled_resources::ai_model_roots()
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::var_os("AURORA_C1_DIR") {
+        roots.push(PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("models");
+            if bundled.join("AIModels").is_dir() {
+                roots.push(bundled);
+            }
+        }
+    }
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        roots.push(PathBuf::from(program_files).join("Capture One").join("Capture One"));
+    }
+    roots
 }
 
 fn model_candidates(name: &str) -> Vec<PathBuf> {

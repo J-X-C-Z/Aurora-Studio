@@ -508,6 +508,7 @@ dependencies = [
 name = "aurora-portrait"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "pollster",
  "serde_json",
  "wgpu",

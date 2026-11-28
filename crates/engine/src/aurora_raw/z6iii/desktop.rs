@@ -98,7 +98,8 @@ impl Export {
         if !reconstruct::gpu_available() {
             anyhow::bail!("NVIDIA OpenCL is unavailable");
         }
-        let root = crate::bundled_resources::camera_root();
+        let root = std::env::var_os("AURORA_Z6III_C1_DIR").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One"));
         Ok(Some(Self {
             nef,
             assets: Assets::load(&root, curve_stem(adjustments))?,

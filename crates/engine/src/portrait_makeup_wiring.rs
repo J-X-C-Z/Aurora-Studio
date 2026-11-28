@@ -9,36 +9,7 @@
 //! * A row's owner mask must arrive as same-job pixels through the owner-mask
 //!   source. This module never synthesizes a mask and never substitutes a PNG.
 //! * Material PNGs are decrypted vendor assets; their root is supplied by
-//!   `AURORA_MAKEUP_ASSET_ROOT` or discovered next to the executable. No B3
-//!   material PNG ships in this repository.
-//!
-//! ## Material asset root discovery
-//!
-//! `asset_root` resolves the directory that *contains* `Makeups/`, trying these
-//! candidates in order and accepting the first one that qualifies (directory
-//! exists and either holds `Makeups/` or is itself named `Makeups`):
-//!
-//! 1. `AURORA_MAKEUP_ASSET_ROOT` (highest priority; always wins when valid)
-//! 2. `<exe_dir>/assets/portrait/makeup`
-//! 3. `<exe_dir>/assets/makeup`
-//! 4. `<exe_dir>/makeup`
-//! 5. `<cwd>/assets/portrait/makeup`
-//! 6. `<cwd>/assets/makeup`
-//! 7. `<cwd>/makeup`
-//! 8. `<exe_dir>/../../assets/portrait/makeup` (dev builds: `target/debug`
-//!    or `target/release` up two levels to the repository root)
-//!
-//! `asset_root` always returns the parent that contains `Makeups/`, so callers
-//! can append the contract-relative material path directly. A candidate that is
-//! itself a `Makeups` directory is accepted and normalized to its parent.
-//!
-//! ## Asset source and licensing
-//!
-//! The decrypted material PNGs are third-party vendor assets. They are not
-//! distributed with this repository (no B3 material PNG is checked in, bundled,
-//! or built into the binary); each installation must supply them locally at one
-//! of the locations above. Rows whose material is absent are skipped rather
-//! than synthesized.
+//!   `AURORA_MAKEUP_ASSET_ROOT`. No B3 material PNG ships in this repository.
 //!
 //! ## Owner masks
 //!
@@ -48,7 +19,7 @@
 //! (100, 103, 105, 106, 117, 118, 30007) constructible without any file asset.
 //!
 //! Material-bearing rows (107 `LipStickImageMakeup`, 111, 115, 116, 90032)
-//! remain blocked until a discovered material root supplies decrypted PNGs; the
+//! remain blocked until `AURORA_MAKEUP_ASSET_ROOT` supplies decrypted PNGs; the
 //! assembler skips them instead of failing the whole bundle.
 //!
 //! PF8 and PF9 are first-class FaceStereo preset rows in
@@ -76,9 +47,7 @@ use crate::portrait_makeup_provider::{
 use crate::portrait_stage::ProducerInputs;
 
 /// Root of the decrypted vendor `effect/config` tree. It is deliberately
-/// runtime-only: the decrypted assets are not part of this repository. The
-/// environment variable is the highest-priority discovery candidate; see the
-/// module docs for the full chain.
+/// runtime-only: the decrypted assets are not part of this repository.
 pub const MAKEUP_ASSET_ROOT_ENV: &str = "AURORA_MAKEUP_ASSET_ROOT";
 pub const MAKEUP_ASSET_ROOT_MISSING: &str = "makeup asset root (AURORA_MAKEUP_ASSET_ROOT)";
 pub const MAKEUP_2D_ROW_UNSUPPORTED: &str = "makeup 2D row (FaceStereo excluded)";
@@ -180,54 +149,9 @@ fn row_contract(pf: u32) -> Option<&'static Makeup2dRowContract> {
     MAKEUP_2D_ROWS.iter().find(|row| row.pf == pf)
 }
 
-/// Ordered material-root candidates, highest priority first.
-///
-/// The environment override always comes first; then executable-relative
-/// locations, then working-directory-relative ones, and finally the
-/// `target/{debug,release}/../..` repository root used by dev builds. Pure so
-/// tests can exercise the chain without touching process-global state.
-fn makeup_root_candidates(
-    exe_dir: Option<&Path>,
-    cwd: Option<&Path>,
-    env: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(8);
-    if let Some(env) = env {
-        candidates.push(env);
-    }
-    if let Some(exe_dir) = exe_dir {
-        candidates.push(exe_dir.join("assets").join("portrait").join("makeup"));
-        candidates.push(exe_dir.join("assets").join("makeup"));
-        candidates.push(exe_dir.join("makeup"));
-    }
-    if let Some(cwd) = cwd {
-        candidates.push(cwd.join("assets").join("portrait").join("makeup"));
-        candidates.push(cwd.join("assets").join("makeup"));
-        candidates.push(cwd.join("makeup"));
-    }
-    if let Some(exe_dir) = exe_dir {
-        // `target/debug` or `target/release` -> repository root.
-        candidates.push(
-            exe_dir
-                .join("..")
-                .join("..")
-                .join("assets")
-                .join("portrait")
-                .join("makeup"),
-        );
-    }
-    candidates
-}
-
-/// Qualifies one candidate and normalizes it to the parent of `Makeups/`.
-///
-/// A candidate is accepted when it is a directory that either contains a
-/// `Makeups` subdirectory or is itself named `Makeups`. The returned path is
-/// always the directory that contains `Makeups/`, so callers may append the
-/// contract's `Makeups/...` relative material path directly.
-fn accept_makeup_root(path: &Path) -> Option<PathBuf> {
-    if !path.is_dir() {
-        return None;
+fn normalize_makeup_root(path: &Path) -> Option<PathBuf> {
+    if path.join("Makeups").is_dir() {
+        return Some(path.to_path_buf());
     }
     if path.file_name().is_some_and(|name| name == "Makeups") {
         return path
@@ -235,41 +159,30 @@ fn accept_makeup_root(path: &Path) -> Option<PathBuf> {
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf);
     }
-    if path.join("Makeups").is_dir() {
-        return Some(path.to_path_buf());
-    }
     None
 }
 
-/// Resolves the directory that contains `Makeups/`, or `None` when no
-/// candidate qualifies.
-///
-/// Discovery order (first qualifying candidate wins):
-///
-/// 1. `AURORA_MAKEUP_ASSET_ROOT`
-/// 2. `<exe_dir>/assets/portrait/makeup`
-/// 3. `<exe_dir>/assets/makeup`
-/// 4. `<exe_dir>/makeup`
-/// 5. `<cwd>/assets/portrait/makeup`
-/// 6. `<cwd>/assets/makeup`
-/// 7. `<cwd>/makeup`
-/// 8. `<exe_dir>/../../assets/portrait/makeup` (dev build repository root)
-///
-/// The return value is always the parent of `Makeups/`; a candidate that is
-/// itself a `Makeups` directory is normalized to its parent.
-fn asset_root() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let cwd = std::env::current_dir().ok();
-    let env = std::env::var_os(MAKEUP_ASSET_ROOT_ENV).map(PathBuf::from);
-    makeup_root_candidates(exe_dir.as_deref(), cwd.as_deref(), env)
-        .into_iter()
-        .find_map(|candidate| accept_makeup_root(&candidate))
-}
-
 pub fn makeup_asset_root() -> Option<PathBuf> {
-    asset_root()
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os(MAKEUP_ASSET_ROOT_ENV) {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for rel in ["assets/portrait/makeup", "assets/makeup", "makeup"] {
+                candidates.push(dir.join(rel));
+            }
+            candidates.push(dir.join("../../assets/portrait/makeup"));
+        }
+    }
+    if let Ok(dir) = std::env::current_dir() {
+        for rel in ["assets/portrait/makeup", "assets/makeup", "makeup"] {
+            candidates.push(dir.join(rel));
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|candidate| normalize_makeup_root(&candidate))
 }
 
 /// One discovered makeup style preset under `AURORA_MAKEUP_ASSET_ROOT/Makeups/`.
@@ -328,6 +241,8 @@ fn find_png_recursive(dir: &Path, prefer: &[&str], exclude_sub: &[&str]) -> Opti
             return Some(p.clone());
         }
         let matches = |name: &str| match pat.strip_suffix(".png") {
+            // yyz1.png is the same side as yyz.png; it must not fall back
+            // to the alphabetically earlier opposite-side yyy1.png.
             Some(stem) => name.strip_suffix(".png").and_then(|n| n.strip_prefix(stem))
                 .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
             None => name.starts_with(&pat),
@@ -349,7 +264,8 @@ pub(super) fn makeup_presets_at(root: &Path, pf: u32) -> Vec<MakeupPresetInfo> {
     let (category, prefer, exclude): (&str, &[&str], &[&str]) = match pf {
         100 => ("Eyebrow", &["mmz.png", "mmy.png"], &["sideface"]),
         117 => ("Eyebrow", &["mmy.png", "mmz.png"], &["sideface"]),
-        103 | 30007 => ("EyeLiner", &["yxz.png", "yxzs.png", "yxy.png"], &["sideface"]),
+        103 => ("EyeLiner", &["yxz.png", "yxzs.png", "yxy.png", "yxys.png"], &["sideface"]),
+        30007 => ("EyeLiner", &["yxy.png", "yxys.png", "yxz.png", "yxzs.png"], &["sideface"]),
         105 => ("Eyelash", &["lt.png", "rt.png"], &["sideface"]),
         118 => ("Eyelash", &["lb.png", "rb.png"], &["sideface"]),
         106 => ("Blusher", &["model_blusher", "sh.png", "sh"], &["sideface"]),
@@ -436,9 +352,22 @@ pub fn makeup_palette_for_pf(pf: u32) -> &'static [(&'static str, [u8; 4])] {
         ("浓黑", [24, 22, 24, 255]),
         ("焦糖", [132, 76, 56, 255]),
     ];
+    const LIPSTICK_PALETTE: &[(&str, [u8; 4])] = &[
+        ("豆沙玫瑰", [179, 67, 74, 255]),
+        ("复古砖红", [128, 48, 40, 255]),
+        ("正宫红", [146, 16, 0, 255]),
+        ("焦糖南瓜", [169, 81, 37, 255]),
+        ("番茄红", [180, 42, 21, 255]),
+        ("车厘子红", [143, 8, 40, 255]),
+        ("玫瑰莓粉", [193, 78, 110, 255]),
+        ("珊瑚粉橘", [203, 105, 89, 255]),
+        ("温柔裸粉", [201, 138, 128, 255]),
+        ("草莓粉红", [210, 90, 108, 255]),
+    ];
     match pf {
         100 | 117 => BROW_PALETTE,
         106 => BLUSHER_PALETTE,
+        107 => LIPSTICK_PALETTE,
         103 | 30007 => EYELINER_PALETTE,
         105 | 118 => EYELASH_PALETTE,
         _ => &[],
@@ -451,6 +380,19 @@ pub(crate) struct RowMaterial {
     pub path: PathBuf,
     pub mirror_x: bool,
     pub explicit: bool,
+}
+
+fn is_right_eye_material_file(pf: u32, path: &Path) -> bool {
+    if !matches!(pf, 103 | 105 | 118 | 30007 | 90032) {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = stem.to_ascii_lowercase();
+    ["yxy", "rt", "rb", "yyy", "lpy", "yyggy", "yytly"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 pub(crate) fn row_material_selection(
@@ -466,14 +408,22 @@ pub(crate) fn row_material_selection(
         let root = root.ok_or(Refusal::MissingInput(MAKEUP_ASSET_ROOT_MISSING))?;
         let selected = makeup_presets_at(root, pf).into_iter().nth(raw as usize - 1)
             .ok_or(Refusal::MissingInput(contract.material_missing))?;
-        return Ok(Some(RowMaterial { path: selected.path, mirror_x: selected.mirror_x, explicit: true }));
+        let mirror_x = selected.mirror_x || is_right_eye_material_file(pf, &selected.path);
+        return Ok(Some(RowMaterial { path: selected.path, mirror_x, explicit: true }));
     }
     let Some(root) = root else { return Ok(None) };
     let path = root.join(contract.material);
-    if path.is_file() { return Ok(Some(RowMaterial { path, mirror_x: false, explicit: false })); }
+    if path.is_file() {
+        let mirror_x = is_right_eye_material_file(pf, &path);
+        return Ok(Some(RowMaterial { path, mirror_x, explicit: false }));
+    }
+    // With neither explicit style nor default texture, mask-only rows keep
+    // their existing geometry and response. Only an image row needs a default.
     if !row_profile_for_effect(pf, contract.source_effect)?.requires_material { return Ok(None); }
     Ok(makeup_presets_at(root, pf).into_iter().next().map(|s| RowMaterial {
-        path: s.path, mirror_x: s.mirror_x, explicit: false,
+        mirror_x: s.mirror_x || is_right_eye_material_file(pf, &s.path),
+        path: s.path,
+        explicit: false,
     }))
 }
 
@@ -517,12 +467,103 @@ pub(crate) fn material_tint(pf: u32, extra: Option<&BTreeMap<String, f32>>) -> R
     Ok(([r, g, b] != [255; 3]).then_some([r, g, b]))
 }
 
+/// Returns `MixColor0` from a sibling `effect.json` if present (used by
+/// Lipstick `MULS*` folders whose `staintexture.png` is neutral gray and whose
+/// shade RGB lives in the `LipColor` sibling effect).
+fn read_sibling_mix_color0(material_path: &Path) -> Option<[u8; 3]> {
+    let dir = material_path.parent()?;
+    let bytes = std::fs::read(dir.join("effect.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    for eff in json.get("Effects")?.as_array()? {
+        if let Some(arr) = eff.get("MixColor0").and_then(|v| v.as_array())
+            && arr.len() >= 3
+        {
+            let r = u8::try_from(arr[0].as_i64()?).ok()?;
+            let g = u8::try_from(arr[1].as_i64()?).ok()?;
+            let b = u8::try_from(arr[2].as_i64()?).ok()?;
+            return Some([r, g, b]);
+        }
+    }
+    None
+}
+
+fn is_neutral_gray_stain(image: &Image) -> bool {
+    if image.width == 0 || image.height == 0 || image.pixels.len() != image.pixel_count() * 4 {
+        return false;
+    }
+    let step = (image.pixel_count() / 256).max(1);
+    let mut avg = 0u64;
+    let mut samples = 0u64;
+    for px in image.pixels.chunks_exact(4).step_by(step) {
+        if px[3] < 245 {
+            return false;
+        }
+        let max_diff = px[0].abs_diff(px[1]).max(px[1].abs_diff(px[2]));
+        if max_diff > 10 {
+            return false;
+        }
+        avg += u64::from(px[0]);
+        samples += 1;
+    }
+    if samples == 0 {
+        return false;
+    }
+    let mean = avg / samples;
+    (80..=180).contains(&mean)
+}
+
+/// SoftLight (`FilterType = 42`) treats 128 as neutral (zero change). For neutral
+/// mid-gray `staintexture.png`, lift the texture around neutral `128` onto the
+/// contrast-balanced target lip shade so every lipstick hue shows vividly at
+/// 100 % while retaining natural lip highlights, shadows, and texture grain.
+fn tint_neutral_stain_for_soft_light(material: &mut Image, target: [u8; 3]) {
+    let boosted = target.map(|c| (128.0 + 1.45 * (f32::from(c) - 128.0)).clamp(0.0, 255.0));
+    for texel in material.pixels.chunks_exact_mut(4) {
+        for (value, &blend_c) in texel[..3].iter_mut().zip(&boosted) {
+            let modulated = (f32::from(*value) / 128.0) * blend_c;
+            *value = modulated.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn resolve_lipstick_tint(
+    extra: Option<&BTreeMap<String, f32>>,
+    preset_hint: Option<[u8; 3]>,
+) -> Result<([u8; 3], bool), Refusal> {
+    if let Some(&raw) = extra.and_then(|e| e.get("pc:107:rgb")) {
+        if !(0.0..=16_777_215.0).contains(&raw) || raw.fract() != 0.0 {
+            return Err(Refusal::ValueOutOfRange("makeup material RGB24"));
+        }
+        let [_, r, g, b] = (raw as u32).to_be_bytes();
+        return Ok(([r, g, b], true));
+    }
+    if let Some(&n) = extra.and_then(|e| e.get("pc:107:color"))
+        && n != 0.0
+    {
+        let palette = makeup_palette_for_pf(107);
+        if !n.is_finite() || n < 1.0 || n.fract() != 0.0 || n > palette.len() as f32 {
+            return Err(Refusal::ValueOutOfRange("makeup palette ordinal"));
+        }
+        let c = palette[n as usize - 1].1;
+        return Ok(([c[0], c[1], c[2]], true));
+    }
+    if let Some(hint) = preset_hint {
+        return Ok((hint, false));
+    }
+    let default = makeup_palette_for_pf(107)[0].1;
+    Ok(([default[0], default[1], default[2]], false))
+}
+
 pub(crate) fn tint_material_pixels(material: &mut Image, tint: [u8; 3]) {
     for texel in material.pixels.chunks_exact_mut(4) {
         for (value, multiplier) in texel[..3].iter_mut().zip(tint) {
             *value = ((u16::from(*value) * u16::from(multiplier) + 127) / 255) as u8;
         }
     }
+}
+
+fn asset_root() -> Option<PathBuf> {
+    makeup_asset_root()
 }
 
 /// Canonical B3 order, de-duplicated, unknown PFs refused. FaceStereo rows are
@@ -552,11 +593,10 @@ impl FaceInputBundle {
     ///
     /// Owner masks are rasterized from this bundle's 194 landmarks into each
     /// row's recovered ROI, so the seven mask-only rows need no file asset.
-    /// Material rows are read from the discovered material root (see
-    /// `asset_root`); rows whose material is unavailable are skipped, and
-    /// only an all-skipped request is refused (`MAKEUP_ASSET_ROOT_MISSING` /
-    /// `MAKEUP_MATERIAL_PNG_MISSING`). No static vendor template is ever
-    /// substituted for an owner mask.
+    /// Material rows are read from `AURORA_MAKEUP_ASSET_ROOT`; rows whose
+    /// material is unavailable are skipped, and only an all-skipped request is
+    /// refused (`MAKEUP_ASSET_ROOT_MISSING` / `MAKEUP_MATERIAL_PNG_MISSING`).
+    /// No static vendor template is ever substituted for an owner mask.
     pub fn attach_makeup_bundle(
         &self,
         source: &Image,
@@ -609,7 +649,7 @@ impl FaceInputBundle {
         let root = asset_root();
         let job_id = self.job_id;
         let root_ref = root.as_deref();
-        let (input_rows, skipped_material) = assemble_constructible_rows_with_options(
+        let (input_rows, skipped_material) = assemble_constructible_rows_with_options_and_hints(
             job_id,
             [source.width, source.height],
             &self.points194,
@@ -617,12 +657,23 @@ impl FaceInputBundle {
             face_mask,
             extra,
             |pf| {
-                let Some(selected) = row_material_selection(root_ref, pf, extra)? else { return Ok(None) };
+                let Some(selected) = row_material_selection(root_ref, pf, extra)? else {
+                    return Ok(None);
+                };
                 let image = load_row_material(&selected.path, job_id, pf)?;
                 if image.is_none() && selected.explicit {
-                    return Err(Refusal::MissingInput(row_contract(pf).ok_or(Refusal::UnknownEffect(pf))?.material_missing));
+                    return Err(Refusal::MissingInput(
+                        row_contract(pf)
+                            .ok_or(Refusal::UnknownEffect(pf))?
+                            .material_missing,
+                    ));
                 }
-                Ok(image.map(|img| (img, selected.mirror_x)))
+                let hint = if pf == 107 {
+                    read_sibling_mix_color0(&selected.path)
+                } else {
+                    None
+                };
+                Ok(image.map(|img| (img, selected.mirror_x, hint)))
             },
         )?;
         if !skipped_material.is_empty() {
@@ -701,7 +752,7 @@ where
 }
 
 fn assemble_constructible_rows_with_options<M>(
-    _job_id: u64,
+    job_id: u64,
     frame_size: [u32; 2],
     points194: &[[f32; 2]],
     selected: &[u32],
@@ -712,6 +763,29 @@ fn assemble_constructible_rows_with_options<M>(
 where
     M: FnMut(u32) -> Result<Option<(OwnedMaterial, bool)>, Refusal>,
 {
+    assemble_constructible_rows_with_options_and_hints(
+        job_id,
+        frame_size,
+        points194,
+        selected,
+        face_mask,
+        extra,
+        |pf| Ok(load_material(pf)?.map(|(img, mirror)| (img, mirror, None))),
+    )
+}
+
+fn assemble_constructible_rows_with_options_and_hints<M>(
+    _job_id: u64,
+    frame_size: [u32; 2],
+    points194: &[[f32; 2]],
+    selected: &[u32],
+    face_mask: Option<&[u8]>,
+    extra: Option<&BTreeMap<String, f32>>,
+    mut load_material: M,
+) -> Result<(Vec<OwnedMakeupBundleInputRow>, Vec<u32>), Refusal>
+where
+    M: FnMut(u32) -> Result<Option<(OwnedMaterial, bool, Option<[u8; 3]>)>, Refusal>,
+{
     let mut rows = Vec::with_capacity(selected.len());
     let mut skipped_material = Vec::new();
     for &pf in selected {
@@ -719,12 +793,22 @@ where
         let profile = row_profile_for_effect(pf, contract.source_effect)?;
         let (material, mask_texture, mirror_x) = if profile.requires_material {
             match load_material(pf)? {
-                Some((mut material, mirror)) => {
-                    if let Some(tint) = material_tint(pf, extra)? {
+                Some((mut material, mirror, hint)) => {
+                    if pf == 107 {
+                        let (lip_rgb, explicit_override) = resolve_lipstick_tint(extra, hint)?;
+                        if is_neutral_gray_stain(&material) {
+                            tint_neutral_stain_for_soft_light(
+                                Arc::make_mut(&mut material),
+                                lip_rgb,
+                            );
+                        } else if explicit_override && lip_rgb != [255; 3] {
+                            tint_material_pixels(Arc::make_mut(&mut material), lip_rgb);
+                        }
+                    } else if let Some(tint) = material_tint(pf, extra)? {
                         tint_material_pixels(Arc::make_mut(&mut material), tint);
                     }
                     (Some(material), None, mirror)
-                },
+                }
                 None => {
                     skipped_material.push(pf);
                     continue;
@@ -733,23 +817,23 @@ where
         } else {
             let loaded = load_material(pf)?;
             match loaded {
-                Some((img, mirror)) => (None, Some(img), mirror),
+                Some((img, mirror, _)) => (None, Some(img), mirror),
                 None => (None, None, false),
             }
         };
+        let mesh = crate::portrait_makeup_mesh2d::region_mesh(points194, frame_size, &profile)?;
         let draw = crate::portrait_makeup_mesh2d::build_face2d_draw_bytes(
             points194,
             frame_size,
             &profile,
         )?;
-        let positions = decode_owned_positions(&draw)?;
-        let indices = decode_owned_indices(&draw)?;
-        let (origin, size) = draw_origin_size(&positions, frame_size)?;
+        let (origin, size) = draw_origin_size(&mesh.positions, frame_size)?;
         let owner_mask: Option<OwnedOwnerMask> = if profile.requires_owner_mask() {
-            Some(derive_owner_mask_textured(
+            Some(derive_owner_mask_with_uvs(
                 pf,
-                &positions,
-                &indices,
+                &mesh.positions,
+                &mesh.uvs,
+                &mesh.indices,
                 origin,
                 size,
                 frame_size,
@@ -761,11 +845,24 @@ where
             None
         };
         let material_uv = if profile.requires_material {
-            Some(crate::portrait_makeup_mesh2d::build_region_uv(
-                points194,
-                frame_size,
-                &profile,
-            )?)
+            if mirror_x && pf == 90032 {
+                let mut bytes = Vec::with_capacity(mesh.uvs.len() * 8);
+                for uv in &mesh.uvs {
+                    bytes.extend_from_slice(&(1.0 - uv[0]).to_le_bytes());
+                    bytes.extend_from_slice(&uv[1].to_le_bytes());
+                }
+                Some(crate::portrait_makeup_bundle::OwnedFace2dUvBytes {
+                    vertices: Arc::from(bytes.into_boxed_slice()),
+                    vertex_stride: 8,
+                    offset: 0,
+                })
+            } else {
+                Some(crate::portrait_makeup_mesh2d::build_region_uv(
+                    points194,
+                    frame_size,
+                    &profile,
+                )?)
+            }
         } else {
             None
         };
@@ -844,7 +941,7 @@ fn derive_owner_mask(
     origin: [i32; 2],
     size: [i32; 2],
 ) -> Result<OwnedOwnerMask, Refusal> {
-    derive_owner_mask_textured(0, positions, indices, origin, size, [0, 0], None, false, None)
+    derive_owner_mask_with_uvs(0, positions, &[], indices, origin, size, [0, 0], None, false, None)
 }
 
 fn sample_mask_bilinear(tex: &Image, u: f32, v: f32) -> u8 {
@@ -872,9 +969,54 @@ fn sample_mask_bilinear(tex: &Image, u: f32, v: f32) -> u8 {
     (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8
 }
 
-fn derive_owner_mask_textured(
+fn feather_inward_mask(rgba: &mut [u8], w: usize, h: usize, passes: usize) {
+    if w < 8 || h < 8 || rgba.len() != w * h * 4 {
+        return;
+    }
+    let solid: Vec<u8> = rgba.chunks_exact(4).map(|px| px[0]).collect();
+    let mut cur = solid.clone();
+    let mut tmp = vec![0u8; w * h];
+    for _ in 0..passes {
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                if solid[idx] == 0 {
+                    tmp[idx] = 0;
+                    continue;
+                }
+                let xm1 = cur[y * w + x.saturating_sub(1)] as u16;
+                let x0 = cur[idx] as u16;
+                let xp1 = cur[y * w + (x + 1).min(w - 1)] as u16;
+                tmp[idx] = ((xm1 + 2 * x0 + xp1 + 2) / 4) as u8;
+            }
+        }
+        for y in 0..h {
+            let ym1 = y.saturating_sub(1);
+            let yp1 = (y + 1).min(h - 1);
+            for x in 0..w {
+                let idx = y * w + x;
+                if solid[idx] == 0 {
+                    cur[idx] = 0;
+                    continue;
+                }
+                let a = tmp[ym1 * w + x] as u16;
+                let b = tmp[idx] as u16;
+                let c = tmp[yp1 * w + x] as u16;
+                cur[idx] = ((a + 2 * b + c + 2) / 4) as u8;
+            }
+        }
+    }
+    for (idx, val) in cur.into_iter().enumerate() {
+        let base = idx * 4;
+        rgba[base..base + 4].copy_from_slice(&[val, val, val, val]);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_owner_mask_with_uvs(
     pf: u32,
     positions: &[[f32; 2]],
+    uvs: &[[f32; 2]],
     indices: &[u16],
     origin: [i32; 2],
     size: [i32; 2],
@@ -890,45 +1032,72 @@ fn derive_owner_mask_textured(
     let mut rgba = vec![0u8; w * h * 4];
     let origin_f = [origin[0] as f32, origin[1] as f32];
     let mut covered = false;
+    let use_vertex_uvs = material_mask.is_some()
+        && uvs.len() == positions.len()
+        && !(positions.len() == 4 && matches!(pf, 100 | 117));
     for triangle in indices.chunks_exact(3) {
+        let idx = [triangle[0] as usize, triangle[1] as usize, triangle[2] as usize];
         let points = [
             positions
-                .get(triangle[0] as usize)
+                .get(idx[0])
                 .copied()
                 .ok_or(Refusal::ShapeMismatch("makeup owner mask vertex"))?,
             positions
-                .get(triangle[1] as usize)
+                .get(idx[1])
                 .copied()
                 .ok_or(Refusal::ShapeMismatch("makeup owner mask vertex"))?,
             positions
-                .get(triangle[2] as usize)
+                .get(idx[2])
                 .copied()
                 .ok_or(Refusal::ShapeMismatch("makeup owner mask vertex"))?,
         ];
+        if use_vertex_uvs {
+            if let Some(tex) = material_mask {
+                let tri_uvs = [uvs[idx[0]], uvs[idx[1]], uvs[idx[2]]];
+                covered |= rasterize_textured_triangle(
+                    &mut rgba,
+                    w,
+                    h,
+                    origin_f,
+                    points,
+                    tri_uvs,
+                    tex,
+                    mirror_x,
+                );
+                continue;
+            }
+        }
         covered |= rasterize_triangle(&mut rgba, w, h, origin_f, points);
     }
     if !covered {
         return Err(Refusal::ShapeMismatch("makeup owner mask coverage"));
     }
 
-    // When a real decrypted soft-gradient mask PNG is available for ColorMask /
-    // HistoricalColor rows, modulate the rasterized polygon by the texture so
-    // makeup follows the actual feathered brow/eyeliner/lash/blusher shape.
-    if let Some(tex) = material_mask {
-        let dual_eye_quads = matches!(pf, 103 | 105 | 118 | 30007) && positions.len() == 8;
-        if dual_eye_quads {
-            let left_box = (
-                positions[0][0].min(positions[2][0]),
-                positions[0][1].min(positions[2][1]),
-                (positions[2][0] - positions[0][0]).abs().max(1.0),
-                (positions[2][1] - positions[0][1]).abs().max(1.0),
-            );
-            let right_box = (
-                positions[4][0].min(positions[6][0]),
-                positions[4][1].min(positions[6][1]),
-                (positions[6][0] - positions[4][0]).abs().max(1.0),
-                (positions[6][1] - positions[4][1]).abs().max(1.0),
-            );
+    // Eyebrows (4-vertex oriented quads) retain their exact corner projection
+    // path; multi-vertex curves & 142-point face warps sample per-triangle UVs above.
+    if let Some(tex) = material_mask
+        && !use_vertex_uvs
+    {
+        let quad_uv = |q: &[[f32; 2]], fx: f32, fy: f32| -> Option<(f32, f32)> {
+            let v0 = q[0];
+            let eu = [q[1][0] - v0[0], q[1][1] - v0[1]];
+            let ev = [q[3][0] - v0[0], q[3][1] - v0[1]];
+            let eu2 = eu[0] * eu[0] + eu[1] * eu[1];
+            let ev2 = ev[0] * ev[0] + ev[1] * ev[1];
+            if eu2 <= 1e-6 || ev2 <= 1e-6 {
+                return None;
+            }
+            let rx = fx - v0[0];
+            let ry = fy - v0[1];
+            let u = (rx * eu[0] + ry * eu[1]) / eu2;
+            let v = (rx * ev[0] + ry * ev[1]) / ev2;
+            if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+                Some((u, v))
+            } else {
+                None
+            }
+        };
+        if positions.len() == 4 {
             for y in 0..h {
                 let fy = origin_f[1] + y as f32 + 0.5;
                 for x in 0..w {
@@ -937,45 +1106,25 @@ fn derive_owner_mask_textured(
                         continue;
                     }
                     let fx = origin_f[0] + x as f32 + 0.5;
-                    let mut val = 0u8;
-                    if fx >= left_box.0
-                        && fx <= left_box.0 + left_box.2
-                        && fy >= left_box.1
-                        && fy <= left_box.1 + left_box.3
-                    {
-                        let u = (fx - left_box.0) / left_box.2;
-                        let v = (fy - left_box.1) / left_box.3;
-                        val = val.max(sample_mask_bilinear(tex, u, v));
-                    }
-                    if fx >= right_box.0
-                        && fx <= right_box.0 + right_box.2
-                        && fy >= right_box.1
-                        && fy <= right_box.1 + right_box.3
-                    {
-                        let u = 1.0 - (fx - right_box.0) / right_box.2;
-                        let v = (fy - right_box.1) / right_box.3;
-                        val = val.max(sample_mask_bilinear(tex, u, v));
-                    }
-                    rgba[at..at + 4].copy_from_slice(&[val, val, val, val]);
-                }
-            }
-        } else {
-            let wf = w as f32;
-            let hf = h as f32;
-            for y in 0..h {
-                let v = (y as f32 + 0.5) / hf;
-                for x in 0..w {
-                    let at = (y * w + x) * 4;
-                    if rgba[at] == 0 {
-                        continue;
-                    }
-                    let raw_u = (x as f32 + 0.5) / wf;
-                    let u = if mirror_x { 1.0 - raw_u } else { raw_u };
-                    let val = sample_mask_bilinear(tex, u, v);
+                    let val = if let Some((raw_u, v)) = quad_uv(positions, fx, fy) {
+                        let u = if mirror_x { 1.0 - raw_u } else { raw_u };
+                        sample_mask_bilinear(tex, u, v)
+                    } else {
+                        0
+                    };
                     rgba[at..at + 4].copy_from_slice(&[val, val, val, val]);
                 }
             }
         }
+    }
+
+    if pf == 107 && material_mask.is_none() {
+        feather_inward_mask(&mut rgba, w, h, 2);
+    } else if matches!(pf, 8 | 9 | 106 | 116) && w >= 16 && h >= 16 {
+        // Gently feather whole-face blusher/contour masks so side-profile
+        // triangle boundaries transition smoothly without hard polygonal seams.
+        let passes = ((w.min(h) / 160).clamp(1, 3)) as usize;
+        feather_inward_mask(&mut rgba, w, h, passes);
     }
 
     // Clip every owner mask against the same-job FaceMask so side-profile
@@ -1011,6 +1160,7 @@ fn derive_owner_mask_textured(
         .ok_or(Refusal::ShapeMismatch("makeup owner mask image"))
 }
 
+#[cfg(test)]
 fn decode_owned_positions(draw: &OwnedFace2dDrawBytes) -> Result<Vec<[f32; 2]>, Refusal> {
     let stride = draw.vertex_stride;
     if draw.vertices.is_empty()
@@ -1037,6 +1187,7 @@ fn decode_owned_positions(draw: &OwnedFace2dDrawBytes) -> Result<Vec<[f32; 2]>, 
         .collect())
 }
 
+#[cfg(test)]
 fn decode_owned_indices(draw: &OwnedFace2dDrawBytes) -> Result<Vec<u16>, Refusal> {
     if draw.indices_u16.is_empty() || draw.draw_index_count == 0 || draw.draw_index_count % 3 != 0
     {
@@ -1057,6 +1208,90 @@ fn decode_owned_indices(draw: &OwnedFace2dDrawBytes) -> Result<Vec<u16>, Refusal
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_textured_triangle(
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    origin: [f32; 2],
+    triangle: [[f32; 2]; 3],
+    tri_uvs: [[f32; 2]; 3],
+    tex: &Image,
+    mirror_x: bool,
+) -> bool {
+    let points = [
+        [triangle[0][0] - origin[0], triangle[0][1] - origin[1]],
+        [triangle[1][0] - origin[0], triangle[1][1] - origin[1]],
+        [triangle[2][0] - origin[0], triangle[2][1] - origin[1]],
+    ];
+    let edge = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let area = edge(points[0], points[1], points[2]);
+    if !area.is_finite() || area.abs() < 1e-6 {
+        return false;
+    }
+    let inv_area = 1.0 / area;
+    let min_x = (points
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as isize)
+        .clamp(0, width as isize) as usize;
+    let min_y = (points
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as isize)
+        .clamp(0, height as isize) as usize;
+    let max_x = (points
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as isize)
+        .clamp(0, width as isize) as usize;
+    let max_y = (points
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as isize)
+        .clamp(0, height as isize) as usize;
+    if min_x >= max_x || min_y >= max_y {
+        return false;
+    }
+    let mut covered = false;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let sample = [x as f32 + 0.5, y as f32 + 0.5];
+            let mut w0 = edge(points[1], points[2], sample) * inv_area;
+            let mut w1 = edge(points[2], points[0], sample) * inv_area;
+            let mut w2 = 1.0 - w0 - w1;
+            if w0 < -1e-5 || w1 < -1e-5 || w2 < -1e-5 {
+                continue;
+            }
+            let sum = w0.max(0.0) + w1.max(0.0) + w2.max(0.0);
+            if sum <= 0.0 {
+                continue;
+            }
+            w0 = w0.max(0.0) / sum;
+            w1 = w1.max(0.0) / sum;
+            w2 = w2.max(0.0) / sum;
+            let raw_u = w0 * tri_uvs[0][0] + w1 * tri_uvs[1][0] + w2 * tri_uvs[2][0];
+            let v = w0 * tri_uvs[0][1] + w1 * tri_uvs[1][1] + w2 * tri_uvs[2][1];
+            let u = if mirror_x { 1.0 - raw_u } else { raw_u };
+            let val = sample_mask_bilinear(tex, u, v);
+            let at = (y * width + x) * 4;
+            let prev = rgba[at];
+            let out = val.max(prev);
+            rgba[at..at + 4].copy_from_slice(&[out, out, out, out]);
+            covered = true;
+        }
+    }
+    covered
 }
 
 fn rasterize_triangle(
@@ -1114,7 +1349,7 @@ fn rasterize_triangle(
             let w0 = edge(points[1], points[2], sample) / area;
             let w1 = edge(points[2], points[0], sample) / area;
             let w2 = edge(points[0], points[1], sample) / area;
-            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+            if w0 >= -1e-5 && w1 >= -1e-5 && w2 >= -1e-5 {
                 let at = (y * width + x) * 4;
                 rgba[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
                 covered = true;
@@ -1357,123 +1592,238 @@ mod tests {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod makeup_root_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    #[test]
+    fn profile_blusher_mask_never_leaks_onto_nose_bridge_under_yaw() {
+        let frame = [800u32, 800];
+        // Synthetic canonical [95, 40, 901, 1081] cheek blush mask: bright ONLY on left & right cheeks, 0 on nose bridge/temples.
+        let mut blusher_px = vec![0u8; 100 * 120 * 4];
+        for y in 0..120 {
+            let v = (y as f32 + 0.5) / 120.0;
+            for x in 0..100 {
+                let u = (x as f32 + 0.5) / 100.0;
+                let left_cheek = (u - 0.25).hypot(v - 0.64) < 0.09;
+                let right_cheek = (u - 0.68).hypot(v - 0.64) < 0.09;
+                let val = if left_cheek || right_cheek { 240 } else { 0 };
+                let at = (y * 100 + x) * 4;
+                blusher_px[at..at + 4].copy_from_slice(&[val, val, val, 255]);
+            }
+        }
+        let blusher_tex = Arc::new(Image::new(100, 120, blusher_px).unwrap());
 
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-    /// Fresh empty directory under the system temp dir, unique per call so
-    /// parallel test binaries never share a tree.
-    fn scratch_dir(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let seq = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aurora-makeup-root-{label}-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
-    fn make_makeups_tree(root: &Path) -> PathBuf {
-        let makeup = root.join("assets").join("portrait").join("makeup");
-        std::fs::create_dir_all(makeup.join("Makeups")).expect("create Makeups tree");
-        makeup
+        for (yaw_deg, roll_deg, use_left_cheek) in [(55.0, 18.0, true), (-55.0, -18.0, false)] {
+            let points = crate::portrait_makeup_mesh2d::posed_real_face194_for_tests(
+                yaw_deg,
+                roll_deg,
+                frame,
+            );
+            let (rows, skipped) = assemble_constructible_rows(
+                9,
+                frame,
+                &points,
+                &[106],
+                |_| Ok(Some(Arc::clone(&blusher_tex))),
+            )
+            .unwrap();
+            assert!(skipped.is_empty());
+            let row = &rows[0];
+            let mask = row.owner_mask.as_ref().unwrap();
+            let sample_at_screen = |pt: [f32; 2]| -> u8 {
+                let lx = (pt[0].round() as i32 - row.origin[0]).clamp(0, row.size[0] - 1) as usize;
+                let ly = (pt[1].round() as i32 - row.origin[1]).clamp(0, row.size[1] - 1) as usize;
+                mask.pixels[(ly * mask.width as usize + lx) * 4]
+            };
+            // Nose bridge landmark 56 must stay 0 (zero blush spillover onto nose).
+            assert_eq!(sample_at_screen(points[56]), 0);
+            // Visible near cheek must receive full blush!
+            let near_cheek = if use_left_cheek {
+                [
+                    0.5 * (points[63][0] + points[115][0]),
+                    0.5 * (points[63][1] + points[115][1]),
+                ]
+            } else {
+                [
+                    0.5 * (points[70][0] + points[135][0]),
+                    0.5 * (points[70][1] + points[135][1]),
+                ]
+            };
+            assert!(
+                sample_at_screen(near_cheek) > 150,
+                "near cheek missed blush under yaw={yaw_deg}: {}",
+                sample_at_screen(near_cheek)
+            );
+        }
     }
 
     #[test]
-    fn candidate_chain_is_ordered_env_then_exe_then_cwd_then_dev() {
-        let exe = Path::new("C:/exe");
-        let cwd = Path::new("C:/cwd");
-        let env = PathBuf::from("C:/env");
-        let candidates = makeup_root_candidates(Some(exe), Some(cwd), Some(env));
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("C:/env"),
-                exe.join("assets").join("portrait").join("makeup"),
-                exe.join("assets").join("makeup"),
-                exe.join("makeup"),
-                cwd.join("assets").join("portrait").join("makeup"),
-                cwd.join("assets").join("makeup"),
-                cwd.join("makeup"),
-                exe.join("..")
-                    .join("..")
-                    .join("assets")
-                    .join("portrait")
-                    .join("makeup"),
-            ]
-        );
-        assert!(makeup_root_candidates(None, None, None).is_empty());
-    }
-
-    #[test]
-    fn accept_requires_a_makeups_child_or_makeups_itself() {
-        let root = scratch_dir("accept");
-        let makeup = make_makeups_tree(&root);
-
-        assert_eq!(accept_makeup_root(&makeup), Some(makeup.clone()));
-        assert_eq!(
-            accept_makeup_root(&makeup.join("Makeups")),
-            Some(makeup.clone()),
-            "a Makeups directory is normalized to its parent"
-        );
-
-        let empty = root.join("empty");
-        std::fs::create_dir_all(&empty).expect("create empty dir");
-        assert_eq!(accept_makeup_root(&empty), None, "no Makeups child");
-        assert_eq!(
-            accept_makeup_root(&root.join("absent")),
+    fn pf107_neutral_staintexture_produces_vivid_lip_color_and_open_mouth() {
+        use aurora_portrait::kernels::makeup_material::apply_image_layer_dual;
+        let frame = [800u32, 800];
+        let points =
+            crate::portrait_makeup_mesh2d::posed_real_face194_for_tests(10.0, -8.0, frame);
+        let stain = Arc::new(Image::solid(32, 16, [128, 128, 128, 255]));
+        let (input_rows, _) = assemble_constructible_rows_with_options(
+            11,
+            frame,
+            &points,
+            &[107],
             None,
-            "missing directory is rejected"
-        );
-
-        std::fs::remove_dir_all(&root).expect("cleanup scratch dir");
-    }
-
-    #[test]
-    fn first_qualifying_candidate_wins() {
-        let root = scratch_dir("first");
-        let makeup = make_makeups_tree(&root);
-        let empty = root.join("empty");
-        std::fs::create_dir_all(&empty).expect("create empty dir");
-
-        // Empty candidates before the real one are skipped, not fatal.
-        let candidates =
-            makeup_root_candidates(Some(empty.as_path()), Some(root.as_path()), None);
-        let found = candidates
-            .iter()
-            .find_map(|candidate| accept_makeup_root(candidate));
-        assert_eq!(found, Some(makeup.clone()));
-
-        // The environment candidate outranks an earlier exe-relative hit.
-        let found = makeup_root_candidates(
-            Some(root.as_path()),
-            Some(root.as_path()),
-            Some(makeup.join("Makeups")),
+            None,
+            |_| Ok(Some((Arc::clone(&stain), false))),
         )
-        .into_iter()
-        .find_map(|candidate| accept_makeup_root(&candidate));
-        assert_eq!(found, Some(makeup.clone()));
-
-        std::fs::remove_dir_all(&root).expect("cleanup scratch dir");
+        .unwrap();
+        let owned = produce_owned_makeup_bundle(Some(OwnedMakeupBundleInputs {
+            job_id: 11,
+            ticket: Some(11),
+            frame_size: frame,
+            source_sha256: [0x22; 32],
+            rows: &input_rows,
+        }))
+        .unwrap();
+        let input = owned.makeup_input(107).unwrap();
+        let source = Image::solid(frame[0], frame[1], [175, 118, 110, 255]);
+        let layer = aurora_portrait::kernels::makeup_material::LipStickParams {
+            mix_color: input.mix_color,
+            opacity_percent: input.opacity_percent,
+            degree01: 1.0,
+            shelter_weight: 1.0,
+            region_factors: 1.0,
+            filter_type: input.filter_type,
+            mask_type: 3,
+            blend_alpha: false,
+        }
+        .single_mask_material()
+        .unwrap();
+        let rendered = apply_image_layer_dual(
+            &source,
+            input.material.unwrap(),
+            input.mask.unwrap(),
+            input.mask_uv.unwrap(),
+            input.material_uv.unwrap(),
+            layer,
+        )
+        .unwrap();
+        let px_at = |pt: [f32; 2]| -> [u8; 4] {
+            let x = pt[0].round() as usize;
+            let y = pt[1].round() as usize;
+            let at = (y * frame[0] as usize + x) * 4;
+            rendered.pixels[at..at + 4].try_into().unwrap()
+        };
+        // Midpoint of upper lip (outer 78 and inner 98) must show clear rose lip color shift.
+        let upper_lip = [
+            0.5 * (points[78][0] + points[98][0]),
+            0.5 * (points[78][1] + points[98][1]),
+        ];
+        let out_lip = px_at(upper_lip);
+        assert!(
+            out_lip[0] > 185 && out_lip[1] < 90 && out_lip[2] < 90,
+            "lipstick barely visible on upper lip: {out_lip:?}"
+        );
+        // Inner mouth cavity center (between 98 and 104) must remain unchanged!
+        let teeth_center = [
+            0.5 * (points[98][0] + points[104][0]),
+            0.5 * (points[98][1] + points[104][1]),
+        ];
+        assert_eq!(px_at(teeth_center), [175, 118, 110, 255]);
     }
 
     #[test]
-    fn no_candidate_qualifies_without_assets() {
-        let root = scratch_dir("none");
-        let found = makeup_root_candidates(Some(root.as_path()), Some(root.as_path()), None)
-            .into_iter()
-            .find_map(|candidate| accept_makeup_root(&candidate));
-        assert_eq!(found, None);
-        std::fs::remove_dir_all(&root).expect("cleanup scratch dir");
+    fn right_eye_material_yxy_mirrors_left_eye_yxz_on_both_eyes() {
+        let frame = [800u32, 800];
+        let points =
+            crate::portrait_makeup_mesh2d::posed_real_face194_for_tests(0.0, 0.0, frame);
+        // Synthetic left-eye liner texture (`yxz`): intense ONLY on left/outer wing `u < 0.40`.
+        let mut left_px = vec![0u8; 100 * 100 * 4];
+        for y in 0..100 {
+            for x in 0..40 {
+                let at = (y * 100 + x) * 4;
+                left_px[at..at + 4].copy_from_slice(&[220, 220, 220, 255]);
+            }
+        }
+        // Synthetic right-eye liner texture (`yxy` mirror): intense ONLY on `u > 0.60`.
+        let mut right_px = vec![0u8; 100 * 100 * 4];
+        for y in 0..100 {
+            for x in 60..100 {
+                let at = (y * 100 + x) * 4;
+                right_px[at..at + 4].copy_from_slice(&[220, 220, 220, 255]);
+            }
+        }
+        let left_tex = Arc::new(Image::new(100, 100, left_px).unwrap());
+        let right_tex = Arc::new(Image::new(100, 100, right_px).unwrap());
+
+        let (rows_l, _) = assemble_constructible_rows_with_options(
+            12,
+            frame,
+            &points,
+            &[103],
+            None,
+            None,
+            |_| Ok(Some((Arc::clone(&left_tex), false))),
+        )
+        .unwrap();
+        let (rows_r, _) = assemble_constructible_rows_with_options(
+            13,
+            frame,
+            &points,
+            &[30007],
+            None,
+            None,
+            |_| Ok(Some((Arc::clone(&right_tex), true))),
+        )
+        .unwrap();
+        let ml = rows_l[0].owner_mask.as_ref().unwrap();
+        let mr = rows_r[0].owner_mask.as_ref().unwrap();
+        let sample = |row: &OwnedMakeupBundleInputRow, m: &Image, pt: [f32; 2]| -> u8 {
+            let lx = (pt[0].round() as i32 - row.origin[0]).clamp(0, row.size[0] - 1) as usize;
+            let ly = (pt[1].round() as i32 - row.origin[1]).clamp(0, row.size[1] - 1) as usize;
+            m.pixels[(ly * m.width as usize + lx) * 4]
+        };
+        // Both outer corners (18 & 36, nudged just above lid) must light up, while inner corners (22 & 40) stay 0!
+        let l_outer_above = [points[18][0], points[18][1] - 4.0];
+        let r_outer_above = [points[36][0], points[36][1] - 4.0];
+        let l_inner_above = [points[22][0], points[22][1] - 4.0];
+        assert!(sample(&rows_l[0], ml, l_outer_above) > 150);
+        assert!(sample(&rows_r[0], mr, r_outer_above) > 150);
+        assert_eq!(sample(&rows_r[0], mr, l_inner_above), 0);
+    }
+
+    #[test]
+    fn eyeliner_pf103_prefers_left_and_pf30007_prefers_right_with_consistent_mirror() {
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = Temp(std::env::temp_dir().join(format!(
+            "aurora-eyeliner-side-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        let style = tmp.0.join("Makeups/EyeLiner/MUELR00000003");
+        std::fs::create_dir_all(&style).unwrap();
+        let px = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 200, 200, 255]));
+        for name in ["yxzs.png", "yxys.png"] {
+            px.save(style.join(name)).unwrap();
+        }
+        let p103 = makeup_presets_at(&tmp.0, 103);
+        let p30007 = makeup_presets_at(&tmp.0, 30007);
+        assert_eq!(p103[0].path.file_name().unwrap(), "yxzs.png");
+        assert_eq!(p30007[0].path.file_name().unwrap(), "yxys.png");
+
+        let extra103 = BTreeMap::from([("pc:103:style".into(), 1.0)]);
+        let extra30007 = BTreeMap::from([("pc:30007:style".into(), 1.0)]);
+        let m103 = row_material_selection(Some(&tmp.0), 103, Some(&extra103))
+            .unwrap()
+            .unwrap();
+        let m30007 = row_material_selection(Some(&tmp.0), 30007, Some(&extra30007))
+            .unwrap()
+            .unwrap();
+        assert!(!m103.mirror_x);
+        assert!(m30007.mirror_x);
     }
 }
 
@@ -1502,5 +1852,55 @@ mod facestereo_wiring_tests {
             profile.declared_mask_channel,
             Some(aurora_portrait::kernels::makeup_material::MaskChannel::Rgba)
         );
+    }
+
+    #[test]
+    fn facestereo_pf8_and_pf9_assemble_with_face_mask_and_pass_prove_makeup_row() {
+        let frame = [800u32, 800];
+        let points =
+            crate::portrait_makeup_mesh2d::posed_real_face194_for_tests(0.0, 0.0, frame);
+        let material = Arc::new(Image::solid(64, 64, [180, 160, 150, 220]));
+        let face_mask = vec![200u8; (frame[0] * frame[1]) as usize];
+        let (input_rows, skipped) = assemble_constructible_rows_with_options(
+            29,
+            frame,
+            &points,
+            &[8, 9],
+            Some(&face_mask),
+            None,
+            |_| Ok(Some((Arc::clone(&material), false))),
+        )
+        .expect("PF8/PF9 should assemble without FACESTEREO_OWNER_MASK_UNSUPPORTED");
+        assert!(skipped.is_empty());
+        assert_eq!(
+            input_rows.iter().map(|r| r.pf).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        for row in &input_rows {
+            let mask = row.owner_mask.as_ref().expect("PF8/PF9 owner mask");
+            assert!(
+                mask.pixels.chunks_exact(4).any(|px| px[0] > 0 && px[0] <= 200),
+                "PF{} owner mask should be non-empty and gated by face_mask",
+                row.pf
+            );
+        }
+        let owned = produce_owned_makeup_bundle(Some(OwnedMakeupBundleInputs {
+            job_id: 29,
+            ticket: Some(29),
+            frame_size: frame,
+            source_sha256: [0x33; 32],
+            rows: &input_rows,
+        }))
+        .expect("produce owned FaceStereo bundle");
+        for pf in [8u32, 9] {
+            let proof = crate::portrait_probe_inputs::prove_makeup_row(&owned, pf)
+                .unwrap_or_else(|err| panic!("PF{pf} failed prove_makeup_row: {err:?}"));
+            match proof {
+                crate::portrait_probe_inputs::PfInputProof::Makeup { owner_mask_peak, .. } => {
+                    assert!(owner_mask_peak > 0, "PF{pf} owner mask peak");
+                }
+                other => panic!("PF{pf} unexpected proof variant: {other:?}"),
+            }
+        }
     }
 }

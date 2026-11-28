@@ -84,7 +84,7 @@ TensorRT；否则优先 CUDA，再回退 CPU。显式 `tensorrt` 模式用于离
 ## 验证方法
 
 ```powershell
-cargo build --release --locked -j 1 -p lumen-engine --bin aimask_probe
+cargo build --release --locked -j 1 -p aurora-engine --bin aimask_probe
 ```
 
 用启动器指定 `-Executable` 为 `aimask_probe.exe`，`-AppArgs` 依次为输入 PNG/JPEG、

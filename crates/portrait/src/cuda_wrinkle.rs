@@ -461,6 +461,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn family_reuses_composite_buffers_and_shared_context() {
+        let _cache_guard = cuda::test_exclusive_cache_guard();
         let gpu = match WrinkleGpu::open() {
             Ok(gpu) => gpu,
             Err(error) => {

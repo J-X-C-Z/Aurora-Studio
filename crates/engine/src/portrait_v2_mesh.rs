@@ -1,7 +1,5 @@
 //! Recovered PF8025/PF8026 194 -> 526 geometry and captured V2 topology.
 
-use std::sync::OnceLock;
-
 use aurora_portrait::cuda_vface::Row;
 use aurora_portrait::Refusal;
 
@@ -61,18 +59,25 @@ pub struct VFaceAtlas {
     pub row: Row,
     pub width: u32,
     pub height: u32,
-    pub pixels: std::sync::Arc<Vec<u8>>,
+    pub pixels: Vec<u8>,
 }
 
 impl VFaceAtlas {
     pub fn captured(row: Row) -> Self {
         let [_, _, width, height] = row.spec().rectangle;
-        let pixels = captured_atlas(row);
+        let pixels = match row {
+            Row::LeftPositive => GRID_2010_POSITIVE,
+            Row::RightPositive => GRID_2011_POSITIVE,
+            Row::LeftNegative => GRID_2010_NEGATIVE,
+            Row::RightNegative => GRID_2011_NEGATIVE,
+        }
+        // Absent from this build: `validate` refuses the empty atlas.
+        .unwrap_or_default();
         Self {
             row,
             width,
             height,
-            pixels,
+            pixels: pixels.to_vec(),
         }
     }
 
@@ -85,26 +90,6 @@ impl VFaceAtlas {
         }
         Ok(())
     }
-}
-
-fn captured_atlas(row: Row) -> std::sync::Arc<Vec<u8>> {
-    static LEFT_POSITIVE: OnceLock<std::sync::Arc<Vec<u8>>> = OnceLock::new();
-    static RIGHT_POSITIVE: OnceLock<std::sync::Arc<Vec<u8>>> = OnceLock::new();
-    static LEFT_NEGATIVE: OnceLock<std::sync::Arc<Vec<u8>>> = OnceLock::new();
-    static RIGHT_NEGATIVE: OnceLock<std::sync::Arc<Vec<u8>>> = OnceLock::new();
-    let cache = match row {
-        Row::LeftPositive => &LEFT_POSITIVE,
-        Row::RightPositive => &RIGHT_POSITIVE,
-        Row::LeftNegative => &LEFT_NEGATIVE,
-        Row::RightNegative => &RIGHT_NEGATIVE,
-    };
-    let pixels = match row {
-        Row::LeftPositive => GRID_2010_POSITIVE,
-        Row::RightPositive => GRID_2011_POSITIVE,
-        Row::LeftNegative => GRID_2010_NEGATIVE,
-        Row::RightNegative => GRID_2011_NEGATIVE,
-    };
-    cache.get_or_init(|| std::sync::Arc::new(pixels.unwrap_or_default().to_vec())).clone()
 }
 
 pub fn from_landmarks(

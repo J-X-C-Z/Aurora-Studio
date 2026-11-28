@@ -433,23 +433,10 @@ impl ParamOverrides {
     }
 
     /// Explicit range override, for a future RAW range reader.
-    /// Stores a vendor range. An empty range (`min == max`) is kept: for
-    /// `BandingReductionAmount` it means the camera declares no adjustable
-    /// unit (Z6III reports `0..0`), which callers must treat as "disabled"
-    /// rather than replacing it with a guessed range.
     pub fn set_range(&mut self, key: &'static str, min: f32, max: f32) {
-        if min.is_finite() && max.is_finite() && min <= max {
+        if min.is_finite() && max.is_finite() && min < max {
             self.ranges.insert(key, (min, max));
         }
-    }
-
-    /// The stored range and default for one property, if the frame supplied
-    /// them. Unlike [`Self::apply`], an empty range is returned as-is so the
-    /// caller can disable the control instead of widening it.
-    pub fn range(&self, key: &str) -> Option<(f32, f32, f32)> {
-        let (min, max) = *self.ranges.get(key)?;
-        let default = self.defaults.get(key).copied().unwrap_or(min);
-        Some((min, max, default))
     }
 
     /// Explicit default override, for a RAW or camera-default reader.
@@ -604,33 +591,6 @@ mod tests {
         assert_eq!(clamp("BandingReductionAmount", 101.0), 100.0);
         assert_eq!(clamp("BandingReductionAmount", f32::NAN), 0.0);
         assert_eq!(clamp("UnknownRawKey", 999.0), 999.0);
-    }
-
-    #[test]
-    fn overrides_range_keeps_empty_ranges_and_reports_the_stored_default() {
-        let mut o = ParamOverrides::default();
-        // Z6III: the measured descriptor is 0..0 with no default.
-        o.set_range("BandingReductionAmount", 0.0, 0.0);
-        assert_eq!(o.range("BandingReductionAmount"), Some((0.0, 0.0, 0.0)));
-
-        // A frame that states a real range and default gets both back.
-        let mut o = ParamOverrides::default();
-        o.set_range("BandingReductionAmount", 0.0, 60.0);
-        o.set_default("BandingReductionAmount", 20.0);
-        assert_eq!(o.range("BandingReductionAmount"), Some((0.0, 60.0, 20.0)));
-
-        // A range without a default falls back to its minimum, not to a guess.
-        let mut o = ParamOverrides::default();
-        o.set_range("BandingReductionAmount", 5.0, 60.0);
-        assert_eq!(o.range("BandingReductionAmount"), Some((5.0, 60.0, 5.0)));
-
-        // Unset keys stay absent so the caller keeps its fallback.
-        assert_eq!(ParamOverrides::default().range("BandingReductionAmount"), None);
-        // Inverted or non-finite ranges are refused on write.
-        let mut o = ParamOverrides::default();
-        o.set_range("BandingReductionAmount", 60.0, 0.0);
-        o.set_range("BandingReductionAmount", f32::NAN, 0.0);
-        assert_eq!(o.range("BandingReductionAmount"), None);
     }
 
     #[test]

@@ -60,6 +60,13 @@ pub enum FaceGeometry {
         mask: Vec<u8>,
         host_split_receipt: Option<SmileHostSplitReceipt>,
     },
+    /// Unit-strength PF8033 displacement and mask rasterized from the vendor
+    /// `SmileMouth3D` 2206-vertex / 4269-face morphable mesh fitted to `points194`.
+    SmileMesh {
+        dx: Vec<f32>,
+        dy: Vec<f32>,
+        mask: Vec<u8>,
+    },
     /// PF202 Type1012 draw from the recovered 5x27 producer layout. The EBO
     /// is the captured 136/705 topology, not a tessellation of source points.
     HairLine {
@@ -240,7 +247,8 @@ impl FaceGeometryInputs {
                     )
                         .hash(&mut h);
                 }
-                FaceGeometry::Smile { dx, dy, mask, .. } => {
+                FaceGeometry::Smile { dx, dy, mask, .. }
+                | FaceGeometry::SmileMesh { dx, dy, mask } => {
                     for plane in [dx, dy] {
                         plane.len().hash(&mut h);
                         for value in plane {
@@ -339,15 +347,8 @@ fn missing_draw(pf: u32) -> &'static str {
 /// route at all. The refusal names the inputs that producer documents, so a
 /// missing producer stays distinguishable from a row with no kernel.
 pub(super) fn producer_gap(pf: u32) -> Option<&'static str> {
-    use super::portrait_longtail_inputs as longtail;
-    Some(match pf {
-        30188 | 30189 => longtail::PF30188_PRODUCER_GAP,
-        30209 => longtail::PF30209_PRODUCER_GAP,
-        90085 => longtail::PF90085_PRODUCER_GAP,
-        90087 => longtail::PF90087_PRODUCER_GAP,
-        100005 => longtail::PF100005_PRODUCER_GAP,
-        _ => return None,
-    })
+    let _ = pf;
+    None
 }
 
 fn draw_gap(pf: u32) -> &'static str {
@@ -711,61 +712,125 @@ fn render_skull(
     {
         return Err(Refusal::ShapeMismatch("PF232 15-point radial contour"));
     }
-    let mut min_x = anchor[0];
-    let mut min_y = anchor[1];
-    let mut max_x = anchor[0];
-    let mut max_y = anchor[1];
-    for point in contour_source.iter().chain(contour_warped) {
-        min_x = min_x.min(point[0]);
-        min_y = min_y.min(point[1]);
-        max_x = max_x.max(point[0]);
-        max_y = max_y.max(point[1]);
+    let mut max_delta = 0.0f32;
+    let mut r_sum = 0.0f32;
+    let mut r_cnt = 0.0f32;
+    let mut mean_vx = 0.0f32;
+    let mut mean_vy = 0.0f32;
+    for (original, warped) in contour_source.iter().zip(contour_warped) {
+        let vx = original[0] - anchor[0];
+        let vy = original[1] - anchor[1];
+        let l = vx.hypot(vy);
+        if l > 2.0 {
+            mean_vx += vx / l;
+            mean_vy += vy / l;
+            r_sum += l;
+            r_cnt += 1.0;
+        }
+        max_delta = max_delta.max((warped[0] - original[0]).hypot(warped[1] - original[1]));
     }
-    let x0 = (min_x.floor() as i32 - 5).clamp(0, source.width as i32) as u32;
-    let y0 = (min_y.floor() as i32 - 5).clamp(0, source.height as i32) as u32;
-    let x1 = (max_x.ceil() as i32 + 5).clamp(x0 as i32, source.width as i32) as u32;
-    let y1 = (max_y.ceil() as i32 + 5).clamp(y0 as i32, source.height as i32) as u32;
+    if max_delta < 1e-3 || r_cnt < 1.0 {
+        return Ok(FaceGeometryRun::cpu(None));
+    }
+    let r_scale = (r_sum / r_cnt).max(16.0);
+    let up_len = mean_vx.hypot(mean_vy).max(1e-6);
+    let (crown_ux, crown_uy) = (mean_vx / up_len, mean_vy / up_len);
+
+    // Smooth RBF crown warp with wide bbox padding and gentle displacement scale so
+    // eyebrows/temples remain fixed and bbox boundaries never shear across hair or sky.
+    const SKULL_DISP_SCALE: f32 = 0.26;
+    let sigma = (0.58 * r_scale).max(12.0);
+    let inv_two_sigma2 = 1.0 / (2.0 * sigma * sigma);
+    let support_r = sigma * 2.6;
+
+    let mut nodes = Vec::with_capacity(14);
+    let mut min_x = anchor[0] - support_r;
+    let mut min_y = anchor[1] - support_r;
+    let mut max_x = anchor[0] + support_r;
+    let mut max_y = anchor[1] + support_r;
+    for (original, warped) in contour_source.iter().zip(contour_warped) {
+        let vx = original[0] - anchor[0];
+        let vy = original[1] - anchor[1];
+        if vx.hypot(vy) <= 2.0 {
+            continue;
+        }
+        let dx = (warped[0] - original[0]) * SKULL_DISP_SCALE;
+        let dy = (warped[1] - original[1]) * SKULL_DISP_SCALE;
+        let cx = original[0] + dx * 0.45;
+        let cy = original[1] + dy * 0.45;
+        min_x = min_x.min(cx - support_r);
+        min_y = min_y.min(cy - support_r);
+        max_x = max_x.max(cx + support_r);
+        max_y = max_y.max(cy + support_r);
+        nodes.push([cx, cy, dx, dy]);
+    }
+    if nodes.is_empty() {
+        return Ok(FaceGeometryRun::cpu(None));
+    }
+    let x0 = (min_x.floor() as i32).clamp(0, source.width as i32) as u32;
+    let y0 = (min_y.floor() as i32).clamp(0, source.height as i32) as u32;
+    let x1 = (max_x.ceil() as i32).clamp(x0 as i32, source.width as i32) as u32;
+    let y1 = (max_y.ceil() as i32).clamp(y0 as i32, source.height as i32) as u32;
+    let box_cx = 0.5 * (x0 as f32 + x1 as f32);
+    let box_cy = 0.5 * (y0 as f32 + y1 as f32);
+    let box_hx = (0.5 * (x1 - x0) as f32).max(1.0);
+    let box_hy = (0.5 * (y1 - y0) as f32).max(1.0);
+
     let mut output = source.clone();
     for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        let ny = ((py - box_cy).abs() / box_hy).clamp(0.0, 1.0);
+        let fade_y = if ny > 0.80 {
+            let t = ((ny - 0.80) / 0.20).clamp(0.0, 1.0);
+            1.0 - t * t * (3.0 - 2.0 * t)
+        } else {
+            1.0
+        };
+        if fade_y <= 0.0 {
+            continue;
+        }
         for x in x0..x1 {
-            let pixel = [x as f32 + 0.5, y as f32 + 0.5];
-            let dx = pixel[0] - anchor[0];
-            let dy = pixel[1] - anchor[1];
-            let radius = (dx * dx + dy * dy).sqrt();
-            if radius < 1e-6 {
+            let px = x as f32 + 0.5;
+            let nx = ((px - box_cx).abs() / box_hx).clamp(0.0, 1.0);
+            let fade_x = if nx > 0.80 {
+                let t = ((nx - 0.80) / 0.20).clamp(0.0, 1.0);
+                1.0 - t * t * (3.0 - 2.0 * t)
+            } else {
+                1.0
+            };
+            if fade_x <= 0.0 {
                 continue;
             }
-            let direction = [dx / radius, dy / radius];
-            let mut best = 0usize;
-            let mut best_dot = f32::MIN;
-            for (index, (warped, original)) in contour_warped
-                .iter()
-                .zip(contour_source)
-                .enumerate()
-            {
-                let vx = (warped[0] + original[0]) * 0.5 - anchor[0];
-                let vy = (warped[1] + original[1]) * 0.5 - anchor[1];
-                let norm = (vx * vx + vy * vy).sqrt();
-                let dot = if norm > 1e-6 {
-                    direction[0] * vx / norm + direction[1] * vy / norm
-                } else {
-                    f32::MIN
-                };
-                if dot > best_dot {
-                    best_dot = dot;
-                    best = index;
-                }
+            // Smoothly anchor face below eyebrow/temple level so forehead skin stays natural.
+            let proj = (px - anchor[0]) * crown_ux + (py - anchor[1]) * crown_uy;
+            let elev_t = ((proj + 0.10 * r_scale) / (0.55 * r_scale)).clamp(0.0, 1.0);
+            if elev_t <= 0.0 {
+                continue;
             }
-            let contour_radius = |point: [f32; 2]| {
-                ((point[0] - anchor[0]) * direction[0]
-                    + (point[1] - anchor[1]) * direction[1])
-                    .max(1e-4)
-            };
-            let warped_radius = contour_radius(contour_warped[best]);
-            let source_radius = contour_radius(contour_source[best]);
-            let mapped_radius = radius * source_radius / warped_radius;
-            let sx = anchor[0] + direction[0] * mapped_radius;
-            let sy = anchor[1] + direction[1] * mapped_radius;
+            let elev_fade = elev_t * elev_t * (3.0 - 2.0 * elev_t);
+
+            let mut w_sum = 0.0f32;
+            let mut max_w = 0.0f32;
+            let mut disp_x = 0.0f32;
+            let mut disp_y = 0.0f32;
+            for node in &nodes {
+                let ddx = px - node[0];
+                let ddy = py - node[1];
+                let dist2 = ddx * ddx + ddy * ddy;
+                let w = (-dist2 * inv_two_sigma2).exp();
+                if w > max_w {
+                    max_w = w;
+                }
+                w_sum += w;
+                disp_x += w * node[2];
+                disp_y += w * node[3];
+            }
+            if max_w < 1e-3 || w_sum <= 1e-6 {
+                continue;
+            }
+            let scale = (max_w / w_sum) * elev_fade * fade_x * fade_y;
+            let sx = px - disp_x * scale;
+            let sy = py - disp_y * scale;
             let at = (y as usize * source.width as usize + x as usize) * 4;
             output.pixels[at..at + 4].copy_from_slice(&sample_bilinear(source, sx, sy));
         }
@@ -957,7 +1022,7 @@ fn apply_with_mode(
     if input.job_id == 0 || Some(input.job_id) != job_id {
         return Err(Refusal::ValueOutOfRange("face geometry job ticket"));
     }
-    if region != NormRect::FULL || (input.width, input.height) != (source.width, source.height) {
+    if (input.width, input.height) != (source.width, source.height) {
         return Err(Refusal::ShapeMismatch("face geometry frame/region"));
     }
     if matches!(pf, 30080..=30083) {
@@ -1134,6 +1199,24 @@ fn apply_with_mode(
             },
             232,
         ) => render_skull(source, *anchor, original, warped)?,
+        (
+            FaceGeometry::SmileMesh { dx, dy, mask },
+            8033,
+        ) => {
+            let pixels = smile_warp::pf8033_dense_warp(
+                &source.pixels,
+                source.width,
+                source.height,
+                dx,
+                dy,
+                mask,
+                controls[0],
+            )
+            .map_err(smile_refusal)?;
+            Image::new(source.width, source.height, pixels)
+                .map(|image| FaceGeometryRun::cpu(Some(image)))
+                .ok_or(Refusal::ShapeMismatch("PF8033 output"))?
+        }
         (
             FaceGeometry::Smile {
                 dx,

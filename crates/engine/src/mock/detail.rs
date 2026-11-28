@@ -46,7 +46,6 @@ pub(crate) fn post_process_core_f32(
     scale: f32,
     include_sharpen: bool,
 ) {
-    let _detail = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Detail);
     let w = width as usize;
     let h = height as usize;
     if w == 0 || h == 0 || rgb.len() != w * h {
@@ -733,7 +732,6 @@ fn post_process_impl(
     }
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
 
-    let _detail = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Detail);
     let plan = detail_stage_plan(adj, gpu_enabled);
     if plan.cpu_single_pixel_first {
         stage_single_pixel(rgba, w, h, nr);
@@ -785,10 +783,7 @@ fn post_process_impl(
                 &adj.film_grain,
             ) {
                 // Final frame already downloaded; grain is applied.
-                detail_gpu::ResidentGrain::Applied => {
-                    crate::compute::telemetry::record_decision(true, false);
-                    return;
-                }
+                detail_gpu::ResidentGrain::Applied => return,
                 // Detail is on the host; the tail below runs grain.
                 detail_gpu::ResidentGrain::DetailRestored => resident_gpu = Some(true),
                 // Nothing reached the host: rerun everything on the CPU.
@@ -805,7 +800,6 @@ fn post_process_impl(
         false
     };
 
-    crate::compute::telemetry::record_decision(gpu, false);
     if gpu {
         if plan.cpu_color_nr {
             stage_color_nr(rgba, w, h, nr, scale);

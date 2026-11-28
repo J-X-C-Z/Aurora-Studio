@@ -166,8 +166,7 @@ impl<'a> SourceService<'a> {
             }
             FlightRole::Leader(leader) => leader,
         };
-        let (sensor, file_bytes, route) = raw_admission_inputs(&path);
-        let bytes = decode_admission_bytes((width, height), sensor, format, file_bytes, route.as_ref());
+        let bytes = estimated_decode_bytes(width, height, format);
         let _permit = if heavy {
             let units = decode_units(bytes);
             engine.decode_gates.heavy.acquire(priority, units)
@@ -196,7 +195,6 @@ impl<'a> SourceService<'a> {
         // A RAW keeps libraw's 16-bit linear samples; every other file and any
         // RAW libraw cannot demosaic arrives as 8-bit sRGB.
         // An EIP hides its RAW inside a ZIP; hand every decoder the member.
-        let decode_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Decode);
         let decoded_path = if is_eip(&path) {
             materialize_eip(&engine.root, &path).map_err(|err| format!("{err:#}"))?.raw
         } else {
@@ -267,8 +265,6 @@ impl<'a> SourceService<'a> {
         }
         // BandingSuppression is keyed on ISO and body; the stage stays off when
         // either is missing rather than falling back to a guessed amount.
-        drop(decode_span);
-        let source_build_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::SourceBuild);
         let banding_identity = crate::raw::is_raw(&decoded_path)
             .then(|| crate::exif::read_exif(&decoded_path))
             .map(|exif| raw_banding_identity(&exif));
@@ -295,7 +291,6 @@ impl<'a> SourceService<'a> {
             }
         }
         engine.store_cached_source(image, &path, Arc::clone(&source));
-        drop(source_build_span);
         Ok(source)
         })();
         let _ = match &decoded {
@@ -428,14 +423,6 @@ impl<'a> RenderService<'a> {
                 .find(|entry| entry.info.id == request.image)
                 .map(|entry| entry.path.clone())?
         };
-        // Last settled frame of this exact source/adjustment/size from a previous
-        // session or earlier visit. Placeholder only: the caller installs it
-        // behind the usual generation guard and the real render replaces it.
-        if let Some(disk) = crate::preview_disk::global() {
-            if let Some(frame) = self.disk_placeholder_with(disk, request, &path) {
-                return Some(frame);
-            }
-        }
         if !crate::raw::is_raw(&path) || is_eip(&path) || is_cop(&path) {
             return None;
         }
@@ -522,78 +509,6 @@ impl<'a> RenderService<'a> {
         })
     }
 
-    /// Stored settled frame for `request`, shaped like a progressive first
-    /// frame. `None` unless nothing but the file, adjustments and size were
-    /// asked for: proofing and display conversion are not replayed here.
-    pub(crate) fn disk_placeholder_with(
-        &self,
-        disk: &crate::preview_disk::PreviewDisk,
-        request: &PreviewRequest,
-        path: &std::path::Path,
-    ) -> Option<PreviewFrame> {
-        if request.region != NormRect::FULL
-            || request.proof_profile.is_some()
-            || request.display_profile.is_some()
-        {
-            return None;
-        }
-        let start = Instant::now();
-        let adj = crate::styles::resolve(&request.adjustments);
-        let key = crate::preview_disk::DiskKey::new(
-            path,
-            &adj,
-            request.region,
-            request.max_size,
-            request.bypass,
-            request.mask_overlay,
-            false,
-        )?;
-        let hit = disk.lookup(&key)?;
-        let histogram = crate::processing::statistics::histogram(&hit.rgba);
-        Some(PreviewFrame {
-            image: RgbaImage::new(hit.width, hit.height, hit.rgba),
-            histogram,
-            generation: request.generation,
-            elapsed_ms: start.elapsed().as_secs_f32() * 1000.0,
-            degraded: None,
-            gamut_warning: None,
-            bgra: false,
-            scopes: None,
-        })
-    }
-
-    /// Persists a settled frame for later sessions. Only the exact full-frame,
-    /// final-quality render qualifies; the write runs on a background thread.
-    fn disk_store_final(&self, request: &PreviewRequest, adj: &AdjustmentSet, fast: bool, frame: &CachedFrame) {
-        if fast
-            || request.quality != RenderQuality::Final
-            || request.region != NormRect::FULL
-            || request.mask_overlay.is_some()
-        {
-            return;
-        }
-        let Some(disk) = crate::preview_disk::global() else { return };
-        let path = {
-            let st = self.engine.state.lock();
-            match st.entries.iter().find(|entry| entry.info.id == request.image) {
-                Some(entry) => entry.path.clone(),
-                None => return,
-            }
-        };
-        let Some(key) = crate::preview_disk::DiskKey::new(
-            &path,
-            adj,
-            request.region,
-            request.max_size,
-            request.bypass,
-            request.mask_overlay,
-            false,
-        ) else {
-            return;
-        };
-        crate::preview_disk::store_async(disk, key, frame.width, frame.height, Arc::clone(&frame.pixels));
-    }
-
     pub(crate) fn preview_frame(&self, request: &PreviewRequest, fast: bool) -> anyhow::Result<PreviewFrame> {
         self.preview_frame_scoped(request, fast, crate::scopes::ScopeWants::default())
     }
@@ -618,9 +533,6 @@ impl<'a> RenderService<'a> {
         let jid = engine.preview_jobs.submit(JobScope::Preview, CancelToken::new());
         let _ = engine.preview_jobs.transition(jid, JobState::running(0.0));
         let result = self.preview_frame_inner(request, fast, scopes);
-        if std::env::var_os("AURORA_PERF_REPLAY").is_some() {
-            eprintln!("AURORA_PERF {}", crate::compute::telemetry::perf_json());
-        }
         let _ = match &result {
             Ok(_) => engine.preview_jobs.transition(jid, JobState::Succeeded),
             Err(error) => engine.preview_jobs.transition(jid, JobState::failed(format!("{error:#}"))),
@@ -773,7 +685,7 @@ impl<'a> RenderService<'a> {
                 .proof_profile
                 .as_deref()
                 .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
-            let (image, degraded) = { let _display = crate::compute::telemetry::span(crate::compute::telemetry::Stage::DisplayConversion); engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering) };
+            let (image, degraded) = engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
             let degraded = degraded.or(intent_note);
             let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
             if perf {
@@ -801,13 +713,12 @@ impl<'a> RenderService<'a> {
             histogram: out.histogram.clone(),
         };
         engine.state.lock().preview.insert(key, frame.clone());
-        self.disk_store_final(request, &adj, fast, &frame);
         let source = frame.into_image();
         let gamut_warning = request
             .proof_profile
             .as_deref()
             .and_then(|proof| self.cached_gamut_warning(key, proof, &source));
-        let (image, degraded) = { let _display = crate::compute::telemetry::span(crate::compute::telemetry::Stage::DisplayConversion); engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering) };
+        let (image, degraded) = engine.profiled.lock().converted(profile_key, source, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let degraded = degraded.or(intent_note);
         let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
         if perf {
@@ -1321,7 +1232,7 @@ impl<'a> ExportService<'a> {
         } else {
             (None, (info.width, info.height))
         };
-        let estimated_bytes = estimated_export_bytes_for_recipe(export_dims.0, export_dims.1, &job.recipe);
+        let estimated_bytes = estimated_export_bytes(export_dims.0, export_dims.1, job.recipe.bit_depth);
         // Register the job before spawning so `cancel_job` can reach it without
         // racing the worker. This is where the old gate inserted
         // `JobStatus::Queued`, so a bad recipe or destination still returns

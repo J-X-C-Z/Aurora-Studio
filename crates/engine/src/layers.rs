@@ -319,7 +319,7 @@ impl Default for LumaRange {
 
 // ───────────────────────────── Node graph ─────────────────────────────
 // Data only: see `docs/frontend-contract/node-graph.md`. Engines render the
-// layers in `render_order()`; mixers render through `mix_plan()`.
+// layers in `render_order()`; mixers are not blended yet.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -643,8 +643,8 @@ impl NodeGraph {
         Ok(plan)
     }
 
-    /// A gap is reported and the mixer blends the inputs that are connected; a
-    /// missing input is never guessed.
+    /// Mixers are not clocked yet, so a gap is reported and the renderer keeps
+    /// the serial order; a connected input is never guessed.
     fn mixer_warnings(&self, live: &[u64]) -> Vec<GraphWarning> {
         let mut out = Vec::new();
         for id in live {
@@ -744,164 +744,6 @@ pub fn render_layers(adj: &AdjustmentSet) -> Vec<&Layer> {
             Vec::new()
         }
     }
-}
-
-/// One step of a graph that contains mixers, in evaluation order. A value is
-/// an image keyed by the node that produces it; [`NodeGraph::INPUT`] is the
-/// frame before any layer, and a key nothing has produced yet means that frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MixStep {
-    /// Layers applied in series to the image of `from`; the result is the value
-    /// of `to` (the last node of the run). A layer that is disabled or has no
-    /// opacity passes its input through.
-    Chain { layers: Vec<u64>, from: u64, to: u64 },
-    /// Every branch grades the same image `reference` (the nearest node all
-    /// inputs descend from). `out = I + sum_i (B_i - I)`: each branch's own mask
-    /// and opacity are already inside `B_i`.
-    Parallel { node: u64, reference: u64, inputs: Vec<u64> },
-    /// Inputs stack in ascending input number; the highest is on top.
-    Stack { node: u64, inputs: Vec<StackInput> },
-}
-
-/// One input of a [`MixStep::Stack`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StackInput {
-    /// The node whose image this input carries.
-    pub source: u64,
-    /// The first non-layer node upstream of `source`: the image the layers of
-    /// this input were graded from.
-    pub origin: u64,
-    /// The layers between `origin` and `source`, upstream first. Their combined
-    /// mask coverage is how much of this input replaces the stack below it. An
-    /// empty list is an opaque image.
-    pub layers: Vec<u64>,
-}
-
-/// How a graph with mixers renders. Absent for a purely serial graph, which
-/// keeps rendering as the flat [`render_layers`] list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MixPlan {
-    pub steps: Vec<MixStep>,
-    /// The node that feeds the output.
-    pub output: u64,
-}
-
-impl NodeGraph {
-    /// The evaluation steps for a graph whose output depends on a mixer, or
-    /// `None` when it is purely serial (or has no mixer on the render path).
-    pub fn mix_plan(&self, rows: &[Layer]) -> Result<Option<MixPlan>, GraphError> {
-        let graph = self.repaired(rows);
-        let plan = graph.plan()?;
-        let live = |id: u64| plan.order.contains(&id);
-        let is_mixer = |id: u64| {
-            graph.node(id).is_some_and(|n| matches!(n.kind, NodeKind::Parallel | NodeKind::LayerMixer))
-        };
-        if !plan.order.iter().any(|id| is_mixer(*id)) {
-            return Ok(None);
-        }
-        // A link counts only between live nodes; a dangling or pruned feeder
-        // is the unprocessed frame.
-        let feeder = |to: u64, input: u32| graph.source(to, input).filter(|from| live(*from));
-        let fanout = |id: u64| {
-            graph.links.iter().filter(|l| l.from == id && live(l.to)).count()
-        };
-        let ancestors = |id: u64| {
-            let mut seen = vec![id];
-            let mut stack = vec![id];
-            while let Some(n) = stack.pop() {
-                for l in graph.links.iter().filter(|l| l.to == n && live(l.from)) {
-                    if !seen.contains(&l.from) {
-                        seen.push(l.from);
-                        stack.push(l.from);
-                    }
-                }
-            }
-            seen
-        };
-        let mut steps: Vec<MixStep> = Vec::new();
-        for &id in &plan.order {
-            let Some(node) = graph.node(id) else { continue };
-            match node.kind {
-                NodeKind::Layer => {
-                    let from = feeder(id, 0);
-                    let extend = from.filter(|f| graph.is_layer(*f) && fanout(*f) == 1);
-                    let open = extend.and_then(|f| {
-                        steps.iter().position(
-                            |s| matches!(s, MixStep::Chain { to, .. } if *to == f),
-                        )
-                    });
-                    match open {
-                        Some(at) => {
-                            if let MixStep::Chain { layers, to, .. } = &mut steps[at] {
-                                layers.push(id);
-                                *to = id;
-                            }
-                        }
-                        None => steps.push(MixStep::Chain {
-                            layers: vec![id],
-                            from: from.unwrap_or(Self::INPUT),
-                            to: id,
-                        }),
-                    }
-                }
-                NodeKind::Parallel | NodeKind::LayerMixer => {
-                    let mut inputs: Vec<(u32, u64)> = graph
-                        .links
-                        .iter()
-                        .filter(|l| l.to == id && live(l.from))
-                        .map(|l| (l.input, l.from))
-                        .collect();
-                    inputs.sort_by_key(|(input, _)| *input);
-                    if node.kind == NodeKind::Parallel {
-                        let sources: Vec<u64> = inputs.iter().map(|(_, from)| *from).collect();
-                        // Latest node in evaluation order that every input
-                        // descends from (or is).
-                        let reference = sources
-                            .first()
-                            .map(|first| {
-                                let rest: Vec<Vec<u64>> =
-                                    sources.iter().skip(1).map(|s| ancestors(*s)).collect();
-                                plan.order
-                                    .iter()
-                                    .rev()
-                                    .copied()
-                                    .find(|c| {
-                                        ancestors(*first).contains(c)
-                                            && rest.iter().all(|a| a.contains(c))
-                                    })
-                                    .unwrap_or(Self::INPUT)
-                            })
-                            .unwrap_or(Self::INPUT);
-                        steps.push(MixStep::Parallel { node: id, reference, inputs: sources });
-                    } else {
-                        let stack = inputs
-                            .iter()
-                            .map(|(_, source)| {
-                                let mut layers = Vec::new();
-                                let mut at = *source;
-                                while graph.is_layer(at) {
-                                    layers.push(at);
-                                    at = feeder(at, 0).unwrap_or(Self::INPUT);
-                                }
-                                layers.reverse();
-                                StackInput { source: *source, origin: at, layers }
-                            })
-                            .collect();
-                        steps.push(MixStep::Stack { node: id, inputs: stack });
-                    }
-                }
-                NodeKind::Input | NodeKind::Output => {}
-            }
-        }
-        let output = feeder(Self::OUTPUT, 0).unwrap_or(Self::INPUT);
-        Ok(Some(MixPlan { steps, output }))
-    }
-}
-
-/// [`NodeGraph::mix_plan`] for the render path. `None` means "render the flat
-/// [`render_layers`] list", which is also what a refused graph does.
-pub fn mix_plan(adj: &AdjustmentSet) -> Option<MixPlan> {
-    adj.nodes.as_ref()?.mix_plan(&adj.layers).ok().flatten()
 }
 
 /// What a graph edit makes stale.
@@ -1298,20 +1140,6 @@ mod node_tests {
         let plan = g.plan().unwrap();
         assert_eq!(plan.layers, vec![1, 2]);
         assert!(plan.warnings.contains(&GraphWarning::MissingInput { node: 10, input: 0 }));
-    }
-
-    #[test]
-    fn mix_plan_branches_share_their_common_ancestor() {
-        // 1 feeds branches 2 and 3; the parallel mixer 10 grades 1's image.
-        let g = graph(&[(I, 1, 0), (1, 2, 0), (1, 3, 0), (2, 10, 0), (3, 10, 1), (10, O, 0)], &[1, 2, 3]);
-        let rows = [row(1), row(2), row(3)];
-        let mix = g.mix_plan(&rows).unwrap().unwrap();
-        assert_eq!(mix.output, 10);
-        assert!(mix.steps.contains(&MixStep::Parallel { node: 10, reference: 1, inputs: vec![2, 3] }));
-        assert!(mix.steps.contains(&MixStep::Chain { layers: vec![1], from: I, to: 1 }));
-        // A serial graph has no mix plan.
-        let serial = graph(&[(I, 1, 0), (1, 2, 0), (2, O, 0)], &[1, 2]);
-        assert_eq!(serial.mix_plan(&rows).unwrap(), None);
     }
 
     #[test]

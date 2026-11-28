@@ -66,7 +66,7 @@ const SKIN_SECTIONS: [(&str, &str, &[&str]); 4] = [
     ("Skin tone", "肤色", &["pc:21015", "pc:30096", "pc:90005", "pc:90007", "pc:90004", "pc:21105", "pc:90086"]),
     ("Texture", "质感", &["pc:8068", "pc:8069", "pc:8070"]),
     ("Smoothing & Neutral Grey", "磨皮与中性灰", &["pc:30021", "pc:30022", "pc:90002", "pc:90010", "pc:30013", "pc:30014"]),
-    ("Wrinkles", "祛皱", &["pc:90023", "pc:90024", "pc:21024", "pc:21025", "pc:21069", "pc:21070", "pc:21071"]),
+    ("Wrinkles", "祛皱", &["pc:90023", "pc:90024", "pc:21024", "pc:21025", "pc:21069", "pc:21070", "pc:21071", "pc:90015"]),
 ];
 
 /// How the live makeup sliders are grouped in their panel.
@@ -74,7 +74,7 @@ const MAKEUP_SECTIONS: [(&str, &str, &[&str]); 5] = [
     ("Stereo contour", "立体修容", &["pc:8", "pc:9"]),
     ("Brows & Eyes", "眉眼妆", &["pc:100", "pc:117", "pc:30007", "pc:103", "pc:105", "pc:118", "pc:111"]),
     ("Blusher & Contour", "腮红与修容", &["pc:106", "pc:116"]),
-    ("Lips", "唇妆", &["pc:107", "pc:90032", "pc:90021"]),
+    ("Lips", "唇妆", &["pc:107", "pc:90021"]),
     ("Sticker", "贴纸", &["pc:115"]),
 ];
 
@@ -128,12 +128,12 @@ const WIRED_SKIN_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:21069", "Cheek wrinkles", "祛面颊纹", 0.0),
     ("pc:21070", "Nose back wrinkles", "祛鼻背纹", 0.0),
     ("pc:21071", "Perioral wrinkles", "祛口周纹", 0.0),
+    ("pc:90015", "Neck lines", "祛颈纹", 0.0),
 ];
 
 /// Expression management effects wired to same-job smile warp (`assets/portrait/smile/`).
 const WIRED_EXPRESSION_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:8033", "Smile mouth corner", "微笑嘴角", 0.0),
-    ("pc:100007", "Open-mouth smile", "张嘴微笑", 0.0),
 ];
 
 /// Makeup effects wired to `B3_MAKEUP_ROWS` (`attach_makeup_bundle`) and `PF90021`.
@@ -142,7 +142,7 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:9", "Stereo highlight", "立体高光", 0.0),
     ("pc:100", "Eyebrow (L)", "眉妆（左）", 0.0),
     ("pc:117", "Eyebrow (R)", "眉妆（右）", 0.0),
-    ("pc:30007", "Eyeshadow", "眼影", 0.0),
+    ("pc:30007", "Lower eyeliner", "下眼线", 0.0),
     ("pc:103", "Upper eyeliner", "上眼线", 0.0),
     ("pc:105", "Upper eyelash", "上睫毛", 0.0),
     ("pc:118", "Lower eyelash", "下睫毛", 0.0),
@@ -150,7 +150,6 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:106", "Blusher", "腮红", 0.0),
     ("pc:116", "Contour", "修容", 0.0),
     ("pc:107", "Lipstick", "口红", 0.0),
-    ("pc:90032", "Lip gloss", "唇彩", 0.0),
     ("pc:90021", "Lip makeup enhance", "唇妆增强", 0.5),
     ("pc:115", "Face decoration", "面部贴纸", 0.0),
 ];
@@ -159,15 +158,12 @@ const WIRED_MAKEUP_EFFECTS: &[(&str, &str, &str, f32)] = &[
 const WIRED_EYES_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:100004", "Red blood removal", "去红血丝", 0.0),
     ("pc:101", "Silkworm", "卧蚕", 0.0),
-    ("pc:90130", "Glasses glare removal", "祛眼镜反光", 0.0),
+    ("pc:90032", "Eye makeup", "眼妆", 0.0),
 ];
 
 /// Hair effects wired to FaceParsingV2 / same-job producer inputs.
 const WIRED_HAIR_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:30009", "Hair color unify", "统一发色", 0.0),
-    ("pc:90088", "Stray hair removal", "祛碎发", 0.0),
-    ("pc:90139", "Hair smooth", "头发柔顺", 0.0),
-    ("pc:90160", "Hair gloss", "头发光泽", 0.0),
 ];
 
 /// Teeth effects wired to canonical FaceParsingV2 (`fbe.onnx`) on CUDA.
@@ -175,63 +171,6 @@ const WIRED_TEETH_EFFECTS: &[(&str, &str, &str, f32)] = &[
     ("pc:108", "Teeth whitening", "美牙/牙齿美白", 0.0),
     ("pc:109", "Teeth brightness", "牙齿亮白", 0.0),
     ("pc:110", "Teeth de-yellow", "牙齿去黄", 0.0),
-    ("pc:30025", "Tooth repair", "牙齿修复", 0.0),
-    ("pc:30026", "Teeth alignment", "牙齿矫正", 0.0),
-];
-
-/// Blemish / repair effects wired to same-frame model outputs (`repair_stage`,
-/// beard and eye-bag kernels). Values are 0..=1 in `AdjustmentSet::extra`.
-const WIRED_BLEMISH_EFFECTS: &[(&str, &str, &str, f32)] = &[
-    ("pc:21026", "Stubble removal", "祛胡须", 0.0),
-    ("pc:90116", "Eye bag removal", "祛眼袋", 0.0),
-    ("pc:90034", "Double chin", "祛双下巴", 0.0),
-];
-
-/// An effect the capability table still marks unavailable or whose native
-/// producer is blocked. It renders as a disabled row that names the missing
-/// input; it is never counted as live and cannot store a value.
-struct DisabledEffect {
-    key: &'static str,
-    en: &'static str,
-    zh: &'static str,
-    /// Stored-unit default (0..=1); shown as 0..=100.
-    default: f32,
-    reason_en: &'static str,
-    reason_zh: &'static str,
-}
-
-/// PF90085 `skinToneUnifyFace` is blocked: the kernel exists but no native
-/// preset/parameter generator or GammaMap/sRGB matrices were recovered, and
-/// `portrait_historical_skin` rejects it in `open_reason`.
-const DISABLED_SKIN_EFFECTS: &[DisabledEffect] = &[DisabledEffect {
-    key: "pc:90085",
-    en: "Skin tone unify (face)",
-    zh: "肤色统一（面部）",
-    default: 0.0,
-    reason_en: "Blocked: no native preset/parameter generator, GammaMap or sRGB/ProPhoto matrices; the kernel has no drive values",
-    reason_zh: "已阻塞：缺原厂预设/参数生成器、GammaMap 与 sRGB/ProPhoto 矩阵，内核没有可驱动参数",
-}];
-
-/// PF30188/30189 are only typed producers; the double-chin model output, ROI
-/// writeback and shadow compositing are still open. PF90034 itself is routed
-/// through `repair_stage` and is the enabled control in the blemish panel.
-const DISABLED_BLEMISH_EFFECTS: &[DisabledEffect] = &[
-    DisabledEffect {
-        key: "pc:30188",
-        en: "Double chin — degree",
-        zh: "祛双下巴-程度",
-        default: 0.9,
-        reason_en: "Needs the same-job double-chin model output and ROI writeback; the control-specific model field is not recovered",
-        reason_zh: "缺同 job 双下巴模型输出与 ROI 回写；控件对应的模型字段尚未恢复",
-    },
-    DisabledEffect {
-        key: "pc:30189",
-        en: "Double chin — shadow",
-        zh: "祛双下巴-阴影",
-        default: 0.8,
-        reason_en: "Needs the same-job double-chin shadow output and final compositing; not recovered",
-        reason_zh: "缺同 job 双下巴阴影输出与最终合成；尚未恢复",
-    },
 ];
 
 /// Face geometry reshape effects wired to real 194->414 landmarks + CUDA mesh raster.
@@ -383,7 +322,6 @@ pub(crate) fn has_live_portrait_effect(adjustments: &aurora_engine::AdjustmentSe
             .chain(WIRED_EYES_EFFECTS)
             .chain(WIRED_MAKEUP_EFFECTS)
             .chain(WIRED_HAIR_EFFECTS)
-            .chain(WIRED_BLEMISH_EFFECTS)
             .any(|(key, _, _, neutral)| {
                 adjustments.extra.get(*key).is_some_and(|amount| (amount - neutral).abs() > 1.0e-6)
             })
@@ -432,43 +370,6 @@ fn live_portrait_backing_excludes_neutral_values() {
     adjustments.extra.remove("pc:30210");
     adjustments.extra.insert("pc:90023".into(), 0.3);
     assert!(has_live_portrait_effect(&adjustments));
-    adjustments.extra.remove("pc:90023");
-    adjustments.extra.insert("pc:90088".into(), 0.4);
-    assert!(has_live_portrait_effect(&adjustments));
-}
-
-#[cfg(test)]
-#[test]
-fn amount_sliders_store_0_to_1_and_start_neutral() {
-    for (key, _, _, default) in WIRED_BLEMISH_EFFECTS
-        .iter()
-        .chain(WIRED_HAIR_EFFECTS)
-        .chain(WIRED_TEETH_EFFECTS)
-        .chain(WIRED_EYES_EFFECTS)
-        .chain(WIRED_EXPRESSION_EFFECTS)
-    {
-        let id: u32 = key.strip_prefix("pc:").and_then(|id| id.parse().ok()).unwrap_or_else(|| panic!("{key} is not a pf id"));
-        assert!(*default >= 0.0 && *default <= 1.0, "{key} default {default} outside 0..=1");
-        // PF109/PF110 are brightness/de-yellow sub-controls folded into the
-        // PF108 teeth producer, so they have no dispatcher row of their own.
-        if !matches!(id, 109 | 110) {
-            assert!(aurora_engine::is_bridged_effect(id), "PF{id} has a slider but no engine route");
-        }
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn disabled_effects_never_count_as_live() {
-    for effect in DISABLED_SKIN_EFFECTS.iter().chain(DISABLED_BLEMISH_EFFECTS) {
-        assert!(!has_live_portrait_effect(&{
-            let mut a = aurora_engine::AdjustmentSet::default();
-            a.extra.insert(effect.key.into(), 0.5);
-            a
-        }), "{} must not be wired", effect.key);
-        let id: u32 = effect.key.strip_prefix("pc:").and_then(|id| id.parse().ok()).expect("pf id");
-        assert!(!aurora_engine::is_bridged_effect(id), "PF{id} is routed; it must not be listed as disabled");
-    }
 }
 
 /// Catalogue bands must not duplicate a control that already has a dedicated
@@ -483,8 +384,6 @@ fn is_wired_key(key: &str) -> bool {
         || WIRED_FACE_GEOMETRY_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_FACE_SINGLE_EFFECTS.iter().any(|row| row.0 == key)
         || WIRED_PLUMP_EFFECTS.iter().any(|row| row.0 == key)
-        || WIRED_BLEMISH_EFFECTS.iter().any(|row| row.0 == key)
-        || DISABLED_SKIN_EFFECTS.iter().chain(DISABLED_BLEMISH_EFFECTS).any(|row| row.key == key)
 }
 
 // ─────────────────────── 行原语：能力门控 ───────────────────────
@@ -1408,4 +1307,7 @@ fn pf90032_lives_in_eyes_eye_makeup_not_in_lips() {
     assert_eq!(group_of(30007), "pc-makeup");
     assert_eq!(group_of(30096), "pc-skin");
     assert!(is_long_tail("pc-hands") && !is_long_tail("pc-body"));
+    assert!(WIRED_MAKEUP_EFFECTS.contains(&("pc:30007", "Lower eyeliner", "下眼线", 0.0)));
+    assert!(!WIRED_MAKEUP_EFFECTS.iter().any(|e| e.0 == "pc:90032"));
+    assert!(WIRED_EYES_EFFECTS.contains(&("pc:90032", "Eye makeup", "眼妆", 0.0)));
 }

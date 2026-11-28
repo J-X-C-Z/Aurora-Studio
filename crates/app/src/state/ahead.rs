@@ -50,7 +50,7 @@ impl AppState {
                         Err(err) => {
                             log::warn!("style import: {err:#}");
                             let reason = match StyleImportErrorKind::of(&err) {
-                                StyleImportErrorKind::NotAStyle => t("the file is not a Capture One style or Lightroom .xmp preset", "文件不是 Capture One 风格或 Lightroom .xmp 预设"),
+                                StyleImportErrorKind::NotAStyle => t("the file is not a Capture One style", "文件不是 Capture One 风格"),
                                 StyleImportErrorKind::Io => t("the file could not be read", "文件无法读取"),
                                 StyleImportErrorKind::Unsupported => t("the style uses unsupported settings", "该风格包含不支持的设置"),
                                 StyleImportErrorKind::Other => t("see the log for details", "详情见日志"),

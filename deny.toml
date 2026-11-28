@@ -10,7 +10,10 @@
 # cannot be satisfied without them.
 
 [graph]
-targets = ["x86_64-pc-windows-msvc"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
@@ -19,6 +22,9 @@ ignore = []
 
 [licenses]
 confidence-threshold = 0.9
+# Target-specific crates (Windows vs macOS) may leave some allowed licenses
+# unused on a single host; allow unused entries rather than failing cross-OS.
+unused-allowed-license = "allow"
 allow = [
     "0BSD",
     "Apache-2.0",

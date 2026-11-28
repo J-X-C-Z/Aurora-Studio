@@ -78,12 +78,10 @@ test result: ok. 11 passed; 0 failed
 **当前已知例外（生产代码，TODO）**——`FileEngine` 的具体构造：
 
 - `crates/app/src/state/source.rs:7` `use aurora_engine::{FileEngine, ImageEngine, MockEngine};`
-- `crates/app/src/state/source.rs:51` `FileEngine::open_catalog(path)?`（按扩展名分派 C1 / `.lrcat`）
+- `crates/app/src/state/source.rs:51` `FileEngine::open_c1_catalog(path)?`
 - `crates/app/src/state/source.rs:53` `FileEngine::open(path)?`
-- `crates/app/src/state/source.rs:117` `FileEngine::create_session(path, name)?`
-- `crates/app/src/state/source.rs:122` `FileEngine::create_catalog(path, name)?`
 
-这五处构造后立即擦除为 `Arc<dyn ImageEngine>`，后续处理仍走 trait；但按规则字面
+这三处构造后立即擦除为 `Arc<dyn ImageEngine>`，后续处理仍走 trait；但按规则字面
 仍是直接引用。TODO：在 `aurora_engine` 内提供工厂（例如 `open_source(path) ->
 Box<dyn ImageEngine>`），把具体类型收回引擎。
 
@@ -92,7 +90,7 @@ Box<dyn ImageEngine>`），把具体类型收回引擎。
 - `crates/app/src/state/mod.rs:2986` 与 `:2993`，位于
   `#[cfg(test)] mod import_edits_tests`；测试需要真实 `FileEngine` 落盘。
 
-例外按“文件 + 词 + 出现次数”钉住（`source.rs` 5 次、`state/mod.rs` 2 次），
+例外按“文件 + 词 + 出现次数”钉住（`source.rs` 3 次、`state/mod.rs` 2 次），
 而不是按行号。原因：app crate 由其他 lane 并行编辑，行号会漂移；但**新增**一次
 `FileEngine` 会改变计数并立即失败。文档记录当前行号供人工审阅。
 

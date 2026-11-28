@@ -8,13 +8,6 @@
 //!   tasks are merged and promoted to the highest requested priority and halo.
 //! - Overlap/halo tile decomposition (`split_tiles_with_halo`) and lossless
 //!   reassembly (`stitch_tiles`) for spatial filters (blur/convolution).
-//!
-//! Status: compiled and unit-tested, **not wired into a render path**. Rendering
-//! today walks `SAMPLE_TILE`-row bands inside one `render_sized` call
-//! (`mock/process.rs`) and shares sampled tiles through its tile cache; there is
-//! no per-tile render job, halo re-render or tile-level cancellation call site
-//! that this scheduler could replace without changing the sampling grid or the
-//! pixels. Wiring it needs a tile-granular render entry point first.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

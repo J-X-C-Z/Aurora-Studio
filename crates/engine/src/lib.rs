@@ -19,7 +19,10 @@ mod c1catalog;
 mod c1import;
 mod c1_masks;
 pub mod c1_banding;
-pub mod banding_camera_rules;
+pub mod dng_write;
+pub mod gpu_crossplatform;
+pub mod platform_dispatch;
+pub mod psd_write;
 pub mod c1_cos;
 pub mod c1_eip;
 pub mod c1_writeback;
@@ -51,18 +54,12 @@ mod closedeyes;
 /// Stable pixel/compute contracts shared by CPU, CUDA and Metal adapters.
 pub mod contracts;
 /// Translation from the in-crate GPU runtime vocabulary to `contracts`.
-/// `mock::gpu_runtime`'s full vocabulary only exists on Windows.
-#[cfg(windows)]
 mod compute_bridge;
 /// Persistent edit document versus per-job runtime inputs.
 pub mod document;
 mod engine;
 /// Unified job lifecycle: scoped id, state, cancellation and receipts.
 pub mod job_lifecycle;
-/// Cross-platform GPU compute: CPU oracle plus portable wgpu path.
-pub mod gpu_crossplatform;
-/// Backend availability probe and strict/auto dispatch across platforms.
-pub mod platform_dispatch;
 /// Stages migrated out of `mock` (with compatibility re-exports).
 pub mod processing;
 /// Production render pipeline facade and `RenderPlan` execution bridge.
@@ -83,10 +80,6 @@ mod filmcurve;
 pub mod face_parsing;
 mod heif;
 mod heif_write;
-mod dng_write;
-mod psd_write;
-mod xmp_preset;
-mod lrcat_import;
 mod highlight;
 pub mod hdr;
 pub mod pano;
@@ -123,17 +116,6 @@ pub mod compute_cost;
 pub fn prewarm_gpu() {
     #[cfg(windows)]
     if aurora_portrait::native_infer::backend::BackendRequest::from_env().is_ok_and(|r|r.permits(aurora_portrait::native_infer::backend::BackendKind::Cuda)){mock::prewarm_gpu();}
-}
-
-/// Preloads portrait face detection/mesh/landmark ONNX sessions in the background
-/// so the first interactive portrait slider drag avoids model-open latency.
-pub fn prewarm_face_input() {
-    if let Err(err) = FaceInputSession::open_from_env(false) {
-        log::debug!("face input session prewarm skipped: {err:?}");
-    }
-    if let Err(err) = FaceInputSession::open_from_env(true) {
-        log::debug!("face parsing session prewarm skipped: {err:?}");
-    }
 }
 
 pub mod mask_store;
@@ -301,11 +283,8 @@ pub use portrait_makeup_bundle::*;
 pub use portrait_makeup_provider::*;
 mod param_meta;
 mod preview_cache;
-#[allow(dead_code)] // stats/invalidate/cleanup are API for later wiring; put/get are used via preview_disk
-mod disk_preview_cache;
-mod preview_disk;
-#[allow(dead_code)] // no tile-based render call site exists yet; see module docs
-mod tile_scheduler;
+pub mod disk_preview_cache;
+pub mod tile_scheduler;
 mod presets;
 pub mod raw;
 pub mod aurora_raw;
@@ -333,7 +312,6 @@ pub mod icc;
 pub mod camera_profile;
 pub mod ai_denoise;
 pub mod aimask;
-pub(crate) mod bundled_resources;
 pub mod dustdetect;
 pub mod beautymarks;
 pub mod autorotate;
@@ -412,4 +390,7 @@ pub use store::{Catalog, Entry, Store, StoreError, write_atomic};
 pub use styles::*;
 pub use tether::*;
 pub use xmp::XmpMeta;
+pub mod lcp_lens;
+pub mod xmp_preset;
+pub mod lrcat_import;
 

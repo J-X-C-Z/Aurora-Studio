@@ -23,7 +23,6 @@
 - `portrait_stage.rs`：Mac-A 只加类型注解；功能改动归 Mac-F。
 - `mock/mod.rs`：Mac-A 收口 GPU 模块；Mac-C 新增 Metal 模块时先在本表登记。
 - 所有新增 macOS 代码必须在 Windows 上仍能编译（`cfg(target_os = "macos")` 隔离）。
-- 登记：主控在整合轮中给 `icc.rs` 增加了 macOS ColorSync 目录搜索（`system_profile_dirs`，`cfg(target_os = "macos")`），并让 `recipe::resolve_profile` 的描述匹配也扫描系统目录；后续 macOS 色彩改动仍归 Mac-D。
 
 ## 禁止
 

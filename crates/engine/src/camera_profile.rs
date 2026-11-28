@@ -164,7 +164,14 @@ fn catalog() -> Option<&'static Catalog> {
 /// `$AURORA_CORECONFIG`, else the Capture One install, else the crate's
 /// `testdata` copy (which is what `cargo test` runs against).
 fn core_config_path() -> PathBuf {
-    crate::bundled_resources::core_config_path()
+    if let Some(path) = std::env::var_os("AURORA_CORECONFIG") {
+        return PathBuf::from(path);
+    }
+    let install = PathBuf::from(r"C:\Program Files\Capture One\Capture One\coreConfig.cdx");
+    if install.is_file() {
+        return install;
+    }
+    PathBuf::from("testdata/coreConfig.cdx")
 }
 
 fn parse_catalog(xml: &str) -> Catalog {
@@ -252,7 +259,6 @@ mod tests {
     use crate::adjust::AdjustmentSet;
 
     #[test]
-    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn maps_known_cameras() {
         assert_eq!(for_camera("NIKON Z6_3").as_deref(), Some("NikonZ6III-ProStandard"));
         assert_eq!(for_camera("NIKON Z 7_2").as_deref(), Some("NikonZ7II-ProStandard"));
@@ -434,7 +440,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn real_icm_parses_as_mft2_lut() {
         let profile = crate::icc::profile("NikonZ6III-ProStandard").expect("profile must load");
         assert_eq!(&profile.data_space, b"RGB ");
@@ -446,7 +451,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn lut_conversion_is_monotone_in_l() {
         let profile = crate::icc::profile("NikonZ6III-ProStandard").expect("profile must load");
         let mut prev_l = f32::MIN;

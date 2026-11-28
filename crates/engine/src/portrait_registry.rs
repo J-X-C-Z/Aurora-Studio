@@ -49,8 +49,12 @@ pub enum EffectCategory {
     Teeth,
     Eyes,
     Hair,
-    Body,
     Makeup,
+    /// Body / hands / feet reshaping and body-detail retouch.
+    ///
+    /// The geometry producers are owned outside this module; the category only
+    /// describes where the control belongs.
+    Body,
 }
 
 impl EffectCategory {
@@ -63,8 +67,8 @@ impl EffectCategory {
         Self::Teeth,
         Self::Eyes,
         Self::Hair,
-        Self::Body,
         Self::Makeup,
+        Self::Body,
     ];
 
     pub const fn display_name_en(self) -> &'static str {
@@ -76,8 +80,8 @@ impl EffectCategory {
             Self::Teeth => "Teeth",
             Self::Eyes => "Eyes",
             Self::Hair => "Hair",
-            Self::Body => "Body Reshape",
             Self::Makeup => "Makeup",
+            Self::Body => "Body Reshape",
         }
     }
 
@@ -90,8 +94,8 @@ impl EffectCategory {
             Self::Teeth => "牙齿美化",
             Self::Eyes => "眼睛增强",
             Self::Hair => "头发调整",
-            Self::Body => "全身美型",
             Self::Makeup => "妆容调整",
+            Self::Body => "全身美型",
         }
     }
 }

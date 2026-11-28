@@ -8,8 +8,6 @@
 
 use crate::{Access, EffectMeta, Image, Refusal};
 
-use super::eye_geometry;
-
 const INV255: f32 = 1.0 / 255.0;
 
 /// Registry rows for this lane. `mod.rs` is owned by the integration lane, so
@@ -41,7 +39,7 @@ pub const META: &[EffectMeta] = &[
     EffectMeta { pf: 90087, key: "hairPartFill", label: "Hair seam fill", access: Access::Cpu, inputs: &["PF90087_PART_DEGREE_MAP", "PF90087_PART_LINE_MASK", "PF90087_HAIR_MASK", "PF90087_REPAIR_RGB", "PF90087_REPAIR_MASK"] },
     EffectMeta { pf: 90130, key: "glassesGlareRemoval", label: "Glasses glare removal", access: Access::Cpu, inputs: &["network mask", "effect RGB", "lens mask"] },
     EffectMeta { pf: 100004, key: "redBloodRemoval", label: "Eye red blood removal", access: Access::Cpu, inputs: &["model RGB", "model alpha"] },
-    EffectMeta { pf: 100005, key: "eyeWhitePurify", label: "Eye white purify", access: Access::Cpu, inputs: &["source RGBA", "8 CV_32FC1 model planes", "group A/B enable flags", "ui", "model/frame SHA-256", "handler-to-layer receipt"] },
+    EffectMeta { pf: 100005, key: "eyeWhitePurify", label: "Eye white purify", access: Access::Refused, inputs: &["eye mask", "8-channel model output", "vendor pixel law (open)"] },
 ];
 
 fn checked_pixels(image: &Image, name: &'static str) -> Result<usize, Refusal> {
@@ -2017,161 +2015,6 @@ pub fn eye_white_planes_mix(
     eye_white_mix(source, &effect_rgb, &mask, mixer)
 }
 
-/// PF100005 `0x81A1D50` mask stream: `maskA = ch3`, `maskB = ch7`, converted
-/// with OpenCV `convertTo(CV_8U, alpha=1.0, beta=0)` (round-to-nearest-even),
-/// then `cv::max(maskA, maskB)` when both groups are enabled. One mask is
-/// passed through unchanged when only its group is enabled. The result is a
-/// byte mask suitable for `cv::boundingRect` and for `eye_white_mix`.
-pub fn eye_white_active_mask(
-    model_planes: &[&[f32]; 8],
-    group_a: bool,
-    group_b: bool,
-) -> Result<Vec<u8>, Refusal> {
-    if !group_a && !group_b {
-        return Err(Refusal::MissingInput("PF100005_NO_ENABLED_GROUP"));
-    }
-    if model_planes.iter().any(|plane| plane.is_empty()) {
-        return Err(Refusal::MissingInput("PF100005_AI_RESULT_PLANES"));
-    }
-    if model_planes[3].len() != model_planes[7].len() {
-        return Err(Refusal::ShapeMismatch("model_planes8_mask"));
-    }
-    if model_planes[3]
-        .iter()
-        .chain(model_planes[7].iter())
-        .any(|value| !value.is_finite())
-    {
-        return Err(Refusal::ValueOutOfRange("model_planes8"));
-    }
-    let mask_a: Vec<u8> = model_planes[3].iter().copied().map(cv_convert_to_u8).collect();
-    let mask_b: Vec<u8> = model_planes[7].iter().copied().map(cv_convert_to_u8).collect();
-    Ok(match (group_a, group_b) {
-        (true, true) => mask_a
-            .iter()
-            .zip(mask_b.iter())
-            .map(|(&a, &b)| a.max(b))
-            .collect(),
-        (true, false) => mask_a,
-        (false, true) => mask_b,
-        (false, false) => unreachable!(),
-    })
-}
-
-/// Inclusive `cv::boundingRect` equivalent over nonzero 8-bit mask pixels.
-/// `None` means an empty active mask (no pixels to process); callers must not
-/// turn that into a full-frame operation.
-pub fn eye_white_bounding_rect(mask: &[u8], width: u32, height: u32) -> Result<Option<Rect>, Refusal> {
-    if width == 0 || height == 0 {
-        return Err(Refusal::ShapeMismatch("mask_size"));
-    }
-    let expected = (width as usize).checked_mul(height as usize);
-    if expected != Some(mask.len()) {
-        return Err(Refusal::ShapeMismatch("mask"));
-    }
-    let mut min_x = usize::MAX;
-    let mut min_y = usize::MAX;
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    for (i, &value) in mask.iter().enumerate() {
-        if value == 0 {
-            continue;
-        }
-        let x = i % width as usize;
-        let y = i / width as usize;
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-    if min_x == usize::MAX {
-        return Ok(None);
-    }
-    Ok(Some(Rect {
-        x: min_x as i32,
-        y: min_y as i32,
-        width: (max_x - min_x + 1) as i32,
-        height: (max_y - min_y + 1) as i32,
-    }))
-}
-
-/// PF100005 consumer entry with the recovered same-job planes. `group_a` /
-/// `group_b` correspond to the handler flags at `+0x29` / `+0x2A`; `_mixer`
-/// names the two recovered discriminator variants for the eventual wired
-/// path. Only the statically proven 3+1 plane grouping, `cv::max` mask merge
-/// and `boundingRect` run here. The final vendor RGB/source blend, the
-/// per-group UI-to-flag binding and the handler-to-layer receipt remain
-/// LIVE_ONLY and are named explicitly rather than approximated.
-pub fn eye_white_purify_planes(
-    source: &Image,
-    model_planes: &[&[f32]; 8],
-    group_a: bool,
-    group_b: bool,
-    _mixer: EyeWhiteMixer,
-) -> Result<Image, Refusal> {
-    let pixels = checked_pixels(source, "source")?;
-    if model_planes.iter().any(|plane| plane.len() != pixels) {
-        return Err(Refusal::ShapeMismatch("model_planes8"));
-    }
-    if model_planes
-        .iter()
-        .flat_map(|plane| plane.iter())
-        .any(|value| !value.is_finite())
-    {
-        return Err(Refusal::ValueOutOfRange("model_planes8"));
-    }
-    let active = eye_white_active_mask(model_planes, group_a, group_b)?;
-    let _roi = eye_white_bounding_rect(&active, source.width, source.height)?;
-    // The consumer's final RGB/source composition is not in the statically
-    // decoded function. Refuse before mutating pixels unless the caller has
-    // supplied the proven tail contract (handled by `eye_white_planes_mix`).
-    Err(Refusal::MissingInput("PF100005_FINAL_GROUP_BLEND"))
-}
-
-/// Typed minimum input set for the full PF100005 effect. No local model,
-/// tensor blob or handler receipt is available in this repository, so a
-/// caller that cannot supply all named fields gets a fail-closed refusal.
-pub struct EyeWhiteSameJobInputs<'a> {
-    pub source: &'a Image,
-    pub model_planes: Option<&'a [&'a [f32]; 8]>,
-    pub group_a: Option<bool>,
-    pub group_b: Option<bool>,
-    pub ui: Option<f32>,
-    pub model_sha256: Option<&'a [u8; 32]>,
-    pub frame_sha256: Option<&'a [u8; 32]>,
-    pub receipt: Option<&'a str>,
-}
-
-pub fn eye_white_purify_same_job(inputs: EyeWhiteSameJobInputs<'_>) -> Result<Image, Refusal> {
-    let source = inputs.source;
-    checked_pixels(source, "source")?;
-    let ui = inputs.ui.ok_or(Refusal::MissingInput("PF100005_UI"))?;
-    if !ui.is_finite() || ui < 0.0 || ui > 100.0 {
-        return Err(Refusal::ValueOutOfRange("ui"));
-    }
-    if ui == 0.0 {
-        return Ok(source.clone());
-    }
-    if inputs.model_sha256.is_none() {
-        return Err(Refusal::MissingInput("PF100005_MODEL_SHA256"));
-    }
-    if inputs.frame_sha256.is_none() {
-        return Err(Refusal::MissingInput("PF100005_FRAME_SHA256"));
-    }
-    if inputs.receipt.is_none() {
-        return Err(Refusal::MissingInput("PF100005_HANDLER_LAYER_RECEIPT"));
-    }
-    let group_a = inputs.group_a.ok_or(Refusal::MissingInput("PF100005_GROUP_A_FLAG"))?;
-    let group_b = inputs.group_b.ok_or(Refusal::MissingInput("PF100005_GROUP_B_FLAG"))?;
-    let planes = inputs
-        .model_planes
-        .ok_or(Refusal::MissingInput("PF100005_AI_RESULT_PLANES"))?;
-    eye_white_purify_planes(source, planes, group_a, group_b, EyeWhiteMixer::Fast256)
-}
-
-/// Legacy scalar-only entry. The eight f32 samples are a 4+4 split of the
-/// model head, not eight complete model planes, so a nonzero UI cannot be
-/// composed here. Use `eye_white_purify_planes` with the same-job planes or
-/// `eye_white_purify_same_job` for the typed full contract.
 pub fn eye_white_purify(
     source: &Image,
     roi: Rect,
@@ -2185,26 +2028,14 @@ pub fn eye_white_purify(
     }
     let roi_pixels = roi.width as usize * roi.height as usize;
     check_plane(roi_mask.len(), roi_pixels, "roi_mask")?;
-    if !roi_mask.iter().all(|&value| value <= 1) {
-        return Err(Refusal::ValueOutOfRange("roi_mask"));
-    }
-    if model_output8.len() != 8 {
-        return Err(Refusal::ShapeMismatch("model_output8"));
-    }
-    if !model_output8.iter().all(|value| value.is_finite()) {
-        return Err(Refusal::ValueOutOfRange("model_output8"));
-    }
+    eye_white_split8(model_output8)?;
     if !ui.is_finite() || ui < 0.0 || ui > 100.0 {
         return Err(Refusal::ValueOutOfRange("ui"));
     }
     if ui == 0.0 {
         return Ok(source.clone());
     }
-    // The 8 scalar samples carry no per-plane dimensions, group-enable flags
-    // or handler-to-layer receipt. Do not fabricate two 3+1 plane groups from
-    // them: the packed-f32 blob is 8*H*W samples, and neither the signed mask
-    // nor its final visual alpha is derivable from these eight values.
-    Err(Refusal::MissingInput("PF100005_AI_RESULT_PLANES"))
+    Err(Refusal::NotImplemented(100005))
 }
 
 // ---------------------------------------------------------------------------
@@ -3220,207 +3051,6 @@ pub fn hair_line(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Rows 23/24 - PF44124/PF48019/PF49221/PF41922 Type1018 144-vertex mesh.
-// The four UI sliders are vendor `ControlIndex` 0=head-left (PF44124),
-// 1=head-right (PF48019), 2=tail-left (PF49221), 3=tail-right (PF41922).
-// Each slider addresses exactly one independent 144-vertex consumer; no
-// 102-point synthetic ring replaces the recovered consumer.
-// ---------------------------------------------------------------------------
-
-const BROW_LENGTH_UI_COUNT: usize = 4;
-pub const BROW_LENGTH_MESH_VERTICES: usize = 144;
-pub const BROW_LENGTH_EBO_INDEX_COUNT: usize = 498;
-
-/// Same-job inputs for the four-way brow length draw.
-///
-/// `ui01` is the vendor ControlIndex order. `mesh` is 6 windows x 24 vertices
-/// in framebuffer coordinates, `coeffs` are the three 24-float arrays
-/// `C1/C2/C3`, and `ebo` is the captured ordered Type1018 `0x7080940` index
-/// buffer. Missing or misshapen inputs are refused; nothing is synthesised.
-#[derive(Clone, Debug)]
-pub struct BrowLengthFourWayInputs<'a> {
-    pub ui01: [f32; BROW_LENGTH_UI_COUNT],
-    pub landmarks: &'a [[f32; 2]],
-    /// Six 24-point windows (144 points) in vendor framebuffer coordinates.
-    pub mesh: &'a [eye_geometry::Point],
-    /// Three 24-float coefficient arrays `C1/C2/C3`.
-    pub coeffs: [&'a [f32]; 3],
-    /// Captured Type1018 `0x7080940` index buffer (498 u16 indices).
-    pub ebo: &'a [u16],
-    /// Recovered landmark-distance size normaliser `S`.
-    pub scale: f32,
-}
-
-/// Four independent 144-vertex consumers plus the captured topology, indexed
-/// by ControlIndex 0=head-left, 1=head-right, 2=tail-left, 3=tail-right.
-#[derive(Clone, Debug, PartialEq)]
-pub struct BrowLengthFourWay {
-    pub per_control: [eye_geometry::BrowLengthConsumer; BROW_LENGTH_UI_COUNT],
-    pub ebo: Vec<u16>,
-}
-
-/// Rebuild the ordered 498-index Type1018 buffer that the main tree already
-/// uses. The captured EBO addresses the 4x24+6 = 102-slot vendor range; the
-/// recovered numeric consumer writes 6x24 = 144 target vertices. The expansion
-/// from the 96 EBO slots to the 144 target windows is LIVE_ONLY, so this EBO is
-/// carried as a typed same-job topology input and validated for range only —
-/// it is not claimed to draw all 144 vertices.
-pub fn brow_length_type1018_ebo() -> Vec<u16> {
-    const RING: usize = 24;
-    const HALF: usize = RING / 2;
-    let mut local = Vec::with_capacity(BROW_LENGTH_EBO_INDEX_COUNT);
-    for i in 0..(RING - HALF - 2) {
-        let next = i + 1;
-        let back = RING - 1 - i;
-        let tail = RING - 2 - i;
-        local.extend([
-            i as u16,
-            next as u16,
-            back as u16,
-            back as u16,
-            next as u16,
-            tail as u16,
-        ]);
-    }
-    for i in (RING - HALF - 2)..HALF {
-        local.extend([i as u16, (i + 1) as u16, (HALF + 1) as u16]);
-    }
-    for band in 0..3 {
-        let top = band * RING;
-        let bottom = top + RING;
-        for column in 0..RING {
-            let next = (column + 1) % RING;
-            local.extend([
-                (top + column) as u16,
-                (top + next) as u16,
-                (bottom + column) as u16,
-                (bottom + column) as u16,
-                (top + next) as u16,
-                (bottom + next) as u16,
-            ]);
-        }
-    }
-    debug_assert_eq!(local.len(), BROW_LENGTH_EBO_INDEX_COUNT);
-    local
-        .into_iter()
-        .map(|index| index + 6u16)
-        .collect()
-}
-
-fn brow_length_slot_degree(index: usize, ui: f32) -> Result<f32, Refusal> {
-    // Above neutral 0.5 the vendor short part contributes zero; below it the
-    // long part contributes zero. Their sum is the signed consumer degree.
-    let short = eye_geometry::brow_length_slot_degree(
-        eye_geometry::BrowLengthSlot::new(eye_geometry::BrowPartKind::Short, index)
-            .map_err(|_| Refusal::ValueOutOfRange("brow_length_control_index"))?,
-        ui,
-    )
-    .map_err(|_| Refusal::ValueOutOfRange("brow_length_ui01"))?;
-    let long = eye_geometry::brow_length_slot_degree(
-        eye_geometry::BrowLengthSlot::new(eye_geometry::BrowPartKind::Long, index)
-            .map_err(|_| Refusal::ValueOutOfRange("brow_length_control_index"))?,
-        ui,
-    )
-    .map_err(|_| Refusal::ValueOutOfRange("brow_length_ui01"))?;
-    Ok(short + long)
-}
-
-/// Evaluate the four controls into four independent 144-vertex consumers.
-///
-/// The recovered vendor binding is: ControlIndex 0/2 drive direction A and
-/// 1/3 drive direction B; 0/1 are the head channel and 2/3 the tail channel.
-/// One 144-vertex consumer call necessarily writes all three rings of both
-/// directions, so isolation is obtained by passing a real segment only for
-/// the controlled direction and a degenerate segment for the other direction
-/// (zero half-length is a proven no-op). The un-controlled channel receives
-/// degree zero. The vendor-signed degree is passed through unchanged: the
-/// short-part range is negative and the t<=0 channel consumes it directly.
-pub fn brow_length_four_way(inputs: BrowLengthFourWayInputs<'_>) -> Result<BrowLengthFourWay, Refusal> {
-    if !inputs.ui01.iter().all(|ui| ui.is_finite() && (0.0..=1.0).contains(ui)) {
-        return Err(Refusal::ValueOutOfRange("brow_length_ui01"));
-    }
-    if !inputs.scale.is_finite() {
-        return Err(Refusal::ValueOutOfRange("brow_length_scale"));
-    }
-    if inputs.mesh.len() != BROW_LENGTH_MESH_VERTICES {
-        return Err(Refusal::ShapeMismatch("brow_length_mesh_144"));
-    }
-    if inputs.landmarks.len() < 194 {
-        return Err(Refusal::ShapeMismatch("brow_length_landmarks_194"));
-    }
-    for array in inputs.coeffs {
-        if array.len() != 24 || !array.iter().all(|value| value.is_finite()) {
-            return Err(Refusal::ShapeMismatch("brow_length_coeff_24"));
-        }
-    }
-    if inputs.ebo.len() != BROW_LENGTH_EBO_INDEX_COUNT {
-        return Err(Refusal::ShapeMismatch("brow_length_ebo_498"));
-    }
-    if inputs.ebo != brow_length_type1018_ebo().as_slice() {
-        return Err(Refusal::ValueOutOfRange("brow_length_ebo_order"));
-    }
-    if inputs.ebo.iter().any(|&index| index as usize >= inputs.mesh.len()) {
-        return Err(Refusal::ValueOutOfRange("brow_length_ebo_range"));
-    }
-
-    // Same-job landmark windows `{39,41,43}` (A) and `{22,24,26}` (B); the
-    // middle point is a recovered guide, the endpoints define each segment.
-    let segment = |indices: [usize; 3]| -> Result<[eye_geometry::Point; 2], Refusal> {
-        let mut ends = Vec::with_capacity(2);
-        for i in [indices[0], indices[2]] {
-            let p = inputs.landmarks[i];
-            if !p[0].is_finite() || !p[1].is_finite() {
-                return Err(Refusal::ValueOutOfRange("brow_length_landmarks"));
-            }
-            ends.push(eye_geometry::Point::new(p[0], p[1]));
-        }
-        Ok([ends[0], ends[1]])
-    };
-    let segment_a = segment([39, 41, 43])?;
-    let segment_b = segment([22, 24, 26])?;
-
-    let mut per_control = Vec::with_capacity(BROW_LENGTH_UI_COUNT);
-    for (index, &ui) in inputs.ui01.iter().enumerate() {
-        let degree = brow_length_slot_degree(index, ui)?;
-        let drives_a = index == 0 || index == 2;
-        let is_head = index < 2;
-        // ControlIndex 0/2 -> direction A, 1/3 -> direction B. Give the
-        // uncontrolled direction a zero-length segment: the recovered kernel's
-        // `half <= 0.001` gate makes every one of its 72 vertices an exact
-        // no-op, so the slider cannot leak across the face.
-        let degenerate: [eye_geometry::Point; 2] = [eye_geometry::Point::new(0.0, 0.0); 2];
-        let (head_degree, tail_degree) = if is_head { (degree, 0.0) } else { (0.0, degree) };
-        let consumer = eye_geometry::brow_length_consumer(
-            inputs.mesh,
-            inputs.coeffs,
-            if drives_a { segment_a } else { degenerate },
-            if drives_a { degenerate } else { segment_b },
-            head_degree,
-            tail_degree,
-            inputs.scale,
-        )
-        .map_err(|refusal| match refusal {
-            eye_geometry::Refusal::NonFinite(name)
-            | eye_geometry::Refusal::OutOfRange(name)
-            | eye_geometry::Refusal::MissingMesh(name) => Refusal::ValueOutOfRange(name),
-            eye_geometry::Refusal::MissingFactorList => {
-                Refusal::ValueOutOfRange("brow_length_coeff_24")
-            }
-            _ => Refusal::MissingInput("brow_length_consumer"),
-        })?;
-        per_control.push(consumer);
-    }
-    let per_control: [eye_geometry::BrowLengthConsumer; BROW_LENGTH_UI_COUNT] =
-        per_control
-            .try_into()
-            .map_err(|_| Refusal::ShapeMismatch("brow_length_four_way"))?;
-    Ok(BrowLengthFourWay {
-        per_control,
-        ebo: inputs.ebo.to_vec(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3794,15 +3424,7 @@ mod tests {
         );
         assert_eq!(
             eye_white_purify(&source, roi, &[0; 4], &[0.1; 8], 50.0).unwrap_err(),
-            Refusal::MissingInput("PF100005_AI_RESULT_PLANES")
-        );
-        assert_eq!(
-            eye_white_purify(&source, roi, &[0; 4], &[0.1; 7], 50.0).unwrap_err(),
-            Refusal::ShapeMismatch("model_output8")
-        );
-        assert_eq!(
-            eye_white_purify(&source, roi, &[0; 4], &[0.1; 8], f32::NAN).unwrap_err(),
-            Refusal::ValueOutOfRange("ui")
+            Refusal::NotImplemented(100005)
         );
         assert_eq!(
             eye_white_split8(&[0.1; 7]).unwrap_err(),
@@ -3811,95 +3433,6 @@ mod tests {
         let split = eye_white_split8(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         assert_eq!(split.first4, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(split.second4, [5.0, 6.0, 7.0, 8.0]);
-    }
-
-    #[test]
-    fn row82_static_mask_max_bounding_rect_and_group_gate() {
-        // ch3/ch7 masks: 3 pixels, CV_32FC1 -> CV_8U (round nearest even).
-        let p = |v: f32| vec![v];
-        let planes: [&[f32]; 8] = [
-            &p(0.0), &p(0.0), &p(0.0), &p(0.5),
-            &p(0.0), &p(0.0), &p(0.0), &p(1.0),
-        ];
-        // OpenCV convertTo CV_8U: 0.5 rounds to 0 (ties-even), 1.0 -> 1.
-        assert_eq!(eye_white_active_mask(&planes, true, false).unwrap(), vec![0]);
-        assert_eq!(eye_white_active_mask(&planes, false, true).unwrap(), vec![1]);
-        assert_eq!(eye_white_active_mask(&planes, true, true).unwrap(), vec![1]);
-        assert_eq!(
-            eye_white_active_mask(&planes, false, false).unwrap_err(),
-            Refusal::MissingInput("PF100005_NO_ENABLED_GROUP")
-        );
-        let empty: [&[f32]; 8] = [&[], &[], &[], &[], &[], &[], &[], &[]];
-        assert_eq!(
-            eye_white_active_mask(&empty, true, true).unwrap_err(),
-            Refusal::MissingInput("PF100005_AI_RESULT_PLANES")
-        );
-
-        // boundingRect over a 3x2 mask: nonzeros at (0,0) and (2,1).
-        let mask = [1u8, 0, 0, 0, 0, 1];
-        assert_eq!(
-            eye_white_bounding_rect(&mask, 3, 2).unwrap(),
-            Some(Rect { x: 0, y: 0, width: 3, height: 2 })
-        );
-        assert_eq!(eye_white_bounding_rect(&[0u8; 6], 3, 2).unwrap(), None);
-        assert_eq!(
-            eye_white_bounding_rect(&mask, 3, 1).unwrap_err(),
-            Refusal::ShapeMismatch("mask")
-        );
-    }
-
-    #[test]
-    fn row82_planes_entry_and_same_job_inputs_fail_closed() {
-        let source = Image::solid(1, 1, [100, 110, 120, 130]);
-        let p = |v: f32| vec![v];
-        let planes: [&[f32]; 8] = [
-            &p(100.0), &p(110.0), &p(120.0), &p(1.0),
-            &p(100.0), &p(110.0), &p(120.0), &p(1.0),
-        ];
-        // Group blend is LIVE_ONLY even with well-formed planes.
-        assert_eq!(
-            eye_white_purify_planes(&source, &planes, true, false, EyeWhiteMixer::Fast256)
-                .unwrap_err(),
-            Refusal::MissingInput("PF100005_FINAL_GROUP_BLEND")
-        );
-        let hash = [0u8; 32];
-        let base = EyeWhiteSameJobInputs {
-            source: &source,
-            model_planes: Some(&planes),
-            group_a: Some(true),
-            group_b: Some(false),
-            ui: Some(50.0),
-            model_sha256: Some(&hash),
-            frame_sha256: Some(&hash),
-            receipt: Some("same-job receipt"),
-        };
-        assert_eq!(
-            eye_white_purify_same_job(EyeWhiteSameJobInputs { ..base }).unwrap_err(),
-            Refusal::MissingInput("PF100005_FINAL_GROUP_BLEND")
-        );
-        // Each named missing input is refused before any pixel mutation.
-        let no_ui = EyeWhiteSameJobInputs { ui: None, ..base };
-        assert_eq!(
-            eye_white_purify_same_job(no_ui).unwrap_err(),
-            Refusal::MissingInput("PF100005_UI")
-        );
-        let no_sha = EyeWhiteSameJobInputs { model_sha256: None, ..base };
-        assert_eq!(
-            eye_white_purify_same_job(no_sha).unwrap_err(),
-            Refusal::MissingInput("PF100005_MODEL_SHA256")
-        );
-        let no_receipt = EyeWhiteSameJobInputs { receipt: None, ..base };
-        assert_eq!(
-            eye_white_purify_same_job(no_receipt).unwrap_err(),
-            Refusal::MissingInput("PF100005_HANDLER_LAYER_RECEIPT")
-        );
-        let no_planes = EyeWhiteSameJobInputs { model_planes: None, ..base };
-        assert_eq!(
-            eye_white_purify_same_job(no_planes).unwrap_err(),
-            Refusal::MissingInput("PF100005_AI_RESULT_PLANES")
-        );
-        let zero_ui = EyeWhiteSameJobInputs { ui: Some(0.0), ..base };
-        assert_eq!(eye_white_purify_same_job(zero_ui).unwrap(), source);
     }
 
     #[test]
@@ -4668,175 +4201,21 @@ mod hair_seam_contract_tests {
     }
 }
 
-    // ---- Rows 23/24: PF44124/PF48019/PF49221/PF41922 four-way isolation --
 
-    fn brow_test_landmarks() -> Vec<[f32; 2]> {
-        let mut points = vec![[0.0f32, 0.0]; 194];
-        points[39] = [0.0, 10.0];
-        points[41] = [24.0, 10.0];
-        points[43] = [48.0, 10.0];
-        points[22] = [100.0, 20.0];
-        points[24] = [112.0, 20.0];
-        points[26] = [124.0, 20.0];
-        points
-    }
-
-    fn brow_test_mesh() -> Vec<eye_geometry::Point> {
-        // Six 24-vertex windows. Windows 0..2 belong to direction A and
-        // windows 3..5 to direction B, matching the recovered 144 consumer.
-        (0..BROW_LENGTH_MESH_VERTICES)
-            .map(|i| {
-                let window = i / 24;
-                let slot = i % 24;
-                // Both directions straddle their segment centre so head and
-                // tail controls each have movable vertices in all three rings.
-                let anchor = if window < 3 { -24.0 } else { 100.0 };
-                eye_geometry::Point::new(anchor + slot as f32 * 4.0, window as f32 * 10.0)
-            })
-            .collect()
-    }
-
-    fn brow_test_inputs(ui01: [f32; 4]) -> BrowLengthFourWayInputs<'static> {
-        // Leaked fixtures keep the typed input bundle self-contained in this
-        // unit test; each test is a short-lived process-local allocation.
-        let landmarks: &'static [[f32; 2]] = Box::leak(brow_test_landmarks().into_boxed_slice());
-        let mesh: &'static [eye_geometry::Point] =
-            Box::leak(brow_test_mesh().into_boxed_slice());
-        let coeffs: &'static [f32] = Box::leak(vec![1.0f32; 24].into_boxed_slice());
-        let ebo: &'static [u16] = Box::leak(brow_length_type1018_ebo().into_boxed_slice());
-        BrowLengthFourWayInputs {
-            ui01,
-            landmarks,
-            mesh,
-            coeffs: [coeffs, coeffs, coeffs],
-            ebo,
-            scale: 1.0,
-        }
-    }
-
-    fn nonzero_slots(out: &eye_geometry::BrowLengthConsumer) -> Vec<usize> {
-        out.deltas
-            .iter()
-            .enumerate()
-            .filter_map(|(i, delta)| {
-                (delta.x.abs() > 1e-6 || delta.y.abs() > 1e-6).then_some(i)
-            })
-            .collect()
-    }
+#[cfg(test)]
+mod face_stereo_meta_tests {
+    use super::META;
 
     #[test]
-    fn row23_24_four_way_consumers_are_isolated() {
-        let neutral = [0.5f32; 4];
-        let base = brow_length_four_way(brow_test_inputs(neutral)).unwrap();
-        for out in &base.per_control {
-            assert!(out.noop, "neutral UI must be a no-op");
-            assert!(nonzero_slots(out).is_empty());
-        }
-
-        // Each control moves only its own direction (window group) and its
-        // own end (head = t<=0, tail = t>0). The other three consumers stay
-        // exact no-ops, so a slider cannot leak into a neighbour.
-        for index in 0..4 {
-            let mut ui = neutral;
-            ui[index] = if index < 2 { 1.0 } else { 0.0 };
-            let out = brow_length_four_way(brow_test_inputs(ui)).unwrap();
-            assert_eq!(out.ebo.len(), BROW_LENGTH_EBO_INDEX_COUNT);
-            let changed = nonzero_slots(&out.per_control[index]);
-            assert!(!changed.is_empty(), "control {index} did not move its mesh");
-            // ControlIndex 0/2 drive direction A (slots 0..72); 1/3 drive
-            // direction B (slots 72..144). All three 24-point rings of the
-            // driven direction may move; the other direction must be exact
-            // no-ops because its segment degenerates.
-            let (start, end) = if index == 0 || index == 2 { (0, 72) } else { (72, 144) };
-            assert!(
-                changed.iter().all(|slot| *slot >= start && *slot < end),
-                "control {index} moved outside its direction ({start}..{end}): {changed:?}"
-            );
-            // The fixture straddles both segment centres. Head controls can
-            // only move t<=0 vertices; tail controls only t>0 vertices.
-            let head_slots = if index == 0 || index == 2 {
-                // A centre is slot 12; its projection is zero, so only 0..11
-                // can move on the t<=0 side.
-                (0..3).flat_map(|w| (0..24).map(move |s| w * 24 + s)).filter(|slot| *slot % 24 < 12).collect::<Vec<_>>()
-            } else {
-                // B centre is slot 3; only 0..2 are t<=0.
-                (0..3).flat_map(|w| (0..24).map(move |s| 72 + w * 24 + s)).filter(|slot| *slot % 24 < 3).collect::<Vec<_>>()
-            };
-            if index < 2 {
-                assert!(
-                    changed.iter().all(|slot| head_slots.contains(slot)),
-                    "head control {index} leaked into the tail half"
-                );
-            } else {
-                assert!(
-                    changed.iter().all(|slot| !head_slots.contains(slot)),
-                    "tail control {index} leaked into the head half"
-                );
-            }
-            for other in 0..4 {
-                if other != index {
-                    assert!(
-                        out.per_control[other].noop,
-                        "control {index} leaked into control {other}"
-                    );
-                }
-            }
+    fn pf8_pf9_use_the_shipped_ui_keys_and_blusher_mask_family() {
+        let shadow = META.iter().find(|row| row.pf == 8).expect("PF8 meta");
+        let highlight = META.iter().find(|row| row.pf == 9).expect("PF9 meta");
+        assert_eq!(shadow.key, "shadowStereo");
+        assert_eq!(highlight.key, "highlight");
+        for row in [shadow, highlight] {
+            assert!(row.inputs.iter().any(|input| input.contains("BlusherMaskType=15")));
+            assert!(row.inputs.iter().any(|input| input.contains("ROI [95,40,901,1081]")));
+            assert!(row.inputs.iter().any(|input| input.contains("FilterType 42")));
         }
     }
-
-    #[test]
-    fn row23_24_four_way_changes_are_additive_and_order_independent() {
-        let neutral = [0.5f32; 4];
-        let mut all = neutral;
-        all[0] = 1.0; // head-left
-        all[1] = 0.0; // head-right
-        all[2] = 0.0; // tail-left
-        all[3] = 1.0; // tail-right
-        let together = brow_length_four_way(brow_test_inputs(all)).unwrap();
-        let alone = (0..4).map(|index| {
-            let mut ui = neutral;
-            ui[index] = all[index];
-            brow_length_four_way(brow_test_inputs(ui)).unwrap()
-        });
-        for (index, one) in alone.enumerate() {
-            let moved = nonzero_slots(&one.per_control[index]);
-            assert!(!moved.is_empty());
-            for slot in moved {
-                let expected = one.per_control[index].deltas[slot];
-                let actual = together.per_control[index].deltas[slot];
-                assert!(
-                    (actual.x - expected.x).abs() < 1e-6
-                        && (actual.y - expected.y).abs() < 1e-6,
-                    "control {index} slot {slot}: expected {expected:?}, got {actual:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn row23_24_four_way_refuses_bad_inputs() {
-        let mut inputs = brow_test_inputs([0.5; 4]);
-        inputs.ui01[1] = f32::NAN;
-        assert_eq!(
-            brow_length_four_way(inputs).unwrap_err(),
-            Refusal::ValueOutOfRange("brow_length_ui01")
-        );
-        let mut inputs = brow_test_inputs([0.5; 4]);
-        inputs.mesh = &inputs.mesh[..143];
-        assert_eq!(
-            brow_length_four_way(inputs).unwrap_err(),
-            Refusal::ShapeMismatch("brow_length_mesh_144")
-        );
-        let mut inputs = brow_test_inputs([0.5; 4]);
-        inputs.ebo = &inputs.ebo[..497];
-        assert_eq!(
-            brow_length_four_way(inputs).unwrap_err(),
-            Refusal::ShapeMismatch("brow_length_ebo_498")
-        );
-        let mut inputs = brow_test_inputs([0.5; 4]);
-        inputs.coeffs[1] = &inputs.coeffs[1][..23];
-        assert_eq!(
-            brow_length_four_way(inputs).unwrap_err(),
-            Refusal::ShapeMismatch("brow_length_coeff_24")
-        );
-    }
+}

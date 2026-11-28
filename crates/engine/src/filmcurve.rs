@@ -142,7 +142,9 @@ pub fn curve_dir() -> PathBuf {
     if let Some(dir) = DIR.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         return dir.clone();
     }
-    crate::bundled_resources::film_curves_dir()
+    std::env::var_os("AURORA_FILM_CURVES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Capture One\Capture One\Film Curves"))
 }
 
 

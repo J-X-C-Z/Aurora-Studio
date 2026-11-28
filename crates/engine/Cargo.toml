@@ -7,7 +7,6 @@ license.workspace = true
 
 [features]
 default = ["wgpu-backend"]
-# Portable wgpu compute path in gpu_crossplatform / platform_dispatch.
 wgpu-backend = ["dep:wgpu"]
 z6iii-raw-export = []
 external-fixtures = []

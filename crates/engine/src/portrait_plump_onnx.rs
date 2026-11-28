@@ -108,76 +108,21 @@ where
     }
 }
 
-/// Explicit directory holding `{id}.onnx` FacePlump models. Highest priority.
-pub const PLUMP_MODEL_ROOT_ENV: &str = "AURORA_FACEPLUMP_MODEL_ROOT";
-
-fn push_model_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
-    if !roots.iter().any(|existing| *existing == path) {
-        roots.push(path);
-    }
-}
-
-/// Ordered FacePlump model roots: env override, executable-relative install
-/// layouts, cwd-relative layouts, the dev `../../models` layout, then the
-/// historical absolute development paths. Duplicates collapse to their first
-/// position so a cwd that equals the exe directory is not scanned twice.
-fn plump_model_roots(
-    exe_dir: Option<&Path>,
-    cwd: Option<&Path>,
-    env: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(env) = env {
-        push_model_root(&mut roots, env);
-    }
-    if let Some(dir) = exe_dir {
-        for base in [
-            dir.join("models").join("faceplump"),
-            dir.join("assets").join("portrait").join("faceplump"),
-            dir.join("faceplump"),
-        ] {
-            push_model_root(&mut roots, base);
-        }
-    }
-    if let Some(dir) = cwd {
-        for base in [
-            dir.join("models").join("faceplump"),
-            dir.join("assets").join("portrait").join("faceplump"),
-            dir.join("faceplump"),
-        ] {
-            push_model_root(&mut roots, base);
-        }
-    }
-    if let Some(dir) = exe_dir {
-        for base in [
-            dir.join("..").join("..").join("models").join("faceplump"),
-            dir.join("..")
-                .join("..")
-                .join("assets")
-                .join("portrait")
-                .join("faceplump"),
-        ] {
-            push_model_root(&mut roots, base);
-        }
-    }
-    push_model_root(
-        &mut roots,
-        PathBuf::from(r"C:\WorkSpace\Aurora Studio\05_deliverables\faceplump-models"),
-    );
-    push_model_root(
-        &mut roots,
-        PathBuf::from(r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceplump"),
-    );
-    roots
-}
-
 pub fn discover_plump_onnx_models() -> Result<[PlumpOnnxAsset; 3], Refusal> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let cwd = std::env::current_dir().ok();
-    let env = std::env::var_os(PLUMP_MODEL_ROOT_ENV).map(PathBuf::from);
-    let roots = plump_model_roots(exe_dir.as_deref(), cwd.as_deref(), env);
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("AURORA_FACEPLUMP_MODEL_ROOT").filter(|root| !root.is_empty()) {
+        roots.push(PathBuf::from(root));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(parent.join("models").join("faceplump"));
+            roots.push(parent.join("assets").join("portrait").join("faceplump"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("models").join("faceplump"));
+        roots.push(cwd.join("assets").join("portrait").join("faceplump"));
+    }
     let routes = [Route::HighRes4, Route::HighRes3, Route::LowRes3];
     let mut found = Vec::with_capacity(3);
     for route in routes {
@@ -799,70 +744,5 @@ mod tests {
     fn highres4_final_composite_uses_output_plane_four_as_split_mask() {
         assert_eq!(PLUMP_HIGHRES4_OUTPUT_CHANNEL_MAP.color, [0, 1, 2]);
         assert_eq!(PLUMP_HIGHRES4_OUTPUT_CHANNEL_MAP.split_mask, 3);
-    }
-
-    #[test]
-    fn plump_model_roots_follow_env_exe_cwd_dev_then_fallback_order() {
-        let exe = Path::new(r"C:\app\bin");
-        let cwd = Path::new(r"D:\project");
-        let env = PathBuf::from(r"E:\models\faceplump");
-        let roots = plump_model_roots(Some(exe), Some(cwd), Some(env.clone()));
-        assert_eq!(roots[0], env, "explicit env root wins");
-        assert_eq!(roots[1], exe.join("models").join("faceplump"));
-        assert_eq!(roots[2], exe.join("assets").join("portrait").join("faceplump"));
-        assert_eq!(roots[3], exe.join("faceplump"));
-        assert_eq!(roots[4], cwd.join("models").join("faceplump"));
-        assert_eq!(roots[5], cwd.join("assets").join("portrait").join("faceplump"));
-        assert_eq!(roots[6], cwd.join("faceplump"));
-        assert_eq!(
-            roots[7],
-            exe.join("..").join("..").join("models").join("faceplump")
-        );
-        assert_eq!(
-            roots[8],
-            exe.join("..")
-                .join("..")
-                .join("assets")
-                .join("portrait")
-                .join("faceplump")
-        );
-        assert_eq!(
-            roots[9],
-            PathBuf::from(r"C:\WorkSpace\Aurora Studio\05_deliverables\faceplump-models")
-        );
-        assert_eq!(
-            roots[10],
-            PathBuf::from(r"C:\WorkSpace\Aurora Studio\90_work\build-cache\faceplump")
-        );
-        assert_eq!(roots.len(), 11);
-    }
-
-    #[test]
-    fn plump_model_roots_dedupes_repeated_directories() {
-        // A portable install often runs with cwd == exe dir; the cwd block must
-        // not rescan the same three directories.
-        let dir = Path::new(r"C:\app\bin");
-        let roots = plump_model_roots(Some(dir), Some(dir), None);
-        let mut unique = roots.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), roots.len(), "no duplicate roots: {roots:?}");
-        assert_eq!(roots.len(), 7, "3 exe + 2 dev + 2 absolute fallbacks");
-        assert_eq!(roots[0], dir.join("models").join("faceplump"));
-
-        // The env root is also deduped when it matches a relative layout.
-        let same = dir.join("models").join("faceplump");
-        let roots = plump_model_roots(Some(dir), None, Some(same.clone()));
-        assert_eq!(roots[0], same);
-        assert_eq!(roots.iter().filter(|root| **root == same).count(), 1);
-    }
-
-    #[test]
-    fn plump_model_roots_without_exe_or_cwd_keeps_env_and_fallbacks() {
-        let roots = plump_model_roots(None, None, None);
-        assert_eq!(roots.len(), 2, "only the two absolute fallbacks remain");
-        let roots = plump_model_roots(None, None, Some(PathBuf::from(r"E:\m")));
-        assert_eq!(roots[0], PathBuf::from(r"E:\m"));
-        assert_eq!(roots.len(), 3);
     }
 }

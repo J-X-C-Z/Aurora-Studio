@@ -64,7 +64,15 @@ fn configured_curve(model: &str) -> Option<String> {
 }
 
 fn core_config_path() -> PathBuf {
-    crate::bundled_resources::core_config_path()
+    if let Some(path) = std::env::var_os("AURORA_CORECONFIG") {
+        return PathBuf::from(path);
+    }
+    let install = PathBuf::from(r"C:\Program Files\Capture One\Capture One\coreConfig.cdx");
+    if install.is_file() {
+        install
+    } else {
+        PathBuf::from("testdata/coreConfig.cdx")
+    }
 }
 
 /// Fallback for bodies whose EXIF name is not the `cameraID` spelling.

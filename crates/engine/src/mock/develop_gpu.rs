@@ -2483,100 +2483,6 @@ pub(crate) fn resident_crossover_admits(width: usize, height: usize) -> bool {
     (width as u64).saturating_mul(height as u64) >= floor
 }
 
-/// Device bytes one resident preview frame asks the pool for, per buffer.
-/// Shared by [`render_resident_preview`] and [`resident_preview_admits`] so the
-/// non-allocating preflight and the real `ensure` can never disagree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ResidentNeeds {
-    pub src: usize,
-    pub rgb3: usize,
-    pub usm_cam: usize,
-    pub usm_planes: usize,
-    pub out_u8: usize,
-    pub gain: usize,
-    pub editor: usize,
-}
-
-impl ResidentNeeds {
-    pub(crate) fn of(
-        pixels: usize,
-        params: &DevelopParams,
-        has_gain: bool,
-        camera_usm: bool,
-        display_usm: bool,
-        has_nr: bool,
-        has_single_pixel: bool,
-    ) -> Option<Self> {
-        let needs_rgb3 = camera_usm || display_usm || has_nr || has_single_pixel;
-        Some(Self {
-            src: pixels.checked_mul(16)?,
-            rgb3: if needs_rgb3 { pixels.checked_mul(12)? } else { 0 },
-            usm_cam: if camera_usm { pixels.checked_mul(16)? } else { 0 },
-            usm_planes: if camera_usm || display_usm {
-                pixels.checked_mul(12)?
-            } else if has_single_pixel {
-                pixels.checked_mul(4)?
-            } else {
-                0
-            },
-            out_u8: pixels.checked_mul(4)?,
-            gain: if has_gain { pixels.checked_mul(4)? } else { 0 },
-            editor: params
-                .editor
-                .as_ref()
-                .map(|e| e.floats.len().saturating_mul(4))
-                .unwrap_or(0)
-                .max(E_SKIN_BASE * 4),
-        })
-    }
-
-    /// Lease bytes the pool would hold: fixed tables plus every buffer, with the
-    /// gain plane counted twice (device buffer and page-locked staging).
-    pub(crate) fn lease_bytes(&self) -> usize {
-        ResidentPool::fixed_resident_bytes()
-            .saturating_add(self.src)
-            .saturating_add(self.rgb3)
-            .saturating_add(self.usm_cam)
-            .saturating_add(self.usm_planes)
-            .saturating_add(self.out_u8)
-            .saturating_add(self.gain.saturating_mul(2))
-            .saturating_add(self.editor)
-    }
-}
-
-/// Non-allocating admission for the resident preview path. Callers run this
-/// before building the full-frame gain plane and the sample array, so a frame
-/// the shared VRAM ledger would refuse never materializes them. `true` only says
-/// the ledger would admit the lease; `render_resident_preview` still decides.
-pub(crate) fn resident_preview_admits(
-    width: usize,
-    height: usize,
-    params: &DevelopParams,
-    has_gain: bool,
-    camera_usm: bool,
-    display_usm: bool,
-    nr: Option<&NoiseReduction>,
-) -> bool {
-    if !enabled() || !resident_crossover_admits(width, height) {
-        return false;
-    }
-    let Some(pixels) = width.checked_mul(height).filter(|p| *p > 0) else { return false };
-    let has_single_pixel = nr.is_some_and(|n| n.single_pixel > 0.0);
-    let has_nr = nr.is_some_and(|n| n.luminance > 0.0 || n.color > 0.0);
-    if has_nr && !super::nr_gpu::enabled() {
-        return false;
-    }
-    let Some(needs) = ResidentNeeds::of(pixels, params, has_gain, camera_usm, display_usm, has_nr, has_single_pixel)
-    else {
-        return false;
-    };
-    let total = needs.lease_bytes();
-    if total > develop_budget() {
-        return false;
-    }
-    gpu_runtime::vram_can_allocate("develop_resident", total)
-}
-
 struct ResidentPool {
     // Device buffers and stream are declared BEFORE `lease` so Drop releases
     // VRAM before returning budget credit to the shared VramLedger.
@@ -2954,23 +2860,24 @@ where
         return None;
     }
     let needs_rgb3 = camera_usm.is_some() || display_usm.is_some() || has_nr || has_single_pixel;
-    let ResidentNeeds {
-        src: need_src,
-        rgb3: need_rgb3,
-        usm_cam: need_usm_cam,
-        usm_planes: need_usm_planes,
-        out_u8: need_out_u8,
-        gain: need_gain,
-        editor: need_editor,
-    } = ResidentNeeds::of(
-        pixels,
-        params,
-        gain_plane.is_some(),
-        camera_usm.is_some(),
-        display_usm.is_some(),
-        has_nr,
-        has_single_pixel,
-    )?;
+    let need_src = pixels.checked_mul(16)?;
+    let need_rgb3 = if needs_rgb3 { pixels.checked_mul(12)? } else { 0 };
+    let need_usm_cam = if camera_usm.is_some() { pixels.checked_mul(16)? } else { 0 };
+    let need_usm_planes = if camera_usm.is_some() || display_usm.is_some() {
+        pixels.checked_mul(12)?
+    } else if has_single_pixel {
+        pixels.checked_mul(4)?
+    } else {
+        0
+    };
+    let need_out_u8 = pixels.checked_mul(4)?;
+    let need_gain = if gain_plane.is_some() { pixels.checked_mul(4)? } else { 0 };
+    let need_editor = params
+        .editor
+        .as_ref()
+        .map(|e| e.floats.len().saturating_mul(4))
+        .unwrap_or(0)
+        .max(E_SKIN_BASE * 4);
 
     register_resident_reclaimer();
     let mut lock = resident_state().lock().unwrap_or_else(|e| e.into_inner());
@@ -3480,44 +3387,6 @@ mod tests {
 
     fn code8(v: f32) -> i32 {
         (v.clamp(0.0, 1.0) * 255.0 + 0.5) as i32
-    }
-
-    #[test]
-    fn resident_needs_match_the_pool_buffer_formulas() {
-        let params = DevelopParams::from_adjustments(&AdjustmentSet::default(), [1.0; 3], 1.0, false);
-        let px = 1920usize * 1080;
-        let plain = ResidentNeeds::of(px, &params, false, false, false, false, false).unwrap();
-        assert_eq!(plain.src, px * 16);
-        assert_eq!((plain.rgb3, plain.usm_cam, plain.usm_planes, plain.gain), (0, 0, 0, 0));
-        assert_eq!(plain.out_u8, px * 4);
-        assert!(plain.editor >= E_SKIN_BASE * 4);
-
-        let full = ResidentNeeds::of(px, &params, true, true, false, true, false).unwrap();
-        assert_eq!((full.rgb3, full.usm_cam, full.usm_planes, full.gain), (px * 12, px * 16, px * 12, px * 4));
-        // Single-pixel NR alone needs the rgb3 work frame and a 4 B/px plane.
-        let single = ResidentNeeds::of(px, &params, false, false, false, false, true).unwrap();
-        assert_eq!((single.rgb3, single.usm_planes), (px * 12, px * 4));
-
-        // The gain plane is counted twice (device + page-locked staging).
-        assert_eq!(
-            full.lease_bytes() - plain.lease_bytes(),
-            (full.rgb3 + full.usm_cam + full.usm_planes) + full.gain * 2
-        );
-        // Overflow is refused, not wrapped.
-        assert!(ResidentNeeds::of(usize::MAX / 8, &params, false, false, false, false, false).is_none());
-    }
-
-    #[test]
-    fn resident_preview_admits_refuses_without_a_device_or_below_crossover() {
-        let params = DevelopParams::from_adjustments(&AdjustmentSet::default(), [1.0; 3], 1.0, false);
-        // Below the resident crossover floor: never admitted, nothing allocated.
-        assert!(!resident_preview_admits(64, 64, &params, false, false, false, None));
-        // Zero-sized frames are refused.
-        assert!(!resident_preview_admits(0, 1080, &params, false, false, false, None));
-        // Without a CUDA backend (non-Windows default) nothing is admitted.
-        if !enabled() {
-            assert!(!resident_preview_admits(1920, 1080, &params, true, true, true, None));
-        }
     }
 
     // ── staged transfer counters (pure arithmetic; no CUDA device) ────────

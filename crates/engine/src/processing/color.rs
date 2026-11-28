@@ -347,9 +347,7 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     let mut dl = 0.0f32;
     let mut w_sum = 0.0f32;
 
-    // Only terms that move the pixel count towards `w_sum`: an enabled band
-    // with a zero shift (the default global group) must not dilute the others.
-    if ce.global.enabled && ce.global_shift != HslShift::default() {
+    if ce.global.enabled {
         let mut w = band_weight(&ce.global, 0.0, h0, s0, v0);
         if ce.global.inverted {
             w = 1.0 - w;
@@ -363,9 +361,6 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
     for r in &ce.skin {
         if let Some((_, band)) = ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
             if !band.enabled {
-                continue;
-            }
-            if band.homogeneity == [0.0; 3] {
                 continue;
             }
             let mut w = band_weight(band, 0.0, h0, s0, v0);
@@ -382,7 +377,7 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
             if band.homogeneity[2] != 0.0 {
                 dl += skin_luma_uniform_step(v0 * 100.0, band.center_value * 100.0, band.homogeneity[2]) * w;
             }
-        } else if let Some(u) = r.uniformity.as_ref().filter(|u| u.hue != 0.0 || u.saturation > 0.0 || u.lightness > 0.0) {
+        } else if let Some(u) = &r.uniformity {
             let w = color_range_weight(r, g);
             w_sum += w;
             dh += signed_hue_delta(r.hue, h0) * (u.hue / 100.0 * w);
@@ -420,7 +415,6 @@ pub(crate) fn color_editor(g: [f32; 3], ce: &ColorEditor, k: f32) -> [f32; 3] {
         .map(|r| (r, 0.0))
         .chain(ce.skin.iter().map(|r| (r, 0.0)))
         .chain(ce.max_smooth.iter().map(|r| (r, extra)))
-        .filter(|(r, _)| r.shift != HslShift::default())
     {
         let w = match ce.advanced_bands.iter().find(|(id, _)| *id == r.id) {
             Some((_, band)) if band.enabled => {

@@ -9,6 +9,7 @@ use crate::compute::device::{
     Backend as ComputeDeviceBackend, Capabilities, GpuInfo, Precision as ComputePrecision,
 };
 use crate::compute::policy::install_capabilities;
+use crate::compute_bridge::from_portrait_backend;
 use crate::contracts::compute::{
     diagnose_backend_selection, BackendCapability, BackendDiagnostic, BackendKind, BackendPolicy,
     Precision as ContractPrecision,
@@ -26,24 +27,6 @@ pub struct PlatformCapabilityReport {
     pub ort_providers: Vec<&'static str>,
     pub auto_diagnostic: BackendDiagnostic,
     pub strict_gpu_diagnostic: BackendDiagnostic,
-}
-
-/// Maps the portrait device vocabulary to the contract [`BackendKind`].
-///
-/// Kept here (not in `compute_bridge`, which is Windows-only) so the probe works
-/// on every platform. Must stay in sync with `compute_bridge::from_portrait_backend`.
-const fn from_portrait_backend(backend: PortraitBackend) -> BackendKind {
-    match backend {
-        PortraitBackend::Cpu => BackendKind::Cpu,
-        PortraitBackend::Cuda => BackendKind::Cuda,
-        PortraitBackend::Metal => BackendKind::Metal,
-        PortraitBackend::Vulkan => BackendKind::Vulkan,
-        PortraitBackend::Dx12 => BackendKind::Dx12,
-        PortraitBackend::Hip => BackendKind::Hip,
-        PortraitBackend::Sycl => BackendKind::Sycl,
-        PortraitBackend::OpenCl => BackendKind::OpenCl,
-        PortraitBackend::Npu => BackendKind::Npu,
-    }
 }
 
 fn to_compute_backend(backend: PortraitBackend) -> ComputeDeviceBackend {
@@ -189,7 +172,7 @@ mod tests {
         let caps = host_compute_capabilities();
         let _ = caps.any_gpu();
         let candidates = engine_autotune_candidates();
-        assert!(candidates.len() >= 18);
+        assert!(candidates.len() >= 25);
     }
 
     #[test]

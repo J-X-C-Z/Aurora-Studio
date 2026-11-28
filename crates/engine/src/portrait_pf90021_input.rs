@@ -215,6 +215,10 @@ fn pf90021_identity_volume() -> &'static VolumeLut64 {
     })
 }
 
+fn pf90021_face_parsing_lip_enabled(env_value: Option<&std::ffi::OsStr>) -> bool {
+    !env_value.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
 fn pf90021_lip_mask(
     enabled: bool,
     parsing: Option<&crate::face_parsing::FaceParsingProducerInputs>,
@@ -274,7 +278,9 @@ impl crate::portrait_face_input_stage::FaceInputBundle {
         let (mask_r, mask_source) = match direction {
             Pf90021Direction::Neutral => (Vec::new(), Pf90021MaskSource::LipMaskType3ChannelR),
             Pf90021Direction::Positive | Pf90021Direction::Negative => {
-                let enabled = std::env::var_os(PF90021_FACE_PARSING_LIP_ENV).is_some_and(|value| value == "1");
+                let enabled = pf90021_face_parsing_lip_enabled(
+                    std::env::var_os(PF90021_FACE_PARSING_LIP_ENV).as_deref(),
+                );
                 let parsing = self.model_inputs.as_ref().and_then(|inputs| inputs.parsing.as_ref());
                 (pf90021_lip_mask(enabled, parsing, self.job_id, source.width, source.height)?,
                     Pf90021MaskSource::FaceParsingV2Class8Candidate)
@@ -453,6 +459,17 @@ mod tests {
         let mut stale = parsing;
         stale.model_sha256 = [0; 32];
         assert!(matches!(pf90021_lip_mask(true, Some(&stale), 17, 2, 1), Err(Refusal::ValueOutOfRange(_))));
+    }
+
+    #[test]
+    fn face_parsing_lip_env_defaults_enabled_and_honors_explicit_disable() {
+        use std::ffi::OsStr;
+        assert!(pf90021_face_parsing_lip_enabled(None));
+        assert!(pf90021_face_parsing_lip_enabled(Some(OsStr::new("1"))));
+        assert!(pf90021_face_parsing_lip_enabled(Some(OsStr::new("true"))));
+        assert!(!pf90021_face_parsing_lip_enabled(Some(OsStr::new("0"))));
+        assert!(!pf90021_face_parsing_lip_enabled(Some(OsStr::new("false"))));
+        assert!(!pf90021_face_parsing_lip_enabled(Some(OsStr::new("FALSE"))));
     }
 
     #[test]

@@ -241,9 +241,22 @@ pub(crate) fn catchlight_uv_frame(
         sxy += dx * dy;
     }
     // Principal axis of a symmetric 2x2 covariance: 2θ = atan2(2·sxy, sxx − syy).
-    let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
-    let u = [theta.cos(), theta.sin()];
-    let v = [-u[1], u[0]];
+    // A real iris ring is almost circular, so `sxx - syy` and `sxy` are both at
+    // rounding-noise level. Feeding that noise into atan2 picks an arbitrary
+    // angle: on the recovered template the left iris lands at about +80° and the
+    // right at about -80°, rotating the same catchlight art two different ways
+    // on one face. When the anisotropy is below 1% of the total variance the
+    // ellipse has no meaningful long axis, so use the stable frame-space
+    // horizontal instead; genuinely elongated rings still follow their axis.
+    let anisotropy = (sxx - syy).hypot(2.0 * sxy);
+    let total = sxx + syy;
+    let (u, v) = if total > 0.0 && anisotropy > 0.01 * total {
+        let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let u = [theta.cos(), theta.sin()];
+        (u, [-u[1], u[0]])
+    } else {
+        ([1.0, 0.0], [0.0, 1.0])
+    };
 
     let (mut half_u, mut half_v) = (0.0f32, 0.0f32);
     for point in &clipped {
@@ -688,6 +701,40 @@ mod tests {
             "left span {}",
             left_frame.half_extent[0]
         );
+    }
+
+    #[test]
+    fn a_nearly_circular_iris_uses_a_stable_frame_axis_on_both_sides() {
+        // The recovered primary142 template has sxx≈syy and sxy≈0 on both iris
+        // rings, with opposite sign noise. Without the anisotropy gate the two
+        // eyes picked axes near +80° and -80°, rotating one material two ways.
+        let left = std::array::from_fn(|index| {
+            let angle = index as f32 * std::f32::consts::TAU / CATCHLIGHT_RING_POINTS as f32;
+            // Tiny equal jitter on x makes sxx/syy differ by ~0.001% of total,
+            // the same rounding-noise regime as the recovered template.
+            [10.0 + (6.0 + 0.0001) * angle.cos(), 12.0 + 6.0 * angle.sin()]
+        });
+        let right = std::array::from_fn(|index| {
+            let p = left[index];
+            [p[0] + 20.0, p[1]]
+        });
+        let lf = catchlight_uv_frame(&left, 0.0).unwrap();
+        let rf = catchlight_uv_frame(&right, 0.0).unwrap();
+        assert!(
+            (lf.u[0] - 1.0).abs() < 1e-3 && lf.u[1].abs() < 1e-3,
+            "left iris axis must be stable, got {:?}",
+            lf.u
+        );
+        assert_eq!(lf.u, rf.u, "both eyes must use the same stable axis");
+        assert_eq!(lf.v, rf.v);
+        for axis in 0..2 {
+            assert!(
+                (lf.half_extent[axis] - rf.half_extent[axis]).abs() < 1e-3,
+                "half extent {axis} differs: {:?} vs {:?}",
+                lf.half_extent,
+                rf.half_extent
+            );
+        }
     }
 
     #[test]

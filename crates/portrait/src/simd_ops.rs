@@ -588,8 +588,7 @@ unsafe fn fused_neon(fusion: &PixelStageFusion, src: &[u8], dst: &mut [u8]) {
     unsafe {
         let mut off = 0usize;
         while off < bytes {
-            let mut raw = [0u8; 8];
-            vst1_u8(raw.as_mut_ptr(), vld1_u8(src.as_ptr().add(off)));
+            let raw = vld1_u8(src.as_ptr().add(off));
             let mut p0 = [raw[0], raw[1], raw[2], raw[3]];
             let mut p1 = [raw[4], raw[5], raw[6], raw[7]];
             for op in fusion.stages() {
@@ -599,7 +598,7 @@ unsafe fn fused_neon(fusion: &PixelStageFusion, src: &[u8], dst: &mut [u8]) {
             let mut out = [0u8; 8];
             out[..4].copy_from_slice(&p0);
             out[4..].copy_from_slice(&p1);
-            vst1_u8(dst.as_mut_ptr().add(off), vld1_u8(out.as_ptr()));
+            vst1_u8(dst.as_mut_ptr().add(off), out.as_ptr());
             off += 8;
         }
     }

@@ -255,13 +255,13 @@ fn neutral_wrinkle_uniforms() -> WrinkleUniforms {
 /// 21024 is absent on purpose: its `mask.r`/`mask.b` contribution law is
 /// missing, so `cuda_wrinkle::resolve_p15` refuses it before this point.
 pub fn wrinkle_degree(pf: u32, ui: f32) -> Result<f32, Refusal> {
-    if !matches!(pf, 21025 | 21069 | 21070 | 21071 | 90023 | 90024) {
+    if !matches!(pf, 21025 | 21069 | 21070 | 21071 | 90015 | 90023 | 90024) {
         return Err(Refusal::UnknownEffect(pf));
     }
     if !ui.is_finite() || !(0.0..=100.0).contains(&ui) {
         return Err(Refusal::ValueOutOfRange("ui"));
     }
-    Ok(if matches!(pf, 21025 | 21070 | 90023) {
+    Ok(if matches!(pf, 21025 | 21070 | 90015 | 90023) {
         ui / 100.0
     } else {
         ui

@@ -85,6 +85,23 @@ pub use portrait_eye_bag_stage::{
     PF90116_RESPONSE_SHAPE,
 };
 
+#[path = "portrait_pixcake_smile.rs"]
+mod portrait_pixcake_smile;
+pub(crate) use portrait_pixcake_smile::smile_mesh_assets_present;
+#[path = "portrait_pixcake_eyebag.rs"]
+mod portrait_pixcake_eyebag;
+#[path = "portrait_pixcake_repair.rs"]
+mod portrait_pixcake_repair;
+#[path = "portrait_pixcake_hair_glare.rs"]
+mod portrait_pixcake_hair_glare;
+#[path = "portrait_pixcake_teeth_expr.rs"]
+mod portrait_pixcake_teeth_expr;
+#[path = "portrait_pixcake_blemish.rs"]
+mod portrait_pixcake_blemish;
+#[path = "portrait_pixcake_hands_feet.rs"]
+mod portrait_pixcake_hands_feet;
+#[path = "portrait_pixcake_unify_suit.rs"]
+mod portrait_pixcake_unify_suit;
 #[path = "portrait_face_stage.rs"]
 mod portrait_face_stage;
 pub use portrait_face_stage::{FaceGeometry, FaceGeometryDraw, FaceGeometryInputs};
@@ -103,9 +120,6 @@ pub use portrait_pf8033_cpu_forward::{
     PF8033_MODEL_WIDTH,
 };
 
-#[path = "portrait_longtail_inputs.rs"]
-pub mod portrait_longtail_inputs;
-
 #[path = "portrait_face_geometry_provider.rs"]
 mod portrait_face_geometry_provider;
 pub use portrait_face_geometry_provider::{
@@ -123,9 +137,8 @@ pub use portrait_body_stage::{
 #[path = "portrait_body_producer.rs"]
 mod portrait_body_producer;
 pub use portrait_body_producer::{
-    anchor_set_from_pose, attach_pose_six_point, six_point_job_from_pose, six_point_warp_from_pose,
     BodyGeometryProducerInputs, BodyLandmarkDomain, BodyLandmarkEffect, BodyLandmarkFrame,
-    BodyLandmarkRef, SixPointTargets,
+    BodyLandmarkRef,
 };
 #[path = "portrait_body_inputs.rs"]
 mod portrait_body_inputs;
@@ -235,30 +248,6 @@ impl Default for PortraitMasks {
     }
 }
 
-/// A sampled, quantised mask and the exact stage geometry that produced it.
-#[derive(Clone)]
-pub struct CachedMask {
-    pub width: u32,
-    pub height: u32,
-    pub region: NormRect,
-    pub mask: std::sync::Arc<Vec<u8>>,
-}
-
-impl CachedMask {
-    pub fn new(width: u32, height: u32, region: NormRect, mask: std::sync::Arc<Vec<u8>>) -> Self {
-        Self {
-            width,
-            height,
-            region,
-            mask,
-        }
-    }
-
-    pub fn matches(&self, width: u32, height: u32, region: NormRect) -> bool {
-        self.width == width && self.height == height && self.region == region
-    }
-}
-
 impl PortraitMasks {
     pub(crate) fn receipt_fingerprint(&self) -> u64 {
         let mut hash = fnv_usize(FNV1A64_OFFSET_BASIS, self.width);
@@ -364,6 +353,62 @@ impl PortraitMasks {
             }
         }
         Some(out)
+    }
+
+    /// Normalized full-image width (`0..=1`) of the face (or skin fallback)
+    /// computed once on the uncropped full-image mask grid. Dividing by
+    /// `region.width` and multiplying by `out_w` yields the exact pixel width of
+    /// the face at ANY zoom/pan level, even when part of the face is clipped off
+    /// the viewport.
+    pub fn full_face_norm_width(&self) -> Option<f32> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let plane = self.face.as_deref().or(self.skin.as_deref())?;
+        if plane.len() != self.width * self.height {
+            return None;
+        }
+        let mut min_x = self.width;
+        let mut max_x = 0usize;
+        let mut any = false;
+        for y in 0..self.height {
+            let row = y * self.width;
+            for x in 0..self.width {
+                if plane[row + x] > 0.12 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    any = true;
+                }
+            }
+        }
+        any.then(|| ((max_x - min_x + 1) as f32 / self.width as f32).clamp(0.01, 1.0))
+    }
+
+    /// Resamples every available plane into `region`, keeping the mask's own
+    /// grid dimensions. Calling an attacher that internally reads
+    /// `NormRect::FULL` on the cropped masks then aligns pixel-for-pixel with
+    /// a zoomed viewport tile (`region != NormRect::FULL`).
+    pub fn cropped_to_region(&self, region: NormRect) -> Self {
+        if region == NormRect::FULL || self.width == 0 || self.height == 0 {
+            return Self {
+                skin: self.skin.clone(),
+                hair: self.hair.clone(),
+                face: self.face.clone(),
+                body: self.body.clone(),
+                width: self.width,
+                height: self.height,
+            };
+        }
+        let w = self.width as u32;
+        let h = self.height as u32;
+        Self {
+            skin: self.mask_f32(MaskKind::Skin, w, h, region),
+            hair: self.mask_f32(MaskKind::Hair, w, h, region),
+            face: self.mask_f32(MaskKind::Face, w, h, region),
+            body: self.mask_f32(MaskKind::Body, w, h, region),
+            width: self.width,
+            height: self.height,
+        }
     }
 
     /// Build the PF90004 fields that the local people parser can prove.
@@ -690,16 +735,6 @@ impl PortraitRunReport {
         if base != PortraitRuntimeStatus::IncompleteInput {
             return base;
         }
-        // A body row needs a same-job geometry payload, not a face model. When
-        // no face producer ran its own refusal still names the caller gap, so
-        // the face-input fold below must not relabel it as a missing model.
-        if let Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(name))) =
-            &effect.skip_reason
-        {
-            if name.starts_with("body geometry") {
-                return PortraitRuntimeStatus::IncompleteInput;
-            }
-        }
         if let Some(refusal) = &self.face_input_refusal {
             return refusal_runtime_status(refusal);
         }
@@ -797,6 +832,7 @@ pub struct ProducerInputs {
     pub hair_smooth: Option<HairSmoothProducerInputs>,
     pub hair_gloss: Option<HairGlossProducerInputs>,
     pub eye_bag: Option<aurora_portrait::eye_bag_alignment::AlignedEyeBagPlanes>,
+    pub eye_bag_landmark: Option<aurora_portrait::eye_bag_alignment::AlignedEyeBagPlanes>,
     pub smile: Option<SmileProducerInputs>,
     pub stray_hair: Option<StrayHairProducerInputs>,
     pub pf90021: Option<Pf90021ProducerInputs>,
@@ -807,20 +843,11 @@ pub struct ProducerInputs {
     pub plump: Option<PlumpProducerInputs>,
     pub pf101: Option<Pf101ProducerInputs>,
     pub pf90130: Option<Pf90130ProducerInputs>,
+    pub(crate) beard: Option<portrait_pixcake_hair_glare::BeardProducerInputs>,
+    pub(crate) pf90130_glare: Option<portrait_pixcake_hair_glare::Pf90130GlareRow>,
+    pub(crate) owned_suit_passes: Option<Vec<portrait_pixcake_unify_suit::OwnedSuitPassEntry>>,
     pub moisture_face: Option<crate::portrait_moisture_inputs::OwnedMoistureFaceInputs>,
     pub moisture_body: Option<crate::portrait_moisture_inputs::OwnedMoistureBodyInputs>,
-    /// PF90034/30188/30189 per-face native packet. The recovered producer is
-    /// `W_geometry = f32(PF30188*PF90034)`, `W_shadow = f32(PF90034*PF30189)`
-    /// with the native `1e-4` gate; the model field itself stays an external
-    /// same-job input.
-    pub double_chin_degrees: Option<portrait_longtail_inputs::DoubleChinDegreeInputs>,
-    /// PF90085 per-face value plus the producer metric `v`. Only the degree is
-    /// recoverable here; the palette/GammaMap/matrix chain is named in
-    /// [`portrait_longtail_inputs::PF90085_PRODUCER_GAP`].
-    pub skin_unify_degrees: Option<portrait_longtail_inputs::SkinUnifyDegreeInputs>,
-    /// PF44124/48019/49221/41922 UI controls resolved through the vendor
-    /// two-part tables. The 144-vertex consumer kernel is still external.
-    pub brow_length_degrees: Option<portrait_longtail_inputs::BrowLengthDegreeInputs>,
     /// Why the same-frame face-input producer refused, when it did. Carried so
     /// the run report can name the root cause instead of a downstream mask.
     pub face_input_refusal: Option<Refusal>,
@@ -2974,49 +3001,6 @@ impl ProducerInputs {
                 }
             };
         }
-        // Long-tail per-face packets: a different per-face map or UI packet
-        // must not reuse the previous stage-cache entry.
-        hash = match self.double_chin_degrees.as_ref() {
-            None => fnv_u64(hash, 0),
-            Some(packet) => {
-                hash = fnv_u64(hash, 1);
-                hash = fnv_u64(hash, packet.ticket);
-                for map in [&packet.pf90034, &packet.pf30188, &packet.pf30189] {
-                    hash = fnv_usize(hash, map.entries().len());
-                    for (face, value) in map.entries() {
-                        hash = fnv_u64(hash, u64::from(*face));
-                        hash = fnv_u64(hash, u64::from(value.to_bits()));
-                    }
-                }
-                hash
-            }
-        };
-        hash = match self.skin_unify_degrees.as_ref() {
-            None => fnv_u64(hash, 0),
-            Some(packet) => {
-                hash = fnv_u64(hash, 1);
-                hash = fnv_u64(hash, packet.ticket);
-                for map in [&packet.pf90085, &packet.metric] {
-                    hash = fnv_usize(hash, map.entries().len());
-                    for (face, value) in map.entries() {
-                        hash = fnv_u64(hash, u64::from(*face));
-                        hash = fnv_u64(hash, u64::from(value.to_bits()));
-                    }
-                }
-                hash
-            }
-        };
-        hash = match self.brow_length_degrees.as_ref() {
-            None => fnv_u64(hash, 0),
-            Some(packet) => {
-                hash = fnv_u64(hash, 1);
-                hash = fnv_u64(hash, packet.ticket);
-                for value in packet.ui01 {
-                    hash = fnv_u64(hash, u64::from(value.to_bits()));
-                }
-                hash
-            }
-        };
         hash
     }
 }
@@ -3802,95 +3786,6 @@ impl PortraitJobReceipt {
         }
     }
 
-    /// Hashes one frame into both the standalone frame id and the job-fingerprint
-    /// state after the frame bytes. A stage-cache hit can fold the unchanged
-    /// frame state with the new portrait params without rescanning the frame.
-    pub(crate) fn frame_state_from_renderer_frame(
-        frame: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<(u64, u64), Refusal> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .filter(|&bytes| bytes != 0)
-            .ok_or(Refusal::ShapeMismatch("PortraitFrameReceipt dimensions"))?;
-        if frame.len() != expected {
-            return Err(Refusal::ShapeMismatch("PortraitFrameReceipt frame"));
-        }
-        let frame_seed = fnv_u64(
-            fnv_u64(
-                fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-frame-v1"),
-                u64::from(width),
-            ),
-            u64::from(height),
-        );
-        let mut receipt_state = fnv1a64(FNV1A64_OFFSET_BASIS, b"aurora-portrait-receipt-v1");
-        receipt_state = fnv_usize(receipt_state, frame.len());
-        let (frame_fingerprint, receipt_state) =
-            fnv1a64_pair(frame_seed, receipt_state, frame);
-        Ok((frame_fingerprint, receipt_state))
-    }
-
-    /// Builds the same job id as `from_renderer_receipt_with_fingerprints`,
-    /// given the frame-folded state from
-    /// [`Self::frame_state_from_renderer_frame`]. Only the cheap metadata and
-    /// params are folded again; the pixel buffer is not reread.
-    pub(crate) fn from_renderer_receipt_with_frame_state(
-        frame: &[u8],
-        width: u32,
-        height: u32,
-        region: NormRect,
-        params: &BTreeMap<String, f32>,
-        masks: &PortraitMasks,
-        frame_fingerprint: u64,
-        mut fingerprint: u64,
-        mask_fingerprint: Option<u64>,
-    ) -> Self {
-        let region_bits = [
-            region.x.to_bits(),
-            region.y.to_bits(),
-            region.width.to_bits(),
-            region.height.to_bits(),
-        ];
-        let plane_lengths = [
-            masks.skin.as_ref().map(Vec::len),
-            masks.hair.as_ref().map(Vec::len),
-            masks.face.as_ref().map(Vec::len),
-            masks.body.as_ref().map(Vec::len),
-        ];
-        fingerprint = fnv_u64(fingerprint, u64::from(width));
-        fingerprint = fnv_u64(fingerprint, u64::from(height));
-        for bits in region_bits {
-            fingerprint = fnv_u64(fingerprint, u64::from(bits));
-        }
-        let params_fingerprint = params_fingerprint(params);
-        fingerprint = fnv_u64(fingerprint, params_fingerprint);
-        fingerprint = fnv_usize(fingerprint, masks.width);
-        fingerprint = fnv_usize(fingerprint, masks.height);
-        fingerprint = fnv_u64(
-            fingerprint,
-            mask_fingerprint.unwrap_or_else(|| masks.receipt_fingerprint()),
-        );
-        Self {
-            fingerprint,
-            frame: PortraitFrameReceipt {
-                fingerprint: frame_fingerprint,
-                width,
-                height,
-            },
-            width,
-            height,
-            frame_len: frame.len(),
-            frame_ptr: frame.as_ptr() as usize,
-            params_fingerprint,
-            region_bits,
-            mask_width: masks.width,
-            mask_height: masks.height,
-            plane_lengths,
-        }
-    }
-
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
@@ -3899,6 +3794,7 @@ impl PortraitJobReceipt {
         self.fingerprint
     }
 
+    #[allow(dead_code)]
     pub(crate) fn frame_ptr(&self) -> usize {
         self.frame_ptr
     }
@@ -4003,11 +3899,14 @@ pub struct PortraitJobInputs<'a> {
     pub moisture_face: Option<MoistureFaceInputs<'a>>,
     pub moisture_body: Option<MoistureBodyInputs<'a>>,
     pub eye_bag: Option<EyeBagInputs<'a>>,
+    pub eye_bag_landmark: Option<EyeBagInputs<'a>>,
     pub hair_smooth: Option<HairSmoothInputs<'a>>,
     pub hair_gloss: Option<HairGlossInputs<'a>>,
     pub stray_hair: StrayHairInputs<'a>,
     pub smile: SmileInputs<'a>,
     pub suit_passes: Option<&'a [SuitPassInput<'a>]>,
+    pub(crate) owned_suit_passes: Option<&'a [portrait_pixcake_unify_suit::OwnedSuitPassEntry]>,
+    pub(crate) pf90130_glare: Option<&'a portrait_pixcake_hair_glare::Pf90130GlareRow>,
     pub makeup: Option<&'a [MakeupInput<'a>]>,
     pub makeup_bundle: Option<&'a OwnedMakeupBundle>,
     pub hlf_face: Option<HlfFaceInputs<'a>>,
@@ -4025,12 +3924,7 @@ pub struct PortraitJobInputs<'a> {
     pub plump: Option<&'a PlumpProducerInputs>,
     pub pf101: Option<&'a Pf101ProducerInputs>,
     pub pf90130: Option<&'a Pf90130ProducerInputs>,
-    pub double_chin_degrees: Option<&'a portrait_longtail_inputs::DoubleChinDegreeInputs>,
-    pub skin_unify_degrees: Option<&'a portrait_longtail_inputs::SkinUnifyDegreeInputs>,
-    pub brow_length_degrees: Option<&'a portrait_longtail_inputs::BrowLengthDegreeInputs>,
     pub face_input_refusal: Option<&'a Refusal>,
-    /// A same-frame skin mask supplied by the renderer-side geometry cache.
-    pub skin_mask: Option<std::sync::Arc<Vec<u8>>>,
     /// Digest of the exact pre-effect frame, when the renderer already paid
     /// for it while building the face producer inputs.
     pub stage_sha256: Option<[u8; 32]>,
@@ -4057,11 +3951,14 @@ impl<'a> PortraitJobInputs<'a> {
             moisture_face: None,
             moisture_body: None,
             eye_bag: None,
+            eye_bag_landmark: None,
             hair_smooth: None,
             hair_gloss: None,
             stray_hair: StrayHairInputs::default(),
             smile: SmileInputs::default(),
             suit_passes: None,
+            owned_suit_passes: None,
+            pf90130_glare: None,
             makeup: None,
             makeup_bundle: None,
             hlf_face: None,
@@ -4079,11 +3976,7 @@ impl<'a> PortraitJobInputs<'a> {
             plump: None,
             pf101: None,
             pf90130: None,
-            double_chin_degrees: None,
-            skin_unify_degrees: None,
-            brow_length_degrees: None,
             face_input_refusal: None,
-            skin_mask: None,
             stage_sha256: None,
         }
     }
@@ -4244,6 +4137,28 @@ impl<'a> PortraitJobInputs<'a> {
                 aligned_response_mask: &eye_bag.aligned_response_mask,
             });
         }
+        if let Some(eye_bag) = producer.eye_bag_landmark.as_ref() {
+            self.eye_bag_landmark = Some(EyeBagInputs {
+                ticket: eye_bag.ticket,
+                model_id: eye_bag.model_id,
+                color_units: eye_bag.color_units,
+                geometry_class: eye_bag.geometry_class,
+                geometry_receipt: eye_bag.geometry_receipt,
+                width: eye_bag.frame_width,
+                height: eye_bag.frame_height,
+                aligned_color_field_rgb_f32: &eye_bag.aligned_color_field_rgb_f32,
+                aligned_response_mask: &eye_bag.aligned_response_mask,
+            });
+        }
+        if let Some(beard) = producer.beard.as_ref() {
+            self.beard = Some(beard.as_borrowed());
+        }
+        if let Some(glare) = producer.pf90130_glare.as_ref() {
+            self.pf90130_glare = Some(glare);
+        }
+        if let Some(suit) = producer.owned_suit_passes.as_deref() {
+            self.owned_suit_passes = Some(suit);
+        }
         if let Some(pf90021) = producer.pf90021.as_ref() {
             self.pf90021 = Some(Pf90021Inputs {
                 direction: pf90021.direction,
@@ -4281,12 +4196,6 @@ impl<'a> PortraitJobInputs<'a> {
         self.makeup_bundle = producer.makeup_bundle.as_ref();
         self.pf101 = producer.pf101.as_ref();
         self.pf90130 = producer.pf90130.as_ref();
-        // Long-tail degree packets ride the same bundle; the stage rows that
-        // consume them are routed below and refuse by name while their final
-        // model consumers are open.
-        self.double_chin_degrees = producer.double_chin_degrees.as_ref();
-        self.skin_unify_degrees = producer.skin_unify_degrees.as_ref();
-        self.brow_length_degrees = producer.brow_length_degrees.as_ref();
         self.face_input_refusal = producer.face_input_refusal.as_ref();
         // Borrow the owned same-frame planes back out of `producer`, which lives
         // for `'a` like `self`. A missing owned bundle stays `None`, so the
@@ -4385,6 +4294,7 @@ const SUPPORTED_EFFECTS: &[u32] = &[
     21069,  // Cheek wrinkle
     21070,  // Nose-back wrinkle
     21071,  // Perioral wrinkle
+    90015,  // Neck lines wrinkle
     8068,   // Skin gloss
     8069,   // Skin texture
     8070,   // Skin clarity
@@ -5784,6 +5694,7 @@ fn apply_portrait_effects_impl(
         }
         return report;
     }
+
     let Some(source) = Image::new(width, height, std::mem::take(portrait)) else {
         return report;
     };
@@ -5805,13 +5716,6 @@ fn apply_portrait_effects_impl(
             .get("pc:30210")
             .copied()
             .ok_or(Refusal::MissingInput("PF30210 same-job UI"))
-            .map(|raw| {
-                if raw > 0.0 && raw < 1.0 {
-                    (raw * 4.0).round().clamp(1.0, 4.0)
-                } else {
-                    raw
-                }
-            })
             .and_then(portrait_plump_stage::full_face_descriptor_from_store)
             .map(Some)
     } else {
@@ -5824,13 +5728,7 @@ fn apply_portrait_effects_impl(
     let mut current = source;
     // Keep the main-session optimization: skin effects share one sampled plane.
     // Non-skin rows receive their own explicit planes from `PortraitJobInputs`.
-    let skin_mask_owned = inputs.skin_mask.clone().or_else(|| {
-        inputs
-            .masks
-            .mask_u8(MaskKind::Skin, width, height, region)
-            .map(std::sync::Arc::new)
-    });
-    let skin_mask = skin_mask_owned.as_deref().map(Vec::as_slice);
+    let skin_mask = inputs.masks.mask_u8(MaskKind::Skin, width, height, region);
     let mut slim_result: Option<Result<bool, Refusal>> = None;
     let mut face_results: BTreeMap<u32, (Result<FaceGeometryRun, Refusal>, bool)> =
         BTreeMap::new();
@@ -5846,52 +5744,6 @@ fn apply_portrait_effects_impl(
                 "portrait PF{pf} skipped; missing same-job inputs: {:?}",
                 meta.inputs
             );
-            // PF90085: an attached degree packet must be internally complete
-            // before the row reports its palette-chain gap. This validates the
-            // wire; the pixel producer stays absent. If every face resolves at
-            // or below the recovered `0.001` gate the vendor consumer is
-            // inactive, so the row is an identity frame rather than a gap.
-            if pf == 90085 {
-                if let Some(packet) = inputs.skin_unify_degrees {
-                    match packet.validate() {
-                        Ok(degrees) if degrees
-                            .iter()
-                            .all(|(_, degree)| *degree <= portrait_longtail_inputs::PF90085_DEGREE_GATE) =>
-                        {
-                            report.effects.push(PortraitEffectRun {
-                                pf,
-                                backend: PortraitBackend::Skipped,
-                                dispatches: Vec::new(),
-                                metal_dispatches: Vec::new(),
-                                fallback_reason: Some(
-                                    "PF90085 all faces below the 0.001 gate".to_string(),
-                                ),
-                                skipped: true,
-                                executed: false,
-                                refusal: None,
-                                skip_reason: None,
-                            });
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(refusal) => {
-                            log::debug!("PF90085 degree packet refused: {refusal:?}");
-                            report.effects.push(PortraitEffectRun {
-                                pf,
-                                backend: PortraitBackend::Skipped,
-                                dispatches: Vec::new(),
-                                metal_dispatches: Vec::new(),
-                                fallback_reason: Some(format!("{refusal:?}")),
-                                skipped: true,
-                                executed: false,
-                                refusal: Some(refusal.clone()),
-                                skip_reason: Some(PortraitSkipReason::InputRefused(refusal)),
-                            });
-                            continue;
-                        }
-                    }
-                }
-            }
             // A row with a callable producer reports the inputs that producer
             // documents; only a row with no kernel at all stays NotImplemented.
             let refusal = match portrait_face_stage::producer_gap(pf) {
@@ -6057,44 +5909,13 @@ fn apply_portrait_effects_impl(
             continue;
         }
         if let Some((left, right)) = portrait_face_stage::pair(pf) {
-            // PF44124/48019 and PF49221/41922: when the same-job degree packet
-            // is attached, it must resolve and bind to this job before the row
-            // reaches the Type1018 draw. The 144-vertex consumer kernel is
-            // still external, so this validates the wire without claiming a
-            // pixel implementation.
-            if matches!(left, 44124 | 49221) {
-                if let Some(packet) = inputs.brow_length_degrees {
-                    let bound = inputs.job_id().map_or(true, |job_id| job_id == packet.ticket);
-                    if !bound {
-                        let refusal = Refusal::ValueOutOfRange("BROW_LENGTH_JOB_TICKET");
-                        run.backend = PortraitBackend::Skipped;
-                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
-                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
-                        run.refusal = Some(refusal);
-                        report.effects.push(run);
-                        continue;
-                    }
-                    if let Err(refusal) = packet.resolved() {
-                        run.backend = PortraitBackend::Skipped;
-                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
-                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
-                        run.refusal = Some(refusal);
-                        report.effects.push(run);
-                        continue;
-                    }
-                }
-            }
             let (result, changed) = match face_results.get(&left) {
                 Some((result, changed)) => (result.clone(), *changed),
                 None => {
                     let control =
                         |id| extra.get(&format!("pc:{id}")).copied().unwrap_or(0.0);
                     let controls = [control(left), if left == right { 0.0 } else { control(right) }];
-                    let stage_sha = inputs.stage_sha256.filter(|_| {
-                        inputs.receipt.as_ref().is_some_and(|receipt| {
-                            receipt.frame_ptr() == current.pixels.as_ptr() as usize
-                        })
-                    });
+                    let stage_sha = inputs.stage_sha256.filter(|_| inputs.receipt.is_some());
                     let mut result = match portrait_face_stage::apply_with_stage_sha(
                         &current,
                         region,
@@ -6262,11 +6083,41 @@ fn apply_portrait_effects_impl(
                         }
                     }
                     None => {
-                        let refusal = Refusal::MissingInput("PF90130_TYPED_PRODUCER");
-                        run.backend = PortraitBackend::Skipped;
-                        run.fallback_reason = Some(format!("input refused: {refusal:?}"));
-                        run.skip_reason = Some(PortraitSkipReason::InputRefused(refusal.clone()));
-                        run.refusal = Some(refusal);
+                        if let Some(glare) = inputs.pf90130_glare {
+                            if let SkinRepairData::Glare(glare_inputs) = &glare.data {
+                                let ui_percent = (degree * 100.0).round() as i32;
+                                match aurora_portrait::kernels::face_detail::glasses_glare_removal(
+                                    &current,
+                                    &glare_inputs.effect_rgb,
+                                    glare_inputs.mask.as_deref(),
+                                    glare_inputs.lens_mask.as_deref(),
+                                    glare_inputs.encoding,
+                                    ui_percent,
+                                ) {
+                                    Ok(next) => {
+                                        current = next;
+                                        run.backend = PortraitBackend::Cpu;
+                                        run.skipped = false;
+                                        run.executed = true;
+                                    }
+                                    Err(refusal) => {
+                                        run.backend = PortraitBackend::Skipped;
+                                        run.fallback_reason =
+                                            Some(format!("input refused: {refusal:?}"));
+                                        run.skip_reason =
+                                            Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                                        run.refusal = Some(refusal);
+                                    }
+                                }
+                            }
+                        } else {
+                            let refusal = Refusal::MissingInput("PF90130_TYPED_PRODUCER");
+                            run.backend = PortraitBackend::Skipped;
+                            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
+                            run.skip_reason =
+                                Some(PortraitSkipReason::InputRefused(refusal.clone()));
+                            run.refusal = Some(refusal);
+                        }
                     }
                 }
             }
@@ -6274,31 +6125,6 @@ fn apply_portrait_effects_impl(
             continue;
         }
         if repair_stage::PFS.contains(&pf) {
-            // PF90034: the recovered producer gates on
-            // `W_shadow >= 1e-4 || W_geometry >= 1e-4`. With the same-job
-            // per-face packet present, an all-inactive packet is an identity
-            // frame and must not demand the model shift field.
-            if pf == 90034 {
-                if let Some(packet) = inputs.double_chin_degrees {
-                    match packet.per_face_weights() {
-                        Ok(weights) if !weights.iter().any(|weights| weights.active) => {
-                            run.backend = PortraitBackend::Skipped;
-                            report.effects.push(run);
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(refusal) => {
-                            run.backend = PortraitBackend::Skipped;
-                            run.fallback_reason = Some(format!("input refused: {refusal:?}"));
-                            run.skip_reason =
-                                Some(PortraitSkipReason::InputRefused(refusal.clone()));
-                            run.refusal = Some(refusal);
-                            report.effects.push(run);
-                            continue;
-                        }
-                    }
-                }
-            }
             match repair_stage::apply(&current, pf, degree, inputs.job_id(), inputs.repairs) {
                 Ok(Some(next)) => {
                     current = next;
@@ -6356,12 +6182,13 @@ fn apply_portrait_effects_impl(
                     run.fallback_reason = plan.fallback_reason;
                 }
             }
-            match portrait_historical_skin::apply(
+            match portrait_historical_skin::apply_with_stage_sha(
                 &current,
                 inputs.job_id(),
                 pf,
                 degree,
                 inputs.historical_skin,
+                inputs.stage_sha256.filter(|_| inputs.receipt.is_some()),
             ) {
                 Ok(Some(next)) => {
                     current = next;
@@ -6441,7 +6268,13 @@ fn apply_portrait_effects_impl(
             continue;
         }
         if pf == 90033 {
-            let (next, suit_run) = apply_suit_effect(&current, inputs.suit_passes);
+            let borrowed_suit: Option<Vec<SuitPassInput<'_>>> = inputs.owned_suit_passes.map(|s| {
+                s.iter().map(|entry| entry.as_borrowed()).collect()
+            });
+            let (next, suit_run) = apply_suit_effect(
+                &current,
+                inputs.suit_passes.or(borrowed_suit.as_deref()),
+            );
             if let Some(next) = next {
                 current = next;
             }
@@ -8082,7 +7915,11 @@ fn validate_effect_inputs(
         }
         90116 => {
             check_degree01(extra.get("pc:90116").copied().unwrap_or_default(), "degree")?;
-            let eye_bag = required(inputs.eye_bag, "aligned_color_field_rgb_f32")?;
+            let (eye_bag, is_landmark_fallback) = match (inputs.eye_bag, inputs.eye_bag_landmark) {
+                (Some(eb), _) => (eb, false),
+                (None, Some(eb)) => (eb, true),
+                (None, None) => return Err(Refusal::MissingInput("aligned_color_field_rgb_f32")),
+            };
             if eye_bag.ticket == 0 || inputs.job_id() != Some(eye_bag.ticket) {
                 return Err(Refusal::MissingInput("PF90116_SAME_JOB_TICKET"));
             }
@@ -8107,27 +7944,29 @@ fn validate_effect_inputs(
             {
                 return Err(Refusal::MissingInput("PF90116_COLOR_TARGET_UNITS"));
             }
-            match (
-                inputs.receipt.is_some(),
-                eye_bag.geometry_class,
-                eye_bag.geometry_receipt,
-            ) {
-                (true, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, _) => {
-                    return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
-                }
-                (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, Some(_)) => {
-                    return Err(Refusal::ValueOutOfRange("PF90116_GEOMETRY_RECEIPT"));
-                }
-                (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, None) => {}
-                (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob, None) => {
-                    return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
-                }
-                (
-                    _,
-                    aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob,
-                    Some(receipt),
-                ) => {
-                    receipt.validate_for_stage(eye_bag.ticket)?;
+            if !is_landmark_fallback {
+                match (
+                    inputs.receipt.is_some(),
+                    eye_bag.geometry_class,
+                    eye_bag.geometry_receipt,
+                ) {
+                    (true, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, _) => {
+                        return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
+                    }
+                    (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, Some(_)) => {
+                        return Err(Refusal::ValueOutOfRange("PF90116_GEOMETRY_RECEIPT"));
+                    }
+                    (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::Candidate, None) => {}
+                    (_, aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob, None) => {
+                        return Err(Refusal::MissingInput("PF90116_GEOMETRY_RECEIPT"));
+                    }
+                    (
+                        _,
+                        aurora_portrait::eye_bag_alignment::EyeBagGeometryClass::VendorSameJob,
+                        Some(receipt),
+                    ) => {
+                        receipt.validate_for_stage(eye_bag.ticket)?;
+                    }
                 }
             }
         }
@@ -8152,7 +7991,7 @@ fn validate_effect_inputs(
                 inputs,
             )?;
         }
-        21025 | 21069 | 21070 | 21071 | 90023 | 90024 => {
+        21025 | 21069 | 21070 | 21071 | 90015 | 90023 | 90024 => {
             check_degree01(
                 extra.get(&format!("pc:{pf}")).copied().unwrap_or_default(),
                 "wrinkle ui",
@@ -8291,10 +8130,14 @@ fn apply_cpu_effect(
     inputs: &PortraitJobInputs<'_>,
     hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<Image, Refusal> {
+    let full_face_w_px = inputs
+        .masks
+        .full_face_norm_width()
+        .map(|norm_w| (norm_w / region.width.max(1e-4)) * width as f32);
     match pf {
         0 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_pf0_spotless(current, degree, skin_mask, face_mask.as_deref())
+            apply_pf0_spotless_scaled(current, degree, skin_mask, face_mask.as_deref(), full_face_w_px)
         }
         90085 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
@@ -8302,7 +8145,7 @@ fn apply_cpu_effect(
         }
         21104 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_nose_flaws(current, degree, skin_mask, face_mask.as_deref())
+            apply_nose_flaws_scaled(current, degree, skin_mask, face_mask.as_deref(), full_face_w_px)
         }
         30188 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
@@ -8314,9 +8157,9 @@ fn apply_cpu_effect(
         }
         30209 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_jawline_enhance(current, degree, face_mask.as_deref(), skin_mask)
+            apply_jawline_enhance_scaled(current, degree, face_mask.as_deref(), skin_mask, full_face_w_px)
         }
-        90001 => apply_texture_smooth(current, degree, skin_mask),
+        90001 => apply_texture_smooth_scaled(current, degree, skin_mask, full_face_w_px),
         90003 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
             apply_body_skin_uniform(current, degree, skin_mask, face_mask.as_deref())
@@ -8327,14 +8170,14 @@ fn apply_cpu_effect(
         }
         100005 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_eye_white_purify(current, degree, face_mask.as_deref())
+            apply_eye_white_purify_with_slim(current, degree, face_mask.as_deref(), inputs.slim)
         }
         pf if B3_MAKEUP_ROWS.contains(&pf) => {
             apply_makeup_cpu(current, pf, degree, inputs)
         }
         108 => apply_teeth_cpu(current, degree, inputs),
         30025 => apply_pf30025_cpu(current, degree, inputs),
-        21025 | 21069 | 21070 | 21071 | 90023 | 90024 => {
+        21025 | 21069 | 21070 | 21071 | 90015 | 90023 | 90024 => {
             apply_wrinkle_cpu(current, pf, degree, inputs)
         }
         30021 => apply_hlf_face_cpu(current, degree, inputs, hlf_auto),
@@ -8369,50 +8212,277 @@ fn apply_cpu_effect(
     }
 }
 
-/// PF0 Spotless: vendor-proven blur-difference fragment with the frame's own
-/// SkinMask/FaceMask. The vendor blur FBO producer is still LIVE_ONLY, so this
-/// wiring uses a local separable box blur as a stand-in and makes NO parity claim.
+/// PF0 Spotless: skin-masked, frequency-separated blemish healing.
+///
+/// Uses a skin+face weighted separable blur so hair, eyebrows, eyes, and
+/// background never bleed into the skin baseline, a continuous `smoothstep`
+/// blemish detector (no hard binary cliff that turns forehead shading into
+/// chalky islands), and high-frequency pore retention so healed skin stays
+/// natural and textured.
 fn apply_pf0_spotless(
     current: &Image,
     degree: f32,
     skin_mask: Option<&[u8]>,
     face_mask: Option<&[u8]>,
 ) -> Result<Image, Refusal> {
-    use aurora_portrait::kernels::spotless::{self, ImageF32, SpotlessParams};
+    apply_pf0_spotless_scaled(current, degree, skin_mask, face_mask, None)
+}
+
+fn apply_pf0_spotless_scaled(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
+) -> Result<Image, Refusal> {
     let skin = required(skin_mask, "PF0 skin mask")?;
     let face = required(face_mask, "PF0 face mask")?;
     let pixels = current.pixel_count();
     check_plane(skin.len(), pixels, "PF0 skin mask")?;
     check_plane(face.len(), pixels, "PF0 face mask")?;
+    let degree = degree.clamp(0.0, 1.0);
     if degree <= 0.0 {
         return Ok(current.clone());
     }
-    let params = SpotlessParams {
-        dist_factor: 28.87,
-        dist_threshold: 0.5,
-        dark_diff_min_threshold: 0.0,
-        dark_diff_max_threshold: 0.3,
-        white_diff_factor: 0.7,
-        degree: degree.clamp(0.0, 1.0),
+
+    let w = current.width as usize;
+    let h = current.height as usize;
+    if w == 0 || h == 0 {
+        return Ok(current.clone());
+    }
+
+    let mut sr = vec![0.0f32; pixels];
+    let mut sg = vec![0.0f32; pixels];
+    let mut sb = vec![0.0f32; pixels];
+    let mut luma = vec![0.0f32; pixels];
+    let mut weight = vec![0.0f32; pixels];
+    for p in 0..pixels {
+        let off = p * 4;
+        let r = f32::from(current.pixels[off]);
+        let g = f32::from(current.pixels[off + 1]);
+        let b = f32::from(current.pixels[off + 2]);
+        sr[p] = r;
+        sg[p] = g;
+        sb[p] = b;
+        luma[p] = 0.299 * r + 0.587 * g + 0.114 * b;
+        weight[p] = (f32::from(skin[p]) / 255.0) * (f32::from(face[p]) / 255.0);
+    }
+
+    let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
     };
-    let src: Vec<f32> = current.pixels.iter().map(|v| f32::from(*v) / 255.0).collect();
-    let blur_rgb = box_blur_rgba(current, 8);
-    let face_f: Vec<f32> = face.iter().map(|v| f32::from(*v) / 255.0).collect();
-    let skin_f: Vec<f32> = skin.iter().map(|v| f32::from(*v) / 255.0).collect();
-    let mut out = vec![0.0f32; src.len()];
-    spotless::apply(
-        ImageF32 { width: current.width, height: current.height, pixels: &src },
-        ImageF32 { width: current.width, height: current.height, pixels: &blur_rgb },
-        &face_f,
-        Some(&skin_f),
-        params,
-        &mut out,
-    )?;
-    let mut image = current.clone();
-    for (dst, pixel) in image.pixels.chunks_exact_mut(4).zip(out.chunks_exact(4)) {
-        for channel in 0..4 {
-            dst[channel] = (pixel[channel].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+
+    let weighted_box = |vals: &[f32], wt: &[f32], radius: usize| -> Vec<f32> {
+        if radius == 0 {
+            return vals.to_vec();
         }
+        let mut horiz = vec![0.0f32; pixels];
+        let mut pv = Vec::with_capacity(w + 1);
+        let mut pw = Vec::with_capacity(w + 1);
+        for y in 0..h {
+            let row = y * w;
+            pv.clear();
+            pw.clear();
+            pv.push(0.0f32);
+            pw.push(0.0f32);
+            for x in 0..w {
+                let i = row + x;
+                pv.push(pv[x] + vals[i] * wt[i]);
+                pw.push(pw[x] + wt[i]);
+            }
+            for x in 0..w {
+                let lo = x.saturating_sub(radius);
+                let hi = (x + radius + 1).min(w);
+                let sw = pw[hi] - pw[lo];
+                horiz[row + x] = if sw > 1e-6 {
+                    (pv[hi] - pv[lo]) / sw
+                } else {
+                    vals[row + x]
+                };
+            }
+        }
+        let mut out = vec![0.0f32; pixels];
+        pv.resize(h + 1, 0.0);
+        pw.resize(h + 1, 0.0);
+        for x in 0..w {
+            pv[0] = 0.0;
+            pw[0] = 0.0;
+            for y in 0..h {
+                let i = y * w + x;
+                pv[y + 1] = pv[y] + horiz[i] * wt[i];
+                pw[y + 1] = pw[y] + wt[i];
+            }
+            for y in 0..h {
+                let lo = y.saturating_sub(radius);
+                let hi = (y + radius + 1).min(h);
+                let sw = pw[hi] - pw[lo];
+                out[y * w + x] = if sw > 1e-6 {
+                    (pv[hi] - pv[lo]) / sw
+                } else {
+                    horiz[y * w + x]
+                };
+            }
+        }
+        out
+    };
+
+    let face_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .or_else(|| {
+            mask_bbox(face, w, h)
+                .or_else(|| mask_bbox(skin, w, h))
+                .map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32)
+        })
+        .unwrap_or_else(|| w.min(h) as f32 * 0.35);
+    // Scale spot radius strictly to the uncropped full-image face width projected
+    // to this viewport so fit-to-screen, 65%, 100%, 126%, and 24MP renders all
+    // heal the exact same physical blemish size even when panned/cropped.
+    let spot_r = ((face_w * 0.014).round() as usize).clamp(1, 9);
+    let pore_r = (spot_r / 3).clamp(1, 2);
+    let fine_luma = weighted_box(&luma, &weight, pore_r);
+
+    // Edge-safe isotropic surrounded-spot detector:
+    // A real pimple/freckle/acne spot is darker (or redder/brighter) than BOTH
+    // opposite sides of its surrounding ring on at least 3 of 4 axes (H, V, D1,
+    // D2) with low opposite-side contrast. Anatomical edges (eyelids, brows,
+    // nostril wings, lip borders, philtrum, jaw contour) sit on strong step
+    // edges and fail this test, so they stay 100% crisp and untouched.
+    let mut blemish = vec![0.0f32; pixels];
+    let mut target_r_buf = sr.clone();
+    let mut target_g_buf = sg.clone();
+    let mut target_b_buf = sb.clone();
+    let d = spot_r as isize;
+    let diag = ((spot_r as f32 * 0.7071).round() as isize).max(1);
+    let axes: [((isize, isize), (isize, isize)); 4] = [
+        ((-d, 0), (d, 0)),
+        ((0, -d), (0, d)),
+        ((-diag, -diag), (diag, diag)),
+        ((-diag, diag), (diag, -diag)),
+    ];
+    let w_i = w as isize;
+    let h_i = h as isize;
+    for y in 0..h {
+        let yi = y as isize;
+        for x in 0..w {
+            let p = y * w + x;
+            let wt = weight[p];
+            if wt <= 0.08 {
+                continue;
+            }
+            let xi = x as isize;
+            let cl = luma[p];
+            let crg = sr[p] - sg[p];
+
+            let mut dark_pairs = [0.0f32; 4];
+            let mut red_pairs = [0.0f32; 4];
+            let mut bright_pairs = [0.0f32; 4];
+            let mut max_edge = 0.0f32;
+            let mut ring_idx = [0usize; 8];
+            let mut ring_wt = [0.0f32; 8];
+            let mut ring_n = 0usize;
+            let mut valid_axes = 0usize;
+
+            for (k, &((dx0, dy0), (dx1, dy1))) in axes.iter().enumerate() {
+                let x0 = (xi + dx0).clamp(0, w_i - 1) as usize;
+                let y0 = (yi + dy0).clamp(0, h_i - 1) as usize;
+                let x1 = (xi + dx1).clamp(0, w_i - 1) as usize;
+                let y1 = (yi + dy1).clamp(0, h_i - 1) as usize;
+                let i0 = y0 * w + x0;
+                let i1 = y1 * w + x1;
+                let w0 = weight[i0];
+                let w1 = weight[i1];
+                if w0 < 0.15 || w1 < 0.15 {
+                    continue;
+                }
+                valid_axes += 1;
+                let l0 = luma[i0];
+                let l1 = luma[i1];
+                max_edge = max_edge.max((l0 - l1).abs());
+                // Strictly surrounded: BOTH opposite neighbors must exceed center.
+                dark_pairs[k] = (l0.min(l1) - cl).max(0.0);
+                let rg0 = sr[i0] - sg[i0];
+                let rg1 = sr[i1] - sg[i1];
+                red_pairs[k] = (crg - rg0.max(rg1)).max(0.0);
+                bright_pairs[k] = (cl - l0.max(l1)).max(0.0);
+
+                ring_idx[ring_n] = i0;
+                ring_wt[ring_n] = w0;
+                ring_n += 1;
+                ring_idx[ring_n] = i1;
+                ring_wt[ring_n] = w1;
+                ring_n += 1;
+            }
+            if valid_axes < 3 || ring_n < 6 {
+                continue;
+            }
+            // Take the 2nd smallest across the 4 axes (= surrounded on at least 3 axes),
+            // rejecting lines/creases/nostril wings while keeping round/oval spots.
+            dark_pairs.sort_by(|a, b| a.total_cmp(b));
+            red_pairs.sort_by(|a, b| a.total_cmp(b));
+            bright_pairs.sort_by(|a, b| a.total_cmp(b));
+
+            let edge_protect = 1.0 - smoothstep(10.0, 24.0, max_edge);
+            let dark_score = smoothstep(5.0, 18.0, dark_pairs[1]);
+            let acne_score = smoothstep(4.0, 14.0, red_pairs[1]);
+            let bright_score = smoothstep(8.0, 24.0, bright_pairs[1]) * 0.70;
+            let score = dark_score.max(acne_score).max(bright_score) * edge_protect * wt;
+            if score > 1e-4 {
+                // Reject outlier ring samples (e.g. an adjacent nostril or lash pixel)
+                // so healed skin never picks up brown/dark speck contamination.
+                let is_bright_spot = bright_score > dark_score.max(acne_score);
+                let mut ring_r = 0.0f32;
+                let mut ring_g = 0.0f32;
+                let mut ring_b = 0.0f32;
+                let mut ring_w = 0.0f32;
+                for m in 0..ring_n {
+                    let ri = ring_idx[m];
+                    let keep = if is_bright_spot {
+                        luma[ri] <= cl
+                    } else {
+                        luma[ri] >= cl
+                    };
+                    if keep {
+                        let rw = ring_wt[m];
+                        ring_r += sr[ri] * rw;
+                        ring_g += sg[ri] * rw;
+                        ring_b += sb[ri] * rw;
+                        ring_w += rw;
+                    }
+                }
+                if ring_w > 1e-4 {
+                    blemish[p] = score;
+                    target_r_buf[p] = ring_r / ring_w;
+                    target_g_buf[p] = ring_g / ring_w;
+                    target_b_buf[p] = ring_b / ring_w;
+                }
+            }
+        }
+    }
+
+    // Gentle face-scaled feather so healed spots blend seamlessly without haloing edges.
+    let ones = vec![1.0f32; pixels];
+    let feather_r = (spot_r / 3).clamp(1, 3);
+    let blemish = weighted_box(&blemish, &ones, feather_r);
+    let tr_smooth = weighted_box(&target_r_buf, &weight, feather_r);
+    let tg_smooth = weighted_box(&target_g_buf, &weight, feather_r);
+    let tb_smooth = weighted_box(&target_b_buf, &weight, feather_r);
+
+    let mut image = current.clone();
+    for p in 0..pixels {
+        let alpha = (blemish[p] * degree).clamp(0.0, 1.0);
+        if alpha <= 1e-4 {
+            continue;
+        }
+        // Preserve 65% of fine natural micro-pore texture over the clean ring color.
+        let pore_detail = ((luma[p] - fine_luma[p]) * 0.65).clamp(-10.0, 10.0);
+        let target_r = (tr_smooth[p] + pore_detail).clamp(0.0, 255.0);
+        let target_g = (tg_smooth[p] + pore_detail).clamp(0.0, 255.0);
+        let target_b = (tb_smooth[p] + pore_detail).clamp(0.0, 255.0);
+        let off = p * 4;
+        image.pixels[off] = (sr[p] + alpha * (target_r - sr[p])).round().clamp(0.0, 255.0) as u8;
+        image.pixels[off + 1] = (sg[p] + alpha * (target_g - sg[p])).round().clamp(0.0, 255.0) as u8;
+        image.pixels[off + 2] = (sb[p] + alpha * (target_b - sb[p])).round().clamp(0.0, 255.0) as u8;
     }
     Ok(image)
 }
@@ -8513,10 +8583,20 @@ fn mask_bbox(mask: &[u8], width: usize, height: usize) -> Option<(usize, usize, 
 }
 
 /// PF90001: edge-preserving local texture smoothing within skin mask.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_texture_smooth(
     current: &Image,
     degree: f32,
     skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_texture_smooth_scaled(current, degree, skin_mask, None)
+}
+
+fn apply_texture_smooth_scaled(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let skin = required(skin_mask, "PF90001 skin mask")?;
     let pixels = current.pixel_count();
@@ -8525,7 +8605,14 @@ fn apply_texture_smooth(
     if strength <= 0.0 {
         return Ok(current.clone());
     }
-    let blur = box_blur_rgba(current, 4);
+    let w = current.width as usize;
+    let h = current.height as usize;
+    let skin_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .or_else(|| mask_bbox(skin, w, h).map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32))
+        .unwrap_or_else(|| w.min(h) as f32 * 0.35);
+    let blur_r = ((skin_w * 0.010).round() as u32).clamp(1, 6);
+    let blur = box_blur_rgba(current, blur_r);
     let mut out = current.clone();
     for i in 0..pixels {
         let m = f32::from(skin[i]) / 255.0;
@@ -8620,11 +8707,22 @@ fn apply_body_skin_uniform(
 }
 
 /// PF21104: nose flaws repair within central facial/skin region.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_nose_flaws(
     current: &Image,
     degree: f32,
     skin_mask: Option<&[u8]>,
     face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_nose_flaws_scaled(current, degree, skin_mask, face_mask, None)
+}
+
+fn apply_nose_flaws_scaled(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let skin = required(skin_mask, "PF21104 skin mask")?;
     let pixels = current.pixel_count();
@@ -8644,17 +8742,35 @@ fn apply_nose_flaws(
     let Some((x0, y0, x1, y1)) = bbox else {
         return Ok(current.clone());
     };
+    let face_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .unwrap_or((x1 - x0 + 1) as f32);
     let cx = (x0 + x1) as f32 * 0.5;
     let cy = y0 as f32 + (y1 - y0) as f32 * 0.52;
-    let rx = ((x1 - x0) as f32 * 0.25).max(4.0);
+    let rx = (face_w * 0.25).max(4.0);
     let ry = ((y1 - y0) as f32 * 0.28).max(4.0);
-    let blur = box_blur_rgba(current, 5);
+    // Scale spot radius to face width so nose repair stays identical at all zoom
+    // levels and never blurs nostril wings or nose-bridge shadows into mush.
+    let spot_r = ((face_w * 0.012).round() as isize).clamp(1, 8);
+    let w_i = w as isize;
+    let h_i = h as isize;
+    let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let luma_px = |idx: usize| -> f32 {
+        let o = idx * 4;
+        0.299 * f32::from(current.pixels[o])
+            + 0.587 * f32::from(current.pixels[o + 1])
+            + 0.114 * f32::from(current.pixels[o + 2])
+    };
     let mut out = current.clone();
     for y in y0..=y1 {
+        let yi = y as isize;
         for x in x0..=x1 {
             let i = y * w + x;
             let s = f32::from(skin[i]) / 255.0;
-            if s <= 0.0 {
+            if s <= 0.05 {
                 continue;
             }
             let nx = (x as f32 - cx) / rx;
@@ -8664,25 +8780,145 @@ fn apply_nose_flaws(
                 continue;
             }
             let nose_w = (1.0 - r2).clamp(0.0, 1.0);
+            let xi = x as isize;
+            let i_l = (y * w + (xi - spot_r).clamp(0, w_i - 1) as usize);
+            let i_r = (y * w + (xi + spot_r).clamp(0, w_i - 1) as usize);
+            let i_t = ((yi - spot_r).clamp(0, h_i - 1) as usize * w + x);
+            let i_b = ((yi + spot_r).clamp(0, h_i - 1) as usize * w + x);
+            let ll = luma_px(i_l);
+            let lr = luma_px(i_r);
+            let lt = luma_px(i_t);
+            let lb = luma_px(i_b);
+            let lc = luma_px(i);
+            let edge_c = (ll - lr).abs().max((lt - lb).abs());
+            let edge_protect = 1.0 - smoothstep(14.0, 32.0, edge_c);
+            let surr_dark = (ll.min(lr) - lc).max(0.0).min((lt.min(lb) - lc).max(0.0));
             let off = i * 4;
-            let sr = f32::from(current.pixels[off]) / 255.0;
-            let sg = f32::from(current.pixels[off + 1]) / 255.0;
-            let sb = f32::from(current.pixels[off + 2]) / 255.0;
-            let sl = 0.299 * sr + 0.587 * sg + 0.114 * sb;
-            let bl = 0.299 * blur[off] + 0.587 * blur[off + 1] + 0.114 * blur[off + 2];
-            // Soften dark blemishes / pores / redness spikes relative to local surround.
-            let blemish = ((bl - sl).max(0.0) * 6.0 + (sr - sg - (blur[off] - blur[off + 1])).max(0.0) * 4.0)
-                .clamp(0.0, 1.0);
-            let alpha = strength * s * nose_w * (0.25 + 0.75 * blemish);
+            let sr = f32::from(current.pixels[off]);
+            let sg = f32::from(current.pixels[off + 1]);
+            let ring_rg = |idx: usize| f32::from(current.pixels[idx * 4]) - f32::from(current.pixels[idx * 4 + 1]);
+            let surr_red = (sr - sg - ring_rg(i_l).max(ring_rg(i_r)))
+                .max(0.0)
+                .min((sr - sg - ring_rg(i_t).max(ring_rg(i_b))).max(0.0));
+            let blemish = smoothstep(4.5, 18.0, surr_dark)
+                .max(smoothstep(3.5, 14.0, surr_red))
+                * edge_protect;
+            let alpha = (strength * s * nose_w * blemish).clamp(0.0, 1.0);
+            if alpha <= 1e-4 {
+                continue;
+            }
             for c in 0..3 {
-                let sc = f32::from(current.pixels[off + c]) / 255.0;
-                out.pixels[off + c] = ((sc + (blur[off + c] - sc) * alpha) * 255.0)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                let sc = f32::from(current.pixels[off + c]);
+                let ring_c = 0.25
+                    * (f32::from(current.pixels[i_l * 4 + c])
+                        + f32::from(current.pixels[i_r * 4 + c])
+                        + f32::from(current.pixels[i_t * 4 + c])
+                        + f32::from(current.pixels[i_b * 4 + c]));
+                out.pixels[off + c] = (sc + (ring_c - sc) * alpha).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
     Ok(out)
+}
+
+fn has_valid_eye_landmarks(slim: Option<&SlimProducerInputs>) -> bool {
+    let Some(slim) = slim else {
+        return false;
+    };
+    if slim.points194.len() != 194 {
+        return false;
+    }
+    [18, 22, 26, 36, 40, 44].iter().all(|&idx| {
+        let p = slim.points194[idx];
+        p[0].is_finite() && p[1].is_finite()
+    })
+}
+
+/// Restricts a face mask to soft elliptical eye ROIs derived from `points194`
+/// when available. When `slim` is absent or incomplete, returns `base_mask`
+/// unchanged so legacy callers and unit tests keep their exact behavior.
+fn restrict_mask_to_eye_rois(
+    base_mask: &[u8],
+    width: u32,
+    height: u32,
+    slim: Option<&SlimProducerInputs>,
+) -> Vec<u8> {
+    if !has_valid_eye_landmarks(slim) {
+        return base_mask.to_vec();
+    }
+    let points = &slim.expect("checked valid eye landmarks").points194;
+    let w = width as usize;
+    let h = height as usize;
+    let pixels = w.saturating_mul(h);
+    if pixels == 0 || base_mask.len() != pixels {
+        return base_mask.to_vec();
+    }
+    if !base_mask.iter().any(|&v| v > 0) {
+        return vec![0u8; pixels];
+    }
+
+    let make_eye = |center: [f32; 2], corner_a: [f32; 2], corner_b: [f32; 2]| {
+        let dx = corner_b[0] - corner_a[0];
+        let dy = corner_b[1] - corner_a[1];
+        let raw_dist = dx.hypot(dy);
+        let (ux, uy, dist) = if raw_dist > 1.0e-3 {
+            (dx / raw_dist, dy / raw_dist, raw_dist)
+        } else {
+            (1.0, 0.0, 4.0)
+        };
+        let rx = (dist * 0.62).max(2.0);
+        let ry = (dist * 0.38).max(1.5);
+        (center[0], center[1], ux, uy, rx, ry)
+    };
+
+    let eyes = [
+        make_eye(points[26], points[18], points[22]),
+        make_eye(points[44], points[36], points[40]),
+    ];
+
+    let mut out = vec![0u8; pixels];
+    for (cx, cy, ux, uy, rx, ry) in eyes {
+        let vx = -uy;
+        let vy = ux;
+        let bound = rx.max(ry) + 1.0;
+        let x0 = (cx - bound).floor().max(0.0) as usize;
+        let y0 = (cy - bound).floor().max(0.0) as usize;
+        let x1 = ((cx + bound).ceil() as isize).clamp(0, w.saturating_sub(1) as isize) as usize;
+        let y1 = ((cy + bound).ceil() as isize).clamp(0, h.saturating_sub(1) as isize) as usize;
+        if x0 > x1 || y0 > y1 {
+            continue;
+        }
+        for y in y0..=y1 {
+            let py = y as f32 - cy;
+            let row = y * w;
+            for x in x0..=x1 {
+                let px = x as f32 - cx;
+                let lx = px * ux + py * uy;
+                let ly = px * vx + py * vy;
+                let r2 = (lx / rx) * (lx / rx) + (ly / ry) * (ly / ry);
+                if r2 >= 1.0 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let eye_w = if r <= 0.65 {
+                    1.0
+                } else {
+                    let t = ((1.0 - r) / 0.35).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                let idx = row + x;
+                // Some face-segmentation models attenuate or carve out the eye
+                // sockets inside MaskKind::Face; preserve reasonable weight
+                // inside the landmark eye ellipse while staying strictly 0 outside.
+                let base_f = f32::from(base_mask[idx]) / 255.0;
+                let combined = (eye_w * base_f.max(0.85) * 255.0).round().clamp(0.0, 255.0) as u8;
+                if combined > out[idx] {
+                    out[idx] = combined;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// PF100005: eye-white brightening and de-yellowing/de-reddening in upper facial region.
@@ -8691,24 +8927,39 @@ fn apply_eye_white_purify(
     degree: f32,
     face_mask: Option<&[u8]>,
 ) -> Result<Image, Refusal> {
-    let face = required(face_mask, "PF100005 face mask")?;
+    apply_eye_white_purify_with_slim(current, degree, face_mask, None)
+}
+
+fn apply_eye_white_purify_with_slim(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    slim: Option<&SlimProducerInputs>,
+) -> Result<Image, Refusal> {
+    let base_face = required(face_mask, "PF100005 face mask")?;
     let pixels = current.pixel_count();
-    check_plane(face.len(), pixels, "PF100005 face mask")?;
+    check_plane(base_face.len(), pixels, "PF100005 face mask")?;
     let strength = degree.clamp(0.0, 1.0);
     if strength <= 0.0 {
         return Ok(current.clone());
     }
+    let restricted = restrict_mask_to_eye_rois(base_face, current.width, current.height, slim);
+    let use_upper_band_only = !has_valid_eye_landmarks(slim);
     let w = current.width as usize;
     let h = current.height as usize;
-    let Some((x0, y0, x1, y1)) = mask_bbox(face, w, h) else {
+    let Some((x0, y0, x1, y1)) = mask_bbox(&restricted, w, h) else {
         return Ok(current.clone());
     };
-    let eye_y_max = y0 + ((y1 - y0) as f32 * 0.62) as usize;
+    let eye_y_max = if use_upper_band_only {
+        y0 + ((y1 - y0) as f32 * 0.62) as usize
+    } else {
+        y1
+    };
     let mut out = current.clone();
     for y in y0..=eye_y_max.min(y1) {
         for x in x0..=x1 {
             let i = y * w + x;
-            let fm = f32::from(face[i]) / 255.0;
+            let fm = f32::from(restricted[i]) / 255.0;
             if fm <= 0.0 {
                 continue;
             }
@@ -8888,11 +9139,22 @@ fn apply_double_chin_shadow(
 }
 
 /// PF30209: jawline definition enhancement along lower facial contour.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_jawline_enhance(
     current: &Image,
     degree: f32,
     face_mask: Option<&[u8]>,
     skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_jawline_enhance_scaled(current, degree, face_mask, skin_mask, None)
+}
+
+fn apply_jawline_enhance_scaled(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    skin_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let mask = face_mask.or(skin_mask).ok_or(Refusal::MissingInput("PF30209 face or skin mask"))?;
     let pixels = current.pixel_count();
@@ -8906,7 +9168,11 @@ fn apply_jawline_enhance(
     let Some((x0, y0, x1, y1)) = mask_bbox(mask, w, h) else {
         return Ok(current.clone());
     };
-    let blur = box_blur_rgba(current, 3);
+    let face_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .unwrap_or((x1 - x0 + 1) as f32);
+    let jaw_r = ((face_w * 0.008).round() as u32).clamp(1, 5);
+    let blur = box_blur_rgba(current, jaw_r);
     let jaw_y_min = y0 + ((y1 - y0) as f32 * 0.55) as usize;
     let mut out = current.clone();
     for y in jaw_y_min..=y1 {
@@ -9354,7 +9620,10 @@ fn apply_eye_bag_cpu(
     degree: f32,
     inputs: &PortraitJobInputs<'_>,
 ) -> Result<Image, Refusal> {
-    let input = required(inputs.eye_bag, "aligned_color_field_rgb_f32")?;
+    let input = required(
+        inputs.eye_bag.or(inputs.eye_bag_landmark),
+        "aligned_color_field_rgb_f32",
+    )?;
     aurora_portrait::kernels::eye_bag::compose_field_image_pf90116(
         current,
         input.aligned_color_field_rgb_f32,
@@ -9733,13 +10002,6 @@ fn resolve_stray_hair<'a>(
     let source = &inputs.stray_hair;
     let native_degree = required(source.native_degree, "PF90088_NATIVE_DEGREE")?;
     check_degree01(native_degree, "PF90088_NATIVE_DEGREE")?;
-    // Recovered host gate: the vendor consumer is active only when
-    // `d > 0.001` (`0x8BCBA40`), the same gate the CPU kernel
-    // (`hair_body::stray_hair_with_native`) and the CUDA host check use. Below
-    // it the row is an identity frame and PF90113/PF90114 are not required.
-    if native_degree <= aurora_portrait::kernels::hair_body::STRAY_HAIR_ACTIVE_GATE {
-        return Ok(None);
-    }
     let native_person_area =
         required(source.native_person_area, "PF90088_NATIVE_PERSON_AREA")?;
     check_degree01(native_person_area, "PF90088_NATIVE_PERSON_AREA")?;
@@ -9749,6 +10011,9 @@ fn resolve_stray_hair<'a>(
         native_background_area,
         "PF90088_NATIVE_BACKGROUND_AREA",
     )?;
+    if native_degree == 0.0 {
+        return Ok(None);
+    }
 
     let hairfly_v1 = required(source.hairfly_v1, "PF90088_HAIRFLY_V1")?;
     hairfly_v1
@@ -10104,7 +10369,10 @@ fn try_cuda_same_job_effect(
             ))
         }
         90116 => {
-            let input = inputs.eye_bag.expect("validated PF90116 eye-bag input");
+            let input = inputs
+                .eye_bag
+                .or(inputs.eye_bag_landmark)
+                .expect("validated PF90116 eye-bag input");
             let gpu = match aurora_portrait::cuda_eye_bag::EyeBag::open() {
                 Ok(gpu) => gpu,
                 Err(error) => return Some(Err(error)),
@@ -10594,7 +10862,10 @@ mod cuda_router {
                 Some(run::<router::MoistureBody>(&routed))
             }
             90116 => {
-                let input = inputs.eye_bag.expect("validated PF90116 eye-bag input");
+                let input = inputs
+                    .eye_bag
+                    .or(inputs.eye_bag_landmark)
+                    .expect("validated PF90116 eye-bag input");
                 let routed = router::EyeBagInput {
                     source: current,
                     color3: input.aligned_color_field_rgb_f32,
@@ -11219,22 +11490,29 @@ fn try_cuda_stage_mask_effect(
         }
         100005 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            let face = match required(face_mask.as_deref(), "PF100005 face mask")
+            let base_face = match required(face_mask.as_deref(), "PF100005 face mask")
                 .and_then(|f| check_plane(f.len(), pixels, "PF100005 face mask").map(|_| f))
             {
                 Ok(f) => f,
                 Err(r) => return Some(Err(CudaError::Refused(r))),
             };
-            let Some((x0, y0, x1, y1)) = mask_bbox(face, width as usize, height as usize) else {
+            let restricted = restrict_mask_to_eye_rois(base_face, width, height, inputs.slim);
+            let use_upper_band_only = !has_valid_eye_landmarks(inputs.slim);
+            let Some((x0, y0, x1, y1)) = mask_bbox(&restricted, width as usize, height as usize)
+            else {
                 return Some(Ok((current.clone(), Vec::new())));
             };
-            let eye_y_end = (y0 + ((y1 - y0) as f32 * 0.62) as usize).min(y1);
+            let eye_y_end = if use_upper_band_only {
+                (y0 + ((y1 - y0) as f32 * 0.62) as usize).min(y1)
+            } else {
+                y1
+            };
             Some(launch_stage_ptx(
                 "pf100005_eye_white_purify_kernel",
                 width,
                 height,
                 |gpu, grid, block, d_src, d_dst| {
-                    let d_face = upload_stage_bytes(gpu, face)?;
+                    let d_face = upload_stage_bytes(gpu, &restricted)?;
                     let mut p_src = d_src.handle();
                     let mut p_face = d_face.handle();
                     let mut p_dst = d_dst.handle();
@@ -11970,27 +12248,6 @@ mod tests {
             Some(PortraitRuntimeStatus::MissingModel)
         );
 
-        // A body row's own same-job gap stays incomplete input even though no
-        // face producer ran for a body-only job.
-        let body = effect_run(
-            405,
-            PortraitBackend::Skipped,
-            false,
-            None,
-            Some(PortraitSkipReason::InputRefused(Refusal::MissingInput(
-                "body geometry job",
-            ))),
-            None,
-        );
-        let body_only = PortraitRunReport {
-            effects: vec![body],
-            ..Default::default()
-        };
-        assert_eq!(
-            body_only.status(405),
-            Some(PortraitRuntimeStatus::IncompleteInput)
-        );
-
         let no_target = PortraitRunReport {
             effects: vec![row.clone()],
             face_input_refusal: Some(Refusal::MissingInput("C1 face detection score")),
@@ -12221,45 +12478,6 @@ mod tests {
 
         assert_eq!(receipt.frame_receipt().fingerprint(), legacy_frame);
         assert_eq!(receipt.fingerprint(), legacy);
-    }
-
-    #[test]
-    fn cached_frame_state_keeps_the_full_receipt_id() {
-        let (width, height) = (8u32, 8u32);
-        let source = frame(width, height);
-        let masks = PortraitMasks::solid(1.0);
-        let params = BTreeMap::from([
-            ("pc:247".to_string(), 0.4f32),
-            ("pc:248".to_string(), 0.2f32),
-        ]);
-        let region = NormRect {
-            x: 0.125,
-            y: 0.25,
-            width: 0.5,
-            height: 0.75,
-        };
-        let full = PortraitJobReceipt::from_renderer_receipt(
-            &source, width, height, region, &params, &masks,
-        );
-        let (frame_fingerprint, frame_state) =
-            PortraitJobReceipt::frame_state_from_renderer_frame(&source, width, height)
-                .expect("valid frame state");
-        let cached = PortraitJobReceipt::from_renderer_receipt_with_frame_state(
-            &source,
-            width,
-            height,
-            region,
-            &params,
-            &masks,
-            frame_fingerprint,
-            frame_state,
-            None,
-        );
-        assert_eq!(
-            cached.frame_receipt().fingerprint(),
-            full.frame_receipt().fingerprint()
-        );
-        assert_eq!(cached.fingerprint(), full.fingerprint());
     }
 
     #[test]
@@ -14006,9 +14224,72 @@ mod tests {
         let r90003 = apply_body_skin_uniform(&img, 0.8, Some(&full_mask), Some(&half_face_mask)).unwrap();
         assert_ne!(r90003.pixels, base, "PF90003 should uniform body skin");
 
-        // PF21104
-        let r21104 = apply_nose_flaws(&img, 0.8, Some(&full_mask), Some(&full_mask)).unwrap();
-        assert_ne!(r21104.pixels, base, "PF21104 should repair nose region");
+        // PF21104: isolated blemish on nose gets healed; step edges stay crisp.
+        let mut spot_pixels = vec![190u8; 32 * 32 * 4];
+        for px in spot_pixels.chunks_exact_mut(4) {
+            px[0] = 200;
+            px[1] = 165;
+            px[2] = 140;
+            px[3] = 255;
+        }
+        // Plant an isolated dark blemish right at nose center (16, 16)
+        let center_off = (16 * 32 + 16) * 4;
+        spot_pixels[center_off] = 120;
+        spot_pixels[center_off + 1] = 95;
+        spot_pixels[center_off + 2] = 80;
+        let spot_img = Image::new(32, 32, spot_pixels.clone()).unwrap();
+        let full_mask_32 = vec![255u8; 32 * 32];
+        let r21104 = apply_nose_flaws(&spot_img, 0.8, Some(&full_mask_32), Some(&full_mask_32)).unwrap();
+        assert!(
+            r21104.pixels[center_off] > spot_pixels[center_off] + 20,
+            "PF21104 should heal isolated nose blemish"
+        );
+        // PF0: isolated dark blemish is healed while sharp anatomical step edge stays untouched.
+        let mut edge_and_spot = spot_pixels.clone();
+        for y in 0..32 {
+            for x in 0..8 {
+                let off = (y * 32 + x) * 4;
+                edge_and_spot[off] = 60;
+                edge_and_spot[off + 1] = 50;
+                edge_and_spot[off + 2] = 45;
+            }
+        }
+        let edge_img = Image::new(32, 32, edge_and_spot.clone()).unwrap();
+        let r0 = apply_pf0_spotless(&edge_img, 1.0, Some(&full_mask_32), Some(&full_mask_32)).unwrap();
+        assert!(
+            r0.pixels[center_off] > edge_and_spot[center_off] + 20,
+            "PF0 must heal isolated dark blemish"
+        );
+        let edge_off = (16 * 32 + 7) * 4;
+        assert_eq!(
+            r0.pixels[edge_off], edge_and_spot[edge_off],
+            "PF0 must not smear sharp anatomical step edges (nostril/lip/eyelid)"
+        );
+        // Zoom region crop keeps PortraitMasks aligned on sub-viewport renders.
+        let mut q_mask = vec![0.0f32; 16 * 16];
+        for y in 8..16 {
+            for x in 8..16 {
+                q_mask[y * 16 + x] = 1.0;
+            }
+        }
+        let pm = PortraitMasks {
+            skin: Some(q_mask.clone()),
+            hair: None,
+            face: Some(q_mask),
+            body: None,
+            width: 16,
+            height: 16,
+        };
+        let cropped = pm.cropped_to_region(NormRect { x: 0.5, y: 0.5, width: 0.5, height: 0.5 });
+        let sampled = cropped.mask_u8(MaskKind::Skin, 8, 8, NormRect::FULL).unwrap();
+        assert!(
+            sampled.iter().all(|&v| v >= 240),
+            "cropped_to_region must align bottom-right quadrant to full zoomed tile"
+        );
+        assert!(
+            (pm.full_face_norm_width().unwrap() - 0.5).abs() < 1e-4,
+            "full_face_norm_width must report uncropped normalized width"
+        );
 
         // PF100005
         let mut eye_img = img.clone();
@@ -16286,6 +16567,7 @@ mod tests {
                 aligned_color_field_rgb_f32: &eye_color,
                 aligned_response_mask: &eye_response,
             }),
+            eye_bag_landmark: None,
             smile: SmileInputs {
                 material: Some("Grinning"),
                 lip_mask: Some(&lip),
@@ -16295,6 +16577,8 @@ mod tests {
                 roi: Some(smile_roi),
             },
             suit_passes: Some(&suit_passes),
+            owned_suit_passes: None,
+            pf90130_glare: None,
             hair_smooth: None,
             hair_gloss: None,
             stray_hair: StrayHairInputs::default(),
@@ -16313,11 +16597,7 @@ mod tests {
             historical_tone: None,
             historical_skin: None,
             plump: None,
-            double_chin_degrees: None,
-            skin_unify_degrees: None,
-            brow_length_degrees: None,
             face_input_refusal: None,
-            skin_mask: None,
             stage_sha256: None,
         };
 

@@ -226,12 +226,6 @@ fn validate_rect(layer: &PsdLayer<'_>, width: u32, height: u32, label: &str) -> 
 /// planar lengths, out-of-bounds layer rectangles, overlong layer names or
 /// arithmetic overflow.
 pub fn encode_psd(image: &PsdImage<'_>) -> Result<Vec<u8>> {
-    encode_psd_with_icc(image, None)
-}
-
-/// Like [`encode_psd`], additionally embedding `icc` as image resource 1039
-/// (ICC profile) when given.
-pub fn encode_psd_with_icc(image: &PsdImage<'_>, icc: Option<&[u8]>) -> Result<Vec<u8>> {
     let width = usize::try_from(image.width).context("PSD width does not fit usize")?;
     let height = usize::try_from(image.height).context("PSD height does not fit usize")?;
     ensure!(width > 0 && height > 0, "PSD canvas must be non-empty");
@@ -350,7 +344,6 @@ pub fn encode_psd_with_icc(image: &PsdImage<'_>, icc: Option<&[u8]>) -> Result<V
     let mut out = Vec::new();
     out.extend_from_slice(b"8BPS");
     push_u16(&mut out, 1); // version
-    out.extend_from_slice(&[0u8; 6]); // reserved
     push_u16(&mut out, u16::try_from(merged_channels)?);
     push_u32(&mut out, image.height);
     push_u32(&mut out, image.width);
@@ -358,24 +351,7 @@ pub fn encode_psd_with_icc(image: &PsdImage<'_>, icc: Option<&[u8]>) -> Result<V
     push_u16(&mut out, 3); // color mode = RGB
 
     push_u32(&mut out, 0); // color mode data length
-    match icc.filter(|icc| !icc.is_empty()) {
-        Some(icc) => {
-            // Image resource block: "8BIM", id, empty Pascal name (padded
-            // to even), u32 length, data padded to even.
-            let mut res = Vec::with_capacity(icc.len() + 16);
-            res.extend_from_slice(b"8BIM");
-            push_u16(&mut res, 1039);
-            res.extend_from_slice(&[0, 0]);
-            push_u32(&mut res, u32::try_from(icc.len()).context("ICC profile exceeds u32")?);
-            res.extend_from_slice(icc);
-            if icc.len() % 2 == 1 {
-                res.push(0);
-            }
-            push_u32(&mut out, u32::try_from(res.len()).context("image resources exceed u32")?);
-            out.extend_from_slice(&res);
-        }
-        None => push_u32(&mut out, 0), // image resources length
-    }
+    push_u32(&mut out, 0); // image resources length
 
     push_u32(&mut out, layer_mask_len);
     push_u32(&mut out, layer_info_len);
@@ -484,7 +460,6 @@ mod tests {
         // File header.
         assert_eq!(r.take(4), b"8BPS");
         assert_eq!(r.u16(), 1);
-        assert_eq!(r.take(6), &[0u8; 6]);
         let merged_planes = (image.width as usize) * (image.height as usize);
         let merged_channels = plane_count(image.merged, merged_planes);
         assert_eq!(r.u16() as usize, merged_channels);
@@ -600,25 +575,6 @@ mod tests {
             );
         }
         assert_eq!(r.pos, bytes.len(), "trailing bytes after merged image");
-    }
-
-    #[test]
-    fn icc_profile_is_written_as_image_resource_1039() {
-        let merged = u8_planes(2, 2, 3, 3);
-        let image = PsdImage { width: 2, height: 2, depth: PsdSampleDepth::Eight, merged: PsdPixels::U8(&merged), layers: &[] };
-        let icc = [7u8; 5];
-        let bytes = encode_psd_with_icc(&image, Some(&icc)).unwrap();
-        assert_eq!(&bytes[0..4], b"8BPS");
-        let mut r = Reader::new(&bytes);
-        r.take(26);
-        assert_eq!(r.u32(), 0);
-        let res_len = r.u32();
-        assert_eq!(res_len, 4 + 2 + 2 + 4 + 6);
-        assert_eq!(r.take(4), b"8BIM");
-        assert_eq!(r.u16(), 1039);
-        r.take(2);
-        assert_eq!(r.u32(), 5);
-        assert_eq!(r.take(5), &icc);
     }
 
     #[test]

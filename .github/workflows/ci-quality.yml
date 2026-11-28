@@ -1,0 +1,128 @@
+name: CI Quality
+
+# Quality, hygiene, dependency audit, and asset-free dual-state compile checks.
+# Complements ci.yml and macos.yml without duplicating full synthetic test runs.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  package-name-guard:
+    name: Package name and manifest hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify canonical workspace package names
+        run: |
+          set -euo pipefail
+          grep -Eq '^name = "portrait-app"$' crates/app/Cargo.toml
+          grep -Eq '^name = "aurora-engine"$' crates/engine/Cargo.toml
+          grep -Eq '^name = "aurora-portrait"$' crates/portrait/Cargo.toml
+
+      - name: Reject legacy lumen-app / lumen-engine package references
+        run: |
+          set -euo pipefail
+          if git grep -n -E '\b(lumen-app|lumen-engine)\b' -- \
+            Cargo.toml \
+            'crates/*/Cargo.toml' \
+            '.github/workflows/' \
+            ':!.github/workflows/ci-quality.yml' \
+            'scripts/' \
+            'crates/engine/src/bin/' \
+            AGENTS.md \
+            CONTRIBUTING.md \
+            docs/windows-gpu.md; then
+            echo "::error::Legacy package name (lumen-app / lumen-engine) found. Use portrait-app / aurora-engine / aurora-portrait."
+            exit 1
+          fi
+
+      - name: Reject tracked private fixtures and RAW media
+        run: |
+          set -euo pipefail
+          BAD="$(git ls-files | grep -Ei '(^crates/engine/testdata/|\.(nef|dng|cr[23]|arw|raf|orf|rw2|pef|srw|eip|psd)$)' || true)"
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            echo "::error::Private fixtures or RAW media must not be tracked in git."
+            exit 1
+          fi
+
+  dual-state-compile:
+    name: Asset-free dual-state compile (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-quality-windows
+
+      - name: Verify locked manifest metadata
+        run: cargo metadata --locked --no-deps --format-version 1 > NUL
+
+      - name: State 1 — Default asset-free workspace check
+        run: |
+          cargo check --workspace --all-targets --locked
+          cargo check -p aurora-portrait --all-targets --locked
+          cargo check -p portrait-app --release --locked
+
+      - name: State 2 — Optional feature flags compile check (no local fixtures executed)
+        run: |
+          cargo check -p aurora-engine --features z6iii-raw-export --all-targets --locked
+          cargo test -p aurora-engine --features external-fixtures --no-run --locked
+
+      - name: Architecture and capability unit tests
+        run: |
+          cargo test -p aurora-engine --test architecture_rules --locked -- --test-threads=1
+          cargo test -p aurora-engine --lib portrait_registry --locked -- --test-threads=1
+          cargo test -p portrait-app --lib capability --locked -- --test-threads=1
+
+      - name: Package allowlist advisory check
+        shell: pwsh
+        run: ./scripts/check-package-allowlist.ps1 -Mode warn
+
+  dependency-audit:
+    name: License allowlist and advisory audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      - name: cargo deny check (licenses, bans, sources, advisories)
+        run: cargo deny check licenses bans sources advisories
+
+      - name: cargo audit
+        run: cargo audit

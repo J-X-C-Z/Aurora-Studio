@@ -696,40 +696,16 @@ pub(crate) struct Discovered {
 }
 
 /// Directories searched for profiles: the Capture One/local install and, unless
-/// `AURORA_ICC_DIR` pins the search, the OS colour folders (Windows colour
-/// directory, macOS ColorSync).
-pub(crate) fn search_dirs() -> Vec<PathBuf> {
+/// `AURORA_ICC_DIR` pins the search, the Windows colour directory.
+fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![profile_dir()];
     if std::env::var_os("AURORA_ICC_DIR").is_none() {
-        dirs.extend(system_profile_dirs().into_iter().filter(|dir| dir.is_dir()));
+        let system = PathBuf::from(r"C:\Windows\System32\spool\drivers\color");
+        if system.is_dir() {
+            dirs.push(system);
+        }
     }
     dirs
-}
-
-/// The operating system's colour-profile folders, user folder first so a
-/// user-installed profile shadows the system copy.
-#[cfg(windows)]
-fn system_profile_dirs() -> Vec<PathBuf> {
-    vec![PathBuf::from(r"C:\Windows\System32\spool\drivers\color")]
-}
-
-/// ColorSync folders; `/System/Library/ColorSync/Profiles` holds the
-/// `sRGB IEC61966-2.1` profile the recipe defaults to.
-#[cfg(target_os = "macos")]
-fn system_profile_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join("Library/ColorSync/Profiles"));
-    }
-    dirs.push(PathBuf::from("/Library/ColorSync/Profiles"));
-    dirs.push(PathBuf::from("/System/Library/ColorSync/Profiles"));
-    dirs
-}
-
-/// Other hosts (Linux is a development host only) list no system folder.
-#[cfg(not(any(windows, target_os = "macos")))]
-fn system_profile_dirs() -> Vec<PathBuf> {
-    Vec::new()
 }
 
 /// Every profile below `dirs` that parses, deduplicated by file stem. Earlier
@@ -1912,7 +1888,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn other_c1_profile_families_match_lcms() {
         // Ground truth from lcms2 for one profile from each C1 family.
         let cases: [(&str, [[i32; 6]; 5]); 3] = [

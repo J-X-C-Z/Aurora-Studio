@@ -268,7 +268,6 @@ fn prewarm_in_background() {
                 ),
                 Err(err) => log::warn!("AI session prewarm skipped: {err:#}"),
             }
-            aurora_engine::prewarm_face_input();
         });
 }
 
