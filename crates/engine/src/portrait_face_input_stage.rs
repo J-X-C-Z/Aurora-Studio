@@ -1156,12 +1156,15 @@ impl FaceInputBundle {
                     )
                 };
                 if want_5 || want_90116 || want_90080 {
+                    // Combine canonical face (slot 1) + skin/nose/ear group (slot 18 = sat8(2,7,11,12))
+                    // via saturating_add so softmax boundaries between cheeks and nose stay 100% seamless
+                    // with zero holes, while eyes/brows/lips/hair remain cleanly excluded.
                     let face = proj(1);
-                    let skin = proj(2);
+                    let skin_nose = proj(18);
                     let combined: Vec<u8> = face
                         .iter()
-                        .zip(&skin)
-                        .map(|(&a, &b)| a.max(b))
+                        .zip(&skin_nose)
+                        .map(|(&a, &b)| a.saturating_add(b))
                         .collect();
                     parsing_skin = Some(combined);
                 }
@@ -1339,10 +1342,16 @@ impl FaceInputBundle {
                 if active(21026) || active(90088) || active(30259) || active(90089) || active(30030)
                     || active(44297) || active(30187) || active(30190) || active(30059) || active(90033)
                 {
+                    // Seamless face + skin + nose union via saturating_add (slots 1 + 18)
+                    // avoids softmax boundary dips/holes along the nose bridge and wings.
                     let face = proj(1);
-                    let skin = proj(2);
-                    let combined: Vec<u8> = face.iter().zip(&skin).map(|(&a, &b)| a.max(b)).collect();
-                    parsing_face = Some(face);
+                    let skin_nose = proj(18);
+                    let combined: Vec<u8> = face
+                        .iter()
+                        .zip(&skin_nose)
+                        .map(|(&a, &b)| a.saturating_add(b))
+                        .collect();
+                    parsing_face = Some(combined.clone());
                     parsing_skin = Some(combined);
                 }
                 if active(90130) {

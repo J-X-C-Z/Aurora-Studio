@@ -3656,7 +3656,11 @@ fn render_sized(
         if want_stage_attachments {
             let want_parsing = want_stage_parsing;
             if let Some(stage_frame) = stage_frame.as_ref() {
-                let attachment_bundle = if region != NormRect::FULL && !geometric_lens {
+                // Always generate FaceDetection + 194 Landmarks + FaceParsingV2 ONCE
+                // on the full-resolution source image (`src.face_input_image()`), then
+                // project to any zoom/pan/export viewport (both `NormRect::FULL` and
+                // zoomed crops) so masks and landmarks never jitter or regenerate on zoom.
+                let attachment_bundle = if !geometric_lens {
                     if let Some(projected) = projected_source_bundle.get() {
                         Ok(projected)
                     } else {
@@ -3686,7 +3690,7 @@ fn render_sized(
                             }
                             Err(refusal) => {
                                 log::debug!(
-                                    "cropped viewport full-frame face projection refused; falling back to stage frame: {refusal:?}"
+                                    "full-res source face projection refused; falling back to stage frame: {refusal:?}"
                                 );
                                 stage_bundle_cached(
                                     &stage_bundle,

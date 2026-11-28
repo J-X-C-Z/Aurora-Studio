@@ -355,6 +355,35 @@ impl PortraitMasks {
         Some(out)
     }
 
+    /// Normalized full-image width (`0..=1`) of the face (or skin fallback)
+    /// computed once on the uncropped full-image mask grid. Dividing by
+    /// `region.width` and multiplying by `out_w` yields the exact pixel width of
+    /// the face at ANY zoom/pan level, even when part of the face is clipped off
+    /// the viewport.
+    pub fn full_face_norm_width(&self) -> Option<f32> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let plane = self.face.as_deref().or(self.skin.as_deref())?;
+        if plane.len() != self.width * self.height {
+            return None;
+        }
+        let mut min_x = self.width;
+        let mut max_x = 0usize;
+        let mut any = false;
+        for y in 0..self.height {
+            let row = y * self.width;
+            for x in 0..self.width {
+                if plane[row + x] > 0.12 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    any = true;
+                }
+            }
+        }
+        any.then(|| ((max_x - min_x + 1) as f32 / self.width as f32).clamp(0.01, 1.0))
+    }
+
     /// Resamples every available plane into `region`, keeping the mask's own
     /// grid dimensions. Calling an attacher that internally reads
     /// `NormRect::FULL` on the cropped masks then aligns pixel-for-pixel with
@@ -8101,10 +8130,14 @@ fn apply_cpu_effect(
     inputs: &PortraitJobInputs<'_>,
     hlf_auto: Option<&HlfAutoInputs>,
 ) -> Result<Image, Refusal> {
+    let full_face_w_px = inputs
+        .masks
+        .full_face_norm_width()
+        .map(|norm_w| (norm_w / region.width.max(1e-4)) * width as f32);
     match pf {
         0 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_pf0_spotless(current, degree, skin_mask, face_mask.as_deref())
+            apply_pf0_spotless_scaled(current, degree, skin_mask, face_mask.as_deref(), full_face_w_px)
         }
         90085 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
@@ -8112,7 +8145,7 @@ fn apply_cpu_effect(
         }
         21104 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_nose_flaws(current, degree, skin_mask, face_mask.as_deref())
+            apply_nose_flaws_scaled(current, degree, skin_mask, face_mask.as_deref(), full_face_w_px)
         }
         30188 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
@@ -8124,9 +8157,9 @@ fn apply_cpu_effect(
         }
         30209 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
-            apply_jawline_enhance(current, degree, face_mask.as_deref(), skin_mask)
+            apply_jawline_enhance_scaled(current, degree, face_mask.as_deref(), skin_mask, full_face_w_px)
         }
-        90001 => apply_texture_smooth(current, degree, skin_mask),
+        90001 => apply_texture_smooth_scaled(current, degree, skin_mask, full_face_w_px),
         90003 => {
             let face_mask = inputs.masks.mask_u8(MaskKind::Face, width, height, region);
             apply_body_skin_uniform(current, degree, skin_mask, face_mask.as_deref())
@@ -8191,6 +8224,16 @@ fn apply_pf0_spotless(
     degree: f32,
     skin_mask: Option<&[u8]>,
     face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_pf0_spotless_scaled(current, degree, skin_mask, face_mask, None)
+}
+
+fn apply_pf0_spotless_scaled(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let skin = required(skin_mask, "PF0 skin mask")?;
     let face = required(face_mask, "PF0 face mask")?;
@@ -8284,13 +8327,17 @@ fn apply_pf0_spotless(
         out
     };
 
-    let face_w = mask_bbox(face, w, h)
-        .or_else(|| mask_bbox(skin, w, h))
-        .map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32)
+    let face_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .or_else(|| {
+            mask_bbox(face, w, h)
+                .or_else(|| mask_bbox(skin, w, h))
+                .map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32)
+        })
         .unwrap_or_else(|| w.min(h) as f32 * 0.35);
-    // Scale spot radius strictly to face width so fit-to-screen, 65%, 100%,
-    // 125%, and 24MP renders all heal the exact same physical blemish size
-    // without ever blurring eyes/nose/mouth into mush at low zoom.
+    // Scale spot radius strictly to the uncropped full-image face width projected
+    // to this viewport so fit-to-screen, 65%, 100%, 126%, and 24MP renders all
+    // heal the exact same physical blemish size even when panned/cropped.
     let spot_r = ((face_w * 0.014).round() as usize).clamp(1, 9);
     let pore_r = (spot_r / 3).clamp(1, 2);
     let fine_luma = weighted_box(&luma, &weight, pore_r);
@@ -8331,10 +8378,9 @@ fn apply_pf0_spotless(
             let mut red_pairs = [0.0f32; 4];
             let mut bright_pairs = [0.0f32; 4];
             let mut max_edge = 0.0f32;
-            let mut ring_r = 0.0f32;
-            let mut ring_g = 0.0f32;
-            let mut ring_b = 0.0f32;
-            let mut ring_w = 0.0f32;
+            let mut ring_idx = [0usize; 8];
+            let mut ring_wt = [0.0f32; 8];
+            let mut ring_n = 0usize;
             let mut valid_axes = 0usize;
 
             for (k, &((dx0, dy0), (dx1, dy1))) in axes.iter().enumerate() {
@@ -8346,7 +8392,7 @@ fn apply_pf0_spotless(
                 let i1 = y1 * w + x1;
                 let w0 = weight[i0];
                 let w1 = weight[i1];
-                if w0 < 0.1 || w1 < 0.1 {
+                if w0 < 0.15 || w1 < 0.15 {
                     continue;
                 }
                 valid_axes += 1;
@@ -8360,12 +8406,14 @@ fn apply_pf0_spotless(
                 red_pairs[k] = (crg - rg0.max(rg1)).max(0.0);
                 bright_pairs[k] = (cl - l0.max(l1)).max(0.0);
 
-                ring_r += sr[i0] * w0 + sr[i1] * w1;
-                ring_g += sg[i0] * w0 + sg[i1] * w1;
-                ring_b += sb[i0] * w0 + sb[i1] * w1;
-                ring_w += w0 + w1;
+                ring_idx[ring_n] = i0;
+                ring_wt[ring_n] = w0;
+                ring_n += 1;
+                ring_idx[ring_n] = i1;
+                ring_wt[ring_n] = w1;
+                ring_n += 1;
             }
-            if valid_axes < 3 || ring_w <= 1e-4 {
+            if valid_axes < 3 || ring_n < 6 {
                 continue;
             }
             // Take the 2nd smallest across the 4 axes (= surrounded on at least 3 axes),
@@ -8374,16 +8422,40 @@ fn apply_pf0_spotless(
             red_pairs.sort_by(|a, b| a.total_cmp(b));
             bright_pairs.sort_by(|a, b| a.total_cmp(b));
 
-            let edge_protect = 1.0 - smoothstep(14.0, 32.0, max_edge);
-            let dark_score = smoothstep(4.5, 18.0, dark_pairs[1]);
-            let acne_score = smoothstep(3.5, 14.0, red_pairs[1]);
-            let bright_score = smoothstep(7.0, 24.0, bright_pairs[1]) * 0.70;
+            let edge_protect = 1.0 - smoothstep(10.0, 24.0, max_edge);
+            let dark_score = smoothstep(5.0, 18.0, dark_pairs[1]);
+            let acne_score = smoothstep(4.0, 14.0, red_pairs[1]);
+            let bright_score = smoothstep(8.0, 24.0, bright_pairs[1]) * 0.70;
             let score = dark_score.max(acne_score).max(bright_score) * edge_protect * wt;
             if score > 1e-4 {
-                blemish[p] = score;
-                target_r_buf[p] = ring_r / ring_w;
-                target_g_buf[p] = ring_g / ring_w;
-                target_b_buf[p] = ring_b / ring_w;
+                // Reject outlier ring samples (e.g. an adjacent nostril or lash pixel)
+                // so healed skin never picks up brown/dark speck contamination.
+                let is_bright_spot = bright_score > dark_score.max(acne_score);
+                let mut ring_r = 0.0f32;
+                let mut ring_g = 0.0f32;
+                let mut ring_b = 0.0f32;
+                let mut ring_w = 0.0f32;
+                for m in 0..ring_n {
+                    let ri = ring_idx[m];
+                    let keep = if is_bright_spot {
+                        luma[ri] <= cl
+                    } else {
+                        luma[ri] >= cl
+                    };
+                    if keep {
+                        let rw = ring_wt[m];
+                        ring_r += sr[ri] * rw;
+                        ring_g += sg[ri] * rw;
+                        ring_b += sb[ri] * rw;
+                        ring_w += rw;
+                    }
+                }
+                if ring_w > 1e-4 {
+                    blemish[p] = score;
+                    target_r_buf[p] = ring_r / ring_w;
+                    target_g_buf[p] = ring_g / ring_w;
+                    target_b_buf[p] = ring_b / ring_w;
+                }
             }
         }
     }
@@ -8511,10 +8583,20 @@ fn mask_bbox(mask: &[u8], width: usize, height: usize) -> Option<(usize, usize, 
 }
 
 /// PF90001: edge-preserving local texture smoothing within skin mask.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_texture_smooth(
     current: &Image,
     degree: f32,
     skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_texture_smooth_scaled(current, degree, skin_mask, None)
+}
+
+fn apply_texture_smooth_scaled(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let skin = required(skin_mask, "PF90001 skin mask")?;
     let pixels = current.pixel_count();
@@ -8525,8 +8607,9 @@ fn apply_texture_smooth(
     }
     let w = current.width as usize;
     let h = current.height as usize;
-    let skin_w = mask_bbox(skin, w, h)
-        .map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32)
+    let skin_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .or_else(|| mask_bbox(skin, w, h).map(|(x0, _, x1, _)| (x1 - x0 + 1) as f32))
         .unwrap_or_else(|| w.min(h) as f32 * 0.35);
     let blur_r = ((skin_w * 0.010).round() as u32).clamp(1, 6);
     let blur = box_blur_rgba(current, blur_r);
@@ -8624,11 +8707,22 @@ fn apply_body_skin_uniform(
 }
 
 /// PF21104: nose flaws repair within central facial/skin region.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_nose_flaws(
     current: &Image,
     degree: f32,
     skin_mask: Option<&[u8]>,
     face_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_nose_flaws_scaled(current, degree, skin_mask, face_mask, None)
+}
+
+fn apply_nose_flaws_scaled(
+    current: &Image,
+    degree: f32,
+    skin_mask: Option<&[u8]>,
+    face_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let skin = required(skin_mask, "PF21104 skin mask")?;
     let pixels = current.pixel_count();
@@ -8648,7 +8742,9 @@ fn apply_nose_flaws(
     let Some((x0, y0, x1, y1)) = bbox else {
         return Ok(current.clone());
     };
-    let face_w = (x1 - x0 + 1) as f32;
+    let face_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .unwrap_or((x1 - x0 + 1) as f32);
     let cx = (x0 + x1) as f32 * 0.5;
     let cy = y0 as f32 + (y1 - y0) as f32 * 0.52;
     let rx = (face_w * 0.25).max(4.0);
@@ -9043,11 +9139,22 @@ fn apply_double_chin_shadow(
 }
 
 /// PF30209: jawline definition enhancement along lower facial contour.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_jawline_enhance(
     current: &Image,
     degree: f32,
     face_mask: Option<&[u8]>,
     skin_mask: Option<&[u8]>,
+) -> Result<Image, Refusal> {
+    apply_jawline_enhance_scaled(current, degree, face_mask, skin_mask, None)
+}
+
+fn apply_jawline_enhance_scaled(
+    current: &Image,
+    degree: f32,
+    face_mask: Option<&[u8]>,
+    skin_mask: Option<&[u8]>,
+    full_face_w_px: Option<f32>,
 ) -> Result<Image, Refusal> {
     let mask = face_mask.or(skin_mask).ok_or(Refusal::MissingInput("PF30209 face or skin mask"))?;
     let pixels = current.pixel_count();
@@ -9061,7 +9168,9 @@ fn apply_jawline_enhance(
     let Some((x0, y0, x1, y1)) = mask_bbox(mask, w, h) else {
         return Ok(current.clone());
     };
-    let face_w = (x1 - x0 + 1) as f32;
+    let face_w = full_face_w_px
+        .filter(|v| v.is_finite() && *v > 8.0)
+        .unwrap_or((x1 - x0 + 1) as f32);
     let jaw_r = ((face_w * 0.008).round() as u32).clamp(1, 5);
     let blur = box_blur_rgba(current, jaw_r);
     let jaw_y_min = y0 + ((y1 - y0) as f32 * 0.55) as usize;
@@ -14176,6 +14285,10 @@ mod tests {
         assert!(
             sampled.iter().all(|&v| v >= 240),
             "cropped_to_region must align bottom-right quadrant to full zoomed tile"
+        );
+        assert!(
+            (pm.full_face_norm_width().unwrap() - 0.5).abs() < 1e-4,
+            "full_face_norm_width must report uncropped normalized width"
         );
 
         // PF100005
