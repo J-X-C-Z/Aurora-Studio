@@ -3340,13 +3340,28 @@ impl FileEngine {
         self.sources().source_with_priority(image, priority)
     }
 
-    /// Full-size RAW for 1:1 zoom and export. The native slot holds one frame,
-    /// so native decodes are serialized; same-image callers share one flight.
     fn native_raw_source(&self, image: ImageId, viewport: Option<(&crate::Geometry, NormRect, u32)>) -> Option<Arc<Source>> {
-        let (path, lens, width, height, banding_identity) = {
+        self.native_source(image, viewport, false, DecodePriority::Interactive)
+    }
+
+    fn native_portrait_source(&self, image: ImageId, priority: DecodePriority) -> Option<Arc<Source>> {
+        self.native_source(image, None, true, priority)
+    }
+
+    /// One native frame slot shared by portrait analysis, native zoom and export.
+    fn native_source(
+        &self,
+        image: ImageId,
+        viewport: Option<(&crate::Geometry, NormRect, u32)>,
+        portrait: bool,
+        priority: DecodePriority,
+    ) -> Option<Arc<Source>> {
+        let (path, lens, width, height, banding_identity, raw) = {
             let st = self.state.lock();
             let entry = st.entries.iter().find(|e| e.info.id == image)?;
-            if !(crate::raw::is_raw(&entry.path) || is_eip(&entry.path))
+            let raw = crate::raw::is_raw(&entry.path) || is_eip(&entry.path);
+            if (!raw && !portrait)
+                || (portrait && entry.info.width.max(entry.info.height) <= SOURCE_LONG_SIDE)
                 || viewport.is_some_and(|(geometry, region, max)| {
                     !wants_native_raw((entry.info.width, entry.info.height), geometry, region, max)
                 })
@@ -3359,8 +3374,12 @@ impl FileEngine {
                 entry.info.width,
                 entry.info.height,
                 raw_banding_identity(&entry.info.exif),
+                raw,
             )
         };
+        if !raw && full_res_export_decode_fits(width, height, full_res_export_decode_cap()).is_err() {
+            return None;
+        }
         if let Some(cached) = self.cached_native(image, &path) {
             return cached;
         }
@@ -3387,16 +3406,22 @@ impl FileEngine {
                 }
             }
             let (sensor, file_bytes, route) = raw_admission_inputs(&path);
-            let units = decode_units(decode_admission_bytes(
-                (width, height),
-                sensor,
-                DecodeFormat::RawNative,
-                file_bytes,
-                route.as_ref(),
-            ));
-            let _permit = self.decode_gates.heavy.acquire(DecodePriority::Interactive, units);
+            let bytes = if raw {
+                decode_admission_bytes(
+                    (width, height), sensor, DecodeFormat::RawNative, file_bytes, route.as_ref(),
+                )
+            } else {
+                usize::try_from(full_res_export_estimate_bytes(width, height)).unwrap_or(usize::MAX)
+            };
+            let _permit = self.decode_gates.heavy.acquire(priority, decode_units(bytes));
             self.state.lock().source_cache.misses += 1;
             let decoded = (|| {
+                if !raw {
+                    return decode_full_res_export_source(&self.root, &path, lens)
+                        .map(Arc::new)
+                        .map_err(|error| log::warn!("full-resolution portrait source refused: {error:#}"))
+                        .ok();
+                }
                 let path = if is_eip(&path) { materialize_eip(&self.root, &path).ok()?.raw } else { path.clone() };
                 let (source, provenance) = crate::raw_cache::get_or_decode_source16(&path, 0)?;
                 Some(Arc::new(
@@ -3410,7 +3435,7 @@ impl FileEngine {
                 ))
             })();
             if decoded.is_none() {
-                log::warn!("native RAW source unavailable for {image:?}");
+                log::warn!("native source unavailable for {image:?}");
             }
             let bytes = decoded.as_ref().map_or(0, |source| source_cache_bytes(source));
             let identity = SourceFileIdentity::read(&path)
@@ -3437,7 +3462,7 @@ impl FileEngine {
         })();
         let flight_result = match decoded {
             Some(source) => Ok(source),
-            None => Err(format!("native RAW source unavailable for {image:?}")),
+            None => Err(format!("native source unavailable for {image:?}")),
         };
         leader.finish(flight_result).ok()
     }

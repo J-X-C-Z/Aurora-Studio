@@ -806,13 +806,16 @@ impl Source {
             return image;
         }
         let plane = &self.levels[0];
-        let mut rgba = Vec::with_capacity((plane.width * plane.height * 4) as usize);
-        for pixel in &plane.data {
-            for channel in pixel {
-                rgba.push((linear_to_srgb((*channel).clamp(0.0, 1.0)) * 255.0 + 0.5) as u8);
-            }
-            rgba.push(255);
-        }
+        let mut rgba = vec![255; plane.data.len() * 4];
+        rgba.par_chunks_mut(4096 * 4)
+            .zip(plane.data.par_chunks(4096))
+            .for_each(|(bytes, pixels)| {
+                for (dst, pixel) in bytes.chunks_exact_mut(4).zip(pixels) {
+                    for (out, &channel) in dst[..3].iter_mut().zip(pixel) {
+                        *out = (linear_to_srgb(channel.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                    }
+                }
+            });
         let image = std::sync::Arc::new(
             crate::PortraitImage::new(plane.width, plane.height, rgba)
                 .expect("the decoded source level has exactly one RGBA plane"),
@@ -1398,7 +1401,16 @@ fn needs_stage_face_bundle_direct(extra: &std::collections::BTreeMap<String, f32
     })
 }
 
+fn face_retouch_active(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    ["pc:0", "pc:21104"]
+        .into_iter()
+        .any(|key| extra.get(key).is_some_and(|&value| value > 0.0 && value <= 1.0))
+}
+
 fn needs_stage_face_parsing(extra: &std::collections::BTreeMap<String, f32>) -> bool {
+    if face_retouch_active(extra) {
+        return true;
+    }
     extra.iter().any(|(key, value)| {
         if key == "pc:90021" {
             return value.is_finite() && value.clamp(0.0, 1.0) != 0.5;
@@ -1467,10 +1479,21 @@ fn teeth_ui_percents(
     crate::portrait_stage::pf108_ui_percents(extra)
 }
 
+fn lens_moves_portrait_pixels(src: &Source, lens: &crate::LensCorrection) -> bool {
+    lens.shift_x.abs() > 1.0e-6
+        || lens.shift_y.abs() > 1.0e-6
+        || lens.tilt.abs() > 1.0e-6
+        || (lens.distortion.abs() > 1.0e-6
+            && (!lens.use_profile
+                || super::lens_profile::warp_for(lens, src.lens_shot.as_ref(), src.lens_auto.as_ref())
+                    .is_some_and(|warp| warp.distortion.iter().any(|&(_, shift)| shift != 0.0))))
+}
+
 fn stage_face_bundle(
     job_id: u64,
     frame: &crate::PortraitImage,
     include_parsing: bool,
+    include_radiance: bool,
     digest: Option<[u8; 32]>,
 ) -> Result<crate::FaceInputBundle, aurora_portrait::Refusal> {
     let session = match crate::FaceInputSession::open_from_env(include_parsing) {
@@ -1483,9 +1506,8 @@ fn stage_face_bundle(
         }
         Err(refusal) => return Err(refusal),
     };
-    let produce = |session: &crate::FaceInputSession| match digest {
-        Some(digest) => session.produce_with_digest(job_id, frame, digest),
-        None => session.produce(job_id, frame),
+    let produce = |session: &crate::FaceInputSession| {
+        session.produce_for_render(job_id, frame, digest, include_radiance)
     };
     match produce(&session) {
         Ok(bundle) => Ok(bundle),
@@ -1509,9 +1531,10 @@ fn stage_bundle_cached<'a>(
     frame: &'a crate::PortraitImage,
     job_id: u64,
     include_parsing: bool,
+    include_radiance: bool,
     digest: Option<[u8; 32]>,
 ) -> Result<&'a crate::FaceInputBundle, aurora_portrait::Refusal> {
-    match cell.get_or_init(|| stage_face_bundle(job_id, frame, include_parsing, digest)) {
+    match cell.get_or_init(|| stage_face_bundle(job_id, frame, include_parsing, include_radiance, digest)) {
         Ok(bundle) => Ok(bundle),
         Err(refusal) => Err(refusal.clone()),
     }
@@ -1866,6 +1889,7 @@ pub fn render(
         true,
         false,
         ScopeWants::default(),
+        src,
     )
     .0
 }
@@ -1874,6 +1898,22 @@ pub fn render(
 /// resident fast path handles the whole frame and the caller needs display order.
 pub(crate) fn render_preview_bgra(
     src: &Source,
+    adj: &AdjustmentSet,
+    region: NormRect,
+    max_size: u32,
+    bypass: bool,
+    mask_overlay: Option<u64>,
+    want_bgra: bool,
+    scopes: ScopeWants,
+) -> Rendered {
+    render_preview_with_portrait_source(
+        src, src, adj, region, max_size, bypass, mask_overlay, want_bgra, scopes,
+    )
+}
+
+pub(crate) fn render_preview_with_portrait_source(
+    src: &Source,
+    portrait_src: &Source,
     adj: &AdjustmentSet,
     region: NormRect,
     max_size: u32,
@@ -1897,6 +1937,7 @@ pub(crate) fn render_preview_bgra(
         true,
         want_bgra,
         scopes,
+        portrait_src,
     )
     .0
 }
@@ -1928,6 +1969,7 @@ pub fn render16(
             false,
             false,
             ScopeWants::default(),
+            src,
         );
     Rendered16 {
         rgba: wide.expect("a wide render always returns its 16-bit buffer"),
@@ -2609,6 +2651,7 @@ fn render_sized(
     with_histogram: bool,
     want_bgra: bool,
     scopes: ScopeWants,
+    portrait_src: &Source,
 ) -> (Rendered, Option<Vec<u16>>) {
     let _render_total = crate::compute::telemetry::span(crate::compute::telemetry::Stage::RenderTotal);
     let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
@@ -3643,7 +3686,8 @@ fn render_sized(
         portrait_stage_store(src, adj, region, out_w, out_h, scale, level, mask_overlay, &rgba);
     }
     let mut portrait_report = if portrait_active {
-        let masks = src.portrait_masks();
+        let masks = portrait_src.portrait_masks();
+        let portrait_size = [portrait_src.size().0, portrait_src.size().1];
         let receipt =
             crate::portrait_stage::PortraitJobReceipt::from_renderer_receipt_with_fingerprints(
                 &rgba,
@@ -3653,7 +3697,7 @@ fn render_sized(
                 &adj.extra,
                 masks,
                 cached_frame_fingerprint,
-                Some(src.portrait_masks_receipt_fingerprint()),
+                Some(portrait_src.portrait_masks_receipt_fingerprint()),
             );
         // Face landmarks come from the full decoded source and are mapped
         // through the renderer's FrameMap into the current out_w/out_h stage.
@@ -3698,11 +3742,23 @@ fn render_sized(
         let stage_bundle = OnceLock::new();
         let projected_source_bundle = OnceLock::new();
         let stage_include_parsing = want_stage_parsing && want_stage_attachments;
-        let geometric_lens = adj.lens.use_profile
-            || adj.lens.distortion.abs() > 1.0e-6
-            || adj.lens.shift_x.abs() > 1.0e-6
-            || adj.lens.shift_y.abs() > 1.0e-6
-            || adj.lens.tilt.abs() > 1.0e-6;
+        let want_radiance = adj.extra.get("pc:90004").is_some_and(|&value| value > 0.0);
+        // Automatic lens profiles are also used for non-geometric corrections.
+        // Only a correction that moves pixels can invalidate the source projection.
+        let geometric_lens = lens_moves_portrait_pixels(src, &adj.lens);
+        let source_face_frame = OnceLock::new();
+        let source_face_bundle = OnceLock::new();
+        let on_source = || {
+            let frame = source_face_frame.get_or_init(|| portrait_src.face_input_image());
+            stage_bundle_cached(
+                &source_face_bundle,
+                frame.as_ref(),
+                receipt.job_id(),
+                stage_include_parsing,
+                want_radiance && portrait_size == [out_w, out_h],
+                None,
+            )
+        };
         if want_stage_slim {
             if let Some(stage_frame) = stage_frame.as_ref() {
                 let on_stage = || {
@@ -3711,6 +3767,7 @@ fn render_sized(
                         stage_frame,
                         receipt.job_id(),
                         stage_include_parsing,
+                        want_radiance,
                         stage_sha256,
                     )?
                     .slim_inputs(stage_frame)
@@ -3719,15 +3776,9 @@ fn render_sized(
                     on_stage()
                 } else {
                     let from_source = || -> Result<_, aurora_portrait::Refusal> {
-                        let source_frame = src.face_input_image();
-                        let bundle = stage_face_bundle(
-                            receipt.job_id(),
-                            source_frame.as_ref(),
-                            stage_include_parsing,
-                            None,
-                        )?;
+                        let bundle = on_source()?;
                         let transform = crate::FaceStageTransform::new(
-                            [src.size().0, src.size().1],
+                            portrait_size,
                             [out_w, out_h],
                             [region.x, region.y, region.width, region.height],
                             &adj.geometry,
@@ -3740,8 +3791,8 @@ fn render_sized(
                             )
                             .or_else(|_| {
                                 let projected = project_face_bundle_to_stage(
-                                    &bundle,
-                                    [src.size().0, src.size().1],
+                                    bundle,
+                                    portrait_size,
                                     stage_frame,
                                     stage_sha256.unwrap(),
                                     region,
@@ -3772,30 +3823,20 @@ fn render_sized(
                 }
             }
         }
-        // Keep R17's PF108 path on the stage frame; its parsing semantics are
-        // owned by the separate teeth lane.
+        let mut face_retouch = None;
         if want_stage_attachments {
             let want_parsing = want_stage_parsing;
             if let Some(stage_frame) = stage_frame.as_ref() {
-                // Always generate FaceDetection + 194 Landmarks + FaceParsingV2 ONCE
-                // on the full-resolution source image (`src.face_input_image()`), then
-                // project to any zoom/pan/export viewport (both `NormRect::FULL` and
-                // zoomed crops) so masks and landmarks never jitter or regenerate on zoom.
+                // The source cache keeps parsing and landmarks in native image
+                // coordinates. Each viewport samples that same result.
                 let attachment_bundle = if !geometric_lens {
                     if let Some(projected) = projected_source_bundle.get() {
                         Ok(projected)
                     } else {
                         let source_projected = (|| {
-                            let source_frame = src.face_input_image();
-                            let source_bundle = stage_face_bundle(
-                                receipt.job_id(),
-                                source_frame.as_ref(),
-                                stage_include_parsing,
-                                None,
-                            )?;
                             project_face_bundle_to_stage(
-                                &source_bundle,
-                                [src.size().0, src.size().1],
+                                on_source()?,
+                                portrait_size,
                                 stage_frame,
                                 stage_sha256.unwrap(),
                                 region,
@@ -3818,6 +3859,7 @@ fn render_sized(
                                     stage_frame,
                                     receipt.job_id(),
                                     stage_include_parsing,
+                                    want_radiance,
                                     stage_sha256,
                                 )
                             }
@@ -3829,11 +3871,18 @@ fn render_sized(
                         stage_frame,
                         receipt.job_id(),
                         stage_include_parsing,
+                        want_radiance,
                         stage_sha256,
                     )
                 };
                 match attachment_bundle {
                     Ok(bundle) => {
+                        if face_retouch_active(&adj.extra) {
+                            match bundle.face_retouch_mask(stage_frame) {
+                                Ok(mask) => face_retouch = Some(mask),
+                                Err(refusal) => log::debug!("face retouch mask unavailable: {refusal:?}"),
+                            }
+                        }
                         let mut inputs = producer_inputs.take().unwrap_or_default();
                         let mut attached = false;
                         if inputs.slim.is_none() {
@@ -4099,6 +4148,7 @@ fn render_sized(
         let mut inputs =
             crate::portrait_stage::PortraitJobInputs::from_renderer_receipt(receipt, masks);
         inputs.stage_sha256 = stage_sha256;
+        inputs.face_retouch = face_retouch.as_ref();
         if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
@@ -5615,6 +5665,24 @@ mod tests {
         extra.insert("pc:109".to_string(), 0.0f32);
         extra.insert("pc:110".to_string(), 0.0f32);
         assert!(!needs_stage_face_parsing(&extra));
+    }
+
+    #[test]
+    fn portrait_source_projection_ignores_identity_lens_profiles() {
+        let src = Source::from_linear(2, 2, vec![[0.0; 3]; 4]);
+        let mut lens = crate::LensCorrection { use_profile: true, ..Default::default() };
+        assert!(!lens_moves_portrait_pixels(&src, &lens));
+        lens.distortion = 100.0;
+        assert!(!lens_moves_portrait_pixels(&src, &lens), "profile is unavailable");
+        lens.use_profile = false;
+        assert!(lens_moves_portrait_pixels(&src, &lens), "manual distortion");
+        lens.distortion = 0.0;
+        lens.shift_x = 10.0;
+        assert!(lens_moves_portrait_pixels(&src, &lens), "lens shift");
+        for row in ["pc:0", "pc:21104"] {
+            assert!(needs_stage_face_parsing(&[(row.to_string(), 1.0)].into()));
+            assert!(!needs_stage_face_parsing(&[(row.to_string(), 0.0)].into()));
+        }
     }
 
     #[test]
@@ -9207,6 +9275,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             true,
             false,
             ScopeWants::default(),
+            &src,
         );
         let (export, export_wide) = render_sized(
             &src,
@@ -9222,6 +9291,7 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
             false,
             false,
             ScopeWants::default(),
+            &src,
         );
         assert_ne!(preview.histogram, Histogram::default());
         assert_eq!(export.histogram, Histogram::default());

@@ -378,14 +378,13 @@ pub struct FaceParsingInference {
     pub mask_provider: &'static str,
 }
 
-/// Loaded ONNX session plus the two TeethWhitenV3 LUTs and the 256-byte id2 lookup.
+/// Loaded ONNX session and the optional TeethWhitenV3 consumer assets.
 pub struct FaceParsingProducer {
     model_path: PathBuf,
     session: Session,
     model_sha256: [u8; 32],
     teeth_lut: [u8; 256],
-    whiten_lut: Vec<u8>,
-    bright_lut: Vec<u8>,
+    teeth_luts: Result<(Vec<u8>, Vec<u8>)>,
     #[cfg(windows)]
     mask_gpu: Option<ModelPreprocess>,
 }
@@ -408,8 +407,10 @@ impl FaceParsingProducer {
             sha256_32(&teeth_lut) == FACE_PARSING_V2_TEETH_LUT_SHA256,
             "FaceParsingV2 teeth lookup identity mismatch"
         );
-        let whiten_lut = decode_lut(WHITEN_PNG, &WHITEN_LUT_IDENTITY)?;
-        let bright_lut = decode_lut(BRIGHT_PNG, &BRIGHT_LUT_IDENTITY)?;
+        // Parsing is also used by skin effects, which need neither teeth LUT.
+        let teeth_luts = decode_lut(WHITEN_PNG, &WHITEN_LUT_IDENTITY).and_then(|whiten| {
+            decode_lut(BRIGHT_PNG, &BRIGHT_LUT_IDENTITY).map(|bright| (whiten, bright))
+        });
 
         let runtime = Runtime::get().context("ONNX Runtime is not available")?;
         let session = runtime
@@ -456,8 +457,7 @@ impl FaceParsingProducer {
             session,
             model_sha256,
             teeth_lut,
-            whiten_lut,
-            bright_lut,
+            teeth_luts,
             #[cfg(windows)]
             mask_gpu,
         })
@@ -604,12 +604,11 @@ impl FaceParsingProducer {
         Ok((quantize_mask_cpu(probability)?, "cpu"))
     }
 
-    fn pf90004_bundle(
-        &self,
+    pub(crate) fn pf90004_bundle(
         frame: &Image,
         parsing: &FaceParsingProducerInputs,
-        crop_to_source: [[f32; 3]; 2],
     ) -> Result<Pf90004ProducerInputs> {
+        let crop_to_source = inverse_native(parsing.source_to_crop)?;
         ensure!(
             parsing.model_sha256 == FACE_PARSING_V2_MODEL_SHA256,
             "PF90004 requires the canonical FaceParsingV2 model"
@@ -691,6 +690,21 @@ impl FaceParsingProducer {
         bright_ui: f32,
         deyellow_ui: f32,
     ) -> Result<ProducerInputs> {
+        let mut inputs = self.produce_mask_inputs(frame, job_id, source_to_crop, bright_ui, deyellow_ui)?;
+        inputs.pf90004 = Some(Self::pf90004_bundle(
+            frame, inputs.parsing.as_ref().expect("canonical parsing was produced"),
+        )?);
+        Ok(inputs)
+    }
+
+    pub(crate) fn produce_mask_inputs(
+        &self,
+        frame: &Image,
+        job_id: u64,
+        source_to_crop: [[f32; 3]; 2],
+        bright_ui: f32,
+        deyellow_ui: f32,
+    ) -> Result<ProducerInputs> {
         ensure!(
             bright_ui.is_finite()
                 && deyellow_ui.is_finite()
@@ -700,34 +714,38 @@ impl FaceParsingProducer {
         );
         let inference = self.infer(frame, job_id, source_to_crop)?;
         let crop_to_source = inverse_native(source_to_crop)?;
-        let mask_g = project_teeth_mask(
-            &inference.teeth_crop,
-            FACE_PARSING_V2_SIDE,
-            FACE_PARSING_V2_SIDE,
-            crop_to_source,
-            frame.width,
-            frame.height,
-        )?;
-        let mask_sha256 = sha256_32(&mask_g);
-        let pf90004 = self.pf90004_bundle(frame, &inference.parsing, crop_to_source)?;
+        let teeth = match &self.teeth_luts {
+            Ok((whiten_lut, bright_lut)) => {
+                let mask_g = project_teeth_mask(
+                    &inference.teeth_crop,
+                    FACE_PARSING_V2_SIDE,
+                    FACE_PARSING_V2_SIDE,
+                    crop_to_source,
+                    frame.width,
+                    frame.height,
+                )?;
+                Some(TeethProducerInputs {
+                    job_id,
+                    mask_width: frame.width,
+                    mask_height: frame.height,
+                    mask_source: TeethMaskSource::FaceParsingV2Id2G,
+                    mask_format: TeethMaskFormat::U8,
+                    mask_sha256: sha256_32(&mask_g),
+                    whiten_lut_identity: PF108_WHITEN_LUT_IDENTITY,
+                    bright_lut_identity: PF108_BRIGHT_LUT_IDENTITY,
+                    mask_g,
+                    bright_ui,
+                    deyellow_ui,
+                    whiten_lut: whiten_lut.clone(),
+                    bright_lut: bright_lut.clone(),
+                })
+            }
+            Err(error) if bright_ui > 0.0 || deyellow_ui > 0.0 => bail!("{error:#}"),
+            Err(_) => None,
+        };
         Ok(ProducerInputs {
             parsing: Some(inference.parsing),
-            teeth: Some(TeethProducerInputs {
-                job_id,
-                mask_width: frame.width,
-                mask_height: frame.height,
-                mask_source: TeethMaskSource::FaceParsingV2Id2G,
-                mask_format: TeethMaskFormat::U8,
-                mask_sha256,
-                whiten_lut_identity: PF108_WHITEN_LUT_IDENTITY,
-                bright_lut_identity: PF108_BRIGHT_LUT_IDENTITY,
-                mask_g,
-                bright_ui,
-                deyellow_ui,
-                whiten_lut: self.whiten_lut.clone(),
-                bright_lut: self.bright_lut.clone(),
-            }),
-            pf90004: Some(pf90004),
+            teeth,
             ..ProducerInputs::default()
         })
     }

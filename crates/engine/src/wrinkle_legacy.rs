@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use aurora_portrait::kernels::skin_adjust::{Roi, WrinkleUniforms};
 use aurora_portrait::{Image, Refusal};
 
@@ -606,6 +608,8 @@ pub struct WrinkleProducerInputs {
     pub(crate) height: u32,
     legacy_skin_mask: Option<WrinkleLegacySkinMaskProducer>,
     mask_mini_image: Option<WrinkleMaskMiniImageProducer>,
+    default_mask_pf: Option<u32>,
+    additional_pf_masks: BTreeMap<u32, Vec<u8>>,
     pub(crate) base_full: Option<Image>,
     pub(crate) residual_full: Option<Image>,
     uniforms: Option<WrinkleUniforms>,
@@ -648,12 +652,37 @@ impl WrinkleProducerInputs {
             height,
             legacy_skin_mask: Some(legacy_skin_mask),
             mask_mini_image: Some(mask_mini_image),
+            default_mask_pf: None,
+            additional_pf_masks: BTreeMap::new(),
             base_full: Some(base_full),
             residual_full: Some(residual_full),
             uniforms: Some(uniforms),
         };
         producer.validate_shape()?;
         Ok(producer)
+    }
+
+    pub(crate) fn with_pf_masks(
+        mut self,
+        default_pf: u32,
+        additional: BTreeMap<u32, Vec<u8>>,
+    ) -> Result<Self, Refusal> {
+        if additional.contains_key(&default_pf) {
+            return Err(Refusal::ValueOutOfRange("wrinkle PF mask id"));
+        }
+        let default_mask = self
+            .mask_mini_image
+            .as_ref()
+            .ok_or(Refusal::MissingInput("wrinkle mask mini-image"))?;
+        if additional
+            .values()
+            .any(|mask| mask.len() != default_mask.mask_rgba_full().len())
+        {
+            return Err(Refusal::ShapeMismatch("wrinkle PF mask frame"));
+        }
+        self.default_mask_pf = Some(default_pf);
+        self.additional_pf_masks = additional;
+        Ok(self)
     }
 
     fn validate_shape(&self) -> Result<(), Refusal> {
@@ -758,6 +787,29 @@ impl WrinkleProducerInputs {
         })
     }
 
+    pub(crate) fn resolve_for(
+        &self,
+        current: &Image,
+        job_id: Option<u64>,
+        pf: u32,
+    ) -> Result<ResolvedWrinkleInputs<'_>, Refusal> {
+        let mut resolved = self.resolve(current, job_id)?;
+        if self
+            .default_mask_pf
+            .is_some_and(|default_pf| default_pf != pf)
+        {
+            let mask = self
+                .additional_pf_masks
+                .get(&pf)
+                .ok_or(Refusal::MissingInput("wrinkle PF mask"))?;
+            if mask.len() != resolved.mask_rgba_full.len() {
+                return Err(Refusal::ShapeMismatch("wrinkle PF mask frame"));
+            }
+            resolved.mask_rgba_full = mask;
+        }
+        Ok(resolved)
+    }
+
     pub fn fnv_fingerprint(&self, seed: u64) -> u64 {
         let mut hash = seed;
         hash = hash_u64(hash, u64::from(self.legacy_skin_mask.is_some()));
@@ -792,6 +844,15 @@ impl WrinkleProducerInputs {
             }
             hash = hash_bytes(hash, mask.mini_image().rgba8());
             hash = hash_bytes(hash, mask.mask_rgba_full());
+        }
+        if let Some(default_pf) = self.default_mask_pf {
+            hash = hash_bytes(hash, b"wrinkle per-PF masks");
+            hash = hash_u64(hash, u64::from(default_pf));
+            hash = hash_u64(hash, self.additional_pf_masks.len() as u64);
+            for (&pf, mask) in &self.additional_pf_masks {
+                hash = hash_u64(hash, u64::from(pf));
+                hash = hash_bytes(hash, mask);
+            }
         }
         hash = match self.uniforms {
             None => hash_u64(hash, 0),
@@ -1061,6 +1122,43 @@ mod tests {
                 width: 3,
                 height: 2,
             }
+        );
+        assert_eq!(
+            producer
+                .resolve_for(&current, Some(ticket), 21071)
+                .unwrap()
+                .mask_rgba_full,
+            resolved.mask_rgba_full,
+        );
+        let mask_len = resolved.mask_rgba_full.len();
+        let mut routed = producer
+            .with_pf_masks(21025, BTreeMap::from([(21071, vec![123; mask_len])]))
+            .unwrap();
+        assert!(std::ptr::eq(
+            routed
+                .resolve_for(&current, Some(ticket), 21025)
+                .unwrap()
+                .mask_rgba_full,
+            routed.resolve(&current, Some(ticket)).unwrap().mask_rgba_full,
+        ));
+        assert_eq!(
+            routed
+                .resolve_for(&current, Some(ticket), 21071)
+                .unwrap()
+                .mask_rgba_full,
+            vec![123; mask_len],
+        );
+        assert_eq!(
+            routed.resolve_for(&current, Some(ticket), 21070).unwrap_err(),
+            Refusal::MissingInput("wrinkle PF mask"),
+        );
+        let fingerprint = routed.fnv_fingerprint(0);
+        routed.additional_pf_masks.get_mut(&21071).unwrap()[0] ^= 1;
+        assert_ne!(routed.fnv_fingerprint(0), fingerprint);
+        routed.additional_pf_masks.get_mut(&21071).unwrap().pop().unwrap();
+        assert_eq!(
+            routed.resolve_for(&current, Some(ticket), 21071).unwrap_err(),
+            Refusal::ShapeMismatch("wrinkle PF mask frame"),
         );
     }
 

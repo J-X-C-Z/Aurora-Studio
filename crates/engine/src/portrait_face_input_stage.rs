@@ -1156,17 +1156,7 @@ impl FaceInputBundle {
                     )
                 };
                 if want_5 || want_90116 || want_90080 {
-                    // Combine canonical face (slot 1) + skin/nose/ear group (slot 18 = sat8(2,7,11,12))
-                    // via saturating_add so softmax boundaries between cheeks and nose stay 100% seamless
-                    // with zero holes, while eyes/brows/lips/hair remain cleanly excluded.
-                    let face = proj(1);
-                    let skin_nose = proj(18);
-                    let combined: Vec<u8> = face
-                        .iter()
-                        .zip(&skin_nose)
-                        .map(|(&a, &b)| a.saturating_add(b))
-                        .collect();
-                    parsing_skin = Some(combined);
+                    parsing_skin = Some(proj(18));
                 }
                 if want_5 || want_90116 {
                     parsing_eye = Some(proj(19));
@@ -1342,17 +1332,10 @@ impl FaceInputBundle {
                 if active(21026) || active(90088) || active(30259) || active(90089) || active(30030)
                     || active(44297) || active(30187) || active(30190) || active(30059) || active(90033)
                 {
-                    // Seamless face + skin + nose union via saturating_add (slots 1 + 18)
-                    // avoids softmax boundary dips/holes along the nose bridge and wings.
-                    let face = proj(1);
-                    let skin_nose = proj(18);
-                    let combined: Vec<u8> = face
-                        .iter()
-                        .zip(&skin_nose)
-                        .map(|(&a, &b)| a.saturating_add(b))
-                        .collect();
-                    parsing_face = Some(combined.clone());
-                    parsing_skin = Some(combined);
+                    // The skin group already includes the beard and nasal base.
+                    let skin = proj(18);
+                    parsing_face = Some(skin.clone());
+                    parsing_skin = Some(skin);
                 }
                 if active(90130) {
                     parsing_eye = Some(proj(19));
@@ -2511,19 +2494,24 @@ impl FaceInputBundle {
             .parsing
             .clone()
             .ok_or(Refusal::MissingInput("FaceParsingV2 parsing planes"))?;
-        let mut teeth = inputs
-            .teeth
-            .clone()
-            .ok_or(Refusal::MissingInput("PF108 teeth mask"))?;
+        let teeth = match inputs.teeth.as_ref() {
+            Some(teeth) => Some(super::TeethProducerInputs {
+                job_id: self.job_id,
+                bright_ui,
+                deyellow_ui,
+                ..teeth.clone()
+            }),
+            None if bright_ui > 0.0 || deyellow_ui > 0.0 => {
+                return Err(Refusal::MissingInput("PF108 teeth mask or LUTs"));
+            }
+            None => None,
+        };
         parsing.job_id = self.job_id;
-        teeth.job_id = self.job_id;
-        teeth.bright_ui = bright_ui;
-        teeth.deyellow_ui = deyellow_ui;
         if producer.parsing.is_none() {
             producer.parsing = Some(parsing);
         }
         if producer.teeth.is_none() {
-            producer.teeth = Some(teeth);
+            producer.teeth = teeth;
         }
         if producer.pf90004.is_none() {
             producer.pf90004 = inputs.pf90004.clone();
@@ -3310,7 +3298,34 @@ impl FaceInputBundle {
         Ok(())
     }
 
-    /// Builds same-job wrinkle and historical-skin wrinkle inputs (`PF21024, 21025, 21069, 21070, 21071, 90023, 90024`)
+    pub(crate) fn face_retouch_mask(
+        &self,
+        frame: &Image,
+    ) -> Result<super::FaceRetouchMask, Refusal> {
+        self.validate_ticket(frame, Some(self.job_id))?;
+        let parsing = self.model_inputs.as_ref()
+            .and_then(|inputs| inputs.parsing.as_ref())
+            .filter(|parsing| parsing.job_id == self.job_id)
+            .ok_or(Refusal::MissingInput("face retouch parsing"))?;
+        let skin = crate::face_parsing::project_face_parsing_skin_mask(
+            parsing, frame.width, frame.height,
+        )?;
+        // The uncut projected landmarks keep the nose zone fixed while panning.
+        let bridge = self.points194[54];
+        let tip = self.points194[57];
+        let center = midpoint(bridge, tip);
+        let eye_dist = distance(self.points194[26], self.points194[44]);
+        let nose = [
+            center[0], center[1], eye_dist * 0.40, distance(bridge, tip) * 0.85,
+        ];
+        Ok(super::FaceRetouchMask {
+            skin,
+            face_width: self.roi_xywh[2],
+            nose,
+        })
+    }
+
+    /// Builds same-job wrinkle and historical-skin wrinkle inputs (`PF21024, 21025, 21069, 21070, 21071, 90015, 90023, 90024`)
     /// from the source frame's frequency-separated Gaussian/median base and `fbe.onnx` facial-skin mask.
     pub fn attach_wrinkle_from_extra(
         &self,
@@ -3327,13 +3342,14 @@ impl FaceInputBundle {
 
         self.validate_ticket(source, Some(self.job_id))?;
         let control = |pf: u32| extra.get(&format!("pc:{pf}")).copied().unwrap_or(0.0);
-        let active_routed = [21025u32, 21069, 21070, 21071, 90015]
+        let mut active_routed = [21025u32, 21069, 21070, 21071, 90015]
             .into_iter()
-            .any(|pf| control(pf) > 0.0);
+            .filter(|&pf| control(pf) > 0.0);
+        let first_routed = active_routed.next();
         let active_hist = [21024u32, 90023, 90024]
             .into_iter()
             .any(|pf| control(pf) > 0.001);
-        if !active_routed && !active_hist {
+        if first_routed.is_none() && !active_hist {
             return Ok(());
         }
         let inputs = self
@@ -3527,9 +3543,7 @@ impl FaceInputBundle {
             high_freq_max_threshold: 0.35,
         };
 
-        let mask_rgba = build_pf_mask(&[21025, 21069, 21070, 21071, 90015]);
-
-        if (active_routed || active_hist) && producer.wrinkle.is_none() {
+        if producer.wrinkle.is_none() {
             let legacy_tex =
                 WrinkleLegacySkinMaskTexture::from_service_6200(1, 2, 2, vec![255; 16])?;
             let legacy_prod = WrinkleLegacySkinMaskProducer::from_same_job(
@@ -3549,7 +3563,7 @@ impl FaceInputBundle {
                 source.height,
                 mini_img,
                 face_roi,
-                mask_rgba.clone(),
+                build_pf_mask(first_routed.as_slice()),
             )?;
             let wrinkle_inputs = WrinkleProducerInputs::from_same_job(
                 WrinkleSameJobReceipt::from_job_id(self.job_id),
@@ -3561,6 +3575,15 @@ impl FaceInputBundle {
                 mini_prod,
                 uniforms,
             )?;
+            let wrinkle_inputs = if let Some(pf) = first_routed {
+                // The first mask lives in the legacy slot; only later PFs need extra storage.
+                let additional = active_routed
+                    .map(|pf| (pf, build_pf_mask(&[pf])))
+                    .collect();
+                wrinkle_inputs.with_pf_masks(pf, additional)?
+            } else {
+                wrinkle_inputs
+            };
             producer.write_wrinkle(wrinkle_inputs);
         }
 
@@ -3869,7 +3892,7 @@ impl FaceInputProducer {
     }
 
     pub fn produce(&self, job_id: u64, source: &Image) -> Result<FaceInputBundle, Refusal> {
-        self.produce_with_sha(job_id, source, None)
+        self.produce_with_sha(job_id, source, None, true)
     }
 
     /// Reuse the exact SHA-256 computed for the session's cache identity.
@@ -3878,6 +3901,7 @@ impl FaceInputProducer {
         job_id: u64,
         source: &Image,
         source_sha256: Option<[u8; 32]>,
+        include_radiance: bool,
     ) -> Result<FaceInputBundle, Refusal> {
         if job_id == 0 {
             return Err(Refusal::ValueOutOfRange("face input job ticket"));
@@ -3900,9 +3924,12 @@ impl FaceInputProducer {
                     let source_to_crop = roi
                         .source_to_crop()
                         .map_err(|_| Refusal::MissingInput(FACE_PARSING_V2_ROI_ERROR))?;
-                    parsing
-                        .produce(source, job_id, source_to_crop, 0.0, 0.0)
-                        .map_err(|error| {
+                    let output = if include_radiance {
+                        parsing.produce(source, job_id, source_to_crop, 0.0, 0.0)
+                    } else {
+                        parsing.produce_mask_inputs(source, job_id, source_to_crop, 0.0, 0.0)
+                    };
+                    output.map_err(|error| {
                             log::warn!("FaceParsingV2 canonical producer refused: {error:#}");
                             Refusal::MissingInput(FACE_PARSING_V2_PRODUCE_ERROR)
                         })
@@ -4977,7 +5004,29 @@ impl FaceInputSession {
     }
 
     pub fn produce(&self, job_id: u64, source: &Image) -> Result<FaceInputBundle, Refusal> {
-        self.produce_with_digest(job_id, source, frame_digest(source))
+        self.produce_for_render(job_id, source, None, true)
+    }
+
+    pub(crate) fn produce_for_render(
+        &self,
+        job_id: u64,
+        source: &Image,
+        digest: Option<[u8; 32]>,
+        include_radiance: bool,
+    ) -> Result<FaceInputBundle, Refusal> {
+        let digest = digest.unwrap_or_else(|| frame_digest(source));
+        let mut bundle = self.produce_with_digest(job_id, source, digest)?;
+        if include_radiance
+            && let Some(inputs) = bundle.model_inputs.as_mut()
+            && let Some(parsing) = inputs.parsing.as_ref()
+        {
+            inputs.pf90004 = Some(FaceParsingProducer::pf90004_bundle(source, parsing)
+                .map_err(|error| {
+                    log::warn!("FaceParsingV2 radiance payload refused: {error:#}");
+                    Refusal::MissingInput(FACE_PARSING_V2_PRODUCE_ERROR)
+                })?);
+        }
+        Ok(bundle)
     }
 
     /// Produces a bundle for a caller that already hashed `source`. The digest
@@ -5072,9 +5121,13 @@ impl FaceInputSession {
                 cache.remove_result(&alias_entry.result);
             }
         }
+        log::debug!(
+            "portrait face uncached source {}x{}, parsing={}",
+            source.width, source.height, self.key.include_parsing
+        );
         let bundle = self
             .producer
-            .produce_with_sha(job_id, source, Some(digest))?;
+            .produce_with_sha(job_id, source, Some(digest), false)?;
         let result_key = FaceInputResultKey::from_bundle(&self.key, &bundle, alias.source)?;
         let bundle = Arc::new(bundle);
         result_cache()
@@ -6752,11 +6805,14 @@ mod frame_digest_scope_tests {
         }
         b.points194[18] = [110.0, 108.0];
         b.points194[22] = [82.0, 108.0];
+        b.points194[26] = [96.0, 108.0]; // left eye anchor
         b.points194[40] = [146.0, 108.0];
         b.points194[36] = [174.0, 108.0];
+        b.points194[44] = [160.0, 108.0]; // right eye anchor
+        b.points194[54] = [128.0, 110.0]; // nose bridge
         b.points194[57] = [128.0, 134.0]; // nose tip
         b.points194[73] = [116.0, 166.0]; // lip left
-        b.points194[84] = [140.0, 166.0]; // lip right
+        b.points194[83] = [140.0, 166.0]; // lip right
         b.points194[109] = [56.0, 110.0]; // contour left
         b.points194[125] = [128.0, 200.0]; // chin
         b.points194[141] = [200.0, 110.0]; // contour right
@@ -6798,6 +6854,21 @@ mod frame_digest_scope_tests {
         b.attach_wrinkle_from_extra(&source, &extra, &mut producer)
             .expect("attach wrinkle inputs");
         let w_inputs = producer.wrinkle.as_ref().expect("wrinkle attached");
+        for (pf, x, y, other_x, other_y) in [
+            (21025, 110, 178, 128, 122),
+            (21069, 88, 136, 128, 166),
+            (21070, 128, 122, 128, 166),
+            (21071, 128, 166, 128, 122),
+            (90015, 128, 224, 128, 122),
+        ] {
+            let mask = w_inputs
+                .resolve_for(&source, Some(JOB), pf)
+                .unwrap()
+                .mask_rgba_full;
+            let at = |x, y| mask[((y * w + x) * 4) as usize];
+            assert!(at(x, y) > 0, "PF{pf} missed its own crease");
+            assert_eq!(at(other_x, other_y), 0, "PF{pf} leaked to another crease");
+        }
         let h_inputs = producer
             .historical_skin
             .as_ref()

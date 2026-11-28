@@ -65,6 +65,7 @@ const RENDER_VERSION: u32 = 1;
 pub(crate) struct PreviewKey {
     build: u64,
     source_snapshot: Option<u64>,
+    portrait_snapshot: Option<u64>,
     image: ImageId,
     params: ParamsFingerprint,
     long_side: u32,
@@ -81,6 +82,11 @@ impl PreviewKey {
         self
     }
 
+    pub(crate) fn with_portrait_source(mut self, snapshot: Option<u64>) -> Self {
+        self.portrait_snapshot = snapshot;
+        self
+    }
+
     /// True when two requests differ at most in their layer rows and node
     /// topology. The caller must still run [`NodeGraph::dirty_between`]: this
     /// only rules out every other input, including spots and all develop /
@@ -88,6 +94,7 @@ impl PreviewKey {
     pub(crate) fn graph_reusable_with(&self, other: &Self) -> bool {
         self.build == other.build
             && self.source_snapshot == other.source_snapshot
+            && self.portrait_snapshot == other.portrait_snapshot
             && self.image == other.image
             && self.long_side == other.long_side
             && self.region == other.region
@@ -267,6 +274,7 @@ pub(crate) fn key(
     PreviewKey {
         build: build_fingerprint(),
         source_snapshot: None,
+        portrait_snapshot: None,
         image,
         params: ParamsFingerprint::of(adj),
         long_side: max_size,
@@ -301,7 +309,7 @@ pub(crate) fn persistent_digest(
     }
     let p = ParamsFingerprint::of(adj);
     Some(format!(
-        "pv1-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{max_size}-{:x}.{:x}.{:x}.{:x}-{}{}",
+        "pv2-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{max_size}-{:x}.{:x}.{:x}.{:x}-{}{}",
         build_fingerprint(),
         p.characterization,
         p.geometry,

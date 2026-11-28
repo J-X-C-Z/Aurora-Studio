@@ -199,19 +199,26 @@ fn blur_rgb(
     )
 }
 
-fn erode_min(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
+fn feather_beard_mask(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut out = vec![0u8; mask.len()];
     for y in 0..height {
         for x in 0..width {
-            let mut value = 255u8;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let nx = (x as i32 + dx).clamp(0, width as i32 - 1) as usize;
-                    let ny = (y as i32 + dy).clamp(0, height as i32 - 1) as usize;
-                    value = value.min(mask[ny * width + nx]);
+            let p = y * width + x;
+            let center = f32::from(mask[p]);
+            if center == 0.0 {
+                continue;
+            }
+            let mut sum = 0u16;
+            let mut count = 0u16;
+            for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                    sum += u16::from(mask[ny * width + nx]);
+                    count += 1;
                 }
             }
-            out[y * width + x] = value;
+            // Feather inward without spreading the repair across a protected edge.
+            let mean = f32::from(sum) / f32::from(count);
+            out[p] = clamp_byte(0.75 * center + 0.25 * center.min(mean));
         }
     }
     out
@@ -282,10 +289,11 @@ const BEARD_SKIN: &str = "PF21026_SKIN_MASK";
 pub(crate) struct BeardProducerInputs {
     /// Full-frame anatomical beard coverage, feathered.
     pub mask_a: Vec<u8>,
-    /// Full-frame detected dark stubble, eroded so soft edges survive.
+    /// Full-frame detected dark stubble with feathered coverage.
     pub mask_b: Vec<u8>,
     /// Full-frame repaired skin, same dimensions as the source frame.
     pub repair_rgb: Image,
+    pub repair_source: Image,
 }
 
 impl BeardProducerInputs {
@@ -304,10 +312,9 @@ impl BeardProducerInputs {
 ///
 /// The beard zone is anchored on the 194-point mouth corners (73/83), nose tip
 /// (57), chin (125) and jaw contour (109/141): moustache above the upper lip,
-/// chin patch below the lower lip, and the two jaw segments. The lip vermilion
-/// and the nose tip are excluded. `mask_b` is non-zero only where a dark, low
-/// short-hair signal is detected, so a clean-shaven face is a no-op instead of
-/// an unconditional skin blur.
+/// chin patch below the lower lip, and the two jaw segments. The lip line,
+/// mouth corners and nose base are guarded. `mask_b` follows fine dark ridges
+/// with brighter skin on both sides.
 pub(crate) fn build_pf21026_beard_inputs(
     frame: &Image,
     face_points194: &[[f32; 2]],
@@ -368,12 +375,14 @@ pub(crate) fn build_pf21026_beard_inputs(
     ];
     let chin_rx = mouth_w * 0.55;
     let chin_ry = (chin[1] - mouth_mid[1]).abs().max(eye_dist * 0.20) * 0.55;
-    let lip_rx = mouth_w * 0.48;
-    let lip_ry = eye_dist * 0.11;
-    let nose_rx = mouth_w * 0.22;
-    let nose_ry = eye_dist * 0.10;
+    let lip_radius = eye_dist * 0.14;
+    let nose_rx = (mouth_w * 0.32).max(eye_dist * 0.12);
+    let nose_ry = eye_dist * 0.13;
     let jaw_radius = eye_dist * 0.20;
     let cheek_radius = eye_dist * 0.16;
+    let lower_face = [chin[0] - nose_tip[0], chin[1] - nose_tip[1]];
+    let lower_face_len = lower_face[0].hypot(lower_face[1]).max(f32::EPSILON);
+    let down = [lower_face[0] / lower_face_len, lower_face[1] / lower_face_len];
 
     let (width, height) = (frame.width as usize, frame.height as usize);
     let mut zone = vec![0.0f32; pixels];
@@ -396,9 +405,19 @@ pub(crate) fn build_pf21026_beard_inputs(
                 weight = weight.max(segment_weight(fx, fy, chin, jaw, jaw_radius));
                 weight = weight.max(segment_weight(fx, fy, mouth_r, jaw, cheek_radius));
             }
-            // Keep the lip vermilion and the nose tip out of the repair.
-            weight *= 1.0 - ellipse(fx, fy, mouth_mid, lip_rx, lip_ry);
-            weight *= 1.0 - ellipse(fx, fy, nose_tip, nose_rx, nose_ry);
+            // Mouth-to-jaw bands can cross the lower eyelid on a turned face.
+            let below_nose = (fx - nose_tip[0]) * down[0] + (fy - nose_tip[1]) * down[1];
+            weight *= smoothstep(0.0, eye_dist * 0.12, below_nose);
+            weight *= 1.0 - segment_weight(fx, fy, mouth_l, mouth_r, lip_radius);
+            let across_nose = (fx - nose_tip[0]) * down[1] - (fy - nose_tip[1]) * down[0];
+            let nose_guard = ellipse(
+                across_nose,
+                below_nose,
+                [0.0, eye_dist * 0.03],
+                nose_rx,
+                nose_ry,
+            );
+            weight *= 1.0 - smoothstep(0.0, 0.65, nose_guard * nose_guard);
             zone[y * width + x] = weight.clamp(0.0, 1.0);
         }
     }
@@ -423,43 +442,61 @@ pub(crate) fn build_pf21026_beard_inputs(
         region[p] = zone[p] * skin;
     }
 
-    // Local skin baseline, then the dark short-hair response against it.
-    let radius = ((eye_dist * 0.35).round() as usize).clamp(4, 32);
-    let baseline_luma = weighted_blur(&source_luma, &region, width, height, radius);
-    let mut stubble = vec![0.0f32; pixels];
-    for p in 0..pixels {
-        let drop = baseline_luma[p] - source_luma[p];
-        stubble[p] = smoothstep(6.0, 26.0, drop) * region[p];
+    // A fine dark ridge has brighter samples on both sides across its width.
+    // A smooth shadow or a one-sided step lacks this contrast at hair scale.
+    let probe = ((eye_dist * 0.012).round() as usize).clamp(2, 5);
+    let diagonal = ((probe as f32 * std::f32::consts::FRAC_1_SQRT_2).round() as usize).max(1);
+    let offsets = [
+        probe,
+        probe * width,
+        diagonal * (width + 1),
+        diagonal * (width - 1),
+    ];
+    let mut texture_drop = vec![0.0f32; pixels];
+    for y in probe..height.saturating_sub(probe) {
+        for x in probe..width.saturating_sub(probe) {
+            let p = y * width + x;
+            if region[p] <= 0.0 {
+                continue;
+            }
+            let mut brighter_side = source_luma[p];
+            for offset in offsets {
+                brighter_side =
+                    brighter_side.max(source_luma[p - offset].min(source_luma[p + offset]));
+            }
+            texture_drop[p] = brighter_side - source_luma[p];
+        }
     }
 
-    // Rebuild skin from the neighbourhood. Stubble pixels keep a 20% vote so a
-    // large patch still resolves to its surrounding skin instead of to itself.
+    let radius = probe * 3;
     let mut clean_weight = vec![0.0f32; pixels];
-    for p in 0..pixels {
-        clean_weight[p] = region[p] * (0.20 + 0.80 * (1.0 - stubble[p]));
-    }
-    let (base_r, base_g, base_b) =
-        blur_rgb(&source_r, &source_g, &source_b, &clean_weight, width, height, radius);
-    let smooth_luma = weighted_blur(&source_luma, &region, width, height, 2);
-
-    let mut repair_pixels = frame.pixels.clone();
     let mut mask_a = vec![0u8; pixels];
     let mut mask_b_raw = vec![0u8; pixels];
     for p in 0..pixels {
+        let hair = smoothstep(4.0, 18.0, texture_drop[p]);
+        clean_weight[p] = region[p] * (1.0 - 0.80 * hair);
         mask_a[p] = clamp_byte(255.0 * region[p]);
-        mask_b_raw[p] =
-            clamp_byte(255.0 * region[p] * smoothstep(0.12, 0.55, stubble[p]));
-        if region[p] <= 0.0 {
+        mask_b_raw[p] = clamp_byte(255.0 * region[p] * hair);
+    }
+    let (base_r, base_g, base_b) =
+        blur_rgb(&source_r, &source_g, &source_b, &clean_weight, width, height, radius);
+
+    let mut repair_pixels = frame.pixels.clone();
+    for p in 0..pixels {
+        if mask_b_raw[p] == 0 {
             continue;
         }
-        // Put back a fraction of the clean skin texture so the repair does not
-        // read as a flat plastic patch.
-        let high_frequency = (source_luma[p] - smooth_luma[p]) * 0.25;
-        repair_pixels[p * 4] = clamp_byte(base_r[p] + high_frequency);
-        repair_pixels[p * 4 + 1] = clamp_byte(base_g[p] + high_frequency);
-        repair_pixels[p * 4 + 2] = clamp_byte(base_b[p] + high_frequency);
+        let lift = luma(base_r[p], base_g[p], base_b[p]) - source_luma[p];
+        if lift <= 0.0 {
+            continue;
+        }
+        // Keep the repair within the measured texture contrast near shadows.
+        let mix = (0.85 * texture_drop[p] / lift).min(1.0);
+        repair_pixels[p * 4] = clamp_byte(source_r[p] + mix * (base_r[p] - source_r[p]));
+        repair_pixels[p * 4 + 1] = clamp_byte(source_g[p] + mix * (base_g[p] - source_g[p]));
+        repair_pixels[p * 4 + 2] = clamp_byte(source_b[p] + mix * (base_b[p] - source_b[p]));
     }
-    let mask_b = erode_min(&mask_b_raw, width, height);
+    let mask_b = feather_beard_mask(&mask_b_raw, width, height);
     let repair_rgb =
         Image::new(frame.width, frame.height, repair_pixels).ok_or(Refusal::ShapeMismatch(
             "PF21026_REPAIR_RGB",
@@ -468,6 +505,7 @@ pub(crate) fn build_pf21026_beard_inputs(
         mask_a,
         mask_b,
         repair_rgb,
+        repair_source: frame.clone(),
     })
 }
 
@@ -1031,36 +1069,37 @@ mod tests {
         let skin = [190u8, 155, 130];
         let stubble = [55u8, 45, 38];
         let mut frame = skin_frame(skin);
-        // Moustache patch and chin patch.
-        for y in 78..84u32 {
-            for x in 52..76u32 {
-                set_pixel(&mut frame, x, y, stubble);
-            }
+        for y in 79..83 {
+            set_pixel(&mut frame, 59, y, stubble);
         }
-        for y in 96..106u32 {
-            for x in 54..74u32 {
-                set_pixel(&mut frame, x, y, stubble);
-            }
+        for y in 96..106 {
+            set_pixel(&mut frame, 63, y, [178, 143, 118]);
+            set_pixel(&mut frame, 64, y, stubble);
         }
 
-        let owned = build_pf21026_beard_inputs(&frame, &face_points(), None).unwrap();
+        let mut points = face_points();
+        points[109] = [38.0, 50.0];
+        points[141] = [90.0, 50.0];
+        let guarded_pixels = [(40, 54), (64, 75), (56, 88), (64, 88), (72, 88)];
+        for (x, y) in guarded_pixels {
+            set_pixel(&mut frame, x, y, stubble);
+        }
+        let index = |x: u32, y: u32| (y * SIDE + x) as usize;
+        let chin_index = index(64, 100);
+        frame.pixels[chin_index * 4 + 3] = 137;
+        let owned = build_pf21026_beard_inputs(&frame, &points, None).unwrap();
         assert_eq!(owned.mask_a.len(), frame.pixel_count());
         assert_eq!(owned.mask_b.len(), frame.pixel_count());
         assert_eq!((owned.repair_rgb.width, owned.repair_rgb.height), (SIDE, SIDE));
 
-        let chin_index = 100 * SIDE as usize + 64;
-        assert!(owned.mask_a[chin_index] > 0, "chin is inside the beard zone");
-        assert!(
-            owned.mask_b[chin_index] > 0,
-            "detected stubble must be in mask_b"
-        );
-        // The lip exclusion is a smooth ellipse, so the exact half-pixel sample
-        // keeps a tiny anatomical-zone residue. What matters is that the
-        // detected-hair mask stays zero there, i.e. the vermilion is not
-        // repaired.
-        let lip_index = 88 * SIDE as usize + 64;
-        assert!(owned.mask_a[lip_index] < 16, "lip vermilion stays out");
-        assert_eq!(owned.mask_b[lip_index], 0, "lip is never a stubble target");
+        for (x, y) in guarded_pixels {
+            assert_eq!(owned.mask_a[index(x, y)], 0, "anatomy at ({x}, {y})");
+            assert_eq!(owned.mask_b[index(x, y)], 0);
+        }
+        assert!(owned.mask_b[index(59, 81)] > 0, "thin moustache survives");
+        let soft_edge = owned.mask_b[index(63, 100)];
+        assert!(soft_edge > 0 && soft_edge < owned.mask_b[chin_index]);
+        assert_eq!(owned.mask_b[index(62, 100)], 0, "no spread onto skin");
 
         let borrowed = owned.as_borrowed();
         let repaired = beard::apply(
@@ -1075,11 +1114,27 @@ mod tests {
             pixel_luma(&repaired, 64, 100) > pixel_luma(&frame, 64, 100) + 40.0,
             "stubble must be replaced by skin"
         );
+        assert_eq!(repaired.pixels[chin_index * 4 + 3], 137);
         assert_eq!(
             repaired.pixel(2, 2),
             frame.pixel(2, 2),
             "outside the beard zone is untouched"
         );
+    }
+
+    #[test]
+    fn pf21026_preserves_smooth_shadow_and_one_sided_edge() {
+        let mut frame = skin_frame([175; 3]);
+        for y in 0..SIDE {
+            let shade = 112 + (y.abs_diff(100).min(24) / 3) as u8;
+            for x in 0..48 {
+                set_pixel(&mut frame, x, y, [shade; 3]);
+            }
+        }
+        let owned = build_pf21026_beard_inputs(&frame, &face_points(), None).unwrap();
+        assert!(owned.mask_a[(100 * SIDE + 47) as usize] > 0);
+        assert!(owned.mask_b.iter().all(|&alpha| alpha == 0));
+        assert_eq!(owned.repair_rgb, frame);
     }
 
     #[test]

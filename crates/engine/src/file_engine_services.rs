@@ -348,11 +348,17 @@ impl<'a> RenderService<'a> {
         adjustments: &AdjustmentSet,
         max_size: u32,
     ) -> anyhow::Result<RgbaImage> {
+        let adj = crate::styles::resolve(adjustments);
+        let portrait = crate::portrait_registry::has_active_portrait_effect(&adj);
         let thumb_key = if let Some(store) = &self.engine.store {
             let st = self.engine.state.lock();
             st.entries.iter().find(|e| e.info.id == image).map(|e| {
                 let mtime_ns = crate::aurora_store::file_mtime_ns(&e.path);
-                let adj_hash = crate::aurora_store::hash_adjustments(adjustments);
+                // Portrait thumbnails from an older analysis source are stale.
+                let mut adj_hash = crate::aurora_store::hash_adjustments(adjustments);
+                if portrait {
+                    adj_hash ^= 0x18d7_0c7e_94b5_453e;
+                }
                 (store.clone(), e.rel_path.clone(), mtime_ns, adj_hash)
             })
         } else {
@@ -367,13 +373,10 @@ impl<'a> RenderService<'a> {
 
         // Thumbnails queue behind the visible preview on the decode gate.
         let src = self.engine.source_with_priority(image, DecodePriority::Thumbnail)?;
-        let out = process::render(
-            &src,
-            &crate::styles::resolve(adjustments),
-            NormRect::FULL,
-            max_size,
-            false,
-            None,
+        let native = portrait.then(|| self.engine.native_portrait_source(image, DecodePriority::Thumbnail)).flatten();
+        let out = process::render_preview_with_portrait_source(
+            &src, native.as_deref().unwrap_or(&src), &adj, NormRect::FULL, max_size,
+            false, None, false, crate::scopes::ScopeWants::default(),
         );
         let rgba = RgbaImage::new(out.width, out.height, out.rgba);
         if let Some((store, rel_path, mtime_ns, adj_hash)) = thumb_key {
@@ -418,7 +421,11 @@ impl<'a> RenderService<'a> {
         if request.region != NormRect::FULL {
             return None;
         }
-        if self.engine.cached_source(request.image).is_some() {
+        let mut adj = crate::styles::resolve(&request.adjustments);
+        let portrait = !request.bypass
+            && (crate::portrait_registry::has_active_portrait_effect(&adj)
+                || crate::portrait_stage::has_live_body_request(&adj.extra));
+        if !portrait && self.engine.cached_source(request.image).is_some() {
             return None;
         }
         let path = {
@@ -439,7 +446,7 @@ impl<'a> RenderService<'a> {
         if !crate::raw::is_raw(&path) || is_eip(&path) || is_cop(&path) {
             return None;
         }
-        if crate::raw_cache::has_cached_source16(&path, SOURCE_LONG_SIDE) {
+        if !portrait && crate::raw_cache::has_cached_source16(&path, SOURCE_LONG_SIDE) {
             return None;
         }
         let start = std::time::Instant::now();
@@ -456,7 +463,10 @@ impl<'a> RenderService<'a> {
             preview
         };
         let (w, h) = resized.dimensions();
-        let adj = crate::styles::resolve(&request.adjustments);
+        if portrait {
+            // Present the developed base while the regular render analyzes the original.
+            adj.to_mut().extra.retain(|key, _| !key.starts_with("pc:"));
+        }
         if !request.bypass && !adj.is_default() {
             let src = Source::from_rgba(w, h, resized.as_raw()).with_camera_preview(true);
             let out = process::render_preview_bgra(
@@ -651,6 +661,15 @@ impl<'a> RenderService<'a> {
             Some(native) => (native, "native_raw"),
             None => (engine.source(request.image)?, "source"),
         };
+        let native_portrait = if source_kind == "source"
+            && !request.bypass
+            && crate::portrait_registry::has_active_portrait_effect(&adj)
+        {
+            engine.native_portrait_source(request.image, DecodePriority::Interactive)
+        } else {
+            None
+        };
+        let portrait_src = native_portrait.as_deref().unwrap_or(&src);
         let (rendering, intent_note) = crate::engine::request_rendering(request);
         let display_is_noop = match request.display_profile.as_deref() {
             None => true,
@@ -696,8 +715,9 @@ impl<'a> RenderService<'a> {
             crate::scopes::ScopeWants::default()
         };
         if direct_bgra {
-            let out = process::render_preview_bgra(
+            let out = process::render_preview_with_portrait_source(
                 &src,
+                portrait_src,
                 &adj,
                 request.region,
                 max,
@@ -732,7 +752,8 @@ impl<'a> RenderService<'a> {
             });
         }
         let key = preview_cache::key(request.image, &adj, request.region, max, request.bypass, request.mask_overlay, fast)
-            .with_source(src.snapshot_id());
+            .with_source(src.snapshot_id())
+            .with_portrait_source(native_portrait.as_ref().map(|source| source.snapshot_id()));
         let profile_key = crate::engine::ProfileKey::new(key, request.proof_profile.as_deref(), request.display_profile.as_deref(), (request.proof_paper_white, request.proof_black_point), rendering);
         let graph = adj.nodes.clone().unwrap_or_default().repaired(&adj.layers);
         let mut frame_key = key;
@@ -793,7 +814,10 @@ impl<'a> RenderService<'a> {
                 scopes: None,
             });
         }
-        let out = process::render_at(&src, &adj, request.region, max, request.bypass, request.mask_overlay, fast, scopes);
+        let out = process::render_preview_with_portrait_source(
+            &src, portrait_src, &adj, request.region, max, request.bypass,
+            request.mask_overlay, false, scopes,
+        );
         let frame = CachedFrame {
             width: out.width,
             height: out.height,
@@ -1301,7 +1325,11 @@ impl<'a> ExportService<'a> {
             let adjustments = crate::styles::resolve(&engine.load_adjustments(job.image)).into_owned();
             // Native RAW is always preferred: it is the real full-resolution
             // decode. Without it the preview source is capped at SOURCE_LONG_SIDE.
-            let native = engine.native_raw_source(job.image, None);
+            let native = if crate::portrait_registry::has_active_portrait_effect(&adjustments) {
+                engine.native_portrait_source(job.image, DecodePriority::Interactive)
+            } else {
+                engine.native_raw_source(job.image, None)
+            };
             let frame_source_size = native.as_ref().map_or((info.width, info.height), |native| native.size());
             let (width, height) =
                 crate::mock::geometry::FrameMap::new(frame_source_size, &adjustments.geometry).frame_size();
